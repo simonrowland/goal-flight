@@ -1,0 +1,207 @@
+# init <topic>
+
+`<topic>` is the slug for this initiative (e.g., `payments-rewrite`, `auth-migration`, `port-to-rust`). Lowercase, hyphens.
+
+## Steps
+
+### 1. Validate environment
+
+Run in parallel:
+- `git rev-parse --show-toplevel` → bail if not a git repo.
+- `command -v codex` → capture path and `codex --version` if present.
+- `command -v bun` → capture version.
+- Check gstack install on **both sides** (it works for both Claude Code and codex):
+  - Claude-side: `[ -d ~/.claude/skills/gstack ]`
+  - Codex-side: `[ -d ~/.codex/skills/gstack ]`
+  - Project-level (if present, takes precedence): `[ -d <repo-root>/.agents/skills/gstack ]`
+  - Capture which sides are installed; report both.
+- Check context-mode install on **both sides**:
+  - Claude-side: grep `~/.claude/settings.json` or `~/.claude.json` for an MCP server entry named `context-mode` (or run `claude mcp list 2>&1 | grep context-mode`). Captured: registered or not.
+  - Codex-side: grep `~/.codex/config.json` or `~/.codex/mcp.json` for `context-mode`. Captured: registered or not.
+  - Plugin form: `[ -d ~/.claude/plugins/context-mode ]` may also be present.
+  - Capture which sides registered; report both.
+
+If `codex` missing: tell the user (do NOT auto-install):
+> "codex CLI not found. Install with `bun install -g @openai/codex && codex auth login`. The skill works without codex (Claude subagents only) but loses parallel-reviewer capability for milestone reviews."
+
+If `gstack` is missing on **either side**: **recommend install and offer to run it.**
+
+Three cases:
+
+1. **Both sides absent** → recommend full install:
+   > "gstack not installed. Strongly recommended — Gary Tan's skill pack works for both Claude Code AND codex, providing `/review`, `/office-hours`, `/plan-eng-review`, `/cso`, `/investigate`, etc. that this skill leans on heavily. The official install registers it for both:
+   >
+   > ```bash
+   > git clone --single-branch --depth 1 https://github.com/garrytan/gstack.git ~/.claude/skills/gstack && cd ~/.claude/skills/gstack && ./setup
+   > ```
+   >
+   > Run it now? (y/n)"
+
+2. **Codex-side present, Claude-side absent** (or vice versa) → recommend re-running setup:
+   > "gstack is installed for `<side present>` but not `<side missing>`. To register for both, re-run:
+   > ```bash
+   > cd ~/.claude/skills/gstack 2>/dev/null || git clone --single-branch --depth 1 https://github.com/garrytan/gstack.git ~/.claude/skills/gstack && cd ~/.claude/skills/gstack && ./setup
+   > ```
+   > This makes `/review` etc. directly invokable from Claude (faster, no codex round-trip) AND keeps the codex-side parallel-review capability. Run it? (y/n)"
+
+3. **Both sides present** → continue silently; note in summary.
+
+If user says yes to install: run the command via Bash. After completion, re-check both `[ -d ~/.claude/skills/gstack ]` and `[ -d ~/.codex/skills/gstack ]`; report what registered.
+
+If user says no: continue with whatever's installed; note in summary which gstack invocations will use Claude-direct, which will use codex-via-`exec`, and which will fall back to local prompts.
+
+If `context-mode` is missing on either side, recommend installation:
+
+> "context-mode is a strong multiplier for this controller pattern — it offloads large command outputs (diffs, test runs, greps, codex tails) to an FTS5 sandbox and lets the controller and executors query by pattern instead of pulling everything into context. Especially valuable on the codex side during `\goal` loops where shell output fills context fast. Install instructions: https://github.com/simonrowland/context-mode. Want me to walk through the install? (y/n)"
+
+If user accepts: surface the install command from the project README. After install, re-check MCP registrations on both sides; report.
+
+If user declines: continue. Note in summary that large-output handling will use direct Bash/Read tools and may consume more context per chunk.
+
+Today's date: use the conversation's `currentDate` value, format `YYYY-MM-DD`.
+
+### 2. Audit the repo via subagent (controller does NOT read docs directly)
+
+**Spawn an Explore subagent** with the prompt at `prompts/repo-audit.md`. Substitute `{{TOPIC}}` and the repo root. The subagent reads README, AGENTS.md (if exists), `docs/`, recent git log, top-level test directories, package manifests. It returns a precis (project name, 3-5 hard invariants, file map, conversation/commit style, existing AGENTS.md status, tooling).
+
+Wait for the subagent's report before scaffolding. Its report is the source of truth for the placeholders below.
+
+### 2.5. Pin the high-level goal (LOAD-BEARING)
+
+The user shouldn't need to remind future sessions what the point of `<topic>` is. Memorialize the goal here.
+
+**Ask the user:**
+> "What's the high-level goal of this `<topic>` work? In a paragraph: what does the success state look like, and what changes for the user/system when it's done?"
+
+**If the user's reply is concrete** (>2 sentences, names a measurable outcome, identifies a user/system that benefits): proceed directly to write the goal-statement file.
+
+**If the goal is fuzzy or abstract** ("just clean up X", "modernize Y", "fix the foo issue"): flag this and recommend interrogation. Three paths in priority order:
+
+1. **gstack `/office-hours` Claude-side direct** (preferred — fastest, no codex round-trip):
+   > "The goal is fuzzy — recommend running gstack `/office-hours` to interrogate. It'll ask the YC forcing questions: who's the user, what's the demand, narrowest wedge, etc. I can invoke it directly via the Skill tool. Run now? (y/n)"
+   
+   If yes: invoke `Skill(skill: "office-hours", args: "<topic-context>")`. Capture output and distill into the goal-statement file.
+
+2. **gstack `/office-hours` via codex** (when only codex-side install exists):
+   > "Same as above, but `/office-hours` isn't registered on the Claude side here — I'll invoke it via `codex exec '/office-hours <topic-context>'`. Run now? (y/n)"
+   
+   If yes: dispatch and capture stdout. Distill into the goal-statement file.
+
+3. **Local YC-style subagent fallback** (when gstack is absent on both sides):
+   Spawn a Claude subagent (Agent tool) with this prompt:
+   > "You're running a YC-style office-hours interrogation. The user is starting work on `<topic>`. From the conversation context, their starting fuzzy goal is: `<paraphrase>`. Ask them, in order: (1) Who specifically benefits when this is done? (2) What demand or pain triggered this now? (3) What's the narrowest wedge that proves it works? (4) What's the success criterion you'd test against? (5) What's explicitly NOT in scope? Drive to a one-paragraph goal statement + measurable success criteria. Output as fields ready to populate `templates/goal-statement.md.tpl`."
+
+**Write the goal-statement** to `<repo-root>/docs-private/<topic>-goal-statement-<today>.md` using `templates/goal-statement.md.tpl`. This is the load-bearing anchor; subsequent commands cite it.
+
+If the user defers ("we can figure that out later"): write a stub goal-statement with the user's fuzzy version + a `STATUS: DRAFT — needs sharpening before execute` line. decompose-plan will refuse to proceed without sharpening.
+
+### 3. Scaffold
+
+For each template, read it, substitute placeholders (`{{TOPIC}}`, `{{DATE}}`, `{{REPO_ROOT}}`, `{{PROJECT_NAME}}`, plus audit-derived values like `{{INVARIANT_*}}`), then write:
+
+| Template | Output | If exists |
+|----------|--------|-----------|
+| `templates/AGENTS.md.tpl` | `<repo-root>/AGENTS.md` | **Merge mode**: read existing; show user a diff of proposed additions/edits; ask which to apply. Never destructive. |
+| (direct create) | `<repo-root>/docs-private/.gitkeep` | skip |
+| `templates/RESUME-NOTES.tpl` | `<repo-root>/docs-private/RESUME-NOTES-<today>.md` | bump `(rev N)` |
+| `templates/worker-context.md.tpl` | `<repo-root>/docs-private/worker-context.md` | create only if AGENTS.md is huge (>1000 lines) or multiple distinct worker profiles exist; otherwise skip — executors read AGENTS.md directly |
+
+Forensics live in the harness-captured session JSONL plus the per-subagent
+JSONL plus the codex tail files plus RESUME-NOTES + git log. No separate
+`controller.log` is created; the structured-timeline view is recoverable
+via `jq` over the session JSONL when needed.
+
+The initial RESUME-NOTES should explicitly say "init complete; ready for `/goal-flight decompose-plan`" — most fields will be placeholders until decompose-plan runs.
+
+### 3.5. Build the RAG corpus (context-engineering)
+
+Now that AGENTS.md, the goal-statement, and the audit precis exist, scaffold the dispatch-time context library at `<repo-root>/docs-private/rag/` so executors stop re-reading the same domain context every dispatch and the controller stops re-pasting the same wrapper layers.
+
+Refer to `templates/rag-corpus-schema.md.tpl` for the directory shape and per-slice word budgets.
+
+#### Pre-flight gates (skip the corpus if any apply)
+
+The corpus is overhead. Skip it on projects too small or too sparse to amortize the cost. Three gates — if ANY of them trips, skip step 3.5 and continue. Surface the skip reason in the init summary so the user can override.
+
+1. **Greenfield no-source gate**: audit precis from step 2 identified <3 hard invariants AND no binding-spec / refactor-plan file exists. Slice-builders would distill empty placeholders. Defer until decompose-plan lands real chunks and decisions.
+2. **Small-project gate**: anticipated chunk count is <12 AND planned LoC delta is <5000 (estimate from goal-statement). Note the AND — only trip when both fall below. Cost (~$1-3 of subagent dispatch + 3 passes of wall-clock) IS justified for any project with sustained dispatch volume; tokens are a free good relative to quality. Bias toward building the corpus.
+3. **Sparse-doc gate**: no AGENTS.md beyond the bare template AND no `docs/` tree AND no `docs-private/` files. The audit precis would be all the source the corpus has.
+
+If skipped: print "Corpus build skipped: <reason>. Run `/goal-flight build-corpus` later when source material exists." Leave the rest of init intact.
+
+#### Source-list derivation per slice
+
+Slice-builders need their source paths pinned in the dispatch. Mapping:
+
+| Slice | Source materials (controller passes these paths to the builder) |
+|-------|----------------------------------------------------------------|
+| `invariants.md` | AGENTS.md hard-invariants section + any `tests/test_*_guards*.py` files identified by audit |
+| `file-map.md` | The audit precis's file-map section + `ls -la <repo-root>` output + project manifest (package.json / pyproject.toml / etc.) |
+| `binding-spec/<intent>.md` (one per intent) | The intent's section of the binding-spec / authority-matrix file (slice names derive from the headings in that file; controller enumerates them during pass-1 slice-builder dispatch, not later at dispatch composition time). Skip this whole subdirectory if no binding-spec exists. |
+| `patterns/<pattern>.md` (one per pattern) | The canonical implementation file (controller picks from audit's "notable patterns" or from the goal-statement's named patterns) + sibling implementations the pattern needs to be consistent with. Skip this whole subdirectory if audit identified no recurring patterns. |
+| `decisions.md` | Recent goal-queue entries with STATUS lines, recent commit messages, any inline `[Reviewer note: ...]` annotations |
+| `verification.md` | The audit precis's tooling section + actual content of any `tests/conftest.py` or `tests/test_artifact_*.py` |
+
+If the controller can't enumerate sources for a slice (e.g., no binding-spec exists), skip that slice entirely. Surface skipped slices in the init summary.
+
+#### Three-pass pipeline
+
+**Pass 1 — parallel slice builders (Claude subagents).**
+
+For each slice in the source-list table above where sources exist:
+- Dispatch one Claude subagent (Agent tool, general-purpose, `model: "opus"` for code-adjacent slices like `patterns/*` and `verification.md`, **also `decisions.md`** because its content is read by every Reviewer + Planner dispatch downstream so quality matters; default model only for the simplest prose slices).
+- Use `prompts/rag-slice-builder.md` as the dispatch template.
+- Pass the source-material absolute paths from the table above.
+- Each subagent writes its slice to `docs-private/rag/<filename>` and reports back.
+
+Spawn all in parallel; cap at ~10 concurrent subagents to avoid noise. Smaller projects: 4-6 slices; larger ones: 10-15.
+
+**Pass 2 — per-slice review (Claude subagents, parallel).**
+
+For each slice that pass 1 produced:
+- Spawn a reviewer subagent with `prompts/rag-slice-review.md`.
+- Reviewer reads the slice + its source materials AND verifies any grep patterns the slice claims work against the actual code.
+- Reports P0/P1/P2/P3 findings, including a `Dispatch-readiness` category (does the slice match its schema's per-slice format?).
+
+If any P0/P1: re-dispatch the corresponding slice-builder with findings as input, OR patch directly if small (controller decides).
+
+**Pass 3 — cross-slice consolidation (one Claude Opus 1M-context pass; codex fallback).**
+
+After all per-slice reviews are clean:
+- Default: dispatch a single Claude Opus subagent (Agent tool, `model: "opus"`) with `prompts/rag-cross-slice-consolidation.md`. Pass absolute paths of every corpus file. Opus's 1M context holds the aggregate corpus (~12 KB max for a typical project) cleanly; reliability is higher than codex.
+- Fallback (codex): only if you specifically want a model-diversity second opinion, or Claude Opus is unavailable. Codex command pattern: `codex exec '<contents of prompts/rag-cross-slice-consolidation.md, with each corpus file's ABSOLUTE path enumerated and "cd <repo-root>" prefixed>' > /tmp/goal-flight-rag-consolidation-<topic>-<iso>.txt 2>&1 &`. Tail or wait.
+- Apply any P0/P1 fixes; surface P2/P3 as TODO comments in the affected slice.
+
+**Pass 4 — final assessment (one Claude Opus subagent).**
+
+After Pass 3 fixes are applied, dispatch one final-assessment subagent with `prompts/rag-final-assessment.md`. It:
+- Aggregates per-slice reviewer scores into a quality dashboard (the reviewers emitted these per the score rubric in `prompts/rag-slice-review.md`).
+- Walks through a hypothetical cold-executor dispatch to identify residual gaps.
+- Recommends next-wave priorities.
+- Issues a CORPUS IS DISPATCH-READY / NEEDS-MORE-ITERATION verdict.
+
+The quality dashboard goes into RESUME-NOTES as a small table; the next-wave priorities feed the next iteration of step 3.5 (or a user-triggered `/goal-flight build-corpus --next-wave`).
+
+**Outcome**: `docs-private/rag/` is now populated, reviewed, and scored. Future dispatches paste from these slices instead of reconstructing context from scratch. The controller's context budget is preserved for integration, requirements adjudication, and graph-orientation calls.
+
+### 4. Ensure gitignore
+
+Read `<repo-root>/.gitignore`. If `docs-private/` is not present, append it. Ask the user before adding `AGENTS.md` to `.gitignore` (some teams keep it tracked).
+
+### 5. Self-review the init output
+
+**Spawn a second subagent** (Explore) to audit what init produced. Prompt it:
+
+> "init just scaffolded `<repo-root>/AGENTS.md` and `<repo-root>/docs-private/worker-context.md` based on a repo audit. Read both files plus the audit report below. Identify: (a) invariants the codebase enforces (in tests or guard rails) that aren't captured in either file; (b) file-map gaps; (c) anything in the conversation-style section that contradicts the existing commit log. Report under 300 words; format as TODO list the controller can paste into AGENTS.md."
+
+If the self-review finds gaps, surface them to the user as a TODO comment block at the end of AGENTS.md (HTML comment so it doesn't render in viewers). Do not edit AGENTS.md to fix the gaps automatically — let the user decide.
+
+### 6. Print summary
+
+- Files created / modified (one path per line).
+- Codex install status (path + version, or "missing — install command above").
+- gstack install status (installed / installed-during-init / declined — using fallback prompts).
+- Audit subagent's high-level findings (project type, invariant count, AGENTS.md status).
+- Goal statement status (concrete / interrogated-via-office-hours / DRAFT — sharpen before execute).
+- Self-review TODOs (if any), with the AGENTS.md location they'll appear at.
+- Suggested next step: `/goal-flight decompose-plan <plan-file>` (or "decompose the plan you already discussed in this session"). If goal-statement is DRAFT: "decompose-plan will refuse until the goal is sharpened."
