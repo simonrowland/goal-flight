@@ -347,6 +347,65 @@ If codex isn't installed, is older than `0.128.0`, or has `features.goals` disab
 
 5. **Iteration cap** — default 5–8 per chunk; configurable via a `[max-iterations:<N>]` chunk tag in the goal-queue. Past the cap, the chunk is fighting something the iteration can't resolve (architectural mismatch, missing context, ambiguous Acceptance criteria, or an out-of-scope dependency). Mark `[BLOCKED:<reason>]` in the queue, notify user via `osascript` (per `SKILL.md` notification rule), and move on. The in-progress patch and the last iteration's blockers list are durable in git (uncommitted) + RESUME-NOTES — the user can resume manually.
 
+**Parsing the Final response from each iteration's JSONL transcript:** when the Agent dispatch completes, the harness sends a `task-notification` with the path to the subagent's JSONL transcript (typically `~/.claude/projects/<encoded-repo>/subagents/agent-<id>.jsonl` per the SKILL.md forensics note). The controller reads that path **after** the notification arrives — never poll during the run. The last `assistant` message in the JSONL, immediately before the `done` event, contains the Final response block per the goal-prompt schema. Extract: `Goal complete: <true|false>`, `Memo path: <...>`, `Dirty files: <...>`, `Blockers: <...>`. That's the iteration's verdict; the rest of the transcript (intermediate tool calls, reasoning) is forensic only — do not pull it into the controller's context unless debugging a stuck loop.
+
+### Fallback: Grok iteration loop (shell-based alternative to Opus iteration)
+
+Same controller-as-loop pattern, but the dispatch target is the Grok CLI (`grok -p ...`) instead of the Agent tool. Useful when you want model diversity in the iteration (Grok's blind spots differ from Opus's), when Grok-account billing is cheaper than Claude session billing for the workload, or when codex isn't set up but Grok is. Like the codex `/goal` dispatch, Grok runs as a shell tool with file-backed I/O — the same tail-friendly observability story applies.
+
+**Pre-requirements** (verify in `commands/init.md` step 1):
+
+- `command -v grok` → capture version. Surface in init summary.
+- Grok account authenticated (`grok login` or equivalent — check Grok docs for the current login subcommand).
+
+**Dispatch shape (one iteration):**
+
+```bash
+# Render the goal-prompt from templates/codex-goal-prompt.md.tpl with the
+# Iteration <N> of <MAX> + Prior progress preamble (same composition as
+# the Opus iteration loop above).
+GOAL_FILE=/tmp/goal-flight-goal-<slug>-iter<N>-<iso>.md
+RESPONSE=/tmp/goal-flight-goal-<slug>-iter<N>-<iso>.response.json
+STDERR=/tmp/goal-flight-goal-<slug>-iter<N>-<iso>.stderr.log
+
+grok -p --output-format json \
+  --model grok-build \
+  --disable-slash-commands \
+  < "$GOAL_FILE" > "$RESPONSE" 2> "$STDERR" &
+PID=$!
+```
+
+Key flags:
+
+- `-p` — non-interactive print mode (no TUI, no REPL).
+- `--output-format json` — structured output, easier to parse than free-form text. The Final response block ends up in a deterministic field rather than mixed with reasoning.
+- `--model grok-build` — code-writing model. Substitute the current Grok model name if it changes; verify with `grok --help`.
+- `--disable-slash-commands` — Grok's session-level slash commands (analogous to codex's `/clear`, `/compact`, etc.) get noise-free when the prompt is the only input. Keep for agent-to-agent use.
+- `< "$GOAL_FILE"` — prompt via stdin redirection. Same reason as codex `/goal`: bypasses any CLI argument length limit; survives Grok's in-session compaction if Grok auto-compacts long runs.
+
+**Iteration loop logic:** identical to the Opus iteration loop above. Wait for the `RESPONSE` file's process to exit (`wait $PID` or check that the file's final JSON object is complete), parse the JSON for the Final response block, branch on `Goal complete: true/false`, re-dispatch with updated preamble if continuation needed. Iteration cap and `[BLOCKED:<reason>]` escalation behave the same way.
+
+**Parsing the Grok response:** Grok's `--output-format json` emits one JSON object per assistant turn. The final object contains the closing assistant message — that's where the Final response block lives. Parse with `jq` for robustness:
+
+```bash
+jq -r '.messages[-1].content' "$RESPONSE" | tail -40
+```
+
+Or extract specific fields if Grok exposes them as structured keys.
+
+**When to pick Grok iteration vs Opus iteration:**
+
+| Factor | Opus iteration | Grok iteration |
+|---|---|---|
+| Dispatch surface | Agent tool (Claude session billing) | Shell tool (Grok account billing) |
+| Observability | JSONL transcript via task-notification | tail-friendly response.json + stderr.log live |
+| Model | Claude Opus | Grok (grok-build or current code model) |
+| Blind spots | Claude's | Grok's — useful for model diversity in stuck loops |
+| Setup | None (Agent tool is built into Claude Code) | `grok` CLI must be installed and authenticated |
+| Compaction risk | Per-iteration context (isolated; clean per-call) | Per-iteration context (isolated; clean per-call) |
+
+Both are external loops driven by the controller — pick whichever fits the chunk's model needs and your billing constraints. Mixing them across iterations of the same chunk works too (iteration 1 Opus, iteration 2 Grok if the first stalled on a blind spot Grok handles better) — but flag this as `[mixed-executor]` in the goal-queue so RESUME-NOTES forensics are tractable.
+
 **When to pick which path:**
 
 - **codex `/goal` mode** if available and chunk warrants ≥ 3 iterations of plan/act/test. The persistent session is materially cheaper at that scale (one model invocation amortized across the whole loop).

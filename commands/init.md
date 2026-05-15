@@ -14,6 +14,7 @@ Run in parallel:
 - `git rev-parse --show-toplevel` → bail if not a git repo.
 - `command -v codex` → capture path. If present, also capture `codex --version` (e.g. `codex-cli 0.130.0`) and record it in the init summary — codex CLI behaviour shifts between versions (flag names, MCP semantics, plugin defaults), and the dispatch-shape assumptions in `reference/pattern.md` are pinned to a version. RESUME-NOTES forensics later are easier with the version recorded.
 - `command -v bun` → capture version.
+- `command -v grok` → capture path + `grok --version` if present. Grok is a peer dispatch target for `/goal`-mode chunks via the Opus/Grok iteration loop fallback (see `reference/pattern.md` §Fallback: Grok iteration loop). If absent, the skill still works — Opus iteration (via Agent tool) is the no-extra-install fallback. If present, surface availability in the summary so the controller knows the model-diversity option is available for stuck-iteration recovery.
 - Check gstack install on the **Claude side** (the controller side) plus codex side for parallel-reviewer milestone use:
   - Claude-side: `[ -d ~/.claude/skills/gstack ]`
   - Codex-side: `[ -d ~/.codex/skills/gstack ]`
