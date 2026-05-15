@@ -58,6 +58,18 @@ If user accepts: surface the install command from the project README. After inst
 
 If user declines: continue. Note in summary that large-output handling will use direct Bash/Read tools and may consume more context per chunk.
 
+**Register the project as codex-trusted** (one-time, idempotent — prevents codex MCP approval-gate stalls in non-interactive dispatches):
+
+- Resolve the goal-flight skill root: `SKILL_ROOT=$(dirname "$(readlink -f ~/.claude/skills/goal-flight 2>/dev/null || echo ~/.claude/skills/goal-flight/SKILL.md)")` — or just `~/Repos/goal-flight` if installed locally.
+- Run `bash "$SKILL_ROOT/scripts/install-codex-overrides.sh" --check` against the project root. Three outcomes:
+
+  1. **Already trusted** (exit 0): report `codex trust: registered for <repo-root>` in the env summary; continue.
+  2. **Codex not installed**: skip silently; no stall risk possible.
+  3. **Codex installed but project missing trust** (exit 1): recommend install:
+     > "codex `exec` will stall on the MCP approval gate in this project without a one-line user-config trust entry. I can register it via `bash <skill-root>/scripts/install-codex-overrides.sh` — adds a `[projects.\"<abs>\"].trust_level = \"trusted\"` block to `~/.codex/config.toml` (worktrees inherit via path prefix). Run now? (y/n)"
+     - If yes: run the install. Re-check; report.
+     - If no: continue, BUT note in env summary that every codex dispatch in this project must include `--ignore-user-config` (see `reference/pattern.md` §Codex reliability fallback shape), which loses MCP tool access during the dispatch.
+
 Today's date: use the conversation's `currentDate` value, format `YYYY-MM-DD`.
 
 ### 2. Audit the repo via subagent (controller does NOT read docs directly)
@@ -83,7 +95,7 @@ The user shouldn't need to remind future sessions what the point of `<topic>` is
    If yes: invoke `Skill(skill: "office-hours", args: "<topic-context>")`. Capture output and distill into the goal-statement file.
 
 2. **gstack `/office-hours` via codex** (when only codex-side install exists):
-   > "Same as above, but `/office-hours` isn't registered on the Claude side here — I'll invoke it via `timeout 300 codex exec --ignore-user-config '/office-hours <topic-context>'`. Run now? (y/n)"
+   > "Same as above, but `/office-hours` isn't registered on the Claude side here — I'll invoke it via `timeout 300 codex exec '/office-hours <topic-context>'`. Run now? (y/n)"
    
    If yes: dispatch and capture stdout. Distill into the goal-statement file.
 
@@ -169,7 +181,7 @@ If any P0/P1: re-dispatch the corresponding slice-builder with findings as input
 
 After all per-slice reviews are clean:
 - Default: dispatch a single Claude Opus subagent (Agent tool, `model: "opus"`) with `prompts/rag-cross-slice-consolidation.md`. Pass absolute paths of every corpus file. Opus's 1M context holds the aggregate corpus (~12 KB max for a typical project) cleanly; reliability is higher than codex.
-- Fallback (codex): only if you specifically want a model-diversity second opinion, or Claude Opus is unavailable. Codex command pattern: `timeout --kill-after=10 300 codex exec --ignore-user-config '<contents of prompts/rag-cross-slice-consolidation.md, with each corpus file's ABSOLUTE path enumerated and "cd <repo-root>" prefixed>' > /tmp/goal-flight-rag-consolidation-<topic>-<iso>.txt 2>&1 &`. Tail or wait. (See `reference/pattern.md` §Codex reliability for why `--ignore-user-config` and `timeout` are required.)
+- Fallback (codex): only if you specifically want a model-diversity second opinion, or Claude Opus is unavailable. Codex command pattern: `timeout --kill-after=10 300 codex exec '<contents of prompts/rag-cross-slice-consolidation.md, with each corpus file's ABSOLUTE path enumerated and "cd <repo-root>" prefixed>' > /tmp/goal-flight-rag-consolidation-<topic>-<iso>.txt 2>&1 &`. Tail or wait. (Assumes the project has been registered as codex-trusted in step 1; otherwise add `--ignore-user-config`. See `reference/pattern.md` §Codex reliability.)
 - Apply any P0/P1 fixes; surface P2/P3 as TODO comments in the affected slice.
 
 **Pass 4 — final assessment (one Claude Opus subagent).**
@@ -184,42 +196,56 @@ The quality dashboard goes into RESUME-NOTES as a small table; the next-wave pri
 
 **Outcome**: `docs-private/rag/` is now populated, reviewed, and scored. Future dispatches paste from these slices instead of reconstructing context from scratch. The controller's context budget is preserved for integration, requirements adjudication, and graph-orientation calls.
 
-### 4. Ensure gitignore
+### 4. Ensure gitignore + AGENTS.md tracked
 
-Read `<repo-root>/.gitignore`. If `docs-private/` is not present, append it. Ask the user before adding `AGENTS.md` to `.gitignore` (some teams keep it tracked).
+Read `<repo-root>/.gitignore`.
+
+- If `docs-private/` is not present, append it. (docs-private holds dated per-session state — RESUME-NOTES, goal-queue, goal-statement, rag/ — which is correctly per-machine and should not be tracked.)
+- **AGENTS.md should be tracked, not gitignored.** The worktree story is the key reason: tracked files propagate to every worktree's checkout automatically; gitignored files do not, so a controller or executor spawned inside a worktree silently has no AGENTS.md to read, defeating the auto-load directive in step 4.5. The CLAUDE.md pointer in 4.5 is also worktree-correct only when its target (AGENTS.md) propagates.
+  - If AGENTS.md is currently listed in `.gitignore`: ask the user *"AGENTS.md is gitignored, which means it won't appear in worktree checkouts and the auto-read directive will silently fail there. Remove from .gitignore so it propagates? (y/n)"*. Default yes.
+  - If AGENTS.md is not gitignored but is also not yet committed: note in summary; suggest the user `git add AGENTS.md` and commit on their next commit.
+  - If the user prefers gitignored AGENTS.md (some teams do — competitive content, privacy, license): note in summary that worktrees won't auto-inherit AGENTS.md and the user is responsible for symlinking (`ln -s <main>/AGENTS.md <worktree>/AGENTS.md`) or copying per worktree, OR running every controller from the main worktree only.
 
 ### 4.5. Ensure AGENTS.md will be auto-read by future sessions
 
-Claude Code does not auto-load `AGENTS.md` the way it auto-loads `CLAUDE.md` (Codex does load AGENTS.md natively; Claude Code currently does not). To make AGENTS.md reliably the first thing every future controller and executor reads, ensure a CLAUDE.md exists with a directive pointing at it.
+Claude Code does not auto-load `AGENTS.md` the way it auto-loads `CLAUDE.md` (Codex loads AGENTS.md natively; Claude Code currently does not). To make AGENTS.md reliably the first thing every future controller and executor reads, ensure a CLAUDE.md exists with a directive pointing at it.
 
-Two options, in priority order:
+**First, check what's already in place:**
 
-1. **Project-level `<repo-root>/CLAUDE.md`** (preferred — propagates to teammates via git, assuming CLAUDE.md is tracked).
-   - If `CLAUDE.md` exists at the repo root: read it. If it doesn't already reference AGENTS.md, propose appending:
-     ```
-     ## Read AGENTS.md first
-     This project pins agent operating instructions in `AGENTS.md` at the repo root.
-     Read it before doing any work — it carries the project invariants, file map,
-     and conversation style that shape everything downstream.
-     ```
-     Show the diff and ask before applying.
-   - If no project CLAUDE.md exists: ask the user *"Create `<repo-root>/CLAUDE.md` with the AGENTS.md directive? (y/n)"*. If yes, write the snippet above. If no, fall back to option 2.
+- Global directive: `grep -l "AGENTS.md" ~/.claude/CLAUDE.md 2>/dev/null` — if present, the user has a machine-wide rule.
+- Project directive: `grep -l "AGENTS.md" <repo-root>/CLAUDE.md 2>/dev/null` — if present, the project has a per-repo rule.
 
-2. **Global `~/.claude/CLAUDE.md`** (per-machine; no team propagation; useful if the project CLAUDE.md is owned by another team or shouldn't be touched).
-   - Check if it already contains an AGENTS.md auto-read directive (grep for `AGENTS.md` in the file). If yes, you're done — note it in the summary.
-   - If not, propose adding:
-     ```
-     # session start
-     At session start in any project, if `AGENTS.md` exists at the repo root,
-     read it before doing other work — it carries the project invariants, file map,
-     and conversation style that shape everything downstream. Claude Code does not
-     auto-load AGENTS.md; this makes the behavior symmetric with Codex. If working
-     inside a git worktree where AGENTS.md is gitignored and absent, also check
-     the parent project root.
-     ```
-     Note this affects every project on the user's machine. Apply only with explicit consent.
+**Then dispatch on what's there:**
 
-If both options are declined: note in summary that AGENTS.md will need to be Read manually at the start of each future session, OR be invoked via `/goal-flight` (which always Reads it). Future controllers/executors that don't go through the skill won't pick it up.
+| Global has it? | Project has it? | Action |
+|----------------|-----------------|--------|
+| Yes | Yes | Done. Note both in summary. |
+| Yes | No | Ask: *"Your global CLAUDE.md already auto-reads AGENTS.md, so this works for you on this machine. Want to also add a project-level pointer in `<repo-root>/CLAUDE.md`? It propagates to teammates via git so they get the same behavior. (y/n)"* |
+| No | Yes | Ask: *"Project CLAUDE.md auto-reads AGENTS.md, so any session in this repo works. Want to also add it to your global `~/.claude/CLAUDE.md` so other projects of yours benefit? (y/n)"* |
+| No | No | **Ask scope explicitly:** *"To make AGENTS.md auto-load reliably, I can add a directive to: (1) global `~/.claude/CLAUDE.md` — once, all your projects benefit, no team propagation; (2) project `<repo-root>/CLAUDE.md` — only this repo, propagates to teammates via git; (3) both — belt-and-suspenders, useful if you sometimes work without your global config. Which?"* |
+
+**Snippet for project-level CLAUDE.md** (if user picks project or both):
+```
+## Read AGENTS.md first
+This project pins agent operating instructions in `AGENTS.md` at the repo root.
+Read it before doing any work — it carries the project invariants, file map,
+and conversation style that shape everything downstream.
+```
+If a project CLAUDE.md already exists, append; show the diff and ask before applying. If not, create it.
+
+**Snippet for global ~/.claude/CLAUDE.md** (if user picks global or both):
+```
+# session start
+At session start in any project, if `AGENTS.md` exists at the repo root,
+read it before doing other work — it carries the project invariants, file map,
+and conversation style that shape everything downstream. Claude Code does not
+auto-load AGENTS.md; this makes the behavior symmetric with Codex. If working
+inside a git worktree where AGENTS.md is gitignored and absent, also check
+the parent project root.
+```
+Append (don't overwrite); show the diff and ask before applying. Note this affects every project on this machine.
+
+If user declines all options: note in summary that AGENTS.md will need to be Read manually at the start of each future session, OR be invoked via `/goal-flight` (which always Reads it). Future controllers / executors that don't go through the skill won't pick it up.
 
 ### 5. Self-review the init output
 

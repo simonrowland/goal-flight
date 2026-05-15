@@ -138,11 +138,11 @@ Both reviewers use the same gstack `/review` framing (when installed) for consis
 
 - If gstack registered on codex side:
   ```bash
-  timeout --kill-after=10 300 codex exec --ignore-user-config '/review <start-hash>..<end-hash>. Reference: AGENTS.md, docs-private/<topic>-goal-statement-*.md, docs-private/<topic>-goal-queue-*.md. Output findings as P0/P1/P2/P3.' > /tmp/goal-flight-gstack-codex-<topic>-<iso>.txt 2>&1 &
+  timeout --kill-after=10 300 codex exec '/review <start-hash>..<end-hash>. Reference: AGENTS.md, docs-private/<topic>-goal-statement-*.md, docs-private/<topic>-goal-queue-*.md. Output findings as P0/P1/P2/P3.' > /tmp/goal-flight-gstack-codex-<topic>-<iso>.txt 2>&1 &
   ```
 - If gstack absent on codex side:
   ```bash
-  timeout --kill-after=10 300 codex exec --ignore-user-config '<contents of prompts/gstack-codex-challenge.md, with commit range and goal-queue path pasted in>' > /tmp/goal-flight-gstack-codex-<topic>-<iso>.txt 2>&1 &
+  timeout --kill-after=10 300 codex exec '<contents of prompts/gstack-codex-challenge.md, with commit range and goal-queue path pasted in>' > /tmp/goal-flight-gstack-codex-<topic>-<iso>.txt 2>&1 &
   ```
 
 Capture PID; poll temp file for completion.
@@ -150,7 +150,7 @@ Capture PID; poll temp file for completion.
 **Optional third pass** for security-relevant changes (touches auth, sessions, input handling, SQL, deserialization) — gstack `/cso`:
 
 - Claude-side: `Skill(skill: "cso", args: "<start-hash>..<end-hash>")` if registered, else dispatch subagent.
-- Codex-side: `timeout --kill-after=10 300 codex exec --ignore-user-config '/cso <start-hash>..<end-hash>' > /tmp/goal-flight-gstack-cso-<topic>-<iso>.txt 2>&1 &` if registered.
+- Codex-side: `timeout --kill-after=10 300 codex exec '/cso <start-hash>..<end-hash>' > /tmp/goal-flight-gstack-cso-<topic>-<iso>.txt 2>&1 &` if registered.
 
 **Fourth pass — RAG corpus drift review** (when `docs-private/rag/` exists from init step 3.5):
 

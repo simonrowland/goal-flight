@@ -51,11 +51,11 @@ Render `templates/goal-queue.tpl` with the drafted chunks and `[parallel-safe:<g
 
 - If gstack registered on codex side (`~/.codex/skills/gstack/` exists):
   ```bash
-  timeout --kill-after=10 300 codex exec --ignore-user-config '/plan-eng-review <path to docs-private/<topic>-goal-queue-<today>.md>. Reference: docs-private/<topic>-goal-statement-*.md, AGENTS.md.' > /tmp/goal-flight-decomp-codex-<topic>.txt 2>&1 &
+  timeout --kill-after=10 300 codex exec '/plan-eng-review <path to docs-private/<topic>-goal-queue-<today>.md>. Reference: docs-private/<topic>-goal-statement-*.md, AGENTS.md.' > /tmp/goal-flight-decomp-codex-<topic>.txt 2>&1 &
   ```
 - If gstack absent on codex side:
   ```bash
-  timeout --kill-after=10 300 codex exec --ignore-user-config '<contents of prompts/decomposition-review.md, with the plan + drafted decomposition pasted in>' > /tmp/goal-flight-decomp-codex-<topic>.txt 2>&1 &
+  timeout --kill-after=10 300 codex exec '<contents of prompts/decomposition-review.md, with the plan + drafted decomposition pasted in>' > /tmp/goal-flight-decomp-codex-<topic>.txt 2>&1 &
   ```
 
 Capture the PID. The output goes to a temp file.

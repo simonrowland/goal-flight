@@ -133,19 +133,35 @@ Without context-mode, you're using Bash + Read directly and need to be more care
 
 ## Codex reliability
 
-`codex exec` can stall silently in non-interactive use. Root cause when context-mode is installed (per `docs-private/codex-stall-investigation-2026-05-15.md`): `~/.codex/config.toml` declares context-mode MCP servers with `approval_mode = "approve"`. In a non-interactive `codex exec`, the first MCP tool call (e.g. `ctx_search`) blocks forever waiting for an approval click that never arrives — manifests as zero-byte tail file, PID alive, ~0% CPU. Healthy baseline measured on this machine: p50 ~10 s, p95 ~25 s across small/medium/large prompts (300 s hard ceiling gives 10× headroom).
+`codex exec` can stall silently in non-interactive use. Root cause: when `~/.codex/config.toml` declares MCP servers (e.g. context-mode) with per-tool `approval_mode = "approve"`, the first MCP tool call in a non-interactive `codex exec` blocks forever — codex waits for an approval click that has no TTY surface to arrive on. Manifests as zero-byte tail file, PID alive, ~0% CPU. Healthy baseline measured on this machine: p50 ~10 s, p95 ~25 s across small/medium/large prompts (300 s hard ceiling gives 10× headroom).
 
-**Primary fix — `--ignore-user-config` on every dispatch:**
+**Primary fix — register the project as codex-trusted (one-time per project):**
+
+```bash
+bash <goal-flight-root>/scripts/install-codex-overrides.sh
+```
+
+Adds a `[projects."<ABS>"].trust_level = "trusted"` block to `~/.codex/config.toml`. Codex auto-approves MCP tool calls when the cwd at exec time is inside a trusted project. Path matching is prefix-based, so `.claude/worktrees/*` and any other subdirectory inherits trust from the project root automatically — **no per-worktree registration needed.** `commands/init.md` invokes this script during environment validation; re-run manually if the project moved or `~/.codex/config.toml` was rebuilt. The script also mirrors the trust block to `<project>/.codex/config.toml` for self-documentation (suppress with `--no-project-mirror`).
+
+**Dispatch shape (assumes trust is registered):**
 
 ```bash
 TAIL=/tmp/goal-flight-<purpose>-<topic>-<iso>.txt
-timeout --kill-after=10 300 codex exec --ignore-user-config '<prompt>' > "$TAIL" 2>&1 &
+timeout --kill-after=10 300 codex exec '<prompt>' > "$TAIL" 2>&1 &
 PID=$!
 ```
 
-`--ignore-user-config` skips `~/.codex/config.toml` (MCP servers, `approval_mode`, hooks); the dispatch runs against codex defaults. Filesystem-installed skills (e.g. gstack at `~/.codex/skills/gstack/`) remain available. `timeout 300` enforces a hard wall-clock ceiling — codex v0.130.0 has no `--timeout` flag.
+`timeout 300` enforces a hard wall-clock ceiling — codex v0.130.0 has no `--timeout` flag. Codex uses the user's preferred model + reasoning settings from `~/.codex/config.toml`; context-mode MCP tools remain available to the dispatched session.
 
-**Backstop watchdog** for residual rare stalls that aren't MCP-approval (network wedge, codex-internal hang):
+**Fallback if the project can't be registered as trusted** (shared machine, one-off invocation, or `~/.codex/config.toml` shouldn't be mutated):
+
+```bash
+timeout --kill-after=10 300 codex exec --ignore-user-config '<prompt>' > "$TAIL" 2>&1 &
+```
+
+`--ignore-user-config` skips the entire `~/.codex/config.toml` (MCP servers, approval_mode, hooks); the dispatch runs against codex defaults. Filesystem-installed skills (e.g. gstack at `~/.codex/skills/gstack/`) remain available, but **MCP tools (context-mode etc.) become unavailable to the dispatched codex session** — the trust-based fix is strictly preferable when feasible.
+
+**Backstop watchdog** for residual rare stalls that aren't MCP-approval (network wedge, codex-internal hang) — useful regardless of which dispatch shape you pick:
 
 ```bash
 ( prev=0; idle=0
@@ -174,17 +190,17 @@ Detection thresholds (numeric, derived from observed baseline; 30 s polling cade
 **Pre-flight check** at the top of each milestone-review batch:
 
 ```bash
-timeout 30 codex exec --ignore-user-config 'Respond with OK and stop.' > /dev/null 2>&1 \
+timeout 30 codex exec 'Respond with OK and stop.' > /dev/null 2>&1 \
   || echo "codex not reachable — going Claude-only this milestone"
 ```
 
-If pre-flight fails or stalls, skip codex for the batch and run reviewers Claude-only.
+If pre-flight fails or stalls, skip codex for the batch and run reviewers Claude-only. (If pre-flight stalls specifically with zero-byte output, the project is likely not registered as trusted — run `scripts/install-codex-overrides.sh` and retry.)
 
 ## Subagent observability
 
 Subagents are inherently hard to observe (you can't watch them work in real time the way you watch your own tool calls scroll), but the skill's dispatch shapes give you two ways to peek:
 
-- **Codex side (tail-friendly by design).** All codex dispatches use `timeout --kill-after=10 300 codex exec --ignore-user-config '...' > /tmp/goal-flight-<purpose>-<topic>-<iso>.txt 2>&1 &` and capture the PID (see §Codex reliability above for why `--ignore-user-config` and `timeout` are required, plus the optional stall-watchdog). The user (or controller) can `tail -f /tmp/goal-flight-*.txt` to watch progress in another terminal. This is how the gstack milestone reviewer is wired in `commands/execute.md` and `commands/decompose-plan.md`. Useful when you want to see whether codex is making forward progress or has stalled silently.
+- **Codex side (tail-friendly by design).** All codex dispatches use `timeout --kill-after=10 300 codex exec '...' > /tmp/goal-flight-<purpose>-<topic>-<iso>.txt 2>&1 &` and capture the PID (see §Codex reliability above for the trust-registration sidecar that prevents MCP approval-gate stalls, plus the optional backstop watchdog and the `--ignore-user-config` fallback shape). The user (or controller) can `tail -f /tmp/goal-flight-*.txt` to watch progress in another terminal. This is how the gstack milestone reviewer is wired in `commands/execute.md` and `commands/decompose-plan.md`. Useful when you want to see whether codex is making forward progress or has stalled silently.
 - **Claude subagent side (observable but discouraged).** Agent-tool dispatches write their full JSONL transcript to a harness-managed path that appears in the `task-notification` message when the subagent completes. You CAN read this for forensic debugging after the fact. You should NOT poll it during the run (see "do not poll" below) — partial transcripts give unreliable progress signal and risk filling your context with raw subagent output.
 
 The asymmetry is real: codex output is human-tail-friendly; Claude subagent output is harness-managed and notification-driven. Both are observable; the operational discipline is different.
