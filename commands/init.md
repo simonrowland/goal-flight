@@ -181,7 +181,15 @@ If any P0/P1: re-dispatch the corresponding slice-builder with findings as input
 
 After all per-slice reviews are clean:
 - Default: dispatch a single Claude Opus subagent (Agent tool, `model: "opus"`) with `prompts/rag-cross-slice-consolidation.md`. Pass absolute paths of every corpus file. Opus's 1M context holds the aggregate corpus (~12 KB max for a typical project) cleanly; reliability is higher than codex.
-- Fallback (codex): only if you specifically want a model-diversity second opinion, or Claude Opus is unavailable. Codex command pattern: `timeout --kill-after=10 300 codex exec '<contents of prompts/rag-cross-slice-consolidation.md, with each corpus file's ABSOLUTE path enumerated and "cd <repo-root>" prefixed>' > /tmp/goal-flight-rag-consolidation-<topic>-<iso>.txt 2>&1 &`. Tail or wait. (Assumes the project has been registered as codex-trusted in step 1; otherwise add `--ignore-user-config`. See `reference/pattern.md` §Codex reliability.)
+- Fallback (codex): only if you specifically want a model-diversity second opinion, or Claude Opus is unavailable. Codex command pattern — point codex at the prompts file, don't paste it into the exec arg:
+
+```bash
+timeout --kill-after=10 300 codex exec \
+  "cd <repo-root> && (Read ~/.claude/skills/goal-flight/prompts/rag-cross-slice-consolidation.md in full and execute it. The corpus files to consolidate are at <repo-root>/docs-private/rag/ — enumerate them yourself with \`ls docs-private/rag/**/*.md\`. If your context compacts mid-pass, re-read the prompts file — it is the unparaphrased source of truth.)" \
+  > /tmp/goal-flight-rag-consolidation-<topic>-<iso>.txt 2>&1 &
+```
+
+Tail or wait. The pointer-based shape avoids spamming the controller's tokens with pre-pasted prompt content + corpus file paths, and survives codex session compaction (codex can re-Read the file). Assumes the project has been registered as codex-trusted in step 1; otherwise add `--ignore-user-config`. See `reference/pattern.md` §Codex reliability.
 - Apply any P0/P1 fixes; surface P2/P3 as TODO comments in the affected slice.
 
 **Pass 4 — final assessment (one Claude Opus subagent).**

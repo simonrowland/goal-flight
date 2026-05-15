@@ -157,11 +157,42 @@ Adds a `[projects."<ABS>"].trust_level = "trusted"` block to `~/.codex/config.to
 
 ```bash
 TAIL=/tmp/goal-flight-<purpose>-<topic>-<iso>.txt
-timeout --kill-after=10 300 codex exec '<prompt>' > "$TAIL" 2>&1 &
+timeout --kill-after=10 300 codex exec '<short prompt with file pointers>' > "$TAIL" 2>&1 &
 PID=$!
 ```
 
 `timeout 300` enforces a hard wall-clock ceiling — codex v0.130.0 has no `--timeout` flag. Codex uses the user's preferred model + reasoning settings from `~/.codex/config.toml`; context-mode MCP tools remain available to the dispatched session.
+
+**Keep the prompt short — pass pointers, not pre-pasted content.** This isn't just about codex's CLI argument size; it's about three coupled problems:
+
+1. **Controller token spam.** A 6–11 KB wrapper means the controller is composing 6–11 KB of context every dispatch and burning its own tokens to render it. The dispatched agent is fully capable of reading the source files itself; the controller's job is to point at them, not to pre-digest them.
+2. **Staleness clobbers correctness.** Controller-composed "facts" (file:line refs, function signatures, invariant restatements) drift from current main on the timescale of minutes. Frontier models trust pasted text because the controller is upstream in the trust hierarchy. Pointers force the agent to re-verify against live disk and surface drift.
+3. **Codex session compaction.** Long dispatches can compact mid-run; codex's auto-summary will paraphrase any inline goal text. If the goal lives in the codex exec arg only, the unparaphrased original is lost. If the dispatch tells codex to Read files on disk, the post-compaction codex can re-Read those files — they're still ground truth.
+
+Concretely, prefer:
+
+```bash
+# Good: short, pointer-shaped — codex Reads what it needs at the time it needs it.
+timeout --kill-after=10 300 codex exec \
+  '/review <start-hash>..<end-hash>. Read AGENTS.md and the most recent
+   docs-private/<topic>-goal-statement-*.md / docs-private/<topic>-goal-queue-*.md
+   files. Output P0/P1/P2/P3.' \
+  > "$TAIL" 2>&1 &
+```
+
+over:
+
+```bash
+# Avoid: monster inline prompt with pre-pasted file contents.
+timeout --kill-after=10 300 codex exec \
+  "$(cat <<'PROMPT'
+   /review <range>. <full AGENTS.md pasted here>. <full goal-statement pasted>.
+   <pasted goal-queue Progress table>. <pasted binding-spec excerpts>...
+PROMPT
+)" > "$TAIL" 2>&1 &
+```
+
+For dispatch shapes that need to hand codex a substantial template (e.g. `prompts/gstack-codex-challenge.md`, `prompts/decomposition-review.md`, `prompts/rag-cross-slice-consolidation.md`), point codex at the file path on disk — it Reads the file itself, re-Reads on compaction. See `prompts/dispatch-wrapper.md` for the full verification-first wrapper philosophy that applies to both codex and Agent-tool dispatches.
 
 **Fallback if the project can't be registered as trusted** (shared machine, one-off invocation, or `~/.codex/config.toml` shouldn't be mutated):
 

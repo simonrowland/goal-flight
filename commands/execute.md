@@ -163,10 +163,13 @@ Both reviewers use the same gstack `/review` framing (when installed) for consis
   ```bash
   timeout --kill-after=10 300 codex exec '/review <start-hash>..<end-hash>. Reference: AGENTS.md, docs-private/<topic>-goal-statement-*.md, docs-private/<topic>-goal-queue-*.md. Output findings as P0/P1/P2/P3.' > /tmp/goal-flight-gstack-codex-<topic>-<iso>.txt 2>&1 &
   ```
-- If gstack absent on codex side:
+- If gstack absent on codex side — point codex at the prompt file on disk, don't paste its contents into the exec arg:
   ```bash
-  timeout --kill-after=10 300 codex exec '<contents of prompts/gstack-codex-challenge.md, with commit range and goal-queue path pasted in>' > /tmp/goal-flight-gstack-codex-<topic>-<iso>.txt 2>&1 &
+  timeout --kill-after=10 300 codex exec \
+    "Read ~/.claude/skills/goal-flight/prompts/gstack-codex-challenge.md in full and execute it. Commit range: <start-hash>..<end-hash>. Goal-queue: docs-private/<topic>-goal-queue-*.md. If your context compacts mid-review, re-read the prompts file — the file is the unparaphrased source of truth." \
+    > /tmp/goal-flight-gstack-codex-<topic>-<iso>.txt 2>&1 &
   ```
+  Avoids spamming the controller's tokens with pre-pasted prompt content; survives codex session compaction (codex can re-Read the file); bypasses any CLI argument length limit. Same principle as `reference/pattern.md` §Codex reliability "keep the prompt short — pass pointers."
 
 Capture PID; poll temp file for completion.
 
