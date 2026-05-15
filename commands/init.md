@@ -28,18 +28,39 @@ Run in parallel:
 If `codex` missing: tell the user (do NOT auto-install):
 > "codex CLI not found. Install with `npm install -g @openai/codex && codex login`. The skill works without codex (Claude subagents only) but loses parallel-reviewer capability for milestone reviews."
 
-If `codex` present, compare its version against the latest published. Quick check:
+If `codex` present, compare its version against the latest published AND against the **`/goal` mode minimum (0.128.0)** — `/goal` is the codex CLI feature goal-flight's chunk-execution dispatch shape leans on (see `reference/pattern.md` §Codex `/goal` mode dispatch shape). Without it, codex dispatches still work for reviews but lose the multi-hour autonomous-loop primitive.
 
 ```bash
 LATEST=$(npm view @openai/codex version 2>/dev/null)
 INSTALLED=$(codex --version 2>&1 | awk '{print $NF}')
-[ -n "$LATEST" ] && [ "$INSTALLED" != "$LATEST" ] \
-  && echo "codex $INSTALLED installed; $LATEST available — run 'codex update' if you want the latest."
+GOAL_MIN="0.128.0"
+
+# Semver-aware comparison: returns the smaller of two versions
+older() { [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -1)" = "$1" ]; }
+
+if older "$INSTALLED" "$GOAL_MIN"; then
+  echo "codex $INSTALLED installed; /goal mode requires $GOAL_MIN or newer."
+  echo "Strongly recommend: codex update    (codex's built-in upgrade subcommand)"
+elif [ -n "$LATEST" ] && [ "$INSTALLED" != "$LATEST" ]; then
+  echo "codex $INSTALLED installed; $LATEST available — run 'codex update' for the latest."
+fi
 ```
 
-Surface the suggestion to the user but do NOT auto-update — environment mutation is the user's call. `codex update` is codex's built-in update subcommand (runs the upgrade + any post-install marketplace re-sync codex wants to do). Prefer it over the bare `npm update -g @openai/codex` so any version-specific hooks fire.
+Surface the recommendation but do NOT auto-update — environment mutation is the user's call. `codex update` is codex's built-in upgrade subcommand (runs the upgrade + any post-install marketplace re-sync codex wants to do); prefer it over the bare `npm update -g @openai/codex` so any version-specific hooks fire.
 
-If codex update IS needed for a behaviour goal-flight depends on (e.g. a flag this skill assumes is present), be explicit about the minimum-tested version in the summary — currently goal-flight is calibrated against `codex-cli 0.130.0`. Anything materially older may diverge from the dispatch shapes in `reference/pattern.md`.
+**Pre-0.128 codex is the line that matters most** — that's when `/goal` mode shipped. Behaviour calibrated for goal-flight: 0.128.0 minimum (chunk-execution dispatches via `/goal`), 0.130.0 current and recorded in this skill's `reference/pattern.md`. Anything materially older than 0.128 means codex can still review/consolidate (slash-command dispatches) but the chunk-execution loop primitive isn't available.
+
+**Check the `/goal` feature flag** — `/goal` mode requires `features.goals = true` in `~/.codex/config.toml`. The supported enable command is:
+
+```bash
+codex features list 2>&1 | awk '/^[[:space:]]*goals\b/ {print}'    # confirm current state
+```
+
+If `goals` is not enabled and codex is recent enough (>= 0.128.0), surface:
+
+> "Codex `/goal` mode is experimental and not enabled. Enable it with `codex features enable goals` (idempotent — writes `features.goals = true` to `~/.codex/config.toml`). Without it, goal-flight chunk dispatches fall back to short-prompt codex dispatches that don't use the multi-hour autonomous loop. Run `codex features enable goals`? (y/n)"
+
+If user accepts: run it, re-check. Note in summary whether `goals` is now enabled.
 
 If `gstack` is missing on **either side**: **recommend install and offer to run it.**
 

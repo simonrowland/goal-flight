@@ -7,6 +7,25 @@ incremented when meaningful skill behaviour changes.
 ## [Unreleased]
 
 ### Added
+- **Codex `/goal` mode integrated as a peer dispatch shape.** Codex CLI's
+  experimental `/goal` slash command (gated behind `features.goals = true`
+  in `~/.codex/config.toml`, requires codex ≥ 0.128.0) runs a non-
+  interactive plan/act/test/iterate loop when fed a goal-shaped prompt via
+  stdin. Activation: `codex exec -C <workdir> - < prompt.md`. New
+  `templates/codex-goal-prompt.md.tpl` ships the canonical prompt
+  skeleton (Objective / Workspace / Rules / Acceptance criteria / Test
+  gates / Blocker protocol / Edit policy / Final response schema).
+  `reference/pattern.md` §Codex `/goal` mode dispatch shape documents
+  the full pattern including: why no `timeout 300` wrapper (`/goal` is
+  multi-hour by design), monitoring via tail-polling for the Final
+  response schema rather than activity-based stall watchdog, and a
+  decision table for when to use `/goal` mode (chunk execution with
+  loop primitive) vs the short-prompt codex shape (bounded review
+  tasks).
+- **Init step 1 now gates codex on `/goal` mode minimum (0.128.0) and
+  `features.goals` enable-state.** Recommends `codex update` if older;
+  recommends `codex features enable goals` if disabled. Both are
+  opt-in prompts — user's environment, user's call.
 - `[controller-direct]` chunk tag — `commands/decompose-plan.md` step 2 now
   tags trivial single-file chunks (< ~30 LoC, no cross-module coupling) so
   the controller can handle them inline with Read + Edit + commit instead

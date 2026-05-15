@@ -260,6 +260,54 @@ timeout 30 codex exec 'Respond with OK and stop.' > /dev/null 2>&1 \
 
 If pre-flight fails or stalls, skip codex for the batch and run reviewers Claude-only. (If pre-flight stalls specifically with zero-byte output, the project is likely not registered as trusted — run `scripts/install-codex-overrides.sh` and retry.)
 
+## Codex `/goal` mode dispatch shape (chunk execution)
+
+`/goal` is a session-level slash command in codex CLI (≥ 0.128.0) gated behind `features.goals = true` in `~/.codex/config.toml`. It attaches a persistent objective to a codex thread; codex then runs a plan / act / test / review / iterate loop until the goal hits its stopping condition or a token budget exhausts. Designed for multi-hour autonomous runs.
+
+**Critical: `/goal` mode runs non-interactively from a shell when the prompt is goal-shaped and passed via stdin.** The shape — Objective + Workspace + Rules + Acceptance criteria + Test gates + Final response schema — is what auto-activates the loop. There is no `--goal` flag and no `codex goal` subcommand; the dispatch shape is `codex exec -C <workdir> - < prompt.md`.
+
+**Pre-requirements (verified in `commands/init.md` step 1):**
+
+- `codex --version` ≥ `0.128.0` (older versions don't have `/goal` mode). Recommend `codex update` if older.
+- `features.goals = true` in `~/.codex/config.toml`. Set via `codex features enable goals` (idempotent).
+- Project is codex-trusted via `scripts/install-codex-overrides.sh` (else the MCP approval-gate stall bites the same as for non-goal dispatches).
+
+**Dispatch shape:**
+
+```bash
+# 1. Render the goal-shaped prompt from templates/codex-goal-prompt.md.tpl
+GOAL_FILE=/tmp/goal-flight-goal-<slug>-<iso>.md
+TAIL=/tmp/goal-flight-goal-<slug>-<iso>.tail.txt
+# (controller composes $GOAL_FILE per the template: Objective, Workspace,
+# Rules, Acceptance criteria, Test gates, Blocker protocol, Edit policy,
+# Final response schema)
+
+# 2. Dispatch — file via stdin, no inline arg, no `timeout 300` wrapper.
+codex exec -C <ABSOLUTE_WORKSPACE_PATH> - < "$GOAL_FILE" > "$TAIL" 2>&1 &
+PID=$!
+```
+
+`-C <workdir>` sets the working root for the goal-mode session. The `-` positional arg tells codex to read the prompt from stdin; `< "$GOAL_FILE"` pipes the file. **Do not wrap in `timeout 300`** — `/goal` mode is designed to run for hours; the 300 s ceiling we use for review dispatches is wrong for chunk execution under `/goal`.
+
+**Monitoring instead of timeout:** the controller polls `$TAIL` for the "Final response" block specified in the prompt's Final response schema. When that block appears with the agreed fields (memo path, key conclusion, commands run, dirty files, blockers, goal complete), the dispatch is complete and the controller proceeds to verify-diff + commit. The watchdog logic in this same section (zero-output ≥ 90 s, no-progress ≥ 180 s) does NOT apply — long pauses during plan / act / test / iterate cycles are expected behaviour, not stall signal.
+
+**Stall detection for `/goal` dispatches** is coarser: an outer hard wall-clock cap (e.g. 6–12 hours configurable per chunk in the goal-queue's optional `[budget:<hours>]` tag), or "no new file activity in the workspace for ≥ 60 minutes" as a heuristic, or the controller's own context handoff cadence (write RESUME-NOTES, kill on next compaction). Per-dispatch token budget can also be set on the codex side — see codex docs on `/goal` budgets.
+
+**When to use `/goal` mode vs short-prompt codex dispatch:**
+
+| Use `/goal` mode (file-via-stdin, no timeout) | Use short-prompt codex dispatch (inline, `timeout 300`) |
+|---|---|
+| Per-chunk execution where the agent needs to plan / act / test / iterate | Milestone `/review HEAD~5..HEAD` |
+| Code migrations, refactor chunks, multi-step debug work | `/plan-eng-review` decomposition checks |
+| Any chunk where the Acceptance criteria need verification loops | `/cso` security review pass |
+| Long-form prototype implementation from a PLAN.md | RAG cross-slice consolidation |
+
+The short-prompt shape (the one earlier in this section: `codex exec '<short prompt with file pointers>' > $TAIL 2>&1 &`) is correct for bounded review tasks. The `/goal` mode shape is correct for executor work that needs the loop primitive. They're peer dispatch shapes, not alternatives — different work calls for different shapes.
+
+**Template:** `templates/codex-goal-prompt.md.tpl` has the canonical goal-prompt skeleton with placeholders for Objective, Workspace, Rules, Acceptance, Test gates, Blocker protocol, Edit policy, and Final response schema. Controllers should render that template per chunk rather than hand-composing the structure each time (drift risk).
+
+**Same verification-first principle:** the goal-prompt points at files (`docs-private/<X>.md`, source paths, plan files); it does not pre-paste their contents. Codex `/goal` mode has Read + Grep + Bash and the multi-hour budget to use them. The arguments for pointer-based dispatch in the short-prompt shape apply with extra force here — at multi-hour scale, controller-pasted "facts" are nearly guaranteed to go stale.
+
 ## Subagent observability
 
 Subagents are inherently hard to observe (you can't watch them work in real time the way you watch your own tool calls scroll), but the skill's dispatch shapes give you two ways to peek:
