@@ -308,6 +308,53 @@ The short-prompt shape (the one earlier in this section: `codex exec '<short pro
 
 **Same verification-first principle:** the goal-prompt points at files (`docs-private/<X>.md`, source paths, plan files); it does not pre-paste their contents. Codex `/goal` mode has Read + Grep + Bash and the multi-hour budget to use them. The arguments for pointer-based dispatch in the short-prompt shape apply with extra force here — at multi-hour scale, controller-pasted "facts" are nearly guaranteed to go stale.
 
+### Fallback: Opus iteration loop driven by the controller
+
+If codex isn't installed, is older than `0.128.0`, or has `features.goals` disabled, the same goal-prompt structure works as a Claude Opus Agent-tool iteration loop driven by the controller. **The controller becomes the loop primitive externally** — each Agent dispatch is one iteration; the controller decides whether to re-dispatch with updated state or declare the chunk done. Slower than codex `/goal` mode (each iteration pays Agent-tool dispatch overhead instead of running inside one persistent session) but requires no codex setup at all.
+
+**Pattern:**
+
+1. **Render the same goal-prompt** from `templates/codex-goal-prompt.md.tpl` — Objective, Workspace, Rules, Acceptance criteria, Test gates, Blocker protocol, Edit policy, Final response schema. Identical shape to the codex `/goal` dispatch; **the prompt template is reusable across both paths**.
+
+2. **Iteration 1** — dispatch via Agent tool (general-purpose, model: `"opus"`) with the goal-prompt plus a small preamble:
+
+   ```
+   Iteration 1 of <MAX>.
+   Prior progress: (none — this is the first iteration).
+
+   <full goal-prompt rendered from the template>
+   ```
+
+3. **Wait for the Agent's report.** Parse the Final response block at the end:
+   - `Goal complete: true` → verify diff + run tests + commit, chunk done.
+   - `Goal complete: false` → continuation needed. Capture: `git diff --stat`, list of dirty files, the Agent's blockers list, and a 2-3 sentence summary of what was attempted and what remains.
+   - **No Final response block at all** (malformed report) → escalate to user; do not iterate blindly.
+
+4. **Iteration N+1** — re-dispatch with the **same goal-prompt unchanged** plus an updated preamble:
+
+   ```
+   Iteration <N+1> of <MAX>.
+   Prior progress:
+   - Files modified so far: <list from git diff --stat>
+   - What worked: <Agent's last-iteration summary>
+   - What remains: <Agent's blockers / unfinished Acceptance criteria items>
+   - Tests currently: <pass/fail count>
+
+   <full goal-prompt rendered from the template — unchanged>
+   ```
+
+   Do NOT paraphrase or trim the goal-prompt across iterations. The Acceptance criteria and Final response schema are the contract; rewriting them mid-chunk drifts the target.
+
+5. **Iteration cap** — default 5–8 per chunk; configurable via a `[max-iterations:<N>]` chunk tag in the goal-queue. Past the cap, the chunk is fighting something the iteration can't resolve (architectural mismatch, missing context, ambiguous Acceptance criteria, or an out-of-scope dependency). Mark `[BLOCKED:<reason>]` in the queue, notify user via `osascript` (per `SKILL.md` notification rule), and move on. The in-progress patch and the last iteration's blockers list are durable in git (uncommitted) + RESUME-NOTES — the user can resume manually.
+
+**When to pick which path:**
+
+- **codex `/goal` mode** if available and chunk warrants ≥ 3 iterations of plan/act/test. The persistent session is materially cheaper at that scale (one model invocation amortized across the whole loop).
+- **Opus iteration loop** if codex isn't set up, the chunk typically completes in 1–2 iterations, or you specifically want the iterations isolated in separate subagent context windows for forensic clarity (each iteration's transcript is a separate JSONL file).
+- **Single-shot Agent dispatch (no iteration)** — the existing default path in `commands/execute.md` step 2b — for chunks that don't need a loop primitive at all (most chunks). The 5-layer wrapper in `prompts/dispatch-wrapper.md` is the right shape there; the goal-prompt template is for chunks where the loop semantics matter.
+
+The decompose-plan analyst can pre-tag chunks the controller will dispatch via the loop with `[goal-mode]` (alongside `[parallel-safe:<group>]`, `[milestone]`, `[controller-direct]`), but it's not required — the controller can choose at execute time based on chunk shape.
+
 ## Subagent observability
 
 Subagents are inherently hard to observe (you can't watch them work in real time the way you watch your own tool calls scroll), but the skill's dispatch shapes give you two ways to peek:
