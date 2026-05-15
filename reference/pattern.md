@@ -84,7 +84,7 @@ The controller's value is forward motion until a real blocker. **Interrupt the u
 
 ## Handoff before compact
 
-When your context is ~70% full or compaction is imminent, write `docs-private/RESUME-NOTES-YYYY-MM-DD.md` so the next controller can pick up:
+When your context is ~80% full or compaction is imminent, write `docs-private/RESUME-NOTES-YYYY-MM-DD.md` so the next controller can pick up:
 
 - **TL;DR** — one paragraph: where we are, what's in flight, what's queued.
 - **Progress table** — verbatim copy of the table above.
@@ -93,6 +93,29 @@ When your context is ~70% full or compaction is imminent, write `docs-private/RE
 - **First 5 minutes** — exact next steps for resume.
 
 Date the filename. If today's file exists, bump `(rev N)` in the H1 instead of overwriting.
+
+### Calibrate the threshold — 80% is a default, not a hard rule
+
+The right time to handoff is a function of two things, not a single percentage:
+
+1. **Remaining work in the queue.** If 1–2 small chunks are left and they're routine, run hot — you might finish the queue (and RESUME-NOTES "QUEUE COMPLETE" naturally) before compaction matters. If a dozen chunks remain and the next few involve milestone reviews or BLOCKED-chunk surgery, conserve harder.
+2. **Cost of waking afresh with summaries.** Mid-complex-chunk-debug (multiple subagent dispatches in flight, a milestone review's P0 cluster mid-resolution, an in-progress reasoning chain across files) is expensive to lose to compaction summaries — handoff earlier. Between chunks, fresh RESUME-NOTES rev, no in-flight work — cheap to lose — handoff later.
+
+**Subagents + `\goal` mode already do most of the heavy lifting for extending the productive session life.** Each chunk's dispatch, verification, and milestone-review work runs in subagent context windows, not the controller's. The controller's own context primarily holds: queue state, RESUME-NOTES content, recent git log, in-flight dispatch metadata, and the recent few turns of tool output it actually needs to make decisions. That's leverage — the controller can run a long time without compacting *as long as it doesn't accidentally pull large outputs into its own context* (per "controller delegates bulk reads to Explore subagents" in SKILL.md).
+
+Conserve harder (handoff well before 80%) when:
+
+- Multiple subagent dispatches are in flight whose notifications you'd lose mid-decision-state.
+- You're mid-debug on a P0 from a milestone review with the failing diff + invariant context loaded.
+- The next planned action would itself consume significant context (e.g. you have to fall back to a direct Read of a 500-line file because no Explore subagent is appropriate).
+
+Run hotter (push past 80%, even to 90%+) when:
+
+- Queue has 1–3 trivial chunks left and one final RESUME-NOTES bump will close it cleanly.
+- Most recent RESUME-NOTES rev already captures the complete in-flight state — handoff at compaction is nearly lossless.
+- You're between chunks with no in-flight subagent work; only the next dispatch is queued and its specification lives entirely in the goal-queue file.
+
+The cost of an early handoff is one extra rev bump (cheap). The cost of a late one is whatever state the harness's summary clobbers (expensive when mid-complex-state, near-zero between chunks). Calibrate accordingly; the default is 80% only because most controller turns fall between those extremes.
 
 ### Three layers of state — different scopes
 

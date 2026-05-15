@@ -24,6 +24,17 @@ incremented when meaningful skill behaviour changes.
   (>200 lines, full READMEs, full architecture docs) still go to Explore
   subagents; short verification reads inline are fine. The ban is on bulk
   consumption, not on the controller using its eyes.
+- **Handoff threshold raised 70% → 80% with explicit calibration.**
+  `reference/pattern.md` §Handoff before compact now treats the percentage
+  as a default rather than a hard rule. The right handoff time is a
+  function of (remaining work in the queue) × (cost of waking afresh
+  with summaries). Conserve harder mid-complex-chunk-debug or with
+  multiple in-flight subagents whose notifications carry state; run
+  hotter (90%+) when the queue is 1-3 trivial chunks from done and
+  the most recent RESUME-NOTES rev already captures in-flight state.
+  Explicit note that subagents + `\goal` mode are the primary leverage
+  for extending session life — the controller's own context mostly
+  holds metadata, not the bottleneck.
 - `templates/goal-queue.tpl` independence-tags section now lists
   `[controller-direct]` alongside `[parallel-safe:<group>]` and `[milestone]`.
 - **Codex dispatch shape: pointers, not pre-pasted content.** `reference/
