@@ -25,6 +25,13 @@ Render the dispatch prompt as:
 ```
 \goal <SLUG>
 
+[Layer 0 (MANDATORY when isolation: "worktree"): base-verification pre-flight per
+ prompts/dispatch-wrapper.md "Layer 0". Capture the expected base SHA via
+ `git rev-parse main` from the MAIN worktree path (NOT from controller cwd —
+ cwd may be a sibling worktree whose branch lags main). Paste that SHA into the
+ prompt. Executor verifies HEAD vs expected and aborts on mismatch — this catches
+ the worktree-base-stale failure that bit goal #18 JSON-RUNNER-HARNESS.]
+
 [Layer 1: situational frame — main HEAD, what just landed, what this dispatch's role is]
 
 [Goal text pasted from queue — SCOPE / CHECKLIST / ACCEPTANCE / FORBIDDEN]

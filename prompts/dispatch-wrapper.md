@@ -10,6 +10,25 @@ The audit substrate: 55 Agent dispatches across goals #4–#10 + milestone
 cluster fixes + planning subagents. Dispatch size 6–11 KB. Goal text alone
 was always insufficient.
 
+## Layer 0 — Base-verification pre-flight (MANDATORY for worktree-isolated dispatches)
+
+**Failure mode this catches**: the Agent tool's `isolation: "worktree"` creates a worktree branched off the controller's current working-directory HEAD, NOT necessarily off `main`. If the controller is running in a sibling worktree (e.g., `.claude/worktrees/<controller-workspace>/`) whose branch lags main, the executor will silently build against the wrong substrate and the work won't cherry-pick cleanly. **This bit us on goal #18 JSON-RUNNER-HARNESS** — the worktree branched off a base 33 commits behind main; the agent built against pre-kernel APIs; commits conflicted at cherry-pick time. Captured in `docs-private/future-work.md` (skill-side bug).
+
+Include this assertion at the TOP of every dispatch prompt when worktree isolation is used:
+
+```
+PRE-FLIGHT (do this before reading the rest of the prompt):
+
+1. Run: `git rev-parse HEAD` in your working directory.
+2. Compare to the expected base: <PASTE EXPECTED SHA HERE — typically main HEAD>.
+3. If they DO NOT match: STOP. Do not proceed with the goal. Report back:
+   "Base mismatch: my worktree HEAD is <actual>, expected <expected>.
+    Aborting — please dispatch me with the correct base."
+4. If they match: continue with Layer 1 onwards.
+```
+
+The controller's responsibility before dispatching: capture `git rev-parse main` (or whatever the canonical base branch is) from the MAIN worktree path, NOT from controller `cwd` (which may be a sibling worktree). Paste that SHA into the prompt as the expected base.
+
 ## Layer 1 — Situational frame
 
 State where main is, what just happened, and what this dispatch's role is in
