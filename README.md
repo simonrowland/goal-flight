@@ -6,19 +6,21 @@ A [Claude Code](https://claude.ai/code) skill for long-running unattended contro
 
 Turn a fresh Claude Code session into a **controller** that:
 
-- Decomposes a plan into numbered `\goal` chunks with structured SCOPE / CHECKLIST / ACCEPTANCE / FORBIDDEN
+- Decomposes a plan into numbered codex-cli `/goal` chunks with structured SCOPE / CHECKLIST / ACCEPTANCE / FORBIDDEN
 - Dispatches each chunk to an **executor subagent** with a 5-layer wrapper (situational frame, template-provider pointer, file-anchors, environment caveats, goal-specific self-review specialization)
 - Embeds adversarial self-review inside every dispatch (executor self-fixes P0/P1/P2 before reporting done)
 - Runs **parallel codex + claude review sweeps** at milestone cadence (the "gstack" pattern)
 - Builds a **RAG corpus** of curated dispatch-time context at init time so the controller stops re-pasting AGENTS.md hard invariants per dispatch
 - Writes dated **handoff notes** (RESUME-NOTES-YYYY-MM-DD.md) before context fills so the next controller wakes up cleanly
 
-Designed for ~12-hour unattended runs where you check in periodically rather than babysit.
+Designed for ~12-hour unattended runs where you check in periodically or respond to decision notifications, rather than babysit.
+
+The philosophy is to apply more tokens to improve software quality, and apply more tokens to reduce unnecessary user prompts (including Netflix-style "Are you still there?" prompts).
 
 ## Install
 
 ```bash
-git clone https://github.com/<you>/goal-flight.git ~/.claude/skills/goal-flight
+git clone https://github.com/simonrowland/goal-flight.git ~/.claude/skills/goal-flight
 ```
 
 Then in a Claude Code session: `/goal-flight init <topic>` to start, or `/goal-flight` (no args) to print the high-level pattern reference.
