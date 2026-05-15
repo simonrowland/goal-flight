@@ -26,6 +26,20 @@ incremented when meaningful skill behaviour changes.
   consumption, not on the controller using its eyes.
 - `templates/goal-queue.tpl` independence-tags section now lists
   `[controller-direct]` alongside `[parallel-safe:<group>]` and `[milestone]`.
+- **Codex dispatch shape: pointers, not pre-pasted content.** `reference/
+  pattern.md` §Codex reliability and three dispatch sites in
+  `commands/{execute,decompose-plan,init}.md` rewritten to hand codex
+  short prompts that point at files on disk (e.g. `Read prompts/
+  gstack-codex-challenge.md in full and execute it`) rather than pasting
+  the prompt file's contents into the codex exec arg. Solves three
+  coupled problems at once: (1) controller burns its own tokens
+  composing 6–11 KB of context per dispatch when the agent could just
+  Read; (2) controller-pasted "facts" go stale on the timescale of
+  minutes between composition and execution; (3) codex session
+  compaction clobbers the unparaphrased original — pointer-based
+  dispatch lets codex re-Read on compaction. Aligns the codex side
+  with `prompts/dispatch-wrapper.md`'s verification-first principle
+  for Claude Agent dispatches.
 
 ## [0.2.0] — 2026-05-15
 

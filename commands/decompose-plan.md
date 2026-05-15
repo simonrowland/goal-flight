@@ -59,10 +59,13 @@ Render `templates/goal-queue.tpl` with the drafted chunks and `[parallel-safe:<g
   ```bash
   timeout --kill-after=10 300 codex exec '/plan-eng-review <path to docs-private/<topic>-goal-queue-<today>.md>. Reference: docs-private/<topic>-goal-statement-*.md, AGENTS.md.' > /tmp/goal-flight-decomp-codex-<topic>.txt 2>&1 &
   ```
-- If gstack absent on codex side:
+- If gstack absent on codex side — point codex at the prompt file on disk, don't paste its contents into the exec arg:
   ```bash
-  timeout --kill-after=10 300 codex exec '<contents of prompts/decomposition-review.md, with the plan + drafted decomposition pasted in>' > /tmp/goal-flight-decomp-codex-<topic>.txt 2>&1 &
+  timeout --kill-after=10 300 codex exec \
+    "Read ~/.claude/skills/goal-flight/prompts/decomposition-review.md in full and execute it. Plan: <path-to-plan-file>. Drafted decomposition: docs-private/<topic>-goal-queue-<today>.md. Goal-statement: docs-private/<topic>-goal-statement-*.md. If your context compacts mid-review, re-read the prompts file — the file is the unparaphrased source of truth." \
+    > /tmp/goal-flight-decomp-codex-<topic>.txt 2>&1 &
   ```
+  Avoids spamming the controller's tokens with pre-pasted prompt + plan + decomposition; survives codex session compaction; bypasses any CLI argument length limit. Same principle as `reference/pattern.md` §Codex reliability "keep the prompt short — pass pointers."
 
 Capture the PID. The output goes to a temp file.
 
