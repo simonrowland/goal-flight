@@ -64,13 +64,24 @@ If the corpus exists and the dispatch doesn't paste from it for layers 2/3/4, th
 
 Read `prompts/dispatch-wrapper.md` for the full per-layer worked examples (sourced from goals #8/#9/#10 dispatches in the goal-flight reference project) and the complete slice-to-layer mapping.
 
-**b. Dispatch as Claude subagent** via the Agent tool (general-purpose). Pass:
-- `description`: short phrase like "Execute \\goal <SLUG>"
-- `prompt`: the full dispatch prompt from (a)
-- `model`: `"opus"` for code-writing chunks (default for execute). Use the agent definition's default model for non-code chunks (planning, review writeups, docs prose).
-- The subagent works in the main worktree.
+**b. Execute the chunk.** Two paths depending on the chunk's tags from `decompose-plan` step 2:
 
-If using codex instead of an Agent-tool dispatch, include the highest-reasoning flag in the `codex exec` invocation (verify the current codex CLI flag — at time of writing `-c model_reasoning_effort=xhigh` is the pattern). Same principle: perfectionist output for code-writing chunks; default reasoning for non-code work.
+- **`[controller-direct]` chunks** — controller does the work inline. The dispatch overhead (subagent context init, model invocation, transcript) costs more than the work itself for trivial single-file changes. Workflow:
+  1. Read the target file(s) directly (Read tool).
+  2. Apply the change (Edit tool).
+  3. Run the relevant subset of the test suite per `docs-private/worker-context.md` or `AGENTS.md`.
+  4. Run the goal-specific self-review (Layer 5 from `prompts/executor-self-review.md`, specialized to this chunk's grep patterns and acceptance criteria) against your own diff. Treat your own work adversarially — if you find a P0/P1, self-fix before commit.
+  5. Skip steps c (wait) and d (verify diff via subagent) below — you just did them inline. Proceed to step e (commit).
+  
+  Use this path only for chunks decompose-plan tagged `[controller-direct]`. **Do not retag mid-execute** — if a chunk turns out trickier than expected, abort the inline path, surface the surprise as a goal-queue annotation, and fall through to the subagent path.
+
+- **Untagged chunks (default)** — dispatch as Claude subagent via the Agent tool (general-purpose). Pass:
+  - `description`: short phrase like "Execute \\goal <SLUG>"
+  - `prompt`: the full dispatch prompt from (a)
+  - `model`: `"opus"` for code-writing chunks (default for execute). Use the agent definition's default model for non-code chunks (planning, review writeups, docs prose).
+  - The subagent works in the main worktree.
+  
+  If using codex instead of an Agent-tool dispatch, include the highest-reasoning flag in the `codex exec` invocation (verify the current codex CLI flag — at time of writing `-c model_reasoning_effort=xhigh` is the pattern). Same principle: perfectionist output for code-writing chunks; default reasoning for non-code work.
 
 **c. Wait** for the executor to report done.
 

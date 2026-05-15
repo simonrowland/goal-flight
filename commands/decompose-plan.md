@@ -30,9 +30,15 @@ Read `<repo-root>/docs-private/<topic>-goal-statement-*.md` (most recent).
 
 > "Read the plan below. Decompose it into N self-contained `\goal` chunks. Each chunk must have SCOPE / CHECKLIST / ACCEPTANCE / FORBIDDEN sections per the goal-queue template at `~/.claude/skills/goal-flight/templates/goal-queue.tpl` (read it for the exact skeleton). Smallest-first; imperative voice. Number them 1..N. Surface anything in the plan that resists decomposition or requires controller-side judgement. Plan: <paste plan text or path>."
 
-When drafter completes, **analyst** (Explore): identify parallel-safe chunks.
+When drafter completes, **analyst** (Explore): identify parallel-safe chunks AND trivial chunks the controller can handle inline.
 
-> "Given these N drafted chunks, identify which touch disjoint files/modules and could safely run in parallel worktrees. Tag each parallel-safe chunk with `[parallel-safe:<group-id>]` (chunks in the same group can run together; different groups must be sequential relative to each other if they share dependencies). Conservative bias: when unsure, do not tag. Report which file paths each chunk touches; this becomes the audit trail for parallel safety. Drafter output: <paste>."
+> "Given these N drafted chunks, two tagging passes:
+>
+> (1) **`[parallel-safe:<group-id>]`** — chunks that touch disjoint files/modules and could safely run in parallel worktrees. Chunks in the same group can run together; different groups must be sequential relative to each other if they share dependencies. Conservative bias: when unsure, do not tag.
+>
+> (2) **`[controller-direct]`** — trivial chunks where dispatching a subagent would cost more than the work itself. Apply when ALL of: single-file change, < ~30 LoC delta, no cross-module coupling, no new public surface, no test-harness changes. Examples: typo fixes, version bumps, single-constant renames, single-line bug fixes confirmed against an existing failing test. Conservative bias: when unsure, do NOT tag — let `execute.md` dispatch a subagent.
+>
+> Report which file paths each chunk touches (audit trail for parallel safety + controller-direct triviality). Drafter output: <paste>."
 
 ### 3. Write to goal-queue
 

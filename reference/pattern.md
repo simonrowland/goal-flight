@@ -94,6 +94,16 @@ When your context is ~70% full or compaction is imminent, write `docs-private/RE
 
 Date the filename. If today's file exists, bump `(rev N)` in the H1 instead of overwriting.
 
+### Three layers of state — different scopes
+
+State of the controller's work lives in three places. Don't conflate them; they have different lifecycles:
+
+- **`docs-private/RESUME-NOTES-<date>-(rev N).md`** — cross-session **prose** handoff. Survives compaction, session boundaries, machine reboots. The next controller reads this first. Bump rev at: end of init, after decompose-plan, after each milestone review, before any anticipated compaction, on queue completion. Rev numbers within a day are append-only — never overwrite a prior rev.
+- **`docs-private/<topic>-goal-queue-<date>.md` Progress table** — cross-session **chunk-level state**. One row per `\goal`, status field is the truth on what's TODO / IN-FLIGHT / DONE / BLOCKED. Updated immediately after every commit by the controller. This is what `/goal-flight resume` reconstructs from on wake.
+- **TodoWrite (harness state)** — in-session **tactical sub-step tracking**. Only the current chunk's sub-steps: "Read the file. Edit the function. Run pytest." Survives compaction *within the same session* but not cross-session. Optional — use when a chunk's internal steps benefit from explicit tracking; skip for simple chunks. Cross-session state belongs in the goal-queue + RESUME-NOTES, NOT in TodoWrite.
+
+Rule of thumb: if a piece of state needs to survive `/goal-flight resume`, it goes in a file. If it's "what am I doing in the next 3 tool calls," TodoWrite is fine. The harness's TodoWrite reminders nudge you toward the latter; don't let them drift into duplicating the goal-queue.
+
 ## Context engineering — the corpus pattern
 
 Canonical source for the corpus schema is `templates/rag-corpus-schema.md.tpl`. Word budgets, slice naming, and writing rules live there; if any of those drift in this section or in `commands/init.md` step 3.5, the schema template is authoritative.
