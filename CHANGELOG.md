@@ -36,7 +36,27 @@ incremented when meaningful skill behaviour changes.
   `/goal` per-iteration but zero-setup; useful when codex isn't
   installed or `features.goals` isn't enabled, AND when the chunk
   typically completes in 1–2 iterations (overhead difference is
-  negligible at that scale).
+  negligible at that scale). Each iteration's transcript is
+  readable via the task-notification's JSONL path; controller
+  parses the last assistant message before the `done` event for the
+  Final response block.
+- **Grok iteration loop as a peer fallback to Opus iteration.** Same
+  controller-as-loop pattern but dispatch surface is `grok -p
+  --output-format json --model grok-build --disable-slash-commands
+  < prompt.md > response.json 2> stderr.log &` — shell tool,
+  file-backed, structured JSON output, tail-friendly. Pre-requirement
+  detected in `commands/init.md` step 1 (`command -v grok`). Reuses
+  the same `templates/codex-goal-prompt.md.tpl`. Useful when you
+  want model diversity in iteration (Grok's blind spots differ from
+  Opus's), when Grok-account billing is cheaper than Claude session
+  billing for the workload, or when codex isn't set up but Grok is.
+  `reference/pattern.md` adds a decision matrix for Opus vs Grok
+  iteration covering dispatch surface, observability, model
+  blind-spots, setup cost, and compaction risk. Mixed-executor
+  iterations across a single chunk (e.g. iter 1 Opus, iter 2 Grok)
+  are valid for stuck-loop recovery; tag the chunk
+  `[mixed-executor]` in the goal-queue for RESUME-NOTES
+  forensics.
 - **Init step 1 now gates codex on `/goal` mode minimum (0.128.0) and
   `features.goals` enable-state.** Recommends `codex update` if older;
   recommends `codex features enable goals` if disabled. Both are
