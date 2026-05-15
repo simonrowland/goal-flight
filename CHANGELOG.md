@@ -1,0 +1,60 @@
+# Changelog
+
+Notable changes to the goal-flight Claude Code skill. Format loosely follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are
+incremented when meaningful skill behaviour changes.
+
+## [Unreleased]
+
+Nothing pending.
+
+## [0.2.0] — 2026-05-15
+
+### Added
+- `scripts/install-codex-overrides.sh` — idempotent installer that registers
+  a project as codex-trusted in `~/.codex/config.toml`. Bypasses the MCP
+  approval-gate stall that broke ~2/5 non-interactive `codex exec` dispatches
+  in the original release.
+- `/goal-flight register-codex [<path>]` sub-command — thin wrapper around
+  the install script for repeat invocations after the initial init.
+- `/goal-flight validate-dispatch [<goal-slug>]` sub-command — renders the
+  5-layer dispatch wrapper for a goal without dispatching it. Catches
+  malformed layers before burning an Opus subagent dispatch.
+- `/goal-flight validate-queue [<queue-file>]` sub-command — schema-checks
+  a goal-queue: every chunk has SCOPE / CHECKLIST / ACCEPTANCE / FORBIDDEN;
+  numbering is sequential; `[parallel-safe:<group>]` tags reference defined
+  groups; no duplicate slugs.
+- `commands/execute.md` parallel-mode now includes a cherry-pick conflict
+  handling recipe at step 3c — re-dispatch with current main HEAD as Layer 0
+  base SHA, or mark `[REBASE-NEEDED:<reason>]` and continue the batch.
+- `tests/` directory with a bash test harness for `install-codex-overrides.sh`
+  (sandbox-`HOME` based — never touches the real `~/.codex/config.toml`).
+- `README.md` Quickstart section.
+- `CHANGELOG.md` and `VERSION` files.
+
+### Changed
+- `reference/pattern.md` §Codex reliability rewritten. Primary fix is now the
+  project-trust sidecar (`install-codex-overrides.sh`); `--ignore-user-config`
+  demoted to documented fallback. Detection thresholds (zero-output ≥ 90 s,
+  no-progress ≥ 180 s, hard-timeout 300 s) are numeric and data-derived; the
+  earlier "> 2× expected window" prescription is gone.
+- Every codex dispatch site in `commands/{execute,decompose-plan,init}.md`
+  and `SKILL.md` now uses `timeout --kill-after=10 300 codex exec '...'`
+  (no `--ignore-user-config`). Codex dispatches retain MCP tool access.
+- `commands/execute.md` step 3a — explicit note that worktrees inherit codex
+  trust by path prefix; no per-worktree registration needed.
+
+### Fixed
+- Codex `exec` silent-stall failure mode (zero-byte tail file, PID alive,
+  ~0% CPU). Root cause: `~/.codex/config.toml` `[mcp_servers.X.tools.Y]
+  approval_mode = "approve"` blocking non-interactive dispatches with no
+  TTY surface for the approval prompt. Resolved by project-trust
+  registration; documented in `docs-private/codex-stall-investigation-
+  2026-05-15.md` (gitignored).
+
+## [0.1.0] — 2026-05-14
+
+Initial release. Controller pattern, dispatch wrapper layers, milestone
+gstack reviews, RAG corpus pipeline, RESUME-NOTES handoff. See
+`docs-private/lessons-learned-2026-05-15.md` (gitignored) for the harden
+session that motivated 0.2.

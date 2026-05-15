@@ -40,6 +40,9 @@ If args, dispatch on the first token by reading the matching detailed instructio
 | `ask-questions` | `commands/ask-questions.md` |
 | `execute` | `commands/execute.md` |
 | `build-corpus` | `commands/build-corpus.md` |
+| `register-codex` | `commands/register-codex.md` |
+| `validate-dispatch` | `commands/validate-dispatch.md` |
+| `validate-queue` | `commands/validate-queue.md` |
 | `resume` | (handle inline; see "Resume / goal" below) |
 | `goal` | (handle inline; see "Resume / goal" below) |
 
