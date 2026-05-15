@@ -6,11 +6,15 @@
 
 ### 1. Validate environment
 
+**Agent roles in goal-flight:**
+- **Controller** — the agent running `/goal-flight` (currently Claude Code; Hermes is the future candidate). Owns dispatch + verify + commit + handoff.
+- **Executor / Reviewer** — the agent receiving `\goal` dispatches (Agent-tool Claude subagents by default, with `Bash codex exec` for the parallel codex reviewer at milestones). **Codex is a dispatch target, not a controller** — never expected to invoke `/goal-flight <sub>` itself.
+
 Run in parallel:
 - `git rev-parse --show-toplevel` → bail if not a git repo.
-- `command -v codex` → capture path and `codex --version` if present.
+- `command -v codex` → capture path. If present, also capture `codex --version` (e.g. `codex-cli 0.130.0`) and record it in the init summary — codex CLI behaviour shifts between versions (flag names, MCP semantics, plugin defaults), and the dispatch-shape assumptions in `reference/pattern.md` are pinned to a version. RESUME-NOTES forensics later are easier with the version recorded.
 - `command -v bun` → capture version.
-- Check gstack install on **both sides** (it works for both Claude Code and codex):
+- Check gstack install on the **Claude side** (the controller side) plus codex side for parallel-reviewer milestone use:
   - Claude-side: `[ -d ~/.claude/skills/gstack ]`
   - Codex-side: `[ -d ~/.codex/skills/gstack ]`
   - Project-level (if present, takes precedence): `[ -d <repo-root>/.agents/skills/gstack ]`
@@ -22,7 +26,20 @@ Run in parallel:
   - Capture which sides registered; report both.
 
 If `codex` missing: tell the user (do NOT auto-install):
-> "codex CLI not found. Install with `bun install -g @openai/codex && codex auth login`. The skill works without codex (Claude subagents only) but loses parallel-reviewer capability for milestone reviews."
+> "codex CLI not found. Install with `npm install -g @openai/codex && codex login`. The skill works without codex (Claude subagents only) but loses parallel-reviewer capability for milestone reviews."
+
+If `codex` present, compare its version against the latest published. Quick check:
+
+```bash
+LATEST=$(npm view @openai/codex version 2>/dev/null)
+INSTALLED=$(codex --version 2>&1 | awk '{print $NF}')
+[ -n "$LATEST" ] && [ "$INSTALLED" != "$LATEST" ] \
+  && echo "codex $INSTALLED installed; $LATEST available — run 'codex update' if you want the latest."
+```
+
+Surface the suggestion to the user but do NOT auto-update — environment mutation is the user's call. `codex update` is codex's built-in update subcommand (runs the upgrade + any post-install marketplace re-sync codex wants to do). Prefer it over the bare `npm update -g @openai/codex` so any version-specific hooks fire.
+
+If codex update IS needed for a behaviour goal-flight depends on (e.g. a flag this skill assumes is present), be explicit about the minimum-tested version in the summary — currently goal-flight is calibrated against `codex-cli 0.130.0`. Anything materially older may diverge from the dispatch shapes in `reference/pattern.md`.
 
 If `gstack` is missing on **either side**: **recommend install and offer to run it.**
 

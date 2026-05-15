@@ -37,6 +37,20 @@ incremented when meaningful skill behaviour changes.
   holds metadata, not the bottleneck.
 - `templates/goal-queue.tpl` independence-tags section now lists
   `[controller-direct]` alongside `[parallel-safe:<group>]` and `[milestone]`.
+- **Agent roles framing made explicit in init step 1.** Codex is a
+  dispatch target (executor / reviewer) — never expected to invoke
+  `/goal-flight <sub>` itself. Controller is Claude Code today; Hermes
+  is the future candidate. The clarification removes a footgun around
+  `\goal` (in-prompt text marker, backslash) vs `/goal-flight goal
+  <SLUG>` (slash command, controller-side queue helper) — there is no
+  `/goal` codex command in v0.130.0 or any current marketplace.
+- **`commands/init.md` step 1 now captures `codex --version` in the
+  summary** and surfaces a `codex update` recommendation when an older
+  version is installed than the latest published `@openai/codex`. Does
+  not auto-update — user's call. Notes the minimum-tested version
+  (`codex-cli 0.130.0` as of v0.2.x). RESUME-NOTES forensics benefit
+  from having the version recorded since codex CLI behaviour shifts
+  between versions.
 - **Codex dispatch shape: pointers, not pre-pasted content.** `reference/
   pattern.md` §Codex reliability and three dispatch sites in
   `commands/{execute,decompose-plan,init}.md` rewritten to hand codex
