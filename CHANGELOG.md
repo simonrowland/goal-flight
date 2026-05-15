@@ -22,6 +22,21 @@ incremented when meaningful skill behaviour changes.
   decision table for when to use `/goal` mode (chunk execution with
   loop primitive) vs the short-prompt codex shape (bounded review
   tasks).
+- **Opus iteration loop as a no-codex fallback for `/goal`-mode chunks.**
+  Same goal-prompt template; the controller becomes the loop primitive
+  externally. Each Agent dispatch is one iteration; the controller
+  parses the Final response block, captures git-diff state +
+  Agent-reported blockers + tests pass/fail, and either commits
+  (Goal complete: true) or re-dispatches with the unchanged goal-
+  prompt + an updated "Iteration N of MAX, Prior progress: ..."
+  preamble. Iteration cap defaults to 5–8 (configurable via
+  `[max-iterations:<N>]` chunk tag). Documented as a §subsection
+  inside Codex `/goal` mode dispatch shape; reuses the same
+  `templates/codex-goal-prompt.md.tpl`. Strictly slower than codex
+  `/goal` per-iteration but zero-setup; useful when codex isn't
+  installed or `features.goals` isn't enabled, AND when the chunk
+  typically completes in 1–2 iterations (overhead difference is
+  negligible at that scale).
 - **Init step 1 now gates codex on `/goal` mode minimum (0.128.0) and
   `features.goals` enable-state.** Recommends `codex update` if older;
   recommends `codex features enable goals` if disabled. Both are
