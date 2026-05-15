@@ -25,6 +25,36 @@ git clone https://github.com/simonrowland/goal-flight.git ~/.claude/skills/goal-
 
 Then in a Claude Code session: `/goal-flight init <topic>` to start, or `/goal-flight` (no args) to print the high-level pattern reference.
 
+## Quickstart
+
+```bash
+# 1. In your project repo, in a Claude Code session:
+/goal-flight init <topic>            # audits the repo, scaffolds AGENTS.md +
+                                     # docs-private/ + (optional) RAG corpus,
+                                     # registers the project as codex-trusted
+                                     # if codex is installed
+
+/goal-flight decompose-plan          # breaks a plan into numbered \goal chunks
+                                     # with SCOPE / CHECKLIST / ACCEPTANCE /
+                                     # FORBIDDEN; parallel reviewer pass
+
+/goal-flight execute                 # runs the per-chunk dispatch loop with
+                                     # embedded self-review; milestone codex+
+                                     # claude reviews every K commits
+
+# 2. Resume after a break / new session:
+/goal-flight resume                  # rebuilds RESUME-NOTES from current git state
+
+# 3. (Maintenance, if codex was added to a project post-init)
+/goal-flight register-codex          # registers the cwd project as codex-trusted
+
+# 4. (Debugging — dry-run, no dispatch billed)
+/goal-flight validate-dispatch <slug>   # render the 5-layer wrapper for review
+/goal-flight validate-queue             # schema-check the goal-queue
+```
+
+`/goal-flight` with no arg prints the high-level pattern reference (`reference/pattern.md`). The full sub-command list is below.
+
 ## Sub-commands
 
 | Command | What it does |
@@ -37,6 +67,9 @@ Then in a Claude Code session: `/goal-flight init <topic>` to start, or `/goal-f
 | `/goal-flight build-corpus [<flags>]` | Extend / rebuild the `docs-private/rag/` corpus after init |
 | `/goal-flight resume` | Rebuild RESUME-NOTES from current git state |
 | `/goal-flight goal <SLUG>` | Append one goal to the queue using the skeleton |
+| `/goal-flight register-codex [<path>]` | Register a project (or worktree path) as codex-trusted; bypass MCP approval-gate stalls |
+| `/goal-flight validate-dispatch [<slug>]` | Render the 5-layer dispatch wrapper for a goal **without dispatching** — dry-run for wrapper-composition bugs |
+| `/goal-flight validate-queue [<path>]` | Schema-check the goal-queue: chunk structure, numbering, parallel-safe tags, slug uniqueness |
 
 ## Why this pattern works (the gist)
 

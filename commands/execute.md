@@ -107,7 +107,17 @@ git worktree add <repo-root>/.claude/worktrees/<adjective-noun-N>/ -b claude/<ad
 - Verify diff in that worktree (same checks as sequential step 2d).
 - Commit in the worktree (the subagent typically does this since it lives inside the isolated worktree's git context).
 - Cherry-pick onto main: from main worktree, `git cherry-pick <subagent-commit-hash>`. **Cherry-pick is the default; do NOT use `git merge --ff-only`** — isolated worktrees branched off main do not fast-forward cleanly when sibling worktrees committed since the shared base, so merge --ff-only fails or pulls in unrelated history. Cherry-pick is safer and produces a clean linear stack of one-commit-per-chunk on main, which is also what the Progress table assumes.
-- After cherry-pick: run integration pytest from main to catch cross-cluster regressions (each subagent ran tests in isolation; this is the first time all the changes coexist).
+
+**If `git cherry-pick` reports CONFLICT** (sibling chunks edited adjacent territory or made conflicting assumptions):
+
+- Capture the conflict surface: `git status` for the conflicted paths, the failing chunk's slug + branch name, and the prior-landed commits in the batch (these form the new baseline the failing chunk needs to rebase against).
+- Abort the cherry-pick in main: `git cherry-pick --abort`. Leave the main worktree clean; the failing chunk's commit still exists on its branch and can be re-dispatched.
+- Classify and route:
+  - **Mechanical conflict** (same file edited by sibling chunks in disjoint ways the 3-way merge couldn't reconcile): re-dispatch this chunk with the CURRENT main HEAD as the Layer 0 base SHA. The executor rebuilds against post-batch state. This is usually the right path for surface conflicts (formatting, neighbouring functions, adjacent imports).
+  - **Semantic conflict** (sibling chunks made conflicting design assumptions — e.g. both renamed the same function differently, both introduced a constant with the same name but different value): mark this chunk `[REBASE-NEEDED:<one-line-reason>]` in the queue, notify the user via `osascript -e 'display notification "Chunk N rebase needed: <reason>" with title "goal-flight" sound name "Funk"'`, and continue the batch with the remaining chunks. Surface for resolution at the next milestone review.
+- **Do NOT** manually edit conflict markers in the main worktree. The controller's job is to dispatch work, not adjudicate merges by hand. Re-dispatch (mechanical) or re-decompose (semantic) is the right tool — both keep the per-chunk commit shape intact for the Progress table.
+
+- After cherry-pick (or skip-with-reason): run integration pytest from main to catch cross-cluster regressions (each subagent ran tests in isolation; this is the first time all the changes coexist).
 - Update Progress table; log.
 
 **d. After all N land**: leave the agent worktrees in place if locked (system manages cleanup); otherwise collapse worktrees (`git worktree remove`); delete branches (`git branch -d`); update Progress table for the batch; log.
