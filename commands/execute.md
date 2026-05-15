@@ -99,6 +99,8 @@ For each batch of up to N consecutive `[parallel-safe:<group>]` chunks:
 git worktree add <repo-root>/.claude/worktrees/<adjective-noun-N>/ -b claude/<adjective-noun-N>
 ```
 
+**Codex trust at worktree-creation time: nothing to do.** The worktree path is always under `<repo-root>/.claude/worktrees/...`, and codex matches `[projects."<ABS>"].trust_level` entries by path prefix. As long as `<repo-root>` was registered at init (per `commands/init.md` step 1, via `scripts/install-codex-overrides.sh`), every worktree under it inherits trust automatically — `codex exec` dispatches from inside the worktree pass MCP approval gates the same way they would from the main worktree. If you ever spawn a worktree OUTSIDE the repo root (uncommon — goal-flight's convention keeps them inside), register that path explicitly: `bash <skill-root>/scripts/install-codex-overrides.sh <worktree-path>`.
+
 **b. Dispatch each as a Claude subagent in its own worktree.** Pass the worktree path in the agent description so the subagent knows where to work.
 
 **c. Controller monitors all N.** As each reports done:
