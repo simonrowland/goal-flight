@@ -6,7 +6,26 @@ incremented when meaningful skill behaviour changes.
 
 ## [Unreleased]
 
-Nothing pending.
+### Added
+- `[controller-direct]` chunk tag — `commands/decompose-plan.md` step 2 now
+  tags trivial single-file chunks (< ~30 LoC, no cross-module coupling) so
+  the controller can handle them inline with Read + Edit + commit instead
+  of dispatching a subagent. `commands/execute.md` step 2b branches on the
+  tag. Closes the dispatch-overpresribe gap for tiny chunks where subagent
+  dispatch costs more than the work itself.
+- `reference/pattern.md` §Handoff before compact gains a "Three layers of
+  state" subsection making the RESUME-NOTES / goal-queue Progress table /
+  TodoWrite split explicit. RESUME-NOTES = cross-session prose, goal-queue
+  Progress = cross-session chunk state, TodoWrite = in-session tactical
+  sub-steps.
+
+### Changed
+- `SKILL.md` controller-delegates-reads bullet softened: bulk reads
+  (>200 lines, full READMEs, full architecture docs) still go to Explore
+  subagents; short verification reads inline are fine. The ban is on bulk
+  consumption, not on the controller using its eyes.
+- `templates/goal-queue.tpl` independence-tags section now lists
+  `[controller-direct]` alongside `[parallel-safe:<group>]` and `[milestone]`.
 
 ## [0.2.0] — 2026-05-15
 

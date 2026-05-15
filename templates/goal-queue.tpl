@@ -23,6 +23,7 @@ Status values: ✅ DONE — `<hash>` · 🟡 IN-FLIGHT — `<executor-id>` · TO
 Independence tags:
 - `[parallel-safe:<group>]` — chunks in the same group can run together via `/goal-flight execute --parallel N`. Different groups must respect implicit ordering. Untagged chunks are sequential-only.
 - `[milestone]` — append to a chunk's slug to trigger a gstack review sweep after this chunk lands (in addition to the every-K-commits cadence).
+- `[controller-direct]` — trivial chunks (single-file, < ~30 LoC delta, no cross-module coupling, no new public surface) that the controller handles inline with Read + Edit + commit, skipping the Agent subagent dispatch. Dispatch overhead exceeds the work for genuinely tiny chunks; the analyst tags these during decompose-plan step 2. Untagged chunks dispatch as subagents by default.
 
 ## Next dispatch batch
 
