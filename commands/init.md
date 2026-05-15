@@ -83,7 +83,7 @@ The user shouldn't need to remind future sessions what the point of `<topic>` is
    If yes: invoke `Skill(skill: "office-hours", args: "<topic-context>")`. Capture output and distill into the goal-statement file.
 
 2. **gstack `/office-hours` via codex** (when only codex-side install exists):
-   > "Same as above, but `/office-hours` isn't registered on the Claude side here — I'll invoke it via `codex exec '/office-hours <topic-context>'`. Run now? (y/n)"
+   > "Same as above, but `/office-hours` isn't registered on the Claude side here — I'll invoke it via `timeout 300 codex exec --ignore-user-config '/office-hours <topic-context>'`. Run now? (y/n)"
    
    If yes: dispatch and capture stdout. Distill into the goal-statement file.
 
@@ -169,7 +169,7 @@ If any P0/P1: re-dispatch the corresponding slice-builder with findings as input
 
 After all per-slice reviews are clean:
 - Default: dispatch a single Claude Opus subagent (Agent tool, `model: "opus"`) with `prompts/rag-cross-slice-consolidation.md`. Pass absolute paths of every corpus file. Opus's 1M context holds the aggregate corpus (~12 KB max for a typical project) cleanly; reliability is higher than codex.
-- Fallback (codex): only if you specifically want a model-diversity second opinion, or Claude Opus is unavailable. Codex command pattern: `codex exec '<contents of prompts/rag-cross-slice-consolidation.md, with each corpus file's ABSOLUTE path enumerated and "cd <repo-root>" prefixed>' > /tmp/goal-flight-rag-consolidation-<topic>-<iso>.txt 2>&1 &`. Tail or wait.
+- Fallback (codex): only if you specifically want a model-diversity second opinion, or Claude Opus is unavailable. Codex command pattern: `timeout --kill-after=10 300 codex exec --ignore-user-config '<contents of prompts/rag-cross-slice-consolidation.md, with each corpus file's ABSOLUTE path enumerated and "cd <repo-root>" prefixed>' > /tmp/goal-flight-rag-consolidation-<topic>-<iso>.txt 2>&1 &`. Tail or wait. (See `reference/pattern.md` §Codex reliability for why `--ignore-user-config` and `timeout` are required.)
 - Apply any P0/P1 fixes; surface P2/P3 as TODO comments in the affected slice.
 
 **Pass 4 — final assessment (one Claude Opus subagent).**
@@ -188,6 +188,39 @@ The quality dashboard goes into RESUME-NOTES as a small table; the next-wave pri
 
 Read `<repo-root>/.gitignore`. If `docs-private/` is not present, append it. Ask the user before adding `AGENTS.md` to `.gitignore` (some teams keep it tracked).
 
+### 4.5. Ensure AGENTS.md will be auto-read by future sessions
+
+Claude Code does not auto-load `AGENTS.md` the way it auto-loads `CLAUDE.md` (Codex does load AGENTS.md natively; Claude Code currently does not). To make AGENTS.md reliably the first thing every future controller and executor reads, ensure a CLAUDE.md exists with a directive pointing at it.
+
+Two options, in priority order:
+
+1. **Project-level `<repo-root>/CLAUDE.md`** (preferred — propagates to teammates via git, assuming CLAUDE.md is tracked).
+   - If `CLAUDE.md` exists at the repo root: read it. If it doesn't already reference AGENTS.md, propose appending:
+     ```
+     ## Read AGENTS.md first
+     This project pins agent operating instructions in `AGENTS.md` at the repo root.
+     Read it before doing any work — it carries the project invariants, file map,
+     and conversation style that shape everything downstream.
+     ```
+     Show the diff and ask before applying.
+   - If no project CLAUDE.md exists: ask the user *"Create `<repo-root>/CLAUDE.md` with the AGENTS.md directive? (y/n)"*. If yes, write the snippet above. If no, fall back to option 2.
+
+2. **Global `~/.claude/CLAUDE.md`** (per-machine; no team propagation; useful if the project CLAUDE.md is owned by another team or shouldn't be touched).
+   - Check if it already contains an AGENTS.md auto-read directive (grep for `AGENTS.md` in the file). If yes, you're done — note it in the summary.
+   - If not, propose adding:
+     ```
+     # session start
+     At session start in any project, if `AGENTS.md` exists at the repo root,
+     read it before doing other work — it carries the project invariants, file map,
+     and conversation style that shape everything downstream. Claude Code does not
+     auto-load AGENTS.md; this makes the behavior symmetric with Codex. If working
+     inside a git worktree where AGENTS.md is gitignored and absent, also check
+     the parent project root.
+     ```
+     Note this affects every project on the user's machine. Apply only with explicit consent.
+
+If both options are declined: note in summary that AGENTS.md will need to be Read manually at the start of each future session, OR be invoked via `/goal-flight` (which always Reads it). Future controllers/executors that don't go through the skill won't pick it up.
+
 ### 5. Self-review the init output
 
 **Spawn a second subagent** (Explore) to audit what init produced. Prompt it:
@@ -203,5 +236,6 @@ If the self-review finds gaps, surface them to the user as a TODO comment block 
 - gstack install status (installed / installed-during-init / declined — using fallback prompts).
 - Audit subagent's high-level findings (project type, invariant count, AGENTS.md status).
 - Goal statement status (concrete / interrogated-via-office-hours / DRAFT — sharpen before execute).
+- AGENTS.md auto-read directive: where it landed (project CLAUDE.md / global CLAUDE.md / already-present / declined-and-relying-on-skill-invocation).
 - Self-review TODOs (if any), with the AGENTS.md location they'll appear at.
 - Suggested next step: `/goal-flight decompose-plan <plan-file>` (or "decompose the plan you already discussed in this session"). If goal-statement is DRAFT: "decompose-plan will refuse until the goal is sharpened."

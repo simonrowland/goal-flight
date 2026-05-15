@@ -51,18 +51,18 @@ Render `templates/goal-queue.tpl` with the drafted chunks and `[parallel-safe:<g
 
 - If gstack registered on codex side (`~/.codex/skills/gstack/` exists):
   ```bash
-  codex exec '/plan-eng-review <path to docs-private/<topic>-goal-queue-<today>.md>. Reference: docs-private/<topic>-goal-statement-*.md, AGENTS.md.' > /tmp/goal-flight-decomp-codex-<topic>.txt 2>&1 &
+  timeout --kill-after=10 300 codex exec --ignore-user-config '/plan-eng-review <path to docs-private/<topic>-goal-queue-<today>.md>. Reference: docs-private/<topic>-goal-statement-*.md, AGENTS.md.' > /tmp/goal-flight-decomp-codex-<topic>.txt 2>&1 &
   ```
 - If gstack absent on codex side:
   ```bash
-  codex exec '<contents of prompts/decomposition-review.md, with the plan + drafted decomposition pasted in>' > /tmp/goal-flight-decomp-codex-<topic>.txt 2>&1 &
+  timeout --kill-after=10 300 codex exec --ignore-user-config '<contents of prompts/decomposition-review.md, with the plan + drafted decomposition pasted in>' > /tmp/goal-flight-decomp-codex-<topic>.txt 2>&1 &
   ```
 
 Capture the PID. The output goes to a temp file.
 
 Wait for both. (Codex: poll the temp file or `wait $PID`. Claude reviewer: returns when done.)
 
-If codex stalls (>2× expected window): kill the process and proceed with the Claude reviewer's findings only. Note in RESUME-NOTES' "In-flight" section.
+If codex stalls (the `timeout(1)` wrapper fires after 300 s, or the optional watchdog kills on zero-output ≥90 s / no-progress ≥180 s — see `reference/pattern.md` §Codex reliability): proceed with the Claude reviewer's findings only. Note in RESUME-NOTES' "In-flight" section.
 
 ### 4.5. Verify the decomposition serves the goal
 

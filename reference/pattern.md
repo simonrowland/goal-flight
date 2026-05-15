@@ -133,13 +133,58 @@ Without context-mode, you're using Bash + Read directly and need to be more care
 
 ## Codex reliability
 
-`codex exec` stalls silently ~2/5 runs in long sessions. If a chunk takes >2× the expected window, kill codex and re-dispatch the same `\goal` text as a Claude subagent (general-purpose agent). Shape is identical.
+`codex exec` can stall silently in non-interactive use. Root cause when context-mode is installed (per `docs-private/codex-stall-investigation-2026-05-15.md`): `~/.codex/config.toml` declares context-mode MCP servers with `approval_mode = "approve"`. In a non-interactive `codex exec`, the first MCP tool call (e.g. `ctx_search`) blocks forever waiting for an approval click that never arrives — manifests as zero-byte tail file, PID alive, ~0% CPU. Healthy baseline measured on this machine: p50 ~10 s, p95 ~25 s across small/medium/large prompts (300 s hard ceiling gives 10× headroom).
+
+**Primary fix — `--ignore-user-config` on every dispatch:**
+
+```bash
+TAIL=/tmp/goal-flight-<purpose>-<topic>-<iso>.txt
+timeout --kill-after=10 300 codex exec --ignore-user-config '<prompt>' > "$TAIL" 2>&1 &
+PID=$!
+```
+
+`--ignore-user-config` skips `~/.codex/config.toml` (MCP servers, `approval_mode`, hooks); the dispatch runs against codex defaults. Filesystem-installed skills (e.g. gstack at `~/.codex/skills/gstack/`) remain available. `timeout 300` enforces a hard wall-clock ceiling — codex v0.130.0 has no `--timeout` flag.
+
+**Backstop watchdog** for residual rare stalls that aren't MCP-approval (network wedge, codex-internal hang):
+
+```bash
+( prev=0; idle=0
+  while kill -0 "$PID" 2>/dev/null; do
+    sleep 30
+    sz=$(wc -c < "$TAIL" 2>/dev/null | tr -d ' '); sz=${sz:-0}
+    if [ "$sz" = "$prev" ]; then idle=$((idle + 30)); else idle=0; fi
+    prev=$sz
+    # Zero-output stall: 0 bytes for >=90s ⇒ codex never produced anything
+    [ "$sz" = "0" ] && [ "$idle" -ge 90 ] && { kill -TERM "$PID"; break; }
+    # No-progress stall: tail unchanged for >=180s ⇒ stuck mid-run
+    [ "$idle" -ge 180 ] && { kill -TERM "$PID"; break; }
+  done ) &
+```
+
+Detection thresholds (numeric, derived from observed baseline; 30 s polling cadence):
+
+| Stall class | Rule | Threshold |
+|---|---|---|
+| Zero-output | tail file at 0 bytes | ≥ 90 s |
+| No-progress | tail file unchanged | ≥ 180 s |
+| Hard timeout | wall-clock | 300 s (`timeout(1)`) |
+
+**Retry on stall-kill**: re-dispatch the *identical* prompt as a Claude general-purpose subagent (Agent tool). One retry max. The dispatch-prompt shape is identical between codex and Claude general-purpose, so the failover is mechanical.
+
+**Pre-flight check** at the top of each milestone-review batch:
+
+```bash
+timeout 30 codex exec --ignore-user-config 'Respond with OK and stop.' > /dev/null 2>&1 \
+  || echo "codex not reachable — going Claude-only this milestone"
+```
+
+If pre-flight fails or stalls, skip codex for the batch and run reviewers Claude-only.
 
 ## Subagent observability
 
 Subagents are inherently hard to observe (you can't watch them work in real time the way you watch your own tool calls scroll), but the skill's dispatch shapes give you two ways to peek:
 
-- **Codex side (tail-friendly by design).** All codex dispatches use `codex exec '...' > /tmp/goal-flight-<purpose>-<topic>-<iso>.txt 2>&1 &` and capture the PID. The user (or controller) can `tail -f /tmp/goal-flight-*.txt` to watch progress in another terminal. This is how the gstack milestone reviewer is wired in `commands/execute.md` and `commands/decompose-plan.md`. Useful when you want to see whether codex is making forward progress or has stalled silently (the 2/5 stall rate makes this a real concern).
+- **Codex side (tail-friendly by design).** All codex dispatches use `timeout --kill-after=10 300 codex exec --ignore-user-config '...' > /tmp/goal-flight-<purpose>-<topic>-<iso>.txt 2>&1 &` and capture the PID (see §Codex reliability above for why `--ignore-user-config` and `timeout` are required, plus the optional stall-watchdog). The user (or controller) can `tail -f /tmp/goal-flight-*.txt` to watch progress in another terminal. This is how the gstack milestone reviewer is wired in `commands/execute.md` and `commands/decompose-plan.md`. Useful when you want to see whether codex is making forward progress or has stalled silently.
 - **Claude subagent side (observable but discouraged).** Agent-tool dispatches write their full JSONL transcript to a harness-managed path that appears in the `task-notification` message when the subagent completes. You CAN read this for forensic debugging after the fact. You should NOT poll it during the run (see "do not poll" below) — partial transcripts give unreliable progress signal and risk filling your context with raw subagent output.
 
 The asymmetry is real: codex output is human-tail-friendly; Claude subagent output is harness-managed and notification-driven. Both are observable; the operational discipline is different.

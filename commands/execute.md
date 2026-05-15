@@ -131,11 +131,11 @@ Both reviewers use the same gstack `/review` framing (when installed) for consis
 
 - If gstack registered on codex side:
   ```bash
-  codex exec '/review <start-hash>..<end-hash>. Reference: AGENTS.md, docs-private/<topic>-goal-statement-*.md, docs-private/<topic>-goal-queue-*.md. Output findings as P0/P1/P2/P3.' > /tmp/goal-flight-gstack-codex-<topic>-<iso>.txt 2>&1 &
+  timeout --kill-after=10 300 codex exec --ignore-user-config '/review <start-hash>..<end-hash>. Reference: AGENTS.md, docs-private/<topic>-goal-statement-*.md, docs-private/<topic>-goal-queue-*.md. Output findings as P0/P1/P2/P3.' > /tmp/goal-flight-gstack-codex-<topic>-<iso>.txt 2>&1 &
   ```
 - If gstack absent on codex side:
   ```bash
-  codex exec '<contents of prompts/gstack-codex-challenge.md, with commit range and goal-queue path pasted in>' > /tmp/goal-flight-gstack-codex-<topic>-<iso>.txt 2>&1 &
+  timeout --kill-after=10 300 codex exec --ignore-user-config '<contents of prompts/gstack-codex-challenge.md, with commit range and goal-queue path pasted in>' > /tmp/goal-flight-gstack-codex-<topic>-<iso>.txt 2>&1 &
   ```
 
 Capture PID; poll temp file for completion.
@@ -143,7 +143,7 @@ Capture PID; poll temp file for completion.
 **Optional third pass** for security-relevant changes (touches auth, sessions, input handling, SQL, deserialization) — gstack `/cso`:
 
 - Claude-side: `Skill(skill: "cso", args: "<start-hash>..<end-hash>")` if registered, else dispatch subagent.
-- Codex-side: `codex exec '/cso <start-hash>..<end-hash>' > /tmp/goal-flight-gstack-cso-<topic>-<iso>.txt 2>&1 &` if registered.
+- Codex-side: `timeout --kill-after=10 300 codex exec --ignore-user-config '/cso <start-hash>..<end-hash>' > /tmp/goal-flight-gstack-cso-<topic>-<iso>.txt 2>&1 &` if registered.
 
 **Fourth pass — RAG corpus drift review** (when `docs-private/rag/` exists from init step 3.5):
 
@@ -155,7 +155,7 @@ The corpus is load-bearing for every dispatch's wrapper layers 2-4. As goals lan
   > "RAG corpus drift review. Read every file in `docs-private/rag/`. For each slice, verify against current code state: (a) do file:line refs still exist? (b) do grep patterns still match? (c) has any decision in `decisions.md` been amended/reversed by a commit in `<milestone-start>..<HEAD-after-fix-clusters>` without the slice being updated? (d) do `patterns/*.md` files still describe the canonical implementation, or has it moved/been lifted? Report per-slice P0/P1/P2/P3 findings."
 - Apply fixes inline (controller-direct) for small drift; re-dispatch a slice-builder for major drift (>30% of slice needs rewriting).
 
-If codex isn't available or stalls: proceed with Claude only; note in summary.
+If codex isn't available or stalls (the `timeout(1)` wrapper fires after 300 s, or the optional watchdog kills on zero-output ≥90 s / no-progress ≥180 s — see `reference/pattern.md` §Codex reliability): proceed with Claude only; note in summary.
 
 **c. Wait for both**; consolidate findings (dedupe; severity-rank P0/P1/P2/P3).
 
