@@ -1,6 +1,6 @@
 # goal-flight
 
-A [Claude Code](https://claude.ai/code) skill that turns a fresh session into a **controller** for long, decomposed code work. Claude Code runs out of context on multi-chunk refactors when one agent does everything; goal-flight delegates concrete work to bounded subagents and keeps the controller small, so multi-hour unattended runs land as a clean stack of one-commit-per-chunk on main without the controller's context window filling up.
+A [Claude Code](https://claude.ai/code) skill that turns a fresh session into a **controller** for long, decomposed code work. Claude Code runs out of context on multi-chunk refactors when one agent does everything; goal-flight delegates concrete work to /goal subagents with review loops, and keeps the controller small, so multi-hour unattended runs land as a clean stack of one-commit-per-chunk on main without the controller's context window filling up.
 
 ```bash
 git clone https://github.com/simonrowland/goal-flight.git ~/.claude/skills/goal-flight
@@ -8,16 +8,16 @@ git clone https://github.com/simonrowland/goal-flight.git ~/.claude/skills/goal-
 
 ## What it gets you
 
-- **Multi-hour unattended runs.** Check in periodically or respond to decision notifications. The controller's context primarily holds metadata (queue state, recent commits, in-flight dispatch headers); real work happens in subagent context windows.
+- **Multi-hour unattended runs.** Check in periodically or respond to decision notifications. The controller's context primarily holds architecture, plan, and metadata (queue state, recent commits, in-flight dispatch headers); real work happens in subagent context windows.
 - **Verification-first dispatch.** Wrappers point at files for the agent to investigate, not pre-pasted "facts" that go stale on the timescale of minutes. Frontier models trust controller-text uncritically; pointers force them to re-verify against live disk and surface drift.
-- **Parallel codex + claude reviews at milestone cadence.** Two independent reviewers (Claude and codex, OR concern-split Claude×Claude) catch what one model misses. Via [gstack](https://github.com/garrytan/gstack)'s `/review` skill when installed.
+- **Parallel codex + claude reviews at milestone cadence.** Two independent reviewers (Claude + codex) address bugs and completion before pestering you. Via [gstack](https://github.com/garrytan/gstack)'s `/review` skill when installed.
 - **Three dispatch paths** the controller picks from per chunk, not one rigid loop — controller-inline for trivial chunks, single-shot subagent for the common case, multi-hour goal-mode loop (codex `/goal` or controller-driven iteration) for chunks that need it.
 
 ## How it differs from the alternatives
 
 - vs. **running Claude Code naively** — the controller doesn't itself do the work. It dispatches and verifies, which means it stays small and runs longer before compaction.
-- vs. **cloud agents (Devin / Cursor agent)** — runs on your machine, in your Claude Code session, with your existing skills (gstack, context-mode, codex). No new platform, no separate billing per task.
-- vs. **writing prompts manually** — the dispatch wrapper is composed from a verification-first principle, not hand-crafted per goal. The 7-category adversarial self-review is embedded in every executor prompt so the executor catches its own errors before the controller verifies.
+- vs. **claw or cloud agents (Hermes / Cursor agent)** — runs on your machine, in your Claude Code session, with your existing skills (gstack, context-mode, codex). This aims to replace a team of Hermes/OpenClaw code+review agents with a workflow.
+- vs. **writing prompts manually** — make the plan, not the code. The skill asks a frontier model to decompose your plan into chunks, flagging what can run in parallel and what can have a /goal pattern. The 7-category adversarial self-review is embedded in every executor prompt so the executor catches its own errors before the controller verifies.
 
 ## Quickstart
 
