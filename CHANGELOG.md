@@ -43,6 +43,34 @@ Three-commit aggressive cull (`d67c80c` + `afcff37` + this one) following parall
 Frontier-model composition guarantee: the skill no longer carries worked examples of dispatch prompts, per-slice content shapes, or template scaffolding the agent could compose itself from a brief description. What remains is principle + load-bearing shapes + executable scripts.
 
 ### Added
+- **`scripts/self-fork-detect.sh` + self-delegation-via-fork pattern.**
+  `/fork` (Claude Code slash command, also `--fork-session` CLI flag)
+  creates a new session with a fresh `CLAUDE_CODE_SESSION_ID`. The
+  helper script lets the controller write a contract (controller's
+  session ID + task description + completion/abort signals) before
+  forking; the new session's `detect` mode prints `ORIGINAL | FORK |
+  SUBAGENT | NO_CONTRACT` by comparing env var to contract. On FORK,
+  the task + signals are printed for the fork to act on.
+
+  Empirically verified (May 2026):
+  - `claude --resume <sid> --fork-session` creates a new top-level
+    JSONL with a new session ID (`4be591f6-…` from parent `05752a67-…`
+    in the verification probe).
+  - Agent-tool subagents INHERIT the parent's
+    `CLAUDE_CODE_SESSION_ID` (their JSONL lives at `<proj>/<sid>/
+    subagents/agent-<hash>.jsonl`, nested under the parent). The
+    `detect` script's heuristic (recent activity under any `subagents/`
+    subdir + env-matches-marker) reports SUBAGENT, not ORIGINAL,
+    so a subagent that incidentally reads the contract doesn't
+    misfire as the controller.
+
+  `SKILL.md` gains a §"Self-delegation via /fork" subsection with
+  the identity-surface table + decision guide (controller-direct vs
+  Agent-tool subagent vs /fork — different trade-offs).
+  `tests/test-self-fork-detect.sh` covers the marker roundtrip and
+  the synthetic-mismatch FORK case (the actual /fork path requires
+  user interaction; the test exercises everything that can be
+  exercised non-interactively).
 - **Codex `/goal` mode integrated as a peer dispatch shape.** Codex CLI's
   experimental `/goal` slash command (gated behind `features.goals = true`
   in `~/.codex/config.toml`, requires codex ≥ 0.128.0) runs a non-
