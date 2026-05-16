@@ -4,6 +4,45 @@ Notable changes to the goal-flight Claude Code skill. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are
 incremented when meaningful skill behaviour changes.
 
+## [0.2.6] — 2026-05-16
+
+Dispatch-mode rule simplified to a duration threshold. 0.2.5 introduced a
+type-based prescription (executor = background, reviewer / planner =
+foreground) that was both wrong (most goal-flight reviewers / planners
+take 30s–3min, well past any "inline" budget) and complicated. User
+trimmed it to:
+
+> Background if the tool call is going to be over ~10 seconds, so the
+> user's terminal doesn't hang for steering.
+
+That's the whole rule. Foreground / background isn't about agent type
+or purpose — it's about whether the user can tolerate a locked terminal
+for the call's duration.
+
+### Changed
+- **SKILL.md §Per-chunk loop** tightened: opens with the dispatch rule
+  ("any tool call expected to take more than ~10 seconds runs in
+  background"), then the steps. Dropped the two-turn-cycle exposition
+  in favor of stating the rule once and letting the step list embody
+  it.
+- **SKILL.md §Three subagent types table** — Dispatch-mode column
+  (added in 0.2.5) removed; replaced with a one-line note pointing at
+  §Per-chunk loop for the duration rule. Type and mode are orthogonal;
+  the table is about type only.
+- **SKILL.md §Asking discipline** "dispatch executors in background —
+  foreground = failure mode" bullet (0.2.5) replaced with
+  "Background-dispatch anything expected to take more than ~10 seconds"
+  — same rule, simpler framing.
+
+### Why simpler
+The 0.2.5 framing dragged in "Executor = background, Reviewer = fore-
+ground" prescriptions that don't survive contact with how long goal-
+flight's actual reviewers run. The duration threshold is the actual
+predictor of whether the user's lockout cost wins. Strip the rest.
+
+### Tests
+3 suites / 46 assertions remain green.
+
 ## [0.2.5] — 2026-05-16
 
 Executor dispatch defaults to background; foreground Agent for executors
