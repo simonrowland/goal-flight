@@ -89,6 +89,41 @@ When context is ~80% full or compaction is imminent, write fresh `docs-private/R
 - **Controller delegates *bulk* Read-heavy work to Explore subagents.** Don't read whole READMEs, architecture docs, or files >200 lines directly during init or execute — spawn an Explore agent, consume its summary. Short verification reads (< 200 lines, specific `file:line` ranges, targeted `grep` / `tail -n` / `sed -n`) are fine inline. The ban is on bulk context consumption, not on the controller using its eyes.
 - **`AGENTS.md` is never overwritten.** If it exists, init proposes additions/edits as a diff for the user to apply.
 
+### Self-delegation via `/fork`
+
+Claude Code's `/fork` (renamed `/branch` in v2.1.77 but `/fork` still works) creates a new session branched off the current one with full conversation history inherited; the new session gets a new `CLAUDE_CODE_SESSION_ID`. **The forked session can self-detect via env var comparison against a marker the controller wrote before forking.**
+
+Empirical identity surface (verified):
+
+| Role | `CLAUDE_CODE_SESSION_ID` | JSONL path on disk |
+|---|---|---|
+| Controller | `X` | `<proj>/X.jsonl` (top-level) |
+| Subagent (Agent-tool dispatch) | `X` (inherited) | `<proj>/X/subagents/agent-<hash>.jsonl` (nested) |
+| Fork | `Y` (new) | `<proj>/Y.jsonl` (top-level sibling) |
+
+Use `scripts/self-fork-detect.sh`:
+
+```bash
+# 1. Controller writes the contract BEFORE typing /fork:
+bash scripts/self-fork-detect.sh write '<task the fork should execute>'
+
+# 2. After /fork (or `claude --resume <sid> --fork-session`), in the new session:
+bash scripts/self-fork-detect.sh detect
+# Prints one of: ORIGINAL | FORK | SUBAGENT | NO_CONTRACT
+# On FORK: also prints the task to execute + completion + abort signals.
+
+# 3. After the fork's work is committed:
+bash scripts/self-fork-detect.sh clear
+```
+
+Default contract path: `docs-private/.fork-contract.json` (gitignored by default per the existing `docs-private/` policy). Completion signal: `git commit + RESUME-NOTES rev bump with FORK-COMPLETE marker`. Abort signal: `write FORK-BLOCKED-<id>.md and stop`. The fork's work persists via git/RESUME-NOTES; the original controller sees it on `/rewind` or `resume`.
+
+When to use vs `[controller-direct]` vs Agent-tool subagent:
+
+- **`[controller-direct]`** — controller does the work inline. Best for trivial chunks (single-file, <30 LoC) OR when controller-state matters but the work is short.
+- **Agent-tool subagent** — fresh-context dispatch, task-notification on completion, full JSONL transcript. Best when you want the work in an isolated context (clean per-call), don't need controller's loaded state, and want the completion-notification affordance.
+- **`/fork`** — branch the controller into a new session with full inherited state. Best when controller has substantial session-loaded context the work needs AND the work is risky/exploratory enough that a `/rewind`-able savepoint helps. Single-thread (no concurrent execution); reporting back is filesystem-only (commits + RESUME-NOTES; no task-notification equivalent for forks).
+
 ### Worktree convention
 
 Controller works in the main worktree. Parallel-safe chunks each get `<repo>/.claude/worktrees/<adjective-noun>/` on a `claude/<adjective-noun>` branch. Codex trust prefix-matches the project root, so worktrees inherit automatically — no per-worktree registration. Cherry-pick onto main; do NOT use `git merge --ff-only` (sibling worktrees branched off main don't fast-forward cleanly when other worktrees committed since).
