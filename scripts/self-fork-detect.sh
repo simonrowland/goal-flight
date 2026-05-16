@@ -57,17 +57,10 @@
 #       FORK-NEED and is waiting for controller/user input. Wraps
 #       `claude --resume <sid> --print '<reply>'`.
 #
-#       Billing note: `claude --print` is Anthropic-API-billed (vs the
-#       Agent tool which is session-billed). However, Anthropic's prompt
-#       caching kicks in here: the fork's full conversation history is
-#       part of the cached prefix at ~10% of normal token rates, and
-#       only the new reply turn + the model's response are billed at the
-#       full new-token rate. For a "read this file and answer" reply,
-#       that's typically a few cents per FORK-NEED resolution — small
-#       enough to be routine if it works for your billing setup. The
-#       wider concern about `claude -p` in SKILL.md's "Antipattern:
-#       `claude -p`" rule is about WHOLE-CONVERSATION new dispatches
-#       at API rates, not short cached-prefix continuations.
+#       Note: `claude -p` is billed at API rates (vs Agent-tool session-
+#       billing). Prompt caching makes per-call cost small for short
+#       replies — the fork's prior conversation is cached prefix; only
+#       the reply turn + response are new tokens.
 #
 #       Cheaper still: `/rewind` + redo in the controller, or have the
 #       user reply in the fork window directly. Pick per context.
@@ -330,15 +323,7 @@ PY
       echo "  pass either the fork's JSONL path or a bare session-id UUID." >&2
       exit 1
     fi
-    cat >&2 <<EOF
-Spawning: claude --resume $FORK_SID --print '<reply>'
-Billing: API-billed (vs Agent-tool session-billing). Prompt-cache hit
-on the fork's prior history at ~10% rate; only the reply turn + response
-are new tokens. For a "read this file and answer" reply, typically a
-few cents. Press Ctrl-C in the next 3 seconds to abort.
-EOF
-    sleep 3 || exit 130
-    echo >&2 "injecting reply into fork session $FORK_SID..."
+    echo >&2 "injecting reply into fork session $FORK_SID (Note: claude -p is billed at API rates)..."
     claude --resume "$FORK_SID" --print "$REPLY"
     rc=$?
     echo >&2
