@@ -87,16 +87,31 @@ if os.path.isdir(projects_root):
             if f.endswith(".jsonl"):
                 jsonls_snapshot.append(os.path.join(root, f))
 
+# The fork has no clean "return value" channel like Agent-tool's task-notification.
+# Forks communicate back by EMITTING KEYWORD MARKERS in their assistant text,
+# which the controller's `monitor` mode greps from the fork's JSONL. Both ends
+# need to agree on the vocabulary — that's what marker_vocabulary captures.
+marker_vocabulary = {
+    "FORK-STATUS": "intermediate progress; controller logs but keeps monitoring. Example: 'FORK-STATUS: read 3 files, drafting plan'",
+    "FORK-RESULT": "structured output the controller should extract; key=value shape works well. Example: 'FORK-RESULT: memo_path=docs-private/MEMO.md'",
+    "FORK-NEED":   "fork is blocked on a controller / user decision; monitor exits with code 2 so the controller knows to intervene. Example: 'FORK-NEED: confirm X is in-scope'",
+    "FORK-COMPLETE": "fork is done; monitor exits with code 0. Payload is a one-line summary. Example: 'FORK-COMPLETE: queue chunks #4-7 implemented, all tests green'",
+    "FORK-BLOCKED": "fork hit an unrecoverable issue, will not continue; monitor exits with code 1. Example: 'FORK-BLOCKED: missing dependency X'",
+}
+
 contract = {
   "controller_session_id": sid,
   "marker_written_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
   "jsonl_snapshot": sorted(jsonls_snapshot),
   "fork_contract": {
     "task": task,
-    "completion_signal": "git commit + RESUME-NOTES rev bump with FORK-COMPLETE marker",
-    "abort_signal": "write docs-private/FORK-BLOCKED-<id>.md and stop without committing",
+    "marker_vocabulary": marker_vocabulary,
+    "completion_signal": "emit 'FORK-COMPLETE: <one-line summary>' in your response; commit work + bump RESUME-NOTES rev so the original controller sees the result on /rewind or resume",
+    "abort_signal": "emit 'FORK-BLOCKED: <reason>' and stop without committing",
+    "intervention_signal": "emit 'FORK-NEED: <question>' if the work hits a decision only the user can make",
+    "status_signal": "emit 'FORK-STATUS: <one-line progress update>' periodically so the controller has a heartbeat",
   },
-  "_about": "Written by scripts/self-fork-detect.sh before /fork. After /fork, the new session checks identity via `detect`. Controller can use `find-fork` to locate the new session's JSONL (diff against jsonl_snapshot) and `monitor` to watch it.",
+  "_about": "Written by scripts/self-fork-detect.sh before /fork. After /fork, the new session checks identity via `detect` (prints the task + marker vocabulary the fork should emit). Controller can use `find-fork` to locate the new session's JSONL and `monitor` to watch it.",
 }
 with open(contract_path, "w") as f:
   json.dump(contract, f, indent=2)
@@ -104,6 +119,7 @@ print(f"wrote {contract_path}")
 print(f"  controller_session_id: {contract['controller_session_id']}")
 print(f"  task: {contract['fork_contract']['task']}")
 print(f"  jsonl_snapshot: {len(jsonls_snapshot)} files captured")
+print(f"  marker vocabulary: {', '.join(marker_vocabulary.keys())}")
 PY
     ;;
 
@@ -184,13 +200,35 @@ PY
         # JSONL grew — extract events since the last poll
         if [ "$last_size" -gt 0 ]; then
           # Print the new lines (everything past the previous size)
-          tail -c "+$((last_size + 1))" "$FORK_JSONL" 2>/dev/null | \
-            jq -r 'select(.type == "assistant") | .message.content // [] | .[] | select(.type == "text") | .text[0:200]' 2>/dev/null
-          # Check for FORK-COMPLETE marker
-          if tail -c "+$((last_size + 1))" "$FORK_JSONL" 2>/dev/null | grep -q "FORK-COMPLETE"; then
+          NEW_CHUNK=$(tail -c "+$((last_size + 1))" "$FORK_JSONL" 2>/dev/null)
+          # Extract assistant text and print abbreviated
+          echo "$NEW_CHUNK" | jq -r 'select(.type == "assistant") | .message.content // [] | .[] | select(.type == "text") | .text[0:300]' 2>/dev/null
+
+          # Route on FORK-* markers (highest priority terminal markers first).
+          if echo "$NEW_CHUNK" | grep -qE "FORK-COMPLETE\b"; then
             echo
             echo "✅ FORK-COMPLETE marker observed — fork signalled completion."
+            echo "$NEW_CHUNK" | grep -oE "FORK-COMPLETE[^\"]*" | head -3
             exit 0
+          fi
+          if echo "$NEW_CHUNK" | grep -qE "FORK-BLOCKED\b"; then
+            echo
+            echo "❌ FORK-BLOCKED marker observed — fork stopped on unrecoverable issue."
+            echo "$NEW_CHUNK" | grep -oE "FORK-BLOCKED[^\"]*" | head -3
+            exit 1
+          fi
+          if echo "$NEW_CHUNK" | grep -qE "FORK-NEED\b"; then
+            echo
+            echo "🟡 FORK-NEED marker observed — fork needs controller/user intervention."
+            echo "$NEW_CHUNK" | grep -oE "FORK-NEED[^\"]*" | head -3
+            exit 2
+          fi
+          # Non-terminal markers: log and keep monitoring.
+          if echo "$NEW_CHUNK" | grep -qE "FORK-STATUS\b"; then
+            echo "  ↪ status: $(echo "$NEW_CHUNK" | grep -oE "FORK-STATUS[^\"]*" | head -1)"
+          fi
+          if echo "$NEW_CHUNK" | grep -qE "FORK-RESULT\b"; then
+            echo "  ↪ result: $(echo "$NEW_CHUNK" | grep -oE "FORK-RESULT[^\"]*" | head -1)"
           fi
         fi
         last_size="$curr_size"
@@ -200,7 +238,7 @@ PY
         idle_seconds=$((idle_seconds + POLL))
         if [ "$idle_seconds" -ge "$IDLE_STOP" ]; then
           echo
-          echo "⏸  idle ${idle_seconds}s — fork done or stuck. Stopping monitor."
+          echo "⏸  idle ${idle_seconds}s — fork done or stuck without emitting a terminal marker."
           exit 0
         fi
       fi
@@ -236,8 +274,16 @@ PY
 import json, sys
 c = json.load(open(sys.argv[1]))["fork_contract"]
 print(f"task: {c['task']}")
-print(f"on completion: {c['completion_signal']}")
-print(f"on blocker: {c['abort_signal']}")
+print()
+print("You communicate back to the controller by EMITTING KEYWORD MARKERS in your assistant text. There is no clean return channel for forks (no task-notification analog); the controller polls your JSONL for these strings. Emit them literally as shown:")
+print()
+for marker, desc in c.get("marker_vocabulary", {}).items():
+    print(f"  {marker}:  {desc}")
+print()
+print(f"completion signal: {c['completion_signal']}")
+print(f"abort signal:      {c['abort_signal']}")
+print(f"intervention:      {c.get('intervention_signal', '(emit FORK-NEED if the work hits a controller-only decision)')}")
+print(f"status (heartbeat): {c.get('status_signal', '(emit FORK-STATUS periodically)')}")
 PY
     fi
     ;;

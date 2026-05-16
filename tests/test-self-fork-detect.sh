@@ -135,8 +135,10 @@ if [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then
     sleep 2
     # Append a fork-complete event (already in initial line, but make sure monitor reads it)
     echo '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"FORK-COMPLETE: synthetic test done"}]}}' >> "$FAKE_JSONL"
+    set +e
     wait "$MONITOR_PID" 2>/dev/null
     rc=$?
+    set -e
     if [ "$rc" = "0" ] && grep -q "FORK-COMPLETE" /tmp/monitor-test-out.txt; then
       echo "test9 pass: monitor exits 0 on FORK-COMPLETE marker"
     else
@@ -146,6 +148,74 @@ if [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then
       exit 1
     fi
     rm -f "$FAKE_JSONL" /tmp/monitor-test-out.txt
+  fi
+fi
+
+
+# Test 10: write embeds marker_vocabulary in contract.
+if [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then
+  "$SCRIPT" write "test 10 task" ".fork-contract-10.json" >/dev/null
+  if python3 -c "import json,sys; c=json.load(open('.fork-contract-10.json')); v=c['fork_contract'].get('marker_vocabulary',{}); sys.exit(0 if all(k in v for k in ['FORK-STATUS','FORK-RESULT','FORK-NEED','FORK-COMPLETE','FORK-BLOCKED']) else 1)"; then
+    echo "test10 pass: write embeds all 5 markers in marker_vocabulary"
+  else
+    echo "test10 FAIL: marker_vocabulary missing required keys"
+    exit 1
+  fi
+fi
+
+# Test 11: monitor exits 1 on FORK-BLOCKED.
+if [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then
+  PROJ_DIR="$HOME/.claude/projects"
+  SUBDIR=$(ls -d "$PROJ_DIR"/* 2>/dev/null | head -1)
+  if [ -n "$SUBDIR" ]; then
+    FAKE_BLOCKED_SID="bbbb1111-test-test-test-${RANDOM}cccc"
+    FAKE_BLOCKED_JSONL="$SUBDIR/${FAKE_BLOCKED_SID}.jsonl"
+    echo '{"type":"prompt","message":{"role":"user","content":[{"type":"text","text":"start"}]}}' > "$FAKE_BLOCKED_JSONL"
+    timeout 30 "$SCRIPT" monitor "$FAKE_BLOCKED_JSONL" --poll 1 --idle-stop 5 > /tmp/monitor-blocked-out.txt 2>&1 &
+    MPID=$!
+    sleep 2
+    echo '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"FORK-BLOCKED: synthetic missing-dep test"}]}}' >> "$FAKE_BLOCKED_JSONL"
+    set +e
+    wait "$MPID" 2>/dev/null
+    rc=$?
+    set -e
+    if [ "$rc" = "1" ] && grep -q "FORK-BLOCKED" /tmp/monitor-blocked-out.txt; then
+      echo "test11 pass: monitor exits 1 on FORK-BLOCKED"
+    else
+      echo "test11 FAIL: expected rc=1; got rc=$rc"
+      cat /tmp/monitor-blocked-out.txt
+      rm -f "$FAKE_BLOCKED_JSONL" /tmp/monitor-blocked-out.txt
+      exit 1
+    fi
+    rm -f "$FAKE_BLOCKED_JSONL" /tmp/monitor-blocked-out.txt
+  fi
+fi
+
+# Test 12: monitor exits 2 on FORK-NEED (intervention required).
+if [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then
+  PROJ_DIR="$HOME/.claude/projects"
+  SUBDIR=$(ls -d "$PROJ_DIR"/* 2>/dev/null | head -1)
+  if [ -n "$SUBDIR" ]; then
+    FAKE_NEED_SID="cccc1111-test-test-test-${RANDOM}dddd"
+    FAKE_NEED_JSONL="$SUBDIR/${FAKE_NEED_SID}.jsonl"
+    echo '{"type":"prompt","message":{"role":"user","content":[{"type":"text","text":"start"}]}}' > "$FAKE_NEED_JSONL"
+    timeout 30 "$SCRIPT" monitor "$FAKE_NEED_JSONL" --poll 1 --idle-stop 5 > /tmp/monitor-need-out.txt 2>&1 &
+    MPID=$!
+    sleep 2
+    echo '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"FORK-NEED: confirm if X is in-scope"}]}}' >> "$FAKE_NEED_JSONL"
+    set +e
+    wait "$MPID" 2>/dev/null
+    rc=$?
+    set -e
+    if [ "$rc" = "2" ] && grep -q "FORK-NEED" /tmp/monitor-need-out.txt; then
+      echo "test12 pass: monitor exits 2 on FORK-NEED"
+    else
+      echo "test12 FAIL: expected rc=2; got rc=$rc"
+      cat /tmp/monitor-need-out.txt
+      rm -f "$FAKE_NEED_JSONL" /tmp/monitor-need-out.txt
+      exit 1
+    fi
+    rm -f "$FAKE_NEED_JSONL" /tmp/monitor-need-out.txt
   fi
 fi
 

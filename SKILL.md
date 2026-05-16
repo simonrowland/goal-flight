@@ -129,7 +129,21 @@ bash scripts/self-fork-detect.sh monitor <fork-jsonl-path>
 bash scripts/self-fork-detect.sh clear
 ```
 
-Default contract path: `docs-private/.fork-contract.json` (gitignored by default per the existing `docs-private/` policy). Completion signal: `git commit + RESUME-NOTES rev bump with FORK-COMPLETE marker`. Abort signal: `write FORK-BLOCKED-<id>.md and stop`. The fork's work persists via git/RESUME-NOTES; the original controller sees it on `/rewind` or `resume`.
+Default contract path: `docs-private/.fork-contract.json` (gitignored by default per the existing `docs-private/` policy).
+
+**Keyword marker vocabulary** (the only "return channel" — fork emits these in its assistant text; controller polls JSONL for them):
+
+| Marker | Semantics | Monitor exit |
+|---|---|---|
+| `FORK-STATUS: <update>` | Intermediate progress; controller logs but keeps monitoring | (keeps polling) |
+| `FORK-RESULT: <key>=<value>` | Structured output the controller should extract | (keeps polling) |
+| `FORK-NEED: <question>` | Fork is blocked on a controller/user decision | **exit 2** (intervention required) |
+| `FORK-COMPLETE: <summary>` | Fork is done | **exit 0** |
+| `FORK-BLOCKED: <reason>` | Fork hit an unrecoverable issue, won't continue | **exit 1** |
+
+`detect` (FORK case) prints this vocabulary to the fork so it knows what to emit; `monitor` greps for these strings and routes accordingly. The fork's work persists via git/RESUME-NOTES; the original controller also sees it on `/rewind` or `resume` if not actively monitoring.
+
+The keyword mechanism is the workaround for forks lacking a task-notification analog. Subagents (Agent tool) get a proper callback on completion; forks don't, so the fork must DELIBERATELY emit grep-able strings the controller polls for.
 
 When to use vs `[controller-direct]` vs Agent-tool subagent:
 
