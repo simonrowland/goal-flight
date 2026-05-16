@@ -4,13 +4,15 @@ Notable changes to the goal-flight Claude Code skill. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are
 incremented when meaningful skill behaviour changes.
 
-## [0.3.0] — 2026-05-16
+## [0.2.1] — 2026-05-16
 
-Post-convergence UX-friction batch + lessons from a parallel session using
+Post-convergence UX-friction batch + lessons from parallel sessions using
 the skill. Three substantive commits on top of the 0.2.0 convergence stack
 at `1ade7fd`, plus a grok-sweep fix-up that dropped an ungrounded review-
-channel claim and tightened prose. Three parallel grok-build review sweeps
-(broad correctness / adversarial / prose) drove the fix-up.
+channel claim and tightened prose, plus a follow-on lesson capture for the
+codex/context-mode timeout pattern surfaced in the field. Three parallel
+grok-build review sweeps (broad correctness / adversarial / prose) drove
+the fix-up.
 
 ### Added
 - **Init env summary surfaces Claude Code + context-mode versions** plus
@@ -34,6 +36,14 @@ channel claim and tightened prose. Three parallel grok-build review sweeps
   surface-installs wedge on network or leave half-installed venvs the
   next iteration trips over. Resolve the dependency surface up-front.
   Commit `f6bd2c5`.
+- **"Never wrap headless dispatches in an MCP tool call"** bullet in
+  SKILL.md §Codex reliability. Wrapping `codex exec` / `grok -p` /
+  `claude -p` inside `ctx_execute` (or any MCP tool call) hits the
+  MCP/context timeout — the controller sees a hang even though the
+  underlying process ran fine and exited. Pattern: Bash + `>` redirect
+  to a file, poll via `while kill -0 $PID; do sleep 15; done`,
+  `ctx_search` the captured output AFTER exit. Canonical upstream
+  capture: `montecarlo/AGENTS.md` §GStack Claude Reviews.
 
 ### Changed
 - **README Quickstart now flags the DRAFT-goal gate** so first-time users
