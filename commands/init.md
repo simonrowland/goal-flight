@@ -14,7 +14,7 @@ Run in parallel:
 - `git rev-parse --show-toplevel` → bail if not a git repo.
 - `command -v codex` → capture path. If present, also capture `codex --version` (e.g. `codex-cli 0.130.0`) and record it in the init summary — codex CLI behaviour shifts between versions (flag names, MCP semantics, plugin defaults), and the dispatch-shape assumptions in `SKILL.md` are pinned to a version. RESUME-NOTES forensics later are easier with the version recorded.
 - `command -v bun` → capture version.
-- `command -v grok` → capture path + `grok --version` if present. Grok is a peer dispatch target for `/goal`-mode chunks via the Opus/Grok iteration loop fallback (see `SKILL.md` §Fallback: Grok iteration loop). If absent, the skill still works — Opus iteration (via Agent tool) is the no-extra-install fallback. If present, surface availability in the summary so the controller knows the model-diversity option is available for stuck-iteration recovery.
+- Grok probe — check both `command -v grok` AND `~/.grok/bin/grok`. The xAI grok installer puts the binary at `~/.grok/bin/` and adds that path to `~/.zshrc`; Claude Code's Bash tool runs a non-interactive shell that doesn't source `.zshrc`, so `command -v grok` returns empty even when grok works fine in the user's terminal. Capture either path that resolves + `grok --version`. Grok is a peer dispatch target for `/goal`-mode chunks via the Opus/Grok iteration loop fallback (see `SKILL.md` §Fallback: Grok iteration loop). If absent on both probes, the skill still works — Opus iteration (via Agent tool) is the no-extra-install fallback. If present, surface availability + the resolved absolute path in the summary so subsequent dispatches in this skill can use the absolute path directly rather than re-fighting PATH discovery.
 - Check gstack install on the **Claude side** (the controller side) plus codex side for parallel-reviewer milestone use:
   - Claude-side: `[ -d ~/.claude/skills/gstack ]`
   - Codex-side: `[ -d ~/.codex/skills/gstack ]`
@@ -62,14 +62,14 @@ The setup script registers gstack on both Claude and codex sides. If only one si
 
 If `context-mode` MCP is missing on either side, offer install with a pointer to https://github.com/simonrowland/context-mode. Context-mode offloads large command outputs (diffs, test runs, greps, codex tails) to an FTS5 sandbox — a real multiplier on `/goal` loops where shell output fills context fast. Decline = note in summary that large-output handling falls back to direct Bash/Read.
 
-**Auto-mirror context-mode Claude→codex** (when present Claude-side but missing the matching `[mcp_servers.context-mode]` block in `~/.codex/config.toml` — codex MCP registration is fiddly by hand). Auto-runs without y/n — the user opted in by running `init` and the backup makes the mutation recoverable. If extraction fails (uncommon plugin variant, missing `jq`), no-op silently; the pointer above covers manual install.
+**Auto-register context-mode on codex side** (when Claude has it but codex doesn't — codex MCP registration is fiddly by hand). Run `python3 ~/.claude/skills/goal-flight/scripts/register-context-mode-codex.py`. The script:
 
-Steps the controller takes:
+- Detects Claude-side install (explicit `mcpServers` entry OR plugin form under `~/.claude/plugins/`).
+- Skips if codex isn't installed, or if `~/.codex/config.toml` already has `[mcp_servers.context-mode]` (preserves user customization — does NOT clobber).
+- Writes the canonical npx form (`command = "<npx>"`, `args = ["-y", "context-mode@latest"]`) — bypasses the `${CLAUDE_PLUGIN_ROOT}` resolution problem (codex doesn't shell-expand that variable; the npm-published `context-mode` package is the portable form).
+- Backs up the existing TOML (collision-resistant suffix via `mktemp`) and writes atomically under `flock` so concurrent init invocations don't corrupt the file.
 
-1. Extract the Claude-side launch command + args. Try in order: `jq '.mcpServers["context-mode"]' ~/.claude.json` → `jq '.mcpServers["context-mode"]' ~/.claude/settings.json` → the plugin manifest under `~/.claude/plugins/context-mode/` (probe with `find … -name manifest.json` then `jq '.mcp.command // .command'`).
-2. Back up the existing TOML: `cp ~/.codex/config.toml ~/.codex/config.toml.bak.$(date +%Y%m%d-%H%M%S)` (create the directory first if absent).
-3. Append a `[mcp_servers.context-mode]` block with `command = "<extracted>"` and `args = [<extracted>]`. TOML accepts JSON-array syntax for arrays-of-strings, so the Claude-side `args` array writes verbatim. If env vars were declared Claude-side, mirror them as `env = { KEY = "value", ... }`.
-4. Report exactly what landed in `~/.codex/config.toml` (the block + the backup path) so the user can audit.
+Auto-runs without y/n — backup makes it recoverable; the user opted in by running `init`. Run `python3 .../register-context-mode-codex.py --check` for state-only (no writes). Tests at `tests/test-register-context-mode-codex.sh` cover fresh state, idempotency, no-clobber, plugin form, malformed JSON, and the backup path.
 
 **Register the project as codex-trusted** (one-time, idempotent — prevents codex MCP approval-gate stalls in non-interactive dispatches):
 

@@ -2,6 +2,25 @@
 
 The init step's corpus-builder pipeline produces this structure under `docs-private/rag/`. Each slice is curated by a dedicated subagent at init time and refreshed by the corpus-drift reviewer at milestone reviews. Dispatch composition then becomes "select which slices apply to this chunk" — controller picks; subagents read.
 
+## Frontmatter (every slice)
+
+Every slice file starts with a YAML frontmatter block bracketed by `---` fences. The `verified-at` field is load-bearing — the `SKILL.md` pre-flight corpus-drift probe reads it across slices, and milestone-review drift checks use it to decide whether to re-verify or re-build.
+
+```
+---
+verified-at: <40-char commit SHA from `git rev-parse HEAD` at write time>
+slice: <slice path relative to docs-private/rag/>
+sources: <bullet list of source file paths the slice distilled from>
+---
+```
+
+Rules (pin these — the corpus-drift probe in `SKILL.md` depends on the exact shape):
+
+- `verified-at` is the **full 40-character** commit SHA (not short). The probe runs `git rev-list --count <verified-at>..HEAD` — short SHAs collide more often and `rev-list` may reject ambiguous references.
+- Key spelling: lowercase `verified-at` with hyphen, not `verified_at` / `verifiedAt` / `Verified-At`.
+- Delimiters: standard YAML frontmatter (`---` open, `---` close).
+- One slice = one frontmatter block at the top of the file. No mid-file frontmatter; no per-section verified-at.
+
 ## Directory
 
 ```
