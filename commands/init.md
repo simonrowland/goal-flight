@@ -62,6 +62,15 @@ The setup script registers gstack on both Claude and codex sides. If only one si
 
 If `context-mode` MCP is missing on either side, offer install with a pointer to https://github.com/simonrowland/context-mode. Context-mode offloads large command outputs (diffs, test runs, greps, codex tails) to an FTS5 sandbox — a real multiplier on `/goal` loops where shell output fills context fast. Decline = note in summary that large-output handling falls back to direct Bash/Read.
 
+**Auto-mirror context-mode Claude→codex** (when present Claude-side but missing the matching `[mcp_servers.context-mode]` block in `~/.codex/config.toml` — codex MCP registration is fiddly by hand). Auto-runs without y/n — the user opted in by running `init` and the backup makes the mutation recoverable. If extraction fails (uncommon plugin variant, missing `jq`), no-op silently; the pointer above covers manual install.
+
+Steps the controller takes:
+
+1. Extract the Claude-side launch command + args. Try in order: `jq '.mcpServers["context-mode"]' ~/.claude.json` → `jq '.mcpServers["context-mode"]' ~/.claude/settings.json` → the plugin manifest under `~/.claude/plugins/context-mode/` (probe with `find … -name manifest.json` then `jq '.mcp.command // .command'`).
+2. Back up the existing TOML: `cp ~/.codex/config.toml ~/.codex/config.toml.bak.$(date +%Y%m%d-%H%M%S)` (create the directory first if absent).
+3. Append a `[mcp_servers.context-mode]` block with `command = "<extracted>"` and `args = [<extracted>]`. TOML accepts JSON-array syntax for arrays-of-strings, so the Claude-side `args` array writes verbatim. If env vars were declared Claude-side, mirror them as `env = { KEY = "value", ... }`.
+4. Report exactly what landed in `~/.codex/config.toml` (the block + the backup path) so the user can audit.
+
 **Register the project as codex-trusted** (one-time, idempotent — prevents codex MCP approval-gate stalls in non-interactive dispatches):
 
 - Run `bash ~/.claude/skills/goal-flight/scripts/install-codex-overrides.sh --check` against the project root. (The script handles its own path resolution and accepts an optional explicit path arg.) Three outcomes:
@@ -177,11 +186,15 @@ Branch: <branch> @ <head>
 3. docs-private/<topic>-goal-queue-<date>.md
 4. <next: whatever is queued>
 
+## Decisions log (append-only)
+One line per mid-run decision resolved (Q → A → why). Lets a resuming controller see settled questions without re-asking them, and prevents oscillation when later chunks re-surface the same ambiguity.
+- <YYYY-MM-DD HH:MM> — <decision summary; e.g., "use sqlite WAL mode for the corpus index → parallel readers from look-ahead subagents">
+
 ## First 5 minutes
 <exact next steps for the next controller>
 ```
 
-After init: `(rev 0)` H1 line literally says "init complete; ready for `/goal-flight decompose-plan`." Bump `(rev N)` for subsequent revisions; never overwrite.
+After init: `(rev 0)` H1 line literally says "init complete; ready for `/goal-flight decompose-plan`." Bump `(rev N)` for subsequent revisions; never overwrite. The Decisions log is append-only within a rev AND across revs — never delete entries; later revs preserve all prior decisions.
 
 **`<repo-root>/docs-private/worker-context.md`** — OPTIONAL, only create if AGENTS.md is huge (>1000 lines) or the project has multiple distinct worker profiles. Default: skip — executors read AGENTS.md directly per the "Worker context is optional" hard convention in `SKILL.md`. If you create it, it's a ~150-line precis with: one-line scope, the 3-5 most load-bearing invariants, where to put new code (path table), build/test commands. Executors read this instead of full AGENTS.md.
 
