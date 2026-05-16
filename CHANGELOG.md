@@ -6,6 +6,42 @@ incremented when meaningful skill behaviour changes.
 
 ## [Unreleased]
 
+### **STRIP REFACTOR — skill collapsed from ~230 KB to ~30 KB**
+
+Three-commit aggressive cull (`d67c80c` + `afcff37` + this one) following parallel claude + codex reviews of the prior state. Reviewers surfaced cross-file drift (P0), validate-dispatch shallow heuristics + verification-first conflict (P1/P2), and an install-script path-trust vulnerability (P0). Plus a user-level realization that frontier models don't need per-slice templates or pre-pasted wrapper examples to do good work; the templates were calcifying around one project's idioms and over-prescribing for others.
+
+**Deleted (~2000 lines stripped across the strip):**
+- 6 rag-slice templates (`templates/rag-slice-*.md.tpl`).
+- 4 init-time templates (`AGENTS.md.tpl`, `RESUME-NOTES.tpl`, `goal-statement.md.tpl`, `worker-context.md.tpl`) — inlined as 5–15 line shapes in `commands/init.md`.
+- `templates/goal-queue.tpl` — inlined as compact shape in `commands/decompose-plan.md` step 3.
+- 4 RAG-pipeline prompt files (`rag-slice-builder.md`, `rag-slice-review.md`, `rag-cross-slice-consolidation.md`, `rag-final-assessment.md`) — collapsed into 4 short pass briefs in `commands/build-corpus.md`.
+- `reference/pattern.md` — folded into `SKILL.md` (now the canonical gist; `/goal-flight` no-args prints it).
+- `prompts/dispatch-wrapper.md` — stripped from 15 KB of per-layer worked examples to ~5 KB of verification-first principle + Layer 0 spec + principle table for layers 1–5. Examples calcified; the principle generalizes.
+
+**Rewrites:**
+- `SKILL.md` — now beefier (folded in `pattern.md`'s Codex reliability, /goal mode, Handoff before compact, state-three-layers, three-dispatch-paths, three-subagent-types, Don'ts).
+- `commands/validate-dispatch.md` — aligned with verification-first wrapper (was telling controllers to "paste these slices" while wrapper said "point at them"). Heuristics tightened: catches `:line` anchors without verification framing in same paragraph, catches stale-`git fetch` as P0 blocker, catches Layer 5 specialization in prompt (was inverted before).
+- `commands/build-corpus.md` and `commands/init.md` step 3.5 — RAG pipeline expressed as 4 short pass briefs instead of per-pass prompt-file references.
+- `README.md` — stripped from 16 KB to ~6 KB. Cut the 12-knob parameter-space table and 5 example tunings; both were one-project-specific calcification. Kept the Quickstart, sub-command table, Why-the-pattern-works gist, Adapting-via-agent-edit paragraph, When-NOT-to-use list.
+
+**Codex reviewer P0 fix (`scripts/install-codex-overrides.sh`):**
+- Added path-guard rejecting `/`, `$HOME` exactly, and single-segment paths under root (`/usr`, `/tmp`, `/etc`, etc.). Prior version accepted `/` and wrote `[projects."/"] trust_level = "trusted"` — effectively trusting every cwd via prefix-match. Verified guards reject all four cases and pass a legitimate deep path through.
+- Bonus: warns (but doesn't block) if the target isn't a git repo. Most legitimate codex-trusted projects are git repos; a missing `.git/` is usually a sign of a mistake but legitimate cases exist (research dirs).
+
+**Codex reviewer P1/P2 fixes:**
+- `prompts/dispatch-wrapper.md`: controller-side worktree-base verify now documented as a belt-and-braces alongside prompt-side Layer 0 (`git -C <worktree> rev-parse HEAD == expected` before dispatch). Honor-system Layer 0 alone is too weak.
+- `commands/validate-dispatch.md` + `prompts/dispatch-wrapper.md` Layer 0: expected SHA captured via `git fetch origin && git rev-parse origin/main` from the MAIN worktree, not local `main` alone. Local can be stale.
+
+**Remaining files** (load-bearing, kept):
+- `templates/codex-goal-prompt.md.tpl` — /goal mode prompt skeleton (Objective / Workspace / Rules / Acceptance / Test gates / Blocker protocol / Edit policy / Final response schema). Non-prescriptive shape that activates codex /goal mode non-interactively + serves as the goal-prompt for Opus/Grok iteration loops.
+- `templates/rag-corpus-schema.md.tpl` — corpus directory shape + per-slice word budgets + verified-at frontmatter convention.
+- 8 prompts (`ask-anticipatory.md`, `decomposition-review.md`, `dispatch-wrapper.md`, `dual-plan-adversarial.md`, `executor-self-review.md`, `gstack-claude-review.md`, `gstack-codex-challenge.md`, `repo-audit.md`).
+- 8 commands.
+- `scripts/install-codex-overrides.sh` (hardened).
+- `tests/` (1 test file, 8 assertions, still green).
+
+Frontier-model composition guarantee: the skill no longer carries worked examples of dispatch prompts, per-slice content shapes, or template scaffolding the agent could compose itself from a brief description. What remains is principle + load-bearing shapes + executable scripts.
+
 ### Added
 - **Codex `/goal` mode integrated as a peer dispatch shape.** Codex CLI's
   experimental `/goal` slash command (gated behind `features.goals = true`
