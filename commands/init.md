@@ -12,6 +12,7 @@
 
 Run in parallel:
 - `git rev-parse --show-toplevel` → bail if not a git repo.
+- `claude --version` → capture the leading semver (e.g. `2.1.142` from `2.1.142 (Claude Code)` output; `awk '{print $1}'`). Surface in the env summary alongside codex. Derive the primary self-delegation slash form: `/branch` is canonical at ≥ 2.1.77 (the rename pin documented in `SKILL.md` §Self-delegation via `/fork`); `/fork` still works as an alias. Surface both so SKILL.md self-delegation references match the running CLI, and RESUME-NOTES forensics can pin behaviour to a CLI version (Claude Code does not version-stamp session JSONLs).
 - `command -v codex` → capture path. If present, also capture `codex --version` (e.g. `codex-cli 0.130.0`) and record it in the init summary — codex CLI behaviour shifts between versions (flag names, MCP semantics, plugin defaults), and the dispatch-shape assumptions in `SKILL.md` are pinned to a version. RESUME-NOTES forensics later are easier with the version recorded.
 - `command -v bun` → capture version.
 - Grok probe — check both `command -v grok` AND `~/.grok/bin/grok`. The xAI grok installer puts the binary at `~/.grok/bin/` and adds that path to `~/.zshrc`; Claude Code's Bash tool runs a non-interactive shell that doesn't source `.zshrc`, so `command -v grok` returns empty even when grok works fine in the user's terminal. Capture either path that resolves + `grok --version`. Grok is a peer dispatch target for `/goal`-mode chunks via the Opus/Grok iteration loop fallback (see `SKILL.md` §Fallback: Grok iteration loop). If absent on both probes, the skill still works — Opus iteration (via Agent tool) is the no-extra-install fallback. If present, surface availability + the resolved absolute path in the summary so subsequent dispatches in this skill can use the absolute path directly rather than re-fighting PATH discovery.
@@ -23,6 +24,7 @@ Run in parallel:
 - Check context-mode install on **both sides**:
   - Delegate authoritative detection to `python3 <skill-root>/scripts/register-context-mode-codex.py --check` (path resolution per the auto-register block below). The script does content-only detection — `mcpServers["context-mode"]` lookup across `~/.claude.json` / `~/.claude/settings.json` and every `plugin.json` under `~/.claude/plugins/` (no path-substring heuristic; bundle plugins and custom-named install dirs are handled). On codex side it tomllib-parses `~/.codex/config.toml` and recognizes bracket-table, quoted-key, and inline-table forms while ignoring comments.
   - `--check` exit codes: `0` — codex absent OR codex already registered (nothing to do); `1` — codex missing the block (whether Claude has it or not — surface to user so they can investigate); `2` — Python <3.11, the script can't run; `4` — codex needs register AND `npx` is missing on PATH (install Node.js first; the subsequent write would have failed). Capture the verdict for the env summary.
+  - Version capture (when detected on either side): `npx -y context-mode@latest --version 2>/dev/null | head -1` returns e.g. `1.0.135`. Run once and cache for the env summary. Skip silently on missing `npx` or failed call — the `--check` verdict is still actionable without a version. Helps users see when the running ctx_* tools diverge from the package the corpus was scored against.
 
 If `codex` missing: tell the user (do NOT auto-install):
 > "codex CLI not found. Install with `npm install -g @openai/codex && codex login`. The skill works without codex (Claude subagents only) but loses parallel-reviewer capability for milestone reviews."
@@ -292,7 +294,9 @@ If the self-review finds gaps, surface them to the user as a TODO comment block 
 ### 6. Print summary
 
 - Files created / modified (one path per line).
+- Claude Code version + primary self-delegation form (e.g. `2.1.142` → primary `/branch`; `/fork` still works as alias at ≥ 2.1.77).
 - Codex install status (path + version, or "missing — install command above").
+- Context-mode version (if registered, with the side(s) where the registration was found — e.g. `1.0.135 (claude+codex)`).
 - gstack install status (installed / installed-during-init / declined — using fallback prompts).
 - Audit subagent's high-level findings (project type, invariant count, AGENTS.md status).
 - Goal statement status (concrete / interrogated-via-office-hours / DRAFT — sharpen before execute).
