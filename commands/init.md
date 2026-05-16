@@ -178,6 +178,7 @@ If AGENTS.md exists: **merge mode** — read existing; surface a diff of propose
 
 ```
 # Resume Notes — <DATE> (rev 0)
+Skill-loaded: <LOADED_LINE from SKILL.md §Session pre-flight probe 1, captured at write time>
 
 ## TL;DR
 <one paragraph: where we are, what's in flight, what's queued>

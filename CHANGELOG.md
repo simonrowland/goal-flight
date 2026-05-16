@@ -4,6 +4,52 @@ Notable changes to the goal-flight Claude Code skill. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are
 incremented when meaningful skill behaviour changes.
 
+## [0.2.2] — 2026-05-16
+
+Skill-update drift detection. Long-running controller sessions could load
+SKILL.md, run for hours, and never notice when `git pull` refreshed the
+skill on disk — they kept using the stale content. Failure surface for
+this in 0.2.1: a session that loaded before the MCP-wrap rule shipped
+would keep wrapping `codex exec` in `ctx_execute` and burning time on
+mysterious hangs.
+
+Grok design exploration (`/tmp/grok-autoupdate-out.txt`) proposed four
+options ranked across lightness × unobtrusiveness × coverage; Option 2
+shipped here. (Option 1, a dedicated `scripts/check-skill-update.sh`,
+queued for 0.2.3 once this pattern proves out.)
+
+### Added
+- **`Skill-loaded:` header line** with `version@git-sha fprint:<8 hex>`
+  in three places: emitted in session pre-flight's opening parenthetical
+  (`SKILL.md` §Session pre-flight probe 1); written into new goal-queue
+  files (`commands/decompose-plan.md` step 3); written into new
+  RESUME-NOTES files (`commands/init.md` step 3). The fprint is
+  `sha256(SKILL.md + commands/execute.md + prompts/dispatch-wrapper.md)`
+  truncated to 8 hex chars — catches behaviour-affecting edits while
+  ignoring isolated prompt-tweaks elsewhere.
+- **Probe 4 in §Session pre-flight: skill-update drift.** When an
+  in-flight goal-queue or RESUME-NOTES carries a `Skill-loaded:` header
+  that differs from the live LOADED_LINE, surface one line:
+  `"Skill updated since this session loaded: <old> -> <new>. Re-invoke
+  /goal-flight to refresh SKILL.md, or read the section you need."`
+  Silent when lines match exactly or when the file carries no header
+  (legacy file from < 0.2.2 — treat as no-data, not as drift).
+- **Read-and-compare sites** added in `SKILL.md` §resume steps 1-2 and
+  `commands/execute.md` §Pre-flight — every controller entrypoint that
+  reads a state file now does the comparison so the drift catches
+  early, before the dispatched executors operate on stale conventions.
+
+### Sources
+- `/tmp/grok-autoupdate-out.txt` — grok-build design exploration that
+  proposed Options 1-4 and recommended 2.
+- Field motivation: see 0.2.1 §"Never wrap headless dispatches in an
+  MCP tool call" — the rule users would miss until the next session
+  restart absent this detection mechanism.
+
+### Tests
+3 suites / 46 assertions remain green (no test changes — convention
+addition for the controller to follow; testable scripts unchanged).
+
 ## [0.2.1] — 2026-05-16
 
 Post-convergence UX-friction batch + lessons from parallel sessions using

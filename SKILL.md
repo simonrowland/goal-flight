@@ -1,6 +1,6 @@
 ---
 name: goal-flight
-version: 0.2.1
+version: 0.2.2
 description: "long-running unattended controller for chunked code work — init repo, decompose plan, anticipate questions, execute with embedded review and milestone gstack sweeps"
 allowed-tools:
   - Bash
@@ -29,11 +29,20 @@ The controller dispatches `/goal` chunks to executor subagents, embeds adversari
 
 ## Session pre-flight (silent — surface only what fires)
 
-On `/goal-flight` invocation, the controller orients itself with three fast probes before responding to any sub-command. Silent on a fresh project; surfaces drift before it bites.
+On `/goal-flight` invocation, the controller orients itself with four fast probes before responding to any sub-command. Silent on a fresh project; surfaces drift before it bites.
 
-1. **Skill version** — try in order: `cat ~/.claude/skills/goal-flight/VERSION`, then any `VERSION` file beside a `SKILL.md` matching this skill (`find ~/.claude/plugins -path '*goal-flight/VERSION'` for plugin-form installs). Skip silently if neither resolves. Quote as `(goal-flight v<X.Y.Z>)` parenthetical in the session's first non-trivial response so RESUME-NOTES forensics can pin behaviour to a version.
+1. **Skill version + load-time fingerprint** — resolve the skill root: clone-form `~/.claude/skills/goal-flight/` first; plugin-form fallback `find ~/.claude/plugins -maxdepth 4 -type d -name goal-flight 2>/dev/null | head -1`. Skip silently if neither resolves. Compute the load-time fingerprint via this recipe (canonical home; other sites cite "per pre-flight recipe"):
+   ```bash
+   SKILL_ROOT=<resolved-above>
+   VERSION=$(head -1 "$SKILL_ROOT/VERSION")
+   GIT_SHA=$(git -C "$SKILL_ROOT" rev-parse --short HEAD 2>/dev/null || echo no-git)
+   FPRINT=$(cat "$SKILL_ROOT/SKILL.md" "$SKILL_ROOT/commands/execute.md" "$SKILL_ROOT/prompts/dispatch-wrapper.md" 2>/dev/null | shasum -a 256 | awk '{print $1}' | head -c 8)
+   LOADED_LINE="Skill-loaded: ${VERSION}@${GIT_SHA} fprint:${FPRINT}"
+   ```
+   Quote `LOADED_LINE` as a parenthetical in the session's first non-trivial response (e.g. `(Skill-loaded: 0.2.2@9ef12ae fprint:a1b2c3d4)`). The same line is written into goal-queue and RESUME-NOTES headers when those files are created (see `commands/decompose-plan.md` step 3 / `commands/init.md` step 3) and read back by probe 4 to detect updates mid-run.
 2. **In-flight state** — `find docs-private -maxdepth 1 -name 'RESUME-NOTES-*.md' -mtime -7 2>/dev/null | sort | tail -3` (mtime-filtered: only recent files trip the nudge; year-old RESUME-NOTES from a prior topic don't). If any match and the user invoked something other than `resume` / `goal` / `init`, surface a one-line nudge: "RESUME-NOTES from <date> exists — run `/goal-flight resume` first?" User redirects if they meant to start fresh.
 3. **Corpus drift** — if `docs-private/rag/` exists, read the oldest `verified-at:` SHA from slice frontmatter (format pinned in `templates/rag-corpus-schema.md.tpl` §Frontmatter — YAML frontmatter, lowercase `verified-at`, full 40-char SHA). If `git rev-list --count <SHA>..HEAD` exceeds 20, surface "corpus is N commits stale — executors will verify aggressively or run `/goal-flight build-corpus --next-wave`."
+4. **Skill-update drift** — when an in-flight goal-queue (`docs-private/*-goal-queue-*.md`) or RESUME-NOTES contains a `Skill-loaded:` header, compare it to the live `LOADED_LINE` from probe 1. If any of version / git sha / fprint differs, surface one line: `"Skill updated since this session loaded: <stored-line> -> <live-line>. Re-invoke /goal-flight to refresh SKILL.md, or read the section you need."` Then continue. Skip silently when (a) the lines match exactly, or (b) the file has no `Skill-loaded:` header at all (legacy file written before 0.2.2 shipped this convention — treat as no-data, not as drift).
 
 A fresh project trips none of these. They cost ~50 ms (~200 ms on slow-startup shells) and prevent silent staleness compounding across a 12-hour run.
 
@@ -249,10 +258,10 @@ The shapes for reviewer + planner live in their respective prompt files, NOT com
 ## Resume / goal sub-commands (handled inline)
 
 ### `resume`
-1. Find the most recent `docs-private/RESUME-NOTES-*.md`. If none, bail: "Run `/goal-flight init <topic>` first."
-2. Find the most recent goal-queue: `docs-private/*-goal-queue-*.md`.
+1. Find the most recent `docs-private/RESUME-NOTES-*.md`. If none, bail: "Run `/goal-flight init <topic>` first." If the file carries a `Skill-loaded:` header, compare it to the live `LOADED_LINE` (per §Session pre-flight probe 1 recipe) and surface the drift nudge from probe 4 if they differ.
+2. Find the most recent goal-queue: `docs-private/*-goal-queue-*.md`. Same `Skill-loaded:` comparison if the header is present.
 3. Read git state via Bash: `git rev-parse HEAD`, `git rev-parse --abbrev-ref HEAD`, `git log --oneline -20`.
-4. Spawn a subagent to write `docs-private/RESUME-NOTES-<today>.md`. If today's file exists, increment `(rev N)` in H1 instead of overwriting. RESUME-NOTES contains: TL;DR (one paragraph), Progress table verbatim, in-flight executor IDs/PIDs, reading order on wake (numbered file list), first-5-minutes (exact next steps).
+4. Spawn a subagent to write `docs-private/RESUME-NOTES-<today>.md`. If today's file exists, increment `(rev N)` in H1 instead of overwriting. RESUME-NOTES contains: TL;DR (one paragraph), Progress table verbatim, in-flight executor IDs/PIDs, reading order on wake (numbered file list), first-5-minutes (exact next steps). New writes include the current `Skill-loaded:` header (per `commands/init.md` step 3 shape).
 5. Print: file path; placeholders the user still needs to fill in.
 
 ### `goal <SLUG>`

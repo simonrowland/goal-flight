@@ -8,6 +8,7 @@ Run the per-chunk loop. **Sequential by default.** With `--parallel N`: spawn up
 
 - Find most recent `docs-private/RESUME-NOTES-*.md`. Delegate the read to an Explore subagent if it's large.
 - Find most recent goal-queue: `docs-private/<topic>-goal-queue-*.md`.
+- **Skill-update drift check** — if either file carries a `Skill-loaded:` header, compare it to the live `LOADED_LINE` per `SKILL.md` §Session pre-flight probe 1 recipe. If different, surface the one-line nudge from probe 4 before composing any dispatch wrapper (executor prompts will still be valid, but the controller should know the skill itself changed under it).
 - Verify reality via Bash: `git log --oneline -10`, `git status`, `git rev-parse HEAD`. Confirm matches RESUME-NOTES' Code-state section.
 - Quick test smoke if known (e.g. `pytest --collect-only`).
 - If drift between RESUME-NOTES and reality: pause, surface to user, do not dispatch.
