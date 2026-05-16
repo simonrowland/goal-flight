@@ -4,6 +4,48 @@ Notable changes to the goal-flight Claude Code skill. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are
 incremented when meaningful skill behaviour changes.
 
+## [0.2.4] — 2026-05-16
+
+Per-chunk turn-yielding rule made explicit. Field motivation: a user
+running goal-flight against an academic-paper drafting flow watched
+the controller dispatch chunks #9, #10, #11 back-to-back, each as a
+proper subagent — but typed status requests and steering piled up
+unprocessed at the bottom of the chat. The chunks WERE going to
+subagents (correct path); the bug was that the controller was
+chaining N chunks inside one assistant turn, so user-typed messages
+queued at the harness level and never surfaced until the chain
+broke.
+
+0.2.3 fixed the controller-direct interactivity tradeoff but missed
+this larger pattern: even when dispatching correctly, chaining inside
+one turn defeats interjection. 0.2.4 closes that gap.
+
+### Changed
+- **SKILL.md §Per-chunk loop step 7 added (new step):** yield the
+  turn before dispatching chunk N+1. Emit a one-line status (`Chunk
+  #N landed at <sha>. Dispatching chunk #N+1.`) and STOP the current
+  assistant turn. The next chunk dispatch fires on the next turn,
+  triggered by user input (their queued message processes first) or
+  by silent continuation (no input → next chunk proceeds). Exception
+  carved for `[goal-mode]` loops where the loop primitive owns
+  turn-boundaries.
+- **SKILL.md §Asking discipline** gains a companion bullet:
+  "Yield the turn between chunks" — clarifies this is NOT a Netflix
+  check-in (no `Continue?` prompt) but a clean turn boundary the
+  Claude Code harness needs to drain queued input.
+
+### Why this matters
+Without per-chunk yielding, a 14-chunk unattended run looks correct
+from the controller's perspective (each chunk dispatched, verified,
+committed) and broken from the user's perspective (no way to steer
+mid-run despite multiple typed attempts). The skill's whole premise
+is "12-hour unattended runs where you check in periodically rather
+than babysit" — but "check in periodically" requires the check-ins
+to actually work.
+
+### Tests
+3 suites / 46 assertions remain green (prose-only changes).
+
 ## [0.2.3] — 2026-05-16
 
 Interactivity tradeoff for `[controller-direct]` dispatch path made
