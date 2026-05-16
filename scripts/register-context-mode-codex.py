@@ -248,7 +248,10 @@ def main(argv: list[str]) -> int:
     parser.add_argument(
         "--check",
         action="store_true",
-        help="Report state; write nothing. Exit 0 if registered or codex absent; 1 if missing.",
+        help=(
+            "Report state; write nothing. Exit 0 if registered or codex absent; "
+            "1 if codex needs the block; 4 if needs the block AND npx is missing on PATH."
+        ),
     )
     args = parser.parse_args(argv)
 

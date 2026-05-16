@@ -73,7 +73,7 @@ Then run: `python3 <resolved-path>` (and `--check` for state-only). The script:
 - Writes the canonical npx form (`command = "<npx>"`, `args = ["-y", "context-mode@latest"]`) — bypasses the `${CLAUDE_PLUGIN_ROOT}` resolution problem (codex doesn't shell-expand that variable; the npm-published `context-mode` package is the portable form).
 - Backs up the existing TOML (collision-resistant suffix via `mktemp`) and writes atomically under `flock` so concurrent init invocations don't corrupt the file.
 
-Auto-runs without y/n — backup makes it recoverable; the user opted in by running `init`. Requires Python 3.11+ (script uses `tomllib` for TOML-aware existing-registration detection). Tests at `tests/test-register-context-mode-codex.sh` cover fresh state, idempotency, no-clobber, plugin form, malformed JSON, inline-table TOML form, commented-out form, non-dict JSON, missing-npx, and lock cleanup (15 assertions).
+Auto-runs without y/n — backup makes it recoverable; the user opted in by running `init`. Requires Python 3.11+ (script uses `tomllib` for TOML-aware existing-registration detection). Tests at `tests/test-register-context-mode-codex.sh` cover fresh state, idempotency, no-clobber, plugin form, malformed JSON, inline-table TOML form, commented-out form, non-dict JSON, missing-npx, lock cleanup, and `--check` npx-absent exit code 4 (16 assertions).
 
 **Register the project as codex-trusted** (one-time, idempotent — prevents codex MCP approval-gate stalls in non-interactive dispatches):
 
