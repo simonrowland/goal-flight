@@ -5,11 +5,11 @@ for what you find, not for what you wrote. Severity-rank P0/P1/P2/P3.
 
 **Controller note**: the categories below are intentionally abstract for
 portability. When pasting this into an executor dispatch, **specialize each
-bullet to this goal's project nouns and grep patterns** — atoms-close vs
-row-counts vs column-nullability vs tool-call wellformedness etc. The
-abstract category names mean nothing to an executor until you tell them
-which file, which mutation, which artifact to check. See
-`prompts/dispatch-wrapper.md` layer 5 for worked specialization examples.
+bullet to this goal's project nouns and grep patterns** — the abstract
+category names mean nothing to an executor until you tell them which file,
+which mutation, which artifact to check. See `prompts/dispatch-wrapper.md`
+for the verification-first principle and the slice-to-layer mapping when a
+corpus exists.
 
 - INVARIANT GAP    — does every state mutation close the relevant
                      conservation/balance/schema/contract invariant exactly?
@@ -76,11 +76,3 @@ to a reviewer. Add a regression test that locks in the correct behavior,
 explicitly framed as "this test exists because Reviewer X claimed behavior
 Y; the code actually does Z and the test guards against future drift
 toward Y." This converts a one-time misread into a permanent guard.
-
-Field example: a reviewer flagged a "split-credit attribution bug"
-asserting `condensed_kg = product_kg - remaining_kg > 0` when scale<1.
-Hand trace showed `product_kg *= scale` (existing line) makes
-`condensed_kg = 0` correctly. The reviewer was wrong, but the subtle
-double-scaling cancellation is fragile to future edits — lock it in with
-an explicit test asserting the proposal has no `process.condensation_train`
-credit at scale<1 with `remaining_kg_hr=rate_kg_hr` caller intent.
