@@ -142,27 +142,88 @@ The user shouldn't need to remind future sessions what the point of `<topic>` is
    Spawn a Claude subagent (Agent tool) with this prompt:
    > "You're running a YC-style office-hours interrogation. The user is starting work on `<topic>`. From the conversation context, their starting fuzzy goal is: `<paraphrase>`. Ask them, in order: (1) Who specifically benefits when this is done? (2) What demand or pain triggered this now? (3) What's the narrowest wedge that proves it works? (4) What's the success criterion you'd test against? (5) What's explicitly NOT in scope? Drive to a one-paragraph goal statement + measurable success criteria. Output as fields ready to populate `templates/goal-statement.md.tpl`."
 
-**Write the goal-statement** to `<repo-root>/docs-private/<topic>-goal-statement-<today>.md` using `templates/goal-statement.md.tpl`. This is the load-bearing anchor; subsequent commands cite it.
+**Write the goal-statement** to `<repo-root>/docs-private/<topic>-goal-statement-<today>.md` with this shape (compose; no template file):
 
-If the user defers ("we can figure that out later"): write a stub goal-statement with the user's fuzzy version + a `STATUS: DRAFT — needs sharpening before execute` line. decompose-plan will refuse to proceed without sharpening.
+```
+# <TOPIC> — Goal Statement
+Date: <today>
+Owner: <user>
+Source: <user statement | office-hours | refactor-plan §N>
+Status: <CONCRETE | DRAFT — <reason>>
+
+## What changes when this is done
+<one paragraph: concrete success state; names a user/system that benefits and what they observe differently>
+
+## Why now
+<one paragraph: what triggered this, what cost is being paid by not doing it, deadline window>
+
+## Success criteria
+<bulleted; each criterion testable>
+
+## Explicitly NOT in scope
+<bulleted; the negative space>
+```
+
+This is the load-bearing anchor; subsequent commands cite it. If the user defers ("figure that out later"): write a stub with `Status: DRAFT — needs sharpening` and decompose-plan will refuse to proceed without sharpening.
 
 ### 3. Scaffold
 
-For each template, read it, substitute placeholders (`{{TOPIC}}`, `{{DATE}}`, `{{REPO_ROOT}}`, `{{PROJECT_NAME}}`, plus audit-derived values like `{{INVARIANT_*}}`), then write:
+Three files to write, all from inline shapes (no .tpl files — frontier model composes from these descriptions):
 
-| Template | Output | If exists |
-|----------|--------|-----------|
-| `templates/AGENTS.md.tpl` | `<repo-root>/AGENTS.md` | **Merge mode**: read existing; show user a diff of proposed additions/edits; ask which to apply. Never destructive. |
-| (direct create) | `<repo-root>/docs-private/.gitkeep` | skip |
-| `templates/RESUME-NOTES.tpl` | `<repo-root>/docs-private/RESUME-NOTES-<today>.md` | bump `(rev N)` |
-| `templates/worker-context.md.tpl` | `<repo-root>/docs-private/worker-context.md` | create only if AGENTS.md is huge (>1000 lines) or multiple distinct worker profiles exist; otherwise skip — executors read AGENTS.md directly |
+**`<repo-root>/AGENTS.md`** — project operating instructions. Shape:
 
-Forensics live in the harness-captured session JSONL plus the per-subagent
-JSONL plus the codex tail files plus RESUME-NOTES + git log. No separate
-`controller.log` is created; the structured-timeline view is recoverable
-via `jq` over the session JSONL when needed.
+```
+# Agent Operating Instructions — <PROJECT_NAME>
 
-The initial RESUME-NOTES should explicitly say "init complete; ready for `/goal-flight decompose-plan`" — most fields will be placeholders until decompose-plan runs.
+Private (gitignored). Read this before touching code. Applies to every coding agent: Claude Code, Codex, review subagents.
+
+## What this project is
+<one paragraph: scope; one paragraph: what's explicitly NOT in scope>
+
+## Hard invariants — never break
+<numbered list, smallest set you'd reject any PR for; 3-7 typical; the shorter, the louder>
+
+## <DOMAIN> policy (binding)
+<authority matrix if applicable; forbidden actions>
+
+## File map
+<table: Area | Path>
+
+## Commands
+<shell commands for build / test / typecheck>
+```
+
+If AGENTS.md exists: **merge mode** — read existing; surface a diff of proposed additions/edits to the user; ask which to apply. Never overwrite destructively.
+
+**`<repo-root>/docs-private/RESUME-NOTES-<today>.md`** — controller handoff. Shape:
+
+```
+# Resume Notes — <DATE> (rev 0)
+
+## TL;DR
+<one paragraph: where we are, what's in flight, what's queued>
+
+## Code state
+Branch: <branch> @ <head>
+<git log --oneline -10>
+
+## Reading order on wake
+1. AGENTS.md
+2. docs-private/<topic>-goal-statement-<today>.md
+3. docs-private/<topic>-goal-queue-<date>.md
+4. <next: whatever is queued>
+
+## First 5 minutes
+<exact next steps for the next controller>
+```
+
+After init: `(rev 0)` H1 line literally says "init complete; ready for `/goal-flight decompose-plan`." Bump `(rev N)` for subsequent revisions; never overwrite.
+
+**`<repo-root>/docs-private/worker-context.md`** — OPTIONAL, only create if AGENTS.md is huge (>1000 lines) or the project has multiple distinct worker profiles. Default: skip — executors read AGENTS.md directly per the "Worker context is optional" hard convention in `SKILL.md`. If you create it, it's a ~150-line precis with: one-line scope, the 3-5 most load-bearing invariants, where to put new code (path table), build/test commands. Executors read this instead of full AGENTS.md.
+
+Also create `<repo-root>/docs-private/.gitkeep` (empty file) so docs-private/ is tracked-as-directory but its dated contents are gitignored per the repo's existing .gitignore policy.
+
+Forensics live in the harness-captured session JSONL + per-subagent JSONL + codex tail files + RESUME-NOTES + git log. No separate `controller.log` is created.
 
 ### 3.5. Build the RAG corpus (context-engineering)
 
@@ -195,53 +256,20 @@ Slice-builders need their source paths pinned in the dispatch. Mapping:
 
 If the controller can't enumerate sources for a slice (e.g., no binding-spec exists), skip that slice entirely. Surface skipped slices in the init summary.
 
-#### Three-pass pipeline
+#### 4-pass pipeline (canonical shape — invoke from here or via `/goal-flight build-corpus`)
 
-**Pass 1 — parallel slice builders (Claude subagents).**
+`commands/build-corpus.md` documents the full 4-pass pipeline (slice builders → per-slice reviewers → cross-slice consolidation → final assessment) in detail. Init step 3.5 invokes the same pipeline; the cost calculus matches.
 
-For each slice in the source-list table above where sources exist:
-- Dispatch one Claude subagent (Agent tool, general-purpose, `model: "opus"` for code-adjacent slices like `patterns/*` and `verification.md`, **also `decisions.md`** because its content is read by every Reviewer + Planner dispatch downstream so quality matters; default model only for the simplest prose slices).
-- Use `prompts/rag-slice-builder.md` as the dispatch template.
-- Pass the source-material absolute paths from the table above.
-- Each subagent writes its slice to `docs-private/rag/<filename>` and reports back.
+For init: spawn the pipeline now. Each pass uses Claude subagents (Opus for code-adjacent slices: `patterns/*`, `verification.md`, `decisions.md`; default model for prose-only slices). Slices land in `docs-private/rag/<filename>` with `verified-at: <HEAD-SHA>` frontmatter per `templates/rag-corpus-schema.md.tpl`. No per-pass prompt files needed — the slice schema + source-list table + verification-first principle (slices are starting hypotheses the executor verifies, not authoritative facts) are sufficient brief for frontier-model subagents.
 
-Spawn all in parallel; cap at ~10 concurrent subagents to avoid noise. Smaller projects: 4-6 slices; larger ones: 10-15.
+Pass-specific briefs (controller composes from these on dispatch — frontier model fills in details):
 
-**Pass 2 — per-slice review (Claude subagents, parallel).**
+- **Pass 1 (builders, parallel)**: read source paths from the table above; produce slice file at schema-defined path; frontmatter `verified-at: <current-HEAD>`. ~10 concurrent max; 4–6 slices for small projects, 10–15 for larger.
+- **Pass 2 (reviewers, parallel, one per slice)**: read slice + sources; verify grep patterns against actual code; score 1–5 (Factual / Complete / Voice / Dispatch-ready); P0/P1/P2 findings. Block Pass 3 until P0+P1 patched.
+- **Pass 3 (consolidator, one Opus pass)**: pass all corpus file absolute paths; identify cross-slice contradictions, deduplicate, refresh `verified-at` on slices reviewed-but-not-rebuilt. Codex fallback only if Opus unavailable.
+- **Pass 4 (assessment, one Opus pass)**: aggregate scores into quality dashboard; recommend next-wave priorities; issue CORPUS IS DISPATCH-READY / NEEDS-MORE-ITERATION verdict. Dashboard → RESUME-NOTES; priorities → drive future `/goal-flight build-corpus --next-wave`.
 
-For each slice that pass 1 produced:
-- Spawn a reviewer subagent with `prompts/rag-slice-review.md`.
-- Reviewer reads the slice + its source materials AND verifies any grep patterns the slice claims work against the actual code.
-- Reports P0/P1/P2/P3 findings, including a `Dispatch-readiness` category (does the slice match its schema's per-slice format?).
-
-If any P0/P1: re-dispatch the corresponding slice-builder with findings as input, OR patch directly if small (controller decides).
-
-**Pass 3 — cross-slice consolidation (one Claude Opus 1M-context pass; codex fallback).**
-
-After all per-slice reviews are clean:
-- Default: dispatch a single Claude Opus subagent (Agent tool, `model: "opus"`) with `prompts/rag-cross-slice-consolidation.md`. Pass absolute paths of every corpus file. Opus's 1M context holds the aggregate corpus (~12 KB max for a typical project) cleanly; reliability is higher than codex.
-- Fallback (codex): only if you specifically want a model-diversity second opinion, or Claude Opus is unavailable. Codex command pattern — point codex at the prompts file, don't paste it into the exec arg:
-
-```bash
-timeout --kill-after=10 300 codex exec \
-  "cd <repo-root> && (Read ~/.claude/skills/goal-flight/prompts/rag-cross-slice-consolidation.md in full and execute it. The corpus files to consolidate are at <repo-root>/docs-private/rag/ — enumerate them yourself with \`ls docs-private/rag/**/*.md\`. If your context compacts mid-pass, re-read the prompts file — it is the unparaphrased source of truth.)" \
-  > /tmp/goal-flight-rag-consolidation-<topic>-<iso>.txt 2>&1 &
-```
-
-Tail or wait. The pointer-based shape avoids spamming the controller's tokens with pre-pasted prompt content + corpus file paths, and survives codex session compaction (codex can re-Read the file). Assumes the project has been registered as codex-trusted in step 1; otherwise add `--ignore-user-config`. See `SKILL.md` §Codex reliability.
-- Apply any P0/P1 fixes; surface P2/P3 as TODO comments in the affected slice.
-
-**Pass 4 — final assessment (one Claude Opus subagent).**
-
-After Pass 3 fixes are applied, dispatch one final-assessment subagent with `prompts/rag-final-assessment.md`. It:
-- Aggregates per-slice reviewer scores into a quality dashboard (the reviewers emitted these per the score rubric in `prompts/rag-slice-review.md`).
-- Walks through a hypothetical cold-executor dispatch to identify residual gaps.
-- Recommends next-wave priorities.
-- Issues a CORPUS IS DISPATCH-READY / NEEDS-MORE-ITERATION verdict.
-
-The quality dashboard goes into RESUME-NOTES as a small table; the next-wave priorities feed the next iteration of step 3.5 (or a user-triggered `/goal-flight build-corpus --next-wave`).
-
-**Outcome**: `docs-private/rag/` is now populated, reviewed, and scored. Future dispatches paste from these slices instead of reconstructing context from scratch. The controller's context budget is preserved for integration, requirements adjudication, and graph-orientation calls.
+**Outcome**: `docs-private/rag/` is populated, reviewed, scored. Future dispatches reference these slices as starting hypotheses (per `prompts/dispatch-wrapper.md` corpus integration); controller's context budget preserved for integration / requirements adjudication / orientation calls.
 
 ### 4. Ensure gitignore + AGENTS.md tracked
 

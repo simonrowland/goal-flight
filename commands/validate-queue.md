@@ -20,7 +20,7 @@ before they bite mid-execute.
 1. Resolve the queue file (most recent by date suffix if no arg).
 
 2. Parse the queue. Each chunk is a `## #N <slug>` heading followed by
-   four mandatory subsections (per `templates/goal-queue.tpl`):
+   four mandatory subsections (per the goal-queue shape in `commands/decompose-plan.md`):
    - `### SCOPE` — one paragraph.
    - `### CHECKLIST` — bulleted list.
    - `### ACCEPTANCE` — testable criteria, bulleted.
@@ -81,6 +81,6 @@ before they bite mid-execute.
 
 ## See also
 
-- `templates/goal-queue.tpl` — the canonical structure.
+- `commands/decompose-plan.md` step 3 — the canonical goal-queue shape (inline).
 - `commands/decompose-plan.md` — produces the queue this validates.
 - `commands/validate-dispatch.md` — validates per-chunk wrapper rendering.

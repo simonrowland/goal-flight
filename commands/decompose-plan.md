@@ -28,7 +28,34 @@ Read `<repo-root>/docs-private/<topic>-goal-statement-*.md` (most recent).
 
 **Drafter** (general-purpose Agent): produce the numbered `\goal` decomposition.
 
-> "Read the plan below. Decompose it into N self-contained `\goal` chunks. Each chunk must have SCOPE / CHECKLIST / ACCEPTANCE / FORBIDDEN sections per the goal-queue template at `~/.claude/skills/goal-flight/templates/goal-queue.tpl` (read it for the exact skeleton). Smallest-first; imperative voice. Number them 1..N. Surface anything in the plan that resists decomposition or requires controller-side judgement. Plan: <paste plan text or path>."
+> "Read the plan below. Decompose it into N self-contained `\goal` chunks. Each chunk must have SCOPE / CHECKLIST / ACCEPTANCE / FORBIDDEN sections (skeleton at the bottom of this prompt). Smallest-first; imperative voice. Number them 1..N. Surface anything in the plan that resists decomposition or requires controller-side judgement. Plan: <paste plan text or path>.
+>
+> Per-chunk skeleton:
+> ```
+> ## <N>. \goal <SLUG>
+> STATUS (optional — pin observed reality if goal is touched post-write)
+> SCOPE
+> <1-3 sentence problem + boundary; what module(s), what contract>
+>
+> PRECONDITION (optional)
+> - <upstream goal slug + commit, or env requirement>
+>
+> REFERENCE
+> - AGENTS.md (hard invariants)
+> - docs-private/<topic>-binding-spec.md §<N>
+>
+> CHECKLIST
+> 1. <smallest-first imperative>
+>    [Reviewer note: <margin annotation when checklist amended mid-flight>]
+> 2. <...>
+>
+> ACCEPTANCE
+> - <testable criterion>
+> - All passing tests stay green
+>
+> FORBIDDEN
+> - <explicit anti-scope: paths or patterns not to touch>
+> ```"
 
 When drafter completes, **analyst** (Explore): identify parallel-safe chunks AND trivial chunks the controller can handle inline.
 
@@ -48,7 +75,41 @@ When drafter completes, **analyst** (Explore): identify parallel-safe chunks AND
 
 ### 3. Write to goal-queue
 
-Render `templates/goal-queue.tpl` with the drafted chunks and `[parallel-safe:<group>]` tags. Write to `<repo-root>/docs-private/<topic>-goal-queue-<today>.md`. If a same-day file exists, append the new chunks numbered after the last existing entry (do not duplicate).
+Write to `<repo-root>/docs-private/<topic>-goal-queue-<today>.md` with this shape:
+
+```
+# <TOPIC> Goal Queue
+Date: <today>
+Working directory: <repo-root>
+
+Each goal is a self-contained `\goal` dispatch directive. Read together with AGENTS.md, the binding-spec, and the plan of record.
+
+## Progress (as of <today>, main @ <head>)
+| Goal | Status | Commit |
+|------|--------|--------|
+| 1. `<slug>` | TODO | — |
+| 2. `<slug>` [parallel-safe:A] | TODO | — |
+...
+
+Status: ✅ DONE — `<hash>` · 🟡 IN-FLIGHT — `<executor-id>` · TODO · BLOCKED — `<reason>` · PARTIAL — `<reason; see #N>`
+
+Tags (see SKILL.md for full definitions):
+- [parallel-safe:<group>] — chunks in the same group can run via `--parallel N`
+- [milestone] — trigger gstack review sweep after this chunk lands
+- [controller-direct] — controller handles inline (trivial OR too much session-loaded context to explain)
+- [goal-mode] — chunk warrants the iteration loop primitive (codex /goal native or external Opus/Grok loop)
+- [max-iterations:<N>] — cap for [goal-mode] external loops
+- [mixed-executor] — iterations cross executor types for model-diversity stuck-loop recovery
+
+## Universal preconditions
+- All passing tests stay green; new tests added per goal
+- No silent fallback between providers on unit failure
+- <other AGENTS.md-derived invariants>
+
+## <N>. `\goal <SLUG>` (per-chunk skeleton from the drafter above)
+```
+
+If a same-day file exists, append new chunks numbered after the last existing entry (do not duplicate). Tags `[parallel-safe:<group>]` come from the analyst (step 2 above); other tags applied by analyst or controller as judgment dictates.
 
 ### 4. Review the decomposition itself (parallel reviewers)
 
