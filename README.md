@@ -49,6 +49,15 @@ Then in a Claude Code session: `/goal-flight init <topic>` to start, or `/goal-f
 /goal-flight register-codex          # registers cwd project as codex-trusted
 /goal-flight validate-dispatch <slug>   # dry-run the wrapper for review
 /goal-flight validate-queue          # schema-check the goal-queue
+
+# 4. Self-delegation via /fork (optional — when you want to branch the
+#    controller into a sub-session that does a focused task and reports
+#    back via filesystem markers):
+bash scripts/self-fork-detect.sh write '<task>'    # before /fork
+# (user types /fork or `claude --resume <sid> --fork-session`)
+bash scripts/self-fork-detect.sh detect            # in the fork
+bash scripts/self-fork-detect.sh find-fork         # back in controller
+bash scripts/self-fork-detect.sh monitor <jsonl>   # watch fork's progress
 ```
 
 `/goal-flight` with no args prints `SKILL.md` — the full gist.
@@ -81,9 +90,27 @@ The result: the user can step away in bunny slippers. The controller makes forwa
 
 ## Adapting this to your project
 
-This skill ships tuned for **high-accuracy scientific programming**, but the patterns generalize. The intended workflow: clone this repo, open it in Claude Code, point at it and say "Adapt this skill for a [domain] project; my north star is [X]; my self-review categories should add [Y]; here's our verification command and our invariants." The skill is small (now ~30 KB total) so a single Opus subagent can read the whole thing, propose a diff, and apply it in one pass. Then commit your fork.
+This skill ships tuned for **high-accuracy scientific programming**, but the patterns generalize. The intended workflow: clone this repo, open it in Claude Code, point at it and say "Adapt this skill for a [domain] project; my north star is [X]; my self-review categories should add [Y]; here's our verification command and our invariants." The skill is ~200 KB total (down from ~230 KB after the May 2026 strip — the wholesale rewrite of `commands/init.md` and `commands/execute.md` to remove SKILL.md-redundant guidance is the next-largest prune target if you want to push further). A single Opus subagent can still read the whole thing, propose a diff, and apply it in one pass. Then commit your fork.
 
 The main knobs are in `SKILL.md` (north star, asking discipline, token-bias dial), `prompts/executor-self-review.md` (the 7 abstract categories — add domain-specific ones), `commands/execute.md` (review cadence `K`, parallel mode), and `templates/rag-corpus-schema.md.tpl` (slice mix + word budgets).
+
+## Self-delegation via `/fork`
+
+Optional pattern, useful when the controller has substantial session-loaded state that a fresh Agent-tool subagent would have to re-discover, AND you want a `/rewind`-able savepoint before doing something risky/exploratory.
+
+Claude Code's `/fork` (renamed `/branch` in v2.1.77 but `/fork` still works) creates a new session with all conversation history inherited; the new session gets a fresh `CLAUDE_CODE_SESSION_ID`. The skill ships `scripts/self-fork-detect.sh` to formalize the contract — controller writes a marker before forking; the fork reads the marker post-fork and learns what task to execute + which keyword markers to emit so the controller (polling the fork's JSONL) can extract status, results, completion, blockers, or intervention-required signals.
+
+**Marker vocabulary** (only return channel; forks lack the task-notification callback that Agent-tool subagents have):
+
+| Marker | Semantics | Monitor exit |
+|---|---|---|
+| `FORK-STATUS: <update>` | Intermediate progress | (keeps polling) |
+| `FORK-RESULT: <key>=<value>` | Structured output to extract | (keeps polling) |
+| `FORK-NEED: <question>` | Controller/user intervention required | **2** |
+| `FORK-COMPLETE: <summary>` | Done | **0** |
+| `FORK-BLOCKED: <reason>` | Unrecoverable, won't continue | **1** |
+
+See [`SKILL.md` §Self-delegation via /fork](SKILL.md) for the full pattern. The empirical identity surface (controller / subagent / fork — env var + JSONL path per role) is documented there, verified May 2026 on Claude Code v2.1.142.
 
 ## When NOT to use this
 
@@ -127,16 +154,20 @@ goal-flight/
 │   ├── codex-goal-prompt.md.tpl      # /goal mode prompt shape
 │   └── rag-corpus-schema.md.tpl      # Corpus directory shape + verified-at convention
 ├── scripts/
-│   └── install-codex-overrides.sh    # Codex trust registration
+│   ├── install-codex-overrides.sh    # Codex trust registration
+│   └── self-fork-detect.sh           # /fork self-delegation contract + monitor
 ├── tests/
 │   ├── run.sh
 │   ├── test-install-codex-overrides.sh
+│   ├── test-self-fork-detect.sh
 │   └── README.md
 ```
 
 ## Provenance
 
-Distilled from a sustained refactor session on a regolith pyrolysis simulator where the controller-pattern ran for ~12 hours across multiple chunked goals. The pattern proven there is what this skill formalizes. After a post-session audit found that controller-pasted "facts" in dispatch wrappers were going stale and being trusted by frontier-model executors, the wrapper philosophy was refactored to verification-first (scaffold investigation; don't substitute for it). The skill itself was stripped from ~230 KB of templates and per-pass prompt files to ~30 KB of gist + load-bearing shapes — frontier models compose the per-task specifics; the skill carries only what doesn't generalize from principle.
+Distilled from a sustained refactor session on a regolith pyrolysis simulator where the controller-pattern ran for ~12 hours across multiple chunked goals. The pattern proven there is what this skill formalizes. After a post-session audit found that controller-pasted "facts" in dispatch wrappers were going stale and being trusted by frontier-model executors, the wrapper philosophy was refactored to verification-first (scaffold investigation; don't substitute for it). The skill itself was stripped from ~230 KB of templates and per-pass prompt files to ~200 KB of gist + load-bearing shapes + helpers — frontier models compose the per-task specifics; the skill carries only what doesn't generalize from principle.
+
+The `/fork` self-delegation pattern was added after the strip, when empirical probing confirmed that `CLAUDE_CODE_SESSION_ID` is exposed to the model via Bash env and that `/fork` (or `--fork-session`) creates a new session ID — making it possible for a forked session to self-detect via a marker file the controller wrote pre-fork. Forks lack the task-notification callback Agent-tool subagents have, so the keyword-marker vocabulary (FORK-STATUS / FORK-RESULT / FORK-NEED / FORK-COMPLETE / FORK-BLOCKED) is the only return channel — controller polls the fork's JSONL for these strings.
 
 ## License
 
