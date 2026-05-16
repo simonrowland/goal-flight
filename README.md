@@ -58,7 +58,7 @@ Plus an opt-in self-delegation pattern via `/fork` — controller writes a marke
 |---|---|---|
 | **`[controller-direct]`** | Trivially small (single-file, < ~30 LoC), OR controller already has the session-loaded context a fresh subagent would have to re-discover | Inline; no subagent |
 | **Single-shot subagent** (Claude Agent / `codex exec` / `grok -p`) | Default for most chunks. Frontier model picks the executor target based on chunk shape | One subagent dispatch per chunk |
-| **Goal-mode loop** (codex `/goal` in-session, or external iteration loop driven by the controller) | Multi-step refactor, code migration, prototype implementation — anything that benefits from a plan/act/test/iterate loop | Multi-hour autonomous session (codex), or N Agent-tool dispatches (controller-driven loop) |
+| **Goal-mode loop** (codex `/goal` in-session, or external iteration loop driven by the controller) | Multi-step refactor, code migration, converge to ground-truth test, prototype implementation — anything that benefits from a plan/act/test/iterate loop | Multi-hour autonomous session (codex), or N Agent-tool dispatches (controller-driven loop) |
 
 The skill doesn't prescribe between Opus, codex, and Grok within a path — frontier models pick based on the chunk. Hard convention: code-writing dispatches use the largest available model + highest reasoning by default; non-code dispatches use defaults.
 
