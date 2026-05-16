@@ -65,6 +65,41 @@ if [ -z "$PROJECT_ROOT" ]; then
 fi
 PROJECT_ROOT="$(cd "$PROJECT_ROOT" && pwd)"
 
+# --- Path guard (codex reviewer P0 fix) ---
+# Reject paths that would trust too much. Trust is prefix-based in codex:
+# `[projects."/"]` trusts every cwd; `[projects."/Users/foo"]` trusts the
+# entire home directory; single-segment paths like `/tmp` or `/usr` trust
+# huge swaths. Require the registration target be a real project — at
+# least two path segments under root, AND not be $HOME exactly, AND ideally
+# be inside a git repo (unless explicitly running from a non-git target).
+case "$PROJECT_ROOT" in
+  "/")
+    echo "ERROR: refusing to register '/' as codex-trusted." >&2
+    echo "  Codex trust is prefix-based; trusting / trusts every cwd." >&2
+    exit 2
+    ;;
+  "$HOME")
+    echo "ERROR: refusing to register \$HOME ($HOME) as codex-trusted." >&2
+    echo "  Trust on \$HOME applies to every subdirectory; register a specific project." >&2
+    exit 2
+    ;;
+esac
+# Count path segments — single-segment paths under root (/tmp, /usr, /etc, etc.)
+# are system directories that should not be project-trusted.
+SEGMENT_COUNT=$(printf '%s' "$PROJECT_ROOT" | awk -F'/' '{print NF-1}')
+if [ "$SEGMENT_COUNT" -lt 2 ]; then
+  echo "ERROR: refusing to register '$PROJECT_ROOT' as codex-trusted." >&2
+  echo "  Single-segment paths under root are typically system directories." >&2
+  echo "  Use a deeper path like '/Users/<you>/Repos/<project>' or '~/Repos/<project>'." >&2
+  exit 2
+fi
+# Bonus check: warn (but don't block) if the path isn't a git repo. Some
+# legitimate codex-trusted projects aren't git repos (research dirs, etc.)
+# but most are; a missing .git/ is often a sign of a mistake.
+if [ ! -d "$PROJECT_ROOT/.git" ] && [ ! -f "$PROJECT_ROOT/.git" ]; then
+  echo "WARN: $PROJECT_ROOT is not a git repo. Proceeding (codex trust doesn't require git), but double-check this is the intended target." >&2
+fi
+
 USER_CONFIG="$HOME/.codex/config.toml"
 PROJECT_CONFIG="$PROJECT_ROOT/.codex/config.toml"
 ENTRY_KEY="[projects.\"${PROJECT_ROOT}\"]"
