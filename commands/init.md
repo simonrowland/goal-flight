@@ -21,10 +21,8 @@ Run in parallel:
   - Project-level (if present, takes precedence): `[ -d <repo-root>/.agents/skills/gstack ]`
   - Capture which sides are installed; report both.
 - Check context-mode install on **both sides**:
-  - Claude-side: grep `~/.claude/settings.json` or `~/.claude.json` for an MCP server entry named `context-mode` (or run `claude mcp list 2>&1 | grep context-mode`). Captured: registered or not.
-  - Codex-side: parse `~/.codex/config.toml` (TOML, NOT JSON — codex v0.130.0 stores MCP servers under `[mcp_servers.X]` tables; the prior `.config.json` / `.mcp.json` filenames are stale). Inline-table form `mcp_servers = { context-mode = ... }` and quoted-key form `[mcp_servers."context-mode"]` are both valid; the auto-register script handles all three via tomllib parse. Captured: registered or not.
-  - Plugin form: `[ -d ~/.claude/plugins/context-mode ]` may also be present.
-  - Capture which sides registered; report both.
+  - Delegate authoritative detection to `python3 <skill-root>/scripts/register-context-mode-codex.py --check` (path resolution per the auto-register block below). The script does content-only detection — `mcpServers["context-mode"]` lookup across `~/.claude.json` / `~/.claude/settings.json` and every `plugin.json` under `~/.claude/plugins/` (no path-substring heuristic; bundle plugins and custom-named install dirs are handled). On codex side it tomllib-parses `~/.codex/config.toml` and recognizes bracket-table, quoted-key, and inline-table forms while ignoring comments.
+  - Possible exit codes: `0` — both sides registered or codex absent (nothing to do); `1` — Claude has context-mode but codex doesn't; `2` — Python <3.11 (script can't run); `4` — npx missing. Capture the verdict for the env summary.
 
 If `codex` missing: tell the user (do NOT auto-install):
 > "codex CLI not found. Install with `npm install -g @openai/codex && codex login`. The skill works without codex (Claude subagents only) but loses parallel-reviewer capability for milestone reviews."
