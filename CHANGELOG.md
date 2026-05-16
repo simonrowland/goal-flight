@@ -4,6 +4,39 @@ Notable changes to the goal-flight Claude Code skill. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are
 incremented when meaningful skill behaviour changes.
 
+## [0.2.3] — 2026-05-16
+
+Interactivity tradeoff for `[controller-direct]` dispatch path made
+explicit. Field motivation: a user observed that a running controller
+session was inlining work via `[controller-direct]`, blocking their
+ability to comment / question / redirect mid-flight — the session
+appeared "hung between agents" but was actually busy executing tool
+calls. SKILL.md didn't call this tradeoff out, so the controller
+defaulted to inline when subagent dispatch would have served the user
+better.
+
+### Changed
+- **SKILL.md §Dispatch model `[controller-direct]` bullet** — added
+  the interactivity tradeoff: while the controller inlines, the parent
+  session is unresponsive to user input. Subagent dispatch (path 2)
+  frees the parent so the user can interject. Heuristic added: prefer
+  subagent dispatch when the user is at the keyboard, when the work
+  will take more than ~1 minute even if the LoC delta is small, or
+  when the chunk is parallel-safe so look-ahead can run alongside.
+  Inline only when session-loaded state is genuinely load-bearing AND
+  the work is short. ESC interrupts the current tool call (including
+  a subagent dispatch) but doesn't roll back disk changes.
+- **SKILL.md §Asking discipline** — companion rule added between the
+  "no Netflix check-ins" and "prepare the question with subagents"
+  bullets: don't monopolize the parent thread with long inline work.
+  Same heuristic as the dispatch-model bullet, framed from the asking-
+  discipline north star (user retains ability to interject = real value
+  the controller protects).
+
+### Tests
+3 suites / 46 assertions remain green (prose-only changes; testable
+scripts unchanged).
+
 ## [0.2.2] — 2026-05-16
 
 Skill-update drift detection. Long-running controller sessions could load
