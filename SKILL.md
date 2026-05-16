@@ -1,6 +1,6 @@
 ---
 name: goal-flight
-version: 0.2.4
+version: 0.2.5
 description: "long-running unattended controller for chunked code work — init repo, decompose plan, anticipate questions, execute with embedded review and milestone gstack sweeps"
 allowed-tools:
   - Bash
@@ -104,7 +104,7 @@ The controller's value is forward motion until a real blocker. **Interrupt the u
 - **Don't ask trivia.** Worktree labels, file naming nits, paint colors — never ask. Just decide.
 - **Don't do Netflix "are-you-still-watching" check-ins.** "Step 1 done. Continue?" when nothing is blocked is the antipattern. Running commentary as work progresses IS welcome — short status lines giving the user a window into the work. The thing to cut is the implicit-stop pattern ("Hold or go?", "Proceed?") on routine forward motion.
 - **Don't monopolize the parent thread with long inline work.** While the controller inlines (`[controller-direct]` path), the user cannot comment, question, or redirect — the session is busy executing tool calls. Dispatch to a subagent (path 2) for anything that won't finish in ~1 minute, even if the LoC delta is small, so the user retains the ability to interject. ESC will interrupt the current tool call (including a subagent dispatch) but won't roll back what's already on disk. See §Dispatch model `[controller-direct]` for the full interactivity tradeoff.
-- **Yield the turn between chunks.** Even when each chunk dispatches a subagent (the "right" path), chaining N chunks back-to-back inside one assistant turn defeats user interjection: Claude Code queues messages typed mid-turn, and they don't surface until the turn ends. The §Per-chunk loop step 7 makes this concrete (one-line status + STOP between chunks). User messages then flush on the next turn. This is NOT a Netflix check-in — there's no "Continue?" prompt, just a clean turn boundary the harness needs to drain queued input.
+- **Dispatch executors in background — foreground Agent is a failure mode.** Foreground (default) Agent tool calls keep the controller's turn open until the executor returns; long executor runs (multi-minute typical) mean the user cannot interject and their typed messages queue at the harness level until the chain breaks. Background dispatch (`run_in_background: true` for Agent; `&` + tail-polling for codex / grok via Bash) ends the turn immediately at dispatch, and the harness re-surfaces completion as a new turn — every chunk yields naturally. See §Per-chunk loop for the canonical two-turn cycle. Foreground Agent stays appropriate for *inline reviewers* whose result feeds the immediate next decision (anticipatory subagents, look-ahead Explore, decomposition reviewers) — those are short and the controller genuinely needs the result inline.
 - **Prepare the question with subagents first.** While waiting on a long-running subagent or codex review, dispatch anticipatory reviewer-loop subagents to pre-resolve choices. A well-prepared ask with subagent-vetted options is worth roughly 5 raw asks.
 - **Do ask when** a chemistry/physics/security/correctness assumption needs user values, when a destructive operation is about to fire, or when a decision would lock in a wrong invariant.
 
@@ -206,15 +206,23 @@ When to use vs `[controller-direct]` vs Agent-tool subagent:
 
 Controller works in the main worktree. Parallel-safe chunks each get `<repo>/.claude/worktrees/<adjective-noun>/` on a `claude/<adjective-noun>` branch. Codex trust prefix-matches the project root, so worktrees inherit automatically — no per-worktree registration. Cherry-pick onto main; do NOT use `git merge --ff-only` (sibling worktrees branched off main don't fast-forward cleanly when other worktrees committed since).
 
-### Per-chunk loop (canonical shape)
+### Per-chunk loop (canonical shape — two-turn cycle)
 
-1. **Dispatch** — pick one of the three paths above based on chunk shape.
-2. **Wait** — do NOT poll the subagent transcript. The harness sends a task-notification on completion. Use the waiting interval for parallel-safe prep (next-chunk wrapper composition, RAG corpus drift, anticipatory questions).
+Each chunk spans **two assistant turns**: a **dispatch turn** that fires the executor in background and ends immediately, and a **completion turn** triggered when the harness re-surfaces the executor's completion as a task-notification. The two-turn split is load-bearing — it's the structural mechanism that drains queued user input. **Foreground Agent dispatch for executor chunks is a failure mode**: the controller's turn doesn't end until the executor returns, the user cannot interject during the (often long) run, and any status questions / steering / corrections they type pile up unprocessed at the bottom of the chat.
+
+**Dispatch turn:**
+1. **Dispatch in background.** Agent tool with `run_in_background: true` for Claude executor chunks; `codex exec ... > /tmp/<file> 2>&1 &` or `grok -p ... > /tmp/<file> 2>&1 &` for codex / grok. Foreground Agent (default) is for tight **inline reviewers** whose result feeds the immediate next decision — anticipatory subagents, decomposition reviewers, look-ahead Explore agents whose summary informs the next chunk's wrapper. For an **executor** (writing code, running tests, committing), default to background.
+2. **Emit one-line status, end the turn.** "Dispatching chunk #N (`<slug>`). Background task `<id>`." The harness will re-surface completion as a new assistant turn via task-notification. **Do not chain chunk N+1's dispatch within this turn.**
+
+**Completion turn** (triggered by the harness when the background executor exits):
+
 3. **Verify the diff briefly** — scope contained, suite green, no leaked invariants. Executor's self-review already caught issues; you sanity-check.
 4. **Commit** (one chunk = one commit). Parallel-mode: cherry-pick onto main.
 5. **Update the Progress table** in goal-queue + your visible state.
-6. **Look-ahead** — fire-and-forget Explore subagent reading the next 1–2 chunks for hidden dependencies or missing acceptance criteria.
-7. **Yield the turn before dispatching chunk N+1.** Emit a one-line status (`Chunk #N landed at <sha>. Dispatching chunk #N+1.`) and STOP the current assistant turn. Do not chain chunk N+1's Dispatch step within the same turn as chunk N's commit. Reason: Claude Code queues user messages typed while the assistant is mid-tool-chain; those messages don't surface until the turn ends. If you chain chunks back-to-back without yielding, the user's status questions, steering, and corrections pile up unprocessed at the bottom of the chat — they CAN see the controller working, but they can't intervene. Yielding per chunk gives them a real interjection surface without imposing Netflix-style check-ins (no "Continue?" — just a clean turn boundary that lets the harness flush queued input). The next chunk dispatch happens at the next turn, which fires either when the user types something (their message processed first) or when the user types nothing (proceed with chunk N+1 silently). Exception: in **goal-mode loops** (codex `/goal` or external Opus/Grok iteration) the loop primitive owns turn-boundaries itself; the controller only yields at iteration-cap or convergence.
+6. **Look-ahead** — fire-and-forget Explore subagent (also `run_in_background: true`) reading the next 1–2 chunks for hidden dependencies or missing acceptance criteria.
+7. **Dispatch chunk N+1 in background, then end the turn** (back to step 1 for the next chunk). The look-ahead from step 6 continues in parallel; its completion will arrive as another notification.
+
+The two-turn cycle preserves user interjection at every chunk boundary — typically the *only* place the user has a clean surface to comment, steer, or kill a run mid-flight without ESC-rollback ambiguity. Exception: `[goal-mode]` loops own their own turn-boundaries (codex `/goal` runs multi-hour internally; external Opus/Grok loops have the controller tail-polling). In goal-mode the controller surfaces turns at iteration-cap or convergence only, not per-iteration.
 
 ### Progress table — keep this current
 
@@ -233,13 +241,15 @@ Status legend: ✅ done · 🟡 in flight · queued · blocked · post-`<gate>`.
 
 ### Three subagent types
 
-| Type | Purpose | Source for the dispatched prompt | Reports |
-|------|---------|----------------------------------|---------|
-| **Executor** | Implement a `/goal` chunk; writes code, runs tests, commits | Controller composes per `prompts/dispatch-wrapper.md` (all 5 layers + optional RAG slices) | `git diff --stat`, P0/P1/P2/P3 findings, tests run, surprises |
-| **Reviewer** | Read-only adversarial pass over a commit range or draft | Loaded as-is from `prompts/gstack-claude-review.md`, `prompts/gstack-codex-challenge.md`, or `prompts/decomposition-review.md` — these are reduced-layer shapes (effectively Layers 1+3, no Layer 0/2/5). Or invoked via gstack `/review` when registered (preferred). | Findings list with file:line refs, P0/P1/P2/P3, confidence |
-| **Planner** | Write a plan document to a pinned path; "NO code changes" | Loaded as-is from `prompts/dual-plan-adversarial.md` (when dual-lens) or composed inline (Layers 1+3 + pinned deliverable path) | File path, word count, bottom-line recommendation, open questions |
+| Type | Purpose | Dispatch mode | Source for the dispatched prompt | Reports |
+|------|---------|---------------|----------------------------------|---------|
+| **Executor** | Implement a `/goal` chunk; writes code, runs tests, commits | **Background** (Agent `run_in_background: true`, or Bash `&` for codex / grok) — completion arrives as a new turn via task-notification | Controller composes per `prompts/dispatch-wrapper.md` (all 5 layers + optional RAG slices) | `git diff --stat`, P0/P1/P2/P3 findings, tests run, surprises |
+| **Reviewer** | Read-only adversarial pass over a commit range or draft | **Foreground** (default) — short and the controller needs the findings inline to decide next chunk | Loaded as-is from `prompts/gstack-claude-review.md`, `prompts/gstack-codex-challenge.md`, or `prompts/decomposition-review.md` — these are reduced-layer shapes (effectively Layers 1+3, no Layer 0/2/5). Or invoked via gstack `/review` when registered (preferred). | Findings list with file:line refs, P0/P1/P2/P3, confidence |
+| **Planner** | Write a plan document to a pinned path; "NO code changes" | **Foreground** (default) — the plan is the immediate input for the next decision | Loaded as-is from `prompts/dual-plan-adversarial.md` (when dual-lens) or composed inline (Layers 1+3 + pinned deliverable path) | File path, word count, bottom-line recommendation, open questions |
 
 The shapes for reviewer + planner live in their respective prompt files, NOT composed per-dispatch by the controller. The controller's job for these types is to substitute the few placeholders (`<range>`, `<paths>`, `<deliverable path>`) and dispatch; the full wrapper is in the file. Reviewer/planner dispatches that mistakenly receive the executor wrapper (all 5 layers) waste context and encourage drift into code-writing — keep them on the reduced shapes.
+
+The executor / reviewer split also determines dispatch mode: executors run long (minutes to multi-hour) and the controller does not need their result inline — background dispatch yields the turn so the user can interject. Reviewers and planners are short and feed the immediate next decision — foreground is appropriate. Confusing the two (foreground executor, or background reviewer) is the most common pacing antipattern; see §Per-chunk loop for the executor's two-turn cycle.
 
 ### Don't
 

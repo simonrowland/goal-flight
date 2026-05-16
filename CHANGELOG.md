@@ -4,6 +4,55 @@ Notable changes to the goal-flight Claude Code skill. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are
 incremented when meaningful skill behaviour changes.
 
+## [0.2.5] — 2026-05-16
+
+Executor dispatch defaults to background; foreground Agent for executors
+is named explicitly as a failure mode. 0.2.4 added a "yield the turn
+between chunks" rule, but treated the symptom — the root cause is that
+foreground Agent dispatch keeps the controller's turn OPEN for the
+entire executor run (often minutes), so queued user messages never
+drain. Background dispatch (`run_in_background: true` for Agent;
+`&` + tail-polling for codex / grok Bash) yields the turn at dispatch
+time; the harness re-surfaces completion as a new turn via task-
+notification. This makes the chunk loop a two-turn cycle instead of a
+one-turn block.
+
+### Changed
+- **SKILL.md §Per-chunk loop rewritten** as a two-turn cycle: dispatch
+  turn (step 1 background-dispatch + step 2 emit one-line status and
+  end the turn) and completion turn (steps 3-7: verify diff, commit,
+  update Progress, look-ahead, dispatch chunk N+1). The two-turn split
+  is load-bearing — it's the structural mechanism that drains queued
+  user input every chunk.
+- **SKILL.md §Three subagent types table** gains a Dispatch-mode
+  column: Executor = background (long-running, controller doesn't need
+  result inline), Reviewer + Planner = foreground (short, result feeds
+  the immediate next decision). Mismatching the mode is named as the
+  most common pacing antipattern.
+- **SKILL.md §Asking discipline** "yield the turn between chunks"
+  bullet (added in 0.2.4) replaced with a more accurate "dispatch
+  executors in background — foreground Agent is a failure mode"
+  bullet that explains the root cause and points at the two-turn
+  cycle.
+
+### Why this matters
+The 0.2.4 step 7 ("yield the turn before chunk N+1") was a workaround
+that asked the controller to remember to emit one-line + STOP between
+chunks. Easy to forget mid-execute. Background dispatch makes the yield
+*structural* — the turn ends at dispatch time, not as a separate manual
+step. Less prone to chain-the-chunks drift.
+
+Foreground Agent stays correct for short inline reviewers (anticipatory
+subagents, look-ahead Explore, decomposition reviewers) where the
+controller genuinely needs the result inline. The pacing antipattern
+is foreground Agent for *executors*, where the result isn't needed
+inline anyway (the next decision is just "verify diff + commit", which
+happens fine on the next turn).
+
+### Tests
+3 suites / 46 assertions remain green (prose-only changes; testable
+scripts unchanged).
+
 ## [0.2.4] — 2026-05-16
 
 Per-chunk turn-yielding rule made explicit. Field motivation: a user
