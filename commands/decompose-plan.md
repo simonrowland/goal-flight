@@ -81,6 +81,7 @@ Write to `<repo-root>/docs-private/<topic>-goal-queue-<today>.md` with this shap
 # <TOPIC> Goal Queue
 Date: <today>
 Working directory: <repo-root>
+Skill-loaded: <LOADED_LINE from SKILL.md §Session pre-flight probe 1, captured at decomposition time>
 
 Each goal is a self-contained `/goal` dispatch directive. Read together with AGENTS.md, the binding-spec, and the plan of record.
 
