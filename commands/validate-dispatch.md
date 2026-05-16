@@ -1,82 +1,60 @@
 # validate-dispatch [<goal-slug>]
 
-Render and print the 5-layer dispatch wrapper for a goal **without dispatching it**.
-A dry-run for debugging controller-composition bugs. Cheap (no Opus subagent
-spawned, no tokens billed for an executor that's about to fail on a malformed
-layer).
+Render and print the dispatch wrapper for a goal **without dispatching it**. Dry-run for catching malformed wrappers before burning a real Opus / codex / Grok dispatch on them.
+
+This is a soft-check, not a guarantee. The heuristics catch common failure modes; a clever malformed wrapper can still pass them. Controller judgment remains load-bearing.
 
 ## When to invoke
 
-- The user explicitly typed `/goal-flight validate-dispatch [<slug>]`.
-- The controller is about to dispatch a complex chunk and wants to sanity-check
-  the wrapper before spending a real dispatch on it.
-- A previous dispatch came back wrong; the user suspects the wrapper was
-  malformed and wants to re-render.
+- User typed `/goal-flight validate-dispatch [<slug>]`.
+- Controller is about to dispatch a complex chunk and wants to sanity-check.
+- A previous dispatch came back wrong; the user suspects the wrapper.
 
 ## What the user provides
 
-- **No args** → render the NEXT non-DONE chunk in the most recent goal-queue.
-- **One arg `<goal-slug>`** → render that specific chunk (matched against the
-  queue's slug field).
+- **No args** → render the next non-DONE chunk in the most recent goal-queue.
+- **One arg `<goal-slug>`** → that specific chunk.
 
-## Steps
+## Render the wrapper (verification-first; per `prompts/dispatch-wrapper.md`)
 
-1. Find the most recent `docs-private/<topic>-goal-queue-*.md` (most recent by
-   date suffix, or by mtime if same date). Read it.
+1. Find the most recent `docs-private/<topic>-goal-queue-*.md`. Pick the chunk.
+2. Compose the wrapper as **pointers, not pre-pasted content**:
+   - **Layer 0** — base-verification pre-flight with expected SHA captured via `git fetch origin && git rev-parse origin/main` from the MAIN worktree (not controller cwd). The fetch is load-bearing — local `main` can be stale relative to `origin/main`, and Layer 0 verifying against a stale base defeats the point.
+   - **Layer 1** — ~30-word situational frame.
+   - **Goal text** — verbatim from queue.
+   - **Layer 2** — pointer at canonical pattern (`docs-private/rag/patterns/<X>.md` if corpus exists). Framing: *"Investigate as starting hypothesis; verify before mirroring."*
+   - **Layer 3** — pointer at file-map (`docs-private/rag/file-map.md`). Framing: *"Use as navigation; verify every file:line before relying."*
+   - **Layer 4** — environment caveats. Only what the agent can't discover in <5s.
+   - **Layer 5** — abstract self-review categories from `prompts/executor-self-review.md`. **Executor specializes in the REPORT, not in this prompt.**
 
-2. Pick the target chunk:
-   - If slug provided: search for the chunk with matching slug; if not found,
-     surface available slugs and ask.
-   - If no slug: pick the next chunk whose STATUS is `TODO` (not `DONE` /
-     `BLOCKED` / `IN-FLIGHT`).
+3. Print in a fenced block with header (slug, layer set, byte count).
 
-3. Determine whether a RAG corpus exists: `[ -d <repo-root>/docs-private/rag/ ]`.
+## Validation heuristics
 
-4. Render the wrapper per `prompts/dispatch-wrapper.md`:
-   - **Layer 0** (if worktree mode would apply): the base-verification pre-flight
-     stanza, with the expected main HEAD SHA filled in from `git rev-parse main`.
-   - **Layer 1** — situational frame: last commit subject + 1-line description
-     of what this dispatch's role is in the sequence.
-   - **Goal text** — paste verbatim from queue (SCOPE / CHECKLIST / ACCEPTANCE
-     / FORBIDDEN).
-   - **Layer 2** — template-provider pointer: pick the canonical mirror per
-     the slice-to-layer mapping in `prompts/dispatch-wrapper.md`. If corpus
-     exists, paste the contents of one `docs-private/rag/patterns/<pattern>.md`.
-     If trivial chunk: skip with annotation `(layer 2 skipped — trivial single-file)`.
-   - **Layer 3** — file-path-and-line anchors: paste `file-map.md` plus relevant
-     `binding-spec/<intent>.md` slices, or a flat list of paths + commit hashes
-     + class names if no corpus.
-   - **Layer 4** — environment caveats: `verification.md` + relevant
-     `decisions.md` excerpts; or hand-composed if no corpus.
-   - **Layer 5** — goal-specific self-review: pull `prompts/executor-self-review.md`
-     §7 categories and specialize the patterns/nouns/line numbers to this chunk.
+Surfaced as warnings or P0 blockers. None is sufficient on its own; treat as suggestive.
 
-5. Print the assembled wrapper to the user in a single fenced block, with a
-   header line counting layers used and word count: e.g.
-   ```
-   === DISPATCH WRAPPER for goal #N <slug> ===
-   layers: 0 + 1 + (goal) + 2 + 3 + 4 + 5
-   word count: ~4200
-   ===
-   <wrapper text>
-   ```
+- **Byte count > 5 KB** → WARN. Verification-first target is 3–5 KB. Strongly suggests pre-paste regression — examine which "facts" the controller pasted that the executor could discover.
+- **Byte count < 800 B** → WARN. Likely missing layers.
+- **Layer 0 missing for worktree-isolated dispatch** OR **expected-SHA is empty / matches `<PASTE_HERE>` placeholder / no `git fetch origin` was run in the past minute** → P0 BLOCKER. Do not dispatch; the worktree-base failure mode is real, and a stale local `main` SHA fails the spirit of the check.
+- **Any layer (2/3/4) contains `:line-number` anchors without verification framing nearby** (the strings "verify", "starting hypothesis", "before relying", "map", "investigate" within the same paragraph) → WARN. Pre-paste regression. Counts the anchors, NOT just presence — > 10 file:line anchors total is the threshold (the pointer pattern usually has 3–5).
+- **Layer 5 contains chunk-specific specialization** (anything beyond the 7 abstract category names + "specialize in the report") → WARN. Layer 5 stays abstract in the prompt; specialization moves to the executor's report.
+- **Goal text section is missing or empty** → P0 BLOCKER.
 
-6. Surface validation findings:
-   - **Word count < 800**: warn — likely missing layers; check 2/3/4.
-   - **Word count > 20 000**: warn — likely pasted whole files instead of
-     curated slices; will eat executor context.
-   - **Layer 3 has zero `:line` anchors**: warn — wrapper is vague; executor
-     will have to grep.
-   - **Layer 5 contains the literal string "P0/P1/P2"** without specialization
-     to this chunk's grep patterns: warn — likely a raw paste rather than
-     specialization.
+## What this does NOT catch
 
-7. Do NOT dispatch. The user reviews; if happy, they run `/goal-flight execute`
-   (which will re-render fresh) or copy the wrapper into an Agent call manually.
+- Whether rendered file:line anchors point at files that actually exist. (Would require executing the wrapper. Layer 0 + Layer 3 verification framing pushes that check onto the executor — by design.)
+- Whether Layer 5's abstract category set is appropriate for THIS chunk. Judgment call.
+- Substantive errors in the goal text itself — `validate-queue` partially covers structural problems; semantic errors aren't catchable from heuristics.
+- Whether `origin/main` itself is at the right SHA for this dispatch's intended base — if the user wants to dispatch against a non-`main` base, they pass it explicitly.
+
+## After validation
+
+- All checks pass → user proceeds to `/goal-flight execute` (the wrapper rendered there is a fresh re-render).
+- Warnings → user examines, may decide the heuristic is wrong for this chunk OR fixes the wrapper logic.
+- P0 blocker → do not dispatch. Fix the layer that's wrong.
 
 ## See also
 
-- `prompts/dispatch-wrapper.md` — the canonical layer spec.
-- `commands/execute.md` step 2a — where the wrapper is normally rendered.
-- `commands/validate-queue.md` — validates the queue structure itself; this
-  command assumes a valid queue.
+- `prompts/dispatch-wrapper.md` — canonical wrapper spec (verification-first).
+- `commands/execute.md` step 2 — where the wrapper is normally rendered + dispatched.
+- `commands/validate-queue.md` — schema-check the queue itself.

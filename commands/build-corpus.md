@@ -1,59 +1,45 @@
 # build-corpus [--slice <name>] [--next-wave [<N>]] [--all] [--rebuild]
 
-Trigger a RAG corpus build OR extension OR rebuild after `init` step 3.5 has already run. Same 4-pass pipeline (build → per-slice review → cross-slice consolidation → final assessment) but invoked outside init.
+Build, extend, or rebuild the `docs-private/rag/` corpus after `init` step 3.5 has already created it. Same 4-pass pipeline; invocation outside init.
 
 ## Modes
 
 | Args | Mode | Behaviour |
 |------|------|-----------|
-| (none) or `--next-wave` | **Next-wave extension** | Read the most recent final-assessment's "Next-wave priorities" list from RESUME-NOTES; build those slices using the same pipeline. If none recommended, prompt the user for what to add. |
-| `--next-wave <N>` | **Next-wave extension, capped** | Build only the top N priority slices (default unlimited). |
-| `--slice <name>` | **Single-slice rebuild or addition** | Build or rebuild one named slice (e.g., `--slice binding-spec/electrolysis-step.md`). |
-| `--all` | **Full rebuild** | Re-run all slices from scratch. Use when source documents have shifted significantly and per-slice drift won't catch all of it. |
-| `--rebuild` | **Rebuild existing only** | Re-run every slice currently in `docs-private/rag/` but DON'T add new ones. Lighter than `--all`. |
+| (none) or `--next-wave` | Next-wave extension — read most recent final-assessment's "Next-wave priorities" list from RESUME-NOTES; build those slices |
+| `--next-wave <N>` | Cap at top N priority slices |
+| `--slice <name>` | Build or rebuild one named slice (e.g. `--slice binding-spec/electrolysis-step.md`) |
+| `--all` | Full rebuild — re-run all slices from scratch |
+| `--rebuild` | Re-run every existing slice but don't add new ones |
 
-## Steps
+## 4-pass pipeline (same shape as init step 3.5)
 
-### 1. Pre-flight
+Schema reference: `templates/rag-corpus-schema.md.tpl` (directory shape + per-slice word budgets + `verified-at: <commit-SHA>` frontmatter convention).
 
-- Verify `docs-private/rag/` exists. If not, bail: "Run `/goal-flight init <topic>` first; corpus has not been initialized."
-- Read the most recent RESUME-NOTES for the quality dashboard from the last assessment (look for the dashboard table). If absent, treat all slices as un-scored.
-- Read the most recent final-assessment output (look in subagent transcripts at `~/.claude/projects/<encoded>/subagents/agent-*.jsonl` for the last `rag-final-assessment` dispatch — or if persisted to a file, read that).
-- Identify the slices to build based on mode args (above).
+**Pass 1 — slice builders (parallel Claude subagents).** For each target slice, dispatch a builder. Brief: read the slice's source materials (paths come from the source-list table in `commands/init.md` step 3.5), produce a slice file at the schema-defined path with frontmatter `verified-at: <current-HEAD-SHA>`. Builder OVERWRITES for `--all` / `--rebuild`; WRITES new for `--slice` / `--next-wave`. No prompt-template file needed — the slice schema + source-list + verification-first principle are sufficient brief.
 
-### 2. Build pipeline (same as init step 3.5)
+**Pass 2 — per-slice reviewers (parallel Claude subagents).** Each reviewer scores its slice 1–5 per rubric (Factual / Complete / Voice / Dispatch-ready) and surfaces P0/P1/P2 findings. Block Pass 3 until P0+P1 patched.
 
-**Pass 1 — slice builders (parallel Claude subagents).** Use `prompts/rag-slice-builder.md`. Each builder reads its per-slice template (`templates/rag-slice-<type>.md.tpl`) + the source-material paths derived from the source-list table in `commands/init.md` step 3.5. For `--all` and `--rebuild`, the builder OVERWRITES the existing slice; for `--slice <name>` or `--next-wave` it WRITES a new slice.
+**Pass 3 — cross-slice consolidation (one Claude Opus pass).** Pass absolute paths of ALL corpus files (including ones not rebuilt this run — drift between new and old slices is the most likely failure mode). Brief: identify cross-slice contradictions, deduplicate, fix frontmatter `verified-at` for slices reviewed but not rebuilt. Apply fixes.
 
-**Pass 2 — per-slice reviewers (parallel Claude subagents).** Use `prompts/rag-slice-review.md`. Each reviewer scores its slice 1-5 per rubric (Factual / Complete / Voice / Dispatch-ready). Block proceeding to Pass 3 until P0 + P1 patched.
+**Pass 4 — final assessment (one Claude Opus pass).** Aggregate per-slice scores into a quality dashboard; recommend the NEXT next-wave priorities (slices that would most improve dispatch readiness if added). Output written to RESUME-NOTES quality dashboard section.
 
-**Pass 3 — cross-slice consolidation (one Claude Opus pass).** Use `prompts/rag-cross-slice-consolidation.md`. Pass absolute paths of ALL corpus files (including ones not rebuilt this run — drift between new and old slices is the most likely failure mode). Apply fixes.
+## After the pipeline
 
-**Pass 4 — final assessment (one Claude Opus pass).** Use `prompts/rag-final-assessment.md`. Aggregates per-slice scores into a dashboard; recommends the NEXT next-wave priorities.
-
-### 3. Update RESUME-NOTES
-
-Bump RESUME-NOTES rev. Replace the quality dashboard with the new Pass 4 output. Update the "Next-wave priorities" section so a future `/goal-flight build-corpus` (no args) knows what to build.
-
-### 4. Print summary
-
-- Mode: <next-wave | single | all | rebuild>
-- Slices built (or rebuilt): list with one-line word counts and self-scored quality
-- Total pipeline P0/P1/P2 fixes that landed across the 4 passes
-- Pipeline verdict: CORPUS IS DISPATCH-READY / NEEDS-MORE-ITERATION
-- Next-wave priorities (from Pass 4): list
+1. Bump RESUME-NOTES rev. Replace quality dashboard with the new Pass 4 output. Update "Next-wave priorities" so a future `/goal-flight build-corpus` (no args) knows what to build.
+2. Print summary: mode, slices built/rebuilt with word counts + self-scored quality, total P0/P1/P2 fixes that landed, pipeline verdict (CORPUS IS DISPATCH-READY / NEEDS-MORE-ITERATION), next-wave priorities.
 
 ## What this command does NOT do
 
-- Does not modify the skill itself. If the slice schema needs to change (new slice type, new template), the user edits `templates/rag-corpus-schema.md.tpl` + the per-slice template + this command's source-list table — separate work.
-- Does not delete slices. If a slice is obsolete (e.g., the binding-spec section it covered was deleted from the spec), the user removes it manually; `build-corpus` only adds/rebuilds.
-- Does not dispatch `\goal` work that USES the corpus. That's `/goal-flight execute`.
+- Modify the skill itself. If the slice schema needs to change, the user edits `templates/rag-corpus-schema.md.tpl` + the source-list table in `commands/init.md` step 3.5 — separate work.
+- Delete slices. Obsolete slices are removed manually.
+- Dispatch `\goal` work that USES the corpus. That's `/goal-flight execute`.
 
 ## When NOT to invoke
 
-- Right after `init` — the init's own step 3.5 already built the first-wave corpus.
-- When the source documents haven't drifted and the corpus has no known gaps. Drift review at milestone (`commands/execute.md` step 4) catches incidental drift; explicit rebuild is the heavier intervention.
+- Right after `init` — init step 3.5 already built the first-wave corpus.
+- When source documents haven't drifted and the corpus has no known gaps. Milestone drift review (`commands/execute.md` step 4) catches incidental drift; explicit rebuild is the heavier intervention.
 
 ## Cost
 
-Each invocation: ~N slice-builders + ~N reviewers + 1 consolidator + 1 final-assessment subagent. For N=6 slices typical of a wave extension, that's ~14 subagent dispatches. Roughly 15-30 minutes wall clock if dispatched in parallel.
+Each invocation: ~N slice-builders + ~N reviewers + 1 consolidator + 1 final-assessment. For N=6 slices typical of a wave extension: ~14 subagent dispatches; 15–30 minutes wall clock if parallelized.
