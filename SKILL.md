@@ -55,7 +55,7 @@ Full spec: `prompts/dispatch-wrapper.md`. Target dispatch size: 3–5 KB, not 6�
 - **Codex CLI ≥ 0.128.0** for `/goal` mode (older versions still work for reviews / consolidation / short-prompt dispatches — they just don't have the in-session loop primitive). Init step 1 checks the version and recommends `codex update` if older.
 - **Wrap `codex exec` in `timeout --kill-after=10 300`** for non-`/goal` dispatches. Codex v0.130.0 has no `--timeout` flag. 300 s is 10× observed p95 (~25 s healthy). **Do NOT** wrap `/goal` mode dispatches in `timeout 300` — they're multi-hour by design; the controller monitors the tail file for the Final response block to detect completion.
 - **Backstop watchdog** for residual stalls (network wedge, codex-internal hang): zero-output ≥ 90 s OR no-progress ≥ 180 s ⇒ kill + retry as Claude general-purpose subagent. Applies to short-prompt dispatches only; for `/goal` mode, long pauses during plan/act/test/iterate cycles are expected and the watchdog would false-positive.
-- **Fallback when trust can't be registered** (shared machine, one-off invocation): `codex exec --ignore-user-config '...'`. Loses MCP tool access in the dispatched session; trust-registration is strictly preferable when feasible.
+- **Fallback when trust can't be registered** (`--ignore-user-config`): shared machine, one-off invocation, or `~/.codex/config.toml` shouldn't be mutated. Run `codex exec --ignore-user-config '...'`. Loses MCP tool access in the dispatched session; trust-registration is strictly preferable when feasible.
 
 ### Asking discipline — north star
 
