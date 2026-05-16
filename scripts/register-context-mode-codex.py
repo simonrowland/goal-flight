@@ -277,16 +277,25 @@ def main(argv: list[str]) -> int:
         print(msg)
         return 0
 
+    # Probe npx so --check surfaces the "Claude has it AND codex needs register
+    # AND npx is missing" two-step failure pattern upfront rather than after a
+    # subsequent write-mode attempt.
+    npx = shutil.which("npx")
+
     if args.check:
+        if not npx:
+            print(
+                f"CHECK: codex MISSING [mcp_servers.context-mode]; "
+                f"Claude has it ({provenance}); npx ALSO missing on PATH. "
+                "Install Node.js (which ships npx) before re-running without --check."
+            )
+            return 4
         print(
             f"CHECK: codex MISSING [mcp_servers.context-mode]; "
             f"Claude has it ({provenance}). Run without --check to register."
         )
         return 1
 
-    # Resolve npx now (before any write). Refuse-with-error if absent —
-    # writing a registration that codex can't exec helps no one.
-    npx = shutil.which("npx")
     if not npx:
         print(
             "ERROR: `npx` not on PATH; cannot write a working "
