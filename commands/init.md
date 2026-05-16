@@ -29,73 +29,38 @@ Run in parallel:
 If `codex` missing: tell the user (do NOT auto-install):
 > "codex CLI not found. Install with `npm install -g @openai/codex && codex login`. The skill works without codex (Claude subagents only) but loses parallel-reviewer capability for milestone reviews."
 
-If `codex` present, compare its version against the latest published AND against the **`/goal` mode minimum (0.128.0)** — `/goal` is the codex CLI feature goal-flight's chunk-execution dispatch shape leans on (see `SKILL.md` §Codex `/goal` mode dispatch shape). Without it, codex dispatches still work for reviews but lose the multi-hour autonomous-loop primitive.
+If `codex` present, check version + `/goal` feature flag. `/goal` mode (codex CLI's multi-hour autonomous loop) requires codex ≥ 0.128.0 + `features.goals = true` in `~/.codex/config.toml`. Older codex still works for short-prompt review dispatches but loses the loop primitive.
 
 ```bash
-LATEST=$(npm view @openai/codex version 2>/dev/null)
 INSTALLED=$(codex --version 2>&1 | awk '{print $NF}')
 GOAL_MIN="0.128.0"
-
-# Semver-aware comparison: returns the smaller of two versions
 older() { [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -1)" = "$1" ]; }
 
 if older "$INSTALLED" "$GOAL_MIN"; then
-  echo "codex $INSTALLED installed; /goal mode requires $GOAL_MIN or newer."
-  echo "Strongly recommend: codex update    (codex's built-in upgrade subcommand)"
-elif [ -n "$LATEST" ] && [ "$INSTALLED" != "$LATEST" ]; then
-  echo "codex $INSTALLED installed; $LATEST available — run 'codex update' for the latest."
+  echo "codex $INSTALLED installed; /goal mode requires $GOAL_MIN+. Recommend: codex update"
+elif command -v npm >/dev/null 2>&1; then
+  LATEST=$(npm view @openai/codex version 2>/dev/null)
+  [ -n "$LATEST" ] && [ "$INSTALLED" != "$LATEST" ] && \
+    echo "codex $INSTALLED installed; $LATEST available — run 'codex update' for the latest."
 fi
+
+# Features flag
+codex features list 2>&1 | grep -q '^[[:space:]]*goals.*enabled' || \
+  echo "Recommend: codex features enable goals (enables /goal mode)"
 ```
 
-Surface the recommendation but do NOT auto-update — environment mutation is the user's call. `codex update` is codex's built-in upgrade subcommand (runs the upgrade + any post-install marketplace re-sync codex wants to do); prefer it over the bare `npm update -g @openai/codex` so any version-specific hooks fire.
+Surface recommendations but don't auto-update — environment mutation is the user's call. If features.goals is off, ask y/n before enabling.
 
-**Pre-0.128 codex is the line that matters most** — that's when `/goal` mode shipped. Behaviour calibrated for goal-flight: 0.128.0 minimum (chunk-execution dispatches via `/goal`), 0.130.0 current and recorded in this skill's `SKILL.md`. Anything materially older than 0.128 means codex can still review/consolidate (slash-command dispatches) but the chunk-execution loop primitive isn't available.
-
-**Check the `/goal` feature flag** — `/goal` mode requires `features.goals = true` in `~/.codex/config.toml`. The supported enable command is:
+If `gstack` is missing on either side, offer install:
 
 ```bash
-codex features list 2>&1 | awk '/^[[:space:]]*goals\b/ {print}'    # confirm current state
+git clone --single-branch --depth 1 https://github.com/garrytan/gstack.git ~/.claude/skills/gstack \
+  && cd ~/.claude/skills/gstack && ./setup
 ```
 
-If `goals` is not enabled and codex is recent enough (>= 0.128.0), surface:
+The setup script registers gstack on both Claude and codex sides. If only one side is present, re-running setup adds the other. Ask y/n before running; if declined, fall back to `prompts/gstack-*.md` for review dispatches and note in summary which gstack invocations use Claude-direct vs codex-via-exec vs local-prompts.
 
-> "Codex `/goal` mode is experimental and not enabled. Enable it with `codex features enable goals` (idempotent — writes `features.goals = true` to `~/.codex/config.toml`). Without it, goal-flight chunk dispatches fall back to short-prompt codex dispatches that don't use the multi-hour autonomous loop. Run `codex features enable goals`? (y/n)"
-
-If user accepts: run it, re-check. Note in summary whether `goals` is now enabled.
-
-If `gstack` is missing on **either side**: **recommend install and offer to run it.**
-
-Three cases:
-
-1. **Both sides absent** → recommend full install:
-   > "gstack not installed. Strongly recommended — Gary Tan's skill pack works for both Claude Code AND codex, providing `/review`, `/office-hours`, `/plan-eng-review`, `/cso`, `/investigate`, etc. that this skill leans on heavily. The official install registers it for both:
-   >
-   > ```bash
-   > git clone --single-branch --depth 1 https://github.com/garrytan/gstack.git ~/.claude/skills/gstack && cd ~/.claude/skills/gstack && ./setup
-   > ```
-   >
-   > Run it now? (y/n)"
-
-2. **Codex-side present, Claude-side absent** (or vice versa) → recommend re-running setup:
-   > "gstack is installed for `<side present>` but not `<side missing>`. To register for both, re-run:
-   > ```bash
-   > cd ~/.claude/skills/gstack 2>/dev/null || git clone --single-branch --depth 1 https://github.com/garrytan/gstack.git ~/.claude/skills/gstack && cd ~/.claude/skills/gstack && ./setup
-   > ```
-   > This makes `/review` etc. directly invokable from Claude (faster, no codex round-trip) AND keeps the codex-side parallel-review capability. Run it? (y/n)"
-
-3. **Both sides present** → continue silently; note in summary.
-
-If user says yes to install: run the command via Bash. After completion, re-check both `[ -d ~/.claude/skills/gstack ]` and `[ -d ~/.codex/skills/gstack ]`; report what registered.
-
-If user says no: continue with whatever's installed; note in summary which gstack invocations will use Claude-direct, which will use codex-via-`exec`, and which will fall back to local prompts.
-
-If `context-mode` is missing on either side, recommend installation:
-
-> "context-mode is a strong multiplier for this controller pattern — it offloads large command outputs (diffs, test runs, greps, codex tails) to an FTS5 sandbox and lets the controller and executors query by pattern instead of pulling everything into context. Especially valuable on the codex side during `/goal` loops where shell output fills context fast. Install instructions: https://github.com/simonrowland/context-mode. Want me to walk through the install? (y/n)"
-
-If user accepts: surface the install command from the project README. After install, re-check MCP registrations on both sides; report.
-
-If user declines: continue. Note in summary that large-output handling will use direct Bash/Read tools and may consume more context per chunk.
+If `context-mode` MCP is missing on either side, offer install with a pointer to https://github.com/simonrowland/context-mode. Context-mode offloads large command outputs (diffs, test runs, greps, codex tails) to an FTS5 sandbox — a real multiplier on `/goal` loops where shell output fills context fast. Decline = note in summary that large-output handling falls back to direct Bash/Read.
 
 **Register the project as codex-trusted** (one-time, idempotent — prevents codex MCP approval-gate stalls in non-interactive dispatches):
 
@@ -275,52 +240,30 @@ Pass-specific briefs (controller composes from these on dispatch — frontier mo
 
 Read `<repo-root>/.gitignore`.
 
-- If `docs-private/` is not present, append it. (docs-private holds dated per-session state — RESUME-NOTES, goal-queue, goal-statement, rag/ — which is correctly per-machine and should not be tracked.)
-- **AGENTS.md should be tracked, not gitignored.** The worktree story is the key reason: tracked files propagate to every worktree's checkout automatically; gitignored files do not, so a controller or executor spawned inside a worktree silently has no AGENTS.md to read, defeating the auto-load directive in step 4.5. The CLAUDE.md pointer in 4.5 is also worktree-correct only when its target (AGENTS.md) propagates.
-  - If AGENTS.md is currently listed in `.gitignore`: ask the user *"AGENTS.md is gitignored, which means it won't appear in worktree checkouts and the auto-read directive will silently fail there. Remove from .gitignore so it propagates? (y/n)"*. Default yes.
-  - If AGENTS.md is not gitignored but is also not yet committed: note in summary; suggest the user `git add AGENTS.md` and commit on their next commit.
-  - If the user prefers gitignored AGENTS.md (some teams do — competitive content, privacy, license): note in summary that worktrees won't auto-inherit AGENTS.md and the user is responsible for symlinking (`ln -s <main>/AGENTS.md <worktree>/AGENTS.md`) or copying per worktree, OR running every controller from the main worktree only.
+- Append `docs-private/` if missing (holds per-session state: RESUME-NOTES, goal-queue, goal-statement, rag/).
+- **AGENTS.md should be tracked, not gitignored** — worktrees inherit tracked files automatically; gitignored AGENTS.md silently disappears from worktree checkouts and defeats the auto-load directive (step 4.5). If gitignored: ask y/n to remove from gitignore (default yes). If not committed: suggest `git add AGENTS.md`. If user explicitly wants AGENTS.md gitignored (privacy/license): note in summary that worktree controllers need a symlink (`ln -s <main>/AGENTS.md <worktree>/AGENTS.md`) or to run from main only.
 
 ### 4.5. Ensure AGENTS.md will be auto-read by future sessions
 
-Claude Code does not auto-load `AGENTS.md` the way it auto-loads `CLAUDE.md` (Codex loads AGENTS.md natively; Claude Code currently does not). To make AGENTS.md reliably the first thing every future controller and executor reads, ensure a CLAUDE.md exists with a directive pointing at it.
+Claude Code doesn't auto-load `AGENTS.md` (Codex does natively). To make it reliably the first thing future sessions read, ensure a CLAUDE.md directive exists pointing at it.
 
-**First, check what's already in place:**
+Check both: `grep -l "AGENTS.md" ~/.claude/CLAUDE.md 2>/dev/null` (machine-wide) and `grep -l "AGENTS.md" <repo-root>/CLAUDE.md 2>/dev/null` (per-repo). If neither, ask which scope: global (all your projects, no team propagation), project-level (this repo only, propagates via git), or both.
 
-- Global directive: `grep -l "AGENTS.md" ~/.claude/CLAUDE.md 2>/dev/null` — if present, the user has a machine-wide rule.
-- Project directive: `grep -l "AGENTS.md" <repo-root>/CLAUDE.md 2>/dev/null` — if present, the project has a per-repo rule.
+Snippets to append (don't overwrite existing CLAUDE.md):
 
-**Then dispatch on what's there:**
-
-| Global has it? | Project has it? | Action |
-|----------------|-----------------|--------|
-| Yes | Yes | Done. Note both in summary. |
-| Yes | No | Ask: *"Your global CLAUDE.md already auto-reads AGENTS.md, so this works for you on this machine. Want to also add a project-level pointer in `<repo-root>/CLAUDE.md`? It propagates to teammates via git so they get the same behavior. (y/n)"* |
-| No | Yes | Ask: *"Project CLAUDE.md auto-reads AGENTS.md, so any session in this repo works. Want to also add it to your global `~/.claude/CLAUDE.md` so other projects of yours benefit? (y/n)"* |
-| No | No | **Ask scope explicitly:** *"To make AGENTS.md auto-load reliably, I can add a directive to: (1) global `~/.claude/CLAUDE.md` — once, all your projects benefit, no team propagation; (2) project `<repo-root>/CLAUDE.md` — only this repo, propagates to teammates via git; (3) both — belt-and-suspenders, useful if you sometimes work without your global config. Which?"* |
-
-**Snippet for project-level CLAUDE.md** (if user picks project or both):
+**Project-level** (`<repo-root>/CLAUDE.md`):
 ```
 ## Read AGENTS.md first
-This project pins agent operating instructions in `AGENTS.md` at the repo root.
-Read it before doing any work — it carries the project invariants, file map,
-and conversation style that shape everything downstream.
+This project pins agent operating instructions in `AGENTS.md` at the repo root. Read it before doing any work — it carries the project invariants, file map, and conventions.
 ```
-If a project CLAUDE.md already exists, append; show the diff and ask before applying. If not, create it.
 
-**Snippet for global ~/.claude/CLAUDE.md** (if user picks global or both):
+**Global** (`~/.claude/CLAUDE.md`):
 ```
 # session start
-At session start in any project, if `AGENTS.md` exists at the repo root,
-read it before doing other work — it carries the project invariants, file map,
-and conversation style that shape everything downstream. Claude Code does not
-auto-load AGENTS.md; this makes the behavior symmetric with Codex. If working
-inside a git worktree where AGENTS.md is gitignored and absent, also check
-the parent project root.
+At session start in any project, if `AGENTS.md` exists at the repo root, read it before doing other work — makes behavior symmetric with Codex (which auto-loads AGENTS.md natively).
 ```
-Append (don't overwrite); show the diff and ask before applying. Note this affects every project on this machine.
 
-If user declines all options: note in summary that AGENTS.md will need to be Read manually at the start of each future session, OR be invoked via `/goal-flight` (which always Reads it). Future controllers / executors that don't go through the skill won't pick it up.
+If user declines all options: note in summary that AGENTS.md will need manual Read at session start (or be invoked via `/goal-flight` which always reads it).
 
 ### 5. Self-review the init output
 

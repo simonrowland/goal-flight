@@ -6,259 +6,122 @@ Run the per-chunk loop. **Sequential by default.** With `--parallel N`: spawn up
 
 ### 1. Pre-flight
 
-- Find most recent `docs-private/RESUME-NOTES-*.md`. **Delegate the read to an Explore subagent** if it's large; consume the subagent's summary.
+- Find most recent `docs-private/RESUME-NOTES-*.md`. Delegate the read to an Explore subagent if it's large.
 - Find most recent goal-queue: `docs-private/<topic>-goal-queue-*.md`.
 - Verify reality via Bash: `git log --oneline -10`, `git status`, `git rev-parse HEAD`. Confirm matches RESUME-NOTES' Code-state section.
-- Quick test smoke (if known): e.g. `pytest --collect-only` or `npm test -- --listTests`. Confirm baseline.
-- If any drift between RESUME-NOTES and reality: pause, surface to user, do not dispatch.
+- Quick test smoke if known (e.g. `pytest --collect-only`).
+- If drift between RESUME-NOTES and reality: pause, surface to user, do not dispatch.
 
 ### 2. Per-chunk loop — sequential mode
 
 For each non-DONE goal in the queue (in order):
 
-**a. Build dispatch prompt — render the 5-layer wrapper from `prompts/dispatch-wrapper.md`.**
+**a. Build dispatch prompt** per `prompts/dispatch-wrapper.md` — verification-first scaffolding, target 3–5 KB. Layer 0 (worktree-isolated dispatches) captures expected base SHA from `git fetch origin && git rev-parse origin/main` in the MAIN worktree, not controller cwd. Layers 1–5 scaffold investigation rather than pre-paste content. Tail with `invariants.md` if corpus exists.
 
-Raw goal text from the queue is NOT enough. Field-validated practice (55 dispatches sampled): real dispatches that complete cleanly are 6–11 KB; goal text alone is 600–1200 chars. The delta is the 5-layer wrapper the controller composes per dispatch.
+If the `docs-private/rag/` corpus exists, paste slice content per the slice-to-layer mapping in `prompts/dispatch-wrapper.md` — as starting hypotheses the executor verifies, not authoritative facts.
 
-Render the dispatch prompt as:
+**b. Execute the chunk.** Branch on chunk tags from `decompose-plan` step 2 (see `SKILL.md` §Three dispatch paths for the full decision matrix):
 
-```
-/goal <SLUG>
+- **`[controller-direct]`** — controller inline: Read + Edit + run test subset + adversarial self-review (Layer 5 specialized against own diff). Skip steps c–d below; jump to commit. Use only for chunks tagged at decompose-plan time. Don't retag mid-execute — if a chunk turns out trickier, abort inline and fall through to the subagent path.
+- **`[goal-mode]`** — codex `/goal` mode (in-session loop) or external Opus/Grok iteration loop. Render `templates/codex-goal-prompt.md.tpl`; dispatch per the path chosen.
+- **Untagged (default)** — Claude Agent (`model: "opus"`, highest reasoning for code-writing chunks). Or codex via `timeout 300 codex exec '...'` if you want model-diversity for this chunk (codex auto-activates `/goal` mode on goal-shaped prompts when `features.goals = true`).
 
-[Layer 0 (MANDATORY when isolation: "worktree"): base-verification pre-flight per
- prompts/dispatch-wrapper.md "Layer 0". Capture the expected base SHA via
- `git rev-parse main` from the MAIN worktree path (NOT from controller cwd —
- cwd may be a sibling worktree whose branch lags main). Paste that SHA into the
- prompt. Executor verifies HEAD vs expected and aborts on mismatch — this catches
- the worktree-base-stale failure that bit goal #18 JSON-RUNNER-HARNESS.]
+**Fork primitives** are the heavier "branch the controller's state" tool when a chunk depends on session-loaded context AND you want a `/rewind`-able savepoint. See `SKILL.md` §Self-delegation via `/fork` for the full pattern (controller writes contract via `scripts/self-fork-detect.sh write`; fork detects via `detect`; monitor watches the marker vocabulary).
 
-[Layer 1: situational frame — main HEAD, what just landed, what this dispatch's role is]
+**c. Wait** for executor's task-notification. Don't poll the transcript.
 
-[Goal text pasted from queue — SCOPE / CHECKLIST / ACCEPTANCE / FORBIDDEN]
+**d. Verify diff briefly:** `git diff --stat` (scope contained?) + `git diff` first 200 lines (FORBIDDEN actions? mutator patterns the goal banned?) + run the test subset.
 
-[Layer 2: template-provider pointer — name the canonical mirror + the differences]
+If any check fails: surface to user OR re-dispatch the executor with the failing finding as input. Don't commit on failure.
 
-[Layer 3: file-path-and-line anchors — flat list of paths, commit hashes, class names]
+**e. Commit** (one chunk per commit). Imperative subject + `(chunk N/M)` suffix. HEREDOC for the body.
 
-[Layer 4: environment caveats — optional deps, skip patterns, install state]
+**f. Update Progress table** in goal-queue: `| #N <slug> | DONE — <hash> |`.
 
-[Layer 5: goal-specific self-review — §7 categories from prompts/executor-self-review.md
- SPECIALIZED to this goal's grep patterns + nouns + line numbers. Do not paste raw.]
-
-Report format: see prompts/executor-self-review.md.
-Read <repo-root>/docs-private/worker-context.md (if exists) or <repo-root>/AGENTS.md.
-```
-
-For **trivial single-file goals** (likely LoC delta < 50, no new public surface, no cross-module coupling): layers 1 + 5 alone suffice. Skip 2/3/4.
-
-**If `docs-private/rag/` corpus exists** (built by init step 3.5): use the slice-to-layer mapping at the bottom of `prompts/dispatch-wrapper.md`. Quick reference:
-- Layer 2 ← one `patterns/<pattern>.md` (the canonical example this chunk mirrors)
-- Layer 3 ← `file-map.md` (or `file-map/*.md` set if split) + relevant `binding-spec/<intent>.md` slices
-- Layer 4 ← `verification.md` (or `verification/tests.md` + `verification/grep-invariants.md` if split) + topic-filtered entries from `decisions.md` (or relevant epoch slice if `decisions.md` was epoch-split)
-- Tail ← `invariants.md` (always)
-- Layers 1 + 5 always hand-composed per dispatch
-
-For split slices: paste the entire split set, not a subset. Splits manage word budget; relevance filtering happens at the family level (paste this slice or not), not within a family.
-
-If the corpus exists and the dispatch doesn't paste from it for layers 2/3/4, the controller has regressed to hand-composition; self-check before sending.
-
-Read `prompts/dispatch-wrapper.md` for the full per-layer worked examples (sourced from goals #8/#9/#10 dispatches in the goal-flight reference project) and the complete slice-to-layer mapping.
-
-**b. Execute the chunk.** Two paths depending on the chunk's tags from `decompose-plan` step 2:
-
-- **`[controller-direct]` chunks** — controller does the work inline. Two distinct triggers for this tag (per `commands/decompose-plan.md` step 2): (A) trivially small work; (B) the controller has session-loaded state a fresh subagent would have to re-discover. Both reduce to the same overhead-arbitrage: dispatch + re-loading context costs more than just doing the work. Workflow:
-  1. Read the target file(s) directly (Read tool).
-  2. Apply the change (Edit tool).
-  3. Run the relevant subset of the test suite per `docs-private/worker-context.md` or `AGENTS.md`.
-  4. Run the goal-specific self-review (Layer 5 from `prompts/executor-self-review.md`, specialized to this chunk's grep patterns and acceptance criteria) against your own diff. Treat your own work adversarially — if you find a P0/P1, self-fix before commit.
-  5. Skip steps c (wait) and d (verify diff via subagent) below — you just did them inline. Proceed to step e (commit).
-  
-  Use this path only for chunks decompose-plan tagged `[controller-direct]`. **Do not retag mid-execute** — if a chunk turns out trickier than expected, abort the inline path, surface the surprise as a goal-queue annotation, and fall through to the subagent path.
-
-  **Fork primitives — both sides have them.** When the controller has been driving a multi-step task and the next chunk depends on accumulated session state, the right move is often "branch off this session" rather than "spawn a fresh subagent that has to re-load context."
-
-  - **Claude Code: `/fork` (slash command, renamed `/branch` in v2.1.77 but `/fork` still works) + `--fork-session` (CLI flag).** `/fork` creates a branch of the current conversation at the current state; user switches into the new branch with all context inherited (file reads, chat history, partial state); the original is preserved and `/rewind`-reachable. `--fork-session` is the CLI-side equivalent — `claude --resume <id> --fork-session` resumes with a new session ID, leaving the original unchanged. Use cases for the controller: branch before high-risk irreversible actions (so `/rewind` is available if the approach goes wrong), branch to try alternative approaches, branch to isolate a long detour from the main thread. Note: `/fork` is single-thread — the user (or controller) is in the NEW branch after forking; it's not a concurrent-execution primitive, more like a checkpoint-and-branch.
-  - **Codex: `codex fork --last <continuation-prompt>`** + `codex exec resume --last '<continuation>'`. Spawns / resumes a session inheriting the prior session's context. Same logic on the codex side.
-  - **`[controller-direct]` is the everyday Claude path** for "too much context to explain" — when the controller already has the state and re-explaining to a fresh Agent-tool subagent would cost more than just doing the work inline. Agent-tool dispatches don't inherit controller context; the controller IS the agent that has it. `/fork` is the heavier primitive when you specifically want to BRANCH from the current state (e.g., preserve current progress while trying a risky approach).
-
-- **Untagged chunks (default)** — dispatch as Claude subagent via the Agent tool (general-purpose). Pass:
-  - `description`: short phrase like "Execute /goal <SLUG>"
-  - `prompt`: the full dispatch prompt from (a)
-  - `model`: `"opus"` for code-writing chunks (default for execute). Use the agent definition's default model for non-code chunks (planning, review writeups, docs prose).
-  - The subagent works in the main worktree.
-  
-  If using codex instead of an Agent-tool dispatch, include the highest-reasoning flag in the `codex exec` invocation (verify the current codex CLI flag — at time of writing `-c model_reasoning_effort=xhigh` is the pattern). Same principle: perfectionist output for code-writing chunks; default reasoning for non-code work.
-
-**c. Wait** for the executor to report done.
-
-**d. Verify diff briefly.** Run in parallel:
-- `git diff --stat` — scope contained?
-- `git diff` (read first 200 lines) — quick scan for FORBIDDEN actions; grep for the mutator patterns the goal forbade.
-- Run the test command (or relevant subset) per worker-context.md.
-
-If any check fails: surface findings to user OR re-dispatch the executor with the failing finding as input. Do not commit on failure.
-
-**e. Commit** (one chunk per commit). Message: short imperative + `(chunk N/M)` suffix. Use HEREDOC.
-
-**f. Update Progress table** in goal-queue: `| #N <slug> | DONE — <hash> |` (replace previous TODO/IN-FLIGHT entry).
-
-**g. Spawn look-ahead subagent** (read-only Explore, fire-and-forget — don't block on its output):
-> "Read the goal-queue. The next 1-2 chunks (#<N+1>, #<N+2>) are about to dispatch. Scan the binding-spec, AGENTS.md, and current code state for: hidden dependencies, ambiguities the executor will hit, missing acceptance criteria. Report any anticipatory questions in the format from `prompts/ask-anticipatory.md`. If nothing material, say so."
-
-If the look-ahead returns material questions, run `commands/ask-questions.md --scope next-chunks` non-blockingly (queue for next pause).
+**g. Spawn look-ahead** (read-only Explore, fire-and-forget): "Read the goal-queue. Next 1–2 chunks about to dispatch. Scan binding-spec / AGENTS.md / current code for hidden dependencies, ambiguities, missing acceptance criteria. Report anticipatory questions per `prompts/ask-anticipatory.md`." If material questions surface, queue `commands/ask-questions.md --scope next-chunks` non-blockingly.
 
 ### 3. Per-chunk loop — parallel mode (`--parallel N`)
 
 For each batch of up to N consecutive `[parallel-safe:<group>]` chunks:
 
-**a. Spawn worktrees.** For each chunk in the batch:
-```bash
-git worktree add <repo-root>/.claude/worktrees/<adjective-noun-N>/ -b claude/<adjective-noun-N>
-```
+**a. Spawn worktrees:** `git worktree add <repo-root>/.claude/worktrees/<adjective-noun-N>/ -b claude/<adjective-noun-N>`. Codex trust prefix-matches the project root, so worktrees under `<repo-root>/.claude/worktrees/*` inherit trust automatically (no per-worktree registration; see `SKILL.md` §Worktree convention).
 
-**Codex trust at worktree-creation time: nothing to do.** The worktree path is always under `<repo-root>/.claude/worktrees/...`, and codex matches `[projects."<ABS>"].trust_level` entries by path prefix. As long as `<repo-root>` was registered at init (per `commands/init.md` step 1, via `scripts/install-codex-overrides.sh`), every worktree under it inherits trust automatically — `codex exec` dispatches from inside the worktree pass MCP approval gates the same way they would from the main worktree. If you ever spawn a worktree OUTSIDE the repo root (uncommon — goal-flight's convention keeps them inside), register that path explicitly: `bash <skill-root>/scripts/install-codex-overrides.sh <worktree-path>`.
-
-**b. Dispatch each as a Claude subagent in its own worktree.** Pass the worktree path in the agent description so the subagent knows where to work.
+**b. Dispatch each as a Claude subagent in its own worktree.** Pass the worktree path in the agent description.
 
 **c. Controller monitors all N.** As each reports done:
-- Verify diff in that worktree (same checks as sequential step 2d).
-- Commit in the worktree (the subagent typically does this since it lives inside the isolated worktree's git context).
-- Cherry-pick onto main: from main worktree, `git cherry-pick <subagent-commit-hash>`. **Cherry-pick is the default; do NOT use `git merge --ff-only`** — isolated worktrees branched off main do not fast-forward cleanly when sibling worktrees committed since the shared base, so merge --ff-only fails or pulls in unrelated history. Cherry-pick is safer and produces a clean linear stack of one-commit-per-chunk on main, which is also what the Progress table assumes.
+- Verify diff in that worktree.
+- Commit in the worktree.
+- Cherry-pick onto main from main worktree. **Never `git merge --ff-only`** — sibling worktrees branched off main don't fast-forward cleanly when other worktrees have committed since the shared base.
 
 **If `git cherry-pick` reports CONFLICT** (sibling chunks edited adjacent territory or made conflicting assumptions):
 
-- Capture the conflict surface: `git status` for the conflicted paths, the failing chunk's slug + branch name, and the prior-landed commits in the batch (these form the new baseline the failing chunk needs to rebase against).
-- Abort the cherry-pick in main: `git cherry-pick --abort`. Leave the main worktree clean; the failing chunk's commit still exists on its branch and can be re-dispatched.
-- Classify and route:
-  - **Mechanical conflict** (same file edited by sibling chunks in disjoint ways the 3-way merge couldn't reconcile): re-dispatch this chunk with the CURRENT main HEAD as the Layer 0 base SHA. The executor rebuilds against post-batch state. This is usually the right path for surface conflicts (formatting, neighbouring functions, adjacent imports).
-  - **Semantic conflict** (sibling chunks made conflicting design assumptions — e.g. both renamed the same function differently, both introduced a constant with the same name but different value): mark this chunk `[REBASE-NEEDED:<one-line-reason>]` in the queue, notify the user via `osascript -e 'display notification "Chunk N rebase needed: <reason>" with title "goal-flight" sound name "Funk"'`, and continue the batch with the remaining chunks. Surface for resolution at the next milestone review.
-- **Do NOT** manually edit conflict markers in the main worktree. The controller's job is to dispatch work, not adjudicate merges by hand. Re-dispatch (mechanical) or re-decompose (semantic) is the right tool — both keep the per-chunk commit shape intact for the Progress table.
+- Capture: `git status` for conflicted paths, the failing chunk's slug + branch, the prior-landed commits in this batch.
+- `git cherry-pick --abort` in main. The failing chunk's commit still exists on its branch; can be re-dispatched.
+- Classify:
+  - **Mechanical** (disjoint edits the 3-way merge couldn't reconcile): re-dispatch this chunk with current main HEAD as the Layer 0 base SHA. Usually right for surface conflicts.
+  - **Semantic** (conflicting design assumptions — same function renamed differently, same constant introduced with different value): mark `[REBASE-NEEDED:<reason>]` in the queue, notify the user, continue the batch with remaining chunks. Resolve at next milestone review.
+- **Never** manually edit conflict markers in main. Re-dispatch or re-decompose; both preserve the per-chunk commit shape the Progress table assumes.
 
-- After cherry-pick (or skip-with-reason): run integration pytest from main to catch cross-cluster regressions (each subagent ran tests in isolation; this is the first time all the changes coexist).
-- Update Progress table; log.
+- After cherry-pick (or skip-with-reason): run integration tests from main to catch cross-cluster regressions.
+- Update Progress table.
 
-**d. After all N land**: leave the agent worktrees in place if locked (system manages cleanup); otherwise collapse worktrees (`git worktree remove`); delete branches (`git branch -d`); update Progress table for the batch; log.
+**d. After all N land:** collapse worktrees (`git worktree remove`), delete branches, update Progress table for the batch.
 
-**e. If any one chunk fails**: do not block the others. Isolate the failure (mark chunk BLOCKED in queue), notify user (`osascript -e 'display notification "Chunk N blocked: <reason>" with title "goal-flight" sound name "Funk"'`), continue with the rest.
+**e. If any one chunk fails:** isolate the failure (mark BLOCKED in queue), notify user, continue with the rest.
 
 ### 4. Periodic gstack review
 
-Every K commits (default K=5; configurable via `--review-every <K>`), or at user-flagged milestones (chunks tagged `[milestone]` in the queue):
+Every K commits (default K=5; configurable via `--review-every <K>`), or at user-flagged `[milestone]` chunks:
 
-**a. Capture the commit range:** `<last-review-head>..<current-head>`.
+**a. Capture commit range:** `<last-review-head>..<current-head>`.
 
-**b. Two reviewers in parallel — choose the diversity axis.**
+**b. Two reviewers in parallel.** Choose the diversity axis:
 
-Reviewers should be independent on a load-bearing axis. Two axes available:
+- **Model diversity** (Claude + codex). Good for algorithmic chunks where the two models' blind spots differ.
+- **Concern diversity** (two Claude subagents with disjoint lenses, e.g. correctness vs code-quality). Higher load-bearing for long refactor runs — one reviewer can't cover both axes deeply enough.
 
-- **Model diversity** (Claude + codex). Good for numerical/algorithmic chunks where the two models' blind spots are different. The default historically.
-- **Concern diversity** (two Claude subagents with disjoint lenses, e.g. "chemistry/accounting correctness" vs "code-quality + architecture consistency"). **More load-bearing for 12-hour refactor runs** — one reviewer can't cover both axes deeply enough; concern-splitting produces 2× the surface coverage.
+Mix is fine: one Claude reviewer (concern A) + one codex reviewer (concern B) splits both axes.
 
-For big refactor milestones (multi-file, multi-commit), prefer concern diversity. For small numerical / API chunks where you want a second model's blind spots, prefer model diversity. Mix: one Claude reviewer (concern: chemistry) + one codex reviewer (concern: code quality) splits BOTH axes.
+**Claude challenger:** invoke `Skill(skill: "review", ...)` directly if gstack registered Claude-side; else dispatch subagent with `prompts/gstack-claude-review.md`.
 
-Both reviewers use the same gstack `/review` framing (when installed) for consistent severity ranking; they produce independent findings since they're different models OR different concerns.
+**Codex challenger:** invoke gstack `/review` via codex if registered codex-side; else point codex at `prompts/gstack-codex-challenge.md` (don't paste content into the exec arg — `SKILL.md` §Codex reliability covers the pointer pattern).
 
-**Claude challenger** — preferred Claude-side path:
+**Optional third pass** for security-relevant changes: gstack `/cso` (same dispatch logic).
 
-- If gstack registered on Claude side: invoke `Skill(skill: "review", args: "<start-hash>..<end-hash>. Reference: AGENTS.md, docs-private/<topic>-goal-statement-*.md, docs-private/<topic>-goal-queue-*.md. Output findings as P0/P1/P2/P3.")` directly, OR dispatch a subagent that invokes it (use subagent if you want to isolate context — recommended for 12-hour runs).
-- If gstack absent on Claude side: spawn a subagent (Agent tool, general-purpose) with `prompts/gstack-claude-review.md` prompt + commit range + paths.
+**Fourth pass — RAG corpus drift review** when `docs-private/rag/` exists: dispatch after fix-clusters have landed (range = `<milestone-start>..<HEAD-after-fix-clusters>`). Brief: read every corpus slice; for each, verify file:line refs / grep patterns / decisions against current code; report per-slice P0/P1/P2/P3. Apply small drift inline; re-dispatch a slice-builder for major drift (>30% rewrite).
 
-**Codex challenger** (background, parallel second opinion):
+**c. Wait for both reviewers.** Consolidate findings; dedupe; severity-rank P0/P1/P2/P3.
 
-- If gstack registered on codex side:
-  ```bash
-  timeout --kill-after=10 300 codex exec '/review <start-hash>..<end-hash>. Reference: AGENTS.md, docs-private/<topic>-goal-statement-*.md, docs-private/<topic>-goal-queue-*.md. Output findings as P0/P1/P2/P3.' > /tmp/goal-flight-gstack-codex-<topic>-<iso>.txt 2>&1 &
-  ```
-- If gstack absent on codex side — point codex at the prompt file on disk, don't paste its contents into the exec arg:
-  ```bash
-  timeout --kill-after=10 300 codex exec \
-    "Read ~/.claude/skills/goal-flight/prompts/gstack-codex-challenge.md in full and execute it. Commit range: <start-hash>..<end-hash>. Goal-queue: docs-private/<topic>-goal-queue-*.md. If your context compacts mid-review, re-read the prompts file — the file is the unparaphrased source of truth." \
-    > /tmp/goal-flight-gstack-codex-<topic>-<iso>.txt 2>&1 &
-  ```
-  Avoids spamming the controller's tokens with pre-pasted prompt content; survives codex session compaction (codex can re-Read the file); bypasses any CLI argument length limit. Same principle as `SKILL.md` §Codex reliability "keep the prompt short — pass pointers."
+**d. Fix clusters in parallel.** Group findings by ownership (which file/module). One Claude subagent per cluster. **Each cluster prompt MUST explicitly forbid touching files owned by other clusters** — without this, parallel fix clusters race on shared files. The forbid list is as load-bearing as SCOPE.
 
-Capture PID; poll temp file for completion.
-
-**Optional third pass** for security-relevant changes (touches auth, sessions, input handling, SQL, deserialization) — gstack `/cso`:
-
-- Claude-side: `Skill(skill: "cso", args: "<start-hash>..<end-hash>")` if registered, else dispatch subagent.
-- Codex-side: `timeout --kill-after=10 300 codex exec '/cso <start-hash>..<end-hash>' > /tmp/goal-flight-gstack-cso-<topic>-<iso>.txt 2>&1 &` if registered.
-
-**Fourth pass — RAG corpus drift review** (when `docs-private/rag/` exists from init step 3.5):
-
-The corpus is load-bearing for every dispatch's wrapper layers 2-4. As goals land, decisions change, helpers get lifted, file paths move — slices drift away from current reality. Catch drift at milestone cadence so the next batch of dispatches uses fresh context.
-
-**Sequencing matters**: drift review must run AFTER the milestone's fix-cluster commits have been cherry-picked onto main. If drift review captures its commit range at milestone START, fix-cluster commits land BEFORE drift consumes them — and drift may incorrectly pass on a corpus the fix-clusters have just invalidated. Capture the drift-review range as `<milestone-start>..<HEAD-after-fix-clusters-landed>`, not `<milestone-start>..<milestone-review-start>`.
-
-- Dispatch a Claude subagent (after fix-clusters have landed) with this prompt:
-  > "RAG corpus drift review. Read every file in `docs-private/rag/`. For each slice, verify against current code state: (a) do file:line refs still exist? (b) do grep patterns still match? (c) has any decision in `decisions.md` been amended/reversed by a commit in `<milestone-start>..<HEAD-after-fix-clusters>` without the slice being updated? (d) do `patterns/*.md` files still describe the canonical implementation, or has it moved/been lifted? Report per-slice P0/P1/P2/P3 findings."
-- Apply fixes inline (controller-direct) for small drift; re-dispatch a slice-builder for major drift (>30% of slice needs rewriting).
-
-If codex isn't available or stalls (the `timeout(1)` wrapper fires after 300 s, or the optional watchdog kills on zero-output ≥90 s / no-progress ≥180 s — see `SKILL.md` §Codex reliability): proceed with Claude only; note in summary.
-
-**c. Wait for both**; consolidate findings (dedupe; severity-rank P0/P1/P2/P3).
-
-**d. For findings: spawn fix-cluster subagents in parallel.** Group findings by ownership (which file/module they affect); one Claude subagent per ownership-clean cluster. Each subagent:
-- Receives its cluster of findings.
-- Implements fixes.
-- Runs the executor self-review pass before reporting done.
-
-**Each cluster prompt MUST explicitly forbid touching files owned by other clusters.** Without this, parallel fix clusters race on shared files. Wording template:
-
-> "Your scope is the `engines/builtin/` tree + new `tests/chemistry/test_kernel_control_audit.py`. **DO NOT touch `simulator/*` — that's Cluster B's slice. DO NOT touch `docs/` or `docs-private/` — that's Cluster C's slice.** If you find an issue requiring changes outside your scope, surface it in your report rather than implementing — the controller will route to the right cluster or queue as a follow-up."
-
-This is what makes the 3-cluster parallel fix pattern from goal #7's milestone settlement race-free in practice. The forbid list is as load-bearing as the SCOPE.
-
-Cherry-pick each cluster's commits onto main (NOT `git merge --ff-only` — see parallel-mode step c).
+Cherry-pick each cluster's commits onto main.
 
 **e. After convergence:**
-- Bump RESUME-NOTES rev (delegate to subagent) including a one-line milestone-review summary (commit range, findings count, cluster count).
-- Update Progress table with milestone-review entries.
+- Bump RESUME-NOTES rev with milestone summary (commit range, findings count, cluster count).
+- Update Progress table.
 
 ### 5. Handoff before compact
 
-When the controller's context is approaching limit (heuristic: turn count above threshold, or user signals):
-
-- **Spawn a subagent** to write fresh `docs-private/RESUME-NOTES-<today>.md`. Bump `(rev N)` if same-day file exists. Subagent reads current state (git log, in-flight chunk, queue progress), renders `templates/RESUME-NOTES.tpl`, writes the file.
-- Controller's NEXT turn can be the one that gets compacted; the resume notes ensure a fresh controller can wake up cleanly.
+Per `SKILL.md` §Handoff before compact: write fresh `docs-private/RESUME-NOTES-<today>.md` at ~80% context, calibrated by remaining queue + cost-of-waking-afresh. Delegate the write to a subagent so the controller doesn't burn its own context on the template. Bump `(rev N)` if same-day file exists.
 
 ### 6. Notifications
 
 Only fire on:
-
 - **Blocker**: `osascript -e 'display notification "Blocker: <reason>" with title "goal-flight" sound name "Funk"'`
 - **Queue completion**: `osascript -e 'display notification "Queue complete: N chunks done" with title "goal-flight" sound name "Glass"'`
 
-Never notify on routine commit success. Never notify on milestone-review completion (it's expected).
+Never on routine commit success. Never on expected milestone-review completion.
 
 ### 7. Mid-execute ask-questions
 
-If the controller hits an ambiguity that the look-ahead subagent flagged but couldn't resolve, OR if the current chunk's SCOPE has a genuine question the executor needs answered: invoke `commands/ask-questions.md --scope current-chunk`. Block the loop only if the answer is required for the chunk's safe completion.
+If the controller hits an ambiguity the look-ahead surfaced but couldn't resolve, OR the current chunk has a SCOPE question the executor needs answered: invoke `commands/ask-questions.md --scope current-chunk`. Block the loop only if the answer is required for safe completion.
 
 ### 8. Termination
 
-When the queue is fully DONE (no TODO, IN-FLIGHT, or BLOCKED):
-
-- Final milestone gstack review on the entire run (commit range from queue start to HEAD).
+When the queue is fully DONE:
+- Final milestone gstack review on the full run (commit range from queue start to HEAD).
 - Notify user.
 - Bump RESUME-NOTES rev with "QUEUE COMPLETE" in TL;DR.
-- Print summary: total chunks, total commits, milestone-review count, P0/P1 found+fixed, time elapsed (if knowable).
+- Print summary: total chunks, total commits, milestone-review count, P0/P1 found+fixed, time elapsed.
 
-### 9. Dispatch types
-
-The controller spawns three distinct subagent types. Each has a different prompt shape; mark the type in the Agent tool's `description` field so logs are skimmable.
-
-| Type | Purpose | Recommended wrapper layers (per `prompts/dispatch-wrapper.md`) | Reports |
-|------|---------|---------------------------------------------------|---------|
-| **Executor** | Implement a `/goal` chunk; writes code, runs tests, commits. | All 5 (situational, template-pointer, file-anchors, env-caveats, goal-specific self-review). Plus `prompts/executor-self-review.md`. | `git diff --stat`, self-review findings (P0/P1/P2/P3), tests run, surprises. |
-| **Reviewer** | Read-only adversarial pass over a commit range or a draft. | Layers 1+3 typically; layer 4 (env caveats) usually skipped because reviewers don't need test-environment fluency. Add layer 2 if reviewing a chunk that mirrors a specific canonical pattern. **Always include topic-filtered `decisions.md`** so the reviewer knows what was deliberately rejected and doesn't re-flag it. Plus `invariants.md` tail (always). | Findings list with file:line refs, P0/P1/P2/P3, confidence rating. |
-| **Planner** | Write a plan document to a pinned path; explicitly "NO code changes." | Layers 1+3 + the pinned deliverable path. **Always include topic-filtered `decisions.md`** so the planner doesn't re-open closed decisions. Plus `invariants.md` tail (always). The deliverable IS the output. | File path, word count, bottom-line recommendation, open questions. |
-
-Wrapper layers per type are recommendations, not contracts — the audit substrate (`prompts/dispatch-wrapper.md`'s 55-dispatch sample) is from one project's executor dispatches; reviewer and planner samples were a handful each. Adjust as the work demands.
-
-Examples from goal-flight reference project:
-- Executor: goal #8 ALPHAMELTS-DIAGNOSTIC-GATE dispatch, 11 KB, layers 1–5.
-- Reviewer: milestone gstack review of `a259f80..f10c405`, 4 KB, layers 1+3.
-- Planner: mixed-cation oxides plan A + plan B (parallel planners), 3 KB each, layers 1+3 + pinned `docs-private/mixed-cation-oxides-plan-{A,B}-*.md` paths.
-
-Distinguishing them prevents the controller from accidentally giving a reviewer the full wrapper (wastes their context) or a planner the executor wrapper (encourages drift into code-writing).
+See `SKILL.md` §Three subagent types for Executor / Reviewer / Planner wrapper-layer recommendations.
