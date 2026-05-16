@@ -57,13 +57,20 @@
 #       FORK-NEED and is waiting for controller/user input. Wraps
 #       `claude --resume <sid> --print '<reply>'`.
 #
-#       *** COST WARNING ***
-#       `claude --print` is API-billed (the antipattern goal-flight
-#       rejects for routine dispatches). One-off use for FORK-NEED
-#       resolution is reasonable; per-chunk use would be expensive.
-#       For zero-cost alternatives, see SKILL.md §Self-delegation /
-#       Resolving FORK-NEED — the recommended default is `/rewind` +
-#       redo in the controller, not auto-inject.
+#       Billing note: `claude --print` is Anthropic-API-billed (vs the
+#       Agent tool which is session-billed). However, Anthropic's prompt
+#       caching kicks in here: the fork's full conversation history is
+#       part of the cached prefix at ~10% of normal token rates, and
+#       only the new reply turn + the model's response are billed at the
+#       full new-token rate. For a "read this file and answer" reply,
+#       that's typically a few cents per FORK-NEED resolution — small
+#       enough to be routine if it works for your billing setup. The
+#       wider concern about `claude -p` in SKILL.md's "Antipattern:
+#       `claude -p`" rule is about WHOLE-CONVERSATION new dispatches
+#       at API rates, not short cached-prefix continuations.
+#
+#       Cheaper still: `/rewind` + redo in the controller, or have the
+#       user reply in the fork window directly. Pick per context.
 #
 #   self-fork-detect.sh clear [<contract-path>]
 #       Remove the contract. Run after the fork's work is committed and the
@@ -324,11 +331,11 @@ PY
       exit 1
     fi
     cat >&2 <<EOF
-*** COST WARNING ***
 Spawning: claude --resume $FORK_SID --print '<reply>'
-This is API-billed (\`claude --print\` antipattern). One-off use for
-FORK-NEED resolution is reasonable; routine use is expensive. Press
-Ctrl-C in the next 3 seconds to abort.
+Billing: API-billed (vs Agent-tool session-billing). Prompt-cache hit
+on the fork's prior history at ~10% rate; only the reply turn + response
+are new tokens. For a "read this file and answer" reply, typically a
+few cents. Press Ctrl-C in the next 3 seconds to abort.
 EOF
     sleep 3 || exit 130
     echo >&2 "injecting reply into fork session $FORK_SID..."

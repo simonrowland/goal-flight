@@ -8,7 +8,7 @@
 
 **Agent roles in goal-flight:**
 - **Controller** — the agent running `/goal-flight` (currently Claude Code; Hermes is the future candidate). Owns dispatch + verify + commit + handoff.
-- **Executor / Reviewer** — the agent receiving `\goal` dispatches (Agent-tool Claude subagents by default, with `Bash codex exec` for the parallel codex reviewer at milestones). **Codex is a dispatch target, not a controller** — never expected to invoke `/goal-flight <sub>` itself.
+- **Executor / Reviewer** — the agent receiving `/goal` dispatches (Agent-tool Claude subagents by default, with `Bash codex exec` for the parallel codex reviewer at milestones). **Codex is a dispatch target, not a controller** — never expected to invoke `/goal-flight <sub>` itself.
 
 Run in parallel:
 - `git rev-parse --show-toplevel` → bail if not a git repo.
@@ -91,7 +91,7 @@ If user says no: continue with whatever's installed; note in summary which gstac
 
 If `context-mode` is missing on either side, recommend installation:
 
-> "context-mode is a strong multiplier for this controller pattern — it offloads large command outputs (diffs, test runs, greps, codex tails) to an FTS5 sandbox and lets the controller and executors query by pattern instead of pulling everything into context. Especially valuable on the codex side during `\goal` loops where shell output fills context fast. Install instructions: https://github.com/simonrowland/context-mode. Want me to walk through the install? (y/n)"
+> "context-mode is a strong multiplier for this controller pattern — it offloads large command outputs (diffs, test runs, greps, codex tails) to an FTS5 sandbox and lets the controller and executors query by pattern instead of pulling everything into context. Especially valuable on the codex side during `/goal` loops where shell output fills context fast. Install instructions: https://github.com/simonrowland/context-mode. Want me to walk through the install? (y/n)"
 
 If user accepts: surface the install command from the project README. After install, re-check MCP registrations on both sides; report.
 
