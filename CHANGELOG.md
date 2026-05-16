@@ -4,6 +4,27 @@ Notable changes to the goal-flight Claude Code skill. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are
 incremented when meaningful skill behaviour changes.
 
+## [0.2.7] — 2026-05-16
+
+Dispatch rule prose tightened — drop "foreground" mentions (it's the
+harness default; no need to spell it out) and lead with the reason:
+"so the user's terminal doesn't hang, allowing them to steer."
+
+### Changed
+- **SKILL.md §Per-chunk loop dispatch rule** — replaced "background if
+  >10s; foreground for shorter calls is fine. Reason: foreground locks
+  the user's terminal..." with "background if >10s — so the user's
+  terminal doesn't hang, allowing them to steer." Same rule, fewer
+  words, reason up front.
+- **SKILL.md §Asking discipline** background-dispatch bullet — same
+  prose simplification.
+- **SKILL.md §Three subagent types** dispatch-mode note — dropped
+  "foreground otherwise" tail.
+- Feedback memory updated to match.
+
+### Tests
+3 suites / 46 assertions remain green.
+
 ## [0.2.6] — 2026-05-16
 
 Dispatch-mode rule simplified to a duration threshold. 0.2.5 introduced a

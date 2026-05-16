@@ -1,6 +1,6 @@
 ---
 name: goal-flight
-version: 0.2.6
+version: 0.2.7
 description: "long-running unattended controller for chunked code work — init repo, decompose plan, anticipate questions, execute with embedded review and milestone gstack sweeps"
 allowed-tools:
   - Bash
@@ -104,7 +104,7 @@ The controller's value is forward motion until a real blocker. **Interrupt the u
 - **Don't ask trivia.** Worktree labels, file naming nits, paint colors — never ask. Just decide.
 - **Don't do Netflix "are-you-still-watching" check-ins.** "Step 1 done. Continue?" when nothing is blocked is the antipattern. Running commentary as work progresses IS welcome — short status lines giving the user a window into the work. The thing to cut is the implicit-stop pattern ("Hold or go?", "Proceed?") on routine forward motion.
 - **Don't monopolize the parent thread with long inline work.** While the controller inlines (`[controller-direct]` path), the user cannot comment, question, or redirect — the session is busy executing tool calls. Dispatch to a subagent (path 2) for anything that won't finish in ~1 minute, even if the LoC delta is small, so the user retains the ability to interject. ESC will interrupt the current tool call (including a subagent dispatch) but won't roll back what's already on disk. See §Dispatch model `[controller-direct]` for the full interactivity tradeoff.
-- **Background-dispatch anything expected to take more than ~10 seconds.** Foreground tool calls lock the user's terminal — they can't type questions, steering, or kills until the call returns. Above ~10s the lockout cost outweighs the inline-result convenience. Use `run_in_background: true` for Agent and `&` + redirection-to-file for Bash codex / grok dispatches. The harness re-surfaces completion as a new turn via task-notification. See §Per-chunk loop for the canonical shape.
+- **Background-dispatch anything expected to take more than ~10 seconds** — so the user's terminal doesn't hang, allowing them to steer. `run_in_background: true` for Agent; `&` + redirection-to-file for Bash codex / grok. The harness re-surfaces completion as a new turn via task-notification. See §Per-chunk loop for the canonical shape.
 - **Prepare the question with subagents first.** While waiting on a long-running subagent or codex review, dispatch anticipatory reviewer-loop subagents to pre-resolve choices. A well-prepared ask with subagent-vetted options is worth roughly 5 raw asks.
 - **Do ask when** a chemistry/physics/security/correctness assumption needs user values, when a destructive operation is about to fire, or when a decision would lock in a wrong invariant.
 
@@ -208,7 +208,7 @@ Controller works in the main worktree. Parallel-safe chunks each get `<repo>/.cl
 
 ### Per-chunk loop (canonical shape)
 
-**Dispatch rule**: any tool call expected to take more than ~10 seconds runs in background (`run_in_background: true` for Agent; `codex exec ... &` or `grok -p ... &` with redirection-to-file for Bash). Foreground for shorter calls is fine. Reason: foreground locks the user's terminal — they can't type questions, steering, or kills until the call returns. Above ~10s the lockout cost outweighs the inline-result convenience. Background dispatch ends the turn at dispatch; the harness re-surfaces completion as a new turn via task-notification.
+**Dispatch rule**: any tool call expected to take more than ~10 seconds runs in background — so the user's terminal doesn't hang, allowing them to steer. `run_in_background: true` for Agent; `codex exec ... &` or `grok -p ... &` with redirection-to-file for Bash. Background dispatch ends the turn at dispatch; the harness re-surfaces completion as a new turn via task-notification.
 
 1. **Dispatch in background** (executor chunks are always long enough to qualify).
 2. **Emit one-line status, end the turn.** "Dispatching chunk #N (`<slug>`). Background task `<id>`." Do not chain chunk N+1's dispatch within this turn.
@@ -245,7 +245,7 @@ Status legend: ✅ done · 🟡 in flight · queued · blocked · post-`<gate>`.
 
 The shapes for reviewer + planner live in their respective prompt files, NOT composed per-dispatch by the controller. The controller's job for these types is to substitute the few placeholders (`<range>`, `<paths>`, `<deliverable path>`) and dispatch; the full wrapper is in the file. Reviewer/planner dispatches that mistakenly receive the executor wrapper (all 5 layers) waste context and encourage drift into code-writing — keep them on the reduced shapes.
 
-Dispatch mode is orthogonal to type — see §Per-chunk loop dispatch rule: background if expected to exceed ~10s, foreground otherwise. Most goal-flight reviewer / planner dispatches qualify for background (gstack `/review` typically takes 30s–3min).
+Dispatch mode is orthogonal to type — see §Per-chunk loop dispatch rule: background if expected to exceed ~10s. Most goal-flight reviewer / planner dispatches qualify (gstack `/review` typically takes 30s–3min).
 
 ### Don't
 
