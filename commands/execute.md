@@ -66,7 +66,7 @@ Read `prompts/dispatch-wrapper.md` for the full per-layer worked examples (sourc
 
 **b. Execute the chunk.** Two paths depending on the chunk's tags from `decompose-plan` step 2:
 
-- **`[controller-direct]` chunks** — controller does the work inline. The dispatch overhead (subagent context init, model invocation, transcript) costs more than the work itself for trivial single-file changes. Workflow:
+- **`[controller-direct]` chunks** — controller does the work inline. Two distinct triggers for this tag (per `commands/decompose-plan.md` step 2): (A) trivially small work; (B) the controller has session-loaded state a fresh subagent would have to re-discover. Both reduce to the same overhead-arbitrage: dispatch + re-loading context costs more than just doing the work. Workflow:
   1. Read the target file(s) directly (Read tool).
   2. Apply the change (Edit tool).
   3. Run the relevant subset of the test suite per `docs-private/worker-context.md` or `AGENTS.md`.
@@ -74,6 +74,8 @@ Read `prompts/dispatch-wrapper.md` for the full per-layer worked examples (sourc
   5. Skip steps c (wait) and d (verify diff via subagent) below — you just did them inline. Proceed to step e (commit).
   
   Use this path only for chunks decompose-plan tagged `[controller-direct]`. **Do not retag mid-execute** — if a chunk turns out trickier than expected, abort the inline path, surface the surprise as a goal-queue annotation, and fall through to the subagent path.
+
+  **Codex-side analog for the "too much context to explain" trigger: `codex fork --last <continuation-prompt>`.** Codex CLI's `fork` subcommand spawns a new session that inherits the prior session's loaded context (chat history, file reads, partially-applied state). When the controller has been driving codex through a multi-step task and the next chunk depends on that codex session's accumulated state, `codex exec resume --last '<continuation>'` (or `codex fork --last` if you want a branch rather than a continuation) is the codex-native equivalent of "don't make a fresh agent re-load 20 minutes of context." Same principle, different surface. The Claude controller path is `[controller-direct]` because Claude's Agent tool can't inherit the controller's loaded context — the controller IS the agent that already has it.
 
 - **Untagged chunks (default)** — dispatch as Claude subagent via the Agent tool (general-purpose). Pass:
   - `description`: short phrase like "Execute \\goal <SLUG>"

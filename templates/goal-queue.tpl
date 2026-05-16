@@ -23,7 +23,7 @@ Status values: ✅ DONE — `<hash>` · 🟡 IN-FLIGHT — `<executor-id>` · TO
 Independence tags:
 - `[parallel-safe:<group>]` — chunks in the same group can run together via `/goal-flight execute --parallel N`. Different groups must respect implicit ordering. Untagged chunks are sequential-only.
 - `[milestone]` — append to a chunk's slug to trigger a gstack review sweep after this chunk lands (in addition to the every-K-commits cadence).
-- `[controller-direct]` — trivial chunks (single-file, < ~30 LoC delta, no cross-module coupling, no new public surface) that the controller handles inline with Read + Edit + commit, skipping the Agent subagent dispatch. Dispatch overhead exceeds the work for genuinely tiny chunks; the analyst tags these during decompose-plan step 2. Untagged chunks dispatch as subagents by default.
+- `[controller-direct]` — chunks the controller handles inline with Read + Edit + commit, skipping the Agent subagent dispatch. Two triggers: (A) **trivially small work** — single-file, < ~30 LoC delta, no cross-module coupling, no new public surface, no test-harness changes (typo fixes, version bumps, single-constant renames, single-line bug fixes against an existing failing test); (B) **too much context to explain** — when the controller has session-loaded state (mid-debug, just-consumed milestone-review P0, rolling decisions not yet in `docs-private/rag/decisions.md`) that re-explaining to a fresh subagent would cost more than just doing the work. Heuristic for (B): a clean dispatch wrapper would exceed ~5 KB primarily because of context the controller already holds. Untagged chunks dispatch as subagents by default.
 
 ## Next dispatch batch
 

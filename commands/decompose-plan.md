@@ -36,7 +36,13 @@ When drafter completes, **analyst** (Explore): identify parallel-safe chunks AND
 >
 > (1) **`[parallel-safe:<group-id>]`** — chunks that touch disjoint files/modules and could safely run in parallel worktrees. Chunks in the same group can run together; different groups must be sequential relative to each other if they share dependencies. Conservative bias: when unsure, do not tag.
 >
-> (2) **`[controller-direct]`** — trivial chunks where dispatching a subagent would cost more than the work itself. Apply when ALL of: single-file change, < ~30 LoC delta, no cross-module coupling, no new public surface, no test-harness changes. Examples: typo fixes, version bumps, single-constant renames, single-line bug fixes confirmed against an existing failing test. Conservative bias: when unsure, do NOT tag — let `execute.md` dispatch a subagent.
+> (2) **`[controller-direct]`** — chunks where dispatching a subagent would cost more than just doing the work inline. Two distinct triggers:
+>
+>     **A. Trivially small work.** Single-file change, < ~30 LoC delta, no cross-module coupling, no new public surface, no test-harness changes. Dispatch overhead exceeds the work. Examples: typo fixes, version bumps, single-constant renames, single-line bug fixes confirmed against an existing failing test.
+>
+>     **B. Too much context to explain.** The controller has already loaded substantial relevant state (read files, traced data flow, accumulated reasoning across prior chunks in this session) that a fresh subagent would have to re-discover via dispatch wrapper. When the cost of EXPLAINING the context (wrapper rendering + executor re-load) exceeds the cost of just doing the work, controller-direct wins on the same overhead-arbitrage logic as case A, but for a different reason. Heuristic: if a clean dispatch wrapper for this chunk would exceed ~5 KB (the verification-first target size per `prompts/dispatch-wrapper.md`) primarily because the chunk depends on session-loaded controller state, prefer inline. Common shapes: mid-debug chunks where the controller has just diagnosed the bug; chunks that resolve a P0 from a milestone review the controller just consumed; chunks that depend on rolling decisions made in the last 10 turns that haven't been promoted to `docs-private/rag/decisions.md` yet.
+>
+> Conservative bias: when unsure, do NOT tag — let `execute.md` dispatch a subagent. The default subagent path is safer for ambiguous cases (clean context, transcript record, parallel-safe candidates).
 >
 > Report which file paths each chunk touches (audit trail for parallel safety + controller-direct triviality). Drafter output: <paste>."
 
