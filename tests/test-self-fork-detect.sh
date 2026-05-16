@@ -219,5 +219,30 @@ if [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then
   fi
 fi
 
+
+# Test 13: reply mode rejects missing args.
+set +e
+out=$("$SCRIPT" reply 2>&1)
+rc=$?
+set -e
+if [ "$rc" != "0" ] && echo "$out" | grep -q "usage:"; then
+  echo "test13 pass: reply mode rejects missing args (exit $rc)"
+else
+  echo "test13 FAIL: reply with no args should error; got rc=$rc, out=$out"
+  exit 1
+fi
+
+# Test 14: reply mode rejects malformed UUID.
+set +e
+out=$("$SCRIPT" reply "not-a-uuid" "test reply" 2>&1)
+rc=$?
+set -e
+if [ "$rc" != "0" ] && echo "$out" | grep -q "doesn't match UUID shape"; then
+  echo "test14 pass: reply mode rejects malformed UUID (exit $rc)"
+else
+  echo "test14 FAIL: reply with bad UUID should error; got rc=$rc"
+  exit 1
+fi
+
 echo
 echo "all self-fork-detect tests passed"

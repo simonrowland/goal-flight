@@ -52,6 +52,19 @@
 #           completion per the contract).
 #       --poll defaults to 5 seconds.
 #
+#   self-fork-detect.sh reply <fork-jsonl-or-sid> '<reply prompt>'
+#       Inject a reply into the fork session. Used when the fork emitted
+#       FORK-NEED and is waiting for controller/user input. Wraps
+#       `claude --resume <sid> --print '<reply>'`.
+#
+#       *** COST WARNING ***
+#       `claude --print` is API-billed (the antipattern goal-flight
+#       rejects for routine dispatches). One-off use for FORK-NEED
+#       resolution is reasonable; per-chunk use would be expensive.
+#       For zero-cost alternatives, see SKILL.md §Self-delegation /
+#       Resolving FORK-NEED — the recommended default is `/rewind` +
+#       redo in the controller, not auto-inject.
+#
 #   self-fork-detect.sh clear [<contract-path>]
 #       Remove the contract. Run after the fork's work is committed and the
 #       contract no longer represents an active delegation.
@@ -286,6 +299,45 @@ print(f"intervention:      {c.get('intervention_signal', '(emit FORK-NEED if the
 print(f"status (heartbeat): {c.get('status_signal', '(emit FORK-STATUS periodically)')}")
 PY
     fi
+    ;;
+
+  reply)
+    TARGET="${2:-}"
+    REPLY="${3:-}"
+    if [ -z "$TARGET" ] || [ -z "$REPLY" ]; then
+      echo "ERROR: usage: $0 reply <fork-jsonl-or-sid> '<reply prompt>'" >&2
+      exit 1
+    fi
+    # Extract session ID — accept either a JSONL path or a bare UUID.
+    case "$TARGET" in
+      *.jsonl)
+        FORK_SID=$(basename "$TARGET" .jsonl)
+        ;;
+      *)
+        FORK_SID="$TARGET"
+        ;;
+    esac
+    # Validate UUID-ish shape (8-4-4-4-12 hex segments).
+    if ! echo "$FORK_SID" | grep -qE '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
+      echo "ERROR: fork session ID doesn't match UUID shape: $FORK_SID" >&2
+      echo "  pass either the fork's JSONL path or a bare session-id UUID." >&2
+      exit 1
+    fi
+    cat >&2 <<EOF
+*** COST WARNING ***
+Spawning: claude --resume $FORK_SID --print '<reply>'
+This is API-billed (\`claude --print\` antipattern). One-off use for
+FORK-NEED resolution is reasonable; routine use is expensive. Press
+Ctrl-C in the next 3 seconds to abort.
+EOF
+    sleep 3 || exit 130
+    echo >&2 "injecting reply into fork session $FORK_SID..."
+    claude --resume "$FORK_SID" --print "$REPLY"
+    rc=$?
+    echo >&2
+    echo >&2 "reply injected. The fork's JSONL has grown with the reply turn + response."
+    echo >&2 "Re-invoke 'self-fork-detect.sh monitor <fork-jsonl>' to keep watching."
+    exit $rc
     ;;
 
   clear)
