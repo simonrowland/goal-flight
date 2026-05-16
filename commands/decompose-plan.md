@@ -15,7 +15,7 @@ If the source is ambiguous, ask the user which plan they want decomposed before 
 Read `<repo-root>/docs-private/<topic>-goal-statement-*.md` (most recent).
 
 - **If absent**: bail with: "No goal statement found. Run `/goal-flight init <topic>` first to pin the high-level goal."
-- **If status is `DRAFT`**: refuse to proceed. Return: "Goal statement is still DRAFT (`<reason from file>`). Sharpen it first — re-run `/goal-flight init <topic>` and accept the office-hours interrogation, or edit the file directly and remove the DRAFT marker."
+- **If status is `DRAFT`**: refuse to proceed. Return: "Goal statement at `<resolved-file-path>` is still DRAFT (`<reason from file>`). Sharpen before continuing — pick one: (1) re-run `/goal-flight init <topic>` and accept the gstack `/office-hours` interrogation; or (2) edit `<resolved-file-path>` directly, replace the `Status: DRAFT — <reason>` line with `Status: CONCRETE`, then re-run `/goal-flight decompose-plan`." Cite the resolved absolute path so the user can open or `sed -i` it without re-deriving the slug.
 - **If concrete**: keep its content in mind for steps 4.5 and 6 (coherence check and summary).
 
 ### 1. Establish plan source
