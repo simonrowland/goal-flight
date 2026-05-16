@@ -1,6 +1,6 @@
 ---
 name: goal-flight
-version: 0.2.3
+version: 0.2.4
 description: "long-running unattended controller for chunked code work — init repo, decompose plan, anticipate questions, execute with embedded review and milestone gstack sweeps"
 allowed-tools:
   - Bash
@@ -104,6 +104,7 @@ The controller's value is forward motion until a real blocker. **Interrupt the u
 - **Don't ask trivia.** Worktree labels, file naming nits, paint colors — never ask. Just decide.
 - **Don't do Netflix "are-you-still-watching" check-ins.** "Step 1 done. Continue?" when nothing is blocked is the antipattern. Running commentary as work progresses IS welcome — short status lines giving the user a window into the work. The thing to cut is the implicit-stop pattern ("Hold or go?", "Proceed?") on routine forward motion.
 - **Don't monopolize the parent thread with long inline work.** While the controller inlines (`[controller-direct]` path), the user cannot comment, question, or redirect — the session is busy executing tool calls. Dispatch to a subagent (path 2) for anything that won't finish in ~1 minute, even if the LoC delta is small, so the user retains the ability to interject. ESC will interrupt the current tool call (including a subagent dispatch) but won't roll back what's already on disk. See §Dispatch model `[controller-direct]` for the full interactivity tradeoff.
+- **Yield the turn between chunks.** Even when each chunk dispatches a subagent (the "right" path), chaining N chunks back-to-back inside one assistant turn defeats user interjection: Claude Code queues messages typed mid-turn, and they don't surface until the turn ends. The §Per-chunk loop step 7 makes this concrete (one-line status + STOP between chunks). User messages then flush on the next turn. This is NOT a Netflix check-in — there's no "Continue?" prompt, just a clean turn boundary the harness needs to drain queued input.
 - **Prepare the question with subagents first.** While waiting on a long-running subagent or codex review, dispatch anticipatory reviewer-loop subagents to pre-resolve choices. A well-prepared ask with subagent-vetted options is worth roughly 5 raw asks.
 - **Do ask when** a chemistry/physics/security/correctness assumption needs user values, when a destructive operation is about to fire, or when a decision would lock in a wrong invariant.
 
@@ -213,6 +214,7 @@ Controller works in the main worktree. Parallel-safe chunks each get `<repo>/.cl
 4. **Commit** (one chunk = one commit). Parallel-mode: cherry-pick onto main.
 5. **Update the Progress table** in goal-queue + your visible state.
 6. **Look-ahead** — fire-and-forget Explore subagent reading the next 1–2 chunks for hidden dependencies or missing acceptance criteria.
+7. **Yield the turn before dispatching chunk N+1.** Emit a one-line status (`Chunk #N landed at <sha>. Dispatching chunk #N+1.`) and STOP the current assistant turn. Do not chain chunk N+1's Dispatch step within the same turn as chunk N's commit. Reason: Claude Code queues user messages typed while the assistant is mid-tool-chain; those messages don't surface until the turn ends. If you chain chunks back-to-back without yielding, the user's status questions, steering, and corrections pile up unprocessed at the bottom of the chat — they CAN see the controller working, but they can't intervene. Yielding per chunk gives them a real interjection surface without imposing Netflix-style check-ins (no "Continue?" — just a clean turn boundary that lets the harness flush queued input). The next chunk dispatch happens at the next turn, which fires either when the user types something (their message processed first) or when the user types nothing (proceed with chunk N+1 silently). Exception: in **goal-mode loops** (codex `/goal` or external Opus/Grok iteration) the loop primitive owns turn-boundaries itself; the controller only yields at iteration-cap or convergence.
 
 ### Progress table — keep this current
 
