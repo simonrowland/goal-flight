@@ -35,14 +35,21 @@ EOF
 exit 0
 EOF
   chmod +x "$SANDBOX/bin/npx"
+  # Symlink the real python3 into the sandbox bin so test cases that strip
+  # PATH down to $SANDBOX/bin still resolve the script's shebang correctly.
+  # The script requires Python 3.11+ (for tomllib); fall back to "python3"
+  # discovery via PATH if `which` doesn't find a 3.11+ binary.
+  ln -sf "$(command -v python3)" "$SANDBOX/bin/python3"
   export HOME="$SANDBOX/home"
   export PATH="$SANDBOX/bin:$ORIG_PATH"
 }
 
 # --- test 1: --check with no codex on PATH → exit 0, "not installed" ---
 mk_sandbox no-codex
-# Use a minimal PATH that has python3 (for shebang) but no codex.
-out=$(PATH="/usr/bin:/bin" HOME="$HOME" "$SCRIPT" --check 2>&1) && rc=0 || rc=$?
+# Remove the fake codex from sandbox bin; PATH (sandbox bin only) now lacks
+# codex but still has the python3 symlink for the script's shebang.
+rm "$SANDBOX/bin/codex"
+out=$(PATH="$SANDBOX/bin" HOME="$HOME" "$SCRIPT" --check 2>&1) && rc=0 || rc=$?
 [ "$rc" = "0" ] \
   || { echo "test1 FAIL: expected exit 0 when codex missing, got $rc; out=$out"; exit 1; }
 echo "$out" | grep -q "codex not installed" \
@@ -100,7 +107,13 @@ grep -qF '"-y"' "$HOME/.codex/config.toml" \
   || { echo "test4 FAIL: args[0] not -y"; cat "$HOME/.codex/config.toml"; exit 1; }
 grep -qF '"context-mode@latest"' "$HOME/.codex/config.toml" \
   || { echo "test4 FAIL: args[1] not context-mode@latest"; cat "$HOME/.codex/config.toml"; exit 1; }
-echo "test4 pass: register writes canonical npx block"
+# stdout MUST report success — not "raced" (round-2 reviewer caught the
+# Path() sentinel collision where fresh writes were misreported as raced).
+echo "$out" | grep -q "registered context-mode for codex" \
+  || { echo "test4 FAIL: stdout missing 'registered' success message"; echo "$out"; exit 1; }
+echo "$out" | grep -qi "raced" \
+  && { echo "test4 FAIL: stdout falsely reports 'raced' on fresh write"; echo "$out"; exit 1; }
+echo "test4 pass: register writes canonical npx block (+ stdout success-reported, not raced-reported)"
 
 # --- test 5: --check after register → exit 0 ---
 "$SCRIPT" --check >/dev/null 2>&1 \
@@ -191,6 +204,86 @@ out=$("$SCRIPT" --check 2>&1) && rc=0 || rc=$?
 echo "$out" | grep -qi "not detected claude-side" \
   || { echo "test10 FAIL: expected 'not detected' even with malformed JSON; got: $out"; exit 1; }
 echo "test10 pass: malformed Claude JSON is handled gracefully"
+
+# --- test 11: inline-table TOML form is detected as already-registered ---
+# Round-2 P0: prior substring-match-based detection missed this form and
+# would append a duplicate block, producing TOML with duplicate keys.
+mk_sandbox inline-table
+cat > "$HOME/.claude.json" <<'EOF'
+{ "mcpServers": { "context-mode": { "command": "node", "args": [] } } }
+EOF
+mkdir -p "$HOME/.codex"
+cat > "$HOME/.codex/config.toml" <<'EOF'
+mcp_servers = { "context-mode" = { command = "node", args = [] } }
+EOF
+out=$("$SCRIPT" 2>&1)
+echo "$out" | grep -q "already in" \
+  || { echo "test11 FAIL: should detect inline-table form as already-registered; got: $out"; cat "$HOME/.codex/config.toml"; exit 1; }
+# Verify we did NOT append a duplicate
+matches=$(grep -cF 'context-mode' "$HOME/.codex/config.toml")
+[ "$matches" = "1" ] \
+  || { echo "test11 FAIL: expected 1 context-mode mention, found $matches"; cat "$HOME/.codex/config.toml"; exit 1; }
+echo "test11 pass: inline-table TOML form detected (no duplicate append)"
+
+# --- test 12: commented-out registration does NOT trigger false-positive no-op ---
+# Round-2 P0: prior substring-match treated commented-out blocks as registered.
+mk_sandbox commented-out
+cat > "$HOME/.claude.json" <<'EOF'
+{ "mcpServers": { "context-mode": { "command": "node", "args": [] } } }
+EOF
+mkdir -p "$HOME/.codex"
+cat > "$HOME/.codex/config.toml" <<'EOF'
+# This is a comment — historical reference
+# [mcp_servers.context-mode]
+# command = "old-form-no-longer-used"
+EOF
+"$SCRIPT" >/dev/null
+# After registration, an ACTIVE block must exist (un-commented)
+grep -qE '^\[mcp_servers\.context-mode\]' "$HOME/.codex/config.toml" \
+  || { echo "test12 FAIL: commented-out should not block real registration"; cat "$HOME/.codex/config.toml"; exit 1; }
+echo "test12 pass: commented-out registration does not block real append"
+
+# --- test 13: non-dict Claude JSON (array, scalar) does not crash ---
+# Round-2 P1: `cfg.get(...)` crashed when cfg was a list or string.
+mk_sandbox non-dict-json
+echo '["not", "a", "dict"]' > "$HOME/.claude.json"
+out=$("$SCRIPT" --check 2>&1) && rc=0 || rc=$?
+[ "$rc" = "1" ] \
+  || { echo "test13a FAIL: expected exit 1 on non-dict JSON, got $rc; out=$out"; exit 1; }
+# Also try scalar
+echo '"just a string"' > "$HOME/.claude.json"
+out=$("$SCRIPT" --check 2>&1) && rc=0 || rc=$?
+[ "$rc" = "1" ] \
+  || { echo "test13b FAIL: expected exit 1 on scalar JSON, got $rc; out=$out"; exit 1; }
+echo "test13 pass: non-dict Claude JSON does not crash"
+
+# --- test 14: missing npx produces clean error (no broken registration written) ---
+# Round-2 P1: prior fallback `"/usr/bin/env npx"` would write an invalid command.
+mk_sandbox no-npx
+cat > "$HOME/.claude.json" <<'EOF'
+{ "mcpServers": { "context-mode": { "command": "node", "args": [] } } }
+EOF
+# Remove npx from sandbox AND override PATH to exclude all real npx locations.
+rm "$SANDBOX/bin/npx"
+out=$(PATH="$SANDBOX/bin" "$SCRIPT" 2>&1) && rc=0 || rc=$?
+[ "$rc" != "0" ] \
+  || { echo "test14 FAIL: expected non-zero exit when npx missing, got $rc; out=$out"; exit 1; }
+echo "$out" | grep -qi "npx" \
+  || { echo "test14 FAIL: expected error mentioning npx; got: $out"; exit 1; }
+[ ! -f "$HOME/.codex/config.toml" ] \
+  || { echo "test14 FAIL: config.toml was written despite missing npx"; cat "$HOME/.codex/config.toml"; exit 1; }
+echo "test14 pass: missing npx is a clean error (no broken registration)"
+
+# --- test 15: lock file is cleaned up after successful register ---
+# Round-2 P1: prior lock file persisted as a stale artifact.
+mk_sandbox lock-cleanup
+cat > "$HOME/.claude.json" <<'EOF'
+{ "mcpServers": { "context-mode": { "command": "node", "args": [] } } }
+EOF
+"$SCRIPT" >/dev/null
+[ ! -f "$HOME/.codex/.register-context-mode.lock" ] \
+  || { echo "test15 FAIL: lock file persisted after successful register"; ls -la "$HOME/.codex/"; exit 1; }
+echo "test15 pass: lock file cleaned up after register"
 
 echo
 echo "all register-context-mode-codex tests passed"

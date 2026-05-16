@@ -149,14 +149,60 @@ codex_count=$(grep -cxF '.codex/' "$proj/.gitignore")
 echo "test11 pass: re-run is idempotent for .gitignore"
 
 # --- test 12: --no-project-mirror skips gitignore too ---
+# Strengthen: assert .gitignore does NOT exist (fresh project) — the
+# original test trivially passed when no .gitignore was created at all.
 mk_sandbox gitignore-skip; proj="$PROJ"
 "$SCRIPT" --no-project-mirror "$proj" >/dev/null
-# .gitignore should not be created OR if pre-existing, should not gain .codex/
-if [ -f "$proj/.gitignore" ]; then
-  grep -qxF '.codex/' "$proj/.gitignore" \
-    && { echo "test12 FAIL: .codex/ added to .gitignore despite --no-project-mirror"; exit 1; }
-fi
-echo "test12 pass: --no-project-mirror skips gitignore"
+[ ! -f "$proj/.gitignore" ] \
+  || { echo "test12 FAIL: .gitignore created despite --no-project-mirror"; cat "$proj/.gitignore"; exit 1; }
+echo "test12 pass: --no-project-mirror skips gitignore (no file created)"
+
+# --- test 13: --no-project-mirror does NOT modify pre-existing .gitignore ---
+mk_sandbox gitignore-skip-existing; proj="$PROJ"
+cat > "$proj/.gitignore" <<'EOF'
+node_modules/
+EOF
+"$SCRIPT" --no-project-mirror "$proj" >/dev/null
+grep -qxF '.codex/' "$proj/.gitignore" \
+  && { echo "test13 FAIL: .codex/ added to .gitignore despite --no-project-mirror"; cat "$proj/.gitignore"; exit 1; }
+grep -qxF 'node_modules/' "$proj/.gitignore" \
+  || { echo "test13 FAIL: pre-existing .gitignore content lost"; cat "$proj/.gitignore"; exit 1; }
+echo "test13 pass: --no-project-mirror leaves pre-existing .gitignore alone"
+
+# --- test 14: dedup recognizes .codex (no trailing slash) ---
+# Round-2 reviewer P2: prior `grep -qxF '.codex/'` would miss `.codex`.
+mk_sandbox gitignore-dedup-no-slash; proj="$PROJ"
+cat > "$proj/.gitignore" <<'EOF'
+node_modules/
+.codex
+EOF
+"$SCRIPT" "$proj" >/dev/null
+# The existing `.codex` (no slash) entry already covers the case.
+# We should NOT duplicate with `.codex/`.
+codex_lines=$(grep -cE '^\.codex/?$' "$proj/.gitignore")
+[ "$codex_lines" = "1" ] \
+  || { echo "test14 FAIL: expected 1 .codex line, found $codex_lines"; cat "$proj/.gitignore"; exit 1; }
+echo "test14 pass: dedup recognizes .codex (no trailing slash)"
+
+# --- test 15: dedup recognizes /.codex/ (rooted) ---
+mk_sandbox gitignore-dedup-rooted; proj="$PROJ"
+cat > "$proj/.gitignore" <<'EOF'
+/.codex/
+EOF
+"$SCRIPT" "$proj" >/dev/null
+codex_lines=$(grep -cE '^/?\.codex/?$' "$proj/.gitignore")
+[ "$codex_lines" = "1" ] \
+  || { echo "test15 FAIL: expected 1 rooted-.codex line, found $codex_lines"; cat "$proj/.gitignore"; exit 1; }
+echo "test15 pass: dedup recognizes /.codex/ (rooted)"
+
+# --- test 16: fresh .gitignore has no leading newline (cosmetic) ---
+mk_sandbox gitignore-fresh-shape; proj="$PROJ"
+"$SCRIPT" "$proj" >/dev/null
+# First byte of the file must NOT be a newline
+first_byte=$(head -c1 "$proj/.gitignore" | od -An -c | tr -d ' ')
+[ "$first_byte" = "#" ] \
+  || { echo "test16 FAIL: fresh .gitignore should start with '#' (no leading newline); first byte: '$first_byte'"; cat "$proj/.gitignore"; exit 1; }
+echo "test16 pass: fresh .gitignore starts cleanly (no leading blank line)"
 
 echo
 echo "all install-codex-overrides tests passed"
