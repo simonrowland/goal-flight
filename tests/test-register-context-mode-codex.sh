@@ -20,6 +20,12 @@ trap 'rm -rf "$TMPROOT"' EXIT
 
 ORIG_PATH="$PATH"
 ORIG_HOME="$HOME"
+# Resolve python3 ONCE up-front, BEFORE any sandbox mucks with PATH.
+# Otherwise sandbox python3 symlinks form a chain through prior $TMPROOT
+# sandboxes which would break when an individual test strips PATH down to
+# a single sandbox/bin.
+REAL_PYTHON3="$(command -v python3)"
+[ -x "$REAL_PYTHON3" ] || { echo "no python3 found"; exit 1; }
 
 mk_sandbox() {
   local name="$1"
@@ -35,11 +41,12 @@ EOF
 exit 0
 EOF
   chmod +x "$SANDBOX/bin/npx"
-  # Symlink the real python3 into the sandbox bin so test cases that strip
-  # PATH down to $SANDBOX/bin still resolve the script's shebang correctly.
-  # The script requires Python 3.11+ (for tomllib); fall back to "python3"
-  # discovery via PATH if `which` doesn't find a 3.11+ binary.
-  ln -sf "$(command -v python3)" "$SANDBOX/bin/python3"
+  # Symlink the real python3 (pinned at script start) into the sandbox bin
+  # so test cases that strip PATH down to $SANDBOX/bin still resolve the
+  # script's shebang correctly. The script requires Python 3.11+ for
+  # tomllib; the pinned REAL_PYTHON3 ensures we don't chain through
+  # earlier sandboxes' symlinks.
+  ln -sf "$REAL_PYTHON3" "$SANDBOX/bin/python3"
   export HOME="$SANDBOX/home"
   export PATH="$SANDBOX/bin:$ORIG_PATH"
 }
@@ -284,6 +291,23 @@ EOF
 [ ! -f "$HOME/.codex/.register-context-mode.lock" ] \
   || { echo "test15 FAIL: lock file persisted after successful register"; ls -la "$HOME/.codex/"; exit 1; }
 echo "test15 pass: lock file cleaned up after register"
+
+# --- test 16: --check with codex needs register AND npx missing → exit 4 ---
+# Round-4 P1: prior --check returned 1 even when npx was absent, leading to
+# a two-step failure pattern (init says "register" → write fails).
+mk_sandbox check-no-npx
+cat > "$HOME/.claude.json" <<'EOF'
+{ "mcpServers": { "context-mode": { "command": "node", "args": [] } } }
+EOF
+rm "$SANDBOX/bin/npx"
+out=$(PATH="$SANDBOX/bin" "$SCRIPT" --check 2>&1) && rc=0 || rc=$?
+[ "$rc" = "4" ] \
+  || { echo "test16 FAIL: expected exit 4 (npx absent + needs register), got $rc; out=$out"; exit 1; }
+echo "$out" | grep -qi "npx" \
+  || { echo "test16 FAIL: --check output should mention npx; got: $out"; exit 1; }
+[ ! -f "$HOME/.codex/config.toml" ] \
+  || { echo "test16 FAIL: --check should not write config; got file"; exit 1; }
+echo "test16 pass: --check probes npx and reports exit 4 when missing"
 
 echo
 echo "all register-context-mode-codex tests passed"

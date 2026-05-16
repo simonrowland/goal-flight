@@ -22,7 +22,7 @@ Run in parallel:
   - Capture which sides are installed; report both.
 - Check context-mode install on **both sides**:
   - Delegate authoritative detection to `python3 <skill-root>/scripts/register-context-mode-codex.py --check` (path resolution per the auto-register block below). The script does content-only detection — `mcpServers["context-mode"]` lookup across `~/.claude.json` / `~/.claude/settings.json` and every `plugin.json` under `~/.claude/plugins/` (no path-substring heuristic; bundle plugins and custom-named install dirs are handled). On codex side it tomllib-parses `~/.codex/config.toml` and recognizes bracket-table, quoted-key, and inline-table forms while ignoring comments.
-  - Possible exit codes: `0` — both sides registered or codex absent (nothing to do); `1` — Claude has context-mode but codex doesn't; `2` — Python <3.11 (script can't run); `4` — npx missing. Capture the verdict for the env summary.
+  - `--check` exit codes: `0` — codex absent OR codex already registered (nothing to do); `1` — codex missing the block (whether Claude has it or not — surface to user so they can investigate); `2` — Python <3.11, the script can't run; `4` — codex needs register AND `npx` is missing on PATH (install Node.js first; the subsequent write would have failed). Capture the verdict for the env summary.
 
 If `codex` missing: tell the user (do NOT auto-install):
 > "codex CLI not found. Install with `npm install -g @openai/codex && codex login`. The skill works without codex (Claude subagents only) but loses parallel-reviewer capability for milestone reviews."

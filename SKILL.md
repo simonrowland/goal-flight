@@ -68,7 +68,7 @@ If no args: print this file.
   1. **`[controller-direct]`** — controller does the work inline. Two triggers: (a) trivially small (single-file, < ~30 LoC, no cross-module coupling); (b) controller already has the session-loaded state a fresh subagent would have to re-discover (mid-debug, just-consumed milestone-review P0, rolling decisions not yet in `decisions.md`). Heuristic for (b): a clean dispatch wrapper would exceed ~5 KB primarily because of context the controller already holds.
   2. **Single-shot subagent** — Agent tool (Claude) OR codex `exec` short-prompt OR `grok -p` short-prompt. One dispatch, executor reports done. The default path for most chunks. Frontier model picks the executor target based on chunk shape.
   3. **Goal-mode loop** — codex `/goal` (in-session, codex ≥ 0.128 + features.goals) OR external loop driven by the controller (one Agent or Grok dispatch per iteration; controller parses Final response block, re-dispatches with updated `Iteration N of MAX, Prior progress: ...` preamble). Iteration cap: 5–8 default, configurable via `[max-iterations:<N>]` chunk tag.
-- **Token bias is a dial, not a fixed setting.** Default biases UP: largest model + highest reasoning + parallel reviewers + corpus eagerly built — because subagent + codex tokens are largely free goods relative to engineering quality, especially when parallelisable. Per-chunk override DOWN when the work is genuinely small (use `[controller-direct]` or a smaller model in the dispatch's `model:` field). Per-project override DOWN via `tuning.token-bias = "lean"` in `docs-private/<topic>-tuning.md` for prototype-speed workloads. The default makes the controller use more tokens to interrupt the user less, not the other way around.
+- **Token bias is a dial, not a fixed setting.** Default biases UP: largest model + highest reasoning + parallel reviewers + corpus eagerly built — because subagent + codex tokens are largely free goods relative to engineering quality, especially when parallelisable. Per-chunk override DOWN when the work is genuinely small (use `[controller-direct]` or a smaller model in the dispatch's `model:` field) — this dial works today. A per-project `docs-private/<topic>-tuning.md` with a `token-bias: lean` field is conceptually appealing but **not yet wired into dispatch composition**; mentioning it here as a forward-looking surface so contributors know where it would land. The default makes the controller use more tokens to interrupt the user less, not the other way around.
 
 ### Verification-first dispatch wrapper
 
@@ -218,13 +218,13 @@ Status legend: ✅ done · 🟡 in flight · queued · blocked · post-`<gate>`.
 
 ### Three subagent types
 
-| Type | Purpose | Wrapper layers | Reports |
-|------|---------|----------------|---------|
-| **Executor** | Implement a `/goal` chunk; writes code, runs tests, commits | All 5 (Layer 0 + Layers 1–5 per `prompts/dispatch-wrapper.md`) | `git diff --stat`, P0/P1/P2/P3 findings, tests run, surprises |
-| **Reviewer** | Read-only adversarial pass over a commit range or draft | Layers 1+3 typically; layer 4 if env-relevant; layer 2 if reviewing pattern-mirror work | Findings list with file:line refs, P0/P1/P2/P3, confidence |
-| **Planner** | Write a plan document to a pinned path; "NO code changes" | Layers 1+3 + pinned deliverable path | File path, word count, bottom-line recommendation, open questions |
+| Type | Purpose | Source for the dispatched prompt | Reports |
+|------|---------|----------------------------------|---------|
+| **Executor** | Implement a `/goal` chunk; writes code, runs tests, commits | Controller composes per `prompts/dispatch-wrapper.md` (all 5 layers + optional RAG slices) | `git diff --stat`, P0/P1/P2/P3 findings, tests run, surprises |
+| **Reviewer** | Read-only adversarial pass over a commit range or draft | Loaded as-is from `prompts/gstack-claude-review.md`, `prompts/gstack-codex-challenge.md`, or `prompts/decomposition-review.md` — these are reduced-layer shapes (effectively Layers 1+3, no Layer 0/2/5). Or invoked via gstack `/review` when registered (preferred). | Findings list with file:line refs, P0/P1/P2/P3, confidence |
+| **Planner** | Write a plan document to a pinned path; "NO code changes" | Loaded as-is from `prompts/dual-plan-adversarial.md` (when dual-lens) or composed inline (Layers 1+3 + pinned deliverable path) | File path, word count, bottom-line recommendation, open questions |
 
-Distinguishing them prevents the controller from giving a reviewer the full wrapper (wastes context) or a planner the executor wrapper (encourages drift into code-writing).
+The shapes for reviewer + planner live in their respective prompt files, NOT composed per-dispatch by the controller. The controller's job for these types is to substitute the few placeholders (`<range>`, `<paths>`, `<deliverable path>`) and dispatch; the full wrapper is in the file. Reviewer/planner dispatches that mistakenly receive the executor wrapper (all 5 layers) waste context and encourage drift into code-writing — keep them on the reduced shapes.
 
 ### Don't
 
