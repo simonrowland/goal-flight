@@ -33,6 +33,8 @@ git clone https://github.com/simonrowland/goal-flight.git ~/.claude/skills/goal-
                                   # (use when picking up across sessions)
 ```
 
+> **Heads up**: `init` asks for a concrete high-level goal. If you defer with a fuzzy one ("modernize the codebase", "clean up the API"), init writes a `DRAFT` stub and `decompose-plan` will refuse until you sharpen it. Two ways forward: (1) re-run `init` and accept the gstack `/office-hours` interrogation; or (2) edit `docs-private/<topic>-goal-statement-<today>.md` and flip `Status: DRAFT — ...` to `Status: CONCRETE`, then re-run `decompose-plan`. The gate exists so 6-hour unattended runs don't drift from a goal that was never pinned.
+
 `/goal-flight` with no args prints `SKILL.md` — the full pattern reference.
 
 ## Sub-commands
