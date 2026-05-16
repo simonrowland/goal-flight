@@ -4,6 +4,82 @@ Notable changes to the goal-flight Claude Code skill. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are
 incremented when meaningful skill behaviour changes.
 
+## [0.3.0] — 2026-05-16
+
+Post-convergence UX-friction batch + lessons from a parallel session using
+the skill. Three substantive commits on top of the 0.2.0 convergence stack
+at `1ade7fd`, plus a grok-sweep fix-up that dropped an ungrounded review-
+channel claim and tightened prose. Three parallel grok-build review sweeps
+(broad correctness / adversarial / prose) drove the fix-up.
+
+### Added
+- **Init env summary surfaces Claude Code + context-mode versions** plus
+  the primary self-delegation slash form (`/fork` vs `/branch`, derived
+  from `claude --version` against the 2.1.77 rename pin). Helps first-time
+  users see which CLI version + slash form their session runs against, and
+  lets RESUME-NOTES forensics pin behaviour to a CLI version (Claude Code
+  does not version-stamp session JSONLs). `commands/init.md` step 1
+  (probes) + step 6 (summary bullets). Source: round-4 grok forward-
+  looking items A + E. Commit `f54772f`.
+- **Layer 0 capture-timing rule** in `prompts/dispatch-wrapper.md`:
+  capture expected base SHA AFTER any pre-dispatch admin commits (goal-
+  queue Progress-table updates, RESUME-NOTES rev bumps, .gitignore
+  additions) and BEFORE composing the dispatch prompt. Pre-admin-commit
+  capture lets Layer 0 correctly reject; the fix is capture order, not
+  Layer 0 lenience. Codex correctly refused such drift in the field — the
+  gate worked as designed. Commit `f6bd2c5`, prose-tightened in `0e94432`.
+- **Codex `/goal` mode pre-install dependencies** bullet in SKILL.md
+  §Codex reliability. Multi-hour `/goal` loops + mid-iteration
+  `pip install` / `npm install` / `uv sync` is a real friction class:
+  surface-installs wedge on network or leave half-installed venvs the
+  next iteration trips over. Resolve the dependency surface up-front.
+  Commit `f6bd2c5`.
+
+### Changed
+- **README Quickstart now flags the DRAFT-goal gate** so first-time users
+  aren't blindsided when `decompose-plan` refuses on a fuzzy goal. The
+  refusal in `commands/decompose-plan.md` step 0 cites the resolved
+  absolute path of the goal-statement file and the exact `Status:` line
+  to flip. Source: UX-review Friction #2. Commit `7c03d35`.
+- **SKILL.md Dispatch model section** restructured: the prior single
+  "Token bias is a dial" bullet (which had become a multi-paragraph
+  decay of stale future-work claims) is now two focused bullets — token
+  bias (defaults UP, override per-chunk) and channel routing (user
+  override on top of the controller's per-chunk three-paths default,
+  reserving Claude for orchestration and milestone reviews via gstack
+  `/review`, codex for coding when Claude session-limits bite, grok as
+  an executor). Drops the dead `docs-private/<topic>-tuning.md` reader
+  claim that no code path consumed, AND drops a transient claim about
+  `grok -p` as a parallel-review channel — grok stays as an executor;
+  wiring grok-p as a review-channel target is forward work. Commits
+  `f6bd2c5` (initial collapse) and `0e94432` (split + grok-channel
+  correction).
+
+### Internal
+- **Grok sweep validates the pattern.** Three parallel `grok-build`
+  reviews against a small post-convergence diff converged on
+  CONVERGED / HOLD-one-issue / PROSE-DRIFT respectively; the adversarial
+  lens caught the grok-p review-channel claim that the broad and
+  consolidated reviews missed. Working invocation pattern documented in
+  `docs-private/grok-shell-pattern.md` (skill-private — not on origin):
+  `grok --prompt-file <path> --output-format plain` with the diff
+  embedded in the prompt; drop `--max-turns` (per-message cap surfaces
+  faster than reasoning) and `--effort` (grok-build rejects the
+  `reasoningEffort` parameter).
+
+### Sources
+- `docs-private/review-r4-grok-thorough-2026-05-15.txt` (round-4
+  forward-looking items A + E)
+- `docs-private/ux-review-grok-build-2026-05-15.txt` (Friction #2 + part
+  of Friction #4)
+- Lessons captured from a parallel session using the skill (Layer 0
+  timing, /goal pre-install, token-bias gist)
+- Three parallel grok-build review sweeps (broad / adversarial / prose) —
+  outputs at `/tmp/sweep-out-{A,B,C}.txt` at tag time
+
+### Tests
+3 suites / 46 assertions remain green throughout.
+
 ## [Unreleased]
 
 ### **STRIP REFACTOR — skill collapsed from ~230 KB to ~30 KB**
