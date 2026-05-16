@@ -71,14 +71,20 @@ The skill doesn't prescribe between Opus, codex, and Grok within a path — fron
 
 ## Companion tools (strongly recommended)
 
-- **[gstack](https://github.com/garrytan/gstack)** — Gary Tan's skill pack provides `/review`, `/office-hours`, `/plan-eng-review`, `/cso`, `/investigate` for both Claude Code and codex. Goal-flight invokes `/review` for milestone reviews and `/office-hours` for fuzzy-goal interrogation at init. Without gstack, goal-flight falls back to local prompts; with it, you get the consistent severity-ranking framing across both review lenses.
+- **[gstack](https://github.com/garrytan/gstack)** — Gary Tan's skill pack provides `/review`, `/office-hours`, `/plan-eng-review`, `/cso`, `/investigate` for both Claude Code and codex. Goal-flight invokes `/review` for milestone reviews and `/office-hours` for fuzzy-goal interrogation at init. **Optional** — without gstack, goal-flight falls back to local prompts at `prompts/gstack-claude-review.md` + `prompts/gstack-codex-challenge.md` (and embedded executor self-review still catches most issues). With gstack installed, you get consistent severity-ranking framing across both review lenses, which is meaningfully higher quality on long runs.
 - **[context-mode](https://github.com/simonrowland/context-mode)** — MCP plugin that offloads large command outputs (diffs, integration test runs, codex tail files, large greps) to an FTS5 sandbox queried by pattern. The multiplier that makes 12-hour unattended runs feasible — without it, tool-output fills the controller's context fast and you hit compaction early.
 
 ## Adapting
 
 This skill ships tuned for high-accuracy scientific programming but the patterns generalize. Workflow: clone the repo, open it in Claude Code, ask Claude to "adapt this skill for a [domain] project; my north star is [X]; my self-review categories should add [Y]; here's our verification command and our invariants." A single Opus subagent can read the whole thing, propose a diff, and apply it in one pass.
 
-Main tuning knobs: `SKILL.md` (north star, asking discipline, token-bias), `prompts/executor-self-review.md` (the 7 abstract self-review categories — add domain-specific ones), `commands/execute.md` (review cadence `K`, parallel mode), `templates/rag-corpus-schema.md.tpl` (slice mix + word budgets).
+Main tuning knobs:
+
+- **North star + asking discipline + token bias** — `SKILL.md` hard-conventions section.
+- **Self-review categories** — `prompts/executor-self-review.md` lines 14–35. Seven abstract categories; add domain-specific ones (e.g. SCHEMA GAP for ETL, A11Y GAP for frontend).
+- **Review cadence K** — `commands/execute.md` step 4 ("Every K commits, default K=5"). Change the K literal or pass `--review-every <K>` per run.
+- **RAG corpus slice mix + word budgets** — `templates/rag-corpus-schema.md.tpl`.
+- **`/goal` mode prompt shape** — `templates/codex-goal-prompt.md.tpl` (Objective / Workspace / Rules / Acceptance / Test gates / Final response schema).
 
 ## License
 

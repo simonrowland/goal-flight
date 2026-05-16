@@ -18,7 +18,9 @@ PRE-FLIGHT (before reading the rest):
 4. If matched: continue.
 ```
 
-Controller-side belt-and-braces: before dispatching, `git -C <worktree-path> rev-parse HEAD` must equal the expected SHA. If not, recreate the worktree on the right base or abort. (Prompt-side Layer 0 alone is honor-system — frontier models nearly always honor it, but the controller-side check costs nothing.)
+**Controller-side check, mandatory.** Before dispatching, run `git -C <worktree-path> rev-parse HEAD` and compare to expected SHA. If mismatched: don't dispatch. Recreate the worktree on the right base (`git -C <worktree> reset --hard <expected>` if branch can move; else recreate with `git worktree add -b <branch> <path> <expected>`). Prompt-side Layer 0 alone is honor-system; the controller-side check costs nothing and catches the issue before any executor tokens get spent.
+
+**If the executor reports "Base mismatch, Aborting":** the controller-side check should have prevented this, but if it slipped through — the dispatch is aborted (no commit). Recover by: (a) running the controller-side check + worktree-reset above to fix the worktree, then (b) re-dispatching the same chunk. Don't try to cherry-pick a drifted-base commit; it won't merge cleanly downstream.
 
 ## Layers 1–5 — scaffold, don't substitute
 
@@ -36,7 +38,7 @@ The other layers follow the same principle: point at what to investigate; let th
 
 ## Triviality bypass
 
-Trivial single-file chunks (< ~50 LoC delta, no new public surface, no cross-module coupling): Layers 0 + 1 + abstract Layer 5 suffice. Skip 2/3/4. Even smaller chunks (`[controller-direct]` per `SKILL.md`): controller does the work inline; no subagent.
+Trivial single-file chunks (< ~30 LoC delta, no new public surface, no cross-module coupling): Layers 0 + 1 + abstract Layer 5 suffice. Skip 2/3/4. Same threshold for `[controller-direct]` (see `SKILL.md`): if the chunk genuinely qualifies, the controller can do the work inline with no subagent at all.
 
 ## Corpus integration
 

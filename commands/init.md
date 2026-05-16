@@ -64,15 +64,14 @@ If `context-mode` MCP is missing on either side, offer install with a pointer to
 
 **Register the project as codex-trusted** (one-time, idempotent — prevents codex MCP approval-gate stalls in non-interactive dispatches):
 
-- Resolve the goal-flight skill root: `SKILL_ROOT=$(dirname "$(readlink -f ~/.claude/skills/goal-flight 2>/dev/null || echo ~/.claude/skills/goal-flight/SKILL.md)")` — or just `~/Repos/goal-flight` if installed locally.
-- Run `bash "$SKILL_ROOT/scripts/install-codex-overrides.sh" --check` against the project root. Three outcomes:
+- Run `bash ~/.claude/skills/goal-flight/scripts/install-codex-overrides.sh --check` against the project root. (The script handles its own path resolution and accepts an optional explicit path arg.) Three outcomes:
 
   1. **Already trusted** (exit 0): report `codex trust: registered for <repo-root>` in the env summary; continue.
   2. **Codex not installed**: skip silently; no stall risk possible.
   3. **Codex installed but project missing trust** (exit 1): recommend install:
      > "codex `exec` will stall on the MCP approval gate in this project without a one-line user-config trust entry. I can register it via `bash <skill-root>/scripts/install-codex-overrides.sh` — adds a `[projects.\"<abs>\"].trust_level = \"trusted\"` block to `~/.codex/config.toml` (worktrees inherit via path prefix). Run now? (y/n)"
      - If yes: run the install. Re-check; report.
-     - If no: continue, BUT note in env summary that every codex dispatch in this project must include `--ignore-user-config` (see `SKILL.md` §Codex reliability fallback shape), which loses MCP tool access during the dispatch.
+     - If no: continue, BUT note in env summary that every codex dispatch in this project must include `--ignore-user-config` (see `SKILL.md` §Codex reliability — the `--ignore-user-config` fallback bullet), which loses MCP tool access during the dispatch.
 
 Today's date: use the conversation's `currentDate` value, format `YYYY-MM-DD`.
 
