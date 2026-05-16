@@ -9,7 +9,7 @@ Turn a fresh Claude Code session into a **controller** that:
 - Decomposes a plan into numbered `/goal` chunks with structured SCOPE / CHECKLIST / ACCEPTANCE / FORBIDDEN
 - Dispatches each chunk to an **executor** — Claude Agent subagent (default), `codex exec` (`/goal` mode for multi-hour loops; short-prompt for reviews), or Grok via `grok -p`
 - Embeds adversarial self-review inside every dispatch (executor self-fixes P0/P1/P2 before reporting done)
-- Runs **parallel codex + claude review sweeps** at milestone cadence (the "gstack" pattern)
+- Runs **parallel codex + claude review sweeps** at milestone cadence via [gstack](https://github.com/garrytan/gstack)'s `/review` skill
 - Builds a **RAG corpus** of curated dispatch-time context — read as starting hypotheses the executor verifies, not as authoritative facts
 - Writes dated **handoff notes** before context fills so the next controller wakes up cleanly
 
