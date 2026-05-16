@@ -67,6 +67,21 @@ incremented when meaningful skill behaviour changes.
   of dispatching a subagent. `commands/execute.md` step 2b branches on the
   tag. Closes the dispatch-overpresribe gap for tiny chunks where subagent
   dispatch costs more than the work itself.
+- **`[controller-direct]` criterion expanded with "too much context to
+  explain" trigger.** Two distinct cases now justify inline execution:
+  (A) trivially small work — the original criterion (single-file,
+  <30 LoC, no cross-module coupling); (B) the controller has
+  session-loaded state (mid-debug, just-consumed milestone-review
+  P0 cluster, rolling decisions not yet in `docs-private/rag/
+  decisions.md`) that re-explaining to a fresh subagent would cost
+  more than doing the work. Heuristic for (B): a clean dispatch
+  wrapper would exceed ~5 KB primarily because of session-loaded
+  context. Conservative bias on both — when unsure, don't tag,
+  let the default subagent path handle it. `commands/execute.md`
+  step 2b also notes the codex-side analog: `codex fork --last
+  <continuation>` or `codex exec resume --last '<followup>'` for
+  inheriting codex's prior session state, same overhead-arbitrage
+  logic on a different dispatch surface.
 - `reference/pattern.md` §Handoff before compact gains a "Three layers of
   state" subsection making the RESUME-NOTES / goal-queue Progress table /
   TodoWrite split explicit. RESUME-NOTES = cross-session prose, goal-queue
