@@ -71,13 +71,13 @@ Render `templates/goal-queue.tpl` with the drafted chunks and `[parallel-safe:<g
     "Read ~/.claude/skills/goal-flight/prompts/decomposition-review.md in full and execute it. Plan: <path-to-plan-file>. Drafted decomposition: docs-private/<topic>-goal-queue-<today>.md. Goal-statement: docs-private/<topic>-goal-statement-*.md. If your context compacts mid-review, re-read the prompts file — the file is the unparaphrased source of truth." \
     > /tmp/goal-flight-decomp-codex-<topic>.txt 2>&1 &
   ```
-  Avoids spamming the controller's tokens with pre-pasted prompt + plan + decomposition; survives codex session compaction; bypasses any CLI argument length limit. Same principle as `reference/pattern.md` §Codex reliability "keep the prompt short — pass pointers."
+  Avoids spamming the controller's tokens with pre-pasted prompt + plan + decomposition; survives codex session compaction; bypasses any CLI argument length limit. Same principle as `SKILL.md` §Codex reliability "keep the prompt short — pass pointers."
 
 Capture the PID. The output goes to a temp file.
 
 Wait for both. (Codex: poll the temp file or `wait $PID`. Claude reviewer: returns when done.)
 
-If codex stalls (the `timeout(1)` wrapper fires after 300 s, or the optional watchdog kills on zero-output ≥90 s / no-progress ≥180 s — see `reference/pattern.md` §Codex reliability): proceed with the Claude reviewer's findings only. Note in RESUME-NOTES' "In-flight" section.
+If codex stalls (the `timeout(1)` wrapper fires after 300 s, or the optional watchdog kills on zero-output ≥90 s / no-progress ≥180 s — see `SKILL.md` §Codex reliability): proceed with the Claude reviewer's findings only. Note in RESUME-NOTES' "In-flight" section.
 
 ### 4.5. Verify the decomposition serves the goal
 

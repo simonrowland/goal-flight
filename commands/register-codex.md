@@ -54,6 +54,6 @@ convention.
 
 ## See also
 
-- `reference/pattern.md` §Codex reliability — background on the stall and
+- `SKILL.md` §Codex reliability — background on the stall and
   the trust mechanism.
 - `scripts/install-codex-overrides.sh` — the actual installer.

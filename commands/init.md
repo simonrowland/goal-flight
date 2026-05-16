@@ -12,9 +12,9 @@
 
 Run in parallel:
 - `git rev-parse --show-toplevel` → bail if not a git repo.
-- `command -v codex` → capture path. If present, also capture `codex --version` (e.g. `codex-cli 0.130.0`) and record it in the init summary — codex CLI behaviour shifts between versions (flag names, MCP semantics, plugin defaults), and the dispatch-shape assumptions in `reference/pattern.md` are pinned to a version. RESUME-NOTES forensics later are easier with the version recorded.
+- `command -v codex` → capture path. If present, also capture `codex --version` (e.g. `codex-cli 0.130.0`) and record it in the init summary — codex CLI behaviour shifts between versions (flag names, MCP semantics, plugin defaults), and the dispatch-shape assumptions in `SKILL.md` are pinned to a version. RESUME-NOTES forensics later are easier with the version recorded.
 - `command -v bun` → capture version.
-- `command -v grok` → capture path + `grok --version` if present. Grok is a peer dispatch target for `/goal`-mode chunks via the Opus/Grok iteration loop fallback (see `reference/pattern.md` §Fallback: Grok iteration loop). If absent, the skill still works — Opus iteration (via Agent tool) is the no-extra-install fallback. If present, surface availability in the summary so the controller knows the model-diversity option is available for stuck-iteration recovery.
+- `command -v grok` → capture path + `grok --version` if present. Grok is a peer dispatch target for `/goal`-mode chunks via the Opus/Grok iteration loop fallback (see `SKILL.md` §Fallback: Grok iteration loop). If absent, the skill still works — Opus iteration (via Agent tool) is the no-extra-install fallback. If present, surface availability in the summary so the controller knows the model-diversity option is available for stuck-iteration recovery.
 - Check gstack install on the **Claude side** (the controller side) plus codex side for parallel-reviewer milestone use:
   - Claude-side: `[ -d ~/.claude/skills/gstack ]`
   - Codex-side: `[ -d ~/.codex/skills/gstack ]`
@@ -29,7 +29,7 @@ Run in parallel:
 If `codex` missing: tell the user (do NOT auto-install):
 > "codex CLI not found. Install with `npm install -g @openai/codex && codex login`. The skill works without codex (Claude subagents only) but loses parallel-reviewer capability for milestone reviews."
 
-If `codex` present, compare its version against the latest published AND against the **`/goal` mode minimum (0.128.0)** — `/goal` is the codex CLI feature goal-flight's chunk-execution dispatch shape leans on (see `reference/pattern.md` §Codex `/goal` mode dispatch shape). Without it, codex dispatches still work for reviews but lose the multi-hour autonomous-loop primitive.
+If `codex` present, compare its version against the latest published AND against the **`/goal` mode minimum (0.128.0)** — `/goal` is the codex CLI feature goal-flight's chunk-execution dispatch shape leans on (see `SKILL.md` §Codex `/goal` mode dispatch shape). Without it, codex dispatches still work for reviews but lose the multi-hour autonomous-loop primitive.
 
 ```bash
 LATEST=$(npm view @openai/codex version 2>/dev/null)
@@ -49,7 +49,7 @@ fi
 
 Surface the recommendation but do NOT auto-update — environment mutation is the user's call. `codex update` is codex's built-in upgrade subcommand (runs the upgrade + any post-install marketplace re-sync codex wants to do); prefer it over the bare `npm update -g @openai/codex` so any version-specific hooks fire.
 
-**Pre-0.128 codex is the line that matters most** — that's when `/goal` mode shipped. Behaviour calibrated for goal-flight: 0.128.0 minimum (chunk-execution dispatches via `/goal`), 0.130.0 current and recorded in this skill's `reference/pattern.md`. Anything materially older than 0.128 means codex can still review/consolidate (slash-command dispatches) but the chunk-execution loop primitive isn't available.
+**Pre-0.128 codex is the line that matters most** — that's when `/goal` mode shipped. Behaviour calibrated for goal-flight: 0.128.0 minimum (chunk-execution dispatches via `/goal`), 0.130.0 current and recorded in this skill's `SKILL.md`. Anything materially older than 0.128 means codex can still review/consolidate (slash-command dispatches) but the chunk-execution loop primitive isn't available.
 
 **Check the `/goal` feature flag** — `/goal` mode requires `features.goals = true` in `~/.codex/config.toml`. The supported enable command is:
 
@@ -107,7 +107,7 @@ If user declines: continue. Note in summary that large-output handling will use 
   3. **Codex installed but project missing trust** (exit 1): recommend install:
      > "codex `exec` will stall on the MCP approval gate in this project without a one-line user-config trust entry. I can register it via `bash <skill-root>/scripts/install-codex-overrides.sh` — adds a `[projects.\"<abs>\"].trust_level = \"trusted\"` block to `~/.codex/config.toml` (worktrees inherit via path prefix). Run now? (y/n)"
      - If yes: run the install. Re-check; report.
-     - If no: continue, BUT note in env summary that every codex dispatch in this project must include `--ignore-user-config` (see `reference/pattern.md` §Codex reliability fallback shape), which loses MCP tool access during the dispatch.
+     - If no: continue, BUT note in env summary that every codex dispatch in this project must include `--ignore-user-config` (see `SKILL.md` §Codex reliability fallback shape), which loses MCP tool access during the dispatch.
 
 Today's date: use the conversation's `currentDate` value, format `YYYY-MM-DD`.
 
@@ -228,7 +228,7 @@ timeout --kill-after=10 300 codex exec \
   > /tmp/goal-flight-rag-consolidation-<topic>-<iso>.txt 2>&1 &
 ```
 
-Tail or wait. The pointer-based shape avoids spamming the controller's tokens with pre-pasted prompt content + corpus file paths, and survives codex session compaction (codex can re-Read the file). Assumes the project has been registered as codex-trusted in step 1; otherwise add `--ignore-user-config`. See `reference/pattern.md` §Codex reliability.
+Tail or wait. The pointer-based shape avoids spamming the controller's tokens with pre-pasted prompt content + corpus file paths, and survives codex session compaction (codex can re-Read the file). Assumes the project has been registered as codex-trusted in step 1; otherwise add `--ignore-user-config`. See `SKILL.md` §Codex reliability.
 - Apply any P0/P1 fixes; surface P2/P3 as TODO comments in the affected slice.
 
 **Pass 4 — final assessment (one Claude Opus subagent).**

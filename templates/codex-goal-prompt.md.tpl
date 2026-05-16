@@ -10,7 +10,7 @@ PID=$!
 
 `features.goals = true` must be set in `~/.codex/config.toml` (or `codex features enable goals`). The prompt shape itself — Objective + Workspace + Rules + Acceptance + Final response — is what activates the goal-mode loop non-interactively; codex inspects the prompt at session start and treats it as a long-running thread-attached goal when the structure is present and the feature flag is on.
 
-**No `timeout 300` wrapper** — `/goal` mode is designed for multi-hour autonomous runs. The controller monitors the tail file for the "Final response" block specified at the bottom of the prompt; the dispatch is complete when that block appears with the agreed schema. Watchdog inactivity thresholds from `reference/pattern.md` §Codex reliability do NOT apply (long pauses during plan/act/test/iterate cycles are expected).
+**No `timeout 300` wrapper** — `/goal` mode is designed for multi-hour autonomous runs. The controller monitors the tail file for the "Final response" block specified at the bottom of the prompt; the dispatch is complete when that block appears with the agreed schema. Watchdog inactivity thresholds from `SKILL.md` §Codex reliability do NOT apply (long pauses during plan/act/test/iterate cycles are expected).
 
 ---
 

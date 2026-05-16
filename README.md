@@ -53,13 +53,13 @@ Then in a Claude Code session: `/goal-flight init <topic>` to start, or `/goal-f
 /goal-flight validate-queue             # schema-check the goal-queue
 ```
 
-`/goal-flight` with no arg prints the high-level pattern reference (`reference/pattern.md`). The full sub-command list is below.
+`/goal-flight` with no arg prints the high-level pattern reference (`SKILL.md`). The full sub-command list is below.
 
 ## Sub-commands
 
 | Command | What it does |
 |---------|--------------|
-| `/goal-flight` | Print the high-level pattern reference (`reference/pattern.md`) |
+| `/goal-flight` | Print the high-level pattern reference (`SKILL.md`) |
 | `/goal-flight init <topic>` | Check tooling, audit repo via subagent, scaffold AGENTS / docs-private / RAG corpus |
 | `/goal-flight decompose-plan [<plan-file>]` | Break a plan into `\goal` chunks; parallel reviewer pass for the decomposition |
 | `/goal-flight ask-questions [<scope>]` | Spawn anticipatory subagents; surface clarifying questions for the user |

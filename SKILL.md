@@ -13,68 +13,136 @@ The controller dispatches `\goal` chunks to executor subagents, embeds adversari
 ## Sub-commands
 
 ```
-/goal-flight                              # print the high-level pattern reference
+/goal-flight                              # print this file
 /goal-flight init <topic>                 # check tooling, audit repo, scaffold AGENTS/docs-private/
 /goal-flight decompose-plan [<plan-file>] # break a plan into \goal chunks; review the decomposition
 /goal-flight ask-questions [<scope>]      # spawn anticipatory subagents; surface clarifying questions
-/goal-flight execute [--parallel <N>]     # run the per-chunk loop; sequential default, parallel-safe opt-in
-/goal-flight build-corpus [<flags>]       # extend / rebuild the docs-private/rag/ corpus after init
-```
-
-Single-shot helpers:
-```
+/goal-flight execute [--parallel <N>]     # run the per-chunk loop
+/goal-flight build-corpus [<flags>]       # extend / rebuild the docs-private/rag/ corpus
+/goal-flight register-codex [<path>]      # register a project as codex-trusted (re-run safely)
+/goal-flight validate-dispatch [<slug>]   # dry-run a dispatch wrapper; catch malformed layers
+/goal-flight validate-queue [<path>]      # schema-check the goal-queue
 /goal-flight resume                       # rebuild RESUME-NOTES from current git state
-/goal-flight goal <SLUG>                  # append one goal to the queue using the skeleton
+/goal-flight goal <SLUG>                  # append one goal to the queue
 ```
 
-## What you must do when invoked
+Dispatch on the first token by reading the matching `commands/<token>.md`; `resume` and `goal` are handled inline (see bottom of this file).
 
-If no args: read `reference/pattern.md` (in this skill's directory) and print it. Do not ask follow-up questions.
+If no args: print this file.
 
-If args, dispatch on the first token by reading the matching detailed instructions:
+## Hard conventions
 
-| First token | Read and follow |
-|-------------|-----------------|
-| `init` | `commands/init.md` |
-| `decompose-plan` | `commands/decompose-plan.md` |
-| `ask-questions` | `commands/ask-questions.md` |
-| `execute` | `commands/execute.md` |
-| `build-corpus` | `commands/build-corpus.md` |
-| `register-codex` | `commands/register-codex.md` |
-| `validate-dispatch` | `commands/validate-dispatch.md` |
-| `validate-queue` | `commands/validate-queue.md` |
-| `resume` | (handle inline; see "Resume / goal" below) |
-| `goal` | (handle inline; see "Resume / goal" below) |
+### Dispatch model
 
-The detailed sub-command instructions live in this skill's `commands/` directory so this SKILL.md stays scannable.
+- **Default to Claude Agent tool** (`model: "opus"`, highest reasoning) for code-writing chunks. Claude session billing, not API billing. **Never `claude -p`** — that consumes API billing.
+- **Codex `exec` is a peer dispatch target**, not just a reviewer. Use `Bash timeout 300 codex exec '<short pointer-shaped prompt>'` — keep the prompt short, pass file pointers (the agent reads what it needs at the time it needs it). The MCP approval-gate stall that otherwise breaks ~2/5 codex dispatches is solved at init by `scripts/install-codex-overrides.sh` (registers the project + its worktrees by path prefix as codex-trusted).
+- **Codex `/goal` mode** is a real CLI feature (codex ≥ 0.128.0, `features.goals = true` in `~/.codex/config.toml`). Multi-hour autonomous plan→act→test→iterate loop. Invocation: `codex exec -C <workdir> - < prompt.md`. The prompt shape (Objective + Workspace + Rules + Acceptance + Test gates + Final response schema — see `templates/codex-goal-prompt.md.tpl`) auto-activates the loop when goal-shaped. **`\goal` (backslash) is goal-flight's in-prompt text marker, not codex's `/goal`.** Backslash on the wrapper, forward-slash on codex's CLI feature — they're different things despite looking similar. The Opus / Grok iteration loops below use the same goal-prompt structure but run as external loops driven by the controller (one dispatch per iteration); only codex has the in-session `/goal` primitive.
+- **Three dispatch paths** (frontier models pick; the skill doesn't prescribe between Opus / codex / Grok):
+  1. **`[controller-direct]`** — controller does the work inline. Two triggers: (a) trivially small (single-file, < ~30 LoC, no cross-module coupling); (b) controller already has the session-loaded state a fresh subagent would have to re-discover (mid-debug, just-consumed milestone-review P0, rolling decisions not yet in `decisions.md`). Heuristic for (b): a clean dispatch wrapper would exceed ~5 KB primarily because of context the controller already holds.
+  2. **Single-shot subagent** — Agent tool (Claude) OR codex `exec` short-prompt OR `grok -p` short-prompt. One dispatch, executor reports done. The default path for most chunks. Frontier model picks the executor target based on chunk shape.
+  3. **Goal-mode loop** — codex `/goal` (in-session, codex ≥ 0.128 + features.goals) OR external loop driven by the controller (one Agent or Grok dispatch per iteration; controller parses Final response block, re-dispatches with updated `Iteration N of MAX, Prior progress: ...` preamble). Iteration cap: 5–8 default, configurable via `[max-iterations:<N>]` chunk tag.
+- **Token bias is a dial, not a fixed setting.** Default biases UP: largest model + highest reasoning + parallel reviewers + corpus eagerly built — because subagent + codex tokens are largely free goods relative to engineering quality, especially when parallelisable. Per-chunk override DOWN when the work is genuinely small (use `[controller-direct]` or a smaller model in the dispatch's `model:` field). Per-project override DOWN via `tuning.token-bias = "lean"` in `docs-private/<topic>-tuning.md` for prototype-speed workloads. The default makes the controller use more tokens to interrupt the user less, not the other way around.
 
-## Hard conventions (apply to every sub-command)
+### Verification-first dispatch wrapper
 
-- **Antipattern: `claude -p`.** It consumes Anthropic API billing rates instead of your session billing. **Always use the Agent tool** to spawn Claude subagents (their work is part of your session billing). Codex reviewers go through `Bash timeout 300 codex exec '<short pointer-shaped prompt>'`. `timeout` enforces a hard ceiling since codex v0.130.0 has no `--timeout` flag. **Keep the codex exec arg short** — pass file pointers, not pre-pasted content; the agent reads what it needs at the time it needs it, which dodges controller token spam, controller-curated staleness, and codex session compaction clobbering the unparaphrased original. The MCP approval-gate stall that otherwise breaks ~2/5 dispatches is solved at init time by `scripts/install-codex-overrides.sh` (registers the project + its worktrees by path prefix as codex-trusted). See `reference/pattern.md` §Codex reliability and `prompts/dispatch-wrapper.md` for the verification-first wrapper philosophy.
-- **Default code-writing dispatches to the largest available model + highest reasoning level.** For Agent tool: `model: "opus"` (largest current Claude). For codex: include the highest-reasoning flag (`-c model_reasoning_effort=xhigh` or whatever the current codex CLI exposes; verify with `codex --help`). The trade is latency/cost for perfectionist output — for refactor work where one subtle bug propagates across all subsequent chunks, the trade is worth it. For non-code chunks (planning, review, docs writing) the default model is fine; reserve the escalation for chunks where the executor is writing code that will be cherry-picked into main.
-- **Strongly recommend context-mode.** [context-mode](https://github.com/simonrowland/context-mode) installs MCP tools (`ctx_execute`, `ctx_batch_execute`, `ctx_search`, `ctx_fetch_and_index`) that offload large command outputs to an FTS5 sandbox and query them by pattern instead of stuffing context. For the controller pattern this is a real multiplier — diff verification, integration pytest output, goal-queue searches, codex tail monitoring all benefit. Codex side benefits even more during `\goal` loops where shell tooling fills context quickly. Init checks both Claude Code and codex MCP registrations and recommends install if missing.
-- **Guiding philosophy: use more tokens to improve quality, especially when parallelisable.** Subagent tokens (Claude session billing) and codex tokens (OpenAI Pro accounts) are largely "free goods" relative to engineering quality. The goal is to think / prepare / iterate / review MORE in service of higher-quality software. Concrete biases this should produce when the user is away from keyboard:
-  - When uncertain on a design call, dispatch a planner pair (chemistry-first + engineering-first lenses, or analogous concern-split) rather than waiting to ask.
-  - Add a parallel codex reviewer for any non-trivial milestone — codex's second-opinion is essentially free.
-  - Default to the largest model + highest reasoning for any code-writing work (already a hard convention above).
-  - Build the corpus eagerly at init; loosen the small-project skip threshold rather than tighten it.
-  - On the first sign of dispatch drift or inconsistent output across parallel subagents: dispatch a consistency reviewer, don't paper over.
-  - Iteration cycles are cheap; serialized "ask the user, then act" cycles are not. Prefer parallel adversarial review over blocking on user input for choices the controller can adjudicate from evidence.
-- **Asking discipline — north star: code quality + first-principles scientific integrity.** Interrupt the user only when a decision genuinely affects one of those. Refinements:
-  - **Prepare the question with subagents first.** While waiting on codex or any background work, dispatch anticipatory reviewer-loop subagents to pre-resolve choices the controller might otherwise have to ask about. A second pair of eyes resolves most "should I X or Y?" questions; remaining ones become better-formed asks because the subagent has shaped the options.
-  - **Don't ask trivia.** Worktree labels, file naming nits, paint colors, "proceed or hold when the next step is obviously consistent with the philosophy" — never ask. These don't affect code quality or scientific integrity. Just decide.
-  - **Don't do Netflix "are-you-still-watching" check-ins.** "Step 1 done. Continue?" when nothing is blocked is the antipattern. The user has handed the controller authority precisely so they can step away in bunny slippers; the controller's value is forward motion through routine work until a real blocker arrives. Running commentary as work progresses IS welcome — short status lines showing forward motion give the user a window into what's happening. The thing to cut is the implicit-stop pattern: "X is done. Proceed?" / "Hold or go?" / "Want me to continue?" — these create a hard wait for confirmation when no real decision is needed. Status without an asking-hook is fine; status WITH an asking-hook on non-decision steps is the antipattern.
-  - **Do ask when the choice affects** the north star: an unresolved chemistry/physics assumption, a scope-vs-scope trade-off no subagent can adjudicate without user values, a destructive operation (per the harness's confirmation rule), or a decision that would lock in a wrong invariant.
-  - The right amplification: a well-prepared ask with subagent-vetted options is worth roughly 5 raw asks. Front-load thinking; back-load interruption. When the controller does interrupt, it should be a thoughtful "here's my very thoughtful recommendation against your three main options for how to square X" — not a status ping.
-- **Leverages [gstack](https://github.com/garrytan/gstack)** when installed — Gary Tan's skill pack works for **both Claude Code and codex**, exposing `/review`, `/office-hours`, `/plan-eng-review`, `/plan-ceo-review`, `/cso`, `/investigate`, etc. Init checks both install locations (`~/.claude/skills/gstack/`, `~/.codex/skills/gstack/`, plus project-level `.agents/skills/gstack/`) and recommends install if either side is missing. Commands prefer **Claude-direct invocation** (Skill tool, e.g., `/review <range>`) when available; use `timeout 300 codex exec '/review <range>'` for the parallel second-opinion perspective (assumes the project has been registered via `scripts/install-codex-overrides.sh`; see `reference/pattern.md` §Codex reliability); fall back to local prompts in `prompts/` only when gstack is absent on both sides.
-- **Controller delegates *bulk* Read-heavy work to Explore subagents.** Don't read whole READMEs, full architecture docs, or files >200 lines directly during init or execute — spawn an Explore agent and consume its summary. Short verification reads (< 200 lines, specific `file:line` ranges, targeted `grep` / `tail -n` / `sed -n` outputs) are fine inline. The ban is on bulk context consumption, not on the controller using its eyes. Same principle for chunk execution: `[controller-direct]`-tagged trivial chunks (single-file, < ~30 LoC delta, no cross-module coupling — per `commands/decompose-plan.md` step 2 and `commands/execute.md` step 2b) get handled inline with Read + Edit + commit, no subagent dispatch. Use the controller's judgement; dispatch overhead exceeds work for genuinely tiny chunks.
-- **Worker context is optional, not load-bearing.** Modern context windows (200k+ for mid-tier models, 1M for Opus 1M-context) make precis curation a false economy — the ~5k tokens you save aren't worth the drift risk between a precis and the canonical AGENTS.md. Default: dispatches point executors at AGENTS.md directly. Create `docs-private/worker-context.md` only if your AGENTS.md is genuinely huge (>1000 lines) or the project has multiple distinct worker profiles with little overlap. When present, it supersedes AGENTS.md as the executor's reading entry point; when absent, AGENTS.md serves both controller and executors fine.
-- **The high-level goal is pinned at init time** to `docs-private/<topic>-goal-statement-<today>.md`. Controller cites it in decompose-plan, mid-execute decisions, and milestone summaries. User shouldn't need to remind the session what the point of the task is.
-- **Date format**: `YYYY-MM-DD` from the conversation's `currentDate`. Same-day RESUME-NOTES bump `(rev N)` in H1; never overwrite.
-- **AGENTS.md is never overwritten.** If it exists, init proposes additions/edits as a diff for the user to apply.
-- **Status / progress questions** ("where are we?", "what's the queue?", "what just landed?") work without any skill layer — the controller answers from its visible Progress table and a quick read of the goal-queue. No `/goal-flight status` command needed.
-- **Notifications** via `osascript -e 'display notification "X" with title "goal-flight"'` ONLY on blockers and queue completion. Session scrollback is the primary monitor. Forensics: the harness already captures full session JSONL at `~/.claude/projects/<encoded-repo>/<session-id>.jsonl` plus per-subagent JSONL at `<...>/subagents/agent-<id>.jsonl` plus codex tail files at `/tmp/goal-flight-*-<iso>.txt`. RESUME-NOTES carries the prose narrative; goal-queue Progress table carries the per-chunk status. No additional structured log is needed — a separate `controller.log` is net redundant given those three layers.
-- **Two-worktree convention** — controller works in main worktree; parallel-safe goals each get a `<repo>/.claude/worktrees/<adjective-noun>/` worktree on a `claude/<name>` branch.
+The wrapper **scaffolds what the executor should investigate**; it does NOT substitute for investigation. Controller-pasted "facts" (file:line refs, function signatures, invariant restatements) go stale on the timescale of minutes; frontier models trust pasted text because the controller is upstream in the trust hierarchy. Pointers force the agent to re-verify against live disk and surface drift.
+
+Full spec: `prompts/dispatch-wrapper.md`. Target dispatch size: 3–5 KB, not 6–11 KB (the size reduction is the empirical regression test). Layer 0 (base-verification pre-flight) is mandatory for worktree-isolated dispatches.
+
+### Codex reliability
+
+- **Register every project as codex-trusted** at init time via `scripts/install-codex-overrides.sh`. Without it, non-interactive `codex exec` blocks indefinitely on the first MCP tool call when context-mode (or any MCP server with `approval_mode = "approve"`) is registered. Trust is prefix-based; worktrees inherit automatically. See `commands/register-codex.md`.
+- **Codex CLI ≥ 0.128.0** for `/goal` mode (older versions still work for reviews / consolidation / short-prompt dispatches — they just don't have the in-session loop primitive). Init step 1 checks the version and recommends `codex update` if older.
+- **Wrap `codex exec` in `timeout --kill-after=10 300`** for non-`/goal` dispatches. Codex v0.130.0 has no `--timeout` flag. 300 s is 10× observed p95 (~25 s healthy). **Do NOT** wrap `/goal` mode dispatches in `timeout 300` — they're multi-hour by design; the controller monitors the tail file for the Final response block to detect completion.
+- **Backstop watchdog** for residual stalls (network wedge, codex-internal hang): zero-output ≥ 90 s OR no-progress ≥ 180 s ⇒ kill + retry as Claude general-purpose subagent. Applies to short-prompt dispatches only; for `/goal` mode, long pauses during plan/act/test/iterate cycles are expected and the watchdog would false-positive.
+- **Fallback when trust can't be registered** (shared machine, one-off invocation): `codex exec --ignore-user-config '...'`. Loses MCP tool access in the dispatched session; trust-registration is strictly preferable when feasible.
+
+### Asking discipline — north star
+
+The controller's value is forward motion until a real blocker. **Interrupt the user only when a decision genuinely affects the project's north star** (default: code quality + first-principles scientific integrity; configurable per project).
+
+- **Don't ask trivia.** Worktree labels, file naming nits, paint colors — never ask. Just decide.
+- **Don't do Netflix "are-you-still-watching" check-ins.** "Step 1 done. Continue?" when nothing is blocked is the antipattern. Running commentary as work progresses IS welcome — short status lines giving the user a window into the work. The thing to cut is the implicit-stop pattern ("Hold or go?", "Proceed?") on routine forward motion.
+- **Prepare the question with subagents first.** While waiting on a long-running subagent or codex review, dispatch anticipatory reviewer-loop subagents to pre-resolve choices. A well-prepared ask with subagent-vetted options is worth roughly 5 raw asks.
+- **Do ask when** a chemistry/physics/security/correctness assumption needs user values, when a destructive operation is about to fire, or when a decision would lock in a wrong invariant.
+
+### State — three layers, different scopes
+
+- **`docs-private/RESUME-NOTES-<date>-(rev N).md`** — cross-session prose handoff. Survives compaction, session boundaries, machine reboots. Bump rev at: end of init, after decompose-plan, after each milestone review, before any anticipated compaction, on queue completion. Append-only within a day — never overwrite a prior rev.
+- **`docs-private/<topic>-goal-queue-<date>.md` Progress table** — cross-session chunk-level state. One row per chunk; status = TODO / IN-FLIGHT / DONE / BLOCKED. Updated immediately after every commit. What `/goal-flight resume` reconstructs from.
+- **TodoWrite (harness state)** — in-session tactical sub-step tracking. "Read the file. Edit the function. Run pytest." Survives in-session compaction but NOT cross-session. Optional. If state needs to survive `/goal-flight resume`, it goes in a file; if it's "next 3 tool calls," TodoWrite is fine.
+
+### Handoff before compact
+
+When context is ~80% full or compaction is imminent, write fresh `docs-private/RESUME-NOTES-<date>.md`. 80% is the default; the right threshold is a function of (remaining work in the queue) × (cost of waking afresh with summaries). Conserve harder when multiple subagent dispatches are in flight whose notifications carry mid-decision state; run hotter (90%+) when the queue is 1–3 trivial chunks from done and the most recent RESUME-NOTES rev already captures in-flight state. Subagents + `\goal` mode do most of the heavy lifting for extending session life — the controller's own context primarily holds metadata, not the bottleneck (as long as the controller doesn't pull large outputs into its own context).
+
+### Context-mode multiplier
+
+[context-mode](https://github.com/simonrowland/context-mode) installs MCP tools (`ctx_execute`, `ctx_batch_execute`, `ctx_search`, `ctx_fetch_and_index`) that offload large command outputs to an FTS5 sandbox and query them by pattern instead of stuffing context. Real multiplier for the controller pattern — diff verification, pytest output, goal-queue searches, codex tail monitoring all benefit. Init checks both Claude Code and codex MCP registrations and recommends install if missing.
+
+### gstack integration
+
+[gstack](https://github.com/garrytan/gstack) works on both Claude Code and codex. Init checks both install locations (`~/.claude/skills/gstack/`, `~/.codex/skills/gstack/`, plus project-level `.agents/skills/gstack/`) and recommends install if either side is missing. Prefer Claude-direct invocation (`Skill(skill: "review", ...)`) when available; use `timeout 300 codex exec '/review <range>'` for the parallel second-opinion perspective at milestones.
+
+### Read discipline
+
+- **Controller delegates *bulk* Read-heavy work to Explore subagents.** Don't read whole READMEs, architecture docs, or files >200 lines directly during init or execute — spawn an Explore agent, consume its summary. Short verification reads (< 200 lines, specific `file:line` ranges, targeted `grep` / `tail -n` / `sed -n`) are fine inline. The ban is on bulk context consumption, not on the controller using its eyes.
+- **`AGENTS.md` is never overwritten.** If it exists, init proposes additions/edits as a diff for the user to apply.
+
+### Worktree convention
+
+Controller works in the main worktree. Parallel-safe chunks each get `<repo>/.claude/worktrees/<adjective-noun>/` on a `claude/<adjective-noun>` branch. Codex trust prefix-matches the project root, so worktrees inherit automatically — no per-worktree registration. Cherry-pick onto main; do NOT use `git merge --ff-only` (sibling worktrees branched off main don't fast-forward cleanly when other worktrees committed since).
+
+### Per-chunk loop (canonical shape)
+
+1. **Dispatch** — pick one of the three paths above based on chunk shape.
+2. **Wait** — do NOT poll the subagent transcript. The harness sends a task-notification on completion. Use the waiting interval for parallel-safe prep (next-chunk wrapper composition, RAG corpus drift, anticipatory questions).
+3. **Verify the diff briefly** — scope contained, suite green, no leaked invariants. Executor's self-review already caught issues; you sanity-check.
+4. **Commit** (one chunk = one commit). Parallel-mode: cherry-pick onto main.
+5. **Update the Progress table** in goal-queue + your visible state.
+6. **Look-ahead** — fire-and-forget Explore subagent reading the next 1–2 chunks for hidden dependencies or missing acceptance criteria.
+
+### Progress table — keep this current
+
+```
+Chunk                       Status            Commit
+1. <SLUG>                   ✅                <hash>
+2. <SLUG>                   ✅                <hash>
+3. <SLUG> (current)         🟡 in flight      —
+#4 / #5 / #6                queued            —
+#7                          post-<gate>       —
+
+<branch> @ <head>, <N> green.
+```
+
+Status legend: ✅ done · 🟡 in flight · queued · blocked · post-`<gate>`.
+
+### Three subagent types
+
+| Type | Purpose | Wrapper layers | Reports |
+|------|---------|----------------|---------|
+| **Executor** | Implement a `\goal` chunk; writes code, runs tests, commits | All 5 (Layer 0 + Layers 1–5 per `prompts/dispatch-wrapper.md`) | `git diff --stat`, P0/P1/P2/P3 findings, tests run, surprises |
+| **Reviewer** | Read-only adversarial pass over a commit range or draft | Layers 1+3 typically; layer 4 if env-relevant; layer 2 if reviewing pattern-mirror work | Findings list with file:line refs, P0/P1/P2/P3, confidence |
+| **Planner** | Write a plan document to a pinned path; "NO code changes" | Layers 1+3 + pinned deliverable path | File path, word count, bottom-line recommendation, open questions |
+
+Distinguishing them prevents the controller from giving a reviewer the full wrapper (wastes context) or a planner the executor wrapper (encourages drift into code-writing).
+
+### Don't
+
+- Run a separate reviewer subagent per chunk — the embedded self-review is the cheaper substitute. Reserve full multi-agent review for milestones.
+- Bundle multiple chunks in one commit.
+- Refactor outside the chunk's SCOPE mid-execution. File a follow-up chunk.
+- Skip the diff verification because self-review reported clean.
+- Use `git merge --ff-only` to integrate parallel-worktree subagent commits. Cherry-pick.
+- Hand-write dispatch wrappers when the RAG corpus exists. Source layers 2/3/4 from the corpus with verification framing.
+- Poll a background subagent. Wait for `task-notification`.
+
+### Don't (cont.) — date format + notifications + worker-context
+
+- **Date format**: `YYYY-MM-DD` from the conversation's `currentDate`. Same-day RESUME-NOTES bump `(rev N)` in H1.
+- **Notifications** via `osascript -e 'display notification "X" with title "goal-flight"'` ONLY on blockers and queue completion. Session scrollback is the primary monitor. Forensics live in the harness session JSONL + per-subagent JSONL + codex tail files.
+- **Worker context is optional**. Default: dispatches point executors at `AGENTS.md` directly. Create `docs-private/worker-context.md` only if AGENTS.md is huge (>1000 lines) or the project has distinct worker profiles.
+- **High-level goal pinned at init** to `docs-private/<topic>-goal-statement-<today>.md`. Controller cites it in decompose-plan, mid-execute decisions, milestone summaries.
 
 ## Resume / goal sub-commands (handled inline)
 
@@ -82,12 +150,12 @@ The detailed sub-command instructions live in this skill's `commands/` directory
 1. Find the most recent `docs-private/RESUME-NOTES-*.md`. If none, bail: "Run `/goal-flight init <topic>` first."
 2. Find the most recent goal-queue: `docs-private/*-goal-queue-*.md`.
 3. Read git state via Bash: `git rev-parse HEAD`, `git rev-parse --abbrev-ref HEAD`, `git log --oneline -20`.
-4. **Spawn a subagent** to render `templates/RESUME-NOTES.tpl` with the captured state and write to `docs-private/RESUME-NOTES-<today>.md`. If today's file exists, increment `(rev N)` in H1 instead of overwriting.
+4. Spawn a subagent to write `docs-private/RESUME-NOTES-<today>.md`. If today's file exists, increment `(rev N)` in H1 instead of overwriting. RESUME-NOTES contains: TL;DR (one paragraph), Progress table verbatim, in-flight executor IDs/PIDs, reading order on wake (numbered file list), first-5-minutes (exact next steps).
 5. Print: file path; placeholders the user still needs to fill in.
 
 ### `goal <SLUG>`
 1. Find the most recent goal-queue.
 2. Find the highest existing `## N.` goal number.
-3. Append a new entry: `## <N+1>. \goal <SLUG>` with SCOPE/CHECKLIST/ACCEPTANCE/FORBIDDEN skeleton (read from `templates/goal-queue.tpl`).
+3. Append: `## <N+1>. \goal <SLUG>` with SCOPE / CHECKLIST / ACCEPTANCE / FORBIDDEN skeleton; tags `[parallel-safe:<group>]` `[milestone]` `[controller-direct]` `[goal-mode]` `[max-iterations:<N>]` `[mixed-executor]` as applicable.
 4. Append a row to the Progress table: `| #<N+1> \`<SLUG>\` | TODO |`.
 5. Print the appended block.

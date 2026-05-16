@@ -171,7 +171,7 @@ Both reviewers use the same gstack `/review` framing (when installed) for consis
     "Read ~/.claude/skills/goal-flight/prompts/gstack-codex-challenge.md in full and execute it. Commit range: <start-hash>..<end-hash>. Goal-queue: docs-private/<topic>-goal-queue-*.md. If your context compacts mid-review, re-read the prompts file — the file is the unparaphrased source of truth." \
     > /tmp/goal-flight-gstack-codex-<topic>-<iso>.txt 2>&1 &
   ```
-  Avoids spamming the controller's tokens with pre-pasted prompt content; survives codex session compaction (codex can re-Read the file); bypasses any CLI argument length limit. Same principle as `reference/pattern.md` §Codex reliability "keep the prompt short — pass pointers."
+  Avoids spamming the controller's tokens with pre-pasted prompt content; survives codex session compaction (codex can re-Read the file); bypasses any CLI argument length limit. Same principle as `SKILL.md` §Codex reliability "keep the prompt short — pass pointers."
 
 Capture PID; poll temp file for completion.
 
@@ -190,7 +190,7 @@ The corpus is load-bearing for every dispatch's wrapper layers 2-4. As goals lan
   > "RAG corpus drift review. Read every file in `docs-private/rag/`. For each slice, verify against current code state: (a) do file:line refs still exist? (b) do grep patterns still match? (c) has any decision in `decisions.md` been amended/reversed by a commit in `<milestone-start>..<HEAD-after-fix-clusters>` without the slice being updated? (d) do `patterns/*.md` files still describe the canonical implementation, or has it moved/been lifted? Report per-slice P0/P1/P2/P3 findings."
 - Apply fixes inline (controller-direct) for small drift; re-dispatch a slice-builder for major drift (>30% of slice needs rewriting).
 
-If codex isn't available or stalls (the `timeout(1)` wrapper fires after 300 s, or the optional watchdog kills on zero-output ≥90 s / no-progress ≥180 s — see `reference/pattern.md` §Codex reliability): proceed with Claude only; note in summary.
+If codex isn't available or stalls (the `timeout(1)` wrapper fires after 300 s, or the optional watchdog kills on zero-output ≥90 s / no-progress ≥180 s — see `SKILL.md` §Codex reliability): proceed with Claude only; note in summary.
 
 **c. Wait for both**; consolidate findings (dedupe; severity-rank P0/P1/P2/P3).
 
