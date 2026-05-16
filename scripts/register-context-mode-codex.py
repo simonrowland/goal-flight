@@ -13,11 +13,13 @@ resolution, idempotency. This script does it for you.
 What this script does
 ---------------------
 1. Detects whether context-mode is installed Claude-side (mcpServers entry
-   in ~/.claude.json / ~/.claude/settings.json, OR plugin form under
-   ~/.claude/plugins/).
+   in ~/.claude.json / ~/.claude/settings.json, OR plugin form with an
+   mcpServers entry inside any plugin.json under ~/.claude/plugins/).
 2. Checks whether [mcp_servers.context-mode] is ALREADY registered in
-   ~/.codex/config.toml. If so, no-op (preserves the user's chosen command —
-   they may have intentionally configured a different launch).
+   ~/.codex/config.toml via tomllib parse (handles bracket-table form,
+   quoted-key form, AND inline-table form; ignores commented-out blocks).
+   If present, no-op (preserves the user's chosen command — they may have
+   intentionally configured a different launch).
 3. If Claude has it but codex doesn't, appends the canonical codex
    registration (`npx -y context-mode@latest`) to ~/.codex/config.toml.
    This is the recommended form per context-mode's docs and avoids the
@@ -28,6 +30,8 @@ Idempotency + safety:
 - Backs up existing ~/.codex/config.toml with a collision-resistant suffix.
 - Uses flock + atomic rename for concurrent-init safety.
 - Exits silently if codex isn't installed (no ~/.codex/ to mutate).
+- Refuses-with-error if npx is absent on PATH (codex needs to find it later).
+- Requires Python 3.11+ (for tomllib parsing).
 
 Usage
 -----
@@ -41,6 +45,7 @@ Re-running is safe — duplicates are not created.
 from __future__ import annotations
 
 import argparse
+import errno
 import fcntl
 import json
 import os
@@ -49,92 +54,183 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from typing import Optional
+
+try:
+    import tomllib
+except ImportError:
+    print(
+        "ERROR: this script requires Python 3.11+ for tomllib (got Python "
+        + sys.version.split()[0]
+        + ").",
+        file=sys.stderr,
+    )
+    print(
+        "  Upgrade Python (e.g. `brew install python@3.12`) and re-run.",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+
+
+# Sentinel returned by append_atomically() when another runner won the race.
+# Using a module-level singleton keeps the type signature `Optional[Path]`
+# clean while preserving the distinction between "raced" and "wrote, but no
+# prior config existed so no backup made" — a Round-2 reviewer caught the
+# original conflated `Path()` sentinel.
+class _RaceSentinel:
+    __slots__ = ()
+
+
+RACED = _RaceSentinel()
 
 
 def claude_has_context_mode() -> str | None:
-    """Return a one-line provenance string if context-mode is detected Claude-side, else None."""
+    """Return a one-line provenance string if context-mode is detected Claude-side, else None.
+
+    Detection is content-based: a JSON file must contain an `mcpServers["context-mode"]`
+    entry. Path-substring filters are NOT used — a plugin's install directory may not
+    contain "context-mode" in its name (bundle plugins, custom marketplace paths).
+    """
     # Explicit mcpServers entries
     for src in [Path.home() / ".claude.json", Path.home() / ".claude/settings.json"]:
         if not src.exists():
             continue
         try:
             cfg = json.loads(src.read_text())
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, OSError):
             continue
-        if cfg.get("mcpServers", {}).get("context-mode"):
+        if not isinstance(cfg, dict):
+            continue
+        servers = cfg.get("mcpServers")
+        if isinstance(servers, dict) and servers.get("context-mode"):
             return f"mcpServers entry in {src}"
-    # Plugin form — presence of a plugin.json under ~/.claude/plugins/**/context-mode is enough
+    # Plugin form — scan all plugin.json files, content-check for mcpServers entry.
+    # No path-substring prefilter (round-2 reviewer flag: bundle plugins or
+    # non-context-mode-named install paths would be missed).
     plugins_root = Path.home() / ".claude/plugins"
     if plugins_root.exists():
-        for plugin_json in plugins_root.rglob("plugin.json"):
-            # Path-match on "context-mode" anywhere in the install path
-            if "context-mode" not in str(plugin_json):
-                continue
-            try:
-                cfg = json.loads(plugin_json.read_text())
-            except json.JSONDecodeError:
-                continue
-            if cfg.get("mcpServers", {}).get("context-mode") or cfg.get("name") == "context-mode":
-                return f"plugin form at {plugin_json.parent}"
+        try:
+            for plugin_json in plugins_root.rglob("plugin.json"):
+                try:
+                    cfg = json.loads(plugin_json.read_text())
+                except (json.JSONDecodeError, OSError):
+                    continue
+                if not isinstance(cfg, dict):
+                    continue
+                servers = cfg.get("mcpServers")
+                if isinstance(servers, dict) and servers.get("context-mode"):
+                    return f"plugin form at {plugin_json.parent}"
+        except OSError:
+            pass
     return None
 
 
 def codex_already_registered(codex_config: Path) -> bool:
+    """Return True iff [mcp_servers.context-mode] is an ACTIVE registration.
+
+    Uses tomllib to parse the config — correctly handles bracket-table form,
+    quoted-key form, AND inline-table / dotted-key forms; ignores comments
+    and TOML strings that incidentally contain the registration text.
+    """
     if not codex_config.exists():
         return False
-    content = codex_config.read_text()
-    # Both bare-key and quoted-key forms are valid TOML; match either.
-    return (
-        "[mcp_servers.context-mode]" in content
-        or '[mcp_servers."context-mode"]' in content
-    )
+    try:
+        text = codex_config.read_text()
+    except OSError:
+        return False
+    try:
+        data = tomllib.loads(text)
+    except tomllib.TOMLDecodeError:
+        # Existing file is malformed — treat as "not registered" so the user
+        # gets the proper error on append, rather than a false-positive skip.
+        return False
+    servers = data.get("mcp_servers")
+    if not isinstance(servers, dict):
+        return False
+    return "context-mode" in servers
 
 
-def render_block() -> str:
-    """Render the canonical codex registration for context-mode."""
-    npx = shutil.which("npx") or "/usr/bin/env npx"
-    # All values here are controlled by this script (not user input), so explicit
-    # TOML basic-string escaping suffices. npx path is an absolute filesystem path
-    # without TOML-special characters in any sane setup.
+def render_block(npx_path: str) -> str:
+    """Render the canonical codex registration for context-mode.
+
+    `npx_path` is run through json.dumps so any TOML-special chars in the
+    resolved PATH dir are escaped correctly (TOML basic strings are a superset
+    of JSON strings).
+    """
     return (
         "\n"
         "[mcp_servers.context-mode]\n"
-        f'command = "{npx}"\n'
+        f"command = {json.dumps(npx_path)}\n"
         'args = ["-y", "context-mode@latest"]\n'
     )
 
 
-def append_atomically(codex_config: Path, block: str) -> Path:
-    """Append `block` to `codex_config`, mutex'd against concurrent runs. Returns backup path."""
+def append_atomically(
+    codex_config: Path, block: str
+) -> _RaceSentinel | Optional[Path]:
+    """Append `block` to `codex_config`, mutex'd via flock against concurrent runs.
+
+    Returns:
+      - RACED sentinel if another runner won the lock and registered first.
+      - None if the write succeeded and no prior config existed (no backup).
+      - Path(backup_file) if the write succeeded and a prior config was backed up.
+    """
     codex_config.parent.mkdir(parents=True, exist_ok=True)
     lock_path = codex_config.parent / ".register-context-mode.lock"
-    with open(lock_path, "w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        # Re-check under lock — another runner may have written it.
-        if codex_already_registered(codex_config):
-            return Path()  # signal: no-op (someone else wrote it)
-        backup = Path()
-        if codex_config.exists():
-            ts = time.strftime("%Y%m%d-%H%M%S")
-            backup_fd, backup_name = tempfile.mkstemp(
-                prefix=f"config.toml.bak.{ts}.",
+    try:
+        lock_file = open(lock_path, "w")
+    except PermissionError as e:
+        print(
+            f"ERROR: could not acquire lock at {lock_path} ({e}). "
+            "Check ~/.codex/ permissions and re-run.",
+            file=sys.stderr,
+        )
+        sys.exit(3)
+    try:
+        with lock_file:
+            fcntl.flock(lock_file, fcntl.LOCK_EX)
+            # Re-check under lock — another runner may have written it.
+            if codex_already_registered(codex_config):
+                return RACED
+            backup: Optional[Path] = None
+            if codex_config.exists():
+                ts = time.strftime("%Y%m%d-%H%M%S")
+                backup_fd, backup_name = tempfile.mkstemp(
+                    prefix=f"config.toml.bak.{ts}.",
+                    dir=str(codex_config.parent),
+                )
+                os.close(backup_fd)
+                shutil.copy2(codex_config, backup_name)
+                backup = Path(backup_name)
+            existing = codex_config.read_text() if codex_config.exists() else ""
+            if existing and not existing.endswith("\n"):
+                existing += "\n"
+            new_content = existing + block
+            tmp_fd, tmp_name = tempfile.mkstemp(
+                prefix="config.toml.new.",
                 dir=str(codex_config.parent),
             )
-            os.close(backup_fd)
-            shutil.copy2(codex_config, backup_name)
-            backup = Path(backup_name)
-        existing = codex_config.read_text() if codex_config.exists() else ""
-        if existing and not existing.endswith("\n"):
-            existing += "\n"
-        new_content = existing + block
-        tmp_fd, tmp_name = tempfile.mkstemp(
-            prefix="config.toml.new.",
-            dir=str(codex_config.parent),
-        )
-        with os.fdopen(tmp_fd, "w") as f:
-            f.write(new_content)
-        os.replace(tmp_name, codex_config)
-        return backup
+            with os.fdopen(tmp_fd, "w") as f:
+                f.write(new_content)
+            try:
+                os.replace(tmp_name, codex_config)
+            except OSError as e:
+                if e.errno == errno.EXDEV:
+                    # Cross-FS rename (e.g. tmpdir on different mount). Fall back
+                    # to shutil.move which copies + unlinks. Loses atomicity but
+                    # we still hold the lock, so concurrent readers won't tear.
+                    shutil.move(tmp_name, codex_config)
+                else:
+                    raise
+            return backup
+    finally:
+        # Best-effort lock-file cleanup. The flock is released on file close
+        # above; unlinking the lock file itself prevents ~/.codex/ from
+        # accumulating stale lock artifacts across many init invocations.
+        try:
+            lock_path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def main(argv: list[str]) -> int:
@@ -180,13 +276,26 @@ def main(argv: list[str]) -> int:
         )
         return 1
 
-    block = render_block()
-    backup = append_atomically(codex_config, block)
-    if backup == Path():
+    # Resolve npx now (before any write). Refuse-with-error if absent —
+    # writing a registration that codex can't exec helps no one.
+    npx = shutil.which("npx")
+    if not npx:
+        print(
+            "ERROR: `npx` not on PATH; cannot write a working "
+            "[mcp_servers.context-mode] block. Install Node.js (which "
+            "ships npx) and re-run.",
+            file=sys.stderr,
+        )
+        return 4
+
+    block = render_block(npx)
+    result = append_atomically(codex_config, block)
+    if result is RACED:
         print("raced: another runner registered it under lock. no-op.")
         return 0
+    backup = result  # type: Optional[Path]
     print(f"registered context-mode for codex in {codex_config}")
-    if backup.name:
+    if backup is not None:
         print(f"  prior config backed up to {backup}")
     print(f"  detected Claude-side via: {provenance}")
     print("  block written:")

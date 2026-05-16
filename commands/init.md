@@ -22,7 +22,7 @@ Run in parallel:
   - Capture which sides are installed; report both.
 - Check context-mode install on **both sides**:
   - Claude-side: grep `~/.claude/settings.json` or `~/.claude.json` for an MCP server entry named `context-mode` (or run `claude mcp list 2>&1 | grep context-mode`). Captured: registered or not.
-  - Codex-side: grep `~/.codex/config.json` or `~/.codex/mcp.json` for `context-mode`. Captured: registered or not.
+  - Codex-side: parse `~/.codex/config.toml` (TOML, NOT JSON — codex v0.130.0 stores MCP servers under `[mcp_servers.X]` tables; the prior `.config.json` / `.mcp.json` filenames are stale). Inline-table form `mcp_servers = { context-mode = ... }` and quoted-key form `[mcp_servers."context-mode"]` are both valid; the auto-register script handles all three via tomllib parse. Captured: registered or not.
   - Plugin form: `[ -d ~/.claude/plugins/context-mode ]` may also be present.
   - Capture which sides registered; report both.
 
@@ -62,14 +62,20 @@ The setup script registers gstack on both Claude and codex sides. If only one si
 
 If `context-mode` MCP is missing on either side, offer install with a pointer to https://github.com/simonrowland/context-mode. Context-mode offloads large command outputs (diffs, test runs, greps, codex tails) to an FTS5 sandbox — a real multiplier on `/goal` loops where shell output fills context fast. Decline = note in summary that large-output handling falls back to direct Bash/Read.
 
-**Auto-register context-mode on codex side** (when Claude has it but codex doesn't — codex MCP registration is fiddly by hand). Run `python3 ~/.claude/skills/goal-flight/scripts/register-context-mode-codex.py`. The script:
+**Auto-register context-mode on codex side** (when Claude has it but codex doesn't — codex MCP registration is fiddly by hand). Resolve the script path:
+
+1. Try `~/.claude/skills/goal-flight/scripts/register-context-mode-codex.py` first (canonical install).
+2. If absent (plugin-form goal-flight install), `find ~/.claude/plugins -path '*goal-flight/scripts/register-context-mode-codex.py' 2>/dev/null | head -1`.
+3. If absent on both probes, skip with a note (controller is running with a partial / dev-only install).
+
+Then run: `python3 <resolved-path>` (and `--check` for state-only). The script:
 
 - Detects Claude-side install (explicit `mcpServers` entry OR plugin form under `~/.claude/plugins/`).
 - Skips if codex isn't installed, or if `~/.codex/config.toml` already has `[mcp_servers.context-mode]` (preserves user customization — does NOT clobber).
 - Writes the canonical npx form (`command = "<npx>"`, `args = ["-y", "context-mode@latest"]`) — bypasses the `${CLAUDE_PLUGIN_ROOT}` resolution problem (codex doesn't shell-expand that variable; the npm-published `context-mode` package is the portable form).
 - Backs up the existing TOML (collision-resistant suffix via `mktemp`) and writes atomically under `flock` so concurrent init invocations don't corrupt the file.
 
-Auto-runs without y/n — backup makes it recoverable; the user opted in by running `init`. Run `python3 .../register-context-mode-codex.py --check` for state-only (no writes). Tests at `tests/test-register-context-mode-codex.sh` cover fresh state, idempotency, no-clobber, plugin form, malformed JSON, and the backup path.
+Auto-runs without y/n — backup makes it recoverable; the user opted in by running `init`. Requires Python 3.11+ (script uses `tomllib` for TOML-aware existing-registration detection). Tests at `tests/test-register-context-mode-codex.sh` cover fresh state, idempotency, no-clobber, plugin form, malformed JSON, inline-table TOML form, commented-out form, non-dict JSON, missing-npx, and lock cleanup (15 assertions).
 
 **Register the project as codex-trusted** (one-time, idempotent — prevents codex MCP approval-gate stalls in non-interactive dispatches):
 

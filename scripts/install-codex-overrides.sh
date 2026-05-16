@@ -165,13 +165,26 @@ EOF
 
   # Auto-gitignore .codex/ — the project mirror contains absolute paths
   # specific to this machine; they're not portable across clones.
+  # Idempotent: recognizes existing entries in any of the common
+  # equivalent forms (`.codex`, `.codex/`, `/.codex/`, `.codex/*`) so a
+  # second run doesn't duplicate semantically-identical lines.
   GITIGNORE="$PROJECT_ROOT/.gitignore"
   if [ -d "$PROJECT_ROOT/.git" ] || [ -f "$PROJECT_ROOT/.git" ]; then
-    if [ ! -f "$GITIGNORE" ] || ! grep -qxF '.codex/' "$GITIGNORE"; then
-      if [ -f "$GITIGNORE" ] && [ "$(tail -c1 "$GITIGNORE" | wc -l | tr -d ' ')" != "1" ]; then
-        printf '\n' >> "$GITIGNORE"
+    already_ignored=0
+    if [ -f "$GITIGNORE" ] && grep -qE '^\s*/?\.codex(/(\*)?)?\s*$' "$GITIGNORE"; then
+      already_ignored=1
+    fi
+    if [ "$already_ignored" -eq 0 ]; then
+      if [ -f "$GITIGNORE" ]; then
+        # Ensure file ends in a newline before append (avoid line concatenation).
+        if [ "$(tail -c1 "$GITIGNORE" | wc -l | tr -d ' ')" != "1" ]; then
+          printf '\n' >> "$GITIGNORE"
+        fi
+        printf '\n# Per-machine codex trust mirror (absolute paths, not portable)\n.codex/\n' >> "$GITIGNORE"
+      else
+        # Fresh .gitignore — no leading blank line.
+        printf '# Per-machine codex trust mirror (absolute paths, not portable)\n.codex/\n' > "$GITIGNORE"
       fi
-      printf '\n# Per-machine codex trust mirror (absolute paths, not portable)\n.codex/\n' >> "$GITIGNORE"
       echo "gitignore:      appended .codex/ to ${GITIGNORE}"
     else
       echo "gitignore:      ${GITIGNORE} already lists .codex/"
