@@ -31,11 +31,11 @@ The controller dispatches `/goal` chunks to executor subagents, embeds adversari
 
 On `/goal-flight` invocation, the controller orients itself with three fast probes before responding to any sub-command. Silent on a fresh project; surfaces drift before it bites.
 
-1. **Skill version** — `cat ~/.claude/skills/goal-flight/VERSION` (or this skill's repo `VERSION`). Quote in the session's first non-trivial response so RESUME-NOTES forensics later can pin behaviour to a version.
-2. **In-flight state** — `ls -t docs-private/RESUME-NOTES-*.md 2>/dev/null | head -3`. If any exist within the past week and the user invoked something other than `resume` / `goal` / `init`, surface a one-line nudge: "RESUME-NOTES from <date> exists — run `/goal-flight resume` first?" The user redirects if they meant to start fresh.
-3. **Corpus drift** — if `docs-private/rag/` exists, read the oldest `verified-at:` SHA across slices; if `git rev-list --count <SHA>..HEAD` exceeds 20, surface "corpus is N commits stale — executors will verify aggressively or run `/goal-flight build-corpus --next-wave`."
+1. **Skill version** — try in order: `cat ~/.claude/skills/goal-flight/VERSION`, then any `VERSION` file beside a `SKILL.md` matching this skill (`find ~/.claude/plugins -path '*goal-flight/VERSION'` for plugin-form installs). Skip silently if neither resolves. Quote as `(goal-flight v<X.Y.Z>)` parenthetical in the session's first non-trivial response so RESUME-NOTES forensics can pin behaviour to a version.
+2. **In-flight state** — `find docs-private -maxdepth 1 -name 'RESUME-NOTES-*.md' -mtime -7 2>/dev/null | sort | tail -3` (mtime-filtered: only recent files trip the nudge; year-old RESUME-NOTES from a prior topic don't). If any match and the user invoked something other than `resume` / `goal` / `init`, surface a one-line nudge: "RESUME-NOTES from <date> exists — run `/goal-flight resume` first?" User redirects if they meant to start fresh.
+3. **Corpus drift** — if `docs-private/rag/` exists, read the oldest `verified-at:` SHA from slice frontmatter (format pinned in `templates/rag-corpus-schema.md.tpl` §Frontmatter — YAML frontmatter, lowercase `verified-at`, full 40-char SHA). If `git rev-list --count <SHA>..HEAD` exceeds 20, surface "corpus is N commits stale — executors will verify aggressively or run `/goal-flight build-corpus --next-wave`."
 
-A fresh project trips none of these. They cost ~50 ms and prevent silent staleness compounding across a 12-hour run.
+A fresh project trips none of these. They cost ~50 ms (~200 ms on slow-startup shells) and prevent silent staleness compounding across a 12-hour run.
 
 ## Sub-commands
 
@@ -78,7 +78,8 @@ Full spec: `prompts/dispatch-wrapper.md`. Target dispatch size: 3–5 KB, not 6�
 
 ### Codex reliability
 
-- **Register every project as codex-trusted** at init time via `scripts/install-codex-overrides.sh`. Without it, non-interactive `codex exec` blocks indefinitely on the first MCP tool call when context-mode (or any MCP server with `approval_mode = "approve"`) is registered. Trust is prefix-based; worktrees inherit automatically. See `commands/register-codex.md`.
+- **Register every project as codex-trusted** at init time via `scripts/install-codex-overrides.sh`. Without it, non-interactive `codex exec` blocks indefinitely on the first MCP tool call when context-mode (or any MCP server with `approval_mode = "approve"`) is registered — codex surfaces this as `request_user_input is not supported in exec mode for thread <id>` followed by silent retry loops. Trust registration auto-approves the call, dissolving the loop. Trust is prefix-based; worktrees inherit automatically. See `commands/register-codex.md`.
+- **Register context-mode on codex side** at init time via `scripts/register-context-mode-codex.py`. The script handles the plugin-form vs explicit-form detection on Claude side and writes the canonical `npx -y context-mode@latest` codex registration. Without it, `codex exec` works but loses the context-mode multiplier for that dispatch.
 - **Codex CLI ≥ 0.128.0** for `/goal` mode (older versions still work for reviews / consolidation / short-prompt dispatches — they just don't have the in-session loop primitive). Init step 1 checks the version and recommends `codex update` if older.
 - **Wrap `codex exec` in `timeout --kill-after=10 300`** for non-`/goal` dispatches. Codex v0.130.0 has no `--timeout` flag. 300 s is 10× observed p95 (~25 s healthy). **Do NOT** wrap `/goal` mode dispatches in `timeout 300` — they're multi-hour by design; the controller monitors the tail file for the Final response block to detect completion.
 - **Backstop watchdog** for residual stalls (network wedge, codex-internal hang): zero-output ≥ 90 s OR no-progress ≥ 180 s ⇒ kill + retry as Claude general-purpose subagent. Applies to short-prompt dispatches only; for `/goal` mode, long pauses during plan/act/test/iterate cycles are expected and the watchdog would false-positive.

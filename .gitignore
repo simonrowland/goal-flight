@@ -8,3 +8,7 @@
 # Private ongoing skill-development notes
 docs-private/
 
+# Codex per-project trust mirror — written by scripts/install-codex-overrides.sh.
+# Contains absolute paths specific to the local machine; not portable.
+.codex/
+
