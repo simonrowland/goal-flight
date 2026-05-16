@@ -163,12 +163,6 @@ goal-flight/
 │   └── README.md
 ```
 
-## Provenance
-
-Distilled from a sustained refactor session on a regolith pyrolysis simulator where the controller-pattern ran for ~12 hours across multiple chunked goals. The pattern proven there is what this skill formalizes. After a post-session audit found that controller-pasted "facts" in dispatch wrappers were going stale and being trusted by frontier-model executors, the wrapper philosophy was refactored to verification-first (scaffold investigation; don't substitute for it). The skill itself was stripped from ~230 KB of templates and per-pass prompt files to ~200 KB of gist + load-bearing shapes + helpers — frontier models compose the per-task specifics; the skill carries only what doesn't generalize from principle.
-
-The `/fork` self-delegation pattern was added after the strip, when empirical probing confirmed that `CLAUDE_CODE_SESSION_ID` is exposed to the model via Bash env and that `/fork` (or `--fork-session`) creates a new session ID — making it possible for a forked session to self-detect via a marker file the controller wrote pre-fork. Forks lack the task-notification callback Agent-tool subagents have, so the keyword-marker vocabulary (FORK-STATUS / FORK-RESULT / FORK-NEED / FORK-COMPLETE / FORK-BLOCKED) is the only return channel — controller polls the fork's JSONL for these strings.
-
 ## License
 
 MIT — see [LICENSE](LICENSE).
