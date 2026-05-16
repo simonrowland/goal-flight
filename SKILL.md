@@ -145,6 +145,15 @@ Default contract path: `docs-private/.fork-contract.json` (gitignored by default
 
 The keyword mechanism is the workaround for forks lacking a task-notification analog. Subagents (Agent tool) get a proper callback on completion; forks don't, so the fork must DELIBERATELY emit grep-able strings the controller polls for.
 
+**Resolving `FORK-NEED` (the fork asked a question; how does the controller reply?)** — forks similarly lack a clean inbound channel; there's no `--reply` flag that appends to a paused fork. Four options in order of cost:
+
+1. **`/rewind` + redo in the controller** (default, recommended). Rewind to before the fork; do the work in the controller with the answer baked in. Zero extra cost. The fork's partial work, if it committed anything, persists on disk and can be cherry-picked or referenced.
+2. **User manually replies in the fork window.** Switch to the fork's Claude Code window (or `claude --resume <fork-sid>` interactively) and type the reply. No cost; requires the user is at the keyboard. The fork resumes; the controller re-invokes `monitor` to keep watching.
+3. **Sidecar reply file** (cooperative — needs pre-arranged contract). Controller writes `docs-private/.fork-reply.md` with the answer; the fork's contract pre-instructs it to re-read this file on its next turn. Still needs an external trigger for the fork's next turn (either option 2 or option 4) — so doesn't fully eliminate the orchestration step, but lets the controller stage the reply asynchronously.
+4. **`scripts/self-fork-detect.sh reply <fork-sid-or-jsonl> '<reply prompt>'`** (API-billed; opt-in). Wraps `claude --resume <fork-sid> --print '<reply>'`. Fully automated but `claude --print` is API-billed (the antipattern goal-flight rejects for routine dispatches). Reasonable for occasional FORK-NEED resolution; expensive if hit on every chunk. The helper prints a 3-second cost warning before firing.
+
+The right pick is usually option 1 — by the time FORK-NEED fired, the fork has already paused and the controller has the user's attention; `/rewind` + redo is faster than wrestling with the fork's reply channel.
+
 When to use vs `[controller-direct]` vs Agent-tool subagent:
 
 - **`[controller-direct]`** — controller does the work inline. Best for trivial chunks (single-file, <30 LoC) OR when controller-state matters but the work is short.
