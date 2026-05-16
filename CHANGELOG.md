@@ -4,6 +4,66 @@ Notable changes to the goal-flight Claude Code skill. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are
 incremented when meaningful skill behaviour changes.
 
+## [0.2.8] — 2026-05-16
+
+Convergence-fix sweep against parallel adversarial reviews (codex challenge +
+grok adversarial; both HOLD with high confidence). The reviews caught a real
+P0 in the 0.2.5–0.2.7 dispatch-rule prose: the claim that "background dispatch
+ends the turn at dispatch; the harness re-surfaces completion as a new turn via
+task-notification" is true for Agent-tool `run_in_background: true` but FALSE
+for Bash `&` dispatches (`codex exec ... &`, `grok -p ... &`). Bash `&`
+launches the child and immediately exits the launcher Bash call — the harness
+sends a task-notification for the LAUNCHER's exit, not for the child's
+eventual completion. Without an explicit watcher, a codex/grok dispatch
+silently runs to ground with no callback to the controller.
+
+Outputs from the two reviews persisted at
+`docs-private/codex-challenge-2026-05-16.txt` and
+`docs-private/grok-adversarial-2026-05-16.txt`.
+
+### Fixed (P0)
+- **SKILL.md §Per-chunk loop dispatch rule** now splits Agent vs Bash
+  background mechanics explicitly. Agent: `run_in_background: true` and the
+  harness handles the completion-notification. Bash `&`: launcher exits
+  immediately; the controller must wire a watcher (`while kill -0 $PID
+  2>/dev/null; do sleep 15; done`) via `run_in_background: true` Bash so the
+  harness fires a notification when the watcher (and therefore the child)
+  exits. Documented as the canonical shape with a worked example.
+- **commands/execute.md** step 2 (b/c) updated to match: untagged-default
+  dispatch now explicitly says `run_in_background: true` for Agent OR `codex
+  exec ... &` + PID-capture + watcher for codex. Step c renamed from "Wait
+  for task-notification" to "End the dispatch turn" — the wait is structural
+  (the next turn fires on notification), not a polling loop.
+
+### Fixed (P1)
+- **SKILL.md §Session pre-flight probe 1 (fingerprint compute)**: now
+  surfaces multi-install ambiguity (clone-form AND plugin-form both present)
+  instead of silently picking clone-form. The fprint recipe also checks each
+  of the three behavior-bearing files exists before hashing; missing files
+  produce `fprint:incomplete(<paths>)` instead of a plausible-but-wrong
+  8-hex hash from partial content.
+- **SKILL.md §Session pre-flight probe 4 (drift detection)** now distinguishes
+  four outcomes: match (silent), no-header legacy (silent), malformed-header
+  (surface "cannot compare" with the raw line), differs (surface compact
+  forensics: source file, stored vs live, changed fields, and explicit
+  guidance for the backward-fprint / rollback case so "Skill drift" reads
+  correctly as "changed" not just "updated").
+- **SKILL.md §Don't** "Poll a background subagent" rule renamed and
+  clarified: "Poll an Agent-tool subagent's transcript or its `<output>`
+  JSONL." Explicitly carves out `kill -0 $PID` watching Bash-spawned codex /
+  grok children as the correct pattern (not banned by this rule).
+
+### Deferred (P2 — queued for 0.2.9 or later)
+- Conservative fallback for unknown-duration tool calls (current 10s rule
+  doesn't specify how to estimate before launch).
+- Soften the "cost ~50 ms" claim in §Session pre-flight intro (plugin-find
+  + multi-file hash can exceed that on slow trees).
+- Output-format robustness for `claude --version` and `npx context-mode
+  --version` probes (init.md captures whatever string the CLI prints).
+
+### Tests
+3 suites / 46 assertions remain green throughout.
+
 ## [0.2.7] — 2026-05-16
 
 Dispatch rule prose tightened — drop "foreground" mentions (it's the

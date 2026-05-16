@@ -21,15 +21,15 @@ For each non-DONE goal in the queue (in order):
 
 If the `docs-private/rag/` corpus exists, paste slice content per the slice-to-layer mapping in `prompts/dispatch-wrapper.md` — as starting hypotheses the executor verifies, not authoritative facts.
 
-**b. Execute the chunk.** Branch on chunk tags from `decompose-plan` step 2 (see `SKILL.md` §Three dispatch paths for the full decision matrix):
+**b. Execute the chunk** — dispatch in background per `SKILL.md` §Per-chunk loop dispatch rule (any >10s call backgrounds so the user's terminal doesn't hang). Branch on chunk tags from `decompose-plan` step 2 (see `SKILL.md` §Three dispatch paths for the full decision matrix):
 
-- **`[controller-direct]`** — controller inline: Read + Edit + run test subset + adversarial self-review (Layer 5 specialized against own diff). Skip steps c–d below; jump to commit. Use only for chunks tagged at decompose-plan time. Don't retag mid-execute — if a chunk turns out trickier, abort inline and fall through to the subagent path.
-- **`[goal-mode]`** — codex `/goal` mode (in-session loop) or external Opus/Grok iteration loop. Render `templates/codex-goal-prompt.md.tpl`; dispatch per the path chosen.
-- **Untagged (default)** — Claude Agent (`model: "opus"`, highest reasoning for code-writing chunks). Or codex via `timeout 300 codex exec '...'` if you want model-diversity for this chunk (codex auto-activates `/goal` mode on goal-shaped prompts when `features.goals = true`).
+- **`[controller-direct]`** — controller inline: Read + Edit + run test subset + adversarial self-review (Layer 5 specialized against own diff). Skip steps c–d below; jump to commit. Use only for chunks tagged at decompose-plan time AND expected to complete in seconds (the inline path blocks the parent thread). Don't retag mid-execute — if a chunk turns out trickier, abort inline and fall through to the subagent path.
+- **`[goal-mode]`** — codex `/goal` mode (in-session loop) or external Opus/Grok iteration loop. Render `templates/codex-goal-prompt.md.tpl`; dispatch per the path chosen (codex `/goal` via `codex exec -C <workdir> - < prompt.md > <tail-file> 2>&1 &` then watcher; external Opus/Grok loop is one background Agent or `grok -p &` per iteration).
+- **Untagged (default)** — Claude Agent with `run_in_background: true` and `model: "opus"`, OR codex via `codex exec '...' > /tmp/codex-<slug>.txt 2>&1 &` (capture PID, then dispatch a Bash watcher with `run_in_background: true` running `while kill -0 $PID 2>/dev/null; do sleep 15; done` so the harness can fire a task-notification when codex actually exits — codex's Bash `&` launcher exits immediately and does NOT itself produce a meaningful completion callback).
 
 **Fork primitives** are the heavier "branch the controller's state" tool when a chunk depends on session-loaded context AND you want a `/rewind`-able savepoint. See `SKILL.md` §Self-delegation via `/fork` for the full pattern (controller writes contract via `scripts/self-fork-detect.sh write`; fork detects via `detect`; monitor watches the marker vocabulary).
 
-**c. Wait** for executor's task-notification. Don't poll the transcript.
+**c. End the dispatch turn.** Emit a one-line status (`Dispatching chunk #N (\`<slug>\`). Agent task <id> / shell PID <pid> -> <output-path>.`) and stop. The next assistant turn fires when the task-notification arrives — from the Agent's own completion (for Agent dispatches) or from the watcher exiting (for Bash codex/grok dispatches). Don't poll Agent subagent transcripts; `kill -0` on the shell PID via a watcher Bash call is the right pattern for headless dispatches.
 
 **d. Verify diff briefly:** `git diff --stat` (scope contained?) + `git diff` first 200 lines (FORBIDDEN actions? mutator patterns the goal banned?) + run the test subset.
 

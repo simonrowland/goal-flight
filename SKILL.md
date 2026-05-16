@@ -1,6 +1,6 @@
 ---
 name: goal-flight
-version: 0.2.7
+version: 0.2.8
 description: "long-running unattended controller for chunked code work — init repo, decompose plan, anticipate questions, execute with embedded review and milestone gstack sweeps"
 allowed-tools:
   - Bash
@@ -31,18 +31,47 @@ The controller dispatches `/goal` chunks to executor subagents, embeds adversari
 
 On `/goal-flight` invocation, the controller orients itself with four fast probes before responding to any sub-command. Silent on a fresh project; surfaces drift before it bites.
 
-1. **Skill version + load-time fingerprint** — resolve the skill root: clone-form `~/.claude/skills/goal-flight/` first; plugin-form fallback `find ~/.claude/plugins -maxdepth 4 -type d -name goal-flight 2>/dev/null | head -1`. Skip silently if neither resolves. Compute the load-time fingerprint via this recipe (canonical home; other sites cite "per pre-flight recipe"):
+1. **Skill version + load-time fingerprint** — resolve the skill root. Enumerate **both** locations and surface ambiguity when both exist:
+   ```bash
+   CLONE_FORM=$( [ -d ~/.claude/skills/goal-flight ] && echo ~/.claude/skills/goal-flight )
+   PLUGIN_FORM=$(find ~/.claude/plugins -maxdepth 4 -type d -name goal-flight 2>/dev/null | head -1)
+   ```
+   If both resolve and differ: surface "Multiple goal-flight installs detected: <clone> AND <plugin>. The harness loaded one of them; this probe can't tell which. fprint may match the wrong tree." Then pick clone-form by convention (consistent baseline). If only one resolves, use it. If neither resolves, skip the probe silently.
+
+   Compute the load-time fingerprint via this recipe (canonical home; other sites cite "per pre-flight recipe"):
    ```bash
    SKILL_ROOT=<resolved-above>
-   VERSION=$(head -1 "$SKILL_ROOT/VERSION")
+   VERSION=$(head -1 "$SKILL_ROOT/VERSION" 2>/dev/null || echo missing)
    GIT_SHA=$(git -C "$SKILL_ROOT" rev-parse --short HEAD 2>/dev/null || echo no-git)
-   FPRINT=$(cat "$SKILL_ROOT/SKILL.md" "$SKILL_ROOT/commands/execute.md" "$SKILL_ROOT/prompts/dispatch-wrapper.md" 2>/dev/null | shasum -a 256 | awk '{print $1}' | head -c 8)
+   # Fail loud if any of the 3 behavior-bearing files is missing — partial installs
+   # would otherwise hash whatever cat succeeded in reading and emit a plausible-but-wrong fprint.
+   MISSING=""
+   for f in "$SKILL_ROOT/SKILL.md" "$SKILL_ROOT/commands/execute.md" "$SKILL_ROOT/prompts/dispatch-wrapper.md"; do
+     [ -f "$f" ] || MISSING="$MISSING ${f#$SKILL_ROOT/}"
+   done
+   if [ -n "$MISSING" ]; then
+     FPRINT="incomplete($MISSING)"
+   else
+     FPRINT=$(cat "$SKILL_ROOT/SKILL.md" "$SKILL_ROOT/commands/execute.md" "$SKILL_ROOT/prompts/dispatch-wrapper.md" | shasum -a 256 | awk '{print $1}' | head -c 8)
+   fi
    LOADED_LINE="Skill-loaded: ${VERSION}@${GIT_SHA} fprint:${FPRINT}"
    ```
-   Quote `LOADED_LINE` as a parenthetical in the session's first non-trivial response (e.g. `(Skill-loaded: 0.2.2@9ef12ae fprint:a1b2c3d4)`). The same line is written into goal-queue and RESUME-NOTES headers when those files are created (see `commands/decompose-plan.md` step 3 / `commands/init.md` step 3) and read back by probe 4 to detect updates mid-run.
+   Quote `LOADED_LINE` as a parenthetical in the session's first non-trivial response (e.g. `(Skill-loaded: 0.2.8@<sha> fprint:a1b2c3d4)`). The same line is written into goal-queue and RESUME-NOTES headers when those files are created (see `commands/decompose-plan.md` step 3 / `commands/init.md` step 3) and read back by probe 4 to detect updates mid-run. When `GIT_SHA=no-git` (plugin-form install with no `.git`) or `FPRINT=incomplete(...)`, that's information — record it as-is; downstream comparison should treat any non-no-git-non-incomplete change as drift.
 2. **In-flight state** — `find docs-private -maxdepth 1 -name 'RESUME-NOTES-*.md' -mtime -7 2>/dev/null | sort | tail -3` (mtime-filtered: only recent files trip the nudge; year-old RESUME-NOTES from a prior topic don't). If any match and the user invoked something other than `resume` / `goal` / `init`, surface a one-line nudge: "RESUME-NOTES from <date> exists — run `/goal-flight resume` first?" User redirects if they meant to start fresh.
 3. **Corpus drift** — if `docs-private/rag/` exists, read the oldest `verified-at:` SHA from slice frontmatter (format pinned in `templates/rag-corpus-schema.md.tpl` §Frontmatter — YAML frontmatter, lowercase `verified-at`, full 40-char SHA). If `git rev-list --count <SHA>..HEAD` exceeds 20, surface "corpus is N commits stale — executors will verify aggressively or run `/goal-flight build-corpus --next-wave`."
-4. **Skill-update drift** — when an in-flight goal-queue (`docs-private/*-goal-queue-*.md`) or RESUME-NOTES contains a `Skill-loaded:` header, compare it to the live `LOADED_LINE` from probe 1. If any of version / git sha / fprint differs, surface one line: `"Skill updated since this session loaded: <stored-line> -> <live-line>. Re-invoke /goal-flight to refresh SKILL.md, or read the section you need."` Then continue. Skip silently when (a) the lines match exactly, or (b) the file has no `Skill-loaded:` header at all (legacy file written before 0.2.2 shipped this convention — treat as no-data, not as drift).
+4. **Skill-update drift** — when an in-flight goal-queue (`docs-private/*-goal-queue-*.md`) or RESUME-NOTES contains a `Skill-loaded:` header, compare it to the live `LOADED_LINE` from probe 1. Three outcomes:
+   - **Match** (exact string equality): silent. No nudge.
+   - **No header**: legacy file written before 0.2.2 shipped this convention. Silent. Treat as no-data, not as drift.
+   - **Malformed header** (parse fails, version field missing, fprint not 8-hex or `incomplete(...)`): surface "Malformed Skill-loaded header in `<file>`: `<raw line>`. Cannot compare." Continue without further drift checks against this file.
+   - **Differs**: surface forensics, not just a vague "updated" message:
+     ```
+     Skill drift in <file>:
+       stored: Skill-loaded: 0.2.7@e3a7726 fprint:abcd1234
+       live  : Skill-loaded: 0.2.8@9f12ee01 fprint:ef567890
+       changed fields: version (0.2.7 -> 0.2.8), git_sha, fprint
+     Likely cause: skill repo advanced (git pull, edit, or new commit). Re-invoke /goal-flight to refresh SKILL.md, or read the section that changed. If versions match but fprint differs, the change was uncommitted or sub-version (in-repo edit between fprint capture and now). If versions and git_sha rolled BACKWARD relative to stored, the skill repo checked out a prior commit during this session — likely a deliberate rollback; "Skill drift" is the correct framing (read as "changed", not "updated"), the new line IS the current state, no action needed unless you want to fast-forward.
+     ```
+     One block per affected file (goal-queue and RESUME-NOTES are checked separately; both may fire). Format compactly when in pre-flight to avoid noise.
 
 A fresh project trips none of these. They cost ~50 ms (~200 ms on slow-startup shells) and prevent silent staleness compounding across a 12-hour run.
 
@@ -208,17 +237,37 @@ Controller works in the main worktree. Parallel-safe chunks each get `<repo>/.cl
 
 ### Per-chunk loop (canonical shape)
 
-**Dispatch rule**: any tool call expected to take more than ~10 seconds runs in background — so the user's terminal doesn't hang, allowing them to steer. `run_in_background: true` for Agent; `codex exec ... &` or `grok -p ... &` with redirection-to-file for Bash. Background dispatch ends the turn at dispatch; the harness re-surfaces completion as a new turn via task-notification.
+**Dispatch rule**: any tool call expected to take more than ~10 seconds runs in background — so the user's terminal doesn't hang, allowing them to steer.
 
-1. **Dispatch in background** (executor chunks are always long enough to qualify).
-2. **Emit one-line status, end the turn.** "Dispatching chunk #N (`<slug>`). Background task `<id>`." Do not chain chunk N+1's dispatch within this turn.
-3. **On completion turn** (triggered by task-notification): **verify the diff briefly** — scope contained, suite green, no leaked invariants. Executor's self-review already caught issues; you sanity-check.
+Two background mechanisms with different completion-notification properties:
+
+- **Agent tool** with `run_in_background: true` (also Skill() invocations the harness backgrounds): the harness sends a task-notification when the subagent completes; the controller resumes as a new turn automatically. No watcher needed.
+- **Bash `&` for headless dispatch** (`codex exec ... &`, `grok -p ... &`, `npx ... &`): the launcher Bash call exits **immediately after spawning the child**. The harness sends a task-notification for the launcher's exit, NOT for the child's eventual exit. To get a notification when the child actually completes, the controller must **wire a watcher**:
+
+```bash
+# 1. Launch the child, capture PID.
+codex exec ... > /tmp/codex-<slug>.txt 2>&1 &
+PID=$!
+echo "Dispatched codex PID=$PID -> /tmp/codex-<slug>.txt"
+
+# 2. Dispatch a watcher Bash call with run_in_background: true.
+while kill -0 $PID 2>/dev/null; do sleep 15; done
+echo "codex $PID exited"
+```
+
+The watcher's Bash call is what produces the eventual task-notification (it exits when the child PID is gone). Without the watcher, the controller's turn ends after step 1 and **no callback ever arrives for the child's completion** — the dispatch silently runs to ground and the controller looks "hung" between chunks.
+
+Per-chunk loop:
+
+1. **Dispatch in background.** Agent: `run_in_background: true`. Bash codex/grok: `&` + redirect, capture PID, dispatch watcher with `run_in_background: true`.
+2. **Emit one-line status, end the turn.** "Dispatching chunk #N (`<slug>`). Agent task `<id>` / shell PID `<pid>` -> `<output-path>`." Do not chain chunk N+1's dispatch within this turn.
+3. **On completion turn** (triggered by task-notification — from the Agent's completion, or from the watcher exiting when the Bash child exited): **verify the diff briefly** — scope contained, suite green, no leaked invariants. Executor's self-review already caught issues; you sanity-check. For Bash dispatches, `cat` / `ctx_search` the output file captured in step 1.
 4. **Commit** (one chunk = one commit). Parallel-mode: cherry-pick onto main.
 5. **Update the Progress table** in goal-queue + your visible state.
 6. **Look-ahead** — fire-and-forget Explore subagent (also background) reading the next 1–2 chunks for hidden dependencies or missing acceptance criteria.
 7. **Dispatch chunk N+1 in background, end the turn** (back to step 1).
 
-Exception: `[goal-mode]` loops own their own turn-boundaries (codex `/goal` runs multi-hour internally; external Opus/Grok loops tail-poll). In goal-mode the controller surfaces turns at iteration-cap or convergence only, not per-iteration.
+Exception: `[goal-mode]` loops own their own turn-boundaries (codex `/goal` runs multi-hour internally; external Opus/Grok loops tail-poll). In goal-mode the controller surfaces turns at iteration-cap or convergence only, not per-iteration. The watcher pattern still applies for the external-loop tail-poll case (each iteration is a separate Bash `&` + watcher pair).
 
 ### Progress table — keep this current
 
@@ -255,7 +304,7 @@ Dispatch mode is orthogonal to type — see §Per-chunk loop dispatch rule: back
 - Skip the diff verification because self-review reported clean.
 - Use `git merge --ff-only` to integrate parallel-worktree subagent commits. Cherry-pick.
 - Hand-write dispatch wrappers when the RAG corpus exists. Source layers 2/3/4 from the corpus with verification framing.
-- Poll a background subagent. Wait for `task-notification`.
+- Poll an Agent-tool subagent's transcript or its `<output>` JSONL. Agent dispatches deliver a task-notification on completion; wait for it. (This is NOT a ban on `kill -0 $PID` watching a Bash-spawned child like `codex exec ... &` or `grok -p ... &` — those need an explicit watcher to produce a notification at all; see §Per-chunk loop dispatch rule.)
 
 ### Don't (cont.) — date format + notifications + worker-context
 
