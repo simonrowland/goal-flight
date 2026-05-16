@@ -23,7 +23,7 @@ Raw goal text from the queue is NOT enough. Field-validated practice (55 dispatc
 Render the dispatch prompt as:
 
 ```
-\goal <SLUG>
+/goal <SLUG>
 
 [Layer 0 (MANDATORY when isolation: "worktree"): base-verification pre-flight per
  prompts/dispatch-wrapper.md "Layer 0". Capture the expected base SHA via
@@ -82,7 +82,7 @@ Read `prompts/dispatch-wrapper.md` for the full per-layer worked examples (sourc
   - **`[controller-direct]` is the everyday Claude path** for "too much context to explain" — when the controller already has the state and re-explaining to a fresh Agent-tool subagent would cost more than just doing the work inline. Agent-tool dispatches don't inherit controller context; the controller IS the agent that has it. `/fork` is the heavier primitive when you specifically want to BRANCH from the current state (e.g., preserve current progress while trying a risky approach).
 
 - **Untagged chunks (default)** — dispatch as Claude subagent via the Agent tool (general-purpose). Pass:
-  - `description`: short phrase like "Execute \\goal <SLUG>"
+  - `description`: short phrase like "Execute /goal <SLUG>"
   - `prompt`: the full dispatch prompt from (a)
   - `model`: `"opus"` for code-writing chunks (default for execute). Use the agent definition's default model for non-code chunks (planning, review writeups, docs prose).
   - The subagent works in the main worktree.
@@ -250,7 +250,7 @@ The controller spawns three distinct subagent types. Each has a different prompt
 
 | Type | Purpose | Recommended wrapper layers (per `prompts/dispatch-wrapper.md`) | Reports |
 |------|---------|---------------------------------------------------|---------|
-| **Executor** | Implement a `\goal` chunk; writes code, runs tests, commits. | All 5 (situational, template-pointer, file-anchors, env-caveats, goal-specific self-review). Plus `prompts/executor-self-review.md`. | `git diff --stat`, self-review findings (P0/P1/P2/P3), tests run, surprises. |
+| **Executor** | Implement a `/goal` chunk; writes code, runs tests, commits. | All 5 (situational, template-pointer, file-anchors, env-caveats, goal-specific self-review). Plus `prompts/executor-self-review.md`. | `git diff --stat`, self-review findings (P0/P1/P2/P3), tests run, surprises. |
 | **Reviewer** | Read-only adversarial pass over a commit range or a draft. | Layers 1+3 typically; layer 4 (env caveats) usually skipped because reviewers don't need test-environment fluency. Add layer 2 if reviewing a chunk that mirrors a specific canonical pattern. **Always include topic-filtered `decisions.md`** so the reviewer knows what was deliberately rejected and doesn't re-flag it. Plus `invariants.md` tail (always). | Findings list with file:line refs, P0/P1/P2/P3, confidence rating. |
 | **Planner** | Write a plan document to a pinned path; explicitly "NO code changes." | Layers 1+3 + the pinned deliverable path. **Always include topic-filtered `decisions.md`** so the planner doesn't re-open closed decisions. Plus `invariants.md` tail (always). The deliverable IS the output. | File path, word count, bottom-line recommendation, open questions. |
 

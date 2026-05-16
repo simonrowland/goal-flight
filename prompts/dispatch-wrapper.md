@@ -51,7 +51,7 @@ If a slice the mapping calls for doesn't exist (e.g. `patterns/<X>.md` was skipp
 ## Dispatch shape — minimal skeleton
 
 ```
-\goal <SLUG>
+/goal <SLUG>
 
 [Layer 0: pre-flight verification (mandatory for worktree dispatches)]
 

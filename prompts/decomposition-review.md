@@ -1,4 +1,4 @@
-You are reviewing a proposed decomposition of a plan into `\goal` chunks.
+You are reviewing a proposed decomposition of a plan into `/goal` chunks.
 The controller wants to know if this decomposition is ready for a long
 unattended execution run.
 

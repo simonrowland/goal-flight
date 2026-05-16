@@ -8,14 +8,14 @@ trigger: /goal-flight
 
 Turn a fresh Claude Code session into a **controller** for long-running, decomposed code work — refactors, multi-turn implement-from-architecture-doc, porting, recursive end-to-end testing, finite Ralph/Karpathy loops, scientific convergence against ground truth or first principles.
 
-The controller dispatches `\goal` chunks to executor subagents, embeds adversarial self-review in every dispatch, runs parallel codex+claude review sweeps at milestones (the "gstack" pattern), and writes dated handoff notes before context fills. Designed for ~12-hour unattended runs where you check in periodically rather than babysit.
+The controller dispatches `/goal` chunks to executor subagents, embeds adversarial self-review in every dispatch, runs parallel codex+claude review sweeps at milestones (the "gstack" pattern), and writes dated handoff notes before context fills. Designed for ~12-hour unattended runs where you check in periodically rather than babysit.
 
 ## Sub-commands
 
 ```
 /goal-flight                              # print this file
 /goal-flight init <topic>                 # check tooling, audit repo, scaffold AGENTS/docs-private/
-/goal-flight decompose-plan [<plan-file>] # break a plan into \goal chunks; review the decomposition
+/goal-flight decompose-plan [<plan-file>] # break a plan into /goal chunks; review the decomposition
 /goal-flight ask-questions [<scope>]      # spawn anticipatory subagents; surface clarifying questions
 /goal-flight execute [--parallel <N>]     # run the per-chunk loop
 /goal-flight build-corpus [<flags>]       # extend / rebuild the docs-private/rag/ corpus
@@ -36,7 +36,7 @@ If no args: print this file.
 
 - **Default to Claude Agent tool** (`model: "opus"`, highest reasoning) for code-writing chunks. Claude session billing, not API billing. **Never `claude -p`** — that consumes API billing.
 - **Codex `exec` is a peer dispatch target**, not just a reviewer. Use `Bash timeout 300 codex exec '<short pointer-shaped prompt>'` — keep the prompt short, pass file pointers (the agent reads what it needs at the time it needs it). The MCP approval-gate stall that otherwise breaks ~2/5 codex dispatches is solved at init by `scripts/install-codex-overrides.sh` (registers the project + its worktrees by path prefix as codex-trusted).
-- **Codex `/goal` mode** is a real CLI feature (codex ≥ 0.128.0, `features.goals = true` in `~/.codex/config.toml`). Multi-hour autonomous plan→act→test→iterate loop. Invocation: `codex exec -C <workdir> - < prompt.md`. The prompt shape (Objective + Workspace + Rules + Acceptance + Test gates + Final response schema — see `templates/codex-goal-prompt.md.tpl`) auto-activates the loop when goal-shaped. **`\goal` (backslash) is goal-flight's in-prompt text marker, not codex's `/goal`.** Backslash on the wrapper, forward-slash on codex's CLI feature — they're different things despite looking similar. The Opus / Grok iteration loops below use the same goal-prompt structure but run as external loops driven by the controller (one dispatch per iteration); only codex has the in-session `/goal` primitive.
+- **Codex `/goal` mode** is a real CLI feature (codex ≥ 0.128.0, `features.goals = true` in `~/.codex/config.toml`). Multi-hour autonomous plan→act→test→iterate loop. Invocation: `codex exec -C <workdir> - < prompt.md`. The prompt shape (Objective + Workspace + Rules + Acceptance + Test gates + Final response schema — see `templates/codex-goal-prompt.md.tpl`) auto-activates the loop when goal-shaped. **`/goal` is the unified chunk marker** — appears literally at the top of each chunk in the goal-queue and at the top of each dispatched prompt. To Claude Opus / Grok executors it's just an in-prompt text marker (read as labelled section heading); to codex executors with `features.goals = true` it activates the in-session goal-mode loop. Opus / Grok iteration loops use the same goal-prompt structure but run as external loops driven by the controller (one dispatch per iteration); only codex has the in-session `/goal` primitive. Earlier versions of this skill used `\goal` (backslash); the convention switched to `/goal` (forward slash) so codex auto-activates goal mode without the controller having to special-case the dispatch prefix.
 - **Three dispatch paths** (frontier models pick; the skill doesn't prescribe between Opus / codex / Grok):
   1. **`[controller-direct]`** — controller does the work inline. Two triggers: (a) trivially small (single-file, < ~30 LoC, no cross-module coupling); (b) controller already has the session-loaded state a fresh subagent would have to re-discover (mid-debug, just-consumed milestone-review P0, rolling decisions not yet in `decisions.md`). Heuristic for (b): a clean dispatch wrapper would exceed ~5 KB primarily because of context the controller already holds.
   2. **Single-shot subagent** — Agent tool (Claude) OR codex `exec` short-prompt OR `grok -p` short-prompt. One dispatch, executor reports done. The default path for most chunks. Frontier model picks the executor target based on chunk shape.
@@ -150,7 +150,7 @@ The keyword mechanism is the workaround for forks lacking a task-notification an
 1. **`/rewind` + redo in the controller** (default, recommended). Rewind to before the fork; do the work in the controller with the answer baked in. Zero extra cost. The fork's partial work, if it committed anything, persists on disk and can be cherry-picked or referenced.
 2. **User manually replies in the fork window.** Switch to the fork's Claude Code window (or `claude --resume <fork-sid>` interactively) and type the reply. No cost; requires the user is at the keyboard. The fork resumes; the controller re-invokes `monitor` to keep watching.
 3. **Sidecar reply file** (cooperative — needs pre-arranged contract). Controller writes `docs-private/.fork-reply.md` with the answer; the fork's contract pre-instructs it to re-read this file on its next turn. Still needs an external trigger for the fork's next turn (either option 2 or option 4) — so doesn't fully eliminate the orchestration step, but lets the controller stage the reply asynchronously.
-4. **`scripts/self-fork-detect.sh reply <fork-sid-or-jsonl> '<reply prompt>'`** (API-billed; opt-in). Wraps `claude --resume <fork-sid> --print '<reply>'`. Fully automated but `claude --print` is API-billed (the antipattern goal-flight rejects for routine dispatches). Reasonable for occasional FORK-NEED resolution; expensive if hit on every chunk. The helper prints a 3-second cost warning before firing.
+4. **`scripts/self-fork-detect.sh reply <fork-sid-or-jsonl> '<reply prompt>'`** (API-billed; opt-in). Wraps `claude --resume <fork-sid> --print '<reply>'`. Fully automated. Anthropic's prompt caching makes this cheaper than the "claude -p antipattern" framing implies — the fork's prior conversation is cached prefix at ~10% rate, only the new reply turn + response are full new-token cost. For a short "read this file and answer" reply, typically a few cents per FORK-NEED resolution. The blanket "claude -p antipattern" rule in this skill is about WHOLE-CONVERSATION new dispatches at API rates (where session-billing would be free), not short cached-prefix continuations. Still meaningfully more expensive than option 1 over a long run; pick per context.
 
 The right pick is usually option 1 — by the time FORK-NEED fired, the fork has already paused and the controller has the user's attention; `/rewind` + redo is faster than wrestling with the fork's reply channel.
 
@@ -192,7 +192,7 @@ Status legend: ✅ done · 🟡 in flight · queued · blocked · post-`<gate>`.
 
 | Type | Purpose | Wrapper layers | Reports |
 |------|---------|----------------|---------|
-| **Executor** | Implement a `\goal` chunk; writes code, runs tests, commits | All 5 (Layer 0 + Layers 1–5 per `prompts/dispatch-wrapper.md`) | `git diff --stat`, P0/P1/P2/P3 findings, tests run, surprises |
+| **Executor** | Implement a `/goal` chunk; writes code, runs tests, commits | All 5 (Layer 0 + Layers 1–5 per `prompts/dispatch-wrapper.md`) | `git diff --stat`, P0/P1/P2/P3 findings, tests run, surprises |
 | **Reviewer** | Read-only adversarial pass over a commit range or draft | Layers 1+3 typically; layer 4 if env-relevant; layer 2 if reviewing pattern-mirror work | Findings list with file:line refs, P0/P1/P2/P3, confidence |
 | **Planner** | Write a plan document to a pinned path; "NO code changes" | Layers 1+3 + pinned deliverable path | File path, word count, bottom-line recommendation, open questions |
 
@@ -227,6 +227,6 @@ Distinguishing them prevents the controller from giving a reviewer the full wrap
 ### `goal <SLUG>`
 1. Find the most recent goal-queue.
 2. Find the highest existing `## N.` goal number.
-3. Append: `## <N+1>. \goal <SLUG>` with SCOPE / CHECKLIST / ACCEPTANCE / FORBIDDEN skeleton; tags `[parallel-safe:<group>]` `[milestone]` `[controller-direct]` `[goal-mode]` `[max-iterations:<N>]` `[mixed-executor]` as applicable.
+3. Append: `## <N+1>. /goal <SLUG>` with SCOPE / CHECKLIST / ACCEPTANCE / FORBIDDEN skeleton; tags `[parallel-safe:<group>]` `[milestone]` `[controller-direct]` `[goal-mode]` `[max-iterations:<N>]` `[mixed-executor]` as applicable.
 4. Append a row to the Progress table: `| #<N+1> \`<SLUG>\` | TODO |`.
 5. Print the appended block.

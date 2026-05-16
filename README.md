@@ -6,7 +6,7 @@ A [Claude Code](https://claude.ai/code) skill for long-running unattended contro
 
 Turn a fresh Claude Code session into a **controller** that:
 
-- Decomposes a plan into numbered `\goal` chunks with structured SCOPE / CHECKLIST / ACCEPTANCE / FORBIDDEN
+- Decomposes a plan into numbered `/goal` chunks with structured SCOPE / CHECKLIST / ACCEPTANCE / FORBIDDEN
 - Dispatches each chunk to an **executor** — Claude Agent subagent (default), `codex exec` (`/goal` mode for multi-hour loops; short-prompt for reviews), or Grok via `grok -p`
 - Embeds adversarial self-review inside every dispatch (executor self-fixes P0/P1/P2 before reporting done)
 - Runs **parallel codex + claude review sweeps** at milestone cadence (the "gstack" pattern)
@@ -34,7 +34,7 @@ Then in a Claude Code session: `/goal-flight init <topic>` to start, or `/goal-f
                                      # registers the project as codex-trusted
                                      # if codex is installed
 
-/goal-flight decompose-plan          # breaks a plan into numbered \goal chunks
+/goal-flight decompose-plan          # breaks a plan into numbered /goal chunks
                                      # with SCOPE / CHECKLIST / ACCEPTANCE /
                                      # FORBIDDEN; parallel reviewer pass
 
@@ -68,7 +68,7 @@ bash scripts/self-fork-detect.sh monitor <jsonl>   # watch fork's progress
 |---------|--------------|
 | `/goal-flight` | Print `SKILL.md` |
 | `/goal-flight init <topic>` | Check tooling, audit repo via subagent, scaffold AGENTS / docs-private / RAG corpus |
-| `/goal-flight decompose-plan [<plan-file>]` | Break a plan into `\goal` chunks; parallel reviewer pass for the decomposition |
+| `/goal-flight decompose-plan [<plan-file>]` | Break a plan into `/goal` chunks; parallel reviewer pass for the decomposition |
 | `/goal-flight ask-questions [<scope>]` | Spawn anticipatory subagents; surface clarifying questions for the user |
 | `/goal-flight execute [--parallel <N>]` | Run the per-chunk loop; sequential default, parallel-safe opt-in |
 | `/goal-flight build-corpus [<flags>]` | Extend / rebuild the `docs-private/rag/` corpus after init |

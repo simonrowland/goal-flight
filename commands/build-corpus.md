@@ -33,7 +33,7 @@ Schema reference: `templates/rag-corpus-schema.md.tpl` (directory shape + per-sl
 
 - Modify the skill itself. If the slice schema needs to change, the user edits `templates/rag-corpus-schema.md.tpl` + the source-list table in `commands/init.md` step 3.5 — separate work.
 - Delete slices. Obsolete slices are removed manually.
-- Dispatch `\goal` work that USES the corpus. That's `/goal-flight execute`.
+- Dispatch `/goal` work that USES the corpus. That's `/goal-flight execute`.
 
 ## When NOT to invoke
 

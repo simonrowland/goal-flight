@@ -1,6 +1,6 @@
 # decompose-plan [<plan-file>]
 
-Break a plan into numbered `\goal` chunks. The plan source can come from:
+Break a plan into numbered `/goal` chunks. The plan source can come from:
 
 1. **A file path argument** — `/goal-flight decompose-plan docs-private/refactor-plan.md`
 2. **An in-context conversation** — no arg; the plan was discussed in this session (the user reviewed the plan with you and it's in the chat log)
@@ -26,13 +26,13 @@ Read `<repo-root>/docs-private/<topic>-goal-statement-*.md` (most recent).
 
 ### 2. Spawn drafter + analyst (sequential — analyst depends on drafter)
 
-**Drafter** (general-purpose Agent): produce the numbered `\goal` decomposition.
+**Drafter** (general-purpose Agent): produce the numbered `/goal` decomposition.
 
-> "Read the plan below. Decompose it into N self-contained `\goal` chunks. Each chunk must have SCOPE / CHECKLIST / ACCEPTANCE / FORBIDDEN sections (skeleton at the bottom of this prompt). Smallest-first; imperative voice. Number them 1..N. Surface anything in the plan that resists decomposition or requires controller-side judgement. Plan: <paste plan text or path>.
+> "Read the plan below. Decompose it into N self-contained `/goal` chunks. Each chunk must have SCOPE / CHECKLIST / ACCEPTANCE / FORBIDDEN sections (skeleton at the bottom of this prompt). Smallest-first; imperative voice. Number them 1..N. Surface anything in the plan that resists decomposition or requires controller-side judgement. Plan: <paste plan text or path>.
 >
 > Per-chunk skeleton:
 > ```
-> ## <N>. \goal <SLUG>
+> ## <N>. /goal <SLUG>
 > STATUS (optional — pin observed reality if goal is touched post-write)
 > SCOPE
 > <1-3 sentence problem + boundary; what module(s), what contract>
@@ -82,7 +82,7 @@ Write to `<repo-root>/docs-private/<topic>-goal-queue-<today>.md` with this shap
 Date: <today>
 Working directory: <repo-root>
 
-Each goal is a self-contained `\goal` dispatch directive. Read together with AGENTS.md, the binding-spec, and the plan of record.
+Each goal is a self-contained `/goal` dispatch directive. Read together with AGENTS.md, the binding-spec, and the plan of record.
 
 ## Progress (as of <today>, main @ <head>)
 | Goal | Status | Commit |
@@ -106,7 +106,7 @@ Tags (see SKILL.md for full definitions):
 - No silent fallback between providers on unit failure
 - <other AGENTS.md-derived invariants>
 
-## <N>. `\goal <SLUG>` (per-chunk skeleton from the drafter above)
+## <N>. `/goal <SLUG>` (per-chunk skeleton from the drafter above)
 ```
 
 If a same-day file exists, append new chunks numbered after the last existing entry (do not duplicate). Tags `[parallel-safe:<group>]` come from the analyst (step 2 above); other tags applied by analyst or controller as judgment dictates.
