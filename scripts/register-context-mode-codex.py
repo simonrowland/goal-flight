@@ -175,11 +175,19 @@ def append_atomically(
       - None if the write succeeded and no prior config existed (no backup).
       - Path(backup_file) if the write succeeded and a prior config was backed up.
     """
-    codex_config.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        codex_config.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        print(
+            f"ERROR: could not create {codex_config.parent} ({e}). "
+            "Check that ~/.codex/ exists as a directory (not a file) and is writable.",
+            file=sys.stderr,
+        )
+        sys.exit(3)
     lock_path = codex_config.parent / ".register-context-mode.lock"
     try:
         lock_file = open(lock_path, "w")
-    except PermissionError as e:
+    except OSError as e:
         print(
             f"ERROR: could not acquire lock at {lock_path} ({e}). "
             "Check ~/.codex/ permissions and re-run.",
