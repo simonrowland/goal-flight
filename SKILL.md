@@ -106,13 +106,26 @@ Use `scripts/self-fork-detect.sh`:
 ```bash
 # 1. Controller writes the contract BEFORE typing /fork:
 bash scripts/self-fork-detect.sh write '<task the fork should execute>'
+# Also captures a JSONL snapshot of ~/.claude/projects/ at this moment.
 
 # 2. After /fork (or `claude --resume <sid> --fork-session`), in the new session:
 bash scripts/self-fork-detect.sh detect
 # Prints one of: ORIGINAL | FORK | SUBAGENT | NO_CONTRACT
 # On FORK: also prints the task to execute + completion + abort signals.
 
-# 3. After the fork's work is committed:
+# 3. (Optional) Controller locates the fork's JSONL on disk:
+bash scripts/self-fork-detect.sh find-fork
+# Prints any top-level JSONLs that didn't exist at write time and
+# aren't the controller's own — fork candidates. Empty output =
+# no fork yet (wait 1-2s after the user types /fork, then retry).
+
+# 4. (Optional) Controller monitors the fork's progress live:
+bash scripts/self-fork-detect.sh monitor <fork-jsonl-path>
+# Polls the fork's JSONL (default every 5s), prints new assistant
+# text as it appears, exits on "FORK-COMPLETE" marker OR if the
+# JSONL stops growing for 120s (--idle-stop configurable).
+
+# 5. After the fork's work is committed:
 bash scripts/self-fork-detect.sh clear
 ```
 
