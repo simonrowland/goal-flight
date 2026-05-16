@@ -1,7 +1,24 @@
 ---
 name: goal-flight
+version: 0.2.0
 description: "long-running unattended controller for chunked code work — init repo, decompose plan, anticipate questions, execute with embedded review and milestone gstack sweeps"
-trigger: /goal-flight
+allowed-tools:
+  - Bash
+  - Read
+  - Edit
+  - Write
+  - Glob
+  - Grep
+  - Agent
+  - Skill
+  - TodoWrite
+  - AskUserQuestion
+triggers:
+  - /goal-flight
+  - start a long refactor
+  - begin chunked work
+  - set up controller for unattended run
+  - decompose this plan into goal chunks
 ---
 
 # /goal-flight
@@ -9,6 +26,16 @@ trigger: /goal-flight
 Turn a fresh Claude Code session into a **controller** for long-running, decomposed code work — refactors, multi-turn implement-from-architecture-doc, porting, recursive end-to-end testing, finite Ralph/Karpathy loops, scientific convergence against ground truth or first principles.
 
 The controller dispatches `/goal` chunks to executor subagents, embeds adversarial self-review in every dispatch, runs parallel codex+claude review sweeps at milestones (via [gstack](https://github.com/garrytan/gstack)'s `/review` skill when installed), and writes dated handoff notes before context fills. Designed for ~12-hour unattended runs where you check in periodically rather than babysit.
+
+## Session pre-flight (silent — surface only what fires)
+
+On `/goal-flight` invocation, the controller orients itself with three fast probes before responding to any sub-command. Silent on a fresh project; surfaces drift before it bites.
+
+1. **Skill version** — `cat ~/.claude/skills/goal-flight/VERSION` (or this skill's repo `VERSION`). Quote in the session's first non-trivial response so RESUME-NOTES forensics later can pin behaviour to a version.
+2. **In-flight state** — `ls -t docs-private/RESUME-NOTES-*.md 2>/dev/null | head -3`. If any exist within the past week and the user invoked something other than `resume` / `goal` / `init`, surface a one-line nudge: "RESUME-NOTES from <date> exists — run `/goal-flight resume` first?" The user redirects if they meant to start fresh.
+3. **Corpus drift** — if `docs-private/rag/` exists, read the oldest `verified-at:` SHA across slices; if `git rev-list --count <SHA>..HEAD` exceeds 20, surface "corpus is N commits stale — executors will verify aggressively or run `/goal-flight build-corpus --next-wave`."
+
+A fresh project trips none of these. They cost ~50 ms and prevent silent staleness compounding across a 12-hour run.
 
 ## Sub-commands
 
