@@ -37,13 +37,15 @@ the fix-up.
   next iteration trips over. Resolve the dependency surface up-front.
   Commit `f6bd2c5`.
 - **"Never wrap headless dispatches in an MCP tool call"** bullet in
-  SKILL.md §Codex reliability. Wrapping `codex exec` / `grok -p` /
-  `claude -p` inside `ctx_execute` (or any MCP tool call) hits the
-  MCP/context timeout — the controller sees a hang even though the
-  underlying process ran fine and exited. Pattern: Bash + `>` redirect
-  to a file, poll via `while kill -0 $PID; do sleep 15; done`,
-  `ctx_search` the captured output AFTER exit. Canonical upstream
-  capture: `montecarlo/AGENTS.md` §GStack Claude Reviews.
+  SKILL.md §Codex reliability. Wrapping `codex exec` or `grok -p`
+  inside `ctx_execute` (or any MCP tool call) hits the MCP/context
+  timeout — the controller sees a hang even though the underlying
+  process ran fine and exited; the output is stuck in the OS-captured
+  stdout the MCP wrapper never returned. Pattern: Bash + `>` redirect
+  to a file, poll via `while kill -0 $PID 2>/dev/null; do sleep 15;
+  done`, then `ctx_search` the captured output AFTER exit. (Claude
+  code-writing chunks go through the Agent tool per the Dispatch
+  model section — session billing, not API — never `claude -p`.)
 
 ### Changed
 - **README Quickstart now flags the DRAFT-goal gate** so first-time users
