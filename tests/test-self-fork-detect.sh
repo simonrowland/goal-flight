@@ -89,5 +89,65 @@ echo "test5 pass: clear removes the contract"
 "$SCRIPT" clear ".no-such-contract.json" >/dev/null 2>&1
 echo "test6 pass: clear on nonexistent contract exits cleanly"
 
+
+# Test 7: find-fork with no new JSONLs returns empty.
+if [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then
+  "$SCRIPT" write "test 7 task" ".fork-contract-7.json" >/dev/null
+  result=$("$SCRIPT" find-fork ".fork-contract-7.json" 2>&1)
+  if [ -z "$result" ]; then
+    echo "test7 pass: find-fork on fresh snapshot returns empty"
+  else
+    # Could be non-empty if another fork exists from earlier in the session;
+    # accept as long as it's a list of jsonl paths and doesn't error.
+    if echo "$result" | head -1 | grep -q "\.jsonl$"; then
+      echo "test7 pass: find-fork returned $(echo "$result" | wc -l | tr -d ' ') JSONLs (pre-existing forks from this session — acceptable)"
+    else
+      echo "test7 FAIL: unexpected find-fork output: $result"
+      exit 1
+    fi
+  fi
+fi
+
+# Test 8: find-fork detects a synthetic new JSONL.
+if [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then
+  PROJ_DIR="$HOME/.claude/projects"
+  # Create a synthetic JSONL with a fake session ID that didn't exist at write time.
+  FAKE_SID="ffff0000-test-test-test-${RANDOM}aaaa"
+  # Find or create the project subdir matching our cwd shape
+  SUBDIR=$(ls -d "$PROJ_DIR"/* 2>/dev/null | head -1)
+  if [ -z "$SUBDIR" ]; then
+    echo "test8 SKIP: no project dirs under ~/.claude/projects/"
+  else
+    FAKE_JSONL="$SUBDIR/${FAKE_SID}.jsonl"
+    echo '{"type":"prompt","message":{"role":"user","content":[{"type":"text","text":"FORK-COMPLETE: done"}]}}' > "$FAKE_JSONL"
+    result=$("$SCRIPT" find-fork ".fork-contract-7.json" 2>&1)
+    if echo "$result" | grep -q "$FAKE_SID"; then
+      echo "test8 pass: find-fork detects synthetic new JSONL"
+    else
+      echo "test8 FAIL: find-fork did not list $FAKE_JSONL"
+      echo "  output: $result"
+      rm -f "$FAKE_JSONL"
+      exit 1
+    fi
+    # Test 9: monitor sees FORK-COMPLETE and exits 0.
+    timeout 30 "$SCRIPT" monitor "$FAKE_JSONL" --poll 1 --idle-stop 5 > /tmp/monitor-test-out.txt 2>&1 &
+    MONITOR_PID=$!
+    sleep 2
+    # Append a fork-complete event (already in initial line, but make sure monitor reads it)
+    echo '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"FORK-COMPLETE: synthetic test done"}]}}' >> "$FAKE_JSONL"
+    wait "$MONITOR_PID" 2>/dev/null
+    rc=$?
+    if [ "$rc" = "0" ] && grep -q "FORK-COMPLETE" /tmp/monitor-test-out.txt; then
+      echo "test9 pass: monitor exits 0 on FORK-COMPLETE marker"
+    else
+      echo "test9 FAIL: monitor rc=$rc; output below:"
+      cat /tmp/monitor-test-out.txt
+      rm -f "$FAKE_JSONL" /tmp/monitor-test-out.txt
+      exit 1
+    fi
+    rm -f "$FAKE_JSONL" /tmp/monitor-test-out.txt
+  fi
+fi
+
 echo
-echo "all self-fork-detect tests passed (5-6 depending on whether \$CLAUDE_CODE_SESSION_ID was set)"
+echo "all self-fork-detect tests passed"
