@@ -90,6 +90,30 @@ Auto-runs without y/n — backup makes it recoverable; the user opted in by runn
 
 Today's date: use the conversation's `currentDate` value, format `YYYY-MM-DD`.
 
+### 1.5. Capture box capacity + ACP-worker availability
+
+Run the capacity probe and write the env-caveats file the dispatch wrapper Layer 4 will reference:
+
+```bash
+bash <skill-root>/scripts/probe-box-capacity.sh docs-private/env-caveats.md
+```
+
+Resolve `<skill-root>` per the same convention as the context-mode register script (Step 1 above):
+
+1. Canonical: `~/.claude/skills/goal-flight/scripts/probe-box-capacity.sh`
+2. Plugin form: `find ~/.claude/plugins -path '*goal-flight/scripts/probe-box-capacity.sh' 2>/dev/null | head -1`
+3. If absent on both, skip with a note in the summary — controller is on a partial install.
+
+The probe captures:
+
+- **Box RAM + CPU** (Mac `sysctl` / Linux `/proc/meminfo` + `nproc`).
+- **ACP-worker availability**: presence of `codex-acp`, `grok agent stdio`, `cursor-agent`, `claude-code-cli-acp` on PATH (and at xAI's non-PATH location for grok).
+- **Pool ceiling guidance**: derived from RAM and the measured worst-case worker RSS budget (cursor peak ~1.2 GB).
+
+Output is a Markdown file at `docs-private/env-caveats.md`. It's idempotent — re-run any time the box capacity or installed workers change. Dispatch-wrapper Layer 4 should reference rather than re-derive. (Per-worker billing-path detection — which subs / API keys default-route on this box — is forward work; for now, controllers can read `~/.codex/auth.json` / `~/.cursor/sub` / etc. directly when the routing decision matters.)
+
+If any ACP worker is missing, mention in the summary that goal-flight's `[acp]` dispatch path will fall through to Bash-`&`-tail-file for chunks targeting that worker. The skill works without ACP — it's a quality improvement, not a hard dep.
+
 ### 2. Audit the repo via subagent (controller does NOT read docs directly)
 
 **Spawn an Explore subagent** with the prompt at `prompts/repo-audit.md`. Substitute `{{TOPIC}}` and the repo root. The subagent reads README, AGENTS.md (if exists), `docs/`, recent git log, top-level test directories, package manifests. It returns a precis (project name, 3-5 hard invariants, file map, conversation/commit style, existing AGENTS.md status, tooling).
@@ -105,23 +129,17 @@ The user shouldn't need to remind future sessions what the point of `<topic>` is
 
 **If the user's reply is concrete** (>2 sentences, names a measurable outcome, identifies a user/system that benefits): proceed directly to write the goal-statement file.
 
-**If the goal is fuzzy or abstract** ("just clean up X", "modernize Y", "fix the foo issue"): flag this and recommend interrogation. Three paths in priority order:
+**If the goal is fuzzy or abstract** ("just clean up X", "modernize Y", "fix the foo issue"): flag this and recommend interrogation. **Architectural rule**: user-interrogation runs on the orchestrator (this Claude Code session) because that's the only surface the user is on. Workers (codex `exec`, Agent-tool subagents, `grok -p`) are invisible to the user — they have no channel to ask anything. Never delegate the interrogation to a worker; codex-side gstack is for codex-as-reviewer (e.g., `/plan-eng-review`), not codex-as-interrogator. Two paths in priority order:
 
-1. **gstack `/office-hours` Claude-side direct** (preferred — fastest, no codex round-trip):
+1. **gstack `/office-hours` Claude-side direct** (preferred — uses gstack's YC-style forcing questions verbatim, runs in this same conversation so questions surface to the user):
    > "The goal is fuzzy — recommend running gstack `/office-hours` to interrogate. It'll ask the YC forcing questions: who's the user, what's the demand, narrowest wedge, etc. I can invoke it directly via the Skill tool. Run now? (y/n)"
    
-   If yes: invoke `Skill(skill: "office-hours", args: "<topic-context>")`. Capture output and distill into the goal-statement file.
+   If yes: invoke `Skill(skill: "office-hours", args: "<topic-context>")`. The Skill tool runs office-hours **in this conversation** — its questions surface to the user via the orchestrator's normal asking-channel, answers come back the same way. Distill into the goal-statement file.
 
-2. **gstack `/office-hours` via codex** (when only codex-side install exists):
-   > "Same as above, but `/office-hours` isn't registered on the Claude side here — I'll invoke it via `timeout 300 codex exec '/office-hours <topic-context>'`. Run now? (y/n)"
-   
-   If yes: dispatch and capture stdout. Distill into the goal-statement file.
+2. **Orchestrator embodies the YC gist directly** (when gstack is absent on the Claude side, OR when the goal is more narrowly-focused than `/office-hours`'s startup framing fits):
+   The controller (this skill's Claude Code session — the orchestrator with the conversational surface to the user) asks the YC forcing questions in its own assistant text, in order: (1) Who specifically benefits when this is done? (2) What demand or pain triggered this now? (3) What's the narrowest wedge that proves it works? (4) What's the success criterion you'd test against? (5) What's explicitly NOT in scope? Drives to a one-paragraph goal statement + measurable success criteria.
 
-3. **Local YC-style subagent fallback** (when gstack is absent on both sides):
-   Spawn a Claude subagent (Agent tool) with this prompt:
-   > "You're running a YC-style office-hours interrogation. The user is starting work on `<topic>`. From the conversation context, their starting fuzzy goal is: `<paraphrase>`. Ask them, in order: (1) Who specifically benefits when this is done? (2) What demand or pain triggered this now? (3) What's the narrowest wedge that proves it works? (4) What's the success criterion you'd test against? (5) What's explicitly NOT in scope? Drive to a one-paragraph goal statement + measurable success criteria. Output as fields ready to populate `templates/goal-statement.md.tpl`."
-
-**Write the goal-statement** to `<repo-root>/docs-private/<topic>-goal-statement-<today>.md` with this shape (compose; no template file):
+**Write the goal-statement** to `<repo-root>/docs-private/goal-<topic>-<today>.md` (new naming as of 0.3.0; the `goal-` / `goal-queue-` / `premises-` prefix lets the three artifacts cluster together when scrolling `docs-private/`). Legacy `<topic>-goal-statement-<today>.md` files from <0.3.0 are still read by downstream commands but no longer written. Shape (compose; no template file):
 
 ```
 # <TOPIC> — Goal Statement
@@ -143,7 +161,7 @@ Status: <CONCRETE | DRAFT — <reason>>
 <bulleted; the negative space>
 ```
 
-This is the load-bearing anchor; subsequent commands cite it. If the user defers ("figure that out later"): write a stub with `Status: DRAFT — needs sharpening` and decompose-plan will refuse to proceed without sharpening.
+This is a load-bearing anchor — but **not a rigid gate**. Subsequent commands (decompose-plan, execute) read it as one signal among many (alongside the plan source, architecture doc, and in-session conversation). If the user defers ("figure that out later"): write a stub with `Status: DRAFT — <reason>` and surface it as an inline-office-hours backlog item later; do NOT block subsequent commands on the DRAFT marker — decompose-plan proceeds on whatever signal is available and surfaces the unresolved questions as premise-checks (see `SKILL.md` §Inline office-hours and `commands/decompose-plan.md` step 0).
 
 ### 3. Scaffold
 
@@ -189,9 +207,10 @@ Branch: <branch> @ <head>
 
 ## Reading order on wake
 1. AGENTS.md
-2. docs-private/<topic>-goal-statement-<today>.md
-3. docs-private/<topic>-goal-queue-<date>.md
-4. <next: whatever is queued>
+2. docs-private/goal-<topic>-<today>.md  (or legacy <topic>-goal-statement-<today>.md from <0.3.0)
+3. docs-private/goal-queue-<topic>-<date>.md  (or legacy <topic>-goal-queue-<date>.md from <0.3.0)
+4. docs-private/premises-<topic>-<date>.md  (if any; see SKILL.md §Inline office-hours)
+5. <next: whatever is queued>
 
 ## Decisions log (append-only)
 One line per mid-run decision resolved (Q → A → why). Lets a resuming controller see settled questions without re-asking them, and prevents oscillation when later chunks re-surface the same ambiguity.
@@ -249,9 +268,11 @@ For init: spawn the pipeline now. Each pass uses Claude subagents (Opus for code
 Pass-specific briefs (controller composes from these on dispatch — frontier model fills in details):
 
 - **Pass 1 (builders, parallel)**: read source paths from the table above; produce slice file at schema-defined path; frontmatter `verified-at: <current-HEAD>`. ~10 concurrent max; 4–6 slices for small projects, 10–15 for larger.
-- **Pass 2 (reviewers, parallel, one per slice)**: read slice + sources; verify grep patterns against actual code; score 1–5 (Factual / Complete / Voice / Dispatch-ready); P0/P1/P2 findings. Block Pass 3 until P0+P1 patched.
-- **Pass 3 (consolidator, one Opus pass)**: pass all corpus file absolute paths; identify cross-slice contradictions, deduplicate, refresh `verified-at` on slices reviewed-but-not-rebuilt. Codex fallback only if Opus unavailable.
-- **Pass 4 (assessment, one Opus pass)**: aggregate scores into quality dashboard; recommend next-wave priorities; issue CORPUS IS DISPATCH-READY / NEEDS-MORE-ITERATION verdict. Dashboard → RESUME-NOTES; priorities → drive future `/goal-flight build-corpus --next-wave`.
+- **Pass 2 (reviewers, parallel, one per slice)**: read slice + sources; verify grep patterns against actual code; score 1–5 (Factual / Complete / Voice / Dispatch-ready); P0/P1/P2 findings. Block Pass 3+4 until P0+P1 patched.
+- **Pass 3+4 (parallel Opus, two concurrent dispatches when workload permits)** — the two passes share inputs (Pass-1 slices + Pass-2 scores) and don't depend on each other's outputs except for the final verdict, so they run concurrently by default; fall back to serial only when running both in parallel would exceed Claude session-limit headroom (e.g., several goal-flight runs already converging on the same rate-limit). Codex fallback only if Opus unavailable.
+  - **Pass 3 (consolidator)**: pass all corpus file absolute paths; identify cross-slice contradictions, deduplicate, refresh `verified-at` on slices reviewed-but-not-rebuilt. Returns: contradiction list, deduplicated slice content.
+  - **Pass 4 (assessment)**: aggregate Pass-2 scores into quality dashboard; recommend next-wave priorities. Returns: dashboard, prioritized rebuild queue.
+  - **Final composition** (controller inline, once both return): write the dashboard to RESUME-NOTES; surface next-wave priorities for `/goal-flight build-corpus --next-wave`; issue the CORPUS IS DISPATCH-READY / NEEDS-MORE-ITERATION verdict — DISPATCH-READY requires Pass 3's contradiction list is empty AND Pass 4's mean score ≥ threshold (configurable, default 4.0).
 
 **Outcome**: `docs-private/rag/` is populated, reviewed, scored. Future dispatches reference these slices as starting hypotheses (per `prompts/dispatch-wrapper.md` corpus integration); controller's context budget preserved for integration / requirements adjudication / orientation calls.
 
@@ -300,7 +321,7 @@ If the self-review finds gaps, surface them to the user as a TODO comment block 
 - Context-mode version (if registered, with the side(s) where the registration was found — e.g. `1.0.135 (claude+codex)`).
 - gstack install status (installed / installed-during-init / declined — using fallback prompts).
 - Audit subagent's high-level findings (project type, invariant count, AGENTS.md status).
-- Goal statement status (concrete / interrogated-via-office-hours / DRAFT — sharpen before execute).
+- Goal statement status (concrete / interrogated-via-office-hours / DRAFT — DRAFT is fine, subsequent commands will surface the open questions as inline-office-hours backlog items; no gate).
 - AGENTS.md auto-read directive: where it landed (project CLAUDE.md / global CLAUDE.md / already-present / declined-and-relying-on-skill-invocation).
 - Self-review TODOs (if any), with the AGENTS.md location they'll appear at.
-- Suggested next step: `/goal-flight decompose-plan <plan-file>` (or "decompose the plan you already discussed in this session"). If goal-statement is DRAFT: "decompose-plan will refuse until the goal is sharpened."
+- Suggested next step: `/goal-flight decompose-plan <plan-file>` (or "decompose the plan you already discussed in this session"). Goal-statement state doesn't block this step — DRAFT goals proceed, with the unresolved questions surfaced as inline-office-hours backlog items during execution.

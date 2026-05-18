@@ -15,7 +15,7 @@ your findings will be consolidated with theirs.
 CONTEXT
 - Repo: <repo-root>
 - Commit range: <start-hash>..<end-hash>
-- Goal-queue file: <path to docs-private/<topic>-goal-queue-*.md>
+- Goal-queue file: <path to docs-private/goal-queue-<topic>-*.md, or legacy <topic>-goal-queue-*.md from <0.3.0>
 - Reference docs: <list paths to AGENTS.md, any binding-spec or plan-of-record>
 - Recent commits (newest first):
 

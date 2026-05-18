@@ -1,0 +1,309 @@
+"""Smoke test: vendored ACP client + ergonomic runner against the echo-agent fixture.
+
+Proves end-to-end JSON-RPC over stdio works in pure Python (no external worker
+CLIs, no auth, no network). Also unit-tests the marker extractor against a
+synthetic worker-output sample, and the PID-identity safety check that
+defends ghost cleanup against PID reuse.
+
+Run: `python test/test_acp_pipe.py`
+Expect: `OK: acp pipe + runner + markers + pidfile safety`
+"""
+
+import asyncio
+import json
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT / "scripts"))
+
+from acp_client import AcpConnection, AcpProcessPool, _ps_meta  # noqa: E402
+from acp_pool import compute_pool_ceiling, managed_pool  # noqa: E402
+from acp_runner import extract_markers, run_prompt  # noqa: E402
+
+FIXTURE = REPO_ROOT / "test" / "fixtures" / "acp_echo_agent.py"
+PIDFILE_DIR_TEST = Path("/tmp/goal-flight-acp-pids-test.d")
+
+
+async def smoke_echo() -> None:
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, str(FIXTURE),
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        limit=8 * 1024 * 1024,
+    )
+    # Exercise the async context manager — close_gracefully() runs on exit.
+    async with AcpConnection(agent="echo", session_id="test-1", proc=proc, verbose=False) as conn:
+        init = await conn.initialize()
+        assert init["agentInfo"]["name"] == "echo-agent", f"unexpected init: {init}"
+        await conn.session_new(cwd="/tmp")
+
+        result = await run_prompt(conn, "hello", idle_timeout=10)
+        assert result.ok, f"not ok: stop_reason={result.stop_reason!r} error={result.error}"
+        assert result.text == "echo: hello", f"unexpected text: {result.text!r}"
+        assert result.thoughts == "", f"unexpected thoughts: {result.thoughts!r}"
+        assert result.tool_calls == [], f"unexpected tool_calls: {result.tool_calls}"
+    # Outside the async-with: conn is closed, process should have exited.
+    assert proc.returncode is not None, "echo-agent process did not exit after close_gracefully()"
+
+
+def smoke_markers() -> None:
+    # Codex emits unwrapped markers; verify the canonical case.
+    sample = (
+        "preamble noise\n"
+        "STATUS: probing config\n"
+        "RESULT: kind=count value=4\n"
+        "RESULT: kind=file path=/tmp/x.txt\n"
+        "STATUS: writing\n"
+        "COMPLETE: 1 file written\n"
+        "trailing noise\n"
+    )
+    markers = extract_markers(sample)
+    assert markers.get("STATUS") == ["probing config", "writing"], markers
+    assert markers.get("RESULT") == ["kind=count value=4", "kind=file path=/tmp/x.txt"], markers
+    assert markers.get("COMPLETE") == ["1 file written"], markers
+    assert "USER-NEED" not in markers, markers
+
+    # Grok wraps the marker tag in markdown bold: `**STATUS:** ...`
+    # The regex was DESIGNED to tolerate this; lock the behavior in.
+    grok_sample = (
+        "**STATUS:** investigating buggy.py\n"
+        "**RESULT:** pytest_pass=true\n"
+        "**COMPLETE:** test fixed in one edit\n"
+    )
+    grok_markers = extract_markers(grok_sample)
+    assert grok_markers.get("STATUS") == ["investigating buggy.py"], grok_markers
+    assert grok_markers.get("RESULT") == ["pytest_pass=true"], grok_markers
+    assert grok_markers.get("COMPLETE") == ["test fixed in one edit"], grok_markers
+
+    # Mixed: same worker emits a tagged-and-tail-emphasized line ("**STATUS:** foo **").
+    # The regex strips trailing emphasis via .rstrip("* \t").
+    mixed_sample = (
+        "**STATUS:** doing work **\n"
+        "USER-NEED: clarify the constant\n"
+        "*BLOCKED:* network unreachable\n"  # single-asterisk emphasis variant
+    )
+    mixed = extract_markers(mixed_sample)
+    assert mixed.get("STATUS") == ["doing work"], mixed
+    assert mixed.get("USER-NEED") == ["clarify the constant"], mixed
+    assert mixed.get("BLOCKED") == ["network unreachable"], mixed
+
+
+def smoke_pidfile_safety() -> None:
+    """Three cases against the per-controller pidfile-dir scheme:
+      A) pidfile entry (from a dead "controller") whose worker started_at/cmd
+         no longer match the live PID -> SKIPPED (PID-reuse defense)
+      B) pidfile entry whose worker identity DOES match -> KILLED (orphan reaping)
+      C) pidfile from a LIVE controller (other goal-flight run) -> SKIPPED entirely
+         (concurrent-controller defense; we never touch another live run's workers)
+
+    "Dead controller" simulated via a definitely-dead PID (sys.maxsize) as the
+    pidfile name; "live controller" simulated via PID 1 (init/launchd).
+    """
+    import shutil
+    DEAD_CONTROLLER_PID = sys.maxsize  # impossible to be a live PID
+
+    def _setup_pool() -> AcpProcessPool:
+        PIDFILE_DIR_TEST.mkdir(parents=True, exist_ok=True)
+        pool = AcpProcessPool(agents_config={})
+        pool._pidfile_dir = PIDFILE_DIR_TEST
+        return pool
+
+    # Case A: stale entry, bystander must survive.
+    bystander_a = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    try:
+        time.sleep(0.5)
+        assert _ps_meta(bystander_a.pid) is not None, "case-A bystander died early"
+        stale_entry = {
+            "pid": bystander_a.pid,
+            "pgid": bystander_a.pid,
+            "started_at": "Sun Jan  1 00:00:00 2000",  # obviously wrong
+            "cmd": "ghost-from-the-past",
+            "agent": "fake",
+            "session_id": "stale",
+        }
+        pool = _setup_pool()
+        (PIDFILE_DIR_TEST / f"{DEAD_CONTROLLER_PID}.jsonl").write_text(json.dumps(stale_entry) + "\n")
+        killed = pool.cleanup_ghosts()
+        assert killed == 0, f"case A: cleanup killed {killed} (expected 0)"
+        assert bystander_a.poll() is None, "case A: bystander was killed! safety check failed!"
+    finally:
+        try:
+            bystander_a.terminate(); bystander_a.wait(timeout=2)
+        except Exception:
+            try: bystander_a.kill()
+            except Exception: pass
+        shutil.rmtree(PIDFILE_DIR_TEST, ignore_errors=True)
+
+    # Case B: matching entry, bystander must be killed.
+    bystander_b = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    try:
+        time.sleep(0.5)
+        live = _ps_meta(bystander_b.pid)
+        assert live is not None, "case-B bystander died early"
+        live_lstart, live_comm = live
+        valid_entry = {
+            "pid": bystander_b.pid,
+            "pgid": bystander_b.pid,  # start_new_session=True makes pid == pgid (session leader)
+            "started_at": live_lstart,
+            "cmd": live_comm,
+            "agent": "test",
+            "session_id": "valid-orphan",
+        }
+        pool = _setup_pool()
+        (PIDFILE_DIR_TEST / f"{DEAD_CONTROLLER_PID}.jsonl").write_text(json.dumps(valid_entry) + "\n")
+        killed = pool.cleanup_ghosts()
+        assert killed == 1, f"case B: cleanup killed {killed} (expected 1)"
+        time.sleep(0.5)
+        assert bystander_b.poll() is not None, "case B: bystander not killed — cleanup happy path broken"
+    finally:
+        try:
+            bystander_b.terminate(); bystander_b.wait(timeout=2)
+        except Exception:
+            try: bystander_b.kill()
+            except Exception: pass
+        shutil.rmtree(PIDFILE_DIR_TEST, ignore_errors=True)
+
+    # Case C: pidfile from a LIVE controller (another goal-flight run) — must be
+    # skipped entirely. Even if the worker identity matches, don't touch another
+    # live run's workers.
+    bystander_c = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    try:
+        time.sleep(0.5)
+        live = _ps_meta(bystander_c.pid)
+        assert live is not None, "case-C bystander died early"
+        live_lstart, live_comm = live
+        entry = {
+            "pid": bystander_c.pid,
+            "pgid": bystander_c.pid,
+            "started_at": live_lstart,
+            "cmd": live_comm,
+            "agent": "test",
+            "session_id": "live-controller-protect",
+        }
+        pool = _setup_pool()
+        LIVE_OTHER_PID = 1  # init/launchd — always alive on macOS/Linux
+        (PIDFILE_DIR_TEST / f"{LIVE_OTHER_PID}.jsonl").write_text(json.dumps(entry) + "\n")
+        killed = pool.cleanup_ghosts()
+        assert killed == 0, f"case C: cleanup killed {killed} (expected 0 — live controller's workers must not be touched)"
+        assert bystander_c.poll() is None, "case C: bystander was killed! concurrent-controller defense failed!"
+        assert (PIDFILE_DIR_TEST / f"{LIVE_OTHER_PID}.jsonl").exists(), "case C: live controller's pidfile was consumed!"
+    finally:
+        try:
+            bystander_c.terminate(); bystander_c.wait(timeout=2)
+        except Exception:
+            try: bystander_c.kill()
+            except Exception: pass
+        shutil.rmtree(PIDFILE_DIR_TEST, ignore_errors=True)
+
+
+def smoke_pool_ceiling() -> None:
+    """Verify compute_pool_ceiling against synthetic env-caveats files."""
+    cases = [
+        # (ram_mb, expected_ceiling) — formula: (ram - 2048) // 1200, capped at 20, floor 1
+        (8192,  5),   # 8 GB → (8192-2048)/1200 = 5
+        (16384, 11),  # 16 GB → (16384-2048)/1200 = 11
+        (32768, 20),  # 32 GB → would be 25, capped at 20
+        (131072, 20), # 128 GB → would be 107, capped at 20
+        (1024, 1),    # 1 GB → headroom negative, floors to 1
+    ]
+    test_path = Path("/tmp/goal-flight-env-caveats-test.md")
+    try:
+        for ram_mb, expected in cases:
+            content = f"# test fixture\n- RAM: {ram_mb/1024:.1f} GB ({ram_mb} MB total)\n"
+            test_path.write_text(content)
+            got = compute_pool_ceiling(test_path)
+            assert got == expected, f"ram_mb={ram_mb}: expected {expected}, got {got}"
+
+        # Missing file → falls back to conservative ceiling (4).
+        # Rationale: hard_cap=20 would spawn ~24 GB worst-case (cursor mix) on
+        # an unknown box; 4 is safe on most laptops including small Macs.
+        test_path.unlink()
+        got = compute_pool_ceiling(test_path)
+        assert got == 4, f"missing file: expected 4 (conservative fallback), got {got}"
+
+        # Malformed file → also conservative fallback
+        test_path.write_text("garbage content with no RAM line\n")
+        got = compute_pool_ceiling(test_path)
+        assert got == 4, f"malformed file: expected 4 (conservative fallback), got {got}"
+    finally:
+        test_path.unlink(missing_ok=True)
+
+
+async def smoke_managed_pool() -> None:
+    """Verify managed_pool() async context manager spawns + cleans up cleanly.
+
+    Uses the echo-agent fixture (no real worker CLI needed).
+    """
+    fixture_str = str(FIXTURE)
+    agents_config = {
+        "echo": {
+            "command": sys.executable,
+            "acp_args": [fixture_str],
+            "working_dir": "/tmp",
+        },
+    }
+    # Don't install signal handlers in tests — main thread re-entrancy gets messy.
+    async with managed_pool(agents_config, install_signal_handlers=False) as pool:
+        conn = await pool.get_or_create("echo", "managed-test", cwd="/tmp")
+        # echo-agent doesn't have a ping method and returns method-not-found,
+        # which AcpConnection.ping() treats as "still alive" — verify.
+        assert await conn.ping(timeout=3), "managed_pool: echo conn not alive after get_or_create"
+        assert pool.stats["total"] == 1, pool.stats
+        captured_proc = conn.proc
+    # After context exit: pool drained, conn killed
+    assert captured_proc.returncode is not None, "managed_pool: conn proc not killed on context exit"
+
+
+async def smoke_idle_cleanup() -> None:
+    """managed_pool's background idle-cleanup task should reap connections
+    whose last_active is older than the configured TTL.
+
+    Defends against the rate-limit-retry RAM-burn scenario: long runs that
+    spawn distinct session_ids leave idle workers behind without active
+    culling. Especially load-bearing for claude-class workers (~614 MB RSS).
+    """
+    fixture_str = str(FIXTURE)
+    agents_config = {
+        "echo": {
+            "command": sys.executable,
+            "acp_args": [fixture_str],
+            "working_dir": "/tmp",
+        },
+    }
+    async with managed_pool(
+        agents_config,
+        install_signal_handlers=False,
+        idle_cleanup_ttl_seconds=1.0,        # tiny TTL for test
+        idle_cleanup_interval_seconds=0.5,   # rapid scan
+    ) as pool:
+        conn = await pool.get_or_create("echo", "idle-test", cwd="/tmp")
+        captured_proc = conn.proc
+        # Force last_active into the past so the cleanup loop trips on the next scan
+        conn.last_active = time.time() - 5.0
+        # Wait long enough for the background task to scan + cull
+        await asyncio.sleep(1.5)
+        assert captured_proc.returncode is not None, (
+            "idle-cleanup: connection should have been reaped after TTL"
+        )
+        assert pool.stats["total"] == 0, (
+            f"idle-cleanup: pool still reports {pool.stats['total']} active "
+            "after cleanup_idle should have run"
+        )
+
+
+async def main() -> None:
+    await smoke_echo()
+    smoke_markers()
+    smoke_pidfile_safety()
+    smoke_pool_ceiling()
+    await smoke_managed_pool()
+    await smoke_idle_cleanup()
+    print("OK: acp pipe + runner + markers + pidfile safety + pool ceiling + managed pool + idle cleanup")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

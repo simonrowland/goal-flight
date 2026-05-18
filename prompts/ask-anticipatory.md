@@ -5,7 +5,7 @@ stall waiting for input.
 
 CONTEXT
 - Repo: <repo-root>
-- Goal queue: <path to docs-private/<topic>-goal-queue-*.md>
+- Goal queue: <path to docs-private/goal-queue-<topic>-*.md, or legacy <topic>-goal-queue-*.md from <0.3.0>
 - AGENTS.md: <path>
 - Plan / binding spec / refactor-plan (if any): <paths>
 - Scope of this anticipation: <decomposition | <area> | current-chunk | next-chunks>

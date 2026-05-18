@@ -2,6 +2,8 @@
 
 A [Claude Code](https://claude.ai/code) skill that turns a fresh session into a **controller** for long, decomposed code work. Claude Code runs out of context on multi-chunk refactors when one agent does everything; goal-flight delegates concrete work to /goal subagents with review loops, and keeps the controller small, so multi-hour unattended runs land as a clean stack of one-commit-per-chunk on main without the controller's context window filling up.
 
+**What the controller is for**: high-level management, not execution. The controller holds enough context about your project's goal, scenery (constraints, architecture, prior decisions, failure modes), and intent to exercise discretion and recommend the next move — then dispatches actual work to workers (Claude subagents, codex, grok) that don't need that context. This is the frontier of lightly-supervised development: you check in, ratify suggested moves, redirect when needed, and trust the controller to keep the project anchored across compactions and unattended hours. The dispatch / review / handoff machinery below is what frees the controller to do that job.
+
 ```bash
 git clone https://github.com/simonrowland/goal-flight.git ~/.claude/skills/goal-flight
 ```
@@ -11,7 +13,7 @@ git clone https://github.com/simonrowland/goal-flight.git ~/.claude/skills/goal-
 - **Multi-hour unattended runs.** Check in periodically or respond to decision notifications. The controller's context primarily holds architecture, plan, and metadata (queue state, recent commits, in-flight dispatch headers); real work happens in subagent context windows.
 - **Verification-first dispatch.** Wrappers point at files for the agent to investigate, not pre-pasted "facts" that go stale on the timescale of minutes. Frontier models trust controller-text uncritically; pointers force them to re-verify against live disk and surface drift.
 - **Parallel codex + claude reviews at milestone cadence.** Two independent reviewers (Claude + codex) address bugs and completion before pestering you. Via [gstack](https://github.com/garrytan/gstack)'s `/review` skill when installed.
-- **Three dispatch paths** the controller picks from per chunk, not one rigid loop — controller-inline for trivial chunks, single-shot subagent for the common case, multi-hour goal-mode loop (codex `/goal` or controller-driven iteration) for chunks that need it.
+- **Three dispatch paths** the controller picks from per chunk, not one rigid loop — controller-inline for trivial chunks, single-shot subagent for the common case, multi-hour goal-mode loop (codex `/goal` or controller-driven iteration) for chunks that need it. Each can run over either Bash-`&`-tail-file (default fallback) or ACP (Agent Client Protocol) when the target worker speaks it — ACP gets structured events + persistent sessions + sub-billing through most adapter paths.
 
 ## How it differs from the alternatives
 
@@ -24,16 +26,19 @@ git clone https://github.com/simonrowland/goal-flight.git ~/.claude/skills/goal-
 ```bash
 # In your project repo, in a Claude Code session:
 /goal-flight init <topic>         # audit repo, scaffold AGENTS.md + docs-private/,
-                                  # build optional RAG corpus, register codex-trust
+                                  # build optional RAG corpus, register codex-trust,
+                                  # probe box capacity + ACP-worker availability →
+                                  # docs-private/env-caveats.md
 /goal-flight decompose-plan       # break the plan into /goal chunks (SCOPE / CHECKLIST
                                   # / ACCEPTANCE / FORBIDDEN), parallel reviewer pass
-/goal-flight execute              # per-chunk dispatch loop, embedded self-review,
+/goal-flight execute              # per-chunk dispatch loop (ACP when available, else
+                                  # Bash-&-tail-file), embedded self-review,
                                   # milestone codex+claude reviews every K commits
 /goal-flight resume               # rebuild RESUME-NOTES from current git state
                                   # (use when picking up across sessions)
 ```
 
-> **Heads up**: `init` asks for a concrete high-level goal. If you defer with a fuzzy one ("modernize the codebase", "clean up the API"), init writes a `DRAFT` stub and `decompose-plan` will refuse until you sharpen it. Two ways forward: (1) re-run `init` and accept the gstack `/office-hours` interrogation; or (2) edit `docs-private/<topic>-goal-statement-<today>.md` and flip `Status: DRAFT — ...` to `Status: CONCRETE`, then re-run `decompose-plan`. The gate exists so 6-hour unattended runs don't drift from a goal that was never pinned.
+> **Working signal, not rigid gates**: the skill pins a `goal-<topic>-<date>.md` file at init for compaction-survival, but it's an anchor — not a contract. `decompose-plan` proceeds on whatever signal exists (the goal-statement when present, or the plan source, architecture doc, and in-session conversation), surfacing any inferred assumptions as inline-office-hours backlog items the user can validate during the run. Show up with "here's my architecture doc plus ten minutes of context-setting chat" and the skill takes it from there. The premises file accumulates validated answers as the run progresses. **DRAFT goal-statement is fine** — `decompose-plan` proceeds anyway; sharpen any time by editing `docs-private/goal-<topic>-<date>.md` directly.
 
 `/goal-flight` with no args prints `SKILL.md` — the full pattern reference.
 
@@ -73,7 +78,7 @@ The skill doesn't prescribe between Opus, codex, and Grok within a path — fron
 
 ## Companion tools (strongly recommended)
 
-- **[gstack](https://github.com/garrytan/gstack)** — Gary Tan's skill pack provides `/review`, `/office-hours`, `/plan-eng-review`, `/cso`, `/investigate` for both Claude Code and codex. Goal-flight invokes `/review` for milestone reviews and `/office-hours` for fuzzy-goal interrogation at init. **Optional** — without gstack, goal-flight falls back to local prompts at `prompts/gstack-claude-review.md` + `prompts/gstack-codex-challenge.md` (and embedded executor self-review still catches most issues). With gstack installed, you get consistent severity-ranking framing across both review lenses, which is meaningfully higher quality on long runs.
+- **[gstack](https://github.com/garrytan/gstack)** — Garry Tan's skill pack provides `/review`, `/office-hours`, `/plan-eng-review`, `/cso`, `/investigate` for both Claude Code and codex. Goal-flight invokes `/review` for milestone reviews and `/office-hours` for fuzzy-goal interrogation at init. **Optional** — without gstack, goal-flight falls back to local prompts at `prompts/gstack-claude-review.md` + `prompts/gstack-codex-challenge.md` (and embedded executor self-review still catches most issues). With gstack installed, you get consistent severity-ranking framing across both review lenses, which is meaningfully higher quality on long runs.
 - **[context-mode](https://github.com/simonrowland/context-mode)** — MCP plugin that offloads large command outputs (diffs, integration test runs, codex tail files, large greps) to an FTS5 sandbox queried by pattern. The multiplier that makes 12-hour unattended runs feasible — without it, tool-output fills the controller's context fast and you hit compaction early.
 
 ## Adapting

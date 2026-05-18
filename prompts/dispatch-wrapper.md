@@ -24,7 +24,7 @@ PRE-FLIGHT (before reading the rest):
 
 **If the executor reports "Base mismatch, Aborting":** the controller-side check should have prevented this, but if it slipped through — the dispatch is aborted (no commit). Recover by: (a) running the controller-side check + worktree-reset above to fix the worktree, then (b) re-dispatching the same chunk. Don't try to cherry-pick a drifted-base commit; it won't merge cleanly downstream.
 
-## Layers 1–5 — scaffold, don't substitute
+## Layers 1–6 — scaffold, don't substitute
 
 The other layers follow the same principle: point at what to investigate; let the executor discover and verify.
 
@@ -35,12 +35,13 @@ The other layers follow the same principle: point at what to investigate; let th
 | 3 — File anchors | File-map / binding-spec slice paths | "Use as navigation map. Verify every file:line you rely on with Read/Grep before depending on it. Flag drift in your report." |
 | 4 — Environment caveats | Verification commands + only what the agent can't discover | If the agent can find it with Read/Bash in <5s, the controller should NOT pre-paste it. If the agent CAN'T (test-env oddity, out-of-band convention, deliberate-skip-that-looks-like-bug), paste it. |
 | 5 — Self-review categories | The 7 abstract categories from `prompts/executor-self-review.md` (INVARIANT GAP / SCOPE LEAK / MUTATION PURITY / BEHAVIOR DRIFT / DEAD CODE / CONTRACT LEAK / INTEGRITY) | Abstract scaffold in the PROMPT; executor SPECIALIZES in the REPORT, not pre-pasted. |
+| 6 — Marker vocabulary | The worker message-passing contract: emit `STATUS:`, `RESULT:`, `USER-NEED:`, `USER-CONFIRM:`, `BLOCKED:`, `COMPLETE:` lines as needed. See `SKILL.md` §Worker message passing. | One-line instruction in the prompt: "Emit marker lines per SKILL.md §Worker message passing when you hit ambiguous points, need user input, or finish." Workers without this instruction guess and proceed silently. |
 
 **Frontier models compose excellent dispatch prompts from these principles alone.** No worked examples here — they calcify around one project's idioms and over-prescribe for others. The principle generalizes; the examples don't.
 
 ## Triviality bypass
 
-Trivial single-file chunks (< ~30 LoC delta, no new public surface, no cross-module coupling): Layers 0 + 1 + abstract Layer 5 suffice. Skip 2/3/4. Same threshold for `[controller-direct]` (see `SKILL.md`): if the chunk genuinely qualifies, the controller can do the work inline with no subagent at all.
+Trivial single-file chunks (< ~30 LoC delta, no new public surface, no cross-module coupling): Layers 0 + 1 + abstract Layer 5 + the one-line Layer 6 marker instruction suffice. Skip 2/3/4. Same threshold for `[controller-direct]` (see `SKILL.md`): if the chunk genuinely qualifies, the controller can do the work inline with no subagent at all (and the marker convention is moot — controller-direct has no marker channel because the controller IS the worker).
 
 ## Corpus integration
 
@@ -72,6 +73,15 @@ Report format: see prompts/executor-self-review.md.
 Read AGENTS.md (or worker-context.md if it exists) before starting — treat as starting hypothesis you verify against current code.
 ```
 
-## Target size
+## Prompt size — entry path matters
 
-3–5 KB per dispatch, not 6–11 KB. The size reduction is the empirical test that the refactor delivered. If you're composing a 10 KB dispatch prompt against this checklist, you've regressed to pre-paste-style — examine which "facts" you're handing the executor that they could discover themselves.
+Two distinct entry paths to codex goal-mode loops:
+
+- **Interactive `/goal` slash command** (user types `/goal` in an interactive codex session and pastes the goal text): **~4000-character limit on the goal text — codex bounces longer inputs.** This is the limit the skill's prior prose was citing. Applies when a human is hand-driving codex.
+- **Non-interactive `codex exec -C <workdir> - < prompt.md`** (the path goal-flight actually uses for `[goal-mode]` chunks per `templates/codex-goal-prompt.md.tpl`): **no 4k limit.** Empirical probe with codex 0.130.0 + gpt-5.5 (2026-05-17) accepted a 4407-char prompt cleanly, echoing back all four anchor strings spread across the prompt (probe: `/tmp/codex-goal-size-probe.md` → `/tmp/codex-goal-probe.out`). No bounce, no truncation.
+
+Since goal-flight dispatches via the non-interactive path, the 4k limit doesn't bind on the controller's automated dispatches. It DOES bind on the human-paste path (if you ever hand-drive codex `/goal` interactively for ad-hoc work — keep the goal text under 4k or split into multiple steps).
+
+The **real constraint on the non-interactive path is verification-first hygiene**: pre-paste prompts that hand the executor "facts" go stale on the timescale of minutes; frontier models trust controller-pasted text uncritically; large dispatch prompts almost always indicate the controller is over-explaining rather than pointing the executor at what to read. Bigger prompt = more rope to over-paste with. Across all dispatch shapes (codex non-interactive / exec, Agent tool, `grok -p` / `/implement`, ACP), the principle is the same: **points, not pre-paste**. The size discipline is a smell test for that principle, not a mechanical truncation budget.
+
+Other dispatch shapes (Agent, grok, codex `exec '<inline>'`, ACP) have harness/CLI limits in the 8K–200K char range — well above any prompt the verification-first wrapper should produce. The failure mode there isn't "executor never saw the rest of the prompt"; it's "drift from intent over the run because the prompt over-asserted."
