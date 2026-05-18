@@ -5,8 +5,9 @@
 #   - _VERSION literal (upstream read from ../VERSION; goal-flight has no such file)
 #   - log namespace "acp-bridge.acp_client" -> "goal-flight.acp_client"
 #   - clientInfo.name "acp-bridge" -> "goal-flight"
-#   - pidfile path /tmp/acp-bridge-pids -> /tmp/goal-flight-acp-pids (namespace separation
-#     so both bridges can coexist on the same host without trampling ghost-cleanup state)
+#   - pidfile path /tmp/acp-bridge-pids -> /tmp/goal-flight-acp-pids.d/ (namespace separation
+#     so both bridges can coexist on the same host without trampling ghost-cleanup state;
+#     the .d/ suffix reflects the per-controller-PID directory scheme below)
 #   - auto_allow_tools: bool = False field on AcpConnection; gates the
 #     session/request_permission auto-reply. Upstream auto-allows every tool call
 #     unconditionally — fine for chat-bridge use, bad for a controller that wants
@@ -692,13 +693,33 @@ class AcpProcessPool:
                     skipped_stale += 1
                     continue
                 pgid = entry.get("pgid", pid)
-                try:
-                    os.killpg(pgid, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
+                agent = entry.get("agent", "")
+                # Process-group safety for bash-tail entries: a worker launched
+                # via `codex exec ... &` in non-interactive bash inherits the
+                # PARENT SHELL'S pgroup (the controller's). killpg(controller_pgid,
+                # SIGKILL) would then kill the controller and every sibling worker
+                # in its group. The watcher records pgid best-effort but cannot
+                # promise the worker is a session leader (macOS lacks /usr/bin/setsid,
+                # so the bash-tail recipe in commands/execute.md doesn't enforce
+                # isolation by default).
+                # Defense: for bash-tail entries (agent suffix `-bash-tail`),
+                # only killpg when pgid == pid (worker IS its own session leader).
+                # Otherwise fall back to single-pid kill — slower if the worker
+                # has child processes but safe.
+                is_bash_tail = agent.endswith("-bash-tail")
+                if is_bash_tail and pgid != pid:
                     try:
                         os.kill(pid, signal.SIGKILL)
                     except (ProcessLookupError, PermissionError):
                         continue
+                else:
+                    try:
+                        os.killpg(pgid, signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError):
+                        try:
+                            os.kill(pid, signal.SIGKILL)
+                        except (ProcessLookupError, PermissionError):
+                            continue
                 log.warning(
                     "ghost_cleanup: killed pid=%d pgid=%d agent=%s session=%s (from dead controller pid=%d)",
                     pid, pgid, entry.get("agent", "?"), entry.get("session_id", "?"), controller_pid,

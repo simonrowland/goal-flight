@@ -4,6 +4,84 @@ Notable changes to the goal-flight Claude Code skill. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are
 incremented when meaningful skill behaviour changes.
 
+## [0.3.2] — 2026-05-18
+
+Hardening release — pre-push audit of the 0.3.0 + 0.3.1 stack. Folds three
+P0s and several P1s surfaced by a third reviewer pass (Claude + codex
+hardening reviewers) before pushing to a public repo. The `review-before-commit`
+rule extended to `review-before-push` because both 0.3.0 and 0.3.1 had
+remaining defects that prior passes missed.
+
+### Fixed (P0)
+
+- **`scripts/watch-dispatch-tail.sh:79` bash 4+ `${var,,}` defect**:
+  macOS default bash is 3.2 (Apple stopped updating because GPLv3). The
+  watcher's missing-required-arg error path used `${required,,}` (lowercase
+  substitution, bash 4+) which produced a "bad substitution" runtime error
+  on bash 3.2 and fell through to exit 1 instead of EX_USAGE (64). Replaced
+  with an explicit per-var `case` mapping (the var→flag table is small
+  enough that this is cleaner than calling out to `tr`). Also added
+  integer-validation for `--pid` and `--controller-pid` (non-integer values
+  previously produced invalid JSON in the pidfile body) and an explicit
+  `command -v python3` preflight (silent missing-python3 previously
+  produced empty JSON-escape output and a malformed pidfile body).
+- **Watcher EXIT trap unconditionally removed pidfile, orphaning live
+  workers**. When the watcher exited on **idle-timeout** (code 2) or
+  **controller-dead** (code 3), the worker was still alive but the EXIT
+  trap removed the pidfile — leaving no record for `cleanup_ghosts()` to
+  reap on the next controller startup. Refactored to
+  `cleanup_pidfile_on_exit()` which preserves the pidfile when the worker
+  PID is still alive at exit (any of: marker-then-wind-down, idle-wedge,
+  controller-died-worker-survived, SIGTERM-of-watcher-while-worker-runs).
+  cleanup_ghosts then reaps the orphan correctly on next controller start.
+  Surfaced by codex hardening reviewer; missed by both prior reviewer
+  passes and by my own test coverage.
+- **`cleanup_ghosts()` `killpg` hazard for bash-tail entries**. Bash-tail
+  workers spawned via `cmd &` in non-interactive bash INHERIT the parent
+  shell's pgroup (the controller's). The prior `cleanup_ghosts()` called
+  `os.killpg(pgid, SIGKILL)` unconditionally — which on a shared-pgroup
+  bash-tail entry would kill the controller and every sibling worker.
+  Defense added: for `agent.endswith("-bash-tail")` entries, only `killpg`
+  when `pgid == pid` (worker IS its own session leader); otherwise fall
+  back to single-pid kill. macOS lacks `/usr/bin/setsid` so the bash-tail
+  recipe in commands/execute.md doesn't enforce isolation by default; the
+  `cleanup_ghosts` defense is the safety net. Surfaced by codex hardening
+  reviewer.
+
+### Fixed (P1)
+
+- **`SKILL.md` documentation drift**: three sites (lines 143, 348, 371-380)
+  still described the old inline `while kill -0 $PID` polling pattern that
+  0.3.1's `scripts/watch-dispatch-tail.sh` replaced. Refreshed to point at
+  the canonical watcher recipe with all four exit-code semantics.
+- **`commands/execute.md:27` `[goal-mode]` codex shape missing
+  `--dangerously-bypass-approvals-and-sandbox` flag**: contradicted the
+  template at `templates/codex-goal-prompt.md.tpl:6-8` (which has the flag
+  and is empirically documented as required). A reader following the inline
+  shape literally would dispatch without the flag and see codex emit
+  `BLOCKED:` on first edit. Fixed the inline shape to mirror the template.
+
+### Tests
+
+- **`tests/test-watch-dispatch-tail.sh`** expanded from 10 to 19 assertions.
+  New coverage:
+  - Case 1b: marker received + worker also dead → pidfile REMOVED
+    (verifies the trap correctly removes when worker is gone, not just
+    preserves when alive).
+  - Case 3 pidfile assertion: idle-timeout exit → pidfile PRESERVED
+    (worker still alive, wedged; cleanup_ghosts must be able to reap it).
+  - Case 4 pidfile assertion: controller-dead exit → pidfile PRESERVED
+    (load-bearing path codex hardening reviewer specifically called out).
+  - Case 5a/5b/5c: argument validation under explicit `/bin/bash` (macOS
+    bash 3.2). Verifies exit 64 on missing args, exit 64 on non-integer
+    `--pid` / `--controller-pid`, and confirms no "bad substitution"
+    leak from bash-4-only parameter expansion patterns.
+
+### Tests run
+
+- 6 passed / 0 failed (3 bash legacy + 1 bash hardening + 2 Python).
+- Watcher suite now 19 assertions, up from 10.
+
 ## [0.3.1] — 2026-05-18
 
 Patch release adding **content-aware completion watcher** for the `[bash-tail]`
