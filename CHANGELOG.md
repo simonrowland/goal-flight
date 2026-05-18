@@ -4,6 +4,73 @@ Notable changes to the goal-flight Claude Code skill. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are
 incremented when meaningful skill behaviour changes.
 
+## [0.3.1] — 2026-05-18
+
+Patch release adding **content-aware completion watcher** for the `[bash-tail]`
+dispatch path, with unified orphan-defense across both ACP and Bash-tail
+paths. Folds four coordination asks from the parallel ACP session.
+
+### Added
+
+- **`scripts/watch-dispatch-tail.sh`** — parameterized watcher backgrounded
+  alongside each `[bash-tail]` dispatch. Replaces the inline `while kill -0
+  $PID; do sleep 15; done` pattern that `commands/execute.md` step 2.b used
+  to recommend. Key wins:
+  - **Content-aware completion**: greps the worker's tail for any terminal
+    marker (`^\**(COMPLETE|BLOCKED|USER-NEED|USER-CONFIRM):\**` — emphasis-tolerant
+    for grok's `**MARKER:**` form). Exits when the marker appears, BEFORE
+    the worker process exits. Codex `/goal` runs can sit alive for minutes
+    after meaningful work lands while wind-down completes; the PID-only
+    watcher delayed the controller by that window. Content-aware exit
+    surfaces completion to the controller as soon as the worker emits the
+    terminal line.
+  - **Idle-timeout wedge detection**: exits 2 if the tail file size doesn't
+    change for `--max-idle-secs` (default 180s, matching `SKILL.md`
+    §Codex reliability no-progress threshold). Used to require a manual
+    SIGTERM on the watcher when codex hung; now self-terminates.
+  - **Controller-PID self-monitoring**: exits 3 if the controller PID dies
+    (orphan watcher self-detection). No more zombie watchers polling tail
+    files no one cares about after a controller crash.
+  - **Pidfile registration in the shared ACP dir**: writes a per-watcher entry
+    at `/tmp/goal-flight-acp-pids.d/<controller-pid>.bashtail.<worker-pid>.jsonl`
+    on startup, removes via EXIT trap. Schema matches what `scripts/acp_client.py`
+    `_save_pids()` writes (pid / pgid / started_at / cmd / agent / session_id) so
+    `cleanup_ghosts()` reaps orphaned bash-tail workers using the same
+    identity-verified PID-reuse-safe path the ACP workers use. Closes the
+    pre-0.3.1 gap where `[bash-tail]` workers had no orphan-defense
+    registration at all.
+  - **Exit-code semantics surfaced via WATCHER-EXIT summary line**: every
+    exit path prints `WATCHER-EXIT: <kind> exit_code=<N>` plus the last 30
+    tail lines, so the controller's task-notification handler can branch
+    on `marker` / `pid-dead` / `idle-timeout` / `controller-dead` without
+    re-reading the full tail.
+- **`tests/test-watch-dispatch-tail.sh`** — 10 assertions covering all four
+  exit conditions plus pidfile lifecycle (created on startup, removed on
+  every clean exit path).
+
+### Changed
+
+- **`scripts/acp_client.py` `cleanup_ghosts()`**: extracts controller-pid
+  from the LEADING int prefix of the pidfile stem (`int(pf.stem.split(".", 1)[0])`)
+  rather than requiring the full stem to parse as int. Supports the new
+  `<controller-pid>.bashtail.<worker-pid>.jsonl` naming pattern alongside
+  the existing `<controller-pid>.jsonl` ACP pattern. One ACP-side
+  `cleanup_ghosts()` call now reaps orphans across both dispatch paths.
+  Documented as local change #12 in the vendored-credit header.
+- **`commands/execute.md` step 2.b `[bash-tail]` branch**: replaces the
+  inline `while kill -0` watcher recipe with the parameterized
+  `scripts/watch-dispatch-tail.sh` invocation. Documents WATCHER-EXIT
+  semantics so the controller can branch on graceful-complete vs
+  worker-crashed vs wedge-detected.
+
+### Tests
+
+- **4 bash suites** (`tests/run.sh`): unchanged 3 + `test-watch-dispatch-tail.sh`
+  with 10 assertions across the 4 exit conditions + pidfile lifecycle.
+  All green.
+- **2 Python suites** (`test/test_acp_pipe.py` + `test/test_acp_failure_modes.py`):
+  unchanged from 0.3.0. All green.
+
 ## [0.3.0] — 2026-05-18
 
 Minor-bump release; folds two parallel adversarial reviews (Claude challenger

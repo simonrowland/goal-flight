@@ -1,0 +1,185 @@
+#!/usr/bin/env bash
+# watch-dispatch-tail.sh — content-aware completion watcher for [bash-tail] dispatches.
+#
+# Watches a worker's tail file for any TERMINAL marker (COMPLETE / BLOCKED /
+# USER-NEED / USER-CONFIRM, with optional markdown emphasis tolerance for grok).
+# Exits when:
+#   - terminal marker observed in tail            → exit 0  ("WATCHER-EXIT: marker")
+#   - worker PID dies without terminal marker     → exit 1  ("WATCHER-EXIT: pid-dead")
+#   - no tail update for --max-idle-secs seconds  → exit 2  ("WATCHER-EXIT: idle-timeout")
+#   - controller PID dies                         → exit 3  ("WATCHER-EXIT: controller-dead")
+#
+# Registers a per-watcher entry in the same pidfile dir scripts/acp_client.py uses
+# (/tmp/goal-flight-acp-pids.d/), so cleanup_ghosts reaps orphaned workers
+# uniformly across ACP and bash-tail dispatch paths.
+#
+# Filename: <controller-pid>.bashtail.<worker-pid>.jsonl  (one entry per file).
+# cleanup_ghosts extracts controller-pid from the leading int prefix.
+#
+# Usage:
+#   watch-dispatch-tail.sh \
+#     --pid <worker-pid> \
+#     --tail <path-to-tail-file> \
+#     --controller-pid <controller-pid> \
+#     --agent <agent-label, e.g. codex-bash-tail> \
+#     --session-id <slug> \
+#     [--markers <regex>] \
+#     [--poll-secs <N>] \
+#     [--max-idle-secs <N>]
+#
+# Defaults:
+#   --markers       '^\**(COMPLETE|BLOCKED|USER-NEED|USER-CONFIRM):\**'
+#                   (terminal-marker subset; emphasis-tolerant for grok's **MARKER:**)
+#   --poll-secs     15
+#   --max-idle-secs 180   (matches SKILL.md §Codex reliability no-progress threshold)
+#
+# Intended to be backgrounded by commands/execute.md step 2.b [bash-tail] branch:
+#   bash <skill-root>/scripts/watch-dispatch-tail.sh \
+#     --pid $WORKER_PID --tail /tmp/codex-<slug>.txt \
+#     --controller-pid $$ --agent codex-bash-tail --session-id <slug> \
+#     > /tmp/watcher-<slug>.txt 2>&1 &
+# Then dispatch a Bash watcher with run_in_background: true that simply
+# does `wait $WATCHER_PID` and surfaces the watcher's exit code + tail file
+# back through the task-notification.
+
+set -u
+
+WORKER_PID=""
+TAIL_PATH=""
+CONTROLLER_PID=""
+AGENT_LABEL=""
+SESSION_ID=""
+MARKER_RE='^\**(COMPLETE|BLOCKED|USER-NEED|USER-CONFIRM):\**'
+POLL_SECS=15
+MAX_IDLE_SECS=180
+PIDFILE_DIR=/tmp/goal-flight-acp-pids.d
+
+usage() {
+  sed -n '1,/^$/p' "$0" >&2
+  exit 64
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --pid)            WORKER_PID="$2"; shift 2 ;;
+    --tail)           TAIL_PATH="$2"; shift 2 ;;
+    --controller-pid) CONTROLLER_PID="$2"; shift 2 ;;
+    --agent)          AGENT_LABEL="$2"; shift 2 ;;
+    --session-id)     SESSION_ID="$2"; shift 2 ;;
+    --markers)        MARKER_RE="$2"; shift 2 ;;
+    --poll-secs)      POLL_SECS="$2"; shift 2 ;;
+    --max-idle-secs)  MAX_IDLE_SECS="$2"; shift 2 ;;
+    -h|--help)        usage ;;
+    *) echo "unknown arg: $1" >&2; usage ;;
+  esac
+done
+
+for required in WORKER_PID TAIL_PATH CONTROLLER_PID AGENT_LABEL SESSION_ID; do
+  if [ -z "${!required}" ]; then
+    echo "missing required arg: --${required,,} (or its hyphenated form)" >&2
+    usage
+  fi
+done
+
+# Pidfile registration. Schema mirrors scripts/acp_client.py _save_pids():
+#   pid, pgid, started_at (ps lstart), cmd (ps comm), agent, session_id
+# Filename: <controller-pid>.bashtail.<worker-pid>.jsonl  — single-entry file
+# per watcher. cleanup_ghosts() in acp_client.py extracts controller-pid from
+# the leading int prefix (the dotted-suffix pattern is preserved through the
+# stem-split done there).
+PIDFILE="$PIDFILE_DIR/${CONTROLLER_PID}.bashtail.${WORKER_PID}.jsonl"
+
+# Capture identity for the cleanup_ghosts identity check.
+# ps -o lstart=,comm= -p <pid> is POSIX-portable across Mac and Linux.
+ps_meta() {
+  local pid="$1"
+  ps -o lstart=,comm= -p "$pid" 2>/dev/null | head -1
+}
+
+worker_lstart_comm=$(ps_meta "$WORKER_PID")
+if [ -z "$worker_lstart_comm" ]; then
+  echo "watcher: worker PID $WORKER_PID not alive at startup; exiting 1" >&2
+  exit 1
+fi
+# Split: lstart is the first 5 whitespace tokens, comm is the rest.
+worker_lstart=$(echo "$worker_lstart_comm" | awk '{print $1, $2, $3, $4, $5}')
+worker_comm=$(echo "$worker_lstart_comm" | awk '{for (i=6; i<=NF; i++) printf "%s%s", $i, (i<NF ? " " : "")}')
+
+worker_pgid=$(ps -o pgid= -p "$WORKER_PID" 2>/dev/null | tr -d ' ')
+[ -z "$worker_pgid" ] && worker_pgid="$WORKER_PID"
+
+mkdir -p "$PIDFILE_DIR"
+
+# JSON-encode strings safely. printf %s + python is more reliable than shell escaping.
+json_escape() { python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "$1"; }
+
+cat > "$PIDFILE" <<EOF
+{"pid": $WORKER_PID, "pgid": $worker_pgid, "started_at": $(json_escape "$worker_lstart"), "cmd": $(json_escape "$worker_comm"), "agent": $(json_escape "$AGENT_LABEL"), "session_id": $(json_escape "$SESSION_ID")}
+EOF
+
+trap 'rm -f "$PIDFILE"' EXIT INT TERM
+
+# Track tail file size for idle detection. Re-stat at each poll.
+last_size=0
+last_size_change_ts=$(date +%s)
+if [ -f "$TAIL_PATH" ]; then
+  last_size=$(wc -c < "$TAIL_PATH" 2>/dev/null | tr -d ' ')
+  last_size=${last_size:-0}
+fi
+
+echo "[watcher start $(date '+%H:%M:%S')] worker_pid=$WORKER_PID controller_pid=$CONTROLLER_PID tail=$TAIL_PATH markers='$MARKER_RE' poll=${POLL_SECS}s max_idle=${MAX_IDLE_SECS}s"
+
+while true; do
+  # 1. Controller alive? (orphan watcher self-detection)
+  if ! kill -0 "$CONTROLLER_PID" 2>/dev/null; then
+    echo "[$(date '+%H:%M:%S')] controller PID $CONTROLLER_PID is gone"
+    if [ -f "$TAIL_PATH" ]; then
+      echo "=== tail last 30 lines ==="
+      tail -30 "$TAIL_PATH"
+    fi
+    echo "WATCHER-EXIT: controller-dead exit_code=3"
+    exit 3
+  fi
+
+  # 2. Terminal marker in tail?
+  if [ -f "$TAIL_PATH" ] && grep -qE "$MARKER_RE" "$TAIL_PATH" 2>/dev/null; then
+    echo "[$(date '+%H:%M:%S')] terminal marker matched in tail"
+    echo "=== tail last 30 lines ==="
+    tail -30 "$TAIL_PATH"
+    echo "WATCHER-EXIT: marker exit_code=0"
+    exit 0
+  fi
+
+  # 3. Worker PID still alive?
+  if ! kill -0 "$WORKER_PID" 2>/dev/null; then
+    echo "[$(date '+%H:%M:%S')] worker PID $WORKER_PID is gone (no terminal marker seen)"
+    if [ -f "$TAIL_PATH" ]; then
+      echo "=== tail last 30 lines ==="
+      tail -30 "$TAIL_PATH"
+    fi
+    echo "WATCHER-EXIT: pid-dead exit_code=1"
+    exit 1
+  fi
+
+  # 4. Idle timeout? (no tail-size change for max-idle-secs)
+  if [ -f "$TAIL_PATH" ]; then
+    cur_size=$(wc -c < "$TAIL_PATH" 2>/dev/null | tr -d ' ')
+    cur_size=${cur_size:-0}
+    if [ "$cur_size" -ne "$last_size" ]; then
+      last_size="$cur_size"
+      last_size_change_ts=$(date +%s)
+    else
+      now_ts=$(date +%s)
+      idle_for=$(( now_ts - last_size_change_ts ))
+      if [ "$idle_for" -ge "$MAX_IDLE_SECS" ]; then
+        echo "[$(date '+%H:%M:%S')] tail file idle for ${idle_for}s (>= ${MAX_IDLE_SECS}s threshold) — worker likely wedged"
+        echo "=== tail last 30 lines ==="
+        tail -30 "$TAIL_PATH"
+        echo "WATCHER-EXIT: idle-timeout exit_code=2"
+        exit 2
+      fi
+    fi
+  fi
+
+  sleep "$POLL_SECS"
+done

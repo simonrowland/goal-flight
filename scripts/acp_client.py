@@ -69,6 +69,13 @@
 #     check and kill still allows PID reuse; the double-check shrinks it
 #     to a much smaller window where the recheck-and-kill must both happen
 #     after a reuse — extremely unlikely under normal scheduling.
+#   - cleanup_ghosts pidfile-stem split: extracts controller-pid from the
+#     LEADING int prefix of the filename rather than requiring the full
+#     stem to parse as int. Allows goal-flight's bash-tail watcher
+#     (`scripts/watch-dispatch-tail.sh`) to register orphan-eligible
+#     workers under the same pidfile dir with the naming pattern
+#     `<controller-pid>.bashtail.<worker-pid>.jsonl` — single cleanup_ghosts
+#     pass reaps orphans across both ACP and Bash-tail dispatch paths.
 """ACP stdio JSON-RPC client — manages CLI agent subprocesses."""
 
 import asyncio
@@ -628,8 +635,14 @@ class AcpProcessPool:
         skipped_stale = 0
         skipped_live_controller = 0
         for pf in self._pidfile_dir.glob("*.jsonl"):
+            # Stem patterns recognized:
+            #   "<int>"                            → ACP pool from controller <int>
+            #   "<int>.bashtail.<int>"             → bash-tail watcher subfile
+            #                                       (scripts/watch-dispatch-tail.sh)
+            # Controller PID is always the leading int prefix; the suffix (if any)
+            # carries goal-flight-specific subtyping that cleanup_ghosts ignores.
             try:
-                controller_pid = int(pf.stem)
+                controller_pid = int(pf.stem.split(".", 1)[0])
             except ValueError:
                 continue
             if controller_pid == own_pid:
