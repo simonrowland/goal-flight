@@ -135,6 +135,81 @@ class PoolExhaustedError(AcpError):
     pass
 
 
+# ---------------------------------------------------------------------------
+# Module-level connection registry (Design 2 — bare-AcpConnection orphan defense)
+# ---------------------------------------------------------------------------
+# Both bare AcpConnection and AcpProcessPool register here on spawn. Write-
+# through pidfile so even a SIGKILL of the controller leaves the latest
+# snapshot on disk — cleanup_ghosts() on the next controller start reads
+# from the same dir and reaps orphans with identity verification. Works
+# alongside theirs's [bash-tail] per-watcher pidfile naming (cleanup_ghosts
+# already parses both via stem.split(".", 1)[0]).
+
+import threading  # noqa: E402
+
+_PIDFILE_DIR = Path("/tmp/goal-flight-acp-pids.d")
+_live_connections: dict[int, "AcpConnection"] = {}
+_registry_lock = threading.Lock()
+
+
+def _register_connection(conn: "AcpConnection") -> None:
+    """Add `conn` to the live-connections registry; write-through to pidfile.
+    Called by AcpConnection.__post_init__ — automatic for both bare and
+    pool-managed connections."""
+    with _registry_lock:
+        _live_connections[conn.proc.pid] = conn
+        _write_through_pidfile_locked()
+
+
+def _unregister_connection(conn: "AcpConnection") -> None:
+    """Remove `conn` from registry; write-through to pidfile.
+    Called by AcpConnection.kill()."""
+    with _registry_lock:
+        _live_connections.pop(conn.proc.pid, None)
+        _write_through_pidfile_locked()
+
+
+def _write_through_pidfile_locked() -> None:
+    """Persist the live-connections snapshot. Caller MUST hold _registry_lock.
+
+    Per-controller pidfile path (named <controller-pid>.jsonl) so concurrent
+    goal-flight runs don't share/clobber state. Coexists with [bash-tail]
+    watcher's per-worker subfiles (<pid>.bashtail.<wpid>.jsonl) — both share
+    the same parent dir; cleanup_ghosts handles both via stem parsing.
+    """
+    try:
+        _PIDFILE_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        log.warning("could not create pidfile dir %s: %s", _PIDFILE_DIR, e)
+        return
+    own_pidfile = _PIDFILE_DIR / f"{os.getpid()}.jsonl"
+    entries: list[str] = []
+    for conn in _live_connections.values():
+        meta = _ps_meta(conn.proc.pid)
+        if meta is None:
+            continue
+        lstart, comm = meta
+        try:
+            pgid = os.getpgid(conn.proc.pid)
+        except (ProcessLookupError, PermissionError):
+            pgid = conn.proc.pid
+        entries.append(json.dumps({
+            "pid": conn.proc.pid,
+            "pgid": pgid,
+            "started_at": lstart,
+            "cmd": comm,
+            "agent": conn.agent,
+            "session_id": conn.session_id,
+        }))
+    try:
+        if entries:
+            own_pidfile.write_text("\n".join(entries) + "\n")
+        else:
+            own_pidfile.unlink(missing_ok=True)
+    except OSError as e:
+        log.warning("pidfile write failed (%s): %s", own_pidfile, e)
+
+
 @dataclass
 class AcpConnection:
     agent: str
@@ -148,6 +223,19 @@ class AcpConnection:
     _stderr_task: asyncio.Task | None = field(default=None, init=False)
     _notification_queues: dict[int, asyncio.Queue] = field(default_factory=dict, init=False)
     acp_session_id: str | None = field(default=None, init=False)
+    cwd: str | None = field(default=None, init=False)  # set by session_new; used by run_prompt scope check
+
+    def __post_init__(self) -> None:
+        # Register for orphan-cleanup defense. Isolate I/O failures —
+        # pidfile write errors should NOT block AcpConnection construction.
+        try:
+            _register_connection(self)
+        except Exception as e:
+            log.warning(
+                "AcpConnection registration failed (%s); orphan cleanup defense "
+                "disabled for pid=%d. Connection itself unaffected.",
+                e, self.proc.pid,
+            )
     last_active: float = field(default_factory=time.time, init=False)
     session_reset: bool = field(default=False, init=False)
 
@@ -298,6 +386,7 @@ class AcpConnection:
         return result
 
     async def session_new(self, cwd: str) -> str:
+        self.cwd = cwd  # remember for run_prompt's scope-leak audit (Design 1)
         sub_id, q = self._subscribe()
         try:
             result = await self._send_request("session/new", {
@@ -388,6 +477,14 @@ class AcpConnection:
                     await task
                 except asyncio.CancelledError:
                     pass
+        # Unregister from live-connections; write-through removes our entry
+        # from the pidfile. Isolate I/O failures — a pidfile error here
+        # shouldn't propagate past kill() (caller wants to know the worker
+        # is dead, not whether bookkeeping succeeded).
+        try:
+            _unregister_connection(self)
+        except Exception as e:
+            log.warning("AcpConnection unregister failed (%s); pidfile may be stale", e)
 
     async def close_gracefully(self, soft_timeout: float = 2.0) -> None:
         """Try a clean shutdown, fall back to SIGKILL.
