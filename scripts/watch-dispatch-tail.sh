@@ -74,12 +74,42 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# Map of REQUIRED_VAR → --flag-name for missing-arg diagnostics. Spelled
+# out long-form (rather than computed via `${var,,}`) because that bash 4+
+# lowercase substitution fails on macOS default bash 3.2 with "bad
+# substitution" and `tr` would be portable but uglier than this static map.
 for required in WORKER_PID TAIL_PATH CONTROLLER_PID AGENT_LABEL SESSION_ID; do
   if [ -z "${!required}" ]; then
-    echo "missing required arg: --${required,,} (or its hyphenated form)" >&2
+    case "$required" in
+      WORKER_PID)     flag='--pid' ;;
+      TAIL_PATH)      flag='--tail' ;;
+      CONTROLLER_PID) flag='--controller-pid' ;;
+      AGENT_LABEL)    flag='--agent' ;;
+      SESSION_ID)     flag='--session-id' ;;
+    esac
+    echo "missing required arg: $flag" >&2
     usage
   fi
 done
+
+# Validate PID args are integers — without this, a non-integer WORKER_PID
+# produces invalid JSON in the pidfile body ({"pid": abc, ...}), which
+# cleanup_ghosts json.JSONDecodeError-skips but leaks the file.
+case "$WORKER_PID" in
+  ''|*[!0-9]*) echo "invalid --pid '$WORKER_PID' (must be integer)" >&2; usage ;;
+esac
+case "$CONTROLLER_PID" in
+  ''|*[!0-9]*) echo "invalid --controller-pid '$CONTROLLER_PID' (must be integer)" >&2; usage ;;
+esac
+
+# Hard dep: python3 for json_escape (could fall back to pure-bash escape
+# but the inputs include agent labels and slugs that may contain shell
+# metacharacters; python3's json.dumps is the safe path). Fail fast if
+# missing rather than producing a malformed pidfile body later.
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "python3 required on PATH for pidfile JSON encoding; install or skip --agent labels with special characters" >&2
+  exit 70  # EX_SOFTWARE
+fi
 
 # Pidfile registration. Schema mirrors scripts/acp_client.py _save_pids():
 #   pid, pgid, started_at (ps lstart), cmd (ps comm), agent, session_id
@@ -117,7 +147,25 @@ cat > "$PIDFILE" <<EOF
 {"pid": $WORKER_PID, "pgid": $worker_pgid, "started_at": $(json_escape "$worker_lstart"), "cmd": $(json_escape "$worker_comm"), "agent": $(json_escape "$AGENT_LABEL"), "session_id": $(json_escape "$SESSION_ID")}
 EOF
 
-trap 'rm -f "$PIDFILE"' EXIT INT TERM
+# Pidfile cleanup: preserve the entry when the WORKER is still alive, remove
+# only when the worker is definitely gone. Rationale: exit paths where the
+# worker may still be alive include:
+#   - exit 2 (idle-timeout): worker is wedged but the process is still running;
+#                            cleanup_ghosts() should reap it on the next
+#                            controller startup
+#   - exit 3 (controller-dead): worker may keep running with no supervisor;
+#                              cleanup_ghosts() needs the pidfile to reap it
+#   - SIGTERM of watcher itself: worker survives; need cleanup_ghosts coverage
+# Removing the pidfile in those cases ORPHANS the worker beyond cleanup_ghosts'
+# reach. The check is `kill -0 $WORKER_PID` which is cheap and atomic enough.
+cleanup_pidfile_on_exit() {
+  if [ -n "$WORKER_PID" ] && kill -0 "$WORKER_PID" 2>/dev/null; then
+    : # worker still alive — leave pidfile for cleanup_ghosts() on next controller start
+  else
+    rm -f "$PIDFILE"
+  fi
+}
+trap cleanup_pidfile_on_exit EXIT INT TERM
 
 # Track tail file size for idle detection. Re-stat at each poll.
 last_size=0
