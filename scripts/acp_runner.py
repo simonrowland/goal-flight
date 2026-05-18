@@ -43,7 +43,7 @@ async def run_prompt(
     conn: AcpConnection,
     text: str,
     *,
-    idle_timeout: float = 300,
+    idle_timeout: float | None = 300,
     keep_raw: bool = False,
 ) -> PromptResult:
     """Send a prompt through an already-initialized ACP connection.
@@ -54,7 +54,7 @@ async def run_prompt(
     unwrap and classify those into the structured PromptResult.
 
     idle_timeout: seconds without ANY event from the agent before the runner
-    gives up. Default 300s suits short prompts; raise to 0 (no timeout) or
+    gives up. Default 300s suits short prompts; set to 0/None (no timeout) or
     something like 7200 for goal-mode / implement-mode dispatches that run
     multi-minute autonomously between agent_message_chunks.
     """

@@ -34,6 +34,8 @@ git clone https://github.com/simonrowland/goal-flight.git ~/.claude/skills/goal-
 /goal-flight execute              # per-chunk dispatch loop (ACP when available, else
                                   # Bash-&-tail-file), embedded self-review,
                                   # milestone codex+claude reviews every K commits
+/goal-flight doctor               # validate plugin package, companion tools,
+                                  # codex trust, context-mode, gstack, ACP
 /goal-flight resume               # rebuild RESUME-NOTES from current git state
                                   # (use when picking up across sessions)
 ```
@@ -50,6 +52,7 @@ git clone https://github.com/simonrowland/goal-flight.git ~/.claude/skills/goal-
 | `/goal-flight decompose-plan [<plan>]` | Break a plan into `/goal` chunks with parallel reviewer pass |
 | `/goal-flight ask-questions [<scope>]` | Anticipatory subagents; surface clarifying questions |
 | `/goal-flight execute [--parallel <N>]` | Per-chunk loop; sequential default, parallel-safe opt-in |
+| `/goal-flight doctor` | Read-only health check for plugin/package/runtime readiness |
 | `/goal-flight build-corpus [<flags>]` | Extend / rebuild the optional RAG corpus |
 | `/goal-flight resume` | Rebuild RESUME-NOTES from current git state |
 | `/goal-flight goal <SLUG>` | Append one goal to the queue |
