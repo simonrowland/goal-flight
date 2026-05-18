@@ -4,6 +4,70 @@ Notable changes to the goal-flight Claude Code skill. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are
 incremented when meaningful skill behaviour changes.
 
+## [0.3.4] — 2026-05-18
+
+Combined patch — folds two parallel-session work streams:
+
+### Added — plugin manifest + `doctor` sub-command (commit 850b907 from sibling session)
+
+- **`.claude-plugin/plugin.json`** — declarative plugin manifest making the
+  skill discoverable through Claude Code's plugin form (alongside the
+  existing clone-form install at `~/.claude/skills/goal-flight/`).
+- **`commands/doctor.md`** — new read-only health-check sub-command
+  (`/goal-flight doctor`): validates plugin package, companion tools, codex
+  trust, context-mode, gstack, ACP availability. First-time-user diagnostic
+  + ongoing skill-update sanity check. Surfaced in `README.md` Quickstart
+  and the sub-commands table.
+- **`tests/test-plugin-manifest.sh`** — validates the plugin manifest's
+  schema + structural invariants. Hooked into `tests/run.sh`.
+- **`scripts/acp_client.py` ACP dispatch hardening**:
+  - `_discard_pending(req_id)` helper centralizes future-cancellation;
+    used by both successful resolve and exception paths so pending
+    request futures never leak.
+  - `session_prompt` idle-timeout handling: emits `session/cancel` before
+    yielding the timeout error so codex-acp / cursor-agent doesn't continue
+    a dispatch the controller has abandoned. `idle_timeout=None` or `<=0`
+    disables the gate (for long-running goal-mode loops where multi-minute
+    gaps between agent_message_chunks are normal).
+  - `CancelledError` propagation cleaned up — caller-cancelled requests
+    discard the pending future and re-raise (no leak).
+- **`scripts/acp_runner.py`**: minor doc / signature touches consistent
+  with the dispatch hardening.
+- **`test/test_acp_failure_modes.py`**: expanded with cancel-during-prompt
+  scenarios that exercise the new `_discard_pending` + `session_cancel`
+  paths.
+
+### Fixed — `_save_pids` dedupe (this commit)
+
+Per the latent issue flagged in the 0.3.3 CHANGELOG: `AcpProcessPool._save_pids()`
+and Design 2's `_write_through_pidfile_locked()` previously both wrote to
+`<controller-pid>.jsonl`. In a mixed-mode scenario (bare `AcpConnection` +
+pool-managed connections in the same process), the pool's narrower view
+would clobber the registry's superset — bare-conn orphan-defense entries
+would silently disappear from the pidfile.
+
+The dedupe:
+- **Removed**: `AcpProcessPool._pidfile_dir` class attribute,
+  `_own_pidfile()` method, `_save_pids()` method, and the two
+  `self._save_pids()` call sites in `get_or_create()` + `close()`.
+- **Single writer**: Design 2's module-level `_write_through_pidfile_locked()`
+  is now the sole writer to the per-controller pidfile.
+  `AcpConnection.__post_init__` calls `_register_connection` (on spawn)
+  and `AcpConnection.kill()` calls `_unregister_connection` (on teardown)
+  — automatic for both bare and pool-managed connections.
+- **`cleanup_ghosts()` redirect**: reads from the module-level `_PIDFILE_DIR`
+  instead of `self._pidfile_dir`. All the 0.3.2 hardening (bashtail-stem
+  recognition, killpg safety, identity-verified TOCTOU defense) preserved.
+- **Test override**: `pool._pidfile_dir = ...` → `acp_client._PIDFILE_DIR = ...`
+  (module-level monkey-patch with restore in finally).
+
+Documented as local change #13 in the vendored-credit header.
+
+### Tests
+
+- 7 passed / 0 failed (4 bash legacy + 1 plugin-manifest + 1 watcher + 2 Python).
+- Test suite count expanded from 6 → 7 with the new plugin-manifest test.
+
 ## [0.3.3] — 2026-05-18
 
 Folds two in-flight designs from the parallel ACP session into the hardening

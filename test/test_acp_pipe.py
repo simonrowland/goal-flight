@@ -105,13 +105,18 @@ def smoke_pidfile_safety() -> None:
     pidfile name; "live controller" simulated via PID 1 (init/launchd).
     """
     import shutil
+    import acp_client  # for module-level _PIDFILE_DIR monkey-patch
     DEAD_CONTROLLER_PID = sys.maxsize  # impossible to be a live PID
+
+    # 0.3.4: _pidfile_dir is no longer a pool attribute — Design 2's
+    # module-level _PIDFILE_DIR is the single source of truth. Monkey-patch
+    # it for test isolation; restore in the outer try/finally below.
+    _orig_pidfile_dir = acp_client._PIDFILE_DIR
+    acp_client._PIDFILE_DIR = PIDFILE_DIR_TEST
 
     def _setup_pool() -> AcpProcessPool:
         PIDFILE_DIR_TEST.mkdir(parents=True, exist_ok=True)
-        pool = AcpProcessPool(agents_config={})
-        pool._pidfile_dir = PIDFILE_DIR_TEST
-        return pool
+        return AcpProcessPool(agents_config={})
 
     # Case A: stale entry, bystander must survive.
     bystander_a = subprocess.Popen(["sleep", "30"], start_new_session=True)
@@ -199,6 +204,9 @@ def smoke_pidfile_safety() -> None:
             try: bystander_c.kill()
             except Exception: pass
         shutil.rmtree(PIDFILE_DIR_TEST, ignore_errors=True)
+        # 0.3.4: restore module-level _PIDFILE_DIR so later tests
+        # (smoke_bare_connection_registry) see the production path.
+        acp_client._PIDFILE_DIR = _orig_pidfile_dir
 
 
 def smoke_pool_ceiling() -> None:
