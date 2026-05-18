@@ -77,6 +77,15 @@
 #     workers under the same pidfile dir with the naming pattern
 #     `<controller-pid>.bashtail.<worker-pid>.jsonl` — single cleanup_ghosts
 #     pass reaps orphans across both ACP and Bash-tail dispatch paths.
+#   - AcpProcessPool._save_pids / _own_pidfile / _pidfile_dir removed (0.3.4):
+#     Design 2's module-level registry (_live_connections + write-through
+#     to _PIDFILE_DIR via _write_through_pidfile_locked()) is now the SINGLE
+#     writer to the per-controller pidfile. AcpConnection.__post_init__ +
+#     .kill() handle register/unregister automatically. The pool's prior
+#     _save_pids() snapshots have been removed from get_or_create() + close();
+#     cleanup_ghosts reads from the module-level _PIDFILE_DIR. Eliminates
+#     the latent mixed-mode race where pool's narrower view would clobber
+#     the registry's superset.
 """ACP stdio JSON-RPC client — manages CLI agent subprocesses."""
 
 import asyncio
@@ -620,7 +629,10 @@ class AcpProcessPool:
 
         conn = await self._spawn(agent, session_id, agent_cfg, is_rebuild=is_rebuild, cwd_override=cwd)
         self._connections[key] = conn
-        self._save_pids()
+        # Pidfile write-through happens automatically via Design 2's module-level
+        # registry (AcpConnection.__post_init__ → _register_connection →
+        # _write_through_pidfile_locked). Single writer keeps pidfile content
+        # consistent — see _save_pids removal note below.
         return conn
 
     async def _spawn(self, agent: str, session_id: str, cfg: dict, is_rebuild: bool = False, cwd_override: str = "") -> AcpConnection:
@@ -659,7 +671,8 @@ class AcpProcessPool:
         if conn:
             log.info("closing: agent=%s session=%s", agent, session_id)
             await conn.kill()
-            self._save_pids()
+            # conn.kill() calls _unregister_connection which write-throughs
+            # the pidfile via Design 2; no need for an explicit _save_pids here.
 
     def remove(self, agent: str, session_id: str) -> None:
         self._connections.pop((agent, session_id), None)
@@ -694,54 +707,18 @@ class AcpProcessPool:
             await conn.kill()
         self._connections.clear()
 
-    _pidfile_dir = Path("/tmp/goal-flight-acp-pids.d")
-
-    def _own_pidfile(self) -> Path:
-        """Path to THIS controller's pidfile (per-process — name == controller PID)."""
-        return self._pidfile_dir / f"{os.getpid()}.jsonl"
-
-    def _save_pids(self) -> None:
-        """Persist managed subprocess identity to disk for ghost cleanup across restarts.
-
-        Schema is JSON-Lines (one entry per line); each entry records pid, pgid,
-        live ps lstart, live ps comm, agent label, and session_id. The lstart+comm
-        pair is what cleanup_ghosts() verifies before killing, defending against
-        PID reuse (Mac kern.maxproc=16000 cycles fast).
-
-        File path is per-controller (named <controller-pid>.jsonl) so multiple
-        goal-flight runs on the same host don't share/clobber state.
-        """
-        self._pidfile_dir.mkdir(parents=True, exist_ok=True)
-        own_pidfile = self._own_pidfile()
-        entries: list[str] = []
-        for c in self._connections.values():
-            meta = _ps_meta(c.proc.pid)
-            if meta is None:
-                continue  # process already gone — nothing to record
-            lstart, comm = meta
-            try:
-                pgid = os.getpgid(c.proc.pid)
-            except (ProcessLookupError, PermissionError):
-                pgid = c.proc.pid
-            entries.append(json.dumps({
-                "pid": c.proc.pid,
-                "pgid": pgid,
-                "started_at": lstart,
-                "cmd": comm,
-                "agent": c.agent,
-                "session_id": c.session_id,
-            }))
-        if entries:
-            own_pidfile.write_text("\n".join(entries) + "\n")
-        else:
-            # Empty pool — remove our pidfile so we don't leave a stale empty one
-            own_pidfile.unlink(missing_ok=True)
+    # 0.3.4 dedupe: `_pidfile_dir`, `_own_pidfile()`, and `_save_pids()` removed —
+    # Design 2's module-level registry (_live_connections + _write_through_pidfile_locked
+    # near the top of this file) is now the single writer to the pidfile dir.
+    # AcpConnection.__post_init__ + .kill() handle register/unregister automatically
+    # for both bare and pool-managed connections, so the pool no longer needs its own
+    # snapshot path. cleanup_ghosts below reads from the module-level _PIDFILE_DIR.
 
     def cleanup_ghosts(self) -> int:
         """Kill orphaned agent processes recorded by dead controller(s).
 
         Walks the pidfile directory. For each per-controller pidfile:
-          - Skip our own file (we manage it via _save_pids).
+          - Skip our own file (we manage it via Design 2's write-through registry).
           - Skip files whose controller PID is still alive (a concurrent
             goal-flight run owns those workers; don't touch them).
           - For files from dead controllers: identity-verify each worker
@@ -751,14 +728,14 @@ class AcpProcessPool:
 
         Returns the number of workers killed.
         """
-        if not self._pidfile_dir.exists():
+        if not _PIDFILE_DIR.exists():
             return 0
         own_pid = os.getpid()
         own_worker_pids = {c.proc.pid for c in self._connections.values()}
         killed = 0
         skipped_stale = 0
         skipped_live_controller = 0
-        for pf in self._pidfile_dir.glob("*.jsonl"):
+        for pf in _PIDFILE_DIR.glob("*.jsonl"):
             # Stem patterns recognized:
             #   "<int>"                            → ACP pool from controller <int>
             #   "<int>.bashtail.<int>"             → bash-tail watcher subfile
@@ -770,7 +747,7 @@ class AcpProcessPool:
             except ValueError:
                 continue
             if controller_pid == own_pid:
-                continue  # our file; managed by _save_pids
+                continue  # our file; managed by Design 2's _write_through_pidfile_locked
             if _ps_meta(controller_pid) is not None:
                 # Another goal-flight controller is alive — don't touch its workers.
                 skipped_live_controller += 1
