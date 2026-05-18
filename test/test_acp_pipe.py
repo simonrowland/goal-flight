@@ -210,14 +210,21 @@ def smoke_pidfile_safety() -> None:
 
 
 def smoke_pool_ceiling() -> None:
-    """Verify compute_pool_ceiling against synthetic env-caveats files."""
+    """Verify compute_pool_ceiling uses the operational capacity profile.
+
+    Post-0.4.0-prep refactor: compute_pool_ceiling delegates to
+    goalflight_capacity.profile() when available, which uses a tiered
+    operating-cap scheme:
+      ≤8GB=1, ≤16GB=3, ≤32GB=4, ≤64GB=6, >64GB=8 (override-able).
+    Raw RAM ceiling is clamped to operating cap.
+    """
     cases = [
-        # (ram_mb, expected_ceiling) — formula: (ram - 2048) // 1200, capped at 20, floor 1
-        (8192,  5),   # 8 GB → (8192-2048)/1200 = 5
-        (16384, 11),  # 16 GB → (16384-2048)/1200 = 11
-        (32768, 20),  # 32 GB → would be 25, capped at 20
-        (131072, 20), # 128 GB → would be 107, capped at 20
-        (1024, 1),    # 1 GB → headroom negative, floors to 1
+        # (ram_mb, expected_ceiling) — tiered op-cap scheme via goalflight_capacity.profile()
+        (8192,  1),   # 8 GB → op-cap 1
+        (16384, 3),   # 16 GB → op-cap 3
+        (32768, 4),   # 32 GB → op-cap 4
+        (131072, 8),  # 128 GB → op-cap 8 (default; override-able)
+        (1024, 1),    # 1 GB → floors to 1
     ]
     test_path = Path("/tmp/goal-flight-env-caveats-test.md")
     try:

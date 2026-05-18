@@ -1,3 +1,7 @@
+---
+description: "Build or refresh the private dispatch-context corpus."
+---
+
 # build-corpus [--slice <name>] [--next-wave [<N>]] [--all] [--rebuild]
 
 Build, extend, or rebuild the `docs-private/rag/` corpus after `init` step 3.5 has already created it. Same 4-pass pipeline; invocation outside init.

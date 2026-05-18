@@ -1,6 +1,6 @@
 # goal-flight
 
-A [Claude Code](https://claude.ai/code) skill that turns a fresh session into a **controller** for long, decomposed code work. Claude Code runs out of context on multi-chunk refactors when one agent does everything; goal-flight delegates concrete work to /goal subagents with review loops, and keeps the controller small, so multi-hour unattended runs land as a clean stack of one-commit-per-chunk on main without the controller's context window filling up.
+A [Claude Code](https://claude.ai/code) skill that turns a fresh session into a **controller** for long, decomposed code work. Claude Code runs out of context on multi-chunk refactors when one agent does everything; goal-flight delegates concrete work to /goal subagents with review loops, and keeps the controller small, so multi-hour unattended runs land as a clean stack of one-commit-per-chunk on main without the controller's context window filling up. Deterministic runtime facts live in helper scripts, not in the conversation.
 
 **What the controller is for**: high-level management, not execution. The controller holds enough context about your project's goal, scenery (constraints, architecture, prior decisions, failure modes), and intent to exercise discretion and recommend the next move — then dispatches actual work to workers (Claude subagents, codex, grok) that don't need that context. This is the frontier of lightly-supervised development: you check in, ratify suggested moves, redirect when needed, and trust the controller to keep the project anchored across compactions and unattended hours. The dispatch / review / handoff machinery below is what frees the controller to do that job.
 
@@ -14,6 +14,7 @@ git clone https://github.com/simonrowland/goal-flight.git ~/.claude/skills/goal-
 - **Verification-first dispatch.** Wrappers point at files for the agent to investigate, not pre-pasted "facts" that go stale on the timescale of minutes. Frontier models trust controller-text uncritically; pointers force them to re-verify against live disk and surface drift.
 - **Parallel codex + claude reviews at milestone cadence.** Two independent reviewers (Claude + codex) address bugs and completion before pestering you. Via [gstack](https://github.com/garrytan/gstack)'s `/review` skill when installed.
 - **Three dispatch paths** the controller picks from per chunk, not one rigid loop — controller-inline for trivial chunks, single-shot subagent for the common case, multi-hour goal-mode loop (codex `/goal` or controller-driven iteration) for chunks that need it. Each can run over either Bash-`&`-tail-file (default fallback) or ACP (Agent Client Protocol) when the target worker speaks it — ACP gets structured events + persistent sessions + sub-billing through most adapter paths.
+- **Procedural runtime state.** Capacity, dispatch ledgers, compact status, log watching, doctor checks, ACP runs, and file-backed review jobs live under `scripts/goalflight_*.py`.
 
 ## How it differs from the alternatives
 
@@ -60,7 +61,10 @@ git clone https://github.com/simonrowland/goal-flight.git ~/.claude/skills/goal-
 | `/goal-flight validate-dispatch [<slug>]` | Render a chunk's dispatch wrapper without dispatching |
 | `/goal-flight validate-queue [<path>]` | Schema-check the goal-queue |
 
-Plus an opt-in self-delegation pattern via `/fork` — controller writes a marker contract; forked session detects via env var and follows the contract; controller monitors the fork's JSONL for keyword markers (`FORK-STATUS`, `FORK-COMPLETE`, `FORK-NEED`, etc.). See `SKILL.md` §Self-delegation via `/fork`.
+Plus an opt-in self-delegation pattern via `/fork` — controller writes a marker contract; forked session detects via env var and follows the contract; controller monitors compact status. See `protocols/self-delegation.md`; fork instructions are not always-loaded.
+
+Detailed operating procedures are split into load-on-demand files under
+`protocols/`. The always-loaded `SKILL.md` is intentionally small.
 
 ## Three dispatch paths (the cost/loop trade-off)
 

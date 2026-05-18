@@ -1,4 +1,12 @@
+---
+description: "Register a project path as trusted for Codex CLI."
+---
+
 # register-codex [<project-path>]
+
+Read:
+
+- `protocols/tool-readiness.md`
 
 Register a project (or worktree path) as codex-trusted in `~/.codex/config.toml`.
 This is the thin sub-command wrapper around `scripts/install-codex-overrides.sh`
@@ -24,9 +32,9 @@ convention.
 
 ## Steps
 
-1. Resolve the skill root: read `~/.claude/skills/goal-flight/SKILL.md`'s
-   directory, or use `<repo-root>` if the skill is checked out locally
-   (e.g. `~/Repos/goal-flight`).
+1. Resolve the skill root from the loaded command/plugin path. Prefer the
+   current goal-flight repo root; fall back to clone form only when that is the
+   actual loaded path.
 
 2. Resolve the target path:
    - If user supplied an arg: `cd "$ARG" && pwd` (must exist).
@@ -54,6 +62,6 @@ convention.
 
 ## See also
 
-- `SKILL.md` §Codex reliability — background on the stall and
+- `protocols/tool-readiness.md` — background on the stall and
   the trust mechanism.
 - `scripts/install-codex-overrides.sh` — the actual installer.

@@ -35,6 +35,11 @@ from pathlib import Path
 
 from acp_client import AcpProcessPool
 
+try:
+    import goalflight_capacity
+except Exception:  # pragma: no cover - keep acp_pool usable standalone
+    goalflight_capacity = None
+
 log = logging.getLogger("goal-flight.acp_pool")
 
 # Defaults derived from empirical measurements 2026-05-18 (see env-caveats.md).
@@ -58,7 +63,8 @@ def compute_pool_ceiling(
 ) -> int:
     """Compute max concurrent ACP workers given the box's RAM.
 
-    Reads `docs-private/env-caveats.md` for the RAM_MB line written by
+    Prefer the procedural machine-capacity profile. Fall back to reading
+    `docs-private/env-caveats.md` for the RAM_MB line written by
     `scripts/probe-box-capacity.sh`. Returns min(hard_cap, computed_ceiling).
     Floors at 1 (never returns 0 or negative — pool of 1 is still useful).
 
@@ -95,6 +101,25 @@ def compute_pool_ceiling(
         )
         return CONSERVATIVE_FALLBACK_CEILING
     ram_mb = int(m.group(2))
+    if goalflight_capacity is not None:
+        try:
+            profile = goalflight_capacity.profile(
+                type(
+                    "Args",
+                    (),
+                    {
+                        "ram_mb": ram_mb,
+                        "reserve_mb": controller_reserve_mb,
+                        "worst_worker_mb": worst_case_worker_rss_mb,
+                        "hard_cap": hard_cap,
+                        "max_total": None,
+                    },
+                )()
+            )
+            return int(profile["operating_cap"])
+        except Exception as e:
+            log.warning("goalflight_capacity profile failed (%s); falling back to raw env-caveats ceiling", e)
+
     headroom = ram_mb - controller_reserve_mb
     if headroom <= 0:
         log.warning("env-caveats says ram_mb=%d but controller_reserve=%d; pool of 1", ram_mb, controller_reserve_mb)

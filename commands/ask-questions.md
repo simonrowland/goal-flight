@@ -1,4 +1,12 @@
+---
+description: "Spawn read-only question-finding subagents before unattended work."
+---
+
 # ask-questions [--scope <area>]
+
+Read:
+
+- `protocols/dispatch-routing.md`
 
 Spawn read-only subagents to anticipate integration / requirements / snags questions. Surface only the ones with enough context to make sense to the user. Goal: clear ambiguities up front so the 12-hour unattended run doesn't stall on user input.
 

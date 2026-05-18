@@ -1,3 +1,7 @@
+---
+description: "Schema-check a goal queue file."
+---
+
 # validate-queue [<queue-file>]
 
 Schema-check a goal-queue file. Read-only. Surfaces structural problems

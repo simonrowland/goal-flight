@@ -31,7 +31,7 @@
 #   --markers       '^\**(COMPLETE|BLOCKED|USER-NEED|USER-CONFIRM):\**'
 #                   (terminal-marker subset; emphasis-tolerant for grok's **MARKER:**)
 #   --poll-secs     15
-#   --max-idle-secs 180   (matches SKILL.md §Codex reliability no-progress threshold)
+#   --max-idle-secs 180   (matches protocol idle/no-progress guidance)
 #
 # Intended to be backgrounded by commands/execute.md step 2.b [bash-tail] branch:
 #   bash <skill-root>/scripts/watch-dispatch-tail.sh \

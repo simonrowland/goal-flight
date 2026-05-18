@@ -94,8 +94,9 @@ async def run_prompt(
 
 # Match the marker vocabulary, tolerating optional markdown emphasis around the
 # marker tag. Codex emits unwrapped `STATUS: ...`; grok wraps as `**STATUS:** ...`
-# (markdown bold for the tag, value plain). Pattern mirrors SKILL.md §Worker
-# message passing: `^\**(MARKER):\**` with the value following on the same line.
+# (markdown bold for the tag, value plain). Pattern mirrors
+# protocols/worker-markers.md: `^\**(MARKER):\**` with the value following on
+# the same line.
 _MARKERS_RE = re.compile(
     r"^\**(STATUS|RESULT|USER-NEED|USER-CONFIRM|BLOCKED|COMPLETE):\**\s*(.+?)\s*\**$",
     re.MULTILINE,
@@ -107,8 +108,8 @@ def extract_markers(text: str) -> dict[str, list[str]]:
 
     Returns {marker_type: [values...]} in source order per type. Tolerates
     optional markdown emphasis around the marker tag (grok wraps as
-    `**STATUS:** ...`; codex emits unwrapped `STATUS: ...`). See goal-flight
-    SKILL.md §Worker message passing for the vocabulary spec.
+    `**STATUS:** ...`; codex emits unwrapped `STATUS: ...`). See
+    protocols/worker-markers.md for the vocabulary spec.
 
     Empty-content matches (e.g. a bare `**STATUS:**` line) are skipped so
     they don't appear as spurious empty entries.

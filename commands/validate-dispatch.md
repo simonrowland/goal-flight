@@ -1,4 +1,13 @@
+---
+description: "Render and validate a dispatch wrapper without launching it."
+---
+
 # validate-dispatch [<goal-slug>]
+
+Read:
+
+- `protocols/dispatch-routing.md`
+- `protocols/worker-markers.md`
 
 Render and print the dispatch wrapper for a goal **without dispatching it**. Dry-run for catching malformed wrappers before burning a real Opus / codex / Grok dispatch on them.
 
@@ -26,7 +35,7 @@ This is a soft-check, not a guarantee. The heuristics catch common failure modes
    - **Layer 3** — pointer at file-map (`docs-private/rag/file-map.md`). Framing: *"Use as navigation; verify every file:line before relying."*
    - **Layer 4** — environment caveats. Only what the agent can't discover in <5s.
    - **Layer 5** — abstract self-review categories from `prompts/executor-self-review.md`. **Executor specializes in the REPORT, not in this prompt.**
-   - **Layer 6** — marker vocabulary (one line: instruct the worker to emit `STATUS:`, `RESULT:`, `USER-NEED:`, `USER-CONFIRM:`, `BLOCKED:`, `COMPLETE:` per `SKILL.md` §Worker message passing).
+   - **Layer 6** — marker vocabulary (one line: instruct the worker to emit `STATUS:`, `RESULT:`, `USER-NEED:`, `USER-CONFIRM:`, `BLOCKED:`, `COMPLETE:` per `protocols/worker-markers.md`).
 
 3. Print in a fenced block with header (slug, layer set, byte count).
 
