@@ -18,11 +18,13 @@ Schema reference: `templates/rag-corpus-schema.md.tpl` (directory shape + per-sl
 
 **Pass 1 — slice builders (parallel Claude subagents).** For each target slice, dispatch a builder. Brief: read the slice's source materials (paths come from the source-list table in `commands/init.md` step 3.5), produce a slice file at the schema-defined path with frontmatter `verified-at: <current-HEAD-SHA>`. Builder OVERWRITES for `--all` / `--rebuild`; WRITES new for `--slice` / `--next-wave`. No prompt-template file needed — the slice schema + source-list + verification-first principle are sufficient brief.
 
-**Pass 2 — per-slice reviewers (parallel Claude subagents).** Each reviewer scores its slice 1–5 per rubric (Factual / Complete / Voice / Dispatch-ready) and surfaces P0/P1/P2 findings. Block Pass 3 until P0+P1 patched.
+**Pass 2 — per-slice reviewers (parallel Claude subagents).** Each reviewer scores its slice 1–5 per rubric (Factual / Complete / Voice / Dispatch-ready) and surfaces P0/P1/P2 findings. Block Pass 3+4 until P0+P1 patched.
 
-**Pass 3 — cross-slice consolidation (one Claude Opus pass).** Pass absolute paths of ALL corpus files (including ones not rebuilt this run — drift between new and old slices is the most likely failure mode). Brief: identify cross-slice contradictions, deduplicate, fix frontmatter `verified-at` for slices reviewed but not rebuilt. Apply fixes.
+**Pass 3+4 — parallel Opus, two concurrent dispatches when workload permits.** Pass 3 and Pass 4 share inputs (Pass-1 slices + Pass-2 scores) and don't depend on each other's outputs except for the final DISPATCH-READY verdict, so they run concurrently by default. Fall back to serial only when running both in parallel would exceed Claude session-limit headroom.
 
-**Pass 4 — final assessment (one Claude Opus pass).** Aggregate per-slice scores into a quality dashboard; recommend the NEXT next-wave priorities (slices that would most improve dispatch readiness if added). Output written to RESUME-NOTES quality dashboard section.
+- **Pass 3 — cross-slice consolidation.** Pass absolute paths of ALL corpus files (including ones not rebuilt this run — drift between new and old slices is the most likely failure mode). Brief: identify cross-slice contradictions, deduplicate, fix frontmatter `verified-at` for slices reviewed but not rebuilt. Apply fixes. Returns: contradiction list + deduplicated slice content.
+- **Pass 4 — final assessment.** Aggregate per-slice Pass-2 scores into a quality dashboard; recommend the NEXT next-wave priorities (slices that would most improve dispatch readiness if added). Returns: dashboard + prioritized rebuild queue.
+- **Final composition** (controller inline, once both return): write dashboard to RESUME-NOTES quality-dashboard section; persist next-wave priorities for future `/goal-flight build-corpus` invocations; issue the CORPUS IS DISPATCH-READY / NEEDS-MORE-ITERATION verdict — DISPATCH-READY requires Pass 3's contradiction list is empty AND Pass 4's mean score ≥ threshold (configurable, default 4.0).
 
 ## After the pipeline
 

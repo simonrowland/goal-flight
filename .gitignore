@@ -12,3 +12,11 @@ docs-private/
 # Contains absolute paths specific to the local machine; not portable.
 .codex/
 
+# Claude Code per-project state: worktrees (auto-managed by `/goal-flight execute --parallel`),
+# session state, machine-local memory. None of this is portable or canonical.
+.claude/
+
+# Python bytecode (from scripts/acp_*.py + test/test_acp_*.py).
+__pycache__/
+*.pyc
+

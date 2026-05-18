@@ -12,7 +12,7 @@ before they bite mid-execute.
 
 ## What the user provides
 
-- **No args** → validate the most recent `docs-private/<topic>-goal-queue-*.md`.
+- **No args** → validate the most recent `docs-private/goal-queue-*.md` (new naming as of 0.3.0); fall back to legacy `docs-private/<topic>-goal-queue-*.md` if no new-form file exists.
 - **One arg `<queue-file>`** → validate that specific path.
 
 ## Steps
@@ -46,6 +46,12 @@ before they bite mid-execute.
      trivial single-file work, < ~30 LoC delta, no cross-module coupling.
      Heuristic check: SCOPE word count < 60 AND CHECKLIST item count ≤ 3.
      Warn if violated (probably mis-tagged).
+   - `[acp]` and `[bash-tail]` are mutually exclusive — co-occurrence on the
+     same chunk → P1 conflict warn (controller would otherwise have to pick
+     arbitrarily). `[acp]` should only appear when `docs-private/env-caveats.md`
+     shows the target adapter installed (otherwise the dispatch will fall
+     through to `[bash-tail]` at runtime; warn if env-caveats is missing OR
+     shows the adapter unavailable — execute can still proceed via fallback).
 
    **Content (P2 — quality hints):**
    - SCOPE word count: 40–250 words. Outside this range → flag.

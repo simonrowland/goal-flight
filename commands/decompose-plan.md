@@ -10,13 +10,47 @@ If the source is ambiguous, ask the user which plan they want decomposed before 
 
 ## Steps
 
-### 0. Read the goal statement (load-bearing anchor)
+### 0. Anchor against available context (read, don't gate)
 
-Read `<repo-root>/docs-private/<topic>-goal-statement-*.md` (most recent).
+The goal here is not to enforce a formal goal-statement gate — that would turn the goal-statement into the same kind of invisible-assumption document the skill exists to surface. The goal is to anchor the decomposition against *whatever signal the user has already given* about what they actually want, with explicit visibility into anything inferred.
 
-- **If absent**: bail with: "No goal statement found. Run `/goal-flight init <topic>` first to pin the high-level goal."
-- **If status is `DRAFT`**: refuse to proceed. Return: "Goal statement at `<resolved-file-path>` is still DRAFT (`<reason from file>`). Sharpen before continuing — pick one: (1) re-run `/goal-flight init <topic>` and accept the gstack `/office-hours` interrogation; or (2) edit `<resolved-file-path>` directly, replace the `Status: DRAFT — <reason>` line with `Status: CONCRETE`, then re-run `/goal-flight decompose-plan`." Cite the resolved absolute path so the user can open or `sed -i` it without re-deriving the slug.
-- **If concrete**: keep its content in mind for steps 4.5 and 6 (coherence check and summary).
+Read whatever exists, in priority order:
+
+1. **A pinned goal-statement** at `<repo-root>/docs-private/goal-<topic>-*.md` (or legacy `<topic>-goal-statement-*.md`). Read as the canonical anchor when present.
+2. **The plan source itself** — file argument, in-session conversation, or referenced architecture doc (handled in step 1).
+3. **Conversation context** — anything the user told you about intent / success criteria / non-goals in this session.
+
+Handle the goal-statement's `Status:` field as information, not as a refusal trigger:
+
+- **`Status: CONCRETE` or absent (= concrete-by-default)**: proceed normally; keep content in mind for steps 4.5 and 6.
+- **`Status: DRAFT — <reason>`**: proceed, but surface a high-priority inline-office-hours backlog item ("Goal-statement is DRAFT (`<reason>`). The decomposition will proceed on the plan source + conversation; do you want to interrogate the goal first via `/office-hours`, or sharpen the file directly, or just steer mid-run as decomposition surfaces the implicit-goal questions?"). Don't bail.
+- **Goal-statement absent entirely**: proceed on the plan source / conversation; surface a backlog item ("No pinned goal-statement found. The decomposition will use the plan source and our conversation as the anchor; if you want a more durable anchor across compactions, recommend `/goal-flight init <topic>` later — for now, proceeding."). Don't bail.
+
+**Why this is right**: see `SKILL.md` §Inline office-hours. The whole point of premise-checking is to surface invisible assumptions for validation rather than acting on them silently. A rigid "refuse if goal isn't pinned in a specific file format" gate would do the opposite — block on a single static document the user may not have engaged with, treating it as the only acceptable form of "user intent." User intent lives in the conversation, in architecture docs, in plans, in commit messages; the goal-statement is one durable anchor among many. Surface gaps in the anchor as backlog items; don't refuse the work.
+
+### 0.5. Offer a polish-skill pass on the plan source (optional, non-blocking)
+
+Before decomposing, **offer the user a polish-skill pass** on the plan source (the file arg, the in-session conversation, or whichever signal you found in step 0). The polish-skill class has two sub-classes with different outputs:
+
+- **Interrogative skills** (return *validated user answers* — load these into the premises file): gstack `/office-hours` (YC-style forcing questions), `/grill-me` (adversarial interrogation). These ask the user; the user replies; the replies are the artifact.
+- **Reviewer skills** (return *findings*, not answers — surface as backlog for the user to triage): gstack `/plan-eng-review` (engineering critique), `/eng-design-review` (design review). These produce P0/P1/P2/P3 lists about the plan; nothing in the output is itself a validated premise.
+
+Most often `/office-hours` (interrogative, default). The frontier model can pick differently based on what the plan most needs, or embody the gist directly in its own assistant text. See `SKILL.md` §Inline office-hours for the polish-skill class and the architectural rule.
+
+**Architectural rule** (mirror of `commands/init.md` step 2.5): user-interrogation runs on the orchestrator (this Claude Code session) — Claude-side `Skill(skill: "<name>", args: "...")` OR orchestrator-embodied gist. **Never** `codex exec '/office-hours ...'` or any worker-side dispatch of an interrogative skill — workers have no user-facing channel. Reviewer skills (the second sub-class above) CAN dispatch as workers because they return findings rather than ask questions.
+
+Prompt the user (concisely):
+
+> "Before I decompose this plan, want a polish-skill pass to sharpen it? gstack `/office-hours` is the default (forcing questions on who's the user, what changes when done, narrowest wedge, success criteria) — interrogative, returns your validated answers. Other interrogative: `/grill-me` (adversarial). Reviewer skills (return findings, not answers): `/plan-eng-review` (engineering critique). Or I can skip and just decompose the plan as-is — premise-checks will surface during execution. (y for office-hours / `<name>` for a specific skill / n to skip)"
+
+Three outcomes:
+
+- **Accept interrogative**: invoke Claude-side (or embody the gist); distill the user's validated answers into `docs-private/premises-<topic>-<today>.md` Validated section; use the polished plan as input to step 1.
+- **Accept reviewer**: invoke (Claude-side or worker-side); surface the P0/P1 findings to the user; per-finding, the user decides whether to revise the plan, accept the finding into the goal-statement, or note as a known-limitation. Findings are NOT premises; they're todos against the plan. Use the (possibly revised) plan as input to step 1.
+- **Decline**: proceed directly to step 1 with the plan as-is. The inline-office-hours backlog (per `SKILL.md` §Inline office-hours) will surface premise-checks during execution — declining here doesn't disable that.
+- **Already-concrete plan**: if step 0 found a `Status: CONCRETE` goal-statement AND the plan source has explicit acceptance criteria, you can skip the offer silently — the polish is unlikely to surface anything new.
+
+This is the front-end complement to inline-office-hours' per-chunk premise-checks during execution. Polish the upstream artifact before decomposing; pepper for drift during execution.
 
 ### 1. Establish plan source
 
@@ -75,7 +109,7 @@ When drafter completes, **analyst** (Explore): identify parallel-safe chunks AND
 
 ### 3. Write to goal-queue
 
-Write to `<repo-root>/docs-private/<topic>-goal-queue-<today>.md` with this shape:
+Write to `<repo-root>/docs-private/goal-queue-<topic>-<today>.md` (new naming; legacy `<topic>-goal-queue-<date>.md` from <0.3.0 still accepted on read) with this shape:
 
 ```
 # <TOPIC> Goal Queue
@@ -101,6 +135,8 @@ Tags (see SKILL.md for full definitions):
 - [goal-mode] — chunk warrants the iteration loop primitive (codex /goal native or external Opus/Grok loop)
 - [max-iterations:<N>] — cap for [goal-mode] external loops
 - [mixed-executor] — iterations cross executor types for model-diversity stuck-loop recovery
+- [acp] — force ACP transport (structured events; persistent session); see SKILL.md §Transport choice. Untagged-ACP-capable chunks default to ACP if `docs-private/env-caveats.md` shows the adapter installed
+- [bash-tail] — force legacy Bash-`&`-tail-file dispatch (explicit fallback when ACP overhead isn't worth it, or target worker doesn't speak ACP)
 
 ## Universal preconditions
 - All passing tests stay green; new tests added per goal
@@ -118,19 +154,19 @@ If a same-day file exists, append new chunks numbered after the last existing en
 
 **Claude challenger** — preferred Claude-side path:
 
-- If gstack registered on Claude side (`~/.claude/skills/gstack/` exists): invoke `Skill(skill: "plan-eng-review", args: "<path to docs-private/<topic>-goal-queue-<today>.md>. Reference: docs-private/<topic>-goal-statement-*.md, AGENTS.md.")` directly, OR dispatch a subagent that invokes it (use subagent if you want to isolate context).
+- If gstack registered on Claude side (`~/.claude/skills/gstack/` exists): invoke `Skill(skill: "plan-eng-review", args: "<path to docs-private/goal-queue-<topic>-<today>.md>. Reference: docs-private/goal-<topic>-*.md, AGENTS.md.")` directly, OR dispatch a subagent that invokes it (use subagent if you want to isolate context). (Legacy file naming patterns from <0.3.0 also accepted on read.)
 - If gstack absent on Claude side: spawn a subagent (Agent tool, general-purpose) with `prompts/decomposition-review.md` prompt + same plan + decomposition + the goal-statement pasted in.
 
 **Codex challenger** (background, parallel second opinion):
 
 - If gstack registered on codex side (`~/.codex/skills/gstack/` exists):
   ```bash
-  timeout --kill-after=10 300 codex exec '/plan-eng-review <path to docs-private/<topic>-goal-queue-<today>.md>. Reference: docs-private/<topic>-goal-statement-*.md, AGENTS.md.' > /tmp/goal-flight-decomp-codex-<topic>.txt 2>&1 &
+  timeout --kill-after=10 300 codex exec '/plan-eng-review <path to docs-private/goal-queue-<topic>-<today>.md>. Reference: docs-private/goal-<topic>-*.md, AGENTS.md.' > /tmp/goal-flight-decomp-codex-<topic>.txt 2>&1 &
   ```
 - If gstack absent on codex side — point codex at the prompt file on disk, don't paste its contents into the exec arg:
   ```bash
   timeout --kill-after=10 300 codex exec \
-    "Read ~/.claude/skills/goal-flight/prompts/decomposition-review.md in full and execute it. Plan: <path-to-plan-file>. Drafted decomposition: docs-private/<topic>-goal-queue-<today>.md. Goal-statement: docs-private/<topic>-goal-statement-*.md. If your context compacts mid-review, re-read the prompts file — the file is the unparaphrased source of truth." \
+    "Read ~/.claude/skills/goal-flight/prompts/decomposition-review.md in full and execute it. Plan: <path-to-plan-file>. Drafted decomposition: docs-private/goal-queue-<topic>-<today>.md (or legacy <topic>-goal-queue-<today>.md from <0.3.0). Goal-statement: docs-private/goal-<topic>-*.md (or legacy <topic>-goal-statement-*.md). If your context compacts mid-review, re-read the prompts file — the file is the unparaphrased source of truth." \
     > /tmp/goal-flight-decomp-codex-<topic>.txt 2>&1 &
   ```
   Avoids spamming the controller's tokens with pre-pasted prompt + plan + decomposition; survives codex session compaction; bypasses any CLI argument length limit. Same principle as `SKILL.md` §Codex reliability "keep the prompt short — pass pointers."
@@ -165,7 +201,7 @@ Before declaring decompose-plan done, print to the user:
 - **Parallel-safe groups**: K (with chunk counts per group)
 - **Estimated commit count**: N (one per chunk) + ~N/5 for milestone fix-clusters
 - **Files the user should review before launching execute**:
-  - `docs-private/<topic>-goal-queue-<today>.md`
+  - `docs-private/goal-queue-<topic>-<today>.md`
   - `docs-private/RESUME-NOTES-<today>.md` (if updated)
   - Any binding-spec or plan-of-record referenced
 

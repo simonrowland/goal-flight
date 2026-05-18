@@ -4,6 +4,261 @@ Notable changes to the goal-flight Claude Code skill. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are
 incremented when meaningful skill behaviour changes.
 
+## [0.3.0] — 2026-05-18
+
+Minor-bump release; folds two parallel adversarial reviews (Claude challenger
+via Agent + codex challenger via `codex exec --dangerously-bypass-approvals-and-sandbox`;
+both verdicts `block` pre-fold) PLUS the ACP transport implementation from a
+sibling worktree (`scripts/acp_client.py` vendored from
+aws-samples/sample-acp-bridge with goal-flight-specific corrections; pool +
+runner + tests). Findings folded inline before commit, per the
+review-before-commit workflow rule (we do convergence reviews on staged
+changes BEFORE the public-repo commit, so history doesn't read as "ship X,
+oops, X+1").
+
+### Added — ACP transport (Agent Client Protocol)
+
+- **`scripts/acp_client.py`** — vendored from
+  [aws-samples/sample-acp-bridge](https://github.com/aws-samples/sample-acp-bridge)
+  @ `2cd3c86`, MIT-0, with corrections needed for goal-flight's controller
+  use-case: (1) `auto_allow_tools: bool = False` default — upstream
+  auto-allowed every tool call unconditionally (fine for chat-bridge, bad for
+  a controller that wants user-confirmation surface); (2) **Permission
+  response schema corrected** to the ACP spec — upstream sent
+  `{"optionId": "allow_always"}` which codex-acp rejects with -32700
+  `missing field 'outcome'`; correct shape is
+  `{"outcome": {"outcome": "selected", "optionId": "<id-from-request.options>"}}`
+  with options introspection (prefer `kind="allow_always"`, fall back to
+  `allow_once`, then to `options[0]`); (3) **asyncio reader limit bumped to
+  8 MB** — default 65 KB chokes on goal-mode workers that stream long
+  reasoning traces as single lines; (4) **`close_gracefully()`** — capability-gated
+  `session/close`, then stdin close, soft-timeout wait, kill escalation;
+  AcpConnection is async context manager; (5) **Ghost-cleanup pidfile
+  upgraded to JSON-Lines with identity disambiguation** — upstream killed by
+  PID alone, which on Mac (fast PID reuse) would SIGKILL unrelated processes
+  after a controller restart; new cleanup verifies live `ps lstart+comm` against
+  recorded values before killing.
+- **`scripts/acp_pool.py`** — production-shaped wrapper around `AcpProcessPool`:
+  `managed_pool()` async context manager wires SIGINT/SIGTERM/atexit handlers
+  so controller crashes drain the pool. `compute_pool_ceiling()` reads
+  `docs-private/env-caveats.md` for box RAM and computes `max_processes`
+  using `(RAM_MB - 2048) // 1200` (worst-case worker RSS = cursor-agent peak,
+  controller reserve 2 GB), capped at the AcpProcessPool default 20.
+- **`scripts/acp_runner.py`** — ergonomic wrapper: `PromptResult` dataclass
+  accumulating `agent_message_chunk` text / thoughts / tool_calls / plan /
+  stop_reason / error from `session_prompt` notifications. `run_prompt()`
+  with `idle_timeout` (default 300 s; raise for goal-mode dispatches that
+  run multi-minute between events). `extract_markers()` pulls
+  `STATUS:` / `RESULT:` / `USER-NEED:` / `USER-CONFIRM:` / `BLOCKED:` /
+  `COMPLETE:` lines from accumulated text, tolerating optional markdown
+  emphasis around marker tags (`**STATUS:** ...` style as emitted by grok;
+  unwrapped `STATUS: ...` as emitted by codex) — matches the
+  `^\**(MARKER):\**` regex from SKILL.md §Worker message passing.
+- **`scripts/probe-box-capacity.sh`** — captures Mac/Linux box RAM + CPU +
+  presence of `codex-acp`, `grok agent stdio`, `cursor-agent`,
+  `claude-code-cli-acp`. Writes `docs-private/env-caveats.md` for the
+  dispatch wrapper's Layer 4 to reference. Idempotent.
+- **`test/test_acp_pipe.py`** — smoke test: vendored ACP client + ergonomic
+  runner against an in-process `test/fixtures/acp_echo_agent.py`. Proves
+  end-to-end JSON-RPC over stdio works without external worker CLIs / auth /
+  network. Covers: ACP pipe roundtrip, runner accumulator, marker extractor
+  (both codex-style unwrapped `STATUS:` and grok-style `**STATUS:**` markdown
+  emphasis), pidfile identity safety against PID reuse, `compute_pool_ceiling`
+  formula + fallback cases, `managed_pool()` async context manager teardown.
+- **`test/test_acp_failure_modes.py`** — failure-mode tests: (a) worker
+  process killed mid-prompt → connection-closed sentinel; (b) controller
+  crash / cleanup-under-load via `pool.shutdown()`; (c) broken stdio pipe
+  (worker writes garbage between valid frames).
+- **`test/dispatch_acp_chunk.py`** — live end-to-end test against real
+  `codex-acp` (requires the adapter on PATH + auth). Not in `tests/run.sh`
+  because it's not hermetic; documents the chunk-dispatch loop via
+  `managed_pool` → `get_or_create` → `run_prompt` → `extract_markers`.
+- **`test/probe_real_worker.py`** + **`test/probe_worker_memory.py`** —
+  resource probes for re-measuring worker RSS / ACP capabilities against a
+  different box class. Output feeds the worst-case RSS budget used by
+  `compute_pool_ceiling()`.
+
+### Added — dispatch model integration
+
+- **`SKILL.md` §Transport choice — ACP-first when available**: ACP composes
+  with the single-shot and goal-mode workflow shapes as a structured transport.
+  Untagged-ACP-capable chunks default to ACP; force with `[acp]` or back-off
+  to `[bash-tail]`. Pool capacity auto-derived from `env-caveats.md`.
+  Workers that don't speak ACP (or where the adapter is missing) fall through
+  to Bash-`&`-tail-file automatically.
+- **`commands/execute.md` step 2.b**: new `[acp]` dispatch branch driving
+  `AcpProcessPool` + `acp_runner.run_prompt()`; new `[bash-tail]` branch
+  holding the legacy Bash-`&`-tail-file shape; Untagged now picks
+  transport-by-availability rather than hard-coding shell-out.
+- **`commands/init.md` step 1.5**: new step running
+  `scripts/probe-box-capacity.sh` to capture box RAM + ACP-worker availability
+  to `docs-private/env-caveats.md`. Idempotent re-run on box change.
+
+### Added — controller stewardship surface
+
+- **§Inline office-hours — premise re-validation against drift** (`SKILL.md`).
+  Largest conceptual addition. Backlog of premise-checks ride alongside
+  dispatch turns: inferred premises (controller filling absences), gap-fills
+  (the absence itself signals a missing-spec), and forward considerations
+  (thinking-partner observations). Cherry-pick logic; non-blocking by default;
+  validated answers land in `docs-private/premises-<topic>-<date>.md` so they
+  survive compaction and feed executor dispatches via Layer 4. The mechanism
+  is opportunistic — frontier-model judgment over when/what/how, not
+  rigid automation.
+- **Worker message-passing marker vocabulary** (`SKILL.md` §Worker message
+  passing). Six worker→controller markers: `STATUS:`, `RESULT:`, `USER-NEED:`,
+  `USER-CONFIRM:`, `BLOCKED:`, `COMPLETE:`. One controller→worker marker:
+  `USER-CLARIFICATION:` (prepended on re-dispatch after a `USER-NEED:` is
+  answered). Polling shapes for Bash `&` / Agent / ACP transports; pattern
+  is markdown-emphasis-tolerant (`^\**(STATUS|...|COMPLETE):\**`) so codex
+  and grok formatting both parse. Added as Layer 6 of `prompts/dispatch-wrapper.md`;
+  validate-dispatch warns when missing.
+- **Polish-skill class** (`commands/init.md` step 2.5, `commands/decompose-plan.md`
+  step 0.5). Two sub-classes: interrogative skills (`/office-hours`, `/grill-me`)
+  that return validated user answers, and reviewer skills (`/plan-eng-review`,
+  `/eng-design-review`) that return findings. Interrogative skills run on the
+  orchestrator (Claude-side `Skill(...)` or orchestrator-embodied gist) because
+  workers have no user-facing channel; reviewer skills can dispatch as workers.
+- **Memory companions** (`SKILL.md` §Memory companions). CASS + Hindsight as
+  opt-in markdown-augmenters. Plain dated markdown remains the default.
+- **Skill-loaded fingerprint header** for cross-session drift detection. Init
+  step 1 / dispatch-wrapper / RESUME-NOTES carry `Skill-loaded: <version>@<sha> fprint:<8hex>`;
+  pre-flight probe 4 catches version drift between session start and dispatch.
+
+### Changed — naming convention
+
+- **Goal-statement, goal-queue, and premises files use clustered prefix**:
+  `goal-<topic>-<date>.md` (was `<topic>-goal-statement-<date>.md`),
+  `goal-queue-<topic>-<date>.md` (was `<topic>-goal-queue-<date>.md`),
+  `premises-<topic>-<date>.md` (new). The new prefix lets the three peer
+  artifacts cluster when scrolling `docs-private/`. Legacy file naming is
+  still accepted on read — `init` writes new naming, downstream commands
+  prefer new and fall back to legacy. No migration required for existing
+  projects.
+
+### Verified empirically (2026-05-17)
+
+- **Codex `/goal` non-interactive dispatch** accepts prompts up to 4407 chars
+  cleanly on codex 0.130.0 + gpt-5.5 (probe: `/tmp/codex-goal-size-probe.md` →
+  `/tmp/codex-goal-probe.out`). The 4 KB limit prior versions cited applies
+  only to the interactive `/goal` slash command, not the `codex exec - <
+  prompt.md` path goal-flight uses. SKILL.md / prompts/dispatch-wrapper.md /
+  commands/execute.md prose updated to distinguish the two entry paths.
+- **Codex autonomous edit requires `--dangerously-bypass-approvals-and-sandbox`**.
+  Without the flag, codex correctly emits `BLOCKED: filesystem is read-only and
+  approvals are disabled` after attempting the first edit. With the flag, the
+  full edit → pytest → green loop completes in ~92 s. Safety story is
+  load-bearing: the bypass flag trades sandboxing for autonomy; the worktree
+  boundary only provides external sandboxing when `<workdir>` is a sibling
+  worktree (parallel mode), not when `<workdir>` is the controller cwd
+  (sequential mode). Always pass `-C <workdir>` explicitly so the safety
+  story has a defined surface; in sequential mode the per-chunk diff-verify
+  is the only fence. Verified at `templates/codex-goal-prompt.md.tpl:19` and
+  `SKILL.md` §Codex reliability.
+- **Grok `/implement` is an interactive slash command** (activates the
+  `implementer` role bundled in `~/.grok/agents`), NOT a headless CLI flag.
+  Headless equivalent goal-flight uses: `grok --prompt-file <f> --cwd <path>
+  --permission-mode acceptEdits --output-format plain > <tail> 2>&1 &`.
+  `--permission-mode acceptEdits` is required for autonomous file edits.
+
+### Changed — controller framing
+
+- **README opening + SKILL opening** reframe the controller as **high-level
+  management, not execution**. The controller holds enough context about goal,
+  scenery, and intent to exercise discretion and recommend next moves; actual
+  work dispatches to workers (Claude subagents, codex, grok) that don't need
+  that context. This is the frontier of lightly-supervised development:
+  user ratifies suggested moves, redirects when needed, trusts the controller
+  to keep the project anchored across compactions and unattended hours.
+- **Dispatch-mode-by-duration rule**: any tool call expected to take more than
+  ~10 s runs in background, so the user's terminal doesn't hang. Rule applies
+  to the tool call's duration, not the subagent type. Replaces the prior
+  "subagent foreground / codex-grok background" type-based prescription.
+- **Goal-statement as working signal, not rigid gate**: `decompose-plan` proceeds
+  on whatever signal exists (goal-statement when present, plus plan source,
+  architecture doc, in-session conversation), surfacing inferred assumptions as
+  backlog items. DRAFT state no longer blocks downstream commands.
+- **Codex bypass-flag safety story is honest about sequential vs parallel mode**.
+  Prior prose implied "worktree boundary provides external sandboxing" universally;
+  in sequential mode the bypass dispatches against the controller cwd with no
+  sandbox. Diff-verify is the only fence in that mode. Sites: SKILL.md §Codex
+  reliability, commands/execute.md step 2.b, templates/codex-goal-prompt.md.tpl.
+
+### Fixed — pre-commit reviewer sweep (this release's findings)
+
+- **Naming-rename completed across all sites** that had stale legacy paths
+  inside the same release: `commands/init.md` step 3 + RESUME-NOTES template,
+  `commands/execute.md` step 1 queue lookup, `commands/validate-dispatch.md`
+  step 1, `commands/validate-queue.md` no-args lookup, three prompt files
+  (`ask-anticipatory.md`, `gstack-claude-review.md`, `gstack-codex-challenge.md`).
+- **Layer 5 → Layer 6 cross-references** in SKILL.md and dispatch-wrapper.md
+  (the new marker-vocabulary layer is Layer 6, not 5).
+- **`validate-dispatch.md` heuristic for Layer 6**: warns when the
+  marker-vocabulary line is missing — without it, workers can't signal back
+  through the marker channel.
+- **Private-domain leak in worked examples**: the inline-office-hours section's
+  example was specific to plasma-physics research; replaced with a
+  domain-agnostic `status='cancelled'` rows / aggregate example readable by
+  any project. The codex-goal-prompt template's pre-paste-anti-example
+  similarly genericized.
+
+### Fixed — second-pass reviewer findings (post-ACP-absorb)
+
+- **`AcpProcessPool` now plumbs `auto_allow_tools` through `_spawn()` to every
+  spawned `AcpConnection`**. Pre-fix, `managed_pool()` was advertised as
+  enabling controller-side auto-allow but the pool's spawn path constructed
+  connections with the default `auto_allow_tools=False`, so every dispatched
+  worker would hang on the first `session/request_permission` request. Empirically
+  confirmed by the second-pass codex reviewer via live `test/dispatch_acp_chunk.py`
+  failure (no deliverable, no markers). `managed_pool()` defaults
+  `auto_allow_tools=True` because the goal-flight controller decides chunk
+  acceptability before dispatching, not per-tool-call.
+- **`compute_pool_ceiling()` fallback no longer fail-opens to 20**. Missing
+  `env-caveats.md` (likely a fresh install where `init.md` step 1.5 hasn't run)
+  → returns `CONSERVATIVE_FALLBACK_CEILING = 4` instead of `hard_cap = 20`. The
+  hard-cap fallback would have happily spawned 20 cursor workers (~24 GB RSS) on
+  an unknown box — unsafe default for laptops including small Macs.
+- **`probe-box-capacity.sh` actually verifies `grok agent stdio` is supported**
+  rather than declaring success on `command -v grok`. Older grok versions don't
+  ship the `agent` subcommand; previously the probe would falsely advertise
+  ACP-mode availability.
+- **`probe-box-capacity.sh` capacity guidance table corrected** — the 8 GB row
+  said "4 concurrent" while the formula `(8192-2048)/1200 = 5.12 → 5` yields 5.
+- **`commands/decompose-plan.md` tag dictionary now includes `[acp]` and
+  `[bash-tail]`**; `commands/validate-queue.md` schema validates them
+  (mutually exclusive; `[acp]` warns when env-caveats shows adapter
+  unavailable). Without these, the new dispatch tags were undocumented for
+  the decomposer pass.
+- **`commands/execute.md` parallel mode (§3.b)**: ACP-parallel called out as
+  forward work — current `--parallel` dispatches Claude subagents only;
+  pool-aware parallel coordinator is a future-release feature.
+- **`README.md`**: "Three dispatch paths" now notes the ACP transport overlay;
+  Quickstart mentions the new env-caveats artifact written by `init` step 1.5.
+- **CHANGELOG accuracy**: failure-mode test scenarios corrected from the
+  earlier "oversized response, permission denial" claim to the actual three
+  scenarios in the file. Test coverage for the chunk-dispatch loop and resource
+  probes now properly enumerated.
+- **Missing `docs-private/notes/acp-pipe-validation-2026-05-17.md` citations
+  softened** to point at the in-tree `test/` smoke + failure-mode tests as the
+  real evidence base; the original citation was to a docs-private note that
+  doesn't ship with the public repo.
+- **`scripts/acp_runner.py` marker regex tested against grok-emphasis form**
+  (`**STATUS:** ...`) — the regex was designed to tolerate it but the test
+  fixture only exercised codex-style unwrapped markers. Tests now cover both
+  branches plus single-asterisk emphasis variants.
+
+### Tests
+
+- **3 bash suites** (`tests/run.sh`): `test-install-codex-overrides.sh`,
+  `test-register-context-mode-codex.sh`, `test-self-fork-detect.sh`. All
+  green.
+- **2 Python suites** (`python3 test/test_acp_pipe.py && python3 test/test_acp_failure_modes.py`):
+  ACP smoke + runner + markers + pidfile safety + pool ceiling + managed pool;
+  failure modes (worker-killed-mid-prompt, broken stdio pipe, cleanup under
+  load). All green.
+- **`test/dispatch_acp_chunk.py`** — live end-to-end against real `codex-acp`;
+  not hermetic, runs manually only.
+
 ## [0.2.8] — 2026-05-16
 
 Convergence-fix sweep against parallel adversarial reviews (codex challenge +

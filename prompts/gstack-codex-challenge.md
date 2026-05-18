@@ -12,7 +12,7 @@ adversarial pass before the next batch dispatches.
 CONTEXT
 - Working directory: <repo-root> (you are running locally; full filesystem access).
 - Commit range under review: <start-hash>..<end-hash>
-- Goal-queue file: <path to docs-private/<topic>-goal-queue-*.md>
+- Goal-queue file: <path to docs-private/goal-queue-<topic>-*.md, or legacy <topic>-goal-queue-*.md from <0.3.0>
 - Reference docs (if applicable): <list paths to AGENTS.md, binding-spec, plan-of-record>
 - Recent commits (newest first):
 
