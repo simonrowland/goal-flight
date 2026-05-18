@@ -138,10 +138,187 @@ async def case_c_broken_stdio_garbage() -> None:
         shim_path.unlink(missing_ok=True)
 
 
+async def case_d_idle_timeout_zero_disables_timeout() -> None:
+    """idle_timeout=0 is documented as no timeout; verify it waits for a
+    delayed final response instead of immediately returning agent_timeout."""
+    shim_path = Path(f"/tmp/acp-delay-shim-{os.getpid()}.py")
+    shim_path.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys, time\n"
+        "sessions = {}\n"
+        "def send(obj): print(json.dumps(obj), flush=True)\n"
+        "for line in sys.stdin:\n"
+        "    try:\n"
+        "        msg = json.loads(line)\n"
+        "    except Exception:\n"
+        "        continue\n"
+        "    method = msg.get('method', '')\n"
+        "    req_id = msg.get('id')\n"
+        "    params = msg.get('params', {}) or {}\n"
+        "    if method == 'initialize':\n"
+        "        send({'jsonrpc':'2.0','id':req_id,'result':{'protocolVersion':1,'agentInfo':{'name':'delay-shim','version':'0'},'capabilities':{}}})\n"
+        "    elif method == 'session/new':\n"
+        "        sessions['s'] = {'cwd': params.get('cwd', '/tmp')}\n"
+        "        send({'jsonrpc':'2.0','id':req_id,'result':{'sessionId':'s'}})\n"
+        "    elif method == 'session/prompt':\n"
+        "        text = ''.join(p.get('text','') for p in params.get('prompt', []) if p.get('type') == 'text')\n"
+        "        time.sleep(0.25)\n"
+        "        send({'jsonrpc':'2.0','method':'session/update','params':{'sessionId':'s','update':{'sessionUpdate':'agent_message_chunk','content':{'text':'delayed: '+text}}}})\n"
+        "        send({'jsonrpc':'2.0','id':req_id,'result':{'sessionId':'s','stopReason':'end_turn'}})\n"
+        "    elif method == 'session/cancel':\n"
+        "        pass\n"
+    )
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, str(shim_path),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+            limit=8 * 1024 * 1024,
+        )
+        async with AcpConnection(agent="delay", session_id="d", proc=proc) as conn:
+            init = await conn.initialize()
+            assert init["agentInfo"]["name"] == "delay-shim", f"unexpected init: {init}"
+            await conn.session_new(cwd="/tmp")
+            result = await asyncio.wait_for(
+                run_prompt(conn, "slow", idle_timeout=0),
+                timeout=3,
+            )
+            assert result.ok, f"expected delayed success, got err={result.error} stop={result.stop_reason!r}"
+            assert "delayed: slow" in result.text, f"expected delayed text, got {result.text!r}"
+    finally:
+        shim_path.unlink(missing_ok=True)
+
+
+async def case_e_idle_timeout_clears_pending_and_reuses_connection() -> None:
+    """Timed-out session/prompt calls must not leak _pending entries and the
+    same ACP connection should remain usable for a later prompt."""
+    shim_path = Path(f"/tmp/acp-timeout-shim-{os.getpid()}.py")
+    shim_path.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        "sessions = {}\n"
+        "def send(obj): print(json.dumps(obj), flush=True)\n"
+        "for line in sys.stdin:\n"
+        "    try:\n"
+        "        msg = json.loads(line)\n"
+        "    except Exception:\n"
+        "        continue\n"
+        "    method = msg.get('method', '')\n"
+        "    req_id = msg.get('id')\n"
+        "    params = msg.get('params', {}) or {}\n"
+        "    if method == 'initialize':\n"
+        "        send({'jsonrpc':'2.0','id':req_id,'result':{'protocolVersion':1,'agentInfo':{'name':'timeout-shim','version':'0'},'capabilities':{}}})\n"
+        "    elif method == 'session/new':\n"
+        "        sessions['s'] = {'cwd': params.get('cwd', '/tmp')}\n"
+        "        send({'jsonrpc':'2.0','id':req_id,'result':{'sessionId':'s'}})\n"
+        "    elif method == 'session/prompt':\n"
+        "        text = ''.join(p.get('text','') for p in params.get('prompt', []) if p.get('type') == 'text')\n"
+        "        if text == 'hang':\n"
+        "            continue\n"
+        "        send({'jsonrpc':'2.0','method':'session/update','params':{'sessionId':'s','update':{'sessionUpdate':'agent_message_chunk','content':{'text':'ok: '+text}}}})\n"
+        "        send({'jsonrpc':'2.0','id':req_id,'result':{'sessionId':'s','stopReason':'end_turn'}})\n"
+        "    elif method == 'session/cancel':\n"
+        "        pass\n"
+    )
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, str(shim_path),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+            limit=8 * 1024 * 1024,
+        )
+        async with AcpConnection(agent="timeout", session_id="e", proc=proc) as conn:
+            init = await conn.initialize()
+            assert init["agentInfo"]["name"] == "timeout-shim", f"unexpected init: {init}"
+            await conn.session_new(cwd="/tmp")
+            timed_out = await asyncio.wait_for(
+                run_prompt(conn, "hang", idle_timeout=0.1),
+                timeout=3,
+            )
+            assert timed_out.error is not None, "expected idle timeout error"
+            assert timed_out.error.get("message") == "agent_timeout (idle)", timed_out.error
+            assert conn._pending == {}, f"pending request leaked after timeout: {conn._pending!r}"
+
+            recovered = await asyncio.wait_for(
+                run_prompt(conn, "hello", idle_timeout=3),
+                timeout=3,
+            )
+            assert recovered.ok, f"connection not reusable: err={recovered.error} stop={recovered.stop_reason!r}"
+            assert "ok: hello" in recovered.text, f"expected recovery text, got {recovered.text!r}"
+    finally:
+        shim_path.unlink(missing_ok=True)
+
+
+async def case_f_cancelled_send_request_clears_pending() -> None:
+    """If an awaiter cancels _send_request (e.g. wait_for timeout), the request
+    future must be removed so later responses/prompts don't inherit stale state."""
+    shim_path = Path(f"/tmp/acp-cancel-request-shim-{os.getpid()}.py")
+    shim_path.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        "def send(obj): print(json.dumps(obj), flush=True)\n"
+        "for line in sys.stdin:\n"
+        "    try:\n"
+        "        msg = json.loads(line)\n"
+        "    except Exception:\n"
+        "        continue\n"
+        "    method = msg.get('method', '')\n"
+        "    req_id = msg.get('id')\n"
+        "    params = msg.get('params', {}) or {}\n"
+        "    if method == 'initialize':\n"
+        "        send({'jsonrpc':'2.0','id':req_id,'result':{'protocolVersion':1,'agentInfo':{'name':'cancel-request-shim','version':'0'},'capabilities':{}}})\n"
+        "    elif method == 'session/new':\n"
+        "        send({'jsonrpc':'2.0','id':req_id,'result':{'sessionId':'s'}})\n"
+        "    elif method == 'stall/request':\n"
+        "        continue\n"
+        "    elif method == 'session/prompt':\n"
+        "        text = ''.join(p.get('text','') for p in params.get('prompt', []) if p.get('type') == 'text')\n"
+        "        send({'jsonrpc':'2.0','method':'session/update','params':{'sessionId':'s','update':{'sessionUpdate':'agent_message_chunk','content':{'text':'ok: '+text}}}})\n"
+        "        send({'jsonrpc':'2.0','id':req_id,'result':{'sessionId':'s','stopReason':'end_turn'}})\n"
+        "    elif method == 'session/cancel':\n"
+        "        pass\n"
+    )
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, str(shim_path),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+            limit=8 * 1024 * 1024,
+        )
+        async with AcpConnection(agent="cancel-request", session_id="f", proc=proc) as conn:
+            init = await conn.initialize()
+            assert init["agentInfo"]["name"] == "cancel-request-shim", f"unexpected init: {init}"
+            await conn.session_new(cwd="/tmp")
+            try:
+                await asyncio.wait_for(conn._send_request("stall/request", {}), timeout=0.1)
+                raise AssertionError("stall/request unexpectedly returned")
+            except asyncio.TimeoutError:
+                pass
+            assert conn._pending == {}, f"pending request leaked after cancellation: {conn._pending!r}"
+
+            recovered = await asyncio.wait_for(
+                run_prompt(conn, "after-cancel", idle_timeout=3),
+                timeout=3,
+            )
+            assert recovered.ok, f"connection not reusable: err={recovered.error} stop={recovered.stop_reason!r}"
+            assert "ok: after-cancel" in recovered.text, f"expected recovery text, got {recovered.text!r}"
+    finally:
+        shim_path.unlink(missing_ok=True)
+
+
 async def main() -> None:
     await case_a_worker_killed_mid_prompt()
     await case_b_pool_shutdown_drains_live_connection()
     await case_c_broken_stdio_garbage()
+    await case_d_idle_timeout_zero_disables_timeout()
+    await case_e_idle_timeout_clears_pending_and_reuses_connection()
+    await case_f_cancelled_send_request_clears_pending()
     print("OK: all failure-mode tests pass")
 
 

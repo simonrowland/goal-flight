@@ -85,6 +85,7 @@ A fresh project trips none of these. They cost ~50 ms (~200 ms on slow-startup s
 /goal-flight decompose-plan [<plan-file>] # break a plan into /goal chunks; review the decomposition
 /goal-flight ask-questions [<scope>]      # spawn anticipatory subagents; surface clarifying questions
 /goal-flight execute [--parallel <N>]     # run the per-chunk loop
+/goal-flight doctor                       # read-only health check: plugin/package/runtime readiness
 /goal-flight build-corpus [<flags>]       # extend / rebuild the docs-private/rag/ corpus
 /goal-flight register-codex [<path>]      # register a project as codex-trusted (re-run safely)
 /goal-flight validate-dispatch [<slug>]   # dry-run a dispatch wrapper; catch malformed layers

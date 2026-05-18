@@ -262,9 +262,13 @@ class AcpConnection:
         except (ConnectionResetError, BrokenPipeError, OSError) as e:
             # Worker stdin closed (process likely dead). Don't leak the pending
             # future; raise a clean AcpError so callers can classify cleanly.
-            self._pending.pop(req_id, None)
+            self._discard_pending(req_id)
             raise AcpError(f"{method}: send failed (worker likely dead): {e}") from e
-        result = await fut
+        try:
+            result = await fut
+        except asyncio.CancelledError:
+            self._discard_pending(req_id)
+            raise
         if "error" in result:
             raise AcpError(f"ACP error on {method}: {result['error']}")
         return result.get("result")
@@ -274,6 +278,12 @@ class AcpConnection:
         if params is not None:
             msg["params"] = params
         await self._send(msg)
+
+    def _discard_pending(self, req_id: int) -> None:
+        """Drop a request future when the caller has stopped waiting for it."""
+        fut = self._pending.pop(req_id, None)
+        if fut is not None and not fut.done():
+            fut.cancel()
 
     def _start_reader(self) -> None:
         self._reader_task = asyncio.create_task(self._read_loop())
@@ -399,11 +409,13 @@ class AcpConnection:
         finally:
             self._unsubscribe(sub_id)
 
-    async def session_prompt(self, prompt: str, idle_timeout: float = 300) -> AsyncIterator[dict]:
+    async def session_prompt(self, prompt: str, idle_timeout: float | None = 300) -> AsyncIterator[dict]:
         self.last_active = time.time()
         last_event_time = time.time()
         sub_id, q = self._subscribe()
         req_id = self._next_id()
+        timeout_enabled = idle_timeout is not None and idle_timeout > 0
+        cancel_sent = False
         msg = {
             "jsonrpc": "2.0", "id": req_id, "method": "session/prompt",
             "params": {
@@ -419,7 +431,7 @@ class AcpConnection:
             # Worker stdin closed before we could send the prompt. Yield a
             # clean error sentinel + return so callers don't see raw asyncio
             # exceptions.
-            self._pending.pop(req_id, None)
+            self._discard_pending(req_id)
             self._unsubscribe(sub_id)
             yield {"_prompt_result": {"error": {"code": -1, "message": f"send failed: {e}"}}}
             return
@@ -428,7 +440,14 @@ class AcpConnection:
             while True:
                 if fut.done():
                     break
-                if time.time() - last_event_time > idle_timeout:
+                if timeout_enabled and time.time() - last_event_time > idle_timeout:
+                    self._discard_pending(req_id)
+                    if self.alive and self.acp_session_id is not None:
+                        try:
+                            await self.session_cancel()
+                            cancel_sent = True
+                        except (ConnectionResetError, BrokenPipeError, OSError, AcpError) as e:
+                            log.warning("session_cancel after idle timeout failed: %s", e)
                     yield {"_prompt_result": {"error": {"code": -1, "message": "agent_timeout (idle)"}}}
                     return
                 try:
@@ -455,6 +474,13 @@ class AcpConnection:
             result = fut.result() if fut.done() else {"error": {"code": -1, "message": "no response"}}
             yield {"_prompt_result": result}
         finally:
+            if req_id in self._pending and not fut.done() and not cancel_sent:
+                if self.alive and self.acp_session_id is not None:
+                    try:
+                        await self.session_cancel()
+                    except (ConnectionResetError, BrokenPipeError, OSError, AcpError) as e:
+                        log.warning("session_cancel during prompt cleanup failed: %s", e)
+            self._discard_pending(req_id)
             self._unsubscribe(sub_id)
             self.last_active = time.time()
 
