@@ -11,6 +11,7 @@ Expect: `OK: acp pipe + runner + markers + pidfile safety`
 
 import asyncio
 import json
+import os
 import subprocess
 import sys
 import time
@@ -295,14 +296,154 @@ async def smoke_idle_cleanup() -> None:
         )
 
 
+def smoke_scope_leak_audit() -> None:
+    """Design 1 — scope-leak audit (`acp_runner._scan_out_of_scope_paths`).
+
+    Verifies the post-hoc tool_call locations scan: ACP `ToolCall` /
+    `ToolCallUpdate` updates may include a `locations: [{path, line?}]`
+    array; any path resolving outside the connection's cwd should land in
+    `PromptResult.out_of_scope_writes` as an audit signal.
+
+    Four sub-cases:
+      a) all paths inside cwd → empty
+      b) some paths outside cwd → flagged
+      c) relative paths resolve against connection cwd (not caller cwd)
+      d) empty cwd / None disables checking
+    """
+    import tempfile
+    from acp_runner import _scan_out_of_scope_paths  # noqa: E402
+
+    with tempfile.TemporaryDirectory() as td:
+        cwd = Path(td).resolve()
+        (cwd / "in_scope.py").write_text("# fixture")
+        (cwd / "subdir").mkdir()
+        (cwd / "subdir" / "nested.py").write_text("# fixture")
+
+        # (a) all paths inside cwd
+        in_scope_calls = [
+            {"locations": [{"path": str(cwd / "in_scope.py")}]},
+            {"locations": [{"path": str(cwd / "subdir" / "nested.py"), "line": 1}]},
+        ]
+        got = _scan_out_of_scope_paths(in_scope_calls, str(cwd))
+        assert got == [], f"in-scope only: expected [], got {got}"
+
+        # (b) some paths outside cwd → flagged, dedupe + source-order
+        leaky_calls = [
+            {"locations": [{"path": str(cwd / "in_scope.py")}]},
+            {"locations": [{"path": "/etc/passwd"}]},
+            {"locations": [{"path": "/tmp/leaked.txt"}]},
+            {"locations": [{"path": "/etc/passwd"}]},  # duplicate, must be dedup'd
+        ]
+        got = _scan_out_of_scope_paths(leaky_calls, str(cwd))
+        assert got == ["/etc/passwd", "/tmp/leaked.txt"], f"leak case: expected 2 unique paths, got {got}"
+
+        # (c) relative paths resolve against connection cwd (NOT caller cwd).
+        # Caller (this test process) might be running from elsewhere; the
+        # worker's relative path "in_scope.py" should be interpreted relative
+        # to the connection's recorded cwd.
+        relative_calls = [
+            {"locations": [{"path": "in_scope.py"}]},
+            {"locations": [{"path": "subdir/nested.py"}]},
+            {"locations": [{"path": "../out_of_scope.py"}]},  # outside cwd
+        ]
+        got = _scan_out_of_scope_paths(relative_calls, str(cwd))
+        assert got == ["../out_of_scope.py"], f"relative resolution: expected 1 out-of-scope, got {got}"
+
+        # (d) empty/None cwd disables checking entirely (would otherwise
+        # spuriously match the test process's own cwd via Path("").resolve())
+        assert _scan_out_of_scope_paths(leaky_calls, "") == [], "empty cwd must disable"
+        assert _scan_out_of_scope_paths(leaky_calls, None) == [], "None cwd must disable"  # type: ignore[arg-type]
+
+        # (e) malformed tool_call entries don't crash the scanner
+        malformed = [
+            {},                                        # no locations key
+            {"locations": []},                         # empty array
+            {"locations": [{}]},                       # location without path
+            {"locations": [{"path": ""}]},             # empty path
+            {"locations": [{"path": str(cwd / "in_scope.py")}]},  # one valid in-scope
+        ]
+        got = _scan_out_of_scope_paths(malformed, str(cwd))
+        assert got == [], f"malformed inputs: expected [], got {got}"
+
+
+async def smoke_bare_connection_registry() -> None:
+    """Design 2 — module-level connection registry covers the bare-AcpConnection
+    orphan-defense path (no pool, just `async with AcpConnection(...) as conn`).
+
+    Verifies:
+      a) On bare-conn spawn, a pidfile is written at
+         /tmp/goal-flight-acp-pids.d/<controller-pid>.jsonl containing the
+         spawned process's identity (pid/pgid/started_at/cmd/agent/session_id).
+      b) On AcpConnection.kill() (via async-with exit), the entry is removed.
+      c) The bare-conn path is what `cleanup_ghosts()` would reap on next
+         controller startup if the controller crashed before kill ran.
+    """
+    import acp_client  # for the module-level registry inspection
+    pidfile = acp_client._PIDFILE_DIR / f"{os.getpid()}.jsonl"
+
+    # Pre-condition: no leftover from prior runs in our own pidfile
+    pidfile.unlink(missing_ok=True)
+
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, str(FIXTURE),
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        limit=8 * 1024 * 1024,
+    )
+    spawned_pid = proc.pid
+
+    # Spawn a bare connection; __post_init__ should call _register_connection
+    async with AcpConnection(agent="echo", session_id="bare-registry-test", proc=proc, verbose=False) as conn:
+        await conn.initialize()
+        await conn.session_new(cwd="/tmp")
+        # (a) registry shows our connection
+        assert spawned_pid in acp_client._live_connections, (
+            f"bare conn missing from registry: have {list(acp_client._live_connections)}"
+        )
+        # (b) pidfile written; contains the spawned process identity
+        assert pidfile.exists(), f"bare-conn pidfile not written at {pidfile}"
+        contents = pidfile.read_text().splitlines()
+        assert len(contents) >= 1, f"expected ≥1 entry in pidfile, got {contents!r}"
+        entry = json.loads(contents[0])
+        assert entry["pid"] == spawned_pid, f"pidfile entry pid={entry['pid']} != spawned {spawned_pid}"
+        assert entry["agent"] == "echo", f"agent mismatch: {entry!r}"
+        assert entry["session_id"] == "bare-registry-test", f"session_id mismatch: {entry!r}"
+        # Send a prompt so the connection is exercised end-to-end
+        result = await run_prompt(conn, "hello", idle_timeout=10)
+        assert result.ok, f"bare-conn smoke prompt failed: {result.error!r}"
+        # out_of_scope_writes empty since echo agent emits no tool_calls
+        assert result.out_of_scope_writes == [], f"unexpected leaks: {result.out_of_scope_writes!r}"
+
+    # (c) post-async-with-exit: kill() → _unregister_connection → pidfile cleaned
+    assert spawned_pid not in acp_client._live_connections, (
+        "registry not cleaned after async-with exit"
+    )
+    # When the registry is empty for this controller, pidfile should be unlinked
+    # (the _write_through_pidfile_locked branch that removes empty files).
+    # If other parallel test runs ARE registering against the same controller
+    # pid (unlikely in our single-process test), this could fail — log instead
+    # of hard-assert to avoid flakiness.
+    if pidfile.exists():
+        remaining = pidfile.read_text().splitlines()
+        assert spawned_pid not in [json.loads(L).get("pid") for L in remaining if L], (
+            f"pidfile still references killed conn {spawned_pid}: {remaining!r}"
+        )
+
+    # Defensive cleanup in case the test errored partway
+    pidfile.unlink(missing_ok=True)
+
+
 async def main() -> None:
     await smoke_echo()
     smoke_markers()
     smoke_pidfile_safety()
     smoke_pool_ceiling()
+    smoke_scope_leak_audit()
+    await smoke_bare_connection_registry()
     await smoke_managed_pool()
     await smoke_idle_cleanup()
-    print("OK: acp pipe + runner + markers + pidfile safety + pool ceiling + managed pool + idle cleanup")
+    print("OK: acp pipe + runner + markers + pidfile safety + pool ceiling + scope-leak audit + bare-conn registry + managed pool + idle cleanup")
 
 
 if __name__ == "__main__":

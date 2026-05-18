@@ -4,6 +4,73 @@ Notable changes to the goal-flight Claude Code skill. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are
 incremented when meaningful skill behaviour changes.
 
+## [0.3.3] — 2026-05-18
+
+Folds two in-flight designs from the parallel ACP session into the hardening
+surface so they're tested as part of the same release rather than landing as
+a follow-up with unverified behavior:
+
+### Added — Design 1: scope-leak audit (`scripts/acp_runner.py`)
+
+- **`PromptResult.out_of_scope_writes: list[str]`** — new field on the result
+  dataclass returned by `run_prompt()`. Populated post-hoc by scanning the
+  ACP `tool_call` / `tool_call_update` events' `locations: [{path, line?}]`
+  arrays against the connection's recorded `cwd`. Paths that resolve outside
+  cwd land here as an audit signal for the controller's per-chunk diff-verify.
+- **`_scan_out_of_scope_paths(tool_calls, cwd)`** — helper that does the
+  resolution + classification. Key correctness properties: relative paths
+  resolve against the CONNECTION's cwd (set by `session_new()`), NOT the
+  caller process's cwd — avoids false positives when the controller runs
+  from a different directory than the worker; dedupes; preserves source order;
+  handles malformed locations (None / empty / missing path) defensively;
+  empty/None cwd disables the check entirely (Path("").resolve() would
+  spuriously match cwd).
+- **`AcpConnection.cwd: str | None`** field added — set by `session_new(cwd)`
+  so `run_prompt` can access it for the scope check.
+- Also: **`extract_markers()` skips empty captures** (a bare `**STATUS:**` line
+  with no content no longer creates a spurious empty-string entry).
+
+### Added — Design 2: module-level connection registry (`scripts/acp_client.py`)
+
+- **`_live_connections: dict[int, AcpConnection]`** + `threading.Lock` —
+  registry that both bare `AcpConnection` and pool-managed connections enter
+  via `AcpConnection.__post_init__` on construction. Removed via
+  `AcpConnection.kill()` (also called by `close_gracefully()` and the async
+  context manager exit).
+- **`_write_through_pidfile_locked()`** — persists the live-connection snapshot
+  to `/tmp/goal-flight-acp-pids.d/<controller-pid>.jsonl` on every register
+  and unregister. Even a SIGKILL of the controller leaves the latest snapshot
+  on disk for `cleanup_ghosts()` on the next controller startup to reap.
+- **Closes the bare-`AcpConnection` orphan-defense gap** the prior code had:
+  `AcpProcessPool._save_pids()` only registered pool-managed connections;
+  scripts that used `AcpConnection` directly (small test fixtures, simple
+  helpers) left no orphan record at all.
+
+### Tests
+
+- **`smoke_scope_leak_audit`** in `test/test_acp_pipe.py` — 5 sub-cases:
+  in-scope-only returns empty; out-of-scope paths flagged + deduped +
+  source-order; relative paths resolved against connection cwd; empty/None
+  cwd disables checking; malformed locations don't crash.
+- **`smoke_bare_connection_registry`** in `test/test_acp_pipe.py` — bare
+  `AcpConnection` registers on spawn (verifies `_live_connections` entry
+  + pidfile written with correct identity); kill removes from registry +
+  pidfile entry gone after async-with exit. Also verifies
+  `out_of_scope_writes` is empty when echo agent emits no tool_calls
+  (sanity check on the Design 1 wiring through `run_prompt`).
+- 6 passed / 0 failed across both suites.
+
+### Known latent (not blocking — flagged for 0.3.4)
+
+- `AcpProcessPool._save_pids()` and Design 2's `_write_through_pidfile_locked()`
+  both write to `<controller-pid>.jsonl`. In a single-controller mixed-mode
+  scenario (some bare `AcpConnection` + some pool-managed simultaneously),
+  `_save_pids()`'s narrower view overwrites the registry's superset, dropping
+  bare-conn entries from the pidfile. In practice goal-flight code uses
+  either the pool OR bare connections, not both — so the race is theoretical.
+  Slated for 0.3.4: deprecate `_save_pids()` in favor of the registry's
+  `_write_through` as the single writer.
+
 ## [0.3.2] — 2026-05-18
 
 Hardening release — pre-push audit of the 0.3.0 + 0.3.1 stack. Folds three
