@@ -37,6 +37,30 @@ Handle the goal-statement's `Status:` field as information, not as a refusal tri
 
 **Why this is right**: see `protocols/premises.md`. The whole point of premise-checking is to surface invisible assumptions for validation rather than acting on them silently. A rigid "refuse if goal isn't pinned in a specific file format" gate would do the opposite — block on a single static document the user may not have engaged with, treating it as the only acceptable form of "user intent." User intent lives in the conversation, in architecture docs, in plans, in commit messages; the goal-statement is one durable anchor among many. Surface gaps in the anchor as backlog items; don't refuse the work.
 
+### 0.4. Anticipatory rate-pressure check (silent unless something to surface)
+
+Before generating a chunk plan that will spawn many workers, check that
+the provider budgets are healthy. A decomposition output of, say, 20
+chunks plus parallel reviewers is exactly the workload shape that can
+push the controller's session budget past the rate-limit cliff.
+
+```bash
+python3 <skill-root>/scripts/goalflight_rate_pressure.py --json
+```
+
+Behavior:
+- `providers_under_pressure` empty → continue silently. Don't pre-warn
+  about hypothetical limits; the controller has the routing table
+  defaults and the caps. Silence is correct here.
+- `providers_under_pressure` non-empty → surface a single STATUS line
+  ("rate-pressure on <provider>; will lean on <fallback> for chunks
+  this decomposition spawns") and skew the chunk tagging accordingly
+  (prefer `[acp]` toward fallback providers in the queue).
+
+This is the "anticipate before spam" check. The same probe lives in
+`commands/execute.md` step 1 for the per-dispatch view; do not duplicate
+the call here unnecessarily.
+
 ### 0.5. Offer a polish-skill pass on the plan source (optional, non-blocking)
 
 Before decomposing, **offer the user a polish-skill pass** on the plan source (the file arg, the in-session conversation, or whichever signal you found in step 0). The polish-skill class has two sub-classes with different outputs:

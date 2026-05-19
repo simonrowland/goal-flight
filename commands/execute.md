@@ -26,17 +26,24 @@ python3 <skill-root>/scripts/goalflight_rate_pressure.py --json
 ```
 
 `goalflight_rate_pressure.py` reads the dispatch ledger and reports
-provider-level rate-limit pressure (anthropic-session, anthropic-api,
-openai, xai, cursor). If `providers_under_pressure` is non-empty:
+provider-level rate-limit pressure. Be **silent on clean** — if
+`providers_under_pressure` is empty, do not emit a marker or "nothing
+to report" line. The controller has the routing table; default is fine.
 
-- Emit `STATUS: rate-pressure provider=<p> count=<n> recommended-cap=<half>`.
+If `providers_under_pressure` is non-empty:
+- Emit a single `STATUS: rate-pressure provider=<p> count=<n>` line.
 - For the next chunk, prefer the first available `fallback_providers`
-  entry over the pressured provider's default (e.g., if anthropic-session
-  is pressured, route a code-writing chunk to codex/cursor instead of
-  Claude Agent). The script's `recommended_caps` is advisory — apply by
-  routing decision, not by mutating capacity state.
-- If pressure is severe (multiple providers, repeated runs), surface
+  entry over the pressured provider's default (anthropic-session
+  pressured → route code-writing to codex/cursor instead of Claude
+  Agent). `recommended_caps` is advisory — apply by routing decision,
+  not by mutating capacity state.
+- If pressure crosses **two providers** in the same probe, surface
   `BLOCKED: rate-pressure across providers` to the user and pause.
+
+**Active monitoring under `--parallel N`**: when N ≥ 3, re-run the
+probe between every 2-3 dispatches (not just at session start). The
+window is 10 minutes, so heavy parallel work crosses thresholds fast.
+With N = 1-2, the pre-flight check alone is sufficient — don't poll.
 
 Read-only probe; the controller decides whether to act. See SKILL.md
 "Worker Routing" for the per-task fallback table.
