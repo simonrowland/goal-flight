@@ -82,12 +82,9 @@ Detailed operating procedures are split into load-on-demand files under
 | **one-shot subagent** | Default for most chunks. Frontier model picks the executor target based on chunk shape | One subagent dispatch per chunk |
 | **goal-mode loop** | Multi-step refactor, code migration, prototype implementation, converge code to ground-truth — anything that benefits from plan/act/test/iterate | Multi-hour autonomous session (codex `/goal` natively, or controller-driven iteration loop) |
 
-**Comms shape** (orthogonal axis) — how the controller observes the worker:
+**Comms shape** (orthogonal axis) — how the controller observes the worker. Goal-flight uses the [Agent Client Protocol](https://agentclientprotocol.com) wherever the worker has an adapter (codex / cursor / claude / grok all do today); bash-tail with a `tail -f`-style marker-grep watcher is the cold-storage fallback. ACP composes with `goal-mode` for any worker; `goal-mode + bash-tail` composes only with codex `/goal` (codex emits a Final-response marker the watcher detects; other workers' headless modes don't).
 
-- **`acp`** — structured JSON-RPC over stdio (turn boundaries, tool-call events, stop reasons). Default when the worker has an adapter (codex / cursor / claude / grok all do today).
-- **`bash-tail`** — flat stdout + marker grep (cold-storage fallback, recipes in `protocols/legacy/bash-tail.md`). Only path that does NOT compose with `goal-mode` for non-codex workers — codex `/goal` self-terminates with a Final-response marker the watcher detects; grok / claude headless don't.
-
-The skill doesn't prescribe between codex, cursor, Grok, and Claude within a path — the controller picks based on chunk shape + rate-pressure observations. Hard convention: code-writing dispatches lean toward codex / cursor (sub-billed; don't share the controller's Claude rate-limit budget); reviews lean on gstack `/review` via codex with grok / cursor as concern-diverse sweep partners; Claude Agent subagents are the third-tier fallback for code work. Full routing table in `SKILL.md` "Worker Routing".
+The controller picks executor + comms per chunk based on chunk shape, available adapters, and the rate-pressure walkback's recent observations. The shipped routing defaults lean toward sub-billed workers (codex / cursor / grok) for code-writing — calibrated against the maintainer's current vendor plans, not a project-wide prescription. Adjust to your environment by editing the routing table in `SKILL.md` "Worker Routing"; the walkback adapts dynamically when any one provider gets pressured.
 
 ## When NOT to use this
 
