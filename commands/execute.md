@@ -22,7 +22,24 @@ Read:
 ```bash
 python3 <skill-root>/scripts/goalflight_status.py --json
 python3 <skill-root>/scripts/goalflight_capacity.py status --json
+python3 <skill-root>/scripts/goalflight_rate_pressure.py --json
 ```
+
+`goalflight_rate_pressure.py` reads the dispatch ledger and reports
+provider-level rate-limit pressure (anthropic-session, anthropic-api,
+openai, xai, cursor). If `providers_under_pressure` is non-empty:
+
+- Emit `STATUS: rate-pressure provider=<p> count=<n> recommended-cap=<half>`.
+- For the next chunk, prefer the first available `fallback_providers`
+  entry over the pressured provider's default (e.g., if anthropic-session
+  is pressured, route a code-writing chunk to codex/cursor instead of
+  Claude Agent). The script's `recommended_caps` is advisory — apply by
+  routing decision, not by mutating capacity state.
+- If pressure is severe (multiple providers, repeated runs), surface
+  `BLOCKED: rate-pressure across providers` to the user and pause.
+
+Read-only probe; the controller decides whether to act. See SKILL.md
+"Worker Routing" for the per-task fallback table.
 
 2. Pick the next non-DONE queue item.
 

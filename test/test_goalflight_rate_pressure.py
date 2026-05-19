@@ -55,6 +55,19 @@ def test_provider_for_unknown():
     assert_eq("unknown label", rp.provider_for("future-worker-9000"), None)
 
 
+def test_provider_for_bash_tail_variants():
+    """bash-tail labels emitted by watch-dispatch-tail.sh map to the same
+    provider as their ACP/Agent equivalents — same vendor budget, different
+    dispatch shape. claude-bash-tail specifically maps to anthropic-api
+    (claude -p is API-billed, separate from session)."""
+    assert_eq("claude-bash-tail → anthropic-api",
+              rp.provider_for("claude-bash-tail"), "anthropic-api")
+    assert_eq("codex-bash-tail → openai",
+              rp.provider_for("codex-bash-tail"), "openai")
+    assert_eq("grok-bash-tail → xai",
+              rp.provider_for("grok-bash-tail"), "xai")
+
+
 # ----- detect_rate_limit_signature() -----
 
 def test_detect_blocked_session_limit_state():
@@ -64,10 +77,16 @@ def test_detect_blocked_session_limit_state():
                 rp.detect_rate_limit_signature(record, None))
 
 
-def test_detect_blocked_auth_state():
-    """blocked_auth is treated as rate-limit-adjacent (worker can't reach provider)."""
+def test_detect_blocked_auth_state_does_not_trigger():
+    """blocked_auth is intentionally NOT counted as rate pressure.
+
+    Codex r3 review (2026-05-19) flagged that auth/config failures need
+    credential repair, not cap-halving. The walkback's recommendation
+    would mask the real fix. Keep blocked_auth out of the rate-limit bucket.
+    """
     record = {"agent": "codex", "state": "blocked_auth"}
-    assert_true("blocked_auth detected", rp.detect_rate_limit_signature(record, None))
+    assert_eq("blocked_auth NOT detected as rate pressure",
+              rp.detect_rate_limit_signature(record, None), False)
 
 
 def test_detect_failed_with_rate_limit_error():
@@ -163,6 +182,46 @@ def test_pressure_only_failures_counted():
     assert_eq("only blocked_session_limit counted", counts.get("anthropic-session"), 1)
 
 
+def test_pressure_missing_agent_field():
+    """Records with missing agent field are skipped (not crash)."""
+    now = time.time()
+    recent_iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now - 60))
+    records = [
+        {"dispatch_id": "d1", "state": "blocked_session_limit", "updated_at": recent_iso},
+        {"dispatch_id": "d2", "agent": None, "state": "blocked_session_limit", "updated_at": recent_iso},
+        _build_record("claude", "blocked_session_limit", recent_iso, "d3"),
+    ]
+    counts = rp.pressure_per_provider(records, window_seconds=600, now_ts=now)
+    assert_eq("only the one valid record counted", counts.get("anthropic-session"), 1)
+
+
+def test_pressure_started_at_fallback():
+    """When updated_at is absent, started_at is used for windowing."""
+    now = time.time()
+    recent_iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now - 60))
+    records = [
+        {"dispatch_id": "d1", "agent": "claude", "state": "blocked_session_limit", "started_at": recent_iso},
+    ]
+    counts = rp.pressure_per_provider(records, window_seconds=600, now_ts=now)
+    assert_eq("started_at fallback works", counts.get("anthropic-session"), 1)
+
+
+def test_pressure_mixed_providers_in_window():
+    """Multiple providers in same window are counted independently."""
+    now = time.time()
+    recent_iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now - 60))
+    records = [
+        _build_record("claude", "blocked_session_limit", recent_iso, "d1"),
+        _build_record("claude", "blocked_session_limit", recent_iso, "d2"),
+        _build_record("codex", "blocked_session_limit", recent_iso, "d3"),
+        _build_record("grok", "blocked_session_limit", recent_iso, "d4"),
+    ]
+    counts = rp.pressure_per_provider(records, window_seconds=600, now_ts=now)
+    assert_eq("anthropic-session", counts.get("anthropic-session"), 2)
+    assert_eq("openai", counts.get("openai"), 1)
+    assert_eq("xai", counts.get("xai"), 1)
+
+
 # ----- recommend() -----
 
 def test_recommend_below_threshold_empty():
@@ -176,15 +235,17 @@ def test_recommend_above_threshold_halves_caps():
     """At threshold, recommended cap is current // 2 (floor 1)."""
     out = rp.recommend(
         {"openai": 5},
-        {"codex": 10, "codex-acp": 10},
+        {"codex": 10, "codex-acp": 10, "codex-bash-tail": 10},
         threshold=3,
     )
     assert_eq("one provider", len(out["providers_under_pressure"]), 1)
     pup = out["providers_under_pressure"][0]
     assert_eq("provider key", pup["provider"], "openai")
-    assert_eq("openai labels", sorted(pup["labels"]), ["codex", "codex-acp"])
+    assert_eq("openai labels include bash-tail variant",
+              sorted(pup["labels"]), ["codex", "codex-acp", "codex-bash-tail"])
     assert_eq("codex halved", pup["recommended_caps"]["codex"], 5)
     assert_eq("codex-acp halved", pup["recommended_caps"]["codex-acp"], 5)
+    assert_eq("codex-bash-tail halved", pup["recommended_caps"]["codex-bash-tail"], 5)
 
 
 def test_recommend_cap_floor_one():

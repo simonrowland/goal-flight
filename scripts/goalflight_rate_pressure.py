@@ -66,12 +66,22 @@ SCHEMA = "goalflight.rate-pressure.v1"
 
 # Agent label → provider key. New workers extend this map; the walkback
 # auto-handles them as long as the provider classification is correct.
+#
+# Bash-tail labels (emitted by scripts/watch-dispatch-tail.sh and recorded in
+# the ledger by the legacy bash-tail dispatch path) map to the same providers
+# as their ACP / Agent equivalents — same vendor budget, different dispatch
+# shape. `claude-bash-tail` specifically goes to anthropic-api (NOT
+# anthropic-session) because the bash-tail path uses `claude -p` which is
+# API-billed, separate from the controller's session budget.
 AGENT_TO_PROVIDER: dict[str, str] = {
     "claude": "anthropic-session",
+    "claude-bash-tail": "anthropic-api",
     "claude-code-cli-acp": "anthropic-cli-acp",
     "codex": "openai",
     "codex-acp": "openai",
+    "codex-bash-tail": "openai",
     "grok": "xai",
+    "grok-bash-tail": "xai",
     "cursor": "cursor",
     "cursor-agent": "cursor",
 }
@@ -142,15 +152,20 @@ def detect_rate_limit_signature(record: dict, status: dict | None) -> bool:
 
     Checks: record.state (goal-flight's classification), status.error fields,
     and status.text_excerpt for vendor-specific patterns.
+
+    NOTE: `blocked_auth` is deliberately NOT counted as rate-limit pressure.
+    Auth failures are provider-availability problems (missing/invalid
+    credentials) that need credential repair, not cap-halving. Counting them
+    here would trigger walkback recommendations that mask the real fix.
     """
     state = (record.get("state") or "").lower()
-    if state in {"blocked_session_limit", "blocked_auth"}:
+    if state == "blocked_session_limit":
         return True
     if state == "failed":
         # Need to look at the status payload for the actual error shape.
         pass
     elif state not in {"failed", "inconclusive_timeout"}:
-        # Successful or pending dispatches don't count.
+        # Successful, pending, or auth-blocked dispatches don't count.
         return False
 
     if not status:
