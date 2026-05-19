@@ -137,30 +137,47 @@ treats them as co-equal choices; the controller picks per chunk
 character (codex `/goal` for iterative workhorses; cursor for chunks
 where Claude-like fluency matters and codex would over-engineer).
 
-**Cursor model selection**: prefer cursor's leading internal model
-(`composer-2.5` as of 2026-05-19) — it's covered by the Cursor
-subscription's unlimited internal-model tier. Cursor also exposes
-passthrough models (`gpt-5.3-codex-xhigh`, `claude-opus-4-7-thinking-high`,
-etc.) but those bill against the subscription's paid-passthrough budget
-and burn it fast. Reserve passthrough for chunks that specifically need
-those vendors. The `cursor-agent acp` subcommand has no `--model` flag;
-the model is read from `~/.cursor/cli-config.json`'s `modelId`. To set:
+**Cursor model selection**: prefer cursor's leading internal (`composer-*`)
+model — it's covered by the Cursor subscription's unlimited internal-model
+tier. Cursor also exposes passthrough models (`gpt-*-xhigh`,
+`claude-opus-*-thinking-high`, etc.) but those bill against the
+subscription's paid-passthrough budget and burn it fast. Reserve passthrough
+for chunks that specifically need those vendors.
+
+**Discovery, not hardcoding**: cursor ships new models often. Don't paste a
+model name from yesterday's recipe — ask `cursor-agent --list-models` for
+the current set, or read the doctor probe:
+
+```bash
+python3 <skill-root>/scripts/goalflight_doctor.py --project-root "$PWD" --json | \
+  python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["cursor"]["models"])'
+```
+
+The probe returns:
+- `leading_internal` — highest-versioned `composer-X.Y` (non-`-fast`)
+- `all_internal` — full composer-* list in cursor's listing order
+- `current_user_model` — what `~/.cursor/cli-config.json` is set to
+- `user_behind` — True when the user is on an older internal model or on a
+  passthrough model (which burns paid budget)
+
+The `cursor-agent acp` subcommand has no `--model` flag; the model is read
+from `~/.cursor/cli-config.json`'s `modelId`. To update, edit:
 
 ```json
 "model": {
-  "modelId": "composer-2.5",
-  "displayModelId": "composer-2.5",
-  "displayName": "Composer 2.5",
-  "displayNameShort": "Composer 2.5",
+  "modelId": "<leading_internal from doctor>",
+  "displayModelId": "<same>",
+  "displayName": "<human-readable>",
+  "displayNameShort": "<same>",
   "aliases": [],
   "maxMode": false
 },
 "hasChangedDefaultModel": true
 ```
 
-Cursor's internal models don't have a separate "xhigh" effort tier
-(`composer-2.5` is its own quality level); xhigh variants exist only on
-the OpenAI-passthrough models. Use `composer-2.5` directly.
+Cursor's internal models don't have a separate "xhigh" effort tier;
+xhigh variants exist only on the OpenAI-passthrough models. Use the
+plain `composer-X.Y` ID returned by the probe.
 
 **Failover.** If a Claude Agent dispatch fails with a rate-limit signal,
 re-dispatch the same chunk to codex or grok; don't retry Claude until the

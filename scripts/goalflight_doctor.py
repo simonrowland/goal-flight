@@ -114,6 +114,108 @@ def check_grok() -> dict:
     }
 
 
+def cursor_models_probe() -> dict:
+    """Probe cursor-agent for available models and pick the leading internal one.
+
+    Discovery mechanism for Cursor's "domestic" (internal-tier) models —
+    composer-*. Avoids hardcoding model names in docs that age fast.
+
+    Cursor exposes models via `cursor-agent --list-models`. Output format:
+
+        Available models
+
+        auto - Auto
+        composer-2-fast - Composer 2 Fast (default)
+        composer-2 - Composer 2 (current)
+        gpt-5.3-codex-low - Codex 5.3 Low
+        ...
+        composer-2.5 - Composer 2.5
+        ...
+
+    Internal-tier models start with `composer-` (covered by the unlimited
+    Cursor subscription tier). Vendor-passthrough models (`gpt-*`,
+    `claude-*`) burn the paid-passthrough budget — exclude from "leading
+    internal" pick.
+
+    Returns:
+      leading_internal: the highest-numbered `composer-X.Y` (non-`-fast`)
+      all_internal: full list of composer-* model IDs in listed order
+      current_user_model: what ~/.cursor/cli-config.json `modelId` is set to
+      user_behind: True when current_user_model != leading_internal AND
+                   current_user_model is older internal (or unset)
+    """
+    out: dict = {
+        "leading_internal": None,
+        "all_internal": [],
+        "current_user_model": None,
+        "user_behind": None,
+    }
+    if not shutil.which("cursor-agent"):
+        return out
+    result = run(["cursor-agent", "--list-models"], timeout=10)
+    if not result["ok"]:
+        out["error"] = result.get("stderr", "")[:200]
+        return out
+
+    internal_with_fast = []  # all composer-*
+    internal_no_fast = []    # composer-X.Y without -fast suffix
+    for line in result["stdout"].splitlines():
+        line = line.strip()
+        if " - " not in line:
+            continue
+        model_id, _, _ = line.partition(" - ")
+        model_id = model_id.strip()
+        if not model_id.startswith("composer-"):
+            continue
+        internal_with_fast.append(model_id)
+        if not model_id.endswith("-fast"):
+            internal_no_fast.append(model_id)
+    out["all_internal"] = internal_with_fast
+
+    # Pick highest version. composer-X.Y → tuple of int parts; missing minor → 0.
+    def _version_key(m: str) -> tuple[int, ...]:
+        suffix = m[len("composer-"):]
+        parts = []
+        for chunk in suffix.split("."):
+            digits = "".join(c for c in chunk if c.isdigit())
+            parts.append(int(digits) if digits else 0)
+        return tuple(parts)
+
+    if internal_no_fast:
+        out["leading_internal"] = max(internal_no_fast, key=_version_key)
+
+    # Read user's current modelId.
+    cli_config = Path("~/.cursor/cli-config.json").expanduser()
+    if cli_config.exists():
+        try:
+            data = json.loads(cli_config.read_text())
+            current = data.get("model", {}).get("modelId")
+            if current:
+                out["current_user_model"] = current
+        except (OSError, ValueError):
+            pass
+
+    # User-behind check: only set if we know both endpoints.
+    if out["leading_internal"] and out["current_user_model"]:
+        if out["current_user_model"] == out["leading_internal"]:
+            out["user_behind"] = False
+        elif out["current_user_model"].startswith("composer-"):
+            # Both internal; behind if version lower.
+            try:
+                out["user_behind"] = (
+                    _version_key(out["current_user_model"])
+                    < _version_key(out["leading_internal"])
+                )
+            except (ValueError, IndexError):
+                out["user_behind"] = None
+        else:
+            # User is on passthrough — not "behind" exactly, but flagged
+            # because the recipe prefers internal-tier.
+            out["user_behind"] = True
+
+    return out
+
+
 def check_acp() -> dict:
     grok = check_grok()
     return {
@@ -152,7 +254,12 @@ def doctor(repo: Path) -> dict:
         },
         "context_mode": check_context_mode(repo),
         "gstack": version("gstack", "--version"),
-        "cursor": {"desktop_present": cursor_desktop, "cli": version("cursor", "--version"), "agent": version("cursor-agent", "--version")},
+        "cursor": {
+            "desktop_present": cursor_desktop,
+            "cli": version("cursor", "--version"),
+            "agent": version("cursor-agent", "--version"),
+            "models": cursor_models_probe(),
+        },
         "grok": check_grok(),
         "acp": check_acp(),
         "project": git_state(repo),
