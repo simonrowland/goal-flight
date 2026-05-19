@@ -75,6 +75,7 @@ drift against an in-flight queue.
 | `/goal-flight resume` | `commands/resume.md` | `state-handoff` |
 | `/goal-flight goal <SLUG>` | `commands/goal.md` | none |
 | `/goal-flight register-codex [<path>]` | `commands/register-codex.md` | `tool-readiness` |
+| `/goal-flight update` | `commands/update.md` | `tool-readiness` |
 | `/goal-flight validate-dispatch [<slug>]` | `commands/validate-dispatch.md` | `dispatch-routing`, `worker-markers` |
 | `/goal-flight validate-queue [<path>]` | `commands/validate-queue.md` | none |
 
@@ -98,15 +99,27 @@ Protocol index: `protocols/README.md`.
 
 ## Dispatch Model
 
-Default order:
+Two orthogonal axes. Pick one from each.
 
-1. `controller-direct` for tiny local work.
-2. ACP runner when the worker supports ACP.
-3. Goal-mode loop for iterative implementation.
-4. Bash-tail watcher as fallback.
+- **Iteration pattern**: `one-shot` (default) or `goal-mode loop` (iterative,
+  for review-revise cycles or chunks that exceed one turn).
+- **Comms shape**: `controller-direct` (tiny local edit, no spawn), `acp`
+  (structured JSON-RPC, default when an adapter exists), or `bash-tail`
+  (flat stdout watcher, fallback only).
 
-Details live in `protocols/dispatch-routing.md`. Forking lives in
-`protocols/self-delegation.md` and is loaded only when explicitly needed.
+Most compositions work. The notable exception: `goal-mode + bash-tail` is
+codex-`/goal`-only (codex emits a "Final response" marker; grok and claude
+headless don't). See `protocols/dispatch-routing.md` for the full table.
+
+**Worker bias when the controller is a Claude session.** Prefer non-Claude
+CLI workers (codex, grok, cursor) for code-writing dispatches. Claude
+Agent-tool subagents share the parent session's rate-limit budget; codex
+and grok do not. Routing code-writing to codex reduces pressure on the
+controller's own rate limits.
+
+Bash-tail recipes live in `protocols/legacy/bash-tail.md` and load only
+when ACP isn't viable. Forking lives in `protocols/self-delegation.md` and
+is loaded only when explicitly needed.
 
 ## Worker Markers
 

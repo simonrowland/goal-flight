@@ -13,7 +13,9 @@ Required fields:
 - scope
 - expected files
 - verification command
-- dispatch hint: `controller-direct`, `acp`, `goal-mode`, or `bash-tail`
+- dispatch hint: iteration + comms (e.g. `one-shot/acp`, `goal-mode/acp`,
+  `goal-mode/bash-tail` for codex `/goal`, or `controller-direct` for tiny
+  inline edits) — see `protocols/dispatch-routing.md`
 
 Keep the row compact. Detailed execution rules live in
 `protocols/dispatch-routing.md`.
