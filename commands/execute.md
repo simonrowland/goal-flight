@@ -40,10 +40,18 @@ If `providers_under_pressure` is non-empty:
 - If pressure crosses **two providers** in the same probe, surface
   `BLOCKED: rate-pressure across providers` to the user and pause.
 
-**Active monitoring under `--parallel N`**: when N ≥ 3, re-run the
-probe between every 2-3 dispatches (not just at session start). The
-window is 10 minutes, so heavy parallel work crosses thresholds fast.
-With N = 1-2, the pre-flight check alone is sufficient — don't poll.
+**Active monitoring under `--parallel N`**: provider-specific, not a
+flat N threshold. Empirically:
+- Codex (OpenAI sub) scales cleanly through N=10; no bouncing observed.
+- Grok / cursor (vendor subs) similar — sub-billed providers tolerate
+  goal-flight-shaped parallelism comfortably.
+- Claude Agent subagents (anthropic-session) start bouncing around
+  N=10 in practice — they share the controller's session budget.
+
+So: re-probe between dispatches when **3+ in-flight workers map to
+the same anthropic-* provider** (especially anthropic-session). For
+codex / grok / cursor-only parallel workloads (the routing-table
+default), the pre-flight check alone is sufficient — no polling.
 
 Read-only probe; the controller decides whether to act. See SKILL.md
 "Worker Routing" for the per-task fallback table.
