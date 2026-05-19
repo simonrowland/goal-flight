@@ -167,11 +167,27 @@ re-dispatch the same chunk to codex or grok; don't retry Claude until the
 documented reset window passes.
 
 **Hard caps** live in `scripts/goalflight_capacity.py` (`DEFAULT_AGENT_CAPS`).
-Per-agent caps are deliberately generous (claude=5, codex=10, grok=10) to
-support multi-session parallel work. An adaptive busy-signal walkback —
-deferred to a follow-up — will dial them down dynamically when rate
-limits hit; until then, the static caps + the routing table above are the
-levers.
+Per-agent caps are deliberately generous (claude=5, codex=10, grok=10,
+cursor-agent=5) to support multi-session parallel work. The per-label caps
+are **process-count** caps (RAM-aware); rate limits are provider-level (one
+provider may have multiple agent labels — e.g., `codex` and `codex-acp`
+share the same OpenAI budget; `cursor` and `cursor-agent` share the same
+Cursor subscription).
+
+**Adaptive walkback**: `scripts/goalflight_rate_pressure.py` reads the
+dispatch ledger, classifies failures by provider, and emits a JSON
+recommendation when 3+ rate-limit signatures hit the same provider within
+10 minutes. Controllers should consult it before dispatching:
+
+```bash
+python3 <skill-root>/scripts/goalflight_rate_pressure.py
+```
+
+The recommendation includes halved-cap suggestions and per-provider
+fallback chains. The script is read-only — the controller decides whether
+to act on the recommendation (re-route the next chunk to a fallback
+provider, surface a STATUS marker, etc.). No autonomous mutation of
+capacity state in v1.
 
 Bash-tail recipes live in `protocols/legacy/bash-tail.md` and load only
 when ACP isn't viable. Forking lives in `protocols/self-delegation.md` and
