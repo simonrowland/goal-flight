@@ -23,6 +23,11 @@ try:
 except Exception:  # pragma: no cover - doctor still reports partial state
     goalflight_capacity = None
 
+try:
+    import goalflight_rate_pressure
+except Exception:  # pragma: no cover - doctor still reports partial state
+    goalflight_rate_pressure = None
+
 
 def run(cmd: list[str], cwd: Path | None = None, timeout: float = 8.0) -> dict:
     try:
@@ -264,8 +269,32 @@ def doctor(repo: Path) -> dict:
         "acp": check_acp(),
         "project": git_state(repo),
         "capacity": goalflight_capacity.profile(argparse.Namespace()) if goalflight_capacity else None,
+        "rate_pressure": _rate_pressure_summary(),
     }
     return payload
+
+
+def _rate_pressure_summary() -> dict:
+    """Compact rate-pressure summary for doctor output.
+
+    The controller's job is to not overheat provider services in a way
+    that takes the live session down. This surfaces the same probe
+    `goalflight_rate_pressure.py` emits, so the doctor is a one-stop
+    "is everything OK" check.
+    """
+    if goalflight_rate_pressure is None:
+        return {"available": False, "reason": "goalflight_rate_pressure import failed"}
+    try:
+        state_dir = Path(os.environ.get("GOALFLIGHT_STATE_DIR", f"/tmp/goal-flight-{os.getuid()}"))
+        records = goalflight_rate_pressure.collect_records(state_dir)
+        pressure = goalflight_rate_pressure.pressure_per_provider(records)
+        current_caps = dict(goalflight_capacity.DEFAULT_AGENT_CAPS) if goalflight_capacity else {}
+        rec = goalflight_rate_pressure.recommend(pressure, current_caps)
+        rec["records_examined"] = len(records)
+        rec["state_dir"] = str(state_dir)
+        return rec
+    except Exception as exc:  # pragma: no cover - keep doctor resilient
+        return {"available": False, "reason": f"{type(exc).__name__}: {exc}"}
 
 
 def status_line(ok: bool | None, label: str, detail: str | None = None) -> str:
@@ -297,6 +326,52 @@ def print_human(payload: dict) -> None:
     lines.append(status_line(True, "capacity profile", f"operating={cap.get('operating_cap')} raw={cap.get('raw_ram_ceiling')} ram={cap.get('ram_mb')}MB"))
     project = payload["project"]
     lines.append(status_line(project.get("present"), "git project", f"{project.get('branch')} {project.get('head')} dirty={project.get('dirty')}"))
+
+    # Worker model currency. Today the cursor probe is the only one
+    # implemented. Other workers (codex/grok/claude/claude-code-cli-acp)
+    # would each need their own model-discovery: codex doesn't expose a
+    # native --list-models, claude's model is set per-Agent dispatch, etc.
+    # Surface cursor explicitly; flag the others as not-yet-probed so the
+    # user knows the doctor's currency check is partial.
+    cursor_models = payload["cursor"].get("models") or {}
+    leading = cursor_models.get("leading_internal")
+    current = cursor_models.get("current_user_model")
+    if cursor_models.get("user_behind") is True:
+        lines.append(status_line(
+            False,
+            "cursor model currency",
+            f"on {current}; leading internal is {leading}. "
+            f"Edit ~/.cursor/cli-config.json model.modelId to {leading} for sharper output."
+        ))
+    elif cursor_models.get("user_behind") is False:
+        lines.append(status_line(True, "cursor model currency", f"on {current} (leading internal)"))
+    else:
+        lines.append(status_line(None, "cursor model currency", "could not determine — manual check needed"))
+    lines.append(status_line(
+        None,
+        "other-worker model currency",
+        "codex/grok/claude model-discovery not yet probed; run `<cli> update --check` manually"
+    ))
+
+    # Rate-limit pressure summary — the controller's responsibility is to
+    # not overheat services in a way that crashes the live session.
+    rp = payload.get("rate_pressure") or {}
+    pressured = rp.get("providers_under_pressure") or []
+    if pressured:
+        for entry in pressured:
+            provider = entry.get("provider")
+            count = entry.get("count")
+            fallback = ",".join(entry.get("fallback_providers", []))
+            lines.append(status_line(
+                False,
+                f"rate-pressure {provider}",
+                f"count={count} in 10min window. Recommended caps {entry.get('recommended_caps')}. "
+                f"Fallback providers: {fallback or 'none configured'}."
+            ))
+    else:
+        records = rp.get("records_examined", 0)
+        lines.append(status_line(True, "rate-pressure", f"no provider under pressure ({records} records examined)"))
+
     for line in lines[:80]:
         print(line)
 
