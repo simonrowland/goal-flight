@@ -215,16 +215,19 @@ def smoke_pool_ceiling() -> None:
     Post-0.4.0-prep refactor: compute_pool_ceiling delegates to
     goalflight_capacity.profile() when available, which uses a tiered
     operating-cap scheme:
-      ≤8GB=1, ≤16GB=3, ≤32GB=4, ≤64GB=6, >64GB=8 (override-able).
+      ≤8GB=1, ≤16GB=3, ≤32GB=4, ≤64GB=6, >64GB=16 (override-able).
+    The >64GB tier bumped from 8→16 in the rate-limit-cap update to give
+    multi-session parallel work headroom; per-agent caps grew to 10 for
+    codex/grok, so the prior tier-8 cap was the binding constraint.
     Raw RAM ceiling is clamped to operating cap.
     """
     cases = [
         # (ram_mb, expected_ceiling) — tiered op-cap scheme via goalflight_capacity.profile()
-        (8192,  1),   # 8 GB → op-cap 1
-        (16384, 3),   # 16 GB → op-cap 3
-        (32768, 4),   # 32 GB → op-cap 4
-        (131072, 8),  # 128 GB → op-cap 8 (default; override-able)
-        (1024, 1),    # 1 GB → floors to 1
+        (8192,  1),    # 8 GB → op-cap 1
+        (16384, 3),    # 16 GB → op-cap 3
+        (32768, 4),    # 32 GB → op-cap 4
+        (131072, 16),  # 128 GB → op-cap 16 (was 8 pre-rate-limit-cap update)
+        (1024, 1),     # 1 GB → floors to 1
     ]
     test_path = Path("/tmp/goal-flight-env-caveats-test.md")
     try:

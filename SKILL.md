@@ -114,11 +114,31 @@ to qualify — via its structured "Final response" block. Grok and claude
 headless do not qualify yet; a future worker that gains an equivalent marker
 would join this cell. See `protocols/dispatch-routing.md` for the full table.
 
-**Worker bias when the controller is a Claude session.** Prefer non-Claude
-CLI workers (codex, grok, cursor) for code-writing dispatches. Claude
-Agent-tool subagents share the parent session's rate-limit budget; codex
-and grok do not. Routing code-writing to codex reduces pressure on the
-controller's own rate limits.
+## Worker Routing
+
+The controller is a Claude session; Claude Agent-tool subagents share its
+rate-limit budget. Codex/grok/cursor workers consume their own provider
+budgets and do not. Default routing by task:
+
+| Task | Default | Fallback 1 | Fallback 2 |
+|---|---|---|---|
+| Code-writing chunks | codex (ACP) | grok (ACP) | Claude Agent |
+| Reviewer dispatches | codex + grok in parallel (concern-diverse) | either alone | Claude Agent (only when other reviewers unreachable) |
+| Planning / decompose | codex | controller-direct | Claude Agent |
+| Anticipatory questions | Claude Agent (its interactive strength) | controller-direct | — |
+| Analysis / reflection | controller-direct | — | — |
+| Voice-sensitive prose | Claude Agent (controller judgment per chunk) | — | — |
+
+**Failover.** If a Claude Agent dispatch fails with a rate-limit signal,
+re-dispatch the same chunk to codex or grok; don't retry Claude until the
+documented reset window passes.
+
+**Hard caps** live in `scripts/goalflight_capacity.py` (`DEFAULT_AGENT_CAPS`).
+Per-agent caps are deliberately generous (claude=5, codex=10, grok=10) to
+support multi-session parallel work. An adaptive busy-signal walkback —
+deferred to a follow-up — will dial them down dynamically when rate
+limits hit; until then, the static caps + the routing table above are the
+levers.
 
 Bash-tail recipes live in `protocols/legacy/bash-tail.md` and load only
 when ACP isn't viable. Forking lives in `protocols/self-delegation.md` and

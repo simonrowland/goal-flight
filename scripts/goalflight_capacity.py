@@ -36,14 +36,20 @@ AGENT_RSS_MB = {
     "cursor": 1203,
     "cursor-agent": 1203,
 }
+# Per-agent concurrency caps, machine-global across goal-flight sessions.
+# Sized to support multi-session parallel work. The actual safety net against
+# rate-limit pressure is an adaptive busy-signal walkback (deferred follow-up
+# — see docs-private/claude-rate-limit-recipe-2026-05-19.md §Adaptive pacing).
+# Until that lands, these static caps + the SKILL.md routing table (prefer
+# non-Claude workers for code-writing dispatches) carry the policy load.
 DEFAULT_AGENT_CAPS = {
-    "cursor": 1,
-    "cursor-agent": 1,
-    "claude": 2,
-    "claude-code-cli-acp": 2,
-    "codex": 2,
-    "codex-acp": 2,
-    "grok": 3,
+    "cursor": 3,
+    "cursor-agent": 3,
+    "claude": 5,
+    "claude-code-cli-acp": 5,
+    "codex": 10,
+    "codex-acp": 10,
+    "grok": 10,
 }
 TERMINAL_LEASE_STATES = {
     "released",
@@ -183,7 +189,8 @@ def operating_cap_for_ram(ram_mb: int, raw_ceiling: int) -> int:
     elif ram_mb <= 64 * 1024:
         tier = 6
     else:
-        tier = 8
+        tier = 16  # >64GB: 16 workers (was 8). Headroom for multi-session
+                   # parallel work now that per-agent caps allow codex/grok=10.
     return max(1, min(raw_ceiling, tier))
 
 

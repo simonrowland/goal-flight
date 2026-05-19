@@ -33,5 +33,10 @@ Convergence rule:
    explicitly accepted as backlog.
 4. Do not treat a missing/stalled review as clean.
 
+**Default reviewer routing**: `codex + grok` in parallel (concern-diverse).
+Claude Agent reviewers are the third option, used only when codex AND grok
+are both unreachable — codex/grok consume their own provider budgets, Claude
+Agent consumes the controller's session budget.
+
 Claude session limits create capacity cooldowns. Fallback reviewers should be
 concern-diverse Codex/Grok jobs or scheduled retry, not silent omission.

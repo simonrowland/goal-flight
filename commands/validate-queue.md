@@ -58,11 +58,12 @@ before they bite mid-execute.
      shows the adapter unavailable — execute can still proceed via fallback).
    - `[goal-mode] + [bash-tail]` co-occurrence is **codex-only** — only codex
      `/goal` emits the Final-response marker the watcher needs to detect
-     end-of-goal in a flat tail. If a chunk has `[goal-mode] + [bash-tail]`
+     end-of-goal in a flat tail. **This rule is P0** (escalated from the
+     surrounding P1 block): if a chunk has `[goal-mode] + [bash-tail]`
      AND the target worker is not codex (or worker isn't specified and
-     would default to non-codex per env), → P0 conflict (the dispatch will
-     hang waiting for a marker that never comes). See
-     `protocols/dispatch-routing.md` composition table for the rule.
+     would default to non-codex per env), the dispatch will hang waiting
+     for a marker that never comes. See `protocols/dispatch-routing.md`
+     composition table for the rule.
 
    **Content (P2 — quality hints):**
    - SCOPE word count: 40–250 words. Outside this range → flag.
