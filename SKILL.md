@@ -122,12 +122,20 @@ budgets and do not. Default routing by task:
 
 | Task | Default | Fallback 1 | Fallback 2 |
 |---|---|---|---|
-| Code-writing chunks | codex (ACP) | grok (ACP) | Claude Agent |
-| Reviewer dispatches | codex + grok in parallel (concern-diverse) | either alone | Claude Agent (only when other reviewers unreachable) |
+| Code-writing chunks | codex (ACP) or cursor (ACP) — controller picks per chunk character | grok (ACP) | Claude Agent |
+| Reviewer dispatches | gstack `/review` via codex + concern-diverse sweep (grok / cursor) | any one alone | Claude Agent (only when other reviewers unreachable) |
 | Planning / decompose | codex | controller-direct | Claude Agent |
 | Anticipatory questions | Claude Agent (its interactive strength) | controller-direct | — |
 | Analysis / reflection | controller-direct | — | — |
 | Voice-sensitive prose | Claude Agent (controller judgment per chunk) | — | — |
+
+**Cursor note (2026-05-19)**: cursor-agent shipped a major model update
+benchmarking on par with Claude Opus for coding. It joins codex as a
+first-tier code-writing worker (both ACP-reachable, both sub-billed —
+neither consumes the controller's Claude budget). Default routing now
+treats them as co-equal choices; the controller picks per chunk
+character (codex `/goal` for iterative workhorses; cursor for chunks
+where Claude-like fluency matters and codex would over-engineer).
 
 **Failover.** If a Claude Agent dispatch fails with a rate-limit signal,
 re-dispatch the same chunk to codex or grok; don't retry Claude until the

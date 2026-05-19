@@ -43,8 +43,10 @@ AGENT_RSS_MB = {
 # Until that lands, these static caps + the SKILL.md routing table (prefer
 # non-Claude workers for code-writing dispatches) carry the policy load.
 DEFAULT_AGENT_CAPS = {
-    "cursor": 3,
-    "cursor-agent": 3,
+    "cursor": 5,           # 2026-05-19: cursor model update brought coding
+    "cursor-agent": 5,     # benchmarks on par with Opus; promoted to a
+                           # first-tier code worker alongside codex (parity
+                           # with claude cap at 5).
     "claude": 5,
     "claude-code-cli-acp": 5,
     "codex": 10,
