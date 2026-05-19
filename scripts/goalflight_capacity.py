@@ -37,11 +37,13 @@ AGENT_RSS_MB = {
     "cursor-agent": 1203,
 }
 # Per-agent concurrency caps, machine-global across goal-flight sessions.
-# Sized to support multi-session parallel work. The actual safety net against
-# rate-limit pressure is an adaptive busy-signal walkback (deferred follow-up
-# — see docs-private/claude-rate-limit-recipe-2026-05-19.md §Adaptive pacing).
-# Until that lands, these static caps + the SKILL.md routing table (prefer
-# non-Claude workers for code-writing dispatches) carry the policy load.
+# Sized to support multi-session parallel work. The adaptive busy-signal
+# walkback (scripts/goalflight_rate_pressure.py) DOES exist and is wired
+# into goalflight_doctor.py + commands/execute.md + commands/decompose-plan.md
+# to halve effective caps on observed pressure. Static caps below are
+# starting defaults; learned per-provider thresholds (persisted across
+# sessions) remain future work — see docs-private/BACKLOG.md "Learned
+# rate-pressure thresholds (not just hardcoded caps)".
 DEFAULT_AGENT_CAPS = {
     "cursor": 5,           # 2026-05-19: cursor model update brought coding
     "cursor-agent": 5,     # benchmarks on par with Opus; promoted to a

@@ -44,6 +44,20 @@ verify drift.
 - Check ACP worker adapters: `codex-acp`, `cursor-agent`, `claude-code-cli-acp`, `grok agent stdio`.
 - Check project git state.
 - Check machine capacity profile.
+- **Cursor model currency** (`cursor_models_probe`): runs `cursor-agent --list-models`,
+  identifies the leading internal `composer-X.Y` (non-`-fast`), compares against
+  `~/.cursor/cli-config.json` `modelId`. Flags `user_behind` when the user is on an
+  older internal model or on a paid-passthrough model. Surfaces as `[OK]` or `[WARN]`
+  with the cli-config edit recommendation.
+- **Worker CLI currency** (`worker_currency_probe`): proxy for model currency for
+  workers without a native list-models API. `grok update --check --json` for grok;
+  `npm view <pkg> version` for `@openai/codex` / `@anthropic-ai/claude-code` /
+  `claude-code-cli-acp`. Behind workers get `[WARN]`; verified-current workers `[OK]`;
+  probe-failed (registry unreachable) workers `[INFO]` as a separate line.
+- **Rate-pressure summary** (`_rate_pressure_summary` → `goalflight_rate_pressure`):
+  scans the dispatch ledger for provider-level rate-limit signatures over the last
+  10 minutes. `[WARN]` per pressured provider with recommended caps and fallback
+  providers; `[OK]` when all providers clear.
 
 ## Output
 

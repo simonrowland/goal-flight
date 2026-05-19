@@ -136,15 +136,44 @@ def _npm_registry_version(pkg: str, timeout: float = 6.0) -> str | None:
 
 
 def _version_tuple(s: str | None) -> tuple[int, ...]:
-    """Parse semver-ish string into a comparison tuple. Non-numeric chunks → 0."""
+    """Parse semver-ish string into a comparison tuple, first token only.
+
+    Examples (codex-r4 NIT #5 cases):
+      `2.1.143 (Claude Code)`     → (2, 1, 143)
+      `codex-cli 0.131.0`         → (0, 131, 0)
+      `grok 0.1.213-alpha.1 (f42d66622d)` → (0, 1, 213)
+    Stops at the first non-numeric chunk (the `-alpha.1` part) so trailing
+    build metadata / git hashes don't pollute the tuple.
+    """
     if not s:
         return ()
-    out: list[int] = []
-    for chunk in s.split("."):
-        digits = "".join(c for c in chunk if c.isdigit())
-        if not digits:
+    # Extract the first whitespace-separated semver-ish token. Filters out
+    # CLI-name prefixes like "codex-cli 0.131.0" → "0.131.0".
+    token = None
+    for piece in s.split():
+        if any(c.isdigit() for c in piece) and "." in piece:
+            token = piece
             break
-        out.append(int(digits))
+    if token is None:
+        return ()
+    out: list[int] = []
+    for chunk in token.split("."):
+        # Take leading digits only — stop at the first non-digit (which
+        # handles prerelease suffixes like "213-alpha" → leading "213").
+        leading = ""
+        for c in chunk:
+            if c.isdigit():
+                leading += c
+            else:
+                break
+        if not leading:
+            break
+        out.append(int(leading))
+        if len(leading) < len(chunk):
+            # Chunk had a suffix (e.g., "213-alpha"). We grabbed the
+            # leading number; stop here — don't try to parse subsequent
+            # dot-separated chunks past a prerelease boundary.
+            break
     return tuple(out)
 
 
@@ -452,34 +481,33 @@ def print_human(payload: dict) -> None:
             current = entry.get("current", "?")
             latest = entry.get("latest", "?")
             behind_workers.append(f"{name} ({current} → {latest})")
+    # Verified-current and probe-failed workers go on DIFFERENT lines.
+    # Earlier version lumped probe-failed entries under [OK] "treated as
+    # current"; codex-r4 RECOMMENDED #2 correctly pointed out that an
+    # npm timeout / 404 shouldn't render as healthy. Now [OK] is only
+    # for behind=False (explicitly verified); probe-failed gets its own
+    # [INFO] line.
     if behind_workers:
         lines.append(status_line(
             False,
             "worker CLI currency",
             f"behind: {'; '.join(behind_workers)}. Run /goal-flight update."
         ))
-    else:
-        # Filter the OK list to workers where `behind` is explicitly False —
-        # not just "current is known". A worker with current=X but
-        # latest=None (npm reachability failure / 404 / timeout) has
-        # behind=None and should NOT be claimed as "current" — that would
-        # silently over-claim verified state. Surface the probe gaps
-        # separately so transient registry blips don't go unnoticed.
-        verified_current = sorted(n for n, e in wc.items() if e.get("behind") is False)
-        probe_failed = sorted(
-            n for n, e in wc.items()
-            if e.get("current") and e.get("behind") is None
-        )
-        detail_parts = []
-        if verified_current:
-            detail_parts.append(f"current: {', '.join(verified_current)}")
-        if probe_failed:
-            detail_parts.append(f"probe-failed (treated as current): {', '.join(probe_failed)}")
+    verified_current = sorted(n for n, e in wc.items() if e.get("behind") is False)
+    if verified_current and not behind_workers:
+        lines.append(status_line(True, "worker CLI currency", f"current: {', '.join(verified_current)}"))
+    probe_failed = sorted(
+        n for n, e in wc.items()
+        if e.get("current") and e.get("behind") is None
+    )
+    if probe_failed:
         lines.append(status_line(
-            True,
-            "worker CLI currency",
-            "; ".join(detail_parts) or "none probed",
+            None,
+            "worker currency probe",
+            f"could not verify (npm/grok registry unreachable or 404): {', '.join(probe_failed)}"
         ))
+    if not (behind_workers or verified_current or probe_failed):
+        lines.append(status_line(None, "worker CLI currency", "no workers probed"))
 
     # Rate-limit pressure summary — the controller's responsibility is to
     # not overheat services in a way that crashes the live session.
