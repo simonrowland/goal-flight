@@ -13,8 +13,9 @@ git clone https://github.com/simonrowland/goal-flight.git ~/.claude/skills/goal-
 - **Multi-hour unattended runs.** Check in periodically or respond to decision notifications. The controller's context primarily holds architecture, plan, and metadata (queue state, recent commits, in-flight dispatch headers); real work happens in subagent context windows.
 - **Verification-first dispatch.** Wrappers point at files for the agent to investigate, not pre-pasted "facts" that go stale on the timescale of minutes. Frontier models trust controller-text uncritically; pointers force them to re-verify against live disk and surface drift.
 - **Parallel codex + claude reviews at milestone cadence.** Two independent reviewers (Claude + codex) address bugs and completion before pestering you. Via [gstack](https://github.com/garrytan/gstack)'s `/review` skill when installed.
-- **Three dispatch paths** the controller picks from per chunk, not one rigid loop — controller-inline for trivial chunks, single-shot subagent for the common case, multi-hour goal-mode loop (codex `/goal` or controller-driven iteration) for chunks that need it. Each can run over either Bash-`&`-tail-file (default fallback) or ACP (Agent Client Protocol) when the target worker speaks it — ACP gets structured events + persistent sessions + sub-billing through most adapter paths.
-- **Procedural runtime state.** Capacity, dispatch ledgers, compact status, log watching, doctor checks, ACP runs, and file-backed review jobs live under `scripts/goalflight_*.py`.
+- **Two-axis dispatch routing** the controller picks from per chunk. **Iteration pattern** (one-shot for most chunks, goal-mode loop for chunks that need plan/act/test/iterate, controller-direct for trivial work) crosses with **comms shape** (ACP for structured events + sub-billing when the adapter is available; bash-tail as cold-storage fallback). `goal-mode + bash-tail` is codex-`/goal`-only — codex self-terminates with a Final-response marker the watcher detects; other workers lack the equivalent.
+- **Provider-aware routing + rate-pressure walkback.** Code-writing chunks route to codex / cursor first (sub-billed; don't share the controller's Claude session budget); Claude Agent subagents are the third-tier fallback. `scripts/goalflight_rate_pressure.py` watches the dispatch ledger for provider-level rate-limit signatures and surfaces a STATUS marker + recommended fallback when pressure crosses threshold. The doctor surfaces model currency (cursor `composer-X.Y` discovery + CLI-version-currency for codex / grok / claude / claude-code-cli-acp) so you know when a worker update is due.
+- **Procedural runtime state.** Capacity, dispatch ledgers, compact status, log watching, doctor checks, ACP runs, rate-pressure detection, and file-backed review jobs live under `scripts/goalflight_*.py`.
 
 ## How it differs from the alternatives
 
@@ -36,7 +37,11 @@ git clone https://github.com/simonrowland/goal-flight.git ~/.claude/skills/goal-
                                   # Bash-&-tail-file), embedded self-review,
                                   # milestone codex+claude reviews every K commits
 /goal-flight doctor               # validate plugin package, companion tools,
-                                  # codex trust, context-mode, gstack, ACP
+                                  # codex trust, context-mode, gstack, ACP +
+                                  # surface model currency + rate-pressure
+/goal-flight update               # pull latest goal-flight from origin + run
+                                  # each worker CLI's self-update (codex /
+                                  # grok / cursor-agent / claude / -cli-acp)
 /goal-flight resume               # rebuild RESUME-NOTES from current git state
                                   # (use when picking up across sessions)
 ```
@@ -53,7 +58,8 @@ git clone https://github.com/simonrowland/goal-flight.git ~/.claude/skills/goal-
 | `/goal-flight decompose-plan [<plan>]` | Break a plan into `/goal` chunks with parallel reviewer pass |
 | `/goal-flight ask-questions [<scope>]` | Anticipatory subagents; surface clarifying questions |
 | `/goal-flight execute [--parallel <N>]` | Per-chunk loop; sequential default, parallel-safe opt-in |
-| `/goal-flight doctor` | Read-only health check for plugin/package/runtime readiness |
+| `/goal-flight doctor` | Read-only health check for plugin/package/runtime readiness, model currency, rate-pressure |
+| `/goal-flight update` | Pull latest goal-flight from origin + run each worker CLI's self-update |
 | `/goal-flight build-corpus [<flags>]` | Extend / rebuild the optional RAG corpus |
 | `/goal-flight resume` | Rebuild RESUME-NOTES from current git state |
 | `/goal-flight goal <SLUG>` | Append one goal to the queue |
@@ -66,15 +72,22 @@ Plus an opt-in self-delegation pattern via `/fork` — controller writes a marke
 Detailed operating procedures are split into load-on-demand files under
 `protocols/`. The always-loaded `SKILL.md` is intentionally small.
 
-## Three dispatch paths (the cost/loop trade-off)
+## Dispatch routing (two orthogonal axes)
 
-| Path | When | Cost |
+**Iteration pattern** — how many turns the chunk needs:
+
+| Pattern | When | Cost |
 |---|---|---|
-| **`[controller-direct]`** | Trivially small (single-file, < ~30 LoC), OR controller already has the session-loaded context a fresh subagent would have to re-discover | Inline; no subagent |
-| **Single-shot subagent** (Claude Agent / `codex exec` / `grok -p`) | Default for most chunks. Frontier model picks the executor target based on chunk shape | One subagent dispatch per chunk |
-| **Goal-mode loop** (codex `/goal` in-session, or external iteration loop driven by the controller) | Multi-step refactor, code migration, prototype implementation, converge code to ground-truth — anything that benefits from a plan/act/test/iterate loop | Multi-hour autonomous session (codex), or N Agent-tool dispatches (controller-driven loop) |
+| **`controller-direct`** | Trivially small (single-file, < ~30 LoC), OR controller already has the session-loaded context a fresh subagent would have to re-discover | Inline; no subagent |
+| **one-shot subagent** | Default for most chunks. Frontier model picks the executor target based on chunk shape | One subagent dispatch per chunk |
+| **goal-mode loop** | Multi-step refactor, code migration, prototype implementation, converge code to ground-truth — anything that benefits from plan/act/test/iterate | Multi-hour autonomous session (codex `/goal` natively, or controller-driven iteration loop) |
 
-The skill doesn't prescribe between Opus, codex, and Grok within a path — frontier models pick based on the chunk. Hard convention: code-writing dispatches use the largest available model + highest reasoning by default; non-code dispatches use defaults.
+**Comms shape** (orthogonal axis) — how the controller observes the worker:
+
+- **`acp`** — structured JSON-RPC over stdio (turn boundaries, tool-call events, stop reasons). Default when the worker has an adapter (codex / cursor / claude / grok all do today).
+- **`bash-tail`** — flat stdout + marker grep (cold-storage fallback, recipes in `protocols/legacy/bash-tail.md`). Only path that does NOT compose with `goal-mode` for non-codex workers — codex `/goal` self-terminates with a Final-response marker the watcher detects; grok / claude headless don't.
+
+The skill doesn't prescribe between codex, cursor, Grok, and Claude within a path — the controller picks based on chunk shape + rate-pressure observations. Hard convention: code-writing dispatches lean toward codex / cursor (sub-billed; don't share the controller's Claude rate-limit budget); reviews lean on gstack `/review` via codex with grok / cursor as concern-diverse sweep partners; Claude Agent subagents are the third-tier fallback for code work. Full routing table in `SKILL.md` "Worker Routing".
 
 ## When NOT to use this
 
