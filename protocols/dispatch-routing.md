@@ -49,7 +49,7 @@ orthogonal axes: **iteration pattern** (how many turns) and **comms shape**
 | one-shot | acp | yes | default for any spawned worker |
 | one-shot | bash-tail | yes | only when no ACP adapter |
 | goal-mode | acp | yes | preferred transport for loops |
-| goal-mode | bash-tail | codex `/goal` only | codex emits a structured "Final response" block at end-of-goal — gives the watcher a turn-boundary signal in the flat tail. See `templates/codex-goal-prompt.md.tpl`. Grok / claude headless lack the equivalent end-of-goal marker and fail in this cell; use one-shot + bash-tail with a coarser chunk instead. |
+| goal-mode | bash-tail | depends on worker | Requires the worker to emit a detectable end-of-goal marker in the flat tail (so the watcher knows the loop is complete). **As of 2026-05-19, codex `/goal` is the only worker known to qualify** — its structured "Final response" block is the marker; see `templates/codex-goal-prompt.md.tpl`. Grok and claude headless do not qualify today; a future worker that grows an equivalent marker contract would join this cell. When the worker doesn't qualify, use one-shot + bash-tail with a coarser chunk instead. |
 | goal-mode | controller-direct | n/a | controller-direct is single-turn by definition |
 
 ## Capacity gate

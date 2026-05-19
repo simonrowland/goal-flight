@@ -141,11 +141,11 @@ Tags (see SKILL.md for full definitions):
 - [parallel-safe:<group>] — chunks in the same group can run via `--parallel N`
 - [milestone] — trigger gstack review sweep after this chunk lands
 - [controller-direct] — controller handles inline (trivial OR too much session-loaded context to explain)
-- [goal-mode] — chunk warrants the iteration loop primitive (codex /goal native or external Opus/Grok loop)
+- [goal-mode] — chunk warrants the iteration loop primitive. Composes with `[acp]` for any worker that has an ACP adapter (codex/grok/cursor-agent/claude-code-cli-acp), OR with `[bash-tail]` ONLY for codex `/goal` (codex emits a Final-response marker giving the watcher a turn-boundary signal; other workers don't qualify today — see `protocols/dispatch-routing.md`)
 - [max-iterations:<N>] — cap for [goal-mode] external loops
 - [mixed-executor] — iterations cross executor types for model-diversity stuck-loop recovery
 - [acp] — force ACP transport (structured events; persistent session); see `protocols/dispatch-routing.md`. Untagged-ACP-capable chunks default to ACP if doctor/capacity status shows the adapter installed
-- [bash-tail] — force legacy Bash-`&`-tail-file dispatch (explicit fallback when ACP overhead isn't worth it, or target worker doesn't speak ACP)
+- [bash-tail] — force legacy Bash-`&`-tail-file dispatch (explicit fallback when ACP overhead isn't worth it, or target worker doesn't speak ACP). `[bash-tail] + [goal-mode]` is codex-only; for other workers in `[goal-mode]`, drop `[bash-tail]` and route via `[acp]`
 
 ## Universal preconditions
 - All passing tests stay green; new tests added per goal

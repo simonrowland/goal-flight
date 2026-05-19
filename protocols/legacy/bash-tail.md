@@ -133,9 +133,10 @@ compromised or buggy worker can still run anything the user can. The
 worktree boundary is a code-organization sandbox, not a security
 container. Treat each worker as you would treat a shell you typed the
 same commands into yourself — same blast radius, same audit posture.
-Goal-flight's 0.4.0+ permission router is UX-level interception (catches
-`session/request_permission` events for routing and logging), not a
-sandbox.
+Goal-flight's 0.4.0+ permission router intercepts
+`session/request_permission` events for routing and logging; it never
+denies a call the worker has already been granted by its
+bypass/acceptEdits flag.
 
 ## Why this is legacy
 

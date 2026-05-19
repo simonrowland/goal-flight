@@ -18,11 +18,13 @@ already be fixed upstream).
    repo so `git` operates on the canonical checkout:
 
    ```bash
-   GFROOT="$(readlink -f <skill-root> 2>/dev/null || readlink <skill-root> || echo <skill-root>)"
+   GFROOT="$(realpath <skill-root>)"
    ```
 
-   If `$GFROOT` isn't a git repo (e.g., the user installed via a tarball
-   or a marketplace bundle that doesn't expose `.git`), emit
+   `realpath` is BSD-native on macOS and GNU-native on Linux — same
+   flag-less behavior on both. If `$GFROOT` isn't a git repo (e.g., the
+   user installed via a tarball or a marketplace bundle that doesn't
+   expose `.git`), emit
    `STATUS: plugin install path is not a git checkout (path=$GFROOT) — skipping plugin update` and skip to Sweep 2.
 
 2. Capture current state:
@@ -33,14 +35,21 @@ already be fixed upstream).
    ```
 
 3. Refuse to pull if working tree is dirty (don't risk losing the user's
-   in-flight changes):
+   in-flight changes). `git diff-index` is blind to untracked files; use
+   `git status --porcelain` which catches modified, staged, AND untracked
+   entries:
 
    ```bash
-   git -C "$GFROOT" diff-index --quiet HEAD --
+   if [ -n "$(git -C "$GFROOT" status --porcelain)" ]; then
+     # dirty — skip plugin update
+     emit "STATUS: goal-flight working tree has uncommitted changes — skipping plugin update; resolve dirty state first."
+     # ...then fall through to Sweep 2 anyway; CLI updates don't touch the source repo.
+   fi
    ```
 
-   Non-zero exit → emit
-   `STATUS: goal-flight working tree has uncommitted changes — skipping plugin update; resolve dirty state first.` Then proceed to Sweep 2 anyway; CLI updates don't touch the source repo.
+   The porcelain check returns a non-empty string for any of: modified
+   tracked files, staged changes, untracked files, conflicts. All four
+   should block the pull.
 
 4. Pull + rebase any local commits onto origin/main:
 
@@ -80,8 +89,12 @@ already be fixed upstream).
    python3 "$GFROOT/scripts/goalflight_doctor.py" --project-root "$PWD" --json
    ```
 
-   The `tools` section lists each CLI's presence + path. Skip missing
-   CLIs silently.
+   The doctor returns presence in two places: `capacity.tools` is a flat
+   `{<cli>: <bool>}` map covering codex / grok / claude / cursor-agent /
+   claude-code-cli-acp / codex-acp. `acp.<adapter>` carries ACP-adapter
+   presence and (for some) a version string. Use `capacity.tools` as the
+   present-set filter; skip missing CLIs silently. Versions are captured
+   separately in step 2 via each CLI's `--version`.
 
 2. For each present CLI, capture current version. Run in parallel via
    background Bash calls; each is sub-second:
@@ -101,7 +114,7 @@ already be fixed upstream).
    | CLI | Update command |
    |---|---|
    | codex | `codex update` |
-   | grok | `grok update` (or `grok update <version>` for a pin) |
+   | grok | `grok update` (or `grok update --version <ver>` for a pin; `--check` for dry-run) |
    | cursor-agent | `cursor-agent update` |
    | claude | `claude update` |
    | claude-code-cli-acp | `npm update -g claude-code-cli-acp` |
@@ -143,9 +156,11 @@ HEAD).
 
 - **Don't abort on a single CLI failure.** A failed grok update shouldn't
   block a fresh codex from landing.
-- **Network reachability**: each step needs network. Probe with
-  `curl -s -o /dev/null -w '%{http_code}' https://1.1.1.1` first if
-  you're not sure the user is online.
+- **Network reachability**: each update step needs network. Each updater
+  will surface its own connectivity error if offline — no preflight probe
+  required. If you want one anyway, `ping -c 1 -W 2 1.1.1.1`,
+  `nc -z -w 2 1.1.1.1 443`, or `curl -s -o /dev/null -w '%{http_code}' https://1.1.1.1`
+  all work depending on what's installed.
 - **Don't run during an active dispatch**: a `codex exec` worker running
   during a `codex update` might end up with mixed binaries. Drain
   in-flight dispatches first (check
@@ -153,8 +168,11 @@ HEAD).
   update for after.
 - **Plugin update is hot-swap-unsafe for the live session.** Loaded
   `SKILL.md` + protocols are cached in this conversation. After Sweep 1
-  bumps the skill, type `/goal-flight` (no args) to re-load, or start a
-  fresh session to pick up the new rules.
+  bumps the skill, the most reliable way to pick up the new rules is a
+  fresh session. Re-invoking `/goal-flight` in the live session may
+  re-print the skill content but loader behavior across the various
+  protocol files is not guaranteed; a clean start is the only sure
+  reload path.
 
 ## Output convention
 

@@ -107,9 +107,12 @@ Two orthogonal axes. Pick one from each.
   (structured JSON-RPC, default when an adapter exists), or `bash-tail`
   (flat stdout watcher, fallback only).
 
-Most compositions work. The notable exception: `goal-mode + bash-tail` is
-codex-`/goal`-only (codex emits a "Final response" marker; grok and claude
-headless don't). See `protocols/dispatch-routing.md` for the full table.
+Most compositions work. `goal-mode + bash-tail` requires a worker that emits
+a detectable end-of-goal marker in the flat tail (so the watcher knows the
+loop is complete). As of 2026-05-19, codex `/goal` is the only worker known
+to qualify — via its structured "Final response" block. Grok and claude
+headless do not qualify yet; a future worker that gains an equivalent marker
+would join this cell. See `protocols/dispatch-routing.md` for the full table.
 
 **Worker bias when the controller is a Claude session.** Prefer non-Claude
 CLI workers (codex, grok, cursor) for code-writing dispatches. Claude
