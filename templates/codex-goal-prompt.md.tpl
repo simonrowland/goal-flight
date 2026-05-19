@@ -18,7 +18,7 @@ PID=$!
 - `--skip-git-repo-check` — codex refuses non-interactive runs in non-git directories by default. `[goal-mode]` chunks under `<repo>/.claude/worktrees/` ARE git repos and don't need this flag; chunks dispatched into `/tmp/` or other non-git workspaces do.
 - `--dangerously-bypass-approvals-and-sandbox` — autonomous goal-mode dispatch needs to edit files without an interactive human approval. Without this flag, codex emits `patch rejected: writing is blocked by read-only sandbox; rejected by user approval settings` on the first edit attempt and the chunk fails with `BLOCKED:`. Empirically verified 2026-05-17: same prompt with the flag completes the full edit → pytest → green loop in ~92 seconds; without the flag, codex correctly emits `BLOCKED:` after running pytest and attempting the patch. The "dangerously" prefix in the flag name is meaningful — codex runs unsandboxed, can execute arbitrary shell, can edit anywhere in the workspace. **The bypass safety story depends entirely on `-C <workdir>`** pointing at an isolated tree: when `<workdir>` is a sibling worktree under `.claude/worktrees/<slug>/` (i.e., `--parallel` mode), the worktree boundary acts as an external sandbox and the per-chunk verify-diff catches scope leaks before cherry-pick to main. When `<workdir>` is the controller cwd (sequential mode against the main worktree), there is no sandbox — only the verify-diff step. Sequential bypass-mode against a repo with uncommitted unrelated work is unsafe; either parallel-isolate or accept that diff-verify is the only fence.
 
-**No `timeout 300` wrapper** — `/goal` mode is designed for multi-hour autonomous runs. The controller monitors the tail file for the "Final response" block specified at the bottom of the prompt; the dispatch is complete when that block appears with the agreed schema. Watchdog inactivity thresholds from `SKILL.md` §Codex reliability do NOT apply (long pauses during plan/act/test/iterate cycles are expected).
+**No `timeout 300` wrapper** — `/goal` mode is designed for multi-hour autonomous runs. The controller monitors the tail file for the "Final response" block specified at the bottom of the prompt; the dispatch is complete when that block appears with the agreed schema. Watchdog inactivity thresholds from `SKILL.md` §Codex reliability do NOT apply (long pauses during plan/act/test/review-to-convergence cycles are expected).
 
 ---
 
@@ -43,6 +43,7 @@ Rules:
 - {{RULE_VALIDATION — e.g., validate facts before downstream claims}}
 - Only run safe read/diagnostic commands unless explicitly authorized to edit.
 - **Emit marker lines** when you hit ambiguous points, need user input, or finish. One marker per line in your output. Vocabulary (see goal-flight SKILL.md §Worker message passing): `STATUS: <update>` (informational), `RESULT: <key>=<value>` (structured output), `USER-NEED: <question>` (you can't decide without user input — stop and emit this; the controller will relay), `USER-CONFIRM: <action> [Y/N]` (irreversible op needs authorization), `BLOCKED: <reason>` (unrecoverable), `COMPLETE: <summary>` (task done). The controller polls these from the tail file and relays `USER-NEED:` / `USER-CONFIRM:` to the user via the orchestrator's conversational surface. Don't guess past an ambiguous point — emit `USER-NEED:` and stop.
+- **End-of-convergence-attempt self-review.** When you think the goal is met (test gates green AND acceptance criteria satisfied), DO NOT yet emit `Goal complete: true`. First run the 7-category adversarial self-review from `prompts/executor-self-review.md` (INVARIANT GAP / SCOPE LEAK / MUTATION PURITY / BEHAVIOR DRIFT / DEAD CODE / CONTRACT LEAK / INTEGRITY), specialized to this chunk's project nouns and grep patterns. Severity-rank findings P0/P1/P2/P3. **Any P0 or P1 is a continue-iterating signal** — fix it in-loop (which becomes another plan/act/test cycle) and re-run the self-review pass. Emit `Goal complete: true` only when the self-review pass yields no P0/P1, OR when every flagged P0/P1 was resolved in-loop with test gates still green. **Cadence**: ONE self-review pass per "I think I'm done" attempt — NOT after every micro-step. Typical: 1-3 passes total per chunk.
 
 Acceptance criteria:
 - {{ACCEPT_INSPECT — what to inspect/read first, by file path}}
@@ -51,6 +52,7 @@ Acceptance criteria:
 - {{ACCEPT_RECOMMEND — concrete recommendation + sensitivity/stress alternatives}}
 - {{ACCEPT_WRITE — write memo/output to <docs-private/...md>}}
 - {{ACCEPT_TEST_GATE — any test that must stay green / any artifact that must be produced}}
+- {{ACCEPT_SELF_REVIEW_CLEAN — final 7-category adversarial self-review (per prompts/executor-self-review.md, specialized to this chunk's nouns/files) shows no P0/P1 findings, OR every flagged P0/P1 was resolved in-loop with test gates still green. The controller never sees a non-converged result.}}
 
 Test gates (must remain true throughout):
 - {{TEST_GATE_1 — e.g., pytest tests/test_invariants.py stays green}}
@@ -68,6 +70,7 @@ Final response (must include all of the following, in this order):
 - Commands run: <bulleted list>
 - Dirty files: <`git status --short` style listing, or "clean" if no edits>
 - Blockers: <bulleted list, or "none">
+- Self-review status: <clean | resolved-in-loop with N P0/P1 findings fixed during iteration> — must be one of these two for `Goal complete: true`
 - Goal complete: <true | false; explain if false>
 ```
 
@@ -81,3 +84,4 @@ Final response (must include all of the following, in this order):
 - **Edit policy is load-bearing.** Goal-mode runs for hours; if you don't pin the edit scope, the agent may make changes you didn't authorize. `review-only` and `diagnostic-only` are the safe defaults; `full` is for chunks the goal-queue tags as code-writing.
 - **Blocker protocol matters** — without it, goal-mode may loop on a wedged review tool indefinitely, eating tokens until budget exhaustion. Tell it to surface and stop.
 - **Final response schema must be unambiguous.** The controller polls the tail file for that schema's appearance to detect completion. If the schema is fuzzy, you'll get false-positive-completes or miss the real one.
+- **Self-review cadence is end-of-attempt, not per-step.** The 7-category pass runs ONCE per "I think I'm done" attempt, not after every plan/act/test cycle. Cost per pass: ~30s of worker thinking + a structured report block. Catches obvious P0/P1s in-loop so the controller doesn't have to dispatch a separate reviewer for each chunk; the milestone external review flight (codex + grok via gstack `/review`) remains the heavier per-K-commits gate.
