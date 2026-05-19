@@ -137,6 +137,31 @@ treats them as co-equal choices; the controller picks per chunk
 character (codex `/goal` for iterative workhorses; cursor for chunks
 where Claude-like fluency matters and codex would over-engineer).
 
+**Cursor model selection**: prefer cursor's leading internal model
+(`composer-2.5` as of 2026-05-19) — it's covered by the Cursor
+subscription's unlimited internal-model tier. Cursor also exposes
+passthrough models (`gpt-5.3-codex-xhigh`, `claude-opus-4-7-thinking-high`,
+etc.) but those bill against the subscription's paid-passthrough budget
+and burn it fast. Reserve passthrough for chunks that specifically need
+those vendors. The `cursor-agent acp` subcommand has no `--model` flag;
+the model is read from `~/.cursor/cli-config.json`'s `modelId`. To set:
+
+```json
+"model": {
+  "modelId": "composer-2.5",
+  "displayModelId": "composer-2.5",
+  "displayName": "Composer 2.5",
+  "displayNameShort": "Composer 2.5",
+  "aliases": [],
+  "maxMode": false
+},
+"hasChangedDefaultModel": true
+```
+
+Cursor's internal models don't have a separate "xhigh" effort tier
+(`composer-2.5` is its own quality level); xhigh variants exist only on
+the OpenAI-passthrough models. Use `composer-2.5` directly.
+
 **Failover.** If a Claude Agent dispatch fails with a rate-limit signal,
 re-dispatch the same chunk to codex or grok; don't retry Claude until the
 documented reset window passes.
