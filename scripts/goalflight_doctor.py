@@ -459,8 +459,27 @@ def print_human(payload: dict) -> None:
             f"behind: {'; '.join(behind_workers)}. Run /goal-flight update."
         ))
     else:
-        probed = [n for n, e in wc.items() if e.get("current")]
-        lines.append(status_line(True, "worker CLI currency", f"current: {', '.join(sorted(probed)) or 'none probed'}"))
+        # Filter the OK list to workers where `behind` is explicitly False —
+        # not just "current is known". A worker with current=X but
+        # latest=None (npm reachability failure / 404 / timeout) has
+        # behind=None and should NOT be claimed as "current" — that would
+        # silently over-claim verified state. Surface the probe gaps
+        # separately so transient registry blips don't go unnoticed.
+        verified_current = sorted(n for n, e in wc.items() if e.get("behind") is False)
+        probe_failed = sorted(
+            n for n, e in wc.items()
+            if e.get("current") and e.get("behind") is None
+        )
+        detail_parts = []
+        if verified_current:
+            detail_parts.append(f"current: {', '.join(verified_current)}")
+        if probe_failed:
+            detail_parts.append(f"probe-failed (treated as current): {', '.join(probe_failed)}")
+        lines.append(status_line(
+            True,
+            "worker CLI currency",
+            "; ".join(detail_parts) or "none probed",
+        ))
 
     # Rate-limit pressure summary — the controller's responsibility is to
     # not overheat services in a way that crashes the live session.

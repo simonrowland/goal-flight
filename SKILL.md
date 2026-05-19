@@ -191,6 +191,16 @@ provider may have multiple agent labels — e.g., `codex` and `codex-acp`
 share the same OpenAI budget; `cursor` and `cursor-agent` share the same
 Cursor subscription).
 
+**The caps are placeholders, not laws.** Today's numbers are best-guesses
+calibrated against the maintainer's current vendor plans + 2026-05-19
+service health. Reality is variable: vendor capacity fluctuates, plans
+change, bad model releases happen, your own plan tier differs from the
+maintainer's. The intended trajectory is for the rate-pressure walkback to
+**learn** observed bounce thresholds per provider over time — see the
+backlog entry "learned rate-pressure thresholds". Until that lands, treat
+the static caps as starting defaults and adjust via `DEFAULT_AGENT_CAPS`
+edits if your environment bounces consistently below them.
+
 **Adaptive walkback**: `scripts/goalflight_rate_pressure.py` reads the
 dispatch ledger, classifies failures by provider, and emits a JSON
 recommendation when 3+ rate-limit signatures hit the same provider within
