@@ -4,6 +4,144 @@ Notable changes to the goal-flight Claude Code skill. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are
 incremented when meaningful skill behaviour changes.
 
+## [0.4.0] — 2026-05-19
+
+Dispatch-routing rewrite + adaptive rate-pressure walkback + worker
+currency probes. Substantial shift in how goal-flight thinks about
+worker routing and the controller's own rate-limit budget.
+
+Note: the original 0.4.0 plan was a permission-gate. The 0.4.0-prep
+refactor (commit `d372f47`, included here) cleaned up enough of the
+substrate that the permission-gate is now smaller scope; this release
+ships the routing/walkback/currency layer it sits on top of. The
+permission-gate becomes a 0.5.0 candidate.
+
+### Added — dispatch routing + legacy/
+
+- **Two-axis dispatch routing taxonomy** in `protocols/dispatch-routing.md`.
+  Iteration pattern (one-shot vs goal-mode) × comms shape
+  (controller-direct / acp / bash-tail). Composition rules table
+  documents `goal-mode + bash-tail` as **codex-`/goal`-only** — codex
+  self-terminates with a "Final response" block giving the watcher a
+  turn-boundary signal; grok / claude headless lack the equivalent.
+- **`protocols/legacy/`** subdirectory — cold-storage recipes for
+  bash-tail and `tail -f` paths that pre-date ACP. Loaded only when
+  the primary ACP path is unavailable. Includes accurate CLI
+  invocations (codex stdin redirect, grok `--permission-mode
+  acceptEdits`, claude subshell pattern with no `--cwd` flag),
+  watcher exit-code table, bypass-flag safety story.
+- **`/goal-flight update`** — single command refreshes goal-flight
+  itself (git pull on the source repo, with dirty-tree refusal +
+  post-pull test gate) AND worker CLIs (each runs its own self-update).
+- **Per-task routing table** in SKILL.md with explicit defaults +
+  fallbacks per task category. Worker-bias note: prefer non-Claude
+  CLI workers for code-writing dispatches when the controller is a
+  Claude session (Claude Agent subagents share the controller's
+  rate-limit budget; codex / grok / cursor do not).
+
+### Added — rate-pressure walkback
+
+- **`scripts/goalflight_rate_pressure.py`** (~225 LoC + 23 test
+  assertions) — read-only probe that scans the dispatch ledger,
+  classifies failures by **provider** (anthropic-session,
+  anthropic-api, anthropic-cli-acp, openai, xai, cursor), and emits
+  a JSON recommendation when 3+ rate-limit signatures hit the same
+  provider in 10 minutes. Resolves the cursor/codex-acp aliasing wart
+  at the provider level (per-label caps stay as process-count caps;
+  rate-limit accounting collapses to one entry per vendor budget).
+- **Walkback wired into pre-flight** — `commands/execute.md` step 1
+  consults the probe before every dispatch (silent on clean, single
+  STATUS line + fallback-provider hint on pressure).
+  `commands/decompose-plan.md` step 0.4 consults anticipatorily
+  before generating a multi-chunk plan.
+- **Detection signatures**: case-insensitive substring match on
+  "rate_limit", "429", "you've hit your limit", "usage limit",
+  `anthropic.RateLimitError`, `openai.RateLimitError`, goal-flight's
+  own `blocked_session_limit` state. `blocked_auth` explicitly
+  carved out (auth needs credential repair, not cap-halving).
+
+### Added — model + CLI currency
+
+- **Cursor model discovery** — `cursor_models_probe()` in
+  `goalflight_doctor.py` runs `cursor-agent --list-models`, picks
+  highest-versioned `composer-X.Y` (non-`-fast`) as the leading
+  internal model, reads `~/.cursor/cli-config.json` for the user's
+  current model, flags `user_behind` when on an older internal or a
+  paid-passthrough model. Avoids hardcoding model names that age.
+- **Worker CLI currency probe** — `worker_currency_probe()` in
+  `goalflight_doctor.py`. Grok via native `grok update --check
+  --json`; codex / claude / claude-code-cli-acp via
+  `npm view <pkg> version` registry compare against local
+  `<cli> --version`. CLI-version-currency is the closest universal
+  proxy for "model is current" since new models ship with new CLI
+  releases.
+- **Doctor integration** — payload now includes `rate_pressure` and
+  `worker_currency`; human-readable output shows currency + pressure
+  prominently when actionable, silent on clean.
+
+### Changed
+
+- **Generous static caps** in `goalflight_capacity.DEFAULT_AGENT_CAPS`:
+  claude / claude-code-cli-acp / cursor / cursor-agent = 5; codex /
+  codex-acp / grok = 10. Operating-cap tier 8 (>64GB RAM) bumped
+  8 → 16 to give multi-session parallel work headroom.
+- **Caps are placeholders, not laws.** Static numbers are best-guesses
+  calibrated against the maintainer's vendor plans + 2026-05-19
+  service health. Learned per-provider thresholds are future work.
+- **Controller's own provider is asymmetric.** When goal-flight is
+  hosted by a Claude Code session, `anthropic-session` is the
+  controller's life-support. Bias conservative; don't probe upward
+  on the controller's provider. The cost asymmetry (workday-ending
+  vs re-routable) justifies the caution asymmetry.
+- **--parallel monitoring threshold** is provider-specific, not flat
+  N. Only re-probe between dispatches when 3+ workers map to the
+  same anthropic-* provider. Empirical observation: codex / grok /
+  cursor scale cleanly through N=10.
+- **Queue-tag validation** in `commands/validate-queue.md` —
+  `[goal-mode] + [bash-tail]` co-occurrence with non-codex worker
+  promoted to P0 conflict (was previously undetected).
+- **Cursor co-default for code-writing** alongside codex (cursor's
+  2026-05-19 model update brought coding benchmarks on par with
+  Opus). Prefer cursor's leading internal model (`composer-2.5` as
+  of release) over its paid-passthrough variants which burn the
+  Cursor subscription's paid budget.
+- **gstack `/review`** named as the primary reviewer in
+  `protocols/milestone-review.md`, with grok / cursor as
+  concern-diverse sweep partners. Claude Agent reviewer is the third
+  option, used only when codex AND the sweep tool are unreachable.
+
+### Folded from `d372f47` (0.4.0-prep refactor; was already on main)
+
+- **SKILL.md decomposition** — large prose split into
+  `protocols/*.md` files (load-on-demand). Skill body shrunk from
+  430+ lines to ~200 with the routing table.
+- **Procedural runtime helpers** — 7 new `scripts/goalflight_*.py`
+  emit compact JSON for the controller to read summaries
+  (doctor / capacity / ledger / status / watcher / acp-runner /
+  review-job).
+- **ARCHITECTURE.md** — top-level orientation document.
+
+### Deferred (separate future commits)
+
+- Permission gate (originally scoped for 0.4.0; restructured around
+  the refactor + routing work landing first — see
+  `docs-private/plans/0.4.0-permission-gate-2026-05-18.md`).
+- Learned per-provider rate-pressure thresholds with asymmetric
+  controller-provider treatment (see `docs-private/BACKLOG.md`).
+- Per-worker model-level currency for codex / grok / claude (CLI
+  currency is the current proxy).
+- Timezone-aware ledger windowing.
+- `runs.d/` retention policy.
+- Doctor exit-code escalation on severe rate-pressure.
+
+### Tests
+
+- 9 test suites pass (8 pre-existing + new
+  `test_goalflight_rate_pressure.py` with 23 assertions).
+- 4 adversarial review rounds (codex-acp + grok in parallel) folded
+  before tagging — all blocking + recommended findings addressed;
+  forward-looking items captured.
+
 ## [0.3.4] — 2026-05-18
 
 Combined patch — folds two parallel-session work streams:

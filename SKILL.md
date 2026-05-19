@@ -1,6 +1,6 @@
 ---
 name: goal-flight
-version: 0.4.0-dev
+version: 0.4.0
 description: "long-running unattended controller for chunked code work — init repo, decompose plan, anticipate questions, execute with embedded review and milestone gstack sweeps"
 allowed-tools:
   - Bash
