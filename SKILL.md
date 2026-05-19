@@ -201,6 +201,25 @@ backlog entry "learned rate-pressure thresholds". Until that lands, treat
 the static caps as starting defaults and adjust via `DEFAULT_AGENT_CAPS`
 edits if your environment bounces consistently below them.
 
+**The controller's own provider is asymmetric.** When goal-flight is hosted
+by a Claude Code session, the controller's own service is `anthropic-session`
+— the same budget the controller's interactive turns consume. If that
+provider gets rate-limited, **the user's terminal stops working**. Other
+providers (codex / grok / cursor) failing just means re-routing. Implication
+for the learned-thresholds work:
+
+- Worker providers: cautious upward exploration is OK. If 5 codex workers
+  in parallel is working cleanly and there are many dispatches queued,
+  try 6 and observe — if the 6th errors, back off. Standard EMA dynamics.
+- Controller's own provider: bias conservative. Don't probe upward; only
+  ratchet downward on pressure. Surface a STATUS marker early. Losing the
+  controller ends the user's workday — the cost asymmetry justifies the
+  caution asymmetry.
+
+If goal-flight is hosted by a non-Claude controller (e.g., a hypothetical
+hermes or codex-native port), the same asymmetric treatment applies to
+whichever provider the controller runs on.
+
 **Adaptive walkback**: `scripts/goalflight_rate_pressure.py` reads the
 dispatch ledger, classifies failures by provider, and emits a JSON
 recommendation when 3+ rate-limit signatures hit the same provider within
