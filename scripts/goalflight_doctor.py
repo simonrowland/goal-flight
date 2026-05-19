@@ -119,6 +119,100 @@ def check_grok() -> dict:
     }
 
 
+def _npm_registry_version(pkg: str, timeout: float = 6.0) -> str | None:
+    """Return the published latest version of an npm package, or None on failure.
+
+    Used as a CLI-currency proxy for codex / claude / claude-code-cli-acp.
+    CLI version is the closest universal proxy for "model is current" — new
+    models almost always ship with new CLI releases. Direct model-list APIs
+    exist for some workers (cursor-agent --list-models) but not codex/claude.
+    """
+    if not shutil.which("npm"):
+        return None
+    result = run(["npm", "view", pkg, "version"], timeout=timeout)
+    if not result["ok"]:
+        return None
+    return first_line(result["stdout"])
+
+
+def _version_tuple(s: str | None) -> tuple[int, ...]:
+    """Parse semver-ish string into a comparison tuple. Non-numeric chunks → 0."""
+    if not s:
+        return ()
+    out: list[int] = []
+    for chunk in s.split("."):
+        digits = "".join(c for c in chunk if c.isdigit())
+        if not digits:
+            break
+        out.append(int(digits))
+    return tuple(out)
+
+
+def worker_currency_probe() -> dict:
+    """Currency check for CLI workers other than cursor (which has its own
+    model-level probe in cursor_models_probe).
+
+    Returns per-worker: {current, latest, behind, source}. `behind` is True
+    when current < latest semver-ish; None when either side couldn't be
+    determined (e.g., npm registry unreachable).
+
+    Detection mechanisms:
+    - grok: `grok update --check --json` (native, returns updateAvailable bool).
+    - codex / claude / claude-code-cli-acp: compare installed `--version` to
+      the npm registry's published version. CLI version is the closest
+      universal proxy for "model is current" — new models ship with new CLI
+      releases.
+
+    Cursor isn't here because cursor_models_probe() handles its leading-model
+    discovery directly via `cursor-agent --list-models`, which is more
+    granular than CLI-version-currency.
+    """
+    out: dict = {}
+
+    # --- grok: native check ---
+    grok_entry: dict = {"source": "grok update --check --json"}
+    if shutil.which("grok"):
+        result = run(["grok", "update", "--check", "--json"], timeout=8)
+        if result["ok"]:
+            try:
+                data = json.loads(result["stdout"])
+                grok_entry["current"] = data.get("currentVersion")
+                grok_entry["latest"] = data.get("latestVersion")
+                grok_entry["behind"] = bool(data.get("updateAvailable"))
+                grok_entry["channel"] = data.get("channel")
+            except (ValueError, json.JSONDecodeError):
+                grok_entry["error"] = "non-JSON output"
+        else:
+            grok_entry["error"] = (result.get("stderr") or "")[:200]
+    else:
+        grok_entry["error"] = "grok CLI not on PATH"
+    out["grok"] = grok_entry
+
+    # --- npm-backed: codex / claude / claude-code-cli-acp ---
+    npm_targets = [
+        ("codex", "@openai/codex", "codex"),
+        ("claude", "@anthropic-ai/claude-code", "claude"),
+        ("claude-code-cli-acp", "claude-code-cli-acp", "claude-code-cli-acp"),
+    ]
+    for label, npm_pkg, cli_name in npm_targets:
+        entry: dict = {"source": f"npm view {npm_pkg} version"}
+        if not shutil.which(cli_name):
+            entry["error"] = f"{cli_name} not on PATH"
+            out[label] = entry
+            continue
+        ver_result = version(cli_name, "--version")
+        entry["current"] = ver_result.get("version")
+        latest = _npm_registry_version(npm_pkg)
+        entry["latest"] = latest
+        if entry["current"] and latest:
+            entry["behind"] = _version_tuple(entry["current"]) < _version_tuple(latest)
+        else:
+            entry["behind"] = None
+        out[label] = entry
+
+    return out
+
+
 def cursor_models_probe() -> dict:
     """Probe cursor-agent for available models and pick the leading internal one.
 
@@ -270,6 +364,7 @@ def doctor(repo: Path) -> dict:
         "project": git_state(repo),
         "capacity": goalflight_capacity.profile(argparse.Namespace()) if goalflight_capacity else None,
         "rate_pressure": _rate_pressure_summary(),
+        "worker_currency": worker_currency_probe(),
     }
     return payload
 
@@ -347,11 +442,25 @@ def print_human(payload: dict) -> None:
         lines.append(status_line(True, "cursor model currency", f"on {current} (leading internal)"))
     else:
         lines.append(status_line(None, "cursor model currency", "could not determine — manual check needed"))
-    lines.append(status_line(
-        None,
-        "other-worker model currency",
-        "codex/grok/claude model-discovery not yet probed; run `<cli> update --check` manually"
-    ))
+    # Worker CLI currency (proxy for model currency — new models ship with
+    # new CLI releases). Surface only when behind; silent when current to
+    # avoid being a nag.
+    wc = payload.get("worker_currency") or {}
+    behind_workers = []
+    for name, entry in sorted(wc.items()):
+        if entry.get("behind") is True:
+            current = entry.get("current", "?")
+            latest = entry.get("latest", "?")
+            behind_workers.append(f"{name} ({current} → {latest})")
+    if behind_workers:
+        lines.append(status_line(
+            False,
+            "worker CLI currency",
+            f"behind: {'; '.join(behind_workers)}. Run /goal-flight update."
+        ))
+    else:
+        probed = [n for n, e in wc.items() if e.get("current")]
+        lines.append(status_line(True, "worker CLI currency", f"current: {', '.join(sorted(probed)) or 'none probed'}"))
 
     # Rate-limit pressure summary — the controller's responsibility is to
     # not overheat services in a way that crashes the live session.
