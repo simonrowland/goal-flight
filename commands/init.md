@@ -21,20 +21,33 @@ Read:
 python3 <skill-root>/scripts/goalflight_doctor.py --project-root "$PWD" --json
 ```
 
-2. Run capacity profile:
+2. Ensure the ACP SDK venv exists:
+
+```bash
+ACP_VENV="$HOME/.goal-flight/venvs/acp-0.10"
+if command -v uv >/dev/null 2>&1; then
+  [ -x "$ACP_VENV/bin/python" ] || uv venv "$ACP_VENV"
+  uv pip install --python "$ACP_VENV/bin/python" -r <skill-root>/requirements.txt
+else
+  [ -x "$ACP_VENV/bin/python" ] || python3 -m venv "$ACP_VENV"
+  "$ACP_VENV/bin/python" -m pip install -r <skill-root>/requirements.txt
+fi
+```
+
+3. Run capacity profile:
 
 ```bash
 python3 <skill-root>/scripts/goalflight_capacity.py profile --json
 ```
 
-3. Scaffold private project state if missing:
+4. Scaffold private project state if missing:
 
 - `docs-private/`
 - `docs-private/goal-<topic>-<date>.md` from `templates/goal-statement.md`
 - `docs-private/RESUME-NOTES.md` from `templates/resume-notes.md`
 - `AGENTS.md` from `templates/project-agents.md` when project has no local agent instructions
 
-4. Write only compact environment facts into `docs-private/env-caveats.md`:
+5. Write only compact environment facts into `docs-private/env-caveats.md`:
 
 - doctor summary path/result
 - capacity profile
@@ -44,19 +57,19 @@ python3 <skill-root>/scripts/goalflight_capacity.py profile --json
 
 Do not paste full probe output.
 
-5. Confirm git hygiene:
+6. Confirm git hygiene:
 
 - `docs-private/` ignored
 - `AGENTS.md` tracked or intentionally absent
 - current branch/head/dirty state recorded in resume notes
 
-6. Optional corpus:
+7. Optional corpus:
 
 If the repo is large and the user wants reusable dispatch context, run
 `/goal-flight build-corpus`. Do not run corpus construction by default during
 init.
 
-7. Self-review:
+8. Self-review:
 
 - Are readiness warnings actionable?
 - Did init avoid reading large docs/logs into context?

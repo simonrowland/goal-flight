@@ -21,7 +21,23 @@ from goalflight_liveness import (  # noqa: E402
     cpu_liveness_keep_waiting,
     parse_ps_pgroup_cpu,
     pgroup_cpu_pct,
+    progress_stall_decision,
 )
+from goalflight_acp_client import AcpLivenessActivity  # noqa: E402
+
+
+def _update(session_update: str, text: str = "x") -> dict:
+    return {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": "s",
+            "update": {
+                "sessionUpdate": session_update,
+                "content": {"type": "text", "text": text},
+            },
+        },
+    }
 
 
 def test_busy_silent_worker_classifies_running_quiet() -> None:
@@ -59,16 +75,17 @@ def test_heartbeat_dead_sample_decision_table() -> None:
     cases = [
         ("busy", 8.0, 5, 5, 0, 2, False, 0, False),
         ("idle", 0.0, 5, 5, 0, 2, True, 3, True),
+        ("first-token-grace", 0.0, 0, 0, 0, 2, True, 3, False),
         ("outstanding-tool", 0.0, 5, 5, 1, 2, False, 0, False),
         ("none-cpu", None, 5, 5, 0, 2, False, 0, False),
-        ("new-event", 0.0, 6, 5, 0, 2, False, 0, False),
+        ("new-progress", 0.0, 6, 5, 0, 2, False, 0, False),
     ]
-    for name, cpu, events_seen, previous_events_seen, outstanding, previous_dead, dead, streak, wedged in cases:
+    for name, cpu, progress_seen, previous_progress_seen, outstanding, previous_dead, dead, streak, wedged in cases:
         decision = heartbeat_wedge_decision(
             pid_alive=True,
             pgroup_cpu=cpu,
-            events_seen=events_seen,
-            previous_events_seen=previous_events_seen,
+            wedge_progress_seen=progress_seen,
+            previous_wedge_progress_seen=previous_progress_seen,
             outstanding_count=outstanding,
             cpu_epsilon_pct=0.1,
             previous_dead_samples=previous_dead,
@@ -77,6 +94,123 @@ def test_heartbeat_dead_sample_decision_table() -> None:
         assert decision.dead_sample is dead, name
         assert decision.dead_samples == streak, name
         assert decision.wedged is wedged, name
+
+
+def test_heartbeat_first_token_grace_requires_progress_before_wedge() -> None:
+    dead_samples = 0
+    previous_progress_seen = 0
+    decision = None
+
+    for _ in range(4):
+        decision = heartbeat_wedge_decision(
+            pid_alive=True,
+            pgroup_cpu=0.0,
+            wedge_progress_seen=0,
+            previous_wedge_progress_seen=previous_progress_seen,
+            outstanding_count=0,
+            cpu_epsilon_pct=0.1,
+            previous_dead_samples=dead_samples,
+            wedge_samples=3,
+        )
+        dead_samples = decision.dead_samples
+        previous_progress_seen = 0
+
+    assert decision is not None
+    assert decision.dead_sample is True
+    assert decision.dead_samples == 4
+    assert decision.wedged is False
+
+
+def test_heartbeat_wedges_after_first_progress_and_resets_on_new_progress() -> None:
+    dead_samples = 0
+    previous_progress_seen = 1
+    decision = None
+
+    for _ in range(3):
+        decision = heartbeat_wedge_decision(
+            pid_alive=True,
+            pgroup_cpu=0.0,
+            wedge_progress_seen=1,
+            previous_wedge_progress_seen=previous_progress_seen,
+            outstanding_count=0,
+            cpu_epsilon_pct=0.1,
+            previous_dead_samples=dead_samples,
+            wedge_samples=3,
+        )
+        dead_samples = decision.dead_samples
+        previous_progress_seen = 1
+
+    assert decision is not None
+    assert decision.wedged is True
+
+    decision = heartbeat_wedge_decision(
+        pid_alive=True,
+        pgroup_cpu=0.0,
+        wedge_progress_seen=2,
+        previous_wedge_progress_seen=1,
+        outstanding_count=0,
+        cpu_epsilon_pct=0.1,
+        previous_dead_samples=dead_samples,
+        wedge_samples=3,
+    )
+    assert decision.dead_sample is False
+    assert decision.dead_samples == 0
+    assert decision.wedged is False
+
+
+def test_progress_stall_ignores_raw_event_recency() -> None:
+    activity = AcpLivenessActivity()
+    activity.reset_progress_clock(0.0)
+    activity.note_message(_update("_x.ai/vendor_progress"), 299.0)
+
+    snapshot = activity.snapshot(301.0)
+
+    assert snapshot["quiet_for_s"] == 2.0
+    assert snapshot["progress_quiet_for_s"] == 301.0
+    assert progress_stall_decision(
+        pid_alive=True,
+        progress_quiet_s=snapshot["progress_quiet_for_s"],
+        progress_stall_s=300.0,
+        outstanding_count=snapshot["outstanding_count"],
+    ) is True
+
+
+def test_progress_stall_resets_on_standard_progress() -> None:
+    activity = AcpLivenessActivity()
+    activity.reset_progress_clock(0.0)
+    activity.note_message(_update("agent_message_chunk"), 250.0)
+
+    snapshot = activity.snapshot(300.0)
+
+    assert snapshot["progress_quiet_for_s"] == 50.0
+    assert progress_stall_decision(
+        pid_alive=True,
+        progress_quiet_s=snapshot["progress_quiet_for_s"],
+        progress_stall_s=300.0,
+        outstanding_count=snapshot["outstanding_count"],
+    ) is False
+
+
+def test_progress_stall_allows_cursor_like_slow_first_token() -> None:
+    activity = AcpLivenessActivity()
+    activity.reset_progress_clock(0.0)
+
+    before_first_token = activity.snapshot(90.0)
+    assert progress_stall_decision(
+        pid_alive=True,
+        progress_quiet_s=before_first_token["progress_quiet_for_s"],
+        progress_stall_s=300.0,
+        outstanding_count=before_first_token["outstanding_count"],
+    ) is False
+
+    activity.note_message(_update("agent_message_chunk"), 90.0)
+    after_first_token = activity.snapshot(120.0)
+    assert progress_stall_decision(
+        pid_alive=True,
+        progress_quiet_s=after_first_token["progress_quiet_for_s"],
+        progress_stall_s=300.0,
+        outstanding_count=after_first_token["outstanding_count"],
+    ) is False
 
 
 def _scripted_sampler(values):
@@ -277,6 +411,11 @@ def main() -> None:
     test_idle_silent_worker_classifies_wedged()
     test_none_cpu_idle_classifies_wedged()
     test_heartbeat_dead_sample_decision_table()
+    test_heartbeat_first_token_grace_requires_progress_before_wedge()
+    test_heartbeat_wedges_after_first_progress_and_resets_on_new_progress()
+    test_progress_stall_ignores_raw_event_recency()
+    test_progress_stall_resets_on_standard_progress()
+    test_progress_stall_allows_cursor_like_slow_first_token()
     test_cpu_keep_waiting_busy_first_sample_keeps_waiting()
     test_cpu_keep_waiting_all_idle_is_wedged()
     test_cpu_keep_waiting_transient_none_then_busy_keeps_waiting()

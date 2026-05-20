@@ -346,11 +346,54 @@ def cursor_models_probe() -> dict:
 
 def check_acp() -> dict:
     grok = check_grok()
+    sdk = check_acp_sdk()
     return {
+        "sdk": sdk,
         "codex-acp": {"present": bool(shutil.which("codex-acp"))},
         "cursor-agent": {"present": bool(shutil.which("cursor-agent")), "version": version("cursor-agent", "--version").get("version")},
         "claude-code-cli-acp": {"present": bool(shutil.which("claude-code-cli-acp"))},
         "grok-agent-stdio": {"present": grok["present"], "headless_hint": grok.get("headless_flags")},
+    }
+
+
+def check_acp_sdk() -> dict:
+    python = Path.home() / ".goal-flight/venvs/acp-0.10/bin/python"
+    hint = "SDK missing -- run install: /init installs agent-client-protocol into ~/.goal-flight/venvs/acp-0.10/"
+    runner = SCRIPT_DIR / "goalflight_acp_run.py"
+    system_python = shutil.which("python3") or "python3"
+    runner_help = run([system_python, str(runner), "--help"], timeout=8)
+    runner_reexec_ok = runner_help["ok"] and "--agent" in runner_help.get("stdout", "")
+    if not python.exists():
+        return {
+            "ok": False,
+            "python": str(python),
+            "error": hint,
+            "runner_reexec_ok": runner_reexec_ok,
+            "runner_reexec_detail": f"python3 --help rc={runner_help['returncode']}",
+        }
+    result = run(
+        [
+            str(python),
+            "-c",
+            "import acp, pydantic; print('acp ok')",
+        ],
+        timeout=5,
+    )
+    if not result["ok"]:
+        return {
+            "ok": False,
+            "python": str(python),
+            "error": hint,
+            "stderr": result.get("stderr", "")[:500],
+            "runner_reexec_ok": runner_reexec_ok,
+            "runner_reexec_detail": f"python3 --help rc={runner_help['returncode']}",
+        }
+    return {
+        "ok": True,
+        "python": str(python),
+        "version": "agent-client-protocol==0.10.*",
+        "runner_reexec_ok": runner_reexec_ok,
+        "runner_reexec_detail": f"python3 --help rc={runner_help['returncode']}",
     }
 
 
@@ -445,7 +488,11 @@ def print_human(payload: dict) -> None:
         status_line(payload["grok"].get("headless_flags"), "Grok headless flags", None),
     ]
     for name, item in payload["acp"].items():
-        lines.append(status_line(item.get("present"), f"ACP {name}", item.get("version")))
+        if name == "sdk":
+            lines.append(status_line(item.get("ok"), "ACP SDK venv", item.get("python")))
+            lines.append(status_line(item.get("runner_reexec_ok"), "ACP runner python3 re-exec", item.get("runner_reexec_detail")))
+        else:
+            lines.append(status_line(item.get("present"), f"ACP {name}", item.get("version")))
     cap = payload.get("capacity") or {}
     lines.append(status_line(True, "capacity profile", f"operating={cap.get('operating_cap')} raw={cap.get('raw_ram_ceiling')} ram={cap.get('ram_mb')}MB"))
     project = payload["project"]

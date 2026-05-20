@@ -31,6 +31,8 @@ orthogonal axes: **iteration pattern** (how many turns) and **comms shape**
     --mode <one-shot|goal> \
     --status-json <status.json>
   ```
+  The runner re-execs into `~/.goal-flight/venvs/acp-0.10/bin/python` when
+  system `python3` cannot import `acp`; set `GOALFLIGHT_ACP_PYTHON` to override.
 
   **`--mode` sets the idle-timeout.** `one-shot` (default) uses a 5-minute
   idle ceiling — a short dispatch silent that long is wedged. `goal` uses a
@@ -98,10 +100,12 @@ runner and watchers use **process-group CPU** as the false-positive killer:
   outstanding past `--max-tool-s` (default 1800s) is killed *regardless of CPU* —
   the wall is absolute, so a CPU-busy or CPU-unsamplable stuck tool still trips
   it. Terminal state `tool_timeout`.
-- **Oversized result frame.** An ACP frame larger than the asyncio stream limit
-  no longer hangs the reader: it resolves pending requests with a
-  `result_too_large` error and reaps the worker (`kill()` skips the calling task,
-  so the reader can reap its own connection). Terminal state `result_too_large`.
+- **Oversized ACP frame.** An ACP frame larger than the asyncio stream limit no
+  longer hangs the reader: the guarded reader drops the over-limit newline frame,
+  increments the ACP dropped-frame counter, logs it, and continues. Oversized
+  notifications are skipped. If an oversized response is dropped, the pending
+  request falls through the existing idle/timeout failure path; no
+  `result_too_large` terminal state is emitted for new runs.
 - **StartupGate for fragile adapters** (`scripts/goalflight_startup_gate.py`).
   Some adapters starve each other during startup, not steady-state — the Claude
   TUI adapter blows its hardcoded 120s per-turn timeout on a trivial turn when
@@ -113,8 +117,10 @@ runner and watchers use **process-group CPU** as the false-positive killer:
   `GOALFLIGHT_SERIALIZE_STARTUP`); fail-open after 600s so a stuck holder cannot
   deadlock the fleet; concurrent *turns* stay parallel.
 
-`wedged`, `tool_timeout`, and `result_too_large` are terminal lease states — the
-capacity gate below frees and prunes the slot the same as `complete`/`failed`.
+`wedged` and `tool_timeout` are active ACP terminal lease states — the capacity
+gate below frees and prunes the slot the same as `complete`/`failed`.
+`result_too_large` is retained only as a legacy pruning state for old 0.4.3
+records.
 
 ## Composition rules
 

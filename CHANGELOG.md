@@ -4,6 +4,60 @@ Notable changes to the goal-flight Claude Code skill. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are
 incremented when meaningful skill behaviour changes.
 
+## [0.4.5] — 2026-05-20
+
+**ACP SDK migration.** Replaced the bespoke stdio JSON-RPC transport with the
+official `agent-client-protocol==0.10.*` Python SDK while keeping goal-flight's
+process-group isolation, pidfile ghost cleanup, StartupGate, heartbeat wedge
+detector, one-shot mode, and goal mode.
+
+### Added
+
+- SDK wrapper with hand-spawned `start_new_session=True` workers, verified pgid
+  kill/reap, guarded over-limit frame dropping, raw stream observer liveness
+  counters, and typed permission auto-allow.
+- Hermetic fake-ACP tests for vendor-flood wedge behavior, CPU-busy flood
+  survival, over-limit drop-and-continue, permission auto-allow, tool tracking,
+  and real-time marker cancellation.
+- Live smoke script for maintainers:
+  `~/.goal-flight/venvs/acp-0.10/bin/python test/smoke_acp_sdk_live.py`.
+
+### Changed
+
+- Runner now drives SDK `initialize -> new_session(cwd, mcp_servers=[]) ->
+  prompt` with streamed marker detection before prompt resolution.
+- Heartbeat wedge samples now key off `wedge_progress_seen`, while
+  `raw_events_seen` remains the idle keepalive counter.
+- Oversized ACP frames are drop-and-continue, not terminal kills: the guarded
+  reader logs and counts dropped frames, oversized notifications are skipped, and
+  oversized responses degrade through the existing idle/timeout failure path.
+- `/goal-flight init`, doctor, `requirements.txt`, and `tests/run.sh` know about
+  the isolated ACP SDK venv.
+
+### Fixed
+
+Found and fixed via a live mass-spawn stress harness (all four workers validated,
+zero orphan leaks):
+
+- **SDK venv re-exec** now execs the *unresolved* venv `python` symlink. Resolving
+  it first collapsed the symlink to the bare interpreter outside the venv, so the
+  re-exec landed somewhere without `acp` ("SDK missing"); the loop-guard still uses
+  the resolved path.
+- **Worker kill no longer leaks wrapper-script adapters.** The PID-reuse identity
+  guard compared process start-time *and* `comm`; a launcher that `exec`s its real
+  binary (`cursor-agent`, `claude-code-cli-acp`) changes `comm` at the same PID, so
+  the guard skipped `SIGKILL` and the worker leaked as an orphan (pidfile
+  unregistered, invisible to the audit). The guard now compares start-time only.
+- **Slow-first-token workers are no longer false-wedged.** The heartbeat wedge
+  requires at least one progress event before it can fire, so a worker sitting at
+  ~0% CPU waiting on a slow backend for its first token is not killed mid-wait.
+- **A no-progress event flood can no longer hang forever.** A progress-silence wall
+  (`--progress-stall-s`, default 300s) bounds time-since-last-progress independently
+  of raw-event recency and CPU, so a worker emitting only vendor/noise notifications
+  with zero real progress is still terminated.
+- **`cursor`/`cursor-agent` cap lowered 5 → 3.** Cursor's cloud backend is slow and
+  degrades under concurrency; it completes reliably up to ~3 concurrent.
+
 ## [0.4.3] — 2026-05-20
 
 **ACP dispatch reliability.** 0.4.2 taught the runner to *observe* worker
@@ -13,8 +67,8 @@ with both adapters hung — a worker's long-running tool call (web search) wedgi
 the event stream, and mass-spawned Claude-TUI adapters starving each other at
 startup. Now the heartbeat *acts* on a confirmed wedge (even when the idle gate
 is off), an outstanding tool call gets a grace window plus an absolute wall, an
-oversized result frame is classified instead of hung, and fragile-adapter
-startup is serialized.
+oversized ACP frame is bounded instead of hung, and fragile-adapter startup is
+serialized.
 
 ### The problem
 
@@ -56,12 +110,12 @@ startup is serialized.
   state `tool_timeout`. A separate `--max-quiet-s` (default 3600s; env
   `GOALFLIGHT_MAX_QUIET_S`) bounds total event-silence for a CPU-busy quiet
   worker → `wedged`.
-- **`result_too_large` classification (`acp_client.py`).** The read loop catches
-  `LimitOverrunError`/`ValueError` on an oversized frame, resolves all pending
-  requests with a `result_too_large` error (instead of a generic "connection
-  closed"), and kills the worker. `kill()` is now current-task-safe — it skips
-  cancelling the task that called it, so the reader loop can reap its own
-  connection without self-cancelling. Terminal state `result_too_large`.
+- **Oversized-frame guard (`acp_client.py`).** The read loop catches
+  `LimitOverrunError` on an oversized newline frame, drops that frame, increments
+  the dropped-frame counters, logs it, and continues. Oversized notifications are
+  skipped; if an oversized response is dropped, the pending request reaches the
+  existing idle/timeout failure path. No new run emits terminal state
+  `result_too_large`.
 - **StartupGate (`scripts/goalflight_startup_gate.py`, new).** An async context
   manager that serializes the spawn→handshake window of fragile adapters via a
   per-agent `flock` (`/tmp/goal-flight-startup-locks/<agent>.lock`). It is
@@ -72,17 +126,19 @@ startup is serialized.
   `GOALFLIGHT_SERIALIZE_STARTUP`); fail-open after `max_wait` (600s) so a stuck
   holder cannot deadlock the fleet. Concurrent *turns* stay parallel; only
   startup is throttled.
-- **New typed terminal states wired through capacity.** `wedged`,
-  `tool_timeout`, and `result_too_large` join `TERMINAL_LEASE_STATES`, so a
-  leased slot is freed and pruned on its terminal-at the same as
-  `complete`/`failed`. The per-agent caps are now backed by stress-test evidence
-  plus StartupGate: codex-acp / grok = 10 (verified 49/49 + 13/13
+- **New typed terminal states wired through capacity.** `wedged` and
+  `tool_timeout` join `TERMINAL_LEASE_STATES`, so a leased slot is freed and
+  pruned on its terminal-at the same as `complete`/`failed`. The legacy
+  `result_too_large` state is retained only for pruning old 0.4.3 lease records.
+  The per-agent caps are now backed by stress-test evidence plus StartupGate:
+  codex-acp / grok = 10 (verified 49/49 + 13/13
   true-simultaneous, zero wedges), claude / claude-code-cli-acp = 5 (startup
   serialized), cursor = 5.
 - **Tests.** `test/test_acp_failure_modes.py`: case_n (a live tool survives a
   silent gap — the field-case grace guard), case_o (a silent tool past the wall
-  → `tool_timeout`), case_p (oversized frame → `result_too_large` + worker
-  reaped), case_q (a CPU-*busy* tool past `--max-tool-s` still hits
+  → `tool_timeout`), case_p (oversized frame → drop-and-continue counted; an
+  oversized response reaches the idle/timeout failure path), case_q (a CPU-*busy*
+  tool past `--max-tool-s` still hits
   `tool_timeout` with `elapsed < 2.0` — the discriminator vs the old CPU-gated
   wall). `test/test_goalflight_liveness.py`: the heartbeat dead-sample decision
   table. `test/test_startup_gate.py` (new): serialization, no-op, fail-open,

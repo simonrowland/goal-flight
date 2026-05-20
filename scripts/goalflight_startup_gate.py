@@ -16,8 +16,11 @@ is no stale-lock cleanup to get wrong.
 
 Only the spawn→handshake window is serialized; turns then run concurrently up to
 the capacity cap. This is what lets the count cap stay high while startups never
-contend. Fast-startup adapters (codex-acp, cursor, grok — all clean at high
-concurrency in the same test) are NOT gated.
+contend. codex-acp and grok are fast-startup AND fast-turn (clean at high
+concurrency) so they are NOT gated. cursor is also fast to START, so the
+StartupGate does not help it — but cursor's CLOUD backend is SLOW per turn
+(~0% CPU blocked on the network), which is handled by the first-token wedge grace
+plus a lower capacity cap (3), not by startup serialization.
 
 Tunable via env `GOALFLIGHT_SERIALIZE_STARTUP` (comma-separated agent names);
 default serializes the Claude TUI adapter only.

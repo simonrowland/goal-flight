@@ -4,7 +4,7 @@ Spawns each worker, runs a trivial prompt, samples the worker's whole process
 tree's RSS at idle (post-init) and tracks the peak during the prompt. Prints
 a comparison table. Useful for pool-sizing decisions on a given box.
 
-Usage: python3 test/probe_worker_memory.py
+Usage: ~/.goal-flight/venvs/acp-0.10/bin/python test/probe_worker_memory.py
 """
 
 import asyncio
@@ -17,8 +17,8 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
-from acp_client import AcpConnection  # noqa: E402
 from acp_runner import run_prompt  # noqa: E402
+from goalflight_acp_client import spawn_acp_connection  # noqa: E402
 
 WORKERS: list[tuple[str, list[str]]] = [
     ("codex-acp", []),
@@ -62,19 +62,20 @@ def tree_rss_mb(root_pid: int) -> float:
 
 
 async def probe(cmd: str, args: list[str], cwd: str) -> tuple[float, float, int]:
-    proc = await asyncio.create_subprocess_exec(
-        cmd, *args,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        cwd=cwd, start_new_session=True, limit=8 * 1024 * 1024,
+    conn = await spawn_acp_connection(
+        cmd,
+        args,
+        agent=cmd,
+        session_id="mem",
+        cwd=cwd,
+        auto_allow_tools=True,
     )
-    conn = AcpConnection(agent=cmd, session_id="mem", proc=proc, auto_allow_tools=True)
+    proc = conn.proc
     rss_peak = 0.0
     proc_count = 0
     try:
         await asyncio.wait_for(conn.initialize(), timeout=30)
-        await asyncio.wait_for(conn.session_new(cwd=cwd), timeout=30)
+        await asyncio.wait_for(conn.new_session(cwd=cwd), timeout=30)
         await asyncio.sleep(2)  # let process tree settle
         idle_rss = tree_rss_mb(proc.pid)
         # Count processes in the tree

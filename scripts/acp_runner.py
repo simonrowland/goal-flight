@@ -1,4 +1,4 @@
-"""Ergonomic wrapper around acp_client.AcpConnection.
+"""Ergonomic wrapper around goal-flight ACP SDK connections.
 
 Surfaces:
   - PromptResult dataclass — text / thoughts / tool_calls / plan / stop_reason
@@ -12,13 +12,17 @@ upstream (aws-samples/sample-acp-bridge) so future re-vendoring is a small diff.
 All goal-flight-specific ergonomics live here.
 """
 
-import re
+import asyncio
+import contextlib
 from dataclasses import dataclass, field
 import inspect
+import json
 from pathlib import Path
+import re
+import time
 from typing import Any, Callable
 
-from acp_client import AcpConnection
+from goalflight_acp_client import AcpConnection
 
 
 @dataclass
@@ -31,6 +35,8 @@ class PromptResult:
     error: dict[str, Any] | None = None
     raw_events: list[dict[str, Any]] = field(default_factory=list)
     out_of_scope_writes: list[str] = field(default_factory=list)
+    cancelled_for_marker: bool = False
+    early_marker: str | None = None
     """Paths from tool_call locations that fall outside the connection's cwd.
     Populated by run_prompt post-hoc — a scope-leak audit signal for the
     controller, not a runtime gate. Empty when no leaks OR no recorded cwd."""
@@ -68,35 +74,132 @@ async def run_prompt(
     Passed straight through to AcpConnection.session_prompt.
     """
     result = PromptResult()
-    async for event in conn.session_prompt(text, idle_timeout=idle_timeout, on_idle=on_idle):
-        if on_event is not None:
-            maybe_awaitable = on_event(event)
-            if inspect.isawaitable(maybe_awaitable):
-                await maybe_awaitable
+    turn_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    conn.client.set_turn_queue(turn_queue)
+    prompt_task = asyncio.create_task(conn.prompt(text))
+    last_event_time = time.time()
+    timeout_enabled = idle_timeout is not None and idle_timeout > 0
+
+    async def _call_on_event(message: dict[str, Any]) -> None:
+        if on_event is None:
+            return
+        maybe_awaitable = on_event(message)
+        if inspect.isawaitable(maybe_awaitable):
+            await maybe_awaitable
+
+    def _content_text(content: Any) -> str:
+        if isinstance(content, dict):
+            return str(content.get("text") or "")
+        return ""
+
+    def _accumulate(message: dict[str, Any]) -> None:
         if keep_raw:
-            result.raw_events.append(event)
-        if "_prompt_result" in event:
-            envelope = event["_prompt_result"]
-            if "error" in envelope:
-                result.error = envelope["error"]
-            else:
-                inner = envelope.get("result") or {}
-                result.stop_reason = inner.get("stopReason")
-            continue
-        update = event.get("params", {}).get("update", {})
-        kind = update.get("sessionUpdate")
+            result.raw_events.append(message)
+        if message.get("method") != "session/update":
+            return
+        update = (message.get("params", {}) or {}).get("update", {}) or {}
+        kind = update.get("sessionUpdate") or update.get("session_update")
         content = update.get("content", {}) or {}
         if kind == "agent_message_chunk":
-            result.text += content.get("text", "")
+            result.text += _content_text(content)
         elif kind == "agent_thought_chunk":
-            result.thoughts += content.get("text", "")
+            result.thoughts += _content_text(content)
         elif kind in ("tool_call", "tool_call_update"):
             result.tool_calls.append(update)
         elif kind == "plan":
             for entry in update.get("entries", []) or []:
-                entry_text = entry.get("content")
+                entry_text = entry.get("content") if isinstance(entry, dict) else None
                 if entry_text:
                     result.plan_entries.append(entry_text)
+
+    def _early_marker() -> str | None:
+        markers = extract_markers(result.text)
+        for marker in ("BLOCKED", "USER-CONFIRM", "USER-NEED"):
+            if markers.get(marker):
+                return marker
+        return None
+
+    async def _cancel_prompt(reason: str) -> None:
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(conn.cancel(), timeout=1.0)
+        try:
+            await asyncio.wait_for(asyncio.shield(prompt_task), timeout=2.0)
+        except asyncio.TimeoutError:
+            conn.reusable = False
+            with contextlib.suppress(Exception):
+                await conn.kill()
+            prompt_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await prompt_task
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+        while not turn_queue.empty():
+            with contextlib.suppress(asyncio.QueueEmpty):
+                turn_queue.get_nowait()
+        result.cancelled_for_marker = True
+        result.early_marker = reason
+
+    try:
+        while True:
+            if prompt_task.done():
+                await asyncio.sleep(0)
+                while not turn_queue.empty():
+                    event = turn_queue.get_nowait()
+                    message = event.get("message") or {}
+                    await _call_on_event(message)
+                    _accumulate(message)
+                    marker = _early_marker()
+                    if marker:
+                        await _cancel_prompt(marker)
+                        return result
+                break
+            if timeout_enabled and time.time() - last_event_time > float(idle_timeout):
+                keep_waiting = False
+                if on_idle is not None:
+                    try:
+                        verdict = on_idle()
+                        if inspect.isawaitable(verdict):
+                            verdict = await verdict
+                        keep_waiting = bool(verdict)
+                    except Exception:
+                        keep_waiting = False
+                if prompt_task.done() or keep_waiting or not turn_queue.empty():
+                    last_event_time = time.time()
+                    continue
+                with contextlib.suppress(Exception):
+                    await conn.cancel()
+                prompt_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await prompt_task
+                result.error = {"code": -1, "message": "agent_timeout (idle)"}
+                return result
+            try:
+                event = await asyncio.wait_for(turn_queue.get(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
+            message = event.get("message") or {}
+            last_event_time = time.time()
+            await _call_on_event(message)
+            _accumulate(message)
+            marker = _early_marker()
+            if marker:
+                await _cancel_prompt(marker)
+                return result
+
+        try:
+            response = await prompt_task
+            result.stop_reason = response.stop_reason
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            result.error = {
+                "code": getattr(e, "code", -1),
+                "message": str(e),
+            }
+    finally:
+        conn.client.set_turn_queue(None)
     # Post-hoc scope-leak audit (Design 1): scan tool_call locations for paths
     # outside the connection's cwd. Informational signal; doesn't gate dispatch.
     cwd = getattr(conn, "cwd", None)

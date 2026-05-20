@@ -33,7 +33,7 @@ import signal
 from collections.abc import AsyncIterator
 from pathlib import Path
 
-from acp_client import AcpProcessPool
+from goalflight_acp_client import AcpProcessPool
 
 try:
     import goalflight_capacity
@@ -208,14 +208,10 @@ async def managed_pool(
             try:
                 if conn.alive:
                     import os, signal as _sig
-                    os.killpg(conn.proc.pid, _sig.SIGKILL)
+                    os.killpg(conn.verified_pgid, _sig.SIGKILL)
             except (ProcessLookupError, PermissionError, Exception):
                 pass
         pool._connections.clear()
-        try:
-            pool._pidfile.unlink(missing_ok=True)
-        except Exception:
-            pass
 
     async def _shutdown_async() -> None:
         try:

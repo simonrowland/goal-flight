@@ -1,6 +1,6 @@
 ---
 name: goal-flight
-version: 0.4.3
+version: 0.4.5
 description: "long-running unattended controller for chunked code work — init repo, decompose plan, anticipate questions, execute with embedded review and milestone gstack sweeps"
 allowed-tools:
   - Bash
@@ -178,6 +178,14 @@ from `~/.cursor/cli-config.json`'s `modelId`. To update, edit:
 Cursor's internal models don't have a separate "xhigh" effort tier;
 xhigh variants exist only on the OpenAI-passthrough models. Use the
 plain `composer-X.Y` ID returned by the probe.
+
+**ACP SDK dependency.** ACP dispatch uses the official Python SDK
+(`agent-client-protocol==0.10.*`) from
+`~/.goal-flight/venvs/acp-0.10/bin/python`. The documented `python3
+<skill-root>/scripts/goalflight_acp_run.py ...` command re-execs into that
+managed venv when system Python lacks `acp`; set `GOALFLIGHT_ACP_PYTHON` to
+override the interpreter. If doctor reports `SDK missing -- run install`, run
+`/goal-flight init` to create/update that venv before ACP dispatch.
 
 **Failover.** If a Claude Agent dispatch fails with a rate-limit signal,
 re-dispatch the same chunk to codex or grok; don't retry Claude until the

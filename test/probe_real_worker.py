@@ -1,8 +1,8 @@
 """Drive the vendored ACP client against a real worker CLI.
 
 Usage:
-  python test/probe_real_worker.py codex-acp
-  python test/probe_real_worker.py grok agent stdio
+  ~/.goal-flight/venvs/acp-0.10/bin/python test/probe_real_worker.py codex-acp
+  ~/.goal-flight/venvs/acp-0.10/bin/python test/probe_real_worker.py grok agent stdio
 
 Sends a single short prompt ("What is 2+2? Reply with just the number.") and
 prints a structured PromptResult summary plus timing breakdown. Useful for
@@ -20,8 +20,8 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
-from acp_client import AcpConnection  # noqa: E402
 from acp_runner import run_prompt  # noqa: E402
+from goalflight_acp_client import spawn_acp_connection  # noqa: E402
 
 
 async def probe(cmd: str, args: list[str], *, prompt: str, idle_timeout: float, cwd: str) -> int:
@@ -31,29 +31,25 @@ async def probe(cmd: str, args: list[str], *, prompt: str, idle_timeout: float, 
         return f"[{time.time() - t0:5.1f}s]"
 
     print(f"{stamp('start')} spawning: {cmd} {' '.join(args)}", flush=True)
-    proc = await asyncio.create_subprocess_exec(
-        cmd, *args,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+    conn = await spawn_acp_connection(
+        cmd,
+        args,
+        agent=cmd,
+        session_id="probe-1",
         cwd=cwd,
-        start_new_session=True,
-        limit=8 * 1024 * 1024,  # match acp_client._spawn — goal-mode workers emit single-line traces >64KB
+        auto_allow_tools=True,
     )
-    conn = AcpConnection(
-        agent=cmd, session_id="probe-1", proc=proc,
-        verbose=False, auto_allow_tools=True,
-    )
+    proc = conn.proc
     try:
         try:
             init = await asyncio.wait_for(conn.initialize(), timeout=idle_timeout)
         except asyncio.TimeoutError:
             print(f"{stamp('init')} TIMEOUT during initialize() after {idle_timeout}s")
             return 2
-        print(f"{stamp('init')} agentInfo={init.get('agentInfo')} caps={list((init.get('capabilities') or {}).keys())}", flush=True)
+        print(f"{stamp('init')} agentInfo={init.agent_info} caps={init.agent_capabilities}", flush=True)
 
         try:
-            sid = await asyncio.wait_for(conn.session_new(cwd=cwd), timeout=idle_timeout)
+            sid = await asyncio.wait_for(conn.new_session(cwd=cwd), timeout=idle_timeout)
         except asyncio.TimeoutError:
             print(f"{stamp('sess')} TIMEOUT during session_new() after {idle_timeout}s")
             return 2

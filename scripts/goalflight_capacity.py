@@ -45,10 +45,17 @@ AGENT_RSS_MB = {
 # sessions) remain future work — see docs-private/BACKLOG.md "Learned
 # rate-pressure thresholds (not just hardcoded caps)".
 DEFAULT_AGENT_CAPS = {
-    "cursor": 5,           # 2026-05-19: cursor model update brought coding
-    "cursor-agent": 5,     # benchmarks on par with Opus; promoted to a first-tier
-                           # code worker alongside codex. (Stress-tested 2026-05-20:
-                           # 10/10 concurrent ACP dispatches, clean.)
+    # cursor-agent talks to Cursor's CLOUD backend, which is SLOW: a trivial prompt
+    # takes ~34s solo and ~57s at 3-concurrent, the whole time at ~0% CPU (blocked
+    # on the network). It DOES run concurrently (3 parallel complete together) but
+    # reliably only up to ~3 — at 5 the mid-stream gaps between chunks exceed the
+    # heartbeat wedge window. The first-token grace (heartbeat_wedge_decision
+    # requires wedge_progress_seen>=1) stops false-kills before the first token;
+    # cap 3 covers the steady-state slowness. (Stress-tested 2026-05-20: 1/2/3
+    # clean, 5 -> 2 recoverable wedges, zero orphan leaks.) cursor and cursor-agent
+    # share one Cursor subscription budget.
+    "cursor": 3,
+    "cursor-agent": 3,
     # claude-code-cli-acp PTY-drives the interactive Claude TUI and tails the
     # session transcript with a HARDCODED 120s per-turn timeout (not exposed in
     # ACP-server mode). 2026-05-20: 4 SIMULTANEOUS dispatches starve each other on
@@ -73,6 +80,8 @@ TERMINAL_LEASE_STATES = {
     "failed",
     "wedged",
     "tool_timeout",
+    # Legacy 0.4.3 terminal state. Current ACP oversized frames drop and
+    # continue; keep this so old lease records still prune.
     "result_too_large",
     "blocked",
     "blocked_capacity",

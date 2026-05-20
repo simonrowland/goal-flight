@@ -131,8 +131,8 @@ def heartbeat_wedge_decision(
     *,
     pid_alive: bool,
     pgroup_cpu: float | None,
-    events_seen: int,
-    previous_events_seen: int,
+    wedge_progress_seen: int,
+    previous_wedge_progress_seen: int,
     outstanding_count: int,
     cpu_epsilon_pct: float,
     previous_dead_samples: int,
@@ -148,14 +148,31 @@ def heartbeat_wedge_decision(
         pid_alive
         and pgroup_cpu is not None
         and pgroup_cpu <= cpu_epsilon_pct
-        and events_seen == previous_events_seen
+        and wedge_progress_seen == previous_wedge_progress_seen
         and outstanding_count == 0
     )
     dead_samples = previous_dead_samples + 1 if dead_sample else 0
     return HeartbeatWedgeDecision(
         dead_sample=dead_sample,
         dead_samples=dead_samples,
-        wedged=dead_samples >= max(1, wedge_samples),
+        wedged=dead_samples >= max(1, wedge_samples) and wedge_progress_seen >= 1,
+    )
+
+
+def progress_stall_decision(
+    *,
+    pid_alive: bool,
+    progress_quiet_s: float | None,
+    progress_stall_s: float,
+    outstanding_count: int = 0,
+) -> bool:
+    """Return true when no standard progress has arrived before the wall."""
+    return (
+        pid_alive
+        and progress_stall_s > 0
+        and progress_quiet_s is not None
+        and progress_quiet_s >= progress_stall_s
+        and outstanding_count == 0
     )
 
 

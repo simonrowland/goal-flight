@@ -89,7 +89,7 @@ def handle(msg: dict) -> None:
             "sessionId": session_id,
             "update": {
                 "sessionUpdate": "agent_message_chunk",
-                "content": {"text": f"echo: {text}"},
+                "content": {"type": "text", "text": f"echo: {text}"},
             },
         })
 

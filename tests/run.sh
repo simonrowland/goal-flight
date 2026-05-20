@@ -13,6 +13,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 pass=0
 fail=0
 failed_tests=()
+ACP_PY="${GOALFLIGHT_ACP_PYTHON:-$HOME/.goal-flight/venvs/acp-0.10/bin/python}"
 
 # Bash tests (tests/test-*.sh)
 cd "$SCRIPT_DIR"
@@ -35,7 +36,20 @@ if command -v python3 >/dev/null 2>&1 && [ -d "$REPO_ROOT/test" ]; then
   cd "$REPO_ROOT"
   for test in test/test_*.py; do
     [ -f "$test" ] || continue
-    if python3 "$test" > /tmp/goal-flight-test-$$.out 2>&1; then
+    py="python3"
+    case "$test" in
+      test/test_acp_*.py)
+        py="$ACP_PY"
+        ;;
+    esac
+    if [ "$py" = "$ACP_PY" ] && [ ! -x "$py" ]; then
+      echo "FAIL  $test"
+      echo "      SDK missing -- run install: $ACP_PY"
+      fail=$((fail + 1))
+      failed_tests+=("$test")
+      continue
+    fi
+    if "$py" "$test" > /tmp/goal-flight-test-$$.out 2>&1; then
       echo "PASS  $test"
       pass=$((pass + 1))
     else

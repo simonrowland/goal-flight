@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
-from dataclasses import dataclass, field
+import importlib.util
 import inspect
 import io
 import json
@@ -19,15 +19,50 @@ from typing import Any, Callable
 import uuid
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+
+
+def _acp_reexec_target() -> str | None:
+    """Return the python path to re-exec into for acp, or None to stay put."""
+    if importlib.util.find_spec("acp") is not None:
+        return None
+    override = os.environ.get("GOALFLIGHT_ACP_PYTHON")
+    target = Path(override).expanduser() if override else Path.home() / ".goal-flight/venvs/acp-0.10/bin/python"
+    if not target.exists():
+        return None
+    try:
+        target_real = target.resolve()
+        current_real = Path(sys.executable).resolve()
+    except OSError:
+        target_real = target
+        current_real = Path(sys.executable)
+    if target_real == current_real:
+        return None
+    return str(target)
+
+
+def _ensure_acp_sdk_python() -> None:
+    target = _acp_reexec_target()
+    if target is not None:
+        os.execv(target, [target, *sys.argv])
+
+
+_ensure_acp_sdk_python()
 sys.path.insert(0, str(SCRIPT_DIR))
 
 import goalflight_capacity
 import goalflight_ledger
-from acp_client import AcpConnection, AcpError
+from goalflight_acp_client import (
+    AcpConnection,
+    AcpError,
+    AcpLivenessActivity,
+    cleanup_ghosts,
+    spawn_acp_connection,
+)
 from goalflight_liveness import (
     heartbeat_wedge_decision,
     IdleLivenessGate,
     pgroup_cpu_pct,
+    progress_stall_decision,
     process_group_id,
     write_status,
 )
@@ -56,69 +91,6 @@ def _event_kind(event: dict) -> str:
     return str(event.get("params", {}).get("update", {}).get("sessionUpdate") or event.get("method") or "event")
 
 
-TERMINAL_TOOL_STATUSES = {"completed", "failed"}
-
-
-def _tool_id(payload: dict) -> str | None:
-    value = payload.get("toolCallId") or payload.get("id")
-    return str(value) if value else None
-
-
-def _tool_status(payload: dict) -> str | None:
-    value = payload.get("status")
-    return str(value).lower() if value is not None else None
-
-
-@dataclass
-class ToolActivity:
-    events_seen: int = 0
-    last_event_mono: float = field(default_factory=time.monotonic)
-    outstanding_tools: dict[str, float] = field(default_factory=dict)
-    pending_permissions: dict[str, float] = field(default_factory=dict)
-
-    @property
-    def outstanding_count(self) -> int:
-        return len(self.outstanding_tools) + len(self.pending_permissions)
-
-    def timed_out(self, now: float, max_tool_s: float) -> tuple[str, float] | None:
-        if max_tool_s <= 0:
-            return None
-        for tool_id, started_at in {**self.outstanding_tools, **self.pending_permissions}.items():
-            age = now - started_at
-            if age >= max_tool_s:
-                return tool_id, age
-        return None
-
-
-def _apply_tool_activity(event: dict, activity: ToolActivity, now: float) -> None:
-    update = event.get("params", {}).get("update", {}) or {}
-    kind = update.get("sessionUpdate")
-    if kind == "tool_call":
-        tool_id = _tool_id(update)
-        status = _tool_status(update)
-        if tool_id and status in TERMINAL_TOOL_STATUSES:
-            activity.outstanding_tools.pop(tool_id, None)
-        elif tool_id:
-            activity.outstanding_tools.setdefault(tool_id, now)
-    elif kind == "tool_call_update":
-        tool_id = _tool_id(update)
-        if tool_id and _tool_status(update) in TERMINAL_TOOL_STATUSES:
-            activity.outstanding_tools.pop(tool_id, None)
-
-    if event.get("method") == "session/request_permission":
-        params = event.get("params", {}) or {}
-        tool_call = params.get("toolCall", {}) or {}
-        tool_id = _tool_id(tool_call) or _tool_id(params)
-        status = _tool_status(tool_call) or _tool_status(params)
-        if tool_id and status in (None, "pending"):
-            activity.pending_permissions.setdefault(tool_id, now)
-    elif activity.pending_permissions:
-        # Permission requests are auto-allowed by AcpConnection. Any later event
-        # means that transient liveness signal resolved; the real tool id remains
-        # tracked independently when the adapter reports one.
-        activity.pending_permissions.clear()
-
-
 async def spawn_and_handshake_with_retry(
     command: str,
     acp_args: list[str],
@@ -129,6 +101,7 @@ async def spawn_and_handshake_with_retry(
     attempts: int = 2,
     handshake_timeout: float = 60.0,
     auto_allow_tools: bool = True,
+    activity: AcpLivenessActivity | None = None,
     on_attempt: Callable[[int, asyncio.subprocess.Process], Any] | None = None,
 ) -> tuple[asyncio.subprocess.Process, AcpConnection]:
     """Spawn the worker and run the ACP handshake, retrying once on AcpError.
@@ -150,26 +123,23 @@ async def spawn_and_handshake_with_retry(
     """
     last_err: AcpError | None = None
     for attempt in range(max(1, attempts)):
-        proc = await asyncio.create_subprocess_exec(
+        conn = await spawn_acp_connection(
             command,
-            *acp_args,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            acp_args,
+            agent=agent,
+            session_id=session_id,
             cwd=cwd,
-            start_new_session=True,
-            limit=8 * 1024 * 1024,
+            auto_allow_tools=auto_allow_tools,
+            activity=activity,
         )
+        proc = conn.proc
         if on_attempt is not None:
             maybe = on_attempt(attempt, proc)
             if inspect.isawaitable(maybe):
                 await maybe
-        conn = AcpConnection(
-            agent=agent, session_id=session_id, proc=proc, auto_allow_tools=auto_allow_tools
-        )
         try:
             await conn.initialize(timeout=handshake_timeout)
-            await conn.session_new(cwd, timeout=handshake_timeout)
+            await conn.new_session(cwd, timeout=handshake_timeout)
             return proc, conn
         except AcpError as e:
             last_err = e
@@ -181,6 +151,8 @@ async def spawn_and_handshake_with_retry(
 
 
 async def run(args: argparse.Namespace) -> dict:
+    if not hasattr(args, "progress_stall_s") or args.progress_stall_s is None:
+        args.progress_stall_s = 300.0
     dispatch_id = args.dispatch_id or f"acp-{args.agent}-{uuid.uuid4().hex[:8]}"
     status_path = Path(args.status_json) if args.status_json else Path(args.cwd) / f".goalflight-{dispatch_id}.status.json"
     payload: dict = {
@@ -196,9 +168,12 @@ async def run(args: argparse.Namespace) -> dict:
         "worker_alive": False,
         "pgroup_cpu_pct": None,
         "events_seen": 0,
+        "acp_dropped_frames": 0,
         "last_event_at": None,
         "last_event_kind": None,
         "heartbeat_at": None,
+        "progress_quiet_for_s": 0.0,
+        "progress_stall_s": None,
         "updated_at": _now(),
     }
     status_lock = asyncio.Lock()
@@ -265,8 +240,7 @@ async def run(args: argparse.Namespace) -> dict:
     heartbeat_task: asyncio.Task | None = None
     ledger_recorded = False
     state = "failed"
-    activity = ToolActivity()
-    event_lock = asyncio.Lock()
+    activity = AcpLivenessActivity()
     heartbeat_outcome: str | None = None
     heartbeat_error: dict[str, object] | None = None
     wedged_by_heartbeat = False
@@ -297,7 +271,7 @@ async def run(args: argparse.Namespace) -> dict:
     async def heartbeat_loop() -> None:
         nonlocal heartbeat_outcome
         dead_samples = 0
-        last_sample_events_seen = 0
+        last_sample_progress_seen = 0
         # Created only after a successful handshake, so it tracks the single
         # committed worker. Exit early once that worker exits (grok 2026-05-20
         # P2) rather than sampling a dead pid until the outer finally cancels us.
@@ -307,11 +281,14 @@ async def run(args: argparse.Namespace) -> dict:
             pgid = payload.get("pgid") or process_group_id(proc.pid) or proc.pid
             cpu_pct = await asyncio.to_thread(pgroup_cpu_pct, pgid)
             now_mono = time.monotonic()
-            async with event_lock:
-                seen = activity.events_seen
-                outstanding_count = activity.outstanding_count
-                quiet_for_s = now_mono - activity.last_event_mono
-                timed_out_tool = activity.timed_out(now_mono, args.max_tool_s)
+            snapshot = activity.snapshot(now_mono)
+            seen = int(snapshot["raw_events_seen"])
+            progress_seen = int(snapshot["wedge_progress_seen"])
+            outstanding_count = int(snapshot["outstanding_count"])
+            dropped_frames = int(snapshot.get("dropped_frames", 0))
+            quiet_for_s = float(snapshot["quiet_for_s"])
+            progress_quiet_s = float(snapshot["progress_quiet_for_s"])
+            timed_out_tool = activity.timed_out(now_mono, args.max_tool_s)
             pid_alive = proc.returncode is None
             # Per-tool wall is ABSOLUTE: a tool outstanding longer than
             # --max-tool-s is stuck regardless of CPU (it may be CPU-busy in a
@@ -332,6 +309,23 @@ async def run(args: argparse.Namespace) -> dict:
                 )
                 await conn.kill()
                 return
+            if progress_stall_decision(
+                pid_alive=pid_alive,
+                progress_quiet_s=progress_quiet_s,
+                progress_stall_s=args.progress_stall_s,
+                outstanding_count=outstanding_count,
+            ):
+                await mark_heartbeat_terminal(
+                    "wedged",
+                    {
+                        "code": -1,
+                        "message": "progress_stall",
+                        "progress_quiet_s": round(progress_quiet_s, 3),
+                        "progress_stall_s": round(args.progress_stall_s, 3),
+                    },
+                )
+                await conn.kill()
+                return
             if (
                 args.max_quiet_s > 0
                 and outstanding_count == 0
@@ -347,15 +341,15 @@ async def run(args: argparse.Namespace) -> dict:
             decision = heartbeat_wedge_decision(
                 pid_alive=pid_alive,
                 pgroup_cpu=cpu_pct,
-                events_seen=seen,
-                previous_events_seen=last_sample_events_seen,
+                wedge_progress_seen=progress_seen,
+                previous_wedge_progress_seen=last_sample_progress_seen,
                 outstanding_count=outstanding_count,
                 cpu_epsilon_pct=args.cpu_epsilon,
                 previous_dead_samples=dead_samples,
                 wedge_samples=args.wedge_samples,
             )
             dead_samples = decision.dead_samples
-            last_sample_events_seen = seen
+            last_sample_progress_seen = progress_seen
             await update_status(
                 worker_pid=proc.pid,
                 pgid=pgid,
@@ -363,8 +357,12 @@ async def run(args: argparse.Namespace) -> dict:
                 pgroup_cpu_pct=cpu_pct,
                 heartbeat_at=_now(),
                 heartbeat_dead_samples=dead_samples,
+                wedge_progress_seen=progress_seen,
                 outstanding_tool_calls=outstanding_count,
+                acp_dropped_frames=dropped_frames,
                 quiet_for_s=round(quiet_for_s, 3),
+                progress_quiet_for_s=round(progress_quiet_s, 3),
+                progress_stall_s=args.progress_stall_s,
             )
             if decision.wedged:
                 await mark_heartbeat_terminal(
@@ -377,18 +375,22 @@ async def run(args: argparse.Namespace) -> dict:
 
     async def note_event(event: dict) -> None:
         now_mono = time.monotonic()
-        idle_gate.note_event()  # real progress → reset the running_quiet hard wall
-        async with event_lock:
-            activity.events_seen += 1
-            activity.last_event_mono = now_mono
-            _apply_tool_activity(event, activity, now_mono)
-            seen = activity.events_seen
-            outstanding_count = activity.outstanding_count
+        idle_gate.note_event()  # any incoming SDK observer event keeps idle gate alive
+        snapshot = activity.snapshot(now_mono)
+        seen = int(snapshot["raw_events_seen"])
+        progress_seen = int(snapshot["wedge_progress_seen"])
+        outstanding_count = int(snapshot["outstanding_count"])
+        dropped_frames = int(snapshot.get("dropped_frames", 0))
+        progress_quiet_s = float(snapshot["progress_quiet_for_s"])
         await update_status(
             state="running",
             events_seen=seen,
+            acp_dropped_frames=dropped_frames,
+            wedge_progress_seen=progress_seen,
+            progress_quiet_for_s=round(progress_quiet_s, 3),
+            progress_stall_s=args.progress_stall_s,
             last_event_at=_now(),
-            last_event_kind=_event_kind(event),
+            last_event_kind=str(snapshot.get("last_event_kind") or _event_kind(event)),
             outstanding_tool_calls=outstanding_count,
             worker_pid=proc.pid if proc else None,
             pgid=payload.get("pgid"),
@@ -430,6 +432,7 @@ async def run(args: argparse.Namespace) -> dict:
         await update_status(**updates)
 
     try:
+        cleanup_ghosts()
         # Spawn + handshake, retrying once on AcpError (the intermittent
         # codex-acp wedge). The helper kills a wedged worker before respawning,
         # so no identity-matched PID is ever left alive. Status progresses
@@ -444,6 +447,7 @@ async def run(args: argparse.Namespace) -> dict:
                 agent=args.agent,
                 session_id=args.session_id,
                 cwd=args.cwd,
+                activity=activity,
                 on_attempt=mark_attempt,
             )
         with contextlib.redirect_stdout(io.StringIO()):
@@ -468,6 +472,7 @@ async def run(args: argparse.Namespace) -> dict:
                 )
             )
         ledger_recorded = True
+        activity.reset_progress_clock(time.monotonic())
         heartbeat_task = asyncio.create_task(heartbeat_loop())
         await update_status(state="running")
         result = await run_prompt(
@@ -484,9 +489,13 @@ async def run(args: argparse.Namespace) -> dict:
         if terminal_by_heartbeat or getattr(conn, "killed_by_heartbeat", False):
             state = terminal_by_heartbeat or "wedged"
             error = terminal_error or {"code": -1, "message": state}
-        elif result.error and result.error.get("message") == "result_too_large":
-            state = "result_too_large"
-            error = result.error
+        elif result.cancelled_for_marker:
+            state = "blocked"
+            error = {
+                "code": 0,
+                "message": "early_marker_cancelled",
+                "marker": result.early_marker,
+            }
         else:
             state = "complete" if result.ok else "failed"
             error = result.error
@@ -531,7 +540,14 @@ async def run(args: argparse.Namespace) -> dict:
             with contextlib.suppress(Exception):
                 await conn.close_gracefully()
         if proc is not None:
+            snapshot = activity.snapshot(time.monotonic())
             payload.update(
+                events_seen=int(snapshot["raw_events_seen"]),
+                wedge_progress_seen=int(snapshot["wedge_progress_seen"]),
+                outstanding_tool_calls=int(snapshot["outstanding_count"]),
+                acp_dropped_frames=int(snapshot.get("dropped_frames", 0)),
+                progress_quiet_for_s=round(float(snapshot["progress_quiet_for_s"]), 3),
+                progress_stall_s=args.progress_stall_s,
                 worker_alive=proc.returncode is None,
                 pgid=payload.get("pgid") or process_group_id(proc.pid) or proc.pid,
                 heartbeat_at=_now(),
@@ -600,6 +616,12 @@ def main(argv: list[str] | None = None) -> int:
         help="Absolute event-silence hard wall for CPU-busy quiet workers, independent of idle-timeout.",
     )
     parser.add_argument(
+        "--progress-stall-s",
+        type=float,
+        default=float(os.environ.get("GOALFLIGHT_PROGRESS_STALL_S", "300")),
+        help="Standard-progress silence hard wall. Raw vendor events do not reset it.",
+    )
+    parser.add_argument(
         "--cpu-epsilon",
         type=float,
         default=0.1,
@@ -623,6 +645,8 @@ def main(argv: list[str] | None = None) -> int:
         args.max_tool_s = 1800.0
     if args.max_quiet_s <= 0:
         args.max_quiet_s = 3600.0
+    if args.progress_stall_s <= 0:
+        args.progress_stall_s = 300.0
     args.session_id = args.session_id or f"goalflight-{uuid.uuid4().hex[:8]}"
     payload = asyncio.run(run(args))
     if args.json:
