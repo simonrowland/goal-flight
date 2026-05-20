@@ -28,8 +28,19 @@ orthogonal axes: **iteration pattern** (how many turns) and **comms shape**
     --agent <codex-acp|grok|cursor|claude> \
     --cwd "$PWD" \
     --prompt <prompt.md> \
+    --mode <one-shot|goal> \
     --status-json <status.json>
   ```
+
+  **`--mode` sets the idle-timeout.** `one-shot` (default) uses a 5-minute
+  idle ceiling — a short dispatch silent that long is wedged. `goal` uses a
+  10-hour idle ceiling because goal-mode loops run multi-hour and a worker
+  churning through a big test/compile can emit no events for tens of
+  minutes; a tight ceiling would kill it mid-run. Idle-timeout is the gap
+  between events, NOT total runtime — it resets on every event, so a healthy
+  goal-mode worker emitting periodic STATUS markers never trips it. Override
+  with `--idle-timeout <secs>` (or `--idle-timeout 0` for no idle gate,
+  relying on PID liveness + the worker's terminal marker).
 - `bash-tail`: worker writes stdout/stderr to files; the controller watches
   via marker grep. Fallback only when no ACP adapter is available. See
   `protocols/legacy/bash-tail.md` for recipes.

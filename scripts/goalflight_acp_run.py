@@ -62,7 +62,12 @@ async def run(args: argparse.Namespace) -> dict:
         lease_id=None,
         mem_mb=None,
         agent_cap=None,
-        ttl_s=max(int(args.idle_timeout or 300) * 4, 3600),
+        # Lease TTL covers the worst-case run length. Derive from idle-timeout
+        # (×4 headroom), but when idle-timeout is 0 (no-timeout, mode-dependent),
+        # fall back to a generous goal/one-shot ceiling rather than the bare 300
+        # default — otherwise a no-timeout 10h goal run would hold only a 1h lease
+        # and free its capacity slot mid-run.
+        ttl_s=max(int(args.idle_timeout or (36000 if args.mode == "goal" else 300)) * 4, 3600),
         ram_mb=None,
         reserve_mb=goalflight_capacity.DEFAULT_RESERVE_MB,
         worst_worker_mb=goalflight_capacity.DEFAULT_WORST_WORKER_MB,
@@ -180,10 +185,33 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--prompt-id")
     parser.add_argument("--prompt")
     parser.add_argument("--prompt-text")
-    parser.add_argument("--idle-timeout", type=float, default=300)
+    parser.add_argument(
+        "--mode",
+        choices=["one-shot", "goal"],
+        default="one-shot",
+        help="Dispatch mode. 'goal' raises the default idle-timeout to tolerate the "
+             "long silent stretches of multi-hour goal-mode loops (a worker churning "
+             "through a big test/compile may emit no events for tens of minutes). "
+             "'one-shot' keeps a tight default so a wedged short dispatch is caught fast.",
+    )
+    parser.add_argument(
+        "--idle-timeout",
+        type=float,
+        default=None,
+        help="Seconds of zero agent events before giving up. Idle, NOT total runtime — "
+             "the timer resets on every event. If unset, derived from --mode: "
+             "one-shot=300 (5min), goal=36000 (10h). Pass 0 for no idle timeout "
+             "(rely on PID liveness + the worker's terminal marker instead).",
+    )
     parser.add_argument("--status-json")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
+    # Derive idle-timeout from mode when not explicitly set. Goal-mode loops
+    # run multi-hour and can go silent for long stretches between events; a
+    # 5-minute idle ceiling would kill a healthy worker mid-test. 10h is a
+    # safe wedge-detector ceiling (10h of TOTAL silence = genuinely stuck).
+    if args.idle_timeout is None:
+        args.idle_timeout = 36000.0 if args.mode == "goal" else 300.0
     args.session_id = args.session_id or f"goalflight-{uuid.uuid4().hex[:8]}"
     payload = asyncio.run(run(args))
     if args.json:

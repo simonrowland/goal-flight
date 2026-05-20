@@ -4,6 +4,40 @@ Notable changes to the goal-flight Claude Code skill. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are
 incremented when meaningful skill behaviour changes.
 
+## [0.4.1] — 2026-05-20
+
+Patch: goal-mode ACP dispatches no longer die at a 5-minute idle ceiling.
+
+### Fixed
+
+- **`scripts/goalflight_acp_run.py` idle-timeout was 300s (5min) for all
+  dispatches** — fine for one-shot, fatal for goal-mode-over-ACP. A
+  goal-mode worker churning through a long test/compile can emit zero
+  agent events for tens of minutes; the 5-minute ceiling would kill a
+  healthy multi-hour run mid-loop. (Idle-timeout is the gap between
+  events, not total runtime — it resets on every event — but long silent
+  stretches in goal-mode are legitimate.)
+
+### Added
+
+- **`--mode {one-shot,goal}` flag** on `goalflight_acp_run.py`. Derives
+  the idle-timeout default: `one-shot`=300s (tight; a short dispatch
+  silent that long is wedged), `goal`=36000s (10h; a safe wedge-detector
+  ceiling — 10h of *total* silence means genuinely stuck). Explicit
+  `--idle-timeout <secs>` still overrides; `--idle-timeout 0` disables the
+  idle gate entirely (rely on PID liveness + the worker's terminal
+  marker).
+- Lease-TTL derivation is now mode-aware so a no-timeout (`--idle-timeout 0`)
+  goal run holds a 40h lease instead of collapsing to the 1h floor and
+  freeing its capacity slot mid-run.
+- `protocols/dispatch-routing.md` documents the `--mode` flag in the ACP
+  dispatch recipe with the idle-vs-total-runtime distinction.
+
+Note: the codex `/goal` bash-tail path (per `templates/codex-goal-prompt.md.tpl`)
+was already safe — it uses manual tail monitoring with no fixed timeout.
+This fix is specifically for goal-mode dispatched over ACP, a supported
+path per the dispatch-routing composition table.
+
 ## [0.4.0] — 2026-05-19
 
 Dispatch-routing rewrite + adaptive rate-pressure walkback + worker
