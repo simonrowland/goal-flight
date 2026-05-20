@@ -43,7 +43,9 @@ orthogonal axes: **iteration pattern** (how many turns) and **comms shape**
   relying on PID liveness + the worker's terminal marker).
 - `bash-tail`: worker writes stdout/stderr to files; the controller watches
   via marker grep. Fallback only when no ACP adapter is available. See
-  `protocols/legacy/bash-tail.md` for recipes.
+  `protocols/legacy/bash-tail.md` for recipes and hazards (incl. the
+  context-mode-dispatch caveat — never wrap a spawn or `tail -f` in
+  `ctx_execute`).
   ```bash
   python3 <skill-root>/scripts/goalflight_watch.py \
     --pid "$WORKER_PID" \
