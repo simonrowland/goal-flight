@@ -32,6 +32,7 @@
 #                   (terminal-marker subset; emphasis-tolerant for grok's **MARKER:**)
 #   --poll-secs     15
 #   --max-idle-secs 180   (matches protocol idle/no-progress guidance)
+#   --cpu-epsilon   0.1   (process-group %CPU above this is running_quiet)
 #
 # Intended to be backgrounded by commands/execute.md step 2.b [bash-tail] branch:
 #   bash <skill-root>/scripts/watch-dispatch-tail.sh \
@@ -52,6 +53,13 @@ SESSION_ID=""
 MARKER_RE='^\**(COMPLETE|BLOCKED|USER-NEED|USER-CONFIRM):\**'
 POLL_SECS=15
 MAX_IDLE_SECS=180
+CPU_EPSILON=0.1
+# CPU-sampling-failure grace (codex 2026-05-20 P2): require this many consecutive
+# wedged polls before exiting idle-timeout, so one transient `ps` failure can't
+# false-positive a healthy worker. Not a flag — mirrors goalflight_watch.py. This
+# is the watcher mirror of the runner's intra-decision re-sample grace
+# (goalflight_liveness.cpu_liveness_keep_waiting) — same goal, keep them aligned.
+WEDGE_CONFIRM_SAMPLES=2
 PIDFILE_DIR=/tmp/goal-flight-acp-pids.d
 
 usage() {
@@ -69,6 +77,7 @@ while [ $# -gt 0 ]; do
     --markers)        MARKER_RE="$2"; shift 2 ;;
     --poll-secs)      POLL_SECS="$2"; shift 2 ;;
     --max-idle-secs)  MAX_IDLE_SECS="$2"; shift 2 ;;
+    --cpu-epsilon)    CPU_EPSILON="$2"; shift 2 ;;
     -h|--help)        usage ;;
     *) echo "unknown arg: $1" >&2; usage ;;
   esac
@@ -126,6 +135,25 @@ ps_meta() {
   ps -o lstart=,comm= -p "$pid" 2>/dev/null | head -1
 }
 
+pgroup_cpu_pct() {
+  local pgid="$1"
+  ps -A -o pgid=,%cpu= 2>/dev/null | awk -v target="$pgid" '
+    BEGIN { sum = 0; found = 0 }
+    $1 == target { sum += $2 + 0; found = 1 }
+    END {
+      if (found) {
+        printf "%.1f\n", sum
+      } else {
+        printf "0.0\n"
+      }
+    }'
+}
+
+cpu_gt_epsilon() {
+  local cpu="$1"
+  awk -v cpu="$cpu" -v eps="$CPU_EPSILON" 'BEGIN { exit ! ((cpu + 0) > (eps + 0)) }'
+}
+
 worker_lstart_comm=$(ps_meta "$WORKER_PID")
 if [ -z "$worker_lstart_comm" ]; then
   echo "watcher: worker PID $WORKER_PID not alive at startup; exiting 1" >&2
@@ -170,6 +198,7 @@ trap cleanup_pidfile_on_exit EXIT INT TERM
 # Track tail file size for idle detection. Re-stat at each poll.
 last_size=0
 last_size_change_ts=$(date +%s)
+wedge_streak=0
 if [ -f "$TAIL_PATH" ]; then
   last_size=$(wc -c < "$TAIL_PATH" 2>/dev/null | tr -d ' ')
   last_size=${last_size:-0}
@@ -216,10 +245,27 @@ while true; do
     if [ "$cur_size" -ne "$last_size" ]; then
       last_size="$cur_size"
       last_size_change_ts=$(date +%s)
+      wedge_streak=0   # worker made progress — reset the wedge confirm streak
     else
       now_ts=$(date +%s)
       idle_for=$(( now_ts - last_size_change_ts ))
       if [ "$idle_for" -ge "$MAX_IDLE_SECS" ]; then
+        cpu_pct=$(pgroup_cpu_pct "$worker_pgid")
+        if cpu_gt_epsilon "$cpu_pct"; then
+          wedge_streak=0
+          echo "[$(date '+%H:%M:%S')] WATCHER-STATE: running_quiet worker_pid=$WORKER_PID pgid=$worker_pgid pgroup_cpu_pct=$cpu_pct idle_for=${idle_for}s"
+          sleep "$POLL_SECS"
+          continue
+        fi
+        # CPU at/below epsilon: looks wedged. Require consecutive confirmations
+        # so a single transient `ps` failure (cpu→0.0 for one poll) can't
+        # false-positive a healthy worker into idle-timeout (codex P2 grace).
+        wedge_streak=$(( wedge_streak + 1 ))
+        if [ "$wedge_streak" -lt "$WEDGE_CONFIRM_SAMPLES" ]; then
+          echo "[$(date '+%H:%M:%S')] WATCHER-STATE: wedge-unconfirmed ($wedge_streak/$WEDGE_CONFIRM_SAMPLES) worker_pid=$WORKER_PID pgid=$worker_pgid pgroup_cpu_pct=$cpu_pct idle_for=${idle_for}s — re-checking"
+          sleep "$POLL_SECS"
+          continue
+        fi
         echo "[$(date '+%H:%M:%S')] tail file idle for ${idle_for}s (>= ${MAX_IDLE_SECS}s threshold) — worker likely wedged"
         echo "=== tail last 30 lines ==="
         tail -30 "$TAIL_PATH"

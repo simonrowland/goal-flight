@@ -54,6 +54,35 @@ orthogonal axes: **iteration pattern** (how many turns) and **comms shape**
     --agent <agent>
   ```
 
+## Liveness — a quiet worker is not a dead worker
+
+Event/tail silence alone is NOT a wedge signal. A healthy worker grinding a long
+test or compile can emit zero ACP events (or zero tail bytes) for tens of
+minutes; treating that as a timeout false-positives it into a retry storm. The
+runner and watchers use **process-group CPU** as the false-positive killer:
+
+- The ACP runner (`goalflight_acp_run.py`) writes a *progressive* status JSON
+  (`starting → handshaking → running`) and runs a concurrent heartbeat task that
+  samples pgroup-CPU every `--heartbeat-interval` seconds (default 15s; env
+  `GOALFLIGHT_HEARTBEAT_INTERVAL`). When the ACP stream goes silent past the
+  idle window, the runner checks pgroup-CPU *before* cancelling: **CPU > epsilon
+  ⇒ `running_quiet`, keep waiting; CPU ≈ 0 ⇒ wedged, cancel.** A busy-but-quiet
+  worker is never killed; a genuinely stuck one still is.
+- The watchers (`goalflight_watch.py`, `watch-dispatch-tail.sh`) apply the same
+  rule to bash-tail dispatches: PID alive + pgroup-CPU > epsilon ⇒ `running_quiet`
+  (no idle-timeout exit). A single failed CPU sample is never read as a wedge —
+  the runner re-samples and the watchers require consecutive samples, riding out
+  a transient `ps` failure before declaring a wedge.
+- Heartbeats are **runner-written FILES, never task-notifications.** The
+  controller is woken only on an actionable transition (completion / wedge /
+  blocked), never per beat — a per-beat wake would re-process the controller's
+  whole cached session (ruinous).
+- **Handshake retry-once**: if the handshake (`initialize`/`session_new`) stalls
+  — the intermittent codex-acp wedge, where the worker spawns but never answers
+  even though the handshake works in isolation — the runner kills + respawns the
+  worker and retries the handshake once before falling back. The wedged worker is
+  always reaped first (never retry while an identity-matched PID is still alive).
+
 ## Composition rules
 
 | Iteration | Comms | Supported | Notes |

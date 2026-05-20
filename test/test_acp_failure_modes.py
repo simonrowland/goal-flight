@@ -27,7 +27,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
-from acp_client import AcpConnection, AcpProcessPool  # noqa: E402
+from acp_client import AcpConnection, AcpError, AcpProcessPool  # noqa: E402
 from acp_pool import managed_pool  # noqa: E402
 from acp_runner import run_prompt  # noqa: E402
 
@@ -312,6 +312,358 @@ async def case_f_cancelled_send_request_clears_pending() -> None:
         shim_path.unlink(missing_ok=True)
 
 
+async def case_g_handshake_timeout_on_wedged_init() -> None:
+    """A worker that spawns but never answers `initialize` must fail fast with
+    an AcpError (the codex-acp handshake wedge: idle CPU, empty log, no status
+    JSON), not hang forever. Verifies the 0.4.2 handshake timeout — without it
+    `await fut` blocked indefinitely, and since handshake precedes
+    session_prompt the execution idle-timeout never applied (worse after 0.4.1
+    raised goal-mode idle-timeout to 36000s)."""
+    shim_path = Path(f"/tmp/acp-wedge-init-shim-{os.getpid()}.py")
+    shim_path.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys, time\n"
+        "# Spawn, consume stdin, but NEVER respond to initialize — the wedge.\n"
+        "for line in sys.stdin:\n"
+        "    pass\n"
+        "time.sleep(3600)\n"
+    )
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, str(shim_path),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+            limit=8 * 1024 * 1024,
+        )
+        async with AcpConnection(agent="wedge-init", session_id="g", proc=proc) as conn:
+            raised = False
+            loop = asyncio.get_event_loop()
+            start = loop.time()
+            try:
+                await conn.initialize(timeout=2)
+            except AcpError as e:
+                raised = True
+                msg = str(e).lower()
+                assert "no response" in msg or "wedged" in msg, f"unexpected error text: {e}"
+            elapsed = loop.time() - start
+            assert raised, "initialize() did not raise on wedged handshake (hung?)"
+            assert elapsed < 5, f"handshake timeout too slow: {elapsed:.1f}s (expected ~2s)"
+            assert conn._pending == {}, f"pending request leaked after handshake timeout: {conn._pending!r}"
+    finally:
+        shim_path.unlink(missing_ok=True)
+
+
+async def case_h_on_idle_keeps_busy_worker_alive() -> None:
+    """The codex P1 regression: a worker silent past idle_timeout but reported
+    ALIVE by the on_idle hook must NOT be cancelled — the runner keeps waiting
+    and receives the delayed result. Before the fix, session_prompt cancelled on
+    idle with no liveness check, false-positiving healthy-but-quiet ACP workers
+    (the retry storm). The shim stays silent ~1.5s (past the idle window) then
+    answers; on_idle returns True so the prompt rides it out."""
+    shim_path = Path(f"/tmp/acp-onidle-keep-shim-{os.getpid()}.py")
+    shim_path.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys, time\n"
+        "def send(o): print(json.dumps(o), flush=True)\n"
+        "for line in sys.stdin:\n"
+        "    try:\n"
+        "        msg = json.loads(line)\n"
+        "    except Exception:\n"
+        "        continue\n"
+        "    m = msg.get('method', ''); rid = msg.get('id')\n"
+        "    if m == 'initialize':\n"
+        "        send({'jsonrpc':'2.0','id':rid,'result':{'protocolVersion':1,'agentInfo':{'name':'onidle-keep','version':'0'},'capabilities':{}}})\n"
+        "    elif m == 'session/new':\n"
+        "        send({'jsonrpc':'2.0','id':rid,'result':{'sessionId':'s'}})\n"
+        "    elif m == 'session/prompt':\n"
+        "        time.sleep(1.5)\n"
+        "        send({'jsonrpc':'2.0','method':'session/update','params':{'sessionId':'s','update':{'sessionUpdate':'agent_message_chunk','content':{'text':'finished after silence'}}}})\n"
+        "        send({'jsonrpc':'2.0','id':rid,'result':{'sessionId':'s','stopReason':'end_turn'}})\n"
+        "    elif m == 'session/cancel':\n"
+        "        pass\n"
+    )
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, str(shim_path),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+            limit=8 * 1024 * 1024,
+        )
+        async with AcpConnection(agent="onidle-keep", session_id="h", proc=proc) as conn:
+            await conn.initialize()
+            await conn.session_new(cwd="/tmp")
+            idle_calls = 0
+
+            def keep_alive():
+                nonlocal idle_calls
+                idle_calls += 1
+                return True
+
+            result = await asyncio.wait_for(
+                run_prompt(conn, "go", idle_timeout=0.1, on_idle=keep_alive),
+                timeout=8,
+            )
+            assert result.ok, f"expected success after deferred idle, got err={result.error} stop={result.stop_reason!r}"
+            assert "finished after silence" in result.text, result.text
+            assert idle_calls >= 1, f"on_idle was never consulted — idle path not wired (calls={idle_calls})"
+    finally:
+        shim_path.unlink(missing_ok=True)
+
+
+async def case_i_on_idle_false_still_cancels() -> None:
+    """When the liveness hook says wedged (returns False), the runner must still
+    cancel with agent_timeout (idle) — and the hook must be consulted (proves the
+    idle path runs the hook rather than bypassing it). Uses a hang shim that
+    answers the handshake but never the prompt."""
+    shim_path = Path(f"/tmp/acp-onidle-wedged-shim-{os.getpid()}.py")
+    shim_path.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        "def send(o): print(json.dumps(o), flush=True)\n"
+        "for line in sys.stdin:\n"
+        "    try:\n"
+        "        msg = json.loads(line)\n"
+        "    except Exception:\n"
+        "        continue\n"
+        "    m = msg.get('method', ''); rid = msg.get('id')\n"
+        "    if m == 'initialize':\n"
+        "        send({'jsonrpc':'2.0','id':rid,'result':{'protocolVersion':1,'agentInfo':{'name':'onidle-wedged','version':'0'},'capabilities':{}}})\n"
+        "    elif m == 'session/new':\n"
+        "        send({'jsonrpc':'2.0','id':rid,'result':{'sessionId':'s'}})\n"
+        "    elif m == 'session/prompt':\n"
+        "        continue\n"
+        "    elif m == 'session/cancel':\n"
+        "        pass\n"
+    )
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, str(shim_path),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+            limit=8 * 1024 * 1024,
+        )
+        async with AcpConnection(agent="onidle-wedged", session_id="i", proc=proc) as conn:
+            await conn.initialize()
+            await conn.session_new(cwd="/tmp")
+            idle_calls = 0
+
+            def say_wedged():
+                nonlocal idle_calls
+                idle_calls += 1
+                return False
+
+            result = await asyncio.wait_for(
+                run_prompt(conn, "hang", idle_timeout=0.1, on_idle=say_wedged),
+                timeout=5,
+            )
+            assert result.error is not None, "expected idle timeout error"
+            assert result.error.get("message") == "agent_timeout (idle)", result.error
+            assert idle_calls >= 1, f"on_idle not consulted before cancel (calls={idle_calls})"
+
+            # A hook that RAISES must be treated as wedged (conservative
+            # fallback), not swallow the cancel. Connection is reusable after a
+            # timeout (see case_e), so reuse it here.
+            def boom():
+                raise RuntimeError("liveness hook failure")
+
+            raised_result = await asyncio.wait_for(
+                run_prompt(conn, "hang", idle_timeout=0.1, on_idle=boom),
+                timeout=5,
+            )
+            assert raised_result.error is not None, "raising hook should still time out"
+            assert raised_result.error.get("message") == "agent_timeout (idle)", raised_result.error
+    finally:
+        shim_path.unlink(missing_ok=True)
+
+
+async def case_j_handshake_retry_once() -> None:
+    """spawn_and_handshake_with_retry must kill+respawn a worker that wedges the
+    handshake (the intermittent codex-acp wedge) and succeed on the retry. A
+    marker file makes the shim wedge on its first spawn and behave on the
+    second. Asserts: 2 spawn attempts, the first (wedged) worker killed before
+    the retry, the returned connection handshook and is usable."""
+    from goalflight_acp_run import spawn_and_handshake_with_retry
+
+    marker = Path(f"/tmp/acp-retry-marker-{os.getpid()}")
+    marker.unlink(missing_ok=True)
+    shim_path = Path(f"/tmp/acp-retry-shim-{os.getpid()}.py")
+    shim_path.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys, os, time\n"
+        "marker = sys.argv[1]\n"
+        "if not os.path.exists(marker):\n"
+        "    open(marker, 'w').close()\n"
+        "    # First spawn: wedge — consume stdin, never answer initialize.\n"
+        "    for line in sys.stdin:\n"
+        "        pass\n"
+        "    time.sleep(3600)\n"
+        "    sys.exit(0)\n"
+        "def send(o): print(json.dumps(o), flush=True)\n"
+        "for line in sys.stdin:\n"
+        "    try:\n"
+        "        msg = json.loads(line)\n"
+        "    except Exception:\n"
+        "        continue\n"
+        "    m = msg.get('method', ''); rid = msg.get('id')\n"
+        "    if m == 'initialize':\n"
+        "        send({'jsonrpc':'2.0','id':rid,'result':{'protocolVersion':1,'agentInfo':{'name':'retry-shim','version':'0'},'capabilities':{}}})\n"
+        "    elif m == 'session/new':\n"
+        "        send({'jsonrpc':'2.0','id':rid,'result':{'sessionId':'s'}})\n"
+        "    elif m == 'session/prompt':\n"
+        "        send({'jsonrpc':'2.0','method':'session/update','params':{'sessionId':'s','update':{'sessionUpdate':'agent_message_chunk','content':{'text':'retried ok'}}}})\n"
+        "        send({'jsonrpc':'2.0','id':rid,'result':{'sessionId':'s','stopReason':'end_turn'}})\n"
+    )
+    attempts_seen: list = []
+
+    async def track(attempt: int, p) -> None:
+        attempts_seen.append(p)
+
+    conn = None
+    try:
+        proc, conn = await asyncio.wait_for(
+            spawn_and_handshake_with_retry(
+                sys.executable, [str(shim_path), str(marker)],
+                agent="retry", session_id="j", cwd="/tmp",
+                handshake_timeout=2, on_attempt=track,
+            ),
+            timeout=15,
+        )
+        assert len(attempts_seen) == 2, f"expected 2 spawn attempts, got {len(attempts_seen)}"
+        assert attempts_seen[0].returncode is not None, "first (wedged) worker not killed before retry"
+        assert proc is attempts_seen[1], "returned proc is not the successful (second) worker"
+        assert conn.acp_session_id is not None, "handshake did not complete on retry"
+        recovered = await asyncio.wait_for(run_prompt(conn, "go", idle_timeout=3), timeout=5)
+        assert recovered.ok and "retried ok" in recovered.text, f"retry connection unusable: {recovered.text!r}"
+    finally:
+        if conn is not None:
+            await conn.kill()
+        marker.unlink(missing_ok=True)
+        shim_path.unlink(missing_ok=True)
+
+
+async def case_k_on_idle_async_race_does_not_drop_result() -> None:
+    """Regression for the codex re-review P1: when on_idle is ASYNC, the prompt's
+    final response can arrive DURING the `await on_idle()`. A False verdict must
+    NOT then cancel the just-completed prompt and return agent_timeout —
+    session_prompt rechecks `fut.done()` after the hook and yields the real
+    result. The shim answers ~1.3s after the prompt; the async hook (idle fires
+    ~1s in) sleeps ~0.7s and returns False, so the response lands inside the
+    hook's await window. Without the fix this drops the result → agent_timeout."""
+    shim_path = Path(f"/tmp/acp-onidle-race-shim-{os.getpid()}.py")
+    shim_path.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys, time\n"
+        "def send(o): print(json.dumps(o), flush=True)\n"
+        "for line in sys.stdin:\n"
+        "    try:\n"
+        "        msg = json.loads(line)\n"
+        "    except Exception:\n"
+        "        continue\n"
+        "    m = msg.get('method', ''); rid = msg.get('id')\n"
+        "    if m == 'initialize':\n"
+        "        send({'jsonrpc':'2.0','id':rid,'result':{'protocolVersion':1,'agentInfo':{'name':'onidle-race','version':'0'},'capabilities':{}}})\n"
+        "    elif m == 'session/new':\n"
+        "        send({'jsonrpc':'2.0','id':rid,'result':{'sessionId':'s'}})\n"
+        "    elif m == 'session/prompt':\n"
+        "        time.sleep(1.3)\n"
+        "        send({'jsonrpc':'2.0','method':'session/update','params':{'sessionId':'s','update':{'sessionUpdate':'agent_message_chunk','content':{'text':'late result'}}}})\n"
+        "        send({'jsonrpc':'2.0','id':rid,'result':{'sessionId':'s','stopReason':'end_turn'}})\n"
+        "    elif m == 'session/cancel':\n"
+        "        pass\n"
+    )
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, str(shim_path),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+            limit=8 * 1024 * 1024,
+        )
+        async with AcpConnection(agent="onidle-race", session_id="k", proc=proc) as conn:
+            await conn.initialize()
+            await conn.session_new(cwd="/tmp")
+
+            async def slow_wedged():
+                # Slow async hook: the prompt response arrives during this await.
+                await asyncio.sleep(0.7)
+                return False  # claim wedged — must NOT drop the completed result
+
+            result = await asyncio.wait_for(
+                run_prompt(conn, "go", idle_timeout=0.1, on_idle=slow_wedged),
+                timeout=8,
+            )
+            assert result.ok, f"async-hook race dropped the result: err={result.error} stop={result.stop_reason!r}"
+            assert "late result" in result.text, result.text
+    finally:
+        shim_path.unlink(missing_ok=True)
+
+
+async def case_l_progress_event_during_async_hook_not_dropped() -> None:
+    """Sibling of case_k (codex round-3 P1): a NON-terminal progress event can
+    arrive on the queue during `await on_idle()` while the final response is
+    still pending. A False verdict must NOT cancel — a queued event is proof of
+    life. session_prompt continues when `q` is non-empty (or fut.done, or
+    CPU-busy). The shim emits a progress chunk ~1.3s in (lands inside the hook
+    await), then the result ~2s later. Without the fix this cancels at the first
+    idle as agent_timeout; with it, the prompt completes."""
+    shim_path = Path(f"/tmp/acp-onidle-progress-shim-{os.getpid()}.py")
+    shim_path.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys, time\n"
+        "def send(o): print(json.dumps(o), flush=True)\n"
+        "for line in sys.stdin:\n"
+        "    try:\n"
+        "        msg = json.loads(line)\n"
+        "    except Exception:\n"
+        "        continue\n"
+        "    m = msg.get('method', ''); rid = msg.get('id')\n"
+        "    if m == 'initialize':\n"
+        "        send({'jsonrpc':'2.0','id':rid,'result':{'protocolVersion':1,'agentInfo':{'name':'onidle-progress','version':'0'},'capabilities':{}}})\n"
+        "    elif m == 'session/new':\n"
+        "        send({'jsonrpc':'2.0','id':rid,'result':{'sessionId':'s'}})\n"
+        "    elif m == 'session/prompt':\n"
+        "        time.sleep(1.3)\n"
+        "        send({'jsonrpc':'2.0','method':'session/update','params':{'sessionId':'s','update':{'sessionUpdate':'agent_message_chunk','content':{'text':'progress'}}}})\n"
+        "        time.sleep(2.0)\n"
+        "        send({'jsonrpc':'2.0','method':'session/update','params':{'sessionId':'s','update':{'sessionUpdate':'agent_message_chunk','content':{'text':' done'}}}})\n"
+        "        send({'jsonrpc':'2.0','id':rid,'result':{'sessionId':'s','stopReason':'end_turn'}})\n"
+        "    elif m == 'session/cancel':\n"
+        "        pass\n"
+    )
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, str(shim_path),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+            limit=8 * 1024 * 1024,
+        )
+        async with AcpConnection(agent="onidle-progress", session_id="l", proc=proc) as conn:
+            await conn.initialize()
+            await conn.session_new(cwd="/tmp")
+
+            async def slow_wedged():
+                await asyncio.sleep(0.7)
+                return False  # claim wedged — but a progress event arrived during the await
+
+            result = await asyncio.wait_for(
+                run_prompt(conn, "go", idle_timeout=0.1, on_idle=slow_wedged),
+                timeout=10,
+            )
+            assert result.ok, f"progress-during-hook race cancelled a live worker: err={result.error} stop={result.stop_reason!r}"
+            assert "progress" in result.text and "done" in result.text, result.text
+    finally:
+        shim_path.unlink(missing_ok=True)
+
+
 async def main() -> None:
     await case_a_worker_killed_mid_prompt()
     await case_b_pool_shutdown_drains_live_connection()
@@ -319,6 +671,12 @@ async def main() -> None:
     await case_d_idle_timeout_zero_disables_timeout()
     await case_e_idle_timeout_clears_pending_and_reuses_connection()
     await case_f_cancelled_send_request_clears_pending()
+    await case_g_handshake_timeout_on_wedged_init()
+    await case_h_on_idle_keeps_busy_worker_alive()
+    await case_i_on_idle_false_still_cancels()
+    await case_j_handshake_retry_once()
+    await case_k_on_idle_async_race_does_not_drop_result()
+    await case_l_progress_event_during_async_hook_not_dropped()
     print("OK: all failure-mode tests pass")
 
 

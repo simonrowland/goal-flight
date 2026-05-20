@@ -4,6 +4,88 @@ Notable changes to the goal-flight Claude Code skill. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are
 incremented when meaningful skill behaviour changes.
 
+## [0.4.2] — 2026-05-20
+
+**ACP dispatch liveness & reliability.** A coherent pass at the failure mode
+behind the codex-acp "wedge" reports and the idle-timeout retry storm: the
+runner now *observes* worker liveness (process-group CPU + a progressive
+heartbeat status file) instead of trusting event/tail silence, fails fast on a
+stalled handshake and retries it once, and never false-positive-cancels a
+healthy-but-quiet worker. Lands Phase 1 of the converged liveness design.
+
+### The problem
+
+- **A stalled handshake hung the runner forever.** `initialize()` /
+  `session_new()` blocked on an unbounded `await fut` when a worker spawned but
+  the handshake stalled — the codex-acp wedge: adapter idle at 0% CPU, empty
+  acp-run.log, no status JSON. The stall is *intermittent* — the same handshake
+  answers in isolation — so it is not a client bug to patch but a condition to
+  detect and recover from. Because the handshake precedes `session_prompt`, the
+  execution idle-timeout never applied; the runner hung until something external
+  killed it. **0.4.1 made this strictly worse** — raising the goal-mode
+  execution idle-timeout to 36000s meant a wedged goal-mode handshake could hang
+  ~10h before any bound fired.
+- **Event-silence was the only liveness signal.** A healthy worker grinding a
+  long test/compile emits no ACP events for minutes; the idle-timeout killed it
+  → the retry storm. Status JSON was written final-only, so a watcher couldn't
+  see progress.
+
+### Added
+
+- **CPU-aware liveness (`scripts/goalflight_liveness.py`, new).** Process-group
+  CPU is the false-positive killer: a silent worker with CPU > epsilon is
+  `running_quiet` (left alone); a silent worker with CPU ≈ 0 is `wedged`
+  (cancelled fast). `classify_liveness()` maps (pid-alive, pgroup-CPU,
+  seconds-since-event) → `running` / `running_quiet` / `wedged` / `worker_dead`.
+  CPU is summed across the process GROUP — the codex-acp `node` wrapper can idle
+  at 0% while the child binary grinds.
+- **Progressive heartbeat status (`scripts/goalflight_acp_run.py`).** Status
+  JSON now advances `starting → handshaking → running`, and a concurrent task
+  samples pgroup-CPU every `--heartbeat-interval` seconds (default 15s; env
+  `GOALFLIGHT_HEARTBEAT_INTERVAL`), recording `worker_pid`, `pgid`,
+  `worker_alive`, `pgroup_cpu_pct`, `events_seen`, `last_event_at`,
+  `heartbeat_at`. Heartbeats are **files, never task-notifications** — the
+  controller is woken only on an actionable transition, never per beat (a
+  per-beat wake would re-process its whole cached session — ruinous).
+- **CPU liveness wired into the runner's own idle path.** `session_prompt()`
+  (`scripts/acp_client.py`) gained a generic `on_idle` hook: on idle expiry it
+  asks "keep waiting?" before cancelling. The runner supplies a pgroup-CPU
+  probe, so a healthy-but-quiet ACP worker is `running_quiet`, not
+  `agent_timeout (idle)`. The CPU policy lives in the runner, not the vendored
+  client (the hook stays generic). Re-sampling rides out a transient `ps`
+  failure instead of reading it as 0-CPU.
+- **Handshake retry-once.** On a stalled handshake the runner kills + respawns
+  the worker and retries the handshake once before falling back (the stall is
+  intermittent, so one respawn usually clears it). The wedged worker is always
+  reaped first — never retry while an identity-matched PID is still alive.
+- **CPU-aware watchers.** `scripts/goalflight_watch.py` and
+  `scripts/watch-dispatch-tail.sh` add `running_quiet` (PID alive + pgroup-CPU >
+  epsilon ⇒ keep watching, no idle-timeout exit), with a consecutive-sample
+  confirm so a transient `ps` failure can't false-positive a wedge. The bash
+  watcher stays bash-3.2 portable.
+- **60s handshake timeout** on `initialize()` / `session_new()` via an optional
+  `timeout` on `_send_request`. A healthy adapter answers in well under a
+  second; 60s tolerates a slow cold-start while catching the stall two orders of
+  magnitude faster than the execution idle-timeout. On timeout it raises a clean
+  `AcpError` the runner converts to `state=failed` — so the controller observes
+  the failure (and now retries once) instead of hanging.
+- Tests: `test/test_goalflight_liveness.py` (classify boundaries incl.
+  None+idle, the CPU-sample grace, the parser, live `running_quiet`);
+  `test/test_acp_failure_modes.py` case_g (handshake-timeout), case_h (on_idle
+  keeps a busy worker alive — the P1 regression guard), case_i (on_idle False
+  still cancels), case_j (handshake retry kills + respawns); plus
+  `tests/test-watch-dispatch-tail.sh` running_quiet.
+
+### Notes
+
+The handshake timeout is deliberately separate from the execution idle-timeout:
+handshake = short (catch the stall), execution = long (tolerate legitimate
+goal-mode silence). This is Phase 1 of the liveness design; the typed
+timeout-state taxonomy, semantic dispatch `--kind`, and the detached supervisor
+are deferred to later phases. The root cause inside codex-acp (an intermittent
+adapter handshake stall) is worth a separate upstream look; goal-flight's job is
+to detect and recover, which it now does.
+
 ## [0.4.1] — 2026-05-20
 
 Patch: goal-mode ACP dispatches no longer die at a 5-minute idle ceiling.

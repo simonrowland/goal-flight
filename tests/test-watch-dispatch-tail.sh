@@ -183,6 +183,49 @@ wait "$WORKER_PID" 2>/dev/null
 rm -f "$TAIL" /tmp/watcher-out-idle-$$.txt
 cleanup_pidfile "$PIDFILE_STEM"
 
+# ---- Case 3b: CPU-busy silence → running_quiet, not exit 2 ----
+TAIL=/tmp/test-watch-running-quiet-$$.txt
+: > "$TAIL"
+python3 -c 'import time
+end = time.time() + 8
+x = 0
+while time.time() < end:
+    x += 1
+' & WORKER_PID=$!
+PIDFILE_STEM="$$.bashtail.${WORKER_PID}.jsonl"
+
+bash "$WATCHER" \
+  --pid "$WORKER_PID" --tail "$TAIL" \
+  --controller-pid "$$" --agent test-bashtail \
+  --session-id "test-running-quiet" \
+  --poll-secs 1 --max-idle-secs 1 \
+  > /tmp/watcher-out-running-quiet-$$.txt 2>&1 &
+WATCHER_PID=$!
+sleep 3
+running_quiet_watcher_alive=no
+if kill -0 "$WATCHER_PID" 2>/dev/null; then
+  running_quiet_watcher_alive=yes
+  expect_eq "case-3b watcher still running during CPU-busy silence" "running" "running"
+else
+  wait "$WATCHER_PID"
+  expect_eq "case-3b watcher still running during CPU-busy silence" "running" "exited-$?"
+fi
+if grep -q "WATCHER-STATE: running_quiet" /tmp/watcher-out-running-quiet-$$.txt; then
+  expect_eq "case-3b running_quiet state logged" "yes" "yes"
+else
+  expect_eq "case-3b running_quiet state logged" "yes" "no"
+fi
+if [ "$running_quiet_watcher_alive" = "yes" ]; then
+  echo "**COMPLETE:** busy worker done" >> "$TAIL"
+  wait "$WATCHER_PID"
+  watcher_exit=$?
+  expect_eq "case-3b exit code after terminal marker" "0" "$watcher_exit"
+fi
+kill "$WORKER_PID" 2>/dev/null
+wait "$WORKER_PID" 2>/dev/null
+rm -f "$TAIL" /tmp/watcher-out-running-quiet-$$.txt
+cleanup_pidfile "$PIDFILE_STEM"
+
 # ---- Case 4: controller PID dies → exit 3 ----
 # Spawn a controller-proxy that exits in 2s. The watcher monitors it as its
 # --controller-pid. After 2s the proxy dies; watcher should detect and exit 3.

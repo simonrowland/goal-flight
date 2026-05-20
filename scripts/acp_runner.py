@@ -14,8 +14,9 @@ All goal-flight-specific ergonomics live here.
 
 import re
 from dataclasses import dataclass, field
+import inspect
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from acp_client import AcpConnection
 
@@ -45,6 +46,8 @@ async def run_prompt(
     *,
     idle_timeout: float | None = 300,
     keep_raw: bool = False,
+    on_event: Callable[[dict], Any] | None = None,
+    on_idle: Callable[[], Any] | None = None,
 ) -> PromptResult:
     """Send a prompt through an already-initialized ACP connection.
 
@@ -57,9 +60,19 @@ async def run_prompt(
     gives up. Default 300s suits short prompts; set to 0/None (no timeout) or
     something like 7200 for goal-mode / implement-mode dispatches that run
     multi-minute autonomously between agent_message_chunks.
+
+    on_idle: optional liveness hook consulted when the idle window elapses with
+    no events. Return True to keep waiting (worker alive-but-quiet), False to
+    let the runner cancel (wedged). goalflight_acp_run.py passes a process-group
+    CPU probe so a healthy-but-silent worker isn't false-positive cancelled.
+    Passed straight through to AcpConnection.session_prompt.
     """
     result = PromptResult()
-    async for event in conn.session_prompt(text, idle_timeout=idle_timeout):
+    async for event in conn.session_prompt(text, idle_timeout=idle_timeout, on_idle=on_idle):
+        if on_event is not None:
+            maybe_awaitable = on_event(event)
+            if inspect.isawaitable(maybe_awaitable):
+                await maybe_awaitable
         if keep_raw:
             result.raw_events.append(event)
         if "_prompt_result" in event:

@@ -86,9 +86,29 @@
 #     cleanup_ghosts reads from the module-level _PIDFILE_DIR. Eliminates
 #     the latent mixed-mode race where pool's narrower view would clobber
 #     the registry's superset.
+#   - _send_request() gained an optional `timeout` (0.4.2); initialize() and
+#     session_new() pass a 60s handshake timeout. Upstream `await fut` was
+#     unbounded, so a worker that spawned but never answered the handshake
+#     (the codex-acp wedge: idle CPU, empty acp-run.log, no status JSON) hung
+#     the runner forever — and since the handshake precedes session_prompt,
+#     the execution idle-timeout never applied. Now the wedge raises a clean
+#     AcpError in ~60s; the runner writes state=failed and the controller
+#     falls back. This matters more after 0.4.1 raised the goal-mode execution
+#     idle-timeout to 36000s: without a separate handshake bound, a wedged
+#     goal-mode handshake would have hung ~10h.
+#   - session_prompt() gained an optional `on_idle` callback (0.4.2 liveness):
+#     when the idle window elapses with no ACP events, the hook is consulted
+#     BEFORE cancelling — it returns True ("worker alive, keep waiting") or
+#     False ("wedged, give up"). goal-flight passes a process-group-CPU probe so
+#     a healthy-but-silent worker (running_quiet: CPU>0, no events) is NOT
+#     cancelled — the false-positive idle-timeout retry that the Phase-1
+#     liveness work exists to kill. The CPU policy lives in goalflight_acp_run.py,
+#     NOT here, so the vendored client stays generic (the hook is just "ask
+#     before giving up on idle"). No callback → original event-gap-only cancel.
 """ACP stdio JSON-RPC client — manages CLI agent subprocesses."""
 
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -97,7 +117,7 @@ import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Callable
 
 log = logging.getLogger("goal-flight.acp_client")
 
@@ -259,7 +279,7 @@ class AcpConnection:
         self.proc.stdin.write(data.encode())
         await self.proc.stdin.drain()
 
-    async def _send_request(self, method: str, params: dict | None = None) -> Any:
+    async def _send_request(self, method: str, params: dict | None = None, timeout: float | None = None) -> Any:
         req_id = self._next_id()
         msg: dict[str, Any] = {"jsonrpc": "2.0", "id": req_id, "method": method}
         if params is not None:
@@ -273,8 +293,26 @@ class AcpConnection:
             # future; raise a clean AcpError so callers can classify cleanly.
             self._discard_pending(req_id)
             raise AcpError(f"{method}: send failed (worker likely dead): {e}") from e
+        # `timeout` bounds the wait for the response future. Critically used by
+        # initialize()/session_new() so a worker that spawns but never answers
+        # the handshake (the codex-acp wedge: idle CPU, empty log, no status
+        # JSON) fails fast with a clean AcpError instead of hanging forever.
+        # Without it, `await fut` blocks indefinitely — and the session_prompt
+        # idle-timeout never applies because the handshake happens before the
+        # prompt. None preserves the unbounded behavior for callers that don't
+        # want a request timeout.
         try:
-            result = await fut
+            if timeout is not None:
+                result = await asyncio.wait_for(fut, timeout=timeout)
+            else:
+                result = await fut
+        except asyncio.TimeoutError:
+            self._discard_pending(req_id)
+            raise AcpError(
+                f"{method}: no response within {timeout:.0f}s — worker likely "
+                f"wedged in handshake (spawned but idle, nothing written). "
+                f"Fall back to another transport/worker."
+            )
         except asyncio.CancelledError:
             self._discard_pending(req_id)
             raise
@@ -392,33 +430,43 @@ class AcpConnection:
     def alive(self) -> bool:
         return self.proc.returncode is None
 
-    async def initialize(self) -> dict:
+    async def initialize(self, timeout: float = 60.0) -> dict:
+        # `timeout` bounds the handshake. A healthy adapter answers initialize
+        # in well under a second; 60s tolerates a slow cold-start while still
+        # catching the wedge (codex-acp spawning but never handshaking) two
+        # orders of magnitude faster than the execution idle-timeout, which
+        # is now up to 36000s for goal-mode dispatches.
         self._start_reader()
         result = await self._send_request("initialize", {
             "protocolVersion": 1,
             "clientCapabilities": {},
             "clientInfo": {"name": "goal-flight", "version": _VERSION},
-        })
+        }, timeout=timeout)
         log.info("initialized: agent=%s version=%s",
                  result.get("agentInfo", {}).get("name"),
                  result.get("agentInfo", {}).get("version"))
         return result
 
-    async def session_new(self, cwd: str) -> str:
+    async def session_new(self, cwd: str, timeout: float = 60.0) -> str:
         self.cwd = cwd  # remember for run_prompt's scope-leak audit (Design 1)
         sub_id, q = self._subscribe()
         try:
             result = await self._send_request("session/new", {
                 "cwd": cwd,
                 "mcpServers": [],
-            })
+            }, timeout=timeout)
             self.acp_session_id = result["sessionId"]
             log.info("session created: acp_session=%s", self.acp_session_id)
             return self.acp_session_id
         finally:
             self._unsubscribe(sub_id)
 
-    async def session_prompt(self, prompt: str, idle_timeout: float | None = 300) -> AsyncIterator[dict]:
+    async def session_prompt(
+        self,
+        prompt: str,
+        idle_timeout: float | None = 300,
+        on_idle: Callable[[], Any] | None = None,
+    ) -> AsyncIterator[dict]:
         self.last_active = time.time()
         last_event_time = time.time()
         sub_id, q = self._subscribe()
@@ -450,6 +498,45 @@ class AcpConnection:
                 if fut.done():
                     break
                 if timeout_enabled and time.time() - last_event_time > idle_timeout:
+                    # Idle window elapsed with no ACP events. Before treating
+                    # this as a wedge, consult the optional liveness hook: a
+                    # healthy worker doing CPU-heavy silent work (running_quiet)
+                    # must NOT be cancelled — that false positive is the retry
+                    # storm Phase 1 exists to kill. The hook (supplied by
+                    # goalflight_acp_run.py) samples process-group CPU and
+                    # returns True ("alive, keep waiting") / False ("wedged,
+                    # give up"). No hook → original event-gap-only cancel.
+                    # NOTE: the hook runs inline in this consumer loop, so a slow
+                    # hook briefly pauses event drain — harmless here because we
+                    # only reach this branch when the worker has BEEN silent for a
+                    # full idle window (no events to drain), and the hook is
+                    # bounded (a couple of short CPU samples).
+                    keep_waiting = False
+                    if on_idle is not None:
+                        try:
+                            verdict = on_idle()
+                            if inspect.isawaitable(verdict):
+                                verdict = await verdict
+                            keep_waiting = bool(verdict)
+                        except Exception as e:
+                            log.warning("on_idle liveness hook raised (%s); treating as wedged", e)
+                            keep_waiting = False
+                    # The hook may have awaited (e.g. a CPU sample); during that
+                    # await the worker could have shown signs of life that make the
+                    # idle verdict stale. Only cancel if it truly showed none. Any
+                    # of these means alive → never cancel on a stale verdict:
+                    #   - fut.done()      : the final response arrived → go yield it
+                    #   - q not empty     : a progress event was queued during the
+                    #                       await → the worker is actively emitting
+                    #   - keep_waiting    : the hook says CPU-busy (running_quiet)
+                    if fut.done():
+                        break
+                    if keep_waiting or not q.empty():
+                        # Reset the idle clock and keep streaming. The next idle
+                        # window re-checks liveness, so a worker that later goes
+                        # truly quiet is still caught within one idle_timeout.
+                        last_event_time = time.time()
+                        continue
                     self._discard_pending(req_id)
                     if self.alive and self.acp_session_id is not None:
                         try:
