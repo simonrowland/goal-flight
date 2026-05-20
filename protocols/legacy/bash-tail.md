@@ -6,15 +6,28 @@ tool-call locations, and stop reasons as structured events; bash-tail loses
 all of that — but bash-tail remains the canonical recipe for **codex
 `/goal` mode** (see `templates/codex-goal-prompt.md.tpl`).
 
-**Goal-mode + bash-tail compatibility:**
+**One-shot + bash-tail — works for ANY worker.** This is the common
+bash-tail case. The worker emits the standard terminal markers
+(`COMPLETE:` / `BLOCKED:` / `USER-NEED:` / `USER-CONFIRM:`) and the
+watcher greps for them; `STATUS:` / `RESULT:` lines stream as progress in
+between. codex, grok, claude, and cursor headless all do this fine. Nothing
+about bash-tail is goal-mode-only — a one-shot task that emits a status
+update or two and a final `COMPLETE:` is exactly what the watcher is built
+for.
 
-- **codex `/goal`** — works. Codex emits a structured "Final response" block
-  at the end of the goal, giving the watcher a turn-boundary signal in the
-  flat tail. Empirically verified.
-- **grok / claude headless** — does not work. No equivalent end-of-goal
-  signal in the flat tail; the watcher has no way to know when iteration
-  is complete. Use one-shot + bash-tail with a coarser chunk instead, or
-  switch to ACP if the adapter is available.
+**Goal-mode + bash-tail — codex `/goal` only.** This is the constrained
+case. Goal-mode runs many turns, so the watcher needs a distinct
+end-of-*loop* signal — not just the end-of-*turn* terminal markers above.
+
+- **codex `/goal`** — works. Codex emits a structured "Final response"
+  block at the end of the goal, giving the watcher the end-of-loop signal
+  in the flat tail. Empirically verified. (See
+  `templates/codex-goal-prompt.md.tpl`.)
+- **grok / claude headless in goal-mode** — does not work. No equivalent
+  end-of-loop signal; the watcher can't tell when their iteration is done.
+  This is a *goal-mode* limitation only — one-shot + bash-tail works fine
+  for them (see above). For their iterative work, use one-shot + bash-tail
+  with a coarser chunk, or switch to ACP if the adapter is available.
 
 ## Recipes
 
