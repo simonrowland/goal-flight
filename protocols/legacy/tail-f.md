@@ -23,6 +23,12 @@ tail -f /tmp/<agent>-<slug>.txt
 the foreground forever; the controller has no way to time-bound it. Run it
 from a separate shell or use the structured watcher instead.
 
+**Do not** wrap `tail -f` in context-mode (`ctx_execute` /
+`ctx_batch_execute`) either. It's infinite by design and would trip
+context-mode's bounded-command timeout (~120s default), returning a
+truncated, misleading slice. context-mode is for bounded commands that
+finish; use the flat marker probe below or `goalflight_watch.py` instead.
+
 Flat marker probe for procedural code (no follow loop):
 
 ```bash

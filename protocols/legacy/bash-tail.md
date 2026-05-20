@@ -112,6 +112,30 @@ function name — line drifts over time) reaps orphaned workers uniformly
 across ACP and bash-tail paths. Filename pattern:
 `<controller-pid>.bashtail.<worker-pid>.jsonl`.
 
+## Do NOT route the dispatch or the tail through context-mode
+
+It is tempting to run the `codex exec ... &` spawn or a `tail -f <tail>`
+inside `ctx_execute` / `ctx_batch_execute` to keep output out of the
+controller's context. **Don't.** context-mode is a *bounded-command*
+tool — its timeout (default ~120s) exists to hand control back to the
+controller when a command hangs. A worker spawn is intentionally
+long-running (minutes–hours); a `tail -f` is intentionally infinite.
+Both trip the timeout and get killed mid-run — the worker orphaned, the
+tail truncated. The timeout is not a misconfiguration to lengthen; it is
+correct for context-mode's purpose, which is exactly why long/infinite
+processes don't belong inside it.
+
+Correct split:
+
+- **Dispatch**: native Bash with `&` (as in the recipes above). Never
+  wrapped in an MCP tool call.
+- **Follow progress**: `scripts/watch-dispatch-tail.sh` or
+  `scripts/goalflight_watch.py` — they poll and return, never block.
+- **context-mode's job here**: the *bounded* analysis commands that run
+  AROUND the dispatch — verify the diff, run the test gate, grep the
+  result. Those finish and produce output worth indexing; the worker
+  spawn and the tail-follow do not.
+
 ## Bypass-flag safety story
 
 The bypass / accept-edits flags grant the worker process full local
