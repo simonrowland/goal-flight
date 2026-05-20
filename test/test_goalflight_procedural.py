@@ -64,6 +64,9 @@ def test_capacity_prunes_review_terminal_states() -> None:
         "leases": {
             "l1": {"lease_id": "l1", "state": "inconclusive_timeout", "released_at": old},
             "l2": {"lease_id": "l2", "state": "blocked_session_limit", "ended_at": old},
+            "l3": {"lease_id": "l3", "state": "wedged", "released_at": old},
+            "l4": {"lease_id": "l4", "state": "tool_timeout", "released_at": old},
+            "l5": {"lease_id": "l5", "state": "result_too_large", "released_at": old},
         },
         "cooldowns": {},
     }

@@ -4,6 +4,105 @@ Notable changes to the goal-flight Claude Code skill. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are
 incremented when meaningful skill behaviour changes.
 
+## [0.4.3] — 2026-05-20
+
+**ACP dispatch reliability.** 0.4.2 taught the runner to *observe* worker
+liveness and recover a stalled handshake; 0.4.3 closes the field failure modes
+its passive heartbeat could not. A controller running 0.4.2 reported `ACP = 0%`
+with both adapters hung — a worker's long-running tool call (web search) wedging
+the event stream, and mass-spawned Claude-TUI adapters starving each other at
+startup. Now the heartbeat *acts* on a confirmed wedge (even when the idle gate
+is off), an outstanding tool call gets a grace window plus an absolute wall, an
+oversized result frame is classified instead of hung, and fragile-adapter
+startup is serialized.
+
+### The problem
+
+- **The 0.4.2 heartbeat observed but never acted.** It wrote progressive
+  CPU/event status, but only `session_prompt`'s idle-timeout could actually
+  cancel a worker — so `--idle-timeout 0` (a supported goal-mode path) had no
+  wedge backstop at all, and a wedge inside a long legitimate-silence window went
+  uncaught.
+- **A long-running tool call wedged the stream.** A worker that emits a
+  `tool_call` (web search, a big test) then goes silent looks identical to a
+  wedge under the CPU rule — I/O-wait sits at ≈0% CPU. The CPU grace alone could
+  not tell a healthy in-progress tool from a genuinely stuck one.
+- **An oversized result frame hung the reader.** An ACP frame larger than
+  asyncio's stream limit raised `LimitOverrunError` deep in the read loop;
+  pending requests never resolved and the runner hung indefinitely.
+- **Mass-spawned Claude-TUI adapters starved at startup.** Four simultaneous
+  `claude-code-cli-acp` dispatches each blew the adapter's hardcoded 120s
+  per-turn timeout on an otherwise trivial turn (3/4 failed); the same four with
+  serialized startups ran 4/4. The contention is the TUI's *startup*
+  (hooks/LSP/keychain/auto-memory/MCP), not steady-state.
+
+### Added
+
+- **Heartbeat-driven wedge detector that acts (`goalflight_acp_run.py` +
+  `goalflight_liveness.heartbeat_wedge_decision`).** The concurrent heartbeat
+  now kills and finalizes a worker on a *confirmed* wedge, independent of the
+  idle-timeout — so `--idle-timeout 0` is still protected. A dead sample requires
+  ALL of: PID alive, pgroup-CPU ≤ epsilon, event count unchanged since the last
+  beat, and zero outstanding tool calls; `--wedge-samples` consecutive dead
+  samples (default 4; env `GOALFLIGHT_WEDGE_SAMPLES`) are required before the
+  kill, so a single transient `ps` failure or a momentary lull cannot
+  false-positive. Terminal state `wedged`.
+- **Tool-call grace + an absolute per-tool wall (`ToolActivity`).** The runner
+  tracks outstanding ACP tool calls. While a tool is in flight the dead-sample
+  wedge rule is suppressed — a silent web search is NOT a wedge (the field case).
+  But an individual tool outstanding past `--max-tool-s` (default 1800s; env
+  `GOALFLIGHT_MAX_TOOL_S`) is killed *regardless of CPU* — the wall is ABSOLUTE,
+  so a tool that is CPU-busy or whose CPU is unsamplable still trips it. Terminal
+  state `tool_timeout`. A separate `--max-quiet-s` (default 3600s; env
+  `GOALFLIGHT_MAX_QUIET_S`) bounds total event-silence for a CPU-busy quiet
+  worker → `wedged`.
+- **`result_too_large` classification (`acp_client.py`).** The read loop catches
+  `LimitOverrunError`/`ValueError` on an oversized frame, resolves all pending
+  requests with a `result_too_large` error (instead of a generic "connection
+  closed"), and kills the worker. `kill()` is now current-task-safe — it skips
+  cancelling the task that called it, so the reader loop can reap its own
+  connection without self-cancelling. Terminal state `result_too_large`.
+- **StartupGate (`scripts/goalflight_startup_gate.py`, new).** An async context
+  manager that serializes the spawn→handshake window of fragile adapters via a
+  per-agent `flock` (`/tmp/goal-flight-startup-locks/<agent>.lock`). It is
+  *handshake-gated, not a hardcoded stagger* — the lock is held only across
+  spawn + handshake, so the next worker starts the instant the previous one is
+  ready, on any machine (no interval baselined to one laptop's speed). Default
+  serializes the Claude TUI adapter only (override via env
+  `GOALFLIGHT_SERIALIZE_STARTUP`); fail-open after `max_wait` (600s) so a stuck
+  holder cannot deadlock the fleet. Concurrent *turns* stay parallel; only
+  startup is throttled.
+- **New typed terminal states wired through capacity.** `wedged`,
+  `tool_timeout`, and `result_too_large` join `TERMINAL_LEASE_STATES`, so a
+  leased slot is freed and pruned on its terminal-at the same as
+  `complete`/`failed`. The per-agent caps are now backed by stress-test evidence
+  plus StartupGate: codex-acp / grok = 10 (verified 49/49 + 13/13
+  true-simultaneous, zero wedges), claude / claude-code-cli-acp = 5 (startup
+  serialized), cursor = 5.
+- **Tests.** `test/test_acp_failure_modes.py`: case_n (a live tool survives a
+  silent gap — the field-case grace guard), case_o (a silent tool past the wall
+  → `tool_timeout`), case_p (oversized frame → `result_too_large` + worker
+  reaped), case_q (a CPU-*busy* tool past `--max-tool-s` still hits
+  `tool_timeout` with `elapsed < 2.0` — the discriminator vs the old CPU-gated
+  wall). `test/test_goalflight_liveness.py`: the heartbeat dead-sample decision
+  table. `test/test_startup_gate.py` (new): serialization, no-op, fail-open,
+  exception-release, env-override. `test/test_wedge_detector.py` (new): the
+  corpus-verified tool-grace rule across codex/grok/claude event shapes.
+  `test/test_goalflight_procedural.py`: terminal-prune coverage for the new
+  states.
+
+### Notes
+
+The wedge detector and the idle-timeout are deliberately separate: the
+idle-timeout bounds the gap between events (and rides the CPU grace), while the
+heartbeat wedge detector is the absolute backstop that fires even when the idle
+gate is disabled. The root causes — the intermittent codex-acp handshake stall
+and the Claude-TUI startup contention — live in those adapters; goal-flight's job
+is to detect, bound, and recover, which it now does for the handshake (0.4.2) and
+for the wedge / stuck-tool / oversized-frame / startup-storm failures (0.4.3).
+The broader typed timeout-state taxonomy and the detached supervisor remain
+deferred to a later phase.
+
 ## [0.4.2] — 2026-05-20
 
 **ACP dispatch liveness & reliability.** A coherent pass at the failure mode

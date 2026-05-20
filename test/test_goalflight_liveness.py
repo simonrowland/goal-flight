@@ -14,6 +14,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 from goalflight_liveness import (  # noqa: E402
+    heartbeat_wedge_decision,
     IdleLivenessGate,
     LivenessThresholds,
     classify_liveness,
@@ -52,6 +53,30 @@ def test_none_cpu_idle_classifies_wedged() -> None:
     # classifier (grok 2026-05-20 P2: assert the None+idle branch explicitly).
     thresholds = LivenessThresholds(idle_timeout_s=10.0, cpu_epsilon_pct=0.1)
     assert classify_liveness(True, None, 100.0, thresholds) == "wedged"
+
+
+def test_heartbeat_dead_sample_decision_table() -> None:
+    cases = [
+        ("busy", 8.0, 5, 5, 0, 2, False, 0, False),
+        ("idle", 0.0, 5, 5, 0, 2, True, 3, True),
+        ("outstanding-tool", 0.0, 5, 5, 1, 2, False, 0, False),
+        ("none-cpu", None, 5, 5, 0, 2, False, 0, False),
+        ("new-event", 0.0, 6, 5, 0, 2, False, 0, False),
+    ]
+    for name, cpu, events_seen, previous_events_seen, outstanding, previous_dead, dead, streak, wedged in cases:
+        decision = heartbeat_wedge_decision(
+            pid_alive=True,
+            pgroup_cpu=cpu,
+            events_seen=events_seen,
+            previous_events_seen=previous_events_seen,
+            outstanding_count=outstanding,
+            cpu_epsilon_pct=0.1,
+            previous_dead_samples=previous_dead,
+            wedge_samples=3,
+        )
+        assert decision.dead_sample is dead, name
+        assert decision.dead_samples == streak, name
+        assert decision.wedged is wedged, name
 
 
 def _scripted_sampler(values):
@@ -251,6 +276,7 @@ def main() -> None:
     test_busy_silent_worker_classifies_running_quiet()
     test_idle_silent_worker_classifies_wedged()
     test_none_cpu_idle_classifies_wedged()
+    test_heartbeat_dead_sample_decision_table()
     test_cpu_keep_waiting_busy_first_sample_keeps_waiting()
     test_cpu_keep_waiting_all_idle_is_wedged()
     test_cpu_keep_waiting_transient_none_then_busy_keeps_waiting()

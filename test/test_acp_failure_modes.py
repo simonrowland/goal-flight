@@ -22,6 +22,8 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
+import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -32,6 +34,81 @@ from acp_pool import managed_pool  # noqa: E402
 from acp_runner import run_prompt  # noqa: E402
 
 FIXTURE = REPO_ROOT / "test" / "fixtures" / "acp_echo_agent.py"
+
+
+def _write_runner_shim(path: Path, prompt_body: str) -> None:
+    path.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys, time\n"
+        "def send(obj):\n"
+        "    print(json.dumps(obj), flush=True)\n"
+        "for line in sys.stdin:\n"
+        "    try:\n"
+        "        msg = json.loads(line)\n"
+        "    except Exception:\n"
+        "        continue\n"
+        "    method = msg.get('method', '')\n"
+        "    req_id = msg.get('id')\n"
+        "    if method == 'initialize':\n"
+        "        send({'jsonrpc':'2.0','id':req_id,'result':{'protocolVersion':1,'agentInfo':{'name':'wedge-shim','version':'0'},'capabilities':{}}})\n"
+        "    elif method == 'session/new':\n"
+        "        send({'jsonrpc':'2.0','id':req_id,'result':{'sessionId':'s1'}})\n"
+        "    elif method == 'session/prompt':\n"
+        "        sid = msg.get('params',{}).get('sessionId','s1')\n"
+        f"{prompt_body}\n"
+    )
+    path.chmod(0o755)
+
+
+async def _run_goalflight_shim(
+    prompt_body: str,
+    *,
+    idle_timeout: float = 0.0,
+    heartbeat_interval: float = 0.05,
+    wedge_samples: int = 3,
+    max_tool_s: float = 2.0,
+    max_quiet_s: float = 60.0,
+    timeout: float = 5.0,
+) -> tuple[dict, float, str, str, int]:
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        shim = base / "wedge_shim.py"
+        status = base / "status.json"
+        state_dir = base / "state"
+        _write_runner_shim(shim, prompt_body)
+        env = os.environ.copy()
+        env["GOALFLIGHT_STATE_DIR"] = str(state_dir)
+        start = time.monotonic()
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable,
+            str(REPO_ROOT / "scripts" / "goalflight_acp_run.py"),
+            "--agent",
+            str(shim),
+            "--cwd",
+            str(REPO_ROOT),
+            "--prompt-text",
+            "go",
+            "--status-json",
+            str(status),
+            "--idle-timeout",
+            str(idle_timeout),
+            "--heartbeat-interval",
+            str(heartbeat_interval),
+            "--wedge-samples",
+            str(wedge_samples),
+            "--max-tool-s",
+            str(max_tool_s),
+            "--max-quiet-s",
+            str(max_quiet_s),
+            "--json",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+        )
+        stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        elapsed = time.monotonic() - start
+        payload = json.loads(status.read_text())
+        return payload, elapsed, stdout_b.decode(), stderr_b.decode(), proc.returncode
 
 
 async def case_a_worker_killed_mid_prompt() -> None:
@@ -664,6 +741,101 @@ async def case_l_progress_event_during_async_hook_not_dropped() -> None:
         shim_path.unlink(missing_ok=True)
 
 
+async def case_m_heartbeat_wedges_untracked_tool_call_stall() -> None:
+    """Heartbeat wedge detector is independent of idle_timeout."""
+    status, elapsed, _stdout, stderr, rc = await _run_goalflight_shim(
+        "        send({'jsonrpc':'2.0','method':'session/update','params':{'sessionId':sid,'update':{'sessionUpdate':'tool_call','title':'untracked'}}})\n"
+        "        time.sleep(30)\n",
+        idle_timeout=0,
+        heartbeat_interval=0.05,
+        wedge_samples=3,
+        max_tool_s=2.0,
+        timeout=4.0,
+    )
+    assert rc != 0, stderr
+    assert status["state"] == "wedged", status
+    assert status.get("killed_by_heartbeat") is True, status
+    assert elapsed < 2.0, f"heartbeat wedge was not fast: elapsed={elapsed:.3f} status={status}"
+
+
+async def case_n_live_tool_call_grace_survives_silent_gap() -> None:
+    """FIELD CASE: a tracked live tool may be silent past K samples and complete."""
+    status, elapsed, _stdout, stderr, rc = await _run_goalflight_shim(
+        "        send({'jsonrpc':'2.0','method':'session/update','params':{'sessionId':sid,'update':{'sessionUpdate':'tool_call','toolCallId':'tool-live','kind':'fetch','title':'web'}}})\n"
+        "        time.sleep(0.35)\n"
+        "        send({'jsonrpc':'2.0','method':'session/update','params':{'sessionId':sid,'update':{'sessionUpdate':'tool_call_update','toolCallId':'tool-live','status':'completed'}}})\n"
+        "        send({'jsonrpc':'2.0','id':req_id,'result':{'sessionId':sid,'stopReason':'end_turn'}})\n",
+        idle_timeout=0,
+        heartbeat_interval=0.05,
+        wedge_samples=3,
+        max_tool_s=2.0,
+        timeout=4.0,
+    )
+    assert rc == 0, stderr
+    assert status["state"] == "complete", status
+    assert status.get("killed_by_heartbeat") is not True, status
+    assert elapsed >= 0.30, f"test did not stay silent long enough: elapsed={elapsed:.3f}"
+
+
+async def case_o_silent_tool_hits_max_tool_wall() -> None:
+    status, elapsed, _stdout, stderr, rc = await _run_goalflight_shim(
+        "        send({'jsonrpc':'2.0','method':'session/update','params':{'sessionId':sid,'update':{'sessionUpdate':'tool_call','toolCallId':'tool-timeout','kind':'fetch','title':'web'}}})\n"
+        "        time.sleep(30)\n",
+        idle_timeout=0,
+        heartbeat_interval=0.05,
+        wedge_samples=3,
+        max_tool_s=0.2,
+        timeout=4.0,
+    )
+    assert rc != 0, stderr
+    assert status["state"] == "tool_timeout", status
+    assert status.get("error", {}).get("message") == "tool_timeout", status
+    assert status.get("worker_alive") is False, status
+    assert elapsed < 2.0, f"tool timeout was not fast: elapsed={elapsed:.3f} status={status}"
+
+
+async def case_p_reader_overflow_is_result_too_large_and_reaped() -> None:
+    status, _elapsed, _stdout, stderr, rc = await _run_goalflight_shim(
+        "        big = 'x' * (8 * 1024 * 1024 + 100000)\n"
+        "        send({'jsonrpc':'2.0','method':'session/update','params':{'sessionId':sid,'update':{'sessionUpdate':'agent_message_chunk','content':{'text':big}}}})\n"
+        "        time.sleep(30)\n",
+        idle_timeout=0,
+        heartbeat_interval=0.05,
+        wedge_samples=3,
+        max_tool_s=2.0,
+        timeout=6.0,
+    )
+    assert rc != 0, stderr
+    assert status["state"] == "result_too_large", status
+    assert status.get("error", {}).get("message") == "result_too_large", status
+    assert status.get("worker_alive") is False, status
+
+
+async def case_q_busy_tool_hits_max_tool_wall() -> None:
+    """codex 2026-05-20 P1: the per-tool wall must be ABSOLUTE — a tool stuck
+    while BURNING CPU (e.g. a hung retry loop) must still hit max_tool_s, not
+    escape because CPU>epsilon. Same as case_o but the worker spins CPU instead
+    of sleeping. Without the absolute wall the wall would only fire AFTER the
+    busy-loop ends + CPU drops, so the `elapsed` bound is the discriminator."""
+    status, elapsed, _stdout, stderr, rc = await _run_goalflight_shim(
+        "        send({'jsonrpc':'2.0','method':'session/update','params':{'sessionId':sid,'update':{'sessionUpdate':'tool_call','toolCallId':'tool-busy','kind':'fetch','title':'web'}}})\n"
+        "        _end = time.time() + 5.0\n"
+        "        _x = 0\n"
+        "        while time.time() < _end:\n"
+        "            _x += 1\n",
+        idle_timeout=0,
+        heartbeat_interval=0.05,
+        wedge_samples=3,
+        max_tool_s=0.2,
+        timeout=8.0,
+    )
+    assert rc != 0, stderr
+    assert status["state"] == "tool_timeout", status
+    assert status.get("error", {}).get("message") == "tool_timeout", status
+    assert status.get("worker_alive") is False, status
+    assert elapsed < 2.0, f"absolute tool wall did not fire while CPU-busy: elapsed={elapsed:.3f} status={status}"
+
+
 async def main() -> None:
     await case_a_worker_killed_mid_prompt()
     await case_b_pool_shutdown_drains_live_connection()
@@ -677,6 +849,11 @@ async def main() -> None:
     await case_j_handshake_retry_once()
     await case_k_on_idle_async_race_does_not_drop_result()
     await case_l_progress_event_during_async_hook_not_dropped()
+    await case_m_heartbeat_wedges_untracked_tool_call_stall()
+    await case_n_live_tool_call_grace_survives_silent_gap()
+    await case_o_silent_tool_hits_max_tool_wall()
+    await case_p_reader_overflow_is_result_too_large_and_reaped()
+    await case_q_busy_tool_hits_max_tool_wall()
     print("OK: all failure-mode tests pass")
 
 

@@ -46,13 +46,24 @@ AGENT_RSS_MB = {
 # rate-pressure thresholds (not just hardcoded caps)".
 DEFAULT_AGENT_CAPS = {
     "cursor": 5,           # 2026-05-19: cursor model update brought coding
-    "cursor-agent": 5,     # benchmarks on par with Opus; promoted to a
-                           # first-tier code worker alongside codex (parity
-                           # with claude cap at 5).
+    "cursor-agent": 5,     # benchmarks on par with Opus; promoted to a first-tier
+                           # code worker alongside codex. (Stress-tested 2026-05-20:
+                           # 10/10 concurrent ACP dispatches, clean.)
+    # claude-code-cli-acp PTY-drives the interactive Claude TUI and tails the
+    # session transcript with a HARDCODED 120s per-turn timeout (not exposed in
+    # ACP-server mode). 2026-05-20: 4 SIMULTANEOUS dispatches starve each other on
+    # TUI startup (hooks/LSP/keychain/auto-memory/MCP) — even a trivial turn
+    # exceeded 120s (3/4); the SAME 4 with serialized startups ran 4/4. The
+    # contention is STARTUP, not steady-state. goalflight_startup_gate.StartupGate
+    # now serializes the spawn→handshake window for this adapter (handshake-gated,
+    # machine-agnostic — no hardcoded stagger interval), so concurrent TURNS are
+    # safe and the count cap can stay at 5. (`--bare` can't help — it forces
+    # ANTHROPIC_API_KEY, breaking subscription/OAuth auth. For very high Claude
+    # parallelism, the Agent tool is still the native path — no adapter/PTY.)
     "claude": 5,
     "claude-code-cli-acp": 5,
     "codex": 10,
-    "codex-acp": 10,
+    "codex-acp": 10,       # stress-tested 2026-05-20: 49/49 + 13/13 TRUE-simultaneous, zero wedges
     "grok": 10,
 }
 TERMINAL_LEASE_STATES = {
@@ -60,6 +71,9 @@ TERMINAL_LEASE_STATES = {
     "expired",
     "complete",
     "failed",
+    "wedged",
+    "tool_timeout",
+    "result_too_large",
     "blocked",
     "blocked_capacity",
     "blocked_session_limit",

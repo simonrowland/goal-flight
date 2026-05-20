@@ -24,6 +24,13 @@ class LivenessThresholds:
     cpu_epsilon_pct: float = 0.1
 
 
+@dataclass(frozen=True)
+class HeartbeatWedgeDecision:
+    dead_sample: bool
+    dead_samples: int
+    wedged: bool
+
+
 LivenessState = str
 
 
@@ -118,6 +125,38 @@ def classify_liveness(
     if pgroup_cpu is not None and pgroup_cpu > thresholds.cpu_epsilon_pct:
         return "running_quiet"
     return "wedged"
+
+
+def heartbeat_wedge_decision(
+    *,
+    pid_alive: bool,
+    pgroup_cpu: float | None,
+    events_seen: int,
+    previous_events_seen: int,
+    outstanding_count: int,
+    cpu_epsilon_pct: float,
+    previous_dead_samples: int,
+    wedge_samples: int,
+) -> HeartbeatWedgeDecision:
+    """Update heartbeat dead-sample streak and wedge verdict.
+
+    A dead sample is intentionally stricter than the idle-path classifier:
+    unavailable CPU (None) is not treated as idle, because this loop repeats on
+    a short cadence and should avoid false kills from a transient ps failure.
+    """
+    dead_sample = (
+        pid_alive
+        and pgroup_cpu is not None
+        and pgroup_cpu <= cpu_epsilon_pct
+        and events_seen == previous_events_seen
+        and outstanding_count == 0
+    )
+    dead_samples = previous_dead_samples + 1 if dead_sample else 0
+    return HeartbeatWedgeDecision(
+        dead_sample=dead_sample,
+        dead_samples=dead_samples,
+        wedged=dead_samples >= max(1, wedge_samples),
+    )
 
 
 def write_status(path: Path, payload: dict) -> None:
@@ -223,4 +262,3 @@ class IdleLivenessGate:
             # give up so a pathological spinner can't hang the runner forever.
             return False, cpu
         return True, cpu
-

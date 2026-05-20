@@ -82,6 +82,39 @@ runner and watchers use **process-group CPU** as the false-positive killer:
   even though the handshake works in isolation — the runner kills + respawns the
   worker and retries the handshake once before falling back. The wedged worker is
   always reaped first (never retry while an identity-matched PID is still alive).
+- **The heartbeat *acts* (the active backstop, not just a status file).** Beyond
+  the idle-path CPU check above, the concurrent heartbeat kills + finalizes a
+  worker on a *confirmed* wedge even when `--idle-timeout 0` disables the idle
+  gate. A "dead sample" requires ALL of: PID alive, pgroup-CPU ≤ epsilon, event
+  count unchanged since the last beat, and zero outstanding tool calls;
+  `--wedge-samples` consecutive dead samples (default 4) are required before the
+  kill, so a transient `ps` failure or a momentary lull cannot false-positive.
+  Terminal state `wedged`. `--max-quiet-s` (default 3600s) is a second wall for a
+  CPU-busy worker that emits no events at all.
+- **Tool-call grace + an absolute per-tool wall.** A worker that emits a
+  `tool_call` (web search, a long test) then goes silent is I/O-bound at ≈0% CPU
+  — indistinguishable from a wedge by CPU alone. While a tool is outstanding the
+  dead-sample rule is suppressed (it is legitimate work). But a single tool
+  outstanding past `--max-tool-s` (default 1800s) is killed *regardless of CPU* —
+  the wall is absolute, so a CPU-busy or CPU-unsamplable stuck tool still trips
+  it. Terminal state `tool_timeout`.
+- **Oversized result frame.** An ACP frame larger than the asyncio stream limit
+  no longer hangs the reader: it resolves pending requests with a
+  `result_too_large` error and reaps the worker (`kill()` skips the calling task,
+  so the reader can reap its own connection). Terminal state `result_too_large`.
+- **StartupGate for fragile adapters** (`scripts/goalflight_startup_gate.py`).
+  Some adapters starve each other during startup, not steady-state — the Claude
+  TUI adapter blows its hardcoded 120s per-turn timeout on a trivial turn when
+  several spawn at once (TUI init: hooks/LSP/keychain/auto-memory/MCP). The gate
+  serializes the spawn→handshake window per agent via an `flock`. It is
+  *handshake-gated, not a fixed stagger* — the next worker starts the instant the
+  previous one finishes its handshake, on any machine (no interval baselined to
+  one laptop). Default serializes the Claude TUI adapter only (env
+  `GOALFLIGHT_SERIALIZE_STARTUP`); fail-open after 600s so a stuck holder cannot
+  deadlock the fleet; concurrent *turns* stay parallel.
+
+`wedged`, `tool_timeout`, and `result_too_large` are terminal lease states — the
+capacity gate below frees and prunes the slot the same as `complete`/`failed`.
 
 ## Composition rules
 

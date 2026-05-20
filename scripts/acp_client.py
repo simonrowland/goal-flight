@@ -348,9 +348,16 @@ class AcpConnection:
             pass
 
     async def _read_loop(self) -> None:
+        pending_error = {"code": -1, "message": "connection closed"}
         try:
             while True:
-                line = await self.proc.stdout.readline()
+                try:
+                    line = await self.proc.stdout.readline()
+                except (asyncio.LimitOverrunError, ValueError) as e:
+                    pending_error = {"code": -1, "message": "result_too_large"}
+                    log.error("reader loop line exceeded limit: %s", e)
+                    await self.kill()
+                    return
                 if not line:
                     break
                 try:
@@ -412,7 +419,7 @@ class AcpConnection:
         finally:
             for fut in self._pending.values():
                 if not fut.done():
-                    fut.set_result({"error": {"code": -1, "message": "connection closed"}})
+                    fut.set_result({"error": pending_error})
             self._pending.clear()
             for q in self._notification_queues.values():
                 q.put_nowait(None)
@@ -592,7 +599,10 @@ class AcpConnection:
             except (ProcessLookupError, PermissionError):
                 self.proc.kill()
             await self.proc.wait()
+        current = asyncio.current_task()
         for task in (self._reader_task, self._stderr_task):
+            if task is current:
+                continue
             if task and not task.done():
                 task.cancel()
                 try:
