@@ -32,6 +32,7 @@ import re
 import signal
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any, Callable
 
 from goalflight_acp_client import AcpProcessPool
 
@@ -145,6 +146,12 @@ async def managed_pool(
     verbose: bool = False,
     install_signal_handlers: bool = True,
     auto_allow_tools: bool = True,
+    permission_policy: Callable[[Any, list[Any], str | None], str] | None = None,
+    permission_mode: str = "auto",
+    permission_dir: Any = None,
+    permission_inline_timeout_s: float | None = None,
+    permission_user_timeout_s: float | None = None,
+    context_mode: bool = True,
     idle_cleanup_ttl_seconds: float | None = DEFAULT_IDLE_TTL_SECONDS,
     idle_cleanup_interval_seconds: float = DEFAULT_IDLE_CHECK_INTERVAL,
 ) -> AsyncIterator[AcpProcessPool]:
@@ -164,14 +171,68 @@ async def managed_pool(
     re-raise so the controller sees the signal as intended (KeyboardInterrupt
     on SIGINT, SystemExit-equivalent on SIGTERM).
 
-    auto_allow_tools: defaults to True here because the goal-flight controller
-    is the user-facing surface and decides per-chunk whether a tool call is
-    acceptable BEFORE dispatching; once a chunk is dispatched, every tool the
-    worker requests is in-scope by construction. The AcpProcessPool default
-    (False) is appropriate for chat-bridge use where each tool call is its own
-    user-interaction event. Pass auto_allow_tools=False here explicitly only
-    if you want the worker to hang on session/request_permission for diagnostic
-    purposes.
+    auto_allow_tools: defaults to True here so the controller-as-auto-mode
+    permission ROUTER is active: in-scope requests (in-worktree work,
+    in-workspace MCP/elicitation) are auto-allowed so the worker perceives no
+    delay, while boundary crossings (out-of-worktree targets, network/fetch) are
+    ESCALATED to the user. False makes the controller auto-DENY every request
+    (clean DeniedOutcome(cancelled) — the worker cancels the gated call and
+    continues rather than wedging; older builds raised method_not_found here,
+    which hung permission-gating adapters). Either way the request is answered
+    promptly, so the worker never wedges on the permission channel.
+
+    permission_policy: optional decision function
+    (tool_call, options, cwd) -> "allow" | "deny" | "escalate" that overrides the
+    scope-aware default, letting the controller fold in chunk SCOPE/FORBIDDEN and
+    re-dispatch decisions. Escalations surface to the controller via the runner's
+    permission_pending status (see GoalflightClient.request_permission).
+
+    permission_mode: escalation TRANSPORT. "auto" (default) answers an escalated
+    request with a cancel immediately and surfaces it via permission_pending
+    (USER-CONFIRM -> re-dispatch). "inline" HOLDS the worker's permission open and
+    authorizes it IN PLACE -- it never re-dispatches. The handler publishes a
+    request file under permission_dir and the controller answers via
+    goalflight_acp_permits. Two-phase, awake-time timeout (active_monotonic, so a
+    laptop sleep does not consume the budget):
+      - controller window (permission_inline_timeout_s, ~3 min): if the controller
+        neither acks nor decides, AUTO-DECLINE -- the worker is denied that one
+        tool and CONTINUES its turn (surfaced informationally in
+        result.permission_auto_declined, reason "controller_timeout"). This is the
+        resilience escape hatch: a rate-limited / crashed / asleep controller never
+        blocks a worker that runs on its own provider.
+      - user window (permission_user_timeout_s, ~10h): once the controller writes
+        an ACK (write_ack -- "I'm asking the user"), the deadline extends so the
+        worker waits for the human (coffee break). Expiry -> auto-decline, reason
+        "user_timeout". A write_decision (allow/deny) ends either phase at once.
+    Inline needs the router (auto_allow_tools=True) and a relay draining
+    permission_dir.
+
+    CONTROLLER CONTRACT for inline mode (the ~3 min controller window assumes it):
+      1. POLL every turn: run permits.list_requests(permission_dir) at the top of
+         each loop iteration while any inline worker is active. It is FILE IPC --
+         the request is not a Claude message, so stacked user input cannot bury it
+         in a queue; each queued message is its own turn, so you still poll on each.
+      2. ACK FIRST, decide second: on a request you cannot auto-decide instantly,
+         permits.write_ack(dir, key) immediately (a one-line file that flips the
+         worker to the ~10h window), THEN present to the user / decide, THEN
+         write_decision. The 3 min bar is "controller gets ONE turn", not "fully
+         decides".
+      3. BACKGROUND all >10s work so turns stay frequent and the poll cadence stays
+         well under the controller window.
+      4. If unavailable anyway (rate-limited / asleep), the worker auto-declines and
+         continues; on recovery, re-dispatch just the declined action from the
+         worker's permission_auto_declined.
+
+    permission_dir: directory for inline request/decision/ack files. Defaults (in
+    GoalflightClient) to $GOAL_FLIGHT_PERMISSION_DIR or a PID-scoped temp dir; pass
+    an explicit path when the relay runs in a DIFFERENT process than the worker (so
+    both sides agree on the location). Ignored in "auto" mode.
+
+    permission_inline_timeout_s: controller-responsiveness window -- awake-seconds
+    to wait for an ack-or-decision before auto-declining (default 180 = 3 min).
+
+    permission_user_timeout_s: post-ack user-decision window -- awake-seconds to
+    wait for the user's decision after the controller acks (default 36000 = 10h).
 
     idle_cleanup_ttl_seconds: connections with last_active older than this are
     reaped by a background task. Defaults to 300s (5 min). Critical for long
@@ -193,6 +254,12 @@ async def managed_pool(
         max_processes=max_processes,
         verbose=verbose,
         auto_allow_tools=auto_allow_tools,
+        permission_policy=permission_policy,
+        permission_mode=permission_mode,
+        permission_dir=permission_dir,
+        permission_inline_timeout_s=permission_inline_timeout_s,
+        permission_user_timeout_s=permission_user_timeout_s,
+        context_mode=context_mode,
     )
     pool.cleanup_ghosts()  # reap any orphans from a prior controller run
 

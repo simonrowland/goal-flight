@@ -81,6 +81,9 @@ def agent_command(agent: str) -> tuple[str, list[str]]:
         return "cursor-agent", ["acp"]
     if agent == "claude":
         return "claude-code-cli-acp", []
+    # codex-acp needs the MCP-elicitation flag, but it is injected at the single
+    # spawn boundary (ensure_codex_acp_elicitation, called by spawn_acp_connection)
+    # so it covers pool/custom callers too -- not only this runner helper.
     return agent, []
 
 
@@ -159,6 +162,11 @@ async def spawn_and_handshake_with_retry(
     auto_allow_tools: bool = True,
     activity: AcpLivenessActivity | None = None,
     on_attempt: Callable[[int, asyncio.subprocess.Process], Any] | None = None,
+    context_mode: bool = True,
+    permission_mode: str = "auto",
+    permission_dir: str | None = None,
+    permission_inline_timeout_s: float | None = None,
+    permission_user_timeout_s: float | None = None,
 ) -> tuple[asyncio.subprocess.Process, AcpConnection]:
     """Spawn the worker and run the ACP handshake, retrying once on AcpError.
 
@@ -187,6 +195,11 @@ async def spawn_and_handshake_with_retry(
             cwd=cwd,
             auto_allow_tools=auto_allow_tools,
             activity=activity,
+            context_mode=context_mode,
+            permission_mode=permission_mode,
+            permission_dir=permission_dir,
+            permission_inline_timeout_s=permission_inline_timeout_s,
+            permission_user_timeout_s=permission_user_timeout_s,
         )
         proc = conn.proc
         if on_attempt is not None:
@@ -367,14 +380,16 @@ async def run(args: argparse.Namespace) -> dict:
             dropped_frames = int(snapshot.get("dropped_frames", 0))
             quiet_for_s = float(snapshot["quiet_for_s"])
             progress_quiet_s = float(snapshot["progress_quiet_for_s"])
-            timed_out_tool = activity.timed_out(now_mono, args.max_tool_s)
             pid_alive = proc.returncode is None
-            # Per-tool wall is ABSOLUTE: a tool outstanding longer than
-            # --max-tool-s is stuck regardless of CPU (it may be CPU-busy in a
-            # hung retry loop, or CPU may be unsamplable). Gating it on CPU≤ε
-            # would let those hang forever (codex 2026-05-20 P1). The grace
-            # (don't wedge while a tool is outstanding) still applies UP TO the
-            # wall; past it, the tool itself is the wedge.
+            # Absolute per-tool wall is checked EVERY tick, BEFORE the inline-hold
+            # short-circuit, so the max_tool_s backstop for a never-answered inline
+            # hold (added to activity.timed_out) is actually reachable. A tool (or
+            # held permission) outstanding longer than --max-tool-s is stuck
+            # regardless of CPU (it may be CPU-busy in a hung retry loop, or CPU may
+            # be unsamplable). Gating it on CPU≤ε would let those hang forever
+            # (codex 2026-05-20 P1). The grace (don't wedge while a tool is
+            # outstanding) still applies UP TO the wall; past it, it's the wedge.
+            timed_out_tool = activity.timed_out(now_mono, args.max_tool_s)
             if timed_out_tool is not None and pid_alive:
                 tool_id, age_s = timed_out_tool
                 await mark_heartbeat_terminal(
@@ -388,6 +403,25 @@ async def run(args: argparse.Namespace) -> dict:
                 )
                 await conn.kill()
                 return
+            if activity.has_inline_holds() and pid_alive:
+                # The inline permission router is holding a request open awaiting a
+                # controller/user decision (permission_mode="inline"). The worker is
+                # paused by design; publish a visible state and skip the SILENCE-class
+                # wedge checks (progress stall / max_quiet / CPU dead-samples) this
+                # tick -- but NOT the absolute max_tool_s wall above, and the
+                # handler's own inline timeout + finally-release still bound the hold.
+                await update_status(
+                    state="awaiting_permission",
+                    worker_pid=proc.pid,
+                    pgid=pgid,
+                    worker_alive=pid_alive,
+                    pgroup_cpu_pct=cpu_pct,
+                    inline_held=int(snapshot.get("inline_held", 0)),
+                    outstanding_tool_calls=outstanding_count,
+                    heartbeat_at=_now(),
+                )
+                await asyncio.sleep(args.heartbeat_interval)
+                continue
             if progress_stall_decision(
                 pid_alive=pid_alive,
                 progress_quiet_s=progress_quiet_s,
@@ -528,6 +562,11 @@ async def run(args: argparse.Namespace) -> dict:
                 cwd=args.cwd,
                 activity=activity,
                 on_attempt=mark_attempt,
+                context_mode=(getattr(args, "context_mode", "enabled") != "disabled"),
+                permission_mode=getattr(args, "permission_mode", "auto"),
+                permission_dir=getattr(args, "permission_dir", None),
+                permission_inline_timeout_s=getattr(args, "permission_inline_timeout_s", None),
+                permission_user_timeout_s=getattr(args, "permission_user_timeout_s", None),
             )
         with contextlib.redirect_stdout(io.StringIO()):
             goalflight_ledger.cmd_record(
@@ -587,6 +626,15 @@ async def run(args: argparse.Namespace) -> dict:
             "last_marker": {kind: values[-1] for kind, values in markers.items() if values} or None,
             "text_excerpt": result.text[-4000:],
             "out_of_scope_writes": result.out_of_scope_writes,
+            # Permission requests the controller router escalated to the user
+            # (boundary crossings it would not auto-allow). state is "blocked"
+            # (marker USER-CONFIRM); the controller surfaces these, gets a user
+            # decision, and re-dispatches. None when nothing was escalated.
+            "permission_pending": result.permission_escalations or None,
+            # Informational -- inline permissions the controller auto-declined on
+            # timeout; the worker continued without the tool (no re-dispatch).
+            # Does NOT change state.
+            "permission_auto_declined": result.permission_auto_declined or None,
             # Reconcile the heartbeat flags with the FINAL verdict. A tail-race
             # heartbeat may have written killed/wedged into the payload before
             # decide_terminal_state ruled the turn complete on a genuine
@@ -674,6 +722,54 @@ def main(argv: list[str] | None = None) -> int:
              "(rely on PID liveness + the worker's terminal marker instead).",
     )
     parser.add_argument("--status-json")
+    parser.add_argument(
+        "--context-mode",
+        choices=["enabled", "disabled"],
+        default="enabled",
+        help="codex-acp only: whether the context-mode MCP server is active for "
+             "this worker. 'enabled' (default) routes its elicitation through the "
+             "ACP permission channel (auto-approved when in-scope); 'disabled' "
+             "turns context-mode off for this dispatch entirely (no MCP "
+             "elicitation surface). No effect on other adapters.",
+    )
+    parser.add_argument(
+        "--permission-mode",
+        choices=["auto", "inline"],
+        default="auto",
+        help="Escalation transport for boundary-crossing permission requests. "
+             "'auto' (default): answer with a cancel and surface permission_pending "
+             "(USER-CONFIRM -> re-dispatch). 'inline': HOLD the worker open and "
+             "authorize in place via the --permission-dir file IPC (an orchestrator "
+             "drains the dir, optionally write_ack to defer to the user, writes a "
+             "decision) -- it never re-dispatches. Two-phase awake-time timeout: if "
+             "no ack/decision within --permission-inline-timeout-s, or no decision "
+             "within --permission-user-timeout-s after an ack, the worker "
+             "auto-declines that tool and CONTINUES. Inline across processes "
+             "REQUIRES an explicit --permission-dir both sides share.",
+    )
+    parser.add_argument(
+        "--permission-dir",
+        default=None,
+        help="Directory for inline permission request/decision files. Default: "
+             "$GOAL_FLIGHT_PERMISSION_DIR or a PID-scoped temp dir (only "
+             "discoverable in-process). Set explicitly so a separate orchestrator "
+             "relay can find this worker's requests. No effect in 'auto' mode.",
+    )
+    parser.add_argument(
+        "--permission-inline-timeout-s",
+        type=float,
+        default=None,
+        help="Inline mode controller-responsiveness window: max awake-seconds to "
+             "hold a permission waiting for the controller to ack-or-decide before "
+             "auto-declining (worker continues; default 180 = 3 min). No effect in "
+             "'auto' mode.",
+    )
+    parser.add_argument(
+        "--permission-user-timeout-s", type=float, default=None,
+        help="Inline mode: after the controller ACKs a permission (defer-to-user), "
+             "max awake-seconds to wait for the user's decision before auto-declining "
+             "(default 36000 = 10h). No effect in 'auto' mode.",
+    )
     parser.add_argument(
         "--heartbeat-interval",
         type=float,

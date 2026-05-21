@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 import inspect
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import signal
@@ -21,6 +22,7 @@ import threading
 import time
 from typing import Any, Callable, Protocol
 
+import goalflight_acp_permits as permits
 from goalflight_liveness import active_monotonic
 
 
@@ -29,6 +31,22 @@ log = logging.getLogger("goal-flight.acp_client")
 _VERSION = "0.4.5-sdk"
 DEFAULT_ACP_LIMIT = 32 * 1024 * 1024
 DEFAULT_PERMISSION_TIMEOUT_S = 30.0
+# Inline permission mode, phase 1: controller-responsiveness window. How long the
+# worker HOLDS its ACP permission open (awake-time) waiting for the controller to
+# ack OR decide before AUTO-DECLINING (deny + worker continues, no re-dispatch).
+# 3 min assumes the controller polls+acks each turn (see acp_pool.managed_pool
+# "CONTROLLER CONTRACT"); short enough that a rate-limited/asleep controller never
+# blocks a worker on its own provider, long enough for the controller to get a turn.
+DEFAULT_INLINE_PERMISSION_TIMEOUT_S = 180.0
+# Post-ACK user-decision window (awake-time): how long the worker waits for the
+# human after the controller acks, before auto-declining. Long by design (a
+# coffee break); still bounded so a forgotten ack can't hold a slot forever.
+DEFAULT_USER_PERMISSION_TIMEOUT_S = 36000.0  # 10h
+INLINE_PERMISSION_POLL_S = 0.5
+INLINE_HOLD_GRACE_S = 30.0
+PERMISSION_MODE_AUTO = "auto"
+PERMISSION_MODE_INLINE = "inline"
+_PERMISSION_MODES = (PERMISSION_MODE_AUTO, PERMISSION_MODE_INLINE)
 TERMINAL_TOOL_STATUSES = {"completed", "failed", "cancelled"}
 WEDGE_PROGRESS_KINDS = {
     "agent_message_chunk",
@@ -319,6 +337,14 @@ class AcpLivenessActivity:
     last_event_kind: str | None = None
     outstanding_tools: dict[str, float] = field(default_factory=dict)
     pending_permissions: dict[str, float] = field(default_factory=dict)
+    # Permissions the inline router is deliberately HOLDING open while it asks the
+    # controller/user (permission_mode="inline"). Tracked separately from
+    # pending_permissions because the semantics differ: a held inline permission
+    # is healthy (the worker is intentionally paused), so it counts toward
+    # outstanding_count (granting the heartbeat's silence grace) but is EXEMPT
+    # from the short permission_timeout_s expiry. Each value is the hold's own
+    # deadline; a stuck hold is reaped only after that deadline plus grace.
+    inline_held_permissions: dict[str, float] = field(default_factory=dict)
     dropped_frames: int = 0
 
     def note_message(self, message: dict[str, Any], now: float | None = None) -> str:
@@ -361,6 +387,26 @@ class AcpLivenessActivity:
         elif self.pending_permissions:
             self.pending_permissions.clear()
 
+    def hold_inline_permission(self, tool_id: str, deadline: float) -> None:
+        """Mark a permission as held-open by the inline router (healthy pause)."""
+        if tool_id:
+            self.inline_held_permissions.setdefault(tool_id, deadline)
+
+    def extend_inline_hold(self, tool_id: str, deadline: float) -> None:
+        """Push out an existing inline hold's deadline (controller acked; the worker
+        is now waiting on the user). No-op if the hold isn't tracked."""
+        if tool_id and tool_id in self.inline_held_permissions:
+            self.inline_held_permissions[tool_id] = deadline
+
+    def release_inline_permission(self, tool_id: str | None = None) -> None:
+        if tool_id:
+            self.inline_held_permissions.pop(tool_id, None)
+        elif self.inline_held_permissions:
+            self.inline_held_permissions.clear()
+
+    def has_inline_holds(self) -> bool:
+        return bool(self.inline_held_permissions)
+
     def _prune_permissions(self, now: float) -> None:
         if self.permission_timeout_s <= 0:
             self.pending_permissions.clear()
@@ -378,7 +424,11 @@ class AcpLivenessActivity:
         ]
 
     def outstanding_count(self, now: float | None = None) -> int:
-        return len(self.outstanding_tools) + len(self.pending_permissions)
+        return (
+            len(self.outstanding_tools)
+            + len(self.pending_permissions)
+            + len(self.inline_held_permissions)
+        )
 
     def timed_out(self, now: float, max_tool_s: float) -> tuple[str, float] | None:
         expired_permissions = self._expired_permissions(now)
@@ -387,10 +437,15 @@ class AcpLivenessActivity:
             for expired_id, _ in expired_permissions:
                 self.pending_permissions.pop(expired_id, None)
             return tool_id, now - started_at
-        if max_tool_s <= 0:
-            return None
         if self.permission_timeout_s <= 0:
             self.pending_permissions.clear()
+        for tool_id, deadline in list(self.inline_held_permissions.items()):
+            age_past_deadline = now - deadline
+            if now >= deadline + INLINE_HOLD_GRACE_S:
+                self.inline_held_permissions.pop(tool_id, None)
+                return tool_id, age_past_deadline
+        if max_tool_s <= 0:
+            return None
         for tool_id, started_at in self.outstanding_tools.items():
             age = now - started_at
             if age >= max_tool_s:
@@ -411,6 +466,7 @@ class AcpLivenessActivity:
             "quiet_for_s": now - self.last_event_mono,
             "progress_quiet_for_s": now - self.last_progress_mono,
             "outstanding_count": self.outstanding_count(now),
+            "inline_held": len(self.inline_held_permissions),
             "dropped_frames": self.dropped_frames,
         }
 
@@ -465,6 +521,138 @@ class GuardedStreamReader(asyncio.StreamReader):
                 return
 
 
+def _tc_get(obj: Any, *names: str) -> Any:
+    """Read a field from an ACP tool_call/location that may be an SDK object OR a
+    raw dict (snake_case and camelCase keys). Returns the first present value, so
+    the policy behaves the same whether codex-acp sent a typed object (prod) or a
+    dict reaches us (tests, future transports)."""
+    for name in names:
+        if isinstance(obj, dict):
+            if name in obj and obj[name] is not None:
+                return obj[name]
+        else:
+            val = getattr(obj, name, None)
+            if val is not None:
+                return val
+    return None
+
+
+def _tool_call_locations(tool_call: Any) -> list[str]:
+    """Path strings from an ACP ToolCall/ToolCallUpdate ``locations`` array
+    (each entry is {path, line?}), tolerating both SDK objects and dicts."""
+    out: list[str] = []
+    for loc in _tc_get(tool_call, "locations") or []:
+        path = _tc_get(loc, "path")
+        if path:
+            out.append(str(path))
+    return out
+
+
+def _path_outside_cwd(raw: str, root: Path) -> bool:
+    """True if ``raw`` is NOT within ``root`` (already ``Path(cwd).resolve()``)
+    after symlink resolution -- the same resolve()+is_relative_to test the
+    existing scope-leak audit (_scan_out_of_scope_paths) uses. Resolving BOTH
+    sides makes a symlink cwd and a symlink-inside-cwd escape compare
+    consistently (no case/spelling mismatch from mixing resolved vs lexical
+    forms). Relative paths resolve against root. Fails CLOSED: an
+    unresolvable/uncomparable path is treated as outside (escalate), never
+    silently in-scope."""
+    try:
+        p = Path(raw)
+        if not p.is_absolute():
+            p = root / p
+        return not p.resolve().is_relative_to(root)
+    except (OSError, ValueError, RuntimeError):
+        return True  # cannot classify -> fail closed (escalate)
+
+
+def _targets_outside_cwd(tool_call: Any, cwd: str | None) -> list[str]:
+    """Location paths that are NOT PROVABLY inside the worker's cwd (the worktree
+    sandbox). Relative paths resolve against cwd. Fails CLOSED: when there are
+    located targets but no usable boundary (cwd empty/unresolvable), EVERY target
+    counts as outside -- we cannot prove in-scope, so we escalate rather than
+    silently allow. No locations -> nothing to prove -> empty (benign)."""
+    locs = _tool_call_locations(tool_call)
+    if not locs:
+        return []
+    if not cwd:
+        return list(locs)  # no boundary to prove against -> fail closed
+    try:
+        root = Path(cwd).resolve()
+    except (OSError, ValueError, TypeError):
+        return list(locs)  # unresolvable cwd -> fail closed
+    return [raw for raw in locs if _path_outside_cwd(raw, root)]
+
+
+def _same_dir(a: str | None, b: str | None) -> bool:
+    """True if a and b resolve to the same directory. Fail-safe: unknown/
+    unresolvable -> False (rebuild rather than reuse a wrong-cwd worker).
+    Compares realpath at call time; assumes cwd is a stable directory, not a
+    symlink retargeted mid-session (goal-flight cwds are worktrees, not mutable
+    symlinks)."""
+    if not a or not b:
+        return False
+    try:
+        return os.path.realpath(a) == os.path.realpath(b)
+    except OSError:
+        return False
+
+
+# Permission router decisions. The controller (this client) auto-allows obvious
+# in-scope work so the worker perceives no delay, denies hardcoded-dangerous
+# operations, and ESCALATES genuinely boundary-crossing requests to the user.
+PERMISSION_ALLOW = "allow"
+PERMISSION_DENY = "deny"
+PERMISSION_ESCALATE = "escalate"
+
+# Tool kinds that MODIFY state (ACP ToolKind). A write-like permission whose
+# targets we cannot see (no locations) cannot be proven in-worktree -> escalate.
+_WRITE_KINDS = frozenset({"edit", "delete", "move"})
+_READ_SAFE_KINDS = frozenset({"", "read", "search", "think"})
+
+
+def default_permission_policy(tool_call: Any, options: list[Any], cwd: str | None) -> str:
+    """Scope-aware default permission policy (controller-as-auto-mode router).
+
+    Auto-allow only bounded in-worktree writes and read-safe/no-side-effect kinds.
+    Escalate shell/network side effects (execute/fetch), unknown/future kinds, and
+    writes whose targets cannot be proven in-worktree. This is a fail-closed
+    allowlist:
+      - any tool target NOT provably inside cwd          -> escalate
+      - fetch / execute                                 -> escalate
+      - edit/delete/move with in-cwd locations          -> allow
+      - edit/delete/move with NO locations              -> escalate
+      - "", read, search, think                         -> allow
+      - other / switch_mode / unknown                   -> escalate
+
+    Returns PERMISSION_ALLOW / PERMISSION_ESCALATE (a custom policy may also
+    return PERMISSION_DENY). Replaceable per-dispatch via
+    GoalflightClient(permission_policy=...) so the orchestrator can fold in chunk
+    SCOPE/FORBIDDEN and re-dispatch decisions.
+
+    NOTE (deliberate): a kindless request with no locations (kind == "") is
+    AUTO-ALLOWED -- this is the shape of an in-workspace MCP elicitation (e.g.
+    context-mode ctx_index 'Approve Index Content'), auto-allowed so the worker
+    does not wedge. The residual risk (a misbehaving / non-codex adapter sending
+    a state-changing action with NO kind AND NO locations would also auto-allow;
+    codex-acp never does -- its edits carry kind+locations) is accepted and
+    bounded by (a) a custom permission_policy for security-strict deployments and
+    (b) the worker's OS sandbox. To fail closed on kindless, supply a policy that
+    escalates when kind == "".
+    """
+    if _targets_outside_cwd(tool_call, cwd):
+        return PERMISSION_ESCALATE
+    kind = str(_tc_get(tool_call, "kind") or "")
+    locations = _tool_call_locations(tool_call)
+    if kind in {"fetch", "execute"}:
+        return PERMISSION_ESCALATE
+    if kind in _WRITE_KINDS:
+        return PERMISSION_ESCALATE if not locations else PERMISSION_ALLOW
+    if kind in _READ_SAFE_KINDS:
+        return PERMISSION_ALLOW
+    return PERMISSION_ESCALATE
+
+
 class GoalflightClient(ClientBase):  # type: ignore[misc, valid-type]
     def __init__(
         self,
@@ -472,11 +660,91 @@ class GoalflightClient(ClientBase):  # type: ignore[misc, valid-type]
         activity: AcpLivenessActivity | None = None,
         auto_allow_tools: bool = True,
         turn_queue: asyncio.Queue[dict[str, Any]] | None = None,
+        cwd: str | None = None,
+        permission_policy: Callable[[Any, list[Any], str | None], str] | None = None,
+        permission_mode: str = PERMISSION_MODE_AUTO,
+        permission_dir: str | os.PathLike[str] | None = None,
+        permission_inline_timeout_s: float | None = None,
+        permission_user_timeout_s: float | None = None,
     ) -> None:
         self.activity = activity or AcpLivenessActivity()
         self.auto_allow_tools = auto_allow_tools
         self.turn_queue = turn_queue
         self.typed_updates: list[dict[str, Any]] = []
+        # Permission router: cwd defines the worktree boundary; permission_policy
+        # is the controller's decision function (default = scope-aware). Escalated
+        # requests are recorded here for the runner to surface to the user.
+        # A plain list is safe (no lock): request_permission (the appender) and
+        # run_prompt (the reader/clearer) both run as coroutines on the SAME
+        # asyncio event loop -- the acp SDK dispatches requests via asyncio tasks,
+        # not a worker thread -- so append/list/clear never interleave mid-call.
+        self.cwd = cwd
+        self.permission_policy = permission_policy
+        self.permission_escalations: list[dict[str, Any]] = []
+        # Requests the controller auto-declined because it did not answer the
+        # inline hold in time (or the IPC failed). Informational only -- the
+        # worker was given a deny and CONTINUED; this does NOT trigger re-dispatch.
+        self.permission_auto_declined: list[dict[str, Any]] = []
+        # Escalation TRANSPORT. "auto" (default): an escalated request is answered
+        # with a cancel immediately and surfaced via permission_escalations ->
+        # USER-CONFIRM -> re-dispatch. "inline": HOLD the request open, publish it
+        # via file IPC (goalflight_acp_permits), poll for the controller's decision,
+        # and return the real outcome IN PLACE -- it never re-dispatches. Two-phase
+        # awake-time timeout: controller window (permission_inline_timeout_s) then,
+        # on a controller ack, user window (permission_user_timeout_s); each expiry
+        # AUTO-DECLINES (deny + the worker continues, recorded in
+        # permission_auto_declined). Inline requires the router
+        # (auto_allow_tools=True); with auto_allow_tools=False every request is
+        # denied before the router runs.
+        self.permission_mode = (
+            permission_mode if permission_mode in _PERMISSION_MODES else PERMISSION_MODE_AUTO
+        )
+        self.permission_dir = (
+            permits.permission_dir(permission_dir)
+            if self.permission_mode == PERMISSION_MODE_INLINE
+            else None
+        )
+        if permission_inline_timeout_s is None:
+            self.permission_inline_timeout_s = DEFAULT_INLINE_PERMISSION_TIMEOUT_S
+        else:
+            try:
+                inline_timeout = float(permission_inline_timeout_s)
+            except (TypeError, ValueError):
+                log.warning(
+                    "invalid inline permission timeout %r; using default %.0fs",
+                    permission_inline_timeout_s,
+                    DEFAULT_INLINE_PERMISSION_TIMEOUT_S,
+                )
+                inline_timeout = DEFAULT_INLINE_PERMISSION_TIMEOUT_S
+            if not math.isfinite(inline_timeout) or inline_timeout <= 0:
+                log.warning(
+                    "invalid inline permission timeout %r; using default %.0fs",
+                    permission_inline_timeout_s,
+                    DEFAULT_INLINE_PERMISSION_TIMEOUT_S,
+                )
+                inline_timeout = DEFAULT_INLINE_PERMISSION_TIMEOUT_S
+            self.permission_inline_timeout_s = inline_timeout
+        if permission_user_timeout_s is None:
+            self.permission_user_timeout_s = DEFAULT_USER_PERMISSION_TIMEOUT_S
+        else:
+            try:
+                user_timeout = float(permission_user_timeout_s)
+            except (TypeError, ValueError):
+                log.warning(
+                    "invalid user permission timeout %r; using default %.0fs",
+                    permission_user_timeout_s,
+                    DEFAULT_USER_PERMISSION_TIMEOUT_S,
+                )
+                user_timeout = DEFAULT_USER_PERMISSION_TIMEOUT_S
+            if not math.isfinite(user_timeout) or user_timeout <= 0:
+                log.warning(
+                    "invalid user permission timeout %r; using default %.0fs",
+                    permission_user_timeout_s,
+                    DEFAULT_USER_PERMISSION_TIMEOUT_S,
+                )
+                user_timeout = DEFAULT_USER_PERMISSION_TIMEOUT_S
+            self.permission_user_timeout_s = user_timeout
+        self.permission_inline_poll_s = INLINE_PERMISSION_POLL_S
 
     def set_turn_queue(self, queue: asyncio.Queue[dict[str, Any]] | None) -> None:
         self.turn_queue = queue
@@ -489,28 +757,232 @@ class GoalflightClient(ClientBase):  # type: ignore[misc, valid-type]
         if self.turn_queue is not None:
             self.turn_queue.put_nowait({"source": "observer", "kind": kind, "message": message})
 
+    @staticmethod
+    def _select_allow_option(options: list[Any]) -> str | None:
+        """Pick the option id to auto-grant, or None if none is grantable.
+
+        Prefer the least-privilege ALLOW (allow_once > allow_always), then ANY
+        allow-like kind (covers future allow_* kinds), in offered order.
+        NEVER auto-select a ``reject_*`` option: real adapters send e.g.
+        codex-acp's ``[allow_once 'approved', reject_once 'abort']`` (no
+        allow_always), and a worker may offer them reject-first -- the old
+        ``options[0]`` fallback would then turn an auto-allow into an auto-DENY.
+        Returns None when only reject options exist; the caller then cancels
+        cleanly (still a definitive answer, so the worker never wedges).
+        """
+        opts = list(options or [])
+        for pref in ("allow_once", "allow_always"):
+            for opt in opts:
+                if _tc_get(opt, "kind") == pref:
+                    option_id = _tc_get(opt, "option_id", "optionId")
+                    if option_id:
+                        return option_id
+        for opt in opts:
+            kind = _tc_get(opt, "kind")
+            option_id = _tc_get(opt, "option_id", "optionId")
+            # Fail closed: only an explicit allow_* kind may be auto-granted (this
+            # catches any future allow_* beyond allow_always/allow_once). A
+            # kindless or unknown kind -- cancel / defer / deny_once / ... -- must
+            # NOT be treated as allow-like, or an auto-allow could approve a deny
+            # variant. Those fall through to a clean DeniedOutcome(cancelled).
+            if option_id and kind is not None and str(kind).startswith("allow"):
+                return option_id
+        return None
+
     async def request_permission(self, options: list[Any], session_id: str, tool_call: Any, **kwargs: Any) -> Any:
-        tool_id = getattr(tool_call, "tool_call_id", None) or getattr(tool_call, "id", None)
-        if not self.auto_allow_tools:
-            raise RequestError.method_not_found("session/request_permission")
-        chosen_id: str | None = None
-        for kind_pref in ("allow_always", "allow_once"):
-            for opt in options or []:
-                if getattr(opt, "kind", None) == kind_pref:
-                    chosen_id = getattr(opt, "option_id", None)
-                    break
-            if chosen_id:
-                break
-        if not chosen_id and options:
-            chosen_id = getattr(options[0], "option_id", None)
+        tool_id = _tc_get(tool_call, "tool_call_id", "toolCallId", "id")
+        # Always clear pending-permission liveness tracking: we ARE answering the
+        # request, on every path below (grant OR deny).
         self.activity.resolve_permission(str(tool_id) if tool_id else None)
-        if chosen_id:
-            log.info("auto-allow permission: %s -> optionId=%s", getattr(tool_call, "title", "?"), chosen_id)
-            return RequestPermissionResponse(
-                outcome=AllowedOutcome(outcome="selected", option_id=chosen_id)
-            )
-        log.warning("auto-allow permission request had no selectable options; cancelling")
+        if not self.auto_allow_tools:
+            # Deny cleanly rather than raising method_not_found. method_not_found
+            # advertises "this client has no permission method at all", and some
+            # adapters (the 0.3.0-era codex-acp) then HANG on the unanswered gate
+            # -- the "every worker hangs on its first tool call" regression. A
+            # DeniedOutcome is a definitive answer: the worker cancels the gated
+            # call and proceeds/fails instead of wedging. auto_allow_tools=False
+            # means "do not auto-grant", which is exactly a deny.
+            return RequestPermissionResponse(outcome=DeniedOutcome(outcome="cancelled"))
+        # Controller-as-auto-mode router: decide allow / deny / escalate. The
+        # decision must ALWAYS resolve the (synchronous) request promptly so the
+        # worker never wedges on the permission channel -- escalation answers with
+        # a cancel and is surfaced to the user out-of-band (runner -> blocked ->
+        # USER-CONFIRM -> re-dispatch), never by holding the request open.
+        policy = self.permission_policy or default_permission_policy
+        title = _tc_get(tool_call, "title") or "?"
+        try:
+            decision = policy(tool_call, options, self.cwd)
+        except Exception:
+            log.exception("permission policy raised for %s; escalating", title)
+            decision = PERMISSION_ESCALATE
+        if decision == PERMISSION_ALLOW:
+            chosen_id = self._select_allow_option(options)
+            if chosen_id:
+                log.info("auto-allow permission (in scope): %s -> optionId=%s", title, chosen_id)
+                return RequestPermissionResponse(
+                    outcome=AllowedOutcome(outcome="selected", option_id=chosen_id)
+                )
+            log.warning("permission allow but no allow option offered (%s); cancelling", title)
+            return RequestPermissionResponse(outcome=DeniedOutcome(outcome="cancelled"))
+        if decision == PERMISSION_ESCALATE:
+            record = {
+                "key": permits.make_key(session_id, str(tool_id) if tool_id else None),
+                "tool_call_id": str(tool_id) if tool_id else None,
+                "session_id": session_id,
+                "title": title,
+                "kind": _tc_get(tool_call, "kind"),
+                "cwd": self.cwd,
+                "targets_outside_cwd": _targets_outside_cwd(tool_call, self.cwd),
+                "options": [
+                    {"kind": _tc_get(o, "kind"), "option_id": _tc_get(o, "option_id", "optionId")}
+                    for o in (options or [])
+                ],
+            }
+            if self.permission_mode == PERMISSION_MODE_INLINE:
+                # HOLD the request open and authorize it IN PLACE via the controller
+                # (file IPC). Returns a definitive outcome on EVERY normal path -- a
+                # decision (allow/deny) OR an auto-decline-deny on timeout/IPC-error
+                # (the worker then continues; never re-dispatches). Returns None ONLY
+                # when inline is unconfigured (no permission_dir); that lone case
+                # falls through to the auto escalate path below.
+                outcome = await self._await_inline_decision(record, options, tool_id, session_id)
+                if outcome is not None:
+                    return outcome
+                log.info("inline mode has no permission_dir; escalating instead: %s", title)
+            self.permission_escalations.append(record)
+            # Wake run_prompt immediately so it surfaces the escalation now rather
+            # than on its next ~1s poll. The event carries no "message"; the loop
+            # treats it as a no-op and re-checks escalations at the top. (Same
+            # event loop as this handler, so this is ordered after the append.)
+            if self.turn_queue is not None:
+                with contextlib.suppress(Exception):
+                    self.turn_queue.put_nowait({"source": "permission_escalation"})
+            log.info("escalate permission to controller/user: %s", title)
+            return RequestPermissionResponse(outcome=DeniedOutcome(outcome="cancelled"))
+        # PERMISSION_DENY (a custom policy rejecting a hardcoded-dangerous op).
+        log.info("deny permission (policy): %s", title)
         return RequestPermissionResponse(outcome=DeniedOutcome(outcome="cancelled"))
+
+    def _outcome_from_decision(self, decision: dict[str, Any], options: list[Any]) -> Any:
+        """Map a controller decision file to an ACP outcome. An ``allow`` honors
+        the named option_id ONLY if it is an allow option. A missing id falls back
+        to the safe allow selector; a reject/unknown id fails closed."""
+        if decision.get("decision") == permits.DECISION_ALLOW:
+            offered = set()
+            for option in (options or []):
+                kind = _tc_get(option, "kind")
+                option_id = _tc_get(option, "option_id", "optionId")
+                if isinstance(kind, str) and kind.startswith("allow") and option_id:
+                    offered.add(option_id)
+            chosen = decision.get("option_id")
+            if chosen and chosen in offered:
+                return RequestPermissionResponse(
+                    outcome=AllowedOutcome(outcome="selected", option_id=chosen)
+                )
+            if not chosen:
+                chosen = self._select_allow_option(options)
+                if chosen:
+                    return RequestPermissionResponse(
+                        outcome=AllowedOutcome(outcome="selected", option_id=chosen)
+                    )
+        return RequestPermissionResponse(outcome=DeniedOutcome(outcome="cancelled"))
+
+    async def _await_inline_decision(
+        self, record: dict[str, Any], options: list[Any], tool_id: Any, session_id: str
+    ) -> Any | None:
+        """Hold the ACP permission open across two awake-time phases: a short
+        controller ACK window, then a longer post-ACK user-decision window.
+        Returns an ACP outcome on a decision, or a deny on timeout / IPC error.
+        The held permission is registered with the liveness activity so the
+        heartbeat treats the pause as healthy, not as a wedge."""
+        directory = self.permission_dir
+        if directory is None:
+            return None
+        key = record["key"]
+        hold_id = str(tool_id) if tool_id else key
+        ack_deadline = active_monotonic() + self.permission_inline_timeout_s
+        self.activity.hold_inline_permission(hold_id, ack_deadline)
+        acked = False
+        deadline = ack_deadline
+        try:
+            # Opportunistic cruft removal (one cheap listing): reap orphan files
+            # from crashes or the timeout/late-write race. Never touches a live
+            # round-trip (only files older than DEFAULT_SWEEP_AGE_S).
+            with contextlib.suppress(Exception):
+                permits.sweep(directory)
+            permits.write_request(directory, record)
+            # Nudge any in-process relay that watches the turn queue; harmless to
+            # a controller that polls the directory instead.
+            if self.turn_queue is not None:
+                with contextlib.suppress(Exception):
+                    self.turn_queue.put_nowait(
+                        {"source": "permission_inline_request", "key": key}
+                    )
+            while True:
+                got = permits.read_decision(directory, key)
+                if got is not None:
+                    return self._outcome_from_decision(got, options)
+                if not acked and permits.read_ack(directory, key):
+                    # An ack noticed up to one poll interval after the controller deadline still
+                    # extends -- intentional: a controller that acked at the edge IS alive, so honor
+                    # it rather than auto-decline a live controller on a sub-second timing race.
+                    acked = True
+                    deadline = active_monotonic() + self.permission_user_timeout_s
+                    self.activity.extend_inline_hold(hold_id, deadline)
+                    log.info(
+                        "inline permission ACKed by controller; extending to "
+                        "user-decision window (%.0fs awake): %s",
+                        self.permission_user_timeout_s,
+                        record.get("title"),
+                    )
+                if active_monotonic() >= deadline:
+                    got = permits.read_decision(directory, key)
+                    if got is not None:
+                        return self._outcome_from_decision(got, options)
+                    reason = "user_timeout" if acked else "controller_timeout"
+                    self.permission_auto_declined.append({
+                        "key": record.get("key"),
+                        "tool_call_id": record.get("tool_call_id"),
+                        "title": record.get("title"),
+                        "kind": record.get("kind"),
+                        "reason": reason,
+                        "timeout_s": (self.permission_user_timeout_s if acked
+                                      else self.permission_inline_timeout_s),
+                    })
+                    log.warning(
+                        "inline permission auto-declined (%s) after %.0fs awake-time; "
+                        "worker continues without the tool: %s",
+                        reason,
+                        (self.permission_user_timeout_s if acked else self.permission_inline_timeout_s),
+                        record.get("title"),
+                    )
+                    return RequestPermissionResponse(outcome=DeniedOutcome(outcome="cancelled"))
+                await asyncio.sleep(self.permission_inline_poll_s)
+        except asyncio.CancelledError:
+            # The handler was cancelled mid-hold (event-loop / connection teardown).
+            # request_permission is a SYNCHRONOUS gate for the worker: if we
+            # propagate without answering, a still-alive worker is left waiting on
+            # the permission and wedges. Answer with a definitive deny (a returned
+            # value here suppresses the cancellation, which is correct for an RPC
+            # handler that must always reply) so the worker can never hang. The
+            # finally below still releases the hold and clears the IPC files.
+            log.info("inline permission cancelled; denying so the worker stays answerable")
+            return RequestPermissionResponse(outcome=DeniedOutcome(outcome="cancelled"))
+        except Exception:
+            log.exception("inline permission IPC failed (%s); auto-declining so the worker continues", record.get("title"))
+            self.permission_auto_declined.append({
+                "key": record.get("key"),
+                "tool_call_id": record.get("tool_call_id"),
+                "title": record.get("title"),
+                "kind": record.get("kind"),
+                "reason": "ipc_error",
+                "timeout_s": self.permission_inline_timeout_s,
+            })
+            return RequestPermissionResponse(outcome=DeniedOutcome(outcome="cancelled"))
+        finally:
+            self.activity.release_inline_permission(hold_id)
+            with contextlib.suppress(Exception):
+                permits.clear(directory, key)
 
     async def session_update(self, session_id: str, update: Any, **kwargs: Any) -> None:
         update_dict = update.model_dump(
@@ -565,6 +1037,7 @@ class GoalflightAcpConnection:
     verified_pgid: int
     verbose: bool = False
     auto_allow_tools: bool = True
+    context_mode: bool = True
     acp_session_id: str | None = None
     cwd: str | None = None
     reusable: bool = True
@@ -709,6 +1182,72 @@ class GoalflightAcpConnection:
             return self.alive
 
 
+# codex-acp routes MCP-server elicitation (request_user_input) into a hang
+# UNLESS told to surface it through the ACP permission channel. Without this flag
+# an MCP tool that elicits -- e.g. context-mode's ctx_index -- wedges the worker
+# on its first tool call: codex-acp neither forwards the elicitation over ACP
+# (even when the client advertises ClientCapabilities.elicitation) nor rejects it
+# the way `codex exec` does ("request_user_input is not supported in exec mode");
+# the tool_call stays in_progress at ~0% CPU forever (reproduced + bisected
+# 2026-05-21). With the flag the elicitation arrives as a session/request_permission
+# (title "Approve <tool>", standard allow_*/reject_* options) that
+# GoalflightClient.request_permission auto-allows, so the tool completes.
+_ELICIT_KEY = "features.tool_call_mcp_elicitation"
+_CTX_ENABLED_KEY = "mcp_servers.context-mode.enabled"
+# Back-compat: the only flag injected before the context-mode toggle existed.
+CODEX_ACP_ELICITATION_ARGS = ["-c", f"{_ELICIT_KEY}=true"]
+
+
+def _strip_c_key(acp_args: list[str], key: str) -> list[str]:
+    """Drop any `-c <key>=...` pair (codex's two-token form) from acp_args so our
+    injected value is the ONLY one for that key -- order-independent and not
+    defeatable by a stray/conflicting caller arg."""
+    out: list[str] = []
+    i, n = 0, len(acp_args)
+    while i < n:
+        if (
+            acp_args[i] == "-c"
+            and i + 1 < n
+            and str(acp_args[i + 1]).split("=", 1)[0].strip() == key
+        ):
+            i += 2
+            continue
+        out.append(acp_args[i])
+        i += 1
+    return out
+
+
+def ensure_codex_acp_args(command: str, acp_args: list[str], *, context_mode: bool = True) -> list[str]:
+    """Guarantee codex-acp's MCP posture at the SINGLE spawn boundary, for every
+    caller (runner agent_command, AcpProcessPool config, custom launcher). No-op
+    for any other adapter.
+
+    context_mode=True (default): route MCP-server elicitation through the ACP
+    permission channel (features.tool_call_mcp_elicitation=true) so an eliciting
+    tool surfaces as an answerable permission instead of wedging the worker.
+    context_mode=False: disable the context-mode MCP server for THIS worker
+    (mcp_servers.context-mode.enabled=false) -- no MCP elicitation surface at all.
+    The controller chooses per dispatch (goalflight_acp_run --context-mode).
+
+    The chosen flag is appended LAST after stripping any caller value for the same
+    key, so a conflicting/stray caller arg can't defeat the guarantee.
+    """
+    if os.path.basename(str(command)) != "codex-acp":
+        return acp_args
+    # Strip BOTH related keys first so a caller's OPPOSITE-posture arg can't
+    # survive (e.g. a stray enabled=false in context_mode=True), then append the
+    # single flag for the chosen posture last (last-wins + conflict-free).
+    stripped = _strip_c_key(_strip_c_key(acp_args, _ELICIT_KEY), _CTX_ENABLED_KEY)
+    if context_mode:
+        return [*stripped, "-c", f"{_ELICIT_KEY}=true"]
+    return [*stripped, "-c", f"{_CTX_ENABLED_KEY}=false"]
+
+
+# Back-compat alias (pre-toggle name); thin wrapper over ensure_codex_acp_args.
+def ensure_codex_acp_elicitation(command: str, acp_args: list[str]) -> list[str]:
+    return ensure_codex_acp_args(command, acp_args, context_mode=True)
+
+
 async def spawn_acp_connection(
     command: str,
     acp_args: list[str],
@@ -719,8 +1258,15 @@ async def spawn_acp_connection(
     auto_allow_tools: bool = True,
     verbose: bool = False,
     activity: AcpLivenessActivity | None = None,
+    permission_policy: Callable[[Any, list[Any], str | None], str] | None = None,
+    permission_mode: str = PERMISSION_MODE_AUTO,
+    permission_dir: str | os.PathLike[str] | None = None,
+    permission_inline_timeout_s: float | None = None,
+    permission_user_timeout_s: float | None = None,
+    context_mode: bool = True,
 ) -> GoalflightAcpConnection:
     require_acp_sdk()
+    acp_args = ensure_codex_acp_args(command, acp_args, context_mode=context_mode)
     limit = acp_limit_from_env()
     os.makedirs(cwd, exist_ok=True)
     proc = await asyncio.create_subprocess_exec(
@@ -758,7 +1304,16 @@ async def spawn_acp_connection(
         )
 
     activity = activity or AcpLivenessActivity()
-    client = GoalflightClient(activity=activity, auto_allow_tools=auto_allow_tools)
+    client = GoalflightClient(
+        activity=activity,
+        auto_allow_tools=auto_allow_tools,
+        cwd=cwd,
+        permission_policy=permission_policy,
+        permission_mode=permission_mode,
+        permission_dir=permission_dir,
+        permission_inline_timeout_s=permission_inline_timeout_s,
+        permission_user_timeout_s=permission_user_timeout_s,
+    )
     guarded_reader = GuardedStreamReader(proc.stdout, limit=limit, on_drop=activity.note_dropped_frame)
     conn = connect_to_agent(
         client,
@@ -776,6 +1331,8 @@ async def spawn_acp_connection(
         verified_pgid=verified_pgid,
         verbose=verbose,
         auto_allow_tools=auto_allow_tools,
+        context_mode=context_mode,
+        cwd=cwd,
     )
 
 
@@ -787,21 +1344,53 @@ class AcpProcessPool:
         max_per_agent: int = 10,
         verbose: bool = False,
         auto_allow_tools: bool = False,
+        permission_policy: Callable[[Any, list[Any], str | None], str] | None = None,
+        permission_mode: str = PERMISSION_MODE_AUTO,
+        permission_dir: str | os.PathLike[str] | None = None,
+        permission_inline_timeout_s: float | None = None,
+        permission_user_timeout_s: float | None = None,
+        context_mode: bool = True,
     ) -> None:
         self._config = agents_config
         self._max = max_processes
         self._max_per_agent = max_per_agent
         self._verbose = verbose
         self._auto_allow_tools = auto_allow_tools
+        self._permission_policy = permission_policy
+        self._permission_mode = permission_mode
+        self._permission_dir = permission_dir
+        self._permission_inline_timeout_s = permission_inline_timeout_s
+        self._permission_user_timeout_s = permission_user_timeout_s
+        self._context_mode = context_mode
         self._connections: dict[tuple[str, str], GoalflightAcpConnection] = {}
 
     def _count_agent(self, agent: str) -> int:
         return sum(1 for (a, _) in self._connections if a == agent)
 
-    async def get_or_create(self, agent: str, session_id: str, cwd: str = "") -> GoalflightAcpConnection:
+    async def get_or_create(
+        self,
+        agent: str,
+        session_id: str,
+        cwd: str = "",
+        context_mode: bool | None = None,
+    ) -> GoalflightAcpConnection:
+        # Per-dispatch context-mode override (defaults to the pool's). A reused
+        # connection carries the launch posture it was spawned with, so it can
+        # only be returned when the requested posture matches -- otherwise rebuild
+        # (a worker spawned with context-mode enabled can't serve a disabled
+        # dispatch, and vice versa).
+        effective_context_mode = self._context_mode if context_mode is None else context_mode
         key = (agent, session_id)
+        agent_cfg = self._config.get(agent)
+        workdir = cwd or (agent_cfg.get("working_dir", "/tmp") if agent_cfg else "/tmp")
         conn = self._connections.get(key)
-        if conn and conn.alive and conn.reusable:
+        if (
+            conn
+            and conn.alive
+            and conn.reusable
+            and conn.context_mode == effective_context_mode
+            and _same_dir(conn.cwd, workdir)
+        ):
             return conn
         is_rebuild = conn is not None
         if conn:
@@ -812,12 +1401,10 @@ class AcpProcessPool:
             raise PoolExhaustedError(f"global limit reached ({self._max})")
         if self._count_agent(agent) >= self._max_per_agent:
             raise PoolExhaustedError(f"per-agent limit reached for {agent} ({self._max_per_agent})")
-        agent_cfg = self._config.get(agent)
         if not agent_cfg:
             raise AcpError(f"agent not found: {agent}")
         command = agent_cfg["command"]
         acp_args = agent_cfg.get("acp_args", [agent_cfg.get("acp_arg", "acp")])
-        workdir = cwd or agent_cfg.get("working_dir", "/tmp")
         new_conn = await spawn_acp_connection(
             command,
             acp_args,
@@ -826,6 +1413,12 @@ class AcpProcessPool:
             cwd=workdir,
             auto_allow_tools=self._auto_allow_tools,
             verbose=self._verbose,
+            permission_policy=self._permission_policy,
+            permission_mode=self._permission_mode,
+            permission_dir=self._permission_dir,
+            permission_inline_timeout_s=self._permission_inline_timeout_s,
+            permission_user_timeout_s=self._permission_user_timeout_s,
+            context_mode=effective_context_mode,
         )
         if is_rebuild:
             new_conn.session_reset = True

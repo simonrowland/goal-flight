@@ -78,8 +78,49 @@ def read_message() -> dict | None:
         return {}
 
 
-def request_permission(session_id: str, tool_id: str) -> str:
+DEFAULT_PERMISSION_OPTIONS = [
+    {"optionId": "opt_once", "kind": "allow_once", "name": "Allow once"},
+    {"optionId": "opt_always", "kind": "allow_always", "name": "Always allow"},
+]
+
+# The shape codex-acp 0.14.0 actually sends for a built-in tool gate (captured
+# 2026-05-21): allow_once + reject_once, ids approved/abort, NO allow_always.
+CODEX_PERMISSION_OPTIONS = [
+    {"optionId": "approved", "kind": "allow_once", "name": "Approve"},
+    {"optionId": "abort", "kind": "reject_once", "name": "Abort"},
+]
+
+# The shape codex-acp surfaces when an MCP tool ELICITS (request_user_input)
+# under features.tool_call_mcp_elicitation=true (captured 2026-05-21 from
+# context-mode ctx_index, title "Approve Index Content"): allow_once plus multiple
+# allow_always options + a reject. Auto-allow must pick allow_once.
+ELICITATION_PERMISSION_OPTIONS = [
+    {"optionId": "approved", "kind": "allow_once", "name": "Approve once"},
+    {"optionId": "approved-for-session", "kind": "allow_always", "name": "Approve for session"},
+    {"optionId": "approved-always", "kind": "allow_always", "name": "Always approve"},
+    {"optionId": "cancel", "kind": "reject_once", "name": "Cancel"},
+]
+
+
+def request_permission(
+    session_id: str,
+    tool_id: str,
+    options: list | None = None,
+    title: str = "edit file",
+    locations: list | None = None,
+    kind: str | None = None,
+) -> str:
     request_id = 9001
+    tool_call = {
+        "sessionUpdate": "tool_call",
+        "toolCallId": tool_id,
+        "title": title,
+        "status": "pending",
+    }
+    if locations:
+        tool_call["locations"] = locations
+    if kind:
+        tool_call["kind"] = kind
     send(
         {
             "jsonrpc": "2.0",
@@ -87,16 +128,8 @@ def request_permission(session_id: str, tool_id: str) -> str:
             "method": "session/request_permission",
             "params": {
                 "sessionId": session_id,
-                "toolCall": {
-                    "sessionUpdate": "tool_call",
-                    "toolCallId": tool_id,
-                    "title": "edit file",
-                    "status": "pending",
-                },
-                "options": [
-                    {"optionId": "opt_once", "kind": "allow_once", "name": "Allow once"},
-                    {"optionId": "opt_always", "kind": "allow_always", "name": "Always allow"},
-                ],
+                "toolCall": tool_call,
+                "options": DEFAULT_PERMISSION_OPTIONS if options is None else options,
             },
         }
     )
@@ -152,6 +185,89 @@ def handle_prompt(req_id: int, params: dict) -> None:
         text_update(session_id, f"permission:{selected}")
         response(req_id, {"sessionId": session_id, "stopReason": "end_turn"})
         return
+    if SCENARIO == "permission_codex":
+        # Real codex-acp built-in-tool gate: allow_once + reject_once, no
+        # allow_always. Auto-allow must pick the allow_once ('approved'),
+        # NOT the reject_once ('abort').
+        selected = request_permission(
+            session_id, "perm-codex",
+            options=CODEX_PERMISSION_OPTIONS, title="Edit /tmp/probe.txt",
+        )
+        text_update(session_id, f"permission:{selected}")
+        response(req_id, {"sessionId": session_id, "stopReason": "end_turn"})
+        return
+    if SCENARIO == "permission_reject_first":
+        # Same options, REJECT offered first. The old options[0] fallback would
+        # have selected 'abort'; auto-allow must still pick 'approved'.
+        selected = request_permission(
+            session_id, "perm-rf",
+            options=list(reversed(CODEX_PERMISSION_OPTIONS)), title="Edit x",
+        )
+        text_update(session_id, f"permission:{selected}")
+        response(req_id, {"sessionId": session_id, "stopReason": "end_turn"})
+        return
+    if SCENARIO == "permission_elicitation":
+        # MCP elicitation surfaced as a permission (codex-acp +
+        # features.tool_call_mcp_elicitation=true). The worker unblocks only if
+        # the client answers with an allow option (auto-allow picks allow_once).
+        selected = request_permission(
+            session_id, "perm-elicit",
+            options=ELICITATION_PERMISSION_OPTIONS, title="Approve Index Content",
+        )
+        text_update(session_id, f"permission:{selected}")
+        response(req_id, {"sessionId": session_id, "stopReason": "end_turn"})
+        return
+    if SCENARIO == "permission_reject_only":
+        # Only a reject option exists: auto-allow cannot grant, must cancel
+        # cleanly (definitive answer) so the worker still unblocks.
+        selected = request_permission(
+            session_id, "perm-ro",
+            options=[{"optionId": "abort", "kind": "reject_once", "name": "Abort"}],
+            title="Edit x",
+        )
+        text_update(session_id, f"permission:{selected or 'cancelled'}")
+        response(req_id, {"sessionId": session_id, "stopReason": "end_turn"})
+        return
+    if SCENARIO == "permission_inline":
+        # Boundary-crossing request (target OUTSIDE cwd) so the router ESCALATES.
+        # Under permission_mode="inline" the controller HOLDS the request open and
+        # answers it in place (allow option_id, or cancel on deny/timeout). Unlike
+        # 'permission_escalate' we then COMPLETE the turn, so the test can observe
+        # what the worker received: 'permission:<optionId>' on allow, or
+        # 'permission:cancelled' on deny.
+        selected = request_permission(
+            session_id, "perm-inline",
+            options=CODEX_PERMISSION_OPTIONS, title="Edit /etc/hosts",
+            locations=[{"path": "/etc/hosts"}],  # outside the worker cwd
+        )
+        text_update(session_id, f"permission:{selected or 'cancelled'}")
+        response(req_id, {"sessionId": session_id, "stopReason": "end_turn"})
+        return
+    if SCENARIO in ("permission_escalate", "permission_fetch"):
+        # The controller's permission ROUTER escalates a boundary-crossing
+        # request: it answers the ACP request with a cancel, then the runner
+        # cancels the whole turn. Model that by sending the request and WAITING
+        # for the cancel (like 'blocked') rather than ending, so the runner can
+        # detect + surface the escalation.
+        if SCENARIO == "permission_escalate":
+            request_permission(
+                session_id, "perm-esc",
+                options=CODEX_PERMISSION_OPTIONS, title="Edit /etc/hosts",
+                locations=[{"path": "/etc/hosts"}],  # outside the worker cwd
+            )
+        else:
+            request_permission(
+                session_id, "perm-fetch",
+                options=CODEX_PERMISSION_OPTIONS, title="Fetch https://example.com",
+                kind="fetch",  # ToolKind 'fetch' == network access
+            )
+        while True:
+            message = read_message()
+            if message is None:
+                return
+            if message.get("method") == "session/cancel":
+                return
+            time.sleep(0.01)
     if SCENARIO == "tool_tracking":
         tool_update(session_id, "tool_call", "tool-1", status="pending")
         tool_update(session_id, "tool_call_update", "tool-1", status="completed")
