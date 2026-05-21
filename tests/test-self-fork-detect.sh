@@ -16,6 +16,17 @@ TMPROOT=$(mktemp -d /tmp/goal-flight-fork-detect-test.XXXX)
 trap 'rm -rf "$TMPROOT"' EXIT
 cd "$TMPROOT"
 
+# --- Hermetic sandbox -------------------------------------------------------
+# self-fork-detect.sh resolves the session-transcript store from
+# ~/.claude/projects (os.path.expanduser / $HOME) for write-snapshot, find-fork,
+# detect's subagent check, and monitor. On the dev box that dir exists and is
+# full of real sessions; in clean/CI sandboxes it is absent or foreign. Point
+# HOME at a throwaway tree under $TMPROOT so every script action runs against a
+# mocked, deterministic projects dir — no dependence on the real path, and no
+# pollution of the user's real session transcripts. The EXIT trap cleans it up.
+export HOME="$TMPROOT/home"
+mkdir -p "$HOME/.claude/projects/mock-project"
+
 # Test 1: detect with no contract → NO_CONTRACT.
 result=$("$SCRIPT" detect ".fork-contract-1.json" 2>&1 | head -1)
 [ "$result" = "NO_CONTRACT" ] \

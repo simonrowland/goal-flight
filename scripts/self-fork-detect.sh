@@ -194,20 +194,31 @@ PY
 
     echo "monitoring $FORK_JSONL"
     echo "  poll: ${POLL}s   idle-stop: ${IDLE_STOP}s"
-    echo "  exit-on: 'FORK-COMPLETE' marker OR no mtime change for ${IDLE_STOP}s"
+    echo "  exit-on: 'FORK-COMPLETE' marker OR no size change for ${IDLE_STOP}s"
     echo
 
-    last_mtime=0
     last_size=0
     idle_seconds=0
+
+    # File size is the growth signal. stat(1) differs by platform: BSD/macOS
+    # uses `-f %z`, GNU/Linux uses `-c %s`. Detect once against the real file
+    # (the probe must yield a pure integer — GNU `stat -f` silently prints
+    # non-numeric filesystem info), then fall back to POSIX `wc -c` if neither
+    # stat form works. Detecting once keeps the poll loop cheap and portable.
+    if stat -f '%z' "$FORK_JSONL" 2>/dev/null | grep -qE '^[0-9]+$'; then
+      _statsize() { stat -f '%z' "$1" 2>/dev/null; }
+    elif stat -c '%s' "$FORK_JSONL" 2>/dev/null | grep -qE '^[0-9]+$'; then
+      _statsize() { stat -c '%s' "$1" 2>/dev/null; }
+    else
+      _statsize() { wc -c < "$1" 2>/dev/null | tr -d ' '; }
+    fi
 
     while true; do
       if ! [ -f "$FORK_JSONL" ]; then
         echo "fork JSONL disappeared — stopping monitor"
         exit 1
       fi
-      curr_mtime=$(stat -f '%m' "$FORK_JSONL" 2>/dev/null)
-      curr_size=$(stat -f '%z' "$FORK_JSONL" 2>/dev/null)
+      curr_size=$(_statsize "$FORK_JSONL")
 
       if [ "$curr_size" != "$last_size" ]; then
         # JSONL grew — extract events since the last poll
@@ -245,7 +256,6 @@ PY
           fi
         fi
         last_size="$curr_size"
-        last_mtime="$curr_mtime"
         idle_seconds=0
       else
         idle_seconds=$((idle_seconds + POLL))

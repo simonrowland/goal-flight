@@ -6,9 +6,11 @@ incremented when meaningful skill behaviour changes.
 
 ## [0.4.6] — 2026-05-21
 
-**Runner liveness: terminal-state precedence fix + hermetic regression coverage.**
+**Runner liveness + portability: terminal-state precedence, sleep-resilient timeout
+clocks, and a Linux-portable fork monitor — plus hermetic regression coverage.**
 Closes the runner-level test-coverage debt acknowledged in the 0.4.5 SDK-migration
-review, and fixes a terminal-classification edge case found while writing it.
+review, fixes a terminal-classification edge case found while writing it, makes ACP
+liveness budgets immune to laptop sleep, and ports the `/fork` self-monitor to Linux.
 
 ### Fixed
 
@@ -29,6 +31,11 @@ review, and fixes a terminal-classification edge case found while writing it.
 - The heartbeat loop now detects large wall-clock gaps that are absent from the
   active clock, writes a `paused ... (system sleep/suspend)` status note, and
   skips all silence-class terminal checks for that thaw tick.
+- The `/fork` self-monitor (`scripts/self-fork-detect.sh`) is portable to Linux.
+  It read the JSONL growth signal with macOS-only `stat -f`; on Linux `stat -f`
+  silently means `--file-system` (wrong numbers), so the monitor never saw the file
+  grow. It now validates that the `stat` output is an integer and falls back across
+  BSD `stat -f` / GNU `stat -c` / POSIX `wc -c`, exercised by the test.
 
 ### Added
 
