@@ -40,6 +40,19 @@ def text_update(session_id: str, text: str) -> None:
     )
 
 
+def thought_update(session_id: str, text: str) -> None:
+    notification(
+        "session/update",
+        {
+            "sessionId": session_id,
+            "update": {
+                "sessionUpdate": "agent_thought_chunk",
+                "content": {"type": "text", "text": text},
+            },
+        },
+    )
+
+
 def vendor_update(session_id: str, text: str) -> None:
     notification(
         "session/update",
@@ -78,7 +91,36 @@ def read_message() -> dict | None:
         return {}
 
 
-def request_permission(session_id: str, tool_id: str) -> str:
+DEFAULT_PERMISSION_OPTIONS = [
+    {"optionId": "opt_once", "kind": "allow_once", "name": "Allow once"},
+    {"optionId": "opt_always", "kind": "allow_always", "name": "Always allow"},
+]
+
+# The shape codex-acp 0.14.0 actually sends for a built-in tool gate (captured
+# 2026-05-21): allow_once + reject_once, ids approved/abort, NO allow_always.
+CODEX_PERMISSION_OPTIONS = [
+    {"optionId": "approved", "kind": "allow_once", "name": "Approve"},
+    {"optionId": "abort", "kind": "reject_once", "name": "Abort"},
+]
+
+# The shape codex-acp surfaces when an MCP tool ELICITS (request_user_input)
+# under features.tool_call_mcp_elicitation=true (captured 2026-05-21 from
+# context-mode ctx_index, title "Approve Index Content"): multiple allow_always
+# options + a reject. Auto-allow must pick an allow_always (approve-for-session).
+ELICITATION_PERMISSION_OPTIONS = [
+    {"optionId": "approved", "kind": "allow_once", "name": "Approve once"},
+    {"optionId": "approved-for-session", "kind": "allow_always", "name": "Approve for session"},
+    {"optionId": "approved-always", "kind": "allow_always", "name": "Always approve"},
+    {"optionId": "cancel", "kind": "reject_once", "name": "Cancel"},
+]
+
+
+def request_permission(
+    session_id: str,
+    tool_id: str,
+    options: list | None = None,
+    title: str = "edit file",
+) -> str:
     request_id = 9001
     send(
         {
@@ -90,13 +132,10 @@ def request_permission(session_id: str, tool_id: str) -> str:
                 "toolCall": {
                     "sessionUpdate": "tool_call",
                     "toolCallId": tool_id,
-                    "title": "edit file",
+                    "title": title,
                     "status": "pending",
                 },
-                "options": [
-                    {"optionId": "opt_once", "kind": "allow_once", "name": "Allow once"},
-                    {"optionId": "opt_always", "kind": "allow_always", "name": "Always allow"},
-                ],
+                "options": DEFAULT_PERMISSION_OPTIONS if options is None else options,
             },
         }
     )
@@ -152,6 +191,49 @@ def handle_prompt(req_id: int, params: dict) -> None:
         text_update(session_id, f"permission:{selected}")
         response(req_id, {"sessionId": session_id, "stopReason": "end_turn"})
         return
+    if SCENARIO == "permission_codex":
+        # Real codex-acp built-in-tool gate: allow_once + reject_once, no
+        # allow_always. Auto-allow must pick the allow_once ('approved'),
+        # NOT the reject_once ('abort').
+        selected = request_permission(
+            session_id, "perm-codex",
+            options=CODEX_PERMISSION_OPTIONS, title="Edit /tmp/probe.txt",
+        )
+        text_update(session_id, f"permission:{selected}")
+        response(req_id, {"sessionId": session_id, "stopReason": "end_turn"})
+        return
+    if SCENARIO == "permission_reject_first":
+        # Same options, REJECT offered first. The old options[0] fallback would
+        # have selected 'abort'; auto-allow must still pick 'approved'.
+        selected = request_permission(
+            session_id, "perm-rf",
+            options=list(reversed(CODEX_PERMISSION_OPTIONS)), title="Edit x",
+        )
+        text_update(session_id, f"permission:{selected}")
+        response(req_id, {"sessionId": session_id, "stopReason": "end_turn"})
+        return
+    if SCENARIO == "permission_elicitation":
+        # MCP elicitation surfaced as a permission (codex-acp +
+        # features.tool_call_mcp_elicitation=true). The worker unblocks only if
+        # the client answers with an allow option (auto-allow picks allow_always).
+        selected = request_permission(
+            session_id, "perm-elicit",
+            options=ELICITATION_PERMISSION_OPTIONS, title="Approve Index Content",
+        )
+        text_update(session_id, f"permission:{selected}")
+        response(req_id, {"sessionId": session_id, "stopReason": "end_turn"})
+        return
+    if SCENARIO == "permission_reject_only":
+        # Only a reject option exists: auto-allow cannot grant, must cancel
+        # cleanly (definitive answer) so the worker still unblocks.
+        selected = request_permission(
+            session_id, "perm-ro",
+            options=[{"optionId": "abort", "kind": "reject_once", "name": "Abort"}],
+            title="Edit x",
+        )
+        text_update(session_id, f"permission:{selected or 'cancelled'}")
+        response(req_id, {"sessionId": session_id, "stopReason": "end_turn"})
+        return
     if SCENARIO == "tool_tracking":
         tool_update(session_id, "tool_call", "tool-1", status="pending")
         tool_update(session_id, "tool_call_update", "tool-1", status="completed")
@@ -182,7 +264,23 @@ def handle_prompt(req_id: int, params: dict) -> None:
         text_update(session_id, "started")
         while True:
             time.sleep(1.0)
-    if SCENARIO == "idle_silent":
+    if SCENARIO == "long_reasoning_pause":
+        pause_s = float(os.environ.get("GOALFLIGHT_FAKE_ACP_LONG_PAUSE_S", "1.0"))
+        text_update(session_id, "started")
+        time.sleep(pause_s)
+        text_update(session_id, "finished")
+        response(req_id, {"sessionId": session_id, "stopReason": "end_turn"})
+        return
+    if SCENARIO == "thought_stream_pause":
+        interval = float(os.environ.get("GOALFLIGHT_FAKE_ACP_INTERVAL", "0.2"))
+        chunks = int(os.environ.get("GOALFLIGHT_FAKE_ACP_THOUGHT_CHUNKS", "5"))
+        for i in range(chunks):
+            thought_update(session_id, f"thinking-{i}")
+            if i != chunks - 1:
+                time.sleep(interval)
+        response(req_id, {"sessionId": session_id, "stopReason": "end_turn"})
+        return
+    if SCENARIO in {"idle_silent", "dead_silent_turn"}:
         # Handshake completes, then the prompt turn emits NOTHING and never
         # responds — models a worker that goes fully event-silent (no progress,
         # no vendor noise). The heartbeat wedge can't fire (it requires >=1 prior

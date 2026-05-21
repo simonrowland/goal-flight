@@ -4,6 +4,41 @@ Notable changes to the goal-flight Claude Code skill. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are
 incremented when meaningful skill behaviour changes.
 
+## [0.4.7] — 2026-05-21
+
+**ACP reliability for remote-API workers: context-mode MCP elicitation no longer
+wedges codex-acp; turn-in-flight liveness ends reasoning-pause false-kills; plus
+permission hardening and a deflaked watcher test.**
+
+- **context-mode-via-ACP wedge fixed.** A codex-acp worker calling an MCP tool that
+  uses elicitation (`request_user_input`) — e.g. context-mode's `ctx_index` — hung
+  until the per-tool wall (the elicitation was neither forwarded over ACP nor
+  rejected the way `codex exec` does). codex-acp is now launched with
+  `-c features.tool_call_mcp_elicitation=true` (injected at the single spawn
+  boundary, codex-acp-only, idempotent), routing the elicitation through
+  `session/request_permission` where auto-allow answers it — context-mode stays
+  available. Validated end-to-end (codex-acp `ctx_index` completes in ~6s, no wedge).
+- **Permission handling hardened.** `request_permission` prefers allow_always >
+  allow_once, fails closed (only `allow_*` kinds auto-grant; reject-only sets and
+  malformed `allow…` kinds cancel cleanly), and returns `DeniedOutcome(cancelled)`
+  when auto-allow is off instead of raising `method_not_found` (which hung older
+  adapters).
+- **Turn-in-flight liveness for remote-API workers.** A per-adapter
+  `liveness_profile` (`remote_api` | `local_compute` | `hybrid`): for `remote_api`,
+  while an ACP prompt-turn is in flight the local-CPU progress-stall / max-quiet /
+  wedge walls are suppressed and a bounded `remote_turn_silence_s` (default 1200s)
+  backstop applies — remote-API workers (codex-acp / grok / cursor / claude) sit at
+  ~0% local CPU during remote model reasoning and were being false-killed.
+  `--max-tool-s` stays absolute; `local_compute` is unchanged. Closes the goal-mode
+  reasoning-pause false-kill without reintroducing the long idle hang.
+- **Test reliability.** `tests/test-watch-dispatch-tail.sh` is now hermetic — it
+  registers fake workers in a per-run `mktemp -d` (via `$GOAL_FLIGHT_PIDFILE_DIR`,
+  honored by `scripts/watch-dispatch-tail.sh`; production default unchanged) instead
+  of the shared `/tmp/goal-flight-acp-pids.d`, eliminating a ~1-in-3 flake where a
+  concurrent `cleanup_ghosts()` reaped case 4's deliberate orphan.
+
+Reviewed: codex + grok (ship; codex P2 — fail-closed `allow_` prefix — folded).
+
 ## [0.4.6] — 2026-05-21
 
 **Runner liveness + portability: terminal-state precedence, sleep-resilient timeout

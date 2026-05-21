@@ -152,6 +152,100 @@ async def case_permission_auto_allow() -> None:
         await conn.kill()
 
 
+async def case_permission_codex_shape_unblocks() -> None:
+    # Real codex-acp built-in-tool gate shape: allow_once + reject_once, no
+    # allow_always (captured 2026-05-21). Auto-allow must pick the allow_once
+    # ('approved'), the worker must unblock, and the gate must NOT be answered
+    # with the reject ('abort'). This is the hermetic permission-round-trip
+    # regression for the shape codex-acp actually sends.
+    conn = await _connect("permission_codex")
+    try:
+        result = await run_prompt(conn, "go", idle_timeout=5)
+        assert result.ok, result
+        assert "permission:approved" in result.text, result.text
+        assert "permission:abort" not in result.text, result.text
+        assert conn.client.activity.outstanding_count() == 0
+    finally:
+        await conn.kill()
+
+
+async def case_permission_reject_first_picks_allow() -> None:
+    # Reject option offered FIRST. The old options[0] fallback would have
+    # answered with 'abort' (auto-allow turned into auto-DENY); the selector
+    # must still pick the allow_once 'approved'.
+    conn = await _connect("permission_reject_first")
+    try:
+        result = await run_prompt(conn, "go", idle_timeout=5)
+        assert result.ok, result
+        assert "permission:approved" in result.text, result.text
+        assert "permission:abort" not in result.text, result.text
+    finally:
+        await conn.kill()
+
+
+async def case_permission_reject_only_cancels_and_unblocks() -> None:
+    # Only a reject option exists: auto-allow cannot grant, so it cancels
+    # cleanly. The point is liveness — the worker still gets a definitive
+    # answer and completes its turn (never wedges), and we never wrap the
+    # reject id in an AllowedOutcome.
+    conn = await _connect("permission_reject_only")
+    try:
+        result = await run_prompt(conn, "go", idle_timeout=5)
+        assert result.ok, result
+        assert "permission:abort" not in result.text, result.text
+        assert conn.client.activity.outstanding_count() == 0
+    finally:
+        await conn.kill()
+
+
+async def case_permission_auto_allow_false_denies_and_unblocks() -> None:
+    # auto_allow_tools=False must DENY cleanly through the full subprocess path,
+    # NOT hang. The worker sends request_permission; the handler returns
+    # DeniedOutcome(cancelled); the worker still reaches end_turn with
+    # outstanding_count()==0. Guards the 0.3.0 "every worker hangs on
+    # method_not_found" regression on the real liveness path (the unit test only
+    # proves no-raise).
+    old = os.environ.get("GOALFLIGHT_FAKE_ACP_SCENARIO")
+    os.environ["GOALFLIGHT_FAKE_ACP_SCENARIO"] = "permission_codex"
+    try:
+        conn = await spawn_acp_connection(
+            sys.executable, [str(FAKE)], agent="fake",
+            session_id="test-noallow", cwd=str(ROOT), auto_allow_tools=False,
+        )
+        await conn.initialize()
+        await conn.new_session(str(ROOT))
+        try:
+            result = await run_prompt(conn, "go", idle_timeout=5)
+            assert result.ok, result
+            assert "permission:approved" not in result.text, result.text
+            assert conn.client.activity.outstanding_count() == 0
+        finally:
+            await conn.kill()
+    finally:
+        if old is None:
+            os.environ.pop("GOALFLIGHT_FAKE_ACP_SCENARIO", None)
+        else:
+            os.environ["GOALFLIGHT_FAKE_ACP_SCENARIO"] = old
+
+
+async def case_permission_elicitation_unblocks() -> None:
+    # The codex-acp wedge FIX path: an MCP tool that elicits (request_user_input)
+    # surfaces as a session/request_permission once codex-acp runs with
+    # features.tool_call_mcp_elicitation=true. The options carry multiple
+    # allow_always entries + a reject (the real shape captured from
+    # context-mode ctx_index). Auto-allow must pick an allow_always and the
+    # worker must unblock -- never 'cancel'.
+    conn = await _connect("permission_elicitation")
+    try:
+        result = await run_prompt(conn, "go", idle_timeout=5)
+        assert result.ok, result
+        assert "permission:approved-for-session" in result.text, result.text
+        assert "permission:cancel" not in result.text, result.text
+        assert conn.client.activity.outstanding_count() == 0
+    finally:
+        await conn.kill()
+
+
 async def case_tool_tracking_closes() -> None:
     conn = await _connect("tool_tracking")
     try:
@@ -249,6 +343,73 @@ async def case_managed_pool_sdk_connection() -> None:
         assert pool.stats["total"] == 1
 
 
+def case_codex_acp_elicitation_injection_unit() -> None:
+    # The codex-acp wedge fix is injected at the SINGLE spawn boundary
+    # (ensure_codex_acp_elicitation, called by spawn_acp_connection), so it
+    # covers the runner, AcpProcessPool config, and any custom launcher. Without
+    # the flag, an MCP tool that elicits (e.g. context-mode ctx_index) wedges
+    # codex-acp at its first tool call (~0% CPU forever).
+    from goalflight_acp_client import (
+        ensure_codex_acp_elicitation as ensure,
+        CODEX_ACP_ELICITATION_ARGS,
+    )
+    FLAG = "features.tool_call_mcp_elicitation=true"
+    # bare codex-acp gets the exact flag (order matters: -c then value), prepended
+    assert ensure("codex-acp", []) == ["-c", FLAG]
+    assert ensure("codex-acp", []) == list(CODEX_ACP_ELICITATION_ARGS)
+    # absolute-path basename still matches
+    assert ensure("/opt/homebrew/bin/codex-acp", []) == ["-c", FLAG]
+    # idempotent: never doubles the flag
+    assert ensure("codex-acp", ["-c", FLAG]) == ["-c", FLAG]
+    # preserves caller args (pool config), flag prepended once
+    assert ensure("codex-acp", ["-c", 'model="x"']) == ["-c", FLAG, "-c", 'model="x"']
+    # no-op for every other adapter / command
+    for other in ("grok", "cursor", "claude-code-cli-acp", "/usr/bin/python3"):
+        assert ensure(other, []) == [], other
+        assert FLAG not in ensure(other, ["-x"]), other
+
+
+def case_permission_handler_selection_unit() -> None:
+    # Unit-test GoalflightClient.request_permission selection + deny semantics
+    # directly (no subprocess), against codex-acp's REAL option shape.
+    import types
+    from goalflight_acp_client import GoalflightClient
+
+    def opt(kind: str, oid: str) -> types.SimpleNamespace:
+        return types.SimpleNamespace(kind=kind, option_id=oid, name=kind)
+
+    tc = types.SimpleNamespace(tool_call_id="t1", id="t1", title="Edit foo")
+    codex = [opt("allow_once", "approved"), opt("reject_once", "abort")]
+
+    async def _run() -> None:
+        client = GoalflightClient(auto_allow_tools=True)
+        # codex shape -> picks the allow_once, returns an AllowedOutcome
+        r = await client.request_permission(codex, "s", tc)
+        assert r.outcome.outcome == "selected", r.outcome
+        assert getattr(r.outcome, "option_id", None) == "approved", r.outcome
+        # reject offered FIRST -> still the allow, never 'abort'
+        r2 = await client.request_permission(list(reversed(codex)), "s", tc)
+        assert getattr(r2.outcome, "option_id", None) == "approved", r2.outcome
+        # allow_always beats allow_once even when offered last
+        three = [opt("reject_once", "no"), opt("allow_once", "once"), opt("allow_always", "always")]
+        r3 = await client.request_permission(three, "s", tc)
+        assert getattr(r3.outcome, "option_id", None) == "always", r3.outcome
+        # only reject options -> cancel, never wrap a reject id in AllowedOutcome
+        r4 = await client.request_permission([opt("reject_once", "abort")], "s", tc)
+        assert r4.outcome.outcome == "cancelled", r4.outcome
+        # malformed "allow"-prefix kinds (allowed/allowance/allowfoo) are NOT
+        # allow_* options -> must fail closed (cancel), never auto-grant.
+        r4b = await client.request_permission([opt("allowed", "sneaky"), opt("allowance", "x")], "s", tc)
+        assert r4b.outcome.outcome == "cancelled", r4b.outcome
+        # auto_allow_tools=False -> deny cleanly; must NOT raise method_not_found
+        # (the 0.3.0 "every worker hangs on first tool call" regression).
+        denier = GoalflightClient(auto_allow_tools=False)
+        r5 = await denier.request_permission(codex, "s", tc)
+        assert r5.outcome.outcome == "cancelled", r5.outcome
+
+    asyncio.run(_run())
+
+
 def case_marker_parser() -> None:
     sample = "**STATUS:** working\nUSER-CONFIRM: approve\nCOMPLETE: done\n"
     markers = extract_markers(sample)
@@ -268,6 +429,11 @@ async def amain() -> None:
     await case_overlimit_response_fails_cleanly()
     await case_runner_overlimit_response_status_counts_drop()
     await case_permission_auto_allow()
+    await case_permission_codex_shape_unblocks()
+    await case_permission_reject_first_picks_allow()
+    await case_permission_reject_only_cancels_and_unblocks()
+    await case_permission_auto_allow_false_denies_and_unblocks()
+    await case_permission_elicitation_unblocks()
     await case_tool_tracking_closes()
     await case_fine_chunks_vendor_no_dup_marker()
     await case_realtime_blocked_cancels_before_prompt_resolves()
@@ -278,6 +444,8 @@ async def amain() -> None:
 
 def main() -> None:
     case_marker_parser()
+    case_codex_acp_elicitation_injection_unit()
+    case_permission_handler_selection_unit()
     case_pool_ceiling_fallback()
     asyncio.run(amain())
     print("OK: ACP SDK pipe tests pass")

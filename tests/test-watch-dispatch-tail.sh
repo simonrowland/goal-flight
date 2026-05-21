@@ -16,7 +16,29 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 WATCHER="$REPO_ROOT/scripts/watch-dispatch-tail.sh"
-PIDFILE_DIR=/tmp/goal-flight-acp-pids.d
+
+# Hermetic pidfile dir. The watcher honors $GOAL_FLIGHT_PIDFILE_DIR, so exporting
+# it here makes every watcher child register under a private temp dir instead of
+# the real production dir (/tmp/goal-flight-acp-pids.d).
+#
+# Why this matters: case 4 deliberately lets the controller-proxy die, which makes
+# its still-alive worker a genuine "orphan". If the test wrote into the shared
+# production dir, a concurrent acp_client.cleanup_ghosts() (real goal-flight
+# activity, or a sibling test) would legitimately reap that orphan — SIGKILL the
+# worker and unlink the pidfile — mid-test. That surfaced as a ~1-in-3 flake on
+# "case-4 pidfile preserved" (got=removed), passing on re-run, depending purely on
+# whether anything else triggered cleanup_ghosts during the ~2s window. Cases 1/3
+# escaped it only because their controller ($$) stays alive, so cleanup_ghosts
+# skips them. Isolating the dir removes the shared-state dependency entirely.
+PIDFILE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/goal-flight-test-pids.XXXXXX")" || {
+  # Refuse to silently fall back to the shared production dir (an empty
+  # GOAL_FLIGHT_PIDFILE_DIR would make the watcher use its default) — that would
+  # reintroduce the very cross-contamination this isolation prevents.
+  echo "FATAL: mktemp -d failed; cannot create isolated pidfile dir" >&2
+  exit 1
+}
+export GOAL_FLIGHT_PIDFILE_DIR="$PIDFILE_DIR"
+trap 'rm -rf "$PIDFILE_DIR"' EXIT
 
 pass=0
 fail=0

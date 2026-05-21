@@ -24,7 +24,7 @@ from goalflight_acp_client import (  # noqa: E402
     AcpProcessPool,
     PoolExhaustedError,
 )
-from goalflight_acp_run import decide_terminal_state, spawn_and_handshake_with_retry  # noqa: E402
+from goalflight_acp_run import adapter_liveness_config, decide_terminal_state, spawn_and_handshake_with_retry  # noqa: E402
 from goalflight_liveness import heartbeat_wedge_decision, progress_stall_decision  # noqa: E402
 
 
@@ -161,6 +161,20 @@ def case_progress_stall_wall_ignores_raw_vendor_noise() -> None:
     ) is True
 
 
+def case_adapter_manifest_liveness_defaults() -> None:
+    profile, remote_turn_silence_s = adapter_liveness_config("codex")
+    assert profile == "remote_api"
+    assert remote_turn_silence_s == 1200.0
+
+    profile, remote_turn_silence_s = adapter_liveness_config("claude")
+    assert profile == "remote_api"
+    assert remote_turn_silence_s == 1200.0
+
+    profile, remote_turn_silence_s = adapter_liveness_config("missing-agent")
+    assert profile == "local_compute"
+    assert remote_turn_silence_s == 1200.0
+
+
 def _pid_alive(pid: object) -> bool:
     if not isinstance(pid, int):
         return False
@@ -225,6 +239,9 @@ def _run_fake_runner(
     idle_timeout: float = 10.0,
     max_quiet_s: float = 10.0,
     max_tool_s: float = 10.0,
+    liveness_profile: str | None = None,
+    remote_turn_silence_s: float | None = None,
+    remote_turn_cancel_grace_s: float = 0.1,
     extra_env: dict[str, str] | None = None,
     timeout_s: float = 8.0,
 ) -> tuple[int, dict, str, str]:
@@ -269,6 +286,11 @@ def _run_fake_runner(
             str(max_tool_s),
             "--json",
         ]
+        if liveness_profile is not None:
+            args.extend(["--liveness-profile", liveness_profile])
+        if remote_turn_silence_s is not None:
+            args.extend(["--remote-turn-silence-s", str(remote_turn_silence_s)])
+            args.extend(["--remote-turn-cancel-grace-s", str(remote_turn_cancel_grace_s)])
         proc = subprocess.Popen(
             args,
             cwd=ROOT,
@@ -312,6 +334,7 @@ def case_runner_progress_then_silent_wedges_and_reaps() -> None:
     returncode, status, stdout, stderr = _run_fake_runner(
         "progress_then_silent",
         progress_stall_s=30.0,
+        liveness_profile="local_compute",
     )
 
     assert returncode != 0, stdout
@@ -319,6 +342,73 @@ def case_runner_progress_then_silent_wedges_and_reaps() -> None:
     assert status["error"]["message"] == "wedged_by_heartbeat", status
     assert status["wedge_progress_seen"] >= 1, status
     assert status["heartbeat_dead_samples"] >= 2, status
+    assert status["worker_alive"] is False, status
+    assert not _pid_alive(status.get("worker_pid")), (status, stderr)
+
+
+def case_runner_remote_long_reasoning_pause_survives_old_walls() -> None:
+    returncode, status, stdout, stderr = _run_fake_runner(
+        "long_reasoning_pause",
+        progress_stall_s=0.3,
+        idle_timeout=0.0,
+        max_quiet_s=0.3,
+        max_tool_s=30.0,
+        liveness_profile="remote_api",
+        remote_turn_silence_s=3.0,
+        extra_env={"GOALFLIGHT_FAKE_ACP_LONG_PAUSE_S": "1.0"},
+        timeout_s=8.0,
+    )
+
+    assert returncode == 0, (stdout, stderr, status)
+    assert status["state"] == "complete", status
+    assert status["ok"] is True, status
+    assert status["liveness_profile"] == "remote_api", status
+    assert "finished" in (status.get("text_excerpt") or ""), status
+    assert status["worker_alive"] is False, status
+    assert not _pid_alive(status.get("worker_pid")), (status, stderr)
+
+
+def case_runner_remote_dead_silent_turn_hits_remote_wall() -> None:
+    returncode, status, stdout, stderr = _run_fake_runner(
+        "dead_silent_turn",
+        progress_stall_s=30.0,
+        heartbeat_interval=0.1,
+        idle_timeout=0.0,
+        max_quiet_s=30.0,
+        max_tool_s=30.0,
+        liveness_profile="remote_api",
+        remote_turn_silence_s=0.4,
+        remote_turn_cancel_grace_s=0.1,
+        timeout_s=8.0,
+    )
+
+    assert returncode != 0, stdout
+    assert status["state"] == "remote_turn_silence", status
+    assert status["error"]["message"] == "remote_turn_silence", status
+    assert status["liveness_profile"] == "remote_api", status
+    assert status["turn_silent_for_s"] >= 0.4, status
+    assert status["worker_alive"] is False, status
+    assert not _pid_alive(status.get("worker_pid")), (status, stderr)
+
+
+def case_runner_thought_stream_survives_progress_stall_wall() -> None:
+    returncode, status, stdout, stderr = _run_fake_runner(
+        "thought_stream_pause",
+        progress_stall_s=0.3,
+        heartbeat_interval=0.05,
+        idle_timeout=0.0,
+        max_quiet_s=30.0,
+        extra_env={
+            "GOALFLIGHT_FAKE_ACP_INTERVAL": "0.2",
+            "GOALFLIGHT_FAKE_ACP_THOUGHT_CHUNKS": "5",
+        },
+        timeout_s=8.0,
+    )
+
+    assert returncode == 0, (stdout, stderr, status)
+    assert status["state"] == "complete", status
+    assert status["ok"] is True, status
+    assert status["wedge_progress_seen"] >= 1, status
     assert status["worker_alive"] is False, status
     assert not _pid_alive(status.get("worker_pid")), (status, stderr)
 
@@ -612,8 +702,12 @@ def main() -> None:
     case_standard_progress_resets_wedge_streak()
     case_permission_timeout_unblocks_wedge()
     case_progress_stall_wall_ignores_raw_vendor_noise()
+    case_adapter_manifest_liveness_defaults()
     case_runner_raw_vendor_flood_hits_progress_stall_and_reaps()
     case_runner_progress_then_silent_wedges_and_reaps()
+    case_runner_remote_long_reasoning_pause_survives_old_walls()
+    case_runner_remote_dead_silent_turn_hits_remote_wall()
+    case_runner_thought_stream_survives_progress_stall_wall()
     case_terminal_state_endturn_beats_tail_race_wedge()
     case_runner_idle_silent_idle_timeout_reaps()
     case_runner_oversized_frame_dropped_then_completes()

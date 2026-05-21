@@ -60,7 +60,11 @@ CPU_EPSILON=0.1
 # is the watcher mirror of the runner's intra-decision re-sample grace
 # (goalflight_liveness.cpu_liveness_keep_waiting) — same goal, keep them aligned.
 WEDGE_CONFIRM_SAMPLES=2
-PIDFILE_DIR=/tmp/goal-flight-acp-pids.d
+# Pidfile dir. Honors $GOAL_FLIGHT_PIDFILE_DIR so tests can redirect registration
+# into an isolated temp dir. Default is unchanged, so in production the watcher and
+# scripts/acp_client.py still share /tmp/goal-flight-acp-pids.d and cleanup_ghosts
+# reaps uniformly across both dispatch paths.
+PIDFILE_DIR="${GOAL_FLIGHT_PIDFILE_DIR:-/tmp/goal-flight-acp-pids.d}"
 
 usage() {
   sed -n '1,/^$/p' "$0" >&2

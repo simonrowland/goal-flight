@@ -19,6 +19,13 @@ from typing import Any, Callable
 import uuid
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+ADAPTERS_DIR = SCRIPT_DIR.parent / "adapters"
+DEFAULT_REMOTE_TURN_SILENCE_S = 1200.0
+DEFAULT_REMOTE_TURN_CANCEL_GRACE_S = 15.0
+LIVENESS_PROFILES = {"remote_api", "local_compute", "hybrid"}
+AGENT_MANIFEST_ALIASES = {
+    "claude": "claude-code",
+}
 
 
 def _acp_reexec_target() -> str | None:
@@ -81,7 +88,40 @@ def agent_command(agent: str) -> tuple[str, list[str]]:
         return "cursor-agent", ["acp"]
     if agent == "claude":
         return "claude-code-cli-acp", []
+    # codex-acp needs the MCP-elicitation flag, but it is injected at the single
+    # spawn boundary (ensure_codex_acp_elicitation, called by spawn_acp_connection)
+    # so it covers pool/custom callers too -- not only this runner helper.
     return agent, []
+
+
+def _adapter_manifest_candidates(agent: str) -> list[Path]:
+    names = [agent, AGENT_MANIFEST_ALIASES.get(agent)]
+    if "/" in agent:
+        names.append(Path(agent).stem)
+    return [ADAPTERS_DIR / f"{name}.json" for name in names if name]
+
+
+def adapter_liveness_config(agent: str) -> tuple[str, float]:
+    for path in _adapter_manifest_candidates(agent):
+        if not path.exists():
+            continue
+        try:
+            manifest = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            break
+        status_contract = manifest.get("status_contract") or {}
+        profile = str(status_contract.get("liveness_profile") or "local_compute")
+        if profile not in LIVENESS_PROFILES:
+            profile = "local_compute"
+        silence_s = status_contract.get("remote_turn_silence_s")
+        try:
+            remote_turn_silence_s = float(silence_s)
+        except (TypeError, ValueError):
+            remote_turn_silence_s = DEFAULT_REMOTE_TURN_SILENCE_S
+        if remote_turn_silence_s <= 0:
+            remote_turn_silence_s = DEFAULT_REMOTE_TURN_SILENCE_S
+        return profile, remote_turn_silence_s
+    return "local_compute", DEFAULT_REMOTE_TURN_SILENCE_S
 
 
 def _now() -> int:
@@ -209,6 +249,26 @@ async def spawn_and_handshake_with_retry(
 async def run(args: argparse.Namespace) -> dict:
     if not hasattr(args, "progress_stall_s") or args.progress_stall_s is None:
         args.progress_stall_s = 300.0
+    manifest_profile, manifest_remote_turn_silence_s = adapter_liveness_config(args.agent)
+    liveness_profile = getattr(args, "liveness_profile", None) or manifest_profile
+    if liveness_profile not in LIVENESS_PROFILES:
+        liveness_profile = "local_compute"
+    remote_turn_silence_s = getattr(args, "remote_turn_silence_s", None)
+    if remote_turn_silence_s is None:
+        remote_turn_silence_s = manifest_remote_turn_silence_s
+    try:
+        remote_turn_silence_s = float(remote_turn_silence_s)
+    except (TypeError, ValueError):
+        remote_turn_silence_s = DEFAULT_REMOTE_TURN_SILENCE_S
+    if remote_turn_silence_s <= 0:
+        remote_turn_silence_s = DEFAULT_REMOTE_TURN_SILENCE_S
+    remote_turn_cancel_grace_s = getattr(args, "remote_turn_cancel_grace_s", DEFAULT_REMOTE_TURN_CANCEL_GRACE_S)
+    try:
+        remote_turn_cancel_grace_s = float(remote_turn_cancel_grace_s)
+    except (TypeError, ValueError):
+        remote_turn_cancel_grace_s = DEFAULT_REMOTE_TURN_CANCEL_GRACE_S
+    if remote_turn_cancel_grace_s < 0:
+        remote_turn_cancel_grace_s = DEFAULT_REMOTE_TURN_CANCEL_GRACE_S
     dispatch_id = args.dispatch_id or f"acp-{args.agent}-{uuid.uuid4().hex[:8]}"
     status_path = Path(args.status_json) if args.status_json else Path(args.cwd) / f".goalflight-{dispatch_id}.status.json"
     payload: dict = {
@@ -230,6 +290,10 @@ async def run(args: argparse.Namespace) -> dict:
         "heartbeat_at": None,
         "progress_quiet_for_s": 0.0,
         "progress_stall_s": None,
+        "liveness_profile": liveness_profile,
+        "remote_turn_silence_s": remote_turn_silence_s,
+        "turn_in_flight": False,
+        "turn_silent_for_s": 0.0,
         "updated_at": _now(),
     }
     status_lock = asyncio.Lock()
@@ -367,6 +431,8 @@ async def run(args: argparse.Namespace) -> dict:
             dropped_frames = int(snapshot.get("dropped_frames", 0))
             quiet_for_s = float(snapshot["quiet_for_s"])
             progress_quiet_s = float(snapshot["progress_quiet_for_s"])
+            turn_in_flight = bool(snapshot.get("turn_in_flight"))
+            turn_silent_for_s = float(snapshot.get("turn_silent_for_s", 0.0))
             timed_out_tool = activity.timed_out(now_mono, args.max_tool_s)
             pid_alive = proc.returncode is None
             # Per-tool wall is ABSOLUTE: a tool outstanding longer than
@@ -388,6 +454,49 @@ async def run(args: argparse.Namespace) -> dict:
                 )
                 await conn.kill()
                 return
+            if (
+                liveness_profile == "remote_api"
+                and turn_in_flight
+                and outstanding_count == 0
+                and pid_alive
+            ):
+                if turn_silent_for_s >= remote_turn_silence_s:
+                    await mark_heartbeat_terminal(
+                        "remote_turn_silence",
+                        {
+                            "code": -1,
+                            "message": "remote_turn_silence",
+                            "turn_silent_for_s": round(turn_silent_for_s, 3),
+                            "remote_turn_silence_s": round(remote_turn_silence_s, 3),
+                        },
+                    )
+                    with contextlib.suppress(Exception):
+                        await asyncio.wait_for(conn.cancel(), timeout=1.0)
+                    if remote_turn_cancel_grace_s > 0:
+                        await asyncio.sleep(remote_turn_cancel_grace_s)
+                    await conn.kill()
+                    return
+                dead_samples = 0
+                await update_status(
+                    worker_pid=proc.pid,
+                    pgid=pgid,
+                    worker_alive=pid_alive,
+                    pgroup_cpu_pct=cpu_pct,
+                    heartbeat_at=_now(),
+                    heartbeat_dead_samples=dead_samples,
+                    wedge_progress_seen=progress_seen,
+                    outstanding_tool_calls=outstanding_count,
+                    acp_dropped_frames=dropped_frames,
+                    quiet_for_s=round(quiet_for_s, 3),
+                    progress_quiet_for_s=round(progress_quiet_s, 3),
+                    progress_stall_s=args.progress_stall_s,
+                    turn_in_flight=True,
+                    turn_silent_for_s=round(turn_silent_for_s, 3),
+                    liveness_profile=liveness_profile,
+                    remote_turn_silence_s=round(remote_turn_silence_s, 3),
+                )
+                await asyncio.sleep(args.heartbeat_interval)
+                continue
             if progress_stall_decision(
                 pid_alive=pid_alive,
                 progress_quiet_s=progress_quiet_s,
@@ -442,6 +551,8 @@ async def run(args: argparse.Namespace) -> dict:
                 quiet_for_s=round(quiet_for_s, 3),
                 progress_quiet_for_s=round(progress_quiet_s, 3),
                 progress_stall_s=args.progress_stall_s,
+                turn_in_flight=turn_in_flight,
+                turn_silent_for_s=round(turn_silent_for_s, 3),
             )
             if decision.wedged:
                 await mark_heartbeat_terminal(
@@ -461,6 +572,8 @@ async def run(args: argparse.Namespace) -> dict:
         outstanding_count = int(snapshot["outstanding_count"])
         dropped_frames = int(snapshot.get("dropped_frames", 0))
         progress_quiet_s = float(snapshot["progress_quiet_for_s"])
+        turn_in_flight = bool(snapshot.get("turn_in_flight"))
+        turn_silent_for_s = float(snapshot.get("turn_silent_for_s", 0.0))
         await update_status(
             state="running",
             events_seen=seen,
@@ -471,6 +584,8 @@ async def run(args: argparse.Namespace) -> dict:
             last_event_at=_now(),
             last_event_kind=str(snapshot.get("last_event_kind") or _event_kind(event)),
             outstanding_tool_calls=outstanding_count,
+            turn_in_flight=turn_in_flight,
+            turn_silent_for_s=round(turn_silent_for_s, 3),
             worker_pid=proc.pid if proc else None,
             pgid=payload.get("pgid"),
             worker_alive=(proc.returncode is None) if proc else False,
@@ -486,6 +601,19 @@ async def run(args: argparse.Namespace) -> dict:
         # wedged ⇒ let the runner cancel.
         if proc is None or proc.returncode is not None:
             return False
+        if liveness_profile == "remote_api" and activity.turn_in_flight():
+            now_mono = active_monotonic()
+            await update_status(
+                state="running_remote_turn",
+                worker_alive=True,
+                heartbeat_at=_now(),
+                turn_in_flight=True,
+                turn_silent_for_s=round(activity.turn_silent_for(now_mono), 3),
+                outstanding_tool_calls=activity.outstanding_count(now_mono),
+                liveness_profile=liveness_profile,
+                remote_turn_silence_s=round(remote_turn_silence_s, 3),
+            )
+            return True
         pgid = payload.get("pgid") or process_group_id(proc.pid) or proc.pid
         keep_waiting, cpu = await idle_gate.keep_waiting(
             lambda: asyncio.to_thread(pgroup_cpu_pct, pgid)
@@ -593,7 +721,7 @@ async def run(args: argparse.Namespace) -> dict:
             # end_turn; without this the record would be self-contradictory
             # (state=complete, killed_by_heartbeat=true) and mislead a controller
             # keying retry off the flag.
-            "killed_by_heartbeat": state in ("wedged", "tool_timeout"),
+            "killed_by_heartbeat": state in ("wedged", "tool_timeout", "remote_turn_silence"),
             "wedged_by_heartbeat": state == "wedged",
         })
     except Exception as e:
@@ -605,6 +733,8 @@ async def run(args: argparse.Namespace) -> dict:
                 "state": terminal_by_heartbeat or "wedged",
                 "ok": False,
                 "error": terminal_error or {"code": -1, "message": terminal_by_heartbeat or "wedged"},
+                "killed_by_heartbeat": True,
+                "wedged_by_heartbeat": (terminal_by_heartbeat or "wedged") == "wedged",
             })
         else:
             payload.update({"state": "failed", "error": f"{type(e).__name__}: {e}"})
@@ -631,6 +761,8 @@ async def run(args: argparse.Namespace) -> dict:
                 acp_dropped_frames=int(snapshot.get("dropped_frames", 0)),
                 progress_quiet_for_s=round(float(snapshot["progress_quiet_for_s"]), 3),
                 progress_stall_s=args.progress_stall_s,
+                turn_in_flight=bool(snapshot.get("turn_in_flight")),
+                turn_silent_for_s=round(float(snapshot.get("turn_silent_for_s", 0.0)), 3),
                 worker_alive=proc.returncode is None,
                 pgid=payload.get("pgid") or process_group_id(proc.pid) or proc.pid,
                 heartbeat_at=_now(),
@@ -703,6 +835,24 @@ def main(argv: list[str] | None = None) -> int:
         type=float,
         default=float(os.environ.get("GOALFLIGHT_PROGRESS_STALL_S", "300")),
         help="Standard-progress silence hard wall. Raw vendor events do not reset it.",
+    )
+    parser.add_argument(
+        "--liveness-profile",
+        choices=sorted(LIVENESS_PROFILES),
+        default=None,
+        help="Override adapter liveness profile. Defaults to adapters/<agent>.json status_contract.",
+    )
+    parser.add_argument(
+        "--remote-turn-silence-s",
+        type=float,
+        default=None,
+        help="Remote-API in-flight prompt-turn silence wall. Defaults to adapter override or 1200s.",
+    )
+    parser.add_argument(
+        "--remote-turn-cancel-grace-s",
+        type=float,
+        default=float(os.environ.get("GOALFLIGHT_REMOTE_TURN_CANCEL_GRACE_S", str(DEFAULT_REMOTE_TURN_CANCEL_GRACE_S))),
+        help="Seconds to wait after ACP cancel before killing a remote silent turn.",
     )
     parser.add_argument(
         "--cpu-epsilon",

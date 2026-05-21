@@ -169,9 +169,12 @@ async def managed_pool(
     acceptable BEFORE dispatching; once a chunk is dispatched, every tool the
     worker requests is in-scope by construction. The AcpProcessPool default
     (False) is appropriate for chat-bridge use where each tool call is its own
-    user-interaction event. Pass auto_allow_tools=False here explicitly only
-    if you want the worker to hang on session/request_permission for diagnostic
-    purposes.
+    user-interaction event. Pass auto_allow_tools=False here explicitly if you
+    want the controller to auto-DENY every permission request: the handler
+    returns a clean DeniedOutcome(cancelled), so the worker cancels the gated
+    call and continues/fails rather than wedging. (Older builds raised
+    method_not_found here, which hung permission-gating adapters — see
+    GoalflightClient.request_permission.)
 
     idle_cleanup_ttl_seconds: connections with last_active older than this are
     reaped by a background task. Defaults to 300s (5 min). Critical for long

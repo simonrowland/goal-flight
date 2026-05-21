@@ -37,8 +37,6 @@ WEDGE_PROGRESS_KINDS = {
     "tool_call_update",
     "plan",
 }
-
-
 class _ClientBase(Protocol):
     pass
 
@@ -320,6 +318,29 @@ class AcpLivenessActivity:
     outstanding_tools: dict[str, float] = field(default_factory=dict)
     pending_permissions: dict[str, float] = field(default_factory=dict)
     dropped_frames: int = 0
+    turn_started_mono: float | None = None
+    turn_completed_mono: float | None = None
+    turn_stop_reason: str | None = None
+
+    def begin_turn(self, now: float | None = None) -> None:
+        now = active_monotonic() if now is None else now
+        self.turn_started_mono = now
+        self.turn_completed_mono = None
+        self.turn_stop_reason = None
+
+    def finish_turn(self, stop_reason: str | None = None, now: float | None = None) -> None:
+        now = active_monotonic() if now is None else now
+        self.turn_completed_mono = now
+        self.turn_stop_reason = stop_reason or "unknown"
+
+    def turn_in_flight(self) -> bool:
+        return self.turn_started_mono is not None and self.turn_stop_reason is None
+
+    def turn_silent_for(self, now: float | None = None) -> float:
+        if self.turn_started_mono is None:
+            return 0.0
+        now = active_monotonic() if now is None else now
+        return max(0.0, now - max(self.turn_started_mono, self.last_event_mono))
 
     def note_message(self, message: dict[str, Any], now: float | None = None) -> str:
         now = active_monotonic() if now is None else now
@@ -412,6 +433,9 @@ class AcpLivenessActivity:
             "progress_quiet_for_s": now - self.last_progress_mono,
             "outstanding_count": self.outstanding_count(now),
             "dropped_frames": self.dropped_frames,
+            "turn_in_flight": self.turn_in_flight(),
+            "turn_silent_for_s": self.turn_silent_for(now),
+            "turn_stop_reason": self.turn_stop_reason,
         }
 
 
@@ -489,27 +513,59 @@ class GoalflightClient(ClientBase):  # type: ignore[misc, valid-type]
         if self.turn_queue is not None:
             self.turn_queue.put_nowait({"source": "observer", "kind": kind, "message": message})
 
+    @staticmethod
+    def _select_allow_option(options: list[Any]) -> str | None:
+        """Pick the option id to auto-grant, or None if none is grantable.
+
+        Prefer the most permissive ALLOW (allow_always > allow_once), then ANY
+        non-reject kind (covers future allow-like kinds), in offered order.
+        NEVER auto-select a ``reject_*`` option: real adapters send e.g.
+        codex-acp's ``[allow_once 'approved', reject_once 'abort']`` (no
+        allow_always), and a worker may offer them reject-first -- the old
+        ``options[0]`` fallback would then turn an auto-allow into an auto-DENY.
+        Returns None when only reject options exist; the caller then cancels
+        cleanly (still a definitive answer, so the worker never wedges).
+        """
+        opts = list(options or [])
+        for pref in ("allow_always", "allow_once"):
+            for opt in opts:
+                if getattr(opt, "kind", None) == pref:
+                    option_id = getattr(opt, "option_id", None)
+                    if option_id:
+                        return option_id
+        for opt in opts:
+            kind = getattr(opt, "kind", None)
+            option_id = getattr(opt, "option_id", None)
+            # Fail closed: only an explicit allow_* kind may be auto-granted (this
+            # catches any future allow_* beyond allow_always/allow_once). A
+            # kindless or unknown kind -- cancel / defer / deny_once / ... -- must
+            # NOT be treated as allow-like, or an auto-allow could approve a deny
+            # variant. Those fall through to a clean DeniedOutcome(cancelled).
+            if option_id and kind is not None and str(kind).startswith("allow_"):
+                return option_id
+        return None
+
     async def request_permission(self, options: list[Any], session_id: str, tool_call: Any, **kwargs: Any) -> Any:
         tool_id = getattr(tool_call, "tool_call_id", None) or getattr(tool_call, "id", None)
-        if not self.auto_allow_tools:
-            raise RequestError.method_not_found("session/request_permission")
-        chosen_id: str | None = None
-        for kind_pref in ("allow_always", "allow_once"):
-            for opt in options or []:
-                if getattr(opt, "kind", None) == kind_pref:
-                    chosen_id = getattr(opt, "option_id", None)
-                    break
-            if chosen_id:
-                break
-        if not chosen_id and options:
-            chosen_id = getattr(options[0], "option_id", None)
+        # Always clear pending-permission liveness tracking: we ARE answering the
+        # request, on every path below (grant OR deny).
         self.activity.resolve_permission(str(tool_id) if tool_id else None)
+        if not self.auto_allow_tools:
+            # Deny cleanly rather than raising method_not_found. method_not_found
+            # advertises "this client has no permission method at all", and some
+            # adapters (the 0.3.0-era codex-acp) then HANG on the unanswered gate
+            # -- the "every worker hangs on its first tool call" regression. A
+            # DeniedOutcome is a definitive answer: the worker cancels the gated
+            # call and proceeds/fails instead of wedging. auto_allow_tools=False
+            # means "do not auto-grant", which is exactly a deny.
+            return RequestPermissionResponse(outcome=DeniedOutcome(outcome="cancelled"))
+        chosen_id = self._select_allow_option(options)
         if chosen_id:
             log.info("auto-allow permission: %s -> optionId=%s", getattr(tool_call, "title", "?"), chosen_id)
             return RequestPermissionResponse(
                 outcome=AllowedOutcome(outcome="selected", option_id=chosen_id)
             )
-        log.warning("auto-allow permission request had no selectable options; cancelling")
+        log.warning("auto-allow permission request had no allow option; cancelling")
         return RequestPermissionResponse(outcome=DeniedOutcome(outcome="cancelled"))
 
     async def session_update(self, session_id: str, update: Any, **kwargs: Any) -> None:
@@ -642,7 +698,17 @@ class GoalflightAcpConnection:
         require_acp_sdk()
         if not self.acp_session_id:
             raise AcpError("prompt called before new_session")
-        return await self.conn.prompt(session_id=self.acp_session_id, prompt=[text_block(text)])
+        self.client.activity.begin_turn(active_monotonic())
+        try:
+            response = await self.conn.prompt(session_id=self.acp_session_id, prompt=[text_block(text)])
+        except asyncio.CancelledError:
+            self.client.activity.finish_turn("cancelled", active_monotonic())
+            raise
+        except Exception:
+            self.client.activity.finish_turn("error", active_monotonic())
+            raise
+        self.client.activity.finish_turn(getattr(response, "stop_reason", None), active_monotonic())
+        return response
 
     async def cancel(self, session_id: str | None = None) -> None:
         if not self.acp_session_id and not session_id:
@@ -709,6 +775,31 @@ class GoalflightAcpConnection:
             return self.alive
 
 
+# codex-acp routes MCP-server elicitation (request_user_input) into a hang
+# UNLESS told to surface it through the ACP permission channel. Without this flag
+# an MCP tool that elicits -- e.g. context-mode's ctx_index -- wedges the worker
+# on its first tool call: codex-acp neither forwards the elicitation over ACP
+# (even when the client advertises ClientCapabilities.elicitation) nor rejects it
+# the way `codex exec` does ("request_user_input is not supported in exec mode");
+# the tool_call stays in_progress at ~0% CPU forever (reproduced + bisected
+# 2026-05-21). With the flag the elicitation arrives as a session/request_permission
+# (title "Approve <tool>", standard allow_*/reject_* options) that
+# GoalflightClient.request_permission auto-allows, so the tool completes.
+CODEX_ACP_ELICITATION_ARGS = ["-c", "features.tool_call_mcp_elicitation=true"]
+
+
+def ensure_codex_acp_elicitation(command: str, acp_args: list[str]) -> list[str]:
+    """Guarantee codex-acp is spawned with MCP elicitation routed through the
+    permission channel, for EVERY caller (runner agent_command, AcpProcessPool
+    config, or a custom launcher) -- the single spawn boundary. Idempotent and a
+    no-op for any other adapter. See CODEX_ACP_ELICITATION_ARGS for the why."""
+    if os.path.basename(str(command)) != "codex-acp":
+        return acp_args
+    if "features.tool_call_mcp_elicitation=true" in acp_args:
+        return acp_args
+    return [*CODEX_ACP_ELICITATION_ARGS, *acp_args]
+
+
 async def spawn_acp_connection(
     command: str,
     acp_args: list[str],
@@ -721,6 +812,7 @@ async def spawn_acp_connection(
     activity: AcpLivenessActivity | None = None,
 ) -> GoalflightAcpConnection:
     require_acp_sdk()
+    acp_args = ensure_codex_acp_elicitation(command, acp_args)
     limit = acp_limit_from_env()
     os.makedirs(cwd, exist_ok=True)
     proc = await asyncio.create_subprocess_exec(
