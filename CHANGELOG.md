@@ -4,6 +4,35 @@ Notable changes to the goal-flight Claude Code skill. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are
 incremented when meaningful skill behaviour changes.
 
+## [0.4.6] — 2026-05-21
+
+**Runner liveness: terminal-state precedence fix + hermetic regression coverage.**
+Closes the runner-level test-coverage debt acknowledged in the 0.4.5 SDK-migration
+review, and fixes a terminal-classification edge case found while writing it.
+
+### Fixed
+
+- A genuine `end_turn` now beats a SILENCE-class heartbeat terminal (dead-sample
+  wedge / `progress_stall` / `max_quiet_s` — all reported as `wedged`, all gated on
+  `outstanding_count == 0`) that trips in the brief alive-and-silent tail after a
+  turn completes. Previously the heartbeat verdict was checked unconditionally, so
+  on an aggressive heartbeat cadence a completed turn could be mislabeled `wedged`.
+  `tool_timeout` (a tool left outstanding past `--max-tool-s`) is exempt and still
+  wins — `end_turn` does not refute a dangling-tool anomaly. Classification is now a
+  pure, unit-tested helper (`decide_terminal_state`), and the success-path status
+  record reconciles `killed_by_heartbeat` / `wedged_by_heartbeat` with the final
+  state so a tail-race `complete` is never self-contradictory.
+
+### Added
+
+- Hermetic fake-agent regression tests for the runner paths that lost deterministic
+  coverage in the SDK migration: idle-timeout / `IdleLivenessGate` firing,
+  `spawn_and_handshake_with_retry` kill-before-respawn on a handshake wedge,
+  `AcpProcessPool` exhaustion + drain, oversized-frame drop-and-continue, the
+  goal-mode (`idle-timeout=0`) progress-stall and heartbeat backstops, per-tool
+  `tool_timeout` reaping, and the `decide_terminal_state` precedence lattice.
+- Fake-agent scenarios: `idle_silent`, `handshake_wedge`, `tool_stuck`.
+
 ## [0.4.5] — 2026-05-20
 
 **ACP SDK migration.** Replaced the bespoke stdio JSON-RPC transport with the

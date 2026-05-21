@@ -158,6 +158,15 @@ def handle_prompt(req_id: int, params: dict) -> None:
         text_update(session_id, "tool done")
         response(req_id, {"sessionId": session_id, "stopReason": "end_turn"})
         return
+    if SCENARIO == "tool_stuck":
+        # Open a tool call and never resolve it (no completed update, no
+        # end_turn). The outstanding tool keeps outstanding_count > 0, which
+        # gates OFF the silence-class backstops (dead-sample wedge / progress
+        # stall / max_quiet all require outstanding_count == 0), so the runner's
+        # per-tool absolute wall (--max-tool-s) is the deterministic terminal.
+        tool_update(session_id, "tool_call", "tool-stuck", status="pending")
+        while True:
+            time.sleep(1.0)
     if SCENARIO == "fine_chunks_vendor":
         for chunk in ("COM", "P", "LETE", ": ", "gro", "k ", "sm", "oke", "\n"):
             text_update(session_id, chunk)
@@ -171,6 +180,15 @@ def handle_prompt(req_id: int, params: dict) -> None:
             time.sleep(interval)
     if SCENARIO == "progress_then_silent":
         text_update(session_id, "started")
+        while True:
+            time.sleep(1.0)
+    if SCENARIO == "idle_silent":
+        # Handshake completes, then the prompt turn emits NOTHING and never
+        # responds — models a worker that goes fully event-silent (no progress,
+        # no vendor noise). The heartbeat wedge can't fire (it requires >=1 prior
+        # progress event), so the runner's idle-timeout / IdleLivenessGate path
+        # is the only thing that can reap it. Stays low-CPU so the CPU-aware idle
+        # gate classifies it wedged rather than running_quiet.
         while True:
             time.sleep(1.0)
     if SCENARIO == "blocked":
@@ -217,6 +235,13 @@ def handle(message: dict) -> None:
 
 
 def main() -> None:
+    if SCENARIO == "handshake_wedge":
+        # Spawn, then never read stdin or answer initialize — the intermittent
+        # codex-acp handshake wedge (worker is up but the handshake hangs).
+        # spawn_and_handshake_with_retry must hit its handshake_timeout, kill
+        # this worker, and respawn (the kill-before-respawn invariant).
+        while True:
+            time.sleep(1.0)
     while True:
         message = read_message()
         if message is None:

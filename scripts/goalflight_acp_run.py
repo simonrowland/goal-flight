@@ -91,6 +91,59 @@ def _event_kind(event: dict) -> str:
     return str(event.get("params", {}).get("update", {}).get("sessionUpdate") or event.get("method") or "event")
 
 
+def decide_terminal_state(
+    *,
+    result_ok: bool,
+    result_error: dict | None,
+    heartbeat_outcome: str | None,
+    killed_by_heartbeat: bool,
+    cancelled_for_marker: bool,
+    early_marker: str | None,
+    heartbeat_error: dict | None,
+) -> tuple[str, dict | None]:
+    """Resolve the runner's terminal (state, error) from the prompt result and
+    the heartbeat verdict, in priority order.
+
+    A genuine end_turn (``result_ok``) refutes the SILENCE-class heartbeat
+    terminals — the dead-sample wedge, ``progress_stall``, and ``max_quiet_s``,
+    all reported as ``"wedged"`` and all gated on ``outstanding_count == 0``.
+    Those fire on inactivity; the heartbeat loop keeps sampling until the outer
+    ``finally`` cancels it, so a worker that has ALREADY completed its turn is
+    briefly alive-and-silent (returned from the turn, waiting to be closed) and
+    on an aggressive cadence one of them can trip in that tail AFTER end_turn was
+    received. The worker *spoke* (a terminal end_turn), so it was not silently
+    wedged: result_ok wins. This can never mask a real silence wedge, because a
+    worker killed mid-turn cannot emit end_turn (the SDK rejects the pending
+    prompt on the closed pipe), so a real wedge always has ``result_ok`` False.
+
+    ``tool_timeout`` is NOT a silence signal: it fires while a tool is still
+    OUTSTANDING (``outstanding_count > 0``) past its absolute wall
+    (``--max-tool-s``). end_turn does not refute it — a worker that ends its turn
+    leaving a tool it opened unresolved past the wall is a real anomaly the
+    operator must see — so tool_timeout wins even over result_ok.
+
+    A killed-but-no-recorded-outcome race defaults to the silence-class
+    ``"wedged"`` (the dead-sample wedge is what the kill-without-outcome path is).
+    """
+    heartbeat_terminal = heartbeat_outcome or ("wedged" if killed_by_heartbeat else None)
+    # tool_timeout is an outstanding-tool anomaly, not silence — never masked.
+    if heartbeat_terminal == "tool_timeout":
+        return "tool_timeout", heartbeat_error or {"code": -1, "message": "tool_timeout"}
+    # Silence-class heartbeat terminals win only if the turn didn't complete;
+    # a genuine end_turn refutes them.
+    if heartbeat_terminal and not result_ok:
+        return heartbeat_terminal, heartbeat_error or {"code": -1, "message": heartbeat_terminal}
+    if cancelled_for_marker:
+        return "blocked", {
+            "code": 0,
+            "message": "early_marker_cancelled",
+            "marker": early_marker,
+        }
+    if result_ok:
+        return "complete", result_error
+    return "failed", result_error
+
+
 async def spawn_and_handshake_with_retry(
     command: str,
     acp_args: list[str],
@@ -486,19 +539,15 @@ async def run(args: argparse.Namespace) -> dict:
         async with status_lock:
             terminal_by_heartbeat = heartbeat_outcome or getattr(conn, "heartbeat_outcome", None)
             terminal_error = heartbeat_error
-        if terminal_by_heartbeat or getattr(conn, "killed_by_heartbeat", False):
-            state = terminal_by_heartbeat or "wedged"
-            error = terminal_error or {"code": -1, "message": state}
-        elif result.cancelled_for_marker:
-            state = "blocked"
-            error = {
-                "code": 0,
-                "message": "early_marker_cancelled",
-                "marker": result.early_marker,
-            }
-        else:
-            state = "complete" if result.ok else "failed"
-            error = result.error
+        state, error = decide_terminal_state(
+            result_ok=result.ok,
+            result_error=result.error,
+            heartbeat_outcome=terminal_by_heartbeat,
+            killed_by_heartbeat=bool(getattr(conn, "killed_by_heartbeat", False)),
+            cancelled_for_marker=result.cancelled_for_marker,
+            early_marker=result.early_marker,
+            heartbeat_error=terminal_error,
+        )
         if state == "complete" and (
             markers.get("BLOCKED") or markers.get("USER-NEED") or markers.get("USER-CONFIRM")
         ):
@@ -512,6 +561,14 @@ async def run(args: argparse.Namespace) -> dict:
             "last_marker": {kind: values[-1] for kind, values in markers.items() if values} or None,
             "text_excerpt": result.text[-4000:],
             "out_of_scope_writes": result.out_of_scope_writes,
+            # Reconcile the heartbeat flags with the FINAL verdict. A tail-race
+            # heartbeat may have written killed/wedged into the payload before
+            # decide_terminal_state ruled the turn complete on a genuine
+            # end_turn; without this the record would be self-contradictory
+            # (state=complete, killed_by_heartbeat=true) and mislead a controller
+            # keying retry off the flag.
+            "killed_by_heartbeat": state in ("wedged", "tool_timeout"),
+            "wedged_by_heartbeat": state == "wedged",
         })
     except Exception as e:
         async with status_lock:
