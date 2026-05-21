@@ -1,0 +1,130 @@
+{
+  "schema": "goalflight.agent-adapter.v1",
+  "agent_id": "grok",
+  "display_name": "Grok CLI",
+  "agent_family": "grok",
+  "providers": {
+    "controller_provider": "xai",
+    "model_provider": "xai",
+    "same_provider_policy": "forbid_self_review"
+  },
+  "support": {
+    "controller": {
+      "capability": "candidate",
+      "evidence": ["survey: Grok CLI has ACP/headless claims but official invocation maturity is still gated", "repo: ACP runner maps grok to grok agent stdio"],
+      "readiness_requirements": ["binary", "version", "auth_optional", "safe_args", "status_contract"],
+      "fallback": "worker_only"
+    },
+    "worker": {
+      "capability": "candidate",
+      "transport": ["acp", "cli_json", "tail_file"],
+      "readiness_requirements": ["binary", "version", "noninteractive", "status_contract", "safe_args"],
+      "fallback": "tail_file"
+    }
+  },
+  "local_readiness_state": {
+    "storage": "machine-local, never checked in",
+    "path_pattern": "$XDG_STATE_HOME/goal-flight/readiness/<agent>.json",
+    "controller": "probe_required",
+    "worker": "probe_required",
+    "last_probe_ids": ["grok-path", "grok-version", "grok-help"],
+    "updated_at": null
+  },
+  "live_gate": {
+    "function": "validate_adapter_gate",
+    "controller_allowed_expr": "support.controller.capability == supported && local_readiness.controller == ready",
+    "worker_allowed_expr": "support.worker.capability == supported && local_readiness.worker == ready && requested_transport is verified",
+    "default": "deny",
+    "support_status_enum": ["unsupported", "config_only", "probe_required", "candidate", "not_installed", "forbidden-arg", "failed", "blocked"],
+    "return_fields": ["allowed", "reason", "required_probe_ids", "blocked_fields", "safe_next_action", "live_controller_allowed", "live_worker_dispatch_allowed"]
+  },
+  "tool_name_map": {
+    "shell_exec": {"host_tools": ["grok CLI", "shell"], "constraints": ["safe probes only"]},
+    "read_file": {"host_tools": ["workspace file read"], "constraints": ["workspace reads only"]},
+    "write_file": {"host_tools": ["workspace edit"], "constraints": ["authorized edit scope only"]},
+    "search": {"host_tools": ["workspace search"], "constraints": ["filtered search"]},
+    "delegate": {"host_tools": ["grok agent stdio"], "constraints": ["candidate until live gate verified"]},
+    "ask_user": {"host_tools": ["USER-NEED marker"], "constraints": ["block on ambiguity"]},
+    "plan_update": {"host_tools": ["status markers"], "constraints": ["controller tracks plan externally"]},
+    "memory_search": {"host_tools": ["repo resume notes", "Grok session state"], "constraints": ["repo files remain canonical"]},
+    "browser_ui": {"host_tools": ["browser tool if host exposes one"], "constraints": ["only when available"]}
+  },
+  "invocation": {
+    "skill_triggers": ["goal-flight", "Grok worker"],
+    "commands": ["grok agent stdio"],
+    "exec": {
+      "kind": "acp",
+      "binary": "grok",
+      "args": ["agent", "stdio"],
+      "arg_policy": {
+        "required_safe_args": ["agent", "stdio"],
+        "forbidden_args": ["--yolo", "-y", "--dangerously-*", "--dangerously-bypass-approvals-and-sandbox", "--dangerously-skip-permissions", "--allow-dangerously-skip-permissions", "--always-approve", "--allow-all-tools", "--trust-all-tools", "--auto-approve", "--auto-accept", "--skip-permissions", "--no-sandbox", "--disable-sandbox", "--sandbox-disable"],
+        "requires_explicit_justification": ["--bare", "--auto", "--batch-api", "--headless-with-approval-bypass"],
+        "reject_in": ["invocation", "probes", "generated_wrappers", "checked_in_configs"]
+      },
+      "stdin": "prompt",
+      "cwd_policy": "repo_required",
+      "output_contract": {
+        "parser": "status_json",
+        "completion_detection": "structured_final_event",
+        "final_event": "ACP prompt result",
+        "final_regex": "Goal complete: (true|false)",
+        "exit_code_policy": "mapped",
+        "resume_args": [],
+        "goal_mode_eligible": true
+      }
+    }
+  },
+  "permission_surface": {
+    "file_reads": ["workspace files"],
+    "file_writes": ["authorized edit scope only"],
+    "shell": {"allowed_families": ["safe probes", "test runner"], "forbidden_families": ["permission bypass", "destructive reset", "raw web fetch"]},
+    "network": {"allowed": false, "user_gate": true, "notes": "Auth/model calls are not discovery probes."},
+    "browser_ui": {"allowed": false, "user_gate": true, "notes": "No verified browser UI contract."},
+    "memory_writes": {"allowed": false, "backend": "repo_files"},
+    "plugin_sandbox": {"mode": "none", "declared_permissions": []},
+    "auto_approve_detection": {"probes": ["grok-args-scan"], "strict_fail": true},
+    "secrets": ["GROK_API_KEY"],
+    "irreversible_ops": ["git reset --hard", "force push", "rm -rf"]
+  },
+  "memory_backend": {
+    "canonical": "repo_files",
+    "repo_files": [".goal-flight/**"],
+    "host_native": {"role": "advisory", "backend": "Grok session state"},
+    "mirror_writeback": false,
+    "source_epoch": "goal-flight-0.5.0",
+    "snapshot_id": "grok-host-adapter",
+    "migration_lock_required_for_writeback": true,
+    "drift_policy": "warn_and_prefer_repo"
+  },
+  "packaging": {
+    "checked_in_wrappers": ["configs/grok/"],
+    "generated_outputs": ["dist/grok/"],
+    "install_actions": [],
+    "plugin_manifest": {"supported": false, "path": null, "api_status": "unsupported"},
+    "mcp": {"required": false, "servers": []},
+    "validation": ["json parse", "schema required groups", "candidate gate stays deny"]
+  },
+  "discovery": {
+    "budget": {"max_path_probes": 4, "max_version_probes": 1, "max_help_probes": 1, "max_ms_per_probe": 6000, "max_total_ms_per_agent": 20000, "max_total_ms_all_agents": 90000, "max_stdout_bytes_per_probe": 4096, "max_stderr_bytes_per_probe": 4096, "network_default": "deny", "model_consuming": "forbidden"},
+    "probes": [
+      {"id": "grok-path", "class": "path", "argv": ["sh", "-lc", "command -v grok || test -x ~/.grok/bin/grok"], "safe_for_setup": true, "network": false, "model_consuming": false, "env_scrub": true},
+      {"id": "grok-version", "class": "version", "argv": ["grok", "--version"], "safe_for_setup": true, "network": false, "model_consuming": false, "env_scrub": true},
+      {"id": "grok-help", "class": "help", "argv": ["grok", "--help"], "safe_for_setup": true, "network": false, "model_consuming": false, "env_scrub": true}
+    ]
+  },
+  "status_contract": {
+    "schema": "goalflight.acp-run.v1",
+    "liveness_profile": "remote_api",
+    "heartbeat_required": true,
+    "dispatcher_owns_heartbeat": true,
+    "status_file": ".goal-flight/status/<dispatch_id>.json",
+    "transport_instance_id": "grok:<pid>:<dispatch_id>",
+    "seq": "monotonic integer",
+    "parser_type": "acp",
+    "marker_namespace": "goalflight:<dispatch_id>:<transport>:<seq>",
+    "stale_after_s": 180,
+    "terminal_states": ["complete", "failed", "blocked", "wedged"]
+  },
+  "host_projection": {}
+}

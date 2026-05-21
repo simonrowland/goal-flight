@@ -1,5 +1,5 @@
 ---
-description: "Spawn read-only question-finding subagents before unattended work."
+description: "Spawn read-only question-finding workers before unattended work."
 ---
 
 # ask-questions [--scope <area>]
@@ -8,7 +8,7 @@ Read:
 
 - `protocols/dispatch-routing.md`
 
-Spawn read-only subagents to anticipate integration / requirements / snags questions. Surface only the ones with enough context to make sense to the user. Goal: clear ambiguities up front so the 12-hour unattended run doesn't stall on user input.
+Spawn read-only workers to anticipate integration / requirements / snags questions. Surface only the ones with enough context to make sense to the user. Goal: clear ambiguities up front so the 12-hour unattended run doesn't stall on user input.
 
 ## Modes
 
@@ -27,15 +27,15 @@ Spawn read-only subagents to anticipate integration / requirements / snags quest
 | `current-chunk` (continuous mode) | The chunk currently being executed; surface only blockers |
 | `next-chunks` (continuous mode, look-ahead) | Next 1-2 upcoming chunks; non-blocking surfacing |
 
-### 2. Spawn 1-2 anticipatory subagents
+### 2. Spawn 1-2 anticipatory workers
 
-**Read-only Explore subagents** with the prompt at `prompts/ask-anticipatory.md`. Substitute the scope and paths. Each subagent:
+Use read-only explorer workers through the host `delegate` operation with the prompt at `prompts/ask-anticipatory.md` (current Claude wrapper: Explore subagents; other hosts: adapter delegate equivalent). Substitute the scope and paths. Each worker:
 
 1. Scans the goal-queue, AGENTS.md, any binding-spec, recent git log.
 2. Generates `(question, default-answer, confidence, risk-if-wrong, second-opinion-suggestion)` tuples.
-3. For low-confidence items: notes "consider second opinion from <other model>" — codex if Claude is uncertain; claude if codex is uncertain.
+3. For low-confidence items: notes "consider second opinion from <other ready, concern-diverse reviewer>" — for example, if the controller's primary model is Claude in the current wrapper, use a codex/cursor/grok peer; if the controller is codex, use a Claude-compatible/cursor/grok peer.
 
-If two subagents are spawned (recommended for `decomposition` scope; one is sufficient for `current-chunk`), run in parallel and dedupe results.
+If two workers are spawned (recommended for `decomposition` scope; one is sufficient for `current-chunk`), run in parallel and dedupe results.
 
 ### 3. Filter aggressively
 
@@ -52,20 +52,20 @@ Keep:
 
 ### 4. Second-opinion sweep for uncertain defaults
 
-If a subagent flagged "consider second opinion" for an item that you'd otherwise default on:
+If a worker flagged "consider second opinion" for an item that you'd otherwise default on:
 
-- If both codex and Claude reviewers are available: spawn a quick reviewer of the other type with just that item. Compare answers. If they agree, default silently. If they disagree, escalate to user.
-- If only one model is available: ask the user.
+- If a ready concern-diverse peer reviewer is available: spawn a quick reviewer of that peer type with just that item. Compare answers. If they agree, default silently. If they disagree, escalate to user.
+- If no ready peer reviewer is available: ask the user.
 
-### 4.5. Dual-subagent planning for open architectural questions
+### 4.5. Dual-worker planning for open architectural questions
 
-If anticipator surfaced a question that's bigger than a default-or-ask — an open architectural question where the right answer needs thought rather than user knowledge — consider the dual-subagent adversarial planning pattern (`prompts/dual-plan-adversarial.md`). Dispatch two planners in parallel with different lenses (chemistry-first vs engineering-first, performance-first vs correctness-first, etc.); each writes a plan document; controller synthesizes. Cheaper for context than one large planner; the adversarial divergence is the value.
+If anticipator surfaced a question that's bigger than a default-or-ask — an open architectural question where the right answer needs thought rather than user knowledge — consider the dual-worker adversarial planning pattern (`prompts/dual-plan-adversarial.md`). Dispatch two planners in parallel with different lenses (chemistry-first vs engineering-first, performance-first vs correctness-first, etc.); each writes a plan document; controller synthesizes. Cheaper for context than one large planner; the adversarial divergence is the value.
 
 Use this sparingly — only for questions that genuinely benefit from two complementary perspectives. For most ambiguities, the single-anticipator + default-or-ask flow is enough.
 
 ### 5. Present to user
 
-Use `AskUserQuestion`. Max 4 questions per call (group related; if more remain, present in batches). For each:
+Use the `ask_user` operation. Max 4 questions per call (group related; if more remain, present in batches). For each:
 
 - **Question**: phrased so a user can answer in <30 seconds.
 - **Options**: the controller's recommended default first (label it "(recommended)"), with a one-line rationale in the description.
@@ -81,7 +81,7 @@ Append to `<repo-root>/docs-private/<topic>-answers-<today>.md` (create if not p
 ## Q<N>: <question>
 - **Asked**: <iso-timestamp>
 - **Scope**: <decomposition | <area> | current-chunk | next-chunks>
-- **Source**: anticipatory subagent (codex|claude|both) / mid-execute pause
+- **Source**: anticipatory worker (`<adapter-id>` | `multiple`) / mid-execute pause
 - **Default proposed**: <controller's default>
 - **User answered**: <answer or "accepted default">
 - **Affects chunks**: <list of chunk numbers/slugs>
@@ -95,4 +95,4 @@ When invoked from inside `execute`:
 
 - **Block the loop only if** the answer is required for the current chunk's safe completion (e.g., "should I drop the column or rename it?" — destructive choice the user must make).
 - **Otherwise non-blocking**: queue the question in the answers file and continue. Address at the next natural pause (after current commit, or before next milestone review).
-- **Look-ahead questions**: spawned by the post-commit look-ahead subagent. These are always non-blocking; queue them for the next standalone ask-questions invocation.
+- **Look-ahead questions**: spawned by the post-commit look-ahead worker. These are always non-blocking; queue them for the next standalone ask-questions invocation.

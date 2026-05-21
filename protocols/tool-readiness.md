@@ -14,14 +14,25 @@ JSON mode:
 python3 <skill-root>/scripts/goalflight_doctor.py --project-root "$PWD" --json
 ```
 
-Readiness decisions:
+Readiness decisions have two layers:
 
-- Claude plugin validation failure: block plugin release.
+- **Static capability**: adapter manifest says the worker/controller can support a
+  transport, permission mode, setup probe, or model/status query.
+- **Local readiness**: this machine/session passes the live gate for that
+  capability: executable present, version/status probe usable, adapter handshake
+  works, and required registration exists.
+
+Never route from static capability alone. Use local readiness for scheduling:
+
+- Plugin/package validation failure: block release for the affected package or
+  adapter path.
 - Codex Desktop present but `codex` CLI missing: suggest `npm install -g @openai/codex && codex login`; Desktop implies the user likely has an OpenAI account.
 - Cursor Desktop without `cursor`: suggest Cursor command-palette shell-command install.
 - Cursor Desktop without `cursor-agent`: Cursor manual use is possible; ACP worker use is not.
 - Grok binary without Grok Build/headless flags: do not route headless work to Grok.
-- No ACP adapters: dispatch falls back to Bash-tail watcher.
+- ACP-capable adapter declared but handshake fails: do not route ACP work to that
+  worker; use another ready adapter or a legacy fallback.
+- No locally ready ACP adapters: dispatch falls back to Bash-tail watcher.
 - context-mode missing on the side that will process large output: warn before long review or log-heavy command.
 
 Capacity decisions come from:

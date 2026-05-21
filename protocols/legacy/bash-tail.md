@@ -39,7 +39,8 @@ Worker invocations. All three drop a tail file the watcher polls. Replace
 ```bash
 codex exec \
   --skip-git-repo-check \
-  --dangerously-bypass-approvals-and-sandbox \
+  --sandbox workspace-write \
+  -c approval_policy=never \
   -C "<workdir>" \
   - < <prompt.md> \
   > /tmp/codex-<slug>.txt 2>&1 &
@@ -55,10 +56,13 @@ documents the canonical `/goal` mode invocation including the
   directories by default. Worktrees under `.claude/worktrees/` are git
   repos and don't need this; chunks dispatched into `/tmp/` or other
   non-git workspaces do.
-- `--dangerously-bypass-approvals-and-sandbox` — required for non-
+- `--sandbox workspace-write -c approval_policy=never` — required for non-
   interactive operation. Codex's permission UI is a stdin TTY and would
-  block forever on `codex exec`. The bypass flag is binary: it grants
-  the process full local authority. See the safety story below.
+  block forever on `codex exec` without `approval_policy=never`;
+  `workspace-write` grants in-workspace edit authority. Do NOT use
+  `--dangerously-bypass-approvals-and-sandbox`: it drops the sandbox
+  entirely and is rejected by some controllers' auto-mode safety
+  classifiers. See the safety story below.
 
 ### grok (headless one-shot)
 

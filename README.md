@@ -1,10 +1,11 @@
 # goal-flight
 
-A [Claude Code](https://claude.ai/code) skill that turns a fresh session into a **controller** for long, decomposed code work. Claude Code runs out of context on multi-chunk refactors when one agent does everything; goal-flight delegates concrete work to /goal subagents with review loops, and keeps the controller small, so multi-hour unattended runs land as a clean stack of one-commit-per-chunk on main without the controller's context window filling up. Deterministic runtime facts live in helper scripts, not in the conversation.
+goal-flight is a portable skill core plus host wrappers for long, decomposed code work. The current checked-in wrapper targets [Claude Code](https://claude.ai/code); generated wrappers can project the same command/protocol/script core into other controllers through adapter manifests. One controller doing every edit runs out of context on multi-chunk refactors, so goal-flight delegates concrete work to workers with review loops and keeps the controller small. Multi-hour unattended runs can then land as a clean stack of one-commit-per-chunk on main without the controller's context window filling up. Deterministic runtime facts live in helper scripts, not in the conversation.
 
-**What the controller is for**: high-level management, not execution. The controller holds enough context about your project's goal, scenery (constraints, architecture, prior decisions, failure modes), and intent to exercise discretion and recommend the next move — then dispatches actual work to workers (Claude subagents, codex, grok) that don't need that context. This is the frontier of lightly-supervised development: you check in, ratify suggested moves, redirect when needed, and trust the controller to keep the project anchored across compactions and unattended hours. The dispatch / review / handoff machinery below is what frees the controller to do that job.
+**What the controller is for**: high-level management, not execution. The controller holds enough context about your project's goal, scenery (constraints, architecture, prior decisions, failure modes), and intent to exercise discretion and recommend the next move — then dispatches actual work to workers (examples: Claude subagents, codex, grok) that don't need that context. This is the frontier of lightly-supervised development: you check in, ratify suggested moves, redirect when needed, and trust the controller to keep the project anchored across compactions and unattended hours. The dispatch / review / handoff machinery below is what frees the controller to do that job.
 
 ```bash
+# Current Claude Code wrapper install example:
 git clone https://github.com/simonrowland/goal-flight.git ~/.claude/skills/goal-flight
 ```
 
@@ -12,21 +13,21 @@ git clone https://github.com/simonrowland/goal-flight.git ~/.claude/skills/goal-
 
 - **Multi-hour unattended runs.** Check in periodically or respond to decision notifications. The controller's context primarily holds architecture, plan, and metadata (queue state, recent commits, in-flight dispatch headers); real work happens in subagent context windows.
 - **Verification-first dispatch.** Wrappers point at files for the agent to investigate, not pre-pasted "facts" that go stale on the timescale of minutes. Frontier models trust controller-text uncritically; pointers force them to re-verify against live disk and surface drift.
-- **Parallel codex + claude reviews at milestone cadence.** Two independent reviewers (Claude + codex) address bugs and completion before pestering you. Via [gstack](https://github.com/garrytan/gstack)'s `/review` skill when installed.
+- **Parallel cross-agent reviews at milestone cadence.** Two independent reviewers (for example Claude + codex) address bugs and completion before pestering you. Via [gstack](https://github.com/garrytan/gstack)'s `/review` skill when installed.
 - **Two-axis dispatch routing** the controller picks from per chunk. **Iteration pattern** (one-shot for most chunks, goal-mode loop for chunks that need plan/act/test/review-to-convergence, controller-direct for trivial work) crosses with **comms shape** (ACP for structured events + sub-billing when the adapter is available; bash-tail as cold-storage fallback). `goal-mode + bash-tail` is codex-`/goal`-only — codex self-terminates with a Final-response marker the watcher detects; other workers lack the equivalent.
-- **Provider-aware routing + rate-pressure walkback.** Code-writing chunks route to codex / cursor first (sub-billed; don't share the controller's Claude session budget); Claude Agent subagents are the third-tier fallback. `scripts/goalflight_rate_pressure.py` watches the dispatch ledger for provider-level rate-limit signatures and surfaces a STATUS marker + recommended fallback when pressure crosses threshold. The doctor surfaces model currency (cursor `composer-X.Y` discovery + CLI-version-currency for codex / grok / claude / claude-code-cli-acp) so you know when a worker update is due.
+- **Provider-aware routing + rate-pressure walkback.** In the current Claude Code wrapper, code-writing chunks route to codex / cursor first (sub-billed; they do not share the controller's Claude session budget); Claude Agent subagents are the third-tier fallback. `scripts/goalflight_rate_pressure.py` watches the dispatch ledger for provider-level rate-limit signatures and surfaces a STATUS marker + recommended fallback when pressure crosses threshold. The doctor surfaces model currency (cursor `composer-X.Y` discovery + CLI-version-currency for codex / grok / claude / claude-code-cli-acp) so you know when a worker update is due.
 - **Procedural runtime state.** Capacity, dispatch ledgers, compact status, log watching, doctor checks, ACP runs, rate-pressure detection, and file-backed review jobs live under `scripts/goalflight_*.py`.
 
 ## How it differs from the alternatives
 
-- vs. **running Claude Code naively** — the controller doesn't itself do the work. It dispatches and verifies, which means it stays small and runs longer before compaction.
-- vs. **claw or cloud agents (Hermes / Cursor agent)** — runs on your machine, in your Claude Code session, with your existing skills (gstack, context-mode, codex). This aims to replace a team of Hermes/OpenClaw code+review agents with a workflow.
+- vs. **running one host controller naively** — the controller doesn't itself do the work. It dispatches and verifies, which means it stays small and runs longer before compaction.
+- vs. **claw or cloud agents (Hermes / Cursor agent)** — runs on your machine, in your controller host, with your existing local tools and adapters. The current Claude Code wrapper can use skills such as gstack, context-mode, and codex; other wrappers should declare equivalent host bindings in adapter manifests.
 - vs. **writing prompts manually** — make the plan, not the code. The skill asks a frontier model to decompose your plan into chunks, flagging what can run in parallel and what can have a /goal pattern. Every `/goal` reviews to convergence by default; the 7-category adversarial self-review runs inside the loop until reviews pass, so the controller never sees a non-converged result.
 
 ## Quickstart
 
 ```bash
-# In your project repo, in a Claude Code session:
+# In your project repo, in a controller session (Claude Code wrapper shown):
 /goal-flight init <topic>         # audit repo, scaffold AGENTS.md + docs-private/,
                                   # build optional RAG corpus, register codex-trust,
                                   # probe box capacity + ACP-worker availability →
@@ -35,8 +36,8 @@ git clone https://github.com/simonrowland/goal-flight.git ~/.claude/skills/goal-
                                   # / ACCEPTANCE / FORBIDDEN), parallel reviewer pass
 /goal-flight execute              # per-chunk dispatch loop (ACP when available, else
                                   # Bash-&-tail-file), embedded self-review,
-                                  # milestone codex+claude reviews every K commits
-/goal-flight doctor               # validate plugin package, companion tools,
+                                  # milestone reviewer examples every K commits
+/goal-flight doctor               # validate wrapper/package health, companion tools,
                                   # codex trust, context-mode, gstack, ACP +
                                   # surface model currency + rate-pressure
 /goal-flight update               # pull latest goal-flight from origin + run
@@ -82,7 +83,7 @@ Detailed operating procedures are split into load-on-demand files under
 | **one-shot subagent** | Default for most chunks. Frontier model picks the executor target based on chunk shape | One subagent dispatch per chunk |
 | **goal-mode loop** | Multi-step refactor, code migration, prototype implementation, converge code to ground-truth — anything that benefits from plan/act/test/review-to-convergence | Multi-hour autonomous session (codex `/goal` natively, or controller-driven iteration loop) |
 
-**Comms shape** (orthogonal axis) — how the controller observes the worker. Goal-flight uses the [Agent Client Protocol](https://agentclientprotocol.com) wherever the worker has an adapter (codex / cursor / claude / grok all do today); bash-tail with a `tail -f`-style marker-grep watcher is the cold-storage fallback. ACP composes with `goal-mode` for any worker; `goal-mode + bash-tail` composes only with codex `/goal` (codex emits a Final-response marker the watcher detects; other workers' headless modes don't).
+**Comms shape** (orthogonal axis) — how the controller observes the worker. Goal-flight uses the [Agent Client Protocol](https://agentclientprotocol.com) wherever the worker has an adapter (codex / cursor / claude / grok all do today); bash-tail with a `tail -f`-style marker-grep watcher is the cold-storage fallback. ACP composes with `goal-mode` for any worker; `goal-mode + bash-tail` composes only with codex `/goal` today (codex emits a Final-response marker the watcher detects; other workers' headless modes don't).
 
 The controller picks executor + comms per chunk based on chunk shape, available adapters, and the rate-pressure walkback's recent observations. The shipped routing defaults lean toward sub-billed workers (codex / cursor / grok) for code-writing — calibrated against the maintainer's current vendor plans, not a project-wide prescription. Adjust to your environment by editing the routing table in `SKILL.md` "Worker Routing"; the walkback adapts dynamically when any one provider gets pressured.
 
@@ -100,7 +101,7 @@ The controller picks executor + comms per chunk based on chunk shape, available 
 
 ## Adapting
 
-This skill ships tuned for high-accuracy scientific programming but the patterns generalize. Workflow: clone the repo, open it in Claude Code, ask Claude to "adapt this skill for a [domain] project; my north star is [X]; my self-review categories should add [Y]; here's our verification command and our invariants." A single Opus subagent can read the whole thing, propose a diff, and apply it in one pass.
+This skill ships tuned for high-accuracy scientific programming but the patterns generalize. Workflow: clone the repo, open it in your controller host (Claude Code wrapper today), and ask the host to adapt the skill for a domain project with a north star, verification command, invariants, and any domain-specific self-review categories. A strong subagent can read the whole thing, propose a diff, and apply it in one pass.
 
 Main tuning knobs:
 

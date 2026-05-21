@@ -56,6 +56,21 @@ orthogonal axes: **iteration pattern** (how many turns) and **comms shape**
     --agent <agent>
   ```
 
+## Worker/controller candidates
+
+Treat routing candidates as first-class only after their readiness gate passes:
+
+| Candidate | Controller use | Worker use | Readiness gate |
+|---|---|---|---|
+| Codex | yes | yes | Desktop/CLI available when needed, context-mode registered for large-output work, ACP handshake passes for structured dispatch. |
+| Cursor | yes | yes | Cursor Desktop or CLI path present for controller use; `cursor-agent` present and ACP handshake passes for worker use; model-currency probe is current or explicitly accepted as stale. |
+| Grok | yes | yes | Grok Build/headless flags present; structured ACP path passes before ACP dispatch; bash-tail is fallback-only and must obey the marker limits in Composition rules. |
+| Claude compatibility path | yes | yes | Adapter-owned CLI/plugin probes pass; startup gate applies where the adapter requires serialized initialization. |
+
+If a candidate has static adapter capability but fails local readiness, do not
+route work to it. Pick another ready candidate with equivalent concern coverage
+or fall back to the legacy watcher when no ACP path is locally ready.
+
 ## Liveness — a quiet worker is not a dead worker
 
 Event/tail silence alone is NOT a wedge signal. A healthy worker grinding a long
@@ -121,6 +136,44 @@ runner and watchers use **process-group CPU** as the false-positive killer:
 gate below frees and prunes the slot the same as `complete`/`failed`.
 `result_too_large` is retained only as a legacy pruning state for old 0.4.3
 records.
+
+## Worker permissions and context-mode over ACP
+
+A spawned worker's permissions resolve **inside the runner subprocess**, not at
+the controller. `goalflight_acp_run.py` answers every `session/request_permission`
+itself via `auto_allow_tools=True` (default). The controller is never in the
+per-tool permission loop and **cannot be asked to approve a tool call in real
+time**. The only worker→controller escalation channel is the text markers
+`USER-NEED:` / `USER-CONFIRM:` (`worker-markers.md`): a worker that needs a human
+decision stops and emits one; the controller relays it.
+
+Two independent gates govern a codex worker. Do not conflate them:
+
+1. **codex sandbox + approval policy** — file writes, shell, network. Open it with
+   `--sandbox workspace-write -c approval_policy=never` (the classifier-safe form
+   of "full permissions"). `--dangerously-bypass-approvals-and-sandbox` is rejected
+   by some controllers' auto-mode safety classifiers and is unnecessary when the
+   worker's edit scope is its workspace.
+2. **MCP elicitation** (`request_user_input`) — raised by tools like context-mode's
+   `ctx_index`. NOT a sandbox/approval matter, so gate #1 does nothing for it. Left
+   unhandled, codex-acp neither forwards nor rejects the elicitation over ACP and
+   the tool call wedges at ~0% CPU until the per-tool wall.
+
+**A codex worker can use context-mode over ACP in auto-mode.** The runner
+auto-injects `-c features.tool_call_mcp_elicitation=true` for codex-acp at the
+single spawn boundary (`ensure_codex_acp_elicitation`); the elicitation then
+arrives as a `request_permission` that `auto_allow_tools` grants, and the tool
+completes. So a worker may index/search/execute via context-mode in a normal
+auto-mode ACP dispatch — **no `tail -f`, no "disable context-mode for ACP."**
+Proven by hermetic tests (`test_acp_pipe.py::case_permission_elicitation_unblocks`,
+`::case_codex_acp_elicitation_injection_unit`) and a live codex-acp + context-mode
+end-to-end run (index + search, completed clean).
+
+Distinct, and still true: do **not** wrap the *dispatch* or a `tail -f` in
+`ctx_execute` / `ctx_batch_execute` (the controller-side caveat in Axis 2 and
+`legacy/bash-tail.md`). That is the controller offloading a long-running spawn
+into context-mode's bounded-command timeout — unrelated to a worker calling
+context-mode tools.
 
 ## Composition rules
 

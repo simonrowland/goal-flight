@@ -1,7 +1,7 @@
 ---
 name: goal-flight
 version: 0.4.7
-description: "long-running unattended controller for chunked code work — init repo, decompose plan, anticipate questions, execute with embedded review and milestone gstack sweeps"
+description: "Claude-compatible wrapper for portable goal-flight core — long-running unattended controller for chunked code work"
 allowed-tools:
   - Bash
   - Read
@@ -21,9 +21,15 @@ triggers:
   - decompose this plan into goal chunks
 ---
 
-Use this skill when the user wants Claude Code to manage code work that is too
-large for one uninterrupted session: decomposed implementation, long refactors,
-review flights, resumable queues, or unattended executor dispatch.
+This checked-in `SKILL.md` is the current Claude Code-compatible wrapper for
+the portable goal-flight core. Keep this front matter and `allowed-tools`
+surface compatible with Claude Code until generated host wrappers land. The
+portable core is the command/protocol/script/adapter surface; adapter manifests
+own host bindings, host tool names, invocation details, and wrapper packaging.
+
+Use this wrapper when a controller must manage code work that is too large for
+one uninterrupted session: decomposed implementation, long refactors, review
+flights, resumable queues, or unattended executor dispatch.
 
 ## Controller Contract
 
@@ -116,9 +122,12 @@ would join this cell. See `protocols/dispatch-routing.md` for the full table.
 
 ## Worker Routing
 
-The controller is a Claude session; Claude Agent-tool subagents share its
-rate-limit budget. Codex/grok/cursor workers consume their own provider
-budgets and do not. Default routing by task:
+The checked-in wrapper currently runs in a Claude Code controller session.
+Native Claude Agent-tool subagents share that session's rate-limit budget.
+Codex/grok/cursor workers consume their own provider budgets and do not. These
+are host-specific examples for this wrapper; portable routing decisions should
+flow through adapter manifests as generated wrappers land. Default routing by
+task:
 
 | Task | Default | Fallback 1 | Fallback 2 |
 |---|---|---|---|

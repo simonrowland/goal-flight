@@ -70,7 +70,7 @@ Before decomposing, **offer the user a polish-skill pass** on the plan source (t
 
 Most often `/office-hours` (interrogative, default). The frontier model can pick differently based on what the plan most needs, or embody the gist directly in its own assistant text. See `protocols/premises.md` for the polish-skill class and the architectural rule.
 
-**Architectural rule** (mirror of `commands/init.md` step 2.5): user-interrogation runs on the orchestrator (this Claude Code session) — Claude-side `Skill(skill: "<name>", args: "...")` OR orchestrator-embodied gist. **Never** `codex exec '/office-hours ...'` or any worker-side dispatch of an interrogative skill — workers have no user-facing channel. Reviewer skills (the second sub-class above) CAN dispatch as workers because they return findings rather than ask questions.
+**Architectural rule** (mirror of `commands/init.md` step 2.5): user-interrogation runs on the controller via `ask_user` plus, when useful, the controller host's `delegate` equivalent for an interrogative skill. In the current Claude wrapper, that means the wrapper-owned delegate path; other hosts use their adapter's delegate equivalent. The controller may also embody the gist directly in assistant text. **Never** dispatch an interrogative skill to a non-user-facing worker — workers have no user-facing channel. Reviewer skills (the second sub-class above) CAN dispatch as workers because they return findings rather than ask questions.
 
 Prompt the user (concisely):
 
@@ -78,8 +78,8 @@ Prompt the user (concisely):
 
 Three outcomes:
 
-- **Accept interrogative**: invoke Claude-side (or embody the gist); distill the user's validated answers into `docs-private/premises-<topic>-<today>.md` Validated section; use the polished plan as input to step 1.
-- **Accept reviewer**: invoke (Claude-side or worker-side); surface the P0/P1 findings to the user; per-finding, the user decides whether to revise the plan, accept the finding into the goal-statement, or note as a known-limitation. Findings are NOT premises; they're todos against the plan. Use the (possibly revised) plan as input to step 1.
+- **Accept interrogative**: invoke through the controller host's `delegate` equivalent (current Claude wrapper: wrapper-owned delegate path; other hosts: adapter delegate equivalent) or embody the gist; distill the user's validated answers into `docs-private/premises-<topic>-<today>.md` Validated section; use the polished plan as input to step 1.
+- **Accept reviewer**: invoke through the controller host's `delegate` equivalent or dispatch a review worker through the chosen adapter; surface the P0/P1 findings to the user; per-finding, the user decides whether to revise the plan, accept the finding into the goal-statement, or note as a known-limitation. Findings are NOT premises; they're todos against the plan. Use the (possibly revised) plan as input to step 1.
 - **Decline**: proceed directly to step 1 with the plan as-is. The inline-office-hours backlog (per `protocols/premises.md`) will surface premise-checks during execution — declining here doesn't disable that.
 - **Already-concrete plan**: if step 0 found a `Status: CONCRETE` goal-statement AND the plan source has explicit acceptance criteria, you can skip the offer silently — the polish is unlikely to surface anything new.
 
@@ -87,13 +87,13 @@ This is the front-end complement to inline-office-hours' per-chunk premise-check
 
 ### 1. Establish plan source
 
-- File arg present: read it (delegate to Explore subagent if >300 lines).
+- File arg present: read it (delegate to an explorer worker if >300 lines; current Claude wrapper: Explore subagent; other hosts: adapter delegate equivalent).
 - No arg: scan the recent conversation for plan-shaped content (numbered phases, "step 1 / step 2", architecture sections, refactor discussions). Summarize what plan you think they mean (1-2 sentences) and confirm with the user before proceeding.
 - If multiple candidates: list them and ask which.
 
 ### 2. Spawn drafter + analyst (sequential — analyst depends on drafter)
 
-**Drafter** (general-purpose Agent): produce the numbered `/goal` decomposition.
+**Drafter** (general-purpose worker via the host `delegate` operation; current Claude wrapper: general-purpose subagent; other hosts: adapter delegate equivalent): produce the numbered `/goal` decomposition.
 
 > "Read the plan below. Decompose it into N self-contained `/goal` chunks. Each chunk must have SCOPE / CHECKLIST / ACCEPTANCE / FORBIDDEN sections (skeleton at the bottom of this prompt). Smallest-first; imperative voice. Number them 1..N. Surface anything in the plan that resists decomposition or requires controller-side judgement. Plan: <paste plan text or path>.
 >
@@ -124,19 +124,19 @@ This is the front-end complement to inline-office-hours' per-chunk premise-check
 > - <explicit anti-scope: paths or patterns not to touch>
 > ```"
 
-When drafter completes, **analyst** (Explore): identify parallel-safe chunks AND trivial chunks the controller can handle inline.
+When drafter completes, **analyst** (explorer worker via the host `delegate` operation; current Claude wrapper: Explore subagent; other hosts: adapter delegate equivalent): identify parallel-safe chunks AND trivial chunks the controller can handle inline.
 
 > "Given these N drafted chunks, two tagging passes:
 >
 > (1) **`[parallel-safe:<group-id>]`** — chunks that touch disjoint files/modules and could safely run in parallel worktrees. Chunks in the same group can run together; different groups must be sequential relative to each other if they share dependencies. Conservative bias: when unsure, do not tag.
 >
-> (2) **`[controller-direct]`** — chunks where dispatching a subagent would cost more than just doing the work inline. Two distinct triggers:
+> (2) **`[controller-direct]`** — chunks where dispatching a worker would cost more than just doing the work inline. Two distinct triggers:
 >
 >     **A. Trivially small work.** Single-file change, < ~30 LoC delta, no cross-module coupling, no new public surface, no test-harness changes. Dispatch overhead exceeds the work. Examples: typo fixes, version bumps, single-constant renames, single-line bug fixes confirmed against an existing failing test.
 >
->     **B. Too much context to explain.** The controller has already loaded substantial relevant state (read files, traced data flow, accumulated reasoning across prior chunks in this session) that a fresh subagent would have to re-discover via dispatch wrapper. When the cost of EXPLAINING the context (wrapper rendering + executor re-load) exceeds the cost of just doing the work, controller-direct wins on the same overhead-arbitrage logic as case A, but for a different reason. Heuristic: if a clean dispatch wrapper for this chunk would exceed ~5 KB (the verification-first target size per `prompts/dispatch-wrapper.md`) primarily because the chunk depends on session-loaded controller state, prefer inline. Common shapes: mid-debug chunks where the controller has just diagnosed the bug; chunks that resolve a P0 from a milestone review the controller just consumed; chunks that depend on rolling decisions made in the last 10 turns that haven't been promoted to `docs-private/rag/decisions.md` yet.
+>     **B. Too much context to explain.** The controller has already loaded substantial relevant state (read files, traced data flow, accumulated reasoning across prior chunks in this session) that a fresh worker would have to re-discover via dispatch wrapper. When the cost of EXPLAINING the context (wrapper rendering + executor re-load) exceeds the cost of just doing the work, controller-direct wins on the same overhead-arbitrage logic as case A, but for a different reason. Heuristic: if a clean dispatch wrapper for this chunk would exceed ~5 KB (the verification-first target size per `prompts/dispatch-wrapper.md`) primarily because the chunk depends on session-loaded controller state, prefer inline. Common shapes: mid-debug chunks where the controller has just diagnosed the bug; chunks that resolve a P0 from a milestone review the controller just consumed; chunks that depend on rolling decisions made in the last 10 turns that haven't been promoted to `docs-private/rag/decisions.md` yet.
 >
-> Conservative bias: when unsure, do NOT tag — let `execute.md` dispatch a subagent. The default subagent path is safer for ambiguous cases (clean context, transcript record, parallel-safe candidates).
+> Conservative bias: when unsure, do NOT tag — let `execute.md` dispatch a worker. The default worker-dispatch path is safer for ambiguous cases (clean context, transcript record, parallel-safe candidates).
 >
 > Report which file paths each chunk touches (audit trail for parallel safety + controller-direct triviality). Drafter output: <paste>."
 
@@ -185,18 +185,19 @@ If a same-day file exists, append new chunks numbered after the last existing en
 
 **Two reviewers in parallel.** The decomposition is the artifact under review. Both reviewers use the same gstack `/plan-eng-review` framing (when installed) for consistent severity ranking; they produce independent findings since they're different models.
 
-**Claude challenger** — preferred Claude-side path:
+**Controller-host challenger** — primary reviewer through the controller's host adapter:
 
-- If gstack registered on Claude side (`~/.claude/skills/gstack/` exists): invoke `Skill(skill: "plan-eng-review", args: "<path to docs-private/goal-queue-<topic>-<today>.md>. Reference: docs-private/goal-<topic>-*.md, AGENTS.md.")` directly, OR dispatch a subagent that invokes it (use subagent if you want to isolate context). (Legacy file naming patterns from <0.3.0 also accepted on read.)
-- If gstack absent on Claude side: spawn a subagent (Agent tool, general-purpose) with `prompts/decomposition-review.md` prompt + same plan + decomposition + the goal-statement pasted in.
+- Use the controller host's `delegate` equivalent for a gstack `/plan-eng-review` run when that host has gstack registered. In the current Claude wrapper, this is the wrapper-owned delegate path; other hosts use their adapter's delegate equivalent. Reference: `<path to docs-private/goal-queue-<topic>-<today>.md>`, `docs-private/goal-<topic>-*.md`, `AGENTS.md`. (Legacy file naming patterns from <0.3.0 also accepted on read.)
+- If gstack is absent for the controller host: delegate a general-purpose reviewer through the host adapter with `prompts/decomposition-review.md` prompt + same plan + decomposition + the goal-statement pasted in.
 
-**Codex challenger** (background, parallel second opinion):
+**Peer challenger** (background, parallel second opinion through a different ready adapter):
 
-- If gstack registered on codex side (`~/.codex/skills/gstack/` exists):
+- Choose a concern-diverse ready peer adapter (codex, cursor, grok, or another adapter that passes readiness). Use that adapter's declared `delegate` / invocation mapping. The codex commands below are adapter examples, not the default host path.
+- Codex adapter example, if gstack registered on codex side (`~/.codex/skills/gstack/` exists):
   ```bash
   timeout --kill-after=10 300 codex exec '/plan-eng-review <path to docs-private/goal-queue-<topic>-<today>.md>. Reference: docs-private/goal-<topic>-*.md, AGENTS.md.' > /tmp/goal-flight-decomp-codex-<topic>.txt 2>&1 &
   ```
-- If gstack absent on codex side — point codex at the prompt file on disk, don't paste its contents into the exec arg:
+- Codex adapter example, if gstack absent on codex side — point codex at the prompt file on disk, don't paste its contents into the exec arg:
   ```bash
   timeout --kill-after=10 300 codex exec \
     "Read <skill-root>/prompts/decomposition-review.md in full and execute it. Plan: <path-to-plan-file>. Drafted decomposition: docs-private/goal-queue-<topic>-<today>.md (or legacy <topic>-goal-queue-<today>.md from <0.3.0). Goal-statement: docs-private/goal-<topic>-*.md (or legacy <topic>-goal-statement-*.md). If your context compacts mid-review, re-read the prompts file — the file is the unparaphrased source of truth." \
@@ -206,13 +207,13 @@ If a same-day file exists, append new chunks numbered after the last existing en
 
 Capture the PID. The output goes to a temp file.
 
-Wait for both. (Codex: poll the temp file or `wait $PID`. Claude reviewer: returns when done.)
+Wait for both. (Codex adapter example: poll the temp file or `wait $PID`. Controller-host reviewer returns when done.)
 
-If codex stalls (the `timeout(1)` wrapper fires after 300 s, or the optional watchdog kills on zero-output >=90 s / no-progress >=180 s): proceed with the Claude reviewer's findings only. Note in RESUME-NOTES' "In-flight" section.
+If the peer challenger stalls (codex adapter example: the `timeout(1)` wrapper fires after 300 s, or the optional watchdog kills on zero-output >=90 s / no-progress >=180 s): proceed with the controller-host reviewer's findings only. Note in RESUME-NOTES' "In-flight" section.
 
 ### 4.5. Verify the decomposition serves the goal
 
-Spawn a quick coherence subagent (Explore):
+Spawn a quick coherence worker through the host `delegate` operation (current Claude wrapper: Explore subagent; other hosts: adapter delegate equivalent):
 
 > "Read goal-statement: `<paste file content>`. Read drafted decomposition: `<paste numbered chunks>`. Does this decomposition, if executed end-to-end, plausibly achieve the goal-statement's success criteria? List any chunks that don't trace to a goal element. List any goal elements that no chunk addresses. Score: aligned / partial / divergent."
 
@@ -222,7 +223,7 @@ If `partial` or `divergent`: surface to user; do NOT proceed to ask-questions un
 
 Dedupe findings across the two reviewers. Severity-rank P0/P1/P2/P3. Surface to user:
 
-> "Decomposition reviewed by codex + claude. Found N P0 (must-fix), M P1 (should-fix), K P2 (nice-to-have). [Brief summary of each P0/P1.] Want me to revise the decomposition before continuing, or proceed to ask-questions?"
+> "Decomposition reviewed by controller-host reviewer + peer reviewer. Found N P0 (must-fix), M P1 (should-fix), K P2 (nice-to-have). [Brief summary of each P0/P1.] Want me to revise the decomposition before continuing, or proceed to ask-questions?"
 
 If user says revise: re-spawn the drafter with the findings as input; loop back to step 3.
 
@@ -246,4 +247,4 @@ Unless the user explicitly said no in step 6, immediately invoke `commands/ask-q
 
 ### 8. Update RESUME-NOTES
 
-Refresh `docs-private/RESUME-NOTES-<today>.md` (bump rev) with: decomposition complete, N chunks, K parallel-safe groups, queue file path, next step `/goal-flight execute`. Delegate the writing to a subagent so the controller doesn't burn its own context.
+Refresh `docs-private/RESUME-NOTES-<today>.md` (bump rev) with: decomposition complete, N chunks, K parallel-safe groups, queue file path, next step `/goal-flight execute`. Delegate the writing to a worker through the host `delegate` operation so the controller doesn't burn its own context.

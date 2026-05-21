@@ -22,10 +22,19 @@ python3 <skill-root>/scripts/goalflight_doctor.py --project-root "$PWD" --json
 ## Required Checks
 
 The script owns the checks; this file names the contract so tests and humans can
-verify drift.
+verify drift. In the current implementation, doctor reports static adapter
+manifest validity plus local availability checks: PATH/binary presence, selected
+CLI versions, context-mode registration, gstack, project state, capacity, model
+currency probes, and rate-pressure signals.
 
-- `claude plugin validate <goal-flight-root>`
-- `claude --version`
+It does **not** yet prove full worker/controller routeability. The bounded ACP
+handshake plus `validate_adapter_gate` routeability gate is forthcoming in Phase
+3 chunk 11 and is **not enforced by `goalflight_doctor.py` yet**. Until then,
+ACP rows in doctor output mean "binary/entrypoint present on this machine", not
+"structured dispatch has passed a live ACP handshake".
+
+- Validate goal-flight packaging and adapter manifests. Host-native validators
+  are adapter-owned compatibility probes, not the core readiness source.
 - Check Codex Desktop:
   - `/Applications/Codex.app`
   - `mdfind 'kMDItemCFBundleIdentifier == "com.openai.codex"'`
@@ -34,14 +43,21 @@ verify drift.
   `Codex Desktop found, but codex CLI missing. Install CLI with npm install -g @openai/codex && codex login. Desktop install implies the user likely already has an OpenAI account; CLI login should use that account.`
 - Check context-mode registration with `scripts/register-context-mode-codex.py --check`.
 - Check `gstack --version`.
-- Check Cursor Desktop, `cursor`, and `cursor-agent`.
-  - `/Applications/Cursor.app`
-  - `command -v cursor`
-  - `command -v cursor-agent`
-- Check Grok Build, including headless flags.
-  - `--prompt-file`
-  - `--permission-mode`
-- Check ACP worker adapters: `codex-acp`, `cursor-agent`, `claude-code-cli-acp`, `grok agent stdio`.
+- Check first-class local worker/controller candidates:
+  - Codex: Desktop/CLI present, context-mode registered when large-output work
+    will run, ACP adapter binary present when the Codex ACP path is considered.
+  - Cursor: Desktop, `cursor`, and `cursor-agent` present when Cursor is routed
+    as controller or worker.
+    - `/Applications/Cursor.app`
+    - `command -v cursor`
+    - `command -v cursor-agent`
+  - Grok: Grok Build present, headless flags available.
+    - `--prompt-file`
+    - `--permission-mode`
+  - Claude compatibility path: CLI/plugin checks pass before Claude-specific
+    compatibility examples are used.
+- Check ACP worker adapters for presence/PATH only: `codex-acp`,
+  `cursor-agent`, `claude-code-cli-acp`, `grok agent stdio`.
 - Check project git state.
 - Check machine capacity profile.
 - **Cursor model currency** (`cursor_models_probe`): runs `cursor-agent --list-models`,

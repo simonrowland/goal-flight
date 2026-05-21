@@ -2,15 +2,22 @@
 
 ## Direction
 
-goal-flight is a small controller plus procedural runtime helpers. The
-controller keeps judgment and product context. Scripts own deterministic facts:
-tool readiness, process state, capacity, logs, status, and review job files.
+goal-flight is a portable skill core plus host wrappers. The core is a small
+controller pattern plus procedural runtime helpers. The controller keeps
+judgment and product context. Scripts own deterministic facts: tool readiness,
+process state, capacity, logs, status, and review job files. Adapter manifests
+own host bindings: tool names, invocation, permissions, packaging, memory
+projection, and local readiness requirements.
+
+Wrappers are host projections over the same core. The checked-in `SKILL.md` and
+`.claude-plugin/` package are the current Claude Code wrapper surface; they are
+wrapper health, not the definition of core validation.
 
 ## Context Budget
 
 Always-loaded surface:
 
-- `SKILL.md`: router, invariants, command index
+- `SKILL.md`: current wrapper router, invariants, command index
 - invoked `commands/*.md`
 - only referenced `protocols/*.md`
 
@@ -29,13 +36,13 @@ that need inherited conversation context.
 
 Scripts emit compact JSON and short human checklists:
 
-- `goalflight_doctor.py`: plugin/tool/runtime readiness
+- `goalflight_doctor.py`: wrapper/tool/runtime readiness
 - `goalflight_capacity.py`: machine-global worker leases and cooldowns
 - `goalflight_ledger.py`: dispatch records with PID plus process identity
 - `goalflight_status.py`: aggregate capacity and dispatch status
 - `goalflight_watch.py`: log marker extraction without `tail -f`
 - `goalflight_acp_run.py`: ACP prompt runner with status and ledger records
-- `goalflight_review_job.py`: file-backed Codex/Claude review jobs
+- `goalflight_review_job.py`: file-backed review jobs (for example Codex/Claude)
 
 Model reads summaries. Raw logs, JSONL streams, and full review transcripts stay
 in files.
@@ -54,8 +61,9 @@ Default operating caps:
 - <=64 GB: 6 workers
 - larger: 8 workers unless overridden
 
-Provider/session limits are cooldowns. A Claude session limit or Codex/Grok
-rate limit blocks future acquire attempts before a worker is spawned.
+Provider/session limits are cooldowns. A host session limit or provider rate
+limit (for example Claude, Codex, or Grok) blocks future acquire attempts
+before a worker is spawned.
 
 ## Ledger
 
@@ -87,3 +95,11 @@ Milestone reviews are jobs, not prose. States include:
 - `failed`
 
 Missing or inconclusive review output is never treated as clean.
+
+## Validation Boundaries
+
+Core validation checks adapter schemas, no-leak rules, command/protocol
+contracts, and tests. Wrapper/package validation checks host projection health,
+such as the current `.claude-plugin/` package. A wrapper can fail packaging
+validation without redefining the portable core contract; the adapter and script
+facts say what is supported, ready, and safe to run.
