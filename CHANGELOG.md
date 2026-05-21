@@ -22,6 +22,13 @@ review, and fixes a terminal-classification edge case found while writing it.
   pure, unit-tested helper (`decide_terminal_state`), and the success-path status
   record reconciles `killed_by_heartbeat` / `wedged_by_heartbeat` with the final
   state so a tail-race `complete` is never self-contradictory.
+- Sleep no longer counts against ACP liveness budgets. Runner idle timeout,
+  per-tool `--max-tool-s`, progress-stall, heartbeat wedge, and running-quiet
+  hard-wall clocks now use an active monotonic clock that excludes macOS system
+  sleep/suspend where the platform exposes it.
+- The heartbeat loop now detects large wall-clock gaps that are absent from the
+  active clock, writes a `paused ... (system sleep/suspend)` status note, and
+  skips all silence-class terminal checks for that thaw tick.
 
 ### Added
 
@@ -32,6 +39,8 @@ review, and fixes a terminal-classification edge case found while writing it.
   goal-mode (`idle-timeout=0`) progress-stall and heartbeat backstops, per-tool
   `tool_timeout` reaping, and the `decide_terminal_state` precedence lattice.
 - Fake-agent scenarios: `idle_silent`, `handshake_wedge`, `tool_stuck`.
+- Simulated-sleep regression tests cover sleep-excluding budget math and the
+  freeze guard's paused-note / skip-then-resume behavior.
 
 ## [0.4.5] — 2026-05-20
 

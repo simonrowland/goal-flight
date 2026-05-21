@@ -18,6 +18,38 @@ import time
 from typing import Awaitable, Callable
 
 
+def active_monotonic() -> float:
+    """Monotonic seconds that do NOT advance while the system is asleep.
+
+    macOS CLOCK_UPTIME_RAW excludes sleep; Linux CLOCK_MONOTONIC excludes suspend.
+    """
+    for name in ("CLOCK_UPTIME_RAW", "CLOCK_MONOTONIC"):
+        clk = getattr(time, name, None)
+        if clk is not None:
+            try:
+                return time.clock_gettime(clk)
+            except OSError:
+                pass
+    return time.monotonic()
+
+
+def system_sleep_pause_s(
+    *,
+    prev_wall: float,
+    prev_active: float,
+    wall_now: float,
+    active_now: float,
+    heartbeat_interval_s: float,
+) -> float:
+    """Return detected sleep/suspend seconds large enough to skip this tick."""
+    freeze_s = max(0.0, (wall_now - prev_wall) - (active_now - prev_active))
+    return freeze_s if freeze_s > max(5.0, 2 * heartbeat_interval_s) else 0.0
+
+
+def system_sleep_pause_note(freeze_s: float, total_paused_s: float) -> str:
+    return f"paused {freeze_s:.0f}s (system sleep/suspend); total_paused {total_paused_s:.0f}s"
+
+
 @dataclass(frozen=True)
 class LivenessThresholds:
     idle_timeout_s: float | None
@@ -251,7 +283,7 @@ class IdleLivenessGate:
         cpu_epsilon_pct: float,
         hard_wall_s: float,
         *,
-        now: Callable[[], float] = time.monotonic,
+        now: Callable[[], float] = active_monotonic,
     ) -> None:
         self.cpu_epsilon_pct = cpu_epsilon_pct
         self.hard_wall_s = hard_wall_s

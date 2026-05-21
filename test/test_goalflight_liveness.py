@@ -14,6 +14,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 from goalflight_liveness import (  # noqa: E402
+    active_monotonic,
     heartbeat_wedge_decision,
     IdleLivenessGate,
     LivenessThresholds,
@@ -22,7 +23,10 @@ from goalflight_liveness import (  # noqa: E402
     parse_ps_pgroup_cpu,
     pgroup_cpu_pct,
     progress_stall_decision,
+    system_sleep_pause_note,
+    system_sleep_pause_s,
 )
+import goalflight_acp_client as acp_client  # noqa: E402
 from goalflight_acp_client import AcpLivenessActivity  # noqa: E402
 
 
@@ -35,6 +39,21 @@ def _update(session_update: str, text: str = "x") -> dict:
             "update": {
                 "sessionUpdate": session_update,
                 "content": {"type": "text", "text": text},
+            },
+        },
+    }
+
+
+def _tool_update(tool_id: str = "t1", status: str = "running") -> dict:
+    return {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": "s",
+            "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": tool_id,
+                "status": status,
             },
         },
     }
@@ -211,6 +230,104 @@ def test_progress_stall_allows_cursor_like_slow_first_token() -> None:
         progress_stall_s=300.0,
         outstanding_count=after_first_token["outstanding_count"],
     ) is False
+
+
+def test_active_monotonic_is_monotonic_float() -> None:
+    start = active_monotonic()
+    end = active_monotonic()
+
+    assert isinstance(start, float)
+    assert isinstance(end, float)
+    assert end >= start
+
+
+def test_simulated_sleep_excluded_from_liveness_budgets() -> None:
+    active_now = {"value": 100.0}
+    original_clock = acp_client.active_monotonic
+    acp_client.active_monotonic = lambda: active_now["value"]
+    try:
+        activity = AcpLivenessActivity(last_event_mono=100.0, last_progress_mono=100.0)
+        activity.note_message(_tool_update(), None)
+
+        wall_elapsed_s = 1808.0
+        active_now["value"] = 110.0
+        snapshot = activity.snapshot()
+        timed_out_tool = activity.timed_out(active_now["value"], max_tool_s=1800.0)
+    finally:
+        acp_client.active_monotonic = original_clock
+
+    assert wall_elapsed_s > 1800.0
+    assert snapshot["quiet_for_s"] == 10.0
+    assert snapshot["progress_quiet_for_s"] == 10.0
+    assert timed_out_tool is None
+    assert classify_liveness(
+        pid_alive=True,
+        pgroup_cpu=None,
+        seconds_since_event=snapshot["quiet_for_s"],
+        thresholds=LivenessThresholds(idle_timeout_s=300.0, cpu_epsilon_pct=0.1),
+    ) == "running"
+    assert progress_stall_decision(
+        pid_alive=True,
+        progress_quiet_s=snapshot["progress_quiet_for_s"],
+        progress_stall_s=300.0,
+        outstanding_count=snapshot["outstanding_count"],
+    ) is False
+
+
+def test_freeze_guard_skips_terminal_eval_then_resumes() -> None:
+    prev_wall = 0.0
+    prev_active = 0.0
+    wall_now = 1808.0
+    active_now = 8.0
+    total_paused_s = 0.0
+    terminal_evals = 0
+    status_notes: list[str] = []
+
+    activity = AcpLivenessActivity(last_event_mono=0.0, last_progress_mono=0.0)
+    activity.note_message(_tool_update(), 0.0)
+
+    freeze_s = system_sleep_pause_s(
+        prev_wall=prev_wall,
+        prev_active=prev_active,
+        wall_now=wall_now,
+        active_now=active_now,
+        heartbeat_interval_s=0.1,
+    )
+    if freeze_s > 0:
+        total_paused_s += freeze_s
+        status_notes.append(system_sleep_pause_note(freeze_s, total_paused_s))
+    else:
+        terminal_evals += 1
+        activity.timed_out(active_now, max_tool_s=1800.0)
+
+    assert terminal_evals == 0
+    assert status_notes == ["paused 1800s (system sleep/suspend); total_paused 1800s"]
+
+    prev_wall, prev_active = wall_now, active_now
+    wall_now = 1808.2
+    active_now = 8.2
+    freeze_s = system_sleep_pause_s(
+        prev_wall=prev_wall,
+        prev_active=prev_active,
+        wall_now=wall_now,
+        active_now=active_now,
+        heartbeat_interval_s=0.1,
+    )
+    if freeze_s > 0:
+        status_notes.append(system_sleep_pause_note(freeze_s, total_paused_s + freeze_s))
+    else:
+        terminal_evals += 1
+        timed_out_tool = activity.timed_out(active_now, max_tool_s=1800.0)
+        progress_stalled = progress_stall_decision(
+            pid_alive=True,
+            progress_quiet_s=activity.snapshot(active_now)["progress_quiet_for_s"],
+            progress_stall_s=300.0,
+            outstanding_count=activity.outstanding_count(active_now),
+        )
+
+    assert terminal_evals == 1
+    assert timed_out_tool is None
+    assert progress_stalled is False
 
 
 def _scripted_sampler(values):
@@ -416,6 +533,9 @@ def main() -> None:
     test_progress_stall_ignores_raw_event_recency()
     test_progress_stall_resets_on_standard_progress()
     test_progress_stall_allows_cursor_like_slow_first_token()
+    test_active_monotonic_is_monotonic_float()
+    test_simulated_sleep_excluded_from_liveness_budgets()
+    test_freeze_guard_skips_terminal_eval_then_resumes()
     test_cpu_keep_waiting_busy_first_sample_keeps_waiting()
     test_cpu_keep_waiting_all_idle_is_wedged()
     test_cpu_keep_waiting_transient_none_then_busy_keeps_waiting()

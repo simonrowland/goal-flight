@@ -21,6 +21,8 @@ import threading
 import time
 from typing import Any, Callable, Protocol
 
+from goalflight_liveness import active_monotonic
+
 
 log = logging.getLogger("goal-flight.acp_client")
 
@@ -312,15 +314,15 @@ class AcpLivenessActivity:
     permission_timeout_s: float = DEFAULT_PERMISSION_TIMEOUT_S
     raw_events_seen: int = 0
     wedge_progress_seen: int = 0
-    last_event_mono: float = field(default_factory=time.monotonic)
-    last_progress_mono: float = field(default_factory=time.monotonic)
+    last_event_mono: float = field(default_factory=active_monotonic)
+    last_progress_mono: float = field(default_factory=active_monotonic)
     last_event_kind: str | None = None
     outstanding_tools: dict[str, float] = field(default_factory=dict)
     pending_permissions: dict[str, float] = field(default_factory=dict)
     dropped_frames: int = 0
 
     def note_message(self, message: dict[str, Any], now: float | None = None) -> str:
-        now = time.monotonic() if now is None else now
+        now = active_monotonic() if now is None else now
         kind = classify_message(message)
         self.raw_events_seen += 1
         self.last_event_mono = now
@@ -351,7 +353,7 @@ class AcpLivenessActivity:
         self.dropped_frames += 1
 
     def reset_progress_clock(self, now: float | None = None) -> None:
-        self.last_progress_mono = time.monotonic() if now is None else now
+        self.last_progress_mono = active_monotonic() if now is None else now
 
     def resolve_permission(self, tool_id: str | None = None) -> None:
         if tool_id:
@@ -401,7 +403,7 @@ class AcpLivenessActivity:
         return None
 
     def snapshot(self, now: float | None = None) -> dict[str, Any]:
-        now = time.monotonic() if now is None else now
+        now = active_monotonic() if now is None else now
         return {
             "raw_events_seen": self.raw_events_seen,
             "wedge_progress_seen": self.wedge_progress_seen,

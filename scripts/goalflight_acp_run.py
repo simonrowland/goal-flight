@@ -59,11 +59,14 @@ from goalflight_acp_client import (
     spawn_acp_connection,
 )
 from goalflight_liveness import (
+    active_monotonic,
     heartbeat_wedge_decision,
     IdleLivenessGate,
     pgroup_cpu_pct,
     progress_stall_decision,
     process_group_id,
+    system_sleep_pause_note,
+    system_sleep_pause_s,
     write_status,
 )
 from goalflight_startup_gate import StartupGate
@@ -325,15 +328,38 @@ async def run(args: argparse.Namespace) -> dict:
         nonlocal heartbeat_outcome
         dead_samples = 0
         last_sample_progress_seen = 0
+        prev_wall = time.time()
+        prev_active = active_monotonic()
+        total_paused_s = 0.0
         # Created only after a successful handshake, so it tracks the single
         # committed worker. Exit early once that worker exits (grok 2026-05-20
         # P2) rather than sampling a dead pid until the outer finally cancels us.
         while True:
             if proc is None or proc.returncode is not None:
                 return
+            wall_now = time.time()
+            active_now = active_monotonic()
+            freeze_s = system_sleep_pause_s(
+                prev_wall=prev_wall,
+                prev_active=prev_active,
+                wall_now=wall_now,
+                active_now=active_now,
+                heartbeat_interval_s=args.heartbeat_interval,
+            )
+            if freeze_s > 0:
+                total_paused_s += freeze_s
+                await update_status(
+                    note=system_sleep_pause_note(freeze_s, total_paused_s),
+                    total_paused_s=round(total_paused_s, 3),
+                    heartbeat_at=_now(),
+                )
+                prev_wall, prev_active = wall_now, active_now
+                await asyncio.sleep(args.heartbeat_interval)
+                continue
+            prev_wall, prev_active = wall_now, active_now
             pgid = payload.get("pgid") or process_group_id(proc.pid) or proc.pid
             cpu_pct = await asyncio.to_thread(pgroup_cpu_pct, pgid)
-            now_mono = time.monotonic()
+            now_mono = active_now
             snapshot = activity.snapshot(now_mono)
             seen = int(snapshot["raw_events_seen"])
             progress_seen = int(snapshot["wedge_progress_seen"])
@@ -427,7 +453,7 @@ async def run(args: argparse.Namespace) -> dict:
             await asyncio.sleep(args.heartbeat_interval)
 
     async def note_event(event: dict) -> None:
-        now_mono = time.monotonic()
+        now_mono = active_monotonic()
         idle_gate.note_event()  # any incoming SDK observer event keeps idle gate alive
         snapshot = activity.snapshot(now_mono)
         seen = int(snapshot["raw_events_seen"])
@@ -525,7 +551,7 @@ async def run(args: argparse.Namespace) -> dict:
                 )
             )
         ledger_recorded = True
-        activity.reset_progress_clock(time.monotonic())
+        activity.reset_progress_clock(active_monotonic())
         heartbeat_task = asyncio.create_task(heartbeat_loop())
         await update_status(state="running")
         result = await run_prompt(
@@ -597,7 +623,7 @@ async def run(args: argparse.Namespace) -> dict:
             with contextlib.suppress(Exception):
                 await conn.close_gracefully()
         if proc is not None:
-            snapshot = activity.snapshot(time.monotonic())
+            snapshot = activity.snapshot(active_monotonic())
             payload.update(
                 events_seen=int(snapshot["raw_events_seen"]),
                 wedge_progress_seen=int(snapshot["wedge_progress_seen"]),

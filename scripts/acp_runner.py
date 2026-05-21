@@ -19,10 +19,10 @@ import inspect
 import json
 from pathlib import Path
 import re
-import time
 from typing import Any, Callable
 
 from goalflight_acp_client import AcpConnection
+from goalflight_liveness import active_monotonic
 
 
 @dataclass
@@ -77,7 +77,7 @@ async def run_prompt(
     turn_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
     conn.client.set_turn_queue(turn_queue)
     prompt_task = asyncio.create_task(conn.prompt(text))
-    last_event_time = time.time()
+    last_event_time = active_monotonic()
     timeout_enabled = idle_timeout is not None and idle_timeout > 0
 
     async def _call_on_event(message: dict[str, Any]) -> None:
@@ -155,7 +155,7 @@ async def run_prompt(
                         await _cancel_prompt(marker)
                         return result
                 break
-            if timeout_enabled and time.time() - last_event_time > float(idle_timeout):
+            if timeout_enabled and active_monotonic() - last_event_time > float(idle_timeout):
                 keep_waiting = False
                 if on_idle is not None:
                     try:
@@ -166,7 +166,7 @@ async def run_prompt(
                     except Exception:
                         keep_waiting = False
                 if prompt_task.done() or keep_waiting or not turn_queue.empty():
-                    last_event_time = time.time()
+                    last_event_time = active_monotonic()
                     continue
                 with contextlib.suppress(Exception):
                     await conn.cancel()
@@ -180,7 +180,7 @@ async def run_prompt(
             except asyncio.TimeoutError:
                 continue
             message = event.get("message") or {}
-            last_event_time = time.time()
+            last_event_time = active_monotonic()
             await _call_on_event(message)
             _accumulate(message)
             marker = _early_marker()
