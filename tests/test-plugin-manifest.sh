@@ -7,6 +7,8 @@ CLAUDE_MANIFEST="$REPO_ROOT/.claude-plugin/plugin.json"
 CODEX_ROOT_MANIFEST="$REPO_ROOT/.codex-plugin/plugin.json"
 CODEX_PLUGIN_MANIFEST="$REPO_ROOT/plugins/goal-flight/.codex-plugin/plugin.json"
 CODEX_MARKETPLACE="$REPO_ROOT/.agents/plugins/marketplace.json"
+CODEX_ROOT_SKILLS="$REPO_ROOT/skills"
+CODEX_PLUGIN_SKILLS="$REPO_ROOT/plugins/goal-flight/skills"
 
 [ -f "$CLAUDE_MANIFEST" ] || {
   echo "missing .claude-plugin/plugin.json" >&2
@@ -43,6 +45,20 @@ if marketplace.get("name") != "goal-flight":
 if not any(plugin.get("name") == "goal-flight" and plugin.get("source", {}).get("path") == "./plugins/goal-flight" for plugin in plugins):
     raise SystemExit("codex marketplace missing goal-flight local plugin path")
 PY
+
+for skill_dir in "$CODEX_ROOT_SKILLS" "$CODEX_PLUGIN_SKILLS"; do
+  for skill in goal-flight goal-flight-doctor goal-flight-init; do
+    skill_file="$skill_dir/$skill/SKILL.md"
+    [ -f "$skill_file" ] || {
+      echo "missing Codex skill wrapper: $skill_file" >&2
+      exit 1
+    }
+    grep -q "name: $skill" "$skill_file" || {
+      echo "Codex skill wrapper name mismatch: $skill_file" >&2
+      exit 1
+    }
+  done
+done
 
 if command -v claude >/dev/null 2>&1; then
   claude plugin validate "$REPO_ROOT" >/tmp/goal-flight-plugin-validate-$$.out 2>&1 || {

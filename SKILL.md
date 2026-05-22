@@ -1,6 +1,6 @@
 ---
 name: goal-flight
-version: 0.4.8
+version: 0.4.9
 description: "Claude-compatible wrapper for portable goal-flight core — long-running unattended controller for chunked code work"
 allowed-tools:
   - Bash

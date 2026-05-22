@@ -42,12 +42,15 @@ Dry-run output must show every planned copy, merge, link, or registration
 before mutation. Apply requires explicit approval and writes a machine-local
 backup manifest for rollback.
 
-For Codex, setup registers the desktop-facing plugin/personal skill and also
-checks the CLI worker surface. Codex Desktop is the likely controller; `codex
-exec` remains the worker path. Setup also registers the context-mode MCP server
-when needed. For Cursor, setup installs global agent instructions, a personal
-skill, and rules; context-mode remains deferred until a verified Cursor hook or
-plugin API exists.
+For Codex, setup registers the desktop-facing plugin and checks the CLI worker
+surface. Codex Desktop is the likely controller; `codex exec` remains the worker
+path. Setup also registers the context-mode MCP server when needed. For Cursor,
+setup installs global agent instructions, a personal skill, and rules;
+context-mode remains deferred until a verified Cursor hook or plugin API exists.
+
+Codex plugin autocomplete lists skills, not nested subcommands. Use
+`goal-flight-doctor` and `goal-flight-init` when you want command-shaped
+autocomplete entries, or invoke `goal-flight` with the command text.
 
 After setup and host restart, run `/goal-flight init <topic>` in the target
 project. Init runs doctor, capacity checks, worker readiness checks, and writes

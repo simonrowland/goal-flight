@@ -623,7 +623,10 @@ def _record_backup(action: dict[str, Any], target: Path, backups_root: Path) -> 
     if existed:
         backups_root.mkdir(parents=True, exist_ok=True)
         backup = backups_root / f"{len(list(backups_root.iterdir())):04d}-{target.name}.bak"
-        shutil.copy2(target, backup)
+        if target.is_dir() and not target.is_symlink():
+            shutil.copytree(target, backup)
+        else:
+            shutil.copy2(target, backup)
     return {
         "kind": action["kind"],
         "target": str(target),
@@ -660,6 +663,34 @@ def _apply_action(repo_root: Path, agent: str, action: dict[str, Any], backups_r
     return record
 
 
+def _codex_legacy_personal_skill_cleanup_needed(destination_ids: set[str] | None) -> bool:
+    if not destination_ids:
+        return False
+    return "codex-desktop-controller" in destination_ids and "codex-cli-controller" not in destination_ids
+
+
+def _codex_legacy_personal_skill_path() -> Path:
+    return Path.home() / ".codex/skills/goal-flight"
+
+
+def _cleanup_codex_legacy_personal_skill(backups_root: Path) -> dict[str, Any] | None:
+    target = _codex_legacy_personal_skill_path()
+    if not target.exists():
+        return None
+    action = {
+        "kind": "remove_tree",
+        "source": "legacy-codex-personal-skill",
+        "target": str(target),
+        "rollback": "restore_backup",
+    }
+    record = _record_backup(action, target, backups_root)
+    if target.is_dir() and not target.is_symlink():
+        shutil.rmtree(target)
+    else:
+        target.unlink()
+    return record
+
+
 def _write_backup_manifest(path: Path, agent: str, records: list[dict[str, Any]]) -> None:
     data = {
         "schema": BACKUP_SCHEMA,
@@ -682,7 +713,15 @@ def _restore_from_manifest(path: Path) -> None:
                 backup = Path(record["backup"])
                 if not backup.exists():
                     raise SetupError(f"backup missing: {backup}")
-                _copy_atomic(backup, target)
+                if backup.is_dir():
+                    if target.exists() or target.is_symlink():
+                        if target.is_dir() and not target.is_symlink():
+                            shutil.rmtree(target)
+                        else:
+                            target.unlink()
+                    shutil.copytree(backup, target)
+                else:
+                    _copy_atomic(backup, target)
             elif target.exists() or target.is_symlink():
                 target.unlink()
         elif rollback in {"delete_link", "unregister_plugin"}:
@@ -724,6 +763,8 @@ def _dry_run(
         if action["kind"] == "register_plugin":
             for argv in _codex_plugin_commands(repo_root):
                 print(f"CODEX {_format_command(argv)}")
+    if agent == "codex" and _codex_legacy_personal_skill_cleanup_needed(destination_ids):
+        print(f"CLEANUP remove_tree target={_codex_legacy_personal_skill_path()} reason=desktop_plugin_supersedes_personal_skill")
     _run_host_bootstrap(
         repo_root,
         agent,
@@ -757,6 +798,10 @@ def _apply(
     backup_manifest = _backup_manifest_path(agent)
     backups_root = backup_manifest.with_suffix("")
     records = [_apply_action(repo_root, agent, action, backups_root) for action in actions]
+    if agent == "codex" and _codex_legacy_personal_skill_cleanup_needed(destination_ids):
+        cleanup_record = _cleanup_codex_legacy_personal_skill(backups_root)
+        if cleanup_record:
+            records.append(cleanup_record)
     _run_host_bootstrap(
         repo_root,
         agent,

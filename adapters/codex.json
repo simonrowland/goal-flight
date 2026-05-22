@@ -170,7 +170,7 @@
         "user_gate": true,
         "backup_path": "~/.codex/skills/goal-flight/SKILL.md.goal-flight.bak",
         "rollback": "restore_backup",
-        "destinations": ["codex-desktop-controller", "codex-cli-controller"]
+        "destinations": ["codex-cli-controller"]
       },
       {
         "kind": "register_plugin",
@@ -216,7 +216,6 @@
         "default": true,
         "probe_ids": ["codex-path", "codex-version"],
         "install_action_sources": [
-          "skills/goal-flight/SKILL.md",
           ".agents/plugins/marketplace.json",
           "configs/codex/config.toml"
         ],
@@ -226,7 +225,6 @@
         ],
         "paths": [
           "~/.codex/config.toml",
-          "~/.codex/skills/goal-flight/SKILL.md",
           "~/.codex/plugins/cache/goal-flight/goal-flight/<version>/"
         ],
         "requires_restart": true

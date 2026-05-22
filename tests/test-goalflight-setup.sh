@@ -39,7 +39,10 @@ fi
 
 codex_dry="$(run_setup --agent codex)"
 printf '%s\n' "$codex_dry" | grep -q 'DRY-RUN setup agent=codex' || fail "codex dry-run header missing"
-printf '%s\n' "$codex_dry" | grep -q '.codex/skills/goal-flight/SKILL.md' || fail "codex personal skill action missing"
+if printf '%s\n' "$codex_dry" | grep -q 'ACTION copy source=.*.codex/skills/goal-flight/SKILL.md'; then
+  fail "codex desktop setup should not install duplicate personal skill"
+fi
+printf '%s\n' "$codex_dry" | grep -q 'CLEANUP remove_tree target=.*.codex/skills/goal-flight' || fail "codex legacy personal skill cleanup missing"
 printf '%s\n' "$codex_dry" | grep -q 'ACTION register_plugin' || fail "codex plugin registration action missing"
 printf '%s\n' "$codex_dry" | grep -q 'codex plugin marketplace add' || fail "codex marketplace command missing"
 printf '%s\n' "$codex_dry" | grep -q 'codex plugin add goal-flight@goal-flight' || fail "codex plugin add command missing"
@@ -93,6 +96,8 @@ grep -q 'refusing mutation without --yes' /tmp/goal-flight-setup-denied.out || f
 
 mkdir -p "$HOME/.codex"
 printf 'existing = true\n' > "$HOME/.codex/config.toml"
+mkdir -p "$HOME/.codex/skills/goal-flight"
+printf 'legacy skill\n' > "$HOME/.codex/skills/goal-flight/SKILL.md"
 cp "$HOME/.codex/config.toml" "$TMP_ROOT/original-config.toml"
 export GOALFLIGHT_SETUP_FAKE_CODEX_LOG="$TMP_ROOT/fake-codex.log"
 export GOALFLIGHT_SETUP_FAKE_CONTEXT_MODE_LOG="$TMP_ROOT/fake-context-mode.log"
@@ -104,8 +109,7 @@ manifest="$(printf '%s\n' "$apply_out" | awk '/^BACKUP_MANIFEST /{print $2}')"
 grep -q 'codex plugin marketplace add' "$GOALFLIGHT_SETUP_FAKE_CODEX_LOG" || fail "fake marketplace command missing"
 grep -q 'codex plugin add goal-flight@goal-flight' "$GOALFLIGHT_SETUP_FAKE_CODEX_LOG" || fail "fake plugin add command missing"
 grep -q 'register-context-mode-codex.py' "$GOALFLIGHT_SETUP_FAKE_CONTEXT_MODE_LOG" || fail "fake context-mode command missing"
-[ -f "$HOME/.codex/skills/goal-flight/SKILL.md" ] || fail "codex personal skill not installed"
-grep -q 'goal-flight' "$HOME/.codex/skills/goal-flight/SKILL.md" || fail "codex personal skill content missing"
+[ ! -e "$HOME/.codex/skills/goal-flight" ] || fail "codex legacy personal skill not cleaned up"
 grep -q 'existing = true' "$HOME/.codex/config.toml" || fail "existing codex config lost"
 [ "$(grep -c '# >>> goal-flight codex' "$HOME/.codex/config.toml")" -eq 1 ] || fail "goal-flight block missing after apply"
 
@@ -114,13 +118,14 @@ run_setup --apply --yes --agent codex >/tmp/goal-flight-setup-apply2.out
 
 run_setup --uninstall --from-manifest "$manifest" >/tmp/goal-flight-setup-uninstall.out
 cmp "$TMP_ROOT/original-config.toml" "$HOME/.codex/config.toml" >/dev/null || fail "uninstall did not restore original config"
-[ ! -e "$HOME/.codex/skills/goal-flight/SKILL.md" ] || fail "uninstall did not remove codex personal skill"
+grep -q 'legacy skill' "$HOME/.codex/skills/goal-flight/SKILL.md" || fail "uninstall did not restore legacy personal skill"
 
 FIXTURE_REPO="$TMP_ROOT/fixture-repo"
 mkdir -p "$FIXTURE_REPO/adapters" "$FIXTURE_REPO/configs/codex"
 cp "$REPO_ROOT/adapters/codex.json" "$FIXTURE_REPO/adapters/codex.json"
 cp "$REPO_ROOT/configs/codex/config.toml" "$FIXTURE_REPO/configs/codex/config.toml"
 cp -R "$REPO_ROOT/.codex-plugin" "$FIXTURE_REPO/.codex-plugin"
+cp -R "$REPO_ROOT/.agents" "$FIXTURE_REPO/.agents"
 python3 - "$FIXTURE_REPO/adapters/codex.json" <<'PY'
 import json
 import sys
@@ -128,7 +133,12 @@ from pathlib import Path
 
 path = Path(sys.argv[1])
 data = json.loads(path.read_text())
-data["packaging"]["install_actions"][0]["user_gate"] = False
+for action in data["packaging"]["install_actions"]:
+    if action["kind"] == "register_plugin":
+        action["user_gate"] = False
+        break
+else:
+    raise SystemExit("register_plugin action missing")
 path.write_text(json.dumps(data, indent=2) + "\n")
 PY
 if python3 "$REPO_ROOT/scripts/goalflight_setup.py" --repo-root "$FIXTURE_REPO" --agent codex --apply --yes >/tmp/goal-flight-setup-ungated.out 2>&1; then
