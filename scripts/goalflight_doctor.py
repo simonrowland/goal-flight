@@ -59,10 +59,44 @@ def first_line(text: str | None) -> str | None:
 
 def version(binary: str, *args: str) -> dict:
     path = shutil.which(binary)
+    if not path and binary == "cursor-agent":
+        fallback = Path.home() / ".local/bin/cursor-agent"
+        if fallback.exists():
+            path = str(fallback)
+    if not path and binary == "grok":
+        fallback = Path.home() / ".grok/bin/grok"
+        if fallback.exists():
+            path = str(fallback)
     if not path:
         return {"present": False}
     result = run([path, *args], timeout=4)
     return {"present": True, "path": path, "version": first_line(result["stdout"] or result["stderr"]), "ok": result["ok"]}
+
+
+def check_gstack() -> dict:
+    cli = version("gstack", "--version")
+    if cli.get("present"):
+        cli["kind"] = "cli"
+        return cli
+
+    repo = Path.home() / ".gstack/repos/gstack"
+    package_json = repo / "package.json"
+    skills_dir = repo / ".agents/skills"
+    if package_json.exists() and skills_dir.exists():
+        try:
+            package = json.loads(package_json.read_text())
+        except Exception:
+            package = {}
+        version_text = package.get("version")
+        return {
+            "present": True,
+            "path": str(repo),
+            "kind": "skill_repo",
+            "version": f"gstack {version_text}" if version_text else "gstack skill repo",
+            "ok": True,
+        }
+
+    return {"present": False}
 
 
 def app_exists(name: str, bundle_id: str | None = None) -> bool:
@@ -278,9 +312,10 @@ def cursor_models_probe() -> dict:
         "current_user_model": None,
         "user_behind": None,
     }
-    if not shutil.which("cursor-agent"):
+    cursor_agent = shutil.which("cursor-agent") or str(Path.home() / ".local/bin/cursor-agent")
+    if not Path(cursor_agent).exists() and not shutil.which("cursor-agent"):
         return out
-    result = run(["cursor-agent", "--list-models"], timeout=10)
+    result = run([cursor_agent, "models"], timeout=10)
     if not result["ok"]:
         out["error"] = result.get("stderr", "")[:200]
         return out
@@ -350,7 +385,7 @@ def check_acp() -> dict:
     return {
         "sdk": sdk,
         "codex-acp": {"present": bool(shutil.which("codex-acp"))},
-        "cursor-agent": {"present": bool(shutil.which("cursor-agent")), "version": version("cursor-agent", "--version").get("version")},
+        "cursor-agent": {"present": bool(version("cursor-agent", "--version").get("present")), "version": version("cursor-agent", "--version").get("version")},
         "claude-code-cli-acp": {"present": bool(shutil.which("claude-code-cli-acp"))},
         "grok-agent-stdio": {"present": grok["present"], "headless_hint": grok.get("headless_flags")},
     }
@@ -424,7 +459,7 @@ def doctor(repo: Path) -> dict:
             "install_hint": "npm install -g @openai/codex && codex login" if codex_desktop and not codex_cli.get("present") else None,
         },
         "context_mode": check_context_mode(repo),
-        "gstack": version("gstack", "--version"),
+        "gstack": check_gstack(),
         "cursor": {
             "desktop_present": cursor_desktop,
             "cli": version("cursor", "--version"),

@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+exec python3 "$REPO_ROOT/scripts/goalflight_trigger_guard.py" --repo "$REPO_ROOT" --staged

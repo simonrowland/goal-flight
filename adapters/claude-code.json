@@ -105,6 +105,62 @@
     "mcp": {"required": false, "servers": []},
     "validation": ["json parse", "schema required groups", "forbidden args scan"]
   },
+  "setup": {
+    "controller_destinations": [
+      {
+        "id": "claude-code-controller",
+        "label": "Claude Code controller",
+        "role": "controller",
+        "surface": "cli",
+        "default": true,
+        "probe_ids": ["claude-path", "claude-version"],
+        "install_action_sources": [],
+        "commands": ["claude"],
+        "paths": ["$(command -v claude)", "~/.claude/skills/goal-flight/SKILL.md"],
+        "requires_restart": true
+      }
+    ],
+    "worker_destinations": [
+      {
+        "id": "claude-cli-worker",
+        "label": "Claude Code CLI worker",
+        "role": "worker",
+        "surface": "cli",
+        "default": true,
+        "probe_ids": ["claude-path", "claude-version"],
+        "install_action_sources": [],
+        "commands": ["claude -p --output-format stream-json"],
+        "paths": ["$(command -v claude)"],
+        "requires_restart": false
+      }
+    ],
+    "addons": [
+      {
+        "id": "context-mode",
+        "label": "context-mode MCP sandbox",
+        "default": true,
+        "compatible_destination_ids": [
+          "claude-code-controller",
+          "claude-cli-worker"
+        ],
+        "install_mode": "init_self_check",
+        "commands": ["context-mode --help"],
+        "paths": ["~/.claude", "~/.claude/plugins/"]
+      },
+      {
+        "id": "gstack",
+        "label": "gstack skills",
+        "default": true,
+        "compatible_destination_ids": [
+          "claude-code-controller",
+          "claude-cli-worker"
+        ],
+        "install_mode": "init_self_check",
+        "commands": ["test -d ~/.gstack/repos/gstack/.agents/skills"],
+        "paths": ["~/.gstack", "~/.claude/skills/"]
+      }
+    ]
+  },
   "discovery": {
     "budget": {"max_path_probes": 4, "max_version_probes": 2, "max_help_probes": 1, "max_ms_per_probe": 5000, "max_total_ms_per_agent": 15000, "max_total_ms_all_agents": 90000, "max_stdout_bytes_per_probe": 4096, "max_stderr_bytes_per_probe": 4096, "network_default": "deny", "model_consuming": "forbidden"},
     "probes": [

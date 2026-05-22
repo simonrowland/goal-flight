@@ -27,6 +27,7 @@ DEFAULT_FORBIDDEN_ARG_PATTERNS = (
     "--no-sandbox",
     "--disable-sandbox",
     "--sandbox-disable",
+    "*danger-full-access*",
 )
 
 REQUIRED_GATE_CONTRACT_SECTIONS = (
@@ -212,6 +213,7 @@ def validate_adapter_gate(
     role: str,
     requested_transport: str | None = None,
     argv: Iterable[str] | None = None,
+    live_entry: str | None = None,
 ) -> dict[str, Any]:
     """Return gate decision. Unknown or incomplete input is denied.
 
@@ -233,6 +235,7 @@ def validate_adapter_gate(
             "safe_next_action": "fix_adapter_manifest_contract",
             "live_controller_allowed": False,
             "live_worker_dispatch_allowed": False,
+            "live_entry": live_entry,
         }
 
     forbidden = find_forbidden_args(argv, manifest_forbidden_patterns(manifest))
@@ -262,6 +265,7 @@ def validate_adapter_gate(
         "safe_next_action": GATE_NEXT_ACTIONS.get(reason, "deny"),
         "live_controller_allowed": bool(controller_allowed),
         "live_worker_dispatch_allowed": bool(worker_allowed),
+        "live_entry": live_entry,
     }
 
 

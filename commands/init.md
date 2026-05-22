@@ -15,13 +15,28 @@ Read:
 
 ## Steps
 
-1. Run doctor:
+1. Confirm host setup/bootstrap happened. If this is a fresh host install, run
+   setup from the cloned Goal Flight repository before project init:
+
+```bash
+./setup.sh --agent <codex-or-cursor>
+./setup.sh --apply --yes --agent <codex-or-cursor>
+```
+
+For Codex, setup registers the Goal Flight package for the Desktop controller
+surface, installs the personal Codex skill as a fallback, checks the CLI worker
+surface, and registers context-mode MCP when needed. `codex exec` remains the
+worker path. For Cursor, setup installs global agent instructions, a personal
+skill, and rules; context-mode remains deferred until a verified Cursor hook or
+plugin API exists.
+
+2. Run doctor:
 
 ```bash
 python3 <skill-root>/scripts/goalflight_doctor.py --project-root "$PWD" --json
 ```
 
-2. Ensure the ACP SDK venv exists:
+3. Ensure the ACP SDK venv exists:
 
 ```bash
 ACP_VENV="$HOME/.goal-flight/venvs/acp-0.10"
@@ -34,20 +49,20 @@ else
 fi
 ```
 
-3. Run capacity profile:
+4. Run capacity profile:
 
 ```bash
 python3 <skill-root>/scripts/goalflight_capacity.py profile --json
 ```
 
-4. Scaffold private project state if missing:
+5. Scaffold private project state if missing:
 
 - `docs-private/`
 - `docs-private/goal-<topic>-<date>.md` from `templates/goal-statement.md`
 - `docs-private/RESUME-NOTES.md` from `templates/resume-notes.md`
 - `AGENTS.md` from `templates/project-agents.md` when project has no local agent instructions
 
-5. Write only compact environment facts into `docs-private/env-caveats.md`:
+6. Write only compact environment facts into `docs-private/env-caveats.md`:
 
 - doctor summary path/result
 - capacity profile
@@ -57,19 +72,19 @@ python3 <skill-root>/scripts/goalflight_capacity.py profile --json
 
 Do not paste full probe output.
 
-6. Confirm git hygiene:
+7. Confirm git hygiene:
 
 - `docs-private/` ignored
 - `AGENTS.md` tracked or intentionally absent
 - current branch/head/dirty state recorded in resume notes
 
-7. Optional corpus:
+8. Optional corpus:
 
 If the repo is large and the user wants reusable dispatch context, run
 `/goal-flight build-corpus`. Do not run corpus construction by default during
 init.
 
-8. Self-review:
+9. Self-review:
 
 - Are readiness warnings actionable?
 - Did init avoid reading large docs/logs into context?

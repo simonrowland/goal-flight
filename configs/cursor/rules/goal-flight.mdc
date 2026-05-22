@@ -1,0 +1,15 @@
+---
+description: Goal Flight controller rules
+alwaysApply: false
+---
+
+# goal-flight
+
+- Treat repository Markdown plus Git as canonical state.
+- Load `AGENTS.md` when present, then `SKILL.md` or generated host wrapper
+  instructions for Goal Flight commands.
+- On Goal Flight init, verify `gstack` is available before using gstack review
+  commands. If missing, surface a setup action instead of silently continuing.
+- Do not auto-approve broad shell, network, auth, update, package-registry, or
+  model-consuming probes.
+- Keep machine-local readiness in state files, not checked-in adapter manifests.

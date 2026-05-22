@@ -1,0 +1,12 @@
+# Goal Flight Codex host wrapper marker.
+#
+# setup.sh merges this block into ~/.codex/config.toml only when called with
+# --apply --yes. Keep project-specific trust and MCP server declarations in the
+# user's existing Codex config; this file is a safe registration marker for the
+# setup registrar.
+
+[goal_flight]
+host_wrapper = "codex"
+source = "goal-flight"
+controller_surface = "desktop"
+worker_surface = "cli"

@@ -152,9 +152,37 @@
     "drift_policy": "warn_and_prefer_repo"
   },
   "packaging": {
-    "checked_in_wrappers": ["templates/codex-goal-prompt.md.tpl"],
+    "checked_in_wrappers": [
+      ".codex-plugin/plugin.json",
+      ".agents/plugins/marketplace.json",
+      "plugins/goal-flight/",
+      "skills/goal-flight/SKILL.md",
+      "templates/codex-goal-prompt.md.tpl"
+    ],
     "generated_outputs": ["dist/codex/"],
     "install_actions": [
+      {
+        "kind": "copy",
+        "source": "skills/goal-flight/SKILL.md",
+        "target": "~/.codex/skills/goal-flight/SKILL.md",
+        "writes_repo": false,
+        "writes_user_config": true,
+        "user_gate": true,
+        "backup_path": "~/.codex/skills/goal-flight/SKILL.md.goal-flight.bak",
+        "rollback": "restore_backup",
+        "destinations": ["codex-desktop-controller", "codex-cli-controller"]
+      },
+      {
+        "kind": "register_plugin",
+        "source": ".agents/plugins/marketplace.json",
+        "target": "~/.codex/config.toml",
+        "writes_repo": false,
+        "writes_user_config": true,
+        "user_gate": true,
+        "backup_path": "~/.codex/config.toml.goal-flight.bak",
+        "rollback": "restore_backup",
+        "destinations": ["codex-desktop-controller"]
+      },
       {
         "kind": "copy_or_merge",
         "source": "configs/codex/config.toml",
@@ -163,19 +191,107 @@
         "writes_user_config": true,
         "user_gate": true,
         "backup_path": "~/.codex/config.toml.goal-flight.bak",
-        "rollback": "restore_backup"
+        "rollback": "restore_backup",
+        "destinations": ["codex-desktop-controller", "codex-cli-controller"]
       }
     ],
     "plugin_manifest": {
-      "supported": false,
-      "path": null,
-      "api_status": "unsupported"
+      "supported": true,
+      "path": "plugins/goal-flight/.codex-plugin/plugin.json",
+      "api_status": "verified"
     },
     "mcp": {
       "required": true,
       "servers": ["context-mode"]
     },
     "validation": ["json parse", "schema required groups", "forbidden args scan", "./tests/run.sh"]
+  },
+  "setup": {
+    "controller_destinations": [
+      {
+        "id": "codex-desktop-controller",
+        "label": "Codex Desktop controller",
+        "role": "controller",
+        "surface": "desktop",
+        "default": true,
+        "probe_ids": ["codex-path", "codex-version"],
+        "install_action_sources": [
+          "skills/goal-flight/SKILL.md",
+          ".agents/plugins/marketplace.json",
+          "configs/codex/config.toml"
+        ],
+        "commands": [
+          "codex plugin marketplace add <goal-flight-repo>",
+          "codex plugin add goal-flight@goal-flight"
+        ],
+        "paths": [
+          "~/.codex/config.toml",
+          "~/.codex/skills/goal-flight/SKILL.md",
+          "~/.codex/plugins/cache/goal-flight/goal-flight/<version>/"
+        ],
+        "requires_restart": true
+      },
+      {
+        "id": "codex-cli-controller",
+        "label": "Codex CLI controller",
+        "role": "controller",
+        "surface": "cli",
+        "default": false,
+        "probe_ids": ["codex-path", "codex-version"],
+        "install_action_sources": [
+          "skills/goal-flight/SKILL.md",
+          "configs/codex/config.toml"
+        ],
+        "commands": ["codex exec --json -C <repo> -"],
+        "paths": [
+          "~/.codex/config.toml",
+          "~/.codex/skills/goal-flight/SKILL.md"
+        ],
+        "requires_restart": false
+      }
+    ],
+    "worker_destinations": [
+      {
+        "id": "codex-cli-worker",
+        "label": "Codex CLI worker",
+        "role": "worker",
+        "surface": "cli",
+        "default": true,
+        "probe_ids": ["codex-path", "codex-version"],
+        "install_action_sources": [],
+        "commands": ["codex exec --json -C <repo> -"],
+        "paths": ["$(command -v codex)"],
+        "requires_restart": false
+      }
+    ],
+    "addons": [
+      {
+        "id": "context-mode",
+        "label": "context-mode MCP sandbox",
+        "default": true,
+        "compatible_destination_ids": [
+          "codex-desktop-controller",
+          "codex-cli-controller",
+          "codex-cli-worker"
+        ],
+        "install_mode": "setup",
+        "commands": ["python3 scripts/register-context-mode-codex.py"],
+        "paths": ["~/.codex/config.toml", "[mcp_servers.context-mode]"]
+      },
+      {
+        "id": "gstack",
+        "label": "gstack skills",
+        "default": true,
+        "compatible_destination_ids": [
+          "codex-desktop-controller",
+          "codex-cli-controller",
+          "codex-cli-worker"
+        ],
+        "install_mode": "init_self_check",
+        "commands": ["test -d ~/.gstack/repos/gstack/.agents/skills"],
+        "paths": ["~/.gstack", "~/.codex/skills/"]
+      }
+    ]
   },
   "discovery": {
     "budget": {

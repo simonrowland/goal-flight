@@ -64,6 +64,9 @@
     "packaging": {
       "$ref": "#/$defs/packaging"
     },
+    "setup": {
+      "$ref": "#/$defs/setup"
+    },
     "discovery": {
       "$ref": "#/$defs/discovery"
     },
@@ -960,6 +963,138 @@
             "delete_link",
             "unregister_plugin"
           ]
+        },
+        "destinations": {
+          "$ref": "#/$defs/stringArray"
+        }
+      }
+    },
+    "setup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "controller_destinations",
+        "worker_destinations"
+      ],
+      "properties": {
+        "controller_destinations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/setupDestination"
+          }
+        },
+        "worker_destinations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/setupDestination"
+          }
+        },
+        "addons": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/setupAddon"
+          }
+        }
+      }
+    },
+    "setupAddon": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "label",
+        "default",
+        "compatible_destination_ids",
+        "install_mode",
+        "commands",
+        "paths"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1
+        },
+        "default": {
+          "type": "boolean"
+        },
+        "compatible_destination_ids": {
+          "$ref": "#/$defs/stringArray"
+        },
+        "install_mode": {
+          "enum": [
+            "setup",
+            "init_self_check",
+            "deferred"
+          ]
+        },
+        "commands": {
+          "$ref": "#/$defs/stringArray"
+        },
+        "paths": {
+          "$ref": "#/$defs/stringArray"
+        }
+      }
+    },
+    "setupDestination": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "label",
+        "role",
+        "surface",
+        "default",
+        "probe_ids",
+        "install_action_sources",
+        "commands",
+        "paths"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1
+        },
+        "role": {
+          "enum": [
+            "controller",
+            "worker"
+          ]
+        },
+        "surface": {
+          "enum": [
+            "desktop",
+            "cli",
+            "remote_acp",
+            "rules",
+            "plugin",
+            "config"
+          ]
+        },
+        "default": {
+          "type": "boolean"
+        },
+        "probe_ids": {
+          "$ref": "#/$defs/stringArray"
+        },
+        "install_action_sources": {
+          "$ref": "#/$defs/stringArray"
+        },
+        "commands": {
+          "$ref": "#/$defs/stringArray"
+        },
+        "paths": {
+          "$ref": "#/$defs/stringArray"
+        },
+        "requires_restart": {
+          "type": "boolean"
         }
       }
     },

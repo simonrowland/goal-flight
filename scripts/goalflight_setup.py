@@ -1,0 +1,833 @@
+#!/usr/bin/env python3
+"""Agent-aware setup registrar for Goal Flight host wrappers.
+
+The default mode is a dry run. Mutating setup requires both --apply and --yes.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import shutil
+import shlex
+import sys
+import subprocess
+import tempfile
+from datetime import datetime, timezone
+from typing import Any
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from goalflight_adapter_gate import validate_adapter_gate  # noqa: E402
+
+
+BACKUP_SCHEMA = "goalflight.setup-backup.v1"
+MERGE_START = "# >>> goal-flight"
+MERGE_END = "# <<< goal-flight"
+SETUP_ALLOWED_GATE_REASONS = {
+    "allowed",
+    "candidate",
+    "config_only",
+    "not_installed",
+    "probe_required",
+    "unsupported",
+}
+
+
+class SetupError(RuntimeError):
+    pass
+
+
+def _now_slug() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+
+
+def _expand_target(raw: str) -> Path:
+    return Path(os.path.expandvars(os.path.expanduser(raw)))
+
+
+def _state_root() -> Path:
+    raw = os.environ.get("XDG_STATE_HOME")
+    if raw:
+        return Path(raw).expanduser() / "goal-flight"
+    return Path.home() / ".local/state/goal-flight"
+
+
+def _load_manifest(repo_root: Path, agent: str) -> dict[str, Any]:
+    path = repo_root / "adapters" / f"{agent}.json"
+    if not path.exists():
+        raise SetupError(f"adapter manifest not found: {path}")
+    data = json.loads(path.read_text())
+    if data.get("agent_id") != agent:
+        raise SetupError(f"adapter id mismatch: {path}")
+    return data
+
+
+def _load_manifests(repo_root: Path) -> list[dict[str, Any]]:
+    manifests: list[dict[str, Any]] = []
+    for path in sorted((repo_root / "adapters").glob("*.json")):
+        if path.name.endswith(".schema.json"):
+            continue
+        data = json.loads(path.read_text())
+        if data.get("agent_id"):
+            manifests.append(data)
+    return manifests
+
+
+def _actions(manifest: dict[str, Any]) -> list[dict[str, Any]]:
+    return list(manifest.get("packaging", {}).get("install_actions", []))
+
+
+def _selected_actions(manifest: dict[str, Any], destination_ids: set[str] | None) -> list[dict[str, Any]]:
+    actions = _actions(manifest)
+    if not destination_ids:
+        return actions
+    selected: list[dict[str, Any]] = []
+    for action in actions:
+        declared = set(action.get("destinations", []))
+        if not declared or declared.intersection(destination_ids):
+            selected.append(action)
+    return selected
+
+
+def _plugin_action(manifest: dict[str, Any]) -> str:
+    plugin = manifest.get("packaging", {}).get("plugin_manifest", {})
+    if plugin.get("supported") and plugin.get("path"):
+        return f"PLUGIN register_plugin source={plugin['path']} api_status={plugin.get('api_status')}"
+    supported = str(bool(plugin.get("supported", False))).lower()
+    return f"PLUGIN skip supported={supported} api_status={plugin.get('api_status')}"
+
+
+def _codex_plugin_commands(repo_root: Path) -> list[list[str]]:
+    return [
+        ["codex", "plugin", "remove", "goal-flight@goal-flight"],
+        ["codex", "plugin", "marketplace", "add", str(repo_root)],
+        ["codex", "plugin", "add", "goal-flight@goal-flight"],
+    ]
+
+
+def _format_command(argv: list[str]) -> str:
+    return " ".join(shlex.quote(part) for part in argv)
+
+
+def _run_codex_plugin_registration(repo_root: Path) -> None:
+    fake_log = os.environ.get("GOALFLIGHT_SETUP_FAKE_CODEX_LOG")
+    commands = _codex_plugin_commands(repo_root)
+    if fake_log:
+        fake_path = Path(fake_log).expanduser()
+        fake_path.parent.mkdir(parents=True, exist_ok=True)
+        with fake_path.open("a") as handle:
+            for argv in commands:
+                handle.write(_format_command(argv) + "\n")
+                print(f"CODEX {_format_command(argv)}")
+        return
+
+    for argv in commands:
+        result = subprocess.run(argv, text=True, capture_output=True, check=False)
+        combined = f"{result.stdout}\n{result.stderr}".lower()
+        allowed = ("already", "exists", "not installed", "not found")
+        if result.returncode != 0 and not any(word in combined for word in allowed):
+            raise SetupError(
+                "codex plugin registration failed: "
+                f"{_format_command(argv)}\n{result.stderr.strip() or result.stdout.strip()}"
+            )
+        print(f"CODEX {_format_command(argv)}")
+    result = subprocess.run(
+        ["codex", "plugin", "list", "--marketplace", "goal-flight"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0 or "goal-flight@goal-flight (installed, enabled)" not in result.stdout:
+        raise SetupError(
+            "codex plugin registration did not verify as installed and enabled\n"
+            f"{result.stderr.strip() or result.stdout.strip()}"
+        )
+    cached_manifest = (
+        Path.home()
+        / ".codex/plugins/cache/goal-flight/goal-flight"
+        / json.loads((repo_root / "plugins/goal-flight/.codex-plugin/plugin.json").read_text())["version"]
+        / ".codex-plugin/plugin.json"
+    )
+    if cached_manifest.exists():
+        cached = json.loads(cached_manifest.read_text())
+        if cached.get("interface", {}).get("displayName") != "goal-flight":
+            raise SetupError(f"codex plugin cache is stale: {cached_manifest}")
+    print("VERIFY codex plugin goal-flight@goal-flight installed enabled")
+
+
+def _run_codex_context_mode_registration(repo_root: Path, *, dry_run: bool) -> None:
+    script = repo_root / "scripts" / "register-context-mode-codex.py"
+    if not script.exists():
+        raise SetupError(f"context-mode registration script missing: {script}")
+    check_argv = [sys.executable, str(script), "--check"]
+    apply_argv = [sys.executable, str(script)]
+    if dry_run:
+        print(f"BOOTSTRAP {_format_command(check_argv)}")
+        print(f"BOOTSTRAP {_format_command(apply_argv)}")
+        return
+
+    fake_log = os.environ.get("GOALFLIGHT_SETUP_FAKE_CONTEXT_MODE_LOG")
+    if fake_log:
+        fake_path = Path(fake_log).expanduser()
+        fake_path.parent.mkdir(parents=True, exist_ok=True)
+        with fake_path.open("a") as handle:
+            handle.write(_format_command(apply_argv) + "\n")
+        print(f"BOOTSTRAP {_format_command(apply_argv)}")
+        return
+
+    result = subprocess.run(apply_argv, text=True, capture_output=True, check=False)
+    if result.returncode != 0:
+        raise SetupError(
+            "context-mode registration failed: "
+            f"{_format_command(apply_argv)}\n{result.stderr.strip() or result.stdout.strip()}"
+        )
+    print(f"BOOTSTRAP {_format_command(apply_argv)}")
+
+
+def _check_codex_cli_worker_surface(*, dry_run: bool) -> None:
+    commands = [
+        ["codex", "--version"],
+        ["codex", "exec", "--help"],
+    ]
+    if dry_run:
+        for argv in commands:
+            print(f"WORKER_CHECK {_format_command(argv)}")
+        return
+    for argv in commands:
+        result = subprocess.run(argv, text=True, capture_output=True, check=False)
+        if result.returncode != 0:
+            raise SetupError(
+                "codex CLI worker check failed: "
+                f"{_format_command(argv)}\n{result.stderr.strip() or result.stdout.strip()}"
+            )
+        first_line = (result.stdout or result.stderr).strip().splitlines()
+        detail = first_line[0] if first_line else "ok"
+        print(f"WORKER_CHECK {_format_command(argv)} status=ok detail={detail[:120]}")
+
+
+def _run_host_bootstrap(
+    repo_root: Path,
+    agent: str,
+    *,
+    dry_run: bool,
+    destination_ids: set[str] | None = None,
+    addon_ids: set[str] | None = None,
+) -> None:
+    addons = _selected_addons(_load_manifest(repo_root, agent), destination_ids, addon_ids)
+    addon_modes = {addon["id"]: addon.get("install_mode") for addon in addons}
+    if agent == "codex":
+        selected = destination_ids or _agent_default_destinations(repo_root, agent)
+        if "codex-desktop-controller" in selected:
+            print("CONTROLLER_SURFACE codex desktop")
+        if "codex-cli-controller" in selected:
+            print("CONTROLLER_SURFACE codex cli")
+        if "codex-cli-worker" in selected:
+            _check_codex_cli_worker_surface(dry_run=dry_run)
+        if addon_modes.get("context-mode") == "setup":
+            _run_codex_context_mode_registration(repo_root, dry_run=dry_run)
+        for addon in addons:
+            if addon.get("install_mode") == "init_self_check":
+                _run_addon_self_check(agent, addon)
+        if "codex-desktop-controller" in selected:
+            print("RESTART_REQUIRED codex reload plugin and skill registries")
+    elif agent == "cursor":
+        selected = destination_ids or _agent_default_destinations(repo_root, agent)
+        if "cursor-desktop-controller" in selected:
+            print("CONTROLLER_SURFACE cursor desktop")
+        if "cursor-cli-worker" in selected:
+            print("WORKER_CHECK cursor-agent --version")
+        for addon in addons:
+            if addon.get("install_mode") == "deferred":
+                print(f"ADDON_DEFERRED cursor {addon['id']} reason=plugin_or_hook_api_unverified")
+            elif addon.get("install_mode") == "init_self_check":
+                _run_addon_self_check(agent, addon)
+        print("RESTART_REQUIRED cursor reload global instructions and skills")
+    elif agent == "grok":
+        selected = destination_ids or _agent_default_destinations(repo_root, agent)
+        if "grok-cli-controller" in selected:
+            print("CONTROLLER_SURFACE grok cli candidate")
+        if "grok-acp-worker" in selected:
+            print("WORKER_CHECK grok agent stdio")
+        for addon in addons:
+            if addon.get("install_mode") == "init_self_check":
+                _run_addon_self_check(agent, addon)
+
+
+def _safe_discovery_summary(manifest: dict[str, Any]) -> list[str]:
+    lines: list[str] = []
+    for probe in manifest.get("discovery", {}).get("probes", []):
+        if not probe.get("safe_for_setup"):
+            continue
+        if probe.get("model_consuming") or probe.get("network"):
+            continue
+        argv = probe.get("argv")
+        if not isinstance(argv, list) or not all(isinstance(part, str) for part in argv):
+            continue
+        try:
+            result = subprocess.run(
+                argv,
+                text=True,
+                capture_output=True,
+                timeout=5,
+                check=False,
+                env=_probe_env(probe),
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            lines.append(f"PROBE {probe.get('id')} status=not_installed detail={type(exc).__name__}")
+            continue
+        status = "ok" if result.returncode == 0 else "not_installed"
+        first_line = (result.stdout or result.stderr).strip().splitlines()
+        detail = first_line[0][:120] if first_line else ""
+        suffix = f" detail={detail}" if detail else ""
+        lines.append(f"PROBE {probe.get('id')} status={status}{suffix}")
+    return lines
+
+
+def _run_addon_self_check(agent: str, addon: dict[str, Any]) -> None:
+    commands = addon.get("commands", [])
+    if not commands:
+        print(f"ADDON_CHECK {agent} {addon['id']} mode=init_self_check status=skipped detail=no_commands")
+        return
+    for command in commands:
+        try:
+            result = subprocess.run(
+                ["sh", "-lc", command],
+                text=True,
+                capture_output=True,
+                timeout=5,
+                check=False,
+                env=_probe_env({"env_scrub": True}),
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            print(
+                f"ADDON_CHECK {agent} {addon['id']} mode=init_self_check "
+                f"status=not_installed command={command!r} detail={type(exc).__name__}"
+            )
+            continue
+        detail_lines = (result.stdout or result.stderr).strip().splitlines()
+        detail = detail_lines[0][:120] if detail_lines else ""
+        status = "ok" if result.returncode == 0 else "not_installed"
+        detail_part = f" detail={detail}" if detail else ""
+        print(
+            f"ADDON_CHECK {agent} {addon['id']} mode=init_self_check "
+            f"status={status} command={command!r}{detail_part}"
+        )
+
+
+def _probe_env(probe: dict[str, Any]) -> dict[str, str] | None:
+    if not probe.get("env_scrub"):
+        return None
+    path_items = [
+        str(Path.home() / ".local/bin"),
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+        "/usr/bin",
+        "/bin",
+        "/usr/sbin",
+        "/sbin",
+    ]
+    return {
+        "HOME": str(Path.home()),
+        "PATH": os.pathsep.join(path_items),
+        "SHELL": os.environ.get("SHELL", "/bin/sh"),
+    }
+
+
+def _run_probe(probe: dict[str, Any]) -> dict[str, Any]:
+    argv = probe.get("argv")
+    if not isinstance(argv, list) or not all(isinstance(part, str) for part in argv):
+        return {"id": probe.get("id"), "status": "invalid", "detail": "bad argv"}
+    if not probe.get("safe_for_setup") or probe.get("network") or probe.get("model_consuming"):
+        return {"id": probe.get("id"), "status": "skipped", "detail": "unsafe for setup"}
+    try:
+        result = subprocess.run(
+            argv,
+            text=True,
+            capture_output=True,
+            timeout=5,
+            check=False,
+            env=_probe_env(probe),
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"id": probe.get("id"), "status": "not_installed", "detail": type(exc).__name__}
+    detail_lines = (result.stdout or result.stderr).strip().splitlines()
+    detail = detail_lines[0][:120] if detail_lines else ""
+    return {
+        "id": probe.get("id"),
+        "status": "ok" if result.returncode == 0 else "not_installed",
+        "detail": detail,
+    }
+
+
+def _probe_manifest(manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {
+        str(result["id"]): result
+        for result in (_run_probe(probe) for probe in manifest.get("discovery", {}).get("probes", []))
+        if result.get("id")
+    }
+
+
+def _destination_ready(destination: dict[str, Any], probes: dict[str, dict[str, Any]]) -> bool:
+    probe_ids = destination.get("probe_ids", [])
+    return all(probes.get(probe_id, {}).get("status") == "ok" for probe_id in probe_ids)
+
+
+def _setup_destinations(manifest: dict[str, Any], role: str) -> list[dict[str, Any]]:
+    key = "controller_destinations" if role == "controller" else "worker_destinations"
+    return list(manifest.get("setup", {}).get(key, []))
+
+
+def _setup_addons(manifest: dict[str, Any]) -> list[dict[str, Any]]:
+    return list(manifest.get("setup", {}).get("addons", []))
+
+
+def _all_setup_destination_ids(manifest: dict[str, Any]) -> set[str]:
+    return {
+        destination["id"]
+        for role in ("controller", "worker")
+        for destination in _setup_destinations(manifest, role)
+    }
+
+
+def _destination_index(manifests: list[dict[str, Any]]) -> dict[str, tuple[dict[str, Any], dict[str, Any]]]:
+    index: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
+    for manifest in manifests:
+        for role in ("controller", "worker"):
+            for destination in _setup_destinations(manifest, role):
+                index[destination["id"]] = (manifest, destination)
+    return index
+
+
+def _addon_index(manifests: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    index: dict[str, list[dict[str, Any]]] = {}
+    for manifest in manifests:
+        for addon in _setup_addons(manifest):
+            index.setdefault(addon["id"], []).append(addon)
+    return index
+
+
+def _selected_addons(
+    manifest: dict[str, Any],
+    destination_ids: set[str] | None,
+    addon_ids: set[str] | None,
+) -> list[dict[str, Any]]:
+    selected: list[dict[str, Any]] = []
+    destinations = destination_ids or _all_setup_destination_ids(manifest)
+    for addon in _setup_addons(manifest):
+        compatible = set(addon.get("compatible_destination_ids", []))
+        if compatible and destinations and not compatible.intersection(destinations):
+            continue
+        if addon_ids is None:
+            if addon.get("default"):
+                selected.append(addon)
+        elif addon.get("id") in addon_ids:
+            selected.append(addon)
+    return selected
+
+
+def _parse_csv(raw: str | None) -> set[str]:
+    if not raw:
+        return set()
+    return {item.strip() for item in raw.split(",") if item.strip()}
+
+
+def _parse_optional_csv(raw: str | None) -> set[str] | None:
+    if raw is None:
+        return None
+    return _parse_csv(raw)
+
+
+def _list_agents(repo_root: Path, manifests: list[dict[str, Any]]) -> None:
+    print("Goal Flight setup discovery")
+    for manifest in manifests:
+        probes = _probe_manifest(manifest)
+        print(f"AGENT {manifest['agent_id']} name={manifest.get('display_name')}")
+        for role in ("controller", "worker"):
+            for destination in _setup_destinations(manifest, role):
+                ready = _destination_ready(destination, probes)
+                default = "default" if destination.get("default") else "optional"
+                print(
+                    f"  {role} {destination['id']} status={'installed' if ready else 'missing'} "
+                    f"{default} surface={destination.get('surface')}"
+                )
+                for command in destination.get("commands", []):
+                    print(f"    command {command}")
+                for path_value in destination.get("paths", []):
+                    print(f"    path {path_value}")
+        for addon in _setup_addons(manifest):
+            print(
+                f"  addon {addon['id']} default={str(addon.get('default')).lower()} "
+                f"mode={addon.get('install_mode')} compatible={','.join(addon.get('compatible_destination_ids', []))}"
+            )
+
+
+def _default_destinations(manifests: list[dict[str, Any]], role: str) -> set[str]:
+    selected: set[str] = set()
+    for manifest in manifests:
+        probes = _probe_manifest(manifest)
+        for destination in _setup_destinations(manifest, role):
+            if destination.get("default") and _destination_ready(destination, probes):
+                selected.add(destination["id"])
+    return selected
+
+
+def _agent_default_destinations(repo_root: Path, agent: str) -> set[str]:
+    manifest = _load_manifest(repo_root, agent)
+    probes = _probe_manifest(manifest)
+    selected: set[str] = set()
+    for role in ("controller", "worker"):
+        for destination in _setup_destinations(manifest, role):
+            if destination.get("default") and _destination_ready(destination, probes):
+                selected.add(destination["id"])
+    return selected
+
+
+def _prompt_csv(label: str, choices: list[str], defaults: set[str]) -> set[str]:
+    print(f"{label}:")
+    for idx, choice in enumerate(choices, start=1):
+        marker = "*" if choice in defaults else " "
+        print(f"  {idx}. [{marker}] {choice}")
+    raw = input(f"{label} numbers or ids, empty=defaults: ").strip()
+    if not raw:
+        return set(defaults)
+    selected: set[str] = set()
+    for item in raw.split(","):
+        item = item.strip()
+        if item.isdigit() and 1 <= int(item) <= len(choices):
+            selected.add(choices[int(item) - 1])
+        elif item:
+            selected.add(item)
+    return selected
+
+
+def _interactive_selection(manifests: list[dict[str, Any]]) -> tuple[set[str], set[str], set[str]]:
+    controller_choices = [dest["id"] for manifest in manifests for dest in _setup_destinations(manifest, "controller")]
+    worker_choices = [dest["id"] for manifest in manifests for dest in _setup_destinations(manifest, "worker")]
+    controller_defaults = _default_destinations(manifests, "controller")
+    worker_defaults = _default_destinations(manifests, "worker")
+    controllers = _prompt_csv("Controller destinations", controller_choices, controller_defaults)
+    workers = _prompt_csv("Worker destinations", worker_choices, worker_defaults)
+    addon_choices = sorted({addon["id"] for manifest in manifests for addon in _setup_addons(manifest)})
+    addon_defaults = {addon["id"] for manifest in manifests for addon in _setup_addons(manifest) if addon.get("default")}
+    addons = _prompt_csv("Recommended add-ons", addon_choices, addon_defaults)
+    return controllers, workers, addons
+
+
+def _run_selection(
+    repo_root: Path,
+    manifests: list[dict[str, Any]],
+    destination_ids: set[str],
+    addon_ids: set[str] | None,
+    *,
+    apply: bool,
+    yes: bool,
+) -> None:
+    index = _destination_index(manifests)
+    unknown = sorted(destination_ids - set(index))
+    if unknown:
+        raise SetupError(f"unknown setup destination(s): {', '.join(unknown)}")
+    addons_by_id = _addon_index(manifests)
+    if addon_ids is not None:
+        unknown_addons = sorted(addon_ids - set(addons_by_id))
+        if unknown_addons:
+            raise SetupError(f"unknown setup add-on(s): {', '.join(unknown_addons)}")
+    by_agent: dict[str, set[str]] = {}
+    for destination_id in destination_ids:
+        manifest, _ = index[destination_id]
+        by_agent.setdefault(manifest["agent_id"], set()).add(destination_id)
+    if addon_ids is not None:
+        print(f"ADDONS selected={','.join(sorted(addon_ids))}")
+    for manifest in manifests:
+        selected = by_agent.get(manifest["agent_id"])
+        if not selected:
+            continue
+        selected_addons = _selected_addons(manifest, selected, addon_ids)
+        selected_addon_ids = {addon["id"] for addon in selected_addons}
+        incompatible = sorted(
+            addon_id
+            for addon_id in (addon_ids or set())
+            if addon_id in addons_by_id and addon_id not in selected_addon_ids
+        )
+        if incompatible:
+            raise SetupError(
+                f"setup add-on(s) incompatible with selected destinations: {', '.join(incompatible)}"
+            )
+        if apply:
+            _apply(repo_root, manifest["agent_id"], manifest, yes, selected, addon_ids)
+        else:
+            _dry_run(repo_root, manifest["agent_id"], manifest, selected, addon_ids)
+
+
+def _source_path(repo_root: Path, action: dict[str, Any]) -> Path:
+    source = Path(action["source"])
+    if not source.is_absolute():
+        source = repo_root / source
+    return source
+
+
+def _backup_manifest_path(agent: str) -> Path:
+    root = _state_root() / "setup-backups"
+    root.mkdir(parents=True, exist_ok=True)
+    return root / f"{_now_slug()}-{agent}.json"
+
+
+def _atomic_write(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    tmp_path = Path(tmp)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            handle.write(content)
+        tmp_path.replace(path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+
+def _copy_atomic(source: Path, target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=f".{target.name}.", dir=str(target.parent))
+    tmp_path = Path(tmp)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(source.read_bytes())
+        tmp_path.replace(target)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+
+def _merged_content(agent: str, target: Path, source: Path) -> str:
+    source_text = source.read_text()
+    block = f"{MERGE_START} {agent}\n{source_text.rstrip()}\n{MERGE_END} {agent}\n"
+    if not target.exists():
+        return block
+    existing = target.read_text()
+    if f"{MERGE_START} {agent}" in existing:
+        return existing
+    prefix = existing.rstrip()
+    if prefix:
+        return f"{prefix}\n\n{block}"
+    return block
+
+
+def _record_backup(action: dict[str, Any], target: Path, backups_root: Path) -> dict[str, Any]:
+    existed = target.exists()
+    backup: Path | None = None
+    if existed:
+        backups_root.mkdir(parents=True, exist_ok=True)
+        backup = backups_root / f"{len(list(backups_root.iterdir())):04d}-{target.name}.bak"
+        shutil.copy2(target, backup)
+    return {
+        "kind": action["kind"],
+        "target": str(target),
+        "existed": existed,
+        "backup": str(backup) if backup else None,
+        "rollback": action["rollback"],
+    }
+
+
+def _apply_action(repo_root: Path, agent: str, action: dict[str, Any], backups_root: Path) -> dict[str, Any]:
+    if (action.get("writes_repo") or action.get("writes_user_config")) and not action.get("user_gate"):
+        raise SetupError(f"refusing ungated write action: {action.get('kind')} {action.get('target')}")
+
+    source = _source_path(repo_root, action)
+    target = _expand_target(action["target"])
+    if not source.exists():
+        raise SetupError(f"setup source missing: {source}")
+
+    record = _record_backup(action, target, backups_root)
+    kind = action["kind"]
+    if kind == "register_plugin":
+        _run_codex_plugin_registration(repo_root)
+    elif kind == "copy":
+        _copy_atomic(source, target)
+    elif kind in {"copy_or_merge", "merge_config"}:
+        _atomic_write(target, _merged_content(agent, target, source))
+    elif kind == "link":
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists() or target.is_symlink():
+            target.unlink()
+        target.symlink_to(source)
+    else:
+        raise SetupError(f"unsupported setup action kind: {kind}")
+    return record
+
+
+def _write_backup_manifest(path: Path, agent: str, records: list[dict[str, Any]]) -> None:
+    data = {
+        "schema": BACKUP_SCHEMA,
+        "agent": agent,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "actions": records,
+    }
+    _atomic_write(path, json.dumps(data, indent=2, sort_keys=True) + "\n")
+
+
+def _restore_from_manifest(path: Path) -> None:
+    data = json.loads(path.read_text())
+    if data.get("schema") != BACKUP_SCHEMA:
+        raise SetupError(f"not a Goal Flight setup backup manifest: {path}")
+    for record in reversed(data.get("actions", [])):
+        target = Path(record["target"])
+        rollback = record.get("rollback")
+        if rollback == "restore_backup":
+            if record.get("existed"):
+                backup = Path(record["backup"])
+                if not backup.exists():
+                    raise SetupError(f"backup missing: {backup}")
+                _copy_atomic(backup, target)
+            elif target.exists() or target.is_symlink():
+                target.unlink()
+        elif rollback in {"delete_link", "unregister_plugin"}:
+            if target.exists() or target.is_symlink():
+                target.unlink()
+        else:
+            raise SetupError(f"unsupported rollback kind: {rollback}")
+        print(f"RESTORE {target}")
+
+
+def _dry_run(
+    repo_root: Path,
+    agent: str,
+    manifest: dict[str, Any],
+    destination_ids: set[str] | None = None,
+    addon_ids: set[str] | None = None,
+) -> None:
+    print(f"DRY-RUN setup agent={agent}")
+    if destination_ids:
+        print(f"DESTINATIONS selected={','.join(sorted(destination_ids))}")
+    selected_addons = _selected_addons(manifest, destination_ids, addon_ids)
+    if addon_ids is not None:
+        print(f"ADDONS selected={','.join(sorted(addon_ids))}")
+    elif selected_addons:
+        print(f"ADDONS default={','.join(sorted(addon['id'] for addon in selected_addons))}")
+    for line in _safe_discovery_summary(manifest):
+        print(line)
+    actions = _selected_actions(manifest, destination_ids)
+    for action in actions:
+        source = _source_path(repo_root, action)
+        target = _expand_target(action["target"])
+        print(
+            "ACTION "
+            f"{action['kind']} source={source} target={target} "
+            f"writes_repo={str(action['writes_repo']).lower()} "
+            f"writes_user_config={str(action['writes_user_config']).lower()} "
+            f"user_gate={str(action['user_gate']).lower()} rollback={action['rollback']}"
+        )
+        if action["kind"] == "register_plugin":
+            for argv in _codex_plugin_commands(repo_root):
+                print(f"CODEX {_format_command(argv)}")
+    _run_host_bootstrap(
+        repo_root,
+        agent,
+        dry_run=True,
+        destination_ids=destination_ids,
+        addon_ids=addon_ids,
+    )
+    plugin_supported = bool(manifest.get("packaging", {}).get("plugin_manifest", {}).get("supported"))
+    if plugin_supported and destination_ids and not any(action["kind"] == "register_plugin" for action in actions):
+        print("PLUGIN skip selected_destinations")
+    else:
+        print(_plugin_action(manifest))
+    print("NO MUTATION: pass --apply --yes to write approved setup actions")
+
+
+def _apply(
+    repo_root: Path,
+    agent: str,
+    manifest: dict[str, Any],
+    yes: bool,
+    destination_ids: set[str] | None = None,
+    addon_ids: set[str] | None = None,
+) -> None:
+    if not yes:
+        raise SetupError("refusing mutation without --yes")
+    gate = validate_adapter_gate(manifest, role="controller", argv=[], live_entry="setup_apply")
+    reason = str(gate.get("reason"))
+    if not gate.get("allowed") and reason not in SETUP_ALLOWED_GATE_REASONS:
+        raise SetupError(f"setup gate denied: {gate.get('reason')} fields={gate.get('blocked_fields')}")
+    actions = _selected_actions(manifest, destination_ids)
+    backup_manifest = _backup_manifest_path(agent)
+    backups_root = backup_manifest.with_suffix("")
+    records = [_apply_action(repo_root, agent, action, backups_root) for action in actions]
+    _run_host_bootstrap(
+        repo_root,
+        agent,
+        dry_run=False,
+        destination_ids=destination_ids,
+        addon_ids=addon_ids,
+    )
+    _write_backup_manifest(backup_manifest, agent, records)
+    if not records:
+        print(f"NO_WRITES setup agent={agent}")
+    for record in records:
+        print(f"APPLY {record['kind']} {record['target']}")
+    print(f"BACKUP_MANIFEST {backup_manifest}")
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Goal Flight setup registrar")
+    parser.add_argument("--agent", help="adapter id, e.g. codex or cursor")
+    parser.add_argument("--list-agents", action="store_true", help="show installed controller/worker destinations")
+    parser.add_argument("--tui", action="store_true", help="prompt for controller, worker, and add-on destinations")
+    parser.add_argument("--controllers", help="comma-separated controller destination ids")
+    parser.add_argument("--workers", help="comma-separated worker destination ids")
+    parser.add_argument("--addons", help="comma-separated add-on ids")
+    parser.add_argument("--apply", action="store_true", help="perform approved writes")
+    parser.add_argument("--yes", action="store_true", help="confirm writes for --apply")
+    parser.add_argument("--uninstall", action="store_true", help="rollback using --from-manifest")
+    parser.add_argument("--from-manifest", help="backup manifest created by --apply")
+    parser.add_argument("--repo-root", default=str(REPO_ROOT), help=argparse.SUPPRESS)
+    args = parser.parse_args(argv)
+
+    try:
+        repo_root = Path(args.repo_root).resolve()
+        manifests = _load_manifests(repo_root)
+        if args.uninstall:
+            if not args.from_manifest:
+                raise SetupError("--uninstall requires --from-manifest")
+            _restore_from_manifest(Path(args.from_manifest).expanduser())
+            return 0
+        if args.list_agents:
+            _list_agents(repo_root, manifests)
+            return 0
+        if args.tui or (not args.agent and not args.controllers and not args.workers and sys.stdin.isatty()):
+            controllers, workers, addons = _interactive_selection(manifests)
+            _run_selection(repo_root, manifests, controllers | workers, addons, apply=args.apply, yes=args.yes)
+            return 0
+        if args.controllers or args.workers:
+            controllers = _parse_csv(args.controllers)
+            workers = _parse_csv(args.workers)
+            addons = _parse_optional_csv(args.addons)
+            _run_selection(repo_root, manifests, controllers | workers, addons, apply=args.apply, yes=args.yes)
+            return 0
+        if not args.agent:
+            _list_agents(repo_root, manifests)
+            print("NO MUTATION: pass --tui, --controllers/--workers, or --agent")
+            return 0
+        if not args.agent:
+            raise SetupError("--agent is required unless --uninstall is used")
+        manifest = _load_manifest(repo_root, args.agent)
+        destinations = _agent_default_destinations(repo_root, args.agent)
+        if not destinations and _setup_destinations(manifest, "controller") + _setup_destinations(manifest, "worker"):
+            raise SetupError(f"no ready default setup destinations for agent: {args.agent}")
+        addons = _parse_optional_csv(args.addons)
+        if args.apply:
+            _apply(repo_root, args.agent, manifest, args.yes, destinations, addons)
+        else:
+            _dry_run(repo_root, args.agent, manifest, destinations, addons)
+        return 0
+    except SetupError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

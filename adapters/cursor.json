@@ -98,19 +98,123 @@
     "drift_policy": "warn_and_prefer_repo"
   },
   "packaging": {
-    "checked_in_wrappers": ["configs/cursor/"],
+    "checked_in_wrappers": [
+      "configs/cursor/AGENTS.md",
+      "configs/cursor/rules/goal-flight.mdc",
+      "configs/cursor/skills/goal-flight/SKILL.md"
+    ],
     "generated_outputs": ["dist/cursor/"],
-    "install_actions": [],
+    "install_actions": [
+      {
+        "kind": "copy_or_merge",
+        "source": "configs/cursor/AGENTS.md",
+        "target": "~/.cursor/AGENTS.md",
+        "writes_repo": false,
+        "writes_user_config": true,
+        "user_gate": true,
+        "backup_path": "~/.cursor/AGENTS.md.goal-flight.bak",
+        "rollback": "restore_backup",
+        "destinations": ["cursor-desktop-controller"]
+      },
+      {
+        "kind": "copy",
+        "source": "configs/cursor/skills/goal-flight/SKILL.md",
+        "target": "~/.cursor/skills/goal-flight/SKILL.md",
+        "writes_repo": false,
+        "writes_user_config": true,
+        "user_gate": true,
+        "backup_path": "~/.cursor/skills/goal-flight/SKILL.md.goal-flight.bak",
+        "rollback": "restore_backup",
+        "destinations": ["cursor-desktop-controller"]
+      },
+      {
+        "kind": "copy",
+        "source": "configs/cursor/rules/goal-flight.mdc",
+        "target": "~/.cursor/rules/goal-flight.mdc",
+        "writes_repo": false,
+        "writes_user_config": true,
+        "user_gate": true,
+        "backup_path": "~/.cursor/rules/goal-flight.mdc.goal-flight.bak",
+        "rollback": "restore_backup",
+        "destinations": ["cursor-desktop-controller"]
+      }
+    ],
     "plugin_manifest": {"supported": false, "path": null, "api_status": "probe_required"},
     "mcp": {"required": false, "servers": []},
     "validation": ["json parse", "schema required groups", "candidate gate stays deny"]
   },
+  "setup": {
+    "controller_destinations": [
+      {
+        "id": "cursor-desktop-controller",
+        "label": "Cursor Desktop controller",
+        "role": "controller",
+        "surface": "desktop",
+        "default": true,
+        "probe_ids": ["cursor-desktop-app"],
+        "install_action_sources": [
+          "configs/cursor/AGENTS.md",
+          "configs/cursor/skills/goal-flight/SKILL.md",
+          "configs/cursor/rules/goal-flight.mdc"
+        ],
+        "commands": ["open -a Cursor <repo>"],
+        "paths": [
+          "/Applications/Cursor.app",
+          "~/.cursor/AGENTS.md",
+          "~/.cursor/skills/goal-flight/SKILL.md",
+          "~/.cursor/rules/goal-flight.mdc"
+        ],
+        "requires_restart": true
+      }
+    ],
+    "worker_destinations": [
+      {
+        "id": "cursor-cli-worker",
+        "label": "Cursor Agent CLI worker",
+        "role": "worker",
+        "surface": "cli",
+        "default": true,
+        "probe_ids": ["cursor-agent-path", "cursor-agent-version"],
+        "install_action_sources": [],
+        "commands": ["cursor-agent acp"],
+        "paths": ["$(command -v cursor-agent)", "~/.local/bin/cursor-agent"],
+        "requires_restart": false
+      }
+    ],
+    "addons": [
+      {
+        "id": "context-mode",
+        "label": "context-mode MCP sandbox",
+        "default": true,
+        "compatible_destination_ids": [
+          "cursor-desktop-controller",
+          "cursor-cli-worker"
+        ],
+        "install_mode": "deferred",
+        "commands": ["context-mode --help"],
+        "paths": ["~/.cursor", "~/.cursor/skills/"]
+      },
+      {
+        "id": "gstack",
+        "label": "gstack skills",
+        "default": true,
+        "compatible_destination_ids": [
+          "cursor-desktop-controller",
+          "cursor-cli-worker"
+        ],
+        "install_mode": "init_self_check",
+        "commands": ["test -d ~/.gstack/repos/gstack/.agents/skills"],
+        "paths": ["~/.gstack", "~/.cursor/skills/"]
+      }
+    ]
+  },
   "discovery": {
     "budget": {"max_path_probes": 4, "max_version_probes": 1, "max_help_probes": 1, "max_ms_per_probe": 6000, "max_total_ms_per_agent": 20000, "max_total_ms_all_agents": 90000, "max_stdout_bytes_per_probe": 4096, "max_stderr_bytes_per_probe": 4096, "network_default": "deny", "model_consuming": "forbidden"},
     "probes": [
-      {"id": "cursor-agent-path", "class": "path", "argv": ["sh", "-lc", "command -v cursor-agent"], "safe_for_setup": true, "network": false, "model_consuming": false, "env_scrub": true},
-      {"id": "cursor-agent-version", "class": "version", "argv": ["cursor-agent", "--version"], "safe_for_setup": true, "network": false, "model_consuming": false, "env_scrub": true},
-      {"id": "cursor-agent-models", "class": "auth_status", "argv": ["cursor-agent", "--list-models"], "safe_for_setup": true, "network": false, "model_consuming": false, "env_scrub": true}
+      {"id": "cursor-desktop-app", "class": "path", "argv": ["sh", "-lc", "test -d /Applications/Cursor.app && printf /Applications/Cursor.app"], "safe_for_setup": true, "network": false, "model_consuming": false, "env_scrub": true},
+      {"id": "cursor-agent-path", "class": "path", "argv": ["sh", "-lc", "command -v cursor-agent || test -x ~/.local/bin/cursor-agent"], "safe_for_setup": true, "network": false, "model_consuming": false, "env_scrub": true},
+      {"id": "cursor-agent-version", "class": "version", "argv": ["sh", "-lc", "bin=$(command -v cursor-agent || printf '%s' \"$HOME/.local/bin/cursor-agent\"); test -x \"$bin\" && \"$bin\" --version"], "safe_for_setup": true, "network": false, "model_consuming": false, "env_scrub": true},
+      {"id": "cursor-agent-models", "class": "auth_status", "argv": ["sh", "-lc", "bin=$(command -v cursor-agent || printf '%s' \"$HOME/.local/bin/cursor-agent\"); test -x \"$bin\" && \"$bin\" models"], "safe_for_setup": true, "network": false, "model_consuming": false, "env_scrub": true}
     ]
   },
   "status_contract": {

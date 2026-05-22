@@ -85,7 +85,8 @@ def agent_command(agent: str) -> tuple[str, list[str]]:
         binary = shutil.which("grok") or str(Path.home() / ".grok/bin/grok")
         return binary, ["agent", "stdio"]
     if agent == "cursor":
-        return "cursor-agent", ["acp"]
+        binary = shutil.which("cursor-agent") or str(Path.home() / ".local/bin/cursor-agent")
+        return binary, ["acp"]
     if agent == "claude":
         return "claude-code-cli-acp", []
     # codex-acp needs the MCP-elicitation flag, but it is injected at the single

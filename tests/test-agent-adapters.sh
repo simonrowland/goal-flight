@@ -81,7 +81,7 @@ bad = copy.deepcopy(codex)
 bad["invocation"]["exec"]["args"].append("--yolo")
 expect_error("forbidden-invocation-arg", bad, "forbidden arg")
 
-for token in ("--no-sandbox=true", "--auto-approve=true", "--sandbox-disable=1"):
+for token in ("--no-sandbox=true", "--auto-approve=true", "--sandbox-disable=1", "--sandbox=danger-full-access"):
     bad = copy.deepcopy(codex)
     bad["invocation"]["exec"]["args"].append(token)
     expect_error(f"forbidden-invocation-arg-value-{token}", bad, "forbidden arg")
@@ -227,7 +227,7 @@ expect_denied(
     argv=["codex", "exec", "--json", "--yolo"],
 )
 
-for token in ("--no-sandbox=true", "--auto-approve=true", "--sandbox-disable=1"):
+for token in ("--no-sandbox=true", "--auto-approve=true", "--sandbox-disable=1", "--sandbox=danger-full-access"):
     expect_denied(
         f"forbidden-arg-value-{token}",
         codex,

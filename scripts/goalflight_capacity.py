@@ -186,13 +186,14 @@ def detect_ram_mb() -> int:
 
 def detect_tools() -> dict:
     grok = shutil.which("grok") or str(Path.home() / ".grok/bin/grok")
+    cursor_agent = shutil.which("cursor-agent") or str(Path.home() / ".local/bin/cursor-agent")
     tools = {
         "codex": bool(shutil.which("codex")),
         "codex-acp": bool(shutil.which("codex-acp")),
         "claude": bool(shutil.which("claude")),
         "claude-code-cli-acp": bool(shutil.which("claude-code-cli-acp")),
         "cursor": bool(shutil.which("cursor")),
-        "cursor-agent": bool(shutil.which("cursor-agent")),
+        "cursor-agent": Path(cursor_agent).exists() if cursor_agent else False,
         "grok": Path(grok).exists() if grok else False,
     }
     return tools

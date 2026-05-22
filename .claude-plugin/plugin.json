@@ -1,6 +1,6 @@
 {
   "name": "goal-flight",
-  "version": "0.4.7",
+  "version": "0.4.8",
   "description": "Claude Code controller skill for long-running, decomposed code work with dispatch, review, recovery, and context-preserving handoffs.",
   "author": {
     "name": "Simon Rowland",

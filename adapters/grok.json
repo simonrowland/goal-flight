@@ -100,17 +100,70 @@
   "packaging": {
     "checked_in_wrappers": ["configs/grok/"],
     "generated_outputs": ["dist/grok/"],
-    "install_actions": [],
+    "install_actions": [
+      {
+        "kind": "copy",
+        "source": "configs/grok/skills/goal-flight/SKILL.md",
+        "target": "~/.grok/skills/goal-flight/SKILL.md",
+        "writes_repo": false,
+        "writes_user_config": true,
+        "user_gate": true,
+        "backup_path": "$XDG_STATE_HOME/goal-flight/setup-backups/grok.json",
+        "rollback": "restore_backup",
+        "destinations": ["grok-cli-controller"]
+      }
+    ],
     "plugin_manifest": {"supported": false, "path": null, "api_status": "unsupported"},
     "mcp": {"required": false, "servers": []},
     "validation": ["json parse", "schema required groups", "candidate gate stays deny"]
+  },
+  "setup": {
+    "controller_destinations": [
+      {
+        "id": "grok-cli-controller",
+        "label": "Grok CLI controller skill",
+        "role": "controller",
+        "surface": "cli",
+        "default": false,
+        "probe_ids": ["grok-path", "grok-version"],
+        "install_action_sources": ["configs/grok/skills/goal-flight/SKILL.md"],
+        "commands": ["grok --prompt-file <file>"],
+        "paths": ["~/.grok/skills/goal-flight/SKILL.md"],
+        "requires_restart": false
+      }
+    ],
+    "worker_destinations": [
+      {
+        "id": "grok-acp-worker",
+        "label": "Grok ACP worker",
+        "role": "worker",
+        "surface": "cli",
+        "default": true,
+        "probe_ids": ["grok-path", "grok-version", "grok-help"],
+        "install_action_sources": [],
+        "commands": ["grok agent stdio"],
+        "paths": ["$(command -v grok)", "~/.grok/bin/grok"],
+        "requires_restart": false
+      }
+    ],
+    "addons": [
+      {
+        "id": "gstack",
+        "label": "gstack skills",
+        "default": true,
+        "compatible_destination_ids": ["grok-cli-controller", "grok-acp-worker"],
+        "install_mode": "init_self_check",
+        "commands": ["test -d ~/.gstack/repos/gstack/.agents/skills"],
+        "paths": ["~/.gstack", "~/.grok/skills/"]
+      }
+    ]
   },
   "discovery": {
     "budget": {"max_path_probes": 4, "max_version_probes": 1, "max_help_probes": 1, "max_ms_per_probe": 6000, "max_total_ms_per_agent": 20000, "max_total_ms_all_agents": 90000, "max_stdout_bytes_per_probe": 4096, "max_stderr_bytes_per_probe": 4096, "network_default": "deny", "model_consuming": "forbidden"},
     "probes": [
       {"id": "grok-path", "class": "path", "argv": ["sh", "-lc", "command -v grok || test -x ~/.grok/bin/grok"], "safe_for_setup": true, "network": false, "model_consuming": false, "env_scrub": true},
-      {"id": "grok-version", "class": "version", "argv": ["grok", "--version"], "safe_for_setup": true, "network": false, "model_consuming": false, "env_scrub": true},
-      {"id": "grok-help", "class": "help", "argv": ["grok", "--help"], "safe_for_setup": true, "network": false, "model_consuming": false, "env_scrub": true}
+      {"id": "grok-version", "class": "version", "argv": ["sh", "-lc", "bin=$(command -v grok || printf '%s' \"$HOME/.grok/bin/grok\"); test -x \"$bin\" && \"$bin\" --version"], "safe_for_setup": true, "network": false, "model_consuming": false, "env_scrub": true},
+      {"id": "grok-help", "class": "help", "argv": ["sh", "-lc", "bin=$(command -v grok || printf '%s' \"$HOME/.grok/bin/grok\"); test -x \"$bin\" && \"$bin\" --help"], "safe_for_setup": true, "network": false, "model_consuming": false, "env_scrub": true}
     ]
   },
   "status_contract": {
