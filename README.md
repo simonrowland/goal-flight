@@ -1,11 +1,11 @@
 # goal-flight
 
-goal-flight lets you hand an AI a large software goal and have it keep moving after the first context window would normally fall apart. It turns the work into durable project files: a plan, queue, environment caveats, worker status, review evidence, and resume notes that survive compaction, restarts, and overnight runs. The current checked-in wrapper targets [Claude Code](https://claude.ai/code); generated wrappers can project the same command/protocol/script core into other hosts through adapter manifests. Multi-hour runs can land as a clean stack of one-commit-per-chunk on main, with deterministic runtime facts in helper scripts rather than in the conversation.
+goal-flight is a multi-agent controller. It lets you hand an AI a large software goal and have it keep moving after the first context window would normally fall apart. It turns the work into durable project files: a plan, queue, environment caveats, worker status, review evidence, and resume notes that survive compaction, restarts, and overnight runs. The current checked-in wrapper targets [Claude Code](https://claude.ai/code). Multi-hour runs can land as a clean stack of one-commit-per-chunk on main, with integrated self-reviews leveraging Gstack.
 
-**What the controller is for**: high-level management, not execution. The controller holds enough context about your project's goal, scenery (constraints, architecture, prior decisions, failure modes), and intent to exercise discretion and recommend the next move — then dispatches actual work to workers (examples: Claude subagents, codex, grok) that don't need that context. This is the frontier of lightly-supervised development: you check in, ratify suggested moves, redirect when needed, and trust the controller to keep the project anchored across compactions and unattended hours. The dispatch / review / handoff machinery below is what frees the controller to do that job.
+**What the controller is for**: high-level management, not execution. The controller holds enough context about your project's goal, scenery (constraints, architecture, prior decisions, failure modes), and intent to exercise discretion and recommend the next move — then dispatches actual work to workers (examples: claude-cli, codex, cursor, grok) to work in an iterative code-review goal loop. This workflow allows lightly-supervised coding: you check in, ratify suggested moves, redirect when needed, and trust the controller to keep the project anchored across compactions and unattended hours. The dispatch / review / handoff machinery below is what frees the controller to do that job.
 
 ```bash
-# Current Claude Code wrapper install example:
+# Claude Code  install:
 git clone https://github.com/simonrowland/goal-flight.git ~/.claude/skills/goal-flight
 ```
 
