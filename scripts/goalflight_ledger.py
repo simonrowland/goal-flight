@@ -211,6 +211,12 @@ def cmd_record(args: argparse.Namespace) -> int:
     dispatch_id = args.dispatch_id or str(uuid.uuid4())
     worker_identity = process_identity(args.worker_pid)
     controller_pid = args.controller_pid or os.getpid()
+    os_sandbox = None
+    if getattr(args, "os_sandbox_json", None):
+        try:
+            os_sandbox = json.loads(args.os_sandbox_json)
+        except json.JSONDecodeError:
+            os_sandbox = {"raw": args.os_sandbox_json}
     record = {
         "schema": SCHEMA,
         "dispatch_id": dispatch_id,
@@ -231,6 +237,7 @@ def cmd_record(args: argparse.Namespace) -> int:
         "stdout_path": args.stdout_path,
         "stderr_path": args.stderr_path,
         "status_path": args.status_path,
+        "os_sandbox": os_sandbox,
         "state": args.state,
         "started_at": utc_now(),
         "hostname": socket.gethostname(),
@@ -272,6 +279,7 @@ def status_payload() -> dict:
             "worker_pid": r.get("worker_pid"),
             "project_root": r.get("project_root"),
             "status_path": r.get("status_path"),
+            "os_sandbox": r.get("os_sandbox"),
             "started_at": r.get("started_at"),
             "updated_at": r.get("updated_at"),
         }
@@ -321,6 +329,7 @@ def build_parser() -> argparse.ArgumentParser:
     rec.add_argument("--stdout-path")
     rec.add_argument("--stderr-path")
     rec.add_argument("--status-path")
+    rec.add_argument("--os-sandbox-json")
     rec.add_argument("--state", default="running")
     rec.add_argument("--json", action="store_true")
     rec.set_defaults(func=cmd_record)

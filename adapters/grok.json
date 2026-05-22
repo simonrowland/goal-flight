@@ -83,6 +83,12 @@
     "browser_ui": {"allowed": false, "user_gate": true, "notes": "No verified browser UI contract."},
     "memory_writes": {"allowed": false, "backend": "repo_files"},
     "plugin_sandbox": {"mode": "none", "declared_permissions": []},
+    "os_sandbox": {
+      "supported_profiles": ["off", "read-only", "workspace-write"],
+      "default_profile": "off",
+      "implementation": "runner:sandbox-exec",
+      "notes": "Dispatch-level worker subprocess wrapper; not a Grok CLI flag. Permits temp and Grok host-state writes while fencing project writes by profile."
+    },
     "auto_approve_detection": {"probes": ["grok-args-scan"], "strict_fail": true},
     "secrets": ["GROK_API_KEY"],
     "irreversible_ops": ["git reset --hard", "force push", "rm -rf"]

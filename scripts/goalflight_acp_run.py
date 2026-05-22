@@ -58,6 +58,7 @@ from goalflight_adapter_readiness import (
     load_manifest,
     manifest_candidates,
     validate_acp_dispatch_readiness,
+    validate_os_sandbox_request,
 )
 from goalflight_acp_client import (
     AcpConnection,
@@ -76,6 +77,14 @@ from goalflight_liveness import (
     system_sleep_pause_note,
     system_sleep_pause_s,
     write_status,
+)
+from goalflight_os_sandbox import (
+    OS_SANDBOX_ARG_CHOICES,
+    OS_SANDBOX_OFF,
+    OsSandboxError,
+    canonical_os_sandbox,
+    prepare_os_sandbox_command,
+    preflight_os_sandbox,
 )
 from goalflight_startup_gate import StartupGate
 from acp_runner import extract_markers, run_prompt
@@ -221,6 +230,7 @@ async def spawn_and_handshake_with_retry(
     permission_dir: str | None = None,
     permission_inline_timeout_s: float | None = None,
     permission_user_timeout_s: float | None = None,
+    os_sandbox: str = OS_SANDBOX_OFF,
 ) -> tuple[asyncio.subprocess.Process, AcpConnection]:
     """Spawn the worker and run the ACP handshake, retrying once on AcpError.
 
@@ -254,6 +264,7 @@ async def spawn_and_handshake_with_retry(
             permission_dir=permission_dir,
             permission_inline_timeout_s=permission_inline_timeout_s,
             permission_user_timeout_s=permission_user_timeout_s,
+            os_sandbox=os_sandbox,
         )
         proc = conn.proc
         if on_attempt is not None:
@@ -280,6 +291,14 @@ async def run(args: argparse.Namespace) -> dict:
     liveness_profile = getattr(args, "liveness_profile", None) or manifest_profile
     if liveness_profile not in LIVENESS_PROFILES:
         liveness_profile = "local_compute"
+    requested_os_sandbox = getattr(args, "os_sandbox", OS_SANDBOX_OFF)
+    try:
+        os_sandbox_profile: str | None = canonical_os_sandbox(requested_os_sandbox)
+    except OsSandboxError as e:
+        os_sandbox_profile = None
+        os_sandbox_error = str(e)
+    else:
+        os_sandbox_error = None
     remote_turn_silence_s = getattr(args, "remote_turn_silence_s", None)
     if remote_turn_silence_s is None:
         remote_turn_silence_s = manifest_remote_turn_silence_s
@@ -321,6 +340,11 @@ async def run(args: argparse.Namespace) -> dict:
         "remote_turn_silence_s": remote_turn_silence_s,
         "turn_in_flight": False,
         "turn_silent_for_s": 0.0,
+        "os_sandbox": {
+            "requested": requested_os_sandbox,
+            "profile": os_sandbox_profile,
+            "enabled": os_sandbox_profile not in {None, OS_SANDBOX_OFF},
+        },
         "updated_at": _now(),
     }
     status_lock = asyncio.Lock()
@@ -345,6 +369,29 @@ async def run(args: argparse.Namespace) -> dict:
     gate = validate_acp_dispatch_readiness(args.agent, [command, *acp_args])
     if gate is not None:
         payload.update({"state": "blocked_adapter_gate", "error": gate})
+        write_status(status_path, payload)
+        return payload
+    if os_sandbox_error is not None:
+        payload.update({"state": "blocked_os_sandbox", "error": os_sandbox_error})
+        write_status(status_path, payload)
+        return payload
+    os_sandbox_gate = validate_os_sandbox_request(args.agent, os_sandbox_profile)
+    if os_sandbox_gate is not None:
+        payload.update({"state": "blocked_os_sandbox", "error": os_sandbox_gate})
+        write_status(status_path, payload)
+        return payload
+    try:
+        preflight_os_sandbox(os_sandbox_profile)
+        if os_sandbox_profile != OS_SANDBOX_OFF:
+            prepare_os_sandbox_command(
+                command,
+                acp_args,
+                cwd=args.cwd,
+                os_sandbox=os_sandbox_profile,
+                agent=args.agent,
+            )
+    except OsSandboxError as e:
+        payload.update({"state": "blocked_os_sandbox", "error": str(e)})
         write_status(status_path, payload)
         return payload
 
@@ -721,7 +768,9 @@ async def run(args: argparse.Namespace) -> dict:
                 permission_dir=getattr(args, "permission_dir", None),
                 permission_inline_timeout_s=getattr(args, "permission_inline_timeout_s", None),
                 permission_user_timeout_s=getattr(args, "permission_user_timeout_s", None),
+                os_sandbox=os_sandbox_profile,
             )
+        await update_status(os_sandbox=getattr(conn, "os_sandbox_metadata", None) or payload["os_sandbox"])
         with contextlib.redirect_stdout(io.StringIO()):
             goalflight_ledger.cmd_record(
                 argparse.Namespace(
@@ -739,6 +788,7 @@ async def run(args: argparse.Namespace) -> dict:
                     stdout_path=None,
                     stderr_path=None,
                     status_path=str(status_path),
+                    os_sandbox_json=json.dumps(payload.get("os_sandbox") or {}, sort_keys=True),
                     state="running",
                     json=True,
                 )
@@ -889,6 +939,16 @@ def main(argv: list[str] | None = None) -> int:
              "ACP permission channel (auto-approved when in-scope); 'disabled' "
              "turns context-mode off for this dispatch entirely (no MCP "
              "elicitation surface). No effect on other adapters.",
+    )
+    parser.add_argument(
+        "--os-sandbox",
+        choices=OS_SANDBOX_ARG_CHOICES,
+        default=OS_SANDBOX_OFF,
+        help="Process-level OS sandbox for the worker subprocess. 'off'/'host-default' "
+             "keeps current behavior. 'read-only' permits file reads plus temp writes "
+             "but blocks repository writes. 'workspace-write' also permits writes under "
+             "--cwd. On macOS this uses sandbox-exec; unsupported platforms fail closed "
+             "with blocked_os_sandbox before capacity is acquired.",
     )
     parser.add_argument(
         "--permission-mode",

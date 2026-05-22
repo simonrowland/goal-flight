@@ -152,6 +152,7 @@ async def managed_pool(
     permission_inline_timeout_s: float | None = None,
     permission_user_timeout_s: float | None = None,
     context_mode: bool = True,
+    os_sandbox: str = "off",
     idle_cleanup_ttl_seconds: float | None = DEFAULT_IDLE_TTL_SECONDS,
     idle_cleanup_interval_seconds: float = DEFAULT_IDLE_CHECK_INTERVAL,
 ) -> AsyncIterator[AcpProcessPool]:
@@ -234,6 +235,11 @@ async def managed_pool(
     permission_user_timeout_s: post-ack user-decision window -- awake-seconds to
     wait for the user's decision after the controller acks (default 36000 = 10h).
 
+    os_sandbox: process-level sandbox profile for spawned workers. "off" keeps
+    the host default. "read-only" and "workspace-write" wrap the worker
+    subprocess in the host OS sandbox where available; this is separate from ACP
+    permission escalation and applies before the agent process starts.
+
     idle_cleanup_ttl_seconds: connections with last_active older than this are
     reaped by a background task. Defaults to 300s (5 min). Critical for long
     runs that spawn many distinct session_ids — without this, idle workers
@@ -260,6 +266,7 @@ async def managed_pool(
         permission_inline_timeout_s=permission_inline_timeout_s,
         permission_user_timeout_s=permission_user_timeout_s,
         context_mode=context_mode,
+        os_sandbox=os_sandbox,
     )
     pool.cleanup_ghosts()  # reap any orphans from a prior controller run
 

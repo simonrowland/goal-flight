@@ -29,6 +29,7 @@ orthogonal axes: **iteration pattern** (how many turns) and **comms shape**
     --cwd "$PWD" \
     --prompt <prompt.md> \
     --mode <one-shot|goal> \
+    --os-sandbox <off|read-only|workspace-write> \
     --status-json <status.json>
   ```
   The runner re-execs into `~/.goal-flight/venvs/acp-0.10/bin/python` when
@@ -156,17 +157,27 @@ time**. The only worker→controller escalation channel is the text markers
 `USER-NEED:` / `USER-CONFIRM:` (`worker-markers.md`): a worker that needs a human
 decision stops and emits one; the controller relays it.
 
-Two independent gates govern a codex worker. Do not conflate them:
+Three separate layers can affect a spawned worker. Do not conflate them:
 
-1. **codex sandbox + approval policy** — file writes, shell, network. Open it with
-   `--sandbox workspace-write -c approval_policy=never` (the classifier-safe form
-   of "full permissions"). `--dangerously-bypass-approvals-and-sandbox` is rejected
-   by some controllers' auto-mode safety classifiers and is unnecessary when the
-   worker's edit scope is its workspace.
-2. **MCP elicitation** (`request_user_input`) — raised by tools like context-mode's
-   `ctx_index`. NOT a sandbox/approval matter, so gate #1 does nothing for it. Left
-   unhandled, codex-acp neither forwards nor rejects the elicitation over ACP and
-   the tool call wedges at ~0% CPU until the per-tool wall.
+1. **Goal Flight OS sandbox** — `goalflight_acp_run.py --os-sandbox read-only`
+   or `--os-sandbox workspace-write` wraps the ACP worker subprocess in the host
+   OS sandbox where available. On macOS this is `sandbox-exec`; unsupported
+   hosts fail closed with `blocked_os_sandbox` before capacity is acquired.
+   `read-only` permits file reads, temp writes, and the worker CLI's own
+   host-state directory (for auth/session/cache); `workspace-write` also permits
+   writes under `--cwd`. This is the real process/file fence for ACP workers;
+   adapter CLI flags remain adapter-specific policy knobs.
+2. **codex sandbox + approval policy** — useful for the codex exec/bash-tail
+   path and shell approvals. Open it with `--sandbox workspace-write -c
+   approval_policy=never` (the classifier-safe form of "full permissions").
+   `--dangerously-bypass-approvals-and-sandbox` is rejected by some controllers'
+   auto-mode safety classifiers and is unnecessary when the worker's edit scope
+   is its workspace.
+3. **MCP elicitation** (`request_user_input`) — raised by tools like context-mode's
+   `ctx_index`. NOT a filesystem sandbox or approval-policy matter, so the first
+   two layers do nothing for it. Left unhandled, codex-acp neither forwards nor
+   rejects the elicitation over ACP and the tool call wedges at ~0% CPU until the
+   per-tool wall.
 
 **A codex worker can use context-mode over ACP in auto-mode.** The runner
 auto-injects `-c features.tool_call_mcp_elicitation=true` for codex-acp at the

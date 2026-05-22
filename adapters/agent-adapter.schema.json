@@ -300,6 +300,7 @@
         "browser_ui",
         "memory_writes",
         "plugin_sandbox",
+        "os_sandbox",
         "auto_approve_detection",
         "secrets",
         "irreversible_ops"
@@ -336,6 +337,7 @@
             "declared_permissions": {"$ref": "#/$defs/stringArray"}
           }
         },
+        "os_sandbox": {"$ref": "#/$defs/osSandbox"},
         "auto_approve_detection": {
           "type": "object",
           "additionalProperties": false,
@@ -347,6 +349,21 @@
         },
         "secrets": {"$ref": "#/$defs/stringArray"},
         "irreversible_ops": {"$ref": "#/$defs/stringArray"}
+      }
+    },
+    "osSandbox": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["supported_profiles", "default_profile", "implementation"],
+      "properties": {
+        "supported_profiles": {
+          "type": "array",
+          "items": {"enum": ["off", "read-only", "workspace-write"]},
+          "uniqueItems": true
+        },
+        "default_profile": {"enum": ["off", "read-only", "workspace-write"]},
+        "implementation": {"enum": ["runner:sandbox-exec", "host-default", "unsupported"]},
+        "notes": {"type": "string"}
       }
     },
     "gatedBoolean": {

@@ -131,6 +131,12 @@
       "mode": "narrow",
       "declared_permissions": ["filesystem workspace-write", "context-mode analysis", "explicit browser plugin use"]
     },
+    "os_sandbox": {
+      "supported_profiles": ["off", "read-only", "workspace-write"],
+      "default_profile": "off",
+      "implementation": "runner:sandbox-exec",
+      "notes": "Dispatch-level worker subprocess wrapper. This permits temp and Codex host-state writes while fencing project writes by profile; separate from Codex approval policy and ACP permission escalation."
+    },
     "auto_approve_detection": {
       "probes": ["codex-args-scan", "adapter-forbidden-args-scan"],
       "strict_fail": true

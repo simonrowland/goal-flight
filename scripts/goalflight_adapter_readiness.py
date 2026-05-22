@@ -11,6 +11,7 @@ import subprocess
 from typing import Any
 
 from goalflight_adapter_gate import validate_adapter_gate
+from goalflight_os_sandbox import OS_SANDBOX_OFF
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -151,3 +152,27 @@ def validate_acp_dispatch_readiness(agent: str, argv: list[str]) -> dict[str, An
         local_state=local_readiness_state(manifest),
     )
     return None if decision.get("allowed") else decision
+
+
+def validate_os_sandbox_request(agent: str, profile: str | None) -> dict[str, Any] | None:
+    if profile in {None, OS_SANDBOX_OFF}:
+        return None
+    manifest = load_manifest(agent) or {}
+    os_spec = ((manifest.get("permission_surface") or {}).get("os_sandbox") or {})
+    if not isinstance(os_spec, dict):
+        return {
+            "allowed": False,
+            "reason": "os_sandbox_undeclared",
+            "profile": profile,
+            "safe_next_action": "declare_os_sandbox_support_or_use_off",
+        }
+    supported = os_spec.get("supported_profiles")
+    if not isinstance(supported, list) or profile not in supported:
+        return {
+            "allowed": False,
+            "reason": "os_sandbox_unsupported",
+            "profile": profile,
+            "supported_profiles": supported if isinstance(supported, list) else [],
+            "safe_next_action": "select_supported_os_sandbox_profile",
+        }
+    return None

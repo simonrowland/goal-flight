@@ -78,6 +78,16 @@ bad["permission_surface"]["auto_approve_detection"]["strict_fail"] = False
 expect_error("silent-auto-approve", bad, "strict_fail")
 
 bad = copy.deepcopy(codex)
+bad["permission_surface"]["os_sandbox"]["default_profile"] = "read-only"
+bad["permission_surface"]["os_sandbox"]["supported_profiles"] = ["off"]
+expect_error("os-sandbox-default-unsupported", bad, "os_sandbox default_profile")
+
+bad = copy.deepcopy(codex)
+bad["permission_surface"]["os_sandbox"]["implementation"] = "unsupported"
+bad["permission_surface"]["os_sandbox"]["supported_profiles"] = ["off", "workspace-write"]
+expect_error("os-sandbox-unsupported-declares-write", bad, "unsupported os_sandbox")
+
+bad = copy.deepcopy(codex)
 bad["invocation"]["exec"]["args"].append("--yolo")
 expect_error("forbidden-invocation-arg", bad, "forbidden arg")
 
