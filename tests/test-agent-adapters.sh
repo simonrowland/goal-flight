@@ -154,9 +154,19 @@ allowed = validate_adapter_gate(
     role="worker",
     requested_transport="cli_json",
     argv=["codex", "exec", "--json", "-C", str(repo), "-"],
+    local_state={"controller": "ready", "worker": "ready"},
 )
 if not allowed["allowed"]:
     raise SystemExit(f"codex safe worker dispatch should pass gate, got {allowed}")
+
+static_denied = validate_adapter_gate(
+    codex,
+    role="worker",
+    requested_transport="cli_json",
+    argv=["codex", "exec", "--json", "-C", str(repo), "-"],
+)
+if static_denied["allowed"] or static_denied["reason"] != "probe_required":
+    raise SystemExit(f"checked-in readiness should not allow live dispatch, got {static_denied}")
 
 bad = copy.deepcopy(codex)
 del bad["live_gate"]
@@ -213,10 +223,11 @@ expect_denied(
 )
 expect_denied(
     "not-installed",
-    {**copy.deepcopy(codex), "local_readiness_state": {**copy.deepcopy(codex["local_readiness_state"]), "worker": "not_installed"}},
+    codex,
     "not_installed",
     role="worker",
     requested_transport="tail_file",
+    local_state={"controller": "ready", "worker": "not_installed"},
 )
 expect_denied(
     "forbidden-arg",

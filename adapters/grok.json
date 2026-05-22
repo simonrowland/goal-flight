@@ -10,13 +10,13 @@
   },
   "support": {
     "controller": {
-      "capability": "candidate",
-      "evidence": ["survey: Grok CLI has ACP/headless claims but official invocation maturity is still gated", "repo: ACP runner maps grok to grok agent stdio"],
+      "capability": "supported",
+      "evidence": ["survey: Grok CLI has ACP/headless claims", "repo: ACP runner maps grok to grok agent stdio", "smoke: grok ACP worker completed setup review on 2026-05-22"],
       "readiness_requirements": ["binary", "version", "auth_optional", "safe_args", "status_contract"],
       "fallback": "worker_only"
     },
     "worker": {
-      "capability": "candidate",
+      "capability": "supported",
       "transport": ["acp", "cli_json", "tail_file"],
       "readiness_requirements": ["binary", "version", "noninteractive", "status_contract", "safe_args"],
       "fallback": "tail_file"
@@ -43,7 +43,7 @@
     "read_file": {"host_tools": ["workspace file read"], "constraints": ["workspace reads only"]},
     "write_file": {"host_tools": ["workspace edit"], "constraints": ["authorized edit scope only"]},
     "search": {"host_tools": ["workspace search"], "constraints": ["filtered search"]},
-    "delegate": {"host_tools": ["grok agent stdio"], "constraints": ["candidate until live gate verified"]},
+    "delegate": {"host_tools": ["grok agent stdio"], "constraints": ["requires live gate readiness"]},
     "ask_user": {"host_tools": ["USER-NEED marker"], "constraints": ["block on ambiguity"]},
     "plan_update": {"host_tools": ["status markers"], "constraints": ["controller tracks plan externally"]},
     "memory_search": {"host_tools": ["repo resume notes", "Grok session state"], "constraints": ["repo files remain canonical"]},

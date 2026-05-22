@@ -7,6 +7,7 @@ The default mode is a dry run. Mutating setup requires both --apply and --yes.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -15,6 +16,7 @@ import shlex
 import sys
 import subprocess
 import tempfile
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
@@ -29,18 +31,18 @@ from goalflight_adapter_gate import validate_adapter_gate  # noqa: E402
 BACKUP_SCHEMA = "goalflight.setup-backup.v1"
 MERGE_START = "# >>> goal-flight"
 MERGE_END = "# <<< goal-flight"
-SETUP_ALLOWED_GATE_REASONS = {
-    "allowed",
-    "candidate",
-    "config_only",
-    "not_installed",
-    "probe_required",
-    "unsupported",
-}
+SETUP_ALLOWED_GATE_REASONS = {"allowed", "candidate", "config_only", "not_installed", "probe_required", "unsupported"}
 
 
-class SetupError(RuntimeError):
-    pass
+class SetupError(RuntimeError): pass
+
+
+@dataclass(frozen=True)
+class SetupPlanItem:
+    agent: str
+    manifest: dict[str, Any]
+    destination_ids: set[str]
+    addon_ids: set[str] | None
 
 
 def _now_slug() -> str:
@@ -111,6 +113,10 @@ def _codex_plugin_commands(repo_root: Path) -> list[list[str]]:
     ]
 
 
+def _codex_plugin_unregister_commands() -> list[list[str]]:
+    return [["codex", "plugin", "remove", "goal-flight@goal-flight"], ["codex", "plugin", "marketplace", "remove", "goal-flight"]]
+
+
 def _format_command(argv: list[str]) -> str:
     return " ".join(shlex.quote(part) for part in argv)
 
@@ -125,6 +131,8 @@ def _run_codex_plugin_registration(repo_root: Path) -> None:
             for argv in commands:
                 handle.write(_format_command(argv) + "\n")
                 print(f"CODEX {_format_command(argv)}")
+        if os.environ.get("GOALFLIGHT_SETUP_FAKE_CODEX_FAIL_VERIFY"):
+            raise SetupError("fake codex plugin registration failed")
         return
 
     for argv in commands:
@@ -159,6 +167,30 @@ def _run_codex_plugin_registration(repo_root: Path) -> None:
         if cached.get("interface", {}).get("displayName") != "goal-flight":
             raise SetupError(f"codex plugin cache is stale: {cached_manifest}")
     print("VERIFY codex plugin goal-flight@goal-flight installed enabled")
+
+
+def _run_codex_plugin_unregistration() -> None:
+    fake_log = os.environ.get("GOALFLIGHT_SETUP_FAKE_CODEX_LOG")
+    commands = _codex_plugin_unregister_commands()
+    if fake_log:
+        fake_path = Path(fake_log).expanduser()
+        fake_path.parent.mkdir(parents=True, exist_ok=True)
+        with fake_path.open("a") as handle:
+            for argv in commands:
+                handle.write(_format_command(argv) + "\n")
+                print(f"CODEX {_format_command(argv)}")
+        return
+
+    for argv in commands:
+        result = subprocess.run(argv, text=True, capture_output=True, check=False)
+        combined = f"{result.stdout}\n{result.stderr}".lower()
+        allowed = ("not installed", "not found", "unknown", "missing")
+        if result.returncode != 0 and not any(word in combined for word in allowed):
+            raise SetupError(
+                "codex plugin unregistration failed: "
+                f"{_format_command(argv)}\n{result.stderr.strip() or result.stdout.strip()}"
+            )
+        print(f"CODEX {_format_command(argv)}")
 
 
 def _run_codex_context_mode_registration(repo_root: Path, *, dry_run: bool) -> None:
@@ -219,44 +251,45 @@ def _run_host_bootstrap(
     destination_ids: set[str] | None = None,
     addon_ids: set[str] | None = None,
 ) -> None:
-    addons = _selected_addons(_load_manifest(repo_root, agent), destination_ids, addon_ids)
-    addon_modes = {addon["id"]: addon.get("install_mode") for addon in addons}
-    if agent == "codex":
-        selected = destination_ids or _agent_default_destinations(repo_root, agent)
-        if "codex-desktop-controller" in selected:
-            print("CONTROLLER_SURFACE codex desktop")
-        if "codex-cli-controller" in selected:
-            print("CONTROLLER_SURFACE codex cli")
-        if "codex-cli-worker" in selected:
-            _check_codex_cli_worker_surface(dry_run=dry_run)
-        if addon_modes.get("context-mode") == "setup":
+    manifest = _load_manifest(repo_root, agent)
+    selected = destination_ids or _agent_default_destinations(repo_root, agent)
+    destinations = _selected_destinations(manifest, selected)
+    for destination in destinations:
+        role = destination.get("role")
+        surface = destination.get("surface")
+        if role == "controller":
+            cap = manifest.get("support", {}).get("controller", {}).get("capability")
+            suffix = " candidate" if cap == "candidate" else ""
+            print(f"CONTROLLER_SURFACE {agent} {surface}{suffix}")
+        elif role == "worker":
+            if agent == "codex" and destination["id"] == "codex-cli-worker":
+                _check_codex_cli_worker_surface(dry_run=dry_run)
+            elif agent == "cursor" and destination["id"] == "cursor-cli-worker":
+                print("WORKER_CHECK cursor-agent --version")
+            else:
+                commands = destination.get("commands", [])
+                detail = commands[0] if commands else destination["id"]
+                print(f"WORKER_CHECK {detail}")
+
+    addons = _selected_addons(manifest, selected, addon_ids)
+    for addon_id in _skipped_addon_ids(manifest, selected, addon_ids):
+        print(f"ADDON_SKIP {agent} {addon_id} reason=incompatible_destinations")
+    for addon in addons:
+        mode = addon.get("install_mode")
+        if mode == "setup" and agent == "codex" and addon.get("id") == "context-mode":
             _run_codex_context_mode_registration(repo_root, dry_run=dry_run)
-        for addon in addons:
-            if addon.get("install_mode") == "init_self_check":
-                _run_addon_self_check(agent, addon)
-        if "codex-desktop-controller" in selected:
+        elif mode == "deferred":
+            print(f"ADDON_DEFERRED {agent} {addon['id']} reason=plugin_or_hook_api_unverified")
+        elif mode == "init_self_check":
+            _run_addon_self_check(agent, addon)
+
+    if any(destination.get("requires_restart") for destination in destinations):
+        if agent == "codex":
             print("RESTART_REQUIRED codex reload plugin and skill registries")
-    elif agent == "cursor":
-        selected = destination_ids or _agent_default_destinations(repo_root, agent)
-        if "cursor-desktop-controller" in selected:
-            print("CONTROLLER_SURFACE cursor desktop")
-        if "cursor-cli-worker" in selected:
-            print("WORKER_CHECK cursor-agent --version")
-        for addon in addons:
-            if addon.get("install_mode") == "deferred":
-                print(f"ADDON_DEFERRED cursor {addon['id']} reason=plugin_or_hook_api_unverified")
-            elif addon.get("install_mode") == "init_self_check":
-                _run_addon_self_check(agent, addon)
-        print("RESTART_REQUIRED cursor reload global instructions and skills")
-    elif agent == "grok":
-        selected = destination_ids or _agent_default_destinations(repo_root, agent)
-        if "grok-cli-controller" in selected:
-            print("CONTROLLER_SURFACE grok cli candidate")
-        if "grok-acp-worker" in selected:
-            print("WORKER_CHECK grok agent stdio")
-        for addon in addons:
-            if addon.get("install_mode") == "init_self_check":
-                _run_addon_self_check(agent, addon)
+        elif agent == "cursor":
+            print("RESTART_REQUIRED cursor reload global instructions and skills")
+        else:
+            print(f"RESTART_REQUIRED {agent} reload host instructions")
 
 
 def _safe_discovery_summary(manifest: dict[str, Any]) -> list[str]:
@@ -383,6 +416,24 @@ def _setup_destinations(manifest: dict[str, Any], role: str) -> list[dict[str, A
     return list(manifest.get("setup", {}).get(key, []))
 
 
+def _all_setup_destinations(manifest: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        destination
+        for role in ("controller", "worker")
+        for destination in _setup_destinations(manifest, role)
+    ]
+
+
+def _selected_destinations(
+    manifest: dict[str, Any],
+    destination_ids: set[str] | None,
+) -> list[dict[str, Any]]:
+    destinations = _all_setup_destinations(manifest)
+    if not destination_ids:
+        return destinations
+    return [destination for destination in destinations if destination["id"] in destination_ids]
+
+
 def _setup_addons(manifest: dict[str, Any]) -> list[dict[str, Any]]:
     return list(manifest.get("setup", {}).get("addons", []))
 
@@ -429,6 +480,26 @@ def _selected_addons(
         elif addon.get("id") in addon_ids:
             selected.append(addon)
     return selected
+
+
+def _skipped_addon_ids(
+    manifest: dict[str, Any],
+    destination_ids: set[str] | None,
+    addon_ids: set[str] | None,
+) -> list[str]:
+    if addon_ids is None:
+        return []
+    selected = {addon["id"] for addon in _selected_addons(manifest, destination_ids, addon_ids)}
+    return sorted(addon_ids - selected)
+
+
+def _validate_requested_addons(manifests: list[dict[str, Any]], addon_ids: set[str] | None) -> None:
+    if addon_ids is None:
+        return
+    known = {addon["id"] for manifest in manifests for addon in _setup_addons(manifest)}
+    unknown = sorted(addon_ids - known)
+    if unknown:
+        raise SetupError(f"unknown setup add-on(s): {', '.join(unknown)}")
 
 
 def _parse_csv(raw: str | None) -> set[str]:
@@ -519,6 +590,55 @@ def _interactive_selection(manifests: list[dict[str, Any]]) -> tuple[set[str], s
     return controllers, workers, addons
 
 
+def _build_selection_plan(
+    manifests: list[dict[str, Any]],
+    destination_ids: set[str],
+    addon_ids: set[str] | None,
+) -> list[SetupPlanItem]:
+    index = _destination_index(manifests)
+    unknown = sorted(destination_ids - set(index))
+    if unknown:
+        raise SetupError(f"unknown setup destination(s): {', '.join(unknown)}")
+    _validate_requested_addons(manifests, addon_ids)
+
+    by_agent: dict[str, set[str]] = {}
+    for destination_id in destination_ids:
+        manifest, _ = index[destination_id]
+        by_agent.setdefault(manifest["agent_id"], set()).add(destination_id)
+    return [
+        SetupPlanItem(
+            agent=manifest["agent_id"],
+            manifest=manifest,
+            destination_ids=selected,
+            addon_ids=addon_ids,
+        )
+        for manifest in manifests
+        if (selected := by_agent.get(manifest["agent_id"]))
+    ]
+
+
+def _ensure_setup_gate(manifest: dict[str, Any]) -> None:
+    gate = validate_adapter_gate(manifest, role="controller", argv=[], live_entry="setup_apply")
+    reason = str(gate.get("reason"))
+    if not gate.get("allowed") and reason not in SETUP_ALLOWED_GATE_REASONS:
+        raise SetupError(f"setup gate denied: {gate.get('reason')} fields={gate.get('blocked_fields')}")
+
+
+def _ensure_setup_actions(
+    repo_root: Path,
+    manifest: dict[str, Any],
+    destination_ids: set[str] | None,
+) -> list[dict[str, Any]]:
+    actions = _selected_actions(manifest, destination_ids)
+    for action in actions:
+        if (action.get("writes_repo") or action.get("writes_user_config")) and not action.get("user_gate"):
+            raise SetupError(f"refusing ungated write action: {action.get('kind')} {action.get('target')}")
+        source = _source_path(repo_root, action)
+        if not source.exists():
+            raise SetupError(f"setup source missing: {source}")
+    return actions
+
+
 def _run_selection(
     repo_root: Path,
     manifests: list[dict[str, Any]],
@@ -528,40 +648,26 @@ def _run_selection(
     apply: bool,
     yes: bool,
 ) -> None:
-    index = _destination_index(manifests)
-    unknown = sorted(destination_ids - set(index))
-    if unknown:
-        raise SetupError(f"unknown setup destination(s): {', '.join(unknown)}")
-    addons_by_id = _addon_index(manifests)
-    if addon_ids is not None:
-        unknown_addons = sorted(addon_ids - set(addons_by_id))
-        if unknown_addons:
-            raise SetupError(f"unknown setup add-on(s): {', '.join(unknown_addons)}")
-    by_agent: dict[str, set[str]] = {}
-    for destination_id in destination_ids:
-        manifest, _ = index[destination_id]
-        by_agent.setdefault(manifest["agent_id"], set()).add(destination_id)
+    plan = _build_selection_plan(manifests, destination_ids, addon_ids)
+    if apply:
+        for item in plan:
+            _ensure_setup_gate(item.manifest)
+            _ensure_setup_actions(repo_root, item.manifest, item.destination_ids)
     if addon_ids is not None:
         print(f"ADDONS selected={','.join(sorted(addon_ids))}")
-    for manifest in manifests:
-        selected = by_agent.get(manifest["agent_id"])
-        if not selected:
-            continue
-        selected_addons = _selected_addons(manifest, selected, addon_ids)
-        selected_addon_ids = {addon["id"] for addon in selected_addons}
-        incompatible = sorted(
-            addon_id
-            for addon_id in (addon_ids or set())
-            if addon_id in addons_by_id and addon_id not in selected_addon_ids
-        )
-        if incompatible:
-            raise SetupError(
-                f"setup add-on(s) incompatible with selected destinations: {', '.join(incompatible)}"
-            )
+    for item in plan:
         if apply:
-            _apply(repo_root, manifest["agent_id"], manifest, yes, selected, addon_ids)
+            _apply(
+                repo_root,
+                item.agent,
+                item.manifest,
+                yes,
+                item.destination_ids,
+                item.addon_ids,
+                gate_checked=True,
+            )
         else:
-            _dry_run(repo_root, manifest["agent_id"], manifest, selected, addon_ids)
+            _dry_run(repo_root, item.agent, item.manifest, item.destination_ids, item.addon_ids)
 
 
 def _source_path(repo_root: Path, action: dict[str, Any]) -> Path:
@@ -637,18 +743,18 @@ def _record_backup(action: dict[str, Any], target: Path, backups_root: Path) -> 
 
 
 def _apply_action(repo_root: Path, agent: str, action: dict[str, Any], backups_root: Path) -> dict[str, Any]:
-    if (action.get("writes_repo") or action.get("writes_user_config")) and not action.get("user_gate"):
-        raise SetupError(f"refusing ungated write action: {action.get('kind')} {action.get('target')}")
-
     source = _source_path(repo_root, action)
     target = _expand_target(action["target"])
-    if not source.exists():
-        raise SetupError(f"setup source missing: {source}")
 
     record = _record_backup(action, target, backups_root)
     kind = action["kind"]
     if kind == "register_plugin":
-        _run_codex_plugin_registration(repo_root)
+        try:
+            _run_codex_plugin_registration(repo_root)
+        except Exception:
+            with contextlib.suppress(Exception):
+                _run_codex_plugin_unregistration()
+            raise
     elif kind == "copy":
         _copy_atomic(source, target)
     elif kind in {"copy_or_merge", "merge_config"}:
@@ -663,10 +769,8 @@ def _apply_action(repo_root: Path, agent: str, action: dict[str, Any], backups_r
     return record
 
 
-def _codex_legacy_personal_skill_cleanup_needed(destination_ids: set[str] | None) -> bool:
-    if not destination_ids:
-        return False
-    return "codex-desktop-controller" in destination_ids and "codex-cli-controller" not in destination_ids
+def _codex_legacy_personal_skill_cleanup_needed(actions: list[dict[str, Any]]) -> bool:
+    return any(action["kind"] == "register_plugin" for action in actions)
 
 
 def _codex_legacy_personal_skill_path() -> Path:
@@ -708,6 +812,8 @@ def _restore_from_manifest(path: Path) -> None:
     for record in reversed(data.get("actions", [])):
         target = Path(record["target"])
         rollback = record.get("rollback")
+        if record.get("kind") == "register_plugin":
+            _run_codex_plugin_unregistration()
         if rollback == "restore_backup":
             if record.get("existed"):
                 backup = Path(record["backup"])
@@ -724,9 +830,11 @@ def _restore_from_manifest(path: Path) -> None:
                     _copy_atomic(backup, target)
             elif target.exists() or target.is_symlink():
                 target.unlink()
-        elif rollback in {"delete_link", "unregister_plugin"}:
+        elif rollback == "delete_link":
             if target.exists() or target.is_symlink():
                 target.unlink()
+        elif rollback == "unregister_plugin":
+            _run_codex_plugin_unregistration()
         else:
             raise SetupError(f"unsupported rollback kind: {rollback}")
         print(f"RESTORE {target}")
@@ -763,7 +871,7 @@ def _dry_run(
         if action["kind"] == "register_plugin":
             for argv in _codex_plugin_commands(repo_root):
                 print(f"CODEX {_format_command(argv)}")
-    if agent == "codex" and _codex_legacy_personal_skill_cleanup_needed(destination_ids):
+    if agent == "codex" and _codex_legacy_personal_skill_cleanup_needed(actions):
         print(f"CLEANUP remove_tree target={_codex_legacy_personal_skill_path()} reason=desktop_plugin_supersedes_personal_skill")
     _run_host_bootstrap(
         repo_root,
@@ -787,21 +895,25 @@ def _apply(
     yes: bool,
     destination_ids: set[str] | None = None,
     addon_ids: set[str] | None = None,
+    *,
+    gate_checked: bool = False,
 ) -> None:
     if not yes:
         raise SetupError("refusing mutation without --yes")
-    gate = validate_adapter_gate(manifest, role="controller", argv=[], live_entry="setup_apply")
-    reason = str(gate.get("reason"))
-    if not gate.get("allowed") and reason not in SETUP_ALLOWED_GATE_REASONS:
-        raise SetupError(f"setup gate denied: {gate.get('reason')} fields={gate.get('blocked_fields')}")
-    actions = _selected_actions(manifest, destination_ids)
+    if not gate_checked:
+        _ensure_setup_gate(manifest)
+    actions = _ensure_setup_actions(repo_root, manifest, destination_ids)
     backup_manifest = _backup_manifest_path(agent)
     backups_root = backup_manifest.with_suffix("")
-    records = [_apply_action(repo_root, agent, action, backups_root) for action in actions]
-    if agent == "codex" and _codex_legacy_personal_skill_cleanup_needed(destination_ids):
+    records: list[dict[str, Any]] = []
+    for action in actions:
+        records.append(_apply_action(repo_root, agent, action, backups_root))
+        _write_backup_manifest(backup_manifest, agent, records)
+    if agent == "codex" and _codex_legacy_personal_skill_cleanup_needed(actions):
         cleanup_record = _cleanup_codex_legacy_personal_skill(backups_root)
         if cleanup_record:
             records.append(cleanup_record)
+            _write_backup_manifest(backup_manifest, agent, records)
     _run_host_bootstrap(
         repo_root,
         agent,
@@ -809,7 +921,8 @@ def _apply(
         destination_ids=destination_ids,
         addon_ids=addon_ids,
     )
-    _write_backup_manifest(backup_manifest, agent, records)
+    if not backup_manifest.exists():
+        _write_backup_manifest(backup_manifest, agent, records)
     if not records:
         print(f"NO_WRITES setup agent={agent}")
     for record in records:
@@ -864,6 +977,7 @@ def main(argv: list[str] | None = None) -> int:
         if not destinations and _setup_destinations(manifest, "controller") + _setup_destinations(manifest, "worker"):
             raise SetupError(f"no ready default setup destinations for agent: {args.agent}")
         addons = _parse_optional_csv(args.addons)
+        _validate_requested_addons(manifests, addons)
         if args.apply:
             _apply(repo_root, args.agent, manifest, args.yes, destinations, addons)
         else:

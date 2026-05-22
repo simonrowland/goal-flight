@@ -27,7 +27,9 @@ the manifest before translating abstract operations into host calls.
 
 `invocation.exec` declares how the agent runs: native tool, CLI, ACP, plugin, or
 prompt template. It also declares safe required args, forbidden args,
-justification-gated args, stdin mode, cwd policy, and output parsing.
+justification-gated args, stdin mode, cwd policy, and output parsing. For ACP,
+the manifest describes the wire/dialect contract and wrapper command; it does
+not imply the worker implementation uses the same SDK as the controller.
 
 Forbidden args are rejected in invocations, probes, generated wrappers, and
 checked-in configs before live setup, controller launch, or worker dispatch.

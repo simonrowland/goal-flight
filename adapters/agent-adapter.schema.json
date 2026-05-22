@@ -24,59 +24,23 @@
     "host_projection"
   ],
   "properties": {
-    "schema": {
-      "const": "goalflight.agent-adapter.v1"
-    },
-    "agent_id": {
-      "$ref": "#/$defs/agentId"
-    },
-    "display_name": {
-      "type": "string",
-      "minLength": 1
-    },
-    "agent_family": {
-      "$ref": "#/$defs/agentFamily"
-    },
-    "providers": {
-      "$ref": "#/$defs/providers"
-    },
-    "support": {
-      "$ref": "#/$defs/support"
-    },
-    "local_readiness_state": {
-      "$ref": "#/$defs/localReadinessState"
-    },
-    "live_gate": {
-      "$ref": "#/$defs/liveGate"
-    },
-    "tool_name_map": {
-      "$ref": "#/$defs/toolNameMap"
-    },
-    "invocation": {
-      "$ref": "#/$defs/invocation"
-    },
-    "permission_surface": {
-      "$ref": "#/$defs/permissionSurface"
-    },
-    "memory_backend": {
-      "$ref": "#/$defs/memoryBackend"
-    },
-    "packaging": {
-      "$ref": "#/$defs/packaging"
-    },
-    "setup": {
-      "$ref": "#/$defs/setup"
-    },
-    "discovery": {
-      "$ref": "#/$defs/discovery"
-    },
-    "status_contract": {
-      "$ref": "#/$defs/statusContract"
-    },
-    "host_projection": {
-      "type": "object",
-      "additionalProperties": true
-    }
+    "schema": {"const": "goalflight.agent-adapter.v1"},
+    "agent_id": {"$ref": "#/$defs/agentId"},
+    "display_name": {"type": "string", "minLength": 1},
+    "agent_family": {"$ref": "#/$defs/agentFamily"},
+    "providers": {"$ref": "#/$defs/providers"},
+    "support": {"$ref": "#/$defs/support"},
+    "local_readiness_state": {"$ref": "#/$defs/localReadinessState"},
+    "live_gate": {"$ref": "#/$defs/liveGate"},
+    "tool_name_map": {"$ref": "#/$defs/toolNameMap"},
+    "invocation": {"$ref": "#/$defs/invocation"},
+    "permission_surface": {"$ref": "#/$defs/permissionSurface"},
+    "memory_backend": {"$ref": "#/$defs/memoryBackend"},
+    "packaging": {"$ref": "#/$defs/packaging"},
+    "setup": {"$ref": "#/$defs/setup"},
+    "discovery": {"$ref": "#/$defs/discovery"},
+    "status_contract": {"$ref": "#/$defs/statusContract"},
+    "host_projection": {"type": "object", "additionalProperties": true}
   },
   "$defs": {
     "agentId": {
@@ -115,263 +79,100 @@
     },
     "stringArray": {
       "type": "array",
-      "items": {
-        "type": "string"
-      },
+      "items": {"type": "string"},
       "uniqueItems": true
     },
     "providers": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "controller_provider",
-        "model_provider",
-        "same_provider_policy"
-      ],
+      "required": ["controller_provider", "model_provider", "same_provider_policy"],
       "properties": {
-        "controller_provider": {
-          "enum": [
-            "anthropic",
-            "openai",
-            "google",
-            "xai",
-            "github",
-            "local",
-            "mixed",
-            "none",
-            "unknown"
-          ]
-        },
-        "model_provider": {
-          "enum": [
-            "anthropic",
-            "openai",
-            "google",
-            "xai",
-            "github",
-            "local",
-            "mixed",
-            "unknown"
-          ]
-        },
-        "same_provider_policy": {
-          "enum": [
-            "allow",
-            "lower_trust_weight",
-            "require_cross_provider_review",
-            "forbid_self_review"
-          ]
-        }
+        "controller_provider": {"enum": ["anthropic", "openai", "google", "xai", "github", "local", "mixed", "none", "unknown"]},
+        "model_provider": {"enum": ["anthropic", "openai", "google", "xai", "github", "local", "mixed", "unknown"]},
+        "same_provider_policy": {"enum": ["allow", "lower_trust_weight", "require_cross_provider_review", "forbid_self_review"]}
       }
     },
     "support": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "controller",
-        "worker"
-      ],
+      "required": ["controller", "worker"],
       "properties": {
-        "controller": {
-          "$ref": "#/$defs/controllerSupport"
-        },
-        "worker": {
-          "$ref": "#/$defs/workerSupport"
-        }
+        "controller": {"$ref": "#/$defs/controllerSupport"},
+        "worker": {"$ref": "#/$defs/workerSupport"}
       }
     },
     "controllerSupport": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "capability",
-        "evidence",
-        "readiness_requirements",
-        "fallback"
-      ],
+      "required": ["capability", "evidence", "readiness_requirements", "fallback"],
       "properties": {
-        "capability": {
-          "$ref": "#/$defs/staticCapability"
-        },
-        "evidence": {
-          "$ref": "#/$defs/stringArray"
-        },
+        "capability": {"$ref": "#/$defs/staticCapability"},
+        "evidence": {"$ref": "#/$defs/stringArray"},
         "readiness_requirements": {
           "type": "array",
-          "items": {
-            "enum": [
-              "binary",
-              "version",
-              "auth_optional",
-              "safe_args",
-              "status_contract"
-            ]
-          },
+          "items": {"enum": ["binary", "version", "auth_optional", "safe_args", "status_contract"]},
           "uniqueItems": true
         },
-        "fallback": {
-          "enum": [
-            "worker_only",
-            "config_only",
-            "unsupported"
-          ]
-        }
+        "fallback": {"enum": ["worker_only", "config_only", "unsupported"]}
       }
     },
     "workerSupport": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "capability",
-        "transport",
-        "readiness_requirements",
-        "fallback"
-      ],
+      "required": ["capability", "transport", "readiness_requirements", "fallback"],
       "properties": {
-        "capability": {
-          "$ref": "#/$defs/staticCapability"
-        },
+        "capability": {"$ref": "#/$defs/staticCapability"},
         "transport": {
           "type": "array",
-          "items": {
-            "$ref": "#/$defs/transport"
-          },
+          "items": {"$ref": "#/$defs/transport"},
           "uniqueItems": true
         },
         "readiness_requirements": {
           "type": "array",
-          "items": {
-            "enum": [
-              "binary",
-              "version",
-              "noninteractive",
-              "status_contract",
-              "safe_args"
-            ]
-          },
+          "items": {"enum": ["binary", "version", "noninteractive", "status_contract", "safe_args"]},
           "uniqueItems": true
         },
-        "fallback": {
-          "enum": [
-            "manual",
-            "tail_file",
-            "unsupported"
-          ]
-        }
+        "fallback": {"enum": ["manual", "tail_file", "unsupported"]}
       }
     },
-    "staticCapability": {
-      "enum": [
-        "supported",
-        "candidate",
-        "unsupported"
-      ]
-    },
-    "transport": {
-      "enum": [
-        "native",
-        "acp",
-        "tail_file",
-        "cli_json",
-        "plugin"
-      ]
-    },
+    "staticCapability": {"enum": ["supported", "candidate", "unsupported"]},
+    "transport": {"enum": ["native", "acp", "tail_file", "cli_json", "plugin"]},
     "localReadinessState": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "storage",
-        "path_pattern",
-        "controller",
-        "worker",
-        "last_probe_ids",
-        "updated_at"
-      ],
+      "required": ["storage", "path_pattern", "controller", "worker", "last_probe_ids", "updated_at"],
       "properties": {
-        "storage": {
-          "const": "machine-local, never checked in"
-        },
-        "path_pattern": {
-          "const": "$XDG_STATE_HOME/goal-flight/readiness/<agent>.json"
-        },
-        "controller": {
-          "$ref": "#/$defs/localReadiness"
-        },
-        "worker": {
-          "$ref": "#/$defs/localReadiness"
-        },
-        "last_probe_ids": {
-          "$ref": "#/$defs/stringArray"
-        },
-        "updated_at": {
-          "type": [
-            "string",
-            "null"
-          ]
-        }
+        "storage": {"const": "machine-local, never checked in"},
+        "path_pattern": {"const": "$XDG_STATE_HOME/goal-flight/readiness/<agent>.json"},
+        "controller": {"$ref": "#/$defs/localReadiness"},
+        "worker": {"$ref": "#/$defs/localReadiness"},
+        "last_probe_ids": {"$ref": "#/$defs/stringArray"},
+        "updated_at": {"type": ["string", "null"]}
       }
     },
-    "localReadiness": {
-      "enum": [
-        "ready",
-        "not_installed",
-        "probe_required",
-        "failed",
-        "blocked",
-        "unsupported"
-      ]
-    },
+    "localReadiness": {"enum": ["ready", "not_installed", "probe_required", "failed", "blocked", "unsupported"]},
     "liveGate": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "function",
-        "controller_allowed_expr",
-        "worker_allowed_expr",
-        "default",
-        "support_status_enum",
-        "return_fields"
-      ],
+      "required": ["function", "controller_allowed_expr", "worker_allowed_expr", "default", "support_status_enum", "return_fields"],
       "properties": {
-        "function": {
-          "const": "validate_adapter_gate"
-        },
-        "controller_allowed_expr": {
-          "const": "support.controller.capability == supported && local_readiness.controller == ready"
-        },
+        "function": {"const": "validate_adapter_gate"},
+        "controller_allowed_expr": {"const": "support.controller.capability == supported && local_readiness.controller == ready"},
         "worker_allowed_expr": {
           "const": "support.worker.capability == supported && local_readiness.worker == ready && requested_transport is verified"
         },
-        "default": {
-          "const": "deny"
-        },
+        "default": {"const": "deny"},
         "support_status_enum": {
           "type": "array",
           "prefixItems": [
-            {
-              "const": "unsupported"
-            },
-            {
-              "const": "config_only"
-            },
-            {
-              "const": "probe_required"
-            },
-            {
-              "const": "candidate"
-            },
-            {
-              "const": "not_installed"
-            },
-            {
-              "const": "forbidden-arg"
-            },
-            {
-              "const": "failed"
-            },
-            {
-              "const": "blocked"
-            }
+            {"const": "unsupported"},
+            {"const": "config_only"},
+            {"const": "probe_required"},
+            {"const": "candidate"},
+            {"const": "not_installed"},
+            {"const": "forbidden-arg"},
+            {"const": "failed"},
+            {"const": "blocked"}
           ],
           "minItems": 8,
           "maxItems": 8
@@ -379,27 +180,13 @@
         "return_fields": {
           "type": "array",
           "prefixItems": [
-            {
-              "const": "allowed"
-            },
-            {
-              "const": "reason"
-            },
-            {
-              "const": "required_probe_ids"
-            },
-            {
-              "const": "blocked_fields"
-            },
-            {
-              "const": "safe_next_action"
-            },
-            {
-              "const": "live_controller_allowed"
-            },
-            {
-              "const": "live_worker_dispatch_allowed"
-            }
+            {"const": "allowed"},
+            {"const": "reason"},
+            {"const": "required_probe_ids"},
+            {"const": "blocked_fields"},
+            {"const": "safe_next_action"},
+            {"const": "live_controller_allowed"},
+            {"const": "live_worker_dispatch_allowed"}
           ],
           "minItems": 7,
           "maxItems": 7
@@ -421,152 +208,61 @@
         "browser_ui"
       ],
       "properties": {
-        "shell_exec": {
-          "$ref": "#/$defs/toolOperation"
-        },
-        "read_file": {
-          "$ref": "#/$defs/toolOperation"
-        },
-        "write_file": {
-          "$ref": "#/$defs/toolOperation"
-        },
-        "search": {
-          "$ref": "#/$defs/toolOperation"
-        },
-        "delegate": {
-          "$ref": "#/$defs/toolOperation"
-        },
-        "ask_user": {
-          "$ref": "#/$defs/toolOperation"
-        },
-        "plan_update": {
-          "$ref": "#/$defs/toolOperation"
-        },
-        "memory_search": {
-          "$ref": "#/$defs/toolOperation"
-        },
-        "browser_ui": {
-          "$ref": "#/$defs/toolOperation"
-        }
+        "shell_exec": {"$ref": "#/$defs/toolOperation"},
+        "read_file": {"$ref": "#/$defs/toolOperation"},
+        "write_file": {"$ref": "#/$defs/toolOperation"},
+        "search": {"$ref": "#/$defs/toolOperation"},
+        "delegate": {"$ref": "#/$defs/toolOperation"},
+        "ask_user": {"$ref": "#/$defs/toolOperation"},
+        "plan_update": {"$ref": "#/$defs/toolOperation"},
+        "memory_search": {"$ref": "#/$defs/toolOperation"},
+        "browser_ui": {"$ref": "#/$defs/toolOperation"}
       }
     },
     "toolOperation": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "host_tools",
-        "constraints"
-      ],
+      "required": ["host_tools", "constraints"],
       "properties": {
-        "host_tools": {
-          "$ref": "#/$defs/stringArray"
-        },
-        "constraints": {
-          "$ref": "#/$defs/stringArray"
-        }
+        "host_tools": {"$ref": "#/$defs/stringArray"},
+        "constraints": {"$ref": "#/$defs/stringArray"}
       }
     },
     "invocation": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "skill_triggers",
-        "commands",
-        "exec"
-      ],
+      "required": ["skill_triggers", "commands", "exec"],
       "properties": {
-        "skill_triggers": {
-          "$ref": "#/$defs/stringArray"
-        },
-        "commands": {
-          "$ref": "#/$defs/stringArray"
-        },
-        "exec": {
-          "$ref": "#/$defs/execSpec"
-        }
+        "skill_triggers": {"$ref": "#/$defs/stringArray"},
+        "commands": {"$ref": "#/$defs/stringArray"},
+        "exec": {"$ref": "#/$defs/execSpec"}
       }
     },
     "execSpec": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "kind",
-        "binary",
-        "args",
-        "arg_policy",
-        "stdin",
-        "cwd_policy",
-        "output_contract"
-      ],
+      "required": ["kind", "binary", "args", "arg_policy", "stdin", "cwd_policy", "output_contract"],
       "properties": {
-        "kind": {
-          "enum": [
-            "native_tool",
-            "cli",
-            "acp",
-            "plugin",
-            "prompt_template"
-          ]
-        },
-        "binary": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "args": {
-          "$ref": "#/$defs/stringArray"
-        },
-        "arg_policy": {
-          "$ref": "#/$defs/argPolicy"
-        },
-        "stdin": {
-          "enum": [
-            "prompt",
-            "none"
-          ]
-        },
-        "cwd_policy": {
-          "enum": [
-            "repo_required",
-            "workspace",
-            "host_default"
-          ]
-        },
-        "output_contract": {
-          "$ref": "#/$defs/outputContract"
-        }
+        "kind": {"enum": ["native_tool", "cli", "acp", "plugin", "prompt_template"]},
+        "binary": {"type": ["string", "null"]},
+        "args": {"$ref": "#/$defs/stringArray"},
+        "arg_policy": {"$ref": "#/$defs/argPolicy"},
+        "stdin": {"enum": ["prompt", "none"]},
+        "cwd_policy": {"enum": ["repo_required", "workspace", "host_default"]},
+        "output_contract": {"$ref": "#/$defs/outputContract"}
       }
     },
     "argPolicy": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "required_safe_args",
-        "forbidden_args",
-        "requires_explicit_justification",
-        "reject_in"
-      ],
+      "required": ["required_safe_args", "forbidden_args", "requires_explicit_justification", "reject_in"],
       "properties": {
-        "required_safe_args": {
-          "$ref": "#/$defs/stringArray"
-        },
-        "forbidden_args": {
-          "$ref": "#/$defs/stringArray"
-        },
-        "requires_explicit_justification": {
-          "$ref": "#/$defs/stringArray"
-        },
+        "required_safe_args": {"$ref": "#/$defs/stringArray"},
+        "forbidden_args": {"$ref": "#/$defs/stringArray"},
+        "requires_explicit_justification": {"$ref": "#/$defs/stringArray"},
         "reject_in": {
           "type": "array",
-          "items": {
-            "enum": [
-              "invocation",
-              "probes",
-              "generated_wrappers",
-              "checked_in_configs"
-            ]
-          },
+          "items": {"enum": ["invocation", "probes", "generated_wrappers", "checked_in_configs"]},
           "uniqueItems": true
         }
       }
@@ -584,47 +280,13 @@
         "goal_mode_eligible"
       ],
       "properties": {
-        "parser": {
-          "enum": [
-            "status_json",
-            "markers",
-            "jsonl",
-            "transcript"
-          ]
-        },
-        "completion_detection": {
-          "enum": [
-            "structured_final_event",
-            "final_regex",
-            "exit_only",
-            "unsupported"
-          ]
-        },
-        "final_event": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "final_regex": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "exit_code_policy": {
-          "enum": [
-            "zero_success",
-            "mapped",
-            "ignored_never"
-          ]
-        },
-        "resume_args": {
-          "$ref": "#/$defs/stringArray"
-        },
-        "goal_mode_eligible": {
-          "type": "boolean"
-        }
+        "parser": {"enum": ["status_json", "markers", "jsonl", "transcript"]},
+        "completion_detection": {"enum": ["structured_final_event", "final_regex", "exit_only", "unsupported"]},
+        "final_event": {"type": ["string", "null"]},
+        "final_regex": {"type": ["string", "null"]},
+        "exit_code_policy": {"enum": ["zero_success", "mapped", "ignored_never"]},
+        "resume_args": {"$ref": "#/$defs/stringArray"},
+        "goal_mode_eligible": {"type": "boolean"}
       }
     },
     "permissionSurface": {
@@ -643,136 +305,68 @@
         "irreversible_ops"
       ],
       "properties": {
-        "file_reads": {
-          "$ref": "#/$defs/stringArray"
-        },
-        "file_writes": {
-          "$ref": "#/$defs/stringArray"
-        },
+        "file_reads": {"$ref": "#/$defs/stringArray"},
+        "file_writes": {"$ref": "#/$defs/stringArray"},
         "shell": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "allowed_families",
-            "forbidden_families"
-          ],
+          "required": ["allowed_families", "forbidden_families"],
           "properties": {
-            "allowed_families": {
-              "$ref": "#/$defs/stringArray"
-            },
-            "forbidden_families": {
-              "$ref": "#/$defs/stringArray"
-            }
+            "allowed_families": {"$ref": "#/$defs/stringArray"},
+            "forbidden_families": {"$ref": "#/$defs/stringArray"}
           }
         },
-        "network": {
-          "$ref": "#/$defs/networkPermission"
-        },
-        "browser_ui": {
-          "$ref": "#/$defs/gatedBoolean"
-        },
+        "network": {"$ref": "#/$defs/networkPermission"},
+        "browser_ui": {"$ref": "#/$defs/gatedBoolean"},
         "memory_writes": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "allowed",
-            "backend"
-          ],
+          "required": ["allowed", "backend"],
           "properties": {
-            "allowed": {
-              "type": "boolean"
-            },
-            "backend": {
-              "enum": [
-                "none",
-                "repo_files",
-                "host_native",
-                "mirror"
-              ]
-            }
+            "allowed": {"type": "boolean"},
+            "backend": {"enum": ["none", "repo_files", "host_native", "mirror"]}
           }
         },
         "plugin_sandbox": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "mode",
-            "declared_permissions"
-          ],
+          "required": ["mode", "declared_permissions"],
           "properties": {
-            "mode": {
-              "enum": [
-                "none",
-                "narrow",
-                "broad"
-              ]
-            },
-            "declared_permissions": {
-              "$ref": "#/$defs/stringArray"
-            }
+            "mode": {"enum": ["none", "narrow", "broad"]},
+            "declared_permissions": {"$ref": "#/$defs/stringArray"}
           }
         },
         "auto_approve_detection": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "probes",
-            "strict_fail"
-          ],
+          "required": ["probes", "strict_fail"],
           "properties": {
-            "probes": {
-              "$ref": "#/$defs/stringArray"
-            },
-            "strict_fail": {
-              "type": "boolean"
-            }
+            "probes": {"$ref": "#/$defs/stringArray"},
+            "strict_fail": {"type": "boolean"}
           }
         },
-        "secrets": {
-          "$ref": "#/$defs/stringArray"
-        },
-        "irreversible_ops": {
-          "$ref": "#/$defs/stringArray"
-        }
+        "secrets": {"$ref": "#/$defs/stringArray"},
+        "irreversible_ops": {"$ref": "#/$defs/stringArray"}
       }
     },
     "gatedBoolean": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "allowed",
-        "user_gate"
-      ],
+      "required": ["allowed", "user_gate"],
       "properties": {
-        "allowed": {
-          "type": "boolean"
-        },
-        "user_gate": {
-          "type": "boolean"
-        },
-        "notes": {
-          "type": "string"
-        }
+        "allowed": {"type": "boolean"},
+        "user_gate": {"type": "boolean"},
+        "notes": {"type": "string"}
       }
     },
     "networkPermission": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "allowed",
-        "user_gate",
-        "notes"
-      ],
+      "required": ["allowed", "user_gate", "notes"],
       "properties": {
-        "allowed": {
-          "type": "boolean"
-        },
-        "user_gate": {
-          "type": "boolean"
-        },
-        "notes": {
-          "type": "string"
-        }
+        "allowed": {"type": "boolean"},
+        "user_gate": {"type": "boolean"},
+        "notes": {"type": "string"}
       }
     },
     "memoryBackend": {
@@ -789,331 +383,132 @@
         "drift_policy"
       ],
       "properties": {
-        "canonical": {
-          "const": "repo_files"
-        },
-        "repo_files": {
-          "$ref": "#/$defs/stringArray"
-        },
+        "canonical": {"const": "repo_files"},
+        "repo_files": {"$ref": "#/$defs/stringArray"},
         "host_native": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "role",
-            "backend"
-          ],
+          "required": ["role", "backend"],
           "properties": {
-            "role": {
-              "enum": [
-                "none",
-                "mirror",
-                "advisory",
-                "projection"
-              ]
-            },
-            "backend": {
-              "type": [
-                "string",
-                "null"
-              ]
-            }
+            "role": {"enum": ["none", "mirror", "advisory", "projection"]},
+            "backend": {"type": ["string", "null"]}
           }
         },
-        "mirror_writeback": {
-          "type": "boolean"
-        },
-        "source_epoch": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "snapshot_id": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "migration_lock_required_for_writeback": {
-          "type": "boolean"
-        },
-        "drift_policy": {
-          "enum": [
-            "warn_and_prefer_repo"
-          ]
-        }
+        "mirror_writeback": {"type": "boolean"},
+        "source_epoch": {"type": ["string", "null"]},
+        "snapshot_id": {"type": ["string", "null"]},
+        "migration_lock_required_for_writeback": {"type": "boolean"},
+        "drift_policy": {"enum": ["warn_and_prefer_repo"]}
       }
     },
     "packaging": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "checked_in_wrappers",
-        "generated_outputs",
-        "install_actions",
-        "plugin_manifest",
-        "mcp",
-        "validation"
-      ],
+      "required": ["checked_in_wrappers", "generated_outputs", "install_actions", "plugin_manifest", "mcp", "validation"],
       "properties": {
-        "checked_in_wrappers": {
-          "$ref": "#/$defs/stringArray"
-        },
-        "generated_outputs": {
-          "$ref": "#/$defs/stringArray"
-        },
+        "checked_in_wrappers": {"$ref": "#/$defs/stringArray"},
+        "generated_outputs": {"$ref": "#/$defs/stringArray"},
         "install_actions": {
           "type": "array",
-          "items": {
-            "$ref": "#/$defs/installAction"
-          }
+          "items": {"$ref": "#/$defs/installAction"}
         },
         "plugin_manifest": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "supported",
-            "path",
-            "api_status"
-          ],
+          "required": ["supported", "path", "api_status"],
           "properties": {
-            "supported": {
-              "type": "boolean"
-            },
-            "path": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "api_status": {
-              "enum": [
-                "verified",
-                "probe_required",
-                "unsupported"
-              ]
-            }
+            "supported": {"type": "boolean"},
+            "path": {"type": ["string", "null"]},
+            "api_status": {"enum": ["verified", "probe_required", "unsupported"]}
           }
         },
         "mcp": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "required",
-            "servers"
-          ],
+          "required": ["required", "servers"],
           "properties": {
-            "required": {
-              "type": "boolean"
-            },
-            "servers": {
-              "$ref": "#/$defs/stringArray"
-            }
+            "required": {"type": "boolean"},
+            "servers": {"$ref": "#/$defs/stringArray"}
           }
         },
-        "validation": {
-          "$ref": "#/$defs/stringArray"
-        }
+        "validation": {"$ref": "#/$defs/stringArray"}
       }
     },
     "installAction": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "kind",
-        "source",
-        "target",
-        "writes_repo",
-        "writes_user_config",
-        "user_gate",
-        "backup_path",
-        "rollback"
-      ],
+      "required": ["kind", "source", "target", "writes_repo", "writes_user_config", "user_gate", "backup_path", "rollback"],
       "properties": {
-        "kind": {
-          "enum": [
-            "copy",
-            "copy_or_merge",
-            "merge_config",
-            "link",
-            "register_plugin"
-          ]
-        },
-        "source": {
-          "type": "string"
-        },
-        "target": {
-          "type": "string"
-        },
-        "writes_repo": {
-          "type": "boolean"
-        },
-        "writes_user_config": {
-          "type": "boolean"
-        },
-        "user_gate": {
-          "type": "boolean"
-        },
-        "backup_path": {
-          "type": "string"
-        },
-        "rollback": {
-          "enum": [
-            "restore_backup",
-            "delete_link",
-            "unregister_plugin"
-          ]
-        },
-        "destinations": {
-          "$ref": "#/$defs/stringArray"
-        }
+        "kind": {"enum": ["copy", "copy_or_merge", "merge_config", "link", "register_plugin"]},
+        "source": {"type": "string"},
+        "target": {"type": "string"},
+        "writes_repo": {"type": "boolean"},
+        "writes_user_config": {"type": "boolean"},
+        "user_gate": {"type": "boolean"},
+        "backup_path": {"type": "string"},
+        "rollback": {"enum": ["restore_backup", "delete_link", "unregister_plugin"]},
+        "destinations": {"$ref": "#/$defs/stringArray"}
       }
     },
     "setup": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "controller_destinations",
-        "worker_destinations"
-      ],
+      "required": ["controller_destinations", "worker_destinations"],
       "properties": {
         "controller_destinations": {
           "type": "array",
-          "items": {
-            "$ref": "#/$defs/setupDestination"
-          }
+          "items": {"$ref": "#/$defs/setupDestination"}
         },
         "worker_destinations": {
           "type": "array",
-          "items": {
-            "$ref": "#/$defs/setupDestination"
-          }
+          "items": {"$ref": "#/$defs/setupDestination"}
         },
         "addons": {
           "type": "array",
-          "items": {
-            "$ref": "#/$defs/setupAddon"
-          }
+          "items": {"$ref": "#/$defs/setupAddon"}
         }
       }
     },
     "setupAddon": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "id",
-        "label",
-        "default",
-        "compatible_destination_ids",
-        "install_mode",
-        "commands",
-        "paths"
-      ],
+      "required": ["id", "label", "default", "compatible_destination_ids", "install_mode", "commands", "paths"],
       "properties": {
-        "id": {
-          "type": "string",
-          "minLength": 1
-        },
-        "label": {
-          "type": "string",
-          "minLength": 1
-        },
-        "default": {
-          "type": "boolean"
-        },
-        "compatible_destination_ids": {
-          "$ref": "#/$defs/stringArray"
-        },
-        "install_mode": {
-          "enum": [
-            "setup",
-            "init_self_check",
-            "deferred"
-          ]
-        },
-        "commands": {
-          "$ref": "#/$defs/stringArray"
-        },
-        "paths": {
-          "$ref": "#/$defs/stringArray"
-        }
+        "id": {"type": "string", "minLength": 1},
+        "label": {"type": "string", "minLength": 1},
+        "default": {"type": "boolean"},
+        "compatible_destination_ids": {"$ref": "#/$defs/stringArray"},
+        "install_mode": {"enum": ["setup", "init_self_check", "deferred"]},
+        "commands": {"$ref": "#/$defs/stringArray"},
+        "paths": {"$ref": "#/$defs/stringArray"}
       }
     },
     "setupDestination": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "id",
-        "label",
-        "role",
-        "surface",
-        "default",
-        "probe_ids",
-        "install_action_sources",
-        "commands",
-        "paths"
-      ],
+      "required": ["id", "label", "role", "surface", "default", "probe_ids", "install_action_sources", "commands", "paths"],
       "properties": {
-        "id": {
-          "type": "string",
-          "minLength": 1
-        },
-        "label": {
-          "type": "string",
-          "minLength": 1
-        },
-        "role": {
-          "enum": [
-            "controller",
-            "worker"
-          ]
-        },
-        "surface": {
-          "enum": [
-            "desktop",
-            "cli",
-            "remote_acp",
-            "rules",
-            "plugin",
-            "config"
-          ]
-        },
-        "default": {
-          "type": "boolean"
-        },
-        "probe_ids": {
-          "$ref": "#/$defs/stringArray"
-        },
-        "install_action_sources": {
-          "$ref": "#/$defs/stringArray"
-        },
-        "commands": {
-          "$ref": "#/$defs/stringArray"
-        },
-        "paths": {
-          "$ref": "#/$defs/stringArray"
-        },
-        "requires_restart": {
-          "type": "boolean"
-        }
+        "id": {"type": "string", "minLength": 1},
+        "label": {"type": "string", "minLength": 1},
+        "role": {"enum": ["controller", "worker"]},
+        "surface": {"enum": ["desktop", "cli", "remote_acp", "rules", "plugin", "config"]},
+        "default": {"type": "boolean"},
+        "probe_ids": {"$ref": "#/$defs/stringArray"},
+        "install_action_sources": {"$ref": "#/$defs/stringArray"},
+        "commands": {"$ref": "#/$defs/stringArray"},
+        "paths": {"$ref": "#/$defs/stringArray"},
+        "requires_restart": {"type": "boolean"}
       }
     },
     "discovery": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "budget",
-        "probes"
-      ],
+      "required": ["budget", "probes"],
       "properties": {
-        "budget": {
-          "$ref": "#/$defs/discoveryBudget"
-        },
+        "budget": {"$ref": "#/$defs/discoveryBudget"},
         "probes": {
           "type": "array",
-          "items": {
-            "$ref": "#/$defs/probe"
-          }
+          "items": {"$ref": "#/$defs/probe"}
         }
       }
     },
@@ -1133,88 +528,30 @@
         "model_consuming"
       ],
       "properties": {
-        "max_path_probes": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "max_version_probes": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "max_help_probes": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "max_ms_per_probe": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "max_total_ms_per_agent": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "max_total_ms_all_agents": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "max_stdout_bytes_per_probe": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "max_stderr_bytes_per_probe": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "network_default": {
-          "const": "deny"
-        },
-        "model_consuming": {
-          "const": "forbidden"
-        }
+        "max_path_probes": {"type": "integer", "minimum": 0},
+        "max_version_probes": {"type": "integer", "minimum": 0},
+        "max_help_probes": {"type": "integer", "minimum": 0},
+        "max_ms_per_probe": {"type": "integer", "minimum": 0},
+        "max_total_ms_per_agent": {"type": "integer", "minimum": 0},
+        "max_total_ms_all_agents": {"type": "integer", "minimum": 0},
+        "max_stdout_bytes_per_probe": {"type": "integer", "minimum": 0},
+        "max_stderr_bytes_per_probe": {"type": "integer", "minimum": 0},
+        "network_default": {"const": "deny"},
+        "model_consuming": {"const": "forbidden"}
       }
     },
     "probe": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "id",
-        "class",
-        "argv",
-        "safe_for_setup",
-        "network",
-        "model_consuming",
-        "env_scrub"
-      ],
+      "required": ["id", "class", "argv", "safe_for_setup", "network", "model_consuming", "env_scrub"],
       "properties": {
-        "id": {
-          "type": "string",
-          "minLength": 1
-        },
-        "class": {
-          "enum": [
-            "path",
-            "version",
-            "help",
-            "config_read",
-            "auth_status",
-            "unsafe_user_gated"
-          ]
-        },
-        "argv": {
-          "$ref": "#/$defs/stringArray"
-        },
-        "safe_for_setup": {
-          "type": "boolean"
-        },
-        "network": {
-          "type": "boolean"
-        },
-        "model_consuming": {
-          "type": "boolean"
-        },
-        "env_scrub": {
-          "type": "boolean"
-        }
+        "id": {"type": "string", "minLength": 1},
+        "class": {"enum": ["path", "version", "help", "config_read", "auth_status", "unsafe_user_gated"]},
+        "argv": {"$ref": "#/$defs/stringArray"},
+        "safe_for_setup": {"type": "boolean"},
+        "network": {"type": "boolean"},
+        "model_consuming": {"type": "boolean"},
+        "env_scrub": {"type": "boolean"}
       }
     },
     "statusContract": {
@@ -1234,65 +571,24 @@
         "terminal_states"
       ],
       "properties": {
-        "schema": {
-          "const": "goalflight.acp-run.v1"
-        },
-        "liveness_profile": {
-          "enum": [
-            "remote_api",
-            "local_compute",
-            "hybrid"
-          ]
-        },
-        "remote_turn_silence_s": {
-          "type": "integer",
-          "minimum": 1
-        },
-        "heartbeat_required": {
-          "type": "boolean"
-        },
-        "dispatcher_owns_heartbeat": {
-          "type": "boolean"
-        },
-        "status_file": {
-          "type": "string"
-        },
-        "transport_instance_id": {
-          "type": "string"
-        },
-        "seq": {
-          "type": "string"
-        },
-        "parser_type": {
-          "enum": [
-            "acp",
-            "bash_tail",
-            "cli_json",
-            "plugin"
-          ]
-        },
-        "marker_namespace": {
-          "const": "goalflight:<dispatch_id>:<transport>:<seq>"
-        },
-        "stale_after_s": {
-          "type": "integer",
-          "minimum": 1
-        },
+        "schema": {"const": "goalflight.acp-run.v1"},
+        "liveness_profile": {"enum": ["remote_api", "local_compute", "hybrid"]},
+        "remote_turn_silence_s": {"type": "integer", "minimum": 1},
+        "heartbeat_required": {"type": "boolean"},
+        "dispatcher_owns_heartbeat": {"type": "boolean"},
+        "status_file": {"type": "string"},
+        "transport_instance_id": {"type": "string"},
+        "seq": {"type": "string"},
+        "parser_type": {"enum": ["acp", "bash_tail", "cli_json", "plugin"]},
+        "marker_namespace": {"const": "goalflight:<dispatch_id>:<transport>:<seq>"},
+        "stale_after_s": {"type": "integer", "minimum": 1},
         "terminal_states": {
           "type": "array",
           "prefixItems": [
-            {
-              "const": "complete"
-            },
-            {
-              "const": "failed"
-            },
-            {
-              "const": "blocked"
-            },
-            {
-              "const": "wedged"
-            }
+            {"const": "complete"},
+            {"const": "failed"},
+            {"const": "blocked"},
+            {"const": "wedged"}
           ],
           "minItems": 4,
           "maxItems": 4

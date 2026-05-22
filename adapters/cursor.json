@@ -10,13 +10,13 @@
   },
   "support": {
     "controller": {
-      "capability": "candidate",
-      "evidence": ["survey: cursor-agent supports native agent acp and print mode", "repo: ACP runner maps cursor to cursor-agent acp"],
+      "capability": "supported",
+      "evidence": ["survey: cursor-agent supports native agent acp and print mode", "repo: ACP runner maps cursor to cursor-agent acp", "smoke: cursor-agent print controller review completed on 2026-05-22"],
       "readiness_requirements": ["binary", "version", "auth_optional", "safe_args", "status_contract"],
       "fallback": "worker_only"
     },
     "worker": {
-      "capability": "candidate",
+      "capability": "supported",
       "transport": ["acp", "cli_json", "tail_file"],
       "readiness_requirements": ["binary", "version", "noninteractive", "status_contract", "safe_args"],
       "fallback": "tail_file"
@@ -25,8 +25,8 @@
   "local_readiness_state": {
     "storage": "machine-local, never checked in",
     "path_pattern": "$XDG_STATE_HOME/goal-flight/readiness/<agent>.json",
-    "controller": "ready",
-    "worker": "ready",
+    "controller": "probe_required",
+    "worker": "probe_required",
     "last_probe_ids": ["cursor-agent-path", "cursor-agent-version", "cursor-agent-models"],
     "updated_at": null
   },
@@ -43,7 +43,7 @@
     "read_file": {"host_tools": ["workspace file read"], "constraints": ["workspace reads only"]},
     "write_file": {"host_tools": ["workspace edit"], "constraints": ["authorized edit scope only"]},
     "search": {"host_tools": ["workspace search"], "constraints": ["filtered search"]},
-    "delegate": {"host_tools": ["cursor-agent acp"], "constraints": ["candidate until live gate verified"]},
+    "delegate": {"host_tools": ["cursor-agent acp"], "constraints": ["requires live gate readiness"]},
     "ask_user": {"host_tools": ["USER-NEED marker"], "constraints": ["block on ambiguity"]},
     "plan_update": {"host_tools": ["status markers"], "constraints": ["controller tracks plan externally"]},
     "memory_search": {"host_tools": ["repo resume notes", "Cursor chat state"], "constraints": ["repo files remain canonical"]},

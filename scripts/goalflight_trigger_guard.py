@@ -17,6 +17,10 @@ ENCODED_PATTERNS = (
     "b3BlbmNsYXc=",
     "b3Blbi1jbGF3",
 )
+BACKGROUND_URL = (
+    "https://www.reddit.com/r/ClaudeAI/search/"
+    "?q=Claude%20Code%20git-visible%20billing%20trigger&restrict_sr=1"
+)
 
 
 class GuardError(RuntimeError):
@@ -125,6 +129,11 @@ def report(findings: list[str]) -> int:
         return 0
     print("Goal Flight trigger guard blocked this commit.", file=sys.stderr)
     print("Remove host-routing trigger tokens from git-visible paths, staged content, or message text.", file=sys.stderr)
+    print(
+        "Why: these encoded tokens are reported to make Claude Code treat a Pro session as API-billed when they appear in git-visible metadata.",
+        file=sys.stderr,
+    )
+    print(f"Background for the next human/agent: {BACKGROUND_URL}", file=sys.stderr)
     for finding in findings:
         print(f"- {finding}", file=sys.stderr)
     return 1

@@ -33,6 +33,11 @@ orthogonal axes: **iteration pattern** (how many turns) and **comms shape**
   ```
   The runner re-execs into `~/.goal-flight/venvs/acp-0.10/bin/python` when
   system `python3` cannot import `acp`; set `GOALFLIGHT_ACP_PYTHON` to override.
+  That Python package is the controller-side client implementation. Workers do
+  not need to be implemented with that SDK; they need to speak the adapter's
+  declared ACP wire contract. A vendor CLI can expose its own `agent stdio`
+  implementation while the manifest still owns command args, safe probes,
+  liveness profile, and output contract.
 
   **`--mode` sets the idle-timeout.** `one-shot` (default) uses a 5-minute
   idle ceiling — a short dispatch silent that long is wedged. `goal` uses a
@@ -70,6 +75,10 @@ Treat routing candidates as first-class only after their readiness gate passes:
 If a candidate has static adapter capability but fails local readiness, do not
 route work to it. Pick another ready candidate with equivalent concern coverage
 or fall back to the legacy watcher when no ACP path is locally ready.
+
+Unknown ACP commands are denied by default. Add a checked-in adapter manifest or
+point `GOALFLIGHT_ADAPTERS_DIR` at a machine-local manifest directory for
+experiments; do not silently dispatch an unmanifested binary.
 
 ## Liveness — a quiet worker is not a dead worker
 

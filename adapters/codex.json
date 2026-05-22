@@ -29,8 +29,8 @@
   "local_readiness_state": {
     "storage": "machine-local, never checked in",
     "path_pattern": "$XDG_STATE_HOME/goal-flight/readiness/<agent>.json",
-    "controller": "ready",
-    "worker": "ready",
+    "controller": "probe_required",
+    "worker": "probe_required",
     "last_probe_ids": ["codex-path", "codex-version", "codex-login-status"],
     "updated_at": null
   },
@@ -153,17 +153,15 @@
   },
   "packaging": {
     "checked_in_wrappers": [
-      ".codex-plugin/plugin.json",
       ".agents/plugins/marketplace.json",
       "plugins/goal-flight/",
-      "skills/goal-flight/SKILL.md",
       "templates/codex-goal-prompt.md.tpl"
     ],
     "generated_outputs": ["dist/codex/"],
     "install_actions": [
       {
         "kind": "copy",
-        "source": "skills/goal-flight/SKILL.md",
+        "source": "plugins/goal-flight/skills/goal-flight/SKILL.md",
         "target": "~/.codex/skills/goal-flight/SKILL.md",
         "writes_repo": false,
         "writes_user_config": true,
@@ -237,7 +235,7 @@
         "default": false,
         "probe_ids": ["codex-path", "codex-version"],
         "install_action_sources": [
-          "skills/goal-flight/SKILL.md",
+          "plugins/goal-flight/skills/goal-flight/SKILL.md",
           "configs/codex/config.toml"
         ],
         "commands": ["codex exec --json -C <repo> -"],

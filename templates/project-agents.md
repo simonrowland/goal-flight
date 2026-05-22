@@ -19,3 +19,12 @@ Private. Read before touching code.
 - test: `<command>`
 - lint: `<command>`
 - build: `<command>`
+
+## Goal Flight Routing
+
+- skill-root: `${GOALFLIGHT_ROOT:-<path-to-goal-flight-clone>}`
+- load order: read this `AGENTS.md`, then repository `SKILL.md`, then the
+  invoked Goal Flight `commands/*.md` file from skill-root.
+- keep `docs-private/` ignored; store env caveats, queues, ledgers, review
+  outputs, and resume notes there.
+- use the project commands above for verification before closing a chunk.

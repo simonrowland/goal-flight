@@ -14,6 +14,12 @@ python3 <skill-root>/scripts/goalflight_review_job.py \
   --timeout-s 1800
 ```
 
+For a dirty-tree review, start from `prompts/dirty-tree-review.md` and replace
+`<repo-root>` plus the focus bullets. Write the rendered prompt to
+`docs-private/reviews/<date-topic>/<reviewer>.prompt.md` before dispatch. Keep
+rendered prompts, stdout/stderr, status files, and final review outputs under
+`docs-private/`; keep reusable prompt skeletons in tracked `prompts/`.
+
 Review states:
 
 - `pending`

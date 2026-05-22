@@ -11,6 +11,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -111,7 +112,17 @@ def app_exists(name: str, bundle_id: str | None = None) -> bool:
 
 def check_plugin(repo: Path) -> dict:
     manifest = repo / ".claude-plugin/plugin.json"
-    out = {"manifest": str(manifest), "manifest_exists": manifest.exists()}
+    package_repo = (repo / "plugins/goal-flight/.codex-plugin/plugin.json").exists() and (repo / "VERSION").exists()
+    out = {
+        "manifest": str(manifest),
+        "manifest_exists": manifest.exists() if package_repo else None,
+        "package_repo": package_repo,
+        "skipped": not package_repo,
+    }
+    if not package_repo:
+        out["skip_reason"] = "target_project_not_goal_flight_package"
+        out["validate_ok"] = None
+        return out
     if shutil.which("claude") and manifest.exists():
         result = run(["claude", "plugin", "validate", str(repo)], cwd=repo, timeout=20)
         out.update(
@@ -124,6 +135,54 @@ def check_plugin(repo: Path) -> dict:
     else:
         out["validate_ok"] = None
     return out
+
+
+def _path_state(path: Path) -> dict:
+    return {"path": str(path), "exists": path.exists()}
+
+
+def check_host_goalflight_install() -> dict:
+    home = Path.home()
+    codex_plugin_cache = sorted(
+        str(path)
+        for path in (home / ".codex/plugins/cache/goal-flight/goal-flight").glob("*/.codex-plugin/plugin.json")
+    )
+    codex_personal = home / ".codex/skills/goal-flight/SKILL.md"
+    cursor_agents = home / ".cursor/AGENTS.md"
+    cursor_skill = home / ".cursor/skills/goal-flight/SKILL.md"
+    cursor_rules = home / ".cursor/rules/goal-flight.mdc"
+    grok_skill = home / ".grok/skills/goal-flight/SKILL.md"
+    claude_skill = home / ".claude/skills/goal-flight/SKILL.md"
+    payload = {
+        "codex": {
+            "ok": bool(codex_plugin_cache) or codex_personal.exists(),
+            "plugin_cache": codex_plugin_cache,
+            "personal_skill": _path_state(codex_personal),
+        },
+        "cursor": {
+            "ok": cursor_skill.exists() and (cursor_agents.exists() or cursor_rules.exists()),
+            "global_agents": _path_state(cursor_agents),
+            "skill": _path_state(cursor_skill),
+            "rules": _path_state(cursor_rules),
+        },
+        "grok": {
+            "ok": grok_skill.exists(),
+            "skill": _path_state(grok_skill),
+        },
+        "claude": {
+            "ok": claude_skill.exists(),
+            "skill": _path_state(claude_skill),
+        },
+    }
+    for host, item in payload.items():
+        if host == "codex":
+            detail = "plugin_cache" if item["plugin_cache"] else item["personal_skill"]["path"]
+        elif host == "cursor":
+            detail = f"{item['skill']['path']} agents={item['global_agents']['exists']} rules={item['rules']['exists']}"
+        else:
+            detail = item["skill"]["path"]
+        item["detail"] = detail
+    return payload
 
 
 def check_context_mode(repo: Path) -> dict:
@@ -159,7 +218,7 @@ def _npm_registry_version(pkg: str, timeout: float = 6.0) -> str | None:
     Used as a CLI-currency proxy for codex / claude / claude-code-cli-acp.
     CLI version is the closest universal proxy for "model is current" — new
     models almost always ship with new CLI releases. Direct model-list APIs
-    exist for some workers (cursor-agent --list-models) but not codex/claude.
+    exist for some workers (cursor-agent models) but not codex/claude.
     """
     if not shutil.which("npm"):
         return None
@@ -227,7 +286,7 @@ def worker_currency_probe() -> dict:
       releases.
 
     Cursor isn't here because cursor_models_probe() handles its leading-model
-    discovery directly via `cursor-agent --list-models`, which is more
+    discovery directly via `cursor-agent models`, which is more
     granular than CLI-version-currency.
     """
     out: dict = {}
@@ -282,7 +341,7 @@ def cursor_models_probe() -> dict:
     Discovery mechanism for Cursor's "domestic" (internal-tier) models —
     composer-*. Avoids hardcoding model names in docs that age fast.
 
-    Cursor exposes models via `cursor-agent --list-models`. Output format:
+    Cursor exposes models via `cursor-agent models`. Output format:
 
         Available models
 
@@ -443,7 +502,100 @@ def git_state(repo: Path) -> dict:
     }
 
 
+def _agent_instructions(repo: Path) -> tuple[Path | None, str]:
+    for name in ("AGENTS.md", "AGENT.md"):
+        path = repo / name
+        if path.exists():
+            return path, path.read_text(errors="replace")
+    return None, ""
+
+
+def _command_entry(text: str, key: str) -> str | None:
+    for line in text.splitlines():
+        stripped = line.strip()
+        lower = stripped.lower()
+        for prefix in (f"- {key}:", f"* {key}:", f"{key}:"):
+            if lower.startswith(prefix):
+                return stripped.split(":", 1)[1].strip()
+    return None
+
+
+def _goalflight_skill_root(agent_text: str) -> dict:
+    source = "package"
+    raw = None
+    resolved = SCRIPT_DIR.parent
+    env_value = os.environ.get("GOALFLIGHT_ROOT")
+    for line in agent_text.splitlines():
+        stripped = line.strip()
+        if stripped.lower().startswith("- skill-root:") or stripped.lower().startswith("skill-root:"):
+            raw = stripped.split(":", 1)[1].strip().strip("`")
+            break
+    if env_value:
+        resolved = Path(env_value).expanduser()
+        source = "GOALFLIGHT_ROOT"
+    elif raw:
+        match = re.search(r"\$\{GOALFLIGHT_ROOT:-([^}]+)\}", raw)
+        candidate = match.group(1) if match else raw
+        if "<path-to-goal-flight-clone>" not in candidate:
+            resolved = Path(candidate).expanduser()
+            source = "AGENTS.md"
+    return {
+        "path": str(resolved),
+        "exists": resolved.exists(),
+        "source": source,
+        "raw": raw,
+    }
+
+
+def check_project_goalflight_readiness(repo: Path) -> dict:
+    docs_private = repo / "docs-private"
+    env_caveats = docs_private / "env-caveats.md"
+    repo_skill = repo / "SKILL.md"
+    agent_path, agent_text = _agent_instructions(repo)
+    lower = agent_text.casefold()
+    has_routing = bool(
+        agent_path
+        and "goal-flight" in lower
+        and ("skill-root" in lower or "goalflight_root" in lower or "commands/" in lower)
+        and "skill.md" in lower
+    )
+    commands = {
+        "test": _command_entry(agent_text, "test"),
+        "lint": _command_entry(agent_text, "lint"),
+        "build": _command_entry(agent_text, "build"),
+    }
+    resume_notes = sorted(str(path) for path in docs_private.glob("RESUME-NOTES*.md"))
+    skill_root = _goalflight_skill_root(agent_text)
+    warnings: list[str] = []
+    if not env_caveats.exists():
+        warnings.append("missing docs-private/env-caveats.md")
+    if not repo_skill.exists():
+        warnings.append("missing repo SKILL.md")
+    if not has_routing:
+        warnings.append("AGENTS.md lacks goal-flight routing")
+    if not skill_root.get("exists"):
+        warnings.append("skill-root not resolvable")
+    if not commands["test"]:
+        warnings.append("project test command not recorded")
+    return {
+        "init_done": env_caveats.exists(),
+        "env_caveats": str(env_caveats),
+        "repo_skill": {"path": str(repo_skill), "exists": repo_skill.exists()},
+        "routing": {
+            "path": str(agent_path) if agent_path else None,
+            "exists": bool(agent_path),
+            "has_goalflight_block": has_routing,
+        },
+        "commands": commands,
+        "resume_notes": resume_notes,
+        "skill_root": skill_root,
+        "warnings": warnings,
+        "ok": not warnings,
+    }
+
+
 def doctor(repo: Path) -> dict:
+    skill_root = SCRIPT_DIR.parent
     codex_desktop = app_exists("Codex", "com.openai.codex")
     codex_cli = version("codex", "--version")
     cursor_desktop = app_exists("Cursor", "com.todesktop.230313mzl4w4u92")
@@ -451,6 +603,7 @@ def doctor(repo: Path) -> dict:
         "schema": "goalflight.doctor.v1",
         "repo": str(repo),
         "plugin": check_plugin(repo),
+        "host_goalflight_install": check_host_goalflight_install(),
         "claude": version("claude", "--version"),
         "codex": {
             "desktop_present": codex_desktop,
@@ -458,7 +611,7 @@ def doctor(repo: Path) -> dict:
             "desktop_without_cli": bool(codex_desktop and not codex_cli.get("present")),
             "install_hint": "npm install -g @openai/codex && codex login" if codex_desktop and not codex_cli.get("present") else None,
         },
-        "context_mode": check_context_mode(repo),
+        "context_mode": check_context_mode(skill_root),
         "gstack": check_gstack(),
         "cursor": {
             "desktop_present": cursor_desktop,
@@ -469,6 +622,7 @@ def doctor(repo: Path) -> dict:
         "grok": check_grok(),
         "acp": check_acp(),
         "project": git_state(repo),
+        "project_goalflight_readiness": check_project_goalflight_readiness(repo),
         "capacity": goalflight_capacity.profile(argparse.Namespace()) if goalflight_capacity else None,
         "rate_pressure": _rate_pressure_summary(),
         "worker_currency": worker_currency_probe(),
@@ -505,9 +659,14 @@ def status_line(ok: bool | None, label: str, detail: str | None = None) -> str:
 
 
 def print_human(payload: dict) -> None:
+    plugin = payload["plugin"]
     lines = [
-        status_line(payload["plugin"].get("manifest_exists"), "plugin manifest", payload["plugin"].get("manifest")),
-        status_line(payload["plugin"].get("validate_ok"), "claude plugin validate", payload["plugin"].get("validate_first_line")),
+        status_line(
+            None if plugin.get("skipped") else plugin.get("manifest_exists"),
+            "package plugin manifest",
+            plugin.get("skip_reason") if plugin.get("skipped") else plugin.get("manifest"),
+        ),
+        status_line(plugin.get("validate_ok"), "claude plugin validate", plugin.get("validate_first_line")),
         status_line(payload["claude"].get("present"), "claude CLI", payload["claude"].get("version")),
         status_line(payload["codex"]["cli"].get("present"), "codex CLI", payload["codex"]["cli"].get("version")),
         status_line(not payload["codex"].get("desktop_without_cli"), "Codex Desktop/CLI pairing", payload["codex"].get("install_hint")),
@@ -522,6 +681,8 @@ def print_human(payload: dict) -> None:
         status_line(payload["grok"].get("present"), "Grok Build binary", payload["grok"].get("version")),
         status_line(payload["grok"].get("headless_flags"), "Grok headless flags", None),
     ]
+    for host, item in (payload.get("host_goalflight_install") or {}).items():
+        lines.append(status_line(item.get("ok"), f"{host} goal-flight host install", item.get("detail")))
     for name, item in payload["acp"].items():
         if name == "sdk":
             lines.append(status_line(item.get("ok"), "ACP SDK venv", item.get("python")))
@@ -532,11 +693,28 @@ def print_human(payload: dict) -> None:
     lines.append(status_line(True, "capacity profile", f"operating={cap.get('operating_cap')} raw={cap.get('raw_ram_ceiling')} ram={cap.get('ram_mb')}MB"))
     project = payload["project"]
     lines.append(status_line(project.get("present"), "git project", f"{project.get('branch')} {project.get('head')} dirty={project.get('dirty')}"))
+    readiness = payload.get("project_goalflight_readiness") or {}
+    lines.extend([
+        status_line(readiness.get("init_done"), "project init", readiness.get("env_caveats")),
+        status_line(readiness.get("repo_skill", {}).get("exists"), "project SKILL.md", readiness.get("repo_skill", {}).get("path")),
+        status_line(readiness.get("routing", {}).get("has_goalflight_block"), "project AGENTS goal-flight routing", readiness.get("routing", {}).get("path")),
+        status_line(
+            readiness.get("skill_root", {}).get("exists"),
+            "skill-root resolvable",
+            f"{readiness.get('skill_root', {}).get('path')} source={readiness.get('skill_root', {}).get('source')}",
+        ),
+    ])
+    commands = readiness.get("commands") or {}
+    for name in ("test", "lint", "build"):
+        value = commands.get(name)
+        lines.append(status_line(bool(value) if name == "test" else (True if value else None), f"project {name} command", value or "not recorded"))
+    resume_notes = readiness.get("resume_notes") or []
+    lines.append(status_line(True if resume_notes else None, "resume notes", f"{len(resume_notes)} found" if resume_notes else "none"))
 
     # Worker model currency. Today the cursor probe is the only one
     # implemented. Other workers (codex/grok/claude/claude-code-cli-acp)
     # would each need their own model-discovery: codex doesn't expose a
-    # native --list-models, claude's model is set per-Agent dispatch, etc.
+    # native model-list command, claude's model is set per-Agent dispatch, etc.
     # Surface cursor explicitly; flag the others as not-yet-probed so the
     # user knows the doctor's currency check is partial.
     cursor_models = payload["cursor"].get("models") or {}
@@ -624,7 +802,10 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(payload, sort_keys=True))
     else:
         print_human(payload)
-    if not payload["plugin"].get("manifest_exists") or payload["plugin"].get("validate_ok") is False:
+    plugin = payload["plugin"]
+    if not plugin.get("skipped") and (
+        plugin.get("manifest_exists") is False or plugin.get("validate_ok") is False
+    ):
         return 1
     return 0
 

@@ -1,6 +1,6 @@
 # goal-flight
 
-goal-flight is a portable skill core plus host wrappers for long, decomposed code work. The current checked-in wrapper targets [Claude Code](https://claude.ai/code); generated wrappers can project the same command/protocol/script core into other controllers through adapter manifests. One controller doing every edit runs out of context on multi-chunk refactors, so goal-flight delegates concrete work to workers with review loops and keeps the controller small. Multi-hour unattended runs can then land as a clean stack of one-commit-per-chunk on main without the controller's context window filling up. Deterministic runtime facts live in helper scripts, not in the conversation.
+goal-flight lets you hand an AI a large software goal and have it keep moving after the first context window would normally fall apart. It turns the work into durable project files: a plan, queue, environment caveats, worker status, review evidence, and resume notes that survive compaction, restarts, and overnight runs. The current checked-in wrapper targets [Claude Code](https://claude.ai/code); generated wrappers can project the same command/protocol/script core into other hosts through adapter manifests. Multi-hour runs can land as a clean stack of one-commit-per-chunk on main, with deterministic runtime facts in helper scripts rather than in the conversation.
 
 **What the controller is for**: high-level management, not execution. The controller holds enough context about your project's goal, scenery (constraints, architecture, prior decisions, failure modes), and intent to exercise discretion and recommend the next move — then dispatches actual work to workers (examples: Claude subagents, codex, grok) that don't need that context. This is the frontier of lightly-supervised development: you check in, ratify suggested moves, redirect when needed, and trust the controller to keep the project anchored across compactions and unattended hours. The dispatch / review / handoff machinery below is what frees the controller to do that job.
 
@@ -28,7 +28,7 @@ git clone https://github.com/simonrowland/goal-flight.git ~/.claude/skills/goal-
 
 ```bash
 # In your project repo, in a controller session (Claude Code wrapper shown):
-/goal-flight init <topic>         # audit repo, scaffold AGENTS.md + docs-private/,
+/goal-flight init <topic>         # audit repo, scaffold AGENTS.md/SKILL.md + docs-private/,
                                   # build optional RAG corpus, register codex-trust,
                                   # probe box capacity + ACP-worker availability →
                                   # docs-private/env-caveats.md

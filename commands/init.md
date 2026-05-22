@@ -24,11 +24,11 @@ Read:
 ```
 
 For Codex, setup registers the Goal Flight package for the Desktop controller
-surface, installs the personal Codex skill as a fallback, checks the CLI worker
-surface, and registers context-mode MCP when needed. `codex exec` remains the
-worker path. For Cursor, setup installs global agent instructions, a personal
-skill, and rules; context-mode remains deferred until a verified Cursor hook or
-plugin API exists.
+surface, cleans any duplicate legacy personal Codex skill when plugin
+registration succeeds, checks the CLI worker surface, and registers
+context-mode MCP when needed. `codex exec` remains the worker path. For Cursor,
+setup installs global agent instructions, a personal skill, and rules;
+context-mode remains deferred until a verified Cursor hook or plugin API exists.
 
 2. Run doctor:
 
@@ -61,6 +61,7 @@ python3 <skill-root>/scripts/goalflight_capacity.py profile --json
 - `docs-private/goal-<topic>-<date>.md` from `templates/goal-statement.md`
 - `docs-private/RESUME-NOTES.md` from `templates/resume-notes.md`
 - `AGENTS.md` from `templates/project-agents.md` when project has no local agent instructions
+- `SKILL.md` from `templates/project-skill.md` when project has no root skill
 
 6. Write only compact environment facts into `docs-private/env-caveats.md`:
 
@@ -76,6 +77,7 @@ Do not paste full probe output.
 
 - `docs-private/` ignored
 - `AGENTS.md` tracked or intentionally absent
+- root `SKILL.md` tracked or intentionally absent
 - current branch/head/dirty state recorded in resume notes
 
 8. Optional corpus:

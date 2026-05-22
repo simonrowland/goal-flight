@@ -36,6 +36,12 @@ EXPECTED_ADAPTERS = {
     "amp",
     "antigravity",
 }
+FORBIDDEN_ROOT_CODEX_PACKAGE_PATHS = [
+    ".codex-plugin/plugin.json",
+    "skills/goal-flight/SKILL.md",
+    "skills/goal-flight-doctor/SKILL.md",
+    "skills/goal-flight-init/SKILL.md",
+]
 
 SURVEY_WORKER_STUBS = {
     "gemini",
@@ -320,6 +326,11 @@ def validate_manifest_semantics(
         errors.append(f"{source}: controller and worker support must both be declared")
     if "controller" not in readiness or "worker" not in readiness:
         errors.append(f"{source}: controller and worker readiness must both be declared")
+    for role in ("controller", "worker"):
+        if readiness.get(role) == "ready":
+            errors.append(
+                f"{source}: checked-in {role} readiness must be probe_required or worse"
+            )
 
     if agent_id in SURVEY_WORKER_STUBS:
         controller_cap = support.get("controller", {}).get("capability")
@@ -339,8 +350,8 @@ def validate_manifest_semantics(
             errors.append(f"{source}: codex controller capability must be supported")
         if support.get("worker", {}).get("capability") != "supported":
             errors.append(f"{source}: codex worker capability must be supported")
-        if readiness.get("controller") != "ready" or readiness.get("worker") != "ready":
-            errors.append(f"{source}: codex local readiness must be ready for controller and worker")
+        if readiness.get("controller") != "probe_required" or readiness.get("worker") != "probe_required":
+            errors.append(f"{source}: codex checked-in readiness must require local probes")
     discovery = manifest.get("discovery", {})
     budget = discovery.get("budget", {})
     probes = discovery.get("probes", [])
@@ -492,6 +503,9 @@ def validate_repository(repo_root: Path) -> tuple[int, int, list[str]]:
     adapters_dir = repo_root / "adapters"
     schema_path = adapters_dir / "agent-adapter.schema.json"
     errors: list[str] = []
+    for rel in FORBIDDEN_ROOT_CODEX_PACKAGE_PATHS:
+        if (repo_root / rel).exists():
+            errors.append(f"{rel}: duplicate root Codex package path must not exist")
     try:
         schema = json.loads(schema_path.read_text())
     except Exception as exc:  # noqa: BLE001 - CLI validator should report parse errors.

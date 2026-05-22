@@ -19,13 +19,9 @@ from typing import Any, Callable
 import uuid
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-ADAPTERS_DIR = SCRIPT_DIR.parent / "adapters"
 DEFAULT_REMOTE_TURN_SILENCE_S = 1200.0
 DEFAULT_REMOTE_TURN_CANCEL_GRACE_S = 15.0
 LIVENESS_PROFILES = {"remote_api", "local_compute", "hybrid"}
-AGENT_MANIFEST_ALIASES = {
-    "claude": "claude-code",
-}
 
 
 def _acp_reexec_target() -> str | None:
@@ -58,6 +54,11 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 import goalflight_capacity
 import goalflight_ledger
+from goalflight_adapter_readiness import (
+    load_manifest,
+    manifest_candidates,
+    validate_acp_dispatch_readiness,
+)
 from goalflight_acp_client import (
     AcpConnection,
     AcpError,
@@ -80,26 +81,41 @@ from goalflight_startup_gate import StartupGate
 from acp_runner import extract_markers, run_prompt
 
 
+def _resolve_manifest_binary(binary: str) -> str:
+    if binary == "grok":
+        return shutil.which("grok") or str(Path.home() / ".grok/bin/grok")
+    if binary == "cursor-agent":
+        return shutil.which("cursor-agent") or str(Path.home() / ".local/bin/cursor-agent")
+    if "/" in binary:
+        return str(Path(binary).expanduser())
+    return shutil.which(binary) or binary
+
+
+def _manifest_acp_command(agent: str) -> tuple[str, list[str]] | None:
+    manifest = load_manifest(agent)
+    exec_spec = ((manifest or {}).get("invocation") or {}).get("exec") or {}
+    if exec_spec.get("kind") != "acp":
+        return None
+    binary = exec_spec.get("binary")
+    args = exec_spec.get("args")
+    if not isinstance(binary, str) or not isinstance(args, list):
+        return None
+    if not all(isinstance(part, str) for part in args):
+        return None
+    return _resolve_manifest_binary(binary), list(args)
+
+
 def agent_command(agent: str) -> tuple[str, list[str]]:
-    if agent == "grok":
-        binary = shutil.which("grok") or str(Path.home() / ".grok/bin/grok")
-        return binary, ["agent", "stdio"]
-    if agent == "cursor":
-        binary = shutil.which("cursor-agent") or str(Path.home() / ".local/bin/cursor-agent")
-        return binary, ["acp"]
+    manifest_command = _manifest_acp_command(agent)
+    if manifest_command is not None:
+        return manifest_command
     if agent == "claude":
         return "claude-code-cli-acp", []
-    # codex-acp needs the MCP-elicitation flag, but it is injected at the single
-    # spawn boundary (ensure_codex_acp_elicitation, called by spawn_acp_connection)
-    # so it covers pool/custom callers too -- not only this runner helper.
     return agent, []
 
 
 def _adapter_manifest_candidates(agent: str) -> list[Path]:
-    names = [agent, AGENT_MANIFEST_ALIASES.get(agent)]
-    if "/" in agent:
-        names.append(Path(agent).stem)
-    return [ADAPTERS_DIR / f"{name}.json" for name in names if name]
+    return manifest_candidates(agent)
 
 
 def adapter_liveness_config(agent: str) -> tuple[str, float]:
@@ -325,12 +341,14 @@ async def run(args: argparse.Namespace) -> dict:
         write_status(status_path, payload)
         return payload
 
-    # Lease TTL covers the worst-case run length. Derive from idle-timeout
-    # (×4 headroom), but when idle-timeout is 0 (no-timeout, mode-dependent),
-    # fall back to a generous goal/one-shot ceiling rather than the bare 300
-    # default — otherwise a no-timeout 10h goal run would hold only a 1h lease
-    # and free its capacity slot mid-run. The running_quiet hard wall is now
-    # the separate --max-quiet-s knob; capacity TTL stays a lease concern.
+    command, acp_args = agent_command(args.agent)
+    gate = validate_acp_dispatch_readiness(args.agent, [command, *acp_args])
+    if gate is not None:
+        payload.update({"state": "blocked_adapter_gate", "error": gate})
+        write_status(status_path, payload)
+        return payload
+
+    # Lease TTL covers the worst-case run length. Derive from idle-timeout.
     lease_ttl_s = max(int(args.idle_timeout or (36000 if args.mode == "goal" else 300)) * 4, 3600)
     acquire_args = argparse.Namespace(
         agent=args.agent,
@@ -365,7 +383,6 @@ async def run(args: argparse.Namespace) -> dict:
     lease_id = acquire_payload.get("lease", {}).get("lease_id")
     await update_status(lease_id=lease_id)
 
-    command, acp_args = agent_command(args.agent)
     proc: asyncio.subprocess.Process | None = None
     conn: AcpConnection | None = None
     heartbeat_task: asyncio.Task | None = None

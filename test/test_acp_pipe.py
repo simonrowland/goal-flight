@@ -20,9 +20,40 @@ from acp_pool import compute_pool_ceiling, managed_pool  # noqa: E402
 from acp_runner import extract_markers, run_prompt  # noqa: E402
 import goalflight_acp_permits as permits  # noqa: E402
 import goalflight_acp_run  # noqa: E402
+import goalflight_adapter_readiness  # noqa: E402
 from goalflight_acp_client import spawn_acp_connection  # noqa: E402
 
 FAKE = ROOT / "test/fixtures/acp_fake_agent.py"
+
+
+def _write_supported_adapter_manifest(directory: Path, name: str) -> None:
+    (directory / f"{name}.json").write_text(json.dumps({
+        "support": {
+            "controller": {"capability": "supported", "fallback": "worker_only"},
+            "worker": {"capability": "supported", "transport": ["acp"], "fallback": "tail_file"},
+        },
+        "local_readiness_state": {
+            "controller": "probe_required",
+            "worker": "probe_required",
+            "last_probe_ids": ["python-version"],
+        },
+        "live_gate": {"function": "validate_adapter_gate", "default": "deny"},
+        "status_contract": {"terminal_states": ["complete"], "stale_after_s": 60},
+        "permission_surface": {
+            "plugin_sandbox": {},
+            "auto_approve_detection": {"strict_fail": True},
+        },
+        "discovery": {
+            "probes": [{
+                "id": "python-version",
+                "argv": [sys.executable, "--version"],
+                "safe_for_setup": True,
+                "network": False,
+                "model_consuming": False,
+            }],
+        },
+        "invocation": {"exec": {"arg_policy": {"forbidden_args": []}}},
+    }))
 
 
 async def _connect(scenario: str, *, limit: str | None = None):
@@ -157,12 +188,16 @@ async def case_runner_overlimit_response_status_counts_drop() -> None:
     old_scenario = os.environ.get("GOALFLIGHT_FAKE_ACP_SCENARIO")
     old_limit = os.environ.get("GOALFLIGHT_ACP_LIMIT")
     old_agent_command = goalflight_acp_run.agent_command
+    old_adapters_dir = goalflight_adapter_readiness.ADAPTERS_DIR
     os.environ["GOALFLIGHT_FAKE_ACP_SCENARIO"] = "overlimit_response"
     os.environ["GOALFLIGHT_ACP_LIMIT"] = "4k"
     goalflight_acp_run.agent_command = lambda agent: (sys.executable, [str(FAKE)])
     try:
         with tempfile.TemporaryDirectory() as tmp:
-            status_path = Path(tmp) / "status.json"
+            tmp_path = Path(tmp)
+            goalflight_adapter_readiness.ADAPTERS_DIR = tmp_path
+            _write_supported_adapter_manifest(tmp_path, "fake-runner")
+            status_path = tmp_path / "status.json"
             dispatch_id = f"test-runner-overlimit-{os.getpid()}"
             payload = await goalflight_acp_run.run(
                 argparse.Namespace(
@@ -198,6 +233,142 @@ async def case_runner_overlimit_response_status_counts_drop() -> None:
             os.environ.pop("GOALFLIGHT_ACP_LIMIT", None)
         else:
             os.environ["GOALFLIGHT_ACP_LIMIT"] = old_limit
+        goalflight_adapter_readiness.ADAPTERS_DIR = old_adapters_dir
+
+
+async def case_runner_blocks_probe_required_adapter() -> None:
+    old_agent_command = goalflight_acp_run.agent_command
+    old_adapters_dir = goalflight_adapter_readiness.ADAPTERS_DIR
+    goalflight_acp_run.agent_command = lambda agent: (sys.executable, [str(FAKE)])
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            goalflight_adapter_readiness.ADAPTERS_DIR = tmp_path
+            (tmp_path / "blocked-runner.json").write_text(json.dumps({
+                "support": {
+                    "controller": {"capability": "supported", "fallback": "worker_only"},
+                    "worker": {"capability": "supported", "transport": ["acp"], "fallback": "tail_file"},
+                },
+                "local_readiness_state": {
+                    "controller": "probe_required",
+                    "worker": "probe_required",
+                    "last_probe_ids": ["missing-probe"],
+                },
+                "live_gate": {"function": "validate_adapter_gate", "default": "deny"},
+                "status_contract": {"terminal_states": ["complete"], "stale_after_s": 60},
+                "permission_surface": {
+                    "plugin_sandbox": {},
+                    "auto_approve_detection": {"strict_fail": True},
+                },
+                "discovery": {"probes": []},
+                "invocation": {"exec": {"arg_policy": {"forbidden_args": []}}},
+            }))
+            status_path = tmp_path / "status.json"
+            payload = await goalflight_acp_run.run(argparse.Namespace(
+                agent="blocked-runner",
+                cwd=str(ROOT),
+                session_id=f"blocked-{os.getpid()}",
+                dispatch_id=f"blocked-{os.getpid()}",
+                prompt_id=None,
+                prompt=None,
+                prompt_text="should not spawn",
+                mode="one-shot",
+                status_json=str(status_path),
+                idle_timeout=0.2,
+                heartbeat_interval=5.0,
+                wedge_samples=100,
+                max_tool_s=60.0,
+                max_quiet_s=60.0,
+                progress_stall_s=60.0,
+                liveness_profile=None,
+                remote_turn_silence_s=None,
+                remote_turn_cancel_grace_s=0.0,
+                cpu_epsilon=0.1,
+            ))
+            assert payload["state"] == "blocked_adapter_gate", payload
+            assert payload["worker_pid"] is None, payload
+            assert payload["error"]["reason"] == "probe_required", payload
+            assert status_path.exists(), "blocked gate should write status"
+    finally:
+        goalflight_acp_run.agent_command = old_agent_command
+        goalflight_adapter_readiness.ADAPTERS_DIR = old_adapters_dir
+
+
+async def case_runner_blocks_invalid_adapter_manifest() -> None:
+    old_agent_command = goalflight_acp_run.agent_command
+    old_adapters_dir = goalflight_adapter_readiness.ADAPTERS_DIR
+    goalflight_acp_run.agent_command = lambda agent: (sys.executable, [str(FAKE)])
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            goalflight_adapter_readiness.ADAPTERS_DIR = tmp_path
+            (tmp_path / "invalid-runner.json").write_text("{not-json")
+            status_path = tmp_path / "status.json"
+            payload = await goalflight_acp_run.run(argparse.Namespace(
+                agent="invalid-runner",
+                cwd=str(ROOT),
+                session_id=f"invalid-{os.getpid()}",
+                dispatch_id=f"invalid-{os.getpid()}",
+                prompt_id=None,
+                prompt=None,
+                prompt_text="should not spawn",
+                mode="one-shot",
+                status_json=str(status_path),
+                idle_timeout=0.2,
+                heartbeat_interval=5.0,
+                wedge_samples=100,
+                max_tool_s=60.0,
+                max_quiet_s=60.0,
+                progress_stall_s=60.0,
+                liveness_profile=None,
+                remote_turn_silence_s=None,
+                remote_turn_cancel_grace_s=0.0,
+                cpu_epsilon=0.1,
+            ))
+            assert payload["state"] == "blocked_adapter_gate", payload
+            assert payload["worker_pid"] is None, payload
+            assert payload["error"]["reason"] == "adapter_manifest_invalid", payload
+    finally:
+        goalflight_acp_run.agent_command = old_agent_command
+        goalflight_adapter_readiness.ADAPTERS_DIR = old_adapters_dir
+
+
+async def case_runner_blocks_missing_adapter_manifest() -> None:
+    old_agent_command = goalflight_acp_run.agent_command
+    old_adapters_dir = goalflight_adapter_readiness.ADAPTERS_DIR
+    goalflight_acp_run.agent_command = lambda agent: (sys.executable, [str(FAKE)])
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            goalflight_adapter_readiness.ADAPTERS_DIR = tmp_path
+            status_path = tmp_path / "status.json"
+            payload = await goalflight_acp_run.run(argparse.Namespace(
+                agent="missing-runner",
+                cwd=str(ROOT),
+                session_id=f"missing-{os.getpid()}",
+                dispatch_id=f"missing-{os.getpid()}",
+                prompt_id=None,
+                prompt=None,
+                prompt_text="should not spawn",
+                mode="one-shot",
+                status_json=str(status_path),
+                idle_timeout=0.2,
+                heartbeat_interval=5.0,
+                wedge_samples=100,
+                max_tool_s=60.0,
+                max_quiet_s=60.0,
+                progress_stall_s=60.0,
+                liveness_profile=None,
+                remote_turn_silence_s=None,
+                remote_turn_cancel_grace_s=0.0,
+                cpu_epsilon=0.1,
+            ))
+            assert payload["state"] == "blocked_adapter_gate", payload
+            assert payload["worker_pid"] is None, payload
+            assert payload["error"]["reason"] == "adapter_manifest_missing", payload
+    finally:
+        goalflight_acp_run.agent_command = old_agent_command
+        goalflight_adapter_readiness.ADAPTERS_DIR = old_adapters_dir
 
 
 async def case_permission_auto_allow() -> None:
@@ -1025,6 +1196,9 @@ async def amain() -> None:
     await case_overlimit_frame_drops_and_continues()
     await case_overlimit_response_fails_cleanly()
     await case_runner_overlimit_response_status_counts_drop()
+    await case_runner_blocks_probe_required_adapter()
+    await case_runner_blocks_invalid_adapter_manifest()
+    await case_runner_blocks_missing_adapter_manifest()
     await case_permission_auto_allow()
     await case_permission_codex_shape_unblocks()
     await case_permission_reject_first_picks_allow()

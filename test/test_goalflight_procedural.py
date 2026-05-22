@@ -133,7 +133,55 @@ def test_doctor_json_shape() -> None:
     payload = goalflight_doctor.doctor(ROOT)
     assert_true("doctor schema", payload["schema"] == "goalflight.doctor.v1")
     assert_true("plugin section", "plugin" in payload and "manifest_exists" in payload["plugin"])
+    assert_true("host install section", "host_goalflight_install" in payload)
+    assert_true("codex host install probe", "codex" in payload["host_goalflight_install"])
+    assert_true("project readiness section", "project_goalflight_readiness" in payload)
     assert_true("capacity section", payload["capacity"]["schema"] == "goalflight.capacity.profile.v1")
+
+
+def test_doctor_target_project_readiness_split() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        repo = Path(td)
+        (repo / "docs-private").mkdir()
+        (repo / "docs-private/env-caveats.md").write_text("RAM_MB=1000\n")
+        (repo / "SKILL.md").write_text("# Test project\n")
+        (repo / "AGENTS.md").write_text(
+            "## Goal Flight Routing\n"
+            f"- skill-root: ${{GOALFLIGHT_ROOT:-{ROOT}}}\n"
+            "- load order: AGENTS.md -> SKILL.md -> commands/*.md\n"
+            "## Commands\n"
+            "- test: `pytest`\n"
+            "- lint: `ruff check .`\n"
+        )
+        payload = goalflight_doctor.doctor(repo)
+        assert_true("target plugin skipped", payload["plugin"]["skipped"] is True)
+        readiness = payload["project_goalflight_readiness"]
+        assert_true("target project ready", readiness["ok"] is True)
+        assert_true("test command recorded", readiness["commands"]["test"] == "`pytest`")
+        assert_true("skill root resolved from routing", readiness["skill_root"]["source"] == "AGENTS.md")
+        assert_true("skill root exists", readiness["skill_root"]["exists"] is True)
+        assert_true(
+            "context-mode probe uses skill root",
+            payload["context_mode"]["register_script"].endswith("scripts/register-context-mode-codex.py"),
+        )
+
+
+def test_doctor_package_repo_validates_plugin_manifest() -> None:
+    payload = goalflight_doctor.doctor(ROOT)
+    assert_true("package plugin validation not skipped", payload["plugin"]["skipped"] is False)
+    assert_true("package plugin manifest present", payload["plugin"]["manifest_exists"] is True)
+
+
+def test_doctor_cli_target_project_skips_package_plugin() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        result = run(
+            ["python3", "scripts/goalflight_doctor.py", "--project-root", td, "--json"],
+            check=False,
+        )
+        assert_true("target doctor exits 0", result.returncode == 0)
+        payload = json.loads(result.stdout)
+        assert_true("target plugin skipped in CLI", payload["plugin"]["skipped"] is True)
+        assert_true("target missing init warned", payload["project_goalflight_readiness"]["ok"] is False)
 
 
 def test_instruction_split_contract() -> None:
@@ -331,6 +379,9 @@ def main() -> None:
         test_capacity_prunes_review_terminal_states,
         test_ledger_record_finish_status,
         test_doctor_json_shape,
+        test_doctor_target_project_readiness_split,
+        test_doctor_package_repo_validates_plugin_manifest,
+        test_doctor_cli_target_project_skips_package_plugin,
         test_instruction_split_contract,
         test_review_job_codex_no_final_is_inconclusive,
         test_runners_write_status_on_capacity_and_spawn_failure,

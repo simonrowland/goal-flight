@@ -22,16 +22,17 @@ python3 <skill-root>/scripts/goalflight_doctor.py --project-root "$PWD" --json
 ## Required Checks
 
 The script owns the checks; this file names the contract so tests and humans can
-verify drift. In the current implementation, doctor reports static adapter
-manifest validity plus local availability checks: PATH/binary presence, selected
-CLI versions, context-mode registration, gstack, project state, capacity, model
+verify drift. Doctor separates host-global install readiness from project-local
+Goal Flight readiness.
+
+Host-global checks cover PATH/binary presence, selected CLI versions,
+host-wrapper installation, context-mode registration, gstack, capacity, model
 currency probes, and rate-pressure signals.
 
-It does **not** yet prove full worker/controller routeability. The bounded ACP
-handshake plus `validate_adapter_gate` routeability gate is forthcoming in Phase
-3 chunk 11 and is **not enforced by `goalflight_doctor.py` yet**. Until then,
-ACP rows in doctor output mean "binary/entrypoint present on this machine", not
-"structured dispatch has passed a live ACP handshake".
+Project-local checks cover `docs-private/env-caveats.md`, repository `SKILL.md`,
+`AGENTS.md` Goal Flight routing, project verification commands, and resume notes.
+Package plugin validation applies only when `--project-root` is the Goal Flight
+package repository; for normal target projects it is skipped as INFO.
 
 - Validate goal-flight packaging and adapter manifests. Host-native validators
   are adapter-owned compatibility probes, not the core readiness source.
@@ -59,8 +60,14 @@ ACP rows in doctor output mean "binary/entrypoint present on this machine", not
 - Check ACP worker adapters for presence/PATH only: `codex-acp`,
   `cursor-agent`, `claude-code-cli-acp`, `grok agent stdio`.
 - Check project git state.
+- Check project Goal Flight readiness:
+  - `docs-private/env-caveats.md`
+  - root `SKILL.md`
+  - `AGENTS.md` Goal Flight routing with skill-root/load-order guidance
+  - project test/lint/build commands
+  - optional `docs-private/RESUME-NOTES*.md`
 - Check machine capacity profile.
-- **Cursor model currency** (`cursor_models_probe`): runs `cursor-agent --list-models`,
+- **Cursor model currency** (`cursor_models_probe`): runs `cursor-agent models`,
   identifies the leading internal `composer-X.Y` (non-`-fast`), compares against
   `~/.cursor/cli-config.json` `modelId`. Flags `user_behind` when the user is on an
   older internal model or on a paid-passthrough model. Surfaces as `[OK]` or `[WARN]`
@@ -81,5 +88,8 @@ Human mode prints an <=80 line checklist.
 
 JSON mode emits `goalflight.doctor.v1`.
 
-WARN means usable with caveat. FAIL means the requested path should not run until
-fixed. Missing optional workers should route dispatch elsewhere.
+WARN means usable with caveat. Missing optional workers should route dispatch
+elsewhere. The CLI exits nonzero for package validation failures; project
+readiness and host-install caveats are structured WARN/INFO fields, so
+automation should inspect JSON fields such as `project_goalflight_readiness.ok`
+and `host_goalflight_install.<host>.ok`.

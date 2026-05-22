@@ -36,6 +36,14 @@ no_addons_dry="$(run_setup --controllers codex-cli-controller --workers codex-cl
 if printf '%s\n' "$no_addons_dry" | grep -q 'register-context-mode-codex.py'; then
   fail "empty --addons should skip context-mode bootstrap"
 fi
+mixed_dry="$(run_setup --controllers codex-desktop-controller,grok-cli-controller --workers codex-cli-worker,grok-acp-worker --addons context-mode,gstack)"
+printf '%s\n' "$mixed_dry" | grep -q 'DRY-RUN setup agent=codex' || fail "mixed selection should plan codex"
+printf '%s\n' "$mixed_dry" | grep -q 'DRY-RUN setup agent=grok' || fail "mixed selection should plan grok"
+printf '%s\n' "$mixed_dry" | grep -q 'ADDON_SKIP grok context-mode reason=incompatible_destinations' || fail "mixed selection should skip incompatible add-on per agent"
+printf '%s\n' "$mixed_dry" | grep -q 'WORKER_CHECK grok agent stdio' || fail "mixed grok worker check missing"
+combined_codex_dry="$(run_setup --controllers codex-desktop-controller,codex-cli-controller --workers codex-cli-worker --addons '')"
+printf '%s\n' "$combined_codex_dry" | grep -q 'ACTION register_plugin' || fail "combined codex setup should register desktop plugin"
+printf '%s\n' "$combined_codex_dry" | grep -q 'CLEANUP remove_tree target=.*.codex/skills/goal-flight' || fail "combined codex setup should clean duplicate personal skill"
 
 codex_dry="$(run_setup --agent codex)"
 printf '%s\n' "$codex_dry" | grep -q 'DRY-RUN setup agent=codex' || fail "codex dry-run header missing"
@@ -102,6 +110,36 @@ cp "$HOME/.codex/config.toml" "$TMP_ROOT/original-config.toml"
 export GOALFLIGHT_SETUP_FAKE_CODEX_LOG="$TMP_ROOT/fake-codex.log"
 export GOALFLIGHT_SETUP_FAKE_CONTEXT_MODE_LOG="$TMP_ROOT/fake-context-mode.log"
 
+fail_log="$TMP_ROOT/fake-codex-fail.log"
+if GOALFLIGHT_SETUP_FAKE_CODEX_LOG="$fail_log" GOALFLIGHT_SETUP_FAKE_CODEX_FAIL_VERIFY=1 \
+  run_setup --apply --yes --controllers codex-desktop-controller --addons '' >/tmp/goal-flight-setup-plugin-fail.out 2>&1; then
+  fail "plugin registration failure should fail"
+fi
+grep -q 'codex plugin remove goal-flight@goal-flight' "$fail_log" || fail "failed plugin apply did not unregister plugin"
+grep -q 'codex plugin marketplace remove goal-flight' "$fail_log" || fail "failed plugin apply did not unregister marketplace"
+
+COMBINED_HOME="$TMP_ROOT/combined-home"
+COMBINED_STATE="$TMP_ROOT/combined-state"
+mkdir -p "$COMBINED_HOME/.codex/skills/goal-flight"
+printf 'legacy skill\n' > "$COMBINED_HOME/.codex/skills/goal-flight/SKILL.md"
+printf 'existing = true\n' > "$COMBINED_HOME/.codex/config.toml"
+combined_log="$TMP_ROOT/fake-codex-combined.log"
+combined_context_log="$TMP_ROOT/fake-context-mode-combined.log"
+combined_apply_out="$(
+  HOME="$COMBINED_HOME" XDG_STATE_HOME="$COMBINED_STATE" \
+  GOALFLIGHT_SETUP_FAKE_CODEX_LOG="$combined_log" \
+  GOALFLIGHT_SETUP_FAKE_CONTEXT_MODE_LOG="$combined_context_log" \
+  run_setup --apply --yes --controllers codex-desktop-controller,codex-cli-controller --workers codex-cli-worker --addons ''
+)"
+combined_manifest="$(printf '%s\n' "$combined_apply_out" | awk '/^BACKUP_MANIFEST /{print $2}')"
+[ -n "$combined_manifest" ] || fail "combined codex backup manifest path missing"
+grep -q 'codex plugin add goal-flight@goal-flight' "$combined_log" || fail "combined codex plugin add missing"
+[ ! -e "$COMBINED_HOME/.codex/skills/goal-flight" ] || fail "combined codex apply left duplicate personal skill"
+HOME="$COMBINED_HOME" XDG_STATE_HOME="$COMBINED_STATE" \
+  GOALFLIGHT_SETUP_FAKE_CODEX_LOG="$combined_log" \
+  run_setup --uninstall --from-manifest "$combined_manifest" >/tmp/goal-flight-setup-combined-uninstall.out
+grep -q 'legacy skill' "$COMBINED_HOME/.codex/skills/goal-flight/SKILL.md" || fail "combined codex uninstall did not restore legacy personal skill"
+
 apply_out="$(run_setup --apply --yes --agent codex)"
 manifest="$(printf '%s\n' "$apply_out" | awk '/^BACKUP_MANIFEST /{print $2}')"
 [ -n "$manifest" ] || fail "backup manifest path missing"
@@ -117,6 +155,8 @@ run_setup --apply --yes --agent codex >/tmp/goal-flight-setup-apply2.out
 [ "$(grep -c '# >>> goal-flight codex' "$HOME/.codex/config.toml")" -eq 1 ] || fail "codex setup not idempotent"
 
 run_setup --uninstall --from-manifest "$manifest" >/tmp/goal-flight-setup-uninstall.out
+grep -q 'codex plugin remove goal-flight@goal-flight' "$GOALFLIGHT_SETUP_FAKE_CODEX_LOG" || fail "fake plugin remove command missing"
+grep -q 'codex plugin marketplace remove goal-flight' "$GOALFLIGHT_SETUP_FAKE_CODEX_LOG" || fail "fake marketplace remove command missing"
 cmp "$TMP_ROOT/original-config.toml" "$HOME/.codex/config.toml" >/dev/null || fail "uninstall did not restore original config"
 grep -q 'legacy skill' "$HOME/.codex/skills/goal-flight/SKILL.md" || fail "uninstall did not restore legacy personal skill"
 
@@ -124,8 +164,9 @@ FIXTURE_REPO="$TMP_ROOT/fixture-repo"
 mkdir -p "$FIXTURE_REPO/adapters" "$FIXTURE_REPO/configs/codex"
 cp "$REPO_ROOT/adapters/codex.json" "$FIXTURE_REPO/adapters/codex.json"
 cp "$REPO_ROOT/configs/codex/config.toml" "$FIXTURE_REPO/configs/codex/config.toml"
-cp -R "$REPO_ROOT/.codex-plugin" "$FIXTURE_REPO/.codex-plugin"
 cp -R "$REPO_ROOT/.agents" "$FIXTURE_REPO/.agents"
+mkdir -p "$FIXTURE_REPO/plugins"
+cp -R "$REPO_ROOT/plugins/goal-flight" "$FIXTURE_REPO/plugins/goal-flight"
 python3 - "$FIXTURE_REPO/adapters/codex.json" <<'PY'
 import json
 import sys

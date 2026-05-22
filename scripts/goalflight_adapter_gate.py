@@ -158,6 +158,27 @@ def _probe_ids(adapter: dict[str, Any]) -> list[str]:
     return ids
 
 
+def _effective_readiness(
+    adapter: dict[str, Any],
+    local_state: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Return machine-local readiness, defaulting checked-in state to unknown.
+
+    Adapter manifests describe the readiness record shape. Live allow decisions
+    must come from a caller-provided local probe result, not committed JSON.
+    """
+
+    manifest_state = adapter.get("local_readiness_state", {})
+    effective = dict(manifest_state) if isinstance(manifest_state, dict) else {}
+    effective["controller"] = "probe_required"
+    effective["worker"] = "probe_required"
+    if isinstance(local_state, dict):
+        for key in ("controller", "worker", "last_probe_ids", "updated_at"):
+            if key in local_state:
+                effective[key] = local_state[key]
+    return effective
+
+
 def _readiness_reason(state: str) -> str:
     if state == "not_installed":
         return "not_installed"
@@ -170,12 +191,13 @@ def _readiness_reason(state: str) -> str:
 
 def _role_decision(
     adapter: dict[str, Any],
+    readiness_state: dict[str, Any],
     role: str,
     requested_transport: str | None,
     forbidden: list[str],
 ) -> tuple[bool, str, list[str]]:
     support = adapter.get("support", {}).get(role, {})
-    readiness = adapter.get("local_readiness_state", {}).get(role)
+    readiness = readiness_state.get(role)
     capability = support.get("capability")
     fallback = support.get("fallback")
     blocked_fields: list[str] = []
@@ -214,6 +236,7 @@ def validate_adapter_gate(
     requested_transport: str | None = None,
     argv: Iterable[str] | None = None,
     live_entry: str | None = None,
+    local_state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return gate decision. Unknown or incomplete input is denied.
 
@@ -239,12 +262,15 @@ def validate_adapter_gate(
         }
 
     forbidden = find_forbidden_args(argv, manifest_forbidden_patterns(manifest))
+    readiness_state = _effective_readiness(manifest, local_state)
     allowed, reason, blocked_fields = _role_decision(
-        manifest, role, requested_transport, forbidden
+        manifest, readiness_state, role, requested_transport, forbidden
     )
-    controller_allowed, _, _ = _role_decision(manifest, "controller", None, forbidden)
+    controller_allowed, _, _ = _role_decision(
+        manifest, readiness_state, "controller", None, forbidden
+    )
     worker_allowed, _, _ = _role_decision(
-        manifest, "worker", requested_transport, forbidden
+        manifest, readiness_state, "worker", requested_transport, forbidden
     )
 
     required_probe_ids: list[str] = []

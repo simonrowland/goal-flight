@@ -24,7 +24,7 @@ from goalflight_acp_client import (  # noqa: E402
     AcpProcessPool,
     PoolExhaustedError,
 )
-from goalflight_acp_run import adapter_liveness_config, decide_terminal_state, spawn_and_handshake_with_retry  # noqa: E402
+from goalflight_acp_run import adapter_liveness_config, agent_command, decide_terminal_state, spawn_and_handshake_with_retry  # noqa: E402
 from goalflight_liveness import heartbeat_wedge_decision, progress_stall_decision  # noqa: E402
 
 
@@ -166,6 +166,14 @@ def case_adapter_manifest_liveness_defaults() -> None:
     assert profile == "remote_api"
     assert remote_turn_silence_s == 1200.0
 
+    profile, remote_turn_silence_s = adapter_liveness_config("codex-acp")
+    assert profile == "remote_api"
+    assert remote_turn_silence_s == 1200.0
+
+    profile, remote_turn_silence_s = adapter_liveness_config("cursor-agent")
+    assert profile == "remote_api"
+    assert remote_turn_silence_s == 1200.0
+
     profile, remote_turn_silence_s = adapter_liveness_config("claude")
     assert profile == "remote_api"
     assert remote_turn_silence_s == 1200.0
@@ -173,6 +181,24 @@ def case_adapter_manifest_liveness_defaults() -> None:
     profile, remote_turn_silence_s = adapter_liveness_config("missing-agent")
     assert profile == "local_compute"
     assert remote_turn_silence_s == 1200.0
+
+
+def case_manifest_acp_command_defaults() -> None:
+    binary, args = agent_command("grok")
+    assert Path(binary).name == "grok"
+    assert args == ["agent", "stdio"]
+
+    binary, args = agent_command("cursor")
+    assert Path(binary).name == "cursor-agent"
+    assert args == ["acp"]
+
+    binary, args = agent_command("cursor-agent")
+    assert Path(binary).name == "cursor-agent"
+    assert args == ["acp"]
+
+    binary, args = agent_command("codex-acp")
+    assert binary == "codex-acp"
+    assert args == []
 
 
 def _pid_alive(pid: object) -> bool:
@@ -199,6 +225,37 @@ def _make_fake_agent_wrapper(tmp: Path, scenario: str | None = None) -> Path:
     wrapper.write_text("\n".join(lines) + "\n")
     wrapper.chmod(0o755)
     return wrapper
+
+
+def _write_supported_adapter_manifest(directory: Path, name: str) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / f"{name}.json").write_text(json.dumps({
+        "support": {
+            "controller": {"capability": "supported", "fallback": "worker_only"},
+            "worker": {"capability": "supported", "transport": ["acp"], "fallback": "tail_file"},
+        },
+        "local_readiness_state": {
+            "controller": "probe_required",
+            "worker": "probe_required",
+            "last_probe_ids": ["python-version"],
+        },
+        "live_gate": {"function": "validate_adapter_gate", "default": "deny"},
+        "status_contract": {"terminal_states": ["complete"], "stale_after_s": 60},
+        "permission_surface": {
+            "plugin_sandbox": {},
+            "auto_approve_detection": {"strict_fail": True},
+        },
+        "discovery": {
+            "probes": [{
+                "id": "python-version",
+                "argv": [sys.executable, "--version"],
+                "safe_for_setup": True,
+                "network": False,
+                "model_consuming": False,
+            }],
+        },
+        "invocation": {"exec": {"arg_policy": {"forbidden_args": []}}},
+    }))
 
 
 def _force_kill(pid: object) -> None:
@@ -250,6 +307,8 @@ def _run_fake_runner(
         state_dir = tmp / "state"
         status = tmp / f"{scenario}.status.json"
         wrapper = _make_fake_agent_wrapper(tmp)
+        adapters_dir = tmp / "adapters"
+        _write_supported_adapter_manifest(adapters_dir, wrapper.name)
         env = os.environ.copy()
         env.update(
             {
@@ -257,6 +316,7 @@ def _run_fake_runner(
                 "GOALFLIGHT_FAKE_ACP_SCENARIO": scenario,
                 "GOALFLIGHT_FAKE_ACP_INTERVAL": "0.05",
                 "GOALFLIGHT_ACP_PYTHON": sys.executable,
+                "GOALFLIGHT_ADAPTERS_DIR": str(adapters_dir),
             }
         )
         if extra_env:
@@ -703,6 +763,7 @@ def main() -> None:
     case_permission_timeout_unblocks_wedge()
     case_progress_stall_wall_ignores_raw_vendor_noise()
     case_adapter_manifest_liveness_defaults()
+    case_manifest_acp_command_defaults()
     case_runner_raw_vendor_flood_hits_progress_stall_and_reaps()
     case_runner_progress_then_silent_wedges_and_reaps()
     case_runner_remote_long_reasoning_pause_survives_old_walls()

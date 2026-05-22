@@ -154,8 +154,8 @@ subscription's paid-passthrough budget and burn it fast. Reserve passthrough
 for chunks that specifically need those vendors.
 
 **Discovery, not hardcoding**: cursor ships new models often. Don't paste a
-model name from yesterday's recipe — ask `cursor-agent --list-models` for
-the current set, or read the doctor probe:
+model name from yesterday's recipe — ask `cursor-agent models` for the current
+set, or read the doctor probe:
 
 ```bash
 python3 <skill-root>/scripts/goalflight_doctor.py --project-root "$PWD" --json | \
