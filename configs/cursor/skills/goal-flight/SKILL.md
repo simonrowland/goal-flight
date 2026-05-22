@@ -43,8 +43,10 @@ before mutation. Apply requires explicit approval and writes a machine-local
 backup manifest for rollback.
 
 Cursor setup installs global agent instructions, this personal skill, and the
-Goal Flight rule. Context-mode remains deferred until a verified Cursor hook or
-plugin API exists.
+Goal Flight rule. Context-mode is available for Cursor, but the Goal Flight
+setup installer has not automated Cursor context-mode installation yet. If the
+user wants it, the agent can install context-mode for Cursor explicitly and
+verify it before use.
 
 After setup and Cursor restart, run Goal Flight init in the target project. Init
 runs doctor, capacity checks, worker readiness checks, and writes compact

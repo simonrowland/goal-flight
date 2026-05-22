@@ -28,7 +28,9 @@ surface, cleans any duplicate legacy personal Codex skill when plugin
 registration succeeds, checks the CLI worker surface, and registers
 context-mode MCP when needed. `codex exec` remains the worker path. For Cursor,
 setup installs global agent instructions, a personal skill, and rules;
-context-mode remains deferred until a verified Cursor hook or plugin API exists.
+context-mode is available for Cursor, but the Goal Flight setup installer has
+not automated Cursor context-mode installation yet. If the user wants it, the
+agent can install context-mode for Cursor explicitly and verify it before use.
 
 2. Run doctor:
 
