@@ -55,6 +55,7 @@ package repository; for normal target projects it is skipped as INFO.
   - Grok: Grok Build present, headless flags available.
     - `--prompt-file`
     - `--permission-mode`
+    - `--os-sandbox`
   - Claude compatibility path: CLI/plugin checks pass before Claude-specific
     compatibility examples are used.
 - Check ACP worker adapters for presence/PATH only: `codex-acp`,

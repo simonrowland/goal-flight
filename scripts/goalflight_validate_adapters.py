@@ -395,6 +395,14 @@ def validate_manifest_semantics(
     plugin_sandbox = permission_surface.get("plugin_sandbox", {})
     if plugin_sandbox.get("mode") == "broad" and not plugin_sandbox.get("declared_permissions"):
         errors.append(f"{source}: broad plugin sandbox permissions are undeclared")
+    os_sandbox = permission_surface.get("os_sandbox")
+    if isinstance(os_sandbox, dict):
+        profiles = os_sandbox.get("supported_profiles", [])
+        default_profile = os_sandbox.get("default_profile")
+        if default_profile not in profiles:
+            errors.append(f"{source}: os_sandbox default_profile is not supported")
+        if os_sandbox.get("implementation") == "unsupported" and profiles != ["off"]:
+            errors.append(f"{source}: unsupported os_sandbox must only declare off")
     auto_approve = permission_surface.get("auto_approve_detection", {})
     if auto_approve.get("strict_fail") is not True:
         errors.append(f"{source}: auto-approve/bypass detection must strict_fail")

@@ -11,8 +11,16 @@ python3 <skill-root>/scripts/goalflight_review_job.py \
   --repo "$PWD" \
   --prompt <prompt.md> \
   --output-dir <review-dir> \
-  --timeout-s 1800
+  --timeout-s 1800 \
+  --max-quiet-s 3600
 ```
+
+`--timeout-s` is a soft wall for status visibility, not an automatic kill.
+The runner keeps a review alive past that wall while stdout/final output or
+process-group CPU shows progress. `--max-quiet-s` classifies a quiet, idle
+worker as `inconclusive_timeout`; `--max-total-s` is an optional hard wall.
+Status heartbeats report `stdout_bytes`, `events_seen`, `last_event_kind`,
+`final_detected`, `quiet_for_s`, and process-group CPU.
 
 For a dirty-tree review, start from `prompts/dirty-tree-review.md` and replace
 `<repo-root>` plus the focus bullets. Write the rendered prompt to

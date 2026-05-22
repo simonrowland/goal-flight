@@ -83,6 +83,7 @@
     "browser_ui": {"allowed": true, "user_gate": false, "notes": "Local browser checks only."},
     "memory_writes": {"allowed": false, "backend": "repo_files"},
     "plugin_sandbox": {"mode": "narrow", "declared_permissions": ["workspace files", "explicit tools"]},
+    "os_sandbox": {"supported_profiles": ["off"], "default_profile": "off", "implementation": "unsupported", "notes": "No verified runner OS sandbox profile for this adapter yet."},
     "auto_approve_detection": {"probes": ["claude-args-scan"], "strict_fail": true},
     "secrets": ["ANTHROPIC_API_KEY"],
     "irreversible_ops": ["git reset --hard", "force push", "rm -rf"]

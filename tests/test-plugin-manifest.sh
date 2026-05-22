@@ -87,7 +87,8 @@ for expected in \
   "command -v cursor-agent" \
   "Grok Build" \
   "--prompt-file" \
-  "--permission-mode"
+  "--permission-mode" \
+  "--os-sandbox"
 do
   grep -q -- "$expected" "$DOCTOR" || {
     echo "doctor.md missing expected probe: $expected" >&2

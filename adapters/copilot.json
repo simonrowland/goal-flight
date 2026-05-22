@@ -230,6 +230,12 @@
       "mode": "none",
       "declared_permissions": []
     },
+    "os_sandbox": {
+      "supported_profiles": ["off"],
+      "default_profile": "off",
+      "implementation": "unsupported",
+      "notes": "No verified runner OS sandbox profile for this adapter yet."
+    },
     "auto_approve_detection": {
       "probes": [
         "adapter-forbidden-args-scan"

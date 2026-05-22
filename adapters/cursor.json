@@ -83,6 +83,12 @@
     "browser_ui": {"allowed": true, "user_gate": true, "notes": "Host availability varies."},
     "memory_writes": {"allowed": false, "backend": "repo_files"},
     "plugin_sandbox": {"mode": "narrow", "declared_permissions": ["workspace rules", "agent CLI"]},
+    "os_sandbox": {
+      "supported_profiles": ["off", "read-only", "workspace-write"],
+      "default_profile": "off",
+      "implementation": "runner:sandbox-exec",
+      "notes": "Dispatch-level worker subprocess wrapper; not a cursor-agent flag. Permits temp and Cursor host-state writes while fencing project writes by profile."
+    },
     "auto_approve_detection": {"probes": ["cursor-args-scan"], "strict_fail": true},
     "secrets": ["CURSOR_API_KEY"],
     "irreversible_ops": ["git reset --hard", "force push", "rm -rf"]

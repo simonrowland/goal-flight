@@ -23,7 +23,9 @@ import time
 from typing import Any, Callable, Protocol
 
 import goalflight_acp_permits as permits
+from goalflight_adapter_readiness import validate_os_sandbox_request
 from goalflight_liveness import active_monotonic
+from goalflight_os_sandbox import OS_SANDBOX_OFF, canonical_os_sandbox, prepare_os_sandbox_command
 
 
 log = logging.getLogger("goal-flight.acp_client")
@@ -1062,6 +1064,8 @@ class GoalflightAcpConnection:
     verbose: bool = False
     auto_allow_tools: bool = True
     context_mode: bool = True
+    os_sandbox: str = OS_SANDBOX_OFF
+    os_sandbox_metadata: dict[str, Any] | None = None
     acp_session_id: str | None = None
     cwd: str | None = None
     reusable: bool = True
@@ -1298,14 +1302,22 @@ async def spawn_acp_connection(
     permission_inline_timeout_s: float | None = None,
     permission_user_timeout_s: float | None = None,
     context_mode: bool = True,
+    os_sandbox: str = OS_SANDBOX_OFF,
 ) -> GoalflightAcpConnection:
     require_acp_sdk()
     acp_args = ensure_codex_acp_args(command, acp_args, context_mode=context_mode)
     limit = acp_limit_from_env()
     os.makedirs(cwd, exist_ok=True)
-    proc = await asyncio.create_subprocess_exec(
+    sandboxed = prepare_os_sandbox_command(
         command,
-        *acp_args,
+        acp_args,
+        cwd=cwd,
+        os_sandbox=os_sandbox,
+        agent=agent,
+    )
+    proc = await asyncio.create_subprocess_exec(
+        sandboxed.command,
+        *sandboxed.args,
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -1366,6 +1378,8 @@ async def spawn_acp_connection(
         verbose=verbose,
         auto_allow_tools=auto_allow_tools,
         context_mode=context_mode,
+        os_sandbox=sandboxed.profile,
+        os_sandbox_metadata=sandboxed.metadata(),
         cwd=cwd,
     )
 
@@ -1384,6 +1398,7 @@ class AcpProcessPool:
         permission_inline_timeout_s: float | None = None,
         permission_user_timeout_s: float | None = None,
         context_mode: bool = True,
+        os_sandbox: str = OS_SANDBOX_OFF,
     ) -> None:
         self._config = agents_config
         self._max = max_processes
@@ -1396,6 +1411,7 @@ class AcpProcessPool:
         self._permission_inline_timeout_s = permission_inline_timeout_s
         self._permission_user_timeout_s = permission_user_timeout_s
         self._context_mode = context_mode
+        self._os_sandbox = canonical_os_sandbox(os_sandbox)
         self._connections: dict[tuple[str, str], GoalflightAcpConnection] = {}
 
     def _count_agent(self, agent: str) -> int:
@@ -1407,6 +1423,7 @@ class AcpProcessPool:
         session_id: str,
         cwd: str = "",
         context_mode: bool | None = None,
+        os_sandbox: str | None = None,
     ) -> GoalflightAcpConnection:
         # Per-dispatch context-mode override (defaults to the pool's). A reused
         # connection carries the launch posture it was spawned with, so it can
@@ -1414,6 +1431,7 @@ class AcpProcessPool:
         # (a worker spawned with context-mode enabled can't serve a disabled
         # dispatch, and vice versa).
         effective_context_mode = self._context_mode if context_mode is None else context_mode
+        effective_os_sandbox = self._os_sandbox if os_sandbox is None else canonical_os_sandbox(os_sandbox)
         key = (agent, session_id)
         agent_cfg = self._config.get(agent)
         workdir = cwd or (agent_cfg.get("working_dir", "/tmp") if agent_cfg else "/tmp")
@@ -1423,6 +1441,7 @@ class AcpProcessPool:
             and conn.alive
             and conn.reusable
             and conn.context_mode == effective_context_mode
+            and conn.os_sandbox == effective_os_sandbox
             and _same_dir(conn.cwd, workdir)
         ):
             return conn
@@ -1437,6 +1456,9 @@ class AcpProcessPool:
             raise PoolExhaustedError(f"per-agent limit reached for {agent} ({self._max_per_agent})")
         if not agent_cfg:
             raise AcpError(f"agent not found: {agent}")
+        os_sandbox_gate = validate_os_sandbox_request(agent, effective_os_sandbox)
+        if os_sandbox_gate is not None:
+            raise AcpError(f"os sandbox blocked: {json.dumps(os_sandbox_gate, sort_keys=True)}")
         command = agent_cfg["command"]
         acp_args = agent_cfg.get("acp_args", [agent_cfg.get("acp_arg", "acp")])
         new_conn = await spawn_acp_connection(
@@ -1453,6 +1475,7 @@ class AcpProcessPool:
             permission_inline_timeout_s=self._permission_inline_timeout_s,
             permission_user_timeout_s=self._permission_user_timeout_s,
             context_mode=effective_context_mode,
+            os_sandbox=effective_os_sandbox,
         )
         if is_rebuild:
             new_conn.session_reset = True

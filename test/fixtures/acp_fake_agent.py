@@ -157,6 +157,36 @@ def request_permission(
 
 def handle_prompt(req_id: int, params: dict) -> None:
     session_id = params.get("sessionId", "")
+    if SCENARIO == "sandbox_write_probe":
+        cwd = sessions.get(session_id, {}).get("cwd") or os.getcwd()
+        inside = os.path.join(cwd, "goalflight-sandbox-inside.txt")
+        outside = os.path.join(os.path.expanduser("~"), ".goalflight-sandbox-outside-probe")
+
+        def attempt(path: str) -> tuple[bool, str | None]:
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("probe\n")
+                return True, None
+            except Exception as e:
+                return False, type(e).__name__
+
+        inside_ok, inside_error = attempt(inside)
+        outside_ok, outside_error = attempt(outside)
+        if outside_ok:
+            try:
+                os.unlink(outside)
+            except OSError:
+                pass
+        text_update(
+            session_id,
+            "RESULT: "
+            f"inside_write={str(inside_ok).lower()} "
+            f"outside_write={str(outside_ok).lower()} "
+            f"inside_error={inside_error or 'none'} "
+            f"outside_error={outside_error or 'none'}\n",
+        )
+        response(req_id, {"sessionId": session_id, "stopReason": "end_turn"})
+        return
     if SCENARIO == "overlimit":
         big = {
             "jsonrpc": "2.0",
