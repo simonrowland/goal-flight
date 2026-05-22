@@ -20,6 +20,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import goalflight_acp_run  # noqa: E402
 import goalflight_adapter_readiness  # noqa: E402
+import goalflight_os_sandbox as goalflight_os_sandbox_mod  # noqa: E402
 from goalflight_acp_client import AcpError, AcpProcessPool  # noqa: E402
 from goalflight_os_sandbox import (  # noqa: E402
     OS_SANDBOX_OFF,
@@ -27,6 +28,7 @@ from goalflight_os_sandbox import (  # noqa: E402
     OS_SANDBOX_WORKSPACE_WRITE,
     OsSandboxError,
     canonical_os_sandbox,
+    preflight_os_sandbox,
     prepare_os_sandbox_command,
 )
 
@@ -88,6 +90,27 @@ def case_canonical_profiles() -> None:
         pass
     else:
         raise AssertionError("invalid OS sandbox profile should fail closed")
+
+
+def case_requested_sandbox_fails_closed_on_unsupported_hosts() -> None:
+    old_system = goalflight_os_sandbox_mod.platform.system
+    old_which = goalflight_os_sandbox_mod.shutil.which
+    try:
+        goalflight_os_sandbox_mod.shutil.which = lambda name: "/usr/bin/sandbox-exec"
+        for host in ("Windows", "Linux"):
+            goalflight_os_sandbox_mod.platform.system = lambda host=host: host
+            assert preflight_os_sandbox(OS_SANDBOX_OFF) == OS_SANDBOX_OFF
+            for profile in (OS_SANDBOX_READ_ONLY, OS_SANDBOX_WORKSPACE_WRITE):
+                try:
+                    preflight_os_sandbox(profile)
+                except OsSandboxError as e:
+                    assert "requires macOS sandbox-exec" in str(e), e
+                    assert f"platform={host}" in str(e), e
+                else:
+                    raise AssertionError(f"{host} OS sandbox request should fail closed")
+    finally:
+        goalflight_os_sandbox_mod.platform.system = old_system
+        goalflight_os_sandbox_mod.shutil.which = old_which
 
 
 def case_prepare_wrapper_blocks_home_write() -> None:
@@ -565,6 +588,7 @@ def case_pool_blocks_alias_undeclared_os_sandbox() -> None:
 
 def main() -> None:
     case_canonical_profiles()
+    case_requested_sandbox_fails_closed_on_unsupported_hosts()
     case_prepare_wrapper_blocks_home_write()
     case_profile_string_escapes_workspace_path()
     case_rejects_cwd_under_temp_root()
