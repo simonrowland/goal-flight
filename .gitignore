@@ -8,6 +8,10 @@
 # Private ongoing skill-development notes
 docs-private/
 
+# Local legacy host adapter drafts. Kept out of git to avoid host-name
+# scans changing controller billing behavior.
+legacy-host-adapters/
+
 # Codex per-project trust mirror — written by scripts/install-codex-overrides.sh.
 # Contains absolute paths specific to the local machine; not portable.
 .codex/
@@ -19,4 +23,3 @@ docs-private/
 # Python bytecode (from scripts/acp_*.py + test/test_acp_*.py).
 __pycache__/
 *.pyc
-

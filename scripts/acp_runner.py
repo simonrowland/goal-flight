@@ -35,11 +35,20 @@ class PromptResult:
     error: dict[str, Any] | None = None
     raw_events: list[dict[str, Any]] = field(default_factory=list)
     out_of_scope_writes: list[str] = field(default_factory=list)
-    cancelled_for_marker: bool = False
-    early_marker: str | None = None
     """Paths from tool_call locations that fall outside the connection's cwd.
     Populated by run_prompt post-hoc — a scope-leak audit signal for the
     controller, not a runtime gate. Empty when no leaks OR no recorded cwd."""
+    cancelled_for_marker: bool = False
+    early_marker: str | None = None
+    permission_escalations: list[dict[str, Any]] = field(default_factory=list)
+    """Permission requests the controller's router escalated to the user (the
+    worker asked to cross a boundary it couldn't auto-decide). When non-empty the
+    turn was cancelled (early_marker='USER-CONFIRM'); the controller surfaces
+    these to the user, records a decision, and re-dispatches."""
+    permission_auto_declined: list[dict[str, Any]] = field(default_factory=list)
+    """Inline permissions the controller auto-declined (it did not answer within
+    the inline timeout / IPC failed); the worker was denied and CONTINUED --
+    informational, not a re-dispatch signal (unlike permission_escalations)."""
 
     @property
     def ok(self) -> bool:
@@ -47,6 +56,35 @@ class PromptResult:
 
 
 async def run_prompt(
+    conn: AcpConnection,
+    text: str,
+    *,
+    idle_timeout: float | None = 300,
+    keep_raw: bool = False,
+    on_event: Callable[[dict], Any] | None = None,
+    on_idle: Callable[[], Any] | None = None,
+) -> PromptResult:
+    """Run one prompt on a connection; concurrent reuse of one connection is unsupported."""
+    if getattr(conn.client, "_prompt_in_use", False):
+        raise RuntimeError(
+            "connection already running a prompt "
+            "(concurrent reuse of one ACP connection is unsupported)"
+        )
+    conn.client._prompt_in_use = True
+    try:
+        return await _run_prompt_locked(
+            conn,
+            text,
+            idle_timeout=idle_timeout,
+            keep_raw=keep_raw,
+            on_event=on_event,
+            on_idle=on_idle,
+        )
+    finally:
+        conn.client._prompt_in_use = False
+
+
+async def _run_prompt_locked(
     conn: AcpConnection,
     text: str,
     *,
@@ -76,9 +114,32 @@ async def run_prompt(
     result = PromptResult()
     turn_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
     conn.client.set_turn_queue(turn_queue)
+    # Permission escalations are per-turn: clear any from a prior turn on a reused
+    # (pool) connection so a stale deferral can't re-cancel this one.
+    _escalations = getattr(conn.client, "permission_escalations", None)
+    if _escalations is not None:
+        _escalations.clear()
+    _auto = getattr(conn.client, "permission_auto_declined", None)
+    if _auto is not None:
+        _auto.clear()
     prompt_task = asyncio.create_task(conn.prompt(text))
     last_event_time = active_monotonic()
     timeout_enabled = idle_timeout is not None and idle_timeout > 0
+
+    def _pending_escalations() -> list[dict[str, Any]]:
+        return list(getattr(conn.client, "permission_escalations", None) or [])
+
+    def _copy_permission_auto_declined() -> None:
+        result.permission_auto_declined = list(
+            getattr(conn.client, "permission_auto_declined", None) or []
+        )
+
+    def _inline_holding() -> bool:
+        # True while the inline permission router is holding a request open
+        # awaiting a controller/user decision (permission_mode="inline"). The
+        # worker is intentionally quiet during the hold, not wedged.
+        activity = getattr(getattr(conn, "client", None), "activity", None)
+        return bool(activity is not None and activity.has_inline_holds())
 
     async def _call_on_event(message: dict[str, Any]) -> None:
         if on_event is None:
@@ -143,6 +204,17 @@ async def run_prompt(
 
     try:
         while True:
+            esc = _pending_escalations()
+            if esc and not result.cancelled_for_marker:
+                # The controller's permission router escalated a request to the
+                # user. The ACP request was ALREADY answered (cancel), so the
+                # worker is not held open; stop the turn and surface the deferral
+                # as USER-CONFIRM so the controller can ask the user and
+                # re-dispatch. Liveness-safe: we never hold the permission open.
+                result.permission_escalations = esc
+                await _cancel_prompt("USER-CONFIRM")
+                _copy_permission_auto_declined()
+                return result
             if prompt_task.done():
                 await asyncio.sleep(0)
                 while not turn_queue.empty():
@@ -153,9 +225,18 @@ async def run_prompt(
                     marker = _early_marker()
                     if marker:
                         await _cancel_prompt(marker)
+                        _copy_permission_auto_declined()
                         return result
                 break
             if timeout_enabled and active_monotonic() - last_event_time > float(idle_timeout):
+                if _inline_holding():
+                    # An inline permission is held open awaiting a controller/user
+                    # decision (file IPC). The worker is paused by design, not
+                    # wedged; the handler's own inline timeout bounds the hold.
+                    # Keep waiting WITHOUT consulting the CPU gate (the worker is
+                    # legitimately at ~0% CPU while blocked on the permission).
+                    last_event_time = active_monotonic()
+                    continue
                 keep_waiting = False
                 if on_idle is not None:
                     try:
@@ -174,6 +255,7 @@ async def run_prompt(
                 with contextlib.suppress(asyncio.CancelledError):
                     await prompt_task
                 result.error = {"code": -1, "message": "agent_timeout (idle)"}
+                _copy_permission_auto_declined()
                 return result
             try:
                 event = await asyncio.wait_for(turn_queue.get(), timeout=1.0)
@@ -186,6 +268,7 @@ async def run_prompt(
             marker = _early_marker()
             if marker:
                 await _cancel_prompt(marker)
+                _copy_permission_auto_declined()
                 return result
 
         try:
@@ -198,6 +281,14 @@ async def run_prompt(
                 "code": getattr(e, "code", -1),
                 "message": str(e),
             }
+    except asyncio.CancelledError:
+        conn.reusable = False
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(conn.cancel(), timeout=1.0)
+        prompt_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await prompt_task
+        raise
     finally:
         conn.client.set_turn_queue(None)
     # Post-hoc scope-leak audit (Design 1): scan tool_call locations for paths
@@ -205,6 +296,7 @@ async def run_prompt(
     cwd = getattr(conn, "cwd", None)
     if cwd:
         result.out_of_scope_writes = _scan_out_of_scope_paths(result.tool_calls, cwd)
+    _copy_permission_auto_declined()
     return result
 
 

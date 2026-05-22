@@ -21,7 +21,7 @@ git clone https://github.com/simonrowland/goal-flight.git ~/.claude/skills/goal-
 ## How it differs from the alternatives
 
 - vs. **running one host controller naively** — the controller doesn't itself do the work. It dispatches and verifies, which means it stays small and runs longer before compaction.
-- vs. **claw or cloud agents (Hermes / Cursor agent)** — runs on your machine, in your controller host, with your existing local tools and adapters. The current Claude Code wrapper can use skills such as gstack, context-mode, and codex; other wrappers should declare equivalent host bindings in adapter manifests.
+- vs. **cloud agent swarms or editor agents** — runs on your machine, in your controller host, with your existing local tools and adapters. The current Claude Code wrapper can use skills such as gstack, context-mode, and codex; other wrappers should declare equivalent host bindings in adapter manifests.
 - vs. **writing prompts manually** — make the plan, not the code. The skill asks a frontier model to decompose your plan into chunks, flagging what can run in parallel and what can have a /goal pattern. Every `/goal` reviews to convergence by default; the 7-category adversarial self-review runs inside the loop until reviews pass, so the controller never sees a non-converged result.
 
 ## Quickstart

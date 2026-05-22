@@ -26,8 +26,6 @@ EXPECTED_ADAPTERS = {
     "codex",
     "cursor",
     "grok",
-    "hermes",
-    "openclaw",
     "gemini",
     "qwen",
     "opencode",
@@ -35,7 +33,6 @@ EXPECTED_ADAPTERS = {
     "kiro",
     "copilot",
     "openhands",
-    "pi",
     "amp",
     "antigravity",
 }
@@ -48,7 +45,6 @@ SURVEY_WORKER_STUBS = {
     "kiro",
     "copilot",
     "openhands",
-    "pi",
     "amp",
     "antigravity",
 }

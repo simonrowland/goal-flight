@@ -105,8 +105,8 @@ CODEX_PERMISSION_OPTIONS = [
 
 # The shape codex-acp surfaces when an MCP tool ELICITS (request_user_input)
 # under features.tool_call_mcp_elicitation=true (captured 2026-05-21 from
-# context-mode ctx_index, title "Approve Index Content"): multiple allow_always
-# options + a reject. Auto-allow must pick an allow_always (approve-for-session).
+# context-mode ctx_index, title "Approve Index Content"): allow_once plus multiple
+# allow_always options + a reject. Auto-allow must pick allow_once.
 ELICITATION_PERMISSION_OPTIONS = [
     {"optionId": "approved", "kind": "allow_once", "name": "Approve once"},
     {"optionId": "approved-for-session", "kind": "allow_always", "name": "Approve for session"},
@@ -120,8 +120,20 @@ def request_permission(
     tool_id: str,
     options: list | None = None,
     title: str = "edit file",
+    locations: list | None = None,
+    kind: str | None = None,
 ) -> str:
     request_id = 9001
+    tool_call = {
+        "sessionUpdate": "tool_call",
+        "toolCallId": tool_id,
+        "title": title,
+        "status": "pending",
+    }
+    if locations:
+        tool_call["locations"] = locations
+    if kind:
+        tool_call["kind"] = kind
     send(
         {
             "jsonrpc": "2.0",
@@ -129,12 +141,7 @@ def request_permission(
             "method": "session/request_permission",
             "params": {
                 "sessionId": session_id,
-                "toolCall": {
-                    "sessionUpdate": "tool_call",
-                    "toolCallId": tool_id,
-                    "title": title,
-                    "status": "pending",
-                },
+                "toolCall": tool_call,
                 "options": DEFAULT_PERMISSION_OPTIONS if options is None else options,
             },
         }
@@ -215,7 +222,7 @@ def handle_prompt(req_id: int, params: dict) -> None:
     if SCENARIO == "permission_elicitation":
         # MCP elicitation surfaced as a permission (codex-acp +
         # features.tool_call_mcp_elicitation=true). The worker unblocks only if
-        # the client answers with an allow option (auto-allow picks allow_always).
+        # the client answers with an allow option (auto-allow picks allow_once).
         selected = request_permission(
             session_id, "perm-elicit",
             options=ELICITATION_PERMISSION_OPTIONS, title="Approve Index Content",
@@ -234,6 +241,46 @@ def handle_prompt(req_id: int, params: dict) -> None:
         text_update(session_id, f"permission:{selected or 'cancelled'}")
         response(req_id, {"sessionId": session_id, "stopReason": "end_turn"})
         return
+    if SCENARIO == "permission_inline":
+        # Boundary-crossing request (target OUTSIDE cwd) so the router ESCALATES.
+        # Under permission_mode="inline" the controller HOLDS the request open and
+        # answers it in place (allow option_id, or cancel on deny/timeout). Unlike
+        # 'permission_escalate' we then COMPLETE the turn, so the test can observe
+        # what the worker received: 'permission:<optionId>' on allow, or
+        # 'permission:cancelled' on deny.
+        selected = request_permission(
+            session_id, "perm-inline",
+            options=CODEX_PERMISSION_OPTIONS, title="Edit /etc/hosts",
+            locations=[{"path": "/etc/hosts"}],  # outside the worker cwd
+        )
+        text_update(session_id, f"permission:{selected or 'cancelled'}")
+        response(req_id, {"sessionId": session_id, "stopReason": "end_turn"})
+        return
+    if SCENARIO in ("permission_escalate", "permission_fetch"):
+        # The controller's permission ROUTER escalates a boundary-crossing
+        # request: it answers the ACP request with a cancel, then the runner
+        # cancels the whole turn. Model that by sending the request and WAITING
+        # for the cancel (like 'blocked') rather than ending, so the runner can
+        # detect + surface the escalation.
+        if SCENARIO == "permission_escalate":
+            request_permission(
+                session_id, "perm-esc",
+                options=CODEX_PERMISSION_OPTIONS, title="Edit /etc/hosts",
+                locations=[{"path": "/etc/hosts"}],  # outside the worker cwd
+            )
+        else:
+            request_permission(
+                session_id, "perm-fetch",
+                options=CODEX_PERMISSION_OPTIONS, title="Fetch https://example.com",
+                kind="fetch",  # ToolKind 'fetch' == network access
+            )
+        while True:
+            message = read_message()
+            if message is None:
+                return
+            if message.get("method") == "session/cancel":
+                return
+            time.sleep(0.01)
     if SCENARIO == "tool_tracking":
         tool_update(session_id, "tool_call", "tool-1", status="pending")
         tool_update(session_id, "tool_call_update", "tool-1", status="completed")

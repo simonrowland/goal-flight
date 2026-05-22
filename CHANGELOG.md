@@ -1571,8 +1571,8 @@ Frontier-model composition guarantee: the skill no longer carries worked example
   `[controller-direct]` alongside `[parallel-safe:<group>]` and `[milestone]`.
 - **Agent roles framing made explicit in init step 1.** Codex is a
   dispatch target (executor / reviewer) — never expected to invoke
-  `/goal-flight <sub>` itself. Controller is Claude Code today; Hermes
-  is the future candidate. The clarification removes a footgun around
+  `/goal-flight <sub>` itself. Controller is Claude Code today; other
+  controller wrappers can be added later. The clarification removes a footgun around
   `\goal` (in-prompt text marker, backslash) vs `/goal-flight goal
   <SLUG>` (slash command, controller-side queue helper) — there is no
   `/goal` codex command in v0.130.0 or any current marketplace.

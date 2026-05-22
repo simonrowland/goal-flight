@@ -233,8 +233,8 @@ for the learned-thresholds work:
   controller ends the user's workday — the cost asymmetry justifies the
   caution asymmetry.
 
-If goal-flight is hosted by a non-Claude controller (e.g., a hypothetical
-hermes or codex-native port), the same asymmetric treatment applies to
+If goal-flight is hosted by a non-Claude controller (e.g., a codex-native
+or editor-native port), the same asymmetric treatment applies to
 whichever provider the controller runs on.
 
 **Adaptive walkback**: `scripts/goalflight_rate_pressure.py` reads the
