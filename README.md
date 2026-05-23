@@ -27,7 +27,7 @@ Hand it an ambitious project. It fans out `/goal` prompts to CLI coding agents (
 - **Parallel cross-agent reviews at milestone cadence.** Two independent reviewers (for example Claude + codex) address bugs and completion before pestering you. Via [gstack](https://github.com/garrytan/gstack)'s `/review` skill when installed.
 - **/goal native.** the controller picks from per chunk. **Iteration pattern** (one-shot for most chunks, goal-mode loop for chunks that need plan/act/test/review-to-convergence, controller-direct for trivial work)
 - **Token Management.** Throw tokens at your problem for better code and less babysitting, but divide the usage and rate-limits between multiple agent vendors, task-by-task.
-- **Fancy Monitoring.** ACP for structured events from claude-cli, cursor, codex, grok. Uses bash-tail as fallback and to support generic agents.
+- **Fancy Monitoring.** ACP for structured events from claude-cli, cursor, codex, grok. Uses bash-tail as fallback and to support generic agents. Controller handles worker notifications, and can escalate messages to the user.
 - **Rate-limit walkback.** `goalflight_rate_pressure.py` watches the dispatch ledger for provider-level rate-limit signatures and surfaces a STATUS marker + recommended fallback when pressure crosses threshold. It tracks how many workers are on your machine to be mindful of capacity limits.
 - **Procedural runtime state.** Capacity, dispatch ledgers, compact status, log watching, doctor checks, ACP runs, rate-pressure detection, and file-backed review jobs live under `scripts/goalflight_*.py`. The doctor checks for cli-agent updates, so you can run the worker update command.
 
