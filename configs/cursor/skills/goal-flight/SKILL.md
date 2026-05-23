@@ -34,19 +34,25 @@ project-local state and execution readiness.
 From the cloned Goal Flight repository, run:
 
 ```shell
-./setup.sh --agent cursor
-./setup.sh --apply --yes --agent cursor
+./setup.sh --cursor
+./setup.sh --apply --yes --cursor
+
+# Optional project-local install for one repository:
+./setup.sh --apply --yes --cursor-project /path/to/project
 ```
 
 Dry-run output must show every planned copy, merge, link, or registration
 before mutation. Apply requires explicit approval and writes a machine-local
 backup manifest for rollback.
 
-Cursor setup installs global agent instructions, this personal skill, and the
-Goal Flight rule. Context-mode is available for Cursor, but the Goal Flight
-setup installer has not automated Cursor context-mode installation yet. If the
-user wants it, the agent can install context-mode for Cursor explicitly and
-verify it before use.
+Cursor setup installs global agent instructions, this personal skill, the Goal
+Flight rule, and a Cursor MCP entry for context-mode. Project-local setup writes
+the same wrapper under `.cursor/` in the target repository. Use
+`--cursor-agents-standard` for the shared `~/.agents/skills/` location, or
+`--cursor-link-claude` to symlink Cursor's skill directory to an existing Claude
+skill checkout. If `cursor-agent mcp list` says context-mode needs approval,
+run `cursor-agent mcp enable context-mode`, then verify with
+`cursor-agent mcp list-tools context-mode`.
 
 After setup and Cursor restart, run Goal Flight init in the target project. Init
 runs doctor, capacity checks, worker readiness checks, and writes compact

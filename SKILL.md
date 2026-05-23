@@ -1,7 +1,18 @@
 ---
 name: goal-flight
 version: 0.4.9
-description: "Claude-compatible wrapper for portable goal-flight core — long-running unattended controller for chunked code work"
+description: "Portable Goal Flight controller workflow for planning, dispatching, reviewing, recovering, and resuming long-running repository work from file-backed state."
+tags:
+  - orchestration
+  - controller
+  - dispatch
+  - review
+  - handoff
+paths:
+  commands: commands/
+  protocols: protocols/
+  scripts: scripts/
+  adapters: adapters/
 allowed-tools:
   - Bash
   - Read

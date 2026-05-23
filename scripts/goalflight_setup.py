@@ -32,6 +32,7 @@ BACKUP_SCHEMA = "goalflight.setup-backup.v1"
 MERGE_START = "# >>> goal-flight"
 MERGE_END = "# <<< goal-flight"
 SETUP_ALLOWED_GATE_REASONS = {"allowed", "candidate", "config_only", "not_installed", "probe_required", "unsupported"}
+TARGET_PROJECT_TOKEN = "${GOALFLIGHT_TARGET_PROJECT}"
 
 
 class SetupError(RuntimeError): pass
@@ -49,7 +50,11 @@ def _now_slug() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
 
 
-def _expand_target(raw: str) -> Path:
+def _expand_target(raw: str, target_project: Path | None = None) -> Path:
+    if TARGET_PROJECT_TOKEN in raw:
+        if target_project is None:
+            raise SetupError(f"target path requires --target-project: {raw}")
+        raw = raw.replace(TARGET_PROJECT_TOKEN, str(target_project))
     return Path(os.path.expandvars(os.path.expanduser(raw)))
 
 
@@ -222,6 +227,64 @@ def _run_codex_context_mode_registration(repo_root: Path, *, dry_run: bool) -> N
     print(f"BOOTSTRAP {_format_command(apply_argv)}")
 
 
+def _run_cursor_context_mode_registration(
+    repo_root: Path,
+    *,
+    dry_run: bool,
+    target_project: Path,
+    destination_ids: set[str] | None,
+    backups_root: Path | None = None,
+    backup_manifest: Path | None = None,
+    agent: str = "cursor",
+    existing_records: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    script = repo_root / "scripts" / "register-context-mode-cursor.py"
+    if not script.exists():
+        raise SetupError(f"cursor context-mode registration script missing: {script}")
+
+    selected = destination_ids or set()
+    global_destinations = {
+        "cursor-desktop-controller",
+        "cursor-agents-standard-controller",
+        "cursor-claude-link-controller",
+        "cursor-cli-worker",
+    }
+    scopes: list[str] = []
+    if not selected or selected.intersection(global_destinations):
+        scopes.append("global")
+    if "cursor-project-controller" in selected:
+        scopes.append("project")
+
+    records: list[dict[str, Any]] = []
+    for scope in scopes:
+        argv = [sys.executable, str(script), "--scope", scope, "--project-root", str(target_project)]
+        if dry_run:
+            print(f"BOOTSTRAP {_format_command(argv + ['--check'])}")
+            print(f"BOOTSTRAP {_format_command(argv)}")
+            continue
+        argv.append("--no-sidecar-backup")
+        if backups_root is not None:
+            target = Path.home() / ".cursor/mcp.json"
+            if scope == "project":
+                target = target_project / ".cursor/mcp.json"
+            record = _record_backup(
+                {"kind": "merge_config", "target": str(target), "rollback": "restore_backup"},
+                target,
+                backups_root,
+            )
+            records.append(record)
+            if backup_manifest is not None and existing_records is not None:
+                _write_backup_manifest(backup_manifest, agent, existing_records + records)
+        result = subprocess.run(argv, text=True, capture_output=True, check=False)
+        if result.returncode != 0:
+            raise SetupError(
+                "cursor context-mode registration failed: "
+                f"{_format_command(argv)}\n{result.stderr.strip() or result.stdout.strip()}"
+            )
+        print(f"BOOTSTRAP {_format_command(argv)}")
+    return records
+
+
 def _check_codex_cli_worker_surface(*, dry_run: bool) -> None:
     commands = [
         ["codex", "--version"],
@@ -243,17 +306,41 @@ def _check_codex_cli_worker_surface(*, dry_run: bool) -> None:
         print(f"WORKER_CHECK {_format_command(argv)} status=ok detail={detail[:120]}")
 
 
+def _check_cursor_cli_worker_surface(*, dry_run: bool) -> None:
+    command = "cursor-agent --version"
+    if dry_run:
+        print(f"WORKER_CHECK {command}")
+        return
+    path = shutil.which("cursor-agent") or str(Path.home() / ".local/bin/cursor-agent")
+    if not Path(path).exists() and shutil.which("cursor-agent") is None:
+        raise SetupError("cursor-agent worker check failed: cursor-agent not found")
+    result = subprocess.run([path, "--version"], text=True, capture_output=True, check=False)
+    if result.returncode != 0:
+        raise SetupError(
+            "cursor-agent worker check failed: "
+            f"{path} --version\n{result.stderr.strip() or result.stdout.strip()}"
+        )
+    first_line = (result.stdout or result.stderr).strip().splitlines()
+    detail = first_line[0] if first_line else "ok"
+    print(f"WORKER_CHECK cursor-agent --version status=ok detail={detail[:120]}")
+
+
 def _run_host_bootstrap(
     repo_root: Path,
     agent: str,
     *,
     dry_run: bool,
+    target_project: Path,
     destination_ids: set[str] | None = None,
     addon_ids: set[str] | None = None,
-) -> None:
+    backups_root: Path | None = None,
+    backup_manifest: Path | None = None,
+    existing_records: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     manifest = _load_manifest(repo_root, agent)
     selected = destination_ids or _agent_default_destinations(repo_root, agent)
     destinations = _selected_destinations(manifest, selected)
+    records: list[dict[str, Any]] = []
     for destination in destinations:
         role = destination.get("role")
         surface = destination.get("surface")
@@ -265,7 +352,7 @@ def _run_host_bootstrap(
             if agent == "codex" and destination["id"] == "codex-cli-worker":
                 _check_codex_cli_worker_surface(dry_run=dry_run)
             elif agent == "cursor" and destination["id"] == "cursor-cli-worker":
-                print("WORKER_CHECK cursor-agent --version")
+                _check_cursor_cli_worker_surface(dry_run=dry_run)
             else:
                 commands = destination.get("commands", [])
                 detail = commands[0] if commands else destination["id"]
@@ -278,6 +365,19 @@ def _run_host_bootstrap(
         mode = addon.get("install_mode")
         if mode == "setup" and agent == "codex" and addon.get("id") == "context-mode":
             _run_codex_context_mode_registration(repo_root, dry_run=dry_run)
+        elif mode == "setup" and agent == "cursor" and addon.get("id") == "context-mode":
+            records.extend(
+                _run_cursor_context_mode_registration(
+                    repo_root,
+                    dry_run=dry_run,
+                    target_project=target_project,
+                    destination_ids=selected,
+                    backups_root=None if dry_run else backups_root,
+                    backup_manifest=None if dry_run else backup_manifest,
+                    agent=agent,
+                    existing_records=existing_records,
+                )
+            )
         elif mode == "deferred":
             print(f"ADDON_DEFERRED {agent} {addon['id']} reason=plugin_or_hook_api_unverified")
         elif mode == "init_self_check":
@@ -287,9 +387,10 @@ def _run_host_bootstrap(
         if agent == "codex":
             print("RESTART_REQUIRED codex reload plugin and skill registries")
         elif agent == "cursor":
-            print("RESTART_REQUIRED cursor reload global instructions and skills")
+            print("RESTART_REQUIRED cursor reload instructions and skills")
         else:
             print(f"RESTART_REQUIRED {agent} reload host instructions")
+    return records
 
 
 def _safe_discovery_summary(manifest: dict[str, Any]) -> list[str]:
@@ -647,6 +748,7 @@ def _run_selection(
     *,
     apply: bool,
     yes: bool,
+    target_project: Path,
 ) -> None:
     plan = _build_selection_plan(manifests, destination_ids, addon_ids)
     if apply:
@@ -664,14 +766,22 @@ def _run_selection(
                 yes,
                 item.destination_ids,
                 item.addon_ids,
+                target_project=target_project,
                 gate_checked=True,
             )
         else:
-            _dry_run(repo_root, item.agent, item.manifest, item.destination_ids, item.addon_ids)
+            _dry_run(
+                repo_root,
+                item.agent,
+                item.manifest,
+                item.destination_ids,
+                item.addon_ids,
+                target_project=target_project,
+            )
 
 
 def _source_path(repo_root: Path, action: dict[str, Any]) -> Path:
-    source = Path(action["source"])
+    source = Path(os.path.expandvars(os.path.expanduser(action["source"])))
     if not source.is_absolute():
         source = repo_root / source
     return source
@@ -742,9 +852,15 @@ def _record_backup(action: dict[str, Any], target: Path, backups_root: Path) -> 
     }
 
 
-def _apply_action(repo_root: Path, agent: str, action: dict[str, Any], backups_root: Path) -> dict[str, Any]:
+def _apply_action(
+    repo_root: Path,
+    agent: str,
+    action: dict[str, Any],
+    backups_root: Path,
+    target_project: Path,
+) -> dict[str, Any]:
     source = _source_path(repo_root, action)
-    target = _expand_target(action["target"])
+    target = _expand_target(action["target"], target_project)
 
     record = _record_backup(action, target, backups_root)
     kind = action["kind"]
@@ -762,7 +878,10 @@ def _apply_action(repo_root: Path, agent: str, action: dict[str, Any], backups_r
     elif kind == "link":
         target.parent.mkdir(parents=True, exist_ok=True)
         if target.exists() or target.is_symlink():
-            target.unlink()
+            if target.is_dir() and not target.is_symlink():
+                shutil.rmtree(target)
+            else:
+                target.unlink()
         target.symlink_to(source)
     else:
         raise SetupError(f"unsupported setup action kind: {kind}")
@@ -846,6 +965,8 @@ def _dry_run(
     manifest: dict[str, Any],
     destination_ids: set[str] | None = None,
     addon_ids: set[str] | None = None,
+    *,
+    target_project: Path,
 ) -> None:
     print(f"DRY-RUN setup agent={agent}")
     if destination_ids:
@@ -860,7 +981,7 @@ def _dry_run(
     actions = _selected_actions(manifest, destination_ids)
     for action in actions:
         source = _source_path(repo_root, action)
-        target = _expand_target(action["target"])
+        target = _expand_target(action["target"], target_project)
         print(
             "ACTION "
             f"{action['kind']} source={source} target={target} "
@@ -877,6 +998,7 @@ def _dry_run(
         repo_root,
         agent,
         dry_run=True,
+        target_project=target_project,
         destination_ids=destination_ids,
         addon_ids=addon_ids,
     )
@@ -896,6 +1018,7 @@ def _apply(
     destination_ids: set[str] | None = None,
     addon_ids: set[str] | None = None,
     *,
+    target_project: Path,
     gate_checked: bool = False,
 ) -> None:
     if not yes:
@@ -907,20 +1030,27 @@ def _apply(
     backups_root = backup_manifest.with_suffix("")
     records: list[dict[str, Any]] = []
     for action in actions:
-        records.append(_apply_action(repo_root, agent, action, backups_root))
+        records.append(_apply_action(repo_root, agent, action, backups_root, target_project))
         _write_backup_manifest(backup_manifest, agent, records)
     if agent == "codex" and _codex_legacy_personal_skill_cleanup_needed(actions):
         cleanup_record = _cleanup_codex_legacy_personal_skill(backups_root)
         if cleanup_record:
             records.append(cleanup_record)
             _write_backup_manifest(backup_manifest, agent, records)
-    _run_host_bootstrap(
+    bootstrap_records = _run_host_bootstrap(
         repo_root,
         agent,
         dry_run=False,
+        target_project=target_project,
         destination_ids=destination_ids,
         addon_ids=addon_ids,
+        backups_root=backups_root,
+        backup_manifest=backup_manifest,
+        existing_records=records,
     )
+    if bootstrap_records:
+        records.extend(bootstrap_records)
+        _write_backup_manifest(backup_manifest, agent, records)
     if not backup_manifest.exists():
         _write_backup_manifest(backup_manifest, agent, records)
     if not records:
@@ -933,11 +1063,30 @@ def _apply(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Goal Flight setup registrar")
     parser.add_argument("--agent", help="adapter id, e.g. codex or cursor")
+    parser.add_argument("--cursor", action="store_true", help="shortcut for the default Cursor controller/worker setup")
+    parser.add_argument(
+        "--cursor-project",
+        nargs="?",
+        const=".",
+        metavar="PATH",
+        help="install Cursor project-local wrappers under PATH/.cursor",
+    )
+    parser.add_argument(
+        "--cursor-agents-standard",
+        action="store_true",
+        help="install the Cursor wrapper under ~/.agents/skills/goal-flight",
+    )
+    parser.add_argument(
+        "--cursor-link-claude",
+        action="store_true",
+        help="symlink the Cursor skill directory to an existing Claude skill checkout",
+    )
     parser.add_argument("--list-agents", action="store_true", help="show installed controller/worker destinations")
     parser.add_argument("--tui", action="store_true", help="prompt for controller, worker, and add-on destinations")
     parser.add_argument("--controllers", help="comma-separated controller destination ids")
     parser.add_argument("--workers", help="comma-separated worker destination ids")
     parser.add_argument("--addons", help="comma-separated add-on ids")
+    parser.add_argument("--target-project", default=".", help="target project for project-local install destinations")
     parser.add_argument("--apply", action="store_true", help="perform approved writes")
     parser.add_argument("--yes", action="store_true", help="confirm writes for --apply")
     parser.add_argument("--uninstall", action="store_true", help="rollback using --from-manifest")
@@ -947,6 +1096,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         repo_root = Path(args.repo_root).resolve()
+        target_project = Path(args.cursor_project or args.target_project).expanduser().resolve()
         manifests = _load_manifests(repo_root)
         if args.uninstall:
             if not args.from_manifest:
@@ -958,13 +1108,56 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.tui or (not args.agent and not args.controllers and not args.workers and sys.stdin.isatty()):
             controllers, workers, addons = _interactive_selection(manifests)
-            _run_selection(repo_root, manifests, controllers | workers, addons, apply=args.apply, yes=args.yes)
+            _run_selection(
+                repo_root,
+                manifests,
+                controllers | workers,
+                addons,
+                apply=args.apply,
+                yes=args.yes,
+                target_project=target_project,
+            )
+            return 0
+        if args.cursor or args.cursor_project or args.cursor_agents_standard or args.cursor_link_claude:
+            destinations = set()
+            if args.cursor:
+                destinations.add("cursor-desktop-controller")
+                defaults = _agent_default_destinations(repo_root, "cursor")
+                if "cursor-cli-worker" in defaults:
+                    destinations.add("cursor-cli-worker")
+            if args.cursor_project:
+                destinations.add("cursor-project-controller")
+            if args.cursor_agents_standard:
+                destinations.add("cursor-agents-standard-controller")
+            if args.cursor_link_claude:
+                destinations.add("cursor-claude-link-controller")
+            if not destinations:
+                destinations.update(_agent_default_destinations(repo_root, "cursor"))
+            addons = _parse_optional_csv(args.addons)
+            _validate_requested_addons(manifests, addons)
+            _run_selection(
+                repo_root,
+                manifests,
+                destinations,
+                addons,
+                apply=args.apply,
+                yes=args.yes,
+                target_project=target_project,
+            )
             return 0
         if args.controllers or args.workers:
             controllers = _parse_csv(args.controllers)
             workers = _parse_csv(args.workers)
             addons = _parse_optional_csv(args.addons)
-            _run_selection(repo_root, manifests, controllers | workers, addons, apply=args.apply, yes=args.yes)
+            _run_selection(
+                repo_root,
+                manifests,
+                controllers | workers,
+                addons,
+                apply=args.apply,
+                yes=args.yes,
+                target_project=target_project,
+            )
             return 0
         if not args.agent:
             _list_agents(repo_root, manifests)
@@ -979,9 +1172,17 @@ def main(argv: list[str] | None = None) -> int:
         addons = _parse_optional_csv(args.addons)
         _validate_requested_addons(manifests, addons)
         if args.apply:
-            _apply(repo_root, args.agent, manifest, args.yes, destinations, addons)
+            _apply(
+                repo_root,
+                args.agent,
+                manifest,
+                args.yes,
+                destinations,
+                addons,
+                target_project=target_project,
+            )
         else:
-            _dry_run(repo_root, args.agent, manifest, destinations, addons)
+            _dry_run(repo_root, args.agent, manifest, destinations, addons, target_project=target_project)
         return 0
     except SetupError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

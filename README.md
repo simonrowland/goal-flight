@@ -9,6 +9,64 @@ goal-flight is a multi-agent controller, which delegates coding /goal and parall
 git clone https://github.com/simonrowland/goal-flight.git ~/.claude/skills/goal-flight
 ```
 
+## Install in Cursor
+
+Clone Goal Flight once, then run setup from that clone. `install.sh` is a thin
+alias for `setup.sh`. Setup is dry-run first; add `--apply --yes` only after the
+planned writes look right.
+
+```bash
+git clone https://github.com/simonrowland/goal-flight.git ~/Repos/goal-flight
+cd ~/Repos/goal-flight
+
+# Global Cursor install: ~/.cursor/AGENTS.md, ~/.cursor/skills/, ~/.cursor/rules/,
+# and ~/.cursor/mcp.json for context-mode.
+./setup.sh --cursor
+./setup.sh --apply --yes --cursor
+
+# Per-project install: <project>/.cursor/AGENTS.md, .cursor/skills/, .cursor/rules/,
+# and <project>/.cursor/mcp.json when context-mode is selected.
+./setup.sh --cursor-project /path/to/project
+./setup.sh --apply --yes --cursor-project /path/to/project
+
+# Standard agents skill location.
+./setup.sh --apply --yes --cursor-agents-standard
+
+# Link Cursor to an existing Claude skill checkout instead of copying.
+./setup.sh --apply --yes --cursor-link-claude --addons ''
+```
+
+Cursor MCP config uses JSON, not Claude or Codex settings. Cursor's CLI and
+editor use the same MCP configuration and discover project/global `mcp.json`
+files ([Cursor docs](https://docs.cursor.com/cli/mcp)). The global file is
+`~/.cursor/mcp.json`; a project-specific file is `<project>/.cursor/mcp.json`.
+Goal Flight writes this context-mode entry, resolving `npx` to an executable
+absolute path on the machine:
+
+```json
+{
+  "mcpServers": {
+    "context-mode": {
+      "command": "/absolute/path/to/npx",
+      "args": ["-y", "context-mode@latest"]
+    }
+  }
+}
+```
+
+After install, restart Cursor and verify discovery:
+
+```bash
+cursor-agent mcp list
+cursor-agent mcp enable context-mode    # if list says the server needs approval
+cursor-agent mcp list-tools context-mode
+python3 ~/Repos/goal-flight/scripts/goalflight_doctor.py --project-root /path/to/project
+```
+
+If Cursor does not auto-load the skill, mention `goal-flight` in the agent chat;
+the wrapper tells Cursor to read the project `AGENTS.md`, root `SKILL.md`, and
+invoked `commands/*.md` files.
+
 ## What it gets you
 
 - **Multi-hour unattended runs.** Check in periodically or respond to decision notifications. The controller's context primarily holds architecture, plan, and metadata (queue state, recent commits, in-flight dispatch headers); real work happens in subagent context windows.

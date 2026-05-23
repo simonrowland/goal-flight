@@ -36,6 +36,9 @@ From the cloned Goal Flight repository, run:
 ```shell
 ./setup.sh --agent codex
 ./setup.sh --apply --yes --agent codex
+
+./setup.sh --cursor
+./setup.sh --apply --yes --cursor
 ```
 
 Dry-run output must show every planned copy, merge, link, or registration
@@ -45,10 +48,11 @@ backup manifest for rollback.
 For Codex, setup registers the desktop-facing plugin and checks the CLI worker
 surface. Codex Desktop is the likely controller; `codex exec` remains the worker
 path. Setup also registers the context-mode MCP server when needed. For Cursor,
-setup installs global agent instructions, a personal skill, and rules;
-context-mode is available for Cursor, but the Goal Flight setup installer has
-not automated Cursor context-mode installation yet. If the user wants it, the
-agent can install context-mode for Cursor explicitly and verify it before use.
+setup installs global agent instructions, a personal skill, rules, and Cursor
+MCP config for context-mode. Use `--cursor-project <project>` for per-project
+`.cursor/` wrappers, `--cursor-agents-standard` for `~/.agents/skills/`, or
+`--cursor-link-claude --addons ''` to symlink Cursor to an existing Claude skill
+checkout.
 
 Codex plugin autocomplete lists skills, not nested subcommands. Use
 `goal-flight-doctor` and `goal-flight-init` when you want command-shaped

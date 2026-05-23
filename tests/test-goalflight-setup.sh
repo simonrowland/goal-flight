@@ -73,10 +73,68 @@ printf '%s\n' "$cursor_dry" | grep -q 'DRY-RUN setup agent=cursor' || fail "curs
 printf '%s\n' "$cursor_dry" | grep -q '.cursor/AGENTS.md' || fail "cursor global AGENTS action missing"
 printf '%s\n' "$cursor_dry" | grep -q '.cursor/skills/goal-flight/SKILL.md' || fail "cursor personal skill action missing"
 printf '%s\n' "$cursor_dry" | grep -q 'goal-flight.mdc' || fail "cursor rule action missing"
+printf '%s\n' "$cursor_dry" | grep -q 'register-context-mode-cursor.py --scope global' || fail "cursor context-mode MCP registration missing"
 printf '%s\n' "$cursor_dry" | grep -q 'PLUGIN skip supported=false' || fail "cursor plugin must stay skipped"
 [ ! -e "$HOME/.cursor/rules/goal-flight.mdc" ] || fail "dry-run mutated cursor rules"
 [ ! -e "$HOME/.cursor/AGENTS.md" ] || fail "dry-run mutated cursor AGENTS"
 [ ! -e "$HOME/.cursor/skills/goal-flight/SKILL.md" ] || fail "dry-run mutated cursor skill"
+[ ! -e "$HOME/.cursor/mcp.json" ] || fail "dry-run mutated cursor MCP config"
+
+cursor_alias_dry="$(run_setup --cursor --addons '')"
+printf '%s\n' "$cursor_alias_dry" | grep -q 'DRY-RUN setup agent=cursor' || fail "cursor shortcut did not select cursor setup"
+printf '%s\n' "$cursor_alias_dry" | grep -q 'DESTINATIONS selected=.*cursor-desktop-controller' || fail "cursor shortcut should always select desktop controller wrapper"
+install_alias_dry="$(bash "$REPO_ROOT/install.sh" --cursor --addons '')"
+printf '%s\n' "$install_alias_dry" | grep -q 'DRY-RUN setup agent=cursor' || fail "install.sh cursor alias did not select cursor setup"
+
+CURSOR_PROJECT="$TMP_ROOT/cursor-project"
+mkdir -p "$CURSOR_PROJECT"
+CURSOR_PROJECT="$(cd "$CURSOR_PROJECT" && pwd -P)"
+cursor_project_dry="$(run_setup --cursor-project "$CURSOR_PROJECT" --addons '')"
+printf '%s\n' "$cursor_project_dry" | grep -q "$CURSOR_PROJECT/.cursor/skills/goal-flight/SKILL.md" || fail "cursor project skill action missing"
+printf '%s\n' "$cursor_project_dry" | grep -q "$CURSOR_PROJECT/.cursor/rules/goal-flight.mdc" || fail "cursor project rule action missing"
+cursor_project_apply="$(run_setup --apply --yes --cursor-project "$CURSOR_PROJECT" --addons '')"
+cursor_project_manifest="$(printf '%s\n' "$cursor_project_apply" | awk '/^BACKUP_MANIFEST /{print $2}')"
+[ -f "$CURSOR_PROJECT/.cursor/skills/goal-flight/SKILL.md" ] || fail "cursor project skill not installed"
+[ -f "$CURSOR_PROJECT/.cursor/AGENTS.md" ] || fail "cursor project AGENTS not installed"
+[ -f "$CURSOR_PROJECT/.cursor/rules/goal-flight.mdc" ] || fail "cursor project rule not installed"
+run_setup --uninstall --from-manifest "$cursor_project_manifest" >/tmp/goal-flight-setup-cursor-project-uninstall.out
+[ ! -e "$CURSOR_PROJECT/.cursor/skills/goal-flight/SKILL.md" ] || fail "cursor project uninstall left skill"
+[ ! -e "$CURSOR_PROJECT/.cursor/AGENTS.md" ] || fail "cursor project uninstall left AGENTS"
+[ ! -e "$CURSOR_PROJECT/.cursor/rules/goal-flight.mdc" ] || fail "cursor project uninstall left rule"
+
+CURSOR_PROJECT_MCP="$TMP_ROOT/cursor-project-mcp"
+mkdir -p "$CURSOR_PROJECT_MCP"
+CURSOR_PROJECT_MCP="$(cd "$CURSOR_PROJECT_MCP" && pwd -P)"
+cursor_project_mcp_apply="$(run_setup --apply --yes --cursor-project "$CURSOR_PROJECT_MCP")"
+cursor_project_mcp_manifest="$(printf '%s\n' "$cursor_project_mcp_apply" | awk '/^BACKUP_MANIFEST /{print $2}')"
+[ -f "$CURSOR_PROJECT_MCP/.cursor/mcp.json" ] || fail "cursor project MCP config not registered"
+grep -q 'context-mode' "$CURSOR_PROJECT_MCP/.cursor/mcp.json" || fail "cursor project MCP content missing"
+[ ! -e "$HOME/.cursor/mcp.json" ] || fail "cursor project-only setup should not write global MCP config"
+run_setup --uninstall --from-manifest "$cursor_project_mcp_manifest" >/tmp/goal-flight-setup-cursor-project-mcp-uninstall.out
+[ ! -e "$CURSOR_PROJECT_MCP/.cursor/mcp.json" ] || fail "cursor project MCP uninstall left config"
+
+cursor_agents_apply="$(run_setup --apply --yes --cursor-agents-standard --addons '')"
+cursor_agents_manifest="$(printf '%s\n' "$cursor_agents_apply" | awk '/^BACKUP_MANIFEST /{print $2}')"
+[ -f "$HOME/.agents/skills/goal-flight/SKILL.md" ] || fail "standard agents skill not installed"
+run_setup --uninstall --from-manifest "$cursor_agents_manifest" >/tmp/goal-flight-setup-cursor-agents-uninstall.out
+[ ! -e "$HOME/.agents/skills/goal-flight/SKILL.md" ] || fail "standard agents uninstall left skill"
+
+if run_setup --apply --yes --cursor-link-claude --addons '' >/tmp/goal-flight-setup-cursor-link-missing.out 2>&1; then
+  fail "cursor link should fail when Claude skill source is missing"
+fi
+grep -q 'setup source missing' /tmp/goal-flight-setup-cursor-link-missing.out || fail "missing Claude link source reason missing"
+
+mkdir -p "$HOME/.claude/skills/goal-flight"
+printf 'linked skill\n' > "$HOME/.claude/skills/goal-flight/SKILL.md"
+cursor_link_apply="$(run_setup --apply --yes --cursor-link-claude --addons '')"
+cursor_link_manifest="$(printf '%s\n' "$cursor_link_apply" | awk '/^BACKUP_MANIFEST /{print $2}')"
+[ -L "$HOME/.cursor/skills/goal-flight" ] || fail "cursor link from claude not installed"
+cursor_link_expected="$(cd "$HOME/.claude/skills/goal-flight" && pwd -P)"
+cursor_link_actual="$(cd "$(readlink "$HOME/.cursor/skills/goal-flight")" && pwd -P)"
+[ "$cursor_link_actual" = "$cursor_link_expected" ] || fail "cursor link target mismatch"
+run_setup --uninstall --from-manifest "$cursor_link_manifest" >/tmp/goal-flight-setup-cursor-link-uninstall.out
+[ ! -e "$HOME/.cursor/skills/goal-flight" ] || fail "cursor link uninstall left skill"
+rm -rf "$HOME/.claude"
 
 cursor_apply_out="$(run_setup --apply --yes --agent cursor)"
 cursor_manifest="$(printf '%s\n' "$cursor_apply_out" | awk '/^BACKUP_MANIFEST /{print $2}')"
@@ -85,13 +143,48 @@ cursor_manifest="$(printf '%s\n' "$cursor_apply_out" | awk '/^BACKUP_MANIFEST /{
 [ -f "$HOME/.cursor/AGENTS.md" ] || fail "cursor global AGENTS not installed"
 [ -f "$HOME/.cursor/skills/goal-flight/SKILL.md" ] || fail "cursor skill not installed"
 [ -f "$HOME/.cursor/rules/goal-flight.mdc" ] || fail "cursor rule not installed"
+[ -f "$HOME/.cursor/mcp.json" ] || fail "cursor MCP config not registered"
 grep -q 'goal-flight' "$HOME/.cursor/AGENTS.md" || fail "cursor AGENTS content missing"
 grep -q 'goal-flight' "$HOME/.cursor/skills/goal-flight/SKILL.md" || fail "cursor skill content missing"
 grep -q 'goal-flight' "$HOME/.cursor/rules/goal-flight.mdc" || fail "cursor rule content missing"
+grep -q 'context-mode' "$HOME/.cursor/mcp.json" || fail "cursor MCP content missing"
+grep -q "$(command -v npx)" "$HOME/.cursor/mcp.json" || fail "cursor MCP should pin resolved npx path"
+if ls "$HOME/.cursor"/mcp.json.bak.* >/dev/null 2>&1; then
+  fail "cursor setup should use Goal Flight manifest backups, not sidecar MCP backups"
+fi
 run_setup --uninstall --from-manifest "$cursor_manifest" >/tmp/goal-flight-setup-cursor-uninstall.out
 [ ! -e "$HOME/.cursor/rules/goal-flight.mdc" ] || fail "cursor uninstall did not remove new rule"
 [ ! -e "$HOME/.cursor/AGENTS.md" ] || fail "cursor uninstall did not remove new AGENTS"
 [ ! -e "$HOME/.cursor/skills/goal-flight/SKILL.md" ] || fail "cursor uninstall did not remove new skill"
+[ ! -e "$HOME/.cursor/mcp.json" ] || fail "cursor uninstall did not remove new MCP config"
+
+NO_NPX_HOME="$TMP_ROOT/no-npx-home"
+NO_NPX_STATE="$TMP_ROOT/no-npx-state"
+NO_NPX_BIN="$TMP_ROOT/no-npx-bin"
+mkdir -p "$NO_NPX_HOME" "$NO_NPX_BIN"
+if HOME="$NO_NPX_HOME" XDG_STATE_HOME="$NO_NPX_STATE" PATH="$NO_NPX_BIN:/usr/bin:/bin" \
+  run_setup --apply --yes --cursor --addons context-mode >/tmp/goal-flight-setup-cursor-no-npx.out 2>&1; then
+  fail "cursor context-mode setup should fail before writing config when npx is missing"
+fi
+grep -q 'npx is required' /tmp/goal-flight-setup-cursor-no-npx.out || fail "missing npx failure reason missing"
+[ ! -e "$NO_NPX_HOME/.cursor/mcp.json" ] || fail "missing npx path wrote cursor MCP config"
+
+PARTIAL_HOME="$TMP_ROOT/partial-home"
+PARTIAL_STATE="$TMP_ROOT/partial-state"
+PARTIAL_PROJECT="$TMP_ROOT/partial-project"
+mkdir -p "$PARTIAL_HOME" "$PARTIAL_PROJECT/.cursor"
+printf 'not json\n' > "$PARTIAL_PROJECT/.cursor/mcp.json"
+if HOME="$PARTIAL_HOME" XDG_STATE_HOME="$PARTIAL_STATE" \
+  run_setup --apply --yes --cursor --cursor-project "$PARTIAL_PROJECT" >/tmp/goal-flight-setup-cursor-partial.out 2>&1; then
+  fail "cursor partial MCP failure should fail"
+fi
+partial_manifest="$(awk '/^BACKUP_MANIFEST /{print $2}' /tmp/goal-flight-setup-cursor-partial.out | tail -1)"
+[ -n "$partial_manifest" ] || partial_manifest="$(find "$PARTIAL_STATE/goal-flight/setup-backups" -name '*-cursor.json' -print | head -1)"
+[ -f "$partial_manifest" ] || fail "partial cursor failure did not persist backup manifest"
+grep -q '.cursor/mcp.json' "$partial_manifest" || fail "partial cursor failure manifest missing MCP backup record"
+[ -f "$PARTIAL_HOME/.cursor/mcp.json" ] || fail "partial cursor failure did not create global MCP before failing"
+HOME="$PARTIAL_HOME" XDG_STATE_HOME="$PARTIAL_STATE" run_setup --uninstall --from-manifest "$partial_manifest" >/tmp/goal-flight-setup-cursor-partial-uninstall.out
+[ ! -e "$PARTIAL_HOME/.cursor/mcp.json" ] || fail "partial cursor uninstall did not remove global MCP config"
 
 claude_dry="$(run_setup --agent claude-code)"
 printf '%s\n' "$claude_dry" | grep -q 'PLUGIN skip selected_destinations' || fail "claude setup should stay discovery-only"

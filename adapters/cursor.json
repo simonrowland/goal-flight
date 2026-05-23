@@ -135,6 +135,17 @@
       },
       {
         "kind": "copy",
+        "source": "configs/cursor/skills/goal-flight/SKILL.md",
+        "target": "${GOALFLIGHT_TARGET_PROJECT}/.cursor/skills/goal-flight/SKILL.md",
+        "writes_repo": true,
+        "writes_user_config": false,
+        "user_gate": true,
+        "backup_path": "${GOALFLIGHT_TARGET_PROJECT}/.cursor/skills/goal-flight/SKILL.md.goal-flight.bak",
+        "rollback": "restore_backup",
+        "destinations": ["cursor-project-controller"]
+      },
+      {
+        "kind": "copy",
         "source": "configs/cursor/rules/goal-flight.mdc",
         "target": "~/.cursor/rules/goal-flight.mdc",
         "writes_repo": false,
@@ -143,10 +154,54 @@
         "backup_path": "~/.cursor/rules/goal-flight.mdc.goal-flight.bak",
         "rollback": "restore_backup",
         "destinations": ["cursor-desktop-controller"]
+      },
+      {
+        "kind": "copy_or_merge",
+        "source": "configs/cursor/AGENTS.md",
+        "target": "${GOALFLIGHT_TARGET_PROJECT}/.cursor/AGENTS.md",
+        "writes_repo": true,
+        "writes_user_config": false,
+        "user_gate": true,
+        "backup_path": "${GOALFLIGHT_TARGET_PROJECT}/.cursor/AGENTS.md.goal-flight.bak",
+        "rollback": "restore_backup",
+        "destinations": ["cursor-project-controller"]
+      },
+      {
+        "kind": "copy",
+        "source": "configs/cursor/rules/goal-flight.mdc",
+        "target": "${GOALFLIGHT_TARGET_PROJECT}/.cursor/rules/goal-flight.mdc",
+        "writes_repo": true,
+        "writes_user_config": false,
+        "user_gate": true,
+        "backup_path": "${GOALFLIGHT_TARGET_PROJECT}/.cursor/rules/goal-flight.mdc.goal-flight.bak",
+        "rollback": "restore_backup",
+        "destinations": ["cursor-project-controller"]
+      },
+      {
+        "kind": "copy",
+        "source": "configs/cursor/skills/goal-flight/SKILL.md",
+        "target": "~/.agents/skills/goal-flight/SKILL.md",
+        "writes_repo": false,
+        "writes_user_config": true,
+        "user_gate": true,
+        "backup_path": "~/.agents/skills/goal-flight/SKILL.md.goal-flight.bak",
+        "rollback": "restore_backup",
+        "destinations": ["cursor-agents-standard-controller"]
+      },
+      {
+        "kind": "link",
+        "source": "~/.claude/skills/goal-flight",
+        "target": "~/.cursor/skills/goal-flight",
+        "writes_repo": false,
+        "writes_user_config": true,
+        "user_gate": true,
+        "backup_path": "~/.cursor/skills/goal-flight.goal-flight.bak",
+        "rollback": "restore_backup",
+        "destinations": ["cursor-claude-link-controller"]
       }
     ],
     "plugin_manifest": {"supported": false, "path": null, "api_status": "probe_required"},
-    "mcp": {"required": false, "servers": []},
+    "mcp": {"required": false, "servers": ["context-mode"]},
     "validation": ["json parse", "schema required groups", "candidate gate stays deny"]
   },
   "setup": {
@@ -169,6 +224,58 @@
           "~/.cursor/AGENTS.md",
           "~/.cursor/skills/goal-flight/SKILL.md",
           "~/.cursor/rules/goal-flight.mdc"
+        ],
+        "requires_restart": true
+      },
+      {
+        "id": "cursor-project-controller",
+        "label": "Cursor project-local controller",
+        "role": "controller",
+        "surface": "config",
+        "default": false,
+        "probe_ids": [],
+        "install_action_sources": [
+          "configs/cursor/AGENTS.md",
+          "configs/cursor/skills/goal-flight/SKILL.md",
+          "configs/cursor/rules/goal-flight.mdc"
+        ],
+        "commands": ["./setup.sh --cursor-project <project> --apply --yes"],
+        "paths": [
+          "<project>/.cursor/AGENTS.md",
+          "<project>/.cursor/skills/goal-flight/SKILL.md",
+          "<project>/.cursor/rules/goal-flight.mdc",
+          "<project>/.cursor/mcp.json"
+        ],
+        "requires_restart": true
+      },
+      {
+        "id": "cursor-agents-standard-controller",
+        "label": "Standard ~/.agents skill",
+        "role": "controller",
+        "surface": "config",
+        "default": false,
+        "probe_ids": [],
+        "install_action_sources": [
+          "configs/cursor/skills/goal-flight/SKILL.md"
+        ],
+        "commands": ["./setup.sh --cursor-agents-standard --apply --yes"],
+        "paths": ["~/.agents/skills/goal-flight/SKILL.md"],
+        "requires_restart": true
+      },
+      {
+        "id": "cursor-claude-link-controller",
+        "label": "Link Claude skill into Cursor",
+        "role": "controller",
+        "surface": "config",
+        "default": false,
+        "probe_ids": [],
+        "install_action_sources": [
+          "~/.claude/skills/goal-flight"
+        ],
+        "commands": ["./setup.sh --cursor-link-claude --apply --yes"],
+        "paths": [
+          "~/.claude/skills/goal-flight",
+          "~/.cursor/skills/goal-flight"
         ],
         "requires_restart": true
       }
@@ -194,11 +301,14 @@
         "default": true,
         "compatible_destination_ids": [
           "cursor-desktop-controller",
+          "cursor-project-controller",
+          "cursor-agents-standard-controller",
+          "cursor-claude-link-controller",
           "cursor-cli-worker"
         ],
-        "install_mode": "deferred",
-        "commands": ["context-mode --help"],
-        "paths": ["~/.cursor", "~/.cursor/skills/"]
+        "install_mode": "setup",
+        "commands": ["python3 scripts/register-context-mode-cursor.py --scope global"],
+        "paths": ["~/.cursor/mcp.json", "<project>/.cursor/mcp.json"]
       },
       {
         "id": "gstack",
@@ -206,6 +316,9 @@
         "default": true,
         "compatible_destination_ids": [
           "cursor-desktop-controller",
+          "cursor-project-controller",
+          "cursor-agents-standard-controller",
+          "cursor-claude-link-controller",
           "cursor-cli-worker"
         ],
         "install_mode": "init_self_check",
