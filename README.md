@@ -1,72 +1,25 @@
 # goal-flight
 
-goal-flight is a multi-agent controller, which delegates coding /goal and parallel-review work to additional agent sessions. It lets you hand Claude a large software task to break down into closed chunks, and have it keep moving after the first context window would normally fall apart. It turns the work into durable project files: a plan, queue, environment caveats, worker status, review evidence, and resume notes that survive compaction, restarts, and overnight runs. Use [Claude Code](https://claude.ai/code) as the controller; codex, cursor, claude-cli, etc as workers. Multi-hour runs can land as a clean stack of one-commit-per-chunk on main, with integrated self-reviews leveraging Gstack.
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+![Python](https://img.shields.io/badge/python-3.10%2B-blue)
+![Last commit](https://img.shields.io/github/last-commit/simonrowland/goal-flight)
+![Stars](https://img.shields.io/github/stars/simonrowland/goal-flight)
 
-**What the controller is for**: high-level management, not execution. The controller holds enough context about your project's goal, scenery (constraints, architecture, prior decisions, failure modes), and intent to exercise discretion and recommend the next move — then dispatches actual work to workers (examples: claude-cli, codex, cursor, grok) to work in an iterative code-review goal loop. This workflow allows lightly-supervised coding: you check in, ratify suggested moves, redirect when needed, and trust the controller to keep the project anchored across compactions and unattended hours. The dispatch / review / handoff machinery below is what frees the controller to do that job.
+**Multi-agent controller for large software goals.**  
+Hand it an ambitious project. It fans out `/goal` prompts to CLI coding agents (claude-cli, Cursor, Codex, Grok, etc.), keeps its own context laser-focused on architecture and dispatch, and creates durable project files that survive context compaction, restarts, and overnight runs. Built first for Claude Code.
 
-```bash
-# Claude Code  install:
-git clone https://github.com/simonrowland/goal-flight.git ~/.claude/skills/goal-flight
-```
+[Features](#features) • [Quickstart](#quickstart) • [Architecture](#architecture) • [Commands](#commands)
 
-## Install in Cursor
+## Features
 
-Clone Goal Flight once, then run setup from that clone. `install.sh` is a thin
-alias for `setup.sh`. Setup is dry-run first; add `--apply --yes` only after the
-planned writes look right.
-
-```bash
-git clone https://github.com/simonrowland/goal-flight.git ~/Repos/goal-flight
-cd ~/Repos/goal-flight
-
-# Global Cursor install: ~/.cursor/AGENTS.md, ~/.cursor/skills/, ~/.cursor/rules/,
-# and ~/.cursor/mcp.json for context-mode.
-./setup.sh --cursor
-./setup.sh --apply --yes --cursor
-
-# Per-project install: <project>/.cursor/AGENTS.md, .cursor/skills/, .cursor/rules/,
-# and <project>/.cursor/mcp.json when context-mode is selected.
-./setup.sh --cursor-project /path/to/project
-./setup.sh --apply --yes --cursor-project /path/to/project
-
-# Standard agents skill location.
-./setup.sh --apply --yes --cursor-agents-standard
-
-# Link Cursor to an existing Claude skill checkout instead of copying.
-./setup.sh --apply --yes --cursor-link-claude --addons ''
-```
-
-Cursor MCP config uses JSON, not Claude or Codex settings. Cursor's CLI and
-editor use the same MCP configuration and discover project/global `mcp.json`
-files ([Cursor docs](https://docs.cursor.com/cli/mcp)). The global file is
-`~/.cursor/mcp.json`; a project-specific file is `<project>/.cursor/mcp.json`.
-Goal Flight writes this context-mode entry, resolving `npx` to an executable
-absolute path on the machine:
-
-```json
-{
-  "mcpServers": {
-    "context-mode": {
-      "command": "/absolute/path/to/npx",
-      "args": ["-y", "context-mode@latest"]
-    }
-  }
-}
-```
-
-After install, restart Cursor and verify discovery:
-
-```bash
-cursor-agent mcp list
-cursor-agent mcp enable context-mode    # if list says the server needs approval
-cursor-agent mcp list-tools context-mode
-python3 ~/Repos/goal-flight/scripts/goalflight_doctor.py --project-root /path/to/project
-```
-
-If Cursor does not auto-load the skill, mention `goal-flight` in the agent chat;
-the wrapper tells Cursor to read the project `AGENTS.md`, root `SKILL.md`, and
-invoked `commands/*.md` files.
-
+- Multi-hour unattended runs with light supervision
+- Verification-first dispatch (live files only)
+- Parallel cross-agent reviews (Claude + another model via gstack)
+- Two-axis routing (iteration pattern × comms shape)
+- Provider-aware rate-pressure walkback
+- Procedural runtime state + doctor checks
+- Self-delegation `/fork` pattern (opt-in)
+  
 ## What it gets you
 
 - **Multi-hour unattended runs.** Check in periodically or respond to decision notifications. The controller's context primarily holds architecture, plan, and metadata (queue state, recent commits, in-flight dispatch headers); real work happens in subagent context windows.
