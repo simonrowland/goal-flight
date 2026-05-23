@@ -19,18 +19,24 @@ Read:
    setup from the cloned Goal Flight repository before project init:
 
 ```bash
-./setup.sh --agent <codex-or-cursor>
-./setup.sh --apply --yes --agent <codex-or-cursor>
+./setup.sh --agent codex
+./setup.sh --apply --yes --agent codex
+
+./setup.sh --cursor
+./setup.sh --apply --yes --cursor
+
+# Optional Cursor project-local install:
+./setup.sh --apply --yes --cursor-project "$PWD"
 ```
 
 For Codex, setup registers the Goal Flight package for the Desktop controller
 surface, cleans any duplicate legacy personal Codex skill when plugin
 registration succeeds, checks the CLI worker surface, and registers
 context-mode MCP when needed. `codex exec` remains the worker path. For Cursor,
-setup installs global agent instructions, a personal skill, and rules;
-context-mode is available for Cursor, but the Goal Flight setup installer has
-not automated Cursor context-mode installation yet. If the user wants it, the
-agent can install context-mode for Cursor explicitly and verify it before use.
+setup installs global agent instructions, a personal skill, rules, and Cursor
+MCP config for context-mode. Project-local setup writes the wrapper and, when
+context-mode is selected, project-specific `.cursor/mcp.json` under the target
+repository.
 
 2. Run doctor:
 

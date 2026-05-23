@@ -151,6 +151,7 @@ def check_host_goalflight_install() -> dict:
     cursor_agents = home / ".cursor/AGENTS.md"
     cursor_skill = home / ".cursor/skills/goal-flight/SKILL.md"
     cursor_rules = home / ".cursor/rules/goal-flight.mdc"
+    standard_agents_skill = home / ".agents/skills/goal-flight/SKILL.md"
     grok_skill = home / ".grok/skills/goal-flight/SKILL.md"
     claude_skill = home / ".claude/skills/goal-flight/SKILL.md"
     payload = {
@@ -160,9 +161,10 @@ def check_host_goalflight_install() -> dict:
             "personal_skill": _path_state(codex_personal),
         },
         "cursor": {
-            "ok": cursor_skill.exists() and (cursor_agents.exists() or cursor_rules.exists()),
+            "ok": cursor_skill.exists() or standard_agents_skill.exists(),
             "global_agents": _path_state(cursor_agents),
             "skill": _path_state(cursor_skill),
+            "standard_agents_skill": _path_state(standard_agents_skill),
             "rules": _path_state(cursor_rules),
         },
         "grok": {
@@ -178,7 +180,10 @@ def check_host_goalflight_install() -> dict:
         if host == "codex":
             detail = "plugin_cache" if item["plugin_cache"] else item["personal_skill"]["path"]
         elif host == "cursor":
-            detail = f"{item['skill']['path']} agents={item['global_agents']['exists']} rules={item['rules']['exists']}"
+            detail = (
+                f"{item['skill']['path']} standard={item['standard_agents_skill']['exists']} "
+                f"agents={item['global_agents']['exists']} rules={item['rules']['exists']}"
+            )
         else:
             detail = item["skill"]["path"]
         item["detail"] = detail
@@ -192,6 +197,27 @@ def check_context_mode(repo: Path) -> dict:
         result = run(["python3", str(script), "--check"], cwd=repo, timeout=10)
         out.update({"check_returncode": result["returncode"], "check_ok": result["ok"], "stderr": result["stderr"][:500]})
     out["npx_present"] = bool(shutil.which("npx"))
+    return out
+
+
+def check_cursor_context_mode(skill_root: Path, project_root: Path) -> dict:
+    script = skill_root / "scripts/register-context-mode-cursor.py"
+    out = {"register_script": str(script), "register_script_exists": script.exists()}
+    if not script.exists():
+        return out
+    global_result = run(["python3", str(script), "--scope", "global", "--project-root", str(project_root), "--check"], timeout=10)
+    project_result = run(["python3", str(script), "--scope", "project", "--project-root", str(project_root), "--check"], timeout=10)
+    out.update(
+        {
+            "global_check_returncode": global_result["returncode"],
+            "global_check_ok": global_result["ok"],
+            "project_check_returncode": project_result["returncode"],
+            "project_check_ok": project_result["ok"],
+            "global_path": str(Path.home() / ".cursor/mcp.json"),
+            "project_path": str(project_root / ".cursor/mcp.json"),
+            "npx_present": bool(shutil.which("npx")),
+        }
+    )
     return out
 
 
@@ -551,6 +577,8 @@ def check_project_goalflight_readiness(repo: Path) -> dict:
     docs_private = repo / "docs-private"
     env_caveats = docs_private / "env-caveats.md"
     repo_skill = repo / "SKILL.md"
+    cursor_project_skill = repo / ".cursor/skills/goal-flight/SKILL.md"
+    cursor_project_rules = repo / ".cursor/rules/goal-flight.mdc"
     agent_path, agent_text = _agent_instructions(repo)
     lower = agent_text.casefold()
     has_routing = bool(
@@ -581,6 +609,10 @@ def check_project_goalflight_readiness(repo: Path) -> dict:
         "init_done": env_caveats.exists(),
         "env_caveats": str(env_caveats),
         "repo_skill": {"path": str(repo_skill), "exists": repo_skill.exists()},
+        "cursor_project": {
+            "skill": _path_state(cursor_project_skill),
+            "rules": _path_state(cursor_project_rules),
+        },
         "routing": {
             "path": str(agent_path) if agent_path else None,
             "exists": bool(agent_path),
@@ -612,6 +644,7 @@ def doctor(repo: Path) -> dict:
             "install_hint": "npm install -g @openai/codex && codex login" if codex_desktop and not codex_cli.get("present") else None,
         },
         "context_mode": check_context_mode(skill_root),
+        "cursor_context_mode": check_cursor_context_mode(skill_root, repo),
         "gstack": check_gstack(),
         "cursor": {
             "desktop_present": cursor_desktop,
@@ -674,6 +707,16 @@ def print_human(payload: dict) -> None:
             payload["context_mode"].get("register_script_exists") and payload["context_mode"].get("check_returncode") == 0,
             "context-mode registration probe",
             f"return={payload['context_mode'].get('check_returncode')} script_exists={payload['context_mode'].get('register_script_exists')}",
+        ),
+        status_line(
+            payload["cursor_context_mode"].get("global_check_returncode") == 0,
+            "Cursor context-mode MCP global",
+            f"{payload['cursor_context_mode'].get('global_path')} npx={payload['cursor_context_mode'].get('npx_present')}",
+        ),
+        status_line(
+            payload["cursor_context_mode"].get("project_check_returncode") == 0,
+            "Cursor context-mode MCP project",
+            payload["cursor_context_mode"].get("project_path"),
         ),
         status_line(payload["gstack"].get("present"), "gstack", payload["gstack"].get("version")),
         status_line(payload["cursor"].get("desktop_present"), "Cursor Desktop", None),

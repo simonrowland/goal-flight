@@ -42,16 +42,22 @@ package repository; for normal target projects it is skipped as INFO.
 - Check `codex --version`.
 - If Codex Desktop exists but `codex` CLI is missing, WARN with:
   `Codex Desktop found, but codex CLI missing. Install CLI with npm install -g @openai/codex && codex login. Desktop install implies the user likely already has an OpenAI account; CLI login should use that account.`
-- Check context-mode registration with `scripts/register-context-mode-codex.py --check`.
+- Check Codex context-mode registration with `scripts/register-context-mode-codex.py --check`.
+- Check Cursor context-mode registration with
+  `scripts/register-context-mode-cursor.py --scope global --check` and
+  `scripts/register-context-mode-cursor.py --scope project --project-root "$PWD" --check`.
 - Check `gstack --version`.
 - Check first-class local worker/controller candidates:
   - Codex: Desktop/CLI present, context-mode registered when large-output work
     will run, ACP adapter binary present when the Codex ACP path is considered.
   - Cursor: Desktop, `cursor`, and `cursor-agent` present when Cursor is routed
-    as controller or worker.
+    as controller or worker; global or project `mcp.json` has context-mode when
+    large-output work will run.
     - `/Applications/Cursor.app`
     - `command -v cursor`
     - `command -v cursor-agent`
+    - `~/.cursor/mcp.json`
+    - `.cursor/mcp.json`
   - Grok: Grok Build present, headless flags available.
     - `--prompt-file`
     - `--permission-mode`
