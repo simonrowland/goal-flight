@@ -497,6 +497,40 @@ class AcpLivenessActivity:
         }
 
 
+def _looks_like_json_rpc_line(line: bytes) -> bool:
+    stripped = line.lstrip()
+    return bool(stripped) and stripped.startswith(b"{")
+
+
+class JsonRpcLineFilterReader(asyncio.StreamReader):
+    """Drop stdout lines that are not JSON-RPC objects.
+
+    Some ACP workers (notably OpenCode with the LiteLLM plugin) print human
+    diagnostics to stdout during startup. The ACP SDK expects newline-delimited
+    JSON only; skipping non-object lines keeps the transport stable.
+    """
+
+    def __init__(self, inner: asyncio.StreamReader) -> None:
+        super().__init__()
+        self._inner = inner
+        self.skipped_lines = 0
+
+    async def readuntil(self, separator: bytes = b"\n") -> bytes:
+        while True:
+            line = await self._inner.readuntil(separator)
+            if _looks_like_json_rpc_line(line):
+                return line
+            self.skipped_lines += 1
+            if log.isEnabledFor(logging.DEBUG):
+                log.debug(
+                    "skipping non-json acp stdout: %r",
+                    line.decode(errors="replace").rstrip()[:200],
+                )
+
+    async def read(self, n: int = -1) -> bytes:
+        return await self._inner.read(n)
+
+
 class GuardedStreamReader(asyncio.StreamReader):
     """StreamReader subclass that drops over-limit newline frames and continues."""
 
@@ -663,8 +697,10 @@ def default_permission_policy(tool_call: Any, options: list[Any], cwd: str | Non
     a state-changing action with NO kind AND NO locations would also auto-allow;
     codex-acp never does -- its edits carry kind+locations) is accepted and
     bounded by (a) a custom permission_policy for security-strict deployments and
-    (b) the worker's OS sandbox. To fail closed on kindless, supply a policy that
-    escalates when kind == "".
+    (b) the worker's OS sandbox. When OS sandbox is enabled, use
+    permission_policy_for_dispatch() instead — it auto-allows in-worktree execute/
+    fetch because sandbox-exec is the backstop. To fail closed on kindless, supply
+    a policy that escalates when kind == "".
     """
     if _targets_outside_cwd(tool_call, cwd):
         return PERMISSION_ESCALATE
@@ -677,6 +713,32 @@ def default_permission_policy(tool_call: Any, options: list[Any], cwd: str | Non
     if kind in _READ_SAFE_KINDS:
         return PERMISSION_ALLOW
     return PERMISSION_ESCALATE
+
+
+def permission_policy_for_dispatch(
+    os_sandbox: str,
+    *,
+    base: Callable[[Any, list[Any], str | None], str] | None = None,
+) -> Callable[[Any, list[Any], str | None], str]:
+    """Permission router for a dispatch, keyed on OS sandbox posture.
+
+    Without OS sandbox, shell/network side effects (execute/fetch) escalate to the
+    controller. With sandbox-exec wrapping the worker subprocess, in-worktree
+    execute and fetch may auto-allow because the OS fence is the backstop.
+    """
+    base_policy = base or default_permission_policy
+    sandbox_on = canonical_os_sandbox(os_sandbox) != OS_SANDBOX_OFF
+
+    def policy(tool_call: Any, options: list[Any], cwd: str | None) -> str:
+        if sandbox_on:
+            if _targets_outside_cwd(tool_call, cwd):
+                return PERMISSION_ESCALATE
+            kind = str(_tc_get(tool_call, "kind") or "")
+            if kind in {"fetch", "execute"}:
+                return PERMISSION_ALLOW
+        return base_policy(tool_call, options, cwd)
+
+    return policy
 
 
 class GoalflightClient(ClientBase):  # type: ignore[misc, valid-type]
@@ -1352,17 +1414,21 @@ async def spawn_acp_connection(
         )
 
     activity = activity or AcpLivenessActivity()
+    effective_policy = permission_policy or permission_policy_for_dispatch(sandboxed.profile)
     client = GoalflightClient(
         activity=activity,
         auto_allow_tools=auto_allow_tools,
         cwd=cwd,
-        permission_policy=permission_policy,
+        permission_policy=effective_policy,
         permission_mode=permission_mode,
         permission_dir=permission_dir,
         permission_inline_timeout_s=permission_inline_timeout_s,
         permission_user_timeout_s=permission_user_timeout_s,
     )
-    guarded_reader = GuardedStreamReader(proc.stdout, limit=limit, on_drop=activity.note_dropped_frame)
+    stdout_reader: asyncio.StreamReader = proc.stdout
+    if os.path.basename(str(sandboxed.command)) == "opencode":
+        stdout_reader = JsonRpcLineFilterReader(proc.stdout)
+    guarded_reader = GuardedStreamReader(stdout_reader, limit=limit, on_drop=activity.note_dropped_frame)
     conn = connect_to_agent(
         client,
         proc.stdin,

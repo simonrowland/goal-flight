@@ -99,6 +99,33 @@ also share the parent's rate-limit budget. Reserve `claude -p` for cases
 where you need a clearly delimited headless run outside the parent
 session's context window AND you are willing to pay API rates.
 
+### opencode (HTTP bash-tail one-shot)
+
+Bare `opencode run` can hang in headless environments (snapshot cleanup,
+DB contention with `opencode serve`). Use the Goal Flight HTTP helper
+instead — it writes Goal Flight markers directly to the tail file:
+
+```bash
+python3 <skill-root>/scripts/opencode_bash_tail.py \
+  --directory "<workdir>" \
+  --tail /tmp/opencode-<slug>.txt \
+  --prompt-file <prompt.md> \
+  --model litellm/frontier-coder \
+  > /tmp/opencode-worker-meta-<slug>.txt 2>&1 &
+WORKER_PID=$!
+```
+
+The script starts `opencode serve` if needed, sends the prompt via
+`POST /session/{id}/message`, streams `STATUS:` lines and the assistant
+reply into `--tail`, then writes `COMPLETE: true` or `BLOCKED: ...`.
+
+Copy project `opencode.json` into `<workdir>` when testing outside the
+repo (set `"snapshot": false` on large trees). Requires LiteLLM env
+(`LITELLM_API_KEY` or `source ~/.config/rpp/litellm.env`).
+
+For structured turn boundaries and tool events, prefer `opencode acp`
+(see `adapters/opencode.json` and `OPENCODE.md`).
+
 ## Watcher
 
 Once spawned, watch the tail file with the dispatch watcher:
@@ -108,7 +135,7 @@ bash <skill-root>/scripts/watch-dispatch-tail.sh \
   --pid "$WORKER_PID" \
   --tail /tmp/<agent>-<slug>.txt \
   --controller-pid $$ \
-  --agent <codex-bash-tail|grok-bash-tail|claude-bash-tail> \
+  --agent <codex-bash-tail|grok-bash-tail|claude-bash-tail|opencode-bash-tail> \
   --session-id <slug> \
   > /tmp/watcher-<slug>.txt 2>&1 &
 WATCHER_PID=$!

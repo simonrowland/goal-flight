@@ -1,12 +1,15 @@
 # goal-flight
 
-goal-flight is a multi-agent controller, which delegates coding /goal and parallel-review work to additional agent sessions. It lets you hand Claude a large software task to break down into closed chunks, and have it keep moving after the first context window would normally fall apart. It turns the work into durable project files: a plan, queue, environment caveats, worker status, review evidence, and resume notes that survive compaction, restarts, and overnight runs. Use [Claude Code](https://claude.ai/code) as the controller; codex, cursor, claude-cli, etc as workers. Multi-hour runs can land as a clean stack of one-commit-per-chunk on main, with integrated self-reviews leveraging Gstack.
+goal-flight is a multi-agent controller, which delegates coding /goal and parallel-review work to additional agent sessions. It lets you hand a frontier model a large software task to break down into closed chunks, and keep moving after the first context window would normally fall apart. It turns the work into durable project files: a plan, queue, environment caveats, worker status, review evidence, and resume notes that survive compaction, restarts, and overnight runs. Multi-hour runs can land as a clean stack of one-commit-per-chunk on main, with integrated self-reviews leveraging Gstack.
 
-**What the controller is for**: high-level management, not execution. The controller holds enough context about your project's goal, scenery (constraints, architecture, prior decisions, failure modes), and intent to exercise discretion and recommend the next move — then dispatches actual work to workers (examples: claude-cli, codex, cursor, grok) to work in an iterative code-review goal loop. This workflow allows lightly-supervised coding: you check in, ratify suggested moves, redirect when needed, and trust the controller to keep the project anchored across compactions and unattended hours. The dispatch / review / handoff machinery below is what frees the controller to do that job.
+**Controller hosts.** [Claude Code](https://claude.ai/code) is the reference controller. Goal Flight also ships controller ports for [Codex](https://github.com/openai/codex), [Cursor](https://cursor.com), and [OpenCode](https://opencode.ai) — same `SKILL.md`, file-backed queue, and dispatch machinery, with host-specific install wrappers below. Workers include codex, cursor, grok, claude-cli, and other ACP or bash-tail adapters.
+
+**What the controller is for**: high-level management, not execution. The controller holds enough context about your project's goal, scenery (constraints, architecture, prior decisions, failure modes), and intent to exercise discretion and recommend the next move — then dispatches actual work to workers to run in an iterative code-review goal loop. This workflow allows lightly-supervised coding: you check in, ratify suggested moves, redirect when needed, and trust the controller to keep the project anchored across compactions and unattended hours. The dispatch / review / handoff machinery below is what frees the controller to do that job.
 
 ```bash
-# Claude Code  install:
+# Claude Code install (reference controller):
 git clone https://github.com/simonrowland/goal-flight.git ~/.claude/skills/goal-flight
+# Codex / Cursor / OpenCode: clone once, then use ./setup.sh --codex | --cursor | --opencode (see below).
 ```
 
 ## Install in Cursor
@@ -66,6 +69,46 @@ python3 ~/Repos/goal-flight/scripts/goalflight_doctor.py --project-root /path/to
 If Cursor does not auto-load the skill, mention `goal-flight` in the agent chat;
 the wrapper tells Cursor to read the project `AGENTS.md`, root `SKILL.md`, and
 invoked `commands/*.md` files.
+
+## Install in OpenCode
+
+OpenCode is a Claude Code-compatible host with native skills, `AGENTS.md`, and
+ACP worker transport via `opencode acp`. Setup mirrors the Cursor port.
+
+```bash
+git clone https://github.com/simonrowland/goal-flight.git ~/Repos/goal-flight
+cd ~/Repos/goal-flight
+
+# Global OpenCode install: ~/.config/opencode/AGENTS.md, skills/, and opencode.json
+# for context-mode MCP plus goal-flight skill permissions.
+./setup.sh --opencode
+./setup.sh --apply --yes --opencode
+
+# Per-project install: <project>/AGENTS.md, .opencode/skills/, and opencode.json.
+./setup.sh --opencode-project /path/to/project
+./setup.sh --apply --yes --opencode-project /path/to/project
+
+# Standard agents skill location.
+./setup.sh --apply --yes --opencode-agents-standard
+
+# Link OpenCode to an existing Claude skill checkout instead of copying.
+./setup.sh --apply --yes --opencode-link-claude --addons ''
+```
+
+OpenCode MCP servers live in JSON config, not Cursor-style `mcp.json`. The global
+file is `~/.config/opencode/opencode.json`; a project-specific file is
+`<project>/opencode.json`. Goal Flight merges a checked-in fragment that allows
+the `goal-flight` skills and registers context-mode when `npx` is available.
+
+After install, restart OpenCode and verify discovery:
+
+```bash
+opencode mcp list
+opencode mcp auth list
+python3 ~/Repos/goal-flight/scripts/goalflight_doctor.py --project-root /path/to/project
+```
+
+See [OPENCODE.md](OPENCODE.md) for host-specific notes.
 
 ## What it gets you
 

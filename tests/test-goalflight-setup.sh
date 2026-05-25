@@ -190,6 +190,114 @@ claude_dry="$(run_setup --agent claude-code)"
 printf '%s\n' "$claude_dry" | grep -q 'PLUGIN skip selected_destinations' || fail "claude setup should stay discovery-only"
 [ ! -e "$HOME/.claude" ] || fail "dry-run mutated claude config"
 
+OPENCODE_BIN="$HOME/.local/bin"
+mkdir -p "$OPENCODE_BIN"
+cat > "$OPENCODE_BIN/opencode" <<'EOF'
+#!/usr/bin/env bash
+case "$1" in
+  --version) echo "opencode test 0.0.0"; exit 0 ;;
+  acp)
+    if [ "${2:-}" = "--help" ]; then exit 0; fi
+    exit 0
+    ;;
+  run) exit 0 ;;
+esac
+if [ "$1" = "--help" ]; then echo "acp run"; exit 0; fi
+exit 1
+EOF
+chmod +x "$OPENCODE_BIN/opencode"
+
+opencode_dry="$(run_setup --agent opencode)"
+printf '%s\n' "$opencode_dry" | grep -q 'DRY-RUN setup agent=opencode' || fail "opencode dry-run header missing"
+printf '%s\n' "$opencode_dry" | grep -q '.config/opencode/AGENTS.md' || fail "opencode global AGENTS action missing"
+printf '%s\n' "$opencode_dry" | grep -q '.config/opencode/skills/goal-flight/SKILL.md' || fail "opencode personal skill action missing"
+printf '%s\n' "$opencode_dry" | grep -q 'register-context-mode-opencode.py --scope global' || fail "opencode context-mode MCP registration missing"
+printf '%s\n' "$opencode_dry" | grep -q 'PLUGIN skip supported=false' || fail "opencode plugin must stay skipped"
+[ ! -e "$HOME/.config/opencode/AGENTS.md" ] || fail "dry-run mutated opencode AGENTS"
+[ ! -e "$HOME/.config/opencode/skills/goal-flight/SKILL.md" ] || fail "dry-run mutated opencode skill"
+[ ! -e "$HOME/.config/opencode/opencode.json" ] || fail "dry-run mutated opencode config"
+
+opencode_alias_dry="$(run_setup --opencode --addons '')"
+printf '%s\n' "$opencode_alias_dry" | grep -q 'DRY-RUN setup agent=opencode' || fail "opencode shortcut did not select opencode setup"
+printf '%s\n' "$opencode_alias_dry" | grep -q 'DESTINATIONS selected=.*opencode-global-controller' || fail "opencode shortcut should select global controller wrapper"
+install_opencode_alias_dry="$(bash "$REPO_ROOT/install.sh" --opencode --addons '')"
+printf '%s\n' "$install_opencode_alias_dry" | grep -q 'DRY-RUN setup agent=opencode' || fail "install.sh opencode alias did not select opencode setup"
+
+OPENCODE_PROJECT="$TMP_ROOT/opencode-project"
+mkdir -p "$OPENCODE_PROJECT"
+opencode_project_dry="$(run_setup --opencode-project "$OPENCODE_PROJECT" --addons '')"
+printf '%s\n' "$opencode_project_dry" | grep -q '.opencode/skills/goal-flight/SKILL.md' || fail "opencode project skill action missing"
+printf '%s\n' "$opencode_project_dry" | grep -q '/AGENTS.md' || fail "opencode project AGENTS action missing"
+opencode_project_apply="$(run_setup --apply --yes --opencode-project "$OPENCODE_PROJECT" --addons '')"
+opencode_project_manifest="$(printf '%s\n' "$opencode_project_apply" | awk '/^BACKUP_MANIFEST /{print $2}')"
+[ -f "$OPENCODE_PROJECT/.opencode/skills/goal-flight/SKILL.md" ] || fail "opencode project skill not installed"
+[ -f "$OPENCODE_PROJECT/AGENTS.md" ] || fail "opencode project AGENTS not installed"
+run_setup --uninstall --from-manifest "$opencode_project_manifest" >/tmp/goal-flight-setup-opencode-project-uninstall.out
+[ ! -e "$OPENCODE_PROJECT/.opencode/skills/goal-flight/SKILL.md" ] || fail "opencode project uninstall left skill"
+[ ! -e "$OPENCODE_PROJECT/AGENTS.md" ] || fail "opencode project uninstall left AGENTS"
+
+OPENCODE_PROJECT_MCP="$TMP_ROOT/opencode-project-mcp"
+mkdir -p "$OPENCODE_PROJECT_MCP"
+opencode_project_mcp_apply="$(run_setup --apply --yes --opencode-project "$OPENCODE_PROJECT_MCP")"
+opencode_project_mcp_manifest="$(printf '%s\n' "$opencode_project_mcp_apply" | awk '/^BACKUP_MANIFEST /{print $2}')"
+[ -f "$OPENCODE_PROJECT_MCP/opencode.json" ] || fail "opencode project config not registered"
+grep -q 'context-mode' "$OPENCODE_PROJECT_MCP/opencode.json" || fail "opencode project MCP content missing"
+grep -q 'goal-flight' "$OPENCODE_PROJECT_MCP/opencode.json" || fail "opencode project skill permission missing"
+[ ! -e "$HOME/.config/opencode/opencode.json" ] || fail "opencode project-only setup should not write global config"
+run_setup --uninstall --from-manifest "$opencode_project_mcp_manifest" >/tmp/goal-flight-setup-opencode-project-mcp-uninstall.out
+[ ! -e "$OPENCODE_PROJECT_MCP/opencode.json" ] || fail "opencode project MCP uninstall left config"
+
+opencode_agents_apply="$(run_setup --apply --yes --opencode-agents-standard --addons '')"
+opencode_agents_manifest="$(printf '%s\n' "$opencode_agents_apply" | awk '/^BACKUP_MANIFEST /{print $2}')"
+[ -f "$HOME/.agents/skills/goal-flight/SKILL.md" ] || fail "opencode agents-standard skill not installed"
+run_setup --uninstall --from-manifest "$opencode_agents_manifest" >/tmp/goal-flight-setup-opencode-agents-uninstall.out
+[ ! -e "$HOME/.agents/skills/goal-flight/SKILL.md" ] || fail "opencode agents-standard uninstall left skill"
+
+if run_setup --apply --yes --opencode-link-claude --addons '' >/tmp/goal-flight-setup-opencode-link-missing.out 2>&1; then
+  fail "opencode link should fail when Claude skill source is missing"
+fi
+grep -q 'setup source missing' /tmp/goal-flight-setup-opencode-link-missing.out || fail "missing Claude link source reason missing"
+
+mkdir -p "$HOME/.claude/skills/goal-flight"
+printf 'claude skill\n' > "$HOME/.claude/skills/goal-flight/SKILL.md"
+opencode_link_apply="$(run_setup --apply --yes --opencode-link-claude --addons '')"
+opencode_link_manifest="$(printf '%s\n' "$opencode_link_apply" | awk '/^BACKUP_MANIFEST /{print $2}')"
+[ -L "$HOME/.config/opencode/skills/goal-flight" ] || fail "opencode link from claude not installed"
+opencode_link_expected="$(cd "$HOME/.claude/skills/goal-flight" && pwd -P)"
+opencode_link_actual="$(cd "$(readlink "$HOME/.config/opencode/skills/goal-flight")" && pwd -P)"
+[ "$opencode_link_actual" = "$opencode_link_expected" ] || fail "opencode link target mismatch"
+run_setup --uninstall --from-manifest "$opencode_link_manifest" >/tmp/goal-flight-setup-opencode-link-uninstall.out
+[ ! -e "$HOME/.config/opencode/skills/goal-flight" ] || fail "opencode link uninstall left skill"
+
+opencode_apply_out="$(run_setup --apply --yes --agent opencode)"
+opencode_manifest="$(printf '%s\n' "$opencode_apply_out" | awk '/^BACKUP_MANIFEST /{print $2}')"
+[ -n "$opencode_manifest" ] || fail "opencode backup manifest path missing"
+[ -f "$opencode_manifest" ] || fail "opencode backup manifest not written"
+[ -f "$HOME/.config/opencode/AGENTS.md" ] || fail "opencode global AGENTS not installed"
+[ -f "$HOME/.config/opencode/skills/goal-flight/SKILL.md" ] || fail "opencode skill not installed"
+[ -f "$HOME/.config/opencode/opencode.json" ] || fail "opencode config not registered"
+grep -q 'goal-flight' "$HOME/.config/opencode/AGENTS.md" || fail "opencode AGENTS content missing"
+grep -q 'goal-flight' "$HOME/.config/opencode/skills/goal-flight/SKILL.md" || fail "opencode skill content missing"
+grep -q 'context-mode' "$HOME/.config/opencode/opencode.json" || fail "opencode MCP content missing"
+grep -q 'goal-flight' "$HOME/.config/opencode/opencode.json" || fail "opencode skill permission missing"
+if ls "$HOME/.config/opencode"/opencode.json.bak.* >/dev/null 2>&1; then
+  fail "opencode setup should use Goal Flight manifest backups, not sidecar config backups"
+fi
+run_setup --uninstall --from-manifest "$opencode_manifest" >/tmp/goal-flight-setup-opencode-uninstall.out
+[ ! -e "$HOME/.config/opencode/AGENTS.md" ] || fail "opencode uninstall did not remove new AGENTS"
+[ ! -e "$HOME/.config/opencode/skills/goal-flight/SKILL.md" ] || fail "opencode uninstall did not remove new skill"
+[ ! -e "$HOME/.config/opencode/opencode.json" ] || fail "opencode uninstall did not remove new config"
+
+NO_NPX_OPENCODE_HOME="$TMP_ROOT/no-npx-opencode-home"
+NO_NPX_OPENCODE_STATE="$TMP_ROOT/no-npx-opencode-state"
+mkdir -p "$NO_NPX_OPENCODE_HOME"
+if HOME="$NO_NPX_OPENCODE_HOME" XDG_STATE_HOME="$NO_NPX_OPENCODE_STATE" PATH="$OPENCODE_BIN:/usr/bin:/bin" \
+  run_setup --apply --yes --opencode --addons context-mode >/tmp/goal-flight-setup-opencode-no-npx.out 2>&1; then
+  fail "opencode context-mode setup should fail before writing config when npx is missing"
+fi
+grep -q 'npx is required' /tmp/goal-flight-setup-opencode-no-npx.out || fail "missing npx failure reason missing for opencode"
+[ ! -e "$NO_NPX_OPENCODE_HOME/.config/opencode/opencode.json" ] || fail "missing npx path wrote opencode config"
+
 if run_setup --apply --agent codex >/tmp/goal-flight-setup-denied.out 2>&1; then
   fail "apply without --yes should fail"
 fi

@@ -156,6 +156,9 @@ def check_host_goalflight_install() -> dict:
     cursor_agents = home / ".cursor/AGENTS.md"
     cursor_skill = home / ".cursor/skills/goal-flight/SKILL.md"
     cursor_rules = home / ".cursor/rules/goal-flight.mdc"
+    opencode_agents = home / ".config/opencode/AGENTS.md"
+    opencode_skill = home / ".config/opencode/skills/goal-flight/SKILL.md"
+    opencode_config = home / ".config/opencode/opencode.json"
     standard_agents_skill = home / ".agents/skills/goal-flight/SKILL.md"
     grok_skill = home / ".grok/skills/goal-flight/SKILL.md"
     claude_skill = home / ".claude/skills/goal-flight/SKILL.md"
@@ -171,6 +174,13 @@ def check_host_goalflight_install() -> dict:
             "skill": _path_state(cursor_skill),
             "standard_agents_skill": _path_state(standard_agents_skill),
             "rules": _path_state(cursor_rules),
+        },
+        "opencode": {
+            "ok": opencode_skill.exists() or standard_agents_skill.exists(),
+            "global_agents": _path_state(opencode_agents),
+            "skill": _path_state(opencode_skill),
+            "config": _path_state(opencode_config),
+            "standard_agents_skill": _path_state(standard_agents_skill),
         },
         "grok": {
             "ok": grok_skill.exists(),
@@ -188,6 +198,11 @@ def check_host_goalflight_install() -> dict:
             detail = (
                 f"{item['skill']['path']} standard={item['standard_agents_skill']['exists']} "
                 f"agents={item['global_agents']['exists']} rules={item['rules']['exists']}"
+            )
+        elif host == "opencode":
+            detail = (
+                f"{item['skill']['path']} standard={item['standard_agents_skill']['exists']} "
+                f"agents={item['global_agents']['exists']} config={item['config']['exists']}"
             )
         else:
             detail = item["skill"]["path"]
@@ -220,6 +235,27 @@ def check_cursor_context_mode(skill_root: Path, project_root: Path) -> dict:
             "project_check_ok": project_result["ok"],
             "global_path": str(Path.home() / ".cursor/mcp.json"),
             "project_path": str(project_root / ".cursor/mcp.json"),
+            "npx_present": bool(shutil.which("npx")),
+        }
+    )
+    return out
+
+
+def check_opencode_context_mode(skill_root: Path, project_root: Path) -> dict:
+    script = skill_root / "scripts/register-context-mode-opencode.py"
+    out = {"register_script": str(script), "register_script_exists": script.exists()}
+    if not script.exists():
+        return out
+    global_result = run(["python3", str(script), "--scope", "global", "--project-root", str(project_root), "--check"], timeout=10)
+    project_result = run(["python3", str(script), "--scope", "project", "--project-root", str(project_root), "--check"], timeout=10)
+    out.update(
+        {
+            "global_check_returncode": global_result["returncode"],
+            "global_check_ok": global_result["ok"],
+            "project_check_returncode": project_result["returncode"],
+            "project_check_ok": project_result["ok"],
+            "global_path": str(Path.home() / ".config/opencode/opencode.json"),
+            "project_path": str(project_root / "opencode.json"),
             "npx_present": bool(shutil.which("npx")),
         }
     )
@@ -478,6 +514,14 @@ def check_acp() -> dict:
         "cursor-agent": {"present": bool(version("cursor-agent", "--version").get("present")), "version": version("cursor-agent", "--version").get("version")},
         "claude-code-cli-acp": {"present": bool(shutil.which("claude-code-cli-acp"))},
         "grok-agent-stdio": {"present": grok["present"], "headless_hint": grok.get("headless_flags")},
+        "opencode-acp": {
+            "present": bool(version("opencode", "--version").get("present")),
+            "version": version("opencode", "--version").get("version"),
+        },
+        "opencode-bash-tail": {
+            "present": (SCRIPT_DIR / "opencode_bash_tail.py").is_file(),
+            "script": str(SCRIPT_DIR / "opencode_bash_tail.py"),
+        },
     }
 
 
@@ -623,6 +667,8 @@ def check_project_goalflight_readiness(repo: Path) -> dict:
     repo_skill = repo / "SKILL.md"
     cursor_project_skill = repo / ".cursor/skills/goal-flight/SKILL.md"
     cursor_project_rules = repo / ".cursor/rules/goal-flight.mdc"
+    opencode_project_skill = repo / ".opencode/skills/goal-flight/SKILL.md"
+    opencode_project_config = repo / "opencode.json"
     agent_path, agent_text = _agent_instructions(repo)
     lower = agent_text.casefold()
     has_routing = bool(
@@ -657,6 +703,10 @@ def check_project_goalflight_readiness(repo: Path) -> dict:
             "skill": _path_state(cursor_project_skill),
             "rules": _path_state(cursor_project_rules),
         },
+        "opencode_project": {
+            "skill": _path_state(opencode_project_skill),
+            "config": _path_state(opencode_project_config),
+        },
         "routing": {
             "path": str(agent_path) if agent_path else None,
             "exists": bool(agent_path),
@@ -689,6 +739,7 @@ def doctor(repo: Path, *, fleet: bool = False, fleet_dir: Path | None = None, fl
         },
         "context_mode": check_context_mode(skill_root),
         "cursor_context_mode": check_cursor_context_mode(skill_root, repo),
+        "opencode_context_mode": check_opencode_context_mode(skill_root, repo),
         "gstack": check_gstack(),
         "cursor": {
             "desktop_present": cursor_desktop,
@@ -696,6 +747,7 @@ def doctor(repo: Path, *, fleet: bool = False, fleet_dir: Path | None = None, fl
             "agent": version("cursor-agent", "--version"),
             "models": cursor_models_probe(),
         },
+        "opencode": version("opencode", "--version"),
         "grok": check_grok(),
         "acp": check_acp(),
         "project": git_state(repo),
@@ -794,9 +846,20 @@ def print_human(payload: dict) -> None:
             "Cursor context-mode MCP project",
             payload["cursor_context_mode"].get("project_path"),
         ),
+        status_line(
+            payload["opencode_context_mode"].get("global_check_returncode") == 0,
+            "OpenCode context-mode MCP global",
+            f"{payload['opencode_context_mode'].get('global_path')} npx={payload['opencode_context_mode'].get('npx_present')}",
+        ),
+        status_line(
+            payload["opencode_context_mode"].get("project_check_returncode") == 0,
+            "OpenCode context-mode MCP project",
+            payload["opencode_context_mode"].get("project_path"),
+        ),
         status_line(payload["gstack"].get("present"), "gstack", payload["gstack"].get("version")),
         status_line(payload["cursor"].get("desktop_present"), "Cursor Desktop", None),
         status_line(payload["cursor"]["agent"].get("present"), "cursor-agent ACP", payload["cursor"]["agent"].get("version")),
+        status_line(payload["opencode"].get("present"), "opencode ACP", payload["opencode"].get("version")),
         status_line(payload["grok"].get("present"), "Grok Build binary", payload["grok"].get("version")),
         status_line(payload["grok"].get("headless_flags"), "Grok headless flags", None),
     ]

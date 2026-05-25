@@ -4,43 +4,34 @@
   "display_name": "OpenCode",
   "agent_family": "opencode",
   "providers": {
-    "controller_provider": "none",
+    "controller_provider": "mixed",
     "model_provider": "mixed",
     "same_provider_policy": "require_cross_provider_review"
   },
   "support": {
     "controller": {
-      "capability": "unsupported",
+      "capability": "supported",
       "evidence": [
-        "survey: OpenCode was assessed as a worker CLI, not a verified goal-flight controller",
-        "stub: no live local controller probe has been run for this manifest"
+        "survey: OpenCode is a Claude Code-compatible fork with native skills and AGENTS.md",
+        "docs: opencode acp exposes ACP over stdio",
+        "repo: setup installs ~/.config/opencode wrappers mirroring cursor port"
       ],
-      "readiness_requirements": [],
-      "fallback": "unsupported"
+      "readiness_requirements": ["binary", "version", "auth_optional", "safe_args", "status_contract"],
+      "fallback": "worker_only"
     },
     "worker": {
-      "capability": "candidate",
-      "transport": [
-        "cli_json",
-        "acp",
-        "tail_file"
-      ],
-      "readiness_requirements": [
-        "binary",
-        "version",
-        "noninteractive",
-        "status_contract",
-        "safe_args"
-      ],
+      "capability": "supported",
+      "transport": ["acp", "cli_json", "tail_file"],
+      "readiness_requirements": ["binary", "version", "noninteractive", "status_contract", "safe_args"],
       "fallback": "tail_file"
     }
   },
   "local_readiness_state": {
     "storage": "machine-local, never checked in",
     "path_pattern": "$XDG_STATE_HOME/goal-flight/readiness/<agent>.json",
-    "controller": "unsupported",
+    "controller": "probe_required",
     "worker": "probe_required",
-    "last_probe_ids": [],
+    "last_probe_ids": ["opencode-path", "opencode-version", "opencode-acp-help"],
     "updated_at": null
   },
   "live_gate": {
@@ -48,307 +39,282 @@
     "controller_allowed_expr": "support.controller.capability == supported && local_readiness.controller == ready",
     "worker_allowed_expr": "support.worker.capability == supported && local_readiness.worker == ready && requested_transport is verified",
     "default": "deny",
-    "support_status_enum": [
-      "unsupported",
-      "config_only",
-      "probe_required",
-      "candidate",
-      "not_installed",
-      "forbidden-arg",
-      "failed",
-      "blocked"
-    ],
-    "return_fields": [
-      "allowed",
-      "reason",
-      "required_probe_ids",
-      "blocked_fields",
-      "safe_next_action",
-      "live_controller_allowed",
-      "live_worker_dispatch_allowed"
-    ]
+    "support_status_enum": ["unsupported", "config_only", "probe_required", "candidate", "not_installed", "forbidden-arg", "failed", "blocked"],
+    "return_fields": ["allowed", "reason", "required_probe_ids", "blocked_fields", "safe_next_action", "live_controller_allowed", "live_worker_dispatch_allowed"]
   },
   "tool_name_map": {
-    "shell_exec": {
-      "host_tools": [
-        "opencode native tool surface (unverified)"
-      ],
-      "constraints": [
-        "deny until binary/version/noninteractive probes pass",
-        "forbid approval-bypass arguments"
-      ]
-    },
-    "read_file": {
-      "host_tools": [
-        "opencode native tool surface (unverified)"
-      ],
-      "constraints": [
-        "workspace reads only after live gate"
-      ]
-    },
-    "write_file": {
-      "host_tools": [
-        "opencode native tool surface (unverified)"
-      ],
-      "constraints": [
-        "workspace writes only after live gate",
-        "controller keeps status authority"
-      ]
-    },
-    "search": {
-      "host_tools": [
-        "opencode native tool surface (unverified)"
-      ],
-      "constraints": [
-        "prefer structured output where available"
-      ]
-    },
-    "delegate": {
-      "host_tools": [],
-      "constraints": [
-        "not mapped for gated worker stub"
-      ]
-    },
-    "ask_user": {
-      "host_tools": [],
-      "constraints": [
-        "controller owns user questions"
-      ]
-    },
-    "plan_update": {
-      "host_tools": [],
-      "constraints": [
-        "controller owns plan state"
-      ]
-    },
-    "memory_search": {
-      "host_tools": [],
-      "constraints": [
-        "repo files remain canonical"
-      ]
-    },
-    "browser_ui": {
-      "host_tools": [],
-      "constraints": [
-        "not mapped for gated worker stub"
-      ]
-    }
+    "shell_exec": {"host_tools": ["bash"], "constraints": ["safe probes only", "workspace shell after live gate"]},
+    "read_file": {"host_tools": ["read", "list", "glob", "grep"], "constraints": ["workspace reads only"]},
+    "write_file": {"host_tools": ["edit", "write"], "constraints": ["authorized edit scope only"]},
+    "search": {"host_tools": ["glob", "grep", "list"], "constraints": ["filtered search"]},
+    "delegate": {"host_tools": ["task", "opencode acp"], "constraints": ["requires live gate readiness"]},
+    "ask_user": {"host_tools": ["question", "USER-NEED marker"], "constraints": ["block on ambiguity"]},
+    "plan_update": {"host_tools": ["todowrite", "status markers"], "constraints": ["controller tracks plan externally"]},
+    "memory_search": {"host_tools": ["repo resume notes", "OpenCode session state"], "constraints": ["repo files remain canonical"]},
+    "browser_ui": {"host_tools": ["webfetch", "websearch"], "constraints": ["only when available and permitted"]}
   },
   "invocation": {
-    "skill_triggers": [
-      "goal-flight worker: opencode"
-    ],
-    "commands": [
-      "opencode run <prompt> --format json"
-    ],
+    "skill_triggers": ["goal-flight", "OpenCode worker"],
+    "commands": ["opencode acp", "opencode run --format json"],
     "exec": {
-      "kind": "cli",
+      "kind": "acp",
       "binary": "opencode",
-      "args": [
-        "run",
-        "<prompt>",
-        "--format",
-        "json"
-      ],
+      "args": ["acp"],
       "arg_policy": {
-        "required_safe_args": [
-          "run",
-          "<prompt>",
-          "--format",
-          "json"
-        ],
-        "forbidden_args": [
-          "--yolo",
-          "-y",
-          "--dangerously-*",
-          "--dangerously-skip-permissions",
-          "--dangerously-allow-all",
-          "--dangerously-bypass-approvals-and-sandbox",
-          "--allow-dangerously-skip-permissions",
-          "--always-approve",
-          "--allow-all-tools",
-          "--trust-all-tools",
-          "--auto-accept",
-          "--skip-permissions",
-          "--no-sandbox",
-          "--disable-sandbox",
-          "--sandbox-disable"
-        ],
-        "requires_explicit_justification": [
-          "--continue",
-          "--session"
-        ],
-        "reject_in": [
-          "invocation",
-          "probes",
-          "generated_wrappers",
-          "checked_in_configs"
-        ]
+        "required_safe_args": ["acp"],
+        "forbidden_args": ["--yolo", "-y", "--dangerously-*", "--dangerously-skip-permissions", "--dangerously-bypass-approvals-and-sandbox", "--allow-dangerously-skip-permissions", "--always-approve", "--allow-all-tools", "--trust-all-tools", "--auto-approve", "--auto-accept", "--skip-permissions", "--no-sandbox", "--disable-sandbox", "--sandbox-disable"],
+        "requires_explicit_justification": ["--continue", "--session", "--fork"],
+        "reject_in": ["invocation", "probes", "generated_wrappers", "checked_in_configs"]
       },
       "stdin": "prompt",
       "cwd_policy": "repo_required",
       "output_contract": {
         "parser": "status_json",
-        "completion_detection": "exit_only",
-        "final_event": null,
+        "completion_detection": "structured_final_event",
+        "final_event": "ACP prompt result",
         "final_regex": "Goal complete: (true|false)",
-        "exit_code_policy": "zero_success",
-        "resume_args": [
-          "--continue",
-          "--session"
-        ],
-        "goal_mode_eligible": false
+        "exit_code_policy": "mapped",
+        "resume_args": ["--continue", "--session"],
+        "goal_mode_eligible": true
       }
     }
   },
   "permission_surface": {
-    "file_reads": [
-      "workspace files after live gate"
-    ],
-    "file_writes": [
-      "workspace files after live gate"
-    ],
-    "shell": {
-      "allowed_families": [
-        "safe local probes",
-        "agent tool calls after live gate"
-      ],
-      "forbidden_families": [
-        "approval bypass",
-        "raw web fetch",
-        "destructive reset",
-        "unchecked long output"
-      ]
-    },
-    "network": {
-      "allowed": false,
-      "user_gate": true,
-      "notes": "Network denied for stub readiness probes."
-    },
-    "browser_ui": {
-      "allowed": false,
-      "user_gate": true,
-      "notes": "No browser mapping verified for this worker stub."
-    },
-    "memory_writes": {
-      "allowed": false,
-      "backend": "none"
-    },
-    "plugin_sandbox": {
-      "mode": "none",
-      "declared_permissions": []
-    },
+    "file_reads": ["workspace files"],
+    "file_writes": ["authorized edit scope only"],
+    "shell": {"allowed_families": ["safe probes", "test runner"], "forbidden_families": ["permission bypass", "destructive reset", "raw web fetch"]},
+    "network": {"allowed": false, "user_gate": true, "notes": "Auth/model probes must stay non-consuming."},
+    "browser_ui": {"allowed": true, "user_gate": true, "notes": "Host availability varies by provider and permissions."},
+    "memory_writes": {"allowed": false, "backend": "repo_files"},
+    "plugin_sandbox": {"mode": "narrow", "declared_permissions": ["workspace rules", "skill tool", "MCP servers"]},
     "os_sandbox": {
-      "supported_profiles": ["off"],
+      "supported_profiles": ["off", "read-only", "workspace-write"],
       "default_profile": "off",
-      "implementation": "unsupported",
-      "notes": "No verified runner OS sandbox profile for this adapter yet."
+      "implementation": "runner:sandbox-exec",
+      "notes": "Dispatch-level worker subprocess wrapper; not an opencode CLI flag."
     },
-    "auto_approve_detection": {
-      "probes": [
-        "adapter-forbidden-args-scan"
-      ],
-      "strict_fail": true
-    },
-    "secrets": [
-      "OPENAI_API_KEY",
-      "ANTHROPIC_API_KEY",
-      "OPENCODE_API_KEY"
-    ],
-    "irreversible_ops": [
-      "git reset --hard",
-      "force push",
-      "rm -rf",
-      "credential deletion"
-    ]
+    "auto_approve_detection": {"probes": ["opencode-args-scan"], "strict_fail": true},
+    "secrets": ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "OPENCODE_API_KEY"],
+    "irreversible_ops": ["git reset --hard", "force push", "rm -rf"]
   },
   "memory_backend": {
     "canonical": "repo_files",
-    "repo_files": [
-      ".goal-flight/**",
-      "prompts/**"
-    ],
-    "host_native": {
-      "role": "none",
-      "backend": null
-    },
+    "repo_files": [".goal-flight/**"],
+    "host_native": {"role": "advisory", "backend": "OpenCode session and config state"},
     "mirror_writeback": false,
     "source_epoch": "goal-flight-0.5.0",
-    "snapshot_id": "opencode-gated-stub",
+    "snapshot_id": "opencode-host-adapter",
     "migration_lock_required_for_writeback": true,
     "drift_policy": "warn_and_prefer_repo"
   },
   "packaging": {
-    "checked_in_wrappers": [],
-    "generated_outputs": [],
-    "install_actions": [],
-    "plugin_manifest": {
-      "supported": false,
-      "path": null,
-      "api_status": "unsupported"
-    },
-    "mcp": {
-      "required": false,
-      "servers": []
-    },
-    "validation": [
-      "json parse",
-      "schema required groups",
-      "forbidden args scan",
-      "./tests/run.sh"
+    "checked_in_wrappers": [
+      "configs/opencode/AGENTS.md",
+      "configs/opencode/opencode.json",
+      "configs/opencode/skills/goal-flight/SKILL.md",
+      "OPENCODE.md"
+    ],
+    "generated_outputs": ["dist/opencode/"],
+    "install_actions": [
+      {
+        "kind": "copy_or_merge",
+        "source": "configs/opencode/AGENTS.md",
+        "target": "~/.config/opencode/AGENTS.md",
+        "writes_repo": false,
+        "writes_user_config": true,
+        "user_gate": true,
+        "backup_path": "~/.config/opencode/AGENTS.md.goal-flight.bak",
+        "rollback": "restore_backup",
+        "destinations": ["opencode-global-controller"]
+      },
+      {
+        "kind": "copy",
+        "source": "configs/opencode/skills/goal-flight/SKILL.md",
+        "target": "~/.config/opencode/skills/goal-flight/SKILL.md",
+        "writes_repo": false,
+        "writes_user_config": true,
+        "user_gate": true,
+        "backup_path": "~/.config/opencode/skills/goal-flight/SKILL.md.goal-flight.bak",
+        "rollback": "restore_backup",
+        "destinations": ["opencode-global-controller"]
+      },
+      {
+        "kind": "copy",
+        "source": "configs/opencode/skills/goal-flight/SKILL.md",
+        "target": "${GOALFLIGHT_TARGET_PROJECT}/.opencode/skills/goal-flight/SKILL.md",
+        "writes_repo": true,
+        "writes_user_config": false,
+        "user_gate": true,
+        "backup_path": "${GOALFLIGHT_TARGET_PROJECT}/.opencode/skills/goal-flight/SKILL.md.goal-flight.bak",
+        "rollback": "restore_backup",
+        "destinations": ["opencode-project-controller"]
+      },
+      {
+        "kind": "copy_or_merge",
+        "source": "configs/opencode/AGENTS.md",
+        "target": "${GOALFLIGHT_TARGET_PROJECT}/AGENTS.md",
+        "writes_repo": true,
+        "writes_user_config": false,
+        "user_gate": true,
+        "backup_path": "${GOALFLIGHT_TARGET_PROJECT}/AGENTS.md.goal-flight.bak",
+        "rollback": "restore_backup",
+        "destinations": ["opencode-project-controller"]
+      },
+      {
+        "kind": "copy",
+        "source": "configs/opencode/skills/goal-flight/SKILL.md",
+        "target": "~/.agents/skills/goal-flight/SKILL.md",
+        "writes_repo": false,
+        "writes_user_config": true,
+        "user_gate": true,
+        "backup_path": "~/.agents/skills/goal-flight/SKILL.md.goal-flight.bak",
+        "rollback": "restore_backup",
+        "destinations": ["opencode-agents-standard-controller"]
+      },
+      {
+        "kind": "link",
+        "source": "~/.claude/skills/goal-flight",
+        "target": "~/.config/opencode/skills/goal-flight",
+        "writes_repo": false,
+        "writes_user_config": true,
+        "user_gate": true,
+        "backup_path": "~/.config/opencode/skills/goal-flight.goal-flight.bak",
+        "rollback": "restore_backup",
+        "destinations": ["opencode-claude-link-controller"]
+      }
+    ],
+    "plugin_manifest": {"supported": false, "path": null, "api_status": "unsupported"},
+    "mcp": {"required": false, "servers": ["context-mode"]},
+    "validation": ["json parse", "schema required groups", "forbidden args scan", "./tests/run.sh"]
+  },
+  "setup": {
+    "controller_destinations": [
+      {
+        "id": "opencode-global-controller",
+        "label": "OpenCode global controller",
+        "role": "controller",
+        "surface": "cli",
+        "default": true,
+        "probe_ids": ["opencode-path", "opencode-version"],
+        "install_action_sources": [
+          "configs/opencode/AGENTS.md",
+          "configs/opencode/skills/goal-flight/SKILL.md",
+          "configs/opencode/opencode.json"
+        ],
+        "commands": ["opencode"],
+        "paths": [
+          "$(command -v opencode)",
+          "~/.config/opencode/AGENTS.md",
+          "~/.config/opencode/skills/goal-flight/SKILL.md",
+          "~/.config/opencode/opencode.json"
+        ],
+        "requires_restart": true
+      },
+      {
+        "id": "opencode-project-controller",
+        "label": "OpenCode project-local controller",
+        "role": "controller",
+        "surface": "config",
+        "default": false,
+        "probe_ids": [],
+        "install_action_sources": [
+          "configs/opencode/AGENTS.md",
+          "configs/opencode/skills/goal-flight/SKILL.md",
+          "configs/opencode/opencode.json"
+        ],
+        "commands": ["./setup.sh --opencode-project <project> --apply --yes"],
+        "paths": [
+          "<project>/AGENTS.md",
+          "<project>/.opencode/skills/goal-flight/SKILL.md",
+          "<project>/opencode.json"
+        ],
+        "requires_restart": true
+      },
+      {
+        "id": "opencode-agents-standard-controller",
+        "label": "Standard ~/.agents skill",
+        "role": "controller",
+        "surface": "config",
+        "default": false,
+        "probe_ids": [],
+        "install_action_sources": [
+          "configs/opencode/skills/goal-flight/SKILL.md"
+        ],
+        "commands": ["./setup.sh --opencode-agents-standard --apply --yes"],
+        "paths": ["~/.agents/skills/goal-flight/SKILL.md"],
+        "requires_restart": true
+      },
+      {
+        "id": "opencode-claude-link-controller",
+        "label": "Link Claude skill into OpenCode",
+        "role": "controller",
+        "surface": "config",
+        "default": false,
+        "probe_ids": [],
+        "install_action_sources": [
+          "~/.claude/skills/goal-flight"
+        ],
+        "commands": ["./setup.sh --opencode-link-claude --apply --yes"],
+        "paths": [
+          "~/.claude/skills/goal-flight",
+          "~/.config/opencode/skills/goal-flight"
+        ],
+        "requires_restart": true
+      }
+    ],
+    "worker_destinations": [
+      {
+        "id": "opencode-acp-worker",
+        "label": "OpenCode ACP worker",
+        "role": "worker",
+        "surface": "cli",
+        "default": true,
+        "probe_ids": ["opencode-path", "opencode-version", "opencode-acp-help"],
+        "install_action_sources": [],
+        "commands": ["opencode acp"],
+        "paths": ["$(command -v opencode)"],
+        "requires_restart": false
+      }
+    ],
+    "addons": [
+      {
+        "id": "context-mode",
+        "label": "context-mode MCP sandbox",
+        "default": true,
+        "compatible_destination_ids": [
+          "opencode-global-controller",
+          "opencode-project-controller",
+          "opencode-agents-standard-controller",
+          "opencode-claude-link-controller",
+          "opencode-acp-worker"
+        ],
+        "install_mode": "setup",
+        "commands": ["python3 scripts/register-context-mode-opencode.py --scope global"],
+        "paths": ["~/.config/opencode/opencode.json", "<project>/opencode.json"]
+      },
+      {
+        "id": "gstack",
+        "label": "gstack skills",
+        "default": true,
+        "compatible_destination_ids": [
+          "opencode-global-controller",
+          "opencode-project-controller",
+          "opencode-agents-standard-controller",
+          "opencode-claude-link-controller",
+          "opencode-acp-worker"
+        ],
+        "install_mode": "init_self_check",
+        "commands": ["test -d ~/.gstack/repos/gstack/.agents/skills"],
+        "paths": ["~/.gstack", "~/.config/opencode/skills/"]
+      }
     ]
   },
   "discovery": {
-    "budget": {
-      "max_path_probes": 1,
-      "max_version_probes": 1,
-      "max_help_probes": 1,
-      "max_ms_per_probe": 5000,
-      "max_total_ms_per_agent": 15000,
-      "max_total_ms_all_agents": 90000,
-      "max_stdout_bytes_per_probe": 4096,
-      "max_stderr_bytes_per_probe": 4096,
-      "network_default": "deny",
-      "model_consuming": "forbidden"
-    },
+    "budget": {"max_path_probes": 2, "max_version_probes": 1, "max_help_probes": 1, "max_ms_per_probe": 6000, "max_total_ms_per_agent": 20000, "max_total_ms_all_agents": 90000, "max_stdout_bytes_per_probe": 4096, "max_stderr_bytes_per_probe": 4096, "network_default": "deny", "model_consuming": "forbidden"},
     "probes": [
-      {
-        "id": "opencode-path",
-        "class": "path",
-        "argv": [
-          "sh",
-          "-lc",
-          "command -v opencode"
-        ],
-        "safe_for_setup": true,
-        "network": false,
-        "model_consuming": false,
-        "env_scrub": true
-      },
-      {
-        "id": "opencode-version",
-        "class": "version",
-        "argv": [
-          "opencode",
-          "--version"
-        ],
-        "safe_for_setup": true,
-        "network": false,
-        "model_consuming": false,
-        "env_scrub": true
-      },
-      {
-        "id": "opencode-help",
-        "class": "help",
-        "argv": [
-          "opencode",
-          "--help"
-        ],
-        "safe_for_setup": true,
-        "network": false,
-        "model_consuming": false,
-        "env_scrub": true
-      }
+      {"id": "opencode-path", "class": "path", "argv": ["sh", "-lc", "command -v opencode"], "safe_for_setup": true, "network": false, "model_consuming": false, "env_scrub": true},
+      {"id": "opencode-version", "class": "version", "argv": ["opencode", "--version"], "safe_for_setup": true, "network": false, "model_consuming": false, "env_scrub": true},
+      {"id": "opencode-acp-help", "class": "help", "argv": ["sh", "-lc", "opencode acp --help >/dev/null 2>&1 || opencode --help | grep -q acp"], "safe_for_setup": true, "network": false, "model_consuming": false, "env_scrub": true}
     ]
   },
   "status_contract": {
@@ -359,15 +325,10 @@
     "status_file": ".goal-flight/status/<dispatch_id>.json",
     "transport_instance_id": "opencode:<pid>:<dispatch_id>",
     "seq": "monotonic integer",
-    "parser_type": "cli_json",
+    "parser_type": "acp",
     "marker_namespace": "goalflight:<dispatch_id>:<transport>:<seq>",
-    "stale_after_s": 120,
-    "terminal_states": [
-      "complete",
-      "failed",
-      "blocked",
-      "wedged"
-    ]
+    "stale_after_s": 180,
+    "terminal_states": ["complete", "failed", "blocked", "wedged"]
   },
   "host_projection": {}
 }

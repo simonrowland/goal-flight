@@ -1,0 +1,17 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": [
+    "opencode-plugin-litellm@latest"
+  ],
+  "model": "litellm/frontier-coder",
+  "provider": {
+    "litellm": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "LiteLLM (RPP)",
+      "options": {
+        "baseURL": "http://rpp-ctrl-3:4000/v1",
+        "apiKey": "{env:LITELLM_API_KEY}"
+      }
+    }
+  }
+}

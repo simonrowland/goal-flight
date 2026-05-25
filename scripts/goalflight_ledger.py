@@ -34,6 +34,9 @@ WORKER_PATTERNS = (
     "grok",
     "cursor-agent",
     "claude-code-cli-acp",
+    "opencode",
+    "opencode-acp",
+    "opencode-bash-tail",
 )
 
 

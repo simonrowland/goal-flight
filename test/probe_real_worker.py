@@ -3,6 +3,12 @@
 Usage:
   ~/.goal-flight/venvs/acp-0.10/bin/python test/probe_real_worker.py codex-acp
   ~/.goal-flight/venvs/acp-0.10/bin/python test/probe_real_worker.py grok agent stdio
+  ~/.goal-flight/venvs/acp-0.10/bin/python test/probe_real_worker.py \\
+      --cwd /tmp/opencode-acp opencode acp
+
+Probe flags (--cwd, --timeout, --prompt) must appear before the worker command.
+Do not pass them after ``opencode acp`` — argparse would forward them to the
+worker and break the ACP handshake.
 
 Sends a single short prompt ("What is 2+2? Reply with just the number.") and
 prints a structured PromptResult summary plus timing breakdown. Useful for
@@ -75,14 +81,20 @@ async def probe(cmd: str, args: list[str], *, prompt: str, idle_timeout: float, 
 
 def main() -> int:
     p = argparse.ArgumentParser()
-    p.add_argument("cmd", help="worker CLI binary (e.g. codex-acp, grok)")
-    p.add_argument("args", nargs=argparse.REMAINDER, help="args to pass after cmd")
     p.add_argument("--prompt", default="What is 2+2? Reply with just the number.")
     p.add_argument("--timeout", type=float, default=120.0, help="idle_timeout per phase")
     p.add_argument("--cwd", default="/tmp/acp-probe", help="cwd handed to the worker")
+    p.add_argument("cmd", help="worker CLI binary (e.g. codex-acp, grok, opencode)")
+    p.add_argument("args", nargs=argparse.REMAINDER, help="args passed to the worker after cmd")
     a = p.parse_args()
+    worker_args = list(a.args)
+    if worker_args[:1] == ["--"]:
+        worker_args = worker_args[1:]
+    for bad in ("--prompt", "--timeout", "--cwd"):
+        if bad in worker_args:
+            p.error(f"{bad} must appear before the worker command, not in worker args")
     Path(a.cwd).mkdir(parents=True, exist_ok=True)
-    return asyncio.run(probe(a.cmd, a.args, prompt=a.prompt, idle_timeout=a.timeout, cwd=a.cwd))
+    return asyncio.run(probe(a.cmd, worker_args, prompt=a.prompt, idle_timeout=a.timeout, cwd=a.cwd))
 
 
 if __name__ == "__main__":
