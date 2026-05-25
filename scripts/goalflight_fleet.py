@@ -485,6 +485,17 @@ def cmd_status(args: argparse.Namespace) -> int:
                 continue
             if doc and doc.get("state") == "active":
                 info["account_locks_active"] += 1
+    fleet_path = args.fleet_dir / "fleet.json"
+    if fleet_path.exists():
+        try:
+            fleet_doc = read_json(fleet_path)
+            nodes = fleet_doc.get("nodes") or {}
+            info["nodes"] = {
+                "count": len(nodes),
+                "ids": sorted(nodes.keys()),
+            }
+        except (OSError, json.JSONDecodeError, schemas.SchemaError):
+            info["nodes"] = {"count": 0, "ids": [], "error": "invalid fleet.json"}
     print(json.dumps(info, indent=2))
     return 0 if info["exists"] else 1
 
@@ -700,6 +711,21 @@ def main(argv: list[str] | None = None) -> int:
     st_explain = steering_sub.add_parser("explain")
     st_explain.add_argument("--chunk", type=Path)
     st_explain.set_defaults(func=cmd_steering_explain)
+
+    node = sub.add_parser("node")
+    node_sub = node.add_subparsers(dest="node_cmd", required=True)
+    import goalflight_fleet_node as fleet_node
+
+    node_add = node_sub.add_parser("add", help="Onboard a remote node from an SSH alias")
+    node_add.add_argument("--from-ssh", required=True, help="SSH config Host alias")
+    node_add.add_argument("--node-id", help="Fleet node id (defaults to alias)")
+    node_add.add_argument("--repo-root", help="Absolute repo path on remote host")
+    node_add.add_argument("--state-dir", help="Remote goal-flight state dir")
+    node_add.add_argument("--billing-accounts", help="Comma-separated account_key values")
+    node_add.add_argument("--ssh-config", type=Path, help="Path to ssh config (default ~/.ssh/config)")
+    node_add.add_argument("--dry-run", action="store_true")
+    node_add.add_argument("--json", action="store_true")
+    node_add.set_defaults(func=fleet_node.cmd_node_add)
 
     args = parser.parse_args(argv)
     return args.func(args)

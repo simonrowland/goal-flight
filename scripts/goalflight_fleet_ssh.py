@@ -1,0 +1,317 @@
+#!/usr/bin/env python3
+"""SSH remote command allowlist for fleet operations (Track A goal 3)."""
+
+from __future__ import annotations
+
+import re
+import shlex
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable
+
+ALLOWED_COMMAND_CLASSES = frozenset(
+    {
+        "probe_echo",
+        "probe_repo_exists",
+        "probe_script_exists",
+        "doctor",
+        "status",
+        "capacity",
+        "acp_run",
+        "git_fetch",
+        "git_checkout",
+        "git_worktree_add",
+        "git_worktree_remove",
+        "read_status_file",
+        "read_lease_file",
+    }
+)
+
+UNSAFE_COMMAND_CLASSES = frozenset({"shell", "arbitrary"})
+
+SHELL_METACHAR_RE = re.compile(r"[;&|`<>()$\\]|\$\(")
+
+REMEDIATION_HINTS: dict[str, str] = {
+    "host_key_mismatch": "Run: ssh-keygen -R <host> && ssh <alias> true",
+    "repo_missing": "Clone the repo on the remote host or fix --repo-root",
+    "script_missing": "Ensure goal-flight scripts exist under the remote repo_root",
+    "auth_drift": "Run adapter auth probe on the remote (e.g. codex login status)",
+    "probe_failed": "Verify SSH alias, identity file, and BatchMode connectivity",
+    "allowlist_blocked": "Command class is not on the fleet SSH allowlist",
+    "unsafe_remote_blocked": "Set unsafe_remote only after explicit USER-CONFIRM",
+}
+
+
+class SshAllowlistError(Exception):
+    def __init__(self, message: str, *, code: str = "allowlist_blocked") -> None:
+        self.code = code
+        self.remediation = REMEDIATION_HINTS.get(code, REMEDIATION_HINTS["allowlist_blocked"])
+        super().__init__(message)
+
+
+@dataclass(frozen=True)
+class SshHostSpec:
+    alias: str
+    hostname: str
+    user: str | None = None
+    port: int | None = None
+    identity_file: str | None = None
+
+
+def validate_remote_argv(argv: list[str]) -> None:
+    if not isinstance(argv, list) or not argv:
+        raise SshAllowlistError("remote argv must be a non-empty list")
+    for idx, part in enumerate(argv):
+        if not isinstance(part, str) or not part:
+            raise SshAllowlistError(f"remote argv[{idx}] must be a non-empty string")
+        if "\n" in part or "\r" in part:
+            raise SshAllowlistError(f"remote argv[{idx}] contains newline")
+        if SHELL_METACHAR_RE.search(part):
+            raise SshAllowlistError(f"remote argv[{idx}] contains shell metacharacters")
+
+
+def assert_allowed(command_class: str, *, unsafe_remote: bool = False) -> None:
+    if command_class in UNSAFE_COMMAND_CLASSES:
+        if not unsafe_remote:
+            raise SshAllowlistError(
+                f"command class {command_class!r} requires unsafe_remote=true",
+                code="unsafe_remote_blocked",
+            )
+        return
+    if command_class not in ALLOWED_COMMAND_CLASSES:
+        raise SshAllowlistError(
+            f"command class not allowlisted: {command_class}",
+            code="allowlist_blocked",
+        )
+
+
+def _require_repo_root(repo_root: str) -> str:
+    if not repo_root or not isinstance(repo_root, str):
+        raise SshAllowlistError("repo_root is required")
+    return repo_root
+
+
+def build_remote_command(command_class: str, **params: Any) -> list[str]:
+    assert_allowed(command_class, unsafe_remote=bool(params.get("unsafe_remote")))
+    python = str(params.get("python") or "python3")
+
+    if command_class == "probe_echo":
+        argv = ["echo", "goal-flight-probe-ok"]
+        validate_remote_argv(argv)
+        return argv
+
+    repo_root = _require_repo_root(str(params.get("repo_root") or ""))
+    if command_class == "probe_repo_exists":
+        argv = ["test", "-d", repo_root]
+    elif command_class == "probe_script_exists":
+        script = str(params.get("script") or "scripts/goalflight_doctor.py")
+        argv = ["test", "-x", f"{repo_root}/{script}".replace("//", "/")]
+    elif command_class == "doctor":
+        argv = [python, f"{repo_root}/scripts/goalflight_doctor.py", "--json"]
+    elif command_class == "status":
+        argv = [python, f"{repo_root}/scripts/goalflight_capacity.py", "status", "--json"]
+    elif command_class == "capacity":
+        argv = [python, f"{repo_root}/scripts/goalflight_capacity.py", "status", "--json"]
+    elif command_class == "acp_run":
+        dispatch_id = str(params.get("dispatch_id") or "")
+        agent = str(params.get("agent") or "")
+        prompt = str(params.get("prompt") or "")
+        if not dispatch_id or not agent:
+            raise SshAllowlistError("acp_run requires dispatch_id and agent")
+        argv = [
+            python,
+            f"{repo_root}/scripts/goalflight_acp_run.py",
+            "--agent",
+            agent,
+            "--cwd",
+            repo_root,
+            "--dispatch-id",
+            dispatch_id,
+            "--prompt-text",
+            prompt,
+            "--json",
+        ]
+    elif command_class == "git_fetch":
+        argv = ["git", "-C", repo_root, "fetch", "--quiet", "origin"]
+    elif command_class == "git_checkout":
+        ref = str(params.get("ref") or "HEAD")
+        argv = ["git", "-C", repo_root, "checkout", ref]
+    elif command_class == "git_worktree_add":
+        path = str(params.get("worktree_path") or "")
+        ref = str(params.get("ref") or "HEAD")
+        if not path:
+            raise SshAllowlistError("git_worktree_add requires worktree_path")
+        argv = ["git", "-C", repo_root, "worktree", "add", path, ref]
+    elif command_class == "git_worktree_remove":
+        path = str(params.get("worktree_path") or "")
+        if not path:
+            raise SshAllowlistError("git_worktree_remove requires worktree_path")
+        argv = ["git", "-C", repo_root, "worktree", "remove", path]
+    elif command_class == "read_status_file":
+        status_path = str(params.get("status_path") or "")
+        if not status_path:
+            raise SshAllowlistError("read_status_file requires status_path")
+        argv = ["cat", status_path]
+    elif command_class == "read_lease_file":
+        lease_path = str(params.get("lease_path") or "")
+        if not lease_path:
+            raise SshAllowlistError("read_lease_file requires lease_path")
+        argv = ["cat", lease_path]
+    else:
+        raise SshAllowlistError(f"unsupported command class: {command_class}")
+
+    validate_remote_argv(argv)
+    return argv
+
+
+def build_ssh_command(
+    host: SshHostSpec,
+    remote_argv: list[str],
+    *,
+    command_class: str | None = None,
+    unsafe_remote: bool = False,
+) -> list[str]:
+    if command_class is not None:
+        assert_allowed(command_class, unsafe_remote=unsafe_remote)
+    validate_remote_argv(remote_argv)
+    target = host.alias
+    if host.user:
+        target = f"{host.user}@{host.hostname}"
+    else:
+        target = host.hostname
+    cmd = ["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new"]
+    if host.port:
+        cmd.extend(["-p", str(host.port)])
+    if host.identity_file:
+        cmd.extend(["-i", str(Path(host.identity_file).expanduser())])
+    cmd.append(target)
+    cmd.append("--")
+    cmd.extend(remote_argv)
+    return cmd
+
+
+def parse_ssh_config(alias: str, config_path: Path | None = None) -> SshHostSpec:
+    path = config_path or Path.home() / ".ssh" / "config"
+    if not path.exists():
+        raise SshAllowlistError(f"ssh config not found: {path}", code="probe_failed")
+    blocks: dict[str, dict[str, str]] = {}
+    current: str | None = None
+    for raw in path.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        lower = line.lower()
+        if lower.startswith("host "):
+            current = line.split(None, 1)[1].strip()
+            blocks.setdefault(current, {})
+            continue
+        if current is None:
+            continue
+        parts = line.split(None, 1)
+        if len(parts) != 2:
+            continue
+        key, value = parts[0].lower(), parts[1].strip()
+        blocks[current][key] = value
+    if alias not in blocks:
+        raise SshAllowlistError(f"ssh Host alias not found: {alias}", code="probe_failed")
+    stanza = blocks[alias]
+    hostname = stanza.get("hostname", alias)
+    user = stanza.get("user")
+    port_raw = stanza.get("port")
+    port = int(port_raw) if port_raw and port_raw.isdigit() else None
+    identity = stanza.get("identityfile")
+    return SshHostSpec(alias=alias, hostname=hostname, user=user, port=port, identity_file=identity)
+
+
+def run_ssh(
+    argv: list[str],
+    *,
+    runner: Callable[[list[str]], tuple[int, str, str]] | None = None,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    if dry_run:
+        return {"ok": True, "dry_run": True, "argv": argv, "stdout": "", "stderr": "", "exit_code": 0}
+    if runner is None:
+        import subprocess
+
+        def _default_runner(cmd: list[str]) -> tuple[int, str, str]:
+            proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            return proc.returncode, proc.stdout, proc.stderr
+
+        runner = _default_runner
+    code, stdout, stderr = runner(argv)
+    return {
+        "ok": code == 0,
+        "argv": argv,
+        "stdout": stdout,
+        "stderr": stderr,
+        "exit_code": code,
+    }
+
+
+def format_remediation(error: SshAllowlistError) -> str:
+    return f"{error} | hint: {error.remediation}"
+
+
+def cmd_validate(args) -> int:
+    import argparse
+    import json
+    import sys
+
+    if not isinstance(args, argparse.Namespace):
+        raise TypeError("expected argparse.Namespace")
+    try:
+        assert_allowed(args.command_class, unsafe_remote=args.unsafe_remote)
+        remote = build_remote_command(
+            args.command_class,
+            repo_root=args.repo_root,
+            dispatch_id=args.dispatch_id,
+            agent=args.agent,
+            unsafe_remote=args.unsafe_remote,
+        )
+    except SshAllowlistError as exc:
+        print(format_remediation(exc), file=sys.stderr)
+        return 1
+    if args.alias:
+        host = parse_ssh_config(args.alias, args.ssh_config)
+    else:
+        host = SshHostSpec(alias="local", hostname="localhost")
+    ssh_cmd = build_ssh_command(
+        host,
+        remote,
+        command_class=args.command_class,
+        unsafe_remote=args.unsafe_remote,
+    )
+    print(json.dumps({"remote": remote, "ssh": ssh_cmd}, indent=2))
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    import argparse
+    import json
+
+    parser = argparse.ArgumentParser(description="Goal Flight fleet SSH allowlist")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    validate = sub.add_parser("validate")
+    validate.add_argument("--command-class", required=True)
+    validate.add_argument("--repo-root", default="/tmp/goal-flight")
+    validate.add_argument("--alias")
+    validate.add_argument("--ssh-config", type=Path)
+    validate.add_argument("--dispatch-id")
+    validate.add_argument("--agent")
+    validate.add_argument("--unsafe-remote", action="store_true")
+    validate.set_defaults(func=cmd_validate)
+
+    explain = sub.add_parser("remediation")
+    explain.add_argument("--code", default="allowlist_blocked")
+    explain.set_defaults(
+        func=lambda args: print(REMEDIATION_HINTS.get(args.code, REMEDIATION_HINTS["allowlist_blocked"])) or 0
+    )
+
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
