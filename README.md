@@ -7,108 +7,19 @@ goal-flight is a multi-agent controller, which delegates coding /goal and parall
 **What the controller is for**: high-level management, not execution. The controller holds enough context about your project's goal, scenery (constraints, architecture, prior decisions, failure modes), and intent to exercise discretion and recommend the next move — then dispatches actual work to workers to run in an iterative code-review goal loop. This workflow allows lightly-supervised coding: you check in, ratify suggested moves, redirect when needed, and trust the controller to keep the project anchored across compactions and unattended hours. The dispatch / review / handoff machinery below is what frees the controller to do that job.
 
 ```bash
-# Claude Code install (reference controller):
+# Claude Code (reference controller):
 git clone https://github.com/simonrowland/goal-flight.git ~/.claude/skills/goal-flight
-# Codex / Cursor / OpenCode: clone once, then use ./setup.sh --codex | --cursor | --opencode (see below).
+
+# Codex / Cursor / OpenCode — clone once, then one command per host (global + project):
+git clone https://github.com/simonrowland/goal-flight.git ~/Repos/goal-flight && cd ~/Repos/goal-flight
+./install.sh cursor /path/to/your/project
+./install.sh opencode /path/to/your/project
+./install.sh codex
 ```
 
-## Install in Cursor
+Restart the host, then run doctor: `python3 scripts/goalflight_doctor.py --project-root /path/to/your/project`.
 
-Clone Goal Flight once, then run setup from that clone. `install.sh` is a thin
-alias for `setup.sh`. Setup is dry-run first; add `--apply --yes` only after the
-planned writes look right.
-
-```bash
-git clone https://github.com/simonrowland/goal-flight.git ~/Repos/goal-flight
-cd ~/Repos/goal-flight
-
-# Global Cursor install: ~/.cursor/AGENTS.md, ~/.cursor/skills/, ~/.cursor/rules/,
-# and ~/.cursor/mcp.json for context-mode.
-./setup.sh --cursor
-./setup.sh --apply --yes --cursor
-
-# Per-project install: <project>/.cursor/AGENTS.md, .cursor/skills/, .cursor/rules/,
-# and <project>/.cursor/mcp.json when context-mode is selected.
-./setup.sh --cursor-project /path/to/project
-./setup.sh --apply --yes --cursor-project /path/to/project
-
-# Standard agents skill location.
-./setup.sh --apply --yes --cursor-agents-standard
-
-# Link Cursor to an existing Claude skill checkout instead of copying.
-./setup.sh --apply --yes --cursor-link-claude --addons ''
-```
-
-Cursor MCP config uses JSON, not Claude or Codex settings. Cursor's CLI and
-editor use the same MCP configuration and discover project/global `mcp.json`
-files ([Cursor docs](https://docs.cursor.com/cli/mcp)). The global file is
-`~/.cursor/mcp.json`; a project-specific file is `<project>/.cursor/mcp.json`.
-Goal Flight writes this context-mode entry, resolving `npx` to an executable
-absolute path on the machine:
-
-```json
-{
-  "mcpServers": {
-    "context-mode": {
-      "command": "/absolute/path/to/npx",
-      "args": ["-y", "context-mode@latest"]
-    }
-  }
-}
-```
-
-After install, restart Cursor and verify discovery:
-
-```bash
-cursor-agent mcp list
-cursor-agent mcp enable context-mode    # if list says the server needs approval
-cursor-agent mcp list-tools context-mode
-python3 ~/Repos/goal-flight/scripts/goalflight_doctor.py --project-root /path/to/project
-```
-
-If Cursor does not auto-load the skill, mention `goal-flight` in the agent chat;
-the wrapper tells Cursor to read the project `AGENTS.md`, root `SKILL.md`, and
-invoked `commands/*.md` files.
-
-## Install in OpenCode
-
-OpenCode is a Claude Code-compatible host with native skills, `AGENTS.md`, and
-ACP worker transport via `opencode acp`. Setup mirrors the Cursor port.
-
-```bash
-git clone https://github.com/simonrowland/goal-flight.git ~/Repos/goal-flight
-cd ~/Repos/goal-flight
-
-# Global OpenCode install: ~/.config/opencode/AGENTS.md, skills/, and opencode.json
-# for context-mode MCP plus goal-flight skill permissions.
-./setup.sh --opencode
-./setup.sh --apply --yes --opencode
-
-# Per-project install: <project>/AGENTS.md, .opencode/skills/, and opencode.json.
-./setup.sh --opencode-project /path/to/project
-./setup.sh --apply --yes --opencode-project /path/to/project
-
-# Standard agents skill location.
-./setup.sh --apply --yes --opencode-agents-standard
-
-# Link OpenCode to an existing Claude skill checkout instead of copying.
-./setup.sh --apply --yes --opencode-link-claude --addons ''
-```
-
-OpenCode MCP servers live in JSON config, not Cursor-style `mcp.json`. The global
-file is `~/.config/opencode/opencode.json`; a project-specific file is
-`<project>/opencode.json`. Goal Flight merges a checked-in fragment that allows
-the `goal-flight` skills and registers context-mode when `npx` is available.
-
-After install, restart OpenCode and verify discovery:
-
-```bash
-opencode mcp list
-opencode mcp auth list
-python3 ~/Repos/goal-flight/scripts/goalflight_doctor.py --project-root /path/to/project
-```
-
-See [OPENCODE.md](OPENCODE.md) for host-specific notes.
+Same flags via `setup.sh`: `--cursor-install`, `--opencode-install`, and `--codex-install` (each implies `--apply --yes`). Dry-run, link-to-Claude, and agents-standard paths are in [CURSOR.md](CURSOR.md) and [OPENCODE.md](OPENCODE.md).
 
 ## What it gets you
 

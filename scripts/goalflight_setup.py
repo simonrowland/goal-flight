@@ -1163,9 +1163,48 @@ def _apply(
     print(f"BACKUP_MANIFEST {backup_manifest}")
 
 
+def _expand_host_install_shortcuts(args: argparse.Namespace) -> None:
+    """Map one-shot install flags onto the existing cursor/opencode/codex setup paths."""
+    cursor_install = getattr(args, "cursor_install", None)
+    if cursor_install is not None:
+        args.apply = True
+        args.yes = True
+        args.cursor = True
+        args.cursor_project = cursor_install
+    opencode_install = getattr(args, "opencode_install", None)
+    if opencode_install is not None:
+        args.apply = True
+        args.yes = True
+        args.opencode = True
+        args.opencode_project = opencode_install
+    if getattr(args, "codex_install", False):
+        args.apply = True
+        args.yes = True
+        args.agent = args.agent or "codex"
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Goal Flight setup registrar")
     parser.add_argument("--agent", help="adapter id, e.g. codex or cursor")
+    parser.add_argument(
+        "--cursor-install",
+        nargs="?",
+        const=".",
+        metavar="PATH",
+        help="one-shot Cursor install (global + project at PATH); implies --apply --yes",
+    )
+    parser.add_argument(
+        "--opencode-install",
+        nargs="?",
+        const=".",
+        metavar="PATH",
+        help="one-shot OpenCode install (global + project at PATH); implies --apply --yes",
+    )
+    parser.add_argument(
+        "--codex-install",
+        action="store_true",
+        help="one-shot Codex plugin + CLI worker install; implies --apply --yes --agent codex",
+    )
     parser.add_argument("--cursor", action="store_true", help="shortcut for the default Cursor controller/worker setup")
     parser.add_argument(
         "--cursor-project",
@@ -1214,6 +1253,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--from-manifest", help="backup manifest created by --apply")
     parser.add_argument("--repo-root", default=str(REPO_ROOT), help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+    _expand_host_install_shortcuts(args)
 
     try:
         repo_root = Path(args.repo_root).resolve()
@@ -1229,7 +1269,22 @@ def main(argv: list[str] | None = None) -> int:
         if args.list_agents:
             _list_agents(repo_root, manifests)
             return 0
-        if args.tui or (not args.agent and not args.controllers and not args.workers and sys.stdin.isatty()):
+        host_install = (
+            args.cursor
+            or args.cursor_project
+            or args.opencode
+            or args.opencode_project
+            or getattr(args, "cursor_install", None) is not None
+            or getattr(args, "opencode_install", None) is not None
+            or getattr(args, "codex_install", False)
+        )
+        if args.tui or (
+            not args.agent
+            and not args.controllers
+            and not args.workers
+            and not host_install
+            and sys.stdin.isatty()
+        ):
             controllers, workers, addons = _interactive_selection(manifests)
             _run_selection(
                 repo_root,

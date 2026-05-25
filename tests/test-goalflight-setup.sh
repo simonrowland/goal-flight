@@ -158,6 +158,19 @@ run_setup --uninstall --from-manifest "$cursor_manifest" >/tmp/goal-flight-setup
 [ ! -e "$HOME/.cursor/skills/goal-flight/SKILL.md" ] || fail "cursor uninstall did not remove new skill"
 [ ! -e "$HOME/.cursor/mcp.json" ] || fail "cursor uninstall did not remove new MCP config"
 
+CURSOR_ONE_SHOT="$TMP_ROOT/cursor-one-shot"
+mkdir -p "$CURSOR_ONE_SHOT"
+CURSOR_ONE_SHOT="$(cd "$CURSOR_ONE_SHOT" && pwd -P)"
+cursor_install_out="$(bash "$REPO_ROOT/install.sh" cursor "$CURSOR_ONE_SHOT" --addons '' 2>&1)"
+printf '%s\n' "$cursor_install_out" | grep -q '^APPLY ' || fail "install.sh cursor should apply writes"
+printf '%s\n' "$cursor_install_out" | grep -q 'CONTROLLER_SURFACE cursor desktop' || fail "cursor-install missing global controller"
+printf '%s\n' "$cursor_install_out" | grep -q "$CURSOR_ONE_SHOT/.cursor/skills/goal-flight/SKILL.md" || fail "cursor-install missing project skill apply"
+[ -f "$CURSOR_ONE_SHOT/.cursor/skills/goal-flight/SKILL.md" ] || fail "cursor-install project skill missing"
+while read -r cursor_install_manifest; do
+  [ -n "$cursor_install_manifest" ] || continue
+  run_setup --uninstall --from-manifest "$cursor_install_manifest" >/tmp/goal-flight-setup-cursor-install-uninstall.out
+done <<< "$(printf '%s\n' "$cursor_install_out" | awk '/^BACKUP_MANIFEST /{print $2}')"
+
 NO_NPX_HOME="$TMP_ROOT/no-npx-home"
 NO_NPX_STATE="$TMP_ROOT/no-npx-state"
 NO_NPX_BIN="$TMP_ROOT/no-npx-bin"
@@ -287,6 +300,19 @@ run_setup --uninstall --from-manifest "$opencode_manifest" >/tmp/goal-flight-set
 [ ! -e "$HOME/.config/opencode/AGENTS.md" ] || fail "opencode uninstall did not remove new AGENTS"
 [ ! -e "$HOME/.config/opencode/skills/goal-flight/SKILL.md" ] || fail "opencode uninstall did not remove new skill"
 [ ! -e "$HOME/.config/opencode/opencode.json" ] || fail "opencode uninstall did not remove new config"
+
+OPENCODE_ONE_SHOT="$TMP_ROOT/opencode-one-shot"
+mkdir -p "$OPENCODE_ONE_SHOT"
+OPENCODE_ONE_SHOT="$(cd "$OPENCODE_ONE_SHOT" && pwd -P)"
+opencode_install_out="$(bash "$REPO_ROOT/install.sh" opencode "$OPENCODE_ONE_SHOT" --addons '' 2>&1)"
+printf '%s\n' "$opencode_install_out" | grep -q '^APPLY ' || fail "install.sh opencode should apply writes"
+printf '%s\n' "$opencode_install_out" | grep -q 'CONTROLLER_SURFACE opencode' || fail "opencode-install missing global controller"
+printf '%s\n' "$opencode_install_out" | grep -q "$OPENCODE_ONE_SHOT/.opencode/skills/goal-flight/SKILL.md" || fail "opencode-install missing project skill apply"
+[ -f "$OPENCODE_ONE_SHOT/.opencode/skills/goal-flight/SKILL.md" ] || fail "opencode-install project skill missing"
+while read -r opencode_install_manifest; do
+  [ -n "$opencode_install_manifest" ] || continue
+  run_setup --uninstall --from-manifest "$opencode_install_manifest" >/tmp/goal-flight-setup-opencode-install-uninstall.out
+done <<< "$(printf '%s\n' "$opencode_install_out" | awk '/^BACKUP_MANIFEST /{print $2}')"
 
 NO_NPX_OPENCODE_HOME="$TMP_ROOT/no-npx-opencode-home"
 NO_NPX_OPENCODE_STATE="$TMP_ROOT/no-npx-opencode-state"
