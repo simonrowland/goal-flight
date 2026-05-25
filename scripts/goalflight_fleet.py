@@ -586,6 +586,12 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_dispatch(args: argparse.Namespace) -> int:
+    import goalflight_fleet_dispatch as fleet_dispatch
+
+    return fleet_dispatch.cmd_dispatch(args)
+
+
 def cmd_watch(args: argparse.Namespace) -> int:
     if not args.fleet:
         print("watch requires --fleet", file=sys.stderr)
@@ -726,6 +732,19 @@ def main(argv: list[str] | None = None) -> int:
     recon.add_argument("--dispatch-id", help="Reconcile one in-flight dispatch row")
     recon.add_argument("--all-in-flight", action="store_true", help="Reconcile all in-flight rows")
     recon.set_defaults(func=cmd_reconcile)
+
+    dispatch = sub.add_parser("dispatch", help="Remote dispatch preview/exec (MVP)")
+    dispatch.add_argument("--node", required=True)
+    dispatch.add_argument("--prompt", required=True)
+    dispatch.add_argument("--agent", help="Explicit agent (required unless --thin-defaults)")
+    dispatch.add_argument("--billing-account", help="Explicit billing account")
+    dispatch.add_argument("--dispatch-id")
+    dispatch.add_argument("--thin-defaults", action="store_true", help="Fill agent/billing from steering")
+    dispatch.add_argument("--exec", action="store_true", help="Acquire locks and spawn (default preview)")
+    dispatch.add_argument("--stub-remote", action="store_true", help="Use stub SSH runner (tests)")
+    dispatch.add_argument("--stub-terminal", action="store_true", help="Complete stub dispatch immediately")
+    dispatch.add_argument("--json", action="store_true")
+    dispatch.set_defaults(func=cmd_dispatch)
 
     watch = sub.add_parser("watch", help="Mirror remote dispatch status into controller register")
     watch.add_argument("--fleet", action="store_true", help="Watch all in-flight fleet dispatches")
