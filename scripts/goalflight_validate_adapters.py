@@ -46,7 +46,6 @@ FORBIDDEN_ROOT_CODEX_PACKAGE_PATHS = [
 SURVEY_WORKER_STUBS = {
     "gemini",
     "qwen",
-    "opencode",
     "kilocode",
     "kiro",
     "copilot",

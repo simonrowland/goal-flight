@@ -953,6 +953,35 @@ def case_permission_policy_unit() -> None:
     assert policy({"title": "Approve Index Content"}, [], cwd) == PERMISSION_ALLOW
 
 
+def case_permission_policy_os_sandbox_unit() -> None:
+    import types
+    from goalflight_acp_client import (
+        default_permission_policy as base_policy,
+        permission_policy_for_dispatch,
+        PERMISSION_ALLOW,
+        PERMISSION_ESCALATE,
+    )
+    from goalflight_os_sandbox import OS_SANDBOX_OFF, OS_SANDBOX_READ_ONLY
+    cwd = str(ROOT)
+
+    def tc(**kw) -> types.SimpleNamespace:
+        return types.SimpleNamespace(**kw)
+
+    off = permission_policy_for_dispatch(OS_SANDBOX_OFF)
+    ro = permission_policy_for_dispatch(OS_SANDBOX_READ_ONLY)
+
+    assert off(tc(locations=[], kind="execute"), [], cwd) == PERMISSION_ESCALATE
+    assert ro(tc(locations=[], kind="execute"), [], cwd) == PERMISSION_ALLOW
+    assert ro(tc(locations=[], kind="fetch"), [], cwd) == PERMISSION_ALLOW
+    assert ro(
+        tc(locations=[{"path": "/etc/hosts"}], kind="execute"), [], cwd
+    ) == PERMISSION_ESCALATE
+    # custom base policy still applies for non-side-effect kinds
+    assert ro(tc(locations=[{"path": str(ROOT / "scripts/x.py")}], kind="edit"), [], cwd) == PERMISSION_ALLOW
+    wrapped = permission_policy_for_dispatch(OS_SANDBOX_READ_ONLY, base=base_policy)
+    assert wrapped(tc(locations=[], kind="execute"), [], cwd) == PERMISSION_ALLOW
+
+
 def case_permits_ipc_roundtrip_unit() -> None:
     # The inline file-IPC contract: write a request, the controller lists it and
     # writes a decision, the worker reads it, then clears. Here we assert the
@@ -1231,6 +1260,7 @@ def main() -> None:
     case_permission_inline_rejects_nonallow_option_unit()
     case_permission_select_prefers_allow_once_unit()
     case_permission_policy_unit()
+    case_permission_policy_os_sandbox_unit()
     case_permits_ipc_roundtrip_unit()
     case_permits_ack_roundtrip_unit()
     case_permits_fifo_decision_does_not_hide_unit()

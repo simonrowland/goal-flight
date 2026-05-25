@@ -35,6 +35,9 @@ AGENT_RSS_MB = {
     "claude-code-cli-acp": 614,
     "cursor": 1203,
     "cursor-agent": 1203,
+    "opencode": 386,
+    "opencode-acp": 386,
+    "opencode-bash-tail": 386,
 }
 # Per-agent concurrency caps, machine-global across goal-flight sessions.
 # Sized to support multi-session parallel work. The adaptive busy-signal
@@ -56,6 +59,9 @@ DEFAULT_AGENT_CAPS = {
     # share one Cursor subscription budget.
     "cursor": 3,
     "cursor-agent": 3,
+    "opencode": 10,
+    "opencode-acp": 10,
+    "opencode-bash-tail": 10,
     # claude-code-cli-acp PTY-drives the interactive Claude TUI and tails the
     # session transcript with a HARDCODED 120s per-turn timeout (not exposed in
     # ACP-server mode). 2026-05-20: 4 SIMULTANEOUS dispatches starve each other on
@@ -194,6 +200,7 @@ def detect_tools() -> dict:
         "claude-code-cli-acp": bool(shutil.which("claude-code-cli-acp")),
         "cursor": bool(shutil.which("cursor")),
         "cursor-agent": Path(cursor_agent).exists() if cursor_agent else False,
+        "opencode": bool(shutil.which("opencode")),
         "grok": Path(grok).exists() if grok else False,
     }
     return tools

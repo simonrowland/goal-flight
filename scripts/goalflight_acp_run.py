@@ -95,6 +95,8 @@ def _resolve_manifest_binary(binary: str) -> str:
         return shutil.which("grok") or str(Path.home() / ".grok/bin/grok")
     if binary == "cursor-agent":
         return shutil.which("cursor-agent") or str(Path.home() / ".local/bin/cursor-agent")
+    if binary == "opencode":
+        return shutil.which("opencode") or str(Path.home() / ".local/bin/opencode")
     if "/" in binary:
         return str(Path(binary).expanduser())
     return shutil.which(binary) or binary

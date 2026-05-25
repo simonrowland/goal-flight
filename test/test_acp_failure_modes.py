@@ -22,6 +22,7 @@ from goalflight_acp_client import (  # noqa: E402
     AcpError,
     AcpLivenessActivity,
     AcpProcessPool,
+    JsonRpcLineFilterReader,
     PoolExhaustedError,
 )
 from goalflight_acp_run import adapter_liveness_config, agent_command, decide_terminal_state, spawn_and_handshake_with_retry  # noqa: E402
@@ -199,6 +200,24 @@ def case_manifest_acp_command_defaults() -> None:
     binary, args = agent_command("codex-acp")
     assert binary == "codex-acp"
     assert args == []
+
+    binary, args = agent_command("opencode")
+    assert Path(binary).name == "opencode"
+    assert args == ["acp"]
+
+
+def case_json_rpc_stdout_filter() -> None:
+    async def _run() -> None:
+        inner = asyncio.StreamReader()
+        inner.feed_data(b"[opencode-litellm] discovered models\n")
+        inner.feed_data(b'{"jsonrpc":"2.0","id":1,"result":{}}\n')
+        inner.feed_eof()
+        filtered = JsonRpcLineFilterReader(inner)
+        line = await filtered.readuntil(b"\n")
+        assert line.startswith(b"{"), line
+        assert filtered.skipped_lines == 1
+
+    asyncio.run(_run())
 
 
 def _pid_alive(pid: object) -> bool:
@@ -764,6 +783,7 @@ def main() -> None:
     case_progress_stall_wall_ignores_raw_vendor_noise()
     case_adapter_manifest_liveness_defaults()
     case_manifest_acp_command_defaults()
+    case_json_rpc_stdout_filter()
     case_runner_raw_vendor_flood_hits_progress_stall_and_reaps()
     case_runner_progress_then_silent_wedges_and_reaps()
     case_runner_remote_long_reasoning_pause_survives_old_walls()

@@ -66,6 +66,12 @@ def test_provider_for_bash_tail_variants():
               rp.provider_for("codex-bash-tail"), "openai")
     assert_eq("grok-bash-tail → xai",
               rp.provider_for("grok-bash-tail"), "xai")
+    assert_eq("opencode → openai",
+              rp.provider_for("opencode"), "openai")
+    assert_eq("opencode-acp → openai",
+              rp.provider_for("opencode-acp"), "openai")
+    assert_eq("opencode-bash-tail → openai",
+              rp.provider_for("opencode-bash-tail"), "openai")
 
 
 # ----- detect_rate_limit_signature() -----
@@ -235,17 +241,29 @@ def test_recommend_above_threshold_halves_caps():
     """At threshold, recommended cap is current // 2 (floor 1)."""
     out = rp.recommend(
         {"openai": 5},
-        {"codex": 10, "codex-acp": 10, "codex-bash-tail": 10},
+        {
+            "codex": 10,
+            "codex-acp": 10,
+            "codex-bash-tail": 10,
+            "opencode": 10,
+            "opencode-acp": 10,
+            "opencode-bash-tail": 10,
+        },
         threshold=3,
     )
     assert_eq("one provider", len(out["providers_under_pressure"]), 1)
     pup = out["providers_under_pressure"][0]
     assert_eq("provider key", pup["provider"], "openai")
-    assert_eq("openai labels include bash-tail variant",
-              sorted(pup["labels"]), ["codex", "codex-acp", "codex-bash-tail"])
+    assert_eq("openai labels include bash-tail variants",
+              sorted(pup["labels"]),
+              ["codex", "codex-acp", "codex-bash-tail",
+               "opencode", "opencode-acp", "opencode-bash-tail"])
     assert_eq("codex halved", pup["recommended_caps"]["codex"], 5)
     assert_eq("codex-acp halved", pup["recommended_caps"]["codex-acp"], 5)
     assert_eq("codex-bash-tail halved", pup["recommended_caps"]["codex-bash-tail"], 5)
+    assert_eq("opencode halved", pup["recommended_caps"]["opencode"], 5)
+    assert_eq("opencode-acp halved", pup["recommended_caps"]["opencode-acp"], 5)
+    assert_eq("opencode-bash-tail halved", pup["recommended_caps"]["opencode-bash-tail"], 5)
 
 
 def test_recommend_cap_floor_one():

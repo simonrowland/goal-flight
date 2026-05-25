@@ -84,6 +84,9 @@ AGENT_TO_PROVIDER: dict[str, str] = {
     "grok-bash-tail": "xai",
     "cursor": "cursor",
     "cursor-agent": "cursor",
+    "opencode": "openai",
+    "opencode-acp": "openai",
+    "opencode-bash-tail": "openai",
 }
 
 # Default task-category fallback when a provider is under pressure. The
