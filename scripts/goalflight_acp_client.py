@@ -1303,6 +1303,7 @@ async def spawn_acp_connection(
     permission_user_timeout_s: float | None = None,
     context_mode: bool = True,
     os_sandbox: str = OS_SANDBOX_OFF,
+    env: dict[str, str] | None = None,
 ) -> GoalflightAcpConnection:
     require_acp_sdk()
     acp_args = ensure_codex_acp_args(command, acp_args, context_mode=context_mode)
@@ -1324,6 +1325,7 @@ async def spawn_acp_connection(
         cwd=cwd,
         start_new_session=True,
         limit=limit,
+        env=env,
     )
     if proc.stdin is None or proc.stdout is None:
         with contextlib.suppress(ProcessLookupError):

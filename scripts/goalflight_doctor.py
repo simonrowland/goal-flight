@@ -29,6 +29,11 @@ try:
 except Exception:  # pragma: no cover - doctor still reports partial state
     goalflight_rate_pressure = None
 
+try:
+    import goalflight_fleet
+except Exception:  # pragma: no cover - doctor still reports partial state
+    goalflight_fleet = None
+
 
 def run(cmd: list[str], cwd: Path | None = None, timeout: float = 8.0) -> dict:
     try:
@@ -573,6 +578,45 @@ def _goalflight_skill_root(agent_text: str) -> dict:
     }
 
 
+def check_router(repo: Path) -> dict:
+    """Track B: single-surface router readiness (optional field for JSON consumers)."""
+    actions_script = repo / "scripts" / "goalflight_actions.py"
+    bin_goalflight = repo / "bin" / "goalflight"
+    python = shutil.which("python3") or "python3"
+    out: dict = {
+        "bin_goalflight": _path_state(bin_goalflight),
+        "actions_script": _path_state(actions_script),
+        "recommended_entrypoint": "bin/goalflight <domain> <resource> <verb>",
+    }
+    if not actions_script.exists():
+        out["ok"] = False
+        out["reason"] = "goalflight_actions.py missing"
+        return out
+    validate = run([python, str(actions_script), "validate"], cwd=repo, timeout=15)
+    route = run(
+        [python, str(actions_script), "route", "core", "doctor", "read"],
+        cwd=repo,
+        timeout=10,
+    )
+    out["actions_validate"] = {
+        "ok": validate["ok"],
+        "returncode": validate["returncode"],
+    }
+    out["doctor_route_dry_run"] = {
+        "ok": route["ok"],
+        "returncode": route["returncode"],
+        "command_preview": first_line(route.get("stdout")),
+    }
+    out["ok"] = bool(validate["ok"] and route["ok"] and bin_goalflight.exists())
+    if not bin_goalflight.exists():
+        out["reason"] = "bin/goalflight missing — use scripts/goalflight_actions.py route"
+    elif not validate["ok"]:
+        out["reason"] = "action registry validate failed"
+    elif not route["ok"]:
+        out["reason"] = "core.doctor.read route failed"
+    return out
+
+
 def check_project_goalflight_readiness(repo: Path) -> dict:
     docs_private = repo / "docs-private"
     env_caveats = docs_private / "env-caveats.md"
@@ -656,7 +700,9 @@ def doctor(repo: Path) -> dict:
         "acp": check_acp(),
         "project": git_state(repo),
         "project_goalflight_readiness": check_project_goalflight_readiness(repo),
+        "router": check_router(repo),
         "capacity": goalflight_capacity.profile(argparse.Namespace()) if goalflight_capacity else None,
+        "fleet_reconcile": _fleet_reconcile_summary(),
         "rate_pressure": _rate_pressure_summary(),
         "worker_currency": worker_currency_probe(),
     }
@@ -676,13 +722,25 @@ def _rate_pressure_summary() -> dict:
     try:
         state_dir = Path(os.environ.get("GOALFLIGHT_STATE_DIR", f"/tmp/goal-flight-{os.getuid()}"))
         records = goalflight_rate_pressure.collect_records(state_dir)
-        pressure = goalflight_rate_pressure.pressure_per_provider(records)
+        billing = goalflight_rate_pressure.load_billing_accounts()
+        pool_map = goalflight_rate_pressure.agent_limit_pool_map(billing)
+        pressure = goalflight_rate_pressure.pressure_per_provider(records, pool_map=pool_map)
         current_caps = dict(goalflight_capacity.DEFAULT_AGENT_CAPS) if goalflight_capacity else {}
-        rec = goalflight_rate_pressure.recommend(pressure, current_caps)
+        rec = goalflight_rate_pressure.recommend(pressure, current_caps, pool_map=pool_map)
         rec["records_examined"] = len(records)
         rec["state_dir"] = str(state_dir)
         return rec
     except Exception as exc:  # pragma: no cover - keep doctor resilient
+        return {"available": False, "reason": f"{type(exc).__name__}: {exc}"}
+
+
+def _fleet_reconcile_summary(*, release_stale: bool = False) -> dict:
+    if goalflight_fleet is None:
+        return {"available": False, "reason": "goalflight_fleet import failed"}
+    try:
+        fleet_dir = goalflight_fleet.default_fleet_dir()
+        return goalflight_fleet.reconcile_fleet(fleet_dir, release_stale=release_stale)
+    except Exception as exc:  # pragma: no cover
         return {"available": False, "reason": f"{type(exc).__name__}: {exc}"}
 
 
@@ -737,6 +795,7 @@ def print_human(payload: dict) -> None:
     project = payload["project"]
     lines.append(status_line(project.get("present"), "git project", f"{project.get('branch')} {project.get('head')} dirty={project.get('dirty')}"))
     readiness = payload.get("project_goalflight_readiness") or {}
+    router = payload.get("router") or {}
     lines.extend([
         status_line(readiness.get("init_done"), "project init", readiness.get("env_caveats")),
         status_line(readiness.get("repo_skill", {}).get("exists"), "project SKILL.md", readiness.get("repo_skill", {}).get("path")),
@@ -747,6 +806,13 @@ def print_human(payload: dict) -> None:
             f"{readiness.get('skill_root', {}).get('path')} source={readiness.get('skill_root', {}).get('source')}",
         ),
     ])
+    lines.append(
+        status_line(
+            router.get("ok"),
+            "action router",
+            router.get("recommended_entrypoint") if router.get("ok") else router.get("reason"),
+        )
+    )
     commands = readiness.get("commands") or {}
     for name in ("test", "lint", "build"):
         value = commands.get(name)
@@ -839,8 +905,17 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="goal-flight doctor")
     parser.add_argument("--project-root", default=os.getcwd())
     parser.add_argument("--json", action="store_true")
+    parser.add_argument(
+        "--fleet-reconcile-stale",
+        action="store_true",
+        help="Release stale capacity leases and expired account locks before reporting",
+    )
     args = parser.parse_args(argv)
+    if args.fleet_reconcile_stale and goalflight_fleet is not None:
+        goalflight_fleet.reconcile_fleet(goalflight_fleet.default_fleet_dir(), release_stale=True)
     payload = doctor(Path(args.project_root).resolve())
+    if args.fleet_reconcile_stale:
+        payload["fleet_reconcile"] = _fleet_reconcile_summary(release_stale=True)
     if args.json:
         print(json.dumps(payload, sort_keys=True))
     else:

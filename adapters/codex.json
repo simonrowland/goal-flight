@@ -86,6 +86,7 @@
     "exec": {
       "kind": "cli",
       "binary": "codex",
+      "action_id": "core.dispatch.execute",
       "args": ["exec", "--json", "-C", "<repo>", "-"],
       "arg_policy": {
         "required_safe_args": ["exec", "--json", "-C", "<repo>"],

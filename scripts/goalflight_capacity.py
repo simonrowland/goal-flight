@@ -35,6 +35,7 @@ AGENT_RSS_MB = {
     "claude-code-cli-acp": 614,
     "cursor": 1203,
     "cursor-agent": 1203,
+    "opencode": 386,
 }
 # Per-agent concurrency caps, machine-global across goal-flight sessions.
 # Sized to support multi-session parallel work. The adaptive busy-signal
@@ -56,6 +57,7 @@ DEFAULT_AGENT_CAPS = {
     # share one Cursor subscription budget.
     "cursor": 3,
     "cursor-agent": 3,
+    "opencode": 10,
     # claude-code-cli-acp PTY-drives the interactive Claude TUI and tails the
     # session transcript with a HARDCODED 120s per-turn timeout (not exposed in
     # ACP-server mode). 2026-05-20: 4 SIMULTANEOUS dispatches starve each other on
@@ -72,6 +74,10 @@ DEFAULT_AGENT_CAPS = {
     "codex": 10,
     "codex-acp": 10,       # stress-tested 2026-05-20: 49/49 + 13/13 TRUE-simultaneous, zero wedges
     "grok": 10,
+    # Gateway orchestrators: lower cap, longer orchestration latency (Track D).
+    "herm-worker": 2,
+    "cla-worker": 2,
+    "paperclip": 2,
 }
 TERMINAL_LEASE_STATES = {
     "released",
@@ -194,6 +200,7 @@ def detect_tools() -> dict:
         "claude-code-cli-acp": bool(shutil.which("claude-code-cli-acp")),
         "cursor": bool(shutil.which("cursor")),
         "cursor-agent": Path(cursor_agent).exists() if cursor_agent else False,
+        "opencode": bool(shutil.which("opencode")),
         "grok": Path(grok).exists() if grok else False,
     }
     return tools
@@ -400,6 +407,54 @@ def cmd_cooldown(args: argparse.Namespace) -> int:
     return 0
 
 
+def pid_alive(pid: int | None) -> bool:
+    if not pid:
+        return False
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def stale_active_leases(data: dict) -> list[dict]:
+    """Active leases whose controller or worker PID is no longer running."""
+    stale: list[dict] = []
+    for lease in active_leases(data):
+        controller_pid = lease.get("controller_pid")
+        worker_pid = lease.get("worker_pid")
+        if not pid_alive(controller_pid):
+            stale.append(lease)
+            continue
+        if worker_pid is not None and not pid_alive(worker_pid):
+            stale.append(lease)
+    return stale
+
+
+def cmd_release_stale(args: argparse.Namespace) -> int:
+    released: list[str] = []
+    with StateLock():
+        data = load_state()
+        prune_state(data)
+        for lease in stale_active_leases(data):
+            lease_id = lease.get("lease_id")
+            if not lease_id:
+                continue
+            entry = data.get("leases", {}).get(lease_id)
+            if not entry:
+                continue
+            entry["state"] = args.state
+            entry["released_at"] = iso()
+            entry["reason"] = args.reason
+            if not args.keep:
+                data.get("leases", {}).pop(lease_id, None)
+            released.append(str(lease_id))
+        save_state(data)
+    payload = {"ok": True, "released": released, "count": len(released)}
+    print(json.dumps(payload, sort_keys=True))
+    return 0
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     with StateLock():
         data = load_state()
@@ -453,6 +508,12 @@ def build_parser() -> argparse.ArgumentParser:
     rel.add_argument("--reason")
     rel.add_argument("--keep", action="store_true")
     rel.set_defaults(func=cmd_release)
+
+    rel_stale = sub.add_parser("release-stale")
+    rel_stale.add_argument("--state", default="expired")
+    rel_stale.add_argument("--reason", default="stale_controller")
+    rel_stale.add_argument("--keep", action="store_true")
+    rel_stale.set_defaults(func=cmd_release_stale)
 
     cool = sub.add_parser("cooldown")
     cool.add_argument("action", choices=["set", "clear"])

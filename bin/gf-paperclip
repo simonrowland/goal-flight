@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+export GF_GATEWAY_AGENT=paperclip
+exec "$ROOT/scripts/gf_gateway_worker_stub.sh" "$@"

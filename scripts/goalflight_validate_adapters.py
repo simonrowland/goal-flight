@@ -35,6 +35,9 @@ EXPECTED_ADAPTERS = {
     "openhands",
     "amp",
     "antigravity",
+    "herm-worker",
+    "cla-worker",
+    "paperclip",
 }
 FORBIDDEN_ROOT_CODEX_PACKAGE_PATHS = [
     ".codex-plugin/plugin.json",
@@ -46,13 +49,18 @@ FORBIDDEN_ROOT_CODEX_PACKAGE_PATHS = [
 SURVEY_WORKER_STUBS = {
     "gemini",
     "qwen",
-    "opencode",
     "kilocode",
     "kiro",
     "copilot",
     "openhands",
     "amp",
     "antigravity",
+}
+
+GATEWAY_WORKER_STUBS = {
+    "herm-worker",
+    "cla-worker",
+    "paperclip",
 }
 
 HOST_TOOL_RE = re.compile(
@@ -332,18 +340,25 @@ def validate_manifest_semantics(
                 f"{source}: checked-in {role} readiness must be probe_required or worse"
             )
 
-    if agent_id in SURVEY_WORKER_STUBS:
+    if agent_id in SURVEY_WORKER_STUBS or agent_id in GATEWAY_WORKER_STUBS:
         controller_cap = support.get("controller", {}).get("capability")
         worker_cap = support.get("worker", {}).get("capability")
         worker_ready = readiness.get("worker")
         if controller_cap != "unsupported":
-            errors.append(f"{source}: survey stub controller must be unsupported")
+            errors.append(f"{source}: worker stub controller must be unsupported")
         if worker_cap not in {"candidate", "unsupported"}:
-            errors.append(f"{source}: survey stub worker must be candidate or unsupported")
+            errors.append(f"{source}: worker stub worker must be candidate or unsupported")
         if worker_ready != "probe_required":
-            errors.append(f"{source}: survey stub worker readiness must be probe_required")
+            errors.append(f"{source}: worker stub worker readiness must be probe_required")
         if live_gate.get("default") != "deny":
-            errors.append(f"{source}: survey stub live dispatch must default deny")
+            errors.append(f"{source}: worker stub live dispatch must default deny")
+        if agent_id in GATEWAY_WORKER_STUBS:
+            host_projection = manifest.get("host_projection", {})
+            recipes = host_projection.get("delegation_recipes")
+            if not isinstance(recipes, dict) or not {"acp", "bash_tail"}.issubset(recipes):
+                errors.append(
+                    f"{source}: gateway stub must declare host_projection.delegation_recipes.acp and bash_tail"
+                )
 
     if agent_id == "codex":
         if support.get("controller", {}).get("capability") != "supported":

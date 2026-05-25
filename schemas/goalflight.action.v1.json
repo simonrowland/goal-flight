@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "goalflight.action.v1",
+  "title": "Goal Flight action registry entry",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "domain", "resource", "verb", "command"],
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9]*(\\.[a-z][a-z0-9-]*)+$"
+    },
+    "domain": {"type": "string"},
+    "resource": {"type": "string"},
+    "verb": {
+      "type": "string",
+      "enum": ["create", "read", "update", "delete", "execute"]
+    },
+    "crud": {"type": "string", "enum": ["C", "R", "U", "D", "X"]},
+    "summary": {"type": "string"},
+    "command": {"type": "string", "minLength": 1},
+    "env": {
+      "type": "object",
+      "additionalProperties": {"type": "string"}
+    },
+    "requires": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "remote_allowed": {"type": "boolean", "default": false},
+    "transport": {
+      "type": "string",
+      "enum": ["subprocess", "acp", "ssh-remote"]
+    },
+    "message_types": {
+      "type": "array",
+      "items": {"type": "string"}
+    }
+  }
+}

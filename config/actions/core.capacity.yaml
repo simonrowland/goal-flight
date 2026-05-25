@@ -1,0 +1,15 @@
+id: core.capacity.read
+domain: core
+resource: capacity
+verb: read
+crud: R
+summary: Show capacity status and active leases
+command: >
+  ${GOALFLIGHT_PYTHON} ${GOALFLIGHT_REPO}/scripts/goalflight_capacity.py status --json
+env:
+  GOALFLIGHT_PYTHON: python3
+  GOALFLIGHT_REPO: ${GOALFLIGHT_REPO_ROOT}
+requires: []
+remote_allowed: false
+transport: subprocess
+message_types: []

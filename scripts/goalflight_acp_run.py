@@ -86,6 +86,7 @@ from goalflight_os_sandbox import (
     prepare_os_sandbox_command,
     preflight_os_sandbox,
 )
+from goalflight_profile import dispatch_env
 from goalflight_startup_gate import StartupGate
 from acp_runner import extract_markers, run_prompt
 
@@ -231,6 +232,7 @@ async def spawn_and_handshake_with_retry(
     permission_inline_timeout_s: float | None = None,
     permission_user_timeout_s: float | None = None,
     os_sandbox: str = OS_SANDBOX_OFF,
+    env: dict[str, str] | None = None,
 ) -> tuple[asyncio.subprocess.Process, AcpConnection]:
     """Spawn the worker and run the ACP handshake, retrying once on AcpError.
 
@@ -265,6 +267,7 @@ async def spawn_and_handshake_with_retry(
             permission_inline_timeout_s=permission_inline_timeout_s,
             permission_user_timeout_s=permission_user_timeout_s,
             os_sandbox=os_sandbox,
+            env=env,
         )
         proc = conn.proc
         if on_attempt is not None:
@@ -366,6 +369,8 @@ async def run(args: argparse.Namespace) -> dict:
         return payload
 
     command, acp_args = agent_command(args.agent)
+    install_slot = getattr(args, "install_slot", None)
+    spawn_env = dispatch_env(args.agent, install_slot)
     gate = validate_acp_dispatch_readiness(args.agent, [command, *acp_args])
     if gate is not None:
         payload.update({"state": "blocked_adapter_gate", "error": gate})
@@ -769,6 +774,7 @@ async def run(args: argparse.Namespace) -> dict:
                 permission_inline_timeout_s=getattr(args, "permission_inline_timeout_s", None),
                 permission_user_timeout_s=getattr(args, "permission_user_timeout_s", None),
                 os_sandbox=os_sandbox_profile,
+                env=spawn_env,
             )
         await update_status(os_sandbox=getattr(conn, "os_sandbox_metadata", None) or payload["os_sandbox"])
         with contextlib.redirect_stdout(io.StringIO()):
@@ -905,6 +911,12 @@ async def run(args: argparse.Namespace) -> dict:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="goal-flight ACP runner")
     parser.add_argument("--agent", required=True)
+    parser.add_argument(
+        "--install-slot",
+        default=None,
+        help="Gateway worker profile slot (~/.goal-flight/profiles/<slot>.env). "
+        "Ignored for non-gateway agents.",
+    )
     parser.add_argument("--cwd", required=True)
     parser.add_argument("--session-id", default=None)
     parser.add_argument("--dispatch-id")

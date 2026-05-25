@@ -331,6 +331,24 @@ def extract_markers(text: str) -> dict[str, list[str]]:
     return out
 
 
+def extract_message_envelopes(
+    text: str,
+    dispatch_id: str,
+    *,
+    seq_start: int = 1,
+    source: dict | None = None,
+) -> list[dict]:
+    """Markers from worker text as goalflight.message.v1 envelopes."""
+    from goalflight_messages import markers_to_envelopes
+
+    return markers_to_envelopes(
+        extract_markers(text),
+        dispatch_id=dispatch_id,
+        seq_start=seq_start,
+        source=source,
+    )
+
+
 def _scan_out_of_scope_paths(tool_calls: list[dict[str, Any]], cwd: str | Path) -> list[str]:
     """Walk tool_call updates; return path strings from `locations` arrays
     that resolve outside cwd. De-duplicated, source-order preserved.
