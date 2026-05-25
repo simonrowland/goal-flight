@@ -1,0 +1,9 @@
+{
+  "schema": "goalflight.acp-run.v1",
+  "seq": 7,
+  "dispatch_id": "acp-codex-fixture-01",
+  "state": "running",
+  "agent": "codex-acp",
+  "worker_pid": 4242,
+  "updated_at": "2026-05-24T12:00:00+00:00"
+}
