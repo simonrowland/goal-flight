@@ -1,5 +1,22 @@
 #!/usr/bin/env python3
-"""Pure dispatch row classification for fleet status (Track A goals 9b/9d)."""
+"""Pure dispatch row classification for fleet status (Track A goals 9b/9d).
+
+Classifies in-flight dispatch rows from SSH reachability, mirrored status JSON,
+lease snapshot, and PID hints without mutating locks or performing SSH I/O.
+
+Release authority (plan of record: ``docs-private/plans/multi-workstation-acp-fleet.md``,
+§ *Release predicate*, item **#2**):
+
+    Never release on mirror stale alone while last-known PID/lease says active.
+
+``may_release_locks`` implements the controller-side guard for reconcile/doctor (10b/10c).
+Mirror-stale rows — ``quarantine_reason == mirror_stale`` — always return False even if
+classification is ``quarantined`` or ``unknown``. Terminal remote status and reconciling
+rows with unreadable mirror + dead PID may return True (prefigures 10b decision table).
+
+See also: Phase 1 queue slice 9d in
+``docs-private/goal-queue-phase1-remote-observe-dispatch-2026-05-24.md``.
+"""
 
 from __future__ import annotations
 
@@ -104,7 +121,12 @@ def classify_dispatch_row(
 
 
 def may_release_locks(classification: DispatchClassification) -> bool:
-    """Release predicate guard — mirror-stale-only rows must never release locks."""
+    """Return whether reconcile/doctor may release locks for this classification.
+
+    Enforces plan release predicate #2: deny when ``quarantine_reason`` is
+    ``mirror_stale`` regardless of ``state``. Allow ``terminal`` and select
+    ``reconciling`` + ``mirror_unreadable`` paths only.
+    """
     if classification.state == "released":
         return True
     if classification.state != "reconciling" and classification.state != "terminal":

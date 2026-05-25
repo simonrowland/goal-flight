@@ -466,17 +466,17 @@ def cmd_validate(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_status(args: argparse.Namespace) -> int:
+def _legacy_fleet_status(fleet_dir: Path) -> dict:
     info = {
-        "fleet_dir": str(args.fleet_dir),
-        "exists": args.fleet_dir.is_dir(),
+        "fleet_dir": str(fleet_dir),
+        "exists": fleet_dir.is_dir(),
         "files": {},
         "account_locks_active": 0,
     }
     for name in (*FLEET_FILES, "register/aggregate.json"):
-        path = args.fleet_dir / name
+        path = fleet_dir / name
         info["files"][name] = path.exists()
-    locks_dir = args.fleet_dir / "locks" / "accounts"
+    locks_dir = fleet_dir / "locks" / "accounts"
     if locks_dir.is_dir():
         for path in locks_dir.glob("*.json"):
             try:
@@ -485,7 +485,7 @@ def cmd_status(args: argparse.Namespace) -> int:
                 continue
             if doc and doc.get("state") == "active":
                 info["account_locks_active"] += 1
-    fleet_path = args.fleet_dir / "fleet.json"
+    fleet_path = fleet_dir / "fleet.json"
     if fleet_path.exists():
         try:
             fleet_doc = read_json(fleet_path)
@@ -496,6 +496,21 @@ def cmd_status(args: argparse.Namespace) -> int:
             }
         except (OSError, json.JSONDecodeError, schemas.SchemaError):
             info["nodes"] = {"count": 0, "ids": [], "error": "invalid fleet.json"}
+    return info
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    if args.fleet:
+        import goalflight_fleet_status_cli as fleet_status_cli
+
+        info = fleet_status_cli.build_fleet_status(args.fleet_dir)
+        if args.json:
+            print(json.dumps(info, indent=2))
+        else:
+            print(fleet_status_cli.format_fleet_status_table(info))
+        return 0 if info.get("exists") else 1
+
+    info = _legacy_fleet_status(args.fleet_dir)
     print(json.dumps(info, indent=2))
     return 0 if info["exists"] else 1
 
@@ -551,9 +566,33 @@ def cmd_lock_release(args: argparse.Namespace) -> int:
 
 
 def cmd_reconcile(args: argparse.Namespace) -> int:
+    if getattr(args, "dispatch_id", None) or getattr(args, "all_in_flight", False):
+        import goalflight_fleet_reconcile as fleet_reconcile
+
+        mutate = bool(args.release_stale)
+        if args.dispatch_id:
+            row = fleet_reconcile.reconcile_dispatch(
+                args.fleet_dir,
+                args.dispatch_id,
+                mutate=mutate,
+            )
+            print(json.dumps(row.to_dict(), indent=2))
+            return 0
+        summary = fleet_reconcile.reconcile_all_in_flight(args.fleet_dir, mutate=mutate)
+        print(json.dumps(summary, indent=2))
+        return 0
     result = reconcile_fleet(args.fleet_dir, release_stale=args.release_stale)
     print(json.dumps(result, indent=2))
     return 0
+
+
+def cmd_watch(args: argparse.Namespace) -> int:
+    if not args.fleet:
+        print("watch requires --fleet", file=sys.stderr)
+        return 2
+    import goalflight_fleet_watch as fleet_watch
+
+    return fleet_watch.cmd_watch_fleet(args)
 
 
 def _steering_actor(args: argparse.Namespace) -> dict:
@@ -655,7 +694,10 @@ def main(argv: list[str] | None = None) -> int:
     boot.set_defaults(func=cmd_bootstrap)
 
     sub.add_parser("validate").set_defaults(func=cmd_validate)
-    sub.add_parser("status").set_defaults(func=cmd_status)
+    stat = sub.add_parser("status")
+    stat.add_argument("--fleet", action="store_true", help="Aggregate per-node dispatch rows")
+    stat.add_argument("--json", action="store_true", help="JSON output (default for legacy status)")
+    stat.set_defaults(func=cmd_status)
 
     export = sub.add_parser("export")
     export.add_argument("--out", "-o", type=Path, required=True)
@@ -681,7 +723,17 @@ def main(argv: list[str] | None = None) -> int:
 
     recon = sub.add_parser("reconcile")
     recon.add_argument("--release-stale", action="store_true")
+    recon.add_argument("--dispatch-id", help="Reconcile one in-flight dispatch row")
+    recon.add_argument("--all-in-flight", action="store_true", help="Reconcile all in-flight rows")
     recon.set_defaults(func=cmd_reconcile)
+
+    watch = sub.add_parser("watch", help="Mirror remote dispatch status into controller register")
+    watch.add_argument("--fleet", action="store_true", help="Watch all in-flight fleet dispatches")
+    watch.add_argument("--once", action="store_true", help="Single sync pass (default when no --interval)")
+    watch.add_argument("--interval", type=float, default=0.0, help="Poll interval seconds (loop until interrupted)")
+    watch.add_argument("--dry-run", action="store_true", help="Skip real SSH (transport no-op fetch)")
+    watch.add_argument("--json", action="store_true")
+    watch.set_defaults(func=cmd_watch)
 
     steering = sub.add_parser("steering")
     steering_sub = steering.add_subparsers(dest="steering_cmd", required=True)

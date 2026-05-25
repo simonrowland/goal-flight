@@ -760,6 +760,7 @@ def doctor(repo: Path, *, fleet: bool = False, fleet_dir: Path | None = None, fl
     }
     if fleet:
         payload["fleet"] = _fleet_auth_summary(fleet_dir, refresh=fleet_probe)
+        payload["fleet_dispatches"] = _fleet_dispatch_report(fleet_dir)
     return payload
 
 
@@ -809,9 +810,26 @@ def _fleet_reconcile_summary(*, release_stale: bool = False) -> dict:
         return {"available": False, "reason": "goalflight_fleet import failed"}
     try:
         fleet_dir = goalflight_fleet.default_fleet_dir()
-        return goalflight_fleet.reconcile_fleet(fleet_dir, release_stale=release_stale)
+        if release_stale:
+            import goalflight_fleet_stale as fleet_stale
+
+            return fleet_stale.doctor_fleet_stale_release(fleet_dir, mutate=True)
+        return goalflight_fleet.reconcile_fleet(fleet_dir, release_stale=False)
     except Exception as exc:  # pragma: no cover
         return {"available": False, "reason": f"{type(exc).__name__}: {exc}"}
+
+
+def _fleet_dispatch_report(fleet_dir: Path | None = None) -> dict:
+    if goalflight_fleet is None:
+        return {"available": False, "reason": "goalflight_fleet import failed", "dispatches": []}
+    try:
+        import goalflight_fleet_reconcile as fleet_reconcile
+
+        target = fleet_dir or goalflight_fleet.default_fleet_dir()
+        rows = fleet_reconcile.classify_fleet_dispatches(target)
+        return {"available": True, "fleet_dir": str(target), "dispatches": rows}
+    except Exception as exc:  # pragma: no cover
+        return {"available": False, "reason": f"{type(exc).__name__}: {exc}", "dispatches": []}
 
 
 def status_line(ok: bool | None, label: str, detail: str | None = None) -> str:
@@ -1008,7 +1026,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     if args.fleet_reconcile_stale and goalflight_fleet is not None:
-        goalflight_fleet.reconcile_fleet(goalflight_fleet.default_fleet_dir(), release_stale=True)
+        import goalflight_fleet_stale as fleet_stale
+
+        fleet_stale.doctor_fleet_stale_release(goalflight_fleet.default_fleet_dir(), mutate=True)
     fleet_dir = args.fleet_dir
     if fleet_dir is None and args.fleet and goalflight_fleet is not None:
         fleet_dir = goalflight_fleet.default_fleet_dir()
