@@ -24,6 +24,7 @@ ALLOWED_COMMAND_CLASSES = frozenset(
         "git_worktree_remove",
         "read_status_file",
         "read_lease_file",
+        "auth_probe",
     }
 )
 
@@ -157,6 +158,19 @@ def build_remote_command(command_class: str, **params: Any) -> list[str]:
         if not lease_path:
             raise SshAllowlistError("read_lease_file requires lease_path")
         argv = ["cat", lease_path]
+    elif command_class == "auth_probe":
+        account_key = str(params.get("account_key") or "")
+        if not account_key:
+            raise SshAllowlistError("auth_probe requires account_key")
+        argv = [
+            python,
+            f"{repo_root}/scripts/goalflight_fleet_billing.py",
+            "probe",
+            "--account-key",
+            account_key,
+            "--fleet-dir",
+            "/dev/null",
+        ]
     else:
         raise SshAllowlistError(f"unsupported command class: {command_class}")
 

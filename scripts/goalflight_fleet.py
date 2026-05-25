@@ -727,6 +727,22 @@ def main(argv: list[str] | None = None) -> int:
     node_add.add_argument("--json", action="store_true")
     node_add.set_defaults(func=fleet_node.cmd_node_add)
 
+    import goalflight_fleet_billing as fleet_billing
+
+    account = sub.add_parser("account")
+    account_sub = account.add_subparsers(dest="account_cmd", required=True)
+    acct_link = account_sub.add_parser("link", help="Link billing account to node and run auth probe")
+    acct_link.add_argument("--account-key", required=True)
+    acct_link.add_argument("--node", required=True)
+    acct_link.add_argument("--skip-probe", action="store_true")
+    acct_link.add_argument("--json", action="store_true")
+    acct_link.set_defaults(func=fleet_billing.cmd_account_link)
+    acct_unlink = account_sub.add_parser("unlink")
+    acct_unlink.add_argument("--account-key", required=True)
+    acct_unlink.add_argument("--node", required=True)
+    acct_unlink.add_argument("--json", action="store_true")
+    acct_unlink.set_defaults(func=fleet_billing.cmd_account_unlink)
+
     args = parser.parse_args(argv)
     return args.func(args)
 

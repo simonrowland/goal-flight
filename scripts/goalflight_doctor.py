@@ -670,7 +670,7 @@ def check_project_goalflight_readiness(repo: Path) -> dict:
     }
 
 
-def doctor(repo: Path) -> dict:
+def doctor(repo: Path, *, fleet: bool = False, fleet_dir: Path | None = None, fleet_probe: bool = False) -> dict:
     skill_root = SCRIPT_DIR.parent
     codex_desktop = app_exists("Codex", "com.openai.codex")
     codex_cli = version("codex", "--version")
@@ -706,7 +706,25 @@ def doctor(repo: Path) -> dict:
         "rate_pressure": _rate_pressure_summary(),
         "worker_currency": worker_currency_probe(),
     }
+    if fleet:
+        payload["fleet"] = _fleet_auth_summary(fleet_dir, refresh=fleet_probe)
     return payload
+
+
+def _fleet_auth_summary(
+    fleet_dir: Path | None = None,
+    *,
+    refresh: bool = False,
+) -> dict:
+    if goalflight_fleet is None:
+        return {"available": False, "reason": "goalflight_fleet import failed", "nodes": []}
+    try:
+        import goalflight_fleet_billing as fleet_billing
+
+        target = fleet_dir or goalflight_fleet.default_fleet_dir()
+        return fleet_billing.fleet_auth_doctor(target, refresh=refresh)
+    except Exception as exc:  # pragma: no cover
+        return {"available": False, "reason": f"{type(exc).__name__}: {exc}", "nodes": []}
 
 
 def _rate_pressure_summary() -> dict:
@@ -910,10 +928,33 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Release stale capacity leases and expired account locks before reporting",
     )
+    parser.add_argument(
+        "--fleet",
+        action="store_true",
+        help="Include fleet auth probe summary (nodes[].accounts[].auth_probe)",
+    )
+    parser.add_argument(
+        "--fleet-dir",
+        type=Path,
+        help="Fleet store directory for --fleet (default ~/.goal-flight/fleet)",
+    )
+    parser.add_argument(
+        "--fleet-probe",
+        action="store_true",
+        help="Refresh auth probes when used with --fleet",
+    )
     args = parser.parse_args(argv)
     if args.fleet_reconcile_stale and goalflight_fleet is not None:
         goalflight_fleet.reconcile_fleet(goalflight_fleet.default_fleet_dir(), release_stale=True)
-    payload = doctor(Path(args.project_root).resolve())
+    fleet_dir = args.fleet_dir
+    if fleet_dir is None and args.fleet and goalflight_fleet is not None:
+        fleet_dir = goalflight_fleet.default_fleet_dir()
+    payload = doctor(
+        Path(args.project_root).resolve(),
+        fleet=args.fleet,
+        fleet_dir=fleet_dir,
+        fleet_probe=args.fleet_probe,
+    )
     if args.fleet_reconcile_stale:
         payload["fleet_reconcile"] = _fleet_reconcile_summary(release_stale=True)
     if args.json:
