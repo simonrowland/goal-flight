@@ -761,6 +761,7 @@ def doctor(repo: Path, *, fleet: bool = False, fleet_dir: Path | None = None, fl
     if fleet:
         payload["fleet"] = _fleet_auth_summary(fleet_dir, refresh=fleet_probe)
         payload["fleet_dispatches"] = _fleet_dispatch_report(fleet_dir)
+        payload["fleet_bash_tail_probes"] = _fleet_bash_tail_probe_summary(fleet_dir)
     return payload
 
 
@@ -817,6 +818,38 @@ def _fleet_reconcile_summary(*, release_stale: bool = False) -> dict:
         return goalflight_fleet.reconcile_fleet(fleet_dir, release_stale=False)
     except Exception as exc:  # pragma: no cover
         return {"available": False, "reason": f"{type(exc).__name__}: {exc}"}
+
+
+def _fleet_bash_tail_probe_summary(fleet_dir: Path | None = None) -> dict:
+    if goalflight_fleet is None:
+        return {"available": False, "reason": "goalflight_fleet import failed", "nodes": []}
+    try:
+        import goalflight_fleet_bash_tail_probe as bash_probe
+
+        target = fleet_dir or goalflight_fleet.default_fleet_dir()
+        fleet_path = target / "fleet.json"
+        if not fleet_path.exists():
+            return {"available": True, "fleet_dir": str(target), "nodes": []}
+        fleet_doc = goalflight_fleet.read_json(fleet_path)
+        nodes_out: list[dict] = []
+        for node_id in sorted((fleet_doc.get("nodes") or {}).keys()):
+            probes = bash_probe.load_latest_probes(target, node_id)
+            nodes_out.append(
+                {
+                    "node_id": node_id,
+                    "bash_tail_probe": {
+                        adapter: {
+                            "ok": doc.get("ok"),
+                            "marker_seen": doc.get("marker_seen"),
+                            "probed_at": doc.get("probed_at"),
+                        }
+                        for adapter, doc in sorted(probes.items())
+                    },
+                }
+            )
+        return {"available": True, "fleet_dir": str(target), "nodes": nodes_out}
+    except Exception as exc:  # pragma: no cover
+        return {"available": False, "reason": f"{type(exc).__name__}: {exc}", "nodes": []}
 
 
 def _fleet_dispatch_report(fleet_dir: Path | None = None) -> dict:
