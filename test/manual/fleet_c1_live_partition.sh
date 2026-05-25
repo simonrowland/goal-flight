@@ -8,13 +8,14 @@ if [[ "${GOALFLIGHT_LIVE_SSH:-}" != "1" ]]; then
 fi
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-FLEET_DIR="${GOALFLIGHT_FLEET_DIR:-$HOME/.goal-flight/fleet}"
+export GOALFLIGHT_FLEET_DIR="${GOALFLIGHT_FLEET_DIR:-$HOME/.goal-flight/fleet}"
 DISPATCH_ID="${GOALFLIGHT_FLEET_DISPATCH_ID:-}"
+FLEET=(python3 scripts/goalflight_fleet.py --fleet-dir "$GOALFLIGHT_FLEET_DIR")
 
 cd "$REPO_ROOT"
 
 echo "== C1 live partition harness (operator-assisted) =="
-echo "Fleet dir: $FLEET_DIR"
+echo "Fleet dir: $GOALFLIGHT_FLEET_DIR"
 echo "Runbook: docs-private/runbooks/fleet-c1-live-partition.md"
 echo
 
@@ -31,15 +32,15 @@ echo "Dispatch under test: $DISPATCH_ID"
 echo
 
 echo "== Scenario 1 prep: reconcile while SSH may be down =="
-python3 scripts/goalflight_fleet.py reconcile --dispatch-id "$DISPATCH_ID" --json | head -30
+"${FLEET[@]}" reconcile --dispatch-id "$DISPATCH_ID" --json | head -30
 
 echo
 echo "== Watch once (refresh mirrors) =="
-python3 scripts/goalflight_fleet.py watch --fleet --once --json | head -30
+"${FLEET[@]}" watch --fleet --once --json | head -30
 
 echo
 echo "== Scenario 2/3: reconcile again (idempotency check) =="
-python3 scripts/goalflight_fleet.py reconcile --dispatch-id "$DISPATCH_ID" --json | head -30
+"${FLEET[@]}" reconcile --dispatch-id "$DISPATCH_ID" --json | head -30
 
 echo
 echo "OK: C1 harness finished — compare JSON released flags against runbook expectations"

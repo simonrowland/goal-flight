@@ -72,6 +72,18 @@ def test_parse_ssh_config() -> None:
         assert_true("port", host.port == 2222)
 
 
+def test_parse_ssh_config_loopback_without_stanza() -> None:
+    import getpass
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        cfg = Path(td) / "config"
+        cfg.write_text("Host build-1\n  HostName 10.0.0.5\n  User simon\n")
+        host = ssh.parse_ssh_config("localhost", cfg)
+        assert_true("loopback hostname", host.hostname == "127.0.0.1")
+        assert_true("loopback user", host.user == getpass.getuser())
+
+
 def main() -> None:
     for test in (
         test_allowed_command_classes_build,
@@ -80,6 +92,7 @@ def main() -> None:
         test_unknown_class_blocked,
         test_build_ssh_uses_separator,
         test_parse_ssh_config,
+        test_parse_ssh_config_loopback_without_stanza,
     ):
         test()
         print(f"PASS {test.__name__}")

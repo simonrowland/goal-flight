@@ -228,6 +228,14 @@ def parse_ssh_config(alias: str, config_path: Path | None = None) -> SshHostSpec
         key, value = parts[0].lower(), parts[1].strip()
         blocks[current][key] = value
     if alias not in blocks:
+        import getpass
+
+        if alias in {"localhost", "127.0.0.1", "::1"}:
+            return SshHostSpec(
+                alias=alias,
+                hostname="127.0.0.1",
+                user=getpass.getuser(),
+            )
         raise SshAllowlistError(f"ssh Host alias not found: {alias}", code="probe_failed")
     stanza = blocks[alias]
     hostname = stanza.get("hostname", alias)
