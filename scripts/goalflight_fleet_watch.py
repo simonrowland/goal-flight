@@ -311,13 +311,7 @@ class SshFleetWatchTransport:
         ssh_info = node_entry.get("ssh") or {}
         alias = ssh_info.get("alias") or node_id
         try:
-            host = fleet_ssh.SshHostSpec(
-                alias=str(alias),
-                hostname=str(ssh_info.get("hostname") or alias),
-                user=ssh_info.get("user"),
-                port=ssh_info.get("port"),
-                identity_file=ssh_info.get("identity_file"),
-            )
+            host = fleet_ssh.host_from_node_entry(node_id, node_entry)
             repo_root = str(node_entry.get("repo_root") or "")
             remote = fleet_ssh.build_remote_command(
                 "read_status_file",

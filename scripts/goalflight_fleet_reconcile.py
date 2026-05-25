@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 import goalflight_fleet_mirror as mirror
 import goalflight_fleet_status as status
@@ -111,11 +111,23 @@ def build_dispatch_context(
     meta: dict[str, Any] | None = None,
     *,
     ssh_reachable: bool | None = None,
+    ssh_runner: Callable[[list[str]], tuple[int, str, str]] | None = None,
 ) -> DispatchReconcileContext:
+    import goalflight_fleet as fleet
+    import goalflight_fleet_ssh as fleet_ssh
     import goalflight_fleet_watch as fleet_watch
 
     meta = dict(meta or status_cli._collect_dispatch_meta(fleet_dir).get(dispatch_id) or {})
     meta.setdefault("dispatch_id", dispatch_id)
+    if ssh_reachable is None and "ssh_reachable" not in meta:
+        node_id = str(meta.get("node_id") or "")
+        fleet_doc = fleet.read_json(fleet_dir / "fleet.json")
+        node_entry = (fleet_doc.get("nodes") or {}).get(node_id)
+        if isinstance(node_entry, dict):
+            host = fleet_ssh.host_from_node_entry(node_id, node_entry)
+            ssh_reachable = fleet_ssh.probe_ssh_reachable(host, runner=ssh_runner)
+        else:
+            ssh_reachable = False
     if ssh_reachable is not None:
         meta["ssh_reachable"] = ssh_reachable
 
@@ -233,9 +245,15 @@ def reconcile_dispatch(
     *,
     mutate: bool = False,
     ssh_reachable: bool | None = None,
+    ssh_runner: Callable[[list[str]], tuple[int, str, str]] | None = None,
     audit: bool = True,
 ) -> DispatchReconcileResult:
-    ctx = build_dispatch_context(fleet_dir, dispatch_id, ssh_reachable=ssh_reachable)
+    ctx = build_dispatch_context(
+        fleet_dir,
+        dispatch_id,
+        ssh_reachable=ssh_reachable,
+        ssh_runner=ssh_runner,
+    )
     decision = decide_reconcile_action(ctx)
     released = False
     account_key: str | None = None
@@ -277,6 +295,7 @@ def reconcile_all_in_flight(
     *,
     mutate: bool = False,
     ssh_reachable_by_dispatch: dict[str, bool] | None = None,
+    ssh_runner: Callable[[list[str]], tuple[int, str, str]] | None = None,
 ) -> dict[str, Any]:
     targets = status_cli._collect_dispatch_meta(fleet_dir)
     rows: list[dict[str, Any]] = []
@@ -290,6 +309,7 @@ def reconcile_all_in_flight(
             dispatch_id,
             mutate=mutate,
             ssh_reachable=ssh,
+            ssh_runner=ssh_runner,
             audit=mutate,
         )
         rows.append(row.to_dict())

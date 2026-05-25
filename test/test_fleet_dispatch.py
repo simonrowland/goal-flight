@@ -79,6 +79,8 @@ def test_explicit_dry_run_preview() -> None:
         assert_true("remote cmds", len(payload["remote_commands"]) >= 2)
         classes = [c["command_class"] for c in payload["remote_commands"]]
         assert_true("worktree add", "git_worktree_add" in classes)
+        acp = next(c for c in payload["remote_commands"] if c["command_class"] == "acp_run")
+        assert_true("acp cwd worktree", payload["worktree_path"] in acp["argv"])
 
 
 def test_red_auth_blocks_exec() -> None:
@@ -207,6 +209,52 @@ def test_stub_e2e_terminal_clears_locks() -> None:
         assert_true("lock cleared", lock is None or lock.get("state") == "released")
 
 
+def test_resolve_dispatch_runner_stub_and_live() -> None:
+    stub_args = Args(stub_remote=True)
+    stub_runner = fleet_dispatch.resolve_dispatch_runner(stub_args)
+    assert stub_runner is not None
+    code, _stdout, _stderr = stub_runner(["ssh", "ignored"])
+    assert_true("stub ok", code == 0)
+
+    live_args = Args(stub_remote=False)
+    live_runner = fleet_dispatch.resolve_dispatch_runner(live_args)
+    assert_true("live default", live_runner is fleet_dispatch.default_ssh_runner)
+
+
+def test_exec_without_stub_uses_runner() -> None:
+    captured: list[list[str]] = []
+
+    def capture_runner(argv: list[str]) -> tuple[int, str, str]:
+        captured.append(list(argv))
+        return 0, "{}", ""
+
+    with tempfile.TemporaryDirectory() as td:
+        fleet_dir = Path(td) / "fleet"
+        _fixture_fleet(fleet_dir)
+        preview = fleet_dispatch.preview_dispatch(
+            fleet_dir,
+            node_id="localhost",
+            agent="codex-acp",
+            billing_account="openai/default",
+            prompt="chunk.md",
+            dispatch_id="acp-live-runner",
+        )
+        args = Args(
+            fleet_dir=fleet_dir,
+            node="localhost",
+            agent="codex-acp",
+            billing_account="openai/default",
+            prompt="chunk.md",
+            exec=True,
+            thin_defaults=False,
+            stub_remote=False,
+            stub_runner=capture_runner,
+        )
+        args.stub_runner = capture_runner
+        fleet_dispatch.execute_dispatch(fleet_dir, preview, runner=fleet_dispatch.resolve_dispatch_runner(args))
+        assert_true("remote commands", len(captured) >= 1)
+
+
 def test_ledger_remote_lease_id_roundtrip() -> None:
     with tempfile.TemporaryDirectory() as td:
         fleet_dir = Path(td) / "fleet"
@@ -231,6 +279,8 @@ def main() -> None:
     test_thin_defaults_shows_billing_banner()
     test_lock_chain_rollback_on_worktree_failure()
     test_quarantine_blocks_dispatch()
+    test_resolve_dispatch_runner_stub_and_live()
+    test_exec_without_stub_uses_runner()
     test_stub_e2e_terminal_clears_locks()
     test_ledger_remote_lease_id_roundtrip()
     print("OK: fleet dispatch tests pass")

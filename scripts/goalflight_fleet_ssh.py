@@ -117,6 +117,7 @@ def build_remote_command(command_class: str, **params: Any) -> list[str]:
         dispatch_id = str(params.get("dispatch_id") or "")
         agent = str(params.get("agent") or "")
         prompt = str(params.get("prompt") or "")
+        cwd = str(params.get("cwd") or repo_root)
         if not dispatch_id or not agent:
             raise SshAllowlistError("acp_run requires dispatch_id and agent")
         argv = [
@@ -125,7 +126,7 @@ def build_remote_command(command_class: str, **params: Any) -> list[str]:
             "--agent",
             agent,
             "--cwd",
-            repo_root,
+            cwd,
             "--dispatch-id",
             dispatch_id,
             "--prompt-text",
@@ -261,6 +262,32 @@ def run_ssh(
         "stderr": stderr,
         "exit_code": code,
     }
+
+
+def host_from_node_entry(node_id: str, node_entry: dict[str, Any]) -> SshHostSpec:
+    ssh_info = node_entry.get("ssh") or {}
+    alias = str(ssh_info.get("alias") or node_id)
+    port_raw = ssh_info.get("port")
+    port = int(port_raw) if port_raw is not None and str(port_raw).isdigit() else None
+    return SshHostSpec(
+        alias=alias,
+        hostname=str(ssh_info.get("hostname") or alias),
+        user=ssh_info.get("user"),
+        port=port,
+        identity_file=ssh_info.get("identity_file"),
+    )
+
+
+def probe_ssh_reachable(
+    host: SshHostSpec,
+    *,
+    runner: Callable[[list[str]], tuple[int, str, str]] | None = None,
+    dry_run: bool = False,
+) -> bool:
+    remote = build_remote_command("probe_echo")
+    ssh_argv = build_ssh_command(host, remote, command_class="probe_echo")
+    run = run_ssh(ssh_argv, runner=runner, dry_run=dry_run)
+    return bool(run.get("ok"))
 
 
 def format_remediation(error: SshAllowlistError) -> str:

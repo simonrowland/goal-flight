@@ -223,12 +223,40 @@ def test_sync_fleet_mirrors_batch() -> None:
         assert_true("batch seq", mirror_result.last_seq == 2)
 
 
+def test_ssh_transport_uses_injected_runner() -> None:
+    dispatch_id = "acp-codex-watch-ssh"
+    payload = _status_payload(dispatch_id=dispatch_id, seq=3)
+    captured: list[list[str]] = []
+
+    def capture_runner(argv: list[str]) -> tuple[int, str, str]:
+        captured.append(list(argv))
+        return 0, payload, ""
+
+    with tempfile.TemporaryDirectory() as td:
+        fleet_dir = Path(td) / "fleet"
+        _fixture_fleet(fleet_dir)
+        status_path = _write_dispatch(fleet_dir, dispatch_id=dispatch_id, seq=1)
+        node_entry = fleet.read_json(fleet_dir / "fleet.json")["nodes"]["build-1"]
+        transport = fleet_watch.SshFleetWatchTransport(runner=capture_runner)
+        row = fleet_watch.ingest_dispatch_mirror(
+            fleet_dir,
+            dispatch_id,
+            fleet.read_json(status_path.parent / "meta.json"),
+            transport,
+            node_entry=node_entry,
+        )
+        assert_true("ingested", row.action == "ingested")
+        assert_true("ssh invoked", len(captured) == 1)
+        assert_true("read_status", "read_status_file" in " ".join(captured[0]) or "cat" in captured[0])
+
+
 def main() -> None:
     test_ingest_advances_mirror_and_meta()
     test_seq_regression_preserves_last_good_mirror()
     test_seq_regression_stops_subsequent_ingest()
     test_validation_failure_does_not_truncate_mirror()
     test_sync_fleet_mirrors_batch()
+    test_ssh_transport_uses_injected_runner()
     print("OK: fleet watch tests pass")
 
 

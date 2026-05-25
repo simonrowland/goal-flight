@@ -186,10 +186,44 @@ def test_audit_log_appended_on_mutate() -> None:
         assert_true("dispatch id", entry.get("dispatch_id") == dispatch_id)
 
 
+def test_live_ssh_probe_quarantine_when_unreachable() -> None:
+    dispatch_id = "acp-reconcile-live-probe"
+    with tempfile.TemporaryDirectory() as td:
+        fleet_dir = Path(td) / "fleet"
+        _fixture_fleet(fleet_dir)
+        _acquire_lock(fleet_dir, dispatch_id)
+        _write_dispatch(
+            fleet_dir,
+            dispatch_id=dispatch_id,
+            mirror_name="valid_ok.json",
+            meta={
+                "dispatch_id": dispatch_id,
+                "node_id": "localhost",
+                "lease_active": True,
+                "pid_hint": "unknown",
+            },
+        )
+
+        def fail_runner(_argv: list[str]) -> tuple[int, str, str]:
+            return 255, "", "connection refused"
+
+        row = fleet_reconcile.reconcile_dispatch(
+            fleet_dir,
+            dispatch_id,
+            mutate=True,
+            ssh_runner=fail_runner,
+        )
+        assert_true("quarantine", row.action == "quarantine")
+        assert_true("partition reason", row.reason == "ssh_partition")
+        lock = fleet_reconcile.find_account_lock_for_dispatch(fleet_dir, dispatch_id)
+        assert_true("lock held", lock is not None and lock.get("state") == "active")
+
+
 def main() -> None:
     test_ssh_down_quarantine_no_release()
     test_terminal_dead_pid_release_once()
     test_audit_log_appended_on_mutate()
+    test_live_ssh_probe_quarantine_when_unreachable()
     print("OK: fleet reconcile tests pass")
 
 

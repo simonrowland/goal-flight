@@ -154,7 +154,12 @@ def build_remote_command_plan(
         ("git_worktree_add", {"worktree_path": worktree_path, "ref": "HEAD"}),
         (
             "acp_run",
-            {"dispatch_id": dispatch_id, "agent": agent, "prompt": prompt},
+            {
+                "dispatch_id": dispatch_id,
+                "agent": agent,
+                "prompt": prompt,
+                "cwd": worktree_path,
+            },
         ),
     ):
         argv = fleet_ssh.build_remote_command(command_class, repo_root=repo_root, **extra)
@@ -402,6 +407,21 @@ def record_dispatch_ledger(
     return {"ok": True, "path": str(path), "record": record}
 
 
+def default_ssh_runner(argv: list[str]) -> tuple[int, str, str]:
+    import goalflight_fleet_ssh as fleet_ssh
+
+    run = fleet_ssh.run_ssh(argv)
+    return int(run.get("exit_code", 1)), str(run.get("stdout") or ""), str(run.get("stderr") or "")
+
+
+def resolve_dispatch_runner(args) -> Callable[[list[str]], tuple[int, str, str]] | None:
+    if getattr(args, "stub_runner", None):
+        return args.stub_runner
+    if getattr(args, "stub_remote", False):
+        return lambda _argv: (0, "{}", "")
+    return default_ssh_runner
+
+
 def execute_dispatch(
     fleet_dir: Path,
     preview: DispatchPreview,
@@ -467,11 +487,7 @@ def cmd_dispatch(args) -> int:
         print(json.dumps({"ok": False, "error": str(exc), "code": exc.code}), file=__import__("sys").stderr)
         return 1
 
-    runner = None
-    if getattr(args, "stub_runner", None):
-        runner = args.stub_runner
-    elif getattr(args, "stub_remote", False):
-        runner = lambda _argv: (0, "{}", "")
+    runner = resolve_dispatch_runner(args)
 
     result = execute_dispatch(
         args.fleet_dir,
