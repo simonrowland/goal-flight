@@ -174,11 +174,7 @@ async def _run_prompt_locked(
                     result.plan_entries.append(entry_text)
 
     def _early_marker() -> str | None:
-        markers = extract_markers(result.text)
-        for marker in ("BLOCKED", "USER-CONFIRM", "USER-NEED"):
-            if markers.get(marker):
-                return marker
-        return None
+        return early_actionable_marker(extract_markers(result.text))
 
     async def _cancel_prompt(reason: str) -> None:
         with contextlib.suppress(Exception):
@@ -329,6 +325,43 @@ def extract_markers(text: str) -> dict[str, list[str]]:
         if value:  # skip empty captures
             out.setdefault(m.group(1), []).append(value)
     return out
+
+
+# Worker sign-off payloads on BLOCKED:/USER-NEED: that mean "no blocker".
+# Case-insensitive after strip; empty/whitespace-only counts as sentinel too.
+_SENTINEL_MARKER_PAYLOADS = frozenset({
+    "none",
+    "n/a",
+    "na",
+    "-",
+    "no",
+    "nope",
+    "false",
+    "(none)",
+})
+
+
+def is_sentinel_marker_payload(payload: str) -> bool:
+    normalized = payload.strip().casefold()
+    if not normalized:
+        return True
+    return normalized in _SENTINEL_MARKER_PAYLOADS
+
+
+def has_actionable_marker_values(markers: dict[str, list[str]], kind: str) -> bool:
+    values = markers.get(kind) or []
+    if not values:
+        return False
+    if kind in ("BLOCKED", "USER-NEED"):
+        return any(not is_sentinel_marker_payload(v) for v in values)
+    return True
+
+
+def early_actionable_marker(markers: dict[str, list[str]]) -> str | None:
+    for marker in ("BLOCKED", "USER-CONFIRM", "USER-NEED"):
+        if has_actionable_marker_values(markers, marker):
+            return marker
+    return None
 
 
 def _scan_out_of_scope_paths(tool_calls: list[dict[str, Any]], cwd: str | Path) -> list[str]:
