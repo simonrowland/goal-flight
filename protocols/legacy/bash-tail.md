@@ -106,7 +106,7 @@ DB contention with `opencode serve`). Use the Goal Flight HTTP helper
 instead — it writes Goal Flight markers directly to the tail file:
 
 ```bash
-python3 <skill-root>/scripts/opencode_bash_tail.py \
+python3 <skill-root>/scripts/hosts/opencode/bash_tail.py \
   --directory "<workdir>" \
   --tail /tmp/opencode-<slug>.txt \
   --prompt-file <prompt.md> \
@@ -124,7 +124,7 @@ repo (set `"snapshot": false` on large trees). Requires LiteLLM env
 (`LITELLM_API_KEY` or `source ~/.config/rpp/litellm.env`).
 
 For structured turn boundaries and tool events, prefer `opencode acp`
-(see `adapters/opencode.json` and `OPENCODE.md`).
+(see `adapters/opencode.json` and `docs/hosts/opencode.md`).
 
 ## Watcher
 

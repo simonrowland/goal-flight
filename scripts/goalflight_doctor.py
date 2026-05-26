@@ -242,7 +242,7 @@ def check_cursor_context_mode(skill_root: Path, project_root: Path) -> dict:
 
 
 def check_opencode_context_mode(skill_root: Path, project_root: Path) -> dict:
-    script = skill_root / "scripts/register-context-mode-opencode.py"
+    script = skill_root / "scripts/hosts/opencode/register_context_mode.py"
     out = {"register_script": str(script), "register_script_exists": script.exists()}
     if not script.exists():
         return out
@@ -519,8 +519,8 @@ def check_acp() -> dict:
             "version": version("opencode", "--version").get("version"),
         },
         "opencode-bash-tail": {
-            "present": (SCRIPT_DIR / "opencode_bash_tail.py").is_file(),
-            "script": str(SCRIPT_DIR / "opencode_bash_tail.py"),
+            "present": (SCRIPT_DIR / "hosts/opencode/bash_tail.py").is_file(),
+            "script": str(SCRIPT_DIR / "hosts/opencode/bash_tail.py"),
         },
     }
 

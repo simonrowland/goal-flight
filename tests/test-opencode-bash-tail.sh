@@ -5,7 +5,7 @@
 set -u
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-WORKER="$REPO_ROOT/scripts/opencode_bash_tail.py"
+WORKER="$REPO_ROOT/scripts/hosts/opencode/bash_tail.py"
 WATCHER="$REPO_ROOT/scripts/watch-dispatch-tail.sh"
 
 if ! command -v opencode >/dev/null 2>&1; then
@@ -42,7 +42,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-cp "$REPO_ROOT/opencode.json" "$WORKDIR/opencode.json"
+cp "$REPO_ROOT/configs/opencode/opencode.json" "$WORKDIR/opencode.json"
 cat > "$PROMPT" <<'EOF'
 What is 2+2? Reply with just the number on one line.
 EOF

@@ -296,7 +296,7 @@ def _run_opencode_context_mode_registration(
     agent: str = "opencode",
     existing_records: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
-    script = repo_root / "scripts" / "register-context-mode-opencode.py"
+    script = repo_root / "scripts" / "hosts" / "opencode" / "register_context_mode.py"
     if not script.exists():
         raise SetupError(f"opencode context-mode registration script missing: {script}")
 

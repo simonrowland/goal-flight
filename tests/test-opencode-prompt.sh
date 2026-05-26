@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Optional live smoke test for scripts/opencode_prompt.py.
+# Optional live smoke test for scripts/hosts/opencode/prompt.py.
 # Skips when opencode or LiteLLM credentials are unavailable.
 
 set -u
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-SCRIPT="$REPO_ROOT/scripts/opencode_prompt.py"
+SCRIPT="$REPO_ROOT/scripts/hosts/opencode/prompt.py"
 
 if ! command -v opencode >/dev/null 2>&1; then
   echo "SKIP  tests/test-opencode-prompt.sh (opencode not installed)"

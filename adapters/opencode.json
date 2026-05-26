@@ -112,7 +112,7 @@
       "configs/opencode/AGENTS.md",
       "configs/opencode/opencode.json",
       "configs/opencode/skills/goal-flight/SKILL.md",
-      "OPENCODE.md"
+      "docs/hosts/opencode.md"
     ],
     "generated_outputs": ["dist/opencode/"],
     "install_actions": [
@@ -289,7 +289,7 @@
           "opencode-acp-worker"
         ],
         "install_mode": "setup",
-        "commands": ["python3 scripts/register-context-mode-opencode.py --scope global"],
+        "commands": ["python3 scripts/hosts/opencode/register_context_mode.py --scope global"],
         "paths": ["~/.config/opencode/opencode.json", "<project>/opencode.json"]
       },
       {

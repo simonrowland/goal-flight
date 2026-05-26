@@ -5,7 +5,7 @@
 set -u
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-SCRIPT="$REPO_ROOT/scripts/opencode_self_dispatch_test.py"
+SCRIPT="$REPO_ROOT/scripts/hosts/opencode/self_dispatch_test.py"
 
 if ! command -v opencode >/dev/null 2>&1; then
   echo "SKIP  tests/test-opencode-self-dispatch.sh (opencode not installed)"

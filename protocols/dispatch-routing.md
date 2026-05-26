@@ -71,7 +71,7 @@ Treat routing candidates as first-class only after their readiness gate passes:
 | Codex | yes | yes | Desktop/CLI available when needed, context-mode registered for large-output work, ACP handshake passes for structured dispatch. |
 | Cursor | yes | yes | Cursor Desktop or CLI path present for controller use; `cursor-agent` present and ACP handshake passes for worker use; model-currency probe is current or explicitly accepted as stale. |
 | Grok | yes | yes | Grok Build/headless flags present; structured ACP path passes before ACP dispatch; bash-tail is fallback-only and must obey the marker limits in Composition rules. |
-| OpenCode | yes | yes | `opencode` on PATH; `opencode acp` for structured dispatch; HTTP helper (`opencode_prompt.py`) for controller one-shots; bash-tail via `opencode_bash_tail.py` (not bare `opencode run`). |
+| OpenCode | yes | yes | `opencode` on PATH; `opencode acp` for structured dispatch; HTTP helper (`scripts/hosts/opencode/prompt.py`) for controller one-shots; bash-tail via `scripts/hosts/opencode/bash_tail.py` (not bare `opencode run`). |
 | Claude compatibility path | yes | yes | Adapter-owned CLI/plugin probes pass; startup gate applies where the adapter requires serialized initialization. |
 
 If a candidate has static adapter capability but fails local readiness, do not

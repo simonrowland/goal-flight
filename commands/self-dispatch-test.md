@@ -13,7 +13,7 @@ Read:
 
 - `protocols/dispatch-routing.md`
 - `protocols/worker-markers.md`
-- `OPENCODE.md`
+- `docs/hosts/opencode.md`
 
 ## When to invoke
 
@@ -31,7 +31,7 @@ Read:
 
 ```bash
 source ~/.config/rpp/litellm.env   # when using litellm/* models
-python3 <skill-root>/scripts/opencode_self_dispatch_test.py --json
+python3 <skill-root>/scripts/hosts/opencode/self_dispatch_test.py --json
 ```
 
 3. Summarize **only** the JSON fields into the conversation:
@@ -49,7 +49,7 @@ Do **not** paste raw tail files or full doctor JSON.
 4. If `ok` is false:
 
 - `skipped: true` → missing opencode/LiteLLM; surface install steps from
-  `OPENCODE.md` and stop.
+  `docs/hosts/opencode.md` and stop.
 - ACP failed, bash-tail passed → cite `transports.acp.error`; ACP is the
   default worker path.
 - bash-tail failed, ACP passed → cite `transports.bash_tail.error`; execute
@@ -61,7 +61,7 @@ Do **not** paste raw tail files or full doctor JSON.
 
 - Controller preflight (doctor + capacity) runs from the OpenCode host.
 - OpenCode can spawn **itself** as an ACP worker via `goalflight_acp_run.py`.
-- OpenCode can spawn **itself** as a bash-tail worker via `opencode_bash_tail.py`
+- OpenCode can spawn **itself** as a bash-tail worker via `scripts/hosts/opencode/bash_tail.py`
   and the standard `watch-dispatch-tail.sh` watcher.
 
 Workers use a read-only arithmetic prompt (`2+2 → 4`) in a temp workdir with
@@ -70,9 +70,9 @@ project `opencode.json` copied in. No repository writes.
 ## Optional flags
 
 ```bash
-python3 <skill-root>/scripts/opencode_self_dispatch_test.py --json --skip-bash-tail
-python3 <skill-root>/scripts/opencode_self_dispatch_test.py --json --skip-acp
-python3 <skill-root>/scripts/opencode_self_dispatch_test.py --json -m litellm/frontier-coder
+python3 <skill-root>/scripts/hosts/opencode/self_dispatch_test.py --json --skip-bash-tail
+python3 <skill-root>/scripts/hosts/opencode/self_dispatch_test.py --json --skip-acp
+python3 <skill-root>/scripts/hosts/opencode/self_dispatch_test.py --json -m litellm/frontier-coder
 ```
 
 ## After a passing run
