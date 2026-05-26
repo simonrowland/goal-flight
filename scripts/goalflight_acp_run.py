@@ -88,7 +88,7 @@ from goalflight_os_sandbox import (
 )
 from goalflight_profile import dispatch_env
 from goalflight_startup_gate import StartupGate
-from acp_runner import extract_markers, run_prompt
+from acp_runner import extract_markers, has_actionable_marker_values, run_prompt
 
 
 def _resolve_manifest_binary(binary: str) -> str:
@@ -833,7 +833,9 @@ async def run(args: argparse.Namespace) -> dict:
             heartbeat_error=terminal_error,
         )
         if state == "complete" and (
-            markers.get("BLOCKED") or markers.get("USER-NEED") or markers.get("USER-CONFIRM")
+            has_actionable_marker_values(markers, "BLOCKED")
+            or has_actionable_marker_values(markers, "USER-NEED")
+            or markers.get("USER-CONFIRM")
         ):
             state = "blocked"
         payload.update({
