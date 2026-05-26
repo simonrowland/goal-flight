@@ -108,12 +108,18 @@ def test_acp_run_uses_prompt_b64_and_acp_python() -> None:
         agent="codex-acp",
         prompt=prompt,
         cwd="/Users/dev/.goal-flight/worktrees/acp-test",
+        status_json="/Users/dev/.goal-flight/dispatches/acp-test/status.json",
     )
     assert_true("acp venv python", argv[0].endswith("/venvs/acp-0.10/bin/python"))
     b64_idx = argv.index("--prompt-b64")
     decoded = base64.b64decode(argv[b64_idx + 1].encode("ascii")).decode("utf-8")
     assert_true("prompt roundtrip", decoded == prompt)
     assert_true("no prompt-text", "--prompt-text" not in argv)
+    status_idx = argv.index("--status-json")
+    assert_true(
+        "status json path",
+        argv[status_idx + 1] == "/Users/dev/.goal-flight/dispatches/acp-test/status.json",
+    )
 
 
 def main() -> None:

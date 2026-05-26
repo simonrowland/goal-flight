@@ -141,6 +141,9 @@ def build_remote_command(command_class: str, **params: Any) -> list[str]:
             prompt_b64,
             "--json",
         ]
+        status_json = str(params.get("status_json") or "").strip()
+        if status_json:
+            argv.extend(["--status-json", status_json])
     elif command_class == "git_fetch":
         argv = ["git", "-C", repo_root, "fetch", "--quiet", "origin"]
     elif command_class == "git_checkout":

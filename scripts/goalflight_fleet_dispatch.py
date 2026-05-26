@@ -138,6 +138,11 @@ def assert_dispatch_gates(fleet_dir: Path, *, node_id: str, billing_account: str
         raise DispatchGateError(str(exc), code="auth") from exc
 
 
+def remote_status_path_for_dispatch(state_dir: str, dispatch_id: str) -> str:
+    base = str(state_dir or "~/.goal-flight").strip().rstrip("/")
+    return f"{base}/dispatches/{dispatch_id}/status.json"
+
+
 def build_remote_command_plan(
     node_entry: dict[str, Any],
     *,
@@ -150,6 +155,7 @@ def build_remote_command_plan(
 
     repo_root = str(node_entry.get("repo_root") or "")
     state_dir = str(node_entry.get("state_dir") or "~/.goal-flight")
+    status_json = remote_status_path_for_dispatch(state_dir, dispatch_id)
     plans: list[dict[str, Any]] = []
     for command_class, extra in (
         ("git_worktree_add", {"worktree_path": worktree_path, "ref": "HEAD"}),
@@ -161,6 +167,7 @@ def build_remote_command_plan(
                 "prompt": prompt,
                 "cwd": worktree_path,
                 "state_dir": state_dir,
+                "status_json": status_json,
             },
         ),
     ):
@@ -332,6 +339,11 @@ def register_dispatch_meta(
     import goalflight_fleet as fleet
     import goalflight_fleet_watch as fleet_watch
 
+    fleet_doc = fleet.read_json(fleet_dir / "fleet.json")
+    node_entry = (fleet_doc.get("nodes") or {}).get(preview.node_id) or {}
+    state_dir = str(node_entry.get("state_dir") or "~/.goal-flight")
+    remote_status_path = remote_status_path_for_dispatch(state_dir, preview.dispatch_id)
+
     dispatch_dir = fleet_watch.dispatch_register_dir(fleet_dir) / preview.dispatch_id
     dispatch_dir.mkdir(parents=True, exist_ok=True)
     fleet._atomic_write_json(
@@ -343,6 +355,8 @@ def register_dispatch_meta(
             "lease_active": lease_active,
             "pid_hint": pid_hint,
             "ssh_reachable": True,
+            "remote_state_dir": state_dir,
+            "remote_status_path": remote_status_path,
         },
     )
     aggregate_path = fleet_dir / "register" / "aggregate.json"
@@ -416,6 +430,64 @@ def default_ssh_runner(argv: list[str]) -> tuple[int, str, str]:
     return int(run.get("exit_code", 1)), str(run.get("stdout") or ""), str(run.get("stderr") or "")
 
 
+def _remote_acp_run_succeeded(chain: LockChainResult) -> bool:
+    for entry in reversed(chain.remote_log):
+        if entry.get("dry_run"):
+            continue
+        if entry.get("command_class") != "acp_run":
+            continue
+        return int(entry.get("exit_code", 1)) == 0
+    return False
+
+
+def finalize_live_sync_dispatch(
+    fleet_dir: Path,
+    preview: DispatchPreview,
+    chain: LockChainResult,
+    ledger_info: dict[str, Any],
+    *,
+    runner: Callable[[list[str]], tuple[int, str, str]] | None = None,
+) -> dict[str, Any] | None:
+    """After synchronous live acp_run, ingest remote mirror and release fleet locks."""
+    if not _remote_acp_run_succeeded(chain):
+        return None
+
+    import goalflight_fleet as fleet
+    import goalflight_fleet_reconcile as fleet_reconcile
+    import goalflight_fleet_watch as fleet_watch
+    import goalflight_ledger as ledger
+
+    fleet_doc = fleet.read_json(fleet_dir / "fleet.json")
+    node_entry = (fleet_doc.get("nodes") or {}).get(preview.node_id)
+    if not isinstance(node_entry, dict):
+        return {"ok": False, "error": f"unknown node {preview.node_id}"}
+
+    meta_path = fleet_watch.dispatch_meta_path(fleet_dir, preview.dispatch_id)
+    meta = fleet_watch._read_json_object(meta_path)
+    transport = fleet_watch.SshFleetWatchTransport(runner=runner or default_ssh_runner)
+    ingest = fleet_watch.ingest_dispatch_mirror(
+        fleet_dir,
+        preview.dispatch_id,
+        meta,
+        transport,
+        node_entry=node_entry,
+    )
+    if not ingest.ok:
+        return {"ok": False, "ingest": ingest.to_dict() if hasattr(ingest, "to_dict") else ingest.__dict__}
+
+    register_dispatch_meta(fleet_dir, preview, pid_hint="dead", lease_active=False)
+    with ledger.StateLock():
+        record = json.loads(Path(ledger_info["path"]).read_text())
+        mirror_payload = json.loads(
+            fleet_watch.dispatch_status_path(fleet_dir, preview.dispatch_id).read_text()
+        )
+        record["state"] = str(mirror_payload.get("state") or "complete")
+        record["ended_at"] = ledger.utc_now()
+        ledger.write_record(record)
+    reconcile = fleet_reconcile.reconcile_dispatch(fleet_dir, preview.dispatch_id, mutate=True)
+    return {"ok": True, "ingest": ingest.action, "reconcile": reconcile.to_dict()}
+
+
 def resolve_dispatch_runner(args) -> Callable[[list[str]], tuple[int, str, str]] | None:
     if getattr(args, "stub_runner", None):
         return args.stub_runner
@@ -448,12 +520,27 @@ def execute_dispatch(
         import goalflight_fleet_reconcile as fleet_reconcile
 
         fleet_reconcile.reconcile_dispatch(fleet_dir, preview.dispatch_id, mutate=True)
+        return {
+            "ok": True,
+            "dispatch_id": preview.dispatch_id,
+            "remote_lease_id": chain.remote_lease_id,
+            "ledger": ledger_info,
+            "remote_log": chain.remote_log,
+        }
+    finalize = finalize_live_sync_dispatch(
+        fleet_dir,
+        preview,
+        chain,
+        ledger_info,
+        runner=runner,
+    )
     return {
         "ok": True,
         "dispatch_id": preview.dispatch_id,
         "remote_lease_id": chain.remote_lease_id,
         "ledger": ledger_info,
         "remote_log": chain.remote_log,
+        "finalize": finalize,
     }
 
 

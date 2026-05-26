@@ -81,6 +81,11 @@ def test_explicit_dry_run_preview() -> None:
         assert_true("worktree add", "git_worktree_add" in classes)
         acp = next(c for c in payload["remote_commands"] if c["command_class"] == "acp_run")
         assert_true("acp cwd worktree", payload["worktree_path"] in acp["argv"])
+        assert_true(
+            "acp status json",
+            "/tmp/goal-flight-dispatch-test/dispatches/acp-dispatch-explicit/status.json"
+            in acp["argv"],
+        )
 
 
 def test_red_auth_blocks_exec() -> None:
@@ -255,6 +260,53 @@ def test_exec_without_stub_uses_runner() -> None:
         assert_true("remote commands", len(captured) >= 1)
 
 
+def test_sync_finalize_clears_locks() -> None:
+    mirror_json = json.dumps(
+        {
+            "schema": "goalflight.acp-run.v1",
+            "dispatch_id": "acp-sync-finalize",
+            "state": "complete",
+            "agent": "codex-acp",
+            "events_seen": 3,
+        }
+    )
+
+    def mirror_runner(argv: list[str]) -> tuple[int, str, str]:
+        joined = " ".join(argv)
+        if "goalflight_acp_run.py" in joined:
+            return 0, mirror_json, ""
+        if joined.endswith("status.json") or "read_status_file" in joined or " cat " in joined:
+            return 0, mirror_json, ""
+        return 0, "{}", ""
+
+    with tempfile.TemporaryDirectory() as td:
+        fleet_dir = Path(td) / "fleet"
+        _fixture_fleet(fleet_dir)
+        preview = fleet_dispatch.preview_dispatch(
+            fleet_dir,
+            node_id="localhost",
+            agent="codex-acp",
+            billing_account="openai/default",
+            prompt="chunk.md",
+            dispatch_id="acp-sync-finalize",
+        )
+        result = fleet_dispatch.execute_dispatch(
+            fleet_dir,
+            preview,
+            runner=mirror_runner,
+            stub_terminal=False,
+        )
+        assert_true("ok", result["ok"] is True)
+        assert_true("finalize ok", (result.get("finalize") or {}).get("ok") is True)
+        lock = fleet.load_account_lock(fleet.account_lock_path(fleet_dir, "openai/default"))
+        assert_true("lock cleared", lock is None or lock.get("state") == "released")
+        meta = json.loads(
+            (fleet_dir / "register" / "dispatches" / "acp-sync-finalize" / "meta.json").read_text()
+        )
+        assert_true("remote status path", meta.get("remote_status_path"))
+        assert_true("lease inactive", meta.get("lease_active") is False)
+
+
 def test_ledger_remote_lease_id_roundtrip() -> None:
     with tempfile.TemporaryDirectory() as td:
         fleet_dir = Path(td) / "fleet"
@@ -282,6 +334,7 @@ def main() -> None:
     test_resolve_dispatch_runner_stub_and_live()
     test_exec_without_stub_uses_runner()
     test_stub_e2e_terminal_clears_locks()
+    test_sync_finalize_clears_locks()
     test_ledger_remote_lease_id_roundtrip()
     print("OK: fleet dispatch tests pass")
 
