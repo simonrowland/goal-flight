@@ -107,6 +107,6 @@ echo "== watch once =="
 "${FLEET[@]}" watch --fleet --once --json
 
 echo "== reconcile =="
-"${FLEET[@]}" reconcile --all-in-flight --json
+"${FLEET[@]}" reconcile --all-in-flight
 
 echo "OK: live fleet dispatch smoke completed"

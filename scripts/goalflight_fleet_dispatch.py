@@ -149,6 +149,7 @@ def build_remote_command_plan(
     import goalflight_fleet_ssh as fleet_ssh
 
     repo_root = str(node_entry.get("repo_root") or "")
+    state_dir = str(node_entry.get("state_dir") or "~/.goal-flight")
     plans: list[dict[str, Any]] = []
     for command_class, extra in (
         ("git_worktree_add", {"worktree_path": worktree_path, "ref": "HEAD"}),
@@ -159,6 +160,7 @@ def build_remote_command_plan(
                 "agent": agent,
                 "prompt": prompt,
                 "cwd": worktree_path,
+                "state_dir": state_dir,
             },
         ),
     ):

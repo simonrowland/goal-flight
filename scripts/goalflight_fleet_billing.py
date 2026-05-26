@@ -33,13 +33,20 @@ class DispatchAuthError(Exception):
 
 
 def default_runner(argv: list[str]) -> tuple[int, str, str]:
+    import os
+
     try:
+        env = os.environ.copy()
+        extra = "/opt/homebrew/bin:/usr/local/bin"
+        if extra not in env.get("PATH", ""):
+            env["PATH"] = f"{extra}:{env.get('PATH', '')}"
         proc = subprocess.run(
             argv,
             capture_output=True,
             text=True,
             timeout=30,
             check=False,
+            env=env,
         )
         return proc.returncode, proc.stdout or "", proc.stderr or ""
     except (OSError, subprocess.TimeoutExpired) as exc:

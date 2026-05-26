@@ -3,11 +3,15 @@
 
 from __future__ import annotations
 
+import base64
 import re
 import shlex
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
+
+# Non-interactive SSH often omits Homebrew; fleet workers (codex-acp, codex) live there.
+REMOTE_PATH_PREFIX = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 ALLOWED_COMMAND_CLASSES = frozenset(
     {
@@ -118,10 +122,14 @@ def build_remote_command(command_class: str, **params: Any) -> list[str]:
         agent = str(params.get("agent") or "")
         prompt = str(params.get("prompt") or "")
         cwd = str(params.get("cwd") or repo_root)
+        state_dir = str(params.get("state_dir") or "~/.goal-flight").rstrip("/")
         if not dispatch_id or not agent:
             raise SshAllowlistError("acp_run requires dispatch_id and agent")
+        # Remote SSH on some hosts splits argv on spaces; base64 keeps prompts intact.
+        prompt_b64 = base64.b64encode(prompt.encode("utf-8")).decode("ascii")
+        acp_python = str(params.get("python") or f"{state_dir}/venvs/acp-0.10/bin/python")
         argv = [
-            python,
+            acp_python,
             f"{repo_root}/scripts/goalflight_acp_run.py",
             "--agent",
             agent,
@@ -129,8 +137,8 @@ def build_remote_command(command_class: str, **params: Any) -> list[str]:
             cwd,
             "--dispatch-id",
             dispatch_id,
-            "--prompt-text",
-            prompt,
+            "--prompt-b64",
+            prompt_b64,
             "--json",
         ]
     elif command_class == "git_fetch":
@@ -166,11 +174,11 @@ def build_remote_command(command_class: str, **params: Any) -> list[str]:
         argv = [
             python,
             f"{repo_root}/scripts/goalflight_fleet_billing.py",
+            "--fleet-dir",
+            "/dev/null",
             "probe",
             "--account-key",
             account_key,
-            "--fleet-dir",
-            "/dev/null",
         ]
     else:
         raise SshAllowlistError(f"unsupported command class: {command_class}")
@@ -201,6 +209,7 @@ def build_ssh_command(
         cmd.extend(["-i", str(Path(host.identity_file).expanduser())])
     cmd.append(target)
     cmd.append("--")
+    cmd.extend(["env", f"PATH={REMOTE_PATH_PREFIX}"])
     cmd.extend(remote_argv)
     return cmd
 

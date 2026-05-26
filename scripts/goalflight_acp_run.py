@@ -362,9 +362,16 @@ async def run(args: argparse.Namespace) -> dict:
 
     write_status(status_path, payload)
     try:
-        prompt = Path(args.prompt).read_text() if args.prompt else args.prompt_text
+        if args.prompt:
+            prompt = Path(args.prompt).read_text()
+        elif getattr(args, "prompt_b64", None):
+            import base64
+
+            prompt = base64.b64decode(args.prompt_b64.encode("ascii")).decode("utf-8")
+        else:
+            prompt = args.prompt_text
         if not prompt:
-            raise ValueError("--prompt or --prompt-text required")
+            raise ValueError("--prompt, --prompt-text, or --prompt-b64 required")
     except Exception as e:
         payload.update({"state": "failed", "error": f"{type(e).__name__}: {e}"})
         write_status(status_path, payload)
@@ -925,6 +932,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--prompt-id")
     parser.add_argument("--prompt")
     parser.add_argument("--prompt-text")
+    parser.add_argument(
+        "--prompt-b64",
+        help="Base64-encoded prompt text for fleet SSH dispatch (avoids argv splitting).",
+    )
     parser.add_argument(
         "--mode",
         choices=["one-shot", "goal"],

@@ -55,6 +55,8 @@ def test_build_ssh_uses_separator() -> None:
     cmd = ssh.build_ssh_command(host, remote, command_class="probe_echo")
     assert_true("ssh prefix", cmd[0] == "ssh")
     assert_true("double dash", "--" in cmd)
+    env_idx = cmd.index("env")
+    assert_true("env wrapper", cmd[env_idx + 1].startswith("PATH="))
     assert_true("remote tail", cmd[-2:] == ["echo", "goal-flight-probe-ok"])
 
 
@@ -84,6 +86,36 @@ def test_parse_ssh_config_loopback_without_stanza() -> None:
         assert_true("loopback user", host.user == getpass.getuser())
 
 
+def test_auth_probe_remote_argv_order() -> None:
+    argv = ssh.build_remote_command(
+        "auth_probe",
+        repo_root="/srv/goal-flight",
+        account_key="openai/default",
+    )
+    assert_true("fleet-dir before subcommand", argv.index("--fleet-dir") < argv.index("probe"))
+    assert_true("probe subcommand", "probe" in argv)
+
+
+def test_acp_run_uses_prompt_b64_and_acp_python() -> None:
+    import base64
+
+    prompt = "Reply with exactly: fleet-smoke-ok"
+    argv = ssh.build_remote_command(
+        "acp_run",
+        repo_root="/srv/goal-flight",
+        state_dir="/Users/dev/.goal-flight",
+        dispatch_id="acp-test",
+        agent="codex-acp",
+        prompt=prompt,
+        cwd="/Users/dev/.goal-flight/worktrees/acp-test",
+    )
+    assert_true("acp venv python", argv[0].endswith("/venvs/acp-0.10/bin/python"))
+    b64_idx = argv.index("--prompt-b64")
+    decoded = base64.b64decode(argv[b64_idx + 1].encode("ascii")).decode("utf-8")
+    assert_true("prompt roundtrip", decoded == prompt)
+    assert_true("no prompt-text", "--prompt-text" not in argv)
+
+
 def main() -> None:
     for test in (
         test_allowed_command_classes_build,
@@ -93,6 +125,8 @@ def main() -> None:
         test_build_ssh_uses_separator,
         test_parse_ssh_config,
         test_parse_ssh_config_loopback_without_stanza,
+        test_auth_probe_remote_argv_order,
+        test_acp_run_uses_prompt_b64_and_acp_python,
     ):
         test()
         print(f"PASS {test.__name__}")
