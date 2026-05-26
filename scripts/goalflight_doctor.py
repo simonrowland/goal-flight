@@ -29,6 +29,11 @@ try:
 except Exception:  # pragma: no cover - doctor still reports partial state
     goalflight_rate_pressure = None
 
+try:
+    import goalflight_fleet
+except Exception:  # pragma: no cover - doctor still reports partial state
+    goalflight_fleet = None
+
 
 def run(cmd: list[str], cwd: Path | None = None, timeout: float = 8.0) -> dict:
     try:
@@ -151,6 +156,9 @@ def check_host_goalflight_install() -> dict:
     cursor_agents = home / ".cursor/AGENTS.md"
     cursor_skill = home / ".cursor/skills/goal-flight/SKILL.md"
     cursor_rules = home / ".cursor/rules/goal-flight.mdc"
+    opencode_agents = home / ".config/opencode/AGENTS.md"
+    opencode_skill = home / ".config/opencode/skills/goal-flight/SKILL.md"
+    opencode_config = home / ".config/opencode/opencode.json"
     standard_agents_skill = home / ".agents/skills/goal-flight/SKILL.md"
     grok_skill = home / ".grok/skills/goal-flight/SKILL.md"
     claude_skill = home / ".claude/skills/goal-flight/SKILL.md"
@@ -166,6 +174,13 @@ def check_host_goalflight_install() -> dict:
             "skill": _path_state(cursor_skill),
             "standard_agents_skill": _path_state(standard_agents_skill),
             "rules": _path_state(cursor_rules),
+        },
+        "opencode": {
+            "ok": opencode_skill.exists() or standard_agents_skill.exists(),
+            "global_agents": _path_state(opencode_agents),
+            "skill": _path_state(opencode_skill),
+            "config": _path_state(opencode_config),
+            "standard_agents_skill": _path_state(standard_agents_skill),
         },
         "grok": {
             "ok": grok_skill.exists(),
@@ -183,6 +198,11 @@ def check_host_goalflight_install() -> dict:
             detail = (
                 f"{item['skill']['path']} standard={item['standard_agents_skill']['exists']} "
                 f"agents={item['global_agents']['exists']} rules={item['rules']['exists']}"
+            )
+        elif host == "opencode":
+            detail = (
+                f"{item['skill']['path']} standard={item['standard_agents_skill']['exists']} "
+                f"agents={item['global_agents']['exists']} config={item['config']['exists']}"
             )
         else:
             detail = item["skill"]["path"]
@@ -215,6 +235,27 @@ def check_cursor_context_mode(skill_root: Path, project_root: Path) -> dict:
             "project_check_ok": project_result["ok"],
             "global_path": str(Path.home() / ".cursor/mcp.json"),
             "project_path": str(project_root / ".cursor/mcp.json"),
+            "npx_present": bool(shutil.which("npx")),
+        }
+    )
+    return out
+
+
+def check_opencode_context_mode(skill_root: Path, project_root: Path) -> dict:
+    script = skill_root / "scripts/hosts/opencode/register_context_mode.py"
+    out = {"register_script": str(script), "register_script_exists": script.exists()}
+    if not script.exists():
+        return out
+    global_result = run(["python3", str(script), "--scope", "global", "--project-root", str(project_root), "--check"], timeout=10)
+    project_result = run(["python3", str(script), "--scope", "project", "--project-root", str(project_root), "--check"], timeout=10)
+    out.update(
+        {
+            "global_check_returncode": global_result["returncode"],
+            "global_check_ok": global_result["ok"],
+            "project_check_returncode": project_result["returncode"],
+            "project_check_ok": project_result["ok"],
+            "global_path": str(Path.home() / ".config/opencode/opencode.json"),
+            "project_path": str(project_root / "opencode.json"),
             "npx_present": bool(shutil.which("npx")),
         }
     )
@@ -473,6 +514,14 @@ def check_acp() -> dict:
         "cursor-agent": {"present": bool(version("cursor-agent", "--version").get("present")), "version": version("cursor-agent", "--version").get("version")},
         "claude-code-cli-acp": {"present": bool(shutil.which("claude-code-cli-acp"))},
         "grok-agent-stdio": {"present": grok["present"], "headless_hint": grok.get("headless_flags")},
+        "opencode-acp": {
+            "present": bool(version("opencode", "--version").get("present")),
+            "version": version("opencode", "--version").get("version"),
+        },
+        "opencode-bash-tail": {
+            "present": (SCRIPT_DIR / "hosts/opencode/bash_tail.py").is_file(),
+            "script": str(SCRIPT_DIR / "hosts/opencode/bash_tail.py"),
+        },
     }
 
 
@@ -573,12 +622,53 @@ def _goalflight_skill_root(agent_text: str) -> dict:
     }
 
 
+def check_router(repo: Path) -> dict:
+    """Track B: single-surface router readiness (optional field for JSON consumers)."""
+    actions_script = repo / "scripts" / "goalflight_actions.py"
+    bin_goalflight = repo / "bin" / "goalflight"
+    python = shutil.which("python3") or "python3"
+    out: dict = {
+        "bin_goalflight": _path_state(bin_goalflight),
+        "actions_script": _path_state(actions_script),
+        "recommended_entrypoint": "bin/goalflight <domain> <resource> <verb>",
+    }
+    if not actions_script.exists():
+        out["ok"] = False
+        out["reason"] = "goalflight_actions.py missing"
+        return out
+    validate = run([python, str(actions_script), "validate"], cwd=repo, timeout=15)
+    route = run(
+        [python, str(actions_script), "route", "core", "doctor", "read"],
+        cwd=repo,
+        timeout=10,
+    )
+    out["actions_validate"] = {
+        "ok": validate["ok"],
+        "returncode": validate["returncode"],
+    }
+    out["doctor_route_dry_run"] = {
+        "ok": route["ok"],
+        "returncode": route["returncode"],
+        "command_preview": first_line(route.get("stdout")),
+    }
+    out["ok"] = bool(validate["ok"] and route["ok"] and bin_goalflight.exists())
+    if not bin_goalflight.exists():
+        out["reason"] = "bin/goalflight missing — use scripts/goalflight_actions.py route"
+    elif not validate["ok"]:
+        out["reason"] = "action registry validate failed"
+    elif not route["ok"]:
+        out["reason"] = "core.doctor.read route failed"
+    return out
+
+
 def check_project_goalflight_readiness(repo: Path) -> dict:
     docs_private = repo / "docs-private"
     env_caveats = docs_private / "env-caveats.md"
     repo_skill = repo / "SKILL.md"
     cursor_project_skill = repo / ".cursor/skills/goal-flight/SKILL.md"
     cursor_project_rules = repo / ".cursor/rules/goal-flight.mdc"
+    opencode_project_skill = repo / ".opencode/skills/goal-flight/SKILL.md"
+    opencode_project_config = repo / "opencode.json"
     agent_path, agent_text = _agent_instructions(repo)
     lower = agent_text.casefold()
     has_routing = bool(
@@ -613,6 +703,10 @@ def check_project_goalflight_readiness(repo: Path) -> dict:
             "skill": _path_state(cursor_project_skill),
             "rules": _path_state(cursor_project_rules),
         },
+        "opencode_project": {
+            "skill": _path_state(opencode_project_skill),
+            "config": _path_state(opencode_project_config),
+        },
         "routing": {
             "path": str(agent_path) if agent_path else None,
             "exists": bool(agent_path),
@@ -626,7 +720,7 @@ def check_project_goalflight_readiness(repo: Path) -> dict:
     }
 
 
-def doctor(repo: Path) -> dict:
+def doctor(repo: Path, *, fleet: bool = False, fleet_dir: Path | None = None, fleet_probe: bool = False) -> dict:
     skill_root = SCRIPT_DIR.parent
     codex_desktop = app_exists("Codex", "com.openai.codex")
     codex_cli = version("codex", "--version")
@@ -645,6 +739,7 @@ def doctor(repo: Path) -> dict:
         },
         "context_mode": check_context_mode(skill_root),
         "cursor_context_mode": check_cursor_context_mode(skill_root, repo),
+        "opencode_context_mode": check_opencode_context_mode(skill_root, repo),
         "gstack": check_gstack(),
         "cursor": {
             "desktop_present": cursor_desktop,
@@ -652,15 +747,38 @@ def doctor(repo: Path) -> dict:
             "agent": version("cursor-agent", "--version"),
             "models": cursor_models_probe(),
         },
+        "opencode": version("opencode", "--version"),
         "grok": check_grok(),
         "acp": check_acp(),
         "project": git_state(repo),
         "project_goalflight_readiness": check_project_goalflight_readiness(repo),
+        "router": check_router(repo),
         "capacity": goalflight_capacity.profile(argparse.Namespace()) if goalflight_capacity else None,
+        "fleet_reconcile": _fleet_reconcile_summary(),
         "rate_pressure": _rate_pressure_summary(),
         "worker_currency": worker_currency_probe(),
     }
+    if fleet:
+        payload["fleet"] = _fleet_auth_summary(fleet_dir, refresh=fleet_probe)
+        payload["fleet_dispatches"] = _fleet_dispatch_report(fleet_dir)
+        payload["fleet_bash_tail_probes"] = _fleet_bash_tail_probe_summary(fleet_dir)
     return payload
+
+
+def _fleet_auth_summary(
+    fleet_dir: Path | None = None,
+    *,
+    refresh: bool = False,
+) -> dict:
+    if goalflight_fleet is None:
+        return {"available": False, "reason": "goalflight_fleet import failed", "nodes": []}
+    try:
+        import goalflight_fleet_billing as fleet_billing
+
+        target = fleet_dir or goalflight_fleet.default_fleet_dir()
+        return fleet_billing.fleet_auth_doctor(target, refresh=refresh)
+    except Exception as exc:  # pragma: no cover
+        return {"available": False, "reason": f"{type(exc).__name__}: {exc}", "nodes": []}
 
 
 def _rate_pressure_summary() -> dict:
@@ -676,14 +794,75 @@ def _rate_pressure_summary() -> dict:
     try:
         state_dir = Path(os.environ.get("GOALFLIGHT_STATE_DIR", f"/tmp/goal-flight-{os.getuid()}"))
         records = goalflight_rate_pressure.collect_records(state_dir)
-        pressure = goalflight_rate_pressure.pressure_per_provider(records)
+        billing = goalflight_rate_pressure.load_billing_accounts()
+        pool_map = goalflight_rate_pressure.agent_limit_pool_map(billing)
+        pressure = goalflight_rate_pressure.pressure_per_provider(records, pool_map=pool_map)
         current_caps = dict(goalflight_capacity.DEFAULT_AGENT_CAPS) if goalflight_capacity else {}
-        rec = goalflight_rate_pressure.recommend(pressure, current_caps)
+        rec = goalflight_rate_pressure.recommend(pressure, current_caps, pool_map=pool_map)
         rec["records_examined"] = len(records)
         rec["state_dir"] = str(state_dir)
         return rec
     except Exception as exc:  # pragma: no cover - keep doctor resilient
         return {"available": False, "reason": f"{type(exc).__name__}: {exc}"}
+
+
+def _fleet_reconcile_summary(*, release_stale: bool = False) -> dict:
+    if goalflight_fleet is None:
+        return {"available": False, "reason": "goalflight_fleet import failed"}
+    try:
+        fleet_dir = goalflight_fleet.default_fleet_dir()
+        if release_stale:
+            import goalflight_fleet_stale as fleet_stale
+
+            return fleet_stale.doctor_fleet_stale_release(fleet_dir, mutate=True)
+        return goalflight_fleet.reconcile_fleet(fleet_dir, release_stale=False)
+    except Exception as exc:  # pragma: no cover
+        return {"available": False, "reason": f"{type(exc).__name__}: {exc}"}
+
+
+def _fleet_bash_tail_probe_summary(fleet_dir: Path | None = None) -> dict:
+    if goalflight_fleet is None:
+        return {"available": False, "reason": "goalflight_fleet import failed", "nodes": []}
+    try:
+        import goalflight_fleet_bash_tail_probe as bash_probe
+
+        target = fleet_dir or goalflight_fleet.default_fleet_dir()
+        fleet_path = target / "fleet.json"
+        if not fleet_path.exists():
+            return {"available": True, "fleet_dir": str(target), "nodes": []}
+        fleet_doc = goalflight_fleet.read_json(fleet_path)
+        nodes_out: list[dict] = []
+        for node_id in sorted((fleet_doc.get("nodes") or {}).keys()):
+            probes = bash_probe.load_latest_probes(target, node_id)
+            nodes_out.append(
+                {
+                    "node_id": node_id,
+                    "bash_tail_probe": {
+                        adapter: {
+                            "ok": doc.get("ok"),
+                            "marker_seen": doc.get("marker_seen"),
+                            "probed_at": doc.get("probed_at"),
+                        }
+                        for adapter, doc in sorted(probes.items())
+                    },
+                }
+            )
+        return {"available": True, "fleet_dir": str(target), "nodes": nodes_out}
+    except Exception as exc:  # pragma: no cover
+        return {"available": False, "reason": f"{type(exc).__name__}: {exc}", "nodes": []}
+
+
+def _fleet_dispatch_report(fleet_dir: Path | None = None) -> dict:
+    if goalflight_fleet is None:
+        return {"available": False, "reason": "goalflight_fleet import failed", "dispatches": []}
+    try:
+        import goalflight_fleet_reconcile as fleet_reconcile
+
+        target = fleet_dir or goalflight_fleet.default_fleet_dir()
+        rows = fleet_reconcile.classify_fleet_dispatches(target)
+        return {"available": True, "fleet_dir": str(target), "dispatches": rows}
+    except Exception as exc:  # pragma: no cover
+        return {"available": False, "reason": f"{type(exc).__name__}: {exc}", "dispatches": []}
 
 
 def status_line(ok: bool | None, label: str, detail: str | None = None) -> str:
@@ -718,9 +897,20 @@ def print_human(payload: dict) -> None:
             "Cursor context-mode MCP project",
             payload["cursor_context_mode"].get("project_path"),
         ),
+        status_line(
+            payload["opencode_context_mode"].get("global_check_returncode") == 0,
+            "OpenCode context-mode MCP global",
+            f"{payload['opencode_context_mode'].get('global_path')} npx={payload['opencode_context_mode'].get('npx_present')}",
+        ),
+        status_line(
+            payload["opencode_context_mode"].get("project_check_returncode") == 0,
+            "OpenCode context-mode MCP project",
+            payload["opencode_context_mode"].get("project_path"),
+        ),
         status_line(payload["gstack"].get("present"), "gstack", payload["gstack"].get("version")),
         status_line(payload["cursor"].get("desktop_present"), "Cursor Desktop", None),
         status_line(payload["cursor"]["agent"].get("present"), "cursor-agent ACP", payload["cursor"]["agent"].get("version")),
+        status_line(payload["opencode"].get("present"), "opencode ACP", payload["opencode"].get("version")),
         status_line(payload["grok"].get("present"), "Grok Build binary", payload["grok"].get("version")),
         status_line(payload["grok"].get("headless_flags"), "Grok headless flags", None),
     ]
@@ -737,6 +927,7 @@ def print_human(payload: dict) -> None:
     project = payload["project"]
     lines.append(status_line(project.get("present"), "git project", f"{project.get('branch')} {project.get('head')} dirty={project.get('dirty')}"))
     readiness = payload.get("project_goalflight_readiness") or {}
+    router = payload.get("router") or {}
     lines.extend([
         status_line(readiness.get("init_done"), "project init", readiness.get("env_caveats")),
         status_line(readiness.get("repo_skill", {}).get("exists"), "project SKILL.md", readiness.get("repo_skill", {}).get("path")),
@@ -747,6 +938,13 @@ def print_human(payload: dict) -> None:
             f"{readiness.get('skill_root', {}).get('path')} source={readiness.get('skill_root', {}).get('source')}",
         ),
     ])
+    lines.append(
+        status_line(
+            router.get("ok"),
+            "action router",
+            router.get("recommended_entrypoint") if router.get("ok") else router.get("reason"),
+        )
+    )
     commands = readiness.get("commands") or {}
     for name in ("test", "lint", "build"):
         value = commands.get(name)
@@ -839,8 +1037,42 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="goal-flight doctor")
     parser.add_argument("--project-root", default=os.getcwd())
     parser.add_argument("--json", action="store_true")
+    parser.add_argument(
+        "--fleet-reconcile-stale",
+        action="store_true",
+        help="Release stale capacity leases and expired account locks before reporting",
+    )
+    parser.add_argument(
+        "--fleet",
+        action="store_true",
+        help="Include fleet auth probe summary (nodes[].accounts[].auth_probe)",
+    )
+    parser.add_argument(
+        "--fleet-dir",
+        type=Path,
+        help="Fleet store directory for --fleet (default ~/.goal-flight/fleet)",
+    )
+    parser.add_argument(
+        "--fleet-probe",
+        action="store_true",
+        help="Refresh auth probes when used with --fleet",
+    )
     args = parser.parse_args(argv)
-    payload = doctor(Path(args.project_root).resolve())
+    if args.fleet_reconcile_stale and goalflight_fleet is not None:
+        import goalflight_fleet_stale as fleet_stale
+
+        fleet_stale.doctor_fleet_stale_release(goalflight_fleet.default_fleet_dir(), mutate=True)
+    fleet_dir = args.fleet_dir
+    if fleet_dir is None and args.fleet and goalflight_fleet is not None:
+        fleet_dir = goalflight_fleet.default_fleet_dir()
+    payload = doctor(
+        Path(args.project_root).resolve(),
+        fleet=args.fleet,
+        fleet_dir=fleet_dir,
+        fleet_probe=args.fleet_probe,
+    )
+    if args.fleet_reconcile_stale:
+        payload["fleet_reconcile"] = _fleet_reconcile_summary(release_stale=True)
     if args.json:
         print(json.dumps(payload, sort_keys=True))
     else:

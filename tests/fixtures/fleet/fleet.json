@@ -1,0 +1,7 @@
+{
+  "schema": "goalflight.fleet.v1",
+  "schema_version": 1,
+  "min_reader_version": 1,
+  "controller_id": "fixture:1",
+  "nodes": {}
+}

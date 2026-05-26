@@ -5,6 +5,10 @@
 .idea/
 .vscode/
 
+# Local host install targets (written by setup into user/project paths, not repo canon)
+.opencode/
+.cursor/
+
 # Private ongoing skill-development notes
 docs-private/
 
@@ -23,3 +27,7 @@ legacy-host-adapters/
 # Python bytecode (from scripts/acp_*.py + test/test_acp_*.py).
 __pycache__/
 *.pyc
+
+# Manual live-test artifacts (not checked in).
+test/manual/.prompt-matrix-report.json
+test/manual/.prompt-matrix-run.log

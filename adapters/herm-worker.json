@@ -1,0 +1,227 @@
+{
+  "schema": "goalflight.agent-adapter.v1",
+  "agent_id": "herm-worker",
+  "display_name": "Gateway worker (herm slot)",
+  "agent_family": "gateway",
+  "providers": {
+    "controller_provider": "none",
+    "model_provider": "mixed",
+    "same_provider_policy": "require_cross_provider_review"
+  },
+  "support": {
+    "controller": {
+      "capability": "unsupported",
+      "evidence": [
+        "architecture: gateway orchestrator is worker-only; controller stays on designated workstation",
+        "stub: no verified local controller surface for this slot"
+      ],
+      "readiness_requirements": [],
+      "fallback": "unsupported"
+    },
+    "worker": {
+      "capability": "candidate",
+      "transport": ["acp", "tail_file"],
+      "readiness_requirements": ["binary", "version", "noninteractive", "status_contract", "safe_args"],
+      "fallback": "tail_file"
+    }
+  },
+  "local_readiness_state": {
+    "storage": "machine-local, never checked in",
+    "path_pattern": "$XDG_STATE_HOME/goal-flight/readiness/<agent>.json",
+    "controller": "unsupported",
+    "worker": "probe_required",
+    "last_probe_ids": [],
+    "updated_at": null
+  },
+  "live_gate": {
+    "function": "validate_adapter_gate",
+    "controller_allowed_expr": "support.controller.capability == supported && local_readiness.controller == ready",
+    "worker_allowed_expr": "support.worker.capability == supported && local_readiness.worker == ready && requested_transport is verified",
+    "default": "deny",
+    "support_status_enum": ["unsupported", "config_only", "probe_required", "candidate", "not_installed", "forbidden-arg", "failed", "blocked"],
+    "return_fields": ["allowed", "reason", "required_probe_ids", "blocked_fields", "safe_next_action", "live_controller_allowed", "live_worker_dispatch_allowed"]
+  },
+  "tool_name_map": {
+    "shell_exec": {"host_tools": ["gateway child CLI dispatch"], "constraints": ["deny until live gate; no approval-bypass args"]},
+    "read_file": {"host_tools": ["gateway workspace bridge"], "constraints": ["workspace reads only after live gate"]},
+    "write_file": {"host_tools": ["gateway workspace bridge"], "constraints": ["authorized edit scope only"]},
+    "search": {"host_tools": ["gateway search bridge"], "constraints": ["filtered search"]},
+    "delegate": {"host_tools": ["gf-herm-worker"], "constraints": ["controller composes prompt; gateway owns subprocess lifecycle"]},
+    "ask_user": {"host_tools": ["USER-NEED marker"], "constraints": ["controller owns user questions"]},
+    "plan_update": {"host_tools": ["status markers"], "constraints": ["controller owns plan state"]},
+    "memory_search": {"host_tools": ["repo resume notes"], "constraints": ["repo files remain canonical"]},
+    "browser_ui": {"host_tools": [], "constraints": ["not mapped for gateway stub"]}
+  },
+  "invocation": {
+    "skill_triggers": ["goal-flight worker: herm-worker"],
+    "commands": ["gf-herm-worker acp stdio", "gf-herm-worker run --prompt-file <file>"],
+    "exec": {
+      "kind": "acp",
+      "binary": "gf-herm-worker",
+      "args": ["acp", "stdio"],
+      "arg_policy": {
+        "required_safe_args": ["acp", "stdio"],
+        "forbidden_args": ["--yolo", "-y", "--dangerously-*", "--skip-permissions", "--no-sandbox"],
+        "requires_explicit_justification": ["--bare", "--auto"],
+        "reject_in": ["invocation", "probes", "generated_wrappers", "checked_in_configs"]
+      },
+      "stdin": "prompt",
+      "cwd_policy": "repo_required",
+      "output_contract": {
+        "parser": "status_json",
+        "completion_detection": "structured_final_event",
+        "final_event": "ACP prompt result",
+        "final_regex": "Goal complete: (true|false)",
+        "exit_code_policy": "mapped",
+        "resume_args": [],
+        "goal_mode_eligible": true
+      }
+    }
+  },
+  "permission_surface": {
+    "file_reads": ["workspace files after live gate"],
+    "file_writes": ["workspace files after live gate"],
+    "shell": {"allowed_families": ["gateway-orchestrated child CLIs"], "forbidden_families": ["approval bypass", "destructive reset"]},
+    "network": {"allowed": true, "user_gate": true, "notes": "Gateway endpoint from profile ENV; never checked in."},
+    "browser_ui": {"allowed": false, "user_gate": true, "notes": "No verified browser mapping."},
+    "memory_writes": {"allowed": false, "backend": "repo_files"},
+    "plugin_sandbox": {"mode": "none", "declared_permissions": []},
+    "os_sandbox": {"supported_profiles": ["off"], "default_profile": "off", "implementation": "unsupported", "notes": "Sandbox on gateway host; not controller subprocess."},
+    "auto_approve_detection": {"probes": ["adapter-forbidden-args-scan"], "strict_fail": true},
+    "secrets": ["GOALFLIGHT_HERM_WORKER_URL", "GOALFLIGHT_HERM_WORKER_TOKEN_FILE"],
+    "irreversible_ops": ["git reset --hard", "force push", "rm -rf"]
+  },
+  "memory_backend": {
+    "canonical": "repo_files",
+    "repo_files": [".goal-flight/**"],
+    "host_native": {"role": "advisory", "backend": "gateway session state"},
+    "mirror_writeback": false,
+    "source_epoch": "goal-flight-0.5.0",
+    "snapshot_id": "herm-worker-gated-stub",
+    "migration_lock_required_for_writeback": true,
+    "drift_policy": "warn_and_prefer_repo"
+  },
+  "packaging": {
+    "checked_in_wrappers": [],
+    "generated_outputs": [],
+    "install_actions": [],
+    "plugin_manifest": {"supported": false, "path": null, "api_status": "unsupported"},
+    "mcp": {"required": false, "servers": []},
+    "validation": ["json parse", "schema required groups", "forbidden args scan", "./tests/run.sh"]
+  },
+  "setup": {
+    "controller_destinations": [],
+    "worker_destinations": [
+      {
+        "id": "herm-worker-gateway",
+        "label": "Gateway worker (herm slot)",
+        "role": "worker",
+        "surface": "remote_acp",
+        "default": true,
+        "probe_ids": ["herm-worker-path", "herm-worker-version", "herm-worker-help"],
+        "install_action_sources": [],
+        "commands": ["gf-herm-worker acp stdio"],
+        "paths": ["$(command -v gf-herm-worker)", "~/.goal-flight/profiles/<slot>.env"],
+        "requires_restart": false
+      }
+    ],
+    "addons": []
+  },
+  "discovery": {
+    "budget": {
+      "max_path_probes": 1,
+      "max_version_probes": 1,
+      "max_help_probes": 1,
+      "max_ms_per_probe": 5000,
+      "max_total_ms_per_agent": 15000,
+      "max_total_ms_all_agents": 90000,
+      "max_stdout_bytes_per_probe": 4096,
+      "max_stderr_bytes_per_probe": 4096,
+      "network_default": "deny",
+      "model_consuming": "forbidden"
+    },
+    "probes": [
+      {
+        "id": "herm-worker-path",
+        "class": "path",
+        "argv": ["sh", "-lc", "command -v gf-herm-worker"],
+        "safe_for_setup": true,
+        "network": false,
+        "model_consuming": false,
+        "env_scrub": true
+      },
+      {
+        "id": "herm-worker-version",
+        "class": "version",
+        "argv": ["gf-herm-worker", "--version"],
+        "safe_for_setup": true,
+        "network": false,
+        "model_consuming": false,
+        "env_scrub": true
+      },
+      {
+        "id": "herm-worker-help",
+        "class": "help",
+        "argv": ["gf-herm-worker", "--help"],
+        "safe_for_setup": true,
+        "network": false,
+        "model_consuming": false,
+        "env_scrub": true
+      }
+    ]
+  },
+  "status_contract": {
+    "schema": "goalflight.acp-run.v1",
+    "liveness_profile": "remote_api",
+    "heartbeat_required": true,
+    "dispatcher_owns_heartbeat": true,
+    "status_file": ".goal-flight/status/<dispatch_id>.json",
+    "transport_instance_id": "herm-worker:<pid>:<dispatch_id>",
+    "seq": "monotonic integer",
+    "parser_type": "acp",
+    "marker_namespace": "goalflight:<dispatch_id>:<transport>:<seq>",
+    "stale_after_s": 180,
+    "terminal_states": ["complete", "failed", "blocked", "wedged"]
+  },
+  "host_projection": {
+    "adapter_summary": {
+      "agent_id": "herm-worker",
+      "transports": ["acp", "tail_file"],
+      "liveness_profile": "remote_api",
+      "default_cap": 2,
+      "remote_turn_silence_s": 1800,
+      "remote_turn_cancel_grace_s": 30,
+      "profile_env_required": ["GOALFLIGHT_HERM_WORKER_URL"]
+    },
+    "delegation_recipes": {
+      "acp": {
+        "transport": "acp",
+        "spawn": {
+          "binary": "gf-herm-worker",
+          "args": ["acp", "stdio"],
+          "cwd_policy": "repo_required",
+          "env_from_profile": ["GOALFLIGHT_HERM_WORKER_URL", "GOALFLIGHT_HERM_WORKER_TOKEN_FILE", "GOALFLIGHT_HERM_WORKER_TIMEOUT_S"]
+        },
+        "connection": {"idle_timeout_s": 1800, "cancel_grace_s": 30},
+        "status": {"schema": "goalflight.acp-run.v1", "parser_type": "acp", "dispatcher_owns_heartbeat": true}
+      },
+      "bash_tail": {
+        "transport": "tail_file",
+        "run": {
+          "command_template": "gf-herm-worker run --cwd {repo} --prompt-file {prompt_file} --stdout {stdout_log} --stderr {stderr_log} --status-file {status_file}",
+          "prompt_delivery": "file"
+        },
+        "parse": {
+          "marker_regex": "^(STATUS|USER-NEED|USER-CONFIRM):",
+          "completion": "structured_final_event",
+          "final_regex": "Goal complete: (true|false)"
+        },
+        "status": {"schema": "goalflight.acp-run.v1", "parser_type": "tail_file", "seq": "monotonic_from_watcher"}
+      }
+    },
+    "install_slot": {
+      "profile_env_pattern": "~/.goal-flight/profiles/${GOALFLIGHT_INSTALL_SLOT:-default}.env",
+      "readiness_path_pattern": "$XDG_STATE_HOME/goal-flight/readiness/<agent>.<slot>.json"
+    }
+  }
+}

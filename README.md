@@ -5,10 +5,28 @@
 ![Last commit](https://img.shields.io/github/last-commit/simonrowland/goal-flight)
 ![Stars](https://img.shields.io/github/stars/simonrowland/goal-flight)
 
-**Multi-agent controller for large software goals.**  
-Hand it an ambitious project. It fans out `/goal` prompts to CLI coding agents (claude-cli, Cursor, Codex, Grok, etc.), keeps its own context laser-focused on architecture and dispatch, and creates durable project files that survive context compaction, restarts, and overnight runs. Built first for Claude Code.
+goal-flight is a multi-agent controller, which delegates coding /goal and parallel-review work to additional agent sessions. It lets you hand a frontier model a large software task to break down into closed chunks, and keep moving after the first context window would normally fall apart. It turns the work into durable project files: a plan, queue, environment caveats, worker status, review evidence, and resume notes that survive compaction, restarts, and overnight runs. Multi-hour runs can land as a clean stack of one-commit-per-chunk on main, with integrated self-reviews leveraging Gstack.
+
+**Controller hosts.** [Claude Code](https://claude.ai/code) is the reference controller. Goal Flight also ships controller ports for [Codex](https://github.com/openai/codex), [Cursor](https://cursor.com), and [OpenCode](https://opencode.ai) — same `SKILL.md`, file-backed queue, and dispatch machinery, with host-specific install wrappers below. Workers include codex, cursor, grok, claude-cli, and other ACP or bash-tail adapters.
+
+**What the controller is for**: high-level management, not execution. The controller holds enough context about your project's goal, scenery (constraints, architecture, prior decisions, failure modes), and intent to exercise discretion and recommend the next move — then dispatches actual work to workers to run in an iterative code-review goal loop. This workflow allows lightly-supervised coding: you check in, ratify suggested moves, redirect when needed, and trust the controller to keep the project anchored across compactions and unattended hours. The dispatch / review / handoff machinery below is what frees the controller to do that job.
 
 [Features](#features) • [Quickstart](#quickstart) • [Architecture](#architecture) • [Commands](#commands)
+
+```bash
+# Claude Code (reference controller):
+git clone https://github.com/simonrowland/goal-flight.git ~/.claude/skills/goal-flight
+
+# Codex / Cursor / OpenCode — clone once, then one command per host (global + project):
+git clone https://github.com/simonrowland/goal-flight.git ~/Repos/goal-flight && cd ~/Repos/goal-flight
+./install.sh cursor /path/to/your/project
+./install.sh opencode /path/to/your/project
+./install.sh codex
+```
+
+Restart the host, then run doctor: `python3 scripts/goalflight_doctor.py --project-root /path/to/your/project`.
+
+Same flags via `setup.sh`: `--cursor-install`, `--opencode-install`, and `--codex-install` (each implies `--apply --yes`). Dry-run, link-to-Claude, and agents-standard paths are in [docs/hosts/cursor.md](docs/hosts/cursor.md) and [docs/hosts/opencode.md](docs/hosts/opencode.md).
 
 ## Features
 
@@ -99,6 +117,17 @@ Detailed operating procedures are split into load-on-demand files under
 **Comms shape** (orthogonal axis) — how the controller observes the worker. Goal-flight uses the [Agent Client Protocol](https://agentclientprotocol.com) wherever the worker has an adapter (codex / cursor / claude / grok all do today); bash-tail with a `tail -f`-style marker-grep watcher is the cold-storage fallback. ACP composes with `goal-mode` for any worker; `goal-mode + bash-tail` composes only with codex `/goal` today (codex emits a Final-response marker the watcher detects; other workers' headless modes don't).
 
 The controller picks executor + comms per chunk based on chunk shape, available adapters, and the rate-pressure walkback's recent observations. The shipped routing defaults lean toward sub-billed workers (codex / cursor / grok) for code-writing — calibrated against the maintainer's current vendor plans, not a project-wide prescription. Adjust to your environment by editing the routing table in `SKILL.md` "Worker Routing"; the walkback adapts dynamically when any one provider gets pressured.
+
+## Multi-node fleet (1.0)
+
+For remote workers over SSH, bootstrap a fleet store and use `goalflight_fleet.py`
+dispatch / watch / reconcile. OpenCode, Cursor, Codex, and Claude ACP workers
+can run on registered nodes while the controller stays local. See
+[docs/fleet.md](docs/fleet.md) for the operator guide; live smoke:
+`GOALFLIGHT_LIVE_SSH=1 ./test/manual/test_fleet_live_smoke.sh`.
+
+Unified CLI: `bin/goalflight <domain> <resource> <verb>` (action router over
+`config/actions/`).
 
 ## When NOT to use this
 

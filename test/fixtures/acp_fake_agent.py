@@ -375,6 +375,17 @@ def handle_prompt(req_id: int, params: dict) -> None:
             if message.get("method") == "session/cancel":
                 return
             time.sleep(0.01)
+    if SCENARIO == "blocked_none":
+        text_update(session_id, "RESULT: work done\n")
+        text_update(session_id, "COMPLETE: goal done\n")
+        text_update(session_id, "BLOCKED: none\n")
+        response(req_id, {"sessionId": session_id, "stopReason": "end_turn"})
+        return
+    if SCENARIO == "user_need_none":
+        text_update(session_id, "COMPLETE: goal done\n")
+        text_update(session_id, "USER-NEED: none\n")
+        response(req_id, {"sessionId": session_id, "stopReason": "end_turn"})
+        return
     if SCENARIO == "goal":
         text_update(session_id, "STATUS: working\n")
         text_update(session_id, "COMPLETE: goal done\n")

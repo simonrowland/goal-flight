@@ -34,6 +34,9 @@ WORKER_PATTERNS = (
     "grok",
     "cursor-agent",
     "claude-code-cli-acp",
+    "opencode",
+    "opencode-acp",
+    "opencode-bash-tail",
 )
 
 
@@ -234,6 +237,7 @@ def cmd_record(args: argparse.Namespace) -> int:
         "acp_session_id": args.acp_session_id,
         "logical_session_id": args.logical_session_id,
         "lease_id": args.lease_id,
+        "remote_lease_id": getattr(args, "remote_lease_id", None) or args.lease_id,
         "stdout_path": args.stdout_path,
         "stderr_path": args.stderr_path,
         "status_path": args.status_path,

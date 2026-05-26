@@ -1,0 +1,27 @@
+{
+  "tools": [
+    {
+      "name": "goalflight_post_message",
+      "description": "Append a goalflight.message.v1 envelope to the dispatch inbox. Writes the same bytes as goalflight messages post / file append.",
+      "inputSchema": {
+        "type": "object",
+        "required": ["dispatch_id", "type"],
+        "properties": {
+          "dispatch_id": { "type": "string" },
+          "type": { "type": "string" },
+          "payload": { "type": "object" },
+          "source": {
+            "type": "object",
+            "properties": {
+              "node": { "type": "string" },
+              "adapter": { "type": "string" },
+              "transport": { "type": "string" }
+            }
+          },
+          "seq": { "type": "integer" },
+          "priority": { "type": "string" }
+        }
+      }
+    }
+  ]
+}

@@ -86,8 +86,9 @@ from goalflight_os_sandbox import (
     prepare_os_sandbox_command,
     preflight_os_sandbox,
 )
+from goalflight_profile import dispatch_env
 from goalflight_startup_gate import StartupGate
-from acp_runner import extract_markers, run_prompt
+from acp_runner import extract_markers, has_actionable_marker_values, run_prompt
 
 
 def _resolve_manifest_binary(binary: str) -> str:
@@ -95,6 +96,8 @@ def _resolve_manifest_binary(binary: str) -> str:
         return shutil.which("grok") or str(Path.home() / ".grok/bin/grok")
     if binary == "cursor-agent":
         return shutil.which("cursor-agent") or str(Path.home() / ".local/bin/cursor-agent")
+    if binary == "opencode":
+        return shutil.which("opencode") or str(Path.home() / ".local/bin/opencode")
     if "/" in binary:
         return str(Path(binary).expanduser())
     return shutil.which(binary) or binary
@@ -231,6 +234,7 @@ async def spawn_and_handshake_with_retry(
     permission_inline_timeout_s: float | None = None,
     permission_user_timeout_s: float | None = None,
     os_sandbox: str = OS_SANDBOX_OFF,
+    env: dict[str, str] | None = None,
 ) -> tuple[asyncio.subprocess.Process, AcpConnection]:
     """Spawn the worker and run the ACP handshake, retrying once on AcpError.
 
@@ -265,6 +269,7 @@ async def spawn_and_handshake_with_retry(
             permission_inline_timeout_s=permission_inline_timeout_s,
             permission_user_timeout_s=permission_user_timeout_s,
             os_sandbox=os_sandbox,
+            env=env,
         )
         proc = conn.proc
         if on_attempt is not None:
@@ -357,15 +362,24 @@ async def run(args: argparse.Namespace) -> dict:
 
     write_status(status_path, payload)
     try:
-        prompt = Path(args.prompt).read_text() if args.prompt else args.prompt_text
+        if args.prompt:
+            prompt = Path(args.prompt).read_text()
+        elif getattr(args, "prompt_b64", None):
+            import base64
+
+            prompt = base64.b64decode(args.prompt_b64.encode("ascii")).decode("utf-8")
+        else:
+            prompt = args.prompt_text
         if not prompt:
-            raise ValueError("--prompt or --prompt-text required")
+            raise ValueError("--prompt, --prompt-text, or --prompt-b64 required")
     except Exception as e:
         payload.update({"state": "failed", "error": f"{type(e).__name__}: {e}"})
         write_status(status_path, payload)
         return payload
 
     command, acp_args = agent_command(args.agent)
+    install_slot = getattr(args, "install_slot", None)
+    spawn_env = dispatch_env(args.agent, install_slot)
     gate = validate_acp_dispatch_readiness(args.agent, [command, *acp_args])
     if gate is not None:
         payload.update({"state": "blocked_adapter_gate", "error": gate})
@@ -769,6 +783,7 @@ async def run(args: argparse.Namespace) -> dict:
                 permission_inline_timeout_s=getattr(args, "permission_inline_timeout_s", None),
                 permission_user_timeout_s=getattr(args, "permission_user_timeout_s", None),
                 os_sandbox=os_sandbox_profile,
+                env=spawn_env,
             )
         await update_status(os_sandbox=getattr(conn, "os_sandbox_metadata", None) or payload["os_sandbox"])
         with contextlib.redirect_stdout(io.StringIO()):
@@ -818,7 +833,9 @@ async def run(args: argparse.Namespace) -> dict:
             heartbeat_error=terminal_error,
         )
         if state == "complete" and (
-            markers.get("BLOCKED") or markers.get("USER-NEED") or markers.get("USER-CONFIRM")
+            has_actionable_marker_values(markers, "BLOCKED")
+            or has_actionable_marker_values(markers, "USER-NEED")
+            or markers.get("USER-CONFIRM")
         ):
             state = "blocked"
         payload.update({
@@ -905,12 +922,22 @@ async def run(args: argparse.Namespace) -> dict:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="goal-flight ACP runner")
     parser.add_argument("--agent", required=True)
+    parser.add_argument(
+        "--install-slot",
+        default=None,
+        help="Gateway worker profile slot (~/.goal-flight/profiles/<slot>.env). "
+        "Ignored for non-gateway agents.",
+    )
     parser.add_argument("--cwd", required=True)
     parser.add_argument("--session-id", default=None)
     parser.add_argument("--dispatch-id")
     parser.add_argument("--prompt-id")
     parser.add_argument("--prompt")
     parser.add_argument("--prompt-text")
+    parser.add_argument(
+        "--prompt-b64",
+        help="Base64-encoded prompt text for fleet SSH dispatch (avoids argv splitting).",
+    )
     parser.add_argument(
         "--mode",
         choices=["one-shot", "goal"],

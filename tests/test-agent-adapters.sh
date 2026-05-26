@@ -4,7 +4,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 python3 "$REPO_ROOT/scripts/goalflight_validate_adapters.py" >/tmp/goal-flight-adapters-$$.out
-grep -q "schema_validates=13/13" /tmp/goal-flight-adapters-$$.out || {
+grep -q "schema_validates=16/16" /tmp/goal-flight-adapters-$$.out || {
   cat /tmp/goal-flight-adapters-$$.out
   rm -f /tmp/goal-flight-adapters-$$.out
   exit 1
@@ -217,6 +217,13 @@ expect_denied(
     "candidate",
     role="worker",
     requested_transport="cli_json",
+)
+expect_denied(
+    "gateway-candidate",
+    load("herm-worker"),
+    "candidate",
+    role="worker",
+    requested_transport="acp",
 )
 
 config_only = copy.deepcopy(codex)

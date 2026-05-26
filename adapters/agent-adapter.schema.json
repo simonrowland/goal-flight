@@ -57,7 +57,10 @@
         "copilot",
         "openhands",
         "amp",
-        "antigravity"
+        "antigravity",
+        "herm-worker",
+        "cla-worker",
+        "paperclip"
       ]
     },
     "agentFamily": {
@@ -74,7 +77,8 @@
         "copilot",
         "openhands",
         "amp",
-        "antigravity"
+        "antigravity",
+        "gateway"
       ]
     },
     "stringArray": {
@@ -249,7 +253,12 @@
         "arg_policy": {"$ref": "#/$defs/argPolicy"},
         "stdin": {"enum": ["prompt", "none"]},
         "cwd_policy": {"enum": ["repo_required", "workspace", "host_default"]},
-        "output_contract": {"$ref": "#/$defs/outputContract"}
+        "output_contract": {"$ref": "#/$defs/outputContract"},
+        "action_id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9]*(\\.[a-z][a-z0-9-]*)+$",
+          "description": "Optional Goal Flight action registry id for router dispatch"
+        }
       }
     },
     "argPolicy": {
@@ -483,7 +492,23 @@
         "addons": {
           "type": "array",
           "items": {"$ref": "#/$defs/setupAddon"}
+        },
+        "prerequisites": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/setupPrerequisite"}
         }
+      }
+    },
+    "setupPrerequisite": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "applies_to_destination_ids", "summary", "steps"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "applies_to_destination_ids": {"$ref": "#/$defs/stringArray"},
+        "platforms": {"$ref": "#/$defs/stringArray"},
+        "summary": {"type": "string", "minLength": 1},
+        "steps": {"$ref": "#/$defs/stringArray"}
       }
     },
     "setupAddon": {
@@ -514,7 +539,8 @@
         "install_action_sources": {"$ref": "#/$defs/stringArray"},
         "commands": {"$ref": "#/$defs/stringArray"},
         "paths": {"$ref": "#/$defs/stringArray"},
-        "requires_restart": {"type": "boolean"}
+        "requires_restart": {"type": "boolean"},
+        "prerequisites": {"$ref": "#/$defs/stringArray"}
       }
     },
     "discovery": {

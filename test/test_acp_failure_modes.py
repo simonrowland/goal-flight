@@ -22,9 +22,11 @@ from goalflight_acp_client import (  # noqa: E402
     AcpError,
     AcpLivenessActivity,
     AcpProcessPool,
+    JsonRpcLineFilterReader,
     PoolExhaustedError,
 )
 from goalflight_acp_run import adapter_liveness_config, agent_command, decide_terminal_state, spawn_and_handshake_with_retry  # noqa: E402
+from acp_runner import has_actionable_marker_values  # noqa: E402
 from goalflight_liveness import heartbeat_wedge_decision, progress_stall_decision  # noqa: E402
 
 
@@ -199,6 +201,24 @@ def case_manifest_acp_command_defaults() -> None:
     binary, args = agent_command("codex-acp")
     assert binary == "codex-acp"
     assert args == []
+
+    binary, args = agent_command("opencode")
+    assert Path(binary).name == "opencode"
+    assert args == ["acp"]
+
+
+def case_json_rpc_stdout_filter() -> None:
+    async def _run() -> None:
+        inner = asyncio.StreamReader()
+        inner.feed_data(b"[opencode-litellm] discovered models\n")
+        inner.feed_data(b'{"jsonrpc":"2.0","id":1,"result":{}}\n')
+        inner.feed_eof()
+        filtered = JsonRpcLineFilterReader(inner)
+        line = await filtered.readuntil(b"\n")
+        assert line.startswith(b"{"), line
+        assert filtered.skipped_lines == 1
+
+    asyncio.run(_run())
 
 
 def _pid_alive(pid: object) -> bool:
@@ -557,6 +577,57 @@ def case_terminal_state_endturn_beats_tail_race_wedge() -> None:
     assert state == "failed", state
 
 
+def case_runner_blocked_none_completes() -> None:
+    returncode, status, stdout, stderr = _run_fake_runner(
+        "blocked_none",
+        progress_stall_s=30.0,
+        idle_timeout=5.0,
+        timeout_s=20.0,
+    )
+
+    assert returncode == 0, (stdout, stderr, status)
+    assert status["state"] == "complete", status
+    assert status["ok"] is True, status
+    assert status["error"] is None, status
+    assert status["markers"]["BLOCKED"] == ["none"], status
+    assert status["markers"]["COMPLETE"] == ["goal done"], status
+    assert not has_actionable_marker_values(status["markers"], "BLOCKED")
+
+
+def case_runner_blocked_substantive_cancels() -> None:
+    returncode, status, stdout, stderr = _run_fake_runner(
+        "blocked",
+        progress_stall_s=30.0,
+        heartbeat_interval=1.0,
+        wedge_samples=999,
+        idle_timeout=5.0,
+        timeout_s=20.0,
+    )
+
+    assert returncode != 0, (stdout, stderr, status)
+    assert status["state"] == "blocked", status
+    assert status["ok"] is False, status
+    assert status["error"]["marker"] == "BLOCKED", status
+    assert status["error"]["message"] == "early_marker_cancelled", status
+    assert status["markers"]["BLOCKED"] == ["need maintainer"], status
+
+
+def case_runner_user_need_none_completes() -> None:
+    returncode, status, stdout, stderr = _run_fake_runner(
+        "user_need_none",
+        progress_stall_s=30.0,
+        idle_timeout=5.0,
+        timeout_s=20.0,
+    )
+
+    assert returncode == 0, (stdout, stderr, status)
+    assert status["state"] == "complete", status
+    assert status["ok"] is True, status
+    assert status["error"] is None, status
+    assert status["markers"]["USER-NEED"] == ["none"], status
+    assert not has_actionable_marker_values(status["markers"], "USER-NEED")
+
+
 def case_runner_idle_silent_idle_timeout_reaps() -> None:
     # IdleLivenessGate / on_idle path: a worker that emits nothing and never
     # responds is reaped by the run_prompt idle timeout (not the heartbeat —
@@ -764,12 +835,16 @@ def main() -> None:
     case_progress_stall_wall_ignores_raw_vendor_noise()
     case_adapter_manifest_liveness_defaults()
     case_manifest_acp_command_defaults()
+    case_json_rpc_stdout_filter()
     case_runner_raw_vendor_flood_hits_progress_stall_and_reaps()
     case_runner_progress_then_silent_wedges_and_reaps()
     case_runner_remote_long_reasoning_pause_survives_old_walls()
     case_runner_remote_dead_silent_turn_hits_remote_wall()
     case_runner_thought_stream_survives_progress_stall_wall()
     case_terminal_state_endturn_beats_tail_race_wedge()
+    case_runner_blocked_none_completes()
+    case_runner_blocked_substantive_cancels()
+    case_runner_user_need_none_completes()
     case_runner_idle_silent_idle_timeout_reaps()
     case_runner_oversized_frame_dropped_then_completes()
     case_runner_goal_mode_progress_stall_backstop()

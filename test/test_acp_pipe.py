@@ -17,7 +17,13 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from acp_pool import compute_pool_ceiling, managed_pool  # noqa: E402
-from acp_runner import extract_markers, run_prompt  # noqa: E402
+from acp_runner import (  # noqa: E402
+    early_actionable_marker,
+    extract_markers,
+    has_actionable_marker_values,
+    is_sentinel_marker_payload,
+    run_prompt,
+)
 import goalflight_acp_permits as permits  # noqa: E402
 import goalflight_acp_run  # noqa: E402
 import goalflight_adapter_readiness  # noqa: E402
@@ -661,6 +667,34 @@ async def case_fine_chunks_vendor_no_dup_marker() -> None:
         await conn.kill()
 
 
+async def case_blocked_none_signoff_completes() -> None:
+    conn = await _connect("blocked_none")
+    try:
+        result = await run_prompt(conn, "go", idle_timeout=5)
+        assert result.ok, result
+        assert not result.cancelled_for_marker, result
+        assert result.early_marker is None, result
+        markers = extract_markers(result.text)
+        assert markers["BLOCKED"] == ["none"], markers
+        assert markers["COMPLETE"] == ["goal done"], markers
+        assert early_actionable_marker(markers) is None
+    finally:
+        await conn.kill()
+
+
+async def case_user_need_none_signoff_completes() -> None:
+    conn = await _connect("user_need_none")
+    try:
+        result = await run_prompt(conn, "go", idle_timeout=5)
+        assert result.ok, result
+        assert not result.cancelled_for_marker, result
+        markers = extract_markers(result.text)
+        assert markers["USER-NEED"] == ["none"], markers
+        assert early_actionable_marker(markers) is None
+    finally:
+        await conn.kill()
+
+
 async def case_realtime_blocked_cancels_before_prompt_resolves() -> None:
     conn = await _connect("blocked")
     start = time.monotonic()
@@ -953,6 +987,35 @@ def case_permission_policy_unit() -> None:
     assert policy({"title": "Approve Index Content"}, [], cwd) == PERMISSION_ALLOW
 
 
+def case_permission_policy_os_sandbox_unit() -> None:
+    import types
+    from goalflight_acp_client import (
+        default_permission_policy as base_policy,
+        permission_policy_for_dispatch,
+        PERMISSION_ALLOW,
+        PERMISSION_ESCALATE,
+    )
+    from goalflight_os_sandbox import OS_SANDBOX_OFF, OS_SANDBOX_READ_ONLY
+    cwd = str(ROOT)
+
+    def tc(**kw) -> types.SimpleNamespace:
+        return types.SimpleNamespace(**kw)
+
+    off = permission_policy_for_dispatch(OS_SANDBOX_OFF)
+    ro = permission_policy_for_dispatch(OS_SANDBOX_READ_ONLY)
+
+    assert off(tc(locations=[], kind="execute"), [], cwd) == PERMISSION_ESCALATE
+    assert ro(tc(locations=[], kind="execute"), [], cwd) == PERMISSION_ALLOW
+    assert ro(tc(locations=[], kind="fetch"), [], cwd) == PERMISSION_ALLOW
+    assert ro(
+        tc(locations=[{"path": "/etc/hosts"}], kind="execute"), [], cwd
+    ) == PERMISSION_ESCALATE
+    # custom base policy still applies for non-side-effect kinds
+    assert ro(tc(locations=[{"path": str(ROOT / "scripts/x.py")}], kind="edit"), [], cwd) == PERMISSION_ALLOW
+    wrapped = permission_policy_for_dispatch(OS_SANDBOX_READ_ONLY, base=base_policy)
+    assert wrapped(tc(locations=[], kind="execute"), [], cwd) == PERMISSION_ALLOW
+
+
 def case_permits_ipc_roundtrip_unit() -> None:
     # The inline file-IPC contract: write a request, the controller lists it and
     # writes a decision, the worker reads it, then clears. Here we assert the
@@ -1186,6 +1249,30 @@ def case_marker_parser() -> None:
     assert markers["COMPLETE"] == ["done"]
 
 
+def case_sentinel_marker_payloads_unit() -> None:
+    for payload in ("none", "NONE", "  none  ", "N/A", "(none)", "-", "", "   "):
+        assert is_sentinel_marker_payload(payload), payload
+    assert not is_sentinel_marker_payload("missing API key, cannot proceed")
+    blocked_none = extract_markers(
+        "RESULT:\n- work done\n\nBLOCKED: none\nCOMPLETE: goal done\n"
+    )
+    assert blocked_none["BLOCKED"] == ["none"]
+    assert not has_actionable_marker_values(blocked_none, "BLOCKED")
+    assert early_actionable_marker(blocked_none) is None
+    substantive = extract_markers("BLOCKED: missing API key, cannot proceed\n")
+    assert has_actionable_marker_values(substantive, "BLOCKED")
+    assert early_actionable_marker(substantive) == "BLOCKED"
+    mixed = extract_markers("BLOCKED: none\nBLOCKED: missing API key\n")
+    assert has_actionable_marker_values(mixed, "BLOCKED")
+    assert early_actionable_marker(mixed) == "BLOCKED"
+    user_need_none = extract_markers("USER-NEED: none\n")
+    assert user_need_none["USER-NEED"] == ["none"]
+    assert not has_actionable_marker_values(user_need_none, "USER-NEED")
+    user_need_real = extract_markers("USER-NEED: pick deployment target\n")
+    assert has_actionable_marker_values(user_need_real, "USER-NEED")
+    assert early_actionable_marker(user_need_real) == "USER-NEED"
+
+
 def case_pool_ceiling_fallback(tmp: Path | None = None) -> None:
     missing = ROOT / "test/.missing-env-caveats.md"
     assert compute_pool_ceiling(missing) >= 1
@@ -1215,6 +1302,8 @@ async def amain() -> None:
     await case_pool_inline_threading()
     await case_tool_tracking_closes()
     await case_fine_chunks_vendor_no_dup_marker()
+    await case_blocked_none_signoff_completes()
+    await case_user_need_none_signoff_completes()
     await case_realtime_blocked_cancels_before_prompt_resolves()
     await case_realtime_blocked_cancel_rebuilds_pool_connection()
     await case_run_prompt_cancel_marks_unreusable()
@@ -1226,11 +1315,13 @@ async def amain() -> None:
 
 def main() -> None:
     case_marker_parser()
+    case_sentinel_marker_payloads_unit()
     case_codex_acp_args_injection_unit()
     case_permission_handler_selection_unit()
     case_permission_inline_rejects_nonallow_option_unit()
     case_permission_select_prefers_allow_once_unit()
     case_permission_policy_unit()
+    case_permission_policy_os_sandbox_unit()
     case_permits_ipc_roundtrip_unit()
     case_permits_ack_roundtrip_unit()
     case_permits_fifo_decision_does_not_hide_unit()

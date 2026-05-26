@@ -285,6 +285,64 @@ def _run_cursor_context_mode_registration(
     return records
 
 
+def _run_opencode_context_mode_registration(
+    repo_root: Path,
+    *,
+    dry_run: bool,
+    target_project: Path,
+    destination_ids: set[str] | None,
+    backups_root: Path | None = None,
+    backup_manifest: Path | None = None,
+    agent: str = "opencode",
+    existing_records: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    script = repo_root / "scripts" / "hosts" / "opencode" / "register_context_mode.py"
+    if not script.exists():
+        raise SetupError(f"opencode context-mode registration script missing: {script}")
+
+    selected = destination_ids or set()
+    global_destinations = {
+        "opencode-global-controller",
+        "opencode-agents-standard-controller",
+        "opencode-claude-link-controller",
+        "opencode-acp-worker",
+    }
+    scopes: list[str] = []
+    if not selected or selected.intersection(global_destinations):
+        scopes.append("global")
+    if "opencode-project-controller" in selected:
+        scopes.append("project")
+
+    records: list[dict[str, Any]] = []
+    for scope in scopes:
+        argv = [sys.executable, str(script), "--scope", scope, "--project-root", str(target_project)]
+        if dry_run:
+            print(f"BOOTSTRAP {_format_command(argv + ['--check'])}")
+            print(f"BOOTSTRAP {_format_command(argv)}")
+            continue
+        argv.append("--no-sidecar-backup")
+        if backups_root is not None:
+            target = Path.home() / ".config/opencode/opencode.json"
+            if scope == "project":
+                target = target_project / "opencode.json"
+            record = _record_backup(
+                {"kind": "merge_config", "target": str(target), "rollback": "restore_backup"},
+                target,
+                backups_root,
+            )
+            records.append(record)
+            if backup_manifest is not None and existing_records is not None:
+                _write_backup_manifest(backup_manifest, agent, existing_records + records)
+        result = subprocess.run(argv, text=True, capture_output=True, check=False)
+        if result.returncode != 0:
+            raise SetupError(
+                "opencode context-mode registration failed: "
+                f"{_format_command(argv)}\n{result.stderr.strip() or result.stdout.strip()}"
+            )
+        print(f"BOOTSTRAP {_format_command(argv)}")
+    return records
+
+
 def _check_codex_cli_worker_surface(*, dry_run: bool) -> None:
     commands = [
         ["codex", "--version"],
@@ -325,6 +383,34 @@ def _check_cursor_cli_worker_surface(*, dry_run: bool) -> None:
     print(f"WORKER_CHECK cursor-agent --version status=ok detail={detail[:120]}")
 
 
+def _check_opencode_acp_worker_surface(*, dry_run: bool) -> None:
+    if dry_run:
+        print("WORKER_CHECK opencode --version")
+        print("WORKER_CHECK opencode acp --help")
+        return
+    path = shutil.which("opencode") or str(Path.home() / ".local/bin/opencode")
+    if not Path(path).exists() and shutil.which("opencode") is None:
+        raise SetupError("opencode ACP worker check failed: opencode not found")
+    version = subprocess.run([path, "--version"], text=True, capture_output=True, check=False)
+    if version.returncode != 0:
+        raise SetupError(
+            "opencode ACP worker check failed: "
+            f"{path} --version\n{version.stderr.strip() or version.stdout.strip()}"
+        )
+    acp = subprocess.run([path, "acp", "--help"], text=True, capture_output=True, check=False)
+    if acp.returncode != 0:
+        help_result = subprocess.run([path, "--help"], text=True, capture_output=True, check=False)
+        help_text = (help_result.stdout or help_result.stderr or "")
+        if "acp" not in help_text.casefold():
+            raise SetupError(
+                "opencode ACP worker check failed: "
+                f"{path} acp --help unavailable and acp not listed in {path} --help"
+            )
+    first_line = (version.stdout or version.stderr).strip().splitlines()
+    detail = first_line[0] if first_line else "ok"
+    print(f"WORKER_CHECK opencode --version status=ok detail={detail[:120]}")
+
+
 def _run_host_bootstrap(
     repo_root: Path,
     agent: str,
@@ -353,6 +439,8 @@ def _run_host_bootstrap(
                 _check_codex_cli_worker_surface(dry_run=dry_run)
             elif agent == "cursor" and destination["id"] == "cursor-cli-worker":
                 _check_cursor_cli_worker_surface(dry_run=dry_run)
+            elif agent == "opencode" and destination["id"] == "opencode-acp-worker":
+                _check_opencode_acp_worker_surface(dry_run=dry_run)
             else:
                 commands = destination.get("commands", [])
                 detail = commands[0] if commands else destination["id"]
@@ -378,6 +466,19 @@ def _run_host_bootstrap(
                     existing_records=existing_records,
                 )
             )
+        elif mode == "setup" and agent == "opencode" and addon.get("id") == "context-mode":
+            records.extend(
+                _run_opencode_context_mode_registration(
+                    repo_root,
+                    dry_run=dry_run,
+                    target_project=target_project,
+                    destination_ids=selected,
+                    backups_root=None if dry_run else backups_root,
+                    backup_manifest=None if dry_run else backup_manifest,
+                    agent=agent,
+                    existing_records=existing_records,
+                )
+            )
         elif mode == "deferred":
             print(f"ADDON_DEFERRED {agent} {addon['id']} reason=plugin_or_hook_api_unverified")
         elif mode == "init_self_check":
@@ -388,6 +489,8 @@ def _run_host_bootstrap(
             print("RESTART_REQUIRED codex reload plugin and skill registries")
         elif agent == "cursor":
             print("RESTART_REQUIRED cursor reload instructions and skills")
+        elif agent == "opencode":
+            print("RESTART_REQUIRED opencode reload instructions and skills")
         else:
             print(f"RESTART_REQUIRED {agent} reload host instructions")
     return records
@@ -1060,9 +1163,48 @@ def _apply(
     print(f"BACKUP_MANIFEST {backup_manifest}")
 
 
+def _expand_host_install_shortcuts(args: argparse.Namespace) -> None:
+    """Map one-shot install flags onto the existing cursor/opencode/codex setup paths."""
+    cursor_install = getattr(args, "cursor_install", None)
+    if cursor_install is not None:
+        args.apply = True
+        args.yes = True
+        args.cursor = True
+        args.cursor_project = cursor_install
+    opencode_install = getattr(args, "opencode_install", None)
+    if opencode_install is not None:
+        args.apply = True
+        args.yes = True
+        args.opencode = True
+        args.opencode_project = opencode_install
+    if getattr(args, "codex_install", False):
+        args.apply = True
+        args.yes = True
+        args.agent = args.agent or "codex"
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Goal Flight setup registrar")
     parser.add_argument("--agent", help="adapter id, e.g. codex or cursor")
+    parser.add_argument(
+        "--cursor-install",
+        nargs="?",
+        const=".",
+        metavar="PATH",
+        help="one-shot Cursor install (global + project at PATH); implies --apply --yes",
+    )
+    parser.add_argument(
+        "--opencode-install",
+        nargs="?",
+        const=".",
+        metavar="PATH",
+        help="one-shot OpenCode install (global + project at PATH); implies --apply --yes",
+    )
+    parser.add_argument(
+        "--codex-install",
+        action="store_true",
+        help="one-shot Codex plugin + CLI worker install; implies --apply --yes --agent codex",
+    )
     parser.add_argument("--cursor", action="store_true", help="shortcut for the default Cursor controller/worker setup")
     parser.add_argument(
         "--cursor-project",
@@ -1081,6 +1223,24 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="symlink the Cursor skill directory to an existing Claude skill checkout",
     )
+    parser.add_argument("--opencode", action="store_true", help="shortcut for the default OpenCode controller/worker setup")
+    parser.add_argument(
+        "--opencode-project",
+        nargs="?",
+        const=".",
+        metavar="PATH",
+        help="install OpenCode project-local wrappers under PATH/.opencode",
+    )
+    parser.add_argument(
+        "--opencode-agents-standard",
+        action="store_true",
+        help="install the OpenCode wrapper under ~/.agents/skills/goal-flight",
+    )
+    parser.add_argument(
+        "--opencode-link-claude",
+        action="store_true",
+        help="symlink the OpenCode skill directory to an existing Claude skill checkout",
+    )
     parser.add_argument("--list-agents", action="store_true", help="show installed controller/worker destinations")
     parser.add_argument("--tui", action="store_true", help="prompt for controller, worker, and add-on destinations")
     parser.add_argument("--controllers", help="comma-separated controller destination ids")
@@ -1093,10 +1253,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--from-manifest", help="backup manifest created by --apply")
     parser.add_argument("--repo-root", default=str(REPO_ROOT), help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+    _expand_host_install_shortcuts(args)
 
     try:
         repo_root = Path(args.repo_root).resolve()
-        target_project = Path(args.cursor_project or args.target_project).expanduser().resolve()
+        target_project = Path(
+            args.cursor_project or args.opencode_project or args.target_project
+        ).expanduser().resolve()
         manifests = _load_manifests(repo_root)
         if args.uninstall:
             if not args.from_manifest:
@@ -1106,7 +1269,22 @@ def main(argv: list[str] | None = None) -> int:
         if args.list_agents:
             _list_agents(repo_root, manifests)
             return 0
-        if args.tui or (not args.agent and not args.controllers and not args.workers and sys.stdin.isatty()):
+        host_install = (
+            args.cursor
+            or args.cursor_project
+            or args.opencode
+            or args.opencode_project
+            or getattr(args, "cursor_install", None) is not None
+            or getattr(args, "opencode_install", None) is not None
+            or getattr(args, "codex_install", False)
+        )
+        if args.tui or (
+            not args.agent
+            and not args.controllers
+            and not args.workers
+            and not host_install
+            and sys.stdin.isatty()
+        ):
             controllers, workers, addons = _interactive_selection(manifests)
             _run_selection(
                 repo_root,
@@ -1133,6 +1311,33 @@ def main(argv: list[str] | None = None) -> int:
                 destinations.add("cursor-claude-link-controller")
             if not destinations:
                 destinations.update(_agent_default_destinations(repo_root, "cursor"))
+            addons = _parse_optional_csv(args.addons)
+            _validate_requested_addons(manifests, addons)
+            _run_selection(
+                repo_root,
+                manifests,
+                destinations,
+                addons,
+                apply=args.apply,
+                yes=args.yes,
+                target_project=target_project,
+            )
+            return 0
+        if args.opencode or args.opencode_project or args.opencode_agents_standard or args.opencode_link_claude:
+            destinations = set()
+            if args.opencode:
+                destinations.add("opencode-global-controller")
+                defaults = _agent_default_destinations(repo_root, "opencode")
+                if "opencode-acp-worker" in defaults:
+                    destinations.add("opencode-acp-worker")
+            if args.opencode_project:
+                destinations.add("opencode-project-controller")
+            if args.opencode_agents_standard:
+                destinations.add("opencode-agents-standard-controller")
+            if args.opencode_link_claude:
+                destinations.add("opencode-claude-link-controller")
+            if not destinations:
+                destinations.update(_agent_default_destinations(repo_root, "opencode"))
             addons = _parse_optional_csv(args.addons)
             _validate_requested_addons(manifests, addons)
             _run_selection(

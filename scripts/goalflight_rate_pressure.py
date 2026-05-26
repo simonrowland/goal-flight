@@ -84,6 +84,9 @@ AGENT_TO_PROVIDER: dict[str, str] = {
     "grok-bash-tail": "xai",
     "cursor": "cursor",
     "cursor-agent": "cursor",
+    "opencode": "openai",
+    "opencode-acp": "openai",
+    "opencode-bash-tail": "openai",
 }
 
 # Default task-category fallback when a provider is under pressure. The
@@ -120,6 +123,47 @@ RATE_LIMIT_PATTERNS: tuple[str, ...] = (
 def provider_for(agent_label: str) -> str | None:
     """Map an agent label to its provider key. Returns None for unknown labels."""
     return AGENT_TO_PROVIDER.get(agent_label)
+
+
+def default_fleet_dir() -> Path:
+    return Path(os.environ.get("GOALFLIGHT_FLEET_DIR", Path.home() / ".goal-flight" / "fleet")).expanduser()
+
+
+def load_billing_accounts(fleet_dir: Path | None = None) -> dict | None:
+    fleet_dir = fleet_dir or default_fleet_dir()
+    path = fleet_dir / "billing-accounts.json"
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def agent_limit_pool_map(billing_doc: dict | None) -> dict[str, str]:
+    """Map agent label → limit_pool_id from fleet billing facts."""
+    out: dict[str, str] = {}
+    if not billing_doc:
+        return out
+    for account in billing_doc.get("accounts") or []:
+        pool_id = account.get("limit_pool_id")
+        if not pool_id:
+            continue
+        for label in account.get("agent_labels") or []:
+            out[str(label)] = str(pool_id)
+    return out
+
+
+def budget_key_for_agent(agent_label: str, *, pool_map: dict[str, str] | None = None) -> str | None:
+    """Prefer limit_pool_id; fall back to legacy provider key."""
+    if pool_map:
+        pool = pool_map.get(agent_label)
+        if pool:
+            return f"pool:{pool}"
+    provider = provider_for(agent_label)
+    if provider:
+        return f"provider:{provider}"
+    return None
 
 
 def _default_state_dir() -> Path:
@@ -190,12 +234,13 @@ def pressure_per_provider(
     records: list[dict],
     window_seconds: int = 600,
     now_ts: float | None = None,
+    *,
+    pool_map: dict[str, str] | None = None,
 ) -> dict[str, int]:
-    """Count rate-limit signatures per provider within window.
+    """Count rate-limit signatures per budget key within window.
 
-    `records` may be the raw ledger list; each must have at least `agent`,
-    `state`, `updated_at` (ISO8601 string) keys. Records older than the
-    window are skipped.
+    Keys are `pool:<limit_pool_id>` when fleet billing map is available,
+    otherwise `provider:<provider_key>`.
     """
     if now_ts is None:
         now_ts = time.time()
@@ -203,8 +248,8 @@ def pressure_per_provider(
     counts: dict[str, int] = {}
     for record in records:
         agent = record.get("agent")
-        provider = provider_for(agent) if agent else None
-        if not provider:
+        key = budget_key_for_agent(agent, pool_map=pool_map) if agent else None
+        if not key:
             continue
         updated = record.get("updated_at") or record.get("started_at") or ""
         if not updated or updated < cutoff_iso:
@@ -212,7 +257,7 @@ def pressure_per_provider(
         status = _read_status(record)
         if not detect_rate_limit_signature(record, status):
             continue
-        counts[provider] = counts.get(provider, 0) + 1
+        counts[key] = counts.get(key, 0) + 1
     return counts
 
 
@@ -220,39 +265,57 @@ def recommend(
     pressure: dict[str, int],
     current_caps: dict[str, int],
     threshold: int = 3,
+    *,
+    pool_map: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Build a recommendation payload.
 
-    `pressure`: {provider_key: count} from pressure_per_provider().
-    `current_caps`: live cap map (agent → int). Provider->labels reverse-mapped.
-    Returns a JSON-shaped dict with one entry per provider under pressure.
+    `pressure`: {budget_key: count} from pressure_per_provider().
     """
     label_groups: dict[str, list[str]] = {}
-    for agent_label, provider in AGENT_TO_PROVIDER.items():
-        label_groups.setdefault(provider, []).append(agent_label)
+    for agent_label in AGENT_TO_PROVIDER:
+        key = budget_key_for_agent(agent_label, pool_map=pool_map)
+        if key:
+            label_groups.setdefault(key, []).append(agent_label)
 
     out: dict[str, Any] = {
         "schema": SCHEMA,
         "threshold": threshold,
         "providers_under_pressure": [],
         "providers_observed": list(pressure.keys()),
+        "budget_keys_observed": list(pressure.keys()),
     }
-    for provider, count in sorted(pressure.items(), key=lambda kv: -kv[1]):
+    for budget_key, count in sorted(pressure.items(), key=lambda kv: -kv[1]):
         if count < threshold:
             continue
-        labels = label_groups.get(provider, [])
+        labels = label_groups.get(budget_key, [])
         recommended_caps = {
             label: max(1, current_caps.get(label, 5) // 2)
             for label in labels
         }
-        out["providers_under_pressure"].append({
+        provider = budget_key.split(":", 1)[1] if budget_key.startswith("provider:") else None
+        limit_pool_id = budget_key.split(":", 1)[1] if budget_key.startswith("pool:") else None
+        if limit_pool_id and pool_map:
+            for label, pool in pool_map.items():
+                if pool == limit_pool_id and label not in labels:
+                    labels.append(label)
+            recommended_caps = {
+                label: max(1, current_caps.get(label, 5) // 2)
+                for label in labels
+            }
+            provider = provider or provider_for(labels[0]) if labels else None
+        fallback = PROVIDER_FALLBACK.get(provider or "", [])
+        entry = {
             "provider": provider,
+            "limit_pool_id": limit_pool_id,
+            "budget_key": budget_key,
             "count": count,
             "labels": labels,
-            "current_caps": {l: current_caps.get(l) for l in labels},
+            "current_caps": {label: current_caps.get(label) for label in labels},
             "recommended_caps": recommended_caps,
-            "fallback_providers": PROVIDER_FALLBACK.get(provider, []),
-        })
+            "fallback_providers": fallback,
+        }
+        out["providers_under_pressure"].append(entry)
     return out
 
 
@@ -295,6 +358,8 @@ def main(argv: list[str] | None = None) -> int:
 
     state_dir = Path(args.state_dir)
     records = collect_records(state_dir)
+    billing = load_billing_accounts()
+    pool_map = agent_limit_pool_map(billing)
 
     # Read current caps from goalflight_capacity if importable; fall back to a
     # safe default map. Importing avoids hard-coding the map in two places.
@@ -305,11 +370,12 @@ def main(argv: list[str] | None = None) -> int:
     except ImportError:
         current_caps = {label: 5 for label in AGENT_TO_PROVIDER}
 
-    pressure = pressure_per_provider(records, window_seconds=args.window_seconds)
-    payload = recommend(pressure, current_caps, threshold=args.threshold)
+    pressure = pressure_per_provider(records, window_seconds=args.window_seconds, pool_map=pool_map)
+    payload = recommend(pressure, current_caps, threshold=args.threshold, pool_map=pool_map)
     payload["state_dir"] = str(state_dir)
     payload["window_seconds"] = args.window_seconds
     payload["records_examined"] = len(records)
+    payload["limit_pool_map_loaded"] = bool(pool_map)
     print(json.dumps(payload, indent=2 if not args.json else None, sort_keys=True))
     return 0
 

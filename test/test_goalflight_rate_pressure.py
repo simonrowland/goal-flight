@@ -66,6 +66,12 @@ def test_provider_for_bash_tail_variants():
               rp.provider_for("codex-bash-tail"), "openai")
     assert_eq("grok-bash-tail → xai",
               rp.provider_for("grok-bash-tail"), "xai")
+    assert_eq("opencode → openai",
+              rp.provider_for("opencode"), "openai")
+    assert_eq("opencode-acp → openai",
+              rp.provider_for("opencode-acp"), "openai")
+    assert_eq("opencode-bash-tail → openai",
+              rp.provider_for("opencode-bash-tail"), "openai")
 
 
 # ----- detect_rate_limit_signature() -----
@@ -153,7 +159,7 @@ def test_pressure_groups_aliased_labels():
         _build_record("codex-acp", "blocked_session_limit", recent_iso, "d3"),
     ]
     counts = rp.pressure_per_provider(records, window_seconds=600, now_ts=now)
-    assert_eq("openai counts both labels", counts.get("openai"), 3)
+    assert_eq("openai counts both labels", counts.get("provider:openai"), 3)
 
 
 def test_pressure_outside_window_excluded():
@@ -166,7 +172,7 @@ def test_pressure_outside_window_excluded():
         _build_record("claude", "blocked_session_limit", recent_iso, "d2"),
     ]
     counts = rp.pressure_per_provider(records, window_seconds=600, now_ts=now)
-    assert_eq("anthropic-session window-filtered", counts.get("anthropic-session"), 1)
+    assert_eq("anthropic-session window-filtered", counts.get("provider:anthropic-session"), 1)
 
 
 def test_pressure_only_failures_counted():
@@ -179,7 +185,7 @@ def test_pressure_only_failures_counted():
         _build_record("claude", "blocked_session_limit", recent_iso, "d3"),
     ]
     counts = rp.pressure_per_provider(records, window_seconds=600, now_ts=now)
-    assert_eq("only blocked_session_limit counted", counts.get("anthropic-session"), 1)
+    assert_eq("only blocked_session_limit counted", counts.get("provider:anthropic-session"), 1)
 
 
 def test_pressure_missing_agent_field():
@@ -192,7 +198,7 @@ def test_pressure_missing_agent_field():
         _build_record("claude", "blocked_session_limit", recent_iso, "d3"),
     ]
     counts = rp.pressure_per_provider(records, window_seconds=600, now_ts=now)
-    assert_eq("only the one valid record counted", counts.get("anthropic-session"), 1)
+    assert_eq("only the one valid record counted", counts.get("provider:anthropic-session"), 1)
 
 
 def test_pressure_started_at_fallback():
@@ -203,7 +209,7 @@ def test_pressure_started_at_fallback():
         {"dispatch_id": "d1", "agent": "claude", "state": "blocked_session_limit", "started_at": recent_iso},
     ]
     counts = rp.pressure_per_provider(records, window_seconds=600, now_ts=now)
-    assert_eq("started_at fallback works", counts.get("anthropic-session"), 1)
+    assert_eq("started_at fallback works", counts.get("provider:anthropic-session"), 1)
 
 
 def test_pressure_mixed_providers_in_window():
@@ -217,41 +223,54 @@ def test_pressure_mixed_providers_in_window():
         _build_record("grok", "blocked_session_limit", recent_iso, "d4"),
     ]
     counts = rp.pressure_per_provider(records, window_seconds=600, now_ts=now)
-    assert_eq("anthropic-session", counts.get("anthropic-session"), 2)
-    assert_eq("openai", counts.get("openai"), 1)
-    assert_eq("xai", counts.get("xai"), 1)
+    assert_eq("anthropic-session", counts.get("provider:anthropic-session"), 2)
+    assert_eq("openai", counts.get("provider:openai"), 1)
+    assert_eq("xai", counts.get("provider:xai"), 1)
 
 
 # ----- recommend() -----
 
 def test_recommend_below_threshold_empty():
     """Provider counts below threshold don't appear in providers_under_pressure."""
-    out = rp.recommend({"openai": 2}, {"codex": 10, "codex-acp": 10}, threshold=3)
+    out = rp.recommend({"provider:openai": 2}, {"codex": 10, "codex-acp": 10}, threshold=3)
     assert_eq("no providers under pressure", out["providers_under_pressure"], [])
-    assert_eq("but providers_observed populated", out["providers_observed"], ["openai"])
+    assert_eq("but providers_observed populated", out["providers_observed"], ["provider:openai"])
 
 
 def test_recommend_above_threshold_halves_caps():
     """At threshold, recommended cap is current // 2 (floor 1)."""
     out = rp.recommend(
-        {"openai": 5},
-        {"codex": 10, "codex-acp": 10, "codex-bash-tail": 10},
+        {"provider:openai": 5},
+        {
+            "codex": 10,
+            "codex-acp": 10,
+            "codex-bash-tail": 10,
+            "opencode": 10,
+            "opencode-acp": 10,
+            "opencode-bash-tail": 10,
+        },
         threshold=3,
     )
     assert_eq("one provider", len(out["providers_under_pressure"]), 1)
     pup = out["providers_under_pressure"][0]
     assert_eq("provider key", pup["provider"], "openai")
-    assert_eq("openai labels include bash-tail variant",
-              sorted(pup["labels"]), ["codex", "codex-acp", "codex-bash-tail"])
+    assert_eq("budget key", pup["budget_key"], "provider:openai")
+    assert_eq("openai labels include bash-tail variants",
+              sorted(pup["labels"]),
+              ["codex", "codex-acp", "codex-bash-tail",
+               "opencode", "opencode-acp", "opencode-bash-tail"])
     assert_eq("codex halved", pup["recommended_caps"]["codex"], 5)
     assert_eq("codex-acp halved", pup["recommended_caps"]["codex-acp"], 5)
     assert_eq("codex-bash-tail halved", pup["recommended_caps"]["codex-bash-tail"], 5)
+    assert_eq("opencode halved", pup["recommended_caps"]["opencode"], 5)
+    assert_eq("opencode-acp halved", pup["recommended_caps"]["opencode-acp"], 5)
+    assert_eq("opencode-bash-tail halved", pup["recommended_caps"]["opencode-bash-tail"], 5)
 
 
 def test_recommend_cap_floor_one():
     """Caps already at 1 don't go to 0."""
     out = rp.recommend(
-        {"cursor": 4},
+        {"provider:cursor": 4},
         {"cursor": 1, "cursor-agent": 1},
         threshold=3,
     )
@@ -262,11 +281,36 @@ def test_recommend_cap_floor_one():
 
 def test_recommend_fallback_providers_populated():
     """Each pressured provider includes the documented fallback chain."""
-    out = rp.recommend({"anthropic-session": 5}, {"claude": 5}, threshold=3)
+    out = rp.recommend({"provider:anthropic-session": 5}, {"claude": 5}, threshold=3)
     pup = out["providers_under_pressure"][0]
     fallback = pup["fallback_providers"]
     assert_true("fallback list non-empty", len(fallback) > 0)
     assert_true("fallback contains codex", "codex" in fallback)
+
+
+def test_limit_pool_pressure_aggregation(tmp_path: Path | None = None):
+    """Fleet billing map groups agent labels under limit_pool_id."""
+    billing = {
+        "schema": "goalflight.fleet.billing-accounts.v1",
+        "schema_version": 1,
+        "min_reader_version": 1,
+        "accounts": [
+            {
+                "account_key": "openai/default",
+                "limit_pool_id": "openai-default",
+                "agent_labels": ["codex", "codex-acp"],
+            }
+        ],
+    }
+    pool_map = rp.agent_limit_pool_map(billing)
+    now = time.time()
+    recent_iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now - 60))
+    records = [
+        _build_record("codex", "blocked_session_limit", recent_iso, "d1"),
+        _build_record("codex-acp", "blocked_session_limit", recent_iso, "d2"),
+    ]
+    counts = rp.pressure_per_provider(records, window_seconds=600, now_ts=now, pool_map=pool_map)
+    assert_eq("pool aggregation", counts.get("pool:openai-default"), 2)
 
 
 # ----- collect_records() -----

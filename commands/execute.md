@@ -23,7 +23,14 @@ Read:
 python3 <skill-root>/scripts/goalflight_status.py --json
 python3 <skill-root>/scripts/goalflight_capacity.py status --json
 python3 <skill-root>/scripts/goalflight_rate_pressure.py --json
+python3 <skill-root>/scripts/goalflight_messages.py relay || true
 ```
+
+`goalflight_messages.py relay` exits **2** when open `user_need` / `user_confirm`
+rows exist in the fleet register aggregate (built from
+`~/.goal-flight/messages/*.jsonl` and `~/.goal-flight/fleet/register/dispatches/`).
+Print the line to the controller host and **stop** — do not auto-answer. After the
+user responds, append steering or continue dispatch per `protocols/worker-markers.md`.
 
 `goalflight_rate_pressure.py` reads the dispatch ledger and reports
 provider-level rate-limit pressure. Be **silent on clean** — if
@@ -128,6 +135,6 @@ Use worktrees for concurrent code edits. See `protocols/worktrees-parallel.md`.
 Stop when:
 
 - queue is DONE
-- a blocking user question is required
+- a blocking user question is required (including `goalflight_messages.py relay` exit 2)
 - capacity/rate limits block all valid dispatch paths
 - tests or reviews find an issue that should not be delegated further

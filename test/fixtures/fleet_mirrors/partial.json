@@ -1,0 +1,6 @@
+{
+  "schema": "goalflight.acp-run.v1",
+  "seq": 1,
+  "dispatch_id": "acp-codex-fixture-04",
+  "state": "starting",
+  "updated_at": "2026-05-24T12:02:00+00:00

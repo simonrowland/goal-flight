@@ -1,0 +1,51 @@
+id: core.dispatch.read
+domain: core
+resource: dispatch
+verb: read
+crud: R
+summary: Show aggregate dispatch status
+command: >
+  ${GOALFLIGHT_PYTHON} ${GOALFLIGHT_REPO}/scripts/goalflight_status.py --json
+env:
+  GOALFLIGHT_PYTHON: python3
+  GOALFLIGHT_REPO: ${GOALFLIGHT_REPO_ROOT}
+requires: []
+remote_allowed: false
+transport: subprocess
+message_types: []
+
+---
+id: core.dispatch.execute
+domain: core
+resource: dispatch
+verb: execute
+crud: X
+summary: Run ACP dispatch wrapper (acp_run.py)
+command: >
+  ${GOALFLIGHT_PYTHON} ${GOALFLIGHT_REPO}/scripts/goalflight_acp_run.py ${GOALFLIGHT_DISPATCH_ARGS}
+env:
+  GOALFLIGHT_PYTHON: python3
+  GOALFLIGHT_REPO: ${GOALFLIGHT_REPO_ROOT}
+  GOALFLIGHT_DISPATCH_ARGS: ""
+requires: []
+remote_allowed: false
+transport: acp
+message_types: [status, result, user_need, blocked]
+
+---
+id: core.watch.read
+domain: core
+resource: watch
+verb: read
+crud: R
+summary: Watch dispatch tail / worker output (goalflight_watch.py)
+command: >
+  ${GOALFLIGHT_PYTHON} ${GOALFLIGHT_REPO}/scripts/goalflight_watch.py ${GOALFLIGHT_WATCH_ARGS}
+env:
+  GOALFLIGHT_PYTHON: python3
+  GOALFLIGHT_REPO: ${GOALFLIGHT_REPO_ROOT}
+  GOALFLIGHT_WATCH_ARGS: "--help"
+requires: []
+remote_allowed: false
+transport: subprocess
+message_types: [status, result, user_need, blocked]
