@@ -19,7 +19,7 @@ git clone https://github.com/simonrowland/goal-flight.git ~/Repos/goal-flight &&
 
 Restart the host, then run doctor: `python3 scripts/goalflight_doctor.py --project-root /path/to/your/project`.
 
-Same flags via `setup.sh`: `--cursor-install`, `--opencode-install`, and `--codex-install` (each implies `--apply --yes`). Dry-run, link-to-Claude, and agents-standard paths are in [CURSOR.md](CURSOR.md) and [OPENCODE.md](OPENCODE.md).
+Same flags via `setup.sh`: `--cursor-install`, `--opencode-install`, and `--codex-install` (each implies `--apply --yes`). Dry-run, link-to-Claude, and agents-standard paths are in [docs/hosts/cursor.md](docs/hosts/cursor.md) and [docs/hosts/opencode.md](docs/hosts/opencode.md).
 
 ## What it gets you
 
@@ -100,6 +100,17 @@ Detailed operating procedures are split into load-on-demand files under
 **Comms shape** (orthogonal axis) — how the controller observes the worker. Goal-flight uses the [Agent Client Protocol](https://agentclientprotocol.com) wherever the worker has an adapter (codex / cursor / claude / grok all do today); bash-tail with a `tail -f`-style marker-grep watcher is the cold-storage fallback. ACP composes with `goal-mode` for any worker; `goal-mode + bash-tail` composes only with codex `/goal` today (codex emits a Final-response marker the watcher detects; other workers' headless modes don't).
 
 The controller picks executor + comms per chunk based on chunk shape, available adapters, and the rate-pressure walkback's recent observations. The shipped routing defaults lean toward sub-billed workers (codex / cursor / grok) for code-writing — calibrated against the maintainer's current vendor plans, not a project-wide prescription. Adjust to your environment by editing the routing table in `SKILL.md` "Worker Routing"; the walkback adapts dynamically when any one provider gets pressured.
+
+## Multi-node fleet (1.0)
+
+For remote workers over SSH, bootstrap a fleet store and use `goalflight_fleet.py`
+dispatch / watch / reconcile. OpenCode, Cursor, Codex, and Claude ACP workers
+can run on registered nodes while the controller stays local. See
+[docs/fleet.md](docs/fleet.md) for the operator guide; live smoke:
+`GOALFLIGHT_LIVE_SSH=1 ./test/manual/test_fleet_live_smoke.sh`.
+
+Unified CLI: `bin/goalflight <domain> <resource> <verb>` (action router over
+`config/actions/`).
 
 ## When NOT to use this
 

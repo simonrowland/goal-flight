@@ -30,4 +30,19 @@ Advanced setup (dry-run first, omit `--apply --yes`):
 ./setup.sh --apply --yes --opencode-link-claude --addons ''
 ```
 
-For bash-tail workers use `scripts/opencode_bash_tail.py`, not bare `opencode run`.
+For bash-tail workers use `scripts/hosts/opencode/bash_tail.py`, not bare `opencode run`.
+
+Install source for project `opencode.json`: `configs/opencode/opencode.json`.
+
+## Remote bash-tail (beta)
+
+Local bash-tail via the HTTP API is supported. **Remote fleet bash-tail marker
+tail** (streaming `BLOCKED:` / `USER-NEED:` markers from a worker on another
+machine) is **beta** in 1.0.0:
+
+- Probe-only validation: `python3 scripts/goalflight_fleet_bash_tail_probe.py`
+  and `test/test_fleet_bash_tail_probe.py`
+- Full remote dispatch parity with local bash-tail is not a release gate; use ACP
+  workers for production remote dispatch
+
+See [fleet.md](../fleet.md) for SSH fleet operations.
