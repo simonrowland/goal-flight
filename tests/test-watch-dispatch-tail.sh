@@ -119,7 +119,7 @@ cleanup_pidfile "$PIDFILE_STEM"
 # removes the pidfile.
 TAIL=/tmp/test-watch-marker-dead-$$.txt
 : > "$TAIL"
-sleep 1 & WORKER_PID=$!
+sleep 2 & WORKER_PID=$!
 PIDFILE_STEM="$$.bashtail.${WORKER_PID}.jsonl"
 
 bash "$WATCHER" \
@@ -129,12 +129,10 @@ bash "$WATCHER" \
   --poll-secs 1 --max-idle-secs 30 \
   > /tmp/watcher-out-marker-dead-$$.txt 2>&1 &
 WATCHER_PID=$!
-sleep 0.3
-echo "**COMPLETE:** done" >> "$TAIL"
-# Worker exits at +1s; watcher should see marker, exit 0, and remove pidfile
-# (worker is gone by the time the trap runs).
 wait "$WORKER_PID" 2>/dev/null
-sleep 0.2  # let watcher tick once more so kill -0 returns false
+sleep 0.1
+echo "**COMPLETE:** done" >> "$TAIL"
+sleep 0.5  # let watcher observe marker after worker exit
 wait "$WATCHER_PID"
 watcher_exit=$?
 expect_eq "case-1b exit code (marker + worker dead)" "0" "$watcher_exit"

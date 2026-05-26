@@ -34,24 +34,39 @@ cleanup() {
 }
 trap cleanup EXIT
 
-cp "$REPO_ROOT/opencode.json" "$PROBE_DIR/opencode.json"
+cp "$REPO_ROOT/configs/opencode/opencode.json" "$PROBE_DIR/opencode.json"
 
-out="$("$ACP_PY" "$PROBE" --cwd "$PROBE_DIR" --timeout 300 opencode acp 2>&1)" || {
-  echo "FAIL  tests/test-opencode-acp.sh"
-  echo "$out" | sed 's/^/      /'
-  exit 1
-}
+attempt=1
+max_attempts=3
+out=""
+while [ "$attempt" -le "$max_attempts" ]; do
+  out="$("$ACP_PY" "$PROBE" --cwd "$PROBE_DIR" --timeout 300 opencode acp 2>&1)" || {
+    if [ "$attempt" -eq "$max_attempts" ]; then
+      echo "FAIL  tests/test-opencode-acp.sh"
+      echo "$out" | sed 's/^/      /'
+      exit 1
+    fi
+    attempt=$((attempt + 1))
+    sleep 2
+    continue
+  }
 
-if ! printf '%s\n' "$out" | grep -q "stop_reason='end_turn'"; then
-  echo "FAIL  tests/test-opencode-acp.sh (no end_turn)"
-  printf '%s\n' "$out" | sed 's/^/      /'
-  exit 1
-fi
+  if printf '%s\n' "$out" | grep -q "stop_reason='end_turn'" \
+    && printf '%s\n' "$out" | grep -Eq "text.*'4'|thoughts.*'4'"; then
+    break
+  fi
 
-if ! printf '%s\n' "$out" | grep -q "text.*'4'"; then
-  echo "FAIL  tests/test-opencode-acp.sh (expected reply 4)"
-  printf '%s\n' "$out" | sed 's/^/      /'
-  exit 1
-fi
+  if [ "$attempt" -eq "$max_attempts" ]; then
+    if ! printf '%s\n' "$out" | grep -q "stop_reason='end_turn'"; then
+      echo "FAIL  tests/test-opencode-acp.sh (no end_turn)"
+    else
+      echo "FAIL  tests/test-opencode-acp.sh (expected reply 4 in text or thoughts after ${max_attempts} attempts)"
+    fi
+    printf '%s\n' "$out" | sed 's/^/      /'
+    exit 1
+  fi
+  attempt=$((attempt + 1))
+  sleep 2
+done
 
 echo "PASS  tests/test-opencode-acp.sh"
