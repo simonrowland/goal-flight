@@ -4,6 +4,46 @@ Notable changes to the goal-flight Claude Code skill. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are
 incremented when meaningful skill behaviour changes.
 
+## [1.0.0] — 2026-05-26
+
+**Major release: multi-node fleet dispatch, four controller hosts, action router,
+and canonical docs layout.**
+
+### Added
+
+- **Fleet layer** — `goalflight_fleet.py` bootstrap/validate/dispatch/watch/reconcile
+  with live SSH remote workers, billing account locks, and status mirror sync.
+- **Action router** — `bin/goalflight` unified entrypoint over `config/actions/`
+  and `goalflight_actions.py`.
+- **OpenCode controller port** — full ACP + bash-tail + prompt + self-dispatch
+  support; promoted to `supported` worker (not survey stub).
+- **Public docs tree** — `docs/architecture.md`, `docs/hosts/cursor.md`,
+  `docs/hosts/opencode.md`, `docs/fleet.md`, root `CONTRIBUTING.md`.
+- **Canonical host scripts** — OpenCode helpers under `scripts/hosts/opencode/`
+  with flat `scripts/opencode_*.py` compatibility shims.
+- **Manual prompt matrix** — `test/manual/test_acp_prompt_matrix.py` for hermetic
+  and live worker/fleet checks.
+
+### Fixed
+
+- **ACP sentinel hygiene** — `BLOCKED: none` / `USER-NEED: none` no longer wedge
+  dispatch when the model emits placeholder marker lines.
+- **OpenCode register_context_mode REPO_ROOT** — fragment merge now resolves the
+  skill repository correctly from `scripts/hosts/opencode/`.
+
+### Changed
+
+- **Controller hosts** — Claude Code (reference), Codex, Cursor, and OpenCode
+  ship as sibling controller/worker adapters with shared `SKILL.md` core.
+- Root `ARCHITECTURE.md` is a pointer to `docs/architecture.md`.
+
+### Known limitations (1.0.0)
+
+- Remote fleet **bash-tail marker tail** is beta (probe-only); prefer ACP for
+  production remote dispatch.
+- Live prompt-matrix `claude-code-cli-acp` may fail with upstream `-32603` errors;
+  not a release gate.
+
 ## [0.4.7] — 2026-05-21
 
 **ACP reliability for remote-API workers: context-mode MCP elicitation no longer

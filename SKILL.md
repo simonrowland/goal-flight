@@ -1,6 +1,6 @@
 ---
 name: goal-flight
-version: 0.4.9
+version: 1.0.0
 description: "Portable Goal Flight controller workflow for planning, dispatching, reviewing, recovering, and resuming long-running repository work from file-backed state."
 tags:
   - orchestration
