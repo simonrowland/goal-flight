@@ -10,7 +10,7 @@ start a durable Goal Flight run for a repository task.
 
 ## Steps
 
-1. Read `AGENT.md` or `AGENTS.md` when present.
+1. Read the repository `AGENTS.md` first when present.
 2. Read the repository root `SKILL.md` as the canonical Goal Flight workflow.
 3. Read `commands/init.md` and the protocols it references.
 4. Treat the user's remaining text as the init topic.

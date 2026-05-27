@@ -10,7 +10,7 @@ worker dispatch, review flights, or handoff notes that survive context loss.
 
 ## Load Order
 
-1. Read `AGENT.md` or `AGENTS.md` when present.
+1. Read the repository `AGENTS.md` first when present.
 2. Read the repository root `SKILL.md` as the canonical Goal Flight workflow.
 3. Read the newest relevant `docs-private/RESUME-NOTES-*.md` only when the task
    asks to resume prior Goal Flight work.

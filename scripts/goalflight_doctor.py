@@ -595,10 +595,9 @@ def git_state(repo: Path) -> dict:
 
 
 def _agent_instructions(repo: Path) -> tuple[Path | None, str]:
-    for name in ("AGENTS.md", "AGENT.md"):
-        path = repo / name
-        if path.exists():
-            return path, path.read_text(errors="replace")
+    path = repo / "AGENTS.md"
+    if path.exists():
+        return path, path.read_text(errors="replace")
     return None, ""
 
 

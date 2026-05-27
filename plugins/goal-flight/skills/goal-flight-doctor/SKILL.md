@@ -10,7 +10,7 @@ readiness, setup verification, or host/worker diagnostics.
 
 ## Steps
 
-1. Read `AGENT.md` or `AGENTS.md` when present.
+1. Read the repository `AGENTS.md` first when present.
 2. Read the repository root `SKILL.md` as the canonical Goal Flight workflow.
 3. Read `commands/doctor.md`.
 4. Run the procedural doctor for the current repository:
