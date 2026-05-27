@@ -16,9 +16,11 @@ alone is **not** sufficient.
 structured severity-tagged findings (P0/P1/P2/P3) against the chunk diff and
 is the reference framing this skill is built around.
 
-Invoke gstack `/review` through the host's skill mechanism (Claude Code:
-`Skill(skill: "review", args: "<start>..<end>")` or a `general-purpose`
-subagent that loads gstack; codex: `codex exec '/review <start>..<end>'`).
+Invoke gstack `/review` through the host's skill-load mechanism. The exact
+invocation is host-specific (each host loads gstack skills its own way — see
+the host's gstack install docs); the protocol invariant is that the gstack
+`/review` skill, not a hand-rolled prompt, is what runs against the chunk
+diff.
 
 Fix P0/P1/P2 findings before commit. P3 findings may be deferred with a note
 in `docs-private/RESUME-NOTES*.md` or the active goal-queue margin.
