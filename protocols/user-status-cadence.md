@@ -9,7 +9,8 @@ from** worker markers (`protocols/worker-markers.md`), chunk review
 
 Keep the user informed with compact progress while workers run. This is **not**
 engagement polling — do not ask "are you still there?" or "want me to continue?"
-(See `SKILL.md` §Autonomous throughput.)
+The autonomous-throughput discipline lives in `SKILL.md` (top-level); read the
+whole skill before relying on partial summaries.
 
 ## Cadence
 
