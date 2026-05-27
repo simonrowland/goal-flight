@@ -111,8 +111,50 @@ Protocol index: `protocols/README.md`.
 - Missing or stalled review is inconclusive, not clean.
 - Ask the user only for real product/permission blockers, destructive choices,
   or irreducible ambiguity.
+- During an active goal-flight run, **keep shipping** through decompose →
+  execute until the queue is done or a real blocker stops you — do not pause
+  for engagement checks (see **Autonomous throughput** below).
 - Keep `docs-private/` private. Public docs describe shipped behavior, not
   private review scratch.
+
+## Autonomous throughput
+
+Goal Flight exists so long work survives compactions and unattended hours.
+The controller's job is to **advance the queue**, not to poll the user for
+presence.
+
+When the user has invoked a goal-flight command, approved a plan, or given a
+substantive scope instruction (for example "implement Wave 1", "keep going",
+"let's implement"):
+
+- **Keep working** through the next durable artifacts: code, tests green,
+  queue/ledger/resume notes updated, and **commits for each completed chunk**
+  or logical atomic unit until decomposition is finished and execute drains
+  the queue.
+- **Default is continue**, not confirm. The next step implied by the plan,
+  RESUME-NOTES, or goal-queue is authorization enough.
+- **Do not use engagement prompts** when no actually-important user direction
+  is required. Anti-patterns:
+  - "Are you still there?"
+  - "Want me to continue?"
+  - "Say the word if you want me to …"
+  - Ending a turn with optional follow-ups that stall work the user already
+    scoped
+- **Record non-blocking uncertainty in files**, not chat: inline-office-hours
+  backlog, `docs-private/premises-*.md`, RESUME-NOTES, or scenario `notes` —
+  then proceed with the best default from the plan.
+- **Stop and ask only** for `USER-NEED` / `USER-CONFIRM` tier blockers: permission,
+  destructive or irreversible action without a plan default, product choice the
+  plan cannot infer, auth/capacity hard stop, or explicit command gates (for
+  example decompose-plan step 6 before launching execute).
+
+Commits during execute follow **one commit per completed chunk** (plus
+milestone fix-clusters) unless the user forbade commits for this run. That is
+part of the active workflow, not a separate permission request per chunk.
+
+**Push is not commit.** Land commits locally as chunks complete. Push to a
+remote only after the relevant tests pass and the user has permitted publish
+(see `AGENTS.md` §Git workflow).
 
 ## Dispatch Model
 

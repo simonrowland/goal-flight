@@ -104,7 +104,8 @@ the log is corrupt or missing.
 - inspect diff
 - run focused tests
 - run self-review against changed files
-- commit only when requested by the user or by the active workflow
+- commit when the active goal-flight workflow completes a chunk (default: one
+  commit per chunk) or when the user explicitly requests a commit
 
 9. Milestone review:
 

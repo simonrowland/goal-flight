@@ -14,6 +14,19 @@
 - For tests of controller generalization, use a nondestructive task: run doctor,
   make a compact plan, check capacity, launch one read-only worker, and summarize
   status/ledger evidence without writing to the repository.
+- During an active goal-flight run, keep advancing the queue and accumulating
+  commits per chunk until decomposition/execute is done; do not stall on
+  engagement prompts. See repository root `SKILL.md` §Autonomous throughput.
+
+## Git workflow (this repo)
+
+- **Commit as work completes** — logical chunks, green or focused tests, no
+  waiting for a separate "please commit" unless the user forbade commits for
+  this run.
+- **Do not push to public** without running the relevant test sweep and
+  explicit user permission.
+- Amending, force-push, and destructive git operations still require explicit
+  user request.
 
 ## Git-Visible Trigger Hygiene
 
