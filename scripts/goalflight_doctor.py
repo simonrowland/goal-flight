@@ -686,6 +686,7 @@ def check_project_goalflight_readiness(repo: Path) -> dict:
     cursor_project_rules = repo / ".cursor/rules/goal-flight.mdc"
     opencode_project_skill = repo / ".opencode/skills/goal-flight/SKILL.md"
     opencode_project_config = repo / "opencode.json"
+    opencode_canonical_config = repo / "configs/opencode/opencode.json"
     agent_path, agent_text = _agent_instructions(repo)
     lower = agent_text.casefold()
     has_routing = bool(
@@ -723,6 +724,7 @@ def check_project_goalflight_readiness(repo: Path) -> dict:
         "opencode_project": {
             "skill": _path_state(opencode_project_skill),
             "config": _path_state(opencode_project_config),
+            "canonical_config": _path_state(opencode_canonical_config),
         },
         "routing": {
             "path": str(agent_path) if agent_path else None,

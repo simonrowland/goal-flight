@@ -9,9 +9,6 @@
 .opencode/
 .cursor/
 
-# Private ongoing skill-development notes
-docs-private/
-
 # Local legacy host adapter drafts. Kept out of git to avoid host-name
 # scans changing controller billing behavior.
 legacy-host-adapters/

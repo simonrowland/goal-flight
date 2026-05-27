@@ -120,9 +120,13 @@ def _capacity_snapshot() -> dict[str, Any]:
 
 def _prepare_workdir(project_root: Path) -> Path:
     workdir = Path(tempfile.mkdtemp(prefix="opencode-self-dispatch-"))
-    project_config = project_root / "opencode.json"
-    if project_config.is_file():
-        shutil.copy2(project_config, workdir / "opencode.json")
+    for candidate in (
+        project_root / "opencode.json",
+        REPO_ROOT / "configs/opencode/opencode.json",
+    ):
+        if candidate.is_file():
+            shutil.copy2(candidate, workdir / "opencode.json")
+            break
     return workdir
 
 
