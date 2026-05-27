@@ -2,6 +2,9 @@
 
 ## TL;DR
 
+**Post-compaction:** reload Goal Flight (`AGENTS.md` → `SKILL.md` →
+`commands/resume.md`) before acting; chat context is gone.
+
 <state>
 
 ## Code state

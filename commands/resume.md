@@ -6,6 +6,9 @@ description: "Resume from git state, status JSON, and dispatch ledger."
 
 Rebuild working context from files and procedural status.
 
+Applies only when Goal Flight was already in play (see `protocols/state-handoff.md`).
+After compaction, reload the skill per `AGENTS.md` load order before the steps below.
+
 Read `protocols/state-handoff.md`.
 
 Run:

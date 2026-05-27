@@ -12,17 +12,23 @@ Before compact or sleep:
 - update RESUME-NOTES with current git head, queue state, active dispatch IDs, and next command
 - do not paste raw logs
 
-On resume:
+On resume (only when Goal Flight was already in play — user invoked it, an open
+goal queue or dispatch ledger exists, or `docs-private/RESUME-NOTES*.md` says
+so; **not** for ordinary one-off coding):
 
-1. Check git reality.
-2. Run `goalflight_status.py --json`.
-3. Classify active dispatches:
+0. Reload Goal Flight: `AGENTS.md` → host wrapper (if any) → `SKILL.md` →
+   `commands/resume.md` and this file. Chat summaries are hints, not substitutes.
+1. Read newest relevant `docs-private/RESUME-NOTES*.md` and queue/ledger rows.
+2. Check git reality.
+3. Run `goalflight_status.py --json`.
+4. Classify active dispatches:
    - expected live
    - stale dead PID
    - stale PID reuse
    - surplus worker-like process
    - cooldown blocked
-4. Continue from status rows, not from memory.
+5. Continue from status rows, not from memory. Stay controller: dispatch workers
+   for implementation unless dispatch routing marks the chunk `controller-direct`.
 
 The dispatch ledger validates process identity with PID plus process start/command.
 PID alone is never authoritative.

@@ -5,6 +5,9 @@
 
 ## TL;DR
 
+**Post-compaction:** reload Goal Flight (`AGENTS.md` → `SKILL.md` →
+`commands/resume.md`) before acting.
+
 Simulated compaction handoff. Chat context is gone; this file is canonical.
 Continue by running status, then the fast resume test subset.
 
