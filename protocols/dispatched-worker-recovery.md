@@ -45,9 +45,10 @@ allow-patterns, different mode, different agent) and re-fire the chunk.
 3. **Run the verification gates the worker would have run.** Focused tests
    (`./tests/run.sh` or specific test targets per chunk scope), schema
    validation if relevant (e.g., JSON adapter manifests, YAML frontmatter),
-   forbidden-pattern grep (`SKILL.md §section` cross-refs, host-tool literals
-   per `tests/bash/test-agent-adapters.sh`). These would have run in the worker
-   if it hadn't blocked.
+   forbidden-pattern grep (the `test_instruction_split_contract` rule against
+   protocols/scripts cross-referencing back to SKILL section anchors, plus
+   the host-tool literal scan per `tests/bash/test-agent-adapters.sh`). These
+   would have run in the worker if it hadn't blocked.
 
 4. **Run an independent review on the worker's diff.** `gstack /review` via
    the host's normal skill-load path, OR `codex review` via bash-tail if the
