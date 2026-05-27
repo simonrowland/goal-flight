@@ -47,8 +47,15 @@ allow-patterns, different mode, different agent) and re-fire the chunk.
    validation if relevant (e.g., JSON adapter manifests, YAML frontmatter),
    forbidden-pattern grep (the `test_instruction_split_contract` rule against
    protocols/scripts cross-referencing back to SKILL section anchors, plus
-   the host-tool literal scan per `tests/bash/test-agent-adapters.sh`). These
-   would have run in the worker if it hadn't blocked.
+   the host-tool literal scan per `tests/bash/test-agent-adapters.sh`), and
+   the **codename-hygiene scan against the worker's proposed commit message,
+   new filenames, and any tracked-content edits** — per `AGENTS.md`
+   "Git-Visible Trigger Hygiene". This last check is the most
+   strategically important: vendor-trigger codenames in git-visible content
+   shift the account's API rate-billing tier, so the recovery commit MUST
+   pass this scan before staging. Use role descriptors (worker / runner /
+   shim / orchestrator) in commit messages, not the vendor's product name.
+   These verifications would have run in the worker if it hadn't blocked.
 
 4. **Run an independent review on the worker's diff.** `gstack /review` via
    the host's normal skill-load path, OR `codex review` via bash-tail if the
