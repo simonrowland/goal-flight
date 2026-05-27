@@ -32,12 +32,12 @@ triggers:
   - decompose this plan into goal chunks
 ---
 
-Read this skill end-to-end.
-It is the compiled controller distillation of `docs/controller-behaviours.md`.
-Do not stop at command lookup or Hard Invariants; back-half sections carry routing,
-state, marker, rate-limit, and context contracts.
-Read this skill end-to-end, including Worker Routing, State, and Context Discipline.
-Use the navigation map below to jump back after the full read.
+Read this skill end-to-end — including Worker Routing, State, and Context
+Discipline. It is the compiled controller distillation of
+`docs/controller-behaviours.md`. Do not stop at command lookup or Hard
+Invariants; back-half sections carry routing, state, marker, rate-limit, and
+context contracts. Use the navigation map below to jump back after the full
+read.
 
 This checked-in `SKILL.md` is the Claude Code-compatible wrapper for the portable
 core. Keep front matter and `allowed-tools` compatible until generated wrappers
@@ -61,9 +61,8 @@ only the invoked `commands/*.md` plus referenced `protocols/*.md`.
 Companion tools: gstack `/review` is the canonical chunk reviewer; gstack
 `/challenge` is the adversarial frame; fall back to `prompts/gstack-*.md` only
 when gstack is absent. context-mode stores large outputs and searches them.
-Controller behaviour probes run through portable host adapters, not host-specific
-print-mode shortcuts.
-Controller behaviour probes run through portable host adapters, not host-specific print-mode shortcuts.
+Controller behaviour probes run through portable host adapters, not
+host-specific print-mode shortcuts.
 
 ## Navigation map: behaviour -> SKILL anchor -> protocol/script
 
@@ -145,11 +144,9 @@ Review layers: executor self-review, chunk review, milestone review.
 On chunk completion, dispatch gstack `/review` before committing. Reviews go
 through gstack `/review` and `/challenge`; do not hand-roll review prompts.
 Reviewer misses become regression tests, not trust exemptions. Write review
-rubrics before first wave dispatch. Diversify reviewer concern, not just model.
-Use consolidation review for cross-slice contradictions. Milestone review is
-a separate gate from chunk review.
-Reviews go through gstack `/review` and `/challenge`; do not hand-roll review prompts.
-Write review rubrics before first wave dispatch.
+rubrics before first wave dispatch. Diversify reviewer concern, not just
+model. Use consolidation review for cross-slice contradictions. Milestone
+review is a separate gate from chunk review.
 
 Canonical nested review shape:
 
