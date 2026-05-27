@@ -1566,6 +1566,8 @@ chunk-3a rationale:
       - `adapters/claude-code.json`
       - `adapters/codex.json`
       - `adapters/cursor.json`
+      - `adapters/grok.json`
+      - `adapters/opencode.json`
     - **r_numbers:** []
 - **severity:** med
 - **last_reviewed_commit:** (chunk-3b)
@@ -1590,6 +1592,8 @@ chunk-3a rationale:
       - `adapters/claude-code.json`
       - `adapters/codex.json`
       - `adapters/cursor.json`
+      - `adapters/grok.json`
+      - `adapters/opencode.json`
     - **r_numbers:** []
 - **severity:** high
 - **last_reviewed_commit:** (chunk-3b)
@@ -1614,6 +1618,8 @@ chunk-3a rationale:
       - `adapters/claude-code.json`
       - `adapters/codex.json`
       - `adapters/cursor.json`
+      - `adapters/grok.json`
+      - `adapters/opencode.json`
     - **r_numbers:** []
 - **severity:** high
 - **last_reviewed_commit:** (chunk-3b)
@@ -1638,6 +1644,8 @@ chunk-3a rationale:
       - `adapters/claude-code.json`
       - `adapters/codex.json`
       - `adapters/cursor.json`
+      - `adapters/grok.json`
+      - `adapters/opencode.json`
     - **r_numbers:** []
 - **severity:** med
 - **last_reviewed_commit:** (chunk-3b)
@@ -1662,6 +1670,8 @@ chunk-3a rationale:
       - `adapters/claude-code.json`
       - `adapters/codex.json`
       - `adapters/cursor.json`
+      - `adapters/grok.json`
+      - `adapters/opencode.json`
     - **r_numbers:** []
 - **severity:** high
 - **last_reviewed_commit:** (chunk-3b)
@@ -1686,6 +1696,8 @@ chunk-3a rationale:
       - `adapters/claude-code.json`
       - `adapters/codex.json`
       - `adapters/cursor.json`
+      - `adapters/grok.json`
+      - `adapters/opencode.json`
     - **r_numbers:** []
 - **severity:** high
 - **last_reviewed_commit:** (chunk-3b)
@@ -1710,6 +1722,8 @@ chunk-3a rationale:
       - `adapters/claude-code.json`
       - `adapters/codex.json`
       - `adapters/cursor.json`
+      - `adapters/grok.json`
+      - `adapters/opencode.json`
     - **r_numbers:** []
 - **severity:** high
 - **last_reviewed_commit:** (chunk-3b)
@@ -1734,6 +1748,8 @@ chunk-3a rationale:
       - `adapters/claude-code.json`
       - `adapters/codex.json`
       - `adapters/cursor.json`
+      - `adapters/grok.json`
+      - `adapters/opencode.json`
     - **r_numbers:** []
 - **severity:** high
 - **last_reviewed_commit:** (chunk-3b)
@@ -1758,6 +1774,8 @@ chunk-3a rationale:
       - `adapters/claude-code.json`
       - `adapters/codex.json`
       - `adapters/cursor.json`
+      - `adapters/grok.json`
+      - `adapters/opencode.json`
     - **r_numbers:** []
 - **severity:** high
 - **last_reviewed_commit:** (chunk-3b)
@@ -1782,6 +1800,8 @@ chunk-3a rationale:
       - `adapters/claude-code.json`
       - `adapters/codex.json`
       - `adapters/cursor.json`
+      - `adapters/grok.json`
+      - `adapters/opencode.json`
     - **r_numbers:** []
 - **severity:** high
 - **last_reviewed_commit:** (chunk-3b)
@@ -1806,6 +1826,8 @@ chunk-3a rationale:
       - `adapters/claude-code.json`
       - `adapters/codex.json`
       - `adapters/cursor.json`
+      - `adapters/grok.json`
+      - `adapters/opencode.json`
     - **r_numbers:** []
 - **severity:** high
 - **last_reviewed_commit:** (chunk-3b)
@@ -1830,6 +1852,8 @@ chunk-3a rationale:
       - `adapters/claude-code.json`
       - `adapters/codex.json`
       - `adapters/cursor.json`
+      - `adapters/grok.json`
+      - `adapters/opencode.json`
     - **r_numbers:** []
 - **severity:** med
 - **last_reviewed_commit:** (chunk-3b)
@@ -1854,6 +1878,8 @@ chunk-3a rationale:
       - `adapters/claude-code.json`
       - `adapters/codex.json`
       - `adapters/cursor.json`
+      - `adapters/grok.json`
+      - `adapters/opencode.json`
     - **r_numbers:** []
 - **severity:** med
 - **last_reviewed_commit:** (chunk-3b)
@@ -1878,6 +1904,8 @@ chunk-3a rationale:
       - `adapters/claude-code.json`
       - `adapters/codex.json`
       - `adapters/cursor.json`
+      - `adapters/grok.json`
+      - `adapters/opencode.json`
     - **r_numbers:** []
 - **severity:** med
 - **last_reviewed_commit:** (chunk-3b)
@@ -1902,6 +1930,8 @@ chunk-3a rationale:
       - `adapters/claude-code.json`
       - `adapters/codex.json`
       - `adapters/cursor.json`
+      - `adapters/grok.json`
+      - `adapters/opencode.json`
     - **r_numbers:** []
 - **severity:** med
 - **last_reviewed_commit:** (chunk-3b)
@@ -1926,6 +1956,8 @@ chunk-3a rationale:
       - `adapters/claude-code.json`
       - `adapters/codex.json`
       - `adapters/cursor.json`
+      - `adapters/grok.json`
+      - `adapters/opencode.json`
     - **r_numbers:** []
 - **severity:** med
 - **last_reviewed_commit:** (chunk-3b)
@@ -1950,6 +1982,8 @@ chunk-3a rationale:
       - `adapters/claude-code.json`
       - `adapters/codex.json`
       - `adapters/cursor.json`
+      - `adapters/grok.json`
+      - `adapters/opencode.json`
     - **r_numbers:** []
 - **severity:** med
 - **last_reviewed_commit:** (chunk-3b)
@@ -1974,6 +2008,8 @@ chunk-3a rationale:
       - `adapters/claude-code.json`
       - `adapters/codex.json`
       - `adapters/cursor.json`
+      - `adapters/grok.json`
+      - `adapters/opencode.json`
     - **r_numbers:** []
 - **severity:** med
 - **last_reviewed_commit:** (chunk-3b)
@@ -1998,6 +2034,8 @@ chunk-3a rationale:
       - `adapters/claude-code.json`
       - `adapters/codex.json`
       - `adapters/cursor.json`
+      - `adapters/grok.json`
+      - `adapters/opencode.json`
     - **r_numbers:** []
 - **severity:** med
 - **last_reviewed_commit:** (chunk-3b)
@@ -2126,6 +2164,8 @@ chunk-3a rationale:
       - `adapters/agent-adapter.schema.json`
       - `adapters/codex.json`
       - `adapters/cursor.json`
+      - `adapters/grok.json`
+      - `adapters/opencode.json`
     - **r_numbers:** []
 - **severity:** high
 - **last_reviewed_commit:** (chunk-3b)
