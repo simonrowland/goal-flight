@@ -119,13 +119,17 @@ runner and watchers use **process-group CPU** as the false-positive killer:
   kill, so a transient `ps` failure or a momentary lull cannot false-positive.
   Terminal state `wedged`. `--max-quiet-s` (default 3600s) is a second wall for a
   CPU-busy worker that emits no events at all.
-- **Tool-call grace + an absolute per-tool wall.** A worker that emits a
-  `tool_call` (web search, a long test) then goes silent is I/O-bound at ≈0% CPU
-  — indistinguishable from a wedge by CPU alone. While a tool is outstanding the
-  dead-sample rule is suppressed (it is legitimate work). But a single tool
-  outstanding past `--max-tool-s` (default 1800s) is killed *regardless of CPU* —
-  the wall is absolute, so a CPU-busy or CPU-unsamplable stuck tool still trips
-  it. Terminal state `tool_timeout`.
+- **Tool-call grace + stall detection + a coarse per-tool wall.** A worker that
+  emits a `tool_call` (web search, a long test) then goes silent is I/O-bound at
+  ≈0% CPU — indistinguishable from a wedge by CPU alone. While a tool is
+  outstanding the dead-sample rule is suppressed (it is legitimate work).
+  **`--progress-stall-s` (default 300s) is the operative stuck signal** — it
+  kills when standard progress events go quiet, even if raw vendor noise
+  continues. Tune it for the worker's expected quiet pattern.
+  **`--max-tool-s` (default 3600s, the harness clamp) is a coarse safety net**
+  for one outstanding tool: activity-naive wall-clock. Lower it only for
+  known-fast tasks; do not use it as the primary stall detector. Terminal state
+  `tool_timeout` when the wall fires.
 - **Oversized ACP frame.** An ACP frame larger than the asyncio stream limit no
   longer hangs the reader: the guarded reader drops the over-limit newline frame,
   increments the ACP dropped-frame counter, logs it, and continues. Oversized

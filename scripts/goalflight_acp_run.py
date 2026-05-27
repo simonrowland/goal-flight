@@ -1,5 +1,19 @@
 #!/usr/bin/env python3
-"""Run one ACP prompt with compact status, capacity, and ledger records."""
+"""Run one ACP prompt with compact status, capacity, and ledger records.
+
+Timeout model (two signals):
+
+- ``--progress-stall-s`` (default 300) — **operative stall detector**. Kills when
+  standard progress events go quiet for N seconds. Raw vendor noise does not
+  reset it. Tune this for the worker's expected per-event quiet pattern.
+
+- ``--max-tool-s`` (default 3600, the harness clamp) — **wall-clock safety net**
+  for one outstanding tool call. Activity-naive. Use a lower value only when you
+  know the task is fast; do not use it as the primary stuck-detection knob.
+
+Explicit ``--max-tool-s`` on the command line (or ``GOALFLIGHT_MAX_TOOL_S``)
+still wins over the default.
+"""
 
 from __future__ import annotations
 
@@ -21,6 +35,7 @@ import uuid
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_REMOTE_TURN_SILENCE_S = 1200.0
 DEFAULT_REMOTE_TURN_CANCEL_GRACE_S = 15.0
+DEFAULT_MAX_TOOL_S = 3600.0
 LIVENESS_PROFILES = {"remote_api", "local_compute", "hybrid"}
 
 
@@ -1031,8 +1046,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--max-tool-s",
         type=float,
-        default=float(os.environ.get("GOALFLIGHT_MAX_TOOL_S", "1800")),
-        help="Maximum silent wall time for one outstanding ACP tool call before tool_timeout.",
+        default=float(os.environ.get("GOALFLIGHT_MAX_TOOL_S", str(DEFAULT_MAX_TOOL_S))),
+        help="Wall-clock safety net for one outstanding ACP tool call (default "
+             f"{DEFAULT_MAX_TOOL_S:.0f}s, the harness clamp). Activity-naive — "
+             "not the primary stuck detector. Lower values are for known-fast "
+             "tasks only. Use --progress-stall-s for genuine hangs.",
     )
     parser.add_argument(
         "--max-quiet-s",
@@ -1044,7 +1062,10 @@ def main(argv: list[str] | None = None) -> int:
         "--progress-stall-s",
         type=float,
         default=float(os.environ.get("GOALFLIGHT_PROGRESS_STALL_S", "300")),
-        help="Standard-progress silence hard wall. Raw vendor events do not reset it.",
+        help="Operative activity-based stall detector: kill when standard progress "
+             "events are silent for N seconds (default 300). Raw vendor events do "
+             "not reset it. Tune for the worker's expected quiet pattern; do not "
+             "substitute a tight --max-tool-s for this.",
     )
     parser.add_argument(
         "--liveness-profile",
@@ -1085,7 +1106,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.wedge_samples <= 0:
         args.wedge_samples = 4
     if args.max_tool_s <= 0:
-        args.max_tool_s = 1800.0
+        args.max_tool_s = DEFAULT_MAX_TOOL_S
     if args.max_quiet_s <= 0:
         args.max_quiet_s = 3600.0
     if args.progress_stall_s <= 0:
