@@ -3,6 +3,13 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
 SETUP="$REPO_ROOT/setup.sh"
+WORKER_PATH="${REPO_ROOT}/scripts/hosts/fleet/setup_worker_path.sh"
+
+ensure_mac_worker_bins() {
+  if [[ "$(uname -s)" == Darwin && -x "${WORKER_PATH}" ]]; then
+    bash "${WORKER_PATH}"
+  fi
+}
 
 if [[ $# -ge 1 ]]; then
   case "$1" in
@@ -14,7 +21,9 @@ if [[ $# -ge 1 ]]; then
       else
         project="."
       fi
-      exec "$SETUP" --cursor-install "$project" "$@"
+      "$SETUP" --cursor-install "$project" "$@"
+      ensure_mac_worker_bins
+      exit $?
       ;;
     opencode)
       shift
@@ -24,11 +33,30 @@ if [[ $# -ge 1 ]]; then
       else
         project="."
       fi
-      exec "$SETUP" --opencode-install "$project" "$@"
+      "$SETUP" --opencode-install "$project" "$@"
+      ensure_mac_worker_bins
+      exit $?
       ;;
     codex)
       shift
-      exec "$SETUP" --codex-install "$@"
+      "$SETUP" --codex-install "$@"
+      ensure_mac_worker_bins
+      exit $?
+      ;;
+    grok)
+      shift
+      bash "${REPO_ROOT}/scripts/hosts/fleet/install_grok.sh" "$@"
+      exit $?
+      ;;
+    claude-acp)
+      shift
+      bash "${REPO_ROOT}/scripts/hosts/fleet/install_claude_acp.sh" "$@"
+      exit $?
+      ;;
+    worker-path)
+      shift
+      ensure_mac_worker_bins
+      exit $?
       ;;
   esac
 fi

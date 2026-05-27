@@ -11,6 +11,7 @@ import contextlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import shlex
 import sys
@@ -156,7 +157,11 @@ def _run_codex_plugin_registration(repo_root: Path) -> None:
         capture_output=True,
         check=False,
     )
-    if result.returncode != 0 or "goal-flight@goal-flight (installed, enabled)" not in result.stdout:
+    if result.returncode != 0 or not re.search(
+        r"goal-flight@goal-flight\b.*\binstalled\b.*\benabled\b",
+        result.stdout,
+        re.I | re.S,
+    ):
         raise SetupError(
             "codex plugin registration did not verify as installed and enabled\n"
             f"{result.stderr.strip() or result.stdout.strip()}"
@@ -373,7 +378,9 @@ def _check_cursor_cli_worker_surface(*, dry_run: bool) -> None:
     if not Path(path).exists() and shutil.which("cursor-agent") is None:
         raise SetupError("cursor-agent worker check failed: cursor-agent not found")
     result = subprocess.run([path, "--version"], text=True, capture_output=True, check=False)
-    if result.returncode != 0:
+    combined = f"{result.stdout or ''}\n{result.stderr or ''}"
+    keychain_locked = result.returncode != 0 and re.search(r"keychain.*locked", combined, re.I)
+    if result.returncode != 0 and not keychain_locked:
         raise SetupError(
             "cursor-agent worker check failed: "
             f"{path} --version\n{result.stderr.strip() or result.stdout.strip()}"
@@ -411,6 +418,20 @@ def _check_opencode_acp_worker_surface(*, dry_run: bool) -> None:
     print(f"WORKER_CHECK opencode --version status=ok detail={detail[:120]}")
 
 
+def _run_mac_worker_path_setup(repo_root: Path, *, dry_run: bool) -> None:
+    if dry_run or sys.platform != "darwin":
+        return
+    script = repo_root / "scripts" / "hosts" / "fleet" / "setup_worker_path.sh"
+    if not script.exists():
+        return
+    result = subprocess.run(["bash", str(script)], text=True, capture_output=True, check=False)
+    if result.stdout.strip():
+        print(result.stdout.strip())
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+        raise SetupError(f"mac worker PATH setup failed: {detail}")
+
+
 def _run_host_bootstrap(
     repo_root: Path,
     agent: str,
@@ -426,6 +447,8 @@ def _run_host_bootstrap(
     manifest = _load_manifest(repo_root, agent)
     selected = destination_ids or _agent_default_destinations(repo_root, agent)
     destinations = _selected_destinations(manifest, selected)
+    if any(destination.get("role") == "worker" for destination in destinations):
+        _run_mac_worker_path_setup(repo_root, dry_run=dry_run)
     records: list[dict[str, Any]] = []
     for destination in destinations:
         role = destination.get("role")

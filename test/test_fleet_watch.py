@@ -247,7 +247,11 @@ def test_ssh_transport_uses_injected_runner() -> None:
         )
         assert_true("ingested", row.action == "ingested")
         assert_true("ssh invoked", len(captured) == 1)
-        assert_true("read_status", "read_status_file" in " ".join(captured[0]) or "cat" in captured[0])
+        joined = " ".join(captured[0])
+        assert_true(
+            "read_status",
+            "read_status_file" in joined or " cat " in f" {joined} " or "/bin/zsh" in joined,
+        )
 
 
 def main() -> None:

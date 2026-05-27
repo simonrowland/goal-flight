@@ -10,8 +10,21 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-# Non-interactive SSH often omits Homebrew; fleet workers (codex-acp, codex) live there.
-REMOTE_PATH_PREFIX = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+# Non-interactive SSH often omits Homebrew and user-local agent installs.
+SYSTEM_PATH_PREFIX = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+# OpenSSH forced-command exec often omits HOME; bootstrap before user-local bins.
+REMOTE_PATH_PREFIX = (
+    "$HOME/.local/bin:$HOME/.grok/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+)
+REMOTE_HOME_BOOTSTRAP = 'HOME=${HOME:-$(eval echo ~${USER:-$(whoami)})}'
+
+
+def wrap_remote_argv(remote_argv: list[str]) -> list[str]:
+    """Run remote argv under zsh with fleet worker PATH (expands $HOME on the node)."""
+    validate_remote_argv(remote_argv)
+    inner = " ".join(shlex.quote(part) for part in remote_argv)
+    script = f"{REMOTE_HOME_BOOTSTRAP}; PATH={REMOTE_PATH_PREFIX}:$PATH; exec {inner}"
+    return ["/bin/zsh", "-c", script]
 
 ALLOWED_COMMAND_CLASSES = frozenset(
     {
@@ -212,8 +225,7 @@ def build_ssh_command(
         cmd.extend(["-i", str(Path(host.identity_file).expanduser())])
     cmd.append(target)
     cmd.append("--")
-    cmd.extend(["env", f"PATH={REMOTE_PATH_PREFIX}"])
-    cmd.extend(remote_argv)
+    cmd.extend(wrap_remote_argv(remote_argv))
     return cmd
 
 

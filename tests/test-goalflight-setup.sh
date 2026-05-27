@@ -205,6 +205,7 @@ printf '%s\n' "$claude_dry" | grep -q 'PLUGIN skip selected_destinations' || fai
 
 OPENCODE_BIN="$HOME/.local/bin"
 mkdir -p "$OPENCODE_BIN"
+rm -f "$OPENCODE_BIN/opencode"
 cat > "$OPENCODE_BIN/opencode" <<'EOF'
 #!/usr/bin/env bash
 case "$1" in

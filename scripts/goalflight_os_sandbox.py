@@ -152,6 +152,12 @@ def _agent_state_roots(agent: str | None, command: str) -> list[str]:
             home / ".config" / "claude",
             home / ".cache" / "claude",
         ])
+    if "opencode" in label or "opencode" in binary:
+        roots.extend([
+            home / ".config" / "opencode",
+            home / ".local" / "share" / "opencode",
+            home / ".cache" / "opencode",
+        ])
     return [str(path) for path in roots]
 
 

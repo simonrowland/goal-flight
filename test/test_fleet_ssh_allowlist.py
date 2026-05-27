@@ -55,9 +55,12 @@ def test_build_ssh_uses_separator() -> None:
     cmd = ssh.build_ssh_command(host, remote, command_class="probe_echo")
     assert_true("ssh prefix", cmd[0] == "ssh")
     assert_true("double dash", "--" in cmd)
-    env_idx = cmd.index("env")
-    assert_true("env wrapper", cmd[env_idx + 1].startswith("PATH="))
-    assert_true("remote tail", cmd[-2:] == ["echo", "goal-flight-probe-ok"])
+    zsh_idx = cmd.index("/bin/zsh")
+    assert_true("zsh wrapper", cmd[zsh_idx + 1] == "-c")
+    assert_true("remote echo in script", "goal-flight-probe-ok" in cmd[zsh_idx + 2])
+    assert_true("homebrew path in script", "/opt/homebrew/bin" in cmd[zsh_idx + 2])
+    assert_true("local bin path in script", "$HOME/.local/bin" in cmd[zsh_idx + 2])
+    assert_true("home bootstrap", "HOME=${HOME:-" in cmd[zsh_idx + 2])
 
 
 def test_parse_ssh_config() -> None:

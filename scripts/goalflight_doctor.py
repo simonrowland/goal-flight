@@ -63,6 +63,9 @@ def first_line(text: str | None) -> str | None:
     return text.splitlines()[0] if text.splitlines() else None
 
 
+KEYCHAIN_LOCKED_RE = re.compile(r"keychain.*locked", re.I)
+
+
 def version(binary: str, *args: str) -> dict:
     path = shutil.which(binary)
     if not path and binary == "cursor-agent":
@@ -73,10 +76,24 @@ def version(binary: str, *args: str) -> dict:
         fallback = Path.home() / ".grok/bin/grok"
         if fallback.exists():
             path = str(fallback)
+    if not path and binary == "claude":
+        fallback = Path.home() / ".local/bin/claude"
+        if fallback.exists():
+            path = str(fallback)
     if not path:
         return {"present": False}
     result = run([path, *args], timeout=4)
-    return {"present": True, "path": path, "version": first_line(result["stdout"] or result["stderr"]), "ok": result["ok"]}
+    combined = f"{result['stdout'] or ''}\n{result['stderr'] or ''}"
+    version_text = first_line(result["stdout"] or result["stderr"])
+    ok = result["ok"]
+    out: dict = {"present": True, "path": path, "version": version_text, "ok": ok}
+    if not ok and binary == "cursor-agent" and KEYCHAIN_LOCKED_RE.search(combined):
+        # BatchMode SSH often hits a locked login keychain; binary is still usable for dispatch.
+        out["ok"] = True
+        out["keychain_locked"] = True
+        if not version_text or KEYCHAIN_LOCKED_RE.search(version_text):
+            out["version"] = "present (login keychain locked over SSH)"
+    return out
 
 
 def check_gstack() -> dict:

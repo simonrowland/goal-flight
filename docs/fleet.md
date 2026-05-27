@@ -34,6 +34,44 @@ Add SSH-reachable workers with the node subcommand (see
 - Repository checkout path on the remote machine
 - Allowed agent transports (for example `codex-acp`, `cursor-agent`)
 
+### Worker node install (Mac Studio / headless SSH)
+
+Fleet SSH probes run under `BatchMode` with a thin default `PATH`. Install
+agent CLIs once per worker, then run the PATH helper so doctor and billing
+probes find them:
+
+```bash
+# On the worker (interactive SSH session)
+curl -fsSL https://x.ai/cli/install.sh | bash          # Grok Build
+./install.sh grok                                       # or from goal-flight checkout
+./install.sh claude-acp                                 # npm global claude-code-cli-acp shim
+bash scripts/hosts/fleet/setup_worker_path.sh         # ~/.local/bin symlinks + PATH
+# Or: ./install.sh worker-path
+
+# Codex / codex-acp / OpenCode via Homebrew are symlinked into ~/.local/bin by
+# setup_worker_path.sh. Claude Code ships inside Claude.app (linked as `claude`);
+# Claude **ACP** uses the separate npm shim `claude-code-cli-acp` (not `claude acp`).
+# cursor-agent and grok are linked from their install trees into ~/.local/bin too.
+```
+
+Sign in on the worker (each person uses their own accounts; shared Grok/Cursor
+is fine when you use separate worktrees/repos):
+
+```bash
+codex login                    # OpenAI
+grok login --device-auth       # headless: URL + code in terminal
+grok login --oauth             # local browser (auth.x.ai)
+claude                         # Anthropic (first run opens browser)
+```
+
+**Cursor over SSH:** `cursor-agent --version` may report “login keychain is
+locked” in non-interactive SSH even when the GUI session is fine. Doctor treats
+that as present; unlock once after reboot if needed:
+
+```bash
+security unlock-keychain ~/Library/Keychains/login.keychain-db
+```
+
 Validate SSH allowlisting before live dispatch:
 
 ```bash

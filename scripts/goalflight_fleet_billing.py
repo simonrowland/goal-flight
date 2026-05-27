@@ -18,11 +18,19 @@ PROVIDER_BY_ACCOUNT: dict[str, str] = {
     "openai": "openai",
     "anthropic": "anthropic-session",
     "anthropic-session": "anthropic-session",
+    "grok": "grok",
+    "cursor": "cursor",
 }
 
 LOCAL_PROBE_ARGV: dict[str, list[str]] = {
     "openai": ["codex", "login", "status"],
     "anthropic-session": ["claude", "--version"],
+    "grok": [
+        "sh",
+        "-lc",
+        'test -s "${HOME}/.grok/auth.json" && echo logged_in',
+    ],
+    "cursor": ["cursor-agent", "--version"],
 }
 
 
@@ -37,7 +45,15 @@ def default_runner(argv: list[str]) -> tuple[int, str, str]:
 
     try:
         env = os.environ.copy()
-        extra = "/opt/homebrew/bin:/usr/local/bin"
+        home = Path.home()
+        extra = os.pathsep.join(
+            [
+                str(home / ".local/bin"),
+                str(home / ".grok/bin"),
+                "/opt/homebrew/bin",
+                "/usr/local/bin",
+            ]
+        )
         if extra not in env.get("PATH", ""):
             env["PATH"] = f"{extra}:{env.get('PATH', '')}"
         proc = subprocess.run(
@@ -79,6 +95,12 @@ def interpret_auth_probe(provider: str, exit_code: int, stdout: str, stderr: str
             return "yellow"
         return "red"
     if provider == "anthropic-session":
+        return "green" if exit_code == 0 and stdout.strip() else "red"
+    if provider == "grok":
+        if exit_code == 0 and re.search(r"logged_in", combined, re.I):
+            return "green"
+        return "red"
+    if provider == "cursor":
         return "green" if exit_code == 0 and stdout.strip() else "red"
     return "green" if exit_code == 0 else "red"
 

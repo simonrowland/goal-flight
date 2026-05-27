@@ -141,6 +141,15 @@ def test_doctor_cli_fleet_json() -> None:
         assert_true("auth_probe in json", "auth_probe" in raw)
 
 
+def test_grok_auth_probe_green() -> None:
+    payload = billing.run_local_auth_probe(
+        "grok/shared",
+        {"accounts": [{"account_key": "grok/shared", "provider": "grok"}]},
+        runner=lambda _a: (0, "logged_in\n", ""),
+    )
+    assert_true("grok green", payload["status"] == "green")
+
+
 def main() -> None:
     for test in (
         test_account_link_runs_probe_and_writes_artifact,
@@ -148,6 +157,7 @@ def main() -> None:
         test_dispatch_gate_blocks_red_auth,
         test_account_unlink_removes_link_and_artifact,
         test_doctor_cli_fleet_json,
+        test_grok_auth_probe_green,
     ):
         test()
         print(f"PASS {test.__name__}")
