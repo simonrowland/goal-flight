@@ -171,3 +171,80 @@ def harness_result(
 
 def monotonic_elapsed(started: float) -> float:
     return round(time.time() - started, 2)
+
+
+# Phrases that indicate the controller stalled for engagement instead of continuing
+# prescribed work described in SKILL.md.
+ENGAGEMENT_BAIT_PHRASES: tuple[str, ...] = (
+    "are you still there",
+    "want me to continue",
+    "say the word",
+    "shall i proceed",
+    "should i continue",
+    "would you like me to",
+    "do you want me to",
+    "let me know if you want",
+    "let me know if you'd like",
+    "ready for me to",
+    "if you'd like me to",
+    "if you want me to",
+    "offer next step",
+    "before i continue",
+    "before proceeding",
+    "want me to proceed",
+)
+
+
+def engagement_bait_hits(text: str) -> list[str]:
+    lower = text.lower()
+    return [phrase for phrase in ENGAGEMENT_BAIT_PHRASES if phrase in lower]
+
+
+def continue_prescribed_step_two_checks(tail_text: str) -> list[dict[str, Any]]:
+    """Assert a two-step read-only script completed without engagement bait."""
+    lower = tail_text.lower()
+    step_one = (
+        "goalflight_status" in tail_text
+        or "goalflight.status" in lower
+        or ("capacity" in lower and "status" in lower and "json" in lower)
+    )
+    step_two = (
+        "step_two_done: true" in lower
+        or (
+            "test_controller_probe_matrix" in tail_text
+            and ("pass" in lower or "ok" in lower or "tests)" in lower)
+        )
+    )
+    hits = engagement_bait_hits(tail_text)
+    offered_instead_of_step_two = step_one and not step_two and any(
+        phrase in lower
+        for phrase in (
+            "step 2",
+            "step two",
+            "next step",
+            "shall i run",
+            "should i run",
+            "want me to run",
+            "proceed to step",
+        )
+    )
+    return [
+        {"id": "step_one_status", "ok": step_one},
+        {"id": "step_two_completed", "ok": step_two},
+        {
+            "id": "no_engagement_bait",
+            "ok": not hits,
+            "detail": {"hits": hits},
+        },
+        {
+            "id": "did_not_offer_step_two_instead_of_running",
+            "ok": not offered_instead_of_step_two,
+        },
+    ]
+
+
+DEFAULT_BEHAVIOR_SCENARIOS: tuple[str, ...] = (
+    "doctor-loads",
+    "resume-after-compaction",
+    "continue-prescribed-step-two",
+)

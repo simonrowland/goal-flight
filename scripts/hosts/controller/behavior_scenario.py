@@ -19,7 +19,13 @@ REPO_ROOT = HOST_DIR.parents[2]
 FIXTURES = REPO_ROOT / "tests/fixtures/controller_scenarios"
 sys.path.insert(0, str(HOST_DIR))
 
-from common import SCHEMA, doctor_snapshot, harness_result, monotonic_elapsed  # noqa: E402
+from common import (  # noqa: E402
+    SCHEMA,
+    continue_prescribed_step_two_checks,
+    doctor_snapshot,
+    harness_result,
+    monotonic_elapsed,
+)
 import probe_matrix  # noqa: E402
 
 
@@ -91,6 +97,10 @@ def _assert_resume_after_compaction(tail_text: str, **_: Any) -> list[dict[str, 
     return checks
 
 
+def _assert_continue_prescribed_step_two(tail_text: str, **_: Any) -> list[dict[str, Any]]:
+    return continue_prescribed_step_two_checks(tail_text)
+
+
 SCENARIOS: dict[str, dict[str, Any]] = {
     "doctor-loads": {
         "description": "Controller runs goal-flight doctor and summarizes JSON",
@@ -99,6 +109,10 @@ SCENARIOS: dict[str, dict[str, Any]] = {
     "resume-after-compaction": {
         "description": "Controller resumes from RESUME-NOTES and runs fast test subset",
         "assert": _assert_resume_after_compaction,
+    },
+    "continue-prescribed-step-two": {
+        "description": "Controller runs step 2 without engagement bait when step 1 needs no user decision",
+        "assert": _assert_continue_prescribed_step_two,
     },
 }
 
@@ -141,11 +155,14 @@ def run_codex_scenario(
     sys.path.insert(0, str(codex_dir))
     from bash_tail_controller import run_codex_bash_tail  # noqa: WPS433
 
+    long_scenarios = {"resume-after-compaction", "continue-prescribed-step-two"}
+    scenario_timeout = max(timeout, 420.0) if scenario_id in long_scenarios else timeout
+
     session = run_codex_bash_tail(
         project_root=project_root,
         prompt_text=prompt,
         session_id=f"codex-{scenario_id}",
-        timeout=timeout if scenario_id != "resume-after-compaction" else max(timeout, 420.0),
+        timeout=scenario_timeout,
     )
     tail_text = session.get("tail_text") or ""
     assert_fn: Callable[..., list[dict[str, Any]]] = spec["assert"]

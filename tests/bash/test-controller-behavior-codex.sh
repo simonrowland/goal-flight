@@ -25,7 +25,7 @@ if ! command -v codex >/dev/null 2>&1; then
   exit 0
 fi
 
-SCENARIOS="${GOALFLIGHT_CONTROLLER_SCENARIOS:-doctor-loads resume-after-compaction}"
+SCENARIOS="${GOALFLIGHT_CONTROLLER_SCENARIOS:-doctor-loads resume-after-compaction continue-prescribed-step-two}"
 FAIL=0
 
 for SCENARIO in $SCENARIOS; do

@@ -40,6 +40,7 @@ Fixtures live under `tests/fixtures/controller_scenarios/<id>/prompt.md`.
 |----------|-------------------------|
 | `doctor-loads` | Invokes or cites `goalflight_doctor.py --json`; mentions ok / host install |
 | `resume-after-compaction` | Reads RESUME-NOTES handoff; runs status + fast test subset; tests pass |
+| `continue-prescribed-step-two` | Runs `goalflight_status.py --json` then `test_controller_probe_matrix.py` without asking; no engagement bait; ends with `STEP_TWO_DONE: true` |
 
 ## Compaction resume drill (procedural, no LLM)
 
