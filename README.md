@@ -69,7 +69,7 @@ Same flags via `setup.sh`: `--cursor-install`, `--opencode-install`, and `--code
                                   # Bash-&-tail-file), embedded self-review,
                                   # milestone reviewer examples every K commits
 /goal-flight doctor               # validate wrapper/package health, companion tools,
-                                  # codex trust, context-mode, gstack, ACP +
+                                  # codex trust, context-mode, gstack, autoreview, ACP +
                                   # surface model currency + rate-pressure
 /goal-flight update               # pull latest goal-flight from origin + run
                                   # each worker CLI's self-update (codex /
@@ -138,7 +138,8 @@ Unified CLI: `bin/goalflight <domain> <resource> <verb>` (action router over
 
 ## Companion tools (strongly recommended)
 
-- **[gstack](https://github.com/garrytan/gstack)** — Garry Tan's skill pack provides `/review`, `/office-hours`, `/plan-eng-review`, `/cso`, `/investigate` for both Claude Code and codex. Goal-flight invokes `/review` for milestone reviews and `/office-hours` for fuzzy-goal interrogation at init. **Optional** — without gstack, goal-flight falls back to local prompts at `prompts/gstack-claude-review.md` + `prompts/gstack-codex-challenge.md` (and embedded executor self-review still catches most issues). With gstack installed, you get consistent severity-ranking framing across both review lenses, which is meaningfully higher quality on long runs.
+- **[gstack](https://github.com/garrytan/gstack)** — Garry Tan's skill pack provides `/review`, `/office-hours`, `/plan-eng-review`, `/cso`, `/investigate` for both Claude Code and codex. Goal-flight invokes `/review` as the **default independent reviewer** for chunk-level pre-commit review (`protocols/chunk-review.md`) and for milestone reviews (`protocols/milestone-review.md`, gstack + concern-diverse sweep); `/office-hours` covers fuzzy-goal interrogation at init. **Optional** — without gstack, goal-flight falls back to local prompts at `prompts/gstack-claude-review.md` + `prompts/gstack-codex-challenge.md` (and embedded executor self-review still catches most issues). With gstack installed, you get consistent severity-ranking framing across both review lenses, which is meaningfully higher quality on long runs.
+- **autoreview** — Complementary diff-local pre-commit pass (`protocols/chunk-review.md`, `./scripts/autoreview.sh`). Runs in parallel with gstack at chunk level when the controller chooses; does **not** replace gstack as the default review path. Catches diff-local issues (API footguns, missing tests on touched paths, regression invariants) that a structural reviewer may not prioritize. Requires upstream autoreview (typically the Cursor autoreview skill or `AUTOREVIEW_HELPER`); doctor reports WARN when absent.
 - **[context-mode](https://github.com/simonrowland/context-mode)** — MCP plugin that offloads large command outputs (diffs, integration test runs, codex tail files, large greps) to an FTS5 sandbox queried by pattern. The multiplier that makes 12-hour unattended runs feasible — without it, tool-output fills the controller's context fast and you hit compaction early.
 
 ## Adapting

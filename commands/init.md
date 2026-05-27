@@ -6,12 +6,9 @@ description: "Initialize goal-flight state for a project."
 
 Initialize a project for goal-flight with compact, procedural discovery.
 
-Read:
-
-- `protocols/session-preflight.md`
-- `protocols/tool-readiness.md`
-- `protocols/premises.md`
-- `protocols/state-handoff.md`
+Read `protocols/session-preflight.md`, `protocols/tool-readiness.md`,
+`protocols/premises.md`, `protocols/state-handoff.md`, and
+`protocols/chunk-review.md` (review tooling).
 
 ## Steps
 
@@ -37,6 +34,20 @@ setup installs global agent instructions, a personal skill, rules, and Cursor
 MCP config for context-mode. Project-local setup writes the wrapper and, when
 context-mode is selected, project-specific `.cursor/mcp.json` under the target
 repository.
+
+Default add-ons (same tier as setup prompts):
+
+- **context-mode** — large-output offload
+- **gstack** — default independent reviewer for both chunk-level pre-commit
+  review and milestone review (`/review`, plus `/office-hours`, `/plan-eng-review`,
+  `/cso`, `/investigate`). Local fallback prompts live in
+  `prompts/gstack-claude-review.md` and `prompts/gstack-codex-challenge.md` when
+  gstack is not installed.
+- **autoreview** — complementary diff-local pre-commit pass via
+  `scripts/autoreview.sh`. Runs in parallel with gstack at chunk level when the
+  controller chooses; does not replace gstack as the default review path.
+  Install upstream autoreview before init when doctor WARNs — typically the
+  Cursor autoreview skill or `AUTOREVIEW_HELPER`.
 
 2. Run doctor:
 

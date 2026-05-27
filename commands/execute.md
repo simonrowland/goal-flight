@@ -12,6 +12,8 @@ Read:
 - `protocols/dispatch-routing.md`
 - `protocols/worker-markers.md`
 - `protocols/state-handoff.md`
+- `protocols/user-status-cadence.md`
+- `protocols/chunk-review.md`
 - `protocols/milestone-review.md`
 - `protocols/worktrees-parallel.md` only for `--parallel`
 
@@ -94,24 +96,36 @@ Every spawned worker must have:
 Use `scripts/goalflight_ledger.py record` directly only when a runner did not
 already record the worker.
 
+**In-flight monitoring:** while workers or review jobs run, follow
+`protocols/user-status-cadence.md` — poll `goalflight_status.py --json` and
+surface a compact user status update at least every 15 minutes unless context
+is tight (file-only row in RESUME-NOTES then). Background the poll; do not
+block on raw logs.
+
 7. Completion:
 
 Read status JSON. Do not inspect raw logs unless the status script reports that
 the log is corrupt or missing.
 
-8. Verification:
+8. Verification (chunk review — not milestone review):
+
+Read `protocols/chunk-review.md`.
 
 - inspect diff
 - run focused tests
-- run self-review against changed files
+- run at least one independent pre-commit review per `protocols/chunk-review.md`
+  (default gstack `/review` on the chunk diff; `./scripts/autoreview.sh --mode local`
+  may run in parallel as a complementary diff-local pass; background if >10s)
+- run executor self-review findings when present in worker output
+- fix P0/P1/P2 from review before commit
 - commit when the active goal-flight workflow completes a chunk (default: one
   commit per chunk) or when the user explicitly requests a commit
 
-9. Milestone review:
+9. Milestone review (separate from step 8):
 
 At configured cadence or `[milestone]` chunks, run file-backed review flights
-via `scripts/goalflight_review_job.py`. Missing/stalled/session-limited reviews
-are inconclusive, not clean.
+per `protocols/milestone-review.md` via `scripts/goalflight_review_job.py`.
+Missing/stalled/session-limited reviews are inconclusive, not clean.
 
 10. Resume/handoff:
 

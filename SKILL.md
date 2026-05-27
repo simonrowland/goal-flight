@@ -86,7 +86,7 @@ drift against an in-flight queue.
 | `/goal-flight init <topic>` | `commands/init.md` | `session-preflight`, `tool-readiness`, `premises`, `state-handoff` |
 | `/goal-flight decompose-plan [<plan>]` | `commands/decompose-plan.md` | `premises`, `dispatch-routing` |
 | `/goal-flight ask-questions [<scope>]` | `commands/ask-questions.md` | `dispatch-routing` |
-| `/goal-flight execute [--parallel <N>]` | `commands/execute.md` | `dispatch-routing`, `worker-markers`, `state-handoff`, `milestone-review`; add `worktrees-parallel` for `--parallel` |
+| `/goal-flight execute [--parallel <N>]` | `commands/execute.md` | `dispatch-routing`, `worker-markers`, `state-handoff`, `user-status-cadence`, `chunk-review`, `milestone-review`; add `worktrees-parallel` for `--parallel` |
 | `/goal-flight doctor` | `commands/doctor.md` | `tool-readiness` |
 | `/goal-flight build-corpus [<flags>]` | `commands/build-corpus.md` | corpus docs referenced there |
 | `/goal-flight resume` | `commands/resume.md` | `state-handoff` |
@@ -114,6 +114,10 @@ Protocol index: `protocols/README.md`.
 - During an active goal-flight run, **keep shipping** through decompose →
   execute until the queue is done or a real blocker stops you — do not pause
   for engagement checks (see **Autonomous throughput** below).
+- While workers or review jobs are in-flight, **report progress to the user**
+  at least every 15 minutes unless context is tight — see
+  `protocols/user-status-cadence.md`. That is status reporting, not asking
+  the user to confirm continuation.
 - Keep `docs-private/` private. Public docs describe shipped behavior, not
   private review scratch.
 
@@ -143,6 +147,10 @@ substantive scope instruction (for example "implement Wave 1", "keep going",
 - **Record non-blocking uncertainty in files**, not chat: inline-office-hours
   backlog, `docs-private/premises-*.md`, RESUME-NOTES, or scenario `notes` —
   then proceed with the best default from the plan.
+- **Mid-session user requests:** when goal-flight is already in play and the
+  user adds scope or a new ask, append a compact row to the active
+  `docs-private/goal-queue-*.md` via `commands/goal.md` **before** dispatch or
+  implementation — chat alone is not the backlog.
 - **Stop and ask only** for `USER-NEED` / `USER-CONFIRM` tier blockers: permission,
   destructive or irreversible action without a plan default, product choice the
   plan cannot infer, auth/capacity hard stop, or explicit command gates (for
@@ -152,9 +160,30 @@ Commits during execute follow **one commit per completed chunk** (plus
 milestone fix-clusters) unless the user forbade commits for this run. That is
 part of the active workflow, not a separate permission request per chunk.
 
+Before each chunk commit: focused tests green **and** at least one independent
+review per `protocols/chunk-review.md` (default gstack `/review`, with
+`./scripts/autoreview.sh` as a complementary parallel option for diff-local
+findings — controller decides per chunk; background if >10s).
+
+At milestone cadence or `[milestone]` chunks, run `protocols/milestone-review.md`
+(gstack `/review` + concern-diverse sweep) — a separate gate from chunk review.
+
 **Push is not commit.** Land commits locally as chunks complete. Push to a
 remote only after the relevant tests pass and the user has permitted publish
 (see `AGENTS.md` §Git workflow).
+
+## User progress reporting
+
+Distinct from engagement polling and from worker `STATUS:` markers.
+
+While `execute` has in-flight workers, review jobs, or background verification
+(>10s), poll compact state and give the user a short progress update **at least
+every 15 minutes** unless **context is tight** (compaction imminent, user asked
+for minimal chatter, or the turn must stay small). Full rules:
+`protocols/user-status-cadence.md`.
+
+When context is tight, still poll and append a one-line timestamp to
+RESUME-NOTES — skip the chat digest until there is room.
 
 ## Dispatch Model
 

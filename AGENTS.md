@@ -17,14 +17,20 @@
 - During an active goal-flight run, keep advancing the queue and accumulating
   commits per chunk until decomposition/execute is done; do not stall on
   engagement prompts. See repository root `SKILL.md` §Autonomous throughput.
+- **Active run + compaction:** if goal-flight was already in play (user invoked
+  it, open queue/ledger, or `docs-private/RESUME-NOTES*.md`), reload the skill
+  (load order above → `commands/resume.md`). Not always-on. Details:
+  `protocols/state-handoff.md`.
 
 ## Git workflow (this repo)
 
-- **Commit as work completes** — logical chunks, green or focused tests, no
-  waiting for a separate "please commit" unless the user forbade commits for
-  this run.
-- **Do not push to public** without running the relevant test sweep and
-  explicit user permission.
+- **Commit as work completes** — one logical chunk at a time after focused tests
+  **and at least one independent review** (`protocols/chunk-review.md`; default
+  gstack `/review`, with `./scripts/autoreview.sh` as a complementary parallel
+  option). Executor self-review alone is not enough.
+- Do not wait for a separate "please commit" unless the user forbade commits.
+- **Do not push to public** without the relevant test sweep and explicit user
+  permission.
 - Amending, force-push, and destructive git operations still require explicit
   user request.
 

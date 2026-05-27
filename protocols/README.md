@@ -10,6 +10,8 @@ protocol files carry the detailed operating procedures.
 | `dispatch-routing.md` | choosing iteration pattern (one-shot / goal-mode) and comms shape (controller-direct / ACP / bash-tail) |
 | `worker-markers.md` | rendering prompts or parsing worker status |
 | `state-handoff.md` | compacting, resume notes, status recovery |
+| `user-status-cadence.md` | in-flight worker poll + user progress updates (≤15 min) |
+| `chunk-review.md` | pre-commit gstack `/review` (default; complementary parallel autoreview optional) before chunk land |
 | `premises.md` | init/decompose needs premise distillation |
 | `self-delegation.md` | user explicitly asks for `/fork` or `/branch` |
 | `worktrees-parallel.md` | `execute --parallel` or merge orchestration |
