@@ -42,7 +42,7 @@ Same flags via `setup.sh`: `--cursor-install`, `--opencode-install`, and `--code
 
 - **Multi-hour unattended runs.** Check in periodically or respond to decision notifications. The controller's context primarily holds architecture, plan, and metadata (queue state, recent commits, in-flight dispatch headers); real work happens in subagent context windows.
 - **Verification-first dispatch.** Wrappers point at files for the agent to investigate, not pre-pasted "facts" that go stale on the timescale of minutes. Frontier models trust controller-text uncritically; pointers force them to re-verify against live disk and surface drift.
-- **Parallel cross-agent reviews at milestone cadence.** Two independent reviewers (for example Claude + codex) address bugs and completion before pestering you. Via [gstack](https://github.com/garrytan/gstack)'s `/review` skill when installed.
+- **Parallel cross-agent reviews at milestone cadence.** Two independent reviewers (Claude + codex) address bugs and completion before pestering you. Via [gstack](https://github.com/garrytan/gstack)'s `/review` skill when installed.
 - **/goal native.** the controller picks from per chunk. **Iteration pattern** (one-shot for most chunks, goal-mode loop for chunks that need plan/act/test/review-to-convergence, controller-direct for trivial work)
 - **Token Management.** Throw tokens at your problem for better code and less babysitting, but divide the usage and rate-limits between multiple agent vendors, task-by-task.
 - **Fancy Monitoring.** ACP for structured events from claude-cli, cursor, codex, grok. Uses bash-tail as fallback and to support generic agents. Controller handles worker notifications, and can escalate messages to the user.
