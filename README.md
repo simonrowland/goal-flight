@@ -18,7 +18,7 @@ goal-flight is a multi-agent controller, which delegates coding /goal and parall
 git clone https://github.com/simonrowland/goal-flight.git ~/.claude/skills/goal-flight
 
 # Codex / Cursor / OpenCode — clone once, then one command per host (global + project):
-git clone https://github.com/simonrowland/goal-flight.git ~/Repos/goal-flight && cd ~/Repos/goal-flight
+git clone https://github.com/simonrowland/goal-flight.git ~/.goal-flight && cd ~/.goal-flight
 ./install.sh cursor /path/to/your/project
 ./install.sh opencode /path/to/your/project
 ./install.sh codex

@@ -16,7 +16,7 @@ Read:
 ## Steps
 
 1. Confirm host setup/bootstrap happened. If this is a fresh host install, run
-   setup from the cloned Goal Flight repository before project init:
+   setup from your Goal Flight clone (default `~/.goal-flight`) before project init:
 
 ```bash
 ./setup.sh --agent codex

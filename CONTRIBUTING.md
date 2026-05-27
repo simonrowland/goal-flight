@@ -27,8 +27,8 @@ Out of scope for this repository:
 ## Development setup
 
 ```bash
-git clone https://github.com/simonrowland/goal-flight.git
-cd goal-flight
+git clone https://github.com/simonrowland/goal-flight.git ~/.goal-flight
+cd ~/.goal-flight
 ```
 
 Create the ACP SDK venv (required for ACP Python tests):

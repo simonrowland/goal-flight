@@ -1,5 +1,7 @@
 # Cursor Notes
 
+Run from your Goal Flight clone (default `~/.goal-flight`; see README).
+
 One-shot install (global + project):
 
 ```bash

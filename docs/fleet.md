@@ -43,7 +43,7 @@ probes find them:
 ```bash
 # On the worker (interactive SSH session)
 curl -fsSL https://x.ai/cli/install.sh | bash          # Grok Build
-./install.sh grok                                       # or from goal-flight checkout
+./install.sh grok                                       # from ~/.goal-flight checkout
 ./install.sh claude-acp                                 # npm global claude-code-cli-acp shim
 bash scripts/hosts/fleet/setup_worker_path.sh         # ~/.local/bin symlinks + PATH
 # Or: ./install.sh worker-path

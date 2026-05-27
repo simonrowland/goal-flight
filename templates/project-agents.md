@@ -22,7 +22,7 @@ Private. Read before touching code.
 
 ## Goal Flight Routing
 
-- skill-root: `${GOALFLIGHT_ROOT:-<path-to-goal-flight-clone>}`
+- skill-root: `${GOALFLIGHT_ROOT:-~/.goal-flight}`
 - load order: read this `AGENTS.md`, then repository `SKILL.md`, then the
   invoked Goal Flight `commands/*.md` file from skill-root.
 - keep `docs-private/` ignored; store env caveats, queues, ledgers, review
