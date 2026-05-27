@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+"""Autoreview Claude backend via goal-flight ACP (claude-code-cli-acp).
+
+Drop-in for upstream autoreview's native Claude print-CLI path: autoreview passes
+the review prompt on stdin and expects structured JSON on stdout.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import re
+import subprocess
+import sys
+import tempfile
+import uuid
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+ACP_RUN = ROOT / "scripts" / "goalflight_acp_run.py"
+
+
+def _parse_json_candidate(text: str) -> dict | None:
+    stripped = text.strip()
+    if not stripped:
+        return None
+    try:
+        parsed = json.loads(stripped)
+    except json.JSONDecodeError:
+        parsed = None
+    if isinstance(parsed, dict) and "findings" in parsed:
+        return parsed
+    if isinstance(parsed, dict) and isinstance(parsed.get("structured_output"), dict):
+        inner = parsed["structured_output"]
+        if "findings" in inner:
+            return inner
+    fenced = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", stripped, flags=re.S)
+    for block in reversed(fenced):
+        try:
+            obj = json.loads(block)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict) and "findings" in obj:
+            return obj
+    for line in reversed(stripped.splitlines()):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict) and "findings" in obj:
+            return obj
+    return None
+
+
+def _extract_report(text: str) -> dict:
+    report = _parse_json_candidate(text)
+    if report is None:
+        raise RuntimeError(f"ACP review did not return structured findings JSON\n{text[-2000:]}")
+    return report
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--print", action="store_true")
+    parser.add_argument("--no-session-persistence", action="store_true")
+    parser.add_argument("--output-format")
+    parser.add_argument("--json-schema")
+    parser.add_argument("--model")
+    parser.add_argument("--effort")
+    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--allowedTools")
+    parser.add_argument("--tools")
+    parser.parse_known_args(argv)
+
+    prompt = sys.stdin.read()
+    if not prompt.strip():
+        print("autoreview_claude_acp: empty stdin prompt", file=sys.stderr)
+        return 1
+
+    repo = Path.cwd()
+    dispatch_id = f"autoreview-{uuid.uuid4().hex[:10]}"
+    prompt_b64 = base64.b64encode(prompt.encode("utf-8")).decode("ascii")
+
+    with tempfile.TemporaryDirectory(prefix="goalflight-autoreview-") as td:
+        status_path = Path(td) / "status.json"
+        cmd = [
+            sys.executable,
+            str(ACP_RUN),
+            "--agent",
+            "claude",
+            "--cwd",
+            str(repo),
+            "--dispatch-id",
+            dispatch_id,
+            "--prompt-id",
+            "autoreview",
+            "--prompt-b64",
+            prompt_b64,
+            "--status-json",
+            str(status_path),
+            "--json",
+            "--idle-timeout",
+            "1800",
+            "--max-quiet-s",
+            "3600",
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if proc.returncode != 0:
+            print(proc.stderr or proc.stdout, file=sys.stderr)
+            return proc.returncode or 1
+        try:
+            payload = json.loads(proc.stdout)
+        except json.JSONDecodeError as exc:
+            print(f"autoreview_claude_acp: invalid ACP JSON: {exc}\n{proc.stdout[:2000]}", file=sys.stderr)
+            return 1
+
+    text = str(payload.get("result_text") or payload.get("text_excerpt") or "")
+    if payload.get("state") != "complete":
+        err = payload.get("error") or payload.get("state")
+        print(f"autoreview_claude_acp: ACP run failed: {err}\n{text[-2000:]}", file=sys.stderr)
+        return 1
+
+    report = _extract_report(text)
+    print(json.dumps(report))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
