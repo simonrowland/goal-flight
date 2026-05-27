@@ -1,5 +1,23 @@
 # Agent Notes
 
+## Companion tools (defined for non-Claude controllers loading this file)
+
+- **gstack** — Garry Tan's skill pack (`/review`, `/challenge`, `/office-hours`,
+  `/plan-eng-review`, `/cso`, `/investigate`, etc.). Installs at
+  `~/.gstack/repos/gstack/.agents/skills/` and is registered per-host
+  (Claude Code: `~/.claude/skills/`; Codex: `~/.codex/skills/`; Cursor:
+  `~/.cursor/skills/`). Goal Flight invokes `gstack /review` as the canonical
+  chunk-level pre-commit reviewer and `gstack /challenge` for adversarial
+  framing. When gstack is absent, fall back to the bundled prompt skeletons at
+  `prompts/gstack-claude-review.md` and `prompts/gstack-codex-challenge.md` —
+  do **not** hand-roll a custom review prompt.
+- **context-mode** — MCP plugin that offloads large command outputs
+  (diffs, integration test runs, codex tail files, large greps) to an FTS5
+  sandbox queried by pattern. Lets the controller analyze big artifacts
+  without consuming its own context window. Installs per-host (Claude Code:
+  `~/.claude/plugins/cache/context-mode/...`; Codex: registered via
+  `scripts/register-context-mode-codex.py`).
+
 ## Goal Flight Routing
 
 - When a user invokes `goal-flight` or asks for durable planning, dispatch,

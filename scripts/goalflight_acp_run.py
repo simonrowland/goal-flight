@@ -79,9 +79,61 @@ from goalflight_acp_client import (
     AcpConnection,
     AcpError,
     AcpLivenessActivity,
+    PERMISSION_ALLOW,
     cleanup_ghosts,
+    default_permission_policy,
     spawn_acp_connection,
 )
+import re as _re
+
+
+def _tool_call_title(tool_call: Any) -> str:
+    """Extract a tool-call title without depending on the client's _tc_get helper."""
+    for key in ("title", "Title"):
+        try:
+            value = tool_call.get(key) if hasattr(tool_call, "get") else getattr(tool_call, key, None)
+        except Exception:
+            value = None
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
+def make_title_allow_policy(
+    patterns: list[Any],
+    base: Callable[[Any, list[Any], str | None], str] | None = None,
+) -> Callable[[Any, list[Any], str | None], str]:
+    """Wrap a base permission policy with an allow-by-title-pattern shortcut.
+
+    Patterns are pre-compiled regex objects (anything with ``.search(s)``). When
+    the tool-call's title matches any pattern, return ``PERMISSION_ALLOW``
+    immediately. Otherwise fall through to ``base`` (defaults to
+    ``default_permission_policy``).
+
+    Used by the runner's ``--permission-allow-tool-title-pattern`` flag to let
+    the controller pre-authorize specific tool-call shapes inside a worker's
+    chunk scope without escalating mid-run. The classic case: a dispatched chunk
+    that includes "run ``./tests/run.sh``" in its acceptance criteria — the
+    controller passes a pattern like ``^./tests/run\\.sh$`` so the runner
+    auto-approves that exact execute request and the worker proceeds.
+
+    R26 — restores the original ACP-passthrough design where the controller
+    exercises discretion (approves authorized scope) and escalates only requests
+    that genuinely need user judgment (destructive, out-of-scope, ambiguous).
+    """
+    base_policy = base or default_permission_policy
+
+    def policy(tool_call: Any, options: list[Any], cwd: str | None) -> str:
+        title = _tool_call_title(tool_call)
+        for pattern in patterns:
+            try:
+                if pattern.search(title):
+                    return PERMISSION_ALLOW
+            except Exception:
+                continue
+        return base_policy(tool_call, options, cwd)
+
+    return policy
 from goalflight_liveness import (
     active_monotonic,
     heartbeat_wedge_decision,
@@ -248,6 +300,7 @@ async def spawn_and_handshake_with_retry(
     permission_dir: str | None = None,
     permission_inline_timeout_s: float | None = None,
     permission_user_timeout_s: float | None = None,
+    permission_policy: Callable[[Any, list[Any], str | None], str] | None = None,
     os_sandbox: str = OS_SANDBOX_OFF,
     env: dict[str, str] | None = None,
 ) -> tuple[asyncio.subprocess.Process, AcpConnection]:
@@ -283,6 +336,7 @@ async def spawn_and_handshake_with_retry(
             permission_dir=permission_dir,
             permission_inline_timeout_s=permission_inline_timeout_s,
             permission_user_timeout_s=permission_user_timeout_s,
+            permission_policy=permission_policy,
             os_sandbox=os_sandbox,
             env=env,
         )
@@ -783,6 +837,27 @@ async def run(args: argparse.Namespace) -> dict:
         # StartupGate serializes the heavy startup of fragile adapters (the
         # Claude TUI) so concurrent launches don't starve each other on init;
         # it releases the instant the handshake completes, so TURNS overlap.
+        # R26: controller-discretion permission policy. When the caller passed
+        # --permission-allow-tool-title-pattern flags, build a policy that
+        # auto-allows matching titles before falling through to the default
+        # scope-aware policy. Otherwise leave permission_policy=None (the worker
+        # uses default_permission_policy via the client).
+        allow_patterns_raw = getattr(args, "permission_allow_tool_title_pattern", None) or []
+        if allow_patterns_raw:
+            try:
+                _compiled_patterns = [_re.compile(p) for p in allow_patterns_raw]
+                permission_policy = make_title_allow_policy(_compiled_patterns)
+            except _re.error as exc:
+                # Invalid regex — fail loud rather than silently mis-authorize.
+                # Return a dict matching the function's declared `-> dict` return
+                # type so callers reading the return value get a consistent
+                # shape; the status JSON has already been updated identically.
+                _err = {"code": -1, "message": f"invalid --permission-allow-tool-title-pattern: {exc}"}
+                await update_status(state="failed", error=_err)
+                return {"state": "failed", "error": _err}
+        else:
+            permission_policy = None
+
         async with StartupGate(args.agent):
             proc, conn = await spawn_and_handshake_with_retry(
                 command,
@@ -797,6 +872,7 @@ async def run(args: argparse.Namespace) -> dict:
                 permission_dir=getattr(args, "permission_dir", None),
                 permission_inline_timeout_s=getattr(args, "permission_inline_timeout_s", None),
                 permission_user_timeout_s=getattr(args, "permission_user_timeout_s", None),
+                permission_policy=permission_policy,
                 os_sandbox=os_sandbox_profile,
                 env=spawn_env,
             )
@@ -1030,6 +1106,22 @@ def main(argv: list[str] | None = None) -> int:
         help="Inline mode: after the controller ACKs a permission (defer-to-user), "
              "max awake-seconds to wait for the user's decision before auto-declining "
              "(default 36000 = 10h). No effect in 'auto' mode.",
+    )
+    parser.add_argument(
+        "--permission-allow-tool-title-pattern",
+        action="append",
+        default=[],
+        metavar="REGEX",
+        help="Controller-discretion auto-allow shortcut (R26). Regex pattern (Python "
+             "re.search semantics) matched against the request_permission tool-call "
+             "title. When the title matches any provided pattern, the runner "
+             "auto-approves the request before falling through to the default "
+             "scope-aware policy. Repeatable: pass multiple --permission-allow-tool-"
+             "title-pattern flags to add patterns. Use to pre-authorize the worker's "
+             "in-scope tool uses (e.g., a chunk authorized to run "
+             "'./tests/run.sh' can pass '^./tests/run\\.sh$'). Does NOT bypass the "
+             "destructive-op fail-closed checks in the base policy when patterns "
+             "don't match — those still escalate to USER-CONFIRM.",
     )
     parser.add_argument(
         "--heartbeat-interval",

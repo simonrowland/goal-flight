@@ -22,8 +22,12 @@ the host's gstack install docs); the protocol invariant is that the gstack
 `/review` skill, not a hand-rolled prompt, is what runs against the chunk
 diff.
 
-Fix P0/P1/P2 findings before commit. P3 findings may be deferred with a note
-in `docs-private/RESUME-NOTES*.md` or the active goal-queue margin.
+Fix P0/P1/P2 findings before commit. **P3 findings: apply the safe/easy ones
+in the same review loop** (typos, missing punctuation, obvious doc cleanups,
+dead-code crumbs, minor naming fixes) — the goal is high-quality software, not
+minimum-strictness gating. Only the genuinely uncertain or out-of-scope P3s
+may be deferred with a note in `docs-private/RESUME-NOTES*.md` or the active
+goal-queue margin.
 
 When gstack is not installed locally, fall back to the bundled prompts:
 `prompts/gstack-claude-review.md` and `prompts/gstack-codex-challenge.md`.
