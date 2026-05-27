@@ -27,12 +27,11 @@ in `docs-private/RESUME-NOTES*.md` or the active goal-queue margin.
 
 When gstack is not installed locally, fall back to the bundled prompts:
 `prompts/gstack-claude-review.md` and `prompts/gstack-codex-challenge.md`.
-These reproduce gstack's framing for the chunk-level pre-commit gate; use the
-same dispatch path the host normally routes review-class work through (Agent
-tool for Claude, `codex exec` for codex, etc.). Do **not** hand-roll a custom
-"please review this diff" prompt invoked directly against a worker — that
-bypasses the canonical severity-tagging framing and is the R19 regression
-class.
+These reproduce gstack's framing for the chunk-level pre-commit gate;
+dispatch them via whichever review-class subagent path the host normally
+uses. Do **not** hand-roll a custom "please review this diff" prompt
+invoked directly against a worker — that bypasses the canonical severity-
+tagging framing and is the R19 regression class.
 
 ## Complementary — `./scripts/autoreview.sh`
 
