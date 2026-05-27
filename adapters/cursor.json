@@ -324,6 +324,21 @@
         "install_mode": "init_self_check",
         "commands": ["test -d ~/.gstack/repos/gstack/.agents/skills"],
         "paths": ["~/.gstack", "~/.cursor/skills/"]
+      },
+      {
+        "id": "autoreview",
+        "label": "autoreview chunk review",
+        "default": true,
+        "compatible_destination_ids": [
+          "cursor-desktop-controller",
+          "cursor-project-controller",
+          "cursor-agents-standard-controller",
+          "cursor-claude-link-controller",
+          "cursor-cli-worker"
+        ],
+        "install_mode": "init_self_check",
+        "commands": ["test -x scripts/autoreview.sh"],
+        "paths": ["scripts/autoreview.sh", "scripts/autoreview_claude_acp", "~/.cursor/skills/autoreview"]
       }
     ]
   },

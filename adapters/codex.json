@@ -293,6 +293,19 @@
         "install_mode": "init_self_check",
         "commands": ["test -d ~/.gstack/repos/gstack/.agents/skills"],
         "paths": ["~/.gstack", "~/.codex/skills/"]
+      },
+      {
+        "id": "autoreview",
+        "label": "autoreview chunk review",
+        "default": true,
+        "compatible_destination_ids": [
+          "codex-desktop-controller",
+          "codex-cli-controller",
+          "codex-cli-worker"
+        ],
+        "install_mode": "init_self_check",
+        "commands": ["test -x scripts/autoreview.sh"],
+        "paths": ["scripts/autoreview.sh", "scripts/autoreview_claude_acp", "~/.cursor/skills/autoreview"]
       }
     ]
   },

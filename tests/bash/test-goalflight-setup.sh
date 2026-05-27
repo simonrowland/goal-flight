@@ -23,6 +23,23 @@ printf '%s\n' "$list_out" | grep -q 'controller codex-desktop-controller' || fai
 printf '%s\n' "$list_out" | grep -q 'worker codex-cli-worker' || fail "codex cli worker not listed"
 printf '%s\n' "$list_out" | grep -q 'addon context-mode' || fail "context-mode add-on not listed"
 printf '%s\n' "$list_out" | grep -q 'addon gstack' || fail "gstack add-on not listed"
+printf '%s\n' "$list_out" | grep -q 'addon autoreview' || fail "autoreview add-on not listed"
+python3 - "$REPO_ROOT" <<'PY'
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+adapters = ["claude-code", "codex", "cursor", "grok", "opencode"]
+missing = []
+for name in adapters:
+    manifest = json.loads((root / "adapters" / f"{name}.json").read_text())
+    addons = manifest.get("setup", {}).get("addons", [])
+    if not any(addon.get("id") == "autoreview" for addon in addons):
+        missing.append(name)
+if missing:
+    raise SystemExit("missing autoreview addon: " + ", ".join(missing))
+PY
 
 cli_dry="$(run_setup --controllers codex-cli-controller --workers codex-cli-worker --addons context-mode)"
 printf '%s\n' "$cli_dry" | grep -q 'DESTINATIONS selected=codex-cli-controller,codex-cli-worker' || fail "cli destination selection missing"

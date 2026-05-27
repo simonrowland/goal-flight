@@ -122,6 +122,34 @@ def check_gstack() -> dict:
     return {"present": False}
 
 
+def check_autoreview(skill_root: Path) -> dict:
+    script_path = skill_root / "scripts/autoreview.sh"
+    helper_env = os.environ.get("AUTOREVIEW_HELPER")
+    helper = Path(helper_env).expanduser() if helper_env else Path.home() / ".cursor/skills/autoreview/scripts/autoreview"
+    script_ok = script_path.is_file() and os.access(script_path, os.X_OK)
+    helper_ok = helper.is_file() and os.access(helper, os.X_OK)
+    out = {
+        "present": script_ok,
+        "ok": script_ok and helper_ok,
+        "script_path": str(script_path),
+        "upstream_helper": str(helper) if helper_ok else None,
+        "claude_acp": str(skill_root / "scripts/autoreview_claude_acp"),
+    }
+    if script_ok and helper_ok:
+        out["version"] = "goal-flight wrapper + upstream autoreview"
+    else:
+        missing = []
+        if not script_ok:
+            missing.append("wrapper")
+        if not helper_ok:
+            missing.append("helper")
+        out["install_hint"] = (
+            "Install upstream autoreview (Cursor skill or AUTOREVIEW_HELPER) "
+            f"and ensure scripts/autoreview.sh is executable; missing: {', '.join(missing)}"
+        )
+    return out
+
+
 def app_exists(name: str, bundle_id: str | None = None) -> bool:
     direct = Path("/Applications") / f"{name}.app"
     if direct.exists():
@@ -759,6 +787,7 @@ def doctor(repo: Path, *, fleet: bool = False, fleet_dir: Path | None = None, fl
         "cursor_context_mode": check_cursor_context_mode(skill_root, repo),
         "opencode_context_mode": check_opencode_context_mode(skill_root, repo),
         "gstack": check_gstack(),
+        "autoreview": check_autoreview(skill_root),
         "cursor": {
             "desktop_present": cursor_desktop,
             "cli": version("cursor", "--version"),
@@ -926,6 +955,7 @@ def print_human(payload: dict) -> None:
             payload["opencode_context_mode"].get("project_path"),
         ),
         status_line(payload["gstack"].get("present"), "gstack", payload["gstack"].get("version")),
+        status_line(payload["autoreview"].get("present"), "autoreview", payload["autoreview"].get("version") or payload["autoreview"].get("install_hint")),
         status_line(payload["cursor"].get("desktop_present"), "Cursor Desktop", None),
         status_line(payload["cursor"]["agent"].get("present"), "cursor-agent ACP", payload["cursor"]["agent"].get("version")),
         status_line(payload["opencode"].get("present"), "opencode ACP", payload["opencode"].get("version")),
