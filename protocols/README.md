@@ -12,6 +12,7 @@ protocol files carry the detailed operating procedures.
 | `state-handoff.md` | compacting, resume notes, status recovery |
 | `user-status-cadence.md` | in-flight worker poll + user progress updates (≤15 min) |
 | `chunk-review.md` | pre-commit gstack `/review` (default; complementary parallel autoreview optional) before chunk land |
+| `dispatched-worker-recovery.md` | controller takeover when an ACP-dispatched worker terminal-blocks before commit |
 | `premises.md` | init/decompose needs premise distillation |
 | `self-delegation.md` | user explicitly asks for `/fork` or `/branch` |
 | `worktrees-parallel.md` | `execute --parallel` or merge orchestration |
