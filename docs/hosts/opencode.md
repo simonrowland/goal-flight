@@ -41,7 +41,7 @@ tail** (streaming `BLOCKED:` / `USER-NEED:` markers from a worker on another
 machine) is **beta** in 1.0.0:
 
 - Probe-only validation: `python3 scripts/goalflight_fleet_bash_tail_probe.py`
-  and `test/test_fleet_bash_tail_probe.py`
+  and `tests/python/test_fleet_bash_tail_probe.py`
 - Full remote dispatch parity with local bash-tail is not a release gate; use ACP
   workers for production remote dispatch
 

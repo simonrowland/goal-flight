@@ -30,8 +30,18 @@ LOCAL_PROBE_ARGV: dict[str, list[str]] = {
         "-lc",
         'test -s "${HOME}/.grok/auth.json" && echo logged_in',
     ],
-    "cursor": ["cursor-agent", "--version"],
+    "cursor": ["cursor-agent", "status"],
 }
+
+KEYCHAIN_LOCKED_RE = re.compile(r"keychain.*locked", re.I)
+CURSOR_AUTH_NEGATIVE_RE = re.compile(
+    r"not logged in|not authenticated|login required|please log in",
+    re.I,
+)
+CURSOR_AUTH_POSITIVE_RE = re.compile(
+    r"logged in as|login successful|✓ logged in",
+    re.I,
+)
 
 
 class DispatchAuthError(Exception):
@@ -101,7 +111,13 @@ def interpret_auth_probe(provider: str, exit_code: int, stdout: str, stderr: str
             return "green"
         return "red"
     if provider == "cursor":
-        return "green" if exit_code == 0 and stdout.strip() else "red"
+        if KEYCHAIN_LOCKED_RE.search(combined):
+            return "yellow"
+        if CURSOR_AUTH_NEGATIVE_RE.search(combined):
+            return "red"
+        if exit_code == 0 and CURSOR_AUTH_POSITIVE_RE.search(combined):
+            return "green"
+        return "red"
     return "green" if exit_code == 0 else "red"
 
 

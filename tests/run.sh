@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Discover and run two test suites:
-#   - tests/test-*.sh — bash tests (installers, codex overrides, fork-detect)
-#   - test/test_*.py — Python tests (ACP client + pool + runner + failure modes)
+#   - tests/bash/test-*.sh — bash tests (installers, codex overrides, fork-detect)
+#   - tests/python/test_*.py — Python tests (ACP client + pool + runner + failure modes)
 # One pass/fail per file. Exit code = number of failed tests.
 #
-# Skips test/dispatch_acp_chunk.py (live e2e against real codex-acp, non-hermetic).
+# Skips tests/python/dispatch_acp_chunk.py (live e2e against real codex-acp, non-hermetic).
 
 set -u
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -15,30 +15,30 @@ fail=0
 failed_tests=()
 ACP_PY="${GOALFLIGHT_ACP_PYTHON:-$HOME/.goal-flight/venvs/acp-0.10/bin/python}"
 
-# Bash tests (tests/test-*.sh)
-cd "$SCRIPT_DIR"
+# Bash tests (tests/bash/test-*.sh)
+cd "$SCRIPT_DIR/bash"
 for test in test-*.sh; do
   [ -f "$test" ] || continue
   if bash "$test" > /tmp/goal-flight-test-$$.out 2>&1; then
-    echo "PASS  tests/$test"
+    echo "PASS  tests/bash/$test"
     pass=$((pass + 1))
   else
-    echo "FAIL  tests/$test"
+    echo "FAIL  tests/bash/$test"
     cat /tmp/goal-flight-test-$$.out | sed 's/^/      /'
     fail=$((fail + 1))
-    failed_tests+=("tests/$test")
+    failed_tests+=("tests/bash/$test")
   fi
   rm -f /tmp/goal-flight-test-$$.out
 done
 
-# Python tests (test/test_*.py; skips dispatch_acp_chunk.py — requires live codex-acp)
-if command -v python3 >/dev/null 2>&1 && [ -d "$REPO_ROOT/test" ]; then
+# Python tests (tests/python/test_*.py; skips dispatch_acp_chunk.py — requires live codex-acp)
+if command -v python3 >/dev/null 2>&1 && [ -d "$REPO_ROOT/tests/python" ]; then
   cd "$REPO_ROOT"
-  for test in test/test_*.py; do
+  for test in tests/python/test_*.py; do
     [ -f "$test" ] || continue
     py="python3"
     case "$test" in
-      test/test_acp_*.py)
+      tests/python/test_acp_*.py)
         py="$ACP_PY"
         ;;
     esac

@@ -26,9 +26,9 @@ __pycache__/
 *.pyc
 
 # Manual live-test artifacts (not checked in).
-test/manual/.prompt-matrix-report.json
-test/manual/.prompt-matrix-run.log
-test/manual/.acp-hardening-report.json
-test/manual/.acp-hardening-run.log
+tests/manual/.prompt-matrix-report.json
+tests/manual/.prompt-matrix-run.log
+tests/manual/.acp-hardening-report.json
+tests/manual/.acp-hardening-run.log
 .goalflight-acp-*.status.json
 codedb.snapshot

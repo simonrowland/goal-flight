@@ -73,18 +73,18 @@ Run the full harness from the repo root:
 
 The harness discovers:
 
-- `tests/test-*.sh` — bash tests (installers, adapters, host helpers, guards)
-- `test/test_*.py` — Python tests (ACP client, pool, runner, procedural scripts)
+- `tests/bash/test-*.sh` — bash tests (installers, adapters, host helpers, guards)
+- `tests/python/test_*.py` — Python tests (ACP client, pool, runner, procedural scripts)
 
-`test/test_acp_*.py` uses `GOALFLIGHT_ACP_PYTHON` when set, otherwise
+`tests/python/test_acp_*.py` uses `GOALFLIGHT_ACP_PYTHON` when set, otherwise
 `~/.goal-flight/venvs/acp-0.10/bin/python`. If that venv is missing, those tests
 fail with an install hint.
 
 Run one test file:
 
 ```bash
-bash tests/test-agent-adapters.sh
-python3 test/test_goalflight_procedural.py
+bash tests/bash/test-agent-adapters.sh
+python3 tests/python/test_goalflight_procedural.py
 ```
 
 Exit code from `./tests/run.sh` equals the number of failed test files.
@@ -108,7 +108,7 @@ Exit code from `./tests/run.sh` equals the number of failed test files.
 Any edit to `adapters/*.json` or `adapters/agent-adapter.schema.json` must pass:
 
 ```bash
-bash tests/test-agent-adapters.sh
+bash tests/bash/test-agent-adapters.sh
 ```
 
 That script validates schema coverage, no-leak rules, and gate behavior. Update
@@ -141,7 +141,7 @@ metadata. Before opening a PR, check:
 - Agent instruction files that local coding tools load
 
 Refer generically to the **trigger audit** when documenting this policy. Run
-`bash tests/test-trigger-guard.sh` if you touch install paths, adapter names,
+`bash tests/bash/test-trigger-guard.sh` if you touch install paths, adapter names,
 or repo hygiene checks. Map installer `--agent=` aliases to neutral manifest
 filenames before reading or writing `adapters/*.json`.
 

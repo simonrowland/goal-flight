@@ -140,7 +140,7 @@ Hermetic CI skips live SSH. For operator verification:
 ```bash
 export GOALFLIGHT_LIVE_SSH=1
 export GOALFLIGHT_FLEET_NODE=localhost   # or your SSH alias
-./test/manual/test_fleet_live_smoke.sh
+./tests/manual/test_fleet_live_smoke.sh
 ```
 
 ## Failure triage

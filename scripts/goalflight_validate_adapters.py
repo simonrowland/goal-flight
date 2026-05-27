@@ -79,7 +79,6 @@ NO_LEAK_SKIP_PREFIXES = (
     "adapters/",
     "docs-private/",
     "scripts/",
-    "test/",
     "tests/",
 )
 

@@ -19,10 +19,26 @@ REMOTE_PATH_PREFIX = (
 REMOTE_HOME_BOOTSTRAP = 'HOME=${HOME:-$(eval echo ~${USER:-$(whoami)})}'
 
 
+def _quote_remote_argv_part(part: str) -> str:
+    """Quote one remote argv element; preserve remote tilde expansion via $HOME."""
+    if part == "~":
+        return '"${HOME}"'
+    if part.startswith("~/"):
+        suffix = part[2:]
+        escaped = (
+            suffix.replace("\\", "\\\\")
+            .replace('"', '\\"')
+            .replace("$", "\\$")
+            .replace("`", "\\`")
+        )
+        return f'"${{HOME}}/{escaped}"'
+    return shlex.quote(part)
+
+
 def wrap_remote_argv(remote_argv: list[str]) -> list[str]:
     """Run remote argv under zsh with fleet worker PATH (expands $HOME on the node)."""
     validate_remote_argv(remote_argv)
-    inner = " ".join(shlex.quote(part) for part in remote_argv)
+    inner = " ".join(_quote_remote_argv_part(part) for part in remote_argv)
     script = f"{REMOTE_HOME_BOOTSTRAP}; PATH={REMOTE_PATH_PREFIX}:$PATH; exec {inner}"
     return ["/bin/zsh", "-c", script]
 

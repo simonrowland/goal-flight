@@ -11,7 +11,7 @@ goal-flight is a multi-agent controller, which delegates coding /goal and parall
 
 **What the controller is for**: high-level management, not execution. The controller holds enough context about your project's goal, scenery (constraints, architecture, prior decisions, failure modes), and intent to exercise discretion and recommend the next move — then dispatches actual work to workers to run in an iterative code-review goal loop. This workflow allows lightly-supervised coding: you check in, ratify suggested moves, redirect when needed, and trust the controller to keep the project anchored across compactions and unattended hours. The dispatch / review / handoff machinery below is what frees the controller to do that job.
 
-[Features](#features) • [Quickstart](#quickstart) • [Architecture](#architecture) • [Commands](#commands)
+[Features](#features) • [Quickstart](#quickstart) • [Architecture](docs/architecture.md) • [Commands](#commands)
 
 ```bash
 # Claude Code (reference controller):
@@ -124,7 +124,7 @@ For remote workers over SSH, bootstrap a fleet store and use `goalflight_fleet.p
 dispatch / watch / reconcile. OpenCode, Cursor, Codex, and Claude ACP workers
 can run on registered nodes while the controller stays local. See
 [docs/fleet.md](docs/fleet.md) for the operator guide; live smoke:
-`GOALFLIGHT_LIVE_SSH=1 ./test/manual/test_fleet_live_smoke.sh`.
+`GOALFLIGHT_LIVE_SSH=1 ./tests/manual/test_fleet_live_smoke.sh`.
 
 Unified CLI: `bin/goalflight <domain> <resource> <verb>` (action router over
 `config/actions/`).

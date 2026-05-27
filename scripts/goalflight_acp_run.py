@@ -846,6 +846,7 @@ async def run(args: argparse.Namespace) -> dict:
             "markers": markers,
             "last_marker": {kind: values[-1] for kind, values in markers.items() if values} or None,
             "text_excerpt": result.text[-4000:],
+            "result_text": result.text if state == "complete" else None,
             "out_of_scope_writes": result.out_of_scope_writes,
             # Permission requests the controller router escalated to the user
             # (boundary crossings it would not auto-allow). state is "blocked"
