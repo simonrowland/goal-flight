@@ -151,6 +151,27 @@ def test_doctor_json_shape() -> None:
             "autoreview upstream helper resolves when ok",
             autoreview.get("upstream_helper") not in (None, ""),
         )
+    # Worker-reliability hardening (commit #8): three new doctor sections
+    # surface the activation contract + AGENTS.md tracking + RESUME-NOTES
+    # naming canonical patterns directly in doctor output.
+    assert_true("agents_md_state section", "agents_md_state" in payload)
+    ams = payload["agents_md_state"]
+    for key in ("present", "tracked", "gitignored", "has_goalflight_section", "ok"):
+        assert_true(f"agents_md_state.{key} present", key in ams)
+    assert_true("session_status section", "session_status" in payload)
+    ss = payload["session_status"]
+    assert_true("session_status.ok present", "ok" in ss)
+    if ss.get("ok"):
+        for key in ("active", "queue_file", "active_leases_in_project"):
+            assert_true(f"session_status.{key} present when ok", key in ss)
+    assert_true("resume_notes_pattern section", "resume_notes_pattern" in payload)
+    rnp = payload["resume_notes_pattern"]
+    for key in ("present", "count", "pattern_violations", "ok"):
+        assert_true(f"resume_notes_pattern.{key} present", key in rnp)
+    assert_true(
+        "resume_notes_pattern violations is a list",
+        isinstance(rnp.get("pattern_violations"), list),
+    )
 
 
 def test_doctor_target_project_readiness_split() -> None:

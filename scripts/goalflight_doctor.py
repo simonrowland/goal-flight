@@ -150,6 +150,128 @@ def check_autoreview(skill_root: Path) -> dict:
     return out
 
 
+def check_agents_md_state(project_root: Path) -> dict:
+    """Probe the AGENTS.md tracking state for a project.
+
+    Returns:
+      present:           AGENTS.md exists on disk
+      tracked:           git knows about it
+      gitignored:        a gitignore rule matches it (catastrophic — skill
+                         load order silently breaks across machines)
+      has_goalflight_section:  the "Goal Flight Routing" header is present
+                         (means goal-flight has been wired into this AGENTS.md)
+    """
+    agents = project_root / "AGENTS.md"
+    out: dict = {
+        "present": agents.is_file(),
+        "tracked": False,
+        "gitignored": False,
+        "has_goalflight_section": False,
+    }
+    if not (project_root / ".git").exists():
+        out["ok"] = out["present"]
+        return out
+    if out["present"]:
+        try:
+            out["has_goalflight_section"] = "## Goal Flight Routing" in agents.read_text(
+                encoding="utf-8", errors="ignore"
+            )
+        except OSError:
+            pass
+        tracked = run(["git", "ls-files", "--error-unmatch", "AGENTS.md"], cwd=project_root)
+        out["tracked"] = tracked.get("returncode") == 0
+        ignored = run(["git", "check-ignore", "-q", "AGENTS.md"], cwd=project_root)
+        out["gitignored"] = ignored.get("returncode") == 0
+    # ok=true when: present + tracked + not gitignored + has goal-flight section
+    out["ok"] = bool(
+        out["present"] and out["tracked"] and not out["gitignored"]
+        and out["has_goalflight_section"]
+    )
+    if out["gitignored"]:
+        out["install_hint"] = (
+            "AGENTS.md is gitignored. It is the canonical skill entry point, "
+            "not a vendor adapter — see AGENT-FILENAME-POLICY.md. Either remove "
+            "the matching .gitignore entry (or add `!AGENTS.md` negation) and "
+            "`git add -- AGENTS.md`, or place goal-flight routing notes in "
+            "`.agent-context/goal-flight.md` and adjust load order."
+        )
+    elif not out["present"]:
+        out["install_hint"] = (
+            "AGENTS.md missing. Run `/goal-flight init` to write the template "
+            "or `goalflight_session_status.py --text` is not reachable."
+        )
+    elif not out["has_goalflight_section"]:
+        out["install_hint"] = (
+            "AGENTS.md present but missing the `## Goal Flight Routing` "
+            "section + activation directive. Run `/goal-flight init` to append."
+        )
+    return out
+
+
+def check_session_status(skill_root: Path, project_root: Path) -> dict:
+    """Run the session-status helper and surface its verdict in the doctor
+    payload. The helper unions queue/leases/RESUME-NOTES signals into a
+    single `active` bool; doctor exposes that as the canonical "is
+    goal-flight active here?" answer.
+    """
+    helper = skill_root / "scripts/goalflight_session_status.py"
+    if not helper.exists():
+        return {"ok": False, "present": False, "install_hint": str(helper) + " missing"}
+    out = run(
+        ["python3", str(helper), "--project-root", str(project_root), "--json"],
+        timeout=10.0,
+    )
+    if out.get("returncode") != 0:
+        return {"ok": False, "present": True, "error": out.get("stderr") or out.get("stdout")}
+    try:
+        payload = json.loads(out.get("stdout") or "{}")
+    except json.JSONDecodeError as exc:
+        return {"ok": False, "present": True, "error": f"json decode: {exc}"}
+    return {
+        "ok": True,
+        "present": True,
+        "active": payload.get("active", False),
+        "queue_file": payload.get("queue_file"),
+        "queue_state": payload.get("queue_state"),
+        "queue_reason": payload.get("queue_reason"),
+        "active_leases_in_project": payload.get("active_leases_in_project", 0),
+        "newest_resume_notes": payload.get("newest_resume_notes"),
+    }
+
+
+def check_resume_notes_pattern(project_root: Path) -> dict:
+    """Probe `docs-private/RESUME-NOTES-*.md` for the canonical filename
+    pattern: RESUME-NOTES-<YYYY-MM-DD>[-rev<N>].md. Surfaces topic-prefixed
+    variants (e.g. RESUME-NOTES-generalize-2026-05-20.md) as WARN — those
+    break the find-newest-by-lexicographic-sort convention.
+    """
+    private = project_root / "docs-private"
+    if not private.is_dir():
+        return {"ok": True, "present": False, "count": 0, "pattern_violations": []}
+    import re
+
+    canonical = re.compile(r"^RESUME-NOTES-\d{4}-\d{2}-\d{2}(-rev\d+)?\.md$")
+    files = sorted(private.glob("RESUME-NOTES-*.md"))
+    violations: list[str] = []
+    for f in files:
+        if not canonical.match(f.name):
+            violations.append(f.name)
+    return {
+        "ok": not violations,
+        "present": bool(files),
+        "count": len(files),
+        "newest": str(files[-1].relative_to(project_root)) if files else None,
+        "pattern_violations": violations,
+        "install_hint": (
+            f"RESUME-NOTES files with non-canonical names: {violations}. "
+            "Canonical: RESUME-NOTES-<YYYY-MM-DD>[-rev<N>].md (no topic prefix; "
+            "topic goes inside the file). Historical exceptions may be left in "
+            "place; new files should follow the canonical form. See "
+            "protocols/state-handoff.md."
+        ) if violations else None,
+    }
+
+
 def app_exists(name: str, bundle_id: str | None = None) -> bool:
     direct = Path("/Applications") / f"{name}.app"
     if direct.exists():
@@ -788,6 +910,9 @@ def doctor(repo: Path, *, fleet: bool = False, fleet_dir: Path | None = None, fl
         "opencode_context_mode": check_opencode_context_mode(skill_root, repo),
         "gstack": check_gstack(),
         "autoreview": check_autoreview(skill_root),
+        "agents_md_state": check_agents_md_state(repo),
+        "session_status": check_session_status(skill_root, repo),
+        "resume_notes_pattern": check_resume_notes_pattern(repo),
         "cursor": {
             "desktop_present": cursor_desktop,
             "cli": version("cursor", "--version"),
