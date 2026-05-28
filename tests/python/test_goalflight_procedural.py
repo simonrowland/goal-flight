@@ -57,6 +57,43 @@ def test_capacity_acquire_release_cooldown() -> None:
         assert_true("status schema", status["schema"] == "goalflight.capacity.v1")
 
 
+def test_chunk_summary_empty_state_dir_json_shape() -> None:
+    script = ROOT / "scripts" / "goalflight_chunk_summary.py"
+    assert_true("chunk summary script exists", script.exists())
+    with tempfile.TemporaryDirectory() as td:
+        state_dir = Path(td)
+        payload = json.loads(
+            run(
+                [
+                    "python3",
+                    "scripts/goalflight_chunk_summary.py",
+                    "--slug",
+                    "missing-chunk",
+                    "--state-dir",
+                    str(state_dir),
+                    "--json",
+                ],
+                state_dir=state_dir,
+            ).stdout
+        )
+    assert_true("chunk summary slug", payload["slug"] == "missing-chunk")
+    assert_true("chunk summary state", payload["state"] == "missing")
+    assert_true("chunk summary dispatch id", payload["dispatch_id"] is None)
+    assert_true("chunk summary worker liveness", payload["worker_pid_alive"] is False)
+    for key in (
+        "slug",
+        "dispatch_id",
+        "state",
+        "worker_pid_alive",
+        "status_path",
+        "log_path",
+        "last_marker",
+        "mins_since_last_event",
+        "decision_hint",
+    ):
+        assert_true(f"chunk summary key {key}", key in payload)
+
+
 def test_capacity_prunes_review_terminal_states() -> None:
     old = "2000-01-01T00:00:00+00:00"
     data = {
@@ -333,15 +370,15 @@ def test_doctor_cli_target_project_skips_package_plugin() -> None:
 
 def test_instruction_split_contract() -> None:
     skill = (ROOT / "SKILL.md").read_text()
-    # 2026-05-28: budget raised 20KB → 25KB after the worker-reliability
+    # 2026-05-28: budget raised 20KB → 26KB after the worker-reliability
     # hardening additions (commit-guard pointer, session-status activation
     # contract, canonical post-compaction reload order, in-flight monitoring
     # worked commands, permission-pattern warning, stale-wrapper warning,
-    # dangerous-bypass context fence). Each was driven by the AUI surface
-    # audit + sweep B/C/D findings. Catches future feature-add bloat.
+    # dangerous-bypass context fence) plus file-backed context-protection
+    # dispatch rules. Catches future feature-add bloat.
     assert_true(
-        f"SKILL under 25KB (got {len(skill.encode())}B)",
-        len(skill.encode()) <= 25_000,
+        f"SKILL under 26KB (got {len(skill.encode())}B)",
+        len(skill.encode()) <= 26_000,
     )
     for protocol in [
         "session-preflight.md",
@@ -1192,6 +1229,7 @@ def test_dispatched_worker_recovery_protocol_present() -> None:
 def main() -> None:
     tests = [
         test_capacity_acquire_release_cooldown,
+        test_chunk_summary_empty_state_dir_json_shape,
         test_capacity_prunes_review_terminal_states,
         test_ledger_record_finish_status,
         test_doctor_json_shape,

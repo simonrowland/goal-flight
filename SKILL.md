@@ -95,6 +95,7 @@ host-specific print-mode shortcuts.
 | status preflight | Session Pre-Flight | `protocols/session-preflight.md`, `scripts/goalflight_status.py`, `scripts/goalflight_doctor.py` |
 | **in-flight dispatch monitoring** | Session Pre-Flight | `scripts/goalflight_status.py --json`, `scripts/goalflight_watch.py` (ACP), `scripts/watch-dispatch-tail.sh` (bash-tail) |
 | **active leases / what's in flight** | Capacity and rate limits | `scripts/goalflight_capacity.py status` |
+| **per-chunk status snapshot** | Session Pre-Flight | `python3 <skill-root>/scripts/goalflight_chunk_summary.py --slug <slug> --json` |
 | autonomous throughput | Autonomous throughput | `commands/execute.md`, `commands/goal.md` |
 | **chat as requirements** | Chat as requirements | `commands/goal.md`, `protocols/user-status-cadence.md` |
 | user-status-cadence | User progress reporting | `protocols/user-status-cadence.md` |
@@ -202,6 +203,18 @@ P0/P1/P2 before commit.
 - Verification first. Every executor prompt starts by checking repo state,
   target files, and assumptions before editing.
 - Background anything expected to run longer than 10 seconds.
+- Subagent / Agent / Task / Explore dispatches whose returns may exceed
+  ~5KB MUST instruct the worker to write findings to
+  `docs-private/research/<date>-<slug>/findings.md` and return only
+  `READY: <path>` plus a one-paragraph TL;DR + severity-tagged finding
+  count. The controller reads the TL;DR; opens the file only when TL;DR
+  signals a real action. Returning a 9KB report inline defeats the
+  dispatch — the bytes land back in controller context anyway.
+- Read >5KB without an expected Edit follow-up within 2 turns → use
+  `Agent` (Explore for read-only, general-purpose for tool-using
+  investigation) with a defined prompt instead. Recon-Reads pull the
+  full body into controller context; an Agent dispatch returns a
+  conclusion at ~10x compression.
 - No `tail -f` in conversation. Use status files instead:
   - Aggregate snapshot: `python3 <skill-root>/scripts/goalflight_status.py --json`
   - ACP dispatch: `python3 <skill-root>/scripts/goalflight_watch.py --pid <pid> --tail <tailfile> --status-json <path>`

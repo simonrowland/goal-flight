@@ -117,6 +117,14 @@ block on raw logs.
 Read status JSON. Do not inspect raw logs unless the status script reports that
 the log is corrupt or missing.
 
+For Agent / Task / Explore dispatches that may produce > 5KB of findings, the
+dispatch prompt MUST instruct the subagent to write findings to a file under
+`docs-private/research/<date>-<slug>/` and return ONLY a one-paragraph TL;DR +
+the file path + severity-tagged finding count. Do not consume the subagent's
+full investigation report in conversation — that defeats the dispatch and
+silently doubles the context cost (worker read + controller read of same
+content).
+
 8. Verification (chunk review — not milestone review):
 
 Read `protocols/chunk-review.md`.
@@ -130,7 +138,13 @@ Read `protocols/chunk-review.md`.
 - fix P0/P1/P2 from review before commit
 - commit when the active goal-flight workflow completes a chunk (default: one
   commit per chunk) or when the user explicitly requests a commit. Use
-  explicit pathspecs: `git commit -m '<scope>' -- <file1> <file2> ...`.
+  explicit pathspecs: `git commit -m '<scope>' -- <file1> <file2> ...`. For
+  commit messages longer than 3 lines, write the message to
+  `docs-private/commit-msgs/<chunk-slug>.txt` first and use
+  `git commit -F docs-private/commit-msgs/<chunk-slug>.txt -- <files>`. Inline
+  `git commit -m "$(cat <<'EOF' ... EOF)"` heredocs put the full prose into
+  the controller's conversation context for the rest of the session; the
+  file-backed version is read once by git and never re-enters context.
   Never bare `git commit` while other workers may have staged WIP — the
   commit guard (`scripts/goalflight_commit_guard.py`) refuses to prevent
   bundling. The guard's error message names the lease IDs in flight, the

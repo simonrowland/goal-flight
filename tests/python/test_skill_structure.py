@@ -329,7 +329,7 @@ KNOWN_MAX_SECTION_LINE_GAPS = {
     "user-status-cadence-15min": {
         "fix_chunk": "chunk-X budget realignment after AUI hardening",
         "max_section_lines": 20,
-        "actual_content_lines": 22,
+        "actual_content_lines": 34,
         "section_heading": "## Hard Invariants",
     },
     "reviewer-misses-regression-tests": {
