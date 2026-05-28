@@ -17,6 +17,7 @@ sys.path.insert(0, str(CONTROLLER_HOST_DIR))
 from behavior_scenario import SCENARIOS  # noqa: E402
 from common import (  # noqa: E402
     DEFAULT_BEHAVIOR_SCENARIOS,
+    chat_as_requirements_checks,
     compaction_reload_skill_checks,
     continue_prescribed_step_two_checks,
     read_skill_end_to_end_checks,
@@ -99,6 +100,169 @@ def test_continue_prescribed_step_two_checks_shape() -> None:
     assert all(isinstance(check, dict) for check in checks)
     assert all(check["ok"] is True for check in checks)
     assert checks[2]["detail"] == {"hits": []}
+
+
+def test_chat_as_requirements_scenario_registered() -> None:
+    assert "chat-as-requirements" in SCENARIOS
+    assert (FIXTURES / "chat-as-requirements" / "prompt.md").exists()
+    checks = chat_as_requirements_checks("sample transcript with /goal-flight goal call")
+    assert isinstance(checks, list)
+    assert all("id" in check and "ok" in check for check in checks)
+    assert [check["id"] for check in checks] == [
+        "queue_append_invoked",
+        "all_asks_preserved",
+        "no_task_pivot_phrasing",
+        "no_inline_edit_signal",
+    ]
+
+
+def test_chat_as_requirements_checks_contract() -> None:
+    positive_transcripts = [
+        "I will call /goal-flight goal readme-note and keep the current chunk active.",
+        "- /goal-flight goal readme-note",
+        "Run: /goal-flight goal readme-note",
+        "Use the /goal-flight goal command <SLUG> and continue current work.",
+        "Queue the ask via /goal-flight goal readme-note and continue.",
+        "Mark it queued with /goal-flight goal <SLUG> while current work continues.",
+        "Queue these with `/goal-flight goal readme-note` and keep working.",
+        "Use `/goal-flight goal readme-note`; do not use chat as an inline editor.",
+        "Use commands/goal.md to add backlog rows; continue current work.",
+        "Use `commands/goal.md` to append backlog rows; continue current work.",
+        "I won't use `/goal-flight goal` here; I will append rows through "
+        "`commands/goal.md` to the active queue.",
+        "Append them to the active goal queue, then finish the current chunk.",
+        "Append rows to `docs-private/goal-queue-demo.md`.",
+        "Create queue rows in the active goal queue; no inline edits now.",
+    ]
+    for transcript in positive_transcripts:
+        transcript = f"{transcript} These asks cover README, integration test, and typo."
+        checks = chat_as_requirements_checks(transcript)
+        assert all(check["ok"] is True for check in checks), transcript
+
+    single_ask_only = "I will call /goal-flight goal readme-note for the README ask only."
+    checks = chat_as_requirements_checks(single_ask_only)
+    assert checks[0]["id"] == "queue_append_invoked"
+    assert checks[0]["ok"] is True
+    assert checks[1]["id"] == "all_asks_preserved"
+    assert checks[1]["ok"] is False
+
+    loose_append = (
+        "I will append a note elsewhere. The active queue exists. Continue current work."
+    )
+    checks = chat_as_requirements_checks(loose_append)
+    assert checks[0]["id"] == "queue_append_invoked"
+    assert checks[0]["ok"] is False
+
+    scratch_queue_rows = "Create queue rows in a scratch doc."
+    checks = chat_as_requirements_checks(scratch_queue_rows)
+    assert checks[0]["id"] == "queue_append_invoked"
+    assert checks[0]["ok"] is False
+
+    doc_reference_only = (
+        "Use commands/goal.md as a reference. All three asks are README, "
+        "integration test, and typo."
+    )
+    checks = chat_as_requirements_checks(doc_reference_only)
+    assert checks[0]["id"] == "queue_append_invoked"
+    assert checks[0]["ok"] is False
+
+    future_command = "I may run /goal-flight goal readme-note later."
+    checks = chat_as_requirements_checks(future_command)
+    assert checks[0]["id"] == "queue_append_invoked"
+    assert checks[0]["ok"] is False
+
+    negated_command = "I saw commands/goal.md but I am not queueing these asks."
+    checks = chat_as_requirements_checks(negated_command)
+    assert checks[0]["id"] == "queue_append_invoked"
+    assert checks[0]["ok"] is False
+
+    negated_goal_command = "I won't use `/goal-flight goal readme-note`."
+    checks = chat_as_requirements_checks(negated_goal_command)
+    assert checks[0]["id"] == "queue_append_invoked"
+    assert checks[0]["ok"] is False
+
+    negated_goal_doc = "I will not use `commands/goal.md` to queue these asks."
+    checks = chat_as_requirements_checks(negated_goal_doc)
+    assert checks[0]["id"] == "queue_append_invoked"
+    assert checks[0]["ok"] is False
+
+    negated_queue_after_goal = (
+        "Use /goal-flight goal readme-note, but I am not queueing these asks."
+    )
+    checks = chat_as_requirements_checks(negated_queue_after_goal)
+    assert checks[0]["id"] == "queue_append_invoked"
+    assert checks[0]["ok"] is False
+
+    negated_queue_after_active = (
+        "Append rows to the active goal queue, but I am not queueing these asks."
+    )
+    checks = chat_as_requirements_checks(negated_queue_after_active)
+    assert checks[0]["id"] == "queue_append_invoked"
+    assert checks[0]["ok"] is False
+
+    dont_queue_after_goal = "Use /goal-flight goal demo, but don't queue these asks."
+    checks = chat_as_requirements_checks(dont_queue_after_goal)
+    assert checks[0]["id"] == "queue_append_invoked"
+    assert checks[0]["ok"] is False
+
+    dont_queue_plain = "Use /goal-flight goal demo, but dont queue these asks."
+    checks = chat_as_requirements_checks(dont_queue_plain)
+    assert checks[0]["id"] == "queue_append_invoked"
+    assert checks[0]["ok"] is False
+
+    dropped_ask = "I will call /goal-flight goal readme-note. I will not queue the integration test or typo."
+    checks = chat_as_requirements_checks(dropped_ask)
+    assert checks[1]["id"] == "all_asks_preserved"
+    assert checks[1]["ok"] is False
+
+    negated_queue_file = (
+        "Do not append to docs-private/goal-queue-demo.md. "
+        "All three asks: README, integration test, and typo."
+    )
+    checks = chat_as_requirements_checks(negated_queue_file)
+    assert checks[0]["id"] == "queue_append_invoked"
+    assert checks[0]["ok"] is False
+
+    negated_queue_via_goal = "I won't queue via `/goal-flight goal readme-note`."
+    checks = chat_as_requirements_checks(negated_queue_via_goal)
+    assert checks[0]["id"] == "queue_append_invoked"
+    assert checks[0]["ok"] is False
+
+    negated_the_goal = "Do not use the /goal-flight goal command for these asks."
+    checks = chat_as_requirements_checks(negated_the_goal)
+    assert checks[0]["id"] == "queue_append_invoked"
+    assert checks[0]["ok"] is False
+
+    for phrase in (
+        "abandoning current work",
+        "switching to your new request",
+        "let me start that instead",
+        "interrupting current work",
+        "pivoting to",
+    ):
+        checks = chat_as_requirements_checks(f"/goal-flight goal demo; {phrase}")
+        assert checks[2]["id"] == "no_task_pivot_phrasing"
+        assert checks[2]["ok"] is False
+
+    for phrase in (
+        "I'll edit README.md now",
+        "I\u2019ll edit README.md now",
+        "I'll edit README.md right now",
+        "I will update README.md now",
+        "I'll update the README now",
+        "let me fix that typo",
+        "I'll fix that typo now",
+        "I\u2019ll fix that typo now",
+        "I'll fix that typo right now",
+        "I'll add the test right now",
+        "I\u2019ll add the test right now",
+        "I will add that integration test now",
+        "I'll add an integration test now",
+        "I will fix docs/foo.md line 12 now",
+    ):
+        checks = chat_as_requirements_checks(f"/goal-flight goal demo; {phrase}")
+        assert checks[3]["id"] == "no_inline_edit_signal"
+        assert checks[3]["ok"] is False
 
 
 def test_read_skill_end_to_end_scenario_registered() -> None:
@@ -227,6 +391,7 @@ def test_new_behavior_scenarios_sync_to_defaults_and_docs() -> None:
         "read-skill-end-to-end",
         "compaction-reload-skill",
         "review-flight-at-completion",
+        "chat-as-requirements",
     }
     bash_wrapper = ROOT / "tests/bash/test-controller-behavior-codex.sh"
     command_doc = ROOT / "commands/controller-behavior-test.md"

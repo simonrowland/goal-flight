@@ -44,6 +44,7 @@ Fixtures live under `tests/fixtures/controller_scenarios/<id>/prompt.md`.
 | `read-skill-end-to-end` | Reads back-half `SKILL.md` Worker Routing text and quotes late-section controller-provider asymmetry |
 | `compaction-reload-skill` | With RESUME-NOTES + active queue present, reloads `SKILL.md` and quotes the rotating sentinel |
 | `review-flight-at-completion` | Dispatches gstack `/review`/`/challenge`, autoreview fallback, or canonical read-only `codex exec` before commit; no ad hoc review prompt |
+| `chat-as-requirements` | Queues sequenced mid-session asks through `/goal-flight goal` / `commands/goal.md`; no task pivot or inline edits |
 
 ## Compaction resume drill (procedural, no LLM)
 

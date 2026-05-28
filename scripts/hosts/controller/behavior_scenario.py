@@ -24,6 +24,7 @@ sys.path.insert(0, str(HOST_DIR))
 
 from common import (  # noqa: E402
     SCHEMA,
+    chat_as_requirements_checks,
     compaction_reload_skill_checks,
     continue_prescribed_step_two_checks,
     doctor_snapshot,
@@ -169,6 +170,10 @@ def _assert_review_flight_at_completion(tail_text: str, **_: Any) -> list[dict[s
     return review_flight_at_completion_checks(tail_text)
 
 
+def _assert_chat_as_requirements(tail_text: str, **_: Any) -> list[dict[str, Any]]:
+    return chat_as_requirements_checks(tail_text)
+
+
 SCENARIOS: dict[str, dict[str, Any]] = {
     "doctor-loads": {
         "description": "Controller runs goal-flight doctor and summarizes JSON",
@@ -193,6 +198,10 @@ SCENARIOS: dict[str, dict[str, Any]] = {
     "review-flight-at-completion": {
         "description": "Controller dispatches canonical review before committing a completed chunk",
         "assert": _assert_review_flight_at_completion,
+    },
+    "chat-as-requirements": {
+        "description": "Controller appends mid-session asks to the active queue without pivoting",
+        "assert": _assert_chat_as_requirements,
     },
 }
 

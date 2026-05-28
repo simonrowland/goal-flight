@@ -455,6 +455,140 @@ def review_flight_at_completion_checks(tail_text: str) -> list[dict[str, Any]]:
     ]
 
 
+def chat_as_requirements_checks(tail_text: str) -> list[dict[str, Any]]:
+    """Assert controller-chat-is-requirements-not-inline-editor behaviour."""
+    lower = tail_text.lower().replace("\u2019", "'").replace("\u2018", "'")
+    queue_text = lower.replace("`", "")
+    goal_command_patterns = (
+        r"(?:^\s*[-*$>]*\s*|[\n]\s*[-*$>]*\s*)"
+        r"/goal-flight\s+goal\s+[a-z0-9_<][\w.<>-]*\b",
+        r"\b(?:call|calling|run|running|invoke|invoking|use|using)"
+        r"(?:\s+the)?(?:\s*:)?\s+/goal-flight\s+goal"
+        r"(?:\s+command)?\s+[a-z0-9_<][\w.<>-]*\b",
+        r"\b(?:queued\s+)?(?:via|with|using)\s+"
+        r"/goal-flight\s+goal\s+[a-z0-9_<][\w.<>-]*\b",
+    )
+    goal_command_blockers = (
+        r"\b(?:may|might|could)\s+(?:call|run|invoke|use)\s+/goal-flight\s+goal\b",
+        r"\b(?:not|never|won't|wont|can't|cant|don't|dont)\s+"
+        r"(?:call|run|invoke|use)(?:\s+the)?\s+/goal-flight\s+goal\b",
+        r"\b(?:not|never|won't|wont|can't|cant|don't|dont)\s+"
+        r"(?:queue|route|record|add)(?:\s+\w+){0,4}\s+"
+        r"(?:via|with|using)\s+/goal-flight\s+goal\b",
+    )
+    goal_doc_patterns = (
+        r"\b(?:append|appending|"
+        r"queue|record|write|add)(?:\s+\w+){0,6}\s+"
+        r"(?:through\s+|via\s+|with\s+|using\s+)?commands/goal\.md\b",
+        r"\bcommands/goal\.md\b(?:\s+\w+){0,6}\s+"
+        r"(?:append|appending|queue|record|write|add)\b",
+    )
+    goal_doc_blockers = (
+        r"\b(?:not|never|won't|wont|can't|cant|don't|dont)\s+"
+        r"(?:use|append|appending|queue|record|write|add)(?:\s+\w+){0,6}\s+"
+        r"(?:through\s+|via\s+|with\s+|using\s+)?commands/goal\.md\b",
+        r"\b(?:not|never|won't|wont|can't|cant|don't|dont)\s+"
+        r"(?:queue|queuing|queueing|append|appending)(?:\s+\w+){0,6}\s+"
+        r"(?:asks|these|them|rows)\b",
+    )
+    active_queue_patterns = (
+        r"\bappend(?:ing)?(?:\s+\w+){0,5}\s+to\s+(?:the\s+)?(?:active\s+)?(?:goal\s+)?queue\b",
+        r"\bappend(?:ing)?(?:\s+\w+){0,5}\s+to\s+(?:the\s+)?active\s+queue\s+file\b",
+        r"\bappend(?:ing)?(?:\s+\w+){0,5}\s+to\s+docs-private/goal-queue-[\w.-]+\.md\b",
+        r"\b(?:add|create|write)(?:\s+\w+){0,5}\s+queue\s+rows"
+        r"(?:\s+\w+){0,5}\s+(?:active|goal)\s+queue\b",
+    )
+    active_queue_blockers = (
+        r"\b(?:not|never|won't|wont|can't|cant|don't|dont)\s+"
+        r"(?:queue|queuing|queueing|append|appending)(?:\s+\w+){0,6}\s+"
+        r"(?:to\s+(?:the\s+)?(?:active\s+)?(?:goal\s+)?queue)\b",
+        r"\b(?:not|never|won't|wont|can't|cant|don't|dont)\s+"
+        r"(?:append|appending)(?:\s+\w+){0,6}\s+"
+        r"to\s+docs-private/goal-queue-[\w.-]+\.md\b",
+    )
+    global_queue_blockers = (
+        r"\b(?:not|never|won't|wont|can't|cant|don't|dont)\s+"
+        r"(?:queue|queuing|queueing|append|appending)(?:\s+\w+){0,6}\s+"
+        r"(?:asks|these|them|rows)\b",
+    )
+
+    def route_ok(patterns: tuple[str, ...], blockers: tuple[str, ...]) -> bool:
+        return any(re.search(pattern, queue_text) for pattern in patterns) and not any(
+            re.search(pattern, queue_text) for pattern in blockers
+        )
+
+    queue_append = (
+        route_ok(goal_command_patterns, goal_command_blockers)
+        or route_ok(goal_doc_patterns, goal_doc_blockers)
+        or route_ok(active_queue_patterns, active_queue_blockers)
+    )
+    queue_append = queue_append and not any(
+        re.search(pattern, queue_text) for pattern in global_queue_blockers
+    )
+    all_asks_preserved = any(
+        phrase in lower
+        for phrase in (
+            "all three",
+            "three asks",
+            "these asks",
+            "the asks",
+            "each ask",
+            "all of them",
+            "three queue rows",
+            "sequenced asks",
+        )
+    ) or (
+        "readme" in lower
+        and ("integration test" in lower or "test for" in lower)
+        and ("typo" in lower or "docs/foo" in lower)
+    )
+    dropped_ask_patterns = (
+        r"\b(?:skip|drop|not\s+queue|don't\s+queue|dont\s+queue|"
+        r"won't\s+queue|wont\s+queue|never\s+queue)(?:\s+\w+){0,5}\s+"
+        r"(?:readme|integration\s+test|typo|docs/foo)\b",
+        r"\b(?:readme|integration\s+test|typo|docs/foo)(?:\s+\w+){0,5}\s+"
+        r"(?:skip|drop|not\s+queued|not\s+queue|dropped)\b",
+    )
+    all_asks_preserved = all_asks_preserved and not any(
+        re.search(pattern, lower) for pattern in dropped_ask_patterns
+    )
+    pivot_phrases = [
+        "abandoning current work",
+        "switching to your new request",
+        "let me start that instead",
+        "interrupting current work",
+        "pivoting to",
+    ]
+    inline_edit_patterns = (
+        r"\b(?:i\s+will|i'll|let me)\s+(?:edit|update)\s+"
+        r"(?:the\s+)?readme(?:\.md)?(?:\s+right)?\s+now\b",
+        r"\b(?:i\s+will|i'll|let me)\s+add(?:\s+an|\s+a|\s+that|\s+the)?\s+"
+        r"(?:integration\s+)?test(?:\s+right)?\s+now\b",
+        r"\b(?:i\s+will|i'll|let me)\s+fix(?:\s+that|\s+the)?\s+"
+        r"(?:typo|typo\s+in\s+docs/foo\.md|docs/foo\.md)"
+        r"(?:\s+line\s+12)?(?:\s+right)?\s+now\b",
+        r"\blet me fix that typo\b",
+    )
+    pivot_hits = [phrase for phrase in pivot_phrases if phrase in lower]
+    inline_hits = [
+        pattern for pattern in inline_edit_patterns if re.search(pattern, lower)
+    ]
+    return [
+        {"id": "queue_append_invoked", "ok": queue_append},
+        {"id": "all_asks_preserved", "ok": all_asks_preserved},
+        {
+            "id": "no_task_pivot_phrasing",
+            "ok": not pivot_hits,
+            "detail": {"hits": pivot_hits},
+        },
+        {
+            "id": "no_inline_edit_signal",
+            "ok": not inline_hits,
+            "detail": {"hits": inline_hits},
+        },
+    ]
+
+
 DEFAULT_BEHAVIOR_SCENARIOS: tuple[str, ...] = (
     "doctor-loads",
     "resume-after-compaction",
@@ -462,4 +596,5 @@ DEFAULT_BEHAVIOR_SCENARIOS: tuple[str, ...] = (
     "read-skill-end-to-end",
     "compaction-reload-skill",
     "review-flight-at-completion",
+    "chat-as-requirements",
 )
