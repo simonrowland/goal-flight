@@ -45,6 +45,9 @@ Fixtures live under `tests/fixtures/controller_scenarios/<id>/prompt.md`.
 | `compaction-reload-skill` | With RESUME-NOTES + active queue present, reloads `SKILL.md` and quotes the rotating sentinel |
 | `review-flight-at-completion` | Dispatches gstack `/review`/`/challenge`, autoreview fallback, or canonical read-only `codex exec` before commit; no ad hoc review prompt |
 | `chat-as-requirements` | Queues sequenced mid-session asks through `/goal-flight goal` / `commands/goal.md`; no task pivot or inline edits |
+| `draft-goal-office-hours` | Routes fuzzy draft-goal prompts to gstack `/office-hours` or `commands/ask-questions.md` before implementation |
+| `vague-goal-premise-backlog` | Records unclear premises in `docs-private/premises-*.md`, `commands/premises.md`, or an office-hours backlog; no blocking clarification question |
+| `context-load-order` | Shows `AGENTS.md` -> `SKILL.md` -> `protocols/chunk-review.md` load order before answering the review-path question |
 
 ## Compaction resume drill (procedural, no LLM)
 
@@ -66,5 +69,4 @@ bash tests/bash/test-compaction-resume-drill.sh
 Fixture handoff when no local `docs-private/RESUME-NOTES*.md`:
 `tests/fixtures/compaction_handoff/RESUME-NOTES.md`
 
-Add scenarios in Wave 2+: `draft-goal-office-hours`, `vague-goal-premise-backlog`,
-`context-load-order`, `delegation-evidence`.
+Add scenarios in Wave 2+: `delegation-evidence`.

@@ -19,9 +19,12 @@ from common import (  # noqa: E402
     DEFAULT_BEHAVIOR_SCENARIOS,
     chat_as_requirements_checks,
     compaction_reload_skill_checks,
+    context_load_order_checks,
     continue_prescribed_step_two_checks,
+    draft_goal_office_hours_checks,
     read_skill_end_to_end_checks,
     review_flight_at_completion_checks,
+    vague_goal_premise_backlog_checks,
 )
 
 
@@ -386,12 +389,130 @@ def test_review_flight_at_completion_allows_negated_custom_phrase() -> None:
     assert all(check["ok"] is True for check in checks)
 
 
+def test_draft_goal_office_hours_scenario_registered() -> None:
+    assert "draft-goal-office-hours" in SCENARIOS
+    assert callable(SCENARIOS["draft-goal-office-hours"]["assert"])
+    prompt = FIXTURES / "draft-goal-office-hours" / "prompt.md"
+    assert prompt.exists()
+    text = prompt.read_text(encoding="utf-8")
+    assert "help me build something cool" in text
+    assert "{{PROJECT_ROOT}}" in text
+
+    checks = draft_goal_office_hours_checks(
+        "DISPATCH: gstack /office-hours\n"
+        "The request is too broad for implementation.\n"
+        "COMPLETE: true"
+    )
+    assert isinstance(checks, list)
+    assert [check["id"] for check in checks] == [
+        "office_hours_dispatch_present",
+        "no_implementation_before_office_hours",
+        "no_implementation_work_started",
+    ]
+    assert all("id" in check and "ok" in check for check in checks)
+    assert all(check["ok"] is True for check in checks)
+
+    rejected = draft_goal_office_hours_checks(
+        "I will apply_patch and then think about /office-hours."
+    )
+    by_id = {check["id"]: check for check in rejected}
+    assert by_id["no_implementation_before_office_hours"]["ok"] is False
+
+    rejected_after_dispatch = draft_goal_office_hours_checks(
+        "DISPATCH: gstack /office-hours\nThen I will apply_patch the prototype."
+    )
+    by_id = {check["id"]: check for check in rejected_after_dispatch}
+    assert by_id["no_implementation_work_started"]["ok"] is False
+
+    negated_edit = draft_goal_office_hours_checks(
+        "DISPATCH: gstack /office-hours\nI will not edit repository files."
+    )
+    assert all(check["ok"] is True for check in negated_edit)
+
+
+def test_vague_goal_premise_backlog_scenario_registered() -> None:
+    assert "vague-goal-premise-backlog" in SCENARIOS
+    assert callable(SCENARIOS["vague-goal-premise-backlog"]["assert"])
+    prompt = FIXTURES / "vague-goal-premise-backlog" / "prompt.md"
+    assert prompt.exists()
+    text = prompt.read_text(encoding="utf-8")
+    assert "refactor the auth flow" in text
+    assert "{{PROJECT_ROOT}}" in text
+
+    checks = vague_goal_premise_backlog_checks(
+        "BACKLOG: docs-private/premises-auth-flow.md\n"
+        "Record the unclear auth-flow premise as a backlog row.\n"
+        "COMPLETE: true"
+    )
+    assert isinstance(checks, list)
+    assert [check["id"] for check in checks] == [
+        "premise_backlog_recorded",
+        "no_blocking_question",
+    ]
+    assert all("id" in check and "ok" in check for check in checks)
+    assert all(check["ok"] is True for check in checks)
+
+    rejected = vague_goal_premise_backlog_checks(
+        "BACKLOG: docs-private/premises-auth-flow.md\nCould you clarify the premise?"
+    )
+    by_id = {check["id"]: check for check in rejected}
+    assert by_id["no_blocking_question"]["ok"] is False
+
+
+def test_context_load_order_scenario_registered() -> None:
+    assert "context-load-order" in SCENARIOS
+    assert callable(SCENARIOS["context-load-order"]["assert"])
+    prompt = FIXTURES / "context-load-order" / "prompt.md"
+    assert prompt.exists()
+    text = prompt.read_text(encoding="utf-8")
+    assert "canonical review path" in text
+    assert "{{PROJECT_ROOT}}" in text
+
+    checks = context_load_order_checks(
+        "LOAD_ORDER: AGENTS.md -> SKILL.md -> protocols/chunk-review.md\n"
+        "Canonical review path: gstack /review before commit.\n"
+        "COMPLETE: true"
+    )
+    assert isinstance(checks, list)
+    assert [check["id"] for check in checks] == [
+        "agents_before_skill",
+        "skill_before_protocol",
+        "canonical_protocol_present",
+        "canonical_review_path_present",
+    ]
+    assert all("id" in check and "ok" in check for check in checks)
+    assert all(check["ok"] is True for check in checks)
+
+    rejected = context_load_order_checks(
+        "LOAD_ORDER: SKILL.md -> AGENTS.md -> protocols/chunk-review.md"
+    )
+    by_id = {check["id"]: check for check in rejected}
+    assert by_id["agents_before_skill"]["ok"] is False
+
+    missing_review_path = context_load_order_checks(
+        "LOAD_ORDER: AGENTS.md -> SKILL.md -> protocols/chunk-review.md\n"
+        "Canonical review path: run a private checker."
+    )
+    by_id = {check["id"]: check for check in missing_review_path}
+    assert by_id["canonical_review_path_present"]["ok"] is False
+
+    plain_review = context_load_order_checks(
+        "LOAD_ORDER: AGENTS.md -> SKILL.md -> protocols/chunk-review.md\n"
+        "Canonical review path: /review the chunk before commit."
+    )
+    by_id = {check["id"]: check for check in plain_review}
+    assert by_id["canonical_review_path_present"]["ok"] is True
+
+
 def test_new_behavior_scenarios_sync_to_defaults_and_docs() -> None:
     required = {
         "read-skill-end-to-end",
         "compaction-reload-skill",
         "review-flight-at-completion",
         "chat-as-requirements",
+        "draft-goal-office-hours",
+        "vague-goal-premise-backlog",
+        "context-load-order",
     }
     bash_wrapper = ROOT / "tests/bash/test-controller-behavior-codex.sh"
     command_doc = ROOT / "commands/controller-behavior-test.md"

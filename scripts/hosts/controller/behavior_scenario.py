@@ -26,12 +26,15 @@ from common import (  # noqa: E402
     SCHEMA,
     chat_as_requirements_checks,
     compaction_reload_skill_checks,
+    context_load_order_checks,
     continue_prescribed_step_two_checks,
+    draft_goal_office_hours_checks,
     doctor_snapshot,
     harness_result,
     monotonic_elapsed,
     read_skill_end_to_end_checks,
     review_flight_at_completion_checks,
+    vague_goal_premise_backlog_checks,
 )
 import probe_matrix  # noqa: E402
 
@@ -174,6 +177,18 @@ def _assert_chat_as_requirements(tail_text: str, **_: Any) -> list[dict[str, Any
     return chat_as_requirements_checks(tail_text)
 
 
+def _assert_draft_goal_office_hours(tail_text: str, **_: Any) -> list[dict[str, Any]]:
+    return draft_goal_office_hours_checks(tail_text)
+
+
+def _assert_vague_goal_premise_backlog(tail_text: str, **_: Any) -> list[dict[str, Any]]:
+    return vague_goal_premise_backlog_checks(tail_text)
+
+
+def _assert_context_load_order(tail_text: str, **_: Any) -> list[dict[str, Any]]:
+    return context_load_order_checks(tail_text)
+
+
 SCENARIOS: dict[str, dict[str, Any]] = {
     "doctor-loads": {
         "description": "Controller runs goal-flight doctor and summarizes JSON",
@@ -202,6 +217,18 @@ SCENARIOS: dict[str, dict[str, Any]] = {
     "chat-as-requirements": {
         "description": "Controller appends mid-session asks to the active queue without pivoting",
         "assert": _assert_chat_as_requirements,
+    },
+    "draft-goal-office-hours": {
+        "description": "Controller routes fuzzy draft goals to office-hours or ask-questions before implementation",
+        "assert": _assert_draft_goal_office_hours,
+    },
+    "vague-goal-premise-backlog": {
+        "description": "Controller records vague premises in a premise backlog instead of blocking on clarification",
+        "assert": _assert_vague_goal_premise_backlog,
+    },
+    "context-load-order": {
+        "description": "Controller reads AGENTS.md, SKILL.md, then the relevant protocol in order",
+        "assert": _assert_context_load_order,
     },
 }
 

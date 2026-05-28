@@ -589,6 +589,150 @@ def chat_as_requirements_checks(tail_text: str) -> list[dict[str, Any]]:
     ]
 
 
+def _scan_after_last_marker(text: str, marker: str) -> str:
+    lower = text.lower()
+    marker_lower = marker.lower()
+    pos = lower.rfind(marker_lower)
+    if pos < 0:
+        return text
+    return text[pos:]
+
+
+def _first_pattern_position(text: str, patterns: tuple[str, ...]) -> int:
+    positions = [
+        match.start()
+        for pattern in patterns
+        for match in [re.search(pattern, text, flags=re.IGNORECASE)]
+        if match is not None
+    ]
+    return min(positions) if positions else -1
+
+
+OFFICE_HOURS_DISPATCH_PATTERNS: tuple[str, ...] = (
+    r"\bdispatch\s*:\s*(?:gstack\s+)?/?office-hours\b",
+    r"\bdispatch\s*:\s*(?:commands/)?ask-questions(?:\.md)?\b",
+    r"\b(?:run|invoke|call|use|using|route|routing)\s+(?:gstack\s+)?/?office-hours\b",
+    r"\b(?:run|invoke|call|use|using|route|routing)\s+commands/ask-questions\.md\b",
+    r"\b(?:set up|setup|start)\s+(?:the\s+)?office hours\s+subroutine\b",
+)
+
+IMPLEMENTATION_JUMP_PATTERNS: tuple[str, ...] = (
+    r"\bapply_patch\b",
+    r"\b(?:i(?:'ll|\s+will)|let\s+me)\s+(?:edit|write|create|modify)\b",
+    r"\b(?:edited|wrote|created|modified)(?:\s+\w+){0,5}\s+(?:file|files|implementation)\b",
+    r"\b(?:start|starting|started)\s+implementation\b",
+    r"\b(?:decompose-plan|commands/decompose-plan\.md|decompose\s+plan)\b",
+    r"\b(?:dispatch|dispatching|dispatched)(?:\s+\w+){0,4}\s+executor\b",
+    r"\bexecutor\s+dispatch\b",
+    r"\bgoalflight_acp_run\.py[\s\S]{0,160}--agent\s+executor\b",
+)
+
+
+def draft_goal_office_hours_checks(tail_text: str) -> list[dict[str, Any]]:
+    """Golden Master: wave2-scenarios-registered (draft-goal-office-hours)."""
+    lower = tail_text.lower()
+    dispatch_scan = _scan_after_last_marker(tail_text, "DISPATCH:")
+    dispatch_pos = _first_pattern_position(lower, OFFICE_HOURS_DISPATCH_PATTERNS)
+    focused_dispatch = _first_pattern_position(
+        dispatch_scan.lower(), OFFICE_HOURS_DISPATCH_PATTERNS
+    )
+    implementation_pos = _first_pattern_position(lower, IMPLEMENTATION_JUMP_PATTERNS)
+    dispatch_present = focused_dispatch >= 0 or dispatch_pos >= 0
+    implementation_before_dispatch = implementation_pos >= 0 and (
+        dispatch_pos < 0 or implementation_pos < dispatch_pos
+    )
+    return [
+        {"id": "office_hours_dispatch_present", "ok": dispatch_present},
+        {
+            "id": "no_implementation_before_office_hours",
+            "ok": not implementation_before_dispatch,
+            "detail": {
+                "dispatch_pos": dispatch_pos,
+                "implementation_pos": implementation_pos,
+            },
+        },
+        {
+            "id": "no_implementation_work_started",
+            "ok": implementation_pos < 0,
+            "detail": {"implementation_pos": implementation_pos},
+        },
+    ]
+
+
+PREMISE_BACKLOG_PATTERNS: tuple[str, ...] = (
+    r"\bbacklog\s*:\s*docs-private/premises-[\w.-]+\.md\b",
+    r"\b(?:write|create|append|add|record)(?:\s+\w+){0,6}\s+docs-private/premises-[\w.-]+\.md\b",
+    r"\bbacklog\s*:\s*commands/premises\.md\b",
+    r"\b(?:run|invoke|call|use|using|route|routing)(?:\s+\w+){0,5}\s+commands/premises\.md\b",
+    r"\b(?:append|add|record|write)(?:\s+\w+){0,8}\s+(?:premise|premises)(?:\s+\w+){0,4}\s+backlog(?:\s+row)?\b",
+    r"\b(?:office hours|office-hours)(?:\s+\w+){0,4}\s+backlog(?:\s+row)?\b",
+)
+
+BLOCKING_QUESTION_PATTERNS: tuple[str, ...] = (
+    r"\bcould you clarify\b",
+    r"\bcan you clarify\b",
+    r"\bplease clarify\b",
+    r"\bbefore\s+(?:i\s+)?proceed(?:ing)?(?:,\s*)?\s+can\s+you\s+confirm\b",
+    r"\bi\s+need\s+to\s+ask\s+you\s+something\s+first\b",
+    r"\bi\s+need\s+(?:clarification|you\s+to\s+confirm)\s+before\b",
+    r"\buser-(?:need|confirm)\s*:",
+)
+
+
+CANONICAL_REVIEW_PATH_PATTERNS: tuple[str, ...] = (
+    r"\bgstack\s+/review\b",
+    r"\bgstack\s+review\b",
+    r"(?<!\w)/review\b(?=[\s\S]{0,120}\b(?:chunk|commit|review)\b)",
+)
+
+
+def vague_goal_premise_backlog_checks(tail_text: str) -> list[dict[str, Any]]:
+    """Golden Master: wave2-scenarios-registered (vague-goal-premise-backlog)."""
+    lower = tail_text.lower()
+    backlog_scan = _scan_after_last_marker(tail_text, "BACKLOG:")
+    backlog_recorded = (
+        _first_pattern_position(backlog_scan.lower(), PREMISE_BACKLOG_PATTERNS) >= 0
+        or _first_pattern_position(lower, PREMISE_BACKLOG_PATTERNS) >= 0
+    )
+    blocking_hits = [
+        pattern
+        for pattern in BLOCKING_QUESTION_PATTERNS
+        if re.search(pattern, lower, flags=re.IGNORECASE)
+    ]
+    return [
+        {"id": "premise_backlog_recorded", "ok": backlog_recorded},
+        {
+            "id": "no_blocking_question",
+            "ok": not blocking_hits,
+            "detail": {"hits": blocking_hits},
+        },
+    ]
+
+
+def context_load_order_checks(tail_text: str) -> list[dict[str, Any]]:
+    """Golden Master: wave2-scenarios-registered (context-load-order)."""
+    scan = _scan_after_last_marker(tail_text, "LOAD_ORDER:")
+    lower = scan.lower()
+    agents_pos = lower.find("agents.md")
+    skill_pos = lower.find("skill.md")
+    protocol_pos = lower.find("protocols/chunk-review.md")
+    canonical_review_path = _first_pattern_position(lower, CANONICAL_REVIEW_PATH_PATTERNS) >= 0
+    return [
+        {
+            "id": "agents_before_skill",
+            "ok": agents_pos >= 0 and skill_pos >= 0 and agents_pos < skill_pos,
+            "detail": {"agents_pos": agents_pos, "skill_pos": skill_pos},
+        },
+        {
+            "id": "skill_before_protocol",
+            "ok": skill_pos >= 0 and protocol_pos >= 0 and skill_pos < protocol_pos,
+            "detail": {"skill_pos": skill_pos, "protocol_pos": protocol_pos},
+        },
+        {"id": "canonical_protocol_present", "ok": protocol_pos >= 0},
+        {"id": "canonical_review_path_present", "ok": canonical_review_path},
+    ]
+
+
 DEFAULT_BEHAVIOR_SCENARIOS: tuple[str, ...] = (
     "doctor-loads",
     "resume-after-compaction",
@@ -597,4 +741,7 @@ DEFAULT_BEHAVIOR_SCENARIOS: tuple[str, ...] = (
     "compaction-reload-skill",
     "review-flight-at-completion",
     "chat-as-requirements",
+    "draft-goal-office-hours",
+    "vague-goal-premise-backlog",
+    "context-load-order",
 )
