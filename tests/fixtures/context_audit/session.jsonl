@@ -1,0 +1,4 @@
+{"type":"assistant","sessionId":"fixture-session","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"commands/resume.md"}}]}}
+{"type":"assistant","sessionId":"fixture-session","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"printf audit"}}]}}
+{"type":"assistant","sessionId":"fixture-session","message":{"content":[{"type":"tool_use","name":"Agent","input":{"prompt":"Inspect fixture and return READY: tests/fixtures/context_audit/report.md"}}]}}
+{"type":"assistant","sessionId":"fixture-session","message":{"content":[{"type":"tool_use","name":"Edit","input":{"file_path":"commands/resume.md","old_string":"x","new_string":"y"}}]}}
