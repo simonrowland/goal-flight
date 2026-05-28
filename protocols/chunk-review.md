@@ -25,7 +25,7 @@ Canonical invocation (worker-internal or controller-side, same shape):
 ```bash
 codex exec --sandbox read-only --dangerously-bypass-approvals-and-sandbox \
   -c 'model_reasoning_effort="xhigh"' \
-  -c 'features.web_search="cached"' \
+  --enable web_search_cached \
   "$REVIEW_PROMPT" \
   < /dev/null \
   > docs-private/reviews/<date>-<slug>/codex-review.final.md \
@@ -39,11 +39,13 @@ observable symptom is 0 bytes of stdout for hours with near-zero CPU. Every
 bash-tail review invocation MUST redirect stdin from `/dev/null` (or pipe the
 prompt into stdin instead of passing it positionally).
 
-**`features.web_search` over `--enable web_search_cached`.** The
-`--enable web_search_cached` flag is deprecated as of codex v0.131 (it still
-runs but emits a deprecation warning into stderr). Use the `-c` config-key
-form `features.web_search="cached"` instead; that's the supported v0.131+
-shape.
+**`--enable web_search_cached` note.** As of codex v0.131 stderr emits a
+deprecation warning about a `[features].web_search_cached` config-toml key
+(not the CLI flag) — web search is now enabled by default. The CLI flag
+`--enable web_search_cached` itself still works and is the supported way to
+trust hook execution for this invocation. Do NOT replace it with
+`-c features.web_search="cached"` — that is a different (string-vs-boolean)
+key shape and codex rejects it as a config type error.
 
 Parse the captured stdout (`codex-review.final.md`) for severity-tagged
 findings (P0/P1/P2/P3) and apply per the chunk-review policy below.
