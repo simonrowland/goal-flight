@@ -61,10 +61,13 @@ def _git_repo_root() -> Path:
     return Path(out.stdout.strip())
 
 
-def _capacity_status(repo_root: Path) -> dict:
+def _capacity_status(repo_root: Path) -> dict | None:
+    """Return capacity status JSON or None on failure. None signals
+    "status unavailable" — caller decides fail-open vs fail-closed.
+    """
     capacity = SCRIPT_DIR / "goalflight_capacity.py"
     if not capacity.exists():
-        return {}
+        return None
     try:
         out = subprocess.run(
             ["python3", str(capacity), "status", "--json"],
@@ -74,14 +77,20 @@ def _capacity_status(repo_root: Path) -> dict:
             timeout=5,
         )
         if out.returncode != 0:
-            return {}
+            return None
         return json.loads(out.stdout or "{}")
     except (subprocess.SubprocessError, json.JSONDecodeError, OSError):
-        return {}
+        return None
 
 
-def _active_same_root_leases(repo_root: Path) -> list[dict]:
+def _active_same_root_leases(repo_root: Path) -> tuple[list[dict] | None, str | None]:
+    """Return (leases, error) — leases is None when capacity status is
+    unavailable, signaling the caller should fail-closed (or fail-open
+    if the operator opted in).
+    """
     data = _capacity_status(repo_root)
+    if data is None:
+        return None, "capacity status unavailable"
     # `goalflight_capacity.py status --json` returns `{"active": [...]}` —
     # already filtered to state=active. Keep a defensive state check anyway.
     active = data.get("active") or []
@@ -98,50 +107,39 @@ def _active_same_root_leases(repo_root: Path) -> list[dict]:
                 matched.append(lease)
         except OSError:
             continue
-    return matched
+    return matched, None
 
 
 def _commit_is_partial() -> bool:
-    """Best-effort detection of whether the in-flight `git commit` was
-    invoked with explicit pathspecs.
+    """Detect whether the in-flight `git commit` was invoked with explicit
+    pathspecs (partial commit), so the guard knows to let it through.
 
-    git sets GIT_INDEX_FILE in some hook scenarios but not reliably for
-    pre-commit. We use the presence of `GIT_PARTIAL_COMMIT` if available
-    (set internally for `git commit -- <pathspec>`), and fall back to
-    checking whether the working-tree differs from index for any file
-    that's staged (the partial-commit indicator most hooks rely on).
+    Canonical signal (per git internals): when `git commit -- <pathspec>`
+    runs, git creates a temporary index file at `.git/next-index-<pid>`
+    and exports `GIT_INDEX_FILE` pointing at it to the pre-commit hook.
+    Bare `git commit` does NOT set this variable (the hook reads the main
+    .git/index). This is the strongest signal available from inside a
+    pre-commit hook — used by sweep A P1 / D1 reviews to replace the
+    heuristic that falsely refused safe pathspec commits.
+
+    Fallbacks (in priority order):
+      1. GIT_INDEX_FILE basename starts with "next-index-" → partial.
+      2. GIT_PARTIAL_COMMIT env var set (some git versions) → partial.
+      3. Otherwise: NOT partial. Conservative — guard applies.
+
+    The previous overlap-heuristic (stage ∩ working-tree-diff) was both
+    false-positive-prone (overlap can exist for legit reasons) AND
+    false-negative-prone (`git commit -- file` leaves no overlap when
+    file2 has identical staged+working-tree state). Replaced entirely.
     """
     if os.environ.get("GIT_PARTIAL_COMMIT"):
         return True
-    # When the user does `git commit -- <pathspec>`, git constructs the
-    # commit from the working tree of the named paths (auto-staging them
-    # from working tree), and leaves other staged paths alone. The pre-
-    # commit hook fires AFTER that staging happens for the partial commit.
-    # We can't directly observe the user's argv from a pre-commit hook,
-    # but the canonical detection is: any staged file whose working-tree
-    # state differs from the staged version indicates the user's pre-
-    # existing staging is still there (i.e., the commit IS partial).
-    try:
-        out = subprocess.run(
-            ["git", "diff", "--cached", "--name-only"],
-            capture_output=True, text=True, check=True,
-        )
-        staged = [p for p in out.stdout.splitlines() if p]
-        wt = subprocess.run(
-            ["git", "diff", "--name-only"],
-            capture_output=True, text=True, check=True,
-        )
-        unstaged = {p for p in wt.stdout.splitlines() if p}
-    except subprocess.SubprocessError:
-        return False
-    # If the user did `git commit -- <pathspecs>`, the unstaged set will
-    # include files that were staged but not in the pathspec list. That
-    # signature is "some staged paths but the working tree still has
-    # un-staged changes to those same files" — a strong heuristic the
-    # commit is partial. Pure conservative behavior on uncertainty: treat
-    # as NOT partial (= apply the guard).
-    overlap = set(staged) & unstaged
-    return bool(overlap)
+    git_index_file = os.environ.get("GIT_INDEX_FILE", "")
+    if git_index_file:
+        base = os.path.basename(git_index_file)
+        if base.startswith("next-index-"):
+            return True
+    return False
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -155,18 +153,63 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     repo_root = _git_repo_root()
-    leases = _active_same_root_leases(repo_root)
+    leases, status_err = _active_same_root_leases(repo_root)
+
+    # Sweep A P2: fail-closed when capacity status is unavailable, unless
+    # the operator explicitly opts in via GOALFLIGHT_COMMIT_GUARD_FAIL_OPEN=1.
+    # Silent fail-open would let collisions through whenever the capacity
+    # plumbing is broken — that's the same failure mode the guard exists
+    # to prevent.
+    if leases is None:
+        if os.environ.get("GOALFLIGHT_COMMIT_GUARD_FAIL_OPEN") == "1":
+            if args.json:
+                print(json.dumps({"ok": True, "fail_open": True, "error": status_err}))
+            return 0
+        msg = (
+            f"goal-flight commit guard: REFUSED ({status_err}).\n\n"
+            "Cannot verify worker leases — failing closed to prevent "
+            "potential WIP bundling. To proceed anyway:\n"
+            "  - Fix the capacity status path (run "
+            "    `python3 scripts/goalflight_capacity.py status --json` "
+            "    to diagnose), OR\n"
+            "  - Set `GOALFLIGHT_COMMIT_GUARD_FAIL_OPEN=1` to opt into "
+            "    fail-open (use only if you know capacity is intentionally "
+            "    not configured for this project).\n"
+        )
+        if args.json:
+            print(json.dumps({"ok": False, "fail_closed": True, "error": status_err, "message": msg}))
+        else:
+            sys.stderr.write(msg)
+        return 2
 
     if not leases:
         if args.json:
             print(json.dumps({"ok": True, "leases": []}))
         return 0
 
+    # Sweep A P2: env override accepts only specific dispatch IDs.
+    # `all` is reserved for explicit one-shot CLI flag use; setting
+    # GOALFLIGHT_COMMIT_GUARD_OVERRIDE=all globally would disable the
+    # guard for every future commit (too easy to set + forget).
     override_env = os.environ.get("GOALFLIGHT_COMMIT_GUARD_OVERRIDE", "")
     override_flag = args.override_active_leases
-    override_raw = ",".join(p for p in (override_env, override_flag) if p)
-    override_ids = {x.strip() for x in override_raw.split(",") if x.strip()}
-    if "all" in override_ids:
+    env_ids = {x.strip() for x in override_env.split(",") if x.strip()}
+    flag_ids = {x.strip() for x in override_flag.split(",") if x.strip()}
+    if "all" in env_ids:
+        msg = (
+            "goal-flight commit guard: REFUSED.\n\n"
+            "GOALFLIGHT_COMMIT_GUARD_OVERRIDE=all is not allowed via env.\n"
+            "Use the CLI flag explicitly per-invocation:\n"
+            "  --override-active-leases all\n"
+            "Or list specific dispatch IDs in the env var.\n"
+        )
+        if args.json:
+            print(json.dumps({"ok": False, "leases": leases, "message": msg}))
+        else:
+            sys.stderr.write(msg)
+        return 2
+    override_ids = env_ids | flag_ids
+    if "all" in flag_ids:
         if args.json:
             print(json.dumps({"ok": True, "override": "all", "leases": leases}))
         return 0

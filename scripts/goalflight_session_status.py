@@ -66,31 +66,60 @@ def _session_file(project_root: Path) -> Path:
 
 
 def ensure_session(project_root: Path, *, pid: int | None = None) -> dict:
-    """Read or generate the per-terminal session id file.
+    """Read or generate the per-terminal session id record.
 
-    Returns dict with id/pid/started_at/hostname. If the file exists with
-    a live pid, the existing record wins. If the recorded pid is dead, a
-    fresh record is written.
+    Per-terminal scope: the session record is keyed by `(project_root, pid)`.
+    The file lives at `project_root/docs-private/.goal-flight-current-session.json`
+    but the persisted shape is a MAP of `pid -> record`, so two terminals in
+    the same project_root each have their own slot. Within a single PID the
+    record persists across compactions; across PIDs they are independent.
+
+    Returns dict with id/pid/started_at/hostname for the CURRENT PID. If the
+    file already has a record for this PID (e.g., earlier command in the
+    same terminal), returns it. Otherwise creates a fresh record.
+
+    Stale per-PID slots whose PID is dead are pruned on each write.
     """
     pid = pid or os.getpid()
     path = _session_file(project_root)
     path.parent.mkdir(parents=True, exist_ok=True)
-    existing = None
+    data: dict[str, dict] = {}
     if path.exists():
         try:
-            existing = json.loads(path.read_text())
+            raw = json.loads(path.read_text())
         except (json.JSONDecodeError, OSError):
-            existing = None
-    if existing and isinstance(existing, dict) and _pid_alive(existing.get("pid")):
-        return existing
-    record = {
-        "id": str(uuid.uuid4()),
-        "pid": pid,
-        "started_at": _now_iso(),
-        "hostname": socket.gethostname(),
-    }
-    path.write_text(json.dumps(record, indent=2) + "\n")
-    return record
+            raw = None
+        # Back-compat: previous shape was a single record without a pid map.
+        # If we find that, migrate it under its own pid key.
+        if isinstance(raw, dict):
+            if "id" in raw and "pid" in raw and not all(
+                isinstance(v, dict) for v in raw.values()
+            ):
+                data = {str(raw.get("pid")): raw}
+            else:
+                # Map-shape: keys are pid strings, values are records.
+                data = {str(k): v for k, v in raw.items() if isinstance(v, dict)}
+    key = str(pid)
+    if key in data:
+        # Existing record for this PID — return it as-is. Pruning of
+        # dead-pid slots from OTHER terminals is a maintenance concern
+        # handled by --force-release-stale, not the ensure_session path
+        # (which is hot — runs on every CLI invocation in a goal-flight
+        # terminal).
+        result = data[key]
+    else:
+        result = {
+            "id": str(uuid.uuid4()),
+            "pid": pid,
+            "started_at": _now_iso(),
+            "hostname": socket.gethostname(),
+        }
+        data[key] = result
+    # Atomic write via temp file rename.
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n")
+    tmp.replace(path)
+    return result
 
 
 def _pid_alive(pid: object) -> bool:
@@ -324,7 +353,8 @@ def aggregate_status(project_root: Path, *, ttl_days: int = 7) -> dict:
     leases_for_project = _active_leases_for(project_root)
     notes = find_resume_notes(project_root)
     newest_notes = newest(notes)
-    active = queue_active or bool(leases_for_project)
+    notes_active, notes_reason = _resume_notes_active(newest_notes, ttl_days=ttl_days)
+    active = queue_active or bool(leases_for_project) or notes_active
     return {
         "active": active,
         "queue_file": str(newest_queue.relative_to(project_root)) if newest_queue else None,
@@ -336,8 +366,53 @@ def aggregate_status(project_root: Path, *, ttl_days: int = 7) -> dict:
         "active_leases_in_project": len(leases_for_project),
         "active_lease_dispatch_ids": [l.get("dispatch_id") for l in leases_for_project],
         "newest_resume_notes": str(newest_notes.relative_to(project_root)) if newest_notes else None,
+        "resume_notes_active": notes_active,
+        "resume_notes_reason": notes_reason,
         "ttl_days": ttl_days,
     }
+
+
+def _resume_notes_active(notes_path: Path | None, *, ttl_days: int = 7) -> tuple[bool, str]:
+    """Read the newest RESUME-NOTES file and infer activation state from its
+    front matter (if YAML) or its TL;DR section. Tolerant by design: if the
+    file is unparseable or has no signal, returns (False, "no signal").
+
+    Signals (any one is enough for active=True):
+      - YAML frontmatter `state: active` (canonical)
+      - First H1 / TL;DR section contains "**Status:** active" or
+        "**Active**" or "in flight" line
+      - File mtime within TTL AND title matches a date stamp (heuristic)
+
+    Reads at most 2KB to avoid pulling in entire long notes files.
+    """
+    if notes_path is None or not notes_path.exists():
+        return False, "no resume notes"
+    try:
+        head = notes_path.read_text(encoding="utf-8", errors="ignore")[:2048]
+    except OSError:
+        return False, "resume notes unreadable"
+    # Try YAML frontmatter first.
+    if head.startswith("---\n"):
+        front, _ = _parse_frontmatter(head)
+        state = str(front.get("state", "")).lower()
+        if state == "active":
+            return True, "frontmatter state: active"
+        if state in ("complete", "done", "completed", "abandoned"):
+            return False, f"frontmatter state: {state}"
+    head_lower = head.lower()
+    # Look for explicit active/complete signals in TL;DR-style prose.
+    if "**status:** active" in head_lower or "status: active" in head_lower:
+        return True, "TL;DR Status: active"
+    if "in flight" in head_lower or "in-flight" in head_lower:
+        return True, "TL;DR mentions in-flight"
+    if (
+        "**status:** complete" in head_lower
+        or "all chunks done" in head_lower
+        or "push pending" in head_lower
+        or "all chunks committed" in head_lower
+    ):
+        return False, "TL;DR complete-state signal"
+    return False, "no signal"
 
 
 def _active_leases_for(project_root: Path) -> list[dict]:
@@ -394,93 +469,190 @@ def to_text(status: dict) -> str:
 # --- claim / release --------------------------------------------------------
 
 
+def _validate_queue_in_project(project_root: Path, queue: Path) -> Path | None:
+    """Resolve queue path and ensure it lives under project_root/docs-private/.
+    Returns the resolved path on success, None if it escapes scope.
+    Review A P3: refuse out-of-scope --queue arguments.
+    """
+    target = queue.resolve()
+    expected_root = (project_root / "docs-private").resolve()
+    try:
+        target.relative_to(expected_root)
+    except ValueError:
+        return None
+    return target
+
+
+def _file_lock(path: Path):
+    """Per-file lock using fcntl.flock. Context-manager that opens
+    `path.lock` and acquires an exclusive lock; releases on exit.
+    Two concurrent claims on the same queue now serialize.
+    """
+    import contextlib
+    import fcntl
+
+    @contextlib.contextmanager
+    def _ctx():
+        lock_path = path.with_suffix(path.suffix + ".lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
+    return _ctx()
+
+
 def claim(project_root: Path, queue: Path, *, force: bool = False) -> tuple[bool, str]:
-    """Stamp current session into queue frontmatter. Refuses on live owner."""
+    """Stamp current session into queue frontmatter. Refuses on live owner.
+
+    Uses an exclusive file lock to serialize concurrent claims. Reads + mutates
+    + writes the queue inside the lock so two terminals' claims can't both
+    win. Verifies the queue path is under project_root/docs-private (A P3).
+    """
     if not queue.exists():
         return False, f"queue not found: {queue}"
-    text = queue.read_text()
-    front, body = _parse_frontmatter(text)
-    if not front:
-        return False, f"queue {queue.name} has no frontmatter to stamp into"
-    session = ensure_session(project_root)
-    current = front.get("current_session")
-    if isinstance(current, dict) and current.get("id") and current.get("id") != session["id"]:
-        owner_alive = _pid_alive(current.get("pid"))
-        if owner_alive and not force:
-            return False, (
-                f"queue already claimed by session {current.get('id')} "
-                f"(pid {current.get('pid')} alive); pass --force to take over"
-            )
-    history = list(front.get("session_history") or [])
-    history.append({
-        "id": session["id"],
-        "pid": session["pid"],
-        "started_at": session["started_at"],
-        "claimed_at": _now_iso(),
-        "ended_at": None,
-        "ended_reason": None,
-    })
-    front["current_session"] = {
-        "id": session["id"],
-        "pid": session["pid"],
-        "started_at": session["started_at"],
-        "hostname": session["hostname"],
-    }
-    front["session_history"] = history
-    front["last-touched"] = _now_iso()
-    queue.write_text(_dump_frontmatter(front) + body)
+    resolved = _validate_queue_in_project(project_root, queue)
+    if resolved is None:
+        return False, (
+            f"queue {queue} is outside {project_root}/docs-private/; refusing"
+        )
+    queue = resolved
+    with _file_lock(queue):
+        text = queue.read_text()
+        front, body = _parse_frontmatter(text)
+        if not front:
+            return False, f"queue {queue.name} has no frontmatter to stamp into"
+        session = ensure_session(project_root)
+        current = front.get("current_session")
+        if isinstance(current, dict) and current.get("id") and current.get("id") != session["id"]:
+            owner_alive = _pid_alive(current.get("pid"))
+            if owner_alive and not force:
+                return False, (
+                    f"queue already claimed by session {current.get('id')} "
+                    f"(pid {current.get('pid')} alive); pass --force to take over"
+                )
+        history = list(front.get("session_history") or [])
+        history.append({
+            "id": session["id"],
+            "pid": session["pid"],
+            "started_at": session["started_at"],
+            "claimed_at": _now_iso(),
+            "ended_at": None,
+            "ended_reason": None,
+        })
+        front["current_session"] = {
+            "id": session["id"],
+            "pid": session["pid"],
+            "started_at": session["started_at"],
+            "hostname": session["hostname"],
+        }
+        front["session_history"] = history
+        front["last-touched"] = _now_iso()
+        _atomic_write(queue, _dump_frontmatter(front) + body)
     return True, f"claimed by session {session['id']}"
+
+
+def _atomic_write(path: Path, content: str) -> None:
+    """Write atomically via temp + rename — avoids torn writes if interrupted."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(content)
+    tmp.replace(path)
 
 
 def release(project_root: Path, queue: Path | None, *, reason: str = "user-exit") -> tuple[bool, str]:
     """Mark session ended in queue frontmatter (if --queue) and clear the
-    per-terminal session file."""
+    per-terminal session file.
+
+    Compare-after-read: only releases when current_session.id matches THIS
+    terminal's session id; refuses if a different session owns it. Use
+    --force-release-stale or claim --force to take over instead.
+    """
     msgs: list[str] = []
     if queue is not None and queue.exists():
-        text = queue.read_text()
-        front, body = _parse_frontmatter(text)
-        if front:
-            history = list(front.get("session_history") or [])
-            current = front.get("current_session")
-            if isinstance(current, dict) and current.get("id"):
-                session_id = current.get("id")
-                for entry in reversed(history):
-                    if isinstance(entry, dict) and entry.get("id") == session_id and entry.get("ended_at") is None:
-                        entry["ended_at"] = _now_iso()
-                        entry["ended_reason"] = reason
-                        break
-            front["current_session"] = None
-            front["session_history"] = history
-            front["last-touched"] = _now_iso()
-            queue.write_text(_dump_frontmatter(front) + body)
-            msgs.append(f"released queue {queue.name}")
+        resolved = _validate_queue_in_project(project_root, queue)
+        if resolved is None:
+            return False, f"queue {queue} is outside {project_root}/docs-private/; refusing"
+        queue = resolved
+        my_session = ensure_session(project_root)
+        with _file_lock(queue):
+            text = queue.read_text()
+            front, body = _parse_frontmatter(text)
+            if front:
+                current = front.get("current_session")
+                if isinstance(current, dict) and current.get("id"):
+                    if current.get("id") != my_session["id"]:
+                        return False, (
+                            f"queue current_session={current.get('id')} is not "
+                            f"this terminal's session ({my_session['id']}); "
+                            "refusing to release. Use --force-release-stale "
+                            "or claim --force to take over."
+                        )
+                history = list(front.get("session_history") or [])
+                if isinstance(current, dict) and current.get("id"):
+                    session_id = current.get("id")
+                    for entry in reversed(history):
+                        if isinstance(entry, dict) and entry.get("id") == session_id and entry.get("ended_at") is None:
+                            entry["ended_at"] = _now_iso()
+                            entry["ended_reason"] = reason
+                            break
+                front["current_session"] = None
+                front["session_history"] = history
+                front["last-touched"] = _now_iso()
+                _atomic_write(queue, _dump_frontmatter(front) + body)
+                msgs.append(f"released queue {queue.name}")
+    # Per-terminal session map: remove only this PID's slot, keep others.
     sf = _session_file(project_root)
     if sf.exists():
-        sf.unlink()
-        msgs.append("cleared session file")
+        try:
+            raw = json.loads(sf.read_text())
+        except (json.JSONDecodeError, OSError):
+            raw = None
+        my_pid = str(os.getpid())
+        if isinstance(raw, dict):
+            if "id" in raw and "pid" in raw:
+                # Old single-record shape (back-compat) — drop the whole file.
+                sf.unlink()
+                msgs.append("cleared session file (back-compat)")
+            else:
+                # Map shape: remove only this pid's slot.
+                if my_pid in raw:
+                    del raw[my_pid]
+                if raw:
+                    _atomic_write(sf, json.dumps(raw, indent=2) + "\n")
+                else:
+                    sf.unlink()
+                msgs.append("cleared this terminal's session slot")
     if not msgs:
         return False, "nothing to release"
     return True, "; ".join(msgs)
 
 
 def force_release_stale(project_root: Path) -> tuple[int, list[str]]:
-    """Across all goal-queues, clear current_session where pid is dead."""
+    """Across all goal-queues, clear current_session where pid is dead.
+    Locks each queue for the duration of its mutation."""
     cleared: list[str] = []
     for queue in find_queues(project_root):
-        front, body = _parse_frontmatter(queue.read_text())
-        current = front.get("current_session")
-        if isinstance(current, dict) and current.get("pid") and not _pid_alive(current.get("pid")):
-            history = list(front.get("session_history") or [])
-            for entry in reversed(history):
-                if isinstance(entry, dict) and entry.get("id") == current.get("id") and entry.get("ended_at") is None:
-                    entry["ended_at"] = _now_iso()
-                    entry["ended_reason"] = "stale-pid"
-                    break
-            front["current_session"] = None
-            front["session_history"] = history
-            front["last-touched"] = _now_iso()
-            queue.write_text(_dump_frontmatter(front) + body)
-            cleared.append(queue.name)
+        with _file_lock(queue):
+            front, body = _parse_frontmatter(queue.read_text())
+            current = front.get("current_session")
+            if isinstance(current, dict) and current.get("pid") and not _pid_alive(current.get("pid")):
+                history = list(front.get("session_history") or [])
+                for entry in reversed(history):
+                    if isinstance(entry, dict) and entry.get("id") == current.get("id") and entry.get("ended_at") is None:
+                        entry["ended_at"] = _now_iso()
+                        entry["ended_reason"] = "stale-pid"
+                        break
+                front["current_session"] = None
+                front["session_history"] = history
+                front["last-touched"] = _now_iso()
+                _atomic_write(queue, _dump_frontmatter(front) + body)
+                cleared.append(queue.name)
     return len(cleared), cleared
 
 
