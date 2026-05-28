@@ -93,9 +93,9 @@ If the worker needs access to additional directories outside `<workdir>`,
 use `--add-dir <path>` (each path becomes accessible to the session).
 
 **Billing**: `claude -p` produces **API billing**, not session billing.
-Prefer the Agent tool for sub-billed dispatches — Agent-tool subagents
-share the parent session's billing but make their own LLM calls, so they
-also share the parent's rate-limit budget. Reserve `claude -p` for cases
+Prefer the native subagent path for sub-billed dispatches — native subagents
+share the controller's session budget but make their own LLM calls, so they
+also share the controller's rate-limit budget. Reserve `claude -p` for cases
 where you need a clearly delimited headless run outside the parent
 session's context window AND you are willing to pay API rates.
 

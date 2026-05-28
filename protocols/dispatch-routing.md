@@ -178,8 +178,8 @@ Three separate layers can affect a spawned worker. Do not conflate them:
    `--dangerously-bypass-approvals-and-sandbox` is rejected by some controllers'
    auto-mode safety classifiers and is unnecessary when the worker's edit scope
    is its workspace.
-3. **MCP elicitation** (`request_user_input`) — raised by tools like context-mode's
-   `ctx_index`. NOT a filesystem sandbox or approval-policy matter, so the first
+3. **MCP elicitation** — raised by tool-level user-input request handlers such as
+   context-mode's `ctx_index`. NOT a filesystem sandbox or approval-policy matter, so the first
    two layers do nothing for it. Left unhandled, codex-acp neither forwards nor
    rejects the elicitation over ACP and the tool call wedges at ~0% CPU until the
    per-tool wall.

@@ -242,59 +242,9 @@ EXPECTED_ENTRY_IDS = {
     "worker-escalate-not-bypass",
 }
 
-KNOWN_SKILL_ALIGNMENT_GAPS = {
-    "controller-probe-runner-portability": {
-        "fix_chunk": "chunk-5.1 skill-distillation catch-up",
-        "kind": "literal",
-        "pattern": "Controller behaviour probes run through portable host adapters, not host-specific print-mode shortcuts",
-        "current_substitute": "Controller behaviour probes run through portable host adapters, not\nhost-specific print-mode shortcuts.",
-        "current_substitute_section": "## Per-host pointers",
-    },
-    "read-skill-end-to-end-behaviour": {
-        "fix_chunk": "chunk-5.1 skill-distillation catch-up",
-        "kind": "literal",
-        "pattern": "Read this skill end-to-end, including Worker Routing, State, and Context Discipline",
-        # 2026-05-28: preamble promoted to a bold callout per AUI surface
-        # audit; substitute wording updated to match while preserving the
-        # canonical "Read this skill end-to-end" phrase verbatim.
-        "current_substitute": "Read this skill end-to-end before acting** \u2014 including Worker\n> Routing, State, Context Discipline, and Do Not.",
-        "current_substitute_section": "preamble",
-    },
-    "gstack-review-and-challenge-canonical": {
-        "fix_chunk": "chunk-5.1 skill-distillation catch-up",
-        "kind": "literal",
-        "pattern": "Reviews go through gstack `/review` and `/challenge`; do not hand-roll review prompts",
-        "current_substitute": "Companion tools: gstack `/review` is the canonical chunk reviewer; gstack\n`/challenge` is the adversarial frame; fall back to `prompts/gstack-*.md` only\nwhen gstack is absent.",
-        "current_substitute_section": "## Per-host pointers",
-    },
-    "rubric-before-wave": {
-        "fix_chunk": "chunk-5.1 skill-distillation catch-up",
-        "kind": "literal",
-        "pattern": "Write review rubrics before first wave dispatch",
-        "current_substitute": "Write review\nrubrics before first wave dispatch.",
-        "current_substitute_section": "## Review layers",
-    },
-    "concern-diverse-review": {
-        "fix_chunk": "chunk-5.1 skill-distillation catch-up",
-        "kind": "literal",
-        "pattern": "Diversify reviewer concern, not just model",
-        "current_substitute": "Diversify reviewer concern, not just\nmodel.",
-        "current_substitute_section": "## Review layers",
-    },
-}
+KNOWN_SKILL_ALIGNMENT_GAPS = {}
 
-KNOWN_PROTOCOL_LITERAL_GAPS = {
-    ("protocols/legacy/bash-tail.md", "Agent tool"): {
-        "fix_chunk": "chunk-5.1 protocol-legacy wording cleanup",
-        "line_number": 96,
-        "line": "Prefer the Agent tool for sub-billed dispatches \u2014 Agent-tool subagents",
-    },
-    ("protocols/dispatch-routing.md", "request_user_input"): {
-        "fix_chunk": "chunk-5.1 protocol-elicitation wording cleanup",
-        "line_number": 181,
-        "line": "3. **MCP elicitation** (`request_user_input`) \u2014 raised by tools like context-mode's",
-    },
-}
+KNOWN_PROTOCOL_LITERAL_GAPS = {}
 
 KNOWN_MAX_SECTION_LINE_GAPS = {
     "split-large-chunk-scope": {
@@ -321,12 +271,6 @@ KNOWN_MAX_SECTION_LINE_GAPS = {
     # The Golden Master budgets stay at their original values pending a
     # formal realignment in a follow-up chunk; this allowlist makes the
     # overruns explicit + reviewable rather than silent.
-    "skill-load-order-mandatory": {
-        "fix_chunk": "chunk-X budget realignment after AUI hardening",
-        "max_section_lines": 10,
-        "actual_content_lines": 24,
-        "section_heading": "preamble",
-    },
     "user-status-cadence-15min": {
         "fix_chunk": "chunk-X budget realignment after AUI hardening",
         "max_section_lines": 20,
@@ -338,12 +282,6 @@ KNOWN_MAX_SECTION_LINE_GAPS = {
         "max_section_lines": 5,
         "actual_content_lines": 35,
         "section_heading": "## Hard Invariants",
-    },
-    "reviewer-misses-regression-tests": {
-        "fix_chunk": "chunk-X budget realignment after AUI hardening",
-        "max_section_lines": 25,
-        "actual_content_lines": 28,
-        "section_heading": "## Review layers",
     },
     "state-layers-separated": {
         "fix_chunk": "chunk-X budget realignment after AUI hardening",

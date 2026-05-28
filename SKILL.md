@@ -32,16 +32,15 @@ triggers:
   - decompose this plan into goal chunks
 ---
 
-> ⚠️ **Read this skill end-to-end before acting** — including Worker
-> Routing, State, Context Discipline, and Do Not. The back half carries
-> routing, state, marker, rate-limit, permission, and safety contracts.
-> The navigation map below jumps back after the full read.
+> ⚠️ **Read this skill end-to-end, including Worker Routing, State, and Context Discipline** before acting; also read Do Not. The back half carries routing, state, marker, rate-limit, permission, and safety contracts.
 
 This checked-in `SKILL.md` is the compiled controller distillation of
 `docs/controller-behaviours.md`. It is the Claude Code-compatible wrapper for
 the portable core. Keep front matter and `allowed-tools` compatible until
 generated wrappers own host bindings, tool names, invocation details, and
 packaging.
+
+## Activation Check
 
 **Is goal-flight active in this project?** Run
 `python3 <skill-root>/scripts/goalflight_session_status.py --text` before
@@ -84,8 +83,7 @@ only the invoked `commands/*.md` plus referenced `protocols/*.md`.
 Companion tools: gstack `/review` is the canonical chunk reviewer; gstack
 `/challenge` is the adversarial frame; fall back to `prompts/gstack-*.md` only
 when gstack is absent. context-mode stores large outputs and searches them.
-Controller behaviour probes run through portable host adapters, not
-host-specific print-mode shortcuts.
+Controller behaviour probes run through portable host adapters, not host-specific print-mode shortcuts.
 
 ## Navigation map: behaviour -> SKILL anchor -> protocol/script
 
@@ -172,12 +170,13 @@ Review layers: executor self-review, chunk review, milestone review.
 | Chunk review | Every commit-worthy chunk | default gstack `/review`; `./scripts/autoreview.sh` as a complementary parallel option |
 | Milestone review | K-commit cadence or `[milestone]` chunks | `protocols/milestone-review.md`, gstack `/review` + concern-diverse sweep |
 
-On chunk completion, dispatch gstack `/review` before committing. Reviews go
-through gstack `/review` and `/challenge`; do not hand-roll review prompts.
-Reviewer misses become regression tests, not trust exemptions. Write review
-rubrics before first wave dispatch. Diversify reviewer concern, not just
-model. Use consolidation review for cross-slice contradictions. Milestone
-review is a separate gate from chunk review.
+On chunk completion, dispatch gstack `/review` before committing.
+Reviews go through gstack `/review` and `/challenge`; do not hand-roll review prompts.
+Reviewer misses become regression tests, not trust exemptions. Write review rubrics before first wave dispatch.
+Diversify reviewer concern, not just model. Use consolidation review for cross-slice contradictions.
+Milestone review is a separate gate from chunk review.
+
+## Nested Review Invocation
 
 Canonical nested review shape (full rationale + flags: `protocols/chunk-review.md`):
 
