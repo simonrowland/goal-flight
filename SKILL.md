@@ -32,16 +32,23 @@ triggers:
   - decompose this plan into goal chunks
 ---
 
-Read this skill end-to-end — including Worker Routing, State, and Context
-Discipline. It is the compiled controller distillation of
-`docs/controller-behaviours.md`. Do not stop at command lookup or Hard
-Invariants; back-half sections carry routing, state, marker, rate-limit, and
-context contracts. Use the navigation map below to jump back after the full
-read.
+> ⚠️ **Read this skill end-to-end before acting** — including Worker
+> Routing, State, Context Discipline, and Do Not. The back half carries
+> routing, state, marker, rate-limit, permission, and safety contracts.
+> The navigation map below jumps back after the full read.
 
-This checked-in `SKILL.md` is the Claude Code-compatible wrapper for the portable
-core. Keep front matter and `allowed-tools` compatible until generated wrappers
-own host bindings, tool names, invocation details, and packaging.
+This checked-in `SKILL.md` is the compiled controller distillation of
+`docs/controller-behaviours.md`. It is the Claude Code-compatible wrapper for
+the portable core. Keep front matter and `allowed-tools` compatible until
+generated wrappers own host bindings, tool names, invocation details, and
+packaging.
+
+**Is goal-flight active in this project?** Run
+`python3 <skill-root>/scripts/goalflight_session_status.py --text` before
+auto-loading the rest of this skill. If the verdict is "no active
+goal-flight session", you are NOT in a goal-flight run — do regular coding
+without loading the back half. Only load end-to-end when the verdict is
+"active" or when the user explicitly invokes `/goal-flight <command>`.
 
 ## Per-host pointers
 
@@ -56,6 +63,12 @@ host wrapper first, then root `SKILL.md` as canonical workflow:
 | grok | `~/.grok/skills/goal-flight/SKILL.md` or generated path from `configs/grok/skills/goal-flight/SKILL.md` |
 | opencode | `.opencode/skills/goal-flight/SKILL.md`, `~/.config/opencode/skills/goal-flight/SKILL.md`, or `~/.agents/skills/goal-flight/SKILL.md` |
 
+**Stale-wrapper warning:** non-native hosts hold a *copy* of `SKILL.md`. If
+the source repo updated and `./install.sh <host>` was not re-run, the
+installed copy is stale. The repository `SKILL.md` is canonical — when the
+installed wrapper and the repo wrapper disagree, trust the repo. Doctor
+probes the divergence; re-run install to resync.
+
 Load order: `AGENTS.md` -> installed host wrapper -> repository `SKILL.md` ->
 only the invoked `commands/*.md` plus referenced `protocols/*.md`.
 Companion tools: gstack `/review` is the canonical chunk reviewer; gstack
@@ -68,15 +81,22 @@ host-specific print-mode shortcuts.
 
 | Topic | SKILL anchor | Protocol/script |
 |---|---|---|
+| **is goal-flight active here?** | preamble above | `scripts/goalflight_session_status.py --text` |
 | status preflight | Session Pre-Flight | `protocols/session-preflight.md`, `scripts/goalflight_status.py`, `scripts/goalflight_doctor.py` |
+| **in-flight dispatch monitoring** | Session Pre-Flight | `scripts/goalflight_status.py --json`, `scripts/goalflight_watch.py` (ACP), `scripts/watch-dispatch-tail.sh` (bash-tail) |
+| **active leases / what's in flight** | Capacity and rate limits | `scripts/goalflight_capacity.py status` |
 | autonomous throughput | Autonomous throughput | `commands/execute.md`, `commands/goal.md` |
+| **chat as requirements** | Chat as requirements | `commands/goal.md`, `protocols/user-status-cadence.md` |
 | user-status-cadence | User progress reporting | `protocols/user-status-cadence.md` |
 | chunk-vs-milestone review | Review layers | `protocols/chunk-review.md`, `protocols/milestone-review.md` |
-| dispatch axes | Dispatch Model, Worker Routing | `protocols/dispatch-routing.md` |
+| dispatch axes (per-task routing table is in Worker Routing) | Dispatch Model, Worker Routing | `protocols/dispatch-routing.md` |
+| **worker permissions / YOLO warning** | Worker Routing | `scripts/goalflight_acp_run.py` `make_title_allow_policy` |
+| **worker blocked: controller takeover** | (back half) | `protocols/dispatched-worker-recovery.md` |
 | rate limits & caps | Capacity and rate limits | `scripts/goalflight_capacity.py`, `scripts/goalflight_rate_pressure.py` |
 | worker markers | Worker Markers | `protocols/worker-markers.md`, `scripts/goalflight_watch.py` |
-| resume/compaction | State | `commands/resume.md`, `protocols/state-handoff.md` |
+| resume/compaction (canonical reload order) | State | `commands/resume.md`, `protocols/state-handoff.md`, `scripts/goalflight_session_status.py` |
 | context discipline | Context Discipline | context-mode, `scripts/goalflight_*.py` |
+| **Do Not / safety gates** | Do Not | (read-end-to-end is load-bearing for safety) |
 
 ## Controller Contract
 
@@ -148,25 +168,41 @@ rubrics before first wave dispatch. Diversify reviewer concern, not just
 model. Use consolidation review for cross-slice contradictions. Milestone
 review is a separate gate from chunk review.
 
-Canonical nested review shape:
+Canonical nested review shape (full rationale + flags: `protocols/chunk-review.md`):
 
 ```bash
 codex exec --sandbox read-only --dangerously-bypass-approvals-and-sandbox \
   -c 'model_reasoning_effort="xhigh"' \
   --enable web_search_cached \
-  "$REVIEW_PROMPT"
+  "$REVIEW_PROMPT" \
+  < /dev/null \
+  > docs-private/reviews/<date>-<slug>/codex-review.final.md \
+  2> docs-private/reviews/<date>-<slug>/codex-review.stderr.log
 ```
 
-Stream output to `docs-private/reviews/<date>-<slug>/codex-review.final.md`.
-Apply P3-safe-easy findings inline; fix P0/P1/P2 before commit.
+**`< /dev/null` is load-bearing.** Without it, `codex exec` reads stdin to EOF
+and the bash-tail invocation blocks forever (observed wedge 2026-05-27).
+**`--dangerously-bypass-approvals-and-sandbox` is scoped to this read-only
+nested-review pattern only** — do NOT generalize it to write operations or
+to top-level worker spawns. Apply P3-safe-easy findings inline; fix
+P0/P1/P2 before commit.
 
 ## Hard Invariants
 
 - Verification first. Every executor prompt starts by checking repo state,
   target files, and assumptions before editing.
 - Background anything expected to run longer than 10 seconds.
-- No `tail -f` in conversation. Use status files and `scripts/goalflight_watch.py`.
+- No `tail -f` in conversation. Use status files instead:
+  - Aggregate snapshot: `python3 <skill-root>/scripts/goalflight_status.py --json`
+  - ACP dispatch: `python3 <skill-root>/scripts/goalflight_watch.py --pid <pid> --tail <tailfile> --status-json <path>`
+  - Bash-tail dispatch: `<skill-root>/scripts/watch-dispatch-tail.sh` (content-aware completion watcher with terminal-marker / pid-dead / idle / controller-dead exit codes)
 - No worker spawn without capacity consideration.
+- No bare `git commit` while workers are in flight — commit guard
+  `scripts/goalflight_commit_guard.py` refuses to prevent bundling worker
+  WIP. Use `git commit -m '...' -- <files>` with explicit pathspecs.
+- No broad `--permission-allow-tool-title-pattern '.*'` without
+  `--os-sandbox=read-only` — title-allow layers AFTER hard gates, so
+  execute/fetch escalates without sandbox; the warning fires at startup.
 - Every long worker or review job needs a ledger/status path.
 - Missing or stalled review is inconclusive, not clean.
 - Ask the user only for real product/permission blockers, destructive choices,
@@ -261,6 +297,19 @@ Worker live gate also requires requested transport verified.
 Discovery probes do not use network or model calls.
 
 ## Worker Routing
+
+**Permission-pattern warning** (controller-side, when dispatching ACP workers):
+the `--permission-allow-tool-title-pattern` flag fast-paths titles matching
+the regex through to PERMISSION_ALLOW, but ONLY for the safe subset (read,
+in-cwd writes). Hard gates (outside-cwd writes, kind=execute, kind=fetch)
+always run first regardless of pattern — so a broad `.*` "YOLO" pattern
+will NOT silently authorize destructive operations. Workers that need
+execute/fetch must run under `--os-sandbox=read-only` so the sandbox is the
+backstop; the runner emits a startup warning when a broad pattern is paired
+with sandbox-off. Scope patterns precisely (e.g.
+`^./tests/run\.sh$`) when sandbox is off. See
+`scripts/goalflight_acp_run.py` `make_title_allow_policy` for the full
+layering rationale.
 
 Default routing by task:
 
@@ -370,6 +419,22 @@ python3 <skill-root>/scripts/goalflight_status.py --json
 Active run + compaction: reload Goal Flight only when already in play. After
 compaction, if goal-flight was active, reload SKILL.md and commands/resume.md
 before continuing. Not always-on.
+
+**Canonical post-compaction reload order:**
+1. Read `AGENTS.md` (entry point).
+2. `python3 <skill-root>/scripts/goalflight_session_status.py --text` —
+   single command, definitive verdict. If "no active goal-flight session",
+   stop here; you are NOT in a goal-flight run.
+3. Read repository `SKILL.md` end-to-end (this file).
+4. Find newest RESUME-NOTES:
+   `ls -1 docs-private/RESUME-NOTES-*.md | sort | tail -1`
+   (canonical pattern: `RESUME-NOTES-<YYYY-MM-DD>[-rev<N>].md` — ISO 8601
+   date so lexicographic sort = chronological; no topic prefixes).
+5. Read newest queue file at `docs-private/goal-queue-*.md` for the chunk
+   table + frontmatter `state` and `current_session`.
+6. `python3 <skill-root>/scripts/goalflight_status.py --json` for live
+   capacity + ledger.
+7. Continue from status, not from chat memory.
 After compaction, if goal-flight was active, reload SKILL.md and commands/resume.md before continuing.
 
 ## Context Discipline

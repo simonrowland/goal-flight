@@ -200,7 +200,16 @@ def test_doctor_cli_target_project_skips_package_plugin() -> None:
 
 def test_instruction_split_contract() -> None:
     skill = (ROOT / "SKILL.md").read_text()
-    assert_true("SKILL under 20KB", len(skill.encode()) <= 20_000)
+    # 2026-05-28: budget raised 20KB → 25KB after the worker-reliability
+    # hardening additions (commit-guard pointer, session-status activation
+    # contract, canonical post-compaction reload order, in-flight monitoring
+    # worked commands, permission-pattern warning, stale-wrapper warning,
+    # dangerous-bypass context fence). Each was driven by the AUI surface
+    # audit + sweep B/C/D findings. Catches future feature-add bloat.
+    assert_true(
+        f"SKILL under 25KB (got {len(skill.encode())}B)",
+        len(skill.encode()) <= 25_000,
+    )
     for protocol in [
         "session-preflight.md",
         "tool-readiness.md",
