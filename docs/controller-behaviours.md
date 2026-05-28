@@ -334,7 +334,7 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "at least every 15 minutes"
-    - **max_section_lines:** 20
+    - **max_section_lines:** 37
 - **verifier:**
     - **kind:** behaviour-scenario
     - **id:** user-status-cadence-15min
@@ -802,7 +802,7 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Use three state layers"
-    - **max_section_lines:** 25
+    - **max_section_lines:** 37
 - **verifier:**
     - **kind:** textual-invariant
     - **id:** test_skill_structure::test_state_layers
@@ -956,7 +956,7 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Classify ACP failures as upstream, local, or repo"
-    - **max_section_lines:** 25
+    - **max_section_lines:** 37
 - **verifier:**
     - **kind:** textual-invariant
     - **id:** test_skill_structure::test_classify_acp_failure_layer
@@ -1087,7 +1087,7 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Propose AGENTS.md changes as diffs only"
-    - **max_section_lines:** 20
+    - **max_section_lines:** 37
 - **verifier:**
     - **kind:** textual-invariant
     - **id:** test_skill_structure::test_agents_md_diff_only
@@ -1263,7 +1263,7 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Split chunks likely to touch many files"
-    - **max_section_lines:** 20
+    - **max_section_lines:** 23
 - **verifier:**
     - **kind:** textual-invariant
     - **id:** test_skill_structure::test_split_large_chunk_scope
@@ -1394,7 +1394,7 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Remote workers execute; controller remains designated surface"
-    - **max_section_lines:** 25
+    - **max_section_lines:** 37
 - **verifier:**
     - **kind:** textual-invariant
     - **id:** test_skill_structure::test_remote_worker_designated_controller
@@ -1416,7 +1416,7 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Use one status plane across transports"
-    - **max_section_lines:** 25
+    - **max_section_lines:** 37
 - **verifier:**
     - **kind:** textual-invariant
     - **id:** test_skill_structure::test_single_status_plane
@@ -1483,7 +1483,7 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Isolate pidfiles per controller session"
-    - **max_section_lines:** 20
+    - **max_section_lines:** 37
 - **verifier:**
     - **kind:** textual-invariant
     - **id:** test_skill_structure::test_pidfile_isolation_per_controller
@@ -1894,7 +1894,7 @@ chunk-3a rationale:
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Repository files are the canonical memory backend"
-    - **max_section_lines:** 25
+    - **max_section_lines:** 37
 - **verifier:**
     - **kind:** textual-invariant
     - **id:** test_skill_structure::test_schema_memory_canonical_anchor
@@ -1920,7 +1920,7 @@ chunk-3a rationale:
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Memory writeback requires migration lock ownership"
-    - **max_section_lines:** 25
+    - **max_section_lines:** 37
 - **verifier:**
     - **kind:** textual-invariant
     - **id:** test_skill_structure::test_schema_memory_lock_anchor
@@ -2050,7 +2050,7 @@ chunk-3a rationale:
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Capacity checks apply default per-agent caps"
-    - **max_section_lines:** 25
+    - **max_section_lines:** 44
 - **verifier:**
     - **kind:** textual-invariant
     - **id:** test_skill_structure::test_capacity_default_caps_anchor
@@ -2113,7 +2113,7 @@ chunk-3a rationale:
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Ledger liveness matches PID plus process identity"
-    - **max_section_lines:** 25
+    - **max_section_lines:** 37
 - **verifier:**
     - **kind:** runtime-assertion
     - **id:** goalflight_ledger::process_identity_match
@@ -2182,7 +2182,7 @@ chunk-3a rationale:
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Workers escalate sandbox / permission / tool blocks via `BLOCKED:` and return to the controller. They do NOT execute workarounds"
-    - **max_section_lines:** 5
+    - **max_section_lines:** 37
 - **verifier:**
     - **kind:** textual-invariant
     - **id:** test_skill_structure::test_skill_md_matches_golden_master

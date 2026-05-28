@@ -246,98 +246,13 @@ KNOWN_SKILL_ALIGNMENT_GAPS = {}
 
 KNOWN_PROTOCOL_LITERAL_GAPS = {}
 
-KNOWN_MAX_SECTION_LINE_GAPS = {
-    "split-large-chunk-scope": {
-        "fix_chunk": "chunk-5.1 skill-section-budget catch-up",
-        "max_section_lines": 20,
-        "actual_content_lines": 21,
-        "section_heading": "## Dispatch Model",
-    },
-    "default-agent-caps-enforced": {
-        "fix_chunk": "chunk-X budget realignment after AUI hardening",
-        "max_section_lines": 25,
-        "actual_content_lines": 42,
-        "section_heading": "## Worker Routing",
-    },
-    # 2026-05-28 worker-reliability hardening overruns. Each was driven by
-    # the AUI surface audit + sweep B/C/D findings:
-    # - preamble: bold callout + activation check directive (skill_load_order)
-    # - ## State: 7-step canonical post-compaction reload order (8 lines
-    #   added; previously implicit, scattered across protocols/state-handoff.md)
-    # - ## Hard Invariants: worked replacement commands for "no tail -f" +
-    #   commit-guard pointer + permission-pattern warning (4 lines added)
-    # - ## Review layers: < /dev/null context fence + bypass-flag scope
-    #   note (4 lines added)
-    # The Golden Master budgets stay at their original values pending a
-    # formal realignment in a follow-up chunk; this allowlist makes the
-    # overruns explicit + reviewable rather than silent.
-    "user-status-cadence-15min": {
-        "fix_chunk": "chunk-X budget realignment after AUI hardening",
-        "max_section_lines": 20,
-        "actual_content_lines": 35,
-        "section_heading": "## Hard Invariants",
-    },
-    "worker-escalate-not-bypass": {
-        "fix_chunk": "chunk-X budget realignment after AUI hardening",
-        "max_section_lines": 5,
-        "actual_content_lines": 35,
-        "section_heading": "## Hard Invariants",
-    },
-    "state-layers-separated": {
-        "fix_chunk": "chunk-X budget realignment after AUI hardening",
-        "max_section_lines": 25,
-        "actual_content_lines": 35,
-        "section_heading": "## State",
-    },
-    "repo-files-canonical-memory-backend": {
-        "fix_chunk": "chunk-X budget realignment after AUI hardening",
-        "max_section_lines": 25,
-        "actual_content_lines": 35,
-        "section_heading": "## State",
-    },
-    "single-status-plane": {
-        "fix_chunk": "chunk-X budget realignment after AUI hardening",
-        "max_section_lines": 25,
-        "actual_content_lines": 35,
-        "section_heading": "## State",
-    },
-    "ledger-pid-plus-process-identity": {
-        "fix_chunk": "chunk-X budget realignment after AUI hardening",
-        "max_section_lines": 25,
-        "actual_content_lines": 35,
-        "section_heading": "## State",
-    },
-    "memory-writeback-lock-required": {
-        "fix_chunk": "chunk-X budget realignment after AUI hardening",
-        "max_section_lines": 25,
-        "actual_content_lines": 35,
-        "section_heading": "## State",
-    },
-    "classify-acp-failure-layer": {
-        "fix_chunk": "chunk-X budget realignment after AUI hardening",
-        "max_section_lines": 25,
-        "actual_content_lines": 35,
-        "section_heading": "## State",
-    },
-    "remote-worker-designated-controller": {
-        "fix_chunk": "chunk-X budget realignment after AUI hardening",
-        "max_section_lines": 25,
-        "actual_content_lines": 35,
-        "section_heading": "## State",
-    },
-    "pidfile-isolation-per-controller": {
-        "fix_chunk": "chunk-X budget realignment after AUI hardening",
-        "max_section_lines": 20,
-        "actual_content_lines": 35,
-        "section_heading": "## State",
-    },
-    "agents-md-diff-only": {
-        "fix_chunk": "chunk-X budget realignment after AUI hardening",
-        "max_section_lines": 20,
-        "actual_content_lines": 35,
-        "section_heading": "## State",
-    },
-}
+# Allowlist for known max_section_lines overruns. Empty after the 2026-05-28
+# realignment that updated Golden Master budgets to match post-AUI-hardening
+# actuals plus a 2-line buffer (entry budgets were raised in
+# `docs/controller-behaviours.md`, not test thresholds). Repopulate ONLY when
+# a new overrun lands that is genuinely pending a follow-up budget update;
+# otherwise raise the per-entry budget directly in the Golden Master.
+KNOWN_MAX_SECTION_LINE_GAPS: dict[str, dict[str, Any]] = {}
 
 KNOWN_ENTRY_SCHEMA_EXTENSIONS = {
     "skill-load-order-mandatory": {
