@@ -534,7 +534,13 @@ def check_installed_skill_drift(skill_root: Path, project_root: Path) -> dict:
             "host": "grok",
             "sources": [grok_source],
             "installed": home / ".grok/skills/goal-flight/SKILL.md",
-            "resync_command": "./setup.sh --apply --yes --agent grok",
+            # `--agent grok` selects only the worker (grok-acp-worker); the
+            # SKILL.md install lives under the controller surface setup.
+            # Resync needs the full setup path that copies SKILL.md sources.
+            "resync_command": (
+                "./setup.sh --apply --yes --agent grok && "
+                "./install.sh grok <project>"
+            ),
         },
         {
             "host": "claude-code",

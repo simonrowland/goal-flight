@@ -30,9 +30,12 @@ Same flags via `setup.sh`: `--cursor-install`, `--opencode-install`, and `--code
 
 After source `SKILL.md`, `commands/`, `protocols/`, `templates/`, or `adapters/`
 changes, copied host installs must be resynced from the source repo with
-`./install.sh <host>` unless the host skill is symlinked to the source. Doctor
-JSON reports `installed_skill_drift`; text mode prints `installed_skill_md_hash`
-WARNs.
+`./install.sh <host>` unless the host skill is symlinked to the source. The
+doctor's `installed_skill_drift` probe hashes only the installed `SKILL.md`
+file (per host); a hash divergence WARN there means the wrapper is stale,
+which usually correlates with the other directories being stale too. Run
+the resync command in the probe's `resync_command` field; text mode prints
+`installed_skill_md_hash` WARNs.
 
 ## Features
 
