@@ -28,6 +28,12 @@ Restart the host, then run doctor: `python3 scripts/goalflight_doctor.py --proje
 
 Same flags via `setup.sh`: `--cursor-install`, `--opencode-install`, and `--codex-install` (each implies `--apply --yes`). Dry-run, link-to-Claude, and agents-standard paths are in [docs/hosts/cursor.md](docs/hosts/cursor.md) and [docs/hosts/opencode.md](docs/hosts/opencode.md).
 
+After source `SKILL.md`, `commands/`, `protocols/`, `templates/`, or `adapters/`
+changes, copied host installs must be resynced from the source repo with
+`./install.sh <host>` unless the host skill is symlinked to the source. Doctor
+JSON reports `installed_skill_drift`; text mode prints `installed_skill_md_hash`
+WARNs.
+
 ## Features
 
 - Multi-hour unattended runs with light supervision
@@ -37,7 +43,7 @@ Same flags via `setup.sh`: `--cursor-install`, `--opencode-install`, and `--code
 - Provider-aware rate-pressure walkback
 - Procedural runtime state + doctor checks
 - Self-delegation `/fork` pattern (opt-in)
-  
+
 ## What it gets you
 
 - **Multi-hour unattended runs.** Check in periodically or respond to decision notifications. The controller's context primarily holds architecture, plan, and metadata (queue state, recent commits, in-flight dispatch headers); real work happens in subagent context windows.
@@ -149,7 +155,6 @@ Default `./tests/run.sh` stays hermetic and cheap. Set
 which runs `scripts/autoreview.sh --engine claude` against a known-good fixture
 commit through `scripts/autoreview_claude_acp`. Each invocation consumes one
 Claude ACP-sub-billed autoreview pass.
-
 
 ## Adapting
 

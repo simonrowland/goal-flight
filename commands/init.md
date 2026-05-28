@@ -26,6 +26,12 @@ Read `protocols/session-preflight.md`, `protocols/tool-readiness.md`,
 ./setup.sh --apply --yes --cursor-project "$PWD"
 ```
 
+After source `SKILL.md`, `commands/`, `protocols/`, `templates/`, or `adapters/`
+changes, copied host installs need a resync from the source repo with
+`./install.sh <host>` or the matching setup path unless the host skill path is a
+symlink. Doctor JSON reports `installed_skill_drift`, and text mode prints
+`installed_skill_md_hash` WARNs.
+
 For Codex, setup registers the Goal Flight package for the Desktop controller
 surface, cleans any duplicate legacy personal Codex skill when plugin
 registration succeeds, checks the CLI worker surface, and registers

@@ -8,6 +8,7 @@ hand-running a long environment probe sequence into the context window.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -359,6 +360,14 @@ def _path_state(path: Path) -> dict:
     return {"path": str(path), "exists": path.exists()}
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def check_host_goalflight_install() -> dict:
     home = Path.home()
     codex_plugin_cache = sorted(
@@ -421,6 +430,147 @@ def check_host_goalflight_install() -> dict:
             detail = item["skill"]["path"]
         item["detail"] = detail
     return payload
+
+
+def _has_symlink_component(path: Path) -> bool:
+    for candidate in (path, path.parent):
+        try:
+            if candidate.is_symlink():
+                return True
+        except OSError:
+            return False
+    return False
+
+
+def _installed_skill_entry(
+    *,
+    host: str,
+    sources: list[Path],
+    installed: Path,
+    source_root: Path,
+    root_hash: str | None,
+    resync_command: str,
+) -> dict | None:
+    if not installed.is_file():
+        return None
+
+    symlinked = _has_symlink_component(installed)
+    installed_hash = _sha256_file(installed)
+    source_hashes = [
+        {"path": str(source), "hash": _sha256_file(source)}
+        for source in sources
+        if source.is_file()
+    ]
+    if symlinked and source_root.is_file() and root_hash:
+        source_hashes = [{"path": str(source_root), "hash": root_hash}]
+
+    primary = next((item for item in source_hashes if item["hash"] == installed_hash), None)
+    if primary is None and source_hashes:
+        primary = source_hashes[0]
+    drift = bool(source_hashes and installed_hash not in {item["hash"] for item in source_hashes})
+    return {
+        "host": host,
+        "path": str(installed),
+        "source": primary["path"] if primary else None,
+        "source_root_hash": root_hash,
+        "source_hash": primary["hash"] if primary else None,
+        "source_alternatives": source_hashes,
+        "installed_hash": installed_hash,
+        "drift": drift,
+        "install_mode": "symlink" if symlinked else "copy",
+        "resync_command": resync_command,
+    }
+
+
+def check_installed_skill_drift(skill_root: Path, project_root: Path) -> dict:
+    home = Path.home()
+    source_root = skill_root / "SKILL.md"
+    root_hash = _sha256_file(source_root) if source_root.is_file() else None
+    codex_plugin_cache = sorted(
+        (home / ".codex/plugins/cache/goal-flight/goal-flight").glob("*/skills/goal-flight/SKILL.md")
+    )
+    codex_source = skill_root / "plugins/goal-flight/skills/goal-flight/SKILL.md"
+    cursor_source = skill_root / "configs/cursor/skills/goal-flight/SKILL.md"
+    opencode_source = skill_root / "configs/opencode/skills/goal-flight/SKILL.md"
+    grok_source = skill_root / "configs/grok/skills/goal-flight/SKILL.md"
+    candidates: list[dict] = [
+        {
+            "host": "codex",
+            "sources": [codex_source],
+            "installed": home / ".codex/skills/goal-flight/SKILL.md",
+            "resync_command": "./install.sh codex",
+        },
+        {
+            "host": "cursor",
+            "sources": [cursor_source],
+            "installed": home / ".cursor/skills/goal-flight/SKILL.md",
+            "resync_command": "./install.sh cursor <project>",
+        },
+        {
+            "host": "cursor",
+            "sources": [cursor_source],
+            "installed": project_root / ".cursor/skills/goal-flight/SKILL.md",
+            "resync_command": "./install.sh cursor <project>",
+        },
+        {
+            "host": "opencode",
+            "sources": [opencode_source],
+            "installed": home / ".config/opencode/skills/goal-flight/SKILL.md",
+            "resync_command": "./install.sh opencode <project>",
+        },
+        {
+            "host": "opencode",
+            "sources": [opencode_source],
+            "installed": project_root / ".opencode/skills/goal-flight/SKILL.md",
+            "resync_command": "./install.sh opencode <project>",
+        },
+        {
+            "host": "cursor",
+            "sources": [cursor_source, opencode_source],
+            "installed": home / ".agents/skills/goal-flight/SKILL.md",
+            "resync_command": "./install.sh cursor <project> or ./install.sh opencode <project>",
+        },
+        {
+            "host": "grok",
+            "sources": [grok_source],
+            "installed": home / ".grok/skills/goal-flight/SKILL.md",
+            "resync_command": "./setup.sh --apply --yes --agent grok",
+        },
+        {
+            "host": "claude-code",
+            "sources": [source_root],
+            "installed": home / ".claude/skills/goal-flight/SKILL.md",
+            "resync_command": "git -C $HOME/.claude/skills/goal-flight pull --ff-only",
+        },
+    ]
+    candidates.extend(
+        {
+            "host": "codex",
+            "sources": [codex_source],
+            "installed": path,
+            "resync_command": "./install.sh codex",
+        }
+        for path in codex_plugin_cache
+    )
+
+    entries: list[dict] = []
+    for candidate in candidates:
+        entry = _installed_skill_entry(
+            host=candidate["host"],
+            sources=candidate["sources"],
+            installed=candidate["installed"],
+            source_root=source_root,
+            root_hash=root_hash,
+            resync_command=candidate["resync_command"],
+        )
+        if entry is not None:
+            entries.append(entry)
+    return {
+        "source_root": str(source_root),
+        "source_root_hash": root_hash,
+        "entries": entries,
+        "drift": any(item["drift"] for item in entries),
+    }
 
 
 def check_context_mode(repo: Path) -> dict:
@@ -944,6 +1094,7 @@ def doctor(repo: Path, *, fleet: bool = False, fleet_dir: Path | None = None, fl
         "repo": str(repo),
         "plugin": check_plugin(repo),
         "host_goalflight_install": check_host_goalflight_install(),
+        "installed_skill_drift": check_installed_skill_drift(skill_root, repo),
         "claude": version("claude", "--version"),
         "codex": {
             "desktop_present": codex_desktop,
@@ -1135,6 +1286,14 @@ def print_human(payload: dict) -> None:
     ]
     for host, item in (payload.get("host_goalflight_install") or {}).items():
         lines.append(status_line(item.get("ok"), f"{host} goal-flight host install", item.get("detail")))
+    for item in (payload.get("installed_skill_drift") or {}).get("entries", []):
+        detail = (
+            f"{item.get('path')} source={str(item.get('source_hash'))[:12]} "
+            f"installed={str(item.get('installed_hash'))[:12]}"
+        )
+        if item.get("drift"):
+            detail = f"{detail} resync={item.get('resync_command')}"
+        lines.append(status_line(not item.get("drift"), f"{item.get('host')} installed_skill_md_hash", detail))
     for name, item in payload["acp"].items():
         if name == "sdk":
             lines.append(status_line(item.get("ok"), "ACP SDK venv", item.get("python")))

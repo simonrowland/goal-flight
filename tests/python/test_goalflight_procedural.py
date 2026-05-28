@@ -136,6 +136,24 @@ def test_doctor_json_shape() -> None:
     assert_true("plugin section", "plugin" in payload and "manifest_exists" in payload["plugin"])
     assert_true("host install section", "host_goalflight_install" in payload)
     assert_true("codex host install probe", "codex" in payload["host_goalflight_install"])
+    assert_true("installed skill drift section", "installed_skill_drift" in payload)
+    isd = payload["installed_skill_drift"]
+    for key in ("source_root", "source_root_hash", "entries", "drift"):
+        assert_true(f"installed_skill_drift.{key} present", key in isd)
+    assert_true("installed_skill_drift entries is a list", isinstance(isd.get("entries"), list))
+    for entry in isd.get("entries", []):
+        for key in (
+            "host",
+            "path",
+            "source",
+            "source_hash",
+            "source_alternatives",
+            "installed_hash",
+            "drift",
+            "install_mode",
+            "resync_command",
+        ):
+            assert_true(f"installed_skill_drift entry {key} present", key in entry)
     assert_true("project readiness section", "project_goalflight_readiness" in payload)
     assert_true("capacity section", payload["capacity"]["schema"] == "goalflight.capacity.profile.v1")
     assert_true("autoreview section", "autoreview" in payload)
@@ -172,6 +190,100 @@ def test_doctor_json_shape() -> None:
         "resume_notes_pattern violations is a list",
         isinstance(rnp.get("pattern_violations"), list),
     )
+
+
+def _write_skill(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+
+
+def test_installed_skill_drift_covers_project_local_copy() -> None:
+    old_home = os.environ.get("HOME")
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            project = root / "project"
+            skill_root = root / "goal-flight"
+            os.environ["HOME"] = str(home)
+            _write_skill(skill_root / "SKILL.md", "root skill\n")
+            _write_skill(skill_root / "plugins/goal-flight/skills/goal-flight/SKILL.md", "codex skill\n")
+            _write_skill(skill_root / "configs/cursor/skills/goal-flight/SKILL.md", "cursor skill\n")
+            _write_skill(skill_root / "configs/opencode/skills/goal-flight/SKILL.md", "opencode skill\n")
+            _write_skill(skill_root / "configs/grok/skills/goal-flight/SKILL.md", "grok skill\n")
+            _write_skill(project / ".cursor/skills/goal-flight/SKILL.md", "old cursor skill\n")
+
+            payload = goalflight_doctor.check_installed_skill_drift(skill_root, project)
+            entries = {entry["path"]: entry for entry in payload["entries"]}
+            project_entry = entries[str(project / ".cursor/skills/goal-flight/SKILL.md")]
+            assert_true("project-local cursor copy detected", project_entry["host"] == "cursor")
+            assert_true("project-local stale copy warns", project_entry["drift"] is True)
+    finally:
+        if old_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = old_home
+
+
+def test_installed_skill_drift_allows_claude_link_mode() -> None:
+    old_home = os.environ.get("HOME")
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            project = root / "project"
+            skill_root = root / "goal-flight"
+            os.environ["HOME"] = str(home)
+            _write_skill(skill_root / "SKILL.md", "root skill\n")
+            _write_skill(skill_root / "plugins/goal-flight/skills/goal-flight/SKILL.md", "codex skill\n")
+            _write_skill(skill_root / "configs/cursor/skills/goal-flight/SKILL.md", "cursor skill\n")
+            _write_skill(skill_root / "configs/opencode/skills/goal-flight/SKILL.md", "opencode skill\n")
+            _write_skill(skill_root / "configs/grok/skills/goal-flight/SKILL.md", "grok skill\n")
+            cursor_parent = home / ".cursor/skills"
+            cursor_parent.mkdir(parents=True)
+            os.symlink(skill_root, cursor_parent / "goal-flight")
+
+            payload = goalflight_doctor.check_installed_skill_drift(skill_root, project)
+            entries = {entry["path"]: entry for entry in payload["entries"]}
+            cursor_entry = entries[str(home / ".cursor/skills/goal-flight/SKILL.md")]
+            assert_true("cursor link mode classified", cursor_entry["install_mode"] == "symlink")
+            assert_true("cursor link mode compares root skill", cursor_entry["source"] == str(skill_root / "SKILL.md"))
+            assert_true("cursor link mode does not false-warn", cursor_entry["drift"] is False)
+    finally:
+        if old_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = old_home
+
+
+def test_installed_skill_drift_project_symlink_stays_copy_mode() -> None:
+    old_home = os.environ.get("HOME")
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            actual_project = root / "actual-project"
+            project_link = root / "project-link"
+            skill_root = root / "goal-flight"
+            os.environ["HOME"] = str(home)
+            _write_skill(skill_root / "SKILL.md", "root skill\n")
+            _write_skill(skill_root / "plugins/goal-flight/skills/goal-flight/SKILL.md", "codex skill\n")
+            _write_skill(skill_root / "configs/cursor/skills/goal-flight/SKILL.md", "cursor skill\n")
+            _write_skill(skill_root / "configs/opencode/skills/goal-flight/SKILL.md", "opencode skill\n")
+            _write_skill(skill_root / "configs/grok/skills/goal-flight/SKILL.md", "grok skill\n")
+            _write_skill(actual_project / ".cursor/skills/goal-flight/SKILL.md", "cursor skill\n")
+            os.symlink(actual_project, project_link)
+
+            payload = goalflight_doctor.check_installed_skill_drift(skill_root, project_link)
+            entries = {entry["path"]: entry for entry in payload["entries"]}
+            cursor_entry = entries[str(project_link / ".cursor/skills/goal-flight/SKILL.md")]
+            assert_true("project symlink remains copy mode", cursor_entry["install_mode"] == "copy")
+            assert_true("project symlink copy does not false-warn", cursor_entry["drift"] is False)
+    finally:
+        if old_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = old_home
 
 
 def test_doctor_target_project_readiness_split() -> None:
@@ -1083,6 +1195,9 @@ def main() -> None:
         test_capacity_prunes_review_terminal_states,
         test_ledger_record_finish_status,
         test_doctor_json_shape,
+        test_installed_skill_drift_covers_project_local_copy,
+        test_installed_skill_drift_allows_claude_link_mode,
+        test_installed_skill_drift_project_symlink_stays_copy_mode,
         test_doctor_target_project_readiness_split,
         test_doctor_package_repo_validates_plugin_manifest,
         test_doctor_cli_target_project_skips_package_plugin,

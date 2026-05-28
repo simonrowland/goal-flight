@@ -35,6 +35,9 @@ and canonical docs layout.**
 
 - **Controller hosts** — Claude Code (reference), Codex, Cursor, and OpenCode
   ship as sibling controller/worker adapters with shared `SKILL.md` core.
+- **Installed skill resync** — copied host installs must be refreshed with
+  `./install.sh <host>` after source skill/support-file changes; doctor surfaces
+  `installed_skill_drift` JSON and `installed_skill_md_hash` text WARNs.
 - Root `ARCHITECTURE.md` is a pointer to `docs/architecture.md`.
 
 ### Known limitations (1.0.0)

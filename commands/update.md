@@ -8,6 +8,13 @@ Useful before starting a long unattended run (you want both fresh skill
 rules and fresh workers) or when triaging worker-side flakiness (might
 already be fixed upstream).
 
+## Installed skill resync
+
+After source `SKILL.md`, `commands/`, `protocols/`, `templates/`, or `adapters/`
+changes, copied host installs need `./install.sh <host>` from the source repo
+unless the host skill path is a symlink; doctor JSON reports
+`installed_skill_drift`, and text mode prints `installed_skill_md_hash` WARNs.
+
 ## Recipe
 
 ### Sweep 1 — Update goal-flight plugin
