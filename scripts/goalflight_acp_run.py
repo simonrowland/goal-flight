@@ -103,27 +103,52 @@ def make_title_allow_policy(
     patterns: list[Any],
     base: Callable[[Any, list[Any], str | None], str] | None = None,
 ) -> Callable[[Any, list[Any], str | None], str]:
-    """Wrap a base permission policy with an allow-by-title-pattern shortcut.
+    """Wrap a base permission policy with an allow-by-title-pattern fast-path
+    layered AFTER the base policy's hard safety gates.
 
-    Patterns are pre-compiled regex objects (anything with ``.search(s)``). When
-    the tool-call's title matches any pattern, return ``PERMISSION_ALLOW``
-    immediately. Otherwise fall through to ``base`` (defaults to
-    ``default_permission_policy``).
+    Patterns are pre-compiled regex objects (anything with ``.search(s)``). The
+    layering is intentional:
 
-    Used by the runner's ``--permission-allow-tool-title-pattern`` flag to let
-    the controller pre-authorize specific tool-call shapes inside a worker's
-    chunk scope without escalating mid-run. The classic case: a dispatched chunk
-    that includes "run ``./tests/run.sh``" in its acceptance criteria — the
-    controller passes a pattern like ``^./tests/run\\.sh$`` so the runner
-    auto-approves that exact execute request and the worker proceeds.
+      1. Hard safety gates ALWAYS run first — no title regex can bypass them:
+           - target outside cwd                        → escalate
+           - destructive shell/network (kind=execute, kind=fetch) without OS
+             sandbox enabled → falls through to base, which escalates
+      2. For tool-calls that pass (1), title regex fast-paths the
+         already-permittable subset (read-safe, in-cwd writes with locations).
+      3. Anything not matched by title falls through to ``base``
+         (defaults to ``default_permission_policy``).
 
-    R26 — restores the original ACP-passthrough design where the controller
-    exercises discretion (approves authorized scope) and escalates only requests
-    that genuinely need user judgment (destructive, out-of-scope, ambiguous).
+    Original use case: a dispatched chunk's acceptance criteria includes
+    "run ``./tests/run.sh``" — the controller passes a pattern like
+    ``^./tests/run\\.sh$`` to fast-path that exact shape. The pattern is
+    PRECISE and intentional, not broad.
+
+    Why this layering matters (sweep B P1, 2026-05-27): the previous
+    implementation ran title regex BEFORE hard gates, so a broad ``.*``
+    "YOLO" pattern would auto-allow ANY tool call — including
+    destructive execute, network fetch, and writes outside cwd. The pattern
+    became a silent over-authorization rather than a scope fast-path. The
+    new layering ensures even ``.*`` cannot bypass the outside-cwd gate or
+    sandbox-less execute/fetch gate; broad patterns only ever fast-path the
+    safe kinds. For workers that legitimately need execute/fetch, enable
+    OS sandbox (--os-sandbox read-only) — the sandbox is the backstop, and
+    ``permission_policy_for_dispatch`` auto-allows execute/fetch when
+    sandbox is on.
+
+    R26 — restores the original ACP-passthrough design: the controller
+    exercises discretion (approves authorized scope) and escalates only
+    requests that genuinely need user judgment (destructive, out-of-scope,
+    ambiguous).
     """
     base_policy = base or default_permission_policy
 
     def policy(tool_call: Any, options: list[Any], cwd: str | None) -> str:
+        # Defer hard-gate evaluation to a helper that mirrors
+        # default_permission_policy's escalation rules WITHOUT the
+        # final permittable-kind allows. If the base policy would
+        # escalate on a hard-gate basis, title regex must NOT bypass.
+        if _hard_gate_escalates(tool_call, cwd):
+            return base_policy(tool_call, options, cwd)
         title = _tool_call_title(tool_call)
         for pattern in patterns:
             try:
@@ -134,6 +159,38 @@ def make_title_allow_policy(
         return base_policy(tool_call, options, cwd)
 
     return policy
+
+
+def _hard_gate_escalates(tool_call: Any, cwd: str | None) -> bool:
+    """Return True if the tool-call would escalate on hard-gate grounds
+    that title regex must not bypass.
+
+    Hard gates (mirrors default_permission_policy's escalate path):
+      - target outside cwd                                → True
+      - kind ∈ {fetch, execute} when caller's base policy is the default
+        (sandbox-off treats these as escalate)            → True
+
+    The base policy is responsible for the final allow/escalate decision;
+    we only refuse to short-circuit when the call shape would have hit
+    one of these gates. When OS sandbox is on,
+    ``permission_policy_for_dispatch`` is the base — its sandbox-aware
+    behavior re-evaluates after this check, so execute/fetch with sandbox
+    on still gets auto-allowed by the base.
+
+    This function imports lazily to avoid circular imports during module
+    initialization.
+    """
+    # Local imports — _targets_outside_cwd and _tc_get live in the client.
+    try:
+        from goalflight_acp_client import _targets_outside_cwd, _tc_get
+    except ImportError:
+        return False
+    if _targets_outside_cwd(tool_call, cwd):
+        return True
+    kind = str(_tc_get(tool_call, "kind") or "")
+    if kind in {"fetch", "execute"}:
+        return True
+    return False
 from goalflight_liveness import (
     active_monotonic,
     heartbeat_wedge_decision,
@@ -855,6 +912,25 @@ async def run(args: argparse.Namespace) -> dict:
                 _err = {"code": -1, "message": f"invalid --permission-allow-tool-title-pattern: {exc}"}
                 await update_status(state="failed", error=_err)
                 return {"state": "failed", "error": _err}
+            # Broad-pattern + sandbox-off audit warning: even with the
+            # post-fix layering (sweep B P1), execute/fetch escalate when
+            # sandbox is off. A `.*` pattern paired with sandbox-off means
+            # workers needing execute/fetch will block on every tool call.
+            # Warn the operator at startup so they know to add --os-sandbox
+            # read-only (or scope patterns more precisely).
+            os_sandbox_profile = getattr(args, "os_sandbox", "off")
+            broad = [p for p in allow_patterns_raw if p in (".*", ".+", ".*$", "^.*$")]
+            if broad and os_sandbox_profile == "off":
+                import sys as _sys
+                _sys.stderr.write(
+                    "goalflight_acp_run: WARNING — broad title-allow pattern(s) "
+                    f"{broad!r} with --os-sandbox=off. Execute/fetch tool calls "
+                    "will still escalate (hard gate). Either pair with "
+                    "--os-sandbox=read-only (workers get auto-allow on "
+                    "execute/fetch via sandbox backstop) or scope patterns more "
+                    "precisely. See scripts/goalflight_acp_run.py "
+                    "make_title_allow_policy docstring.\n"
+                )
         else:
             permission_policy = None
 

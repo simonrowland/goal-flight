@@ -428,6 +428,82 @@ def test_chunk_review_canonical_invocation_has_stdin_redirect() -> None:
     )
 
 
+def test_title_allow_policy_layers_after_hard_gates() -> None:
+    """Worker-reliability invariant: title-allow regex is a fast-path LAYERED
+    AFTER hard safety gates, not before. A broad pattern like '.*' must NOT
+    silently authorize destructive execute, network fetch, or outside-cwd
+    writes. Catches sweep B P1 (2026-05-27).
+
+    Test cases:
+    - title '.*' + kind='read'           → ALLOW (fast-path safe)
+    - title '.*' + kind='execute'        → escalate (hard gate: sandbox-off
+                                            execute must escalate)
+    - title '.*' + kind='fetch'          → escalate (hard gate)
+    - title '.*' + target outside cwd    → escalate (hard gate)
+    - precise pattern matching execute   → still escalates (hard gate ALWAYS
+                                            wins; operator can't bypass via
+                                            narrow pattern either — must use
+                                            OS sandbox instead)
+    - no-match pattern + safe kind       → falls through to base; base allows
+    """
+    import re
+    import goalflight_acp_run as gar
+
+    yolo = [re.compile(".*")]
+    policy = gar.make_title_allow_policy(yolo)
+
+    # Helper to build a tool-call dict matching the client's _tc_get shape.
+    def tc(title, kind, locations=None):
+        return {
+            "title": title,
+            "kind": kind,
+            "locations": locations or [],
+        }
+
+    cwd = "/tmp/test-cwd"
+
+    # Safe read with broad pattern → allow (fast-path)
+    assert_true(
+        ".* allows read kind",
+        policy(tc("read foo.txt", "read"), [], cwd) == "allow",
+    )
+
+    # Execute with broad pattern → must escalate (hard gate)
+    assert_true(
+        ".* must NOT bypass execute hard-gate",
+        policy(tc("run rm -rf /", "execute"), [], cwd) == "escalate",
+    )
+
+    # Fetch with broad pattern → must escalate (hard gate)
+    assert_true(
+        ".* must NOT bypass fetch hard-gate",
+        policy(tc("curl http://evil", "fetch"), [], cwd) == "escalate",
+    )
+
+    # Outside-cwd write with broad pattern → must escalate
+    outside_write = tc("edit /etc/passwd", "edit",
+                        locations=[{"path": "/etc/passwd"}])
+    assert_true(
+        ".* must NOT bypass outside-cwd hard-gate",
+        policy(outside_write, [], cwd) == "escalate",
+    )
+
+    # Precise pattern matching execute → still escalates (hard gate always wins)
+    precise = gar.make_title_allow_policy([re.compile(r"^./tests/run\.sh$")])
+    assert_true(
+        "precise execute pattern still hits hard-gate",
+        precise(tc("./tests/run.sh", "execute"), [], cwd) == "escalate",
+    )
+
+    # In-cwd write with title match → allow (fast-path safe case)
+    in_cwd_write = tc("edit foo.py", "edit",
+                       locations=[{"path": f"{cwd}/foo.py"}])
+    assert_true(
+        "in-cwd write with broad pattern allows",
+        policy(in_cwd_write, [], cwd) == "allow",
+    )
+
+
 def test_commit_guard_refuses_with_active_leases_and_honors_override() -> None:
     """Worker-reliability invariant: commit guard refuses bare `git commit`
     when active same-root leases exist, and the error message names the
@@ -676,6 +752,7 @@ def main() -> None:
         test_review_job_codex_no_final_is_inconclusive,
         test_runners_write_status_on_capacity_and_spawn_failure,
         test_chunk_review_canonical_invocation_has_stdin_redirect,
+        test_title_allow_policy_layers_after_hard_gates,
         test_commit_guard_refuses_with_active_leases_and_honors_override,
         test_session_status_helper_contract,
         test_dispatched_worker_recovery_protocol_present,
