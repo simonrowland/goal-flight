@@ -165,32 +165,54 @@ def _hard_gate_escalates(tool_call: Any, cwd: str | None) -> bool:
     """Return True if the tool-call would escalate on hard-gate grounds
     that title regex must not bypass.
 
-    Hard gates (mirrors default_permission_policy's escalate path):
-      - target outside cwd                                → True
-      - kind ∈ {fetch, execute} when caller's base policy is the default
-        (sandbox-off treats these as escalate)            → True
+    Hard gates (mirrors default_permission_policy's full escalate path —
+    sweep B P1 follow-up tightened from 2 gates to 4):
+      - target outside cwd                                  → True
+      - kind ∈ {fetch, execute}                             → True
+      - kind ∈ {edit, delete, move} with no locations
+        (write whose target can't be proven in-cwd)         → True
+      - unknown / future kinds (anything not in the
+        {fetch, execute, edit, delete, move, "", read,
+         search, think} allowlist)                          → True
 
-    The base policy is responsible for the final allow/escalate decision;
-    we only refuse to short-circuit when the call shape would have hit
-    one of these gates. When OS sandbox is on,
+    Read-safe kinds (`""`, `read`, `search`, `think`) and
+    located in-cwd writes (`edit`, `delete`, `move` with locations)
+    are eligible for title-allow fast-path; everything else falls
+    through to the base policy.
+
+    The base policy is responsible for the final allow/escalate
+    decision. When OS sandbox is on,
     ``permission_policy_for_dispatch`` is the base — its sandbox-aware
-    behavior re-evaluates after this check, so execute/fetch with sandbox
-    on still gets auto-allowed by the base.
+    behavior re-evaluates after this check, so execute/fetch with
+    sandbox on still gets auto-allowed by the base.
 
-    This function imports lazily to avoid circular imports during module
-    initialization.
+    Import failure (extremely unlikely): treat the call as hard-gated
+    so we defer to the base instead of fast-pathing (fail-closed).
     """
-    # Local imports — _targets_outside_cwd and _tc_get live in the client.
     try:
-        from goalflight_acp_client import _targets_outside_cwd, _tc_get
+        from goalflight_acp_client import (
+            _READ_SAFE_KINDS,
+            _WRITE_KINDS,
+            _targets_outside_cwd,
+            _tc_get,
+            _tool_call_locations,
+        )
     except ImportError:
-        return False
+        return True  # fail-closed
     if _targets_outside_cwd(tool_call, cwd):
         return True
     kind = str(_tc_get(tool_call, "kind") or "")
     if kind in {"fetch", "execute"}:
         return True
-    return False
+    if kind in _WRITE_KINDS:
+        locations = _tool_call_locations(tool_call)
+        if not locations:
+            return True  # write with no targets we can verify in-cwd
+        return False  # in-cwd write — title-allow may fast-path
+    if kind in _READ_SAFE_KINDS:
+        return False  # read-safe — title-allow may fast-path
+    # Unknown / future kind — refuse to fast-path.
+    return True
 from goalflight_liveness import (
     active_monotonic,
     heartbeat_wedge_decision,
@@ -903,7 +925,22 @@ async def run(args: argparse.Namespace) -> dict:
         if allow_patterns_raw:
             try:
                 _compiled_patterns = [_re.compile(p) for p in allow_patterns_raw]
-                permission_policy = make_title_allow_policy(_compiled_patterns)
+                # Sweep B P1 follow-up: wire the sandbox-aware base into the
+                # title-allow policy. The client's spawn path only installs
+                # permission_policy_for_dispatch when permission_policy is
+                # None — when we pass a title-allow policy, we must compose
+                # the sandbox-aware policy as its base so --os-sandbox
+                # actually auto-allows in-cwd execute/fetch under the
+                # documented contract.
+                os_sandbox_profile = getattr(args, "os_sandbox", "off")
+                try:
+                    from goalflight_acp_client import permission_policy_for_dispatch
+                    base_policy = permission_policy_for_dispatch(os_sandbox_profile)
+                except ImportError:
+                    base_policy = None  # default to default_permission_policy
+                permission_policy = make_title_allow_policy(
+                    _compiled_patterns, base=base_policy
+                )
             except _re.error as exc:
                 # Invalid regex — fail loud rather than silently mis-authorize.
                 # Return a dict matching the function's declared `-> dict` return
@@ -918,9 +955,19 @@ async def run(args: argparse.Namespace) -> dict:
             # workers needing execute/fetch will block on every tool call.
             # Warn the operator at startup so they know to add --os-sandbox
             # read-only (or scope patterns more precisely).
-            os_sandbox_profile = getattr(args, "os_sandbox", "off")
-            broad = [p for p in allow_patterns_raw if p in (".*", ".+", ".*$", "^.*$")]
-            if broad and os_sandbox_profile == "off":
+            # Reuse os_sandbox_profile from base-policy wiring above.
+            # Broaden the "broad pattern" detection beyond exact strings:
+            # any pattern that matches an arbitrary string of safe-titles
+            # qualifies. Probe by compiling and searching against representative
+            # benign titles; if ALL match, treat as broad.
+            sentinel_titles = (
+                "read foo.txt", "edit bar.py", "search docs", "run ls",
+            )
+            broad: list[str] = []
+            for raw, compiled in zip(allow_patterns_raw, _compiled_patterns):
+                if all(compiled.search(t) for t in sentinel_titles):
+                    broad.append(raw)
+            if broad and os_sandbox_profile in ("off", "none", "host-default"):
                 import sys as _sys
                 _sys.stderr.write(
                     "goalflight_acp_run: WARNING — broad title-allow pattern(s) "

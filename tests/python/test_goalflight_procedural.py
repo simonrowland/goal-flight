@@ -570,6 +570,68 @@ def test_title_allow_policy_layers_after_hard_gates() -> None:
         policy(in_cwd_write, [], cwd) == "allow",
     )
 
+    # Sweep B P1 follow-up: extended hard-gate coverage.
+
+    # Write with NO locations → escalate (can't prove in-cwd)
+    write_no_loc = tc("edit ???", "edit", locations=[])
+    assert_true(
+        ".* must NOT bypass write-with-no-locations hard-gate",
+        policy(write_no_loc, [], cwd) == "escalate",
+    )
+
+    # kind=delete with locations in cwd → allow
+    delete_in_cwd = tc("delete foo.tmp", "delete",
+                       locations=[{"path": f"{cwd}/foo.tmp"}])
+    assert_true(
+        "in-cwd delete with broad pattern allows",
+        policy(delete_in_cwd, [], cwd) == "allow",
+    )
+
+    # kind=move with locations outside cwd → escalate (outside-cwd hard gate)
+    move_outside = tc("move /etc/foo /etc/bar", "move",
+                       locations=[{"path": "/etc/foo"}, {"path": "/etc/bar"}])
+    assert_true(
+        ".* must NOT bypass outside-cwd move",
+        policy(move_outside, [], cwd) == "escalate",
+    )
+
+    # Unknown / future kind → escalate (refuse to fast-path)
+    unknown_kind = tc("future-op blob", "switch_mode")
+    assert_true(
+        ".* must NOT bypass unknown kind hard-gate",
+        policy(unknown_kind, [], cwd) == "escalate",
+    )
+
+    # kind="" (empty) — read-safe per default_permission_policy → allow
+    kindless = tc("approve mcp elicitation", "")
+    assert_true(
+        "kindless (MCP elicitation shape) allows with broad pattern",
+        policy(kindless, [], cwd) == "allow",
+    )
+
+    # Regex compile failure path: ensure runtime regex exception falls
+    # through silently to the base policy. Pattern object whose .search
+    # raises emulates the bad-state case.
+    class BrokenPattern:
+        def search(self, _s):
+            raise RuntimeError("simulated regex backend failure")
+    broken_policy = gar.make_title_allow_policy([BrokenPattern()])
+    # On exception, the policy falls through to base. For kind=read, base
+    # allows. So a broken pattern should still let the safe call through.
+    assert_true(
+        "broken pattern falls through to base policy (read → allow)",
+        broken_policy(tc("safe read", "read"), [], cwd) == "allow",
+    )
+
+    # Multiple patterns: first hits hard gate, second matches title — title
+    # match must NOT bypass the hard gate. (Both patterns are .* but order
+    # doesn't matter since hard gate runs before pattern iteration.)
+    multi = gar.make_title_allow_policy([re.compile(".*"), re.compile("test")])
+    assert_true(
+        "multiple patterns: hard-gate still wins",
+        multi(tc("run anything", "execute"), [], cwd) == "escalate",
+    )
+
 
 def test_commit_guard_refuses_with_active_leases_and_honors_override() -> None:
     """Worker-reliability invariant: commit guard refuses bare `git commit`
