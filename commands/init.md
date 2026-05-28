@@ -87,20 +87,22 @@ python3 <skill-root>/scripts/goalflight_capacity.py profile --json
 - `docs-private/RESUME-NOTES-<YYYY-MM-DD>.md` from `templates/resume-notes.md`
   (canonical naming: ISO 8601 date so lexicographic sort = chronological; no
   topic prefixes — topic context goes inside the file's TL;DR)
-- `AGENTS.md` — 3-branch decision tree:
-  - **absent**: write from `templates/project-agents.md`, then
-    `git add -- AGENTS.md` (use the explicit pathspec — never bare
-    `git add -A` while workers may be in flight).
-  - **present, tracked, no `## Goal Flight Routing` section**: APPEND the
-    Goal Flight Routing block + top-of-file blockquote activation directive
+- `AGENTS.md` handling (downstream projects often keep AGENTS.md
+  per-operator and gitignored on purpose — that's fine; the file is
+  still the local skill entry point):
+  - **absent**: write from `templates/project-agents.md`. If the path is
+    NOT gitignored, `git add -- AGENTS.md`. If gitignored, leave
+    untracked — the operator wants it that way.
+  - **present, no `## Goal Flight Routing` section**: APPEND the Goal
+    Flight Routing block + top-of-file blockquote activation directive
     from the template (idempotent — check for the section header first).
-  - **present, tracked, already has the section**: skip (no-op).
-  - **present, but gitignored**: REFUSE with diagnostic — *"AGENTS.md is
-    gitignored in this project, which breaks skill load across machines and
-    teammates. AGENTS.md is the canonical skill entry point, not a
-    vendor-adapter file. Either remove the .gitignore entry / add
-    `!AGENTS.md` negation, or place goal-flight routing notes in
-    `.agent-context/goal-flight.md` and adjust the load order accordingly."*
+    Don't change the file's git-tracking state.
+  - **present, already has the section**: skip (no-op).
+  - For projects with multiple operators / public history that want the
+    goal-flight routing tracked: maintain `.agent-context/goal-flight.md`
+    separately, tracked, and reference it from the (per-operator,
+    gitignored) AGENTS.md. Init does not handle that split automatically
+    — operator decides.
 - `SKILL.md` from `templates/project-skill.md` when project has no root skill
 
 6. Write only compact environment facts into `docs-private/env-caveats.md`:

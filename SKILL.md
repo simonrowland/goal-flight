@@ -50,6 +50,16 @@ goal-flight session", you are NOT in a goal-flight run — do regular coding
 without loading the back half. Only load end-to-end when the verdict is
 "active" or when the user explicitly invokes `/goal-flight <command>`.
 
+**Skill-freshness + designated-controller check.** If your context has a
+"skill: goal-flight (previously invoked)" reminder but you can't quote
+this preamble verbatim, your loaded skill body is STALE — system reminders
+carry truncated content across compactions and silently drop load-bearing
+rules. Re-invoke `/goal-flight` to reload SKILL.md end-to-end before
+acting on its rules. Then check your terminal session ID
+(`scripts/goalflight_session_status.py --ensure-session`) against the
+active queue's `current_session.id` — if they match, you are the
+designated controller; if not, surface to user before claiming.
+
 ## Per-host pointers
 
 Per-host pointers tell non-native controllers where their installed wrapper lives.

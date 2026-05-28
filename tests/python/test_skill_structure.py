@@ -323,7 +323,7 @@ KNOWN_MAX_SECTION_LINE_GAPS = {
     "skill-load-order-mandatory": {
         "fix_chunk": "chunk-X budget realignment after AUI hardening",
         "max_section_lines": 10,
-        "actual_content_lines": 15,
+        "actual_content_lines": 24,
         "section_heading": "preamble",
     },
     "user-status-cadence-15min": {

@@ -156,9 +156,13 @@ def check_agents_md_state(project_root: Path) -> dict:
 
     Returns:
       present:           AGENTS.md exists on disk
-      tracked:           git knows about it
-      gitignored:        a gitignore rule matches it (catastrophic — skill
-                         load order silently breaks across machines)
+      tracked:           git knows about it (informational — many downstream
+                         projects intentionally keep AGENTS.md per-operator
+                         and gitignored, not shared. The local file is still
+                         the canonical skill entry point for this operator;
+                         doctor does not flag the gitignored shape as an
+                         error.)
+      gitignored:        a gitignore rule matches it (informational only)
       has_goalflight_section:  the "Goal Flight Routing" header is present
                          (means goal-flight has been wired into this AGENTS.md)
     """
@@ -193,33 +197,23 @@ def check_agents_md_state(project_root: Path) -> dict:
         out["tracked"] = tracked.get("returncode") == 0
         ignored = run(["git", "check-ignore", "-q", "AGENTS.md"], cwd=project_root)
         out["gitignored"] = ignored.get("returncode") == 0
-    # ok=true when: present + tracked + not gitignored + has goal-flight section
-    out["ok"] = bool(
-        out["present"] and out["tracked"] and not out["gitignored"]
-        and out["has_goalflight_section"]
-    )
-    if out["gitignored"]:
-        out["install_hint"] = (
-            "AGENTS.md is gitignored. It is the canonical skill entry point, "
-            "not a vendor adapter. Either remove the matching .gitignore "
-            "entry (or add `!AGENTS.md` negation) and `git add -- AGENTS.md`, "
-            "or place goal-flight routing notes in `.agent-context/goal-flight.md` "
-            "and adjust the load order accordingly."
-        )
-    elif not out["present"]:
+    # ok=true when AGENTS.md exists locally AND has the goal-flight section.
+    # Tracking + gitignored state are informational only — many downstream
+    # projects intentionally keep AGENTS.md per-operator-private.
+    out["ok"] = bool(out["present"] and out["has_goalflight_section"])
+    if not out["present"]:
         out["install_hint"] = (
             "AGENTS.md missing. Run `/goal-flight init` to write it from "
-            "`templates/project-agents.md`."
-        )
-    elif not out["tracked"]:
-        out["install_hint"] = (
-            "AGENTS.md is present but untracked. Run `git add -- AGENTS.md` "
-            "so other operators / machines see the skill entry point."
+            "`templates/project-agents.md`. Init respects existing gitignore "
+            "rules — if AGENTS.md is in your .gitignore, the file is created "
+            "locally and left untracked (per-operator pattern)."
         )
     elif not out["has_goalflight_section"]:
         out["install_hint"] = (
             "AGENTS.md present but missing the `## Goal Flight Routing` "
-            "section + activation directive. Run `/goal-flight init` to append."
+            "section + activation directive. Run `/goal-flight init` to "
+            "append the section. The file's tracked / gitignored state is "
+            "preserved."
         )
     return out
 

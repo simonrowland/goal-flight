@@ -77,6 +77,18 @@ activation contract above; **not** for ordinary one-off coding.
 
 0. Reload Goal Flight: `AGENTS.md` → host wrapper (if any) → `SKILL.md` →
    `commands/resume.md` and this file. Chat summaries are hints, not substitutes.
+0.5. **Skill-freshness + designated-controller check.** If a system
+   reminder says `goal-flight (previously invoked)` but you can't quote
+   SKILL.md line 35 ("⚠️ Read this skill end-to-end before acting"),
+   the loaded skill body is STALE (truncated reminders silently drop
+   load-bearing rules like "background >10s", `git commit -- <files>`,
+   "no `tail -f`"). Re-invoke `/goal-flight` to reload fresh, then
+   confirm you're the designated controller: compare your terminal's
+   session id (`goalflight_session_status.py --ensure-session`) against
+   the active queue's `current_session.id` field. If `current_session.pid`
+   is alive and the id mismatches yours, ANOTHER controller owns this
+   run — surface to user before claiming. If `current_session.pid` is
+   dead, `--force-release-stale` then claim.
 1. Activation check: `goalflight_session_status.py --text`. Bail out
    if "no active session".
 2. Read newest RESUME-NOTES via the find-newest one-liner above + queue

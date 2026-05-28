@@ -7,6 +7,14 @@ Private. Read before touching code.
 > — definitive verdict. If **active**, follow the load order in
 > "Goal Flight Routing" below. If **no active session**, do NOT auto-load
 > goal-flight's SKILL.md — only load when the user invokes `/goal-flight`.
+>
+> **Skill-freshness check (post-compaction):** if a system reminder says
+> the skill was previously invoked but you can't quote its preamble
+> verbatim, re-invoke `/goal-flight` to reload SKILL.md fresh — truncated
+> system reminders silently drop load-bearing rules across compactions.
+> Then verify you're the designated controller via session-id lookup
+> (`goalflight_session_status.py --ensure-session` vs the active queue's
+> `current_session.id`).
 
 ## What this project is
 
