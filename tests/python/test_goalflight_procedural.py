@@ -779,6 +779,77 @@ def test_session_status_helper_contract() -> None:
         ))
 
 
+def test_no_unsafe_codex_exec_invocations_across_docs() -> None:
+    """Worker-reliability regression: scan all doc + prompt + command files
+    for `codex exec` invocations that omit `< /dev/null`. Sweep A P0
+    (2026-05-27) found SKILL.md:154 had a duplicate of the bash-tail
+    canonical block without the stdin redirect; this test prevents that
+    class from recurring elsewhere.
+
+    Files scanned:
+    - SKILL.md
+    - commands/*.md (front-line worker prompts cite invocation shapes)
+    - prompts/gstack-*.md (review-prompt templates)
+    - protocols/*.md EXCEPT protocols/legacy/* (legacy is allowlisted)
+
+    Allowlist (technical debt; track via issue):
+    - protocols/legacy/bash-tail.md — kept for historical reference
+    - scripts/install-codex-overrides.sh — install-time, not runtime
+      review invocation
+    """
+    import re
+    forbidden_dirs = {"protocols/legacy"}
+    allowlist_files = set()
+    scan_paths: list[Path] = []
+    scan_paths.append(ROOT / "SKILL.md")
+    scan_paths.extend(sorted((ROOT / "commands").glob("*.md")))
+    scan_paths.extend(sorted((ROOT / "prompts").glob("gstack-*.md")))
+    for proto in sorted((ROOT / "protocols").glob("*.md")):
+        rel = proto.relative_to(ROOT).as_posix()
+        if any(rel.startswith(d + "/") or rel == d for d in forbidden_dirs):
+            continue
+        scan_paths.append(proto)
+
+    # Look for `codex exec` followed (within ~12 lines) by either a
+    # closing fence/text without `< /dev/null` OR an explicit pipe form.
+    # Allow `codex exec --help` informational mentions to pass.
+    bad: list[str] = []
+    for path in scan_paths:
+        rel = path.relative_to(ROOT).as_posix()
+        if rel in allowlist_files:
+            continue
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        for m in re.finditer(r"codex exec\s+--sandbox", text):
+            # Pull the surrounding ~16 lines as the invocation window.
+            start = m.start()
+            line_start = text.rfind("\n", 0, start) + 1
+            # Find the end of the invocation: nearest blank-line or 16 lines.
+            tail = text[line_start : line_start + 1200]
+            window_end = 0
+            blank_marker = "\n\n"
+            blank_idx = tail.find(blank_marker)
+            if blank_idx > 0:
+                window_end = blank_idx
+            else:
+                window_end = min(len(tail), 1200)
+            window = tail[:window_end]
+            # An invocation is safe if it contains `< /dev/null` OR is
+            # piped-into via stdin (heredoc / |) elsewhere.
+            if "< /dev/null" in window or "<<EOF" in window or "<<'" in window:
+                continue
+            # Allow informational mentions where the codex exec line is
+            # quoted inside backticks without a full multi-line invocation:
+            # check for a backtick close on the same line.
+            same_line = text[line_start : text.find("\n", line_start)]
+            if same_line.count("`") >= 2:
+                continue
+            bad.append(f"{rel}:{text[:start].count(chr(10)) + 1}")
+    assert_true(
+        f"no `codex exec --sandbox` invocations missing `< /dev/null` (found: {bad})",
+        not bad,
+    )
+
+
 def test_dispatched_worker_recovery_protocol_present() -> None:
     """Worker-reliability invariant: the controller-takeover recovery
     protocol must exist and reference the canonical verification gates.
@@ -819,6 +890,7 @@ def main() -> None:
         test_review_job_codex_no_final_is_inconclusive,
         test_runners_write_status_on_capacity_and_spawn_failure,
         test_chunk_review_canonical_invocation_has_stdin_redirect,
+        test_no_unsafe_codex_exec_invocations_across_docs,
         test_title_allow_policy_layers_after_hard_gates,
         test_denied_permission_downgrades_complete_to_blocked,
         test_commit_guard_refuses_with_active_leases_and_honors_override,
