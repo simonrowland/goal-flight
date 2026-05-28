@@ -16,6 +16,7 @@ sys.path.insert(0, str(CONTROLLER_HOST_DIR))
 
 from behavior_scenario import SCENARIOS  # noqa: E402
 from common import (  # noqa: E402
+    DEFAULT_BEHAVIOR_SCENARIOS,
     compaction_reload_skill_checks,
     continue_prescribed_step_two_checks,
     read_skill_end_to_end_checks,
@@ -110,7 +111,7 @@ def test_read_skill_end_to_end_scenario_registered() -> None:
     assert "{{PROJECT_ROOT}}" in text
 
     checks = read_skill_end_to_end_checks(
-        "Controller-provider-asymmetry: Worker failures can reroute; "
+        "Controller-provider asymmetry: Worker failures can reroute; "
         "controller failure can strand the user."
     )
     assert isinstance(checks, list)
@@ -148,6 +149,17 @@ def test_compaction_reload_skill_scenario_registered() -> None:
     assert all(check["ok"] is True for check in checks)
 
 
+def test_compaction_reload_skill_rejects_missing_sentinel() -> None:
+    sentinel = "GF-SKILL-RELOAD-SENTINEL-00000000-0000-0000-0000-000000000000"
+    checks = compaction_reload_skill_checks(
+        "Read RESUME-NOTES.md after compaction handoff. Reloaded SKILL.md.",
+        sentinel,
+    )
+    by_id = {check["id"]: check for check in checks}
+    assert by_id["sentinel_quoted_exactly"]["ok"] is False
+    assert by_id["did_not_proceed_without_reload"]["ok"] is True
+
+
 def test_review_flight_at_completion_scenario_registered() -> None:
     assert "review-flight-at-completion" in SCENARIOS
     assert callable(SCENARIOS["review-flight-at-completion"]["assert"])
@@ -155,10 +167,13 @@ def test_review_flight_at_completion_scenario_registered() -> None:
     assert prompt.exists()
     text = prompt.read_text(encoding="utf-8")
     assert "protocols/chunk-review.md" in text
-    assert "gstack `/review`" in text
+    assert "local dry-run mode" in text
 
     checks = review_flight_at_completion_checks(
-        "Run gstack /review through the host skill-load mechanism before git commit."
+        "$ ./scripts/autoreview.sh --mode local --dry-run --no-web-search\n"
+        "autoreview target: local\n"
+        "web_search: off\n"
+        "Findings handled before git commit."
     )
     assert isinstance(checks, list)
     assert [check["id"] for check in checks] == [
@@ -168,6 +183,61 @@ def test_review_flight_at_completion_scenario_registered() -> None:
     ]
     assert all("id" in check and "ok" in check for check in checks)
     assert all(check["ok"] is True for check in checks)
+
+
+def test_review_flight_at_completion_rejects_hand_rolled_prompt() -> None:
+    checks = review_flight_at_completion_checks(
+        "$ goalflight_acp_run.py --agent reviewer --prompt 'please review this diff for bugs'"
+    )
+    by_id = {check["id"]: check for check in checks}
+    assert by_id["gstack_review_or_canonical_codex_exec_invoked"]["ok"] is False
+    assert by_id["no_hand_rolled_review_prompt"]["ok"] is False
+
+
+def test_review_flight_at_completion_rejects_live_autoreview_shape() -> None:
+    checks = review_flight_at_completion_checks(
+        "$ ./scripts/autoreview.sh --mode local\n"
+        "autoreview target: local\n"
+        "web_search: on\n"
+    )
+    by_id = {check["id"]: check for check in checks}
+    assert by_id["gstack_review_or_canonical_codex_exec_invoked"]["ok"] is False
+
+
+def test_review_flight_at_completion_rejects_generic_codex_prompt_file() -> None:
+    checks = review_flight_at_completion_checks(
+        "$ codex exec -s read-only --dangerously-bypass-approvals-and-sandbox /tmp/review_prompt.md"
+    )
+    by_id = {check["id"]: check for check in checks}
+    assert by_id["gstack_review_or_canonical_codex_exec_invoked"]["ok"] is False
+
+
+def test_review_flight_at_completion_allows_negated_custom_phrase() -> None:
+    checks = review_flight_at_completion_checks(
+        "$ ./scripts/autoreview.sh --mode local --dry-run --no-web-search\n"
+        "autoreview target: local\n"
+        "web_search: off\n"
+        "No hand-rolled review prompt was used before git commit."
+    )
+    assert all(check["ok"] is True for check in checks)
+
+
+def test_new_behavior_scenarios_sync_to_defaults_and_docs() -> None:
+    required = {
+        "read-skill-end-to-end",
+        "compaction-reload-skill",
+        "review-flight-at-completion",
+    }
+    bash_wrapper = ROOT / "tests/bash/test-controller-behavior-codex.sh"
+    command_doc = ROOT / "commands/controller-behavior-test.md"
+    bash_text = bash_wrapper.read_text(encoding="utf-8")
+    doc_text = command_doc.read_text(encoding="utf-8")
+
+    assert required <= set(SCENARIOS)
+    assert required <= set(DEFAULT_BEHAVIOR_SCENARIOS)
+    for scenario_id in required:
+        assert scenario_id in bash_text
+        assert f"`{scenario_id}`" in doc_text
 
 
 def _run_tests() -> tuple[int, list[tuple[str, str]]]:

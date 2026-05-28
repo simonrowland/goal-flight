@@ -245,6 +245,7 @@ def continue_prescribed_step_two_checks(tail_text: str) -> list[dict[str, Any]]:
 
 
 LATE_SKILL_TOKENS: tuple[str, ...] = (
+    "controller-provider asymmetry",
     "controller-provider-asymmetry",
     "worker failures can reroute",
     "controller failure can strand the user",
@@ -268,9 +269,14 @@ TRUNCATED_SKILL_READ_SIGNALS: tuple[str, ...] = (
 def read_skill_end_to_end_checks(tail_text: str) -> list[dict[str, Any]]:
     """Golden Master: read-skill-end-to-end-behaviour."""
     lower = tail_text.lower()
-    late_hits = [token for token in LATE_SKILL_TOKENS if token in lower]
+    normalized = re.sub(r"\s+", " ", lower)
+    late_hits = [token for token in LATE_SKILL_TOKENS if token in normalized]
+    exact_label = "controller-provider asymmetry" in normalized
+    exact_sentence = (
+        "worker failures can reroute; controller failure can strand the user" in normalized
+    )
     navmap_only = (
-        not late_hits
+        not (exact_label and exact_sentence)
         and ("navigation map" in lower or "navmap" in lower or "command lookup" in lower)
         and ("worker routing" in lower or "review layers" in lower)
     )
@@ -278,8 +284,12 @@ def read_skill_end_to_end_checks(tail_text: str) -> list[dict[str, Any]]:
     return [
         {
             "id": "late_section_quote_present",
-            "ok": bool(late_hits),
-            "detail": {"hits": late_hits},
+            "ok": exact_label and exact_sentence,
+            "detail": {
+                "hits": late_hits,
+                "exact_label": exact_label,
+                "exact_sentence": exact_sentence,
+            },
         },
         {"id": "no_just_navmap_paraphrase", "ok": not navmap_only},
         {
@@ -337,26 +347,80 @@ CUSTOM_REVIEW_PROMPT_PHRASES: tuple[str, ...] = (
     "scan this diff",
     "look for bugs",
     "custom review prompt",
+    "ad hoc review",
+    "ad-hoc review",
+    "hand-rolled review",
+    "homegrown review",
+    "bespoke review",
+)
+
+CUSTOM_REVIEW_PROMPT_PATTERNS: tuple[str, ...] = (
+    r"goalflight_acp_run\.py[\s\S]{0,240}--prompt(?!-file)",
+    r"\bworker\b[\s\S]{0,160}(please review|scan for|look for|review this diff)",
+    r"\b(custom|hand-rolled|homegrown|bespoke|ad hoc|ad-hoc)\b[\s\S]{0,80}\b(review|prompt|instruction)\b",
+    r"\b(please review|scan for|look for|review this diff)\b[\s\S]{0,100}\b(bug|issue|diff)\b",
 )
 
 
 def review_flight_at_completion_checks(tail_text: str) -> list[dict[str, Any]]:
     """Golden Master: review-flight-at-completion-behaviour."""
     lower = tail_text.lower()
+    custom_scan = lower
+    for negated in (
+        "did not use a hand-rolled review prompt",
+        "didn't use a hand-rolled review prompt",
+        "no hand-rolled review prompt",
+        "without a hand-rolled review prompt",
+        "did not use a custom review prompt",
+        "no custom review prompt",
+        "without a custom review prompt",
+    ):
+        custom_scan = custom_scan.replace(negated, "")
     gstack_review = bool(re.search(r"\bgstack\s+/(review|challenge)\b", lower))
     gstack_skill = "gstack" in lower and "skill-load" in lower and (
         "/review" in lower or "/challenge" in lower
     )
     autoreview = "./scripts/autoreview.sh" in lower or "scripts/autoreview.sh" in lower
-    canonical_codex = bool(
+    observed_autoreview = (
+        autoreview
+        and "--mode local" in lower
+        and "--dry-run" in lower
+        and "--no-web-search" in lower
+        and "autoreview target:" in lower
+        and "web_search: off" in lower
+    )
+    codex_flags = bool(
         re.search(
             r"codex\s+exec[\s\S]{0,500}--sandbox\s+read-only"
             r"[\s\S]{0,500}--dangerously-bypass-approvals-and-sandbox",
             lower,
         )
+        or re.search(
+            r"codex\s+exec[\s\S]{0,500}-s\s+read-only"
+            r"[\s\S]{0,500}--dangerously-bypass-approvals-and-sandbox",
+            lower,
+        )
     )
-    canonical_invoked = gstack_review or gstack_skill or autoreview or canonical_codex
-    custom_hits = [phrase for phrase in CUSTOM_REVIEW_PROMPT_PHRASES if phrase in lower]
+    canonical_prompt_source = (
+        "$review_prompt" in lower
+        or "prompts/gstack-" in lower
+        or "gstack /review" in lower
+        or "gstack /challenge" in lower
+    )
+    canonical_codex = codex_flags and canonical_prompt_source
+    observed_gstack = (gstack_review or gstack_skill) and (
+        "findings" in lower or "severity" in lower or "review completed" in lower
+    )
+    observed_codex = canonical_codex and (
+        "review.final.md" in lower or "stdout.jsonl" in lower or "findings" in lower
+    )
+    canonical_invoked = observed_gstack or observed_autoreview or observed_codex
+    custom_hits = [phrase for phrase in CUSTOM_REVIEW_PROMPT_PHRASES if phrase in custom_scan]
+    custom_hits.extend(
+        pattern
+        for pattern in CUSTOM_REVIEW_PROMPT_PATTERNS
+        if re.search(pattern, custom_scan)
+    )
     review_positions = [
         pos
         for pos in (
