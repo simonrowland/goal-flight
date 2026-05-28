@@ -15,7 +15,12 @@ CONTROLLER_HOST_DIR = ROOT / "scripts/hosts/controller"
 sys.path.insert(0, str(CONTROLLER_HOST_DIR))
 
 from behavior_scenario import SCENARIOS  # noqa: E402
-from common import continue_prescribed_step_two_checks  # noqa: E402
+from common import (  # noqa: E402
+    compaction_reload_skill_checks,
+    continue_prescribed_step_two_checks,
+    read_skill_end_to_end_checks,
+    review_flight_at_completion_checks,
+)
 
 
 def _run_probe(*extra: str) -> dict:
@@ -93,6 +98,76 @@ def test_continue_prescribed_step_two_checks_shape() -> None:
     assert all(isinstance(check, dict) for check in checks)
     assert all(check["ok"] is True for check in checks)
     assert checks[2]["detail"] == {"hits": []}
+
+
+def test_read_skill_end_to_end_scenario_registered() -> None:
+    assert "read-skill-end-to-end" in SCENARIOS
+    assert callable(SCENARIOS["read-skill-end-to-end"]["assert"])
+    prompt = FIXTURES / "read-skill-end-to-end" / "prompt.md"
+    assert prompt.exists()
+    text = prompt.read_text(encoding="utf-8")
+    assert "SKILL.md" in text
+    assert "{{PROJECT_ROOT}}" in text
+
+    checks = read_skill_end_to_end_checks(
+        "Controller-provider-asymmetry: Worker failures can reroute; "
+        "controller failure can strand the user."
+    )
+    assert isinstance(checks, list)
+    assert [check["id"] for check in checks] == [
+        "late_section_quote_present",
+        "no_just_navmap_paraphrase",
+        "no_truncated_read_signal",
+    ]
+    assert all("id" in check and "ok" in check for check in checks)
+    assert all(check["ok"] is True for check in checks)
+
+
+def test_compaction_reload_skill_scenario_registered() -> None:
+    assert "compaction-reload-skill" in SCENARIOS
+    assert callable(SCENARIOS["compaction-reload-skill"]["assert"])
+    prompt = FIXTURES / "compaction-reload-skill" / "prompt.md"
+    assert prompt.exists()
+    text = prompt.read_text(encoding="utf-8")
+    assert "{{SENTINEL}}" in text
+    assert "SKILL_RELOAD_SENTINEL_QUOTE" in text
+
+    sentinel = "GF-SKILL-RELOAD-SENTINEL-00000000-0000-0000-0000-000000000000"
+    checks = compaction_reload_skill_checks(
+        f"Read RESUME-NOTES.md after compaction handoff. Reloaded SKILL.md. "
+        f"SKILL_RELOAD_SENTINEL_QUOTE: {sentinel}",
+        sentinel,
+    )
+    assert isinstance(checks, list)
+    assert [check["id"] for check in checks] == [
+        "sentinel_quoted_exactly",
+        "resume_notes_acknowledged",
+        "did_not_proceed_without_reload",
+    ]
+    assert all("id" in check and "ok" in check for check in checks)
+    assert all(check["ok"] is True for check in checks)
+
+
+def test_review_flight_at_completion_scenario_registered() -> None:
+    assert "review-flight-at-completion" in SCENARIOS
+    assert callable(SCENARIOS["review-flight-at-completion"]["assert"])
+    prompt = FIXTURES / "review-flight-at-completion" / "prompt.md"
+    assert prompt.exists()
+    text = prompt.read_text(encoding="utf-8")
+    assert "protocols/chunk-review.md" in text
+    assert "gstack `/review`" in text
+
+    checks = review_flight_at_completion_checks(
+        "Run gstack /review through the host skill-load mechanism before git commit."
+    )
+    assert isinstance(checks, list)
+    assert [check["id"] for check in checks] == [
+        "gstack_review_or_canonical_codex_exec_invoked",
+        "no_hand_rolled_review_prompt",
+        "review_runs_before_commit_signal",
+    ]
+    assert all("id" in check and "ok" in check for check in checks)
+    assert all(check["ok"] is True for check in checks)
 
 
 def _run_tests() -> tuple[int, list[tuple[str, str]]]:

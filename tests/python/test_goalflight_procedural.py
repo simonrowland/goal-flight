@@ -386,6 +386,74 @@ def test_runners_write_status_on_capacity_and_spawn_failure() -> None:
         assert_true("missing prompt status", missing_status["state"] == "failed")
 
 
+def test_chunk_review_canonical_invocation_has_stdin_redirect() -> None:
+    """Worker-reliability regression: bash-tail review wedge.
+
+    Root cause memorialized in commit b9af53d (2026-05-27): `codex exec`
+    reads stdin to EOF even when the prompt is passed positionally.
+    Without an explicit stdin close, background bash-tail invocations
+    inherit the parent shell's stdin and block forever — 0 bytes of stdout
+    for hours with near-zero CPU. The canonical invocation in
+    protocols/chunk-review.md MUST redirect stdin from /dev/null (or pipe
+    the prompt in via stdin). This test catches future edits that strip
+    the redirect.
+    """
+    chunk_review = (ROOT / "protocols/chunk-review.md").read_text()
+    # Locate the canonical invocation block under "How the review runs".
+    marker = "## How the review runs"
+    assert_true("chunk-review.md has 'How the review runs' section", marker in chunk_review)
+    after_marker = chunk_review.split(marker, 1)[1]
+    # First fenced bash block after the marker is the canonical invocation.
+    fence_start = after_marker.find("```bash")
+    assert_true("canonical invocation bash block present", fence_start >= 0)
+    fence_end = after_marker.find("```", fence_start + 7)
+    assert_true("canonical invocation bash block closed", fence_end > fence_start)
+    invocation = after_marker[fence_start:fence_end]
+    assert_true(
+        "canonical invocation invokes codex exec with sandbox + bypass-approvals",
+        "codex exec --sandbox read-only --dangerously-bypass-approvals-and-sandbox" in invocation,
+    )
+    assert_true(
+        "canonical invocation explicitly redirects stdin from /dev/null",
+        "< /dev/null" in invocation,
+    )
+    assert_true(
+        "canonical invocation captures stdout to a review final-md path",
+        "> docs-private/reviews/" in invocation and "review.final.md" in invocation,
+    )
+    assert_true(
+        "canonical invocation captures stderr to a sibling log",
+        "2> docs-private/reviews/" in invocation and "stderr.log" in invocation,
+    )
+
+
+def test_dispatched_worker_recovery_protocol_present() -> None:
+    """Worker-reliability invariant: the controller-takeover recovery
+    protocol must exist and reference the canonical verification gates.
+
+    Memorialized in commit 2a662aa: when a dispatched worker blocks
+    mid-chunk (typically on a permission elicitation or a wedged review),
+    the controller takes over by reading status JSON, running gates,
+    reviewing controller-side, staging the worker's scope explicitly,
+    and committing with worker attribution. Without this protocol the
+    failure mode is silent stalling.
+    """
+    recovery = ROOT / "protocols/dispatched-worker-recovery.md"
+    assert_true("dispatched-worker-recovery.md exists", recovery.exists())
+    text = recovery.read_text()
+    for needle in (
+        "status JSON",
+        "focused tests",
+        "codename",  # codename-hygiene scan (commit 2a662aa)
+        "stage",
+        "commit",
+    ):
+        assert_true(
+            f"recovery protocol mentions '{needle}'",
+            needle.lower() in text.lower(),
+        )
+
+
 def main() -> None:
     tests = [
         test_capacity_acquire_release_cooldown,
@@ -398,6 +466,8 @@ def main() -> None:
         test_instruction_split_contract,
         test_review_job_codex_no_final_is_inconclusive,
         test_runners_write_status_on_capacity_and_spawn_failure,
+        test_chunk_review_canonical_invocation_has_stdin_redirect,
+        test_dispatched_worker_recovery_protocol_present,
     ]
     for test in tests:
         test()

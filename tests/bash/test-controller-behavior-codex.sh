@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Live Codex controller behavior: doctor-loads scenario (bash-tail).
+# Live Codex controller behavior scenarios (bash-tail).
 #
 # Skips when:
 #   - codex not installed
@@ -25,7 +25,7 @@ if ! command -v codex >/dev/null 2>&1; then
   exit 0
 fi
 
-SCENARIOS="${GOALFLIGHT_CONTROLLER_SCENARIOS:-doctor-loads resume-after-compaction continue-prescribed-step-two}"
+SCENARIOS="${GOALFLIGHT_CONTROLLER_SCENARIOS:-doctor-loads resume-after-compaction continue-prescribed-step-two read-skill-end-to-end compaction-reload-skill review-flight-at-completion}"
 FAIL=0
 
 for SCENARIO in $SCENARIOS; do

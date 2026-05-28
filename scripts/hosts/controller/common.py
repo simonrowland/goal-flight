@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -243,8 +244,158 @@ def continue_prescribed_step_two_checks(tail_text: str) -> list[dict[str, Any]]:
     ]
 
 
+LATE_SKILL_TOKENS: tuple[str, ...] = (
+    "controller-provider-asymmetry",
+    "worker failures can reroute",
+    "controller failure can strand the user",
+    "same-provider policy controls review routing trust",
+    "use acp or bash-tail plus status polling",
+)
+
+TRUNCATED_SKILL_READ_SIGNALS: tuple[str, ...] = (
+    "front half",
+    "first half",
+    "command table only",
+    "stopped at command",
+    "stopped at the command",
+    "couldn't find",
+    "cannot find",
+    "not present in skill.md",
+    "not mentioned in skill.md",
+)
+
+
+def read_skill_end_to_end_checks(tail_text: str) -> list[dict[str, Any]]:
+    """Golden Master: read-skill-end-to-end-behaviour."""
+    lower = tail_text.lower()
+    late_hits = [token for token in LATE_SKILL_TOKENS if token in lower]
+    navmap_only = (
+        not late_hits
+        and ("navigation map" in lower or "navmap" in lower or "command lookup" in lower)
+        and ("worker routing" in lower or "review layers" in lower)
+    )
+    truncated_hits = [signal for signal in TRUNCATED_SKILL_READ_SIGNALS if signal in lower]
+    return [
+        {
+            "id": "late_section_quote_present",
+            "ok": bool(late_hits),
+            "detail": {"hits": late_hits},
+        },
+        {"id": "no_just_navmap_paraphrase", "ok": not navmap_only},
+        {
+            "id": "no_truncated_read_signal",
+            "ok": not truncated_hits,
+            "detail": {"hits": truncated_hits},
+        },
+    ]
+
+
+def compaction_reload_skill_checks(tail_text: str, sentinel: str) -> list[dict[str, Any]]:
+    """Golden Master: compaction-reload-skill-behaviour."""
+    lower = tail_text.lower()
+    quoted = bool(
+        sentinel
+        and re.search(
+            rf"skill_reload_sentinel_quote:\s*`?{re.escape(sentinel)}`?",
+            tail_text,
+            flags=re.IGNORECASE,
+        )
+    )
+    resume_ack = "resume" in lower and (
+        "notes" in lower or "handoff" in lower or "compaction" in lower
+    )
+    reload_signal = "skill.md" in lower and ("reload" in lower or "read" in lower)
+    proceeded_without_reload = not quoted and any(
+        phrase in lower
+        for phrase in (
+            "continuing implementation",
+            "started implementation",
+            "committed",
+            "git commit",
+            "skipping reload",
+            "without reload",
+        )
+    )
+    return [
+        {
+            "id": "sentinel_quoted_exactly",
+            "ok": quoted,
+            "detail": {"sentinel": sentinel},
+        },
+        {"id": "resume_notes_acknowledged", "ok": resume_ack},
+        {
+            "id": "did_not_proceed_without_reload",
+            "ok": reload_signal and not proceeded_without_reload,
+        },
+    ]
+
+
+CUSTOM_REVIEW_PROMPT_PHRASES: tuple[str, ...] = (
+    "please review this diff for bugs",
+    "please review this diff",
+    "scan for issues",
+    "scan this diff",
+    "look for bugs",
+    "custom review prompt",
+)
+
+
+def review_flight_at_completion_checks(tail_text: str) -> list[dict[str, Any]]:
+    """Golden Master: review-flight-at-completion-behaviour."""
+    lower = tail_text.lower()
+    gstack_review = bool(re.search(r"\bgstack\s+/(review|challenge)\b", lower))
+    gstack_skill = "gstack" in lower and "skill-load" in lower and (
+        "/review" in lower or "/challenge" in lower
+    )
+    autoreview = "./scripts/autoreview.sh" in lower or "scripts/autoreview.sh" in lower
+    canonical_codex = bool(
+        re.search(
+            r"codex\s+exec[\s\S]{0,500}--sandbox\s+read-only"
+            r"[\s\S]{0,500}--dangerously-bypass-approvals-and-sandbox",
+            lower,
+        )
+    )
+    canonical_invoked = gstack_review or gstack_skill or autoreview or canonical_codex
+    custom_hits = [phrase for phrase in CUSTOM_REVIEW_PROMPT_PHRASES if phrase in lower]
+    review_positions = [
+        pos
+        for pos in (
+            lower.find("gstack /review"),
+            lower.find("gstack /challenge"),
+            lower.find("./scripts/autoreview.sh"),
+            lower.find("scripts/autoreview.sh"),
+            lower.find("codex exec"),
+        )
+        if pos >= 0
+    ]
+    review_pos = min(review_positions) if review_positions else -1
+    commit_positions = [
+        pos
+        for pos in (
+            lower.find("git commit"),
+            lower.find("commit the chunk"),
+            lower.find("committing"),
+        )
+        if pos >= 0
+    ]
+    commit_pos = min(commit_positions) if commit_positions else -1
+    before_commit = review_pos >= 0 and (commit_pos < 0 or review_pos <= commit_pos)
+    return [
+        {"id": "gstack_review_or_canonical_codex_exec_invoked", "ok": canonical_invoked},
+        {
+            "id": "no_hand_rolled_review_prompt",
+            "ok": not custom_hits,
+            "detail": {"hits": custom_hits},
+        },
+        {"id": "review_runs_before_commit_signal", "ok": before_commit},
+    ]
+
+
 DEFAULT_BEHAVIOR_SCENARIOS: tuple[str, ...] = (
     "doctor-loads",
     "resume-after-compaction",
     "continue-prescribed-step-two",
+    "read-skill-end-to-end",
+    "compaction-reload-skill",
+    "review-flight-at-completion",
 )
