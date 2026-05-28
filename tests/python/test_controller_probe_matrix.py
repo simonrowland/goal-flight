@@ -7,6 +7,7 @@ import json
 import subprocess
 import sys
 import tempfile
+import types
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -580,6 +581,88 @@ def test_claude_acp_runner_uses_acp_shim_and_writes_transcript() -> None:
     assert "--" + "print" not in cmd
     assert payload["ok"] is True
     assert payload["transport"] == "acp"
+
+
+def test_codex_runner_writes_transcript_when_requested() -> None:
+    def fake_probe(controller: str) -> dict:
+        assert controller == "codex"
+        return {
+            "id": "codex",
+            "available": True,
+            "binary": "/tmp/codex",
+            "transports": ["bash_tail"],
+        }
+
+    def fake_doctor(_: Path) -> dict:
+        return {"ok": True, "doctor_ok": True, "host_install_ok": True}
+
+    def fake_prompt(scenario_id: str, project_root: Path, *, sentinel: str | None = None) -> str:
+        assert scenario_id == "doctor-loads"
+        assert project_root == ROOT
+        assert sentinel is None or sentinel == ""
+        return "Prompt mentions goalflight_doctor.py"
+
+    def fake_run_codex_bash_tail(**_: object) -> dict:
+        return {
+            "ok": True,
+            "tail_text": 'goalflight_doctor.py host_goalflight_install {"ok": true}\nCOMPLETE: true',
+            "complete_marker": True,
+            "watcher_returncode": 0,
+            "worker_returncode": 0,
+        }
+
+    original_probe = behavior_module.probe_matrix.probe_controller
+    original_doctor = behavior_module.doctor_snapshot
+    original_prompt = behavior_module._load_prompt
+    original_module = sys.modules.get("bash_tail_controller")
+    try:
+        behavior_module.probe_matrix.probe_controller = fake_probe
+        behavior_module.doctor_snapshot = fake_doctor
+        behavior_module._load_prompt = fake_prompt
+        sys.modules["bash_tail_controller"] = types.SimpleNamespace(
+            run_codex_bash_tail=fake_run_codex_bash_tail
+        )
+        with tempfile.TemporaryDirectory() as td:
+            payload = behavior_module.run_codex_scenario(
+                "doctor-loads",
+                project_root=ROOT,
+                timeout=5,
+                transcript_dir=td,
+            )
+            transcript = Path(payload["session"]["transcript_path"])
+            assert transcript == (Path(td) / "doctor-loads.transcript.log").resolve()
+            text = transcript.read_text(encoding="utf-8")
+            assert "controller: codex" in text
+            assert "Prompt mentions goalflight_doctor.py" in text
+            assert "COMPLETE: true" in text
+    finally:
+        behavior_module.probe_matrix.probe_controller = original_probe
+        behavior_module.doctor_snapshot = original_doctor
+        behavior_module._load_prompt = original_prompt
+        if original_module is None:
+            sys.modules.pop("bash_tail_controller", None)
+        else:
+            sys.modules["bash_tail_controller"] = original_module
+
+    assert payload["ok"] is True
+    assert payload["transport"] == "bash_tail"
+
+
+def test_multi_host_plan_requires_runner_supported_controller() -> None:
+    matrix = {
+        "controllers": {
+            "codex": {"available": False},
+            "opencode": {"available": True},
+        },
+        "available_controllers": ["opencode"],
+    }
+    plan = behavior_module.build_multi_host_plan("opencode", matrix=matrix)
+
+    assert plan["requested_controllers"] == ["opencode"]
+    assert plan["available_controllers"] == ["opencode"]
+    assert plan["supported_controllers"] == ["codex", "claude-acp"]
+    assert plan["selected_controllers"] == []
+    assert plan["available_unsupported_controllers"] == ["opencode"]
 
 
 def test_new_behavior_scenarios_sync_to_defaults_and_docs() -> None:

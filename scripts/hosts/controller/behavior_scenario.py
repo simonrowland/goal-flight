@@ -234,12 +234,67 @@ SCENARIOS: dict[str, dict[str, Any]] = {
     },
 }
 
+IMPLEMENTED_CONTROLLERS: tuple[str, ...] = ("codex", "claude-acp")
+
+CONTROLLER_ALIASES: dict[str, str] = {
+    "claude-code-acp": "claude-acp",
+    "claude-code-cli-acp": "claude-acp",
+}
+
+
+def build_multi_host_plan(
+    requested_text: str,
+    *,
+    matrix: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    requested_raw = [item.strip() for item in requested_text.split(",") if item.strip()]
+    requested: list[str] = []
+    for item in requested_raw:
+        normalized = CONTROLLER_ALIASES.get(item, item)
+        if normalized not in requested:
+            requested.append(normalized)
+
+    probe_payload = matrix if matrix is not None else probe_matrix.build_probe_matrix()
+    controllers = probe_payload.get("controllers") or {}
+    available = probe_payload.get("available_controllers") or []
+    supported = list(IMPLEMENTED_CONTROLLERS)
+    selected = [
+        controller
+        for controller in available
+        if controller in requested and controller in supported
+    ]
+    unknown = [controller for controller in requested if controller not in controllers]
+    unavailable = [
+        controller
+        for controller in requested
+        if controller in controllers and controller not in available
+    ]
+    available_unsupported = [
+        controller
+        for controller in requested
+        if controller in available and controller not in supported
+    ]
+
+    return {
+        "schema": "goalflight.controller-behavior.multi-host.plan.v1",
+        "requested_raw": requested_raw,
+        "requested_controllers": requested,
+        "available_controllers": available,
+        "supported_controllers": supported,
+        "selected_controllers": selected,
+        "unknown_controllers": unknown,
+        "unavailable_controllers": unavailable,
+        "available_unsupported_controllers": available_unsupported,
+        "scenarios": list(SCENARIOS),
+    }
+
 
 def run_codex_scenario(
     scenario_id: str,
     *,
     project_root: Path,
     timeout: float,
+    transcript_dir: str | None = None,
 ) -> dict[str, Any]:
     started = time.time()
     row = probe_matrix.probe_controller("codex")
@@ -311,6 +366,17 @@ def run_codex_scenario(
         }
     )
     ok = bool(session.get("ok")) and all(c.get("ok") for c in checks)
+    if transcript_dir:
+        transcript_path = _transcript_dir(project_root, transcript_dir) / f"{scenario_id}.transcript.log"
+        _write_codex_transcript(
+            transcript_path=transcript_path,
+            scenario_id=scenario_id,
+            prompt=prompt,
+            session=session,
+            checks=checks,
+            ok=ok,
+        )
+        session["transcript_path"] = str(transcript_path)
     return harness_result(
         controller="codex",
         scenario=scenario_id,
@@ -363,6 +429,39 @@ def _write_acp_transcript(
                 "",
                 "STDERR:",
                 stderr.rstrip(),
+                "",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def _write_codex_transcript(
+    *,
+    transcript_path: Path,
+    scenario_id: str,
+    prompt: str,
+    session: dict[str, Any],
+    checks: list[dict[str, Any]],
+    ok: bool,
+) -> None:
+    transcript_path.parent.mkdir(parents=True, exist_ok=True)
+    transcript_path.write_text(
+        "\n".join(
+            [
+                "controller: codex",
+                f"scenario: {scenario_id}",
+                f"ok: {ok}",
+                f"worker_returncode: {session.get('worker_returncode')}",
+                f"watcher_returncode: {session.get('watcher_returncode')}",
+                f"checks: {json.dumps(checks)}",
+                "",
+                "PROMPT:",
+                prompt.rstrip(),
+                "",
+                "TAIL:",
+                str(session.get("tail_text") or "").rstrip(),
                 "",
             ]
         )
@@ -559,7 +658,12 @@ def run_scenario(
     transcript_dir: str | None = None,
 ) -> dict[str, Any]:
     if controller == "codex":
-        return run_codex_scenario(scenario_id, project_root=project_root, timeout=timeout)
+        return run_codex_scenario(
+            scenario_id,
+            project_root=project_root,
+            timeout=timeout,
+            transcript_dir=transcript_dir,
+        )
     if controller == "claude-acp":
         return run_claude_code_acp_scenario(
             scenario_id,
