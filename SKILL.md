@@ -181,7 +181,8 @@ Milestone review is a separate gate from chunk review.
 Canonical nested review shape (full rationale + flags: `protocols/chunk-review.md`):
 
 ```bash
-codex exec --sandbox read-only --dangerously-bypass-approvals-and-sandbox \
+codex exec --sandbox read-only \
+  -c approval_policy=never \
   -c 'model_reasoning_effort="xhigh"' \
   --enable web_search_cached \
   "$REVIEW_PROMPT" \
@@ -192,10 +193,12 @@ codex exec --sandbox read-only --dangerously-bypass-approvals-and-sandbox \
 
 **`< /dev/null` is load-bearing.** Without it, `codex exec` reads stdin to EOF
 and the bash-tail invocation blocks forever (observed wedge 2026-05-27).
-**`--dangerously-bypass-approvals-and-sandbox` is scoped to this read-only
-nested-review pattern only** — do NOT generalize it to write operations or
-to top-level worker spawns. Apply P3-safe-easy findings inline; fix
-P0/P1/P2 before commit.
+**`-c approval_policy=never`** is the canonical non-interactive form (per
+`protocols/legacy/bash-tail.md` worker recipe). Do NOT substitute the
+deprecated `--dangerously-bypass-approvals-and-sandbox` flag — it is
+rejected by classifiers and explicitly forbidden in adapter manifests
+(`adapters/codex.json` `forbidden_args`). Apply P3-safe-easy findings
+inline; fix P0/P1/P2 before commit.
 
 ## Hard Invariants
 
