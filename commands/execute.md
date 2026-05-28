@@ -125,6 +125,57 @@ full investigation report in conversation — that defeats the dispatch and
 silently doubles the context cost (worker read + controller read of same
 content).
 
+**Return contract by worker class.** Dispatch prompts must specify which
+shape the worker should emit so the controller can parse the headline
+without reading the body.
+
+*Investigator (read-only — reviewer, auditor, plan-validator):*
+
+```
+READY: <findings-path>
+
+TL;DR: <≤3 lines>
+
+Findings: <P0> P0, <P1> P1, <P2> P2, <P3> P3
+Strongest concern: <one line>
+```
+
+*Executor (writes + commits — implementation chunk worker):*
+
+```
+COMMIT: <local sha>
+
+TL;DR: <≤3 lines — what shipped>
+
+DETAILED: <findings-path with diff narrative + reviewer-pass notes>
+Files: <changed-file-list>
+Tests: <X/Y passed>
+Reviewer pass: <none | gstack-review-clean | findings-applied>
+Strongest residual concern: <one line>
+```
+
+*Blocked (any worker class — sandbox / permission / hook / tool block):*
+
+```
+BLOCKED: <intended-step> blocked due to <reason>
+
+TL;DR: <≤3 lines — what was drafted, what blocked>
+
+Recommended controller action: <one line>
+```
+
+Workers DO NOT execute workarounds (alternate APIs, git plumbing, inline
+content dumps when file-write was blocked) — they return BLOCKED and the
+controller decides. Push is NEVER worker-authorized; commit-and-push is a
+two-step gate where the worker commits locally (if its envelope permits)
+and the controller pushes (only with explicit user permission per the
+push-discipline invariant).
+
+The controller reads TL;DR + headline (READY path / COMMIT sha / BLOCKED
+reason) on first pass. Open DETAILED only when TL;DR raises a flag,
+defer to the chunk-review pass in step 8, or when failure analysis is
+needed.
+
 8. Verification (chunk review — not milestone review):
 
 Read `protocols/chunk-review.md`.
