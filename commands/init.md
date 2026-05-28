@@ -92,10 +92,9 @@ python3 <skill-root>/scripts/goalflight_capacity.py profile --json
   - **present, but gitignored**: REFUSE with diagnostic — *"AGENTS.md is
     gitignored in this project, which breaks skill load across machines and
     teammates. AGENTS.md is the canonical skill entry point, not a
-    vendor-adapter file (see AGENT-FILENAME-POLICY.md). Either remove the
-    .gitignore entry / add `!AGENTS.md` negation, or place goal-flight
-    routing notes in `.agent-context/goal-flight.md` and adjust the load
-    order accordingly."*
+    vendor-adapter file. Either remove the .gitignore entry / add
+    `!AGENTS.md` negation, or place goal-flight routing notes in
+    `.agent-context/goal-flight.md` and adjust the load order accordingly."*
 - `SKILL.md` from `templates/project-skill.md` when project has no root skill
 
 6. Write only compact environment facts into `docs-private/env-caveats.md`:

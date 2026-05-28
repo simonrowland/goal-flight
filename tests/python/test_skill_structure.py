@@ -305,7 +305,7 @@ KNOWN_MAX_SECTION_LINE_GAPS = {
     "default-agent-caps-enforced": {
         "fix_chunk": "chunk-X budget realignment after AUI hardening",
         "max_section_lines": 25,
-        "actual_content_lines": 40,
+        "actual_content_lines": 42,
         "section_heading": "## Worker Routing",
     },
     # 2026-05-28 worker-reliability hardening overruns. Each was driven by

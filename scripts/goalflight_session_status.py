@@ -659,9 +659,28 @@ def force_release_stale(project_root: Path) -> tuple[int, list[str]]:
 # --- CLI --------------------------------------------------------------------
 
 
+def _default_project_root() -> str:
+    """Cwd-stable default for --project-root: prefer the git toplevel of
+    the current working directory; fall back to cwd if not in a git repo.
+    Sweep C P1 fix — invocations from subdirs now resolve to the repo
+    root automatically.
+    """
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=2,
+        )
+        if out.returncode == 0 and out.stdout.strip():
+            return out.stdout.strip()
+    except (subprocess.SubprocessError, OSError, FileNotFoundError):
+        pass
+    return str(Path.cwd())
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="goal-flight session status helper")
-    parser.add_argument("--project-root", default=str(Path.cwd()))
+    parser.add_argument("--project-root", default=_default_project_root())
     parser.add_argument("--ttl-days", type=int, default=7)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--json", action="store_true")

@@ -169,7 +169,17 @@ def check_agents_md_state(project_root: Path) -> dict:
         "has_goalflight_section": False,
     }
     if not (project_root / ".git").exists():
-        out["ok"] = out["present"]
+        # Non-git project: presence alone isn't enough — empty / frontmatter-
+        # only AGENTS.md should be ok=false. Treat as ok only when the file
+        # has substantive content (>500 bytes is a generous floor).
+        if out["present"]:
+            try:
+                size = (project_root / "AGENTS.md").stat().st_size
+            except OSError:
+                size = 0
+            out["ok"] = size >= 500
+        else:
+            out["ok"] = False
         return out
     if out["present"]:
         try:
@@ -190,15 +200,20 @@ def check_agents_md_state(project_root: Path) -> dict:
     if out["gitignored"]:
         out["install_hint"] = (
             "AGENTS.md is gitignored. It is the canonical skill entry point, "
-            "not a vendor adapter — see AGENT-FILENAME-POLICY.md. Either remove "
-            "the matching .gitignore entry (or add `!AGENTS.md` negation) and "
-            "`git add -- AGENTS.md`, or place goal-flight routing notes in "
-            "`.agent-context/goal-flight.md` and adjust load order."
+            "not a vendor adapter. Either remove the matching .gitignore "
+            "entry (or add `!AGENTS.md` negation) and `git add -- AGENTS.md`, "
+            "or place goal-flight routing notes in `.agent-context/goal-flight.md` "
+            "and adjust the load order accordingly."
         )
     elif not out["present"]:
         out["install_hint"] = (
-            "AGENTS.md missing. Run `/goal-flight init` to write the template "
-            "or `goalflight_session_status.py --text` is not reachable."
+            "AGENTS.md missing. Run `/goal-flight init` to write it from "
+            "`templates/project-agents.md`."
+        )
+    elif not out["tracked"]:
+        out["install_hint"] = (
+            "AGENTS.md is present but untracked. Run `git add -- AGENTS.md` "
+            "so other operators / machines see the skill entry point."
         )
     elif not out["has_goalflight_section"]:
         out["install_hint"] = (
@@ -216,17 +231,42 @@ def check_session_status(skill_root: Path, project_root: Path) -> dict:
     """
     helper = skill_root / "scripts/goalflight_session_status.py"
     if not helper.exists():
-        return {"ok": False, "present": False, "install_hint": str(helper) + " missing"}
+        return {
+            "ok": False,
+            "present": False,
+            "install_hint": (
+                f"{helper} missing — reinstall goal-flight or check that "
+                "the skill-root environment variable points at the right tree."
+            ),
+        }
     out = run(
         ["python3", str(helper), "--project-root", str(project_root), "--json"],
         timeout=10.0,
     )
     if out.get("returncode") != 0:
-        return {"ok": False, "present": True, "error": out.get("stderr") or out.get("stdout")}
+        return {
+            "ok": False,
+            "present": True,
+            "error": out.get("stderr") or out.get("stdout"),
+            "install_hint": (
+                "session_status helper returned nonzero; reproduce with "
+                f"`python3 {helper} --project-root {project_root} --text` "
+                "and check the stderr."
+            ),
+        }
     try:
         payload = json.loads(out.get("stdout") or "{}")
     except json.JSONDecodeError as exc:
-        return {"ok": False, "present": True, "error": f"json decode: {exc}"}
+        return {
+            "ok": False,
+            "present": True,
+            "error": f"json decode: {exc}",
+            "install_hint": (
+                "session_status returned non-JSON stdout — the helper has "
+                "a bug or the python3 launcher is broken. Reproduce with "
+                f"`python3 {helper} --project-root {project_root} --json`."
+            ),
+        }
     return {
         "ok": True,
         "present": True,
@@ -236,6 +276,7 @@ def check_session_status(skill_root: Path, project_root: Path) -> dict:
         "queue_reason": payload.get("queue_reason"),
         "active_leases_in_project": payload.get("active_leases_in_project", 0),
         "newest_resume_notes": payload.get("newest_resume_notes"),
+        "resume_notes_active": payload.get("resume_notes_active"),
     }
 
 
@@ -244,6 +285,10 @@ def check_resume_notes_pattern(project_root: Path) -> dict:
     pattern: RESUME-NOTES-<YYYY-MM-DD>[-rev<N>].md. Surfaces topic-prefixed
     variants (e.g. RESUME-NOTES-generalize-2026-05-20.md) as WARN — those
     break the find-newest-by-lexicographic-sort convention.
+
+    `newest` filters to canonical files only — so the find-newest workflow
+    described in protocols/state-handoff.md picks the right file even when
+    historical topic-prefixed variants remain.
     """
     private = project_root / "docs-private"
     if not private.is_dir():
@@ -252,15 +297,16 @@ def check_resume_notes_pattern(project_root: Path) -> dict:
 
     canonical = re.compile(r"^RESUME-NOTES-\d{4}-\d{2}-\d{2}(-rev\d+)?\.md$")
     files = sorted(private.glob("RESUME-NOTES-*.md"))
-    violations: list[str] = []
-    for f in files:
-        if not canonical.match(f.name):
-            violations.append(f.name)
+    canonical_files = [f for f in files if canonical.match(f.name)]
+    violations: list[str] = [f.name for f in files if f not in canonical_files]
     return {
         "ok": not violations,
         "present": bool(files),
         "count": len(files),
-        "newest": str(files[-1].relative_to(project_root)) if files else None,
+        # Sweep D P2 fix: filter to canonical-only for newest. Lex-sort of
+        # canonical-only files = chronological by construction.
+        "newest": str(canonical_files[-1].relative_to(project_root)) if canonical_files else None,
+        "newest_any": str(files[-1].relative_to(project_root)) if files else None,
         "pattern_violations": violations,
         "install_hint": (
             f"RESUME-NOTES files with non-canonical names: {violations}. "

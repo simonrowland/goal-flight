@@ -103,12 +103,21 @@ Symptoms:
 
 Recovery options:
 
-1. **If the bundled commit has NOT been pushed:** `git reset --soft
-   HEAD~1` brings the bundled changes back to staging. Then commit by
-   scope with explicit pathspecs:
+1. **If the bundled commit has NOT been pushed** — preflight first, then
+   reset:
+   ```bash
+   # Preflight (run all three before reset):
+   git rev-parse --abbrev-ref @{u} 2>/dev/null && echo "BRANCH HAS UPSTREAM — verify not pushed"
+   git status --short                                # confirm clean working tree (no uncommitted)
+   bundled_sha=$(git rev-parse HEAD)
+   echo "preserving bundle as $bundled_sha"          # so you can recover via reflog if needed
+   ```
+   Then `git reset --soft HEAD~1` brings the bundled changes back to
+   staging. Commit by scope with explicit pathspecs:
    `git commit -m "<scope-A msg>" -- <scope-A files>` followed by
-   `git commit -m "<scope-B msg>" -- <scope-B files>`. History is now
-   correctly attributed.
+   `git commit -m "<scope-B msg>" -- <scope-B files>`. History now
+   correctly attributed. Recovery if anything goes wrong:
+   `git reset --hard "$bundled_sha"` restores the bundled commit.
 2. **If the bundled commit HAS been pushed (or rewriting is undesired):**
    leave it in place. Amend its message to credit all bundled scopes
    (`git commit --amend -m "<combined msg referencing chunks 6 + 7>"`),

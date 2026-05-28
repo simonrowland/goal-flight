@@ -91,7 +91,7 @@ host-specific print-mode shortcuts.
 | chunk-vs-milestone review | Review layers | `protocols/chunk-review.md`, `protocols/milestone-review.md` |
 | dispatch axes (per-task routing table is in Worker Routing) | Dispatch Model, Worker Routing | `protocols/dispatch-routing.md` |
 | **worker permissions / YOLO warning** | Worker Routing | `scripts/goalflight_acp_run.py` `make_title_allow_policy` |
-| **worker blocked: controller takeover** | (back half) | `protocols/dispatched-worker-recovery.md` |
+| **worker blocked: controller takeover** | Worker Routing | `protocols/dispatched-worker-recovery.md` |
 | rate limits & caps | Capacity and rate limits | `scripts/goalflight_capacity.py`, `scripts/goalflight_rate_pressure.py` |
 | worker markers | Worker Markers | `protocols/worker-markers.md`, `scripts/goalflight_watch.py` |
 | resume/compaction (canonical reload order) | State | `commands/resume.md`, `protocols/state-handoff.md`, `scripts/goalflight_session_status.py` |
@@ -299,17 +299,19 @@ Discovery probes do not use network or model calls.
 ## Worker Routing
 
 **Permission-pattern warning** (controller-side, when dispatching ACP workers):
-the `--permission-allow-tool-title-pattern` flag fast-paths titles matching
-the regex through to PERMISSION_ALLOW, but ONLY for the safe subset (read,
-in-cwd writes). Hard gates (outside-cwd writes, kind=execute, kind=fetch)
-always run first regardless of pattern — so a broad `.*` "YOLO" pattern
-will NOT silently authorize destructive operations. Workers that need
-execute/fetch must run under `--os-sandbox=read-only` so the sandbox is the
-backstop; the runner emits a startup warning when a broad pattern is paired
-with sandbox-off. Scope patterns precisely (e.g.
-`^./tests/run\.sh$`) when sandbox is off. See
+**Always use precise patterns** scoped to the dispatched chunk's authorized
+shapes (e.g. `^./tests/run\.sh$` for a chunk whose acceptance criteria
+include running the test sweep). `--permission-allow-tool-title-pattern`
+fast-paths matching titles BUT only for the safe subset — hard gates
+(outside-cwd writes, kind=execute, kind=fetch without sandbox, write with
+no in-cwd locations, unknown kinds) always run first, so a broad `.*`
+"YOLO" pattern CAN'T silently authorize destructive operations. **OS
+sandbox is a defense-in-depth backstop, not a permission-design substitute**
+— pair `--os-sandbox=read-only` (or `workspace-write` when commits are
+expected) with precise patterns. The runner emits a startup warning when a
+broad pattern is paired with sandbox-off. See
 `scripts/goalflight_acp_run.py` `make_title_allow_policy` for the full
-layering rationale.
+layering rationale (sweep B P1 + follow-ups).
 
 Default routing by task:
 
