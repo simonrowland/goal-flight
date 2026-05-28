@@ -17,6 +17,7 @@ sys.path.insert(0, str(SCRIPTS))
 import goalflight_doctor
 import goalflight_capacity
 import goalflight_review_job
+import goalflight_session_status
 
 
 def run(args: list[str], *, state_dir: Path | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -427,6 +428,137 @@ def test_chunk_review_canonical_invocation_has_stdin_redirect() -> None:
     )
 
 
+def test_session_status_helper_contract() -> None:
+    """Worker-reliability invariant: the session-status helper is the
+    canonical activation signal across compactions. Post-compaction agents
+    run it from `AGENTS.md` to decide whether to load the skill.
+
+    Covered scenarios:
+    - empty project → not active, queue_file None
+    - queue with state=active fresh → active, queue_state reflected
+    - queue with state=active but last-touched > ttl → abandoned (not active)
+    - queue with state=complete → not active, queue_state reflected
+    - claim by alive different pid refuses; force succeeds
+    - release clears current_session + appends history.ended_at
+    """
+    import goalflight_session_status as gss
+
+    with tempfile.TemporaryDirectory() as td:
+        project = Path(td)
+        (project / "docs-private").mkdir()
+
+        # Empty project
+        status = gss.aggregate_status(project)
+        assert_true("empty project not active", status["active"] is False)
+        assert_true("empty project queue_file None", status["queue_file"] is None)
+
+        # Fresh active queue
+        queue = project / "docs-private/goal-queue-demo.md"
+        queue.write_text(
+            "---\n"
+            "slug: demo\n"
+            "started: 2026-05-28\n"
+            "state: active\n"
+            f"last-touched: {gss._now_iso()}\n"
+            "---\n\n"
+            "# Demo queue\n"
+        )
+        status = gss.aggregate_status(project)
+        assert_true("fresh active queue is active", status["active"] is True)
+        assert_true("fresh active queue_state=active", status["queue_state"] == "active")
+        assert_true("fresh active queue_slug=demo", status["queue_slug"] == "demo")
+
+        # Active but stale (past TTL)
+        queue.write_text(
+            "---\n"
+            "slug: demo\n"
+            "started: 2025-04-01\n"
+            "state: active\n"
+            "last-touched: 2025-04-01T00:00:00Z\n"
+            "---\n\n"
+            "# Demo queue\n"
+        )
+        status = gss.aggregate_status(project, ttl_days=7)
+        assert_true("stale active queue abandoned", status["active"] is False)
+        assert_true("stale queue still reports state=active", status["queue_state"] == "active")
+        assert_true("stale queue reason mentions abandoned", "abandoned" in status["queue_reason"])
+
+        # Complete queue → not active
+        queue.write_text(
+            "---\n"
+            "slug: demo\n"
+            "started: 2026-05-28\n"
+            "state: complete\n"
+            f"last-touched: {gss._now_iso()}\n"
+            "---\n\n"
+            "# Demo queue\n"
+        )
+        status = gss.aggregate_status(project)
+        assert_true("complete queue not active", status["active"] is False)
+        assert_true("complete queue_state=complete", status["queue_state"] == "complete")
+
+        # Claim refuses on live different pid
+        queue.write_text(
+            "---\n"
+            "slug: demo\n"
+            "state: active\n"
+            f"last-touched: {gss._now_iso()}\n"
+            "current_session:\n"
+            "  id: 11111111-1111-1111-1111-111111111111\n"
+            f"  pid: {os.getpid()}\n"  # alive pid (this test process)
+            "  started_at: 2026-05-28T00:00:00Z\n"
+            "  hostname: testhost\n"
+            "---\n\n"
+            "# Demo queue\n"
+        )
+        # Use a fresh session id by deleting any cached session file.
+        sf = project / "docs-private/.goal-flight-current-session.json"
+        if sf.exists():
+            sf.unlink()
+        ok, msg = gss.claim(project, queue, force=False)
+        assert_true("claim refuses on alive different pid", ok is False)
+        assert_true("claim refusal mentions force", "force" in msg.lower())
+
+        # Force claim succeeds
+        ok, msg = gss.claim(project, queue, force=True)
+        assert_true("force claim succeeds", ok is True)
+
+        # Claim succeeds when prior pid is dead
+        queue.write_text(
+            "---\n"
+            "slug: demo\n"
+            "state: active\n"
+            f"last-touched: {gss._now_iso()}\n"
+            "current_session:\n"
+            "  id: 22222222-2222-2222-2222-222222222222\n"
+            "  pid: 1\n"  # init pid is alive but very unlikely to belong to us;
+            # use a high pid that's almost certainly dead instead
+            "  started_at: 2026-05-28T00:00:00Z\n"
+            "  hostname: testhost\n"
+            "---\n\n"
+            "# Demo queue\n"
+        )
+        # Replace pid with a definitely-dead one (99999999 well above any practical pid)
+        text = queue.read_text().replace("pid: 1", "pid: 99999999")
+        queue.write_text(text)
+        sf.unlink(missing_ok=True)
+        ok, msg = gss.claim(project, queue, force=False)
+        assert_true("claim succeeds with dead prior pid", ok is True)
+
+        # Release clears current_session and stamps ended_at on history
+        ok, msg = gss.release(project, queue, reason="test-exit")
+        assert_true("release succeeds", ok is True)
+        front, _ = gss._parse_frontmatter(queue.read_text())
+        assert_true(
+            "release clears current_session",
+            front.get("current_session") in (None, {}, "null"),
+        )
+        history = front.get("session_history") or []
+        assert_true("release stamps history.ended_at", any(
+            isinstance(e, dict) and e.get("ended_at") for e in history
+        ))
+
+
 def test_dispatched_worker_recovery_protocol_present() -> None:
     """Worker-reliability invariant: the controller-takeover recovery
     protocol must exist and reference the canonical verification gates.
@@ -467,6 +599,7 @@ def main() -> None:
         test_review_job_codex_no_final_is_inconclusive,
         test_runners_write_status_on_capacity_and_spawn_failure,
         test_chunk_review_canonical_invocation_has_stdin_redirect,
+        test_session_status_helper_contract,
         test_dispatched_worker_recovery_protocol_present,
     ]
     for test in tests:
