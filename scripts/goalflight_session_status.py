@@ -78,47 +78,53 @@ def ensure_session(project_root: Path, *, pid: int | None = None) -> dict:
     file already has a record for this PID (e.g., earlier command in the
     same terminal), returns it. Otherwise creates a fresh record.
 
-    Stale per-PID slots whose PID is dead are pruned on each write.
+    The session-file mutation runs under a session-file lock + atomic
+    write with a unique temp path. Two concurrent ensure_session()s from
+    different terminals serialize on the lock, then merge their writes
+    safely (each adds its own pid slot without clobbering the other).
     """
     pid = pid or os.getpid()
     path = _session_file(project_root)
     path.parent.mkdir(parents=True, exist_ok=True)
-    data: dict[str, dict] = {}
-    if path.exists():
-        try:
-            raw = json.loads(path.read_text())
-        except (json.JSONDecodeError, OSError):
-            raw = None
-        # Back-compat: previous shape was a single record without a pid map.
-        # If we find that, migrate it under its own pid key.
-        if isinstance(raw, dict):
-            if "id" in raw and "pid" in raw and not all(
-                isinstance(v, dict) for v in raw.values()
-            ):
-                data = {str(raw.get("pid")): raw}
-            else:
-                # Map-shape: keys are pid strings, values are records.
-                data = {str(k): v for k, v in raw.items() if isinstance(v, dict)}
-    key = str(pid)
-    if key in data:
-        # Existing record for this PID — return it as-is. Pruning of
-        # dead-pid slots from OTHER terminals is a maintenance concern
-        # handled by --force-release-stale, not the ensure_session path
-        # (which is hot — runs on every CLI invocation in a goal-flight
-        # terminal).
-        result = data[key]
-    else:
-        result = {
-            "id": str(uuid.uuid4()),
-            "pid": pid,
-            "started_at": _now_iso(),
-            "hostname": socket.gethostname(),
-        }
-        data[key] = result
-    # Atomic write via temp file rename.
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2) + "\n")
-    tmp.replace(path)
+    with _file_lock(path):
+        data: dict[str, dict] = {}
+        if path.exists():
+            try:
+                raw = json.loads(path.read_text())
+            except (json.JSONDecodeError, OSError):
+                raw = None
+            # Back-compat: previous shape was a single record without a pid map.
+            # If we find that, migrate it under its own pid key.
+            if isinstance(raw, dict):
+                if "id" in raw and "pid" in raw and not all(
+                    isinstance(v, dict) for v in raw.values()
+                ):
+                    data = {str(raw.get("pid")): raw}
+                else:
+                    # Map-shape: keys are pid strings, values are records.
+                    data = {str(k): v for k, v in raw.items() if isinstance(v, dict)}
+        key = str(pid)
+        if key in data:
+            # Existing record for this PID — return it as-is. Pruning of
+            # dead-pid slots from OTHER terminals is a maintenance concern
+            # handled by --force-release-stale, not the ensure_session path
+            # (which is hot — runs on every CLI invocation in a goal-flight
+            # terminal).
+            result = data[key]
+        else:
+            result = {
+                "id": str(uuid.uuid4()),
+                "pid": pid,
+                "started_at": _now_iso(),
+                "hostname": socket.gethostname(),
+            }
+            data[key] = result
+        # Atomic write via unique temp file rename. Unique suffix prevents
+        # concurrent ensure_session()s from clobbering each other's temp
+        # files (lock-serialized but defensive).
+        tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}")
+        tmp.write_text(json.dumps(data, indent=2) + "\n")
+        tmp.replace(path)
     return result
 
 
@@ -487,6 +493,13 @@ def _file_lock(path: Path):
     """Per-file lock using fcntl.flock. Context-manager that opens
     `path.lock` and acquires an exclusive lock; releases on exit.
     Two concurrent claims on the same queue now serialize.
+
+    Network filesystems (NFS, SMB) sometimes refuse `fcntl.flock` with
+    `ENOLCK` or `EOPNOTSUPP`. We catch those, emit a single stderr
+    diagnostic, and fall through to lock-free execution. The race is
+    bounded by the atomic write semantics (temp + rename) so even
+    without locking, two concurrent writers degrade to "last-writer-
+    wins on the lost slot" rather than crash.
     """
     import contextlib
     import fcntl
@@ -495,15 +508,39 @@ def _file_lock(path: Path):
     def _ctx():
         lock_path = path.with_suffix(path.suffix + ".lock")
         lock_path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT, 0o600)
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
+            fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT, 0o600)
+        except OSError as exc:
+            sys.stderr.write(
+                f"goalflight_session_status: lock open failed for {lock_path} "
+                f"({exc.__class__.__name__}: {exc}); proceeding lock-free. "
+                "On a network FS without flock support, two concurrent "
+                "writers can lose a slot; recover with --force-release-stale.\n"
+            )
             yield
+            return
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            except OSError as exc:
+                sys.stderr.write(
+                    f"goalflight_session_status: flock unsupported on "
+                    f"{lock_path} ({exc.__class__.__name__}); proceeding lock-free.\n"
+                )
+                yield
+                return
+            try:
+                yield
+            finally:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass  # already unlocked / unsupported
         finally:
             try:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-            finally:
                 os.close(fd)
+            except OSError:
+                pass
 
     return _ctx()
 
@@ -607,27 +644,31 @@ def release(project_root: Path, queue: Path | None, *, reason: str = "user-exit"
                 _atomic_write(queue, _dump_frontmatter(front) + body)
                 msgs.append(f"released queue {queue.name}")
     # Per-terminal session map: remove only this PID's slot, keep others.
+    # Lock + atomic write — same discipline as ensure_session.
     sf = _session_file(project_root)
     if sf.exists():
-        try:
-            raw = json.loads(sf.read_text())
-        except (json.JSONDecodeError, OSError):
-            raw = None
-        my_pid = str(os.getpid())
-        if isinstance(raw, dict):
-            if "id" in raw and "pid" in raw:
-                # Old single-record shape (back-compat) — drop the whole file.
-                sf.unlink()
-                msgs.append("cleared session file (back-compat)")
-            else:
-                # Map shape: remove only this pid's slot.
-                if my_pid in raw:
-                    del raw[my_pid]
-                if raw:
-                    _atomic_write(sf, json.dumps(raw, indent=2) + "\n")
-                else:
+        with _file_lock(sf):
+            try:
+                raw = json.loads(sf.read_text())
+            except (json.JSONDecodeError, OSError):
+                raw = None
+            my_pid = str(os.getpid())
+            if isinstance(raw, dict):
+                if "id" in raw and "pid" in raw and not all(
+                    isinstance(v, dict) for v in raw.values()
+                ):
+                    # Old single-record shape (back-compat) — drop the whole file.
                     sf.unlink()
-                msgs.append("cleared this terminal's session slot")
+                    msgs.append("cleared session file (back-compat)")
+                else:
+                    # Map shape: remove only this pid's slot.
+                    if my_pid in raw:
+                        del raw[my_pid]
+                    if raw:
+                        _atomic_write(sf, json.dumps(raw, indent=2) + "\n")
+                    else:
+                        sf.unlink()
+                    msgs.append("cleared this terminal's session slot")
     if not msgs:
         return False, "nothing to release"
     return True, "; ".join(msgs)

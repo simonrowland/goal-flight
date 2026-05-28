@@ -106,11 +106,21 @@ Recovery options:
 1. **If the bundled commit has NOT been pushed** — preflight first, then
    reset:
    ```bash
-   # Preflight (run all three before reset):
-   git rev-parse --abbrev-ref @{u} 2>/dev/null && echo "BRANCH HAS UPSTREAM — verify not pushed"
-   git status --short                                # confirm clean working tree (no uncommitted)
+   # Preflight (run all four before reset):
    bundled_sha=$(git rev-parse HEAD)
    echo "preserving bundle as $bundled_sha"          # so you can recover via reflog if needed
+   git status --short                                # confirm clean working tree (no uncommitted)
+   # Test: is HEAD already on upstream? If so, the bundle was pushed
+   # and reset would diverge local from remote.
+   if git rev-parse --abbrev-ref @{u} >/dev/null 2>&1; then
+     if git merge-base --is-ancestor HEAD @{u} 2>/dev/null; then
+       echo "ABORT: HEAD is on upstream; pushed. Use option 2 (amend) or option 3 (document)."
+       exit 1
+     fi
+     echo "branch has upstream but HEAD not pushed — reset is safe"
+   else
+     echo "no upstream — local-only branch, reset is safe"
+   fi
    ```
    Then `git reset --soft HEAD~1` brings the bundled changes back to
    staging. Commit by scope with explicit pathspecs:
