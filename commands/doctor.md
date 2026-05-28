@@ -26,8 +26,8 @@ verify drift. Doctor separates host-global install readiness from project-local
 Goal Flight readiness.
 
 Host-global checks cover PATH/binary presence, selected CLI versions,
-host-wrapper installation, context-mode registration, gstack, capacity, model
-currency probes, and rate-pressure signals.
+host-wrapper installation, context-mode registration, gstack, autoreview,
+capacity, model currency probes, and rate-pressure signals.
 
 Project-local checks cover `docs-private/env-caveats.md`, repository `SKILL.md`,
 `AGENTS.md` Goal Flight routing, project verification commands, and resume notes.
@@ -47,6 +47,8 @@ package repository; for normal target projects it is skipped as INFO.
   `scripts/register-context-mode-cursor.py --scope global --check` and
   `scripts/register-context-mode-cursor.py --scope project --project-root "$PWD" --check`.
 - Check `gstack --version`.
+- Check autoreview: `scripts/autoreview.sh` executable and upstream helper
+  (`AUTOREVIEW_HELPER` or `~/.cursor/skills/autoreview/scripts/autoreview`).
 - Check first-class local worker/controller candidates:
   - Codex: Desktop/CLI present, context-mode registered when large-output work
     will run, ACP adapter binary present when the Codex ACP path is considered.

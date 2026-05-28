@@ -137,6 +137,10 @@ def test_doctor_json_shape() -> None:
     assert_true("codex host install probe", "codex" in payload["host_goalflight_install"])
     assert_true("project readiness section", "project_goalflight_readiness" in payload)
     assert_true("capacity section", payload["capacity"]["schema"] == "goalflight.capacity.profile.v1")
+    assert_true("autoreview section", "autoreview" in payload)
+    assert_true("autoreview ok key", "ok" in payload["autoreview"])
+    assert_true("autoreview script path", payload["autoreview"]["script_path"].endswith("scripts/autoreview.sh"))
+    assert_true("autoreview upstream helper key", "upstream_helper" in payload["autoreview"])
 
 
 def test_doctor_target_project_readiness_split() -> None:
