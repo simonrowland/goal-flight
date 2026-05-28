@@ -13,12 +13,21 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 pass=0
 fail=0
 failed_tests=()
+skill_structure_seen=0
 ACP_PY="${GOALFLIGHT_ACP_PYTHON:-$HOME/.goal-flight/venvs/acp-0.10/bin/python}"
+list_only=0
+if [ "${1:-}" = "--list" ]; then
+  list_only=1
+fi
 
 # Bash tests (tests/bash/test-*.sh)
 cd "$SCRIPT_DIR/bash"
 for test in test-*.sh; do
   [ -f "$test" ] || continue
+  if [ "$list_only" -eq 1 ]; then
+    echo "tests/bash/$test"
+    continue
+  fi
   if bash "$test" > /tmp/goal-flight-test-$$.out 2>&1; then
     echo "PASS  tests/bash/$test"
     pass=$((pass + 1))
@@ -32,6 +41,7 @@ for test in test-*.sh; do
 done
 
 # Python tests (tests/python/test_*.py; skips dispatch_acp_chunk.py — requires live codex-acp)
+# Golden Master guard: tests/python/test_skill_structure.py is intentionally covered by this glob.
 if command -v python3 >/dev/null 2>&1 && [ -d "$REPO_ROOT/tests/python" ]; then
   cd "$REPO_ROOT"
   for test in tests/python/test_*.py; do
@@ -42,17 +52,27 @@ if command -v python3 >/dev/null 2>&1 && [ -d "$REPO_ROOT/tests/python" ]; then
         py="$ACP_PY"
         ;;
     esac
-    if [ "$py" = "$ACP_PY" ] && [ ! -x "$py" ]; then
+    if [ "$list_only" -ne 1 ] && [ "$py" = "$ACP_PY" ] && [ ! -x "$py" ]; then
       echo "FAIL  $test"
       echo "      SDK missing -- run install: $ACP_PY"
       fail=$((fail + 1))
       failed_tests+=("$test")
       continue
     fi
+    if [ "$list_only" -eq 1 ]; then
+      echo "$test"
+      continue
+    fi
     if "$py" "$test" > /tmp/goal-flight-test-$$.out 2>&1; then
+      if [ "$test" = "tests/python/test_skill_structure.py" ]; then
+        skill_structure_seen=1
+      fi
       echo "PASS  $test"
       pass=$((pass + 1))
     else
+      if [ "$test" = "tests/python/test_skill_structure.py" ]; then
+        skill_structure_seen=1
+      fi
       echo "FAIL  $test"
       cat /tmp/goal-flight-test-$$.out | sed 's/^/      /'
       fail=$((fail + 1))
@@ -60,6 +80,17 @@ if command -v python3 >/dev/null 2>&1 && [ -d "$REPO_ROOT/tests/python" ]; then
     fi
     rm -f /tmp/goal-flight-test-$$.out
   done
+fi
+
+if [ "$list_only" -ne 1 ] && [ "$skill_structure_seen" -ne 1 ]; then
+  echo "FAIL  tests/python/test_skill_structure.py"
+  echo "      required Golden Master guard was not executed"
+  fail=$((fail + 1))
+  failed_tests+=("tests/python/test_skill_structure.py")
+fi
+
+if [ "$list_only" -eq 1 ]; then
+  exit 0
 fi
 
 echo
