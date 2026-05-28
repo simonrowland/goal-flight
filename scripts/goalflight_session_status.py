@@ -359,11 +359,12 @@ def _active_leases_for(project_root: Path) -> list[dict]:
         data = json.loads(out.stdout or "{}")
     except (subprocess.SubprocessError, json.JSONDecodeError, OSError):
         return []
-    leases = data.get("leases") or {}
+    # capacity status JSON: `{"active": [<lease>, ...]}` already filtered.
+    active = data.get("active") or []
     target = str(project_root.resolve())
     matched: list[dict] = []
-    for _id, lease in leases.items():
-        if lease.get("state") != "active":
+    for lease in active:
+        if lease.get("state") and lease.get("state") != "active":
             continue
         lp = lease.get("project_root")
         if lp and str(Path(lp).resolve()) == target:

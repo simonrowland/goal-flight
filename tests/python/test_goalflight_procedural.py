@@ -428,6 +428,83 @@ def test_chunk_review_canonical_invocation_has_stdin_redirect() -> None:
     )
 
 
+def test_commit_guard_refuses_with_active_leases_and_honors_override() -> None:
+    """Worker-reliability invariant: commit guard refuses bare `git commit`
+    when active same-root leases exist, and the error message names the
+    lease ids, the partial-commit fix, and the override flag.
+    """
+    import goalflight_commit_guard as guard
+
+    with tempfile.TemporaryDirectory() as td:
+        repo = Path(td)
+        # Init a real git repo so guard's repo-root detection works.
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit",
+                        "--allow-empty", "-m", "init"], cwd=repo, check=True)
+        (repo / "scratch.txt").write_text("a\n")
+        subprocess.run(["git", "add", "scratch.txt"], cwd=repo, check=True)
+
+        state_dir = repo / "state"
+        env = os.environ.copy()
+        env["GOALFLIGHT_STATE_DIR"] = str(state_dir)
+
+        # No leases → exit 0
+        out = subprocess.run(
+            ["python3", str(ROOT / "scripts/goalflight_commit_guard.py"), "--json"],
+            cwd=repo, env=env, capture_output=True, text=True,
+        )
+        assert_true("no leases exits 0", out.returncode == 0)
+        body = json.loads(out.stdout)
+        assert_true("no leases reports ok", body["ok"] is True)
+
+        # Inject an active same-root lease via goalflight_capacity acquire.
+        # We use the capacity CLI directly to ensure project_root is set.
+        acq = subprocess.run(
+            ["python3", str(ROOT / "scripts/goalflight_capacity.py"), "acquire",
+             "--agent", "codex-acp", "--project-root", str(repo),
+             "--dispatch-id", "test-guard-dispatch", "--mem-mb", "100"],
+            cwd=repo, env=env, capture_output=True, text=True,
+        )
+        assert_true(
+            f"acquire succeeds (rc={acq.returncode} stderr={acq.stderr[:200]})",
+            acq.returncode == 0,
+        )
+
+        # With active lease, guard refuses
+        out = subprocess.run(
+            ["python3", str(ROOT / "scripts/goalflight_commit_guard.py"), "--json"],
+            cwd=repo, env=env, capture_output=True, text=True,
+        )
+        assert_true("active lease refuses exit 2", out.returncode == 2)
+        body = json.loads(out.stdout)
+        assert_true("refusal reports ok=false", body["ok"] is False)
+        msg = body.get("message") or ""
+        assert_true("refusal names the lease id", "test-guard-dispatch" in msg)
+        assert_true("refusal shows partial-commit fix",
+                    "git commit -m" in msg and "--" in msg)
+        assert_true("refusal names the override env var",
+                    "GOALFLIGHT_COMMIT_GUARD_OVERRIDE" in msg)
+        assert_true("refusal points at recovery protocol",
+                    "dispatched-worker-recovery" in msg)
+
+        # Override by lease id → allows
+        env_override = dict(env)
+        env_override["GOALFLIGHT_COMMIT_GUARD_OVERRIDE"] = "test-guard-dispatch"
+        out = subprocess.run(
+            ["python3", str(ROOT / "scripts/goalflight_commit_guard.py"), "--json"],
+            cwd=repo, env=env_override, capture_output=True, text=True,
+        )
+        assert_true("override by id allows exit 0", out.returncode == 0)
+
+        # Override by 'all' → allows
+        env_override["GOALFLIGHT_COMMIT_GUARD_OVERRIDE"] = "all"
+        out = subprocess.run(
+            ["python3", str(ROOT / "scripts/goalflight_commit_guard.py"), "--json"],
+            cwd=repo, env=env_override, capture_output=True, text=True,
+        )
+        assert_true("override all allows exit 0", out.returncode == 0)
+
+
 def test_session_status_helper_contract() -> None:
     """Worker-reliability invariant: the session-status helper is the
     canonical activation signal across compactions. Post-compaction agents
@@ -599,6 +676,7 @@ def main() -> None:
         test_review_job_codex_no_final_is_inconclusive,
         test_runners_write_status_on_capacity_and_spawn_failure,
         test_chunk_review_canonical_invocation_has_stdin_redirect,
+        test_commit_guard_refuses_with_active_leases_and_honors_override,
         test_session_status_helper_contract,
         test_dispatched_worker_recovery_protocol_present,
     ]
