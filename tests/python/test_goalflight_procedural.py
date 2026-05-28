@@ -141,6 +141,15 @@ def test_doctor_json_shape() -> None:
     assert_true("autoreview ok key", "ok" in payload["autoreview"])
     assert_true("autoreview script path", payload["autoreview"]["script_path"].endswith("scripts/autoreview.sh"))
     assert_true("autoreview upstream helper key", "upstream_helper" in payload["autoreview"])
+    # Resolution contract (catches the regression where ok=True but upstream_helper
+    # resolves to None — the env-based AUTOREVIEW_HELPER fallback path going silent
+    # while keeping the key present would otherwise pass the schema assertions).
+    autoreview = payload["autoreview"]
+    if autoreview.get("ok"):
+        assert_true(
+            "autoreview upstream helper resolves when ok",
+            autoreview.get("upstream_helper") not in (None, ""),
+        )
 
 
 def test_doctor_target_project_readiness_split() -> None:
