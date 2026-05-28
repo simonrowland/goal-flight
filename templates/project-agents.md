@@ -2,6 +2,12 @@
 
 Private. Read before touching code.
 
+> **Goal Flight is installed in this project.** Check active state FIRST:
+> `python3 ${GOALFLIGHT_ROOT:-~/.goal-flight}/scripts/goalflight_session_status.py --text`
+> — definitive verdict. If **active**, follow the load order in
+> "Goal Flight Routing" below. If **no active session**, do NOT auto-load
+> goal-flight's SKILL.md — only load when the user invokes `/goal-flight`.
+
 ## What this project is
 
 <short description>
@@ -23,17 +29,25 @@ Private. Read before touching code.
 ## Goal Flight Routing
 
 - skill-root: `${GOALFLIGHT_ROOT:-~/.goal-flight}`
-- load order: read this `AGENTS.md`, then repository `SKILL.md`, then the
-  invoked Goal Flight `commands/*.md` file from skill-root.
+- **activation check** (run before loading the skill):
+  `python3 ${GOALFLIGHT_ROOT:-~/.goal-flight}/scripts/goalflight_session_status.py --text`.
+  Only proceed with the rest of the load order when the verdict is active.
+- load order: this `AGENTS.md` → installed host wrapper (codex/grok/cursor/
+  opencode hold a copy; native Claude symlinks) → repository `SKILL.md` →
+  only the invoked `commands/*.md` plus referenced `protocols/*.md`.
 - keep `docs-private/` ignored; store env caveats, queues, ledgers, review
   outputs, and resume notes there.
 - use the project commands above for verification before closing a chunk.
-- active run + compaction: reload skill + `commands/resume.md` (skill-root);
-  see `protocols/state-handoff.md`. Not always-on.
+- **post-compaction reload**: run the activation check first; if active,
+  read newest `docs-private/RESUME-NOTES-<YYYY-MM-DD>.md` and the active
+  goal-queue's frontmatter. Full sequence in `protocols/state-handoff.md`.
 
 ## Git workflow
 
 - Commit each logical chunk after focused tests **and at least one independent
   review** (`protocols/chunk-review.md`; default gstack `/review`, with
   `./scripts/autoreview.sh` as a complementary parallel option).
+- While other goal-flight workers are in flight, `git commit -m '...' -- <files>`
+  with explicit pathspecs — never bare `git commit`. The commit guard
+  (`scripts/goalflight_commit_guard.py`) refuses to prevent bundling worker WIP.
 - Do not push without explicit permission.

@@ -1,5 +1,12 @@
 # Agent Notes
 
+> **Goal Flight is installed in this repo.** Check active state FIRST with
+> `python3 scripts/goalflight_session_status.py --text` — definitive verdict.
+> If **active**, follow the Goal Flight load order below. If **no active
+> session**, do NOT auto-load the skill end-to-end — only when the user
+> invokes `/goal-flight <command>`. Reading repository `SKILL.md`
+> end-to-end is the load-order step that follows; do not skip it.
+
 ## Companion tools (defined for non-Claude controllers loading this file)
 
 - **gstack** — Garry Tan's skill pack (`/review`, `/challenge`, `/office-hours`,
@@ -35,10 +42,12 @@
 - During an active goal-flight run, keep advancing the queue and accumulating
   commits per chunk until decomposition/execute is done; do not stall on
   engagement prompts. See repository root `SKILL.md` §Autonomous throughput.
-- **Active run + compaction:** if goal-flight was already in play (user invoked
-  it, open queue/ledger, or `docs-private/RESUME-NOTES*.md`), reload the skill
-  (load order above → `commands/resume.md`). Not always-on. Details:
-  `protocols/state-handoff.md`.
+- **Active run + compaction:** if goal-flight was already in play (verdict
+  active per `goalflight_session_status.py --text`, OR open queue/ledger,
+  OR `docs-private/RESUME-NOTES-<YYYY-MM-DD>.md`), reload the skill (load
+  order above → `commands/resume.md`). Not always-on. Canonical post-
+  compaction reload sequence is in repository `SKILL.md` §State.
+  Details: `protocols/state-handoff.md`.
 
 ## Git workflow (this repo)
 
@@ -47,6 +56,10 @@
   gstack `/review`, with `./scripts/autoreview.sh` as a complementary parallel
   option). Executor self-review alone is not enough.
 - Do not wait for a separate "please commit" unless the user forbade commits.
+- **`git commit -m '...' -- <files>` with explicit pathspecs** while other
+  goal-flight workers are in flight. Never bare `git commit` — the commit
+  guard (`scripts/goalflight_commit_guard.py`) refuses to prevent bundling
+  worker WIP. See its error message for the fix shape.
 - **Do not push to public** without the relevant test sweep and explicit user
   permission.
 - Amending, force-push, and destructive git operations still require explicit

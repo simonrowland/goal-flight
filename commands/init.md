@@ -78,8 +78,24 @@ python3 <skill-root>/scripts/goalflight_capacity.py profile --json
 
 - `docs-private/`
 - `docs-private/goal-<topic>-<date>.md` from `templates/goal-statement.md`
-- `docs-private/RESUME-NOTES.md` from `templates/resume-notes.md`
-- `AGENTS.md` from `templates/project-agents.md` when project has no local agent instructions
+- `docs-private/RESUME-NOTES-<YYYY-MM-DD>.md` from `templates/resume-notes.md`
+  (canonical naming: ISO 8601 date so lexicographic sort = chronological; no
+  topic prefixes — topic context goes inside the file's TL;DR)
+- `AGENTS.md` — 3-branch decision tree:
+  - **absent**: write from `templates/project-agents.md`, then
+    `git add -- AGENTS.md` (use the explicit pathspec — never bare
+    `git add -A` while workers may be in flight).
+  - **present, tracked, no `## Goal Flight Routing` section**: APPEND the
+    Goal Flight Routing block + top-of-file blockquote activation directive
+    from the template (idempotent — check for the section header first).
+  - **present, tracked, already has the section**: skip (no-op).
+  - **present, but gitignored**: REFUSE with diagnostic — *"AGENTS.md is
+    gitignored in this project, which breaks skill load across machines and
+    teammates. AGENTS.md is the canonical skill entry point, not a
+    vendor-adapter file (see AGENT-FILENAME-POLICY.md). Either remove the
+    .gitignore entry / add `!AGENTS.md` negation, or place goal-flight
+    routing notes in `.agent-context/goal-flight.md` and adjust the load
+    order accordingly."*
 - `SKILL.md` from `templates/project-skill.md` when project has no root skill
 
 6. Write only compact environment facts into `docs-private/env-caveats.md`:
