@@ -654,6 +654,30 @@ async def run(args: argparse.Namespace) -> dict:
         write_status(status_path, payload)
         return payload
 
+    # Sweep D-class pre-acquire sandbox cwd check (test_os_sandbox case
+    # `blocks_temp_cwd_before_capacity`): macos_write_roots refuses cwds
+    # inside an allowed temp root (the sandbox can't enforce workspace
+    # boundaries when cwd is itself inside the always-allowed dirs). Run
+    # the check NOW so a blocked sandbox shape doesn't waste a capacity
+    # lease. The same check still runs again during `prepare_os_sandbox_
+    # command` after spawn — this just short-circuits early.
+    if os_sandbox_profile not in {None, OS_SANDBOX_OFF}:
+        try:
+            from goalflight_os_sandbox import macos_write_roots
+            _ = macos_write_roots(
+                args.cwd,
+                os_sandbox_profile,
+                agent=args.agent,
+                command=command if isinstance(command, str) else "",
+            )
+        except OsSandboxError as e:
+            payload.update({"state": "blocked_os_sandbox", "error": str(e)})
+            write_status(status_path, payload)
+            return payload
+        except Exception:
+            # Linux / unsupported platform: defer to spawn-time check.
+            pass
+
     # Lease TTL covers the worst-case run length. Derive from idle-timeout.
     lease_ttl_s = max(int(args.idle_timeout or (36000 if args.mode == "goal" else 300)) * 4, 3600)
     acquire_args = argparse.Namespace(

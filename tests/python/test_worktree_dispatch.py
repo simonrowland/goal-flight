@@ -99,9 +99,13 @@ def test_worktree_create_routes_distinct_cwds_and_stale_probe() -> None:
                 "acp-test-two",
             )
 
+            # macOS resolves /var/folders → /private/var/folders; goalflight_acp_run
+            # calls project_root.resolve() before building the worktree path. Resolve
+            # `repo` for comparison so the assertion isn't fooled by the /private prefix.
+            resolved_repo = repo.resolve()
             assert_true("distinct worktrees", wt_one != wt_two)
-            assert_true("first under managed root", wt_one.parent == repo / "worktrees")
-            assert_true("second under managed root", wt_two.parent == repo / "worktrees")
+            assert_true("first under managed root", wt_one.parent == resolved_repo / "worktrees")
+            assert_true("second under managed root", wt_two.parent == resolved_repo / "worktrees")
             assert_true("first cwd routed", args_one.cwd == str(wt_one))
             assert_true("second cwd routed", args_two.cwd == str(wt_two))
 
@@ -370,7 +374,10 @@ def test_runner_worktree_status_and_capacity_contract() -> None:
 
             payload = asyncio.run(goalflight_acp_run.run(args))
             status = json.loads(status_path.read_text())
-            worktree_path = repo / "worktrees" / "acp-run-contract"
+            # Worktree path is built from repo.resolve() in the runner (macOS
+            # /var/folders → /private/var/folders resolution); compare against
+            # the same.
+            worktree_path = repo.resolve() / "worktrees" / "acp-run-contract"
             assert_true("runner complete", payload["state"] == "complete")
             assert_true("status worktree path", status["worktree_path"] == str(worktree_path))
             assert_true("status worker cwd", status["worker_cwd"] == str(worktree_path))

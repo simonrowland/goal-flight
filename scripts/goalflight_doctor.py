@@ -1020,7 +1020,12 @@ def check_worktrees(project_root: Path) -> dict:
             "ok": False,
             "error": f"managed worktree root must not be a symlink: {managed_root_path}",
         }
-    managed_root = managed_root_path.absolute()
+    # Use resolve() to canonicalize /var/folders → /private/var/folders on macOS
+    # so the prefix-match below works against `git worktree list`'s resolved paths.
+    try:
+        managed_root = managed_root_path.resolve()
+    except OSError:
+        managed_root = managed_root_path.absolute()
     paths: list[str] = []
     dispatch_by_path: dict[str, str] = {}
     details: list[dict] = []
@@ -1032,19 +1037,27 @@ def check_worktrees(project_root: Path) -> dict:
         raw_path = Path(str(raw))
         path = raw_path if raw_path.is_absolute() else project_root / raw_path
         path = path.absolute()
+        # Try literal-parent match first (handles the symlink-leaf-escape case:
+        # a symlink whose own path sits under managed_root_path but resolves
+        # outside — we want to flag, not skip). Fall back to resolved-match
+        # for the /private/var ↔ /var resolution case.
+        rel = None
         try:
-            rel = path.relative_to(managed_root)
+            rel = path.relative_to(managed_root_path.absolute())
         except ValueError:
-            continue
-        if len(rel.parts) != 1:
+            try:
+                rel = path.resolve().relative_to(managed_root)
+            except (ValueError, OSError):
+                continue
+        if rel is None or len(rel.parts) != 1:
             continue
         if path.is_symlink():
             escaped.append(str(path))
             continue
         try:
             resolved_path = path.resolve()
-            resolved_path.relative_to(managed_root.resolve())
-        except ValueError:
+            resolved_path.relative_to(managed_root)
+        except (ValueError, OSError):
             escaped.append(str(path))
             continue
         dispatch_id = rel.parts[0]
