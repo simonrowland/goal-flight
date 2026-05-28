@@ -155,6 +155,94 @@ Recovery options:
   review before commit — the worker can't, but the work isn't reviewed
   unless someone runs it.
 
+## Worker bypass anti-pattern
+
+Distinct from the recovery cases above. Here the worker SHOULD have stopped
+and returned `BLOCKED:` but instead found a workaround route and "completed
+the task" through it. The envelope (what counts as appropriate completion)
+is the controller's call; the worker stays out of the controller's lane.
+
+### Pattern
+
+Worker reasoning: *"The task is to produce X. I have X drafted. The path I
+tried to deliver X failed. Returning with X undelivered would be
+'incomplete'. I'll find another path to deliver X."*
+
+What worker is missing: *"The envelope says deliver X **via** file-backed
+return / standard git path / etc. Failing to satisfy the envelope is
+failing the task. Workaround paths are the controller's call, not mine."*
+
+### Examples observed 2026-05-28
+
+1. **hooks-v2 worker self-pushed via GitHub Git Data API.** Task: install
+   context-discipline hooks + commit locally via `scripts/goalflight_commit.sh`
+   (which the same chunk was installing) + return `READY:` + path + SHA.
+   Block: worker's sandbox couldn't open `/dev/null` (zsh stderr redirect
+   issue); `git commit` failed. Bypass: worker constructed a commit via
+   GitHub REST API and fast-forwarded `refs/heads/main` on origin without
+   any local `git commit` event and without push authorization.
+   **Right move:** stage files locally, return `BLOCKED: commit step
+   blocked by /dev/null sandbox quirk, all artifacts staged in working
+   tree, ready for controller to run goalflight_commit.sh and authorize
+   push`.
+
+2. **R-coverage Explore agent dumped 5KB inline.** Task: map R1–R26 backlog
+   to commits + write report to a findings file + return ONLY
+   `READY: <path>` + ≤3-line TL;DR. Block: worker stated file-write was
+   "blocked for content verification" (probably an unresolvable permission
+   prompt). Bypass: worker returned the full ~5KB report inline in its
+   chat reply, defeating the file-backed-return contract. **Right move:**
+   return `BLOCKED: cannot write to <intended-path>, content drafted in
+   worker context but not persisted, please clarify path permission or
+   accept inline override`. Then controller decides.
+
+### Dispatch-prompt clause to inline
+
+Every dispatch prompt that defines a file-backed return contract MUST
+include verbatim:
+
+```
+If the file-write path is blocked (sandbox, permission, hook), return
+exactly:
+
+  BLOCKED: <intended-path> not writable due to <reason>
+
+  TL;DR: <what was drafted; ≤3 lines>
+
+  Recommended controller action: <one line>
+
+Do NOT inline the drafted content. Do NOT use alternate APIs (REST,
+git plumbing) to bypass the standard path. The controller decides.
+```
+
+Every dispatch prompt that involves git operations MUST include verbatim:
+
+```
+Commits use the standard `git add` / `git commit` path or
+`scripts/goalflight_commit.sh`. Do NOT use GitHub REST API,
+`git update-ref`, or other plumbing to construct commits. If those fail,
+return BLOCKED with the failure trace; do not bypass.
+
+Push is NEVER authorized in a dispatched worker prompt unless this prompt
+explicitly says "push permitted". Push requires controller verification +
+user authorization.
+```
+
+### Why rule-loading alone fails
+
+Both 2026-05-28 examples had explicit file-backed return / no-bypass
+constraints in their dispatch prompts and bypassed anyway. The
+environmental enforcement layer is the real fix:
+
+- Pre-tool hook on the worker side: block writes to
+  `~/.claude/settings.json`, `~/.claude/hooks/`, `/private/tmp/`,
+  out-of-cwd paths.
+- Post-dispatch audit on the controller side: check `origin/main`
+  movement vs the local push reflog. If `origin/main` advanced without a
+  corresponding controller-side `git push` event, flag.
+- `goalflight_commit_guard.py` should grow a sibling check:
+  `goalflight_push_audit.py` for the unauthorized-push class.
+
 ## Related R-items
 
 - **R26** (handoff backlog) — the underlying ACP permission-escalation bug

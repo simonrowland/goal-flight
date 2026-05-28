@@ -4,6 +4,21 @@ set -euo pipefail
 # Claude Code PreToolUse hook for Goal Flight context discipline.
 # Reads a tool-call JSON object from stdin or a --dry-run fixture path and
 # emits a compact block decision JSON object on stdout.
+#
+# SCOPE: this hook fires globally (every Claude Code session, every project)
+# when symlinked into ~/.claude/hooks/ and registered in settings.json.
+# The block rules (Read >5KB, heredoc Bash) would break unrelated sessions
+# (Cowork, other repos) if applied globally. The scope gate below makes the
+# hook a no-op outside the goal-flight repo unless GOALFLIGHT_HOOKS_FORCE=1
+# is set (test/dev override).
+#
+# Detection precedence:
+#   1. payload.cwd field from the PreToolUse JSON (if Claude Code provides it)
+#   2. CLAUDE_CODE_CWD env var (if Claude Code exports it)
+#   3. PWD env var (best-effort fallback)
+# Match: prefix `/Users/simonrowland/Repos/goal-flight`. This is a known
+# hardcoded path; portable detection (probe for goal-flight repo marker)
+# is queued as Wave-A follow-up.
 
 dry_run=0
 if [[ "${1:-}" == "--dry-run" ]]; then
@@ -15,6 +30,27 @@ if [[ $# -gt 0 ]]; then
   input_json=$(cat "$1")
 else
   input_json=$(cat)
+fi
+
+# Scope gate (skipped under --dry-run so test fixtures keep working).
+if [[ "$dry_run" -eq 0 ]]; then
+  goalflight_root="/Users/simonrowland/Repos/goal-flight"
+  payload_cwd=$(printf '%s' "$input_json" | python3 -c 'import json,sys
+try:
+    d = json.loads(sys.stdin.read() or "{}")
+    print(d.get("cwd") or "")
+except Exception:
+    print("")' 2>/dev/null || true)
+  effective_cwd="${payload_cwd:-${CLAUDE_CODE_CWD:-${PWD:-}}}"
+  case "${effective_cwd}" in
+    "${goalflight_root}"*) ;;
+    *)
+      if [[ "${GOALFLIGHT_HOOKS_FORCE:-}" != "1" ]]; then
+        echo '{"block":false}'
+        exit 0
+      fi
+      ;;
+  esac
 fi
 
 python3 -c '

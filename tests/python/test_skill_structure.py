@@ -239,6 +239,7 @@ EXPECTED_ENTRY_IDS = {
     "ledger-pid-plus-process-identity",
     "acp-permit-file-ipc-contract",
     "install-actions-user-gate-backups",
+    "worker-escalate-not-bypass",
 }
 
 KNOWN_SKILL_ALIGNMENT_GAPS = {
@@ -329,7 +330,13 @@ KNOWN_MAX_SECTION_LINE_GAPS = {
     "user-status-cadence-15min": {
         "fix_chunk": "chunk-X budget realignment after AUI hardening",
         "max_section_lines": 20,
-        "actual_content_lines": 34,
+        "actual_content_lines": 35,
+        "section_heading": "## Hard Invariants",
+    },
+    "worker-escalate-not-bypass": {
+        "fix_chunk": "chunk-X budget realignment after AUI hardening",
+        "max_section_lines": 5,
+        "actual_content_lines": 35,
         "section_heading": "## Hard Invariants",
     },
     "reviewer-misses-regression-tests": {
@@ -399,6 +406,12 @@ KNOWN_ENTRY_SCHEMA_EXTENSIONS = {
         "top": {"notes"},
         "nested": {
             "skill_md_compressed_form": {"note"},
+            "verifier": {"fallback"},
+        },
+    },
+    "worker-escalate-not-bypass": {
+        "top": {"notes"},
+        "nested": {
             "verifier": {"fallback"},
         },
     },

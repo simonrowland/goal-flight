@@ -233,6 +233,7 @@ P0/P1/P2 before commit.
 - During an active goal-flight run, keep shipping through decompose -> execute
   until the queue is done or a real blocker stops you.
 - Report progress at least every 15 minutes unless context is tight.
+- Workers escalate sandbox / permission / tool blocks via `BLOCKED:` and return to the controller. They do NOT execute workarounds (alternate APIs, git plumbing, inline content dumps when a file-write is blocked). Push and out-of-standard-path commits are the controller's call, not the worker's. Detail + session examples: `protocols/dispatched-worker-recovery.md` §"Worker bypass anti-pattern".
 - Keep `docs-private/` private.
 
 ## Capacity and rate limits

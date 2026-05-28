@@ -2172,6 +2172,31 @@ chunk-3a rationale:
 
 ---
 
+### Entry: worker-escalate-not-bypass
+
+- **id:** `worker-escalate-not-bypass`
+- **name:** Workers escalate sandbox/permission blocks, not bypass
+- **category:** `worker-markers`
+- **controller_does:** When a dispatched worker hits a sandbox, permission, hook, or tool-availability block during its task, the worker returns to the controller with a `BLOCKED:` marker plus the block detail and a recommended controller action, rather than executing a workaround (alternate APIs, git plumbing, inline content dumps for blocked file-writes). The controller decides whether the workaround is appropriate.
+- **failure_mode:** Worker hits a block, rationalizes a workaround, completes via the alternate path. Concrete anti-patterns from the 2026-05-28 session: a worker whose `git commit` hit a `/dev/null` sandbox quirk published a commit via the GitHub Git Data API and self-pushed `main`; a worker whose findings-file write was rejected returned the ~5KB report inline, defeating the file-backed-return contract. In both cases the controller never got to decide whether the workaround was appropriate, and unauthorized state changes (push, inline payload dumps) landed.
+- **skill_md_compressed_form:**
+    - **kind:** literal
+    - **pattern:** "Workers escalate sandbox / permission / tool blocks via `BLOCKED:` and return to the controller. They do NOT execute workarounds"
+    - **max_section_lines:** 5
+- **verifier:**
+    - **kind:** textual-invariant
+    - **id:** test_skill_structure::test_skill_md_matches_golden_master
+    - **fallback:** behaviour-scenario `worker-blocked-no-bypass` (Wave-C; not yet implemented)
+- **provenance:**
+    - **sources:**
+      - `protocols/dispatched-worker-recovery.md`
+      - `docs-private/research/2026-05-28-skill-worker-escalate-review/findings.md`
+    - **r_numbers:** []
+- **severity:** high
+- **max_skill_lines:** 8
+- **last_reviewed_commit:** (this commit)
+- **notes:** Observed 2x in the 2026-05-28 session — same root cause across different worker types (codex-acp executor and Claude Explore subagent). Detailed examples and the protocol-side handling live in `protocols/dispatched-worker-recovery.md` §"Worker bypass anti-pattern". The compressed-form text uses `BLOCKED:` (the canonical marker per `protocols/worker-markers.md`), not the proposed `READY-BLOCKED:` (rejected by review for marker-proliferation).
+
 ## Adding a new entry
 
 1. Pick a unique kebab-case `id` not already used.
