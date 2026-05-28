@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -14,6 +15,7 @@ FIXTURES = ROOT / "tests/fixtures/controller_scenarios"
 CONTROLLER_HOST_DIR = ROOT / "scripts/hosts/controller"
 sys.path.insert(0, str(CONTROLLER_HOST_DIR))
 
+import behavior_scenario as behavior_module  # noqa: E402
 from behavior_scenario import SCENARIOS  # noqa: E402
 from common import (  # noqa: E402
     DEFAULT_BEHAVIOR_SCENARIOS,
@@ -504,6 +506,82 @@ def test_context_load_order_scenario_registered() -> None:
     assert by_id["canonical_review_path_present"]["ok"] is True
 
 
+def test_claude_acp_runner_uses_acp_shim_and_writes_transcript() -> None:
+    seen: dict[str, object] = {}
+
+    class FakeProc:
+        returncode = 0
+        stdout = json.dumps(
+            {
+                "state": "complete",
+                "ok": True,
+                "result_text": "goalflight_doctor.py host_goalflight_install {\"ok\": true}",
+            }
+        )
+        stderr = ""
+
+    def fake_probe(controller: str) -> dict:
+        assert controller == "claude-acp"
+        return {
+            "id": "claude-acp",
+            "available": True,
+            "binary": "/tmp/claude-code-cli-acp",
+            "transports": ["acp"],
+        }
+
+    def fake_doctor(_: Path) -> dict:
+        return {"ok": True, "doctor_ok": True, "host_install_ok": True}
+
+    def fake_prompt(scenario_id: str, project_root: Path, *, sentinel: str | None = None) -> str:
+        assert scenario_id == "doctor-loads"
+        assert project_root == ROOT
+        assert sentinel is None or sentinel == ""
+        return "Prompt mentions goalflight_doctor.py"
+
+    def fake_run(cmd: list[str], **kwargs: object) -> FakeProc:
+        seen["cmd"] = cmd
+        seen["kwargs"] = kwargs
+        return FakeProc()
+
+    original_probe = behavior_module.probe_matrix.probe_controller
+    original_doctor = behavior_module.doctor_snapshot
+    original_prompt = behavior_module._load_prompt
+    original_run = behavior_module.subprocess.run
+    try:
+        behavior_module.probe_matrix.probe_controller = fake_probe
+        behavior_module.doctor_snapshot = fake_doctor
+        behavior_module._load_prompt = fake_prompt
+        behavior_module.subprocess.run = fake_run
+        with tempfile.TemporaryDirectory() as td:
+            payload = behavior_module.run_claude_code_acp_scenario(
+                "doctor-loads",
+                project_root=ROOT,
+                timeout=5,
+                transcript_dir=td,
+            )
+            transcript = Path(payload["session"]["transcript_path"])
+            assert transcript == (Path(td) / "doctor-loads.transcript.log").resolve()
+            assert transcript.is_file()
+            assert "goalflight_doctor.py" in transcript.read_text(encoding="utf-8")
+    finally:
+        behavior_module.probe_matrix.probe_controller = original_probe
+        behavior_module.doctor_snapshot = original_doctor
+        behavior_module._load_prompt = original_prompt
+        behavior_module.subprocess.run = original_run
+
+    cmd = seen["cmd"]
+    assert isinstance(cmd, list)
+    assert str(ROOT / "scripts/goalflight_acp_run.py") in cmd
+    assert cmd[cmd.index("--agent") + 1] == "claude"
+    assert "--prompt" in cmd
+    assert "--status-json" in cmd
+    assert "--json" in cmd
+    assert "-p" not in cmd
+    assert "--" + "print" not in cmd
+    assert payload["ok"] is True
+    assert payload["transport"] == "acp"
+
+
 def test_new_behavior_scenarios_sync_to_defaults_and_docs() -> None:
     required = {
         "read-skill-end-to-end",
@@ -515,15 +593,20 @@ def test_new_behavior_scenarios_sync_to_defaults_and_docs() -> None:
         "context-load-order",
     }
     bash_wrapper = ROOT / "tests/bash/test-controller-behavior-codex.sh"
+    claude_bash_wrapper = ROOT / "tests/bash/test-controller-behavior-claude-code-acp.sh"
     command_doc = ROOT / "commands/controller-behavior-test.md"
     bash_text = bash_wrapper.read_text(encoding="utf-8")
+    claude_bash_text = claude_bash_wrapper.read_text(encoding="utf-8")
     doc_text = command_doc.read_text(encoding="utf-8")
 
     assert required <= set(SCENARIOS)
     assert required <= set(DEFAULT_BEHAVIOR_SCENARIOS)
     for scenario_id in required:
         assert scenario_id in bash_text
+        assert scenario_id in claude_bash_text
         assert f"`{scenario_id}`" in doc_text
+    assert "--controller claude-acp" in claude_bash_text
+    assert "claude-code-cli-acp" in doc_text
 
 
 def _run_tests() -> tuple[int, list[tuple[str, str]]]:

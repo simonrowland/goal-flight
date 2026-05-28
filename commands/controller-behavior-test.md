@@ -9,8 +9,16 @@ Read:
 - `docs-private/plans/controller-behavior-harness-plan.md` (when present locally)
 
 Runs the file-backed controller behavior harness. Wave 1 implements **Codex +
-bash-tail** with the `doctor-loads` scenario. Claude regression uses
-`claude-code-cli-acp` (Wave 3); do not use `claude -p` for billing reasons.
+bash-tail** with the `doctor-loads` scenario. The Claude Code regression path
+uses `claude-code-cli-acp` through Goal Flight ACP so it stays on the
+subscription-routed interactive shim.
+
+## Host runners
+
+| Controller | Transport | Bash test | Transcript path |
+|------------|-----------|-----------|-----------------|
+| `codex` | bash-tail `codex exec` | `tests/bash/test-controller-behavior-codex.sh` | harness temp tail |
+| `claude-acp` | ACP shim via `claude-code-cli-acp` | `tests/bash/test-controller-behavior-claude-code-acp.sh` | `docs-private/reviews/<date>-chunk-15/<scenario>.transcript.log` |
 
 ## Usage
 
@@ -24,12 +32,21 @@ python3 scripts/hosts/controller/behavior_scenario.py \
   --scenario doctor-loads \
   --directory "$(git rev-parse --show-toplevel)" \
   --json
+
+python3 scripts/hosts/controller/behavior_scenario.py \
+  --controller claude-acp \
+  --scenario doctor-loads \
+  --directory "$(git rev-parse --show-toplevel)" \
+  --transcript-dir "docs-private/reviews/$(date +%F)-chunk-15" \
+  --json
 ```
 
 ## Skip policy
 
 - `./tests/run.sh` includes `tests/bash/test-controller-behavior-codex.sh`, which
   **skips exit 0** unless `GOALFLIGHT_CONTROLLER_BEHAVIOR=1` and `codex` is on PATH.
+- `./tests/run.sh` includes `tests/bash/test-controller-behavior-claude-code-acp.sh`, which
+  **skips exit 0** unless `GOALFLIGHT_CONTROLLER_BEHAVIOR=1` and `claude-code-cli-acp` is on PATH.
 - Hermetic structure tests always run via `tests/bash/test-controller-probe-matrix.sh`.
 
 ## Scenarios (fixtures)

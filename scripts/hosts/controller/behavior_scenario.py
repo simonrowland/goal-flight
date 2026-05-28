@@ -8,8 +8,10 @@ hosts follow the same contract.
 from __future__ import annotations
 
 import argparse
+import datetime as _dt
 import json
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -106,7 +108,7 @@ def _prepare_compaction_reload_project(project_root: Path) -> tuple[Path, str]:
     return temp_root, sentinel
 
 
-def _assert_doctor_loads(tail_text: str, *, doctor: dict[str, Any]) -> list[dict[str, Any]]:
+def _assert_doctor_loads(tail_text: str, *, doctor: dict[str, Any], **_: Any) -> list[dict[str, Any]]:
     checks: list[dict[str, Any]] = []
     lower = tail_text.lower()
     invoked = (
@@ -322,15 +324,249 @@ def run_codex_scenario(
     )
 
 
+def _transcript_dir(default_root: Path, explicit: str | None) -> Path:
+    if explicit:
+        return Path(explicit).expanduser().resolve()
+    today = _dt.date.today().isoformat()
+    return default_root / "docs-private" / "reviews" / f"{today}-chunk-15"
+
+
+def _write_acp_transcript(
+    *,
+    transcript_path: Path,
+    scenario_id: str,
+    prompt: str,
+    command: list[str],
+    stdout: str,
+    stderr: str,
+    payload: dict[str, Any],
+) -> None:
+    transcript_path.parent.mkdir(parents=True, exist_ok=True)
+    result_text = str(payload.get("result_text") or payload.get("text_excerpt") or "")
+    transcript_path.write_text(
+        "\n".join(
+            [
+                f"controller: claude-acp",
+                f"scenario: {scenario_id}",
+                f"state: {payload.get('state')}",
+                f"ok: {payload.get('ok')}",
+                f"command: {json.dumps(command)}",
+                "",
+                "PROMPT:",
+                prompt.rstrip(),
+                "",
+                "RESULT_TEXT:",
+                result_text.rstrip(),
+                "",
+                "STDOUT:",
+                stdout.rstrip(),
+                "",
+                "STDERR:",
+                stderr.rstrip(),
+                "",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def run_claude_code_acp_scenario(
+    scenario_id: str,
+    *,
+    project_root: Path,
+    timeout: float,
+    transcript_dir: str | None = None,
+) -> dict[str, Any]:
+    started = time.time()
+    controller = "claude-acp"
+    row = probe_matrix.probe_controller(controller)
+    if not row.get("available"):
+        return harness_result(
+            controller=controller,
+            scenario=scenario_id,
+            ok=False,
+            skipped=True,
+            skip_reason=row.get("skip_reason") or "claude-code-cli-acp unavailable",
+            transport="acp",
+            elapsed_s=monotonic_elapsed(started),
+        )
+
+    spec = SCENARIOS.get(scenario_id)
+    if spec is None:
+        return harness_result(
+            controller=controller,
+            scenario=scenario_id,
+            ok=False,
+            skipped=True,
+            skip_reason=f"unknown scenario: {scenario_id}",
+            transport="acp",
+            elapsed_s=monotonic_elapsed(started),
+        )
+
+    doctor = doctor_snapshot(project_root)
+    scenario_root = project_root
+    cleanup_root: Path | None = None
+    sentinel = ""
+    if scenario_id == "compaction-reload-skill":
+        scenario_root, sentinel = _prepare_compaction_reload_project(project_root)
+        cleanup_root = scenario_root
+    prompt = _load_prompt(scenario_id, scenario_root, sentinel=sentinel)
+
+    long_scenarios = {
+        "resume-after-compaction",
+        "continue-prescribed-step-two",
+        "compaction-reload-skill",
+        "review-flight-at-completion",
+    }
+    scenario_timeout = max(timeout, 420.0) if scenario_id in long_scenarios else timeout
+    transcript_root = _transcript_dir(project_root, transcript_dir)
+    transcript_path = transcript_root / f"{scenario_id}.transcript.log"
+
+    with tempfile.TemporaryDirectory(prefix="goalflight-controller-acp-") as td:
+        temp_root = Path(td)
+        prompt_path = temp_root / f"{scenario_id}.prompt.md"
+        status_path = temp_root / f"{scenario_id}.status.json"
+        prompt_path.write_text(prompt.strip() + "\n", encoding="utf-8")
+        cmd = [
+            sys.executable,
+            str(REPO_ROOT / "scripts" / "goalflight_acp_run.py"),
+            "--agent",
+            "claude",
+            "--cwd",
+            str(scenario_root),
+            "--dispatch-id",
+            f"controller-behavior-claude-acp-{scenario_id}-{uuid.uuid4().hex[:8]}",
+            "--prompt-id",
+            scenario_id,
+            "--prompt",
+            str(prompt_path),
+            "--status-json",
+            str(status_path),
+            "--json",
+            "--idle-timeout",
+            str(scenario_timeout),
+            "--progress-stall-s",
+            str(scenario_timeout),
+            "--max-quiet-s",
+            str(scenario_timeout + 60),
+        ]
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=str(scenario_root),
+                capture_output=True,
+                text=True,
+                timeout=scenario_timeout + 120,
+                check=False,
+            )
+            stdout = proc.stdout
+            stderr = proc.stderr
+            returncode = proc.returncode
+        except subprocess.TimeoutExpired as exc:
+            stdout = exc.stdout or ""
+            stderr = (exc.stderr or "") + "\nTIMEOUT"
+            returncode = 124
+
+        payload: dict[str, Any] = {}
+        if stdout.strip():
+            try:
+                parsed = json.loads(stdout)
+                if isinstance(parsed, dict):
+                    payload = parsed
+            except json.JSONDecodeError:
+                payload = {}
+        if not payload and status_path.is_file():
+            try:
+                parsed = json.loads(status_path.read_text(encoding="utf-8"))
+                if isinstance(parsed, dict):
+                    payload = parsed
+            except (OSError, json.JSONDecodeError):
+                payload = {}
+
+    if cleanup_root is not None:
+        shutil.rmtree(cleanup_root, ignore_errors=True)
+
+    _write_acp_transcript(
+        transcript_path=transcript_path,
+        scenario_id=scenario_id,
+        prompt=prompt,
+        command=cmd,
+        stdout=stdout,
+        stderr=stderr,
+        payload=payload,
+    )
+    tail_text = "\n".join(
+        str(part)
+        for part in (
+            payload.get("result_text"),
+            payload.get("text_excerpt"),
+            stdout,
+            stderr,
+        )
+        if part
+    )
+    assert_fn: Callable[..., list[dict[str, Any]]] = spec["assert"]
+    checks = assert_fn(tail_text, doctor=doctor, sentinel=sentinel)
+    checks.append(
+        {
+            "id": "acp_complete",
+            "ok": returncode == 0 and payload.get("state") == "complete",
+            "detail": {
+                "returncode": returncode,
+                "state": payload.get("state"),
+                "error": payload.get("error"),
+            },
+        }
+    )
+    checks.append(
+        {
+            "id": "transcript_written",
+            "ok": transcript_path.is_file() and transcript_path.stat().st_size > 0,
+            "detail": {"path": str(transcript_path)},
+        }
+    )
+    ok = returncode == 0 and payload.get("state") == "complete" and all(c.get("ok") for c in checks)
+    return harness_result(
+        controller=controller,
+        scenario=scenario_id,
+        ok=ok,
+        skipped=False,
+        transport="acp",
+        doctor=doctor,
+        session={
+            "transport": "acp",
+            "agent": "claude-code-cli-acp",
+            "returncode": returncode,
+            "state": payload.get("state"),
+            "ok": payload.get("ok"),
+            "error": payload.get("error"),
+            "transcript_path": str(transcript_path),
+            "status_path": str(payload.get("status_path") or ""),
+            "text_excerpt": tail_text[-2000:],
+        },
+        checks=checks,
+        elapsed_s=monotonic_elapsed(started),
+    )
+
+
 def run_scenario(
     controller: str,
     scenario_id: str,
     *,
     project_root: Path,
     timeout: float,
+    transcript_dir: str | None = None,
 ) -> dict[str, Any]:
     if controller == "codex":
         return run_codex_scenario(scenario_id, project_root=project_root, timeout=timeout)
+    if controller == "claude-acp":
+        return run_claude_code_acp_scenario(
+            scenario_id,
+            project_root=project_root,
+            timeout=timeout,
+            transcript_dir=transcript_dir,
+        )
     row = probe_matrix.probe_controller(controller)
     return harness_result(
         controller=controller,
@@ -348,6 +584,7 @@ def main() -> int:
     parser.add_argument("--scenario", default="doctor-loads", help="Scenario id")
     parser.add_argument("--directory", "-C", default=str(REPO_ROOT), help="Project root")
     parser.add_argument("--timeout", type=float, default=300.0, help="Scenario timeout seconds")
+    parser.add_argument("--transcript-dir", help="Directory for live controller transcripts")
     parser.add_argument("--json", action="store_true", help="Emit JSON")
     args = parser.parse_args()
 
@@ -356,6 +593,7 @@ def main() -> int:
         args.scenario,
         project_root=Path(args.directory).resolve(),
         timeout=args.timeout,
+        transcript_dir=args.transcript_dir,
     )
     payload.setdefault("schema", SCHEMA)
 
