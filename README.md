@@ -142,6 +142,15 @@ Unified CLI: `bin/goalflight <domain> <resource> <verb>` (action router over
 - **autoreview** — Complementary diff-local pre-commit pass (`protocols/chunk-review.md`, `./scripts/autoreview.sh`). Runs in parallel with gstack at chunk level when the controller chooses; does **not** replace gstack as the default review path. Catches diff-local issues (API footguns, missing tests on touched paths, regression invariants) that a structural reviewer may not prioritize. Requires upstream autoreview (typically the Cursor autoreview skill or `AUTOREVIEW_HELPER`); doctor reports WARN when absent.
 - **[context-mode](https://github.com/simonrowland/context-mode)** — MCP plugin that offloads large command outputs (diffs, integration test runs, codex tail files, large greps) to an FTS5 sandbox queried by pattern. The multiplier that makes 12-hour unattended runs feasible — without it, tool-output fills the controller's context fast and you hit compaction early.
 
+## Maintainer test tiers
+
+Default `./tests/run.sh` stays hermetic and cheap. Set
+`GOALFLIGHT_AUTOREVIEW=1` to include `tests/bash/test-autoreview-smoke.sh`,
+which runs `scripts/autoreview.sh --engine claude` against a known-good fixture
+commit through `scripts/autoreview_claude_acp`. Each invocation consumes one
+Claude ACP-sub-billed autoreview pass.
+
+
 ## Adapting
 
 This skill ships tuned for high-accuracy scientific programming but the patterns generalize. Workflow: clone the repo, open it in your controller host (Claude Code wrapper today), and ask the host to adapt the skill for a domain project with a north star, verification command, invariants, and any domain-specific self-review categories. A strong subagent can read the whole thing, propose a diff, and apply it in one pass.
