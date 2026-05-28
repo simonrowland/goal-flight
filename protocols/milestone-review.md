@@ -1,6 +1,8 @@
 # Milestone Review Protocol
 
-Use at configured review cadence or user-requested review flights.
+Milestone-scale review flights at configured cadence or `[milestone]` queue
+chunks. **Separate protocol** from per-chunk pre-commit review
+(`protocols/chunk-review.md`).
 
 Run reviewers as file-backed jobs:
 
