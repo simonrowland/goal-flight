@@ -82,6 +82,16 @@ valid agent only if it preserves the review/implementation concern.
 - Bash-tail fallback: worker stdout/stderr to files plus `scripts/goalflight_watch.py`
 - Review job: `scripts/goalflight_review_job.py`
 
+For `--parallel N` where `N >= 2`, ACP code-writing dispatches must pass
+`--worktree create`; the runner creates `worktrees/<dispatch-id>/` from `HEAD`
+and routes the worker `--cwd` there. Sequential dispatch (`--parallel 1` or no
+flag) stays in the project root.
+
+Parallel worktrees start from committed `HEAD`; they do not include uncommitted
+controller-root edits. Commit prerequisite changes before dispatch; stash or
+discard unrelated dirt, or fold uncommitted prerequisite content directly into
+the worker prompt.
+
 6. Record status:
 
 Every spawned worker must have:
@@ -148,7 +158,8 @@ python3 <skill-root>/scripts/goalflight_status.py --json
 min(N, machine operating cap, per-agent cap, no-active-cooldown)
 ```
 
-Use worktrees for concurrent code edits. See `protocols/worktrees-parallel.md`.
+Use `scripts/goalflight_acp_run.py --worktree create` for concurrent code
+edits. See `protocols/worktrees-parallel.md`.
 
 ## Termination
 

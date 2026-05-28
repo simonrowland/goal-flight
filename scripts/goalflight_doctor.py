@@ -946,6 +946,164 @@ def git_state(repo: Path) -> dict:
     }
 
 
+def _parse_git_worktree_porcelain(text: str) -> list[dict]:
+    records: list[dict] = []
+    current: dict | None = None
+    for line in text.splitlines():
+        if line.startswith("worktree "):
+            if current:
+                records.append(current)
+            current = {"path": line.split(" ", 1)[1]}
+            continue
+        if current is None:
+            continue
+        if " " in line:
+            key, value = line.split(" ", 1)
+            current[key] = value
+        elif line:
+            current[line] = True
+    if current:
+        records.append(current)
+    return records
+
+
+def _active_capacity_dispatches() -> tuple[set[tuple[str, str]], str | None]:
+    if goalflight_capacity is None:
+        return set(), "goalflight_capacity import failed"
+    try:
+        with goalflight_capacity.StateLock():
+            data = goalflight_capacity.load_state()
+            goalflight_capacity.prune_state(data)
+            active: set[tuple[str, str]] = set()
+            for lease in goalflight_capacity.active_leases(data):
+                dispatch_id = lease.get("dispatch_id")
+                active_root = (
+                    lease.get("worktree_path")
+                    or lease.get("worker_cwd")
+                    or lease.get("project_root")
+                )
+                if not dispatch_id or not active_root:
+                    continue
+                try:
+                    project_path = str(Path(str(active_root)).expanduser().resolve())
+                except OSError:
+                    project_path = str(active_root)
+                active.add((str(dispatch_id), project_path))
+            return active, None
+    except Exception as exc:
+        return set(), f"{type(exc).__name__}: {exc}"
+
+
+def check_worktrees(project_root: Path) -> dict:
+    """Report managed per-dispatch worktrees and stale completed ones.
+
+    Only paths under ``<project_root>/worktrees/<dispatch-id>`` are managed by
+    local ACP dispatch. Other git worktrees belong to operators or other tools.
+    """
+    result = run(["git", "worktree", "list", "--porcelain"], cwd=project_root, timeout=8)
+    if not result.get("ok"):
+        return {
+            "count": 0,
+            "paths": [],
+            "stale": [],
+            "ok": False,
+            "error": result.get("stderr") or result.get("stdout"),
+        }
+
+    managed_root_path = project_root / "worktrees"
+    if managed_root_path.is_symlink():
+        return {
+            "count": 0,
+            "paths": [],
+            "stale": [],
+            "escaped": [],
+            "ok": False,
+            "error": f"managed worktree root must not be a symlink: {managed_root_path}",
+        }
+    managed_root = managed_root_path.absolute()
+    paths: list[str] = []
+    dispatch_by_path: dict[str, str] = {}
+    details: list[dict] = []
+    escaped: list[str] = []
+    for record in _parse_git_worktree_porcelain(result.get("stdout") or ""):
+        raw = record.get("path")
+        if not raw:
+            continue
+        raw_path = Path(str(raw))
+        path = raw_path if raw_path.is_absolute() else project_root / raw_path
+        path = path.absolute()
+        try:
+            rel = path.relative_to(managed_root)
+        except ValueError:
+            continue
+        if len(rel.parts) != 1:
+            continue
+        if path.is_symlink():
+            escaped.append(str(path))
+            continue
+        try:
+            resolved_path = path.resolve()
+            resolved_path.relative_to(managed_root.resolve())
+        except ValueError:
+            escaped.append(str(path))
+            continue
+        dispatch_id = rel.parts[0]
+        path_text = str(resolved_path)
+        paths.append(path_text)
+        dispatch_by_path[path_text] = dispatch_id
+        status = run(["git", "status", "--short"], cwd=resolved_path, timeout=4)
+        head = run(["git", "rev-parse", "--short", "HEAD"], cwd=resolved_path, timeout=4)
+        branch = run(["git", "branch", "--show-current"], cwd=resolved_path, timeout=4)
+        details.append(
+            {
+                "path": path_text,
+                "dispatch_id": dispatch_id,
+                "dirty": bool(status.get("stdout")),
+                "head": head.get("stdout") or None,
+                "branch": branch.get("stdout") or None,
+            }
+        )
+
+    blocking_paths: list[str] = []
+    if managed_root_path.is_dir():
+        registered = {str(Path(path).absolute()) for path in paths}
+        registered_resolved = {str(Path(path).resolve()) for path in paths}
+        for child in sorted(managed_root_path.iterdir()):
+            if child.is_symlink():
+                continue
+            if not child.is_dir():
+                continue
+            child_abs = str(child.absolute())
+            child_resolved = str(child.resolve())
+            if child_abs not in registered and child_resolved not in registered_resolved:
+                blocking_paths.append(child_abs)
+
+    active_dispatches, capacity_error = _active_capacity_dispatches()
+    project_root_key = str(project_root.resolve())
+    stale = []
+    if capacity_error is None:
+        stale = [
+            path
+            for path, dispatch_id in sorted(dispatch_by_path.items())
+            if (dispatch_id, path) not in active_dispatches
+            and (dispatch_id, project_root_key) not in active_dispatches
+        ]
+    return {
+        "count": len(paths),
+        "paths": sorted(paths),
+        "stale": stale,
+        "blocking_paths": blocking_paths,
+        "details": sorted(details, key=lambda item: item["path"]),
+        "escaped": sorted(escaped),
+        "ok": capacity_error is None and not escaped and not stale and not blocking_paths,
+        "error": (
+            capacity_error
+            or (f"managed worktree path escaped root: {escaped}" if escaped else None)
+            or (f"unregistered blocking worktree paths: {blocking_paths}" if blocking_paths else None)
+        ),
+    }
+
+
 def _agent_instructions(repo: Path) -> tuple[Path | None, str]:
     path = repo / "AGENTS.md"
     if path.exists():
@@ -1126,6 +1284,7 @@ def doctor(repo: Path, *, fleet: bool = False, fleet_dir: Path | None = None, fl
         "grok": check_grok(),
         "acp": check_acp(),
         "project": git_state(repo),
+        "worktrees": check_worktrees(repo),
         "project_goalflight_readiness": check_project_goalflight_readiness(repo),
         "router": check_router(repo),
         "capacity": goalflight_capacity.profile(argparse.Namespace()) if goalflight_capacity else None,
@@ -1310,6 +1469,42 @@ def print_human(payload: dict) -> None:
     lines.append(status_line(True, "capacity profile", f"operating={cap.get('operating_cap')} raw={cap.get('raw_ram_ceiling')} ram={cap.get('ram_mb')}MB"))
     project = payload["project"]
     lines.append(status_line(project.get("present"), "git project", f"{project.get('branch')} {project.get('head')} dirty={project.get('dirty')}"))
+    worktrees = payload.get("worktrees") or {}
+    stale_worktrees = worktrees.get("stale") or []
+    if stale_worktrees:
+        details = payload.get("worktrees", {}).get("details") or []
+        stale_detail = [item for item in details if item.get("path") in set(stale_worktrees)]
+        dirty_count = sum(1 for item in stale_detail if item.get("dirty"))
+        heads = ", ".join(
+            f"{Path(str(item.get('path'))).name}@{item.get('head') or '?'}"
+            for item in stale_detail[:3]
+        )
+        lines.append(status_line(
+            False,
+            "parallel worktrees",
+            f"stale={len(stale_worktrees)} managed={worktrees.get('count')}; "
+            f"dirty={dirty_count} heads={heads or 'n/a'}; "
+            "inspect, run `git worktree remove <path>`, then `git worktree prune`",
+        ))
+    elif worktrees.get("blocking_paths"):
+        lines.append(status_line(
+            False,
+            "parallel worktrees",
+            f"blocking={len(worktrees.get('blocking_paths') or [])} managed={worktrees.get('count')}; "
+            "inspect/remove unregistered paths before reusing dispatch ids",
+        ))
+    elif worktrees.get("ok") is False:
+        lines.append(status_line(
+            False,
+            "parallel worktrees",
+            f"managed={worktrees.get('count', 0)} stale=unknown; {worktrees.get('error')}",
+        ))
+    else:
+        lines.append(status_line(
+            worktrees.get("ok"),
+            "parallel worktrees",
+            f"managed={worktrees.get('count', 0)} stale=0",
+        ))
     readiness = payload.get("project_goalflight_readiness") or {}
     router = payload.get("router") or {}
     lines.extend([

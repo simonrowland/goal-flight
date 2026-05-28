@@ -356,6 +356,8 @@ def cmd_acquire(args: argparse.Namespace) -> int:
             "prompt_id": args.prompt_id,
             "agent": agent,
             "project_root": args.project_root,
+            "worker_cwd": getattr(args, "worker_cwd", None),
+            "worktree_path": getattr(args, "worktree_path", None),
             "controller_pid": args.controller_pid or os.getpid(),
             "worker_pid": args.worker_pid,
             "mem_mb": rss_mb,
@@ -498,6 +500,8 @@ def build_parser() -> argparse.ArgumentParser:
     acq.add_argument("--dispatch-id")
     acq.add_argument("--prompt-id")
     acq.add_argument("--project-root")
+    acq.add_argument("--worker-cwd")
+    acq.add_argument("--worktree-path")
     acq.add_argument("--controller-pid", type=int)
     acq.add_argument("--worker-pid", type=int)
     acq.add_argument("--lease-id")

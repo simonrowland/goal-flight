@@ -21,6 +21,9 @@ legacy-host-adapters/
 # session state, machine-local memory. None of this is portable or canonical.
 .claude/
 
+# Goal Flight local per-dispatch worktrees.
+worktrees/
+
 # Python bytecode (from scripts/acp_*.py + test/test_acp_*.py).
 __pycache__/
 *.pyc
