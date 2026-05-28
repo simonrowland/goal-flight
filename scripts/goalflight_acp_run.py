@@ -1005,6 +1005,19 @@ async def run(args: argparse.Namespace) -> dict:
             or markers.get("USER-CONFIRM")
         ):
             state = "blocked"
+        # Sweep B P1 (2026-05-27): denied permissions can look like success.
+        # If the worker had any inline permission auto-declined (timeout or
+        # explicit deny) and no PERMISSION-OK-PROCEEDED marker says it
+        # explicitly worked around the denial, refuse to record complete.
+        # False negatives are recoverable (operator re-dispatches with
+        # tighter scope or a permission override); false positives —
+        # "complete" while the actual write was blocked — are not.
+        if state == "complete" and result.permission_auto_declined:
+            proceeded_ok = markers.get("PERMISSION-OK-PROCEEDED") or markers.get(
+                "PERMISSION-OK-PROCEEDED:"
+            )
+            if not proceeded_ok:
+                state = "blocked_permission_denied"
         payload.update({
             "state": state,
             "ok": result.ok and state == "complete",
@@ -1020,9 +1033,12 @@ async def run(args: argparse.Namespace) -> dict:
             # (marker USER-CONFIRM); the controller surfaces these, gets a user
             # decision, and re-dispatches. None when nothing was escalated.
             "permission_pending": result.permission_escalations or None,
-            # Informational -- inline permissions the controller auto-declined on
-            # timeout; the worker continued without the tool (no re-dispatch).
-            # Does NOT change state.
+            # Inline permissions the controller auto-declined on timeout. Sweep B
+            # P1: this list NOW influences terminal state — if non-empty and the
+            # worker didn't emit PERMISSION-OK-PROCEEDED, complete is downgraded
+            # to blocked_permission_denied. Worker can emit
+            # `PERMISSION-OK-PROCEEDED: <reason>` to explicitly opt out of the
+            # downgrade when it knows it worked around the decline.
             "permission_auto_declined": result.permission_auto_declined or None,
             # Reconcile the heartbeat flags with the FINAL verdict. A tail-race
             # heartbeat may have written killed/wedged into the payload before
