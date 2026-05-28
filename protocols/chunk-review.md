@@ -25,14 +25,28 @@ Canonical invocation (worker-internal or controller-side, same shape):
 ```bash
 codex exec --sandbox read-only --dangerously-bypass-approvals-and-sandbox \
   -c 'model_reasoning_effort="xhigh"' \
-  --enable web_search_cached \
-  "$REVIEW_PROMPT"
+  -c 'features.web_search="cached"' \
+  "$REVIEW_PROMPT" \
+  < /dev/null \
+  > docs-private/reviews/<date>-<slug>/codex-review.final.md \
+  2> docs-private/reviews/<date>-<slug>/codex-review.stderr.log
 ```
 
-Stream stdout into a review output file under
-`docs-private/reviews/<date>-<slug>/codex-review.final.md`. Parse for
-severity-tagged findings (P0/P1/P2/P3) and apply per the chunk-review policy
-below.
+**Critical: `< /dev/null`.** `codex exec` reads stdin to EOF even when the
+prompt is passed positionally. Without an explicit stdin close (or pipe), the
+process inherits the parent shell's stdin and blocks waiting for EOF — the
+observable symptom is 0 bytes of stdout for hours with near-zero CPU. Every
+bash-tail review invocation MUST redirect stdin from `/dev/null` (or pipe the
+prompt into stdin instead of passing it positionally).
+
+**`features.web_search` over `--enable web_search_cached`.** The
+`--enable web_search_cached` flag is deprecated as of codex v0.131 (it still
+runs but emits a deprecation warning into stderr). Use the `-c` config-key
+form `features.web_search="cached"` instead; that's the supported v0.131+
+shape.
+
+Parse the captured stdout (`codex-review.final.md`) for severity-tagged
+findings (P0/P1/P2/P3) and apply per the chunk-review policy below.
 
 **Why this works:** the codex-acp shim's permission gate triggers on
 worker-issued ACP tool calls (e.g., the worker invoking `codex exec` as a
