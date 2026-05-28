@@ -195,14 +195,19 @@ If a same-day file exists, append new chunks numbered after the last existing en
 - Choose a concern-diverse ready peer adapter (codex, cursor, grok, or another adapter that passes readiness). Use that adapter's declared `delegate` / invocation mapping. The codex commands below are adapter examples, not the default host path.
 - Codex adapter example, if gstack registered on codex side (`~/.codex/skills/gstack/` exists):
   ```bash
-  timeout --kill-after=10 300 codex exec '/plan-eng-review <path to docs-private/goal-queue-<topic>-<today>.md>. Reference: docs-private/goal-<topic>-*.md, AGENTS.md.' > /tmp/goal-flight-decomp-codex-<topic>.txt 2>&1 &
+  timeout --kill-after=10 300 codex exec '/plan-eng-review <path to docs-private/goal-queue-<topic>-<today>.md>. Reference: docs-private/goal-<topic>-*.md, AGENTS.md.' < /dev/null > /tmp/goal-flight-decomp-codex-<topic>.txt 2>&1 &
   ```
 - Codex adapter example, if gstack absent on codex side — point codex at the prompt file on disk, don't paste its contents into the exec arg:
   ```bash
   timeout --kill-after=10 300 codex exec \
     "Read <skill-root>/prompts/decomposition-review.md in full and execute it. Plan: <path-to-plan-file>. Drafted decomposition: docs-private/goal-queue-<topic>-<today>.md (or legacy <topic>-goal-queue-<today>.md from <0.3.0). Goal-statement: docs-private/goal-<topic>-*.md (or legacy <topic>-goal-statement-*.md). If your context compacts mid-review, re-read the prompts file — the file is the unparaphrased source of truth." \
+    < /dev/null \
     > /tmp/goal-flight-decomp-codex-<topic>.txt 2>&1 &
   ```
+  **`< /dev/null` is load-bearing** — `codex exec` reads stdin to EOF;
+  background bash inherits the parent shell's stdin and blocks forever
+  without the explicit close. See `protocols/chunk-review.md` "How the
+  review runs" for the full rationale.
   Avoids spamming the controller's tokens with pre-pasted prompt + plan + decomposition; survives codex session compaction; bypasses any CLI argument length limit. Same principle as the context discipline in `SKILL.md`: keep the prompt short and pass pointers.
 
 Capture the PID. The output goes to a temp file.

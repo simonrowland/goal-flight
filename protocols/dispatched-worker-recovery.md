@@ -84,6 +84,42 @@ allow-patterns, different mode, different agent) and re-fire the chunk.
    reason = strong signal to fix the dispatch path (e.g., the layer-2
    permission watcher in R26).
 
+## Recovery sub-case: worker WIP bundled into someone else's commit
+
+The fb05e84-class incident (2026-05-27): controller (or another worker)
+ran bare `git commit` while a worker had staged its scope files. The
+worker's staged WIP got bundled into a commit with the wrong author /
+scope / message. The worker either finds nothing left to commit (silent
+exit) or fails with "nothing to commit" depending on its workflow.
+
+Symptoms:
+
+- Worker's status JSON says `state: complete` but git log shows the
+  worker's scope landed in a different commit (different author, message
+  doesn't match the chunk's expected `Chunk-N: <slug>` shape).
+- `git log --author=<worker>` returns nothing for the recent window.
+- The bundled commit's diff contains files from multiple dispatch
+  scopes (cross-scope file list).
+
+Recovery options:
+
+1. **If the bundled commit has NOT been pushed:** `git reset --soft
+   HEAD~1` brings the bundled changes back to staging. Then commit by
+   scope with explicit pathspecs:
+   `git commit -m "<scope-A msg>" -- <scope-A files>` followed by
+   `git commit -m "<scope-B msg>" -- <scope-B files>`. History is now
+   correctly attributed.
+2. **If the bundled commit HAS been pushed (or rewriting is undesired):**
+   leave it in place. Amend its message to credit all bundled scopes
+   (`git commit --amend -m "<combined msg referencing chunks 6 + 7>"`),
+   OR document the bundle in `docs-private/RESUME-NOTES-<date>.md` with
+   the dispatch IDs and the chunks they should have landed under. Future
+   audits see the deliberate bundle.
+3. **Forward-looking:** the commit guard (`scripts/goalflight_commit_guard.py`,
+   installed as a `.git/hooks/pre-commit` symlink) refuses bare `git commit`
+   while active same-root leases exist. Install it; the runtime error
+   teaches the discipline at the moment of failure.
+
 ## What NOT to do
 
 - **Don't re-dispatch the same chunk with the same allow-patterns and hope

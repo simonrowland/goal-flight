@@ -119,7 +119,12 @@ Read `protocols/chunk-review.md`.
 - run executor self-review findings when present in worker output
 - fix P0/P1/P2 from review before commit
 - commit when the active goal-flight workflow completes a chunk (default: one
-  commit per chunk) or when the user explicitly requests a commit
+  commit per chunk) or when the user explicitly requests a commit. Use
+  explicit pathspecs: `git commit -m '<scope>' -- <file1> <file2> ...`.
+  Never bare `git commit` while other workers may have staged WIP — the
+  commit guard (`scripts/goalflight_commit_guard.py`) refuses to prevent
+  bundling. The guard's error message names the lease IDs in flight, the
+  partial-commit fix shape, and the override flag if needed.
 
 9. Milestone review (separate from step 8):
 

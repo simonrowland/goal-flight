@@ -34,7 +34,7 @@
 #   --max-idle-secs 180   (matches protocol idle/no-progress guidance)
 #   --cpu-epsilon   0.1   (process-group %CPU above this is running_quiet)
 #
-# Intended to be backgrounded by commands/execute.md step 2.b [bash-tail] branch:
+# Intended to be backgrounded by commands/execute.md (the bash-tail dispatch branch):
 #   bash <skill-root>/scripts/watch-dispatch-tail.sh \
 #     --pid $WORKER_PID --tail /tmp/codex-<slug>.txt \
 #     --controller-pid $$ --agent codex-bash-tail --session-id <slug> \

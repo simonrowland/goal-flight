@@ -183,3 +183,16 @@ Recommended add-ons at setup/init: **gstack** (default reviewer) and
 autoreview requires the upstream helper (typically `AUTOREVIEW_HELPER` or
 `~/.cursor/skills/autoreview/scripts/autoreview`). Doctor reports WARN when
 either is absent.
+
+## Commit hygiene at chunk completion
+
+When committing a reviewed chunk, use explicit pathspecs:
+
+```bash
+git commit -m "<scoped message>" -- <file1> <file2> ...
+```
+
+Never bare `git commit` while other goal-flight workers may have staged WIP
+in the shared worktree — the commit guard
+(`scripts/goalflight_commit_guard.py`) refuses to prevent bundling. See its
+error message at failure time for the recovery shape.
