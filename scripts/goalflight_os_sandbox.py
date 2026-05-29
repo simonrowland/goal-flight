@@ -201,6 +201,17 @@ def macos_sandbox_profile(
         raise OsSandboxError(f"unsupported macOS sandbox profile: {profile!r}")
     write_roots = macos_write_roots(cwd, profile, agent=agent, command=command)
     write_filters = "\n".join(f"  (subpath {_scheme_string(path)})" for path in write_roots)
+    # /dev/null and /dev/zero are safe write targets (a data sink and a zero
+    # source — writing to them mutates no real filesystem state). git and many
+    # tools redirect stderr/stdin to /dev/null; without an explicit allow rule
+    # the workspace-write sandbox denies the open() for write and the worker
+    # fails at the git step (observed 2026-05-28: 5+ codex-acp workers hit
+    # BLOCKED on commit because `git ... 2>/dev/null` could not open the device).
+    # These are device-node literals, NOT a /dev subpath grant — the rest of
+    # /dev stays denied. Reads of /dev/null are already covered by file-read*.
+    device_filters = "\n".join(
+        f"  (literal {_scheme_string(path)})" for path in ("/dev/null", "/dev/zero")
+    )
     profile_text = f"""(version 1)
 (deny default)
 (allow process*)
@@ -210,7 +221,8 @@ def macos_sandbox_profile(
 (allow network*)
 (allow file-read*)
 (allow file-write*
-{write_filters})
+{write_filters}
+{device_filters})
 """
     return profile_text, write_roots
 

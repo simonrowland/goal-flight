@@ -199,6 +199,32 @@ def case_profile_string_escapes_workspace_path() -> None:
         shutil.rmtree(base, ignore_errors=True)
 
 
+def case_profile_grants_dev_null_write() -> None:
+    # Regression (2026-05-28): the workspace-write sandbox restricted file-write*
+    # to write_roots subpaths, so git's `2>/dev/null` redirect could not open the
+    # device for write and 5+ codex-acp workers hit BLOCKED at the commit step.
+    # /dev/null + /dev/zero must be write-allowed device literals under BOTH
+    # profiles (safe data sink / zero source; not a /dev subpath grant). Hermetic:
+    # macos_sandbox_profile only builds the policy string, so this runs on any
+    # platform regardless of sandbox-exec availability.
+    for profile in (OS_SANDBOX_READ_ONLY, OS_SANDBOX_WORKSPACE_WRITE):
+        profile_text, _ = goalflight_os_sandbox_mod.macos_sandbox_profile(
+            str(ROOT), profile
+        )
+        assert "(allow file-write*" in profile_text, (profile, profile_text)
+        assert '(literal "/dev/null")' in profile_text, (profile, profile_text)
+        assert '(literal "/dev/zero")' in profile_text, (profile, profile_text)
+        # the device literals must sit inside the file-write* block, not after it
+        write_block = profile_text.split("(allow file-write*", 1)[1]
+        assert '(literal "/dev/null")' in write_block, (profile, profile_text)
+        # scope lock: /dev must appear ONLY as exact literals, never as a
+        # subpath grant. A `(subpath "/dev")` (or any `/dev/...` subpath) would
+        # silently widen write access to the whole device tree (/dev/disk*,
+        # /dev/mem, ...). This catches a future careless widen that the
+        # presence checks above would NOT — they only assert /dev/null is there.
+        assert '(subpath "/dev' not in profile_text, (profile, profile_text)
+
+
 def case_rejects_cwd_under_temp_root() -> None:
     if not _sandbox_available():
         print("SKIP: sandbox-exec unavailable")
@@ -591,6 +617,7 @@ def main() -> None:
     case_requested_sandbox_fails_closed_on_unsupported_hosts()
     case_prepare_wrapper_blocks_home_write()
     case_profile_string_escapes_workspace_path()
+    case_profile_grants_dev_null_write()
     case_rejects_cwd_under_temp_root()
     case_agent_state_roots_are_explicit_exception()
     case_rejects_cwd_under_agent_state_root()
