@@ -590,8 +590,13 @@ def test_chunk_review_canonical_invocation_has_stdin_redirect() -> None:
     assert_true("canonical invocation bash block closed", fence_end > fence_start)
     invocation = after_marker[fence_start:fence_end]
     assert_true(
-        "canonical invocation invokes codex exec with sandbox + bypass-approvals",
-        "codex exec --sandbox read-only --dangerously-bypass-approvals-and-sandbox" in invocation,
+        "canonical invocation invokes codex exec with sandbox + non-interactive approval policy",
+        "codex exec --sandbox read-only -c approval_policy=never" in invocation,
+    )
+    assert_true(
+        "canonical invocation does NOT use the deprecated dangerously-bypass flag "
+        "(rejected by classifiers; forbidden in adapter manifests)",
+        "--dangerously-bypass-approvals-and-sandbox" not in invocation,
     )
     assert_true(
         "canonical invocation explicitly redirects stdin from /dev/null",
@@ -1226,6 +1231,68 @@ def test_dispatched_worker_recovery_protocol_present() -> None:
         )
 
 
+def _is_legitimate_bypass_reference(line: str) -> bool:
+    """True when a line NAMES the deprecated dangerously-bypass flag in a
+    forbid-list, detection-regex, or prohibition context (the immune system)
+    rather than EMITTING it in an actual `codex exec` invocation (the drift).
+
+    Distinguishing signatures (content-keyed, robust to line-number drift):
+    - `dangerously-bypass-approvals-and-sandbox",` — trailing quote+comma marks
+      a quoted list element (forbid-list) or a regex string literal (detector).
+    - `do not use` — a prose prohibition naming the flag to ban it.
+
+    An actual emit (`codex exec ... --dangerously-bypass-approvals-and-sandbox`)
+    has the flag followed by whitespace / line-continuation, not a quote-comma,
+    and is not prose — so it matches neither signature and IS flagged."""
+    lowered = line.lower()
+    return (
+        'dangerously-bypass-approvals-and-sandbox",' in lowered
+        or "do not use" in lowered
+    )
+
+
+def test_no_dangerous_bypass_in_executable_surface() -> None:
+    """The deprecated `--dangerously-bypass-approvals-and-sandbox` flag is
+    rejected by classifiers and forbidden in adapter manifests. It must not be
+    EMITTED in an actual invocation in the executable surface (scripts/,
+    templates/) where it would cause a runtime classifier denial. The canonical
+    non-interactive form is `--sandbox <profile> -c approval_policy=never`.
+
+    This scan catches the drift class where a one-off pasted command gets
+    memorialized into a wrapper or template (re-audit 2026-05-29 found
+    scripts/goalflight_recon.sh carrying it). It deliberately ALLOWS lines that
+    merely NAME the flag to forbid / detect / prohibit it (forbid-list elements
+    in goalflight_adapter_gate.py, the review-flight detection regex in
+    scripts/hosts/controller/common.py, the explicit 'Do NOT use' prohibition
+    in templates/codex-goal-prompt.md.tpl) — those are the immune system, not
+    drift. Docs canonical-invocation blocks are covered separately by
+    test_chunk_review_canonical_invocation_has_stdin_redirect."""
+    flag = "--dangerously-bypass-approvals-and-sandbox"
+    offenders: list[str] = []
+    for sub in ("scripts", "templates"):
+        base = ROOT / sub
+        if not base.is_dir():
+            continue
+        for path in base.rglob("*"):
+            if not path.is_file():
+                continue
+            if path.suffix not in (".sh", ".py", ".tpl", ".md"):
+                continue
+            try:
+                text = path.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            for lineno, line in enumerate(text.splitlines(), 1):
+                if flag in line and not _is_legitimate_bypass_reference(line):
+                    offenders.append(f"{path.relative_to(ROOT)}:{lineno}")
+    assert_true(
+        f"no deprecated dangerously-bypass flag EMITTED in scripts/ or "
+        f"templates/ (forbid-list / detector / prohibition references are "
+        f"allowed; found emits: {offenders})",
+        not offenders,
+    )
+
+
 def main() -> None:
     tests = [
         test_capacity_acquire_release_cooldown,
@@ -1251,6 +1318,7 @@ def main() -> None:
         test_commit_guard_refuses_with_active_leases_and_honors_override,
         test_session_status_helper_contract,
         test_dispatched_worker_recovery_protocol_present,
+        test_no_dangerous_bypass_in_executable_surface,
     ]
     for test in tests:
         test()

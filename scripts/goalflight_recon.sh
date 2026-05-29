@@ -64,7 +64,7 @@ PROMPT
 
 (
   cd "$root"
-  codex exec --sandbox read-only --dangerously-bypass-approvals-and-sandbox \
+  codex exec --sandbox read-only -c approval_policy=never \
     -c 'model_reasoning_effort="xhigh"' \
     --enable web_search_cached \
     "$prompt" \

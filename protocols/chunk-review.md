@@ -13,17 +13,21 @@ alone is **not** sufficient.
 ## How the review runs (bash-tail subprocess, not nested ACP tool call)
 
 **gstack `/review` is read-only — invoke it as a bash-tail subprocess with
-codex's own read-only sandbox + bypass-approvals, NOT as a nested ACP
-tool-call inside the worker's shim.** Read-only sandbox enforces the safety
-property the ACP permission gate was protecting; bypass-approvals removes
-the asking flow that's redundant when the inner sandbox is already
-constraining the subprocess. The two together let the goal-mode worker run
-its own review without triggering ACP permission elicitation.
+codex's own read-only sandbox + non-interactive approval policy, NOT as a
+nested ACP tool-call inside the worker's shim.** Read-only sandbox enforces
+the safety property the ACP permission gate was protecting;
+`-c approval_policy=never` removes the asking flow that's redundant when the
+inner sandbox is already constraining the subprocess. The two together let
+the goal-mode worker run its own review without triggering ACP permission
+elicitation. Do NOT use `--dangerously-bypass-approvals-and-sandbox` — it is
+rejected by classifiers and forbidden in adapter manifests
+(`adapters/*.json` `forbidden_args`); `-c approval_policy=never` paired with
+`--sandbox read-only` is the canonical non-interactive form.
 
 Canonical invocation (worker-internal or controller-side, same shape):
 
 ```bash
-codex exec --sandbox read-only --dangerously-bypass-approvals-and-sandbox \
+codex exec --sandbox read-only -c approval_policy=never \
   -c 'model_reasoning_effort="xhigh"' \
   --enable web_search_cached \
   "$REVIEW_PROMPT" \
