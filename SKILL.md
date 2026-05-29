@@ -96,6 +96,7 @@ Controller behaviour probes run through portable host adapters, not host-specifi
 | **per-chunk status snapshot** | Session Pre-Flight | `python3 <skill-root>/scripts/goalflight_chunk_summary.py --slug <slug> --json` |
 | autonomous throughput | Autonomous throughput | `commands/execute.md`, `commands/goal.md` |
 | **chat as requirements** | Chat as requirements | `commands/goal.md`, `protocols/user-status-cadence.md` |
+| context lints | Autonomous throughput | `protocols/engagement-lint.md`, `foreground-duration-hook.md` |
 | user-status-cadence | User progress reporting | `protocols/user-status-cadence.md` |
 | chunk-vs-milestone review | Review layers | `protocols/chunk-review.md`, `protocols/milestone-review.md` |
 | dispatch axes (per-task routing table is in Worker Routing) | Dispatch Model, Worker Routing | `protocols/dispatch-routing.md` |
