@@ -12,13 +12,17 @@ set -euo pipefail
 # hook a no-op outside the goal-flight repo unless GOALFLIGHT_HOOKS_FORCE=1
 # is set (test/dev override).
 #
-# Detection precedence:
+# Detection precedence for the session's working directory:
 #   1. payload.cwd field from the PreToolUse JSON (if Claude Code provides it)
 #   2. CLAUDE_CODE_CWD env var (if Claude Code exports it)
 #   3. PWD env var (best-effort fallback)
-# Match: prefix `/Users/simonrowland/Repos/goal-flight`. This is a known
-# hardcoded path; portable detection (probe for goal-flight repo marker)
-# is queued as Wave-A follow-up.
+# The goal-flight repo root is derived from THIS script's own real location
+# (resolving the ~/.claude/hooks symlink back to <repo>/scripts/hooks/), so no
+# operator-specific path is embedded. Enforce only when the working directory
+# is under that root; otherwise no-op. If the root cannot be derived, fail open
+# (never block an unrelated session). NOTE: this matches a goal-flight-repo cwd
+# only; firing for goal-flight-on-any-project (an active-controller marker) is
+# the Wave-A follow-up.
 
 dry_run=0
 if [[ "${1:-}" == "--dry-run" ]]; then
@@ -34,7 +38,26 @@ fi
 
 # Scope gate (skipped under --dry-run so test fixtures keep working).
 if [[ "$dry_run" -eq 0 ]]; then
-  goalflight_root="/Users/simonrowland/Repos/goal-flight"
+  # Derive the goal-flight repo root from this script's own real path,
+  # resolving the ~/.claude/hooks symlink back to <repo>/scripts/hooks/.
+  # No operator-specific path is hardcoded; a failed derivation -> fail open.
+  _hook_src="${BASH_SOURCE[0]:-$0}"
+  # Resolve symlink hops manually (stock macOS readlink lacks -f). Every step is
+  # fail-open-safe: an iteration cap defends against a circular link chain, and
+  # each substitution falls back to empty (caught by the sanity guard below)
+  # rather than aborting under `set -e`.
+  _hook_hops=0
+  while [ -L "$_hook_src" ] && [ "$_hook_hops" -lt 40 ]; do
+    _hook_hops=$((_hook_hops + 1))
+    _hook_link="$(readlink "$_hook_src" || true)"
+    [ -n "$_hook_link" ] || break
+    case "$_hook_link" in
+      /*) _hook_src="$_hook_link" ;;
+      *)  _hook_src="$(cd "$(dirname "$_hook_src")" 2>/dev/null && pwd || true)/$_hook_link" ;;
+    esac
+  done
+  goalflight_root="$(cd "$(dirname "$_hook_src")/../.." 2>/dev/null && pwd || true)"
+
   payload_cwd=$(printf '%s' "$input_json" | python3 -c 'import json,sys
 try:
     d = json.loads(sys.stdin.read() or "{}")
@@ -42,15 +65,19 @@ try:
 except Exception:
     print("")' 2>/dev/null || true)
   effective_cwd="${payload_cwd:-${CLAUDE_CODE_CWD:-${PWD:-}}}"
-  case "${effective_cwd}" in
-    "${goalflight_root}"*) ;;
-    *)
-      if [[ "${GOALFLIGHT_HOOKS_FORCE:-}" != "1" ]]; then
-        echo '{"block":false}'
-        exit 0
-      fi
-      ;;
-  esac
+
+  # Enforce only when cwd is under a sanely-derived root. An empty or "/" root
+  # (derivation failed) must NOT become a match-everything prefix -> fail open.
+  in_scope=0
+  if [[ -n "${goalflight_root}" && "${goalflight_root}" != "/" ]]; then
+    case "${effective_cwd}" in
+      "${goalflight_root}"*) in_scope=1 ;;
+    esac
+  fi
+  if [[ "$in_scope" -ne 1 && "${GOALFLIGHT_HOOKS_FORCE:-}" != "1" ]]; then
+    echo '{"block":false}'
+    exit 0
+  fi
 fi
 
 python3 -c '

@@ -19,8 +19,12 @@ override env vars per the block messages.
 
 ## Scope verification
 
-The hook is a no-op outside `/Users/simonrowland/Repos/goal-flight*`. After
-installing the symlink + settings.json registration, verify the scope-gate:
+The hook is a no-op outside the goal-flight repo working tree (call it
+`<goal-flight-repo-root>`). It derives that root from its own real location
+(resolving the `~/.claude/hooks` symlink back to
+`<goal-flight-repo-root>/scripts/hooks/`), so no operator-specific path is
+embedded and the hook works for any checkout. After installing the symlink +
+settings.json registration, verify the scope-gate:
 
 1. Open a Claude Code session in a NON-goal-flight directory (e.g.
    `~/Repos/<other-repo>`).
@@ -31,6 +35,6 @@ installing the symlink + settings.json registration, verify the scope-gate:
 4. To force-enable the hook outside the goal-flight repo (test/dev only),
    set `GOALFLIGHT_HOOKS_FORCE=1` in the environment.
 
-The current scope-gate uses a hardcoded path (`/Users/simonrowland/Repos/goal-flight`).
-Portable repo detection (probe for `SKILL.md` with `name: goal-flight`) is
+The scope-gate currently matches a goal-flight-repo working directory. Firing
+for goal-flight-on-any-project (via an active-controller session marker) is
 queued as a Wave-A follow-up.

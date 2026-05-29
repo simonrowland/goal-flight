@@ -402,7 +402,7 @@ def review_flight_at_completion_checks(tail_text: str) -> list[dict[str, Any]]:
             r"codex\s+exec[\s\S]{0,500}(?:--sandbox\s+read-only|-s\s+read-only)"
             r"[\s\S]{0,500}"
             r"(?:--dangerously-bypass-approvals-and-sandbox"
-            r"|approval_policy[=\s\"']*never)",
+            r"|approval_policy[=\s\"']+never)",
             lower,
         )
     )

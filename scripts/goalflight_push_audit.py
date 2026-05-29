@@ -1,5 +1,19 @@
 #!/usr/bin/env python3
-"""Audit remote branch advancement against local push and commit reflogs."""
+"""Audit remote branch advancement against local push and commit reflogs.
+
+Detects the unauthorized-origin-advance class: origin moved to a SHA with no
+corresponding local push reflog entry (e.g. a push from another worktree or
+machine, or a commit constructed + pushed via an out-of-band API such as the
+GitHub Git Data API). Read-only: runs only cat-file / ls-remote / rev-parse /
+show + reflog reads, never pushes or mutates. The `git push -f` in ADVICE is a
+printed suggestion string, never executed.
+
+Limitation — do not over-trust `aligned`: a rogue push from the controller's
+OWN clone writes a normal push reflog entry, so it reads as `aligned` here.
+That same-clone case is covered by the commit guard + the worker-escalate-not-
+bypass discipline, not by this reflog-based audit. `aligned` means "no remote
+advance lacks a local push reflog entry", not "every advance was authorized".
+"""
 
 from __future__ import annotations
 
