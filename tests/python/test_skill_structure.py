@@ -487,13 +487,23 @@ def longest_common_substring_length(left: str, right: str) -> int:
     return best
 
 
+def _is_section_heading(line: str) -> bool:
+    # H2 and H3 both bound a budget slice. Treating ``### `` sub-headings as
+    # boundaries lets a large ``## `` section be split into coherent thematic
+    # slices (e.g. ``## State`` -> State layers / Status plane / Resume) so each
+    # Golden Master entry's max_section_lines measures its own slice instead of
+    # the whole H2 block. Deeper headings (``#### ``+) are not treated as
+    # boundaries — only the second and third levels carve budget slices.
+    return line.startswith("## ") or line.startswith("### ")
+
+
 def skill_section_budget_measure(skill_lines: list[str], match_line_index: int) -> tuple[str, int]:
     frontmatter_markers = [idx for idx, line in enumerate(skill_lines) if line.strip() == "---"]
     section_start = (frontmatter_markers[1] + 1) if len(frontmatter_markers) >= 2 else 0
     section_heading = "preamble"
 
     for idx in range(match_line_index, -1, -1):
-        if skill_lines[idx].startswith("## "):
+        if _is_section_heading(skill_lines[idx]):
             section_start = idx + 1
             section_heading = skill_lines[idx]
             break
@@ -503,7 +513,7 @@ def skill_section_budget_measure(skill_lines: list[str], match_line_index: int) 
 
     section_end = len(skill_lines)
     for idx in range(match_line_index + 1, len(skill_lines)):
-        if skill_lines[idx].startswith("## "):
+        if _is_section_heading(skill_lines[idx]):
             section_end = idx
             break
 

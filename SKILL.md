@@ -425,19 +425,27 @@ Details live in `protocols/worker-markers.md`.
 
 ## State
 
+### State layers
+
 Use three state layers:
 - project: git, tests, docs, queue
 - machine: capacity leases, dispatch ledger, cooldowns
 - conversation: current decisions and unresolved questions
 
-Repository files are the canonical memory backend. Use one status plane across
-transports. Isolate pidfiles per controller session. Ledger liveness matches
-PID plus process identity. Memory writeback requires migration lock ownership.
-Classify ACP failures as upstream, local, or repo. Remote workers execute;
-controller remains designated surface. Propose AGENTS.md changes as diffs only.
+Repository files are the canonical memory backend.
+Memory writeback requires migration lock ownership.
+
+### Status plane and liveness
+
 Use one status plane across transports.
 Ledger liveness matches PID plus process identity.
+Isolate pidfiles per controller session.
+Classify ACP failures as upstream, local, or repo.
+
+### Resume and handoff
+
 Remote workers execute; controller remains designated surface.
+Propose AGENTS.md changes as diffs only.
 
 On resume or after sleep:
 
@@ -445,9 +453,8 @@ On resume or after sleep:
 python3 <skill-root>/scripts/goalflight_status.py --json
 ```
 
-Active run + compaction: reload Goal Flight only when already in play. After
-compaction, if goal-flight was active, reload SKILL.md and commands/resume.md
-before continuing. Not always-on.
+Active run + compaction: reload Goal Flight only when already in play. Not
+always-on. After compaction, if goal-flight was active, reload SKILL.md and commands/resume.md before continuing.
 
 **Canonical post-compaction reload order:**
 1. Read `AGENTS.md` (entry point).
@@ -464,7 +471,6 @@ before continuing. Not always-on.
 6. `python3 <skill-root>/scripts/goalflight_status.py --json` for live
    capacity + ledger.
 7. Continue from status, not from chat memory.
-After compaction, if goal-flight was active, reload SKILL.md and commands/resume.md before continuing.
 
 ## Context Discipline
 
