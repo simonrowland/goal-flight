@@ -355,6 +355,22 @@ def test_review_flight_at_completion_scenario_registered() -> None:
     assert all(check["ok"] is True for check in checks)
 
 
+def test_review_flight_at_completion_accepts_canonical_codex_approval_policy() -> None:
+    # Regression (2026-05-29): the canonical codex review form uses
+    # `-c approval_policy=never`, NOT the deprecated
+    # `--dangerously-bypass-approvals-and-sandbox` flag. The review-flight
+    # detector must recognize the canonical form, else a correct post-fix
+    # review reads as "review skipped" (false negative).
+    checks = review_flight_at_completion_checks(
+        '$ codex exec --sandbox read-only -c approval_policy=never '
+        '-c \'model_reasoning_effort="xhigh"\' "$REVIEW_PROMPT" < /dev/null '
+        '> docs-private/reviews/2026-05-29-x/codex-review.final.md\n'
+        'Findings handled before git commit.'
+    )
+    by_id = {check["id"]: check for check in checks}
+    assert by_id["gstack_review_or_canonical_codex_exec_invoked"]["ok"] is True
+
+
 def test_review_flight_at_completion_rejects_hand_rolled_prompt() -> None:
     checks = review_flight_at_completion_checks(
         "$ goalflight_acp_run.py --agent reviewer --prompt 'please review this diff for bugs'"

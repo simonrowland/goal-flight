@@ -389,15 +389,20 @@ def review_flight_at_completion_checks(tail_text: str) -> list[dict[str, Any]]:
         and "autoreview target:" in lower
         and "web_search: off" in lower
     )
+    # Recognize a codex review by: `codex exec` + a read-only sandbox
+    # (`--sandbox read-only` or `-s read-only`) + a non-interactive approval
+    # signal. The CANONICAL signal is `-c approval_policy=never`; the
+    # deprecated `--dangerously-bypass-approvals-and-sandbox` is also matched
+    # so old transcripts still parse, but it is NOT the prescribed form (it is
+    # classifier-rejected and forbidden in adapter manifests — see
+    # protocols/chunk-review.md). Without the approval_policy branch a correct
+    # post-canonical-fix review would go unrecognized → false "review skipped".
     codex_flags = bool(
         re.search(
-            r"codex\s+exec[\s\S]{0,500}--sandbox\s+read-only"
-            r"[\s\S]{0,500}--dangerously-bypass-approvals-and-sandbox",
-            lower,
-        )
-        or re.search(
-            r"codex\s+exec[\s\S]{0,500}-s\s+read-only"
-            r"[\s\S]{0,500}--dangerously-bypass-approvals-and-sandbox",
+            r"codex\s+exec[\s\S]{0,500}(?:--sandbox\s+read-only|-s\s+read-only)"
+            r"[\s\S]{0,500}"
+            r"(?:--dangerously-bypass-approvals-and-sandbox"
+            r"|approval_policy[=\s\"']*never)",
             lower,
         )
     )

@@ -1231,64 +1231,72 @@ def test_dispatched_worker_recovery_protocol_present() -> None:
         )
 
 
-def _is_legitimate_bypass_reference(line: str) -> bool:
-    """True when a line NAMES the deprecated dangerously-bypass flag in a
-    forbid-list, detection-regex, or prohibition context (the immune system)
-    rather than EMITTING it in an actual `codex exec` invocation (the drift).
-
-    Distinguishing signatures (content-keyed, robust to line-number drift):
-    - `dangerously-bypass-approvals-and-sandbox",` — trailing quote+comma marks
-      a quoted list element (forbid-list) or a regex string literal (detector).
-    - `do not use` — a prose prohibition naming the flag to ban it.
-
-    An actual emit (`codex exec ... --dangerously-bypass-approvals-and-sandbox`)
-    has the flag followed by whitespace / line-continuation, not a quote-comma,
-    and is not prose — so it matches neither signature and IS flagged."""
-    lowered = line.lower()
-    return (
-        'dangerously-bypass-approvals-and-sandbox",' in lowered
-        or "do not use" in lowered
-    )
+# Python files that construct a codex command via subprocess argv but do NOT
+# go through the adapter `arg_policy` forbidden_args gate (hard-coded Popen
+# sites). These carry NO forbid-list, so any occurrence of the deprecated flag
+# in them is an EMIT, not a reference — scan them wholesale. Add new hard-coded
+# codex-emit sites here when they appear.
+KNOWN_CODEX_EMIT_PY_SITES = (
+    "scripts/hosts/codex/bash_tail_controller.py",
+    "scripts/goalflight_review_job.py",
+)
 
 
-def test_no_dangerous_bypass_in_executable_surface() -> None:
+def test_no_dangerous_bypass_in_codex_emit_surface() -> None:
     """The deprecated `--dangerously-bypass-approvals-and-sandbox` flag is
-    rejected by classifiers and forbidden in adapter manifests. It must not be
-    EMITTED in an actual invocation in the executable surface (scripts/,
-    templates/) where it would cause a runtime classifier denial. The canonical
+    rejected by codex's runtime classifier and forbidden in adapter manifests.
+    It must not be EMITTED in an actual codex invocation. The canonical
     non-interactive form is `--sandbox <profile> -c approval_policy=never`.
 
-    This scan catches the drift class where a one-off pasted command gets
-    memorialized into a wrapper or template (re-audit 2026-05-29 found
-    scripts/goalflight_recon.sh carrying it). It deliberately ALLOWS lines that
-    merely NAME the flag to forbid / detect / prohibit it (forbid-list elements
-    in goalflight_adapter_gate.py, the review-flight detection regex in
-    scripts/hosts/controller/common.py, the explicit 'Do NOT use' prohibition
-    in templates/codex-goal-prompt.md.tpl) — those are the immune system, not
-    drift. Docs canonical-invocation blocks are covered separately by
-    test_chunk_review_canonical_invocation_has_stdin_redirect."""
+    Coverage is layered, and no single mechanism covers everything:
+    - `*.sh` / `*.tpl` under scripts/ and templates/ — scanned here (the
+      re-audit 2026-05-29 found scripts/goalflight_recon.sh carrying it).
+    - manifest-declared invocations — gated by the adapter `arg_policy`
+      `forbidden_args` scan (goalflight_adapter_gate.py + validate/setup), NOT
+      by this test.
+    - hard-coded codex Popen argvs in Python (KNOWN_CODEX_EMIT_PY_SITES) —
+      gated by NEITHER the shell scan NOR arg_policy, so scanned here directly.
+    - codex's own runtime classifier — the final backstop for anything missed.
+
+    Deliberately NOT broadly scanned:
+    - other `*.py` — the flag appears there only as DATA: forbid-list elements
+      (goalflight_adapter_gate.py), detection regexes (hosts/controller/
+      common.py), comments. A shape-based scan cannot distinguish a forbid-list
+      arg `"--flag",` from an emit arg `"--flag",`, so broad .py scanning is
+      false-positive-prone; the known emit sites above carry no forbid-lists, so
+      scanning THEM is unambiguous.
+    - `*.md` — prohibition prose; canonical-invocation blocks are covered by
+      test_chunk_review_canonical_invocation_has_stdin_redirect + skill-structure.
+
+    A line is allowed iff it carries an explicit `do not use` prohibition
+    (covers the codex-goal-prompt.md.tpl 'Do NOT use ...' note)."""
     flag = "--dangerously-bypass-approvals-and-sandbox"
     offenders: list[str] = []
+
+    scan_paths: list[Path] = []
     for sub in ("scripts", "templates"):
         base = ROOT / sub
-        if not base.is_dir():
+        if base.is_dir():
+            scan_paths.extend(
+                p for p in base.rglob("*")
+                if p.is_file() and p.suffix in (".sh", ".tpl")
+            )
+    scan_paths.extend(
+        ROOT / rel for rel in KNOWN_CODEX_EMIT_PY_SITES if (ROOT / rel).is_file()
+    )
+
+    for path in scan_paths:
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
             continue
-        for path in base.rglob("*"):
-            if not path.is_file():
-                continue
-            if path.suffix not in (".sh", ".py", ".tpl", ".md"):
-                continue
-            try:
-                text = path.read_text(encoding="utf-8", errors="ignore")
-            except OSError:
-                continue
-            for lineno, line in enumerate(text.splitlines(), 1):
-                if flag in line and not _is_legitimate_bypass_reference(line):
-                    offenders.append(f"{path.relative_to(ROOT)}:{lineno}")
+        for lineno, line in enumerate(text.splitlines(), 1):
+            if flag in line and "do not use" not in line.lower():
+                offenders.append(f"{path.relative_to(ROOT)}:{lineno}")
     assert_true(
-        f"no deprecated dangerously-bypass flag EMITTED in scripts/ or "
-        f"templates/ (forbid-list / detector / prohibition references are "
-        f"allowed; found emits: {offenders})",
+        f"no deprecated dangerously-bypass flag EMITTED in *.sh / *.tpl / "
+        f"hard-coded codex Popen sites (prohibition 'do not use' lines allowed; "
+        f"found emits: {offenders})",
         not offenders,
     )
 
@@ -1318,7 +1326,7 @@ def main() -> None:
         test_commit_guard_refuses_with_active_leases_and_honors_override,
         test_session_status_helper_contract,
         test_dispatched_worker_recovery_protocol_present,
-        test_no_dangerous_bypass_in_executable_surface,
+        test_no_dangerous_bypass_in_codex_emit_surface,
     ]
     for test in tests:
         test()
