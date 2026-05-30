@@ -12,9 +12,10 @@ import subprocess
 import sys
 from typing import Any
 
+import goalflight_compat
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_STATE_DIR = Path(os.environ.get("GOALFLIGHT_STATE_DIR", Path("/tmp") / f"goal-flight-{os.getuid()}"))
+DEFAULT_STATE_DIR = Path(os.environ.get("GOALFLIGHT_STATE_DIR", goalflight_compat.default_state_dir()))
 TERMINAL_DONE = {"complete", "released"}
 TERMINAL_FAILED = {
     "blocked",
@@ -59,11 +60,7 @@ def age_mins(value: Any) -> int | None:
 def pid_alive(pid: Any) -> bool:
     if pid in (None, ""):
         return False
-    try:
-        os.kill(int(pid), 0)
-        return True
-    except (OSError, TypeError, ValueError):
-        return False
+    return goalflight_compat.pid_alive(pid)
 
 
 def read_json(path: Path | None) -> dict[str, Any] | None:
@@ -127,7 +124,7 @@ def status_candidates(slug: str, record: dict[str, Any] | None) -> list[Path]:
             value = record.get(key)
             if isinstance(value, str) and value:
                 candidates.append(Path(value).expanduser())
-    candidates.append(Path("/tmp") / f"goalflight-{slug}-dispatch" / "status.json")
+    candidates.append(goalflight_compat.temp_base() / f"goalflight-{slug}-dispatch" / "status.json")
     seen: set[str] = set()
     unique: list[Path] = []
     for candidate in candidates:

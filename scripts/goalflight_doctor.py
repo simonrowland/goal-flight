@@ -17,6 +17,8 @@ import shutil
 import subprocess
 import sys
 
+import goalflight_compat
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
@@ -1333,7 +1335,7 @@ def _rate_pressure_summary() -> dict:
     if goalflight_rate_pressure is None:
         return {"available": False, "reason": "goalflight_rate_pressure import failed"}
     try:
-        state_dir = Path(os.environ.get("GOALFLIGHT_STATE_DIR", f"/tmp/goal-flight-{os.getuid()}"))
+        state_dir = Path(os.environ.get("GOALFLIGHT_STATE_DIR", goalflight_compat.default_state_dir()))
         records = goalflight_rate_pressure.collect_records(state_dir)
         billing = goalflight_rate_pressure.load_billing_accounts()
         pool_map = goalflight_rate_pressure.agent_limit_pool_map(billing)

@@ -495,6 +495,7 @@ Git-visible trigger aliases stay out of filenames, manifests, and commit message
 
 - Do not paste long logs, diffs, JSONL streams, or review transcripts.
 - Do not treat PID alone as process identity.
+- Do not hand-iterate (>~3 edit/test cycles) a chunk in controller context — goal-loop it. Controller-direct is for tiny or judgment-only edits.
 - Do not let one goal-flight session consume all machine capacity.
 - Do not silently skip review when a provider hits rate or session limits.
 - Do not load `/fork` instructions by default.

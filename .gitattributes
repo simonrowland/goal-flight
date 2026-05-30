@@ -1,0 +1,40 @@
+# Normalize line endings to LF everywhere (incl. Windows checkouts).
+#
+# Rationale: with Git-for-Windows autocrlf=true a fresh clone rewrites committed
+# LF bytes to CRLF on checkout. That breaks goal-flight two ways:
+#   (a) doctor's _sha256_file drift-check (goalflight_doctor.py) hashes file bytes
+#       -> reports drift on EVERY file on a clean install; and
+#   (b) the git-autoupdate clean-tree / ff-only gate sees the whole tree as dirty
+#       -> auto-update silently skips forever (fails at its own purpose).
+# Forcing eol=lf keeps byte-for-byte parity across platforms. After adding this
+# file on an existing Windows clone, run once: git add --renormalize .
+*               text=auto eol=lf
+
+# Byte-hashed / line-ending-sensitive sources: force LF explicitly (belt + braces
+# so every doctor-hashed file is covered regardless of auto-detection).
+*.py            text eol=lf
+*.sh            text eol=lf
+*.md            text eol=lf
+*.json          text eol=lf
+*.txt           text eol=lf
+*.yaml          text eol=lf
+*.yml           text eol=lf
+*.toml          text eol=lf
+*.tpl           text eol=lf
+*.cfg           text eol=lf
+*.ini           text eol=lf
+
+# Windows launchers: cmd.exe is the one interpreter that can mis-handle LF in
+# batch labels/gotos, so keep .cmd/.bat CRLF. PowerShell tolerates LF.
+*.cmd           text eol=crlf
+*.bat           text eol=crlf
+*.ps1           text eol=lf
+
+# Binary assets: never touch.
+*.png           binary
+*.jpg           binary
+*.jpeg          binary
+*.gif           binary
+*.ico           binary
+*.pdf           binary
+*.zip           binary

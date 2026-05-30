@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
-import fcntl
 import hashlib
 import json
 import os
@@ -22,6 +21,7 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
+import goalflight_compat as fcntl
 import goalflight_fleet_schemas as schemas
 
 

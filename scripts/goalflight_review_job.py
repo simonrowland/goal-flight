@@ -20,6 +20,7 @@ import uuid
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
+import goalflight_compat
 import goalflight_capacity
 import goalflight_ledger
 from goalflight_liveness import (
@@ -122,11 +123,7 @@ class JsonlProgress:
 def _alive(pid: int | None) -> bool:
     if not pid:
         return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
+    return goalflight_compat.pid_alive(pid)
 
 
 def _pgroup_has_live_processes(pgid: int | None) -> bool:

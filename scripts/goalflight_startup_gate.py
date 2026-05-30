@@ -29,11 +29,12 @@ default serializes the Claude TUI adapter only.
 from __future__ import annotations
 
 import asyncio
-import fcntl
 import os
-from pathlib import Path
 
-_LOCK_DIR = Path("/tmp/goal-flight-startup-locks")
+import goalflight_compat
+import goalflight_compat as fcntl
+
+_LOCK_DIR = goalflight_compat.temp_base() / "goal-flight-startup-locks"
 
 
 def _serialize_set() -> set[str]:

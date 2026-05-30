@@ -52,6 +52,8 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+import goalflight_compat
+
 ROOT = Path(__file__).resolve().parent.parent
 SESSION_FILE_REL = Path("docs-private/.goal-flight-current-session.json")
 QUEUE_GLOB = "docs-private/goal-queue-*.md"
@@ -131,13 +133,7 @@ def ensure_session(project_root: Path, *, pid: int | None = None) -> dict:
 def _pid_alive(pid: object) -> bool:
     if not isinstance(pid, int) or pid <= 0:
         return False
-    try:
-        os.kill(pid, 0)
-    except (ProcessLookupError, PermissionError):
-        return False
-    except OSError:
-        return False
-    return True
+    return goalflight_compat.pid_alive(pid)
 
 
 def _now_iso() -> str:
@@ -502,7 +498,7 @@ def _file_lock(path: Path):
     wins on the lost slot" rather than crash.
     """
     import contextlib
-    import fcntl
+    import goalflight_compat as fcntl
 
     @contextlib.contextmanager
     def _ctx():

@@ -22,6 +22,7 @@ import threading
 import time
 from typing import Any, Callable, Protocol
 
+import goalflight_compat
 import goalflight_acp_permits as permits
 from goalflight_adapter_readiness import validate_os_sandbox_request
 from goalflight_liveness import active_monotonic
@@ -164,7 +165,12 @@ class PoolExhaustedError(AcpError):
     pass
 
 
-_PIDFILE_DIR = Path("/tmp/goal-flight-acp-pids.d")
+_PIDFILE_DIR = Path(
+    os.environ.get(
+        "GOAL_FLIGHT_PIDFILE_DIR",
+        goalflight_compat.temp_base() / "goal-flight-acp-pids.d",
+    )
+)
 _live_connections: dict[int, "GoalflightAcpConnection"] = {}
 _registry_lock = threading.Lock()
 

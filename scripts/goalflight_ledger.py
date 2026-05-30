@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
-import fcntl
 import hashlib
 import json
 import os
@@ -20,11 +19,14 @@ import subprocess
 import sys
 import uuid
 
+import goalflight_compat
+import goalflight_compat as fcntl
+
 SCHEMA = "goalflight.dispatch.v1"
 
 
 def _default_state_dir() -> Path:
-    return Path("/tmp") / f"goal-flight-{os.getuid()}"
+    return goalflight_compat.default_state_dir()
 
 
 DEFAULT_STATE_DIR = Path(os.environ.get("GOALFLIGHT_STATE_DIR", _default_state_dir()))
@@ -99,9 +101,7 @@ def _ps_field(pid: int, field: str) -> str | None:
 def process_identity(pid: int | None) -> dict | None:
     if not pid:
         return None
-    try:
-        os.kill(pid, 0)
-    except OSError:
+    if not goalflight_compat.pid_alive(pid):
         return None
     ident = {
         "pid": pid,

@@ -46,7 +46,6 @@ from __future__ import annotations
 
 import argparse
 import errno
-import fcntl
 import json
 import os
 import shutil
@@ -55,6 +54,8 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Optional
+
+import goalflight_compat as fcntl
 
 try:
     import tomllib

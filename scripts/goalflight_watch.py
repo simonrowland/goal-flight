@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import time
 
+import goalflight_compat
 from goalflight_liveness import (
     LivenessThresholds,
     classify_liveness,
@@ -18,7 +19,10 @@ from goalflight_liveness import (
     write_status,
 )
 
-MARKER_RE = re.compile(r"^(STATUS|RESULT|USER-NEED|USER-CONFIRM|BLOCKED|COMPLETE):\s*(.*)$")
+# `\**` tolerance: grok (and other markdown-emitting workers) write **COMPLETE:**
+# etc.; without it the bold marker is never matched and the worker idle-times-out
+# instead of waking the controller (grok review, 2026-05-30). Mirrors watch-dispatch-tail.sh.
+MARKER_RE = re.compile(r"^\**(STATUS|RESULT|USER-NEED|USER-CONFIRM|BLOCKED|COMPLETE):\**\s*(.*)$")
 TERMINAL_MARKERS = {"RESULT", "USER-NEED", "USER-CONFIRM", "BLOCKED", "COMPLETE"}
 # CPU-sampling-failure grace (codex 2026-05-20 P2): require this many consecutive
 # `wedged` polls before exiting with idle_timeout, so a single transient `ps`
@@ -31,14 +35,11 @@ WEDGE_CONFIRM_SAMPLES = 2
 def alive(pid: int | None) -> bool:
     if not pid:
         return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
+    return goalflight_compat.pid_alive(pid)
 
 
-def extract_markers(path: Path, max_bytes: int = 10 * 1024 * 1024) -> tuple[list[dict], int]:
+def extract_markers(path: Path, max_bytes: int = 10 * 1024 * 1024,
+                    ignore_lines: set[str] | None = None) -> tuple[list[dict], int]:
     if not path.exists():
         return [], 0
     size = path.stat().st_size
@@ -48,7 +49,13 @@ def extract_markers(path: Path, max_bytes: int = 10 * 1024 * 1024) -> tuple[list
         f.seek(start)
         text = f.read().decode(errors="replace")
     for idx, line in enumerate(text.splitlines(), start=1):
-        match = MARKER_RE.match(line.strip())
+        stripped = line.strip()
+        # Skip lines that are verbatim from the echoed prompt: a worker that echoes
+        # its prompt (codex, grok) would otherwise trip the watcher on the prompt's
+        # own "end with COMPLETE: ..." instruction before doing any real work.
+        if ignore_lines and stripped in ignore_lines:
+            continue
+        match = MARKER_RE.match(stripped)
         if match:
             markers.append({"line": idx, "kind": match.group(1), "text": match.group(2)[:1000]})
     return markers, size
@@ -66,7 +73,17 @@ def main() -> int:
     parser.add_argument("--cpu-epsilon", type=float, default=0.1)
     parser.add_argument("--pgid", type=int)
     parser.add_argument("--controller-pid", type=int)
+    parser.add_argument("--ignore-prompt-file",
+                        help="Ignore marker lines appearing verbatim in this prompt file, so a worker's "
+                             "echoed prompt can't trip the watcher on its own 'end with COMPLETE:' instruction.")
     args = parser.parse_args()
+
+    ignore_lines: set[str] = set()
+    if args.ignore_prompt_file:
+        _pf = Path(args.ignore_prompt_file)
+        if _pf.exists():
+            ignore_lines = {ln.strip() for ln in
+                            _pf.read_text(encoding="utf-8", errors="replace").splitlines() if ln.strip()}
 
     tail = Path(args.tail)
     status_path = Path(args.status_json)
@@ -77,11 +94,16 @@ def main() -> int:
     exit_reason = "unknown"
     exit_code = 1
     wedge_streak = 0
-    pgid = args.pgid or process_group_id(args.pid) or args.pid
+    # process_group_id/pgroup_cpu_pct use os.getpgid/ps (POSIX-only). On native
+    # Windows they raise/return nothing — and the watcher IS the cross-platform
+    # dispatch path, so it must NOT crash there. Degrade to existence + tail-idle
+    # (no CPU-wedge) on Windows.
+    _win = goalflight_compat.is_windows()
+    pgid = None if _win else (args.pgid or process_group_id(args.pid) or args.pid)
     thresholds = LivenessThresholds(idle_timeout_s=args.max_idle_secs, cpu_epsilon_pct=args.cpu_epsilon)
 
     while True:
-        markers, size = extract_markers(tail)
+        markers, size = extract_markers(tail, ignore_lines=ignore_lines)
         if size != last_size:
             last_size = size
             last_change = time.time()
@@ -89,7 +111,7 @@ def main() -> int:
         seconds_since_event = now - last_change
         terminal = next((m for m in reversed(markers) if m["kind"] in TERMINAL_MARKERS), None)
         worker_alive = alive(args.pid)
-        if worker_alive:
+        if worker_alive and not _win:
             pgid = args.pgid or process_group_id(args.pid) or pgid
             cpu_pct = pgroup_cpu_pct(pgid)
         else:

@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
-import fcntl
 import json
 import os
 from pathlib import Path
@@ -16,11 +15,14 @@ import subprocess
 import sys
 import uuid
 
+import goalflight_compat
+import goalflight_compat as fcntl
+
 SCHEMA = "goalflight.capacity.v1"
 
 
 def _default_state_dir() -> Path:
-    return Path("/tmp") / f"goal-flight-{os.getuid()}"
+    return goalflight_compat.default_state_dir()
 
 
 DEFAULT_STATE_DIR = Path(os.environ.get("GOALFLIGHT_STATE_DIR", _default_state_dir()))
@@ -416,11 +418,7 @@ def cmd_cooldown(args: argparse.Namespace) -> int:
 def pid_alive(pid: int | None) -> bool:
     if not pid:
         return False
-    try:
-        os.kill(int(pid), 0)
-        return True
-    except (OSError, ValueError, TypeError):
-        return False
+    return goalflight_compat.pid_alive(pid)
 
 
 def stale_active_leases(data: dict) -> list[dict]:
