@@ -240,6 +240,13 @@ EXPECTED_ENTRY_IDS = {
     "acp-permit-file-ipc-contract",
     "install-actions-user-gate-backups",
     "worker-escalate-not-bypass",
+    "goal-loop-is-the-default-for-convergence-heavy-implementation",
+    "convergence-lives-in-the-loop",
+    "controller-context-is-the-scarce-resource",
+    "reviews-one-shot-fixes-looped",
+    "three-edit-cycle-controller-direct-anti-pattern",
+    "never-pgrep-for-worker-liveness",
+    "dispatch-cli-worker-via-one-crash-safe-command",
 }
 
 KNOWN_SKILL_ALIGNMENT_GAPS = {}

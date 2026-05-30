@@ -2197,6 +2197,184 @@ chunk-3a rationale:
 - **last_reviewed_commit:** (this commit)
 - **notes:** Observed 2x in the 2026-05-28 session — same root cause across different worker types (codex-acp executor and Claude Explore subagent). Detailed examples and the protocol-side handling live in `protocols/dispatched-worker-recovery.md` §"Worker bypass anti-pattern". The compressed-form text uses `BLOCKED:` (the canonical marker per `protocols/worker-markers.md`), not the proposed `READY-BLOCKED:` (rejected by review for marker-proliferation).
 
+---
+
+### Entry: goal-loop-is-the-default-for-convergence-heavy-implementation
+
+- **id:** `goal-loop-is-the-default-for-convergence-heavy-implementation`
+- **name:** Goal-loop is default for convergence-heavy implementation
+- **category:** `worker-routing-defaults`
+- **controller_does:** The controller routes substantive multi-step implementation by work shape: controller-direct only for tiny or judgment-heavy edits, one-shot dispatch for a single bounded task, and a goal-loop for work that must iterate until tests pass and self-review is clean.
+- **failure_mode:** The controller keeps iterative implementation in its own context because it already has some local state, then spends repeated edit/test turns on work that should have been delegated as a converging loop.
+- **skill_md_compressed_form:**
+    - **kind:** literal
+    - **pattern:** "Goal-loop is default for convergence-heavy implementation; one-shot is single bounded work; controller-direct only tiny/judgment."
+    - **max_section_lines:** 30
+- **verifier:**
+    - **kind:** behaviour-scenario
+    - **id:** goal-loop-default
+- **provenance:**
+    - **sources:**
+      - `docs-private/research/2026-05-30-goal-loop-target-behaviours.md`
+      - `docs-private/RESUME-NOTES-2026-05-30.md`
+    - **r_numbers:** []
+- **severity:** high
+- **max_skill_lines:** 3
+- **last_reviewed_commit:** (this commit)
+
+---
+
+### Entry: convergence-lives-in-the-loop
+
+- **id:** `convergence-lives-in-the-loop`
+- **name:** Convergence lives in the loop
+- **category:** `autonomous-throughput-and-status`
+- **controller_does:** A goal-loop worker owns the plan/act/test/self-review cycle and returns only after the agreed gates pass or a real blocker is emitted.
+- **failure_mode:** The worker returns a draft after one edit, forcing the controller to absorb review findings, rerun tests, and hand-iterate the convergence cycle in conversation.
+- **skill_md_compressed_form:**
+    - **kind:** literal
+    - **pattern:** "Goal-loop returns converged result, never draft: plan/act/test/self-review until green."
+    - **max_section_lines:** 30
+- **verifier:**
+    - **kind:** textual-invariant
+    - **id:** test_skill_structure::test_skill_md_matches_golden_master
+- **provenance:**
+    - **sources:**
+      - `docs-private/research/2026-05-30-goal-loop-target-behaviours.md`
+      - `docs-private/RESUME-NOTES-2026-05-30.md`
+    - **r_numbers:** []
+- **severity:** high
+- **max_skill_lines:** 3
+- **last_reviewed_commit:** (this commit)
+
+---
+
+### Entry: controller-context-is-the-scarce-resource
+
+- **id:** `controller-context-is-the-scarce-resource`
+- **name:** Controller context is the scarce resource
+- **category:** `context-discipline`
+- **controller_does:** The controller protects its own conversation window by delegating repeated edit/test/review-fold cycles and reading back compact, converged conclusions.
+- **failure_mode:** The controller treats local context as free, performs every iteration itself, and turns recoverable worker churn into unrecoverable controller-context bloat.
+- **skill_md_compressed_form:**
+    - **kind:** literal
+    - **pattern:** "Controller context is scarce; delegate iteration so only the converged conclusion returns."
+    - **max_section_lines:** 20
+- **verifier:**
+    - **kind:** textual-invariant
+    - **id:** test_skill_structure::test_skill_md_matches_golden_master
+- **provenance:**
+    - **sources:**
+      - `docs-private/research/2026-05-30-goal-loop-target-behaviours.md`
+      - `docs-private/RESUME-NOTES-2026-05-30.md`
+    - **r_numbers:** []
+- **severity:** high
+- **max_skill_lines:** 2
+- **last_reviewed_commit:** (this commit)
+
+---
+
+### Entry: reviews-one-shot-fixes-looped
+
+- **id:** `reviews-one-shot-fixes-looped`
+- **name:** Reviews are one-shot; fixes are looped
+- **category:** `review-discipline`
+- **controller_does:** The controller dispatches review as a bounded one-shot judgment task, then routes the fix/test/re-review response cycle as loop-shaped implementation work when findings require convergence.
+- **failure_mode:** The controller goal-loops review generation itself or, after receiving findings, hand-edits the response through repeated local fix/test turns.
+- **skill_md_compressed_form:**
+    - **kind:** literal
+    - **pattern:** "Reviews are one-shot; fixes loop to green and re-review."
+    - **max_section_lines:** 25
+- **verifier:**
+    - **kind:** textual-invariant
+    - **id:** test_skill_structure::test_skill_md_matches_golden_master
+- **provenance:**
+    - **sources:**
+      - `docs-private/research/2026-05-30-goal-loop-target-behaviours.md`
+      - `docs-private/RESUME-NOTES-2026-05-30.md`
+    - **r_numbers:** []
+- **severity:** high
+- **max_skill_lines:** 2
+- **last_reviewed_commit:** (this commit)
+
+---
+
+### Entry: three-edit-cycle-controller-direct-anti-pattern
+
+- **id:** `three-edit-cycle-controller-direct-anti-pattern`
+- **name:** More than three edit/test cycles is controller-direct smell
+- **category:** `do-not`
+- **controller_does:** When the controller notices it has crossed roughly three edit/test cycles on one chunk, it stops hand-iterating and delegates the rest as a goal-loop.
+- **failure_mode:** The controller keeps applying patches and rerunning tests in its own context after the work has revealed itself as convergence-heavy.
+- **skill_md_compressed_form:**
+    - **kind:** literal
+    - **pattern:** "Do not hand-iterate (>~3 edit/test cycles) what a goal-loop should converge."
+    - **max_section_lines:** 45
+- **verifier:**
+    - **kind:** behaviour-scenario
+    - **id:** no-hand-iterate
+- **provenance:**
+    - **sources:**
+      - `docs-private/research/2026-05-30-goal-loop-target-behaviours.md`
+      - `docs-private/RESUME-NOTES-2026-05-30.md`
+    - **r_numbers:** []
+- **severity:** high
+- **max_skill_lines:** 2
+- **last_reviewed_commit:** (this commit)
+
+---
+
+### Entry: never-pgrep-for-worker-liveness
+
+- **id:** `never-pgrep-for-worker-liveness`
+- **name:** Never pgrep for dispatched worker liveness
+- **category:** `state-layers`
+- **controller_does:** The controller checks a dispatched worker through identity-aware status surfaces keyed by dispatch identity, status files, watcher state, or ledger records.
+- **failure_mode:** The controller runs `pgrep` against a worker engine name and matches an unrelated process, then treats that process as the dispatched worker's liveness signal.
+- **skill_md_compressed_form:**
+    - **kind:** literal
+    - **pattern:** "Never `pgrep` for worker liveness; use dispatch/status identity."
+    - **max_section_lines:** 10
+- **verifier:**
+    - **kind:** behaviour-scenario
+    - **id:** never-pgrep-for-worker-liveness
+- **provenance:**
+    - **sources:**
+      - `docs-private/research/2026-05-30-goal-loop-target-behaviours.md`
+      - `docs-private/RESUME-NOTES-2026-05-30.md`
+      - `scripts/goalflight_status.py`
+      - `scripts/goalflight_watch.py`
+    - **r_numbers:** []
+- **severity:** high
+- **max_skill_lines:** 2
+- **last_reviewed_commit:** (this commit)
+
+---
+
+### Entry: dispatch-cli-worker-via-one-crash-safe-command
+
+- **id:** `dispatch-cli-worker-via-one-crash-safe-command`
+- **name:** Dispatch CLI workers through one crash-safe command
+- **category:** `dispatch-discipline`
+- **controller_does:** The controller launches a CLI worker through the crash-safe dispatch wrapper so the detached worker, watcher, reaper, and terminal-state propagation stay coupled.
+- **failure_mode:** The controller backgrounds a raw worker exec directly, loses terminal-state wakeup, and leaves the workflow hung after the worker exits.
+- **skill_md_compressed_form:**
+    - **kind:** literal
+    - **pattern:** "Dispatch CLI workers via `scripts/goalflight_dispatch.py`, never bare background exec."
+    - **max_section_lines:** 45
+- **verifier:**
+    - **kind:** behaviour-scenario
+    - **id:** dispatch-cli-worker-via-crash-safe-command
+- **provenance:**
+    - **sources:**
+      - `docs-private/research/2026-05-30-goal-loop-target-behaviours.md`
+      - `docs-private/RESUME-NOTES-2026-05-30.md`
+      - `scripts/goalflight_dispatch.py`
+    - **r_numbers:** []
+- **severity:** high
+- **max_skill_lines:** 2
+- **last_reviewed_commit:** (this commit)
+
 ## Adding a new entry
 
 1. Pick a unique kebab-case `id` not already used.

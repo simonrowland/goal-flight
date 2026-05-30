@@ -114,6 +114,7 @@ Use this wrapper for work too large for one uninterrupted session: decomposed
 implementation, long refactors, review flights, resumable queues, or unattended
 dispatch. The controller manages context and verification; it does not hoard
 every file, log, or worker transcript in conversation.
+Controller context is scarce; delegate iteration so only the converged conclusion returns.
 
 Always:
 - read the invoked command file and only its referenced protocols
@@ -174,6 +175,7 @@ Review layers: executor self-review, chunk review, milestone review.
 On chunk completion, dispatch gstack `/review` before committing.
 Reviews go through gstack `/review` and `/challenge`; do not hand-roll review prompts.
 Reviewer misses become regression tests, not trust exemptions. Write review rubrics before first wave dispatch.
+Reviews are one-shot; fixes loop to green and re-review.
 Diversify reviewer concern, not just model. Use consolidation review for cross-slice contradictions.
 Milestone review is a separate gate from chunk review.
 
@@ -245,17 +247,13 @@ Consider capacity before any worker spawn. Capacity checks apply default
 per-agent caps from `scripts/goalflight_capacity.py` (`DEFAULT_AGENT_CAPS`).
 Capacity acquire waits on machine, agent, RSS, or cooldown pressure.
 
-Hard caps are RAM/process safeguards, not provider truth. Learn rate pressure
-from ledger, not constants. `scripts/goalflight_rate_pressure.py` reads recent
+Hard caps are RAM/process safeguards, not provider truth. Learn rate pressure from ledger, not constants. `scripts/goalflight_rate_pressure.py` reads recent
 ledger failures and emits fallback/halved-cap recommendations after clustered
 provider pressure.
-Learn rate pressure from ledger, not constants.
 
 Probe workers upward; keep controller provider conservative. Controller budget
 loss can end the interactive session; worker-provider pressure can be rerouted.
-Bound dispatch hangs with idle and quiet timeouts. Terminal leases leave active
-capacity after completion.
-Terminal leases leave active capacity after completion.
+Bound dispatch hangs with idle and quiet timeouts. Terminal leases leave active capacity after completion.
 
 ## Autonomous throughput
 
@@ -269,8 +267,7 @@ When the user invoked goal-flight, approved a plan, or gave scope:
 - Do not use engagement prompts.
 - Record non-blocking uncertainty in files, then proceed with the plan default.
 - Commits during execute follow **one commit per completed chunk**.
-- Push to remote only after relevant tests pass and user permits publish.
-Push to a remote only after the relevant tests pass and the user has permitted publish.
+- Push to a remote only after the relevant tests pass and the user has permitted publish.
 
 Stop only for `USER-NEED` / `USER-CONFIRM` blockers: permission, destructive
 or irreversible action without a plan default, product choice the plan cannot
@@ -282,11 +279,7 @@ Controller chat is requirements input, not an inline editor command. Mid-session
 asks are steering/architecture/scope input. Append them to the active goal queue
 or promote them to a plan revision plus re-review when they change scope.
 
-Do not task-pivot or inline-edit on receipt. Plan before editing when scope is
-unsettled. Prepare ambiguous questions before asking the user. Relay USER-NEED
-through controller, not worker chat. chat alone is not the backlog.
-Plan before editing when scope is unsettled.
-Relay USER-NEED through controller, not worker chat.
+Do not task-pivot or inline-edit on receipt. Plan before editing when scope is unsettled. Prepare ambiguous questions before asking the user. Relay USER-NEED through controller, not worker chat. chat alone is not the backlog.
 
 ## User progress reporting
 
@@ -300,28 +293,17 @@ When context is tight, still poll and append a one-line timestamp to RESUME-NOTE
 ## Dispatch Model
 
 Two orthogonal axes:
-- Iteration pattern: `one-shot` default, or `goal-mode loop` for iterative
-  review-revise work.
+- Iteration pattern: Goal-loop is default for convergence-heavy implementation; one-shot is single bounded work; controller-direct only tiny/judgment.
+- Goal-loop returns converged result, never draft: plan/act/test/self-review until green.
 - Comms shape: `controller-direct`, `acp`, or `bash-tail`.
+Dispatch CLI workers via `scripts/goalflight_dispatch.py`, never bare background exec.
+Do not hand-iterate (>~3 edit/test cycles) what a goal-loop should converge.
 
 Use ACP or bash-tail plus status polling; do not block on editor task panes.
-Abstract tool roles resolve through host tool-name maps. Type dispatches as
-executor, reviewer, or planner. Dispatch prompts need the five-layer wrapper.
-Parallel fix clusters need explicit forbid lists. Split chunks likely to touch
-many files. Controller-direct only for tiny or plan-marked chunks. Same-provider
-policy controls review routing trust.
-Type dispatches as executor, reviewer, or planner.
-Split chunks likely to touch many files.
-Same-provider policy controls review routing trust.
+Abstract tool roles resolve through host tool-name maps. Type dispatches as executor, reviewer, or planner. Dispatch prompts need the five-layer wrapper. Parallel fix clusters need explicit forbid lists. Split chunks likely to touch many files. Controller-direct only for tiny or plan-marked chunks. Same-provider policy controls review routing trust.
 
 Fabricated approval rejected: Never invent user approval for a gated step.
-Controller dispatch waits for declared readiness requirements. Controller live
-gate requires supported capability and ready local state. Worker live gate also
-requires requested transport verified. Discovery probes do not use network or
-model calls. Discovery probes stay within manifest budget caps.
-Controller live gate requires supported capability and ready local state.
-Worker live gate also requires requested transport verified.
-Discovery probes do not use network or model calls.
+Controller dispatch waits for declared readiness requirements. Controller live gate requires supported capability and ready local state. Worker live gate also requires requested transport verified. Discovery probes do not use network or model calls. Discovery probes stay within manifest budget caps.
 
 ## Worker Routing
 
@@ -380,38 +362,13 @@ Bash-tail recipes live in `protocols/legacy/bash-tail.md`; forking lives in
 
 ## Verification and test gates
 
-Before each chunk commit: focused tests green. Background tests are pending
-until results are read. `./tests/run.sh` is the repo-wide gate when chunk scope
-or release risk justifies it. GOALFLIGHT_AUTOREVIEW=1 is an optional maintainer
-tier, not a default review path.
-Background tests are pending until results are read.
-GOALFLIGHT_AUTOREVIEW=1 is an optional maintainer tier, not a default review path.
+Before each chunk commit: focused tests green. Background tests are pending until results are read. `./tests/run.sh` is the repo-wide gate when chunk scope or release risk justifies it. GOALFLIGHT_AUTOREVIEW=1 is an optional maintainer tier, not a default review path.
 
-For each Golden Master entry, SKILL.md contains the entry's compressed-form
-text. Wave 2 scenarios: draft-goal-office-hours, vague-goal-premise-backlog,
-context-load-order. Build corpus eagerly; it audits source truth. Use primary
-sources, not precis, for corpus slices. Specialize self-review bullets to
-project nouns. Check source-truth contradictions before corpus build. Preflight
-noninteractive workers for MCP approval stalls. No remote dispatch before phase
-gate is green.
-For each Golden Master entry, SKILL.md contains the entry's compressed-form text.
-Wave 2 scenarios: draft-goal-office-hours, vague-goal-premise-backlog, context-load-order.
-Use primary sources, not precis, for corpus slices.
-Specialize self-review bullets to project nouns.
-Preflight noninteractive workers for MCP approval stalls.
-No remote dispatch before phase gate is green.
+For each Golden Master entry, SKILL.md contains the entry's compressed-form text. Wave 2 scenarios: draft-goal-office-hours, vague-goal-premise-backlog, context-load-order. Build corpus eagerly; it audits source truth. Use primary sources, not precis, for corpus slices. Specialize self-review bullets to project nouns. Check source-truth contradictions before corpus build. Preflight noninteractive workers for MCP approval stalls. No remote dispatch before phase gate is green.
 
 ## Worker Markers
 
-Long worker and review jobs require a ledger/status path. Status contract
-requires heartbeat markers for live workers. Heartbeats are files; wake only on
-transitions. Stale workers trip on manifest stale-after thresholds. Terminal
-states are closed manifest values. Worker markers use goalflight dispatch
-transport sequence grammar.
-Heartbeats are files; wake only on transitions.
-Status contract requires heartbeat markers for live workers.
-Terminal states are closed manifest values.
-Worker markers use goalflight dispatch transport sequence grammar.
+Long worker and review jobs require a ledger/status path. Status contract requires heartbeat markers for live workers. Heartbeats are files; wake only on transitions. Stale workers trip on manifest stale-after thresholds. Terminal states are closed manifest values. Worker markers use goalflight dispatch transport sequence grammar.
 
 Workers communicate with one-line markers:
 - `STATUS:`
@@ -439,6 +396,7 @@ Memory writeback requires migration lock ownership.
 
 Use one status plane across transports.
 Ledger liveness matches PID plus process identity.
+Never `pgrep` for worker liveness; use dispatch/status identity.
 Isolate pidfiles per controller session.
 Classify ACP failures as upstream, local, or repo.
 
@@ -476,9 +434,7 @@ always-on. After compaction, if goal-flight was active, reload SKILL.md and comm
 
 Read for edits narrowly. Analyze/search/count/filter with procedural code or
 context-mode. Store long artifacts in files and return paths plus summaries.
-Prebuild corpus; do not inline landscape per dispatch. Keep worker-context
-optional when canonical docs fit.
-Keep worker-context optional when canonical docs fit.
+Prebuild corpus; do not inline landscape per dispatch. Keep worker-context optional when canonical docs fit.
 
 When in doubt, move deterministic logic into `scripts/goalflight_*.py`; keep the
 model responsible for judgment: choosing next action, interpreting findings, and

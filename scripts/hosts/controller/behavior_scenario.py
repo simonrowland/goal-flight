@@ -30,10 +30,14 @@ from common import (  # noqa: E402
     compaction_reload_skill_checks,
     context_load_order_checks,
     continue_prescribed_step_two_checks,
+    dispatch_cli_worker_crash_safe_checks,
     draft_goal_office_hours_checks,
+    goal_loop_default_checks,
     doctor_snapshot,
     harness_result,
     monotonic_elapsed,
+    never_pgrep_worker_liveness_checks,
+    no_hand_iterate_checks,
     read_skill_end_to_end_checks,
     review_flight_at_completion_checks,
     vague_goal_premise_backlog_checks,
@@ -191,6 +195,22 @@ def _assert_context_load_order(tail_text: str, **_: Any) -> list[dict[str, Any]]
     return context_load_order_checks(tail_text)
 
 
+def _assert_goal_loop_default(tail_text: str, **_: Any) -> list[dict[str, Any]]:
+    return goal_loop_default_checks(tail_text)
+
+
+def _assert_dispatch_cli_worker_crash_safe(tail_text: str, **_: Any) -> list[dict[str, Any]]:
+    return dispatch_cli_worker_crash_safe_checks(tail_text)
+
+
+def _assert_never_pgrep_worker_liveness(tail_text: str, **_: Any) -> list[dict[str, Any]]:
+    return never_pgrep_worker_liveness_checks(tail_text)
+
+
+def _assert_no_hand_iterate(tail_text: str, **_: Any) -> list[dict[str, Any]]:
+    return no_hand_iterate_checks(tail_text)
+
+
 SCENARIOS: dict[str, dict[str, Any]] = {
     "doctor-loads": {
         "description": "Controller runs goal-flight doctor and summarizes JSON",
@@ -231,6 +251,22 @@ SCENARIOS: dict[str, dict[str, Any]] = {
     "context-load-order": {
         "description": "Controller reads AGENTS.md, SKILL.md, then the relevant protocol in order",
         "assert": _assert_context_load_order,
+    },
+    "goal-loop-default": {
+        "description": "Controller routes convergence-heavy implementation to a goal-loop dispatch",
+        "assert": _assert_goal_loop_default,
+    },
+    "dispatch-cli-worker-via-crash-safe-command": {
+        "description": "Controller launches CLI workers through the crash-safe dispatch wrapper",
+        "assert": _assert_dispatch_cli_worker_crash_safe,
+    },
+    "never-pgrep-for-worker-liveness": {
+        "description": "Controller checks worker liveness through identity-aware status surfaces",
+        "assert": _assert_never_pgrep_worker_liveness,
+    },
+    "no-hand-iterate": {
+        "description": "Controller stops after the edit/test cycle smell and delegates the loop",
+        "assert": _assert_no_hand_iterate,
     },
 }
 

@@ -24,7 +24,11 @@ from common import (  # noqa: E402
     compaction_reload_skill_checks,
     context_load_order_checks,
     continue_prescribed_step_two_checks,
+    dispatch_cli_worker_crash_safe_checks,
     draft_goal_office_hours_checks,
+    goal_loop_default_checks,
+    never_pgrep_worker_liveness_checks,
+    no_hand_iterate_checks,
     read_skill_end_to_end_checks,
     review_flight_at_completion_checks,
     vague_goal_premise_backlog_checks,
@@ -521,6 +525,93 @@ def test_context_load_order_scenario_registered() -> None:
     )
     by_id = {check["id"]: check for check in plain_review}
     assert by_id["canonical_review_path_present"]["ok"] is True
+
+
+def test_goal_loop_default_scenario_registered() -> None:
+    assert "goal-loop-default" in SCENARIOS
+    assert callable(SCENARIOS["goal-loop-default"]["assert"])
+    prompt = FIXTURES / "goal-loop-default" / "prompt.md"
+    assert prompt.exists()
+    text = prompt.read_text(encoding="utf-8")
+    assert "scripts/goalflight_dispatch.py" in text
+    assert "{{PROJECT_ROOT}}" in text
+
+    checks = goal_loop_default_checks(
+        "ROUTE: goal-loop default\n"
+        "DISPATCH: scripts/goalflight_dispatch.py ...\n"
+        "Reason: convergence-heavy implementation.\n"
+        "COMPLETE: true"
+    )
+    assert [check["id"] for check in checks] == [
+        "dispatch_tool_used",
+        "goal_loop_default_named",
+        "no_controller_direct_edit_cycle",
+    ]
+    assert all(check["ok"] is True for check in checks)
+
+
+def test_dispatch_cli_worker_crash_safe_scenario_registered() -> None:
+    assert "dispatch-cli-worker-via-crash-safe-command" in SCENARIOS
+    assert callable(SCENARIOS["dispatch-cli-worker-via-crash-safe-command"]["assert"])
+    prompt = FIXTURES / "dispatch-cli-worker-via-crash-safe-command" / "prompt.md"
+    assert prompt.exists()
+    text = prompt.read_text(encoding="utf-8")
+    assert "scripts/goalflight_dispatch.py" in text
+    assert "bare background exec" in text
+
+    checks = dispatch_cli_worker_crash_safe_checks(
+        "DISPATCH: scripts/goalflight_dispatch.py ...\n"
+        "Reason: crash-safe watcher/reaper preserves terminal state.\n"
+        "COMPLETE: true"
+    )
+    assert [check["id"] for check in checks] == [
+        "goalflight_dispatch_used",
+        "crash_safe_surface_named",
+        "no_bare_background_exec",
+    ]
+    assert all(check["ok"] is True for check in checks)
+
+
+def test_never_pgrep_worker_liveness_scenario_registered() -> None:
+    assert "never-pgrep-for-worker-liveness" in SCENARIOS
+    assert callable(SCENARIOS["never-pgrep-for-worker-liveness"]["assert"])
+    prompt = FIXTURES / "never-pgrep-for-worker-liveness" / "prompt.md"
+    assert prompt.exists()
+    text = prompt.read_text(encoding="utf-8")
+    assert "goalflight_status.py" in text
+    assert "`pgrep`" in text
+
+    checks = never_pgrep_worker_liveness_checks(
+        "Use goalflight_status.py --json and select dispatch id gf-demo-123. "
+        "Never pgrep for this liveness decision. COMPLETE: true"
+    )
+    assert [check["id"] for check in checks] == [
+        "identity_aware_liveness_surface",
+        "no_pgrep_liveness_probe",
+    ]
+    assert all(check["ok"] is True for check in checks)
+
+
+def test_no_hand_iterate_scenario_registered() -> None:
+    assert "no-hand-iterate" in SCENARIOS
+    assert callable(SCENARIOS["no-hand-iterate"]["assert"])
+    prompt = FIXTURES / "no-hand-iterate" / "prompt.md"
+    assert prompt.exists()
+    text = prompt.read_text(encoding="utf-8")
+    assert "edit/test cycles" in text
+    assert "scripts/goalflight_dispatch.py" in text
+
+    checks = no_hand_iterate_checks(
+        "STOP: >~3 edit/test cycles\n"
+        "DISPATCH: scripts/goalflight_dispatch.py for goal-loop convergence.\n"
+        "COMPLETE: true"
+    )
+    assert [check["id"] for check in checks] == [
+        "edit_cycle_smell_named",
+        "delegated_to_goal_loop",
+        "no_more_controller_direct_edits",
+    ]
+    assert all(check["ok"] is True for check in checks)
 
 
 def test_claude_acp_runner_uses_acp_shim_and_writes_transcript() -> None:

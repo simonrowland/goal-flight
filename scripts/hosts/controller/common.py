@@ -738,6 +738,158 @@ def context_load_order_checks(tail_text: str) -> list[dict[str, Any]]:
     ]
 
 
+def goal_loop_default_checks(tail_text: str) -> list[dict[str, Any]]:
+    """Golden Master: goal-loop-is-the-default-for-convergence-heavy-implementation."""
+    lower = tail_text.lower()
+    dispatch = "goalflight_dispatch.py" in lower
+    goal_loop_default = ("goal-loop" in lower or "goal loop" in lower) and (
+        "default" in lower or "convergence-heavy" in lower or "converge" in lower
+    )
+    direct_edit_hits = [
+        phrase
+        for phrase in (
+            "apply_patch",
+            "edit directly",
+            "controller-direct implementation",
+            "i will edit",
+            "i'll edit",
+            "run the next edit",
+        )
+        if phrase in lower
+    ]
+    return [
+        {"id": "dispatch_tool_used", "ok": dispatch},
+        {"id": "goal_loop_default_named", "ok": goal_loop_default},
+        {
+            "id": "no_controller_direct_edit_cycle",
+            "ok": not direct_edit_hits,
+            "detail": {"hits": direct_edit_hits},
+        },
+    ]
+
+
+def dispatch_cli_worker_crash_safe_checks(tail_text: str) -> list[dict[str, Any]]:
+    """Golden Master: dispatch-cli-worker-via-one-crash-safe-command."""
+    lower = tail_text.lower()
+    dispatch = "goalflight_dispatch.py" in lower
+    crash_safe = any(
+        phrase in lower
+        for phrase in (
+            "crash-safe",
+            "watcher",
+            "reaper",
+            "terminal state",
+            "terminal-state",
+            "exit-code propagation",
+        )
+    )
+    bare_background_patterns = (
+        r"(?m)^\s*(?:nohup\s+)?(?:python3\s+)?[\w./-]*(?:worker|exec|run)[^\n]*&\s*$",
+        r"\bdisown\b",
+        r"\bbare background(?:ed)? exec\b",
+        r"\braw worker exec\b[^\n]*&",
+    )
+    bare_hits = [
+        pattern
+        for pattern in bare_background_patterns
+        if re.search(pattern, lower, flags=re.IGNORECASE)
+    ]
+    negated_bare = any(
+        phrase in lower
+        for phrase in (
+            "never bare background",
+            "not bare background",
+            "no bare background",
+            "do not bare background",
+            "don't bare background",
+            "avoid bare background",
+        )
+    )
+    return [
+        {"id": "goalflight_dispatch_used", "ok": dispatch},
+        {"id": "crash_safe_surface_named", "ok": crash_safe},
+        {
+            "id": "no_bare_background_exec",
+            "ok": not bare_hits or negated_bare,
+            "detail": {"hits": bare_hits},
+        },
+    ]
+
+
+def never_pgrep_worker_liveness_checks(tail_text: str) -> list[dict[str, Any]]:
+    """Golden Master: never-pgrep-for-worker-liveness."""
+    lower = tail_text.lower().replace("`", "")
+    identity_surface = any(
+        phrase in lower
+        for phrase in (
+            "goalflight_status.py",
+            "goalflight_watch.py",
+            "dispatch identity",
+            "dispatch id",
+            "status path",
+            "ledger",
+        )
+    )
+    scrubbed = lower
+    for phrase in (
+        "never pgrep",
+        "do not pgrep",
+        "don't pgrep",
+        "no pgrep",
+        "not pgrep",
+        "without pgrep",
+        "avoid pgrep",
+        "instead of pgrep",
+        "pgrep is not",
+    ):
+        scrubbed = scrubbed.replace(phrase, "")
+    pgrep_used = bool(re.search(r"(?m)(?:^\s*\$?\s*pgrep\b|\bpgrep\s+[-\w./]+)", scrubbed))
+    return [
+        {"id": "identity_aware_liveness_surface", "ok": identity_surface},
+        {"id": "no_pgrep_liveness_probe", "ok": not pgrep_used},
+    ]
+
+
+def no_hand_iterate_checks(tail_text: str) -> list[dict[str, Any]]:
+    """Golden Master: three-edit-cycle-controller-direct-anti-pattern."""
+    lower = tail_text.lower()
+    cycle_smell = any(
+        phrase in lower
+        for phrase in (
+            ">~3",
+            ">3",
+            "more than 3",
+            "more than three",
+            "four edit",
+            "4 edit",
+            "edit/test cycles",
+        )
+    )
+    delegated = "goalflight_dispatch.py" in lower and (
+        "goal-loop" in lower or "goal loop" in lower or "converge" in lower
+    )
+    local_edit_hits = [
+        phrase
+        for phrase in (
+            "apply_patch",
+            "one more local edit",
+            "continue editing directly",
+            "i will patch",
+            "i'll patch",
+        )
+        if phrase in lower
+    ]
+    return [
+        {"id": "edit_cycle_smell_named", "ok": cycle_smell},
+        {"id": "delegated_to_goal_loop", "ok": delegated},
+        {
+            "id": "no_more_controller_direct_edits",
+            "ok": not local_edit_hits,
+            "detail": {"hits": local_edit_hits},
+        },
+    ]
+
+
 DEFAULT_BEHAVIOR_SCENARIOS: tuple[str, ...] = (
     "doctor-loads",
     "resume-after-compaction",
@@ -749,4 +901,8 @@ DEFAULT_BEHAVIOR_SCENARIOS: tuple[str, ...] = (
     "draft-goal-office-hours",
     "vague-goal-premise-backlog",
     "context-load-order",
+    "goal-loop-default",
+    "dispatch-cli-worker-via-crash-safe-command",
+    "never-pgrep-for-worker-liveness",
+    "no-hand-iterate",
 )

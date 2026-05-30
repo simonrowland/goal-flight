@@ -31,7 +31,7 @@ fi
 TRANSCRIPT_DIR="${GOALFLIGHT_CONTROLLER_TRANSCRIPT_DIR:-$REPO_ROOT/docs-private/reviews/$(date +%F)-chunk-15}"
 mkdir -p "$TRANSCRIPT_DIR"
 
-SCENARIOS="${GOALFLIGHT_CONTROLLER_SCENARIOS:-doctor-loads resume-after-compaction continue-prescribed-step-two read-skill-end-to-end compaction-reload-skill review-flight-at-completion chat-as-requirements draft-goal-office-hours vague-goal-premise-backlog context-load-order}"
+SCENARIOS="${GOALFLIGHT_CONTROLLER_SCENARIOS:-doctor-loads resume-after-compaction continue-prescribed-step-two read-skill-end-to-end compaction-reload-skill review-flight-at-completion chat-as-requirements draft-goal-office-hours vague-goal-premise-backlog context-load-order goal-loop-default dispatch-cli-worker-via-crash-safe-command never-pgrep-for-worker-liveness no-hand-iterate}"
 FAIL=0
 
 for SCENARIO in $SCENARIOS; do
