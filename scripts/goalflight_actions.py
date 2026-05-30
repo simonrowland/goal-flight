@@ -22,6 +22,13 @@ DEFAULT_ACTIONS_DIR = REPO_ROOT / "config" / "actions"
 DEFAULT_SCHEMA = REPO_ROOT / "schemas" / "goalflight.action.v1.json"
 DEFAULT_COMMANDS_ENV = REPO_ROOT / "config" / "commands.env"
 ENV_PATTERN = re.compile(r"\$\{([A-Z0-9_]+)\}")
+sys.path.insert(0, str(SCRIPT_DIR))
+
+import goalflight_compat  # noqa: E402
+
+
+def _windows_shell_arg(value: str) -> str:
+    return subprocess.list2cmdline([value])
 
 
 def _substitute(value: str, env: dict[str, str]) -> str:
@@ -93,6 +100,8 @@ def _resolve_env(entry: dict, extra_env: dict[str, str] | None = None) -> dict[s
     if extra_env:
         env.update(extra_env)
     merged: dict[str, str] = {**env, **(entry.get("env") or {})}
+    if goalflight_compat.is_windows() and merged.get("GOALFLIGHT_PYTHON") == "python3":
+        merged["GOALFLIGHT_PYTHON"] = os.environ.get("GOALFLIGHT_PYTHON") or goalflight_compat.python_executable()
     for _ in range(4):
         changed = False
         for key, val in list(merged.items()):
@@ -102,6 +111,10 @@ def _resolve_env(entry: dict, extra_env: dict[str, str] | None = None) -> dict[s
                 changed = True
         if not changed:
             break
+    if goalflight_compat.is_windows():
+        for key in ("GOALFLIGHT_PYTHON", "GOALFLIGHT_REPO_ROOT", "GOALFLIGHT_REPO"):
+            if key in merged:
+                merged[key] = _windows_shell_arg(str(merged[key]))
     return merged
 
 

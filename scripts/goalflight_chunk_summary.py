@@ -81,6 +81,8 @@ def run_capacity_status(state_dir: Path) -> dict[str, Any]:
         cwd=SCRIPT_DIR.parent,
         env=env,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,

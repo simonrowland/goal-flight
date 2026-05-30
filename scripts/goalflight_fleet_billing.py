@@ -70,6 +70,8 @@ def default_runner(argv: list[str]) -> tuple[int, str, str]:
             argv,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=30,
             check=False,
             env=env,

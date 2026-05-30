@@ -11,6 +11,8 @@ import shutil
 import tempfile
 from typing import Any
 
+import goalflight_compat
+
 
 OS_SANDBOX_OFF = "off"
 OS_SANDBOX_READ_ONLY = "read-only"
@@ -77,6 +79,8 @@ def preflight_os_sandbox(value: str | None) -> str:
     profile = canonical_os_sandbox(value)
     if profile == OS_SANDBOX_OFF:
         return profile
+    if goalflight_compat.is_windows():
+        raise OsSandboxError(goalflight_compat.windows_os_sandbox_refusal())
     if platform.system() != "Darwin":
         raise OsSandboxError(
             f"os sandbox profile {profile!r} requires macOS sandbox-exec; "

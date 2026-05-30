@@ -127,7 +127,7 @@ def _require_repo_root(repo_root: str) -> str:
 
 def build_remote_command(command_class: str, **params: Any) -> list[str]:
     assert_allowed(command_class, unsafe_remote=bool(params.get("unsafe_remote")))
-    python = str(params.get("python") or "python3")
+    python = str(params.get("python") or "python")
 
     if command_class == "probe_echo":
         argv = ["echo", "goal-flight-probe-ok"]
@@ -298,7 +298,7 @@ def run_ssh(
         import subprocess
 
         def _default_runner(cmd: list[str]) -> tuple[int, str, str]:
-            proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
             return proc.returncode, proc.stdout, proc.stderr
 
         runner = _default_runner

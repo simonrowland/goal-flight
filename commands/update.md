@@ -47,7 +47,7 @@ unless the host skill path is a symlink; doctor JSON reports
    entries:
 
    ```bash
-   if [ -n "$(git -C "$GFROOT" status --porcelain)" ]; then
+   if [ -n "$(git -C "$GFROOT" -c core.autocrlf=false status --porcelain)" ]; then
      # dirty — skip plugin update
      emit "STATUS: goal-flight working tree has uncommitted changes — skipping plugin update; resolve dirty state first."
      # ...then fall through to Sweep 2 anyway; CLI updates don't touch the source repo.
@@ -58,14 +58,26 @@ unless the host skill path is a symlink; doctor JSON reports
    tracked files, staged changes, untracked files, conflicts. All four
    should block the pull.
 
-4. Pull + rebase any local commits onto origin/main:
+4. Default update is fast-forward-only-or-skip. This is the automatic path:
 
    ```bash
-   git -C "$GFROOT" fetch origin
-   git -C "$GFROOT" pull --rebase origin main
+   "$GFROOT/scripts/goalflight_autoupdate.py" --repo "$GFROOT" --json
    ```
 
-   If `pull --rebase` reports conflicts, emit
+   The helper refuses dirty trees, uses `git -c core.autocrlf=false` on
+   Windows so CRLF conversion does not manufacture dirtiness, and only runs
+   `merge --ff-only` when the local checkout is strictly behind `origin/main`.
+   Ahead or diverged checkouts emit `skipped_ahead` / `skipped_diverged` and
+   leave the working tree untouched. On native Windows it also caches the
+   result once per controller session to avoid repeated fetch latency.
+
+   `pull --rebase` is deliberate, user-invoked repair for a diverged checkout:
+
+   ```bash
+   "$GFROOT/scripts/goalflight_autoupdate.py" --repo "$GFROOT" --rebase --json
+   ```
+
+   If the rebase path reports conflicts, emit
    `BLOCKED: goal-flight rebase conflict — manual resolution required at $GFROOT` and surface to user. Do NOT continue to Sweep 2 (a half-updated plugin is worse than no update).
 
 5. Capture new state:
@@ -93,7 +105,8 @@ unless the host skill path is a symlink; doctor JSON reports
 1. Probe present-set:
 
    ```bash
-   python3 "$GFROOT/scripts/goalflight_doctor.py" --project-root "$PWD" --json
+   PY="${GOALFLIGHT_PYTHON:-$(command -v "python${GOALFLIGHT_PYTHON_MAJOR:-3}" || command -v python)}"
+   "$PY" "$GFROOT/scripts/goalflight_doctor.py" --project-root "$PWD" --json
    ```
 
    The doctor returns presence in two places: `capacity.tools` is a flat

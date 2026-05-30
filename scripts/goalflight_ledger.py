@@ -91,6 +91,8 @@ def _ps_field(pid: int, field: str) -> str | None:
         out = subprocess.check_output(
             ["ps", "-p", str(pid), "-o", f"{field}="],
             text=True,
+            encoding="utf-8",
+            errors="replace",
             stderr=subprocess.DEVNULL,
         ).strip()
     except (OSError, subprocess.CalledProcessError):
@@ -103,6 +105,12 @@ def process_identity(pid: int | None) -> dict | None:
         return None
     if not goalflight_compat.pid_alive(pid):
         return None
+    if goalflight_compat.is_windows():
+        return {
+            "pid": pid,
+            "identity_available": False,
+            "identity_source": "windows_pid_probe_only",
+        }
     ident = {
         "pid": pid,
         "ppid": _ps_field(pid, "ppid"),
@@ -122,6 +130,8 @@ def identity_matches(record: dict) -> tuple[bool, str]:
     if current is None:
         return False, "dead"
     prior = record.get("worker_identity") or record.get("controller_identity") or {}
+    if goalflight_compat.is_windows() and not current.get("identity_available", True):
+        return False, "identity_indeterminate"
     for key in ("lstart", "comm"):
         if prior.get(key) and current.get(key) and prior[key] != current[key]:
             return False, f"pid_reused_{key}"
@@ -149,6 +159,8 @@ def classify(record: dict) -> str:
         return "expected_live"
     if reason == "no_pid":
         return "unknown_no_pid"
+    if reason == "identity_indeterminate":
+        return "identity_indeterminate"
     return f"stale_{reason}"
 
 
@@ -185,6 +197,8 @@ def scan_surplus(records: list[dict], limit: int = 20) -> list[dict]:
         out = subprocess.check_output(
             ["ps", "ax", "-o", "pid=", "-o", "comm=", "-o", "args="],
             text=True,
+            encoding="utf-8",
+            errors="replace",
             stderr=subprocess.DEVNULL,
         )
     except (OSError, subprocess.CalledProcessError):

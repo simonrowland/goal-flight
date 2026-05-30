@@ -30,6 +30,17 @@ from acp_runner import has_actionable_marker_values  # noqa: E402
 from goalflight_liveness import heartbeat_wedge_decision, progress_stall_decision  # noqa: E402
 
 
+def skipif(condition: bool, reason: str):
+    def _decorator(func):
+        def _wrapped(*args, **kwargs):
+            if condition:
+                print(f"SKIP: {func.__name__}: {reason}")
+                return None
+            return func(*args, **kwargs)
+        return _wrapped
+    return _decorator
+
+
 def _vendor_event() -> dict:
     return {
         "jsonrpc": "2.0",
@@ -376,6 +387,8 @@ def _run_fake_runner(
             cwd=ROOT,
             env=env,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             start_new_session=True,
@@ -395,6 +408,7 @@ def _run_fake_runner(
         return proc.returncode, json.loads(status.read_text()), stdout, stderr
 
 
+@skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")
 def case_runner_raw_vendor_flood_hits_progress_stall_and_reaps() -> None:
     returncode, status, stdout, stderr = _run_fake_runner(
         "raw_vendor_flood",
@@ -410,6 +424,7 @@ def case_runner_raw_vendor_flood_hits_progress_stall_and_reaps() -> None:
     assert not _pid_alive(status.get("worker_pid")), (status, stderr)
 
 
+@skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")
 def case_runner_progress_then_silent_wedges_and_reaps() -> None:
     returncode, status, stdout, stderr = _run_fake_runner(
         "progress_then_silent",
@@ -426,6 +441,7 @@ def case_runner_progress_then_silent_wedges_and_reaps() -> None:
     assert not _pid_alive(status.get("worker_pid")), (status, stderr)
 
 
+@skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")
 def case_runner_remote_long_reasoning_pause_survives_old_walls() -> None:
     returncode, status, stdout, stderr = _run_fake_runner(
         "long_reasoning_pause",
@@ -448,6 +464,7 @@ def case_runner_remote_long_reasoning_pause_survives_old_walls() -> None:
     assert not _pid_alive(status.get("worker_pid")), (status, stderr)
 
 
+@skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")
 def case_runner_remote_dead_silent_turn_hits_remote_wall() -> None:
     returncode, status, stdout, stderr = _run_fake_runner(
         "dead_silent_turn",
@@ -471,6 +488,7 @@ def case_runner_remote_dead_silent_turn_hits_remote_wall() -> None:
     assert not _pid_alive(status.get("worker_pid")), (status, stderr)
 
 
+@skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")
 def case_runner_thought_stream_survives_progress_stall_wall() -> None:
     returncode, status, stdout, stderr = _run_fake_runner(
         "thought_stream_pause",
@@ -577,6 +595,7 @@ def case_terminal_state_endturn_beats_tail_race_wedge() -> None:
     assert state == "failed", state
 
 
+@skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")
 def case_runner_blocked_none_completes() -> None:
     returncode, status, stdout, stderr = _run_fake_runner(
         "blocked_none",
@@ -594,6 +613,7 @@ def case_runner_blocked_none_completes() -> None:
     assert not has_actionable_marker_values(status["markers"], "BLOCKED")
 
 
+@skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")
 def case_runner_blocked_substantive_cancels() -> None:
     returncode, status, stdout, stderr = _run_fake_runner(
         "blocked",
@@ -612,6 +632,7 @@ def case_runner_blocked_substantive_cancels() -> None:
     assert status["markers"]["BLOCKED"] == ["need maintainer"], status
 
 
+@skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")
 def case_runner_user_need_none_completes() -> None:
     returncode, status, stdout, stderr = _run_fake_runner(
         "user_need_none",
@@ -628,6 +649,7 @@ def case_runner_user_need_none_completes() -> None:
     assert not has_actionable_marker_values(status["markers"], "USER-NEED")
 
 
+@skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")
 def case_runner_idle_silent_idle_timeout_reaps() -> None:
     # IdleLivenessGate / on_idle path: a worker that emits nothing and never
     # responds is reaped by the run_prompt idle timeout (not the heartbeat —
@@ -652,6 +674,7 @@ def case_runner_idle_silent_idle_timeout_reaps() -> None:
     assert not _pid_alive(status.get("worker_pid")), (status, stderr)
 
 
+@skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")
 def case_runner_oversized_frame_dropped_then_completes() -> None:
     # GuardedStreamReader drop-and-continue at the runner level: with a small
     # ACP frame limit the agent's over-limit frame is dropped (and counted in
@@ -682,6 +705,7 @@ def case_runner_oversized_frame_dropped_then_completes() -> None:
     assert not _pid_alive(status.get("worker_pid")), (status, stderr)
 
 
+@skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")
 def case_runner_goal_mode_progress_stall_backstop() -> None:
     # idle-timeout=0 (goal mode: rely on PID liveness + terminal markers). The
     # run_prompt idle path is fully disabled, so the heartbeat progress-stall
@@ -702,6 +726,7 @@ def case_runner_goal_mode_progress_stall_backstop() -> None:
     assert not _pid_alive(status.get("worker_pid")), (status, stderr)
 
 
+@skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")
 def case_runner_goal_mode_heartbeat_backstop() -> None:
     # idle-timeout=0 (goal mode), progress-stall wall held off (30s): the
     # heartbeat dead-sample wedge detector is the only backstop and must still
@@ -721,6 +746,7 @@ def case_runner_goal_mode_heartbeat_backstop() -> None:
     assert not _pid_alive(status.get("worker_pid")), (status, stderr)
 
 
+@skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")
 def case_runner_tool_timeout_reaps() -> None:
     # Per-tool absolute wall: a worker that opens a tool call and never resolves
     # it (no completed update, no end_turn) is reaped by tool_timeout. The
@@ -742,6 +768,7 @@ def case_runner_tool_timeout_reaps() -> None:
     assert not _pid_alive(status.get("worker_pid")), (status, stderr)
 
 
+@skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")
 def case_handshake_wedge_kills_before_respawn() -> None:
     # spawn_and_handshake_with_retry against a worker that spawns but never
     # answers initialize. Each attempt must hit the handshake_timeout, kill the
@@ -789,6 +816,7 @@ def case_handshake_wedge_kills_before_respawn() -> None:
     asyncio.run(_run())
 
 
+@skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")
 def case_pool_exhaustion_then_drain() -> None:
     # AcpProcessPool: get_or_create up to the ceiling, the next raises
     # PoolExhaustedError without spawning, and shutdown() drains every worker

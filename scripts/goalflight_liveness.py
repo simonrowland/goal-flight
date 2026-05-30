@@ -127,6 +127,8 @@ def pgroup_cpu_pct(pgid_or_pid: int | str | None) -> float | None:
             ["ps", "-A", "-o", "pgid=,%cpu="],
             stderr=subprocess.DEVNULL,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=2.0,
         )
     except (OSError, subprocess.SubprocessError):

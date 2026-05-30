@@ -26,6 +26,30 @@ git clone https://github.com/simonrowland/goal-flight.git ~/.goal-flight && cd ~
 
 Restart the host, then run doctor: `python3 scripts/goalflight_doctor.py --project-root /path/to/your/project`.
 
+## Windows
+
+Native Windows support is Phase 1 read/plan only. Doctor, status, action
+routing, capacity reads, and ledger reads work. Live worker dispatch and
+file-backed review jobs refuse on native Windows with a WSL next step:
+
+```powershell
+wsl --install
+```
+
+Use `%USERPROFILE%` / `$env:USERPROFILE`, not `~`, for native Windows paths:
+
+```powershell
+git clone https://github.com/simonrowland/goal-flight.git "$env:USERPROFILE\.goal-flight"
+cd "$env:USERPROFILE\.goal-flight"
+.\bin\goalflight.ps1 core doctor read
+py -3 .\scripts\goalflight_doctor.py --project-root C:\path\to\project --text
+```
+
+Keep two installs when you dispatch from WSL: one native Windows checkout for
+read/plan, one WSL checkout under the Linux home directory for dispatch. See
+[docs/hosts/windows.md](docs/hosts/windows.md) for the capability matrix,
+launcher details, CRLF caveat, and two-install procedure.
+
 Same flags via `setup.sh`: `--cursor-install`, `--opencode-install`, and `--codex-install` (each implies `--apply --yes`). Dry-run, link-to-Claude, and agents-standard paths are in [docs/hosts/cursor.md](docs/hosts/cursor.md) and [docs/hosts/opencode.md](docs/hosts/opencode.md).
 
 After source `SKILL.md`, `commands/`, `protocols/`, `templates/`, or `adapters/`

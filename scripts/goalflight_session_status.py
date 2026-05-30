@@ -425,10 +425,12 @@ def _active_leases_for(project_root: Path) -> list[dict]:
         import subprocess
 
         out = subprocess.run(
-            ["python3", str(ROOT / "scripts/goalflight_capacity.py"), "status", "--json"],
+            [goalflight_compat.python_executable(), str(ROOT / "scripts/goalflight_capacity.py"), "status", "--json"],
             cwd=str(ROOT),
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=10,
         )
         if out.returncode != 0:
@@ -706,7 +708,11 @@ def _default_project_root() -> str:
         import subprocess
         out = subprocess.run(
             ["git", "rev-parse", "--show-toplevel"],
-            capture_output=True, text=True, timeout=2,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=2,
         )
         if out.returncode == 0 and out.stdout.strip():
             return out.stdout.strip()

@@ -31,6 +31,8 @@ def run_cmd(
             cwd=str(cwd) if cwd else None,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
             check=False,
             env=env,
@@ -115,6 +117,8 @@ def run_bash_tail_watch(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         env=env,
     )
     try:

@@ -176,12 +176,54 @@ def machine_id() -> str:
 
 def run_text(cmd: list[str], timeout: float = 2.0) -> str | None:
     try:
-        return subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL, timeout=timeout).strip()
+        return subprocess.check_output(
+            cmd,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stderr=subprocess.DEVNULL,
+            timeout=timeout,
+        ).strip()
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
         return None
 
 
+def _windows_ram_mb() -> int:
+    """Return physical RAM via GlobalMemoryStatusEx, or 0 if unavailable."""
+    if not goalflight_compat.is_windows():  # pragma: no cover - Windows only helper
+        return 0
+    try:  # pragma: no cover - Windows only
+        import ctypes
+        from ctypes import wintypes
+
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", wintypes.DWORD),
+                ("dwMemoryLoad", wintypes.DWORD),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        status = MEMORYSTATUSEX()
+        status.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GlobalMemoryStatusEx.argtypes = (ctypes.POINTER(MEMORYSTATUSEX),)
+        kernel32.GlobalMemoryStatusEx.restype = wintypes.BOOL
+        if not kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return 0
+        return int(status.ullTotalPhys) // 1024 // 1024
+    except Exception:
+        return 0
+
+
 def detect_ram_mb() -> int:
+    if goalflight_compat.is_windows():
+        return _windows_ram_mb()
     if sys.platform == "darwin":
         out = run_text(["sysctl", "-n", "hw.memsize"])
         if out and out.isdigit():
@@ -247,7 +289,7 @@ def profile(args: argparse.Namespace | None = None) -> dict:
         operating_cap = max(1, min(raw_ceiling, max_total))
     else:
         operating_cap = operating_cap_for_ram(ram_mb, raw_ceiling)
-    return {
+    payload = {
         "schema": "goalflight.capacity.profile.v1",
         "machine_id": machine_id(),
         "ram_mb": ram_mb,
@@ -261,6 +303,18 @@ def profile(args: argparse.Namespace | None = None) -> dict:
         "agent_rss_mb": AGENT_RSS_MB,
         "tools": detect_tools(),
     }
+    if (
+        goalflight_compat.is_windows()
+        and ram_mb <= 0
+        and not max_total
+        and not os.environ.get("GOALFLIGHT_CAPACITY_MAX_TOTAL")
+        and operating_cap == 1
+    ):
+        payload["warnings"] = [
+            "RAM probe unavailable on Windows -> dispatch capped at 1 "
+            "(set GOALFLIGHT_CAPACITY_MAX_TOTAL to override)"
+        ]
+    return payload
 
 
 def prune_state(data: dict) -> None:
@@ -306,6 +360,8 @@ def cmd_profile(args: argparse.Namespace) -> int:
     else:
         print(f"capacity: ram={payload['ram_mb']}MB raw={payload['raw_ram_ceiling']} operating={payload['operating_cap']}")
         print(f"tools: {', '.join(k for k, v in payload['tools'].items() if v) or 'none'}")
+        for warning in payload.get("warnings") or []:
+            print(f"warning: {warning}")
     return 0
 
 

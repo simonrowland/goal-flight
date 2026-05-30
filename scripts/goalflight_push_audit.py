@@ -68,6 +68,8 @@ def run_git(args: list[str], *, check: bool = True) -> subprocess.CompletedProce
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         check=False,
     )
     if check and proc.returncode != 0:

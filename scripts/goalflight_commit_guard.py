@@ -46,6 +46,9 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT_FALLBACK = SCRIPT_DIR.parent
+sys.path.insert(0, str(SCRIPT_DIR))
+
+import goalflight_compat  # noqa: E402
 
 
 def _git_repo_root() -> Path:
@@ -54,6 +57,8 @@ def _git_repo_root() -> Path:
             ["git", "rev-parse", "--show-toplevel"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             check=True,
         )
     except (subprocess.SubprocessError, FileNotFoundError):
@@ -70,9 +75,11 @@ def _capacity_status(repo_root: Path) -> dict | None:
         return None
     try:
         out = subprocess.run(
-            ["python3", str(capacity), "status", "--json"],
+            [goalflight_compat.python_executable(), str(capacity), "status", "--json"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             cwd=str(repo_root),
             timeout=5,
         )
@@ -170,7 +177,8 @@ def main(argv: list[str] | None = None) -> int:
             "Cannot verify worker leases — failing closed to prevent "
             "potential WIP bundling. To proceed anyway:\n"
             "  - Fix the capacity status path (run "
-            "    `python3 scripts/goalflight_capacity.py status --json` "
+            "    `GOALFLIGHT_PYTHON=<path-to-python> "
+            "scripts/goalflight_capacity.py status --json` "
             "    to diagnose), OR\n"
             "  - Set `GOALFLIGHT_COMMIT_GUARD_FAIL_OPEN=1` to opt into "
             "    fail-open (use only if you know capacity is intentionally "

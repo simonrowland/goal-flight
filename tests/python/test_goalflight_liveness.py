@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -28,6 +29,17 @@ from goalflight_liveness import (  # noqa: E402
 )
 import goalflight_acp_client as acp_client  # noqa: E402
 from goalflight_acp_client import AcpLivenessActivity  # noqa: E402
+
+
+def skipif(condition: bool, reason: str):
+    def _decorator(func):
+        def _wrapped(*args, **kwargs):
+            if condition:
+                print(f"SKIP: {func.__name__}: {reason}")
+                return None
+            return func(*args, **kwargs)
+        return _wrapped
+    return _decorator
 
 
 def _update(session_update: str, text: str = "x") -> dict:
@@ -418,6 +430,7 @@ def test_idle_gate_event_resets_hard_wall() -> None:
     assert keep is True, "a real event must reset the running_quiet hard wall"
 
 
+@skipif(os.name == "nt", reason="POSIX process-group CPU sampler")
 def test_cpu_keep_waiting_real_busy_subprocess_keeps_waiting() -> None:
     # End-to-end: REAL pgroup_cpu_pct sampling of a REAL CPU-spinning subprocess
     # → cpu_liveness_keep_waiting returns keep=True. Exercises the runner's
@@ -456,6 +469,7 @@ def test_pgroup_cpu_pct_returns_float_or_none() -> None:
     assert sample is None or isinstance(sample, float), sample
 
 
+@skipif(os.name == "nt", reason="POSIX watcher process-group CPU sampler")
 def test_python_watcher_busy_silence_records_running_quiet() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
@@ -489,6 +503,8 @@ def test_python_watcher_busy_silence_records_running_quiet() -> None:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
+            errors="replace",
         )
         try:
             deadline = time.time() + 5

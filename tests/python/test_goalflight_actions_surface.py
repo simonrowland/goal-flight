@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = ROOT / "scripts"
+sys.path.insert(0, str(SCRIPTS))
+
+import goalflight_actions  # noqa: E402
 
 
 def _run(args: list[str]) -> subprocess.CompletedProcess:
@@ -47,6 +52,22 @@ def test_setup_map_has_worker_destinations():
     assert proc.returncode == 0, proc.stderr
     rows = json.loads(proc.stdout)
     assert any(row["destination_id"] == "codex-cli-worker" for row in rows)
+
+
+def test_windows_action_render_quotes_paths():
+    entry = {
+        "command": "${GOALFLIGHT_PYTHON} ${GOALFLIGHT_REPO}/scripts/goalflight_doctor.py --json",
+        "env": {
+            "GOALFLIGHT_PYTHON": "python3",
+            "GOALFLIGHT_REPO": "${GOALFLIGHT_REPO_ROOT}",
+        },
+    }
+    with patch("goalflight_actions.goalflight_compat.is_windows", return_value=True), \
+        patch("goalflight_actions.goalflight_compat.python_executable", return_value=r"C:\Program Files\Python\python.exe"), \
+        patch.dict(os.environ, {"GOALFLIGHT_REPO_ROOT": r"C:\Users\Ada Lovelace\goal-flight"}):
+        cmd = goalflight_actions.resolve_command(entry)
+    assert r'"C:\Program Files\Python\python.exe"' in cmd
+    assert r'"C:\Users\Ada Lovelace\goal-flight"/scripts/goalflight_doctor.py' in cmd
 
 
 def _run_tests():

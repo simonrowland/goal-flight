@@ -41,6 +41,8 @@ def spawn_codex_worker(project_root: Path, prompt_file: Path, tail_path: Path) -
         stdout=tail_handle,
         stderr=subprocess.STDOUT,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         cwd=str(project_root),
     )
 

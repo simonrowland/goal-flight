@@ -134,6 +134,8 @@ def _ps_meta(pid: int) -> tuple[str, str] | None:
             ["ps", "-o", "lstart=,comm=", "-p", str(pid)],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=2,
         )
         if r.returncode != 0:
@@ -1373,6 +1375,8 @@ async def spawn_acp_connection(
     os_sandbox: str = OS_SANDBOX_OFF,
     env: dict[str, str] | None = None,
 ) -> GoalflightAcpConnection:
+    if goalflight_compat.is_windows():
+        raise AcpError(goalflight_compat.windows_dispatch_refusal())
     require_acp_sdk()
     acp_args = ensure_codex_acp_args(command, acp_args, context_mode=context_mode)
     limit = acp_limit_from_env()

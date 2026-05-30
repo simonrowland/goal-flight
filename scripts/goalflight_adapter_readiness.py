@@ -80,6 +80,8 @@ def _run_probe(probe: dict[str, Any]) -> bool:
         result = subprocess.run(
             argv,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             capture_output=True,
             timeout=5,
             check=False,

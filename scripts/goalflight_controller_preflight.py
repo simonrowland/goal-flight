@@ -15,6 +15,8 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
+import goalflight_compat  # noqa: E402
+
 DEFAULT_CONTEXT_ORDER = ("AGENTS.md", "SKILL.md")
 DEFAULT_STEERING_OPS = ("show", "propose", "apply", "explain")
 
@@ -58,6 +60,8 @@ def run_cmd(cmd: list[str], *, cwd: Path | None = None, timeout: float = 12.0) -
             cmd,
             cwd=str(cwd) if cwd else None,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             timeout=timeout,
@@ -75,7 +79,7 @@ def run_cmd(cmd: list[str], *, cwd: Path | None = None, timeout: float = 12.0) -
 
 
 def check_steering_ops(fleet_dir: Path, ops: tuple[str, ...]) -> list[dict]:
-    python = shutil.which("python3") or "python3"
+    python = goalflight_compat.python_executable()
     checks: list[dict] = []
     for op in ops:
         if op == "show":
@@ -100,7 +104,7 @@ def check_steering_ops(fleet_dir: Path, ops: tuple[str, ...]) -> list[dict]:
 
 
 def check_router(repo_root: Path) -> dict:
-    python = shutil.which("python3") or "python3"
+    python = goalflight_compat.python_executable()
     validate = run_cmd([python, str(SCRIPT_DIR / "goalflight_actions.py"), "validate"], cwd=repo_root)
     route = run_cmd(
         [python, str(SCRIPT_DIR / "goalflight_actions.py"), "route", "core", "doctor", "read"],
@@ -146,7 +150,7 @@ def remediation(adapter: str, status: str, checks: dict) -> list[str]:
     if not all(item.get("ok") for item in checks.get("context_files") or []):
         hints.append("Restore AGENTS.md and SKILL.md in project root.")
     if not checks.get("router", {}).get("ok"):
-        hints.append("Run: python3 scripts/goalflight_actions.py validate")
+        hints.append("Run: GOALFLIGHT_PYTHON=<python> scripts/goalflight_actions.py validate")
     host_cli = checks.get("host_cli") or {}
     if not host_cli.get("present"):
         hints.append(f"Install {adapter} CLI and re-run preflight.")

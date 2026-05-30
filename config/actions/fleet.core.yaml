@@ -7,7 +7,6 @@ summary: Bootstrap ~/.goal-flight/fleet layout
 command: >
   ${GOALFLIGHT_PYTHON} ${GOALFLIGHT_REPO}/scripts/goalflight_fleet.py bootstrap --json
 env:
-  GOALFLIGHT_PYTHON: python3
   GOALFLIGHT_REPO: ${GOALFLIGHT_REPO_ROOT}
 requires: []
 remote_allowed: false
@@ -24,7 +23,6 @@ summary: Fleet store status JSON
 command: >
   ${GOALFLIGHT_PYTHON} ${GOALFLIGHT_REPO}/scripts/goalflight_fleet.py status
 env:
-  GOALFLIGHT_PYTHON: python3
   GOALFLIGHT_REPO: ${GOALFLIGHT_REPO_ROOT}
 requires: []
 remote_allowed: false
@@ -41,7 +39,6 @@ summary: Validate fleet JSON schemas on disk
 command: >
   ${GOALFLIGHT_PYTHON} ${GOALFLIGHT_REPO}/scripts/goalflight_fleet.py validate
 env:
-  GOALFLIGHT_PYTHON: python3
   GOALFLIGHT_REPO: ${GOALFLIGHT_REPO_ROOT}
 requires: []
 remote_allowed: false
@@ -58,7 +55,6 @@ summary: Reconcile stale capacity leases and account locks
 command: >
   ${GOALFLIGHT_PYTHON} ${GOALFLIGHT_REPO}/scripts/goalflight_fleet.py reconcile ${GOALFLIGHT_FLEET_RECONCILE_ARGS}
 env:
-  GOALFLIGHT_PYTHON: python3
   GOALFLIGHT_REPO: ${GOALFLIGHT_REPO_ROOT}
   GOALFLIGHT_FLEET_RECONCILE_ARGS: ""
 requires: []
@@ -76,7 +72,6 @@ summary: Show effective steering policy
 command: >
   ${GOALFLIGHT_PYTHON} ${GOALFLIGHT_REPO}/scripts/goalflight_fleet.py steering show
 env:
-  GOALFLIGHT_PYTHON: python3
   GOALFLIGHT_REPO: ${GOALFLIGHT_REPO_ROOT}
 requires: []
 remote_allowed: false
@@ -93,7 +88,6 @@ summary: Apply a pending steering proposal by id
 command: >
   ${GOALFLIGHT_PYTHON} ${GOALFLIGHT_REPO}/scripts/goalflight_fleet.py steering apply --proposal-id ${GOALFLIGHT_PROPOSAL_ID}
 env:
-  GOALFLIGHT_PYTHON: python3
   GOALFLIGHT_REPO: ${GOALFLIGHT_REPO_ROOT}
   GOALFLIGHT_PROPOSAL_ID: ""
 requires: []

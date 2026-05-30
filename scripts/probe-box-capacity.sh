@@ -5,9 +5,22 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PROFILE_JSON="$(python3 "$SCRIPT_DIR/goalflight_capacity.py" profile --json)"
+if [[ -n "${GOALFLIGHT_PYTHON:-}" ]]; then
+  PY="$GOALFLIGHT_PYTHON"
+else
+  PY3_CANDIDATE="python${GOALFLIGHT_PYTHON_MAJOR:-3}"
+  if command -v "$PY3_CANDIDATE" >/dev/null 2>&1; then
+    PY="$PY3_CANDIDATE"
+  elif command -v python >/dev/null 2>&1; then
+    PY="python"
+  else
+    echo "probe-box-capacity.sh: Python 3 not found; set GOALFLIGHT_PYTHON" >&2
+    exit 127
+  fi
+fi
+PROFILE_JSON="$("$PY" "$SCRIPT_DIR/goalflight_capacity.py" profile --json)"
 
-python3 - "$PROFILE_JSON" <<'PY'
+"$PY" - "$PROFILE_JSON" <<'PY'
 import json
 import sys
 

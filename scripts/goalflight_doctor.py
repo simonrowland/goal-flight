@@ -44,6 +44,8 @@ def run(cmd: list[str], cwd: Path | None = None, timeout: float = 8.0) -> dict:
             cmd,
             cwd=str(cwd) if cwd else None,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             timeout=timeout,
@@ -237,7 +239,7 @@ def check_session_status(skill_root: Path, project_root: Path) -> dict:
             ),
         }
     out = run(
-        ["python3", str(helper), "--project-root", str(project_root), "--json"],
+        [sys.executable, str(helper), "--project-root", str(project_root), "--json"],
         timeout=10.0,
     )
     if out.get("returncode") != 0:
@@ -247,7 +249,7 @@ def check_session_status(skill_root: Path, project_root: Path) -> dict:
             "error": out.get("stderr") or out.get("stdout"),
             "install_hint": (
                 "session_status helper returned nonzero; reproduce with "
-                f"`python3 {helper} --project-root {project_root} --text` "
+                f"`{sys.executable} {helper} --project-root {project_root} --text` "
                 "and check the stderr."
             ),
         }
@@ -260,8 +262,8 @@ def check_session_status(skill_root: Path, project_root: Path) -> dict:
             "error": f"json decode: {exc}",
             "install_hint": (
                 "session_status returned non-JSON stdout — the helper has "
-                "a bug or the python3 launcher is broken. Reproduce with "
-                f"`python3 {helper} --project-root {project_root} --json`."
+                "a bug or the Python launcher is broken. Reproduce with "
+                f"`{sys.executable} {helper} --project-root {project_root} --json`."
             ),
         }
     return {
@@ -579,7 +581,7 @@ def check_context_mode(repo: Path) -> dict:
     script = repo / "scripts/register-context-mode-codex.py"
     out = {"register_script": str(script), "register_script_exists": script.exists()}
     if script.exists():
-        result = run(["python3", str(script), "--check"], cwd=repo, timeout=10)
+        result = run([sys.executable, str(script), "--check"], cwd=repo, timeout=10)
         out.update({"check_returncode": result["returncode"], "check_ok": result["ok"], "stderr": result["stderr"][:500]})
     out["npx_present"] = bool(shutil.which("npx"))
     return out
@@ -590,8 +592,14 @@ def check_cursor_context_mode(skill_root: Path, project_root: Path) -> dict:
     out = {"register_script": str(script), "register_script_exists": script.exists()}
     if not script.exists():
         return out
-    global_result = run(["python3", str(script), "--scope", "global", "--project-root", str(project_root), "--check"], timeout=10)
-    project_result = run(["python3", str(script), "--scope", "project", "--project-root", str(project_root), "--check"], timeout=10)
+    global_result = run(
+        [sys.executable, str(script), "--scope", "global", "--project-root", str(project_root), "--check"],
+        timeout=10,
+    )
+    project_result = run(
+        [sys.executable, str(script), "--scope", "project", "--project-root", str(project_root), "--check"],
+        timeout=10,
+    )
     out.update(
         {
             "global_check_returncode": global_result["returncode"],
@@ -611,8 +619,14 @@ def check_opencode_context_mode(skill_root: Path, project_root: Path) -> dict:
     out = {"register_script": str(script), "register_script_exists": script.exists()}
     if not script.exists():
         return out
-    global_result = run(["python3", str(script), "--scope", "global", "--project-root", str(project_root), "--check"], timeout=10)
-    project_result = run(["python3", str(script), "--scope", "project", "--project-root", str(project_root), "--check"], timeout=10)
+    global_result = run(
+        [sys.executable, str(script), "--scope", "global", "--project-root", str(project_root), "--check"],
+        timeout=10,
+    )
+    project_result = run(
+        [sys.executable, str(script), "--scope", "project", "--project-root", str(project_root), "--check"],
+        timeout=10,
+    )
     out.update(
         {
             "global_check_returncode": global_result["returncode"],
@@ -891,10 +905,11 @@ def check_acp() -> dict:
 
 
 def check_acp_sdk() -> dict:
-    python = Path.home() / ".goal-flight/venvs/acp-0.10/bin/python"
+    venv_root = Path.home() / ".goal-flight/venvs/acp-0.10"
+    python = venv_root / ("Scripts/python.exe" if goalflight_compat.is_windows() else "bin/python")
     hint = "SDK missing -- run install: /init installs agent-client-protocol into ~/.goal-flight/venvs/acp-0.10/"
     runner = SCRIPT_DIR / "goalflight_acp_run.py"
-    system_python = shutil.which("python3") or "python3"
+    system_python = sys.executable
     runner_help = run([system_python, str(runner), "--help"], timeout=8)
     runner_reexec_ok = runner_help["ok"] and "--agent" in runner_help.get("stdout", "")
     if not python.exists():
@@ -903,7 +918,7 @@ def check_acp_sdk() -> dict:
             "python": str(python),
             "error": hint,
             "runner_reexec_ok": runner_reexec_ok,
-            "runner_reexec_detail": f"python3 --help rc={runner_help['returncode']}",
+            "runner_reexec_detail": f"{system_python} --help rc={runner_help['returncode']}",
         }
     result = run(
         [
@@ -920,14 +935,14 @@ def check_acp_sdk() -> dict:
             "error": hint,
             "stderr": result.get("stderr", "")[:500],
             "runner_reexec_ok": runner_reexec_ok,
-            "runner_reexec_detail": f"python3 --help rc={runner_help['returncode']}",
+            "runner_reexec_detail": f"{system_python} --help rc={runner_help['returncode']}",
         }
     return {
         "ok": True,
         "python": str(python),
         "version": "agent-client-protocol==0.10.*",
         "runner_reexec_ok": runner_reexec_ok,
-        "runner_reexec_detail": f"python3 --help rc={runner_help['returncode']}",
+        "runner_reexec_detail": f"{system_python} --help rc={runner_help['returncode']}",
     }
 
 
@@ -1161,7 +1176,7 @@ def check_router(repo: Path) -> dict:
     """Track B: single-surface router readiness (optional field for JSON consumers)."""
     actions_script = repo / "scripts" / "goalflight_actions.py"
     bin_goalflight = repo / "bin" / "goalflight"
-    python = shutil.which("python3") or "python3"
+    python = sys.executable
     out: dict = {
         "bin_goalflight": _path_state(bin_goalflight),
         "actions_script": _path_state(actions_script),
@@ -1301,6 +1316,14 @@ def doctor(repo: Path, *, fleet: bool = False, fleet_dir: Path | None = None, fl
         "rate_pressure": _rate_pressure_summary(),
         "worker_currency": worker_currency_probe(),
     }
+    if goalflight_compat.is_windows():
+        payload["platform"] = {
+            "os_name": os.name,
+            "sys_platform": sys.platform,
+            "is_windows": True,
+            "resolved_python": goalflight_compat.python_executable(),
+            "native_windows_support": "read/plan OK; dispatch -> use WSL. Phase 2 enables native dispatch.",
+        }
     if fleet:
         payload["fleet"] = _fleet_auth_summary(fleet_dir, refresh=fleet_probe)
         payload["fleet_dispatches"] = _fleet_dispatch_report(fleet_dir)
@@ -1458,6 +1481,22 @@ def print_human(payload: dict) -> None:
         status_line(payload["grok"].get("present"), "Grok Build binary", payload["grok"].get("version")),
         status_line(payload["grok"].get("headless_flags"), "Grok headless flags", None),
     ]
+    if goalflight_compat.is_windows():
+        platform_info = payload.get("platform") or {}
+        lines = [
+            status_line(
+                None,
+                "platform",
+                f"os={platform_info.get('os_name')} sys={platform_info.get('sys_platform')} "
+                f"python={platform_info.get('resolved_python')}",
+            ),
+            status_line(
+                None,
+                "native Windows support",
+                platform_info.get("native_windows_support"),
+            ),
+            *lines,
+        ]
     for host, item in (payload.get("host_goalflight_install") or {}).items():
         lines.append(status_line(item.get("ok"), f"{host} goal-flight host install", item.get("detail")))
     for item in (payload.get("installed_skill_drift") or {}).get("entries", []):
@@ -1471,7 +1510,7 @@ def print_human(payload: dict) -> None:
     for name, item in payload["acp"].items():
         if name == "sdk":
             lines.append(status_line(item.get("ok"), "ACP SDK venv", item.get("python")))
-            lines.append(status_line(item.get("runner_reexec_ok"), "ACP runner python3 re-exec", item.get("runner_reexec_detail")))
+            lines.append(status_line(item.get("runner_reexec_ok"), "ACP runner Python re-exec", item.get("runner_reexec_detail")))
         else:
             lines.append(status_line(item.get("present"), f"ACP {name}", item.get("version")))
     cap = payload.get("capacity") or {}

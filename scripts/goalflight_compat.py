@@ -27,11 +27,17 @@ from __future__ import annotations
 
 import errno
 import os
+import sys
 import tempfile
 from pathlib import Path
 
 __all__ = [
     "is_windows",
+    "python_executable",
+    "windows_dispatch_refusal",
+    "windows_os_sandbox_refusal",
+    "windows_hooks_skip",
+    "windows_watcher_skip",
     "LOCK_EX",
     "LOCK_SH",
     "LOCK_NB",
@@ -46,6 +52,42 @@ __all__ = [
 def is_windows() -> bool:
     """True on native Windows (``os.name == "nt"``). NOT true under WSL."""
     return os.name == "nt"
+
+
+def python_executable() -> str:
+    """Python executable for internal re-invokes, overrideable for launchers."""
+    return os.environ.get("GOALFLIGHT_PYTHON") or sys.executable
+
+
+def windows_dispatch_refusal() -> str:
+    return (
+        "native Windows dispatch is off in Phase 1: run `wsl --install`, "
+        "re-run inside the distro, and use the WSL install. "
+        "Phase 2 enables native dispatch. See docs/hosts/windows.md#native-windows-support."
+    )
+
+
+def windows_os_sandbox_refusal() -> str:
+    return (
+        "OS sandbox is macOS-only; on Windows you get worktree isolation + "
+        "the worker's own --sandbox. Drop --os-sandbox to proceed, or use WSL. "
+        "See docs/hosts/windows.md#capability-matrix."
+    )
+
+
+def windows_hooks_skip() -> str:
+    return (
+        "context-discipline hooks are POSIX/Git-Bash-only and are not installed "
+        "on native Windows; context protection is advisory here (see SKILL.md State) "
+        "or use WSL. See docs/hosts/windows.md#context-discipline-hooks."
+    )
+
+
+def windows_watcher_skip() -> str:
+    return (
+        "bash-tail watcher is POSIX/Git-Bash-only and is skipped on native Windows; "
+        "use WSL for dispatch watching. See docs/hosts/windows.md#capability-matrix."
+    )
 
 
 # --------------------------------------------------------------------------- #

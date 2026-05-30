@@ -278,7 +278,7 @@
           "codex-cli-worker"
         ],
         "install_mode": "setup",
-        "commands": ["python3 scripts/register-context-mode-codex.py"],
+        "commands": ["${GOALFLIGHT_PYTHON} scripts/register-context-mode-codex.py"],
         "paths": ["~/.codex/config.toml", "[mcp_servers.context-mode]"]
       },
       {

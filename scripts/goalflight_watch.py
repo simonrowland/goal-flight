@@ -87,6 +87,20 @@ def main() -> int:
 
     tail = Path(args.tail)
     status_path = Path(args.status_json)
+    if goalflight_compat.is_windows():
+        payload = {
+            "schema": "goalflight.status.v1",
+            "dispatch_id": args.dispatch_id,
+            "agent": args.agent,
+            "worker_pid": args.pid,
+            "state": "watcher_skipped_windows",
+            "reason": goalflight_compat.windows_watcher_skip(),
+            "tail_path": str(tail),
+            "updated_at": int(time.time()),
+        }
+        write_status(status_path, payload)
+        print(json.dumps({"state": payload["state"], "reason": payload["reason"], "status_path": str(status_path)}, sort_keys=True))
+        return 0
     last_size = -1
     last_change = time.time()
     terminal = None
@@ -94,12 +108,7 @@ def main() -> int:
     exit_reason = "unknown"
     exit_code = 1
     wedge_streak = 0
-    # process_group_id/pgroup_cpu_pct use os.getpgid/ps (POSIX-only). On native
-    # Windows they raise/return nothing — and the watcher IS the cross-platform
-    # dispatch path, so it must NOT crash there. Degrade to existence + tail-idle
-    # (no CPU-wedge) on Windows.
-    _win = goalflight_compat.is_windows()
-    pgid = None if _win else (args.pgid or process_group_id(args.pid) or args.pid)
+    pgid = args.pgid or process_group_id(args.pid) or args.pid
     thresholds = LivenessThresholds(idle_timeout_s=args.max_idle_secs, cpu_epsilon_pct=args.cpu_epsilon)
 
     while True:
@@ -111,7 +120,7 @@ def main() -> int:
         seconds_since_event = now - last_change
         terminal = next((m for m in reversed(markers) if m["kind"] in TERMINAL_MARKERS), None)
         worker_alive = alive(args.pid)
-        if worker_alive and not _win:
+        if worker_alive:
             pgid = args.pgid or process_group_id(args.pid) or pgid
             cpu_pct = pgroup_cpu_pct(pgid)
         else:

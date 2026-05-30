@@ -24,7 +24,17 @@ if command -v uv >/dev/null 2>&1; then
   uv venv "${ACP_VENV}"
   uv pip install --python "${ACP_VENV}/bin/python" -r "${REQ}"
 else
-  python3 -m venv "${ACP_VENV}"
+  if [[ -n "${GOALFLIGHT_PYTHON:-}" ]]; then
+    GF_PY="$GOALFLIGHT_PYTHON"
+  else
+    GF_PY_CANDIDATE="python${GOALFLIGHT_PYTHON_MAJOR:-3}"
+    if command -v "$GF_PY_CANDIDATE" >/dev/null 2>&1; then
+      GF_PY="$GF_PY_CANDIDATE"
+    else
+      GF_PY="python"
+    fi
+  fi
+  "$GF_PY" -m venv "${ACP_VENV}"
   "${ACP_VENV}/bin/python" -m pip install -r "${REQ}"
 fi
 

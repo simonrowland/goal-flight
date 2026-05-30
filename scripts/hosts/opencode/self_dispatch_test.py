@@ -62,6 +62,8 @@ def _run(cmd: list[str], *, cwd: Path | None = None, timeout: float = 300) -> di
             cwd=str(cwd) if cwd else None,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
             check=False,
         )
@@ -216,6 +218,8 @@ def _run_bash_tail(*, workdir: Path, model: str, timeout: float) -> dict[str, An
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         env=env,
     )
     watcher_proc = subprocess.Popen(
@@ -240,6 +244,8 @@ def _run_bash_tail(*, workdir: Path, model: str, timeout: float) -> dict[str, An
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         env=env,
     )
     worker_rc = worker_proc.wait(timeout=timeout)

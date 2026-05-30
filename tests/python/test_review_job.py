@@ -36,6 +36,8 @@ def run(
         cwd=ROOT,
         env=merged_env,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         timeout=timeout,
@@ -50,13 +52,31 @@ def assert_true(name: str, condition: bool) -> None:
         raise AssertionError(name)
 
 
+def skipif(condition: bool, reason: str):
+    def _decorator(func):
+        def _wrapped(*args, **kwargs):
+            if condition:
+                print(f"SKIP: {func.__name__}: {reason}")
+                return None
+            return func(*args, **kwargs)
+        return _wrapped
+    return _decorator
+
+
 def pgroup_has_processes(pgid: int) -> bool:
-    output = subprocess.check_output(["ps", "-A", "-o", "pgid="], text=True)
+    output = subprocess.check_output(["ps", "-A", "-o", "pgid="], text=True, encoding="utf-8", errors="replace")
     return any(line.strip() == str(pgid) for line in output.splitlines())
 
 
 def process_exists(pid: int) -> bool:
-    result = subprocess.run(["ps", "-p", str(pid), "-o", "pid="], text=True, capture_output=True, check=False)
+    result = subprocess.run(
+        ["ps", "-p", str(pid), "-o", "pid="],
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        capture_output=True,
+        check=False,
+    )
     return bool(result.stdout.strip())
 
 
@@ -198,6 +218,7 @@ def review_command(tmp: Path, fake_codex: Path, name: str, *, timeout_s: float =
     ]
 
 
+@skipif(os.name == "nt", reason="native Windows review-job dispatch is refused in Phase 1")
 def test_active_worker_can_complete_after_soft_timeout() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
@@ -218,6 +239,7 @@ def test_active_worker_can_complete_after_soft_timeout() -> None:
         assert_true("final tracked", status["final_detected"] is True and status["final_bytes"] > 0)
 
 
+@skipif(os.name == "nt", reason="native Windows review-job dispatch is refused in Phase 1")
 def test_final_file_detected_before_process_exit() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
@@ -232,6 +254,8 @@ def test_final_file_detected_before_process_exit() -> None:
             cwd=ROOT,
             env=env,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
@@ -252,6 +276,7 @@ def test_final_file_detected_before_process_exit() -> None:
         assert_true("terminal complete after process exit", final_status["state"] == "complete")
 
 
+@skipif(os.name == "nt", reason="POSIX process-group kill test")
 def test_no_progress_timeout_kills_process_group() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
@@ -277,6 +302,7 @@ def test_no_progress_timeout_kills_process_group() -> None:
         assert_true("child process group received terminate", child_term_file.exists())
 
 
+@skipif(os.name == "nt", reason="native Windows review-job dispatch is refused in Phase 1")
 def test_jsonl_partial_and_malformed_lines_are_tolerated() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
@@ -295,6 +321,7 @@ def test_jsonl_partial_and_malformed_lines_are_tolerated() -> None:
         assert_true("nested event kind detected", status["last_event_kind"] == "msg.done")
 
 
+@skipif(os.name == "nt", reason="native Windows review-job dispatch is refused in Phase 1")
 def test_prompt_write_cannot_block_monitor_before_timeout() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
@@ -339,6 +366,7 @@ def test_prompt_write_cannot_block_monitor_before_timeout() -> None:
         assert_true("stdin-block reason recorded", status["timeout_reason"] == "no_progress_timeout")
 
 
+@skipif(os.name == "nt", reason="POSIX process-group kill test")
 def test_parent_exit_with_live_child_is_inconclusive_and_reaped() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)

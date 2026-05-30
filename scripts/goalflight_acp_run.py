@@ -34,6 +34,9 @@ from typing import Any, Callable
 import uuid
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIR))
+import goalflight_compat  # noqa: E402
+
 DEFAULT_REMOTE_TURN_SILENCE_S = 1200.0
 DEFAULT_REMOTE_TURN_CANCEL_GRACE_S = 15.0
 DEFAULT_MAX_TOOL_S = 3600.0
@@ -60,13 +63,14 @@ def _acp_reexec_target() -> str | None:
 
 
 def _ensure_acp_sdk_python() -> None:
+    if goalflight_compat.is_windows():
+        return
     target = _acp_reexec_target()
     if target is not None:
         os.execv(target, [target, *sys.argv])
 
 
 _ensure_acp_sdk_python()
-sys.path.insert(0, str(SCRIPT_DIR))
 
 import goalflight_capacity
 import goalflight_ledger
@@ -333,6 +337,8 @@ def create_dispatch_worktree(project_root: Path, dispatch_id: str) -> Path:
         ["git", "rev-parse", "--show-toplevel"],
         cwd=str(project_root),
         text=True,
+        encoding="utf-8",
+        errors="replace",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
@@ -354,6 +360,8 @@ def create_dispatch_worktree(project_root: Path, dispatch_id: str) -> Path:
         ["git", "worktree", "add", str(worktree_path), "HEAD"],
         cwd=str(project_root),
         text=True,
+        encoding="utf-8",
+        errors="replace",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
@@ -1300,6 +1308,39 @@ async def run(args: argparse.Namespace) -> dict:
     return payload
 
 
+def write_windows_refusal_status(args: argparse.Namespace) -> tuple[dict, Path]:
+    dispatch_id = args.dispatch_id or f"acp-{args.agent}-{uuid.uuid4().hex[:8]}"
+    project_root = Path(args.cwd).resolve()
+    status_path = (
+        Path(args.status_json)
+        if args.status_json
+        else project_root / f".goalflight-{status_filename_segment(dispatch_id)}.status.json"
+    )
+    payload = {
+        "schema": "goalflight.acp-run.v1",
+        "dispatch_id": dispatch_id,
+        "lease_id": None,
+        "agent": args.agent,
+        "session_id": args.session_id,
+        "project_root": str(project_root),
+        "worker_cwd": args.cwd,
+        "worktree_mode": getattr(args, "worktree", "off"),
+        "planned_worktree_path": None,
+        "worktree_path": None,
+        "state": "blocked_windows_dispatch",
+        "ok": False,
+        "error": goalflight_compat.windows_dispatch_refusal(),
+        "next_step": "wsl --install; re-run inside the distro",
+        "worker_pid": None,
+        "pgid": None,
+        "worker_alive": False,
+        "status_path": str(status_path),
+        "updated_at": _now(),
+    }
+    write_status(status_path, payload)
+    return payload, status_path
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="goal-flight ACP runner")
     parser.add_argument("--agent", required=True)
@@ -1502,6 +1543,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.progress_stall_s <= 0:
         args.progress_stall_s = 300.0
     args.session_id = args.session_id or f"goalflight-{uuid.uuid4().hex[:8]}"
+    if goalflight_compat.is_windows():
+        payload, status_path = write_windows_refusal_status(args)
+        if args.json:
+            print(json.dumps(payload, sort_keys=True))
+        else:
+            print(f"{payload['dispatch_id']}: blocked_windows_dispatch status={status_path}")
+        return 2
     payload = asyncio.run(run(args))
     if args.json:
         print(json.dumps(payload, sort_keys=True))

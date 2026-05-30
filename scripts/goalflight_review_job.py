@@ -129,11 +129,15 @@ def _alive(pid: int | None) -> bool:
 def _pgroup_has_live_processes(pgid: int | None) -> bool:
     if pgid is None:
         return False
+    if goalflight_compat.is_windows():
+        return False
     try:
         output = subprocess.check_output(
             ["ps", "-A", "-o", "pgid="],
             stderr=subprocess.DEVNULL,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=2.0,
         )
     except (OSError, subprocess.SubprocessError):
@@ -143,6 +147,18 @@ def _pgroup_has_live_processes(pgid: int | None) -> bool:
 
 
 def _terminate_process_group(proc: subprocess.Popen[str], pgid: int | None, grace_s: float = 5.0) -> bool:
+    if goalflight_compat.is_windows():
+        with contextlib.suppress(Exception):
+            proc.terminate()
+        if proc.poll() is None:
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.wait(timeout=grace_s)
+        if proc.poll() is None:
+            with contextlib.suppress(Exception):
+                proc.kill()
+            with contextlib.suppress(Exception):
+                proc.wait(timeout=grace_s)
+        return proc.poll() is not None
     target = pgid or process_group_id(proc.pid) or proc.pid
     signalled = False
     try:
@@ -217,7 +233,7 @@ def _monitor_process(
 ) -> dict[str, Any]:
     prompt_state, prompt_thread = _start_prompt_writer(proc, prompt_text)
 
-    pgid = process_group_id(proc.pid) or proc.pid
+    pgid = None if goalflight_compat.is_windows() else (process_group_id(proc.pid) or proc.pid)
     stdout_progress = JsonlProgress(stdout_path)
     last_stdout_bytes = _file_size(stdout_path)
     last_stderr_bytes = _file_size(stderr_path)
@@ -456,6 +472,23 @@ def main(argv: list[str] | None = None) -> int:
     status_path = out_dir / f"{args.name}.status.json"
     dispatch_id = f"review-{args.name}-{uuid.uuid4().hex[:8]}"
     final_path = Path(args.output_dir) / f"{args.name}.final.md" if args.agent == "codex" else None
+    if goalflight_compat.is_windows():
+        payload = {
+            "schema": "goalflight.review-job.v1",
+            "dispatch_id": dispatch_id,
+            "agent": args.agent,
+            "name": args.name,
+            "state": "blocked_windows_dispatch",
+            "error": goalflight_compat.windows_dispatch_refusal(),
+            "next_step": "wsl --install; re-run inside the distro",
+            "prompt_path": args.prompt,
+            "stdout_path": str(stdout_path),
+            "stderr_path": str(stderr_path),
+            "final_path": str(final_path) if final_path else None,
+        }
+        write_status(status_path, payload)
+        print(json.dumps(payload, sort_keys=True) if args.json else f"{args.name}: blocked_windows_dispatch status={status_path}")
+        return 2
 
     lease_ttl_s = max(int(max(args.timeout_s, args.max_quiet_s, args.max_total_s or 0) * 4), 7200)
     acquire_argv = argparse.Namespace(
@@ -532,7 +565,7 @@ def main(argv: list[str] | None = None) -> int:
     started = time.time()
     returncode: int | None = None
     ledger_recorded = False
-    with stdout_path.open("w") as stdout_f, stderr_path.open("w") as stderr_f:
+    with stdout_path.open("w", encoding="utf-8", errors="replace") as stdout_f, stderr_path.open("w", encoding="utf-8", errors="replace") as stderr_f:
         try:
             proc = subprocess.Popen(
                 cmd,
@@ -541,6 +574,8 @@ def main(argv: list[str] | None = None) -> int:
                 stdout=stdout_f,
                 stderr=stderr_f,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 start_new_session=True,
             )
         except Exception as e:

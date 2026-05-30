@@ -26,6 +26,7 @@ REPO_ROOT = SCRIPT_DIR.parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
+import goalflight_compat  # noqa: E402
 from goalflight_adapter_gate import validate_adapter_gate  # noqa: E402
 
 
@@ -142,7 +143,7 @@ def _run_codex_plugin_registration(repo_root: Path) -> None:
         return
 
     for argv in commands:
-        result = subprocess.run(argv, text=True, capture_output=True, check=False)
+        result = subprocess.run(argv, text=True, encoding="utf-8", errors="replace", capture_output=True, check=False)
         combined = f"{result.stdout}\n{result.stderr}".lower()
         allowed = ("already", "exists", "not installed", "not found")
         if result.returncode != 0 and not any(word in combined for word in allowed):
@@ -154,6 +155,8 @@ def _run_codex_plugin_registration(repo_root: Path) -> None:
     result = subprocess.run(
         ["codex", "plugin", "list", "--marketplace", "goal-flight"],
         text=True,
+        encoding="utf-8",
+        errors="replace",
         capture_output=True,
         check=False,
     )
@@ -192,7 +195,7 @@ def _run_codex_plugin_unregistration() -> None:
         return
 
     for argv in commands:
-        result = subprocess.run(argv, text=True, capture_output=True, check=False)
+        result = subprocess.run(argv, text=True, encoding="utf-8", errors="replace", capture_output=True, check=False)
         combined = f"{result.stdout}\n{result.stderr}".lower()
         allowed = ("not installed", "not found", "unknown", "missing")
         if result.returncode != 0 and not any(word in combined for word in allowed):
@@ -223,7 +226,7 @@ def _run_codex_context_mode_registration(repo_root: Path, *, dry_run: bool) -> N
         print(f"BOOTSTRAP {_format_command(apply_argv)}")
         return
 
-    result = subprocess.run(apply_argv, text=True, capture_output=True, check=False)
+    result = subprocess.run(apply_argv, text=True, encoding="utf-8", errors="replace", capture_output=True, check=False)
     if result.returncode != 0:
         raise SetupError(
             "context-mode registration failed: "
@@ -280,7 +283,7 @@ def _run_cursor_context_mode_registration(
             records.append(record)
             if backup_manifest is not None and existing_records is not None:
                 _write_backup_manifest(backup_manifest, agent, existing_records + records)
-        result = subprocess.run(argv, text=True, capture_output=True, check=False)
+        result = subprocess.run(argv, text=True, encoding="utf-8", errors="replace", capture_output=True, check=False)
         if result.returncode != 0:
             raise SetupError(
                 "cursor context-mode registration failed: "
@@ -338,7 +341,7 @@ def _run_opencode_context_mode_registration(
             records.append(record)
             if backup_manifest is not None and existing_records is not None:
                 _write_backup_manifest(backup_manifest, agent, existing_records + records)
-        result = subprocess.run(argv, text=True, capture_output=True, check=False)
+        result = subprocess.run(argv, text=True, encoding="utf-8", errors="replace", capture_output=True, check=False)
         if result.returncode != 0:
             raise SetupError(
                 "opencode context-mode registration failed: "
@@ -358,7 +361,7 @@ def _check_codex_cli_worker_surface(*, dry_run: bool) -> None:
             print(f"WORKER_CHECK {_format_command(argv)}")
         return
     for argv in commands:
-        result = subprocess.run(argv, text=True, capture_output=True, check=False)
+        result = subprocess.run(argv, text=True, encoding="utf-8", errors="replace", capture_output=True, check=False)
         if result.returncode != 0:
             raise SetupError(
                 "codex CLI worker check failed: "
@@ -377,7 +380,7 @@ def _check_cursor_cli_worker_surface(*, dry_run: bool) -> None:
     path = shutil.which("cursor-agent") or str(Path.home() / ".local/bin/cursor-agent")
     if not Path(path).exists() and shutil.which("cursor-agent") is None:
         raise SetupError("cursor-agent worker check failed: cursor-agent not found")
-    result = subprocess.run([path, "--version"], text=True, capture_output=True, check=False)
+    result = subprocess.run([path, "--version"], text=True, encoding="utf-8", errors="replace", capture_output=True, check=False)
     combined = f"{result.stdout or ''}\n{result.stderr or ''}"
     keychain_locked = result.returncode != 0 and re.search(r"keychain.*locked", combined, re.I)
     if result.returncode != 0 and not keychain_locked:
@@ -398,15 +401,15 @@ def _check_opencode_acp_worker_surface(*, dry_run: bool) -> None:
     path = shutil.which("opencode") or str(Path.home() / ".local/bin/opencode")
     if not Path(path).exists() and shutil.which("opencode") is None:
         raise SetupError("opencode ACP worker check failed: opencode not found")
-    version = subprocess.run([path, "--version"], text=True, capture_output=True, check=False)
+    version = subprocess.run([path, "--version"], text=True, encoding="utf-8", errors="replace", capture_output=True, check=False)
     if version.returncode != 0:
         raise SetupError(
             "opencode ACP worker check failed: "
             f"{path} --version\n{version.stderr.strip() or version.stdout.strip()}"
         )
-    acp = subprocess.run([path, "acp", "--help"], text=True, capture_output=True, check=False)
+    acp = subprocess.run([path, "acp", "--help"], text=True, encoding="utf-8", errors="replace", capture_output=True, check=False)
     if acp.returncode != 0:
-        help_result = subprocess.run([path, "--help"], text=True, capture_output=True, check=False)
+        help_result = subprocess.run([path, "--help"], text=True, encoding="utf-8", errors="replace", capture_output=True, check=False)
         help_text = (help_result.stdout or help_result.stderr or "")
         if "acp" not in help_text.casefold():
             raise SetupError(
@@ -424,7 +427,7 @@ def _run_mac_worker_path_setup(repo_root: Path, *, dry_run: bool) -> None:
     script = repo_root / "scripts" / "hosts" / "fleet" / "setup_worker_path.sh"
     if not script.exists():
         return
-    result = subprocess.run(["bash", str(script)], text=True, capture_output=True, check=False)
+    result = subprocess.run(["bash", str(script)], text=True, encoding="utf-8", errors="replace", capture_output=True, check=False)
     if result.stdout.strip():
         print(result.stdout.strip())
     if result.returncode != 0:
@@ -474,6 +477,12 @@ def _run_host_bootstrap(
         print(f"ADDON_SKIP {agent} {addon_id} reason=incompatible_destinations")
     for addon in addons:
         mode = addon.get("install_mode")
+        if goalflight_compat.is_windows() and addon.get("id") == "context-mode":
+            print(
+                f"ADDON_SKIP {agent} {addon['id']} reason=windows_hooks_unsupported "
+                f"detail={goalflight_compat.windows_hooks_skip()}"
+            )
+            continue
         if mode == "setup" and agent == "codex" and addon.get("id") == "context-mode":
             _run_codex_context_mode_registration(repo_root, dry_run=dry_run)
         elif mode == "setup" and agent == "cursor" and addon.get("id") == "context-mode":
@@ -533,6 +542,8 @@ def _safe_discovery_summary(manifest: dict[str, Any]) -> list[str]:
             result = subprocess.run(
                 argv,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 capture_output=True,
                 timeout=5,
                 check=False,
@@ -559,6 +570,8 @@ def _run_addon_self_check(agent: str, addon: dict[str, Any]) -> None:
             result = subprocess.run(
                 ["sh", "-lc", command],
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 capture_output=True,
                 timeout=5,
                 check=False,
@@ -596,6 +609,7 @@ def _probe_env(probe: dict[str, Any]) -> dict[str, str] | None:
         "HOME": str(Path.home()),
         "PATH": os.pathsep.join(path_items),
         "SHELL": os.environ.get("SHELL", "/bin/sh"),
+        "GOALFLIGHT_PYTHON": goalflight_compat.python_executable(),
     }
 
 
@@ -609,6 +623,8 @@ def _run_probe(probe: dict[str, Any]) -> dict[str, Any]:
         result = subprocess.run(
             argv,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             capture_output=True,
             timeout=5,
             check=False,
@@ -924,7 +940,7 @@ def _atomic_write(path: Path, content: str) -> None:
     fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
     tmp_path = Path(tmp)
     try:
-        with os.fdopen(fd, "w") as handle:
+        with os.fdopen(fd, "w", encoding="utf-8", errors="replace") as handle:
             handle.write(content)
         tmp_path.replace(path)
     finally:
