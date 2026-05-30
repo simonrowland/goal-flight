@@ -78,6 +78,10 @@ installed copy is stale. The repository `SKILL.md` is canonical — when the
 installed wrapper and the repo wrapper disagree, trust the repo. Doctor
 probes the divergence; re-run install to resync.
 
+**Windows (native host):** read/plan only — native worker dispatch (ACP / bash-tail)
+is POSIX/WSL-only; use the `bin/goalflight.cmd` / `bin/goalflight.ps1` launchers and
+see `docs/hosts/windows.md` (including the WSL path for worker dispatch).
+
 Load order: `AGENTS.md` -> installed host wrapper -> repository `SKILL.md` ->
 only the invoked `commands/*.md` plus referenced `protocols/*.md`.
 Companion tools: gstack `/review` is the canonical chunk reviewer; gstack
