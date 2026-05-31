@@ -40,6 +40,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -63,6 +64,13 @@ ACCOUNT_ENGINE_BY_AGENT = {
     "cursor": "cursor",
     "cursor-agent": "cursor",
 }
+STEER_PROMPT_PREAMBLE = (
+    "You have a steer mailbox at `$GOALFLIGHT_STEER_FILE`. Read it AT THE TOP OF EACH "
+    "ITERATION and IMMEDIATELY BEFORE ANY git commit/push. Incorporate new messages "
+    "into your plan; ack each with `STEER-ACK: <seq>` on its own line; a steer may "
+    "redirect or HALT you — honor it."
+)
+STEER_ACK_RE = re.compile(r"^\**STEER-ACK:\**\s*(\d+)\b")
 
 
 class DispatchUsageError(Exception):
@@ -106,6 +114,10 @@ def _dispatch_base_dir() -> Path:
     return _state_dir() / "dispatch"
 
 
+def _steer_file(dispatch_id: str) -> Path:
+    return _dispatch_base_dir() / f"{dispatch_id}.steer.jsonl"
+
+
 def _raw_worker_args(args) -> list[str]:
     return args.worker[1:] if args.worker and args.worker[0] == "--" else args.worker
 
@@ -129,6 +141,191 @@ def _validate_before_side_effects(args, raw_argv: list[str]) -> None:
         )
     if args.prompt_file and not Path(args.prompt_file).expanduser().exists():
         raise DispatchUsageError(f"prompt file not found: {args.prompt_file}")
+
+
+def _find_dispatch_record(dispatch_id: str) -> dict | None:
+    for record in goalflight_ledger.read_records():
+        if record.get("dispatch_id") == dispatch_id:
+            return record
+    return None
+
+
+def _worker_liveness_warning(record: dict) -> str | None:
+    dispatch_id = record.get("dispatch_id") or "unknown"
+    pid = record.get("worker_pid")
+    if not pid:
+        return f"WARN: dispatch {dispatch_id} has no worker pid; message appended but may not be observed"
+    try:
+        current = goalflight_ledger.process_identity(int(pid))
+    except (TypeError, ValueError, OSError) as exc:
+        return f"WARN: dispatch {dispatch_id} worker identity check failed: {exc}"
+    if current is None:
+        return f"WARN: dispatch {dispatch_id} worker pid {pid} is not alive; message appended but may not be observed"
+    prior = record.get("worker_identity") or {}
+    if goalflight_compat.is_windows() and not current.get("identity_available", True):
+        return f"WARN: dispatch {dispatch_id} worker identity indeterminate; message appended"
+    for key in ("lstart", "comm"):
+        if prior.get(key) and current.get(key) and prior[key] != current[key]:
+            return (
+                f"WARN: dispatch {dispatch_id} worker pid {pid} identity mismatch "
+                f"({key}); message appended but may target stale state"
+            )
+    return None
+
+
+def _parse_steer_lines(lines: list[str]) -> list[dict]:
+    entries: list[dict] = []
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        try:
+            seq = int(item.get("seq"))
+        except (TypeError, ValueError):
+            continue
+        entries.append({
+            "seq": seq,
+            "ts": str(item.get("ts") or ""),
+            "text": str(item.get("text") or ""),
+        })
+    return entries
+
+
+def _read_steer_entries(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    with path.open("r", encoding="utf-8", errors="replace") as f:
+        goalflight_compat.flock(f, goalflight_compat.LOCK_SH)
+        try:
+            return _parse_steer_lines(f.read().splitlines())
+        finally:
+            goalflight_compat.flock(f, goalflight_compat.LOCK_UN)
+
+
+def _append_steer_message(dispatch_id: str, text: str) -> tuple[Path, dict]:
+    path = _steer_file(dispatch_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+", encoding="utf-8") as f:
+        goalflight_compat.flock(f, goalflight_compat.LOCK_EX)
+        try:
+            f.seek(0)
+            existing = _parse_steer_lines(f.read().splitlines())
+            seq = max((entry["seq"] for entry in existing), default=0) + 1
+            entry = {
+                "seq": seq,
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "text": text,
+            }
+            f.seek(0, os.SEEK_END)
+            f.write(json.dumps(entry, sort_keys=True) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+            return path, entry
+        finally:
+            goalflight_compat.flock(f, goalflight_compat.LOCK_UN)
+
+
+def _acked_steer_seqs(record: dict) -> set[int]:
+    acked: set[int] = set()
+    for key in ("stdout_path", "status_path"):
+        value = record.get(key)
+        if not value:
+            continue
+        path = Path(str(value))
+        if not path.exists():
+            continue
+        if key == "status_path":
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            for marker in payload.get("markers") or []:
+                if marker.get("kind") != "STEER-ACK":
+                    continue
+                try:
+                    acked.add(int(str(marker.get("text") or "").split()[0]))
+                except (IndexError, ValueError):
+                    pass
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            match = STEER_ACK_RE.match(line.strip())
+            if match:
+                acked.add(int(match.group(1)))
+    return acked
+
+
+def _list_steer_messages(dispatch_id: str, record: dict) -> int:
+    mailbox = _steer_file(dispatch_id)
+    entries = _read_steer_entries(mailbox)
+    acked = _acked_steer_seqs(record)
+    print(f"steer mailbox: {mailbox}")
+    if not entries:
+        print("(empty)")
+        return 0
+    print("seq\tts\tacked\ttext")
+    for entry in entries:
+        print(
+            f"{entry['seq']}\t{entry['ts']}\t"
+            f"{str(entry['seq'] in acked).lower()}\t{entry['text']}"
+        )
+    return 0
+
+
+def _cmd_steer(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog=f"{Path(sys.argv[0]).name} steer",
+        description="Append or list mailbox steers for an existing dispatch.",
+    )
+    parser.add_argument("dispatch_id")
+    parser.add_argument("message", nargs="?")
+    parser.add_argument("--list", action="store_true", dest="list_messages")
+    args = parser.parse_args(argv)
+
+    record = _find_dispatch_record(args.dispatch_id)
+    if record is None:
+        print(f"goalflight_dispatch: no ledger record for dispatch {args.dispatch_id}", file=sys.stderr)
+        return 64
+
+    if args.list_messages:
+        return _list_steer_messages(args.dispatch_id, record)
+    if args.message is None:
+        print("goalflight_dispatch: steer requires a message or --list", file=sys.stderr)
+        return 64
+
+    shape = goalflight_ledger.infer_shape(record)
+    if shape == "acp":
+        # ACP STEER SEND STUB (#8 --interactive): call session/prompt here once wired.
+        print("acp inline steer lands with --interactive (#8); use session/prompt once wired", file=sys.stderr)
+        return 64
+    if shape != "bash":
+        print(f"goalflight_dispatch: dispatch {args.dispatch_id} has unsupported shape {shape!r}", file=sys.stderr)
+        return 64
+
+    warning = _worker_liveness_warning(record)
+    if warning:
+        print(warning, file=sys.stderr)
+    path, entry = _append_steer_message(args.dispatch_id, args.message)
+    print(f"steer appended: dispatch_id={args.dispatch_id} seq={entry['seq']} mailbox={path}")
+    return 0
+
+
+def _materialize_steer_prompt(prompt_path: str | None, base: Path, dispatch_id: str) -> str | None:
+    if not prompt_path:
+        return None
+    body_path = Path(prompt_path)
+    body = body_path.read_text(encoding="utf-8", errors="replace")
+    full_prompt = f"{STEER_PROMPT_PREAMBLE}\n\n{body}"
+    assembled = base / f"{dispatch_id}.assembled.prompt"
+    assembled.parent.mkdir(parents=True, exist_ok=True)
+    assembled.write_text(full_prompt, encoding="utf-8")
+    return str(assembled)
 
 
 def _default_dispatch_id(agent: str) -> str:
@@ -449,7 +646,11 @@ def build_worker(args, prompt_path, raw_argv: list[str]):
     return None, None  # unknown preset + no raw command
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "steer":
+        return _cmd_steer(argv[1:])
+
     parser = argparse.ArgumentParser(
         description="Crash-safe worker dispatch: detached worker + decoupled watcher."
     )
@@ -485,7 +686,7 @@ def main() -> int:
     parser.add_argument("--json", action="store_true", help="With --stats, emit machine-readable JSON.")
     parser.add_argument("worker", nargs=argparse.REMAINDER,
                         help="Optional `-- <cmd...>` raw worker (overrides the preset)")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.stats is not None:
         try:
             payload = goalflight_ledger.stats_payload(args.stats)
@@ -529,7 +730,10 @@ def main() -> int:
     tail = Path(args.tail) if args.tail else base / f"{args.dispatch_id}.tail"
     status_json = Path(args.status_json) if args.status_json else base / f"{args.dispatch_id}.status.json"
 
+    steer_file = _steer_file(args.dispatch_id)
     prompt_path = None if raw else _resolve_prompt_file(args, base)
+    if prompt_path:
+        prompt_path = _materialize_steer_prompt(prompt_path, base, args.dispatch_id)
     worker_argv, stdin_path = build_worker(args, prompt_path, raw)
     if not worker_argv:
         print("goalflight_dispatch: no worker — use `--agent codex --prompt-file X [--cwd .]` "
@@ -575,6 +779,7 @@ def main() -> int:
         # resolved environment here.
         env = dict(os.environ)
         env.update(account_env)
+        env["GOALFLIGHT_STEER_FILE"] = str(steer_file)
         if args.account and _account_engine(args.agent) == "grok":
             env.pop("GROK_API_KEY", None)
             env.pop("XAI_API_KEY", None)

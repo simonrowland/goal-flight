@@ -164,12 +164,24 @@ def case_incomplete_identity_is_inconclusive_alive() -> None:
         assert payload.get("worker_identity_reason", "").startswith("identity_inconclusive_"), payload
 
 
+def case_steer_ack_is_non_terminal_marker() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        tail = Path(tmp) / "tail.txt"
+        tail.write_text("STATUS: working\nSTEER-ACK: 7\n", encoding="utf-8")
+        markers, _size = goalflight_watch.extract_markers(tail)
+
+    assert markers[-1]["kind"] == "STEER-ACK", markers
+    assert markers[-1]["text"] == "7", markers
+    assert "STEER-ACK" not in goalflight_watch.TERMINAL_MARKERS
+
+
 def main() -> None:
     case_ignores_echoed_prompt_marker()
     case_without_ignore_trips_on_echo()
     case_prompt_ignore_stops_at_first_mismatch()
     case_identity_mismatch_not_alive()
     case_incomplete_identity_is_inconclusive_alive()
+    case_steer_ack_is_non_terminal_marker()
     print("OK: goalflight_watch prompt-echo guard tests pass")
 
 

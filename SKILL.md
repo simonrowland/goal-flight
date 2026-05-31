@@ -285,6 +285,10 @@ or promote them to a plan revision plus re-review when they change scope.
 
 Do not task-pivot or inline-edit on receipt. Plan before editing when scope is unsettled. Prepare ambiguous questions before asking the user. Relay USER-NEED through controller, not worker chat. chat alone is not the backlog.
 
+### In-flight steer mailbox
+
+Steer live bash worker via `scripts/goalflight_dispatch.py steer <id> '<msg>'`; `--list` shows mailbox/acks; worker polls each iteration + before git; ACP inline pending #8.
+
 ## User progress reporting
 
 Distinct from engagement polling and from worker `STATUS:` markers.
@@ -376,6 +380,7 @@ Long worker and review jobs require a ledger/status path. Status contract requir
 
 Workers communicate with one-line markers:
 - `STATUS:`
+- `STEER-ACK:`
 - `RESULT:`
 - `USER-NEED:`
 - `USER-CONFIRM:`
