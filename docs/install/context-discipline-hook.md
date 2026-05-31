@@ -38,3 +38,7 @@ settings.json registration, verify the scope-gate:
 The scope-gate currently matches a goal-flight-repo working directory. Firing
 for goal-flight-on-any-project (via an active-controller session marker) is
 queued as a Wave-A follow-up.
+
+See also `docs/install/session-start-watchdog-hook.md` for the Claude Code
+SessionStart hook that re-arms the in-session Goal Flight watchdog after a
+fresh controller session starts.

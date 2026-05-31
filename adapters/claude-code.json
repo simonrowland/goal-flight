@@ -99,7 +99,7 @@
     "drift_policy": "warn_and_prefer_repo"
   },
   "packaging": {
-    "checked_in_wrappers": [".claude-plugin/plugin.json"],
+    "checked_in_wrappers": [".claude-plugin/plugin.json", "hooks/hooks.json"],
     "generated_outputs": ["dist/claude-code/"],
     "install_actions": [],
     "plugin_manifest": {"supported": true, "path": ".claude-plugin/plugin.json", "api_status": "verified"},

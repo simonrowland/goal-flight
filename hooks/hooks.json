@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/hooks/goalflight-session-start-watchdog.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
