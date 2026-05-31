@@ -182,6 +182,7 @@ Default `./tests/run.sh` stays hermetic and cheap. Set
 which runs `scripts/autoreview.sh --engine claude` against a known-good fixture
 commit through `scripts/autoreview_claude_acp`. Each invocation consumes one
 Claude ACP-sub-billed autoreview pass.
+Set `GOALFLIGHT_ACP_LIVE=1` to include the real codex-acp dispatch smoke.
 
 ## Adapting
 
