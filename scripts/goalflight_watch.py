@@ -11,6 +11,7 @@ import re
 import time
 
 import goalflight_compat
+import goalflight_ledger
 from goalflight_liveness import (
     LivenessThresholds,
     classify_liveness,
@@ -38,23 +39,66 @@ def alive(pid: int | None) -> bool:
     return goalflight_compat.pid_alive(pid)
 
 
+def _identity_token(identity: dict | None) -> dict | None:
+    if not identity:
+        return None
+    return {key: identity.get(key) for key in ("pid", "lstart", "comm") if identity.get(key)}
+
+
+def _load_identity(raw: str | None) -> dict | None:
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def worker_alive(pid: int | None, expected_identity: dict | None) -> tuple[bool, str, dict | None]:
+    if not pid:
+        return False, "no_pid", None
+    current = goalflight_ledger.process_identity(pid)
+    if current is None:
+        return False, "dead", None
+    if expected_identity:
+        if expected_identity.get("pid") and int(expected_identity["pid"]) != int(pid):
+            return False, "identity_pid_mismatch", current
+        missing_expected = [key for key in ("lstart", "comm") if not expected_identity.get(key)]
+        if missing_expected:
+            return True, "identity_inconclusive_missing_expected_" + "_".join(missing_expected), current
+        for key in ("lstart", "comm"):
+            expected = expected_identity.get(key)
+            actual = current.get(key)
+            if not actual:
+                return True, f"identity_inconclusive_missing_current_{key}", current
+            if actual != expected:
+                return False, f"pid_reused_{key}", current
+        return True, "live", current
+    return True, "identity_inconclusive", current
+
+
 def extract_markers(path: Path, max_bytes: int = 10 * 1024 * 1024,
-                    ignore_lines: set[str] | None = None) -> tuple[list[dict], int]:
+                    ignore_prefix_lines: list[str] | None = None) -> tuple[list[dict], int]:
     if not path.exists():
         return [], 0
     size = path.stat().st_size
     start = max(0, size - max_bytes)
+    prompt_prefix = ignore_prefix_lines or []
+    can_ignore_prefix = start == 0 and bool(prompt_prefix)
     markers: list[dict] = []
     with path.open("rb") as f:
         f.seek(start)
         text = f.read().decode(errors="replace")
     for idx, line in enumerate(text.splitlines(), start=1):
         stripped = line.strip()
-        # Skip lines that are verbatim from the echoed prompt: a worker that echoes
-        # its prompt (codex, grok) would otherwise trip the watcher on the prompt's
-        # own "end with COMPLETE: ..." instruction before doing any real work.
-        if ignore_lines and stripped in ignore_lines:
-            continue
+        # Skip only the initial echoed-prompt span. If the worker later emits a
+        # byte-identical real terminal marker, it must still wake the controller.
+        if can_ignore_prefix:
+            expected = prompt_prefix[idx - 1] if idx <= len(prompt_prefix) else None
+            if expected is not None and stripped == expected:
+                continue
+            can_ignore_prefix = False
         match = MARKER_RE.match(stripped)
         if match:
             markers.append({"line": idx, "kind": match.group(1), "text": match.group(2)[:1000]})
@@ -73,17 +117,22 @@ def main() -> int:
     parser.add_argument("--cpu-epsilon", type=float, default=0.1)
     parser.add_argument("--pgid", type=int)
     parser.add_argument("--controller-pid", type=int)
+    parser.add_argument("--worker-identity-json",
+                        help="Process identity token captured at spawn; prevents PID-reuse false liveness.")
     parser.add_argument("--ignore-prompt-file",
                         help="Ignore marker lines appearing verbatim in this prompt file, so a worker's "
                              "echoed prompt can't trip the watcher on its own 'end with COMPLETE:' instruction.")
     args = parser.parse_args()
 
-    ignore_lines: set[str] = set()
+    ignore_prefix_lines: list[str] = []
     if args.ignore_prompt_file:
         _pf = Path(args.ignore_prompt_file)
         if _pf.exists():
-            ignore_lines = {ln.strip() for ln in
-                            _pf.read_text(encoding="utf-8", errors="replace").splitlines() if ln.strip()}
+            ignore_prefix_lines = [
+                ln.strip()
+                for ln in _pf.read_text(encoding="utf-8", errors="replace").splitlines()
+            ]
+    expected_identity = _load_identity(args.worker_identity_json)
 
     tail = Path(args.tail)
     status_path = Path(args.status_json)
@@ -112,27 +161,30 @@ def main() -> int:
     thresholds = LivenessThresholds(idle_timeout_s=args.max_idle_secs, cpu_epsilon_pct=args.cpu_epsilon)
 
     while True:
-        markers, size = extract_markers(tail, ignore_lines=ignore_lines)
+        markers, size = extract_markers(tail, ignore_prefix_lines=ignore_prefix_lines)
         if size != last_size:
             last_size = size
             last_change = time.time()
         now = time.time()
         seconds_since_event = now - last_change
         terminal = next((m for m in reversed(markers) if m["kind"] in TERMINAL_MARKERS), None)
-        worker_alive = alive(args.pid)
-        if worker_alive:
+        worker_is_alive, identity_reason, current_identity = worker_alive(args.pid, expected_identity)
+        if worker_is_alive:
             pgid = args.pgid or process_group_id(args.pid) or pgid
             cpu_pct = pgroup_cpu_pct(pgid)
         else:
             cpu_pct = 0.0
-        liveness_state = classify_liveness(worker_alive, cpu_pct, seconds_since_event, thresholds)
+        liveness_state = classify_liveness(worker_is_alive, cpu_pct, seconds_since_event, thresholds)
         payload = {
             "schema": "goalflight.status.v1",
             "dispatch_id": args.dispatch_id,
             "agent": args.agent,
             "worker_pid": args.pid,
             "pgid": pgid,
-            "worker_alive": worker_alive,
+            "worker_alive": worker_is_alive,
+            "worker_identity_reason": identity_reason,
+            "worker_identity": _identity_token(current_identity),
+            "expected_worker_identity": _identity_token(expected_identity),
             "pgroup_cpu_pct": cpu_pct,
             "seconds_since_event": seconds_since_event,
             "liveness_state": liveness_state,
@@ -155,9 +207,13 @@ def main() -> int:
             exit_code = 3
             write_status(status_path, payload)
             break
-        if not worker_alive:
+        if not worker_is_alive:
             payload["state"] = "worker_dead"
-            exit_reason = "worker_dead_no_terminal_marker"
+            exit_reason = (
+                "worker_dead_no_terminal_marker"
+                if identity_reason == "dead"
+                else f"worker_identity_mismatch:{identity_reason}"
+            )
             exit_code = 1
             write_status(status_path, payload)
             break

@@ -53,6 +53,20 @@ from goalflight_liveness import process_group_id, write_status
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 WATCH_PY = SCRIPT_DIR / "goalflight_watch.py"
+PRESET_AGENTS = {"codex", "grok"}
+STDIN_PROMPT_AGENTS = {"codex", "grok"}
+ACCOUNT_ENGINE_BY_AGENT = {
+    "codex": "codex",
+    "codex-acp": "codex",
+    "grok": "grok",
+    "grok-acp": "grok",
+    "cursor": "cursor",
+    "cursor-agent": "cursor",
+}
+
+
+class DispatchUsageError(Exception):
+    pass
 
 
 def _detached_popen_kwargs() -> dict:
@@ -69,7 +83,7 @@ def _detached_popen_kwargs() -> dict:
 def _resolve_prompt_file(args, base: Path) -> str | None:
     """Normalize --prompt/--prompt-file to a file path (for stdin-fed workers)."""
     if args.prompt_file:
-        return args.prompt_file
+        return str(Path(args.prompt_file).expanduser())
     if args.prompt is not None:
         base.mkdir(parents=True, exist_ok=True)
         pf = base / f"{args.dispatch_id}.prompt"
@@ -82,8 +96,158 @@ def _project_root(args) -> Path:
     return Path(args.cwd).resolve() if args.cwd else Path.cwd().resolve()
 
 
+def _state_dir() -> Path:
+    return Path(
+        os.environ.get("GOALFLIGHT_STATE_DIR", str(goalflight_compat.default_state_dir()))
+    ).expanduser()
+
+
+def _dispatch_base_dir() -> Path:
+    return _state_dir() / "dispatch"
+
+
+def _raw_worker_args(args) -> list[str]:
+    return args.worker[1:] if args.worker and args.worker[0] == "--" else args.worker
+
+
+def _prompt_requested(args) -> bool:
+    return bool(args.prompt_file) or args.prompt is not None
+
+
+def _validate_before_side_effects(args, raw_argv: list[str]) -> None:
+    if raw_argv:
+        return
+    if args.agent not in PRESET_AGENTS:
+        raise DispatchUsageError(
+            "no worker preset for --agent "
+            f"{args.agent!r} — use --agent codex|grok with --prompt/--prompt-file, "
+            "or pass a raw worker after `-- <cmd...>`"
+        )
+    if args.agent in STDIN_PROMPT_AGENTS and not _prompt_requested(args):
+        raise DispatchUsageError(
+            f"--agent {args.agent} requires --prompt or --prompt-file; refusing to feed empty stdin"
+        )
+    if args.prompt_file and not Path(args.prompt_file).expanduser().exists():
+        raise DispatchUsageError(f"prompt file not found: {args.prompt_file}")
+
+
+def _default_dispatch_id(agent: str) -> str:
+    return os.environ.get("GOALFLIGHT_DISPATCH_ID_SEED") or f"{agent}-{os.getpid()}-{int(time.time())}"
+
+
+def _reserve_auto_dispatch_id(agent: str, base: Path) -> str:
+    stem = _default_dispatch_id(agent)
+    ids_dir = base / ".dispatch-ids"
+    ids_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    for attempt in range(1000):
+        dispatch_id = stem if attempt == 0 else f"{stem}-{attempt + 1}"
+        lock_path = ids_dir / f"{dispatch_id}.json"
+        try:
+            fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            continue
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(
+                {
+                    "dispatch_id": dispatch_id,
+                    "agent": agent,
+                    "reserved_at": int(time.time()),
+                    "pid": os.getpid(),
+                },
+                fh,
+                sort_keys=True,
+            )
+            fh.write("\n")
+        return dispatch_id
+    raise DispatchUsageError(f"could not reserve a dispatch id for stem {stem!r}")
+
+
 def _controller_pid(args) -> int:
     return int(args.controller_pid or os.getpid())
+
+
+def _account_engine(agent: str) -> str | None:
+    return ACCOUNT_ENGINE_BY_AGENT.get(agent)
+
+
+def _account_home(account: str, engine: str) -> Path:
+    return Path.home() / ".goal-flight" / "accounts" / account / engine
+
+
+def _apply_home_env(env: dict[str, str], home: Path) -> None:
+    env["HOME"] = str(home)
+    env["XDG_CONFIG_HOME"] = str(home / ".config")
+    env["XDG_STATE_HOME"] = str(home / ".local" / "state")
+    env["XDG_DATA_HOME"] = str(home / ".local" / "share")
+
+
+def _cursor_account_probe(env: dict[str, str]) -> tuple[bool, str | None]:
+    try:
+        proc = subprocess.run(
+            ["cursor-agent", "status"],
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=10,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, str(exc)
+    combined = f"{proc.stdout}\n{proc.stderr}".strip()
+    negative = ("not logged in", "not authenticated", "login required", "please log in")
+    positive = ("logged in", "login successful")
+    lowered = combined.lower()
+    if proc.returncode == 0 and any(term in lowered for term in positive) and not any(term in lowered for term in negative):
+        return True, None
+    return False, combined[-400:] or f"cursor-agent status exited {proc.returncode}"
+
+
+def _resolve_account_env(args) -> dict[str, str]:
+    if not args.account:
+        return {}
+    engine = _account_engine(args.agent)
+    if not engine:
+        raise DispatchUsageError(
+            f"--account is not configured for --agent {args.agent!r}; refusing to bill the wrong account"
+        )
+    home = _account_home(args.account, engine)
+    if engine == "codex":
+        if not home.exists():
+            raise DispatchUsageError(
+                f"--account {args.account} not configured (expected {home}). "
+                "Set that account's creds there, or omit --account for the host default. "
+                "Refusing to bill the wrong account."
+            )
+        return {"CODEX_HOME": str(home)}
+    if not home.exists():
+        raise DispatchUsageError(
+            f"--account {args.account} not configured for {engine} (expected HOME {home}). "
+            "Refusing to bill the wrong account."
+        )
+    env = dict(os.environ)
+    _apply_home_env(env, home)
+    if engine == "grok":
+        env.pop("GROK_API_KEY", None)
+        env.pop("XAI_API_KEY", None)
+        auth = home / ".grok" / "auth.json"
+        if not auth.is_file() or auth.stat().st_size == 0:
+            raise DispatchUsageError(
+                f"--account {args.account} lacks grok creds (expected non-empty {auth}). "
+                "Refusing to bill the wrong account."
+            )
+        return {key: env[key] for key in ("HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME")}
+    if engine == "cursor":
+        env.pop("CURSOR_API_KEY", None)
+        ok, reason = _cursor_account_probe(env)
+        if not ok:
+            raise DispatchUsageError(
+                f"--account {args.account} lacks cursor creds ({reason}). "
+                "Refusing to bill the wrong account."
+            )
+        return {key: env[key] for key in ("HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME")}
+    raise DispatchUsageError(f"--account unsupported for engine {engine!r}")
 
 
 def _acquire_capacity(args, *, project_root: Path, status_json: Path) -> str | None:
@@ -178,7 +342,13 @@ def _pidfile_dir() -> Path:
     )
 
 
-def _write_pidfile(args, *, worker_pid: int, pgid: int | None) -> Path | None:
+def _identity_token(identity: dict | None) -> dict | None:
+    if not identity:
+        return None
+    return {key: identity.get(key) for key in ("pid", "lstart", "comm") if identity.get(key)}
+
+
+def _process_identity_after_spawn(worker_pid: int) -> dict | None:
     ident = None
     for _ in range(20):
         current = goalflight_ledger.process_identity(worker_pid)
@@ -187,6 +357,11 @@ def _write_pidfile(args, *, worker_pid: int, pgid: int | None) -> Path | None:
         if current and current.get("lstart") and current.get("comm"):
             break
         time.sleep(0.05)
+    return ident
+
+
+def _write_pidfile(args, *, worker_pid: int, pgid: int | None, identity: dict | None = None) -> Path | None:
+    ident = identity or _process_identity_after_spawn(worker_pid)
     if not ident:
         return None
     pidfile_dir = _pidfile_dir()
@@ -248,10 +423,7 @@ def build_worker(args, prompt_path, raw_argv: list[str]):
     if args.agent == "grok":
         # Read the prompt from a FILE, not argv `-p` — long goal-flight prompts
         # (5-20KB) would hit E2BIG / argv truncation (grok review #5).
-        if prompt_path:
-            argv = ["grok", "--prompt-file", str(prompt_path), "--permission-mode", "acceptEdits"]
-        else:
-            argv = ["grok", "-p", args.prompt or "", "--permission-mode", "acceptEdits"]
+        argv = ["grok", "--prompt-file", str(prompt_path), "--permission-mode", "acceptEdits"]
         if args.cwd:
             argv += ["--cwd", args.cwd]
         return argv, None
@@ -271,9 +443,9 @@ def main() -> int:
                         help="Read-only sandbox (review/analysis dispatches)")
     parser.add_argument("--account",
                         help="Which subscription account/profile to bill the worker to (shared remote "
-                             "worker pools, e.g. several people's codex Pro on one Mac Studio). Resolves "
-                             "to CODEX_HOME=~/.goal-flight/accounts/<name>/codex. Default: the host's "
-                             "logged-in account.")
+                             "worker pools). Codex resolves to CODEX_HOME=~/.goal-flight/accounts/<name>/codex; "
+                             "grok/cursor resolve to HOME=~/.goal-flight/accounts/<name>/<engine>. "
+                             "Default: the host's logged-in account.")
     parser.add_argument("--billing", choices=["sub", "api"], default="sub",
                         help="ALWAYS 'sub' (subscription) in normal use — the default; 'sub' strips "
                              "OPENAI_API_KEY so codex uses the selected account's Pro plan, never the API. "
@@ -292,6 +464,7 @@ def main() -> int:
     parser.add_argument("worker", nargs=argparse.REMAINDER,
                         help="Optional `-- <cmd...>` raw worker (overrides the preset)")
     args = parser.parse_args()
+    raw = _raw_worker_args(args)
 
     # Resolve comms shape. 'auto' = best per engine; 'acp' unification is not wired
     # here yet, so fail honestly rather than silently doing bash.
@@ -304,13 +477,24 @@ def main() -> int:
               file=sys.stderr)
         return 64
 
+    try:
+        _validate_before_side_effects(args, raw)
+        account_env = _resolve_account_env(args)
+    except DispatchUsageError as e:
+        print(f"goalflight_dispatch: {e}", file=sys.stderr)
+        return 64
+
     # Auto-derive id + paths so the common call is one line.
-    args.dispatch_id = args.dispatch_id or f"{args.agent}-{os.getpid()}-{int(time.time())}"
-    base = goalflight_compat.default_state_dir() / "dispatch"
+    base = _dispatch_base_dir()
+    if not args.dispatch_id:
+        try:
+            args.dispatch_id = _reserve_auto_dispatch_id(args.agent, base)
+        except DispatchUsageError as e:
+            print(f"goalflight_dispatch: {e}", file=sys.stderr)
+            return 64
     tail = Path(args.tail) if args.tail else base / f"{args.dispatch_id}.tail"
     status_json = Path(args.status_json) if args.status_json else base / f"{args.dispatch_id}.status.json"
 
-    raw = args.worker[1:] if args.worker and args.worker[0] == "--" else args.worker
     prompt_path = None if raw else _resolve_prompt_file(args, base)
     worker_argv, stdin_path = build_worker(args, prompt_path, raw)
     if not worker_argv:
@@ -352,21 +536,16 @@ def main() -> int:
         ledger_recorded = True
 
         # 1. Launch the worker DETACHED, output -> tail (prompt -> stdin for codex).
-        # Account + billing -> worker environment. Account selects which subscription
-        # (CODEX_HOME) for shared pools; billing stays 'sub' (strip OPENAI_API_KEY) by
-        # default so codex uses that account's Pro plan, not the API.
+        # Account guards ran before prompt/id/lease side effects; only apply the
+        # resolved environment here.
         env = dict(os.environ)
-        if args.account:
-            codex_home = Path.home() / ".goal-flight" / "accounts" / args.account / "codex"
-            if not codex_home.exists():
-                final_state = "blocked_auth"
-                final_reason = f"missing account CODEX_HOME: {codex_home}"
-                print(f"goalflight_dispatch: --account {args.account} not configured (expected "
-                      f"{codex_home}). Set that account's creds there, or omit --account for the host "
-                      f"default. Refusing to bill the wrong account.", file=sys.stderr)
-                return 64
-            env["CODEX_HOME"] = str(codex_home)
-        if args.billing == "sub" and args.agent == "codex":
+        env.update(account_env)
+        if args.account and _account_engine(args.agent) == "grok":
+            env.pop("GROK_API_KEY", None)
+            env.pop("XAI_API_KEY", None)
+        if args.account and _account_engine(args.agent) == "cursor":
+            env.pop("CURSOR_API_KEY", None)
+        if args.billing == "sub" and _account_engine(args.agent) == "codex":
             env.pop("OPENAI_API_KEY", None)  # subscription billing for the selected account, not the API
 
         stdin_f = open(stdin_path, "rb") if stdin_path else subprocess.DEVNULL
@@ -398,6 +577,13 @@ def main() -> int:
         except Exception as e:
             registration_errors.append(_registration_error("start_reaper", e))
 
+        worker_identity = None
+        try:
+            worker_identity = _process_identity_after_spawn(worker_pid)
+        except Exception as e:
+            registration_errors.append(_registration_error("process_identity", e))
+        worker_identity_token = _identity_token(worker_identity)
+
         pgid = worker_pid
         try:
             pgid = process_group_id(worker_pid) or worker_pid
@@ -408,7 +594,7 @@ def main() -> int:
         except Exception as e:
             registration_errors.append(_registration_error("attach_worker_to_lease", e))
         try:
-            pidfile = _write_pidfile(args, worker_pid=worker_pid, pgid=pgid)
+            pidfile = _write_pidfile(args, worker_pid=worker_pid, pgid=pgid, identity=worker_identity)
         except Exception as e:
             registration_errors.append(_registration_error("write_pidfile", e))
             pidfile = None
@@ -426,7 +612,7 @@ def main() -> int:
         except Exception as e:
             registration_errors.append(_registration_error("record_ledger_running", e))
 
-        summary_head.update({"worker_pid": worker_pid})
+        summary_head.update({"worker_pid": worker_pid, "worker_identity": worker_identity_token})
         if registration_errors:
             summary_head["registration_errors"] = registration_errors
             with contextlib.suppress(Exception):
@@ -448,6 +634,13 @@ def main() -> int:
             "--max-idle-secs", str(args.max_idle_secs),
             "--dispatch-id", args.dispatch_id,
         ]
+        watch_identity_token = (
+            worker_identity_token
+            if worker_identity_token and worker_identity_token.get("lstart") and worker_identity_token.get("comm")
+            else None
+        )
+        if watch_identity_token:
+            watch_cmd += ["--worker-identity-json", json.dumps(watch_identity_token, sort_keys=True)]
         if args.controller_pid:
             watch_cmd += ["--controller-pid", str(args.controller_pid)]
         if prompt_path:

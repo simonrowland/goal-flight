@@ -152,6 +152,13 @@ def _worker_pid_from_stdout(stdout: str) -> int | None:
     return None
 
 
+def _dispatch_end(stdout: str) -> dict:
+    for line in stdout.splitlines():
+        if line.startswith("DISPATCH-END "):
+            return json.loads(line.split(" ", 1)[1])
+    raise AssertionError(f"missing DISPATCH-END in stdout:\n{stdout}")
+
+
 def _assert_terminal_record_and_lease(env: dict[str, str], dispatch_id: str, state: str) -> None:
     payload = _status(env)
     row = _record(payload, dispatch_id)
@@ -337,6 +344,224 @@ def case_capacity_block_does_not_spawn() -> None:
         assert json.loads(status_path.read_text())["state"] == "blocked_capacity"
 
 
+def case_require_prompt_before_side_effects() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        env = _env(tmp)
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(DISPATCH),
+                "--agent",
+                "codex",
+            ],
+            cwd=ROOT,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert proc.returncode == 64, f"expected usage rc=64; stdout={proc.stdout} stderr={proc.stderr}"
+        assert "requires --prompt or --prompt-file" in proc.stderr, proc.stderr
+        assert not (tmp / "state").exists(), "prompt/id/lease side effects happened before prompt guard"
+
+
+def case_account_guard_before_prompt_materialization() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        env = _env(tmp)
+        missing = f"missing-account-{os.getpid()}"
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(DISPATCH),
+                "--agent",
+                "codex",
+                "--account",
+                missing,
+                "--prompt",
+                "COMPLETE: should not materialize",
+            ],
+            cwd=ROOT,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert proc.returncode == 64, f"expected usage rc=64; stdout={proc.stdout} stderr={proc.stderr}"
+        assert "Refusing to bill the wrong account" in proc.stderr, proc.stderr
+        assert not (tmp / "state").exists(), "prompt/id/lease side effects happened before account guard"
+
+
+def case_codex_routed_subscription_strips_openai_api_key() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        env = _env(tmp)
+        env["OPENAI_API_KEY"] = "must-not-leak"
+
+        for agent in ("codex", "codex-acp"):
+            dispatch_id = f"billing-strip-{agent}"
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(DISPATCH),
+                    "--agent",
+                    agent,
+                    "--dispatch-id",
+                    dispatch_id,
+                    "--tail",
+                    str(tmp / f"{dispatch_id}.tail"),
+                    "--status-json",
+                    str(tmp / f"{dispatch_id}.status.json"),
+                    "--poll-secs",
+                    "0.1",
+                    "--max-idle-secs",
+                    "5",
+                    "--billing",
+                    "sub",
+                    "--",
+                    sys.executable,
+                    "-c",
+                    (
+                        "import os; "
+                        "print(('BLOCKED' if os.environ.get('OPENAI_API_KEY') else 'COMPLETE') "
+                        "+ ': openai env', flush=True)"
+                    ),
+                ],
+                cwd=ROOT,
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=10,
+            )
+            assert proc.returncode == 0, f"{agent} leaked OPENAI_API_KEY or failed\nstdout={proc.stdout}\nstderr={proc.stderr}"
+            assert json.loads((tmp / f"{dispatch_id}.status.json").read_text())["state"] == "complete"
+
+
+def case_state_dir_auto_paths() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        env = _env(tmp)
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(DISPATCH),
+                "--agent",
+                "test-dispatch",
+                "--poll-secs",
+                "0.1",
+                "--max-idle-secs",
+                "5",
+                "--",
+                sys.executable,
+                "-c",
+                "print('COMPLETE: state-dir', flush=True)",
+            ],
+            cwd=ROOT,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+        )
+        assert proc.returncode == 0, f"dispatch rc={proc.returncode}\nstdout={proc.stdout}\nstderr={proc.stderr}"
+        end = _dispatch_end(proc.stdout)
+        dispatch_dir = tmp / "state" / "dispatch"
+        assert str(dispatch_dir) in end["tail"], end
+        assert str(dispatch_dir) in end["status_json"], end
+        assert Path(end["tail"]).exists(), end
+        assert Path(end["status_json"]).exists(), end
+
+
+def case_dispatch_end_worker_still_alive_flags() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        env = _env(tmp)
+        alive_proc = _run_dispatch(
+            tmp,
+            env,
+            "worker-still-alive-true",
+            "import time; print('COMPLETE: stays alive', flush=True); time.sleep(5)",
+            poll_secs="0.1",
+            max_idle_secs="10",
+            timeout_s=10,
+        )
+        alive_end = _dispatch_end(alive_proc.stdout)
+        try:
+            assert alive_proc.returncode == 0, alive_proc
+            assert alive_end.get("worker_still_alive") is True, alive_end
+        finally:
+            _kill_if_alive(alive_end.get("worker_pid"))
+
+        dead_proc = _run_dispatch(
+            tmp,
+            env,
+            "worker-still-alive-false",
+            "print('COMPLETE: exits', flush=True)",
+            poll_secs="0.2",
+            max_idle_secs="10",
+            timeout_s=10,
+        )
+        dead_end = _dispatch_end(dead_proc.stdout)
+        assert dead_proc.returncode == 0, dead_proc
+        assert dead_end.get("worker_still_alive") is False, dead_end
+
+
+def case_dispatch_id_collision_suffix() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        env = _env(tmp)
+        env["GOALFLIGHT_DISPATCH_ID_SEED"] = "collision-id"
+        env["GOALFLIGHT_CAPACITY_MAX_TOTAL"] = "2"
+
+        def start_once() -> subprocess.Popen[str]:
+            return subprocess.Popen(
+                [
+                    sys.executable,
+                    str(DISPATCH),
+                    "--agent",
+                    "test-dispatch",
+                    "--poll-secs",
+                    "0.1",
+                    "--max-idle-secs",
+                    "5",
+                    "--",
+                    sys.executable,
+                    "-c",
+                    "print('COMPLETE: collision', flush=True)",
+                ],
+                cwd=ROOT,
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+
+        procs = [start_once(), start_once()]
+        completed = []
+        for proc in procs:
+            stdout, stderr = proc.communicate(timeout=10)
+            assert proc.returncode in {0, 2}, f"dispatch rc={proc.returncode}\nstdout={stdout}\nstderr={stderr}"
+            if proc.returncode == 0:
+                completed.append(_dispatch_end(stdout))
+            else:
+                assert stdout.startswith("DISPATCH-BLOCKED "), stdout
+
+        id_locks = sorted((tmp / "state" / "dispatch" / ".dispatch-ids").glob("*.json"))
+        ids = {json.loads(path.read_text(encoding="utf-8"))["dispatch_id"] for path in id_locks}
+        assert ids == {"collision-id", "collision-id-2"}, completed
+        dispatch_dir = tmp / "state" / "dispatch"
+        tail_paths = {str(dispatch_dir / f"{dispatch_id}.tail") for dispatch_id in ids}
+        status_paths = {str(dispatch_dir / f"{dispatch_id}.status.json") for dispatch_id in ids}
+        assert len(tail_paths) == 2, tail_paths
+        assert len(status_paths) == 2, status_paths
+        assert all(Path(path).exists() for path in status_paths), status_paths
+        if len(completed) == 2:
+            assert {item["tail"] for item in completed} == tail_paths, completed
+            assert {item["status_json"] for item in completed} == status_paths, completed
+
+
 def case_worker_dead_state_releases_and_classifies_terminal() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
@@ -428,6 +653,12 @@ def main() -> None:
     case_status_sees_dispatch_and_lease_releases()
     case_live_controller_pidfile_preserves_blocked_worker_for_reattach()
     case_capacity_block_does_not_spawn()
+    case_require_prompt_before_side_effects()
+    case_account_guard_before_prompt_materialization()
+    case_codex_routed_subscription_strips_openai_api_key()
+    case_state_dir_auto_paths()
+    case_dispatch_end_worker_still_alive_flags()
+    case_dispatch_id_collision_suffix()
     case_worker_dead_state_releases_and_classifies_terminal()
     case_idle_timeout_state_releases_and_classifies_terminal()
     case_watcher_failure_releases_as_failed()
