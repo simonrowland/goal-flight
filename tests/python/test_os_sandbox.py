@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -20,6 +21,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import goalflight_acp_run  # noqa: E402
 import goalflight_adapter_readiness  # noqa: E402
+import goalflight_dispatch  # noqa: E402
 import goalflight_os_sandbox as goalflight_os_sandbox_mod  # noqa: E402
 from goalflight_acp_client import AcpError, AcpProcessPool  # noqa: E402
 from goalflight_os_sandbox import (  # noqa: E402
@@ -37,7 +39,19 @@ FAKE = ROOT / "tests/fixtures/acp_fake_agent.py"
 
 
 def _sandbox_available() -> bool:
-    return platform.system() == "Darwin" and shutil.which("sandbox-exec") is not None
+    if platform.system() != "Darwin" or shutil.which("sandbox-exec") is None:
+        return False
+    try:
+        result = subprocess.run(
+            ["sandbox-exec", "-p", "(version 1)\n(allow default)", "/usr/bin/true"],
+            text=True,
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
 
 
 def _write_supported_adapter_manifest(directory: Path, name: str) -> None:
@@ -111,6 +125,159 @@ def case_requested_sandbox_fails_closed_on_unsupported_hosts() -> None:
     finally:
         goalflight_os_sandbox_mod.platform.system = old_system
         goalflight_os_sandbox_mod.shutil.which = old_which
+
+
+def case_adapter_os_sandbox_is_platform_scoped() -> None:
+    old_system = goalflight_os_sandbox_mod.platform.system
+    old_adapters_dir = goalflight_adapter_readiness.ADAPTERS_DIR
+    try:
+        with tempfile.TemporaryDirectory(prefix="gf-os-sandbox-platform-") as tmp:
+            tmp_path = Path(tmp)
+            goalflight_adapter_readiness.ADAPTERS_DIR = tmp_path
+            _write_supported_adapter_manifest(tmp_path, "fake-sandbox")
+            manifest = json.loads((tmp_path / "fake-sandbox.json").read_text())
+            manifest["permission_surface"]["os_sandbox"]["platform_supported_profiles"] = {
+                "darwin": ["off", "read-only", "workspace-write"],
+                "linux": ["off"],
+                "wsl": ["off"],
+                "windows": ["off"],
+            }
+            (tmp_path / "fake-sandbox.json").write_text(json.dumps(manifest))
+
+            goalflight_os_sandbox_mod.platform.system = lambda: "Linux"
+            blocked = goalflight_adapter_readiness.validate_os_sandbox_request(
+                "fake-sandbox", OS_SANDBOX_READ_ONLY
+            )
+            assert blocked is not None
+            assert blocked["reason"] == "os_sandbox_platform_unsupported", blocked
+            assert blocked["supported_profiles"] == ["off"], blocked
+
+            goalflight_os_sandbox_mod.platform.system = lambda: "Darwin"
+            assert goalflight_adapter_readiness.validate_os_sandbox_request(
+                "fake-sandbox", OS_SANDBOX_READ_ONLY
+            ) is None
+    finally:
+        goalflight_os_sandbox_mod.platform.system = old_system
+        goalflight_adapter_readiness.ADAPTERS_DIR = old_adapters_dir
+
+
+def case_repo_runner_sandbox_adapters_are_platform_scoped() -> None:
+    expected = {
+        "darwin": ["off", "read-only", "workspace-write"],
+        "linux": ["off"],
+        "wsl": ["off"],
+        "windows": ["off"],
+    }
+    for path in sorted((ROOT / "adapters").glob("*.json")):
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        os_sandbox = manifest.get("permission_surface", {}).get("os_sandbox", {})
+        if os_sandbox.get("implementation") != "runner:sandbox-exec":
+            continue
+        if os_sandbox.get("supported_profiles") == ["off"]:
+            continue
+        assert os_sandbox.get("platform_supported_profiles") == expected, path.name
+
+
+def case_dispatch_acp_cfg_disables_os_sandbox_off_darwin() -> None:
+    old_is_macos = goalflight_dispatch.goalflight_compat.is_macos
+    args = argparse.Namespace(
+        agent="codex-acp",
+        cwd=str(ROOT),
+        prompt_file=None,
+        prompt="probe",
+        dispatch_id="linux-sandbox-off",
+        read_only=True,
+        permission_mode="auto",
+        max_idle_secs=30.0,
+        poll_secs=0.2,
+    )
+    try:
+        goalflight_dispatch.goalflight_compat.is_macos = lambda: False
+        linux_cfg = goalflight_dispatch._build_acp_cfg(args, status_json=ROOT / "status.json")
+        assert linux_cfg.os_sandbox == OS_SANDBOX_OFF
+
+        goalflight_dispatch.goalflight_compat.is_macos = lambda: True
+        darwin_cfg = goalflight_dispatch._build_acp_cfg(args, status_json=ROOT / "status.json")
+        assert darwin_cfg.os_sandbox == OS_SANDBOX_READ_ONLY
+    finally:
+        goalflight_dispatch.goalflight_compat.is_macos = old_is_macos
+
+
+def _dispatch_shell_argv_for_platform(system_name: str) -> list[str]:
+    run_dir: Path | None = None
+    with tempfile.TemporaryDirectory(prefix="gf-dispatch-wrapper-") as tmp:
+        tmp_path = Path(tmp)
+        prompt = tmp_path / "prompt.md"
+        prompt.write_text("STATUS: probe\n", encoding="utf-8")
+        argv_path = tmp_path / "argv.txt"
+        fakebin = tmp_path / "bin"
+        fakebin.mkdir()
+        uname = fakebin / "uname"
+        uname.write_text(
+            "#!/usr/bin/env sh\nprintf '%s\\n' \"$GF_FAKE_UNAME\"\n",
+            encoding="utf-8",
+        )
+        fake_python = fakebin / "python3"
+        fake_python.write_text(
+            "#!/usr/bin/env sh\nprintf '%s\\n' \"$@\" > \"$GF_ARGV_OUT\"\n",
+            encoding="utf-8",
+        )
+        uname.chmod(0o755)
+        fake_python.chmod(0o755)
+        env = os.environ.copy()
+        env["PATH"] = f"{fakebin}{os.pathsep}{env.get('PATH', '')}"
+        env["GF_FAKE_UNAME"] = system_name
+        env["GF_ARGV_OUT"] = str(argv_path)
+        try:
+            result = subprocess.run(
+                [
+                    "bash",
+                    str(ROOT / "scripts" / "goalflight_dispatch.sh"),
+                    str(prompt),
+                    "--slug",
+                    f"wrapper-{system_name.lower()}",
+                ],
+                cwd=str(ROOT),
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+            for line in result.stdout.splitlines():
+                if line.startswith("status-path: "):
+                    run_dir = Path(line.split(": ", 1)[1]).parent
+                    break
+            assert result.returncode == 0, result.stderr
+            for _ in range(100):
+                if argv_path.exists():
+                    return argv_path.read_text(encoding="utf-8").splitlines()
+                time.sleep(0.02)
+            raise AssertionError(f"fake python did not capture argv: {result}")
+        finally:
+            if run_dir is not None:
+                shutil.rmtree(run_dir, ignore_errors=True)
+
+
+def case_shell_wrapper_guards_os_sandbox_to_darwin() -> None:
+    text = (ROOT / "scripts" / "goalflight_dispatch.sh").read_text(encoding="utf-8")
+    assert "os_sandbox_args=()" in text
+    assert "permission_allow_args=()" in text
+    assert 'uname -s' in text
+    assert 'os_sandbox_args=(--os-sandbox workspace-write)' in text
+    assert "permission_allow_args=(--permission-allow-tool-title-pattern '.*')" in text
+    assert '${os_sandbox_args[@]+"${os_sandbox_args[@]}"}' in text
+    assert '${permission_allow_args[@]+"${permission_allow_args[@]}"}' in text
+
+    linux_argv = _dispatch_shell_argv_for_platform("Linux")
+    assert "--os-sandbox" not in linux_argv, linux_argv
+    assert "--permission-allow-tool-title-pattern" not in linux_argv, linux_argv
+
+    darwin_argv = _dispatch_shell_argv_for_platform("Darwin")
+    assert "--os-sandbox" in darwin_argv, darwin_argv
+    assert "workspace-write" in darwin_argv, darwin_argv
+    assert "--permission-allow-tool-title-pattern" in darwin_argv, darwin_argv
+    assert ".*" in darwin_argv, darwin_argv
 
 
 def case_prepare_wrapper_blocks_home_write() -> None:
@@ -633,6 +800,10 @@ def case_pool_blocks_alias_undeclared_os_sandbox() -> None:
 def main() -> None:
     case_canonical_profiles()
     case_requested_sandbox_fails_closed_on_unsupported_hosts()
+    case_adapter_os_sandbox_is_platform_scoped()
+    case_repo_runner_sandbox_adapters_are_platform_scoped()
+    case_dispatch_acp_cfg_disables_os_sandbox_off_darwin()
+    case_shell_wrapper_guards_os_sandbox_to_darwin()
     case_prepare_wrapper_blocks_home_write()
     case_profile_string_escapes_workspace_path()
     case_profile_grants_dev_null_write()

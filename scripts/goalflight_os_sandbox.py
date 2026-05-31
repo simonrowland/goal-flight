@@ -35,6 +35,29 @@ class OsSandboxError(RuntimeError):
     """Raised when a requested OS sandbox cannot be enforced."""
 
 
+def os_sandbox_platform_key() -> str:
+    system = platform.system()
+    if goalflight_compat.is_windows() or system == "Windows":
+        return "windows"
+    if goalflight_compat.is_wsl():
+        return "wsl"
+    if system == "Darwin":
+        return "darwin"
+    if system == "Linux":
+        return "linux"
+    return (system or "unknown").lower()
+
+
+def platform_supported_os_sandbox_profiles() -> list[str]:
+    if os_sandbox_platform_key() == "darwin":
+        return [OS_SANDBOX_OFF, OS_SANDBOX_READ_ONLY, OS_SANDBOX_WORKSPACE_WRITE]
+    return [OS_SANDBOX_OFF]
+
+
+def os_sandbox_available() -> bool:
+    return os_sandbox_platform_key() == "darwin" and shutil.which("sandbox-exec") is not None
+
+
 @dataclass(frozen=True)
 class PreparedOsSandboxCommand:
     command: str
@@ -81,7 +104,7 @@ def preflight_os_sandbox(value: str | None) -> str:
         return profile
     if goalflight_compat.is_windows():
         raise OsSandboxError(goalflight_compat.windows_os_sandbox_refusal())
-    if platform.system() != "Darwin":
+    if profile not in platform_supported_os_sandbox_profiles():
         raise OsSandboxError(
             f"os sandbox profile {profile!r} requires macOS sandbox-exec; "
             f"platform={platform.system() or 'unknown'}"

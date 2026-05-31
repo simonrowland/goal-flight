@@ -170,6 +170,10 @@ def test_ledger_record_finish_status() -> None:
 def test_doctor_json_shape() -> None:
     payload = goalflight_doctor.doctor(ROOT)
     assert_true("doctor schema", payload["schema"] == "goalflight.doctor.v1")
+    assert_true("platform section", "platform" in payload)
+    for key in ("is_macos", "is_linux", "os_sandbox_available"):
+        assert_true(f"platform.{key} present", key in payload["platform"])
+    assert_true("wsl_filesystems section", "wsl_filesystems" in payload)
     assert_true("plugin section", "plugin" in payload and "manifest_exists" in payload["plugin"])
     assert_true("host install section", "host_goalflight_install" in payload)
     assert_true("codex host install probe", "codex" in payload["host_goalflight_install"])

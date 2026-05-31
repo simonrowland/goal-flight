@@ -704,7 +704,7 @@ def _build_acp_cfg(args, *, status_json: Path):
 
     project_root = _project_root(args)
     prompt_path = str(Path(args.prompt_file).expanduser()) if args.prompt_file else None
-    os_sandbox = "read-only" if args.read_only else OS_SANDBOX_OFF
+    os_sandbox = "read-only" if args.read_only and goalflight_compat.is_macos() else OS_SANDBOX_OFF
     cfg = argparse.Namespace(
         agent=args.agent,
         install_slot=None,

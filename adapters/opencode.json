@@ -91,6 +91,12 @@
       "supported_profiles": ["off", "read-only", "workspace-write"],
       "default_profile": "off",
       "implementation": "runner:sandbox-exec",
+      "platform_supported_profiles": {
+        "darwin": ["off", "read-only", "workspace-write"],
+        "linux": ["off"],
+        "wsl": ["off"],
+        "windows": ["off"]
+      },
       "notes": "Dispatch-level worker subprocess wrapper; not an opencode CLI flag."
     },
     "auto_approve_detection": {"probes": ["opencode-args-scan"], "strict_fail": true},

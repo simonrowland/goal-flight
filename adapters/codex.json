@@ -136,6 +136,12 @@
       "supported_profiles": ["off", "read-only", "workspace-write"],
       "default_profile": "off",
       "implementation": "runner:sandbox-exec",
+      "platform_supported_profiles": {
+        "darwin": ["off", "read-only", "workspace-write"],
+        "linux": ["off"],
+        "wsl": ["off"],
+        "windows": ["off"]
+      },
       "notes": "Dispatch-level worker subprocess wrapper. This permits temp and Codex host-state writes while fencing project writes by profile; separate from Codex approval policy and ACP permission escalation."
     },
     "auto_approve_detection": {

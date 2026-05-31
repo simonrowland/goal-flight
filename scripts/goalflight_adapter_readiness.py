@@ -11,7 +11,11 @@ import subprocess
 from typing import Any
 
 from goalflight_adapter_gate import validate_adapter_gate
-from goalflight_os_sandbox import OS_SANDBOX_OFF
+from goalflight_os_sandbox import (
+    OS_SANDBOX_OFF,
+    os_sandbox_platform_key,
+    platform_supported_os_sandbox_profiles,
+)
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -159,6 +163,8 @@ def validate_acp_dispatch_readiness(agent: str, argv: list[str]) -> dict[str, An
 def validate_os_sandbox_request(agent: str, profile: str | None) -> dict[str, Any] | None:
     if profile in {None, OS_SANDBOX_OFF}:
         return None
+    platform_key = os_sandbox_platform_key()
+    platform_supported = platform_supported_os_sandbox_profiles()
     manifest = load_manifest(agent) or {}
     os_spec = ((manifest.get("permission_surface") or {}).get("os_sandbox") or {})
     if not isinstance(os_spec, dict):
@@ -176,5 +182,28 @@ def validate_os_sandbox_request(agent: str, profile: str | None) -> dict[str, An
             "profile": profile,
             "supported_profiles": supported if isinstance(supported, list) else [],
             "safe_next_action": "select_supported_os_sandbox_profile",
+        }
+    platform_scoped = os_spec.get("platform_supported_profiles")
+    if isinstance(platform_scoped, dict):
+        scoped_supported = platform_scoped.get(platform_key)
+        if scoped_supported is None and platform_key == "wsl":
+            scoped_supported = platform_scoped.get("linux")
+        if not isinstance(scoped_supported, list) or profile not in scoped_supported:
+            return {
+                "allowed": False,
+                "reason": "os_sandbox_platform_unsupported",
+                "profile": profile,
+                "platform": platform_key,
+                "supported_profiles": scoped_supported if isinstance(scoped_supported, list) else [],
+                "safe_next_action": "use_os_sandbox_off_on_this_platform",
+            }
+    if profile not in platform_supported:
+        return {
+            "allowed": False,
+            "reason": "os_sandbox_platform_unsupported",
+            "profile": profile,
+            "platform": platform_key,
+            "supported_profiles": platform_supported,
+            "safe_next_action": "use_os_sandbox_off_on_this_platform",
         }
     return None

@@ -108,6 +108,13 @@ cd "$HOME/.goal-flight"
 python${GOALFLIGHT_PYTHON_MAJOR:-3} scripts/goalflight_doctor.py --project-root /path/to/project --text
 ```
 
+Keep the WSL checkout, target project, `GOALFLIGHT_STATE_DIR`, fleet directory,
+and dispatch `worktrees/` on the WSL-native filesystem, such as under `$HOME`.
+Do not dispatch from `/mnt/<drive>`; DrvFs can make POSIX `flock` unreliable.
+Build the ACP virtualenv inside WSL with Linux `python3` and use
+`$HOME/.goal-flight/venvs/acp-0.10/bin/python`. Never share a Windows checkout
+or `Scripts/python.exe` virtualenv with the WSL dispatch install.
+
 ## Capability Matrix
 
 | Capability | Native Windows | WSL |
@@ -142,9 +149,11 @@ GOALFLIGHT_WSL=1 tests/bash/test-wsl-dispatch-smoke.sh
 
 ## OS Sandbox
 
-`--os-sandbox` is macOS-only because it depends on `sandbox-exec`. On Windows,
-use dispatch worktree isolation plus the worker's own `--sandbox`. Drop
-`--os-sandbox` to proceed, or use WSL for the dispatch.
+`--os-sandbox` is macOS-only because it depends on `sandbox-exec`. On native
+Windows, Linux, and WSL, Goal Flight leaves the dispatch-level OS sandbox off
+or refuses explicit `read-only` / `workspace-write` requests with structured
+`os_sandbox_platform_unsupported` readiness output. This is expected; use
+dispatch worktree isolation plus the worker's own sandbox/approval policy.
 
 ## Context Discipline Hooks
 

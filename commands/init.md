@@ -93,6 +93,11 @@ python3 <skill-root>/scripts/goalflight_doctor.py --project-root "$PWD" --json
    with the WSL next step, and stale cleanup is degraded to identity-checked
    per-pid cleanup.
 
+   Inside WSL, inspect `wsl_filesystems.warnings`. If project root,
+   `GOALFLIGHT_STATE_DIR`, fleet dir, fleet lock dir, or `worktrees/` is under
+   `/mnt/<drive>`, warn and move to a WSL-native path before dispatch. DrvFs
+   does not provide reliable POSIX `flock` semantics for Goal Flight locks.
+
 3. Ensure the ACP SDK venv exists. On native Windows without usable WSL, skip
    this block; it is POSIX/WSL dispatch setup and the `bin/python` path is
    intentionally not valid for native read/plan mode.

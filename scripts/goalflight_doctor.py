@@ -37,6 +37,11 @@ try:
 except Exception:  # pragma: no cover - doctor still reports partial state
     goalflight_fleet = None
 
+try:
+    import goalflight_os_sandbox
+except Exception:  # pragma: no cover - doctor still reports partial state
+    goalflight_os_sandbox = None
+
 
 def run(cmd: list[str], cwd: Path | None = None, timeout: float = 8.0) -> dict:
     try:
@@ -317,7 +322,28 @@ def check_resume_notes_pattern(project_root: Path) -> dict:
     }
 
 
-def app_exists(name: str, bundle_id: str | None = None) -> bool:
+def app_exists(name: str, bundle_id: str | None = None) -> bool | None:
+    if not goalflight_compat.is_macos():
+        if goalflight_compat.is_linux():
+            desktop_names = {
+                f"{name}.desktop",
+                f"{name.lower()}.desktop",
+                f"{name.replace(' ', '-').lower()}.desktop",
+                f"{name.replace(' ', '').lower()}.desktop",
+            }
+            app_dirs = [
+                Path.home() / ".local/share/applications",
+                Path("/usr/local/share/applications"),
+                Path("/usr/share/applications"),
+                Path("/var/lib/snapd/desktop/applications"),
+            ]
+            for app_dir in app_dirs:
+                try:
+                    if any((app_dir / item).exists() for item in desktop_names):
+                        return True
+                except OSError:
+                    continue
+        return None
     direct = Path("/Applications") / f"{name}.app"
     if direct.exists():
         return True
@@ -325,6 +351,35 @@ def app_exists(name: str, bundle_id: str | None = None) -> bool:
         result = run(["mdfind", f"kMDItemCFBundleIdentifier == '{bundle_id}'"], timeout=3)
         return bool(result["stdout"])
     return False
+
+
+def check_platform() -> dict:
+    sandbox_available = (
+        goalflight_os_sandbox.os_sandbox_available()
+        if goalflight_os_sandbox is not None
+        else False
+    )
+    sandbox_profiles = (
+        goalflight_os_sandbox.platform_supported_os_sandbox_profiles()
+        if goalflight_os_sandbox is not None
+        else ["off"]
+    )
+    sandbox_platform = (
+        goalflight_os_sandbox.os_sandbox_platform_key()
+        if goalflight_os_sandbox is not None
+        else "unknown"
+    )
+    return {
+        "os_name": os.name,
+        "sys_platform": sys.platform,
+        "is_windows": goalflight_compat.is_windows(),
+        "is_macos": goalflight_compat.is_macos(),
+        "is_linux": goalflight_compat.is_linux(),
+        "is_wsl": goalflight_compat.is_wsl(),
+        "os_sandbox_available": sandbox_available,
+        "os_sandbox_platform": sandbox_platform,
+        "os_sandbox_supported_profiles": sandbox_profiles,
+    }
 
 
 def check_plugin(repo: Path) -> dict:
@@ -946,6 +1001,134 @@ def check_acp_sdk() -> dict:
     }
 
 
+def acp_venv_executable_sanity() -> dict:
+    venv_root = Path.home() / ".goal-flight/venvs/acp-0.10"
+    linux_python = venv_root / "bin/python"
+    windows_python = venv_root / "Scripts/python.exe"
+    expected = windows_python if goalflight_compat.is_windows() else linux_python
+    wrong_platform_present = (
+        linux_python.exists() if goalflight_compat.is_windows() else windows_python.exists()
+    )
+    return {
+        "venv_root": str(venv_root),
+        "expected_python": str(expected),
+        "expected_exists": expected.exists(),
+        "windows_python": str(windows_python),
+        "windows_python_exists": windows_python.exists(),
+        "linux_python": str(linux_python),
+        "linux_python_exists": linux_python.exists(),
+        "wrong_platform_python_present": wrong_platform_present,
+        "ok": expected.exists() and not wrong_platform_present,
+        "recommendation": (
+            "Use a Linux-built ACP venv with bin/python inside WSL/Linux; "
+            "do not share a Windows Scripts/python.exe venv."
+        ),
+    }
+
+
+def wsl_version_info() -> dict:
+    if not goalflight_compat.is_wsl():
+        return {"is_wsl": False, "version": None}
+    osrelease = ""
+    proc_version = ""
+    for path, key in (
+        (Path("/proc/sys/kernel/osrelease"), "osrelease"),
+        (Path("/proc/version"), "proc_version"),
+    ):
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore").strip()
+        except OSError:
+            text = ""
+        if key == "osrelease":
+            osrelease = text
+        else:
+            proc_version = text
+    joined = f"{osrelease}\n{proc_version}".lower()
+    if "wsl2" in joined or "microsoft-standard" in joined:
+        version = "2"
+    elif "microsoft" in joined or "wsl" in joined:
+        version = "1_or_unknown"
+    else:
+        version = "unknown"
+    return {
+        "is_wsl": True,
+        "version": version,
+        "osrelease": osrelease,
+        "proc_version": proc_version[:300],
+    }
+
+
+def _nearest_existing_path(path: Path) -> Path | None:
+    current = path.expanduser()
+    while True:
+        if current.exists():
+            return current
+        if current.parent == current:
+            return None
+        current = current.parent
+
+
+def filesystem_type(path: Path) -> dict:
+    target = _nearest_existing_path(path)
+    if target is None or goalflight_compat.is_windows():
+        return {"path": str(path), "stat_path": str(target) if target else None, "type": None, "ok": False}
+    if goalflight_compat.is_linux():
+        result = run(["stat", "-f", "-c", "%T", str(target)], timeout=3)
+    elif goalflight_compat.is_macos():
+        result = run(["stat", "-f", "%T", str(target)], timeout=3)
+    else:
+        result = run(["stat", "-f", "-c", "%T", str(target)], timeout=3)
+        if not result["ok"]:
+            result = run(["stat", "-f", "%T", str(target)], timeout=3)
+    return {
+        "path": str(path),
+        "stat_path": str(target),
+        "type": first_line(result.get("stdout")) if result["ok"] else None,
+        "ok": bool(result["ok"]),
+        "error": None if result["ok"] else first_line(result.get("stderr")),
+    }
+
+
+def check_wsl_filesystems(repo: Path, *, fleet_dir: Path | None = None) -> dict:
+    state_dir = Path(os.environ.get("GOALFLIGHT_STATE_DIR", goalflight_compat.default_state_dir())).expanduser()
+    if fleet_dir is not None:
+        resolved_fleet_dir = fleet_dir.expanduser()
+    elif goalflight_fleet is not None:
+        resolved_fleet_dir = goalflight_fleet.default_fleet_dir()
+    else:
+        resolved_fleet_dir = Path(os.environ.get("GOALFLIGHT_FLEET_DIR", Path.home() / ".goal-flight/fleet")).expanduser()
+    paths = {
+        "project_root": repo,
+        "state_dir": state_dir,
+        "fleet_dir": resolved_fleet_dir,
+        "fleet_lock_dir": resolved_fleet_dir / "locks",
+        "worktree_root": repo / "worktrees",
+    }
+    details = []
+    warnings = []
+    for label, path in paths.items():
+        drvfs_path = goalflight_compat.is_wsl_drvfs_path(path)
+        item = {
+            "label": label,
+            "path": str(path),
+            "drvfs_path": drvfs_path,
+            "filesystem": filesystem_type(path),
+        }
+        details.append(item)
+        if goalflight_compat.is_wsl() and drvfs_path:
+            warnings.append(
+                f"{label} is under /mnt/<drive> (DrvFs); use a WSL-native path for reliable flock and worktrees"
+            )
+    return {
+        "schema": "goalflight.wsl_filesystems.v1",
+        "is_wsl": goalflight_compat.is_wsl(),
+        "ok": not warnings,
+        "details": details,
+        "warnings": warnings,
+        "recommendation": "Keep project, state, fleet, and worktree roots on the WSL-native filesystem.",
+    }
+
+
 def git_state(repo: Path) -> dict:
     if not (repo / ".git").exists():
         return {"present": False}
@@ -1308,6 +1491,8 @@ def check_wsl(repo: Path) -> dict:
             "host": "wsl",
             "is_windows": False,
             "is_wsl": True,
+            "wsl_version": wsl_version_info(),
+            "acp_venv": acp_venv_executable_sanity(),
             "baseline": "wsl",
             "usable": True,
             "probe": probe,
@@ -1338,6 +1523,7 @@ def doctor(repo: Path, *, fleet: bool = False, fleet_dir: Path | None = None, fl
     payload = {
         "schema": "goalflight.doctor.v1",
         "repo": str(repo),
+        "platform": check_platform(),
         "plugin": check_plugin(repo),
         "host_goalflight_install": check_host_goalflight_install(),
         "installed_skill_drift": check_installed_skill_drift(skill_root, repo),
@@ -1374,18 +1560,16 @@ def doctor(repo: Path, *, fleet: bool = False, fleet_dir: Path | None = None, fl
         "rate_pressure": _rate_pressure_summary(),
         "worker_currency": worker_currency_probe(),
         "wsl": check_wsl(repo),
+        "wsl_filesystems": check_wsl_filesystems(repo, fleet_dir=fleet_dir),
     }
     if goalflight_compat.is_windows():
-        payload["platform"] = {
-            "os_name": os.name,
-            "sys_platform": sys.platform,
-            "is_windows": True,
+        payload["platform"].update({
             "resolved_python": goalflight_compat.python_executable(),
             "native_windows_support": (
                 "read/plan OK; dispatch refused on native Windows; run dispatch inside WSL. "
                 "Cleanup is degraded to tracked pid-only."
             ),
-        }
+        })
     if fleet:
         payload["fleet"] = _fleet_auth_summary(fleet_dir, refresh=fleet_probe)
         payload["fleet_dispatches"] = _fleet_dispatch_report(fleet_dir)
@@ -1573,6 +1757,16 @@ def print_human(payload: dict) -> None:
                 True,
                 "WSL dispatch baseline",
                 wsl_info.get("next_step"),
+            ),
+            *lines,
+        ]
+    wsl_filesystems = payload.get("wsl_filesystems") or {}
+    if wsl_filesystems.get("warnings"):
+        lines = [
+            status_line(
+                False,
+                "WSL DrvFs guard",
+                "; ".join(wsl_filesystems.get("warnings") or []),
             ),
             *lines,
         ]

@@ -56,13 +56,20 @@ stdout_path="$run_dir/acp.stdout.jsonl"
 stderr_path="$run_dir/acp.stderr.log"
 mkdir -p "$run_dir"
 
+os_sandbox_args=()
+permission_allow_args=()
+if [[ "$(uname -s 2>/dev/null || true)" == "Darwin" ]]; then
+  os_sandbox_args=(--os-sandbox workspace-write)
+  permission_allow_args=(--permission-allow-tool-title-pattern '.*')
+fi
+
 python3 "$root/scripts/goalflight_acp_run.py" \
   --agent codex-acp \
   --cwd "$PWD" \
   "${worktree_args[@]}" \
   --permission-mode auto \
-  --permission-allow-tool-title-pattern '.*' \
-  --os-sandbox workspace-write \
+  ${permission_allow_args[@]+"${permission_allow_args[@]}"} \
+  ${os_sandbox_args[@]+"${os_sandbox_args[@]}"} \
   --status-json "$status_path" \
   --max-tool-s 1800 \
   --max-quiet-s 3600 \

@@ -10,6 +10,7 @@ root.
 | [architecture.md](architecture.md) | Portable core, runtime scripts, capacity, and validation boundaries |
 | [fleet.md](fleet.md) | Multi-node SSH fleet: bootstrap, dispatch, watch, reconcile |
 | [hosts/cursor.md](hosts/cursor.md) | Cursor install, MCP, and project-local setup |
+| [hosts/linux.md](hosts/linux.md) | Linux/WSL dispatch baseline, OS sandbox scope, and filesystem caveats |
 | [hosts/opencode.md](hosts/opencode.md) | OpenCode install, skills, MCP, and bash-tail workers |
 
 Entry surfaces outside this folder: `README.md`, `SKILL.md`, `CHANGELOG.md`, and

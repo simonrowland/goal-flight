@@ -417,6 +417,21 @@ def validate_manifest_semantics(
             errors.append(f"{source}: os_sandbox default_profile is not supported")
         if os_sandbox.get("implementation") == "unsupported" and profiles != ["off"]:
             errors.append(f"{source}: unsupported os_sandbox must only declare off")
+        platform_profiles = os_sandbox.get("platform_supported_profiles")
+        if isinstance(platform_profiles, dict):
+            for platform_name, scoped_profiles in platform_profiles.items():
+                if not isinstance(scoped_profiles, list):
+                    continue
+                for scoped_profile in scoped_profiles:
+                    if scoped_profile not in profiles:
+                        errors.append(
+                            f"{source}: os_sandbox platform {platform_name} profile "
+                            f"{scoped_profile!r} is not in supported_profiles"
+                        )
+                if default_profile not in scoped_profiles:
+                    errors.append(
+                        f"{source}: os_sandbox platform {platform_name} omits default_profile"
+                    )
     auto_approve = permission_surface.get("auto_approve_detection", {})
     if auto_approve.get("strict_fail") is not True:
         errors.append(f"{source}: auto-approve/bypass detection must strict_fail")

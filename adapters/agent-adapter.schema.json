@@ -365,15 +365,26 @@
       "additionalProperties": false,
       "required": ["supported_profiles", "default_profile", "implementation"],
       "properties": {
-        "supported_profiles": {
-          "type": "array",
-          "items": {"enum": ["off", "read-only", "workspace-write"]},
-          "uniqueItems": true
-        },
+        "supported_profiles": {"$ref": "#/$defs/osSandboxProfiles"},
         "default_profile": {"enum": ["off", "read-only", "workspace-write"]},
         "implementation": {"enum": ["runner:sandbox-exec", "host-default", "unsupported"]},
+        "platform_supported_profiles": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "darwin": {"$ref": "#/$defs/osSandboxProfiles"},
+            "linux": {"$ref": "#/$defs/osSandboxProfiles"},
+            "wsl": {"$ref": "#/$defs/osSandboxProfiles"},
+            "windows": {"$ref": "#/$defs/osSandboxProfiles"}
+          }
+        },
         "notes": {"type": "string"}
       }
+    },
+    "osSandboxProfiles": {
+      "type": "array",
+      "items": {"enum": ["off", "read-only", "workspace-write"]},
+      "uniqueItems": true
     },
     "gatedBoolean": {
       "type": "object",

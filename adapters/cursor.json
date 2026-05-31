@@ -87,6 +87,12 @@
       "supported_profiles": ["off", "read-only", "workspace-write"],
       "default_profile": "off",
       "implementation": "runner:sandbox-exec",
+      "platform_supported_profiles": {
+        "darwin": ["off", "read-only", "workspace-write"],
+        "linux": ["off"],
+        "wsl": ["off"],
+        "windows": ["off"]
+      },
       "notes": "Dispatch-level worker subprocess wrapper; not a cursor-agent flag. Permits temp and Cursor host-state writes while fencing project writes by profile."
     },
     "auto_approve_detection": {"probes": ["cursor-args-scan"], "strict_fail": true},

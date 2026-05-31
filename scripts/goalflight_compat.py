@@ -39,7 +39,10 @@ from pathlib import Path
 
 __all__ = [
     "is_windows",
+    "is_macos",
+    "is_linux",
     "is_wsl",
+    "is_wsl_drvfs_path",
     "python_executable",
     "windows_dispatch_refusal",
     "windows_os_sandbox_refusal",
@@ -64,10 +67,22 @@ __all__ = [
 
 log = logging.getLogger("goal-flight.compat")
 
+_WSL_WINDOWS_FS_TYPES = {"drvfs", "9p", "v9fs"}
+
 
 def is_windows() -> bool:
     """True on native Windows (``os.name == "nt"``). NOT true under WSL."""
     return os.name == "nt"
+
+
+def is_macos() -> bool:
+    """True on macOS/Darwin."""
+    return sys.platform == "darwin"
+
+
+def is_linux() -> bool:
+    """True on Linux, including WSL."""
+    return sys.platform.startswith("linux")
 
 
 def is_wsl() -> bool:
@@ -88,6 +103,130 @@ def is_wsl() -> bool:
         if "microsoft" in text or "wsl" in text:
             return True
     return False
+
+
+def _syntactic_wsl_drive_path(path: Path) -> bool:
+    parts = path.parts
+    return (
+        len(parts) >= 3
+        and parts[0] == "/"
+        and parts[1] == "mnt"
+        and len(parts[2]) == 1
+        and parts[2].isalpha()
+    )
+
+
+def _nearest_existing_path(path: Path) -> Path | None:
+    current = path.expanduser()
+    while True:
+        if current.exists():
+            return current
+        if current.parent == current:
+            return None
+        current = current.parent
+
+
+def _decode_mountinfo_path(value: str) -> str:
+    return (
+        value.replace(r"\040", " ")
+        .replace(r"\011", "\t")
+        .replace(r"\012", "\n")
+        .replace(r"\134", "\\")
+    )
+
+
+def _mount_path_matches(target: Path, mount_point: str) -> bool:
+    target_text = os.path.normpath(str(target))
+    mount_text = os.path.normpath(mount_point)
+    if mount_text == os.sep:
+        return target_text.startswith(os.sep)
+    return target_text == mount_text or target_text.startswith(f"{mount_text}{os.sep}")
+
+
+def _mountinfo_fstype_from_lines(path: Path, lines: list[str]) -> str | None:
+    best_mount = ""
+    best_fstype: str | None = None
+    for line in lines:
+        before, sep, after = line.partition(" - ")
+        if not sep:
+            continue
+        fields = before.split()
+        after_fields = after.split()
+        if len(fields) < 5 or not after_fields:
+            continue
+        mount_point = _decode_mountinfo_path(fields[4])
+        if not _mount_path_matches(path, mount_point):
+            continue
+        normalized = os.path.normpath(mount_point)
+        if len(normalized) > len(best_mount):
+            best_mount = normalized
+            best_fstype = after_fields[0].lower()
+    return best_fstype
+
+
+def _mountinfo_fstype_for_path(path: Path) -> str | None:
+    try:
+        lines = Path("/proc/self/mountinfo").read_text(
+            encoding="utf-8", errors="replace"
+        ).splitlines()
+    except OSError:
+        return None
+    return _mountinfo_fstype_from_lines(path, lines)
+
+
+def _findmnt_fstype_for_path(path: Path) -> str | None:
+    if shutil.which("findmnt") is None:
+        return None
+    try:
+        proc = subprocess.run(
+            ["findmnt", "-T", str(path), "-n", "-o", "FSTYPE"],
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=3,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    first = proc.stdout.splitlines()[0].strip().lower() if proc.stdout.splitlines() else ""
+    return first or None
+
+
+def _mount_fstype_for_path(path: Path) -> str | None:
+    return _mountinfo_fstype_for_path(path) or _findmnt_fstype_for_path(path)
+
+
+def is_wsl_drvfs_path(path: str | os.PathLike[str] | None) -> bool:
+    """True when a WSL path is backed by a Windows filesystem mount.
+
+    Prefer mount fstype evidence (``drvfs`` / ``9p`` / ``v9fs``) so custom
+    automounts and symlinked roots are detected without false-warning on a real
+    Linux filesystem mounted under ``/mnt/<letter>``. If mount metadata is not
+    available, retain the legacy syntactic ``/mnt/<drive>`` fallback.
+    """
+    if path is None:
+        return False
+    original = Path(path).expanduser()
+    nearest = _nearest_existing_path(original)
+    target = nearest or original
+    try:
+        resolved = target.resolve()
+    except OSError:
+        resolved = target
+    fstype = _mount_fstype_for_path(resolved)
+    original_syntactic = _syntactic_wsl_drive_path(original)
+    target_syntactic = _syntactic_wsl_drive_path(target)
+    resolved_syntactic = _syntactic_wsl_drive_path(resolved)
+    if fstype:
+        if fstype.lower() in _WSL_WINDOWS_FS_TYPES:
+            return True
+        if target_syntactic or resolved_syntactic or not original_syntactic:
+            return False
+    return original_syntactic or target_syntactic or resolved_syntactic
 
 
 def python_executable() -> str:
@@ -207,6 +346,18 @@ def _wsl_no_distro_line(line: str) -> bool:
         "keine" in lower
         and ("distribution" in lower or "verteilung" in lower)
         and ("install" in lower or "installiert" in lower)
+    ):
+        return True
+    if (
+        ("no hay" in lower or "ninguna" in lower)
+        and "distrib" in lower
+        and "instalad" in lower
+    ):
+        return True
+    if "aucune" in lower and "distribution" in lower and "install" in lower:
+        return True
+    if "ディストリビューション" in lower and (
+        "ありません" in lower or "インストール" in lower
     ):
         return True
     return False
@@ -367,6 +518,26 @@ def probe_wsl(
         launch_ok, launch_probe = _probe_wsl_default_launch(exe, runner=runner)
         base.update(launch_probe)
         if not launch_ok:
+            launch_no_distro_marker = any(
+                _wsl_no_distro_line(line)
+                for text in (
+                    str(launch_probe.get("launch_stdout") or ""),
+                    str(launch_probe.get("launch_stderr") or ""),
+                )
+                for line in text.splitlines()
+            )
+            if launch_no_distro_marker:
+                base.update(
+                    {
+                        "state": "no_installed_distributions",
+                        "usable": False,
+                        "present": False,
+                        "distributions": [],
+                        "reason": "wsl.exe launch probe reported zero installed distros",
+                        "next_step": "Ask before running `wsl --install` (admin elevation and reboot may be required).",
+                    }
+                )
+                return base
             base.update(
                 {
                     "state": "distro_launch_failed",
