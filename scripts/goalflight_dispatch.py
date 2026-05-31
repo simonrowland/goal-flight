@@ -36,6 +36,7 @@ this is also the dispatch path on Windows (where the bash watcher is refused).
 from __future__ import annotations
 
 import argparse
+import asyncio
 import contextlib
 import io
 import json
@@ -618,6 +619,130 @@ def _release_capacity(lease_id: str | None, state: str, reason: str | None) -> N
         goalflight_capacity.cmd_release(argparse.Namespace(lease_id=lease_id, state=state, reason=reason, keep=True))
 
 
+@contextlib.contextmanager
+def _temporary_env(updates: dict[str, str], *, remove: list[str] | None = None):
+    prior: dict[str, str | None] = {}
+    for key in updates:
+        prior[key] = os.environ.get(key)
+        os.environ[key] = updates[key]
+    for key in remove or []:
+        if key not in prior:
+            prior[key] = os.environ.get(key)
+        os.environ.pop(key, None)
+    try:
+        yield
+    finally:
+        for key, value in prior.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def _normalize_acp_agent(args) -> None:
+    if args.agent in {"worker", "codex"}:
+        args.agent = "codex-acp"
+    if args.agent != "codex-acp":
+        raise DispatchUsageError(
+            f"--shape acp v1 supports --agent codex-acp only; got {args.agent!r}"
+        )
+
+
+def _build_acp_cfg(args, *, status_json: Path):
+    from goalflight_acp_run import (
+        DEFAULT_MAX_TOOL_S,
+        DEFAULT_REMOTE_TURN_CANCEL_GRACE_S,
+        OS_SANDBOX_OFF,
+        normalized_acp_dispatch_cfg,
+    )
+
+    project_root = _project_root(args)
+    prompt_path = str(Path(args.prompt_file).expanduser()) if args.prompt_file else None
+    os_sandbox = "read-only" if args.read_only else OS_SANDBOX_OFF
+    cfg = argparse.Namespace(
+        agent=args.agent,
+        install_slot=None,
+        cwd=str(project_root),
+        worktree="off",
+        session_id=None,
+        dispatch_id=args.dispatch_id,
+        prompt_id=None,
+        prompt=prompt_path,
+        prompt_text=None if prompt_path else args.prompt,
+        prompt_b64=None,
+        mode="one-shot",
+        idle_timeout=float(args.max_idle_secs or 300.0),
+        status_json=str(status_json),
+        context_mode="enabled",
+        os_sandbox=os_sandbox,
+        permission_mode=args.permission_mode,
+        permission_dir=None,
+        permission_inline_timeout_s=None,
+        permission_user_timeout_s=None,
+        permission_allow_tool_title_pattern=[],
+        heartbeat_interval=max(float(args.poll_secs or 0.0), 0.1),
+        wedge_samples=4,
+        max_tool_s=DEFAULT_MAX_TOOL_S,
+        max_quiet_s=max(float(args.max_idle_secs or 300.0), 1.0),
+        progress_stall_s=300.0,
+        liveness_profile=None,
+        remote_turn_silence_s=None,
+        remote_turn_cancel_grace_s=DEFAULT_REMOTE_TURN_CANCEL_GRACE_S,
+        cpu_epsilon=0.1,
+        json=False,
+    )
+    return normalized_acp_dispatch_cfg(cfg)
+
+
+def _run_acp_shape(args, *, base: Path, account_env: dict[str, str]) -> int:
+    from goalflight_acp_run import acp_dispatch_exit_code, run_acp_dispatch
+
+    if not args.dispatch_id:
+        args.dispatch_id = _reserve_auto_dispatch_id(args.agent, base)
+    status_json = Path(args.status_json) if args.status_json else base / f"{args.dispatch_id}.status.json"
+    cfg = _build_acp_cfg(args, status_json=status_json)
+    env_remove = []
+    if args.billing == "sub" and _account_engine(args.agent) == "codex":
+        env_remove.append("OPENAI_API_KEY")
+
+    started = time.time()
+    print(
+        "DISPATCH-START "
+        + json.dumps(
+            {
+                "dispatch_id": cfg.dispatch_id,
+                "agent": cfg.agent,
+                "shape": "acp",
+                "worker_pid": None,
+                "status_json": str(status_json),
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+    with _temporary_env(account_env, remove=env_remove):
+        payload = asyncio.run(run_acp_dispatch(cfg))
+    print(
+        "DISPATCH-END "
+        + json.dumps(
+            {
+                "dispatch_id": payload.get("dispatch_id", cfg.dispatch_id),
+                "agent": payload.get("agent", cfg.agent),
+                "shape": "acp",
+                "worker_pid": payload.get("worker_pid"),
+                "status_json": str(status_json),
+                "terminal_state": payload.get("state"),
+                "worker_still_alive": payload.get("worker_alive"),
+                "reason": payload.get("error") or payload.get("reason"),
+                "elapsed_s": round(time.time() - started, 3),
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+    return acp_dispatch_exit_code(payload)
+
+
 def _registration_error(step: str, exc: Exception) -> dict:
     return {"step": step, "reason": f"{type(exc).__name__}: {exc}"}
 
@@ -673,7 +798,11 @@ def main(argv: list[str] | None = None) -> int:
                              "default, not used by the maintainer; present only for users who explicitly want it.")
     parser.add_argument("--shape", choices=["auto", "bash", "acp"], default="auto",
                         help="Comms shape. 'auto' picks the best per engine (codex/grok->bash, "
-                             "cursor/claude->acp). 'acp' unification is pending; use 'bash' or the raw escape hatch.")
+                             "cursor/claude->acp). v1 ACP routing supports codex-acp.")
+    parser.add_argument("--interactive", action="store_true",
+                        help="Sugar for --shape acp --permission-mode auto (v1: codex-acp auto mode).")
+    parser.add_argument("--permission-mode", choices=["auto"], default="auto",
+                        help="ACP permission mode for dispatch.py v1. Inline relay lands in a later chunk.")
     parser.add_argument("--tail", help="Worker output sink (auto: <state>/dispatch/<id>.tail)")
     parser.add_argument("--status-json", help="Watcher status file (auto: <state>/dispatch/<id>.status.json)")
     parser.add_argument("--dispatch-id", help="Slug for auto paths (auto-generated if omitted)")
@@ -700,17 +829,30 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     raw = _raw_worker_args(args)
 
-    # Resolve comms shape. 'auto' = best per engine; 'acp' unification is not wired
-    # here yet, so fail honestly rather than silently doing bash.
+    if args.interactive:
+        if args.shape not in {"auto", "acp"}:
+            print("goalflight_dispatch: --interactive conflicts with --shape bash", file=sys.stderr)
+            return 64
+        args.shape = "acp"
+
+    # Resolve comms shape. 'auto' = best per engine.
     shape = args.shape
     if shape == "auto":
         shape = "acp" if args.agent in ("cursor", "claude-acp", "claude") else "bash"
     args.shape = shape
     if shape == "acp":
-        print("goalflight_dispatch: --shape acp is not yet wired here — use --shape bash, a codex/grok "
-              "preset, or scripts/goalflight_acp_run.py directly (acp unification is on the backlog).",
-              file=sys.stderr)
-        return 64
+        try:
+            _normalize_acp_agent(args)
+            if not _prompt_requested(args):
+                raise DispatchUsageError("--shape acp requires --prompt or --prompt-file")
+            if args.prompt_file and not Path(args.prompt_file).expanduser().exists():
+                raise DispatchUsageError(f"prompt file not found: {args.prompt_file}")
+            account_env = _resolve_account_env(args)
+            base = _dispatch_base_dir()
+            return _run_acp_shape(args, base=base, account_env=account_env)
+        except DispatchUsageError as e:
+            print(f"goalflight_dispatch: {e}", file=sys.stderr)
+            return 64
 
     try:
         _validate_before_side_effects(args, raw)

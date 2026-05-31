@@ -26,6 +26,7 @@ import io
 import json
 import os
 from pathlib import Path
+import signal
 import shutil
 import subprocess
 import sys
@@ -240,6 +241,54 @@ from goalflight_os_sandbox import (
 from goalflight_profile import dispatch_env
 from goalflight_startup_gate import StartupGate
 from acp_runner import extract_markers, has_actionable_marker_values, run_prompt
+
+
+class _SigtermCancelBridge:
+    """Convert process SIGTERM into asyncio task cancellation.
+
+    The default SIGTERM action exits the interpreter immediately, bypassing
+    coroutine ``finally`` blocks. ACP dispatch owns lease/ledger finalization in
+    ``run_acp_dispatch``; cancelling the main task lets that finalizer run.
+    """
+
+    def __init__(self, loop: asyncio.AbstractEventLoop, task: asyncio.Task | None):
+        self.loop = loop
+        self.task = task
+        self.received = False
+        self._installed = False
+        self._prior_handler: Any = None
+        self._used_loop_handler = False
+
+    def _cancel(self) -> None:
+        self.received = True
+        if self.task is not None and not self.task.done():
+            self.task.cancel()
+
+    def install(self) -> None:
+        self._prior_handler = signal.getsignal(signal.SIGTERM)
+        try:
+            self.loop.add_signal_handler(signal.SIGTERM, self._cancel)
+        except (NotImplementedError, RuntimeError, ValueError):
+            try:
+                signal.signal(signal.SIGTERM, lambda _signum, _frame: self._cancel())
+            except (ValueError, OSError):
+                return
+            self._installed = True
+            self._used_loop_handler = False
+            return
+        self._installed = True
+        self._used_loop_handler = True
+
+    def restore(self) -> None:
+        if not self._installed:
+            return
+        if self._used_loop_handler:
+            with contextlib.suppress(Exception):
+                self.loop.remove_signal_handler(signal.SIGTERM)
+        if self._prior_handler is not None:
+            with contextlib.suppress(Exception):
+                signal.signal(signal.SIGTERM, self._prior_handler)
+        self._installed = False
 
 
 def _resolve_manifest_binary(binary: str) -> str:
@@ -519,6 +568,38 @@ async def spawn_and_handshake_with_retry(
 
 
 async def run_acp_dispatch(cfg: argparse.Namespace) -> dict:
+    """Run one ACP dispatch with a SIGTERM bridge that preserves finalizers."""
+    bridge = _SigtermCancelBridge(asyncio.get_running_loop(), asyncio.current_task())
+    bridge.install()
+    try:
+        return await _run_acp_dispatch_impl(cfg, sigterm_received=lambda: bridge.received)
+    except asyncio.CancelledError:
+        if bridge.received:
+            dispatch_id = cfg.dispatch_id or f"acp-{cfg.agent}-{uuid.uuid4().hex[:8]}"
+            return {
+                "schema": "goalflight.acp-run.v1",
+                "dispatch_id": dispatch_id,
+                "lease_id": None,
+                "agent": cfg.agent,
+                "session_id": cfg.session_id,
+                "state": "failed",
+                "ok": False,
+                "error": {"code": -int(signal.SIGTERM), "message": "sigterm"},
+                "terminated_by_signal": "SIGTERM",
+                "worker_pid": None,
+                "worker_alive": False,
+                "updated_at": _now(),
+            }
+        raise
+    finally:
+        bridge.restore()
+
+
+async def _run_acp_dispatch_impl(
+    cfg: argparse.Namespace,
+    *,
+    sigterm_received: Callable[[], bool] | None = None,
+) -> dict:
     """Run one ACP dispatch from an argparse.Namespace config.
 
     Not thread-callable: ACP connection registries and pidfiles are process-
@@ -728,7 +809,6 @@ async def run_acp_dispatch(cfg: argparse.Namespace) -> dict:
 
     acquire_payload = json.loads(acquire_out.getvalue())
     lease_id = acquire_payload.get("lease", {}).get("lease_id")
-    await update_status(lease_id=lease_id)
 
     proc: asyncio.subprocess.Process | None = None
     conn: AcpConnection | None = None
@@ -743,6 +823,32 @@ async def run_acp_dispatch(cfg: argparse.Namespace) -> dict:
     # enforces a hard wall (lease lifetime) so a pathological CPU spinner that
     # never emits an event can't hang the runner forever.
     idle_gate = IdleLivenessGate(cfg.cpu_epsilon, cfg.max_quiet_s)
+
+    try:
+        await update_status(lease_id=lease_id)
+    except asyncio.CancelledError:
+        if sigterm_received is not None and sigterm_received():
+            payload.update(
+                {
+                    "state": "failed",
+                    "ok": False,
+                    "error": {"code": -int(signal.SIGTERM), "message": "sigterm"},
+                    "terminated_by_signal": "SIGTERM",
+                }
+            )
+            write_status(status_path, payload)
+            if lease_id:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    goalflight_capacity.cmd_release(
+                        argparse.Namespace(
+                            lease_id=lease_id,
+                            state=payload["state"],
+                            reason=payload["error"],
+                            keep=True,
+                        )
+                    )
+            return payload
+        raise
 
     async def mark_heartbeat_terminal(outcome: str, error: dict[str, object]) -> None:
         nonlocal heartbeat_outcome, heartbeat_error, wedged_by_heartbeat
@@ -1267,6 +1373,18 @@ async def run_acp_dispatch(cfg: argparse.Namespace) -> dict:
             "killed_by_heartbeat": state in ("wedged", "tool_timeout", "remote_turn_silence"),
             "wedged_by_heartbeat": state == "wedged",
         })
+    except asyncio.CancelledError:
+        if sigterm_received is not None and sigterm_received():
+            payload.update(
+                {
+                    "state": "failed",
+                    "ok": False,
+                    "error": {"code": -int(signal.SIGTERM), "message": "sigterm"},
+                    "terminated_by_signal": "SIGTERM",
+                }
+            )
+        else:
+            raise
     except Exception as e:
         async with status_lock:
             terminal_by_heartbeat = heartbeat_outcome or (getattr(conn, "heartbeat_outcome", None) if conn else None)
