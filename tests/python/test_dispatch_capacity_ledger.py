@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import os
 import signal
@@ -164,6 +165,16 @@ def _assert_terminal_record_and_lease(env: dict[str, str], dispatch_id: str, sta
     row = _record(payload, dispatch_id)
     assert row and row.get("state") == state, row
     assert row.get("classification") == state, row
+    expected_terminal = "error" if state == "failed" else state
+    assert row.get("terminal_state") == expected_terminal, row
+    assert row.get("engine") == "test-dispatch", row
+    assert row.get("shape") == "bash", row
+    assert row.get("account") == "default", row
+    assert row.get("ended_at"), row
+    assert isinstance(row.get("elapsed_s"), (int, float)), row
+    assert row.get("worker_still_alive") is not None, row
+    if expected_terminal != "complete":
+        assert row.get("reason") or row.get("error"), row
     leases = _leases(payload, dispatch_id)
     assert leases, f"lease missing for {dispatch_id}"
     assert all(lease.get("state") == state for lease in leases), leases
@@ -627,6 +638,66 @@ def case_watcher_failure_releases_as_failed() -> None:
             _kill_if_alive(worker_pid)
 
 
+def case_nonzero_watcher_running_status_finalizes_failed() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        env = _env(tmp)
+        dispatch_id = "dispatch-watcher-running-failure"
+        status_path = tmp / f"{dispatch_id}.status.json"
+        sys.path.insert(0, str(ROOT / "scripts"))
+        import goalflight_dispatch as dispatch_mod  # noqa: E402
+
+        old_argv = sys.argv[:]
+        old_run = dispatch_mod.subprocess.run
+        old_state_dir = os.environ.get("GOALFLIGHT_STATE_DIR")
+        old_pidfile_dir = os.environ.get("GOAL_FLIGHT_PIDFILE_DIR")
+
+        def fake_watcher_run(cmd, *args, **kwargs):
+            if len(cmd) > 1 and Path(cmd[1]).name == "goalflight_watch.py":
+                status_path.parent.mkdir(parents=True, exist_ok=True)
+                status_path.write_text(
+                    json.dumps(
+                        {
+                            "state": "running",
+                            "worker_alive": True,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                return subprocess.CompletedProcess(cmd, 9, stdout="", stderr="")
+            return old_run(cmd, *args, **kwargs)
+
+        try:
+            os.environ.update(env)
+            sys.argv = _dispatch_command(
+                tmp,
+                dispatch_id,
+                "import sys; print('worker-start', flush=True); sys.exit(0)",
+                status_path=status_path,
+            )[1:]
+            dispatch_mod.subprocess.run = fake_watcher_run
+            rc = dispatch_mod.main()
+        finally:
+            dispatch_mod.subprocess.run = old_run
+            sys.argv = old_argv
+            if old_state_dir is None:
+                os.environ.pop("GOALFLIGHT_STATE_DIR", None)
+            else:
+                os.environ["GOALFLIGHT_STATE_DIR"] = old_state_dir
+            if old_pidfile_dir is None:
+                os.environ.pop("GOAL_FLIGHT_PIDFILE_DIR", None)
+            else:
+                os.environ["GOAL_FLIGHT_PIDFILE_DIR"] = old_pidfile_dir
+
+        assert rc == 9, rc
+        payload = _status(env)
+        row = _record(payload, dispatch_id)
+        assert row and row.get("state") == "failed", row
+        assert row.get("terminal_state") == "error", row
+        assert row.get("reason") == "watcher_exit_9", row
+        assert all(lease.get("state") == "failed" for lease in _leases(payload, dispatch_id)), payload
+
+
 def case_post_spawn_registration_failure_still_runs_watcher() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
@@ -649,6 +720,164 @@ def case_post_spawn_registration_failure_still_runs_watcher() -> None:
         _assert_terminal_record_and_lease(env, dispatch_id, "complete")
 
 
+def case_dispatch_stats_window_and_legacy_records() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        env = _env(tmp)
+        runs = tmp / "state" / "runs.d"
+        runs.mkdir(parents=True)
+        now = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+
+        def iso(hours_ago: float) -> str:
+            return (now - dt.timedelta(hours=hours_ago)).isoformat(timespec="seconds")
+
+        def write_record(dispatch_id: str, **updates) -> None:
+            record = {
+                "schema": "goalflight.dispatch.v1",
+                "dispatch_id": dispatch_id,
+                "agent": "alpha",
+                "engine": "alpha",
+                "shape": "bash",
+                "transport": "dispatch",
+                "state": "complete",
+                "terminal_state": "complete",
+                "started_at": iso(1.2),
+                "ended_at": iso(1.0),
+                "elapsed_s": 12.0,
+            }
+            record.update(updates)
+            (runs / f"{dispatch_id}.json").write_text(json.dumps(record), encoding="utf-8")
+
+        write_record("stats-ok", elapsed_s=10.0)
+        write_record(
+            "stats-dead",
+            state="worker_dead",
+            terminal_state="worker_dead",
+            started_at=iso(2.2),
+            ended_at=iso(2.0),
+            elapsed_s=20.0,
+            reason="worker exited",
+        )
+        write_record(
+            "stats-running",
+            state="running",
+            terminal_state=None,
+            started_at=iso(1.5),
+            ended_at=None,
+            elapsed_s=None,
+        )
+        write_record(
+            "stats-legacy-blocked",
+            agent="beta-acp",
+            transport="acp",
+            state="blocked",
+            started_at=iso(3.2),
+            ended_at=iso(3.0),
+            reason="needs input",
+        )
+        legacy_path = runs / "stats-legacy-blocked.json"
+        legacy = json.loads(legacy_path.read_text(encoding="utf-8"))
+        for field in ("engine", "shape", "terminal_state", "elapsed_s"):
+            legacy.pop(field, None)
+        legacy_path.write_text(json.dumps(legacy), encoding="utf-8")
+        write_record(
+            "stats-old",
+            started_at=(now - dt.timedelta(days=10, minutes=5)).isoformat(timespec="seconds"),
+            ended_at=(now - dt.timedelta(days=10)).isoformat(timespec="seconds"),
+            elapsed_s=30.0,
+        )
+
+        proc = subprocess.run(
+            [sys.executable, str(DISPATCH), "--stats", "24h", "--json"],
+            cwd=ROOT,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert proc.returncode == 0, f"stats rc={proc.returncode} stdout={proc.stdout} stderr={proc.stderr}"
+        payload = json.loads(proc.stdout)
+        assert payload["records_considered"] == 4, payload
+        assert payload["by_engine"]["alpha"]["total"] == 3, payload
+        assert payload["by_engine"]["alpha"]["outcomes"] == 2, payload
+        assert payload["by_engine"]["alpha"]["in_flight"] == 1, payload
+        assert payload["by_engine"]["alpha"]["success_rate"] == 0.5, payload
+        assert payload["by_engine"]["alpha"]["failure_modes"] == {"worker_dead": 1}, payload
+        assert payload["by_engine"]["beta"]["failure_modes"] == {"blocked": 1}, payload
+        assert payload["by_shape"]["bash"]["total"] == 3, payload
+        assert payload["by_shape"]["bash"]["outcomes"] == 2, payload
+        assert payload["by_shape"]["bash"]["in_flight"] == 1, payload
+        assert payload["by_shape"]["acp"]["failure_modes"] == {"blocked": 1}, payload
+        assert payload["by_shape"]["bash"]["mean_elapsed_s"] == 15.0, payload
+        assert payload["by_shape"]["bash"]["p95_elapsed_s"] == 20.0, payload
+        assert payload["by_engine"]["alpha"]["recent_failures"][0]["dispatch_id"] == "stats-dead", payload
+
+        default_proc = subprocess.run(
+            [sys.executable, str(DISPATCH), "--stats", "--json"],
+            cwd=ROOT,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert default_proc.returncode == 0, default_proc.stderr
+        assert json.loads(default_proc.stdout)["records_considered"] == 4, default_proc.stdout
+
+        thirty_proc = subprocess.run(
+            [sys.executable, str(DISPATCH), "--stats", "30", "--json"],
+            cwd=ROOT,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert thirty_proc.returncode == 0, thirty_proc.stderr
+        assert json.loads(thirty_proc.stdout)["records_considered"] == 5, thirty_proc.stdout
+
+        table_proc = subprocess.run(
+            [sys.executable, str(DISPATCH), "--stats", "7d"],
+            cwd=ROOT,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert table_proc.returncode == 0, table_proc.stderr
+        assert "by engine:" in table_proc.stdout and "by shape:" in table_proc.stdout, table_proc.stdout
+
+        malformed = subprocess.run(
+            [sys.executable, str(DISPATCH), "--stats", "nope"],
+            cwd=ROOT,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert malformed.returncode == 64, malformed
+        assert "malformed window" in malformed.stderr, malformed.stderr
+
+        no_worker = subprocess.run(
+            [
+                sys.executable,
+                str(DISPATCH),
+                "--agent",
+                "test-dispatch",
+                "--prompt",
+                "COMPLETE: do not materialize",
+                "--stats",
+                "24h",
+                "--json",
+            ],
+            cwd=ROOT,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert no_worker.returncode == 0, no_worker.stderr
+        assert not (tmp / "state" / "dispatch").exists(), "stats materialized dispatch side effects"
+
+
 def main() -> None:
     case_status_sees_dispatch_and_lease_releases()
     case_live_controller_pidfile_preserves_blocked_worker_for_reattach()
@@ -662,7 +891,9 @@ def main() -> None:
     case_worker_dead_state_releases_and_classifies_terminal()
     case_idle_timeout_state_releases_and_classifies_terminal()
     case_watcher_failure_releases_as_failed()
+    case_nonzero_watcher_running_status_finalizes_failed()
     case_post_spawn_registration_failure_still_runs_watcher()
+    case_dispatch_stats_window_and_legacy_records()
     print("OK: dispatch capacity/ledger tests pass")
 
 

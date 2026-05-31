@@ -328,6 +328,7 @@ async def _run_sandbox_probe(profile: str) -> dict:
     old_agent_command = goalflight_acp_run.agent_command
     old_adapters_dir = goalflight_adapter_readiness.ADAPTERS_DIR
     old_scenario = os.environ.get("GOALFLIGHT_FAKE_ACP_SCENARIO")
+    old_state_dir = os.environ.get("GOALFLIGHT_STATE_DIR")
     os.environ["GOALFLIGHT_FAKE_ACP_SCENARIO"] = "sandbox_write_probe"
     goalflight_acp_run.agent_command = lambda agent: (sys.executable, [str(FAKE)])
     workspace = ROOT / f".goalflight-os-sandbox-run-{profile}-{os.getpid()}"
@@ -337,6 +338,7 @@ async def _run_sandbox_probe(profile: str) -> dict:
         with tempfile.TemporaryDirectory(prefix="gf-os-sandbox-adapters-") as tmp:
             tmp_path = Path(tmp)
             goalflight_adapter_readiness.ADAPTERS_DIR = tmp_path
+            os.environ["GOALFLIGHT_STATE_DIR"] = str(tmp_path / "state")
             _write_supported_adapter_manifest(tmp_path, "fake-sandbox")
             status_path = tmp_path / f"{profile}.status.json"
             dispatch_id = f"test-os-sandbox-{profile}-{os.getpid()}"
@@ -377,6 +379,10 @@ async def _run_sandbox_probe(profile: str) -> dict:
             os.environ.pop("GOALFLIGHT_FAKE_ACP_SCENARIO", None)
         else:
             os.environ["GOALFLIGHT_FAKE_ACP_SCENARIO"] = old_scenario
+        if old_state_dir is None:
+            os.environ.pop("GOALFLIGHT_STATE_DIR", None)
+        else:
+            os.environ["GOALFLIGHT_STATE_DIR"] = old_state_dir
         shutil.rmtree(workspace, ignore_errors=True)
 
 
@@ -407,11 +413,13 @@ def case_runner_read_only_blocks_workspace_write() -> None:
 def case_runner_blocks_undeclared_os_sandbox_before_capacity() -> None:
     old_agent_command = goalflight_acp_run.agent_command
     old_adapters_dir = goalflight_adapter_readiness.ADAPTERS_DIR
+    old_state_dir = os.environ.get("GOALFLIGHT_STATE_DIR")
     goalflight_acp_run.agent_command = lambda agent: (sys.executable, [str(FAKE)])
     try:
         with tempfile.TemporaryDirectory(prefix="gf-os-sandbox-unsupported-") as tmp:
             tmp_path = Path(tmp)
             goalflight_adapter_readiness.ADAPTERS_DIR = tmp_path
+            os.environ["GOALFLIGHT_STATE_DIR"] = str(tmp_path / "state")
             _write_supported_adapter_manifest(tmp_path, "fake-no-sandbox")
             manifest = json.loads((tmp_path / "fake-no-sandbox.json").read_text())
             manifest["permission_surface"]["os_sandbox"]["supported_profiles"] = ["off"]
@@ -454,6 +462,10 @@ def case_runner_blocks_undeclared_os_sandbox_before_capacity() -> None:
     finally:
         goalflight_acp_run.agent_command = old_agent_command
         goalflight_adapter_readiness.ADAPTERS_DIR = old_adapters_dir
+        if old_state_dir is None:
+            os.environ.pop("GOALFLIGHT_STATE_DIR", None)
+        else:
+            os.environ["GOALFLIGHT_STATE_DIR"] = old_state_dir
 
 
 def case_runner_blocks_temp_cwd_before_capacity() -> None:
@@ -462,12 +474,14 @@ def case_runner_blocks_temp_cwd_before_capacity() -> None:
         return
     old_agent_command = goalflight_acp_run.agent_command
     old_adapters_dir = goalflight_adapter_readiness.ADAPTERS_DIR
+    old_state_dir = os.environ.get("GOALFLIGHT_STATE_DIR")
     goalflight_acp_run.agent_command = lambda agent: (sys.executable, [str(FAKE)])
     try:
         with tempfile.TemporaryDirectory(prefix="gf-os-sandbox-temp-run-") as cwd:
             with tempfile.TemporaryDirectory(prefix="gf-os-sandbox-adapters-") as tmp:
                 tmp_path = Path(tmp)
                 goalflight_adapter_readiness.ADAPTERS_DIR = tmp_path
+                os.environ["GOALFLIGHT_STATE_DIR"] = str(tmp_path / "state")
                 _write_supported_adapter_manifest(tmp_path, "fake-sandbox")
                 status_path = tmp_path / "status.json"
                 payload = asyncio.run(goalflight_acp_run.run(
@@ -507,6 +521,10 @@ def case_runner_blocks_temp_cwd_before_capacity() -> None:
     finally:
         goalflight_acp_run.agent_command = old_agent_command
         goalflight_adapter_readiness.ADAPTERS_DIR = old_adapters_dir
+        if old_state_dir is None:
+            os.environ.pop("GOALFLIGHT_STATE_DIR", None)
+        else:
+            os.environ["GOALFLIGHT_STATE_DIR"] = old_state_dir
 
 
 def case_pool_canonicalizes_os_sandbox_alias_for_reuse() -> None:

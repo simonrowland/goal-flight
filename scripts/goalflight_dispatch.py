@@ -305,6 +305,9 @@ def _record_ledger(args, *, project_root: Path, prompt_path: str | None, status_
                 prompt_id=None,
                 prompt_path=prompt_path,
                 agent=args.agent,
+                engine=_account_engine(args.agent) or args.agent,
+                shape=args.shape,
+                account=args.account or "default",
                 transport="dispatch",
                 project_root=str(project_root),
                 controller_pid=_controller_pid(args),
@@ -390,9 +393,25 @@ def _cleanup_pidfile_if_worker_dead(pidfile: Path | None, worker_pid: int | None
         pidfile.unlink(missing_ok=True)
 
 
-def _finish_ledger(dispatch_id: str, state: str, reason: str | None) -> None:
+def _finish_ledger(
+    dispatch_id: str,
+    state: str,
+    reason: str | None,
+    *,
+    elapsed_s: float | None = None,
+    worker_still_alive: bool | None = None,
+) -> None:
     with contextlib.redirect_stdout(io.StringIO()):
-        goalflight_ledger.cmd_finish(argparse.Namespace(dispatch_id=dispatch_id, state=state, reason=reason))
+        goalflight_ledger.cmd_finish(
+            argparse.Namespace(
+                dispatch_id=dispatch_id,
+                state=state,
+                reason=reason,
+                terminal_state=None,
+                elapsed_s=elapsed_s,
+                worker_still_alive=worker_still_alive,
+            )
+        )
 
 
 def _release_capacity(lease_id: str | None, state: str, reason: str | None) -> None:
@@ -461,9 +480,23 @@ def main() -> int:
     parser.add_argument("--max-idle-secs", type=float, default=180.0)
     parser.add_argument("--controller-pid", type=int,
                         help="If set, watcher exits when this pid dies (orphan guard)")
+    parser.add_argument("--stats", nargs="?", const="7d", metavar="WINDOW",
+                        help="No-worker stats view over dispatch history; WINDOW is <N>h, <N>d, or bare <N> days.")
+    parser.add_argument("--json", action="store_true", help="With --stats, emit machine-readable JSON.")
     parser.add_argument("worker", nargs=argparse.REMAINDER,
                         help="Optional `-- <cmd...>` raw worker (overrides the preset)")
     args = parser.parse_args()
+    if args.stats is not None:
+        try:
+            payload = goalflight_ledger.stats_payload(args.stats)
+        except ValueError as e:
+            print(f"goalflight_dispatch: {e}", file=sys.stderr)
+            return 64
+        if args.json:
+            print(json.dumps(payload, sort_keys=True))
+        else:
+            print(goalflight_ledger.format_stats_table(payload))
+        return 0
     raw = _raw_worker_args(args)
 
     # Resolve comms shape. 'auto' = best per engine; 'acp' unification is not wired
@@ -471,6 +504,7 @@ def main() -> int:
     shape = args.shape
     if shape == "auto":
         shape = "acp" if args.agent in ("cursor", "claude-acp", "claude") else "bash"
+    args.shape = shape
     if shape == "acp":
         print("goalflight_dispatch: --shape acp is not yet wired here — use --shape bash, a codex/grok "
               "preset, or scripts/goalflight_acp_run.py directly (acp unification is on the backlog).",
@@ -513,6 +547,7 @@ def main() -> int:
     final_reason = None
     worker_alive = None
     watch_rc = 1
+    dispatch_started = time.time()
     summary_head = {
         "dispatch_id": args.dispatch_id,
         "agent": args.agent,
@@ -665,13 +700,21 @@ def main() -> int:
                 final_reason = json.loads(watch.stdout.strip().splitlines()[-1]).get("reason")
             except Exception:
                 final_reason = watch.stdout.strip().splitlines()[-1] if watch.stdout.strip() else None
-        final_state = state or ("complete" if watch_rc == 0 else "failed")
+        if not final_reason and watch.stderr and watch.stderr.strip():
+            final_reason = watch.stderr.strip().splitlines()[-1]
+        if not final_reason and watch_rc != 0:
+            final_reason = f"watcher_exit_{watch_rc}"
+        if watch_rc != 0:
+            terminal_state = goalflight_ledger.terminal_state_for(state, final_reason)
+            final_state = (state or "failed") if terminal_state not in {"complete", "unknown"} else "failed"
+        else:
+            final_state = state or "complete"
 
         # 3. Emit a summary and propagate the watcher's REAL exit code (no masking).
         print("DISPATCH-END " + json.dumps({
             **summary_head,
             "watcher_exit": watch_rc,
-            "terminal_state": state,
+            "terminal_state": final_state,
             "worker_still_alive": worker_alive,  # True on a marker => signal-to-review, NOT done; re-attach
             "reason": final_reason,
             "elapsed_s": round(time.time() - started, 1),
@@ -687,7 +730,16 @@ def main() -> int:
     finally:
         if ledger_recorded:
             with contextlib.suppress(Exception):
-                _finish_ledger(args.dispatch_id, final_state, final_reason)
+                final_worker_alive = worker_alive
+                if final_worker_alive is None and worker_pid:
+                    final_worker_alive = goalflight_compat.pid_alive(worker_pid)
+                _finish_ledger(
+                    args.dispatch_id,
+                    final_state,
+                    final_reason,
+                    elapsed_s=round(time.time() - dispatch_started, 3),
+                    worker_still_alive=final_worker_alive,
+                )
         with contextlib.suppress(Exception):
             _release_capacity(lease_id, final_state, final_reason)
         _cleanup_pidfile_if_worker_dead(pidfile, worker_pid)

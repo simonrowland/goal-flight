@@ -193,6 +193,7 @@ async def case_overlimit_response_fails_cleanly() -> None:
 async def case_runner_overlimit_response_status_counts_drop() -> None:
     old_scenario = os.environ.get("GOALFLIGHT_FAKE_ACP_SCENARIO")
     old_limit = os.environ.get("GOALFLIGHT_ACP_LIMIT")
+    old_state_dir = os.environ.get("GOALFLIGHT_STATE_DIR")
     old_agent_command = goalflight_acp_run.agent_command
     old_adapters_dir = goalflight_adapter_readiness.ADAPTERS_DIR
     os.environ["GOALFLIGHT_FAKE_ACP_SCENARIO"] = "overlimit_response"
@@ -202,6 +203,7 @@ async def case_runner_overlimit_response_status_counts_drop() -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             goalflight_adapter_readiness.ADAPTERS_DIR = tmp_path
+            os.environ["GOALFLIGHT_STATE_DIR"] = str(tmp_path / "state")
             _write_supported_adapter_manifest(tmp_path, "fake-runner")
             status_path = tmp_path / "status.json"
             dispatch_id = f"test-runner-overlimit-{os.getpid()}"
@@ -239,6 +241,10 @@ async def case_runner_overlimit_response_status_counts_drop() -> None:
             os.environ.pop("GOALFLIGHT_ACP_LIMIT", None)
         else:
             os.environ["GOALFLIGHT_ACP_LIMIT"] = old_limit
+        if old_state_dir is None:
+            os.environ.pop("GOALFLIGHT_STATE_DIR", None)
+        else:
+            os.environ["GOALFLIGHT_STATE_DIR"] = old_state_dir
         goalflight_adapter_readiness.ADAPTERS_DIR = old_adapters_dir
 
 

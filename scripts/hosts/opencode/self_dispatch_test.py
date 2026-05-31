@@ -142,20 +142,29 @@ def _reply_has_four(text: str) -> bool:
 
 def _run_acp(*, workdir: Path, model: str, timeout: float) -> dict[str, Any]:
     runner = SCRIPT_DIR / "goalflight_acp_run.py"
-    result = _run(
-        [
-            sys.executable,
-            str(runner),
-            "--agent",
-            "opencode",
-            "--cwd",
-            str(workdir),
-            "--prompt-text",
-            READONLY_PROMPT,
-            "--json",
-        ],
-        timeout=timeout,
-    )
+    old_state_dir = os.environ.get("GOALFLIGHT_STATE_DIR")
+    try:
+        with tempfile.TemporaryDirectory(prefix="gf-opencode-self-dispatch-") as state_tmp:
+            os.environ["GOALFLIGHT_STATE_DIR"] = str(Path(state_tmp) / "state")
+            result = _run(
+                [
+                    sys.executable,
+                    str(runner),
+                    "--agent",
+                    "opencode",
+                    "--cwd",
+                    str(workdir),
+                    "--prompt-text",
+                    READONLY_PROMPT,
+                    "--json",
+                ],
+                timeout=timeout,
+            )
+    finally:
+        if old_state_dir is None:
+            os.environ.pop("GOALFLIGHT_STATE_DIR", None)
+        else:
+            os.environ["GOALFLIGHT_STATE_DIR"] = old_state_dir
     out: dict[str, Any] = {
         "transport": "acp",
         "agent": "opencode",

@@ -551,6 +551,7 @@ async def run(args: argparse.Namespace) -> dict:
     if remote_turn_cancel_grace_s < 0:
         remote_turn_cancel_grace_s = DEFAULT_REMOTE_TURN_CANCEL_GRACE_S
     dispatch_id = args.dispatch_id or f"acp-{args.agent}-{uuid.uuid4().hex[:8]}"
+    run_started = time.time()
     project_root = Path(args.cwd).resolve()
     worktree_mode = getattr(args, "worktree", "off")
     worktree_path: Path | None = None
@@ -1165,6 +1166,9 @@ async def run(args: argparse.Namespace) -> dict:
                     prompt_id=args.prompt_id,
                     prompt_path=args.prompt,
                     agent=args.agent,
+                    engine=goalflight_ledger.infer_engine(args.agent),
+                    shape="acp",
+                    account="default",
                     transport="acp",
                     project_root=args.cwd,
                     controller_pid=os.getpid(),
@@ -1300,7 +1304,16 @@ async def run(args: argparse.Namespace) -> dict:
             payload["pgroup_cpu_pct"] = pgroup_cpu_pct(payload.get("pgid"))
         if ledger_recorded:
             with contextlib.redirect_stdout(io.StringIO()):
-                goalflight_ledger.cmd_finish(argparse.Namespace(dispatch_id=dispatch_id, state=payload.get("state", state), reason=payload.get("error")))
+                goalflight_ledger.cmd_finish(
+                    argparse.Namespace(
+                        dispatch_id=dispatch_id,
+                        state=payload.get("state", state),
+                        reason=payload.get("error"),
+                        terminal_state=None,
+                        elapsed_s=round(time.time() - run_started, 3),
+                        worker_still_alive=payload.get("worker_alive"),
+                    )
+                )
         if lease_id:
             with contextlib.redirect_stdout(io.StringIO()):
                 goalflight_capacity.cmd_release(argparse.Namespace(lease_id=lease_id, state=payload.get("state", state), reason=payload.get("error"), keep=True))
