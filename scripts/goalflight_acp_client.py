@@ -198,6 +198,23 @@ def _write_through_pidfile_locked() -> None:
     own_pidfile = _PIDFILE_DIR / f"{os.getpid()}.jsonl"
     entries: list[str] = []
     for conn in _live_connections.values():
+        if goalflight_compat.is_windows():
+            identity = goalflight_compat.windows_process_identity(conn.proc.pid)
+            if identity is None:
+                continue
+            entries.append(
+                json.dumps(
+                    {
+                        "pid": conn.proc.pid,
+                        "pgid": conn.verified_pgid,
+                        "creation_time": identity.get("creation_time"),
+                        "identity_source": identity.get("identity_source"),
+                        "agent": conn.agent,
+                        "session_id": conn.session_id,
+                    }
+                )
+            )
+            continue
         meta = _ps_meta(conn.proc.pid)
         if meta is None:
             continue
@@ -257,6 +274,28 @@ def cleanup_ghosts(active_worker_pids: set[int] | None = None) -> int:
             pid = entry.get("pid")
             if not isinstance(pid, int) or pid in own_worker_pids:
                 continue
+            if goalflight_compat.is_windows():
+                if not goalflight_compat.pid_alive(pid):
+                    continue
+                if not entry.get("creation_time"):
+                    skipped_stale += 1
+                    log.warning(
+                        "ghost_cleanup: windows pid=%d missing creation identity; "
+                        "unlinking stale pidfile without killing",
+                        pid,
+                    )
+                    continue
+                hard_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
+                if goalflight_compat.kill_pid(
+                    pid,
+                    hard_signal,
+                    process_group=False,
+                    expected_identity=entry,
+                ):
+                    killed += 1
+                else:
+                    skipped_stale += 1
+                continue
             meta = _ps_meta(pid)
             if meta is None:
                 continue
@@ -284,15 +323,12 @@ def cleanup_ghosts(active_worker_pids: set[int] | None = None) -> int:
             pgid = entry.get("pgid", pid)
             agent = entry.get("agent", "")
             is_bash_tail = str(agent).endswith("-bash-tail")
-            try:
-                if is_bash_tail and pgid != pid:
-                    os.kill(pid, signal.SIGKILL)
-                else:
-                    os.killpg(pgid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                with contextlib.suppress(ProcessLookupError, PermissionError):
-                    os.kill(pid, signal.SIGKILL)
-            killed += 1
+            hard_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
+            if is_bash_tail and pgid != pid:
+                if goalflight_compat.kill_pid(pid, hard_signal, process_group=False):
+                    killed += 1
+            elif goalflight_compat.kill_pid(pid, hard_signal, pgid=pgid, process_group=True):
+                killed += 1
         pf.unlink(missing_ok=True)
     if killed or skipped_stale or skipped_live_controller:
         log.info(
@@ -1256,7 +1292,16 @@ class GoalflightAcpConnection:
                 )
             else:
                 try:
-                    os.killpg(self.verified_pgid, signal.SIGKILL)
+                    hard_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
+                    killed = goalflight_compat.kill_pid(
+                        self.proc.pid,
+                        hard_signal,
+                        pgid=self.verified_pgid,
+                        process_group=True,
+                    )
+                    if not killed:
+                        with contextlib.suppress(ProcessLookupError, PermissionError):
+                            self.proc.kill()
                 except (ProcessLookupError, PermissionError):
                     with contextlib.suppress(ProcessLookupError, PermissionError):
                         self.proc.kill()

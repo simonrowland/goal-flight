@@ -34,6 +34,15 @@ Never route from static capability alone. Use local readiness for scheduling:
   worker; use another ready adapter or a legacy fallback.
 - No locally ready ACP adapters: dispatch falls back to Bash-tail watcher.
 - context-mode missing on the side that will process large output: warn before long review or log-heavy command.
+- Native Windows: read `doctor --json` field `wsl`. Full dispatch requires
+  `wsl.host == "wsl"` (already inside WSL) or a native-Windows probe with
+  `wsl.probe.usable == true` followed by re-running inside that distro.
+  `wsl.exe` present but `wsl -l -q` listing zero installed distros is not usable.
+  If the operator declines install, the decline stamp suppresses repeat init
+  prompts; keep the native control plane and honest dispatch refusal.
+- Native Windows cleanup is degraded: stale workers are killed only by tracked
+  pid, not by POSIX process group. That is acceptable for read/plan mode; use
+  WSL when full worker/process-tree dispatch semantics are required.
 
 Capacity decisions come from:
 

@@ -34,6 +34,7 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any, Callable
 
+import goalflight_compat
 from goalflight_acp_client import AcpProcessPool
 
 try:
@@ -281,8 +282,20 @@ async def managed_pool(
         for conn in list(pool._connections.values()):
             try:
                 if conn.alive:
-                    import os, signal as _sig
-                    os.killpg(conn.verified_pgid, _sig.SIGKILL)
+                    import signal as _sig
+                    hard_signal = getattr(_sig, "SIGKILL", _sig.SIGTERM)
+                    # POSIX uses the historical process-group kill. Native
+                    # Windows has no killpg/pgid; kill_pid degrades to the
+                    # tracked worker pid so atexit cleanup never raises
+                    # AttributeError. If stale children survive on Windows,
+                    # remember native dispatch is refused there; run dispatch
+                    # under WSL for full process-tree semantics.
+                    goalflight_compat.kill_pid(
+                        conn.proc.pid,
+                        hard_signal,
+                        pgid=conn.verified_pgid,
+                        process_group=True,
+                    )
             except (ProcessLookupError, PermissionError, Exception):
                 pass
         pool._connections.clear()

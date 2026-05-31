@@ -569,6 +569,9 @@ async def spawn_and_handshake_with_retry(
 
 async def run_acp_dispatch(cfg: argparse.Namespace) -> dict:
     """Run one ACP dispatch with a SIGTERM bridge that preserves finalizers."""
+    if goalflight_compat.is_windows():
+        payload, _status_path = write_windows_refusal_status(cfg)
+        return payload
     bridge = _SigtermCancelBridge(asyncio.get_running_loop(), asyncio.current_task())
     bridge.install()
     try:
@@ -1513,7 +1516,7 @@ def write_windows_refusal_status(args: argparse.Namespace) -> tuple[dict, Path]:
         "state": "blocked_windows_dispatch",
         "ok": False,
         "error": goalflight_compat.windows_dispatch_refusal(),
-        "next_step": "wsl --install; re-run inside the distro",
+        "next_step": "wsl --install; open an installed distro and run dispatch from the WSL checkout",
         "worker_pid": None,
         "pgid": None,
         "worker_alive": False,
@@ -1714,13 +1717,6 @@ def main(argv: list[str] | None = None) -> int:
     # 5-minute idle ceiling would kill a healthy worker mid-test. 10h is a
     # safe wedge-detector ceiling (10h of TOTAL silence = genuinely stuck).
     cfg = normalized_acp_dispatch_cfg(args)
-    if goalflight_compat.is_windows():
-        payload, status_path = write_windows_refusal_status(cfg)
-        if cfg.json:
-            print(json.dumps(payload, sort_keys=True))
-        else:
-            print(f"{payload['dispatch_id']}: blocked_windows_dispatch status={status_path}")
-        return acp_dispatch_exit_code(payload)
     payload = asyncio.run(run_acp_dispatch(cfg))
     if cfg.json:
         print(json.dumps(payload, sort_keys=True))

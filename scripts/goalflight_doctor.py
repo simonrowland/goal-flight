@@ -1272,6 +1272,64 @@ def check_project_goalflight_readiness(repo: Path) -> dict:
     }
 
 
+def check_wsl(repo: Path) -> dict:
+    """Report Windows/WSL dispatch capability honestly.
+
+    Native Windows may run doctor/status/plan, but dispatch remains a POSIX path
+    and must run under WSL. ``probe_wsl`` distinguishes "wsl.exe exists" from
+    "at least one distro is installed"; the latter is the real readiness gate.
+    """
+    probe = goalflight_compat.probe_wsl(repo)
+    if goalflight_compat.is_windows():
+        usable = bool(probe.get("usable"))
+        return {
+            "host": "native_windows",
+            "is_windows": True,
+            "is_wsl": False,
+            "baseline": "wsl_required_for_dispatch",
+            "usable": usable,
+            "probe": probe,
+            "dispatch_capability": "refused_native_use_wsl",
+            "native_control_plane": True,
+            "native_cleanup": "degraded_per_pid",
+            "false_no_distro_debug": (
+                "If a distro is installed but probe.state is no_installed_distributions, "
+                "inspect probe.stdout/stderr/distributions, UTF-16LE/NUL decoding from "
+                "`wsl -l -q`, localized no-distro text, and enterprise-policy guidance output."
+            ),
+            "next_step": (
+                "Open the installed WSL distro and run Goal Flight dispatch there."
+                if usable
+                else "Ask before running `wsl --install`; admin elevation and a reboot may be required."
+            ),
+        }
+    if goalflight_compat.is_wsl():
+        return {
+            "host": "wsl",
+            "is_windows": False,
+            "is_wsl": True,
+            "baseline": "wsl",
+            "usable": True,
+            "probe": probe,
+            "dispatch_capability": "full",
+            "native_control_plane": True,
+            "native_cleanup": "posix_process_group",
+            "next_step": "Dispatch is supported from this WSL session.",
+        }
+    return {
+        "host": "posix",
+        "is_windows": False,
+        "is_wsl": False,
+        "baseline": "posix",
+        "usable": True,
+        "probe": probe,
+        "dispatch_capability": "full",
+        "native_control_plane": True,
+        "native_cleanup": "posix_process_group",
+        "next_step": None,
+    }
+
+
 def doctor(repo: Path, *, fleet: bool = False, fleet_dir: Path | None = None, fleet_probe: bool = False) -> dict:
     skill_root = SCRIPT_DIR.parent
     codex_desktop = app_exists("Codex", "com.openai.codex")
@@ -1315,6 +1373,7 @@ def doctor(repo: Path, *, fleet: bool = False, fleet_dir: Path | None = None, fl
         "fleet_reconcile": _fleet_reconcile_summary(),
         "rate_pressure": _rate_pressure_summary(),
         "worker_currency": worker_currency_probe(),
+        "wsl": check_wsl(repo),
     }
     if goalflight_compat.is_windows():
         payload["platform"] = {
@@ -1322,7 +1381,10 @@ def doctor(repo: Path, *, fleet: bool = False, fleet_dir: Path | None = None, fl
             "sys_platform": sys.platform,
             "is_windows": True,
             "resolved_python": goalflight_compat.python_executable(),
-            "native_windows_support": "read/plan OK; dispatch -> use WSL. Phase 2 enables native dispatch.",
+            "native_windows_support": (
+                "read/plan OK; dispatch refused on native Windows; run dispatch inside WSL. "
+                "Cleanup is degraded to tracked pid-only."
+            ),
         }
     if fleet:
         payload["fleet"] = _fleet_auth_summary(fleet_dir, refresh=fleet_probe)
@@ -1483,6 +1545,8 @@ def print_human(payload: dict) -> None:
     ]
     if goalflight_compat.is_windows():
         platform_info = payload.get("platform") or {}
+        wsl_info = payload.get("wsl") or {}
+        probe = wsl_info.get("probe") or {}
         lines = [
             status_line(
                 None,
@@ -1494,6 +1558,21 @@ def print_human(payload: dict) -> None:
                 None,
                 "native Windows support",
                 platform_info.get("native_windows_support"),
+            ),
+            status_line(
+                bool(wsl_info.get("usable")),
+                "WSL dispatch baseline",
+                f"{probe.get('state')} — {wsl_info.get('next_step')}",
+            ),
+            *lines,
+        ]
+    elif (payload.get("wsl") or {}).get("is_wsl"):
+        wsl_info = payload.get("wsl") or {}
+        lines = [
+            status_line(
+                True,
+                "WSL dispatch baseline",
+                wsl_info.get("next_step"),
             ),
             *lines,
         ]

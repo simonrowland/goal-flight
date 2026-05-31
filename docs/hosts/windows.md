@@ -1,7 +1,8 @@
 # Windows Host Notes
 
-Goal Flight Phase 1 supports native Windows for the read/plan layer only.
-Native dispatch is intentionally refused until Phase 2.
+Goal Flight supports native Windows for the read/plan control plane only.
+**WSL is the required baseline for full worker dispatch.** Native dispatch is
+intentionally refused; Goal Flight does not ship a native-Win32 dispatch port.
 
 ## Native Windows Support
 
@@ -13,15 +14,40 @@ Native Windows can run:
 - capacity and ledger reads
 - documentation and planning commands
 
-Native Windows cannot run live worker dispatch yet. Dispatch entry points refuse
-with a copy-pasteable path:
+Native Windows cannot run live worker dispatch. Dispatch entry points refuse
+with a copy-pasteable WSL path:
 
 ```powershell
 wsl --install
 ```
 
-Then open the Linux distro, install Goal Flight there, and re-run the dispatch
-inside WSL. Phase 2 enables native Windows dispatch.
+Then reboot if Windows asks, open the Linux distro once so it finishes
+installation, install Goal Flight there, and re-run dispatch inside WSL.
+
+Native cleanup is degraded by design: when the control plane finds stale worker
+PIDs it tracks, it kills those individual PIDs only. POSIX process-group reaping
+is available in WSL, not native Windows.
+
+## WSL Required Dispatch Baseline
+
+Doctor reports a top-level `wsl` JSON field. A native Windows machine is ready
+for full functionality only after the operator runs inside an installed WSL
+distro. The native probe is strict:
+
+- `wsl.exe` must exist.
+- `wsl -l -q` must list at least one installed distro.
+- `wsl.exe` present with no distros is **not** usable.
+
+`wsl -l -q` can emit UTF-16LE with NUL bytes. If doctor reports zero distros on
+a machine that obviously has one, inspect `wsl.probe.stdout` / `stderr` first;
+the probe decodes and strips NULs before splitting lines.
+
+Init must ask before running `wsl --install`. The prompt must state that install
+can require admin elevation, downloads a Linux distro, and may require a reboot.
+If the operator declines, Goal Flight writes
+`docs-private/windows-wsl-install-declined.json` so init does not nag every run.
+Decline or pending install does not block read/plan mode; dispatch remains
+honestly refused on native Windows.
 
 ## Install
 
@@ -90,11 +116,29 @@ python${GOALFLIGHT_PYTHON_MAJOR:-3} scripts/goalflight_doctor.py --project-root 
 | Doctor/readiness checks | yes | yes |
 | Action router launcher | yes | yes |
 | Capacity/ledger read layer | yes | yes |
-| Live ACP dispatch | no, refused | yes |
-| File-backed review dispatch | no, refused | yes |
+| Live ACP dispatch | no, refused | yes, supported baseline |
+| File-backed review dispatch | no, refused | yes, supported baseline |
 | Bash-tail watcher | skipped | yes |
 | OS sandbox | no; macOS-only | no; use worktree + worker sandbox |
 | Context-discipline hooks | skipped | yes, POSIX/Git-Bash path |
+| Stale worker cleanup | degraded tracked-pid only | POSIX process group |
+
+## Manual Acceptance Gate
+
+This repository's automated tests mock native Windows from macOS/Linux. Real
+native-Windows behavior remains a manual acceptance gate:
+
+```powershell
+py -3 .\scripts\goalflight_doctor.py --project-root C:\path\to\project --json
+```
+
+Check that `wsl.probe.state` distinguishes missing `wsl.exe`,
+`no_installed_distributions`, and `ready`; check that dispatch still refuses on
+native Windows; then run the gated WSL smoke from inside the distro:
+
+```bash
+GOALFLIGHT_WSL=1 tests/bash/test-wsl-dispatch-smoke.sh
+```
 
 ## OS Sandbox
 

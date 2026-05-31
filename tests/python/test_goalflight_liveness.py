@@ -443,6 +443,10 @@ def test_cpu_keep_waiting_real_busy_subprocess_keeps_waiting() -> None:
         async def sampler():
             return await asyncio.to_thread(pgroup_cpu_pct, worker.pid)
 
+        first_cpu = pgroup_cpu_pct(worker.pid)
+        if first_cpu is None:
+            print("SKIP: process-group CPU sampler unavailable")
+            return
         keep, cpu = asyncio.run(cpu_liveness_keep_waiting(sampler, 0.1))
         assert keep is True, f"real CPU-busy worker should keep waiting (cpu={cpu})"
         assert cpu is not None and cpu > 0.1, cpu
@@ -485,6 +489,11 @@ def test_python_watcher_busy_silence_records_running_quiet() -> None:
             "while time.time() < end:\n"
             "    x += 1\n",
         ])
+        if pgroup_cpu_pct(worker.pid) is None:
+            print("SKIP: process-group CPU sampler unavailable")
+            worker.terminate()
+            worker.wait(timeout=2)
+            return
         watcher = subprocess.Popen(
             [
                 sys.executable,

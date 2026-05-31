@@ -144,6 +144,52 @@ def _validate_before_side_effects(args, raw_argv: list[str]) -> None:
         raise DispatchUsageError(f"prompt file not found: {args.prompt_file}")
 
 
+def _write_windows_dispatch_refusal(args) -> tuple[dict, Path]:
+    dispatch_id = args.dispatch_id or _default_dispatch_id(args.agent)
+    args.dispatch_id = dispatch_id
+    status_path = (
+        Path(args.status_json)
+        if args.status_json
+        else _dispatch_base_dir() / f"{dispatch_id}.status.json"
+    )
+    payload = {
+        "schema": "goalflight.status.v1",
+        "dispatch_id": dispatch_id,
+        "agent": args.agent,
+        "shape": args.shape,
+        "state": "blocked_windows_dispatch",
+        "reason": goalflight_compat.windows_dispatch_refusal(),
+        "next_step": "wsl --install; open an installed distro and run dispatch from the WSL checkout",
+        "worker_pid": None,
+        "worker_alive": False,
+        "tail_path": str(Path(args.tail)) if args.tail else None,
+        "status_path": str(status_path),
+        "updated_at": int(time.time()),
+    }
+    write_status(status_path, payload)
+    return payload, status_path
+
+
+def _refuse_windows_dispatch(args) -> int:
+    payload, status_path = _write_windows_dispatch_refusal(args)
+    print(
+        "DISPATCH-BLOCKED "
+        + json.dumps(
+            {
+                "dispatch_id": payload["dispatch_id"],
+                "agent": payload["agent"],
+                "shape": payload["shape"],
+                "state": payload["state"],
+                "status_json": str(status_path),
+                "reason": payload["reason"],
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+    return 2
+
+
 def _find_dispatch_record(dispatch_id: str) -> dict | None:
     for record in goalflight_ledger.read_records():
         if record.get("dispatch_id") == dispatch_id:
@@ -698,12 +744,35 @@ def _run_acp_shape(args, *, base: Path, account_env: dict[str, str]) -> int:
     from goalflight_acp_run import acp_dispatch_exit_code, run_acp_dispatch
 
     if not args.dispatch_id:
-        args.dispatch_id = _reserve_auto_dispatch_id(args.agent, base)
+        args.dispatch_id = (
+            _default_dispatch_id(args.agent)
+            if goalflight_compat.is_windows()
+            else _reserve_auto_dispatch_id(args.agent, base)
+        )
     status_json = Path(args.status_json) if args.status_json else base / f"{args.dispatch_id}.status.json"
     cfg = _build_acp_cfg(args, status_json=status_json)
     env_remove = []
     if args.billing == "sub" and _account_engine(args.agent) == "codex":
         env_remove.append("OPENAI_API_KEY")
+
+    if goalflight_compat.is_windows():
+        payload = asyncio.run(run_acp_dispatch(cfg))
+        print(
+            "DISPATCH-BLOCKED "
+            + json.dumps(
+                {
+                    "dispatch_id": payload.get("dispatch_id", cfg.dispatch_id),
+                    "agent": payload.get("agent", cfg.agent),
+                    "shape": "acp",
+                    "state": payload.get("state"),
+                    "status_json": str(status_json),
+                    "reason": payload.get("error") or payload.get("reason"),
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+        return acp_dispatch_exit_code(payload)
 
     started = time.time()
     print(
@@ -847,12 +916,17 @@ def main(argv: list[str] | None = None) -> int:
                 raise DispatchUsageError("--shape acp requires --prompt or --prompt-file")
             if args.prompt_file and not Path(args.prompt_file).expanduser().exists():
                 raise DispatchUsageError(f"prompt file not found: {args.prompt_file}")
-            account_env = _resolve_account_env(args)
             base = _dispatch_base_dir()
+            if goalflight_compat.is_windows():
+                return _run_acp_shape(args, base=base, account_env={})
+            account_env = _resolve_account_env(args)
             return _run_acp_shape(args, base=base, account_env=account_env)
         except DispatchUsageError as e:
             print(f"goalflight_dispatch: {e}", file=sys.stderr)
             return 64
+
+    if goalflight_compat.is_windows():
+        return _refuse_windows_dispatch(args)
 
     try:
         _validate_before_side_effects(args, raw)

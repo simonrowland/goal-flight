@@ -61,7 +61,41 @@ Default add-ons (same tier as setup prompts):
 python3 <skill-root>/scripts/goalflight_doctor.py --project-root "$PWD" --json
 ```
 
-3. Ensure the ACP SDK venv exists:
+   On native Windows, inspect the JSON `wsl` field before any dispatch-shaped
+   setup. Goal Flight's full dispatch baseline is WSL, not a native-Win32 port.
+   The WSL probe is usable only when **all** are true:
+
+   - `wsl.exe` is present.
+   - `wsl -l -q` lists at least one installed distro.
+   - A default-distro launch probe succeeds.
+
+   `wsl.exe` present with zero distros is **not** usable. If the operator says a
+   distro exists but the probe reports `no_installed_distributions`, inspect
+   `wsl.probe.stdout`, `wsl.probe.stderr`, and `wsl.probe.distributions` before
+   offering install; the usual traps are UTF-16LE/NUL output from `wsl -l -q`,
+   localized no-distro prose, and enterprise-policy guidance text. If
+   `wsl.probe.usable` is false and `wsl.probe.declined` is false, ask the
+   operator with the controller's host-neutral user-question surface ("Ask User
+   Question" on hosts that expose it) before any install command:
+
+   - **Install WSL now** — controller may run `wsl --install`; surface that this
+     can require admin elevation, downloads a distro, and can require a reboot
+     before dispatch works.
+   - **Keep native read/plan only** — write
+     `docs-private/windows-wsl-install-declined.json` using
+     `goalflight_compat.record_wsl_install_declined(project_root)` (or the same
+     schema) so init does not nag every run.
+
+   If `wsl --install` returns nonzero, asks for reboot, is declined, or is
+   otherwise pending, treat that as nonfatal and continue init in native
+   control-plane mode:
+   doctor/status/plan/capacity reads work, dispatch entry points keep refusing
+   with the WSL next step, and stale cleanup is degraded to identity-checked
+   per-pid cleanup.
+
+3. Ensure the ACP SDK venv exists. On native Windows without usable WSL, skip
+   this block; it is POSIX/WSL dispatch setup and the `bin/python` path is
+   intentionally not valid for native read/plan mode.
 
 ```bash
 ACP_VENV="$HOME/.goal-flight/venvs/acp-0.10"

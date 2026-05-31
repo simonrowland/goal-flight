@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import signal
 import sys
 import tempfile
 from pathlib import Path
@@ -79,6 +80,61 @@ def case_posix_pid_alive_uses_signal_zero() -> None:
     assert calls == [(12345, 0)]
 
 
+def case_windows_kill_pid_requires_creation_identity() -> None:
+    calls: list[tuple[int, int]] = []
+
+    def fake_kill(pid: int, sig: int) -> None:
+        calls.append((pid, sig))
+
+    with patch("goalflight_compat.is_windows", return_value=True), \
+        patch("goalflight_compat.windows_process_identity", return_value={"pid": 12345, "creation_time": "new"}), \
+        patch("goalflight_compat.os.kill", fake_kill), \
+        patch("goalflight_compat.os.killpg", side_effect=AssertionError("killpg must not run"), create=True), \
+        patch("goalflight_compat.log.warning") as warn:
+        assert goalflight_compat.kill_pid(12345, signal.SIGTERM, pgid=99999, process_group=True) is False
+    assert calls == []
+    assert warn.called
+
+
+def case_windows_kill_pid_kills_only_matching_identity() -> None:
+    calls: list[tuple[int, int]] = []
+
+    def fake_kill(pid: int, sig: int) -> None:
+        calls.append((pid, sig))
+
+    with patch("goalflight_compat.is_windows", return_value=True), \
+        patch("goalflight_compat.windows_process_identity", return_value={"pid": 12345, "creation_time": "same"}), \
+        patch("goalflight_compat.os.kill", fake_kill), \
+        patch("goalflight_compat.os.killpg", side_effect=AssertionError("killpg must not run"), create=True):
+        assert goalflight_compat.kill_pid(
+            12345,
+            signal.SIGTERM,
+            pgid=99999,
+            process_group=True,
+            expected_identity={"pid": 12345, "creation_time": "same"},
+        ) is True
+    assert calls == [(12345, signal.SIGTERM)]
+
+
+def case_windows_kill_pid_skips_reused_pid() -> None:
+    calls: list[tuple[int, int]] = []
+
+    def fake_kill(pid: int, sig: int) -> None:
+        calls.append((pid, sig))
+
+    with patch("goalflight_compat.is_windows", return_value=True), \
+        patch("goalflight_compat.windows_process_identity", return_value={"pid": 12345, "creation_time": "new"}), \
+        patch("goalflight_compat.os.kill", fake_kill), \
+        patch("goalflight_compat.log.warning") as warn:
+        assert goalflight_compat.kill_pid(
+            12345,
+            signal.SIGTERM,
+            expected_identity={"pid": 12345, "creation_time": "old"},
+        ) is False
+    assert calls == []
+    assert warn.called
+
+
 def main() -> None:
     case_lock_constants_are_ints()
     case_flock_nonblocking_contention_contract()
@@ -86,6 +142,9 @@ def main() -> None:
     case_pid_alive_contract()
     case_is_windows_contract()
     case_posix_pid_alive_uses_signal_zero()
+    case_windows_kill_pid_requires_creation_identity()
+    case_windows_kill_pid_kills_only_matching_identity()
+    case_windows_kill_pid_skips_reused_pid()
     print("OK: goalflight compat shim tests pass")
 
 

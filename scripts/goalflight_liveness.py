@@ -17,6 +17,8 @@ import subprocess
 import time
 from typing import Awaitable, Callable
 
+import goalflight_compat
+
 
 def active_monotonic() -> float:
     """Monotonic seconds that do NOT advance while the system is asleep.
@@ -74,6 +76,12 @@ def process_group_id(pid: int | str | None) -> int | None:
         return None
     if pid_int is None:
         return None
+    if goalflight_compat.is_windows():
+        # Native Windows has no POSIX process groups (and no ``os.getpgid``).
+        # Dispatch is refused there, but stale-cleanup/status code can still
+        # import this helper; return None so callers fall back to tracked-pid
+        # handling instead of raising AttributeError.
+        return None
     try:
         return os.getpgid(pid_int)
     except (ProcessLookupError, PermissionError, OSError):
@@ -109,6 +117,12 @@ def pgroup_cpu_pct(pgid_or_pid: int | str | None) -> float | None:
     pid is resolved to its current pgid first. Returns None only when the CPU
     sample itself is unavailable; a live-but-idle group returns 0.0.
     """
+    test_override = os.environ.get("GOALFLIGHT_TEST_PGROUP_CPU_PCT")
+    if test_override is not None:
+        try:
+            return float(test_override)
+        except ValueError:
+            return None
     try:
         target = int(pgid_or_pid) if pgid_or_pid is not None else None
     except (TypeError, ValueError):

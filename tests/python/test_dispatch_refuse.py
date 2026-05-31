@@ -16,14 +16,15 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import goalflight_acp_client  # noqa: E402
 import goalflight_acp_run  # noqa: E402
+import goalflight_dispatch  # noqa: E402
 import goalflight_os_sandbox  # noqa: E402
 import goalflight_review_job  # noqa: E402
 
 
 def _assert_dispatch_message(text: str) -> None:
     assert "wsl --install" in text, text
-    assert "re-run inside the distro" in text, text
-    assert "Phase 2 enables native" in text, text
+    assert "use the WSL install" in text, text
+    assert "no native Win32 dispatch port" in text, text
 
 
 def case_acp_spawn_refuses_native_windows() -> None:
@@ -116,6 +117,78 @@ def case_acp_run_refuses_before_side_effects() -> None:
         _assert_dispatch_message(payload["error"])
 
 
+def case_dispatch_bash_front_door_refuses_before_launch() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        status_path = tmp / "bash.status.json"
+        tail_path = tmp / "bash.tail"
+        with patch("goalflight_compat.is_windows", return_value=True), \
+            patch("goalflight_dispatch.subprocess.Popen", side_effect=AssertionError("worker launched")), \
+            patch("goalflight_dispatch.goalflight_capacity.cmd_acquire", side_effect=AssertionError("capacity lease acquired")), \
+            patch("goalflight_dispatch.goalflight_ledger.cmd_record", side_effect=AssertionError("ledger mutated")):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = goalflight_dispatch.main([
+                    "--shape",
+                    "bash",
+                    "--agent",
+                    "custom",
+                    "--cwd",
+                    str(tmp),
+                    "--dispatch-id",
+                    "win-bash",
+                    "--tail",
+                    str(tail_path),
+                    "--status-json",
+                    str(status_path),
+                    "--",
+                    sys.executable,
+                    "-c",
+                    "print('never')",
+                ])
+        assert rc == 2
+        assert not tail_path.exists()
+        payload = json.loads(status_path.read_text(encoding="utf-8"))
+        assert payload["state"] == "blocked_windows_dispatch"
+        assert payload["worker_pid"] is None
+        assert payload["worker_alive"] is False
+        _assert_dispatch_message(payload["reason"])
+
+
+def case_dispatch_acp_front_door_refuses_before_side_effects() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        status_path = tmp / "acp.status.json"
+        with patch("goalflight_compat.is_windows", return_value=True), \
+            patch("goalflight_acp_run.cleanup_ghosts", side_effect=AssertionError("cleanup ran")), \
+            patch("goalflight_acp_run.goalflight_capacity.cmd_acquire", side_effect=AssertionError("capacity lease acquired")), \
+            patch("goalflight_acp_run.goalflight_ledger.cmd_record", side_effect=AssertionError("ledger mutated")):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = goalflight_dispatch.main([
+                    "--shape",
+                    "acp",
+                    "--agent",
+                    "codex-acp",
+                    "--cwd",
+                    str(tmp),
+                    "--dispatch-id",
+                    "win-acp",
+                    "--status-json",
+                    str(status_path),
+                    "--prompt",
+                    "never launch",
+                ])
+        assert rc == 2
+        payload = json.loads(status_path.read_text(encoding="utf-8"))
+        assert payload["state"] == "blocked_windows_dispatch"
+        assert payload["lease_id"] is None
+        assert payload["worker_pid"] is None
+        assert payload["worker_alive"] is False
+        assert not (tmp / "worktrees").exists()
+        _assert_dispatch_message(payload["error"])
+
+
 def case_os_sandbox_refuses_native_windows() -> None:
     with patch("goalflight_compat.is_windows", return_value=True):
         try:
@@ -132,6 +205,8 @@ def main() -> None:
     case_acp_spawn_refuses_native_windows()
     case_review_job_refuses_native_windows()
     case_acp_run_refuses_before_side_effects()
+    case_dispatch_bash_front_door_refuses_before_launch()
+    case_dispatch_acp_front_door_refuses_before_side_effects()
     case_os_sandbox_refuses_native_windows()
     print("OK: native Windows dispatch refusal tests pass")
 

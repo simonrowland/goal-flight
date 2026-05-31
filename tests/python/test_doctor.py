@@ -17,6 +17,13 @@ def case_doctor_reports_platform_fields_for_windows() -> None:
     patches = [
         patch("goalflight_compat.is_windows", return_value=True),
         patch("goalflight_compat.python_executable", return_value=r"C:\Python311\python.exe"),
+        patch("goalflight_compat.probe_wsl", return_value={
+            "state": "ready",
+            "usable": True,
+            "present": True,
+            "distributions": ["Ubuntu"],
+            "declined": False,
+        }),
         patch("goalflight_doctor.app_exists", return_value=False),
         patch("goalflight_doctor.version", return_value={"present": False}),
         patch("goalflight_doctor.check_plugin", return_value={"skipped": True}),
@@ -49,7 +56,13 @@ def case_doctor_reports_platform_fields_for_windows() -> None:
     platform = payload["platform"]
     assert platform["is_windows"] is True
     assert platform["resolved_python"] == r"C:\Python311\python.exe"
-    assert "dispatch -> use WSL" in platform["native_windows_support"]
+    assert "dispatch refused" in platform["native_windows_support"]
+    assert "tracked pid-only" in platform["native_windows_support"]
+    assert payload["wsl"]["host"] == "native_windows"
+    assert payload["wsl"]["usable"] is True
+    assert payload["wsl"]["dispatch_capability"] == "refused_native_use_wsl"
+    assert payload["wsl"]["native_cleanup"] == "degraded_per_pid"
+    assert "UTF-16LE/NUL" in payload["wsl"]["false_no_distro_debug"]
 
 
 def main() -> None:

@@ -480,7 +480,7 @@ def main(argv: list[str] | None = None) -> int:
             "name": args.name,
             "state": "blocked_windows_dispatch",
             "error": goalflight_compat.windows_dispatch_refusal(),
-            "next_step": "wsl --install; re-run inside the distro",
+            "next_step": "wsl --install; open an installed distro and run dispatch from the WSL checkout",
             "prompt_path": args.prompt,
             "stdout_path": str(stdout_path),
             "stderr_path": str(stderr_path),

@@ -28,9 +28,10 @@ Restart the host, then run doctor: `python3 scripts/goalflight_doctor.py --proje
 
 ## Windows
 
-Native Windows support is Phase 1 read/plan only. Doctor, status, action
-routing, capacity reads, and ledger reads work. Live worker dispatch and
-file-backed review jobs refuse on native Windows with a WSL next step:
+Native Windows support is read/plan control-plane only. Doctor, status, action
+routing, capacity reads, and ledger reads work. Full worker dispatch requires
+WSL; live worker dispatch and file-backed review jobs refuse on native Windows
+with a WSL next step:
 
 ```powershell
 wsl --install
@@ -45,10 +46,16 @@ cd "$env:USERPROFILE\.goal-flight"
 py -3 .\scripts\goalflight_doctor.py --project-root C:\path\to\project --text
 ```
 
+Doctor JSON includes a `wsl` field. `wsl.exe` alone is not enough: `wsl -l -q`
+must list at least one installed distro. If install is declined during init, a
+project-local stamp suppresses repeat prompts and native Windows continues as a
+non-feature-complete control plane with degraded tracked-pid cleanup.
+
 Keep two installs when you dispatch from WSL: one native Windows checkout for
 read/plan, one WSL checkout under the Linux home directory for dispatch. See
-[docs/hosts/windows.md](docs/hosts/windows.md) for the capability matrix,
-launcher details, CRLF caveat, and two-install procedure.
+[docs/hosts/windows.md](docs/hosts/windows.md) for the WSL baseline, manual
+real-Windows acceptance gate, capability matrix, launcher details, CRLF caveat,
+and two-install procedure.
 
 Same flags via `setup.sh`: `--cursor-install`, `--opencode-install`, and `--codex-install` (each implies `--apply --yes`). Dry-run, link-to-Claude, and agents-standard paths are in [docs/hosts/cursor.md](docs/hosts/cursor.md) and [docs/hosts/opencode.md](docs/hosts/opencode.md).
 

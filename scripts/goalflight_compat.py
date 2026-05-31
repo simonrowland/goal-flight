@@ -26,32 +26,68 @@ The Windows branches use stdlib ``ctypes`` / ``msvcrt`` only -- zero new wheels.
 from __future__ import annotations
 
 import errno
+import json
+import logging
 import os
+import shutil
+import signal
+import subprocess
 import sys
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 __all__ = [
     "is_windows",
+    "is_wsl",
     "python_executable",
     "windows_dispatch_refusal",
     "windows_os_sandbox_refusal",
     "windows_hooks_skip",
     "windows_watcher_skip",
+    "wsl_decline_stamp_path",
+    "wsl_install_declined",
+    "record_wsl_install_declined",
+    "probe_wsl",
     "LOCK_EX",
     "LOCK_SH",
     "LOCK_NB",
     "LOCK_UN",
     "flock",
     "pid_alive",
+    "windows_process_identity",
+    "kill_pid",
     "default_state_dir",
     "temp_base",
 ]
 
 
+log = logging.getLogger("goal-flight.compat")
+
+
 def is_windows() -> bool:
     """True on native Windows (``os.name == "nt"``). NOT true under WSL."""
     return os.name == "nt"
+
+
+def is_wsl() -> bool:
+    """True when Python is already running inside WSL, not native Windows.
+
+    WSL reports as Linux/POSIX to Python, so ``is_windows()`` must stay false
+    there. If this misdetects on a real WSL box, check
+    ``/proc/sys/kernel/osrelease`` and ``/proc/version`` first; WSL1/WSL2 both
+    include a Microsoft/WSL marker in one of those files.
+    """
+    if is_windows() or sys.platform != "linux":
+        return False
+    for marker_path in (Path("/proc/sys/kernel/osrelease"), Path("/proc/version")):
+        try:
+            text = marker_path.read_text(encoding="utf-8", errors="ignore").lower()
+        except OSError:
+            continue
+        if "microsoft" in text or "wsl" in text:
+            return True
+    return False
 
 
 def python_executable() -> str:
@@ -61,9 +97,11 @@ def python_executable() -> str:
 
 def windows_dispatch_refusal() -> str:
     return (
-        "native Windows dispatch is off in Phase 1: run `wsl --install`, "
-        "re-run inside the distro, and use the WSL install. "
-        "Phase 2 enables native dispatch. See docs/hosts/windows.md#native-windows-support."
+        "native Windows dispatch is intentionally unsupported: run `wsl --install`, "
+        "open an installed distro, and use the WSL install for dispatch. "
+        "Native Windows keeps read/plan plus degraded per-pid cleanup only; "
+        "there is no native Win32 dispatch port. See "
+        "docs/hosts/windows.md#wsl-required-dispatch-baseline."
     )
 
 
@@ -88,6 +126,282 @@ def windows_watcher_skip() -> str:
         "bash-tail watcher is POSIX/Git-Bash-only and is skipped on native Windows; "
         "use WSL for dispatch watching. See docs/hosts/windows.md#capability-matrix."
     )
+
+
+def wsl_decline_stamp_path(project_root: str | os.PathLike[str]) -> Path:
+    """Per-project stamp recording that the operator declined WSL install.
+
+    Init is allowed to ask once, but repeated native-Windows runs should not nag.
+    The controller writes this file only after an explicit user-question decline;
+    doctor and init read it to decide whether to surface the WSL install prompt
+    again.
+    """
+    return Path(project_root) / "docs-private" / "windows-wsl-install-declined.json"
+
+
+def wsl_install_declined(project_root: str | os.PathLike[str] | None) -> bool:
+    if project_root is None:
+        return False
+    try:
+        return wsl_decline_stamp_path(project_root).is_file()
+    except OSError:
+        return False
+
+
+def record_wsl_install_declined(
+    project_root: str | os.PathLike[str],
+    *,
+    reason: str = "user_declined_wsl_install",
+) -> Path:
+    """Write the no-nag WSL decline stamp used by init.
+
+    This helper exists so Windows controllers do not invent incompatible stamp
+    formats. If writing fails on Windows, check that ``docs-private`` exists and
+    that the controller has write permission to the project checkout.
+    """
+    path = wsl_decline_stamp_path(project_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema": "goalflight.windows_wsl_decline.v1",
+        "reason": reason,
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+    }
+    path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+    return path
+
+
+def _decode_wsl_list_output(raw: bytes | str | None) -> str:
+    """Decode ``wsl -l -q`` output from real Windows.
+
+    ``wsl.exe`` often emits UTF-16LE with NUL bytes even when Python expects the
+    console code page. If a machine has distros but the probe sees zero, suspect
+    this decode/NUL handling before changing the WSL readiness logic.
+    """
+    if raw is None:
+        return ""
+    if isinstance(raw, str):
+        return raw.replace("\x00", "")
+    candidates = ("utf-16le", "utf-8-sig", "utf-8")
+    if b"\x00" not in raw:
+        candidates = ("utf-8-sig", "utf-8", "utf-16le")
+    for encoding in candidates:
+        try:
+            text = raw.decode(encoding)
+            return text.replace("\x00", "")
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace").replace("\x00", "")
+
+
+def _wsl_no_distro_line(line: str) -> bool:
+    lower = line.lower()
+    if "no installed distributions" in lower:
+        return True
+    if "windows subsystem for linux" in lower and (
+        "no installed" in lower or "has no" in lower
+    ):
+        return True
+    # German Windows output seen in acceptance: do not let localized no-distro
+    # prose survive as a fake distro name.
+    if (
+        "keine" in lower
+        and ("distribution" in lower or "verteilung" in lower)
+        and ("install" in lower or "installiert" in lower)
+    ):
+        return True
+    return False
+
+
+def _wsl_guidance_or_no_distro_line(line: str) -> bool:
+    lower = line.lower()
+    if _wsl_no_distro_line(line):
+        return True
+    guidance_markers = (
+        "distributions can be installed",
+        "can be installed",
+        "install a distribution",
+        "install distributions",
+        "wsl --install",
+        "wsl.exe --install",
+        "microsoft store",
+        "https://",
+        "http://",
+        "aka.ms/",
+    )
+    return any(marker in lower for marker in guidance_markers)
+
+
+def _wsl_distro_lines(text: str) -> list[str]:
+    lines: list[str] = []
+    for raw in text.splitlines():
+        line = raw.strip().strip("\ufeff")
+        if not line:
+            continue
+        if _wsl_guidance_or_no_distro_line(line):
+            continue
+        lines.append(line)
+    return lines
+
+
+def _probe_wsl_default_launch(
+    exe: str,
+    *,
+    runner=subprocess.run,
+) -> tuple[bool, dict]:
+    sentinel = "__goalflight_wsl_ready__"
+    cmd = [exe, "-e", "sh", "-lc", f"printf {sentinel}"]
+    try:
+        proc = runner(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=8,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, {"launch_error": f"{type(exc).__name__}: {exc}"}
+    stdout = _decode_wsl_list_output(getattr(proc, "stdout", b""))
+    stderr = _decode_wsl_list_output(getattr(proc, "stderr", b""))
+    return (
+        getattr(proc, "returncode", 1) == 0 and sentinel in stdout,
+        {
+            "launch_returncode": getattr(proc, "returncode", None),
+            "launch_stdout": stdout.strip()[:1000],
+            "launch_stderr": stderr.strip()[:1000],
+        },
+    )
+
+
+def probe_wsl(
+    project_root: str | os.PathLike[str] | None = None,
+    *,
+    runner=subprocess.run,
+    which=shutil.which,
+) -> dict:
+    """Probe whether native Windows can hand dispatch to an installed WSL distro.
+
+    Native Windows is allowed to run the control plane, but full worker dispatch
+    must run *inside* WSL. ``wsl.exe`` by itself is insufficient: Windows can have
+    the feature enabled with zero installed distros, and that state cannot run a
+    POSIX worker. If Monday's acceptance box reports ``no_installed_distributions``
+    despite Ubuntu being installed, inspect the decoded ``stdout`` / ``stderr``
+    fields in doctor JSON for encoding or enterprise-policy output.
+    """
+    declined = wsl_install_declined(project_root)
+    base = {
+        "schema": "goalflight.wsl_probe.v1",
+        "is_windows": is_windows(),
+        "is_wsl": is_wsl(),
+        "usable": False,
+        "present": False,
+        "wsl_exe_present": False,
+        "wsl_exe": None,
+        "distributions": [],
+        "declined": declined,
+        "decline_stamp": str(wsl_decline_stamp_path(project_root)) if project_root else None,
+        "install_command": "wsl --install",
+        "requires_admin": True,
+        "requires_reboot": True,
+    }
+    if not is_windows():
+        base.update(
+            {
+                "state": "running_under_wsl" if is_wsl() else "not_native_windows",
+                "usable": is_wsl(),
+                "present": is_wsl(),
+                "reason": "already inside WSL" if is_wsl() else "not native Windows",
+            }
+        )
+        return base
+
+    exe = which("wsl.exe") or which("wsl")
+    if not exe:
+        base.update(
+            {
+                "state": "missing_executable",
+                "reason": "wsl.exe not found on PATH",
+                "next_step": "Ask before running `wsl --install` (admin elevation and reboot may be required).",
+            }
+        )
+        return base
+
+    base["wsl_exe_present"] = True
+    base["wsl_exe"] = exe
+    try:
+        # Keep this as bytes. ``text=True`` can misdecode UTF-16LE/NUL output
+        # from ``wsl -l -q`` and produce a false "no distro" diagnosis.
+        proc = runner(
+            [exe, "-l", "-q"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=8,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        base.update(
+            {
+                "state": "probe_failed",
+                "reason": f"{type(exc).__name__}: {exc}",
+                "next_step": "Run `wsl -l -q` manually in PowerShell and inspect stderr.",
+            }
+        )
+        return base
+
+    stdout = _decode_wsl_list_output(getattr(proc, "stdout", b""))
+    stderr = _decode_wsl_list_output(getattr(proc, "stderr", b""))
+    distros = _wsl_distro_lines(stdout)
+    no_distro_marker = any(
+        _wsl_no_distro_line(line)
+        for text in (stdout, stderr)
+        for line in text.splitlines()
+    )
+    base.update(
+        {
+            "returncode": getattr(proc, "returncode", None),
+            "stdout": stdout.strip()[:1000],
+            "stderr": stderr.strip()[:1000],
+            "distributions": distros,
+        }
+    )
+    if distros:
+        launch_ok, launch_probe = _probe_wsl_default_launch(exe, runner=runner)
+        base.update(launch_probe)
+        if not launch_ok:
+            base.update(
+                {
+                    "state": "distro_launch_failed",
+                    "reason": "wsl.exe listed distro(s), but default distro launch did not complete",
+                    "next_step": "Open the listed distro once, then rerun doctor; inspect launch_stdout/stderr if this persists.",
+                }
+            )
+            return base
+        base.update(
+            {
+                "state": "ready",
+                "present": True,
+                "usable": True,
+                "reason": "wsl.exe present and at least one installed distro listed",
+                "next_step": "Open the distro and run Goal Flight dispatch from the WSL checkout.",
+            }
+        )
+        return base
+
+    # wsl.exe present + no distro is NOT usable. Treating it as ready would send
+    # dispatch into a POSIX path that has no Linux filesystem or shell yet.
+    if getattr(proc, "returncode", 1) == 0 or no_distro_marker:
+        state = "no_installed_distributions"
+        reason = "wsl.exe present but `wsl -l -q` listed zero installed distros"
+    else:
+        state = "probe_failed"
+        reason = stderr.splitlines()[0] if stderr.splitlines() else "wsl -l -q failed"
+    base.update(
+        {
+            "state": state,
+            "reason": reason,
+            "next_step": "Ask before running `wsl --install` (admin elevation and reboot may be required).",
+        }
+    )
+    return base
 
 
 # --------------------------------------------------------------------------- #
@@ -241,3 +555,162 @@ def pid_alive(pid) -> bool:
         return code.value == STILL_ACTIVE
     finally:  # pragma: no cover
         kernel32.CloseHandle(handle)
+
+
+def windows_process_identity(pid) -> dict | None:
+    """Native-Windows process identity from creation FILETIME.
+
+    A pid alone is unsafe for cleanup because Windows can reuse it. The creation
+    time from GetProcessTimes is the minimum identity token we require before
+    terminating a stale pidfile entry.
+    """
+    try:
+        pid_int = int(pid)
+    except (TypeError, ValueError):
+        return None
+    if pid_int <= 0 or not is_windows():
+        return None
+
+    import ctypes  # pragma: no cover
+    from ctypes import wintypes  # pragma: no cover
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000  # pragma: no cover
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # pragma: no cover
+    kernel32.OpenProcess.restype = wintypes.HANDLE  # pragma: no cover
+    kernel32.OpenProcess.argtypes = (  # pragma: no cover
+        wintypes.DWORD,
+        wintypes.BOOL,
+        wintypes.DWORD,
+    )
+    handle = kernel32.OpenProcess(  # pragma: no cover
+        PROCESS_QUERY_LIMITED_INFORMATION, False, pid_int
+    )
+    if not handle:  # pragma: no cover
+        return None
+    try:  # pragma: no cover
+        kernel32.GetProcessTimes.restype = wintypes.BOOL
+        kernel32.GetProcessTimes.argtypes = (
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+        )
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        created = wintypes.FILETIME()
+        exited = wintypes.FILETIME()
+        kernel = wintypes.FILETIME()
+        user = wintypes.FILETIME()
+        if not kernel32.GetProcessTimes(
+            handle,
+            ctypes.byref(created),
+            ctypes.byref(exited),
+            ctypes.byref(kernel),
+            ctypes.byref(user),
+        ):
+            return None
+        creation_time = (int(created.dwHighDateTime) << 32) | int(created.dwLowDateTime)
+        return {
+            "pid": pid_int,
+            "creation_time": str(creation_time),
+            "identity_source": "windows_get_process_times",
+        }
+    finally:  # pragma: no cover
+        kernel32.CloseHandle(handle)
+
+
+def _windows_identity_matches(expected_identity: dict | None, current_identity: dict | None) -> tuple[bool, str]:
+    if not isinstance(expected_identity, dict):
+        return False, "missing_expected_identity"
+    expected = (
+        expected_identity.get("creation_time")
+        or expected_identity.get("creation_time_filetime")
+        or expected_identity.get("create_time")
+    )
+    if expected in (None, ""):
+        return False, "missing_expected_creation_time"
+    if not isinstance(current_identity, dict):
+        return False, "missing_current_identity"
+    current = (
+        current_identity.get("creation_time")
+        or current_identity.get("creation_time_filetime")
+        or current_identity.get("create_time")
+    )
+    if current in (None, ""):
+        return False, "missing_current_creation_time"
+    if str(expected) != str(current):
+        return False, "creation_time_mismatch"
+    return True, "matched"
+
+
+def kill_pid(
+    pid,
+    sig: int | None = None,
+    *,
+    pgid=None,
+    process_group: bool = True,
+    expected_identity: dict | None = None,
+) -> bool:
+    """Best-effort stale-worker kill with native-Windows degradation.
+
+    POSIX callers historically reap a worker's whole process group with
+    ``os.killpg`` because bash-tail / ACP workers can leave child processes.
+    Native Windows has no ``os.killpg`` and this project intentionally does not
+    add Job Objects for a native dispatch port. A bare pid is unsafe there
+    because pid reuse can target an unrelated process, so Windows kills require
+    a recorded creation-time identity that still matches the live pid.
+    """
+    try:
+        pid_int = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid_int <= 0:
+        return False
+    kill_signal = sig if sig is not None else getattr(signal, "SIGTERM", 15)
+
+    if is_windows():  # pragma: no cover - covered by mocks on non-Windows
+        current_identity = windows_process_identity(pid_int)
+        identity_ok, identity_reason = _windows_identity_matches(
+            expected_identity, current_identity
+        )
+        if not identity_ok:
+            log.warning(
+                "windows kill_pid skipped pid=%s reason=%s expected=%r current=%r",
+                pid_int,
+                identity_reason,
+                expected_identity,
+                current_identity,
+            )
+            return False
+        try:
+            os.kill(pid_int, kill_signal)
+            return True
+        except (OSError, ValueError):
+            # Windows supports only a narrow signal set. OSError usually means
+            # the tracked stale pid already exited or is access-denied; ValueError
+            # means the requested signal is unsupported. Treat as "not killed" but
+            # never as a controller crash; the native control plane is degraded by
+            # design.
+            return False
+
+    if process_group:
+        try:
+            target = int(pgid) if pgid is not None else pid_int
+        except (TypeError, ValueError):
+            target = pid_int
+        try:
+            os.killpg(target, kill_signal)
+            return True
+        except (ProcessLookupError, PermissionError):
+            try:
+                os.kill(pid_int, kill_signal)
+                return True
+            except (ProcessLookupError, PermissionError):
+                return False
+
+    try:
+        os.kill(pid_int, kill_signal)
+        return True
+    except (ProcessLookupError, PermissionError):
+        return False

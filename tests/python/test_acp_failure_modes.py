@@ -430,6 +430,7 @@ def case_runner_progress_then_silent_wedges_and_reaps() -> None:
         "progress_then_silent",
         progress_stall_s=30.0,
         liveness_profile="local_compute",
+        extra_env={"GOALFLIGHT_TEST_PGROUP_CPU_PCT": "0.0"},
     )
 
     assert returncode != 0, stdout
@@ -735,6 +736,7 @@ def case_runner_goal_mode_heartbeat_backstop() -> None:
         "progress_then_silent",
         progress_stall_s=30.0,
         idle_timeout=0.0,
+        extra_env={"GOALFLIGHT_TEST_PGROUP_CPU_PCT": "0.0"},
     )
 
     assert returncode != 0, stdout

@@ -142,14 +142,14 @@ def main() -> int:
             "dispatch_id": args.dispatch_id,
             "agent": args.agent,
             "worker_pid": args.pid,
-            "state": "watcher_skipped_windows",
+            "state": "blocked_windows_dispatch",
             "reason": goalflight_compat.windows_watcher_skip(),
             "tail_path": str(tail),
             "updated_at": int(time.time()),
         }
         write_status(status_path, payload)
         print(json.dumps({"state": payload["state"], "reason": payload["reason"], "status_path": str(status_path)}, sort_keys=True))
-        return 0
+        return 4
     last_size = -1
     last_change = time.time()
     terminal = None
