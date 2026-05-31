@@ -14,6 +14,7 @@ real exit code is propagated by the dispatcher (no masking).
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -28,6 +29,9 @@ def _run(worker_cmd: list[str], max_idle: str = "20", poll: str = "1"):
     with tempfile.TemporaryDirectory() as tmp:
         tail = Path(tmp) / "tail.txt"
         status = Path(tmp) / "status.json"
+        env = os.environ.copy()
+        env["GOALFLIGHT_STATE_DIR"] = str(Path(tmp) / "state")
+        env["GOAL_FLIGHT_PIDFILE_DIR"] = str(Path(tmp) / "pids")
         t0 = time.time()
         proc = subprocess.run(
             [
@@ -35,7 +39,7 @@ def _run(worker_cmd: list[str], max_idle: str = "20", poll: str = "1"):
                 "--agent", "test", "--tail", str(tail), "--status-json", str(status),
                 "--poll-secs", poll, "--max-idle-secs", max_idle, "--", *worker_cmd,
             ],
-            capture_output=True, text=True, timeout=float(max_idle) + 30,
+            capture_output=True, text=True, timeout=float(max_idle) + 30, env=env,
         )
         elapsed = time.time() - t0
         lines = proc.stdout.strip().splitlines()

@@ -239,7 +239,7 @@ def cleanup_ghosts(active_worker_pids: set[int] | None = None) -> int:
             continue
         if controller_pid == own_pid:
             continue
-        if _ps_meta(controller_pid) is not None:
+        if _ps_meta(controller_pid) is not None or goalflight_compat.pid_alive(controller_pid):
             skipped_live_controller += 1
             continue
         try:

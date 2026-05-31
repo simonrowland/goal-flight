@@ -149,6 +149,9 @@ def classify(record: dict) -> str:
         "blocked_capacity",
         "blocked_session_limit",
         "blocked_auth",
+        "worker_dead",
+        "idle_timeout",
+        "orphaned",
         "inconclusive_timeout",
         "inconclusive_no_final",
     }
