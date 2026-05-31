@@ -51,6 +51,16 @@ must list at least one installed distro. If install is declined during init, a
 project-local stamp suppresses repeat prompts and native Windows continues as a
 non-feature-complete control plane with degraded tracked-pid cleanup.
 
+Native Windows first action:
+
+```powershell
+py -3 .\tests\run_python.py
+```
+
+That native runner executes the Python suite: Windows-activated tests fire, and
+POSIX-only tests skip with a visible WSL reminder. The bash suite is POSIX/WSL
+only; run `./tests/run.sh` from inside WSL for that layer.
+
 Keep two installs when you dispatch from WSL: one native Windows checkout for
 read/plan, one WSL checkout under the Linux home directory for dispatch. See
 [docs/hosts/windows.md](docs/hosts/windows.md) for the WSL baseline, manual

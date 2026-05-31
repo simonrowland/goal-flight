@@ -3,6 +3,10 @@
 
 from __future__ import annotations
 
+from support import skip_posix_on_native_windows
+
+skip_posix_on_native_windows("bash-tail probe is POSIX/WSL-only")
+
 import json
 import sys
 import tempfile

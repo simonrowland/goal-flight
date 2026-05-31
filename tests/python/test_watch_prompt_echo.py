@@ -11,6 +11,10 @@ only complete on the worker's REAL marker.
 
 from __future__ import annotations
 
+from support import skip_posix_on_native_windows
+
+skip_posix_on_native_windows("watch prompt echo uses bash-tail and start_new_session")
+
 import json
 import subprocess
 import sys

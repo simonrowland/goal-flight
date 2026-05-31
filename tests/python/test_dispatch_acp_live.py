@@ -3,6 +3,10 @@
 
 from __future__ import annotations
 
+from support import skip_posix_on_native_windows
+
+skip_posix_on_native_windows("live ACP dispatch is WSL/POSIX-only")
+
 import json
 import os
 from pathlib import Path

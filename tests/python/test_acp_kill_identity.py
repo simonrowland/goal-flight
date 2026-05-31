@@ -3,6 +3,10 @@
 
 from __future__ import annotations
 
+from support import skip_posix_on_native_windows
+
+skip_posix_on_native_windows("asserts POSIX bash process identity strings")
+
 import sys
 import json
 import tempfile

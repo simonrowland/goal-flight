@@ -3,6 +3,10 @@
 
 from __future__ import annotations
 
+from support import skip_posix_on_native_windows
+
+skip_posix_on_native_windows("uses POSIX process groups, start_new_session, and signals")
+
 import asyncio
 import contextlib
 import json

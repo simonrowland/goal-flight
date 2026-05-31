@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from support import skip_posix_on_native_windows
+
+skip_posix_on_native_windows("liveness tests use POSIX start_new_session process trees")
+
 import asyncio
 import json
 import os

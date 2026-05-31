@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -12,13 +13,22 @@ SCRIPT = ROOT / "scripts" / "goalflight_controller_preflight.py"
 
 
 def _run(adapter: str) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        [sys.executable, str(SCRIPT), "--adapter", adapter, "--json"],
-        cwd=str(ROOT),
-        text=True,
-        capture_output=True,
-        check=False,
-    )
+    with tempfile.TemporaryDirectory() as td:
+        return subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT),
+                "--adapter",
+                adapter,
+                "--fleet-dir",
+                td,
+                "--json",
+            ],
+            cwd=str(ROOT),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
 
 
 def test_grok_controller_red():

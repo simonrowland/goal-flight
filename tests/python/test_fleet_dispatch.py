@@ -3,6 +3,10 @@
 
 from __future__ import annotations
 
+from support import skip_posix_on_native_windows
+
+skip_posix_on_native_windows("fleet dispatch fixtures use POSIX /tmp paths")
+
 import io
 import json
 import sys

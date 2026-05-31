@@ -13,6 +13,10 @@ real exit code is propagated by the dispatcher (no masking).
 
 from __future__ import annotations
 
+from support import skip_posix_on_native_windows
+
+skip_posix_on_native_windows("crash-safety tests launch POSIX bash workers")
+
 import json
 import os
 import subprocess

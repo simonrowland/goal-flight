@@ -3,6 +3,10 @@
 
 from __future__ import annotations
 
+from support import skip_posix_on_native_windows
+
+skip_posix_on_native_windows("fleet partition matrix fixtures use POSIX /tmp paths")
+
 import json
 import shutil
 import sys

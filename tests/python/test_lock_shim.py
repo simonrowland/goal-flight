@@ -3,6 +3,10 @@
 
 from __future__ import annotations
 
+from support import skip_posix_on_native_windows
+
+skip_posix_on_native_windows("lock shim POSIX branch asserts /tmp, killpg, and signals")
+
 import os
 import signal
 import sys

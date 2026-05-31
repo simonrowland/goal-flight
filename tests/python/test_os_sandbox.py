@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from support import note_skip, skip_case_posix_on_native_windows
+
 import argparse
 import asyncio
 import json
@@ -52,6 +54,17 @@ def _sandbox_available() -> bool:
     except (OSError, subprocess.TimeoutExpired):
         return False
     return result.returncode == 0
+
+
+def _skip_unless_posix_shell_case(case_name: str) -> bool:
+    return skip_case_posix_on_native_windows(case_name, "requires POSIX shell execution")
+
+
+def _skip_unless_sandbox_exec_case(case_name: str) -> bool:
+    if _sandbox_available():
+        return False
+    note_skip(case_name, "sandbox-exec unavailable")
+    return True
 
 
 def _write_supported_adapter_manifest(directory: Path, name: str) -> None:
@@ -260,6 +273,8 @@ def _dispatch_shell_argv_for_platform(system_name: str) -> list[str]:
 
 
 def case_shell_wrapper_guards_os_sandbox_to_darwin() -> None:
+    if _skip_unless_posix_shell_case("case_shell_wrapper_guards_os_sandbox_to_darwin"):
+        return
     text = (ROOT / "scripts" / "goalflight_dispatch.sh").read_text(encoding="utf-8")
     assert "os_sandbox_args=()" in text
     assert "permission_allow_args=()" in text
@@ -281,8 +296,7 @@ def case_shell_wrapper_guards_os_sandbox_to_darwin() -> None:
 
 
 def case_prepare_wrapper_blocks_home_write() -> None:
-    if not _sandbox_available():
-        print("SKIP: sandbox-exec unavailable")
+    if _skip_unless_sandbox_exec_case("case_prepare_wrapper_blocks_home_write"):
         return
     workspace = ROOT / f".goalflight-os-sandbox-direct-{os.getpid()}"
     outside = Path.home() / ".goalflight-sandbox-outside-probe"
@@ -324,8 +338,7 @@ def case_prepare_wrapper_blocks_home_write() -> None:
 
 
 def case_profile_string_escapes_workspace_path() -> None:
-    if not _sandbox_available():
-        print("SKIP: sandbox-exec unavailable")
+    if _skip_unless_sandbox_exec_case("case_profile_string_escapes_workspace_path"):
         return
     base = ROOT / f".goalflight-os-sandbox-injection-{os.getpid()}"
     outside = Path.home() / ".goalflight-sandbox-injection-probe"
@@ -393,8 +406,7 @@ def case_profile_grants_dev_null_write() -> None:
 
 
 def case_rejects_cwd_under_temp_root() -> None:
-    if not _sandbox_available():
-        print("SKIP: sandbox-exec unavailable")
+    if _skip_unless_sandbox_exec_case("case_rejects_cwd_under_temp_root"):
         return
     with tempfile.TemporaryDirectory(prefix="gf-os-sandbox-temp-cwd-") as tmp:
         try:
@@ -411,8 +423,7 @@ def case_rejects_cwd_under_temp_root() -> None:
 
 
 def case_agent_state_roots_are_explicit_exception() -> None:
-    if not _sandbox_available():
-        print("SKIP: sandbox-exec unavailable")
+    if _skip_unless_sandbox_exec_case("case_agent_state_roots_are_explicit_exception"):
         return
     old_home = os.environ.get("HOME")
     base = ROOT / f".goalflight-os-sandbox-agent-state-{os.getpid()}"
@@ -460,8 +471,7 @@ def case_agent_state_roots_are_explicit_exception() -> None:
 
 
 def case_rejects_cwd_under_agent_state_root() -> None:
-    if not _sandbox_available():
-        print("SKIP: sandbox-exec unavailable")
+    if _skip_unless_sandbox_exec_case("case_rejects_cwd_under_agent_state_root"):
         return
     old_home = os.environ.get("HOME")
     base = ROOT / f".goalflight-os-sandbox-agent-cwd-{os.getpid()}"
@@ -554,8 +564,7 @@ async def _run_sandbox_probe(profile: str) -> dict:
 
 
 def case_runner_workspace_write_blocks_home_write() -> None:
-    if not _sandbox_available():
-        print("SKIP: sandbox-exec unavailable")
+    if _skip_unless_sandbox_exec_case("case_runner_workspace_write_blocks_home_write"):
         return
     payload = asyncio.run(_run_sandbox_probe(OS_SANDBOX_WORKSPACE_WRITE))
     assert payload["state"] == "complete", payload
@@ -566,8 +575,7 @@ def case_runner_workspace_write_blocks_home_write() -> None:
 
 
 def case_runner_read_only_blocks_workspace_write() -> None:
-    if not _sandbox_available():
-        print("SKIP: sandbox-exec unavailable")
+    if _skip_unless_sandbox_exec_case("case_runner_read_only_blocks_workspace_write"):
         return
     payload = asyncio.run(_run_sandbox_probe(OS_SANDBOX_READ_ONLY))
     assert payload["state"] == "complete", payload
@@ -636,8 +644,7 @@ def case_runner_blocks_undeclared_os_sandbox_before_capacity() -> None:
 
 
 def case_runner_blocks_temp_cwd_before_capacity() -> None:
-    if not _sandbox_available():
-        print("SKIP: sandbox-exec unavailable")
+    if _skip_unless_sandbox_exec_case("case_runner_blocks_temp_cwd_before_capacity"):
         return
     old_agent_command = goalflight_acp_run.agent_command
     old_adapters_dir = goalflight_adapter_readiness.ADAPTERS_DIR

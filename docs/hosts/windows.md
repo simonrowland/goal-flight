@@ -132,19 +132,26 @@ or `Scripts/python.exe` virtualenv with the WSL dispatch install.
 
 ## Manual Acceptance Gate
 
-This repository's automated tests mock native Windows from macOS/Linux. Real
-native-Windows behavior remains a manual acceptance gate:
+Native Windows first action is the Python suite:
 
 ```powershell
-py -3 .\scripts\goalflight_doctor.py --project-root C:\path\to\project --json
+py -3 .\tests\run_python.py
 ```
 
-Check that `wsl.probe.state` distinguishes missing `wsl.exe`,
-`no_installed_distributions`, and `ready`; check that dispatch still refuses on
-native Windows; then run the gated WSL smoke from inside the distro:
+The native runner executes `tests/python/test_*.py`. Windows-activated tests run
+against the real host (`wsl.exe`, Windows `os.kill`, Windows paths, native
+dispatch refusal). POSIX-only tests skip on native Windows with a visible
+reminder:
+
+- no usable WSL: install WSL with `wsl --install`, then run the POSIX suite in WSL
+- usable WSL: run the POSIX suite inside WSL
+
+The bash suite (`tests/bash/*.sh`) is POSIX/WSL-only and is intentionally not
+part of the native Windows entry point. After native Python signal is collected,
+run the POSIX layer from inside the distro:
 
 ```bash
-GOALFLIGHT_WSL=1 tests/bash/test-wsl-dispatch-smoke.sh
+./tests/run.sh
 ```
 
 ## OS Sandbox

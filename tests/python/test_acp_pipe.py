@@ -3,6 +3,10 @@
 
 from __future__ import annotations
 
+from support import skip_posix_on_native_windows
+
+skip_posix_on_native_windows("exercises POSIX ACP worker process lifecycle")
+
 import asyncio
 import argparse
 import json

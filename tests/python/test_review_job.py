@@ -3,6 +3,10 @@
 
 from __future__ import annotations
 
+from support import skip_posix_on_native_windows
+
+skip_posix_on_native_windows("review job tests use POSIX process groups and ps")
+
 import json
 import os
 from pathlib import Path
@@ -61,6 +65,21 @@ def skipif(condition: bool, reason: str):
             return func(*args, **kwargs)
         return _wrapped
     return _decorator
+
+
+def ps_pgid_available() -> bool:
+    try:
+        subprocess.check_output(
+            ["ps", "-A", "-o", "pgid="],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=2.0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return True
 
 
 def pgroup_has_processes(pgid: int) -> bool:
@@ -177,6 +196,9 @@ def write_fake_codex(path: Path) -> None:
                     "    time.sleep(1)\n"
                 )
                 subprocess.Popen([sys.executable, "-c", child_code, str(child_pid_file), str(child_term_file)])
+                deadline = time.time() + 5
+                while not child_pid_file.exists() and time.time() < deadline:
+                    time.sleep(0.01)
                 emit({"type": "parent-done"})
                 final.write_text("parent exited but child stayed alive\n")
                 raise SystemExit(0)
@@ -366,7 +388,7 @@ def test_prompt_write_cannot_block_monitor_before_timeout() -> None:
         assert_true("stdin-block reason recorded", status["timeout_reason"] == "no_progress_timeout")
 
 
-@skipif(os.name == "nt", reason="POSIX process-group kill test")
+@skipif(os.name == "nt" or not ps_pgid_available(), reason="POSIX process-group kill test requires ps pgid listing")
 def test_parent_exit_with_live_child_is_inconclusive_and_reaped() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)

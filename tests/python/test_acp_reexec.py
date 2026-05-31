@@ -3,6 +3,10 @@
 
 from __future__ import annotations
 
+from support import skip_posix_on_native_windows
+
+skip_posix_on_native_windows("uses POSIX venv bin paths and symlink semantics")
+
 import os
 import sys
 import tempfile

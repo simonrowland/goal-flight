@@ -3,6 +3,10 @@
 
 from __future__ import annotations
 
+from support import skip_posix_on_native_windows
+
+skip_posix_on_native_windows("dispatch capacity tests launch POSIX bash workers")
+
 import datetime as dt
 import json
 import os

@@ -3,6 +3,10 @@
 
 from __future__ import annotations
 
+from support import skip_posix_on_native_windows
+
+skip_posix_on_native_windows("worktree dispatch tests use POSIX symlink semantics")
+
 import argparse
 import asyncio
 import contextlib
@@ -67,11 +71,11 @@ def acquire_active_dispatch(dispatch_id: str, project_root: Path) -> None:
         mem_mb=1,
         agent_cap=None,
         ttl_s=3600,
-        ram_mb=None,
+        ram_mb=65536,
         reserve_mb=goalflight_capacity.DEFAULT_RESERVE_MB,
         worst_worker_mb=goalflight_capacity.DEFAULT_WORST_WORKER_MB,
         hard_cap=goalflight_capacity.DEFAULT_HARD_CAP,
-        max_total=None,
+        max_total=10,
     )
     with contextlib.redirect_stdout(io.StringIO()):
         rc = goalflight_capacity.cmd_acquire(args)

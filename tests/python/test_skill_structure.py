@@ -18,6 +18,10 @@ becomes strict for that entry.
 
 from __future__ import annotations
 
+from support import skip_posix_on_native_windows
+
+skip_posix_on_native_windows("skill-structure runner checks invoke bash and POSIX /tmp paths")
+
 import ast
 from collections import Counter
 import os

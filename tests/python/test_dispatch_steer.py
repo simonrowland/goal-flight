@@ -13,6 +13,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+from support import skip_case_posix_on_native_windows
+
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = ROOT / "scripts"
 DISPATCH = SCRIPTS / "goalflight_dispatch.py"
@@ -207,6 +209,12 @@ def case_concurrent_appends_have_monotonic_unique_seq() -> None:
 
 
 def case_spawn_exports_steer_env() -> None:
+    if skip_case_posix_on_native_windows(
+        "case_spawn_exports_steer_env",
+        "steer env export launches a POSIX/WSL bash-tail dispatch worker",
+    ):
+        return
+
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
         dispatch_id = "env-export"

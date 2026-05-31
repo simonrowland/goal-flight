@@ -3,6 +3,10 @@
 
 from __future__ import annotations
 
+from support import skip_posix_on_native_windows
+
+skip_posix_on_native_windows("WSL smoke gate launches a bash test script")
+
 import os
 import stat
 import subprocess
