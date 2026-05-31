@@ -378,10 +378,9 @@ def create_dispatch_worktree(project_root: Path, dispatch_id: str) -> Path:
     return worktree_path
 
 
-def create_and_route_dispatch_worktree(args: argparse.Namespace, project_root: Path, dispatch_id: str) -> Path:
-    """Create a dispatch worktree and mutate args.cwd to point at it."""
+def create_and_route_dispatch_worktree(_cfg: argparse.Namespace, project_root: Path, dispatch_id: str) -> Path:
+    """Create a dispatch worktree; caller routes worker cwd with a local value."""
     created = create_dispatch_worktree(project_root, dispatch_id)
-    args.cwd = str(created)
     return created
 
 
@@ -519,14 +518,21 @@ async def spawn_and_handshake_with_retry(
     raise AcpError(f"handshake failed after {max(1, attempts)} attempt(s): {last_err}")
 
 
-async def run(args: argparse.Namespace) -> dict:
-    if not hasattr(args, "progress_stall_s") or args.progress_stall_s is None:
-        args.progress_stall_s = 300.0
-    manifest_profile, manifest_remote_turn_silence_s = adapter_liveness_config(args.agent)
-    liveness_profile = getattr(args, "liveness_profile", None) or manifest_profile
+async def run_acp_dispatch(cfg: argparse.Namespace) -> dict:
+    """Run one ACP dispatch from an argparse.Namespace config.
+
+    Not thread-callable: ACP connection registries and pidfiles are process-
+    scoped, and the asyncio objects created here are bound to the active loop.
+    """
+    progress_stall_s = getattr(cfg, "progress_stall_s", None)
+    if progress_stall_s is None:
+        progress_stall_s = 300.0
+    worker_cwd = cfg.cwd
+    manifest_profile, manifest_remote_turn_silence_s = adapter_liveness_config(cfg.agent)
+    liveness_profile = getattr(cfg, "liveness_profile", None) or manifest_profile
     if liveness_profile not in LIVENESS_PROFILES:
         liveness_profile = "local_compute"
-    requested_os_sandbox = getattr(args, "os_sandbox", OS_SANDBOX_OFF)
+    requested_os_sandbox = getattr(cfg, "os_sandbox", OS_SANDBOX_OFF)
     try:
         os_sandbox_profile: str | None = canonical_os_sandbox(requested_os_sandbox)
     except OsSandboxError as e:
@@ -534,7 +540,7 @@ async def run(args: argparse.Namespace) -> dict:
         os_sandbox_error = str(e)
     else:
         os_sandbox_error = None
-    remote_turn_silence_s = getattr(args, "remote_turn_silence_s", None)
+    remote_turn_silence_s = getattr(cfg, "remote_turn_silence_s", None)
     if remote_turn_silence_s is None:
         remote_turn_silence_s = manifest_remote_turn_silence_s
     try:
@@ -543,17 +549,17 @@ async def run(args: argparse.Namespace) -> dict:
         remote_turn_silence_s = DEFAULT_REMOTE_TURN_SILENCE_S
     if remote_turn_silence_s <= 0:
         remote_turn_silence_s = DEFAULT_REMOTE_TURN_SILENCE_S
-    remote_turn_cancel_grace_s = getattr(args, "remote_turn_cancel_grace_s", DEFAULT_REMOTE_TURN_CANCEL_GRACE_S)
+    remote_turn_cancel_grace_s = getattr(cfg, "remote_turn_cancel_grace_s", DEFAULT_REMOTE_TURN_CANCEL_GRACE_S)
     try:
         remote_turn_cancel_grace_s = float(remote_turn_cancel_grace_s)
     except (TypeError, ValueError):
         remote_turn_cancel_grace_s = DEFAULT_REMOTE_TURN_CANCEL_GRACE_S
     if remote_turn_cancel_grace_s < 0:
         remote_turn_cancel_grace_s = DEFAULT_REMOTE_TURN_CANCEL_GRACE_S
-    dispatch_id = args.dispatch_id or f"acp-{args.agent}-{uuid.uuid4().hex[:8]}"
+    dispatch_id = cfg.dispatch_id or f"acp-{cfg.agent}-{uuid.uuid4().hex[:8]}"
     run_started = time.time()
-    project_root = Path(args.cwd).resolve()
-    worktree_mode = getattr(args, "worktree", "off")
+    project_root = Path(cfg.cwd).resolve()
+    worktree_mode = getattr(cfg, "worktree", "off")
     worktree_path: Path | None = None
     worktree_error: str | None = None
     if worktree_mode == "create":
@@ -562,8 +568,8 @@ async def run(args: argparse.Namespace) -> dict:
         except Exception as e:
             worktree_error = f"{type(e).__name__}: {e}"
     status_path = (
-        Path(args.status_json)
-        if args.status_json
+        Path(cfg.status_json)
+        if cfg.status_json
         else project_root / (
             f".goalflight-{status_filename_segment(dispatch_id)}.status.json"
             if worktree_error is not None
@@ -574,10 +580,10 @@ async def run(args: argparse.Namespace) -> dict:
         "schema": "goalflight.acp-run.v1",
         "dispatch_id": dispatch_id,
         "lease_id": None,
-        "agent": args.agent,
-        "session_id": args.session_id,
+        "agent": cfg.agent,
+        "session_id": cfg.session_id,
         "project_root": str(project_root),
-        "worker_cwd": args.cwd,
+        "worker_cwd": worker_cwd,
         "worktree_mode": worktree_mode,
         "planned_worktree_path": str(worktree_path) if worktree_path is not None else None,
         "worktree_path": None,
@@ -624,14 +630,14 @@ async def run(args: argparse.Namespace) -> dict:
         write_status(status_path, payload)
         return payload
     try:
-        if args.prompt:
-            prompt = Path(args.prompt).read_text()
-        elif getattr(args, "prompt_b64", None):
+        if cfg.prompt:
+            prompt = Path(cfg.prompt).read_text()
+        elif getattr(cfg, "prompt_b64", None):
             import base64
 
-            prompt = base64.b64decode(args.prompt_b64.encode("ascii")).decode("utf-8")
+            prompt = base64.b64decode(cfg.prompt_b64.encode("ascii")).decode("utf-8")
         else:
-            prompt = args.prompt_text
+            prompt = cfg.prompt_text
         if not prompt:
             raise ValueError("--prompt, --prompt-text, or --prompt-b64 required")
     except Exception as e:
@@ -639,10 +645,10 @@ async def run(args: argparse.Namespace) -> dict:
         write_status(status_path, payload)
         return payload
 
-    command, acp_args = agent_command(args.agent)
-    install_slot = getattr(args, "install_slot", None)
-    spawn_env = dispatch_env(args.agent, install_slot)
-    gate = validate_acp_dispatch_readiness(args.agent, [command, *acp_args])
+    command, acp_args = agent_command(cfg.agent)
+    install_slot = getattr(cfg, "install_slot", None)
+    spawn_env = dispatch_env(cfg.agent, install_slot)
+    gate = validate_acp_dispatch_readiness(cfg.agent, [command, *acp_args])
     if gate is not None:
         payload.update({"state": "blocked_adapter_gate", "error": gate})
         write_status(status_path, payload)
@@ -651,7 +657,7 @@ async def run(args: argparse.Namespace) -> dict:
         payload.update({"state": "blocked_os_sandbox", "error": os_sandbox_error})
         write_status(status_path, payload)
         return payload
-    os_sandbox_gate = validate_os_sandbox_request(args.agent, os_sandbox_profile)
+    os_sandbox_gate = validate_os_sandbox_request(cfg.agent, os_sandbox_profile)
     if os_sandbox_gate is not None:
         payload.update({"state": "blocked_os_sandbox", "error": os_sandbox_gate})
         write_status(status_path, payload)
@@ -674,9 +680,9 @@ async def run(args: argparse.Namespace) -> dict:
         try:
             from goalflight_os_sandbox import macos_write_roots
             _ = macos_write_roots(
-                args.cwd,
+                worker_cwd,
                 os_sandbox_profile,
-                agent=args.agent,
+                agent=cfg.agent,
                 command=command if isinstance(command, str) else "",
             )
         except OsSandboxError as e:
@@ -688,14 +694,14 @@ async def run(args: argparse.Namespace) -> dict:
             pass
 
     # Lease TTL covers the worst-case run length. Derive from idle-timeout.
-    lease_ttl_s = max(int(args.idle_timeout or (36000 if args.mode == "goal" else 300)) * 4, 3600)
+    lease_ttl_s = max(int(cfg.idle_timeout or (36000 if cfg.mode == "goal" else 300)) * 4, 3600)
     acquire_args = argparse.Namespace(
-        agent=args.agent,
+        agent=cfg.agent,
         dispatch_id=dispatch_id,
-        prompt_id=args.prompt_id,
+        prompt_id=cfg.prompt_id,
         project_root=str(project_root),
         worktree_path=str(worktree_path) if worktree_path is not None else None,
-        worker_cwd=str(worktree_path) if worktree_path is not None else args.cwd,
+        worker_cwd=str(worktree_path) if worktree_path is not None else worker_cwd,
         controller_pid=os.getpid(),
         worker_pid=None,
         lease_id=None,
@@ -736,7 +742,7 @@ async def run(args: argparse.Namespace) -> dict:
     # CPU-aware idle gate: keeps a busy-but-silent worker (running_quiet) but
     # enforces a hard wall (lease lifetime) so a pathological CPU spinner that
     # never emits an event can't hang the runner forever.
-    idle_gate = IdleLivenessGate(args.cpu_epsilon, args.max_quiet_s)
+    idle_gate = IdleLivenessGate(cfg.cpu_epsilon, cfg.max_quiet_s)
 
     async def mark_heartbeat_terminal(outcome: str, error: dict[str, object]) -> None:
         nonlocal heartbeat_outcome, heartbeat_error, wedged_by_heartbeat
@@ -777,7 +783,7 @@ async def run(args: argparse.Namespace) -> dict:
                 prev_active=prev_active,
                 wall_now=wall_now,
                 active_now=active_now,
-                heartbeat_interval_s=args.heartbeat_interval,
+                heartbeat_interval_s=cfg.heartbeat_interval,
             )
             if freeze_s > 0:
                 total_paused_s += freeze_s
@@ -787,7 +793,7 @@ async def run(args: argparse.Namespace) -> dict:
                     heartbeat_at=_now(),
                 )
                 prev_wall, prev_active = wall_now, active_now
-                await asyncio.sleep(args.heartbeat_interval)
+                await asyncio.sleep(cfg.heartbeat_interval)
                 continue
             prev_wall, prev_active = wall_now, active_now
             pgid = payload.get("pgid") or process_group_id(proc.pid) or proc.pid
@@ -811,7 +817,7 @@ async def run(args: argparse.Namespace) -> dict:
             # be unsamplable). Gating it on CPU≤ε would let those hang forever
             # (codex 2026-05-20 P1). The grace (don't wedge while a tool is
             # outstanding) still applies UP TO the wall; past it, it's the wedge.
-            timed_out_tool = activity.timed_out(now_mono, args.max_tool_s)
+            timed_out_tool = activity.timed_out(now_mono, cfg.max_tool_s)
             if timed_out_tool is not None and pid_alive:
                 tool_id, age_s = timed_out_tool
                 await mark_heartbeat_terminal(
@@ -861,13 +867,13 @@ async def run(args: argparse.Namespace) -> dict:
                     acp_dropped_frames=dropped_frames,
                     quiet_for_s=round(quiet_for_s, 3),
                     progress_quiet_for_s=round(progress_quiet_s, 3),
-                    progress_stall_s=args.progress_stall_s,
+                    progress_stall_s=progress_stall_s,
                     turn_in_flight=True,
                     turn_silent_for_s=round(turn_silent_for_s, 3),
                     liveness_profile=liveness_profile,
                     remote_turn_silence_s=round(remote_turn_silence_s, 3),
                 )
-                await asyncio.sleep(args.heartbeat_interval)
+                await asyncio.sleep(cfg.heartbeat_interval)
                 continue
             if activity.has_inline_holds() and pid_alive:
                 # The inline permission router is holding a request open awaiting a
@@ -889,19 +895,19 @@ async def run(args: argparse.Namespace) -> dict:
                     acp_dropped_frames=dropped_frames,
                     quiet_for_s=round(quiet_for_s, 3),
                     progress_quiet_for_s=round(progress_quiet_s, 3),
-                    progress_stall_s=args.progress_stall_s,
+                    progress_stall_s=progress_stall_s,
                     inline_held=int(snapshot.get("inline_held", 0)),
                     turn_in_flight=turn_in_flight,
                     turn_silent_for_s=round(turn_silent_for_s, 3),
                     liveness_profile=liveness_profile,
                     remote_turn_silence_s=round(remote_turn_silence_s, 3),
                 )
-                await asyncio.sleep(args.heartbeat_interval)
+                await asyncio.sleep(cfg.heartbeat_interval)
                 continue
             if progress_stall_decision(
                 pid_alive=pid_alive,
                 progress_quiet_s=progress_quiet_s,
-                progress_stall_s=args.progress_stall_s,
+                progress_stall_s=progress_stall_s,
                 outstanding_count=outstanding_count,
             ):
                 await mark_heartbeat_terminal(
@@ -910,15 +916,15 @@ async def run(args: argparse.Namespace) -> dict:
                         "code": -1,
                         "message": "progress_stall",
                         "progress_quiet_s": round(progress_quiet_s, 3),
-                        "progress_stall_s": round(args.progress_stall_s, 3),
+                        "progress_stall_s": round(progress_stall_s, 3),
                     },
                 )
                 await conn.kill()
                 return
             if (
-                args.max_quiet_s > 0
+                cfg.max_quiet_s > 0
                 and outstanding_count == 0
-                and quiet_for_s >= args.max_quiet_s
+                and quiet_for_s >= cfg.max_quiet_s
                 and pid_alive
             ):
                 await mark_heartbeat_terminal(
@@ -933,9 +939,9 @@ async def run(args: argparse.Namespace) -> dict:
                 wedge_progress_seen=progress_seen,
                 previous_wedge_progress_seen=last_sample_progress_seen,
                 outstanding_count=outstanding_count,
-                cpu_epsilon_pct=args.cpu_epsilon,
+                cpu_epsilon_pct=cfg.cpu_epsilon,
                 previous_dead_samples=dead_samples,
-                wedge_samples=args.wedge_samples,
+                wedge_samples=cfg.wedge_samples,
             )
             dead_samples = decision.dead_samples
             last_sample_progress_seen = progress_seen
@@ -951,7 +957,7 @@ async def run(args: argparse.Namespace) -> dict:
                 acp_dropped_frames=dropped_frames,
                 quiet_for_s=round(quiet_for_s, 3),
                 progress_quiet_for_s=round(progress_quiet_s, 3),
-                progress_stall_s=args.progress_stall_s,
+                progress_stall_s=progress_stall_s,
                 turn_in_flight=turn_in_flight,
                 turn_silent_for_s=round(turn_silent_for_s, 3),
             )
@@ -962,7 +968,7 @@ async def run(args: argparse.Namespace) -> dict:
                 )
                 await conn.kill()
                 return
-            await asyncio.sleep(args.heartbeat_interval)
+            await asyncio.sleep(cfg.heartbeat_interval)
 
     async def note_event(event: dict) -> None:
         now_mono = active_monotonic()
@@ -981,7 +987,7 @@ async def run(args: argparse.Namespace) -> dict:
             acp_dropped_frames=dropped_frames,
             wedge_progress_seen=progress_seen,
             progress_quiet_for_s=round(progress_quiet_s, 3),
-            progress_stall_s=args.progress_stall_s,
+            progress_stall_s=progress_stall_s,
             last_event_at=_now(),
             last_event_kind=str(snapshot.get("last_event_kind") or _event_kind(event)),
             outstanding_tool_calls=outstanding_count,
@@ -1042,7 +1048,7 @@ async def run(args: argparse.Namespace) -> dict:
     try:
         if worktree_path is not None:
             try:
-                created = create_and_route_dispatch_worktree(args, project_root, dispatch_id)
+                created = create_and_route_dispatch_worktree(cfg, project_root, dispatch_id)
             except Exception as e:
                 await update_status(
                     state="failed_worktree",
@@ -1050,9 +1056,10 @@ async def run(args: argparse.Namespace) -> dict:
                     error=f"{type(e).__name__}: {e}",
                 )
                 return payload
+            worker_cwd = str(created)
             await update_status(
                 state="worktree_created",
-                worker_cwd=args.cwd,
+                worker_cwd=worker_cwd,
                 worktree_path=str(created),
             )
         try:
@@ -1060,9 +1067,9 @@ async def run(args: argparse.Namespace) -> dict:
                 prepare_os_sandbox_command(
                     command,
                     acp_args,
-                    cwd=args.cwd,
+                    cwd=worker_cwd,
                     os_sandbox=os_sandbox_profile,
-                    agent=args.agent,
+                    agent=cfg.agent,
                 )
         except OsSandboxError as e:
             await update_status(state="blocked_os_sandbox", error=str(e))
@@ -1080,7 +1087,8 @@ async def run(args: argparse.Namespace) -> dict:
         # auto-allows matching titles before falling through to the default
         # scope-aware policy. Otherwise leave permission_policy=None (the worker
         # uses default_permission_policy via the client).
-        allow_patterns_raw = getattr(args, "permission_allow_tool_title_pattern", None) or []
+        spawn_os_sandbox_profile = os_sandbox_profile
+        allow_patterns_raw = getattr(cfg, "permission_allow_tool_title_pattern", None) or []
         if allow_patterns_raw:
             try:
                 _compiled_patterns = [_re.compile(p) for p in allow_patterns_raw]
@@ -1091,10 +1099,11 @@ async def run(args: argparse.Namespace) -> dict:
                 # the sandbox-aware policy as its base so --os-sandbox
                 # actually auto-allows in-cwd execute/fetch under the
                 # documented contract.
-                os_sandbox_profile = getattr(args, "os_sandbox", "off")
+                policy_os_sandbox_profile = getattr(cfg, "os_sandbox", OS_SANDBOX_OFF)
+                spawn_os_sandbox_profile = policy_os_sandbox_profile
                 try:
                     from goalflight_acp_client import permission_policy_for_dispatch
-                    base_policy = permission_policy_for_dispatch(os_sandbox_profile)
+                    base_policy = permission_policy_for_dispatch(policy_os_sandbox_profile)
                 except ImportError:
                     base_policy = None  # default to default_permission_policy
                 permission_policy = make_title_allow_policy(
@@ -1114,7 +1123,7 @@ async def run(args: argparse.Namespace) -> dict:
             # workers needing execute/fetch will block on every tool call.
             # Warn the operator at startup so they know to add --os-sandbox
             # read-only (or scope patterns more precisely).
-            # Reuse os_sandbox_profile from base-policy wiring above.
+            # Reuse policy_os_sandbox_profile from base-policy wiring above.
             # Broaden the "broad pattern" detection beyond exact strings:
             # any pattern that matches an arbitrary string of safe-titles
             # qualifies. Probe by compiling and searching against representative
@@ -1126,7 +1135,7 @@ async def run(args: argparse.Namespace) -> dict:
             for raw, compiled in zip(allow_patterns_raw, _compiled_patterns):
                 if all(compiled.search(t) for t in sentinel_titles):
                     broad.append(raw)
-            if broad and os_sandbox_profile in ("off", "none", "host-default"):
+            if broad and policy_os_sandbox_profile in ("off", "none", "host-default"):
                 import sys as _sys
                 _sys.stderr.write(
                     "goalflight_acp_run: WARNING — broad title-allow pattern(s) "
@@ -1140,22 +1149,22 @@ async def run(args: argparse.Namespace) -> dict:
         else:
             permission_policy = None
 
-        async with StartupGate(args.agent):
+        async with StartupGate(cfg.agent):
             proc, conn = await spawn_and_handshake_with_retry(
                 command,
                 acp_args,
-                agent=args.agent,
-                session_id=args.session_id,
-                cwd=args.cwd,
+                agent=cfg.agent,
+                session_id=cfg.session_id,
+                cwd=worker_cwd,
                 activity=activity,
                 on_attempt=mark_attempt,
-                context_mode=(getattr(args, "context_mode", "enabled") != "disabled"),
-                permission_mode=getattr(args, "permission_mode", "auto"),
-                permission_dir=getattr(args, "permission_dir", None),
-                permission_inline_timeout_s=getattr(args, "permission_inline_timeout_s", None),
-                permission_user_timeout_s=getattr(args, "permission_user_timeout_s", None),
+                context_mode=(getattr(cfg, "context_mode", "enabled") != "disabled"),
+                permission_mode=getattr(cfg, "permission_mode", "auto"),
+                permission_dir=getattr(cfg, "permission_dir", None),
+                permission_inline_timeout_s=getattr(cfg, "permission_inline_timeout_s", None),
+                permission_user_timeout_s=getattr(cfg, "permission_user_timeout_s", None),
                 permission_policy=permission_policy,
-                os_sandbox=os_sandbox_profile,
+                os_sandbox=spawn_os_sandbox_profile,
                 env=spawn_env,
             )
         await update_status(os_sandbox=getattr(conn, "os_sandbox_metadata", None) or payload["os_sandbox"])
@@ -1163,18 +1172,18 @@ async def run(args: argparse.Namespace) -> dict:
             goalflight_ledger.cmd_record(
                 argparse.Namespace(
                     dispatch_id=dispatch_id,
-                    prompt_id=args.prompt_id,
-                    prompt_path=args.prompt,
-                    agent=args.agent,
-                    engine=goalflight_ledger.infer_engine(args.agent),
+                    prompt_id=cfg.prompt_id,
+                    prompt_path=cfg.prompt,
+                    agent=cfg.agent,
+                    engine=goalflight_ledger.infer_engine(cfg.agent),
                     shape="acp",
                     account="default",
                     transport="acp",
-                    project_root=args.cwd,
+                    project_root=worker_cwd,
                     controller_pid=os.getpid(),
                     worker_pid=proc.pid,
-                    acp_session_id=args.session_id,
-                    logical_session_id=args.session_id,
+                    acp_session_id=cfg.session_id,
+                    logical_session_id=cfg.session_id,
                     lease_id=lease_id,
                     stdout_path=None,
                     stderr_path=None,
@@ -1191,7 +1200,7 @@ async def run(args: argparse.Namespace) -> dict:
         result = await run_prompt(
             conn,
             prompt,
-            idle_timeout=args.idle_timeout,
+            idle_timeout=cfg.idle_timeout,
             on_event=note_event,
             on_idle=on_idle_check,
         )
@@ -1294,7 +1303,7 @@ async def run(args: argparse.Namespace) -> dict:
                 outstanding_tool_calls=int(snapshot["outstanding_count"]),
                 acp_dropped_frames=int(snapshot.get("dropped_frames", 0)),
                 progress_quiet_for_s=round(float(snapshot["progress_quiet_for_s"]), 3),
-                progress_stall_s=args.progress_stall_s,
+                progress_stall_s=progress_stall_s,
                 turn_in_flight=bool(snapshot.get("turn_in_flight")),
                 turn_silent_for_s=round(float(snapshot.get("turn_silent_for_s", 0.0)), 3),
                 worker_alive=proc.returncode is None,
@@ -1319,6 +1328,35 @@ async def run(args: argparse.Namespace) -> dict:
                 goalflight_capacity.cmd_release(argparse.Namespace(lease_id=lease_id, state=payload.get("state", state), reason=payload.get("error"), keep=True))
     write_status(status_path, payload)
     return payload
+
+
+async def run(args: argparse.Namespace) -> dict:
+    """Compatibility wrapper for callers that imported the old entrypoint."""
+    return await run_acp_dispatch(args)
+
+
+def normalized_acp_dispatch_cfg(args: argparse.Namespace) -> argparse.Namespace:
+    values = vars(args).copy()
+    if values.get("idle_timeout") is None:
+        values["idle_timeout"] = 36000.0 if values.get("mode") == "goal" else 300.0
+    if values.get("heartbeat_interval", 0) <= 0:
+        values["heartbeat_interval"] = 15.0
+    if values.get("wedge_samples", 0) <= 0:
+        values["wedge_samples"] = 4
+    if values.get("max_tool_s", 0) <= 0:
+        values["max_tool_s"] = DEFAULT_MAX_TOOL_S
+    if values.get("max_quiet_s", 0) <= 0:
+        values["max_quiet_s"] = 3600.0
+    if values.get("progress_stall_s", 0) <= 0:
+        values["progress_stall_s"] = 300.0
+    values["session_id"] = values.get("session_id") or f"goalflight-{uuid.uuid4().hex[:8]}"
+    return argparse.Namespace(**values)
+
+
+def acp_dispatch_exit_code(payload: dict) -> int:
+    if payload.get("state") == "blocked_windows_dispatch":
+        return 2
+    return 0 if payload.get("state") == "complete" else 1
 
 
 def write_windows_refusal_status(args: argparse.Namespace) -> tuple[dict, Path]:
@@ -1543,32 +1581,20 @@ def main(argv: list[str] | None = None) -> int:
     # run multi-hour and can go silent for long stretches between events; a
     # 5-minute idle ceiling would kill a healthy worker mid-test. 10h is a
     # safe wedge-detector ceiling (10h of TOTAL silence = genuinely stuck).
-    if args.idle_timeout is None:
-        args.idle_timeout = 36000.0 if args.mode == "goal" else 300.0
-    if args.heartbeat_interval <= 0:
-        args.heartbeat_interval = 15.0
-    if args.wedge_samples <= 0:
-        args.wedge_samples = 4
-    if args.max_tool_s <= 0:
-        args.max_tool_s = DEFAULT_MAX_TOOL_S
-    if args.max_quiet_s <= 0:
-        args.max_quiet_s = 3600.0
-    if args.progress_stall_s <= 0:
-        args.progress_stall_s = 300.0
-    args.session_id = args.session_id or f"goalflight-{uuid.uuid4().hex[:8]}"
+    cfg = normalized_acp_dispatch_cfg(args)
     if goalflight_compat.is_windows():
-        payload, status_path = write_windows_refusal_status(args)
-        if args.json:
+        payload, status_path = write_windows_refusal_status(cfg)
+        if cfg.json:
             print(json.dumps(payload, sort_keys=True))
         else:
             print(f"{payload['dispatch_id']}: blocked_windows_dispatch status={status_path}")
-        return 2
-    payload = asyncio.run(run(args))
-    if args.json:
+        return acp_dispatch_exit_code(payload)
+    payload = asyncio.run(run_acp_dispatch(cfg))
+    if cfg.json:
         print(json.dumps(payload, sort_keys=True))
     else:
-        print(f"{payload['dispatch_id']}: {payload['state']} status={args.status_json}")
-    return 0 if payload.get("state") == "complete" else 1
+        print(f"{payload['dispatch_id']}: {payload['state']} status={cfg.status_json}")
+    return acp_dispatch_exit_code(payload)
 
 
 if __name__ == "__main__":

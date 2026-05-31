@@ -106,8 +106,8 @@ def test_worktree_create_routes_distinct_cwds_and_stale_probe() -> None:
             assert_true("distinct worktrees", wt_one != wt_two)
             assert_true("first under managed root", wt_one.parent == resolved_repo / "worktrees")
             assert_true("second under managed root", wt_two.parent == resolved_repo / "worktrees")
-            assert_true("first cwd routed", args_one.cwd == str(wt_one))
-            assert_true("second cwd routed", args_two.cwd == str(wt_two))
+            assert_true("first cfg cwd unchanged", args_one.cwd == str(repo))
+            assert_true("second cfg cwd unchanged", args_two.cwd == str(repo))
 
             (wt_one / "tracked.txt").write_text("worker one\n")
             (wt_two / "tracked.txt").write_text("worker two\n")
