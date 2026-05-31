@@ -220,7 +220,7 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **failure_mode:** The controller treats every compacted session as a goal-flight run and reloads commands or starts queue work for an unrelated repository task.
 - **skill_md_compressed_form:**
     - **kind:** literal
-    - **pattern:** "Active run + compaction: reload Goal Flight only when already in play"
+    - **pattern:** "Active run + compaction: if already in play, invoke `/goal-flight resume`"
     - **max_section_lines:** 25
 - **verifier:**
     - **kind:** textual-invariant
@@ -556,7 +556,7 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **failure_mode:** After compaction, the controller relies on the lossy summary and resumes execution without reloading the active run's skill and resume instructions.
 - **skill_md_compressed_form:**
     - **kind:** literal
-    - **pattern:** "After compaction, if goal-flight was active, reload SKILL.md and commands/resume.md before continuing"
+    - **pattern:** "fresh `SKILL.md`/`commands/resume.md`, then stay in-skill"
     - **max_section_lines:** 25
 - **verifier:**
     - **kind:** behaviour-scenario
@@ -569,6 +569,30 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
     - **r_numbers:** [R2, R16]
 - **severity:** high
 - **last_reviewed_commit:** (chunk-3a)
+
+### Entry: compaction-reload-in-skill-continuation-behaviour
+
+- **id:** `compaction-reload-in-skill-continuation-behaviour`
+- **name:** Live-test in-skill continuation
+- **category:** `compaction-and-resume`
+- **controller_does:** The compaction continuation scenario verifies the controller stays in Goal Flight after reload by dispatching worker execution and gating chunk review before any commit.
+- **failure_mode:** After compaction, the controller reloads the skill but then falls back to default assistant behaviour such as inline edits, negated worker dispatch, or skipped review before commit.
+- **skill_md_compressed_form:**
+    - **kind:** literal
+    - **pattern:** "Active run + compaction: if already in play, invoke `/goal-flight resume` for fresh `SKILL.md`/`commands/resume.md`, then stay in-skill"
+    - **max_section_lines:** 45
+- **verifier:**
+    - **kind:** behaviour-scenario
+    - **id:** compaction-reload-in-skill-continuation
+- **provenance:**
+    - **sources:**
+      - `docs-private/HANDOFF-goal-flight-session-2026-05-24.md`
+      - `docs-private/RESUME-NOTES-2026-05-27.md`
+      - `docs-private/plans/skill-regression-test-plan-2026-05-27.md`
+      - `tests/fixtures/controller_scenarios/compaction-reload-in-skill-continuation/prompt.md`
+    - **r_numbers:** [R2, R16]
+- **severity:** high
+- **last_reviewed_commit:** (in-skill-continuation)
 
 ### Entry: review-flight-at-completion-behaviour
 

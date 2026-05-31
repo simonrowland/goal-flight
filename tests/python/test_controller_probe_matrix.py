@@ -21,6 +21,7 @@ from behavior_scenario import SCENARIOS  # noqa: E402
 from common import (  # noqa: E402
     DEFAULT_BEHAVIOR_SCENARIOS,
     chat_as_requirements_checks,
+    compaction_reload_in_skill_continuation_checks,
     compaction_reload_skill_checks,
     context_load_order_checks,
     continue_prescribed_step_two_checks,
@@ -332,6 +333,68 @@ def test_compaction_reload_skill_rejects_missing_sentinel() -> None:
     by_id = {check["id"]: check for check in checks}
     assert by_id["sentinel_quoted_exactly"]["ok"] is False
     assert by_id["did_not_proceed_without_reload"]["ok"] is True
+
+
+def test_compaction_reload_in_skill_continuation_scenario_registered() -> None:
+    assert "compaction-reload-in-skill-continuation" in SCENARIOS
+    assert callable(SCENARIOS["compaction-reload-in-skill-continuation"]["assert"])
+    prompt = FIXTURES / "compaction-reload-in-skill-continuation" / "prompt.md"
+    assert prompt.exists()
+    text = prompt.read_text(encoding="utf-8")
+    assert "{{SENTINEL}}" in text
+    assert "DISPATCH:" in text
+    assert "REVIEW_BEFORE_COMMIT:" in text
+
+    sentinel = "GF-SKILL-RELOAD-SENTINEL-00000000-0000-0000-0000-000000000000"
+    checks = compaction_reload_in_skill_continuation_checks(
+        f"Read RESUME-NOTES.md after compaction handoff. Reloaded SKILL.md. "
+        f"SKILL_RELOAD_SENTINEL_QUOTE: {sentinel}\n"
+        "DISPATCH: python3 scripts/goalflight_dispatch.py run --chunk active\n"
+        "REVIEW_BEFORE_COMMIT: run gstack /review before commit.\n"
+        "COMPLETE: true",
+        sentinel,
+    )
+    assert [check["id"] for check in checks] == [
+        "fresh_skill_reload_quoted",
+        "compaction_resume_acknowledged",
+        "worker_dispatch_continues_in_skill",
+        "review_gate_before_commit",
+        "no_default_assistant_fallback",
+    ]
+    assert all("id" in check and "ok" in check for check in checks)
+    assert all(check["ok"] is True for check in checks)
+
+
+def test_compaction_reload_in_skill_continuation_rejects_default_fallback() -> None:
+    sentinel = "GF-SKILL-RELOAD-SENTINEL-00000000-0000-0000-0000-000000000000"
+    checks = compaction_reload_in_skill_continuation_checks(
+        f"Read RESUME-NOTES.md after compaction handoff. Reloaded SKILL.md. "
+        f"SKILL_RELOAD_SENTINEL_QUOTE: {sentinel}\n"
+        "I will edit directly, then run tests, then git commit.\n",
+        sentinel,
+    )
+    by_id = {check["id"]: check for check in checks}
+    assert by_id["fresh_skill_reload_quoted"]["ok"] is True
+    assert by_id["worker_dispatch_continues_in_skill"]["ok"] is False
+    assert by_id["review_gate_before_commit"]["ok"] is False
+    assert by_id["no_default_assistant_fallback"]["ok"] is False
+
+
+def test_compaction_reload_in_skill_continuation_rejects_negated_action_lines() -> None:
+    sentinel = "GF-SKILL-RELOAD-SENTINEL-00000000-0000-0000-0000-000000000000"
+    checks = compaction_reload_in_skill_continuation_checks(
+        f"Read RESUME-NOTES.md after compaction handoff. Reloaded SKILL.md. "
+        f"SKILL_RELOAD_SENTINEL_QUOTE: {sentinel}\n"
+        "DISPATCH: do not dispatch worker; continue without agent dispatch.\n"
+        "REVIEW_BEFORE_COMMIT: no gstack /review before commit; skip review.\n"
+        "COMPLETE: true",
+        sentinel,
+    )
+    by_id = {check["id"]: check for check in checks}
+    assert by_id["fresh_skill_reload_quoted"]["ok"] is True
+    assert by_id["compaction_resume_acknowledged"]["ok"] is True
+    assert by_id["worker_dispatch_continues_in_skill"]["ok"] is False
+    assert by_id["review_gate_before_commit"]["ok"] is False
 
 
 def test_review_flight_at_completion_scenario_registered() -> None:
@@ -776,6 +839,7 @@ def test_new_behavior_scenarios_sync_to_defaults_and_docs() -> None:
     required = {
         "read-skill-end-to-end",
         "compaction-reload-skill",
+        "compaction-reload-in-skill-continuation",
         "review-flight-at-completion",
         "chat-as-requirements",
         "draft-goal-office-hours",

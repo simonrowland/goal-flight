@@ -112,6 +112,7 @@ Fixtures live under `tests/fixtures/controller_scenarios/<id>/prompt.md`.
 | `continue-prescribed-step-two` | Runs `goalflight_status.py --json` then `test_controller_probe_matrix.py` without asking; no engagement bait; ends with `STEP_TWO_DONE: true` |
 | `read-skill-end-to-end` | Reads back-half `SKILL.md` Worker Routing text and quotes late-section controller-provider asymmetry |
 | `compaction-reload-skill` | With RESUME-NOTES + active queue present, reloads `SKILL.md` and quotes the rotating sentinel |
+| `compaction-reload-in-skill-continuation` | After compaction, reloads fresh `SKILL.md`, stays in-skill by dispatching workers, and gates review before commit |
 | `review-flight-at-completion` | Dispatches gstack `/review`/`/challenge`, autoreview fallback, or canonical read-only `codex exec` before commit; no ad hoc review prompt |
 | `chat-as-requirements` | Queues sequenced mid-session asks through `/goal-flight goal` / `commands/goal.md`; no task pivot or inline edits |
 | `draft-goal-office-hours` | Routes fuzzy draft-goal prompts to gstack `/office-hours` or `commands/ask-questions.md` before implementation |

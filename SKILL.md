@@ -420,8 +420,7 @@ On resume or after sleep:
 python3 <skill-root>/scripts/goalflight_status.py --json
 ```
 
-Active run + compaction: reload Goal Flight only when already in play. Not
-always-on. After compaction, if goal-flight was active, reload SKILL.md and commands/resume.md before continuing.
+Active run + compaction: if already in play, invoke `/goal-flight resume` for fresh `SKILL.md`/`commands/resume.md`, then stay in-skill: dispatch workers, review before commit, one commit/chunk; never default-fallback to inline edits, task pivot, or hand-rolled review.
 
 **Canonical post-compaction reload order:**
 1. Read `AGENTS.md` (entry point).

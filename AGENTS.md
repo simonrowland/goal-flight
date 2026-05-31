@@ -44,10 +44,13 @@
   engagement prompts. See repository root `SKILL.md` §Autonomous throughput.
 - **Active run + compaction:** if goal-flight was already in play (verdict
   active per `goalflight_session_status.py --text`, OR open queue/ledger,
-  OR `docs-private/RESUME-NOTES-<YYYY-MM-DD>.md`), reload the skill (load
-  order above → `commands/resume.md`). Not always-on. Canonical post-
-  compaction reload sequence is in repository `SKILL.md` §State.
-  Details: `protocols/state-handoff.md`.
+  OR `docs-private/RESUME-NOTES-<YYYY-MM-DD>.md`), run `/goal-flight resume`
+  (load order above; fresh disk read of `SKILL.md`, not compacted snapshot),
+  then continue **in-skill**: dispatch workers, review before commit, one
+  explicit-pathspec commit per chunk. Do **not** fall back to default assistant
+  mode: inline edits, abandoning current task on new ask, or hand-rolled review.
+  Canonical sequence: `SKILL.md` §State → `commands/resume.md` →
+  `protocols/state-handoff.md`.
 
 ## Git workflow (this repo)
 

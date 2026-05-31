@@ -27,6 +27,7 @@ sys.path.insert(0, str(HOST_DIR))
 from common import (  # noqa: E402
     SCHEMA,
     chat_as_requirements_checks,
+    compaction_reload_in_skill_continuation_checks,
     compaction_reload_skill_checks,
     context_load_order_checks,
     continue_prescribed_step_two_checks,
@@ -175,6 +176,12 @@ def _assert_compaction_reload_skill(tail_text: str, *, sentinel: str, **_: Any) 
     return compaction_reload_skill_checks(tail_text, sentinel)
 
 
+def _assert_compaction_reload_in_skill_continuation(
+    tail_text: str, *, sentinel: str, **_: Any
+) -> list[dict[str, Any]]:
+    return compaction_reload_in_skill_continuation_checks(tail_text, sentinel)
+
+
 def _assert_review_flight_at_completion(tail_text: str, **_: Any) -> list[dict[str, Any]]:
     return review_flight_at_completion_checks(tail_text)
 
@@ -231,6 +238,10 @@ SCENARIOS: dict[str, dict[str, Any]] = {
     "compaction-reload-skill": {
         "description": "Controller reloads SKILL.md after compaction handoff and quotes rotating sentinel",
         "assert": _assert_compaction_reload_skill,
+    },
+    "compaction-reload-in-skill-continuation": {
+        "description": "Controller stays in-skill after compaction by dispatching workers and gating review",
+        "assert": _assert_compaction_reload_in_skill_continuation,
     },
     "review-flight-at-completion": {
         "description": "Controller dispatches canonical review before committing a completed chunk",
@@ -361,7 +372,7 @@ def run_codex_scenario(
     scenario_root = project_root
     cleanup_root: Path | None = None
     sentinel = ""
-    if scenario_id == "compaction-reload-skill":
+    if scenario_id in {"compaction-reload-skill", "compaction-reload-in-skill-continuation"}:
         scenario_root, sentinel = _prepare_compaction_reload_project(project_root)
         cleanup_root = scenario_root
     prompt = _load_prompt(scenario_id, scenario_root, sentinel=sentinel)
@@ -374,6 +385,7 @@ def run_codex_scenario(
         "resume-after-compaction",
         "continue-prescribed-step-two",
         "compaction-reload-skill",
+        "compaction-reload-in-skill-continuation",
         "review-flight-at-completion",
     }
     scenario_timeout = max(timeout, 420.0) if scenario_id in long_scenarios else timeout
@@ -543,7 +555,7 @@ def run_claude_code_acp_scenario(
     scenario_root = project_root
     cleanup_root: Path | None = None
     sentinel = ""
-    if scenario_id == "compaction-reload-skill":
+    if scenario_id in {"compaction-reload-skill", "compaction-reload-in-skill-continuation"}:
         scenario_root, sentinel = _prepare_compaction_reload_project(project_root)
         cleanup_root = scenario_root
     prompt = _load_prompt(scenario_id, scenario_root, sentinel=sentinel)
@@ -552,6 +564,7 @@ def run_claude_code_acp_scenario(
         "resume-after-compaction",
         "continue-prescribed-step-two",
         "compaction-reload-skill",
+        "compaction-reload-in-skill-continuation",
         "review-flight-at-completion",
     }
     scenario_timeout = max(timeout, 420.0) if scenario_id in long_scenarios else timeout

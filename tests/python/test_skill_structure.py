@@ -170,6 +170,7 @@ EXPECTED_ENTRY_IDS = {
     "skill-invariants-textual-guard",
     "read-skill-end-to-end-behaviour",
     "compaction-reload-skill-behaviour",
+    "compaction-reload-in-skill-continuation-behaviour",
     "review-flight-at-completion-behaviour",
     "per-host-pointer-for-non-native",
     "controller-chat-is-requirements-not-inline-editor",

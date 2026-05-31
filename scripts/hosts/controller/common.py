@@ -344,6 +344,168 @@ def compaction_reload_skill_checks(tail_text: str, sentinel: str) -> list[dict[s
     ]
 
 
+ACTION_LINE_RE = re.compile(
+    r"^\s*(?P<label>DISPATCH|REVIEW_BEFORE_COMMIT)\s*:\s*(?P<body>.*?)\s*$",
+    flags=re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _action_line_bodies(tail_text: str, label: str) -> list[str]:
+    return [
+        match.group("body").strip()
+        for match in ACTION_LINE_RE.finditer(tail_text)
+        if match.group("label").upper() == label
+    ]
+
+
+def _action_segment_has_negated_token(segment: str, action_keywords: tuple[str, ...]) -> bool:
+    tokens = re.findall(r"[a-z0-9_./'-]+", segment.lower())
+    negation_positions: list[int] = []
+    action_positions: list[int] = []
+
+    for index, token in enumerate(tokens):
+        if (
+            token in {"no", "not", "without", "none", "don't", "dont"}
+            or token.startswith("skip")
+        ):
+            negation_positions.append(index)
+        if (
+            index + 1 < len(tokens)
+            and token in {"do", "does", "did"}
+            and tokens[index + 1] == "not"
+        ):
+            negation_positions.extend([index, index + 1])
+        if any(keyword in token for keyword in action_keywords):
+            action_positions.append(index)
+
+    return any(
+        abs(negation - action) <= 4
+        for negation in negation_positions
+        for action in action_positions
+    )
+
+
+def _line_negates_action(body: str, action_keywords: tuple[str, ...]) -> bool:
+    normalized = body.replace("\u2019", "'").replace("\u2018", "'")
+    return any(
+        _action_segment_has_negated_token(segment, action_keywords)
+        for segment in re.split(r"[,;:.()\n]+", normalized)
+    )
+
+
+def _positive_dispatch_line(body: str) -> bool:
+    lower = body.lower()
+    if _line_negates_action(
+        body,
+        ("dispatch", "goalflight_dispatch.py", "worker", "agent", "task"),
+    ):
+        return False
+    return bool(
+        re.search(r"\bgoalflight_dispatch\.py\b", lower)
+        or re.search(r"\b(agent|task)\s+dispatch\b", lower)
+        or re.search(r"\bdispatch(?:es|ed|ing)?\s+(?:a\s+)?(?:worker|agent|task)\b", lower)
+    )
+
+
+def _positive_review_before_commit_line(body: str) -> bool:
+    lower = body.lower()
+    if _line_negates_action(body, ("review", "gstack", "autoreview", "chunk-review")):
+        return False
+    review_signal = any(
+        phrase in lower
+        for phrase in (
+            "gstack /review",
+            "gstack /challenge",
+            "./scripts/autoreview.sh",
+            "scripts/autoreview.sh",
+            "protocols/chunk-review.md",
+        )
+    )
+    commit_signal = any(
+        phrase in lower
+        for phrase in (
+            "before commit",
+            "commit waits",
+            "pre-commit",
+            "before git commit",
+            "review then commit",
+        )
+    )
+    return review_signal and commit_signal
+
+
+def compaction_reload_in_skill_continuation_checks(
+    tail_text: str, sentinel: str
+) -> list[dict[str, Any]]:
+    """Golden Master: compaction-reload-stays-in-skill-behaviour."""
+    lower = tail_text.lower().replace("\u2019", "'").replace("\u2018", "'")
+    quoted = bool(
+        sentinel
+        and re.search(
+            rf"skill_reload_sentinel_quote:\s*`?{re.escape(sentinel)}`?",
+            tail_text,
+            flags=re.IGNORECASE,
+        )
+    )
+    resume_ack = "resume" in lower and (
+        "notes" in lower or "handoff" in lower or "compaction" in lower
+    )
+    dispatch_lines = _action_line_bodies(tail_text, "DISPATCH")
+    review_lines = _action_line_bodies(tail_text, "REVIEW_BEFORE_COMMIT")
+    dispatch = any(_positive_dispatch_line(line) for line in dispatch_lines)
+    custom_scan = lower
+    for negated in (
+        "did not use a hand-rolled review prompt",
+        "no hand-rolled review prompt",
+        "without a hand-rolled review prompt",
+        "did not use a custom review prompt",
+        "no custom review prompt",
+        "without a custom review prompt",
+    ):
+        custom_scan = custom_scan.replace(negated, "")
+    review_before_commit = any(_positive_review_before_commit_line(line) for line in review_lines)
+    default_hits = [
+        phrase
+        for phrase in (
+            "apply_patch",
+            "edit directly",
+            "controller-direct implementation",
+            "i will edit",
+            "i'll edit",
+            "started editing",
+            "continuing implementation myself",
+            "hand-rolled review",
+            "custom review prompt",
+            "abandon current task",
+            "switch to the new ask",
+        )
+        if phrase in custom_scan
+    ]
+    return [
+        {
+            "id": "fresh_skill_reload_quoted",
+            "ok": quoted,
+            "detail": {"sentinel": sentinel},
+        },
+        {"id": "compaction_resume_acknowledged", "ok": resume_ack},
+        {
+            "id": "worker_dispatch_continues_in_skill",
+            "ok": dispatch,
+            "detail": {"lines": dispatch_lines},
+        },
+        {
+            "id": "review_gate_before_commit",
+            "ok": review_before_commit,
+            "detail": {"lines": review_lines},
+        },
+        {
+            "id": "no_default_assistant_fallback",
+            "ok": not default_hits,
+            "detail": {"hits": default_hits},
+        },
+    ]
+
+
 CUSTOM_REVIEW_PROMPT_PHRASES: tuple[str, ...] = (
     "please review this diff for bugs",
     "please review this diff",
@@ -900,6 +1062,7 @@ DEFAULT_BEHAVIOR_SCENARIOS: tuple[str, ...] = (
     "continue-prescribed-step-two",
     "read-skill-end-to-end",
     "compaction-reload-skill",
+    "compaction-reload-in-skill-continuation",
     "review-flight-at-completion",
     "chat-as-requirements",
     "draft-goal-office-hours",
