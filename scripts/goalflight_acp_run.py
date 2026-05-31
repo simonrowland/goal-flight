@@ -824,6 +824,33 @@ async def _run_acp_dispatch_impl(
     # never emits an event can't hang the runner forever.
     idle_gate = IdleLivenessGate(cfg.cpu_epsilon, cfg.max_quiet_s)
 
+    def record_ledger_state(*, worker_pid: int | None, state: str) -> None:
+        with contextlib.redirect_stdout(io.StringIO()):
+            goalflight_ledger.cmd_record(
+                argparse.Namespace(
+                    dispatch_id=dispatch_id,
+                    prompt_id=cfg.prompt_id,
+                    prompt_path=cfg.prompt,
+                    agent=cfg.agent,
+                    engine=goalflight_ledger.infer_engine(cfg.agent),
+                    shape="acp",
+                    account="default",
+                    transport="acp",
+                    project_root=worker_cwd,
+                    controller_pid=os.getpid(),
+                    worker_pid=worker_pid,
+                    acp_session_id=cfg.session_id,
+                    logical_session_id=cfg.session_id,
+                    lease_id=lease_id,
+                    stdout_path=None,
+                    stderr_path=None,
+                    status_path=str(status_path),
+                    os_sandbox_json=json.dumps(payload.get("os_sandbox") or {}, sort_keys=True),
+                    state=state,
+                    json=True,
+                )
+            )
+
     try:
         await update_status(lease_id=lease_id)
     except asyncio.CancelledError:
@@ -1181,6 +1208,8 @@ async def _run_acp_dispatch_impl(
             await update_status(state="blocked_os_sandbox", error=str(e))
             return payload
         cleanup_ghosts()
+        record_ledger_state(worker_pid=None, state="starting")
+        ledger_recorded = True
         # Spawn + handshake, retrying once on AcpError (the intermittent
         # codex-acp wedge). The helper kills a wedged worker before respawning,
         # so no identity-matched PID is ever left alive. Status progresses
@@ -1274,32 +1303,17 @@ async def _run_acp_dispatch_impl(
                 env=spawn_env,
             )
         await update_status(os_sandbox=getattr(conn, "os_sandbox_metadata", None) or payload["os_sandbox"])
-        with contextlib.redirect_stdout(io.StringIO()):
-            goalflight_ledger.cmd_record(
-                argparse.Namespace(
-                    dispatch_id=dispatch_id,
-                    prompt_id=cfg.prompt_id,
-                    prompt_path=cfg.prompt,
-                    agent=cfg.agent,
-                    engine=goalflight_ledger.infer_engine(cfg.agent),
-                    shape="acp",
-                    account="default",
-                    transport="acp",
-                    project_root=worker_cwd,
-                    controller_pid=os.getpid(),
-                    worker_pid=proc.pid,
-                    acp_session_id=cfg.session_id,
-                    logical_session_id=cfg.session_id,
-                    lease_id=lease_id,
-                    stdout_path=None,
-                    stderr_path=None,
-                    status_path=str(status_path),
-                    os_sandbox_json=json.dumps(payload.get("os_sandbox") or {}, sort_keys=True),
-                    state="running",
-                    json=True,
-                )
-            )
-        ledger_recorded = True
+        test_marker = os.environ.get("GOALFLIGHT_TEST_ACP_BEFORE_PID_LEDGER_UPDATE_FILE")
+        if test_marker:
+            with contextlib.suppress(Exception):
+                Path(test_marker).write_text(str(proc.pid), encoding="utf-8")
+        try:
+            test_delay_s = float(os.environ.get("GOALFLIGHT_TEST_ACP_BEFORE_PID_LEDGER_UPDATE_S", "0") or "0")
+        except ValueError:
+            test_delay_s = 0.0
+        if test_delay_s > 0:
+            await asyncio.sleep(test_delay_s)
+        record_ledger_state(worker_pid=proc.pid, state="running")
         activity.reset_progress_clock(active_monotonic())
         heartbeat_task = asyncio.create_task(heartbeat_loop())
         await update_status(state="running")

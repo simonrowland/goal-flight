@@ -332,10 +332,91 @@ def case_dispatch_acp_sigterm_finalizes_and_reaps() -> None:
         assert all(lease.get("released_at") for lease in leases), leases
 
 
+def case_dispatch_acp_sigterm_before_pid_update_keeps_ledger_row() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        _write_fake_codex_acp_manifest(tmp / "adapters")
+        env = _env(tmp, "idle_silent")
+        env["GOALFLIGHT_TEST_ACP_BEFORE_PID_LEDGER_UPDATE_FILE"] = str(tmp / "before-pid-update")
+        env["GOALFLIGHT_TEST_ACP_BEFORE_PID_LEDGER_UPDATE_S"] = "30"
+        dispatch_id = "acp-ledger-before-spawn"
+        status_path = tmp / "status.json"
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                str(DISPATCH),
+                "--shape",
+                "acp",
+                "--agent",
+                "codex-acp",
+                "--dispatch-id",
+                dispatch_id,
+                "--cwd",
+                str(ROOT),
+                "--prompt",
+                "stay running",
+                "--status-json",
+                str(status_path),
+                "--poll-secs",
+                "0.1",
+                "--max-idle-secs",
+                "30",
+            ],
+            cwd=ROOT,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        worker_pid = None
+        try:
+            marker = Path(env["GOALFLIGHT_TEST_ACP_BEFORE_PID_LEDGER_UPDATE_FILE"])
+            worker_pid = int(
+                _wait_for(
+                    lambda: marker.read_text(encoding="utf-8").strip() if marker.exists() else None,
+                    timeout_s=10.0,
+                )
+            )
+            aggregate = _status(env)
+            row = _record(aggregate, dispatch_id)
+            assert row, aggregate["dispatch"].get("records", [])
+            assert row.get("state") == "starting", row
+            assert row.get("worker_pid") is None, row
+
+            proc.send_signal(signal.SIGTERM)
+            stdout, stderr = proc.communicate(timeout=10)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.communicate(timeout=5)
+            if _process_exists(worker_pid):
+                try:
+                    os.kill(worker_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+        assert proc.returncode == 1, f"rc={proc.returncode}\nstdout={stdout}\nstderr={stderr}"
+        assert "DISPATCH-END " in stdout, stdout
+        status = json.loads(status_path.read_text(encoding="utf-8"))
+        assert status["state"] == "failed", status
+        assert status.get("terminated_by_signal") == "SIGTERM", status
+
+        aggregate = _status(env)
+        row = _record(aggregate, dispatch_id)
+        assert row and row.get("state") == "failed", row
+        assert row.get("terminal_state") == "error", row
+        assert row.get("worker_pid") is None, row
+        leases = _leases(aggregate, dispatch_id)
+        assert leases, "lease missing"
+        assert all(lease.get("state") == "failed" for lease in leases), leases
+        assert all(lease.get("released_at") for lease in leases), leases
+
+
 def main() -> None:
     case_dispatch_acp_single_finalize()
     case_dispatch_interactive_sugar_routes_codex_acp_auto()
     case_dispatch_acp_sigterm_finalizes_and_reaps()
+    case_dispatch_acp_sigterm_before_pid_update_keeps_ledger_row()
     print("OK: ACP dispatch routing/SIGTERM tests pass")
 
 
