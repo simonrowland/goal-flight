@@ -8,6 +8,8 @@ from support import skip_posix_on_native_windows
 skip_posix_on_native_windows("uses POSIX process liveness and signal semantics")
 
 import json
+import contextlib
+import io
 import os
 from pathlib import Path
 import signal
@@ -195,7 +197,7 @@ def case_dispatch_acp_single_finalize() -> None:
                 os.environ[key] = value
 
 
-def case_dispatch_interactive_sugar_routes_codex_acp_auto() -> None:
+def case_dispatch_interactive_sugar_routes_codex_acp_inline() -> None:
     import goalflight_adapter_readiness
     import goalflight_dispatch
 
@@ -238,8 +240,97 @@ def case_dispatch_interactive_sugar_routes_codex_acp_auto() -> None:
             status = json.loads(status_path.read_text(encoding="utf-8"))
             assert rc == 0, rc
             assert status["agent"] == "codex-acp", status
+            assert status["permission_mode"] == "inline", status
             assert status["state"] == "complete", status
     finally:
+        goalflight_adapter_readiness.ADAPTERS_DIR = old_adapters_dir
+        for key, value in old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def case_dispatch_inline_permission_relay_writes_decision_and_worker_proceeds() -> None:
+    import goalflight_acp_permits
+    import goalflight_adapter_readiness
+    import goalflight_dispatch
+
+    old_adapters_dir = goalflight_adapter_readiness.ADAPTERS_DIR
+    old_write_decision = goalflight_acp_permits.write_decision
+    old_env = {
+        key: os.environ.get(key)
+        for key in (
+            "GOALFLIGHT_STATE_DIR",
+            "GOAL_FLIGHT_PIDFILE_DIR",
+            "GOALFLIGHT_ADAPTERS_DIR",
+            "GOALFLIGHT_FAKE_ACP_SCENARIO",
+        )
+    }
+    decisions: list[dict[str, str | None]] = []
+
+    def recording_write_decision(directory, key, decision, option_id=None):
+        path = old_write_decision(directory, key, decision, option_id)
+        decisions.append(
+            {
+                "directory": str(directory),
+                "key": str(key),
+                "decision": str(decision),
+                "option_id": None if option_id is None else str(option_id),
+                "path": str(path),
+            }
+        )
+        return path
+
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            adapters = tmp / "adapters"
+            _write_fake_codex_acp_manifest(adapters)
+            os.environ.update(_env(tmp, "permission_inline"))
+            goalflight_adapter_readiness.ADAPTERS_DIR = adapters
+            goalflight_acp_permits.write_decision = recording_write_decision
+            status_path = tmp / "inline-relay.status.json"
+            stdout = io.StringIO()
+
+            with contextlib.redirect_stdout(stdout):
+                rc = goalflight_dispatch.main(
+                    [
+                        "--interactive",
+                        "--dispatch-id",
+                        "acp-inline-relay",
+                        "--cwd",
+                        str(ROOT),
+                        "--prompt",
+                        "go",
+                        "--status-json",
+                        str(status_path),
+                        "--poll-secs",
+                        "0.05",
+                        "--max-idle-secs",
+                        "5",
+                        "--permission-inline-timeout-s",
+                        "5",
+                    ]
+                )
+            out = stdout.getvalue()
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+
+            assert rc == 0, (rc, out, status)
+            assert decisions, "inline relay did not write a decision"
+            assert decisions[0]["decision"] == "deny", decisions
+            assert decisions[0]["option_id"] is None, decisions
+            assert "PERMISSION-PENDING:" in out, out
+            assert status["state"] == "complete", status
+            assert status["permission_mode"] == "inline", status
+            assert "permission:cancelled" in (status.get("result_text") or ""), status
+            assert not status.get("permission_auto_declined"), status
+            recorded = status.get("permission_decisions") or []
+            assert recorded and recorded[0]["decision"] == "deny", recorded
+            assert recorded[0]["targets_outside_cwd"] == ["/etc/hosts"], recorded
+            assert "PERMISSION-PENDING" in (status.get("markers") or {}), status
+    finally:
+        goalflight_acp_permits.write_decision = old_write_decision
         goalflight_adapter_readiness.ADAPTERS_DIR = old_adapters_dir
         for key, value in old_env.items():
             if value is None:
@@ -418,7 +509,8 @@ def case_dispatch_acp_sigterm_before_pid_update_keeps_ledger_row() -> None:
 
 def main() -> None:
     case_dispatch_acp_single_finalize()
-    case_dispatch_interactive_sugar_routes_codex_acp_auto()
+    case_dispatch_interactive_sugar_routes_codex_acp_inline()
+    case_dispatch_inline_permission_relay_writes_decision_and_worker_proceeds()
     case_dispatch_acp_sigterm_finalizes_and_reaps()
     case_dispatch_acp_sigterm_before_pid_update_keeps_ledger_row()
     print("OK: ACP dispatch routing/SIGTERM tests pass")

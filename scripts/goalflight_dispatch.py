@@ -721,10 +721,10 @@ def _build_acp_cfg(args, *, status_json: Path):
         status_json=str(status_json),
         context_mode="enabled",
         os_sandbox=os_sandbox,
-        permission_mode=args.permission_mode,
-        permission_dir=None,
-        permission_inline_timeout_s=None,
-        permission_user_timeout_s=None,
+        permission_mode=getattr(args, "permission_mode", "auto"),
+        permission_dir=getattr(args, "permission_dir", None),
+        permission_inline_timeout_s=getattr(args, "permission_inline_timeout_s", None),
+        permission_user_timeout_s=getattr(args, "permission_user_timeout_s", None),
         permission_allow_tool_title_pattern=[],
         heartbeat_interval=max(float(args.poll_secs or 0.0), 0.1),
         wedge_samples=4,
@@ -869,9 +869,17 @@ def main(argv: list[str] | None = None) -> int:
                         help="Comms shape. 'auto' picks the best per engine (codex/grok->bash, "
                              "cursor/claude->acp). v1 ACP routing supports codex-acp.")
     parser.add_argument("--interactive", action="store_true",
-                        help="Sugar for --shape acp --permission-mode auto (v1: codex-acp auto mode).")
-    parser.add_argument("--permission-mode", choices=["auto"], default="auto",
-                        help="ACP permission mode for dispatch.py v1. Inline relay lands in a later chunk.")
+                        help="Sugar for --shape acp --permission-mode inline (codex-acp inline relay).")
+    parser.add_argument("--permission-mode", choices=["auto", "inline"], default="auto",
+                        help="ACP permission mode. 'auto' cancels escalations for re-dispatch; "
+                             "'inline' relays permission request files to an in-run policy decision.")
+    parser.add_argument("--permission-dir",
+                        help="Directory for inline permission request/decision files. Default is the "
+                             "runner's PID-scoped temp dir.")
+    parser.add_argument("--permission-inline-timeout-s", type=float,
+                        help="Inline controller-responsiveness timeout before worker fallback auto-decline.")
+    parser.add_argument("--permission-user-timeout-s", type=float,
+                        help="Inline post-ack user-decision timeout before worker fallback auto-decline.")
     parser.add_argument("--tail", help="Worker output sink (auto: <state>/dispatch/<id>.tail)")
     parser.add_argument("--status-json", help="Watcher status file (auto: <state>/dispatch/<id>.status.json)")
     parser.add_argument("--dispatch-id", help="Slug for auto paths (auto-generated if omitted)")
@@ -903,6 +911,7 @@ def main(argv: list[str] | None = None) -> int:
             print("goalflight_dispatch: --interactive conflicts with --shape bash", file=sys.stderr)
             return 64
         args.shape = "acp"
+        args.permission_mode = "inline"
 
     # Resolve comms shape. 'auto' = best per engine.
     shape = args.shape

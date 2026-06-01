@@ -997,6 +997,7 @@ class GoalflightClient(ClientBase):  # type: ignore[misc, valid-type]
                 "title": title,
                 "kind": _tc_get(tool_call, "kind"),
                 "cwd": self.cwd,
+                "locations": _tool_call_locations(tool_call),
                 "targets_outside_cwd": _targets_outside_cwd(tool_call, self.cwd),
                 "options": [
                     {"kind": _tc_get(o, "kind"), "option_id": _tc_get(o, "option_id", "optionId")}

@@ -502,14 +502,22 @@ def case_detached_pidfile_entry_survives_ghost_cleanup() -> None:
     # file, corrupting shared connection/event-loop state for later cases in the
     # same process (it false-failed case_handshake_wedge_kills_before_respawn).
     old_pidfile_dir = ac._PIDFILE_DIR
+    old_ps_meta = ac._ps_meta
     tmp = Path(tempfile.mkdtemp(prefix="gf-detach-ghost-"))
     ac._PIDFILE_DIR = tmp
     worker = subprocess.Popen(["sleep", "30"])
     try:
-        meta = ac._ps_meta(worker.pid)
-        assert meta is not None, "could not read live worker identity"
-        lstart, comm = meta
         dead_controller_pid = 999999  # not a live pid
+        lstart, comm = "Mon Jan  1 00:00:00 2026", "sleep"
+
+        def fake_ps_meta(pid: int):
+            if pid == worker.pid:
+                return lstart, comm
+            if pid == dead_controller_pid:
+                return None
+            return old_ps_meta(pid)
+
+        ac._ps_meta = fake_ps_meta
         pidfile = tmp / f"{dead_controller_pid}.jsonl"
         base = {
             "pid": worker.pid, "pgid": worker.pid, "started_at": lstart,
@@ -526,6 +534,7 @@ def case_detached_pidfile_entry_survives_ghost_cleanup() -> None:
         with contextlib.suppress(Exception):
             worker.kill()
         ac._PIDFILE_DIR = old_pidfile_dir
+        ac._ps_meta = old_ps_meta
 
 
 @skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")

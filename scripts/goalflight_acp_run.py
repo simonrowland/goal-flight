@@ -94,6 +94,7 @@ from goalflight_acp_client import (
     default_permission_policy,
     spawn_acp_connection,
 )
+import goalflight_acp_permits as permits
 import re as _re
 
 
@@ -107,6 +108,102 @@ def _tool_call_title(tool_call: Any) -> str:
         if isinstance(value, str) and value:
             return value
     return ""
+
+
+_INLINE_PERMISSION_MARKER = "PERMISSION-PENDING"
+_INLINE_PERMISSION_STR_MAX = 500
+_INLINE_PERMISSION_LIST_MAX = 20
+
+
+def _compact_permission_str(value: Any, limit: int = _INLINE_PERMISSION_STR_MAX) -> str:
+    text = str(value or "")
+    return text if len(text) <= limit else text[: limit - 3] + "..."
+
+
+def _compact_permission_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    out: list[str] = []
+    for item in value[:_INLINE_PERMISSION_LIST_MAX]:
+        out.append(_compact_permission_str(item))
+    return out
+
+
+def _select_request_allow_option(options: Any) -> str | None:
+    if not isinstance(options, list):
+        return None
+    for preferred in ("allow_once", "allow_always"):
+        for option in options:
+            if not isinstance(option, dict):
+                continue
+            if option.get("kind") == preferred and option.get("option_id"):
+                return str(option["option_id"])
+    for option in options:
+        if not isinstance(option, dict):
+            continue
+        kind = option.get("kind")
+        option_id = option.get("option_id")
+        if option_id and isinstance(kind, str) and kind.startswith("allow_"):
+            return str(option_id)
+    return None
+
+
+def _inline_permission_relay_decision(record: dict[str, Any]) -> tuple[str, str | None, str]:
+    """Apply the same conservative boundary policy to an inline IPC request.
+
+    Safe in-cwd/read requests are allowed. Boundary-crossing, network/shell,
+    unverified writes, and unknown future kinds get an explicit deny so the
+    worker proceeds without waiting for the inline timeout.
+    """
+    kind = str(record.get("kind") or "")
+    locations = _compact_permission_list(record.get("locations"))
+    targets_outside_cwd = _compact_permission_list(record.get("targets_outside_cwd"))
+    if targets_outside_cwd:
+        return permits.DECISION_DENY, None, "target_outside_cwd"
+    if kind in {"fetch", "execute"}:
+        return permits.DECISION_DENY, None, f"{kind}_requires_controller"
+    if kind in {"edit", "delete", "move"} and not locations:
+        return permits.DECISION_DENY, None, "unverified_write_locations"
+    if kind in {"edit", "delete", "move", "", "read", "search", "think"}:
+        option_id = _select_request_allow_option(record.get("options"))
+        if option_id:
+            return permits.DECISION_ALLOW, option_id, "in_cwd_safe"
+        return permits.DECISION_DENY, None, "no_allow_option"
+    return permits.DECISION_DENY, None, "unknown_kind"
+
+
+def _inline_permission_summary(
+    record: dict[str, Any],
+    *,
+    decision: str,
+    option_id: str | None,
+    reason: str,
+) -> dict[str, object]:
+    summary: dict[str, object] = {
+        "key": _compact_permission_str(record.get("key"), 160),
+        "tool": _compact_permission_str(record.get("tool_call_id"), 160),
+        "title": _compact_permission_str(record.get("title")),
+        "kind": _compact_permission_str(record.get("kind"), 80),
+        "locations": _compact_permission_list(record.get("locations")),
+        "targets_outside_cwd": _compact_permission_list(record.get("targets_outside_cwd")),
+        "decision": decision,
+        "reason": reason,
+    }
+    if option_id:
+        summary["option_id"] = _compact_permission_str(option_id, 160)
+    return summary
+
+
+def _inline_permission_marker_text(summary: dict[str, object]) -> str:
+    marker = {
+        "key": summary.get("key"),
+        "tool": summary.get("tool"),
+        "title": summary.get("title"),
+        "kind": summary.get("kind"),
+        "decision": summary.get("decision"),
+        "reason": summary.get("reason"),
+    }
+    return json.dumps(marker, sort_keys=True)
 
 
 def make_title_allow_policy(
@@ -652,6 +749,10 @@ async def _run_acp_dispatch_impl(
     dispatch_id = cfg.dispatch_id or f"acp-{cfg.agent}-{uuid.uuid4().hex[:8]}"
     run_started = time.time()
     project_root = Path(cfg.cwd).resolve()
+    permission_mode = str(getattr(cfg, "permission_mode", "auto") or "auto")
+    resolved_permission_dir: str | None = None
+    if permission_mode == "inline":
+        resolved_permission_dir = str(permits.permission_dir(getattr(cfg, "permission_dir", None)))
     worktree_mode = getattr(cfg, "worktree", "off")
     worktree_path: Path | None = None
     worktree_error: str | None = None
@@ -705,6 +806,10 @@ async def _run_acp_dispatch_impl(
             "profile": os_sandbox_profile,
             "enabled": os_sandbox_profile not in {None, OS_SANDBOX_OFF},
         },
+        "permission_mode": permission_mode,
+        "permission_dir": resolved_permission_dir,
+        "pending_permissions": [],
+        "permission_decisions": [],
         "updated_at": _now(),
     }
     status_lock = asyncio.Lock()
@@ -837,6 +942,7 @@ async def _run_acp_dispatch_impl(
     detach_worker = False
     stall_wake_count = 0
     stall_detach_event = asyncio.Event()
+    relayed_permission_keys: set[str] = set()
     # CPU-aware idle gate: keeps a busy-but-silent worker (running_quiet) but
     # enforces a hard wall (lease lifetime) so a pathological CPU spinner that
     # never emits an event can't hang the runner forever.
@@ -900,6 +1006,102 @@ async def _run_acp_dispatch_impl(
         markers["STALLED"] = values[-DEFAULT_STALL_WAKE_CAP:]
         return markers
 
+    async def relay_inline_permissions() -> None:
+        if permission_mode != "inline" or not resolved_permission_dir:
+            return
+        try:
+            requests = await asyncio.to_thread(permits.list_requests, resolved_permission_dir)
+        except Exception as exc:
+            await update_status(permission_relay_error=f"{type(exc).__name__}: {exc}")
+            return
+        if not requests:
+            if payload.get("pending_permissions"):
+                await update_status(pending_permissions=[])
+            return
+
+        pending: list[dict[str, object]] = []
+        decisions: list[tuple[str, str, str | None, dict[str, object]]] = []
+        for record in requests:
+            key = str(record.get("key") or "")
+            if not key:
+                continue
+            decision, option_id, reason = _inline_permission_relay_decision(record)
+            summary = _inline_permission_summary(
+                record,
+                decision=decision,
+                option_id=option_id,
+                reason=reason,
+            )
+            pending.append(summary)
+            decisions.append((key, decision, option_id, summary))
+
+        if not pending:
+            return
+
+        # Keep the dedup set bounded to keys still pending this tick. Once the
+        # worker clears a decided request, its uuid-suffixed key vanishes from
+        # list_requests, so dropping it here keeps the set sized to live requests.
+        current_keys = {str(s.get("key") or "") for s in pending}
+        relayed_permission_keys.intersection_update(current_keys)
+
+        async with status_lock:
+            markers = dict(payload.get("markers") or {})
+            marker_values = list(markers.get(_INLINE_PERMISSION_MARKER) or [])
+            new_marker_values: list[str] = []
+            for summary in pending:
+                key = str(summary.get("key") or "")
+                marker_text = _inline_permission_marker_text(summary)
+                # Mark "seen" on first sight. A transient write_decision failure
+                # must not re-print the marker every tick until success; the
+                # print is the only thing this guards.
+                if key and key not in relayed_permission_keys:
+                    relayed_permission_keys.add(key)
+                    print(f"{_INLINE_PERMISSION_MARKER}: {marker_text}", flush=True)
+                    marker_values.append(marker_text)
+                    new_marker_values.append(marker_text)
+            if marker_values:
+                markers[_INLINE_PERMISSION_MARKER] = marker_values[-20:]
+            payload.update(
+                pending_permissions=pending,
+                markers=markers,
+                updated_at=_now(),
+            )
+            if new_marker_values:
+                payload["last_marker"] = {_INLINE_PERMISSION_MARKER: new_marker_values[-1]}
+            write_status(status_path, payload)
+
+        written: list[dict[str, object]] = []
+        failed: list[dict[str, object]] = []
+        for key, decision, option_id, summary in decisions:
+            try:
+                await asyncio.to_thread(
+                    permits.write_decision,
+                    resolved_permission_dir,
+                    key,
+                    decision,
+                    option_id,
+                )
+            except Exception as exc:
+                failed_summary = dict(summary)
+                failed_summary["write_error"] = f"{type(exc).__name__}: {exc}"
+                failed.append(failed_summary)
+                continue
+            decided = dict(summary)
+            decided["decided_at"] = _now()
+            written.append(decided)
+
+        async with status_lock:
+            history = list(payload.get("permission_decisions") or [])
+            history.extend(written)
+            payload.update(
+                permission_decisions=history[-50:],
+                pending_permissions=failed,
+                updated_at=_now(),
+            )
+            if failed:
+                payload["permission_relay_error"] = failed[-1].get("write_error")
+            write_status(status_path, payload)
+
     try:
         await update_status(lease_id=lease_id)
     except asyncio.CancelledError:
@@ -958,6 +1160,7 @@ async def _run_acp_dispatch_impl(
         while True:
             if proc is None or proc.returncode is not None:
                 return
+            await relay_inline_permissions()
             wall_now = time.time()
             active_now = active_monotonic()
             freeze_s = system_sleep_pause_s(
@@ -1384,7 +1587,7 @@ async def _run_acp_dispatch_impl(
                 on_attempt=mark_attempt,
                 context_mode=(getattr(cfg, "context_mode", "enabled") != "disabled"),
                 permission_mode=getattr(cfg, "permission_mode", "auto"),
-                permission_dir=getattr(cfg, "permission_dir", None),
+                permission_dir=resolved_permission_dir,
                 permission_inline_timeout_s=getattr(cfg, "permission_inline_timeout_s", None),
                 permission_user_timeout_s=getattr(cfg, "permission_user_timeout_s", None),
                 permission_policy=permission_policy,
@@ -1433,6 +1636,13 @@ async def _run_acp_dispatch_impl(
             await stall_wait_task
         result = await prompt_task
         markers = extract_markers(result.text)
+        relay_markers = dict(payload.get("markers") or {})
+        if relay_markers:
+            merged_markers = dict(relay_markers)
+            for kind, values in markers.items():
+                merged_markers.setdefault(kind, [])
+                merged_markers[kind].extend(values)
+            markers = merged_markers
         async with status_lock:
             terminal_by_heartbeat = heartbeat_outcome or getattr(conn, "heartbeat_outcome", None)
             terminal_error = heartbeat_error

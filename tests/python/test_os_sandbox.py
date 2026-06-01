@@ -201,6 +201,9 @@ def case_dispatch_acp_cfg_disables_os_sandbox_off_darwin() -> None:
         dispatch_id="linux-sandbox-off",
         read_only=True,
         permission_mode="auto",
+        permission_dir=None,
+        permission_inline_timeout_s=None,
+        permission_user_timeout_s=None,
         max_idle_secs=30.0,
         poll_secs=0.2,
     )
