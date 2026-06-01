@@ -736,6 +736,8 @@ def _build_acp_cfg(args, *, status_json: Path):
         permission_dir=getattr(args, "permission_dir", None),
         permission_inline_timeout_s=getattr(args, "permission_inline_timeout_s", None),
         permission_user_timeout_s=getattr(args, "permission_user_timeout_s", None),
+        read_only=bool(getattr(args, "read_only", False)),
+        interactive=bool(getattr(args, "interactive", False)),
         permission_allow_tool_title_pattern=[],
         heartbeat_interval=max(float(args.poll_secs or 0.0), 0.1),
         wedge_samples=4,

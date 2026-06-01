@@ -86,6 +86,7 @@ from goalflight_adapter_readiness import (
     validate_acp_dispatch_readiness,
     validate_os_sandbox_request,
 )
+from goalflight_acp_boundaries import permission_boundary_warning
 from goalflight_acp_client import (
     AcpConnection,
     AcpError,
@@ -873,6 +874,7 @@ async def _run_acp_dispatch_impl(
     run_started = time.time()
     project_root = Path(cfg.cwd).resolve()
     permission_mode = str(getattr(cfg, "permission_mode", "auto") or "auto")
+    read_only_dispatch = bool(getattr(cfg, "read_only", False))
     resolved_permission_dir: str | None = None
     if permission_mode == "inline":
         resolved_permission_dir = str(permits.permission_dir(getattr(cfg, "permission_dir", None)))
@@ -941,6 +943,15 @@ async def _run_acp_dispatch_impl(
         "permission_decisions": [],
         "updated_at": _now(),
     }
+    boundary_warning = permission_boundary_warning(
+        agent=cfg.agent,
+        permission_mode=permission_mode,
+        os_sandbox_profile=os_sandbox_profile,
+        read_only=read_only_dispatch,
+        interactive=bool(getattr(cfg, "interactive", False)),
+    )
+    if boundary_warning:
+        payload["permission_boundary_warning"] = boundary_warning
     status_lock = asyncio.Lock()
 
     async def update_status(**updates: object) -> None:
@@ -954,6 +965,8 @@ async def _run_acp_dispatch_impl(
             write_status(status_path, payload)
 
     write_status(status_path, payload)
+    if boundary_warning:
+        print(f"goalflight_acp_run: WARNING: {boundary_warning}", file=sys.stderr)
     if worktree_error is not None:
         payload.update(
             state="failed_worktree",
@@ -2179,6 +2192,8 @@ def normalized_acp_dispatch_cfg(args: argparse.Namespace) -> argparse.Namespace:
         values["progress_stall_s"] = 300.0
     values["stall_kill"] = bool(values.get("stall_kill", False))
     values["session_id"] = values.get("session_id") or f"goalflight-{uuid.uuid4().hex[:8]}"
+    values["read_only"] = bool(values.get("read_only", False))
+    values["interactive"] = bool(values.get("interactive", False))
     return argparse.Namespace(**values)
 
 

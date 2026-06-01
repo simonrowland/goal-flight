@@ -25,6 +25,7 @@ STATUS = SCRIPT_DIR / "goalflight_status.py"
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from goalflight_acp_run import agent_command, adapter_liveness_config  # noqa: E402
+from goalflight_acp_boundaries import UNRELIABLE_ESCALATION_AGENTS  # noqa: E402
 from goalflight_adapter_readiness import validate_acp_dispatch_readiness  # noqa: E402
 import goalflight_compat  # noqa: E402
 
@@ -588,6 +589,7 @@ def run_matrix(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         "gate": "GOALFLIGHT_ACP_LIVE_MATRIX",
         "hold_seconds": args.hold_seconds,
         "agents": [asdict(spec) for spec in specs],
+        "unreliable_escalation_agents": sorted(UNRELIABLE_ESCALATION_AGENTS),
         "properties": list(PROPERTIES),
         "results": [asdict(cell) for cell in cells],
     }
