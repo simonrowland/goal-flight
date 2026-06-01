@@ -289,13 +289,21 @@ def _acked_steer_seqs(record: dict) -> set[int]:
                 payload = json.loads(path.read_text(encoding="utf-8", errors="replace"))
             except (OSError, json.JSONDecodeError):
                 continue
-            for marker in payload.get("markers") or []:
-                if marker.get("kind") != "STEER-ACK":
-                    continue
-                try:
-                    acked.add(int(str(marker.get("text") or "").split()[0]))
-                except (IndexError, ValueError):
-                    pass
+            markers = payload.get("markers") or []
+            if isinstance(markers, dict):
+                for value in markers.get("STEER-ACK") or []:
+                    try:
+                        acked.add(int(str(value or "").split()[0]))
+                    except (IndexError, ValueError):
+                        pass
+            else:
+                for marker in markers:
+                    if not isinstance(marker, dict) or marker.get("kind") != "STEER-ACK":
+                        continue
+                    try:
+                        acked.add(int(str(marker.get("text") or "").split()[0]))
+                    except (IndexError, ValueError):
+                        pass
             continue
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
@@ -348,9 +356,12 @@ def _cmd_steer(argv: list[str]) -> int:
 
     shape = goalflight_ledger.infer_shape(record)
     if shape == "acp":
-        # ACP STEER SEND STUB (#8 --interactive): call session/prompt here once wired.
-        print("acp inline steer lands with --interactive (#8); use session/prompt once wired", file=sys.stderr)
-        return 64
+        warning = _worker_liveness_warning(record)
+        if warning:
+            print(warning, file=sys.stderr)
+        path, entry = _append_steer_message(args.dispatch_id, args.message)
+        print(f"steer appended: dispatch_id={args.dispatch_id} seq={entry['seq']} mailbox={path}")
+        return 0
     if shape != "bash":
         print(f"goalflight_dispatch: dispatch {args.dispatch_id} has unsupported shape {shape!r}", file=sys.stderr)
         return 64
@@ -734,6 +745,7 @@ def _build_acp_cfg(args, *, status_json: Path):
         liveness_profile=None,
         remote_turn_silence_s=None,
         remote_turn_cancel_grace_s=DEFAULT_REMOTE_TURN_CANCEL_GRACE_S,
+        steer_file=str(_steer_file(args.dispatch_id)),
         cpu_epsilon=0.1,
         json=False,
     )

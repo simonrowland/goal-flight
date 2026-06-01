@@ -129,15 +129,32 @@ def case_bash_append_and_list_with_ack() -> None:
 def case_shape_routing_and_missing_record() -> None:
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
-        _record(tmp, "acp-stub", shape="acp", worker_pid=os.getpid())
-        acp = _run_steer(tmp, "acp-stub", "redirect")
-        assert acp.returncode != 0, acp.stdout + acp.stderr
-        assert "acp inline steer lands with --interactive (#8); use session/prompt once wired" in acp.stderr
-        assert not _mailbox(tmp, "acp-stub").exists()
+        _record(tmp, "acp-mailbox", shape="acp", worker_pid=os.getpid())
+        acp = _run_steer(tmp, "acp-mailbox", "redirect")
+        assert acp.returncode == 0, acp.stdout + acp.stderr
+        assert "steer appended:" in acp.stdout, acp.stdout
+        entries = _read_mailbox(tmp, "acp-mailbox")
+        assert len(entries) == 1 and entries[0]["text"] == "redirect", entries
 
         missing = _run_steer(tmp, "missing-dispatch", "redirect")
         assert missing.returncode != 0, missing.stdout + missing.stderr
         assert "no ledger record" in missing.stderr
+
+
+def case_acp_list_reads_status_ack_dict() -> None:
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        dispatch_id = "acp-status-ack"
+        status = tmp / "status.json"
+        status.write_text(json.dumps({"markers": {"STEER-ACK": ["1"]}}), encoding="utf-8")
+        _record(tmp, dispatch_id, shape="acp", worker_pid=os.getpid(), status_path=status)
+
+        proc = _run_steer(tmp, dispatch_id, "redirect")
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+
+        listed = _run_steer(tmp, dispatch_id, "--list")
+        assert listed.returncode == 0, listed.stderr
+        assert "\ttrue\tredirect" in listed.stdout, listed.stdout
 
 
 def case_dead_worker_warns_but_appends() -> None:
@@ -272,6 +289,7 @@ def case_prompt_preamble_is_materialized() -> None:
 def main() -> None:
     case_bash_append_and_list_with_ack()
     case_shape_routing_and_missing_record()
+    case_acp_list_reads_status_ack_dict()
     case_dead_worker_warns_but_appends()
     case_steer_is_no_worker_early_exit()
     case_concurrent_appends_have_monotonic_unique_seq()

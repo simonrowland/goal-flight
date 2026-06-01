@@ -426,6 +426,7 @@ class AcpLivenessActivity:
     turn_started_mono: float | None = None
     turn_completed_mono: float | None = None
     turn_stop_reason: str | None = None
+    turn_completed_count: int = 0
 
     def begin_turn(self, now: float | None = None) -> None:
         now = active_monotonic() if now is None else now
@@ -437,6 +438,7 @@ class AcpLivenessActivity:
         now = active_monotonic() if now is None else now
         self.turn_completed_mono = now
         self.turn_stop_reason = stop_reason or "unknown"
+        self.turn_completed_count += 1
 
     def turn_in_flight(self) -> bool:
         return self.turn_started_mono is not None and self.turn_stop_reason is None
@@ -559,6 +561,11 @@ class AcpLivenessActivity:
 
     def snapshot(self, now: float | None = None) -> dict[str, Any]:
         now = active_monotonic() if now is None else now
+        turn_completed_for_s = (
+            max(0.0, now - self.turn_completed_mono)
+            if self.turn_completed_mono is not None
+            else 0.0
+        )
         return {
             "raw_events_seen": self.raw_events_seen,
             "wedge_progress_seen": self.wedge_progress_seen,
@@ -571,6 +578,8 @@ class AcpLivenessActivity:
             "turn_in_flight": self.turn_in_flight(),
             "turn_silent_for_s": self.turn_silent_for(now),
             "turn_stop_reason": self.turn_stop_reason,
+            "turn_completed_for_s": turn_completed_for_s,
+            "turn_completed_count": self.turn_completed_count,
         }
 
 

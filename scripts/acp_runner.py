@@ -302,7 +302,7 @@ async def _run_prompt_locked(
 # protocols/worker-markers.md: `^\**(MARKER):\**` with the value following on
 # the same line.
 _MARKERS_RE = re.compile(
-    r"^\**(STATUS|RESULT|USER-NEED|USER-CONFIRM|BLOCKED|COMPLETE|PERMISSION-OK-PROCEEDED):\**\s*(.+?)\s*\**$",
+    r"^\**(STATUS|STEER-ACK|RESULT|USER-NEED|USER-CONFIRM|BLOCKED|COMPLETE|PERMISSION-OK-PROCEEDED):\**\s*(.+?)\s*\**$",
     re.MULTILINE,
 )
 

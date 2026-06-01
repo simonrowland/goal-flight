@@ -81,6 +81,17 @@ def tool_update(session_id: str, kind: str, tool_id: str, **fields) -> None:
     )
 
 
+def prompt_text(params: dict) -> str:
+    chunks = params.get("prompt") or []
+    if isinstance(chunks, list):
+        out: list[str] = []
+        for chunk in chunks:
+            if isinstance(chunk, dict):
+                out.append(str(chunk.get("text") or chunk.get("content") or ""))
+        return "".join(out)
+    return str(chunks or "")
+
+
 def read_message() -> dict | None:
     line = sys.stdin.readline()
     if not line:
@@ -157,6 +168,36 @@ def request_permission(
 
 def handle_prompt(req_id: int, params: dict) -> None:
     session_id = params.get("sessionId", "")
+    if SCENARIO in {"steer_multiturn", "steer_nonterminal_then_complete"}:
+        session = sessions.setdefault(session_id, {})
+        turn = int(session.get("turn", 0)) + 1
+        session["turn"] = turn
+        if turn == 1:
+            marker = os.environ.get("GOALFLIGHT_FAKE_ACP_TURN1_FILE")
+            if marker:
+                with open(marker, "w", encoding="utf-8") as f:
+                    f.write("turn1\n")
+            text_update(session_id, "STATUS: first turn\n")
+            time.sleep(float(os.environ.get("GOALFLIGHT_FAKE_ACP_FIRST_TURN_SLEEP", "0.5")))
+            response(req_id, {"sessionId": session_id, "stopReason": "end_turn"})
+            return
+        text = prompt_text(params)
+        if SCENARIO == "steer_nonterminal_then_complete" and turn == 3:
+            text_update(session_id, "COMPLETE: continued after steer\n")
+            response(req_id, {"sessionId": session_id, "stopReason": "end_turn"})
+            return
+        if SCENARIO == "steer_nonterminal_then_complete" and "1:" in text and "redirect now" in text:
+            text_update(session_id, "STEER-ACK: 1\n")
+            text_update(session_id, "STATUS: steer accepted; continuing\n")
+            response(req_id, {"sessionId": session_id, "stopReason": "end_turn"})
+            return
+        if "1:" in text and "redirect now" in text:
+            text_update(session_id, "STEER-ACK: 1\n")
+            text_update(session_id, "COMPLETE: steer done\n")
+        else:
+            text_update(session_id, "BLOCKED: steer prompt missing\n")
+        response(req_id, {"sessionId": session_id, "stopReason": "end_turn"})
+        return
     if SCENARIO == "sandbox_write_probe":
         cwd = sessions.get(session_id, {}).get("cwd") or os.getcwd()
         inside = os.path.join(cwd, "goalflight-sandbox-inside.txt")
@@ -338,6 +379,10 @@ def handle_prompt(req_id: int, params: dict) -> None:
             vendor_update(session_id, "noise")
             time.sleep(interval)
     if SCENARIO == "progress_then_silent":
+        marker = os.environ.get("GOALFLIGHT_FAKE_ACP_PROGRESS_FILE")
+        if marker:
+            with open(marker, "w", encoding="utf-8") as f:
+                f.write("progress\n")
         text_update(session_id, "started")
         while True:
             time.sleep(1.0)

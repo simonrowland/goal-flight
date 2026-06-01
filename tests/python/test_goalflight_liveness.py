@@ -303,6 +303,25 @@ def test_heartbeat_wedges_after_first_progress_and_resets_on_new_progress() -> N
     assert decision.wedged is False
 
 
+def test_turn_completion_count_marks_each_turn_boundary() -> None:
+    activity = AcpLivenessActivity()
+    activity.begin_turn(10.0)
+    in_flight = activity.snapshot(11.0)
+    assert in_flight["turn_in_flight"] is True
+    assert in_flight["turn_completed_count"] == 0
+
+    activity.finish_turn("end_turn", 12.0)
+    first_done = activity.snapshot(15.0)
+    assert first_done["turn_in_flight"] is False
+    assert first_done["turn_completed_count"] == 1
+    assert first_done["turn_completed_for_s"] == 3.0
+
+    activity.begin_turn(20.0)
+    activity.finish_turn("end_turn", 21.0)
+    second_done = activity.snapshot(21.5)
+    assert second_done["turn_completed_count"] == 2
+
+
 def test_progress_stall_ignores_raw_event_recency() -> None:
     activity = AcpLivenessActivity()
     activity.reset_progress_clock(0.0)
@@ -675,6 +694,7 @@ def main() -> None:
     test_heartbeat_dead_sample_decision_table()
     test_heartbeat_first_token_grace_requires_progress_before_wedge()
     test_heartbeat_wedges_after_first_progress_and_resets_on_new_progress()
+    test_turn_completion_count_marks_each_turn_boundary()
     test_progress_stall_ignores_raw_event_recency()
     test_progress_stall_resets_on_standard_progress()
     test_progress_stall_allows_cursor_like_slow_first_token()

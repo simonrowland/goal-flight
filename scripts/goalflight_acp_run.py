@@ -44,6 +44,8 @@ DEFAULT_REMOTE_TURN_SILENCE_S = 1200.0
 DEFAULT_REMOTE_TURN_CANCEL_GRACE_S = 15.0
 DEFAULT_MAX_TOOL_S = 3600.0
 DEFAULT_STALL_WAKE_CAP = 3
+DEFAULT_BETWEEN_TURN_STEER_GRACE_S = 10.0
+DEFAULT_EMPTY_BETWEEN_TURN_STEER_POLL_S = 0.25
 LIVENESS_PROFILES = {"remote_api", "local_compute", "hybrid"}
 
 
@@ -341,7 +343,7 @@ from goalflight_os_sandbox import (
 )
 from goalflight_profile import dispatch_env
 from goalflight_startup_gate import StartupGate
-from acp_runner import extract_markers, has_actionable_marker_values, run_prompt
+from acp_runner import PromptResult, extract_markers, has_actionable_marker_values, run_prompt
 
 
 class _SigtermCancelBridge:
@@ -390,6 +392,84 @@ class _SigtermCancelBridge:
             with contextlib.suppress(Exception):
                 signal.signal(signal.SIGTERM, self._prior_handler)
         self._installed = False
+
+
+def _default_steer_file(dispatch_id: str) -> Path:
+    state_dir = Path(
+        os.environ.get("GOALFLIGHT_STATE_DIR", str(goalflight_compat.default_state_dir()))
+    ).expanduser()
+    return state_dir / "dispatch" / f"{dispatch_id}.steer.jsonl"
+
+
+def _resolve_steer_file(cfg: argparse.Namespace, dispatch_id: str) -> Path:
+    configured = getattr(cfg, "steer_file", None) or os.environ.get("GOALFLIGHT_STEER_FILE")
+    return Path(str(configured)).expanduser() if configured else _default_steer_file(dispatch_id)
+
+
+def _read_steer_entries(path: Path) -> list[dict]:
+    import goalflight_dispatch
+
+    return goalflight_dispatch._read_steer_entries(path)
+
+
+def _steer_ack_seqs(markers: dict[str, list[str]]) -> set[int]:
+    seqs: set[int] = set()
+    for value in markers.get("STEER-ACK") or []:
+        try:
+            seqs.add(int(str(value or "").split()[0]))
+        except (IndexError, ValueError):
+            pass
+    return seqs
+
+
+def _pending_steer_entries(mailbox: Path, seen_seqs: set[int]) -> list[dict]:
+    return [entry for entry in _read_steer_entries(mailbox) if entry["seq"] not in seen_seqs]
+
+
+def _steer_turn_prompt(mailbox: Path, entries: list[dict]) -> str:
+    lines = [
+        "Controller steer messages are queued for this dispatch.",
+        f"Mailbox: {mailbox}",
+        "Incorporate every message below before continuing.",
+        "Acknowledge each one on its own line as `STEER-ACK: <seq>`.",
+        "Mid-turn steer delivery is deferred; this prompt is being sent at a turn boundary.",
+        "",
+        "Queued steer entries:",
+    ]
+    for entry in entries:
+        lines.append(f"{entry['seq']}: {entry['text']}")
+    return "\n".join(lines)
+
+
+def _prompt_with_steer(base_prompt: str, mailbox: Path, entries: list[dict]) -> str:
+    if not entries:
+        return base_prompt
+    return f"{_steer_turn_prompt(mailbox, entries)}\n\nOriginal task:\n{base_prompt}"
+
+
+def _terminal_turn_marker(markers: dict[str, list[str]]) -> bool:
+    return any(markers.get(kind) for kind in ("RESULT", "COMPLETE", "BLOCKED", "USER-NEED", "USER-CONFIRM"))
+
+
+def _merge_prompt_results(results: list[PromptResult]) -> PromptResult:
+    merged = PromptResult()
+    for result in results:
+        merged.text += str(getattr(result, "text", "") or "")
+        merged.thoughts += str(getattr(result, "thoughts", "") or "")
+        merged.tool_calls.extend(list(getattr(result, "tool_calls", []) or []))
+        merged.plan_entries.extend(list(getattr(result, "plan_entries", []) or []))
+        merged.raw_events.extend(list(getattr(result, "raw_events", []) or []))
+        merged.out_of_scope_writes.extend(list(getattr(result, "out_of_scope_writes", []) or []))
+        merged.permission_escalations.extend(list(getattr(result, "permission_escalations", []) or []))
+        merged.permission_auto_declined.extend(list(getattr(result, "permission_auto_declined", []) or []))
+        result_error = getattr(result, "error", None)
+        if result_error is not None and merged.error is None:
+            merged.error = result_error
+        if getattr(result, "cancelled_for_marker", False) and not merged.cancelled_for_marker:
+            merged.cancelled_for_marker = True
+            merged.early_marker = getattr(result, "early_marker", None)
+        merged.stop_reason = getattr(result, "stop_reason", None)
+    return merged
 
 
 class _AcpWorkerDetached(Exception):
@@ -747,6 +827,7 @@ async def _run_acp_dispatch_impl(
     if remote_turn_cancel_grace_s < 0:
         remote_turn_cancel_grace_s = DEFAULT_REMOTE_TURN_CANCEL_GRACE_S
     dispatch_id = cfg.dispatch_id or f"acp-{cfg.agent}-{uuid.uuid4().hex[:8]}"
+    steer_file = _resolve_steer_file(cfg, dispatch_id)
     run_started = time.time()
     project_root = Path(cfg.cwd).resolve()
     permission_mode = str(getattr(cfg, "permission_mode", "auto") or "auto")
@@ -773,6 +854,11 @@ async def _run_acp_dispatch_impl(
     payload: dict = {
         "schema": "goalflight.acp-run.v1",
         "dispatch_id": dispatch_id,
+        "steer_mailbox": str(steer_file),
+        "steer_delivered_seqs": [],
+        "steer_acked_seqs": [],
+        "steer_pending_seqs": [],
+        "steer_mid_turn_delivery": "deferred",
         "lease_id": None,
         "agent": cfg.agent,
         "session_id": cfg.session_id,
@@ -947,6 +1033,23 @@ async def _run_acp_dispatch_impl(
     # enforces a hard wall (lease lifetime) so a pathological CPU spinner that
     # never emits an event can't hang the runner forever.
     idle_gate = IdleLivenessGate(cfg.cpu_epsilon, cfg.max_quiet_s)
+    awaiting_next_prompt = False
+    awaiting_next_prompt_deadline_mono = 0.0
+    pending_steer_first_seen_mono: dict[int, float] = {}
+    try:
+        configured_idle_timeout = float(cfg.idle_timeout or 0.0)
+    except (TypeError, ValueError):
+        configured_idle_timeout = 0.0
+    between_turn_steer_grace_s = DEFAULT_BETWEEN_TURN_STEER_GRACE_S
+    if configured_idle_timeout > 0:
+        between_turn_steer_grace_s = min(
+            DEFAULT_BETWEEN_TURN_STEER_GRACE_S,
+            configured_idle_timeout,
+        )
+    empty_between_turn_steer_poll_s = min(
+        DEFAULT_EMPTY_BETWEEN_TURN_STEER_POLL_S,
+        between_turn_steer_grace_s,
+    )
 
     def record_ledger_state(*, worker_pid: int | None, state: str) -> None:
         with contextlib.redirect_stdout(io.StringIO()):
@@ -1151,6 +1254,7 @@ async def _run_acp_dispatch_impl(
         nonlocal detach_worker, heartbeat_outcome, stall_wake_count
         dead_samples = 0
         last_sample_progress_seen = 0
+        last_sample_turn_completed_count = 0
         prev_wall = time.time()
         prev_active = active_monotonic()
         total_paused_s = 0.0
@@ -1193,7 +1297,16 @@ async def _run_acp_dispatch_impl(
             progress_quiet_s = float(snapshot["progress_quiet_for_s"])
             turn_in_flight = bool(snapshot.get("turn_in_flight"))
             turn_silent_for_s = float(snapshot.get("turn_silent_for_s", 0.0))
+            turn_completed_for_s = float(snapshot.get("turn_completed_for_s", 0.0))
+            turn_completed_count = int(snapshot.get("turn_completed_count", 0))
             pid_alive = proc.returncode is None
+            if (
+                not turn_in_flight
+                and turn_completed_count > last_sample_turn_completed_count
+            ):
+                dead_samples = 0
+                last_sample_progress_seen = progress_seen
+                last_sample_turn_completed_count = turn_completed_count
             # Absolute per-tool wall is checked EVERY tick, BEFORE the inline-hold
             # short-circuit, so the max_tool_s backstop for a never-answered inline
             # hold (added to activity.timed_out) is actually reachable. A tool (or
@@ -1286,6 +1399,76 @@ async def _run_acp_dispatch_impl(
                     turn_silent_for_s=round(turn_silent_for_s, 3),
                     liveness_profile=liveness_profile,
                     remote_turn_silence_s=round(remote_turn_silence_s, 3),
+                )
+                await asyncio.sleep(cfg.heartbeat_interval)
+                continue
+            pending_steer_entries: list[dict] = []
+            if pid_alive:
+                seen_steer = {
+                    int(seq)
+                    for seq in list(payload.get("steer_delivered_seqs") or [])
+                    + list(payload.get("steer_acked_seqs") or [])
+                    if isinstance(seq, int)
+                }
+                for seq in list(pending_steer_first_seen_mono):
+                    if seq in seen_steer:
+                        pending_steer_first_seen_mono.pop(seq, None)
+                with contextlib.suppress(Exception):
+                    pending_steer_entries = _pending_steer_entries(steer_file, seen_steer)
+                for entry in pending_steer_entries:
+                    pending_steer_first_seen_mono.setdefault(int(entry["seq"]), now_mono)
+                pending_seqs = {int(entry["seq"]) for entry in pending_steer_entries}
+                for seq in list(pending_steer_first_seen_mono):
+                    if seq not in pending_seqs:
+                        pending_steer_first_seen_mono.pop(seq, None)
+            turn_boundary_deadline_s = max(
+                0.0,
+                between_turn_steer_grace_s - turn_completed_for_s,
+            ) if turn_completed_count > 0 else 0.0
+            explicit_boundary_deadline_s = (
+                max(0.0, awaiting_next_prompt_deadline_mono - now_mono)
+                if awaiting_next_prompt_deadline_mono > 0
+                else 0.0
+            )
+            awaiting_steer_boundary = (
+                not turn_in_flight
+                and max(turn_boundary_deadline_s, explicit_boundary_deadline_s) > 0
+            )
+            if (
+                pid_alive
+                and awaiting_steer_boundary
+            ):
+                # At a completed turn boundary, allow a short quiet window for
+                # late mailbox appends before starting the next prompt. Mid-turn
+                # steers are only recorded as pending; they must not suppress the
+                # silence-class wedge backstops.
+                dead_samples = 0
+                last_sample_progress_seen = progress_seen
+                await update_status(
+                    state="awaiting_next_prompt",
+                    steer_pending_seqs=[
+                        int(entry["seq"]) for entry in pending_steer_entries
+                    ] or payload.get("steer_pending_seqs", []),
+                    steer_delivery_state="between_turns",
+                    worker_pid=proc.pid,
+                    pgid=pgid,
+                    worker_alive=pid_alive,
+                    pgroup_cpu_pct=cpu_pct,
+                    heartbeat_at=_now(),
+                    heartbeat_dead_samples=dead_samples,
+                    wedge_progress_seen=progress_seen,
+                    outstanding_tool_calls=outstanding_count,
+                    acp_dropped_frames=dropped_frames,
+                    quiet_for_s=round(quiet_for_s, 3),
+                    progress_quiet_for_s=round(progress_quiet_s, 3),
+                    progress_stall_s=progress_stall_s,
+                    turn_in_flight=turn_in_flight,
+                    turn_silent_for_s=round(turn_silent_for_s, 3),
+                    turn_completed_for_s=round(turn_completed_for_s, 3),
+                    awaiting_next_prompt_deadline_s=round(
+                        max(turn_boundary_deadline_s, explicit_boundary_deadline_s),
+                        3,
+                    ),
                 )
                 await asyncio.sleep(cfg.heartbeat_interval)
                 continue
@@ -1609,32 +1792,145 @@ async def _run_acp_dispatch_impl(
         activity.reset_progress_clock(active_monotonic())
         heartbeat_task = asyncio.create_task(heartbeat_loop())
         await update_status(state="running")
-        prompt_task = asyncio.create_task(run_prompt(
-            conn,
-            prompt,
-            idle_timeout=cfg.idle_timeout,
-            on_event=note_event,
-            on_idle=on_idle_check,
-        ))
-        stall_wait_task = asyncio.create_task(stall_detach_event.wait())
-        done, _pending = await asyncio.wait(
-            {prompt_task, stall_wait_task},
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        if prompt_task not in done:
-            detach_worker = True
-            if conn is not None:
-                # Cancel local awaiting without sending session/cancel; the
-                # worker remains alive and detached for controller recovery.
-                conn.acp_session_id = None
-            prompt_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await prompt_task
-            raise _AcpWorkerDetached()
-        stall_wait_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await stall_wait_task
-        result = await prompt_task
+        prompt_results: list[PromptResult] = []
+        delivered_steer_seqs: set[int] = set()
+        acked_steer_seqs: set[int] = set()
+        turn_index = 0
+        next_prompt = prompt
+        while True:
+            seen_steer_seqs = delivered_steer_seqs | acked_steer_seqs
+            pending_steers = _pending_steer_entries(steer_file, seen_steer_seqs)
+            turn_steer_seqs: set[int] = set()
+            if pending_steers:
+                pending_seqs = [int(entry["seq"]) for entry in pending_steers]
+                turn_steer_seqs = set(pending_seqs)
+                await update_status(
+                    steer_pending_seqs=pending_seqs,
+                    steer_delivery_state="delivering_at_turn_boundary",
+                    steer_turn_index=turn_index,
+                )
+                next_prompt = (
+                    _prompt_with_steer(prompt, steer_file, pending_steers)
+                    if turn_index == 0
+                    else _steer_turn_prompt(steer_file, pending_steers)
+                )
+                delivered_steer_seqs.update(pending_seqs)
+            elif turn_index == 0:
+                next_prompt = prompt
+
+            if getattr(getattr(conn, "client", None), "_prompt_in_use", False):
+                await update_status(
+                    steer_delivery_state="queued_until_prompt_free",
+                    steer_pending_seqs=[int(entry["seq"]) for entry in pending_steers],
+                )
+                raise RuntimeError("internal error: ACP steer delivery attempted while prompt in flight")
+
+            prompt_task = asyncio.create_task(run_prompt(
+                conn,
+                next_prompt,
+                idle_timeout=cfg.idle_timeout,
+                on_event=note_event,
+                on_idle=on_idle_check,
+            ))
+            await asyncio.sleep(0)
+            awaiting_next_prompt = False
+            awaiting_next_prompt_deadline_mono = 0.0
+            stall_wait_task = asyncio.create_task(stall_detach_event.wait())
+            done, _pending = await asyncio.wait(
+                {prompt_task, stall_wait_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if prompt_task not in done:
+                detach_worker = True
+                if conn is not None:
+                    # Cancel local awaiting without sending session/cancel; the
+                    # worker remains alive and detached for controller recovery.
+                    conn.acp_session_id = None
+                prompt_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await prompt_task
+                raise _AcpWorkerDetached()
+            stall_wait_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await stall_wait_task
+            turn_result = await prompt_task
+            prompt_results.append(turn_result)
+            turn_markers = extract_markers(turn_result.text)
+            acked_steer_seqs.update(_steer_ack_seqs(turn_markers))
+            for seq in delivered_steer_seqs | acked_steer_seqs:
+                pending_steer_first_seen_mono.pop(seq, None)
+            awaiting_next_prompt = bool(turn_result.ok and not turn_result.cancelled_for_marker)
+            awaiting_next_prompt_deadline_mono = (
+                active_monotonic() + between_turn_steer_grace_s
+                if awaiting_next_prompt and between_turn_steer_grace_s > 0
+                else 0.0
+            )
+            pending_after_turn = _pending_steer_entries(
+                steer_file,
+                delivered_steer_seqs | acked_steer_seqs,
+            )
+            await update_status(
+                steer_pending_seqs=[int(entry["seq"]) for entry in pending_after_turn],
+                steer_delivered_seqs=sorted(delivered_steer_seqs),
+                steer_acked_seqs=sorted(acked_steer_seqs),
+                steer_delivery_state="between_turns",
+            )
+            turn_index += 1
+            current_turn_was_steer = bool(turn_steer_seqs)
+            if not turn_result.ok or turn_result.cancelled_for_marker:
+                awaiting_next_prompt = False
+                awaiting_next_prompt_deadline_mono = 0.0
+                break
+            if (
+                not pending_after_turn
+                and not _terminal_turn_marker(turn_markers)
+                and empty_between_turn_steer_poll_s > 0
+            ):
+                poll_s = min(max(float(cfg.heartbeat_interval or 0.1), 0.05), 0.25)
+                empty_poll_deadline_mono = active_monotonic() + empty_between_turn_steer_poll_s
+                # Mark the between-turn wait so the heartbeat's awaiting_steer_boundary
+                # exemption applies to THIS bounded window (the turn ended cleanly and we
+                # are quietly waiting for a late steer before the next prompt). Without
+                # this the heartbeat would reap the legitimate between-turn wait as wedged.
+                # Scoped to not-turn_in_flight + this deadline only, so a genuinely-stuck
+                # mid-turn worker is unaffected.
+                awaiting_next_prompt = True
+                awaiting_next_prompt_deadline_mono = empty_poll_deadline_mono
+                while active_monotonic() <= empty_poll_deadline_mono:
+                    await asyncio.sleep(poll_s)
+                    pending_after_turn = _pending_steer_entries(
+                        steer_file,
+                        delivered_steer_seqs | acked_steer_seqs,
+                    )
+                    if pending_after_turn:
+                        # Found a late steer: end the wait + clear the exemption so the
+                        # next turn (which sets turn_in_flight) is governed by the normal
+                        # backstops, not this between-turn grace.
+                        awaiting_next_prompt = False
+                        awaiting_next_prompt_deadline_mono = 0.0
+                        await update_status(
+                            steer_pending_seqs=[int(entry["seq"]) for entry in pending_after_turn],
+                            steer_delivery_state="between_turns",
+                        )
+                        break
+                else:
+                    # Poll window expired with no steer: clear the exemption.
+                    awaiting_next_prompt = False
+                    awaiting_next_prompt_deadline_mono = 0.0
+            if not pending_after_turn:
+                if _terminal_turn_marker(turn_markers):
+                    awaiting_next_prompt = False
+                    awaiting_next_prompt_deadline_mono = 0.0
+                    break
+                if current_turn_was_steer:
+                    next_prompt = ""
+                    continue
+                awaiting_next_prompt = False
+                awaiting_next_prompt_deadline_mono = 0.0
+                break
+            next_prompt = ""
+
+        result = _merge_prompt_results(prompt_results)
         markers = extract_markers(result.text)
         relay_markers = dict(payload.get("markers") or {})
         if relay_markers:
@@ -1905,6 +2201,11 @@ def main(argv: list[str] | None = None) -> int:
              "(rely on PID liveness + the worker's terminal marker instead).",
     )
     parser.add_argument("--status-json")
+    parser.add_argument(
+        "--steer-file",
+        default=None,
+        help="File-IPC steer mailbox for between-turn ACP steer delivery.",
+    )
     parser.add_argument(
         "--context-mode",
         choices=["enabled", "disabled"],
