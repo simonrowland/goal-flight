@@ -8,6 +8,7 @@ from support import skip_posix_on_native_windows
 skip_posix_on_native_windows("uses POSIX process groups, start_new_session, and signals")
 
 import asyncio
+import argparse
 import contextlib
 import json
 import os
@@ -16,6 +17,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -26,7 +28,9 @@ from goalflight_acp_client import (  # noqa: E402
     AcpError,
     AcpLivenessActivity,
     AcpProcessPool,
+    GoalflightClient,
     MAX_DROPPED_FRAME_RECORDS,
+    MAX_PERMISSION_ROUTER_DECISIONS,
     JsonRpcLineFilterReader,
     PoolExhaustedError,
     _classify_oversized_json_rpc_head,
@@ -222,6 +226,10 @@ def case_adapter_manifest_liveness_defaults() -> None:
     assert profile == "remote_api"
     assert remote_turn_silence_s == 1200.0
 
+    profile, remote_turn_silence_s = adapter_liveness_config("claude-acp")
+    assert profile == "remote_api"
+    assert remote_turn_silence_s == 1200.0
+
     profile, remote_turn_silence_s = adapter_liveness_config("missing-agent")
     assert profile == "local_compute"
     assert remote_turn_silence_s == 1200.0
@@ -242,6 +250,10 @@ def case_manifest_acp_command_defaults() -> None:
 
     binary, args = agent_command("codex-acp")
     assert binary == "codex-acp"
+    assert args == []
+
+    binary, args = agent_command("claude-acp")
+    assert Path(binary).name == "claude-code-cli-acp"
     assert args == []
 
     binary, args = agent_command("opencode")
@@ -452,6 +464,161 @@ def _run_fake_runner(
                 for path in sorted(runs_dir.glob("*.json"))
             ] if runs_dir.exists() else []
         return proc.returncode, status_payload, stdout, stderr
+
+
+@skipif(os.name == "nt", reason="matrix timeout reap is POSIX process-group behavior")
+def case_matrix_timeout_reaps_runner_process_group() -> None:
+    import goalflight_acp_push_gate_matrix as matrix
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        child_pid_file = tmp / "child.pid"
+        fake_runner = tmp / "hanging_matrix_runner.py"
+        fake_runner.write_text(
+            "\n".join(
+                [
+                    "import json, os, subprocess, sys, time",
+                    "from pathlib import Path",
+                    "status_path = Path(sys.argv[sys.argv.index('--status-json') + 1])",
+                    "child_file = Path(os.environ['GF_MATRIX_CHILD_PID_FILE'])",
+                    "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])",
+                    "child_file.write_text(str(child.pid), encoding='utf-8')",
+                    "status_path.write_text(json.dumps({'state': 'running', 'worker_pid': child.pid, 'pgid': os.getpgid(0)}) + '\\n', encoding='utf-8')",
+                    "time.sleep(60)",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        old_runner = matrix.RUNNER
+        old_child_file = os.environ.get("GF_MATRIX_CHILD_PID_FILE")
+        os.environ["GF_MATRIX_CHILD_PID_FILE"] = str(child_pid_file)
+        try:
+            matrix.RUNNER = fake_runner
+            run = matrix._run_acp_case(
+                matrix.AgentSpec("fake", "fake", timeout_s=0.5),
+                state_root=tmp / "matrix-state",
+                cwd=tmp,
+                dispatch_id="matrix-timeout-reap",
+                prompt="hang",
+                timeout_s=0.5,
+                idle_timeout_s=10.0,
+            )
+            assert run.timed_out, run
+            child_pid = int(child_pid_file.read_text(encoding="utf-8"))
+            deadline = time.time() + 5.0
+            while time.time() < deadline and _pid_alive(child_pid):
+                time.sleep(0.05)
+            assert not _pid_alive(child_pid), f"matrix timeout left child alive: {child_pid}"
+        finally:
+            matrix.RUNNER = old_runner
+            if old_child_file is None:
+                os.environ.pop("GF_MATRIX_CHILD_PID_FILE", None)
+            else:
+                os.environ["GF_MATRIX_CHILD_PID_FILE"] = old_child_file
+            if child_pid_file.exists():
+                with contextlib.suppress(Exception):
+                    _force_kill(int(child_pid_file.read_text(encoding="utf-8")))
+
+
+def case_permission_router_audit_bounded_and_truncated() -> None:
+    async def _run() -> None:
+        client = GoalflightClient(cwd=str(ROOT))
+        options = [{"kind": "allow_once", "optionId": "ok"}]
+        for i in range(MAX_PERMISSION_ROUTER_DECISIONS + 5):
+            await client.request_permission(
+                options,
+                "session-audit",
+                {
+                    "toolCallId": f"perm-{i}",
+                    "title": "T" * 400,
+                    "kind": "read",
+                },
+            )
+        rows = client.permission_router_decisions
+        assert len(rows) == MAX_PERMISSION_ROUTER_DECISIONS, rows
+        assert rows[0]["tool_call_id"] == "perm-5", rows[0]
+        assert len(rows[-1]["title"]) <= 160, rows[-1]
+
+    asyncio.run(_run())
+
+
+def case_normal_dispatch_hides_matrix_audit_surface() -> None:
+    returncode, status, stdout, stderr = _run_fake_runner(
+        "permission_codex",
+        progress_stall_s=5.0,
+    )
+    assert returncode == 0, (returncode, stdout, stderr, status)
+    assert status["state"] == "complete", status
+    assert "permission_router_decisions" not in status, status
+    assert "tool_calls" not in status, status
+
+
+def case_matrix_env_surfaces_bounded_audit() -> None:
+    returncode, status, stdout, stderr = _run_fake_runner(
+        "permission_codex",
+        progress_stall_s=5.0,
+        extra_env={"GOALFLIGHT_ACP_LIVE_MATRIX": "1"},
+    )
+    assert returncode == 0, (returncode, stdout, stderr, status)
+    assert status["state"] == "complete", status
+    rows = status.get("permission_router_decisions") or []
+    assert rows and len(rows) <= MAX_PERMISSION_ROUTER_DECISIONS, status
+    assert status.get("tool_calls") == [], status
+
+
+def case_matrix_claude_defer_skips_remaining_cases() -> None:
+    import goalflight_acp_push_gate_matrix as matrix
+
+    spec = matrix.AgentSpec("claude-acp", "claude-acp", defer_headless_failures=True)
+    old_agents = matrix.AGENTS
+    old_preflight = matrix._preflight
+    old_round_trip = matrix._round_trip
+    old_auto_and_locations = matrix._auto_and_locations
+    old_ledger_stats = matrix._ledger_stats
+    old_held_permission = matrix._held_permission
+    old_silent_turn = matrix._silent_turn
+    try:
+        matrix.AGENTS = (spec,)
+        matrix._preflight = lambda _spec: (True, "ready")
+        matrix._round_trip = lambda _spec, _state_root, _work_root: matrix.MatrixCell(
+            "claude-acp", "round_trip", "PASS", "complete", "matrix-claude-roundtrip"
+        )
+        matrix._auto_and_locations = lambda _spec, _state_root, _work_root: (
+            matrix.MatrixCell(
+                "claude-acp",
+                "auto_permission",
+                "SKIP",
+                "claude-acp deferred (headless auth/PTY): failed",
+                "matrix-claude-boundary",
+            ),
+            matrix.MatrixCell("claude-acp", "locations", "FAIL", "should not be emitted"),
+        )
+
+        def _should_not_run(*_args, **_kwargs):
+            raise AssertionError("deferred claude-acp row should not run later matrix cases")
+
+        matrix._ledger_stats = _should_not_run
+        matrix._held_permission = _should_not_run
+        matrix._silent_turn = _should_not_run
+        with tempfile.TemporaryDirectory() as td:
+            rc, report = matrix.run_matrix(
+                argparse.Namespace(agents=["claude-acp"], state_dir=td, hold_seconds=65.0)
+            )
+        assert rc == 0, report
+        by_prop = {row["property"]: row for row in report["results"]}
+        assert by_prop["round_trip"]["status"] == "PASS", by_prop
+        for prop in ("auto_permission", "ledger_stats", "held_permission", "locations", "silent_turn"):
+            assert by_prop[prop]["status"] == "SKIP", by_prop
+            assert by_prop[prop]["detail"].startswith("claude-acp deferred"), by_prop[prop]
+    finally:
+        matrix.AGENTS = old_agents
+        matrix._preflight = old_preflight
+        matrix._round_trip = old_round_trip
+        matrix._auto_and_locations = old_auto_and_locations
+        matrix._ledger_stats = old_ledger_stats
+        matrix._held_permission = old_held_permission
+        matrix._silent_turn = old_silent_turn
 
 
 @skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")
@@ -1090,6 +1257,11 @@ def main() -> None:
     case_adapter_manifest_liveness_defaults()
     case_manifest_acp_command_defaults()
     case_json_rpc_stdout_filter()
+    case_matrix_timeout_reaps_runner_process_group()
+    case_permission_router_audit_bounded_and_truncated()
+    case_normal_dispatch_hides_matrix_audit_surface()
+    case_matrix_env_surfaces_bounded_audit()
+    case_matrix_claude_defer_skips_remaining_cases()
     case_runner_raw_vendor_flood_hits_progress_stall_and_reaps()
     case_runner_progress_stall_detaches_by_default()
     case_detached_pidfile_entry_survives_ghost_cleanup()

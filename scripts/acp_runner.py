@@ -49,6 +49,8 @@ class PromptResult:
     """Inline permissions the controller auto-declined (it did not answer within
     the inline timeout / IPC failed); the worker was denied and CONTINUED --
     informational, not a re-dispatch signal (unlike permission_escalations)."""
+    permission_router_decisions: list[dict[str, Any]] = field(default_factory=list)
+    """Audit trail of the auto permission router's allow/escalate/deny choices."""
 
     @property
     def ok(self) -> bool:
@@ -122,6 +124,9 @@ async def _run_prompt_locked(
     _auto = getattr(conn.client, "permission_auto_declined", None)
     if _auto is not None:
         _auto.clear()
+    _router = getattr(conn.client, "permission_router_decisions", None)
+    if _router is not None:
+        _router.clear()
     prompt_task = asyncio.create_task(conn.prompt(text))
     last_event_time = active_monotonic()
     timeout_enabled = idle_timeout is not None and idle_timeout > 0
@@ -132,6 +137,11 @@ async def _run_prompt_locked(
     def _copy_permission_auto_declined() -> None:
         result.permission_auto_declined = list(
             getattr(conn.client, "permission_auto_declined", None) or []
+        )
+
+    def _copy_permission_router_decisions() -> None:
+        result.permission_router_decisions = list(
+            getattr(conn.client, "permission_router_decisions", None) or []
         )
 
     def _inline_holding() -> bool:
@@ -210,6 +220,7 @@ async def _run_prompt_locked(
                 result.permission_escalations = esc
                 await _cancel_prompt("USER-CONFIRM")
                 _copy_permission_auto_declined()
+                _copy_permission_router_decisions()
                 return result
             if prompt_task.done():
                 await asyncio.sleep(0)
@@ -222,6 +233,7 @@ async def _run_prompt_locked(
                     if marker:
                         await _cancel_prompt(marker)
                         _copy_permission_auto_declined()
+                        _copy_permission_router_decisions()
                         return result
                 break
             if timeout_enabled and active_monotonic() - last_event_time > float(idle_timeout):
@@ -252,6 +264,7 @@ async def _run_prompt_locked(
                     await prompt_task
                 result.error = {"code": -1, "message": "agent_timeout (idle)"}
                 _copy_permission_auto_declined()
+                _copy_permission_router_decisions()
                 return result
             try:
                 event = await asyncio.wait_for(turn_queue.get(), timeout=1.0)
@@ -265,6 +278,7 @@ async def _run_prompt_locked(
             if marker:
                 await _cancel_prompt(marker)
                 _copy_permission_auto_declined()
+                _copy_permission_router_decisions()
                 return result
 
         try:
@@ -293,6 +307,7 @@ async def _run_prompt_locked(
     if cwd:
         result.out_of_scope_writes = _scan_out_of_scope_paths(result.tool_calls, cwd)
     _copy_permission_auto_declined()
+    _copy_permission_router_decisions()
     return result
 
 

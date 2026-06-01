@@ -999,11 +999,75 @@ def _same_dir(a: str | None, b: str | None) -> bool:
 PERMISSION_ALLOW = "allow"
 PERMISSION_DENY = "deny"
 PERMISSION_ESCALATE = "escalate"
+MAX_PERMISSION_ROUTER_DECISIONS = 50
+_PERMISSION_ROUTER_TITLE_MAX = 160
+_PERMISSION_ROUTER_STR_MAX = 240
+_PERMISSION_ROUTER_LIST_MAX = 10
+_PERMISSION_ROUTER_OPTIONS_MAX = 8
 
 # Tool kinds that MODIFY state (ACP ToolKind). A write-like permission whose
 # targets we cannot see (no locations) cannot be proven in-worktree -> escalate.
 _WRITE_KINDS = frozenset({"edit", "delete", "move"})
 _READ_SAFE_KINDS = frozenset({"", "read", "search", "think"})
+
+
+def _compact_router_str(value: Any, limit: int = _PERMISSION_ROUTER_STR_MAX) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    return text if len(text) <= limit else text[: limit - 3] + "..."
+
+
+def _compact_router_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    out: list[str] = []
+    for item in value[:_PERMISSION_ROUTER_LIST_MAX]:
+        compact = _compact_router_str(item)
+        if compact:
+            out.append(compact)
+    return out
+
+
+def _compact_router_options(value: Any) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        return []
+    out: list[dict[str, str]] = []
+    for item in value[:_PERMISSION_ROUTER_OPTIONS_MAX]:
+        kind = _compact_router_str(_tc_get(item, "kind"), 80)
+        option_id = _compact_router_str(_tc_get(item, "option_id", "optionId"), 160)
+        row: dict[str, str] = {}
+        if kind is not None:
+            row["kind"] = kind
+        if option_id is not None:
+            row["option_id"] = option_id
+        if row:
+            out.append(row)
+    return out
+
+
+def _compact_router_record(record: dict[str, Any]) -> dict[str, Any]:
+    compact: dict[str, Any] = {}
+    for key, limit in (
+        ("key", 160),
+        ("tool_call_id", 160),
+        ("session_id", 160),
+        ("kind", 80),
+        ("cwd", _PERMISSION_ROUTER_STR_MAX),
+        ("decision", 80),
+        ("option_id", 160),
+        ("reason", 160),
+    ):
+        value = _compact_router_str(record.get(key), limit)
+        if value is not None:
+            compact[key] = value
+    title = _compact_router_str(record.get("title"), _PERMISSION_ROUTER_TITLE_MAX)
+    if title is not None:
+        compact["title"] = title
+    compact["locations"] = _compact_router_list(record.get("locations"))
+    compact["targets_outside_cwd"] = _compact_router_list(record.get("targets_outside_cwd"))
+    compact["options"] = _compact_router_options(record.get("options"))
+    return compact
 
 
 def default_permission_policy(tool_call: Any, options: list[Any], cwd: str | None) -> str:
@@ -1108,6 +1172,11 @@ class GoalflightClient(ClientBase):  # type: ignore[misc, valid-type]
         # inline hold in time (or the IPC failed). Informational only -- the
         # worker was given a deny and CONTINUED; this does NOT trigger re-dispatch.
         self.permission_auto_declined: list[dict[str, Any]] = []
+        # Per-turn audit trail for the auto permission router. Live push gates
+        # need to prove the router allowed bounded in-cwd writes and escalated
+        # boundary crossings; permission_escalations alone only records the
+        # escalation half.
+        self.permission_router_decisions: list[dict[str, Any]] = []
         # Escalation TRANSPORT. "auto" (default): an escalated request is answered
         # with a cancel immediately and surfaced via permission_escalations ->
         # USER-CONFIRM -> re-dispatch. "inline": HOLD the request open, publish it
@@ -1172,6 +1241,12 @@ class GoalflightClient(ClientBase):  # type: ignore[misc, valid-type]
     def set_turn_queue(self, queue: asyncio.Queue[dict[str, Any]] | None) -> None:
         self.turn_queue = queue
 
+    def _append_permission_router_decision(self, record: dict[str, Any]) -> None:
+        self.permission_router_decisions.append(_compact_router_record(record))
+        overflow = len(self.permission_router_decisions) - MAX_PERMISSION_ROUTER_DECISIONS
+        if overflow > 0:
+            del self.permission_router_decisions[:overflow]
+
     def observe_stream_event(self, event: Any) -> None:
         if StreamDirection is not None and event.direction != StreamDirection.INCOMING:
             return
@@ -1233,6 +1308,20 @@ class GoalflightClient(ClientBase):  # type: ignore[misc, valid-type]
         # USER-CONFIRM -> re-dispatch), never by holding the request open.
         policy = self.permission_policy or default_permission_policy
         title = _tc_get(tool_call, "title") or "?"
+        base_record = {
+            "key": permits.make_key(session_id, str(tool_id) if tool_id else None),
+            "tool_call_id": str(tool_id) if tool_id else None,
+            "session_id": session_id,
+            "title": title,
+            "kind": _tc_get(tool_call, "kind"),
+            "cwd": self.cwd,
+            "locations": _tool_call_locations(tool_call),
+            "targets_outside_cwd": _targets_outside_cwd(tool_call, self.cwd),
+            "options": [
+                {"kind": _tc_get(o, "kind"), "option_id": _tc_get(o, "option_id", "optionId")}
+                for o in (options or [])
+            ],
+        }
         try:
             decision = policy(tool_call, options, self.cwd)
         except Exception:
@@ -1241,27 +1330,22 @@ class GoalflightClient(ClientBase):  # type: ignore[misc, valid-type]
         if decision == PERMISSION_ALLOW:
             chosen_id = self._select_allow_option(options)
             if chosen_id:
+                record = dict(base_record)
+                record.update({"decision": PERMISSION_ALLOW, "option_id": chosen_id})
+                self._append_permission_router_decision(record)
                 log.info("auto-allow permission (in scope): %s -> optionId=%s", title, chosen_id)
                 return RequestPermissionResponse(
                     outcome=AllowedOutcome(outcome="selected", option_id=chosen_id)
                 )
+            record = dict(base_record)
+            record.update({"decision": PERMISSION_DENY, "reason": "no_allow_option"})
+            self._append_permission_router_decision(record)
             log.warning("permission allow but no allow option offered (%s); cancelling", title)
             return RequestPermissionResponse(outcome=DeniedOutcome(outcome="cancelled"))
         if decision == PERMISSION_ESCALATE:
-            record = {
-                "key": permits.make_key(session_id, str(tool_id) if tool_id else None),
-                "tool_call_id": str(tool_id) if tool_id else None,
-                "session_id": session_id,
-                "title": title,
-                "kind": _tc_get(tool_call, "kind"),
-                "cwd": self.cwd,
-                "locations": _tool_call_locations(tool_call),
-                "targets_outside_cwd": _targets_outside_cwd(tool_call, self.cwd),
-                "options": [
-                    {"kind": _tc_get(o, "kind"), "option_id": _tc_get(o, "option_id", "optionId")}
-                    for o in (options or [])
-                ],
-            }
+            record = dict(base_record)
+            record["decision"] = PERMISSION_ESCALATE
+            self._append_permission_router_decision(record)
             if self.permission_mode == PERMISSION_MODE_INLINE:
                 # HOLD the request open and authorize it IN PLACE via the controller
                 # (file IPC). Returns a definitive outcome on EVERY normal path -- a
@@ -1284,6 +1368,9 @@ class GoalflightClient(ClientBase):  # type: ignore[misc, valid-type]
             log.info("escalate permission to controller/user: %s", title)
             return RequestPermissionResponse(outcome=DeniedOutcome(outcome="cancelled"))
         # PERMISSION_DENY (a custom policy rejecting a hardcoded-dangerous op).
+        record = dict(base_record)
+        record["decision"] = PERMISSION_DENY
+        self._append_permission_router_decision(record)
         log.info("deny permission (policy): %s", title)
         return RequestPermissionResponse(outcome=DeniedOutcome(outcome="cancelled"))
 

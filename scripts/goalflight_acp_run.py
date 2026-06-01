@@ -90,6 +90,7 @@ from goalflight_acp_client import (
     AcpConnection,
     AcpError,
     AcpLivenessActivity,
+    MAX_PERMISSION_ROUTER_DECISIONS,
     PERMISSION_ALLOW,
     cleanup_ghosts,
     mark_connection_detached,
@@ -462,6 +463,9 @@ def _merge_prompt_results(results: list[PromptResult]) -> PromptResult:
         merged.out_of_scope_writes.extend(list(getattr(result, "out_of_scope_writes", []) or []))
         merged.permission_escalations.extend(list(getattr(result, "permission_escalations", []) or []))
         merged.permission_auto_declined.extend(list(getattr(result, "permission_auto_declined", []) or []))
+        merged.permission_router_decisions.extend(list(getattr(result, "permission_router_decisions", []) or []))
+        if len(merged.permission_router_decisions) > MAX_PERMISSION_ROUTER_DECISIONS:
+            merged.permission_router_decisions = merged.permission_router_decisions[-MAX_PERMISSION_ROUTER_DECISIONS:]
         result_error = getattr(result, "error", None)
         if result_error is not None and merged.error is None:
             merged.error = result_error
@@ -506,9 +510,47 @@ def agent_command(agent: str) -> tuple[str, list[str]]:
     manifest_command = _manifest_acp_command(agent)
     if manifest_command is not None:
         return manifest_command
-    if agent == "claude":
+    if agent in {"claude", "claude-acp"}:
         return "claude-code-cli-acp", []
     return agent, []
+
+
+def _compact_tool_call_summaries(tool_calls: list[Any], limit: int = 50) -> list[dict[str, object]]:
+    """Small status-safe surface for live matrix assertions."""
+    out: list[dict[str, object]] = []
+    for item in list(tool_calls or [])[:limit]:
+        raw_locations = None
+        try:
+            raw_locations = item.get("locations") if isinstance(item, dict) else getattr(item, "locations", None)
+        except Exception:
+            raw_locations = None
+        locations: list[str] = []
+        if isinstance(raw_locations, list):
+            for loc in raw_locations[:_INLINE_PERMISSION_LIST_MAX]:
+                path = None
+                try:
+                    path = loc.get("path") if isinstance(loc, dict) else getattr(loc, "path", None)
+                except Exception:
+                    path = None
+                if path:
+                    locations.append(_compact_permission_str(path))
+        summary: dict[str, object] = {
+            "title": _compact_permission_str(_tool_call_title(item)),
+            "locations": locations,
+        }
+        for key in ("kind", "status", "toolCallId", "tool_call_id"):
+            try:
+                value = item.get(key) if isinstance(item, dict) else getattr(item, key, None)
+            except Exception:
+                value = None
+            if value is not None:
+                summary[key] = _compact_permission_str(value, 160)
+        out.append(summary)
+    return out
+
+
+def _permission_audit_surface_enabled(permission_mode: str) -> bool:
+    return permission_mode == "inline" or os.environ.get("GOALFLIGHT_ACP_LIVE_MATRIX") == "1"
 
 
 def _adapter_manifest_candidates(agent: str) -> list[Path]:
@@ -1983,7 +2025,7 @@ async def _run_acp_dispatch_impl(
             )
             if not proceeded_ok:
                 state = "blocked_permission_denied"
-        payload.update({
+        final_updates = {
             "state": state,
             "ok": result.ok and state == "complete",
             "stop_reason": result.stop_reason,
@@ -2013,7 +2055,19 @@ async def _run_acp_dispatch_impl(
             # keying retry off the flag.
             "killed_by_heartbeat": state in ("wedged", "tool_timeout", "remote_turn_silence"),
             "wedged_by_heartbeat": state == "wedged",
-        })
+        }
+        if _permission_audit_surface_enabled(permission_mode):
+            # Extra audit surface is intentionally scoped to inline permission
+            # relays and the live ACP matrix. Normal dispatch status/ledger shape
+            # stays unchanged, avoiding permanent payload creep.
+            final_updates["permission_router_decisions"] = (
+                result.permission_router_decisions[-MAX_PERMISSION_ROUTER_DECISIONS:] or None
+            )
+            final_updates["tool_calls"] = _compact_tool_call_summaries(result.tool_calls)
+        else:
+            payload.pop("permission_router_decisions", None)
+            payload.pop("tool_calls", None)
+        payload.update(final_updates)
     except asyncio.CancelledError:
         if sigterm_received is not None and sigterm_received():
             payload.update(

@@ -21,6 +21,7 @@ from goalflight_os_sandbox import (
 SCRIPT_DIR = Path(__file__).resolve().parent
 ADAPTERS_DIR = Path(os.environ.get("GOALFLIGHT_ADAPTERS_DIR", SCRIPT_DIR.parent / "adapters"))
 AGENT_MANIFEST_ALIASES = {
+    "claude-acp": "claude-code",
     "claude": "claude-code",
     "codex-acp": "codex",
     "cursor-agent": "cursor",
