@@ -7,6 +7,7 @@ from support import skip_posix_on_native_windows
 skip_posix_on_native_windows("liveness tests use POSIX start_new_session process trees")
 
 import asyncio
+import datetime as dt
 import json
 import os
 import subprocess
@@ -19,6 +20,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 import goalflight_liveness  # noqa: E402
+import goalflight_capacity  # noqa: E402
 from goalflight_liveness import (  # noqa: E402
     _system_starved_uncached,
     active_monotonic,
@@ -475,6 +477,79 @@ def test_freeze_guard_skips_terminal_eval_then_resumes() -> None:
     assert progress_stalled is False
 
 
+def test_long_sleep_pause_preserves_silence_budget_math_and_steer_deadline() -> None:
+    prev_wall = 1000.0
+    prev_active = 500.0
+    active_after_sleep = 507.0
+    wall_after_sleep = prev_wall + (6 * 3600) + (active_after_sleep - prev_active)
+
+    freeze_s = system_sleep_pause_s(
+        prev_wall=prev_wall,
+        prev_active=prev_active,
+        wall_now=wall_after_sleep,
+        active_now=active_after_sleep,
+        heartbeat_interval_s=0.1,
+    )
+    assert freeze_s == 6 * 3600
+
+    activity = AcpLivenessActivity(last_event_mono=prev_active, last_progress_mono=prev_active)
+    activity.begin_turn(prev_active)
+    activity.note_message(_update("agent_message_chunk"), prev_active)
+    snapshot = activity.snapshot(active_after_sleep)
+
+    assert snapshot["quiet_for_s"] == 7.0
+    assert snapshot["progress_quiet_for_s"] == 7.0
+    assert snapshot["turn_silent_for_s"] == 7.0
+    assert classify_liveness(
+        pid_alive=True,
+        pgroup_cpu=None,
+        seconds_since_event=snapshot["quiet_for_s"],
+        thresholds=LivenessThresholds(idle_timeout_s=300.0, cpu_epsilon_pct=0.1),
+    ) == "running"
+    assert progress_stall_decision(
+        pid_alive=True,
+        progress_quiet_s=snapshot["progress_quiet_for_s"],
+        progress_stall_s=300.0,
+        outstanding_count=snapshot["outstanding_count"],
+    ) is False
+    assert snapshot["quiet_for_s"] < 300.0  # max_quiet_s budget uses active time
+    assert snapshot["turn_silent_for_s"] < 1200.0  # remote_turn_silence_s uses active time
+    awaiting_next_prompt_deadline_mono = prev_active + 10.0
+    assert awaiting_next_prompt_deadline_mono - active_after_sleep == 3.0
+
+
+def test_sleep_pause_extends_active_capacity_lease_expiry() -> None:
+    old_state_dir = os.environ.get("GOALFLIGHT_STATE_DIR")
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            os.environ["GOALFLIGHT_STATE_DIR"] = td
+            lease_id = "sleep-lease"
+            base = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+            expires_at = base + dt.timedelta(seconds=3600)
+            goalflight_capacity.save_state({
+                "schema": goalflight_capacity.SCHEMA,
+                "machine_id": "test-machine",
+                "leases": {
+                    lease_id: {
+                        "lease_id": lease_id,
+                        "state": "active",
+                        "expires_at": goalflight_capacity.iso(expires_at),
+                    },
+                },
+                "cooldowns": {},
+            })
+
+            assert goalflight_capacity.extend_active_lease_expiry(lease_id, 6 * 3600) is True
+            lease = goalflight_capacity.load_state()["leases"][lease_id]
+            assert goalflight_capacity.parse_iso(lease["expires_at"]) == expires_at + dt.timedelta(seconds=6 * 3600)
+            assert lease["sleep_pause_extended_s"] == 6 * 3600
+    finally:
+        if old_state_dir is None:
+            os.environ.pop("GOALFLIGHT_STATE_DIR", None)
+        else:
+            os.environ["GOALFLIGHT_STATE_DIR"] = old_state_dir
+
+
 def _scripted_sampler(values):
     """Async CPU sampler yielding a fixed sequence; repeats the last value once
     exhausted so tests need not match cpu_liveness_keep_waiting's attempt count."""
@@ -701,6 +776,8 @@ def main() -> None:
     test_active_monotonic_is_monotonic_float()
     test_simulated_sleep_excluded_from_liveness_budgets()
     test_freeze_guard_skips_terminal_eval_then_resumes()
+    test_long_sleep_pause_preserves_silence_budget_math_and_steer_deadline()
+    test_sleep_pause_extends_active_capacity_lease_expiry()
     test_cpu_keep_waiting_busy_first_sample_keeps_waiting()
     test_cpu_keep_waiting_all_idle_is_wedged()
     test_cpu_keep_waiting_transient_none_then_busy_keeps_waiting()

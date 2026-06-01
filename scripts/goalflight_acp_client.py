@@ -35,6 +35,7 @@ log = logging.getLogger("goal-flight.acp_client")
 _VERSION = "0.4.5-sdk"
 DEFAULT_ACP_LIMIT = 32 * 1024 * 1024
 DEFAULT_OVERSIZED_DRAIN_CAP = 1024 * 1024
+STDERR_DRAIN_CHUNK_BYTES = 64 * 1024
 OVERSIZED_DROP_HEAD_BYTES = 1024
 OVERSIZED_CLASSIFY_SCAN_BYTES = 64 * 1024
 MAX_DROPPED_FRAME_RECORDS = 20
@@ -1492,11 +1493,15 @@ class GoalflightAcpConnection:
             return
         try:
             while True:
-                line = await self.proc.stderr.readline()
-                if not line:
+                chunk = await self.proc.stderr.read(STDERR_DRAIN_CHUNK_BYTES)
+                if not chunk:
                     break
                 if self.verbose:
-                    log.debug("acp_stderr: %s", line.decode(errors="replace").rstrip()[:300])
+                    log.debug("acp_stderr: %s", chunk.decode(errors="replace").rstrip()[:300])
+                # Yield each chunk (grok D3 P2): under a stderr flood the verbose-log
+                # path could otherwise starve other tasks on this loop; the read()
+                # already suspends, this guarantees fairness.
+                await asyncio.sleep(0)
         except asyncio.CancelledError:
             raise
         except Exception:

@@ -330,6 +330,16 @@ def handle_prompt(req_id: int, params: dict) -> None:
         sys.stdout.flush()
         while True:
             time.sleep(1.0)
+    if SCENARIO == "stderr_burst":
+        remaining = int(os.environ.get("GOALFLIGHT_FAKE_ACP_STDERR_BURST_BYTES", str(2 * 1024 * 1024)))
+        chunk = b"x" * 65536
+        while remaining > 0:
+            n = min(remaining, len(chunk))
+            os.write(sys.stderr.fileno(), chunk[:n])
+            remaining -= n
+        text_update(session_id, "stderr-burst-done")
+        response(req_id, {"sessionId": session_id, "stopReason": "end_turn"})
+        return
     if SCENARIO == "permission":
         selected = request_permission(session_id, "perm-1")
         text_update(session_id, f"permission:{selected}")

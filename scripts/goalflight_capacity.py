@@ -343,6 +343,27 @@ def prune_state(data: dict) -> None:
             cooldowns.pop(agent, None)
 
 
+def extend_active_lease_expiry(lease_id: str | None, seconds: float) -> bool:
+    """Move an active lease expiry forward after detected system sleep."""
+    if not lease_id or seconds <= 0:
+        return False
+    with StateLock():
+        data = load_state()
+        lease = data.get("leases", {}).get(lease_id)
+        if not lease or lease.get("state") != "active":
+            return False
+        expires_at = parse_iso(lease.get("expires_at"))
+        if expires_at is None:
+            return False
+        lease["expires_at"] = iso(expires_at + dt.timedelta(seconds=seconds))
+        lease["sleep_pause_extended_s"] = round(
+            float(lease.get("sleep_pause_extended_s") or 0.0) + seconds,
+            3,
+        )
+        save_state(data)
+        return True
+
+
 def normalize_agent(agent: str) -> str:
     return agent.strip().lower()
 

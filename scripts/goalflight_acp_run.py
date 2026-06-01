@@ -1281,6 +1281,14 @@ async def _run_acp_dispatch_impl(
             )
             if freeze_s > 0:
                 total_paused_s += freeze_s
+                # Offload the lease-expiry extend to a thread (grok D3 P1): it takes
+                # the contended StateLock (fcntl.flock) + json load/save, so calling
+                # it directly would block the async heartbeat loop. Matches the
+                # to_thread treatment of the other hot-path I/O (cpu sampling).
+                with contextlib.suppress(Exception):
+                    await asyncio.to_thread(
+                        goalflight_capacity.extend_active_lease_expiry, lease_id, freeze_s
+                    )
                 await update_status(
                     note=system_sleep_pause_note(freeze_s, total_paused_s),
                     total_paused_s=round(total_paused_s, 3),

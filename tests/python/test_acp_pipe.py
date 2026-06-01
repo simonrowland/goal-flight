@@ -245,6 +245,24 @@ async def case_overlimit_no_newline_hits_drain_cap() -> None:
         await conn.kill()
 
 
+async def case_stderr_burst_without_newline_drains() -> None:
+    old_burst = os.environ.get("GOALFLIGHT_FAKE_ACP_STDERR_BURST_BYTES")
+    os.environ["GOALFLIGHT_FAKE_ACP_STDERR_BURST_BYTES"] = str(2 * 1024 * 1024)
+    try:
+        conn = await _connect("stderr_burst", limit="4k")
+    finally:
+        if old_burst is None:
+            os.environ.pop("GOALFLIGHT_FAKE_ACP_STDERR_BURST_BYTES", None)
+        else:
+            os.environ["GOALFLIGHT_FAKE_ACP_STDERR_BURST_BYTES"] = old_burst
+    try:
+        result = await asyncio.wait_for(run_prompt(conn, "go", idle_timeout=3), timeout=8)
+        assert result.ok, result
+        assert result.text == "stderr-burst-done", result.text
+    finally:
+        await conn.kill()
+
+
 async def case_overlimit_response_fails_cleanly() -> None:
     conn = await _connect("overlimit_response", limit="4k")
     start = time.monotonic()
@@ -1360,6 +1378,7 @@ async def amain() -> None:
     await case_overlimit_request_gets_safe_error_reply()
     await case_overlimit_request_late_id_gets_safe_error_reply()
     await case_overlimit_no_newline_hits_drain_cap()
+    await case_stderr_burst_without_newline_drains()
     await case_overlimit_response_fails_cleanly()
     await case_runner_overlimit_response_status_counts_drop()
     await case_runner_blocks_probe_required_adapter()
