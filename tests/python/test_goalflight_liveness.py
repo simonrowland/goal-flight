@@ -18,7 +18,9 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
+import goalflight_liveness  # noqa: E402
 from goalflight_liveness import (  # noqa: E402
+    _system_starved_uncached,
     active_monotonic,
     heartbeat_wedge_decision,
     IdleLivenessGate,
@@ -28,6 +30,7 @@ from goalflight_liveness import (  # noqa: E402
     parse_ps_pgroup_cpu,
     pgroup_cpu_pct,
     progress_stall_decision,
+    system_starved,
     system_sleep_pause_note,
     system_sleep_pause_s,
 )
@@ -104,6 +107,113 @@ def test_none_cpu_idle_classifies_wedged() -> None:
     # classifier (grok 2026-05-20 P2: assert the None+idle branch explicitly).
     thresholds = LivenessThresholds(idle_timeout_s=10.0, cpu_epsilon_pct=0.1)
     assert classify_liveness(True, None, 100.0, thresholds) == "wedged"
+
+
+def test_starved_zero_cpu_extends_idle_once_then_wedges() -> None:
+    thresholds = LivenessThresholds(idle_timeout_s=10.0, cpu_epsilon_pct=0.1)
+
+    assert classify_liveness(
+        True,
+        0.0,
+        10.1,
+        thresholds,
+        low_power_relax=True,
+        low_power_relax_factor=3.0,
+    ) == "running"
+    assert classify_liveness(
+        True,
+        0.0,
+        29.9,
+        thresholds,
+        low_power_relax=True,
+        low_power_relax_factor=3.0,
+    ) == "running"
+    assert classify_liveness(
+        True,
+        0.0,
+        30.0,
+        thresholds,
+        low_power_relax=True,
+        low_power_relax_factor=3.0,
+    ) == "wedged"
+
+
+def test_starved_long_idle_wedges_at_absolute_cap_not_multiplied() -> None:
+    # P1b (absolute hard wall): under PERSISTENT starvation the relax must add at
+    # most LOW_POWER_RELAX_CAP_S of grace, NOT multiply a long goal-mode idle.
+    # A 36000s (10h) idle must NOT become ~30h (idle*3); it must wedge at
+    # idle + cap. With the 600s cap: still running just under the cap, wedged at it.
+    from goalflight_liveness import LOW_POWER_RELAX_CAP_S
+
+    thresholds = LivenessThresholds(idle_timeout_s=36000.0, cpu_epsilon_pct=0.1)
+    cap = LOW_POWER_RELAX_CAP_S
+    # just inside the absolute wall -> still patient
+    assert classify_liveness(
+        True, 0.0, 36000.0 + cap - 1.0, thresholds,
+        low_power_relax=True, low_power_relax_factor=3.0,
+    ) == "running"
+    # at the absolute wall -> wedged (NOT extended to idle*3 = 108000s)
+    assert classify_liveness(
+        True, 0.0, 36000.0 + cap, thresholds,
+        low_power_relax=True, low_power_relax_factor=3.0,
+    ) == "wedged"
+    # well before idle*3 but past idle+cap -> wedged (proves no 30h hang)
+    assert classify_liveness(
+        True, 0.0, 50000.0, thresholds,
+        low_power_relax=True, low_power_relax_factor=3.0,
+    ) == "wedged"
+
+
+def test_starved_short_idle_still_gets_factor_benefit() -> None:
+    # The cap must not hurt the short-idle one-shot case: a 300s idle relaxed by
+    # factor 3 (900s) is well under idle+cap (900s), so the factor still applies.
+    thresholds = LivenessThresholds(idle_timeout_s=300.0, cpu_epsilon_pct=0.1)
+    assert classify_liveness(
+        True, 0.0, 850.0, thresholds,
+        low_power_relax=True, low_power_relax_factor=3.0,
+    ) == "running"
+    assert classify_liveness(
+        True, 0.0, 900.0, thresholds,
+        low_power_relax=True, low_power_relax_factor=3.0,
+    ) == "wedged"
+
+
+def test_not_starved_zero_cpu_still_wedges_at_idle_timeout() -> None:
+    thresholds = LivenessThresholds(idle_timeout_s=10.0, cpu_epsilon_pct=0.1)
+
+    assert classify_liveness(
+        True,
+        0.0,
+        10.0,
+        thresholds,
+        low_power_relax=False,
+    ) == "wedged"
+
+
+def test_system_starved_darwin_low_power_low_idle() -> None:
+    def fake_check_output(argv, **_kwargs):
+        if argv == ["pmset", "-g"]:
+            return "System-wide power settings:\n lowpowermode 1\n"
+        if argv == ["iostat", "-c", "2"]:
+            return (
+                "          disk0           cpu     load average\n"
+                "    KB/t  tps  MB/s     us    sy    id    1m    5m   15m\n"
+                "    0.00    0  0.00   82.0   3.0  15.0  4.90  4.10  3.80\n"
+            )
+        raise AssertionError(argv)
+
+    assert _system_starved_uncached(platform_name="darwin", check_output=fake_check_output) is True
+
+
+def test_system_starved_fail_safe_error_is_false() -> None:
+    original = goalflight_liveness._system_starved_uncached
+    goalflight_liveness._SYSTEM_STARVED_CACHE = None
+    try:
+        goalflight_liveness._system_starved_uncached = lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+        assert system_starved(now=lambda: 1.0, force_refresh=True) is False
+    finally:
+        goalflight_liveness._system_starved_uncached = original
+        goalflight_liveness._SYSTEM_STARVED_CACHE = None
 
 
 def test_heartbeat_dead_sample_decision_table() -> None:
@@ -556,6 +666,12 @@ def main() -> None:
     test_busy_silent_worker_classifies_running_quiet()
     test_idle_silent_worker_classifies_wedged()
     test_none_cpu_idle_classifies_wedged()
+    test_starved_zero_cpu_extends_idle_once_then_wedges()
+    test_starved_long_idle_wedges_at_absolute_cap_not_multiplied()
+    test_starved_short_idle_still_gets_factor_benefit()
+    test_not_starved_zero_cpu_still_wedges_at_idle_timeout()
+    test_system_starved_darwin_low_power_low_idle()
+    test_system_starved_fail_safe_error_is_false()
     test_heartbeat_dead_sample_decision_table()
     test_heartbeat_first_token_grace_requires_progress_before_wedge()
     test_heartbeat_wedges_after_first_progress_and_resets_on_new_progress()

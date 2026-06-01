@@ -189,6 +189,24 @@ def _unregister_connection(conn: "GoalflightAcpConnection") -> None:
         _write_through_pidfile_locked()
 
 
+def mark_connection_detached(pid: int) -> bool:
+    """Flag a live connection as intentionally detached (D2 non-destructive stall).
+
+    Rewrites the controller's pidfile so the worker's entry carries ``detached:
+    true`` -> cleanup_ghosts (this controller's next dispatch OR any sibling
+    project sharing the pidfile dir) will SKIP it instead of SIGKILLing the
+    still-running, intentionally-detached worker. Returns True if the pid was a
+    live tracked connection.
+    """
+    with _registry_lock:
+        conn = _live_connections.get(pid)
+        if conn is None:
+            return False
+        conn._detached = True
+        _write_through_pidfile_locked()
+        return True
+
+
 def _write_through_pidfile_locked() -> None:
     try:
         _PIDFILE_DIR.mkdir(parents=True, exist_ok=True)
@@ -211,6 +229,7 @@ def _write_through_pidfile_locked() -> None:
                         "identity_source": identity.get("identity_source"),
                         "agent": conn.agent,
                         "session_id": conn.session_id,
+                        "detached": conn._detached,
                     }
                 )
             )
@@ -228,6 +247,7 @@ def _write_through_pidfile_locked() -> None:
                     "cmd": comm,
                     "agent": conn.agent,
                     "session_id": conn.session_id,
+                    "detached": conn._detached,
                 }
             )
         )
@@ -249,6 +269,7 @@ def cleanup_ghosts(active_worker_pids: set[int] | None = None) -> int:
     killed = 0
     skipped_stale = 0
     skipped_live_controller = 0
+    skipped_detached = 0
     for pf in _PIDFILE_DIR.glob("*.jsonl"):
         try:
             controller_pid = int(pf.stem.split(".", 1)[0])
@@ -273,6 +294,16 @@ def cleanup_ghosts(active_worker_pids: set[int] | None = None) -> int:
                 continue
             pid = entry.get("pid")
             if not isinstance(pid, int) or pid in own_worker_pids:
+                continue
+            if entry.get("detached"):
+                # A worker the runner intentionally DETACHED on a non-destructive
+                # stall (D2): the controller exited but deliberately left the
+                # worker running for re-attach, so it is NOT a ghost. Reaping it
+                # here would SIGKILL a live, intentional worker (and across
+                # concurrent projects sharing this pidfile dir). Leave it; the
+                # capacity lease's detached_* markers drive slot reclamation when
+                # the worker actually dies (see goalflight_capacity stale-release).
+                skipped_detached += 1
                 continue
             if goalflight_compat.is_windows():
                 if not goalflight_compat.pid_alive(pid):
@@ -330,12 +361,14 @@ def cleanup_ghosts(active_worker_pids: set[int] | None = None) -> int:
             elif goalflight_compat.kill_pid(pid, hard_signal, pgid=pgid, process_group=True):
                 killed += 1
         pf.unlink(missing_ok=True)
-    if killed or skipped_stale or skipped_live_controller:
+    if killed or skipped_stale or skipped_live_controller or skipped_detached:
         log.info(
-            "ghost_cleanup: killed=%d skipped_stale=%d skipped_live_controllers=%d",
+            "ghost_cleanup: killed=%d skipped_stale=%d skipped_live_controllers=%d "
+            "skipped_detached=%d",
             killed,
             skipped_stale,
             skipped_live_controller,
+            skipped_detached,
         )
     return killed
 
@@ -1180,6 +1213,10 @@ class GoalflightAcpConnection:
     _started_meta: tuple[str, str] | None = None
     _stderr_task: asyncio.Task | None = None
     _registered: bool = False
+    # Set when the runner intentionally DETACHES this worker on a non-destructive
+    # stall (D2): the pidfile entry is then marked detached so cleanup_ghosts will
+    # NOT reap the still-running worker after the controller exits.
+    _detached: bool = False
 
     def __post_init__(self) -> None:
         self._started_meta = _ps_meta(self.proc.pid)

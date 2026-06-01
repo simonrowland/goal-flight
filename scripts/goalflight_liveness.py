@@ -14,10 +14,23 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import time
 from typing import Awaitable, Callable
 
 import goalflight_compat
+
+SYSTEM_STARVED_CACHE_TTL_S = 30.0
+SYSTEM_STARVED_IDLE_PCT = 20.0
+LOW_POWER_RELAX_FACTOR = 3.0
+# Absolute ceiling on the EXTRA grace the low-power relax may add, in seconds.
+# The relaxed timeout is min(idle_timeout * factor, idle_timeout + CAP): the
+# factor helps the short-idle one-shot case (300s -> 900s), while the CAP keeps
+# persistent starvation from scaling a long goal-mode idle (36000s) into a ~30h
+# hang. So a starved worker waits at most idle_timeout + 10min before wedging,
+# preserving the fail-fast / no-multi-hour-hang invariant regardless of config.
+LOW_POWER_RELAX_CAP_S = 600.0
+_SYSTEM_STARVED_CACHE: tuple[float, bool] | None = None
 
 
 def active_monotonic() -> float:
@@ -50,6 +63,160 @@ def system_sleep_pause_s(
 
 def system_sleep_pause_note(freeze_s: float, total_paused_s: float) -> str:
     return f"paused {freeze_s:.0f}s (system sleep/suspend); total_paused {total_paused_s:.0f}s"
+
+
+def _parse_last_idle_pct(output: str) -> float | None:
+    idle_idx: int | None = None
+    latest_idle: float | None = None
+    for raw_line in output.splitlines():
+        parts = raw_line.split()
+        if not parts:
+            continue
+        lowered = [part.lower() for part in parts]
+        if "id" in lowered:
+            idle_idx = lowered.index("id")
+            continue
+        if idle_idx is not None and len(parts) > idle_idx:
+            try:
+                latest_idle = float(parts[idle_idx])
+                continue
+            except ValueError:
+                pass
+    if latest_idle is not None:
+        return latest_idle
+    for raw_line in reversed(output.splitlines()):
+        parts = raw_line.split()
+        if not parts:
+            continue
+        try:
+            return float(parts[-1])
+        except ValueError:
+            continue
+    return None
+
+
+def _darwin_low_power_mode_enabled(
+    check_output: Callable[..., str] = subprocess.check_output,
+) -> bool:
+    output = check_output(
+        ["pmset", "-g"],
+        stderr=subprocess.DEVNULL,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=2.0,
+    )
+    for raw_line in output.splitlines():
+        parts = raw_line.strip().lower().split()
+        if len(parts) >= 2 and parts[0] == "lowpowermode":
+            return parts[-1] == "1"
+    return False
+
+
+def _darwin_idle_pct(
+    check_output: Callable[..., str] = subprocess.check_output,
+) -> float | None:
+    output = check_output(
+        ["iostat", "-c", "2"],
+        stderr=subprocess.DEVNULL,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=4.0,
+    )
+    return _parse_last_idle_pct(output)
+
+
+def _linux_powersave_governor(sys_root: Path = Path("/sys")) -> bool:
+    governor_paths = list(
+        (sys_root / "devices/system/cpu").glob("cpu[0-9]*/cpufreq/scaling_governor")
+    )
+    if not governor_paths:
+        return False
+    governors: list[str] = []
+    for governor_path in governor_paths:
+        try:
+            governors.append(governor_path.read_text(encoding="utf-8").strip().lower())
+        except OSError:
+            return False
+    return bool(governors) and all(governor == "powersave" for governor in governors)
+
+
+def _proc_stat_totals(proc_stat: Path = Path("/proc/stat")) -> tuple[int, int] | None:
+    try:
+        line = proc_stat.read_text(encoding="utf-8").splitlines()[0]
+    except (OSError, IndexError):
+        return None
+    parts = line.split()
+    if not parts or parts[0] != "cpu":
+        return None
+    try:
+        values = [int(value) for value in parts[1:]]
+    except ValueError:
+        return None
+    if len(values) < 4:
+        return None
+    idle = values[3] + (values[4] if len(values) > 4 else 0)
+    return idle, sum(values)
+
+
+def _linux_idle_pct(
+    *,
+    sleep: Callable[[float], None] = time.sleep,
+    proc_stat: Path = Path("/proc/stat"),
+) -> float | None:
+    first = _proc_stat_totals(proc_stat)
+    if first is None:
+        return None
+    sleep(0.1)
+    second = _proc_stat_totals(proc_stat)
+    if second is None:
+        return None
+    idle_delta = second[0] - first[0]
+    total_delta = second[1] - first[1]
+    if idle_delta < 0 or total_delta <= 0:
+        return None
+    return 100.0 * idle_delta / total_delta
+
+
+def _system_starved_uncached(
+    *,
+    platform_name: str | None = None,
+    check_output: Callable[..., str] = subprocess.check_output,
+    sleep: Callable[[float], None] = time.sleep,
+) -> bool:
+    platform = platform_name or sys.platform
+    if platform == "darwin":
+        low_power = _darwin_low_power_mode_enabled(check_output)
+        idle_pct = _darwin_idle_pct(check_output) if low_power else None
+    elif platform.startswith("linux"):
+        low_power = _linux_powersave_governor()
+        idle_pct = _linux_idle_pct(sleep=sleep) if low_power else None
+    else:
+        return False
+    return bool(low_power and idle_pct is not None and idle_pct < SYSTEM_STARVED_IDLE_PCT)
+
+
+def system_starved(
+    *,
+    now: Callable[[], float] = time.monotonic,
+    force_refresh: bool = False,
+) -> bool:
+    """Best-effort low-power + low-idle detector. Any failure returns False."""
+    global _SYSTEM_STARVED_CACHE
+    t = now()
+    if (
+        not force_refresh
+        and _SYSTEM_STARVED_CACHE is not None
+        and t - _SYSTEM_STARVED_CACHE[0] < SYSTEM_STARVED_CACHE_TTL_S
+    ):
+        return _SYSTEM_STARVED_CACHE[1]
+    try:
+        starved = _system_starved_uncached()
+    except Exception:
+        starved = False
+    _SYSTEM_STARVED_CACHE = (t, starved)
+    return starved
 
 
 @dataclass(frozen=True)
@@ -155,6 +322,9 @@ def classify_liveness(
     pgroup_cpu: float | None,
     seconds_since_event: float | None,
     thresholds: LivenessThresholds,
+    *,
+    low_power_relax: bool = False,
+    low_power_relax_factor: float = LOW_POWER_RELAX_FACTOR,
 ) -> LivenessState:
     """Classify worker liveness from identity, CPU, and progress silence."""
     if not pid_alive:
@@ -172,6 +342,18 @@ def classify_liveness(
 
     if pgroup_cpu is not None and pgroup_cpu > thresholds.cpu_epsilon_pct:
         return "running_quiet"
+    if low_power_relax and pgroup_cpu is not None:
+        # Absolute hard wall: the relax adds at most LOW_POWER_RELAX_CAP_S of
+        # extra grace, never a multiple of a long idle_timeout. min() of the
+        # factor form and the additive-cap form means short idles get the factor
+        # benefit and long (goal-mode) idles are bounded by the cap -> a starved
+        # worker still wedges within idle_timeout + cap, not idle_timeout * 3.
+        relaxed_timeout = min(
+            idle_timeout * max(1.0, low_power_relax_factor),
+            idle_timeout + LOW_POWER_RELAX_CAP_S,
+        )
+        if seconds_since_event < relaxed_timeout:
+            return "running"
     return "wedged"
 
 

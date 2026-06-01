@@ -142,6 +142,83 @@ def case_identity_mismatch_not_alive() -> None:
     assert reason == "pid_reused_lstart", reason
 
 
+def case_matching_lstart_ignores_comm_form_change() -> None:
+    original = goalflight_watch.goalflight_ledger.process_identity
+    try:
+        goalflight_watch.goalflight_ledger.process_identity = lambda pid: {
+            "pid": pid,
+            "lstart": "Sun May 31 19:28:48 2026",
+            "comm": "(grok-0.2.11-maco)",
+        }
+        is_alive, reason, current = goalflight_watch.worker_alive(
+            12345,
+            {"pid": 12345, "lstart": "Sun May 31 19:28:48 2026", "comm": "grok"},
+        )
+    finally:
+        goalflight_watch.goalflight_ledger.process_identity = original
+
+    assert is_alive is True, current
+    assert reason == "live", reason
+
+
+def case_same_second_pid_reuse_with_different_comm_is_not_alive() -> None:
+    # P1a (lstart granularity hole): lstart is second-granularity, so a pid
+    # reused within the same formatted second has an identical lstart. A matching
+    # lstart must NOT alone read "live" when comm proves a different process.
+    original = goalflight_watch.goalflight_ledger.process_identity
+    try:
+        goalflight_watch.goalflight_ledger.process_identity = lambda pid: {
+            "pid": pid,
+            "lstart": "Sun May 31 19:28:48 2026",
+            "comm": "node",
+        }
+        is_alive, reason, current = goalflight_watch.worker_alive(
+            12345,
+            {"pid": 12345, "lstart": "Sun May 31 19:28:48 2026", "comm": "grok"},
+        )
+    finally:
+        goalflight_watch.goalflight_ledger.process_identity = original
+
+    assert is_alive is False, current
+    assert reason == "pid_reused_lstart_comm", reason
+
+
+def case_missing_lstart_uses_tolerant_comm_fallback() -> None:
+    original = goalflight_watch.goalflight_ledger.process_identity
+    try:
+        goalflight_watch.goalflight_ledger.process_identity = lambda pid: {
+            "pid": pid,
+            "comm": "(grok-0.2.11-maco)",
+        }
+        is_alive, reason, current = goalflight_watch.worker_alive(
+            12345,
+            {"pid": 12345, "comm": "grok"},
+        )
+    finally:
+        goalflight_watch.goalflight_ledger.process_identity = original
+
+    assert is_alive is True, current
+    assert reason == "live", reason
+
+
+def case_missing_lstart_unrelated_comm_is_not_alive() -> None:
+    original = goalflight_watch.goalflight_ledger.process_identity
+    try:
+        goalflight_watch.goalflight_ledger.process_identity = lambda pid: {
+            "pid": pid,
+            "comm": "python",
+        }
+        is_alive, reason, current = goalflight_watch.worker_alive(
+            12345,
+            {"pid": 12345, "comm": "grok"},
+        )
+    finally:
+        goalflight_watch.goalflight_ledger.process_identity = original
+
+    assert is_alive is False, current
+    assert reason == "pid_reused_comm", reason
+
+
 def case_incomplete_identity_is_inconclusive_alive() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
@@ -184,6 +261,10 @@ def main() -> None:
     case_without_ignore_trips_on_echo()
     case_prompt_ignore_stops_at_first_mismatch()
     case_identity_mismatch_not_alive()
+    case_matching_lstart_ignores_comm_form_change()
+    case_same_second_pid_reuse_with_different_comm_is_not_alive()
+    case_missing_lstart_uses_tolerant_comm_fallback()
+    case_missing_lstart_unrelated_comm_is_not_alive()
     case_incomplete_identity_is_inconclusive_alive()
     case_steer_ack_is_non_terminal_marker()
     print("OK: goalflight_watch prompt-echo guard tests pass")

@@ -17,6 +17,7 @@ from goalflight_liveness import (
     classify_liveness,
     pgroup_cpu_pct,
     process_group_id,
+    system_starved,
     write_status,
 )
 
@@ -55,6 +56,28 @@ def _load_identity(raw: str | None) -> dict | None:
     return parsed if isinstance(parsed, dict) else None
 
 
+def _comm_base(value: object) -> str:
+    text = str(value or "").strip().lower()
+    if text.startswith("(") and ")" in text:
+        text = text[1:text.find(")")]
+    # A comm may be a bare name ("grok", "(grok-0.2.11-maco)") or a full
+    # executable path ("/opt/homebrew/.../python"); take the basename so a path
+    # tokenizes to its program name rather than an empty leading token.
+    text = text.rsplit("/", 1)[-1]
+    match = re.match(r"[a-z0-9_]+", text)
+    return match.group(0) if match else ""
+
+
+def _comm_matches(expected: object, actual: object) -> bool:
+    expected_base = _comm_base(expected)
+    actual_base = _comm_base(actual)
+    return bool(
+        expected_base
+        and actual_base
+        and (expected_base.startswith(actual_base) or actual_base.startswith(expected_base))
+    )
+
+
 def worker_alive(pid: int | None, expected_identity: dict | None) -> tuple[bool, str, dict | None]:
     if not pid:
         return False, "no_pid", None
@@ -64,16 +87,35 @@ def worker_alive(pid: int | None, expected_identity: dict | None) -> tuple[bool,
     if expected_identity:
         if expected_identity.get("pid") and int(expected_identity["pid"]) != int(pid):
             return False, "identity_pid_mismatch", current
-        missing_expected = [key for key in ("lstart", "comm") if not expected_identity.get(key)]
-        if missing_expected:
-            return True, "identity_inconclusive_missing_expected_" + "_".join(missing_expected), current
-        for key in ("lstart", "comm"):
-            expected = expected_identity.get(key)
-            actual = current.get(key)
-            if not actual:
-                return True, f"identity_inconclusive_missing_current_{key}", current
-            if actual != expected:
-                return False, f"pid_reused_{key}", current
+
+        expected_comm = expected_identity.get("comm")
+        actual_comm = current.get("comm")
+
+        expected_lstart = expected_identity.get("lstart")
+        actual_lstart = current.get("lstart")
+        if expected_lstart and actual_lstart:
+            if actual_lstart != expected_lstart:
+                return False, "pid_reused_lstart", current
+            # lstart is a SECOND-granularity wall-clock string, so a pid reused
+            # within the same formatted second yields an identical lstart. Trust
+            # lstart as the primary anti-reuse key, but when comm is available on
+            # both sides require comm-base compatibility too, so a same-second
+            # reuse by a genuinely DIFFERENT process (different base comm) is
+            # caught. _comm_matches is form-tolerant (base-token prefix), so a
+            # cosmetic comm change ("grok" vs "(grok-0.2.11-maco)") at the same
+            # lstart still reads live -- preserving the Mode B fix.
+            if expected_comm and actual_comm and not _comm_matches(expected_comm, actual_comm):
+                return False, "pid_reused_lstart_comm", current
+            return True, "live", current
+
+        if not expected_comm:
+            missing = ["lstart", "comm"] if not expected_lstart else ["comm"]
+            return True, "identity_inconclusive_missing_expected_" + "_".join(missing), current
+        if not actual_comm:
+            missing = ["lstart", "comm"] if not actual_lstart else ["comm"]
+            return True, "identity_inconclusive_missing_current_" + "_".join(missing), current
+        if not _comm_matches(expected_comm, actual_comm):
+            return False, "pid_reused_comm", current
         return True, "live", current
     return True, "identity_inconclusive", current
 
@@ -174,7 +216,21 @@ def main() -> int:
             cpu_pct = pgroup_cpu_pct(pgid)
         else:
             cpu_pct = 0.0
-        liveness_state = classify_liveness(worker_is_alive, cpu_pct, seconds_since_event, thresholds)
+        low_power_relax = (
+            worker_is_alive
+            and cpu_pct is not None
+            and cpu_pct <= args.cpu_epsilon
+            and args.max_idle_secs > 0
+            and seconds_since_event >= args.max_idle_secs
+            and system_starved()
+        )
+        liveness_state = classify_liveness(
+            worker_is_alive,
+            cpu_pct,
+            seconds_since_event,
+            thresholds,
+            low_power_relax=low_power_relax,
+        )
         payload = {
             "schema": "goalflight.status.v1",
             "dispatch_id": args.dispatch_id,
@@ -195,6 +251,8 @@ def main() -> int:
             "state": "running_quiet" if liveness_state == "running_quiet" else "running",
             "updated_at": int(now),
         }
+        if low_power_relax:
+            payload["low_power_relax"] = True
         if terminal:
             payload["state"] = "complete" if terminal["kind"] in {"RESULT", "COMPLETE"} else "blocked"
             exit_reason = f"marker:{terminal['kind']}"
