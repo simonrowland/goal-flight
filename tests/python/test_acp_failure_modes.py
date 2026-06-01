@@ -334,7 +334,9 @@ def _run_fake_runner(
     liveness_profile: str | None = None,
     remote_turn_silence_s: float | None = None,
     remote_turn_cancel_grace_s: float = 0.1,
+    stall_kill: bool = False,
     extra_env: dict[str, str] | None = None,
+    state_snapshot: dict | None = None,
     timeout_s: float = 8.0,
 ) -> tuple[int, dict, str, str]:
     with tempfile.TemporaryDirectory() as td:
@@ -386,6 +388,8 @@ def _run_fake_runner(
         if remote_turn_silence_s is not None:
             args.extend(["--remote-turn-silence-s", str(remote_turn_silence_s)])
             args.extend(["--remote-turn-cancel-grace-s", str(remote_turn_cancel_grace_s)])
+        if stall_kill:
+            args.append("--stall-kill")
         proc = subprocess.Popen(
             args,
             cwd=ROOT,
@@ -409,7 +413,18 @@ def _run_fake_runner(
             raise AssertionError(f"{scenario} runner timed out\nstdout={stdout}\nstderr={stderr}")
         if not status.exists():
             raise AssertionError(f"{scenario} wrote no status\nstdout={stdout}\nstderr={stderr}")
-        return proc.returncode, json.loads(status.read_text()), stdout, stderr
+        status_payload = json.loads(status.read_text())
+        if state_snapshot is not None:
+            capacity_path = state_dir / "capacity.json"
+            state_snapshot["capacity"] = (
+                json.loads(capacity_path.read_text()) if capacity_path.exists() else {}
+            )
+            runs_dir = state_dir / "runs.d"
+            state_snapshot["records"] = [
+                json.loads(path.read_text())
+                for path in sorted(runs_dir.glob("*.json"))
+            ] if runs_dir.exists() else []
+        return proc.returncode, status_payload, stdout, stderr
 
 
 @skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")
@@ -417,6 +432,7 @@ def case_runner_raw_vendor_flood_hits_progress_stall_and_reaps() -> None:
     returncode, status, stdout, stderr = _run_fake_runner(
         "raw_vendor_flood",
         progress_stall_s=0.5,
+        stall_kill=True,
     )
 
     assert returncode != 0, stdout
@@ -426,6 +442,90 @@ def case_runner_raw_vendor_flood_hits_progress_stall_and_reaps() -> None:
     assert status["events_seen"] > 0, status
     assert status["worker_alive"] is False, status
     assert not _pid_alive(status.get("worker_pid")), (status, stderr)
+
+
+@skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")
+def case_runner_progress_stall_detaches_by_default() -> None:
+    state_snapshot: dict = {}
+    returncode, status, stdout, stderr = _run_fake_runner(
+        "progress_then_silent",
+        progress_stall_s=0.5,
+        heartbeat_interval=0.1,
+        wedge_samples=999,
+        idle_timeout=0.0,
+        max_quiet_s=30.0,
+        max_tool_s=30.0,
+        state_snapshot=state_snapshot,
+        timeout_s=8.0,
+    )
+    worker_pid = status.get("worker_pid")
+    try:
+        assert returncode != 0, stdout
+        assert status["state"] == "stalled", status
+        assert status["error"]["message"] == "progress_stall", status
+        assert status["worker_alive"] is True, status
+        assert status["worker_still_alive"] is True, status
+        assert status["killed_by_heartbeat"] is False, status
+        assert status["wedged_by_heartbeat"] is False, status
+        assert status["markers"]["STALLED"], status
+        assert _pid_alive(worker_pid), (status, stderr)
+
+        dispatch_id = status["dispatch_id"]
+        records = [r for r in state_snapshot.get("records", []) if r.get("dispatch_id") == dispatch_id]
+        assert records and records[-1].get("state") == "stalled", records
+        assert records[-1].get("terminal_state") == "stalled", records[-1]
+        assert records[-1].get("worker_still_alive") is True, records[-1]
+        leases = [
+            lease
+            for lease in (state_snapshot.get("capacity", {}).get("leases") or {}).values()
+            if lease.get("dispatch_id") == dispatch_id
+        ]
+        assert leases and leases[-1].get("state") == "active", leases
+        assert not leases[-1].get("released_at"), leases[-1]
+        assert leases[-1].get("worker_pid") == worker_pid, leases[-1]
+        assert leases[-1].get("controller_pid") == worker_pid, leases[-1]
+    finally:
+        _force_kill(worker_pid)
+
+
+def case_detached_pidfile_entry_survives_ghost_cleanup() -> None:
+    # P0 (the orphan the adversarial review caught): D2 leaves the worker running
+    # on a non-destructive stall, so its pidfile entry must be marked detached and
+    # a LATER cleanup_ghosts (this controller's next dispatch OR a sibling project
+    # sharing /tmp/goal-flight-*/goal-flight-acp-pids.d) MUST SKIP it, not SIGKILL
+    # the live, intentional worker. Proven against a real live process + isolated
+    # pidfile dir; the inverse (detached=false) must still be reaped.
+    import goalflight_acp_client as ac
+    # Monkeypatch the module's _PIDFILE_DIR directly (cleanup_ghosts reads it at
+    # call time). Do NOT importlib.reload(ac): reload creates a SECOND module copy
+    # that diverges from the spawn_and_handshake_with_retry imported at top of this
+    # file, corrupting shared connection/event-loop state for later cases in the
+    # same process (it false-failed case_handshake_wedge_kills_before_respawn).
+    old_pidfile_dir = ac._PIDFILE_DIR
+    tmp = Path(tempfile.mkdtemp(prefix="gf-detach-ghost-"))
+    ac._PIDFILE_DIR = tmp
+    worker = subprocess.Popen(["sleep", "30"])
+    try:
+        meta = ac._ps_meta(worker.pid)
+        assert meta is not None, "could not read live worker identity"
+        lstart, comm = meta
+        dead_controller_pid = 999999  # not a live pid
+        pidfile = tmp / f"{dead_controller_pid}.jsonl"
+        base = {
+            "pid": worker.pid, "pgid": worker.pid, "started_at": lstart,
+            "cmd": comm, "agent": "codex-acp", "session_id": "s",
+        }
+        # detached worker -> NOT killed, survives.
+        pidfile.write_text(json.dumps({**base, "detached": True}) + "\n")
+        assert ac.cleanup_ghosts() == 0, "detached worker must not be reaped"
+        assert worker.poll() is None, "detached worker must survive cleanup_ghosts"
+        # control: identical entry without detached -> reaped (skip stays specific).
+        pidfile.write_text(json.dumps({**base, "detached": False}) + "\n")
+        assert ac.cleanup_ghosts() == 1, "non-detached ghost must still be reaped"
+    finally:
+        with contextlib.suppress(Exception):
+            worker.kill()
+        ac._PIDFILE_DIR = old_pidfile_dir
 
 
 @skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")
@@ -720,6 +820,7 @@ def case_runner_goal_mode_progress_stall_backstop() -> None:
         "raw_vendor_flood",
         progress_stall_s=0.5,
         idle_timeout=0.0,
+        stall_kill=True,
     )
 
     assert returncode != 0, stdout
@@ -871,6 +972,8 @@ def main() -> None:
     case_manifest_acp_command_defaults()
     case_json_rpc_stdout_filter()
     case_runner_raw_vendor_flood_hits_progress_stall_and_reaps()
+    case_runner_progress_stall_detaches_by_default()
+    case_detached_pidfile_entry_survives_ghost_cleanup()
     case_runner_progress_then_silent_wedges_and_reaps()
     case_runner_remote_long_reasoning_pause_survives_old_walls()
     case_runner_remote_dead_silent_turn_hits_remote_wall()

@@ -3,9 +3,11 @@
 
 Timeout model (two signals):
 
-- ``--progress-stall-s`` (default 300) — **operative stall detector**. Kills when
-  standard progress events go quiet for N seconds. Raw vendor noise does not
-  reset it. Tune this for the worker's expected per-event quiet pattern.
+- ``--progress-stall-s`` (default 300) — **operative stall detector**. By
+  default, exits the runner and leaves the worker alive so the host is woken and
+  can re-attach. ``--stall-kill`` restores the old kill-on-stall behavior. Raw
+  vendor noise does not reset it. Tune this for the worker's expected per-event
+  quiet pattern.
 
 - ``--max-tool-s`` (default 3600, the harness clamp) — **wall-clock safety net**
   for one outstanding tool call. Activity-naive. Use a lower value only when you
@@ -41,6 +43,7 @@ import goalflight_compat  # noqa: E402
 DEFAULT_REMOTE_TURN_SILENCE_S = 1200.0
 DEFAULT_REMOTE_TURN_CANCEL_GRACE_S = 15.0
 DEFAULT_MAX_TOOL_S = 3600.0
+DEFAULT_STALL_WAKE_CAP = 3
 LIVENESS_PROFILES = {"remote_api", "local_compute", "hybrid"}
 
 
@@ -87,6 +90,7 @@ from goalflight_acp_client import (
     AcpLivenessActivity,
     PERMISSION_ALLOW,
     cleanup_ghosts,
+    mark_connection_detached,
     default_permission_policy,
     spawn_acp_connection,
 )
@@ -289,6 +293,10 @@ class _SigtermCancelBridge:
             with contextlib.suppress(Exception):
                 signal.signal(signal.SIGTERM, self._prior_handler)
         self._installed = False
+
+
+class _AcpWorkerDetached(Exception):
+    """Internal control-flow signal: runner exits while worker stays alive."""
 
 
 def _resolve_manifest_binary(binary: str) -> str:
@@ -611,6 +619,7 @@ async def _run_acp_dispatch_impl(
     progress_stall_s = getattr(cfg, "progress_stall_s", None)
     if progress_stall_s is None:
         progress_stall_s = 300.0
+    stall_kill = bool(getattr(cfg, "stall_kill", False))
     worker_cwd = cfg.cwd
     manifest_profile, manifest_remote_turn_silence_s = adapter_liveness_config(cfg.agent)
     liveness_profile = getattr(cfg, "liveness_profile", None) or manifest_profile
@@ -684,6 +693,9 @@ async def _run_acp_dispatch_impl(
         "heartbeat_at": None,
         "progress_quiet_for_s": 0.0,
         "progress_stall_s": None,
+        "stall_kill": stall_kill,
+        "stall_wake_count": 0,
+        "stall_wake_cap": DEFAULT_STALL_WAKE_CAP,
         "liveness_profile": liveness_profile,
         "remote_turn_silence_s": remote_turn_silence_s,
         "turn_in_flight": False,
@@ -822,6 +834,9 @@ async def _run_acp_dispatch_impl(
     heartbeat_outcome: str | None = None
     heartbeat_error: dict[str, object] | None = None
     wedged_by_heartbeat = False
+    detach_worker = False
+    stall_wake_count = 0
+    stall_detach_event = asyncio.Event()
     # CPU-aware idle gate: keeps a busy-but-silent worker (running_quiet) but
     # enforces a hard wall (lease lifetime) so a pathological CPU spinner that
     # never emits an event can't hang the runner forever.
@@ -853,6 +868,37 @@ async def _run_acp_dispatch_impl(
                     json=True,
                 )
             )
+
+    def attach_worker_to_lease(worker_pid: int) -> None:
+        if not lease_id:
+            return
+        with goalflight_capacity.StateLock():
+            data = goalflight_capacity.load_state()
+            lease = data.get("leases", {}).get(lease_id)
+            if lease:
+                lease["worker_pid"] = worker_pid
+                goalflight_capacity.save_state(data)
+
+    def detach_lease_to_worker(worker_pid: int, reason: object) -> None:
+        if not lease_id:
+            return
+        with goalflight_capacity.StateLock():
+            data = goalflight_capacity.load_state()
+            lease = data.get("leases", {}).get(lease_id)
+            if lease:
+                lease["worker_pid"] = worker_pid
+                lease["detached_controller_pid"] = lease.get("controller_pid")
+                lease["controller_pid"] = worker_pid
+                lease["detached_at"] = goalflight_capacity.iso()
+                lease["detached_reason"] = reason
+                goalflight_capacity.save_state(data)
+
+    def stalled_markers(message: str) -> dict[str, list[str]]:
+        markers = dict(payload.get("markers") or {})
+        values = list(markers.get("STALLED") or [])
+        values.append(message)
+        markers["STALLED"] = values[-DEFAULT_STALL_WAKE_CAP:]
+        return markers
 
     try:
         await update_status(lease_id=lease_id)
@@ -900,7 +946,7 @@ async def _run_acp_dispatch_impl(
             write_status(status_path, payload)
 
     async def heartbeat_loop() -> None:
-        nonlocal heartbeat_outcome
+        nonlocal detach_worker, heartbeat_outcome, stall_wake_count
         dead_samples = 0
         last_sample_progress_seen = 0
         prev_wall = time.time()
@@ -1040,22 +1086,60 @@ async def _run_acp_dispatch_impl(
                 )
                 await asyncio.sleep(cfg.heartbeat_interval)
                 continue
-            if progress_stall_decision(
+            if turn_in_flight and progress_stall_decision(
                 pid_alive=pid_alive,
                 progress_quiet_s=progress_quiet_s,
                 progress_stall_s=progress_stall_s,
                 outstanding_count=outstanding_count,
             ):
-                await mark_heartbeat_terminal(
-                    "wedged",
-                    {
-                        "code": -1,
-                        "message": "progress_stall",
-                        "progress_quiet_s": round(progress_quiet_s, 3),
-                        "progress_stall_s": round(progress_stall_s, 3),
-                    },
+                stall_error = {
+                    "code": -1,
+                    "message": "progress_stall",
+                    "progress_quiet_s": round(progress_quiet_s, 3),
+                    "progress_stall_s": round(progress_stall_s, 3),
+                }
+                if stall_kill:
+                    await mark_heartbeat_terminal("wedged", stall_error)
+                    await conn.kill()
+                    return
+                stall_wake_count += 1
+                detach_worker = True
+                marker_text = (
+                    "progress_stall "
+                    f"quiet={round(progress_quiet_s, 3)}s "
+                    f"limit={round(progress_stall_s, 3)}s"
                 )
-                await conn.kill()
+                markers = stalled_markers(marker_text)
+                async with status_lock:
+                    payload.update(
+                        state="stalled",
+                        ok=False,
+                        error=stall_error,
+                        killed_by_heartbeat=False,
+                        wedged_by_heartbeat=False,
+                        stalled_by_heartbeat=True,
+                        stall_wake_count=stall_wake_count,
+                        stall_wake_cap=DEFAULT_STALL_WAKE_CAP,
+                        markers=markers,
+                        last_marker={"STALLED": marker_text},
+                        worker_pid=proc.pid,
+                        pgid=pgid,
+                        worker_alive=pid_alive,
+                        worker_still_alive=pid_alive,
+                        heartbeat_at=_now(),
+                        progress_quiet_for_s=round(progress_quiet_s, 3),
+                        progress_stall_s=progress_stall_s,
+                        outstanding_tool_calls=outstanding_count,
+                        acp_dropped_frames=dropped_frames,
+                    )
+                    write_status(status_path, payload)
+                # Disarm the ghost reaper for this intentionally-detached worker
+                # BEFORE the runner unwinds and exits: rewrite the pidfile entry
+                # with detached=true so a later cleanup_ghosts (this controller's
+                # next dispatch or a sibling project sharing the pidfile dir) skips
+                # it instead of SIGKILLing the still-running worker.
+                mark_connection_detached(proc.pid)
+                stall_detach_event.set()
                 return
             if (
                 cfg.max_quiet_s > 0
@@ -1174,6 +1258,8 @@ async def _run_acp_dispatch_impl(
         nonlocal proc
         proc = p  # publish to heartbeat/note_event/on_idle closures + finally
         pgid = process_group_id(p.pid) or p.pid
+        with contextlib.suppress(Exception):
+            attach_worker_to_lease(p.pid)
         updates: dict[str, object] = dict(
             worker_pid=p.pid, pgid=pgid, worker_alive=True, state="handshaking"
         )
@@ -1320,13 +1406,32 @@ async def _run_acp_dispatch_impl(
         activity.reset_progress_clock(active_monotonic())
         heartbeat_task = asyncio.create_task(heartbeat_loop())
         await update_status(state="running")
-        result = await run_prompt(
+        prompt_task = asyncio.create_task(run_prompt(
             conn,
             prompt,
             idle_timeout=cfg.idle_timeout,
             on_event=note_event,
             on_idle=on_idle_check,
+        ))
+        stall_wait_task = asyncio.create_task(stall_detach_event.wait())
+        done, _pending = await asyncio.wait(
+            {prompt_task, stall_wait_task},
+            return_when=asyncio.FIRST_COMPLETED,
         )
+        if prompt_task not in done:
+            detach_worker = True
+            if conn is not None:
+                # Cancel local awaiting without sending session/cancel; the
+                # worker remains alive and detached for controller recovery.
+                conn.acp_session_id = None
+            prompt_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await prompt_task
+            raise _AcpWorkerDetached()
+        stall_wait_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await stall_wait_task
+        result = await prompt_task
         markers = extract_markers(result.text)
         async with status_lock:
             terminal_by_heartbeat = heartbeat_outcome or getattr(conn, "heartbeat_outcome", None)
@@ -1402,6 +1507,15 @@ async def _run_acp_dispatch_impl(
             )
         else:
             raise
+    except _AcpWorkerDetached:
+        if payload.get("state") != "stalled":
+            payload.update(
+                {
+                    "state": "stalled",
+                    "ok": False,
+                    "error": payload.get("error") or {"code": -1, "message": "progress_stall"},
+                }
+            )
     except Exception as e:
         async with status_lock:
             terminal_by_heartbeat = heartbeat_outcome or (getattr(conn, "heartbeat_outcome", None) if conn else None)
@@ -1427,7 +1541,7 @@ async def _run_acp_dispatch_impl(
             heartbeat_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await heartbeat_task
-        if conn is not None:
+        if conn is not None and not detach_worker:
             with contextlib.suppress(Exception):
                 await conn.close_gracefully()
         if proc is not None:
@@ -1445,6 +1559,7 @@ async def _run_acp_dispatch_impl(
                 pgid=payload.get("pgid") or process_group_id(proc.pid) or proc.pid,
                 heartbeat_at=_now(),
             )
+            payload["worker_still_alive"] = payload.get("worker_alive")
             payload["pgroup_cpu_pct"] = pgroup_cpu_pct(payload.get("pgid"))
         if ledger_recorded:
             with contextlib.redirect_stdout(io.StringIO()):
@@ -1453,12 +1568,16 @@ async def _run_acp_dispatch_impl(
                         dispatch_id=dispatch_id,
                         state=payload.get("state", state),
                         reason=payload.get("error"),
-                        terminal_state=None,
+                        terminal_state="stalled" if payload.get("state") == "stalled" else None,
                         elapsed_s=round(time.time() - run_started, 3),
-                        worker_still_alive=payload.get("worker_alive"),
+                        worker_still_alive=payload.get("worker_still_alive"),
                     )
                 )
-        if lease_id:
+        leave_lease_active = bool(detach_worker and proc is not None and proc.returncode is None)
+        if leave_lease_active and proc is not None:
+            with contextlib.suppress(Exception):
+                detach_lease_to_worker(proc.pid, payload.get("error"))
+        elif lease_id:
             with contextlib.redirect_stdout(io.StringIO()):
                 goalflight_capacity.cmd_release(argparse.Namespace(lease_id=lease_id, state=payload.get("state", state), reason=payload.get("error"), keep=True))
     write_status(status_path, payload)
@@ -1484,6 +1603,7 @@ def normalized_acp_dispatch_cfg(args: argparse.Namespace) -> argparse.Namespace:
         values["max_quiet_s"] = 3600.0
     if values.get("progress_stall_s", 0) <= 0:
         values["progress_stall_s"] = 300.0
+    values["stall_kill"] = bool(values.get("stall_kill", False))
     values["session_id"] = values.get("session_id") or f"goalflight-{uuid.uuid4().hex[:8]}"
     return argparse.Namespace(**values)
 
@@ -1520,6 +1640,7 @@ def write_windows_refusal_status(args: argparse.Namespace) -> tuple[dict, Path]:
         "worker_pid": None,
         "pgid": None,
         "worker_alive": False,
+        "worker_still_alive": False,
         "status_path": str(status_path),
         "updated_at": _now(),
     }
@@ -1679,10 +1800,18 @@ def main(argv: list[str] | None = None) -> int:
         "--progress-stall-s",
         type=float,
         default=float(os.environ.get("GOALFLIGHT_PROGRESS_STALL_S", "300")),
-        help="Operative activity-based stall detector: kill when standard progress "
-             "events are silent for N seconds (default 300). Raw vendor events do "
-             "not reset it. Tune for the worker's expected quiet pattern; do not "
+        help="Operative activity-based stall detector: by default, exit the "
+             "runner and leave the worker alive when standard progress events "
+             "are silent for N seconds (default 300). Raw vendor events do not "
+             "reset it. Tune for the worker's expected quiet pattern; do not "
              "substitute a tight --max-tool-s for this.",
+    )
+    parser.add_argument(
+        "--stall-kill",
+        action="store_true",
+        default=os.environ.get("GOALFLIGHT_STALL_KILL", "").lower() in {"1", "true", "yes"},
+        help="Restore old progress-stall behavior: kill the worker instead of "
+             "detaching it and waking the controller.",
     )
     parser.add_argument(
         "--liveness-profile",
