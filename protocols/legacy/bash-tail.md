@@ -31,6 +31,16 @@ end-of-*loop* signal — not just the end-of-*turn* terminal markers above.
 
 ## Recipes
 
+> ⚠️ **Leak warning (tty/process).** These raw `... &` recipes background the
+> worker with a bare shell `&` and track only `$!`. They do NOT register a
+> pidfile or place the worker in its own reapable process group, so
+> `cleanup_ghosts` cannot find them and any helper processes the worker leaves
+> (e.g. codex's tty-using helpers, which reparent to launchd) leak until reboot.
+> **Prefer the tracked path** — `scripts/goalflight_dispatch.py` (crash-safe:
+> `start_new_session` group + pidfile + decoupled watcher + dead-worker group
+> reaping). Use these raw recipes only for throwaway manual runs you reap
+> yourself.
+
 Worker invocations. All three drop a tail file the watcher polls. Replace
 `<slug>` and `<workdir>` per chunk.
 

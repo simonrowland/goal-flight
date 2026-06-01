@@ -42,6 +42,7 @@ import io
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import threading
@@ -639,11 +640,57 @@ def _write_pidfile(args, *, worker_pid: int, pgid: int | None, identity: dict | 
     return pidfile
 
 
+def _reap_dead_worker_pgroup(pidfile: Path, worker_pid: int) -> None:
+    """Best-effort reap of a DEAD worker's orphaned process group.
+
+    The direct-dispatch worker runs in its own session/group
+    (``_detached_popen_kwargs`` / ``start_new_session``), so a terminal marker is
+    non-destructive: a worker that is still ALIVE is left untouched for re-attach.
+    But once the worker (the group leader) has EXITED, any children that lingered
+    in its group are orphans with no reaper -- and unlinking the pidfile (below)
+    would discard the only record of their pgid, so even the opportunistic
+    ``cleanup_ghosts`` sweep could never reach them. So, only when the leader is
+    already dead, killpg the recorded group to clean them up first. Children that
+    escaped to a NEW session (e.g. a helper that called ``setsid`` and reparented
+    to launchd/init) are not in this group and remain an inherent limit; the
+    ``kern.tty.ptmx_max`` backstop + agent choice mitigate that residual class.
+    """
+    pgid = None
+    try:
+        lines = pidfile.read_text(encoding="utf-8").splitlines()
+        if lines:
+            entry = json.loads(lines[0])
+            if isinstance(entry, dict):
+                pgid = int(entry.get("pgid") or 0)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pgid = None
+    if not pgid or pgid <= 1:
+        return
+    # Direct-dispatch invariant: the worker is its own session/group leader
+    # (start_new_session), so pgid == worker_pid. If they disagree we cannot be
+    # sure the group is the worker's -- be conservative and skip.
+    if pgid != worker_pid:
+        return
+    with contextlib.suppress(OSError, AttributeError):
+        if hasattr(os, "getpgrp") and pgid == os.getpgrp():
+            return  # never signal the controller's own process group
+    # Re-check liveness immediately before signalling: if worker_pid was reused
+    # and is now a live unrelated process, skip rather than risk a wrong target.
+    if goalflight_compat.pid_alive(worker_pid):
+        return
+    # killpg the group DIRECTLY -- not via kill_pid, whose empty-group fallback
+    # to a bare kill(worker_pid) could hit a reused pid. An empty/gone group
+    # (ProcessLookupError) or a Windows-absent os.killpg degrades to a no-op.
+    with contextlib.suppress(ProcessLookupError, PermissionError, OSError, AttributeError):
+        os.killpg(pgid, getattr(signal, "SIGTERM", 15))
+
+
 def _cleanup_pidfile_if_worker_dead(pidfile: Path | None, worker_pid: int | None) -> None:
     if not pidfile or not worker_pid:
         return
     if goalflight_compat.pid_alive(worker_pid):
-        return
+        return  # still alive: non-destructive -- leave the pidfile for re-attach
+    _reap_dead_worker_pgroup(pidfile, worker_pid)
     with contextlib.suppress(OSError):
         pidfile.unlink(missing_ok=True)
 
