@@ -66,14 +66,19 @@ def _write_supported_adapter_manifest(directory: Path, name: str) -> None:
     }))
 
 
-async def _connect(scenario: str, *, limit: str | None = None):
+async def _connect(scenario: str, *, limit: str | None = None, drain_cap: str | None = None):
     old_scenario = os.environ.get("GOALFLIGHT_FAKE_ACP_SCENARIO")
     old_limit = os.environ.get("GOALFLIGHT_ACP_LIMIT")
+    old_drain_cap = os.environ.get("GOALFLIGHT_ACP_OVERSIZED_DRAIN_CAP")
     os.environ["GOALFLIGHT_FAKE_ACP_SCENARIO"] = scenario
     if limit is not None:
         os.environ["GOALFLIGHT_ACP_LIMIT"] = limit
     else:
         os.environ.pop("GOALFLIGHT_ACP_LIMIT", None)
+    if drain_cap is not None:
+        os.environ["GOALFLIGHT_ACP_OVERSIZED_DRAIN_CAP"] = drain_cap
+    else:
+        os.environ.pop("GOALFLIGHT_ACP_OVERSIZED_DRAIN_CAP", None)
     try:
         conn = await spawn_acp_connection(
             sys.executable,
@@ -94,6 +99,10 @@ async def _connect(scenario: str, *, limit: str | None = None):
             os.environ.pop("GOALFLIGHT_ACP_LIMIT", None)
         else:
             os.environ["GOALFLIGHT_ACP_LIMIT"] = old_limit
+        if old_drain_cap is None:
+            os.environ.pop("GOALFLIGHT_ACP_OVERSIZED_DRAIN_CAP", None)
+        else:
+            os.environ["GOALFLIGHT_ACP_OVERSIZED_DRAIN_CAP"] = old_drain_cap
 
 
 async def _connect_inline(
@@ -174,7 +183,64 @@ async def case_overlimit_frame_drops_and_continues() -> None:
         assert result.text == "after-limit", result.text
         assert conn.guarded_reader.dropped_frames == 1
         assert conn.client.activity.dropped_frames == 1
-        assert conn.client.activity.snapshot()["dropped_frames"] == 1
+        snapshot = conn.client.activity.snapshot()
+        assert snapshot["dropped_frames"] == 1
+        record = snapshot["dropped_frame_records"][0]
+        assert record["byte_count"] > 4096, record
+        assert record["kind"] == "notification", record
+        assert len(record["head"].encode("utf-8")) <= 1024, record
+        assert "x" * 2048 not in record["head"], record
+    finally:
+        await conn.kill()
+
+
+async def case_overlimit_request_gets_safe_error_reply() -> None:
+    conn = await _connect("overlimit_request", limit="4k")
+    try:
+        result = await run_prompt(conn, "go", idle_timeout=5)
+        assert result.ok, result
+        assert result.text == "request-error:oversized frame dropped", result.text
+        record = conn.client.activity.snapshot()["dropped_frame_records"][0]
+        assert record["kind"] == "request", record
+        assert record["id"] == 4242, record
+        assert record["safe_reply_sent"] is True, record
+        assert record["byte_count"] > 4096, record
+        assert len(record["head"].encode("utf-8")) <= 1024, record
+    finally:
+        await conn.kill()
+
+
+async def case_overlimit_request_late_id_gets_safe_error_reply() -> None:
+    conn = await _connect("overlimit_request_late_id", limit="4k")
+    try:
+        result = await run_prompt(conn, "go", idle_timeout=5)
+        assert result.ok, result
+        assert result.text == "request-error:oversized frame dropped", result.text
+        record = conn.client.activity.snapshot()["dropped_frame_records"][0]
+        assert record["kind"] == "request", record
+        assert record["id"] == 5151, record
+        assert record["safe_reply_sent"] is True, record
+        assert record.get("id_unrecoverable") is not True, record
+        assert record["byte_count"] > 4096, record
+        assert len(record["head"].encode("utf-8")) <= 1024, record
+        assert "x" * 2048 not in record["head"], record
+    finally:
+        await conn.kill()
+
+
+async def case_overlimit_no_newline_hits_drain_cap() -> None:
+    conn = await _connect("overlimit_no_newline", limit="4k", drain_cap="8k")
+    try:
+        result = await run_prompt(conn, "go", idle_timeout=5)
+        assert not result.ok, result
+        assert result.error, result
+        record = conn.client.activity.snapshot()["dropped_frame_records"][0]
+        assert record["kind"] == "notification", record
+        assert record["drain_cap_exceeded"] is True, record
+        assert record["drain_cap"] == 8192, record
+        assert record["byte_count"] > 8192, record
+        assert len(record["head"].encode("utf-8")) <= 1024, record
+        assert conn.alive is False, record
     finally:
         await conn.kill()
 
@@ -1291,6 +1357,9 @@ def case_pool_ceiling_fallback(tmp: Path | None = None) -> None:
 async def amain() -> None:
     await case_echo_roundtrip()
     await case_overlimit_frame_drops_and_continues()
+    await case_overlimit_request_gets_safe_error_reply()
+    await case_overlimit_request_late_id_gets_safe_error_reply()
+    await case_overlimit_no_newline_hits_drain_cap()
     await case_overlimit_response_fails_cleanly()
     await case_runner_overlimit_response_status_counts_drop()
     await case_runner_blocks_probe_required_adapter()

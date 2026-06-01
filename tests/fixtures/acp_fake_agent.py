@@ -264,6 +264,72 @@ def handle_prompt(req_id: int, params: dict) -> None:
             if message.get("method") == "session/cancel":
                 return
             time.sleep(0.01)
+    if SCENARIO == "overlimit_request":
+        overlimit_request_id = 4242
+        big = {
+            "jsonrpc": "2.0",
+            "id": overlimit_request_id,
+            "method": "session/request_permission",
+            "params": {
+                "sessionId": session_id,
+                "toolCall": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "oversized-request",
+                    "title": "x" * 8192,
+                    "status": "pending",
+                },
+                "options": DEFAULT_PERMISSION_OPTIONS,
+            },
+        }
+        sys.stdout.write(json.dumps(big, separators=(",", ":")) + "\n")
+        sys.stdout.flush()
+        while True:
+            message = read_message()
+            if message is None:
+                return
+            if message.get("id") == overlimit_request_id:
+                error = message.get("error") or {}
+                text_update(session_id, f"request-error:{error.get('message')}")
+                response(req_id, {"sessionId": session_id, "stopReason": "end_turn"})
+                return
+            time.sleep(0.01)
+    if SCENARIO == "overlimit_request_late_id":
+        overlimit_request_id = 5151
+        big = {
+            "jsonrpc": "2.0",
+            "method": "session/request_permission",
+            "params": {
+                "sessionId": session_id,
+                "toolCall": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "oversized-request-late-id",
+                    "title": "x" * 8192,
+                    "status": "pending",
+                },
+                "options": DEFAULT_PERMISSION_OPTIONS,
+            },
+            "id": overlimit_request_id,
+        }
+        sys.stdout.write(json.dumps(big, separators=(",", ":")) + "\n")
+        sys.stdout.flush()
+        while True:
+            message = read_message()
+            if message is None:
+                return
+            if message.get("id") == overlimit_request_id:
+                error = message.get("error") or {}
+                text_update(session_id, f"request-error:{error.get('message')}")
+                response(req_id, {"sessionId": session_id, "stopReason": "end_turn"})
+                return
+            time.sleep(0.01)
+    if SCENARIO == "overlimit_no_newline":
+        sys.stdout.write(
+            '{"jsonrpc":"2.0","method":"session/update","params":{"payload":"'
+            + ("x" * 32768)
+        )
+        sys.stdout.flush()
+        while True:
+            time.sleep(1.0)
     if SCENARIO == "permission":
         selected = request_permission(session_id, "perm-1")
         text_update(session_id, f"permission:{selected}")

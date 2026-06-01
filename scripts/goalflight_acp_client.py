@@ -16,6 +16,7 @@ import logging
 import math
 import os
 from pathlib import Path
+import re
 import signal
 import subprocess
 import threading
@@ -33,6 +34,10 @@ log = logging.getLogger("goal-flight.acp_client")
 
 _VERSION = "0.4.5-sdk"
 DEFAULT_ACP_LIMIT = 32 * 1024 * 1024
+DEFAULT_OVERSIZED_DRAIN_CAP = 1024 * 1024
+OVERSIZED_DROP_HEAD_BYTES = 1024
+OVERSIZED_CLASSIFY_SCAN_BYTES = 64 * 1024
+MAX_DROPPED_FRAME_RECORDS = 20
 DEFAULT_PERMISSION_TIMEOUT_S = 30.0
 # Inline permission mode, phase 1: controller-responsiveness window. How long the
 # worker HOLDS its ACP permission open (awake-time) waiting for the controller to
@@ -126,6 +131,27 @@ def acp_limit_from_env() -> int:
     if limit <= 0:
         raise AcpError("GOALFLIGHT_ACP_LIMIT must be positive")
     return limit
+
+
+def acp_oversized_drain_cap_from_env(limit: int) -> int:
+    default = limit + DEFAULT_OVERSIZED_DRAIN_CAP
+    raw = os.environ.get("GOALFLIGHT_ACP_OVERSIZED_DRAIN_CAP")
+    if not raw:
+        return default
+    value = raw.strip().lower()
+    multiplier = 1
+    for suffix, scale in (("mb", 1024 * 1024), ("m", 1024 * 1024), ("kb", 1024), ("k", 1024)):
+        if value.endswith(suffix):
+            value = value[: -len(suffix)]
+            multiplier = scale
+            break
+    try:
+        cap = int(float(value) * multiplier)
+    except ValueError as e:
+        raise AcpError(f"invalid GOALFLIGHT_ACP_OVERSIZED_DRAIN_CAP={raw!r}") from e
+    if cap <= 0:
+        raise AcpError("GOALFLIGHT_ACP_OVERSIZED_DRAIN_CAP must be positive")
+    return max(limit, cap)
 
 
 def _ps_meta(pid: int) -> tuple[str, str] | None:
@@ -423,6 +449,7 @@ class AcpLivenessActivity:
     # deadline; a stuck hold is reaped only after that deadline plus grace.
     inline_held_permissions: dict[str, float] = field(default_factory=dict)
     dropped_frames: int = 0
+    dropped_frame_records: list[dict[str, Any]] = field(default_factory=list)
     turn_started_mono: float | None = None
     turn_completed_mono: float | None = None
     turn_stop_reason: str | None = None
@@ -477,8 +504,12 @@ class AcpLivenessActivity:
             if tool_id:
                 self.pending_permissions.setdefault(tool_id, now)
 
-    def note_dropped_frame(self) -> None:
+    def note_dropped_frame(self, record: dict[str, Any] | None = None) -> None:
         self.dropped_frames += 1
+        if record is not None:
+            self.dropped_frame_records.append(record)
+            if len(self.dropped_frame_records) > MAX_DROPPED_FRAME_RECORDS:
+                del self.dropped_frame_records[:-MAX_DROPPED_FRAME_RECORDS]
 
     def reset_progress_clock(self, now: float | None = None) -> None:
         self.last_progress_mono = active_monotonic() if now is None else now
@@ -575,6 +606,7 @@ class AcpLivenessActivity:
             "outstanding_count": self.outstanding_count(now),
             "inline_held": len(self.inline_held_permissions),
             "dropped_frames": self.dropped_frames,
+            "dropped_frame_records": list(self.dropped_frame_records),
             "turn_in_flight": self.turn_in_flight(),
             "turn_silent_for_s": self.turn_silent_for(now),
             "turn_stop_reason": self.turn_stop_reason,
@@ -586,6 +618,120 @@ class AcpLivenessActivity:
 def _looks_like_json_rpc_line(line: bytes) -> bool:
     stripped = line.lstrip()
     return bool(stripped) and stripped.startswith(b"{")
+
+
+_JSON_RPC_METHOD_RE = re.compile(rb'"method"\s*:')
+_JSON_RPC_RESPONSE_RE = re.compile(rb'"(?:result|error)"\s*:')
+_JSON_RPC_ID_RE = re.compile(rb'"id"\s*:\s*(?P<value>"(?:\\.|[^"\\])*"|-?(?:0|[1-9]\d*)|null)')
+_JSON_RPC_METHOD_VALUE_RE = re.compile(rb'"method"\s*:\s*(?P<value>"(?:\\.|[^"\\])*")')
+_ACP_NOTIFICATION_METHODS = {"session/update"}
+_ACP_REQUEST_METHODS = {"session/request_permission"}
+
+
+def _reader_buffer_head(reader: Any, max_bytes: int = OVERSIZED_DROP_HEAD_BYTES) -> bytes:
+    current = reader
+    seen: set[int] = set()
+    for _ in range(8):
+        if current is None or id(current) in seen:
+            break
+        seen.add(id(current))
+        buffer = getattr(current, "_buffer", None)
+        if buffer:
+            try:
+                return bytes(buffer[:max_bytes])
+            except TypeError:
+                pass
+        next_reader = None
+        for attr in ("_inner", "inner", "_reader", "reader"):
+            candidate = getattr(current, attr, None)
+            if candidate is not None and id(candidate) not in seen:
+                next_reader = candidate
+                break
+        if next_reader is None:
+            break
+        current = next_reader
+    return b""
+
+
+def _recover_json_rpc_id(head: bytes) -> tuple[bool, Any]:
+    match = _JSON_RPC_ID_RE.search(head)
+    if match is None:
+        return False, None
+    try:
+        return True, json.loads(match.group("value").decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False, None
+
+
+def _recover_json_rpc_method(head: bytes) -> str | None:
+    match = _JSON_RPC_METHOD_VALUE_RE.search(head)
+    if match is None:
+        return None
+    try:
+        value = json.loads(match.group("value").decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, str) else None
+
+
+def _classify_oversized_json_rpc_head(
+    head: bytes,
+    *,
+    scan_complete: bool = True,
+    scan_truncated: bool = False,
+) -> tuple[str, bool, Any, bool]:
+    stripped = head.lstrip()
+    if not stripped:
+        return "request", False, None, True
+    if not stripped.startswith(b"{"):
+        return "unknown", False, None, False
+    has_method = _JSON_RPC_METHOD_RE.search(head) is not None
+    has_response = _JSON_RPC_RESPONSE_RE.search(head) is not None
+    method = _recover_json_rpc_method(head)
+    has_id, request_id = _recover_json_rpc_id(head)
+    if has_method and has_id:
+        return "request", True, request_id, False
+    if has_method and method in _ACP_REQUEST_METHODS:
+        return "request", False, None, True
+    if has_method and method in _ACP_NOTIFICATION_METHODS:
+        return "notification", False, None, False
+    if has_method:
+        if scan_complete and not scan_truncated:
+            return "notification", False, None, False
+        return "request", False, None, True
+    if not has_response and (scan_truncated or not scan_complete):
+        return "request", False, None, True
+    return "unknown", False, None, False
+
+
+class _OversizedFrameScan:
+    def __init__(self, initial_head: bytes = b"") -> None:
+        self._surface = bytearray(initial_head[:OVERSIZED_DROP_HEAD_BYTES])
+        self._classify = bytearray()
+        self.truncated = False
+        self.complete = False
+
+    def feed(self, data: bytes) -> None:
+        if not data:
+            return
+        surface_remaining = OVERSIZED_DROP_HEAD_BYTES - len(self._surface)
+        if surface_remaining > 0:
+            self._surface.extend(data[:surface_remaining])
+        classify_remaining = OVERSIZED_CLASSIFY_SCAN_BYTES - len(self._classify)
+        if classify_remaining > 0:
+            self._classify.extend(data[:classify_remaining])
+        if len(data) > classify_remaining:
+            self.truncated = True
+
+    @property
+    def surface_head(self) -> bytes:
+        return bytes(self._surface)
+
+    @property
+    def classify_head(self) -> bytes:
+        if self._classify:
+            return bytes(self._classify)
+        return bytes(self._surface)
 
 
 class JsonRpcLineFilterReader(asyncio.StreamReader):
@@ -625,12 +771,18 @@ class GuardedStreamReader(asyncio.StreamReader):
         inner: asyncio.StreamReader,
         *,
         limit: int,
-        on_drop: Callable[[], Any] | None = None,
+        drain_cap: int | None = None,
+        on_drop: Callable[[dict[str, Any]], Any] | None = None,
+        response_writer: Any | None = None,
+        on_pathological_drop: Callable[[], Any] | None = None,
     ) -> None:
         super().__init__(limit=limit)
         self._inner = inner
         self._limit = limit
+        self._drain_cap = drain_cap if drain_cap is not None else limit + DEFAULT_OVERSIZED_DRAIN_CAP
         self._on_drop = on_drop
+        self._response_writer = response_writer
+        self._on_pathological_drop = on_pathological_drop
         self.dropped_frames = 0
 
     async def readuntil(self, separator: bytes = b"\n") -> bytes:
@@ -646,25 +798,121 @@ class GuardedStreamReader(asyncio.StreamReader):
         return await self._inner.read(n)
 
     async def _drop_oversized_frame(self, error: asyncio.LimitOverrunError, separator: bytes) -> None:
-        self.dropped_frames += 1
-        log.error("dropped over-limit ACP frame (%s)", error)
-        if self._on_drop is not None:
-            result = self._on_drop()
-            if inspect.isawaitable(result):
-                await result
-        consumed = max(1, int(getattr(error, "consumed", 0) or 0))
-        with contextlib.suppress(asyncio.IncompleteReadError):
-            await self._inner.readexactly(consumed)
-        while True:
+        initial_head = _reader_buffer_head(self._inner)
+        frame_scan = _OversizedFrameScan(initial_head)
+        total_drained = 0
+        safe_reply_sent = False
+        drain_cap_exceeded = False
+        drop_recorded = False
+        drop_record: dict[str, Any] | None = None
+
+        async def drain_exactly_bounded(count: int) -> int:
+            remaining = self._drain_cap - total_drained
+            read_count = min(max(1, count), max(1, remaining + 1))
             try:
-                await self._inner.readuntil(separator)
+                data = await self._inner.readexactly(read_count)
+            except asyncio.IncompleteReadError as e:
+                data = e.partial
+            frame_scan.feed(data)
+            return len(data)
+
+        async def record_drop() -> None:
+            nonlocal drop_recorded, drop_record, safe_reply_sent
+            if drop_recorded:
                 return
-            except asyncio.LimitOverrunError as e:
-                consumed = max(1, int(getattr(e, "consumed", 0) or 0))
-                with contextlib.suppress(asyncio.IncompleteReadError):
-                    await self._inner.readexactly(consumed)
-            except asyncio.IncompleteReadError:
+            kind, has_request_id, request_id, id_unrecoverable = _classify_oversized_json_rpc_head(
+                frame_scan.classify_head,
+                scan_complete=frame_scan.complete,
+                scan_truncated=frame_scan.truncated,
+            )
+            if kind == "request":
+                safe_reply_sent = await self._send_oversized_request_error(request_id)
+            record = {
+                "byte_count": total_drained,
+                "kind": kind,
+                "head": frame_scan.surface_head[:OVERSIZED_DROP_HEAD_BYTES].decode("utf-8", errors="replace"),
+            }
+            if drain_cap_exceeded:
+                record["drain_cap_exceeded"] = True
+                record["drain_cap"] = self._drain_cap
+            if kind == "request":
+                if has_request_id:
+                    record["id"] = request_id
+                if id_unrecoverable:
+                    record["id_unrecoverable"] = True
+                record["safe_reply_sent"] = safe_reply_sent
+            self.dropped_frames += 1
+            drop_recorded = True
+            drop_record = record
+            log.error("dropped over-limit ACP frame (%s): %s", error, record)
+            if self._on_drop is not None:
+                result = self._on_drop(record)
+                if inspect.isawaitable(result):
+                    await result
+
+        async def note_pathological_once() -> None:
+            nonlocal drain_cap_exceeded
+            if drain_cap_exceeded:
                 return
+            drain_cap_exceeded = True
+            await record_drop()
+            if self._on_pathological_drop is not None:
+                result = self._on_pathological_drop()
+                if inspect.isawaitable(result):
+                    await result
+
+        try:
+            consumed = max(1, int(getattr(error, "consumed", 0) or 0))
+            total_drained += await drain_exactly_bounded(consumed)
+            if total_drained > self._drain_cap:
+                await note_pathological_once()
+            while True:
+                await asyncio.sleep(0)
+                if drain_cap_exceeded:
+                    chunk = await self._inner.read(65536)
+                    if not chunk:
+                        break
+                    total_drained += len(chunk)
+                    continue
+                try:
+                    tail = await self._inner.readuntil(separator)
+                    frame_scan.feed(tail)
+                    frame_scan.complete = True
+                    total_drained += len(tail)
+                    if total_drained > self._drain_cap:
+                        await note_pathological_once()
+                        continue
+                    break
+                except asyncio.LimitOverrunError as e:
+                    consumed = max(1, int(getattr(e, "consumed", 0) or 0))
+                    total_drained += await drain_exactly_bounded(consumed)
+                    if total_drained > self._drain_cap:
+                        await note_pathological_once()
+                except asyncio.IncompleteReadError as e:
+                    frame_scan.feed(e.partial)
+                    frame_scan.complete = True
+                    total_drained += len(e.partial)
+                    break
+        finally:
+            await record_drop()
+            if drop_record is not None:
+                drop_record["byte_count"] = total_drained
+
+    async def _send_oversized_request_error(self, request_id: Any) -> bool:
+        writer = self._response_writer
+        if writer is None or getattr(writer, "is_closing", lambda: True)():
+            return False
+        response = {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {"code": -32600, "message": "oversized frame dropped"},
+        }
+        try:
+            writer.write(json.dumps(response, separators=(",", ":")).encode("utf-8") + b"\n")
+            return True
+        except Exception:
+            log.exception("failed to send oversized ACP request error response")
+            return False
 
 
 def _tc_get(obj: Any, *names: str) -> Any:
@@ -1530,7 +1778,31 @@ async def spawn_acp_connection(
     stdout_reader: asyncio.StreamReader = proc.stdout
     if os.path.basename(str(sandboxed.command)) == "opencode":
         stdout_reader = JsonRpcLineFilterReader(proc.stdout)
-    guarded_reader = GuardedStreamReader(stdout_reader, limit=limit, on_drop=activity.note_dropped_frame)
+
+    async def kill_pathological_oversized_frame() -> None:
+        if proc.returncode is not None:
+            return
+        hard_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
+        killed = goalflight_compat.kill_pid(
+            proc.pid,
+            hard_signal,
+            pgid=verified_pgid,
+            process_group=True,
+        )
+        if not killed:
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                proc.kill()
+        with contextlib.suppress(Exception):
+            await proc.wait()
+
+    guarded_reader = GuardedStreamReader(
+        stdout_reader,
+        limit=limit,
+        drain_cap=acp_oversized_drain_cap_from_env(limit),
+        on_drop=activity.note_dropped_frame,
+        response_writer=proc.stdin,
+        on_pathological_drop=kill_pathological_oversized_frame,
+    )
     conn = connect_to_agent(
         client,
         proc.stdin,

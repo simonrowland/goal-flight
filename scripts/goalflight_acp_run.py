@@ -875,6 +875,7 @@ async def _run_acp_dispatch_impl(
         "pgroup_cpu_pct": None,
         "events_seen": 0,
         "acp_dropped_frames": 0,
+        "acp_dropped_frame_records": [],
         "last_event_at": None,
         "last_event_kind": None,
         "heartbeat_at": None,
@@ -903,6 +904,10 @@ async def _run_acp_dispatch_impl(
     async def update_status(**updates: object) -> None:
         async with status_lock:
             payload.update(updates)
+            with contextlib.suppress(NameError):
+                snapshot = activity.snapshot(active_monotonic())
+                payload["acp_dropped_frames"] = int(snapshot.get("dropped_frames", 0))
+                payload["acp_dropped_frame_records"] = list(snapshot.get("dropped_frame_records", []))
             payload["updated_at"] = _now()
             write_status(status_path, payload)
 
@@ -2057,6 +2062,7 @@ async def _run_acp_dispatch_impl(
                 wedge_progress_seen=int(snapshot["wedge_progress_seen"]),
                 outstanding_tool_calls=int(snapshot["outstanding_count"]),
                 acp_dropped_frames=int(snapshot.get("dropped_frames", 0)),
+                acp_dropped_frame_records=list(snapshot.get("dropped_frame_records", [])),
                 progress_quiet_for_s=round(float(snapshot["progress_quiet_for_s"]), 3),
                 progress_stall_s=progress_stall_s,
                 turn_in_flight=bool(snapshot.get("turn_in_flight")),

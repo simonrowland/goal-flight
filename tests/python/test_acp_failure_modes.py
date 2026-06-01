@@ -26,8 +26,10 @@ from goalflight_acp_client import (  # noqa: E402
     AcpError,
     AcpLivenessActivity,
     AcpProcessPool,
+    MAX_DROPPED_FRAME_RECORDS,
     JsonRpcLineFilterReader,
     PoolExhaustedError,
+    _classify_oversized_json_rpc_head,
 )
 from goalflight_acp_run import adapter_liveness_config, agent_command, decide_terminal_state, spawn_and_handshake_with_retry  # noqa: E402
 from acp_runner import has_actionable_marker_values  # noqa: E402
@@ -83,6 +85,31 @@ def case_vendor_flood_idle_waits_for_quiet_backstop() -> None:
         previous_progress = activity.wedge_progress_seen
     assert decision.dead_samples == 3
     assert decision.wedged is False
+
+
+def case_dropped_frame_records_are_bounded() -> None:
+    activity = AcpLivenessActivity()
+    for i in range(MAX_DROPPED_FRAME_RECORDS + 5):
+        activity.note_dropped_frame({"seq": i, "head": "x" * 1024})
+    snapshot = activity.snapshot()
+    records = snapshot["dropped_frame_records"]
+    assert snapshot["dropped_frames"] == MAX_DROPPED_FRAME_RECORDS + 5
+    assert len(records) == MAX_DROPPED_FRAME_RECORDS, records
+    assert records[0]["seq"] == 5, records
+    assert records[-1]["seq"] == MAX_DROPPED_FRAME_RECORDS + 4, records
+    assert all(len(record["head"].encode("utf-8")) <= 1024 for record in records)
+
+
+def case_empty_oversized_head_assumes_request_for_reply() -> None:
+    kind, has_request_id, request_id, id_unrecoverable = _classify_oversized_json_rpc_head(
+        b"",
+        scan_complete=False,
+        scan_truncated=False,
+    )
+    assert kind == "request"
+    assert has_request_id is False
+    assert request_id is None
+    assert id_unrecoverable is True
 
 
 def case_vendor_flood_cpu_busy_is_alive() -> None:
@@ -814,7 +841,88 @@ def case_runner_oversized_frame_dropped_then_completes() -> None:
     assert status["state"] == "complete", status
     assert status["ok"] is True, status
     assert status["acp_dropped_frames"] >= 1, status
+    record = status["acp_dropped_frame_records"][0]
+    assert record["byte_count"] > 4096, status
+    assert record["kind"] == "notification", status
+    assert len(record["head"].encode("utf-8")) <= 1024, status
     assert "after-limit" in (status.get("text_excerpt") or ""), status
+    assert status["worker_alive"] is False, status
+    assert not _pid_alive(status.get("worker_pid")), (status, stderr)
+
+
+@skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")
+def case_runner_oversized_request_gets_safe_reply() -> None:
+    returncode, status, stdout, stderr = _run_fake_runner(
+        "overlimit_request",
+        progress_stall_s=30.0,
+        heartbeat_interval=30.0,
+        extra_env={"GOALFLIGHT_ACP_LIMIT": "4096"},
+    )
+
+    assert returncode == 0, (stdout, stderr)
+    assert status["state"] == "complete", status
+    assert status["ok"] is True, status
+    assert status["acp_dropped_frames"] >= 1, status
+    record = status["acp_dropped_frame_records"][0]
+    assert record["kind"] == "request", status
+    assert record["id"] == 4242, status
+    assert record["safe_reply_sent"] is True, status
+    assert record["byte_count"] > 4096, status
+    assert len(record["head"].encode("utf-8")) <= 1024, status
+    assert "request-error:oversized frame dropped" in (status.get("text_excerpt") or ""), status
+    assert status["worker_alive"] is False, status
+    assert not _pid_alive(status.get("worker_pid")), (status, stderr)
+
+
+@skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")
+def case_runner_oversized_request_late_id_gets_safe_reply() -> None:
+    returncode, status, stdout, stderr = _run_fake_runner(
+        "overlimit_request_late_id",
+        progress_stall_s=30.0,
+        heartbeat_interval=30.0,
+        extra_env={"GOALFLIGHT_ACP_LIMIT": "4096"},
+    )
+
+    assert returncode == 0, (stdout, stderr)
+    assert status["state"] == "complete", status
+    assert status["ok"] is True, status
+    assert status["acp_dropped_frames"] >= 1, status
+    record = status["acp_dropped_frame_records"][0]
+    assert record["kind"] == "request", status
+    assert record["id"] == 5151, status
+    assert record["safe_reply_sent"] is True, status
+    assert record.get("id_unrecoverable") is not True, status
+    assert record["byte_count"] > 4096, status
+    assert len(record["head"].encode("utf-8")) <= 1024, status
+    assert "request-error:oversized frame dropped" in (status.get("text_excerpt") or ""), status
+    assert status["worker_alive"] is False, status
+    assert not _pid_alive(status.get("worker_pid")), (status, stderr)
+
+
+@skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")
+def case_runner_oversized_no_newline_kills_worker() -> None:
+    returncode, status, stdout, stderr = _run_fake_runner(
+        "overlimit_no_newline",
+        progress_stall_s=30.0,
+        heartbeat_interval=30.0,
+        idle_timeout=5.0,
+        timeout_s=20.0,
+        extra_env={
+            "GOALFLIGHT_ACP_LIMIT": "4096",
+            "GOALFLIGHT_ACP_OVERSIZED_DRAIN_CAP": "8192",
+        },
+    )
+
+    assert returncode != 0, stdout
+    assert status["state"] == "failed", status
+    assert status["error"], status
+    assert status["acp_dropped_frames"] >= 1, status
+    record = status["acp_dropped_frame_records"][0]
+    assert record["kind"] == "notification", status
+    assert record["drain_cap_exceeded"] is True, status
+    assert record["drain_cap"] == 8192, status
+    assert record["byte_count"] > 8192, status
+    assert len(record["head"].encode("utf-8")) <= 1024, status
     assert status["worker_alive"] is False, status
     assert not _pid_alive(status.get("worker_pid")), (status, stderr)
 
@@ -973,6 +1081,8 @@ def case_pool_exhaustion_then_drain() -> None:
 
 def main() -> None:
     case_vendor_flood_idle_waits_for_quiet_backstop()
+    case_dropped_frame_records_are_bounded()
+    case_empty_oversized_head_assumes_request_for_reply()
     case_vendor_flood_cpu_busy_is_alive()
     case_standard_progress_resets_wedge_streak()
     case_permission_timeout_unblocks_wedge()
@@ -993,6 +1103,9 @@ def main() -> None:
     case_runner_user_need_none_completes()
     case_runner_idle_silent_idle_timeout_reaps()
     case_runner_oversized_frame_dropped_then_completes()
+    case_runner_oversized_request_gets_safe_reply()
+    case_runner_oversized_request_late_id_gets_safe_reply()
+    case_runner_oversized_no_newline_kills_worker()
     case_runner_goal_mode_progress_stall_backstop()
     case_runner_goal_mode_heartbeat_backstop()
     case_runner_tool_timeout_reaps()
