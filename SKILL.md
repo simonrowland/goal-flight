@@ -287,7 +287,7 @@ Do not task-pivot or inline-edit on receipt. Plan before editing when scope is u
 
 ### In-flight steer mailbox
 
-Steer live bash worker via `scripts/goalflight_dispatch.py steer <id> '<msg>'`; `--list` shows mailbox/acks; worker polls each iteration + before git; ACP inline pending #8.
+Steer a live worker via `scripts/goalflight_dispatch.py steer <id> '<msg>'`; `--list` shows mailbox/acks. Bash polls each iteration + before git; ACP delivers at the next turn boundary (mid-turn blocked by the prompt lock). `--interactive` = `--shape acp --permission-mode inline` (relays gated permissions, not auto-decline). Auto-mode write-safety is per-agent: codex-acp gates writes; cursor/grok do NOT (warning fires; pair `--os-sandbox`, macOS-only) — see `docs/acp-push-gate-matrix.md`.
 
 ## User progress reporting
 
