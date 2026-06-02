@@ -3,11 +3,11 @@
 
 Prevents the parallel-dispatch commit collision: when one or more
 goal-flight workers have active leases against the current project_root,
-and the controller runs bare `git commit` (no pathspecs), the commit
+and the orchestrator runs bare `git commit` (no pathspecs), the commit
 silently bundles any staged WIP from other workers into a commit owned
-by the controller (or by whichever worker fires `git commit` first).
+by the orchestrator (or by whichever worker fires `git commit` first).
 Concrete failure observed 2026-05-27 in commit fb05e84 where the
-controller's `git commit` bundled chunks 6/7 partial WIP.
+orchestrator's `git commit` bundled chunks 6/7 partial WIP.
 
 This guard is invoked as a git pre-commit hook (install via
 `scripts/install-commit-guard.sh` or symlink directly into

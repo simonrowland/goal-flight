@@ -3,7 +3,7 @@
 ## Direction
 
 goal-flight is a portable skill core plus host wrappers. The core is a small
-controller pattern plus procedural runtime helpers. The controller keeps
+orchestrator pattern plus procedural runtime helpers. The orchestrator keeps
 judgment and product context. Scripts own deterministic facts: tool readiness,
 process state, capacity, logs, status, and review job files. Adapter manifests
 own host bindings: tool names, invocation, permissions, packaging, memory
@@ -72,7 +72,7 @@ Every long worker/review has:
 - dispatch id
 - prompt id/path/hash
 - agent and transport
-- controller PID identity
+- orchestrator PID identity
 - worker PID identity
 - optional ACP/logical session id
 - status/stdout/stderr paths
@@ -107,6 +107,6 @@ facts say what is supported, ready, and safe to run.
 ## Fleet (1.0)
 
 Multi-node dispatch over SSH lives in `goalflight_fleet*.py` with a file-backed
-fleet store (default `~/.goal-flight/fleet`). The controller previews remote
+fleet store (default `~/.goal-flight/fleet`). The orchestrator previews remote
 `acp_run` plans, executes with `GOALFLIGHT_LIVE_SSH=1`, mirrors remote status,
 and reconciles billing locks. Operator guide: [fleet.md](fleet.md).

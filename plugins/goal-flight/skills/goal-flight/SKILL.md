@@ -46,7 +46,7 @@ before mutation. Apply requires explicit approval and writes a machine-local
 backup manifest for rollback.
 
 For Codex, setup registers the desktop-facing plugin and checks the CLI worker
-surface. Codex Desktop is the likely controller; `codex exec` remains the worker
+surface. Codex Desktop is the likely orchestrator; `codex exec` remains the worker
 path. Setup also registers the context-mode MCP server when needed. For Cursor,
 setup installs global agent instructions, a personal skill, rules, and Cursor
 MCP config for context-mode. Use `--cursor-project <project>` for per-project

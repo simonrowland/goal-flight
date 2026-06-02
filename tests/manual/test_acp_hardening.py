@@ -43,7 +43,7 @@ AUTO_PROMPT = (
     "Do not use tools or ask for permission."
 )
 
-# Agent-side ACP failures tracked separately from controller regressions.
+# Agent-side ACP failures tracked separately from orchestrator regressions.
 KNOWN_LIVE_AGENT_ISSUES = {
     "claude": "ACP initialize/session failure on trivial prompts (vendor -32603)",
 }

@@ -31,13 +31,13 @@ python3 <skill-root>/scripts/goalflight_messages.py relay || true
 `goalflight_messages.py relay` exits **2** when open `user_need` / `user_confirm`
 rows exist in the fleet register aggregate (built from
 `~/.goal-flight/messages/*.jsonl` and `~/.goal-flight/fleet/register/dispatches/`).
-Print the line to the controller host and **stop** — do not auto-answer. After the
+Print the line to the orchestrator host and **stop** — do not auto-answer. After the
 user responds, append steering or continue dispatch per `protocols/worker-markers.md`.
 
 `goalflight_rate_pressure.py` reads the dispatch ledger and reports
 provider-level rate-limit pressure. Be **silent on clean** — if
 `providers_under_pressure` is empty, do not emit a marker or "nothing
-to report" line. The controller has the routing table; default is fine.
+to report" line. The orchestrator has the routing table; default is fine.
 
 If `providers_under_pressure` is non-empty:
 - Emit a single `STATUS: rate-pressure provider=<p> count=<n>` line.
@@ -55,14 +55,14 @@ flat N threshold. Empirically:
 - Grok / cursor (vendor subs) similar — sub-billed providers tolerate
   goal-flight-shaped parallelism comfortably.
 - Claude Agent subagents (anthropic-session) start bouncing around
-  N=10 in practice — they share the controller's session budget.
+  N=10 in practice — they share the orchestrator's session budget.
 
 So: re-probe between dispatches when **3+ in-flight workers map to
 the same anthropic-* provider** (especially anthropic-session). For
 codex / grok / cursor-only parallel workloads (the routing-table
 default), the pre-flight check alone is sufficient — no polling.
 
-Read-only probe; the controller decides whether to act. See SKILL.md
+Read-only probe; the orchestrator decides whether to act. See SKILL.md
 "Worker Routing" for the per-task fallback table.
 
 2. Pick the next non-DONE queue item.
@@ -122,11 +122,11 @@ dispatch prompt MUST instruct the subagent to write findings to a file under
 `docs-private/research/<date>-<slug>/` and return ONLY a one-paragraph TL;DR +
 the file path + severity-tagged finding count. Do not consume the subagent's
 full investigation report in conversation — that defeats the dispatch and
-silently doubles the context cost (worker read + controller read of same
+silently doubles the context cost (worker read + orchestrator read of same
 content).
 
 **Return contract by worker class.** Dispatch prompts must specify which
-shape the worker should emit so the controller can parse the headline
+shape the worker should emit so the orchestrator can parse the headline
 without reading the body.
 
 *Investigator (read-only — reviewer, auditor, plan-validator):*
@@ -161,17 +161,17 @@ BLOCKED: <intended-step> blocked due to <reason>
 
 TL;DR: <≤3 lines — what was drafted, what blocked>
 
-Recommended controller action: <one line>
+Recommended orchestrator action: <one line>
 ```
 
 Workers DO NOT execute workarounds (alternate APIs, git plumbing, inline
 content dumps when file-write was blocked) — they return BLOCKED and the
-controller decides. Push is NEVER worker-authorized; commit-and-push is a
+orchestrator decides. Push is NEVER worker-authorized; commit-and-push is a
 two-step gate where the worker commits locally (if its envelope permits)
-and the controller pushes (only with explicit user permission per the
+and the orchestrator pushes (only with explicit user permission per the
 push-discipline invariant).
 
-The controller reads TL;DR + headline (READY path / COMMIT sha / BLOCKED
+The orchestrator reads TL;DR + headline (READY path / COMMIT sha / BLOCKED
 reason) on first pass. Open DETAILED only when TL;DR raises a flag,
 defer to the chunk-review pass in step 8, or when failure analysis is
 needed.
@@ -194,7 +194,7 @@ Read `protocols/chunk-review.md`.
   `docs-private/commit-msgs/<chunk-slug>.txt` first and use
   `git commit -F docs-private/commit-msgs/<chunk-slug>.txt -- <files>`. Inline
   `git commit -m "$(cat <<'EOF' ... EOF)"` heredocs put the full prose into
-  the controller's conversation context for the rest of the session; the
+  the orchestrator's conversation context for the rest of the session; the
   file-backed version is read once by git and never re-enters context.
   Never bare `git commit` while other workers may have staged WIP — the
   commit guard (`scripts/goalflight_commit_guard.py`) refuses to prevent

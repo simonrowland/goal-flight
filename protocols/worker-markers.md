@@ -20,7 +20,7 @@ Rules:
 
 - Terminal markers: `RESULT`, `COMPLETE`, `USER-NEED`, `USER-CONFIRM`, `BLOCKED`.
 - `RESULT` and `COMPLETE` mean done unless the status JSON shows a process error.
-- `USER-NEED`, `USER-CONFIRM`, and `BLOCKED` stop the dispatch loop and surface to the controller.
+- `USER-NEED`, `USER-CONFIRM`, and `BLOCKED` stop the dispatch loop and surface to the orchestrator.
 - `PERMISSION-OK-PROCEEDED` is non-terminal; it modifies how the
   runner interprets `COMPLETE` in the presence of auto-declined
   permissions. Multiple emissions accumulate in the marker list.

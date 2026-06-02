@@ -1,5 +1,5 @@
 You are reviewing a proposed decomposition of a plan into `/goal` chunks.
-The controller wants to know if this decomposition is ready for a long
+The orchestrator wants to know if this decomposition is ready for a long
 unattended execution run.
 
 CONTEXT
@@ -49,7 +49,7 @@ Specifically:
    anticipatory questions logged?
 
 8. **Verifiability** — for each chunk's ACCEPTANCE: is there a way the
-   controller can mechanically verify pass/fail without running the
+   orchestrator can mechanically verify pass/fail without running the
    user's brain? (Test command, grep, file existence, etc.)
 
 OUTPUT
@@ -79,7 +79,7 @@ OUTPUT
 high / medium / low — note where you'd want a second opinion.
 ```
 
-If the decomposition is solid, say so explicitly. The controller will
+If the decomposition is solid, say so explicitly. The orchestrator will
 proceed with execute on a clean review.
 
 Tone: terse, technical. No emoji. No filler.

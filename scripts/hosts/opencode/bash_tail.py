@@ -12,7 +12,7 @@ Usage (background from execute.md bash-tail branch):
     --tail /tmp/opencode-<slug>.txt \\
     --prompt-file /tmp/prompt-<slug>.md
 
-The controller backgrounds this process and attaches ``watch-dispatch-tail.sh``
+The orchestrator backgrounds this process and attaches ``watch-dispatch-tail.sh``
 with ``--agent opencode-bash-tail``.
 """
 

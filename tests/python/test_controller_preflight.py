@@ -1,4 +1,4 @@
-"""Controller preflight matrix smoke tests."""
+"""Orchestrator preflight matrix smoke tests."""
 
 from __future__ import annotations
 

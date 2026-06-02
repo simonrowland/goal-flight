@@ -51,7 +51,7 @@ before they bite mid-execute.
      Heuristic check: SCOPE word count < 60 AND CHECKLIST item count ≤ 3.
      Warn if violated (probably mis-tagged).
    - `[acp]` and `[bash-tail]` are mutually exclusive — co-occurrence on the
-     same chunk → P1 conflict warn (controller would otherwise have to pick
+     same chunk → P1 conflict warn (orchestrator would otherwise have to pick
      arbitrarily). `[acp]` should only appear when `docs-private/env-caveats.md`
      shows the target adapter installed (otherwise the dispatch will fall
      through to `[bash-tail]` at runtime; warn if env-caveats is missing OR

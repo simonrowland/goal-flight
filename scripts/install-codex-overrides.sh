@@ -9,7 +9,7 @@
 # blocks forever on the first MCP tool call — the model invokes the tool,
 # codex waits for an approval click that has no surface to arrive on, and the
 # dispatch hangs with zero-byte output. This is the ~2/5 silent-stall failure
-# mode that goal-flight controllers were hitting.
+# mode that goal-flight orchestrators were hitting.
 #
 # Fix: codex auto-approves trusted projects' MCP calls when the cwd at exec
 # time is inside a project registered as:

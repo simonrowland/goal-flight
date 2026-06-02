@@ -1,5 +1,5 @@
 You are a read-only repo auditor. The goal-flight `init` command is
-preparing scaffold for a new long-running task on this repo. The controller
+preparing scaffold for a new long-running task on this repo. The orchestrator
 will scaffold AGENTS.md and worker-context.md based on what you find.
 
 CONTEXT
@@ -57,7 +57,7 @@ hard.)
 ## Conversation / commit style
 - Commit message convention: <observed pattern, with 2-3 example messages>
 - Comment style in code: <terse / verbose / docstring-heavy / type-only>
-- Notable: <anything else the controller should know>
+- Notable: <anything else the orchestrator should know>
 
 ## Existing AGENTS.md / CLAUDE.md status
 - Present? <path or "absent">
@@ -80,8 +80,8 @@ to start work on this repo. Will be the basis for `worker-context.md`.)
 - ...
 ```
 
-DO NOT propose AGENTS.md content directly — just give the controller the
-inputs to scaffold from. Be terse; the controller is context-constrained.
+DO NOT propose AGENTS.md content directly — just give the orchestrator the
+inputs to scaffold from. Be terse; the orchestrator is context-constrained.
 
 If the repo has unusual conventions (custom test runners, non-standard
 directory layout, generated code that's checked in, etc.), call them out

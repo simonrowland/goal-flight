@@ -71,7 +71,7 @@ documents the canonical `/goal` mode invocation including the
   block forever on `codex exec` without `approval_policy=never`;
   `workspace-write` grants in-workspace edit authority. Do NOT use
   `--dangerously-bypass-approvals-and-sandbox`: it drops the sandbox
-  entirely and is rejected by some controllers' auto-mode safety
+  entirely and is rejected by some orchestrators' auto-mode safety
   classifiers. See the safety story below.
 
 ### grok (headless one-shot)
@@ -104,8 +104,8 @@ use `--add-dir <path>` (each path becomes accessible to the session).
 
 **Billing**: `claude -p` produces **API billing**, not session billing.
 Prefer the native subagent path for sub-billed dispatches — native subagents
-share the controller's session budget but make their own LLM calls, so they
-also share the controller's rate-limit budget. Reserve `claude -p` for cases
+share the orchestrator's session budget but make their own LLM calls, so they
+also share the orchestrator's rate-limit budget. Reserve `claude -p` for cases
 where you need a clearly delimited headless run outside the parent
 session's context window AND you are willing to pay API rates.
 
@@ -158,7 +158,7 @@ Exit codes:
 | 0 | terminal marker (`COMPLETE` / `BLOCKED` / `USER-NEED` / `USER-CONFIRM`) |
 | 1 | worker PID died without a terminal marker |
 | 2 | tail file idle past `--max-idle-secs` (default 180s) — worker likely wedged |
-| 3 | controller PID died — watcher self-detected orphan |
+| 3 | orchestrator PID died — watcher self-detected orphan |
 
 The watcher registers a pidfile under `/tmp/goal-flight-acp-pids.d/` so
 `cleanup_ghosts()` (defined in `scripts/acp_client.py`; grep for the
@@ -170,9 +170,9 @@ across ACP and bash-tail paths. Filename pattern:
 
 It is tempting to run the `codex exec ... &` spawn or a `tail -f <tail>`
 inside `ctx_execute` / `ctx_batch_execute` to keep output out of the
-controller's context. **Don't.** context-mode is a *bounded-command*
+orchestrator's context. **Don't.** context-mode is a *bounded-command*
 tool — its timeout (default ~120s) exists to hand control back to the
-controller when a command hangs. A worker spawn is intentionally
+orchestrator when a command hangs. A worker spawn is intentionally
 long-running (minutes–hours); a `tail -f` is intentionally infinite.
 Both trip the timeout and get killed mid-run — the worker orphaned, the
 tail truncated. The timeout is not a misconfiguration to lengthen; it is
@@ -195,15 +195,15 @@ Correct split:
 The bypass / accept-edits flags grant the worker process full local
 authority for the lifetime of the dispatch. Two operating modes apply:
 
-- **Sequential mode** (no `--parallel`): the worker runs in the controller's
+- **Sequential mode** (no `--parallel`): the worker runs in the orchestrator's
   repository root. Trust boundary is the user's machine. The bypass flag is
-  acceptable because the controller is already operating with full local
+  acceptable because the orchestrator is already operating with full local
   authority on the user's behalf.
 - **Parallel mode** (`execute --parallel <N>`): each worker runs in its own
   git worktree at a path inside `.claude/worktrees/`. Pass `-C "<workdir>"`
   (codex) / `--cwd "<workdir>"` (grok) explicitly, or wrap in
   `(cd "<workdir>" && ...)` (claude — no `--cwd` flag). Without one of
-  these, the worker inherits the controller's cwd and can edit files
+  these, the worker inherits the orchestrator's cwd and can edit files
   outside its worktree, defeating the worktree-as-sandbox boundary.
 
 In both modes the bypass flag is **not** a security boundary. A
@@ -218,7 +218,7 @@ bypass/acceptEdits flag.
 
 ## Why this is legacy
 
-ACP gives the controller:
+ACP gives the orchestrator:
 
 - discrete `tool_call` and `tool_call_update` events with `locations` arrays
   (used by `_scan_out_of_scope_paths` for scope-leak audit),

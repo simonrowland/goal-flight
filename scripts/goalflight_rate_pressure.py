@@ -3,8 +3,8 @@
 
 Reads the dispatch ledger and recent worker status files, classifies failures
 into rate-limit pressure per provider, and emits a JSON recommendation the
-controller reads before its next dispatch decision. Read-only in v1 — the
-controller decides whether to act; this script never mutates capacity state.
+orchestrator reads before its next dispatch decision. Read-only in v1 — the
+orchestrator decides whether to act; this script never mutates capacity state.
 
 Provider model
 --------------
@@ -12,7 +12,7 @@ Per-label caps in `goalflight_capacity.DEFAULT_AGENT_CAPS` are PROCESS-COUNT
 caps (RAM-aware). Rate limits, on the other hand, are vendor/provider-level.
 This script groups workers by the provider whose budget they consume:
 
-  anthropic-session    claude (Agent-tool subagent — shares controller budget)
+  anthropic-session    claude (Agent-tool subagent — shares orchestrator budget)
   anthropic-cli-acp    claude-code-cli-acp (separate Claude Code session)
   anthropic-api        claude (claude -p headless — API billing)
   openai               codex, codex-acp (same OpenAI subscription / API)
@@ -47,7 +47,7 @@ For each provider under pressure:
   - re-route task categories the SKILL.md routing table defaults onto that
     provider toward the documented fallback
 
-The controller reads this JSON, surfaces a STATUS marker to the user, and
+The orchestrator reads this JSON, surfaces a STATUS marker to the user, and
 optionally re-routes its next dispatch. Mutation of capacity state is
 explicitly out of scope for v1 — keep the policy human-supervisable.
 """
@@ -74,7 +74,7 @@ SCHEMA = "goalflight.rate-pressure.v1"
 # as their ACP / Agent equivalents — same vendor budget, different dispatch
 # shape. `claude-bash-tail` specifically goes to anthropic-api (NOT
 # anthropic-session) because the bash-tail path uses `claude -p` which is
-# API-billed, separate from the controller's session budget.
+# API-billed, separate from the orchestrator's session budget.
 AGENT_TO_PROVIDER: dict[str, str] = {
     "claude": "anthropic-session",
     "claude-bash-tail": "anthropic-api",
@@ -92,10 +92,10 @@ AGENT_TO_PROVIDER: dict[str, str] = {
 }
 
 # Default task-category fallback when a provider is under pressure. The
-# controller can override per-chunk; this is a sensible default that mirrors
+# orchestrator can override per-chunk; this is a sensible default that mirrors
 # the routing table in SKILL.md.
 PROVIDER_FALLBACK: dict[str, list[str]] = {
-    # When the controller's own Claude budget is under pressure, push
+    # When the orchestrator's own Claude budget is under pressure, push
     # everything we can to codex/grok/cursor.
     "anthropic-session": ["codex", "cursor", "grok"],
     # claude-code-cli-acp wraps a separate session — same vendor failover

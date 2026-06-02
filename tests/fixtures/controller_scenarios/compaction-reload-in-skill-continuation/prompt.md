@@ -13,7 +13,7 @@ Active handoff artifacts in this scenario:
 
 Per `AGENTS.md` Active run + compaction, resume Goal Flight only because an
 active handoff exists. Read `AGENTS.md`, reload `SKILL.md` fresh from disk, then
-read `commands/resume.md` before deciding the next controller action.
+read `commands/resume.md` before deciding the next orchestrator action.
 
 The harness injected a rotating sentinel into the back half of `SKILL.md`, under
 Worker Routing. Discover it from `SKILL.md`; it is not present in this prompt.

@@ -1,4 +1,4 @@
-You are running a Goal Flight controller behavior smoke test in repository:
+You are running a Goal Flight orchestrator behavior smoke test in repository:
 
 {{PROJECT_ROOT}}
 

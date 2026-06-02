@@ -11,7 +11,7 @@ Focus:
 - <focus item 3>
 
 Review the diff and relevant untracked files. Rebuild evidence from the repo,
-not from the controller summary. Report findings first, ordered by severity,
+not from the orchestrator summary. Report findings first, ordered by severity,
 with exact file:line references.
 
 Suggested shape:

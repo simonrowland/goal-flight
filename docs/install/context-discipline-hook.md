@@ -41,4 +41,4 @@ queued as a Wave-A follow-up.
 
 See also `docs/install/session-start-watchdog-hook.md` for the Claude Code
 SessionStart hook that re-arms the in-session Goal Flight watchdog after a
-fresh controller session starts.
+fresh orchestrator session starts.

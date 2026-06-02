@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""OpenCode controller self-dispatch test (nondestructive).
+"""OpenCode orchestrator self-dispatch test (nondestructive).
 
-Verifies an OpenCode Goal Flight controller can dispatch read-only workers
+Verifies an OpenCode Goal Flight orchestrator can dispatch read-only workers
 to itself on both supported transports:
 
   - ACP: ``goalflight_acp_run.py --agent opencode``
   - bash-tail: ``scripts/hosts/opencode/bash_tail.py`` + ``watch-dispatch-tail.sh``
 
 Also runs doctor + capacity preflight and returns compact JSON evidence for
-the controller conversation (no raw worker logs).
+the orchestrator conversation (no raw worker logs).
 
 Usage:
 
@@ -351,7 +351,7 @@ def run_self_dispatch_test(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="OpenCode controller self-dispatch test")
+    parser = argparse.ArgumentParser(description="OpenCode orchestrator self-dispatch test")
     parser.add_argument("--directory", "-C", default=str(REPO_ROOT), help="Project root for doctor/capacity")
     parser.add_argument("--model", "-m", default=DEFAULT_MODEL, help=f"LiteLLM/OpenCode model (default: {DEFAULT_MODEL})")
     parser.add_argument("--timeout", type=float, default=180.0, help="Per-transport timeout seconds")

@@ -6,7 +6,7 @@ incremented when meaningful skill behaviour changes.
 
 ## [1.0.0] — 2026-05-26
 
-**Major release: multi-node fleet dispatch, four controller hosts, action router,
+**Major release: multi-node fleet dispatch, four orchestrator hosts, action router,
 and canonical docs layout.**
 
 ### Added
@@ -15,7 +15,7 @@ and canonical docs layout.**
   with live SSH remote workers, billing account locks, and status mirror sync.
 - **Action router** — `bin/goalflight` unified entrypoint over `config/actions/`
   and `goalflight_actions.py`.
-- **OpenCode controller port** — full ACP + bash-tail + prompt + self-dispatch
+- **OpenCode orchestrator port** — full ACP + bash-tail + prompt + self-dispatch
   support; promoted to `supported` worker (not survey stub).
 - **Public docs tree** — `docs/architecture.md`, `docs/hosts/cursor.md`,
   `docs/hosts/opencode.md`, `docs/fleet.md`, root `CONTRIBUTING.md`.
@@ -33,7 +33,7 @@ and canonical docs layout.**
 
 ### Changed
 
-- **Controller hosts** — Claude Code (reference), Codex, Cursor, and OpenCode
+- **Orchestrator hosts** — Claude Code (reference), Codex, Cursor, and OpenCode
   ship as sibling controller/worker adapters with shared `SKILL.md` core.
 - **Installed skill resync** — copied host installs must be refreshed with
   `./install.sh <host>` after source skill/support-file changes; doctor surfaces
@@ -185,7 +185,7 @@ zero orphan leaks):
 
 **ACP dispatch reliability.** 0.4.2 taught the runner to *observe* worker
 liveness and recover a stalled handshake; 0.4.3 closes the field failure modes
-its passive heartbeat could not. A controller running 0.4.2 reported `ACP = 0%`
+its passive heartbeat could not. An orchestrator running 0.4.2 reported `ACP = 0%`
 with both adapters hung — a worker's long-running tool call (web search) wedging
 the event stream, and mass-spawned Claude-TUI adapters starving each other at
 startup. Now the heartbeat *acts* on a confirmed wedge (even when the idle gate
@@ -323,7 +323,7 @@ healthy-but-quiet worker. Lands Phase 1 of the converged liveness design.
   `GOALFLIGHT_HEARTBEAT_INTERVAL`), recording `worker_pid`, `pgid`,
   `worker_alive`, `pgroup_cpu_pct`, `events_seen`, `last_event_at`,
   `heartbeat_at`. Heartbeats are **files, never task-notifications** — the
-  controller is woken only on an actionable transition, never per beat (a
+  orchestrator is woken only on an actionable transition, never per beat (a
   per-beat wake would re-process its whole cached session — ruinous).
 - **CPU liveness wired into the runner's own idle path.** `session_prompt()`
   (`scripts/acp_client.py`) gained a generic `on_idle` hook: on idle expiry it
@@ -345,7 +345,7 @@ healthy-but-quiet worker. Lands Phase 1 of the converged liveness design.
   `timeout` on `_send_request`. A healthy adapter answers in well under a
   second; 60s tolerates a slow cold-start while catching the stall two orders of
   magnitude faster than the execution idle-timeout. On timeout it raises a clean
-  `AcpError` the runner converts to `state=failed` — so the controller observes
+  `AcpError` the runner converts to `state=failed` — so the orchestrator observes
   the failure (and now retries once) instead of hanging.
 - Tests: `test/test_goalflight_liveness.py` (classify boundaries incl.
   None+idle, the CPU-sample grace, the parser, live `running_quiet`);
@@ -402,7 +402,7 @@ path per the dispatch-routing composition table.
 
 Dispatch-routing rewrite + adaptive rate-pressure walkback + worker
 currency probes. Substantial shift in how goal-flight thinks about
-worker routing and the controller's own rate-limit budget.
+worker routing and the orchestrator's own rate-limit budget.
 
 Note: the original 0.4.0 plan was a permission-gate. The 0.4.0-prep
 refactor (commit `d372f47`, included here) cleaned up enough of the
@@ -429,8 +429,8 @@ permission-gate becomes a 0.5.0 candidate.
   post-pull test gate) AND worker CLIs (each runs its own self-update).
 - **Per-task routing table** in SKILL.md with explicit defaults +
   fallbacks per task category. Worker-bias note: prefer non-Claude
-  CLI workers for code-writing dispatches when the controller is a
-  Claude session (Claude Agent subagents share the controller's
+  CLI workers for code-writing dispatches when the orchestrator is a
+  Claude session (Claude Agent subagents share the orchestrator's
   rate-limit budget; codex / grok / cursor do not).
 
 ### Added — rate-pressure walkback
@@ -482,10 +482,10 @@ permission-gate becomes a 0.5.0 candidate.
 - **Caps are placeholders, not laws.** Static numbers are best-guesses
   calibrated against the maintainer's vendor plans + 2026-05-19
   service health. Learned per-provider thresholds are future work.
-- **Controller's own provider is asymmetric.** When goal-flight is
+- **Orchestrator's own provider is asymmetric.** When goal-flight is
   hosted by a Claude Code session, `anthropic-session` is the
-  controller's life-support. Bias conservative; don't probe upward
-  on the controller's provider. The cost asymmetry (workday-ending
+  orchestrator's life-support. Bias conservative; don't probe upward
+  on the orchestrator's provider. The cost asymmetry (workday-ending
   vs re-routable) justifies the caution asymmetry.
 - **--parallel monitoring threshold** is provider-specific, not flat
   N. Only re-probe between dispatches when 3+ workers map to the
@@ -510,7 +510,7 @@ permission-gate becomes a 0.5.0 candidate.
   `protocols/*.md` files (load-on-demand). Skill body shrunk from
   430+ lines to ~200 with the routing table.
 - **Procedural runtime helpers** — 7 new `scripts/goalflight_*.py`
-  emit compact JSON for the controller to read summaries
+  emit compact JSON for the orchestrator to read summaries
   (doctor / capacity / ledger / status / watcher / acp-runner /
   review-job).
 - **ARCHITECTURE.md** — top-level orientation document.
@@ -558,7 +558,7 @@ Combined patch — folds two parallel-session work streams:
     request futures never leak.
   - `session_prompt` idle-timeout handling: emits `session/cancel` before
     yielding the timeout error so codex-acp / cursor-agent doesn't continue
-    a dispatch the controller has abandoned. `idle_timeout=None` or `<=0`
+    a dispatch the orchestrator has abandoned. `idle_timeout=None` or `<=0`
     disables the gate (for long-running goal-mode loops where multi-minute
     gaps between agent_message_chunks are normal).
   - `CancelledError` propagation cleaned up — caller-cancelled requests
@@ -612,11 +612,11 @@ a follow-up with unverified behavior:
   dataclass returned by `run_prompt()`. Populated post-hoc by scanning the
   ACP `tool_call` / `tool_call_update` events' `locations: [{path, line?}]`
   arrays against the connection's recorded `cwd`. Paths that resolve outside
-  cwd land here as an audit signal for the controller's per-chunk diff-verify.
+  cwd land here as an audit signal for the orchestrator's per-chunk diff-verify.
 - **`_scan_out_of_scope_paths(tool_calls, cwd)`** — helper that does the
   resolution + classification. Key correctness properties: relative paths
   resolve against the CONNECTION's cwd (set by `session_new()`), NOT the
-  caller process's cwd — avoids false positives when the controller runs
+  caller process's cwd — avoids false positives when the orchestrator runs
   from a different directory than the worker; dedupes; preserves source order;
   handles malformed locations (None / empty / missing path) defensively;
   empty/None cwd disables the check entirely (Path("").resolve() would
@@ -635,8 +635,8 @@ a follow-up with unverified behavior:
   context manager exit).
 - **`_write_through_pidfile_locked()`** — persists the live-connection snapshot
   to `/tmp/goal-flight-acp-pids.d/<controller-pid>.jsonl` on every register
-  and unregister. Even a SIGKILL of the controller leaves the latest snapshot
-  on disk for `cleanup_ghosts()` on the next controller startup to reap.
+  and unregister. Even a SIGKILL of the orchestrator leaves the latest snapshot
+  on disk for `cleanup_ghosts()` on the next orchestrator startup to reap.
 - **Closes the bare-`AcpConnection` orphan-defense gap** the prior code had:
   `AcpProcessPool._save_pids()` only registered pool-managed connections;
   scripts that used `AcpConnection` directly (small test fixtures, simple
@@ -692,18 +692,18 @@ remaining defects that prior passes missed.
   workers**. When the watcher exited on **idle-timeout** (code 2) or
   **controller-dead** (code 3), the worker was still alive but the EXIT
   trap removed the pidfile — leaving no record for `cleanup_ghosts()` to
-  reap on the next controller startup. Refactored to
+  reap on the next orchestrator startup. Refactored to
   `cleanup_pidfile_on_exit()` which preserves the pidfile when the worker
   PID is still alive at exit (any of: marker-then-wind-down, idle-wedge,
   controller-died-worker-survived, SIGTERM-of-watcher-while-worker-runs).
-  cleanup_ghosts then reaps the orphan correctly on next controller start.
+  cleanup_ghosts then reaps the orphan correctly on next orchestrator start.
   Surfaced by codex hardening reviewer; missed by both prior reviewer
   passes and by my own test coverage.
 - **`cleanup_ghosts()` `killpg` hazard for bash-tail entries**. Bash-tail
   workers spawned via `cmd &` in non-interactive bash INHERIT the parent
-  shell's pgroup (the controller's). The prior `cleanup_ghosts()` called
+  shell's pgroup (the orchestrator's). The prior `cleanup_ghosts()` called
   `os.killpg(pgid, SIGKILL)` unconditionally — which on a shared-pgroup
-  bash-tail entry would kill the controller and every sibling worker.
+  bash-tail entry would kill the orchestrator and every sibling worker.
   Defense added: for `agent.endswith("-bash-tail")` entries, only `killpg`
   when `pgid == pid` (worker IS its own session leader); otherwise fall
   back to single-pid kill. macOS lacks `/usr/bin/setsid` so the bash-tail
@@ -762,16 +762,16 @@ paths. Folds four coordination asks from the parallel ACP session.
     for grok's `**MARKER:**` form). Exits when the marker appears, BEFORE
     the worker process exits. Codex `/goal` runs can sit alive for minutes
     after meaningful work lands while wind-down completes; the PID-only
-    watcher delayed the controller by that window. Content-aware exit
-    surfaces completion to the controller as soon as the worker emits the
+    watcher delayed the orchestrator by that window. Content-aware exit
+    surfaces completion to the orchestrator as soon as the worker emits the
     terminal line.
   - **Idle-timeout wedge detection**: exits 2 if the tail file size doesn't
     change for `--max-idle-secs` (default 180s, matching `SKILL.md`
     §Codex reliability no-progress threshold). Used to require a manual
     SIGTERM on the watcher when codex hung; now self-terminates.
-  - **Controller-PID self-monitoring**: exits 3 if the controller PID dies
+  - **Controller-PID self-monitoring**: exits 3 if the orchestrator PID dies
     (orphan watcher self-detection). No more zombie watchers polling tail
-    files no one cares about after a controller crash.
+    files no one cares about after an orchestrator crash.
   - **Pidfile registration in the shared ACP dir**: writes a per-watcher entry
     at `/tmp/goal-flight-acp-pids.d/<controller-pid>.bashtail.<worker-pid>.jsonl`
     on startup, removes via EXIT trap. Schema matches what `scripts/acp_client.py`
@@ -782,7 +782,7 @@ paths. Folds four coordination asks from the parallel ACP session.
     registration at all.
   - **Exit-code semantics surfaced via WATCHER-EXIT summary line**: every
     exit path prints `WATCHER-EXIT: <kind> exit_code=<N>` plus the last 30
-    tail lines, so the controller's task-notification handler can branch
+    tail lines, so the orchestrator's task-notification handler can branch
     on `marker` / `pid-dead` / `idle-timeout` / `controller-dead` without
     re-reading the full tail.
 - **`tests/test-watch-dispatch-tail.sh`** — 10 assertions covering all four
@@ -801,7 +801,7 @@ paths. Folds four coordination asks from the parallel ACP session.
 - **`commands/execute.md` step 2.b `[bash-tail]` branch**: replaces the
   inline `while kill -0` watcher recipe with the parameterized
   `scripts/watch-dispatch-tail.sh` invocation. Documents WATCHER-EXIT
-  semantics so the controller can branch on graceful-complete vs
+  semantics so the orchestrator can branch on graceful-complete vs
   worker-crashed vs wedge-detected.
 
 ### Tests
@@ -828,10 +828,10 @@ oops, X+1").
 
 - **`scripts/acp_client.py`** — vendored from
   [aws-samples/sample-acp-bridge](https://github.com/aws-samples/sample-acp-bridge)
-  @ `2cd3c86`, MIT-0, with corrections needed for goal-flight's controller
+  @ `2cd3c86`, MIT-0, with corrections needed for goal-flight's orchestrator
   use-case: (1) `auto_allow_tools: bool = False` default — upstream
   auto-allowed every tool call unconditionally (fine for chat-bridge, bad for
-  a controller that wants user-confirmation surface); (2) **Permission
+  an orchestrator that wants user-confirmation surface); (2) **Permission
   response schema corrected** to the ACP spec — upstream sent
   `{"optionId": "allow_always"}` which codex-acp rejects with -32700
   `missing field 'outcome'`; correct shape is
@@ -844,14 +844,14 @@ oops, X+1").
   AcpConnection is async context manager; (5) **Ghost-cleanup pidfile
   upgraded to JSON-Lines with identity disambiguation** — upstream killed by
   PID alone, which on Mac (fast PID reuse) would SIGKILL unrelated processes
-  after a controller restart; new cleanup verifies live `ps lstart+comm` against
+  after an orchestrator restart; new cleanup verifies live `ps lstart+comm` against
   recorded values before killing.
 - **`scripts/acp_pool.py`** — production-shaped wrapper around `AcpProcessPool`:
   `managed_pool()` async context manager wires SIGINT/SIGTERM/atexit handlers
-  so controller crashes drain the pool. `compute_pool_ceiling()` reads
+  so orchestrator crashes drain the pool. `compute_pool_ceiling()` reads
   `docs-private/env-caveats.md` for box RAM and computes `max_processes`
   using `(RAM_MB - 2048) // 1200` (worst-case worker RSS = cursor-agent peak,
-  controller reserve 2 GB), capped at the AcpProcessPool default 20.
+  orchestrator reserve 2 GB), capped at the AcpProcessPool default 20.
 - **`scripts/acp_runner.py`** — ergonomic wrapper: `PromptResult` dataclass
   accumulating `agent_message_chunk` text / thoughts / tool_calls / plan /
   stop_reason / error from `session_prompt` notifications. `run_prompt()`
@@ -874,7 +874,7 @@ oops, X+1").
   emphasis), pidfile identity safety against PID reuse, `compute_pool_ceiling`
   formula + fallback cases, `managed_pool()` async context manager teardown.
 - **`test/test_acp_failure_modes.py`** — failure-mode tests: (a) worker
-  process killed mid-prompt → connection-closed sentinel; (b) controller
+  process killed mid-prompt → connection-closed sentinel; (b) orchestrator
   crash / cleanup-under-load via `pool.shutdown()`; (c) broken stdio pipe
   (worker writes garbage between valid frames).
 - **`test/dispatch_acp_chunk.py`** — live end-to-end test against real
@@ -902,11 +902,11 @@ oops, X+1").
   `scripts/probe-box-capacity.sh` to capture box RAM + ACP-worker availability
   to `docs-private/env-caveats.md`. Idempotent re-run on box change.
 
-### Added — controller stewardship surface
+### Added — orchestrator stewardship surface
 
 - **§Inline office-hours — premise re-validation against drift** (`SKILL.md`).
   Largest conceptual addition. Backlog of premise-checks ride alongside
-  dispatch turns: inferred premises (controller filling absences), gap-fills
+  dispatch turns: inferred premises (orchestrator filling absences), gap-fills
   (the absence itself signals a missing-spec), and forward considerations
   (thinking-partner observations). Cherry-pick logic; non-blocking by default;
   validated answers land in `docs-private/premises-<topic>-<date>.md` so they
@@ -914,8 +914,8 @@ oops, X+1").
   is opportunistic — frontier-model judgment over when/what/how, not
   rigid automation.
 - **Worker message-passing marker vocabulary** (`SKILL.md` §Worker message
-  passing). Six worker→controller markers: `STATUS:`, `RESULT:`, `USER-NEED:`,
-  `USER-CONFIRM:`, `BLOCKED:`, `COMPLETE:`. One controller→worker marker:
+  passing). Six worker→orchestrator markers: `STATUS:`, `RESULT:`, `USER-NEED:`,
+  `USER-CONFIRM:`, `BLOCKED:`, `COMPLETE:`. One orchestrator→worker marker:
   `USER-CLARIFICATION:` (prepended on re-dispatch after a `USER-NEED:` is
   answered). Polling shapes for Bash `&` / Agent / ACP transports; pattern
   is markdown-emphasis-tolerant (`^\**(STATUS|...|COMPLETE):\**`) so codex
@@ -958,7 +958,7 @@ oops, X+1").
   full edit → pytest → green loop completes in ~92 s. Safety story is
   load-bearing: the bypass flag trades sandboxing for autonomy; the worktree
   boundary only provides external sandboxing when `<workdir>` is a sibling
-  worktree (parallel mode), not when `<workdir>` is the controller cwd
+  worktree (parallel mode), not when `<workdir>` is the orchestrator cwd
   (sequential mode). Always pass `-C <workdir>` explicitly so the safety
   story has a defined surface; in sequential mode the per-chunk diff-verify
   is the only fence. Verified at `templates/codex-goal-prompt.md.tpl:19` and
@@ -969,14 +969,14 @@ oops, X+1").
   --permission-mode acceptEdits --output-format plain > <tail> 2>&1 &`.
   `--permission-mode acceptEdits` is required for autonomous file edits.
 
-### Changed — controller framing
+### Changed — orchestrator framing
 
-- **README opening + SKILL opening** reframe the controller as **high-level
-  management, not execution**. The controller holds enough context about goal,
+- **README opening + SKILL opening** reframe the orchestrator as **high-level
+  management, not execution**. The orchestrator holds enough context about goal,
   scenery, and intent to exercise discretion and recommend next moves; actual
   work dispatches to workers (Claude subagents, codex, grok) that don't need
   that context. This is the frontier of lightly-supervised development:
-  user ratifies suggested moves, redirects when needed, trusts the controller
+  user ratifies suggested moves, redirects when needed, trusts the orchestrator
   to keep the project anchored across compactions and unattended hours.
 - **Dispatch-mode-by-duration rule**: any tool call expected to take more than
   ~10 s runs in background, so the user's terminal doesn't hang. Rule applies
@@ -988,7 +988,7 @@ oops, X+1").
   backlog items. DRAFT state no longer blocks downstream commands.
 - **Codex bypass-flag safety story is honest about sequential vs parallel mode**.
   Prior prose implied "worktree boundary provides external sandboxing" universally;
-  in sequential mode the bypass dispatches against the controller cwd with no
+  in sequential mode the bypass dispatches against the orchestrator cwd with no
   sandbox. Diff-verify is the only fence in that mode. Sites: SKILL.md §Codex
   reliability, commands/execute.md step 2.b, templates/codex-goal-prompt.md.tpl.
 
@@ -1019,7 +1019,7 @@ oops, X+1").
   worker would hang on the first `session/request_permission` request. Empirically
   confirmed by the second-pass codex reviewer via live `test/dispatch_acp_chunk.py`
   failure (no deliverable, no markers). `managed_pool()` defaults
-  `auto_allow_tools=True` because the goal-flight controller decides chunk
+  `auto_allow_tools=True` because the goal-flight orchestrator decides chunk
   acceptability before dispatching, not per-tool-call.
 - **`compute_pool_ceiling()` fallback no longer fail-opens to 20**. Missing
   `env-caveats.md` (likely a fresh install where `init.md` step 1.5 hasn't run)
@@ -1078,7 +1078,7 @@ for Bash `&` dispatches (`codex exec ... &`, `grok -p ... &`). Bash `&`
 launches the child and immediately exits the launcher Bash call — the harness
 sends a task-notification for the LAUNCHER's exit, not for the child's
 eventual completion. Without an explicit watcher, a codex/grok dispatch
-silently runs to ground with no callback to the controller.
+silently runs to ground with no callback to the orchestrator.
 
 Outputs from the two reviews persisted at
 `docs-private/codex-challenge-2026-05-16.txt` and
@@ -1088,7 +1088,7 @@ Outputs from the two reviews persisted at
 - **SKILL.md §Per-chunk loop dispatch rule** now splits Agent vs Bash
   background mechanics explicitly. Agent: `run_in_background: true` and the
   harness handles the completion-notification. Bash `&`: launcher exits
-  immediately; the controller must wire a watcher (`while kill -0 $PID
+  immediately; the orchestrator must wire a watcher (`while kill -0 $PID
   2>/dev/null; do sleep 15; done`) via `run_in_background: true` Bash so the
   harness fires a notification when the watcher (and therefore the child)
   exits. Documented as the canonical shape with a worked example.
@@ -1192,7 +1192,7 @@ predictor of whether the user's lockout cost wins. Strip the rest.
 Executor dispatch defaults to background; foreground Agent for executors
 is named explicitly as a failure mode. 0.2.4 added a "yield the turn
 between chunks" rule, but treated the symptom — the root cause is that
-foreground Agent dispatch keeps the controller's turn OPEN for the
+foreground Agent dispatch keeps the orchestrator's turn OPEN for the
 entire executor run (often minutes), so queued user messages never
 drain. Background dispatch (`run_in_background: true` for Agent;
 `&` + tail-polling for codex / grok Bash) yields the turn at dispatch
@@ -1208,7 +1208,7 @@ one-turn block.
   is load-bearing — it's the structural mechanism that drains queued
   user input every chunk.
 - **SKILL.md §Three subagent types table** gains a Dispatch-mode
-  column: Executor = background (long-running, controller doesn't need
+  column: Executor = background (long-running, orchestrator doesn't need
   result inline), Reviewer + Planner = foreground (short, result feeds
   the immediate next decision). Mismatching the mode is named as the
   most common pacing antipattern.
@@ -1220,14 +1220,14 @@ one-turn block.
 
 ### Why this matters
 The 0.2.4 step 7 ("yield the turn before chunk N+1") was a workaround
-that asked the controller to remember to emit one-line + STOP between
+that asked the orchestrator to remember to emit one-line + STOP between
 chunks. Easy to forget mid-execute. Background dispatch makes the yield
 *structural* — the turn ends at dispatch time, not as a separate manual
 step. Less prone to chain-the-chunks drift.
 
 Foreground Agent stays correct for short inline reviewers (anticipatory
 subagents, look-ahead Explore, decomposition reviewers) where the
-controller genuinely needs the result inline. The pacing antipattern
+orchestrator genuinely needs the result inline. The pacing antipattern
 is foreground Agent for *executors*, where the result isn't needed
 inline anyway (the next decision is just "verify diff + commit", which
 happens fine on the next turn).
@@ -1240,10 +1240,10 @@ scripts unchanged).
 
 Per-chunk turn-yielding rule made explicit. Field motivation: a user
 running goal-flight against an academic-paper drafting flow watched
-the controller dispatch chunks #9, #10, #11 back-to-back, each as a
+the orchestrator dispatch chunks #9, #10, #11 back-to-back, each as a
 proper subagent — but typed status requests and steering piled up
 unprocessed at the bottom of the chat. The chunks WERE going to
-subagents (correct path); the bug was that the controller was
+subagents (correct path); the bug was that the orchestrator was
 chaining N chunks inside one assistant turn, so user-typed messages
 queued at the harness level and never surfaced until the chain
 broke.
@@ -1268,7 +1268,7 @@ one turn defeats interjection. 0.2.4 closes that gap.
 
 ### Why this matters
 Without per-chunk yielding, a 14-chunk unattended run looks correct
-from the controller's perspective (each chunk dispatched, verified,
+from the orchestrator's perspective (each chunk dispatched, verified,
 committed) and broken from the user's perspective (no way to steer
 mid-run despite multiple typed attempts). The skill's whole premise
 is "12-hour unattended runs where you check in periodically rather
@@ -1281,17 +1281,17 @@ to actually work.
 ## [0.2.3] — 2026-05-16
 
 Interactivity tradeoff for `[controller-direct]` dispatch path made
-explicit. Field motivation: a user observed that a running controller
+explicit. Field motivation: a user observed that a running orchestrator
 session was inlining work via `[controller-direct]`, blocking their
 ability to comment / question / redirect mid-flight — the session
 appeared "hung between agents" but was actually busy executing tool
-calls. SKILL.md didn't call this tradeoff out, so the controller
+calls. SKILL.md didn't call this tradeoff out, so the orchestrator
 defaulted to inline when subagent dispatch would have served the user
 better.
 
 ### Changed
 - **SKILL.md §Dispatch model `[controller-direct]` bullet** — added
-  the interactivity tradeoff: while the controller inlines, the parent
+  the interactivity tradeoff: while the orchestrator inlines, the parent
   session is unresponsive to user input. Subagent dispatch (path 2)
   frees the parent so the user can interject. Heuristic added: prefer
   subagent dispatch when the user is at the keyboard, when the work
@@ -1305,7 +1305,7 @@ better.
   bullets: don't monopolize the parent thread with long inline work.
   Same heuristic as the dispatch-model bullet, framed from the asking-
   discipline north star (user retains ability to interject = real value
-  the controller protects).
+  the orchestrator protects).
 
 ### Tests
 3 suites / 46 assertions remain green (prose-only changes; testable
@@ -1313,7 +1313,7 @@ scripts unchanged).
 
 ## [0.2.2] — 2026-05-16
 
-Skill-update drift detection. Long-running controller sessions could load
+Skill-update drift detection. Long-running orchestrator sessions could load
 SKILL.md, run for hours, and never notice when `git pull` refreshed the
 skill on disk — they kept using the stale content. Failure surface for
 this in 0.2.1: a session that loaded before the MCP-wrap rule shipped
@@ -1342,7 +1342,7 @@ queued for 0.2.3 once this pattern proves out.)
   Silent when lines match exactly or when the file carries no header
   (legacy file from < 0.2.2 — treat as no-data, not as drift).
 - **Read-and-compare sites** added in `SKILL.md` §resume steps 1-2 and
-  `commands/execute.md` §Pre-flight — every controller entrypoint that
+  `commands/execute.md` §Pre-flight — every orchestrator entrypoint that
   reads a state file now does the comparison so the drift catches
   early, before the dispatched executors operate on stale conventions.
 
@@ -1355,7 +1355,7 @@ queued for 0.2.3 once this pattern proves out.)
 
 ### Tests
 3 suites / 46 assertions remain green (no test changes — convention
-addition for the controller to follow; testable scripts unchanged).
+addition for the orchestrator to follow; testable scripts unchanged).
 
 ## [0.2.1] — 2026-05-16
 
@@ -1392,7 +1392,7 @@ the fix-up.
 - **"Never wrap headless dispatches in an MCP tool call"** bullet in
   SKILL.md §Codex reliability. Wrapping `codex exec`, `grok -p`, or
   `claude -p` inside `ctx_execute` (or any MCP tool call) hits the
-  MCP/context timeout — the controller sees a hang even though the
+  MCP/context timeout — the orchestrator sees a hang even though the
   underlying process ran fine and exited; the output is stuck in the
   OS-captured stdout the MCP wrapper never returned. Pattern: Bash +
   `>` redirect to a file, poll via `while kill -0 $PID 2>/dev/null;
@@ -1411,7 +1411,7 @@ the fix-up.
   "Token bias is a dial" bullet (which had become a multi-paragraph
   decay of stale future-work claims) is now two focused bullets — token
   bias (defaults UP, override per-chunk) and channel routing (user
-  override on top of the controller's per-chunk three-paths default,
+  override on top of the orchestrator's per-chunk three-paths default,
   reserving Claude for orchestration and milestone reviews via gstack
   `/review`, codex for coding when Claude session-limits bite, grok as
   an executor). Drops the dead `docs-private/<topic>-tuning.md` reader
@@ -1462,7 +1462,7 @@ Three-commit aggressive cull (`d67c80c` + `afcff37` + this one) following parall
 
 **Rewrites:**
 - `SKILL.md` — now beefier (folded in `pattern.md`'s Codex reliability, /goal mode, Handoff before compact, state-three-layers, three-dispatch-paths, three-subagent-types, Don'ts).
-- `commands/validate-dispatch.md` — aligned with verification-first wrapper (was telling controllers to "paste these slices" while wrapper said "point at them"). Heuristics tightened: catches `:line` anchors without verification framing in same paragraph, catches stale-`git fetch` as P0 blocker, catches Layer 5 specialization in prompt (was inverted before).
+- `commands/validate-dispatch.md` — aligned with verification-first wrapper (was telling orchestrators to "paste these slices" while wrapper said "point at them"). Heuristics tightened: catches `:line` anchors without verification framing in same paragraph, catches stale-`git fetch` as P0 blocker, catches Layer 5 specialization in prompt (was inverted before).
 - `commands/build-corpus.md` and `commands/init.md` step 3.5 — RAG pipeline expressed as 4 short pass briefs instead of per-pass prompt-file references.
 - `README.md` — stripped from 16 KB to ~6 KB. Cut the 12-knob parameter-space table and 5 example tunings; both were one-project-specific calcification. Kept the Quickstart, sub-command table, Why-the-pattern-works gist, Adapting-via-agent-edit paragraph, When-NOT-to-use list.
 
@@ -1488,7 +1488,7 @@ Frontier-model composition guarantee: the skill no longer carries worked example
 - **`scripts/self-fork-detect.sh` + self-delegation-via-fork pattern.**
   `/fork` (Claude Code slash command, also `--fork-session` CLI flag)
   creates a new session with a fresh `CLAUDE_CODE_SESSION_ID`. The
-  helper script lets the controller write a contract (controller's
+  helper script lets the orchestrator write a contract (orchestrator's
   session ID + task description + completion/abort signals) before
   forking; the new session's `detect` mode prints `ORIGINAL | FORK |
   SUBAGENT | NO_CONTRACT` by comparing env var to contract. On FORK,
@@ -1504,7 +1504,7 @@ Frontier-model composition guarantee: the skill no longer carries worked example
     `detect` script's heuristic (recent activity under any `subagents/`
     subdir + env-matches-marker) reports SUBAGENT, not ORIGINAL,
     so a subagent that incidentally reads the contract doesn't
-    misfire as the controller.
+    misfire as the orchestrator.
 
   `SKILL.md` gains a §"Self-delegation via /fork" subsection with
   the identity-surface table + decision guide (controller-direct vs
@@ -1529,8 +1529,8 @@ Frontier-model composition guarantee: the skill no longer carries worked example
   loop primitive) vs the short-prompt codex shape (bounded review
   tasks).
 - **Opus iteration loop as a no-codex fallback for `/goal`-mode chunks.**
-  Same goal-prompt template; the controller becomes the loop primitive
-  externally. Each Agent dispatch is one iteration; the controller
+  Same goal-prompt template; the orchestrator becomes the loop primitive
+  externally. Each Agent dispatch is one iteration; the orchestrator
   parses the Final response block, captures git-diff state +
   Agent-reported blockers + tests pass/fail, and either commits
   (Goal complete: true) or re-dispatches with the unchanged goal-
@@ -1543,7 +1543,7 @@ Frontier-model composition guarantee: the skill no longer carries worked example
   installed or `features.goals` isn't enabled, AND when the chunk
   typically completes in 1–2 iterations (overhead difference is
   negligible at that scale). Each iteration's transcript is
-  readable via the task-notification's JSONL path; controller
+  readable via the task-notification's JSONL path; orchestrator
   parses the last assistant message before the `done` event for the
   Final response block.
 - **Grok iteration loop as a peer fallback to Opus iteration.** Same
@@ -1569,14 +1569,14 @@ Frontier-model composition guarantee: the skill no longer carries worked example
   opt-in prompts — user's environment, user's call.
 - `[controller-direct]` chunk tag — `commands/decompose-plan.md` step 2 now
   tags trivial single-file chunks (< ~30 LoC, no cross-module coupling) so
-  the controller can handle them inline with Read + Edit + commit instead
+  the orchestrator can handle them inline with Read + Edit + commit instead
   of dispatching a subagent. `commands/execute.md` step 2b branches on the
   tag. Closes the dispatch-overpresribe gap for tiny chunks where subagent
   dispatch costs more than the work itself.
 - **`[controller-direct]` criterion expanded with "too much context to
   explain" trigger.** Two distinct cases now justify inline execution:
   (A) trivially small work — the original criterion (single-file,
-  <30 LoC, no cross-module coupling); (B) the controller has
+  <30 LoC, no cross-module coupling); (B) the orchestrator has
   session-loaded state (mid-debug, just-consumed milestone-review
   P0 cluster, rolling decisions not yet in `docs-private/rag/
   decisions.md`) that re-explaining to a fresh subagent would cost
@@ -1598,7 +1598,7 @@ Frontier-model composition guarantee: the skill no longer carries worked example
 - `SKILL.md` controller-delegates-reads bullet softened: bulk reads
   (>200 lines, full READMEs, full architecture docs) still go to Explore
   subagents; short verification reads inline are fine. The ban is on bulk
-  consumption, not on the controller using its eyes.
+  consumption, not on the orchestrator using its eyes.
 - **Handoff threshold raised 70% → 80% with explicit calibration.**
   `reference/pattern.md` §Handoff before compact now treats the percentage
   as a default rather than a hard rule. The right handoff time is a
@@ -1608,14 +1608,14 @@ Frontier-model composition guarantee: the skill no longer carries worked example
   hotter (90%+) when the queue is 1-3 trivial chunks from done and
   the most recent RESUME-NOTES rev already captures in-flight state.
   Explicit note that subagents + `\goal` mode are the primary leverage
-  for extending session life — the controller's own context mostly
+  for extending session life — the orchestrator's own context mostly
   holds metadata, not the bottleneck.
 - `templates/goal-queue.tpl` independence-tags section now lists
   `[controller-direct]` alongside `[parallel-safe:<group>]` and `[milestone]`.
 - **Agent roles framing made explicit in init step 1.** Codex is a
   dispatch target (executor / reviewer) — never expected to invoke
-  `/goal-flight <sub>` itself. Controller is Claude Code today; other
-  controller wrappers can be added later. The clarification removes a footgun around
+  `/goal-flight <sub>` itself. Orchestrator is Claude Code today; other
+  orchestrator wrappers can be added later. The clarification removes a footgun around
   `\goal` (in-prompt text marker, backslash) vs `/goal-flight goal
   <SLUG>` (slash command, controller-side queue helper) — there is no
   `/goal` codex command in v0.130.0 or any current marketplace.
@@ -1632,7 +1632,7 @@ Frontier-model composition guarantee: the skill no longer carries worked example
   short prompts that point at files on disk (e.g. `Read prompts/
   gstack-codex-challenge.md in full and execute it`) rather than pasting
   the prompt file's contents into the codex exec arg. Solves three
-  coupled problems at once: (1) controller burns its own tokens
+  coupled problems at once: (1) orchestrator burns its own tokens
   composing 6–11 KB of context per dispatch when the agent could just
   Read; (2) controller-pasted "facts" go stale on the timescale of
   minutes between composition and execution; (3) codex session
@@ -1687,7 +1687,7 @@ Frontier-model composition guarantee: the skill no longer carries worked example
 
 ## [0.1.0] — 2026-05-14
 
-Initial release. Controller pattern, dispatch wrapper layers, milestone
+Initial release. Orchestrator pattern, dispatch wrapper layers, milestone
 gstack reviews, RAG corpus pipeline, RESUME-NOTES handoff. See
 `docs-private/lessons-learned-2026-05-15.md` (gitignored) for the harden
 session that motivated 0.2.

@@ -746,7 +746,7 @@ def main(argv: list[str] | None = None) -> int:
     dispatch.add_argument("--json", action="store_true")
     dispatch.set_defaults(func=cmd_dispatch)
 
-    watch = sub.add_parser("watch", help="Mirror remote dispatch status into controller register")
+    watch = sub.add_parser("watch", help="Mirror remote dispatch status into orchestrator register")
     watch.add_argument("--fleet", action="store_true", help="Watch all in-flight fleet dispatches")
     watch.add_argument("--once", action="store_true", help="Single sync pass (default when no --interval)")
     watch.add_argument("--interval", type=float, default=0.0, help="Poll interval seconds (loop until interrupted)")

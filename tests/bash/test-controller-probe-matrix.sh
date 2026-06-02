@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Hermetic + live probe matrix smoke for controller harness.
+# Hermetic + live probe matrix smoke for orchestrator harness.
 
 set -u
 

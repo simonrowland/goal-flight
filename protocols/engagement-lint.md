@@ -1,6 +1,6 @@
 # Engagement-prompt lint protocol
 
-The controller's job during an active goal-flight run is to **advance the
+The orchestrator's job during an active goal-flight run is to **advance the
 queue**, not to re-solicit permission for actions the plan already
 authorized. Engagement prompts ("want me to continue?", "should I
 proceed?", "let me know if…") are a regression class: they convert
@@ -12,7 +12,7 @@ Source data: `docs-private/research/2026-05-28-r2b-protocol-lists/findings.md`.
 
 ## Verb patterns (regression triggers)
 
-The controller MUST NOT emit user-facing messages that match the
+The orchestrator MUST NOT emit user-facing messages that match the
 following substring patterns when the current chunk is already
 authorized by the plan / queue / running execute loop.
 
@@ -35,17 +35,17 @@ violation.
 - A real blocker exists (permission, auth, destructive op without plan
   default, irreducible product ambiguity).
 - The yellow phrase is part of a `USER-NEED:` / `USER-CONFIRM:` block.
-- The chunk's scope explicitly closed and the controller is reporting
+- The chunk's scope explicitly closed and the orchestrator is reporting
   COMPLETE (e.g., "let me know if you want X next" as a forward-pointer
   suggestion, not a continuation gate on the current chunk).
 
 ## Enforcement
 
-- **Floor (hard)**: a future PostToolUse hook on the controller's
+- **Floor (hard)**: a future PostToolUse hook on the orchestrator's
   outgoing message stream blocks send when red pattern appears without
   a paired `USER-NEED:` / `USER-CONFIRM:` marker.
 - **Ceiling (soft)**: doctor probe emits a WARN when sampled session
-  logs show > 1 red occurrence per 100 controller messages.
+  logs show > 1 red occurrence per 100 orchestrator messages.
 - **Runtime audit**: `goalflight_context_audit.py` already aggregates
   similar ratios; add `engagement_red_per_100` as a tracked metric.
 

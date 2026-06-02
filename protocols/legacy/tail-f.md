@@ -19,8 +19,8 @@ ledger.
 tail -f /tmp/<agent>-<slug>.txt
 ```
 
-**Do not** run this from the controller's conversation. `tail -f` blocks
-the foreground forever; the controller has no way to time-bound it. Run it
+**Do not** run this from the orchestrator's conversation. `tail -f` blocks
+the foreground forever; the orchestrator has no way to time-bound it. Run it
 from a separate shell or use the structured watcher instead.
 
 **Do not** wrap `tail -f` in context-mode (`ctx_execute` /

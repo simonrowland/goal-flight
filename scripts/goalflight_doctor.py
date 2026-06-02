@@ -588,7 +588,7 @@ def check_installed_skill_drift(skill_root: Path, project_root: Path) -> dict:
             "sources": [grok_source],
             "installed": home / ".grok/skills/goal-flight/SKILL.md",
             # `--agent grok` selects only the worker (grok-acp-worker); the
-            # SKILL.md install lives under the controller surface setup.
+            # SKILL.md install lives under the orchestrator surface setup.
             # Resync needs the full setup path that copies SKILL.md sources.
             "resync_command": (
                 "./setup.sh --apply --yes --agent grok && "
@@ -1596,7 +1596,7 @@ def _fleet_auth_summary(
 def _rate_pressure_summary() -> dict:
     """Compact rate-pressure summary for doctor output.
 
-    The controller's job is to not overheat provider services in a way
+    The orchestrator's job is to not overheat provider services in a way
     that takes the live session down. This surfaces the same probe
     `goalflight_rate_pressure.py` emits, so the doctor is a one-stop
     "is everything OK" check.
@@ -1910,7 +1910,7 @@ def print_human(payload: dict) -> None:
     if not (behind_workers or verified_current or probe_failed):
         lines.append(status_line(None, "worker CLI currency", "no workers probed"))
 
-    # Rate-limit pressure summary — the controller's responsibility is to
+    # Rate-limit pressure summary — the orchestrator's responsibility is to
     # not overheat services in a way that crashes the live session.
     rp = payload.get("rate_pressure") or {}
     pressured = rp.get("providers_under_pressure") or []

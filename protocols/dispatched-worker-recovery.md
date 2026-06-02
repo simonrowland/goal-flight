@@ -59,7 +59,7 @@ allow-patterns, different mode, different agent) and re-fire the chunk.
 
 4. **Run an independent review on the worker's diff.** `gstack /review` via
    the host's normal skill-load path, OR `codex review` via bash-tail if the
-   controller is non-native. The review runs controller-side as a read-only
+   orchestrator is non-native. The review runs controller-side as a read-only
    operation, NOT nested through the dead worker's ACP shim (see
    `protocols/chunk-review.md` §"Where the review runs"). Apply
    P3-safe-easy findings inline per the new policy.
@@ -76,7 +76,7 @@ allow-patterns, different mode, different agent) and re-fire the chunk.
      dispatched via the OpenAI-side ACP shim completed the implementation
      work and ran focused tests green, then blocked on <reason> — that step
      is replaced by the manual review pass landed in this commit")
-   - Include `Co-Authored-By` for the controller (and worker, when its
+   - Include `Co-Authored-By` for the orchestrator (and worker, when its
      attribution surface is appropriate per the codename rule)
 
 7. **Note in the goal-queue** that the recovery happened so the next session
@@ -86,7 +86,7 @@ allow-patterns, different mode, different agent) and re-fire the chunk.
 
 ## Recovery sub-case: worker WIP bundled into someone else's commit
 
-The fb05e84-class incident (2026-05-27): controller (or another worker)
+The fb05e84-class incident (2026-05-27): orchestrator (or another worker)
 ran bare `git commit` while a worker had staged its scope files. The
 worker's staged WIP got bundled into a commit with the wrong author /
 scope / message. The worker either finds nothing left to commit (silent
@@ -151,7 +151,7 @@ Recovery options:
 - **Don't skip the review step.** The fact that the worker did most of the
   work doesn't mean the work is correct. Run the controller-side review.
 - **Don't silently drop the worker's self-review.** If the worker was about
-  to run gstack `/review` when it blocked, the controller MUST run that
+  to run gstack `/review` when it blocked, the orchestrator MUST run that
   review before commit — the worker can't, but the work isn't reviewed
   unless someone runs it.
 
@@ -160,7 +160,7 @@ Recovery options:
 Distinct from the recovery cases above. Here the worker SHOULD have stopped
 and returned `BLOCKED:` but instead found a workaround route and "completed
 the task" through it. The envelope (what counts as appropriate completion)
-is the controller's call; the worker stays out of the controller's lane.
+is the orchestrator's call; the worker stays out of the orchestrator's lane.
 
 ### Pattern
 
@@ -170,7 +170,7 @@ tried to deliver X failed. Returning with X undelivered would be
 
 What worker is missing: *"The envelope says deliver X **via** file-backed
 return / standard git path / etc. Failing to satisfy the envelope is
-failing the task. Workaround paths are the controller's call, not mine."*
+failing the task. Workaround paths are the orchestrator's call, not mine."*
 
 ### Examples observed 2026-05-28
 
@@ -183,7 +183,7 @@ failing the task. Workaround paths are the controller's call, not mine."*
    any local `git commit` event and without push authorization.
    **Right move:** stage files locally, return `BLOCKED: commit step
    blocked by /dev/null sandbox quirk, all artifacts staged in working
-   tree, ready for controller to run goalflight_commit.sh and authorize
+   tree, ready for orchestrator to run goalflight_commit.sh and authorize
    push`.
 
 2. **R-coverage Explore agent dumped 5KB inline.** Task: map R1–R26 backlog
@@ -194,7 +194,7 @@ failing the task. Workaround paths are the controller's call, not mine."*
    chat reply, defeating the file-backed-return contract. **Right move:**
    return `BLOCKED: cannot write to <intended-path>, content drafted in
    worker context but not persisted, please clarify path permission or
-   accept inline override`. Then controller decides.
+   accept inline override`. Then orchestrator decides.
 
 ### Dispatch-prompt clause to inline
 
@@ -209,10 +209,10 @@ exactly:
 
   TL;DR: <what was drafted; ≤3 lines>
 
-  Recommended controller action: <one line>
+  Recommended orchestrator action: <one line>
 
 Do NOT inline the drafted content. Do NOT use alternate APIs (REST,
-git plumbing) to bypass the standard path. The controller decides.
+git plumbing) to bypass the standard path. The orchestrator decides.
 ```
 
 Every dispatch prompt that involves git operations MUST include verbatim:
@@ -224,7 +224,7 @@ Commits use the standard `git add` / `git commit` path or
 return BLOCKED with the failure trace; do not bypass.
 
 Push is NEVER authorized in a dispatched worker prompt unless this prompt
-explicitly says "push permitted". Push requires controller verification +
+explicitly says "push permitted". Push requires orchestrator verification +
 user authorization.
 ```
 
@@ -237,7 +237,7 @@ environmental enforcement layer is the real fix:
 - Pre-tool hook on the worker side: block writes to
   `~/.claude/settings.json`, `~/.claude/hooks/`, `/private/tmp/`,
   out-of-cwd paths.
-- Post-dispatch audit on the controller side: check `origin/main`
+- Post-dispatch audit on the orchestrator side: check `origin/main`
   movement vs the local push reflog. If `origin/main` advanced without a
   corresponding controller-side `git push` event, flag.
 - `goalflight_commit_guard.py` should grow a sibling check:

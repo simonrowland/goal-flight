@@ -1,6 +1,6 @@
 # User Status Cadence Protocol
 
-Controller behavior during `execute` (and any long dispatch loop). **Separate
+Orchestrator behavior during `execute` (and any long dispatch loop). **Separate
 from** worker markers (`protocols/worker-markers.md`), chunk review
 (`protocols/chunk-review.md`), and milestone review
 (`protocols/milestone-review.md`).
@@ -14,7 +14,7 @@ whole skill before relying on partial summaries.
 
 ## Cadence
 
-While any worker or review job is in-flight, or while the controller is waiting
+While any worker or review job is in-flight, or while the orchestrator is waiting
 on a background job (>10s) before the queue is DONE:
 
 - **At least every 15 minutes**, poll machine state and surface a **user-facing
@@ -60,4 +60,4 @@ session or resume can reconstruct progress.
 
 Workers should emit `STATUS:` markers per `prompts/dispatch-wrapper.md` (~8
 minutes). That feeds watchers and status JSON. **This protocol** is the
-controller translating aggregate state **to the user** on a ≤15-minute cadence.
+orchestrator translating aggregate state **to the user** on a ≤15-minute cadence.

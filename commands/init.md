@@ -32,7 +32,7 @@ changes, copied host installs need a resync from the source repo with
 symlink. Doctor JSON reports `installed_skill_drift`, and text mode prints
 `installed_skill_md_hash` WARNs.
 
-For Codex, setup registers the Goal Flight package for the Desktop controller
+For Codex, setup registers the Goal Flight package for the Desktop orchestrator
 surface, cleans any duplicate legacy personal Codex skill when plugin
 registration succeeds, checks the CLI worker surface, and registers
 context-mode MCP when needed. `codex exec` remains the worker path. For Cursor,
@@ -51,7 +51,7 @@ Default add-ons (same tier as setup prompts):
   gstack is not installed.
 - **autoreview** — complementary diff-local pre-commit pass via
   `scripts/autoreview.sh`. Runs in parallel with gstack at chunk level when the
-  controller chooses; does not replace gstack as the default review path.
+  orchestrator chooses; does not replace gstack as the default review path.
   Install upstream autoreview before init when doctor WARNs — typically the
   Cursor autoreview skill or `AUTOREVIEW_HELPER`.
 
@@ -75,10 +75,10 @@ python3 <skill-root>/scripts/goalflight_doctor.py --project-root "$PWD" --json
    offering install; the usual traps are UTF-16LE/NUL output from `wsl -l -q`,
    localized no-distro prose, and enterprise-policy guidance text. If
    `wsl.probe.usable` is false and `wsl.probe.declined` is false, ask the
-   operator with the controller's host-neutral user-question surface ("Ask User
+   operator with the orchestrator's host-neutral user-question surface ("Ask User
    Question" on hosts that expose it) before any install command:
 
-   - **Install WSL now** — controller may run `wsl --install`; surface that this
+   - **Install WSL now** — orchestrator may run `wsl --install`; surface that this
      can require admin elevation, downloads a distro, and can require a reboot
      before dispatch works.
    - **Keep native read/plan only** — write

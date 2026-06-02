@@ -1,6 +1,6 @@
 # <PROJECT_NAME>
 
-This repository is configured for Goal Flight controller workflows.
+This repository is configured for Goal Flight orchestrator workflows.
 
 Read order:
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Live smoke test: OpenCode controller self-dispatch (ACP + bash-tail).
+# Live smoke test: OpenCode orchestrator self-dispatch (ACP + bash-tail).
 # Skips when opencode or LiteLLM credentials are unavailable.
 
 set -u

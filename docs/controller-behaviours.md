@@ -1,7 +1,7 @@
 ---
 schema_version: 1
 description: >
-  Golden Master of desired goal-flight controller behaviours. Source-of-truth
+  Golden Master of desired goal-flight orchestrator behaviours. Source-of-truth
   declarative spec; SKILL.md is the compiled compressed distillation of this
   document. Adding a feature means adding an entry here FIRST, then re-distilling
   SKILL.md, then implementing.
@@ -39,7 +39,7 @@ entry_schema:
   controller_does:
     type: string
     required: true
-    constraint: one sentence describing the desired controller action
+    constraint: one sentence describing the desired orchestrator action
   failure_mode:
     type: string
     required: true
@@ -127,9 +127,9 @@ behaviours:
     see: '#entry-skill-load-order-mandatory'
 ---
 
-# Goal-Flight Controller Behaviours — Golden Master
+# Goal-Flight Orchestrator Behaviours — Golden Master
 
-This is the source-of-truth declarative spec of desired goal-flight controller
+This is the source-of-truth declarative spec of desired goal-flight orchestrator
 behaviours. `SKILL.md` is the compiled compressed distillation of this document.
 The hermetic test in `tests/python/test_skill_structure.py` (chunk-5) asserts
 `SKILL.md` still distills every entry below.
@@ -166,8 +166,8 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **id:** `skill-load-order-mandatory`
 - **name:** Read SKILL.md end-to-end at session start
 - **category:** `skill-load-and-order`
-- **controller_does:** At session start in a goal-flight-active repository, the controller reads `SKILL.md` **entirely end-to-end** before any command dispatch, and re-reads it after compaction when goal-flight is already in play (per `AGENTS.md` "Active run + compaction" rule).
-- **failure_mode:** The controller skims `SKILL.md` to the command table or to "Hard Invariants" and stops, missing back-half sections (Worker Routing, Hard caps, Adaptive walkback, Controller-provider asymmetry, Context Discipline). Concrete anti-pattern: controller cites only the command table when asked "what's the routing default for code-writing chunks?", because it never reached `## Worker Routing` (line ~205 of current SKILL.md).
+- **controller_does:** At session start in a goal-flight-active repository, the orchestrator reads `SKILL.md` **entirely end-to-end** before any command dispatch, and re-reads it after compaction when goal-flight is already in play (per `AGENTS.md` "Active run + compaction" rule).
+- **failure_mode:** The orchestrator skims `SKILL.md` to the command table or to "Hard Invariants" and stops, missing back-half sections (Worker Routing, Hard caps, Adaptive walkback, Controller-provider asymmetry, Context Discipline). Concrete anti-pattern: orchestrator cites only the command table when asked "what's the routing default for code-writing chunks?", because it never reached `## Worker Routing` (line ~205 of current SKILL.md).
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Read this skill end-to-end"
@@ -194,8 +194,8 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **id:** `status-without-asking-hook-welcome`
 - **name:** Report status without engagement bait
 - **category:** `autonomous-throughput-and-status`
-- **controller_does:** During an active goal-flight run, the controller gives concise progress status and keeps executing the prescribed next step instead of asking whether to continue.
-- **failure_mode:** The controller finishes step 1, then asks "want me to continue with step 2?" even though the plan already authorizes step 2 and no real blocker exists.
+- **controller_does:** During an active goal-flight run, the orchestrator gives concise progress status and keeps executing the prescribed next step instead of asking whether to continue.
+- **failure_mode:** The orchestrator finishes step 1, then asks "want me to continue with step 2?" even though the plan already authorizes step 2 and no real blocker exists.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Default is continue, not confirm"
@@ -216,8 +216,8 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **id:** `compaction-skill-reload-scoped`
 - **name:** Reload skill only for active runs
 - **category:** `compaction-and-resume`
-- **controller_does:** After compaction, the controller reloads Goal Flight skill and resume protocol only when goal-flight was already in play before compaction.
-- **failure_mode:** The controller treats every compacted session as a goal-flight run and reloads commands or starts queue work for an unrelated repository task.
+- **controller_does:** After compaction, the orchestrator reloads Goal Flight skill and resume protocol only when goal-flight was already in play before compaction.
+- **failure_mode:** The orchestrator treats every compacted session as a goal-flight run and reloads commands or starts queue work for an unrelated repository task.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Active run + compaction: if already in play, invoke `/goal-flight resume`"
@@ -239,8 +239,8 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **id:** `mid-session-ask-append-to-goal-queue`
 - **name:** Queue mid-session user asks
 - **category:** `chat-discipline`
-- **controller_does:** When the user adds scope during an active run, the controller appends a compact row to the active goal queue before dispatch or implementation.
-- **failure_mode:** The controller treats chat as the only backlog and launches a worker from the new ask without writing the queue update first.
+- **controller_does:** When the user adds scope during an active run, the orchestrator appends a compact row to the active goal queue before dispatch or implementation.
+- **failure_mode:** The orchestrator treats chat as the only backlog and launches a worker from the new ask without writing the queue update first.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "chat alone is not the backlog"
@@ -262,8 +262,8 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **id:** `no-blocking-cursor-task-worker`
 - **name:** Avoid blocking editor task workers
 - **category:** `worker-routing-defaults`
-- **controller_does:** The controller routes worker execution through ACP or bash-tail plus status polling, rather than blocking the interactive session on editor task panes.
-- **failure_mode:** The controller opens a long editor task and waits synchronously in chat, preventing status polling, capacity checks, or review dispatch from continuing.
+- **controller_does:** The orchestrator routes worker execution through ACP or bash-tail plus status polling, rather than blocking the interactive session on editor task panes.
+- **failure_mode:** The orchestrator opens a long editor task and waits synchronously in chat, preventing status polling, capacity checks, or review dispatch from continuing.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Use ACP or bash-tail plus status polling; do not block on editor task panes"
@@ -284,8 +284,8 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **id:** `autonomous-throughput-commit-as-complete`
 - **name:** Commit completed chunks locally
 - **category:** `autonomous-throughput-and-status`
-- **controller_does:** During execute, the controller commits each completed logical chunk after focused tests and independent review unless the user forbade commits for the run.
-- **failure_mode:** The controller piles up several completed chunks as uncommitted work and waits for a separate "please commit" prompt despite the active goal-flight workflow.
+- **controller_does:** During execute, the orchestrator commits each completed logical chunk after focused tests and independent review unless the user forbade commits for the run.
+- **failure_mode:** The orchestrator piles up several completed chunks as uncommitted work and waits for a separate "please commit" prompt despite the active goal-flight workflow.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Commits during execute follow **one commit per completed chunk**"
@@ -306,8 +306,8 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **id:** `autoreview-complementary-not-default`
 - **name:** Keep autoreview complementary
 - **category:** `review-discipline`
-- **controller_does:** The controller treats `./scripts/autoreview.sh` as a complementary parallel review option, while gstack remains the default chunk review path.
-- **failure_mode:** The controller replaces gstack review with autoreview and documents autoreview as the primary pre-commit reviewer.
+- **controller_does:** The orchestrator treats `./scripts/autoreview.sh` as a complementary parallel review option, while gstack remains the default chunk review path.
+- **failure_mode:** The orchestrator replaces gstack review with autoreview and documents autoreview as the primary pre-commit reviewer.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "`./scripts/autoreview.sh` as a complementary parallel option"
@@ -329,8 +329,8 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **id:** `user-status-cadence-15min`
 - **name:** Poll and report every 15 minutes
 - **category:** `autonomous-throughput-and-status`
-- **controller_does:** While workers, review jobs, or background verification are in flight, the controller polls compact state and gives the user a short update at least every 15 minutes unless context is tight.
-- **failure_mode:** The controller lets workers run for an hour with no poll or status digest, then asks the user what to do next because it lost track of state.
+- **controller_does:** While workers, review jobs, or background verification are in flight, the orchestrator polls compact state and gives the user a short update at least every 15 minutes unless context is tight.
+- **failure_mode:** The orchestrator lets workers run for an hour with no poll or status digest, then asks the user what to do next because it lost track of state.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "at least every 15 minutes"
@@ -351,8 +351,8 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **id:** `milestone-standalone-protocol`
 - **name:** Keep milestone review separate
 - **category:** `review-discipline`
-- **controller_does:** The controller treats milestone review as a separate protocol gate from per-chunk review and invokes it at milestone cadence or milestone-marked chunks.
-- **failure_mode:** The controller runs one diff-local chunk review, labels it a milestone review, and skips the broader concern-diverse milestone sweep.
+- **controller_does:** The orchestrator treats milestone review as a separate protocol gate from per-chunk review and invokes it at milestone cadence or milestone-marked chunks.
+- **failure_mode:** The orchestrator runs one diff-local chunk review, labels it a milestone review, and skips the broader concern-diverse milestone sweep.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "a separate gate from chunk review"
@@ -374,8 +374,8 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **id:** `review-layers-three-distinct`
 - **name:** Preserve three review layers
 - **category:** `review-discipline`
-- **controller_does:** The controller keeps executor self-review, per-chunk review, and milestone review as distinct review layers with different scopes.
-- **failure_mode:** The controller collapses executor self-review and milestone review into one generic "review this diff" worker prompt.
+- **controller_does:** The orchestrator keeps executor self-review, per-chunk review, and milestone review as distinct review layers with different scopes.
+- **failure_mode:** The orchestrator collapses executor self-review and milestone review into one generic "review this diff" worker prompt.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Review layers: executor self-review, chunk review, milestone review"
@@ -397,8 +397,8 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **id:** `gstack-default-review-chunk`
 - **name:** Use gstack for chunk review
 - **category:** `review-discipline`
-- **controller_does:** Before a chunk commit, the controller uses gstack `/review` as the default independent review path and may add complementary reviewers in parallel.
-- **failure_mode:** The controller skips gstack and uses only a local script or ad hoc worker review before committing a chunk.
+- **controller_does:** Before a chunk commit, the orchestrator uses gstack `/review` as the default independent review path and may add complementary reviewers in parallel.
+- **failure_mode:** The orchestrator skips gstack and uses only a local script or ad hoc worker review before committing a chunk.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "default gstack `/review`"
@@ -421,7 +421,7 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **name:** Keep SKILL navigation map
 - **category:** `skill-load-and-order`
 - **controller_does:** The skill distillation keeps a compact navigation map from Golden Master behaviour to SKILL anchor to related protocol or script.
-- **failure_mode:** The controller adds new behaviour text to scattered SKILL sections without a map, so non-native hosts miss rate-limit, review, or compaction rules.
+- **failure_mode:** The orchestrator adds new behaviour text to scattered SKILL sections without a map, so non-native hosts miss rate-limit, review, or compaction rules.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Navigation map: behaviour -> SKILL anchor -> protocol/script"
@@ -443,7 +443,7 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **name:** Make autoreview env opt-in
 - **category:** `test-gate`
 - **controller_does:** The maintainer-only autoreview tier stays opt-in behind `GOALFLIGHT_AUTOREVIEW=1` and never becomes part of the default test path.
-- **failure_mode:** The controller makes autoreview mandatory in `./tests/run.sh`, causing regular contributors to depend on an optional maintainer engine.
+- **failure_mode:** The orchestrator makes autoreview mandatory in `./tests/run.sh`, causing regular contributors to depend on an optional maintainer engine.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "GOALFLIGHT_AUTOREVIEW=1 is an optional maintainer tier, not a default review path"
@@ -463,8 +463,8 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **id:** `wave2-scenarios-registered`
 - **name:** Register Wave 2 scenarios
 - **category:** `verification-first-dispatch`
-- **controller_does:** The controller regression harness registers Wave 2 scenarios for draft-goal office hours, vague-goal premise backlog, and context load order.
-- **failure_mode:** The controller lands only the scenario prompt files and forgets assertion registration, so Wave 2 appears present but never runs.
+- **controller_does:** The orchestrator regression harness registers Wave 2 scenarios for draft-goal office hours, vague-goal premise backlog, and context load order.
+- **failure_mode:** The orchestrator lands only the scenario prompt files and forgets assertion registration, so Wave 2 appears present but never runs.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Wave 2 scenarios: draft-goal-office-hours, vague-goal-premise-backlog, context-load-order"
@@ -483,13 +483,13 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 ### Entry: controller-probe-runner-portability
 
 - **id:** `controller-probe-runner-portability`
-- **name:** Keep controller probes portable
+- **name:** Keep orchestrator probes portable
 - **category:** `native-vs-non-native`
-- **controller_does:** Live controller probes use the ACP shim and later multi-controller runner abstractions so host-specific tooling does not leak into portable behaviour tests.
-- **failure_mode:** The controller hard-codes one host's print-mode command in the live probe and declares other controller hosts unsupported by design.
+- **controller_does:** Live orchestrator probes use the ACP shim and later multi-controller runner abstractions so host-specific tooling does not leak into portable behaviour tests.
+- **failure_mode:** The orchestrator hard-codes one host's print-mode command in the live probe and declares other orchestrator hosts unsupported by design.
 - **skill_md_compressed_form:**
     - **kind:** literal
-    - **pattern:** "Controller behaviour probes run through portable host adapters, not host-specific print-mode shortcuts"
+    - **pattern:** "Orchestrator behaviour probes run through portable host adapters, not host-specific print-mode shortcuts"
     - **max_section_lines:** 45
 - **verifier:**
     - **kind:** runtime-assertion
@@ -529,8 +529,8 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **id:** `read-skill-end-to-end-behaviour`
 - **name:** Live-test full skill reading
 - **category:** `skill-load-and-order`
-- **controller_does:** The behaviour scenario proves the controller read past the front matter by requiring use of back-half sections such as Worker Routing, State, and Context Discipline.
-- **failure_mode:** The controller passes a shallow load-order check by quoting the preamble but cannot answer routing or state questions from later SKILL.md sections.
+- **controller_does:** The behaviour scenario proves the orchestrator read past the front matter by requiring use of back-half sections such as Worker Routing, State, and Context Discipline.
+- **failure_mode:** The orchestrator passes a shallow load-order check by quoting the preamble but cannot answer routing or state questions from later SKILL.md sections.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Read this skill end-to-end, including Worker Routing, State, and Context Discipline"
@@ -552,8 +552,8 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **id:** `compaction-reload-skill-behaviour`
 - **name:** Live-test compaction reload
 - **category:** `compaction-and-resume`
-- **controller_does:** The compaction scenario verifies the controller reloads SKILL.md and `commands/resume.md` before continuing an already-active run.
-- **failure_mode:** After compaction, the controller relies on the lossy summary and resumes execution without reloading the active run's skill and resume instructions.
+- **controller_does:** The compaction scenario verifies the orchestrator reloads SKILL.md and `commands/resume.md` before continuing an already-active run.
+- **failure_mode:** After compaction, the orchestrator relies on the lossy summary and resumes execution without reloading the active run's skill and resume instructions.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "fresh `SKILL.md`/`commands/resume.md`, then stay in-skill"
@@ -575,8 +575,8 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **id:** `compaction-reload-in-skill-continuation-behaviour`
 - **name:** Live-test in-skill continuation
 - **category:** `compaction-and-resume`
-- **controller_does:** The compaction continuation scenario verifies the controller stays in Goal Flight after reload by dispatching worker execution and gating chunk review before any commit.
-- **failure_mode:** After compaction, the controller reloads the skill but then falls back to default assistant behaviour such as inline edits, negated worker dispatch, or skipped review before commit.
+- **controller_does:** The compaction continuation scenario verifies the orchestrator stays in Goal Flight after reload by dispatching worker execution and gating chunk review before any commit.
+- **failure_mode:** After compaction, the orchestrator reloads the skill but then falls back to default assistant behaviour such as inline edits, negated worker dispatch, or skipped review before commit.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Active run + compaction: if already in play, invoke `/goal-flight resume` for fresh `SKILL.md`/`commands/resume.md`, then stay in-skill"
@@ -599,8 +599,8 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **id:** `review-flight-at-completion-behaviour`
 - **name:** Live-test completion review
 - **category:** `review-discipline`
-- **controller_does:** The completion scenario verifies the controller dispatches the canonical review path when a chunk is done and before it commits.
-- **failure_mode:** The controller marks a chunk complete and commits it after executor self-review only, with no independent gstack review flight.
+- **controller_does:** The completion scenario verifies the orchestrator dispatches the canonical review path when a chunk is done and before it commits.
+- **failure_mode:** The orchestrator marks a chunk complete and commits it after executor self-review only, with no independent gstack review flight.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "On chunk completion, dispatch gstack `/review` before committing"
@@ -622,11 +622,11 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **id:** `per-host-pointer-for-non-native`
 - **name:** Point non-native hosts to skill
 - **category:** `native-vs-non-native`
-- **controller_does:** SKILL.md and agent instructions include explicit per-host pointers so non-native controllers can find the installed wrapper and load order.
-- **failure_mode:** A non-native controller misses SKILL.md because it only sees host-local front matter and no pointer tells it where the Goal Flight wrapper lives.
+- **controller_does:** SKILL.md and agent instructions include explicit per-host pointers so non-native orchestrators can find the installed wrapper and load order.
+- **failure_mode:** A non-native orchestrator misses SKILL.md because it only sees host-local front matter and no pointer tells it where the Goal Flight wrapper lives.
 - **skill_md_compressed_form:**
     - **kind:** literal
-    - **pattern:** "Per-host pointers tell non-native controllers where their installed wrapper lives"
+    - **pattern:** "Per-host pointers tell non-native orchestrators where their installed wrapper lives"
     - **max_section_lines:** 45
 - **verifier:**
     - **kind:** textual-invariant
@@ -644,11 +644,11 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **id:** `controller-chat-is-requirements-not-inline-editor`
 - **name:** Treat chat as requirements
 - **category:** `chat-discipline`
-- **controller_does:** During an active run, the controller treats user chat as requirements, steering, or architecture input that may update the goal queue or plan before dispatch.
-- **failure_mode:** The controller abandons the current chunk and starts inline-editing a new user ask immediately on receipt, bypassing queue update and reviewer pass.
+- **controller_does:** During an active run, the orchestrator treats user chat as requirements, steering, or architecture input that may update the goal queue or plan before dispatch.
+- **failure_mode:** The orchestrator abandons the current chunk and starts inline-editing a new user ask immediately on receipt, bypassing queue update and reviewer pass.
 - **skill_md_compressed_form:**
     - **kind:** literal
-    - **pattern:** "Controller chat is requirements input, not an inline editor command"
+    - **pattern:** "Orchestrator chat is requirements input, not an inline editor command"
     - **max_section_lines:** 45
 - **verifier:**
     - **kind:** behaviour-scenario
@@ -666,8 +666,8 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **id:** `gstack-review-and-challenge-canonical`
 - **name:** Use canonical review interfaces
 - **category:** `review-discipline`
-- **controller_does:** The controller sends structural and adversarial reviews through gstack `/review` and `/challenge` instead of writing custom review prompts.
-- **failure_mode:** The controller hand-rolls a "please review this diff" worker prompt and treats that direct worker result as equivalent to the canonical gstack review interface.
+- **controller_does:** The orchestrator sends structural and adversarial reviews through gstack `/review` and `/challenge` instead of writing custom review prompts.
+- **failure_mode:** The orchestrator hand-rolls a "please review this diff" worker prompt and treats that direct worker result as equivalent to the canonical gstack review interface.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Reviews go through gstack `/review` and `/challenge`; do not hand-roll review prompts"
@@ -689,8 +689,8 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **id:** `tests-run-green-before-commit`
 - **name:** Require green tests before commit
 - **category:** `test-gate`
-- **controller_does:** The controller waits for focused tests to finish green before creating a commit for a completed chunk.
-- **failure_mode:** The controller starts tests in the background and commits while they are still running, then fixes failures in follow-up commits.
+- **controller_does:** The orchestrator waits for focused tests to finish green before creating a commit for a completed chunk.
+- **failure_mode:** The orchestrator starts tests in the background and commits while they are still running, then fixes failures in follow-up commits.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Before each chunk commit: focused tests green"
@@ -711,8 +711,8 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **id:** `push-explicit-permission-only`
 - **name:** Push only with permission
 - **category:** `push-discipline`
-- **controller_does:** The controller may commit locally as chunks complete but pushes to a remote only after tests pass and the user explicitly permits publish.
-- **failure_mode:** The controller treats local commit permission as push permission and publishes a branch without the user's explicit approval.
+- **controller_does:** The orchestrator may commit locally as chunks complete but pushes to a remote only after tests pass and the user explicitly permits publish.
+- **failure_mode:** The orchestrator treats local commit permission as push permission and publishes a branch without the user's explicit approval.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Push to a remote only after the relevant tests pass and the user has permitted publish"
@@ -734,7 +734,7 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **name:** Preserve executor self-review
 - **category:** `verification-first-dispatch`
 - **controller_does:** Each executor handoff retains the compact seven-category self-review so obvious failures are caught before independent review.
-- **failure_mode:** The controller removes executor self-review from dispatch prompts because gstack will review later, losing the immediate design-rationale check.
+- **failure_mode:** The orchestrator removes executor self-review from dispatch prompts because gstack will review later, losing the immediate design-rationale check.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Executor self-review covers seven categories before handing off a chunk"
@@ -755,8 +755,8 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **id:** `fabricated-approval-rejected`
 - **name:** Reject fabricated approval
 - **category:** `dispatch-discipline`
-- **controller_does:** The controller treats approval, publish permission, and destructive permission as externally supplied facts and never fabricates them to skip a gate.
-- **failure_mode:** The controller writes "user approved" into a plan or status note without a corresponding user message, then uses that invented approval to bypass review or push gates.
+- **controller_does:** The orchestrator treats approval, publish permission, and destructive permission as externally supplied facts and never fabricates them to skip a gate.
+- **failure_mode:** The orchestrator writes "user approved" into a plan or status note without a corresponding user message, then uses that invented approval to bypass review or push gates.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Never invent user approval for a gated step"
@@ -777,8 +777,8 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **id:** `capacity-check-before-spawn`
 - **name:** Consider capacity before spawning
 - **category:** `capacity-and-rate-limits`
-- **controller_does:** Before spawning workers or review jobs, the controller considers existing worker pressure and provider limits rather than treating parallelism as free.
-- **failure_mode:** The controller fans out workers because the queue is long, ignores existing sessions and provider pressure, and triggers avoidable rate-limit stalls.
+- **controller_does:** Before spawning workers or review jobs, the orchestrator considers existing worker pressure and provider limits rather than treating parallelism as free.
+- **failure_mode:** The orchestrator fans out workers because the queue is long, ignores existing sessions and provider pressure, and triggers avoidable rate-limit stalls.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "No worker spawn without capacity consideration"
@@ -799,8 +799,8 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **id:** `worker-markers-status-path-required`
 - **name:** Require worker status paths
 - **category:** `worker-markers`
-- **controller_does:** Every long worker or review job has a durable status path, and the controller treats worker marker lines as compact status rather than conversational prose.
-- **failure_mode:** The controller launches a long job with no status path, then relies on streamed chat output and cannot reconstruct worker state when the session compacts.
+- **controller_does:** Every long worker or review job has a durable status path, and the orchestrator treats worker marker lines as compact status rather than conversational prose.
+- **failure_mode:** The orchestrator launches a long job with no status path, then relies on streamed chat output and cannot reconstruct worker state when the session compacts.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Every long worker or review job needs a ledger/status path"
@@ -821,8 +821,8 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **id:** `state-layers-separated`
 - **name:** Keep three state layers
 - **category:** `state-layers`
-- **controller_does:** The controller separates project state, machine state, and conversation state when resuming, reporting, or dispatching work.
-- **failure_mode:** The controller treats chat memory as the state of record and ignores git, queue files, dispatch ledgers, or cooldown state after resume.
+- **controller_does:** The orchestrator separates project state, machine state, and conversation state when resuming, reporting, or dispatching work.
+- **failure_mode:** The orchestrator treats chat memory as the state of record and ignores git, queue files, dispatch ledgers, or cooldown state after resume.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Use three state layers"
@@ -843,8 +843,8 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **id:** `context-mode-for-analysis`
 - **name:** Use code for large analysis
 - **category:** `context-discipline`
-- **controller_does:** The controller keeps large reads, counts, searches, and comparisons in procedural analysis tools and returns only compact derived answers.
-- **failure_mode:** The controller dumps a raw long file or command output into chat, flooding the context window and forcing later compaction.
+- **controller_does:** The orchestrator keeps large reads, counts, searches, and comparisons in procedural analysis tools and returns only compact derived answers.
+- **failure_mode:** The orchestrator dumps a raw long file or command output into chat, flooding the context window and forcing later compaction.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Analyze/search/count/filter with procedural code or context-mode"
@@ -865,8 +865,8 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **id:** `trigger-codename-hygiene`
 - **name:** Keep trigger names out of git
 - **category:** `trigger-and-codename-hygiene`
-- **controller_does:** The controller maps host aliases and trigger-prone labels to neutral tracked names before creating manifests, filenames, branch names, or commit messages.
-- **failure_mode:** The controller writes a host alias directly into a manifest filename or commit message, making the billing-trigger name git-visible.
+- **controller_does:** The orchestrator maps host aliases and trigger-prone labels to neutral tracked names before creating manifests, filenames, branch names, or commit messages.
+- **failure_mode:** The orchestrator writes a host alias directly into a manifest filename or commit message, making the billing-trigger name git-visible.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Git-visible trigger aliases stay out of filenames, manifests, and commit messages"
@@ -887,8 +887,8 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **id:** `no-print-mode-review-for-live-probes`
 - **name:** Do not fake live probes
 - **category:** `do-not`
-- **controller_does:** The controller keeps live behaviour probes and canonical review dispatches on their documented paths rather than substituting direct print-mode prompts.
-- **failure_mode:** The controller runs a direct print-mode review command, records it as an ACP behaviour probe, and declares the live suite covered.
+- **controller_does:** The orchestrator keeps live behaviour probes and canonical review dispatches on their documented paths rather than substituting direct print-mode prompts.
+- **failure_mode:** The orchestrator runs a direct print-mode review command, records it as an ACP behaviour probe, and declares the live suite covered.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Do not substitute print-mode prompts for live behaviour probes or canonical review dispatch"
@@ -910,8 +910,8 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **id:** `plan-before-inline-edits`
 - **name:** Plan before unsettled edits
 - **category:** `chat-discipline`
-- **controller_does:** When scope or direction is unsettled, the controller writes or updates the plan before editing files inline.
-- **failure_mode:** The controller starts patching from a mid-session steering message, then discovers the user wanted planning, reviewer convergence, or a different chunk boundary first.
+- **controller_does:** When scope or direction is unsettled, the orchestrator writes or updates the plan before editing files inline.
+- **failure_mode:** The orchestrator starts patching from a mid-session steering message, then discovers the user wanted planning, reviewer convergence, or a different chunk boundary first.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Plan before editing when scope is unsettled"
@@ -932,8 +932,8 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **id:** `background-tests-pending`
 - **name:** Treat background tests as pending
 - **category:** `test-gate`
-- **controller_does:** The controller treats a background or in-flight test run as pending until it has read the final result.
-- **failure_mode:** The controller commits while tests are still running, then learns the chunk introduced failures that should have blocked the commit.
+- **controller_does:** The orchestrator treats a background or in-flight test run as pending until it has read the final result.
+- **failure_mode:** The orchestrator commits while tests are still running, then learns the chunk introduced failures that should have blocked the commit.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Background tests are pending until results are read"
@@ -953,8 +953,8 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **id:** `reviewer-misses-regression-tests`
 - **name:** Convert review misses to tests
 - **category:** `review-discipline`
-- **controller_does:** When an independent review misses a concrete defect, the controller turns that miss into a regression guard instead of weakening the review requirement.
-- **failure_mode:** The controller treats a missed host-tool leak as proof that review is useless, rather than adding a test that catches the leak class next time.
+- **controller_does:** When an independent review misses a concrete defect, the orchestrator turns that miss into a regression guard instead of weakening the review requirement.
+- **failure_mode:** The orchestrator treats a missed host-tool leak as proof that review is useless, rather than adding a test that catches the leak class next time.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Reviewer misses become regression tests, not trust exemptions"
@@ -975,8 +975,8 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **id:** `classify-acp-failure-layer`
 - **name:** Classify ACP failure layers
 - **category:** `state-layers`
-- **controller_does:** The controller classifies ACP failures by layer before changing goal-flight code: upstream shim, local config, adapter bridge, or repository regression.
-- **failure_mode:** The controller patches goal-flight for an upstream prompt-readiness timeout or a local MCP approval stall, obscuring the real owner of the failure.
+- **controller_does:** The orchestrator classifies ACP failures by layer before changing goal-flight code: upstream shim, local config, adapter bridge, or repository regression.
+- **failure_mode:** The orchestrator patches goal-flight for an upstream prompt-readiness timeout or a local MCP approval stall, obscuring the real owner of the failure.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Classify ACP failures as upstream, local, or repo"
@@ -997,8 +997,8 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **id:** `controller-direct-plan-marked`
 - **name:** Restrict controller-direct chunks
 - **category:** `dispatch-discipline`
-- **controller_does:** The controller uses controller-direct only for tiny doc/test edits or chunks that the active plan explicitly marks as controller-direct.
-- **failure_mode:** The controller performs implementation directly because dispatch is inconvenient, even though the plan called for worker execution or reviewable chunk isolation.
+- **controller_does:** The orchestrator uses controller-direct only for tiny doc/test edits or chunks that the active plan explicitly marks as controller-direct.
+- **failure_mode:** The orchestrator performs implementation directly because dispatch is inconvenient, even though the plan called for worker execution or reviewable chunk isolation.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Controller-direct only for tiny or plan-marked chunks"
@@ -1019,8 +1019,8 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **id:** `question-prep-before-ask`
 - **name:** Prepare before asking user
 - **category:** `chat-discipline`
-- **controller_does:** Before asking an anticipatory or ambiguous question, the controller uses available context or subagent preparation to narrow it to a high-signal decision.
-- **failure_mode:** The controller asks the user a raw broad question that a quick synthesis pass could have turned into a small set of concrete choices.
+- **controller_does:** Before asking an anticipatory or ambiguous question, the orchestrator uses available context or subagent preparation to narrow it to a high-signal decision.
+- **failure_mode:** The orchestrator asks the user a raw broad question that a quick synthesis pass could have turned into a small set of concrete choices.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Prepare ambiguous questions before asking the user"
@@ -1041,8 +1041,8 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **id:** `rubric-before-wave`
 - **name:** Define review rubric first
 - **category:** `review-discipline`
-- **controller_does:** For a new wave of review or slice building, the controller writes the score rubric before dispatching the first reviewer.
-- **failure_mode:** The controller invents the rubric mid-build, making early review outputs inconsistent with later review expectations.
+- **controller_does:** For a new wave of review or slice building, the orchestrator writes the score rubric before dispatching the first reviewer.
+- **failure_mode:** The orchestrator invents the rubric mid-build, making early review outputs inconsistent with later review expectations.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Write review rubrics before first wave dispatch"
@@ -1062,8 +1062,8 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **id:** `concern-diverse-review`
 - **name:** Diversify review concerns
 - **category:** `review-discipline`
-- **controller_does:** For broad refactors, the controller diversifies reviewer concerns as well as models or providers.
-- **failure_mode:** The controller launches two reviewers with the same lens and misses a cross-domain integrity issue that concern-diverse review would have surfaced.
+- **controller_does:** For broad refactors, the orchestrator diversifies reviewer concerns as well as models or providers.
+- **failure_mode:** The orchestrator launches two reviewers with the same lens and misses a cross-domain integrity issue that concern-diverse review would have surfaced.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Diversify reviewer concern, not just model"
@@ -1084,8 +1084,8 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **id:** `cross-slice-consolidation`
 - **name:** Consolidate across slices
 - **category:** `review-discipline`
-- **controller_does:** The controller runs a single cross-slice consolidation pass when correctness depends on contradictions between independently built slices.
-- **failure_mode:** The controller accepts clean per-slice reviews while missing that two slices encode mutually incompatible invariants.
+- **controller_does:** The orchestrator runs a single cross-slice consolidation pass when correctness depends on contradictions between independently built slices.
+- **failure_mode:** The orchestrator accepts clean per-slice reviews while missing that two slices encode mutually incompatible invariants.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Use consolidation review for cross-slice contradictions"
@@ -1106,8 +1106,8 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **id:** `agents-md-diff-only`
 - **name:** Preserve AGENTS.md authority
 - **category:** `state-layers`
-- **controller_does:** The controller proposes AGENTS.md changes as reviewable diffs and never overwrites the user-owned canonical instructions during init or corpus work.
-- **failure_mode:** The controller silently edits AGENTS.md to match a derived corpus summary, reversing the source-of-truth direction.
+- **controller_does:** The orchestrator proposes AGENTS.md changes as reviewable diffs and never overwrites the user-owned canonical instructions during init or corpus work.
+- **failure_mode:** The orchestrator silently edits AGENTS.md to match a derived corpus summary, reversing the source-of-truth direction.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Propose AGENTS.md changes as diffs only"
@@ -1128,8 +1128,8 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **id:** `build-corpus-eagerly`
 - **name:** Build corpus as audit
 - **category:** `verification-first-dispatch`
-- **controller_does:** The controller treats corpus construction as an early audit of source truth, even when the repository already has maintained instructions.
-- **failure_mode:** The controller skips corpus build because AGENTS.md exists and misses contradictions between the canonical instructions and the enforced tests.
+- **controller_does:** The orchestrator treats corpus construction as an early audit of source truth, even when the repository already has maintained instructions.
+- **failure_mode:** The orchestrator skips corpus build because AGENTS.md exists and misses contradictions between the canonical instructions and the enforced tests.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Build corpus eagerly; it audits source truth"
@@ -1150,8 +1150,8 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **id:** `corpus-primary-sources`
 - **name:** Use primary corpus sources
 - **category:** `verification-first-dispatch`
-- **controller_does:** The controller builds corpus slices from primary source documents rather than from another precis or summary layer.
-- **failure_mode:** The controller lets a slice builder summarize an already-compressed precis, amplifying omissions and turning a brevity choice into a false invariant.
+- **controller_does:** The orchestrator builds corpus slices from primary source documents rather than from another precis or summary layer.
+- **failure_mode:** The orchestrator lets a slice builder summarize an already-compressed precis, amplifying omissions and turning a brevity choice into a false invariant.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Use primary sources, not precis, for corpus slices"
@@ -1172,8 +1172,8 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **id:** `corpus-init-not-inline`
 - **name:** Prebuild corpus, do not inline
 - **category:** `context-discipline`
-- **controller_does:** The controller prebuilds the RAG corpus at init and avoids inlining the full project landscape into every dispatch prompt.
-- **failure_mode:** The controller spends composition budget repeatedly hand-pasting the same landscape, leaving less attention for chunk-specific routing and verification.
+- **controller_does:** The orchestrator prebuilds the RAG corpus at init and avoids inlining the full project landscape into every dispatch prompt.
+- **failure_mode:** The orchestrator spends composition budget repeatedly hand-pasting the same landscape, leaving less attention for chunk-specific routing and verification.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Prebuild corpus; do not inline landscape per dispatch"
@@ -1194,8 +1194,8 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **id:** `typed-dispatch-wrappers`
 - **name:** Type each dispatch wrapper
 - **category:** `dispatch-discipline`
-- **controller_does:** The controller marks dispatches as executor, reviewer, or planner and uses the wrapper shape appropriate to that role.
-- **failure_mode:** The controller gives a reviewer executor context it does not need, or gives a planner a code-writing wrapper that invites implementation drift.
+- **controller_does:** The orchestrator marks dispatches as executor, reviewer, or planner and uses the wrapper shape appropriate to that role.
+- **failure_mode:** The orchestrator gives a reviewer executor context it does not need, or gives a planner a code-writing wrapper that invites implementation drift.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Type dispatches as executor, reviewer, or planner"
@@ -1216,8 +1216,8 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **id:** `dispatch-wrapper-five-layers`
 - **name:** Preserve five-layer prompts
 - **category:** `dispatch-discipline`
-- **controller_does:** The controller constructs executor prompts with the full layered wrapper instead of appending only raw goal text and a self-review pointer.
-- **failure_mode:** The controller sends a short generic task prompt and loses the situational frame, template pointer, file anchors, environment caveats, and specialized self-review.
+- **controller_does:** The orchestrator constructs executor prompts with the full layered wrapper instead of appending only raw goal text and a self-review pointer.
+- **failure_mode:** The orchestrator sends a short generic task prompt and loses the situational frame, template pointer, file anchors, environment caveats, and specialized self-review.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Dispatch prompts need the five-layer wrapper"
@@ -1238,8 +1238,8 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **id:** `self-review-specialize`
 - **name:** Specialize self-review bullets
 - **category:** `verification-first-dispatch`
-- **controller_does:** The controller rewrites portable self-review categories into project-specific nouns, grep patterns, and invariants before dispatch.
-- **failure_mode:** The controller pastes abstract self-review categories unchanged, so the worker checks generic integrity instead of the chunk's actual failure modes.
+- **controller_does:** The orchestrator rewrites portable self-review categories into project-specific nouns, grep patterns, and invariants before dispatch.
+- **failure_mode:** The orchestrator pastes abstract self-review categories unchanged, so the worker checks generic integrity instead of the chunk's actual failure modes.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Specialize self-review bullets to project nouns"
@@ -1260,7 +1260,7 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **id:** `parallel-fix-forbid-lists`
 - **name:** Bound parallel fix ownership
 - **category:** `dispatch-discipline`
-- **controller_does:** The controller gives parallel fix clusters explicit ownership and forbid lists so workers do not race across slices.
+- **controller_does:** The orchestrator gives parallel fix clusters explicit ownership and forbid lists so workers do not race across slices.
 - **failure_mode:** Two workers edit the same module family because their prompts described the bug class but not the files they must avoid.
 - **skill_md_compressed_form:**
     - **kind:** literal
@@ -1282,8 +1282,8 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **id:** `split-large-chunk-scope`
 - **name:** Split broad chunk scopes
 - **category:** `dispatch-discipline`
-- **controller_does:** The controller splits a chunk before dispatch when the likely file count or line delta makes first-shot completion unlikely.
-- **failure_mode:** The controller asks one worker for adapter, tests, and docs in a single broad pass, then needs a corrective follow-up to finish the missed surfaces.
+- **controller_does:** The orchestrator splits a chunk before dispatch when the likely file count or line delta makes first-shot completion unlikely.
+- **failure_mode:** The orchestrator asks one worker for adapter, tests, and docs in a single broad pass, then needs a corrective follow-up to finish the missed surfaces.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Split chunks likely to touch many files"
@@ -1304,8 +1304,8 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **id:** `worker-context-optional`
 - **name:** Keep worker context optional
 - **category:** `context-discipline`
-- **controller_does:** The controller treats worker-context.md as optional when canonical docs and modern context windows are enough.
-- **failure_mode:** The controller mandates a curated worker-context precis, then lets that precis drift from AGENTS.md and other canonical source documents.
+- **controller_does:** The orchestrator treats worker-context.md as optional when canonical docs and modern context windows are enough.
+- **failure_mode:** The orchestrator mandates a curated worker-context precis, then lets that precis drift from AGENTS.md and other canonical source documents.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Keep worker-context optional when canonical docs fit"
@@ -1325,8 +1325,8 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **id:** `source-truth-self-consistency`
 - **name:** Check source-truth consistency
 - **category:** `verification-first-dispatch`
-- **controller_does:** Before building a corpus from multiple canonical inputs, the controller checks for internal contradictions that a slice builder would otherwise choose between silently.
-- **failure_mode:** The controller lets one slice encode a stale AGENTS.md claim while another follows the binding spec, hiding the contradiction until implementation fails.
+- **controller_does:** Before building a corpus from multiple canonical inputs, the orchestrator checks for internal contradictions that a slice builder would otherwise choose between silently.
+- **failure_mode:** The orchestrator lets one slice encode a stale AGENTS.md claim while another follows the binding spec, hiding the contradiction until implementation fails.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Check source-truth contradictions before corpus build"
@@ -1347,8 +1347,8 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **id:** `bounded-dispatch-timeouts`
 - **name:** Bound dispatch hang time
 - **category:** `capacity-and-rate-limits`
-- **controller_does:** The controller gives long-running dispatches explicit idle, quiet, tool, and heartbeat budgets so hangs have a bounded worst case.
-- **failure_mode:** The controller lets goal-mode use a default multi-hour timeout and only discovers a stalled worker after the queue has been wedged for hours.
+- **controller_does:** The orchestrator gives long-running dispatches explicit idle, quiet, tool, and heartbeat budgets so hangs have a bounded worst case.
+- **failure_mode:** The orchestrator lets goal-mode use a default multi-hour timeout and only discovers a stalled worker after the queue has been wedged for hours.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Bound dispatch hangs with idle and quiet timeouts"
@@ -1369,8 +1369,8 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **id:** `heartbeats-file-pull-model`
 - **name:** Keep heartbeats file-based
 - **category:** `worker-markers`
-- **controller_does:** The controller treats heartbeats as runner-written files and wakes only on actionable transitions such as completion, wedge, or blocked state.
-- **failure_mode:** The controller turns every heartbeat into a task notification, repeatedly reprocessing cached session context and flooding its own attention budget.
+- **controller_does:** The orchestrator treats heartbeats as runner-written files and wakes only on actionable transitions such as completion, wedge, or blocked state.
+- **failure_mode:** The orchestrator turns every heartbeat into a task notification, repeatedly reprocessing cached session context and flooding its own attention budget.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Heartbeats are files; wake only on transitions"
@@ -1391,7 +1391,7 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **id:** `noninteractive-mcp-preflight`
 - **name:** Preflight MCP approval stalls
 - **category:** `verification-first-dispatch`
-- **controller_does:** The controller preflights noninteractive worker launches for MCP approval-mode stalls before trusting them as a reliable dispatch path.
+- **controller_does:** The orchestrator preflights noninteractive worker launches for MCP approval-mode stalls before trusting them as a reliable dispatch path.
 - **failure_mode:** A codex exec worker hangs with zero output because local MCP approval gates require interaction that the noninteractive process cannot provide.
 - **skill_md_compressed_form:**
     - **kind:** literal
@@ -1411,13 +1411,13 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 ### Entry: remote-worker-designated-controller
 
 - **id:** `remote-worker-designated-controller`
-- **name:** Keep one designated controller
+- **name:** Keep one designated orchestrator
 - **category:** `state-layers`
-- **controller_does:** In multi-server work, the controller keeps planning, steering, and observation on the designated controller surface while remote nodes execute worker turns.
+- **controller_does:** In multi-server work, the orchestrator keeps planning, steering, and observation on the designated orchestrator surface while remote nodes execute worker turns.
 - **failure_mode:** A remote worker node starts making steering decisions or maintaining its own status truth, splitting authority across machines.
 - **skill_md_compressed_form:**
     - **kind:** literal
-    - **pattern:** "Remote workers execute; controller remains designated surface"
+    - **pattern:** "Remote workers execute; orchestrator remains designated surface"
     - **max_section_lines:** 25
 - **verifier:**
     - **kind:** textual-invariant
@@ -1435,8 +1435,8 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **id:** `single-status-plane`
 - **name:** Preserve one status plane
 - **category:** `state-layers`
-- **controller_does:** The controller keeps one canonical status/register plane across ACP, bash-tail, and gateway transports.
-- **failure_mode:** A gateway transport becomes a second status store, so doctor, status, and controller views disagree about worker state.
+- **controller_does:** The orchestrator keeps one canonical status/register plane across ACP, bash-tail, and gateway transports.
+- **failure_mode:** A gateway transport becomes a second status store, so doctor, status, and orchestrator views disagree about worker state.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Use one status plane across transports"
@@ -1457,11 +1457,11 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **id:** `user-need-controller-relay`
 - **name:** Relay user needs centrally
 - **category:** `chat-discipline`
-- **controller_does:** Workers express USER-NEED or USER-CONFIRM through the controller relay rather than opening a separate chat path to the user.
-- **failure_mode:** A worker asks the user directly, bypassing the controller's queue, status, and approval accounting.
+- **controller_does:** Workers express USER-NEED or USER-CONFIRM through the orchestrator relay rather than opening a separate chat path to the user.
+- **failure_mode:** A worker asks the user directly, bypassing the orchestrator's queue, status, and approval accounting.
 - **skill_md_compressed_form:**
     - **kind:** literal
-    - **pattern:** "Relay USER-NEED through controller, not worker chat"
+    - **pattern:** "Relay USER-NEED through orchestrator, not worker chat"
     - **max_section_lines:** 25
 - **verifier:**
     - **kind:** textual-invariant
@@ -1479,8 +1479,8 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **id:** `phase-gate-before-remote-dispatch`
 - **name:** Gate remote dispatch
 - **category:** `verification-first-dispatch`
-- **controller_does:** The controller blocks remote or fleet dispatch until the relevant phase-gate acceptances are green.
-- **failure_mode:** The controller starts remote workers before the local contracts, status mirror, and allowlist gates are proven, multiplying failures across machines.
+- **controller_does:** The orchestrator blocks remote or fleet dispatch until the relevant phase-gate acceptances are green.
+- **failure_mode:** The orchestrator starts remote workers before the local contracts, status mirror, and allowlist gates are proven, multiplying failures across machines.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "No remote dispatch before phase gate is green"
@@ -1500,13 +1500,13 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 ### Entry: pidfile-isolation-per-controller
 
 - **id:** `pidfile-isolation-per-controller`
-- **name:** Isolate controller pidfiles
+- **name:** Isolate orchestrator pidfiles
 - **category:** `state-layers`
-- **controller_does:** The controller isolates pidfile and run-state directories per active controller session when multiple sessions may dispatch workers.
-- **failure_mode:** Two sessions share the same pidfile directory, causing healthy workers to be misclassified or cleaned up by the wrong controller.
+- **controller_does:** The orchestrator isolates pidfile and run-state directories per active orchestrator session when multiple sessions may dispatch workers.
+- **failure_mode:** Two sessions share the same pidfile directory, causing healthy workers to be misclassified or cleaned up by the wrong orchestrator.
 - **skill_md_compressed_form:**
     - **kind:** literal
-    - **pattern:** "Isolate pidfiles per controller session"
+    - **pattern:** "Isolate pidfiles per orchestrator session"
     - **max_section_lines:** 6
 - **verifier:**
     - **kind:** textual-invariant
@@ -1524,8 +1524,8 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **id:** `learned-rate-pressure-ledger`
 - **name:** Learn rate pressure
 - **category:** `capacity-and-rate-limits`
-- **controller_does:** The controller learns rate-pressure thresholds from ledgered dispatch outcomes instead of relying only on hardcoded provider caps.
-- **failure_mode:** The controller keeps launching at a stale cap after a provider enters capacity triage, because prior rate-limit failures were not persisted into threshold decisions.
+- **controller_does:** The orchestrator learns rate-pressure thresholds from ledgered dispatch outcomes instead of relying only on hardcoded provider caps.
+- **failure_mode:** The orchestrator keeps launching at a stale cap after a provider enters capacity triage, because prior rate-limit failures were not persisted into threshold decisions.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Learn rate pressure from ledger, not constants"
@@ -1544,13 +1544,13 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 ### Entry: controller-provider-conservative
 
 - **id:** `controller-provider-conservative`
-- **name:** Protect controller provider
+- **name:** Protect orchestrator provider
 - **category:** `capacity-and-rate-limits`
-- **controller_does:** The controller probes non-controller providers upward after clean windows but keeps the controller's own provider conservative.
-- **failure_mode:** The controller experiments upward on the same provider that hosts the controller session and burns the user's interactive workday on rate pressure.
+- **controller_does:** The orchestrator probes non-controller providers upward after clean windows but keeps the orchestrator's own provider conservative.
+- **failure_mode:** The orchestrator experiments upward on the same provider that hosts the orchestrator session and burns the user's interactive workday on rate pressure.
 - **skill_md_compressed_form:**
     - **kind:** literal
-    - **pattern:** "Probe workers upward; keep controller provider conservative"
+    - **pattern:** "Probe workers upward; keep orchestrator provider conservative"
     - **max_section_lines:** 25
 - **verifier:**
     - **kind:** textual-invariant
@@ -1573,13 +1573,13 @@ chunk-3a rationale:
 ### Entry: controller-readiness-probes-before-dispatch
 
 - **id:** `controller-readiness-probes-before-dispatch`
-- **name:** Controller readiness gates dispatch
+- **name:** Orchestrator readiness gates dispatch
 - **category:** `dispatch-discipline`
-- **controller_does:** The controller verifies the adapter-declared controller readiness requirements before using that host as the active controller.
-- **failure_mode:** The controller dispatches through a host because the binary exists but skips version, auth, safe-args, or status-contract readiness checks.
+- **controller_does:** The orchestrator verifies the adapter-declared orchestrator readiness requirements before using that host as the active orchestrator.
+- **failure_mode:** The orchestrator dispatches through a host because the binary exists but skips version, auth, safe-args, or status-contract readiness checks.
 - **skill_md_compressed_form:**
     - **kind:** literal
-    - **pattern:** "Controller dispatch waits for declared readiness requirements"
+    - **pattern:** "Orchestrator dispatch waits for declared readiness requirements"
     - **max_section_lines:** 30
 - **verifier:**
     - **kind:** textual-invariant
@@ -1599,13 +1599,13 @@ chunk-3a rationale:
 ### Entry: controller-live-gate-supported-ready
 
 - **id:** `controller-live-gate-supported-ready`
-- **name:** Controller live gate is conjunctive
+- **name:** Orchestrator live gate is conjunctive
 - **category:** `dispatch-discipline`
-- **controller_does:** The controller evaluates the controller live gate as supported capability plus ready local controller state before use.
-- **failure_mode:** The controller treats advertised support as sufficient and ignores a not-ready local controller state.
+- **controller_does:** The orchestrator evaluates the orchestrator live gate as supported capability plus ready local orchestrator state before use.
+- **failure_mode:** The orchestrator treats advertised support as sufficient and ignores a not-ready local orchestrator state.
 - **skill_md_compressed_form:**
     - **kind:** literal
-    - **pattern:** "Controller live gate requires supported capability and ready local state"
+    - **pattern:** "Orchestrator live gate requires supported capability and ready local state"
     - **max_section_lines:** 25
 - **verifier:**
     - **kind:** textual-invariant
@@ -1627,8 +1627,8 @@ chunk-3a rationale:
 - **id:** `worker-live-gate-supported-ready-verified`
 - **name:** Worker live gate verifies transport
 - **category:** `dispatch-discipline`
-- **controller_does:** The controller evaluates the worker live gate as supported capability, ready worker state, and verified requested transport.
-- **failure_mode:** The controller starts a worker with supported capability but without checking local worker readiness or transport verification.
+- **controller_does:** The orchestrator evaluates the worker live gate as supported capability, ready worker state, and verified requested transport.
+- **failure_mode:** The orchestrator starts a worker with supported capability but without checking local worker readiness or transport verification.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Worker live gate also requires requested transport verified"
@@ -1653,8 +1653,8 @@ chunk-3a rationale:
 - **id:** `discovery-probe-budget-bounded`
 - **name:** Discovery probes stay bounded
 - **category:** `verification-first-dispatch`
-- **controller_does:** The controller keeps adapter discovery within the manifest budget for path, version, help, time, stdout, and stderr probes.
-- **failure_mode:** The controller loops through unbounded path probes or streams full help output while trying to discover a host.
+- **controller_does:** The orchestrator keeps adapter discovery within the manifest budget for path, version, help, time, stdout, and stderr probes.
+- **failure_mode:** The orchestrator loops through unbounded path probes or streams full help output while trying to discover a host.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Discovery probes stay within manifest budget caps"
@@ -1679,8 +1679,8 @@ chunk-3a rationale:
 - **id:** `discovery-probes-no-network-model`
 - **name:** Discovery probes are non-consuming
 - **category:** `dispatch-discipline`
-- **controller_does:** The controller runs setup discovery probes only when they are non-network and non-model-consuming by default.
-- **failure_mode:** The controller burns model quota or performs network discovery while merely checking whether an adapter can run.
+- **controller_does:** The orchestrator runs setup discovery probes only when they are non-network and non-model-consuming by default.
+- **failure_mode:** The orchestrator burns model quota or performs network discovery while merely checking whether an adapter can run.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Discovery probes do not use network or model calls"
@@ -1705,11 +1705,11 @@ chunk-3a rationale:
 - **id:** `permission-forbidden-shell-families`
 - **name:** Forbidden shell families stay blocked
 - **category:** `do-not`
-- **controller_does:** The controller rejects shell commands from adapter-forbidden families such as permission bypass, destructive reset, raw web fetch, or unchecked long output.
-- **failure_mode:** The controller allows a raw web fetch or permission-bypass shell command because it is syntactically valid shell.
+- **controller_does:** The orchestrator rejects shell commands from adapter-forbidden families such as permission bypass, destructive reset, raw web fetch, or unchecked long output.
+- **failure_mode:** The orchestrator allows a raw web fetch or permission-bypass shell command because it is syntactically valid shell.
 - **skill_md_compressed_form:**
     - **kind:** literal
-    - **pattern:** "Forbidden shell families never enter controller dispatch"
+    - **pattern:** "Forbidden shell families never enter orchestrator dispatch"
     - **max_section_lines:** 30
 - **verifier:**
     - **kind:** textual-invariant
@@ -1731,8 +1731,8 @@ chunk-3a rationale:
 - **id:** `auto-approve-scans-strict-fail`
 - **name:** Auto-approve detection fails closed
 - **category:** `do-not`
-- **controller_does:** The controller treats adapter auto-approve detection probes as strict-fail safety checks, not warnings.
-- **failure_mode:** The controller logs an auto-approve flag finding but proceeds with a worker launch anyway.
+- **controller_does:** The orchestrator treats adapter auto-approve detection probes as strict-fail safety checks, not warnings.
+- **failure_mode:** The orchestrator logs an auto-approve flag finding but proceeds with a worker launch anyway.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Auto-approve detection is strict-fail, not advisory"
@@ -1757,8 +1757,8 @@ chunk-3a rationale:
 - **id:** `irreversible-ops-user-gated`
 - **name:** Irreversible operations need a gate
 - **category:** `do-not`
-- **controller_does:** The controller blocks or separately gates adapter-declared irreversible operations before execution.
-- **failure_mode:** The controller runs `git reset --hard`, force-push, `rm -rf`, or credential deletion from generated automation without an explicit user gate.
+- **controller_does:** The orchestrator blocks or separately gates adapter-declared irreversible operations before execution.
+- **failure_mode:** The orchestrator runs `git reset --hard`, force-push, `rm -rf`, or credential deletion from generated automation without an explicit user gate.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Irreversible operations require explicit user gate"
@@ -1783,8 +1783,8 @@ chunk-3a rationale:
 - **id:** `secrets-stay-out-of-probes`
 - **name:** Secrets never leak through probes
 - **category:** `do-not`
-- **controller_does:** The controller keeps adapter-declared secret variables out of probe output, generated wrappers, checked-in configs, and logs.
-- **failure_mode:** The controller copies an API token name or value into a committed wrapper or probe transcript.
+- **controller_does:** The orchestrator keeps adapter-declared secret variables out of probe output, generated wrappers, checked-in configs, and logs.
+- **failure_mode:** The orchestrator copies an API token name or value into a committed wrapper or probe transcript.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Secrets stay out of probes, wrappers, and logs"
@@ -1809,8 +1809,8 @@ chunk-3a rationale:
 - **id:** `forbidden-exec-args-rejected-everywhere`
 - **name:** Forbidden exec args are global rejects
 - **category:** `do-not`
-- **controller_does:** The controller rejects adapter-forbidden exec arguments in invocation, probes, generated wrappers, and checked-in configs.
-- **failure_mode:** The controller removes a forbidden flag from live invocation but leaves it in a generated wrapper or committed adapter config.
+- **controller_does:** The orchestrator rejects adapter-forbidden exec arguments in invocation, probes, generated wrappers, and checked-in configs.
+- **failure_mode:** The orchestrator removes a forbidden flag from live invocation but leaves it in a generated wrapper or committed adapter config.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Forbidden exec args are rejected in every dispatch surface"
@@ -1835,8 +1835,8 @@ chunk-3a rationale:
 - **id:** `risky-exec-args-need-justification`
 - **name:** Risky exec args require justification
 - **category:** `do-not`
-- **controller_does:** The controller requires explicit justification before using adapter-declared risky exec arguments such as bare, auto, force, or approval-bypass modes.
-- **failure_mode:** The controller silently adds `--auto`, `--bare`, `--force`, or a headless approval-bypass mode to a worker command.
+- **controller_does:** The orchestrator requires explicit justification before using adapter-declared risky exec arguments such as bare, auto, force, or approval-bypass modes.
+- **failure_mode:** The orchestrator silently adds `--auto`, `--bare`, `--force`, or a headless approval-bypass mode to a worker command.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Risky exec args need explicit justification before use"
@@ -1861,8 +1861,8 @@ chunk-3a rationale:
 - **id:** `abstract-tool-map-host-specific`
 - **name:** Abstract tools map through manifests
 - **category:** `worker-routing-defaults`
-- **controller_does:** The controller resolves abstract tool roles through each adapter's host-specific tool name map before dispatching instructions.
-- **failure_mode:** The controller tells a worker to call a generic tool name that does not exist on that host.
+- **controller_does:** The orchestrator resolves abstract tool roles through each adapter's host-specific tool name map before dispatching instructions.
+- **failure_mode:** The orchestrator tells a worker to call a generic tool name that does not exist on that host.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Abstract tool roles resolve through host tool-name maps"
@@ -1887,8 +1887,8 @@ chunk-3a rationale:
 - **id:** `same-provider-policy-routing`
 - **name:** Provider trust policy shapes routing
 - **category:** `worker-routing-defaults`
-- **controller_does:** The controller applies the adapter provider policy when choosing review or worker routes, especially same-provider self-review restrictions.
-- **failure_mode:** The controller accepts same-provider self-review despite a manifest policy that forbids it or requires cross-provider review.
+- **controller_does:** The orchestrator applies the adapter provider policy when choosing review or worker routes, especially same-provider self-review restrictions.
+- **failure_mode:** The orchestrator accepts same-provider self-review despite a manifest policy that forbids it or requires cross-provider review.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Same-provider policy controls review routing trust"
@@ -1913,8 +1913,8 @@ chunk-3a rationale:
 - **id:** `repo-files-canonical-memory-backend`
 - **name:** Repo files win memory drift
 - **category:** `state-layers`
-- **controller_does:** The controller treats repository files as the canonical memory backend and warns while preferring repo state on drift.
-- **failure_mode:** The controller overwrites repo files from cached memory or treats memory as more authoritative than checked-in state.
+- **controller_does:** The orchestrator treats repository files as the canonical memory backend and warns while preferring repo state on drift.
+- **failure_mode:** The orchestrator overwrites repo files from cached memory or treats memory as more authoritative than checked-in state.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Repository files are the canonical memory backend"
@@ -1939,8 +1939,8 @@ chunk-3a rationale:
 - **id:** `memory-writeback-lock-required`
 - **name:** Memory writeback needs a lock
 - **category:** `state-layers`
-- **controller_does:** The controller writes back to a memory backend only when the adapter's migration lock requirement is satisfied.
-- **failure_mode:** The controller writes memory-derived state during a migration without acquiring or verifying the required writeback lock.
+- **controller_does:** The orchestrator writes back to a memory backend only when the adapter's migration lock requirement is satisfied.
+- **failure_mode:** The orchestrator writes memory-derived state during a migration without acquiring or verifying the required writeback lock.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Memory writeback requires migration lock ownership"
@@ -1965,8 +1965,8 @@ chunk-3a rationale:
 - **id:** `status-contract-heartbeats-required`
 - **name:** Live workers need heartbeats
 - **category:** `worker-markers`
-- **controller_does:** The controller requires heartbeat-capable status markers for live workers according to the adapter status contract.
-- **failure_mode:** The controller launches a long-running worker without requiring heartbeat markers, leaving no reliable stale-worker signal.
+- **controller_does:** The orchestrator requires heartbeat-capable status markers for live workers according to the adapter status contract.
+- **failure_mode:** The orchestrator launches a long-running worker without requiring heartbeat markers, leaving no reliable stale-worker signal.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Status contract requires heartbeat markers for live workers"
@@ -1991,8 +1991,8 @@ chunk-3a rationale:
 - **id:** `stale-after-threshold-enforced`
 - **name:** Stale thresholds are adapter-owned
 - **category:** `worker-markers`
-- **controller_does:** The controller uses each adapter's stale-after threshold when deciding whether a worker marker has gone stale.
-- **failure_mode:** The controller hardcodes one stale timeout across all hosts and misclassifies a slower adapter as wedged.
+- **controller_does:** The orchestrator uses each adapter's stale-after threshold when deciding whether a worker marker has gone stale.
+- **failure_mode:** The orchestrator hardcodes one stale timeout across all hosts and misclassifies a slower adapter as wedged.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Stale workers trip on manifest stale-after thresholds"
@@ -2017,8 +2017,8 @@ chunk-3a rationale:
 - **id:** `terminal-states-closed-set`
 - **name:** Terminal states come from manifests
 - **category:** `worker-markers`
-- **controller_does:** The controller treats adapter terminal states as the closed set for status completion and failure classification.
-- **failure_mode:** The controller invents an unregistered terminal state or ignores a manifest-declared terminal state.
+- **controller_does:** The orchestrator treats adapter terminal states as the closed set for status completion and failure classification.
+- **failure_mode:** The orchestrator invents an unregistered terminal state or ignores a manifest-declared terminal state.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Terminal states are closed manifest values"
@@ -2043,8 +2043,8 @@ chunk-3a rationale:
 - **id:** `marker-namespace-grammar`
 - **name:** Marker namespace is fixed grammar
 - **category:** `worker-markers`
-- **controller_does:** The controller emits worker markers using the adapter status namespace grammar for dispatch id, transport, and sequence.
-- **failure_mode:** The controller writes ad hoc marker names that cannot be correlated by dispatch id or transport.
+- **controller_does:** The orchestrator emits worker markers using the adapter status namespace grammar for dispatch id, transport, and sequence.
+- **failure_mode:** The orchestrator writes ad hoc marker names that cannot be correlated by dispatch id or transport.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Worker markers use goalflight dispatch transport sequence grammar"
@@ -2069,8 +2069,8 @@ chunk-3a rationale:
 - **id:** `default-agent-caps-enforced`
 - **name:** Default agent caps constrain dispatch
 - **category:** `capacity-and-rate-limits`
-- **controller_does:** The controller applies the capacity script's default per-agent caps when no explicit narrower agent cap is supplied.
-- **failure_mode:** The controller launches unbounded workers for a provider because no per-run cap override was passed.
+- **controller_does:** The orchestrator applies the capacity script's default per-agent caps when no explicit narrower agent cap is supplied.
+- **failure_mode:** The orchestrator launches unbounded workers for a provider because no per-run cap override was passed.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Capacity checks apply default per-agent caps"
@@ -2090,8 +2090,8 @@ chunk-3a rationale:
 - **id:** `capacity-acquire-wait-reasons`
 - **name:** Capacity acquire fails closed
 - **category:** `capacity-and-rate-limits`
-- **controller_does:** The controller obeys capacity acquire wait decisions for cooldowns, machine worker caps, agent worker caps, and RSS budget pressure.
-- **failure_mode:** The controller receives a wait decision from capacity acquire but spawns anyway because it only checked total worker count.
+- **controller_does:** The orchestrator obeys capacity acquire wait decisions for cooldowns, machine worker caps, agent worker caps, and RSS budget pressure.
+- **failure_mode:** The orchestrator receives a wait decision from capacity acquire but spawns anyway because it only checked total worker count.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Capacity acquire waits on machine, agent, RSS, or cooldown pressure"
@@ -2111,8 +2111,8 @@ chunk-3a rationale:
 - **id:** `terminal-lease-lifecycle-pruned`
 - **name:** Terminal leases leave active capacity
 - **category:** `capacity-and-rate-limits`
-- **controller_does:** The controller relies on the capacity lease lifecycle so released, expired, complete, failed, wedged, timeout, and legacy oversized-result leases do not count as active forever.
-- **failure_mode:** The controller counts terminal lease records as active capacity and starves later dispatches.
+- **controller_does:** The orchestrator relies on the capacity lease lifecycle so released, expired, complete, failed, wedged, timeout, and legacy oversized-result leases do not count as active forever.
+- **failure_mode:** The orchestrator counts terminal lease records as active capacity and starves later dispatches.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Terminal leases leave active capacity after completion"
@@ -2132,8 +2132,8 @@ chunk-3a rationale:
 - **id:** `ledger-pid-plus-process-identity`
 - **name:** Ledger liveness uses process identity
 - **category:** `state-layers`
-- **controller_does:** The controller records and checks PID plus process identity fields rather than trusting PID alone for ledger liveness.
-- **failure_mode:** The controller treats a reused PID as the original worker and reports a dead or unrelated process as live.
+- **controller_does:** The orchestrator records and checks PID plus process identity fields rather than trusting PID alone for ledger liveness.
+- **failure_mode:** The orchestrator treats a reused PID as the original worker and reports a dead or unrelated process as live.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Ledger liveness matches PID plus process identity"
@@ -2153,8 +2153,8 @@ chunk-3a rationale:
 - **id:** `acp-permit-file-ipc-contract`
 - **name:** Inline permits use file IPC
 - **category:** `do-not`
-- **controller_does:** The controller handles inline permission authorization through the request, decision, and ack file IPC contract.
-- **failure_mode:** The controller bypasses the permit exchange with an implicit allow, hidden auto-approval, or direct denial-and-redispatch loop.
+- **controller_does:** The orchestrator handles inline permission authorization through the request, decision, and ack file IPC contract.
+- **failure_mode:** The orchestrator bypasses the permit exchange with an implicit allow, hidden auto-approval, or direct denial-and-redispatch loop.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Inline permits use request, decision, and ack files"
@@ -2174,8 +2174,8 @@ chunk-3a rationale:
 - **id:** `install-actions-user-gate-backups`
 - **name:** Install actions are gated and backed up
 - **category:** `do-not`
-- **controller_does:** The controller honors manifest install actions only when user gates and backup paths are present for mutable user files.
-- **failure_mode:** The controller overwrites a user-level agent file during setup without a user gate or backup path.
+- **controller_does:** The orchestrator honors manifest install actions only when user gates and backup paths are present for mutable user files.
+- **failure_mode:** The orchestrator overwrites a user-level agent file during setup without a user gate or backup path.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Install actions need user gates and backup paths"
@@ -2201,11 +2201,11 @@ chunk-3a rationale:
 - **id:** `worker-escalate-not-bypass`
 - **name:** Workers escalate sandbox/permission blocks, not bypass
 - **category:** `worker-markers`
-- **controller_does:** When a dispatched worker hits a sandbox, permission, hook, or tool-availability block during its task, the worker returns to the controller with a `BLOCKED:` marker plus the block detail and a recommended controller action, rather than executing a workaround (alternate APIs, git plumbing, inline content dumps for blocked file-writes). The controller decides whether the workaround is appropriate.
-- **failure_mode:** Worker hits a block, rationalizes a workaround, completes via the alternate path. Concrete anti-patterns from the 2026-05-28 session: a worker whose `git commit` hit a `/dev/null` sandbox quirk published a commit via the GitHub Git Data API and self-pushed `main`; a worker whose findings-file write was rejected returned the ~5KB report inline, defeating the file-backed-return contract. In both cases the controller never got to decide whether the workaround was appropriate, and unauthorized state changes (push, inline payload dumps) landed.
+- **controller_does:** When a dispatched worker hits a sandbox, permission, hook, or tool-availability block during its task, the worker returns to the orchestrator with a `BLOCKED:` marker plus the block detail and a recommended orchestrator action, rather than executing a workaround (alternate APIs, git plumbing, inline content dumps for blocked file-writes). The orchestrator decides whether the workaround is appropriate.
+- **failure_mode:** Worker hits a block, rationalizes a workaround, completes via the alternate path. Concrete anti-patterns from the 2026-05-28 session: a worker whose `git commit` hit a `/dev/null` sandbox quirk published a commit via the GitHub Git Data API and self-pushed `main`; a worker whose findings-file write was rejected returned the ~5KB report inline, defeating the file-backed-return contract. In both cases the orchestrator never got to decide whether the workaround was appropriate, and unauthorized state changes (push, inline payload dumps) landed.
 - **skill_md_compressed_form:**
     - **kind:** literal
-    - **pattern:** "Workers escalate sandbox / permission / tool blocks via `BLOCKED:` and return to the controller. They do NOT execute workarounds"
+    - **pattern:** "Workers escalate sandbox / permission / tool blocks via `BLOCKED:` and return to the orchestrator. They do NOT execute workarounds"
     - **max_section_lines:** 37
 - **verifier:**
     - **kind:** textual-invariant
@@ -2228,8 +2228,8 @@ chunk-3a rationale:
 - **id:** `goal-loop-is-the-default-for-convergence-heavy-implementation`
 - **name:** Goal-loop is default for convergence-heavy implementation
 - **category:** `worker-routing-defaults`
-- **controller_does:** The controller routes substantive multi-step implementation by work shape: controller-direct only for tiny or judgment-heavy edits, one-shot dispatch for a single bounded task, and a goal-loop for work that must iterate until tests pass and self-review is clean.
-- **failure_mode:** The controller keeps iterative implementation in its own context because it already has some local state, then spends repeated edit/test turns on work that should have been delegated as a converging loop.
+- **controller_does:** The orchestrator routes substantive multi-step implementation by work shape: controller-direct only for tiny or judgment-heavy edits, one-shot dispatch for a single bounded task, and a goal-loop for work that must iterate until tests pass and self-review is clean.
+- **failure_mode:** The orchestrator keeps iterative implementation in its own context because it already has some local state, then spends repeated edit/test turns on work that should have been delegated as a converging loop.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Goal-loop is default for convergence-heavy implementation; one-shot is single bounded work; controller-direct only tiny/judgment."
@@ -2254,7 +2254,7 @@ chunk-3a rationale:
 - **name:** Convergence lives in the loop
 - **category:** `autonomous-throughput-and-status`
 - **controller_does:** A goal-loop worker owns the plan/act/test/self-review cycle and returns only after the agreed gates pass or a real blocker is emitted.
-- **failure_mode:** The worker returns a draft after one edit, forcing the controller to absorb review findings, rerun tests, and hand-iterate the convergence cycle in conversation.
+- **failure_mode:** The worker returns a draft after one edit, forcing the orchestrator to absorb review findings, rerun tests, and hand-iterate the convergence cycle in conversation.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Goal-loop returns converged result, never draft: plan/act/test/self-review until green."
@@ -2276,13 +2276,13 @@ chunk-3a rationale:
 ### Entry: controller-context-is-the-scarce-resource
 
 - **id:** `controller-context-is-the-scarce-resource`
-- **name:** Controller context is the scarce resource
+- **name:** Orchestrator context is the scarce resource
 - **category:** `context-discipline`
-- **controller_does:** The controller protects its own conversation window by delegating repeated edit/test/review-fold cycles and reading back compact, converged conclusions.
-- **failure_mode:** The controller treats local context as free, performs every iteration itself, and turns recoverable worker churn into unrecoverable controller-context bloat.
+- **controller_does:** The orchestrator protects its own conversation window by delegating repeated edit/test/review-fold cycles and reading back compact, converged conclusions.
+- **failure_mode:** The orchestrator treats local context as free, performs every iteration itself, and turns recoverable worker churn into unrecoverable controller-context bloat.
 - **skill_md_compressed_form:**
     - **kind:** literal
-    - **pattern:** "Controller context is scarce; delegate iteration so only the converged conclusion returns."
+    - **pattern:** "Orchestrator context is scarce; delegate iteration so only the converged conclusion returns."
     - **max_section_lines:** 20
 - **verifier:**
     - **kind:** textual-invariant
@@ -2303,8 +2303,8 @@ chunk-3a rationale:
 - **id:** `reviews-one-shot-fixes-looped`
 - **name:** Reviews are one-shot; fixes are looped
 - **category:** `review-discipline`
-- **controller_does:** The controller dispatches review as a bounded one-shot judgment task, then routes the fix/test/re-review response cycle as loop-shaped implementation work when findings require convergence.
-- **failure_mode:** The controller goal-loops review generation itself or, after receiving findings, hand-edits the response through repeated local fix/test turns.
+- **controller_does:** The orchestrator dispatches review as a bounded one-shot judgment task, then routes the fix/test/re-review response cycle as loop-shaped implementation work when findings require convergence.
+- **failure_mode:** The orchestrator goal-loops review generation itself or, after receiving findings, hand-edits the response through repeated local fix/test turns.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Reviews are one-shot; fixes loop to green and re-review."
@@ -2328,8 +2328,8 @@ chunk-3a rationale:
 - **id:** `three-edit-cycle-controller-direct-anti-pattern`
 - **name:** More than three edit/test cycles is controller-direct smell
 - **category:** `do-not`
-- **controller_does:** When the controller notices it has crossed roughly three edit/test cycles on one chunk, it stops hand-iterating and delegates the rest as a goal-loop.
-- **failure_mode:** The controller keeps applying patches and rerunning tests in its own context after the work has revealed itself as convergence-heavy.
+- **controller_does:** When the orchestrator notices it has crossed roughly three edit/test cycles on one chunk, it stops hand-iterating and delegates the rest as a goal-loop.
+- **failure_mode:** The orchestrator keeps applying patches and rerunning tests in its own context after the work has revealed itself as convergence-heavy.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Do not hand-iterate (>~3 edit/test cycles) what a goal-loop should converge."
@@ -2353,8 +2353,8 @@ chunk-3a rationale:
 - **id:** `never-pgrep-for-worker-liveness`
 - **name:** Never pgrep for dispatched worker liveness
 - **category:** `state-layers`
-- **controller_does:** The controller checks a dispatched worker through identity-aware status surfaces keyed by dispatch identity, status files, watcher state, or ledger records.
-- **failure_mode:** The controller runs `pgrep` against a worker engine name and matches an unrelated process, then treats that process as the dispatched worker's liveness signal.
+- **controller_does:** The orchestrator checks a dispatched worker through identity-aware status surfaces keyed by dispatch identity, status files, watcher state, or ledger records.
+- **failure_mode:** The orchestrator runs `pgrep` against a worker engine name and matches an unrelated process, then treats that process as the dispatched worker's liveness signal.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Never `pgrep` for worker liveness; use dispatch/status identity."
@@ -2380,8 +2380,8 @@ chunk-3a rationale:
 - **id:** `dispatch-cli-worker-via-one-crash-safe-command`
 - **name:** Dispatch CLI workers through one crash-safe command
 - **category:** `dispatch-discipline`
-- **controller_does:** The controller launches a CLI worker through the crash-safe dispatch wrapper so the detached worker, watcher, reaper, and terminal-state propagation stay coupled.
-- **failure_mode:** The controller backgrounds a raw worker exec directly, loses terminal-state wakeup, and leaves the workflow hung after the worker exits.
+- **controller_does:** The orchestrator launches a CLI worker through the crash-safe dispatch wrapper so the detached worker, watcher, reaper, and terminal-state propagation stay coupled.
+- **failure_mode:** The orchestrator backgrounds a raw worker exec directly, loses terminal-state wakeup, and leaves the workflow hung after the worker exits.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Dispatch CLI workers via `scripts/goalflight_dispatch.py`, never bare background exec."

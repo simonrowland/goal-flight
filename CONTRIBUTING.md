@@ -1,6 +1,6 @@
 # Contributing to goal-flight
 
-Thanks for helping improve goal-flight — a portable multi-agent controller skill
+Thanks for helping improve goal-flight — a portable multi-agent orchestrator skill
 (Markdown commands + Python scripts) with host adapters for Claude Code, Codex,
 Cursor, and OpenCode.
 
@@ -8,7 +8,7 @@ Cursor, and OpenCode.
 
 Good contributions:
 
-- Controller workflow fixes in `SKILL.md`, `commands/*.md`, and `protocols/*.md`
+- Orchestrator workflow fixes in `SKILL.md`, `commands/*.md`, and `protocols/*.md`
 - Procedural runtime improvements in `scripts/goalflight_*.py`
 - Host-specific helpers under `scripts/hosts/<host>/` (keep host logic out of the
   portable core when possible)
@@ -20,7 +20,7 @@ Good contributions:
 Out of scope for this repository:
 
 - Private per-project runtime state (`docs-private/` contents on target repos)
-- One-off notes from a local controller run
+- One-off notes from a local orchestrator run
 - Changes that only make sense for a single downstream project without a
   portable rationale
 
@@ -92,7 +92,7 @@ Exit code from `./tests/run.sh` equals the number of failed test files.
 ## Code conventions
 
 - Match existing style: small focused scripts, argparse CLIs, compact JSON
-  output, short human checklists for the controller to read.
+  output, short human checklists for the orchestrator to read.
 - Keep diffs minimal. Fix the root cause; do not refactor unrelated code in the
   same change.
 - Portable core lives in `SKILL.md`, `commands/`, `protocols/`, and
@@ -123,7 +123,7 @@ write alias names directly into tracked JSON paths.
 env caveats, resume notes, review jobs, and similar artifacts. In downstream
 projects it must stay gitignored.
 
-Do **not** commit private project notes, local probe dumps, or controller
+Do **not** commit private project notes, local probe dumps, or orchestrator
 scratch into this skill repository. Public docs (`docs/`, `README.md`) describe
 shipped behavior; they do not replace private runtime files.
 

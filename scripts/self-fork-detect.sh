@@ -6,9 +6,9 @@
 # Claude Code's `/fork` (or CLI `--fork-session`) creates a new session that
 # inherits the parent's conversation history but gets a new session ID. The
 # `CLAUDE_CODE_SESSION_ID` env var inside the fork reflects the NEW ID. This
-# lets a session distinguish "I'm the original controller" from "I'm a fork
+# lets a session distinguish "I'm the original orchestrator" from "I'm a fork
 # branched off to execute a delegated task" by comparing the current env var
-# to a marker the controller wrote before forking.
+# to a marker the orchestrator wrote before forking.
 #
 # Empirical findings (May 2026, codex CLI 2.1.x):
 #   - /fork creates new session ID (env var changes; JSONL is top-level sibling).
@@ -29,7 +29,7 @@
 #
 #   self-fork-detect.sh detect [<contract-path>]
 #       Reads the contract and prints one of:
-#         ORIGINAL    — env matches controller_session_id; I'm the controller.
+#         ORIGINAL    — env matches controller_session_id; I'm the orchestrator.
 #         FORK        — env differs; I'm a fork. The task line is also printed.
 #         SUBAGENT    — env matches BUT my JSONL is in subagents/. Don't act
 #                       on the contract; you're not the agent it was written for.
@@ -37,8 +37,8 @@
 #
 #   self-fork-detect.sh find-fork [<contract-path>]
 #       List top-level JSONLs that didn't exist when `write` was called
-#       and aren't the controller's own session. These are the fork
-#       candidates the controller can monitor. Prints one path per line
+#       and aren't the orchestrator's own session. These are the fork
+#       candidates the orchestrator can monitor. Prints one path per line
 #       (most-recently-modified first). Empty output = no forks detected
 #       yet (either user hasn't /fork-ed, or fork is too new to have its
 #       JSONL flushed — wait 1-2s and retry).
@@ -62,7 +62,7 @@
 #       replies — the fork's prior conversation is cached prefix; only
 #       the reply turn + response are new tokens.
 #
-#       Cheaper still: `/rewind` + redo in the controller, or have the
+#       Cheaper still: `/rewind` + redo in the orchestrator, or have the
 #       user reply in the fork window directly. Pick per context.
 #
 #   self-fork-detect.sh clear [<contract-path>]
@@ -102,7 +102,7 @@ if os.path.isdir(projects_root):
 
 # The fork has no clean "return value" channel like Agent-tool's task-notification.
 # Forks communicate back by EMITTING KEYWORD MARKERS in their assistant text,
-# which the controller's `monitor` mode greps from the fork's JSONL. Both ends
+# which the orchestrator's `monitor` mode greps from the fork's JSONL. Both ends
 # need to agree on the vocabulary — that's what marker_vocabulary captures.
 marker_vocabulary = {
     "FORK-STATUS": "intermediate progress; controller logs but keeps monitoring. Example: 'FORK-STATUS: read 3 files, drafting plan'",
@@ -280,8 +280,8 @@ PY
 
     # Subagent disambiguation: if my CLAUDE_CODE_SESSION_ID matches the marker
     # AND there's recent (<60s) activity under any subagents/ subdir, I'm
-    # probably a subagent, not the controller. Heuristic; race-prone if
-    # multiple subagents fire simultaneously, but the common case (controller
+    # probably a subagent, not the orchestrator. Heuristic; race-prone if
+    # multiple subagents fire simultaneously, but the common case (orchestrator
     # idle while subagent runs) works.
     RECENT_SUBAGENT_ACTIVITY=$(find "$HOME/.claude/projects" -path "*/subagents/*.jsonl" -mmin -1 2>/dev/null | head -1)
 

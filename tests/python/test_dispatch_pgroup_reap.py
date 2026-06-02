@@ -139,7 +139,7 @@ def case_reap_safe_on_bad_pidfile() -> None:
 
 
 def case_guard_skips_own_pgroup() -> None:
-    # If the recorded pgid is the controller's OWN group AND equals worker_pid
+    # If the recorded pgid is the orchestrator's OWN group AND equals worker_pid
     # (passing the invariant), the reaper must still skip -- otherwise killpg would
     # SIGTERM this test process. Surviving past the call proves the guard fired.
     with tempfile.TemporaryDirectory() as td:

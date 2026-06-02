@@ -383,10 +383,11 @@ def test_instruction_split_contract() -> None:
     # contract, canonical post-compaction reload order, in-flight monitoring
     # worked commands, permission-pattern warning, stale-wrapper warning,
     # dangerous-bypass context fence) plus file-backed context-protection
-    # dispatch rules. Catches future feature-add bloat.
+    # dispatch rules; 2026-06-02 orchestrator-rebrand byte bump. Catches
+    # future feature-add bloat.
     assert_true(
-        f"SKILL under 26KB (got {len(skill.encode())}B)",
-        len(skill.encode()) <= 26_000,
+        f"SKILL under 26.3KB (got {len(skill.encode())}B)",
+        len(skill.encode()) <= 26_300,
     )
     for protocol in [
         "session-preflight.md",
@@ -1218,7 +1219,7 @@ def test_dispatched_worker_recovery_protocol_present() -> None:
 
     Memorialized in commit 2a662aa: when a dispatched worker blocks
     mid-chunk (typically on a permission elicitation or a wedged review),
-    the controller takes over by reading status JSON, running gates,
+    the orchestrator takes over by reading status JSON, running gates,
     reviewing controller-side, staging the worker's scope explicitly,
     and committing with worker attribution. Without this protocol the
     failure mode is silent stalling.

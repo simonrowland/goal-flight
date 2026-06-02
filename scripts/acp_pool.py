@@ -3,7 +3,7 @@
 Two pieces:
 
 1. `managed_pool()` — async context manager that wires SIGINT/SIGTERM/atexit
-   handlers to call `pool.shutdown()` so controller crashes don't orphan
+   handlers to call `pool.shutdown()` so orchestrator crashes don't orphan
    workers (beyond what `cleanup_ghosts()` on next start can handle).
 2. `compute_pool_ceiling()` — reads `docs-private/env-caveats.md` for box RAM,
    computes a `max_processes` ceiling using the worst-case worker RSS budget,
@@ -21,7 +21,7 @@ async with managed_pool(agents_config, env_caveats_path=Path("docs-private/env-c
 ```
 
 Signal handlers + atexit are registered on context entry, unregistered on exit
-(so this doesn't leak global state if the controller wraps multiple pools).
+(so this doesn't leak global state if the orchestrator wraps multiple pools).
 """
 
 import asyncio
@@ -47,7 +47,7 @@ log = logging.getLogger("goal-flight.acp_pool")
 # Defaults derived from empirical measurements 2026-05-18 (see env-caveats.md).
 # Update if a re-measure shifts the worst-case worker.
 DEFAULT_WORST_CASE_WORKER_RSS_MB = 1200  # cursor-agent peak
-DEFAULT_CONTROLLER_RESERVE_MB = 2048      # controller + Claude Code + headroom
+DEFAULT_CONTROLLER_RESERVE_MB = 2048      # orchestrator + Claude Code + headroom
 DEFAULT_HARD_CAP = 20                     # AcpProcessPool's own default
 # Safe default when env-caveats is missing / malformed (don't fail open to the
 # hard_cap on an unknown box — 20 cursor workers ≈ 24 GB RSS would OOM small Macs).
@@ -170,14 +170,14 @@ async def managed_pool(
       - Unregisters atexit handler
 
     The signal handlers do NOT swallow signals — they schedule shutdown and
-    re-raise so the controller sees the signal as intended (KeyboardInterrupt
+    re-raise so the orchestrator sees the signal as intended (KeyboardInterrupt
     on SIGINT, SystemExit-equivalent on SIGTERM).
 
     auto_allow_tools: defaults to True here so the controller-as-auto-mode
     permission ROUTER is active: in-scope requests (in-worktree work,
     in-workspace MCP/elicitation) are auto-allowed so the worker perceives no
     delay, while boundary crossings (out-of-worktree targets, network/fetch) are
-    ESCALATED to the user. False makes the controller auto-DENY every request
+    ESCALATED to the user. False makes the orchestrator auto-DENY every request
     (clean DeniedOutcome(cancelled) — the worker cancels the gated call and
     continues rather than wedging; older builds raised method_not_found here,
     which hung permission-gating adapters). Either way the request is answered
@@ -185,31 +185,31 @@ async def managed_pool(
 
     permission_policy: optional decision function
     (tool_call, options, cwd) -> "allow" | "deny" | "escalate" that overrides the
-    scope-aware default, letting the controller fold in chunk SCOPE/FORBIDDEN and
-    re-dispatch decisions. Escalations surface to the controller via the runner's
+    scope-aware default, letting the orchestrator fold in chunk SCOPE/FORBIDDEN and
+    re-dispatch decisions. Escalations surface to the orchestrator via the runner's
     permission_pending status (see GoalflightClient.request_permission).
 
     permission_mode: escalation TRANSPORT. "auto" (default) answers an escalated
     request with a cancel immediately and surfaces it via permission_pending
     (USER-CONFIRM -> re-dispatch). "inline" HOLDS the worker's permission open and
     authorizes it IN PLACE -- it never re-dispatches. The handler publishes a
-    request file under permission_dir and the controller answers via
+    request file under permission_dir and the orchestrator answers via
     goalflight_acp_permits. Two-phase, awake-time timeout (active_monotonic, so a
     laptop sleep does not consume the budget):
-      - controller window (permission_inline_timeout_s, ~3 min): if the controller
+      - orchestrator window (permission_inline_timeout_s, ~3 min): if the orchestrator
         neither acks nor decides, AUTO-DECLINE -- the worker is denied that one
         tool and CONTINUES its turn (surfaced informationally in
         result.permission_auto_declined, reason "controller_timeout"). This is the
-        resilience escape hatch: a rate-limited / crashed / asleep controller never
+        resilience escape hatch: a rate-limited / crashed / asleep orchestrator never
         blocks a worker that runs on its own provider.
-      - user window (permission_user_timeout_s, ~10h): once the controller writes
+      - user window (permission_user_timeout_s, ~10h): once the orchestrator writes
         an ACK (write_ack -- "I'm asking the user"), the deadline extends so the
         worker waits for the human (coffee break). Expiry -> auto-decline, reason
         "user_timeout". A write_decision (allow/deny) ends either phase at once.
     Inline needs the router (auto_allow_tools=True) and a relay draining
     permission_dir.
 
-    CONTROLLER CONTRACT for inline mode (the ~3 min controller window assumes it):
+    CONTROLLER CONTRACT for inline mode (the ~3 min orchestrator window assumes it):
       1. POLL every turn: run permits.list_requests(permission_dir) at the top of
          each loop iteration while any inline worker is active. It is FILE IPC --
          the request is not a Claude message, so stacked user input cannot bury it
@@ -217,10 +217,10 @@ async def managed_pool(
       2. ACK FIRST, decide second: on a request you cannot auto-decide instantly,
          permits.write_ack(dir, key) immediately (a one-line file that flips the
          worker to the ~10h window), THEN present to the user / decide, THEN
-         write_decision. The 3 min bar is "controller gets ONE turn", not "fully
+         write_decision. The 3 min bar is "orchestrator gets ONE turn", not "fully
          decides".
       3. BACKGROUND all >10s work so turns stay frequent and the poll cadence stays
-         well under the controller window.
+         well under the orchestrator window.
       4. If unavailable anyway (rate-limited / asleep), the worker auto-declines and
          continues; on recovery, re-dispatch just the declined action from the
          worker's permission_auto_declined.
@@ -234,7 +234,7 @@ async def managed_pool(
     to wait for an ack-or-decision before auto-declining (default 180 = 3 min).
 
     permission_user_timeout_s: post-ack user-decision window -- awake-seconds to
-    wait for the user's decision after the controller acks (default 36000 = 10h).
+    wait for the user's decision after the orchestrator acks (default 36000 = 10h).
 
     os_sandbox: process-level sandbox profile for spawned workers. "off" keeps
     the host default. "read-only" and "workspace-write" wrap the worker
@@ -269,7 +269,7 @@ async def managed_pool(
         context_mode=context_mode,
         os_sandbox=os_sandbox,
     )
-    pool.cleanup_ghosts()  # reap any orphans from a prior controller run
+    pool.cleanup_ghosts()  # reap any orphans from a prior orchestrator run
 
     loop = asyncio.get_running_loop()
     prior_handlers: dict[int, object] = {}
@@ -314,7 +314,7 @@ async def managed_pool(
             except Exception:
                 # No loop / loop closed — fall back to sync kill
                 _shutdown_sync_for_atexit()
-            # Restore prior handler and re-raise so controller sees the signal
+            # Restore prior handler and re-raise so orchestrator sees the signal
             signal.signal(sig_num, prior)
             signal.raise_signal(sig_num)
         return handler
@@ -331,7 +331,7 @@ async def managed_pool(
         atexit_registered = True
 
     # Background idle-cleanup loop — defends against RAM accumulation when
-    # controllers spawn many distinct session_ids during long runs (especially
+    # orchestrators spawn many distinct session_ids during long runs (especially
     # under rate-limit retry patterns where a fresh dispatch creates a new
     # heavyweight worker without reusing the old one).
     idle_task: asyncio.Task | None = None

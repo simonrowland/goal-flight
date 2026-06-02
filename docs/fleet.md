@@ -1,19 +1,19 @@
 # Multi-node fleet operations
 
 Goal Flight 1.0 adds a **fleet layer** for dispatching ACP workers on remote
-machines over SSH while the controller stays on your laptop or CI runner. The
+machines over SSH while the orchestrator stays on your laptop or CI runner. The
 fleet store tracks billing accounts, node registry, dispatch mirrors, and account
 locks so multiple workstations can share capacity without double-booking.
 
 ## When to use fleet mode
 
 - You have more than one machine with coding agents installed (for example a
-  MacBook controller and a Mac Studio worker).
-- You want the controller to **preview** remote commands before `--exec`.
+  MacBook orchestrator and a Mac Studio worker).
+- You want the orchestrator to **preview** remote commands before `--exec`.
 - You need **account locks** so two dispatches do not consume the same billing
   account concurrently.
 
-Fleet mode is optional. Local-only dispatch (same machine as the controller)
+Fleet mode is optional. Local-only dispatch (same machine as the orchestrator)
 works without bootstrapping a fleet directory.
 
 ## Bootstrap
@@ -118,7 +118,7 @@ python3 scripts/goalflight_fleet.py watch --fleet --once --json
 python3 scripts/goalflight_fleet.py reconcile --all-in-flight --json
 ```
 
-`watch` mirrors remote `status.json` into the controller register. `reconcile`
+`watch` mirrors remote `status.json` into the orchestrator register. `reconcile`
 releases billing locks when dispatches reach terminal states.
 
 ## Router entrypoint

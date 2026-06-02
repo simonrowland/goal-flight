@@ -12,7 +12,7 @@ Private. Read before touching code.
 > the skill was previously invoked but you can't quote its preamble
 > verbatim, re-invoke `/goal-flight` to reload SKILL.md fresh — truncated
 > system reminders silently drop load-bearing rules across compactions.
-> Then verify you're the designated controller via session-id lookup
+> Then verify you're the designated orchestrator via session-id lookup
 > (`goalflight_session_status.py --ensure-session` vs the active queue's
 > `current_session.id`).
 

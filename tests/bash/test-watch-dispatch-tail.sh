@@ -5,7 +5,7 @@
 #   - exit 0: terminal marker appears in tail (canonical happy path)
 #   - exit 1: worker PID dies without any terminal marker
 #   - exit 2: idle timeout (no tail update for max-idle-secs)
-#   - exit 3: controller PID dies (orphan watcher self-detection)
+#   - exit 3: orchestrator PID dies (orphan watcher self-detection)
 #
 # And pidfile lifecycle:
 #   - on startup: per-watcher subfile written under /tmp/goal-flight-acp-pids.d/
@@ -28,7 +28,7 @@ WATCHER="$REPO_ROOT/scripts/watch-dispatch-tail.sh"
 # worker and unlink the pidfile — mid-test. That surfaced as a ~1-in-3 flake on
 # "case-4 pidfile preserved" (got=removed), passing on re-run, depending purely on
 # whether anything else triggered cleanup_ghosts during the ~2s window. Cases 1/3
-# escaped it only because their controller ($$) stays alive, so cleanup_ghosts
+# escaped it only because their orchestrator ($$) stays alive, so cleanup_ghosts
 # skips them. Isolating the dir removes the shared-state dependency entirely.
 PIDFILE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/goal-flight-test-pids.XXXXXX")" || {
   # Refuse to silently fall back to the shared production dir (an empty
@@ -89,7 +89,7 @@ fi
 # Append terminal marker to tail. Worker is still alive (sleep 30 doesn't
 # exit just because we wrote a marker to a different file). By the new exit-
 # trap contract, the pidfile must be PRESERVED on exit because the worker is
-# still alive — cleanup_ghosts() on a subsequent controller startup is what
+# still alive — cleanup_ghosts() on a subsequent orchestrator startup is what
 # reaps the still-alive-but-orphaned worker.
 echo "**COMPLETE:** test fixture done" >> "$TAIL"
 
@@ -192,7 +192,7 @@ else
   expect_eq "case-3 WATCHER-EXIT summary line emitted" "yes" "no"
 fi
 # Idle exit: worker is still alive (just wedged). Pidfile must be PRESERVED
-# so cleanup_ghosts() reaps the wedged worker on next controller startup.
+# so cleanup_ghosts() reaps the wedged worker on next orchestrator startup.
 if [ -f "$PIDFILE_DIR/$PIDFILE_STEM" ]; then
   expect_eq "case-3 pidfile preserved (worker still alive after idle timeout)" "preserved" "preserved"
 else
@@ -246,7 +246,7 @@ wait "$WORKER_PID" 2>/dev/null
 rm -f "$TAIL" /tmp/watcher-out-running-quiet-$$.txt
 cleanup_pidfile "$PIDFILE_STEM"
 
-# ---- Case 4: controller PID dies → exit 3 ----
+# ---- Case 4: orchestrator PID dies → exit 3 ----
 # Spawn a controller-proxy that exits in 2s. The watcher monitors it as its
 # --controller-pid. After 2s the proxy dies; watcher should detect and exit 3.
 TAIL=/tmp/test-watch-controller-$$.txt
@@ -270,9 +270,9 @@ if grep -q "WATCHER-EXIT: controller-dead exit_code=3" /tmp/watcher-out-controll
 else
   expect_eq "case-4 WATCHER-EXIT summary line emitted" "yes" "no"
 fi
-# Controller-dead exit: worker is still alive (controller just died, worker
+# Controller-dead exit: worker is still alive (orchestrator just died, worker
 # unaffected). Pidfile MUST be preserved so cleanup_ghosts() on the next
-# controller startup walks it, identity-verifies the worker, and reaps it.
+# orchestrator startup walks it, identity-verifies the worker, and reaps it.
 # This is the load-bearing orphan-defense path the codex hardening reviewer
 # specifically flagged in pass 3 — removing the pidfile here orphans the
 # worker beyond cleanup_ghosts' reach.

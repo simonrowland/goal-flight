@@ -7,7 +7,7 @@
 #   - terminal marker observed in tail            → exit 0  ("WATCHER-EXIT: marker")
 #   - worker PID dies without terminal marker     → exit 1  ("WATCHER-EXIT: pid-dead")
 #   - no tail update for --max-idle-secs seconds  → exit 2  ("WATCHER-EXIT: idle-timeout")
-#   - controller PID dies                         → exit 3  ("WATCHER-EXIT: controller-dead")
+#   - orchestrator PID dies                         → exit 3  ("WATCHER-EXIT: controller-dead")
 #
 # Registers a per-watcher entry in the same pidfile dir scripts/acp_client.py uses
 # (/tmp/goal-flight-acp-pids.d/), so cleanup_ghosts reaps orphaned workers
@@ -184,7 +184,7 @@ EOF
 # worker may still be alive include:
 #   - exit 2 (idle-timeout): worker is wedged but the process is still running;
 #                            cleanup_ghosts() should reap it on the next
-#                            controller startup
+#                            orchestrator startup
 #   - exit 3 (controller-dead): worker may keep running with no supervisor;
 #                              cleanup_ghosts() needs the pidfile to reap it
 #   - SIGTERM of watcher itself: worker survives; need cleanup_ghosts coverage
@@ -211,7 +211,7 @@ fi
 echo "[watcher start $(date '+%H:%M:%S')] worker_pid=$WORKER_PID controller_pid=$CONTROLLER_PID tail=$TAIL_PATH markers='$MARKER_RE' poll=${POLL_SECS}s max_idle=${MAX_IDLE_SECS}s"
 
 while true; do
-  # 1. Controller alive? (orphan watcher self-detection)
+  # 1. Orchestrator alive? (orphan watcher self-detection)
   if ! kill -0 "$CONTROLLER_PID" 2>/dev/null; then
     echo "[$(date '+%H:%M:%S')] controller PID $CONTROLLER_PID is gone"
     if [ -f "$TAIL_PATH" ]; then

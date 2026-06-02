@@ -3,7 +3,7 @@ SELF-REVIEW BEFORE REPORTING DONE
 Treat the code as if a different agent submitted it; you gain credit only
 for what you find, not for what you wrote. Severity-rank P0/P1/P2/P3.
 
-**Controller note**: the categories below are intentionally abstract for
+**Orchestrator note**: the categories below are intentionally abstract for
 portability. When pasting this into an executor dispatch, **specialize each
 bullet to this goal's project nouns and grep patterns** — the abstract
 category names mean nothing to an executor until you tell them which file,
@@ -36,7 +36,7 @@ corpus exists.
 
 Self-fix any P0/P1/P2 before reporting done. P3 may be deferred with a note.
 
-REPORT FORMAT (in your reply to the controller, before the diff summary):
+REPORT FORMAT (in your reply to the orchestrator, before the diff summary):
 
 ```
 ## Self-review findings
@@ -60,7 +60,7 @@ REPORT FORMAT (in your reply to the controller, before the diff summary):
 <commands and pass/fail>
 
 ## Surprises
-<anything the controller should know that wasn't in the goal text>
+<anything the orchestrator should know that wasn't in the goal text>
 ```
 
 If you found no P0/P1 issues, say so explicitly. Clean self-reviews are

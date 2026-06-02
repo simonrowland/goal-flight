@@ -390,7 +390,7 @@ def handle_prompt(req_id: int, params: dict) -> None:
         return
     if SCENARIO == "permission_inline":
         # Boundary-crossing request (target OUTSIDE cwd) so the router ESCALATES.
-        # Under permission_mode="inline" the controller HOLDS the request open and
+        # Under permission_mode="inline" the orchestrator HOLDS the request open and
         # answers it in place (allow option_id, or cancel on deny/timeout). Unlike
         # 'permission_escalate' we then COMPLETE the turn, so the test can observe
         # what the worker received: 'permission:<optionId>' on allow, or
@@ -404,7 +404,7 @@ def handle_prompt(req_id: int, params: dict) -> None:
         response(req_id, {"sessionId": session_id, "stopReason": "end_turn"})
         return
     if SCENARIO in ("permission_escalate", "permission_fetch"):
-        # The controller's permission ROUTER escalates a boundary-crossing
+        # The orchestrator's permission ROUTER escalates a boundary-crossing
         # request: it answers the ACP request with a cancel, then the runner
         # cancels the whole turn. Model that by sending the request and WAITING
         # for the cancel (like 'blocked') rather than ending, so the runner can

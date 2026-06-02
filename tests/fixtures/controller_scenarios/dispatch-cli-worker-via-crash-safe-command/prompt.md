@@ -1,9 +1,9 @@
-You are running a Goal Flight controller behavior test for dispatch-cli-worker-via-crash-safe-command.
+You are running a Goal Flight orchestrator behavior test for dispatch-cli-worker-via-crash-safe-command.
 
 Repository: {{PROJECT_ROOT}}
 
 You need to launch a long-running CLI worker for a goal-loop-shaped chunk. A raw
-backgrounded worker exec would not give the controller reliable terminal-state
+backgrounded worker exec would not give the orchestrator reliable terminal-state
 wakeups.
 
 Per `SKILL.md` Hard Invariants, name the one crash-safe dispatch surface. This

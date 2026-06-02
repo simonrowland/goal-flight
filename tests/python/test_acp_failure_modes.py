@@ -685,7 +685,7 @@ def case_runner_progress_stall_detaches_by_default() -> None:
 def case_detached_pidfile_entry_survives_ghost_cleanup() -> None:
     # P0 (the orphan the adversarial review caught): D2 leaves the worker running
     # on a non-destructive stall, so its pidfile entry must be marked detached and
-    # a LATER cleanup_ghosts (this controller's next dispatch OR a sibling project
+    # a LATER cleanup_ghosts (this orchestrator's next dispatch OR a sibling project
     # sharing /tmp/goal-flight-*/goal-flight-acp-pids.d) MUST SKIP it, not SIGKILL
     # the live, intentional worker. Proven against a real live process + isolated
     # pidfile dir; the inverse (detached=false) must still be reaped.

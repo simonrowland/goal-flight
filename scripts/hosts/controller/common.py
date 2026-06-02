@@ -1,4 +1,4 @@
-"""Shared helpers for controller verification harnesses."""
+"""Shared helpers for orchestrator verification harnesses."""
 
 from __future__ import annotations
 
@@ -178,7 +178,7 @@ def monotonic_elapsed(started: float) -> float:
     return round(time.time() - started, 2)
 
 
-# Phrases that indicate the controller stalled for engagement instead of continuing
+# Phrases that indicate the orchestrator stalled for engagement instead of continuing
 # prescribed work described in SKILL.md.
 ENGAGEMENT_BAIT_PHRASES: tuple[str, ...] = (
     "are you still there",
@@ -252,7 +252,7 @@ LATE_SKILL_TOKENS: tuple[str, ...] = (
     "controller-provider asymmetry",
     "controller-provider-asymmetry",
     "worker failures can reroute",
-    "controller failure can strand the user",
+    "orchestrator failure can strand the user",
     "same-provider policy controls review routing trust",
     "use acp or bash-tail plus status polling",
 )
@@ -277,7 +277,7 @@ def read_skill_end_to_end_checks(tail_text: str) -> list[dict[str, Any]]:
     late_hits = [token for token in LATE_SKILL_TOKENS if token in normalized]
     exact_label = "controller-provider asymmetry" in normalized
     exact_sentence = (
-        "worker failures can reroute; controller failure can strand the user" in normalized
+        "worker failures can reroute; orchestrator failure can strand the user" in normalized
     )
     navmap_only = (
         not (exact_label and exact_sentence)

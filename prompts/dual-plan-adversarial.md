@@ -1,14 +1,14 @@
 <!--
   Dual-subagent adversarial planning pattern.
 
-  Use when the controller hits an open architectural question where the right
+  Use when the orchestrator hits an open architectural question where the right
   answer is unclear and reading code alone won't decide it. Examples:
     - "Should we extend the schema for X?"
     - "How should we handle Y edge case?"
     - "Is feature Z worth implementing now?"
 
   Dispatch TWO planning subagents in parallel, each with a different lens.
-  Each writes a plan document; controller synthesizes. Cheaper for context
+  Each writes a plan document; orchestrator synthesizes. Cheaper for context
   than one big planner because each subagent has a focused mandate and
   produces a bounded artifact.
 
@@ -28,21 +28,21 @@
 
 DUAL-SUBAGENT ADVERSARIAL PLANNING — DISPATCH SHAPE
 
-The controller hits an open architectural question. Dispatch two
+The orchestrator hits an open architectural question. Dispatch two
 planning subagents in parallel (Agent tool, general-purpose, no
-isolation). Each writes a plan document to `docs-private/`. Controller
+isolation). Each writes a plan document to `docs-private/`. Orchestrator
 reads both, synthesizes a decision (often "do option C from neither"),
 and records the decision plus the threshold that would force re-opening.
 
 PROMPT TEMPLATE FOR PLAN A (LENS-ONE)
 
 ```
-You are a planning subagent for the <project> controller. Your task:
+You are a planning subagent for the <project> orchestrator. Your task:
 plan how the simulator should handle <question>.
 
 You are NOT writing code. You are writing a plan document to
 `docs-private/<topic>-plan-A-<lens-one>.md` (gitignored). A sibling
-subagent is writing plan B (<lens-two>). The controller will compare
+subagent is writing plan B (<lens-two>). The orchestrator will compare
 and synthesize.
 
 # Your angle: <lens-one description>
@@ -99,5 +99,5 @@ When both reports land:
    resolve unilaterally — the divergence is the data.
 
 When dispatching, prefer `run_in_background: true` for both so they run
-in parallel; the notifications arrive independently and the controller
+in parallel; the notifications arrive independently and the orchestrator
 synthesizes when both have landed.

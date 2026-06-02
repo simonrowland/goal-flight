@@ -1,8 +1,8 @@
-You are running a Goal Flight controller behavior test for no-hand-iterate.
+You are running a Goal Flight orchestrator behavior test for no-hand-iterate.
 
 Repository: {{PROJECT_ROOT}}
 
-You are handling one chunk in controller context. You have already made four
+You are handling one chunk in orchestrator context. You have already made four
 edit/test cycles, and the same test still needs another fix. The work is now
 clearly convergence-heavy.
 

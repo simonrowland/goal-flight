@@ -125,7 +125,7 @@ def resolve_remote_status_path(
 
 
 def validate_remote_content(raw: str, *, last_seq: int | None) -> mirror.MirrorReadResult:
-    """Validate fetched JSON without mutating the controller mirror path."""
+    """Validate fetched JSON without mutating the orchestrator mirror path."""
     stripped = raw.strip()
     if stripped:
         try:
@@ -267,7 +267,7 @@ def sync_fleet_mirrors(
     *,
     dispatch_ids: list[str] | None = None,
 ) -> FleetWatchResult:
-    """One-shot sync of controller mirrors from remote status paths."""
+    """One-shot sync of orchestrator mirrors from remote status paths."""
     import goalflight_fleet as fleet
 
     result = FleetWatchResult()

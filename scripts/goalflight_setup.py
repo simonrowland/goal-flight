@@ -825,7 +825,7 @@ def _interactive_selection(manifests: list[dict[str, Any]]) -> tuple[set[str], s
     worker_choices = [dest["id"] for manifest in manifests for dest in _setup_destinations(manifest, "worker")]
     controller_defaults = _default_destinations(manifests, "controller")
     worker_defaults = _default_destinations(manifests, "worker")
-    controllers = _prompt_csv("Controller destinations", controller_choices, controller_defaults)
+    controllers = _prompt_csv("Orchestrator destinations", controller_choices, controller_defaults)
     workers = _prompt_csv("Worker destinations", worker_choices, worker_defaults)
     addon_choices = sorted({addon["id"] for manifest in manifests for addon in _setup_addons(manifest)})
     addon_defaults = {addon["id"] for manifest in manifests for addon in _setup_addons(manifest) if addon.get("default")}
@@ -1281,8 +1281,8 @@ def main(argv: list[str] | None = None) -> int:
         help="symlink the OpenCode skill directory to an existing Claude skill checkout",
     )
     parser.add_argument("--list-agents", action="store_true", help="show installed controller/worker destinations")
-    parser.add_argument("--tui", action="store_true", help="prompt for controller, worker, and add-on destinations")
-    parser.add_argument("--controllers", help="comma-separated controller destination ids")
+    parser.add_argument("--tui", action="store_true", help="prompt for orchestrator, worker, and add-on destinations")
+    parser.add_argument("--controllers", help="comma-separated orchestrator destination ids")
     parser.add_argument("--workers", help="comma-separated worker destination ids")
     parser.add_argument("--addons", help="comma-separated add-on ids")
     parser.add_argument("--target-project", default=".", help="target project for project-local install destinations")

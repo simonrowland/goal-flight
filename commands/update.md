@@ -19,7 +19,7 @@ unless the host skill path is a symlink; doctor JSON reports
 
 ### Sweep 1 — Update goal-flight plugin
 
-1. Resolve the install path. The controller already knows its own
+1. Resolve the install path. The orchestrator already knows its own
    `<skill-root>` — pass that as `GFROOT`. If `<skill-root>` is a symlink
    (the common install pattern), resolve it to the underlying source
    repo so `git` operates on the canonical checkout:
@@ -69,7 +69,7 @@ unless the host skill path is a symlink; doctor JSON reports
    `merge --ff-only` when the local checkout is strictly behind `origin/main`.
    Ahead or diverged checkouts emit `skipped_ahead` / `skipped_diverged` and
    leave the working tree untouched. On native Windows it also caches the
-   result once per controller session to avoid repeated fetch latency.
+   result once per orchestrator session to avoid repeated fetch latency.
 
    `pull --rebase` is deliberate, user-invoked repair for a diverged checkout:
 

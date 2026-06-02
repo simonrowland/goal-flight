@@ -1,6 +1,6 @@
 # review-flight-at-completion fixture prompt
 
-You are running a Goal Flight controller behavior test.
+You are running a Goal Flight orchestrator behavior test.
 
 Repository: {{PROJECT_ROOT}}
 

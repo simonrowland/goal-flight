@@ -14,7 +14,7 @@ Spawn read-only workers to anticipate integration / requirements / snags questio
 
 - **Standalone**: `/goal-flight ask-questions` — user invokes explicitly between decompose-plan and execute (or any time).
 - **Auto-chained**: invoked at the end of `decompose-plan` with `--scope decomposition`.
-- **Continuous**: invoked from inside `execute` when the controller hits an ambiguity that requires user input.
+- **Continuous**: invoked from inside `execute` when the orchestrator hits an ambiguity that requires user input.
 
 ## Steps
 
@@ -33,14 +33,14 @@ Use read-only explorer workers through the host `delegate` operation with the pr
 
 1. Scans the goal-queue, AGENTS.md, any binding-spec, recent git log.
 2. Generates `(question, default-answer, confidence, risk-if-wrong, second-opinion-suggestion)` tuples.
-3. For low-confidence items: notes "consider second opinion from <other ready, concern-diverse reviewer>" — for example, if the controller's primary model is Claude in the current wrapper, use a codex/cursor/grok peer; if the controller is codex, use a Claude-compatible/cursor/grok peer.
+3. For low-confidence items: notes "consider second opinion from <other ready, concern-diverse reviewer>" — for example, if the orchestrator's primary model is Claude in the current wrapper, use a codex/cursor/grok peer; if the orchestrator is codex, use a Claude-compatible/cursor/grok peer.
 
 If two workers are spawned (recommended for `decomposition` scope; one is sufficient for `current-chunk`), run in parallel and dedupe results.
 
 ### 3. Filter aggressively
 
 Drop:
-- Questions with answers obvious from the scan (controller defaults silently).
+- Questions with answers obvious from the scan (orchestrator defaults silently).
 - Questions that need user knowledge they can't reasonably have yet (too early — defer to a later ask-questions call).
 - Questions without enough context for the user to answer in <30 seconds without re-explanation.
 - Duplicates from the two agents.
@@ -59,7 +59,7 @@ If a worker flagged "consider second opinion" for an item that you'd otherwise d
 
 ### 4.5. Dual-worker planning for open architectural questions
 
-If anticipator surfaced a question that's bigger than a default-or-ask — an open architectural question where the right answer needs thought rather than user knowledge — consider the dual-worker adversarial planning pattern (`prompts/dual-plan-adversarial.md`). Dispatch two planners in parallel with different lenses (chemistry-first vs engineering-first, performance-first vs correctness-first, etc.); each writes a plan document; controller synthesizes. Cheaper for context than one large planner; the adversarial divergence is the value.
+If anticipator surfaced a question that's bigger than a default-or-ask — an open architectural question where the right answer needs thought rather than user knowledge — consider the dual-worker adversarial planning pattern (`prompts/dual-plan-adversarial.md`). Dispatch two planners in parallel with different lenses (chemistry-first vs engineering-first, performance-first vs correctness-first, etc.); each writes a plan document; orchestrator synthesizes. Cheaper for context than one large planner; the adversarial divergence is the value.
 
 Use this sparingly — only for questions that genuinely benefit from two complementary perspectives. For most ambiguities, the single-anticipator + default-or-ask flow is enough.
 
@@ -68,7 +68,7 @@ Use this sparingly — only for questions that genuinely benefit from two comple
 Use the `ask_user` operation. Max 4 questions per call (group related; if more remain, present in batches). For each:
 
 - **Question**: phrased so a user can answer in <30 seconds.
-- **Options**: the controller's recommended default first (label it "(recommended)"), with a one-line rationale in the description.
+- **Options**: the orchestrator's recommended default first (label it "(recommended)"), with a one-line rationale in the description.
 - **Header**: short noun-phrase (3-5 words).
 
 If you have 5+ questions: ask the most important 4 first, then defer the rest until after the user answers (or until a natural pause in execute).
@@ -82,7 +82,7 @@ Append to `<repo-root>/docs-private/<topic>-answers-<today>.md` (create if not p
 - **Asked**: <iso-timestamp>
 - **Scope**: <decomposition | <area> | current-chunk | next-chunks>
 - **Source**: anticipatory worker (`<adapter-id>` | `multiple`) / mid-execute pause
-- **Default proposed**: <controller's default>
+- **Default proposed**: <orchestrator's default>
 - **User answered**: <answer or "accepted default">
 - **Affects chunks**: <list of chunk numbers/slugs>
 ```

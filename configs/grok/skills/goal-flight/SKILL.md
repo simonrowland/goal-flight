@@ -35,6 +35,6 @@ From the cloned Goal Flight repository, run:
 ./setup.sh --apply --yes --controllers grok-cli-controller --workers grok-acp-worker --addons gstack
 ```
 
-Grok setup installs this personal skill when a Grok controller surface is
+Grok setup installs this personal skill when a Grok orchestrator surface is
 selected. Worker execution remains through `grok agent stdio` under the Goal
 Flight ACP runner.

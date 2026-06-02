@@ -19,7 +19,7 @@ check for drift, run
 `python3 scripts/goalflight_doctor.py --project-root "$PWD" --json` and inspect
 `installed_skill_drift`; text mode prints `installed_skill_md_hash` WARNs.
 
-Cursor can run Goal Flight as a controller through the installed skill wrapper
+Cursor can run Goal Flight as an orchestrator through the installed skill wrapper
 and can run `cursor-agent` as an ACP worker.
 
 - Cursor MCP config lives in `~/.cursor/mcp.json` globally or

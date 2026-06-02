@@ -1,10 +1,10 @@
 ---
 name: goal-flight
 version: 1.0.0
-description: "Portable Goal Flight controller workflow for planning, dispatching, reviewing, recovering, and resuming long-running repository work from file-backed state."
+description: "Portable Goal Flight orchestrator workflow for planning, dispatching, reviewing, recovering, and resuming long-running repository work from file-backed state."
 tags:
   - orchestration
-  - controller
+  - orchestrator
   - dispatch
   - review
   - handoff
@@ -28,13 +28,13 @@ triggers:
   - /goal-flight
   - start a long refactor
   - begin chunked work
-  - set up controller for unattended run
+  - set up orchestrator for unattended run
   - decompose this plan into goal chunks
 ---
 
 > ⚠️ **Read this skill end-to-end, including Worker Routing, State, and Context Discipline** before acting; also read Do Not. The back half carries routing, state, marker, rate-limit, permission, and safety contracts.
 
-This checked-in `SKILL.md` is the compiled controller distillation of
+This checked-in `SKILL.md` is the compiled orchestrator distillation of
 `docs/controller-behaviours.md`. It is the Claude Code-compatible wrapper for
 the portable core. Keep front matter and `allowed-tools` compatible until
 generated wrappers own host bindings, tool names, invocation details, and
@@ -57,12 +57,12 @@ rules. Re-invoke `/goal-flight` to reload SKILL.md end-to-end before
 acting on its rules. Then check your terminal session ID
 (`scripts/goalflight_session_status.py --ensure-session`) against the
 active queue's `current_session.id` — if they match, you are the
-designated controller; if not, surface to user before claiming.
+designated orchestrator; if not, surface to user before claiming.
 
 ## Per-host pointers
 
-Per-host pointers tell non-native controllers where their installed wrapper lives.
-If you are a non-Claude controller (codex, grok, cursor, opencode), load your
+Per-host pointers tell non-native orchestrators where their installed wrapper lives.
+If you are a non-Claude orchestrator (codex, grok, cursor, opencode), load your
 host wrapper first, then root `SKILL.md` as canonical workflow:
 
 | Host | Installed wrapper path |
@@ -87,7 +87,7 @@ only the invoked `commands/*.md` plus referenced `protocols/*.md`.
 Companion tools: gstack `/review` is the canonical chunk reviewer; gstack
 `/challenge` is the adversarial frame; fall back to `prompts/gstack-*.md` only
 when gstack is absent. context-mode stores large outputs and searches them.
-Controller behaviour probes run through portable host adapters, not host-specific print-mode shortcuts.
+Orchestrator behaviour probes run through portable host adapters, not host-specific print-mode shortcuts.
 
 ## Navigation map: behaviour -> SKILL anchor -> protocol/script
 
@@ -105,20 +105,20 @@ Controller behaviour probes run through portable host adapters, not host-specifi
 | chunk-vs-milestone review | Review layers | `protocols/chunk-review.md`, `protocols/milestone-review.md` |
 | dispatch axes (per-task routing table is in Worker Routing) | Dispatch Model, Worker Routing | `protocols/dispatch-routing.md` |
 | **worker permissions / YOLO warning** | Worker Routing | `scripts/goalflight_acp_run.py` `make_title_allow_policy` |
-| **worker blocked: controller takeover** | Worker Routing | `protocols/dispatched-worker-recovery.md` |
+| **worker blocked: orchestrator takeover** | Worker Routing | `protocols/dispatched-worker-recovery.md` |
 | rate limits & caps | Capacity and rate limits | `scripts/goalflight_capacity.py`, `scripts/goalflight_rate_pressure.py` |
 | worker markers | Worker Markers | `protocols/worker-markers.md`, `scripts/goalflight_watch.py` |
 | resume/compaction (canonical reload order) | State | `commands/resume.md`, `protocols/state-handoff.md`, `scripts/goalflight_session_status.py` |
 | context discipline | Context Discipline | context-mode, `scripts/goalflight_*.py` |
 | **Do Not / safety gates** | Do Not | (read-end-to-end is load-bearing for safety) |
 
-## Controller Contract
+## Orchestrator Contract
 
 Use this wrapper for work too large for one uninterrupted session: decomposed
 implementation, long refactors, review flights, resumable queues, or unattended
-dispatch. The controller manages context and verification; it does not hoard
+dispatch. The orchestrator manages context and verification; it does not hoard
 every file, log, or worker transcript in conversation.
-Controller context is scarce; delegate iteration so only the converged conclusion returns.
+Orchestrator context is scarce; delegate iteration so only the converged conclusion returns.
 
 Always:
 - read the invoked command file and only its referenced protocols
@@ -216,13 +216,13 @@ inline; fix P0/P1/P2 before commit.
   ~5KB MUST instruct the worker to write findings to
   `docs-private/research/<date>-<slug>/findings.md` and return only
   `READY: <path>` plus a one-paragraph TL;DR + severity-tagged finding
-  count. The controller reads the TL;DR; opens the file only when TL;DR
+  count. The orchestrator reads the TL;DR; opens the file only when TL;DR
   signals a real action. Returning a 9KB report inline defeats the
-  dispatch — the bytes land back in controller context anyway.
+  dispatch — the bytes land back in orchestrator context anyway.
 - Read >5KB without an expected Edit follow-up within 2 turns → use
   `Agent` (Explore for read-only, general-purpose for tool-using
   investigation) with a defined prompt instead. Recon-Reads pull the
-  full body into controller context; an Agent dispatch returns a
+  full body into orchestrator context; an Agent dispatch returns a
   conclusion at ~10x compression.
 - No `tail -f` in conversation. Use status files instead:
   - Aggregate snapshot: `python3 <skill-root>/scripts/goalflight_status.py --json`
@@ -242,7 +242,7 @@ inline; fix P0/P1/P2 before commit.
 - During an active goal-flight run, keep shipping through decompose -> execute
   until the queue is done or a real blocker stops you.
 - Report progress at least every 15 minutes unless context is tight.
-- Workers escalate sandbox / permission / tool blocks via `BLOCKED:` and return to the controller. They do NOT execute workarounds (alternate APIs, git plumbing, inline content dumps when a file-write is blocked). Push and out-of-standard-path commits are the controller's call, not the worker's. Detail + session examples: `protocols/dispatched-worker-recovery.md` §"Worker bypass anti-pattern".
+- Workers escalate sandbox / permission / tool blocks via `BLOCKED:` and return to the orchestrator. They do NOT execute workarounds (alternate APIs, git plumbing, inline content dumps when a file-write is blocked). Push and out-of-standard-path commits are the orchestrator's call, not the worker's. Detail + session examples: `protocols/dispatched-worker-recovery.md` §"Worker bypass anti-pattern".
 - Keep `docs-private/` private.
 
 ## Capacity and rate limits
@@ -255,14 +255,14 @@ Hard caps are RAM/process safeguards, not provider truth. Learn rate pressure fr
 ledger failures and emits fallback/halved-cap recommendations after clustered
 provider pressure.
 
-Probe workers upward; keep controller provider conservative. Controller budget
+Probe workers upward; keep orchestrator provider conservative. Orchestrator budget
 loss can end the interactive session; worker-provider pressure can be rerouted.
 Bound dispatch hangs with idle and quiet timeouts. Terminal leases leave active capacity after completion.
 
 ## Autonomous throughput
 
 Goal Flight exists so long work survives compactions and unattended hours. The
-controller advances the queue; it does not poll the user for presence.
+orchestrator advances the queue; it does not poll the user for presence.
 
 When the user invoked goal-flight, approved a plan, or gave scope:
 - Keep working through code, tests, queue/ledger/resume updates, review, and
@@ -279,11 +279,11 @@ infer, auth/capacity hard stop, or explicit command gate.
 
 ## Chat as requirements
 
-Controller chat is requirements input, not an inline editor command. Mid-session
+Orchestrator chat is requirements input, not an inline editor command. Mid-session
 asks are steering/architecture/scope input. Append them to the active goal queue
 or promote them to a plan revision plus re-review when they change scope.
 
-Do not task-pivot or inline-edit on receipt. Plan before editing when scope is unsettled. Prepare ambiguous questions before asking the user. Relay USER-NEED through controller, not worker chat. chat alone is not the backlog.
+Do not task-pivot or inline-edit on receipt. Plan before editing when scope is unsettled. Prepare ambiguous questions before asking the user. Relay USER-NEED through orchestrator, not worker chat. chat alone is not the backlog.
 
 ### In-flight steer mailbox
 
@@ -311,7 +311,7 @@ Use ACP or bash-tail plus status polling; do not block on editor task panes.
 Abstract tool roles resolve through host tool-name maps. Type dispatches as executor, reviewer, or planner. Dispatch prompts need the five-layer wrapper. Parallel fix clusters need explicit forbid lists. Split chunks likely to touch many files. Controller-direct only for tiny or plan-marked chunks. Same-provider policy controls review routing trust.
 
 Fabricated approval rejected: Never invent user approval for a gated step.
-Controller dispatch waits for declared readiness requirements. Controller live gate requires supported capability and ready local state. Worker live gate also requires requested transport verified. Discovery probes do not use network or model calls. Discovery probes stay within manifest budget caps.
+Orchestrator dispatch waits for declared readiness requirements. Orchestrator live gate requires supported capability and ready local state. Worker live gate also requires requested transport verified. Discovery probes do not use network or model calls. Discovery probes stay within manifest budget caps.
 
 ## Worker Routing
 
@@ -339,7 +339,7 @@ Default routing by task:
 | Planning / decompose | code/planning worker | controller-direct | Claude Agent |
 | Anticipatory questions | strongest interactive planner | controller-direct | - |
 | Analysis / reflection | controller-direct | - | - |
-| Voice-sensitive prose | controller judgment per chunk | - | - |
+| Voice-sensitive prose | orchestrator judgment per chunk | - | - |
 
 Use adapter manifests and doctor probes for current host/model details; do not
 hardcode yesterday's model list. Cursor internal models do not need passthrough
@@ -360,8 +360,8 @@ surface status, or reduce effective cap. No autonomous capacity mutation in v1.
 
 ### Controller-provider asymmetry
 
-Controller-provider-asymmetry: protect the controller's own provider more
-conservatively than worker providers. Worker failures can reroute; controller
+Controller-provider-asymmetry: protect the orchestrator's own provider more
+conservatively than worker providers. Worker failures can reroute; orchestrator
 failure can strand the user.
 
 Bash-tail recipes live in `protocols/legacy/bash-tail.md`; forking lives in
@@ -406,12 +406,12 @@ Memory writeback requires migration lock ownership.
 Use one status plane across transports.
 Ledger liveness matches PID plus process identity.
 Never `pgrep` for worker liveness; use dispatch/status identity.
-Isolate pidfiles per controller session.
+Isolate pidfiles per orchestrator session.
 Classify ACP failures as upstream, local, or repo.
 
 ### Resume and handoff
 
-Remote workers execute; controller remains designated surface.
+Remote workers execute; orchestrator remains designated surface.
 Propose AGENTS.md changes as diffs only.
 
 On resume or after sleep:
@@ -459,12 +459,12 @@ Git-visible trigger aliases stay out of filenames, manifests, and commit message
 
 - Do not paste long logs, diffs, JSONL streams, or review transcripts.
 - Do not treat PID alone as process identity.
-- Do not hand-iterate (>~3 edit/test cycles) a chunk in controller context — goal-loop it. Controller-direct is for tiny or judgment-only edits.
+- Do not hand-iterate (>~3 edit/test cycles) a chunk in orchestrator context — goal-loop it. Controller-direct is for tiny or judgment-only edits.
 - Do not let one goal-flight session consume all machine capacity.
 - Do not silently skip review when a provider hits rate or session limits.
 - Do not load `/fork` instructions by default.
 - Do not substitute print-mode prompts for live behaviour probes or canonical review dispatch.
-- Forbidden shell families never enter controller dispatch.
+- Forbidden shell families never enter orchestrator dispatch.
 - Auto-approve detection is strict-fail, not advisory.
 - Irreversible operations require explicit user gate.
 - Secrets stay out of probes, wrappers, and logs.

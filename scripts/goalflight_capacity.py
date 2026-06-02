@@ -502,7 +502,7 @@ def pid_alive(pid: int | None) -> bool:
 
 
 def stale_active_leases(data: dict) -> list[dict]:
-    """Active leases whose controller or worker PID is no longer running."""
+    """Active leases whose orchestrator or worker PID is no longer running."""
     stale: list[dict] = []
     for lease in active_leases(data):
         controller_pid = lease.get("controller_pid")

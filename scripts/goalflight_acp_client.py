@@ -41,14 +41,14 @@ OVERSIZED_CLASSIFY_SCAN_BYTES = 64 * 1024
 MAX_DROPPED_FRAME_RECORDS = 20
 DEFAULT_PERMISSION_TIMEOUT_S = 30.0
 # Inline permission mode, phase 1: controller-responsiveness window. How long the
-# worker HOLDS its ACP permission open (awake-time) waiting for the controller to
+# worker HOLDS its ACP permission open (awake-time) waiting for the orchestrator to
 # ack OR decide before AUTO-DECLINING (deny + worker continues, no re-dispatch).
-# 3 min assumes the controller polls+acks each turn (see acp_pool.managed_pool
-# "CONTROLLER CONTRACT"); short enough that a rate-limited/asleep controller never
-# blocks a worker on its own provider, long enough for the controller to get a turn.
+# 3 min assumes the orchestrator polls+acks each turn (see acp_pool.managed_pool
+# "CONTROLLER CONTRACT"); short enough that a rate-limited/asleep orchestrator never
+# blocks a worker on its own provider, long enough for the orchestrator to get a turn.
 DEFAULT_INLINE_PERMISSION_TIMEOUT_S = 180.0
 # Post-ACK user-decision window (awake-time): how long the worker waits for the
-# human after the controller acks, before auto-declining. Long by design (a
+# human after the orchestrator acks, before auto-declining. Long by design (a
 # coffee break); still bounded so a forgotten ack can't hold a slot forever.
 DEFAULT_USER_PERMISSION_TIMEOUT_S = 36000.0  # 10h
 INLINE_PERMISSION_POLL_S = 0.5
@@ -219,8 +219,8 @@ def _unregister_connection(conn: "GoalflightAcpConnection") -> None:
 def mark_connection_detached(pid: int) -> bool:
     """Flag a live connection as intentionally detached (D2 non-destructive stall).
 
-    Rewrites the controller's pidfile so the worker's entry carries ``detached:
-    true`` -> cleanup_ghosts (this controller's next dispatch OR any sibling
+    Rewrites the orchestrator's pidfile so the worker's entry carries ``detached:
+    true`` -> cleanup_ghosts (this orchestrator's next dispatch OR any sibling
     project sharing the pidfile dir) will SKIP it instead of SIGKILLing the
     still-running, intentionally-detached worker. Returns True if the pid was a
     live tracked connection.
@@ -288,7 +288,7 @@ def _write_through_pidfile_locked() -> None:
 
 
 def cleanup_ghosts(active_worker_pids: set[int] | None = None) -> int:
-    """Reap workers recorded by dead controller pidfiles."""
+    """Reap workers recorded by dead orchestrator pidfiles."""
     if not _PIDFILE_DIR.exists():
         return 0
     own_pid = os.getpid()
@@ -324,7 +324,7 @@ def cleanup_ghosts(active_worker_pids: set[int] | None = None) -> int:
                 continue
             if entry.get("detached"):
                 # A worker the runner intentionally DETACHED on a non-destructive
-                # stall (D2): the controller exited but deliberately left the
+                # stall (D2): the orchestrator exited but deliberately left the
                 # worker running for re-attach, so it is NOT a ghost. Reaping it
                 # here would SIGKILL a live, intentional worker (and across
                 # concurrent projects sharing this pidfile dir). Leave it; the
@@ -527,7 +527,7 @@ class AcpLivenessActivity:
             self.inline_held_permissions.setdefault(tool_id, deadline)
 
     def extend_inline_hold(self, tool_id: str, deadline: float) -> None:
-        """Push out an existing inline hold's deadline (controller acked; the worker
+        """Push out an existing inline hold's deadline (orchestrator acked; the worker
         is now waiting on the user). No-op if the hold isn't tracked."""
         if tool_id and tool_id in self.inline_held_permissions:
             self.inline_held_permissions[tool_id] = deadline
@@ -993,7 +993,7 @@ def _same_dir(a: str | None, b: str | None) -> bool:
         return False
 
 
-# Permission router decisions. The controller (this client) auto-allows obvious
+# Permission router decisions. The orchestrator (this client) auto-allows obvious
 # in-scope work so the worker perceives no delay, denies hardcoded-dangerous
 # operations, and ESCALATES genuinely boundary-crossing requests to the user.
 PERMISSION_ALLOW = "allow"
@@ -1122,7 +1122,7 @@ def permission_policy_for_dispatch(
     """Permission router for a dispatch, keyed on OS sandbox posture.
 
     Without OS sandbox, shell/network side effects (execute/fetch) escalate to the
-    controller. With sandbox-exec wrapping the worker subprocess, in-worktree
+    orchestrator. With sandbox-exec wrapping the worker subprocess, in-worktree
     execute and fetch may auto-allow because the OS fence is the backstop.
     """
     base_policy = base or default_permission_policy
@@ -1159,7 +1159,7 @@ class GoalflightClient(ClientBase):  # type: ignore[misc, valid-type]
         self.turn_queue = turn_queue
         self.typed_updates: list[dict[str, Any]] = []
         # Permission router: cwd defines the worktree boundary; permission_policy
-        # is the controller's decision function (default = scope-aware). Escalated
+        # is the orchestrator's decision function (default = scope-aware). Escalated
         # requests are recorded here for the runner to surface to the user.
         # A plain list is safe (no lock): request_permission (the appender) and
         # run_prompt (the reader/clearer) both run as coroutines on the SAME
@@ -1168,7 +1168,7 @@ class GoalflightClient(ClientBase):  # type: ignore[misc, valid-type]
         self.cwd = cwd
         self.permission_policy = permission_policy
         self.permission_escalations: list[dict[str, Any]] = []
-        # Requests the controller auto-declined because it did not answer the
+        # Requests the orchestrator auto-declined because it did not answer the
         # inline hold in time (or the IPC failed). Informational only -- the
         # worker was given a deny and CONTINUED; this does NOT trigger re-dispatch.
         self.permission_auto_declined: list[dict[str, Any]] = []
@@ -1180,10 +1180,10 @@ class GoalflightClient(ClientBase):  # type: ignore[misc, valid-type]
         # Escalation TRANSPORT. "auto" (default): an escalated request is answered
         # with a cancel immediately and surfaced via permission_escalations ->
         # USER-CONFIRM -> re-dispatch. "inline": HOLD the request open, publish it
-        # via file IPC (goalflight_acp_permits), poll for the controller's decision,
+        # via file IPC (goalflight_acp_permits), poll for the orchestrator's decision,
         # and return the real outcome IN PLACE -- it never re-dispatches. Two-phase
-        # awake-time timeout: controller window (permission_inline_timeout_s) then,
-        # on a controller ack, user window (permission_user_timeout_s); each expiry
+        # awake-time timeout: orchestrator window (permission_inline_timeout_s) then,
+        # on an orchestrator ack, user window (permission_user_timeout_s); each expiry
         # AUTO-DECLINES (deny + the worker continues, recorded in
         # permission_auto_declined). Inline requires the router
         # (auto_allow_tools=True); with auto_allow_tools=False every request is
@@ -1347,7 +1347,7 @@ class GoalflightClient(ClientBase):  # type: ignore[misc, valid-type]
             record["decision"] = PERMISSION_ESCALATE
             self._append_permission_router_decision(record)
             if self.permission_mode == PERMISSION_MODE_INLINE:
-                # HOLD the request open and authorize it IN PLACE via the controller
+                # HOLD the request open and authorize it IN PLACE via the orchestrator
                 # (file IPC). Returns a definitive outcome on EVERY normal path -- a
                 # decision (allow/deny) OR an auto-decline-deny on timeout/IPC-error
                 # (the worker then continues; never re-dispatches). Returns None ONLY
@@ -1375,7 +1375,7 @@ class GoalflightClient(ClientBase):  # type: ignore[misc, valid-type]
         return RequestPermissionResponse(outcome=DeniedOutcome(outcome="cancelled"))
 
     def _outcome_from_decision(self, decision: dict[str, Any], options: list[Any]) -> Any:
-        """Map a controller decision file to an ACP outcome. An ``allow`` honors
+        """Map an orchestrator decision file to an ACP outcome. An ``allow`` honors
         the named option_id ONLY if it is an allow option. A missing id falls back
         to the safe allow selector; a reject/unknown id fails closed."""
         if decision.get("decision") == permits.DECISION_ALLOW:
@@ -1402,7 +1402,7 @@ class GoalflightClient(ClientBase):  # type: ignore[misc, valid-type]
         self, record: dict[str, Any], options: list[Any], tool_id: Any, session_id: str
     ) -> Any | None:
         """Hold the ACP permission open across two awake-time phases: a short
-        controller ACK window, then a longer post-ACK user-decision window.
+        orchestrator ACK window, then a longer post-ACK user-decision window.
         Returns an ACP outcome on a decision, or a deny on timeout / IPC error.
         The held permission is registered with the liveness activity so the
         heartbeat treats the pause as healthy, not as a wedge."""
@@ -1423,7 +1423,7 @@ class GoalflightClient(ClientBase):  # type: ignore[misc, valid-type]
                 permits.sweep(directory)
             permits.write_request(directory, record)
             # Nudge any in-process relay that watches the turn queue; harmless to
-            # a controller that polls the directory instead.
+            # an orchestrator that polls the directory instead.
             if self.turn_queue is not None:
                 with contextlib.suppress(Exception):
                     self.turn_queue.put_nowait(
@@ -1434,14 +1434,14 @@ class GoalflightClient(ClientBase):  # type: ignore[misc, valid-type]
                 if got is not None:
                     return self._outcome_from_decision(got, options)
                 if not acked and permits.read_ack(directory, key):
-                    # An ack noticed up to one poll interval after the controller deadline still
-                    # extends -- intentional: a controller that acked at the edge IS alive, so honor
-                    # it rather than auto-decline a live controller on a sub-second timing race.
+                    # An ack noticed up to one poll interval after the orchestrator deadline still
+                    # extends -- intentional: an orchestrator that acked at the edge IS alive, so honor
+                    # it rather than auto-decline a live orchestrator on a sub-second timing race.
                     acked = True
                     deadline = active_monotonic() + self.permission_user_timeout_s
                     self.activity.extend_inline_hold(hold_id, deadline)
                     log.info(
-                        "inline permission ACKed by controller; extending to "
+                        "inline permission ACKed by orchestrator; extending to "
                         "user-decision window (%.0fs awake): %s",
                         self.permission_user_timeout_s,
                         record.get("title"),
@@ -1561,7 +1561,7 @@ class GoalflightAcpConnection:
     _registered: bool = False
     # Set when the runner intentionally DETACHES this worker on a non-destructive
     # stall (D2): the pidfile entry is then marked detached so cleanup_ghosts will
-    # NOT reap the still-running worker after the controller exits.
+    # NOT reap the still-running worker after the orchestrator exits.
     _detached: bool = False
 
     def __post_init__(self) -> None:
@@ -1767,7 +1767,7 @@ def ensure_codex_acp_args(command: str, acp_args: list[str], *, context_mode: bo
     tool surfaces as an answerable permission instead of wedging the worker.
     context_mode=False: disable the context-mode MCP server for THIS worker
     (mcp_servers.context-mode.enabled=false) -- no MCP elicitation surface at all.
-    The controller chooses per dispatch (goalflight_acp_run --context-mode).
+    The orchestrator chooses per dispatch (goalflight_acp_run --context-mode).
 
     The chosen flag is appended LAST after stripping any caller value for the same
     key, so a conflicting/stray caller arg can't defeat the guarantee.

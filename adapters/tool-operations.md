@@ -20,7 +20,7 @@ Each operation requires:
 - `host_tools`: concrete tool or command names available for this agent.
 - `constraints`: adapter-specific safety and routing rules.
 
-Host-tool names are adapter data, not core-doc behavior. A controller must read
+Host-tool names are adapter data, not core-doc behavior. An orchestrator must read
 the manifest before translating abstract operations into host calls.
 
 ## Invocation And Output
@@ -29,10 +29,10 @@ the manifest before translating abstract operations into host calls.
 prompt template. It also declares safe required args, forbidden args,
 justification-gated args, stdin mode, cwd policy, and output parsing. For ACP,
 the manifest describes the wire/dialect contract and wrapper command; it does
-not imply the worker implementation uses the same SDK as the controller.
+not imply the worker implementation uses the same SDK as the orchestrator.
 
 Forbidden args are rejected in invocations, probes, generated wrappers, and
-checked-in configs before live setup, controller launch, or worker dispatch.
+checked-in configs before live setup, orchestrator launch, or worker dispatch.
 
 Goal-mode eligibility requires an output contract with a verified structured
 final event or final regex plus an exit/resume policy.

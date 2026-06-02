@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Controller host preflight matrix (Track A goal 6 — Phase 0 MVP)."""
+"""Orchestrator host preflight matrix (Track A goal 6 — Phase 0 MVP)."""
 
 from __future__ import annotations
 
@@ -146,7 +146,7 @@ def evaluate_status(adapter: str, checks: dict) -> str:
 def remediation(adapter: str, status: str, checks: dict) -> list[str]:
     hints: list[str] = []
     if status == "red" and CONTROLLER_STATUS.get(adapter) == "controller_red":
-        hints.append("Grok is worker-only in Phase 0; do not promote to controller.")
+        hints.append("Grok is worker-only in Phase 0; do not promote to orchestrator.")
     if not all(item.get("ok") for item in checks.get("context_files") or []):
         hints.append("Restore AGENTS.md and SKILL.md in project root.")
     if not checks.get("router", {}).get("ok"):
@@ -157,7 +157,7 @@ def remediation(adapter: str, status: str, checks: dict) -> list[str]:
     elif not host_cli.get("ok"):
         hints.append(f"Fix {adapter} CLI auth/version probe.")
     if status == "yellow" and adapter == "codex":
-        hints.append("Codex controller may run yellow until run-context bundle is generated.")
+        hints.append("Codex orchestrator may run yellow until run-context bundle is generated.")
     return hints
 
 
@@ -213,7 +213,7 @@ def write_probe_artifact(fleet_dir: Path, adapter: str, payload: dict) -> Path:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Controller host preflight matrix")
+    parser = argparse.ArgumentParser(description="Orchestrator host preflight matrix")
     parser.add_argument("--adapter", required=True, choices=sorted(CONTROLLER_STATUS))
     parser.add_argument("--project-root", type=Path, default=REPO_ROOT)
     parser.add_argument("--fleet-dir", type=Path, default=default_fleet_dir())

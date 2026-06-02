@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Codex controller bash-tail worker for Goal Flight harness tests.
+"""Codex orchestrator bash-tail worker for Goal Flight harness tests.
 
 Spawns ``codex exec`` with stdin from a prompt file and streams stdout/stderr
 into the tail file for ``watch-dispatch-tail.sh``.
@@ -67,7 +67,7 @@ def run_codex_bash_tail(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Codex bash-tail controller harness worker")
+    parser = argparse.ArgumentParser(description="Codex bash-tail orchestrator harness worker")
     parser.add_argument("--directory", "-C", required=True, help="Project root")
     parser.add_argument("--prompt-file", type=Path, required=True)
     parser.add_argument("--tail", type=Path, required=True)

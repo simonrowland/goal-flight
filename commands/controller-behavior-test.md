@@ -1,5 +1,5 @@
 ---
-description: "Run scripted controller behavior scenarios (Codex-first bash-tail harness)."
+description: "Run scripted orchestrator behavior scenarios (Codex-first bash-tail harness)."
 ---
 
 # controller-behavior-test [--controller codex] [--scenario doctor-loads]
@@ -8,17 +8,17 @@ Read:
 
 - `docs-private/plans/controller-behavior-harness-plan.md` (when present locally)
 
-Runs the file-backed controller behavior harness. Wave 1 implements **Codex +
+Runs the file-backed orchestrator behavior harness. Wave 1 implements **Codex +
 bash-tail** with the `doctor-loads` scenario. The Claude Code regression path
 uses `claude-code-cli-acp` through Goal Flight ACP so it stays on the
 subscription-routed interactive shim. The multi-host live tier enumerates
-available controllers from `scripts/hosts/controller/probe_matrix.py`, filters
+available orchestrators from `scripts/hosts/controller/probe_matrix.py`, filters
 them through `GOALFLIGHT_LIVE_CONTROLLERS`, and runs every registered scenario
 against that intersection.
 
 ## Host runners
 
-| Controller | Transport | Bash test | Transcript path |
+| Orchestrator | Transport | Bash test | Transcript path |
 |------------|-----------|-----------|-----------------|
 | `codex` | bash-tail `codex exec` | `tests/bash/test-controller-behavior-codex.sh` | harness temp tail |
 | `claude-acp` | ACP shim via `claude-code-cli-acp` | `tests/bash/test-controller-behavior-claude-code-acp.sh` | `docs-private/reviews/<date>-chunk-15/<scenario>.transcript.log` |
@@ -96,8 +96,8 @@ The multi-host runner writes
 - `./tests/run.sh` includes `tests/bash/test-controller-behavior-claude-code-acp.sh`, which
   **skips exit 0** unless `GOALFLIGHT_CONTROLLER_BEHAVIOR=1` and `claude-code-cli-acp` is on PATH.
 - `./tests/run.sh` includes `tests/bash/test-controller-behavior-multi-host.sh`, which
-  **skips exit 0** unless `GOALFLIGHT_LIVE_CONTROLLERS` names at least one available controller.
-  Available controllers not implemented by `behavior_scenario.py` are reported
+  **skips exit 0** unless `GOALFLIGHT_LIVE_CONTROLLERS` names at least one available orchestrator.
+  Available orchestrators not implemented by `behavior_scenario.py` are reported
   as `available_unsupported_controllers`; an unsupported-only env gate exits nonzero.
 - Hermetic structure tests always run via `tests/bash/test-controller-probe-matrix.sh`.
 

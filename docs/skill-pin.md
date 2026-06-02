@@ -1,6 +1,6 @@
 # Skill pin: a stable install for sibling projects
 
-If you run goal-flight as a controller in **several projects** on one machine but
+If you run goal-flight as an orchestrator in **several projects** on one machine but
 also **develop goal-flight itself**, the dev tree's uncommitted work-in-progress
 leaks into every other project — because the native Claude host resolves the
 skill from a single user-level symlink, `~/.claude/skills/goal-flight`, and
@@ -95,7 +95,7 @@ worktree); nothing else to do.
   `--live`, *any* project session that starts gets the live tree. Flip back to
   `--pin` when you finish a dev session. (Most dev — editing files, running
   tests — does not require the skill to be live-loaded; only testing *new
-  controller behavior* does.)
+  orchestrator behavior* does.)
 - **POSIX/WSL only.** This manages a symlink; native Windows skill dispatch is
   read/plan-only (see `docs/hosts/windows.md`).
 - **Do not edit the pin worktree.** It is a detached snapshot; make changes in

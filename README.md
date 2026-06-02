@@ -108,7 +108,7 @@ the resync command in the probe's `resync_command` field; text mode prints
 ## Quickstart
 
 ```bash
-# In your project repo, in a orchestrator session (Claude Code wrapper shown):
+# In your project repo, in an orchestrator session (Claude Code wrapper shown):
 /goal-flight init <topic>         # audit repo, scaffold AGENTS.md/SKILL.md + docs-private/,
                                   # build optional RAG corpus, register codex-trust,
                                   # probe box capacity + ACP-worker availability →

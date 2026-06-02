@@ -1,4 +1,4 @@
-"""Generic bash-tail session runner for controller behavior harnesses."""
+"""Generic bash-tail session runner for orchestrator behavior harnesses."""
 
 from __future__ import annotations
 

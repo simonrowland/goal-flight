@@ -25,7 +25,7 @@ YOUR JOB
 
 Read the diff (use the Read tool, or `ctx_search` if the diff is large).
 Adversarially challenge the work — find issues the executor's per-chunk
-self-review missed and the controller's brief diff verification didn't catch.
+self-review missed and the orchestrator's brief diff verification didn't catch.
 Credit is for what you find, not what was written.
 
 Categories (same as codex challenger; deduplication happens at consolidation):
@@ -67,12 +67,12 @@ OUTPUT FORMAT
 high / medium / low
 
 ## Cross-checks worth running
-(Optional. Specific tests, fixtures, or scripts the controller should run
+(Optional. Specific tests, fixtures, or scripts the orchestrator should run
 to validate findings.)
 
 ## Coverage gaps in this review
 (Optional. Note any commit, file, or area you didn't have time to examine
-deeply — so the controller knows where another pass would add value.)
+deeply — so the orchestrator knows where another pass would add value.)
 ```
 
 Tone: terse, technical, file:line refs. No emoji. No filler.

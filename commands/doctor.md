@@ -53,7 +53,7 @@ package repository; for normal target projects it is skipped as INFO.
   - Codex: Desktop/CLI present, context-mode registered when large-output work
     will run, ACP adapter binary present when the Codex ACP path is considered.
   - Cursor: Desktop, `cursor`, and `cursor-agent` present when Cursor is routed
-    as controller or worker; global or project `mcp.json` has context-mode when
+    as orchestrator or worker; global or project `mcp.json` has context-mode when
     large-output work will run.
     - `/Applications/Cursor.app`
     - `command -v cursor`

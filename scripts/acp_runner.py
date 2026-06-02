@@ -37,16 +37,16 @@ class PromptResult:
     out_of_scope_writes: list[str] = field(default_factory=list)
     """Paths from tool_call locations that fall outside the connection's cwd.
     Populated by run_prompt post-hoc — a scope-leak audit signal for the
-    controller, not a runtime gate. Empty when no leaks OR no recorded cwd."""
+    orchestrator, not a runtime gate. Empty when no leaks OR no recorded cwd."""
     cancelled_for_marker: bool = False
     early_marker: str | None = None
     permission_escalations: list[dict[str, Any]] = field(default_factory=list)
-    """Permission requests the controller's router escalated to the user (the
+    """Permission requests the orchestrator's router escalated to the user (the
     worker asked to cross a boundary it couldn't auto-decide). When non-empty the
-    turn was cancelled (early_marker='USER-CONFIRM'); the controller surfaces
+    turn was cancelled (early_marker='USER-CONFIRM'); the orchestrator surfaces
     these to the user, records a decision, and re-dispatches."""
     permission_auto_declined: list[dict[str, Any]] = field(default_factory=list)
-    """Inline permissions the controller auto-declined (it did not answer within
+    """Inline permissions the orchestrator auto-declined (it did not answer within
     the inline timeout / IPC failed); the worker was denied and CONTINUED --
     informational, not a re-dispatch signal (unlike permission_escalations)."""
     permission_router_decisions: list[dict[str, Any]] = field(default_factory=list)
@@ -212,10 +212,10 @@ async def _run_prompt_locked(
         while True:
             esc = _pending_escalations()
             if esc and not result.cancelled_for_marker:
-                # The controller's permission router escalated a request to the
+                # The orchestrator's permission router escalated a request to the
                 # user. The ACP request was ALREADY answered (cancel), so the
                 # worker is not held open; stop the turn and surface the deferral
-                # as USER-CONFIRM so the controller can ask the user and
+                # as USER-CONFIRM so the orchestrator can ask the user and
                 # re-dispatch. Liveness-safe: we never hold the permission open.
                 result.permission_escalations = esc
                 await _cancel_prompt("USER-CONFIRM")
@@ -404,12 +404,12 @@ def _scan_out_of_scope_paths(tool_calls: list[dict[str, Any]], cwd: str | Path) 
     ACP `ToolCall` / `ToolCallUpdate` may include a `locations: [{path, line?}]`
     array enumerating the files/dirs the call touches. Any path resolving
     outside the connection's working directory is a scope-leak candidate —
-    the worker is reading/writing/executing something the controller's
+    the worker is reading/writing/executing something the orchestrator's
     chunk wrapper didn't scope. Worth surfacing.
 
     Relative paths emitted by workers are resolved against the CONNECTION's
     cwd, not the caller process's cwd. Prevents false positives when the
-    controller script runs from a different directory than the worker.
+    orchestrator script runs from a different directory than the worker.
 
     Empty/None cwd disables scope checking entirely — returns [] regardless
     of tool_calls. Avoids Path("").resolve() spuriously matching the test

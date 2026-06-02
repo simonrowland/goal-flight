@@ -2,8 +2,8 @@
 """goalflight_dispatch.py — crash-safe worker dispatch with a decoupled watcher.
 
 ONE command, run via the host's background-task mechanism, that dispatches a
-worker AND reliably wakes the controller on every terminal state. It fixes the
-"controller hangs because the worker crashed/hung and never sent a wakeup" class
+worker AND reliably wakes the orchestrator on every terminal state. It fixes the
+"orchestrator hangs because the worker crashed/hung and never sent a wakeup" class
 (observed 2026-05-30).
 
 Easy path (agent preset — the common case):
@@ -673,7 +673,7 @@ def _reap_dead_worker_pgroup(pidfile: Path, worker_pid: int) -> None:
         return
     with contextlib.suppress(OSError, AttributeError):
         if hasattr(os, "getpgrp") and pgid == os.getpgrp():
-            return  # never signal the controller's own process group
+            return  # never signal the orchestrator's own process group
     # Re-check liveness immediately before signalling: if worker_pid was reused
     # and is now a live unrelated process, skip rather than risk a wrong target.
     if goalflight_compat.pid_alive(worker_pid):
@@ -1186,7 +1186,7 @@ def main(argv: list[str] | None = None) -> int:
 
         # Read the terminal state the watcher recorded (best-effort). worker_still_alive
         # matters: a terminal marker is a NON-DESTRUCTIVE signal (we never kill the
-        # worker), so if it is still alive the controller should re-attach a watcher to
+        # worker), so if it is still alive the orchestrator should re-attach a watcher to
         # keep following it, not assume it is finished.
         state = None
         try:

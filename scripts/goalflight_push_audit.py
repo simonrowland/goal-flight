@@ -8,7 +8,7 @@ GitHub Git Data API). Read-only: runs only cat-file / ls-remote / rev-parse /
 show + reflog reads, never pushes or mutates. The `git push -f` in ADVICE is a
 printed suggestion string, never executed.
 
-Limitation — do not over-trust `aligned`: a rogue push from the controller's
+Limitation — do not over-trust `aligned`: a rogue push from the orchestrator's
 OWN clone writes a normal push reflog entry, so it reads as `aligned` here.
 That same-clone case is covered by the commit guard + the worker-escalate-not-
 bypass discipline, not by this reflog-based audit. `aligned` means "no remote

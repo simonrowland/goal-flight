@@ -1,7 +1,7 @@
 # Foreground-duration hook protocol
 
 Per the Hard Invariant "Background anything expected to run longer than
-10 seconds," the controller MUST `run_in_background: true` for Bash
+10 seconds," the orchestrator MUST `run_in_background: true` for Bash
 calls that match known-slow command families. Foreground calls block
 the user's terminal for the full duration; a single 180s `./tests/run.sh`
 in foreground = 3 minutes of dead terminal.
@@ -27,7 +27,7 @@ Source data: `docs-private/research/2026-05-28-r2b-protocol-lists/findings.md`.
 add `run_in_background: true` (or block the call with a clear redirect
 message if rewriting is not possible).
 
-**warn**: emit a STDERR warning; do not block. The controller may have
+**warn**: emit a STDERR warning; do not block. The orchestrator may have
 a legitimate reason for foreground (e.g., expected sub-1s + needs
 immediate result).
 
@@ -37,7 +37,7 @@ immediate result).
   the prefix patterns above. force-background prefixes get either
   rewritten to background or hard-blocked (preferring rewrite; if the
   harness's PreToolUse contract doesn't allow rewrites, block with the
-  warn-shape message and let the controller re-emit with
+  warn-shape message and let the orchestrator re-emit with
   `run_in_background: true`).
 - **Ceiling (soft)**: `goalflight_context_audit.py` tracks
   `foreground_over_10s_count` per session; doctor surfaces a WARN

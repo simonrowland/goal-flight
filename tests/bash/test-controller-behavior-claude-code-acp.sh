@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Live controller behavior scenarios via Claude Code ACP shim.
+# Live orchestrator behavior scenarios via Claude Code ACP shim.
 #
 # Skips when:
 #   - claude-code-cli-acp not installed

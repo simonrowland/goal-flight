@@ -1,14 +1,14 @@
 """File-IPC contract for INLINE ACP permission authorization.
 
 When an ACP worker runs with ``permission_mode="inline"`` (AcpProcessPool /
-managed_pool / spawn_acp_connection / GoalflightClient), the controller's
+managed_pool / spawn_acp_connection / GoalflightClient), the orchestrator's
 permission router does NOT immediately deny+re-dispatch a boundary-crossing
 request. Instead the worker's ``request_permission`` handler:
 
   1. writes a *request* file into a shared directory, then
   2. HOLDS the ACP permission open (the worker keeps its slot -- probe 14 of
      2026-05-21 confirmed codex-acp tolerates a long-held ``request_permission``)
-     while it polls for a *decision* file the controller writes after asking the
+     while it polls for a *decision* file the orchestrator writes after asking the
      user, then
   3. returns the REAL outcome (the chosen allow option, or a deny).
 
@@ -19,13 +19,13 @@ channel can never wedge -- the "previously it hung" invariant holds even here.
 This module is the pure, dependency-free contract BOTH sides share:
   - worker side  (goalflight_acp_client.request_permission):
         write_request -> poll read_decision -> clear
-  - controller side (orchestrator / goalflight_acp_run relay):
+  - orchestrator side (orchestrator / goalflight_acp_run relay):
         list_requests -> write_ack (optional, defer to user) -> write_decision
 
 Files (each written atomically via a same-dir temp + os.replace, so a reader
 never sees a partial file):
-    <dir>/<key>.request.json     written by worker,     read by controller
-    <dir>/<key>.decision.json    written by controller, read by worker
+    <dir>/<key>.request.json     written by worker,     read by orchestrator
+    <dir>/<key>.decision.json    written by orchestrator, read by worker
 where ``key = sanitize(session_id) + "." + sanitize(tool_call_id | uuid)``.
 
 Directory selection (``permission_dir``):
@@ -33,8 +33,8 @@ Directory selection (``permission_dir``):
     worker and a separate orchestrator MUST pass the SAME --permission-dir);
   - else ``$GOAL_FLIGHT_PERMISSION_DIR``;
   - else ``<tmpdir>/goal-flight-perms.d/<pid>`` -- PID-scoped so the common
-    in-process pool topology (controller == relay == this process) auto-isolates
-    concurrent controllers without cross-reading each other's requests. A
+    in-process pool topology (orchestrator == relay == this process) auto-isolates
+    concurrent orchestrators without cross-reading each other's requests. A
     cross-process relay can NOT discover a PID-scoped default, so that topology
     requires an explicit dir.
 """
@@ -93,9 +93,9 @@ def make_key(session_id: str | None, tool_call_id: str | None) -> str:
     Encodes session_id + tool_call_id (for human-readable correlation in the
     record/files) PLUS a fresh uuid suffix so the key is unique even when a worker
     reuses a tool_call_id across re-dispatches. Uniqueness matters: a decision the
-    controller writes a hair too late (after the worker already timed out + cleared
+    orchestrator writes a hair too late (after the worker already timed out + cleared
     and started a new cycle) would otherwise be read as the answer to the NEW
-    request. A fresh key per call closes that stale-reply window. The controller
+    request. A fresh key per call closes that stale-reply window. The orchestrator
     always uses ``record["key"]`` verbatim, so it does not need to reconstruct it."""
     sid = _sanitize(session_id or "nosession")
     tid = _sanitize(tool_call_id) if tool_call_id else "tc"
@@ -166,7 +166,7 @@ def read_request(path: str | os.PathLike[str]) -> dict[str, Any] | None:
 
 
 def list_requests(directory: str | os.PathLike[str]) -> list[dict[str, Any]]:
-    """Controller side: every pending request, oldest-first. Skips requests that
+    """Orchestrator side: every pending request, oldest-first. Skips requests that
     already have a decision (the worker hasn't cleared them yet) so a relay does
     not double-answer. Each record carries its ``key`` for write_decision."""
     d = Path(directory)
@@ -193,7 +193,7 @@ def write_decision(
     decision: str,
     option_id: str | None = None,
 ) -> Path:
-    """Controller side: answer a pending request. ``decision`` is 'allow' (with an
+    """Orchestrator side: answer a pending request. ``decision`` is 'allow' (with an
     optional ``option_id`` naming the offered allow option) or 'deny'.
 
     First writer wins for regular decision files. A pre-existing non-regular
@@ -260,7 +260,7 @@ def write_decision(
 
 
 def read_decision(directory: str | os.PathLike[str], key: str) -> dict[str, Any] | None:
-    """Worker side: the controller's decision for ``key``, or None if not yet
+    """Worker side: the orchestrator's decision for ``key``, or None if not yet
     written / malformed. A malformed file returns None (the worker keeps polling
     until the inline timeout, then falls back) rather than mis-resolving."""
     rec = _read_json(decision_path(directory, key))
@@ -275,7 +275,7 @@ def read_decision(directory: str | os.PathLike[str], key: str) -> dict[str, Any]
 
 
 def write_ack(directory: str | os.PathLike[str], key: str) -> Path:
-    """Controller side: signal 'request received, presenting to the user' so the
+    """Orchestrator side: signal 'request received, presenting to the user' so the
     worker extends its hold to the user-decision window. Idempotent (re-ack is a
     no-op overwrite)."""
     payload = {"schema": ACK_SCHEMA, "acked_at": time.time(), "key": key}

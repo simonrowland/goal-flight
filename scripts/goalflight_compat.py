@@ -271,7 +271,7 @@ def wsl_decline_stamp_path(project_root: str | os.PathLike[str]) -> Path:
     """Per-project stamp recording that the operator declined WSL install.
 
     Init is allowed to ask once, but repeated native-Windows runs should not nag.
-    The controller writes this file only after an explicit user-question decline;
+    The orchestrator writes this file only after an explicit user-question decline;
     doctor and init read it to decide whether to surface the WSL install prompt
     again.
     """
@@ -294,9 +294,9 @@ def record_wsl_install_declined(
 ) -> Path:
     """Write the no-nag WSL decline stamp used by init.
 
-    This helper exists so Windows controllers do not invent incompatible stamp
+    This helper exists so Windows orchestrators do not invent incompatible stamp
     formats. If writing fails on Windows, check that ``docs-private`` exists and
-    that the controller has write permission to the project checkout.
+    that the orchestrator has write permission to the project checkout.
     """
     path = wsl_decline_stamp_path(project_root)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -861,7 +861,7 @@ def kill_pid(
             # Windows supports only a narrow signal set. OSError usually means
             # the tracked stale pid already exited or is access-denied; ValueError
             # means the requested signal is unsupported. Treat as "not killed" but
-            # never as a controller crash; the native control plane is degraded by
+            # never as an orchestrator crash; the native control plane is degraded by
             # design.
             return False
 

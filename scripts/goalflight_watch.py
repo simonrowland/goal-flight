@@ -23,7 +23,7 @@ from goalflight_liveness import (
 
 # `\**` tolerance: grok (and other markdown-emitting workers) write **COMPLETE:**
 # etc.; without it the bold marker is never matched and the worker idle-times-out
-# instead of waking the controller (grok review, 2026-05-30). Mirrors watch-dispatch-tail.sh.
+# instead of waking the orchestrator (grok review, 2026-05-30). Mirrors watch-dispatch-tail.sh.
 MARKER_RE = re.compile(r"^\**(STATUS|STEER-ACK|RESULT|USER-NEED|USER-CONFIRM|BLOCKED|COMPLETE):\**\s*(.*)$")
 TERMINAL_MARKERS = {"RESULT", "USER-NEED", "USER-CONFIRM", "BLOCKED", "COMPLETE"}
 # CPU-sampling-failure grace (codex 2026-05-20 P2): require this many consecutive
@@ -135,7 +135,7 @@ def extract_markers(path: Path, max_bytes: int = 10 * 1024 * 1024,
     for idx, line in enumerate(text.splitlines(), start=1):
         stripped = line.strip()
         # Skip only the initial echoed-prompt span. If the worker later emits a
-        # byte-identical real terminal marker, it must still wake the controller.
+        # byte-identical real terminal marker, it must still wake the orchestrator.
         if can_ignore_prefix:
             expected = prompt_prefix[idx - 1] if idx <= len(prompt_prefix) else None
             if expected is not None and stripped == expected:

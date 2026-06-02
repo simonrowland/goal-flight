@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Controller behavior scenarios (scripted prompts + deterministic checks).
+"""Orchestrator behavior scenarios (scripted prompts + deterministic checks).
 
 Wave 1 implements Codex bash-tail ``doctor-loads``. Additional scenarios and
 hosts follow the same contract.
@@ -220,63 +220,63 @@ def _assert_no_hand_iterate(tail_text: str, **_: Any) -> list[dict[str, Any]]:
 
 SCENARIOS: dict[str, dict[str, Any]] = {
     "doctor-loads": {
-        "description": "Controller runs goal-flight doctor and summarizes JSON",
+        "description": "Orchestrator runs goal-flight doctor and summarizes JSON",
         "assert": _assert_doctor_loads,
     },
     "resume-after-compaction": {
-        "description": "Controller resumes from RESUME-NOTES and runs fast test subset",
+        "description": "Orchestrator resumes from RESUME-NOTES and runs fast test subset",
         "assert": _assert_resume_after_compaction,
     },
     "continue-prescribed-step-two": {
-        "description": "Controller runs step 2 without engagement bait when step 1 needs no user decision",
+        "description": "Orchestrator runs step 2 without engagement bait when step 1 needs no user decision",
         "assert": _assert_continue_prescribed_step_two,
     },
     "read-skill-end-to-end": {
-        "description": "Controller reads back-half SKILL.md routing text, not only command lookup",
+        "description": "Orchestrator reads back-half SKILL.md routing text, not only command lookup",
         "assert": _assert_read_skill_end_to_end,
     },
     "compaction-reload-skill": {
-        "description": "Controller reloads SKILL.md after compaction handoff and quotes rotating sentinel",
+        "description": "Orchestrator reloads SKILL.md after compaction handoff and quotes rotating sentinel",
         "assert": _assert_compaction_reload_skill,
     },
     "compaction-reload-in-skill-continuation": {
-        "description": "Controller stays in-skill after compaction by dispatching workers and gating review",
+        "description": "Orchestrator stays in-skill after compaction by dispatching workers and gating review",
         "assert": _assert_compaction_reload_in_skill_continuation,
     },
     "review-flight-at-completion": {
-        "description": "Controller dispatches canonical review before committing a completed chunk",
+        "description": "Orchestrator dispatches canonical review before committing a completed chunk",
         "assert": _assert_review_flight_at_completion,
     },
     "chat-as-requirements": {
-        "description": "Controller appends mid-session asks to the active queue without pivoting",
+        "description": "Orchestrator appends mid-session asks to the active queue without pivoting",
         "assert": _assert_chat_as_requirements,
     },
     "draft-goal-office-hours": {
-        "description": "Controller routes fuzzy draft goals to office-hours or ask-questions before implementation",
+        "description": "Orchestrator routes fuzzy draft goals to office-hours or ask-questions before implementation",
         "assert": _assert_draft_goal_office_hours,
     },
     "vague-goal-premise-backlog": {
-        "description": "Controller records vague premises in a premise backlog instead of blocking on clarification",
+        "description": "Orchestrator records vague premises in a premise backlog instead of blocking on clarification",
         "assert": _assert_vague_goal_premise_backlog,
     },
     "context-load-order": {
-        "description": "Controller reads AGENTS.md, SKILL.md, then the relevant protocol in order",
+        "description": "Orchestrator reads AGENTS.md, SKILL.md, then the relevant protocol in order",
         "assert": _assert_context_load_order,
     },
     "goal-loop-default": {
-        "description": "Controller routes convergence-heavy implementation to a goal-loop dispatch",
+        "description": "Orchestrator routes convergence-heavy implementation to a goal-loop dispatch",
         "assert": _assert_goal_loop_default,
     },
     "dispatch-cli-worker-via-crash-safe-command": {
-        "description": "Controller launches CLI workers through the crash-safe dispatch wrapper",
+        "description": "Orchestrator launches CLI workers through the crash-safe dispatch wrapper",
         "assert": _assert_dispatch_cli_worker_crash_safe,
     },
     "never-pgrep-for-worker-liveness": {
-        "description": "Controller checks worker liveness through identity-aware status surfaces",
+        "description": "Orchestrator checks worker liveness through identity-aware status surfaces",
         "assert": _assert_never_pgrep_worker_liveness,
     },
     "no-hand-iterate": {
-        "description": "Controller stops after the edit/test cycle smell and delegates the loop",
+        "description": "Orchestrator stops after the edit/test cycle smell and delegates the loop",
         "assert": _assert_no_hand_iterate,
     },
 }
@@ -732,12 +732,12 @@ def run_scenario(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Goal Flight controller behavior scenario runner")
-    parser.add_argument("--controller", default="codex", help="Controller host id")
+    parser = argparse.ArgumentParser(description="Goal Flight orchestrator behavior scenario runner")
+    parser.add_argument("--controller", default="codex", help="Orchestrator host id")
     parser.add_argument("--scenario", default="doctor-loads", help="Scenario id")
     parser.add_argument("--directory", "-C", default=str(REPO_ROOT), help="Project root")
     parser.add_argument("--timeout", type=float, default=300.0, help="Scenario timeout seconds")
-    parser.add_argument("--transcript-dir", help="Directory for live controller transcripts")
+    parser.add_argument("--transcript-dir", help="Directory for live orchestrator transcripts")
     parser.add_argument("--json", action="store_true", help="Emit JSON")
     args = parser.parse_args()
 

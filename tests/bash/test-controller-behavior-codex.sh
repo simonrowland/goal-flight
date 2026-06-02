@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Live Codex controller behavior scenarios (bash-tail).
+# Live Codex orchestrator behavior scenarios (bash-tail).
 #
 # Skips when:
 #   - codex not installed

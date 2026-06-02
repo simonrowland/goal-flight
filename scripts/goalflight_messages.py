@@ -415,7 +415,7 @@ def cmd_read(args: argparse.Namespace) -> int:
 
 
 def format_controller_relay(aggregate: dict) -> str | None:
-    """One-line summary for controller host when open user_needs exist."""
+    """One-line summary for orchestrator host when open user_needs exist."""
     needs = aggregate.get("open_user_needs") or []
     if not needs:
         return None

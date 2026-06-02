@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Live controller behavior scenarios across env-gated available hosts.
+# Live orchestrator behavior scenarios across env-gated available hosts.
 #
 # Skips unless GOALFLIGHT_LIVE_CONTROLLERS is set to a comma-separated host list.
 

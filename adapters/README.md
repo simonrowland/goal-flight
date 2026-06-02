@@ -16,7 +16,7 @@ projection.
 Static capability and machine-local readiness are separate.
 
 - `support.controller` and `support.worker` are checked-in static capability
-  declarations. They say whether an agent can serve as controller or worker in
+  declarations. They say whether an agent can serve as orchestrator or worker in
   principle: `supported`, `candidate`, or `unsupported`.
 - `local_readiness_state` describes the machine-local readiness record shape.
   Probe executors, setup, and doctor flows own actual readiness files. Checked-
@@ -25,7 +25,7 @@ Static capability and machine-local readiness are separate.
 
 Live work requires both layers to pass. `candidate`, `unsupported`,
 `config_only`, `probe_required`, `not_installed`, and `forbidden-arg` paths
-deny controller launch and worker dispatch.
+deny orchestrator launch and worker dispatch.
 
 ## Validation Flow
 
@@ -36,7 +36,7 @@ validate_adapter_gate(agent_id, role, live_entry, requested_transport, local_sta
 ```
 
 The gate consumes the manifest plus machine-local readiness. It returns whether
-live controller launch or worker dispatch is allowed, a denial reason, required
+live orchestrator launch or worker dispatch is allowed, a denial reason, required
 probe ids, blocked fields, and a safe next action. Default result is deny.
 
 ## Files

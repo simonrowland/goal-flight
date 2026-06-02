@@ -1,6 +1,6 @@
 # vague-goal-premise-backlog fixture prompt
 
-You are running a Goal Flight controller behavior test.
+You are running a Goal Flight orchestrator behavior test.
 
 Repository: {{PROJECT_ROOT}}
 
@@ -11,7 +11,7 @@ Simulated user request:
 The premise is unclear and should be recorded for premise review rather than
 blocking the user for clarification.
 
-Reply as the controller with:
+Reply as the orchestrator with:
 
 - `BACKLOG: <docs-private/premises-*.md, commands/premises.md, or office-hours backlog row>`
 - one compact row describing the premise and uncertainty

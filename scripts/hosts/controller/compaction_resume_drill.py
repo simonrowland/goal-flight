@@ -3,7 +3,7 @@
 
 Mimics ``/goal-flight resume`` + verify tests still pass after handoff from
 RESUME-NOTES. Used by hermetic bash tests and as the ground-truth procedure
-that live controller scenarios should follow.
+that live orchestrator scenarios should follow.
 """
 
 from __future__ import annotations

@@ -1,4 +1,4 @@
-You are running a Goal Flight **autonomous throughput** controller behavior test.
+You are running a Goal Flight **autonomous throughput** orchestrator behavior test.
 
 Repository: {{PROJECT_ROOT}}
 

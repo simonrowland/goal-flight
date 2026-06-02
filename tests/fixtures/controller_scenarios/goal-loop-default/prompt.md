@@ -1,4 +1,4 @@
-You are running a Goal Flight controller behavior test for goal-loop-default.
+You are running a Goal Flight orchestrator behavior test for goal-loop-default.
 
 Repository: {{PROJECT_ROOT}}
 

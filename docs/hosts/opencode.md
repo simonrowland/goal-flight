@@ -19,7 +19,7 @@ check for drift, run
 `python3 scripts/goalflight_doctor.py --project-root "$PWD" --json` and inspect
 `installed_skill_drift`; text mode prints `installed_skill_md_hash` WARNs.
 
-OpenCode can run Goal Flight as a controller through the installed skill wrapper
+OpenCode can run Goal Flight as an orchestrator through the installed skill wrapper
 and can run `opencode acp` as an ACP worker.
 
 - OpenCode config lives in `~/.config/opencode/opencode.json` globally or

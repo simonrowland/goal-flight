@@ -147,7 +147,7 @@ async def _relay_decision(
     hold_extra: float = 0.0,
     timeout: float = 20.0,
 ):
-    """Simulate the controller relay: wait for a pending inline request to appear,
+    """Simulate the orchestrator relay: wait for a pending inline request to appear,
     optionally HOLD `hold_extra` seconds (to exercise run_prompt's idle tolerance),
     then write the decision. Returns the request record, or None on timeout."""
     deadline = time.monotonic() + timeout
@@ -579,7 +579,7 @@ async def case_permission_escalate_out_of_worktree() -> None:
     # A worker permission request targeting a path OUTSIDE its cwd is ESCALATED:
     # the ACP request is answered with a cancel (worker never held open), the turn
     # is cancelled with USER-CONFIRM, and the escalation is surfaced for the
-    # controller to relay to the user + re-dispatch. The 'previously it hung' case,
+    # orchestrator to relay to the user + re-dispatch. The 'previously it hung' case,
     # now liveness-safe.
     conn = await _connect("permission_escalate")  # cwd == ROOT
     try:
@@ -597,7 +597,7 @@ async def case_permission_escalate_out_of_worktree() -> None:
 
 async def case_permission_fetch_escalates() -> None:
     # A network/fetch tool (ToolKind 'fetch') is escalated even with no file
-    # locations -- internet access is a boundary the controller routes to the user.
+    # locations -- internet access is a boundary the orchestrator routes to the user.
     conn = await _connect("permission_fetch")
     try:
         result = await run_prompt(conn, "go", idle_timeout=10)
@@ -610,9 +610,9 @@ async def case_permission_fetch_escalates() -> None:
 
 async def case_permission_inline_allow_authorizes_in_place() -> None:
     # permission_mode="inline": a boundary-crossing request is HELD open while the
-    # controller authorizes it in place (file IPC), then the worker proceeds with
+    # orchestrator authorizes it in place (file IPC), then the worker proceeds with
     # the real allow option -- NO re-dispatch. Also proves run_prompt tolerates the
-    # hold: idle_timeout (1s) is shorter than the controller's hold (2s), so the
+    # hold: idle_timeout (1s) is shorter than the orchestrator's hold (2s), so the
     # worker would be cancelled if the inline hold weren't treated as healthy.
     with tempfile.TemporaryDirectory() as d:
         conn = await _connect_inline("permission_inline", permission_dir=d, inline_timeout=30.0)
@@ -651,7 +651,7 @@ async def case_permission_inline_deny_cancels_in_place() -> None:
 
 
 async def case_permission_inline_timeout_auto_declines() -> None:
-    # No controller answers within the (awake-time) inline timeout: the worker is
+    # No orchestrator answers within the (awake-time) inline timeout: the worker is
     # given a definitive DENY and CONTINUES its turn (NO re-dispatch). The
     # auto-decline is surfaced informationally.
     with tempfile.TemporaryDirectory() as d:
@@ -675,12 +675,12 @@ async def case_permission_inline_ack_extends_to_user_window() -> None:
                                      inline_timeout=0.5, user_timeout=10.0)
         try:
             run_task = asyncio.create_task(run_prompt(conn, "go", idle_timeout=10))
-            # ack immediately, decide only AFTER the 0.5s controller window
+            # ack immediately, decide only AFTER the 0.5s orchestrator window
             for _ in range(200):
                 reqs = permits.list_requests(d)
                 if reqs:
                     permits.write_ack(d, reqs[0]["key"])
-                    await asyncio.sleep(1.0)            # past the controller window
+                    await asyncio.sleep(1.0)            # past the orchestrator window
                     permits.write_decision(d, reqs[0]["key"], "allow", "approved")
                     break
                 await asyncio.sleep(0.02)
@@ -1111,7 +1111,7 @@ def case_permission_policy_os_sandbox_unit() -> None:
 
 
 def case_permits_ipc_roundtrip_unit() -> None:
-    # The inline file-IPC contract: write a request, the controller lists it and
+    # The inline file-IPC contract: write a request, the orchestrator lists it and
     # writes a decision, the worker reads it, then clears. Here we assert the
     # round-trip + that an answered request drops out of list_requests and that a
     # bad decision value is rejected.
@@ -1128,7 +1128,7 @@ def case_permits_ipc_roundtrip_unit() -> None:
         permits.write_decision(d, key, "allow", option_id="approved")
         got = permits.read_decision(d, key)
         assert got and got["decision"] == "allow" and got["option_id"] == "approved", got
-        # an answered request is hidden from the controller's pending list
+        # an answered request is hidden from the orchestrator's pending list
         assert permits.list_requests(d) == [], "answered request still listed as pending"
         permits.clear(d, key)
         assert not permits.request_path(d, key).exists()
@@ -1151,7 +1151,7 @@ def case_permits_ipc_roundtrip_unit() -> None:
             raise AssertionError("write_decision must reject non-allow/deny")
         except ValueError:
             pass
-    # PID-scoped default dir (no explicit / no env) isolates concurrent controllers
+    # PID-scoped default dir (no explicit / no env) isolates concurrent orchestrators
     old_env = os.environ.pop(permits.ENV_PERMISSION_DIR, None)
     try:
         assert str(os.getpid()) in str(permits.permission_dir())

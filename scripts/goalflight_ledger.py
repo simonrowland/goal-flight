@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Machine-local goal-flight dispatch ledger.
 
-Records process identity next to prompt/session metadata so controllers can
+Records process identity next to prompt/session metadata so orchestrators can
 recover after sleep, compaction, or parallel session overlap without reading
 raw logs into the model context.
 """

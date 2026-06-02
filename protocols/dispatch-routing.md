@@ -2,7 +2,7 @@
 
 Choose the smallest execution shape that can finish safely. Routing has two
 orthogonal axes: **iteration pattern** (how many turns) and **comms shape**
-(how the controller observes the worker). Pick one value from each.
+(how the orchestrator observes the worker). Pick one value from each.
 
 ## Axis 1 — Iteration pattern
 
@@ -10,18 +10,18 @@ orthogonal axes: **iteration pattern** (how many turns) and **comms shape**
   Default. Use when the chunk has a clear definition of done and fits one
   worker context.
 - `goal-mode loop`: worker iterates against a goal across multiple turns,
-  either by self-loop (codex `/goal`, Grok Build headless) or by controller
+  either by self-loop (codex `/goal`, Grok Build headless) or by orchestrator
   re-dispatch through the same session. Use when the chunk needs
   review-revise cycles, exceeds one turn, or the worker should keep refining
   until a marker fires.
 
 ## Axis 2 — Comms shape
 
-- `controller-direct`: no worker spawned. The controller does the edit itself.
+- `controller-direct`: no worker spawned. The orchestrator does the edit itself.
   Use only for tiny local work expected to finish in seconds. If the task
   grows, stop and dispatch.
 - `acp`: structured JSON-RPC stream over stdio. Default whenever an adapter
-  exists. The controller sees turn boundaries, tool calls, plan entries, and
+  exists. The orchestrator sees turn boundaries, tool calls, plan entries, and
   stop reasons as discrete events, not text.
   ```bash
   python3 <skill-root>/scripts/goalflight_acp_run.py \
@@ -49,7 +49,7 @@ orthogonal axes: **iteration pattern** (how many turns) and **comms shape**
   goal-mode worker emitting periodic STATUS markers never trips it. Override
   with `--idle-timeout <secs>` (or `--idle-timeout 0` for no idle gate,
   relying on PID liveness + the worker's terminal marker).
-- `bash-tail`: worker writes stdout/stderr to files; the controller watches
+- `bash-tail`: worker writes stdout/stderr to files; the orchestrator watches
   via marker grep. Fallback only when no ACP adapter is available. See
   `protocols/legacy/bash-tail.md` for recipes and hazards (incl. the
   context-mode-dispatch caveat — never wrap a spawn or `tail -f` in
@@ -66,12 +66,12 @@ orthogonal axes: **iteration pattern** (how many turns) and **comms shape**
 
 Treat routing candidates as first-class only after their readiness gate passes:
 
-| Candidate | Controller use | Worker use | Readiness gate |
+| Candidate | Orchestrator use | Worker use | Readiness gate |
 |---|---|---|---|
 | Codex | yes | yes | Desktop/CLI available when needed, context-mode registered for large-output work, ACP handshake passes for structured dispatch. |
-| Cursor | yes | yes | Cursor Desktop or CLI path present for controller use; `cursor-agent` present and ACP handshake passes for worker use; model-currency probe is current or explicitly accepted as stale. |
+| Cursor | yes | yes | Cursor Desktop or CLI path present for orchestrator use; `cursor-agent` present and ACP handshake passes for worker use; model-currency probe is current or explicitly accepted as stale. |
 | Grok | yes | yes | Grok Build/headless flags present; structured ACP path passes before ACP dispatch; bash-tail is fallback-only and must obey the marker limits in Composition rules. |
-| OpenCode | yes | yes | `opencode` on PATH; `opencode acp` for structured dispatch; HTTP helper (`scripts/hosts/opencode/prompt.py`) for controller one-shots; bash-tail via `scripts/hosts/opencode/bash_tail.py` (not bare `opencode run`). |
+| OpenCode | yes | yes | `opencode` on PATH; `opencode acp` for structured dispatch; HTTP helper (`scripts/hosts/opencode/prompt.py`) for orchestrator one-shots; bash-tail via `scripts/hosts/opencode/bash_tail.py` (not bare `opencode run`). |
 | Claude compatibility path | yes | yes | Adapter-owned CLI/plugin probes pass; startup gate applies where the adapter requires serialized initialization. |
 
 If a candidate has static adapter capability but fails local readiness, do not
@@ -102,8 +102,8 @@ runner and watchers use **process-group CPU** as the false-positive killer:
   the runner re-samples and the watchers require consecutive samples, riding out
   a transient `ps` failure before declaring a wedge.
 - Heartbeats are **runner-written FILES, never task-notifications.** The
-  controller is woken only on an actionable transition (completion / wedge /
-  blocked), never per beat — a per-beat wake would re-process the controller's
+  orchestrator is woken only on an actionable transition (completion / wedge /
+  blocked), never per beat — a per-beat wake would re-process the orchestrator's
   whole cached session (ruinous).
 - **Handshake retry-once**: if the handshake (`initialize`/`session_new`) stalls
   — the intermittent codex-acp wedge, where the worker spawns but never answers
@@ -155,12 +155,12 @@ records.
 ## Worker permissions and context-mode over ACP
 
 A spawned worker's permissions resolve **inside the runner subprocess**, not at
-the controller. `goalflight_acp_run.py` answers every `session/request_permission`
-itself via `auto_allow_tools=True` (default). The controller is never in the
+the orchestrator. `goalflight_acp_run.py` answers every `session/request_permission`
+itself via `auto_allow_tools=True` (default). The orchestrator is never in the
 per-tool permission loop and **cannot be asked to approve a tool call in real
-time**. The only worker→controller escalation channel is the text markers
+time**. The only worker→orchestrator escalation channel is the text markers
 `USER-NEED:` / `USER-CONFIRM:` (`worker-markers.md`): a worker that needs a human
-decision stops and emits one; the controller relays it.
+decision stops and emits one; the orchestrator relays it.
 
 Three separate layers can affect a spawned worker. Do not conflate them:
 
@@ -175,7 +175,7 @@ Three separate layers can affect a spawned worker. Do not conflate them:
 2. **codex sandbox + approval policy** — useful for the codex exec/bash-tail
    path and shell approvals. Open it with `--sandbox workspace-write -c
    approval_policy=never` (the classifier-safe form of "full permissions").
-   `--dangerously-bypass-approvals-and-sandbox` is rejected by some controllers'
+   `--dangerously-bypass-approvals-and-sandbox` is rejected by some orchestrators'
    auto-mode safety classifiers and is unnecessary when the worker's edit scope
    is its workspace.
 3. **MCP elicitation** — raised by tool-level user-input request handlers such as
@@ -196,7 +196,7 @@ end-to-end run (index + search, completed clean).
 
 Distinct, and still true: do **not** wrap the *dispatch* or a `tail -f` in
 `ctx_execute` / `ctx_batch_execute` (the controller-side caveat in Axis 2 and
-`legacy/bash-tail.md`). That is the controller offloading a long-running spawn
+`legacy/bash-tail.md`). That is the orchestrator offloading a long-running spawn
 into context-mode's bounded-command timeout — unrelated to a worker calling
 context-mode tools.
 

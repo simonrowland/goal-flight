@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Hermetic tests for controller probe matrix structure."""
+"""Hermetic tests for orchestrator probe matrix structure."""
 
 from __future__ import annotations
 
@@ -291,7 +291,7 @@ def test_read_skill_end_to_end_scenario_registered() -> None:
 
     checks = read_skill_end_to_end_checks(
         "Controller-provider asymmetry: Worker failures can reroute; "
-        "controller failure can strand the user."
+        "orchestrator failure can strand the user."
     )
     assert isinstance(checks, list)
     assert [check["id"] for check in checks] == [

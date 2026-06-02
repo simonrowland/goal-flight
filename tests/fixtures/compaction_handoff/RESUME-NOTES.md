@@ -1,7 +1,7 @@
 # Resume Notes — compaction handoff fixture (hermetic drill)
 
 **Date:** 2026-05-24 (fixture)  
-**Topic:** Controller behavior harness — post-compaction wake drill
+**Topic:** Orchestrator behavior harness — post-compaction wake drill
 
 ## TL;DR
 

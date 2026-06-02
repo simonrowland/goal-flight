@@ -6,7 +6,7 @@ chunk-level wording into milestone docs or vice versa).
 
 ## When
 
-After a chunk's implementation and focused tests pass, before the controller
+After a chunk's implementation and focused tests pass, before the orchestrator
 commits. At least one independent review per chunk — executor self-review
 alone is **not** sufficient.
 
@@ -66,7 +66,7 @@ sandbox+bypass flags, so the gate intercepted it as a write-grade execute.
 
 ## Where the review runs
 
-Both worker and controller can run the same bash-tail shape:
+Both worker and orchestrator can run the same bash-tail shape:
 
 1. **Worker phase (preferred when worker can)**: the goal-mode worker
    includes a self-review step in its loop. It spawns the bash-tail
@@ -74,10 +74,10 @@ Both worker and controller can run the same bash-tail shape:
    surfaces P0/P1/P2 as queue items or holds the chunk open. Worker commit
    includes review evidence (the `codex-review.final.md` path) in the
    commit message.
-2. **Controller phase (fallback / second-opinion)**: if the worker can't
+2. **Orchestrator phase (fallback / second-opinion)**: if the worker can't
    run the review (e.g., the chunk's authorized scope doesn't include it,
    or the dispatch transport doesn't let the worker spawn subprocesses
-   cleanly), the controller runs the same bash-tail invocation
+   cleanly), the orchestrator runs the same bash-tail invocation
    controller-direct after the worker's commit. Findings flow back as
    inline fixes (P3-safe-easy) or follow-up commits (P0/P1/P2).
 
@@ -116,7 +116,7 @@ tagging framing and is the R19 regression class.
 ## Complementary — `./scripts/autoreview.sh`
 
 `scripts/autoreview.sh` is a complementary diff-local pre-commit pass. It
-runs in parallel with `gstack /review` per the controller's choice for a
+runs in parallel with `gstack /review` per the orchestrator's choice for a
 given chunk — does **not** replace gstack as the default. autoreview catches
 diff-local issues (API footguns, missing tests on touched paths, regression
 invariants) that a structural reviewer may not prioritize; the two reviewers
@@ -135,7 +135,7 @@ are concern-diverse.
 
 Background long autoreview runs per `commands/execute.md` step 5 — write
 output to `docs-private/reviews/<date>-chunk-<slug>/autoreview.txt` and poll;
-do not block the controller on streaming stdout.
+do not block the orchestrator on streaming stdout.
 
 ## Layers
 
@@ -143,7 +143,7 @@ do not block the controller on streaming stdout.
 |-------|------|---------|
 | Executor self-review | In-worker pass (`prompts/executor-self-review.md`) | Every chunk (inside worker output) |
 | **Chunk review — `gstack /review` (default)** | **Pre-commit independent structural review** | **Every commit-worthy chunk** |
-| `./scripts/autoreview.sh` (complementary) | Diff-local pre-commit pass, parallel with gstack | Per chunk when controller chooses |
+| `./scripts/autoreview.sh` (complementary) | Diff-local pre-commit pass, parallel with gstack | Per chunk when orchestrator chooses |
 | Milestone review | `protocols/milestone-review.md` (gstack `/review` + concern-diverse sweep) | At K-commit cadence or `[milestone]` queue chunks |
 
 Minimum before commit: focused tests green **and** at least one independent
@@ -155,7 +155,7 @@ but does not replace the gstack default.
 If doctor reports both unavailable in the host environment:
 
 1. Require executor self-review markers in the worker transcript.
-2. Controller inspects diff + focused test output as a fallback gate.
+2. Orchestrator inspects diff + focused test output as a fallback gate.
 3. Record WARN in `docs-private/env-caveats.md` and recommend installing
    gstack (and optionally autoreview as a complementary addon) at next init.
 

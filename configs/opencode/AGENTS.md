@@ -1,6 +1,6 @@
 # goal-flight
 
-Goal Flight is available as an OpenCode controller workflow when installed from
+Goal Flight is available as an OpenCode orchestrator workflow when installed from
 the cloned repository with `./setup.sh --apply --yes --opencode`.
 
 When a task asks for Goal Flight, long-running orchestration, review flights,

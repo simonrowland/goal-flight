@@ -1,4 +1,4 @@
-You are running a Goal Flight controller behavior test for never-pgrep-for-worker-liveness.
+You are running a Goal Flight orchestrator behavior test for never-pgrep-for-worker-liveness.
 
 Repository: {{PROJECT_ROOT}}
 

@@ -1,12 +1,12 @@
 ---
-description: "Nondestructive OpenCode controller self-dispatch verification."
+description: "Nondestructive OpenCode orchestrator self-dispatch verification."
 ---
 
 # self-dispatch-test
 
-Verify the **current host** can act as a Goal Flight controller and dispatch
+Verify the **current host** can act as a Goal Flight orchestrator and dispatch
 read-only OpenCode workers to itself on both supported transports (ACP and
-bash-tail). This is the OpenCode-specific form of the controller
+bash-tail). This is the OpenCode-specific form of the orchestrator
 generalization check in `AGENTS.md`.
 
 Read:
@@ -17,12 +17,12 @@ Read:
 
 ## When to invoke
 
-- User asks to verify OpenCode self-dispatch, controller generalization, or
+- User asks to verify OpenCode self-dispatch, orchestrator generalization, or
   "can goal-flight dispatch workers from OpenCode?"
 - After `./setup.sh --apply --yes --opencode` on a new machine.
 - Before unattended execute on OpenCode when worker readiness is unknown.
 
-## Controller steps
+## Orchestrator steps
 
 1. Confirm Goal Flight is loaded (`AGENTS.md` → host skill → repository
    `SKILL.md`).
@@ -59,7 +59,7 @@ Do **not** paste raw tail files or full doctor JSON.
 
 ## What this proves
 
-- Controller preflight (doctor + capacity) runs from the OpenCode host.
+- Orchestrator preflight (doctor + capacity) runs from the OpenCode host.
 - OpenCode can spawn **itself** as an ACP worker via `goalflight_acp_run.py`.
 - OpenCode can spawn **itself** as a bash-tail worker via `scripts/hosts/opencode/bash_tail.py`
   and the standard `watch-dispatch-tail.sh` watcher.

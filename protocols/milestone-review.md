@@ -56,7 +56,7 @@ sweep — grok or cursor in parallel against the same diff — to catch what
 codex misses. Claude Agent reviewers are the third option, used only
 when codex AND the sweep tool are both unreachable. Codex / grok /
 cursor consume their own provider budgets; Claude Agent consumes the
-controller's session budget.
+orchestrator's session budget.
 
 Cursor's 2026-05-19 model update brought its coding benchmark on par
 with Claude Opus, so cursor is now also a viable reviewer for the

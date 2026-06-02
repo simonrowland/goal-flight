@@ -1,6 +1,6 @@
 # read-skill-end-to-end fixture prompt
 
-You are running a Goal Flight controller behavior test.
+You are running a Goal Flight orchestrator behavior test.
 
 Repository: {{PROJECT_ROOT}}
 
@@ -10,9 +10,9 @@ Do not stop at the command table or navigation map.
 Question:
 
 In the back half of `SKILL.md`, under Worker Routing, there is a subsection that
-describes why the controller's own provider must be protected more conservatively
+describes why the orchestrator's own provider must be protected more conservatively
 than worker providers. Name the exact subsection label and quote the exact
-sentence that compares worker failures with controller failure.
+sentence that compares worker failures with orchestrator failure.
 
 Reply with:
 

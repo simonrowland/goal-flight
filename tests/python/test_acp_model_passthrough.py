@@ -63,7 +63,7 @@ def case_build_worker_injects_model() -> None:
         assert "--model" in argv and argv[argv.index("--model") + 1] == MODEL, (agent, argv)
         argv0 = _build(agent, None)  # default: no model -> no --model
         assert "--model" not in argv0, (agent, argv0)
-    # raw `-- <cmd>` passthrough ignores model (the controller supplies the cmd).
+    # raw `-- <cmd>` passthrough ignores model (the orchestrator supplies the cmd).
     assert _build("x", MODEL, raw=["echo", "hi"]) == ["echo", "hi"]
 
 

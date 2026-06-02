@@ -7,7 +7,7 @@
 > invokes `/goal-flight <command>`. Reading repository `SKILL.md`
 > end-to-end is the load-order step that follows; do not skip it.
 
-## Companion tools (defined for non-Claude controllers loading this file)
+## Companion tools (defined for non-Claude orchestrators loading this file)
 
 - **gstack** — Garry Tan's skill pack (`/review`, `/challenge`, `/office-hours`,
   `/plan-eng-review`, `/cso`, `/investigate`, etc.). Installs at
@@ -20,7 +20,7 @@
   do **not** hand-roll a custom review prompt.
 - **context-mode** — MCP plugin that offloads large command outputs
   (diffs, integration test runs, codex tail files, large greps) to an FTS5
-  sandbox queried by pattern. Lets the controller analyze big artifacts
+  sandbox queried by pattern. Lets the orchestrator analyze big artifacts
   without consuming its own context window. Installs per-host (Claude Code:
   `~/.claude/plugins/cache/context-mode/...`; Codex: registered via
   `scripts/register-context-mode-codex.py`).
@@ -36,7 +36,7 @@
 - Load order: this agent instruction file, then the installed host wrapper when
   available, then repository `SKILL.md`, then only the `commands/*.md` and
   `protocols/*.md` files referenced by the invoked command.
-- For tests of controller generalization, use a nondestructive task: run doctor,
+- For tests of orchestrator generalization, use a nondestructive task: run doctor,
   make a compact plan, check capacity, launch one read-only worker, and summarize
   status/ledger evidence without writing to the repository.
 - During an active goal-flight run, keep advancing the queue and accumulating

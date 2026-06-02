@@ -12,7 +12,7 @@ contract):
    `scripts/goalflight_capacity.py status`).
 3. Newest `docs-private/RESUME-NOTES-*.md` "state" line (if present).
 
-A session id ties a controller invocation to the run. The id lives in
+A session id ties an orchestrator invocation to the run. The id lives in
 `docs-private/.goal-flight-current-session.json` (per-terminal, gitignored).
 The session id is also stamped into the active goal-queue frontmatter under
 `current_session` (so multi-machine takeover is detectable) and appended to

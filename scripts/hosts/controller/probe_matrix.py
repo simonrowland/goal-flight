@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Discover installed controller hosts and usable transports.
+"""Discover installed orchestrator hosts and usable transports.
 
 Emits compact JSON for test harness skip/run decisions. Does not invoke models.
 """
@@ -60,7 +60,7 @@ def probe_controller(controller_id: str) -> dict[str, Any]:
             "id": controller_id,
             "available": False,
             "transports": [],
-            "skip_reason": "unknown controller id",
+            "skip_reason": "unknown orchestrator id",
         }
     return fn()
 
@@ -103,7 +103,7 @@ def _probe_claude_acp() -> dict[str, Any]:
         "binary": binary,
         "transports": ["acp"],
         "skip_reason": None,
-        "notes": "billing-safe controller regression path; do not use claude -p",
+        "notes": "billing-safe orchestrator regression path; do not use claude -p",
     }
 
 
@@ -179,9 +179,9 @@ def build_probe_matrix(*, controllers: list[str] | None = None) -> dict[str, Any
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Goal Flight controller probe matrix")
-    parser.add_argument("--controller", action="append", dest="controllers", help="Limit to controller id(s)")
-    parser.add_argument("--list-available", action="store_true", help="Print available controller ids, one per line")
+    parser = argparse.ArgumentParser(description="Goal Flight orchestrator probe matrix")
+    parser.add_argument("--controller", action="append", dest="controllers", help="Limit to orchestrator id(s)")
+    parser.add_argument("--list-available", action="store_true", help="Print available orchestrator ids, one per line")
     parser.add_argument("--json", action="store_true", help="Emit JSON")
     args = parser.parse_args()
 

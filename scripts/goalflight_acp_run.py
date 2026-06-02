@@ -230,7 +230,7 @@ def make_title_allow_policy(
          (defaults to ``default_permission_policy``).
 
     Original use case: a dispatched chunk's acceptance criteria includes
-    "run ``./tests/run.sh``" — the controller passes a pattern like
+    "run ``./tests/run.sh``" — the orchestrator passes a pattern like
     ``^./tests/run\\.sh$`` to fast-path that exact shape. The pattern is
     PRECISE and intentional, not broad.
 
@@ -246,7 +246,7 @@ def make_title_allow_policy(
     ``permission_policy_for_dispatch`` auto-allows execute/fetch when
     sandbox is on.
 
-    R26 — restores the original ACP-passthrough design: the controller
+    R26 — restores the original ACP-passthrough design: the orchestrator
     exercises discretion (approves authorized scope) and escalates only
     requests that genuinely need user judgment (destructive, out-of-scope,
     ambiguous).
@@ -430,7 +430,7 @@ def _pending_steer_entries(mailbox: Path, seen_seqs: set[int]) -> list[dict]:
 
 def _steer_turn_prompt(mailbox: Path, entries: list[dict]) -> str:
     lines = [
-        "Controller steer messages are queued for this dispatch.",
+        "Orchestrator steer messages are queued for this dispatch.",
         f"Mailbox: {mailbox}",
         "Incorporate every message below before continuing.",
         "Acknowledge each one on its own line as `STEER-ACK: <seq>`.",
@@ -1624,7 +1624,7 @@ async def _run_acp_dispatch_impl(
                     write_status(status_path, payload)
                 # Disarm the ghost reaper for this intentionally-detached worker
                 # BEFORE the runner unwinds and exits: rewrite the pidfile entry
-                # with detached=true so a later cleanup_ghosts (this controller's
+                # with detached=true so a later cleanup_ghosts (this orchestrator's
                 # next dispatch or a sibling project sharing the pidfile dir) skips
                 # it instead of SIGKILLing the still-running worker.
                 mark_connection_detached(proc.pid)
@@ -1947,7 +1947,7 @@ async def _run_acp_dispatch_impl(
                 detach_worker = True
                 if conn is not None:
                     # Cancel local awaiting without sending session/cancel; the
-                    # worker remains alive and detached for controller recovery.
+                    # worker remains alive and detached for orchestrator recovery.
                     conn.acp_session_id = None
                 prompt_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -2083,12 +2083,12 @@ async def _run_acp_dispatch_impl(
             "text_excerpt": result.text[-4000:],
             "result_text": result.text if state == "complete" else None,
             "out_of_scope_writes": result.out_of_scope_writes,
-            # Permission requests the controller router escalated to the user
+            # Permission requests the orchestrator router escalated to the user
             # (boundary crossings it would not auto-allow). state is "blocked"
-            # (marker USER-CONFIRM); the controller surfaces these, gets a user
+            # (marker USER-CONFIRM); the orchestrator surfaces these, gets a user
             # decision, and re-dispatches. None when nothing was escalated.
             "permission_pending": result.permission_escalations or None,
-            # Inline permissions the controller auto-declined on timeout. Sweep B
+            # Inline permissions the orchestrator auto-declined on timeout. Sweep B
             # P1: this list NOW influences terminal state — if non-empty and the
             # worker didn't emit PERMISSION-OK-PROCEEDED, complete is downgraded
             # to blocked_permission_denied. Worker can emit
@@ -2099,7 +2099,7 @@ async def _run_acp_dispatch_impl(
             # heartbeat may have written killed/wedged into the payload before
             # decide_terminal_state ruled the turn complete on a genuine
             # end_turn; without this the record would be self-contradictory
-            # (state=complete, killed_by_heartbeat=true) and mislead a controller
+            # (state=complete, killed_by_heartbeat=true) and mislead an orchestrator
             # keying retry off the flag.
             "killed_by_heartbeat": state in ("wedged", "tool_timeout", "remote_turn_silence"),
             "wedged_by_heartbeat": state == "wedged",
@@ -2375,13 +2375,13 @@ def main(argv: list[str] | None = None) -> int:
         type=float,
         default=None,
         help="Inline mode controller-responsiveness window: max awake-seconds to "
-             "hold a permission waiting for the controller to ack-or-decide before "
+             "hold a permission waiting for the orchestrator to ack-or-decide before "
              "auto-declining (worker continues; default 180 = 3 min). No effect in "
              "'auto' mode.",
     )
     parser.add_argument(
         "--permission-user-timeout-s", type=float, default=None,
-        help="Inline mode: after the controller ACKs a permission (defer-to-user), "
+        help="Inline mode: after the orchestrator ACKs a permission (defer-to-user), "
              "max awake-seconds to wait for the user's decision before auto-declining "
              "(default 36000 = 10h). No effect in 'auto' mode.",
     )
@@ -2443,7 +2443,7 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         default=os.environ.get("GOALFLIGHT_STALL_KILL", "").lower() in {"1", "true", "yes"},
         help="Restore old progress-stall behavior: kill the worker instead of "
-             "detaching it and waking the controller.",
+             "detaching it and waking the orchestrator.",
     )
     parser.add_argument(
         "--liveness-profile",

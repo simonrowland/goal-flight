@@ -44,13 +44,13 @@ exceptions — leave in place, do not retroactively rename.
 
 ## Session identity
 
-While a run is active, the controller's `current_session` is stamped
+While a run is active, the orchestrator's `current_session` is stamped
 into the active goal-queue's frontmatter:
 
 ```yaml
 current_session:
   id: <uuid>
-  pid: <controller PID>
+  pid: <orchestrator PID>
   started_at: <ts>
   hostname: <host>
 session_history:
@@ -83,10 +83,10 @@ activation contract above; **not** for ordinary one-off coding.
    the loaded skill body is STALE (truncated reminders silently drop
    load-bearing rules like "background >10s", `git commit -- <files>`,
    "no `tail -f`"). Re-invoke `/goal-flight` to reload fresh, then
-   confirm you're the designated controller: compare your terminal's
+   confirm you're the designated orchestrator: compare your terminal's
    session id (`goalflight_session_status.py --ensure-session`) against
    the active queue's `current_session.id` field. If `current_session.pid`
-   is alive and the id mismatches yours, ANOTHER controller owns this
+   is alive and the id mismatches yours, ANOTHER orchestrator owns this
    run — surface to user before claiming. If `current_session.pid` is
    dead, `--force-release-stale` then claim.
 1. Activation check: `goalflight_session_status.py --text`. Bail out
@@ -101,7 +101,7 @@ activation contract above; **not** for ordinary one-off coding.
    - stale PID reuse
    - surplus worker-like process
    - cooldown blocked
-6. Continue from status rows, not from memory. Stay controller: dispatch workers
+6. Continue from status rows, not from memory. Stay orchestrator: dispatch workers
    for implementation unless dispatch routing marks the chunk `controller-direct`.
 
 The dispatch ledger validates process identity with PID plus process start/command.
