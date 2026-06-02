@@ -254,7 +254,7 @@ def case_manifest_acp_command_defaults() -> None:
 
     binary, args = agent_command("claude-acp")
     assert Path(binary).name == "claude-code-cli-acp"
-    assert args == []
+    assert args == ["--model", "opus"]  # claude defaults to its strongest (opus)
 
     binary, args = agent_command("opencode")
     assert Path(binary).name == "opencode"

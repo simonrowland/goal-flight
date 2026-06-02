@@ -35,13 +35,20 @@ def case_agent_command_per_agent_placement() -> None:
         assert args[:2] == ["--model", MODEL], (agent, args)
 
 
-def case_agent_command_default_unchanged() -> None:
-    # No model -> args identical to the no-arg call; no selector injected anywhere.
-    for agent in ("grok", "codex", "cursor", "claude", "opencode"):
+def case_agent_command_defaults() -> None:
+    # No model -> most agents keep their own default (no selector injected),
+    # EXCEPT claude which defaults to its strongest (opus) for worker quality.
+    for agent in ("grok", "codex", "cursor", "opencode"):
         base = acp.agent_command(agent)
         assert acp.agent_command(agent, model=None) == base, agent
         flat = " ".join(base[1])
         assert "--model" not in flat and "model=" not in flat, (agent, base)
+    for agent in ("claude", "claude-acp"):
+        _, args = acp.agent_command(agent)
+        assert args[:2] == ["--model", "opus"], (agent, args)
+    # explicit --model overrides the opus default (e.g. a fast model for speed).
+    _, args = acp.agent_command("claude", model="haiku")
+    assert args[:2] == ["--model", "haiku"], args
 
 
 def _build(agent, model, *, raw=None):
@@ -62,7 +69,7 @@ def case_build_worker_injects_model() -> None:
 
 def main() -> None:
     case_agent_command_per_agent_placement()
-    case_agent_command_default_unchanged()
+    case_agent_command_defaults()
     case_build_worker_injects_model()
     print("OK: model passthrough tests pass")
 

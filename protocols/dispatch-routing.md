@@ -237,9 +237,12 @@ leak-free, so it carries unknown helper-leak risk the bash-tail path avoids.)
 
 `goalflight_dispatch.py --model <id>` (and `goalflight_acp_run.py --model <id>`)
 selects the worker model on both transports — bash via `build_worker`, ACP via
-`agent_command`. Default leaves the agent on its own model. The selector is
-inserted PER-AGENT (the flag and its position differ — a blind append breaks
-codex/grok ACP), so pass the **agent's own id format**:
+`agent_command`. With `--model` omitted, each agent keeps its own default — except
+**claude**, which defaults to `opus` (its clear strongest — quality-by-default for
+workers; pass `--model haiku` for speed). codex already defaults strong, grok keeps
+`grok-build`, and cursor/opencode keep their own default (strongest is ambiguous).
+The selector is inserted PER-AGENT (the flag and its position differ — a blind
+append breaks codex/grok ACP), so pass the **agent's own id format**:
 
 | Agent | Example | ACP form |
 |---|---|---|

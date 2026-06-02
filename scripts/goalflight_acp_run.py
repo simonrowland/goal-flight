@@ -526,6 +526,16 @@ def _acp_model_args(agent: str, args: list[str], model: str) -> list[str]:
     return ["--model", model, *args]
 
 
+# Quality-by-default: when no model is selected, dispatch the agent's strongest
+# model where it is UNAMBIGUOUS and above the agent's own default. Today only
+# claude qualifies -- it defaults to sonnet, opus is its clear strongest. codex
+# already defaults strong (user config), grok's two models are task-dependent (it
+# keeps grok-build), and cursor/opencode "strongest" is ambiguous; all of those
+# keep their own default. Override per dispatch with --model (e.g. a fast model
+# for speed). opus is a stable alias, so this map needs no version maintenance.
+_DEFAULT_STRONG_MODEL = {"claude": "opus", "claude-acp": "opus"}
+
+
 def agent_command(agent: str, model: str | None = None) -> tuple[str, list[str]]:
     manifest_command = _manifest_acp_command(agent)
     if manifest_command is not None:
@@ -534,6 +544,8 @@ def agent_command(agent: str, model: str | None = None) -> tuple[str, list[str]]
         binary, args = "claude-code-cli-acp", []
     else:
         binary, args = agent, []
+    if model is None:
+        model = _DEFAULT_STRONG_MODEL.get(str(agent).strip().lower())
     if model:
         args = _acp_model_args(agent, args, str(model))
     return binary, args
