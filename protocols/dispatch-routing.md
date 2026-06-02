@@ -207,9 +207,31 @@ context-mode tools.
 | one-shot | controller-direct | yes | tiny edits, no spawn |
 | one-shot | acp | yes | default for any spawned worker |
 | one-shot | bash-tail | yes | only when no ACP adapter |
-| goal-mode | acp | yes | preferred transport for loops |
+| goal-mode | acp | yes | preferred for main-tree-write loops and non-codex loops; for read-only or worktree-isolated **codex** loops, bash-tail is equivalent + leaner — see below |
 | goal-mode | bash-tail | depends on worker | Requires the worker to emit a detectable end-of-goal marker in the flat tail (so the watcher knows the loop is complete). **As of 2026-05-19, codex `/goal` is the only worker known to qualify** — its structured "Final response" block is the marker; see `templates/codex-goal-prompt.md.tpl`. Grok and claude headless do not qualify today; a future worker that grows an equivalent marker contract would join this cell. When the worker doesn't qualify, use one-shot + bash-tail with a coarser chunk instead. |
 | goal-mode | controller-direct | n/a | controller-direct is single-turn by definition |
+
+### bash-tail vs ACP for a codex goal-loop
+
+Both transports run codex's **native** `/goal` loop unchanged: `--mode goal`
+only widens the ACP idle timeout (10h vs 5m), and the prompt + `features.goals`
+config are identical, so codex — not goal-flight's wrapper — drives the
+iteration either way (it is NOT a simulated/partial goal-mode on bash-tail).
+The transports therefore differ for codex only in that ACP can relay per-tool
+permission decisions live (`--interactive` = `--permission-mode inline`) and
+reads terminal state from structured events instead of a tail marker. Default:
+
+| The codex goal-loop is… | Transport | Why |
+|---|---|---|
+| read-only (review) **or** worktree-isolated | **bash-tail** | no writes → no permission requests → ACP's relay is moot; bash-tail is leaner (no ACP-SDK venv) and `codex exec` is verified not to leak ptys/helpers |
+| writing the **main tree**, wanting live per-write gates | **ACP `--interactive`** | inline permission relay where a bad write to the real tree matters |
+| a **non-codex** agent (grok / cursor) | **ACP** | bash-tail goal-mode needs codex's end-of-goal tail marker, which they lack |
+
+So the "ACP preferred for loops" row above holds for main-tree-write and
+non-codex loops; for read-only or worktree-isolated **codex** loops, prefer
+bash-tail. (Verified 2026-06-01: `codex exec` headless leaves zero leaked
+processes and zero tty delta; `codex-acp` has not been separately confirmed
+leak-free, so it carries unknown helper-leak risk the bash-tail path avoids.)
 
 ## Capacity gate
 
