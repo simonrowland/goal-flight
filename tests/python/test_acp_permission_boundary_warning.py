@@ -97,7 +97,7 @@ async def _run_blocked_startup(
     old_validate = goalflight_acp_run.validate_acp_dispatch_readiness
     old_acquire = goalflight_acp_run.goalflight_capacity.cmd_acquire
     old_record = goalflight_acp_run.goalflight_ledger.cmd_record
-    goalflight_acp_run.agent_command = lambda _agent: (sys.executable, ["-c", "print('never')"])
+    goalflight_acp_run.agent_command = lambda _agent, model=None: (sys.executable, ["-c", "print('never')"])
     goalflight_acp_run.validate_acp_dispatch_readiness = (
         lambda _agent, _command: {"reason": "probe_required"}
     )

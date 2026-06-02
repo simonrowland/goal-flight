@@ -765,6 +765,7 @@ def _build_acp_cfg(args, *, status_json: Path):
     os_sandbox = "read-only" if args.read_only and goalflight_compat.is_macos() else OS_SANDBOX_OFF
     cfg = argparse.Namespace(
         agent=args.agent,
+        model=getattr(args, "model", None),
         install_slot=None,
         cwd=str(project_root),
         worktree="off",
@@ -884,9 +885,12 @@ def build_worker(args, prompt_path, raw_argv: list[str]):
     if raw_argv:
         return raw_argv, None  # raw escape hatch; stdin = DEVNULL
     sandbox = "read-only" if args.read_only else "workspace-write"
+    model = getattr(args, "model", None)
     if args.agent == "codex":
         argv = ["codex", "exec", "--skip-git-repo-check", "--sandbox", sandbox,
                 "-c", "approval_policy=never"]
+        if model:
+            argv += ["--model", str(model)]
         if args.cwd:
             argv += ["-C", args.cwd]
         argv += ["-"]  # codex reads the prompt from stdin
@@ -895,6 +899,8 @@ def build_worker(args, prompt_path, raw_argv: list[str]):
         # Read the prompt from a FILE, not argv `-p` — long goal-flight prompts
         # (5-20KB) would hit E2BIG / argv truncation (grok review #5).
         argv = ["grok", "--prompt-file", str(prompt_path), "--permission-mode", "acceptEdits"]
+        if model:
+            argv += ["--model", str(model)]
         if args.cwd:
             argv += ["--cwd", args.cwd]
         return argv, None
@@ -914,6 +920,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--prompt-file", help="Prompt file (preset path)")
     parser.add_argument("--prompt", help="Inline prompt text (preset path; alternative to --prompt-file)")
     parser.add_argument("--cwd", help="Worker working directory")
+    parser.add_argument("--model", default=None,
+                        help="Worker model id (grok/codex --model passthrough, e.g. "
+                             "grok-composer-2.5-fast for coding). Default = agent's own default.")
     parser.add_argument("--read-only", action="store_true",
                         help="Read-only sandbox (review/analysis dispatches)")
     parser.add_argument("--account",

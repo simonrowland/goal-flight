@@ -510,7 +510,7 @@ async def _run_sandbox_probe(profile: str) -> dict:
     old_scenario = os.environ.get("GOALFLIGHT_FAKE_ACP_SCENARIO")
     old_state_dir = os.environ.get("GOALFLIGHT_STATE_DIR")
     os.environ["GOALFLIGHT_FAKE_ACP_SCENARIO"] = "sandbox_write_probe"
-    goalflight_acp_run.agent_command = lambda agent: (sys.executable, [str(FAKE)])
+    goalflight_acp_run.agent_command = lambda agent, model=None: (sys.executable, [str(FAKE)])
     workspace = ROOT / f".goalflight-os-sandbox-run-{profile}-{os.getpid()}"
     shutil.rmtree(workspace, ignore_errors=True)
     workspace.mkdir()
@@ -592,7 +592,7 @@ def case_runner_blocks_undeclared_os_sandbox_before_capacity() -> None:
     old_agent_command = goalflight_acp_run.agent_command
     old_adapters_dir = goalflight_adapter_readiness.ADAPTERS_DIR
     old_state_dir = os.environ.get("GOALFLIGHT_STATE_DIR")
-    goalflight_acp_run.agent_command = lambda agent: (sys.executable, [str(FAKE)])
+    goalflight_acp_run.agent_command = lambda agent, model=None: (sys.executable, [str(FAKE)])
     try:
         with tempfile.TemporaryDirectory(prefix="gf-os-sandbox-unsupported-") as tmp:
             tmp_path = Path(tmp)
@@ -652,7 +652,7 @@ def case_runner_blocks_temp_cwd_before_capacity() -> None:
     old_agent_command = goalflight_acp_run.agent_command
     old_adapters_dir = goalflight_adapter_readiness.ADAPTERS_DIR
     old_state_dir = os.environ.get("GOALFLIGHT_STATE_DIR")
-    goalflight_acp_run.agent_command = lambda agent: (sys.executable, [str(FAKE)])
+    goalflight_acp_run.agent_command = lambda agent, model=None: (sys.executable, [str(FAKE)])
     try:
         with tempfile.TemporaryDirectory(prefix="gf-os-sandbox-temp-run-") as cwd:
             with tempfile.TemporaryDirectory(prefix="gf-os-sandbox-adapters-") as tmp:

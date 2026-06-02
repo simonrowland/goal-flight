@@ -286,7 +286,7 @@ async def case_runner_overlimit_response_status_counts_drop() -> None:
     old_adapters_dir = goalflight_adapter_readiness.ADAPTERS_DIR
     os.environ["GOALFLIGHT_FAKE_ACP_SCENARIO"] = "overlimit_response"
     os.environ["GOALFLIGHT_ACP_LIMIT"] = "4k"
-    goalflight_acp_run.agent_command = lambda agent: (sys.executable, [str(FAKE)])
+    goalflight_acp_run.agent_command = lambda agent, model=None: (sys.executable, [str(FAKE)])
     try:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -339,7 +339,7 @@ async def case_runner_overlimit_response_status_counts_drop() -> None:
 async def case_runner_blocks_probe_required_adapter() -> None:
     old_agent_command = goalflight_acp_run.agent_command
     old_adapters_dir = goalflight_adapter_readiness.ADAPTERS_DIR
-    goalflight_acp_run.agent_command = lambda agent: (sys.executable, [str(FAKE)])
+    goalflight_acp_run.agent_command = lambda agent, model=None: (sys.executable, [str(FAKE)])
     try:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -397,7 +397,7 @@ async def case_runner_blocks_probe_required_adapter() -> None:
 async def case_runner_blocks_invalid_adapter_manifest() -> None:
     old_agent_command = goalflight_acp_run.agent_command
     old_adapters_dir = goalflight_adapter_readiness.ADAPTERS_DIR
-    goalflight_acp_run.agent_command = lambda agent: (sys.executable, [str(FAKE)])
+    goalflight_acp_run.agent_command = lambda agent, model=None: (sys.executable, [str(FAKE)])
     try:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -436,7 +436,7 @@ async def case_runner_blocks_invalid_adapter_manifest() -> None:
 async def case_runner_blocks_missing_adapter_manifest() -> None:
     old_agent_command = goalflight_acp_run.agent_command
     old_adapters_dir = goalflight_adapter_readiness.ADAPTERS_DIR
-    goalflight_acp_run.agent_command = lambda agent: (sys.executable, [str(FAKE)])
+    goalflight_acp_run.agent_command = lambda agent, model=None: (sys.executable, [str(FAKE)])
     try:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)

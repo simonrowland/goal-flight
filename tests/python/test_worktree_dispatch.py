@@ -368,7 +368,7 @@ def test_runner_worktree_status_and_capacity_contract() -> None:
                 spawn_calls.append(kwargs)
                 return FakeProc(), FakeConn()
 
-            goalflight_acp_run.agent_command = lambda _agent: ("fake-agent", [])
+            goalflight_acp_run.agent_command = lambda _agent, model=None: ("fake-agent", [])
             goalflight_acp_run.validate_acp_dispatch_readiness = lambda _agent, _cmd: None
             goalflight_acp_run.validate_os_sandbox_request = lambda _agent, _profile: None
             goalflight_acp_run.preflight_os_sandbox = lambda _profile: None
@@ -423,7 +423,7 @@ def test_capacity_denied_does_not_create_worktree() -> None:
             status_path = repo / "capacity-denied-status.json"
             args = runner_args(repo, "acp-capacity-denied", status_path)
 
-            goalflight_acp_run.agent_command = lambda _agent: ("fake-agent", [])
+            goalflight_acp_run.agent_command = lambda _agent, model=None: ("fake-agent", [])
             goalflight_acp_run.validate_acp_dispatch_readiness = lambda _agent, _cmd: None
             goalflight_acp_run.validate_os_sandbox_request = lambda _agent, _profile: None
             goalflight_capacity.cmd_acquire = deny_capacity
@@ -467,7 +467,7 @@ def test_runner_worktree_create_failure_writes_failed_status() -> None:
                 spawn_calls.append(kwargs)
                 return FakeProc(), FakeConn()
 
-            goalflight_acp_run.agent_command = lambda _agent: ("fake-agent", [])
+            goalflight_acp_run.agent_command = lambda _agent, model=None: ("fake-agent", [])
             goalflight_acp_run.validate_acp_dispatch_readiness = lambda _agent, _cmd: None
             goalflight_acp_run.validate_os_sandbox_request = lambda _agent, _profile: None
             goalflight_acp_run.preflight_os_sandbox = lambda _profile: None

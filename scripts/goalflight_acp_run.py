@@ -507,13 +507,36 @@ def _manifest_acp_command(agent: str) -> tuple[str, list[str]] | None:
     return _resolve_manifest_binary(binary), list(args)
 
 
-def agent_command(agent: str) -> tuple[str, list[str]]:
+def _acp_model_args(agent: str, args: list[str], model: str) -> list[str]:
+    """Insert a model selector into an ACP command's args, PER-AGENT.
+
+    The selector must sit in the FLAGS region, not after a terminal positional
+    (grok's `stdio`), and the flag itself differs by agent, so a blind append is
+    wrong. Verified forms: codex uses the global config override `-c model=<id>`;
+    grok needs `--model <id>` BEFORE its `stdio` terminal. claude/cursor/opencode
+    take `--model <id>` ahead of their subcommand (cursor/opencode arg-position is
+    best-effort — see protocols/dispatch-routing.md). The id format is the agent's
+    own (grok-composer-2.5-fast, haiku, anthropic/claude-haiku, ...).
+    """
+    a = agent.strip().lower()
+    if a in ("codex", "codex-acp"):
+        return ["-c", f"model={model}", *args]
+    if a in ("grok", "grok-acp") and args and args[-1] == "stdio":
+        return [*args[:-1], "--model", model, "stdio"]
+    return ["--model", model, *args]
+
+
+def agent_command(agent: str, model: str | None = None) -> tuple[str, list[str]]:
     manifest_command = _manifest_acp_command(agent)
     if manifest_command is not None:
-        return manifest_command
-    if agent in {"claude", "claude-acp"}:
-        return "claude-code-cli-acp", []
-    return agent, []
+        binary, args = manifest_command
+    elif agent in {"claude", "claude-acp"}:
+        binary, args = "claude-code-cli-acp", []
+    else:
+        binary, args = agent, []
+    if model:
+        args = _acp_model_args(agent, args, str(model))
+    return binary, args
 
 
 def _compact_tool_call_summaries(tool_calls: list[Any], limit: int = 50) -> list[dict[str, object]]:
@@ -992,7 +1015,7 @@ async def _run_acp_dispatch_impl(
         write_status(status_path, payload)
         return payload
 
-    command, acp_args = agent_command(cfg.agent)
+    command, acp_args = agent_command(cfg.agent, model=getattr(cfg, "model", None))
     install_slot = getattr(cfg, "install_slot", None)
     spawn_env = dispatch_env(cfg.agent, install_slot)
     gate = validate_acp_dispatch_readiness(cfg.agent, [command, *acp_args])
@@ -2240,6 +2263,9 @@ def write_windows_refusal_status(args: argparse.Namespace) -> tuple[dict, Path]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="goal-flight ACP runner")
     parser.add_argument("--agent", required=True)
+    parser.add_argument("--model", default=None,
+                        help="Worker model id (grok/codex --model passthrough, e.g. "
+                             "grok-composer-2.5-fast). Default = agent's own default.")
     parser.add_argument(
         "--install-slot",
         default=None,
