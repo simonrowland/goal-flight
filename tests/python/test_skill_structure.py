@@ -601,6 +601,13 @@ def test_golden_master_entry_schema() -> None:
         )
 
         for source in entry["provenance"]["sources"]:
+            # Provenance under docs-private/ is gitignored, machine-local, and
+            # rotates (RESUME-NOTES get pruned), so requiring on-disk existence
+            # makes the tracked Golden Master untestable on a clean clone / CI.
+            # Enforce existence only for tracked provenance; private notes are
+            # advisory citations.
+            if source.startswith("docs-private/"):
+                continue
             assert_true(f"{entry_id} provenance source exists: {source}", (ROOT / source).exists())
 
 
