@@ -126,7 +126,12 @@ def parse_iso(value: str | None) -> dt.datetime | None:
 
 
 def state_dir() -> Path:
-    path = Path(os.environ.get("GOALFLIGHT_STATE_DIR", str(DEFAULT_STATE_DIR))).expanduser()
+    # A set-but-empty (or whitespace-only) GOALFLIGHT_STATE_DIR must fall back to
+    # DEFAULT_STATE_DIR, NOT resolve to cwd: os.environ.get(key, default) returns ""
+    # when the key is present-but-empty, and Path("").expanduser() == Path(".") (cwd),
+    # which scatters capacity.json / capacity.lock into the current directory.
+    raw = os.environ.get("GOALFLIGHT_STATE_DIR", "").strip()
+    path = Path(raw or DEFAULT_STATE_DIR).expanduser()
     path.mkdir(parents=True, exist_ok=True, mode=0o700)
     return path
 

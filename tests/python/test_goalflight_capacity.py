@@ -241,12 +241,51 @@ def case_acquire_atomic_gate_still_blocks_over_cap(state_dir: Path) -> None:
         worker.wait()
 
 
+def case_empty_state_dir_falls_back_not_cwd() -> None:
+    """A present-but-empty (or whitespace-only) GOALFLIGHT_STATE_DIR must resolve
+    to DEFAULT_STATE_DIR, NOT cwd. Regression: os.environ.get(key, default)
+    returns "" for a present-but-empty key, and Path("").expanduser() == Path(".")
+    (cwd), which scatters capacity.json / capacity.lock into the working dir.
+    """
+    old_env = os.environ.get("GOALFLIGHT_STATE_DIR")
+    old_default = cap.DEFAULT_STATE_DIR
+    old_cwd = os.getcwd()
+    with tempfile.TemporaryDirectory() as td:
+        default_dir = Path(td) / "default-state"
+        work_dir = Path(td) / "work"
+        work_dir.mkdir()
+        cap.DEFAULT_STATE_DIR = default_dir
+        os.chdir(work_dir)
+        try:
+            for blank in ("", "   "):
+                os.environ["GOALFLIGHT_STATE_DIR"] = blank
+                resolved = cap.state_dir()
+                assert resolved == default_dir, (
+                    f"blank env {blank!r} -> {resolved}, expected DEFAULT {default_dir}"
+                )
+                assert resolved.resolve() != work_dir.resolve(), (
+                    "blank env must NOT resolve to cwd"
+                )
+            # an explicit value is still honored
+            explicit = Path(td) / "explicit"
+            os.environ["GOALFLIGHT_STATE_DIR"] = str(explicit)
+            assert cap.state_dir() == explicit
+        finally:
+            os.chdir(old_cwd)
+            cap.DEFAULT_STATE_DIR = old_default
+            if old_env is None:
+                os.environ.pop("GOALFLIGHT_STATE_DIR", None)
+            else:
+                os.environ["GOALFLIGHT_STATE_DIR"] = old_env
+
+
 def main() -> None:
     # Pure in-memory prune cases (no shared-state IO at all).
     case_live_worker_past_ttl_survives_prune()
     case_live_worker_dead_controller_survives_prune()
     case_dead_lease_past_ttl_is_reclaimed()
     case_dead_lease_no_ttl_not_expired()
+    case_empty_state_dir_falls_back_not_cwd()
 
     # IO cases: isolate capacity.json under a temp $GOALFLIGHT_STATE_DIR so the
     # real shared /tmp/goal-flight-<uid>/capacity.json is never touched.
