@@ -633,7 +633,12 @@ def _write_pidfile(args, *, worker_pid: int, pgid: int | None, identity: dict | 
         "pgid": int(pgid or worker_pid),
         "started_at": ident.get("lstart"),
         "cmd": ident.get("comm"),
-        "agent": f"{args.agent}-dispatch",
+        # The "-bash-tail" suffix is load-bearing: cleanup_ghosts() keys its
+        # bash-tail branch (pgid!=pid -> kill the bare pid, not the group) on
+        # ``agent.endswith("-bash-tail")``. Tag it so this dispatch's worker is
+        # reachable by exactly that branch, matching the documented agent names
+        # (codex-bash-tail / grok-bash-tail) in protocols/legacy/bash-tail.md.
+        "agent": f"{args.agent}-bash-tail",
         "session_id": args.dispatch_id,
     }
     pidfile.write_text(json.dumps(entry, sort_keys=True) + "\n", encoding="utf-8")
@@ -685,11 +690,42 @@ def _reap_dead_worker_pgroup(pidfile: Path, worker_pid: int) -> None:
         os.killpg(pgid, getattr(signal, "SIGTERM", 15))
 
 
+def _mark_pidfile_detached(pidfile: Path) -> None:
+    """Stamp ``detached: true`` on a bash-tail pidfile whose worker is still alive.
+
+    Mirror of the ACP ``mark_connection_detached`` path. This dispatch process is
+    EPHEMERAL: once a NON-terminal watcher exit returns (idle-timeout rc=2, or any
+    exit with the worker still running for re-attach), the pidfile's recorded
+    ``controller_pid`` is this soon-to-exit pid. Without a ``detached`` flag the
+    next ``cleanup_ghosts`` sweep -- including a sibling project sharing the pidfile
+    dir -- would see dead-controller + live-worker and SIGKILL the live worker's
+    group, losing its uncommitted work. ``detached: true`` makes cleanup_ghosts
+    SKIP it (exactly as it skips an intentionally-detached ACP worker), without
+    weakening genuine-ghost reaping (dead controller + dead worker, not detached).
+    """
+    try:
+        lines = pidfile.read_text(encoding="utf-8").splitlines()
+        entry = json.loads(lines[0]) if lines else None
+    except (OSError, ValueError, json.JSONDecodeError):
+        return
+    if not isinstance(entry, dict):
+        return
+    entry["detached"] = True
+    with contextlib.suppress(OSError):
+        pidfile.write_text(json.dumps(entry, sort_keys=True) + "\n", encoding="utf-8")
+
+
 def _cleanup_pidfile_if_worker_dead(pidfile: Path | None, worker_pid: int | None) -> None:
     if not pidfile or not worker_pid:
         return
     if goalflight_compat.pid_alive(worker_pid):
-        return  # still alive: non-destructive -- leave the pidfile for re-attach
+        # Still alive: non-destructive -- leave the pidfile for re-attach, but flag
+        # it detached so cleanup_ghosts protects this live worker after we exit
+        # (symmetry with the ACP mark_connection_detached path). Without this, the
+        # un-flagged pidfile + this ephemeral process's now-dead pid = a live worker
+        # that the next ghost sweep would SIGKILL.
+        _mark_pidfile_detached(pidfile)
+        return
     _reap_dead_worker_pgroup(pidfile, worker_pid)
     with contextlib.suppress(OSError):
         pidfile.unlink(missing_ok=True)
