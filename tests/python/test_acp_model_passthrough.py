@@ -61,8 +61,12 @@ def case_build_worker_injects_model() -> None:
     for agent in ("codex", "grok"):
         argv = _build(agent, MODEL)
         assert "--model" in argv and argv[argv.index("--model") + 1] == MODEL, (agent, argv)
-        argv0 = _build(agent, None)  # default: no model -> no --model
-        assert "--model" not in argv0, (agent, argv0)
+    # codex has no default model: none passed -> no --model.
+    argv_codex = _build("codex", None)
+    assert "--model" not in argv_codex, argv_codex
+    # grok defaults to the fast coding model (Composer 2.5) when none is passed.
+    argv_grok = _build("grok", None)
+    assert "--model" in argv_grok and argv_grok[argv_grok.index("--model") + 1] == "grok-composer-2.5-fast", argv_grok
     # raw `-- <cmd>` passthrough ignores model (the orchestrator supplies the cmd).
     assert _build("x", MODEL, raw=["echo", "hi"]) == ["echo", "hi"]
 

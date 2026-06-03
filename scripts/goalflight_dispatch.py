@@ -935,8 +935,11 @@ def build_worker(args, prompt_path, raw_argv: list[str]):
         # Read the prompt from a FILE, not argv `-p` — long goal-flight prompts
         # (5-20KB) would hit E2BIG / argv truncation (grok review #5).
         argv = ["grok", "--prompt-file", str(prompt_path), "--permission-mode", "acceptEdits"]
-        if model:
-            argv += ["--model", str(model)]
+        # Default grok to the fast coding model (Composer 2.5). grok's own default
+        # (grok-build) is slow and error-prone at file edits — observed 2026-06-02
+        # fumbling multi-file doc edits with repeated string-match failures. An
+        # explicit --model always wins.
+        argv += ["--model", str(model) if model else "grok-composer-2.5-fast"]
         if args.cwd:
             argv += ["--cwd", args.cwd]
         return argv, None
