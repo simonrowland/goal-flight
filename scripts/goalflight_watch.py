@@ -27,10 +27,11 @@ from goalflight_liveness import (
 #
 # Hardening (C-P1/D-P1 marker injection): only lines outside ```/~~~ fences are considered
 # for markers. Terminal markers (RESULT/COMPLETE/etc) only trigger completion when they are
-# the last non-empty line (post prefix-ignore, outside fence). Prevents cat/echo/print of
-# marker tokens mid-output or inside fenced examples from false-completing the watcher.
-MARKER_RE = re.compile(r"^\**(STATUS|STEER-ACK|RESULT|USER-NEED|USER-CONFIRM|BLOCKED|COMPLETE):\**\s*(.*)$")
-TERMINAL_MARKERS = {"RESULT", "USER-NEED", "USER-CONFIRM", "BLOCKED", "COMPLETE"}
+# the last non-empty line (post prefix-ignore, outside fence). READY/COMPLETE/RESULT/etc.
+# Prevents cat/echo/print of marker tokens mid-output or inside fenced examples from
+# false-completing the watcher.
+MARKER_RE = re.compile(r"^\**(STATUS|STEER-ACK|RESULT|USER-NEED|USER-CONFIRM|BLOCKED|COMPLETE|READY):\**\s*(.*)$")
+TERMINAL_MARKERS = {"RESULT", "USER-NEED", "USER-CONFIRM", "BLOCKED", "COMPLETE", "READY"}
 # CPU-sampling-failure grace (codex 2026-05-20 P2): require this many consecutive
 # `wedged` polls before exiting with idle_timeout, so a single transient `ps`
 # failure (cpu→None→wedged for one poll) can't false-positive a healthy worker.
@@ -324,7 +325,7 @@ def main() -> int:
         if low_power_relax:
             payload["low_power_relax"] = True
         if terminal:
-            payload["state"] = "complete" if terminal["kind"] in {"RESULT", "COMPLETE"} else "blocked"
+            payload["state"] = "complete" if terminal["kind"] in {"RESULT", "COMPLETE", "READY"} else "blocked"
             exit_reason = f"marker:{terminal['kind']}"
             exit_code = 0 if payload["state"] == "complete" else 4
             write_status(status_path, payload)

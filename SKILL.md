@@ -214,11 +214,12 @@ inline; fix P0/P1/P2 before commit.
 - Background anything expected to run longer than 10 seconds.
 - Subagent / Agent / Task / Explore dispatches whose returns may exceed
   ~5KB MUST instruct the worker to write findings to
-  `docs-private/research/<date>-<slug>/findings.md` and return only
-  `READY: <path>` plus a one-paragraph TL;DR + severity-tagged finding
-  count. The orchestrator reads the TL;DR; opens the file only when TL;DR
-  signals a real action. Returning a 9KB report inline defeats the
-  dispatch — the bytes land back in orchestrator context anyway.
+  `docs-private/research/<date>-<slug>/findings.md` and return a TL;DR +
+  severity-tagged finding count, then `READY: <path>` as the **last**
+  non-empty line (terminal marker — emit TL;DR/findings before it). The
+  orchestrator reads the TL;DR; opens the file only when TL;DR signals a
+  real action. Returning a 9KB report inline defeats the dispatch — the
+  bytes land back in orchestrator context anyway.
 - Read >5KB without an expected Edit follow-up within 2 turns → use
   `Agent` (Explore for read-only, general-purpose for tool-using
   investigation) with a defined prompt instead. Recon-Reads pull the

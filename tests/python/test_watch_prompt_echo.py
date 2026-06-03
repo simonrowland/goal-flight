@@ -312,6 +312,54 @@ def case_mid_output_marker_ignored() -> None:
         assert term.get("text") == "genuine-payload", term
 
 
+def case_ready_terminal_marker() -> None:
+    """READY: is a terminal marker only on the last non-empty line (Investigator shape)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        tail = tmp / "tail.txt"
+        tail.write_text(
+            "TL;DR: audit done\n"
+            "READY: docs-private/research/2026-06-03-audit/findings.md\n"
+            "more output after READY (not terminal)\n",
+            encoding="utf-8",
+        )
+        worker = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"], start_new_session=True)
+        try:
+            rc, elapsed, term, _ = _run_watcher(
+                tail, tmp / "s.json", tmp / "p.md", ignore=False, worker_pid=worker.pid,
+                poll_secs="0.2", max_idle_secs="1",
+            )
+        finally:
+            worker.terminate()
+            worker.wait()
+        assert rc == 2, f"mid-output READY must not complete, got {rc}"
+        assert not term or term.get("kind") not in goalflight_watch.TERMINAL_MARKERS, f"got {term}"
+        assert elapsed < 2.0
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        tail = tmp / "tail.txt"
+        tail.write_text(
+            "TL;DR: audit done\n"
+            "Findings: P0 0, P1 1, P2 0, P3 0\n"
+            "Strongest concern: none\n"
+            "READY: docs-private/research/2026-06-03-audit/findings.md\n",
+            encoding="utf-8",
+        )
+        worker = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"], start_new_session=True)
+        try:
+            rc, elapsed, term, _ = _run_watcher(
+                tail, tmp / "s.json", tmp / "p.md", ignore=False, worker_pid=worker.pid,
+                poll_secs="0.2", max_idle_secs="2",
+            )
+        finally:
+            worker.terminate()
+            worker.wait()
+        assert rc == 0, f"last-line READY must complete, got {rc}"
+        assert term.get("kind") == "READY", term
+        assert "findings.md" in term.get("text", ""), term
+
+
 def main() -> None:
     case_ignores_echoed_prompt_marker()
     case_without_ignore_trips_on_echo()
@@ -324,6 +372,7 @@ def main() -> None:
     case_incomplete_identity_is_inconclusive_alive()
     case_steer_ack_is_non_terminal_marker()
     case_mid_output_marker_ignored()
+    case_ready_terminal_marker()
     print("OK: goalflight_watch prompt-echo guard tests pass")
 
 

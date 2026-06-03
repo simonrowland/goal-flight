@@ -132,12 +132,12 @@ without reading the body.
 *Investigator (read-only — reviewer, auditor, plan-validator):*
 
 ```
-READY: <findings-path>
-
 TL;DR: <≤3 lines>
 
 Findings: <P0> P0, <P1> P1, <P2> P2, <P3> P3
 Strongest concern: <one line>
+
+READY: <findings-path>
 ```
 
 *Executor (writes + commits — implementation chunk worker):*

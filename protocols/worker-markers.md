@@ -8,6 +8,7 @@ Workers emit parseable markers on their own lines:
 - `USER-CONFIRM: <specific confirmation needed before risky action>`
 - `BLOCKED: <blocker and evidence>`
 - `COMPLETE: <finished state>`
+- `READY: <findings-path>` — Investigator file-backed findings (path only in the marker line)
 - `PERMISSION-OK-PROCEEDED: <reason>` — opt-out of the
   denied-permission terminal-state downgrade. Use ONLY when the worker
   KNOWS it worked around an auto-declined permission cleanly (e.g.,
@@ -18,7 +19,8 @@ Workers emit parseable markers on their own lines:
 
 Rules:
 
-- Terminal markers: `RESULT`, `COMPLETE`, `USER-NEED`, `USER-CONFIRM`, `BLOCKED`.
+- Terminal markers: `RESULT`, `COMPLETE`, `READY`, `USER-NEED`, `USER-CONFIRM`, `BLOCKED`.
+- A terminal marker is recognized only as the worker's **final** non-empty line (mid-output / code-fence markers are ignored — the injection guard).
 - `RESULT` and `COMPLETE` mean done unless the status JSON shows a process error.
 - `USER-NEED`, `USER-CONFIRM`, and `BLOCKED` stop the dispatch loop and surface to the orchestrator.
 - `PERMISSION-OK-PROCEEDED` is non-terminal; it modifies how the

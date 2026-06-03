@@ -22,6 +22,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 from acp_pool import compute_pool_ceiling, managed_pool  # noqa: E402
 from acp_runner import (  # noqa: E402
+    TERMINAL_MARKERS,
     early_actionable_marker,
     extract_markers,
     has_actionable_marker_values,
@@ -1343,6 +1344,17 @@ def case_marker_parser() -> None:
     assert markers["COMPLETE"] == ["done"]
 
 
+def case_ready_marker_parser() -> None:
+    """READY: is in the marker vocabulary (Investigator file-backed findings)."""
+    sample = (
+        "TL;DR: audit done\n"
+        "READY: docs-private/research/2026-06-03-audit/findings.md\n"
+    )
+    markers = extract_markers(sample)
+    assert markers["READY"] == ["docs-private/research/2026-06-03-audit/findings.md"]
+    assert "READY" in TERMINAL_MARKERS
+
+
 def case_sentinel_marker_payloads_unit() -> None:
     for payload in ("none", "NONE", "  none  ", "N/A", "(none)", "-", "", "   "):
         assert is_sentinel_marker_payload(payload), payload
@@ -1413,6 +1425,7 @@ async def amain() -> None:
 
 def main() -> None:
     case_marker_parser()
+    case_ready_marker_parser()
     case_sentinel_marker_payloads_unit()
     case_codex_acp_args_injection_unit()
     case_permission_handler_selection_unit()

@@ -324,13 +324,13 @@ async def _run_prompt_locked(
 # from injecting false terminals into extract_markers (used for early cancel and
 # _terminal_turn_marker / result envelopes).
 _MARKERS_RE = re.compile(
-    r"^\**(STATUS|STEER-ACK|RESULT|USER-NEED|USER-CONFIRM|BLOCKED|COMPLETE|PERMISSION-OK-PROCEEDED):\**\s*(.+?)\s*\**$",
+    r"^\**(STATUS|STEER-ACK|RESULT|USER-NEED|USER-CONFIRM|BLOCKED|COMPLETE|READY|PERMISSION-OK-PROCEEDED):\**\s*(.+?)\s*\**$",
     re.MULTILINE,
 )
 
 # Terminal kinds for position check (must match goalflight_watch.TERMINAL_MARKERS
-# for the RESULT/COMPLETE/BLOCKED/USER-* ; PERMISSION-OK is acp-internal non-terminal).
-TERMINAL_MARKERS = {"RESULT", "USER-NEED", "USER-CONFIRM", "BLOCKED", "COMPLETE"}
+# for the RESULT/COMPLETE/BLOCKED/USER-*/READY ; PERMISSION-OK is acp-internal non-terminal).
+TERMINAL_MARKERS = {"RESULT", "USER-NEED", "USER-CONFIRM", "BLOCKED", "COMPLETE", "READY"}
 
 
 def extract_markers(text: str) -> dict[str, list[str]]:
