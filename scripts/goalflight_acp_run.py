@@ -1158,7 +1158,18 @@ async def _run_acp_dispatch_impl(
                     shape="acp",
                     account="default",
                     transport="acp",
-                    project_root=worker_cwd,
+                    # project_root MUST be the original --cwd (main repo
+                    # toplevel), NOT worker_cwd. For a worktree dispatch
+                    # worker_cwd is reassigned to the per-dispatch worktree dir
+                    # (line ~1770), but goalflight_status.scope_payload() filters
+                    # records by exact project_root == this-repo toplevel. If we
+                    # recorded the worktree path here the record would be scoped
+                    # OUT of `status --done/--dispatch/--json` for its whole
+                    # lifetime. The worktree path stays tracked in the ACP status
+                    # JSON (worktree_path/worker_cwd) and the lease's worker_cwd.
+                    # This mirrors the capacity lease, which already records the
+                    # unmodified project_root.
+                    project_root=str(project_root),
                     controller_pid=os.getpid(),
                     worker_pid=worker_pid,
                     acp_session_id=cfg.session_id,
