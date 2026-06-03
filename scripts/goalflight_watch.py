@@ -24,6 +24,11 @@ from goalflight_liveness import (
 # `\**` tolerance: grok (and other markdown-emitting workers) write **COMPLETE:**
 # etc.; without it the bold marker is never matched and the worker idle-times-out
 # instead of waking the orchestrator (grok review, 2026-05-30). Mirrors watch-dispatch-tail.sh.
+#
+# Hardening (C-P1/D-P1 marker injection): only lines outside ```/~~~ fences are considered
+# for markers. Terminal markers (RESULT/COMPLETE/etc) only trigger completion when they are
+# the last non-empty line (post prefix-ignore, outside fence). Prevents cat/echo/print of
+# marker tokens mid-output or inside fenced examples from false-completing the watcher.
 MARKER_RE = re.compile(r"^\**(STATUS|STEER-ACK|RESULT|USER-NEED|USER-CONFIRM|BLOCKED|COMPLETE):\**\s*(.*)$")
 TERMINAL_MARKERS = {"RESULT", "USER-NEED", "USER-CONFIRM", "BLOCKED", "COMPLETE"}
 # CPU-sampling-failure grace (codex 2026-05-20 P2): require this many consecutive
@@ -129,6 +134,7 @@ def extract_markers(path: Path, max_bytes: int = 10 * 1024 * 1024,
     prompt_prefix = ignore_prefix_lines or []
     can_ignore_prefix = start == 0 and bool(prompt_prefix)
     markers: list[dict] = []
+    in_fence = False
     with path.open("rb") as f:
         f.seek(start)
         text = f.read().decode(errors="replace")
@@ -141,10 +147,68 @@ def extract_markers(path: Path, max_bytes: int = 10 * 1024 * 1024,
             if expected is not None and stripped == expected:
                 continue
             can_ignore_prefix = False
+        # Fence skip (hardening): do not match markers inside ``` or ~~~ blocks.
+        # Worker output containing example marker vocab in code fences must not inject terminals.
+        lstrip = line.lstrip()
+        if lstrip.startswith("```") or lstrip.startswith("~~~"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
         match = MARKER_RE.match(stripped)
         if match:
             markers.append({"line": idx, "kind": match.group(1), "text": match.group(2)[:1000]})
     return markers, size
+
+
+def _last_line_is_terminal_marker(path: Path, ignore_prefix_lines: list[str] | None = None) -> dict | None:
+    """Return a terminal marker dict iff the *last non-empty line* of the tail
+    (after prefix-echo ignore and skipping inside code fences) matches a
+    terminal marker kind. This is the only trustworthy position; mid-output
+    marker lines (from prints, cats, logs, or fenced examples) are ignored.
+    """
+    if not path.exists():
+        return None
+    size = path.stat().st_size
+    start = max(0, size - 10 * 1024 * 1024)
+    prompt_prefix = ignore_prefix_lines or []
+    can_ignore_prefix = start == 0 and bool(prompt_prefix)
+    in_fence = False
+    last_nonempty = ""
+    last_in_fence = False
+    with path.open("rb") as f:
+        f.seek(start)
+        text = f.read().decode(errors="replace")
+    for idx, line in enumerate(text.splitlines(), start=1):
+        stripped = line.strip()
+        if can_ignore_prefix:
+            expected = prompt_prefix[idx - 1] if idx <= len(prompt_prefix) else None
+            if expected is not None and stripped == expected:
+                # prefix echo line (even if looks like marker): do not use for last_nonempty terminal decision
+                continue
+            can_ignore_prefix = False
+        lstrip = line.lstrip()
+        fence_line = lstrip.startswith("```") or lstrip.startswith("~~~")
+        if fence_line:
+            in_fence = not in_fence
+            if stripped:
+                last_nonempty = stripped
+                last_in_fence = in_fence
+            continue
+        if in_fence:
+            if stripped:
+                last_nonempty = stripped
+                last_in_fence = True
+            continue
+        if stripped:
+            last_nonempty = stripped
+            last_in_fence = False
+    if not last_nonempty or last_in_fence:
+        return None
+    match = MARKER_RE.match(last_nonempty)
+    if match and match.group(1) in TERMINAL_MARKERS:
+        return {"line": -1, "kind": match.group(1), "text": match.group(2)[:1000]}
+    return None
 
 
 def main() -> int:
@@ -209,7 +273,13 @@ def main() -> int:
             last_change = time.time()
         now = time.time()
         seconds_since_event = now - last_change
-        terminal = next((m for m in reversed(markers) if m["kind"] in TERMINAL_MARKERS), None)
+        terminal = _last_line_is_terminal_marker(tail, ignore_prefix_lines=ignore_prefix_lines)
+        if terminal:
+            # Stability recheck (minimal gap protection): if bytes arrive within a short
+            # window after a terminal marker became the last line, it was a mid-output
+            # emission; discard and keep watching. Genuine sign-off is worker's final act.
+            time.sleep(0.05)
+            terminal = _last_line_is_terminal_marker(tail, ignore_prefix_lines=ignore_prefix_lines)
         worker_is_alive, identity_reason, current_identity = worker_alive(args.pid, expected_identity)
         if worker_is_alive:
             pgid = args.pgid or process_group_id(args.pid) or pgid

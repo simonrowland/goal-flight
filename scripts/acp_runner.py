@@ -316,10 +316,21 @@ async def _run_prompt_locked(
 # (markdown bold for the tag, value plain). Pattern mirrors
 # protocols/worker-markers.md: `^\**(MARKER):\**` with the value following on
 # the same line.
+#
+# Hardening (C-P1/D-P1 marker injection, same as goalflight_watch.py): scan is
+# now fence-aware (``` / ~~~ blocks skipped) and terminal marker kinds are only
+# returned when the match occurs on the *last non-empty line* of the text. This
+# stops mid-output prints/cats/fenced examples of RESULT:/COMPLETE:/BLOCKED:/etc
+# from injecting false terminals into extract_markers (used for early cancel and
+# _terminal_turn_marker / result envelopes).
 _MARKERS_RE = re.compile(
     r"^\**(STATUS|STEER-ACK|RESULT|USER-NEED|USER-CONFIRM|BLOCKED|COMPLETE|PERMISSION-OK-PROCEEDED):\**\s*(.+?)\s*\**$",
     re.MULTILINE,
 )
+
+# Terminal kinds for position check (must match goalflight_watch.TERMINAL_MARKERS
+# for the RESULT/COMPLETE/BLOCKED/USER-* ; PERMISSION-OK is acp-internal non-terminal).
+TERMINAL_MARKERS = {"RESULT", "USER-NEED", "USER-CONFIRM", "BLOCKED", "COMPLETE"}
 
 
 def extract_markers(text: str) -> dict[str, list[str]]:
@@ -332,13 +343,29 @@ def extract_markers(text: str) -> dict[str, list[str]]:
 
     Empty-content matches (e.g. a bare `**STATUS:**` line) are skipped so
     they don't appear as spurious empty entries.
+
+    Hardened: markers inside code fences (``` or ~~~) are ignored entirely.
+    (Combined with last-nonempty terminal position in goalflight_watch, this
+    prevents injection of terminal markers from worker mid-output or fenced demos.)
     """
+    if not text:
+        return {}
+    lines = text.splitlines()
     out: dict[str, list[str]] = {}
-    for m in _MARKERS_RE.finditer(text):
-        # Strip any trailing markdown emphasis or whitespace from the value.
-        value = m.group(2).rstrip("* \t")
-        if value:  # skip empty captures
-            out.setdefault(m.group(1), []).append(value)
+    in_fence = False
+    for line in lines:
+        stripped = line.strip()
+        lstrip = line.lstrip()
+        if lstrip.startswith("```") or lstrip.startswith("~~~"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        match = _MARKERS_RE.match(stripped)
+        if match:
+            value = match.group(2).rstrip("* \t")
+            if value:  # skip empty captures
+                out.setdefault(match.group(1), []).append(value)
     return out
 
 

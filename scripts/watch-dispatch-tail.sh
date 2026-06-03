@@ -223,7 +223,11 @@ while true; do
   fi
 
   # 2. Terminal marker in tail?
-  if [ -f "$TAIL_PATH" ] && grep -qE "$MARKER_RE" "$TAIL_PATH" 2>/dev/null; then
+  # Hardening (C-P1/D-P1 marker injection): only the LAST non-empty line counts as
+  # a terminal. A worker that prints/cats/logs a marker token mid-output must not
+  # false-complete the watcher. (Python watcher + acp_runner also fence-skip; this
+  # legacy bash path checks last-non-empty-line.)
+  if [ -f "$TAIL_PATH" ] && grep -vE '^[[:space:]]*$' "$TAIL_PATH" 2>/dev/null | tail -1 | grep -qE "$MARKER_RE" 2>/dev/null; then
     echo "[$(date '+%H:%M:%S')] terminal marker matched in tail"
     echo "=== tail last 30 lines ==="
     tail -30 "$TAIL_PATH"
