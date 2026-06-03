@@ -94,7 +94,7 @@ activation contract above; **not** for ordinary one-off coding.
 2. Read newest RESUME-NOTES via the find-newest one-liner above + queue
    frontmatter (`state`, `current_session`, `session_history`).
 3. Check git reality.
-4. Run `goalflight_status.py --json`.
+4. Run `goalflight_status.py`.
 5. Classify active dispatches:
    - expected live
    - stale dead PID

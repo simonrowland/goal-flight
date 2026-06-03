@@ -95,7 +95,7 @@ Orchestrator behaviour probes run through portable host adapters, not host-speci
 |---|---|---|
 | **is goal-flight active here?** | preamble above | `scripts/goalflight_session_status.py --text` |
 | status preflight | Session Pre-Flight | `protocols/session-preflight.md`, `scripts/goalflight_status.py`, `scripts/goalflight_doctor.py` |
-| **in-flight dispatch monitoring** | Session Pre-Flight | `scripts/goalflight_status.py --json`, `scripts/goalflight_watch.py` (ACP), `scripts/watch-dispatch-tail.sh` (bash-tail) |
+| **in-flight dispatch monitoring** | Session Pre-Flight | `scripts/goalflight_status.py` (terse digest default; `--json`=machine), `scripts/goalflight_watch.py` (ACP), `scripts/watch-dispatch-tail.sh` (bash-tail) |
 | **active leases / what's in flight** | Capacity and rate limits | `scripts/goalflight_capacity.py status` |
 | **per-chunk status snapshot** | Session Pre-Flight | `python3 <skill-root>/scripts/goalflight_chunk_summary.py --slug <slug> --json` |
 | autonomous throughput | Autonomous throughput | `commands/execute.md`, `commands/goal.md` |
@@ -134,7 +134,7 @@ skill loaded. Load those protocols on demand.
 For non-trivial commands, use `protocols/session-preflight.md`.
 
 ```bash
-python3 <skill-root>/scripts/goalflight_status.py --json
+python3 <skill-root>/scripts/goalflight_status.py
 ```
 
 Use doctor when readiness is unknown or changed:
@@ -242,7 +242,7 @@ inline; fix P0/P1/P2 before commit.
   goal-flight run is active. Workers surface out-of-scope findings in their
   RESULT; the controller harvests them into the Backlog before moving on.
 - No `tail -f` in conversation. Use status files instead:
-  - Aggregate snapshot: `python3 <skill-root>/scripts/goalflight_status.py --json`
+  - Aggregate snapshot: `python3 <skill-root>/scripts/goalflight_status.py` (terse digest default; `--json`=machine)
   - ACP dispatch: `python3 <skill-root>/scripts/goalflight_watch.py --pid <pid> --tail <tailfile> --status-json <path>`
   - Bash-tail dispatch: `<skill-root>/scripts/watch-dispatch-tail.sh` (content-aware completion watcher with terminal-marker / pid-dead / idle / controller-dead exit codes)
 - No worker spawn without capacity consideration.
@@ -448,7 +448,7 @@ Propose AGENTS.md changes as diffs only.
 On resume or after sleep:
 
 ```bash
-python3 <skill-root>/scripts/goalflight_status.py --json
+python3 <skill-root>/scripts/goalflight_status.py
 ```
 
 Active run + compaction: if already in play, invoke `/goal-flight resume` for fresh `SKILL.md`/`commands/resume.md`, then stay in-skill: dispatch workers, review before commit, one commit/chunk; never default-fallback to inline edits, task pivot, or hand-rolled review.
@@ -465,7 +465,7 @@ Active run + compaction: if already in play, invoke `/goal-flight resume` for fr
    date so lexicographic sort = chronological; no topic prefixes).
 5. Read newest queue file at `docs-private/goal-queue-*.md` for the chunk
    table + frontmatter `state` and `current_session`.
-6. `python3 <skill-root>/scripts/goalflight_status.py --json` for live
+6. `python3 <skill-root>/scripts/goalflight_status.py` for live
    capacity + ledger.
 7. Continue from status, not from chat memory.
 

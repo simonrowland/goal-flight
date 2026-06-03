@@ -29,5 +29,5 @@ Rules:
 Compact status path:
 
 ```bash
-python3 <skill-root>/scripts/goalflight_status.py --json
+python3 <skill-root>/scripts/goalflight_status.py
 ```

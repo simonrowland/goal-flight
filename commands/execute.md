@@ -22,7 +22,7 @@ Read:
 1. Pre-flight:
 
 ```bash
-python3 <skill-root>/scripts/goalflight_status.py --json
+python3 <skill-root>/scripts/goalflight_status.py
 python3 <skill-root>/scripts/goalflight_capacity.py status --json
 python3 <skill-root>/scripts/goalflight_rate_pressure.py --json
 python3 <skill-root>/scripts/goalflight_messages.py relay || true
@@ -107,7 +107,7 @@ Use `scripts/goalflight_ledger.py record` directly only when a runner did not
 already record the worker.
 
 **In-flight monitoring:** while workers or review jobs run, follow
-`protocols/user-status-cadence.md` — poll `goalflight_status.py --json` and
+`protocols/user-status-cadence.md` — poll `goalflight_status.py` and
 surface a compact user status update at least every 15 minutes unless context
 is tight (file-only row in RESUME-NOTES then). Background the poll; do not
 block on raw logs.
@@ -212,7 +212,7 @@ Missing/stalled/session-limited reviews are inconclusive, not clean.
 Before compact, sleep, or long wait, update resume notes from:
 
 ```bash
-python3 <skill-root>/scripts/goalflight_status.py --json
+python3 <skill-root>/scripts/goalflight_status.py
 ```
 
 ## Parallel Mode

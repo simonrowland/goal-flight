@@ -5,7 +5,7 @@ Run before non-trivial goal-flight commands. Keep output compact.
 1. Run procedural status first:
 
 ```bash
-python3 <skill-root>/scripts/goalflight_status.py --json
+python3 <skill-root>/scripts/goalflight_status.py
 ```
 
 2. Run doctor when:

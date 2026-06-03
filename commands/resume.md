@@ -38,12 +38,12 @@ Do not act on any resume state until STEP 0 is satisfied.
 
 Follow `AGENTS.md`, then the canonical post-compaction reload order in `SKILL.md`
 (session-status verdict → `SKILL.md` end-to-end → newest RESUME-NOTES → newest
-queue → `goalflight_status.py --json`). Read `protocols/state-handoff.md`.
+queue → `goalflight_status.py`). Read `protocols/state-handoff.md`.
 
 ## STEP 2 — Rebuild status
 
 ```bash
-python3 <skill-root>/scripts/goalflight_status.py --json
+python3 <skill-root>/scripts/goalflight_status.py
 git status --short
 git log -1 --oneline
 ```

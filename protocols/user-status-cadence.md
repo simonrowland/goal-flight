@@ -25,7 +25,7 @@ on a background job (>10s) before the queue is DONE:
 ## Poll (compact)
 
 ```bash
-python3 <skill-root>/scripts/goalflight_status.py --json
+python3 <skill-root>/scripts/goalflight_status.py
 python3 <skill-root>/scripts/goalflight_messages.py relay || true
 ```
 

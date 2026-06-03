@@ -184,7 +184,7 @@ HEAD).
 - **Don't run during an active dispatch**: a `codex exec` worker running
   during a `codex update` might end up with mixed binaries. Drain
   in-flight dispatches first (check
-  `python3 "$GFROOT/scripts/goalflight_status.py" --json`) or queue the
+  `python3 "$GFROOT/scripts/goalflight_status.py"`) or queue the
   update for after.
 - **Plugin update is hot-swap-unsafe for the live session.** Loaded
   `SKILL.md` + protocols are cached in this conversation. After Sweep 1
