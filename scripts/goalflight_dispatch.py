@@ -9,7 +9,7 @@ worker AND reliably wakes the orchestrator on every terminal state. It fixes the
 Easy path (agent preset — the common case):
     python3 goalflight_dispatch.py --agent codex --prompt-file p.md --cwd .
     python3 goalflight_dispatch.py --agent codex --prompt-file p.md --read-only   # review/analysis
-    python3 goalflight_dispatch.py --agent grok  --prompt-file p.md --cwd .
+    python3 goalflight_dispatch.py --agent grok-code --prompt-file p.md --cwd .
 
 Presets bake in the canonical NON-INTERACTIVE + SAFE flags per worker, so you
 never spell them out (and cannot fat-finger `--dangerously-bypass`). Paths and a
@@ -56,15 +56,20 @@ from goalflight_liveness import process_group_id, write_status
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 WATCH_PY = SCRIPT_DIR / "goalflight_watch.py"
-PRESET_AGENTS = {"codex", "grok"}
-STDIN_PROMPT_AGENTS = {"codex", "grok"}
+PRESET_AGENTS = {"codex", "grok-code", "grok-research"}
+STDIN_PROMPT_AGENTS = {"codex", "grok-code", "grok-research"}
 ACCOUNT_ENGINE_BY_AGENT = {
     "codex": "codex",
     "codex-acp": "codex",
     "grok": "grok",
+    "grok-code": "grok",
+    "grok-research": "grok",
     "grok-acp": "grok",
     "cursor": "cursor",
     "cursor-agent": "cursor",
+}
+RETIRED_AGENT_LABELS = {
+    "grok": "use --agent grok-code (coding) or --agent grok-research (web search)",
 }
 STEER_PROMPT_PREAMBLE = (
     "You have a steer mailbox at `$GOALFLIGHT_STEER_FILE`. Read it AT THE TOP OF EACH "
@@ -131,11 +136,16 @@ def _prompt_requested(args) -> bool:
 def _validate_before_side_effects(args, raw_argv: list[str]) -> None:
     if raw_argv:
         return
+    retired = RETIRED_AGENT_LABELS.get(args.agent)
+    if retired:
+        raise DispatchUsageError(
+            f"--agent {args.agent!r} is retired — {retired}"
+        )
     if args.agent not in PRESET_AGENTS:
         raise DispatchUsageError(
             "no worker preset for --agent "
-            f"{args.agent!r} — use --agent codex|grok with --prompt/--prompt-file, "
-            "or pass a raw worker after `-- <cmd...>`"
+            f"{args.agent!r} — use --agent codex|grok-code|grok-research with "
+            "--prompt/--prompt-file, or pass a raw worker after `-- <cmd...>`"
         )
     if args.agent in STDIN_PROMPT_AGENTS and not _prompt_requested(args):
         raise DispatchUsageError(
@@ -931,15 +941,16 @@ def build_worker(args, prompt_path, raw_argv: list[str]):
             argv += ["-C", args.cwd]
         argv += ["-"]  # codex reads the prompt from stdin
         return argv, prompt_path
-    if args.agent == "grok":
+    if args.agent in ("grok-code", "grok-research"):
         # Read the prompt from a FILE, not argv `-p` — long goal-flight prompts
         # (5-20KB) would hit E2BIG / argv truncation (grok review #5).
+        default_model = (
+            "grok-composer-2.5-fast"
+            if args.agent == "grok-code"
+            else "grok-build"
+        )
         argv = ["grok", "--prompt-file", str(prompt_path), "--permission-mode", "acceptEdits"]
-        # Default grok to the fast coding model (Composer 2.5). grok's own default
-        # (grok-build) is slow and error-prone at file edits — observed 2026-06-02
-        # fumbling multi-file doc edits with repeated string-match failures. An
-        # explicit --model always wins.
-        argv += ["--model", str(model) if model else "grok-composer-2.5-fast"]
+        argv += ["--model", str(model) if model else default_model]
         if args.cwd:
             argv += ["--cwd", args.cwd]
         return argv, None
@@ -955,13 +966,13 @@ def main(argv: list[str] | None = None) -> int:
         description="Crash-safe worker dispatch: detached worker + decoupled watcher."
     )
     parser.add_argument("--agent", default="worker",
-                        help="Preset (codex|grok) OR a label when you pass `-- <cmd>`")
+                        help="Preset (codex|grok-code|grok-research) OR a label when you pass `-- <cmd>`")
     parser.add_argument("--prompt-file", help="Prompt file (preset path)")
     parser.add_argument("--prompt", help="Inline prompt text (preset path; alternative to --prompt-file)")
     parser.add_argument("--cwd", help="Worker working directory")
     parser.add_argument("--model", default=None,
-                        help="Worker model id (grok/codex --model passthrough, e.g. "
-                             "grok-composer-2.5-fast for coding). Default = agent's own default.")
+                        help="Worker model id (grok-code/grok-research/codex --model passthrough). "
+                             "Default = agent label's own default.")
     parser.add_argument("--read-only", action="store_true",
                         help="Read-only sandbox (review/analysis dispatches)")
     parser.add_argument("--account",

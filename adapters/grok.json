@@ -200,5 +200,19 @@
     "stale_after_s": 180,
     "terminal_states": ["complete", "failed", "blocked", "wedged"]
   },
-  "host_projection": {}
+  "host_projection": {
+    "dispatch_presets": {
+      "grok-code": {
+        "transport": "cli",
+        "default_model": "grok-composer-2.5-fast",
+        "notes": "Coding worker; replaces retired bare grok dispatch label."
+      },
+      "grok-research": {
+        "transport": "cli",
+        "default_model": "grok-build",
+        "web_search": "enabled_by_default",
+        "notes": "Research/search worker; CLI has --disable-web-search only (no enable flag)."
+      }
+    }
+  }
 }

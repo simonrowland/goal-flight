@@ -239,23 +239,24 @@ leak-free, so it carries unknown helper-leak risk the bash-tail path avoids.)
 selects the worker model on both transports — bash via `build_worker`, ACP via
 `agent_command`. With `--model` omitted, each agent keeps its own default — except
 **claude**, which defaults to `opus` (its clear strongest — quality-by-default for
-workers; pass `--model haiku` for speed). codex already defaults strong, grok keeps
-`grok-build`, and cursor/opencode keep their own default (strongest is ambiguous).
+workers; pass `--model haiku` for speed). codex already defaults strong; `grok-code`
+defaults `grok-composer-2.5-fast`; `grok-research` defaults `grok-build` (web search
+on by default); cursor/opencode keep their own default (strongest is ambiguous).
 The selector is inserted PER-AGENT (the flag and its position differ — a blind
 append breaks codex/grok ACP), so pass the **agent's own id format**:
 
 | Agent | Example | ACP form |
 |---|---|---|
-| grok (coding) | `--agent grok --model grok-composer-2.5-fast` | `grok agent --model <id> stdio` |
+| grok-code | `--agent grok-code` (default composer-2.5) | `grok agent --model <id> stdio` |
+| grok-research | `--agent grok-research` (default grok-build) | `grok agent --model <id> stdio` |
 | claude (speed) | `--agent claude --model haiku` | `claude-code-cli-acp --model <id>` |
 | codex | `--agent codex --model o3` | bash `codex exec --model <id>`; ACP `-c model=<id>` |
 | cursor | `--agent cursor --model sonnet-4` | `cursor-agent --model <id> acp` (best-effort) |
 | opencode | `--agent opencode --model anthropic/claude-haiku` | `opencode --model <id> acp` (best-effort) |
 
 grok/codex/claude placements are verified; cursor/opencode are best-effort (their
-ACP arg position is not separately confirmed). For research/triage on grok, omit
-`--model` (default `grok-build`). The direct CLI takes the same flag outside the
-dispatcher: `grok -m grok-composer-2.5-fast …`.
+ACP arg position is not separately confirmed). Bare `--agent grok` is retired —
+use `grok-code` or `grok-research`. The direct CLI: `grok -m grok-composer-2.5-fast …`.
 
 ## Capacity gate
 

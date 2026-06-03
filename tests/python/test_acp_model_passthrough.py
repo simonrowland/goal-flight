@@ -20,6 +20,7 @@ import goalflight_acp_run as acp  # noqa: E402
 import goalflight_dispatch as dispatch  # noqa: E402
 
 MODEL = "grok-composer-2.5-fast"
+RESEARCH_MODEL = "grok-build"
 
 
 def case_agent_command_per_agent_placement() -> None:
@@ -58,23 +59,46 @@ def _build(agent, model, *, raw=None):
 
 
 def case_build_worker_injects_model() -> None:
-    for agent in ("codex", "grok"):
+    for agent in ("codex", "grok-code", "grok-research"):
         argv = _build(agent, MODEL)
         assert "--model" in argv and argv[argv.index("--model") + 1] == MODEL, (agent, argv)
     # codex has no default model: none passed -> no --model.
     argv_codex = _build("codex", None)
     assert "--model" not in argv_codex, argv_codex
-    # grok defaults to the fast coding model (Composer 2.5) when none is passed.
-    argv_grok = _build("grok", None)
-    assert "--model" in argv_grok and argv_grok[argv_grok.index("--model") + 1] == "grok-composer-2.5-fast", argv_grok
+    # grok-code defaults to the fast coding model (Composer 2.5) when none is passed.
+    argv_code = _build("grok-code", None)
+    assert (
+        "--model" in argv_code
+        and argv_code[argv_code.index("--model") + 1] == "grok-composer-2.5-fast"
+    ), argv_code
+    # grok-research defaults to grok-build when none is passed.
+    argv_research = _build("grok-research", None)
+    assert (
+        "--model" in argv_research
+        and argv_research[argv_research.index("--model") + 1] == RESEARCH_MODEL
+    ), argv_research
+    assert "--disable-web-search" not in argv_research, argv_research
     # raw `-- <cmd>` passthrough ignores model (the orchestrator supplies the cmd).
     assert _build("x", MODEL, raw=["echo", "hi"]) == ["echo", "hi"]
+
+
+def case_retired_bare_grok_agent_label() -> None:
+    ns = argparse.Namespace(agent="grok", cwd="/tmp/x", read_only=False, model=None)
+    try:
+        dispatch._validate_before_side_effects(ns, [])
+    except dispatch.DispatchUsageError as exc:
+        msg = str(exc)
+        assert "retired" in msg.lower(), msg
+        assert "grok-code" in msg and "grok-research" in msg, msg
+    else:
+        raise AssertionError("expected DispatchUsageError for --agent grok")
 
 
 def main() -> None:
     case_agent_command_per_agent_placement()
     case_agent_command_defaults()
     case_build_worker_injects_model()
+    case_retired_bare_grok_agent_label()
     print("OK: model passthrough tests pass")
 
 

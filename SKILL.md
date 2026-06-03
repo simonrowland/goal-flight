@@ -226,7 +226,7 @@ inline; fix P0/P1/P2 before commit.
   conclusion at ~10x compression.
 - The host Agent / Task / Explore tool is for recon, analysis, and review ONLY
   — NEVER a code executor. Code-writing (execution) chunks go through
-  `scripts/goalflight_dispatch.py` (a file-tracked, capacity-leased `codex`/`grok`
+  `scripts/goalflight_dispatch.py` (a file-tracked, capacity-leased `codex`/`grok-code`
   CLI worker), or controller-direct only when the chunk is tiny. Running a
   code-writing chunk as a host Agent is the documented bypass regression: it
   takes NO capacity lease (over-subscribes the machine), leaves NO ledger/status
@@ -356,7 +356,8 @@ Default routing by task:
 
 | Task | Default | Fallback 1 | Fallback 2 |
 |---|---|---|---|
-| Code-writing chunks | `goalflight_dispatch.py` CLI worker (codex/grok) | Alternate CLI worker (grok↔codex) | Host Agent — LAST RESORT only ‡ |
+| Code-writing chunks | `goalflight_dispatch.py` CLI worker (codex/`grok-code`) | Alternate CLI worker (`grok-code`↔codex) | Host Agent — LAST RESORT only ‡ |
+| Research / web search | `goalflight_dispatch.py` `--agent grok-research` | controller-direct | - |
 | Reviewer dispatches | gstack `/review` via review worker + concern-diverse sweep | any one alone | Claude Agent only when others unreachable |
 | Planning / decompose | code/planning worker | controller-direct | Claude Agent |
 | Anticipatory questions | strongest interactive planner | controller-direct | - |
@@ -364,7 +365,7 @@ Default routing by task:
 | Voice-sensitive prose | orchestrator judgment per chunk | - | - |
 
 ‡ **Host Agent as code executor = LAST RESORT, never a co-equal fallback.** Only
-when EVERY CLI worker (codex, grok) is genuinely unreachable — not merely slow or
+when EVERY CLI worker (codex, grok-code) is genuinely unreachable — not merely slow or
 friction-y. When forced to it: (1) confirm all CLI workers are actually down
 (doctor/probe, not assumption); (2) `log()` + record in RESUME-NOTES that you are
 in degraded host-Agent fallback and why; (3) return to `goalflight_dispatch.py`

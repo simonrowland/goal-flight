@@ -31,6 +31,8 @@ DEFAULT_WORST_WORKER_MB = 1200
 DEFAULT_HARD_CAP = 20
 AGENT_RSS_MB = {
     "grok": 111,
+    "grok-code": 111,
+    "grok-research": 111,
     "codex": 386,
     "codex-acp": 386,
     "claude": 614,
@@ -80,6 +82,8 @@ DEFAULT_AGENT_CAPS = {
     "codex": 10,
     "codex-acp": 10,       # stress-tested 2026-05-20: 49/49 + 13/13 TRUE-simultaneous, zero wedges
     "grok": 10,
+    "grok-code": 10,
+    "grok-research": 10,
     # Gateway orchestrators: lower cap, longer orchestration latency (Track D).
     "herm-worker": 2,
     "cla-worker": 2,
@@ -387,8 +391,23 @@ def extend_active_lease_expiry(lease_id: str | None, seconds: float) -> bool:
         return True
 
 
+# Bash-tail + dispatch presets that share one engine/provider concurrency budget.
+AGENT_CAP_POOL: dict[str, str] = {
+    "grok-code": "grok",
+    "grok-research": "grok",
+    "grok-acp": "grok",
+    "grok-bash-tail": "grok",
+}
+
+
 def normalize_agent(agent: str) -> str:
     return agent.strip().lower()
+
+
+def cap_pool(agent: str) -> str:
+    """Map agent label to the shared capacity pool key (engine/provider budget)."""
+    agent = normalize_agent(agent)
+    return AGENT_CAP_POOL.get(agent, agent)
 
 
 def active_leases(data: dict) -> list[dict]:
@@ -434,8 +453,11 @@ def cmd_acquire(args: argparse.Namespace) -> int:
 
         leases = active_leases(data)
         max_total = args.max_total or prof["operating_cap"]
-        agent_cap = args.agent_cap or DEFAULT_AGENT_CAPS.get(agent, 2)
-        agent_count = sum(1 for lease in leases if normalize_agent(lease.get("agent", "")) == agent)
+        pool = cap_pool(agent)
+        agent_cap = args.agent_cap or DEFAULT_AGENT_CAPS.get(pool, DEFAULT_AGENT_CAPS.get(agent, 2))
+        agent_count = sum(
+            1 for lease in leases if cap_pool(normalize_agent(lease.get("agent", ""))) == pool
+        )
         total_rss = sum(int(lease.get("mem_mb") or 0) for lease in leases)
         if len(leases) >= max_total:
             payload = {"decision": "wait", "reason": "machine_worker_cap", "active": len(leases), "max_total": max_total}
