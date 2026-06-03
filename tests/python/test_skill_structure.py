@@ -252,6 +252,10 @@ EXPECTED_ENTRY_IDS = {
     "three-edit-cycle-controller-direct-anti-pattern",
     "never-pgrep-for-worker-liveness",
     "dispatch-cli-worker-via-one-crash-safe-command",
+    "agent-recon-only-not-executor",
+    "out-of-scope-findings-backlog-not-chip",
+    "no-engagement-prompts",
+    "ready-terminal-last-line",
 }
 
 KNOWN_SKILL_ALIGNMENT_GAPS = {}
@@ -275,6 +279,12 @@ KNOWN_ENTRY_SCHEMA_EXTENSIONS = {
         },
     },
     "worker-escalate-not-bypass": {
+        "top": {"notes"},
+        "nested": {
+            "verifier": {"fallback"},
+        },
+    },
+    "ready-terminal-last-line": {
         "top": {"notes"},
         "nested": {
             "verifier": {"fallback"},

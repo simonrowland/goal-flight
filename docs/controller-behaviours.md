@@ -2399,6 +2399,107 @@ chunk-3a rationale:
 - **max_skill_lines:** 2
 - **last_reviewed_commit:** (this commit)
 
+---
+
+### Entry: agent-recon-only-not-executor
+
+- **id:** `agent-recon-only-not-executor`
+- **name:** Host Agent is recon/review only, never code executor
+- **category:** `dispatch-discipline`
+- **controller_does:** The orchestrator uses the host Agent / Task / Explore tool only for recon, analysis, and review. All code-writing execution chunks go through `scripts/goalflight_dispatch.py` (or controller-direct when the chunk is tiny).
+- **failure_mode:** The orchestrator runs a code-writing chunk as a host Agent, bypassing capacity lease, ledger/status trace, marker/steer protocol, and burning the controller provider — the documented bypass regression observed in handoff history.
+- **skill_md_compressed_form:**
+    - **kind:** literal
+    - **pattern:** "The host Agent / Task / Explore tool is for recon, analysis, and review ONLY\n  — NEVER a code executor."
+    - **max_section_lines:** 58
+- **verifier:**
+    - **kind:** textual-invariant
+    - **id:** test_skill_structure::test_skill_md_matches_golden_master
+- **provenance:**
+    - **sources:**
+      - `SKILL.md`
+      - `commands/resume.md`
+      - `protocols/dispatch-routing.md`
+    - **r_numbers:** []
+- **severity:** high
+- **last_reviewed_commit:** 5321d7a
+
+---
+
+### Entry: out-of-scope-findings-backlog-not-chip
+
+- **id:** `out-of-scope-findings-backlog-not-chip`
+- **name:** Out-of-scope findings go to queue backlog, not spawn_task chips
+- **category:** `chat-discipline`
+- **controller_does:** During an active goal-flight run, the orchestrator routes out-of-scope findings (from itself or a worker) into the active goal queue Backlog in `docs-private/goal-queue-*.md`, harvesting worker RESULT markers before moving on.
+- **failure_mode:** The orchestrator spawns a host `spawn_task`/"chip" for an in-run finding, creating an orphaned session cut off from the canonical queue, ledger, and resume plane — the same work-escaping regression class as Agent-tool bypass.
+- **skill_md_compressed_form:**
+    - **kind:** literal
+    - **pattern:** "NOT a host `spawn_task`/\"chip\" — a chip spawns an orphaned"
+    - **max_section_lines:** 58
+- **verifier:**
+    - **kind:** textual-invariant
+    - **id:** test_skill_structure::test_skill_md_matches_golden_master
+- **provenance:**
+    - **sources:**
+      - `SKILL.md`
+      - `commands/resume.md`
+      - `commands/execute.md`
+    - **r_numbers:** []
+- **severity:** high
+- **last_reviewed_commit:** 5321d7a
+
+---
+
+### Entry: no-engagement-prompts
+
+- **id:** `no-engagement-prompts`
+- **name:** No engagement prompts over obvious next steps
+- **category:** `autonomous-throughput-and-status`
+- **controller_does:** During execute, the orchestrator continues through code, tests, review, and commits without permission-boxes or "shall I continue?" polling when the plan already authorizes the obvious next step.
+- **failure_mode:** The orchestrator asks "want me to fix it?", "shall I continue?", or "are you still there?" after a non-blocking step, stalling autonomous throughput despite an active goal-flight run and approved scope.
+- **skill_md_compressed_form:**
+    - **kind:** literal
+    - **pattern:** "Do not use engagement prompts or permission-boxes over obvious matters"
+    - **max_section_lines:** 25
+- **verifier:**
+    - **kind:** textual-invariant
+    - **id:** test_skill_structure::test_skill_md_matches_golden_master
+- **provenance:**
+    - **sources:**
+      - `SKILL.md`
+      - `protocols/engagement-lint.md`
+    - **r_numbers:** []
+- **severity:** high
+- **last_reviewed_commit:** 5321d7a
+
+---
+
+### Entry: ready-terminal-last-line
+
+- **id:** `ready-terminal-last-line`
+- **name:** READY is a terminal marker on the last non-empty line
+- **category:** `worker-markers`
+- **controller_does:** Subagent / Agent / Task / Explore dispatches whose returns may exceed ~5KB instruct the worker to emit TL;DR and findings first, then `READY: <path>` as the last non-empty line so watchers treat completion correctly.
+- **failure_mode:** The worker emits `READY:` mid-output or before TL;DR, causing `goalflight_watch.py` to treat the dispatch as complete prematurely or miss the canonical file-backed return path.
+- **skill_md_compressed_form:**
+    - **kind:** literal
+    - **pattern:** "then `READY: <path>` as the **last**\n  non-empty line (terminal marker"
+    - **max_section_lines:** 58
+- **verifier:**
+    - **kind:** textual-invariant
+    - **id:** test_skill_structure::test_skill_md_matches_golden_master
+    - **fallback:** runtime-assertion `tests/python/test_watch_prompt_echo.py::case_ready_terminal_marker`
+- **provenance:**
+    - **sources:**
+      - `SKILL.md`
+      - `protocols/worker-markers.md`
+      - `scripts/goalflight_watch.py`
+    - **r_numbers:** []
+- **severity:** high
+- **last_reviewed_commit:** 5321d7a
+- **notes:** Runtime marker semantics are also covered by `test_watch_prompt_echo.py::case_ready_terminal_marker`; this entry locks the SKILL.md distillation anchor against prose-only regression.
+
 ## Adding a new entry
 
 1. Pick a unique kebab-case `id` not already used.
