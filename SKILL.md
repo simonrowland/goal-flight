@@ -224,6 +224,23 @@ inline; fix P0/P1/P2 before commit.
   investigation) with a defined prompt instead. Recon-Reads pull the
   full body into orchestrator context; an Agent dispatch returns a
   conclusion at ~10x compression.
+- The host Agent / Task / Explore tool is for recon, analysis, and review ONLY
+  — NEVER a code executor. Code-writing (execution) chunks go through
+  `scripts/goalflight_dispatch.py` (a file-tracked, capacity-leased `codex`/`grok`
+  CLI worker), or controller-direct only when the chunk is tiny. Running a
+  code-writing chunk as a host Agent is the documented bypass regression: it
+  takes NO capacity lease (over-subscribes the machine), leaves NO ledger/status
+  trace (the watchdog, `goalflight_status.py`, and resume go blind to it), burns
+  the controller's OWN provider (the controller-provider-asymmetry violation —
+  heavy fan-out can strand the session), and gets NO marker/steer protocol. The
+  read-only recon use two bullets up is legitimate; using the Agent to WRITE
+  code is the regression.
+- Out-of-scope findings (yours or a worker's) during an active run go to the
+  active goal queue Backlog (`docs-private/goal-queue-*.md`, via `/goal-flight
+  goal` or directly), NOT a host `spawn_task`/"chip" — a chip spawns an orphaned
+  session cut off from this run. Reserve chips for a DIFFERENT repo, or when no
+  goal-flight run is active. Workers surface out-of-scope findings in their
+  RESULT; the controller harvests them into the Backlog before moving on.
 - No `tail -f` in conversation. Use status files instead:
   - Aggregate snapshot: `python3 <skill-root>/scripts/goalflight_status.py --json`
   - ACP dispatch: `python3 <skill-root>/scripts/goalflight_watch.py --pid <pid> --tail <tailfile> --status-json <path>`
@@ -268,7 +285,12 @@ When the user invoked goal-flight, approved a plan, or gave scope:
 - Keep working through code, tests, queue/ledger/resume updates, review, and
   commits until decomposition/execute drains or a real blocker stops it.
 - Default is continue, not confirm.
-- Do not use engagement prompts.
+- Do not use engagement prompts or permission-boxes over obvious matters ("I
+  found a problem: fix it?", "shall I continue?", "are you still there?" — the
+  Netflix are-you-still-there anti-pattern). If an action is the obvious next
+  step toward the goal and is not destructive/irreversible/a genuine product
+  choice, just DO it and report. Reserve questions for the real USER-NEED /
+  USER-CONFIRM blockers below.
 - Record non-blocking uncertainty in files, then proceed with the plan default.
 - Commits during execute follow **one commit per completed chunk**.
 - Push to a remote only after the relevant tests pass and the user has permitted publish.
@@ -334,12 +356,21 @@ Default routing by task:
 
 | Task | Default | Fallback 1 | Fallback 2 |
 |---|---|---|---|
-| Code-writing chunks | ACP code worker chosen per chunk | Alternate ACP code worker | Claude Agent |
+| Code-writing chunks | `goalflight_dispatch.py` CLI worker (codex/grok) | Alternate CLI worker (grok↔codex) | Host Agent — LAST RESORT only ‡ |
 | Reviewer dispatches | gstack `/review` via review worker + concern-diverse sweep | any one alone | Claude Agent only when others unreachable |
 | Planning / decompose | code/planning worker | controller-direct | Claude Agent |
 | Anticipatory questions | strongest interactive planner | controller-direct | - |
 | Analysis / reflection | controller-direct | - | - |
 | Voice-sensitive prose | orchestrator judgment per chunk | - | - |
+
+‡ **Host Agent as code executor = LAST RESORT, never a co-equal fallback.** Only
+when EVERY CLI worker (codex, grok) is genuinely unreachable — not merely slow or
+friction-y. When forced to it: (1) confirm all CLI workers are actually down
+(doctor/probe, not assumption); (2) `log()` + record in RESUME-NOTES that you are
+in degraded host-Agent fallback and why; (3) return to `goalflight_dispatch.py`
+the moment a CLI worker recovers. A transient CLI hiccup is not a license to make
+the host Agent your default executor — that IS the bypass regression. (Read-only
+review/analysis via Explore/Agent is fine — see Hard Invariants.)
 
 Use adapter manifests and doctor probes for current host/model details; do not
 hardcode yesterday's model list. Cursor internal models do not need passthrough

@@ -334,7 +334,7 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "at least every 15 minutes"
-    - **max_section_lines:** 37
+    - **max_section_lines:** 54
 - **verifier:**
     - **kind:** behaviour-scenario
     - **id:** user-status-cadence-15min
@@ -782,7 +782,7 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "No worker spawn without capacity consideration"
-    - **max_section_lines:** 35
+    - **max_section_lines:** 54
 - **verifier:**
     - **kind:** textual-invariant
     - **id:** test_skill_structure::test_capacity_consideration
@@ -804,7 +804,7 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Every long worker or review job needs a ledger/status path"
-    - **max_section_lines:** 35
+    - **max_section_lines:** 54
 - **verifier:**
     - **kind:** textual-invariant
     - **id:** test_skill_structure::test_worker_status_path_required
@@ -2206,7 +2206,7 @@ chunk-3a rationale:
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Workers escalate sandbox / permission / tool blocks via `BLOCKED:` and return to the orchestrator. They do NOT execute workarounds"
-    - **max_section_lines:** 37
+    - **max_section_lines:** 54
 - **verifier:**
     - **kind:** textual-invariant
     - **id:** test_skill_structure::test_skill_md_matches_golden_master
