@@ -320,13 +320,31 @@ def profile(args: argparse.Namespace | None = None) -> dict:
     return payload
 
 
+def _lease_pids_dead(lease: dict) -> bool:
+    """True only when BOTH the worker and orchestrator pids are gone.
+
+    A lease whose tracked processes are all dead is genuinely reclaimable;
+    one with a live pid is still consuming RAM and must not be evicted by a
+    clock-only TTL check (capacity.json is shared across sibling projects, so a
+    TTL eviction here would over-subscribe the machine while the lease is LIVE).
+    """
+    return not pid_alive(lease.get("worker_pid")) and not pid_alive(
+        lease.get("controller_pid")
+    )
+
+
 def prune_state(data: dict) -> None:
     now = utc_now()
     leases = data.get("leases", {})
     for lease_id in list(leases):
         lease = leases[lease_id]
         expires_at = parse_iso(lease.get("expires_at"))
-        if expires_at and expires_at < now:
+        # TTL expiry is gated on liveness: only flip a past-TTL lease to
+        # "expired" when its worker AND orchestrator pids are both dead. A LIVE
+        # lease past its TTL is kept and left to liveness-based reclaim
+        # (cmd_release-stale / stale_active_leases), so a long-running worker in
+        # a sibling project is never evicted out from under itself.
+        if expires_at and expires_at < now and _lease_pids_dead(lease):
             lease["state"] = "expired"
             lease["ended_at"] = lease.get("ended_at") or iso()
         terminal_at = parse_iso(lease.get("released_at") or lease.get("ended_at"))
@@ -540,10 +558,14 @@ def cmd_release_stale(args: argparse.Namespace) -> int:
 
 
 def cmd_status(args: argparse.Namespace) -> int:
+    # Status is a READ. It computes a pruned VIEW for display but never
+    # persists, so a frequent status poll can't evict a live lease (capacity.json
+    # is shared across sibling projects; persisting a prune here would let any
+    # poller race-flip another project's lease). Active-lease reclaim is the
+    # job of `release-stale`, which is liveness-gated by design.
     with StateLock():
         data = load_state()
-        prune_state(data)
-        save_state(data)
+    prune_state(data)
     payload = {"schema": SCHEMA, "profile": profile(args), "state": data, "active": active_leases(data)}
     if args.json:
         print(json.dumps(payload, sort_keys=True))
