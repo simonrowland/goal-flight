@@ -4,6 +4,48 @@ Notable changes to the goal-flight Claude Code skill. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are
 incremented when meaningful skill behaviour changes.
 
+## [1.0.1] — 2026-06-03
+
+**Hardening + reliability release on the 1.0.0 fleet foundation: crash-safe unified
+dispatch, Windows/WSL Phase-1, the controller-behaviour Golden Master, a context-discipline
+layer, and an intent-based multi-engine worker mix.**
+
+### Added
+
+- **Crash-safe unified dispatch** — detached worker + decoupled watcher, pid-identity
+  verification, capacity + ledger registration, `--stats` accounting, shape-aware steer
+  (message an in-flight worker), and an ACP library entrypoint with a SIGTERM bridge.
+- **Windows / WSL Phase-1** — read-layer foundation, WSL=Linux dispatch baseline,
+  refuse-gated native-Windows control plane, python launcher, encoding + autoupdate.
+- **Golden Master of controller behaviours** — schema + codified entries (R1–R26 +
+  high-recurrence regressions), a Codex-first behaviour harness, the compaction-resume
+  drill, and a multi-host runner.
+- **Context-discipline layer** — file-backed Agent returns, Read>5KB / foreground-duration
+  / engagement-lint protocols, hooks + wrappers, and a `goalflight_push_audit` guard.
+- **grok-code / grok-research split** — intent-based worker labels (Composer 2.5 for code,
+  grok-build for research); bare `grok` retired.
+- **Install + ops** — opt-in agent-traits installer, fleet worker install scripts,
+  `~/.goal-flight` canonical install path, terse status surface, controller→orchestrator rebrand.
+
+### Changed
+
+- READY registered as a last-line terminal marker; omitted `--model` defaults to the
+  strongest model; per-worker `--model` passthrough on both transports.
+- context-mode posture: the controller may use it for its own context discipline; the
+  worker-churn guards are preserved.
+
+### Fixed
+
+- Hardening-sweep P0s: worktree ACP dispatches scoped into status; capacity TTL-prune
+  liveness-gated (no live-lease eviction); live bash-tail workers protected from cleanup
+  SIGKILL; terminal-marker injection guard; empty `GOALFLIGHT_STATE_DIR` → default, not cwd.
+- Resume forces an end-to-end `SKILL.md` reload as unconditional STEP 0 (compaction-survival).
+
+### Security
+
+- Denied permissions downgrade to blocked (not silent success); title-allow regex layered
+  after hard safety gates; sandbox base + executable-surface guard.
+
 ## [1.0.0] — 2026-05-26
 
 **Major release: multi-node fleet dispatch, four orchestrator hosts, action router,
