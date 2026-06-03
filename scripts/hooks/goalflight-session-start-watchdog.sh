@@ -328,7 +328,7 @@ def main() -> None:
         f"the canonical watchdog prompt at `{prompt_file}`. Then poll newest bounded "
         "in-flight dispatch status JSON files under "
         "`/tmp/goal-flight-*/dispatch/*.status.json` and resume per the newest "
-        "`docs-private/RESUME-NOTES-*.md`. Do not use context-mode MCP."
+        "`docs-private/RESUME-NOTES-*.md`. Context-mode MCP is fine for your own context discipline; for worker dispatches see `protocols/dispatch-routing.md`."
     )
     print(json.dumps({
         "hookSpecificOutput": {
