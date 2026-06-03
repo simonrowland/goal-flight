@@ -42,6 +42,11 @@ try:
 except Exception:  # pragma: no cover - doctor still reports partial state
     goalflight_os_sandbox = None
 
+try:
+    import goalflight_agent_traits
+except Exception:  # pragma: no cover - doctor still reports partial state
+    goalflight_agent_traits = None
+
 
 def run(cmd: list[str], cwd: Path | None = None, timeout: float = 8.0) -> dict:
     try:
@@ -103,6 +108,53 @@ def version(binary: str, *args: str) -> dict:
         out["keychain_locked"] = True
         if not version_text or KEYCHAIN_LOCKED_RE.search(version_text):
             out["version"] = "present (login keychain locked over SSH)"
+    return out
+
+
+def check_agent_traits() -> dict:
+    """Non-fatal probe for opt-in global agent-behavior traits (claude host)."""
+    if goalflight_agent_traits is None:
+        return {
+            "available": False,
+            "reason": "goalflight_agent_traits import failed",
+            "ok": True,
+            "level": "info",
+        }
+    target = goalflight_agent_traits.default_target("claude")
+    if target is None:
+        return {
+            "available": False,
+            "reason": "no default claude target",
+            "ok": True,
+            "level": "info",
+        }
+    st = goalflight_agent_traits.status(target)
+    installed = goalflight_agent_traits.installed_version(target)
+    ok: bool | None
+    if st == "absent":
+        ok = None
+    elif st == "current":
+        ok = True
+    else:
+        ok = False
+    out: dict = {
+        "available": True,
+        "target": str(target),
+        "status": st,
+        "installed_version": installed,
+        "repo_version": goalflight_agent_traits.TRAITS_VERSION,
+        "ok": ok,
+        "level": "info" if st == "absent" else ("ok" if st == "current" else "warning"),
+    }
+    if st == "absent":
+        out["detail"] = "opt-in available: install.sh --with-agent-traits"
+    elif st == "stale":
+        out["detail"] = (
+            f"agent-traits block is v{installed}, repo is v{goalflight_agent_traits.TRAITS_VERSION}; "
+            "re-run install.sh --with-agent-traits to update"
+        )
+    else:
+        out["detail"] = "agent traits block current"
     return out
 
 
@@ -1538,6 +1590,7 @@ def doctor(repo: Path, *, fleet: bool = False, fleet_dir: Path | None = None, fl
         "cursor_context_mode": check_cursor_context_mode(skill_root, repo),
         "opencode_context_mode": check_opencode_context_mode(skill_root, repo),
         "gstack": check_gstack(),
+        "agent_traits": check_agent_traits(),
         "autoreview": check_autoreview(skill_root),
         "agents_md_state": check_agents_md_state(repo),
         "session_status": check_session_status(skill_root, repo),
@@ -1720,6 +1773,11 @@ def print_human(payload: dict) -> None:
             payload["opencode_context_mode"].get("project_path"),
         ),
         status_line(payload["gstack"].get("present"), "gstack", payload["gstack"].get("version")),
+        status_line(
+            (payload.get("agent_traits") or {}).get("ok"),
+            "agent traits (global opt-in)",
+            (payload.get("agent_traits") or {}).get("detail"),
+        ),
         status_line(payload["autoreview"].get("present"), "autoreview", payload["autoreview"].get("version") or payload["autoreview"].get("install_hint")),
         status_line(payload["cursor"].get("desktop_present"), "Cursor Desktop", None),
         status_line(payload["cursor"]["agent"].get("present"), "cursor-agent ACP", payload["cursor"]["agent"].get("version")),
