@@ -59,3 +59,10 @@ Private. Read before touching code.
   with explicit pathspecs — never bare `git commit`. The commit guard
   (`scripts/goalflight_commit_guard.py`) refuses to prevent bundling worker WIP.
 - Do not push without explicit permission.
+- **Spawned tasks (chips):** a `spawn_task` chip runs in its own git worktree that is
+  only auto-removed when left UNCHANGED — so commit your work cleanly (don't strand a
+  dirty worktree for someone to hand-clean) and report the branch + commit SHA in your
+  return so the initiator can integrate it and drop the worktree.
+- For review/analysis, prefer a sub-billed engine (Codex — the autoreview default — or
+  grok) over a Claude review flight when conserving Claude usage; sub-billed worker
+  capacity is abundant, the Claude budget is not.
