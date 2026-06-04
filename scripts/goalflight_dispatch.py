@@ -56,6 +56,7 @@ from goalflight_liveness import process_group_id, write_status
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 WATCH_PY = SCRIPT_DIR / "goalflight_watch.py"
+WATCH_TAIL_SH = SCRIPT_DIR / "watch-dispatch-tail.sh"
 PRESET_AGENTS = {"codex", "grok-code", "grok-research"}
 STDIN_PROMPT_AGENTS = {"codex", "grok-code", "grok-research"}
 ACCOUNT_ENGINE_BY_AGENT = {
@@ -119,6 +120,94 @@ def _state_dir() -> Path:
 
 def _dispatch_base_dir() -> Path:
     return _state_dir() / "dispatch"
+
+
+def _skill_root() -> Path:
+    return SCRIPT_DIR.parent
+
+
+def _status_reminder_lines(
+    dispatch_id: str,
+    *,
+    status_json: Path | str,
+    tail_path: Path | str,
+    worker_pid: int,
+    shape: str,
+    skill_root: Path | None = None,
+    agent: str | None = None,
+    controller_pid: int | None = None,
+    poll_secs: float | None = None,
+    max_idle_secs: float | None = None,
+) -> list[str]:
+    """Terse post-dispatch status-tooling reminder (stderr only; path-not-payload)."""
+    root = (skill_root or _skill_root()).resolve()
+    status_path = Path(status_json).resolve()
+    tail = Path(tail_path).resolve()
+    status_py = root / "scripts" / "goalflight_status.py"
+    watch_py = root / "scripts" / "goalflight_watch.py"
+    lines = [
+        f"[goal-flight] dispatched {dispatch_id} ({shape}). Check status with the python "
+        "tooling — do NOT hand-roll ps/tail -f/backgrounded watchers (they race the worker "
+        "and exit early):",
+        f"  status: python3 {status_py} --dispatch {dispatch_id}",
+        f"  done?:  python3 {status_py} --done {dispatch_id}   "
+        "# exit 0=terminal, 1=running, 2=ambiguous",
+    ]
+    if shape == "acp":
+        lines.append(
+            f"  watch:  python3 {watch_py} --pid {worker_pid} --tail {tail} "
+            f"--status-json {status_path}"
+        )
+    else:
+        agent_label = f"{agent}-bash-tail" if agent else "worker-bash-tail"
+        watch_parts = [
+            "bash",
+            str(WATCH_TAIL_SH.resolve()),
+            "--pid",
+            str(worker_pid),
+            "--tail",
+            str(tail),
+            "--controller-pid",
+            str(controller_pid if controller_pid is not None else os.getpid()),
+            "--agent",
+            agent_label,
+            "--session-id",
+            dispatch_id,
+        ]
+        if poll_secs is not None:
+            watch_parts += ["--poll-secs", str(poll_secs)]
+        if max_idle_secs is not None:
+            watch_parts += ["--max-idle-secs", str(max_idle_secs)]
+        lines.append("  watch:  " + " ".join(watch_parts))
+    return lines
+
+
+def _print_status_reminder(
+    dispatch_id: str,
+    *,
+    status_json: Path | str,
+    tail_path: Path | str,
+    worker_pid: int,
+    shape: str,
+    skill_root: Path | None = None,
+    agent: str | None = None,
+    controller_pid: int | None = None,
+    poll_secs: float | None = None,
+    max_idle_secs: float | None = None,
+) -> None:
+    for line in _status_reminder_lines(
+        dispatch_id,
+        status_json=status_json,
+        tail_path=tail_path,
+        worker_pid=worker_pid,
+        shape=shape,
+        skill_root=skill_root,
+        agent=agent,
+        controller_pid=controller_pid,
+        poll_secs=poll_secs,
+        max_idle_secs=max_idle_secs,
+    ):
+        print(line, file=sys.stderr, flush=True)
 
 
 def _steer_file(dispatch_id: str) -> Path:
@@ -897,8 +986,18 @@ def _run_acp_shape(args, *, base: Path, account_env: dict[str, str]) -> int:
         ),
         flush=True,
     )
+    tail_path = Path(args.tail) if args.tail else base / f"{cfg.dispatch_id}.tail"
     with _temporary_env(account_env, remove=env_remove):
         payload = asyncio.run(run_acp_dispatch(cfg))
+    worker_pid = payload.get("worker_pid")
+    if worker_pid:
+        _print_status_reminder(
+            cfg.dispatch_id,
+            status_json=status_json,
+            tail_path=tail_path,
+            worker_pid=int(worker_pid),
+            shape="acp",
+        )
     print(
         "DISPATCH-END "
         + json.dumps(
@@ -1207,6 +1306,17 @@ def main(argv: list[str] | None = None) -> int:
                 }, sort_keys=True), file=sys.stderr, flush=True)
         with contextlib.suppress(Exception):
             print("DISPATCH-START " + json.dumps(summary_head, sort_keys=True), flush=True)
+        _print_status_reminder(
+            args.dispatch_id,
+            status_json=status_json,
+            tail_path=tail,
+            worker_pid=worker_pid,
+            shape="bash",
+            agent=args.agent,
+            controller_pid=_controller_pid(args),
+            poll_secs=args.poll_secs,
+            max_idle_secs=args.max_idle_secs,
+        )
 
         # 2. Run the decoupled watcher in the FOREGROUND (it is our only real child).
         watch_cmd = [
