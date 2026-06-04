@@ -187,7 +187,11 @@ def check_gstack() -> dict:
 def check_autoreview(skill_root: Path) -> dict:
     script_path = skill_root / "scripts/autoreview.sh"
     helper_env = os.environ.get("AUTOREVIEW_HELPER")
-    helper = Path(helper_env).expanduser() if helper_env else Path.home() / ".cursor/skills/autoreview/scripts/autoreview"
+    helper = (
+        Path(helper_env).expanduser()
+        if helper_env
+        else skill_root / "autoreview/scripts/autoreview"
+    )
     script_ok = script_path.is_file() and os.access(script_path, os.X_OK)
     helper_ok = helper.is_file() and os.access(helper, os.X_OK)
     out = {
@@ -198,7 +202,7 @@ def check_autoreview(skill_root: Path) -> dict:
         "claude_acp": str(skill_root / "scripts/autoreview_claude_acp"),
     }
     if script_ok and helper_ok:
-        out["version"] = "goal-flight wrapper + upstream autoreview"
+        out["version"] = "goal-flight wrapper (vendored at autoreview/)"
     else:
         missing = []
         if not script_ok:
@@ -206,8 +210,9 @@ def check_autoreview(skill_root: Path) -> dict:
         if not helper_ok:
             missing.append("helper")
         out["install_hint"] = (
-            "Install upstream autoreview (Cursor skill or AUTOREVIEW_HELPER) "
-            f"and ensure scripts/autoreview.sh is executable; missing: {', '.join(missing)}"
+            "Vendored autoreview at autoreview/scripts/autoreview "
+            f"(or AUTOREVIEW_HELPER); ensure scripts/autoreview.sh is executable; "
+            f"missing: {', '.join(missing)}"
         )
     return out
 

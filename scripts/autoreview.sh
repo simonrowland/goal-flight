@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 # Goal Flight autoreview wrapper.
-# - Default reviewer: Codex (upstream autoreview default).
+# - Default reviewer: Codex (vendored autoreview default).
 # - Claude: route through claude-code-cli-acp via scripts/autoreview_claude_acp,
 #   not the native headless Claude print CLI (API-billed path).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-HELPER="${AUTOREVIEW_HELPER:-${HOME}/.cursor/skills/autoreview/scripts/autoreview}"
+HELPER="${AUTOREVIEW_HELPER:-${ROOT}/autoreview/scripts/autoreview}"
 CLAUDE_ACP="${ROOT}/scripts/autoreview_claude_acp"
 
 if [[ ! -x "${HELPER}" ]]; then
   echo "autoreview helper not found: ${HELPER}" >&2
-  echo "Install upstream autoreview (set AUTOREVIEW_HELPER to its scripts/autoreview path)." >&2
+  echo "Vendored autoreview helper missing at autoreview/scripts/autoreview (override with AUTOREVIEW_HELPER if needed)." >&2
   exit 127
 fi
 

@@ -52,8 +52,8 @@ Default add-ons (same tier as setup prompts):
 - **autoreview** — complementary diff-local pre-commit pass via
   `scripts/autoreview.sh`. Runs in parallel with gstack at chunk level when the
   orchestrator chooses; does not replace gstack as the default review path.
-  Install upstream autoreview before init when doctor WARNs — typically the
-  Cursor autoreview skill or `AUTOREVIEW_HELPER`.
+  Vendored at `autoreview/`; doctor WARNs if `autoreview/scripts/autoreview` or
+  `scripts/autoreview.sh` is missing (override helper with `AUTOREVIEW_HELPER`).
 
 2. Run doctor:
 

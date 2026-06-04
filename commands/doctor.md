@@ -47,8 +47,8 @@ package repository; for normal target projects it is skipped as INFO.
   `scripts/register-context-mode-cursor.py --scope global --check` and
   `scripts/register-context-mode-cursor.py --scope project --project-root "$PWD" --check`.
 - Check `gstack --version`.
-- Check autoreview: `scripts/autoreview.sh` executable and upstream helper
-  (`AUTOREVIEW_HELPER` or `~/.cursor/skills/autoreview/scripts/autoreview`).
+- Check autoreview: `scripts/autoreview.sh` executable and vendored helper at
+  `autoreview/scripts/autoreview` (`AUTOREVIEW_HELPER` overrides).
 - Check first-class local worker/controller candidates:
   - Codex: Desktop/CLI present, context-mode registered when large-output work
     will run, ACP adapter binary present when the Codex ACP path is considered.

@@ -184,8 +184,8 @@ Do not skip review entirely when tests pass.
 Recommended add-ons at setup/init: **gstack** (default reviewer) and
 **autoreview** (complementary diff-local pass). gstack lives at
 `~/.gstack/repos/gstack/.agents/skills/` (or the host-specific install path);
-autoreview requires the upstream helper (typically `AUTOREVIEW_HELPER` or
-`~/.cursor/skills/autoreview/scripts/autoreview`). Doctor reports WARN when
+autoreview is vendored at `autoreview/scripts/autoreview` (override with
+`AUTOREVIEW_HELPER`). Doctor reports WARN when
 either is absent.
 
 ## Commit hygiene at chunk completion
