@@ -23,7 +23,7 @@ and not compaction-only:
   - the host Agent/Task tool as a code executor instead of `goalflight_dispatch.py`;
   - engagement-question boxes over obvious matters ("I found a problem: fix it?" —
     the forbidden "are-you-still-there" pattern); just act, per §Autonomous throughput;
-  - `spawn_task` chips for out-of-scope findings instead of the queue backlog.
+  - `spawn_task` chips for findings a worker could do autonomously, instead of queue-backlog worker tasks.
 
 **Self-test:** if you cannot quote `SKILL.md`'s Hard Invariants and Dispatch Model
 from what is currently loaded, you have NOT loaded it.

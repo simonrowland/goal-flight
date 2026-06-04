@@ -2429,13 +2429,13 @@ chunk-3a rationale:
 ### Entry: out-of-scope-findings-backlog-not-chip
 
 - **id:** `out-of-scope-findings-backlog-not-chip`
-- **name:** Out-of-scope findings go to queue backlog, not spawn_task chips
+- **name:** Autonomous findings are worker tasks; reserve chips for user-interaction tasks
 - **category:** `chat-discipline`
-- **controller_does:** During an active goal-flight run, the orchestrator routes out-of-scope findings (from itself or a worker) into the active goal queue Backlog in `docs-private/goal-queue-*.md`, harvesting worker RESULT markers before moving on.
-- **failure_mode:** The orchestrator spawns a host `spawn_task`/"chip" for an in-run finding, creating an orphaned session cut off from the canonical queue, ledger, and resume plane — the same work-escaping regression class as Agent-tool bypass.
+- **controller_does:** During an active run, the orchestrator routes out-of-scope findings (from itself or a worker) into the goal queue Backlog in `docs-private/goal-queue-*.md` as worker tasks the goal-loop executes; it reserves a host `spawn_task`/chip for the narrow case of a context-polluting task that genuinely needs user input/interaction (or a different repo / no active run), harvesting worker RESULT markers before moving on.
+- **failure_mode:** The orchestrator spawns a host `spawn_task`/"chip" for a finding a worker could finish autonomously, orphaning the work from the canonical queue, ledger, and resume plane — chips are the exception (genuinely user-interaction-required tasks), not the default sink for out-of-scope work.
 - **skill_md_compressed_form:**
     - **kind:** literal
-    - **pattern:** "NOT a host `spawn_task`/\"chip\" — a chip spawns an orphaned"
+    - **pattern:** "a worker task, not a host `spawn_task`/\"chip\""
     - **max_section_lines:** 58
 - **verifier:**
     - **kind:** textual-invariant

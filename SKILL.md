@@ -238,9 +238,10 @@ inline; fix P0/P1/P2 before commit.
   code is the regression.
 - Out-of-scope findings (yours or a worker's) during an active run go to the
   active goal queue Backlog (`docs-private/goal-queue-*.md`, via `/goal-flight
-  goal` or directly), NOT a host `spawn_task`/"chip" — a chip spawns an orphaned
-  session cut off from this run. Reserve chips for a DIFFERENT repo, or when no
-  goal-flight run is active. Workers surface out-of-scope findings in their
+  goal` or directly). If a finding can be done autonomously in a goal-loop it is
+  a worker task, not a host `spawn_task`/"chip"; reserve chips for a
+  context-polluting task that genuinely needs user input/interaction (or a
+  different repo / no active run). Workers surface out-of-scope findings in their
   RESULT; the controller harvests them into the Backlog before moving on.
 - No `tail -f` in conversation. Use status files instead:
   - Aggregate snapshot: `python3 <skill-root>/scripts/goalflight_status.py` (terse digest default; `--json`=machine)
