@@ -4,6 +4,17 @@ Notable changes to the goal-flight Claude Code skill. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are
 incremented when meaningful skill behaviour changes.
 
+## [1.0.2] — 2026-06-04
+
+### Added
+
+- **Vendored autoreview** — the structured code-review closeout skill (Codex default; a
+  second-model complement to gstack `/review`) is now bundled in-repo at `autoreview/`
+  rather than requiring an external helper checkout. `scripts/autoreview.sh`, the doctor
+  probe, and the init / chunk-review docs default to the in-repo
+  `autoreview/scripts/autoreview`; MIT-licensed, with attribution preserved in
+  `autoreview/NOTICE`.
+
 ## [1.0.1] — 2026-06-03
 
 **Hardening + reliability release on the 1.0.0 fleet foundation: crash-safe unified
