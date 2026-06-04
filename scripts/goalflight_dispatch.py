@@ -20,11 +20,10 @@ Escape hatch (any worker): pass the raw command after `--`:
     python3 goalflight_dispatch.py --agent custom --tail t --status-json s -- <cmd...>
 
 How it stays crash-safe (validated):
-  1. The worker is launched DETACHED (own session/process-group) so its tree is
-     not this process's child tree (a lingering worker child can't keep us alive).
-  2. The worker is REAPED by a daemon thread so it can't become a POSIX zombie
-     (an un-reaped zombie satisfies os.kill(pid,0) and would defeat crash
-     detection -> the watcher would only escape via the slow idle-timeout).
+  1. The worker is launched by a short detached helper, then reparented into its
+     own session/process-group so launcher teardown cannot reap it.
+  2. The worker is not this dispatcher's child after launch; the helper is
+     reaped immediately and the platform supervisor reaps the worker on exit.
   3. The decoupled watcher (goalflight_watch.py) detects finished(0)/crashed(1)/
      hung(2)/controller-dead(3)/blocked(4) and we exit with ITS code UNCHANGED,
      so the host completion notification carries the real terminal state.
@@ -43,9 +42,9 @@ import json
 import os
 import re
 import signal
+import shutil
 import subprocess
 import sys
-import threading
 import time
 from pathlib import Path
 
@@ -53,10 +52,12 @@ import goalflight_compat
 import goalflight_capacity
 import goalflight_ledger
 from goalflight_liveness import process_group_id, write_status
+from goalflight_watch import _last_line_is_terminal_marker, _marker_state as _marker_state_for_terminal
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 WATCH_PY = SCRIPT_DIR / "goalflight_watch.py"
 WATCH_TAIL_SH = SCRIPT_DIR / "watch-dispatch-tail.sh"
+DAEMON_SPAWN_ARG = "__goalflight_spawn_daemon"
 PRESET_AGENTS = {"codex", "grok-code", "grok-research"}
 STDIN_PROMPT_AGENTS = {"codex", "grok-code", "grok-research"}
 ACCOUNT_ENGINE_BY_AGENT = {
@@ -94,6 +95,304 @@ def _detached_popen_kwargs() -> dict:
         )
         return {"creationflags": flags}
     return {"start_new_session": True}
+
+
+def _cmd_spawn_daemon() -> int:
+    """Private helper: spawn one long-lived child, print its pid, then exit.
+
+    The parent invokes this helper with the final worker/watcher environment.
+    The helper starts the child in a new session and exits immediately, so the
+    child is reparented away from the dispatch launcher. The launcher reaps only
+    this short helper, avoiding direct-child worker zombies.
+    """
+    try:
+        spec = json.loads(sys.stdin.read() or "{}")
+        argv = spec["argv"]
+        stdin_path = spec.get("stdin_path")
+        stdout_path = spec.get("stdout_path")
+        stdout_mode = spec.get("stdout_mode") or "wb"
+        stderr_mode = spec.get("stderr") or "stdout"
+        with contextlib.ExitStack() as stack:
+            if stdin_path:
+                stdin_f = stack.enter_context(open(stdin_path, "rb"))
+            else:
+                stdin_f = subprocess.DEVNULL
+            if stdout_path:
+                stdout_file = Path(stdout_path)
+                stdout_file.parent.mkdir(parents=True, exist_ok=True)
+                stdout_f = stack.enter_context(open(stdout_file, stdout_mode))
+            else:
+                stdout_f = subprocess.DEVNULL
+            stderr_f = subprocess.STDOUT if stderr_mode == "stdout" else subprocess.DEVNULL
+            child = subprocess.Popen(
+                argv,
+                stdin=stdin_f,
+                stdout=stdout_f,
+                stderr=stderr_f,
+                start_new_session=True,
+                close_fds=True,
+            )
+        print(json.dumps({"pid": child.pid}, sort_keys=True), flush=True)
+        return 0
+    except Exception as e:
+        print(json.dumps({"error": f"{type(e).__name__}: {e}"}, sort_keys=True), file=sys.stderr)
+        return 1
+
+
+def _spawn_daemonized_process(
+    argv: list[str],
+    *,
+    env: dict[str, str],
+    stdin_path: str | None = None,
+    stdout_path: Path | None = None,
+    stdout_mode: str = "wb",
+    stderr: str = "stdout",
+    label: str,
+) -> int:
+    """Spawn a child through the private daemon helper and return the child's pid."""
+    spec = {
+        "argv": argv,
+        "stdin_path": stdin_path,
+        "stdout_path": str(stdout_path) if stdout_path else None,
+        "stdout_mode": stdout_mode,
+        "stderr": stderr,
+    }
+    helper = subprocess.run(
+        [sys.executable, str(Path(__file__).resolve()), DAEMON_SPAWN_ARG],
+        input=json.dumps(spec, sort_keys=True),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=env,
+        timeout=30,
+        **_detached_popen_kwargs(),
+    )
+    if helper.returncode != 0:
+        detail = (helper.stderr or helper.stdout or "").strip().splitlines()[-1:]
+        raise RuntimeError(f"{label} daemon spawn failed: {detail[0] if detail else helper.returncode}")
+    lines = [line for line in helper.stdout.splitlines() if line.strip()]
+    if not lines:
+        raise RuntimeError(f"{label} daemon spawn failed: missing pid")
+    result = json.loads(lines[-1])
+    pid = int(result["pid"])
+    return pid
+
+
+def _status_exit_code(state: object) -> int:
+    if state == "complete":
+        return 0
+    if state == "worker_dead":
+        return 1
+    if state == "idle_timeout":
+        return 2
+    if state in {"orphaned", "controller_dead"}:
+        return 3
+    if state == "blocked" or (isinstance(state, str) and state.startswith("blocked")):
+        return 4
+    return 1
+
+
+def _is_status_terminal(state: object) -> bool:
+    if state in {
+        "complete",
+        "worker_dead",
+        "idle_timeout",
+        "orphaned",
+        "controller_dead",
+        "watcher_stopped",
+        "failed",
+    }:
+        return True
+    return isinstance(state, str) and state.startswith("blocked")
+
+
+def _status_matches_current_launch(
+    payload: dict,
+    *,
+    dispatch_id: str,
+    worker_pid: int | None,
+) -> bool:
+    if payload.get("dispatch_id") != dispatch_id:
+        return False
+    if worker_pid is None:
+        return payload.get("worker_pid") is None
+    try:
+        return int(payload.get("worker_pid")) == int(worker_pid)
+    except (TypeError, ValueError):
+        return False
+
+
+def _worker_alive_from_identity(worker_pid: int | None, identity: dict | None) -> tuple[bool, str]:
+    if not worker_pid:
+        return False, "no_pid"
+    try:
+        return goalflight_ledger.identity_matches(
+            {"worker_pid": worker_pid, "worker_identity": identity or {}}
+        )
+    except Exception as e:
+        return goalflight_compat.pid_alive(worker_pid), f"identity_check_error:{type(e).__name__}"
+
+
+def _ignore_prefix_lines(prompt_path: str | None) -> list[str]:
+    if not prompt_path:
+        return []
+    try:
+        return [
+            ln.strip()
+            for ln in Path(prompt_path).read_text(encoding="utf-8", errors="replace").splitlines()
+        ]
+    except Exception:
+        return []
+
+
+def _repair_watcher_terminal_status(
+    status_json: Path,
+    *,
+    args,
+    tail: Path,
+    worker_pid: int | None,
+    worker_identity: dict | None,
+    pgid: int | None,
+    prompt_path: str | None,
+    reason: str,
+) -> dict:
+    try:
+        payload = json.loads(status_json.read_text(encoding="utf-8", errors="replace"))
+        if not isinstance(payload, dict):
+            payload = {}
+    except Exception:
+        payload = {}
+    worker_is_alive, identity_reason = _worker_alive_from_identity(worker_pid, worker_identity)
+    terminal_marker = _last_line_is_terminal_marker(
+        tail,
+        ignore_prefix_lines=_ignore_prefix_lines(prompt_path),
+    )
+    if not terminal_marker:
+        terminal_marker = payload.get("terminal_marker")
+    terminal_pending_state = None
+    if terminal_marker and isinstance(terminal_marker, dict):
+        marker_state = _marker_state_for_terminal(terminal_marker)
+        if marker_state == "complete" and worker_is_alive:
+            state = "watcher_stopped"
+            terminal_pending_state = marker_state
+        else:
+            state = marker_state
+    elif worker_is_alive:
+        state = "watcher_stopped"
+    else:
+        state = "worker_dead"
+    payload.update({
+        "schema": "goalflight.status.v1",
+        "dispatch_id": args.dispatch_id,
+        "agent": args.agent,
+        "worker_pid": worker_pid,
+        "pgid": pgid,
+        "worker_alive": worker_is_alive,
+        "worker_identity_reason": identity_reason,
+        "expected_worker_identity": _identity_token(worker_identity),
+        "tail_path": str(tail),
+        "terminal_marker": terminal_marker if isinstance(terminal_marker, dict) else None,
+        "state": state,
+        "reason": reason,
+        "updated_at": int(time.time()),
+    })
+    if terminal_pending_state:
+        payload["terminal_pending_state"] = terminal_pending_state
+    try:
+        write_status(status_json, payload)
+    except Exception as e:
+        payload["state"] = "failed"
+        payload["reason"] = f"{reason};status_write_error:{type(e).__name__}: {e}"
+        payload["status_write_error"] = f"{type(e).__name__}: {e}"
+    return payload
+
+
+def _wait_for_detached_watcher(
+    *,
+    status_json: Path,
+    watcher_pid: int,
+    poll_secs: float,
+    args,
+    tail: Path,
+    worker_pid: int | None,
+    worker_identity: dict | None,
+    pgid: int | None,
+    prompt_path: str | None,
+) -> tuple[int, dict, str | None]:
+    sleep_s = min(max(float(poll_secs or 1.0), 0.2), 2.0)
+    last_payload: dict = {}
+    while True:
+        try:
+            payload = json.loads(status_json.read_text(encoding="utf-8", errors="replace"))
+            if isinstance(payload, dict):
+                last_payload = payload
+                state = payload.get("state")
+                if _is_status_terminal(state):
+                    if _status_matches_current_launch(
+                        payload,
+                        dispatch_id=args.dispatch_id,
+                        worker_pid=worker_pid,
+                    ):
+                        terminal_marker = payload.get("terminal_marker")
+                        marker_terminal = (
+                            terminal_marker
+                            and isinstance(terminal_marker, dict)
+                            and state == "complete"
+                        )
+                        stale_complete = (
+                            marker_terminal and payload.get("worker_alive") is True
+                            and not (payload.get("reason") or "").endswith(":post_terminal_idle_timeout")
+                        )
+                        if not stale_complete:
+                            return _status_exit_code(state), payload, payload.get("reason")
+                        # Stale 'complete' while the worker is still flagged alive:
+                        # keep waiting for the real worker exit, but ONLY while the
+                        # watcher is alive to refresh status. If the watcher has died
+                        # (e.g. an unwritable status dir froze this payload), do not
+                        # spin forever or trust the false-alive 'complete' -- fall
+                        # through to the watcher-dead repair path below.
+                        if goalflight_compat.pid_alive(watcher_pid):
+                            time.sleep(sleep_s)
+                            continue
+                    elif goalflight_compat.pid_alive(watcher_pid):
+                        time.sleep(sleep_s)
+                        continue
+        except Exception:
+            pass
+        if not goalflight_compat.pid_alive(watcher_pid):
+            repaired = _repair_watcher_terminal_status(
+                status_json,
+                args=args,
+                tail=tail,
+                worker_pid=worker_pid,
+                worker_identity=worker_identity,
+                pgid=pgid,
+                prompt_path=prompt_path,
+                reason="watcher_dead_before_terminal_status",
+            )
+            return _status_exit_code(repaired.get("state")), repaired, repaired.get("reason")
+        time.sleep(sleep_s)
+
+
+def _start_caffeinate(worker_pid: int, *, env: dict[str, str], stdout_path: Path) -> tuple[int | None, str | None]:
+    if sys.platform != "darwin":
+        return None, "not_darwin"
+    caffeinate = shutil.which("caffeinate")
+    if not caffeinate:
+        return None, "caffeinate_not_found"
+    try:
+        pid = _spawn_daemonized_process(
+            [caffeinate, "-dimsu", "-w", str(worker_pid)],
+            env=env,
+            stdout_path=stdout_path,
+            stdout_mode="wb",
+            stderr="stdout",
+            label="caffeinate",
+        )
+        return pid, None
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
 
 
 def _resolve_prompt_file(args, base: Path) -> str | None:
@@ -1058,6 +1357,8 @@ def build_worker(args, prompt_path, raw_argv: list[str]):
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == DAEMON_SPAWN_ARG:
+        return _cmd_spawn_daemon()
     if argv and argv[0] == "steer":
         return _cmd_steer(argv[1:])
 
@@ -1186,8 +1487,9 @@ def main(argv: list[str] | None = None) -> int:
 
     tail.parent.mkdir(parents=True, exist_ok=True)
     project_root = _project_root(args)
-    worker = None
     worker_pid = None
+    watcher_pid = None
+    caffeinate_pid = None
     pidfile = None
     lease_id = None
     ledger_recorded = False
@@ -1232,34 +1534,17 @@ def main(argv: list[str] | None = None) -> int:
         if args.billing == "sub" and _account_engine(args.agent) == "codex":
             env.pop("OPENAI_API_KEY", None)  # subscription billing for the selected account, not the API
 
-        stdin_f = open(stdin_path, "rb") if stdin_path else subprocess.DEVNULL
-        try:
-            with tail.open("wb") as sink:
-                worker = subprocess.Popen(
-                    worker_argv,
-                    stdout=sink,
-                    stderr=subprocess.STDOUT,
-                    stdin=stdin_f,
-                    env=env,
-                    **_detached_popen_kwargs(),
-                )
-        finally:
-            if stdin_path:
-                stdin_f.close()
-
+        worker_pid = _spawn_daemonized_process(
+            worker_argv,
+            env=env,
+            stdin_path=stdin_path,
+            stdout_path=tail,
+            stdout_mode="wb",
+            stderr="stdout",
+            label="worker",
+        )
         started = time.time()
-        worker_pid = worker.pid
         registration_errors = []
-        # Reap the worker when it exits so it does NOT linger as a POSIX zombie. An
-        # un-reaped child zombie still satisfies os.kill(pid, 0), which makes the
-        # watcher's pid_alive() falsely report the worker alive and defeats crash
-        # detection (the watcher would then only escape via the much slower
-        # idle-timeout, not prompt pid-death). Daemon thread so it never blocks our
-        # own exit. (Windows has no zombies; the reaper is harmless there.)
-        try:
-            threading.Thread(target=worker.wait, daemon=True).start()
-        except Exception as e:
-            registration_errors.append(_registration_error("start_reaper", e))
 
         worker_identity = None
         try:
@@ -1273,6 +1558,16 @@ def main(argv: list[str] | None = None) -> int:
             pgid = process_group_id(worker_pid) or worker_pid
         except Exception as e:
             registration_errors.append(_registration_error("process_group_id", e))
+        caffeinate_log = base / f"{args.dispatch_id}.caffeinate.log"
+        caffeinate_pid, caffeinate_reason = _start_caffeinate(
+            worker_pid,
+            env=env,
+            stdout_path=caffeinate_log,
+        )
+        if caffeinate_pid:
+            summary_head["caffeinate_pid"] = caffeinate_pid
+        elif sys.platform == "darwin":
+            registration_errors.append(_registration_error("caffeinate", RuntimeError(caffeinate_reason or "failed")))
         try:
             _attach_worker_to_lease(lease_id, worker_pid)
         except Exception as e:
@@ -1318,7 +1613,9 @@ def main(argv: list[str] | None = None) -> int:
             max_idle_secs=args.max_idle_secs,
         )
 
-        # 2. Run the decoupled watcher in the FOREGROUND (it is our only real child).
+        # 2. Run the decoupled watcher detached from this launcher. We still poll
+        # status and return when it records a terminal state, but launcher teardown
+        # no longer tears down the watcher with the worker.
         watch_cmd = [
             sys.executable, str(WATCH_PY),
             "--pid", str(worker_pid),
@@ -1328,6 +1625,8 @@ def main(argv: list[str] | None = None) -> int:
             "--poll-secs", str(args.poll_secs),
             "--max-idle-secs", str(args.max_idle_secs),
             "--dispatch-id", args.dispatch_id,
+            "--pgid", str(pgid),
+            "--stay-after-terminal",
         ]
         watch_identity_token = (
             worker_identity_token
@@ -1341,8 +1640,42 @@ def main(argv: list[str] | None = None) -> int:
         if prompt_path:
             watch_cmd += ["--ignore-prompt-file", str(prompt_path)]
 
-        watch = subprocess.run(watch_cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
-        watch_rc = watch.returncode
+        watch_log = base / f"{args.dispatch_id}.watcher.log"
+        with contextlib.suppress(Exception):
+            write_status(status_json, {
+                "schema": "goalflight.status.v1",
+                "dispatch_id": args.dispatch_id,
+                "agent": args.agent,
+                "worker_pid": worker_pid,
+                "pgid": pgid,
+                "worker_alive": True,
+                "worker_identity": worker_identity_token,
+                "expected_worker_identity": worker_identity_token,
+                "tail_path": str(tail),
+                "state": "starting",
+                "reason": "watcher_launching",
+                "updated_at": int(time.time()),
+            })
+        watcher_pid = _spawn_daemonized_process(
+            watch_cmd,
+            env=os.environ.copy(),
+            stdout_path=watch_log,
+            stdout_mode="wb",
+            stderr="stdout",
+            label="watcher",
+        )
+        summary_head.update({"watcher_pid": watcher_pid, "watcher_log": str(watch_log)})
+        watch_rc, rec, final_reason = _wait_for_detached_watcher(
+            status_json=status_json,
+            watcher_pid=watcher_pid,
+            poll_secs=args.poll_secs,
+            args=args,
+            tail=tail,
+            worker_pid=worker_pid,
+            worker_identity=worker_identity,
+            pgid=pgid,
+            prompt_path=str(prompt_path) if prompt_path else None,
+        )
 
         # Read the terminal state the watcher recorded (best-effort). worker_still_alive
         # matters: a terminal marker is a NON-DESTRUCTIVE signal (we never kill the
@@ -1350,18 +1683,17 @@ def main(argv: list[str] | None = None) -> int:
         # keep following it, not assume it is finished.
         state = None
         try:
-            rec = json.loads(status_json.read_text(encoding="utf-8", errors="replace"))
             state = rec.get("state")
             worker_alive = rec.get("worker_alive")
         except Exception:
             pass
-        if watch.stdout:
+        if not final_reason and watch_log.exists():
             try:
-                final_reason = json.loads(watch.stdout.strip().splitlines()[-1]).get("reason")
+                lines = watch_log.read_text(encoding="utf-8", errors="replace").strip().splitlines()
+                if lines:
+                    final_reason = json.loads(lines[-1]).get("reason")
             except Exception:
-                final_reason = watch.stdout.strip().splitlines()[-1] if watch.stdout.strip() else None
-        if not final_reason and watch.stderr and watch.stderr.strip():
-            final_reason = watch.stderr.strip().splitlines()[-1]
+                final_reason = lines[-1] if "lines" in locals() and lines else None
         if not final_reason and watch_rc != 0:
             final_reason = f"watcher_exit_{watch_rc}"
         if watch_rc != 0:

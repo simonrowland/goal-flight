@@ -243,10 +243,7 @@ inline; fix P0/P1/P2 before commit.
   context-polluting task that genuinely needs user input/interaction (or a
   different repo / no active run). Workers surface out-of-scope findings in their
   RESULT; the controller harvests them into the Backlog before moving on.
-- No `tail -f` in conversation. Use status files instead:
-  - Aggregate snapshot: `python3 <skill-root>/scripts/goalflight_status.py` (terse digest default; `--json`=machine)
-  - ACP dispatch: `python3 <skill-root>/scripts/goalflight_watch.py --pid <pid> --tail <tailfile> --status-json <path>`
-  - Bash-tail dispatch: `<skill-root>/scripts/watch-dispatch-tail.sh` (content-aware completion watcher with terminal-marker / pid-dead / idle / controller-dead exit codes)
+- No `tail -f` in conversation; liveness authority is the aggregate status command, not raw watcher heartbeat fields.
 - No worker spawn without capacity consideration.
 - No bare `git commit` while workers are in flight — commit guard
   `scripts/goalflight_commit_guard.py` refuses to prevent bundling worker

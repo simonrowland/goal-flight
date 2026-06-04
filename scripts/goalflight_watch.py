@@ -4,10 +4,13 @@
 from __future__ import annotations
 
 import argparse
+import atexit
+import contextlib
 import json
 import os
 from pathlib import Path
 import re
+import signal
 import time
 
 import goalflight_compat
@@ -38,6 +41,26 @@ TERMINAL_MARKERS = {"RESULT", "USER-NEED", "USER-CONFIRM", "BLOCKED", "COMPLETE"
 # Watcher mirror of the runner's intra-decision re-sample grace
 # (goalflight_liveness.cpu_liveness_keep_waiting) — same goal, keep aligned.
 WEDGE_CONFIRM_SAMPLES = 2
+
+
+def _marker_state(marker: dict | None) -> str:
+    if marker and marker.get("kind") in {"RESULT", "COMPLETE", "READY"}:
+        return "complete"
+    return "blocked"
+
+
+def _exit_code_for_state(state: str) -> int:
+    if state == "complete":
+        return 0
+    if state == "worker_dead":
+        return 1
+    if state == "idle_timeout":
+        return 2
+    if state in {"orphaned", "controller_dead"}:
+        return 3
+    if state == "blocked" or state.startswith("blocked"):
+        return 4
+    return 1
 
 
 def alive(pid: int | None) -> bool:
@@ -229,6 +252,8 @@ def main() -> int:
     parser.add_argument("--ignore-prompt-file",
                         help="Ignore marker lines appearing verbatim in this prompt file, so a worker's "
                              "echoed prompt can't trip the watcher on its own 'end with COMPLETE:' instruction.")
+    parser.add_argument("--stay-after-terminal", action="store_true",
+                        help="After a terminal marker, keep watching until the worker exits or this watcher is stopped.")
     args = parser.parse_args()
 
     ignore_prefix_lines: list[str] = []
@@ -266,6 +291,69 @@ def main() -> int:
     wedge_streak = 0
     pgid = args.pgid or process_group_id(args.pid) or args.pid
     thresholds = LivenessThresholds(idle_timeout_s=args.max_idle_secs, cpu_epsilon_pct=args.cpu_epsilon)
+    last_payload: dict | None = None
+    terminal_seen: dict | None = None
+    final_status_written = False
+
+    def write_payload(payload: dict, *, reason: str | None = None, terminal_write: bool = False) -> None:
+        nonlocal last_payload, final_status_written
+        if reason:
+            payload["reason"] = reason
+        write_status(status_path, payload)
+        last_payload = dict(payload)
+        if terminal_write:
+            final_status_written = True
+
+    def flush_terminal_status(reason: str) -> None:
+        nonlocal final_status_written
+        if final_status_written:
+            return
+        now = time.time()
+        worker_is_alive, identity_reason, current_identity = worker_alive(args.pid, expected_identity)
+        if worker_is_alive:
+            current_pgid = args.pgid or process_group_id(args.pid) or pgid
+            cpu_pct = pgroup_cpu_pct(current_pgid)
+        else:
+            current_pgid = pgid
+            cpu_pct = 0.0
+        if terminal_seen and not (
+            args.stay_after_terminal and worker_is_alive and _marker_state(terminal_seen) == "complete"
+        ):
+            state = _marker_state(terminal_seen)
+        elif worker_is_alive:
+            state = "watcher_stopped"
+        else:
+            state = "worker_dead"
+        payload = dict(last_payload or {})
+        payload.update({
+            "schema": "goalflight.status.v1",
+            "dispatch_id": args.dispatch_id,
+            "agent": args.agent,
+            "worker_pid": args.pid,
+            "pgid": current_pgid,
+            "worker_alive": worker_is_alive,
+            "worker_identity_reason": identity_reason,
+            "worker_identity": _identity_token(current_identity),
+            "expected_worker_identity": _identity_token(expected_identity),
+            "pgroup_cpu_pct": cpu_pct,
+            "tail_path": str(tail),
+            "terminal_marker": terminal_seen or (payload.get("terminal_marker") if isinstance(payload, dict) else None),
+            "state": state,
+            "updated_at": int(now),
+        })
+        with contextlib.suppress(Exception):
+            write_payload(payload, reason=reason, terminal_write=True)
+
+    def handle_signal(signum: int, _frame) -> None:
+        name = getattr(signal.Signals(signum), "name", str(signum))
+        flush_terminal_status(f"signal:{name}")
+        raise SystemExit(128 + signum)
+
+    for signame in ("SIGTERM", "SIGHUP", "SIGINT"):
+        sig = getattr(signal, signame, None)
+        if sig is not None:
+            signal.signal(sig, handle_signal)
+    atexit.register(lambda: flush_terminal_status("watcher_exit"))
 
     while True:
         markers, size = extract_markers(tail, ignore_prefix_lines=ignore_prefix_lines)
@@ -325,16 +413,28 @@ def main() -> int:
         if low_power_relax:
             payload["low_power_relax"] = True
         if terminal:
-            payload["state"] = "complete" if terminal["kind"] in {"RESULT", "COMPLETE", "READY"} else "blocked"
-            exit_reason = f"marker:{terminal['kind']}"
-            exit_code = 0 if payload["state"] == "complete" else 4
-            write_status(status_path, payload)
+            terminal_seen = terminal
+        terminal_state = _marker_state(terminal_seen) if terminal_seen else None
+        terminal_reason = f"marker:{terminal_seen['kind']}" if terminal_seen else None
+        post_terminal_wait = (
+            bool(terminal_seen)
+            and args.stay_after_terminal
+            and worker_is_alive
+            and terminal_state == "complete"
+        )
+        if terminal_seen:
+            payload["terminal_marker"] = terminal_seen
+        if terminal_seen and not post_terminal_wait:
+            payload["state"] = terminal_state
+            exit_code = _exit_code_for_state(payload["state"])
+            exit_reason = terminal_reason
+            write_payload(payload, reason=terminal_reason, terminal_write=True)
             break
         if args.controller_pid and not alive(args.controller_pid):
             payload["state"] = "orphaned"
             exit_reason = "controller_dead"
             exit_code = 3
-            write_status(status_path, payload)
+            write_payload(payload, reason=exit_reason, terminal_write=True)
             break
         if not worker_is_alive:
             payload["state"] = "worker_dead"
@@ -344,19 +444,29 @@ def main() -> int:
                 else f"worker_identity_mismatch:{identity_reason}"
             )
             exit_code = 1
-            write_status(status_path, payload)
+            write_payload(payload, reason=exit_reason, terminal_write=True)
             break
         if liveness_state == "wedged":
             wedge_streak += 1
             if wedge_streak >= WEDGE_CONFIRM_SAMPLES:
-                payload["state"] = "idle_timeout"
-                exit_reason = "idle_timeout"
-                exit_code = 2
-                write_status(status_path, payload)
+                if post_terminal_wait:
+                    payload["state"] = terminal_state
+                    exit_reason = f"{terminal_reason}:post_terminal_idle_timeout"
+                    exit_code = _exit_code_for_state(payload["state"])
+                else:
+                    payload["state"] = "idle_timeout"
+                    exit_reason = "idle_timeout"
+                    exit_code = 2
+                write_payload(payload, reason=exit_reason, terminal_write=True)
                 break
         else:
             wedge_streak = 0
-        write_status(status_path, payload)
+        if post_terminal_wait:
+            payload["state"] = "running_after_terminal"
+            payload["terminal_pending_state"] = terminal_state
+            write_payload(payload, reason=f"{terminal_reason}:worker_alive", terminal_write=False)
+        else:
+            write_payload(payload)
         time.sleep(args.poll_secs)
 
     print(json.dumps({"state": payload["state"], "reason": exit_reason, "status_path": str(status_path)}, sort_keys=True))

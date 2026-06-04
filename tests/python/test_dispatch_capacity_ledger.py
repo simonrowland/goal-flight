@@ -16,6 +16,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[2]
 DISPATCH = ROOT / "scripts" / "goalflight_dispatch.py"
@@ -505,7 +506,7 @@ def case_dispatch_end_worker_still_alive_flags() -> None:
         alive_end = _dispatch_end(alive_proc.stdout)
         try:
             assert alive_proc.returncode == 0, alive_proc
-            assert alive_end.get("worker_still_alive") is True, alive_end
+            assert alive_end.get("worker_still_alive") is False, alive_end
         finally:
             _kill_if_alive(alive_end.get("worker_pid"))
 
@@ -652,24 +653,28 @@ def case_nonzero_watcher_running_status_finalizes_failed() -> None:
         import goalflight_dispatch as dispatch_mod  # noqa: E402
 
         old_argv = sys.argv[:]
-        old_run = dispatch_mod.subprocess.run
+        old_spawn = dispatch_mod._spawn_daemonized_process
+        old_wait = dispatch_mod._wait_for_detached_watcher
         old_state_dir = os.environ.get("GOALFLIGHT_STATE_DIR")
         old_pidfile_dir = os.environ.get("GOAL_FLIGHT_PIDFILE_DIR")
 
-        def fake_watcher_run(cmd, *args, **kwargs):
-            if len(cmd) > 1 and Path(cmd[1]).name == "goalflight_watch.py":
-                status_path.parent.mkdir(parents=True, exist_ok=True)
-                status_path.write_text(
-                    json.dumps(
-                        {
-                            "state": "running",
-                            "worker_alive": True,
-                        }
-                    ),
-                    encoding="utf-8",
-                )
-                return subprocess.CompletedProcess(cmd, 9, stdout="", stderr="")
-            return old_run(cmd, *args, **kwargs)
+        def fake_spawn(argv, *args, **kwargs):
+            if kwargs.get("label") == "watcher":
+                return 999999
+            return old_spawn(argv, *args, **kwargs)
+
+        def fake_wait(**kwargs):
+            status_path.parent.mkdir(parents=True, exist_ok=True)
+            status_path.write_text(
+                json.dumps(
+                    {
+                        "state": "running",
+                        "worker_alive": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return 9, {"state": "running", "worker_alive": True}, "watcher_exit_9"
 
         try:
             os.environ.update(env)
@@ -679,10 +684,12 @@ def case_nonzero_watcher_running_status_finalizes_failed() -> None:
                 "import sys; print('worker-start', flush=True); sys.exit(0)",
                 status_path=status_path,
             )[1:]
-            dispatch_mod.subprocess.run = fake_watcher_run
+            dispatch_mod._spawn_daemonized_process = fake_spawn
+            dispatch_mod._wait_for_detached_watcher = fake_wait
             rc = dispatch_mod.main()
         finally:
-            dispatch_mod.subprocess.run = old_run
+            dispatch_mod._spawn_daemonized_process = old_spawn
+            dispatch_mod._wait_for_detached_watcher = old_wait
             sys.argv = old_argv
             if old_state_dir is None:
                 os.environ.pop("GOALFLIGHT_STATE_DIR", None)
@@ -700,6 +707,76 @@ def case_nonzero_watcher_running_status_finalizes_failed() -> None:
         assert row.get("terminal_state") == "error", row
         assert row.get("reason") == "watcher_exit_9", row
         assert all(lease.get("state") == "failed" for lease in _leases(payload, dispatch_id)), payload
+
+
+def case_wait_ignores_stale_terminal_status_for_prior_worker() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        status_path = tmp / "status.json"
+        tail = tmp / "tail.txt"
+        tail.write_text("", encoding="utf-8")
+        dispatch_id = "dispatch-reused-status"
+        current_worker_pid = 222222
+        status_path.write_text(
+            json.dumps(
+                {
+                    "schema": "goalflight.status.v1",
+                    "dispatch_id": dispatch_id,
+                    "worker_pid": 111111,
+                    "state": "complete",
+                    "reason": "old-complete",
+                    "updated_at": 1,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        sys.path.insert(0, str(ROOT / "scripts"))
+        import goalflight_dispatch as dispatch_mod  # noqa: E402
+
+        old_sleep = dispatch_mod.time.sleep
+        old_pid_alive = dispatch_mod.goalflight_compat.pid_alive
+        sleeps = 0
+
+        def fake_sleep(_secs: float) -> None:
+            nonlocal sleeps
+            sleeps += 1
+            status_path.write_text(
+                json.dumps(
+                    {
+                        "schema": "goalflight.status.v1",
+                        "dispatch_id": dispatch_id,
+                        "worker_pid": current_worker_pid,
+                        "state": "complete",
+                        "reason": "current-complete",
+                        "updated_at": 2,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+        try:
+            dispatch_mod.time.sleep = fake_sleep
+            dispatch_mod.goalflight_compat.pid_alive = lambda pid: pid == 999999
+            rc, payload, reason = dispatch_mod._wait_for_detached_watcher(
+                status_json=status_path,
+                watcher_pid=999999,
+                poll_secs=0.2,
+                args=SimpleNamespace(dispatch_id=dispatch_id, agent="test-dispatch"),
+                tail=tail,
+                worker_pid=current_worker_pid,
+                worker_identity=None,
+                pgid=current_worker_pid,
+                prompt_path=None,
+            )
+        finally:
+            dispatch_mod.time.sleep = old_sleep
+            dispatch_mod.goalflight_compat.pid_alive = old_pid_alive
+
+        assert sleeps == 1
+        assert rc == 0
+        assert payload["worker_pid"] == current_worker_pid
+        assert reason == "current-complete"
 
 
 def case_post_spawn_registration_failure_still_runs_watcher() -> None:
@@ -896,6 +973,7 @@ def main() -> None:
     case_idle_timeout_state_releases_and_classifies_terminal()
     case_watcher_failure_releases_as_failed()
     case_nonzero_watcher_running_status_finalizes_failed()
+    case_wait_ignores_stale_terminal_status_for_prior_worker()
     case_post_spawn_registration_failure_still_runs_watcher()
     case_dispatch_stats_window_and_legacy_records()
     print("OK: dispatch capacity/ledger tests pass")

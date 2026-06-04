@@ -18,6 +18,7 @@ from pathlib import Path
 import socket
 import subprocess
 import sys
+import time
 import uuid
 
 import goalflight_compat
@@ -117,22 +118,33 @@ def _ps_field(pid: int, field: str) -> str | None:
 def process_identity(pid: int | None) -> dict | None:
     if not pid:
         return None
-    if not goalflight_compat.pid_alive(pid):
-        return None
     if goalflight_compat.is_windows():
+        # Reject dead PIDs on Windows too, else a dead worker reads as
+        # 'identity_indeterminate' instead of 'dead'. Windows lacks the ps
+        # probe, so return the probe-only token only for a live PID.
+        if not goalflight_compat.pid_alive(pid):
+            return None
         return {
             "pid": pid,
             "identity_available": False,
             "identity_source": "windows_pid_probe_only",
         }
-    ident = {
-        "pid": pid,
-        "ppid": _ps_field(pid, "ppid"),
-        "pgid": _ps_field(pid, "pgid"),
-        "lstart": _ps_field(pid, "lstart"),
-        "comm": _ps_field(pid, "comm"),
-        "args": _ps_field(pid, "args"),
-    }
+    ident = None
+    for attempt in range(20):
+        if not goalflight_compat.pid_alive(pid):
+            return None
+        ident = {
+            "pid": pid,
+            "ppid": _ps_field(pid, "ppid"),
+            "pgid": _ps_field(pid, "pgid"),
+            "lstart": _ps_field(pid, "lstart"),
+            "comm": _ps_field(pid, "comm"),
+            "args": _ps_field(pid, "args"),
+        }
+        if ident.get("lstart") and ident.get("comm"):
+            return ident
+        if attempt < 19:
+            time.sleep(0.1)
     return ident
 
 
@@ -165,6 +177,7 @@ def classify(record: dict) -> str:
         "blocked_auth",
         "worker_dead",
         "idle_timeout",
+        "watcher_stopped",
         "orphaned",
         "inconclusive_timeout",
         "inconclusive_no_final",
@@ -243,6 +256,8 @@ def terminal_state_for(state: object, reason: object = None) -> str:
         return "worker_dead"
     if state == "idle_timeout":
         return "idle_timeout"
+    if state == "watcher_stopped":
+        return "watcher_stopped"
     if state == "controller_dead" or (state == "orphaned" and reason == "controller_dead"):
         return "controller_dead"
     if isinstance(state, str) and state.startswith("blocked"):

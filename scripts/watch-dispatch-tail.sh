@@ -153,12 +153,23 @@ pgroup_cpu_pct() {
     }'
 }
 
+worker_pgid_current() {
+  local pid="$1"
+  ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' '
+}
+
 cpu_gt_epsilon() {
   local cpu="$1"
   awk -v cpu="$cpu" -v eps="$CPU_EPSILON" 'BEGIN { exit ! ((cpu + 0) > (eps + 0)) }'
 }
 
-worker_lstart_comm=$(ps_meta "$WORKER_PID")
+worker_lstart_comm=""
+for _attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+  worker_lstart_comm=$(ps_meta "$WORKER_PID")
+  [ -n "$worker_lstart_comm" ] && break
+  kill -0 "$WORKER_PID" 2>/dev/null || break
+  sleep 0.1
+done
 if [ -z "$worker_lstart_comm" ]; then
   echo "watcher: worker PID $WORKER_PID not alive at startup; exiting 1" >&2
   exit 1
@@ -167,7 +178,13 @@ fi
 worker_lstart=$(echo "$worker_lstart_comm" | awk '{print $1, $2, $3, $4, $5}')
 worker_comm=$(echo "$worker_lstart_comm" | awk '{for (i=6; i<=NF; i++) printf "%s%s", $i, (i<NF ? " " : "")}')
 
-worker_pgid=$(ps -o pgid= -p "$WORKER_PID" 2>/dev/null | tr -d ' ')
+worker_pgid=""
+for _attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+  worker_pgid=$(ps -o pgid= -p "$WORKER_PID" 2>/dev/null | tr -d ' ')
+  [ -n "$worker_pgid" ] && break
+  kill -0 "$WORKER_PID" 2>/dev/null || break
+  sleep 0.1
+done
 [ -z "$worker_pgid" ] && worker_pgid="$WORKER_PID"
 
 mkdir -p "$PIDFILE_DIR"
@@ -258,10 +275,12 @@ while true; do
       now_ts=$(date +%s)
       idle_for=$(( now_ts - last_size_change_ts ))
       if [ "$idle_for" -ge "$MAX_IDLE_SECS" ]; then
+        current_worker_pgid=$(worker_pgid_current "$WORKER_PID")
+        [ -n "$current_worker_pgid" ] && worker_pgid="$current_worker_pgid"
         cpu_pct=$(pgroup_cpu_pct "$worker_pgid")
         if cpu_gt_epsilon "$cpu_pct"; then
           wedge_streak=0
-          echo "[$(date '+%H:%M:%S')] WATCHER-STATE: running_quiet worker_pid=$WORKER_PID pgid=$worker_pgid pgroup_cpu_pct=$cpu_pct idle_for=${idle_for}s"
+          echo "[$(date '+%H:%M:%S')] WATCHER-STATE: running_quiet worker_pid=$WORKER_PID pgid=$worker_pgid pgroup_cpu_pct=$cpu_pct idle_for=${idle_for}s (worker-or-child CPU active)"
           sleep "$POLL_SECS"
           continue
         fi

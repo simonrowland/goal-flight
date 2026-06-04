@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -eu
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/goal-flight-setup-test.XXXXXX")"

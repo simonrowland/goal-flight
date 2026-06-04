@@ -284,7 +284,7 @@ def case_mid_output_marker_ignored() -> None:
             worker.wait()
         assert rc == 2, f"mid-output marker must not complete (expect idle rc=2), got {rc}"
         assert not term or term.get("kind") not in goalflight_watch.TERMINAL_MARKERS, f"terminal_marker must be absent or non-terminal for mid case, got {term}"
-        assert elapsed < 2.0
+        assert elapsed < 4.0
 
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)

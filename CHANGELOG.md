@@ -15,6 +15,15 @@ incremented when meaningful skill behaviour changes.
   `autoreview/scripts/autoreview`; MIT-licensed, with attribution preserved in
   `autoreview/NOTICE`.
 
+### Fixed
+
+- **Bash-tail dispatch lifecycle hardening** — workers, watchers, and macOS
+  `caffeinate -w` assertions now launch through detached helpers so launcher
+  teardown does not reap verify-heavy workers. Watchers flush a non-running raw
+  status on signal/exit, keep monitoring after terminal markers when dispatch
+  asks them to, and quiet CPU-active child processes remain `running_quiet`
+  instead of tripping idle timeout.
+
 ## [1.0.1] — 2026-06-03
 
 **Hardening + reliability release on the 1.0.0 fleet foundation: crash-safe unified

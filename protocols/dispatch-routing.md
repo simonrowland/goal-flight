@@ -98,13 +98,31 @@ runner and watchers use **process-group CPU** as the false-positive killer:
   worker is never killed; a genuinely stuck one still is.
 - The watchers (`goalflight_watch.py`, `watch-dispatch-tail.sh`) apply the same
   rule to bash-tail dispatches: PID alive + pgroup-CPU > epsilon ⇒ `running_quiet`
-  (no idle-timeout exit). A single failed CPU sample is never read as a wedge —
-  the runner re-samples and the watchers require consecutive samples, riding out
-  a transient `ps` failure before declaring a wedge.
+  (no idle-timeout exit). CPU is summed across the worker's current process
+  group, so a quiet parent with a CPU-active test/compile child still counts as
+  active. A single failed CPU sample is never read as a wedge — the runner
+  re-samples and the watchers require consecutive samples, riding out a transient
+  `ps` failure before declaring a wedge.
 - Heartbeats are **runner-written FILES, never task-notifications.** The
   orchestrator is woken only on an actionable transition (completion / wedge /
   blocked), never per beat — a per-beat wake would re-process the orchestrator's
   whole cached session (ruinous).
+- `goalflight_status.py` is authoritative for liveness. Raw `*.status.json`
+  files are the watcher heartbeat and terminal-write surface, but controller
+  decisions that ask "is this dispatch alive?" must use the aggregate status
+  command because it cross-checks PID plus process identity and catches stale
+  false-alive JSON.
+- Bash-tail dispatch holds a macOS-scoped power assertion with
+  `caffeinate -dimsu -w <worker-pid>` when `caffeinate` is available. This
+  reduces App Nap/display-idle suspension while the worker exists. It is not a
+  correctness oracle: user sleep, forced termination, resource pressure, and
+  external process kills can still stop work, so status and controller
+  re-verification remain required.
+- Failure mode: a worker may complete code edits, emit its terminal marker, then
+  lose a long low-output verify run. Treat that as idempotent. Worker prompts
+  should make code completion independent of verify survival: if verify is
+  killed, return the marker with enough detail for the controller to re-run the
+  focused or full verify itself.
 - **Handshake retry-once**: if the handshake (`initialize`/`session_new`) stalls
   — the intermittent codex-acp wedge, where the worker spawns but never answers
   even though the handshake works in isolation — the runner kills + respawns the
