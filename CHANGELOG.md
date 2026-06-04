@@ -4,6 +4,26 @@ Notable changes to the goal-flight Claude Code skill. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are
 incremented when meaningful skill behaviour changes.
 
+## [1.0.3] — 2026-06-04
+
+### Fixed
+
+- **Dispatch-death: crash-safe worker detachment + watcher terminal-state on
+  death.** Bash-tail workers could die mid-verify and the decoupled watcher die
+  with them, freezing `status.json` at `running`/`worker_alive: true`
+  (false-alive). Workers now launch through a detached daemon helper reparented
+  into their own session so launcher/harness teardown can't reap them; the
+  watcher runs detached with signal/`atexit` handlers that flush a terminal
+  status on teardown, and the dispatcher repairs terminal state from the tail
+  marker if the watcher dies first. The poller never finalizes while the worker
+  is still alive, idle-times-out a quiet post-`COMPLETE` worker to terminal
+  (while letting CPU-active verifies keep waiting), and validates status
+  identity (`dispatch_id` + `worker_pid`) so a reused dispatch id can't inherit a
+  prior run's terminal result. macOS `caffeinate -dimsu -w <pid>` (Darwin-only)
+  holds a power assertion scoped to the worker lifetime. `goalflight_status.py`
+  is authoritative for liveness; raw `status.json` is a heartbeat/terminal
+  surface.
+
 ## [1.0.2] — 2026-06-04
 
 ### Added
@@ -14,15 +34,6 @@ incremented when meaningful skill behaviour changes.
   probe, and the init / chunk-review docs default to the in-repo
   `autoreview/scripts/autoreview`; MIT-licensed, with attribution preserved in
   `autoreview/NOTICE`.
-
-### Fixed
-
-- **Bash-tail dispatch lifecycle hardening** — workers, watchers, and macOS
-  `caffeinate -w` assertions now launch through detached helpers so launcher
-  teardown does not reap verify-heavy workers. Watchers flush a non-running raw
-  status on signal/exit, keep monitoring after terminal markers when dispatch
-  asks them to, and quiet CPU-active child processes remain `running_quiet`
-  instead of tripping idle timeout.
 
 ## [1.0.1] — 2026-06-03
 
