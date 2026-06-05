@@ -177,7 +177,7 @@ Controller prepares a base ref:
 Local-only base sync is a controller operation:
 
 ```text
-git push mac-studio-256-1:/Users/simonrowland/Repos/goal-flight \
+git push mac-studio-256-1:<remote-repo-root> \
   HEAD:refs/heads/gf/base/<dispatch-id>
 ```
 
@@ -233,13 +233,13 @@ Worker terminal status must include:
 Controller fetches directly from the remote repo:
 
 ```text
-git fetch mac-studio-256-1:/Users/simonrowland/Repos/goal-flight \
+git fetch mac-studio-256-1:<remote-repo-root> \
   gf/worker/<dispatch-id>:refs/remotes/fleet/mac-studio-256-1/<dispatch-id>/sha/<head-sha>
 ```
 
 The concrete SSH target must be derived from the fleet node record, preserving
-the configured user, host, port, identity file, and repo root. The hardcoded
-`mac-studio-256-1:/Users/...` shape above is illustrative only.
+the configured user, host, port, identity file, and repo root. The placeholder
+target above is illustrative only.
 
 Controller validates:
 
@@ -559,7 +559,7 @@ Persist controller integration state per dispatch:
 {
   "dispatch_id": "acp-...",
   "node": "mac-studio-256-1",
-  "remote_repo_root": "/Users/simonrowland/Repos/goal-flight",
+  "remote_repo_root": "<remote-repo-root>",
   "remote_worktree": "~/.goal-flight/worktrees/acp-...",
   "remote_status_path": "~/.goal-flight/dispatches/acp-.../status.json",
   "base_ref": "origin/main",

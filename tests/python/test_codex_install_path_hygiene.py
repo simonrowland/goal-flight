@@ -26,8 +26,8 @@ CODEX_INSTALL_SURFACES = [
 ]
 
 FORBIDDEN_DEV_PATHS = [
-    "/Repos/goal-flight",
-    "goal-flight-phase0",
+    "/Repos/" + "goal-flight",
+    "goal-flight" + "-phase0",
 ]
 
 
