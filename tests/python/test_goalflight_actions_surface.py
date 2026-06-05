@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -33,9 +34,27 @@ def test_commands_env_idempotent():
         out = Path(tmp) / "commands.env"
         first = _run(["commands-env", "--out", str(out)])
         assert first.returncode == 0, first.stderr
-        assert "GF_ACTION_core_doctor_read=" in out.read_text()
-        assert "goalflight_doctor.py" in out.read_text()
-        assert "goalflight_acp_run.py" in out.read_text()
+        content = out.read_text()
+        assert "GF_ACTION_core_doctor_read=" in content
+        assert "goalflight_doctor.py" in content
+        assert "goalflight_acp_run.py" in content
+        assert str(ROOT) not in content
+        assert ': "${GOALFLIGHT_ROOT:=$HOME/.goal-flight}"' in content
+        assert "$GOALFLIGHT_ROOT/scripts/goalflight_doctor.py" in content
+        expanded = subprocess.run(
+            [
+                "bash",
+                "-lc",
+                f"source {shlex.quote(str(out))}; printf '%s' \"$GF_ACTION_core_doctor_read\"",
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert expanded.returncode == 0, expanded.stderr
+        assert "${GOALFLIGHT_ROOT" not in expanded.stdout
+        assert str(ROOT) not in expanded.stdout
+        assert ".goal-flight/scripts/goalflight_doctor.py" in expanded.stdout
         second = _run(["commands-env", "--out", str(out)])
         assert second.returncode == 0
         assert "unchanged" in second.stdout
