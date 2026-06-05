@@ -93,8 +93,10 @@ def test_auth_probe_remote_argv_order() -> None:
     argv = ssh.build_remote_command(
         "auth_probe",
         repo_root="/srv/goal-flight",
+        state_dir="/Users/dev/.goal-flight",
         account_key="openai/default",
     )
+    assert_true("auth probe venv python", argv[0] == "/Users/dev/.goal-flight/venvs/acp-0.10/bin/python")
     assert_true("fleet-dir before subcommand", argv.index("--fleet-dir") < argv.index("probe"))
     assert_true("probe subcommand", "probe" in argv)
 

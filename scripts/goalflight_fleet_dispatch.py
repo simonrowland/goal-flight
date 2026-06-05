@@ -9,6 +9,8 @@ lock-order enforcement, allowlisted remote worktree + spawn stubs, ledger
 from __future__ import annotations
 
 import json
+import re
+import shlex
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -21,6 +23,52 @@ import goalflight_fleet_status_cli as status_cli
 
 class DispatchError(Exception):
     pass
+
+
+_SENSITIVE_ARGV_FLAGS = frozenset({"--prompt-b64", "--prompt"})
+_EMBEDDED_SECRET_RE = re.compile(r"(--prompt-b64(?:=|\s+))[A-Za-z0-9+/=_-]+")
+
+
+def _redact_argv(argv: list[str]) -> list[str]:
+    """Mask sensitive argv values (e.g. ``--prompt-b64 <base64 prompt>``) before
+    logging or returning them. The base64 prompt is trivially reversible and may
+    carry private task context or pasted credentials."""
+    redacted: list[str] = []
+    mask_next = False
+    for part in argv:
+        if mask_next:
+            redacted.append("<redacted>")
+            mask_next = False
+            continue
+        flag = part.split("=", 1)[0]
+        if flag in _SENSITIVE_ARGV_FLAGS:
+            if "=" in part:
+                redacted.append(f"{flag}=<redacted>")
+            else:
+                redacted.append(part)
+                mask_next = True
+            continue
+        redacted.append(_EMBEDDED_SECRET_RE.sub(r"\1<redacted>", part))
+    return redacted
+
+
+def _format_remote_failure(
+    command_class: str,
+    *,
+    exit_code: int,
+    stdout: str,
+    stderr: str,
+    ssh_argv: list[str],
+) -> str:
+    details = [
+        f"remote {command_class} failed (exit {exit_code})",
+        f"ssh argv: {shlex.join(_redact_argv(ssh_argv))}",
+    ]
+    if stderr:
+        details.append(f"stderr:\n{stderr.rstrip()}")
+    if stdout:
+        details.append(f"stdout:\n{stdout.rstrip()}")
+    return "\n".join(details)
 
 
 class DispatchGateError(DispatchError):
@@ -62,7 +110,12 @@ class DispatchPreview:
             "lock_steps": [
                 {"name": step.name, "status": step.status, "detail": step.detail} for step in self.lock_steps
             ],
-            "remote_commands": self.remote_commands,
+            "remote_commands": [
+                {**cmd, "argv": _redact_argv(cmd["argv"])}
+                if isinstance(cmd, dict) and "argv" in cmd
+                else cmd
+                for cmd in self.remote_commands
+            ],
             "dry_run": True,
         }
 
@@ -158,7 +211,8 @@ def build_remote_command_plan(
     status_json = remote_status_path_for_dispatch(state_dir, dispatch_id)
     plans: list[dict[str, Any]] = []
     for command_class, extra in (
-        ("git_worktree_add", {"worktree_path": worktree_path, "ref": "HEAD"}),
+        ("git_fetch", {}),
+        ("git_worktree_add", {"worktree_path": worktree_path, "ref": "origin/main"}),
         (
             "acp_run",
             {
@@ -276,10 +330,7 @@ def acquire_lock_chain(
         for cmd in preview.remote_commands:
             import goalflight_fleet_ssh as fleet_ssh
 
-            host = fleet_ssh.SshHostSpec(
-                alias=str((node_entry.get("ssh") or {}).get("alias") or preview.node_id),
-                hostname=str((node_entry.get("ssh") or {}).get("hostname") or preview.node_id),
-            )
+            host = fleet_ssh.host_from_node_entry(preview.node_id, node_entry)
             ssh_argv = fleet_ssh.build_ssh_command(
                 host,
                 cmd["argv"],
@@ -290,13 +341,22 @@ def acquire_lock_chain(
                 result.remote_log.append(
                     {
                         "command_class": cmd["command_class"],
+                        "ssh_argv": _redact_argv(ssh_argv),
                         "exit_code": code,
                         "stdout": stdout[:200],
                         "stderr": stderr[:200],
                     }
                 )
                 if code != 0:
-                    raise DispatchError(f"remote {cmd['command_class']} failed")
+                    raise DispatchError(
+                        _format_remote_failure(
+                            str(cmd["command_class"]),
+                            exit_code=code,
+                            stdout=stdout,
+                            stderr=stderr,
+                            ssh_argv=ssh_argv,
+                        )
+                    )
             else:
                 result.remote_log.append({"command_class": cmd["command_class"], "dry_run": True})
         acquired.append("spawn")

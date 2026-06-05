@@ -217,6 +217,7 @@ def run_node_auth_probe(
         remote = fleet_ssh.build_remote_command(
             "auth_probe",
             repo_root=repo_root,
+            state_dir=str(node.get("state_dir") or "~/.goal-flight"),
             account_key=account_key,
         )
         ssh_argv = fleet_ssh.build_ssh_command(host, remote, command_class="auth_probe")

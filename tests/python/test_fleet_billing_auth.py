@@ -141,6 +141,47 @@ def test_doctor_cli_fleet_json() -> None:
         assert_true("auth_probe in json", "auth_probe" in raw)
 
 
+def test_remote_auth_probe_uses_node_venv_python() -> None:
+    captured: list[list[str]] = []
+
+    def ssh_runner(argv: list[str]) -> tuple[int, str, str]:
+        captured.append(list(argv))
+        return (
+            0,
+            json.dumps(
+                {
+                    "schema": billing.AUTH_PROBE_SCHEMA,
+                    "account_key": "openai/default",
+                    "provider": "openai",
+                    "status": "green",
+                }
+            ),
+            "",
+        )
+
+    with tempfile.TemporaryDirectory() as td:
+        fleet_dir = Path(td) / "fleet"
+        _fixture_fleet(fleet_dir, node_id="remote-node")
+        fleet_doc = fleet.read_json(fleet_dir / "fleet.json")
+        node = fleet_doc["nodes"]["remote-node"]
+        node["ssh"] = {"alias": "mac-studio-test", "hostname": "10.0.0.10"}
+        node["state_dir"] = "/Users/dev/.goal-flight"
+        fleet._atomic_write_json(fleet_dir / "fleet.json", fleet_doc)
+
+        result = billing.link_account_to_node(
+            fleet_dir,
+            "openai/default",
+            "remote-node",
+            ssh_runner=ssh_runner,
+        )
+        assert_true("probe green", result["auth_probe"]["status"] == "green")
+        assert_true("ssh captured", bool(captured))
+        assert_true(
+            "node venv python",
+            "/Users/dev/.goal-flight/venvs/acp-0.10/bin/python" in " ".join(captured[0]),
+        )
+
+
 def test_grok_auth_probe_green() -> None:
     payload = billing.run_local_auth_probe(
         "grok/shared",
@@ -188,6 +229,7 @@ def main() -> None:
         test_dispatch_gate_blocks_red_auth,
         test_account_unlink_removes_link_and_artifact,
         test_doctor_cli_fleet_json,
+        test_remote_auth_probe_uses_node_venv_python,
         test_grok_auth_probe_green,
         test_cursor_auth_probe_uses_status_not_version,
     ):

@@ -82,7 +82,12 @@ def test_explicit_dry_run_preview() -> None:
         assert_true("worktree", "worktrees/acp-dispatch-explicit" in payload["worktree_path"])
         assert_true("remote cmds", len(payload["remote_commands"]) >= 2)
         classes = [c["command_class"] for c in payload["remote_commands"]]
+        assert_true("git fetch", "git_fetch" in classes)
         assert_true("worktree add", "git_worktree_add" in classes)
+        assert_true("fetch before worktree", classes.index("git_fetch") < classes.index("git_worktree_add"))
+        worktree_add = next(c for c in payload["remote_commands"] if c["command_class"] == "git_worktree_add")
+        assert_true("worktree add uses fetched ref", worktree_add["argv"][-1] == "origin/main")
+        assert_true("worktree add avoids local HEAD", "HEAD" not in worktree_add["argv"])
         acp = next(c for c in payload["remote_commands"] if c["command_class"] == "acp_run")
         assert_true("acp cwd worktree", payload["worktree_path"] in acp["argv"])
         assert_true(
@@ -161,6 +166,33 @@ def test_lock_chain_rollback_on_worktree_failure() -> None:
             pass
         lock = fleet.load_account_lock(fleet.account_lock_path(fleet_dir, "openai/default"))
         assert_true("account lock released", lock is None or lock.get("state") == "released")
+
+
+def test_remote_failure_surfaces_ssh_details() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        fleet_dir = Path(td) / "fleet"
+        _fixture_fleet(fleet_dir)
+        preview = fleet_dispatch.preview_dispatch(
+            fleet_dir,
+            node_id="localhost",
+            agent="codex-acp",
+            billing_account="openai/default",
+            prompt="chunk.md",
+            dispatch_id="acp-remote-failure",
+        )
+        try:
+            fleet_dispatch.acquire_lock_chain(
+                fleet_dir,
+                preview,
+                runner=lambda _a: (255, "", "real stderr"),
+            )
+            assert_true("should raise", False)
+        except fleet_dispatch.DispatchError as exc:
+            message = str(exc)
+            assert_true("command class", "remote git_fetch failed" in message)
+            assert_true("exit code", "exit 255" in message)
+            assert_true("stderr", "real stderr" in message)
+            assert_true("ssh argv", "ssh argv:" in message)
 
 
 def test_quarantine_blocks_dispatch() -> None:
@@ -264,6 +296,41 @@ def test_exec_without_stub_uses_runner() -> None:
         assert_true("remote commands", len(captured) >= 1)
 
 
+def test_exec_runner_uses_node_ssh_identity() -> None:
+    captured: list[list[str]] = []
+
+    def capture_runner(argv: list[str]) -> tuple[int, str, str]:
+        captured.append(list(argv))
+        return 0, "{}", ""
+
+    with tempfile.TemporaryDirectory() as td:
+        fleet_dir = Path(td) / "fleet"
+        _fixture_fleet(fleet_dir)
+        fleet_doc = fleet.read_json(fleet_dir / "fleet.json")
+        fleet_doc["nodes"]["localhost"]["ssh"] = {
+            "alias": "localhost",
+            "hostname": "remote.example",
+            "user": "runner",
+            "identity_file": "~/.ssh/fleet_key",
+        }
+        fleet._atomic_write_json(fleet_dir / "fleet.json", fleet_doc)
+        preview = fleet_dispatch.preview_dispatch(
+            fleet_dir,
+            node_id="localhost",
+            agent="codex-acp",
+            billing_account="openai/default",
+            prompt="chunk.md",
+            dispatch_id="acp-node-ssh",
+        )
+        fleet_dispatch.execute_dispatch(fleet_dir, preview, runner=capture_runner)
+        assert_true("remote commands", len(captured) >= 1)
+        first = captured[0]
+        assert_true("identity flag", "-i" in first)
+        identity_idx = first.index("-i")
+        assert_true("identity path", first[identity_idx + 1].endswith("/.ssh/fleet_key"))
+        assert_true("user host target", "runner@remote.example" in first)
+
+
 def test_sync_finalize_clears_locks() -> None:
     mirror_json = json.dumps(
         {
@@ -334,9 +401,11 @@ def main() -> None:
     test_red_auth_blocks_exec()
     test_thin_defaults_shows_billing_banner()
     test_lock_chain_rollback_on_worktree_failure()
+    test_remote_failure_surfaces_ssh_details()
     test_quarantine_blocks_dispatch()
     test_resolve_dispatch_runner_stub_and_live()
     test_exec_without_stub_uses_runner()
+    test_exec_runner_uses_node_ssh_identity()
     test_stub_e2e_terminal_clears_locks()
     test_sync_finalize_clears_locks()
     test_ledger_remote_lease_id_roundtrip()

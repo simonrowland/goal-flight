@@ -203,8 +203,10 @@ def build_remote_command(command_class: str, **params: Any) -> list[str]:
         account_key = str(params.get("account_key") or "")
         if not account_key:
             raise SshAllowlistError("auth_probe requires account_key")
+        state_dir = str(params.get("state_dir") or "~/.goal-flight").rstrip("/")
+        auth_python = str(params.get("python") or f"{state_dir}/venvs/acp-0.10/bin/python")
         argv = [
-            python,
+            auth_python,
             f"{repo_root}/scripts/goalflight_fleet_billing.py",
             "--fleet-dir",
             "/dev/null",
