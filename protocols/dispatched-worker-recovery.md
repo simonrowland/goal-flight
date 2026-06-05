@@ -11,8 +11,9 @@ work-in-progress without re-doing it.
 ran the gstack `/review` self-pass as a nested ACP tool-call (worker's
 `execute_command` → codex-acp shim's permission gate). The canonical fix is
 to invoke the review as a bash-tail subprocess with codex's own read-only
-sandbox + bypass-approvals flags (see `protocols/chunk-review.md` §"How the
-review runs"). That removes the permission-gate blocking class entirely.
+sandbox, `-c approval_policy=never`, and closed stdin (`< /dev/null`; see
+`protocols/chunk-review.md` §"How the review runs"). That removes the
+permission-gate blocking class entirely.
 Once chunk prompts adopt that pattern, this recovery protocol applies only
 to other terminal-blocked cases (genuine destructive-op requests,
 infrastructure failures, auth issues) — not the routine review-blocking
@@ -58,11 +59,12 @@ allow-patterns, different mode, different agent) and re-fire the chunk.
    These verifications would have run in the worker if it hadn't blocked.
 
 4. **Run an independent review on the worker's diff.** `gstack /review` via
-   the host's normal skill-load path, OR `codex review` via bash-tail if the
-   orchestrator is non-native. The review runs controller-side as a read-only
-   operation, NOT nested through the dead worker's ACP shim (see
-   `protocols/chunk-review.md` §"Where the review runs"). Apply
-   P3-safe-easy findings inline per the new policy.
+   the host's normal skill-load path, OR a `codex exec` review prompt via the
+   bash-tail shape in `protocols/chunk-review.md` if the orchestrator is
+   non-native. The review runs controller-side as a read-only operation, NOT
+   nested through the dead worker's ACP shim (see `protocols/chunk-review.md`
+   §"Where the review runs"). Apply P3-safe-easy findings inline per the new
+   policy.
 
 5. **Stage the salvageable files explicitly.** `git add` the worker's scope
    files only — never `git add -A`. Leave unrelated dirty WIP for its own

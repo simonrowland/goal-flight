@@ -62,7 +62,8 @@ flag set is a different path — the inner codex's sandbox is the safety
 boundary, and the worker's outer permission gate doesn't intercept the
 already-sandboxed read-only operation. The 2026-05-27 chunk-2/3a/12 blocking
 class came from nesting `codex exec /review` as a tool call without the
-sandbox+bypass flags, so the gate intercepted it as a write-grade execute.
+read-only sandbox, non-interactive approval policy, and closed stdin shape, so
+the gate intercepted it as a write-grade execute.
 
 ## Where the review runs
 
