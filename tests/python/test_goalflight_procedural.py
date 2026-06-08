@@ -386,8 +386,11 @@ def test_instruction_split_contract() -> None:
     # dispatch rules; 2026-06-02 orchestrator-rebrand byte bump. Catches
     # future feature-add bloat.
     assert_true(
-        f"SKILL under 28.7KB (got {len(skill.encode())}B)",
-        len(skill.encode()) <= 28_700,
+        # Budget raised 28.7KB -> 31KB on 2026-06-08 for the deliberate, compacted
+        # "Gotchas from session traffic" section (one-liners; the line budget at
+        # test_skill_structure is already satisfied). Catches future bloat.
+        f"SKILL under 31KB (got {len(skill.encode())}B)",
+        len(skill.encode()) <= 31_000,
     )
     for protocol in [
         "session-preflight.md",

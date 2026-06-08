@@ -264,37 +264,18 @@ inline; fix P0/P1/P2 before commit.
 
 ## Gotchas from session traffic
 
-These are not style preferences; each pattern below was mined from repo-local
-failure traffic. When present in this checkout, full evidence and line references
-live in `docs-private/research/goal-flight-gotchas-audit/addendum.md`.
+Mined from repo-local failure traffic (full evidence when present: `docs-private/research/goal-flight-gotchas-audit/addendum.md`):
 
-- **Resume with stale skill body.** If you cannot quote current Hard Invariants,
-  reload AGENTS -> host wrapper -> repository `SKILL.md` -> `commands/resume.md`
-  before touching queue, status, or git state.
-- **Inline output flood.** Long logs, diffs, JSONL, and review transcripts go to
-  files/context-mode. The controller consumes status JSON, TL;DR, and
-  `READY: <path>`, not raw streams.
-- **Nested review permission trap.** Do not run gstack/codex review as a nested
-  ACP tool call from inside the worker. Use the bash-tail read-only review shape
-  with `--sandbox read-only`, `-c approval_policy=never`, and `< /dev/null`.
-- **Stdin wedge.** `codex exec` reads stdin to EOF even with a positional
-  prompt. Missing `< /dev/null` on bash-tail review is a hang bug.
-- **Command-form drift.** Deprecated or forbidden exec flags in old docs are not
-  precedent. Adapter `forbidden_args` and the current canonical invocation win.
-- **Worker bypass.** When a worker hits a sandbox, permission, write, or commit
-  block, it returns `BLOCKED:`. Alternate delivery paths are orchestrator-only.
-- **False worker death.** Do not discard work on PID alone, `comm` text alone, or
-  one stale watcher field. Reconcile pid+start-time, status JSON, ledger, tail
-  marker, output mtime, and dirty tree before declaring loss.
-- **Quiet is not dead.** Network waits and child-process test runs can show no
-  controller-visible output or CPU. Liveness decisions need terminal markers,
-  child/process-tree evidence, and idle confirmation.
-- **Terminal marker is not final until reconciled.** A live-but-quiet worker
-  after COMPLETE/RESULT/READY must still pass idle/controller-dead logic so the
-  watcher cannot wait forever.
-- **Rollover loses notifications, not state.** Background completion signals are
-  best-effort and session-local. Status JSON, dispatch ledger, capacity ledger,
-  and resume/reconcile are authoritative.
+- **Stale skill body on resume.** Can't quote current Hard Invariants -> reload AGENTS -> host wrapper -> `SKILL.md` -> `commands/resume.md` before queue/status/git.
+- **Inline output flood.** Logs/diffs/JSONL/review transcripts -> files/context-mode; controller reads status JSON + TL;DR + `READY: <path>`, not raw streams.
+- **Nested review permission trap.** Don't run gstack/codex review as a nested ACP tool call inside the worker; use bash-tail read-only review (`--sandbox read-only`, `-c approval_policy=never`, `< /dev/null`).
+- **Stdin wedge.** `codex exec` reads stdin to EOF even with a positional prompt; missing `< /dev/null` on bash-tail review hangs.
+- **Command-form drift.** Deprecated/forbidden exec flags in old docs aren't precedent; adapter `forbidden_args` + the current canonical invocation win.
+- **Worker bypass.** A worker hitting a sandbox/permission/write/commit block returns `BLOCKED:`; alternate delivery paths are orchestrator-only.
+- **False worker death.** Don't discard work on PID/`comm`/one stale field; reconcile pid+start-time, status JSON, ledger, tail marker, output mtime, dirty tree.
+- **Quiet is not dead.** Network waits + child-process test runs show no controller-visible output/CPU; liveness needs terminal markers + process-tree + idle confirmation.
+- **Terminal marker not final until reconciled.** A live-but-quiet worker after COMPLETE/RESULT/READY must still pass idle/controller-dead logic.
+- **Rollover loses notifications, not state.** Background completion signals are best-effort/session-local; status JSON, ledgers, resume/reconcile are authoritative.
 
 ## Capacity and rate limits
 
