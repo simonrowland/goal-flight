@@ -40,6 +40,13 @@ orthogonal axes: **iteration pattern** (how many turns) and **comms shape**
   implementation while the manifest still owns command args, safe probes,
   liveness profile, and output contract.
 
+  `goalflight_dispatch.py --shape acp` supports `codex-acp`, `cursor`, and
+  `claude-acp` (`claude-acp` normalizes to the runner's `claude` label).
+  Cursor uses the `remote_api` liveness profile and the Cursor cap is 3 because
+  the cloud turn can be slow while CPU stays idle. Claude uses the
+  `claude-code-cli-acp` PTY session path; `StartupGate` serializes spawn→handshake
+  and the Claude cap is 5.
+
   **`--mode` sets the idle-timeout.** `one-shot` (default) uses a 5-minute
   idle ceiling — a short dispatch silent that long is wedged. `goal` uses a
   10-hour idle ceiling because goal-mode loops run multi-hour and a worker
@@ -243,7 +250,7 @@ reads terminal state from structured events instead of a tail marker. Default:
 |---|---|---|
 | read-only (review) **or** worktree-isolated | **bash-tail** | no writes → no permission requests → ACP's relay is moot; bash-tail is leaner (no ACP-SDK venv) and `codex exec` is verified not to leak ptys/helpers |
 | writing the **main tree**, wanting live per-write gates | **ACP `--interactive`** | inline permission relay where a bad write to the real tree matters |
-| a **non-codex** agent (grok / cursor) | **ACP** | bash-tail goal-mode needs codex's end-of-goal tail marker, which they lack |
+| a **non-codex** agent (grok / cursor / claude) | **ACP** | bash-tail goal-mode needs codex's end-of-goal tail marker, which they lack |
 
 So the "ACP preferred for loops" row above holds for main-tree-write and
 non-codex loops; for read-only or worktree-isolated **codex** loops, prefer
@@ -258,15 +265,16 @@ selects the worker model on both transports — bash via `build_worker`, ACP via
 `agent_command`. With `--model` omitted, each agent keeps its own default — except
 **claude**, which defaults to `opus` (its clear strongest — quality-by-default for
 workers; pass `--model haiku` for speed). codex already defaults strong; `grok-code`
-defaults `grok-composer-2.5-fast`; `grok-research` defaults `grok-build` (web search
-on by default); cursor/opencode keep their own default (strongest is ambiguous).
+defaults `grok-composer-2.5-fast`; `grok-research` also defaults `grok-composer-2.5-fast`
+(web search on by default; grok-build — grok.com's default — is broken on this machine);
+cursor/opencode keep their own default (strongest is ambiguous).
 The selector is inserted PER-AGENT (the flag and its position differ — a blind
 append breaks codex/grok ACP), so pass the **agent's own id format**:
 
 | Agent | Example | ACP form |
 |---|---|---|
 | grok-code | `--agent grok-code` (default composer-2.5) | `grok agent --model <id> stdio` |
-| grok-research | `--agent grok-research` (default grok-build) | `grok agent --model <id> stdio` |
+| grok-research | `--agent grok-research` (default composer-2.5) | `grok agent --model <id> stdio` |
 | claude (speed) | `--agent claude --model haiku` | `claude-code-cli-acp --model <id>` |
 | codex | `--agent codex --model o3` | bash `codex exec --model <id>`; ACP `-c model=<id>` |
 | cursor | `--agent cursor --model sonnet-4` | `cursor-agent --model <id> acp` (best-effort) |

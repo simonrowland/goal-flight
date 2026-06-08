@@ -20,7 +20,7 @@ import goalflight_acp_run as acp  # noqa: E402
 import goalflight_dispatch as dispatch  # noqa: E402
 
 MODEL = "grok-composer-2.5-fast"
-RESEARCH_MODEL = "grok-build"
+RESEARCH_MODEL = "grok-composer-2.5-fast"
 
 
 def case_agent_command_per_agent_placement() -> None:
@@ -71,7 +71,7 @@ def case_build_worker_injects_model() -> None:
         "--model" in argv_code
         and argv_code[argv_code.index("--model") + 1] == "grok-composer-2.5-fast"
     ), argv_code
-    # grok-research defaults to grok-build when none is passed.
+    # grok-research defaults to grok-composer-2.5-fast (grok-build broken on this box).
     argv_research = _build("grok-research", None)
     assert (
         "--model" in argv_research

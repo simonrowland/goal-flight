@@ -209,7 +209,7 @@
       },
       "grok-research": {
         "transport": "cli",
-        "default_model": "grok-build",
+        "default_model": "grok-composer-2.5-fast",
         "web_search": "enabled_by_default",
         "notes": "Research/search worker; CLI has --disable-web-search only (no enable flag)."
       }

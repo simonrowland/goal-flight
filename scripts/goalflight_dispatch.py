@@ -1178,11 +1178,22 @@ def _temporary_env(updates: dict[str, str], *, remove: list[str] | None = None):
 
 
 def _normalize_acp_agent(args) -> None:
-    if args.agent in {"worker", "codex"}:
-        args.agent = "codex-acp"
-    if args.agent != "codex-acp":
+    agent = str(args.agent or "").strip().lower()
+    aliases = {
+        "worker": "codex-acp",
+        "codex": "codex-acp",
+        "codex-acp": "codex-acp",
+        "cursor": "cursor",
+        "cursor-agent": "cursor",
+        "claude": "claude",
+        "claude-acp": "claude",
+        "claude-code-cli-acp": "claude",
+    }
+    args.agent = aliases.get(agent, agent)
+    if args.agent not in {"codex-acp", "cursor", "claude"}:
         raise DispatchUsageError(
-            f"--shape acp v1 supports --agent codex-acp only; got {args.agent!r}"
+            "--shape acp v1 supports --agent codex-acp, cursor, or claude-acp; "
+            f"got {agent!r}"
         )
 
 
@@ -1197,6 +1208,7 @@ def _build_acp_cfg(args, *, status_json: Path):
     project_root = _project_root(args)
     prompt_path = str(Path(args.prompt_file).expanduser()) if args.prompt_file else None
     os_sandbox = "read-only" if args.read_only and goalflight_compat.is_macos() else OS_SANDBOX_OFF
+    liveness_profile = "remote_api" if args.agent in {"cursor", "claude"} else None
     cfg = argparse.Namespace(
         agent=args.agent,
         model=getattr(args, "model", None),
@@ -1226,7 +1238,7 @@ def _build_acp_cfg(args, *, status_json: Path):
         max_tool_s=DEFAULT_MAX_TOOL_S,
         max_quiet_s=max(float(args.max_idle_secs or 300.0), 1.0),
         progress_stall_s=300.0,
-        liveness_profile=None,
+        liveness_profile=liveness_profile,
         remote_turn_silence_s=None,
         remote_turn_cancel_grace_s=DEFAULT_REMOTE_TURN_CANCEL_GRACE_S,
         steer_file=str(_steer_file(args.dispatch_id)),
@@ -1248,8 +1260,14 @@ def _run_acp_shape(args, *, base: Path, account_env: dict[str, str]) -> int:
     status_json = Path(args.status_json) if args.status_json else base / f"{args.dispatch_id}.status.json"
     cfg = _build_acp_cfg(args, status_json=status_json)
     env_remove = []
-    if args.billing == "sub" and _account_engine(args.agent) == "codex":
-        env_remove.append("OPENAI_API_KEY")
+    if args.billing == "sub":
+        engine = _account_engine(args.agent)
+        if engine == "codex":
+            env_remove.append("OPENAI_API_KEY")
+        elif engine == "cursor":
+            env_remove.append("CURSOR_API_KEY")
+        elif args.agent == "claude":
+            env_remove.append("ANTHROPIC_API_KEY")
 
     if goalflight_compat.is_windows():
         payload = asyncio.run(run_acp_dispatch(cfg))
@@ -1342,11 +1360,11 @@ def build_worker(args, prompt_path, raw_argv: list[str]):
     if args.agent in ("grok-code", "grok-research"):
         # Read the prompt from a FILE, not argv `-p` — long goal-flight prompts
         # (5-20KB) would hit E2BIG / argv truncation (grok review #5).
-        default_model = (
-            "grok-composer-2.5-fast"
-            if args.agent == "grok-code"
-            else "grok-build"
-        )
+        # grok-composer-2.5-fast for both grok-code and grok-research:
+        # grok-build (grok.com's default; formerly grok-research's default) is
+        # broken on this machine — grok-research dies at ~28s with empty output
+        # under web-search; grok-composer-2.5-fast validated working live.
+        default_model = "grok-composer-2.5-fast"
         argv = ["grok", "--prompt-file", str(prompt_path), "--permission-mode", "acceptEdits"]
         argv += ["--model", str(model) if model else default_model]
         if args.cwd:
@@ -1387,7 +1405,8 @@ def main(argv: list[str] | None = None) -> int:
                              "default, not used by the maintainer; present only for users who explicitly want it.")
     parser.add_argument("--shape", choices=["auto", "bash", "acp"], default="auto",
                         help="Comms shape. 'auto' picks the best per engine (codex/grok->bash, "
-                             "cursor/claude->acp). v1 ACP routing supports codex-acp.")
+                             "cursor/claude->acp). v1 ACP routing supports codex-acp, "
+                             "cursor, and claude-acp.")
     parser.add_argument("--interactive", action="store_true",
                         help="Sugar for --shape acp --permission-mode inline (codex-acp inline relay).")
     parser.add_argument("--permission-mode", choices=["auto", "inline"], default="auto",
