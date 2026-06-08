@@ -7,6 +7,9 @@ set -u
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 SCRIPT="$REPO_ROOT/scripts/hosts/opencode/self_dispatch_test.py"
 
+# shellcheck source=tests/bash/lib-opencode-backend.sh
+source "$REPO_ROOT/tests/bash/lib-opencode-backend.sh"
+
 if ! command -v opencode >/dev/null 2>&1; then
   echo "SKIP  tests/bash/test-opencode-self-dispatch.sh (opencode not installed)"
   exit 0
@@ -31,6 +34,11 @@ pkill -f 'opencode serve' >/dev/null 2>&1 || true
 sleep 1
 
 if ! python3 "$SCRIPT" --directory "$REPO_ROOT" --json > /tmp/opencode-self-dispatch-$$.json 2>/tmp/opencode-self-dispatch-$$.err; then
+  BACKEND_LOG="/tmp/opencode-self-dispatch-backend-$$.txt"
+  cat /tmp/opencode-self-dispatch-$$.err /tmp/opencode-self-dispatch-$$.json > "$BACKEND_LOG"
+  if opencode_backend_unhealthy_log "$BACKEND_LOG"; then
+    opencode_backend_skip "tests/bash/test-opencode-self-dispatch.sh"
+  fi
   echo "FAIL  tests/bash/test-opencode-self-dispatch.sh"
   cat /tmp/opencode-self-dispatch-$$.err | sed 's/^/      /'
   cat /tmp/opencode-self-dispatch-$$.json | sed 's/^/      /'

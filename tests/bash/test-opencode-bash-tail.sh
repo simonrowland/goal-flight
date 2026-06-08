@@ -8,6 +8,9 @@ REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 WORKER="$REPO_ROOT/scripts/hosts/opencode/bash_tail.py"
 WATCHER="$REPO_ROOT/scripts/watch-dispatch-tail.sh"
 
+# shellcheck source=tests/bash/lib-opencode-backend.sh
+source "$REPO_ROOT/tests/bash/lib-opencode-backend.sh"
+
 if ! command -v opencode >/dev/null 2>&1; then
   echo "SKIP  tests/bash/test-opencode-bash-tail.sh (opencode not installed)"
   exit 0
@@ -68,6 +71,11 @@ bash "$WATCHER" \
 WATCHER_PID=$!
 
 if ! wait "$WORKER_PID"; then
+  BACKEND_LOG="/tmp/opencode-bash-tail-backend-$$.txt"
+  cat /tmp/opencode-bash-tail-worker-meta-$$.txt "$TAIL" > "$BACKEND_LOG"
+  if opencode_backend_unhealthy_log "$BACKEND_LOG"; then
+    opencode_backend_skip "tests/bash/test-opencode-bash-tail.sh"
+  fi
   echo "FAIL  tests/bash/test-opencode-bash-tail.sh (worker exited non-zero)"
   cat /tmp/opencode-bash-tail-worker-meta-$$.txt | sed 's/^/      /'
   cat "$TAIL" | sed 's/^/      /'

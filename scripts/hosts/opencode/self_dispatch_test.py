@@ -37,6 +37,12 @@ READONLY_PROMPT = "What is 2+2? Reply with just the number on one line."
 SCHEMA = "goalflight.opencode-self-dispatch.v1"
 
 
+def _excerpt(text: str, limit: int = 1000) -> str:
+    if len(text) <= limit:
+        return text
+    return text[-limit:]
+
+
 def _load_litellm_env() -> None:
     if os.environ.get("LITELLM_API_KEY") or os.environ.get("LITELLM_MASTER_KEY"):
         return
@@ -188,6 +194,10 @@ def _run_acp(*, workdir: Path, model: str, timeout: float) -> dict[str, Any]:
             "dispatch_id": payload.get("dispatch_id"),
         }
     )
+    if payload.get("error") is not None:
+        out["error_detail"] = payload.get("error")
+    if result["stderr"].strip():
+        out["stderr_excerpt"] = _excerpt(result["stderr"])
     out["ok"] = (
         result["ok"]
         and payload.get("state") == "complete"
@@ -259,6 +269,10 @@ def _run_bash_tail(*, workdir: Path, model: str, timeout: float) -> dict[str, An
     )
     worker_rc = worker_proc.wait(timeout=timeout)
     watcher_rc = watcher_proc.wait(timeout=timeout)
+    worker_stdout = worker_proc.stdout.read() if worker_proc.stdout else ""
+    worker_stderr = worker_proc.stderr.read() if worker_proc.stderr else ""
+    watcher_stdout = watcher_proc.stdout.read() if watcher_proc.stdout else ""
+    watcher_stderr = watcher_proc.stderr.read() if watcher_proc.stderr else ""
     tail_text = tail_path.read_text(encoding="utf-8") if tail_path.exists() else ""
     out: dict[str, Any] = {
         "transport": "bash_tail",
@@ -276,6 +290,15 @@ def _run_bash_tail(*, workdir: Path, model: str, timeout: float) -> dict[str, An
             f"worker_rc={worker_rc} watcher_rc={watcher_rc} "
             f"complete={out['complete_marker']} reply={out['reply_ok']}"
         )
+        out["tail_excerpt"] = _excerpt(tail_text)
+        if worker_stdout.strip():
+            out["worker_stdout_excerpt"] = _excerpt(worker_stdout)
+        if worker_stderr.strip():
+            out["worker_stderr_excerpt"] = _excerpt(worker_stderr)
+        if watcher_stdout.strip():
+            out["watcher_stdout_excerpt"] = _excerpt(watcher_stdout)
+        if watcher_stderr.strip():
+            out["watcher_stderr_excerpt"] = _excerpt(watcher_stderr)
     try:
         tail_path.unlink(missing_ok=True)
         prompt_path.unlink(missing_ok=True)

@@ -7,6 +7,9 @@ set -u
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 SCRIPT="$REPO_ROOT/scripts/hosts/opencode/prompt.py"
 
+# shellcheck source=tests/bash/lib-opencode-backend.sh
+source "$REPO_ROOT/tests/bash/lib-opencode-backend.sh"
+
 if ! command -v opencode >/dev/null 2>&1; then
   echo "SKIP  tests/bash/test-opencode-prompt.sh (opencode not installed)"
   exit 0
@@ -26,6 +29,11 @@ pkill -f 'opencode serve' >/dev/null 2>&1 || true
 sleep 1
 
 out="$("$SCRIPT" -m litellm/nano "Reply with exactly one word: pong" 2>&1)" || {
+  BACKEND_LOG="/tmp/opencode-prompt-backend-$$.txt"
+  printf '%s\n' "$out" > "$BACKEND_LOG"
+  if opencode_backend_unhealthy_log "$BACKEND_LOG"; then
+    opencode_backend_skip "tests/bash/test-opencode-prompt.sh"
+  fi
   echo "FAIL  tests/bash/test-opencode-prompt.sh"
   echo "$out" | sed 's/^/      /'
   exit 1
