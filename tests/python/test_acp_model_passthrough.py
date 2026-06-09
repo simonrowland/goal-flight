@@ -21,7 +21,9 @@ import goalflight_acp_run as acp  # noqa: E402
 import goalflight_dispatch as dispatch  # noqa: E402
 
 MODEL = "grok-composer-2.5-fast"
-RESEARCH_MODEL = "grok-composer-2.5-fast"
+# grok-research defaults to grok-build (grok's purpose-built web model); the old
+# composer-2.5-fast stopgap could not reliably web_fetch (re-validated 2026-06-09).
+RESEARCH_MODEL = "grok-build"
 
 
 class _FakeProc:
@@ -142,7 +144,8 @@ def case_build_worker_injects_model() -> None:
         "--model" in argv_code
         and argv_code[argv_code.index("--model") + 1] == "grok-composer-2.5-fast"
     ), argv_code
-    # grok-research defaults to grok-composer-2.5-fast (grok-build broken on this box).
+    # grok-research defaults to grok-build (grok's web model); composer is a coding
+    # model and could not reliably web_fetch. grok-code stays on composer above.
     argv_research = _build("grok-research", None)
     assert (
         "--model" in argv_research

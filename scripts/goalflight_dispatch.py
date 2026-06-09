@@ -1534,11 +1534,18 @@ def build_worker(args, prompt_path, raw_argv: list[str]):
     if args.agent in ("grok-code", "grok-research"):
         # Read the prompt from a FILE, not argv `-p` — long goal-flight prompts
         # (5-20KB) would hit E2BIG / argv truncation (grok review #5).
-        # grok-composer-2.5-fast for both grok-code and grok-research:
-        # grok-build (grok.com's default; formerly grok-research's default) is
-        # broken on this machine — grok-research dies at ~28s with empty output
-        # under web-search; grok-composer-2.5-fast validated working live.
-        default_model = "grok-composer-2.5-fast"
+        # Model PER TASK:
+        #   grok-code     (coding, no web) -> grok-composer-2.5-fast
+        #   grok-research (web search/fetch) -> grok-build (grok's purpose-built
+        #                  web model and grok.com's default)
+        # The earlier "grok-build dies at ~28s empty under web-search" note is
+        # STALE: re-validated 2026-06-09, grok-build returned good, primary-source-
+        # cited research in ~43s, recovering via web_search from the intermittent
+        # `web_fetch` tool_output_error flakiness that hits BOTH models. composer
+        # is a coding model and yields thin, weakly-sourced research, so it is the
+        # wrong default for grok-research (observed live: composer web_fetch errors
+        # + Wikipedia-only answers vs grok-build's nature.com primary source).
+        default_model = "grok-build" if args.agent == "grok-research" else "grok-composer-2.5-fast"
         argv = ["grok", "--prompt-file", str(prompt_path), "--permission-mode", "acceptEdits"]
         argv += ["--model", str(model) if model else default_model]
         if args.cwd:
