@@ -13,6 +13,7 @@ import base64
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -206,8 +207,9 @@ def _acp_cmd(
     dispatch_id: str,
     prompt_b64: str,
     status_path: Path,
+    model: str | None = None,
 ) -> list[str]:
-    return [
+    cmd = [
         sys.executable,
         str(ACP_RUN),
         "--agent",
@@ -223,19 +225,62 @@ def _acp_cmd(
         "--status-json",
         str(status_path),
         "--json",
+        # The ~10x headroom over a read-only dispatch's 180s idle is intentional:
+        # a thorough adversarial review turn legitimately runs much longer than a
+        # quick read-only dispatch. --max-quiet-s is the absolute ceiling.
         "--idle-timeout",
         "1800",
         "--max-quiet-s",
         "3600",
         "--permission-allow-tool-title-pattern",
         r".*autoreview-findings-[0-9a-f]+\.json.*",
-        # ONLY the handoff file is write-allowed. No broad `^(Write|Edit) ` or
-        # catch-all `.*` pattern — so a misbehaving/injected grok cannot
-        # overwrite other in-cwd source files during this read-only review;
-        # "only this file" is policy-enforced, not just prompt-enforced. Reads
-        # fall through to the base title-allow policy; hard gates
-        # (outside-cwd/execute/fetch) still escalate.
+        # WRITE BOUNDARY — honest posture (integration audit, 2026-06-09): this
+        # title pattern is an ALLOW FAST-PATH, NOT a deny-fence. goalflight_acp_run's
+        # base policy (default_permission_policy) auto-allows ANY located in-cwd
+        # write, and make_title_allow_policy layers title-allows only AFTER the
+        # hard gates (outside-cwd / execute / fetch) — it cannot deny an in-cwd
+        # write. So the effective review write-boundary is prompt-instructed +
+        # soft, the SAME posture as the codex/claude autoreview engines: a
+        # misbehaving or prompt-injected grok COULD write other in-cwd files.
+        # A hard fence (--os-sandbox read-only) is a known future hardening,
+        # deferred because of a real tension: an in-cwd handoff is blocked by a
+        # read-only os-sandbox (cwd is not a sandbox write-root), while a
+        # system-temp handoff is denied by the permission gate's outside-cwd hard
+        # gate. Closing it needs a custom sandbox write-root scoped to the handoff
+        # path, or a read_only-mode permission allowance — out of scope here.
     ]
+    # FIX (audit P1.1): forward an explicit --model so autoreview's model
+    # selection actually reaches grok (without it, parse_known_args swallowed
+    # --model and every review silently used the grok-acp default). When unset,
+    # goalflight_acp_run applies its own grok-acp default.
+    if model:
+        cmd.extend(["--model", model])
+    return cmd
+
+
+def _terminate_process_group(proc: subprocess.Popen) -> None:
+    """Terminate the worker's whole process group, not just the direct child.
+
+    The direct child is goalflight_acp_run.py, which spawns ``grok agent`` as a
+    grandchild — killing only the child orphans grok. The child leads its own
+    session/group (Popen start_new_session=True), so signalling the group reaps
+    the grandchildren too. SIGTERM first, escalate to SIGKILL if it lingers.
+    """
+    try:
+        pgid = os.getpgid(proc.pid)
+    except (ProcessLookupError, OSError):
+        proc.kill()
+        return
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(pgid, sig)
+        except (ProcessLookupError, OSError):
+            return
+        try:
+            proc.wait(timeout=5)
+            return
+        except subprocess.TimeoutExpired:
+            continue
 
 
 def _run_acp(
@@ -244,6 +289,7 @@ def _run_acp(
     dispatch_id: str,
     prompt_text: str,
     handoff_path: Path,
+    model: str | None = None,
 ) -> tuple[int, dict | None, str]:
     """Run one ACP session; success is the handoff FILE, not chat/result_text."""
     prompt_b64 = base64.b64encode(prompt_text.encode("utf-8")).decode("ascii")
@@ -252,13 +298,20 @@ def _run_acp(
     status_fd, status_name = tempfile.mkstemp(prefix="goalflight-autoreview-status-", suffix=".json")
     os.close(status_fd)
     status_path = Path(status_name)
-    cmd = _acp_cmd(repo, dispatch_id=dispatch_id, prompt_b64=prompt_b64, status_path=status_path)
+    cmd = _acp_cmd(
+        repo,
+        dispatch_id=dispatch_id,
+        prompt_b64=prompt_b64,
+        status_path=status_path,
+        model=model,
+    )
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
         env=env,
+        start_new_session=True,
     )
     last_result_text = ""
     handoff_ready = False
@@ -275,7 +328,7 @@ def _run_acp(
         stdout, stderr = proc.communicate(timeout=3600)
     finally:
         if proc.poll() is None:
-            proc.kill()
+            _terminate_process_group(proc)
             stdout, stderr = proc.communicate(timeout=30)
         status_path.unlink(missing_ok=True)
 
@@ -314,7 +367,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--allowedTools")
     parser.add_argument("--tools")
-    parser.parse_known_args(argv)
+    args, _ = parser.parse_known_args(argv)
 
     prompt = sys.stdin.read()
     if not prompt.strip():
@@ -332,6 +385,7 @@ def main(argv: list[str] | None = None) -> int:
             dispatch_id=dispatch_id,
             prompt_text=prompt_with_handoff,
             handoff_path=handoff_path,
+            model=args.model,
         )
         if rc != 0:
             return rc
@@ -352,6 +406,7 @@ def main(argv: list[str] | None = None) -> int:
                 dispatch_id=recovery_id,
                 prompt_text=recovery_prompt,
                 handoff_path=handoff_path,
+                model=args.model,
             )
             if rc != 0:
                 return rc
