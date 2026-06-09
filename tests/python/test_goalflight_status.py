@@ -198,6 +198,12 @@ def test_done_code() -> None:
     recs = {r["dispatch_id"]: r for r in sample_payload()["dispatch"]["records"]}
     check("live -> 1", S.done_code(recs["live1"]) == 1)
     check("terminal complete -> 0", S.done_code(recs["done1"]) == 0)
+    check("terminal marker + worker dead -> 0", S.done_code({
+        "classification": "complete",
+        "terminal_state": "complete",
+        "worker_pid": 333,
+        "worker_still_alive": False,
+    }) == 0)
     check("unknown_no_pid -> 2", S.done_code(recs["amb1"]) == 2)
     timeout_summary = {
         "dispatch_id": "timeout-live",

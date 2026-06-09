@@ -54,6 +54,7 @@ MARKER_RE='^\**(COMPLETE|BLOCKED|USER-NEED|USER-CONFIRM|READY):\**'
 POLL_SECS=15
 MAX_IDLE_SECS=180
 CPU_EPSILON=0.1
+PID_DEAD_MARKER_GRACE_SECS=1
 # CPU-sampling-failure grace (codex 2026-05-20 P2): require this many consecutive
 # wedged polls before exiting idle-timeout, so one transient `ps` failure can't
 # false-positive a healthy worker. Not a flag — mirrors goalflight_watch.py. This
@@ -227,6 +228,19 @@ fi
 
 echo "[watcher start $(date '+%H:%M:%S')] worker_pid=$WORKER_PID controller_pid=$CONTROLLER_PID tail=$TAIL_PATH markers='$MARKER_RE' poll=${POLL_SECS}s max_idle=${MAX_IDLE_SECS}s"
 
+terminal_marker_seen() {
+  [ -f "$TAIL_PATH" ] || return 1
+  grep -vE '^[[:space:]]*$' "$TAIL_PATH" 2>/dev/null | tail -1 | grep -qE "$MARKER_RE" 2>/dev/null
+}
+
+emit_marker_exit() {
+  echo "[$(date '+%H:%M:%S')] terminal marker matched in tail"
+  echo "=== tail last 30 lines ==="
+  tail -30 "$TAIL_PATH"
+  echo "WATCHER-EXIT: marker exit_code=0"
+  exit 0
+}
+
 while true; do
   # 1. Orchestrator alive? (orphan watcher self-detection)
   if ! kill -0 "$CONTROLLER_PID" 2>/dev/null; then
@@ -244,17 +258,19 @@ while true; do
   # a terminal. A worker that prints/cats/logs a marker token mid-output must not
   # false-complete the watcher. (Python watcher + acp_runner also fence-skip; this
   # legacy bash path checks last-non-empty-line.)
-  if [ -f "$TAIL_PATH" ] && grep -vE '^[[:space:]]*$' "$TAIL_PATH" 2>/dev/null | tail -1 | grep -qE "$MARKER_RE" 2>/dev/null; then
-    echo "[$(date '+%H:%M:%S')] terminal marker matched in tail"
-    echo "=== tail last 30 lines ==="
-    tail -30 "$TAIL_PATH"
-    echo "WATCHER-EXIT: marker exit_code=0"
-    exit 0
+  if terminal_marker_seen; then
+    emit_marker_exit
   fi
 
   # 3. Worker PID still alive?
   if ! kill -0 "$WORKER_PID" 2>/dev/null; then
-    echo "[$(date '+%H:%M:%S')] worker PID $WORKER_PID is gone (no terminal marker seen)"
+    # The tail writer can flush a terminal marker just after the worker exits
+    # and just after the loop's first marker check. Give that marker precedence.
+    sleep "$PID_DEAD_MARKER_GRACE_SECS"
+    if terminal_marker_seen; then
+      emit_marker_exit
+    fi
+    echo "[$(date '+%H:%M:%S')] worker PID $WORKER_PID is gone (no terminal marker seen after pid-dead grace)"
     if [ -f "$TAIL_PATH" ]; then
       echo "=== tail last 30 lines ==="
       tail -30 "$TAIL_PATH"

@@ -129,9 +129,9 @@ def scope_payload(payload: dict, project_root: str | None) -> dict:
 
 def done_code(record: dict) -> int:
     """0 = terminal/done, 1 = live, 2 = ambiguous/unknown."""
-    if _idle_timeout_worker_alive(record):
+    cls = record.get("classification") or record.get("state") or "unknown"
+    if cls == "idle_timeout" and _idle_timeout_worker_alive(record):
         return 1
-    cls = record.get("classification") or "unknown"
     if cls == _LIVE_CLASS:
         return 1
     if cls in _AMBIGUOUS_CLASS or cls.startswith("stale_"):
