@@ -1,0 +1,115 @@
+diff --git a/src/pty/session.rs b/src/pty/session.rs
+index 3c27e04..b361f6d 100644
+--- a/src/pty/session.rs
++++ b/src/pty/session.rs
+@@ -167,9 +167,30 @@ impl ClaudePtySession {
+     }
+
+     pub fn submit_prompt(&mut self, prompt: &str) -> anyhow::Result<()> {
++        thread::sleep(std::time::Duration::from_millis(2_000));
+         self.write_bytes(prompt.as_bytes())?;
+-        thread::sleep(std::time::Duration::from_millis(100));
+-        self.write_bytes(b"\r")
++        thread::sleep(std::time::Duration::from_millis(800));
++        self.write_bytes(b"\r")?;
++        self.retry_submit_if_prompt_still_idle(prompt)
++    }
++
++    fn retry_submit_if_prompt_still_idle(&mut self, prompt: &str) -> anyhow::Result<()> {
++        let Some(needle) = prompt_echo_needle(prompt) else {
++            return Ok(());
++        };
++        for delay_ms in [1_000, 1_500, 2_000] {
++            thread::sleep(std::time::Duration::from_millis(delay_ms));
++            let screen_text = self.screen_snapshot()?;
++            if screen_text.contains(&needle)
++                && crate::terminal::recognizers::recognize_screen(&screen_text)
++                    == crate::terminal::recognizers::ScreenStatus::Idle
++            {
++                self.write_bytes(b"\r")?;
++            } else {
++                break;
++            }
++        }
++        Ok(())
+     }
+
+     pub fn send_exit(&mut self) -> anyhow::Result<()> {
+@@ -246,6 +267,14 @@ impl ClaudePtySession {
+     }
+ }
+
++fn prompt_echo_needle(prompt: &str) -> Option<String> {
++    let line = prompt.lines().rev().find(|line| !line.trim().is_empty())?;
++    let trimmed = line.trim();
++    let char_count = trimmed.chars().count();
++    let start = char_count.saturating_sub(48);
++    Some(trimmed.chars().skip(start).collect())
++}
++
+ fn write_mcp_config_file(config: &ClaudePtyConfig) -> anyhow::Result<Option<PathBuf>> {
+     if config.mcp_servers.is_empty() {
+         return Ok(None);
+diff --git a/src/session/manager.rs b/src/session/manager.rs
+index f314984..76cf36b 100644
+--- a/src/session/manager.rs
++++ b/src/session/manager.rs
+@@ -252,7 +252,22 @@ impl ManagedSession {
+             if let Some(tailer) = tailer.as_mut() {
+                 events.extend(tailer.poll()?);
+             }
+-            if events.iter().any(is_assistant_terminal_event) && pty.is_idle() {
++            let screen_text = pty.screen_snapshot().ok();
++            let screen_is_idle = screen_text
++                .as_deref()
++                .is_some_and(recognizers::recognize_idle);
++            let has_assistant_event = events.iter().any(is_assistant_terminal_event);
++            if has_assistant_event && screen_is_idle {
++                break;
++            }
++            if !has_assistant_event
++                && screen_is_idle
++                && screen_text
++                    .as_deref()
++                    .and_then(assistant_text_from_screen)
++                    .is_some()
++            {
++                events.clear();
+                 break;
+             }
+             if let Some(dialog) = pty.permission_dialog()? {
+@@ -301,7 +316,10 @@ impl ManagedSession {
+             tokio::time::sleep(Duration::from_millis(150)).await;
+         }
+
+-        let screen_text = pty.screen_snapshot().ok();
++        let screen_text = pty
++            .screen_snapshot()
++            .ok()
++            .map(|text| assistant_text_from_screen(&text).unwrap_or(text));
+         *self.pty.lock().unwrap() = Some(pty);
+         Ok(TurnOutput {
+             events,
+@@ -395,6 +413,22 @@ fn is_assistant_terminal_event(event: &TranscriptEvent) -> bool {
+     }
+ }
+
++fn assistant_text_from_screen(text: &str) -> Option<String> {
++    let marker = '⏺';
++    let line = text.lines().find(|line| line.contains(marker))?;
++    let (_, after_marker) = line.split_once(marker)?;
++    let text = after_marker
++        .split(" (")
++        .next()
++        .unwrap_or(after_marker)
++        .trim();
++    if text.is_empty() {
++        None
++    } else {
++        Some(text.to_string())
++    }
++}
++
+ fn permission_fingerprint(dialog: &PermissionDialog) -> String {
+     format!(
+         "{}::{:?}",

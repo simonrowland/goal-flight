@@ -48,6 +48,9 @@ try:
 except Exception:  # pragma: no cover - doctor still reports partial state
     goalflight_agent_traits = None
 
+CLAUDE_ACP_STOPGAP_MAX_VERSION = "0.1.1"
+CLAUDE_ACP_PATCH_SCRIPT = SCRIPT_DIR / "install_claude_acp_patch.sh"
+
 
 def run(cmd: list[str], cwd: Path | None = None, timeout: float = 8.0) -> dict:
     try:
@@ -952,6 +955,139 @@ def _version_tuple(s: str | None) -> tuple[int, ...]:
     return tuple(out)
 
 
+def _sha256_path(path: Path) -> str | None:
+    try:
+        h = hashlib.sha256()
+        with path.open("rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
+
+
+def _claude_acp_installed_version() -> str | None:
+    override = os.environ.get("GOALFLIGHT_CLAUDE_ACP_VERSION")
+    if override:
+        return override
+    if shutil.which("npm"):
+        npm_root = run(["npm", "root", "-g"], timeout=4)
+        package_json = Path(npm_root.get("stdout") or "") / "claude-code-cli-acp/package.json"
+        if npm_root.get("ok") and package_json.is_file():
+            try:
+                data = json.loads(package_json.read_text(encoding="utf-8"))
+                version_text = data.get("version")
+                if isinstance(version_text, str):
+                    return version_text
+            except (OSError, ValueError, json.JSONDecodeError):
+                pass
+    cli = version("claude-code-cli-acp", "--version")
+    if cli.get("present"):
+        return cli.get("version")
+    return None
+
+
+def _claude_acp_platform_binary() -> Path | None:
+    override = os.environ.get("GOALFLIGHT_CLAUDE_ACP_BIN_PATH")
+    if override:
+        return Path(override).expanduser()
+    if shutil.which("npm"):
+        npm_root = run(["npm", "root", "-g"], timeout=4)
+        if npm_root.get("ok"):
+            root = Path(npm_root.get("stdout") or "")
+            platform_name = {
+                "darwin": "darwin",
+                "linux": "linux",
+                "win32": "win32",
+            }.get(sys.platform)
+            machine = os.uname().machine.lower() if hasattr(os, "uname") else ""
+            arch = {
+                "x86_64": "x64",
+                "amd64": "x64",
+                "arm64": "arm64",
+                "aarch64": "arm64",
+            }.get(machine)
+            if platform_name and arch:
+                exe = "claude-code-cli-acp.exe" if platform_name == "win32" else "claude-code-cli-acp"
+                candidate = root / f"claude-code-cli-acp-{platform_name}-{arch}" / "bin" / exe
+                if candidate.is_file():
+                    return candidate
+    path = shutil.which("claude-code-cli-acp")
+    return Path(path) if path else None
+
+
+def check_claude_acp_stopgap() -> dict:
+    """Warn when the Claude ACP npm adapter still needs the vendored stopgap."""
+    installed = _claude_acp_installed_version()
+    binary = _claude_acp_platform_binary()
+    present = bool(installed or (binary and binary.exists()))
+    out: dict = {
+        "present": present,
+        "installed_version": installed,
+        "max_stopgap_version": CLAUDE_ACP_STOPGAP_MAX_VERSION,
+        "binary": str(binary) if binary else None,
+        "apply_script": str(CLAUDE_ACP_PATCH_SCRIPT),
+    }
+    if not present:
+        out.update({
+            "ok": None,
+            "level": "info",
+            "detail": "claude-code-cli-acp not installed",
+        })
+        return out
+    installed_tuple = _version_tuple(installed)
+    max_tuple = _version_tuple(CLAUDE_ACP_STOPGAP_MAX_VERSION)
+    if not installed_tuple:
+        out.update({
+            "ok": True,
+            "level": "ok",
+            "patched": None,
+            "detail": f"installed version {installed or 'unknown'} was not parsed; stopgap skipped",
+        })
+        return out
+    if installed_tuple > max_tuple:
+        out.update({
+            "ok": True,
+            "level": "ok",
+            "patched": None,
+            "detail": f"installed version {installed} is newer than {CLAUDE_ACP_STOPGAP_MAX_VERSION}; stopgap skipped",
+        })
+        return out
+    if not binary or not binary.exists():
+        out.update({
+            "ok": False,
+            "level": "warning",
+            "patched": False,
+            "detail": f"claude-code-cli-acp {installed or 'unknown'} installed but platform binary was not resolved; run {CLAUDE_ACP_PATCH_SCRIPT}",
+        })
+        return out
+
+    current_sha = _sha256_path(binary)
+    orig = Path(f"{binary}.orig")
+    orig_sha = _sha256_path(orig) if orig.exists() else None
+    patched = bool(orig_sha and current_sha and orig_sha != current_sha)
+    out.update({
+        "backup": str(orig),
+        "backup_exists": orig.exists(),
+        "current_sha256": current_sha,
+        "orig_sha256": orig_sha,
+        "patched": patched,
+    })
+    if patched:
+        out.update({
+            "ok": True,
+            "level": "ok",
+            "detail": f"stopgap appears applied; backup at {orig}",
+        })
+    else:
+        out.update({
+            "ok": False,
+            "level": "warning",
+            "detail": f"claude-code-cli-acp {installed or 'unknown'} may need Claude Code 2.1.169 stopgap; run {CLAUDE_ACP_PATCH_SCRIPT}",
+        })
+    return out
+
+
 def worker_currency_probe() -> dict:
     """Currency check for CLI workers other than cursor (which has its own
     model-level probe in cursor_models_probe).
@@ -1746,6 +1882,7 @@ def doctor(
             enabled=worker_write_probe,
         ),
         "acp": check_acp(),
+        "claude_acp_stopgap": check_claude_acp_stopgap(),
         "project": git_state(repo),
         "worktrees": check_worktrees(repo),
         "project_goalflight_readiness": check_project_goalflight_readiness(repo),
@@ -1926,6 +2063,11 @@ def print_human(payload: dict) -> None:
         status_line(payload["opencode"].get("present"), "opencode ACP", payload["opencode"].get("version")),
         status_line(payload["grok"].get("present"), "Grok Build binary", payload["grok"].get("version")),
         status_line(payload["grok"].get("headless_flags"), "Grok headless flags", None),
+        status_line(
+            (payload.get("claude_acp_stopgap") or {}).get("ok"),
+            "Claude ACP TUI-submit stopgap",
+            (payload.get("claude_acp_stopgap") or {}).get("detail"),
+        ),
     ]
     write_probe = payload.get("worker_write_probe") or {}
     lines.append(status_line(

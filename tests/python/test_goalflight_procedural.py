@@ -205,6 +205,9 @@ def test_doctor_json_shape() -> None:
     assert_true("autoreview ok key", "ok" in payload["autoreview"])
     assert_true("autoreview script path", payload["autoreview"]["script_path"].endswith("scripts/autoreview.sh"))
     assert_true("autoreview upstream helper key", "upstream_helper" in payload["autoreview"])
+    assert_true("claude_acp_stopgap section", "claude_acp_stopgap" in payload)
+    for key in ("present", "installed_version", "apply_script", "ok"):
+        assert_true(f"claude_acp_stopgap.{key} present", key in payload["claude_acp_stopgap"])
     # Resolution contract (catches the regression where ok=True but upstream_helper
     # resolves to None — the env-based AUTOREVIEW_HELPER fallback path going silent
     # while keeping the key present would otherwise pass the schema assertions).
@@ -362,6 +365,68 @@ def test_doctor_package_repo_validates_plugin_manifest() -> None:
     payload = goalflight_doctor.doctor(ROOT)
     assert_true("package plugin validation not skipped", payload["plugin"]["skipped"] is False)
     assert_true("package plugin manifest present", payload["plugin"]["manifest_exists"] is True)
+
+
+def test_claude_acp_stopgap_warns_until_patch_backup_differs() -> None:
+    old_env = {key: os.environ.get(key) for key in ("GOALFLIGHT_CLAUDE_ACP_VERSION", "GOALFLIGHT_CLAUDE_ACP_BIN_PATH")}
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            binary = Path(td) / "claude-code-cli-acp"
+            binary.write_bytes(b"original")
+            os.environ["GOALFLIGHT_CLAUDE_ACP_VERSION"] = "0.1.1"
+            os.environ["GOALFLIGHT_CLAUDE_ACP_BIN_PATH"] = str(binary)
+
+            payload = goalflight_doctor.check_claude_acp_stopgap()
+            assert_true("unpatched stopgap warns", payload["ok"] is False)
+            assert_true("unpatched detail points at script", "install_claude_acp_patch.sh" in payload["detail"])
+
+            Path(f"{binary}.orig").write_bytes(b"original")
+            binary.write_bytes(b"patched")
+            payload = goalflight_doctor.check_claude_acp_stopgap()
+            assert_true("backup sha difference means patched", payload["ok"] is True)
+            assert_true("patched flag true", payload["patched"] is True)
+    finally:
+        for key, value in old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def test_claude_acp_stopgap_skips_newer_upstream_version() -> None:
+    old_env = {key: os.environ.get(key) for key in ("GOALFLIGHT_CLAUDE_ACP_VERSION", "GOALFLIGHT_CLAUDE_ACP_BIN_PATH")}
+    try:
+        os.environ["GOALFLIGHT_CLAUDE_ACP_VERSION"] = "0.1.2"
+        os.environ.pop("GOALFLIGHT_CLAUDE_ACP_BIN_PATH", None)
+        payload = goalflight_doctor.check_claude_acp_stopgap()
+        assert_true("newer upstream version skips stopgap", payload["ok"] is True)
+        assert_true("newer upstream patched unknown", payload["patched"] is None)
+    finally:
+        for key, value in old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def test_claude_acp_stopgap_skips_unknown_version() -> None:
+    old_env = {key: os.environ.get(key) for key in ("GOALFLIGHT_CLAUDE_ACP_VERSION", "GOALFLIGHT_CLAUDE_ACP_BIN_PATH")}
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            binary = Path(td) / "claude-code-cli-acp"
+            binary.write_bytes(b"original")
+            os.environ["GOALFLIGHT_CLAUDE_ACP_VERSION"] = "dev-build"
+            os.environ["GOALFLIGHT_CLAUDE_ACP_BIN_PATH"] = str(binary)
+            payload = goalflight_doctor.check_claude_acp_stopgap()
+            assert_true("unknown version skips stopgap warning", payload["ok"] is True)
+            assert_true("unknown version patched unknown", payload["patched"] is None)
+            assert_true("unknown detail does not warn", "may need" not in payload["detail"])
+    finally:
+        for key, value in old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 def test_doctor_cli_target_project_skips_package_plugin() -> None:
@@ -680,7 +745,16 @@ def test_title_allow_policy_layers_after_hard_gates() -> None:
     - no-match pattern + safe kind       → falls through to base; base allows
     """
     import re
-    import goalflight_acp_run as gar
+
+    old_acp_python = os.environ.get("GOALFLIGHT_ACP_PYTHON")
+    os.environ["GOALFLIGHT_ACP_PYTHON"] = sys.executable
+    try:
+        import goalflight_acp_run as gar
+    finally:
+        if old_acp_python is None:
+            os.environ.pop("GOALFLIGHT_ACP_PYTHON", None)
+        else:
+            os.environ["GOALFLIGHT_ACP_PYTHON"] = old_acp_python
 
     yolo = [re.compile(".*")]
     policy = gar.make_title_allow_policy(yolo)
@@ -704,7 +778,7 @@ def test_title_allow_policy_layers_after_hard_gates() -> None:
     # Execute with broad pattern → must escalate (hard gate)
     assert_true(
         ".* must NOT bypass execute hard-gate",
-        policy(tc("run rm -rf /", "execute"), [], cwd) == "escalate",
+        policy(tc("run destructive command", "execute"), [], cwd) == "escalate",
     )
 
     # Fetch with broad pattern → must escalate (hard gate)
@@ -1325,6 +1399,9 @@ def main() -> None:
         test_installed_skill_drift_project_symlink_stays_copy_mode,
         test_doctor_target_project_readiness_split,
         test_doctor_package_repo_validates_plugin_manifest,
+        test_claude_acp_stopgap_warns_until_patch_backup_differs,
+        test_claude_acp_stopgap_skips_newer_upstream_version,
+        test_claude_acp_stopgap_skips_unknown_version,
         test_doctor_cli_target_project_skips_package_plugin,
         test_instruction_split_contract,
         test_review_job_codex_no_final_is_inconclusive,

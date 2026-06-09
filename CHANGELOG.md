@@ -25,6 +25,12 @@ Dispatch-reliability + worker-engine release on top of the 1.0.3 dispatch-death 
   that break fleet fetch; preserves checked-out worktree + remote-backed refs and fails
   closed if the protected set can't be determined.
 - **cursor + claude-acp** wired into the unified dispatcher happy path.
+- **Opt-in claude-acp patch-compile installer (stopgap).** `scripts/install_claude_acp_patch.sh` applies the
+  vendored `patches/claude-code-cli-acp-2.1.169-tui-submit.patch` (the upstream TUI-submit fix — PR
+  `moabualruz/claude-code-cli-acp#1`) to an installed `claude-code-cli-acp@0.1.1`: clones the pinned upstream
+  base, builds with cargo, and swaps + ad-hoc-codesigns the platform binary (run-scoped backup + atomic
+  restore on any failure; idempotent; skips once upstream ships a fixed release). A `goalflight_doctor.py`
+  probe flags an unpatched adapter and points to the script. Not auto-run by `install.sh`; cargo required.
 
 ### Fixed
 
