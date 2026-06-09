@@ -25,7 +25,7 @@ orthogonal axes: **iteration pattern** (how many turns) and **comms shape**
   stop reasons as discrete events, not text.
   ```bash
   python3 <skill-root>/scripts/goalflight_acp_run.py \
-    --agent <codex-acp|grok|cursor|claude|opencode> \
+    --agent <codex-acp|grok|cursor|claude> \
     --cwd "$PWD" \
     --prompt <prompt.md> \
     --mode <one-shot|goal> \
@@ -41,7 +41,9 @@ orthogonal axes: **iteration pattern** (how many turns) and **comms shape**
   liveness profile, and output contract.
 
   `goalflight_dispatch.py --shape acp` supports `codex-acp`, `cursor`, and
-  `claude-acp` (`claude-acp` normalizes to the runner's `claude` label).
+  `claude-acp` (`claude-acp` normalizes to the runner's `claude` label). It
+  does not expose an `opencode` preset; route OpenCode through the host-specific
+  helpers or the raw command passthrough described below.
   Cursor uses the `remote_api` liveness profile and the Cursor cap is 3 because
   the cloud turn can be slow while CPU stays idle. Claude uses the
   `claude-code-cli-acp` PTY session path; `StartupGate` serializes spawn→handshake
@@ -81,7 +83,7 @@ Treat routing candidates as first-class only after their readiness gate passes:
 | Codex | yes | yes | Desktop/CLI available when needed, context-mode registered for large-output work, ACP handshake passes for structured dispatch. |
 | Cursor | yes | yes | Cursor Desktop or CLI path present for orchestrator use; `cursor-agent` present and ACP handshake passes for worker use; model-currency probe is current or explicitly accepted as stale. |
 | Grok | yes | read-only analysis/research only until write probe passes | Grok Build/headless flags present; structured ACP path passes before ACP dispatch; bash-tail is fallback-only and must obey the marker limits in Composition rules. File-writing is not routable unless `goalflight_doctor.py --worker-write-probe --write-probe-agent grok-code` passes in the current environment. |
-| OpenCode | yes | yes | `opencode` on PATH; `opencode acp` for structured dispatch; HTTP helper (`scripts/hosts/opencode/prompt.py`) for orchestrator one-shots; bash-tail via `scripts/hosts/opencode/bash_tail.py` (not bare `opencode run`). |
+| OpenCode | yes | helper/raw passthrough only | `opencode` on PATH; host-specific helpers under `scripts/hosts/opencode/` and live smokes in `tests/bash/test-opencode-*`; raw `goalflight_dispatch.py -- <cmd>` passthrough is allowed when the caller owns the command contract. Not a `goalflight_dispatch.py --agent opencode` preset. |
 | Claude compatibility path | yes | yes | Adapter-owned CLI/plugin probes pass; startup gate applies where the adapter requires serialized initialization. |
 
 If a candidate has static adapter capability but fails local readiness, do not
@@ -292,7 +294,7 @@ selects the worker model on both transports — bash via `build_worker`, ACP via
 workers; pass `--model haiku` for speed). codex already defaults strong; `grok-code`
 defaults `grok-composer-2.5-fast`; `grok-research` also defaults `grok-composer-2.5-fast`
 (web search on by default; grok-build — grok.com's default — is broken on this machine);
-cursor/opencode keep their own default (strongest is ambiguous).
+cursor keeps its own default (strongest is ambiguous).
 The selector is inserted PER-AGENT (the flag and its position differ — a blind
 append breaks codex/grok ACP), so pass the **agent's own id format**:
 
@@ -303,10 +305,11 @@ append breaks codex/grok ACP), so pass the **agent's own id format**:
 | claude (speed) | `--agent claude --model haiku` | `claude-code-cli-acp --model <id>` |
 | codex | `--agent codex --model o3` | bash `codex exec --model <id>`; ACP `-c model=<id>` |
 | cursor | `--agent cursor --model sonnet-4` | `cursor-agent --model <id> acp` (best-effort) |
-| opencode | `--agent opencode --model anthropic/claude-haiku` | `opencode --model <id> acp` (best-effort) |
 
-grok/codex/claude placements are verified; cursor/opencode are best-effort (their
-ACP arg position is not separately confirmed). Bare `--agent grok` is retired —
+grok/codex/claude placements are verified; cursor is best-effort (its ACP arg
+position is not separately confirmed). OpenCode model selection belongs to the
+host-specific helper or raw passthrough command, not `goalflight_dispatch.py
+--agent opencode`. Bare `--agent grok` is retired —
 use `grok-code` or `grok-research`. The direct CLI: `grok -m grok-composer-2.5-fast …`.
 
 ## Capacity gate

@@ -207,6 +207,45 @@ def test_remote_failure_surfaces_ssh_details() -> None:
             assert_true("ssh argv", "ssh argv:" in message)
 
 
+def test_cleanup_refs_failure_stops_before_fetch() -> None:
+    secret = "cleanup failure prompt secret"
+    prompt_b64 = base64.b64encode(secret.encode("utf-8")).decode("ascii")
+    invoked: list[str] = []
+
+    def fail_cleanup(argv: list[str]) -> tuple[int, str, str]:
+        joined = " ".join(argv)
+        if "goalflight_cleanup_dispatch_refs.py" in joined:
+            invoked.append("git_prune_claude_refs")
+            return 17, f"stdout leaked {secret}", f"stderr leaked {prompt_b64}"
+        if " fetch " in f" {joined} ":
+            invoked.append("git_fetch")
+        return 0, "{}", ""
+
+    with tempfile.TemporaryDirectory() as td:
+        fleet_dir = Path(td) / "fleet"
+        _fixture_fleet(fleet_dir)
+        preview = fleet_dispatch.preview_dispatch(
+            fleet_dir,
+            node_id="localhost",
+            agent="codex-acp",
+            billing_account="openai/default",
+            prompt=secret,
+            dispatch_id="acp-cleanup-failure",
+        )
+        try:
+            fleet_dispatch.execute_dispatch(fleet_dir, preview, runner=fail_cleanup)
+            assert_true("should raise", False)
+        except fleet_dispatch.DispatchError as exc:
+            message = str(exc)
+            assert_true("failure class", "remote git_prune_claude_refs failed" in message)
+            assert_true("exit code", "exit 17" in message)
+            assert_true("cleanup ran", invoked == ["git_prune_claude_refs"])
+            assert_true("fetch not invoked", "git_fetch" not in invoked)
+            assert_true("stdout secret redacted", secret not in message)
+            assert_true("stderr prompt b64 redacted", prompt_b64 not in message)
+            assert_true("failure marker", "<redacted>" in message)
+
+
 def test_redact_argv_masks_prompt_values_everywhere() -> None:
     secret = "sensitive prompt with spaces"
     prompt_b64 = base64.b64encode(secret.encode("utf-8")).decode("ascii")
