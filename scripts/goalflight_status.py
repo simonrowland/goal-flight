@@ -23,11 +23,52 @@ import goalflight_ledger
 
 # Each aggregated record carries a precomputed ``classification`` from
 # goalflight_ledger.classify(): the terminal STATE string when terminal, else one
-# of these live/ambiguous labels. Do NOT re-run classify() here -- the aggregated
-# record has had its identity fields (lstart/comm) stripped, so re-classifying
-# would misread a live worker as unknown.
+# of these live/ambiguous labels. Do NOT re-run classify() here for normal
+# records -- the aggregated record may have had identity fields stripped, so
+# re-classifying would misread a live worker as unknown.
 _LIVE_CLASS = "expected_live"
 _AMBIGUOUS_CLASS = {"unknown_no_pid", "identity_indeterminate", "unknown"}
+
+
+def _has_recorded_worker_identity(record: dict) -> bool:
+    ident = record.get("worker_identity")
+    if not isinstance(ident, dict):
+        return False
+    return bool(
+        (ident.get("lstart") and ident.get("comm"))
+        or ident.get("creation_time")
+        or ident.get("creation_time_filetime")
+        or ident.get("create_time")
+    )
+
+
+def _identity_record_for_idle_timeout(record: dict) -> dict | None:
+    if not record.get("worker_pid"):
+        return None
+    if _has_recorded_worker_identity(record):
+        return record
+    dispatch_id = record.get("dispatch_id")
+    if not dispatch_id:
+        return None
+    for raw in goalflight_ledger.read_records():
+        if raw.get("dispatch_id") == dispatch_id and _has_recorded_worker_identity(raw):
+            return raw
+    return None
+
+
+def _idle_timeout_worker_alive(record: dict) -> bool:
+    if (record.get("classification") or record.get("state")) != "idle_timeout":
+        return False
+    identity_record = _identity_record_for_idle_timeout(record)
+    if identity_record is None:
+        return False
+    ok, _reason = goalflight_ledger.identity_matches(identity_record)
+    return ok
+
+
+def _reattach_hint(record: dict) -> str:
+    dispatch_id = record.get("dispatch_id") or "<id>"
+    return f"worker still alive - re-attach via goalflight_status.py --done {dispatch_id}"
 
 
 def this_project_root() -> str | None:
@@ -87,6 +128,8 @@ def scope_payload(payload: dict, project_root: str | None) -> dict:
 
 def done_code(record: dict) -> int:
     """0 = terminal/done, 1 = live, 2 = ambiguous/unknown."""
+    if _idle_timeout_worker_alive(record):
+        return 1
     cls = record.get("classification") or "unknown"
     if cls == _LIVE_CLASS:
         return 1
@@ -104,6 +147,8 @@ def find_record(payload: dict, dispatch_id: str) -> dict | None:
 
 def _signal(record: dict) -> str:
     pid = record.get("worker_pid")
+    if _idle_timeout_worker_alive(record):
+        return f"pid{pid}; {_reattach_hint(record)}"
     if record.get("worker_still_alive") and pid:
         return f"pid{pid}"
     return record.get("reason") or record.get("terminal_state") or ""

@@ -47,15 +47,18 @@ orthogonal axes: **iteration pattern** (how many turns) and **comms shape**
   `claude-code-cli-acp` PTY session path; `StartupGate` serializes spawn→handshake
   and the Claude cap is 5.
 
-  **`--mode` sets the idle-timeout.** `one-shot` (default) uses a 5-minute
-  idle ceiling — a short dispatch silent that long is wedged. `goal` uses a
-  10-hour idle ceiling because goal-mode loops run multi-hour and a worker
-  churning through a big test/compile can emit no events for tens of
-  minutes; a tight ceiling would kill it mid-run. Idle-timeout is the gap
-  between events, NOT total runtime — it resets on every event, so a healthy
-  goal-mode worker emitting periodic STATUS markers never trips it. Override
-  with `--idle-timeout <secs>` (or `--idle-timeout 0` for no idle gate,
-  relying on PID liveness + the worker's terminal marker).
+  Cursor tool-use or file-writing chunks need `--permission-mode inline`
+  (or `--interactive`, which expands to ACP inline mode). Plain `auto`
+  permission mode can surface shell/tool escalation as `USER-CONFIRM` and block
+  the worker even though the same chunk completes when inline permission routing
+  is active.
+
+  **`--max-idle-secs` gates quiet workers.** Default: 600s for write-capable
+  code workers and 180s for read-only, research, or custom workers. The idle
+  timeout is the gap between events, NOT total runtime — it resets on every
+  event, so a healthy worker emitting periodic STATUS markers never trips it.
+  Override with `--max-idle-secs <secs>` (or `--max-idle-secs 0` for no idle
+  gate, relying on PID liveness + the worker's terminal marker).
 - `bash-tail`: worker writes stdout/stderr to files; the orchestrator watches
   via marker grep. Fallback only when no ACP adapter is available. See
   `protocols/legacy/bash-tail.md` for recipes and hazards (incl. the
@@ -95,6 +98,22 @@ worker.
 Unknown ACP commands are denied by default. Add a checked-in adapter manifest or
 point `GOALFLIGHT_ADAPTERS_DIR` at a machine-local manifest directory for
 experiments; do not silently dispatch an unmanifested binary.
+
+## Launch discipline
+
+Each parallel chunk gets exactly one launcher process and one unique
+`--dispatch-id`. Do not run a sequential shell loop that starts dispatch A, waits
+for that launcher to finish, then reuses the same id for B/C. Background each
+dispatch command independently through the host's background-task mechanism and
+assign stable ids per chunk (`chunk-a`, `chunk-b`, `chunk-c`). The dispatcher
+refuses a reused id while the prior ledger record is non-terminal; a duplicate id
+means status, tail, and lease ownership would collide.
+
+Shared-tree code writers that run the full suite (`pytest tests/` or equivalent)
+are serialized. Concurrent code-writing is only for file-disjoint chunks whose
+focused tests do not mutate or sweep the whole shared tree. If two chunks both
+need full-suite verification, run them one after the other or isolate them in
+separate worktrees and merge through the normal review gate.
 
 ## Liveness — a quiet worker is not a dead worker
 
@@ -245,9 +264,8 @@ context-mode tools.
 
 ### bash-tail vs ACP for a codex goal-loop
 
-Both transports run codex's **native** `/goal` loop unchanged: `--mode goal`
-only widens the ACP idle timeout (10h vs 5m), and the prompt + `features.goals`
-config are identical, so codex — not goal-flight's wrapper — drives the
+Both transports run codex's **native** `/goal` loop unchanged: the prompt and
+`features.goals` config are identical, so codex — not goal-flight's wrapper — drives the
 iteration either way (it is NOT a simulated/partial goal-mode on bash-tail).
 The transports therefore differ for codex only in that ACP can relay per-tool
 permission decisions live (`--interactive` = `--permission-mode inline`) and

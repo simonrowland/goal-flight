@@ -28,6 +28,10 @@ and can run `cursor-agent` as an ACP worker.
   approval is needed, and `cursor-agent mcp list-tools context-mode` to verify
   MCP discovery after restarting Cursor.
 - Keep long worker logs in files and summarize status JSON, not raw transcripts.
+- Cursor ACP workers that need tool-use/file-writing chunks must use
+  `--permission-mode inline` (or `--interactive`). Plain `auto` permission mode
+  can escalate shell/tool calls to `USER-CONFIRM` and block the worker; inline
+  mode has been verified for edit + shell chunks.
 
 Advanced setup (dry-run first, omit `--apply --yes`):
 
@@ -63,7 +67,9 @@ with shell errexit — use the skill status tooling for digests only.
 ```bash
 # Canonical Cursor dispatch (one background Shell per worker):
 python3 ~/.goal-flight/skill/scripts/goalflight_dispatch.py \
-  --agent codex \
+  --agent cursor \
+  --shape acp \
+  --permission-mode inline \
   --prompt-file docs-private/dispatch/<chunk>.md \
   --cwd /path/to/repo-or-worktree \
   --dispatch-id <chunk-id> \

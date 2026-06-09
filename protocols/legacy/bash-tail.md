@@ -157,7 +157,7 @@ Exit codes:
 |---|---|
 | 0 | terminal marker (`COMPLETE` / `BLOCKED` / `USER-NEED` / `USER-CONFIRM`) |
 | 1 | worker PID died without a terminal marker |
-| 2 | tail file idle past `--max-idle-secs` (default 180s) — worker likely wedged |
+| 2 | tail file idle past `--max-idle-secs` (direct watcher default 180s; dispatch wrapper default 600s for write-capable code workers) — worker likely wedged |
 | 3 | orchestrator PID died — watcher self-detected orphan |
 
 The watcher registers a pidfile under `/tmp/goal-flight-acp-pids.d/` so
@@ -165,6 +165,12 @@ The watcher registers a pidfile under `/tmp/goal-flight-acp-pids.d/` so
 function name — line drifts over time) reaps orphaned workers uniformly
 across ACP and bash-tail paths. Filename pattern:
 `<controller-pid>.bashtail.<worker-pid>.jsonl`.
+
+When launching multiple bash-tail dispatches, do not use a sequential
+`for c in A B C; do goalflight_dispatch.py ...; done` loop with reused ids. Each
+parallel chunk must be a separate background launcher with its own
+`--dispatch-id`; otherwise B/C collide with A's status/tail/ledger record. The
+dispatch wrapper refuses reused ids whose prior record is still non-terminal.
 
 ## Do NOT route the dispatch or the tail through context-mode
 

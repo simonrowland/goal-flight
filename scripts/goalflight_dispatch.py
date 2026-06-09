@@ -60,6 +60,9 @@ WATCH_TAIL_SH = SCRIPT_DIR / "watch-dispatch-tail.sh"
 DAEMON_SPAWN_ARG = "__goalflight_spawn_daemon"
 PRESET_AGENTS = {"codex", "grok-code", "grok-research"}
 STDIN_PROMPT_AGENTS = {"codex", "grok-code", "grok-research"}
+DEFAULT_MAX_IDLE_SECS = 180.0
+CODE_WRITER_MAX_IDLE_SECS = 600.0
+CODE_WRITER_AGENTS = {"codex", "codex-acp", "grok-code", "cursor", "cursor-agent"}
 ACCOUNT_ENGINE_BY_AGENT = {
     "codex": "codex",
     "codex-acp": "codex",
@@ -73,6 +76,54 @@ ACCOUNT_ENGINE_BY_AGENT = {
 RETIRED_AGENT_LABELS = {
     "grok": "use --agent grok-code (coding) or --agent grok-research (web search)",
 }
+READ_ONLY_INLINE_RETURN_PROMPT_PATTERNS = (
+    (
+        "return inline",
+        re.compile(
+            r"\breturn\b.{0,120}\binline\b"
+            r"|\binline\b.{0,80}\b(?:in\s+chat|final\s+response|response)\b",
+            re.I | re.S,
+        ),
+    ),
+    (
+        "no file write",
+        re.compile(
+            r"\bdo\s+not\s+(?:write|create|save|append|update)\b.{0,80}"
+            r"\b(?:any\s+)?(?:file|files|artifact|review|findings|report)\b"
+            r"|\bno\s+(?:file\s+)?(?:write|writes|writing)\b"
+            r"|\bwithout\s+(?:writing|creating|saving)\b.{0,80}\b(?:file|files)\b",
+            re.I | re.S,
+        ),
+    ),
+)
+READ_ONLY_WRITE_PROMPT_PATTERNS = (
+    (
+        "write review artifact",
+        re.compile(
+            r"\b(?:write|save|create|append|update)\b.{0,80}"
+            r"\b(?:review|findings|report|artifact|verdict)\b.{0,80}"
+            r"\b(?:to|at|under|into|as)\b.{0,80}"
+            r"\b(?:docs-private/|[~/./A-Za-z0-9_-][^ \t\r\n`'\"<>]*[.](?:md|json|log|txt))",
+            re.I | re.S,
+        ),
+    ),
+    (
+        "write review file",
+        re.compile(
+            r"\b(?:write|save|create|append|update)\b.{0,80}"
+            r"\b(?:review|findings|report|artifact|verdict)\b.{0,80}\bfile\b",
+            re.I | re.S,
+        ),
+    ),
+    (
+        "READY artifact contract",
+        re.compile(
+            r"\bREADY:\s*(?:docs-private/|[~/./A-Za-z0-9_-][^ \t\r\n`'\"<>]*[.](?:md|json|log|txt))",
+            re.I,
+        ),
+    ),
+    ("shell output redirect", re.compile(r">\s*(docs-private|[^ \t\r\n]+[.](md|json|log))", re.I)),
+)
 STEER_PROMPT_PREAMBLE = (
     "You have a steer mailbox at `$GOALFLIGHT_STEER_FILE`. Read it AT THE TOP OF EACH "
     "ITERATION and IMMEDIATELY BEFORE ANY git commit/push. Incorporate new messages "
@@ -231,6 +282,21 @@ def _status_matches_current_launch(
         return int(payload.get("worker_pid")) == int(worker_pid)
     except (TypeError, ValueError):
         return False
+
+
+def _reattach_hint(dispatch_id: str) -> str:
+    return f"worker still alive - re-attach via goalflight_status.py --done {dispatch_id}"
+
+
+def _dispatch_end_reattach_hint(
+    dispatch_id: str,
+    *,
+    terminal_state: str | None,
+    worker_alive: object,
+) -> str | None:
+    if terminal_state == "idle_timeout" and worker_alive is True:
+        return _reattach_hint(dispatch_id)
+    return None
 
 
 def _worker_alive_from_identity(worker_pid: int | None, identity: dict | None) -> tuple[bool, str]:
@@ -531,6 +597,47 @@ def _prompt_requested(args) -> bool:
     return bool(args.prompt_file) or args.prompt is not None
 
 
+def _read_prompt_for_guard(args) -> str:
+    if args.prompt is not None:
+        return str(args.prompt)
+    if args.prompt_file:
+        try:
+            return Path(args.prompt_file).expanduser().read_text(
+                encoding="utf-8",
+                errors="replace",
+            )
+        except OSError:
+            return ""
+    return ""
+
+
+def _read_only_write_prompt_reason(args) -> str | None:
+    if not getattr(args, "read_only", False) or not _prompt_requested(args):
+        return None
+    text = _read_prompt_for_guard(args)
+    if not text:
+        return None
+    for label, pattern in READ_ONLY_WRITE_PROMPT_PATTERNS:
+        if pattern.search(text):
+            return label
+    for _label, pattern in READ_ONLY_INLINE_RETURN_PROMPT_PATTERNS:
+        if pattern.search(text):
+            return None
+    return None
+
+
+def _guard_read_only_write_prompt(args) -> None:
+    reason = _read_only_write_prompt_reason(args)
+    if not reason:
+        return
+    raise DispatchUsageError(
+        "--read-only prompt appears to require writing a review artifact "
+        f"(matched {reason}). Read-only workers cannot write review files; "
+        "return findings inline in the final response, or use a writable "
+        "sandbox/worktree."
+    )
+
+
 def _validate_before_side_effects(args, raw_argv: list[str]) -> None:
     if raw_argv:
         return
@@ -551,6 +658,35 @@ def _validate_before_side_effects(args, raw_argv: list[str]) -> None:
         )
     if args.prompt_file and not Path(args.prompt_file).expanduser().exists():
         raise DispatchUsageError(f"prompt file not found: {args.prompt_file}")
+    _guard_read_only_write_prompt(args)
+
+
+def _nonterminal_dispatch_reuse_reason(dispatch_id: str) -> str | None:
+    record = _find_dispatch_record(dispatch_id)
+    if record is None:
+        return None
+    terminal = goalflight_ledger.terminal_state_for(
+        record.get("state"),
+        record.get("reason") or record.get("error"),
+    )
+    if terminal != "unknown":
+        return None
+    classification = goalflight_ledger.classify(record)
+    return (
+        f"classification={classification} state={record.get('state') or 'running'} "
+        f"status={record.get('status_path') or '-'}"
+    )
+
+
+def _refuse_reused_nonterminal_dispatch_id(dispatch_id: str) -> None:
+    reason = _nonterminal_dispatch_reuse_reason(dispatch_id)
+    if not reason:
+        return
+    raise DispatchUsageError(
+        f"dispatch id {dispatch_id!r} already has a non-terminal ledger record "
+        f"({reason}). Use a unique --dispatch-id per parallel chunk; in shell "
+        "loops, launch each dispatch as its own background command."
+    )
 
 
 def _write_windows_dispatch_refusal(args) -> tuple[dict, Path]:
@@ -1271,6 +1407,17 @@ def _build_acp_cfg(args, *, status_json: Path):
     return normalized_acp_dispatch_cfg(cfg)
 
 
+def _default_max_idle_secs(args) -> float:
+    if not getattr(args, "read_only", False) and str(getattr(args, "agent", "")) in CODE_WRITER_AGENTS:
+        return CODE_WRITER_MAX_IDLE_SECS
+    return DEFAULT_MAX_IDLE_SECS
+
+
+def _apply_max_idle_default(args) -> None:
+    if getattr(args, "max_idle_secs", None) is None:
+        args.max_idle_secs = _default_max_idle_secs(args)
+
+
 def _run_acp_shape(args, *, base: Path, account_env: dict[str, str]) -> int:
     from goalflight_acp_run import acp_dispatch_exit_code, run_acp_dispatch
 
@@ -1280,6 +1427,7 @@ def _run_acp_shape(args, *, base: Path, account_env: dict[str, str]) -> int:
             if goalflight_compat.is_windows()
             else _reserve_auto_dispatch_id(args.agent, base)
         )
+    _refuse_reused_nonterminal_dispatch_id(args.dispatch_id)
     status_json = Path(args.status_json) if args.status_json else base / f"{args.dispatch_id}.status.json"
     cfg = _build_acp_cfg(args, status_json=status_json)
     env_remove = []
@@ -1338,24 +1486,25 @@ def _run_acp_shape(args, *, base: Path, account_env: dict[str, str]) -> int:
             worker_pid=int(worker_pid),
             shape="acp",
         )
-    print(
-        "DISPATCH-END "
-        + json.dumps(
-            {
-                "dispatch_id": payload.get("dispatch_id", cfg.dispatch_id),
-                "agent": payload.get("agent", cfg.agent),
-                "shape": "acp",
-                "worker_pid": payload.get("worker_pid"),
-                "status_json": str(status_json),
-                "terminal_state": payload.get("state"),
-                "worker_still_alive": payload.get("worker_alive"),
-                "reason": payload.get("error") or payload.get("reason"),
-                "elapsed_s": round(time.time() - started, 3),
-            },
-            sort_keys=True,
-        ),
-        flush=True,
+    end_payload = {
+        "dispatch_id": payload.get("dispatch_id", cfg.dispatch_id),
+        "agent": payload.get("agent", cfg.agent),
+        "shape": "acp",
+        "worker_pid": payload.get("worker_pid"),
+        "status_json": str(status_json),
+        "terminal_state": payload.get("state"),
+        "worker_still_alive": payload.get("worker_alive"),
+        "reason": payload.get("error") or payload.get("reason"),
+        "elapsed_s": round(time.time() - started, 3),
+    }
+    hint = _dispatch_end_reattach_hint(
+        str(end_payload["dispatch_id"]),
+        terminal_state=end_payload["terminal_state"],
+        worker_alive=end_payload["worker_still_alive"],
     )
+    if hint:
+        end_payload["hint"] = hint
+    print("DISPATCH-END " + json.dumps(end_payload, sort_keys=True), flush=True)
     return acp_dispatch_exit_code(payload)
 
 
@@ -1446,7 +1595,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--status-json", help="Watcher status file (auto: <state>/dispatch/<id>.status.json)")
     parser.add_argument("--dispatch-id", help="Slug for auto paths (auto-generated if omitted)")
     parser.add_argument("--poll-secs", type=float, default=2.0)
-    parser.add_argument("--max-idle-secs", type=float, default=180.0)
+    parser.add_argument(
+        "--max-idle-secs",
+        type=float,
+        default=None,
+        help=(
+            "Watcher idle window. Default: 600s for write-capable code workers, "
+            "180s for read-only/research/custom workers."
+        ),
+    )
     parser.add_argument("--controller-pid", type=int,
                         help="If set, watcher exits when this pid dies (orphan guard)")
     parser.add_argument("--stats", nargs="?", const="7d", metavar="WINDOW",
@@ -1483,10 +1640,12 @@ def main(argv: list[str] | None = None) -> int:
     if shape == "acp":
         try:
             _normalize_acp_agent(args)
+            _apply_max_idle_default(args)
             if not _prompt_requested(args):
                 raise DispatchUsageError("--shape acp requires --prompt or --prompt-file")
             if args.prompt_file and not Path(args.prompt_file).expanduser().exists():
                 raise DispatchUsageError(f"prompt file not found: {args.prompt_file}")
+            _guard_read_only_write_prompt(args)
             base = _dispatch_base_dir()
             if goalflight_compat.is_windows():
                 return _run_acp_shape(args, base=base, account_env={})
@@ -1500,6 +1659,7 @@ def main(argv: list[str] | None = None) -> int:
         return _refuse_windows_dispatch(args)
 
     try:
+        _apply_max_idle_default(args)
         _validate_before_side_effects(args, raw)
         account_env = _resolve_account_env(args)
     except DispatchUsageError as e:
@@ -1514,6 +1674,11 @@ def main(argv: list[str] | None = None) -> int:
         except DispatchUsageError as e:
             print(f"goalflight_dispatch: {e}", file=sys.stderr)
             return 64
+    try:
+        _refuse_reused_nonterminal_dispatch_id(args.dispatch_id)
+    except DispatchUsageError as e:
+        print(f"goalflight_dispatch: {e}", file=sys.stderr)
+        return 64
     tail = Path(args.tail) if args.tail else base / f"{args.dispatch_id}.tail"
     status_json = Path(args.status_json) if args.status_json else base / f"{args.dispatch_id}.status.json"
 
@@ -1745,14 +1910,22 @@ def main(argv: list[str] | None = None) -> int:
             final_state = state or "complete"
 
         # 3. Emit a summary and propagate the watcher's REAL exit code (no masking).
-        print("DISPATCH-END " + json.dumps({
+        end_payload = {
             **summary_head,
             "watcher_exit": watch_rc,
             "terminal_state": final_state,
             "worker_still_alive": worker_alive,  # True on a marker => signal-to-review, NOT done; re-attach
             "reason": final_reason,
             "elapsed_s": round(time.time() - started, 1),
-        }, sort_keys=True), flush=True)
+        }
+        hint = _dispatch_end_reattach_hint(
+            args.dispatch_id,
+            terminal_state=final_state,
+            worker_alive=worker_alive,
+        )
+        if hint:
+            end_payload["hint"] = hint
+        print("DISPATCH-END " + json.dumps(end_payload, sort_keys=True), flush=True)
         return watch_rc
     except SystemExit:
         raise

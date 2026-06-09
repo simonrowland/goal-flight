@@ -198,8 +198,66 @@ def test_done_code() -> None:
     check("live -> 1", S.done_code(recs["live1"]) == 1)
     check("terminal complete -> 0", S.done_code(recs["done1"]) == 0)
     check("unknown_no_pid -> 2", S.done_code(recs["amb1"]) == 2)
+    timeout_summary = {
+        "dispatch_id": "timeout-live",
+        "classification": "idle_timeout",
+        "agent": "codex",
+        "worker_pid": 333,
+        "worker_still_alive": True,
+    }
+    timeout_raw = {
+        **timeout_summary,
+        "worker_identity": {"lstart": "Tue Jun  9 09:00:00 2026", "comm": "python3"},
+    }
+    orig_read_records = S.goalflight_ledger.read_records
+    orig_identity_matches = S.goalflight_ledger.identity_matches
+    try:
+        captured: list[dict] = []
+
+        def identity_live(record: dict) -> tuple[bool, str]:
+            captured.append(record)
+            return True, "live"
+
+        S.goalflight_ledger.read_records = lambda: [timeout_raw]
+        S.goalflight_ledger.identity_matches = identity_live
+        check("idle_timeout refreshes raw identity before live", S.done_code(timeout_summary) == 1)
+        check("idle_timeout liveness used raw identity", captured and captured[-1] is timeout_raw)
+
+        S.goalflight_ledger.identity_matches = lambda record: (False, "dead")
+        check("idle_timeout stale cached worker -> 0", S.done_code(timeout_summary) == 0)
+
+        S.goalflight_ledger.read_records = lambda: []
+        check("idle_timeout cached flag without identity -> 0", S.done_code(timeout_summary) == 0)
+    finally:
+        S.goalflight_ledger.read_records = orig_read_records
+        S.goalflight_ledger.identity_matches = orig_identity_matches
     check("stale_* -> 2", S.done_code({"classification": "stale_pid_reuse"}) == 2)
     check("missing classification -> 2 (do not claim done)", S.done_code({}) == 2)
+
+
+def test_idle_timeout_live_hint_rendered() -> None:
+    orig_identity_matches = S.goalflight_ledger.identity_matches
+    payload = sample_payload()
+    payload["dispatch"]["records"].append(
+        {
+            "dispatch_id": "timeout-live",
+            "project_root": "/repo/A",
+            "classification": "idle_timeout",
+            "agent": "codex",
+            "worker_pid": 333,
+            "worker_still_alive": True,
+            "worker_identity": {"lstart": "Tue Jun  9 09:00:00 2026", "comm": "python3"},
+            "status_path": "/tmp/timeout-live.json",
+        }
+    )
+    try:
+        S.goalflight_ledger.identity_matches = lambda record: (True, "live")
+        digest = "\n".join(S.render_text(S.scope_payload(payload, "/repo/A"), 10))
+        check("idle-timeout live worker counted running", digest.splitlines()[0].startswith("A: running2"))
+        check("idle-timeout live worker hint rendered",
+              "worker still alive - re-attach via goalflight_status.py --done timeout-live" in digest)
+    finally:
+        S.goalflight_ledger.identity_matches = orig_identity_matches
 
 
 def test_rate_pressure_warning_rendered() -> None:
@@ -245,6 +303,7 @@ def main() -> int:
     test_worktree_scope()
     test_worktree_scope_symlinked_root()
     test_done_code()
+    test_idle_timeout_live_hint_rendered()
     test_rate_pressure_warning_rendered()
     test_cli()
     if _FAILS:

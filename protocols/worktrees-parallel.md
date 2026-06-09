@@ -11,6 +11,9 @@ Rules:
 - worktrees start from committed `HEAD`; uncommitted controller-root edits are
   not visible inside parallel dispatch worktrees
 - disjoint write ownership in the prompt
+- shared-tree full-suite code writers are serialized; run `pytest tests/` (or
+  equivalent whole-repo suites) concurrently only when each worker is isolated in
+  its own worktree
 - acquire capacity before each worker spawn
 - ledger every worker PID/session
 - continue independent chunks when one chunk blocks
