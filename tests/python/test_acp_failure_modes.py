@@ -240,6 +240,10 @@ def case_manifest_acp_command_defaults() -> None:
     assert Path(binary).name == "grok"
     assert args == ["agent", "stdio"]
 
+    binary, args = agent_command("grok-acp")
+    assert Path(binary).name == "grok"
+    assert args == ["agent", "--model", "grok-composer-2.5-fast", "stdio"]
+
     binary, args = agent_command("cursor")
     assert Path(binary).name == "cursor-agent"
     assert args == ["acp"]

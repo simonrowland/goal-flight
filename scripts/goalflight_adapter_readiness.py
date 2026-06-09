@@ -25,6 +25,7 @@ AGENT_MANIFEST_ALIASES = {
     "claude": "claude-code",
     "codex-acp": "codex",
     "cursor-agent": "cursor",
+    "grok-acp": "grok",
 }
 
 

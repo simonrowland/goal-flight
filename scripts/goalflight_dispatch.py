@@ -62,7 +62,7 @@ PRESET_AGENTS = {"codex", "grok-code", "grok-research"}
 STDIN_PROMPT_AGENTS = {"codex", "grok-code", "grok-research"}
 DEFAULT_MAX_IDLE_SECS = 180.0
 CODE_WRITER_MAX_IDLE_SECS = 600.0
-CODE_WRITER_AGENTS = {"codex", "codex-acp", "grok-code", "cursor", "cursor-agent"}
+CODE_WRITER_AGENTS = {"codex", "codex-acp", "grok-code", "grok-acp", "cursor", "cursor-agent"}
 ACCOUNT_ENGINE_BY_AGENT = {
     "codex": "codex",
     "codex-acp": "codex",
@@ -1343,6 +1343,7 @@ def _normalize_acp_agent(args) -> None:
         "worker": "codex-acp",
         "codex": "codex-acp",
         "codex-acp": "codex-acp",
+        "grok-acp": "grok-acp",
         "cursor": "cursor",
         "cursor-agent": "cursor",
         "claude": "claude",
@@ -1350,10 +1351,10 @@ def _normalize_acp_agent(args) -> None:
         "claude-code-cli-acp": "claude",
     }
     args.agent = aliases.get(agent, agent)
-    if args.agent not in {"codex-acp", "cursor", "claude"}:
+    if args.agent not in {"codex-acp", "grok-acp", "cursor", "claude"}:
         raise DispatchUsageError(
-            "--shape acp v1 supports --agent codex-acp, cursor, or claude-acp; "
-            f"got {agent!r}"
+            "--shape acp v1 supports --agent codex-acp, grok-acp, cursor, or "
+            f"claude-acp; got {agent!r}"
         )
 
 
@@ -1579,7 +1580,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--shape", choices=["auto", "bash", "acp"], default="auto",
                         help="Comms shape. 'auto' picks the best per engine (codex/grok->bash, "
                              "cursor/claude->acp). v1 ACP routing supports codex-acp, "
-                             "cursor, and claude-acp.")
+                             "grok-acp, cursor, and claude-acp.")
     parser.add_argument("--interactive", action="store_true",
                         help="Sugar for --shape acp --permission-mode inline (codex-acp inline relay).")
     parser.add_argument("--permission-mode", choices=["auto", "inline"], default="auto",

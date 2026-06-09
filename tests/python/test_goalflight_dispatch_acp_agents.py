@@ -31,11 +31,12 @@ def case_normalize_acp_agents() -> None:
     assert _normalize("claude") == "claude"
     assert _normalize("claude-acp") == "claude"
     assert _normalize("claude-code-cli-acp") == "claude"
+    assert _normalize("grok-acp") == "grok-acp"
 
     try:
         _normalize("not-real")
     except dispatch_mod.DispatchUsageError as exc:
-        assert "codex-acp, cursor, or claude-acp" in str(exc)
+        assert "codex-acp, grok-acp, cursor, or claude-acp" in str(exc)
     else:
         raise AssertionError("bogus ACP agent did not raise")
 

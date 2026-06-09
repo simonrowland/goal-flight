@@ -34,6 +34,7 @@ DEFAULT_RATE_PRESSURE_WINDOW_SECONDS = 600
 DEFAULT_RATE_PRESSURE_THRESHOLD = 3
 AGENT_RSS_MB = {
     "grok": 111,
+    "grok-acp": 111,
     "grok-code": 111,
     "grok-research": 111,
     "codex": 386,
@@ -83,6 +84,7 @@ DEFAULT_AGENT_CAPS = {
     "codex": 10,
     "codex-acp": 10,       # stress-tested 2026-05-20: 49/49 + 13/13 TRUE-simultaneous, zero wedges
     "grok": 10,
+    "grok-acp": 10,
     "grok-code": 10,
     "grok-research": 10,
     # Gateway orchestrators: lower cap, longer orchestration latency (Track D).

@@ -73,8 +73,9 @@ async def _handshake_calls(agent: str, model: str | None, *, fail_model: bool = 
 
 def case_agent_command_per_agent_placement() -> None:
     # grok ACP: --model must sit BEFORE the `stdio` terminal (verified form).
-    _, args = acp.agent_command("grok", model=MODEL)
-    assert args[-3:] == ["--model", MODEL, "stdio"], args
+    for agent in ("grok", "grok-acp"):
+        _, args = acp.agent_command(agent, model=MODEL)
+        assert args[-3:] == ["--model", MODEL, "stdio"], (agent, args)
     # codex: global `-c model=<id>` override (NOT --model).
     _, args = acp.agent_command("codex", model=MODEL)
     assert args[:2] == ["-c", f"model={MODEL}"] and "--model" not in args, args
@@ -86,6 +87,13 @@ def case_agent_command_per_agent_placement() -> None:
     for agent in ("claude", "claude-acp"):
         _, args = acp.agent_command(agent, model=MODEL)
         assert args == [], (agent, args)
+
+
+def case_grok_acp_default_model() -> None:
+    _, args = acp.agent_command("grok-acp")
+    assert args[-3:] == ["--model", MODEL, "stdio"], args
+    _, args_explicit = acp.agent_command("grok-acp", model=None)
+    assert args_explicit == ["agent", "--model", MODEL, "stdio"], args_explicit
 
 
 def case_agent_command_defaults() -> None:
@@ -159,6 +167,7 @@ def case_retired_bare_grok_agent_label() -> None:
 
 def main() -> None:
     case_agent_command_per_agent_placement()
+    case_grok_acp_default_model()
     case_agent_command_defaults()
     case_claude_model_applies_after_session_new()
     case_build_worker_injects_model()

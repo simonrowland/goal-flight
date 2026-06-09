@@ -84,6 +84,7 @@ AGENT_TO_PROVIDER: dict[str, str] = {
     "codex-acp": "openai",
     "codex-bash-tail": "openai",
     "grok": "xai",
+    "grok-acp": "xai",
     "grok-code": "xai",
     "grok-research": "xai",
     "grok-bash-tail": "xai",

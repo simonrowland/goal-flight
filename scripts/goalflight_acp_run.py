@@ -538,22 +538,33 @@ def _uses_session_model(agent: str) -> bool:
 
 # Quality-by-default: when no model is selected, dispatch the agent's strongest
 # model where it is UNAMBIGUOUS and above the agent's own default. codex already
-# defaults strong (user config), grok's two models are task-dependent (it keeps
-# grok-build), cursor/opencode "strongest" is ambiguous, and claude-code-cli-acp
-# must be launched with no argv flags to stay in ACP server mode.
-_DEFAULT_STRONG_MODEL: dict[str, str] = {}
+# defaults strong (user config), grok-code/grok-research bash-tail keep their own
+# task-dependent defaults, grok-acp pins Composer 2.5 for ACP writes, cursor/opencode
+# "strongest" is ambiguous, and claude-code-cli-acp must be launched with no argv
+# flags to stay in ACP server mode.
+_GROK_ACP_DEFAULT_MODEL = "grok-composer-2.5-fast"
+_DEFAULT_STRONG_MODEL: dict[str, str] = {
+    "grok-acp": _GROK_ACP_DEFAULT_MODEL,
+}
+
+
+def _grok_acp_base_command() -> tuple[str, list[str]]:
+    return _resolve_manifest_binary("grok"), ["agent", "stdio"]
 
 
 def agent_command(agent: str, model: str | None = None) -> tuple[str, list[str]]:
+    agent_key = str(agent).strip().lower()
     manifest_command = _manifest_acp_command(agent)
     if manifest_command is not None:
         binary, args = manifest_command
-    elif agent in {"claude", "claude-acp"}:
+    elif agent_key in {"grok", "grok-acp"}:
+        binary, args = _grok_acp_base_command()
+    elif agent_key in {"claude", "claude-acp"}:
         binary, args = "claude-code-cli-acp", []
     else:
         binary, args = agent, []
     if model is None:
-        model = _DEFAULT_STRONG_MODEL.get(str(agent).strip().lower())
+        model = _DEFAULT_STRONG_MODEL.get(agent_key)
     if model:
         args = _acp_model_args(agent, args, str(model))
     return binary, args
@@ -1160,8 +1171,20 @@ async def _run_acp_dispatch_impl(
             DEFAULT_BETWEEN_TURN_STEER_GRACE_S,
             configured_idle_timeout,
         )
+    empty_poll_override = os.environ.get("GOALFLIGHT_EMPTY_BETWEEN_TURN_STEER_POLL_S")
+    try:
+        configured_empty_poll = (
+            float(empty_poll_override) if empty_poll_override not in (None, "") else None
+        )
+    except (TypeError, ValueError):
+        configured_empty_poll = None
+    base_empty_poll = (
+        configured_empty_poll
+        if configured_empty_poll is not None
+        else DEFAULT_EMPTY_BETWEEN_TURN_STEER_POLL_S
+    )
     empty_between_turn_steer_poll_s = min(
-        DEFAULT_EMPTY_BETWEEN_TURN_STEER_POLL_S,
+        base_empty_poll,
         between_turn_steer_grace_s,
     )
 
