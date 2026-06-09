@@ -24,6 +24,11 @@ legacy-host-adapters/
 # Goal Flight local per-dispatch worktrees.
 worktrees/
 
+# Goal Flight local runtime state (autoreview handoff temp files, etc.).
+# Not portable or canonical; an orphaned handoff here must never enter a
+# review bundle (`local_bundle` slurps untracked files) or be git-added.
+.goal-flight/
+
 # Python bytecode (from scripts/acp_*.py + test/test_acp_*.py).
 __pycache__/
 *.pyc

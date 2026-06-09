@@ -35,6 +35,38 @@ if ! grep -q 'autoreview_claude_acp' "$REPO_ROOT/scripts/autoreview.sh"; then
   exit 1
 fi
 
+# --- grok-acp engine: static + hermetic guard coverage (no live grok runtime) ---
+
+if [ ! -f "$REPO_ROOT/scripts/autoreview_grok_acp" ]; then
+  echo "FAIL  $TEST_NAME"
+  echo "      missing ACP shim: scripts/autoreview_grok_acp"
+  exit 1
+fi
+
+if ! grep -q 'autoreview_grok_acp' "$REPO_ROOT/scripts/autoreview.sh"; then
+  echo "FAIL  $TEST_NAME"
+  echo "      scripts/autoreview.sh does not reference scripts/autoreview_grok_acp"
+  exit 1
+fi
+
+# The grok-acp engine must refuse the raw grok CLI (which cannot do the ACP
+# file-handoff) with a teaching error, instead of failing confusingly downstream.
+grok_guard_out="$("$REPO_ROOT/autoreview/scripts/autoreview" --engine grok-acp --grok-bin grok --mode uncommitted 2>&1)"
+if ! printf '%s' "$grok_guard_out" | grep -q 'requires the autoreview_grok_acp ACP shim'; then
+  echo "FAIL  $TEST_NAME"
+  echo "      grok-acp engine did not reject the raw grok CLI with the shim-required guard"
+  exit 1
+fi
+
+# The ACP file-handoff requires write tools, so --no-tools must be rejected
+# (matches codex/copilot). Pass the real shim so the guard above is satisfied first.
+grok_notools_out="$("$REPO_ROOT/autoreview/scripts/autoreview" --engine grok-acp --grok-bin "$REPO_ROOT/scripts/autoreview_grok_acp" --no-tools --mode uncommitted 2>&1)"
+if ! printf '%s' "$grok_notools_out" | grep -q 'no-tools is not supported by the grok-acp engine'; then
+  echo "FAIL  $TEST_NAME"
+  echo "      grok-acp engine did not reject --no-tools"
+  exit 1
+fi
+
 if grep -Eq 'claude[[:space:]]+(-p|--print)' "$REPO_ROOT/scripts/autoreview.sh"; then
   echo "FAIL  $TEST_NAME"
   echo "      scripts/autoreview.sh must route Claude through ACP shim, not native print mode"

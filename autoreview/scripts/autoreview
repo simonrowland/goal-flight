@@ -17,12 +17,13 @@ from pathlib import Path
 from typing import Any, Callable
 
 
-ENGINES = ("codex", "claude", "droid", "copilot")
+ENGINES = ("codex", "claude", "droid", "copilot", "grok-acp")
 THINKING_LEVELS_BY_ENGINE = {
     "codex": {"low", "medium", "high", "xhigh"},
     "claude": {"low", "medium", "high", "xhigh", "max"},
     "droid": set(),
     "copilot": set(),
+    "grok-acp": set(),
 }
 
 
@@ -562,6 +563,55 @@ def run_claude(args: argparse.Namespace, repo: Path, prompt: str) -> str:
     return result.stdout
 
 
+def run_grok_acp(args: argparse.Namespace, repo: Path, prompt: str) -> str:
+    grok_bin = resolve_command(args.grok_bin, repo)
+    # The grok-acp engine delivers structured findings through grok's native ACP
+    # file-handoff, implemented only by the autoreview_grok_acp shim. The raw
+    # `grok` CLI does not implement it, so a bare --grok-bin (the default) would
+    # silently produce a confusing failure. Fail loudly with guidance instead.
+    if os.path.basename(grok_bin) == "grok":
+        raise SystemExit(
+            "grok-acp engine requires the autoreview_grok_acp ACP shim, not the raw "
+            "grok CLI. Invoke via scripts/autoreview.sh (it sets --grok-bin "
+            "automatically), or pass --grok-bin <path-to-scripts/autoreview_grok_acp>."
+        )
+    if not args.tools:
+        raise SystemExit(
+            "--no-tools is not supported by the grok-acp engine; the ACP file-handoff "
+            "requires write tools to deliver the findings JSON"
+        )
+    cmd = [
+        grok_bin,
+        "--print",
+        "--no-session-persistence",
+        "--output-format",
+        "stream-json" if args.stream_engine_output else "json",
+        "--json-schema",
+        json.dumps(SCHEMA),
+    ]
+    if args.tools:
+        cmd.extend(["--allowedTools", claude_allowed_tools(args)])
+    else:
+        cmd.extend(["--tools", ""])
+    if args.stream_engine_output:
+        cmd.append("--verbose")
+    if args.model:
+        cmd.extend(["--model", args.model])
+    if args.thinking:
+        cmd.extend(["--effort", args.thinking])
+    result = run_with_heartbeat(
+        cmd,
+        repo,
+        input_text=prompt,
+        label="grok-acp",
+        stream_output=args.stream_engine_output,
+        stream_display=ClaudeStreamDisplay() if args.stream_engine_output else None,
+    )
+    if result.returncode != 0:
+        raise SystemExit(f"grok-acp engine failed ({result.returncode})\n{result.stderr or result.stdout}")
+    return result.stdout
+
+
 def run_droid(args: argparse.Namespace, repo: Path, prompt: str) -> str:
     if args.thinking:
         raise SystemExit("--thinking is not supported by the droid engine")
@@ -983,6 +1033,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--allow-partial-panel", action="store_true", help="Continue panel output when one reviewer fails.")
     parser.add_argument("--codex-bin", default=os.environ.get("CODEX_BIN", "codex"))
     parser.add_argument("--claude-bin", default=os.environ.get("CLAUDE_BIN", "claude"))
+    parser.add_argument("--grok-bin", default=os.environ.get("GROK_BIN", "grok"))
     parser.add_argument("--droid-bin", default=os.environ.get("DROID_BIN", "droid"))
     parser.add_argument("--copilot-bin", default=os.environ.get("COPILOT_BIN", "copilot"))
     parser.add_argument("--no-tools", dest="tools", action="store_false", default=True, help="Disable tools for engines that support it. Codex and copilot reject no-tools review.")
@@ -1026,6 +1077,8 @@ def run_engine(args: argparse.Namespace, repo: Path, prompt: str) -> str:
         return run_codex(args, repo, prompt)
     if args.engine == "claude":
         return run_claude(args, repo, prompt)
+    if args.engine == "grok-acp":
+        return run_grok_acp(args, repo, prompt)
     if args.engine == "droid":
         return run_droid(args, repo, prompt)
     if args.engine == "copilot":
@@ -1077,7 +1130,10 @@ def reviewer_args(args: argparse.Namespace) -> list[argparse.Namespace]:
     if args.reviewers:
         tokens = [token.strip() for token in args.reviewers.split(",") if token.strip()]
         if len(tokens) == 1 and tokens[0] == "all":
-            tokens = list(ENGINES)
+            # grok-acp is a goal-flight-specific engine (needs the autoreview_grok_acp
+            # ACP shim + a grok ACP runtime). Keep it explicit-only — out of the
+            # default `all` sweep — so a panel does not fail on hosts without grok.
+            tokens = [engine for engine in ENGINES if engine != "grok-acp"]
         reviewers = [parse_reviewer_token(token) for token in tokens]
     elif args.panel:
         engines = [args.engine]
