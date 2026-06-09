@@ -77,13 +77,20 @@ Treat routing candidates as first-class only after their readiness gate passes:
 |---|---|---|---|
 | Codex | yes | yes | Desktop/CLI available when needed, context-mode registered for large-output work, ACP handshake passes for structured dispatch. |
 | Cursor | yes | yes | Cursor Desktop or CLI path present for orchestrator use; `cursor-agent` present and ACP handshake passes for worker use; model-currency probe is current or explicitly accepted as stale. |
-| Grok | yes | yes | Grok Build/headless flags present; structured ACP path passes before ACP dispatch; bash-tail is fallback-only and must obey the marker limits in Composition rules. |
+| Grok | yes | read-only analysis/research only until write probe passes | Grok Build/headless flags present; structured ACP path passes before ACP dispatch; bash-tail is fallback-only and must obey the marker limits in Composition rules. File-writing is not routable unless `goalflight_doctor.py --worker-write-probe --write-probe-agent grok-code` passes in the current environment. |
 | OpenCode | yes | yes | `opencode` on PATH; `opencode acp` for structured dispatch; HTTP helper (`scripts/hosts/opencode/prompt.py`) for orchestrator one-shots; bash-tail via `scripts/hosts/opencode/bash_tail.py` (not bare `opencode run`). |
 | Claude compatibility path | yes | yes | Adapter-owned CLI/plugin probes pass; startup gate applies where the adapter requires serialized initialization. |
 
 If a candidate has static adapter capability but fails local readiness, do not
 route work to it. Pick another ready candidate with equivalent concern coverage
 or fall back to the legacy watcher when no ACP path is locally ready.
+
+Grok-specific write guard: treat `grok-code`/`grok-research` as inline
+review, analysis, and research workers unless the current machine has passed the
+doctor write-file e2e probe. A grok worker that exits cleanly after writing a
+target file but emits no final terminal marker is still not a valid file-writing
+worker for Goal Flight; route write chunks to codex or another marker-reliable
+worker.
 
 Unknown ACP commands are denied by default. Add a checked-in adapter manifest or
 point `GOALFLIGHT_ADAPTERS_DIR` at a machine-local manifest directory for
@@ -250,7 +257,7 @@ reads terminal state from structured events instead of a tail marker. Default:
 |---|---|---|
 | read-only (review) **or** worktree-isolated | **bash-tail** | no writes → no permission requests → ACP's relay is moot; bash-tail is leaner (no ACP-SDK venv) and `codex exec` is verified not to leak ptys/helpers |
 | writing the **main tree**, wanting live per-write gates | **ACP `--interactive`** | inline permission relay where a bad write to the real tree matters |
-| a **non-codex** agent (grok / cursor / claude) | **ACP** | bash-tail goal-mode needs codex's end-of-goal tail marker, which they lack |
+| a **non-codex** agent (cursor / claude; grok only after write probe passes) | **ACP** | bash-tail goal-mode needs codex's end-of-goal tail marker, which they otherwise lack |
 
 So the "ACP preferred for loops" row above holds for main-tree-write and
 non-codex loops; for read-only or worktree-isolated **codex** loops, prefer

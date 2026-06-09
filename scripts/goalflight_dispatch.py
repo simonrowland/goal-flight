@@ -79,6 +79,16 @@ STEER_PROMPT_PREAMBLE = (
     "into your plan; ack each with `STEER-ACK: <seq>` on its own line; a steer may "
     "redirect or HALT you — honor it."
 )
+GROK_EXECUTION_PREAMBLE = (
+    "Grok worker execution contract:\n"
+    "- Use your available tools to actually perform the requested filesystem, shell, "
+    "research, or analysis actions before answering. Do not only plan, summarize, or "
+    "describe commands.\n"
+    "- For successful completion, emit a final line outside any Markdown fence in this "
+    "exact shape: `COMPLETE: <summary>`.\n"
+    "- The `COMPLETE: <summary>` line must be the last non-empty line of your output. "
+    "Do not print anything after it."
+)
 STEER_ACK_RE = re.compile(r"^\**STEER-ACK:\**\s*(\d+)\b")
 
 
@@ -773,12 +783,25 @@ def _cmd_steer(argv: list[str]) -> int:
     return 0
 
 
-def _materialize_steer_prompt(prompt_path: str | None, base: Path, dispatch_id: str) -> str | None:
+def _worker_prompt_preamble(agent: str | None) -> str:
+    preambles = [STEER_PROMPT_PREAMBLE]
+    if agent in {"grok-code", "grok-research"}:
+        preambles.append(GROK_EXECUTION_PREAMBLE)
+    return "\n\n".join(preambles)
+
+
+def _materialize_steer_prompt(
+    prompt_path: str | None,
+    base: Path,
+    dispatch_id: str,
+    *,
+    agent: str | None = None,
+) -> str | None:
     if not prompt_path:
         return None
     body_path = Path(prompt_path)
     body = body_path.read_text(encoding="utf-8", errors="replace")
-    full_prompt = f"{STEER_PROMPT_PREAMBLE}\n\n{body}"
+    full_prompt = f"{_worker_prompt_preamble(agent)}\n\n{body}"
     assembled = base / f"{dispatch_id}.assembled.prompt"
     assembled.parent.mkdir(parents=True, exist_ok=True)
     assembled.write_text(full_prompt, encoding="utf-8")
@@ -1497,7 +1520,7 @@ def main(argv: list[str] | None = None) -> int:
     steer_file = _steer_file(args.dispatch_id)
     prompt_path = None if raw else _resolve_prompt_file(args, base)
     if prompt_path:
-        prompt_path = _materialize_steer_prompt(prompt_path, base, args.dispatch_id)
+        prompt_path = _materialize_steer_prompt(prompt_path, base, args.dispatch_id, agent=args.agent)
     worker_argv, stdin_path = build_worker(args, prompt_path, raw)
     if not worker_argv:
         print("goalflight_dispatch: no worker — use `--agent codex --prompt-file X [--cwd .]` "

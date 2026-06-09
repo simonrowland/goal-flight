@@ -40,6 +40,7 @@ def case_doctor_reports_platform_fields_for_windows() -> None:
         patch("goalflight_doctor.check_resume_notes_pattern", return_value=[]),
         patch("goalflight_doctor.cursor_models_probe", return_value={}),
         patch("goalflight_doctor.check_grok", return_value={}),
+        patch("goalflight_doctor.worker_write_file_probe", return_value={"enabled": False, "ok": None}),
         patch("goalflight_doctor.check_acp", return_value={}),
         patch("goalflight_doctor.git_state", return_value={}),
         patch("goalflight_doctor.check_worktrees", return_value={}),
@@ -64,6 +65,7 @@ def case_doctor_reports_platform_fields_for_windows() -> None:
     assert payload["wsl"]["dispatch_capability"] == "refused_native_use_wsl"
     assert payload["wsl"]["native_cleanup"] == "degraded_per_pid"
     assert "UTF-16LE/NUL" in payload["wsl"]["false_no_distro_debug"]
+    assert payload["worker_write_probe"]["enabled"] is False
 
 
 def case_doctor_reports_platform_fields_for_linux() -> None:

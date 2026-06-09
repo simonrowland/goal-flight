@@ -19,6 +19,12 @@ For machine-readable output:
 python3 <skill-root>/scripts/goalflight_doctor.py --project-root "$PWD" --json
 ```
 
+For a live worker write-file probe:
+
+```bash
+python3 <skill-root>/scripts/goalflight_doctor.py --project-root "$PWD" --worker-write-probe --write-probe-agent grok-code
+```
+
 ## Required Checks
 
 The script owns the checks; this file names the contract so tests and humans can
@@ -60,7 +66,9 @@ package repository; for normal target projects it is skipped as INFO.
     - `command -v cursor-agent`
     - `~/.cursor/mcp.json`
     - `.cursor/mcp.json`
-  - Grok: Grok Build present, headless flags available.
+  - Grok: Grok Build present, headless flags available. File-writing routes
+    require the live write-file e2e probe to pass in the current environment;
+    otherwise use Grok for read-only analysis/research only.
     - `--prompt-file`
     - `--permission-mode`
     - `--os-sandbox`

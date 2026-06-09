@@ -371,8 +371,8 @@ Default routing by task:
 
 | Task | Default | Fallback 1 | Fallback 2 |
 |---|---|---|---|
-| Code-writing chunks | `goalflight_dispatch.py` CLI worker (codex/`grok-code`) | Alternate CLI worker (`grok-code`↔codex) | Host Agent — LAST RESORT only ‡ |
-| Research / web search | `goalflight_dispatch.py` `--agent grok-research` | controller-direct | - |
+| Code-writing chunks | `goalflight_dispatch.py` codex worker | Alternate marker-reliable CLI worker with passing write-file probe | Host Agent — LAST RESORT only ‡ |
+| Research / web search | `goalflight_dispatch.py` `--agent grok-research` (read-only) | controller-direct | - |
 | Reviewer dispatches | gstack `/review` via review worker + concern-diverse sweep | any one alone | Claude Agent only when others unreachable |
 | Planning / decompose | code/planning worker | controller-direct | Claude Agent |
 | Anticipatory questions | strongest interactive planner | controller-direct | - |

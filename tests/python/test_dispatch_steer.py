@@ -286,6 +286,69 @@ def case_prompt_preamble_is_materialized() -> None:
         assert assembled.name == "prompt-case.assembled.prompt", assembled
 
 
+def case_grok_prompt_adds_execution_and_terminal_contract() -> None:
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        body = tmp / "body.md"
+        body.write_text("Write target.txt with ok.\n", encoding="utf-8")
+        assembled = Path(
+            goalflight_dispatch._materialize_steer_prompt(
+                str(body),
+                tmp / "dispatch",
+                "grok-prompt-case",
+                agent="grok-code",
+            )
+        )
+        text = assembled.read_text(encoding="utf-8")
+
+        expected_prefix = (
+            goalflight_dispatch.STEER_PROMPT_PREAMBLE
+            + "\n\n"
+            + goalflight_dispatch.GROK_EXECUTION_PREAMBLE
+            + "\n\n"
+        )
+        assert text.startswith(expected_prefix), text
+        assert "Use your available tools to actually perform" in text, text
+        assert "`COMPLETE: <summary>`" in text, text
+        assert "last non-empty line" in text, text
+        assert "Write target.txt with ok." in text, text
+
+
+def case_codex_prompt_does_not_add_grok_contract() -> None:
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        body = tmp / "body.md"
+        body.write_text("Review only.\n", encoding="utf-8")
+        assembled = Path(
+            goalflight_dispatch._materialize_steer_prompt(
+                str(body),
+                tmp / "dispatch",
+                "codex-prompt-case",
+                agent="codex",
+            )
+        )
+        text = assembled.read_text(encoding="utf-8")
+
+        assert text.startswith(goalflight_dispatch.STEER_PROMPT_PREAMBLE + "\n\n"), text
+        assert goalflight_dispatch.GROK_EXECUTION_PREAMBLE not in text, text
+
+
+def case_preamble_routing_matrix() -> None:
+    # Lock the grok-execution-preamble routing across every agent label:
+    # only grok-code / grok-research receive it; all others (and None) do not.
+    grok_marker = goalflight_dispatch.GROK_EXECUTION_PREAMBLE
+    for agent in ("grok-code", "grok-research"):
+        assert grok_marker in goalflight_dispatch._worker_prompt_preamble(agent), agent
+    for agent in ("codex", "cursor", "claude", "claude-acp", "codex-acp", "opencode", None):
+        assert grok_marker not in goalflight_dispatch._worker_prompt_preamble(agent), agent
+    # The steer preamble is always present regardless of agent.
+    for agent in ("grok-code", "grok-research", "codex", None):
+        assert (
+            goalflight_dispatch.STEER_PROMPT_PREAMBLE
+            in goalflight_dispatch._worker_prompt_preamble(agent)
+        ), agent
+
+
 def main() -> None:
     case_bash_append_and_list_with_ack()
     case_shape_routing_and_missing_record()
@@ -295,6 +358,9 @@ def main() -> None:
     case_concurrent_appends_have_monotonic_unique_seq()
     case_spawn_exports_steer_env()
     case_prompt_preamble_is_materialized()
+    case_grok_prompt_adds_execution_and_terminal_contract()
+    case_codex_prompt_does_not_add_grok_contract()
+    case_preamble_routing_matrix()
     print("OK: goalflight_dispatch steer tests pass")
 
 

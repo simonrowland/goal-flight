@@ -16,6 +16,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 
 import goalflight_compat
 
@@ -767,6 +768,129 @@ def check_grok() -> dict:
         "version": first_line(version_result["stdout"] or version_result["stderr"]),
         "grok_build": "Grok Build" in text,
         "headless_flags": "--prompt-file" in text and "--cwd" in text,
+    }
+
+
+def worker_write_file_probe(
+    repo: Path,
+    *,
+    agent: str = "grok-code",
+    enabled: bool = False,
+    timeout_s: float = 90.0,
+) -> dict:
+    if not enabled:
+        return {
+            "enabled": False,
+            "agent": agent,
+            "ok": None,
+            "state": "not_run",
+            "detail": "run doctor with --worker-write-probe to validate engine writes a file e2e",
+        }
+    dispatch = SCRIPT_DIR / "goalflight_dispatch.py"
+    if not dispatch.exists():
+        return {
+            "enabled": True,
+            "agent": agent,
+            "ok": False,
+            "state": "blocked",
+            "detail": f"missing dispatcher: {dispatch}",
+        }
+    state_dir = Path(os.environ.get("GOALFLIGHT_STATE_DIR", goalflight_compat.default_state_dir()))
+    base = state_dir / "doctor-write-probe"
+    base.mkdir(parents=True, exist_ok=True)
+    dispatch_id = f"doctor-write-probe-{agent}-{os.getpid()}-{int(time.time())}"
+    target = base / f"{dispatch_id}.target.txt"
+    prompt = base / f"{dispatch_id}.prompt.md"
+    status = base / f"{dispatch_id}.status.json"
+    tail = base / f"{dispatch_id}.tail"
+    expected = f"goalflight-doctor-write-probe:{dispatch_id}"
+    prompt.write_text(
+        "\n".join(
+            [
+                "Goal Flight doctor write-file e2e probe.",
+                "",
+                f"Write exactly this text to `{target}`:",
+                "",
+                "```text",
+                expected,
+                "```",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    cmd = [
+        sys.executable,
+        str(dispatch),
+        "--agent",
+        agent,
+        "--dispatch-id",
+        dispatch_id,
+        "--prompt-file",
+        str(prompt),
+        "--cwd",
+        str(repo),
+        "--poll-secs",
+        "0.5",
+        "--max-idle-secs",
+        str(max(5.0, min(timeout_s, 180.0))),
+        "--tail",
+        str(tail),
+        "--status-json",
+        str(status),
+    ]
+    env = os.environ.copy()
+    env["GOALFLIGHT_STATE_DIR"] = str(state_dir)
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=repo,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=max(timeout_s + 10.0, 15.0),
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "enabled": True,
+            "agent": agent,
+            "ok": False,
+            "state": "timeout",
+            "detail": f"dispatch timed out after {exc.timeout}s",
+            "dispatch_id": dispatch_id,
+            "status_json": str(status),
+            "tail": str(tail),
+            "target": str(target),
+        }
+
+    status_payload: dict = {}
+    if status.exists():
+        try:
+            parsed = json.loads(status.read_text(encoding="utf-8", errors="replace"))
+            if isinstance(parsed, dict):
+                status_payload = parsed
+        except json.JSONDecodeError:
+            status_payload = {}
+    target_text = target.read_text(encoding="utf-8", errors="replace") if target.exists() else ""
+    terminal_marker = status_payload.get("terminal_marker")
+    marker_ok = bool(terminal_marker and terminal_marker.get("kind") in {"COMPLETE", "RESULT", "READY"})
+    target_ok = target_text.strip() == expected
+    ok = proc.returncode == 0 and target_ok and marker_ok
+    state = status_payload.get("state") or ("complete" if proc.returncode == 0 else "failed")
+    reason = status_payload.get("reason") or first_line(proc.stderr) or first_line(proc.stdout)
+    return {
+        "enabled": True,
+        "agent": agent,
+        "ok": ok,
+        "state": state,
+        "detail": (
+            f"rc={proc.returncode} target_ok={target_ok} marker_ok={marker_ok}"
+            + (f" reason={reason}" if reason else "")
+        ),
+        "dispatch_id": dispatch_id,
+        "status_json": str(status),
+        "tail": str(tail),
+        "target": str(target),
     }
 
 
@@ -1572,7 +1696,15 @@ def check_wsl(repo: Path) -> dict:
     }
 
 
-def doctor(repo: Path, *, fleet: bool = False, fleet_dir: Path | None = None, fleet_probe: bool = False) -> dict:
+def doctor(
+    repo: Path,
+    *,
+    fleet: bool = False,
+    fleet_dir: Path | None = None,
+    fleet_probe: bool = False,
+    worker_write_probe: bool = False,
+    write_probe_agent: str = "grok-code",
+) -> dict:
     skill_root = SCRIPT_DIR.parent
     codex_desktop = app_exists("Codex", "com.openai.codex")
     codex_cli = version("codex", "--version")
@@ -1608,6 +1740,11 @@ def doctor(repo: Path, *, fleet: bool = False, fleet_dir: Path | None = None, fl
         },
         "opencode": version("opencode", "--version"),
         "grok": check_grok(),
+        "worker_write_probe": worker_write_file_probe(
+            repo,
+            agent=write_probe_agent,
+            enabled=worker_write_probe,
+        ),
         "acp": check_acp(),
         "project": git_state(repo),
         "worktrees": check_worktrees(repo),
@@ -1790,6 +1927,12 @@ def print_human(payload: dict) -> None:
         status_line(payload["grok"].get("present"), "Grok Build binary", payload["grok"].get("version")),
         status_line(payload["grok"].get("headless_flags"), "Grok headless flags", None),
     ]
+    write_probe = payload.get("worker_write_probe") or {}
+    lines.append(status_line(
+        write_probe.get("ok"),
+        f"{write_probe.get('agent', 'worker')} write-file e2e probe",
+        write_probe.get("detail"),
+    ))
     if goalflight_compat.is_windows():
         platform_info = payload.get("platform") or {}
         wsl_info = payload.get("wsl") or {}
@@ -2020,6 +2163,16 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Refresh auth probes when used with --fleet",
     )
+    parser.add_argument(
+        "--worker-write-probe",
+        action="store_true",
+        help="Run a real worker dispatch that writes a file and emits a terminal marker",
+    )
+    parser.add_argument(
+        "--write-probe-agent",
+        default="grok-code",
+        help="Agent for --worker-write-probe (default: grok-code)",
+    )
     args = parser.parse_args(argv)
     if args.fleet_reconcile_stale and goalflight_fleet is not None:
         import goalflight_fleet_stale as fleet_stale
@@ -2033,6 +2186,8 @@ def main(argv: list[str] | None = None) -> int:
         fleet=args.fleet,
         fleet_dir=fleet_dir,
         fleet_probe=args.fleet_probe,
+        worker_write_probe=args.worker_write_probe,
+        write_probe_agent=args.write_probe_agent,
     )
     if args.fleet_reconcile_stale:
         payload["fleet_reconcile"] = _fleet_reconcile_summary(release_stale=True)
