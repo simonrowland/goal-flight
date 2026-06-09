@@ -8,7 +8,7 @@ opencode_backend_unhealthy_log() {
     return 0
   fi
 
-  if grep -Eiq 'ConnectionRefusedError|Connection refused|ECONNREFUSED|ECONNRESET|EHOSTUNREACH|ENETUNREACH|Network is unreachable|Remote end closed connection|urlopen error.*(timed out|refused|reset|unreachable)|TimeoutError|timed out waiting for assistant reply|did not become healthy' "$file"; then
+  if grep -Eiq 'ConnectionRefusedError|Connection refused|Connection closed|ECONNREFUSED|ECONNRESET|EHOSTUNREACH|ENETUNREACH|Network is unreachable|Remote end closed connection|urlopen error.*(timed out|refused|reset|unreachable)|TimeoutError|timed out waiting for assistant reply|did not become healthy' "$file"; then
     return 0
   fi
 

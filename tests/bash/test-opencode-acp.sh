@@ -8,6 +8,9 @@ REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 ACP_PY="${GOALFLIGHT_ACP_PYTHON:-$HOME/.goal-flight/venvs/acp-0.10/bin/python}"
 PROBE="$REPO_ROOT/tests/python/probe_real_worker.py"
 
+# shellcheck source=tests/bash/lib-opencode-backend.sh
+source "$REPO_ROOT/tests/bash/lib-opencode-backend.sh"
+
 if ! command -v opencode >/dev/null 2>&1; then
   echo "SKIP  tests/bash/test-opencode-acp.sh (opencode not installed)"
   exit 0
@@ -42,6 +45,11 @@ out=""
 while [ "$attempt" -le "$max_attempts" ]; do
   out="$("$ACP_PY" "$PROBE" --cwd "$PROBE_DIR" --timeout 300 opencode acp 2>&1)" || {
     if [ "$attempt" -eq "$max_attempts" ]; then
+      BACKEND_LOG="/tmp/opencode-acp-backend-$$.txt"
+      printf '%s\n' "$out" > "$BACKEND_LOG"
+      if opencode_backend_unhealthy_log "$BACKEND_LOG"; then
+        opencode_backend_skip "tests/bash/test-opencode-acp.sh"
+      fi
       echo "FAIL  tests/bash/test-opencode-acp.sh"
       echo "$out" | sed 's/^/      /'
       exit 1
@@ -57,6 +65,11 @@ while [ "$attempt" -le "$max_attempts" ]; do
   fi
 
   if [ "$attempt" -eq "$max_attempts" ]; then
+    BACKEND_LOG="/tmp/opencode-acp-backend-$$.txt"
+    printf '%s\n' "$out" > "$BACKEND_LOG"
+    if opencode_backend_unhealthy_log "$BACKEND_LOG"; then
+      opencode_backend_skip "tests/bash/test-opencode-acp.sh"
+    fi
     if ! printf '%s\n' "$out" | grep -q "stop_reason='end_turn'"; then
       echo "FAIL  tests/bash/test-opencode-acp.sh (no end_turn)"
     else
