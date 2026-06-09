@@ -4,6 +4,32 @@ Notable changes to the goal-flight Claude Code skill. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are
 incremented when meaningful skill behaviour changes.
 
+## [1.0.5] — 2026-06-09
+
+Post-1.0.4 polish from a package audit + a cross-slice consolidation review.
+
+### Fixed
+
+- **Worker-liveness consolidation.** `done_code()` and the dispatch ledger no longer classify
+  `watcher_stopped` (a terminal-marker worker whose watcher exited) as terminal before a liveness check —
+  they reconcile pid+start-time identity, so `--wait`/`--done` report a still-alive worker as live (needs
+  reattach) rather than done; a marker + dead worker stays terminal. `--wait` evaluates each row's liveness
+  once per poll.
+- **Status reads are pure.** `goalflight_status.py` no longer persists capacity pruning on a status read or
+  `--wait` poll (`capacity.json` is shared across sibling projects).
+- **claude-acp stopgap patch hardened.** Named the Claude Code 2.1.169 TUI timing constants, restricted the
+  assistant-line screen extraction, and added Rust unit tests (upstream PR `moabualruz/claude-code-cli-acp#1`;
+  vendored patch re-generated).
+- **Fleet cleanup-before-fetch coverage.** Direct regression test that a nonzero `git_prune_claude_refs`
+  aborts the dispatch before fetch with redacted output.
+
+### Docs
+
+- Narrowed the OpenCode dispatch-routing claim (OpenCode is not a `goalflight_dispatch.py` preset — it routes
+  via host helpers / raw `-- <cmd>` passthrough). Added SKILL navigation + command-doc entries for `--wait`,
+  the doctor write-probe + claude-acp stopgap probe + installer, capacity adaptive walk-back, and
+  `goalflight_cleanup_dispatch_refs`.
+
 ## [1.0.4] — 2026-06-09
 
 Dispatch-reliability + worker-engine release on top of the 1.0.3 dispatch-death fix.
