@@ -29,6 +29,7 @@ import goalflight_ledger
 # re-classifying would misread a live worker as unknown.
 _LIVE_CLASS = "expected_live"
 _AMBIGUOUS_CLASS = {"unknown_no_pid", "identity_indeterminate", "unknown"}
+_LIVENESS_RECHECK_CLASSES = {"idle_timeout", "watcher_stopped"}
 
 
 def _has_recorded_worker_identity(record: dict) -> bool:
@@ -43,7 +44,13 @@ def _has_recorded_worker_identity(record: dict) -> bool:
     )
 
 
-def _identity_record_for_idle_timeout(record: dict) -> dict | None:
+def _needs_liveness_recheck(record: dict) -> bool:
+    cls = record.get("classification")
+    state = record.get("state")
+    return cls in _LIVENESS_RECHECK_CLASSES or state in _LIVENESS_RECHECK_CLASSES
+
+
+def _identity_record_for_liveness_recheck(record: dict) -> dict | None:
     if not record.get("worker_pid"):
         return None
     if _has_recorded_worker_identity(record):
@@ -57,10 +64,10 @@ def _identity_record_for_idle_timeout(record: dict) -> dict | None:
     return None
 
 
-def _idle_timeout_worker_alive(record: dict) -> bool:
-    if (record.get("classification") or record.get("state")) != "idle_timeout":
+def _rechecked_worker_alive(record: dict) -> bool:
+    if not _needs_liveness_recheck(record):
         return False
-    identity_record = _identity_record_for_idle_timeout(record)
+    identity_record = _identity_record_for_liveness_recheck(record)
     if identity_record is None:
         return False
     ok, _reason = goalflight_ledger.identity_matches(identity_record)
@@ -91,8 +98,7 @@ def this_project_root() -> str | None:
 def status_payload() -> dict:
     with goalflight_capacity.StateLock():
         capacity_state = goalflight_capacity.load_state()
-        goalflight_capacity.prune_state(capacity_state)
-        goalflight_capacity.save_state(capacity_state)
+    goalflight_capacity.prune_state(capacity_state)
     rate_pressure = goalflight_capacity.current_rate_pressure(argparse.Namespace())
     return {
         "schema": "goalflight.status.aggregate.v1",
@@ -130,8 +136,8 @@ def scope_payload(payload: dict, project_root: str | None) -> dict:
 def done_code(record: dict) -> int:
     """0 = terminal/done, 1 = live, 2 = ambiguous/unknown."""
     cls = record.get("classification") or record.get("state") or "unknown"
-    if cls == "idle_timeout" and _idle_timeout_worker_alive(record):
-        return 1
+    if _needs_liveness_recheck(record):
+        return 1 if _rechecked_worker_alive(record) else 0
     if cls == _LIVE_CLASS:
         return 1
     if cls in _AMBIGUOUS_CLASS or cls.startswith("stale_"):
@@ -148,7 +154,7 @@ def find_record(payload: dict, dispatch_id: str) -> dict | None:
 
 def _signal(record: dict) -> str:
     pid = record.get("worker_pid")
-    if _idle_timeout_worker_alive(record):
+    if _rechecked_worker_alive(record):
         return f"pid{pid}; {_reattach_hint(record)}"
     if record.get("worker_still_alive") and pid:
         return f"pid{pid}"
@@ -176,10 +182,10 @@ def _parse_wait_ids(values: list[str] | None) -> list[str]:
     return ids
 
 
-def _terminal_state(record: dict | None, *, timed_out: bool = False) -> str:
+def _terminal_state(record: dict | None, *, code: int, timed_out: bool = False) -> str:
     if record is None:
         return "timeout" if timed_out else "unknown"
-    if done_code(record) != 0:
+    if code != 0:
         return "timeout" if timed_out else (record.get("classification") or "live")
     cls = record.get("classification") or record.get("state") or "unknown"
     if cls == "idle_timeout":
@@ -192,12 +198,13 @@ def _wait_snapshot(payload: dict, wait_ids: list[str], *, timed_out: bool = Fals
     for dispatch_id in wait_ids:
         record = find_record(payload, dispatch_id)
         code = 2 if record is None else done_code(record)
+        terminal = code == 0
         rows.append(
             {
                 "dispatch_id": dispatch_id,
                 "done_code": code,
-                "terminal": code == 0,
-                "state": _terminal_state(record, timed_out=timed_out and code != 0),
+                "terminal": terminal,
+                "state": _terminal_state(record, code=code, timed_out=timed_out and not terminal),
                 "status_path": None if record is None else record.get("status_path"),
             }
         )

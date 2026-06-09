@@ -38,6 +38,8 @@ user responds, append steering or continue dispatch per `protocols/worker-marker
 provider-level rate-limit pressure. Be **silent on clean** — if
 `providers_under_pressure` is empty, do not emit a marker or "nothing
 to report" line. The orchestrator has the routing table; default is fine.
+`goalflight_capacity.py status` surfaces the same adaptive walkback warning for
+operator visibility without mutating `capacity.json`.
 
 If `providers_under_pressure` is non-empty:
 - Emit a single `STATUS: rate-pressure provider=<p> count=<n>` line.
@@ -111,6 +113,10 @@ already record the worker.
 surface a compact user status update at least every 15 minutes unless context
 is tight (file-only row in RESUME-NOTES then). Background the poll; do not
 block on raw logs.
+
+For multi-dispatch joins, use
+`python3 <skill-root>/scripts/goalflight_status.py --wait id1,id2 --wait-timeout <s>`.
+Exit 0 means every requested dispatch is terminal; exit 1 means pending/timeout.
 
 7. Completion:
 

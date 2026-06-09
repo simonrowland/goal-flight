@@ -38,6 +38,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 import goalflight_capacity as cap  # noqa: E402
+import goalflight_status as status  # noqa: E402
 
 
 def _kill_if_alive(pid: int | None) -> None:
@@ -262,6 +263,40 @@ def case_status_still_reclaims_dead_lease_in_view(state_dir: Path) -> None:
     )
 
 
+def case_aggregate_status_payload_does_not_persist_prune(state_dir: Path) -> None:
+    """goalflight_status.status_payload is a read path; --wait polls it often."""
+    lease = _past_ttl_lease(worker_pid=_dead_pid(), controller_pid=_dead_pid())
+    seed = {
+        "schema": cap.SCHEMA,
+        "machine_id": cap.machine_id(),
+        "leases": {lease["lease_id"]: lease},
+        "cooldowns": {},
+    }
+    cap.save_state(seed)
+    before = cap.state_path().read_text()
+
+    orig_dispatch_payload = status.goalflight_ledger.status_payload
+    orig_rate_pressure = status.goalflight_capacity.current_rate_pressure
+    try:
+        status.goalflight_ledger.status_payload = lambda: {
+            "schema": "goalflight.dispatch.v1",
+            "records": [],
+            "surplus_processes": [],
+        }
+        status.goalflight_capacity.current_rate_pressure = lambda args=None: None
+        payload = status.status_payload()
+    finally:
+        status.goalflight_ledger.status_payload = orig_dispatch_payload
+        status.goalflight_capacity.current_rate_pressure = orig_rate_pressure
+
+    after = cap.state_path().read_text()
+    assert after == before, "aggregate status_payload persisted a prune to capacity.json"
+    view_lease = payload["capacity_state"]["leases"].get(lease["lease_id"])
+    assert view_lease is not None and view_lease["state"] == "expired", (
+        "aggregate status_payload should still return the pruned display view"
+    )
+
+
 def case_acquire_atomic_gate_still_blocks_over_cap(state_dir: Path) -> None:
     """cmd_acquire's check-then-act under StateLock still enforces the cap.
 
@@ -441,6 +476,7 @@ def main() -> None:
         try:
             case_status_is_non_mutating_for_live_lease(state_dir)
             case_status_still_reclaims_dead_lease_in_view(state_dir)
+            case_aggregate_status_payload_does_not_persist_prune(state_dir)
             case_acquire_atomic_gate_still_blocks_over_cap(state_dir)
             case_adaptive_rate_pressure_reduces_codex_effective_cap(state_dir)
             case_adaptive_rate_pressure_status_surfaces_warning(state_dir)

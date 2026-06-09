@@ -57,3 +57,7 @@ Then summarize:
 - first safe command to run next
 
 Do not reconstruct state from raw worker logs when status JSON exists.
+
+If git fetch/reconcile is blocked by stale local dispatch refs, inspect with
+`python3 <skill-root>/scripts/goalflight_cleanup_dispatch_refs.py --dry-run --json`
+before deleting refs.

@@ -177,7 +177,6 @@ def classify(record: dict) -> str:
         "blocked_auth",
         "worker_dead",
         "idle_timeout",
-        "watcher_stopped",
         "orphaned",
         "inconclusive_timeout",
         "inconclusive_no_final",
@@ -187,6 +186,10 @@ def classify(record: dict) -> str:
     ok, reason = identity_matches(record)
     if ok:
         return "expected_live"
+    if state == "watcher_stopped":
+        if reason == "identity_indeterminate":
+            return "identity_indeterminate"
+        return "watcher_stopped"
     if reason == "no_pid":
         return "unknown_no_pid"
     if reason == "identity_indeterminate":

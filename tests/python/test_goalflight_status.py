@@ -238,6 +238,49 @@ def test_done_code() -> None:
     finally:
         S.goalflight_ledger.read_records = orig_read_records
         S.goalflight_ledger.identity_matches = orig_identity_matches
+    watcher_summary = {
+        "dispatch_id": "watcher-live",
+        "state": "watcher_stopped",
+        "classification": "watcher_stopped",
+        "agent": "codex",
+        "worker_pid": 444,
+        "worker_still_alive": True,
+    }
+    watcher_raw = {
+        **watcher_summary,
+        "worker_identity": {"lstart": "Tue Jun  9 09:00:00 2026", "comm": "python3"},
+    }
+    orig_read_records = S.goalflight_ledger.read_records
+    orig_identity_matches = S.goalflight_ledger.identity_matches
+    try:
+        captured = []
+
+        def identity_live(record: dict) -> tuple[bool, str]:
+            captured.append(record)
+            return True, "live"
+
+        S.goalflight_ledger.read_records = lambda: [watcher_raw]
+        S.goalflight_ledger.identity_matches = identity_live
+        check("watcher_stopped live marker -> 1", S.done_code(watcher_summary) == 1)
+        check("watcher_stopped liveness used raw identity", captured and captured[-1] is watcher_raw)
+        check(
+            "ledger watcher_stopped live classified expected_live",
+            S.goalflight_ledger.classify(watcher_raw) == "expected_live",
+        )
+
+        S.goalflight_ledger.identity_matches = lambda record: (False, "dead")
+        check("watcher_stopped dead marker -> 0", S.done_code(watcher_summary) == 0)
+        check(
+            "watcher_stopped expected_live stale rechecks to 0",
+            S.done_code({**watcher_summary, "classification": "expected_live"}) == 0,
+        )
+        check(
+            "ledger watcher_stopped dead classified terminal",
+            S.goalflight_ledger.classify(watcher_raw) == "watcher_stopped",
+        )
+    finally:
+        S.goalflight_ledger.read_records = orig_read_records
+        S.goalflight_ledger.identity_matches = orig_identity_matches
     check("stale_* -> 2", S.done_code({"classification": "stale_pid_reuse"}) == 2)
     check("missing classification -> 2 (do not claim done)", S.done_code({}) == 2)
 
@@ -358,6 +401,36 @@ def test_wait_cli() -> None:
         S.status_payload, S.this_project_root = orig_payload, orig_root
 
 
+def test_wait_snapshot_uses_single_liveness_result() -> None:
+    payload = sample_payload()
+    payload["dispatch"]["records"].append(
+        {
+            "dispatch_id": "timeout-flip",
+            "project_root": "/repo/A",
+            "classification": "idle_timeout",
+            "agent": "codex",
+            "worker_pid": 333,
+            "worker_still_alive": True,
+            "worker_identity": {"lstart": "Tue Jun  9 09:00:00 2026", "comm": "python3"},
+        }
+    )
+    orig_identity_matches = S.goalflight_ledger.identity_matches
+    calls: list[dict] = []
+
+    def identity_flips_if_called_twice(record: dict) -> tuple[bool, str]:
+        calls.append(record)
+        return (False, "dead") if len(calls) == 1 else (True, "live")
+
+    try:
+        S.goalflight_ledger.identity_matches = identity_flips_if_called_twice
+        rows = S._wait_snapshot(payload, ["timeout-flip"])
+        check("--wait snapshot evaluates timeout liveness once", len(calls) == 1)
+        check("--wait snapshot keeps terminal decision stable", rows[0]["terminal"] is True)
+        check("--wait snapshot keeps terminal state stable", rows[0]["state"] == "worker_dead")
+    finally:
+        S.goalflight_ledger.identity_matches = orig_identity_matches
+
+
 def main() -> int:
     test_scope()
     test_worktree_scope()
@@ -367,6 +440,7 @@ def main() -> int:
     test_rate_pressure_warning_rendered()
     test_cli()
     test_wait_cli()
+    test_wait_snapshot_uses_single_liveness_result()
     if _FAILS:
         print(f"\n{len(_FAILS)} FAILED: {_FAILS}")
         return 1

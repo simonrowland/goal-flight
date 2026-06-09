@@ -76,6 +76,8 @@ package repository; for normal target projects it is skipped as INFO.
     compatibility examples are used.
 - Check ACP worker adapters for presence/PATH only: `codex-acp`,
   `cursor-agent`, `claude-code-cli-acp`, `grok agent stdio`.
+- Check `claude_acp_stopgap`; when the stopgap is required but absent, use
+  `scripts/install_claude_acp_patch.sh` and re-run doctor.
 - Check project git state.
 - Check project Goal Flight readiness:
   - `docs-private/env-caveats.md`
