@@ -513,27 +513,35 @@ def _acp_model_args(agent: str, args: list[str], model: str) -> list[str]:
     The selector must sit in the FLAGS region, not after a terminal positional
     (grok's `stdio`), and the flag itself differs by agent, so a blind append is
     wrong. Verified forms: codex uses the global config override `-c model=<id>`;
-    grok needs `--model <id>` BEFORE its `stdio` terminal. claude/cursor/opencode
-    take `--model <id>` ahead of their subcommand (cursor/opencode arg-position is
+    grok needs `--model <id>` BEFORE its `stdio` terminal. cursor/opencode take
+    `--model <id>` ahead of their subcommand (cursor/opencode arg-position is
     best-effort — see protocols/dispatch-routing.md). The id format is the agent's
-    own (grok-composer-2.5-fast, haiku, anthropic/claude-haiku, ...).
+    own (grok-composer-2.5-fast, anthropic/claude-haiku, ...).
+
+    claude-code-cli-acp is the exception: it enters ACP stdio server mode only
+    with no argv flags. Passing Claude CLI flags like `--model` switches it away
+    from ACP handshake handling, so model selection cannot happen here.
     """
     a = agent.strip().lower()
     if a in ("codex", "codex-acp"):
         return ["-c", f"model={model}", *args]
     if a in ("grok", "grok-acp") and args and args[-1] == "stdio":
         return [*args[:-1], "--model", model, "stdio"]
+    if a in ("claude", "claude-acp"):
+        return args
     return ["--model", model, *args]
 
 
+def _uses_session_model(agent: str) -> bool:
+    return agent.strip().lower() in {"claude", "claude-acp"}
+
+
 # Quality-by-default: when no model is selected, dispatch the agent's strongest
-# model where it is UNAMBIGUOUS and above the agent's own default. Today only
-# claude qualifies -- it defaults to sonnet, opus is its clear strongest. codex
-# already defaults strong (user config), grok's two models are task-dependent (it
-# keeps grok-build), and cursor/opencode "strongest" is ambiguous; all of those
-# keep their own default. Override per dispatch with --model (e.g. a fast model
-# for speed). opus is a stable alias, so this map needs no version maintenance.
-_DEFAULT_STRONG_MODEL = {"claude": "opus", "claude-acp": "opus"}
+# model where it is UNAMBIGUOUS and above the agent's own default. codex already
+# defaults strong (user config), grok's two models are task-dependent (it keeps
+# grok-build), cursor/opencode "strongest" is ambiguous, and claude-code-cli-acp
+# must be launched with no argv flags to stay in ACP server mode.
+_DEFAULT_STRONG_MODEL: dict[str, str] = {}
 
 
 def agent_command(agent: str, model: str | None = None) -> tuple[str, list[str]]:
@@ -774,6 +782,7 @@ async def spawn_and_handshake_with_retry(
     permission_user_timeout_s: float | None = None,
     permission_policy: Callable[[Any, list[Any], str | None], str] | None = None,
     os_sandbox: str = OS_SANDBOX_OFF,
+    session_model: str | None = None,
     env: dict[str, str] | None = None,
 ) -> tuple[asyncio.subprocess.Process, AcpConnection]:
     """Spawn the worker and run the ACP handshake, retrying once on AcpError.
@@ -820,6 +829,16 @@ async def spawn_and_handshake_with_retry(
         try:
             await conn.initialize(timeout=handshake_timeout)
             await conn.new_session(cwd, timeout=handshake_timeout)
+            if session_model and _uses_session_model(agent):
+                try:
+                    await conn.set_session_model(str(session_model), timeout=handshake_timeout)
+                except Exception as model_error:
+                    print(
+                        "goalflight_acp_run: WARNING: "
+                        f"session model {session_model!r} for {agent} was not applied: "
+                        f"{type(model_error).__name__}: {model_error}",
+                        file=sys.stderr,
+                    )
             return proc, conn
         except AcpError as e:
             last_err = e
@@ -1889,6 +1908,7 @@ async def _run_acp_dispatch_impl(
                 permission_user_timeout_s=getattr(cfg, "permission_user_timeout_s", None),
                 permission_policy=permission_policy,
                 os_sandbox=spawn_os_sandbox_profile,
+                session_model=getattr(cfg, "model", None),
                 env=spawn_env,
             )
         await update_status(os_sandbox=getattr(conn, "os_sandbox_metadata", None) or payload["os_sandbox"])

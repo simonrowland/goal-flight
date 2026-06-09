@@ -1632,6 +1632,22 @@ class GoalflightAcpConnection:
     async def session_new(self, cwd: str, timeout: float = 60.0) -> str:
         return await self.new_session(cwd, timeout=timeout)
 
+    async def set_session_model(self, model: str, timeout: float = 60.0) -> Any:
+        require_acp_sdk()
+        if not self.acp_session_id:
+            raise AcpError("set_session_model called before new_session")
+        try:
+            return await asyncio.wait_for(
+                self.conn.set_session_model(model_id=model, session_id=self.acp_session_id),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError as e:
+            raise AcpError(
+                f"session/set_model: no response within {timeout:.0f}s -- worker likely wedged in handshake"
+            ) from e
+        except Exception as e:
+            raise AcpError(f"session/set_model failed: {e}") from e
+
     async def prompt(self, text: str) -> Any:
         require_acp_sdk()
         if not self.acp_session_id:

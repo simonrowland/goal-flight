@@ -6,6 +6,7 @@ agents without a known --model flag are not touched.
 from __future__ import annotations
 
 import argparse
+import asyncio
 from pathlib import Path
 import sys
 
@@ -23,6 +24,53 @@ MODEL = "grok-composer-2.5-fast"
 RESEARCH_MODEL = "grok-composer-2.5-fast"
 
 
+class _FakeProc:
+    pass
+
+
+class _FakeConn:
+    def __init__(self, *, fail_model: bool = False) -> None:
+        self.proc = _FakeProc()
+        self.fail_model = fail_model
+        self.calls: list[tuple] = []
+
+    async def initialize(self, *, timeout: float) -> None:
+        self.calls.append(("initialize", timeout))
+
+    async def new_session(self, cwd: str, *, timeout: float) -> str:
+        self.calls.append(("new_session", cwd, timeout))
+        return "session-1"
+
+    async def set_session_model(self, model: str, *, timeout: float) -> None:
+        self.calls.append(("set_session_model", model, timeout))
+        if self.fail_model:
+            raise RuntimeError("model rejected")
+
+
+async def _handshake_calls(agent: str, model: str | None, *, fail_model: bool = False) -> list[tuple]:
+    original_spawn = acp.spawn_acp_connection
+    fake_conn = _FakeConn(fail_model=fail_model)
+
+    async def fake_spawn(*_args, **_kwargs):
+        return fake_conn
+
+    acp.spawn_acp_connection = fake_spawn
+    try:
+        await acp.spawn_and_handshake_with_retry(
+            "agent-bin",
+            [],
+            agent=agent,
+            session_id="session-test",
+            cwd="/tmp/x",
+            attempts=1,
+            handshake_timeout=1.0,
+            session_model=model,
+        )
+    finally:
+        acp.spawn_acp_connection = original_spawn
+    return fake_conn.calls
+
+
 def case_agent_command_per_agent_placement() -> None:
     # grok ACP: --model must sit BEFORE the `stdio` terminal (verified form).
     _, args = acp.agent_command("grok", model=MODEL)
@@ -30,26 +78,41 @@ def case_agent_command_per_agent_placement() -> None:
     # codex: global `-c model=<id>` override (NOT --model).
     _, args = acp.agent_command("codex", model=MODEL)
     assert args[:2] == ["-c", f"model={MODEL}"] and "--model" not in args, args
-    # claude/cursor/opencode: --model ahead of the (sub)command.
-    for agent in ("claude", "cursor", "opencode"):
+    # cursor/opencode: --model ahead of the (sub)command.
+    for agent in ("cursor", "opencode"):
         _, args = acp.agent_command(agent, model=MODEL)
         assert args[:2] == ["--model", MODEL], (agent, args)
+    # claude-code-cli-acp enters ACP server mode only with no argv flags.
+    for agent in ("claude", "claude-acp"):
+        _, args = acp.agent_command(agent, model=MODEL)
+        assert args == [], (agent, args)
 
 
 def case_agent_command_defaults() -> None:
-    # No model -> most agents keep their own default (no selector injected),
-    # EXCEPT claude which defaults to its strongest (opus) for worker quality.
-    for agent in ("grok", "codex", "cursor", "opencode"):
+    # No model -> agents keep their own default (no selector injected).
+    for agent in ("grok", "codex", "cursor", "opencode", "claude", "claude-acp"):
         base = acp.agent_command(agent)
         assert acp.agent_command(agent, model=None) == base, agent
         flat = " ".join(base[1])
         assert "--model" not in flat and "model=" not in flat, (agent, base)
-    for agent in ("claude", "claude-acp"):
-        _, args = acp.agent_command(agent)
-        assert args[:2] == ["--model", "opus"], (agent, args)
-    # explicit --model overrides the opus default (e.g. a fast model for speed).
+    # explicit --model is not argv-passed for claude ACP; the adapter would stop
+    # speaking ACP on stdio.
     _, args = acp.agent_command("claude", model="haiku")
-    assert args[:2] == ["--model", "haiku"], args
+    assert args == [], args
+
+
+def case_claude_model_applies_after_session_new() -> None:
+    for agent in ("claude", "claude-acp"):
+        calls = asyncio.run(_handshake_calls(agent, "haiku"))
+        assert calls[:2] == [("initialize", 1.0), ("new_session", "/tmp/x", 1.0)], calls
+        assert ("set_session_model", "haiku", 1.0) in calls, (agent, calls)
+
+    for agent in ("grok", "codex", "cursor", "opencode"):
+        calls = asyncio.run(_handshake_calls(agent, "haiku"))
+        assert all(call[0] != "set_session_model" for call in calls), (agent, calls)
+
+    calls = asyncio.run(_handshake_calls("claude", "haiku", fail_model=True))
+    assert ("set_session_model", "haiku", 1.0) in calls, calls
 
 
 def _build(agent, model, *, raw=None):
@@ -97,6 +160,7 @@ def case_retired_bare_grok_agent_label() -> None:
 def main() -> None:
     case_agent_command_per_agent_placement()
     case_agent_command_defaults()
+    case_claude_model_applies_after_session_new()
     case_build_worker_injects_model()
     case_retired_bare_grok_agent_label()
     print("OK: model passthrough tests pass")
