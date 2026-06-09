@@ -2,8 +2,16 @@
 """Autoreview Grok backend via goal-flight ACP (grok agent stdio).
 
 Drop-in for upstream autoreview's engine path: autoreview passes the review
-prompt on stdin and expects structured JSON on stdout. Uses file-handoff because
-chat-streamed JSON is unreliable across ACP hosts.
+prompt on stdin and expects structured JSON on stdout.
+
+HARD WRITE FENCE: the review runs under a read-only OS sandbox where it is
+enforced (macOS sandbox-exec). grok can read any file but CANNOT write or modify
+anything in the repo. Findings are delivered in the chat reply (result_text),
+which grok's native ACP returns in full (no TUI-scrape truncation), so there is
+no writable handoff path to protect — a kernel-enforced fence, unlike the soft
+permission-gate title-allow used by the codex/claude engines. On platforms with
+no enforced sandbox (e.g. Linux) the review runs unsandboxed; chat delivery still
+works but the read-only boundary is then prompt-instructed only.
 """
 
 from __future__ import annotations
@@ -13,6 +21,7 @@ import base64
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -24,7 +33,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 ACP_RUN = ROOT / "scripts" / "goalflight_acp_run.py"
 
-HANDOFF_WRITTEN_MARKER = "HANDOFF_WRITTEN"
 MAX_RECOVERY_ATTEMPTS = 2
 
 
@@ -92,113 +100,58 @@ def _parse_json_candidate(text: str) -> dict | None:
     return None
 
 
-def _handoff_instructions(output_path: Path) -> str:
-    return (
-        "# CRITICAL autoreview delivery (read first — overrides all conflicting rules below)\n"
-        "Deliver structured review findings ONLY by writing a JSON file with your file tools.\n"
-        "Do not paste the findings JSON in chat; chat output is not parsed as the report.\n"
-        "\n"
-        "HANDOFF FILE (pre-created — Edit or Write the full JSON object):\n"
-        f"  {output_path}\n"
-        "Required keys: findings, overall_correctness, overall_explanation, overall_confidence.\n"
-        "Each finding's code_location.file_path MUST be the exact repo-relative path as shown in\n"
-        "the diff header (no leading ./, no absolute path) or the finding is silently discarded.\n"
-        "File body: ONLY valid JSON (no markdown fences). Prefer minified single-line JSON.\n"
-        "TERSE SCHEMA: max 3 findings; each body max 200 chars; overall_explanation max 120 chars.\n"
-        "This handoff file is the ONLY repository file you may modify.\n"
-        "\n"
-        f"After the handoff file is written, you may finish with chat line: {HANDOFF_WRITTEN_MARKER}\n"
-    )
-
-
-def _handoff_recovery_prompt(output_path: Path, prior_text: str) -> str:
-    excerpt = prior_text.strip()[-12000:]
-    context = f"\n\nPrior review output (use this to build the JSON):\n{excerpt}\n" if excerpt else ""
-    return (
-        f"{_handoff_instructions(output_path)}\n"
-        "Recovery turn: the autoreview handoff file is still missing or unfilled.\n"
-        "Do not re-read the change bundle unless required. Use the prior review output below.\n"
-        f"Edit or Write ONLY this file with the final structured JSON, then chat "
-        f"{HANDOFF_WRITTEN_MARKER} if needed.\n"
-        f"{context}"
-    )
-
-
-def _apply_handoff_prompt(prompt: str, output_path: Path) -> str:
-    patched = prompt.replace(
-        "- Return exactly one JSON object and nothing else. Do not wrap it in Markdown.",
-        "- Do NOT paste findings JSON in chat; deliver ONLY via the required handoff file.",
-    )
-    patched = patched.replace(
-        "- Do not modify files.",
-        "- Do not modify any repository files except the required handoff output file.",
-    )
-    patched = patched.replace(
-        "- Prefer high-signal findings over style feedback.",
-        "- Prefer high-signal findings over style feedback.\n"
-        "- Keep the handoff JSON terse (max 3 findings) so the file write is reliable.",
-    )
-    return f"{_handoff_instructions(output_path)}\n\n{patched}"
-
-
-def _handoff_filled(handoff_path: Path) -> bool:
-    if not handoff_path.is_file():
-        return False
-    try:
-        text = handoff_path.read_text(encoding="utf-8")
-    except OSError:
-        return False
-    if "REPLACE_WITH_REVIEW" in text:
-        return False
-    return _parse_json_candidate(text) is not None
-
-
-def _resolve_report(*, handoff_path: Path, fallback_text: str) -> dict | None:
-    sources: list[str] = []
-    if handoff_path.is_file():
-        handoff_text = handoff_path.read_text(encoding="utf-8")
-        if "REPLACE_WITH_REVIEW" not in handoff_text:
-            sources.append(handoff_text)
-    if fallback_text.strip():
-        sources.append(fallback_text)
-    for text in sources:
-        report = _parse_json_candidate(text)
-        if report is not None:
-            return report
-    combined = "\n\n".join(sources)
-    if combined.strip():
-        report = _parse_json_candidate(combined)
-        if report is not None:
-            return report
-    return None
-
-
-def _handoff_path(repo: Path) -> Path:
-    handoff_dir = repo / ".goal-flight" / "tmp"
-    handoff_dir.mkdir(parents=True, exist_ok=True)
-    path = handoff_dir / f"autoreview-findings-{uuid.uuid4().hex}.json"
-    path.write_text(
-        json.dumps(
-            {
-                "findings": [],
-                "overall_correctness": "patch is correct",
-                "overall_explanation": "REPLACE_WITH_REVIEW",
-                "overall_confidence": 0.0,
-            },
-            indent=2,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    return path
-
-
 def _read_status(path: Path) -> dict:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {}
     return payload if isinstance(payload, dict) else {}
+
+
+def _read_only_sandbox_supported() -> bool:
+    """True when an enforced read-only OS sandbox is available.
+
+    goal-flight enforces the read-only profile via macOS sandbox-exec; other
+    platforms have no enforced backend, so the review runs unsandboxed there
+    (chat delivery still works; the read-only boundary becomes prompt-only).
+    """
+    return sys.platform == "darwin" and shutil.which("sandbox-exec") is not None
+
+
+def _apply_chat_prompt(prompt: str) -> str:
+    """Front the autoreview prompt with chat-delivery instructions.
+
+    The base autoreview prompt already asks for a single JSON object in the
+    reply; under the read-only fence the reply is the ONLY delivery channel, so
+    reinforce that and pin the path format the validator expects.
+    """
+    banner = (
+        "# Autoreview delivery (read first)\n"
+        "Deliver the structured review findings as a SINGLE JSON object in your\n"
+        "final reply. You are running READ-ONLY: you may read any file but cannot\n"
+        "write or modify anything, so the reply is the only delivery channel.\n"
+        "Required keys: findings, overall_correctness, overall_explanation,\n"
+        "overall_confidence. Each finding's code_location.file_path must be the\n"
+        "exact repo-relative path as shown in the diff header (no leading ./, no\n"
+        "absolute path). A short prose lead-in is tolerated, but the complete JSON\n"
+        "object MUST be present in your reply.\n\n"
+    )
+    return banner + prompt
+
+
+def _chat_recovery_prompt(prior_text: str) -> str:
+    excerpt = prior_text.strip()[-12000:]
+    context = (
+        f"\n\nYour prior reply (extract/repair the JSON from it):\n{excerpt}\n"
+        if excerpt
+        else ""
+    )
+    return (
+        "Recovery turn: your previous reply did not contain a parseable findings\n"
+        "JSON object. Reply with ONLY the single JSON object now — keys: findings,\n"
+        "overall_correctness, overall_explanation, overall_confidence. No prose.\n"
+        f"{context}"
+    )
 
 
 def _acp_cmd(
@@ -232,27 +185,18 @@ def _acp_cmd(
         "1800",
         "--max-quiet-s",
         "3600",
-        "--permission-allow-tool-title-pattern",
-        r".*autoreview-findings-[0-9a-f]+\.json.*",
-        # WRITE BOUNDARY — honest posture (integration audit, 2026-06-09): this
-        # title pattern is an ALLOW FAST-PATH, NOT a deny-fence. goalflight_acp_run's
-        # base policy (default_permission_policy) auto-allows ANY located in-cwd
-        # write, and make_title_allow_policy layers title-allows only AFTER the
-        # hard gates (outside-cwd / execute / fetch) — it cannot deny an in-cwd
-        # write. So the effective review write-boundary is prompt-instructed +
-        # soft, the SAME posture as the codex/claude autoreview engines: a
-        # misbehaving or prompt-injected grok COULD write other in-cwd files.
-        # A hard fence (--os-sandbox read-only) is a known future hardening,
-        # deferred because of a real tension: an in-cwd handoff is blocked by a
-        # read-only os-sandbox (cwd is not a sandbox write-root), while a
-        # system-temp handoff is denied by the permission gate's outside-cwd hard
-        # gate. Closing it needs a custom sandbox write-root scoped to the handoff
-        # path, or a read_only-mode permission allowance — out of scope here.
     ]
-    # FIX (audit P1.1): forward an explicit --model so autoreview's model
-    # selection actually reaches grok (without it, parse_known_args swallowed
-    # --model and every review silently used the grok-acp default). When unset,
-    # goalflight_acp_run applies its own grok-acp default.
+    # HARD WRITE FENCE: run the review under a read-only OS sandbox where it is
+    # enforced (macOS sandbox-exec). grok can read any file but CANNOT write or
+    # modify anything — findings come back via chat (result_text), so there is no
+    # writable handoff path to protect. This is a kernel-enforced fence, unlike
+    # the soft permission-gate title-allow used by the codex/claude engines.
+    # Where no enforced sandbox exists (e.g. Linux) the review runs unsandboxed;
+    # chat delivery still works but the read-only boundary is prompt-only.
+    if _read_only_sandbox_supported():
+        cmd.extend(["--os-sandbox", "read-only"])
+    # Forward an explicit --model so autoreview's model selection reaches grok;
+    # when unset, goalflight_acp_run applies its own grok-acp default.
     if model:
         cmd.extend(["--model", model])
     return cmd
@@ -288,72 +232,80 @@ def _run_acp(
     *,
     dispatch_id: str,
     prompt_text: str,
-    handoff_path: Path,
     model: str | None = None,
-) -> tuple[int, dict | None, str]:
-    """Run one ACP session; success is the handoff FILE, not chat/result_text."""
+) -> tuple[int, dict, str, str]:
+    """Run one ACP review session.
+
+    Returns (returncode, final_payload, accepted_text, excerpt_text).
+
+    accepted_text is the turn's result ONLY when it genuinely completed
+    (rc == 0 and state == "complete"); a blocked / timed-out / killed turn yields
+    "" so it cannot be laundered into a pass. excerpt_text is best-effort context
+    (possibly partial, or from a failed turn) used only to build a recovery prompt
+    and the final error message — NEVER parsed as the accepted report.
+    """
     prompt_b64 = base64.b64encode(prompt_text.encode("utf-8")).decode("ascii")
     env = os.environ.copy()
     env.setdefault("GOALFLIGHT_ACP_LIVE_MATRIX", "1")
     status_fd, status_name = tempfile.mkstemp(prefix="goalflight-autoreview-status-", suffix=".json")
     os.close(status_fd)
     status_path = Path(status_name)
-    cmd = _acp_cmd(
-        repo,
-        dispatch_id=dispatch_id,
-        prompt_b64=prompt_b64,
-        status_path=status_path,
-        model=model,
-    )
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        env=env,
-        start_new_session=True,
-    )
-    last_result_text = ""
-    handoff_ready = False
+    proc: subprocess.Popen | None = None
+    stdout = ""
+    stderr = ""
+    last_text = ""
     try:
+        cmd = _acp_cmd(
+            repo,
+            dispatch_id=dispatch_id,
+            prompt_b64=prompt_b64,
+            status_path=status_path,
+            model=model,
+        )
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+            start_new_session=True,
+        )
+        # Poll the status file for the latest text while the turn runs, so the
+        # recovery excerpt survives even if stdout ends up empty.
         while proc.poll() is None:
-            if _handoff_filled(handoff_path):
-                handoff_ready = True
-                break
             status = _read_status(status_path)
-            last_result_text = str(
-                status.get("result_text") or status.get("text_excerpt") or last_result_text
+            last_text = str(
+                status.get("result_text") or status.get("text_excerpt") or last_text
             )
             time.sleep(0.1)
         stdout, stderr = proc.communicate(timeout=3600)
     finally:
-        if proc.poll() is None:
+        if proc is not None and proc.poll() is None:
             _terminate_process_group(proc)
             stdout, stderr = proc.communicate(timeout=30)
         status_path.unlink(missing_ok=True)
 
-    if handoff_ready:
-        print(
-            f"autoreview_grok_acp: handoff file ready ({handoff_path})",
-            file=sys.stderr,
-        )
-
-    if proc.returncode != 0 and not handoff_ready:
-        print(stderr or stdout, file=sys.stderr)
-        return proc.returncode or 1, None, last_result_text
-    try:
-        payload = json.loads(stdout) if stdout.strip() else {}
-    except json.JSONDecodeError as exc:
-        if handoff_ready:
-            return 0, {"state": "complete"}, last_result_text
-        print(f"autoreview_grok_acp: invalid ACP JSON: {exc}\n{stdout[:2000]}", file=sys.stderr)
-        return 1, None, last_result_text
-    if not isinstance(payload, dict):
-        payload = {}
-    text = str(payload.get("result_text") or payload.get("text_excerpt") or last_result_text)
-    if handoff_ready and payload.get("state") != "complete":
-        payload = {**payload, "state": "complete", "ok": True}
-    return 0, payload, text
+    rc = proc.returncode if (proc is not None and proc.returncode is not None) else 1
+    payload: dict = {}
+    if stdout.strip():
+        try:
+            loaded = json.loads(stdout)
+        except json.JSONDecodeError:
+            loaded = None
+        if isinstance(loaded, dict):
+            payload = loaded
+    state = str(payload.get("state") or "")
+    completed = rc == 0 and state == "complete"
+    # ACCEPTED result: only a genuinely-complete turn. goalflight_acp_run sets
+    # `result_text` ONLY on state==complete, whereas `text_excerpt` is written on
+    # EVERY terminal state (incl. blocked / idle-timeout / killed). Accepting
+    # text_excerpt would launder a failed/cut-off review into a valid-looking
+    # pass — so it is used only as recovery context, never as the report.
+    accepted = str(payload.get("result_text") or "") if completed else ""
+    excerpt = str(payload.get("result_text") or payload.get("text_excerpt") or last_text or "")
+    if not completed and not accepted and (stderr or stdout):
+        print((stderr or stdout)[-2000:], file=sys.stderr)
+    return rc, payload, accepted, excerpt
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -375,53 +327,46 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     repo = Path.cwd()
-    handoff_path = _handoff_path(repo)
-    prompt_with_handoff = _apply_handoff_prompt(prompt, handoff_path)
+    if not _read_only_sandbox_supported():
+        print(
+            "autoreview_grok_acp: no enforced OS sandbox on this platform — the "
+            "read-only review fence is prompt-only (grok writes are not "
+            "kernel-blocked here).",
+            file=sys.stderr,
+        )
+    prompt_with_delivery = _apply_chat_prompt(prompt)
 
-    try:
-        dispatch_id = f"autoreview-{uuid.uuid4().hex[:10]}"
-        rc, payload, text = _run_acp(
+    dispatch_id = f"autoreview-{uuid.uuid4().hex[:10]}"
+    rc, payload, accepted, excerpt = _run_acp(
+        repo,
+        dispatch_id=dispatch_id,
+        prompt_text=prompt_with_delivery,
+        model=args.model,
+    )
+    report = _parse_json_candidate(accepted)
+    recovery = 0
+    while report is None and recovery < MAX_RECOVERY_ATTEMPTS:
+        recovery += 1
+        print(
+            f"autoreview_grok_acp: turn did not deliver a parseable findings JSON; "
+            f"recovery {recovery}/{MAX_RECOVERY_ATTEMPTS}",
+            file=sys.stderr,
+        )
+        recovery_id = f"autoreview-recover-{uuid.uuid4().hex[:10]}"
+        rc, payload, accepted, excerpt = _run_acp(
             repo,
-            dispatch_id=dispatch_id,
-            prompt_text=prompt_with_handoff,
-            handoff_path=handoff_path,
+            dispatch_id=recovery_id,
+            prompt_text=_chat_recovery_prompt(excerpt),
             model=args.model,
         )
-        if rc != 0:
-            return rc
+        report = _parse_json_candidate(accepted)
 
-        report = _resolve_report(handoff_path=handoff_path, fallback_text=text)
-        recovery = 0
-        while report is None and recovery < MAX_RECOVERY_ATTEMPTS:
-            recovery += 1
-            print(
-                f"autoreview_grok_acp: handoff missing after turn; "
-                f"recovery {recovery}/{MAX_RECOVERY_ATTEMPTS} ({handoff_path})",
-                file=sys.stderr,
-            )
-            recovery_prompt = _handoff_recovery_prompt(handoff_path, text)
-            recovery_id = f"autoreview-recover-{uuid.uuid4().hex[:10]}"
-            rc, payload, text = _run_acp(
-                repo,
-                dispatch_id=recovery_id,
-                prompt_text=recovery_prompt,
-                handoff_path=handoff_path,
-                model=args.model,
-            )
-            if rc != 0:
-                return rc
-            report = _resolve_report(handoff_path=handoff_path, fallback_text=text)
-
-        if report is None:
-            state = (payload or {}).get("state")
-            handoff_exists = handoff_path.is_file()
-            raise RuntimeError(
-                "ACP review did not return structured findings JSON "
-                f"(state={state!r} handoff_exists={handoff_exists} "
-                f"recovery_attempts={recovery})\n{text[-2000:]}"
-            )
-    finally:
-        handoff_path.unlink(missing_ok=True)
+    if report is None:
+        state = (payload or {}).get("state")
+        raise RuntimeError(
+            "ACP review did not return parseable findings JSON from a COMPLETE turn "
+            f"(state={state!r} rc={rc} recovery_attempts={recovery})\n{excerpt[-2000:]}"
+        )
 
     print(json.dumps(report))
     return 0

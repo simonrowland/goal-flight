@@ -50,7 +50,7 @@ if ! grep -q 'autoreview_grok_acp' "$REPO_ROOT/scripts/autoreview.sh"; then
 fi
 
 # The grok-acp engine must refuse the raw grok CLI (which cannot do the ACP
-# file-handoff) with a teaching error, instead of failing confusingly downstream.
+# chat-delivery handshake) with a teaching error, not a confusing downstream fail.
 grok_guard_out="$("$REPO_ROOT/autoreview/scripts/autoreview" --engine grok-acp --grok-bin grok --mode uncommitted 2>&1)"
 if ! printf '%s' "$grok_guard_out" | grep -q 'requires the autoreview_grok_acp ACP shim'; then
   echo "FAIL  $TEST_NAME"
@@ -58,12 +58,11 @@ if ! printf '%s' "$grok_guard_out" | grep -q 'requires the autoreview_grok_acp A
   exit 1
 fi
 
-# The ACP file-handoff requires write tools, so --no-tools must be rejected
-# (matches codex/copilot). Pass the real shim so the guard above is satisfied first.
-grok_notools_out="$("$REPO_ROOT/autoreview/scripts/autoreview" --engine grok-acp --grok-bin "$REPO_ROOT/scripts/autoreview_grok_acp" --no-tools --mode uncommitted 2>&1)"
-if ! printf '%s' "$grok_notools_out" | grep -q 'no-tools is not supported by the grok-acp engine'; then
+# The shim must enforce the read-only write fence: it requests the read-only OS
+# sandbox (where supported) in the ACP argv, not merely mention it in a comment.
+if ! grep -qF 'cmd.extend(["--os-sandbox", "read-only"])' "$REPO_ROOT/scripts/autoreview_grok_acp"; then
   echo "FAIL  $TEST_NAME"
-  echo "      grok-acp engine did not reject --no-tools"
+  echo "      scripts/autoreview_grok_acp does not add the read-only OS sandbox to the ACP argv"
   exit 1
 fi
 

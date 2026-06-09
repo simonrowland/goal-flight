@@ -566,20 +566,19 @@ def run_claude(args: argparse.Namespace, repo: Path, prompt: str) -> str:
 def run_grok_acp(args: argparse.Namespace, repo: Path, prompt: str) -> str:
     grok_bin = resolve_command(args.grok_bin, repo)
     # The grok-acp engine delivers structured findings through grok's native ACP
-    # file-handoff, implemented only by the autoreview_grok_acp shim. The raw
-    # `grok` CLI does not implement it, so a bare --grok-bin (the default) would
-    # silently produce a confusing failure. Fail loudly with guidance instead.
+    # (chat result_text), implemented only by the autoreview_grok_acp shim. The
+    # raw `grok` CLI does not implement it, so a bare --grok-bin (the default)
+    # would silently produce a confusing failure. Fail loudly with guidance.
     if os.path.basename(grok_bin) == "grok":
         raise SystemExit(
             "grok-acp engine requires the autoreview_grok_acp ACP shim, not the raw "
             "grok CLI. Invoke via scripts/autoreview.sh (it sets --grok-bin "
             "automatically), or pass --grok-bin <path-to-scripts/autoreview_grok_acp>."
         )
-    if not args.tools:
-        raise SystemExit(
-            "--no-tools is not supported by the grok-acp engine; the ACP file-handoff "
-            "requires write tools to deliver the findings JSON"
-        )
+    # --no-tools is a no-op for grok-acp: the review already runs read-only under
+    # an OS sandbox (kernel-enforced where available) and delivers findings via
+    # chat, so there is nothing to disable. Accepted silently (the read-only
+    # intent of --no-tools is satisfied by default), unlike codex/copilot.
     cmd = [
         grok_bin,
         "--print",
