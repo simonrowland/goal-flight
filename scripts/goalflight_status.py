@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import subprocess
+import time
 from pathlib import Path
 import sys
 
@@ -163,6 +164,92 @@ def _dispatch_cells(record: dict) -> str:
     return f"{cls} {agent}"
 
 
+def _parse_wait_ids(values: list[str] | None) -> list[str]:
+    ids: list[str] = []
+    seen: set[str] = set()
+    for raw in values or []:
+        for part in str(raw).split(","):
+            dispatch_id = part.strip()
+            if dispatch_id and dispatch_id not in seen:
+                ids.append(dispatch_id)
+                seen.add(dispatch_id)
+    return ids
+
+
+def _terminal_state(record: dict | None, *, timed_out: bool = False) -> str:
+    if record is None:
+        return "timeout" if timed_out else "unknown"
+    if done_code(record) != 0:
+        return "timeout" if timed_out else (record.get("classification") or "live")
+    cls = record.get("classification") or record.get("state") or "unknown"
+    if cls == "idle_timeout":
+        return "worker_dead"
+    return str(record.get("terminal_state") or cls)
+
+
+def _wait_snapshot(payload: dict, wait_ids: list[str], *, timed_out: bool = False) -> list[dict]:
+    rows: list[dict] = []
+    for dispatch_id in wait_ids:
+        record = find_record(payload, dispatch_id)
+        code = 2 if record is None else done_code(record)
+        rows.append(
+            {
+                "dispatch_id": dispatch_id,
+                "done_code": code,
+                "terminal": code == 0,
+                "state": _terminal_state(record, timed_out=timed_out and code != 0),
+                "status_path": None if record is None else record.get("status_path"),
+            }
+        )
+    return rows
+
+
+def wait_for_dispatches(
+    wait_ids: list[str],
+    *,
+    project_root: str | None,
+    timeout_s: float | None,
+    poll_s: float,
+    json_output: bool = False,
+) -> int:
+    if not wait_ids:
+        print("wait requires at least one dispatch id", file=sys.stderr)
+        return 2
+
+    start = time.monotonic()
+    poll_s = max(0.05, poll_s)
+    while True:
+        payload = scope_payload(status_payload(), project_root)
+        rows = _wait_snapshot(payload, wait_ids)
+        if all(row["terminal"] for row in rows):
+            if json_output:
+                print(json.dumps({"ok": True, "dispatches": rows}, sort_keys=True))
+            else:
+                print(f"wait complete: {len(rows)}/{len(rows)} terminal")
+                for row in rows:
+                    print(f"{row['dispatch_id']} -> {row['state']}")
+            return 0
+
+        if timeout_s is not None and time.monotonic() - start >= timeout_s:
+            rows = _wait_snapshot(payload, wait_ids, timed_out=True)
+            terminal = sum(1 for row in rows if row["terminal"])
+            pending = [row["dispatch_id"] for row in rows if not row["terminal"]]
+            if json_output:
+                print(
+                    json.dumps(
+                        {"ok": False, "timeout": True, "pending": pending, "dispatches": rows},
+                        sort_keys=True,
+                    )
+                )
+            else:
+                print(f"wait timeout: {terminal}/{len(rows)} terminal; pending {','.join(pending)}")
+                for row in rows:
+                    print(f"{row['dispatch_id']} -> {row['state']}")
+            return 1
+
+        time.sleep(poll_s)
+
+
 def render_text(payload: dict, limit: int) -> list[str]:
     scope = payload.get("scope", {})
     root = scope.get("project_root")
@@ -220,6 +307,26 @@ def main(argv: list[str] | None = None) -> int:
         metavar="ID",
         help="exit 0 terminal / 1 live / 2 ambiguous|unknown; no stdout",
     )
+    parser.add_argument(
+        "--wait",
+        metavar="IDS",
+        action="append",
+        help="block until all comma-separated/repeated dispatch ids are terminal",
+    )
+    parser.add_argument(
+        "--wait-timeout",
+        "--timeout-s",
+        dest="wait_timeout",
+        type=float,
+        default=None,
+        help="max seconds to wait before reporting pending ids",
+    )
+    parser.add_argument(
+        "--poll-s",
+        type=float,
+        default=2.0,
+        help="seconds between --wait polls",
+    )
     parser.add_argument("--limit", type=int, default=20)
     args = parser.parse_args(argv)
 
@@ -229,6 +336,15 @@ def main(argv: list[str] | None = None) -> int:
         project_root = str(Path(args.project).resolve())
     else:
         project_root = this_project_root()
+
+    if args.wait:
+        return wait_for_dispatches(
+            _parse_wait_ids(args.wait),
+            project_root=project_root,
+            timeout_s=args.wait_timeout,
+            poll_s=args.poll_s,
+            json_output=args.json,
+        )
 
     payload = scope_payload(status_payload(), project_root)
 

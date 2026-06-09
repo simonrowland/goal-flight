@@ -28,6 +28,10 @@ def red_runner(_argv: list[str]) -> tuple[int, str, str]:
     return 1, "", "not logged in"
 
 
+def tooling_runner(_argv: list[str]) -> tuple[int, str, str]:
+    return 127, "", "python: command not found"
+
+
 def _fixture_fleet(fleet_dir: Path, *, node_id: str = "localhost") -> None:
     fleet.bootstrap(fleet_dir)
     fleet_doc = fleet.read_json(fleet_dir / "fleet.json")
@@ -182,6 +186,96 @@ def test_remote_auth_probe_uses_node_venv_python() -> None:
         )
 
 
+def test_tooling_auth_probe_is_inconclusive_not_red() -> None:
+    payload = billing.run_local_auth_probe(
+        "openai/default",
+        {"accounts": [{"account_key": "openai/default", "provider": "openai"}]},
+        runner=tooling_runner,
+    )
+    assert_true("local 127 inconclusive", payload["status"] == "inconclusive")
+
+
+def test_remote_tooling_probe_reprobes_instead_of_cached_red() -> None:
+    def setup_remote(fleet_dir: Path) -> None:
+        _fixture_fleet(fleet_dir, node_id="remote-node")
+        fleet_doc = fleet.read_json(fleet_dir / "fleet.json")
+        node = fleet_doc["nodes"]["remote-node"]
+        node["ssh"] = {"alias": "mac-studio-test", "hostname": "10.0.0.10"}
+        node["state_dir"] = "/Users/dev/.goal-flight"
+        fleet._atomic_write_json(fleet_dir / "fleet.json", fleet_doc)
+
+    with tempfile.TemporaryDirectory() as td:
+        fleet_dir = Path(td) / "fleet"
+        setup_remote(fleet_dir)
+        result = billing.link_account_to_node(
+            fleet_dir,
+            "openai/default",
+            "remote-node",
+            ssh_runner=lambda _a: (127, "", "bare-python-not-found"),
+        )
+        assert_true("remote 127 inconclusive", result["auth_probe"]["status"] == "inconclusive")
+        artifact = billing.read_probe_artifact(fleet_dir, "remote-node", "openai/default")
+        assert_true("artifact is not red", artifact is not None and artifact["status"] == "inconclusive")
+        try:
+            billing.assert_dispatch_auth(fleet_dir, "remote-node", "openai/default")
+            assert_true("should block", False)
+        except billing.DispatchAuthError as exc:
+            assert_true("gate says inconclusive", exc.auth_probe == "inconclusive")
+
+        calls: list[list[str]] = []
+
+        def green_remote(argv: list[str]) -> tuple[int, str, str]:
+            calls.append(list(argv))
+            return (
+                0,
+                json.dumps(
+                    {
+                        "schema": billing.AUTH_PROBE_SCHEMA,
+                        "account_key": "openai/default",
+                        "provider": "openai",
+                        "status": "green",
+                    }
+                ),
+                "",
+            )
+
+        summary = billing.fleet_auth_doctor(fleet_dir, refresh=False, ssh_runner=green_remote)
+        assert_true("doctor re-probed inconclusive", len(calls) == 1)
+        account = summary["nodes"][0]["accounts"][0]
+        assert_true("doctor refreshed green", account["auth_probe"] == "green")
+
+
+def test_remote_auth_denied_json_can_cache_red() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        fleet_dir = Path(td) / "fleet"
+        _fixture_fleet(fleet_dir, node_id="remote-node")
+        fleet_doc = fleet.read_json(fleet_dir / "fleet.json")
+        node = fleet_doc["nodes"]["remote-node"]
+        node["ssh"] = {"alias": "mac-studio-test", "hostname": "10.0.0.10"}
+        fleet._atomic_write_json(fleet_dir / "fleet.json", fleet_doc)
+
+        result = billing.link_account_to_node(
+            fleet_dir,
+            "openai/default",
+            "remote-node",
+            ssh_runner=lambda _a: (
+                1,
+                json.dumps(
+                    {
+                        "schema": billing.AUTH_PROBE_SCHEMA,
+                        "account_key": "openai/default",
+                        "provider": "openai",
+                        "status": "red",
+                    }
+                ),
+                "",
+            ),
+        )
+        assert_true("remote auth denied stays red", result["auth_probe"]["status"] == "red")
+        artifact = billing.read_probe_artifact(fleet_dir, "remote-node", "openai/default")
+        assert_true("red artifact saved", artifact is not None and artifact["status"] == "red")
+
+
 def test_grok_auth_probe_green() -> None:
     payload = billing.run_local_auth_probe(
         "grok/shared",
@@ -219,7 +313,7 @@ def test_cursor_auth_probe_uses_status_not_version() -> None:
         {"accounts": [{"account_key": "cursor/shared", "provider": "cursor"}]},
         runner=lambda _a: (0, "cursor-agent 2026.05.20\n", ""),
     )
-    assert_true("cursor red on version-only stdout", version_only["status"] == "red")
+    assert_true("cursor version-only inconclusive", version_only["status"] == "inconclusive")
 
 
 def main() -> None:
@@ -230,6 +324,9 @@ def main() -> None:
         test_account_unlink_removes_link_and_artifact,
         test_doctor_cli_fleet_json,
         test_remote_auth_probe_uses_node_venv_python,
+        test_tooling_auth_probe_is_inconclusive_not_red,
+        test_remote_tooling_probe_reprobes_instead_of_cached_red,
+        test_remote_auth_denied_json_can_cache_red,
         test_grok_auth_probe_green,
         test_cursor_auth_probe_uses_status_not_version,
     ):

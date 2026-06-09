@@ -22,6 +22,10 @@ def test_allowed_command_classes_build() -> None:
     assert_true("doctor argv", remote[1].endswith("goalflight_doctor.py"))
     git = ssh.build_remote_command("git_fetch", repo_root="/srv/goal-flight")
     assert_true("git fetch", git[:3] == ["git", "-C", "/srv/goal-flight"])
+    cleanup = ssh.build_remote_command("git_prune_claude_refs", repo_root="/srv/goal-flight")
+    assert_true("cleanup python3", cleanup[0] == "python3")
+    assert_true("cleanup helper", cleanup[1].endswith("goalflight_cleanup_dispatch_refs.py"))
+    assert_true("cleanup repo root", cleanup[-3:] == ["--repo-root", "/srv/goal-flight", "--json"])
 
 
 def test_shell_metachar_rejected() -> None:

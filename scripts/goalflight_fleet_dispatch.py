@@ -8,6 +8,7 @@ lock-order enforcement, allowlisted remote worktree + spawn stubs, ledger
 
 from __future__ import annotations
 
+import base64
 import json
 import re
 import shlex
@@ -26,7 +27,9 @@ class DispatchError(Exception):
 
 
 _SENSITIVE_ARGV_FLAGS = frozenset({"--prompt-b64", "--prompt"})
-_EMBEDDED_SECRET_RE = re.compile(r"(--prompt-b64(?:=|\s+))[A-Za-z0-9+/=_-]+")
+_EMBEDDED_SECRET_RE = re.compile(
+    r"(--prompt(?:-b64)?(?:=|\s+))(?:'[^']*'|\"[^\"]*\"|\S+)"
+)
 
 
 def _redact_argv(argv: list[str]) -> list[str]:
@@ -52,6 +55,21 @@ def _redact_argv(argv: list[str]) -> list[str]:
     return redacted
 
 
+def _prompt_sensitive_values(prompt: str) -> list[str]:
+    values = [prompt]
+    if prompt:
+        values.append(base64.b64encode(prompt.encode("utf-8")).decode("ascii"))
+    return values
+
+
+def _redact_text(text: str, *, sensitive_values: list[str] | None = None) -> str:
+    redacted = _EMBEDDED_SECRET_RE.sub(r"\1<redacted>", text)
+    for value in sensitive_values or []:
+        if value:
+            redacted = redacted.replace(value, "<redacted>")
+    return redacted
+
+
 def _format_remote_failure(
     command_class: str,
     *,
@@ -59,15 +77,16 @@ def _format_remote_failure(
     stdout: str,
     stderr: str,
     ssh_argv: list[str],
+    sensitive_values: list[str] | None = None,
 ) -> str:
     details = [
         f"remote {command_class} failed (exit {exit_code})",
         f"ssh argv: {shlex.join(_redact_argv(ssh_argv))}",
     ]
     if stderr:
-        details.append(f"stderr:\n{stderr.rstrip()}")
+        details.append(f"stderr:\n{_redact_text(stderr, sensitive_values=sensitive_values).rstrip()}")
     if stdout:
-        details.append(f"stdout:\n{stdout.rstrip()}")
+        details.append(f"stdout:\n{_redact_text(stdout, sensitive_values=sensitive_values).rstrip()}")
     return "\n".join(details)
 
 
@@ -103,7 +122,7 @@ class DispatchPreview:
             "node": self.node_id,
             "agent": self.agent,
             "billing_account": self.billing_account,
-            "prompt": self.prompt,
+            "prompt": "<redacted>",
             "worktree_path": self.worktree_path,
             "thin_defaults": self.thin_defaults,
             "billing_banner": self.billing_banner,
@@ -211,6 +230,7 @@ def build_remote_command_plan(
     status_json = remote_status_path_for_dispatch(state_dir, dispatch_id)
     plans: list[dict[str, Any]] = []
     for command_class, extra in (
+        ("git_prune_claude_refs", {"python": str(node_entry.get("python") or "python3")}),
         ("git_fetch", {}),
         ("git_worktree_add", {"worktree_path": worktree_path, "ref": "origin/main"}),
         (
@@ -327,6 +347,7 @@ def acquire_lock_chain(
 
         fleet_doc = fleet.read_json(fleet_dir / "fleet.json")
         node_entry = (fleet_doc.get("nodes") or {}).get(preview.node_id) or {}
+        sensitive_values = _prompt_sensitive_values(preview.prompt)
         for cmd in preview.remote_commands:
             import goalflight_fleet_ssh as fleet_ssh
 
@@ -338,13 +359,15 @@ def acquire_lock_chain(
             )
             if runner is not None:
                 code, stdout, stderr = runner(ssh_argv)
+                redacted_stdout = _redact_text(stdout, sensitive_values=sensitive_values)
+                redacted_stderr = _redact_text(stderr, sensitive_values=sensitive_values)
                 result.remote_log.append(
                     {
                         "command_class": cmd["command_class"],
                         "ssh_argv": _redact_argv(ssh_argv),
                         "exit_code": code,
-                        "stdout": stdout[:200],
-                        "stderr": stderr[:200],
+                        "stdout": redacted_stdout[:200],
+                        "stderr": redacted_stderr[:200],
                     }
                 )
                 if code != 0:
@@ -355,6 +378,7 @@ def acquire_lock_chain(
                             stdout=stdout,
                             stderr=stderr,
                             ssh_argv=ssh_argv,
+                            sensitive_values=sensitive_values,
                         )
                     )
             else:

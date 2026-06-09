@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import json
 import sys
 import tempfile
 from contextlib import redirect_stdout
@@ -298,6 +299,59 @@ def test_cli() -> None:
         S.status_payload, S.this_project_root = orig_payload, orig_root
 
 
+def test_wait_cli() -> None:
+    orig_payload, orig_root = S.status_payload, S.this_project_root
+    payload = sample_payload()
+    payload["dispatch"]["records"].append(
+        {
+            "dispatch_id": "dead1",
+            "project_root": "/repo/A",
+            "classification": "idle_timeout",
+            "agent": "codex",
+            "worker_pid": 333,
+            "worker_still_alive": True,
+        }
+    )
+    S.status_payload = lambda: payload
+    S.this_project_root = lambda: "/repo/A"
+    try:
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = S.main(["--wait", "done1,dead1", "--wait-timeout", "0", "--poll-s", "0.01"])
+        out = buf.getvalue()
+        check("--wait all-terminal returns 0", rc == 0)
+        check("--wait prints complete digest", out.splitlines()[0] == "wait complete: 2/2 terminal")
+        check("--wait maps dead idle_timeout to worker_dead", "dead1 -> worker_dead" in out)
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = S.main(
+                [
+                    "--wait",
+                    "done1,dead1",
+                    "--wait",
+                    "amb1",
+                    "--wait-timeout",
+                    "0",
+                    "--poll-s",
+                    "0.01",
+                ]
+            )
+        out = buf.getvalue()
+        check("--wait timeout returns nonzero", rc == 1)
+        check("--wait timeout reports pending id", "pending amb1" in out)
+        check("--wait timeout keeps final per-id states", "amb1 -> timeout" in out)
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = S.main(["--wait", "done1", "--json", "--wait-timeout", "0"])
+        payload_json = json.loads(buf.getvalue())
+        check("--wait --json returns 0", rc == 0)
+        check("--wait --json has dispatch row", payload_json["dispatches"][0]["dispatch_id"] == "done1")
+    finally:
+        S.status_payload, S.this_project_root = orig_payload, orig_root
+
+
 def main() -> int:
     test_scope()
     test_worktree_scope()
@@ -306,6 +360,7 @@ def main() -> int:
     test_idle_timeout_live_hint_rendered()
     test_rate_pressure_warning_rendered()
     test_cli()
+    test_wait_cli()
     if _FAILS:
         print(f"\n{len(_FAILS)} FAILED: {_FAILS}")
         return 1

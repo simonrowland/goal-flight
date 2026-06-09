@@ -13,6 +13,7 @@ import goalflight_fleet_ssh as fleet_ssh
 
 AUTH_PROBE_SCHEMA = "goalflight.fleet.auth-probe.v1"
 ProbeRunner = Callable[[list[str]], tuple[int, str, str]]
+INCONCLUSIVE_STATUS = "inconclusive"
 
 PROVIDER_BY_ACCOUNT: dict[str, str] = {
     "openai": "openai",
@@ -32,6 +33,19 @@ LOCAL_PROBE_ARGV: dict[str, list[str]] = {
     ],
     "cursor": ["cursor-agent", "status"],
 }
+
+TOOLING_FAILURE_EXIT_CODES = {126, 127}
+TOOLING_FAILURE_RE = re.compile(
+    r"(command not found|not found:|no such file or directory|can't open file|"
+    r"bare-python-not-found|probe_failed|transient|temporar|timeout|connection refused|"
+    r"permission denied \(publickey\)|ssh:)",
+    re.I,
+)
+AUTH_DENIED_RE = re.compile(
+    r"(not logged[_ -]?in|not authenticated|unauthenticated|authentication required|"
+    r"login required|no api key|invalid api key|expired credential|not authorized|unauthorized)",
+    re.I,
+)
 
 KEYCHAIN_LOCKED_RE = re.compile(r"keychain.*locked", re.I)
 CURSOR_AUTH_NEGATIVE_RE = re.compile(
@@ -98,6 +112,24 @@ def probe_argv(provider: str) -> list[str]:
     return list(LOCAL_PROBE_ARGV[provider])
 
 
+def is_inconclusive_probe(payload: dict[str, Any] | None) -> bool:
+    return str((payload or {}).get("status") or "") == INCONCLUSIVE_STATUS
+
+
+def _non_auth_probe_failure(exit_code: int, stdout: str, stderr: str) -> bool:
+    combined = f"{stdout}\n{stderr}"
+    return exit_code in TOOLING_FAILURE_EXIT_CODES or bool(TOOLING_FAILURE_RE.search(combined))
+
+
+def _failed_probe_status(exit_code: int, stdout: str, stderr: str) -> str:
+    combined = f"{stdout}\n{stderr}"
+    if AUTH_DENIED_RE.search(combined):
+        return "red"
+    if _non_auth_probe_failure(exit_code, stdout, stderr):
+        return INCONCLUSIVE_STATUS
+    return INCONCLUSIVE_STATUS
+
+
 def interpret_auth_probe(provider: str, exit_code: int, stdout: str, stderr: str) -> str:
     combined = f"{stdout}\n{stderr}"
     if provider == "openai":
@@ -105,12 +137,18 @@ def interpret_auth_probe(provider: str, exit_code: int, stdout: str, stderr: str
             return "green"
         if exit_code == 0:
             return "yellow"
-        return "red"
+        return _failed_probe_status(exit_code, stdout, stderr)
     if provider == "anthropic-session":
-        return "green" if exit_code == 0 and stdout.strip() else "red"
+        if exit_code == 0 and stdout.strip():
+            return "green"
+        return _failed_probe_status(exit_code, stdout, stderr)
     if provider == "grok":
         if exit_code == 0 and re.search(r"logged_in", combined, re.I):
             return "green"
+        if exit_code == 1:
+            return "red"
+        if _non_auth_probe_failure(exit_code, stdout, stderr):
+            return INCONCLUSIVE_STATUS
         return "red"
     if provider == "cursor":
         if KEYCHAIN_LOCKED_RE.search(combined):
@@ -119,8 +157,8 @@ def interpret_auth_probe(provider: str, exit_code: int, stdout: str, stderr: str
             return "red"
         if exit_code == 0 and CURSOR_AUTH_POSITIVE_RE.search(combined):
             return "green"
-        return "red"
-    return "green" if exit_code == 0 else "red"
+        return _failed_probe_status(exit_code, stdout, stderr)
+    return "green" if exit_code == 0 else _failed_probe_status(exit_code, stdout, stderr)
 
 
 def run_local_auth_probe(
@@ -177,6 +215,16 @@ def read_probe_artifact(fleet_dir: Path, node_id: str, account_key: str) -> dict
         return None
 
 
+def _remote_probe_payload_from_stdout(stdout: str) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(stdout or "{}")
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict) or payload.get("schema") != AUTH_PROBE_SCHEMA:
+        return None
+    return payload
+
+
 def run_node_auth_probe(
     fleet_dir: Path,
     node_id: str,
@@ -222,34 +270,38 @@ def run_node_auth_probe(
         )
         ssh_argv = fleet_ssh.build_ssh_command(host, remote, command_class="auth_probe")
         result = fleet_ssh.run_ssh(ssh_argv, runner=ssh_runner, dry_run=False)
-        if not result["ok"]:
+        remote_payload = _remote_probe_payload_from_stdout(str(result.get("stdout") or ""))
+        if remote_payload is not None:
+            payload = remote_payload
+        elif not result["ok"]:
             payload = {
                 "schema": AUTH_PROBE_SCHEMA,
                 "node_id": node_id,
                 "account_key": account_key,
                 "provider": provider_for_account(account_key, billing_doc),
-                "status": "red",
+                "status": INCONCLUSIVE_STATUS,
                 "exit_code": result.get("exit_code", 1),
                 "stderr_tail": str(result.get("stderr", ""))[-400:],
                 "probed_at": iso_now,
                 "mode": "remote",
                 "failure_code": result.get("failure_code", "probe_failed"),
+                "detail": "remote auth probe failed before returning an auth verdict",
             }
         else:
-            try:
-                payload = json.loads(str(result.get("stdout") or "{}"))
-            except json.JSONDecodeError:
-                payload = {
-                    "schema": AUTH_PROBE_SCHEMA,
-                    "node_id": node_id,
-                    "account_key": account_key,
-                    "status": "red",
-                    "probed_at": iso_now,
-                    "mode": "remote",
-                    "detail": "invalid probe JSON",
-                }
-            payload.setdefault("node_id", node_id)
-            payload.setdefault("account_key", account_key)
+            payload = {
+                "schema": AUTH_PROBE_SCHEMA,
+                "node_id": node_id,
+                "account_key": account_key,
+                "provider": provider_for_account(account_key, billing_doc),
+                "status": INCONCLUSIVE_STATUS,
+                "probed_at": iso_now,
+                "mode": "remote",
+                "detail": "invalid probe JSON",
+            }
+        payload.setdefault("node_id", node_id)
+        payload.setdefault("account_key", account_key)
+        payload.setdefault("mode", "remote")
+        payload.setdefault("probed_at", iso_now)
 
     if write_artifact:
         write_probe_artifact(fleet_dir, node_id, payload)
@@ -355,7 +407,7 @@ def fleet_auth_doctor(
         accounts_out: list[dict[str, Any]] = []
         for account_key in node.get("billing_accounts") or []:
             payload = read_probe_artifact(fleet_dir, node_id, str(account_key))
-            if refresh or payload is None:
+            if refresh or payload is None or is_inconclusive_probe(payload):
                 payload = run_node_auth_probe(
                     fleet_dir,
                     node_id,

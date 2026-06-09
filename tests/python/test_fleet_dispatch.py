@@ -8,6 +8,7 @@ from support import skip_posix_on_native_windows
 skip_posix_on_native_windows("fleet dispatch fixtures use POSIX /tmp paths")
 
 import io
+import base64
 import json
 import sys
 import tempfile
@@ -82,8 +83,13 @@ def test_explicit_dry_run_preview() -> None:
         assert_true("worktree", "worktrees/acp-dispatch-explicit" in payload["worktree_path"])
         assert_true("remote cmds", len(payload["remote_commands"]) >= 2)
         classes = [c["command_class"] for c in payload["remote_commands"]]
+        assert_true("cleanup refs", "git_prune_claude_refs" in classes)
         assert_true("git fetch", "git_fetch" in classes)
         assert_true("worktree add", "git_worktree_add" in classes)
+        assert_true(
+            "cleanup before fetch",
+            classes.index("git_prune_claude_refs") < classes.index("git_fetch"),
+        )
         assert_true("fetch before worktree", classes.index("git_fetch") < classes.index("git_worktree_add"))
         worktree_add = next(c for c in payload["remote_commands"] if c["command_class"] == "git_worktree_add")
         assert_true("worktree add uses fetched ref", worktree_add["argv"][-1] == "origin/main")
@@ -169,6 +175,12 @@ def test_lock_chain_rollback_on_worktree_failure() -> None:
 
 
 def test_remote_failure_surfaces_ssh_details() -> None:
+    def fail_fetch(argv: list[str]) -> tuple[int, str, str]:
+        joined = " ".join(argv)
+        if "goalflight_cleanup_dispatch_refs.py" in joined:
+            return 0, '{"deleted":[]}', ""
+        return 255, "", "real stderr"
+
     with tempfile.TemporaryDirectory() as td:
         fleet_dir = Path(td) / "fleet"
         _fixture_fleet(fleet_dir)
@@ -184,7 +196,7 @@ def test_remote_failure_surfaces_ssh_details() -> None:
             fleet_dispatch.acquire_lock_chain(
                 fleet_dir,
                 preview,
-                runner=lambda _a: (255, "", "real stderr"),
+                runner=fail_fetch,
             )
             assert_true("should raise", False)
         except fleet_dispatch.DispatchError as exc:
@@ -193,6 +205,88 @@ def test_remote_failure_surfaces_ssh_details() -> None:
             assert_true("exit code", "exit 255" in message)
             assert_true("stderr", "real stderr" in message)
             assert_true("ssh argv", "ssh argv:" in message)
+
+
+def test_redact_argv_masks_prompt_values_everywhere() -> None:
+    secret = "sensitive prompt with spaces"
+    prompt_b64 = base64.b64encode(secret.encode("utf-8")).decode("ascii")
+    cases = [
+        ["cmd", "--prompt", secret],
+        ["cmd", f"--prompt={secret}"],
+        ["cmd", "--prompt-b64", prompt_b64],
+        ["cmd", f"--prompt-b64={prompt_b64}"],
+        ["ssh", "host", "--", "/bin/zsh", "-c", f"exec runner --prompt '{secret}' --json"],
+        ["ssh", "host", "--", "/bin/zsh", "-c", f"exec runner --prompt-b64 {prompt_b64} --json"],
+        ["ssh", "host", "--", "/bin/zsh", "-c", f"exec runner --prompt-b64={prompt_b64} --json"],
+    ]
+    for argv in cases:
+        redacted = " ".join(fleet_dispatch._redact_argv(argv))
+        assert_true("secret redacted", secret not in redacted)
+        assert_true("prompt b64 redacted", prompt_b64 not in redacted)
+        assert_true("redaction marker", "<redacted>" in redacted)
+
+    with tempfile.TemporaryDirectory() as td:
+        fleet_dir = Path(td) / "fleet"
+        _fixture_fleet(fleet_dir)
+        preview = fleet_dispatch.preview_dispatch(
+            fleet_dir,
+            node_id="localhost",
+            agent="codex-acp",
+            billing_account="openai/default",
+            prompt=secret,
+            dispatch_id="acp-redact-preview",
+        )
+        preview_payload = preview.to_dict()
+        assert_true("preview prompt marker", preview_payload["prompt"] == "<redacted>")
+        serialized = json.dumps(preview_payload)
+        assert_true("preview prompt redacted", secret not in serialized)
+        assert_true("preview prompt b64 redacted", prompt_b64 not in serialized)
+        assert_true("preview marker", "<redacted>" in serialized)
+
+        def fail_acp(argv: list[str]) -> tuple[int, str, str]:
+            joined = " ".join(argv)
+            if "goalflight_acp_run.py" in joined:
+                return 9, f"stdout echoed {secret}", f"stderr echoed --prompt-b64 {prompt_b64}"
+            return 0, "{}", ""
+
+        try:
+            fleet_dispatch.acquire_lock_chain(fleet_dir, preview, runner=fail_acp)
+            assert_true("should raise", False)
+        except fleet_dispatch.DispatchError as exc:
+            message = str(exc)
+            assert_true("failure class", "remote acp_run failed" in message)
+            assert_true("failure prompt redacted", secret not in message)
+            assert_true("failure prompt b64 redacted", prompt_b64 not in message)
+            assert_true("failure marker", "<redacted>" in message)
+
+        live_preview = fleet_dispatch.preview_dispatch(
+            fleet_dir,
+            node_id="localhost",
+            agent="codex-acp",
+            billing_account="openai/default",
+            prompt=secret,
+            dispatch_id="acp-redact-live",
+        )
+
+        def echo_acp(argv: list[str]) -> tuple[int, str, str]:
+            joined = " ".join(argv)
+            if "goalflight_acp_run.py" in joined:
+                return 0, f"stdout echoed {secret}", f"stderr echoed --prompt-b64 {prompt_b64}"
+            return 0, "{}", ""
+
+        chain = fleet_dispatch.acquire_lock_chain(fleet_dir, live_preview, runner=echo_acp)
+        try:
+            live_result = json.dumps({"remote_log": chain.remote_log})
+            assert_true("live stdout/stderr prompt redacted", secret not in live_result)
+            assert_true("live stdout/stderr prompt b64 redacted", prompt_b64 not in live_result)
+            assert_true("live stdout/stderr marker", "<redacted>" in live_result)
+        finally:
+            fleet_dispatch.release_lock_chain(
+                fleet_dir,
+                live_preview,
+                acquired=chain.acquired,
+                fencing_token=chain.fencing_token,
+            )
 
 
 def test_quarantine_blocks_dispatch() -> None:
@@ -402,6 +496,7 @@ def main() -> None:
     test_thin_defaults_shows_billing_banner()
     test_lock_chain_rollback_on_worktree_failure()
     test_remote_failure_surfaces_ssh_details()
+    test_redact_argv_masks_prompt_values_everywhere()
     test_quarantine_blocks_dispatch()
     test_resolve_dispatch_runner_stub_and_live()
     test_exec_without_stub_uses_runner()

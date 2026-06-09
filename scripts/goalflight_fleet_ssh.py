@@ -50,6 +50,7 @@ ALLOWED_COMMAND_CLASSES = frozenset(
         "doctor",
         "status",
         "capacity",
+        "git_prune_claude_refs",
         "acp_run",
         "git_fetch",
         "git_checkout",
@@ -146,6 +147,15 @@ def build_remote_command(command_class: str, **params: Any) -> list[str]:
         argv = [python, f"{repo_root}/scripts/goalflight_capacity.py", "status", "--json"]
     elif command_class == "capacity":
         argv = [python, f"{repo_root}/scripts/goalflight_capacity.py", "status", "--json"]
+    elif command_class == "git_prune_claude_refs":
+        cleanup_python = str(params.get("python") or "python3")
+        argv = [
+            cleanup_python,
+            f"{repo_root}/scripts/goalflight_cleanup_dispatch_refs.py",
+            "--repo-root",
+            repo_root,
+            "--json",
+        ]
     elif command_class == "acp_run":
         dispatch_id = str(params.get("dispatch_id") or "")
         agent = str(params.get("agent") or "")

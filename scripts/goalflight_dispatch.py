@@ -525,6 +525,7 @@ def _status_reminder_lines(
         "tooling — do NOT hand-roll ps/tail -f/backgrounded watchers (they race the worker "
         "and exit early):",
         f"  status: python3 {status_py} --dispatch {dispatch_id}",
+        f"  wait:   python3 {status_py} --wait {dispatch_id}",
         f"  done?:  python3 {status_py} --done {dispatch_id}   "
         "# exit 0=terminal, 1=running, 2=ambiguous",
     ]

@@ -35,6 +35,7 @@ def test_status_reminder_bash_shape() -> None:
     text, _status_json, tail = _reminder_text("bash")
     assert "reminder-dispatch-42" in text
     assert "--dispatch reminder-dispatch-42" in text
+    assert "--wait reminder-dispatch-42" in text
     assert "--done reminder-dispatch-42" in text
     assert "0=terminal" in text and "1=running" in text and "2=ambiguous" in text
     assert "do NOT hand-roll" in text
@@ -53,6 +54,7 @@ def test_status_reminder_acp_shape() -> None:
     text, status_json, tail = _reminder_text("acp")
     assert "reminder-dispatch-42" in text
     assert "--dispatch reminder-dispatch-42" in text
+    assert "--wait reminder-dispatch-42" in text
     assert "--done reminder-dispatch-42" in text
     assert "0=terminal" in text and "1=running" in text and "2=ambiguous" in text
     assert "do NOT hand-roll" in text
