@@ -51,10 +51,12 @@ def status_payload() -> dict:
         capacity_state = goalflight_capacity.load_state()
         goalflight_capacity.prune_state(capacity_state)
         goalflight_capacity.save_state(capacity_state)
+    rate_pressure = goalflight_capacity.current_rate_pressure(argparse.Namespace())
     return {
         "schema": "goalflight.status.aggregate.v1",
         "capacity": goalflight_capacity.profile(argparse.Namespace()),
         "capacity_state": capacity_state,
+        "rate_pressure": rate_pressure,
         "dispatch": goalflight_ledger.status_payload(),
     }
 
@@ -147,6 +149,8 @@ def render_text(payload: dict, limit: int) -> list[str]:
         lines.append(
             f"  cooldown {item.get('agent')}: {item.get('reason')} until {item.get('until')}"
         )
+    for warning in goalflight_capacity.rate_pressure_warnings(payload.get("rate_pressure"), limit=limit):
+        lines.append(f"  warning: {warning}")
     return lines
 
 

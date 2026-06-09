@@ -24,12 +24,14 @@ skip_posix_on_native_windows(
 )
 
 import datetime as dt
+import io
 import json
 import os
 import signal
 import subprocess
 import sys
 import tempfile
+from contextlib import redirect_stdout
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -83,6 +85,57 @@ def _past_ttl_lease(*, worker_pid: int | None, controller_pid: int | None) -> di
         "started_at": cap.iso(cap.utc_now() - dt.timedelta(hours=20)),
         "expires_at": expired,
     }
+
+
+def _future_active_lease(idx: int, *, agent: str = "codex") -> dict:
+    now = cap.utc_now()
+    return {
+        "lease_id": f"adaptive-held-{idx}",
+        "dispatch_id": f"adaptive-held-{idx}",
+        "agent": agent,
+        "state": "active",
+        "worker_pid": None,
+        "controller_pid": os.getpid(),
+        "mem_mb": 386,
+        "started_at": cap.iso(now),
+        "expires_at": cap.iso(now + dt.timedelta(hours=1)),
+    }
+
+
+def _seed_codex_at_capacity_records(state_dir: Path, *, count: int = 3) -> None:
+    runs = state_dir / "runs.d"
+    statuses = state_dir / "dispatch"
+    runs.mkdir(parents=True, exist_ok=True)
+    statuses.mkdir(parents=True, exist_ok=True)
+    recent_iso = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    for idx in range(count):
+        status_path = statuses / f"codex-capacity-{idx}.status.json"
+        status_path.write_text(
+            json.dumps(
+                {
+                    "schema": "goalflight.status.v1",
+                    "dispatch_id": f"codex-capacity-{idx}",
+                    "agent": "codex",
+                    "state": "worker_dead",
+                    "error": "ERROR: Selected model is at capacity. Please try a different model.",
+                },
+                sort_keys=True,
+            )
+        )
+        (runs / f"codex-capacity-{idx}.json").write_text(
+            json.dumps(
+                {
+                    "schema": "goalflight.dispatch.v1",
+                    "dispatch_id": f"codex-capacity-{idx}",
+                    "agent": "codex",
+                    "state": "failed",
+                    "started_at": recent_iso,
+                    "updated_at": recent_iso,
+                    "status_path": str(status_path),
+                },
+                sort_keys=True,
+            )
+        )
 
 
 def case_live_worker_past_ttl_survives_prune() -> None:
@@ -241,6 +294,94 @@ def case_acquire_atomic_gate_still_blocks_over_cap(state_dir: Path) -> None:
         worker.wait()
 
 
+def case_adaptive_rate_pressure_reduces_codex_effective_cap(state_dir: Path) -> None:
+    """Clustered codex model-capacity failures halve only codex effective cap."""
+    _seed_codex_at_capacity_records(state_dir, count=3)
+    leases = {_future_active_lease(idx)["lease_id"]: _future_active_lease(idx) for idx in range(5)}
+    cap.save_state(
+        {
+            "schema": cap.SCHEMA,
+            "machine_id": cap.machine_id(),
+            "leases": leases,
+            "cooldowns": {},
+        }
+    )
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = cap.main([
+            "acquire",
+            "--agent", "codex",
+            "--lease-id", "adaptive-sixth",
+            "--project-root", str(REPO_ROOT),
+            "--ttl-s", "3600",
+            "--ram-mb", "65536",
+            "--max-total", "20",
+        ])
+    assert rc == 2, f"adaptive sixth codex acquire should wait (rc={rc}, stdout={buf.getvalue()})"
+    payload = json.loads(buf.getvalue())
+    assert payload["reason"] == "adaptive_rate_pressure", payload
+    assert payload["active"] == 5, payload
+    assert payload["base_agent_cap"] == 10, payload
+    assert payload["agent_cap"] == 5, payload
+    pressure = payload["adaptive_rate_pressure"]
+    assert pressure["scope"] == "agent", pressure
+    assert pressure["provider"] == "openai", pressure
+    assert pressure["budget_key"] == "agent:codex", pressure
+    assert pressure["count"] == 3, pressure
+    data = json.loads(cap.state_path().read_text())
+    assert "adaptive-sixth" not in data["leases"], "adaptive wait created a lease"
+
+    pressure_payload = cap.current_rate_pressure()
+    opencode_cap, opencode_pressure = cap.adaptive_agent_cap("opencode", 10, pressure_payload)
+    assert opencode_cap == 10, opencode_pressure
+    assert opencode_pressure is None, opencode_pressure
+
+    data["leases"].update({
+        _future_active_lease(idx, agent="grok-code")["lease_id"]: _future_active_lease(idx, agent="grok-code")
+        for idx in range(5, 14)
+    })
+    cap.save_state(data)
+    grok_buf = io.StringIO()
+    with redirect_stdout(grok_buf):
+        grok_rc = cap.main([
+            "acquire",
+            "--agent", "grok-code",
+            "--lease-id", "adaptive-grok-tenth",
+            "--project-root", str(REPO_ROOT),
+            "--ttl-s", "3600",
+            "--ram-mb", "65536",
+            "--max-total", "20",
+        ])
+    assert grok_rc == 0, (
+        "clustered codex model-capacity pressure must not reduce grok-code's static cap "
+        f"(rc={grok_rc}, stdout={grok_buf.getvalue()})"
+    )
+    grok_payload = json.loads(grok_buf.getvalue())
+    assert grok_payload["decision"] == "allow", grok_payload
+    data = json.loads(cap.state_path().read_text())
+    assert "adaptive-grok-tenth" in data["leases"], "grok-code full-cap acquire was not leased"
+
+
+def case_adaptive_rate_pressure_status_surfaces_warning(state_dir: Path) -> None:
+    """Capacity status surfaces the transient adaptive backoff warning."""
+    _seed_codex_at_capacity_records(state_dir, count=3)
+    cap.save_state(
+        {
+            "schema": cap.SCHEMA,
+            "machine_id": cap.machine_id(),
+            "leases": {},
+            "cooldowns": {},
+        }
+    )
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = cap.main(["status", "--ram-mb", "65536", "--max-total", "20"])
+    out = buf.getvalue()
+    assert rc == 0, rc
+    assert "warning: adaptive rate pressure agent:codex" in out, out
+    assert "codex 10->5" in out, out
+
+
 def case_empty_state_dir_falls_back_not_cwd() -> None:
     """A present-but-empty (or whitespace-only) GOALFLIGHT_STATE_DIR must resolve
     to DEFAULT_STATE_DIR, NOT cwd. Regression: os.environ.get(key, default)
@@ -290,18 +431,32 @@ def main() -> None:
     # IO cases: isolate capacity.json under a temp $GOALFLIGHT_STATE_DIR so the
     # real shared /tmp/goal-flight-<uid>/capacity.json is never touched.
     old = os.environ.get("GOALFLIGHT_STATE_DIR")
+    old_threshold = os.environ.get("GOALFLIGHT_RATE_PRESSURE_THRESHOLD")
+    old_window = os.environ.get("GOALFLIGHT_RATE_PRESSURE_WINDOW_SECONDS")
     with tempfile.TemporaryDirectory() as td:
         state_dir = Path(td) / "state"
         os.environ["GOALFLIGHT_STATE_DIR"] = str(state_dir)
+        os.environ["GOALFLIGHT_RATE_PRESSURE_THRESHOLD"] = "3"
+        os.environ["GOALFLIGHT_RATE_PRESSURE_WINDOW_SECONDS"] = "600"
         try:
             case_status_is_non_mutating_for_live_lease(state_dir)
             case_status_still_reclaims_dead_lease_in_view(state_dir)
             case_acquire_atomic_gate_still_blocks_over_cap(state_dir)
+            case_adaptive_rate_pressure_reduces_codex_effective_cap(state_dir)
+            case_adaptive_rate_pressure_status_surfaces_warning(state_dir)
         finally:
             if old is None:
                 os.environ.pop("GOALFLIGHT_STATE_DIR", None)
             else:
                 os.environ["GOALFLIGHT_STATE_DIR"] = old
+            if old_threshold is None:
+                os.environ.pop("GOALFLIGHT_RATE_PRESSURE_THRESHOLD", None)
+            else:
+                os.environ["GOALFLIGHT_RATE_PRESSURE_THRESHOLD"] = old_threshold
+            if old_window is None:
+                os.environ.pop("GOALFLIGHT_RATE_PRESSURE_WINDOW_SECONDS", None)
+            else:
+                os.environ["GOALFLIGHT_RATE_PRESSURE_WINDOW_SECONDS"] = old_window
 
     print("OK: capacity TTL liveness-gate + non-mutating status tests pass")
 

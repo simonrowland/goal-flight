@@ -17,6 +17,7 @@ import uuid
 
 import goalflight_compat
 import goalflight_compat as fcntl
+import goalflight_rate_pressure
 
 SCHEMA = "goalflight.capacity.v1"
 
@@ -29,6 +30,8 @@ DEFAULT_STATE_DIR = Path(os.environ.get("GOALFLIGHT_STATE_DIR", _default_state_d
 DEFAULT_RESERVE_MB = 2048
 DEFAULT_WORST_WORKER_MB = 1200
 DEFAULT_HARD_CAP = 20
+DEFAULT_RATE_PRESSURE_WINDOW_SECONDS = 600
+DEFAULT_RATE_PRESSURE_THRESHOLD = 3
 AGENT_RSS_MB = {
     "grok": 111,
     "grok-code": 111,
@@ -45,12 +48,10 @@ AGENT_RSS_MB = {
 }
 # Per-agent concurrency caps, machine-global across goal-flight sessions.
 # Sized to support multi-session parallel work. The adaptive busy-signal
-# walkback (scripts/goalflight_rate_pressure.py) DOES exist and is wired
-# into goalflight_doctor.py + commands/execute.md + commands/decompose-plan.md
-# to halve effective caps on observed pressure. Static caps below are
-# starting defaults; learned per-provider thresholds (persisted across
-# sessions) remain future work — see docs-private/BACKLOG.md "Learned
-# rate-pressure thresholds (not just hardcoded caps)".
+# walkback (scripts/goalflight_rate_pressure.py) reduces effective caps at
+# acquire-time when recent dispatch-ledger failures show provider pressure.
+# Static caps below remain starting defaults; the adaptive cap is transient and
+# never mutates this map or capacity.json.
 DEFAULT_AGENT_CAPS = {
     # cursor-agent talks to Cursor's CLOUD backend, which is SLOW: a trivial prompt
     # takes ~34s solo and ~57s at 3-concurrent, the whole time at ~0% CPU (blocked
@@ -419,6 +420,129 @@ def cooldown_for(data: dict, agent: str) -> dict | None:
     return cooldowns.get(agent) or cooldowns.get(agent.split("-")[0])
 
 
+def _positive_int(value: object, default: int) -> int:
+    try:
+        parsed = int(value) if value not in (None, "") else default
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _rate_pressure_window_seconds(args: argparse.Namespace | None = None) -> int:
+    value = getattr(args, "rate_pressure_window_s", None) if args is not None else None
+    if value is None:
+        value = os.environ.get("GOALFLIGHT_RATE_PRESSURE_WINDOW_SECONDS")
+    return _positive_int(value, DEFAULT_RATE_PRESSURE_WINDOW_SECONDS)
+
+
+def _rate_pressure_threshold(args: argparse.Namespace | None = None) -> int:
+    value = getattr(args, "rate_pressure_threshold", None) if args is not None else None
+    if value is None:
+        value = os.environ.get("GOALFLIGHT_RATE_PRESSURE_THRESHOLD")
+    return _positive_int(value, DEFAULT_RATE_PRESSURE_THRESHOLD)
+
+
+def current_rate_pressure(args: argparse.Namespace | None = None) -> dict:
+    """Return the transient rate-pressure recommendation for this state dir.
+
+    This is deliberately read-only: recent dispatch-ledger failures are the
+    cooldown source, and the recommendation disappears as those records age out
+    of the rolling window. No permanent caps or capacity state are mutated.
+    """
+    window_seconds = _rate_pressure_window_seconds(args)
+    threshold = _rate_pressure_threshold(args)
+    try:
+        billing = goalflight_rate_pressure.load_billing_accounts()
+        pool_map = goalflight_rate_pressure.agent_limit_pool_map(billing)
+        records = goalflight_rate_pressure.collect_records(state_dir())
+        pressure = goalflight_rate_pressure.pressure_per_provider(
+            records,
+            window_seconds=window_seconds,
+            pool_map=pool_map,
+        )
+        payload = goalflight_rate_pressure.recommend(
+            pressure,
+            dict(DEFAULT_AGENT_CAPS),
+            threshold=threshold,
+            pool_map=pool_map,
+        )
+        payload["state_dir"] = str(state_dir())
+        payload["window_seconds"] = window_seconds
+        payload["records_examined"] = len(records)
+        payload["limit_pool_map_loaded"] = bool(pool_map)
+        return payload
+    except Exception as exc:  # pragma: no cover - defensive status surface
+        return {
+            "schema": goalflight_rate_pressure.SCHEMA,
+            "threshold": threshold,
+            "window_seconds": window_seconds,
+            "providers_under_pressure": [],
+            "providers_observed": [],
+            "budget_keys_observed": [],
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+
+def adaptive_agent_cap(agent: str, base_agent_cap: int, pressure: dict | None = None) -> tuple[int, dict | None]:
+    pressure = pressure if pressure is not None else current_rate_pressure()
+    agent = normalize_agent(agent)
+    pool = cap_pool(agent)
+    for entry in pressure.get("providers_under_pressure") or []:
+        labels = [normalize_agent(str(label)) for label in entry.get("labels") or []]
+        if agent not in labels and pool not in labels:
+            continue
+        recommended_caps = entry.get("recommended_caps") or {}
+        recommended = recommended_caps.get(agent)
+        if recommended is None and pool != agent:
+            recommended = recommended_caps.get(pool)
+        if recommended is None:
+            continue
+        effective_cap = max(1, min(base_agent_cap, _positive_int(recommended, base_agent_cap)))
+        if effective_cap >= base_agent_cap:
+            continue
+        detail = {
+            "agent": agent,
+            "scope": entry.get("scope"),
+            "provider": entry.get("provider"),
+            "budget_key": entry.get("budget_key"),
+            "limit_pool_id": entry.get("limit_pool_id"),
+            "count": entry.get("count"),
+            "threshold": pressure.get("threshold"),
+            "window_seconds": pressure.get("window_seconds"),
+            "base_agent_cap": base_agent_cap,
+            "effective_agent_cap": effective_cap,
+            "recommended_caps": recommended_caps,
+            "fallback_providers": entry.get("fallback_providers") or [],
+        }
+        return effective_cap, detail
+    return base_agent_cap, None
+
+
+def rate_pressure_warnings(pressure: dict | None, limit: int = 5) -> list[str]:
+    if not pressure:
+        return []
+    warnings: list[str] = []
+    threshold = pressure.get("threshold")
+    window = pressure.get("window_seconds")
+    for entry in (pressure.get("providers_under_pressure") or [])[:limit]:
+        caps = []
+        for label, cap in sorted((entry.get("recommended_caps") or {}).items()):
+            current = (entry.get("current_caps") or {}).get(label)
+            caps.append(f"{label} {current}->{cap}" if current is not None else f"{label}->{cap}")
+        if entry.get("scope") == "agent":
+            subject = entry.get("budget_key") or "unknown"
+        else:
+            subject = entry.get("provider") or entry.get("budget_key") or "unknown"
+        warnings.append(
+            "adaptive rate pressure "
+            f"{subject}: count={entry.get('count')}/{threshold} window={window}s; "
+            f"effective caps {', '.join(caps) or 'n/a'}; new dispatches wait"
+        )
+    if pressure.get("error"):
+        warnings.append(f"adaptive rate pressure unavailable: {pressure.get('error')}")
+    return warnings
+
+
 def cmd_profile(args: argparse.Namespace) -> int:
     payload = profile(args)
     if args.json:
@@ -454,7 +578,9 @@ def cmd_acquire(args: argparse.Namespace) -> int:
         leases = active_leases(data)
         max_total = args.max_total or prof["operating_cap"]
         pool = cap_pool(agent)
-        agent_cap = args.agent_cap or DEFAULT_AGENT_CAPS.get(pool, DEFAULT_AGENT_CAPS.get(agent, 2))
+        base_agent_cap = args.agent_cap or DEFAULT_AGENT_CAPS.get(pool, DEFAULT_AGENT_CAPS.get(agent, 2))
+        pressure = current_rate_pressure(args)
+        agent_cap, adaptive_pressure = adaptive_agent_cap(agent, base_agent_cap, pressure)
         agent_count = sum(
             1 for lease in leases if cap_pool(normalize_agent(lease.get("agent", ""))) == pool
         )
@@ -465,7 +591,17 @@ def cmd_acquire(args: argparse.Namespace) -> int:
             print(json.dumps(payload, sort_keys=True))
             return 2
         if agent_count >= agent_cap:
-            payload = {"decision": "wait", "reason": "agent_worker_cap", "agent": agent, "active": agent_count, "agent_cap": agent_cap}
+            reason = "adaptive_rate_pressure" if adaptive_pressure else "agent_worker_cap"
+            payload = {
+                "decision": "wait",
+                "reason": reason,
+                "agent": agent,
+                "active": agent_count,
+                "agent_cap": agent_cap,
+                "base_agent_cap": base_agent_cap,
+            }
+            if adaptive_pressure:
+                payload["adaptive_rate_pressure"] = adaptive_pressure
             save_state(data)
             print(json.dumps(payload, sort_keys=True))
             return 2
@@ -593,7 +729,14 @@ def cmd_status(args: argparse.Namespace) -> int:
     with StateLock():
         data = load_state()
     prune_state(data)
-    payload = {"schema": SCHEMA, "profile": profile(args), "state": data, "active": active_leases(data)}
+    pressure = current_rate_pressure(args)
+    payload = {
+        "schema": SCHEMA,
+        "profile": profile(args),
+        "state": data,
+        "active": active_leases(data),
+        "rate_pressure": pressure,
+    }
     if args.json:
         print(json.dumps(payload, sort_keys=True))
         return 0
@@ -605,6 +748,8 @@ def cmd_status(args: argparse.Namespace) -> int:
         print("cooldowns:")
         for cooldown in data["cooldowns"].values():
             print(f"- {cooldown['agent']}: {cooldown.get('reason')} until {cooldown.get('until')}")
+    for warning in rate_pressure_warnings(pressure):
+        print(f"warning: {warning}")
     return 0
 
 
@@ -616,6 +761,8 @@ def build_parser() -> argparse.ArgumentParser:
     parent.add_argument("--worst-worker-mb", type=int, default=DEFAULT_WORST_WORKER_MB)
     parent.add_argument("--hard-cap", type=int, default=DEFAULT_HARD_CAP)
     parent.add_argument("--max-total", type=int)
+    parent.add_argument("--rate-pressure-window-s", type=int)
+    parent.add_argument("--rate-pressure-threshold", type=int)
 
     sub = parser.add_subparsers(dest="cmd", required=True)
     prof = sub.add_parser("profile", parents=[parent])

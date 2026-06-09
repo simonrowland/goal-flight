@@ -53,6 +53,28 @@ def sample_payload() -> dict:
     }
 
 
+def sample_pressure_payload() -> dict:
+    payload = sample_payload()
+    payload["rate_pressure"] = {
+        "schema": "goalflight.rate-pressure.v1",
+        "threshold": 3,
+        "window_seconds": 600,
+        "providers_under_pressure": [
+            {
+                "scope": "agent",
+                "provider": "openai",
+                "budget_key": "agent:codex",
+                "count": 3,
+                "labels": ["codex"],
+                "current_caps": {"codex": 10},
+                "recommended_caps": {"codex": 5},
+                "fallback_providers": ["cursor", "grok"],
+            }
+        ],
+    }
+    return payload
+
+
 def test_scope() -> None:
     p = S.scope_payload(sample_payload(), "/repo/A")
     ids = {r["dispatch_id"] for r in p["dispatch"]["records"]}
@@ -180,6 +202,13 @@ def test_done_code() -> None:
     check("missing classification -> 2 (do not claim done)", S.done_code({}) == 2)
 
 
+def test_rate_pressure_warning_rendered() -> None:
+    digest = "\n".join(S.render_text(sample_pressure_payload(), 10))
+    check("digest surfaces adaptive rate-pressure warning",
+          "warning: adaptive rate pressure agent:codex" in digest)
+    check("digest shows reduced codex cap", "codex 10->5" in digest)
+
+
 def test_cli() -> None:
     orig_payload, orig_root = S.status_payload, S.this_project_root
     S.status_payload = sample_payload
@@ -216,6 +245,7 @@ def main() -> int:
     test_worktree_scope()
     test_worktree_scope_symlinked_root()
     test_done_code()
+    test_rate_pressure_warning_rendered()
     test_cli()
     if _FAILS:
         print(f"\n{len(_FAILS)} FAILED: {_FAILS}")

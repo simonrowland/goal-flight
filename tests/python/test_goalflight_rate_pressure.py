@@ -9,7 +9,8 @@ Test surface covers:
 - pressure_per_provider() windowing — records older than the window are
   excluded; multiple labels for the same provider sum correctly.
 - recommend() — provider-level cap halving (floor 1), fallback-provider list
-  populated, only providers at-or-above threshold appear.
+  populated, only providers at-or-above threshold appear; model-capacity
+  pressure stays label-scoped.
 - collect_records() reads a tmp state dir cleanly.
 """
 
@@ -118,6 +119,15 @@ def test_detect_failed_with_usage_limit_text_excerpt():
     record = {"agent": "claude", "state": "failed"}
     status = {"text_excerpt": "You've hit your limit — resets at 2am."}
     assert_true("usage-limit text in excerpt", rp.detect_rate_limit_signature(record, status))
+
+
+def test_detect_failed_with_codex_model_capacity_message():
+    """Codex's selected-model capacity failure is label-scoped pressure."""
+    record = {"agent": "codex", "state": "failed"}
+    status = {"error": "ERROR: Selected model is at capacity. Please try a different model."}
+    assert_true("codex model capacity detected", rp.detect_rate_limit_signature(record, status))
+    assert_eq("codex model capacity scope",
+              rp.detect_pressure_scope(record, status), rp.MODEL_CAPACITY_SCOPE)
 
 
 def test_detect_failed_unrelated_error_does_not_trigger():
@@ -232,6 +242,37 @@ def test_pressure_mixed_providers_in_window():
     assert_eq("xai", counts.get("provider:xai"), 1)
 
 
+def test_pressure_model_capacity_is_label_scoped():
+    """Model-capacity failures count for the failing label, not its provider."""
+    now = time.time()
+    recent_iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now - 60))
+    state_dir = Path("/tmp") / f"goal-flight-test-model-capacity-{time.time_ns()}"
+    status_dir = state_dir / "dispatch"
+    status_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        records = []
+        for idx in range(3):
+            status_path = status_dir / f"codex-{idx}.status.json"
+            status_path.write_text(json.dumps({
+                "error": "ERROR: Selected model is at capacity. Please try a different model.",
+            }))
+            records.append({
+                "dispatch_id": f"codex-{idx}",
+                "agent": "codex",
+                "state": "failed",
+                "updated_at": recent_iso,
+                "status_path": str(status_path),
+            })
+        counts = rp.pressure_per_provider(records, window_seconds=600, now_ts=now)
+        assert_eq("codex model capacity label key", counts.get("agent:codex"), 3)
+        assert_eq("codex model capacity not provider-wide", counts.get("provider:openai"), None)
+    finally:
+        for p in status_dir.glob("*.json"):
+            p.unlink()
+        status_dir.rmdir()
+        state_dir.rmdir()
+
+
 # ----- recommend() -----
 
 def test_recommend_below_threshold_empty():
@@ -269,6 +310,29 @@ def test_recommend_above_threshold_halves_caps():
     assert_eq("opencode halved", pup["recommended_caps"]["opencode"], 5)
     assert_eq("opencode-acp halved", pup["recommended_caps"]["opencode-acp"], 5)
     assert_eq("opencode-bash-tail halved", pup["recommended_caps"]["opencode-bash-tail"], 5)
+
+
+def test_recommend_model_capacity_halves_only_affected_label():
+    """agent:<label> pressure must not throttle sibling OpenAI labels."""
+    out = rp.recommend(
+        {"agent:codex": 3},
+        {
+            "codex": 10,
+            "codex-acp": 10,
+            "codex-bash-tail": 10,
+            "opencode": 10,
+            "opencode-acp": 10,
+            "opencode-bash-tail": 10,
+        },
+        threshold=3,
+    )
+    assert_eq("one label pressure entry", len(out["providers_under_pressure"]), 1)
+    pup = out["providers_under_pressure"][0]
+    assert_eq("label pressure scope", pup["scope"], "agent")
+    assert_eq("label budget key", pup["budget_key"], "agent:codex")
+    assert_eq("provider retained for fallback context", pup["provider"], "openai")
+    assert_eq("only codex label included", pup["labels"], ["codex"])
+    assert_eq("only codex recommended cap", pup["recommended_caps"], {"codex": 5})
 
 
 def test_recommend_cap_floor_one():

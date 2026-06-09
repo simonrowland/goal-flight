@@ -2,7 +2,7 @@
 """Adaptive rate-limit pressure detector for goal-flight.
 
 Reads the dispatch ledger and recent worker status files, classifies failures
-into rate-limit pressure per provider, and emits a JSON recommendation the
+into account rate-limit pressure per provider or model capacity per label, and emits a JSON recommendation the
 orchestrator reads before its next dispatch decision. Read-only in v1 — the
 orchestrator decides whether to act; this script never mutates capacity state.
 
@@ -34,6 +34,7 @@ error fields for these patterns (case-insensitive substring match):
   - "anthropic.RateLimitError", "openai.RateLimitError"
   - "session_limit"
   - "blocked_session_limit"  (goal-flight's own classification)
+  - "Selected model is at capacity" / "model is at capacity" (label-scoped)
 
 Pressure rule
 -------------
@@ -42,14 +43,14 @@ DEFAULT: 3+ rate-limit signatures for the same provider within the last 600s
 
 Recommendation
 --------------
-For each provider under pressure:
-  - reduce that provider's effective cap by 50% (floor 1)
+For each provider or model label under pressure:
+  - reduce that provider's or label's effective cap by 50% (floor 1)
   - re-route task categories the SKILL.md routing table defaults onto that
     provider toward the documented fallback
 
-The orchestrator reads this JSON, surfaces a STATUS marker to the user, and
-optionally re-routes its next dispatch. Mutation of capacity state is
-explicitly out of scope for v1 — keep the policy human-supervisable.
+The orchestrator/capacity gate reads this JSON, surfaces a STATUS marker to the
+user, and optionally re-routes its next dispatch. Mutation of capacity state is
+explicitly out of scope — keep the policy human-supervisable.
 """
 
 from __future__ import annotations
@@ -109,7 +110,8 @@ PROVIDER_FALLBACK: dict[str, list[str]] = {
     "cursor":            ["codex", "grok"],
 }
 
-# Substring patterns indicating a rate-limit failure. Case-insensitive.
+# Substring patterns indicating an account/provider rate-limit failure.
+# Case-insensitive.
 RATE_LIMIT_PATTERNS: tuple[str, ...] = (
     "rate_limit",
     "rate-limit",
@@ -122,6 +124,17 @@ RATE_LIMIT_PATTERNS: tuple[str, ...] = (
     "session_limit",
     "blocked_session_limit",
 )
+
+# Substring patterns indicating model-specific capacity, not account-wide quota.
+# These reduce only the label that produced the signal.
+MODEL_CAPACITY_PATTERNS: tuple[str, ...] = (
+    "selected model is at capacity",
+    "model is at capacity",
+    "at capacity",
+)
+
+ACCOUNT_RATE_LIMIT_SCOPE = "account_rate_limit"
+MODEL_CAPACITY_SCOPE = "model_capacity"
 
 
 def provider_for(agent_label: str) -> str | None:
@@ -195,8 +208,24 @@ def _read_status(record: dict) -> dict | None:
         return None
 
 
-def detect_rate_limit_signature(record: dict, status: dict | None) -> bool:
-    """Return True if this dispatch shows rate-limit failure signs.
+def _status_haystack(status: dict | None) -> str:
+    if not status:
+        return ""
+    haystack_parts: list[str] = []
+    err = status.get("error")
+    if err:
+        if isinstance(err, dict):
+            haystack_parts.append(json.dumps(err))
+        else:
+            haystack_parts.append(str(err))
+    excerpt = status.get("text_excerpt")
+    if excerpt:
+        haystack_parts.append(str(excerpt))
+    return " ".join(haystack_parts).lower()
+
+
+def detect_pressure_scope(record: dict, status: dict | None) -> str | None:
+    """Return the pressure scope for this dispatch, or None.
 
     Checks: record.state (goal-flight's classification), status.error fields,
     and status.text_excerpt for vendor-specific patterns.
@@ -208,30 +237,27 @@ def detect_rate_limit_signature(record: dict, status: dict | None) -> bool:
     """
     state = (record.get("state") or "").lower()
     if state == "blocked_session_limit":
-        return True
+        return ACCOUNT_RATE_LIMIT_SCOPE
     if state == "failed":
         # Need to look at the status payload for the actual error shape.
         pass
     elif state not in {"failed", "inconclusive_timeout"}:
         # Successful, pending, or auth-blocked dispatches don't count.
-        return False
+        return None
 
-    if not status:
-        return False
-    haystack_parts: list[str] = []
-    err = status.get("error")
-    if err:
-        if isinstance(err, dict):
-            haystack_parts.append(json.dumps(err))
-        else:
-            haystack_parts.append(str(err))
-    excerpt = status.get("text_excerpt")
-    if excerpt:
-        haystack_parts.append(str(excerpt))
-    haystack = " ".join(haystack_parts).lower()
+    haystack = _status_haystack(status)
     if not haystack:
-        return False
-    return any(pat in haystack for pat in RATE_LIMIT_PATTERNS)
+        return None
+    if any(pat in haystack for pat in MODEL_CAPACITY_PATTERNS):
+        return MODEL_CAPACITY_SCOPE
+    if any(pat in haystack for pat in RATE_LIMIT_PATTERNS):
+        return ACCOUNT_RATE_LIMIT_SCOPE
+    return None
+
+
+def detect_rate_limit_signature(record: dict, status: dict | None) -> bool:
+    """Return True if this dispatch shows pressure signs."""
+    return detect_pressure_scope(record, status) is not None
 
 
 def pressure_per_provider(
@@ -241,10 +267,11 @@ def pressure_per_provider(
     *,
     pool_map: dict[str, str] | None = None,
 ) -> dict[str, int]:
-    """Count rate-limit signatures per budget key within window.
+    """Count pressure signatures per budget key within window.
 
     Keys are `pool:<limit_pool_id>` when fleet billing map is available,
-    otherwise `provider:<provider_key>`.
+    otherwise `provider:<provider_key>`. Model-capacity signals use
+    `agent:<label>` because they are not account-wide quota signals.
     """
     if now_ts is None:
         now_ts = time.time()
@@ -252,14 +279,20 @@ def pressure_per_provider(
     counts: dict[str, int] = {}
     for record in records:
         agent = record.get("agent")
-        key = budget_key_for_agent(agent, pool_map=pool_map) if agent else None
-        if not key:
+        if not agent:
             continue
         updated = record.get("updated_at") or record.get("started_at") or ""
         if not updated or updated < cutoff_iso:
             continue
         status = _read_status(record)
-        if not detect_rate_limit_signature(record, status):
+        scope = detect_pressure_scope(record, status)
+        if scope is None:
+            continue
+        if scope == MODEL_CAPACITY_SCOPE:
+            key = f"agent:{str(agent).strip().lower()}"
+        else:
+            key = budget_key_for_agent(agent, pool_map=pool_map)
+        if not key:
             continue
         counts[key] = counts.get(key, 0) + 1
     return counts
@@ -281,6 +314,7 @@ def recommend(
         key = budget_key_for_agent(agent_label, pool_map=pool_map)
         if key:
             label_groups.setdefault(key, []).append(agent_label)
+        label_groups.setdefault(f"agent:{agent_label}", []).append(agent_label)
 
     out: dict[str, Any] = {
         "schema": SCHEMA,
@@ -293,6 +327,11 @@ def recommend(
         if count < threshold:
             continue
         labels = label_groups.get(budget_key, [])
+        scope = "provider"
+        if budget_key.startswith("agent:"):
+            scope = "agent"
+            agent_label = budget_key.split(":", 1)[1]
+            labels = labels or [agent_label]
         recommended_caps = {
             label: max(1, current_caps.get(label, 5) // 2)
             for label in labels
@@ -308,8 +347,11 @@ def recommend(
                 for label in labels
             }
             provider = provider or provider_for(labels[0]) if labels else None
+        if scope == "agent":
+            provider = provider_for(labels[0]) if labels else provider
         fallback = PROVIDER_FALLBACK.get(provider or "", [])
         entry = {
+            "scope": scope,
             "provider": provider,
             "limit_pool_id": limit_pool_id,
             "budget_key": budget_key,
