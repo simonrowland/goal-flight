@@ -4,6 +4,58 @@ Notable changes to the goal-flight Claude Code skill. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are
 incremented when meaningful skill behaviour changes.
 
+## [1.0.4] — 2026-06-09
+
+Dispatch-reliability + worker-engine release on top of the 1.0.3 dispatch-death fix.
+
+### Added
+
+- **Multi-dispatch `--wait`.** `goalflight_status.py --wait <id1,id2,...>` (comma or
+  repeated) blocks until every named dispatch reaches a terminal state via the
+  authoritative `done_code()` liveness, with `--wait-timeout`/`--poll-s`; the
+  dispatcher prints the canonical wait hint after launch.
+- **Doctor worker write-probe.** `goalflight_doctor.py --worker-write-probe` verifies an
+  engine can write a file end-to-end (catches engines that "finish" without persisting).
+- **Adaptive capacity walk-back.** Repeated provider "model at capacity" signals now feed
+  a transient, **label-scoped** effective-cap reduction (`min(static, recommend())`) so
+  new dispatches queue instead of failing and killing in-flight workers; surfaced in
+  status and aged out by the rolling ledger window (no permanent cap mutation).
+- **Dispatch-ref cleanup.** `goalflight_cleanup_dispatch_refs.py` (+ allowlisted
+  `git_prune_claude_refs`, run before fetch) prunes corrupt/stale `refs/heads/claude/*`
+  that break fleet fetch; preserves checked-out worktree + remote-backed refs and fails
+  closed if the protected set can't be determined.
+- **cursor + claude-acp** wired into the unified dispatcher happy path.
+
+### Fixed
+
+- **grok workers execute tools + emit terminal markers.** A grok-only prompt preamble
+  forces tool execution and a final `COMPLETE:` marker, ending the
+  `worker_dead_no_terminal_marker` failures; a conservative routing guard gates grok
+  file-writing on a passing write-probe. grok-research default model corrected to
+  `grok-composer-2.5-fast`.
+- **claude-acp handshake.** `claude-code-cli-acp` only enters ACP stdio mode with no argv;
+  the default `--model` injection is removed and an explicit model is applied via the ACP
+  session.
+- **Dispatch ergonomics.** Code-writer default idle window raised to 600s (read-only /
+  research keep 180s); `--done` treats `idle_timeout` as live only after an identity-aware
+  pid+start-time check, with a reattach hint; read-only review dispatches that expect a
+  file write are refused (inline-return is allowed); reused non-terminal dispatch ids are
+  refused (dup-id collision).
+- **Terminal marker precedence.** A dead worker that emitted a recognized terminal marker
+  is classified terminal regardless of pid liveness (the idle real-pid check applies only
+  when no marker is present).
+- **Fleet.** Live remote dispatch works end-to-end; an auth-probe tooling failure
+  (exit 127 / no-JSON) is treated as inconclusive and re-probed instead of cached as an
+  authoritative auth-red; `--prompt`/`--prompt-b64` are redacted across every serialized
+  ssh argv, preview, and failure-output path.
+- **opencode smoke tests** skip (rather than fail) when the OpenCode/LiteLLM backend is
+  unhealthy.
+
+### Docs
+
+- cursor orchestrator wake-on-worker-completion (background shell + marker contract);
+  fleet remote git lifecycle; gotchas index. SKILL kept within its byte/line budgets.
+
 ## [1.0.3] — 2026-06-04
 
 ### Fixed
