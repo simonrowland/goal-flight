@@ -226,6 +226,15 @@ if [ -f "$TAIL_PATH" ]; then
   last_size=${last_size:-0}
 fi
 
+# Suspend/sleep grace: if the gap between consecutive watcher polls vastly exceeds
+# the poll cadence, the WATCHER itself was suspended (laptop sleep) — wall-clock
+# idle accounting across that gap is invalid (the worker was suspended too, not
+# idle). Observed 2026-06-09: lid-close sleep produced phantom idle_for >> max-idle
+# on wake and killed two healthy mid-verify codex workers (macOS ps %cpu also reads
+# ~0 right after wake, defeating the CPU/wedge grace).
+SLEEP_GAP_GRACE_SECS=$(( POLL_SECS * 5 + 120 ))
+prev_loop_ts=$(date +%s)
+
 echo "[watcher start $(date '+%H:%M:%S')] worker_pid=$WORKER_PID controller_pid=$CONTROLLER_PID tail=$TAIL_PATH markers='$MARKER_RE' poll=${POLL_SECS}s max_idle=${MAX_IDLE_SECS}s"
 
 terminal_marker_seen() {
@@ -242,6 +251,16 @@ emit_marker_exit() {
 }
 
 while true; do
+  # 0. Suspend/sleep detection — reset idle clock across suspend gaps.
+  now_loop_ts=$(date +%s)
+  loop_gap=$(( now_loop_ts - prev_loop_ts ))
+  if [ "$loop_gap" -gt "$SLEEP_GAP_GRACE_SECS" ]; then
+    echo "[$(date '+%H:%M:%S')] WATCHER-STATE: suspend-gap detected (${loop_gap}s between polls > ${SLEEP_GAP_GRACE_SECS}s grace) — resetting idle clock (system slept; worker not idle)"
+    last_size_change_ts=$now_loop_ts
+    wedge_streak=0
+  fi
+  prev_loop_ts=$now_loop_ts
+
   # 1. Orchestrator alive? (orphan watcher self-detection)
   if ! kill -0 "$CONTROLLER_PID" 2>/dev/null; then
     echo "[$(date '+%H:%M:%S')] controller PID $CONTROLLER_PID is gone"
