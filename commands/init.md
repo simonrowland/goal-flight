@@ -156,7 +156,7 @@ Do not paste full probe output.
 
 7. Confirm git hygiene:
 
-- `docs-private/` runtime contents ignored (skeleton README and `.gitkeep` placeholders may be tracked in the skill repo; populated project state stays local)
+- `docs-private/` fully gitignored — create needed directories with `mkdir -p` at init time; never track a skeleton (`.gitkeep` exceptions are how private content gets force-added by accident)
 - `AGENTS.md` tracked or intentionally absent
 - root `SKILL.md` tracked or intentionally absent
 - current branch/head/dirty state recorded in resume notes

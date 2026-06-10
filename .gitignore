@@ -40,3 +40,8 @@ tests/manual/.acp-hardening-report.json
 tests/manual/.acp-hardening-run.log
 .goalflight-acp-*.status.json
 codedb.snapshot
+
+# Private per-project runtime state. Fully untracked — init creates directories
+# at runtime; never track a skeleton here (tracked exceptions are how private
+# content gets force-added by accident).
+docs-private/

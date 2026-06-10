@@ -127,9 +127,10 @@ Do **not** commit private project notes, local probe dumps, or orchestrator
 scratch into this skill repository. Public docs (`docs/`, `README.md`) describe
 shipped behavior; they do not replace private runtime files.
 
-If you add scaffolding for `docs-private/` in the skill repo itself, track only
-a neutral skeleton (for example `.gitkeep` plus a short README). Never commit
-populated project state.
+`docs-private/` is fully untracked in this repo (root `.gitignore`); the init
+flow creates the directories it needs at runtime. Do not track a `.gitkeep`
+skeleton for it — tracked exceptions are exactly how private content gets
+force-added by accident. Never commit anything under `docs-private/`.
 
 ## Git-visible trigger hygiene
 
