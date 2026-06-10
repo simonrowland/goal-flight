@@ -17,6 +17,7 @@ import goalflight_compat
 import goalflight_ledger
 from goalflight_liveness import (
     LivenessThresholds,
+    active_monotonic,
     classify_liveness,
     pgroup_cpu_pct,
     process_group_id,
@@ -283,7 +284,13 @@ def main() -> int:
         print(json.dumps({"state": payload["state"], "reason": payload["reason"], "status_path": str(status_path)}, sort_keys=True))
         return 4
     last_size = -1
-    last_change = time.time()
+    # Idle accounting uses the sleep-excluding clock (active_monotonic):
+    # macOS CLOCK_UPTIME_RAW / Linux CLOCK_MONOTONIC freeze across system
+    # sleep, so a lid-close suspend does NOT count as worker idle time —
+    # wall-clock deltas here produced phantom idle_timeout kills on wake
+    # (same class as watch-dispatch-tail.sh's suspend-gap fix, 2026-06-09).
+    # time.time() remains for epoch display fields (updated_at) only.
+    last_change = active_monotonic()
     terminal = None
     markers: list[dict] = []
     exit_reason = "unknown"
@@ -359,9 +366,9 @@ def main() -> int:
         markers, size = extract_markers(tail, ignore_prefix_lines=ignore_prefix_lines)
         if size != last_size:
             last_size = size
-            last_change = time.time()
+            last_change = active_monotonic()
         now = time.time()
-        seconds_since_event = now - last_change
+        seconds_since_event = active_monotonic() - last_change
         terminal = _last_line_is_terminal_marker(tail, ignore_prefix_lines=ignore_prefix_lines)
         if terminal:
             # Stability recheck (minimal gap protection): if bytes arrive within a short
