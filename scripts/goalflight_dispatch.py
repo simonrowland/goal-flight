@@ -1546,7 +1546,28 @@ def build_worker(args, prompt_path, raw_argv: list[str]):
         # wrong default for grok-research (observed live: composer web_fetch errors
         # + Wikipedia-only answers vs grok-build's nature.com primary source).
         default_model = "grok-build" if args.agent == "grok-research" else "grok-composer-2.5-fast"
-        argv = ["grok", "--prompt-file", str(prompt_path), "--permission-mode", "acceptEdits"]
+        # PERMISSION MODE — pass NO `--permission-mode` flag (do not "fix" by
+        # swapping the value). grok 0.2.39 regression (verified 2026-06-10): in
+        # single-turn `--prompt-file` mode, EVERY `--permission-mode` value stops
+        # the file-write tool from writing — none produce the file; only OMITTING
+        # the flag does. The tail varies by value (probe: grok-composer-2.5-fast,
+        # write-a-file prompt):
+        #   omit-flag    -> file written + DONE marker, rc=0   (the only one that works)
+        #   default      -> 1-byte no-op, no file
+        #   acceptEdits  -> 1-byte no-op, no file   (this is the value we shipped)
+        #   auto         -> 0-byte no-op, no file
+        #   dontAsk      -> prints a normal completion marker but STILL skips the write
+        # The empty no-ops (default/acceptEdits/auto) make the watcher record
+        # worker_dead_no_terminal_marker — how the shipped acceptEdits killed 4
+        # grok-research dispatches (~18-25s, empty tails) on 2026-06-10; dontAsk is
+        # worse, faking a clean finish with no artifact. All values are still listed
+        # in `grok --help`, so this is a CLI regression, not a parse error. No safe
+        # middle-ground value exists, bypassPermissions is too broad, and a
+        # per-dispatch healthcheck would tax every dispatch's critical path — so the
+        # fix is the deterministic omit, locked by a regression test
+        # (tests/python/test_acp_model_passthrough.py). Same lesson as the stale
+        # model note above: grok flags drift; re-validate before trusting one.
+        argv = ["grok", "--prompt-file", str(prompt_path)]
         argv += ["--model", str(model) if model else default_model]
         if args.cwd:
             argv += ["--cwd", args.cwd]

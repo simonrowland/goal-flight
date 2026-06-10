@@ -4,6 +4,26 @@ Notable changes to the goal-flight Claude Code skill. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are
 incremented when meaningful skill behaviour changes.
 
+## [1.0.6] — 2026-06-10
+
+### Fixed
+
+- **grok worker dispatch no longer passes `--permission-mode`.** grok CLI 0.2.39
+  regressed so that in single-turn `--prompt-file` mode, **every** `--permission-mode`
+  value stops the file-write tool from writing — none produce the file; only
+  omitting the flag does. Probe (`grok-composer-2.5-fast`, write-a-file prompt):
+  omit-flag writes the file + emits the terminal marker (rc=0); `default`/`acceptEdits`
+  are 1-byte no-ops with no file; `auto` is a 0-byte no-op; `dontAsk` prints a normal
+  completion marker but still skips the write. The empty no-ops make the watcher
+  record `worker_dead_no_terminal_marker` — how the shipped `acceptEdits` killed four
+  grok-research dispatches on 2026-06-10 (~18-25s, empty tails); `dontAsk` is worse,
+  faking a clean finish with no artifact. The values all remain valid in `grok --help`,
+  so this is a CLI regression, not a parse error. `build_worker` now emits the grok
+  preset with **no** `--permission-mode` flag (the only invocation that permits
+  non-interactive in-cwd edits); `bypassPermissions` was rejected as too broad and a
+  per-dispatch healthcheck as needless critical-path latency. Locked by a regression
+  test and a `build_worker` comment; legacy `protocols/legacy/bash-tail.md` updated.
+
 ## [1.0.5] — 2026-06-09
 
 Post-1.0.4 polish from a package audit + a cross-slice consolidation review.

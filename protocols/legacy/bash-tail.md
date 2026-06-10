@@ -78,14 +78,21 @@ documents the canonical `/goal` mode invocation including the
 
 ```bash
 grok -p "<prompt>" \
-  --permission-mode acceptEdits \
   --cwd "<workdir>" \
   > /tmp/grok-<slug>.txt 2>&1 &
 WORKER_PID=$!
 ```
 
-`--permission-mode acceptEdits` is grok's equivalent of the codex bypass —
-auto-accepts file edits without interactive prompts.
+Pass **no** `--permission-mode` flag. grok 0.2.39 (verified 2026-06-10 with both
+`-p` and `--prompt-file`) regressed so that in single-turn mode **every**
+`--permission-mode` value stops the file-write tool from writing — none produce
+the file; only omitting the flag does. The empty-no-op values (`default`,
+`acceptEdits`, `auto`) leave the worker exiting 0 with an empty tail, which the
+watcher records as `worker_dead_no_terminal_marker`; `dontAsk` is worse — under
+`--prompt-file` it printed a normal completion marker yet still skipped the write.
+Historically `--permission-mode acceptEdits` was used here as grok's equivalent of
+the codex bypass; that flag now breaks edits rather than enabling them. See the
+regression note in `scripts/goalflight_dispatch.py` (`build_worker`, grok preset).
 
 ### claude (headless one-shot)
 

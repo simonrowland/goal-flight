@@ -152,6 +152,16 @@ def case_build_worker_injects_model() -> None:
         and argv_research[argv_research.index("--model") + 1] == RESEARCH_MODEL
     ), argv_research
     assert "--disable-web-search" not in argv_research, argv_research
+    # grok 0.2.39 regression: in single-turn `--prompt-file` mode EVERY
+    # `--permission-mode` value stops the file-write tool from writing (none produce
+    # the file); the empty no-ops surface as worker_dead_no_terminal_marker. Omitting
+    # the flag is the only invocation that writes in-cwd non-interactively. Lock the
+    # omit for both presets so a future "re-add acceptEdits" cannot regress
+    # edit-heavy chunks.
+    for agent in ("grok-code", "grok-research"):
+        argv = _build(agent, None)
+        assert "--permission-mode" not in argv, (agent, argv)
+        assert "acceptEdits" not in argv, (agent, argv)
     # raw `-- <cmd>` passthrough ignores model (the orchestrator supplies the cmd).
     assert _build("x", MODEL, raw=["echo", "hi"]) == ["echo", "hi"]
 
