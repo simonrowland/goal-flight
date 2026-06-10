@@ -291,17 +291,24 @@ leak-free, so it carries unknown helper-leak risk the bash-tail path avoids.)
 selects the worker model on both transports — bash via `build_worker`, ACP via
 `agent_command`. With `--model` omitted, each agent keeps its own default — except
 **claude**, which defaults to `opus` (its clear strongest — quality-by-default for
-workers; pass `--model haiku` for speed). codex already defaults strong; `grok-code`
-defaults `grok-composer-2.5-fast`; `grok-research` also defaults `grok-composer-2.5-fast`
-(web search on by default; grok-build — grok.com's default — is broken on this machine);
-cursor keeps its own default (strongest is ambiguous).
-The selector is inserted PER-AGENT (the flag and its position differ — a blind
-append breaks codex/grok ACP), so pass the **agent's own id format**:
+workers; pass `--model haiku` for speed). codex already defaults strong; cursor keeps its own default (strongest is
+ambiguous).
+
+**Grok is the exception — do NOT pass `--model` for grok.** The harness selects
+grok's model automatically from the agent id, matched to the task, so dispatch
+instructions never name it: choose `grok-code` for coding or `grok-research` for
+web search/fetch and the correct model is wired in by `build_worker` /
+`agent_command`. (Which model maps to which agent is an implementation detail in
+`goalflight_dispatch.py`, not an agent-facing knob.)
+
+For the agents whose model you DO choose, the selector is inserted PER-AGENT (the
+flag and its position differ — a blind append breaks codex/grok ACP), so pass the
+**agent's own id format**:
 
 | Agent | Example | ACP form |
 |---|---|---|
-| grok-code | `--agent grok-code` (default composer-2.5) | `grok agent --model <id> stdio` |
-| grok-research | `--agent grok-research` (default composer-2.5) | `grok agent --model <id> stdio` |
+| grok-code | `--agent grok-code` (no `--model` — harness picks) | `grok agent stdio` (harness inserts the model) |
+| grok-research | `--agent grok-research` (no `--model` — harness picks) | `grok agent stdio` (harness inserts the model) |
 | claude (speed) | `--agent claude --model haiku` | `claude-code-cli-acp --model <id>` |
 | codex | `--agent codex --model o3` | bash `codex exec --model <id>`; ACP `-c model=<id>` |
 | cursor | `--agent cursor --model sonnet-4` | `cursor-agent --model <id> acp` (best-effort) |
@@ -309,8 +316,8 @@ append breaks codex/grok ACP), so pass the **agent's own id format**:
 grok/codex/claude placements are verified; cursor is best-effort (its ACP arg
 position is not separately confirmed). OpenCode model selection belongs to the
 host-specific helper or raw passthrough command, not `goalflight_dispatch.py
---agent opencode`. Bare `--agent grok` is retired —
-use `grok-code` or `grok-research`. The direct CLI: `grok -m grok-composer-2.5-fast …`.
+--agent opencode`. Bare `--agent grok` is retired — use `grok-code` or
+`grok-research` and let the harness pick the model.
 
 ## Capacity gate
 
