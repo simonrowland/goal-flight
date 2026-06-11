@@ -330,9 +330,18 @@ def case_acquire_atomic_gate_still_blocks_over_cap(state_dir: Path) -> None:
 
 
 def case_adaptive_rate_pressure_reduces_codex_effective_cap(state_dir: Path) -> None:
-    """Clustered codex model-capacity failures halve only codex effective cap."""
+    """Clustered codex model-capacity failures halve only codex effective cap.
+
+    Derived from DEFAULT_AGENT_CAPS (not hardcoded counts) so capacity tunes
+    don't break the adaptive-halving contract this case actually tests.
+    """
+    base_cap = cap.DEFAULT_AGENT_CAPS["codex"]
+    adapted_cap = max(1, base_cap // 2)
     _seed_codex_at_capacity_records(state_dir, count=3)
-    leases = {_future_active_lease(idx)["lease_id"]: _future_active_lease(idx) for idx in range(5)}
+    leases = {
+        _future_active_lease(idx)["lease_id"]: _future_active_lease(idx)
+        for idx in range(adapted_cap)
+    }
     cap.save_state(
         {
             "schema": cap.SCHEMA,
@@ -352,12 +361,12 @@ def case_adaptive_rate_pressure_reduces_codex_effective_cap(state_dir: Path) -> 
             "--ram-mb", "65536",
             "--max-total", "20",
         ])
-    assert rc == 2, f"adaptive sixth codex acquire should wait (rc={rc}, stdout={buf.getvalue()})"
+    assert rc == 2, f"adaptive over-cap codex acquire should wait (rc={rc}, stdout={buf.getvalue()})"
     payload = json.loads(buf.getvalue())
     assert payload["reason"] == "adaptive_rate_pressure", payload
-    assert payload["active"] == 5, payload
-    assert payload["base_agent_cap"] == 10, payload
-    assert payload["agent_cap"] == 5, payload
+    assert payload["active"] == adapted_cap, payload
+    assert payload["base_agent_cap"] == base_cap, payload
+    assert payload["agent_cap"] == adapted_cap, payload
     pressure = payload["adaptive_rate_pressure"]
     assert pressure["scope"] == "agent", pressure
     assert pressure["provider"] == "openai", pressure
@@ -414,7 +423,8 @@ def case_adaptive_rate_pressure_status_surfaces_warning(state_dir: Path) -> None
     out = buf.getvalue()
     assert rc == 0, rc
     assert "warning: adaptive rate pressure agent:codex" in out, out
-    assert "codex 10->5" in out, out
+    base_cap = cap.DEFAULT_AGENT_CAPS["codex"]
+    assert f"codex {base_cap}->{max(1, base_cap // 2)}" in out, out
 
 
 def case_empty_state_dir_falls_back_not_cwd() -> None:
