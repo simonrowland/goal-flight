@@ -83,10 +83,14 @@ DEFAULT_AGENT_CAPS = {
     "claude-code-cli-acp": 5,
     "codex": 10,
     "codex-acp": 10,       # stress-tested 2026-05-20: 49/49 + 13/13 TRUE-simultaneous, zero wedges
-    "grok": 10,
-    "grok-acp": 10,
-    "grok-code": 10,
-    "grok-research": 10,
+    # grok loosened 10->14 (2026-06-10): multi-controller queueing observed with
+    # ZERO rate-pressure evidence (449 ledger records, no providers under
+    # pressure); grok is sub-billed, and the adaptive walk-back halves effective
+    # caps at acquire-time if rejections appear. Revisit after more logged hours.
+    "grok": 14,
+    "grok-acp": 14,
+    "grok-code": 14,
+    "grok-research": 14,
     # Gateway orchestrators: lower cap, longer orchestration latency (Track D).
     "herm-worker": 2,
     "cla-worker": 2,
