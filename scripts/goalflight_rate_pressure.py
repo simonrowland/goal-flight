@@ -124,6 +124,18 @@ RATE_LIMIT_PATTERNS: tuple[str, ...] = (
     "openai.ratelimiterror",
     "session_limit",
     "blocked_session_limit",
+    # Coverage-audit additions (2026-06-10) — provider phrases the original
+    # list missed. Matching stays failure-state-gated (detect_pressure_scope),
+    # so prompt-echo inside successful runs cannot false-positive.
+    "too many requests",        # OpenAI/HTTP prose form of 429
+    "insufficient_quota",       # OpenAI hard quota
+    "rate_limit_error",         # Anthropic API error type
+    "overloaded_error",         # Anthropic 529 error type
+    "529",                      # Anthropic overloaded HTTP status (same precedent as bare "429")
+    "session limit",            # Claude CLI prose (space form; underscore form above)
+    "resource_exhausted",       # gRPC/generic quota signal
+    "quota exceeded",           # generic billing/quota hard limit
+    "check your settings to continue",  # Cursor plan/usage block (full phrase for precision)
 )
 
 # Substring patterns indicating model-specific capacity, not account-wide quota.
@@ -222,6 +234,13 @@ def _status_haystack(status: dict | None) -> str:
     excerpt = status.get("text_excerpt")
     if excerpt:
         haystack_parts.append(str(excerpt))
+    # Coverage audit 2026-06-10: result_text carries the worker's final reply,
+    # which on failure-state dispatches often holds the provider's limit prose
+    # (text_excerpt can truncate it away). Safe to scan: detect_pressure_scope
+    # state-gates this haystack to failure-ish records only.
+    result_text = status.get("result_text")
+    if result_text:
+        haystack_parts.append(str(result_text))
     return " ".join(haystack_parts).lower()
 
 
@@ -239,14 +258,22 @@ def detect_pressure_scope(record: dict, status: dict | None) -> str | None:
     state = (record.get("state") or "").lower()
     if state == "blocked_session_limit":
         return ACCOUNT_RATE_LIMIT_SCOPE
-    if state == "failed":
-        # Need to look at the status payload for the actual error shape.
-        pass
-    elif state not in {"failed", "inconclusive_timeout"}:
-        # Successful, pending, or auth-blocked dispatches don't count.
+    # Failure-ish states whose error text deserves a pattern scan (coverage
+    # audit 2026-06-10 widened this from {failed, inconclusive_timeout}).
+    # DELIBERATELY EXCLUDED: "blocked_capacity" is goal-flight's OWN capacity
+    # gate — counting it would feed our queueing back into the walk-back and
+    # falsely halve provider caps (self-referential pressure). "blocked_auth"
+    # stays excluded per the note above.
+    if state not in {"failed", "inconclusive_timeout", "blocked", "inconclusive_no_final"}:
+        # Successful, pending, capacity-, or auth-blocked dispatches don't count.
         return None
 
     haystack = _status_haystack(status)
+    # The ledger record's own error field is a second signal carrier the status
+    # file may lack (e.g. spawn-path failures) — coverage audit 2026-06-10.
+    record_error = record.get("error")
+    if record_error:
+        haystack = f"{haystack} {str(record_error).lower()}".strip()
     if not haystack:
         return None
     if any(pat in haystack for pat in MODEL_CAPACITY_PATTERNS):

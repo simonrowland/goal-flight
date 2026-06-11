@@ -411,6 +411,28 @@ def test_collect_records_reads_files():
 
 # ----- runner -----
 
+def test_coverage_audit_patterns_states_and_guards():
+    """2026-06-10 coverage-audit fold: provider phrases, widened failure
+    states, record.error + result_text carriers, and the self-referential
+    blocked_capacity guard."""
+    S = rp.detect_pressure_scope
+    A = rp.ACCOUNT_RATE_LIMIT_SCOPE
+    # new provider phrases classify on failure states
+    assert_eq("429 prose", S({"state": "failed"}, {"error": "HTTP 429 Too Many Requests"}), A)
+    assert_eq("insufficient_quota", S({"state": "failed"}, {"text_excerpt": "insufficient_quota: billing"}), A)
+    assert_eq("overloaded blocked-state", S({"state": "blocked"}, {"text_excerpt": "anthropic overloaded_error (529)"}), A)
+    assert_eq("session limit result_text", S({"state": "inconclusive_no_final"}, {"result_text": "You have reached your session limit"}), A)
+    assert_eq("cursor settings block", S({"state": "failed"}, {"result_text": "Check your settings to continue"}), A)
+    # ledger record.error is a signal carrier even with no status file
+    assert_eq("record.error carrier", S({"state": "failed", "error": "resource_exhausted"}, None), A)
+    # goal-flight's OWN capacity gate must never count (self-referential
+    # pressure would let our queueing falsely halve provider caps)
+    assert_eq("blocked_capacity guard", S({"state": "blocked_capacity"}, {"error": "machine_worker_cap rate limit"}), None)
+    # auth-blocked and successful dispatches stay excluded even with limit text
+    assert_eq("blocked_auth excluded", S({"state": "blocked_auth"}, {"error": "429"}), None)
+    assert_eq("complete excluded", S({"state": "complete"}, {"result_text": "rate limit discussion in a review"}), None)
+
+
 def _run_tests():
     failed = []
     passed = 0
