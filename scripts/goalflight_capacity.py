@@ -312,8 +312,17 @@ def operating_cap_for_ram(ram_mb: int, raw_ceiling: int) -> int:
     elif ram_mb <= 64 * 1024:
         tier = 6
     else:
-        tier = 16  # >64GB: 16 workers (was 8). Headroom for multi-session
-                   # parallel work now that per-agent caps allow codex/grok=10.
+        # >64GB: tier == DEFAULT_HARD_CAP (was 16, before that 8). On RAM-rich
+        # machines the global cap is NOT a memory bound — the acquire-time RSS
+        # budget owns RAM safety, per-pool caps + adaptive walk-back own
+        # provider limits — it is a CPU/blast-radius BACKSTOP for the case
+        # where many workers run local test suites simultaneously. 16 was two
+        # arbitrary constants stacked (it bound multi-controller storms well
+        # below the pool sums); raised to 20 on monitored evidence
+        # (2026-06-10/11: ~1h through three concurrent review storms, zero
+        # rate-pressure, no saturation alerts). Going past 20 means revisiting
+        # DEFAULT_HARD_CAP with CPU-aware reasoning, not this ladder.
+        tier = 20
     return max(1, min(raw_ceiling, tier))
 
 
