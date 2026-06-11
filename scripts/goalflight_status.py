@@ -140,6 +140,11 @@ def done_code(record: dict) -> int:
         return 1 if _rechecked_worker_alive(record) else 0
     if cls == _LIVE_CLASS:
         return 1
+    if cls in {"queued_capacity", "waiting_capacity"}:
+        # Queued for a capacity slot: live by definition (the launcher is
+        # polling acquire; the wait deadline bounds it). Without this branch
+        # the raw-state fallback would misreport a queued dispatch as DONE.
+        return 1
     if cls in _AMBIGUOUS_CLASS or cls.startswith("stale_"):
         return 2
     return 0

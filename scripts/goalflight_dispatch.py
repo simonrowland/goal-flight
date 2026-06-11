@@ -40,6 +40,7 @@ import contextlib
 import io
 import json
 import os
+import random
 import re
 import signal
 import shutil
@@ -51,7 +52,7 @@ from pathlib import Path
 import goalflight_compat
 import goalflight_capacity
 import goalflight_ledger
-from goalflight_liveness import process_group_id, write_status
+from goalflight_liveness import active_monotonic, process_group_id, write_status
 from goalflight_watch import _last_line_is_terminal_marker, _marker_state as _marker_state_for_terminal
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -1064,6 +1065,44 @@ def _resolve_account_env(args) -> dict[str, str]:
     raise DispatchUsageError(f"--account unsupported for engine {engine!r}")
 
 
+# Bounded capacity-wait defaults per priority lane (seconds). The dispatcher
+# QUEUES inside _acquire_capacity by re-attempting acquire until a slot frees
+# or the deadline lapses — the canonical wait that controllers previously
+# hand-rolled with re-dispatch loops. bulk waits longest (batch work, fine to
+# idle); critical shortest (it borrows headroom, so a block means the machine
+# is truly full). 0 disables waiting (legacy instant DISPATCH-BLOCKED).
+CAPACITY_WAIT_DEFAULTS_S = {"bulk": 900, "normal": 600, "critical": 120}
+_CAPACITY_WAIT_POLL_S = 15.0
+
+
+def _capacity_wait_seconds(args) -> float:
+    """Resolve the queue budget: CLI flag > env > lane default.
+
+    The env override (GOALFLIGHT_CAPACITY_WAIT_S) exists for test suites and
+    emergencies; an explicit --capacity-wait-s still wins over it.
+    """
+    cli = getattr(args, "capacity_wait_s", None)
+    if cli is not None:
+        return max(0.0, float(cli))
+    env_override = os.environ.get("GOALFLIGHT_CAPACITY_WAIT_S")
+    if env_override not in (None, ""):
+        try:
+            value = max(0.0, float(env_override))
+        except ValueError:
+            print(
+                f"goalflight_dispatch: ignoring invalid GOALFLIGHT_CAPACITY_WAIT_S={env_override!r}",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"goalflight_dispatch: capacity wait {value}s from GOALFLIGHT_CAPACITY_WAIT_S",
+                file=sys.stderr,
+            )
+            return value
+    priority = getattr(args, "priority", None) or "normal"
+    return float(CAPACITY_WAIT_DEFAULTS_S.get(priority, 600))
+
+
 def _acquire_capacity(args, *, project_root: Path, status_json: Path) -> str | None:
     lease_ttl_s = max(int(args.max_idle_secs or 300) * 4, 3600)
     acquire_args = argparse.Namespace(
@@ -1086,14 +1125,14 @@ def _acquire_capacity(args, *, project_root: Path, status_json: Path) -> str | N
         hard_cap=goalflight_capacity.DEFAULT_HARD_CAP,
         max_total=None,
     )
-    acquire_out = io.StringIO()
-    with contextlib.redirect_stdout(acquire_out):
-        rc = goalflight_capacity.cmd_acquire(acquire_args)
-    try:
-        payload = json.loads(acquire_out.getvalue() or "{}")
-    except json.JSONDecodeError:
-        payload = {"raw": acquire_out.getvalue()}
-    if rc != 0:
+    wait_budget_s = _capacity_wait_seconds(args)
+    # Sleep-excluding clock: a lid-close suspend must not burn the queue window
+    # (same active_monotonic discipline as the watchers).
+    wait_started = active_monotonic()
+    deadline = wait_started + wait_budget_s if wait_budget_s > 0 else None
+    attempt = 0
+
+    def _write_blocked(blocked_payload: dict) -> None:
         write_status(
             status_json,
             {
@@ -1101,14 +1140,98 @@ def _acquire_capacity(args, *, project_root: Path, status_json: Path) -> str | N
                 "dispatch_id": args.dispatch_id,
                 "agent": args.agent,
                 "state": "blocked_capacity",
-                "reason": payload,
+                "reason": blocked_payload,
                 "worker_alive": False,
                 "updated_at": int(time.time()),
             },
         )
-        print("DISPATCH-BLOCKED " + json.dumps({"state": "blocked_capacity", "reason": payload}, sort_keys=True), flush=True)
-        raise SystemExit(rc)
-    return payload.get("lease", {}).get("lease_id")
+        print("DISPATCH-BLOCKED " + json.dumps({"state": "blocked_capacity", "reason": blocked_payload}, sort_keys=True), flush=True)
+
+    # A SIGTERM/SIGINT during the (possibly minutes-long) queue must not strand
+    # a non-terminal `waiting_capacity` status: convert to SystemExit so the
+    # interrupt handler below writes the terminal record. Handlers restored on
+    # exit (the post-acquire dispatch phases keep their default behavior).
+    def _wait_signal(signum, _frame):
+        raise SystemExit(128 + signum)
+
+    blocked_written = False
+    old_handlers = {}
+    for _signame in ("SIGTERM", "SIGINT"):
+        _sig = getattr(signal, _signame, None)
+        if _sig is not None:
+            with contextlib.suppress(Exception):
+                old_handlers[_sig] = signal.signal(_sig, _wait_signal)
+    try:
+        while True:
+            attempt += 1
+            acquire_out = io.StringIO()
+            with contextlib.redirect_stdout(acquire_out):
+                rc = goalflight_capacity.cmd_acquire(acquire_args)
+            try:
+                payload = json.loads(acquire_out.getvalue() or "{}")
+            except json.JSONDecodeError:
+                payload = {"raw": acquire_out.getvalue()}
+            if rc == 0:
+                return payload.get("lease", {}).get("lease_id")
+            waited_s = round(active_monotonic() - wait_started, 1)
+            # Only genuine "wait" decisions queue; errors (e.g. unknown
+            # priority) and anything else fail immediately.
+            can_wait = payload.get("decision") == "wait" and deadline is not None and active_monotonic() < deadline
+            if not can_wait:
+                blocked_payload = dict(payload)
+                blocked_payload["waited_s"] = waited_s
+                blocked_payload["attempts"] = attempt
+                _write_blocked(blocked_payload)
+                blocked_written = True
+                raise SystemExit(rc)
+            # Queued: surface it (status plane + launcher tail) and re-attempt.
+            write_status(
+                status_json,
+                {
+                    "schema": "goalflight.status.v1",
+                    "dispatch_id": args.dispatch_id,
+                    "agent": args.agent,
+                    "state": "waiting_capacity",
+                    "reason": payload,
+                    "waited_s": waited_s,
+                    "wait_budget_s": wait_budget_s,
+                    "worker_alive": False,
+                    "updated_at": int(time.time()),
+                },
+            )
+            if attempt == 1 or attempt % 4 == 0:
+                print(
+                    "CAPACITY-WAIT "
+                    + json.dumps(
+                        {
+                            "dispatch_id": args.dispatch_id,
+                            "agent": args.agent,
+                            "priority": acquire_args.priority,
+                            "reason": payload.get("reason"),
+                            "waited_s": waited_s,
+                            "wait_budget_s": wait_budget_s,
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+            # Jitter de-synchronizes multiple queued launchers' polls.
+            time.sleep(_CAPACITY_WAIT_POLL_S + random.uniform(0.0, 2.0))
+    except (SystemExit, KeyboardInterrupt):
+        if not blocked_written:
+            _write_blocked(
+                {
+                    "decision": "wait",
+                    "reason": "wait_interrupted",
+                    "waited_s": round(active_monotonic() - wait_started, 1),
+                    "attempts": attempt,
+                }
+            )
+        raise
+    finally:
+        for _sig, _old in old_handlers.items():
+            with contextlib.suppress(Exception):
+                signal.signal(_sig, _old)
 
 
 def _record_ledger(args, *, project_root: Path, prompt_path: str | None, status_json: Path,
@@ -1600,6 +1723,11 @@ def main(argv: list[str] | None = None) -> int:
                         help="Capacity lane. bulk = review storms / batch work (reserves the last "
                              "machine+pool slots for others); critical = fix dispatches (may borrow "
                              "beyond the operating cap, never past the RAM ceiling). Default normal.")
+    parser.add_argument("--capacity-wait-s", type=float, default=None,
+                        help="How long to QUEUE for a capacity slot before DISPATCH-BLOCKED "
+                             "(re-attempts acquire every ~15s; sleep-excluding clock). Default by "
+                             "lane: bulk 900 / normal 600 / critical 120. 0 = fail instantly. "
+                             "Env override: GOALFLIGHT_CAPACITY_WAIT_S.")
     parser.add_argument("--account",
                         help="Which subscription account/profile to bill the worker to (shared remote "
                              "worker pools). Codex resolves to CODEX_HOME=~/.goal-flight/accounts/<name>/codex; "
@@ -1749,7 +1877,37 @@ def main(argv: list[str] | None = None) -> int:
     }
 
     try:
-        lease_id = _acquire_capacity(args, project_root=project_root, status_json=status_json)
+        # Pre-record the ledger BEFORE the capacity queue: the (possibly
+        # minutes-long) wait window must be visible to goalflight_status
+        # (classified queued_capacity = live) and must trip the reused-id
+        # guard for a duplicate explicit --dispatch-id (review P1: the guard
+        # is ledger-based, so a ledger-less wait window was bypassable).
+        _record_ledger(
+            args,
+            project_root=project_root,
+            prompt_path=prompt_path,
+            status_json=status_json,
+            tail=tail,
+            lease_id=None,
+            worker_pid=None,
+            state="waiting_capacity",
+        )
+        ledger_recorded = True
+        try:
+            lease_id = _acquire_capacity(args, project_root=project_root, status_json=status_json)
+        except (SystemExit, KeyboardInterrupt):
+            # Queue exhausted or interrupted: the status file already says
+            # blocked_capacity; make the ledger finish agree instead of the
+            # generic "failed", mirroring the status plane's specific reason
+            # (wait_interrupted vs machine_worker_cap vs agent_worker_cap ...).
+            final_state = "blocked_capacity"
+            final_reason = "capacity_wait"
+            with contextlib.suppress(Exception):
+                blocked = json.loads(Path(status_json).read_text(encoding="utf-8"))
+                specific = (blocked.get("reason") or {}).get("reason")
+                if specific:
+                    final_reason = f"capacity_wait:{specific}"
+            raise
         _record_ledger(
             args,
             project_root=project_root,
@@ -1760,7 +1918,6 @@ def main(argv: list[str] | None = None) -> int:
             worker_pid=None,
             state="starting",
         )
-        ledger_recorded = True
 
         # 1. Launch the worker DETACHED, output -> tail (prompt -> stdin for codex).
         # Account guards ran before prompt/id/lease side effects; only apply the

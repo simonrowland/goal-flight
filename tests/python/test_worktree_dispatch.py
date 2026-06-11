@@ -88,6 +88,7 @@ def test_worktree_create_routes_distinct_cwds_and_stale_probe() -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             os.environ["GOALFLIGHT_STATE_DIR"] = str(root / "state")
+            os.environ["GOALFLIGHT_CAPACITY_WAIT_S"] = "0"
             repo = make_repo(root)
 
             args_one = argparse.Namespace(cwd=str(repo))
@@ -359,6 +360,7 @@ def test_runner_worktree_status_and_capacity_contract() -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             os.environ["GOALFLIGHT_STATE_DIR"] = str(root / "state")
+            os.environ["GOALFLIGHT_CAPACITY_WAIT_S"] = "0"
             repo = make_repo(root)
             status_path = repo / "status.json"
             args = runner_args(repo, "acp-run-contract", status_path)
@@ -419,6 +421,7 @@ def test_capacity_denied_does_not_create_worktree() -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             os.environ["GOALFLIGHT_STATE_DIR"] = str(root / "state")
+            os.environ["GOALFLIGHT_CAPACITY_WAIT_S"] = "0"
             repo = make_repo(root)
             status_path = repo / "capacity-denied-status.json"
             args = runner_args(repo, "acp-capacity-denied", status_path)
@@ -456,6 +459,7 @@ def test_runner_worktree_create_failure_writes_failed_status() -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             os.environ["GOALFLIGHT_STATE_DIR"] = str(root / "state")
+            os.environ["GOALFLIGHT_CAPACITY_WAIT_S"] = "0"
             repo = make_repo(root)
             existing = repo / "worktrees" / "acp-existing"
             existing.mkdir(parents=True)

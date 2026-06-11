@@ -27,6 +27,9 @@ def _env(tmp: Path) -> dict[str, str]:
     env = os.environ.copy()
     env["GOALFLIGHT_STATE_DIR"] = str(tmp / "state")
     env["GOAL_FLIGHT_PIDFILE_DIR"] = str(tmp / "pids")
+    # Tests assert the instant DISPATCH-BLOCKED path; disable the capacity
+    # queue (lane defaults wait minutes, which would hang subprocess asserts).
+    env["GOALFLIGHT_CAPACITY_WAIT_S"] = "0"
     return env
 
 
@@ -358,6 +361,149 @@ def case_capacity_block_does_not_spawn() -> None:
         assert "DISPATCH-START " not in proc.stdout, proc.stdout
         assert not marker.exists(), "blocked dispatch spawned worker"
         assert json.loads(status_path.read_text())["state"] == "blocked_capacity"
+        # Instant fail must report the queue context (waited_s ~0, 1 attempt).
+        reason = json.loads(status_path.read_text())["reason"]
+        assert reason.get("attempts") == 1, reason
+
+
+def case_capacity_wait_queues_until_slot_frees() -> None:
+    """The capacity queue: a dispatch with a wait budget re-attempts acquire
+    and proceeds when the blocking lease is released (no controller re-dispatch
+    loop needed)."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        env = _env(tmp)
+        env["GOALFLIGHT_CAPACITY_MAX_TOTAL"] = "1"
+        env.pop("GOALFLIGHT_CAPACITY_WAIT_S", None)  # use the CLI flag below
+        held = subprocess.run(
+            [
+                sys.executable, "scripts/goalflight_capacity.py", "acquire",
+                "--agent", "test-dispatch", "--dispatch-id", "held-for-queue",
+                "--project-root", str(ROOT), "--ttl-s", "60",
+            ],
+            cwd=ROOT, env=env, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True,
+        )
+        lease_id = json.loads(held.stdout)["lease"]["lease_id"]
+
+        marker = tmp / "queued-then-spawned"
+        status_path = tmp / "queued.status.json"
+        worker_code = (
+            f"from pathlib import Path; import time; "
+            f"Path({str(marker)!r}).write_text('spawned'); "
+            f"print('COMPLETE: queued worker done', flush=True); time.sleep(0.3)"
+        )
+        proc = subprocess.Popen(
+            [
+                sys.executable, str(DISPATCH),
+                "--agent", "test-dispatch", "--dispatch-id", "queued-dispatch",
+                "--capacity-wait-s", "60",
+                "--poll-secs", "0.2", "--max-idle-secs", "20",
+                "--tail", str(tmp / "queued.tail"),
+                "--status-json", str(status_path),
+                "--", sys.executable, "-c", worker_code,
+            ],
+            cwd=ROOT, env=env, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        # Let it enter the queue, confirm the interim status, then free the slot.
+        deadline = time.time() + 12
+        waited_status_seen = False
+        while time.time() < deadline:
+            if status_path.exists():
+                try:
+                    if json.loads(status_path.read_text()).get("state") == "waiting_capacity":
+                        waited_status_seen = True
+                        break
+                except (json.JSONDecodeError, OSError):
+                    pass
+            time.sleep(0.25)
+        assert waited_status_seen, "dispatch never reported waiting_capacity"
+
+        # While queued: --done must report LIVE (exit 1), not done/ambiguous —
+        # the pre-recorded ledger entry classifies as queued_capacity.
+        done = subprocess.run(
+            [sys.executable, str(STATUS), "--done", "queued-dispatch"],
+            cwd=ROOT, env=env, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        assert done.returncode == 1, f"--done on queued dispatch: rc={done.returncode}\n{done.stdout}\n{done.stderr}"
+
+        # While queued: reusing the same explicit dispatch-id must be refused
+        # (the reused-id guard sees the non-terminal waiting_capacity record).
+        reuse = subprocess.run(
+            [
+                sys.executable, str(DISPATCH),
+                "--agent", "test-dispatch", "--dispatch-id", "queued-dispatch",
+                "--capacity-wait-s", "0",
+                "--tail", str(tmp / "reuse.tail"),
+                "--status-json", str(tmp / "reuse.status.json"),
+                "--", sys.executable, "-c", "print('nope')",
+            ],
+            cwd=ROOT, env=env, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        assert reuse.returncode != 0, "duplicate dispatch-id accepted during capacity wait"
+        assert "non-terminal" in (reuse.stderr + reuse.stdout), (reuse.stdout, reuse.stderr)
+
+        subprocess.run(
+            [
+                sys.executable, "scripts/goalflight_capacity.py", "release",
+                "--lease-id", lease_id,
+            ],
+            cwd=ROOT, env=env, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True,
+        )
+        stdout, stderr = proc.communicate(timeout=60)
+        assert proc.returncode == 0, f"queued dispatch rc={proc.returncode}\nstdout={stdout}\nstderr={stderr}"
+        assert "CAPACITY-WAIT " in stdout, stdout
+        assert "DISPATCH-START " in stdout, stdout
+        assert marker.exists(), "queued dispatch never spawned after slot freed"
+
+
+def case_capacity_wait_interrupt_writes_terminal_status() -> None:
+    """SIGTERM during the queue must not strand a non-terminal
+    waiting_capacity status: the launcher writes blocked_capacity
+    (wait_interrupted) and the ledger record finishes terminal."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        env = _env(tmp)
+        env["GOALFLIGHT_CAPACITY_MAX_TOTAL"] = "1"
+        subprocess.run(
+            [
+                sys.executable, "scripts/goalflight_capacity.py", "acquire",
+                "--agent", "test-dispatch", "--dispatch-id", "held-for-interrupt",
+                "--project-root", str(ROOT), "--ttl-s", "60",
+            ],
+            cwd=ROOT, env=env, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True,
+        )
+        status_path = tmp / "interrupted.status.json"
+        proc = subprocess.Popen(
+            [
+                sys.executable, str(DISPATCH),
+                "--agent", "test-dispatch", "--dispatch-id", "interrupted-dispatch",
+                "--capacity-wait-s", "120",
+                "--tail", str(tmp / "interrupted.tail"),
+                "--status-json", str(status_path),
+                "--", sys.executable, "-c", "print('never runs')",
+            ],
+            cwd=ROOT, env=env, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        _wait_for(
+            lambda: status_path.exists()
+            and json.loads(status_path.read_text()).get("state") == "waiting_capacity",
+            timeout_s=15.0,
+        )
+        proc.send_signal(signal.SIGTERM)
+        stdout, stderr = proc.communicate(timeout=20)
+        final = json.loads(status_path.read_text())
+        assert final["state"] == "blocked_capacity", final
+        assert final["reason"].get("reason") == "wait_interrupted", final
+        payload = _status(env)
+        row = _record(payload, "interrupted-dispatch")
+        assert row and row.get("state") == "blocked_capacity", row
 
 
 def case_require_prompt_before_side_effects() -> None:
@@ -963,6 +1109,8 @@ def main() -> None:
     case_status_sees_dispatch_and_lease_releases()
     case_live_controller_pidfile_preserves_blocked_worker_for_reattach()
     case_capacity_block_does_not_spawn()
+    case_capacity_wait_queues_until_slot_frees()
+    case_capacity_wait_interrupt_writes_terminal_status()
     case_require_prompt_before_side_effects()
     case_account_guard_before_prompt_materialization()
     case_codex_routed_subscription_strips_openai_api_key()

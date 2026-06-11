@@ -352,6 +352,27 @@ Convention: controllers SHOULD tag review storms `bulk` and reserve `critical`
 for work that unblocks other work. `capacity.py status` shows non-normal lanes
 as `prio=<lane>` on the lease line.
 
+### Capacity queue (`--capacity-wait-s`)
+
+`goalflight_dispatch.py` QUEUES for a slot: it re-attempts acquire every ~15s
+(jittered) until a slot frees or the budget lapses — no controller re-dispatch
+loop needed. Defaults by lane: bulk 900s / normal 600s / critical 120s
+(critical is short because it borrows headroom — if IT blocks, the machine is
+truly full). `--capacity-wait-s` overrides; `0` = legacy instant
+DISPATCH-BLOCKED; `GOALFLIGHT_CAPACITY_WAIT_S` env is a test/emergency
+override (an explicit CLI flag still wins). The deadline runs on the
+sleep-excluding clock (a lid-close does not burn the window). While queued the
+dispatch is fully visible: status `waiting_capacity`, ledger classification
+`queued_capacity`, `--done` reports LIVE, `CAPACITY-WAIT` lines on the
+launcher tail, and the dispatch-id is reserved (duplicate ids refused).
+Killed mid-wait -> terminal `blocked_capacity (wait_interrupted)`.
+
+Fairness honesty: this is contention polling, NOT FIFO — a newcomer can win a
+freed slot ahead of a longer waiter. Lanes handle PRIORITY; the deadline
+bounds the damage; ticket-FIFO is the named rung if sustained saturation ever
+makes starvation real. (ACP-shape and review_job acquires are still
+single-shot — parity is a known follow-up.)
+
 ## Ledger
 
 After spawn, record PID and prompt:

@@ -183,6 +183,11 @@ def classify(record: dict) -> str:
     }
     if state in terminal_states:
         return state
+    if state == "waiting_capacity":
+        # Queued for a capacity slot: no worker exists yet, so the identity
+        # checks below would misread this as unknown/ambiguous. It is a live,
+        # expected phase of dispatch (bounded by the capacity-wait deadline).
+        return "queued_capacity"
     ok, reason = identity_matches(record)
     if ok:
         return "expected_live"
@@ -267,7 +272,10 @@ def terminal_state_for(state: object, reason: object = None) -> str:
         return "blocked"
     if state == "blocked":
         return "blocked"
-    if state in {None, "", "running", "starting", "running_quiet", "handshaking"}:
+    if state in {None, "", "running", "starting", "running_quiet", "handshaking", "waiting_capacity"}:
+        # waiting_capacity = queued for a capacity slot (pre-spawn, live):
+        # non-terminal, so the reused-dispatch-id guard refuses duplicates
+        # while a launcher is queued.
         return "unknown"
     return "error"
 
