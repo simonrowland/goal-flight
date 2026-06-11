@@ -81,8 +81,13 @@ DEFAULT_AGENT_CAPS = {
     # parallelism, the Agent tool is still the native path — no adapter/PTY.)
     "claude": 5,
     "claude-code-cli-acp": 5,
-    "codex": 10,
-    "codex-acp": 10,       # stress-tested 2026-05-20: 49/49 + 13/13 TRUE-simultaneous, zero wedges
+    # codex loosened 10->12 (2026-06-10): monitored ~1h window through three
+    # multi-controller review storms — 483 dispatch-ledger records, zero
+    # providers under pressure, no saturation alerts. Stress-tested earlier at
+    # 49/49 + 13/13 TRUE-simultaneous with zero wedges (2026-05-20); the
+    # adaptive walk-back still halves effective caps on real rejections.
+    "codex": 12,
+    "codex-acp": 12,
     # grok loosened 10->14 (2026-06-10): multi-controller queueing observed with
     # ZERO rate-pressure evidence (449 ledger records, no providers under
     # pressure); grok is sub-billed, and the adaptive walk-back halves effective
