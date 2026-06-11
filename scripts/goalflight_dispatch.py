@@ -125,6 +125,38 @@ READ_ONLY_WRITE_PROMPT_PATTERNS = (
     ),
     ("shell output redirect", re.compile(r">\s*(docs-private|[^ \t\r\n]+[.](md|json|log))", re.I)),
 )
+
+# Web-research intent on a grok-code dispatch (B5c-style teaching guard).
+# grok-code runs the composer CODING model, which reliably fails web_fetch /
+# returns thin web results (observed live 2026-06-09: a research dispatch
+# tool_output_error'd repeatedly); grok-research runs grok-build, the web
+# model. Precision-first: signals are explicit web-research phrasings; bare
+# URLs and the word "research" alone must NOT trigger (code prompts cite repo
+# links; "research the codebase" is repo reading). Suppressors win.
+# Verb-led, live-action phrasings ONLY (review round 1 found 16+ coding false
+# positives in noun forms): bare "web search"/"websearch" must NOT match
+# (feature/module names), nor "web_fetch" as an implemented symbol, nor
+# "literature review" as a document, nor "internet-facing".
+RESEARCH_INTENT_PROMPT_PATTERNS = (
+    ("web search ask", re.compile(r"\b(?:search(?:es|ing)?\s+(?:the\s+)?(?:web|internet(?!-))|web[-_ ]search\s+for|search\s+online)\b", re.I)),
+    ("browse ask", re.compile(r"\b(?:browse\s+(?:the\s+)?(?:web|internet(?!-))|use\s+your\s+browser)\b", re.I)),
+    ("web fetch ask", re.compile(r"\b(?:web[-_ ]?fetch\s+the\b|fetch\s+(?:the\s+)?(?:page|url)s?\s+(?:from|at)\b)", re.I)),
+    ("cite source URL ask", re.compile(r"\bcite\b.{0,40}\bsource\s+urls?\b", re.I | re.S)),
+    ("literature hunt ask", re.compile(r"\b(?:find|locate|survey|gather)\b.{0,60}\b(?:papers|publications|datasheets?|literature)\b.{0,30}\b(?:online|on\s+the\s+web)\b", re.I | re.S)),
+    ("look up online ask", re.compile(r"\blook\s+up\b.{0,40}\bonline\b", re.I | re.S)),
+    ("deep research ask", re.compile(r"\bdeep[- ]research\b", re.I)),
+)
+RESEARCH_INTENT_SUPPRESSOR_PATTERNS = (
+    re.compile(r"\b(?:do\s+not|don'?t|never)\s+(?:use|access|touch)\s+(?:the\s+)?(?:web|internet|browser)\b", re.I),
+    re.compile(r"\bno\s+(?:web|internet)(?:\s+access)?\b", re.I),
+    # Scoped offline forms only — bare "offline" wrongly suppressed real
+    # research prompts that mention it incidentally (review round 1).
+    re.compile(r"\b(?:run|runs|work(?:ing)?|operate)\s+(?:fully\s+)?offline\b|\boffline\s+mode\b|\bfully\s+offline\b", re.I),
+    # Review/meta context: controller prompts ABOUT web features or web-research
+    # dispatches (inline-return reviews) are not live research.
+    re.compile(r"\bINLINE-RETURN\b|\bverdict\s+as\s+text\b|\bno\s+file\s+writes\b", re.I),
+)
+
 STEER_PROMPT_PREAMBLE = (
     "You have a steer mailbox at `$GOALFLIGHT_STEER_FILE`. Read it AT THE TOP OF EACH "
     "ITERATION and IMMEDIATELY BEFORE ANY git commit/push. Incorporate new messages "
@@ -640,6 +672,41 @@ def _guard_read_only_write_prompt(args) -> None:
     )
 
 
+def _research_intent_reason(args) -> str | None:
+    if args.agent != "grok-code" or getattr(args, "web_research_ok", False):
+        return None
+    # --read-only dispatches are review/analysis posture, not live web research
+    # (the same inline-return lesson as the B5c guard). Genuine web research
+    # belongs on --agent grok-research regardless.
+    if getattr(args, "read_only", False):
+        return None
+    if not _prompt_requested(args):
+        return None
+    text = _read_prompt_for_guard(args)
+    if not text:
+        return None
+    for pattern in RESEARCH_INTENT_SUPPRESSOR_PATTERNS:
+        if pattern.search(text):
+            return None
+    for label, pattern in RESEARCH_INTENT_PROMPT_PATTERNS:
+        if pattern.search(text):
+            return label
+    return None
+
+
+def _guard_grok_code_research_prompt(args) -> None:
+    reason = _research_intent_reason(args)
+    if not reason:
+        return
+    raise DispatchUsageError(
+        f"prompt looks like WEB RESEARCH (matched: {reason}) but --agent grok-code "
+        "runs the composer CODING model, which reliably fails web_fetch/web_search "
+        "(thin, error-prone results — observed live 2026-06-09). Re-dispatch with "
+        "--agent grok-research (web model, web tools on), or pass --web-research-ok "
+        "if this is genuinely a coding task that merely mentions the web."
+    )
+
+
 def _validate_before_side_effects(args, raw_argv: list[str]) -> None:
     if raw_argv:
         return
@@ -661,6 +728,7 @@ def _validate_before_side_effects(args, raw_argv: list[str]) -> None:
     if args.prompt_file and not Path(args.prompt_file).expanduser().exists():
         raise DispatchUsageError(f"prompt file not found: {args.prompt_file}")
     _guard_read_only_write_prompt(args)
+    _guard_grok_code_research_prompt(args)
 
 
 def _nonterminal_dispatch_reuse_reason(dispatch_id: str) -> str | None:
@@ -1723,6 +1791,10 @@ def main(argv: list[str] | None = None) -> int:
                         help="Capacity lane. bulk = review storms / batch work (reserves the last "
                              "machine+pool slots for others); critical = fix dispatches (may borrow "
                              "beyond the operating cap, never past the RAM ceiling). Default normal.")
+    parser.add_argument("--web-research-ok", action="store_true",
+                        help="Override the grok-code research-intent guard: confirm this prompt is "
+                             "a coding task that merely mentions the web (web research belongs on "
+                             "--agent grok-research, whose model can actually drive web tools).")
     parser.add_argument("--capacity-wait-s", type=float, default=None,
                         help="How long to QUEUE for a capacity slot before DISPATCH-BLOCKED "
                              "(re-attempts acquire every ~15s; sleep-excluding clock). Default by "

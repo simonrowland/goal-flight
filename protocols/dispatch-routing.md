@@ -317,7 +317,9 @@ grok/codex/claude placements are verified; cursor is best-effort (its ACP arg
 position is not separately confirmed). OpenCode model selection belongs to the
 host-specific helper or raw passthrough command, not `goalflight_dispatch.py
 --agent opencode`. Bare `--agent grok` is retired — use `grok-code` or
-`grok-research` and let the harness pick the model.
+`grok-research` and let the harness pick the model. Web-research-looking prompts
+on `grok-code` are bounced with a hint (composer can't drive web tools — use
+`grok-research`, or `--web-research-ok` to override a false positive).
 
 ## Capacity gate
 

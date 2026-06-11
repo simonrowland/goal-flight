@@ -115,6 +115,49 @@ def test_read_only_review_artifact_guard() -> None:
         check("mixed write path plus inline prompt is refused", False)
 
 
+def test_grok_code_research_intent_guard() -> None:
+    """Web-research prompts on grok-code bounce with a teaching hint; coding
+    prompts that merely mention the web, suppressed prompts, the override
+    flag, and other agents all pass (precision-first — B5c lesson)."""
+    def reason(**kw):
+        return D._research_intent_reason(_args(**kw))
+
+    research = "Research refractory coatings. Search the web for HfC data and cite source URLs."
+    # triggers on grok-code
+    check("web-search prompt triggers", reason(agent="grok-code", prompt=research) is not None)
+    check("deep-research triggers", reason(agent="grok-code", prompt="Run a deep-research sweep on UHTC oxidation.") is not None)
+    check("web-fetch triggers", reason(agent="grok-code", prompt="web_fetch the vendor page and summarize.") is not None)
+    # guard raises with the teaching message + override pointer
+    try:
+        D._guard_grok_code_research_prompt(_args(agent="grok-code", prompt=research))
+    except D.DispatchUsageError as exc:
+        check("guard names grok-research", "--agent grok-research" in str(exc))
+        check("guard names override", "--web-research-ok" in str(exc))
+    else:
+        check("research prompt on grok-code is refused", False)
+    # precision: must NOT trigger (round-1 review FP corpus)
+    check("bare URL does not trigger", reason(agent="grok-code", prompt="Fix the bug per https://github.com/x/y/issues/12 in this repo.") is None)
+    check("'research the codebase' does not trigger", reason(agent="grok-code", prompt="Research the codebase and refactor the parser.") is None)
+    check("scraper coding task does not trigger", reason(agent="grok-code", prompt="Implement the scraper module's retry logic per the spec in docs/.") is None)
+    check("web-search FEATURE does not trigger", reason(agent="grok-code", prompt="Add web search to the app settings page; wire the websearch module.") is None)
+    check("web_fetch as symbol does not trigger", reason(agent="grok-code", prompt="Refactor web_fetch() error handling and add tests for fetch retries.") is None)
+    check("literature-review doc does not trigger", reason(agent="grok-code", prompt="Move the literature review section into docs/ and fix its table.") is None)
+    check("internet-facing does not trigger", reason(agent="grok-code", prompt="Harden the internet-facing routes; audit the auth middleware.") is None)
+    check("meta-review prompt suppressed", reason(agent="grok-code", prompt="INLINE-RETURN review (read-only; no file writes): review the new web-search guard; it bounces prompts that say search the web.") is None)
+    check("--read-only exempt", reason(agent="grok-code", prompt="Search the web for HfC data.", read_only=True) is None)
+    # suppressors win
+    check("scoped offline suppressor wins", reason(agent="grok-code", prompt="Search the web examples are in fixtures; run fully offline.") is None)
+    check("no-web suppressor wins", reason(agent="grok-code", prompt="Do not use the web; search the web phrasing appears only in the quoted bug report.") is None)
+    check("incidental offline does NOT suppress", reason(agent="grok-code", prompt="Search the web for offline-first sync patterns and cite source URLs.") is not None)
+    # FN adds
+    check("look-up-online triggers", reason(agent="grok-code", prompt="Look up the HfB2 emissivity values online.") is not None)
+    check("fetch-url-from triggers", reason(agent="grok-code", prompt="Fetch the page from the vendor site and summarize the errata.") is not None)
+    # scoping + override
+    check("grok-research is exempt", reason(agent="grok-research", prompt=research) is None)
+    check("codex is exempt", reason(agent="codex", prompt=research) is None)
+    check("--web-research-ok overrides", reason(agent="grok-code", prompt=research, web_research_ok=True) is None)
+
+
 def test_reused_nonterminal_dispatch_id_guard() -> None:
     orig_find = D._find_dispatch_record
     try:
@@ -169,6 +212,7 @@ def test_dispatch_end_hint() -> None:
 def main() -> int:
     test_default_idle_windows()
     test_read_only_review_artifact_guard()
+    test_grok_code_research_intent_guard()
     test_reused_nonterminal_dispatch_id_guard()
     test_dispatch_end_hint()
     if _FAILS:
