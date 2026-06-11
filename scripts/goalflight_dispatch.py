@@ -1078,6 +1078,7 @@ def _acquire_capacity(args, *, project_root: Path, status_json: Path) -> str | N
         lease_id=None,
         mem_mb=None,
         agent_cap=None,
+        priority=getattr(args, "priority", None) or "normal",
         ttl_s=lease_ttl_s,
         ram_mb=None,
         reserve_mb=goalflight_capacity.DEFAULT_RESERVE_MB,
@@ -1595,6 +1596,10 @@ def main(argv: list[str] | None = None) -> int:
                              "Default = agent label's own default.")
     parser.add_argument("--read-only", action="store_true",
                         help="Read-only sandbox (review/analysis dispatches)")
+    parser.add_argument("--priority", choices=["critical", "normal", "bulk"], default="normal",
+                        help="Capacity lane. bulk = review storms / batch work (reserves the last "
+                             "machine+pool slots for others); critical = fix dispatches (may borrow "
+                             "beyond the operating cap, never past the RAM ceiling). Default normal.")
     parser.add_argument("--account",
                         help="Which subscription account/profile to bill the worker to (shared remote "
                              "worker pools). Codex resolves to CODEX_HOME=~/.goal-flight/accounts/<name>/codex; "

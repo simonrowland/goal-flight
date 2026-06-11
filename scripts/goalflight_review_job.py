@@ -501,6 +501,9 @@ def main(argv: list[str] | None = None) -> int:
         lease_id=None,
         mem_mb=None,
         agent_cap=None,
+        # Review jobs are batch work by definition: take the bulk lane so storms
+        # leave headroom for normal/critical dispatches (protocols/dispatch-routing.md).
+        priority="bulk",
         ttl_s=lease_ttl_s,
         ram_mb=None,
         reserve_mb=goalflight_capacity.DEFAULT_RESERVE_MB,

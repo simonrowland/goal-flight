@@ -96,6 +96,22 @@ DEFAULT_AGENT_CAPS = {
     "cla-worker": 2,
     "paperclip": 2,
 }
+# Priority lanes (2026-06-10): acquire is single-shot try-or-block (no queue),
+# so under multi-controller bursts ("review storms") bulk retries statistically
+# crowd out critical fix dispatches. Lanes reserve headroom instead of queueing:
+#   bulk     — may not take the last BULK_GLOBAL_RESERVE machine slots nor the
+#              last BULK_POOL_RESERVE slot of its agent pool. Review storms
+#              SHOULD dispatch with --priority bulk.
+#   normal   — default; exactly today's behavior.
+#   critical — may borrow CRITICAL_*_BORROW slots beyond the operating/pool cap
+#              (never beyond the RAM raw ceiling; pool borrow is DISABLED while
+#              adaptive rate-pressure is active — provider pushback wins).
+PRIORITY_LANES = ("critical", "normal", "bulk")
+BULK_GLOBAL_RESERVE = 3
+BULK_POOL_RESERVE = 1
+CRITICAL_GLOBAL_BORROW = 2
+CRITICAL_POOL_BORROW = 2
+
 TERMINAL_LEASE_STATES = {
     "released",
     "expired",
@@ -587,16 +603,39 @@ def cmd_acquire(args: argparse.Namespace) -> int:
         base_agent_cap = args.agent_cap or DEFAULT_AGENT_CAPS.get(pool, DEFAULT_AGENT_CAPS.get(agent, 2))
         pressure = current_rate_pressure(args)
         agent_cap, adaptive_pressure = adaptive_agent_cap(agent, base_agent_cap, pressure)
+        priority = (getattr(args, "priority", None) or "normal").strip().lower()
+        if priority not in PRIORITY_LANES:
+            save_state(data)  # persist the prune_state() above (hygiene)
+            print(json.dumps({"decision": "error", "reason": f"unknown priority {priority!r}; choose one of {PRIORITY_LANES}"}, sort_keys=True))
+            return 2
+        # Lane-adjusted ceilings. Global critical borrow never exceeds the RAM
+        # raw ceiling; pool critical borrow yields to active rate-pressure.
+        lane_max_total = max_total
+        lane_agent_cap = agent_cap
+        if priority == "bulk":
+            lane_max_total = max(1, max_total - BULK_GLOBAL_RESERVE)
+            lane_agent_cap = max(1, agent_cap - BULK_POOL_RESERVE)
+        elif priority == "critical":
+            lane_max_total = min(max_total + CRITICAL_GLOBAL_BORROW, prof["raw_ram_ceiling"])
+            if adaptive_pressure is None:
+                lane_agent_cap = agent_cap + CRITICAL_POOL_BORROW
         agent_count = sum(
             1 for lease in leases if cap_pool(normalize_agent(lease.get("agent", ""))) == pool
         )
         total_rss = sum(int(lease.get("mem_mb") or 0) for lease in leases)
-        if len(leases) >= max_total:
-            payload = {"decision": "wait", "reason": "machine_worker_cap", "active": len(leases), "max_total": max_total}
+        if len(leases) >= lane_max_total:
+            payload = {
+                "decision": "wait",
+                "reason": "machine_worker_cap",
+                "active": len(leases),
+                "max_total": max_total,
+                "priority": priority,
+                "lane_max_total": lane_max_total,
+            }
             save_state(data)
             print(json.dumps(payload, sort_keys=True))
             return 2
-        if agent_count >= agent_cap:
+        if agent_count >= lane_agent_cap:
             reason = "adaptive_rate_pressure" if adaptive_pressure else "agent_worker_cap"
             payload = {
                 "decision": "wait",
@@ -605,6 +644,8 @@ def cmd_acquire(args: argparse.Namespace) -> int:
                 "active": agent_count,
                 "agent_cap": agent_cap,
                 "base_agent_cap": base_agent_cap,
+                "priority": priority,
+                "lane_agent_cap": lane_agent_cap,
             }
             if adaptive_pressure:
                 payload["adaptive_rate_pressure"] = adaptive_pressure
@@ -612,7 +653,8 @@ def cmd_acquire(args: argparse.Namespace) -> int:
             print(json.dumps(payload, sort_keys=True))
             return 2
         if prof["ram_mb"] and total_rss + rss_mb > max(0, prof["ram_mb"] - prof["controller_reserve_mb"]):
-            payload = {"decision": "wait", "reason": "rss_budget", "active_rss_mb": total_rss, "request_mem_mb": rss_mb}
+            # RAM safety binds ALL lanes — critical cannot borrow past the RSS budget.
+            payload = {"decision": "wait", "reason": "rss_budget", "active_rss_mb": total_rss, "request_mem_mb": rss_mb, "priority": priority}
             save_state(data)
             print(json.dumps(payload, sort_keys=True))
             return 2
@@ -630,6 +672,7 @@ def cmd_acquire(args: argparse.Namespace) -> int:
             "controller_pid": args.controller_pid or os.getpid(),
             "worker_pid": args.worker_pid,
             "mem_mb": rss_mb,
+            "priority": priority,
             "state": "active",
             "started_at": iso(),
             "expires_at": iso(utc_now() + ttl),
@@ -749,7 +792,9 @@ def cmd_status(args: argparse.Namespace) -> int:
     prof = payload["profile"]
     print(f"capacity: active={len(payload['active'])}/{prof['operating_cap']} raw={prof['raw_ram_ceiling']} ram={prof['ram_mb']}MB")
     for lease in payload["active"]:
-        print(f"- {lease['lease_id']} agent={lease['agent']} dispatch={lease.get('dispatch_id')} mem={lease.get('mem_mb')}MB")
+        prio = lease.get("priority")
+        prio_part = f" prio={prio}" if prio and prio != "normal" else ""
+        print(f"- {lease['lease_id']} agent={lease['agent']} dispatch={lease.get('dispatch_id')} mem={lease.get('mem_mb')}MB{prio_part}")
     if data.get("cooldowns"):
         print("cooldowns:")
         for cooldown in data["cooldowns"].values():
@@ -787,6 +832,9 @@ def build_parser() -> argparse.ArgumentParser:
     acq.add_argument("--lease-id")
     acq.add_argument("--mem-mb", type=int)
     acq.add_argument("--agent-cap", type=int)
+    acq.add_argument("--priority", choices=list(PRIORITY_LANES), default="normal",
+                     help="capacity lane: bulk reserves headroom for others (review storms); "
+                          "critical may borrow beyond the operating/pool cap (fix dispatches)")
     acq.add_argument("--ttl-s", type=int, default=8 * 60 * 60)
     acq.set_defaults(func=cmd_acquire)
 

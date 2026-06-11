@@ -333,6 +333,25 @@ python3 <skill-root>/scripts/goalflight_capacity.py acquire \
 If decision is `wait`, do not spawn. Use another agent only if the concern
 coverage remains valid.
 
+### Priority lanes (`--priority {critical,normal,bulk}`)
+
+Acquire is single-shot try-or-block (no queue), so a burst of batch retries can
+statistically crowd out an urgent fix dispatch. Lanes reserve headroom instead
+of queueing — pass `--priority` on `goalflight_dispatch.py` (threaded through
+to acquire) or on `acquire` directly:
+
+- **bulk** — review storms / batch sweeps. May not take the last 3 machine
+  slots nor the last pool slot; bulk work backfills as the queue lightens.
+- **normal** — default; unchanged legacy behavior.
+- **critical** — fix-the-blocker dispatches. May borrow 2 slots beyond the
+  operating cap and 2 beyond the pool cap (never past the RAM raw ceiling;
+  pool borrow is disabled while adaptive rate-pressure is active — provider
+  pushback always wins).
+
+Convention: controllers SHOULD tag review storms `bulk` and reserve `critical`
+for work that unblocks other work. `capacity.py status` shows non-normal lanes
+as `prio=<lane>` on the lease line.
+
 ## Ledger
 
 After spawn, record PID and prompt:
