@@ -80,6 +80,7 @@ ACCOUNT_ENGINE_BY_AGENT = {
 RETIRED_AGENT_LABELS = {
     "grok": "use --agent grok-code (coding) or --agent grok-research (web search)",
 }
+GIT_BASE_PIN_RE = re.compile(r"(?<![A-Za-z0-9_./:-])([0-9A-Fa-f]{7,40})(?![A-Za-z0-9_./:-])")
 READ_ONLY_INLINE_RETURN_PROMPT_PATTERNS = (
     (
         "return inline",
@@ -653,6 +654,102 @@ def _read_prompt_for_guard(args) -> str:
         except OSError:
             return ""
     return ""
+
+
+def _extract_git_base_pins(text: str) -> list[str]:
+    return [m.group(1).lower() for m in GIT_BASE_PIN_RE.finditer(text or "")]
+
+
+def _git_head_for_cwd(cwd: Path) -> str | None:
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(cwd), "rev-parse", "--verify", "HEAD"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    head = proc.stdout.strip().splitlines()[0].lower() if proc.stdout.strip() else ""
+    return head if re.fullmatch(r"[0-9a-f]{40}", head) else None
+
+
+def _git_pin_warning(args) -> str | None:
+    if getattr(args, "ignore_git_warn", False) or not _prompt_requested(args):
+        return None
+    head = _git_head_for_cwd(_project_root(args))
+    if not head:
+        return None
+    text = _read_prompt_for_guard(args)
+    pins = _extract_git_base_pins(text)
+    short_head = head[:7]
+    if not pins:
+        return (
+            "WARN: prompt carries no git base pin; "
+            f"HEAD is {short_head} - workers on stale clones will build on the wrong base; "
+            f"add 'verify HEAD is {short_head}' or pass --ignore-git-warn"
+        )
+    mismatched_pins = [pin for pin in pins if not head.startswith(pin)]
+    if not mismatched_pins:
+        return None
+    return (
+        "WARN: GIT BASE PIN MISMATCH: "
+        f"prompt pin {mismatched_pins[0]} does not match cwd HEAD {short_head}; "
+        "stale brief or wrong repo state - workers on stale clones will build on the wrong base; "
+        "update the pin or pass --ignore-git-warn"
+    )
+
+
+def _grok_model_passthrough_warning(args) -> str | None:
+    if args.agent not in {"grok-code", "grok-research"} or not getattr(args, "model", None):
+        return None
+    return (
+        f"WARN: --model with --agent {args.agent} is advisory-only; "
+        "the harness wires grok model ids, so the flag is unnecessary and can break "
+        "silently on provider id drift"
+    )
+
+
+def _dispatch_warnings(args, raw_argv: list[str]) -> list[str]:
+    if raw_argv:
+        return []
+    warnings = []
+    for warning in (
+        _git_pin_warning(args),
+        _grok_model_passthrough_warning(args),
+    ):
+        if warning:
+            warnings.append(warning)
+    return warnings
+
+
+def _emit_dispatch_warnings(
+    warnings: list[str],
+    *,
+    tail_path: Path | None = None,
+    reset_tail: bool = False,
+) -> None:
+    if not warnings:
+        return
+    tail_file = None
+    if tail_path is not None:
+        with contextlib.suppress(OSError):
+            tail_path.parent.mkdir(parents=True, exist_ok=True)
+            tail_file = tail_path.open("w" if reset_tail else "a", encoding="utf-8")
+    try:
+        for warning in warnings:
+            line = f"goalflight_dispatch: {warning}"
+            print(line, file=sys.stderr, flush=True)
+            if tail_file is not None:
+                print(line, file=tail_file, flush=True)
+    finally:
+        if tail_file is not None:
+            tail_file.close()
 
 
 def _read_only_write_prompt_reason(args) -> str | None:
@@ -1592,6 +1689,12 @@ def _run_acp_shape(args, *, base: Path, account_env: dict[str, str]) -> int:
         elif args.agent == "claude":
             env_remove.append("ANTHROPIC_API_KEY")
 
+    tail_path = Path(args.tail) if args.tail else base / f"{args.dispatch_id}.tail"
+    _emit_dispatch_warnings(
+        getattr(args, "dispatch_warnings", []),
+        tail_path=tail_path,
+        reset_tail=True,
+    )
     if goalflight_compat.is_windows():
         payload = asyncio.run(run_acp_dispatch(cfg))
         print(
@@ -1626,7 +1729,6 @@ def _run_acp_shape(args, *, base: Path, account_env: dict[str, str]) -> int:
         ),
         flush=True,
     )
-    tail_path = Path(args.tail) if args.tail else base / f"{cfg.dispatch_id}.tail"
     with _temporary_env(account_env, remove=env_remove):
         payload = asyncio.run(run_acp_dispatch(cfg))
     worker_pid = payload.get("worker_pid")
@@ -1753,6 +1855,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="Override the grok-code research-intent guard: confirm this prompt is "
                              "a coding task that merely mentions the web (web research belongs on "
                              "--agent grok-research, whose model can actually drive web tools).")
+    parser.add_argument("--ignore-git-warn", action="store_true",
+                        help="Suppress advisory git-base-pin warnings for git-repo cwd prompts.")
     parser.add_argument("--capacity-wait-s", type=float, default=None,
                         help="How long to QUEUE for a capacity slot before DISPATCH-BLOCKED "
                              "(re-attempts acquire every ~15s; sleep-excluding clock). Default by "
@@ -1839,6 +1943,8 @@ def main(argv: list[str] | None = None) -> int:
             if args.prompt_file and not Path(args.prompt_file).expanduser().exists():
                 raise DispatchUsageError(f"prompt file not found: {args.prompt_file}")
             _guard_read_only_write_prompt(args)
+            dispatch_warnings = _dispatch_warnings(args, raw)
+            args.dispatch_warnings = dispatch_warnings
             base = _dispatch_base_dir()
             if goalflight_compat.is_windows():
                 return _run_acp_shape(args, base=base, account_env={})
@@ -1854,6 +1960,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         _apply_max_idle_default(args)
         _validate_before_side_effects(args, raw)
+        dispatch_warnings = _dispatch_warnings(args, raw)
         account_env = _resolve_account_env(args)
     except DispatchUsageError as e:
         print(f"goalflight_dispatch: {e}", file=sys.stderr)
@@ -1886,6 +1993,8 @@ def main(argv: list[str] | None = None) -> int:
         return 64
 
     tail.parent.mkdir(parents=True, exist_ok=True)
+    _emit_dispatch_warnings(dispatch_warnings, tail_path=tail, reset_tail=True)
+    worker_stdout_mode = "ab" if dispatch_warnings else "wb"
     project_root = _project_root(args)
     worker_pid = None
     watcher_pid = None
@@ -1968,7 +2077,7 @@ def main(argv: list[str] | None = None) -> int:
             env=env,
             stdin_path=stdin_path,
             stdout_path=tail,
-            stdout_mode="wb",
+            stdout_mode=worker_stdout_mode,
             stderr="stdout",
             label="worker",
         )

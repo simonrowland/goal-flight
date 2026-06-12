@@ -4,6 +4,9 @@
 from __future__ import annotations
 
 import sys
+import contextlib
+import io
+import subprocess
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,6 +16,7 @@ SCRIPTS = ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 import goalflight_dispatch as D  # noqa: E402
+import goalflight_acp_run as ACP  # noqa: E402
 
 _FAILS: list[str] = []
 
@@ -29,10 +33,35 @@ def _args(**overrides):
         "read_only": False,
         "prompt": "COMPLETE: no-op",
         "prompt_file": None,
+        "cwd": None,
+        "ignore_git_warn": False,
+        "model": None,
         "max_idle_secs": None,
     }
     base.update(overrides)
     return SimpleNamespace(**base)
+
+
+def _run_git(cwd: Path, *args: str) -> str:
+    proc = subprocess.run(
+        ["git", "-C", str(cwd), *args],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        encoding="utf-8",
+    )
+    return proc.stdout.strip()
+
+
+def _make_git_repo(root: Path) -> str:
+    _run_git(root, "init")
+    _run_git(root, "config", "user.email", "goalflight@example.invalid")
+    _run_git(root, "config", "user.name", "Goal Flight Test")
+    (root / "README.md").write_text("fixture\n", encoding="utf-8")
+    _run_git(root, "add", "README.md")
+    _run_git(root, "commit", "-m", "fixture")
+    return _run_git(root, "rev-parse", "HEAD")
 
 
 def test_default_idle_windows() -> None:
@@ -158,6 +187,137 @@ def test_grok_code_research_intent_guard() -> None:
     check("--web-research-ok overrides", reason(agent="grok-code", prompt=research, web_research_ok=True) is None)
 
 
+def test_git_pin_warning() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        repo = Path(td) / "repo"
+        repo.mkdir()
+        head = _make_git_repo(repo)
+        short_head = head[:7]
+
+        no_pin = D._git_pin_warning(_args(cwd=str(repo), prompt="Implement the queued change."))
+        check("git no-pin warns", no_pin is not None and "prompt carries no git base pin" in no_pin)
+        check("git no-pin warning carries HEAD", no_pin is not None and short_head in no_pin)
+        check("git no-pin warning names opt-out", no_pin is not None and "--ignore-git-warn" in no_pin)
+
+        matching = D._git_pin_warning(_args(cwd=str(repo), prompt=f"Verify HEAD is {short_head} before edits."))
+        check("matching short HEAD pin is silent", matching is None)
+
+        full_matching = D._git_pin_warning(_args(cwd=str(repo), prompt=f"Verify HEAD is {head} before edits."))
+        check("matching full HEAD pin is silent", full_matching is None)
+
+        mismatch_pin = "deadbee" if not head.startswith("deadbee") else "cafebab"
+        mismatch = D._git_pin_warning(_args(cwd=str(repo), prompt=f"Verify HEAD is {mismatch_pin} before edits."))
+        check("mismatching pin warns", mismatch is not None and "GIT BASE PIN MISMATCH" in mismatch)
+        check("mismatching pin names prompt pin", mismatch is not None and mismatch_pin in mismatch)
+        check("mismatching pin names cwd HEAD", mismatch is not None and short_head in mismatch)
+
+        mixed = D._git_pin_warning(
+            _args(cwd=str(repo), prompt=f"Verify HEAD is {short_head} and compare {mismatch_pin} before edits")
+        )
+        check("mixed fresh and stale pins warn", mixed is not None and "GIT BASE PIN MISMATCH" in mixed)
+        check("mixed warning names stale pin", mixed is not None and mismatch_pin in mixed)
+
+        ignored_no_pin = D._git_pin_warning(_args(cwd=str(repo), prompt="Implement.", ignore_git_warn=True))
+        ignored_mismatch = D._git_pin_warning(
+            _args(cwd=str(repo), prompt=f"Verify HEAD is {mismatch_pin}.", ignore_git_warn=True)
+        )
+        check("--ignore-git-warn silences no-pin", ignored_no_pin is None)
+        check("--ignore-git-warn silences mismatch", ignored_mismatch is None)
+
+        ordinary = D._git_pin_warning(
+            _args(cwd=str(repo), prompt="ordinary words, abc, and buildabc1234defartifact are not pins")
+        )
+        check("heuristic non-cases do not become mismatch", ordinary is not None and "MISMATCH" not in ordinary)
+        check("ordinary words are not SHA pins", D._extract_git_base_pins("ordinary words only") == [])
+        check("short hex is not a SHA pin", D._extract_git_base_pins("abc") == [])
+        check("hex inside longer identifier is not a SHA pin", D._extract_git_base_pins("buildabc1234defartifact") == [])
+        check("deadline is not a SHA pin", D._extract_git_base_pins("deadline") == [])
+        check("slash-adjacent hex path is not a SHA pin", D._extract_git_base_pins("research/deadbeef") == [])
+        check("dot-adjacent hex path is not a SHA pin", D._extract_git_base_pins("fixture.deadbeef01") == [])
+        check("colon-adjacent hex host token is not a SHA pin", D._extract_git_base_pins("host:deadbeef") == [])
+        check("bare quoted SHA pin matches", D._extract_git_base_pins("'deadbee'") == ["deadbee"])
+        check("spaced SHA pin matches", D._extract_git_base_pins("verify HEAD is deadbee before edits") == ["deadbee"])
+
+        tail = Path(td) / "dispatch.tail"
+        with contextlib.redirect_stderr(io.StringIO()):
+            D._emit_dispatch_warnings([no_pin], tail_path=tail, reset_tail=True)
+        check("warnings are written to dispatch tail", short_head in tail.read_text(encoding="utf-8"))
+
+    with tempfile.TemporaryDirectory() as td:
+        non_git = D._git_pin_warning(_args(cwd=td, prompt="Implement without a pin."))
+        check("non-git cwd is silent", non_git is None)
+
+
+def test_grok_model_passthrough_warning() -> None:
+    warning = D._grok_model_passthrough_warning(
+        _args(agent="grok-code", model="grok-composer-2.5-fast")
+    )
+    check("grok-code --model warns", warning is not None and "harness wires grok model ids" in warning)
+    warning = D._grok_model_passthrough_warning(
+        _args(agent="grok-research", model="grok-build")
+    )
+    check("grok-research --model warns", warning is not None and "provider id drift" in warning)
+    check("codex --model is silent", D._grok_model_passthrough_warning(_args(agent="codex", model="gpt-5")) is None)
+    check("grok without --model is silent", D._grok_model_passthrough_warning(_args(agent="grok-code")) is None)
+
+
+def test_windows_acp_warnings_written_to_tail() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        tail = base / "dispatch.tail"
+        args = _args(
+            agent="codex-acp",
+            prompt="Implement the queued change.",
+            dispatch_id="win-acp",
+            status_json=str(base / "dispatch.status.json"),
+            tail=str(tail),
+            billing="main",
+            shape="acp",
+            poll_secs=0.1,
+            priority="normal",
+            capacity_wait_s=None,
+            permission_mode="auto",
+            permission_dir=None,
+            permission_inline_timeout_s=None,
+            permission_user_timeout_s=None,
+            interactive=False,
+        )
+        args.dispatch_warnings = ["WARN: prompt carries no git base pin; HEAD is 1234567"]
+
+        orig_is_windows = D.goalflight_compat.is_windows
+        orig_build_acp_cfg = D._build_acp_cfg
+        orig_refuse_reused = D._refuse_reused_nonterminal_dispatch_id
+        orig_run_acp_dispatch = ACP.run_acp_dispatch
+        try:
+            D.goalflight_compat.is_windows = lambda: True
+            D._build_acp_cfg = lambda patched_args, status_json: SimpleNamespace(
+                dispatch_id=patched_args.dispatch_id,
+                agent=patched_args.agent,
+            )
+            D._refuse_reused_nonterminal_dispatch_id = lambda dispatch_id: None
+
+            async def fake_run_acp_dispatch(cfg):
+                return {
+                    "dispatch_id": cfg.dispatch_id,
+                    "agent": cfg.agent,
+                    "state": "blocked_windows_dispatch",
+                    "reason": "windows fixture",
+                }
+
+            ACP.run_acp_dispatch = fake_run_acp_dispatch
+            with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+                code = D._run_acp_shape(args, base=base, account_env={})
+        finally:
+            D.goalflight_compat.is_windows = orig_is_windows
+            D._build_acp_cfg = orig_build_acp_cfg
+            D._refuse_reused_nonterminal_dispatch_id = orig_refuse_reused
+            ACP.run_acp_dispatch = orig_run_acp_dispatch
+
+        tail_text = tail.read_text(encoding="utf-8")
+        check("windows ACP refusal keeps exit code", code == 2)
+        check("windows ACP warnings are written to tail", "goalflight_dispatch: WARN: prompt carries no git base pin" in tail_text)
+
+
 def test_reused_nonterminal_dispatch_id_guard() -> None:
     orig_find = D._find_dispatch_record
     try:
@@ -213,6 +373,9 @@ def main() -> int:
     test_default_idle_windows()
     test_read_only_review_artifact_guard()
     test_grok_code_research_intent_guard()
+    test_git_pin_warning()
+    test_grok_model_passthrough_warning()
+    test_windows_acp_warnings_written_to_tail()
     test_reused_nonterminal_dispatch_id_guard()
     test_dispatch_end_hint()
     if _FAILS:
