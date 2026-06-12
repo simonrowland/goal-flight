@@ -523,14 +523,85 @@ def main(argv: list[str] | None = None) -> int:
         hard_cap=goalflight_capacity.DEFAULT_HARD_CAP,
         max_total=None,
     )
-    acquire_out = io.StringIO()
-    with contextlib.redirect_stdout(acquire_out):
-        rc = goalflight_capacity.cmd_acquire(acquire_argv)
-    if rc != 0:
-        try:
-            acquire_payload = json.loads(acquire_out.getvalue() or "{}")
-        except json.JSONDecodeError:
-            acquire_payload = {"raw": acquire_out.getvalue()}
+    wait_budget_s = goalflight_capacity.resolve_capacity_wait_s(
+        lane=acquire_argv.priority,
+        wait_s=None,
+        log_prefix="goalflight_review_job",
+    )
+    capacity_wait_started = active_monotonic()
+    last_capacity_wait = {"attempt": 0}
+
+    def on_capacity_wait(attempt: int, remaining_s: float, reason: dict) -> None:
+        last_capacity_wait["attempt"] = attempt
+        waited_s = round(max(0.0, wait_budget_s - remaining_s), 1)
+        payload = {
+            "schema": "goalflight.review-job.v1",
+            "dispatch_id": dispatch_id,
+            "agent": args.agent,
+            "name": args.name,
+            "state": "waiting_capacity",
+            "reason": reason,
+            "waited_s": waited_s,
+            "wait_budget_s": wait_budget_s,
+            "prompt_path": args.prompt,
+            "stdout_path": str(stdout_path),
+            "stderr_path": str(stderr_path),
+            "final_path": str(final_path) if final_path else None,
+        }
+        write_status(status_path, payload)
+        if attempt == 1 or attempt % 4 == 0:
+            print(
+                "CAPACITY-WAIT "
+                + json.dumps(
+                    {
+                        "dispatch_id": dispatch_id,
+                        "agent": args.agent,
+                        "priority": acquire_argv.priority,
+                        "reason": reason.get("reason"),
+                        "waited_s": waited_s,
+                        "wait_budget_s": wait_budget_s,
+                    },
+                    sort_keys=True,
+                ),
+                file=sys.stderr,
+                flush=True,
+            )
+
+    try:
+        acquire_payload = goalflight_capacity.acquire_with_wait(
+            acquire_argv,
+            lane=acquire_argv.priority,
+            wait_s=wait_budget_s,
+            on_wait=on_capacity_wait,
+            install_signal_handlers=True,
+        )
+    except goalflight_capacity.CapacityWaitInterrupted as exc:
+        payload = {
+            "schema": "goalflight.review-job.v1",
+            "dispatch_id": dispatch_id,
+            "agent": args.agent,
+            "name": args.name,
+            "state": "blocked_capacity",
+            "reason": exc.payload,
+            "prompt_path": args.prompt,
+            "stdout_path": str(stdout_path),
+            "stderr_path": str(stderr_path),
+            "final_path": str(final_path) if final_path else None,
+        }
+        write_status(status_path, payload)
+        if args.json:
+            print(json.dumps(payload, sort_keys=True))
+        else:
+            print(f"{args.name}: blocked_capacity status={status_path}")
+        return exc.exit_code or 1
+    if acquire_payload.get("decision") != "allow":
+        if last_capacity_wait["attempt"]:
+            acquire_payload = dict(acquire_payload)
+            acquire_payload.setdefault(
+                "waited_s",
+                round(max(0.0, active_monotonic() - capacity_wait_started), 1),
+            )
+            acquire_payload.setdefault("attempts", int(last_capacity_wait["attempt"]) + 1)
         payload = {
             "schema": "goalflight.review-job.v1",
             "dispatch_id": dispatch_id,
@@ -548,9 +619,8 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(payload, sort_keys=True))
         else:
             print(f"{args.name}: blocked_capacity status={status_path}")
-        return rc
+        return 2
 
-    acquire_payload = json.loads(acquire_out.getvalue())
     lease_id = acquire_payload.get("lease", {}).get("lease_id")
 
     try:

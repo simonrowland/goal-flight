@@ -24,6 +24,7 @@ skip_posix_on_native_windows(
 )
 
 import datetime as dt
+import argparse
 import io
 import json
 import os
@@ -207,6 +208,120 @@ def case_dead_lease_no_ttl_not_expired() -> None:
     assert survived is not None and survived["state"] == "active", (
         "prune wrongly expired a dead-but-not-yet-past-TTL lease"
     )
+
+
+def case_capacity_wait_resolution_precedence() -> None:
+    assert cap.resolve_capacity_wait_s(lane="bulk", wait_s=7, env={"GOALFLIGHT_CAPACITY_WAIT_S": "3"}) == 7.0
+    assert cap.resolve_capacity_wait_s(lane="critical", wait_s=None, env={"GOALFLIGHT_CAPACITY_WAIT_S": "4.5"}) == 4.5
+    assert cap.resolve_capacity_wait_s(lane="critical", wait_s=None, env={}) == 120.0
+    assert cap.resolve_capacity_wait_s(lane="bulk", wait_s=None, env={"GOALFLIGHT_CAPACITY_WAIT_S": "bad"}) == 900.0
+
+
+def case_acquire_with_wait_zero_preserves_single_shot_payload() -> None:
+    calls = []
+
+    def fake_acquire(_args):
+        calls.append("call")
+        print(json.dumps({"decision": "wait", "reason": "machine_worker_cap"}))
+        return 2
+
+    payload = cap.acquire_with_wait(
+        argparse.Namespace(),
+        lane="normal",
+        wait_s=0,
+        poll_s=1,
+        jitter=0,
+        sleep_fn=lambda _s: (_ for _ in ()).throw(AssertionError("single-shot slept")),
+        acquire_func=fake_acquire,
+    )
+    assert calls == ["call"], calls
+    assert payload == {"decision": "wait", "reason": "machine_worker_cap"}, payload
+
+
+def case_acquire_with_wait_jitter_bounds_and_deadline_math() -> None:
+    clock = [100.0]
+    calls: list[float] = []
+    sleeps: list[float] = []
+    waits: list[tuple[int, float, str]] = []
+
+    def fake_acquire(_args):
+        calls.append(clock[0])
+        print(json.dumps({"decision": "wait", "reason": "machine_worker_cap"}))
+        return 2
+
+    def fake_sleep(duration: float) -> None:
+        sleeps.append(round(duration, 3))
+        clock[0] += duration
+
+    def fake_random(low: float, high: float) -> float:
+        assert low == 0.0 and high == 0.5
+        return 0.5
+
+    def on_wait(attempt: int, remaining_s: float, reason: dict) -> None:
+        waits.append((attempt, round(remaining_s, 3), reason["reason"]))
+
+    payload = cap.acquire_with_wait(
+        argparse.Namespace(),
+        lane="normal",
+        wait_s=2.2,
+        poll_s=1.0,
+        jitter=0.5,
+        on_wait=on_wait,
+        monotonic_fn=lambda: clock[0],
+        sleep_fn=fake_sleep,
+        random_fn=fake_random,
+        acquire_func=fake_acquire,
+    )
+
+    assert payload["decision"] == "wait", payload
+    assert "attempts" not in payload and "waited_s" not in payload, payload
+    assert len(calls) == 3, calls
+    assert sleeps == [0.5, 0.5, 0.5, 0.5, 0.2], sleeps
+    assert waits == [(1, 2.2, "machine_worker_cap"), (2, 0.7, "machine_worker_cap")], waits
+
+
+def case_acquire_with_wait_signal_interrupts_sleep_promptly() -> None:
+    clock = [500.0]
+    sleeps: list[float] = []
+    old_handler = signal.getsignal(signal.SIGTERM)
+
+    def fake_acquire(_args):
+        print(json.dumps({"decision": "wait", "reason": "machine_worker_cap"}))
+        return 2
+
+    def fake_sleep(duration: float) -> None:
+        sleeps.append(duration)
+        signal.raise_signal(signal.SIGTERM)
+        clock[0] += duration
+
+    try:
+        try:
+            cap.acquire_with_wait(
+                argparse.Namespace(),
+                lane="normal",
+                wait_s=60.0,
+                poll_s=15.0,
+                jitter=0,
+                install_signal_handlers=True,
+                monotonic_fn=lambda: clock[0],
+                sleep_fn=fake_sleep,
+                acquire_func=fake_acquire,
+            )
+        except cap.CapacityWaitInterrupted as exc:
+            payload = exc.payload
+        else:
+            raise AssertionError("SIGTERM during capacity wait did not interrupt")
+    finally:
+        assert signal.getsignal(signal.SIGTERM) == old_handler
+
+    assert sleeps == [0.5], sleeps
+    assert payload == {
+        "decision": "wait",
+        "reason": "wait_interrupted",
+        "waited_s": 0.0,
+        "attempts": 1,
+    }, payload
+    assert clock[0] == 500.0, clock
 
 
 def case_status_is_non_mutating_for_live_lease(state_dir: Path) -> None:
@@ -472,6 +587,10 @@ def main() -> None:
     case_dead_lease_past_ttl_is_reclaimed()
     case_dead_lease_no_ttl_not_expired()
     case_empty_state_dir_falls_back_not_cwd()
+    case_capacity_wait_resolution_precedence()
+    case_acquire_with_wait_zero_preserves_single_shot_payload()
+    case_acquire_with_wait_jitter_bounds_and_deadline_math()
+    case_acquire_with_wait_signal_interrupts_sleep_promptly()
 
     # IO cases: isolate capacity.json under a temp $GOALFLIGHT_STATE_DIR so the
     # real shared /tmp/goal-flight-<uid>/capacity.json is never touched.

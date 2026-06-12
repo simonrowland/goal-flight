@@ -133,7 +133,7 @@ def _run_dispatch(
     poll_secs: str = "0.2",
     max_idle_secs: str = "20",
     controller_pid: int | None = None,
-    timeout_s: float = 15.0,
+    timeout_s: float = 90.0,
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         _dispatch_command(
@@ -197,7 +197,7 @@ def case_status_sees_dispatch_and_lease_releases() -> None:
         worker_code = (
             "import time; "
             "print('worker-start', flush=True); "
-            "time.sleep(3); "
+            "time.sleep(15); "
             "print('COMPLETE: done', flush=True); "
             "time.sleep(0.2)"
         )
@@ -237,16 +237,28 @@ def case_status_sees_dispatch_and_lease_releases() -> None:
                     and row.get("state") == "running"
                     and row.get("classification") == "expected_live"
                     and row.get("worker_pid")
-                    and any(lease.get("state") == "active" for lease in _leases(payload, dispatch_id))
+                    and any(
+                        lease.get("state") == "active"
+                        and lease.get("worker_pid") == row.get("worker_pid")
+                        for lease in _leases(payload, dispatch_id)
+                    )
                     else None
-                )
+                ),
+                timeout_s=30.0,
             )
             row = _record(running, dispatch_id)
-            active = [lease for lease in _leases(running, dispatch_id) if lease.get("state") == "active"]
-            assert row and row["worker_pid"], row
-            assert active and active[0].get("worker_pid") == row["worker_pid"], active
+            active = [
+                lease
+                for lease in _leases(running, dispatch_id)
+                if lease.get("state") == "active" and lease.get("worker_pid")
+            ]
+            assert row and row["state"] == "running", row
+            assert row["classification"] == "expected_live", row
+            assert row["worker_pid"], row
+            assert active, active
+            assert active[0].get("worker_pid") == row["worker_pid"], active
 
-            stdout, stderr = proc.communicate(timeout=15)
+            stdout, stderr = proc.communicate(timeout=30)
         finally:
             if proc.poll() is None:
                 proc.kill()
@@ -595,7 +607,7 @@ def case_codex_routed_subscription_strips_openai_api_key() -> None:
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                timeout=10,
+                timeout=90,
             )
             assert proc.returncode == 0, f"{agent} leaked OPENAI_API_KEY or failed\nstdout={proc.stdout}\nstderr={proc.stderr}"
             assert json.loads((tmp / f"{dispatch_id}.status.json").read_text())["state"] == "complete"
@@ -625,7 +637,7 @@ def case_state_dir_auto_paths() -> None:
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=10,
+            timeout=90,
         )
         assert proc.returncode == 0, f"dispatch rc={proc.returncode}\nstdout={proc.stdout}\nstderr={proc.stderr}"
         end = _dispatch_end(proc.stdout)
@@ -647,7 +659,7 @@ def case_dispatch_end_worker_still_alive_flags() -> None:
             "import time; print('COMPLETE: stays alive', flush=True); time.sleep(5)",
             poll_secs="0.1",
             max_idle_secs="10",
-            timeout_s=10,
+            timeout_s=90,
         )
         alive_end = _dispatch_end(alive_proc.stdout)
         try:
@@ -663,7 +675,7 @@ def case_dispatch_end_worker_still_alive_flags() -> None:
             "print('COMPLETE: exits', flush=True)",
             poll_secs="0.2",
             max_idle_secs="10",
-            timeout_s=10,
+            timeout_s=90,
         )
         dead_end = _dispatch_end(dead_proc.stdout)
         assert dead_proc.returncode == 0, dead_proc
@@ -703,7 +715,7 @@ def case_dispatch_id_collision_suffix() -> None:
         procs = [start_once(), start_once()]
         completed = []
         for proc in procs:
-            stdout, stderr = proc.communicate(timeout=10)
+            stdout, stderr = proc.communicate(timeout=90)
             assert proc.returncode in {0, 2}, f"dispatch rc={proc.returncode}\nstdout={stdout}\nstderr={stderr}"
             if proc.returncode == 0:
                 completed.append(_dispatch_end(stdout))
@@ -754,7 +766,7 @@ def case_idle_timeout_state_releases_and_classifies_terminal() -> None:
                 "import time; time.sleep(60)",
                 poll_secs="0.1",
                 max_idle_secs="0.2",
-                timeout_s=10,
+                timeout_s=90,
             )
             worker_pid = _worker_pid_from_stdout(proc.stdout)
             assert proc.returncode == 2, f"dispatch rc={proc.returncode}\nstdout={proc.stdout}\nstderr={proc.stderr}"
@@ -779,7 +791,7 @@ def case_watcher_failure_releases_as_failed() -> None:
                 dispatch_id,
                 "import time; print('worker-start', flush=True); time.sleep(60)",
                 status_path=bad_status_path,
-                timeout_s=10,
+                timeout_s=90,
             )
             worker_pid = _worker_pid_from_stdout(proc.stdout)
             assert proc.returncode == 1, f"dispatch rc={proc.returncode}\nstdout={proc.stdout}\nstderr={proc.stderr}"

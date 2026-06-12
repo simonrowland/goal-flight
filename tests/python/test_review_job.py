@@ -10,6 +10,7 @@ skip_posix_on_native_windows("review job tests use POSIX process groups and ps")
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import tempfile
@@ -252,6 +253,195 @@ def review_command(tmp: Path, fake_codex: Path, name: str, *, timeout_s: float =
     ]
 
 
+def capacity_test_env(state_dir: Path, **extra: str) -> dict[str, str]:
+    env = os.environ.copy()
+    env["GOALFLIGHT_STATE_DIR"] = str(state_dir)
+    env["GOALFLIGHT_CAPACITY_MAX_TOTAL"] = "1"
+    env.update(extra)
+    return env
+
+
+def hold_capacity(state_dir: Path, *, agent: str = "codex", dispatch_id: str = "held-review-capacity") -> str:
+    proc = run(
+        [
+            sys.executable,
+            "scripts/goalflight_capacity.py",
+            "acquire",
+            "--agent",
+            agent,
+            "--dispatch-id",
+            dispatch_id,
+            "--project-root",
+            str(ROOT),
+            "--ttl-s",
+            "60",
+        ],
+        state_dir=state_dir,
+        env={"GOALFLIGHT_CAPACITY_MAX_TOTAL": "1"},
+    )
+    return json.loads(proc.stdout)["lease"]["lease_id"]
+
+
+def release_capacity(state_dir: Path, lease_id: str) -> None:
+    run(
+        [sys.executable, "scripts/goalflight_capacity.py", "release", "--lease-id", lease_id],
+        state_dir=state_dir,
+    )
+
+
+def wait_for_status(path: Path, state: str, *, timeout_s: float = 5.0) -> dict:
+    deadline = time.time() + timeout_s
+    last: dict | None = None
+    while time.time() < deadline:
+        if path.exists():
+            try:
+                last = json.loads(path.read_text())
+            except (json.JSONDecodeError, OSError):
+                pass
+            else:
+                if last.get("state") == state:
+                    return last
+        time.sleep(0.05)
+    raise AssertionError(f"status {path} did not reach {state}; last={last}")
+
+
+@skipif(os.name == "nt", reason="native Windows review-job dispatch is refused in Phase 1")
+def test_review_job_capacity_wait_queues_until_slot_frees() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        state_dir = tmp / "state"
+        fake = tmp / "fake-codex"
+        write_fake_codex(fake)
+        lease_id = hold_capacity(state_dir)
+        cmd = review_command(tmp, fake, "queued-capacity", timeout_s=5, max_quiet_s=5)
+        env = capacity_test_env(
+            state_dir,
+            GOALFLIGHT_CAPACITY_WAIT_S="6",
+            FAKE_REVIEW_MODE="complete_with_stderr",
+        )
+        proc = subprocess.Popen(
+            cmd,
+            cwd=ROOT,
+            env=env,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            status_path = tmp / "out" / "queued-capacity.status.json"
+            waiting = wait_for_status(status_path, "waiting_capacity", timeout_s=5.0)
+            assert_true("review waiting status records queue reason", waiting["reason"]["decision"] == "wait")
+            release_capacity(state_dir, lease_id)
+            stdout, stderr = proc.communicate(timeout=12)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.communicate(timeout=5)
+        status = json.loads((tmp / "out" / "queued-capacity.status.json").read_text())
+        assert_true(f"queued review completed: stdout={stdout} stderr={stderr}", proc.returncode == 0)
+        assert_true("queued review final complete", status["state"] == "complete")
+        assert_true("review emitted capacity wait progress", "CAPACITY-WAIT " in stderr)
+
+
+@skipif(os.name == "nt", reason="native Windows review-job dispatch is refused in Phase 1")
+def test_review_job_capacity_wait_deadline_blocks() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        state_dir = tmp / "state"
+        fake = tmp / "fake-codex"
+        write_fake_codex(fake)
+        lease_id = hold_capacity(state_dir)
+        try:
+            proc = run(
+                review_command(tmp, fake, "deadline-capacity", timeout_s=5, max_quiet_s=5),
+                state_dir=state_dir,
+                env={
+                    "GOALFLIGHT_CAPACITY_MAX_TOTAL": "1",
+                    "GOALFLIGHT_CAPACITY_WAIT_S": "0.2",
+                    "FAKE_REVIEW_MODE": "complete_with_stderr",
+                },
+                check=False,
+                timeout=6,
+            )
+        finally:
+            release_capacity(state_dir, lease_id)
+        status = json.loads((tmp / "out" / "deadline-capacity.status.json").read_text())
+        assert_true("deadline review blocks", proc.returncode == 2 and status["state"] == "blocked_capacity")
+        assert_true("deadline review enriches post-wait reason", status["reason"]["decision"] == "wait" and status["reason"]["attempts"] >= 2)
+        assert_true("deadline review records waited_s", status["reason"]["waited_s"] >= 0.0)
+
+
+@skipif(os.name == "nt", reason="native Windows review-job dispatch is refused in Phase 1")
+def test_review_job_capacity_wait_zero_single_shot() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        state_dir = tmp / "state"
+        fake = tmp / "fake-codex"
+        write_fake_codex(fake)
+        lease_id = hold_capacity(state_dir)
+        try:
+            proc = run(
+                review_command(tmp, fake, "zero-capacity", timeout_s=5, max_quiet_s=5),
+                state_dir=state_dir,
+                env={
+                    "GOALFLIGHT_CAPACITY_MAX_TOTAL": "1",
+                    "GOALFLIGHT_CAPACITY_WAIT_S": "0",
+                    "FAKE_REVIEW_MODE": "complete_with_stderr",
+                },
+                check=False,
+                timeout=6,
+            )
+        finally:
+            release_capacity(state_dir, lease_id)
+        status = json.loads((tmp / "out" / "zero-capacity.status.json").read_text())
+        assert_true("zero wait review blocks immediately", proc.returncode == 2 and status["state"] == "blocked_capacity")
+        assert_true("zero wait preserves single-shot reason payload", "attempts" not in status["reason"] and "waited_s" not in status["reason"])
+
+
+@skipif(os.name == "nt", reason="native Windows review-job dispatch is refused in Phase 1")
+def test_review_job_capacity_wait_sigterm_terminalizes() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        state_dir = tmp / "state"
+        fake = tmp / "fake-codex"
+        write_fake_codex(fake)
+        lease_id = hold_capacity(state_dir)
+        cmd = review_command(tmp, fake, "sigterm-capacity", timeout_s=5, max_quiet_s=5)
+        env = capacity_test_env(
+            state_dir,
+            GOALFLIGHT_CAPACITY_WAIT_S="6",
+            FAKE_REVIEW_MODE="complete_with_stderr",
+        )
+        proc = subprocess.Popen(
+            cmd,
+            cwd=ROOT,
+            env=env,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            status_path = tmp / "out" / "sigterm-capacity.status.json"
+            wait_for_status(status_path, "waiting_capacity", timeout_s=5.0)
+            proc.send_signal(signal.SIGTERM)
+            stdout, stderr = proc.communicate(timeout=5)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.communicate(timeout=5)
+            release_capacity(state_dir, lease_id)
+        status = json.loads((tmp / "out" / "sigterm-capacity.status.json").read_text())
+        assert_true(f"sigterm review exited 143: stdout={stdout} stderr={stderr}", proc.returncode == 143)
+        assert_true("sigterm review terminalized capacity block", status["state"] == "blocked_capacity")
+        assert_true("sigterm reason is interrupted", status["reason"]["reason"] == "wait_interrupted")
+        assert_true("sigterm reason records attempts", status["reason"]["attempts"] == 1)
+        assert_true("sigterm reason records prompt wait", status["reason"]["waited_s"] < 6.0)
+
+
 @skipif(os.name == "nt", reason="native Windows review-job dispatch is refused in Phase 1")
 def test_active_worker_can_complete_after_soft_timeout() -> None:
     with tempfile.TemporaryDirectory() as td:
@@ -295,7 +485,7 @@ def test_final_file_detected_before_process_exit() -> None:
         )
         status_path = tmp / "out" / "final-early.status.json"
         saw_final_running = False
-        deadline = time.time() + 4
+        deadline = time.time() + 8
         while time.time() < deadline and proc.poll() is None:
             if status_path.exists():
                 status = json.loads(status_path.read_text())
@@ -484,6 +674,10 @@ def test_complete_review_does_not_copy_stderr_to_error_fields() -> None:
 
 def main() -> None:
     tests = [
+        test_review_job_capacity_wait_queues_until_slot_frees,
+        test_review_job_capacity_wait_deadline_blocks,
+        test_review_job_capacity_wait_zero_single_shot,
+        test_review_job_capacity_wait_sigterm_terminalizes,
         test_active_worker_can_complete_after_soft_timeout,
         test_final_file_detected_before_process_exit,
         test_no_progress_timeout_kills_process_group,

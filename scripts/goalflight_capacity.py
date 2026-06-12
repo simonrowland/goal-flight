@@ -4,20 +4,27 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
+import contextlib
 import datetime as dt
+import io
 import json
 import os
 from pathlib import Path
 import platform
+import random
 import shutil
+import signal
 import socket
 import subprocess
 import sys
+import time
 import uuid
 
 import goalflight_compat
 import goalflight_compat as fcntl
 import goalflight_rate_pressure
+from goalflight_liveness import active_monotonic
 
 SCHEMA = "goalflight.capacity.v1"
 
@@ -116,6 +123,225 @@ BULK_GLOBAL_RESERVE = 3
 BULK_POOL_RESERVE = 1
 CRITICAL_GLOBAL_BORROW = 2
 CRITICAL_POOL_BORROW = 2
+
+# Bounded capacity-wait defaults per priority lane (seconds). This is
+# contention polling, not a FIFO queue.
+CAPACITY_WAIT_DEFAULTS_S = {"bulk": 900, "normal": 600, "critical": 120}
+CAPACITY_WAIT_POLL_S = 15.0
+CAPACITY_WAIT_JITTER_S = 2.0
+CAPACITY_WAIT_SLEEP_SLICE_S = 0.5
+
+
+class CapacityWaitInterrupted(Exception):
+    """Raised when SIGTERM/SIGINT interrupts acquire_with_wait."""
+
+    def __init__(self, payload: dict, *, exit_code: int | None = None, signum: int | None = None) -> None:
+        super().__init__(payload.get("reason", "wait_interrupted"))
+        self.payload = payload
+        self.exit_code = exit_code
+        self.signum = signum
+
+
+def _capacity_wait_interrupted(
+    *,
+    wait_started: float,
+    attempt: int,
+    monotonic_fn,
+    exit_code: int | None = None,
+    signum: int | None = None,
+) -> CapacityWaitInterrupted:
+    payload = {
+        "decision": "wait",
+        "reason": "wait_interrupted",
+        "waited_s": round(monotonic_fn() - wait_started, 1),
+        "attempts": attempt,
+    }
+    return CapacityWaitInterrupted(payload, exit_code=exit_code, signum=signum)
+
+
+def resolve_capacity_wait_s(
+    *,
+    lane: str | None,
+    wait_s: float | int | None,
+    env: dict[str, str] | None = None,
+    log_prefix: str | None = None,
+    stderr=None,
+) -> float:
+    """Resolve capacity wait budget: explicit wait > env > lane default."""
+
+    if wait_s is not None:
+        return max(0.0, float(wait_s))
+    env_map = os.environ if env is None else env
+    env_override = env_map.get("GOALFLIGHT_CAPACITY_WAIT_S")
+    if env_override not in (None, ""):
+        try:
+            value = max(0.0, float(env_override))
+        except ValueError:
+            if log_prefix:
+                print(
+                    f"{log_prefix}: ignoring invalid GOALFLIGHT_CAPACITY_WAIT_S={env_override!r}",
+                    file=stderr or sys.stderr,
+                )
+        else:
+            if log_prefix:
+                print(
+                    f"{log_prefix}: capacity wait {value}s from GOALFLIGHT_CAPACITY_WAIT_S",
+                    file=stderr or sys.stderr,
+                )
+            return value
+    lane_key = (lane or "normal").strip().lower()
+    return float(CAPACITY_WAIT_DEFAULTS_S.get(lane_key, CAPACITY_WAIT_DEFAULTS_S["normal"]))
+
+
+def _cmd_acquire_payload(
+    acquire_args: argparse.Namespace,
+    *,
+    acquire_func=None,
+) -> tuple[int, dict]:
+    acquire_out = io.StringIO()
+    with contextlib.redirect_stdout(acquire_out):
+        rc = (acquire_func or cmd_acquire)(acquire_args)
+    try:
+        payload = json.loads(acquire_out.getvalue() or "{}")
+    except json.JSONDecodeError:
+        payload = {"raw": acquire_out.getvalue()}
+    return rc, payload
+
+
+def _sleep_bounded(total_s: float, *, sleep_fn, slice_s: float = CAPACITY_WAIT_SLEEP_SLICE_S) -> None:
+    remaining_s = max(0.0, float(total_s))
+    slice_budget_s = max(0.001, float(slice_s))
+    while remaining_s > 0:
+        chunk_s = min(remaining_s, slice_budget_s)
+        sleep_fn(chunk_s)
+        remaining_s = max(0.0, remaining_s - chunk_s)
+
+
+def acquire_with_wait(
+    acquire_args: argparse.Namespace,
+    *,
+    lane: str | None,
+    wait_s: float,
+    poll_s: float = CAPACITY_WAIT_POLL_S,
+    jitter: float = CAPACITY_WAIT_JITTER_S,
+    on_wait=None,
+    install_signal_handlers: bool = False,
+    monotonic_fn=active_monotonic,
+    sleep_fn=time.sleep,
+    random_fn=random.uniform,
+    acquire_func=None,
+) -> dict:
+    """Acquire capacity, polling bounded wait decisions until budget expires.
+
+    The helper deliberately performs no ledger/status writes. Callers can use
+    on_wait(attempt, remaining_s, reason) for their own progress side effects.
+    """
+
+    wait_budget_s = max(0.0, float(wait_s))
+    wait_started = monotonic_fn()
+    deadline = wait_started + wait_budget_s if wait_budget_s > 0 else None
+    attempt = 0
+
+    def _wait_signal(signum, _frame):
+        raise CapacityWaitInterrupted({}, exit_code=128 + signum, signum=signum)
+
+    old_handlers = {}
+    if install_signal_handlers:
+        for signame in ("SIGTERM", "SIGINT"):
+            sig = getattr(signal, signame, None)
+            if sig is not None:
+                with contextlib.suppress(Exception):
+                    old_handlers[sig] = signal.signal(sig, _wait_signal)
+    try:
+        while True:
+            attempt += 1
+            rc, payload = _cmd_acquire_payload(acquire_args, acquire_func=acquire_func)
+            if rc == 0:
+                return payload
+            now = monotonic_fn()
+            can_wait = (
+                payload.get("decision") == "wait"
+                and deadline is not None
+                and now < deadline
+            )
+            if not can_wait:
+                return payload
+            remaining_s = max(0.0, deadline - now)
+            if on_wait is not None:
+                on_wait(attempt, remaining_s, payload)
+            sleep_for = float(poll_s) + (random_fn(0.0, float(jitter)) if jitter > 0 else 0.0)
+            if remaining_s > 0:
+                sleep_for = min(sleep_for, remaining_s)
+            _sleep_bounded(sleep_for, sleep_fn=sleep_fn)
+    except (CapacityWaitInterrupted, KeyboardInterrupt) as exc:
+        exit_code = getattr(exc, "exit_code", None)
+        signum = getattr(exc, "signum", None)
+        raise _capacity_wait_interrupted(
+            wait_started=wait_started,
+            attempt=attempt,
+            monotonic_fn=monotonic_fn,
+            exit_code=exit_code,
+            signum=signum,
+        ) from None
+    finally:
+        for sig, old in old_handlers.items():
+            with contextlib.suppress(Exception):
+                signal.signal(sig, old)
+
+
+async def acquire_with_wait_async(
+    acquire_args: argparse.Namespace,
+    *,
+    lane: str | None,
+    wait_s: float,
+    poll_s: float = CAPACITY_WAIT_POLL_S,
+    jitter: float = CAPACITY_WAIT_JITTER_S,
+    on_wait=None,
+    interrupted=None,
+    interrupted_signum=None,
+    monotonic_fn=active_monotonic,
+    sleep_fn=asyncio.sleep,
+    random_fn=random.uniform,
+    acquire_func=None,
+) -> dict:
+    """Async capacity wait for callers already inside an event loop."""
+
+    wait_budget_s = max(0.0, float(wait_s))
+    wait_started = monotonic_fn()
+    deadline = wait_started + wait_budget_s if wait_budget_s > 0 else None
+    attempt = 0
+    try:
+        while True:
+            attempt += 1
+            rc, payload = _cmd_acquire_payload(acquire_args, acquire_func=acquire_func)
+            if rc == 0:
+                return payload
+            now = monotonic_fn()
+            can_wait = (
+                payload.get("decision") == "wait"
+                and deadline is not None
+                and now < deadline
+            )
+            if not can_wait:
+                return payload
+            remaining_s = max(0.0, deadline - now)
+            if on_wait is not None:
+                on_wait(attempt, remaining_s, payload)
+            sleep_for = float(poll_s) + (random_fn(0.0, float(jitter)) if jitter > 0 else 0.0)
+            if remaining_s > 0:
+                sleep_for = min(sleep_for, remaining_s)
+            await sleep_fn(max(0.0, sleep_for))
+    except asyncio.CancelledError:
+        if interrupted is None or not interrupted():
+            raise
+        signum = interrupted_signum() if interrupted_signum is not None else None
+        raise _capacity_wait_interrupted(
+            wait_started=wait_started,
+            attempt=attempt,
+            monotonic_fn=monotonic_fn,
+            exit_code=128 + signum if signum is not None else None,
+            signum=signum,
+        ) from None
 
 TERMINAL_LEASE_STATES = {
     "released",

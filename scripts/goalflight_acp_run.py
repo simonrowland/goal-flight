@@ -350,7 +350,7 @@ from acp_runner import PromptResult, extract_markers, has_actionable_marker_valu
 
 
 class _SigtermCancelBridge:
-    """Convert process SIGTERM into asyncio task cancellation.
+    """Convert process termination signals into asyncio task cancellation.
 
     The default SIGTERM action exits the interpreter immediately, bypassing
     coroutine ``finally`` blocks. ACP dispatch owns lease/ledger finalization in
@@ -361,39 +361,47 @@ class _SigtermCancelBridge:
         self.loop = loop
         self.task = task
         self.received = False
+        self.signum: int | None = None
         self._installed = False
-        self._prior_handler: Any = None
-        self._used_loop_handler = False
+        self._prior_handlers: dict[int, Any] = {}
+        self._used_loop_handler: dict[int, bool] = {}
+        self._installed_signals: list[int] = []
 
-    def _cancel(self) -> None:
+    def _cancel(self, signum: int) -> None:
         self.received = True
+        self.signum = signum
         if self.task is not None and not self.task.done():
             self.task.cancel()
 
     def install(self) -> None:
-        self._prior_handler = signal.getsignal(signal.SIGTERM)
-        try:
-            self.loop.add_signal_handler(signal.SIGTERM, self._cancel)
-        except (NotImplementedError, RuntimeError, ValueError):
+        for signame in ("SIGTERM", "SIGINT"):
+            sig = getattr(signal, signame, None)
+            if sig is None:
+                continue
+            self._prior_handlers[sig] = signal.getsignal(sig)
             try:
-                signal.signal(signal.SIGTERM, lambda _signum, _frame: self._cancel())
-            except (ValueError, OSError):
-                return
-            self._installed = True
-            self._used_loop_handler = False
-            return
-        self._installed = True
-        self._used_loop_handler = True
+                self.loop.add_signal_handler(sig, self._cancel, sig)
+            except (NotImplementedError, RuntimeError, ValueError):
+                try:
+                    signal.signal(sig, lambda signum, _frame: self._cancel(signum))
+                except (ValueError, OSError):
+                    continue
+                self._used_loop_handler[sig] = False
+            else:
+                self._used_loop_handler[sig] = True
+            self._installed_signals.append(sig)
+        self._installed = bool(self._installed_signals)
 
     def restore(self) -> None:
         if not self._installed:
             return
-        if self._used_loop_handler:
-            with contextlib.suppress(Exception):
-                self.loop.remove_signal_handler(signal.SIGTERM)
-        if self._prior_handler is not None:
-            with contextlib.suppress(Exception):
-                signal.signal(signal.SIGTERM, self._prior_handler)
+        for sig in self._installed_signals:
+            if self._used_loop_handler.get(sig):
+                with contextlib.suppress(Exception):
+                    self.loop.remove_signal_handler(sig)
+            if sig in self._prior_handlers:
+                with contextlib.suppress(Exception):
+                    signal.signal(sig, self._prior_handlers[sig])
         self._installed = False
 
 
@@ -928,7 +936,11 @@ async def run_acp_dispatch(cfg: argparse.Namespace) -> dict:
     bridge = _SigtermCancelBridge(asyncio.get_running_loop(), asyncio.current_task())
     bridge.install()
     try:
-        return await _run_acp_dispatch_impl(cfg, sigterm_received=lambda: bridge.received)
+        return await _run_acp_dispatch_impl(
+            cfg,
+            sigterm_received=lambda: bridge.received,
+            signal_signum=lambda: bridge.signum,
+        )
     except asyncio.CancelledError:
         if bridge.received:
             dispatch_id = cfg.dispatch_id or f"acp-{cfg.agent}-{uuid.uuid4().hex[:8]}"
@@ -955,6 +967,7 @@ async def _run_acp_dispatch_impl(
     cfg: argparse.Namespace,
     *,
     sigterm_received: Callable[[], bool] | None = None,
+    signal_signum: Callable[[], int | None] | None = None,
 ) -> dict:
     """Run one ACP dispatch from an argparse.Namespace config.
 
@@ -1030,6 +1043,7 @@ async def _run_acp_dispatch_impl(
         "steer_mid_turn_delivery": "deferred",
         "lease_id": None,
         "agent": cfg.agent,
+        "priority": getattr(cfg, "priority", "normal"),
         "session_id": cfg.session_id,
         "project_root": str(project_root),
         "worker_cwd": worker_cwd,
@@ -1179,6 +1193,7 @@ async def _run_acp_dispatch_impl(
         lease_id=None,
         mem_mb=None,
         agent_cap=None,
+        priority=getattr(cfg, "priority", "normal"),
         ttl_s=lease_ttl_s,
         ram_mb=None,
         reserve_mb=goalflight_capacity.DEFAULT_RESERVE_MB,
@@ -1186,19 +1201,77 @@ async def _run_acp_dispatch_impl(
         hard_cap=goalflight_capacity.DEFAULT_HARD_CAP,
         max_total=None,
     )
-    acquire_out = io.StringIO()
-    with contextlib.redirect_stdout(acquire_out):
-        rc = goalflight_capacity.cmd_acquire(acquire_args)
-    if rc != 0:
-        try:
-            acquire_payload = json.loads(acquire_out.getvalue() or "{}")
-        except json.JSONDecodeError:
-            acquire_payload = {"raw": acquire_out.getvalue()}
+    wait_budget_s = goalflight_capacity.resolve_capacity_wait_s(
+        lane=acquire_args.priority,
+        wait_s=getattr(cfg, "capacity_wait_s", None),
+        log_prefix="goalflight_acp_run",
+    )
+
+    capacity_wait_started = active_monotonic()
+    last_capacity_wait = {"attempt": 0}
+
+    def on_capacity_wait(attempt: int, remaining_s: float, reason: dict) -> None:
+        last_capacity_wait["attempt"] = attempt
+        waited_s = round(max(0.0, wait_budget_s - remaining_s), 1)
+        payload.update(
+            {
+                "state": "waiting_capacity",
+                "reason": reason,
+                "waited_s": waited_s,
+                "wait_budget_s": wait_budget_s,
+                "updated_at": _now(),
+            }
+        )
+        write_status(status_path, payload)
+        if attempt == 1 or attempt % 4 == 0:
+            print(
+                "CAPACITY-WAIT "
+                + json.dumps(
+                    {
+                        "dispatch_id": dispatch_id,
+                        "agent": cfg.agent,
+                        "priority": acquire_args.priority,
+                        "reason": reason.get("reason"),
+                        "waited_s": waited_s,
+                        "wait_budget_s": wait_budget_s,
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+
+    try:
+        acquire_payload = await goalflight_capacity.acquire_with_wait_async(
+            acquire_args,
+            lane=acquire_args.priority,
+            wait_s=wait_budget_s,
+            on_wait=on_capacity_wait,
+            interrupted=sigterm_received,
+            interrupted_signum=signal_signum,
+        )
+    except goalflight_capacity.CapacityWaitInterrupted as exc:
+        payload.update(
+            {
+                "state": "blocked_capacity",
+                "ok": False,
+                "reason": exc.payload,
+                "updated_at": _now(),
+            }
+        )
+        write_status(status_path, payload)
+        return payload
+    if acquire_payload.get("decision") != "allow":
+        if last_capacity_wait["attempt"]:
+            acquire_payload = dict(acquire_payload)
+            acquire_payload.setdefault(
+                "waited_s",
+                round(max(0.0, active_monotonic() - capacity_wait_started), 1),
+            )
+            acquire_payload.setdefault("attempts", int(last_capacity_wait["attempt"]) + 1)
         payload.update({"state": "blocked_capacity", "reason": acquire_payload})
         write_status(status_path, payload)
         return payload
 
-    acquire_payload = json.loads(acquire_out.getvalue())
     lease_id = acquire_payload.get("lease", {}).get("lease_id")
 
     proc: asyncio.subprocess.Process | None = None
@@ -2342,6 +2415,7 @@ def normalized_acp_dispatch_cfg(args: argparse.Namespace) -> argparse.Namespace:
     values["session_id"] = values.get("session_id") or f"goalflight-{uuid.uuid4().hex[:8]}"
     values["read_only"] = bool(values.get("read_only", False))
     values["interactive"] = bool(values.get("interactive", False))
+    values["priority"] = values.get("priority") or "normal"
     return argparse.Namespace(**values)
 
 
@@ -2409,6 +2483,18 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--session-id", default=None)
     parser.add_argument("--dispatch-id")
+    parser.add_argument(
+        "--priority",
+        choices=list(goalflight_capacity.PRIORITY_LANES),
+        default="normal",
+        help="Capacity lane. ACP dispatch inherits goalflight_dispatch --priority.",
+    )
+    parser.add_argument(
+        "--capacity-wait-s",
+        type=float,
+        default=None,
+        help="Capacity wait budget in seconds. Overrides GOALFLIGHT_CAPACITY_WAIT_S and lane default.",
+    )
     parser.add_argument("--prompt-id")
     parser.add_argument("--prompt")
     parser.add_argument("--prompt-text")

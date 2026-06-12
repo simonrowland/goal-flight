@@ -40,7 +40,6 @@ import contextlib
 import io
 import json
 import os
-import random
 import re
 import signal
 import shutil
@@ -1144,42 +1143,17 @@ def _resolve_account_env(args) -> dict[str, str]:
     raise DispatchUsageError(f"--account unsupported for engine {engine!r}")
 
 
-# Bounded capacity-wait defaults per priority lane (seconds). The dispatcher
-# QUEUES inside _acquire_capacity by re-attempting acquire until a slot frees
-# or the deadline lapses — the canonical wait that controllers previously
-# hand-rolled with re-dispatch loops. bulk waits longest (batch work, fine to
-# idle); critical shortest (it borrows headroom, so a block means the machine
-# is truly full). 0 disables waiting (legacy instant DISPATCH-BLOCKED).
-CAPACITY_WAIT_DEFAULTS_S = {"bulk": 900, "normal": 600, "critical": 120}
-_CAPACITY_WAIT_POLL_S = 15.0
+CAPACITY_WAIT_DEFAULTS_S = goalflight_capacity.CAPACITY_WAIT_DEFAULTS_S
+_CAPACITY_WAIT_POLL_S = goalflight_capacity.CAPACITY_WAIT_POLL_S
 
 
 def _capacity_wait_seconds(args) -> float:
-    """Resolve the queue budget: CLI flag > env > lane default.
-
-    The env override (GOALFLIGHT_CAPACITY_WAIT_S) exists for test suites and
-    emergencies; an explicit --capacity-wait-s still wins over it.
-    """
-    cli = getattr(args, "capacity_wait_s", None)
-    if cli is not None:
-        return max(0.0, float(cli))
-    env_override = os.environ.get("GOALFLIGHT_CAPACITY_WAIT_S")
-    if env_override not in (None, ""):
-        try:
-            value = max(0.0, float(env_override))
-        except ValueError:
-            print(
-                f"goalflight_dispatch: ignoring invalid GOALFLIGHT_CAPACITY_WAIT_S={env_override!r}",
-                file=sys.stderr,
-            )
-        else:
-            print(
-                f"goalflight_dispatch: capacity wait {value}s from GOALFLIGHT_CAPACITY_WAIT_S",
-                file=sys.stderr,
-            )
-            return value
-    priority = getattr(args, "priority", None) or "normal"
-    return float(CAPACITY_WAIT_DEFAULTS_S.get(priority, 600))
+    """Resolve the queue budget: CLI flag > env > lane default."""
+    return goalflight_capacity.resolve_capacity_wait_s(
+        lane=getattr(args, "priority", None) or "normal",
+        wait_s=getattr(args, "capacity_wait_s", None),
+        log_prefix="goalflight_dispatch",
+    )
 
 
 def _acquire_capacity(args, *, project_root: Path, status_json: Path) -> str | None:
@@ -1205,11 +1179,6 @@ def _acquire_capacity(args, *, project_root: Path, status_json: Path) -> str | N
         max_total=None,
     )
     wait_budget_s = _capacity_wait_seconds(args)
-    # Sleep-excluding clock: a lid-close suspend must not burn the queue window
-    # (same active_monotonic discipline as the watchers).
-    wait_started = active_monotonic()
-    deadline = wait_started + wait_budget_s if wait_budget_s > 0 else None
-    attempt = 0
 
     def _write_blocked(blocked_payload: dict) -> None:
         write_status(
@@ -1226,91 +1195,71 @@ def _acquire_capacity(args, *, project_root: Path, status_json: Path) -> str | N
         )
         print("DISPATCH-BLOCKED " + json.dumps({"state": "blocked_capacity", "reason": blocked_payload}, sort_keys=True), flush=True)
 
-    # A SIGTERM/SIGINT during the (possibly minutes-long) queue must not strand
-    # a non-terminal `waiting_capacity` status: convert to SystemExit so the
-    # interrupt handler below writes the terminal record. Handlers restored on
-    # exit (the post-acquire dispatch phases keep their default behavior).
-    def _wait_signal(signum, _frame):
-        raise SystemExit(128 + signum)
+    capacity_wait_started = active_monotonic()
+    last_wait = {"attempt": 0, "remaining_s": wait_budget_s}
 
-    blocked_written = False
-    old_handlers = {}
-    for _signame in ("SIGTERM", "SIGINT"):
-        _sig = getattr(signal, _signame, None)
-        if _sig is not None:
-            with contextlib.suppress(Exception):
-                old_handlers[_sig] = signal.signal(_sig, _wait_signal)
+    def _on_wait(attempt: int, remaining_s: float, reason: dict) -> None:
+        last_wait["attempt"] = attempt
+        last_wait["remaining_s"] = remaining_s
+        waited_s = round(max(0.0, wait_budget_s - remaining_s), 1)
+        write_status(
+            status_json,
+            {
+                "schema": "goalflight.status.v1",
+                "dispatch_id": args.dispatch_id,
+                "agent": args.agent,
+                "state": "waiting_capacity",
+                "reason": reason,
+                "waited_s": waited_s,
+                "wait_budget_s": wait_budget_s,
+                "worker_alive": False,
+                "updated_at": int(time.time()),
+            },
+        )
+        if attempt == 1 or attempt % 4 == 0:
+            print(
+                "CAPACITY-WAIT "
+                + json.dumps(
+                    {
+                        "dispatch_id": args.dispatch_id,
+                        "agent": args.agent,
+                        "priority": acquire_args.priority,
+                        "reason": reason.get("reason"),
+                        "waited_s": waited_s,
+                        "wait_budget_s": wait_budget_s,
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+
     try:
-        while True:
-            attempt += 1
-            acquire_out = io.StringIO()
-            with contextlib.redirect_stdout(acquire_out):
-                rc = goalflight_capacity.cmd_acquire(acquire_args)
-            try:
-                payload = json.loads(acquire_out.getvalue() or "{}")
-            except json.JSONDecodeError:
-                payload = {"raw": acquire_out.getvalue()}
-            if rc == 0:
-                return payload.get("lease", {}).get("lease_id")
-            waited_s = round(active_monotonic() - wait_started, 1)
-            # Only genuine "wait" decisions queue; errors (e.g. unknown
-            # priority) and anything else fail immediately.
-            can_wait = payload.get("decision") == "wait" and deadline is not None and active_monotonic() < deadline
-            if not can_wait:
-                blocked_payload = dict(payload)
-                blocked_payload["waited_s"] = waited_s
-                blocked_payload["attempts"] = attempt
-                _write_blocked(blocked_payload)
-                blocked_written = True
-                raise SystemExit(rc)
-            # Queued: surface it (status plane + launcher tail) and re-attempt.
-            write_status(
-                status_json,
-                {
-                    "schema": "goalflight.status.v1",
-                    "dispatch_id": args.dispatch_id,
-                    "agent": args.agent,
-                    "state": "waiting_capacity",
-                    "reason": payload,
-                    "waited_s": waited_s,
-                    "wait_budget_s": wait_budget_s,
-                    "worker_alive": False,
-                    "updated_at": int(time.time()),
-                },
-            )
-            if attempt == 1 or attempt % 4 == 0:
-                print(
-                    "CAPACITY-WAIT "
-                    + json.dumps(
-                        {
-                            "dispatch_id": args.dispatch_id,
-                            "agent": args.agent,
-                            "priority": acquire_args.priority,
-                            "reason": payload.get("reason"),
-                            "waited_s": waited_s,
-                            "wait_budget_s": wait_budget_s,
-                        },
-                        sort_keys=True,
-                    ),
-                    flush=True,
-                )
-            # Jitter de-synchronizes multiple queued launchers' polls.
-            time.sleep(_CAPACITY_WAIT_POLL_S + random.uniform(0.0, 2.0))
-    except (SystemExit, KeyboardInterrupt):
-        if not blocked_written:
-            _write_blocked(
-                {
-                    "decision": "wait",
-                    "reason": "wait_interrupted",
-                    "waited_s": round(active_monotonic() - wait_started, 1),
-                    "attempts": attempt,
-                }
-            )
-        raise
-    finally:
-        for _sig, _old in old_handlers.items():
-            with contextlib.suppress(Exception):
-                signal.signal(_sig, _old)
+        payload = goalflight_capacity.acquire_with_wait(
+            acquire_args,
+            lane=acquire_args.priority,
+            wait_s=wait_budget_s,
+            poll_s=_CAPACITY_WAIT_POLL_S,
+            jitter=goalflight_capacity.CAPACITY_WAIT_JITTER_S,
+            on_wait=_on_wait,
+            install_signal_handlers=True,
+        )
+    except goalflight_capacity.CapacityWaitInterrupted as exc:
+        _write_blocked(exc.payload)
+        raise SystemExit(exc.exit_code or 1) from None
+    if payload.get("decision") == "allow":
+        return payload.get("lease", {}).get("lease_id")
+    blocked_payload = dict(payload)
+    if last_wait["attempt"]:
+        blocked_payload.setdefault(
+            "waited_s",
+            round(max(0.0, active_monotonic() - capacity_wait_started), 1),
+        )
+        blocked_payload.setdefault("attempts", int(last_wait["attempt"]) + 1)
+    else:
+        blocked_payload.setdefault("waited_s", 0.0)
+        blocked_payload.setdefault("attempts", 1)
+    _write_blocked(blocked_payload)
+    raise SystemExit(2)
 
 
 def _record_ledger(args, *, project_root: Path, prompt_path: str | None, status_json: Path,
@@ -1369,23 +1318,19 @@ def _identity_token(identity: dict | None) -> dict | None:
 
 
 def _process_identity_after_spawn(worker_pid: int) -> dict | None:
-    ident = None
-    for _ in range(20):
-        current = goalflight_ledger.process_identity(worker_pid)
-        if current:
-            ident = current
-        if current and current.get("lstart") and current.get("comm"):
-            break
-        time.sleep(0.05)
-    return ident
+    # goalflight_ledger.process_identity() already performs a bounded retry
+    # loop. Wrapping it in another 20-attempt loop can hold bash dispatch in
+    # "starting" until short workers have already completed on platforms where
+    # ps cannot provide every identity field.
+    return goalflight_ledger.process_identity(worker_pid)
 
 
 def _write_pidfile(args, *, worker_pid: int, pgid: int | None, identity: dict | None = None) -> Path | None:
+    pidfile_dir = _pidfile_dir()
+    pidfile_dir.mkdir(parents=True, exist_ok=True)
     ident = identity or _process_identity_after_spawn(worker_pid)
     if not ident:
         return None
-    pidfile_dir = _pidfile_dir()
-    pidfile_dir.mkdir(parents=True, exist_ok=True)
     controller_pid = _controller_pid(args)
     pidfile = pidfile_dir / f"{controller_pid}.bashtail.{worker_pid}.jsonl"
     entry = {
@@ -1581,6 +1526,8 @@ def _build_acp_cfg(args, *, status_json: Path):
         worktree="off",
         session_id=None,
         dispatch_id=args.dispatch_id,
+        priority=getattr(args, "priority", "normal"),
+        capacity_wait_s=getattr(args, "capacity_wait_s", None),
         prompt_id=None,
         prompt=prompt_path,
         prompt_text=None if prompt_path else args.prompt,
