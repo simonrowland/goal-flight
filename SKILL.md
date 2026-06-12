@@ -103,6 +103,7 @@ Orchestrator behaviour probes run through portable host adapters, not host-speci
 | context lints | Autonomous throughput | `protocols/engagement-lint.md`, `foreground-duration-hook.md` |
 | user-status-cadence | User progress reporting | `protocols/user-status-cadence.md` |
 | chunk-vs-milestone review | Review layers | `protocols/chunk-review.md`, `protocols/milestone-review.md` |
+| **bug-class mining / backwards sweeps** | Review layers | `protocols/review-mining.md` |
 | dispatch axes (per-task routing table is in Worker Routing) | Dispatch Model, Worker Routing | `protocols/dispatch-routing.md` |
 | **worker permissions / YOLO warning** | Worker Routing | `scripts/goalflight_acp_run.py`, doctor `--worker-write-probe`, `scripts/install_claude_acp_patch.sh` |
 | **worker blocked: orchestrator takeover** | Worker Routing | `protocols/dispatched-worker-recovery.md` |
@@ -180,6 +181,8 @@ Review layers: executor self-review, chunk review, milestone review.
 On chunk completion, dispatch gstack `/review` before committing.
 Reviews go through gstack `/review` and `/challenge`; do not hand-roll review prompts.
 Reviewer misses become regression tests, not trust exemptions. Write review rubrics before first wave dispatch.
+Review results are saved durably (`docs-private/reviews/` or the chunk's research dir) — never /tmp-only; tails die at reboot and unsaved verdicts cannot be mined.
+Every NEW bug class triggers the MINT-generalize loop (`protocols/review-mining.md`): mint the class predicate, sweep BACKWARDS over code + the saved review archive for more instances, record the sweep (no-hit included), encode the class as a forward review lens. One catch, one class, one sweep.
 Reviews are one-shot; fixes loop to green and re-review.
 Diversify reviewer concern, not just model. Use consolidation review for cross-slice contradictions.
 Milestone review is a separate gate from chunk review.

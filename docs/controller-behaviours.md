@@ -970,6 +970,48 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **severity:** med
 - **last_reviewed_commit:** (chunk-3c)
 
+### Entry: review-results-durable
+
+- **id:** `review-results-durable`
+- **name:** Save review results durably for mining
+- **category:** `review-discipline`
+- **controller_does:** Copies every review/verification verdict (prompt path, ranked findings, VERDICT line, round number) into `docs-private/reviews/<date>-<slug>/` or the chunk's research dir before moving on, so the archive stays mineable for bug-class hunts.
+- **failure_mode:** Verdicts live only in `/tmp` dispatch tails and die at reboot; later class sweeps have no archive to mine and noted-but-unfixed observations (P3s, "pre-existing" remarks) are lost.
+- **skill_md_compressed_form:**
+    - **kind:** literal
+    - **pattern:** "Review results are saved durably"
+    - **max_section_lines:** 25
+- **verifier:**
+    - **kind:** manual
+    - **id:** review-results-durable-manual
+- **provenance:**
+    - **sources:**
+      - `docs-private/RESUME-NOTES-2026-06-11.md`
+    - **r_numbers:** []
+- **severity:** med
+- **last_reviewed_commit:** (2026-06-11)
+
+### Entry: mint-generalize-loop
+
+- **id:** `mint-generalize-loop`
+- **name:** MINT bug classes and sweep backwards
+- **category:** `review-discipline`
+- **controller_does:** On any NEW bug class (caught by review, field report, or production), mints the sanitized class predicate, dispatches a backwards class-hunt over code plus the saved review archive, records the sweep result (no-hit included), and encodes the class as a forward review lens per `protocols/review-mining.md`.
+- **failure_mode:** Each bug is fixed as a one-off; sibling instances of the same class ship later from surfaces the original diagnosis already implicated (e.g. a fence fixed for decoration fails next on offset input that a prior review had noted as a passing observation).
+- **skill_md_compressed_form:**
+    - **kind:** literal
+    - **pattern:** "One catch, one class, one sweep"
+    - **max_section_lines:** 25
+- **verifier:**
+    - **kind:** manual
+    - **id:** mint-generalize-loop-manual
+- **provenance:**
+    - **sources:**
+      - `docs-private/RESUME-NOTES-2026-06-11.md`
+    - **r_numbers:** []
+- **severity:** med
+- **last_reviewed_commit:** (2026-06-11)
+
 ### Entry: classify-acp-failure-layer
 
 - **id:** `classify-acp-failure-layer`

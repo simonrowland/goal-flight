@@ -19,6 +19,7 @@ protocol files carry the detailed operating procedures.
 | `self-delegation.md` | user explicitly asks for `/fork` or `/branch` |
 | `worktrees-parallel.md` | `execute --parallel` or merge orchestration |
 | `milestone-review.md` | milestone gstack/Codex review flights |
+| `review-mining.md` | a NEW bug class is caught (mint + backwards sweep), or archiving review verdicts |
 
 ## Legacy
 

@@ -166,6 +166,8 @@ EXPECTED_ENTRY_IDS = {
     "user-status-cadence-15min",
     "milestone-standalone-protocol",
     "review-layers-three-distinct",
+    "review-results-durable",
+    "mint-generalize-loop",
     "gstack-default-review-chunk",
     "skill-organization-navigation-map",
     "maintainer-autoreview-env-optional",

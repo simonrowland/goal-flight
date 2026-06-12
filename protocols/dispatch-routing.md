@@ -321,6 +321,39 @@ host-specific helper or raw passthrough command, not `goalflight_dispatch.py
 on `grok-code` are bounced with a hint (composer can't drive web tools — use
 `grok-research`, or `--web-research-ok` to override a false positive).
 
+### Composer-class routing: prefer grok over cursor (operator steer 2026-06-11)
+
+For composer-2.5-class coding work, default to the grok lane and route to
+**cursor only when the chunk explicitly needs the cursor vendor harness**
+(cursor-internal models/features). Transport split follows this doc's
+transport rules, not co-equal choice:
+
+- **`grok-acp`** for goal-loop / code-writing chunks (non-codex goal-mode
+  requires ACP per the transport table above — bash-tail goal mode is
+  codex-only).
+- **`grok-code`** (bash-tail) for one-shot read-only work: reviews, hunts,
+  inline-return verdicts.
+
+Scope note: this demotes CURSOR; it does not displace codex, which remains
+the overall code-writing default in the SKILL.md Worker Routing table. The
+grok lane is the high-capacity second executor lane (pool cap 14 vs
+cursor's 3 in `DEFAULT_AGENT_CAPS`).
+
+Why grok over cursor here:
+
+- **No unattended gates.** `cursor-agent` carries editor-derived workspace
+  trust (one operator-present round per NEW project root or the dispatch dies
+  at a transport USER-CONFIRM in seconds) plus a global approval allowlist
+  that can kill runs mid-task on any unlisted command. The grok harness has
+  neither.
+- **Same model class**, lighter harness, larger pool cap.
+
+**The pairing that must not be lost in the switch:** cursor's approval system
+acted as a write gate; grok does NOT gate writes in auto mode (the dispatch
+warning fires). For write-capable grok dispatches, pair `--os-sandbox`
+(`workspace-write` when commits are expected); reviews stay `--read-only`.
+See `docs/acp-push-gate-matrix.md`.
+
 ## Capacity gate
 
 Before spawning any worker, acquire a machine-global lease:
