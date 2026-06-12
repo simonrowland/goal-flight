@@ -114,6 +114,45 @@ minimum-strictness gating. Only the genuinely uncertain or out-of-scope P3s
 may be deferred with a note in `docs-private/RESUME-NOTES*.md` or the active
 goal-queue margin.
 
+### Fix-chunk closing gate
+
+When a FIX chunk closes substantive review findings — non-trivial closures,
+oracle/tolerance arithmetic, security or contract surfaces, shared-helper
+logic, or multi-round fixes — the closing independent review runs in
+resolution-refutation stance. This is the same review floor, not an extra
+generic gate: trivial copy/CSS/typo cleanup still gets ordinary independent
+review, while closures worth attacking get attacked.
+
+Route refutation legs through the existing sub-billed read-only review
+dispatches described in Worker Routing and the bash-tail invocation above;
+cost is no reason to skip a substantive refutation. The reviewer obligations
+per closure are:
+
+- (a) attempt to REFUTE the closure; default to refuted-if-uncertain.
+- (b) re-derive any oracle/tolerance arithmetic INDEPENDENTLY — never trust
+  the fix's own numbers.
+- (c) verify each designed-red/poison test fires the PRODUCTION predicate, not
+  a parallel reimplementation; check the shared helper or production call path.
+- (d) treat accepted earlier-round fixes as first-class refutation targets — a
+  fix can itself introduce a contract wrinkle.
+- (e) poison-pair is the DEFAULT green-proof shape: the green test asserts
+  success SEMANTICS, the paired poison proves the named failure category
+  actually fires.
+
+Reusable reviewer-prompt fragment:
+
+> FIX-chunk resolution-refutation pass. This chunk closes review findings; do
+> not review the code generally. For each substantive closure, attack the
+> RESOLUTION: (a) attempt to REFUTE the closure and default to
+> refuted-if-uncertain; (b) re-derive oracle/tolerance arithmetic
+> independently, never trusting the fix's own numbers; (c) verify every
+> designed-red/poison test fires the PRODUCTION predicate through the shared
+> helper or production call path, not a parallel reimplementation; (d) treat
+> accepted earlier-round fixes as first-class refutation targets; (e) require
+> poison-pair proof by default, where the green asserts success semantics and
+> the paired poison proves the named failure category actually fires. Return
+> severity-tagged findings plus CLEAN only when all attacked closures survive.
+
 When gstack is not installed locally, fall back to the bundled prompts:
 `prompts/gstack-claude-review.md` and `prompts/gstack-codex-challenge.md`.
 These reproduce gstack's framing for the chunk-level pre-commit gate;

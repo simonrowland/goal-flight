@@ -22,6 +22,10 @@ means the predicate is new, not the instance (a second off-by-one in the
 same parser is the same class; a fence that fails on offset input when the
 last one failed on decoration is a NEW class).
 
+A REFUTED FIX closure is a mint candidate: the refuted resolution/test shape
+is a caught bug class until proven local, so run the predicate + backwards
+sweep question before treating it as one-off cleanup.
+
 1. **MINT the class.** Write the predicate in one or two sentences,
    sanitized and project-neutral: what shape of code/assumption fails, and
    the question a hunter asks to find another instance. Record it with the

@@ -34,6 +34,12 @@ corpus exists.
                      legacy algorithm exactly, not a re-derivation?
                      [specialize: which algorithm? which legacy path?]
 
+**Proof shape (applies to any test you add with a fix, across the categories
+above):** the default is a poison-pair — the green test asserts success
+semantics, and a paired poison proves the named failure category actually
+fires through the production predicate/shared helper (not a parallel
+reimplementation). A lone green that cannot go red proves nothing.
+
 Self-fix any P0/P1/P2 before reporting done. P3 may be deferred with a note.
 
 REPORT FORMAT (in your reply to the orchestrator, before the diff summary):

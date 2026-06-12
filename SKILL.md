@@ -184,6 +184,7 @@ Reviewer misses become regression tests, not trust exemptions. Write review rubr
 Review results are saved durably (`docs-private/reviews/` or the chunk's research dir) — never /tmp-only; tails die at reboot and unsaved verdicts cannot be mined.
 Every NEW bug class triggers the MINT-generalize loop (`protocols/review-mining.md`): mint the class predicate, sweep BACKWARDS over code + the saved review archive for more instances, record the sweep (no-hit included), encode the class as a forward review lens. One catch, one class, one sweep.
 Reviews are one-shot; fixes loop to green and re-review.
+For substantive FIX closures, the closing re-review uses resolution-refutation stance: attack closures/tests, re-derive oracles independently, verify poison tests hit production predicates/shared helpers, and re-attack earlier accepted fixes.
 Diversify reviewer concern, not just model. Use consolidation review for cross-slice contradictions.
 Milestone review is a separate gate from chunk review.
 
