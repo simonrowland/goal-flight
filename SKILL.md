@@ -183,8 +183,7 @@ Reviews go through gstack `/review` and `/challenge`; do not hand-roll review pr
 Reviewer misses become regression tests, not trust exemptions. Write review rubrics before first wave dispatch.
 Review results are saved durably (`docs-private/reviews/` or the chunk's research dir) — never /tmp-only; tails die at reboot and unsaved verdicts cannot be mined.
 Every NEW bug class triggers the MINT-generalize loop (`protocols/review-mining.md`): mint the class predicate, sweep BACKWARDS over code + the saved review archive for more instances, record the sweep (no-hit included), encode the class as a forward review lens. One catch, one class, one sweep.
-Reviews are one-shot; fixes loop to green and re-review.
-For substantive FIX closures, the closing re-review uses resolution-refutation stance: attack closures/tests, re-derive oracles independently, verify poison tests hit production predicates/shared helpers, and re-attack earlier accepted fixes.
+Reviews are one-shot; fixes loop to green and re-review; substantive fix closures get a refutation-stance closing pass that attacks the resolutions.
 Diversify reviewer concern, not just model. Use consolidation review for cross-slice contradictions.
 Milestone review is a separate gate from chunk review.
 
@@ -504,7 +503,6 @@ deciding whether a warning matters.
 Git-visible trigger aliases stay out of filenames, manifests, and commit
 messages. Push to a remote only after the relevant tests pass and the user has
 permitted publish.
-Git-visible trigger aliases stay out of filenames, manifests, and commit messages.
 
 ## Do Not
 
