@@ -60,13 +60,9 @@ def _acp_reexec_target() -> str | None:
     target = Path(override).expanduser() if override else Path.home() / ".goal-flight/venvs/acp-0.10/bin/python"
     if not target.exists():
         return None
-    try:
-        target_real = target.resolve()
-        current_real = Path(sys.executable).resolve()
-    except OSError:
-        target_real = target
-        current_real = Path(sys.executable)
-    if target_real == current_real:
+    target_path = os.path.normpath(str(target))
+    current_path = os.path.normpath(sys.executable)
+    if target_path == current_path:
         return None
     return str(target)
 
