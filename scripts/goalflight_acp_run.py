@@ -46,6 +46,8 @@ DEFAULT_MAX_TOOL_S = 3600.0
 DEFAULT_STALL_WAKE_CAP = 3
 DEFAULT_BETWEEN_TURN_STEER_GRACE_S = 10.0
 DEFAULT_EMPTY_BETWEEN_TURN_STEER_POLL_S = 0.25
+AGENT_STDERR_CAPTURE_BYTES = 64 * 1024
+AGENT_STDERR_ERROR_TAIL_CHARS = 1000
 LIVENESS_PROFILES = {"remote_api", "local_compute", "hybrid"}
 STEER_FILE_ALLOW_ENV = "GOALFLIGHT_ALLOW_EXTERNAL_STEER_FILE"
 
@@ -418,6 +420,97 @@ def _default_status_json_path(dispatch_id: str) -> Path:
 
 def _resolve_status_json_path(configured: str | None, dispatch_id: str) -> Path:
     return Path(configured).expanduser() if configured else _default_status_json_path(dispatch_id)
+
+
+def _agent_stderr_log_path(status_path: Path) -> Path:
+    if status_path.name == "status.json":
+        return status_path.with_name("agent-stderr.log")
+    if status_path.name.endswith(".status.json"):
+        stem = status_path.name[: -len(".status.json")]
+    else:
+        stem = status_path.stem
+    return status_path.with_name(f"{stem}.agent-stderr.log")
+
+
+def _tail_text(path: Path, *, chars: int) -> str | None:
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return None
+    if not raw:
+        return None
+    text = raw[-max(chars * 4, chars):].decode("utf-8", errors="replace")
+    return text[-chars:]
+
+
+class AgentStderrCapture:
+    def __init__(self, path: Path, *, max_bytes: int = AGENT_STDERR_CAPTURE_BYTES) -> None:
+        self.path = path
+        self.max_bytes = max(1, int(max_bytes))
+        self._buffer = bytearray()
+
+    async def attach(self, conn: AcpConnection) -> None:
+        old_task = getattr(conn, "_stderr_task", None)
+        if old_task is not None and not old_task.done():
+            old_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await old_task
+        stream = getattr(getattr(conn, "proc", None), "stderr", None)
+        if stream is None:
+            return
+        task = asyncio.create_task(self._drain(stream))
+        with contextlib.suppress(Exception):
+            setattr(conn, "_stderr_task", task)
+
+    def tail_text(self, chars: int = AGENT_STDERR_ERROR_TAIL_CHARS) -> str | None:
+        return _tail_text(self.path, chars=chars)
+
+    async def _drain(self, stream: asyncio.StreamReader) -> None:
+        try:
+            while True:
+                chunk = await stream.read(AGENT_STDERR_CAPTURE_BYTES)
+                if not chunk:
+                    break
+                self._append(chunk)
+                await asyncio.sleep(0)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+
+    def _append(self, chunk: bytes) -> None:
+        if not chunk:
+            return
+        self._buffer.extend(chunk)
+        if len(self._buffer) > self.max_bytes:
+            del self._buffer[: len(self._buffer) - self.max_bytes]
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+            tmp.write_bytes(bytes(self._buffer))
+            tmp.replace(self.path)
+        except OSError:
+            pass
+
+
+def _error_with_agent_stderr_tail(error: object, stderr_tail: str) -> dict[str, object]:
+    if isinstance(error, dict):
+        out = dict(error)
+        out["agent_stderr_tail"] = stderr_tail
+        return out
+    if error is None:
+        return {"agent_stderr_tail": stderr_tail}
+    return {"message": str(error), "agent_stderr_tail": stderr_tail}
+
+
+def _attach_agent_stderr_tail(payload: dict, capture: AgentStderrCapture) -> None:
+    state = str(payload.get("state") or "")
+    if state not in {"failed", "wedged", "tool_timeout", "remote_turn_silence", "stalled"}:
+        return
+    tail = capture.tail_text()
+    if not tail:
+        return
+    payload["error"] = _error_with_agent_stderr_tail(payload.get("error"), tail)
 
 
 def _default_steer_file(dispatch_id: str) -> Path:
@@ -914,6 +1007,7 @@ async def spawn_and_handshake_with_retry(
     os_sandbox: str = OS_SANDBOX_OFF,
     session_model: str | None = None,
     env: dict[str, str] | None = None,
+    stderr_capture: AgentStderrCapture | None = None,
 ) -> tuple[asyncio.subprocess.Process, AcpConnection]:
     """Spawn the worker and run the ACP handshake, retrying once on AcpError.
 
@@ -951,6 +1045,8 @@ async def spawn_and_handshake_with_retry(
             os_sandbox=os_sandbox,
             env=env,
         )
+        if stderr_capture is not None:
+            await stderr_capture.attach(conn)
         proc = conn.proc
         if on_attempt is not None:
             maybe = on_attempt(attempt, proc)
@@ -1095,6 +1191,8 @@ async def _run_acp_dispatch_impl(
             worktree_error = f"{type(e).__name__}: {e}"
     status_path = _resolve_status_json_path(getattr(cfg, "status_json", None), dispatch_id)
     cfg.status_json = str(status_path)
+    agent_stderr_path = _agent_stderr_log_path(status_path)
+    agent_stderr_capture = AgentStderrCapture(agent_stderr_path)
     payload: dict = {
         "schema": "goalflight.acp-run.v1",
         "dispatch_id": dispatch_id,
@@ -1114,6 +1212,7 @@ async def _run_acp_dispatch_impl(
         "planned_worktree_path": str(worktree_path) if worktree_path is not None else None,
         "worktree_path": None,
         "status_path": str(status_path),
+        "agent_stderr_path": str(agent_stderr_path),
         "state": "starting",
         "ok": False,
         "worker_pid": None,
@@ -2131,6 +2230,7 @@ async def _run_acp_dispatch_impl(
                 os_sandbox=spawn_os_sandbox_profile,
                 session_model=getattr(cfg, "model", None),
                 env=spawn_env,
+                stderr_capture=agent_stderr_capture,
             )
         await update_status(os_sandbox=getattr(conn, "os_sandbox_metadata", None) or payload["os_sandbox"])
         test_marker = goalflight_compat.allowed_env_override(
@@ -2457,6 +2557,7 @@ async def _run_acp_dispatch_impl(
         elif lease_id:
             with contextlib.redirect_stdout(io.StringIO()):
                 goalflight_capacity.cmd_release(argparse.Namespace(lease_id=lease_id, state=payload.get("state", state), reason=payload.get("error"), keep=True))
+    _attach_agent_stderr_tail(payload, agent_stderr_capture)
     write_status(status_path, payload)
     return payload
 

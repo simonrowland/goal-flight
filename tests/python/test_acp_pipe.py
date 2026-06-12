@@ -69,6 +69,84 @@ def _write_supported_adapter_manifest(directory: Path, name: str) -> None:
     }))
 
 
+def _write_stderr_error_agent(path: Path) -> None:
+    path.write_text(
+        """#!/usr/bin/env python3
+import json
+import os
+import sys
+import uuid
+
+
+def send(message):
+    sys.stdout.write(json.dumps(message, separators=(",", ":")) + "\\n")
+    sys.stdout.flush()
+
+
+def response(req_id, result):
+    send({"jsonrpc": "2.0", "id": req_id, "result": result})
+
+
+def write_stderr():
+    total = int(os.environ.get("GOALFLIGHT_FAKE_ACP_CHATTY_STDERR_BYTES", "0") or "0")
+    if total > 0:
+        head = b"head-marker-chatty\\n"
+        tail = b"\\ntail-marker-chatty\\n"
+        sys.stderr.buffer.write(head)
+        remaining = max(0, total - len(head) - len(tail))
+        chunk = b"x" * 8192
+        while remaining > 0:
+            piece = chunk[: min(remaining, len(chunk))]
+            sys.stderr.buffer.write(piece)
+            sys.stderr.buffer.flush()
+            remaining -= len(piece)
+        sys.stderr.buffer.write(tail)
+        sys.stderr.buffer.flush()
+        return
+    sys.stderr.write(os.environ.get("GOALFLIGHT_FAKE_ACP_STDERR_TEXT", "known-agent-stderr\\n"))
+    sys.stderr.flush()
+
+
+def main():
+    sessions = {}
+    while True:
+        line = sys.stdin.readline()
+        if not line:
+            return
+        message = json.loads(line)
+        method = message.get("method")
+        req_id = message.get("id")
+        params = message.get("params") or {}
+        if method == "initialize":
+            response(req_id, {
+                "protocolVersion": 1,
+                "agentInfo": {"name": "stderr-agent", "version": "0.1"},
+                "capabilities": {},
+            })
+        elif method == "session/new":
+            session_id = str(uuid.uuid4())
+            sessions[session_id] = {"cwd": params.get("cwd")}
+            response(req_id, {"sessionId": session_id})
+        elif method == "session/prompt":
+            write_stderr()
+            send({
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": {"code": -32603, "message": "Internal error"},
+            })
+            return
+        elif req_id is not None:
+            send({"jsonrpc": "2.0", "id": req_id, "error": {"code": -32601, "message": method}})
+
+
+if __name__ == "__main__":
+    main()
+""",
+        encoding="utf-8",
+    )
+    path.chmod(path.stat().st_mode | stat.S_IXUSR)
+
+
 def _cwd_goalflight_droppings(cwd: Path) -> list[str]:
     return sorted(path.name for path in cwd.glob(".goalflight-*"))
 
@@ -341,6 +419,130 @@ async def case_runner_overlimit_response_status_counts_drop() -> None:
         else:
             os.environ["GOALFLIGHT_STATE_DIR"] = old_state_dir
         goalflight_adapter_readiness.ADAPTERS_DIR = old_adapters_dir
+
+
+def _stderr_error_runner_args(dispatch_id: str, status_path: Path) -> argparse.Namespace:
+    return argparse.Namespace(
+        agent="stderr-runner",
+        cwd=str(ROOT),
+        session_id=f"{dispatch_id}-session",
+        dispatch_id=dispatch_id,
+        prompt_id=None,
+        prompt=None,
+        prompt_text="go",
+        mode="one-shot",
+        status_json=str(status_path),
+        idle_timeout=2.0,
+        heartbeat_interval=5.0,
+        wedge_samples=100,
+        max_tool_s=60.0,
+        max_quiet_s=60.0,
+        progress_stall_s=60.0,
+        liveness_profile=None,
+        remote_turn_silence_s=None,
+        remote_turn_cancel_grace_s=0.0,
+        cpu_epsilon=0.1,
+    )
+
+
+async def case_runner_captures_agent_stderr_on_failure() -> None:
+    old_agent_command = goalflight_acp_run.agent_command
+    old_adapters_dir = goalflight_adapter_readiness.ADAPTERS_DIR
+    old_state_dir = os.environ.get("GOALFLIGHT_STATE_DIR")
+    old_pidfile_dir = os.environ.get("GOAL_FLIGHT_PIDFILE_DIR")
+    old_stderr_text = os.environ.get("GOALFLIGHT_FAKE_ACP_STDERR_TEXT")
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            agent = tmp_path / "stderr_error_agent.py"
+            _write_stderr_error_agent(agent)
+            goalflight_acp_run.agent_command = lambda _agent, model=None: (sys.executable, [str(agent)])
+            goalflight_adapter_readiness.ADAPTERS_DIR = tmp_path
+            os.environ["GOALFLIGHT_STATE_DIR"] = str(tmp_path / "state")
+            os.environ["GOAL_FLIGHT_PIDFILE_DIR"] = str(tmp_path / "pids")
+            os.environ["GOALFLIGHT_FAKE_ACP_STDERR_TEXT"] = "known-agent-stderr\nline-two\n"
+            _write_supported_adapter_manifest(tmp_path, "stderr-runner")
+
+            status_path = tmp_path / "status.json"
+            dispatch_id = f"stderr-failure-{os.getpid()}"
+            payload = await goalflight_acp_run.run(
+                _stderr_error_runner_args(dispatch_id, status_path)
+            )
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+            stderr_path = Path(status["agent_stderr_path"])
+            stderr_text = stderr_path.read_text(encoding="utf-8")
+
+            assert payload["state"] == "failed", payload
+            assert status["state"] == "failed", status
+            assert stderr_path == tmp_path / "agent-stderr.log", stderr_path
+            assert "known-agent-stderr" in stderr_text, stderr_text
+            assert "known-agent-stderr" in status["error"]["agent_stderr_tail"], status
+            assert status["error"]["message"] == "Internal error", status["error"]
+    finally:
+        goalflight_acp_run.agent_command = old_agent_command
+        goalflight_adapter_readiness.ADAPTERS_DIR = old_adapters_dir
+        if old_state_dir is None:
+            os.environ.pop("GOALFLIGHT_STATE_DIR", None)
+        else:
+            os.environ["GOALFLIGHT_STATE_DIR"] = old_state_dir
+        if old_pidfile_dir is None:
+            os.environ.pop("GOAL_FLIGHT_PIDFILE_DIR", None)
+        else:
+            os.environ["GOAL_FLIGHT_PIDFILE_DIR"] = old_pidfile_dir
+        if old_stderr_text is None:
+            os.environ.pop("GOALFLIGHT_FAKE_ACP_STDERR_TEXT", None)
+        else:
+            os.environ["GOALFLIGHT_FAKE_ACP_STDERR_TEXT"] = old_stderr_text
+
+
+async def case_runner_tail_caps_agent_stderr_on_failure() -> None:
+    old_agent_command = goalflight_acp_run.agent_command
+    old_adapters_dir = goalflight_adapter_readiness.ADAPTERS_DIR
+    old_state_dir = os.environ.get("GOALFLIGHT_STATE_DIR")
+    old_pidfile_dir = os.environ.get("GOAL_FLIGHT_PIDFILE_DIR")
+    old_chatty_bytes = os.environ.get("GOALFLIGHT_FAKE_ACP_CHATTY_STDERR_BYTES")
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            agent = tmp_path / "stderr_error_agent.py"
+            _write_stderr_error_agent(agent)
+            goalflight_acp_run.agent_command = lambda _agent, model=None: (sys.executable, [str(agent)])
+            goalflight_adapter_readiness.ADAPTERS_DIR = tmp_path
+            os.environ["GOALFLIGHT_STATE_DIR"] = str(tmp_path / "state")
+            os.environ["GOAL_FLIGHT_PIDFILE_DIR"] = str(tmp_path / "pids")
+            os.environ["GOALFLIGHT_FAKE_ACP_CHATTY_STDERR_BYTES"] = str(
+                goalflight_acp_run.AGENT_STDERR_CAPTURE_BYTES + 8192
+            )
+            _write_supported_adapter_manifest(tmp_path, "stderr-runner")
+
+            status_path = tmp_path / "status.json"
+            dispatch_id = f"stderr-chatty-{os.getpid()}"
+            await goalflight_acp_run.run(_stderr_error_runner_args(dispatch_id, status_path))
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+            stderr_path = Path(status["agent_stderr_path"])
+            stderr_bytes = stderr_path.read_bytes()
+            stderr_text = stderr_bytes.decode("utf-8", errors="replace")
+
+            assert status["state"] == "failed", status
+            assert len(stderr_bytes) <= goalflight_acp_run.AGENT_STDERR_CAPTURE_BYTES, len(stderr_bytes)
+            assert "tail-marker-chatty" in stderr_text, stderr_text[-200:]
+            assert "head-marker-chatty" not in stderr_text, stderr_text[:200]
+            assert "tail-marker-chatty" in status["error"]["agent_stderr_tail"], status["error"]
+    finally:
+        goalflight_acp_run.agent_command = old_agent_command
+        goalflight_adapter_readiness.ADAPTERS_DIR = old_adapters_dir
+        if old_state_dir is None:
+            os.environ.pop("GOALFLIGHT_STATE_DIR", None)
+        else:
+            os.environ["GOALFLIGHT_STATE_DIR"] = old_state_dir
+        if old_pidfile_dir is None:
+            os.environ.pop("GOAL_FLIGHT_PIDFILE_DIR", None)
+        else:
+            os.environ["GOAL_FLIGHT_PIDFILE_DIR"] = old_pidfile_dir
+        if old_chatty_bytes is None:
+            os.environ.pop("GOALFLIGHT_FAKE_ACP_CHATTY_STDERR_BYTES", None)
+        else:
+            os.environ["GOALFLIGHT_FAKE_ACP_CHATTY_STDERR_BYTES"] = old_chatty_bytes
 
 
 async def case_runner_blocks_probe_required_adapter() -> None:
@@ -1603,6 +1805,8 @@ async def amain() -> None:
     await case_stderr_burst_without_newline_drains()
     await case_overlimit_response_fails_cleanly()
     await case_runner_overlimit_response_status_counts_drop()
+    await case_runner_captures_agent_stderr_on_failure()
+    await case_runner_tail_caps_agent_stderr_on_failure()
     await case_runner_blocks_probe_required_adapter()
     await case_runner_blocks_invalid_adapter_manifest()
     await case_runner_blocks_missing_adapter_manifest()
