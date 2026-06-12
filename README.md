@@ -17,10 +17,8 @@ one-commit-per-chunk work on your branch; nothing is pushed without your permiss
 
 **Hosts and workers.** [Claude Code](https://claude.ai/code) is the supported
 orchestrator. [Codex](https://github.com/openai/codex) is the standard worker; cursor,
-grok, claude-cli, and other worker adapters also serve. Orchestrator ports for
-Codex, [Cursor](https://cursor.com), and [OpenCode](https://opencode.ai) ship in-repo —
-same `SKILL.md`, file-backed queue, and dispatch machinery — but are implemented and
-unsupported; the Claude Code wrapper is the maintained path.
+grok, claude-cli, and other worker adapters also serve. Unsupported orchestrator ports
+for Codex, Cursor, and OpenCode ship in-repo.
 
 **What the orchestrator session is for**: requirements gathering, architecture decisions,
 question escalation, and monitoring — not execution. The orchestrator holds enough context
