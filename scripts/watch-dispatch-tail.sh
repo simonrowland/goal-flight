@@ -2,7 +2,8 @@
 # watch-dispatch-tail.sh — content-aware completion watcher for [bash-tail] dispatches.
 #
 # Watches a worker's tail file for any TERMINAL marker (COMPLETE / BLOCKED /
-# USER-NEED / USER-CONFIRM, with optional markdown emphasis tolerance for grok).
+# USER-NEED / USER-CONFIRM / READY, with optional markdown emphasis tolerance
+# for grok).
 # Exits when:
 #   - terminal marker observed in tail            → exit 0  ("WATCHER-EXIT: marker")
 #   - worker PID dies without terminal marker     → exit 1  ("WATCHER-EXIT: pid-dead")
@@ -23,12 +24,13 @@
 #     --controller-pid <controller-pid> \
 #     --agent <agent-label, e.g. codex-bash-tail> \
 #     --session-id <slug> \
+#     [--ignore-prompt-file <path>] \
 #     [--markers <regex>] \
 #     [--poll-secs <N>] \
 #     [--max-idle-secs <N>]
 #
 # Defaults:
-#   --markers       '^\**(COMPLETE|BLOCKED|USER-NEED|USER-CONFIRM):\**'
+#   --markers       '^\**(COMPLETE|BLOCKED|USER-NEED|USER-CONFIRM|READY):\**'
 #                   (terminal-marker subset; emphasis-tolerant for grok's **MARKER:**)
 #   --poll-secs     15
 #   --max-idle-secs 180   (matches protocol idle/no-progress guidance)
@@ -50,6 +52,7 @@ TAIL_PATH=""
 CONTROLLER_PID=""
 AGENT_LABEL=""
 SESSION_ID=""
+IGNORE_PROMPT_FILE=""
 MARKER_RE='^\**(COMPLETE|BLOCKED|USER-NEED|USER-CONFIRM|READY):\**'
 POLL_SECS=15
 MAX_IDLE_SECS=180
@@ -79,6 +82,7 @@ while [ $# -gt 0 ]; do
     --controller-pid) CONTROLLER_PID="$2"; shift 2 ;;
     --agent)          AGENT_LABEL="$2"; shift 2 ;;
     --session-id)     SESSION_ID="$2"; shift 2 ;;
+    --ignore-prompt-file) IGNORE_PROMPT_FILE="$2"; shift 2 ;;
     --markers)        MARKER_RE="$2"; shift 2 ;;
     --poll-secs)      POLL_SECS="$2"; shift 2 ;;
     --max-idle-secs)  MAX_IDLE_SECS="$2"; shift 2 ;;
@@ -239,15 +243,139 @@ echo "[watcher start $(date '+%H:%M:%S')] worker_pid=$WORKER_PID controller_pid=
 
 terminal_marker_seen() {
   [ -f "$TAIL_PATH" ] || return 1
+  if [ -n "$IGNORE_PROMPT_FILE" ] && [ -f "$IGNORE_PROMPT_FILE" ]; then
+    python3 - "$TAIL_PATH" "$IGNORE_PROMPT_FILE" "$MARKER_RE" <<'PY'
+import pathlib
+import re
+import sys
+
+tail = pathlib.Path(sys.argv[1])
+prompt = pathlib.Path(sys.argv[2])
+marker_re = re.compile(sys.argv[3])
+prompt_lines = [line.strip() for line in prompt.read_text(encoding="utf-8", errors="replace").splitlines()]
+size = tail.stat().st_size
+start = max(0, size - 10 * 1024 * 1024)
+text = tail.read_bytes()[start:].decode(errors="replace")
+can_ignore = start == 0 and bool(prompt_lines)
+in_fence = False
+last_nonempty = ""
+last_in_fence = False
+for idx, line in enumerate(text.splitlines(), start=1):
+    stripped = line.strip()
+    if can_ignore:
+        expected = prompt_lines[idx - 1] if idx <= len(prompt_lines) else None
+        if expected is not None and stripped == expected:
+            continue
+        can_ignore = False
+    lstrip = line.lstrip()
+    if lstrip.startswith("```") or lstrip.startswith("~~~"):
+        in_fence = not in_fence
+        if stripped:
+            last_nonempty = stripped
+            last_in_fence = in_fence
+        continue
+    if in_fence:
+        if stripped:
+            last_nonempty = stripped
+            last_in_fence = True
+        continue
+    if stripped:
+        last_nonempty = stripped
+        last_in_fence = False
+raise SystemExit(0 if last_nonempty and not last_in_fence and marker_re.search(last_nonempty) else 1)
+PY
+    return $?
+  fi
   grep -vE '^[[:space:]]*$' "$TAIL_PATH" 2>/dev/null | tail -1 | grep -qE "$MARKER_RE" 2>/dev/null
 }
 
+final_terminal_marker() {
+  [ -f "$TAIL_PATH" ] || return 1
+  python3 - "$TAIL_PATH" "${IGNORE_PROMPT_FILE:-}" <<'PY'
+import pathlib
+import re
+import sys
+
+tail = pathlib.Path(sys.argv[1])
+prompt_arg = sys.argv[2]
+prompt_lines = []
+if prompt_arg:
+    prompt = pathlib.Path(prompt_arg)
+    if prompt.exists():
+        prompt_lines = [line.strip() for line in prompt.read_text(encoding="utf-8", errors="replace").splitlines()]
+marker_re = re.compile(
+    r"^(?:-\s+)?`?\**(?:STATUS:\s*)?"
+    r"(RESULT|USER-NEED|USER-CONFIRM|BLOCKED|FAILED|COMPLETE|READY):(.*)$"
+)
+hunk_header_re = re.compile(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@")
+
+def diff_context(raw_line: str) -> bool:
+    return raw_line.startswith((" ", "\t", "+")) or (raw_line.startswith("-") and not raw_line.startswith("- "))
+
+def strip_decoration(text: str) -> str:
+    value = text.strip()
+    while value.startswith("*") or value.startswith("`"):
+        value = value[1:].lstrip()
+    while value.endswith("*") or value.endswith("`"):
+        value = value[:-1].rstrip()
+    return value
+
+size = tail.stat().st_size
+start = max(0, size - 10 * 1024 * 1024)
+text = tail.read_bytes()[start:].decode(errors="replace")
+can_ignore = start == 0 and bool(prompt_lines)
+in_fence = False
+in_hunk = False
+terminal = None
+for idx, line in enumerate(text.splitlines(), start=1):
+    stripped = line.strip()
+    if can_ignore:
+        expected = prompt_lines[idx - 1] if idx <= len(prompt_lines) else None
+        if expected is not None and stripped == expected:
+            continue
+        can_ignore = False
+    lstrip = line.lstrip()
+    if lstrip.startswith("```") or lstrip.startswith("~~~"):
+        in_fence = not in_fence
+        continue
+    if in_fence:
+        continue
+    if in_hunk:
+        if line.startswith((" ", "+", "-", "\\")):
+            continue
+        in_hunk = False
+    if hunk_header_re.match(line):
+        in_hunk = True
+        continue
+    if not stripped or diff_context(line):
+        continue
+    match = marker_re.match(stripped)
+    if match:
+        terminal = (idx, match.group(1), strip_decoration(match.group(2))[:1000])
+if terminal:
+    print(f"{terminal[0]}:{terminal[1]}:{terminal[2]}")
+    raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
 emit_marker_exit() {
-  echo "[$(date '+%H:%M:%S')] terminal marker matched in tail"
+  local detail="${1:-terminal marker matched in tail}"
+  local exit_code="${2:-0}"
+  echo "[$(date '+%H:%M:%S')] $detail"
   echo "=== tail last 30 lines ==="
   tail -30 "$TAIL_PATH"
-  echo "WATCHER-EXIT: marker exit_code=0"
-  exit 0
+  echo "WATCHER-EXIT: marker exit_code=$exit_code"
+  exit "$exit_code"
+}
+
+exit_code_for_reconciled_marker_kind() {
+  case "$1" in
+    COMPLETE|RESULT|READY) echo 0 ;;
+    BLOCKED|FAILED) echo 4 ;;
+    USER-NEED|USER-CONFIRM) echo 0 ;;
+    *) echo 0 ;;
+  esac
 }
 
 while true; do
@@ -288,6 +416,13 @@ while true; do
     sleep "$PID_DEAD_MARKER_GRACE_SECS"
     if terminal_marker_seen; then
       emit_marker_exit
+    fi
+    reconciled_marker=$(final_terminal_marker 2>/dev/null || true)
+    if [ -n "$reconciled_marker" ]; then
+      reconciled_kind=${reconciled_marker#*:}
+      reconciled_kind=${reconciled_kind%%:*}
+      reconciled_exit_code=$(exit_code_for_reconciled_marker_kind "$reconciled_kind")
+      emit_marker_exit "terminal marker reconciled after worker exit ($reconciled_marker)" "$reconciled_exit_code"
     fi
     echo "[$(date '+%H:%M:%S')] worker PID $WORKER_PID is gone (no terminal marker seen after pid-dead grace)"
     if [ -f "$TAIL_PATH" ]; then

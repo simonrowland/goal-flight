@@ -35,6 +35,11 @@ from goalflight_liveness import (
 # Prevents cat/echo/print of marker tokens mid-output or inside fenced examples from
 # false-completing the watcher.
 MARKER_RE = re.compile(r"^\**(STATUS|STEER-ACK|RESULT|USER-NEED|USER-CONFIRM|BLOCKED|COMPLETE|READY):\**\s*(.*)$")
+FINAL_TERMINAL_MARKER_RE = re.compile(
+    r"^(?:-\s+)?`?\**(?:STATUS:\s*)?"
+    r"(RESULT|USER-NEED|USER-CONFIRM|BLOCKED|FAILED|COMPLETE|READY):(.*)$"
+)
+HUNK_HEADER_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@")
 TERMINAL_MARKERS = {"RESULT", "USER-NEED", "USER-CONFIRM", "BLOCKED", "COMPLETE", "READY"}
 # CPU-sampling-failure grace (codex 2026-05-20 P2): require this many consecutive
 # `wedged` polls before exiting with idle_timeout, so a single transient `ps`
@@ -62,6 +67,37 @@ def _exit_code_for_state(state: str) -> int:
     if state == "blocked" or state.startswith("blocked"):
         return 4
     return 1
+
+
+def _strip_marker_decoration(text: str) -> str:
+    value = text.strip()
+    while value.startswith("*") or value.startswith("`"):
+        value = value[1:].lstrip()
+    while value.endswith("*") or value.endswith("`"):
+        value = value[:-1].rstrip()
+    return value
+
+
+def _is_diff_context_line(raw_line: str) -> bool:
+    if raw_line.startswith((" ", "\t", "+")):
+        return True
+    return raw_line.startswith("-") and not raw_line.startswith("- ")
+
+
+def _final_terminal_marker_from_line(raw_line: str, line_no: int) -> dict | None:
+    if _is_diff_context_line(raw_line):
+        return None
+    stripped = raw_line.strip()
+    if not stripped:
+        return None
+    match = FINAL_TERMINAL_MARKER_RE.match(stripped)
+    if not match:
+        return None
+    return {
+        "line": line_no,
+        "kind": match.group(1),
+        "text": _strip_marker_decoration(match.group(2))[:1000],
+    }
 
 
 def alive(pid: int | None) -> bool:
@@ -234,6 +270,50 @@ def _last_line_is_terminal_marker(path: Path, ignore_prefix_lines: list[str] | N
     if match and match.group(1) in TERMINAL_MARKERS:
         return {"line": -1, "kind": match.group(1), "text": match.group(2)[:1000]}
     return None
+
+
+def _final_terminal_marker(path: Path, ignore_prefix_lines: list[str] | None = None) -> dict | None:
+    """Return the last terminal marker anywhere in the completed post-prompt tail.
+
+    Live detection remains last-line-only. This reconciliation scan is for the
+    worker-dead path, after no more output can arrive.
+    """
+    if not path.exists():
+        return None
+    size = path.stat().st_size
+    start = max(0, size - 10 * 1024 * 1024)
+    prompt_prefix = ignore_prefix_lines or []
+    can_ignore_prefix = start == 0 and bool(prompt_prefix)
+    in_fence = False
+    in_hunk = False
+    terminal: dict | None = None
+    with path.open("rb") as f:
+        f.seek(start)
+        text = f.read().decode(errors="replace")
+    for idx, line in enumerate(text.splitlines(), start=1):
+        stripped = line.strip()
+        if can_ignore_prefix:
+            expected = prompt_prefix[idx - 1] if idx <= len(prompt_prefix) else None
+            if expected is not None and stripped == expected:
+                continue
+            can_ignore_prefix = False
+        lstrip = line.lstrip()
+        if lstrip.startswith("```") or lstrip.startswith("~~~"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        if in_hunk:
+            if line.startswith((" ", "+", "-", "\\")):
+                continue
+            in_hunk = False
+        if HUNK_HEADER_RE.match(line):
+            in_hunk = True
+            continue
+        candidate = _final_terminal_marker_from_line(line, idx)
+        if candidate:
+            terminal = candidate
+    return terminal
 
 
 def main() -> int:
@@ -444,13 +524,21 @@ def main() -> int:
             write_payload(payload, reason=exit_reason, terminal_write=True)
             break
         if not worker_is_alive:
-            payload["state"] = "worker_dead"
-            exit_reason = (
-                "worker_dead_no_terminal_marker"
-                if identity_reason == "dead"
-                else f"worker_identity_mismatch:{identity_reason}"
-            )
-            exit_code = 1
+            reconciled = _final_terminal_marker(tail, ignore_prefix_lines=ignore_prefix_lines)
+            if reconciled:
+                terminal_seen = reconciled
+                payload["terminal_marker"] = terminal_seen
+                payload["state"] = _marker_state(terminal_seen)
+                exit_reason = f"marker:{terminal_seen['kind']}:final_reconciliation"
+                exit_code = _exit_code_for_state(payload["state"])
+            else:
+                payload["state"] = "worker_dead"
+                exit_reason = (
+                    "worker_dead_no_terminal_marker"
+                    if identity_reason == "dead"
+                    else f"worker_identity_mismatch:{identity_reason}"
+                )
+                exit_code = 1
             write_payload(payload, reason=exit_reason, terminal_write=True)
             break
         if liveness_state == "wedged":

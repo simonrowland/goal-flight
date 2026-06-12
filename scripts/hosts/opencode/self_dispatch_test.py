@@ -255,6 +255,8 @@ def _run_bash_tail(*, workdir: Path, model: str, timeout: float) -> dict[str, An
             "opencode-bash-tail",
             "--session-id",
             "opencode-self-dispatch",
+            "--ignore-prompt-file",
+            str(prompt_path),
             "--poll-secs",
             "1",
             "--max-idle-secs",

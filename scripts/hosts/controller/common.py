@@ -91,29 +91,33 @@ def run_bash_tail_watch(
     session_id: str,
     timeout: float,
     pidfile_dir: Path,
+    prompt_path: Path | None = None,
 ) -> dict[str, Any]:
     env = os.environ.copy()
     env["GOAL_FLIGHT_PIDFILE_DIR"] = str(pidfile_dir)
     max_idle = max(30, int(timeout - 15))
+    watcher_cmd = [
+        "bash",
+        str(WATCHER),
+        "--pid",
+        str(worker_proc.pid),
+        "--tail",
+        str(tail_path),
+        "--controller-pid",
+        str(os.getpid()),
+        "--agent",
+        agent_label,
+        "--session-id",
+        session_id,
+        "--poll-secs",
+        "1",
+        "--max-idle-secs",
+        str(max_idle),
+    ]
+    if prompt_path is not None:
+        watcher_cmd.extend(["--ignore-prompt-file", str(prompt_path)])
     watcher_proc = subprocess.Popen(
-        [
-            "bash",
-            str(WATCHER),
-            "--pid",
-            str(worker_proc.pid),
-            "--tail",
-            str(tail_path),
-            "--controller-pid",
-            str(os.getpid()),
-            "--agent",
-            agent_label,
-            "--session-id",
-            session_id,
-            "--poll-secs",
-            "1",
-            "--max-idle-secs",
-            str(max_idle),
-        ],
+        watcher_cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,

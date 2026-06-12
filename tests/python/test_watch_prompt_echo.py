@@ -360,6 +360,128 @@ def case_ready_terminal_marker() -> None:
         assert "findings.md" in term.get("text", ""), term
 
 
+PYNEC_OBSERVED_TAIL = """
+RESULT: W-pynec-fixes-2
+- `short_dipole`: max_gain_dbi `1.7496324917822492`, directivity/gain linear `1.4961090471558036`
+- `half_wave_dipole`: max_gain_dbi `2.17743874914555`, directivity/gain linear `1.6509878413064911`
+- `small_loop_screen`: max_gain_dbi `1.7429620750016896`, gain linear `1.4938129068081143`
+- Grading remains honestly `BLOCKED(pynec-source-unresolved)` / `REPORT_ONLY`; no literature numbers fabricated.
+
+COMPLETE: W-pynec-fixes-2
+
+No commit made. `GOALFLIGHT_STEER_FILE` was unset in this process, so no steer ack was possible.
+
+"""
+
+RF_B5_OBSERVED_TRAILER = """- [live-grade-2026-06-11-round5.md](/Users/simonrowland/Repos/kiln/docs-private/research/2026-06-11-battery-blast/rf-b5/live-grade-2026-06-11-round5.md)
+
+Verification:
+- `PYTHONPATH=$PWD:$HOME/Repos python3 -m pytest templates/tests/test_analytic_plasma_decks.py -q`
+- `48 passed, 11 skipped`
+- `git diff --check` clean
+
+Production controller should run production RF-B5 variants: base, half-ne, double-ne, double-b, flip-b, vacuum, then grade with `grade_rf_faraday_openpmd` in an environment with `h5py`.
+
+FARR/PyNEC files were not touched; FARR P1 must align to this family Faraday sign convention in follow-up.
+
+"""
+
+SYNCHRAD_OBSERVED_TAIL = """- Run-spec env coverage.
+- No-device fail-closed test without real `pyopencl`.
+
+Verification:
+- `PYTHONPATH=$PWD:$HOME/Repos python3 -m pytest templates/tests/test_rf_synchrad_larmor.py -q` -> `12 passed in 0.75s`
+- `git diff --check` clean for target files.
+- `RESULT: W-synchrad-ctx pytest exit=0`
+- `COMPLETE: W-synchrad-ctx tests`
+
+No live SynchRad run. No commit. `$GOALFLIGHT_STEER_FILE` was unset in tool env, so no steer messages to ack.
+
+"""
+
+
+def _run_dead_worker_tail(tail_text: str, prompt_text: str = ""):
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        prompt = tmp / "prompt.md"
+        prompt.write_text(prompt_text, encoding="utf-8")
+        tail = tmp / "tail.txt"
+        tail.write_text(tail_text, encoding="utf-8")
+        worker = subprocess.Popen([sys.executable, "-c", ""], start_new_session=True)
+        worker.wait()
+        return _run_watcher(
+            tail,
+            tmp / "s.json",
+            prompt,
+            ignore=True,
+            worker_pid=worker.pid,
+            poll_secs="0.2",
+            max_idle_secs="30",
+        )
+
+
+def case_worker_dead_final_reconciliation_observed_shapes() -> None:
+    cases = [
+        ("pynec bare complete", PYNEC_OBSERVED_TAIL, "W-pynec-fixes-2"),
+        (
+            "rf status complete",
+            "STATUS: COMPLETE: W-rf-b5-round5\n"
+            + "".join(f"post-marker summary line {idx}\n" for idx in range(1, 13))
+            + RF_B5_OBSERVED_TRAILER,
+            "W-rf-b5-round5",
+        ),
+        ("synchrad bullet backtick complete", SYNCHRAD_OBSERVED_TAIL, "W-synchrad-ctx tests"),
+    ]
+    for label, tail_text, expected_text in cases:
+        rc, _elapsed, term, payload = _run_dead_worker_tail(tail_text)
+        assert rc == 0, f"{label}: expected final reconciliation exit 0, got {rc} ({payload})"
+        assert payload.get("state") == "complete", f"{label}: {payload}"
+        assert payload.get("reason") == "marker:COMPLETE:final_reconciliation", f"{label}: {payload}"
+        assert term.get("kind") == "COMPLETE", f"{label}: {term}"
+        assert term.get("text") == expected_text, f"{label}: {term}"
+
+
+def case_worker_dead_final_reconciliation_rejects_diff_and_prompt_echo() -> None:
+    rc, _elapsed, term, payload = _run_dead_worker_tail(
+        "diff --git a/file b/file\n"
+        "@@ -1 +1 @@\n"
+        "+STATUS: COMPLETE: diff-output-only\n"
+        "worker died before sign-off\n"
+    )
+    assert rc == 1, f"diff echo must not complete, got rc={rc} ({payload})"
+    assert payload.get("reason") == "worker_dead_no_terminal_marker", payload
+    assert not term, term
+
+    negative_cases = [
+        ("deletion no space", "-STATUS: COMPLETE: x\n"),
+        ("context line leading space", " STATUS: COMPLETE: x\n"),
+        ("hunk deletion indented marker", "@@ -1,1 +1,0 @@\n-    COMPLETE: x\n"),
+    ]
+    for label, tail_text in negative_cases:
+        rc, _elapsed, term, payload = _run_dead_worker_tail(tail_text)
+        assert rc == 1, f"{label}: expected worker-dead no-marker exit 1, got rc={rc} ({payload})"
+        assert payload.get("reason") == "worker_dead_no_terminal_marker", f"{label}: {payload}"
+        assert not term, f"{label}: {term}"
+
+    prompt = "Do the work.\nCOMPLETE: prompt-only\n"
+    rc, _elapsed, term, payload = _run_dead_worker_tail(
+        prompt + "worker died before sign-off\n",
+        prompt_text=prompt,
+    )
+    assert rc == 1, f"prompt echo only must not complete, got rc={rc} ({payload})"
+    assert payload.get("reason") == "worker_dead_no_terminal_marker", payload
+    assert not term, term
+
+
+def case_worker_dead_failed_marker_blocks() -> None:
+    rc, _elapsed, term, payload = _run_dead_worker_tail("FAILED: x\n")
+    assert rc == 4, f"FAILED should map to blocked exit 4, got rc={rc} ({payload})"
+    assert payload.get("state") == "blocked", payload
+    assert payload.get("reason") == "marker:FAILED:final_reconciliation", payload
+    assert term.get("kind") == "FAILED", term
+    assert term.get("text") == "x", term
+
+
 def main() -> None:
     case_ignores_echoed_prompt_marker()
     case_without_ignore_trips_on_echo()
@@ -373,6 +495,9 @@ def main() -> None:
     case_steer_ack_is_non_terminal_marker()
     case_mid_output_marker_ignored()
     case_ready_terminal_marker()
+    case_worker_dead_final_reconciliation_observed_shapes()
+    case_worker_dead_final_reconciliation_rejects_diff_and_prompt_echo()
+    case_worker_dead_failed_marker_blocks()
     print("OK: goalflight_watch prompt-echo guard tests pass")
 
 

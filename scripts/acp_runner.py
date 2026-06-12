@@ -329,7 +329,7 @@ _MARKERS_RE = re.compile(
 )
 
 # Terminal kinds for position check (must match goalflight_watch.TERMINAL_MARKERS
-# for the RESULT/COMPLETE/BLOCKED/USER-*/READY ; PERMISSION-OK is acp-internal non-terminal).
+# for the RESULT/COMPLETE/BLOCKED/USER-*/READY; PERMISSION-OK is acp-internal non-terminal).
 TERMINAL_MARKERS = {"RESULT", "USER-NEED", "USER-CONFIRM", "BLOCKED", "COMPLETE", "READY"}
 
 

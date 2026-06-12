@@ -57,6 +57,27 @@ cleanup_pidfile() {
   local stem="$1"
   rm -f "$PIDFILE_DIR/$stem"
 }
+run_dead_tail_case() {
+  local label="$1"
+  local tail="$2"
+  local prompt="$3"
+  local out="$4"
+  local expected="$5"
+
+  sleep 1 & WORKER_PID=$!
+  PIDFILE_STEM="$$.bashtail.${WORKER_PID}.jsonl"
+  bash "$WATCHER" \
+    --pid "$WORKER_PID" --tail "$tail" \
+    --controller-pid "$$" --agent test-bashtail \
+    --session-id "$label" \
+    --ignore-prompt-file "$prompt" \
+    --poll-secs 1 --max-idle-secs 30 \
+    > "$out" 2>&1
+  watcher_exit=$?
+  wait "$WORKER_PID" 2>/dev/null
+  expect_eq "$label exit code" "$expected" "$watcher_exit"
+  cleanup_pidfile "$PIDFILE_STEM"
+}
 
 # Spawn workers directly in the test shell (NOT in a subshell via `$(spawn_fn)`
 # — that kills the child when the subshell exits). Plain background, capture
@@ -143,6 +164,185 @@ else
 fi
 rm -f "$TAIL" /tmp/watcher-out-marker-dead-$$.txt
 cleanup_pidfile "$PIDFILE_STEM"
+
+# ---- Case 1c: worker-dead final reconciliation sees bare COMPLETE before trailing prose ----
+TAIL=/tmp/test-watch-dead-reconcile-pynec-$$.txt
+PROMPT=/tmp/test-watch-dead-reconcile-pynec-$$.prompt
+OUT=/tmp/watcher-out-dead-reconcile-pynec-$$.txt
+: > "$PROMPT"
+cat > "$TAIL" <<'EOF'
+
+RESULT: W-pynec-fixes-2
+- `short_dipole`: max_gain_dbi `1.7496324917822492`, directivity/gain linear `1.4961090471558036`
+- `half_wave_dipole`: max_gain_dbi `2.17743874914555`, directivity/gain linear `1.6509878413064911`
+- `small_loop_screen`: max_gain_dbi `1.7429620750016896`, gain linear `1.4938129068081143`
+- Grading remains honestly `BLOCKED(pynec-source-unresolved)` / `REPORT_ONLY`; no literature numbers fabricated.
+
+COMPLETE: W-pynec-fixes-2
+
+No commit made. `GOALFLIGHT_STEER_FILE` was unset in this process, so no steer ack was possible.
+
+EOF
+run_dead_tail_case "case-1c dead reconcile bare COMPLETE" "$TAIL" "$PROMPT" "$OUT" "0"
+if grep -q "terminal marker reconciled after worker exit" "$OUT"; then
+  expect_eq "case-1c reconciliation summary emitted" "yes" "yes"
+else
+  expect_eq "case-1c reconciliation summary emitted" "yes" "no"
+fi
+rm -f "$TAIL" "$PROMPT" "$OUT"
+
+# ---- Case 1d: worker-dead final reconciliation sees STATUS: COMPLETE well before final prose ----
+TAIL=/tmp/test-watch-dead-reconcile-rf-$$.txt
+PROMPT=/tmp/test-watch-dead-reconcile-rf-$$.prompt
+OUT=/tmp/watcher-out-dead-reconcile-rf-$$.txt
+: > "$PROMPT"
+{
+  echo "STATUS: COMPLETE: W-rf-b5-round5"
+  for idx in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    echo "post-marker summary line $idx"
+  done
+  cat <<'EOF'
+- [live-grade-2026-06-11-round5.md](/Users/simonrowland/Repos/kiln/docs-private/research/2026-06-11-battery-blast/rf-b5/live-grade-2026-06-11-round5.md)
+
+Verification:
+- `PYTHONPATH=$PWD:$HOME/Repos python3 -m pytest templates/tests/test_analytic_plasma_decks.py -q`
+- `48 passed, 11 skipped`
+- `git diff --check` clean
+
+Production controller should run production RF-B5 variants: base, half-ne, double-ne, double-b, flip-b, vacuum, then grade with `grade_rf_faraday_openpmd` in an environment with `h5py`.
+
+FARR/PyNEC files were not touched; FARR P1 must align to this family Faraday sign convention in follow-up.
+
+EOF
+} > "$TAIL"
+run_dead_tail_case "case-1d dead reconcile STATUS COMPLETE" "$TAIL" "$PROMPT" "$OUT" "0"
+rm -f "$TAIL" "$PROMPT" "$OUT"
+
+# ---- Case 1e: worker-dead final reconciliation sees markdown bullet/backtick COMPLETE ----
+TAIL=/tmp/test-watch-dead-reconcile-synchrad-$$.txt
+PROMPT=/tmp/test-watch-dead-reconcile-synchrad-$$.prompt
+OUT=/tmp/watcher-out-dead-reconcile-synchrad-$$.txt
+: > "$PROMPT"
+cat > "$TAIL" <<'EOF'
+- Run-spec env coverage.
+- No-device fail-closed test without real `pyopencl`.
+
+Verification:
+- `PYTHONPATH=$PWD:$HOME/Repos python3 -m pytest templates/tests/test_rf_synchrad_larmor.py -q` -> `12 passed in 0.75s`
+- `git diff --check` clean for target files.
+- `RESULT: W-synchrad-ctx pytest exit=0`
+- `COMPLETE: W-synchrad-ctx tests`
+
+No live SynchRad run. No commit. `$GOALFLIGHT_STEER_FILE` was unset in tool env, so no steer messages to ack.
+
+EOF
+run_dead_tail_case "case-1e dead reconcile bullet backtick COMPLETE" "$TAIL" "$PROMPT" "$OUT" "0"
+rm -f "$TAIL" "$PROMPT" "$OUT"
+
+# ---- Case 1f: diff-context marker echo is not a terminal sign-off ----
+TAIL=/tmp/test-watch-dead-reconcile-diff-$$.txt
+PROMPT=/tmp/test-watch-dead-reconcile-diff-$$.prompt
+OUT=/tmp/watcher-out-dead-reconcile-diff-$$.txt
+: > "$PROMPT"
+cat > "$TAIL" <<'EOF'
+diff --git a/file b/file
+@@ -1 +1 @@
++STATUS: COMPLETE: diff-output-only
+worker died before sign-off
+EOF
+run_dead_tail_case "case-1f dead reconcile rejects diff echo" "$TAIL" "$PROMPT" "$OUT" "1"
+if grep -q "WATCHER-EXIT: pid-dead exit_code=1" "$OUT"; then
+  expect_eq "case-1f pid-dead summary emitted" "yes" "yes"
+else
+  expect_eq "case-1f pid-dead summary emitted" "yes" "no"
+fi
+rm -f "$TAIL" "$PROMPT" "$OUT"
+
+# ---- Case 1g: prompt-echo-only marker is ignored on worker-dead reconciliation ----
+TAIL=/tmp/test-watch-dead-reconcile-prompt-$$.txt
+PROMPT=/tmp/test-watch-dead-reconcile-prompt-$$.prompt
+OUT=/tmp/watcher-out-dead-reconcile-prompt-$$.txt
+cat > "$PROMPT" <<'EOF'
+Do the work.
+COMPLETE: prompt-only
+EOF
+{
+  cat "$PROMPT"
+  echo "worker died before sign-off"
+} > "$TAIL"
+run_dead_tail_case "case-1g dead reconcile rejects prompt echo" "$TAIL" "$PROMPT" "$OUT" "1"
+rm -f "$TAIL" "$PROMPT" "$OUT"
+
+# ---- Case 1h: diff-ish raw lines are not terminal sign-offs ----
+PROMPT=/tmp/test-watch-dead-reconcile-diff-negative-$$.prompt
+: > "$PROMPT"
+
+TAIL=/tmp/test-watch-dead-reconcile-delete-nospace-$$.txt
+OUT=/tmp/watcher-out-dead-reconcile-delete-nospace-$$.txt
+printf '%s\n' "-STATUS: COMPLETE: x" > "$TAIL"
+run_dead_tail_case "case-1h1 dead reconcile rejects deletion no space" "$TAIL" "$PROMPT" "$OUT" "1"
+if grep -q "WATCHER-EXIT: pid-dead exit_code=1" "$OUT"; then
+  expect_eq "case-1h1 worker_dead_no_terminal_marker classification" "yes" "yes"
+else
+  expect_eq "case-1h1 worker_dead_no_terminal_marker classification" "yes" "no"
+fi
+rm -f "$TAIL" "$OUT"
+
+TAIL=/tmp/test-watch-dead-reconcile-context-line-$$.txt
+OUT=/tmp/watcher-out-dead-reconcile-context-line-$$.txt
+printf '%s\n' " STATUS: COMPLETE: x" > "$TAIL"
+run_dead_tail_case "case-1h2 dead reconcile rejects leading-space context" "$TAIL" "$PROMPT" "$OUT" "1"
+if grep -q "WATCHER-EXIT: pid-dead exit_code=1" "$OUT"; then
+  expect_eq "case-1h2 worker_dead_no_terminal_marker classification" "yes" "yes"
+else
+  expect_eq "case-1h2 worker_dead_no_terminal_marker classification" "yes" "no"
+fi
+rm -f "$TAIL" "$OUT"
+
+TAIL=/tmp/test-watch-dead-reconcile-hunk-delete-$$.txt
+OUT=/tmp/watcher-out-dead-reconcile-hunk-delete-$$.txt
+cat > "$TAIL" <<'EOF'
+@@ -1,1 +1,0 @@
+-    COMPLETE: x
+EOF
+run_dead_tail_case "case-1h3 dead reconcile rejects hunk deletion" "$TAIL" "$PROMPT" "$OUT" "1"
+if grep -q "WATCHER-EXIT: pid-dead exit_code=1" "$OUT"; then
+  expect_eq "case-1h3 worker_dead_no_terminal_marker classification" "yes" "yes"
+else
+  expect_eq "case-1h3 worker_dead_no_terminal_marker classification" "yes" "no"
+fi
+rm -f "$TAIL" "$PROMPT" "$OUT"
+
+# ---- Case 1i: worker-dead final reconciliation maps FAILED to blocked exit ----
+TAIL=/tmp/test-watch-dead-reconcile-failed-$$.txt
+PROMPT=/tmp/test-watch-dead-reconcile-failed-$$.prompt
+OUT=/tmp/watcher-out-dead-reconcile-failed-$$.txt
+: > "$PROMPT"
+printf '%s\n' "FAILED: x" > "$TAIL"
+run_dead_tail_case "case-1i dead reconcile FAILED blocks" "$TAIL" "$PROMPT" "$OUT" "4"
+if grep -q "WATCHER-EXIT: marker exit_code=4" "$OUT"; then
+  expect_eq "case-1i reconciled FAILED exit summary" "yes" "yes"
+else
+  expect_eq "case-1i reconciled FAILED exit summary" "yes" "no"
+fi
+rm -f "$TAIL" "$PROMPT" "$OUT"
+
+# ---- Case 1j: worker-dead final reconciliation maps BLOCKED to blocked exit ----
+TAIL=/tmp/test-watch-dead-reconcile-blocked-$$.txt
+PROMPT=/tmp/test-watch-dead-reconcile-blocked-$$.prompt
+OUT=/tmp/watcher-out-dead-reconcile-blocked-$$.txt
+: > "$PROMPT"
+cat > "$TAIL" <<'EOF'
+BLOCKED: x
+post-marker summary
+EOF
+run_dead_tail_case "case-1j dead reconcile BLOCKED blocks" "$TAIL" "$PROMPT" "$OUT" "4"
+if grep -q "WATCHER-EXIT: marker exit_code=4" "$OUT"; then
+  expect_eq "case-1j reconciled BLOCKED exit summary" "yes" "yes"
+else
+  expect_eq "case-1j reconciled BLOCKED exit summary" "yes" "no"
+fi
+rm -f "$TAIL" "$PROMPT" "$OUT"
 
 # ---- Case 2: worker PID dies without marker → exit 1 ----
 TAIL=/tmp/test-watch-piddead-$$.txt

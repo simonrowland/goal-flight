@@ -53,7 +53,11 @@ import goalflight_compat
 import goalflight_capacity
 import goalflight_ledger
 from goalflight_liveness import active_monotonic, process_group_id, write_status
-from goalflight_watch import _last_line_is_terminal_marker, _marker_state as _marker_state_for_terminal
+from goalflight_watch import (
+    _final_terminal_marker,
+    _last_line_is_terminal_marker,
+    _marker_state as _marker_state_for_terminal,
+)
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 WATCH_PY = SCRIPT_DIR / "goalflight_watch.py"
@@ -373,10 +377,16 @@ def _repair_watcher_terminal_status(
     except Exception:
         payload = {}
     worker_is_alive, identity_reason = _worker_alive_from_identity(worker_pid, worker_identity)
+    ignore_prefix_lines = _ignore_prefix_lines(prompt_path)
     terminal_marker = _last_line_is_terminal_marker(
         tail,
-        ignore_prefix_lines=_ignore_prefix_lines(prompt_path),
+        ignore_prefix_lines=ignore_prefix_lines,
     )
+    if not terminal_marker and not worker_is_alive:
+        terminal_marker = _final_terminal_marker(
+            tail,
+            ignore_prefix_lines=ignore_prefix_lines,
+        )
     if not terminal_marker:
         terminal_marker = payload.get("terminal_marker")
     terminal_pending_state = None

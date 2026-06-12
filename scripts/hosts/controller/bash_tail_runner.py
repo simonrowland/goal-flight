@@ -42,6 +42,7 @@ def run_bash_tail_session(
         session_id=session_id,
         timeout=timeout,
         pidfile_dir=pidfile_dir,
+        prompt_path=prompt_path,
     )
 
     tail_text = watch.get("tail_text") or ""

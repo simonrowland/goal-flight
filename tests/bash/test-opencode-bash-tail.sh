@@ -62,6 +62,7 @@ WORKER_PID=$!
 bash "$WATCHER" \
   --pid "$WORKER_PID" \
   --tail "$TAIL" \
+  --ignore-prompt-file "$PROMPT" \
   --controller-pid "$$" \
   --agent opencode-bash-tail \
   --session-id opencode-bash-tail-smoke \
