@@ -97,7 +97,9 @@ fi
 
 export PATH="${LOCAL_BIN}:${HOME}/.grok/bin:/opt/homebrew/bin:/usr/local/bin:${PATH:-}"
 
-if [[ -x "${SCRIPT_DIR}/ensure_acp_venv.sh" ]]; then
+if [[ "${GOALFLIGHT_SKIP_ACP_VENV_SETUP:-0}" == "1" ]]; then
+  echo "skip: ACP venv setup disabled by GOALFLIGHT_SKIP_ACP_VENV_SETUP"
+elif [[ -x "${SCRIPT_DIR}/ensure_acp_venv.sh" ]]; then
   bash "${SCRIPT_DIR}/ensure_acp_venv.sh"
 else
   echo "WARN: ensure_acp_venv.sh not found beside setup_worker_path.sh" >&2

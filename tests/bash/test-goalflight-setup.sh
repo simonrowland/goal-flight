@@ -7,6 +7,7 @@ trap 'rm -rf "$TMP_ROOT"' EXIT
 
 export HOME="$TMP_ROOT/home"
 export XDG_STATE_HOME="$TMP_ROOT/state"
+export GOALFLIGHT_SKIP_ACP_VENV_SETUP=1
 mkdir -p "$HOME"
 
 fail() {
@@ -182,6 +183,9 @@ cursor_install_out="$(bash "$REPO_ROOT/install.sh" cursor "$CURSOR_ONE_SHOT" --a
 printf '%s\n' "$cursor_install_out" | grep -q '^APPLY ' || fail "install.sh cursor should apply writes"
 printf '%s\n' "$cursor_install_out" | grep -q 'CONTROLLER_SURFACE cursor desktop' || fail "cursor-install missing global controller"
 printf '%s\n' "$cursor_install_out" | grep -q "$CURSOR_ONE_SHOT/.cursor/skills/goal-flight/SKILL.md" || fail "cursor-install missing project skill apply"
+if [[ "$(uname -s)" == Darwin ]]; then
+  printf '%s\n' "$cursor_install_out" | grep -q 'GOALFLIGHT_SKIP_ACP_VENV_SETUP' || fail "cursor-install should skip ACP venv setup in hermetic test"
+fi
 [ -f "$CURSOR_ONE_SHOT/.cursor/skills/goal-flight/SKILL.md" ] || fail "cursor-install project skill missing"
 while read -r cursor_install_manifest; do
   [ -n "$cursor_install_manifest" ] || continue
