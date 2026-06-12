@@ -32,6 +32,8 @@ from goalflight_liveness import (
     write_status,
 )
 
+REVIEW_FAILURE_STDERR_TAIL_BYTES = 2048
+
 
 def _now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -411,6 +413,16 @@ def classify(stderr: str, stdout: str, returncode: int | None, timed_out: bool, 
     return "failed"
 
 
+def _failure_error_with_stderr(state: str, stderr: str) -> dict[str, str] | None:
+    excerpt = stderr.strip()
+    if not excerpt:
+        return None
+    return {
+        "message": f"review_job_{state}",
+        "stderr_excerpt": excerpt[-REVIEW_FAILURE_STDERR_TAIL_BYTES:],
+    }
+
+
 def command_for(args: argparse.Namespace) -> list[str]:
     if args.agent == "codex":
         final = Path(args.output_dir) / f"{args.name}.final.md"
@@ -687,6 +699,14 @@ def main(argv: list[str] | None = None) -> int:
     stdout = _read_tail(stdout_path, max_bytes=4000)
     timed_out = bool(monitor_payload.get("timed_out"))
     state = classify(stderr, stdout, returncode, timed_out, final_path)
+    failure_error = (
+        _failure_error_with_stderr(
+            state,
+            _read_tail(stderr_path, max_bytes=REVIEW_FAILURE_STDERR_TAIL_BYTES),
+        )
+        if state != "complete"
+        else None
+    )
     payload.update(
         {
             "state": state,
@@ -698,13 +718,17 @@ def main(argv: list[str] | None = None) -> int:
             "heartbeat_at": _now(),
         }
     )
+    if failure_error:
+        payload["error"] = failure_error
+    else:
+        payload.pop("error", None)
     write_status(status_path, payload)
     if ledger_recorded:
         with contextlib.redirect_stdout(io.StringIO()):
-            goalflight_ledger.cmd_finish(argparse.Namespace(dispatch_id=dispatch_id, state=state, reason=None))
+            goalflight_ledger.cmd_finish(argparse.Namespace(dispatch_id=dispatch_id, state=state, reason=payload.get("error")))
     if lease_id:
         with contextlib.redirect_stdout(io.StringIO()):
-            goalflight_capacity.cmd_release(argparse.Namespace(lease_id=lease_id, state=state, reason=None, keep=True))
+            goalflight_capacity.cmd_release(argparse.Namespace(lease_id=lease_id, state=state, reason=payload.get("error"), keep=True))
     if state == "blocked_session_limit":
         with contextlib.redirect_stdout(io.StringIO()):
             goalflight_capacity.cmd_cooldown(argparse.Namespace(action="set", agent=args.agent, seconds=3600, reason="session_limit"))

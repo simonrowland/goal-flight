@@ -1379,6 +1379,99 @@ def case_sentinel_marker_payloads_unit() -> None:
     assert early_actionable_marker(user_need_real) == "USER-NEED"
 
 
+def case_rate_pressure_terminal_state_unit() -> None:
+    base = {
+        "result_ok": True,
+        "result_error": None,
+        "heartbeat_outcome": None,
+        "killed_by_heartbeat": False,
+        "cancelled_for_marker": False,
+        "early_marker": None,
+        "heartbeat_error": None,
+        "stop_reason": "end_turn",
+    }
+    plan_block = "You've hit the plan limit. Check your settings to continue."
+    state, error = goalflight_acp_run.decide_terminal_state(
+        **base,
+        result_text=plan_block,
+        successful_terminal_marker=False,
+    )
+    assert state == "blocked", (state, error)
+    assert error and error["signature"] == "check your settings to continue", error
+    assert "Check your settings to continue" in error["excerpt"], error
+
+    marker_text = f"Work output: {plan_block}\nCOMPLETE: done\n"
+    markers = extract_markers(marker_text)
+    state, error = goalflight_acp_run.decide_terminal_state(
+        **base,
+        result_text=marker_text,
+        successful_terminal_marker=goalflight_acp_run._successful_terminal_marker(markers),
+    )
+    assert state == "complete", (state, error)
+
+    blocked_marker_text = "BLOCKED: real reason\n"
+    blocked_marker_markers = extract_markers(blocked_marker_text)
+    state, error = goalflight_acp_run.decide_terminal_state(
+        **base,
+        result_text=blocked_marker_text,
+        successful_terminal_marker=False,
+    )
+    assert state == "complete", (state, error)
+    assert error is None, error
+    state = goalflight_acp_run._state_after_actionable_terminal_markers(state, blocked_marker_markers)
+    assert state == "blocked", (state, error)
+    assert error is None, error
+
+    blocked_signature_text = "BLOCKED: provider said rate limit exceeded\n"
+    blocked_signature_markers = extract_markers(blocked_signature_text)
+    state, error = goalflight_acp_run.decide_terminal_state(
+        **base,
+        result_text=blocked_signature_text,
+        successful_terminal_marker=False,
+    )
+    assert state == "blocked", (state, error)
+    assert error and error["message"] == "provider_limit_signature_without_terminal_marker", error
+    assert error["signature"] == "rate limit", error
+    state = goalflight_acp_run._state_after_actionable_terminal_markers(
+        state,
+        blocked_signature_markers,
+    )
+    assert state == "blocked", (state, error)
+
+    turn_one = goalflight_acp_run.PromptResult(
+        text='Docs example quotes "Check your settings to continue" as UI copy.\n',
+        stop_reason="end_turn",
+    )
+    turn_two = goalflight_acp_run.PromptResult(
+        text="Final innocent output with no terminal marker.\n",
+        stop_reason="end_turn",
+    )
+    merged = goalflight_acp_run._merge_prompt_results([turn_one, turn_two])
+    final_turn = goalflight_acp_run._last_prompt_result([turn_one, turn_two], merged)
+    assert final_turn.text == turn_two.text
+    state, error = goalflight_acp_run.decide_terminal_state(
+        **base,
+        result_text=final_turn.text,
+        successful_terminal_marker=False,
+    )
+    assert state == "complete", (state, error)
+    assert error is None, error
+    legacy_state, legacy_error = goalflight_acp_run.decide_terminal_state(
+        **base,
+        result_text=merged.text,
+        successful_terminal_marker=False,
+    )
+    assert legacy_state == "blocked", (legacy_state, legacy_error)
+    assert legacy_error and legacy_error["signature"] == "check your settings to continue", legacy_error
+
+    state, error = goalflight_acp_run.decide_terminal_state(
+        **base,
+        result_text="Completed ordinary analysis with no provider block.",
+        successful_terminal_marker=False,
+    )
+    assert state == "complete", (state, error)
+
+
 def case_pool_ceiling_fallback(tmp: Path | None = None) -> None:
     missing = ROOT / "tests/python/.missing-env-caveats.md"
     assert compute_pool_ceiling(missing) >= 1
@@ -1427,6 +1520,7 @@ def main() -> None:
     case_marker_parser()
     case_ready_marker_parser()
     case_sentinel_marker_payloads_unit()
+    case_rate_pressure_terminal_state_unit()
     case_codex_acp_args_injection_unit()
     case_permission_handler_selection_unit()
     case_permission_inline_rejects_nonallow_option_unit()

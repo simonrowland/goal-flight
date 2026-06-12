@@ -423,6 +423,7 @@ def test_coverage_audit_patterns_states_and_guards():
     assert_eq("overloaded blocked-state", S({"state": "blocked"}, {"text_excerpt": "anthropic overloaded_error (529)"}), A)
     assert_eq("session limit result_text", S({"state": "inconclusive_no_final"}, {"result_text": "You have reached your session limit"}), A)
     assert_eq("cursor settings block", S({"state": "failed"}, {"result_text": "Check your settings to continue"}), A)
+    assert_eq("review-job stderr excerpt in record.error", S({"state": "failed", "error": {"stderr_excerpt": "provider blocked: Check your settings to continue"}}, None), A)
     # ledger record.error is a signal carrier even with no status file
     assert_eq("record.error carrier", S({"state": "failed", "error": "resource_exhausted"}, None), A)
     # goal-flight's OWN capacity gate must never count (self-referential

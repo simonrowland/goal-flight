@@ -80,6 +80,7 @@ _ensure_acp_sdk_python()
 
 import goalflight_capacity
 import goalflight_ledger
+from goalflight_rate_pressure import RATE_LIMIT_PATTERNS
 from goalflight_adapter_readiness import (
     load_manifest,
     manifest_candidates,
@@ -453,6 +454,48 @@ def _terminal_turn_marker(markers: dict[str, list[str]]) -> bool:
     return any(markers.get(kind) for kind in ("RESULT", "COMPLETE", "BLOCKED", "USER-NEED", "USER-CONFIRM"))
 
 
+def _successful_terminal_marker(markers: dict[str, list[str]]) -> bool:
+    return any(markers.get(kind) for kind in ("RESULT", "COMPLETE", "READY"))
+
+
+def _state_after_actionable_terminal_markers(state: str, markers: dict[str, list[str]]) -> str:
+    if state == "complete" and (
+        has_actionable_marker_values(markers, "BLOCKED")
+        or has_actionable_marker_values(markers, "USER-NEED")
+        or markers.get("USER-CONFIRM")
+    ):
+        return "blocked"
+    return state
+
+
+def _pressure_text(part: object) -> str:
+    if part is None:
+        return ""
+    if isinstance(part, str):
+        return part
+    try:
+        return json.dumps(part, sort_keys=True)
+    except TypeError:
+        return str(part)
+
+
+def _rate_limit_signature_excerpt(*parts: object, context_chars: int = 160) -> tuple[str, str] | None:
+    text = "\n".join(piece for piece in (_pressure_text(part) for part in parts) if piece)
+    haystack = text.casefold()
+    if not haystack:
+        return None
+    for pattern in RATE_LIMIT_PATTERNS:
+        needle = pattern.casefold()
+        idx = haystack.find(needle)
+        if idx == -1:
+            continue
+        start = max(0, idx - context_chars)
+        end = min(len(text), idx + len(pattern) + context_chars)
+        excerpt = " ".join(text[start:end].split())
+        return pattern, excerpt
+    return None
+
+
 def _merge_prompt_results(results: list[PromptResult]) -> PromptResult:
     merged = PromptResult()
     for result in results:
@@ -475,6 +518,10 @@ def _merge_prompt_results(results: list[PromptResult]) -> PromptResult:
             merged.early_marker = getattr(result, "early_marker", None)
         merged.stop_reason = getattr(result, "stop_reason", None)
     return merged
+
+
+def _last_prompt_result(results: list[PromptResult], merged: PromptResult) -> PromptResult:
+    return results[-1] if results else merged
 
 
 class _AcpWorkerDetached(Exception):
@@ -725,11 +772,14 @@ def decide_terminal_state(
     *,
     result_ok: bool,
     result_error: dict | None,
+    result_text: str | None = None,
+    stop_reason: str | None = None,
     heartbeat_outcome: str | None,
     killed_by_heartbeat: bool,
     cancelled_for_marker: bool,
     early_marker: str | None,
     heartbeat_error: dict | None,
+    successful_terminal_marker: bool = False,
 ) -> tuple[str, dict | None]:
     """Resolve the runner's terminal (state, error) from the prompt result and
     the heartbeat verdict, in priority order.
@@ -770,6 +820,16 @@ def decide_terminal_state(
             "marker": early_marker,
         }
     if result_ok:
+        if not successful_terminal_marker:
+            matched = _rate_limit_signature_excerpt(result_text, result_error, stop_reason)
+            if matched:
+                signature, excerpt = matched
+                return "blocked", {
+                    "code": 0,
+                    "message": "provider_limit_signature_without_terminal_marker",
+                    "signature": signature,
+                    "excerpt": excerpt,
+                }
         return "complete", result_error
     return "failed", result_error
 
@@ -2088,6 +2148,7 @@ async def _run_acp_dispatch_impl(
             next_prompt = ""
 
         result = _merge_prompt_results(prompt_results)
+        final_prompt_result = _last_prompt_result(prompt_results, result)
         markers = extract_markers(result.text)
         relay_markers = dict(payload.get("markers") or {})
         if relay_markers:
@@ -2101,19 +2162,17 @@ async def _run_acp_dispatch_impl(
             terminal_error = heartbeat_error
         state, error = decide_terminal_state(
             result_ok=result.ok,
-            result_error=result.error,
+            result_error=final_prompt_result.error,
+            result_text=final_prompt_result.text,
+            stop_reason=final_prompt_result.stop_reason,
             heartbeat_outcome=terminal_by_heartbeat,
             killed_by_heartbeat=bool(getattr(conn, "killed_by_heartbeat", False)),
             cancelled_for_marker=result.cancelled_for_marker,
             early_marker=result.early_marker,
             heartbeat_error=terminal_error,
+            successful_terminal_marker=_successful_terminal_marker(markers),
         )
-        if state == "complete" and (
-            has_actionable_marker_values(markers, "BLOCKED")
-            or has_actionable_marker_values(markers, "USER-NEED")
-            or markers.get("USER-CONFIRM")
-        ):
-            state = "blocked"
+        state = _state_after_actionable_terminal_markers(state, markers)
         # Sweep B P1 (2026-05-27): denied permissions can look like success.
         # If the worker had any inline permission auto-declined (timeout or
         # explicit deny) and no PERMISSION-OK-PROCEEDED marker says it

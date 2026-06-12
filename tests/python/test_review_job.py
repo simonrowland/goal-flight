@@ -21,6 +21,7 @@ SCRIPTS = ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 import goalflight_review_job
+import goalflight_rate_pressure
 
 
 def run(
@@ -150,6 +151,17 @@ def write_fake_codex(path: Path) -> None:
                 sys.stdout.write(json.dumps({"msg": {"type": "done"}}) + "\n")
                 sys.stdout.flush()
                 final.write_text("complete\n")
+                raise SystemExit(0)
+
+            if mode == "stderr_rate_limit_fail":
+                sys.stderr.write("provider blocked: Check your settings to continue\\n")
+                sys.stderr.flush()
+                raise SystemExit(1)
+
+            if mode == "complete_with_stderr":
+                sys.stderr.write("warning: harmless stderr on successful review\\n")
+                sys.stderr.flush()
+                final.write_text("complete\\n")
                 raise SystemExit(0)
 
             if mode == "stall_with_child":
@@ -425,6 +437,51 @@ def test_auth_classifier_ignores_negative_probe_metadata() -> None:
     assert_true("explicit auth failure still blocked", state == "blocked_auth")
 
 
+@skipif(os.name == "nt", reason="native Windows review-job dispatch is refused in Phase 1")
+def test_failed_stderr_excerpt_reaches_pressure_scanner() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        state_dir = tmp / "state"
+        fake = tmp / "fake-codex"
+        write_fake_codex(fake)
+        proc = run(
+            review_command(tmp, fake, "stderr-rate-limit", timeout_s=2, max_quiet_s=5),
+            state_dir=state_dir,
+            env={"FAKE_REVIEW_MODE": "stderr_rate_limit_fail"},
+            check=False,
+        )
+        status = json.loads((tmp / "out" / "stderr-rate-limit.status.json").read_text())
+        record = json.loads((state_dir / "runs.d" / f"{status['dispatch_id']}.json").read_text())
+        scanned = json.dumps(record.get("error")) + json.dumps(status.get("error"))
+        assert_true("stderr failure exits nonzero", proc.returncode != 0 and status["state"] == "failed")
+        assert_true("status error carries bounded stderr", "Check your settings to continue" in scanned)
+        assert_true(
+            "stderr-only provider block reaches scanner",
+            goalflight_rate_pressure.detect_pressure_scope(record, status)
+            == goalflight_rate_pressure.ACCOUNT_RATE_LIMIT_SCOPE,
+        )
+
+
+@skipif(os.name == "nt", reason="native Windows review-job dispatch is refused in Phase 1")
+def test_complete_review_does_not_copy_stderr_to_error_fields() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        state_dir = tmp / "state"
+        fake = tmp / "fake-codex"
+        write_fake_codex(fake)
+        proc = run(
+            review_command(tmp, fake, "complete-stderr", timeout_s=2, max_quiet_s=5),
+            state_dir=state_dir,
+            env={"FAKE_REVIEW_MODE": "complete_with_stderr"},
+        )
+        status = json.loads((tmp / "out" / "complete-stderr.status.json").read_text())
+        record = json.loads((state_dir / "runs.d" / f"{status['dispatch_id']}.json").read_text())
+        assert_true("complete stderr review succeeds", proc.returncode == 0 and status["state"] == "complete")
+        assert_true("complete status has no error", "error" not in status)
+        assert_true("complete ledger has no error", "error" not in record)
+        assert_true("complete ledger has no stderr excerpt", "stderr_excerpt" not in json.dumps(record))
+
+
 def main() -> None:
     tests = [
         test_active_worker_can_complete_after_soft_timeout,
@@ -434,6 +491,8 @@ def main() -> None:
         test_prompt_write_cannot_block_monitor_before_timeout,
         test_parent_exit_with_live_child_is_inconclusive_and_reaped,
         test_auth_classifier_ignores_negative_probe_metadata,
+        test_failed_stderr_excerpt_reaches_pressure_scanner,
+        test_complete_review_does_not_copy_stderr_to_error_fields,
     ]
     for test in tests:
         test()
