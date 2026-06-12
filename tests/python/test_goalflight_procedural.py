@@ -20,18 +20,30 @@ ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
+REVIEW_JOB_TEST_TIMEOUT_S = "10"
+BLOCKED_CAPACITY_WAIT_S = "5"
+BLOCKED_CAPACITY_COOLDOWN_S = "300"
+
 import goalflight_doctor
 import goalflight_capacity
 import goalflight_review_job
 import goalflight_session_status
 
 
-def run(args: list[str], *, state_dir: Path | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
+def run(
+    args: list[str],
+    *,
+    state_dir: Path | None = None,
+    check: bool = True,
+    extra_env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env.pop("GOALFLIGHT_STEER_FILE", None)
     env.pop("GOAL_FLIGHT_PERMISSION_DIR", None)
     if state_dir:
         env["GOALFLIGHT_STATE_DIR"] = str(state_dir)
+    if extra_env:
+        env.update(extra_env)
     proc = subprocess.run(args, cwd=ROOT, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if check and proc.returncode != 0:
         raise AssertionError(f"{args} exited {proc.returncode}\nstdout={proc.stdout}\nstderr={proc.stderr}")
@@ -355,10 +367,17 @@ def test_doctor_target_project_readiness_split() -> None:
         payload = goalflight_doctor.doctor(repo)
         assert_true("target plugin skipped", payload["plugin"]["skipped"] is True)
         readiness = payload["project_goalflight_readiness"]
-        assert_true("target project ready", readiness["ok"] is True)
+        assert_true("target project init done", readiness["init_done"] is True)
+        assert_true("target project skill exists", readiness["repo_skill"]["exists"] is True)
+        assert_true("target project routing recorded", readiness["routing"]["has_goalflight_block"] is True)
         assert_true("test command recorded", readiness["commands"]["test"] == "`pytest`")
         assert_true("skill root resolved from routing", readiness["skill_root"]["source"] == "AGENTS.md")
         assert_true("skill root exists", readiness["skill_root"]["exists"] is True)
+        assert_true("target project has no readiness warnings", readiness["warnings"] == [])
+        # Guard the public rollup itself: ok must track the warnings condition, so a future
+        # change that flips ok independently of warnings still goes red. Pure function of the
+        # already-load-stable warnings list — does not reintroduce the dropped-`ok is True` flake.
+        assert_true("readiness ok tracks warnings", readiness["ok"] is (readiness["warnings"] == []))
         assert_true(
             "context-mode probe uses skill root",
             payload["context_mode"]["register_script"].endswith("scripts/register-context-mode-codex.py"),
@@ -633,7 +652,19 @@ def test_runners_write_status_on_capacity_and_spawn_failure() -> None:
         prompt = Path(td) / "prompt.md"
         prompt.write_text("review this\n")
 
-        run(["python3", "scripts/goalflight_capacity.py", "cooldown", "set", "--agent", "codex", "--seconds", "60"], state_dir=state_dir)
+        run(
+            [
+                "python3",
+                "scripts/goalflight_capacity.py",
+                "cooldown",
+                "set",
+                "--agent",
+                "codex",
+                "--seconds",
+                BLOCKED_CAPACITY_COOLDOWN_S,
+            ],
+            state_dir=state_dir,
+        )
         blocked = run(
             [
                 "python3",
@@ -649,10 +680,14 @@ def test_runners_write_status_on_capacity_and_spawn_failure() -> None:
                 "--output-dir",
                 str(out_dir),
                 "--timeout-s",
-                "1",
+                REVIEW_JOB_TEST_TIMEOUT_S,
                 "--json",
             ],
             state_dir=state_dir,
+            # Generosity bound: this is not a performance assertion. Under load,
+            # capacity polling/status writes may take a few seconds, but the
+            # cooldown must still outlive the bounded wait and return blocked.
+            extra_env={"GOALFLIGHT_CAPACITY_WAIT_S": BLOCKED_CAPACITY_WAIT_S},
             check=False,
         )
         assert_true("blocked review exits 2", blocked.returncode == 2)
@@ -682,7 +717,7 @@ def test_runners_write_status_on_capacity_and_spawn_failure() -> None:
                 "--codex-bin",
                 "/no/such/codex",
                 "--timeout-s",
-                "1",
+                REVIEW_JOB_TEST_TIMEOUT_S,
                 "--json",
             ],
             state_dir=state_dir,
@@ -697,7 +732,19 @@ def test_runners_write_status_on_capacity_and_spawn_failure() -> None:
     with tempfile.TemporaryDirectory() as td:
         state_dir = Path(td) / "state"
         status = Path(td) / "acp.status.json"
-        run(["python3", "scripts/goalflight_capacity.py", "cooldown", "set", "--agent", "codex-acp", "--seconds", "60"], state_dir=state_dir)
+        run(
+            [
+                "python3",
+                "scripts/goalflight_capacity.py",
+                "cooldown",
+                "set",
+                "--agent",
+                "codex-acp",
+                "--seconds",
+                BLOCKED_CAPACITY_COOLDOWN_S,
+            ],
+            state_dir=state_dir,
+        )
         blocked = run(
             [
                 "python3",
@@ -710,6 +757,8 @@ def test_runners_write_status_on_capacity_and_spawn_failure() -> None:
                 "hello",
                 "--status-json",
                 str(status),
+                "--capacity-wait-s",
+                BLOCKED_CAPACITY_WAIT_S,
                 "--json",
             ],
             state_dir=state_dir,
