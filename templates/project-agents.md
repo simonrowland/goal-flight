@@ -34,6 +34,12 @@ Private. Read before touching code.
 - lint: `<command>`
 - build: `<command>`
 
+## Companion tools
+
+- Code-intelligence MCP (e.g. codedb), when connected: use it when convenient —
+  indexed search/outline beats broad greps in large or unfamiliar code. Never
+  mandatory; plain `grep`/Read stay fine for small, known lookups.
+
 ## Goal Flight Routing
 
 - skill-root: `${GOALFLIGHT_ROOT:-~/.goal-flight}`
