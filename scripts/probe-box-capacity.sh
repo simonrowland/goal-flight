@@ -5,6 +5,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# GOALFLIGHT_PYTHON is accepted-watch per the SC-13 sweep: interpreter selector only.
 if [[ -n "${GOALFLIGHT_PYTHON:-}" ]]; then
   PY="$GOALFLIGHT_PYTHON"
 else

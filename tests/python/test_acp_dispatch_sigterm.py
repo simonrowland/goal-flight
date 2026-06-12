@@ -80,6 +80,7 @@ def _env(tmp: Path, scenario: str) -> dict[str, str]:
     env["GOALFLIGHT_STATE_DIR"] = str(tmp / "state")
     env["GOAL_FLIGHT_PIDFILE_DIR"] = str(tmp / "pids")
     env["GOALFLIGHT_ADAPTERS_DIR"] = str(tmp / "adapters")
+    env["GOALFLIGHT_ALLOW_ADAPTERS_DIR_OVERRIDE"] = "1"
     env["GOALFLIGHT_FAKE_ACP_SCENARIO"] = scenario
     return env
 
@@ -146,6 +147,7 @@ def case_dispatch_acp_single_finalize() -> None:
             "GOALFLIGHT_STATE_DIR",
             "GOAL_FLIGHT_PIDFILE_DIR",
             "GOALFLIGHT_ADAPTERS_DIR",
+            "GOALFLIGHT_ALLOW_ADAPTERS_DIR_OVERRIDE",
             "GOALFLIGHT_FAKE_ACP_SCENARIO",
         )
     }
@@ -208,6 +210,7 @@ def case_dispatch_interactive_sugar_routes_codex_acp_inline() -> None:
             "GOALFLIGHT_STATE_DIR",
             "GOAL_FLIGHT_PIDFILE_DIR",
             "GOALFLIGHT_ADAPTERS_DIR",
+            "GOALFLIGHT_ALLOW_ADAPTERS_DIR_OVERRIDE",
             "GOALFLIGHT_FAKE_ACP_SCENARIO",
         )
     }
@@ -264,6 +267,7 @@ def case_dispatch_inline_permission_relay_writes_decision_and_worker_proceeds() 
             "GOALFLIGHT_STATE_DIR",
             "GOAL_FLIGHT_PIDFILE_DIR",
             "GOALFLIGHT_ADAPTERS_DIR",
+            "GOALFLIGHT_ALLOW_ADAPTERS_DIR_OVERRIDE",
             "GOALFLIGHT_FAKE_ACP_SCENARIO",
         )
     }
@@ -433,6 +437,7 @@ def case_dispatch_acp_sigterm_before_pid_update_keeps_ledger_row() -> None:
         _write_fake_codex_acp_manifest(tmp / "adapters")
         env = _env(tmp, "idle_silent")
         env["GOALFLIGHT_TEST_ACP_BEFORE_PID_LEDGER_UPDATE_FILE"] = str(tmp / "before-pid-update")
+        env["GOALFLIGHT_TEST_MODE"] = "1"
         env["GOALFLIGHT_TEST_ACP_BEFORE_PID_LEDGER_UPDATE_S"] = "30"
         dispatch_id = "acp-ledger-before-spawn"
         status_path = tmp / "status.json"

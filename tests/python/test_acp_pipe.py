@@ -1265,9 +1265,11 @@ def case_permits_ipc_roundtrip_unit() -> None:
             pass
     # PID-scoped default dir (no explicit / no env) isolates concurrent orchestrators
     old_env = os.environ.pop(permits.ENV_PERMISSION_DIR, None)
+    old_allow = os.environ.pop(permits.ENV_PERMISSION_DIR_ALLOW, None)
     try:
         assert str(os.getpid()) in str(permits.permission_dir())
         os.environ[permits.ENV_PERMISSION_DIR] = "/tmp/explicit-perms"
+        os.environ[permits.ENV_PERMISSION_DIR_ALLOW] = "1"
         assert permits.permission_dir() == Path("/tmp/explicit-perms")
         assert permits.permission_dir("/override") == Path("/override")  # explicit wins
     finally:
@@ -1275,6 +1277,10 @@ def case_permits_ipc_roundtrip_unit() -> None:
             os.environ.pop(permits.ENV_PERMISSION_DIR, None)
         else:
             os.environ[permits.ENV_PERMISSION_DIR] = old_env
+        if old_allow is None:
+            os.environ.pop(permits.ENV_PERMISSION_DIR_ALLOW, None)
+        else:
+            os.environ[permits.ENV_PERMISSION_DIR_ALLOW] = old_allow
 
 
 def case_permits_first_writer_wins_unit() -> None:
@@ -1628,32 +1634,41 @@ async def amain() -> None:
 
 
 def main() -> None:
-    case_marker_parser()
-    case_ready_marker_parser()
-    case_sentinel_marker_payloads_unit()
-    case_rate_pressure_terminal_state_unit()
-    case_codex_acp_args_injection_unit()
-    case_permission_handler_selection_unit()
-    case_permission_inline_rejects_nonallow_option_unit()
-    case_permission_select_prefers_allow_once_unit()
-    case_permission_policy_unit()
-    case_permission_policy_os_sandbox_unit()
-    case_permits_ipc_roundtrip_unit()
-    case_permits_ack_roundtrip_unit()
-    case_permits_fifo_decision_does_not_hide_unit()
-    case_permits_read_ack_key_match_unit()
-    case_permits_first_writer_wins_unit()
-    case_permits_read_decision_validates_unit()
-    case_permits_write_decision_replaces_malformed_unit()
-    case_permits_write_decision_replaces_fifo_unit()
-    case_permits_rejects_fifo_unit()
-    case_permission_inline_cancel_answers_unit()
-    case_activity_inline_hold_unit()
-    case_pool_ceiling_fallback()
-    case_direct_default_status_uses_dispatch_state_dir()
-    case_direct_explicit_status_json_wins()
-    asyncio.run(amain())
-    print("OK: ACP SDK pipe tests pass")
+    ipc_env = ("GOALFLIGHT_STEER_FILE", "GOAL_FLIGHT_PERMISSION_DIR")
+    old_ipc_env = {key: os.environ.pop(key, None) for key in ipc_env}
+    try:
+        case_marker_parser()
+        case_ready_marker_parser()
+        case_sentinel_marker_payloads_unit()
+        case_rate_pressure_terminal_state_unit()
+        case_codex_acp_args_injection_unit()
+        case_permission_handler_selection_unit()
+        case_permission_inline_rejects_nonallow_option_unit()
+        case_permission_select_prefers_allow_once_unit()
+        case_permission_policy_unit()
+        case_permission_policy_os_sandbox_unit()
+        case_permits_ipc_roundtrip_unit()
+        case_permits_ack_roundtrip_unit()
+        case_permits_fifo_decision_does_not_hide_unit()
+        case_permits_read_ack_key_match_unit()
+        case_permits_first_writer_wins_unit()
+        case_permits_read_decision_validates_unit()
+        case_permits_write_decision_replaces_malformed_unit()
+        case_permits_write_decision_replaces_fifo_unit()
+        case_permits_rejects_fifo_unit()
+        case_permission_inline_cancel_answers_unit()
+        case_activity_inline_hold_unit()
+        case_pool_ceiling_fallback()
+        case_direct_default_status_uses_dispatch_state_dir()
+        case_direct_explicit_status_json_wins()
+        asyncio.run(amain())
+        print("OK: ACP SDK pipe tests pass")
+    finally:
+        for key, value in old_ipc_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 if __name__ == "__main__":

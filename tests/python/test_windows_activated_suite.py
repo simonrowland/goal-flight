@@ -33,6 +33,7 @@ def _isolated_env(tmp: Path) -> dict[str, str]:
     env["GOALFLIGHT_STATE_DIR"] = str(tmp / "state")
     env["GOAL_FLIGHT_PIDFILE_DIR"] = str(tmp / "pids")
     env["GOALFLIGHT_ADAPTERS_DIR"] = str(tmp / "adapters")
+    env["GOALFLIGHT_ALLOW_ADAPTERS_DIR_OVERRIDE"] = "1"
     env["GOALFLIGHT_PYTHON"] = sys.executable
     return env
 

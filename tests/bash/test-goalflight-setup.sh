@@ -358,6 +358,7 @@ printf 'legacy skill\n' > "$HOME/.codex/skills/goal-flight/SKILL.md"
 cp "$HOME/.codex/config.toml" "$TMP_ROOT/original-config.toml"
 export GOALFLIGHT_SETUP_FAKE_CODEX_LOG="$TMP_ROOT/fake-codex.log"
 export GOALFLIGHT_SETUP_FAKE_CONTEXT_MODE_LOG="$TMP_ROOT/fake-context-mode.log"
+export GOALFLIGHT_TEST_MODE=1
 
 fail_log="$TMP_ROOT/fake-codex-fail.log"
 if GOALFLIGHT_SETUP_FAKE_CODEX_LOG="$fail_log" GOALFLIGHT_SETUP_FAKE_CODEX_FAIL_VERIFY=1 \

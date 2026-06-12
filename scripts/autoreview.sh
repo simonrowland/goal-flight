@@ -7,9 +7,22 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-HELPER="${AUTOREVIEW_HELPER:-${ROOT}/autoreview/scripts/autoreview}"
 CLAUDE_ACP="${ROOT}/scripts/autoreview_claude_acp"
 GROK_ACP="${ROOT}/scripts/autoreview_grok_acp"
+
+env_override_warning() {
+  printf 'GOALFLIGHT_ENV_OVERRIDE env=%q action=%q reason=%q source=%q\n' "$1" "$2" "$3" "$4" >&2
+}
+
+HELPER="${ROOT}/autoreview/scripts/autoreview"
+if [[ -n "${AUTOREVIEW_HELPER:-}" ]]; then
+  if [[ "${GOALFLIGHT_ALLOW_AUTOREVIEW_HELPER:-}" == "1" ]]; then
+    HELPER="${AUTOREVIEW_HELPER}"
+    env_override_warning "AUTOREVIEW_HELPER" "active" "GOALFLIGHT_ALLOW_AUTOREVIEW_HELPER=1" "${HELPER}"
+  else
+    env_override_warning "AUTOREVIEW_HELPER" "ignored" "GOALFLIGHT_ALLOW_AUTOREVIEW_HELPER_not_1" "${AUTOREVIEW_HELPER}"
+  fi
+fi
 
 if [[ ! -x "${HELPER}" ]]; then
   echo "autoreview helper not found: ${HELPER}" >&2

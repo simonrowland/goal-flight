@@ -76,6 +76,7 @@ def _env(tmp: Path) -> dict[str, str]:
     env["GOALFLIGHT_STATE_DIR"] = str(tmp / "state")
     env["GOAL_FLIGHT_PIDFILE_DIR"] = str(tmp / "pids")
     env["GOALFLIGHT_ADAPTERS_DIR"] = str(tmp / "adapters")
+    env["GOALFLIGHT_ALLOW_ADAPTERS_DIR_OVERRIDE"] = "1"
     env["GOALFLIGHT_FAKE_ACP_SCENARIO"] = "steer_multiturn"
     env["GOALFLIGHT_FAKE_ACP_TURN1_FILE"] = str(tmp / "turn1")
     env["GOALFLIGHT_FAKE_ACP_FIRST_TURN_SLEEP"] = "1.0"
@@ -175,6 +176,7 @@ def case_mid_turn_steer_does_not_extend_wedge_deadline() -> None:
         env["GOALFLIGHT_FAKE_ACP_SCENARIO"] = "progress_then_silent"
         env["GOALFLIGHT_FAKE_ACP_PROGRESS_FILE"] = str(tmp / "progress")
         env["GOALFLIGHT_TEST_PGROUP_CPU_PCT"] = "0.0"
+        env["GOALFLIGHT_TEST_MODE"] = "1"
         dispatch_id = "acp-midturn-steer-wedges"
         status_path = tmp / "status.json"
         proc = subprocess.Popen(

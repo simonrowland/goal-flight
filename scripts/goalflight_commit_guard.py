@@ -139,6 +139,7 @@ def _commit_is_partial() -> bool:
     false-negative-prone (`git commit -- file` leaves no overlap when
     file2 has identical staged+working-tree state). Replaced entirely.
     """
+    # GIT_* signals are accepted-watch per the SC-13 sweep: git metadata, not a source/write redirect.
     if os.environ.get("GIT_PARTIAL_COMMIT"):
         return True
     git_index_file = os.environ.get("GIT_INDEX_FILE", "")

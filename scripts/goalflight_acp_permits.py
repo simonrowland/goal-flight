@@ -52,6 +52,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+import goalflight_compat
+
 REQUEST_SCHEMA = "goalflight.permission_request.v1"
 DECISION_SCHEMA = "goalflight.permission_decision.v1"
 ACK_SCHEMA = "goalflight.permission_ack.v1"
@@ -64,6 +66,7 @@ DECISION_DENY = "deny"
 _DECISIONS = (DECISION_ALLOW, DECISION_DENY)
 
 ENV_PERMISSION_DIR = "GOAL_FLIGHT_PERMISSION_DIR"
+ENV_PERMISSION_DIR_ALLOW = "GOALFLIGHT_ALLOW_EXTERNAL_PERMISSION_DIR"
 _DEFAULT_DIRNAME = "goal-flight-perms.d"
 _MAX_JSON_BYTES = 1024 * 1024
 
@@ -77,13 +80,52 @@ def _sanitize(value: str, *, limit: int = 100) -> str:
     return cleaned[:limit] or "_"
 
 
-def permission_dir(explicit: str | os.PathLike[str] | None = None) -> Path:
+def _default_allowed_permission_roots() -> list[Path]:
+    state_root = Path(
+        os.environ.get("GOALFLIGHT_STATE_DIR", str(goalflight_compat.default_state_dir()))
+    ).expanduser()
+    return [state_root, state_root / "dispatch"]
+
+
+def permission_dir(
+    explicit: str | os.PathLike[str] | None = None,
+    *,
+    allowed_roots: list[str | os.PathLike[str]] | None = None,
+) -> Path:
     """Resolve the permission IPC directory (see module docstring for policy)."""
     if explicit:
         return Path(explicit)
     env = os.environ.get(ENV_PERMISSION_DIR)
     if env:
-        return Path(env)
+        path = Path(env).expanduser()
+        roots = allowed_roots or _default_allowed_permission_roots()
+        if goalflight_compat.path_is_under(path, roots):
+            goalflight_compat.env_override_warning(
+                ENV_PERMISSION_DIR,
+                "active",
+                "path_under_state_root",
+                source=path,
+            )
+            return path
+        if os.environ.get(ENV_PERMISSION_DIR_ALLOW) == "1":
+            goalflight_compat.env_override_warning(
+                ENV_PERMISSION_DIR,
+                "active",
+                f"{ENV_PERMISSION_DIR_ALLOW}=1",
+                source=path,
+            )
+            return path
+        goalflight_compat.env_override_warning(
+            ENV_PERMISSION_DIR,
+            "ignored",
+            "outside_state_root",
+            source=path,
+        )
+        roots_text = ", ".join(str(root) for root in roots)
+        raise ValueError(
+            f"{ENV_PERMISSION_DIR} must be under a dispatch/state directory "
+            f"({roots_text}) unless {ENV_PERMISSION_DIR_ALLOW}=1"
+        )
     return Path(tempfile.gettempdir()) / _DEFAULT_DIRNAME / str(os.getpid())
 
 

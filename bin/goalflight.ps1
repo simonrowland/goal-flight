@@ -2,6 +2,7 @@ $ErrorActionPreference = "Stop"
 $Root = Resolve-Path (Join-Path $PSScriptRoot "..")
 $Script = Join-Path $Root "scripts\goalflight_actions.py"
 
+# GOALFLIGHT_PYTHON is accepted-watch per the SC-13 sweep: interpreter selector only.
 if ($env:GOALFLIGHT_PYTHON) {
   try {
     & $env:GOALFLIGHT_PYTHON --version *> $null

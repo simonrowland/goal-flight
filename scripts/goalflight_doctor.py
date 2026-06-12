@@ -53,6 +53,9 @@ CLAUDE_ACP_PATCH_SCRIPT = SCRIPT_DIR / "install_claude_acp_patch.sh"
 GSTACK_MINIMAL_SKILLS = ("review", "plan-eng-review", "office-hours")
 GSTACK_EXTERNAL_SKILLS = ("grill-me", "thermo-nuclear-code-quality-review")
 GSTACK_MINIMAL_REQUIRED_SKILLS = GSTACK_MINIMAL_SKILLS + GSTACK_EXTERNAL_SKILLS
+AUTOREVIEW_HELPER_OVERRIDE_GATE = "GOALFLIGHT_ALLOW_AUTOREVIEW_HELPER"
+CLAUDE_ACP_BIN_OVERRIDE_GATE = "GOALFLIGHT_ALLOW_CLAUDE_ACP_BIN_OVERRIDE"
+CLAUDE_ACP_VERSION_OVERRIDE_GATE = "GOALFLIGHT_ALLOW_CLAUDE_ACP_VERSION_OVERRIDE"
 
 
 def run(cmd: list[str], cwd: Path | None = None, timeout: float = 8.0) -> dict:
@@ -284,12 +287,16 @@ def check_gstack() -> dict:
 
 def check_autoreview(skill_root: Path) -> dict:
     script_path = skill_root / "scripts/autoreview.sh"
-    helper_env = os.environ.get("AUTOREVIEW_HELPER")
+    helper_env = goalflight_compat.allowed_env_override(
+        "AUTOREVIEW_HELPER",
+        AUTOREVIEW_HELPER_OVERRIDE_GATE,
+    )
     helper = (
         Path(helper_env).expanduser()
         if helper_env
         else skill_root / "autoreview/scripts/autoreview"
     )
+    helper_source = "env" if helper_env else "vendored"
     script_ok = script_path.is_file() and os.access(script_path, os.X_OK)
     helper_ok = helper.is_file() and os.access(helper, os.X_OK)
     out = {
@@ -297,6 +304,7 @@ def check_autoreview(skill_root: Path) -> dict:
         "ok": script_ok and helper_ok,
         "script_path": str(script_path),
         "upstream_helper": str(helper) if helper_ok else None,
+        "helper_source": helper_source,
         "claude_acp": str(skill_root / "scripts/autoreview_claude_acp"),
     }
     if script_ok and helper_ok:
@@ -1061,7 +1069,10 @@ def _sha256_path(path: Path) -> str | None:
 
 
 def _claude_acp_installed_version() -> str | None:
-    override = os.environ.get("GOALFLIGHT_CLAUDE_ACP_VERSION")
+    override = goalflight_compat.allowed_env_override(
+        "GOALFLIGHT_CLAUDE_ACP_VERSION",
+        CLAUDE_ACP_VERSION_OVERRIDE_GATE,
+    )
     if override:
         return override
     if shutil.which("npm"):
@@ -1082,7 +1093,10 @@ def _claude_acp_installed_version() -> str | None:
 
 
 def _claude_acp_platform_binary() -> Path | None:
-    override = os.environ.get("GOALFLIGHT_CLAUDE_ACP_BIN_PATH")
+    override = goalflight_compat.allowed_env_override(
+        "GOALFLIGHT_CLAUDE_ACP_BIN_PATH",
+        CLAUDE_ACP_BIN_OVERRIDE_GATE,
+    )
     if override:
         return Path(override).expanduser()
     if shutil.which("npm"):

@@ -8,6 +8,8 @@ from support import skip_posix_on_native_windows
 skip_posix_on_native_windows("procedural guards assert POSIX shell and /tmp contracts")
 
 import json
+import contextlib
+import io
 import os
 from pathlib import Path
 import subprocess
@@ -26,6 +28,8 @@ import goalflight_session_status
 
 def run(args: list[str], *, state_dir: Path | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
+    env.pop("GOALFLIGHT_STEER_FILE", None)
+    env.pop("GOAL_FLIGHT_PERMISSION_DIR", None)
     if state_dir:
         env["GOALFLIGHT_STATE_DIR"] = str(state_dir)
     proc = subprocess.run(args, cwd=ROOT, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -367,14 +371,96 @@ def test_doctor_package_repo_validates_plugin_manifest() -> None:
     assert_true("package plugin manifest present", payload["plugin"]["manifest_exists"] is True)
 
 
+def test_autoreview_helper_env_requires_allow_gate() -> None:
+    old_env = {key: os.environ.get(key) for key in ("AUTOREVIEW_HELPER", "GOALFLIGHT_ALLOW_AUTOREVIEW_HELPER")}
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            wrapper = root / "scripts/autoreview.sh"
+            vendored = root / "autoreview/scripts/autoreview"
+            custom = root / "custom-review"
+            for path in (wrapper, vendored, custom):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                path.chmod(0o755)
+
+            os.environ["AUTOREVIEW_HELPER"] = str(custom)
+            os.environ.pop("GOALFLIGHT_ALLOW_AUTOREVIEW_HELPER", None)
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                payload = goalflight_doctor.check_autoreview(root)
+            assert_true("ungated autoreview helper ignored", payload["upstream_helper"] == str(vendored))
+            assert_true("ungated autoreview warning", "env=AUTOREVIEW_HELPER action=ignored" in err.getvalue())
+
+            os.environ["GOALFLIGHT_ALLOW_AUTOREVIEW_HELPER"] = "1"
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                payload = goalflight_doctor.check_autoreview(root)
+            assert_true("gated autoreview helper honored", payload["upstream_helper"] == str(custom))
+            assert_true("gated autoreview warning", "env=AUTOREVIEW_HELPER action=active" in err.getvalue())
+    finally:
+        for key, value in old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def test_adapter_dir_env_requires_allow_gate() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        override = Path(td) / "adapters"
+        code = (
+            "import sys; "
+            f"sys.path.insert(0, {str(SCRIPTS)!r}); "
+            "import goalflight_adapter_readiness as m; "
+            "print(m.ADAPTERS_DIR)"
+        )
+        env = os.environ.copy()
+        env["GOALFLIGHT_ADAPTERS_DIR"] = str(override)
+        env.pop("GOALFLIGHT_ALLOW_ADAPTERS_DIR_OVERRIDE", None)
+        proc = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=ROOT,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        assert_true("adapter dir ungated import ok", proc.returncode == 0)
+        assert_true("adapter dir ungated ignored", proc.stdout.strip() != str(override))
+        assert_true("adapter dir ungated warning", "env=GOALFLIGHT_ADAPTERS_DIR action=ignored" in proc.stderr)
+
+        env["GOALFLIGHT_ALLOW_ADAPTERS_DIR_OVERRIDE"] = "1"
+        proc = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=ROOT,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        assert_true("adapter dir gated import ok", proc.returncode == 0)
+        assert_true("adapter dir gated honored", proc.stdout.strip() == str(override))
+        assert_true("adapter dir gated warning", "env=GOALFLIGHT_ADAPTERS_DIR action=active" in proc.stderr)
+
+
 def test_claude_acp_stopgap_warns_until_patch_backup_differs() -> None:
-    old_env = {key: os.environ.get(key) for key in ("GOALFLIGHT_CLAUDE_ACP_VERSION", "GOALFLIGHT_CLAUDE_ACP_BIN_PATH")}
+    old_env = {key: os.environ.get(key) for key in (
+        "GOALFLIGHT_CLAUDE_ACP_VERSION",
+        "GOALFLIGHT_CLAUDE_ACP_BIN_PATH",
+        "GOALFLIGHT_ALLOW_CLAUDE_ACP_VERSION_OVERRIDE",
+        "GOALFLIGHT_ALLOW_CLAUDE_ACP_BIN_OVERRIDE",
+    )}
     try:
         with tempfile.TemporaryDirectory() as td:
             binary = Path(td) / "claude-code-cli-acp"
             binary.write_bytes(b"original")
             os.environ["GOALFLIGHT_CLAUDE_ACP_VERSION"] = "0.1.1"
+            os.environ["GOALFLIGHT_ALLOW_CLAUDE_ACP_VERSION_OVERRIDE"] = "1"
             os.environ["GOALFLIGHT_CLAUDE_ACP_BIN_PATH"] = str(binary)
+            os.environ["GOALFLIGHT_ALLOW_CLAUDE_ACP_BIN_OVERRIDE"] = "1"
 
             payload = goalflight_doctor.check_claude_acp_stopgap()
             assert_true("unpatched stopgap warns", payload["ok"] is False)
@@ -394,9 +480,14 @@ def test_claude_acp_stopgap_warns_until_patch_backup_differs() -> None:
 
 
 def test_claude_acp_stopgap_skips_newer_upstream_version() -> None:
-    old_env = {key: os.environ.get(key) for key in ("GOALFLIGHT_CLAUDE_ACP_VERSION", "GOALFLIGHT_CLAUDE_ACP_BIN_PATH")}
+    old_env = {key: os.environ.get(key) for key in (
+        "GOALFLIGHT_CLAUDE_ACP_VERSION",
+        "GOALFLIGHT_CLAUDE_ACP_BIN_PATH",
+        "GOALFLIGHT_ALLOW_CLAUDE_ACP_VERSION_OVERRIDE",
+    )}
     try:
         os.environ["GOALFLIGHT_CLAUDE_ACP_VERSION"] = "0.1.2"
+        os.environ["GOALFLIGHT_ALLOW_CLAUDE_ACP_VERSION_OVERRIDE"] = "1"
         os.environ.pop("GOALFLIGHT_CLAUDE_ACP_BIN_PATH", None)
         payload = goalflight_doctor.check_claude_acp_stopgap()
         assert_true("newer upstream version skips stopgap", payload["ok"] is True)
@@ -410,17 +501,58 @@ def test_claude_acp_stopgap_skips_newer_upstream_version() -> None:
 
 
 def test_claude_acp_stopgap_skips_unknown_version() -> None:
-    old_env = {key: os.environ.get(key) for key in ("GOALFLIGHT_CLAUDE_ACP_VERSION", "GOALFLIGHT_CLAUDE_ACP_BIN_PATH")}
+    old_env = {key: os.environ.get(key) for key in (
+        "GOALFLIGHT_CLAUDE_ACP_VERSION",
+        "GOALFLIGHT_CLAUDE_ACP_BIN_PATH",
+        "GOALFLIGHT_ALLOW_CLAUDE_ACP_VERSION_OVERRIDE",
+        "GOALFLIGHT_ALLOW_CLAUDE_ACP_BIN_OVERRIDE",
+    )}
     try:
         with tempfile.TemporaryDirectory() as td:
             binary = Path(td) / "claude-code-cli-acp"
             binary.write_bytes(b"original")
             os.environ["GOALFLIGHT_CLAUDE_ACP_VERSION"] = "dev-build"
+            os.environ["GOALFLIGHT_ALLOW_CLAUDE_ACP_VERSION_OVERRIDE"] = "1"
             os.environ["GOALFLIGHT_CLAUDE_ACP_BIN_PATH"] = str(binary)
+            os.environ["GOALFLIGHT_ALLOW_CLAUDE_ACP_BIN_OVERRIDE"] = "1"
             payload = goalflight_doctor.check_claude_acp_stopgap()
             assert_true("unknown version skips stopgap warning", payload["ok"] is True)
             assert_true("unknown version patched unknown", payload["patched"] is None)
             assert_true("unknown detail does not warn", "may need" not in payload["detail"])
+    finally:
+        for key, value in old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def test_claude_acp_stopgap_ignores_env_without_allow_gates() -> None:
+    keys = (
+        "GOALFLIGHT_CLAUDE_ACP_VERSION",
+        "GOALFLIGHT_CLAUDE_ACP_BIN_PATH",
+        "GOALFLIGHT_ALLOW_CLAUDE_ACP_VERSION_OVERRIDE",
+        "GOALFLIGHT_ALLOW_CLAUDE_ACP_BIN_OVERRIDE",
+        "PATH",
+    )
+    old_env = {key: os.environ.get(key) for key in keys}
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            binary = Path(td) / "claude-code-cli-acp"
+            binary.write_bytes(b"original")
+            os.environ["GOALFLIGHT_CLAUDE_ACP_VERSION"] = "0.1.2"
+            os.environ["GOALFLIGHT_CLAUDE_ACP_BIN_PATH"] = str(binary)
+            os.environ.pop("GOALFLIGHT_ALLOW_CLAUDE_ACP_VERSION_OVERRIDE", None)
+            os.environ.pop("GOALFLIGHT_ALLOW_CLAUDE_ACP_BIN_OVERRIDE", None)
+            os.environ["PATH"] = ""
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                payload = goalflight_doctor.check_claude_acp_stopgap()
+            assert_true("ungated claude version ignored", payload["installed_version"] is None)
+            assert_true("ungated claude binary ignored", payload["binary"] is None)
+            warning = err.getvalue()
+            assert_true("ungated version warning", "env=GOALFLIGHT_CLAUDE_ACP_VERSION action=ignored" in warning)
+            assert_true("ungated bin warning", "env=GOALFLIGHT_CLAUDE_ACP_BIN_PATH action=ignored" in warning)
     finally:
         for key, value in old_env.items():
             if value is None:
@@ -1399,9 +1531,12 @@ def main() -> None:
         test_installed_skill_drift_project_symlink_stays_copy_mode,
         test_doctor_target_project_readiness_split,
         test_doctor_package_repo_validates_plugin_manifest,
+        test_autoreview_helper_env_requires_allow_gate,
+        test_adapter_dir_env_requires_allow_gate,
         test_claude_acp_stopgap_warns_until_patch_backup_differs,
         test_claude_acp_stopgap_skips_newer_upstream_version,
         test_claude_acp_stopgap_skips_unknown_version,
+        test_claude_acp_stopgap_ignores_env_without_allow_gates,
         test_doctor_cli_target_project_skips_package_plugin,
         test_instruction_split_contract,
         test_review_job_codex_no_final_is_inconclusive,

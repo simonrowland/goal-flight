@@ -10,14 +10,66 @@ SCRIPT="$ROOT/scripts/install_claude_acp_patch.sh"
 TMPROOT="$(mktemp -d /tmp/goal-flight-claude-acp-patch-test-XXXXXX)"
 trap 'rm -rf "$TMPROOT"' EXIT
 
-target="$TMPROOT/claude-code-cli-acp"
-patched="$TMPROOT/patched-claude-code-cli-acp"
+target_dir="$TMPROOT/target bin"
+patched_dir="$TMPROOT/patched build"
+mkdir -p "$target_dir" "$patched_dir"
+target="$target_dir/claude-code-cli-acp"
+patched="$patched_dir/patched-claude-code-cli-acp"
 printf 'original\n' > "$target"
 printf 'patched\n' > "$patched"
 chmod 755 "$target" "$patched"
 
+warning_field_equals() {
+  WARNING_TEXT="$4" python3 - "$1" "$2" "$3" <<'PY'
+import os
+import shlex
+import sys
+
+env_name, field, expected = sys.argv[1:4]
+for line in os.environ["WARNING_TEXT"].splitlines():
+    if "GOALFLIGHT_ENV_OVERRIDE" not in line:
+        continue
+    tokens = shlex.split(line)
+    fields = dict(token.split("=", 1) for token in tokens[1:] if "=" in token)
+    if fields.get("env") == env_name and fields.get(field) == expected:
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+out=$(
+  GOALFLIGHT_CLAUDE_ACP_VERSION=9.9.9 \
+  GOALFLIGHT_CLAUDE_ACP_FORCE_CARGO_MISSING=1 \
+  "$SCRIPT" 2>&1
+) && rc=0 || rc=$?
+echo "$out" | grep -q "env=GOALFLIGHT_CLAUDE_ACP_VERSION action=ignored" \
+  || { echo "version-ungated FAIL: expected ignored warning; out=$out"; exit 1; }
+echo "version-ungated pass"
+
+out=$(
+  GOALFLIGHT_CLAUDE_ACP_BIN_PATH="$target" \
+  "$SCRIPT" --version 0.1.1 2>&1
+) && rc=0 || rc=$?
+echo "$out" | grep -q "env=GOALFLIGHT_CLAUDE_ACP_BIN_PATH action=ignored" \
+  || { echo "bin-ungated FAIL: expected ignored warning; out=$out"; exit 1; }
+echo "bin-ungated pass"
+
+out=$(
+  GOALFLIGHT_CLAUDE_ACP_PREBUILT_BINARY="$patched" \
+  GOALFLIGHT_CLAUDE_ACP_FORCE_CARGO_MISSING=1 \
+  "$SCRIPT" --version 0.1.1 --bin-path "$target" 2>&1
+) && rc=0 || rc=$?
+echo "$out" | grep -q "env=GOALFLIGHT_CLAUDE_ACP_PREBUILT_BINARY action=ignored" \
+  || { echo "prebuilt-ungated FAIL: expected ignored warning; out=$out"; exit 1; }
+warning_field_equals "GOALFLIGHT_CLAUDE_ACP_PREBUILT_BINARY" "source" "$patched" "$out" \
+  || { echo "prebuilt-ungated FAIL: source did not round-trip; out=$out"; exit 1; }
+! echo "$out" | grep -q "prebuilt binary:" \
+  || { echo "prebuilt-ungated FAIL: ungated prebuilt was honored; out=$out"; exit 1; }
+echo "prebuilt-ungated pass"
+
 out=$(
   GOALFLIGHT_CLAUDE_ACP_VERSION=0.1.2 \
+  GOALFLIGHT_ALLOW_CLAUDE_ACP_VERSION_OVERRIDE=1 \
   GOALFLIGHT_CLAUDE_ACP_FORCE_CARGO_MISSING=1 \
   "$SCRIPT" 2>&1
 ) && rc=0 || rc=$?
@@ -28,7 +80,9 @@ echo "newer-version pass"
 
 out=$(
   GOALFLIGHT_CLAUDE_ACP_VERSION=0.1.1 \
+  GOALFLIGHT_ALLOW_CLAUDE_ACP_VERSION_OVERRIDE=1 \
   GOALFLIGHT_CLAUDE_ACP_BIN_PATH="$target" \
+  GOALFLIGHT_ALLOW_CLAUDE_ACP_BIN_OVERRIDE=1 \
   GOALFLIGHT_CLAUDE_ACP_FORCE_CARGO_MISSING=1 \
   "$SCRIPT" 2>&1
 ) && rc=0 || rc=$?
@@ -40,11 +94,20 @@ echo "cargo-absent pass"
 cp "$patched" "$target"
 out=$(
   GOALFLIGHT_CLAUDE_ACP_VERSION=0.1.1 \
+  GOALFLIGHT_ALLOW_CLAUDE_ACP_VERSION_OVERRIDE=1 \
   GOALFLIGHT_CLAUDE_ACP_BIN_PATH="$target" \
+  GOALFLIGHT_ALLOW_CLAUDE_ACP_BIN_OVERRIDE=1 \
   GOALFLIGHT_CLAUDE_ACP_PREBUILT_BINARY="$patched" \
+  GOALFLIGHT_ALLOW_CLAUDE_ACP_PREBUILT_BINARY_OVERRIDE=1 \
   "$SCRIPT" 2>&1
 ) && rc=0 || rc=$?
 [ "$rc" = "0" ] || { echo "already-patched FAIL: rc=$rc out=$out"; exit 1; }
+echo "$out" | grep -q "env=GOALFLIGHT_CLAUDE_ACP_PREBUILT_BINARY action=active" \
+  || { echo "already-patched FAIL: expected active prebuilt warning; out=$out"; exit 1; }
+warning_field_equals "GOALFLIGHT_CLAUDE_ACP_PREBUILT_BINARY" "source" "$patched" "$out" \
+  || { echo "already-patched FAIL: source did not round-trip; out=$out"; exit 1; }
+echo "$out" | grep -Eq "prebuilt binary: .* sha256=[0-9a-f]{64}" \
+  || { echo "already-patched FAIL: expected prebuilt sha256; out=$out"; exit 1; }
 echo "$out" | grep -q "already matches the patched build" \
   || { echo "already-patched FAIL: expected idempotent skip; out=$out"; exit 1; }
 echo "already-patched pass"
@@ -69,8 +132,11 @@ for failing_tool in xattr codesign; do
   out=$(
     PATH="$fakebin:$PATH" \
     GOALFLIGHT_CLAUDE_ACP_VERSION=0.1.1 \
+    GOALFLIGHT_ALLOW_CLAUDE_ACP_VERSION_OVERRIDE=1 \
     GOALFLIGHT_CLAUDE_ACP_BIN_PATH="$target" \
+    GOALFLIGHT_ALLOW_CLAUDE_ACP_BIN_OVERRIDE=1 \
     GOALFLIGHT_CLAUDE_ACP_PREBUILT_BINARY="$patched" \
+    GOALFLIGHT_ALLOW_CLAUDE_ACP_PREBUILT_BINARY_OVERRIDE=1 \
     "$SCRIPT" 2>&1
   ) && rc=0 || rc=$?
   [ "$rc" = "2" ] || { echo "rollback-$failing_tool FAIL: expected rc=2 got $rc out=$out"; exit 1; }

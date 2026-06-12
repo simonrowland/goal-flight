@@ -57,6 +57,8 @@ GSTACK_MINIMAL_REQUIRED_SKILLS = GSTACK_MINIMAL_SKILLS + GSTACK_EXTERNAL_SKILLS
 GSTACK_EXTERNAL_DOWNLOAD_TIMEOUT = 10.0
 GSTACK_EXTERNAL_DOWNLOAD_MAX_BYTES = 512 * 1024
 GSTACK_EXTERNAL_SOURCE_OVERRIDE_GATE = "GOALFLIGHT_ALLOW_EXTERNAL_SOURCE_OVERRIDE"
+GSTACK_SOURCE_OVERRIDE_GATE = "GOALFLIGHT_ALLOW_GSTACK_SOURCE_OVERRIDE"
+GSTACK_SKILLS_DIR_OVERRIDE_GATE = "GOALFLIGHT_ALLOW_GSTACK_SKILLS_DIR_OVERRIDE"
 GSTACK_INSTALL_CHOICES = {"minimal", "full", "skip"}
 GSTACK_FULL_INSTALL_HOSTS = {
     "claude-code": "claude",
@@ -157,7 +159,11 @@ def _format_command(argv: list[str]) -> str:
 
 
 def _run_codex_plugin_registration(repo_root: Path) -> None:
-    fake_log = os.environ.get("GOALFLIGHT_SETUP_FAKE_CODEX_LOG")
+    fake_log = goalflight_compat.allowed_env_override(
+        "GOALFLIGHT_SETUP_FAKE_CODEX_LOG",
+        "",
+        test_mode=True,
+    )
     commands = _codex_plugin_commands(repo_root)
     if fake_log:
         fake_path = Path(fake_log).expanduser()
@@ -211,7 +217,11 @@ def _run_codex_plugin_registration(repo_root: Path) -> None:
 
 
 def _run_codex_plugin_unregistration() -> None:
-    fake_log = os.environ.get("GOALFLIGHT_SETUP_FAKE_CODEX_LOG")
+    fake_log = goalflight_compat.allowed_env_override(
+        "GOALFLIGHT_SETUP_FAKE_CODEX_LOG",
+        "",
+        test_mode=True,
+    )
     commands = _codex_plugin_unregister_commands()
     if fake_log:
         fake_path = Path(fake_log).expanduser()
@@ -245,7 +255,11 @@ def _run_codex_context_mode_registration(repo_root: Path, *, dry_run: bool) -> N
         print(f"BOOTSTRAP {_format_command(apply_argv)}")
         return
 
-    fake_log = os.environ.get("GOALFLIGHT_SETUP_FAKE_CONTEXT_MODE_LOG")
+    fake_log = goalflight_compat.allowed_env_override(
+        "GOALFLIGHT_SETUP_FAKE_CONTEXT_MODE_LOG",
+        "",
+        test_mode=True,
+    )
     if fake_log:
         fake_path = Path(fake_log).expanduser()
         fake_path.parent.mkdir(parents=True, exist_ok=True)
@@ -635,7 +649,10 @@ def _gstack_host_name(agent: str) -> str:
 
 
 def _gstack_host_skills_dir(agent: str) -> Path:
-    override = os.environ.get("GOALFLIGHT_GSTACK_SKILLS_DIR")
+    override = goalflight_compat.allowed_env_override(
+        "GOALFLIGHT_GSTACK_SKILLS_DIR",
+        GSTACK_SKILLS_DIR_OVERRIDE_GATE,
+    )
     if override:
         return Path(override).expanduser()
     return {
@@ -645,6 +662,14 @@ def _gstack_host_skills_dir(agent: str) -> Path:
         "opencode": Path.home() / ".config/opencode/skills",
         "grok": Path.home() / ".grok/skills",
     }.get(agent, Path.home() / ".agents/skills")
+
+
+def _gstack_host_skills_dir_source() -> str:
+    if os.environ.get("GOALFLIGHT_GSTACK_SKILLS_DIR"):
+        if os.environ.get(GSTACK_SKILLS_DIR_OVERRIDE_GATE) == "1":
+            return "env:GOALFLIGHT_GSTACK_SKILLS_DIR"
+        return "default:ignored_env"
+    return "default"
 
 
 def _gstack_target_skill_name(agent: str, skill: str) -> str:
@@ -659,6 +684,11 @@ def _gstack_external_source_url(skill: str) -> str:
     override = os.environ.get(env_name)
     if override:
         if os.environ.get(GSTACK_EXTERNAL_SOURCE_OVERRIDE_GATE) == "1":
+            print(
+                "ADDON_GSTACK_EXTERNAL "
+                f"skill={skill} warning=external_source_override_active "
+                f"env={env_name} reason={GSTACK_EXTERNAL_SOURCE_OVERRIDE_GATE}=1"
+            )
             return override
         print(
             "ADDON_GSTACK_EXTERNAL "
@@ -688,7 +718,11 @@ def _gstack_existing_skill_path(skills_dir: Path, skill: str) -> Path | None:
 
 def _gstack_source_candidates() -> list[Path]:
     candidates: list[Path] = []
-    if raw := os.environ.get("GOALFLIGHT_GSTACK_SOURCE"):
+    raw = goalflight_compat.allowed_env_override(
+        "GOALFLIGHT_GSTACK_SOURCE",
+        GSTACK_SOURCE_OVERRIDE_GATE,
+    )
+    if raw:
         candidates.append(Path(raw).expanduser())
     candidates.extend([
         Path.home() / ".claude/skills/gstack",
@@ -888,13 +922,15 @@ def _install_gstack_external_skills(
     backups_root: Path | None = None,
 ) -> list[dict[str, Any]]:
     skills_dir = _gstack_host_skills_dir(agent)
+    skills_dir_source = _gstack_host_skills_dir_source()
     records: list[dict[str, Any]] = []
     for skill in GSTACK_EXTERNAL_SKILL_SOURCES:
         existing = _gstack_existing_skill_path(skills_dir, skill)
         if existing is not None:
             print(
                 "ADDON_GSTACK_EXTERNAL "
-                f"skill={skill} status=ok detail=already_installed target={existing.parent}"
+                f"skill={skill} status=ok detail=already_installed "
+                f"target={existing.parent} target_source={skills_dir_source}"
             )
             continue
         source_url = _gstack_external_source_url(skill)
@@ -902,7 +938,8 @@ def _install_gstack_external_skills(
         if dry_run:
             print(
                 "ADDON_GSTACK_EXTERNAL "
-                f"skill={skill} install=download source={source_url} target={target}"
+                f"skill={skill} install=download source={source_url} "
+                f"target={target} target_source={skills_dir_source}"
             )
             continue
         if backups_root is None:
@@ -923,7 +960,8 @@ def _install_gstack_external_skills(
         _write_external_skill(target, content)
         print(
             "ADDON_GSTACK_EXTERNAL_APPLY "
-            f"skill={target.name} source={source_url} target={target}"
+            f"skill={target.name} source={source_url} "
+            f"target={target} target_source={skills_dir_source}"
         )
     return records
 
@@ -936,6 +974,7 @@ def _install_gstack_minimal(
     backups_root: Path | None = None,
 ) -> list[dict[str, Any]]:
     skills_dir = _gstack_host_skills_dir(agent)
+    skills_dir_source = _gstack_host_skills_dir_source()
     targets = [
         skills_dir / _gstack_target_skill_name(agent, skill)
         for skill in GSTACK_MINIMAL_SKILLS
@@ -946,10 +985,15 @@ def _install_gstack_minimal(
         target_names = ",".join(target.name for target in targets)
         print(
             "ADDON_GSTACK install=minimal "
-            f"source={source} target={skills_dir} skills={target_names}"
+            f"source={source} target={skills_dir} "
+            f"target_source={skills_dir_source} skills={target_names}"
         )
         if license_source.is_file():
-            print(f"ADDON_GSTACK attribution source={license_source} target={license_target}")
+            print(
+                "ADDON_GSTACK attribution "
+                f"source={license_source} target={license_target} "
+                f"target_source={skills_dir_source}"
+            )
         _install_gstack_external_skills(agent, dry_run=True, backups_root=None)
         return []
     if backups_root is None:
@@ -959,11 +1003,18 @@ def _install_gstack_minimal(
         source_dir = _gstack_skill_source(source, agent, skill)
         records.append(_record_gstack_target(target, backups_root))
         _copy_gstack_tree(source_dir, target)
-        print(f"ADDON_GSTACK_APPLY skill={target.name} source={source_dir} target={target}")
+        print(
+            "ADDON_GSTACK_APPLY "
+            f"skill={target.name} source={source_dir} target={target} "
+            f"target_source={skills_dir_source}"
+        )
     if license_source.is_file():
         records.append(_record_gstack_target(license_target, backups_root))
         _copy_atomic(license_source, license_target)
-        print(f"ADDON_GSTACK_APPLY attribution={license_target}")
+        print(
+            "ADDON_GSTACK_APPLY "
+            f"attribution={license_target} target_source={skills_dir_source}"
+        )
     records.extend(_install_gstack_external_skills(agent, dry_run=False, backups_root=backups_root))
     return records
 

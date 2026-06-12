@@ -13,6 +13,12 @@ PATCH_FILE="$REPO_ROOT/patches/claude-code-cli-acp-2.1.169-tui-submit.patch"
 UPSTREAM_REPO="https://github.com/moabualruz/claude-code-cli-acp"
 BASE_COMMIT="c93f4f4"
 STOPGAP_MAX_VERSION="0.1.1"
+ALLOW_BIN_OVERRIDE="GOALFLIGHT_ALLOW_CLAUDE_ACP_BIN_OVERRIDE"
+ALLOW_PREBUILT_OVERRIDE="GOALFLIGHT_ALLOW_CLAUDE_ACP_PREBUILT_BINARY_OVERRIDE"
+ALLOW_VERSION_OVERRIDE="GOALFLIGHT_ALLOW_CLAUDE_ACP_VERSION_OVERRIDE"
+CLI_VERSION=""
+CLI_BIN_PATH=""
+CLI_PREBUILT_BINARY=""
 
 log() {
   printf '%s\n' "$*"
@@ -36,6 +42,44 @@ sha256_file() {
     fail "no sha256 tool found (need shasum, sha256sum, or openssl)" 2
   fi
 }
+
+env_override_warning() {
+  printf 'GOALFLIGHT_ENV_OVERRIDE env=%q action=%q reason=%q source=%q\n' "$1" "$2" "$3" "$4" >&2
+}
+
+usage() {
+  cat <<'USAGE' >&2
+usage: install_claude_acp_patch.sh [--version VERSION] [--bin-path PATH] [--prebuilt-binary PATH]
+USAGE
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --version)
+      [ "$#" -ge 2 ] || { usage; exit 2; }
+      CLI_VERSION="$2"
+      shift 2
+      ;;
+    --bin-path)
+      [ "$#" -ge 2 ] || { usage; exit 2; }
+      CLI_BIN_PATH="$2"
+      shift 2
+      ;;
+    --prebuilt-binary)
+      [ "$#" -ge 2 ] || { usage; exit 2; }
+      CLI_PREBUILT_BINARY="$2"
+      shift 2
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      usage
+      fail "unknown argument: $1" 2
+      ;;
+  esac
+done
 
 semver_core() {
   printf '%s' "$1" | sed -E 's/^[^0-9]*//; s/[^0-9.].*$//'
@@ -65,9 +109,17 @@ version_gt() {
 }
 
 installed_version() {
-  if [ -n "${GOALFLIGHT_CLAUDE_ACP_VERSION:-}" ]; then
-    printf '%s\n' "$GOALFLIGHT_CLAUDE_ACP_VERSION"
+  if [ -n "$CLI_VERSION" ]; then
+    printf '%s\n' "$CLI_VERSION"
     return 0
+  fi
+  if [ -n "${GOALFLIGHT_CLAUDE_ACP_VERSION:-}" ]; then
+    if [ "${!ALLOW_VERSION_OVERRIDE:-}" = "1" ]; then
+      env_override_warning "GOALFLIGHT_CLAUDE_ACP_VERSION" "active" "${ALLOW_VERSION_OVERRIDE}=1" "$GOALFLIGHT_CLAUDE_ACP_VERSION"
+      printf '%s\n' "$GOALFLIGHT_CLAUDE_ACP_VERSION"
+      return 0
+    fi
+    env_override_warning "GOALFLIGHT_CLAUDE_ACP_VERSION" "ignored" "${ALLOW_VERSION_OVERRIDE}_not_1" "$GOALFLIGHT_CLAUDE_ACP_VERSION"
   fi
   command -v npm >/dev/null 2>&1 || return 1
   command -v node >/dev/null 2>&1 || return 1
@@ -84,9 +136,17 @@ installed_version() {
 }
 
 resolve_platform_binary() {
-  if [ -n "${GOALFLIGHT_CLAUDE_ACP_BIN_PATH:-}" ]; then
-    printf '%s\n' "$GOALFLIGHT_CLAUDE_ACP_BIN_PATH"
+  if [ -n "$CLI_BIN_PATH" ]; then
+    printf '%s\n' "$CLI_BIN_PATH"
     return 0
+  fi
+  if [ -n "${GOALFLIGHT_CLAUDE_ACP_BIN_PATH:-}" ]; then
+    if [ "${!ALLOW_BIN_OVERRIDE:-}" = "1" ]; then
+      env_override_warning "GOALFLIGHT_CLAUDE_ACP_BIN_PATH" "active" "${ALLOW_BIN_OVERRIDE}=1" "$GOALFLIGHT_CLAUDE_ACP_BIN_PATH"
+      printf '%s\n' "$GOALFLIGHT_CLAUDE_ACP_BIN_PATH"
+      return 0
+    fi
+    env_override_warning "GOALFLIGHT_CLAUDE_ACP_BIN_PATH" "ignored" "${ALLOW_BIN_OVERRIDE}_not_1" "$GOALFLIGHT_CLAUDE_ACP_BIN_PATH"
   fi
   command -v npm >/dev/null 2>&1 || return 1
   command -v node >/dev/null 2>&1 || return 1
@@ -159,7 +219,17 @@ restore_run_backup() {
   fail "$reason; no run-scoped backup available for $BIN_PATH" "$rc"
 }
 
-if [ -z "${GOALFLIGHT_CLAUDE_ACP_PREBUILT_BINARY:-}" ] && {
+PREBUILT_BINARY="$CLI_PREBUILT_BINARY"
+if [ -z "$PREBUILT_BINARY" ] && [ -n "${GOALFLIGHT_CLAUDE_ACP_PREBUILT_BINARY:-}" ]; then
+  if [ "${!ALLOW_PREBUILT_OVERRIDE:-}" = "1" ]; then
+    PREBUILT_BINARY="$GOALFLIGHT_CLAUDE_ACP_PREBUILT_BINARY"
+    env_override_warning "GOALFLIGHT_CLAUDE_ACP_PREBUILT_BINARY" "active" "${ALLOW_PREBUILT_OVERRIDE}=1" "$PREBUILT_BINARY"
+  else
+    env_override_warning "GOALFLIGHT_CLAUDE_ACP_PREBUILT_BINARY" "ignored" "${ALLOW_PREBUILT_OVERRIDE}_not_1" "$GOALFLIGHT_CLAUDE_ACP_PREBUILT_BINARY"
+  fi
+fi
+
+if [ -z "$PREBUILT_BINARY" ] && {
   [ -n "${GOALFLIGHT_CLAUDE_ACP_FORCE_CARGO_MISSING:-}" ] || ! command -v cargo >/dev/null 2>&1
 }; then
   log "SKIP: Rust cargo is required to build the stopgap binary."
@@ -167,9 +237,10 @@ if [ -z "${GOALFLIGHT_CLAUDE_ACP_PREBUILT_BINARY:-}" ] && {
   exit 3
 fi
 
-if [ -n "${GOALFLIGHT_CLAUDE_ACP_PREBUILT_BINARY:-}" ]; then
-  BUILT_BINARY="$GOALFLIGHT_CLAUDE_ACP_PREBUILT_BINARY"
+if [ -n "$PREBUILT_BINARY" ]; then
+  BUILT_BINARY="$PREBUILT_BINARY"
   [ -f "$BUILT_BINARY" ] || fail "prebuilt test binary missing: $BUILT_BINARY" 2
+  log "prebuilt binary: $BUILT_BINARY sha256=$(sha256_file "$BUILT_BINARY")"
 else
   log "Cloning $UPSTREAM_REPO at $BASE_COMMIT..."
   git clone --quiet "$UPSTREAM_REPO" "$WORK_DIR/claude-code-cli-acp"

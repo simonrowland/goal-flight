@@ -284,7 +284,11 @@ def pgroup_cpu_pct(pgid_or_pid: int | str | None) -> float | None:
     pid is resolved to its current pgid first. Returns None only when the CPU
     sample itself is unavailable; a live-but-idle group returns 0.0.
     """
-    test_override = os.environ.get("GOALFLIGHT_TEST_PGROUP_CPU_PCT")
+    test_override = goalflight_compat.allowed_env_override(
+        "GOALFLIGHT_TEST_PGROUP_CPU_PCT",
+        "",
+        test_mode=True,
+    )
     if test_override is not None:
         try:
             return float(test_override)

@@ -8,9 +8,11 @@ import base64
 from pathlib import Path
 import os
 import re
+import shlex
 import subprocess
 import sys
 
+TRIGGER_PATTERN_OVERRIDE_GATE = "GOALFLIGHT_ALLOW_TRIGGER_GUARD_PATTERN_OVERRIDE"
 
 ENCODED_PATTERNS = (
     "aGVybWVz",
@@ -27,9 +29,61 @@ class GuardError(RuntimeError):
     pass
 
 
-def _decode_patterns() -> list[str]:
+def _warning(env_name: str, action: str, reason: str, *, source: str, count: int | None = None) -> None:
+    parts = [
+        "GOALFLIGHT_ENV_OVERRIDE",
+        f"env={shlex.quote(env_name)}",
+        f"action={shlex.quote(action)}",
+        f"reason={shlex.quote(reason)}",
+        f"source={shlex.quote(source)}",
+    ]
+    if count is not None:
+        parts.append(f"pattern_count={shlex.quote(str(count))}")
+    print(" ".join(parts), file=sys.stderr)
+
+
+def _decode_env_patterns(raw: str) -> list[str]:
+    encoded = tuple(item.strip() for item in raw.split(",") if item.strip())
+    return [
+        base64.b64decode(value.encode("ascii")).decode("utf-8").casefold()
+        for value in encoded
+    ]
+
+
+def _decode_patterns(patterns_file: Path | None = None) -> list[str]:
+    if patterns_file is not None:
+        patterns = [
+            line.strip().casefold()
+            for line in patterns_file.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        _warning(
+            "GOALFLIGHT_TRIGGER_GUARD_PATTERNS_FILE",
+            "active",
+            "cli_patterns_file",
+            source=str(patterns_file),
+            count=len(patterns),
+        )
+        return patterns
     raw = os.environ.get("GOALFLIGHT_TRIGGER_GUARD_PATTERNS_B64")
-    encoded = tuple(item.strip() for item in raw.split(",") if item.strip()) if raw else ENCODED_PATTERNS
+    if raw:
+        if os.environ.get(TRIGGER_PATTERN_OVERRIDE_GATE) == "1":
+            patterns = _decode_env_patterns(raw)
+            _warning(
+                "GOALFLIGHT_TRIGGER_GUARD_PATTERNS_B64",
+                "active",
+                f"{TRIGGER_PATTERN_OVERRIDE_GATE}=1",
+                source="env",
+                count=len(patterns),
+            )
+            return patterns
+        _warning(
+            "GOALFLIGHT_TRIGGER_GUARD_PATTERNS_B64",
+            "ignored",
+            f"{TRIGGER_PATTERN_OVERRIDE_GATE}_not_1",
+            source="env",
+        )
+    encoded = ENCODED_PATTERNS
     return [
         base64.b64decode(value.encode("ascii")).decode("utf-8").casefold()
         for value in encoded
@@ -98,8 +152,8 @@ def _redact(text: str, patterns: list[str]) -> str:
     return redacted
 
 
-def scan_staged(repo: Path) -> list[str]:
-    patterns = _decode_patterns()
+def scan_staged(repo: Path, patterns_file: Path | None = None) -> list[str]:
+    patterns = _decode_patterns(patterns_file)
     findings: list[str] = []
     for status, path in _staged_paths(repo):
         if status == "D":
@@ -116,8 +170,8 @@ def scan_staged(repo: Path) -> list[str]:
     return findings
 
 
-def scan_message(path: Path) -> list[str]:
-    patterns = _decode_patterns()
+def scan_message(path: Path, patterns_file: Path | None = None) -> list[str]:
+    patterns = _decode_patterns(patterns_file)
     text = path.read_text(encoding="utf-8", errors="ignore")
     if _match(text, patterns):
         return [f"commit message: {path}"]
@@ -144,13 +198,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repo", help="repository root")
     parser.add_argument("--staged", action="store_true", help="scan staged paths and blobs")
     parser.add_argument("--commit-msg", help="scan commit message file")
+    parser.add_argument(
+        "--patterns-file",
+        help="Plain-text pattern file, one pattern per non-comment line. Explicit CLI override.",
+    )
     args = parser.parse_args(argv)
 
     findings: list[str] = []
+    patterns_file = Path(args.patterns_file) if args.patterns_file else None
     if args.staged:
-        findings.extend(scan_staged(_repo_root(args.repo)))
+        findings.extend(scan_staged(_repo_root(args.repo), patterns_file))
     if args.commit_msg:
-        findings.extend(scan_message(Path(args.commit_msg)))
+        findings.extend(scan_message(Path(args.commit_msg), patterns_file))
     if not args.staged and not args.commit_msg:
         parser.error("pass --staged and/or --commit-msg")
     return report(findings)

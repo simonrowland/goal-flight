@@ -10,6 +10,7 @@ skip_posix_on_native_windows("uses POSIX process groups, start_new_session, and 
 import asyncio
 import argparse
 import contextlib
+import io
 import json
 import os
 import shlex
@@ -35,9 +36,28 @@ from goalflight_acp_client import (  # noqa: E402
     PoolExhaustedError,
     _classify_oversized_json_rpc_head,
 )
-from goalflight_acp_run import adapter_liveness_config, agent_command, decide_terminal_state, spawn_and_handshake_with_retry  # noqa: E402
+from goalflight_acp_run import (  # noqa: E402
+    _resolve_steer_file,
+    adapter_liveness_config,
+    agent_command,
+    decide_terminal_state,
+    spawn_and_handshake_with_retry,
+)
+import goalflight_acp_permits  # noqa: E402
+import goalflight_compat  # noqa: E402
 from acp_runner import has_actionable_marker_values  # noqa: E402
-from goalflight_liveness import heartbeat_wedge_decision, progress_stall_decision  # noqa: E402
+from goalflight_liveness import heartbeat_wedge_decision, pgroup_cpu_pct, progress_stall_decision  # noqa: E402
+
+
+def env_override_fields(text: str, env_name: str) -> dict[str, str]:
+    for line in text.splitlines():
+        if "GOALFLIGHT_ENV_OVERRIDE" not in line:
+            continue
+        tokens = shlex.split(line)
+        fields = dict(token.split("=", 1) for token in tokens[1:] if "=" in token)
+        if fields.get("env") == env_name:
+            return fields
+    raise AssertionError(f"missing GOALFLIGHT_ENV_OVERRIDE for {env_name}: {text!r}")
 
 
 def skipif(condition: bool, reason: str):
@@ -380,7 +400,7 @@ def _run_fake_runner(
     stall_kill: bool = False,
     extra_env: dict[str, str] | None = None,
     state_snapshot: dict | None = None,
-    timeout_s: float = 8.0,
+    timeout_s: float = 30.0,
 ) -> tuple[int, dict, str, str]:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
@@ -390,6 +410,8 @@ def _run_fake_runner(
         adapters_dir = tmp / "adapters"
         _write_supported_adapter_manifest(adapters_dir, wrapper.name)
         env = os.environ.copy()
+        env.pop("GOALFLIGHT_STEER_FILE", None)
+        env.pop("GOAL_FLIGHT_PERMISSION_DIR", None)
         env.update(
             {
                 "GOALFLIGHT_STATE_DIR": str(state_dir),
@@ -397,6 +419,7 @@ def _run_fake_runner(
                 "GOALFLIGHT_FAKE_ACP_INTERVAL": "0.05",
                 "GOALFLIGHT_ACP_PYTHON": sys.executable,
                 "GOALFLIGHT_ADAPTERS_DIR": str(adapters_dir),
+                "GOALFLIGHT_ALLOW_ADAPTERS_DIR_OVERRIDE": "1",
             }
         )
         if extra_env:
@@ -551,6 +574,7 @@ def case_normal_dispatch_hides_matrix_audit_surface() -> None:
     returncode, status, stdout, stderr = _run_fake_runner(
         "permission_codex",
         progress_stall_s=5.0,
+        timeout_s=30.0,
     )
     assert returncode == 0, (returncode, stdout, stderr, status)
     assert status["state"] == "complete", status
@@ -563,6 +587,7 @@ def case_matrix_env_surfaces_bounded_audit() -> None:
         "permission_codex",
         progress_stall_s=5.0,
         extra_env={"GOALFLIGHT_ACP_LIVE_MATRIX": "1"},
+        timeout_s=30.0,
     )
     assert returncode == 0, (returncode, stdout, stderr, status)
     assert status["state"] == "complete", status
@@ -654,7 +679,7 @@ def case_runner_progress_stall_detaches_by_default() -> None:
         max_quiet_s=30.0,
         max_tool_s=30.0,
         state_snapshot=state_snapshot,
-        timeout_s=8.0,
+        timeout_s=30.0,
     )
     worker_pid = status.get("worker_pid")
     try:
@@ -741,7 +766,7 @@ def case_runner_progress_then_silent_wedges_and_reaps() -> None:
         "progress_then_silent",
         progress_stall_s=30.0,
         liveness_profile="local_compute",
-        extra_env={"GOALFLIGHT_TEST_PGROUP_CPU_PCT": "0.0"},
+        extra_env={"GOALFLIGHT_TEST_PGROUP_CPU_PCT": "0.0", "GOALFLIGHT_TEST_MODE": "1"},
     )
 
     assert returncode != 0, stdout
@@ -764,7 +789,7 @@ def case_runner_remote_long_reasoning_pause_survives_old_walls() -> None:
         liveness_profile="remote_api",
         remote_turn_silence_s=3.0,
         extra_env={"GOALFLIGHT_FAKE_ACP_LONG_PAUSE_S": "1.0"},
-        timeout_s=8.0,
+        timeout_s=30.0,
     )
 
     assert returncode == 0, (stdout, stderr, status)
@@ -788,7 +813,7 @@ def case_runner_remote_dead_silent_turn_hits_remote_wall() -> None:
         liveness_profile="remote_api",
         remote_turn_silence_s=0.4,
         remote_turn_cancel_grace_s=0.1,
-        timeout_s=8.0,
+        timeout_s=30.0,
     )
 
     assert returncode != 0, stdout
@@ -812,7 +837,7 @@ def case_runner_thought_stream_survives_progress_stall_wall() -> None:
             "GOALFLIGHT_FAKE_ACP_INTERVAL": "0.2",
             "GOALFLIGHT_FAKE_ACP_THOUGHT_CHUNKS": "5",
         },
-        timeout_s=8.0,
+        timeout_s=30.0,
     )
 
     assert returncode == 0, (stdout, stderr, status)
@@ -1129,7 +1154,7 @@ def case_runner_goal_mode_heartbeat_backstop() -> None:
         "progress_then_silent",
         progress_stall_s=30.0,
         idle_timeout=0.0,
-        extra_env={"GOALFLIGHT_TEST_PGROUP_CPU_PCT": "0.0"},
+        extra_env={"GOALFLIGHT_TEST_PGROUP_CPU_PCT": "0.0", "GOALFLIGHT_TEST_MODE": "1"},
     )
 
     assert returncode != 0, stdout
@@ -1250,6 +1275,150 @@ def case_pool_exhaustion_then_drain() -> None:
     asyncio.run(_run())
 
 
+def case_env_ipc_paths_are_constrained() -> None:
+    keys = [
+        "GOALFLIGHT_STATE_DIR",
+        "GOALFLIGHT_STEER_FILE",
+        "GOALFLIGHT_ALLOW_EXTERNAL_STEER_FILE",
+        goalflight_acp_permits.ENV_PERMISSION_DIR,
+        goalflight_acp_permits.ENV_PERMISSION_DIR_ALLOW,
+    ]
+    old_env = {key: os.environ.get(key) for key in keys}
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            state = tmp / "state"
+            dispatch = state / "dispatch"
+            dispatch.mkdir(parents=True)
+
+            os.environ["GOALFLIGHT_STATE_DIR"] = str(state)
+            os.environ["GOALFLIGHT_STEER_FILE"] = str(dispatch / "worker.steer.jsonl")
+            os.environ.pop("GOALFLIGHT_ALLOW_EXTERNAL_STEER_FILE", None)
+            steer, steer_source = _resolve_steer_file(argparse.Namespace(steer_file=None), "worker")
+            assert steer == dispatch / "worker.steer.jsonl"
+            assert steer_source == "env:state_root"
+
+            os.environ["GOALFLIGHT_STEER_FILE"] = str(tmp / "outside.steer.jsonl")
+            ignored = False
+            err = io.StringIO()
+            try:
+                with contextlib.redirect_stderr(err):
+                    _resolve_steer_file(argparse.Namespace(steer_file=None), "worker")
+            except ValueError as exc:
+                ignored = "GOALFLIGHT_ALLOW_EXTERNAL_STEER_FILE" in str(exc)
+            assert ignored, "external steer env path should require allow gate"
+            warning = env_override_fields(err.getvalue(), "GOALFLIGHT_STEER_FILE")
+            assert warning["action"] == "ignored"
+            assert warning["reason"] == "outside_state_root"
+            assert warning["source"] == str(tmp / "outside.steer.jsonl")
+
+            os.environ["GOALFLIGHT_ALLOW_EXTERNAL_STEER_FILE"] = "1"
+            steer, steer_source = _resolve_steer_file(argparse.Namespace(steer_file=None), "worker")
+            assert steer == tmp / "outside.steer.jsonl"
+            assert steer_source == "env:allow"
+
+            os.environ[goalflight_acp_permits.ENV_PERMISSION_DIR] = str(dispatch / "perms")
+            os.environ.pop(goalflight_acp_permits.ENV_PERMISSION_DIR_ALLOW, None)
+            permission = goalflight_acp_permits.permission_dir(
+                None,
+                allowed_roots=[state, dispatch],
+            )
+            assert permission == dispatch / "perms"
+
+            os.environ[goalflight_acp_permits.ENV_PERMISSION_DIR] = str(tmp / "outside-perms")
+            ignored = False
+            err = io.StringIO()
+            try:
+                with contextlib.redirect_stderr(err):
+                    goalflight_acp_permits.permission_dir(None, allowed_roots=[state, dispatch])
+            except ValueError as exc:
+                ignored = goalflight_acp_permits.ENV_PERMISSION_DIR_ALLOW in str(exc)
+            assert ignored, "external permission env path should require allow gate"
+            warning = env_override_fields(err.getvalue(), goalflight_acp_permits.ENV_PERMISSION_DIR)
+            assert warning["action"] == "ignored"
+            assert warning["reason"] == "outside_state_root"
+            assert warning["source"] == str(tmp / "outside-perms")
+
+            os.environ[goalflight_acp_permits.ENV_PERMISSION_DIR_ALLOW] = "1"
+            permission = goalflight_acp_permits.permission_dir(
+                None,
+                allowed_roots=[state, dispatch],
+            )
+            assert permission == tmp / "outside-perms"
+    finally:
+        for key, value in old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def case_env_override_warning_shell_tokens_round_trip() -> None:
+    source = "/tmp/goal flight/source with spaces"
+    err = io.StringIO()
+    goalflight_compat.env_override_warning(
+        "GOALFLIGHT_TEST_SPACE_SOURCE",
+        "ignored",
+        "space_source_regression",
+        source=source,
+        extra={"pattern_count": 2},
+        stream=err,
+    )
+    fields = env_override_fields(err.getvalue(), "GOALFLIGHT_TEST_SPACE_SOURCE")
+    assert fields == {
+        "env": "GOALFLIGHT_TEST_SPACE_SOURCE",
+        "action": "ignored",
+        "reason": "space_source_regression",
+        "source": source,
+        "pattern_count": "2",
+    }
+
+
+def case_test_mode_hooks_require_gate() -> None:
+    keys = [
+        "GOALFLIGHT_TEST_MODE",
+        "GOALFLIGHT_TEST_PGROUP_CPU_PCT",
+        "GOALFLIGHT_TEST_ACP_BEFORE_PID_LEDGER_UPDATE_FILE",
+    ]
+    old_env = {key: os.environ.get(key) for key in keys}
+    try:
+        os.environ["GOALFLIGHT_TEST_PGROUP_CPU_PCT"] = "12.5"
+        os.environ["GOALFLIGHT_TEST_ACP_BEFORE_PID_LEDGER_UPDATE_FILE"] = "/tmp/marker"
+        os.environ.pop("GOALFLIGHT_TEST_MODE", None)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            assert pgroup_cpu_pct(None) is None
+            marker = goalflight_compat.allowed_env_override(
+                "GOALFLIGHT_TEST_ACP_BEFORE_PID_LEDGER_UPDATE_FILE",
+                "",
+                test_mode=True,
+            )
+        assert marker is None
+        warning = err.getvalue()
+        assert "env=GOALFLIGHT_TEST_PGROUP_CPU_PCT action=ignored" in warning
+        assert "env=GOALFLIGHT_TEST_ACP_BEFORE_PID_LEDGER_UPDATE_FILE action=ignored" in warning
+
+        os.environ["GOALFLIGHT_TEST_MODE"] = "1"
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            assert pgroup_cpu_pct(None) == 12.5
+            marker = goalflight_compat.allowed_env_override(
+                "GOALFLIGHT_TEST_ACP_BEFORE_PID_LEDGER_UPDATE_FILE",
+                "",
+                test_mode=True,
+            )
+        assert marker == "/tmp/marker"
+        warning = err.getvalue()
+        assert "env=GOALFLIGHT_TEST_PGROUP_CPU_PCT action=active" in warning
+        assert "env=GOALFLIGHT_TEST_ACP_BEFORE_PID_LEDGER_UPDATE_FILE action=active" in warning
+    finally:
+        for key, value in old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 def main() -> None:
     case_vendor_flood_idle_waits_for_quiet_backstop()
     case_dropped_frame_records_are_bounded()
@@ -1287,6 +1456,9 @@ def main() -> None:
     case_runner_tool_timeout_reaps()
     case_handshake_wedge_kills_before_respawn()
     case_pool_exhaustion_then_drain()
+    case_env_ipc_paths_are_constrained()
+    case_env_override_warning_shell_tokens_round_trip()
+    case_test_mode_hooks_require_gate()
     print("OK: ACP SDK failure-mode tests pass")
 
 

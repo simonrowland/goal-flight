@@ -47,12 +47,15 @@ DEFAULT_STALL_WAKE_CAP = 3
 DEFAULT_BETWEEN_TURN_STEER_GRACE_S = 10.0
 DEFAULT_EMPTY_BETWEEN_TURN_STEER_POLL_S = 0.25
 LIVENESS_PROFILES = {"remote_api", "local_compute", "hybrid"}
+STEER_FILE_ALLOW_ENV = "GOALFLIGHT_ALLOW_EXTERNAL_STEER_FILE"
 
 
 def _acp_reexec_target() -> str | None:
     """Return the python path to re-exec into for acp, or None to stay put."""
     if importlib.util.find_spec("acp") is not None:
         return None
+    # Env interpreter selectors are accepted-watch per the SC-13 sweep: command
+    # source overrides, but outside the source/write/safety-disable predicate.
     override = os.environ.get("GOALFLIGHT_ACP_PYTHON")
     target = Path(override).expanduser() if override else Path.home() / ".goal-flight/venvs/acp-0.10/bin/python"
     if not target.exists():
@@ -427,9 +430,46 @@ def _default_steer_file(dispatch_id: str) -> Path:
     return base / f"{dispatch_id}.steer.jsonl"
 
 
-def _resolve_steer_file(cfg: argparse.Namespace, dispatch_id: str) -> Path:
-    configured = getattr(cfg, "steer_file", None) or os.environ.get("GOALFLIGHT_STEER_FILE")
-    return Path(str(configured)).expanduser() if configured else _default_steer_file(dispatch_id)
+def _ipc_allowed_roots() -> list[Path]:
+    dispatch_base = _dispatch_base_dir()
+    return [dispatch_base.parent, dispatch_base]
+
+
+def _resolve_steer_file(cfg: argparse.Namespace, dispatch_id: str) -> tuple[Path, str]:
+    configured = getattr(cfg, "steer_file", None)
+    if configured:
+        return Path(str(configured)).expanduser(), "cli"
+    env_value = os.environ.get("GOALFLIGHT_STEER_FILE")
+    if env_value:
+        path = Path(env_value).expanduser()
+        if goalflight_compat.path_is_under(path, _ipc_allowed_roots()):
+            goalflight_compat.env_override_warning(
+                "GOALFLIGHT_STEER_FILE",
+                "active",
+                "path_under_state_root",
+                source=path,
+            )
+            return path, "env:state_root"
+        if os.environ.get(STEER_FILE_ALLOW_ENV) == "1":
+            goalflight_compat.env_override_warning(
+                "GOALFLIGHT_STEER_FILE",
+                "active",
+                f"{STEER_FILE_ALLOW_ENV}=1",
+                source=path,
+            )
+            return path, "env:allow"
+        goalflight_compat.env_override_warning(
+            "GOALFLIGHT_STEER_FILE",
+            "ignored",
+            "outside_state_root",
+            source=path,
+        )
+        roots = ", ".join(str(root) for root in _ipc_allowed_roots())
+        raise ValueError(
+            f"GOALFLIGHT_STEER_FILE must be under a dispatch/state directory "
+            f"({roots}) unless {STEER_FILE_ALLOW_ENV}=1"
+        )
+    return _default_steer_file(dispatch_id), "default"
 
 
 def _read_steer_entries(path: Path) -> list[dict]:
@@ -1023,14 +1063,32 @@ async def _run_acp_dispatch_impl(
     if remote_turn_cancel_grace_s < 0:
         remote_turn_cancel_grace_s = DEFAULT_REMOTE_TURN_CANCEL_GRACE_S
     dispatch_id = cfg.dispatch_id or f"acp-{cfg.agent}-{uuid.uuid4().hex[:8]}"
-    steer_file = _resolve_steer_file(cfg, dispatch_id)
+    steer_file, steer_file_source = _resolve_steer_file(cfg, dispatch_id)
     run_started = time.time()
     project_root = Path(cfg.cwd).resolve()
     permission_mode = str(getattr(cfg, "permission_mode", "auto") or "auto")
     read_only_dispatch = bool(getattr(cfg, "read_only", False))
     resolved_permission_dir: str | None = None
+    resolved_permission_dir_source: str | None = None
     if permission_mode == "inline":
-        resolved_permission_dir = str(permits.permission_dir(getattr(cfg, "permission_dir", None)))
+        configured_permission_dir = getattr(cfg, "permission_dir", None)
+        resolved_permission_dir = str(
+            permits.permission_dir(
+                configured_permission_dir,
+                allowed_roots=_ipc_allowed_roots(),
+            )
+        )
+        if configured_permission_dir:
+            resolved_permission_dir_source = "cli"
+        elif os.environ.get(permits.ENV_PERMISSION_DIR):
+            env_permission_dir = Path(os.environ[permits.ENV_PERMISSION_DIR]).expanduser()
+            resolved_permission_dir_source = (
+                "env:state_root"
+                if goalflight_compat.path_is_under(env_permission_dir, _ipc_allowed_roots())
+                else "env:allow"
+            )
+        else:
+            resolved_permission_dir_source = "default"
     worktree_mode = getattr(cfg, "worktree", "off")
     worktree_path: Path | None = None
     worktree_error: str | None = None
@@ -1045,6 +1103,7 @@ async def _run_acp_dispatch_impl(
         "schema": "goalflight.acp-run.v1",
         "dispatch_id": dispatch_id,
         "steer_mailbox": str(steer_file),
+        "steer_mailbox_source": steer_file_source,
         "steer_delivered_seqs": [],
         "steer_acked_seqs": [],
         "steer_pending_seqs": [],
@@ -1087,6 +1146,7 @@ async def _run_acp_dispatch_impl(
         },
         "permission_mode": permission_mode,
         "permission_dir": resolved_permission_dir,
+        "permission_dir_source": resolved_permission_dir_source,
         "pending_permissions": [],
         "permission_decisions": [],
         "updated_at": _now(),
@@ -2077,7 +2137,11 @@ async def _run_acp_dispatch_impl(
                 env=spawn_env,
             )
         await update_status(os_sandbox=getattr(conn, "os_sandbox_metadata", None) or payload["os_sandbox"])
-        test_marker = os.environ.get("GOALFLIGHT_TEST_ACP_BEFORE_PID_LEDGER_UPDATE_FILE")
+        test_marker = goalflight_compat.allowed_env_override(
+            "GOALFLIGHT_TEST_ACP_BEFORE_PID_LEDGER_UPDATE_FILE",
+            "",
+            test_mode=True,
+        )
         if test_marker:
             with contextlib.suppress(Exception):
                 Path(test_marker).write_text(str(proc.pid), encoding="utf-8")

@@ -27,7 +27,7 @@ fail() {
   exit 1
 }
 
-export GOALFLIGHT_TRIGGER_GUARD_PATTERNS_B64="Zml4dHVyZWJsb2Nr"
+pattern_b64="Zml4dHVyZWJsb2Nr"
 bad_word="fixtureblock"
 
 mkdir "$TMP_ROOT/repo"
@@ -42,10 +42,24 @@ python3 "$REPO_ROOT/scripts/goalflight_trigger_guard.py" --repo "$PWD" --staged 
 
 printf 'schema: %s\n' "$bad_word" > unsafe.txt
 git add unsafe.txt
+GOALFLIGHT_TRIGGER_GUARD_PATTERNS_B64="$pattern_b64" \
+  python3 "$REPO_ROOT/scripts/goalflight_trigger_guard.py" --repo "$PWD" --staged >"$TMP_ROOT/ungated.out" 2>&1 \
+  || fail "ungated custom pattern should be ignored"
+grep -q 'env=GOALFLIGHT_TRIGGER_GUARD_PATTERNS_B64 action=ignored' "$TMP_ROOT/ungated.out" \
+  || fail "ungated pattern warning missing"
+! grep -q 'staged content' "$TMP_ROOT/ungated.out" \
+  || fail "ungated custom pattern was honored"
+
+export GOALFLIGHT_TRIGGER_GUARD_PATTERNS_B64="$pattern_b64"
+export GOALFLIGHT_ALLOW_TRIGGER_GUARD_PATTERN_OVERRIDE=1
 if python3 "$REPO_ROOT/scripts/goalflight_trigger_guard.py" --repo "$PWD" --staged >"$TMP_ROOT/content.out" 2>&1; then
   fail "unsafe staged content allowed"
 fi
+grep -q 'env=GOALFLIGHT_TRIGGER_GUARD_PATTERNS_B64 action=active' "$TMP_ROOT/content.out" \
+  || fail "active pattern warning missing"
+grep -q 'source=env' "$TMP_ROOT/content.out" || fail "active pattern source missing"
 grep -q 'staged content' "$TMP_ROOT/content.out" || fail "content finding missing"
+grep -q 'pattern_count=1' "$TMP_ROOT/content.out" || fail "active pattern count missing"
 git reset -q
 rm -f unsafe.txt
 

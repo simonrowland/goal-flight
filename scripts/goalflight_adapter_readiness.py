@@ -10,6 +10,7 @@ import shutil
 import subprocess
 from typing import Any
 
+import goalflight_compat
 from goalflight_adapter_gate import validate_adapter_gate
 from goalflight_os_sandbox import (
     OS_SANDBOX_OFF,
@@ -19,7 +20,12 @@ from goalflight_os_sandbox import (
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-ADAPTERS_DIR = Path(os.environ.get("GOALFLIGHT_ADAPTERS_DIR", SCRIPT_DIR.parent / "adapters"))
+_ADAPTERS_DIR_ENV = goalflight_compat.allowed_env_override(
+    "GOALFLIGHT_ADAPTERS_DIR",
+    "GOALFLIGHT_ALLOW_ADAPTERS_DIR_OVERRIDE",
+)
+ADAPTERS_DIR = Path(_ADAPTERS_DIR_ENV).expanduser() if _ADAPTERS_DIR_ENV else SCRIPT_DIR.parent / "adapters"
+ADAPTERS_DIR_SOURCE = "env" if _ADAPTERS_DIR_ENV else "repo"
 AGENT_MANIFEST_ALIASES = {
     "claude-acp": "claude-code",
     "claude": "claude-code",

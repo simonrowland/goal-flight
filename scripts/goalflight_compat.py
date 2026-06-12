@@ -29,6 +29,7 @@ import errno
 import json
 import logging
 import os
+import shlex
 import shutil
 import signal
 import subprocess
@@ -44,6 +45,10 @@ __all__ = [
     "is_wsl",
     "is_wsl_drvfs_path",
     "python_executable",
+    "is_test_mode",
+    "env_override_warning",
+    "allowed_env_override",
+    "path_is_under",
     "windows_dispatch_refusal",
     "windows_os_sandbox_refusal",
     "windows_hooks_skip",
@@ -231,7 +236,105 @@ def is_wsl_drvfs_path(path: str | os.PathLike[str] | None) -> bool:
 
 def python_executable() -> str:
     """Python executable for internal re-invokes, overrideable for launchers."""
+    # Env interpreter selectors are accepted-watch per the SC-13 sweep: command
+    # source overrides, but outside the source/write/safety-disable predicate.
     return os.environ.get("GOALFLIGHT_PYTHON") or sys.executable
+
+
+def is_test_mode() -> bool:
+    """True only when test-only env hooks may affect runtime behavior."""
+    return os.environ.get("GOALFLIGHT_TEST_MODE") == "1"
+
+
+def env_override_warning(
+    env_name: str,
+    action: str,
+    reason: str,
+    *,
+    source: str | os.PathLike[str] | None = None,
+    extra: dict[str, object] | None = None,
+    stream=None,
+) -> None:
+    """Emit the uniform one-line env override warning/status convention."""
+    if stream is None:
+        stream = sys.stderr
+
+    def field(key: str, value: object) -> str:
+        return f"{key}={shlex.quote(str(value))}"
+
+    parts = [
+        "GOALFLIGHT_ENV_OVERRIDE",
+        field("env", env_name),
+        field("action", action),
+        field("reason", reason),
+    ]
+    if source is not None:
+        parts.append(field("source", source))
+    for key, value in (extra or {}).items():
+        parts.append(field(key, value))
+    print(" ".join(parts), file=stream)
+
+
+def allowed_env_override(
+    env_name: str,
+    allow_env: str,
+    *,
+    test_mode: bool = False,
+    source: str | os.PathLike[str] | None = None,
+    stream=None,
+) -> str | None:
+    """Return a gated env override value, warning when active or ignored."""
+    raw = os.environ.get(env_name)
+    if raw is None or raw == "":
+        return None
+    if test_mode and is_test_mode():
+        env_override_warning(
+            env_name,
+            "active",
+            "GOALFLIGHT_TEST_MODE=1",
+            source=source or raw,
+            stream=stream,
+        )
+        return raw
+    if os.environ.get(allow_env) == "1":
+        env_override_warning(
+            env_name,
+            "active",
+            f"{allow_env}=1",
+            source=source or raw,
+            stream=stream,
+        )
+        return raw
+    reason = "GOALFLIGHT_TEST_MODE_not_1" if test_mode else f"{allow_env}_not_1"
+    env_override_warning(
+        env_name,
+        "ignored",
+        reason,
+        source=source or raw,
+        stream=stream,
+    )
+    return None
+
+
+def path_is_under(path: str | os.PathLike[str], roots: list[str | os.PathLike[str]]) -> bool:
+    """True when path resolves under one of roots; missing paths are OK."""
+    candidate = Path(path).expanduser()
+    try:
+        candidate_resolved = candidate.resolve(strict=False)
+    except OSError:
+        candidate_resolved = candidate.absolute()
+    for root in roots:
+        root_path = Path(root).expanduser()
+        try:
+            root_resolved = root_path.resolve(strict=False)
+        except OSError:
+            root_resolved = root_path.absolute()
+        try:
+            candidate_resolved.relative_to(root_resolved)
+            return True
+        except ValueError:
+            continue
+    return False
 
 
 def windows_dispatch_refusal() -> str:

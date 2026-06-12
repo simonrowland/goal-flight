@@ -4,6 +4,7 @@ set "ROOT=%~dp0.."
 set "PYTHON_EXE="
 set "PYTHON_ARGS="
 
+rem GOALFLIGHT_PYTHON is accepted-watch per the SC-13 sweep: interpreter selector only.
 if defined GOALFLIGHT_PYTHON (
   "%GOALFLIGHT_PYTHON%" --version >nul 2>nul
   if not errorlevel 1 (
