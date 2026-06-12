@@ -104,11 +104,11 @@ your permission. Come back
 hours later to reviewed, one-commit-per-chunk work on your branch, with review evidence
 and resume notes on disk.
 
-**Session management.** While a run is active, goal-flight maintains the resume notes — a
-running handoff of repo state, in-flight dispatches, and the next intended action. When
-the session compacts, restarts, or you pick the project up days later, the ritual is one
-command: `/goal-flight resume` reloads the skill, reads the notes and the queue, and
-rebuilds the orchestrator's working state from files. Nothing depends on chat memory.
+**Session management.** Compaction is managed by a handoff file the controller keeps
+updated — repo state, in-flight dispatches, the next intended action. Before the session
+compacts, ask the controller to update its handoff, run `/compact`, then run
+`/goal-flight resume`. The same resume command picks the project up after a restart or
+days away; nothing depends on chat memory.
 
 > **Working signal, not rigid gates**: the skill pins a `goal-<topic>-<date>.md` file at
 > init for compaction-survival, but it's an anchor — not a contract. `decompose-plan`
