@@ -45,8 +45,20 @@ Default add-ons (same tier as setup prompts):
 
 - **context-mode** — large-output offload
 - **gstack** — default independent reviewer for both chunk-level pre-commit
-  review and milestone review (`/review`, plus `/office-hours`, `/plan-eng-review`,
-  `/cso`, `/investigate`). Local fallback prompts live in
+  review and milestone review. When host gstack skills are missing, init offers:
+  **minimal subset** (default: `/review`, `/office-hours`, `/plan-eng-review`,
+  plus downloaded community skills `grill-me` from `udecode/plate` and
+  `thermo-nuclear-code-quality-review` from `cursor/plugins`), **full pack**, or
+  **skip**. Full-pack delegation is used only for hosts the upstream gstack setup
+  supports; unsupported hosts fall back to the minimal copy path with a teaching
+  message. The minimal path exposes only the Goal Flight subset from an existing
+  local gstack checkout/cache and downloads the two public community skills only
+  after the same consent prompt; download failures warn and degrade gracefully.
+  Download sources are pinned HTTPS URLs; the test-only source override
+  (`GOALFLIGHT_GSTACK_EXTERNAL_SOURCE_*`) is ignored unless
+  `GOALFLIGHT_ALLOW_EXTERNAL_SOURCE_OVERRIDE=1` is also set, with a visible
+  ignored-override warning otherwise.
+  Local fallback prompts live in
   `prompts/gstack-claude-review.md` and `prompts/gstack-codex-challenge.md` when
   gstack is not installed.
 - **autoreview** — complementary diff-local pre-commit pass via

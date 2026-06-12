@@ -50,6 +50,9 @@ except Exception:  # pragma: no cover - doctor still reports partial state
 
 CLAUDE_ACP_STOPGAP_MAX_VERSION = "0.1.1"
 CLAUDE_ACP_PATCH_SCRIPT = SCRIPT_DIR / "install_claude_acp_patch.sh"
+GSTACK_MINIMAL_SKILLS = ("review", "plan-eng-review", "office-hours")
+GSTACK_EXTERNAL_SKILLS = ("grill-me", "thermo-nuclear-code-quality-review")
+GSTACK_MINIMAL_REQUIRED_SKILLS = GSTACK_MINIMAL_SKILLS + GSTACK_EXTERNAL_SKILLS
 
 
 def run(cmd: list[str], cwd: Path | None = None, timeout: float = 8.0) -> dict:
@@ -162,10 +165,75 @@ def check_agent_traits() -> dict:
     return out
 
 
+def _gstack_host_skill_roots() -> dict[str, Path]:
+    return {
+        "claude-code": Path.home() / ".claude/skills",
+        "codex": Path.home() / ".codex/skills",
+        "cursor": Path.home() / ".cursor/skills",
+        "opencode": Path.home() / ".config/opencode/skills",
+        "grok": Path.home() / ".grok/skills",
+    }
+
+
+def _gstack_root_subset_state(root: Path) -> dict:
+    skills: dict[str, bool] = {}
+    installed_as: dict[str, str | None] = {}
+    for skill in GSTACK_MINIMAL_REQUIRED_SKILLS:
+        flat = root / skill / "SKILL.md"
+        prefixed = root / f"gstack-{skill}" / "SKILL.md"
+        if flat.is_file():
+            skills[skill] = True
+            installed_as[skill] = skill
+        elif prefixed.is_file():
+            skills[skill] = True
+            installed_as[skill] = f"gstack-{skill}"
+        else:
+            skills[skill] = False
+            installed_as[skill] = None
+    missing = [skill for skill, ok in skills.items() if not ok]
+    return {
+        "path": str(root),
+        "skills": skills,
+        "installed_as": installed_as,
+        "complete": not missing,
+        "missing": missing,
+    }
+
+
+def _gstack_subset_detail(host_roots: dict[str, dict], complete_hosts: list[str]) -> str:
+    if complete_hosts:
+        return "minimal subset hosts: " + ", ".join(complete_hosts)
+    partial: list[str] = []
+    for host, state in host_roots.items():
+        present = [
+            skill
+            for skill, ok in (state.get("skills") or {}).items()
+            if ok
+        ]
+        if present:
+            partial.append(f"{host} has {','.join(present)}")
+    if partial:
+        return "partial minimal subset: " + "; ".join(partial)
+    return "minimal subset not exposed in host skill roots; missing " + ",".join(GSTACK_MINIMAL_REQUIRED_SKILLS)
+
+
 def check_gstack() -> dict:
     cli = version("gstack", "--version")
+    host_roots = {
+        host: _gstack_root_subset_state(root)
+        for host, root in _gstack_host_skill_roots().items()
+    }
+    complete_hosts = [host for host, state in host_roots.items() if state["complete"]]
     if cli.get("present"):
-        cli["kind"] = "cli"
+        cli.update({
+            "kind": "cli",
+            "ok": True,
+            "level": "ok",
+            "minimal_required_skills": list(GSTACK_MINIMAL_REQUIRED_SKILLS),
+            "host_skill_roots": host_roots,
+            "minimal_subset_hosts": complete_hosts,
+            "detail": _gstack_subset_detail(host_roots, complete_hosts),
+        })
         return cli
 
     repo = Path.home() / ".gstack/repos/gstack"
@@ -183,9 +251,35 @@ def check_gstack() -> dict:
             "kind": "skill_repo",
             "version": f"gstack {version_text}" if version_text else "gstack skill repo",
             "ok": True,
+            "level": "ok",
+            "minimal_required_skills": list(GSTACK_MINIMAL_REQUIRED_SKILLS),
+            "host_skill_roots": host_roots,
+            "minimal_subset_hosts": complete_hosts,
+            "detail": _gstack_subset_detail(host_roots, complete_hosts),
         }
 
-    return {"present": False}
+    if complete_hosts:
+        return {
+            "present": True,
+            "kind": "minimal_subset",
+            "version": "gstack minimal subset",
+            "ok": True,
+            "level": "warning",
+            "minimal_required_skills": list(GSTACK_MINIMAL_REQUIRED_SKILLS),
+            "host_skill_roots": host_roots,
+            "minimal_subset_hosts": complete_hosts,
+            "detail": f"minimal subset only: {', '.join(complete_hosts)}",
+        }
+
+    return {
+        "present": False,
+        "ok": False,
+        "level": "warning",
+        "minimal_required_skills": list(GSTACK_MINIMAL_REQUIRED_SKILLS),
+        "host_skill_roots": host_roots,
+        "minimal_subset_hosts": [],
+        "detail": _gstack_subset_detail(host_roots, []),
+    }
 
 
 def check_autoreview(skill_root: Path) -> dict:
@@ -2051,7 +2145,11 @@ def print_human(payload: dict) -> None:
             "OpenCode context-mode MCP project",
             payload["opencode_context_mode"].get("project_path"),
         ),
-        status_line(payload["gstack"].get("present"), "gstack", payload["gstack"].get("version")),
+        status_line(
+            False if payload["gstack"].get("level") == "warning" else payload["gstack"].get("present"),
+            "gstack",
+            payload["gstack"].get("detail") or payload["gstack"].get("version"),
+        ),
         status_line(
             (payload.get("agent_traits") or {}).get("ok"),
             "agent traits (global opt-in)",

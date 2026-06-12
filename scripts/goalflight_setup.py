@@ -17,6 +17,9 @@ import shlex
 import sys
 import subprocess
 import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -27,6 +30,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import goalflight_compat  # noqa: E402
+import goalflight_doctor  # noqa: E402
 from goalflight_adapter_gate import validate_adapter_gate  # noqa: E402
 
 
@@ -35,6 +39,30 @@ MERGE_START = "# >>> goal-flight"
 MERGE_END = "# <<< goal-flight"
 SETUP_ALLOWED_GATE_REASONS = {"allowed", "candidate", "config_only", "not_installed", "probe_required", "unsupported"}
 TARGET_PROJECT_TOKEN = "${GOALFLIGHT_TARGET_PROJECT}"
+GSTACK_MINIMAL_SKILLS = ("review", "plan-eng-review", "office-hours")
+GSTACK_EXTERNAL_SKILL_SOURCES = {
+    "grill-me": (
+        "https://raw.githubusercontent.com/udecode/plate/"
+        "8aec9b9ebbb3d403eca5f84f962f18ab88691715/"
+        "templates/plate-template/.agents/skills/grill-me/SKILL.md"
+    ),
+    "thermo-nuclear-code-quality-review": (
+        "https://raw.githubusercontent.com/cursor/plugins/"
+        "74dd2291e8e37b12fd6dc49b2acbd655c6bdaf12/"
+        "cursor-team-kit/agents/thermo-nuclear-code-quality-review.md"
+    ),
+}
+GSTACK_EXTERNAL_SKILLS = tuple(GSTACK_EXTERNAL_SKILL_SOURCES)
+GSTACK_MINIMAL_REQUIRED_SKILLS = GSTACK_MINIMAL_SKILLS + GSTACK_EXTERNAL_SKILLS
+GSTACK_EXTERNAL_DOWNLOAD_TIMEOUT = 10.0
+GSTACK_EXTERNAL_DOWNLOAD_MAX_BYTES = 512 * 1024
+GSTACK_EXTERNAL_SOURCE_OVERRIDE_GATE = "GOALFLIGHT_ALLOW_EXTERNAL_SOURCE_OVERRIDE"
+GSTACK_INSTALL_CHOICES = {"minimal", "full", "skip"}
+GSTACK_FULL_INSTALL_HOSTS = {
+    "claude-code": "claude",
+    "codex": "codex",
+    "opencode": "opencode",
+}
 
 
 class SetupError(RuntimeError): pass
@@ -483,6 +511,15 @@ def _run_host_bootstrap(
                 f"detail={goalflight_compat.windows_hooks_skip()}"
             )
             continue
+        if addon.get("id") == "gstack":
+            records.extend(
+                _run_gstack_addon(
+                    agent,
+                    dry_run=dry_run,
+                    backups_root=None if dry_run else backups_root,
+                )
+            )
+            continue
         if mode == "setup" and agent == "codex" and addon.get("id") == "context-mode":
             _run_codex_context_mode_registration(repo_root, dry_run=dry_run)
         elif mode == "setup" and agent == "cursor" and addon.get("id") == "context-mode":
@@ -591,6 +628,430 @@ def _run_addon_self_check(agent: str, addon: dict[str, Any]) -> None:
             f"ADDON_CHECK {agent} {addon['id']} mode=init_self_check "
             f"status={status} command={command!r}{detail_part}"
         )
+
+
+def _gstack_host_name(agent: str) -> str:
+    return GSTACK_FULL_INSTALL_HOSTS.get(agent, agent)
+
+
+def _gstack_host_skills_dir(agent: str) -> Path:
+    override = os.environ.get("GOALFLIGHT_GSTACK_SKILLS_DIR")
+    if override:
+        return Path(override).expanduser()
+    return {
+        "claude-code": Path.home() / ".claude/skills",
+        "codex": Path.home() / ".codex/skills",
+        "cursor": Path.home() / ".cursor/skills",
+        "opencode": Path.home() / ".config/opencode/skills",
+        "grok": Path.home() / ".grok/skills",
+    }.get(agent, Path.home() / ".agents/skills")
+
+
+def _gstack_target_skill_name(agent: str, skill: str) -> str:
+    if agent == "claude-code":
+        return skill
+    return f"gstack-{skill}"
+
+
+def _gstack_external_source_url(skill: str) -> str:
+    env_suffix = re.sub(r"[^A-Za-z0-9]+", "_", skill).strip("_").upper()
+    env_name = f"GOALFLIGHT_GSTACK_EXTERNAL_SOURCE_{env_suffix}"
+    override = os.environ.get(env_name)
+    if override:
+        if os.environ.get(GSTACK_EXTERNAL_SOURCE_OVERRIDE_GATE) == "1":
+            return override
+        print(
+            "ADDON_GSTACK_EXTERNAL "
+            f"skill={skill} warning=external_source_override_ignored "
+            f"env={env_name} reason={GSTACK_EXTERNAL_SOURCE_OVERRIDE_GATE}_not_1"
+        )
+    return GSTACK_EXTERNAL_SKILL_SOURCES[skill]
+
+
+def _gstack_external_source_is_gated_override(skill: str, source_url: str) -> bool:
+    env_suffix = re.sub(r"[^A-Za-z0-9]+", "_", skill).strip("_").upper()
+    override = os.environ.get(f"GOALFLIGHT_GSTACK_EXTERNAL_SOURCE_{env_suffix}")
+    return bool(
+        override
+        and source_url == override
+        and os.environ.get(GSTACK_EXTERNAL_SOURCE_OVERRIDE_GATE) == "1"
+    )
+
+
+def _gstack_existing_skill_path(skills_dir: Path, skill: str) -> Path | None:
+    for name in (skill, f"gstack-{skill}"):
+        target = skills_dir / name / "SKILL.md"
+        if target.is_file():
+            return target
+    return None
+
+
+def _gstack_source_candidates() -> list[Path]:
+    candidates: list[Path] = []
+    if raw := os.environ.get("GOALFLIGHT_GSTACK_SOURCE"):
+        candidates.append(Path(raw).expanduser())
+    candidates.extend([
+        Path.home() / ".claude/skills/gstack",
+        Path.home() / ".gstack/repos/gstack",
+    ])
+    seen: set[Path] = set()
+    unique: list[Path] = []
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        unique.append(candidate)
+    return unique
+
+
+def _gstack_source_has_skill(root: Path, skill: str) -> bool:
+    return (
+        (root / skill / "SKILL.md").is_file()
+        or (root / ".agents/skills" / f"gstack-{skill}" / "SKILL.md").is_file()
+        or (root / f"gstack-{skill}" / "SKILL.md").is_file()
+    )
+
+
+def _find_gstack_source() -> Path | None:
+    for candidate in _gstack_source_candidates():
+        if all(_gstack_source_has_skill(candidate, skill) for skill in GSTACK_MINIMAL_SKILLS):
+            return candidate
+    return None
+
+
+def _gstack_skill_source(root: Path, agent: str, skill: str) -> Path:
+    if agent != "claude-code":
+        generated = root / ".agents/skills" / f"gstack-{skill}"
+        if (generated / "SKILL.md").is_file():
+            return generated
+        generated = root / f"gstack-{skill}"
+        if (generated / "SKILL.md").is_file():
+            return generated
+    source = root / skill
+    if (source / "SKILL.md").is_file():
+        return source
+    generated = root / ".agents/skills" / f"gstack-{skill}"
+    if (generated / "SKILL.md").is_file():
+        return generated
+    generated = root / f"gstack-{skill}"
+    if (generated / "SKILL.md").is_file():
+        return generated
+    raise SetupError(f"gstack skill source missing: {skill} under {root}")
+
+
+def _gstack_installed_skills(agent: str) -> dict[str, bool]:
+    skills_dir = _gstack_host_skills_dir(agent)
+    state = goalflight_doctor._gstack_root_subset_state(skills_dir)
+    return dict(state["skills"])
+
+
+def _gstack_minimal_installed(agent: str, installed: dict[str, bool] | None = None) -> bool:
+    if installed is None:
+        installed = _gstack_installed_skills(agent)
+    return bool(installed) and all(installed.values())
+
+
+def _select_gstack_install_choice(*, dry_run: bool) -> str:
+    raw = os.environ.get("GOALFLIGHT_GSTACK_INSTALL") or os.environ.get("GOALFLIGHT_GSTACK_INSTALL_CHOICE")
+    if raw:
+        choice = raw.strip().lower()
+        if choice not in GSTACK_INSTALL_CHOICES:
+            raise SetupError(f"unknown gstack install choice: {raw}")
+        return choice
+    if dry_run:
+        return "skip"
+    if sys.stdin.isatty():
+        print("gstack not installed. Install minimal Goal Flight subset plus community skills, full gstack pack, or skip?")
+        print("  1. minimal subset (default)")
+        print("  2. full pack")
+        print("  3. skip")
+        answer = input("gstack install choice [minimal/full/skip, empty=minimal]: ").strip().lower()
+        if not answer:
+            return "minimal"
+        if answer in {"1", "minimal", "m"}:
+            return "minimal"
+        if answer in {"2", "full", "f"}:
+            return "full"
+        if answer in {"3", "skip", "s", "no", "n"}:
+            return "skip"
+        raise SetupError(f"unknown gstack install choice: {answer}")
+    return "minimal"
+
+
+def _copy_gstack_tree(source: Path, target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists() or target.is_symlink():
+        if target.is_dir() and not target.is_symlink():
+            shutil.rmtree(target)
+        else:
+            target.unlink()
+    shutil.copytree(source, target, symlinks=True)
+
+
+def _record_gstack_target(
+    target: Path,
+    backups_root: Path,
+    *,
+    source: str = "gstack",
+) -> dict[str, Any]:
+    action = {
+        "kind": "gstack_skill",
+        "source": source,
+        "target": str(target),
+        "rollback": "restore_backup",
+    }
+    return _record_backup(action, target, backups_root)
+
+
+class ExternalSkillDownloadError(RuntimeError):
+    pass
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[no-untyped-def]
+        return None
+
+
+def _fetch_external_skill_text(url: str, *, allow_file: bool = False) -> str:
+    parsed = urllib.parse.urlparse(url)
+    allowed_schemes = {"https", "file"} if allow_file else {"https"}
+    if parsed.scheme not in allowed_schemes:
+        scheme = parsed.scheme or "missing"
+        raise ExternalSkillDownloadError(f"unsupported_scheme={scheme}")
+    try:
+        request = urllib.request.Request(url, headers={"User-Agent": "goal-flight-setup/1"})
+        opener = urllib.request.build_opener(_NoRedirectHandler)
+        with opener.open(request, timeout=GSTACK_EXTERNAL_DOWNLOAD_TIMEOUT) as response:
+            status = response.getcode()
+            if status not in (None, 200):
+                raise ExternalSkillDownloadError(f"http_status={status}")
+            data = response.read(GSTACK_EXTERNAL_DOWNLOAD_MAX_BYTES + 1)
+    except (OSError, urllib.error.URLError) as exc:
+        raise ExternalSkillDownloadError(type(exc).__name__) from exc
+    if len(data) > GSTACK_EXTERNAL_DOWNLOAD_MAX_BYTES:
+        raise ExternalSkillDownloadError("size_cap_exceeded")
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ExternalSkillDownloadError("utf8_decode_failed") from exc
+
+
+def _skill_doc_title(text: str, fallback: str) -> str:
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped:
+            return re.sub(r"\s+", " ", stripped.lstrip("#").strip()) or fallback
+    return fallback
+
+
+def _shape_external_skill(skill: str, source_url: str, text: str) -> str:
+    source_line = f"source_url: {json.dumps(source_url)}"
+    if text.startswith("---\n"):
+        end = text.find("\n---", 4)
+        if end != -1:
+            frontmatter = text[4:end]
+            body = text[end + len("\n---"):]
+            lines = [
+                line
+                for line in frontmatter.rstrip().splitlines()
+                if not re.match(r"\s*source_url\s*:", line)
+            ]
+            lines.append(source_line)
+            shaped_frontmatter = "\n".join(lines)
+            return f"---\n{shaped_frontmatter}\n---{body}"
+    description = _skill_doc_title(text, skill)
+    return (
+        "---\n"
+        f"name: {json.dumps(skill)}\n"
+        f"description: {json.dumps(description)}\n"
+        f"{source_line}\n"
+        "---\n"
+        f"{text}"
+    )
+
+
+def _write_external_skill(target: Path, content: str) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists() or target.is_symlink():
+        if target.is_dir() and not target.is_symlink():
+            shutil.rmtree(target)
+        else:
+            target.unlink()
+    target.mkdir(parents=True, exist_ok=True)
+    _atomic_write(target / "SKILL.md", content)
+
+
+def _install_gstack_external_skills(
+    agent: str,
+    *,
+    dry_run: bool,
+    backups_root: Path | None = None,
+) -> list[dict[str, Any]]:
+    skills_dir = _gstack_host_skills_dir(agent)
+    records: list[dict[str, Any]] = []
+    for skill in GSTACK_EXTERNAL_SKILL_SOURCES:
+        existing = _gstack_existing_skill_path(skills_dir, skill)
+        if existing is not None:
+            print(
+                "ADDON_GSTACK_EXTERNAL "
+                f"skill={skill} status=ok detail=already_installed target={existing.parent}"
+            )
+            continue
+        source_url = _gstack_external_source_url(skill)
+        target = skills_dir / _gstack_target_skill_name(agent, skill)
+        if dry_run:
+            print(
+                "ADDON_GSTACK_EXTERNAL "
+                f"skill={skill} install=download source={source_url} target={target}"
+            )
+            continue
+        if backups_root is None:
+            raise SetupError("gstack external skill install requires backup root")
+        try:
+            text = _fetch_external_skill_text(
+                source_url,
+                allow_file=_gstack_external_source_is_gated_override(skill, source_url),
+            )
+            content = _shape_external_skill(skill, source_url, text)
+        except ExternalSkillDownloadError as exc:
+            print(
+                "ADDON_GSTACK_EXTERNAL "
+                f"skill={skill} install=blocked reason=network/source detail={exc} source={source_url}"
+            )
+            continue
+        records.append(_record_gstack_target(target, backups_root, source=source_url))
+        _write_external_skill(target, content)
+        print(
+            "ADDON_GSTACK_EXTERNAL_APPLY "
+            f"skill={target.name} source={source_url} target={target}"
+        )
+    return records
+
+
+def _install_gstack_minimal(
+    agent: str,
+    source: Path,
+    *,
+    dry_run: bool,
+    backups_root: Path | None = None,
+) -> list[dict[str, Any]]:
+    skills_dir = _gstack_host_skills_dir(agent)
+    targets = [
+        skills_dir / _gstack_target_skill_name(agent, skill)
+        for skill in GSTACK_MINIMAL_SKILLS
+    ]
+    license_source = source / "LICENSE"
+    license_target = skills_dir / "gstack-LICENSE"
+    if dry_run:
+        target_names = ",".join(target.name for target in targets)
+        print(
+            "ADDON_GSTACK install=minimal "
+            f"source={source} target={skills_dir} skills={target_names}"
+        )
+        if license_source.is_file():
+            print(f"ADDON_GSTACK attribution source={license_source} target={license_target}")
+        _install_gstack_external_skills(agent, dry_run=True, backups_root=None)
+        return []
+    if backups_root is None:
+        raise SetupError("gstack minimal install requires backup root")
+    records: list[dict[str, Any]] = []
+    for skill, target in zip(GSTACK_MINIMAL_SKILLS, targets, strict=True):
+        source_dir = _gstack_skill_source(source, agent, skill)
+        records.append(_record_gstack_target(target, backups_root))
+        _copy_gstack_tree(source_dir, target)
+        print(f"ADDON_GSTACK_APPLY skill={target.name} source={source_dir} target={target}")
+    if license_source.is_file():
+        records.append(_record_gstack_target(license_target, backups_root))
+        _copy_atomic(license_source, license_target)
+        print(f"ADDON_GSTACK_APPLY attribution={license_target}")
+    records.extend(_install_gstack_external_skills(agent, dry_run=False, backups_root=backups_root))
+    return records
+
+
+def _run_gstack_full_install(
+    agent: str,
+    source: Path,
+    *,
+    dry_run: bool,
+    backups_root: Path | None = None,
+) -> list[dict[str, Any]]:
+    if agent not in GSTACK_FULL_INSTALL_HOSTS:
+        print(
+            "ADDON_GSTACK install=full status=unsupported "
+            f"agent={agent} detail=upstream_gstack_setup_host_unsupported fallback=minimal"
+        )
+        return _install_gstack_minimal(agent, source, dry_run=dry_run, backups_root=backups_root)
+    host = _gstack_host_name(agent)
+    setup = source / "setup"
+    if not setup.is_file():
+        raise SetupError(f"gstack setup helper missing: {setup}")
+    argv = ["bash", str(setup), "--host", host]
+    if dry_run:
+        print(f"ADDON_GSTACK install=full command={_format_command(argv)}")
+        _install_gstack_external_skills(agent, dry_run=True, backups_root=None)
+        return []
+    result = subprocess.run(argv, text=True, encoding="utf-8", errors="replace", capture_output=True, check=False)
+    if result.stdout.strip():
+        print(result.stdout.strip())
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+        raise SetupError(f"gstack full install failed: {detail}")
+    print(f"ADDON_GSTACK_APPLY full source={source} host={host}")
+    return _install_gstack_external_skills(agent, dry_run=False, backups_root=backups_root)
+
+
+def _run_gstack_addon(
+    agent: str,
+    *,
+    dry_run: bool,
+    backups_root: Path | None = None,
+) -> list[dict[str, Any]]:
+    installed = _gstack_installed_skills(agent)
+    source = _find_gstack_source()
+    if _gstack_minimal_installed(agent, installed):
+        print(
+            "ADDON_CHECK "
+            f"{agent} gstack mode=install status=ok detail=minimal_subset "
+            f"skills={','.join(GSTACK_MINIMAL_REQUIRED_SKILLS)}"
+        )
+        return []
+    missing = [skill for skill, ok in installed.items() if not ok]
+    print(
+        "ADDON_CHECK "
+        f"{agent} gstack mode=install status=not_installed "
+        f"missing={','.join(missing)}"
+    )
+    print("ADDON_GSTACK choices=minimal,full,skip default=minimal")
+    choice = _select_gstack_install_choice(dry_run=dry_run)
+    if choice == "skip":
+        if dry_run and source is not None:
+            _install_gstack_minimal(agent, source, dry_run=True, backups_root=None)
+        print("ADDON_GSTACK install=skip")
+        return []
+    if choice == "minimal":
+        if all(installed.get(skill, False) for skill in GSTACK_MINIMAL_SKILLS):
+            print("ADDON_GSTACK install=minimal status=ok detail=gstack_subset_present")
+            return _install_gstack_external_skills(
+                agent,
+                dry_run=dry_run,
+                backups_root=None if dry_run else backups_root,
+            )
+        if source is None:
+            print("ADDON_GSTACK install=blocked reason=source_missing")
+            return _install_gstack_external_skills(
+                agent,
+                dry_run=dry_run,
+                backups_root=None if dry_run else backups_root,
+            )
+        return _install_gstack_minimal(agent, source, dry_run=dry_run, backups_root=backups_root)
+    if source is None:
+        print("ADDON_GSTACK install=blocked reason=source_missing")
+        return _install_gstack_external_skills(
+            agent,
+            dry_run=dry_run,
+            backups_root=None if dry_run else backups_root,
+        )
+    return _run_gstack_full_install(agent, source, dry_run=dry_run, backups_root=backups_root)
 
 
 def _probe_env(probe: dict[str, Any]) -> dict[str, str] | None:
@@ -1090,7 +1551,10 @@ def _restore_from_manifest(path: Path) -> None:
                 else:
                     _copy_atomic(backup, target)
             elif target.exists() or target.is_symlink():
-                target.unlink()
+                if target.is_dir() and not target.is_symlink():
+                    shutil.rmtree(target)
+                else:
+                    target.unlink()
         elif rollback == "delete_link":
             if target.exists() or target.is_symlink():
                 target.unlink()
@@ -1285,6 +1749,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--controllers", help="comma-separated orchestrator destination ids")
     parser.add_argument("--workers", help="comma-separated worker destination ids")
     parser.add_argument("--addons", help="comma-separated add-on ids")
+    parser.add_argument(
+        "--gstack-install",
+        choices=sorted(GSTACK_INSTALL_CHOICES),
+        help="choice when the gstack add-on is selected but host skills are missing",
+    )
     parser.add_argument("--target-project", default=".", help="target project for project-local install destinations")
     parser.add_argument("--apply", action="store_true", help="perform approved writes")
     parser.add_argument("--yes", action="store_true", help="confirm writes for --apply")
@@ -1292,6 +1761,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--from-manifest", help="backup manifest created by --apply")
     parser.add_argument("--repo-root", default=str(REPO_ROOT), help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+    if args.gstack_install:
+        os.environ["GOALFLIGHT_GSTACK_INSTALL"] = args.gstack_install
     _expand_host_install_shortcuts(args)
 
     try:

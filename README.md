@@ -269,7 +269,10 @@ Review skills (recommended — the review gates lean on them):
   to local prompts at `prompts/gstack-claude-review.md` +
   `prompts/gstack-codex-challenge.md` (executor self-review still runs its seven-category
   pass). With gstack installed, you get consistent severity-ranking framing across both
-  review lenses on long runs.
+  review lenses on long runs. `/goal-flight init` offers to install just the subset
+  goal-flight uses — `/review`, `/plan-eng-review`, `/office-hours`, plus the community
+  skills `grill-me` and `thermo-nuclear-code-quality-review` downloaded from their
+  upstream repos — or the full pack, or neither.
 - **autoreview** — Complementary diff-local pre-commit pass (`protocols/chunk-review.md`,
   `./scripts/autoreview.sh`). Runs in parallel with gstack at chunk level when the
   orchestrator chooses; does **not** replace gstack as the default review path. Catches
