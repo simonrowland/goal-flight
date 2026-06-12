@@ -601,6 +601,18 @@ def cmd_watch(args: argparse.Namespace) -> int:
     return fleet_watch.cmd_watch_fleet(args)
 
 
+def cmd_ferry(args: argparse.Namespace) -> int:
+    import goalflight_fleet_ferry as fleet_ferry
+
+    return fleet_ferry.cmd_ferry(args)
+
+
+def cmd_salvage(args: argparse.Namespace) -> int:
+    import goalflight_fleet_ferry as fleet_ferry
+
+    return fleet_ferry.cmd_salvage(args)
+
+
 def _steering_actor(args: argparse.Namespace) -> dict:
     return {
         "controller_id": controller_id(),
@@ -757,6 +769,29 @@ def main(argv: list[str] | None = None) -> int:
     watch.add_argument("--dry-run", action="store_true", help="Skip real SSH (transport no-op fetch)")
     watch.add_argument("--json", action="store_true")
     watch.set_defaults(func=cmd_watch)
+
+    ferry = sub.add_parser("ferry", help="Fixed-envelope rsync ferry between controller and node")
+    ferry.add_argument("--node", required=True)
+    ferry.add_argument("--direction", choices=("pull", "push"), required=True)
+    ferry.add_argument("--src-root", required=True)
+    ferry.add_argument("--dst-root", required=True)
+    ferry.add_argument("--path", action="append", required=True, help="Relative file path under src root")
+    ferry.add_argument("--purpose", required=True, help="Receipt purpose label")
+    ferry.add_argument("--exec", action="store_true", help="Run rsync (default preview)")
+    ferry.add_argument("--json", action="store_true")
+    ferry.set_defaults(func=cmd_ferry)
+
+    salvage = sub.add_parser("salvage", help="Convergent-rsync salvage of a remote worktree")
+    salvage.add_argument("--node", required=True)
+    salvage.add_argument("--worktree-path", required=True)
+    salvage.add_argument("--out-dir", type=Path, required=True)
+    salvage.add_argument("--purpose", default="salvage")
+    salvage.add_argument("--append-only", action="append", default=None, help="Path/pattern excluded from convergence")
+    salvage.add_argument("--max-iterations", type=int, default=10)
+    salvage.add_argument("--sleep-s", type=float, default=1.0)
+    salvage.add_argument("--exec", action="store_true", help="Run SSH/rsync (default preview)")
+    salvage.add_argument("--json", action="store_true")
+    salvage.set_defaults(func=cmd_salvage)
 
     steering = sub.add_parser("steering")
     steering_sub = steering.add_subparsers(dest="steering_cmd", required=True)

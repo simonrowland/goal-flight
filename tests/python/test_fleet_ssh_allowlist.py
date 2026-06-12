@@ -24,6 +24,12 @@ def test_allowed_command_classes_build() -> None:
     assert_true("doctor argv", remote[1].endswith("goalflight_doctor.py"))
     git = ssh.build_remote_command("git_fetch", repo_root="/srv/goal-flight")
     assert_true("git fetch", git[:3] == ["git", "-C", "/srv/goal-flight"])
+    porcelain = ssh.build_remote_command(
+        "git_status_porcelain",
+        repo_root="/srv/goal-flight",
+        worktree_path="/srv/goal-flight-wt",
+    )
+    assert_true("git status porcelain", porcelain[:5] == ["git", "-C", "/srv/goal-flight-wt", "status", "--porcelain"])
     cleanup = ssh.build_remote_command("git_prune_claude_refs", repo_root="/srv/goal-flight")
     assert_true("cleanup python3", cleanup[0] == "python3")
     assert_true("cleanup helper", cleanup[1].endswith("goalflight_cleanup_dispatch_refs.py"))

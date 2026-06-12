@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import json
+import posixpath
 import re
 import shlex
 from dataclasses import dataclass
@@ -79,7 +81,9 @@ ALLOWED_COMMAND_CLASSES = frozenset(
         "git_prune_claude_refs",
         "acp_run",
         "launch_detached",
+        "ferry_preflight",
         "git_fetch",
+        "git_status_porcelain",
         "git_verify_commit",
         "git_checkout",
         "git_worktree_add",
@@ -153,6 +157,27 @@ def _require_repo_root(repo_root: str) -> str:
     if not repo_root or not isinstance(repo_root, str):
         raise SshAllowlistError("repo_root is required")
     return repo_root
+
+
+def _remote_norm(path: str) -> str:
+    raw = str(path or "").strip().replace("\\", "/").rstrip("/")
+    if not raw or "\n" in raw or "\r" in raw:
+        raise SshAllowlistError("remote path must be a non-empty single-line path")
+    return posixpath.normpath(re.sub(r"/+", "/", raw))
+
+
+def _remote_same_or_under(path: str, root: str) -> bool:
+    candidate = _remote_norm(path)
+    base = _remote_norm(root)
+    return candidate == base or candidate.startswith(base.rstrip("/") + "/")
+
+
+def _validate_declared_remote_path(path: str, roots: list[str], *, field: str) -> str:
+    candidate = _remote_norm(path)
+    declared = [_remote_norm(root) for root in roots if str(root or "").strip()]
+    if declared and not any(_remote_same_or_under(candidate, root) for root in declared):
+        raise SshAllowlistError(f"{field} must be under a declared remote root")
+    return candidate
 
 
 def build_remote_command(command_class: str, **params: Any) -> list[str]:
@@ -252,8 +277,36 @@ def build_remote_command(command_class: str, **params: Any) -> list[str]:
         if bool(params.get("recover_unconfirmed")):
             argv.append("--recover-unconfirmed")
         argv.extend(["--base-sha", base_sha])
+    elif command_class == "ferry_preflight":
+        payload = {
+            "root": str(params.get("root") or ""),
+            "files": list(params.get("files") or []),
+            "allowed_roots": list(params.get("allowed_roots") or []),
+        }
+        if not payload["root"] or not payload["files"] or not payload["allowed_roots"]:
+            raise SshAllowlistError("ferry_preflight requires root, files, and allowed_roots")
+        payload_b64 = base64.b64encode(json.dumps(payload, separators=(",", ":")).encode("utf-8")).decode("ascii")
+        argv = [
+            python,
+            f"{repo_root}/scripts/goalflight_fleet_ferry.py",
+            "remote-preflight",
+            "--payload-b64",
+            payload_b64,
+        ]
     elif command_class == "git_fetch":
         argv = ["git", "-C", repo_root, "fetch", "--quiet", "origin"]
+    elif command_class == "git_status_porcelain":
+        worktree_path = str(params.get("worktree_path") or repo_root)
+        if not worktree_path:
+            raise SshAllowlistError("git_status_porcelain requires worktree_path")
+        allowed_roots = list(params.get("allowed_roots") or [])
+        if allowed_roots:
+            worktree_path = _validate_declared_remote_path(
+                worktree_path,
+                allowed_roots,
+                field="git_status_porcelain worktree_path",
+            )
+        argv = ["git", "-C", worktree_path, "status", "--porcelain", "--untracked-files=all"]
     elif command_class == "git_verify_commit":
         sha = str(params.get("sha") or "").strip()
         if not sha:

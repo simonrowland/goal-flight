@@ -133,6 +133,30 @@ bin/goalflight core doctor read
 Action definitions live under `config/actions/`. Doctor reports router readiness
 via `check_router` in `goalflight_doctor.py`.
 
+## File transfer: ferry and salvage
+
+`goalflight_fleet.py ferry` moves files between the controller and a node through
+one envelope (explicit src/dst node+path, direction, purpose label recorded to the
+receipt); `goalflight_fleet.py salvage` recovers a crashed worker's dirty worktree
+by listing `git status --porcelain` over SSH, rsyncing only the dirty files into a
+local quarantine, and re-listing before each pass until the file set converges
+(divergence is reported as a liveness signal, not an error).
+
+**Credential safety.** Ferry refuses to transfer credential-shaped paths in either
+direction — auth state, private keys, token/secret files — matched on the path, its
+resolved target, and same-inode aliases, so a renamed, symlinked, or hardlinked
+credential is denied. Push transfers rsync from a controller-owned staged copy taken
+after the scan (so a post-scan swap on the live source cannot reach the wire); pull
+transfers quarantine received bytes and scan them — including bounded content
+signatures for private-key headers and provider auth-token JSON — before promoting.
+
+**Documented residual.** The transfer layer does not defend against a *compromised
+node*: a malicious process able to write unstructured credential bytes under an
+innocent name while racing a single transfer can still move them — but such a process
+can already read the credential directly, so the ferry is not the boundary in that
+case. Ferry defends against accidental at-rest credential transit on a trusted node,
+which is the fleet's threat model (each node runs its own operator's account).
+
 ## Live smoke test
 
 Hermetic CI skips live SSH. For operator verification:
