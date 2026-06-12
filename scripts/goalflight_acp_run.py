@@ -405,11 +405,26 @@ class _SigtermCancelBridge:
         self._installed = False
 
 
+def _dispatch_base_dir() -> Path:
+    import goalflight_dispatch
+
+    return goalflight_dispatch._dispatch_base_dir()
+
+
+def _default_status_json_path(dispatch_id: str) -> Path:
+    base = _dispatch_base_dir()
+    base.mkdir(parents=True, exist_ok=True)
+    return base / f"{status_filename_segment(dispatch_id)}.status.json"
+
+
+def _resolve_status_json_path(configured: str | None, dispatch_id: str) -> Path:
+    return Path(configured).expanduser() if configured else _default_status_json_path(dispatch_id)
+
+
 def _default_steer_file(dispatch_id: str) -> Path:
-    state_dir = Path(
-        os.environ.get("GOALFLIGHT_STATE_DIR", str(goalflight_compat.default_state_dir()))
-    ).expanduser()
-    return state_dir / "dispatch" / f"{dispatch_id}.steer.jsonl"
+    base = _dispatch_base_dir()
+    base.mkdir(parents=True, exist_ok=True)
+    return base / f"{dispatch_id}.steer.jsonl"
 
 
 def _resolve_steer_file(cfg: argparse.Namespace, dispatch_id: str) -> Path:
@@ -1024,15 +1039,8 @@ async def _run_acp_dispatch_impl(
             worktree_path = worktree_path_for_dispatch(project_root, dispatch_id)
         except Exception as e:
             worktree_error = f"{type(e).__name__}: {e}"
-    status_path = (
-        Path(cfg.status_json)
-        if cfg.status_json
-        else project_root / (
-            f".goalflight-{status_filename_segment(dispatch_id)}.status.json"
-            if worktree_error is not None
-            else f".goalflight-{dispatch_id}.status.json"
-        )
-    )
+    status_path = _resolve_status_json_path(getattr(cfg, "status_json", None), dispatch_id)
+    cfg.status_json = str(status_path)
     payload: dict = {
         "schema": "goalflight.acp-run.v1",
         "dispatch_id": dispatch_id,
@@ -1050,6 +1058,7 @@ async def _run_acp_dispatch_impl(
         "worktree_mode": worktree_mode,
         "planned_worktree_path": str(worktree_path) if worktree_path is not None else None,
         "worktree_path": None,
+        "status_path": str(status_path),
         "state": "starting",
         "ok": False,
         "worker_pid": None,
@@ -2428,11 +2437,8 @@ def acp_dispatch_exit_code(payload: dict) -> int:
 def write_windows_refusal_status(args: argparse.Namespace) -> tuple[dict, Path]:
     dispatch_id = args.dispatch_id or f"acp-{args.agent}-{uuid.uuid4().hex[:8]}"
     project_root = Path(args.cwd).resolve()
-    status_path = (
-        Path(args.status_json)
-        if args.status_json
-        else project_root / f".goalflight-{status_filename_segment(dispatch_id)}.status.json"
-    )
+    status_path = _resolve_status_json_path(getattr(args, "status_json", None), dispatch_id)
+    args.status_json = str(status_path)
     payload = {
         "schema": "goalflight.acp-run.v1",
         "dispatch_id": dispatch_id,

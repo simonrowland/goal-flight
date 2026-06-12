@@ -9,6 +9,8 @@ skip_posix_on_native_windows("exercises POSIX ACP worker process lifecycle")
 
 import asyncio
 import argparse
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -65,6 +67,10 @@ def _write_supported_adapter_manifest(directory: Path, name: str) -> None:
         },
         "invocation": {"exec": {"arg_policy": {"forbidden_args": []}}},
     }))
+
+
+def _cwd_goalflight_droppings(cwd: Path) -> list[str]:
+    return sorted(path.name for path in cwd.glob(".goalflight-*"))
 
 
 async def _connect(scenario: str, *, limit: str | None = None, drain_cap: str | None = None):
@@ -470,6 +476,111 @@ async def case_runner_blocks_missing_adapter_manifest() -> None:
     finally:
         goalflight_acp_run.agent_command = old_agent_command
         goalflight_adapter_readiness.ADAPTERS_DIR = old_adapters_dir
+
+
+def case_direct_default_status_uses_dispatch_state_dir() -> None:
+    old_agent_command = goalflight_acp_run.agent_command
+    old_adapters_dir = goalflight_adapter_readiness.ADAPTERS_DIR
+    old_state_dir = os.environ.get("GOALFLIGHT_STATE_DIR")
+    old_pidfile_dir = os.environ.get("GOAL_FLIGHT_PIDFILE_DIR")
+    goalflight_acp_run.agent_command = lambda agent, model=None: (sys.executable, [str(FAKE)])
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            worker_cwd = tmp_path / "worker"
+            worker_cwd.mkdir()
+            adapters_dir = tmp_path / "adapters"
+            adapters_dir.mkdir()
+            state_dir = tmp_path / "state"
+            goalflight_adapter_readiness.ADAPTERS_DIR = adapters_dir
+            os.environ["GOALFLIGHT_STATE_DIR"] = str(state_dir)
+            os.environ["GOAL_FLIGHT_PIDFILE_DIR"] = str(tmp_path / "pids")
+            dispatch_id = f"direct-default-{os.getpid()}"
+            expected_status = state_dir / "dispatch" / f"{dispatch_id}.status.json"
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                rc = goalflight_acp_run.main([
+                    "--agent", "missing-runner",
+                    "--cwd", str(worker_cwd),
+                    "--session-id", f"{dispatch_id}-session",
+                    "--dispatch-id", dispatch_id,
+                    "--prompt-text", "should not spawn",
+                    "--mode", "one-shot",
+                    "--idle-timeout", "0.2",
+                ])
+
+            status = json.loads(expected_status.read_text(encoding="utf-8"))
+            assert rc == 1, rc
+            assert status["state"] == "blocked_adapter_gate", status
+            assert status["status_path"] == str(expected_status), status
+            assert f"status={expected_status}" in stdout.getvalue(), stdout.getvalue()
+            assert _cwd_goalflight_droppings(worker_cwd) == [], _cwd_goalflight_droppings(worker_cwd)
+    finally:
+        goalflight_acp_run.agent_command = old_agent_command
+        goalflight_adapter_readiness.ADAPTERS_DIR = old_adapters_dir
+        if old_state_dir is None:
+            os.environ.pop("GOALFLIGHT_STATE_DIR", None)
+        else:
+            os.environ["GOALFLIGHT_STATE_DIR"] = old_state_dir
+        if old_pidfile_dir is None:
+            os.environ.pop("GOAL_FLIGHT_PIDFILE_DIR", None)
+        else:
+            os.environ["GOAL_FLIGHT_PIDFILE_DIR"] = old_pidfile_dir
+
+
+def case_direct_explicit_status_json_wins() -> None:
+    old_agent_command = goalflight_acp_run.agent_command
+    old_adapters_dir = goalflight_adapter_readiness.ADAPTERS_DIR
+    old_state_dir = os.environ.get("GOALFLIGHT_STATE_DIR")
+    old_pidfile_dir = os.environ.get("GOAL_FLIGHT_PIDFILE_DIR")
+    goalflight_acp_run.agent_command = lambda agent, model=None: (sys.executable, [str(FAKE)])
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            worker_cwd = tmp_path / "worker"
+            worker_cwd.mkdir()
+            adapters_dir = tmp_path / "adapters"
+            adapters_dir.mkdir()
+            state_dir = tmp_path / "state"
+            explicit_status = tmp_path / "explicit.status.json"
+            goalflight_adapter_readiness.ADAPTERS_DIR = adapters_dir
+            os.environ["GOALFLIGHT_STATE_DIR"] = str(state_dir)
+            os.environ["GOAL_FLIGHT_PIDFILE_DIR"] = str(tmp_path / "pids")
+            dispatch_id = f"direct-explicit-{os.getpid()}"
+            default_status = state_dir / "dispatch" / f"{dispatch_id}.status.json"
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                rc = goalflight_acp_run.main([
+                    "--agent", "missing-runner",
+                    "--cwd", str(worker_cwd),
+                    "--session-id", f"{dispatch_id}-session",
+                    "--dispatch-id", dispatch_id,
+                    "--prompt-text", "should not spawn",
+                    "--mode", "one-shot",
+                    "--idle-timeout", "0.2",
+                    "--status-json", str(explicit_status),
+                ])
+
+            status = json.loads(explicit_status.read_text(encoding="utf-8"))
+            assert rc == 1, rc
+            assert status["state"] == "blocked_adapter_gate", status
+            assert status["status_path"] == str(explicit_status), status
+            assert f"status={explicit_status}" in stdout.getvalue(), stdout.getvalue()
+            assert not default_status.exists(), default_status
+            assert _cwd_goalflight_droppings(worker_cwd) == [], _cwd_goalflight_droppings(worker_cwd)
+    finally:
+        goalflight_acp_run.agent_command = old_agent_command
+        goalflight_adapter_readiness.ADAPTERS_DIR = old_adapters_dir
+        if old_state_dir is None:
+            os.environ.pop("GOALFLIGHT_STATE_DIR", None)
+        else:
+            os.environ["GOALFLIGHT_STATE_DIR"] = old_state_dir
+        if old_pidfile_dir is None:
+            os.environ.pop("GOAL_FLIGHT_PIDFILE_DIR", None)
+        else:
+            os.environ["GOAL_FLIGHT_PIDFILE_DIR"] = old_pidfile_dir
 
 
 async def case_permission_auto_allow() -> None:
@@ -1539,6 +1650,8 @@ def main() -> None:
     case_permission_inline_cancel_answers_unit()
     case_activity_inline_hold_unit()
     case_pool_ceiling_fallback()
+    case_direct_default_status_uses_dispatch_state_dir()
+    case_direct_explicit_status_json_wins()
     asyncio.run(amain())
     print("OK: ACP SDK pipe tests pass")
 
