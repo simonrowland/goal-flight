@@ -3,6 +3,8 @@
 Refresh **goal-flight itself** + the worker CLIs it dispatches to. Two
 sweeps in one command: pull latest goal-flight from origin, then run each
 CLI's built-in update mechanism. Reports a diff table for both.
+Sweep 2 swaps worker binaries; its idle gate below protects those binary
+swaps specifically. Sweep 1 plugin pulls stay unchanged.
 
 Useful before starting a long unattended run (you want both fresh skill
 rules and fresh workers) or when triaging worker-side flakiness (might
@@ -127,9 +129,60 @@ unless the host skill path is a symlink; doctor JSON reports
    claude-code-cli-acp --version 2>&1 || npm list -g claude-code-cli-acp --depth=0
    ```
 
-3. Run each CLI's update command. Background-dispatch each — grok is
-   ~5s, codex / cursor-agent are ~10-30s, claude can be 60s+ on a fresh
-   build, claude-code-cli-acp depends on npm registry speed.
+3. Before each CLI update, run the idle preflight for that CLI. The helper
+   reads the dispatch ledger/status identity machinery under the active
+   `GOALFLIGHT_STATE_DIR`; it does not use `pgrep`. It counts only
+   genuinely live or genuinely ambiguous-but-possibly-live dispatches as
+   in-flight: reconciled `stale_*` rows and terminal rows do not block, while
+   unknown liveness still fails closed. Default behavior is fail-closed per
+   CLI: if any in-flight dispatch uses the binary about to be swapped, skip
+   that CLI's update and continue with unrelated CLIs.
+
+   ```bash
+   "$PY" "$GFROOT/scripts/goalflight_update_preflight.py" --check-idle --agent "$CLI" --json > "$LOGDIR/preflight-$CLI.json"
+   rc=$?
+   if [ "$rc" -ne 0 ]; then
+     ids="$("$PY" - "$LOGDIR/preflight-$CLI.json" <<'PY'
+import json, sys
+p = json.load(open(sys.argv[1], encoding="utf-8"))
+print(",".join(str(r.get("id") or "?") for r in p.get("live_dispatches", [])))
+PY
+)"
+     count="$("$PY" - "$LOGDIR/preflight-$CLI.json" <<'PY'
+import json, sys
+p = json.load(open(sys.argv[1], encoding="utf-8"))
+print(len(p.get("live_dispatches", [])))
+PY
+)"
+     emit "STATUS: $CLI update skipped — $count in-flight worker(s) use it ($ids); drain or pass --force"
+     # report this CLI as skipped-busy; do not run its updater.
+     continue
+   fi
+   ```
+
+   `--force` is the only opt-out. When the operator invokes
+   `/goal-flight update --force`, still run the preflight, but pass
+   `--force` through and emit a loud warning before the updater:
+
+   ```bash
+   "$PY" "$GFROOT/scripts/goalflight_update_preflight.py" --check-idle --agent "$CLI" --force --json > "$LOGDIR/preflight-$CLI.json"
+   emit "STATUS: $CLI update forced — operator accepts mixed-binary risk for in-flight workers"
+   ```
+
+   Per-CLI scopes:
+
+   | CLI being updated | Blocks when these worker labels are in-flight |
+   |---|---|
+   | codex | `codex`, `codex-acp` |
+   | grok | `grok`, `grok-code`, `grok-research`, `grok-acp` |
+   | cursor-agent | `cursor`, `cursor-agent` |
+   | claude | `claude`, `claude-acp` |
+   | claude-code-cli-acp | `claude`, `claude-acp` |
+
+4. Run each CLI's update command after its preflight passes or after
+   explicit `--force`. Background-dispatch each — grok is ~5s, codex /
+   cursor-agent are ~10-30s, claude can be 60s+ on a fresh build,
+   claude-code-cli-acp depends on npm registry speed.
 
    | CLI | Update command |
    |---|---|
@@ -139,9 +192,9 @@ unless the host skill path is a symlink; doctor JSON reports
    | claude | `claude update` |
    | claude-code-cli-acp | `npm update -g claude-code-cli-acp` |
 
-4. After each update completes, re-capture the version.
+5. After each update completes, re-capture the version.
 
-5. Re-run `goalflight_doctor.py --json` and verify the new versions
+6. Re-run `goalflight_doctor.py --json` and verify the new versions
    probe cleanly (e.g., grok daily-alpha sometimes ships a broken build —
    if `--version` now fails or ACP probe fails, flag in the report).
 
@@ -164,7 +217,8 @@ claude-code-cli-acp    <ver>               <ver>               unchanged
 
 Statuses per CLI: `updated` (version changed), `unchanged` (no new
 version), `failed` (update command returned non-zero — capture stderr in
-the report), `skipped` (CLI not present).
+the report), `skipped` (CLI not present), `skipped-busy` (idle preflight
+found in-flight workers using that CLI's binary).
 
 Plugin statuses: `updated` (HEAD or version changed), `unchanged` (no new
 commits), `skipped-dirty` (working tree had uncommitted changes),
@@ -181,11 +235,11 @@ HEAD).
   required. If you want one anyway, `ping -c 1 -W 2 1.1.1.1`,
   `nc -z -w 2 1.1.1.1 443`, or `curl -s -o /dev/null -w '%{http_code}' https://1.1.1.1`
   all work depending on what's installed.
-- **Don't run during an active dispatch**: a `codex exec` worker running
-  during a `codex update` might end up with mixed binaries. Drain
-  in-flight dispatches first (check
-  `python3 "$GFROOT/scripts/goalflight_status.py"`) or queue the
-  update for after.
+- **Worker CLI binary swaps are idle-gated**: a `codex exec` worker
+  running during a `codex update` might end up with mixed binaries. The
+  Sweep 2 preflight skips busy CLI updates by default. Drain in-flight
+  dispatches first, or pass `--force` only when the operator explicitly
+  accepts the mixed-binary risk.
 - **Plugin update is hot-swap-unsafe for the live session.** Loaded
   `SKILL.md` + protocols are cached in this conversation. After Sweep 1
   bumps the skill, the most reliable way to pick up the new rules is a
@@ -202,6 +256,6 @@ Markers per `protocols/worker-markers.md`:
   `STATUS: sweep-2 updating <N> CLIs in parallel`.
 - `RESULT: <subject> <before> → <after> (<status>)` — one line per
   item (plugin HEAD, plugin VERSION, each CLI).
-- `COMPLETE: plugin <status>; CLIs updated <N>, unchanged <M>, failed <K>, skipped <S>`.
+- `COMPLETE: plugin <status>; CLIs updated <N>, unchanged <M>, failed <K>, skipped <S>, skipped-busy <B>`.
 - `BLOCKED:` only on rebase conflicts, test failures on new HEAD, or no
   network at all.
