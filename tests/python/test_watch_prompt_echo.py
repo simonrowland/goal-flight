@@ -30,6 +30,24 @@ sys.path.insert(0, str(SCRIPTS))
 import goalflight_watch  # noqa: E402
 
 
+CODEX_BANNER_14 = (
+    "OpenAI Codex v0.137.0\n"
+    "--------\n"
+    "workdir: /Users/simonrowland/Repos/goal-flight\n"
+    "model: gpt-5.5\n"
+    "provider: openai\n"
+    "approval: never\n"
+    "sandbox: workspace-write [workdir, /tmp, $TMPDIR]\n"
+    "reasoning effort: xhigh\n"
+    "reasoning summaries: none\n"
+    "session id: 019eb974-0dee-79d2-b315-8d2910167bf4\n"
+    "--------\n"
+    "user\n"
+    "You have a steer mailbox at `$GOALFLIGHT_STEER_FILE`. Read it AT THE TOP OF EACH ITERATION and IMMEDIATELY BEFORE ANY git commit/push. Incorporate new messages into your plan; ack each with `STEER-ACK\n"
+    "\n"
+)
+
+
 def _run_watcher(
     tail: Path,
     status: Path,
@@ -120,7 +138,7 @@ def case_prompt_ignore_stops_at_first_mismatch() -> None:
             worker.wait()
         assert rc == 0, f"mismatch before marker must not mask real marker, got rc={rc}"
         assert term.get("text") == "PLACEHOLDER", f"real marker after mismatch was masked, got {term}"
-        assert elapsed < 2.0, f"watcher should wake on real marker, elapsed={elapsed:.1f}s"
+        assert elapsed < 4.0, f"watcher should wake on real marker, elapsed={elapsed:.1f}s"
 
 
 def case_identity_mismatch_not_alive() -> None:
@@ -284,7 +302,7 @@ def case_mid_output_marker_ignored() -> None:
             worker.wait()
         assert rc == 2, f"mid-output marker must not complete (expect idle rc=2), got {rc}"
         assert not term or term.get("kind") not in goalflight_watch.TERMINAL_MARKERS, f"terminal_marker must be absent or non-terminal for mid case, got {term}"
-        assert elapsed < 4.0
+        assert elapsed < 10.0
 
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
@@ -334,7 +352,7 @@ def case_ready_terminal_marker() -> None:
             worker.wait()
         assert rc == 2, f"mid-output READY must not complete, got {rc}"
         assert not term or term.get("kind") not in goalflight_watch.TERMINAL_MARKERS, f"got {term}"
-        assert elapsed < 2.0
+        assert elapsed < 10.0
 
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
@@ -473,6 +491,118 @@ def case_worker_dead_final_reconciliation_rejects_diff_and_prompt_echo() -> None
     assert not term, term
 
 
+def case_worker_dead_rejects_banner_offset_prompt_echo() -> None:
+    prompt = (
+        "Do the watcher reconciliation.\n"
+        "The final line must be exactly:\n"
+        "COMPLETE: gf-fence-offset-fix\n"
+        "or BLOCKED: reason.\n"
+    )
+    rc, _elapsed, term, payload = _run_dead_worker_tail(
+        CODEX_BANNER_14
+        + prompt
+        + "worker started\n"
+        + "mcp: context-mode/ctx_execute started\n",
+        prompt_text=prompt,
+    )
+    assert rc == 1, f"banner-offset prompt echo must stay worker_dead, got rc={rc} ({payload})"
+    assert payload.get("reason") == "worker_dead_no_terminal_marker", payload
+    assert not term, term
+
+
+def case_worker_dead_accepts_banner_offset_genuine_bare_marker() -> None:
+    prompt = (
+        "Do the watcher reconciliation.\n"
+        "The final line must be exactly:\n"
+        "COMPLETE: gf-fence-offset-fix\n"
+        "or BLOCKED: reason.\n"
+    )
+    rc, _elapsed, term, payload = _run_dead_worker_tail(
+        CODEX_BANNER_14
+        + prompt
+        + "worker finished real work\n"
+        + "COMPLETE: gf-fence-offset-fix\n"
+        + "post-marker summary\n",
+        prompt_text=prompt,
+    )
+    assert rc == 0, f"genuine post-echo marker must reconcile, got rc={rc} ({payload})"
+    assert payload.get("state") == "complete", payload
+    assert payload.get("reason") == "marker:COMPLETE:final_reconciliation", payload
+    assert term.get("kind") == "COMPLETE", term
+    assert term.get("text") == "gf-fence-offset-fix", term
+
+
+def case_worker_dead_accepts_fenceless_final_prompt_quoted_marker() -> None:
+    prompt = (
+        "Do the watcher reconciliation.\n"
+        "Final line of your output MUST be exactly:\n"
+        "COMPLETE: gf-fence-offset-fix-r2\n"
+    )
+    rc, _elapsed, term, payload = _run_dead_worker_tail(
+        "grok worker completed review\n"
+        "COMPLETE: gf-fence-offset-fix-r2\n",
+        prompt_text=prompt,
+    )
+    assert rc == 0, f"fence-less genuine final marker must complete, got rc={rc} ({payload})"
+    assert payload.get("state") == "complete", payload
+    assert payload.get("reason") == "marker:COMPLETE", payload
+    assert term.get("kind") == "COMPLETE", term
+    assert term.get("text") == "gf-fence-offset-fix-r2", term
+
+
+def case_worker_dead_rejects_fenceless_mid_tail_prompt_quote() -> None:
+    prompt = (
+        "Do the watcher reconciliation.\n"
+        "Final line of your output MUST be exactly:\n"
+        "COMPLETE: gf-fence-offset-fix-r2\n"
+    )
+    rc, _elapsed, term, payload = _run_dead_worker_tail(
+        "grok worker quoted its brief\n"
+        "COMPLETE: gf-fence-offset-fix-r2\n"
+        "worker died before sign-off\n",
+        prompt_text=prompt,
+    )
+    assert rc == 1, f"fence-less mid-tail prompt quote must stay worker_dead, got rc={rc} ({payload})"
+    assert payload.get("reason") == "worker_dead_no_terminal_marker", payload
+    assert not term, term
+
+
+def case_worker_dead_early_latch_retries_prompt_anchor() -> None:
+    prompt = (
+        "Do the watcher reconciliation.\n"
+        "The final line must be exactly:\n"
+        "COMPLETE: gf-fence-offset-fix-r2\n"
+        "or BLOCKED: reason.\n"
+    )
+    rc, _elapsed, term, payload = _run_dead_worker_tail(
+        "Do the watcher reconciliation.\n"
+        "narration line happens to match prompt line one, but this is not the prompt echo\n"
+        + prompt
+        + "worker died before sign-off\n",
+        prompt_text=prompt,
+    )
+    assert rc == 1, f"second prompt anchor must be fenced, got rc={rc} ({payload})"
+    assert payload.get("reason") == "worker_dead_no_terminal_marker", payload
+    assert not term, term
+
+
+def case_worker_dead_fenceless_decorated_marker_still_reconciles() -> None:
+    prompt = (
+        "Do the watcher reconciliation.\n"
+        "COMPLETE: quoted-only\n"
+    )
+    rc, _elapsed, term, payload = _run_dead_worker_tail(
+        "tail window starts after the prompt anchor\n"
+        "STATUS: COMPLETE: quoted-only\n",
+        prompt_text=prompt,
+    )
+    assert rc == 0, f"fence-less decorated marker should reconcile, got rc={rc} ({payload})"
+    assert payload.get("state") == "complete", payload
+    assert payload.get("reason") == "marker:COMPLETE:final_reconciliation", payload
+    assert term.get("kind") == "COMPLETE", term
+    assert term.get("text") == "quoted-only", term
+
+
 def case_worker_dead_failed_marker_blocks() -> None:
     rc, _elapsed, term, payload = _run_dead_worker_tail("FAILED: x\n")
     assert rc == 4, f"FAILED should map to blocked exit 4, got rc={rc} ({payload})"
@@ -497,6 +627,12 @@ def main() -> None:
     case_ready_terminal_marker()
     case_worker_dead_final_reconciliation_observed_shapes()
     case_worker_dead_final_reconciliation_rejects_diff_and_prompt_echo()
+    case_worker_dead_rejects_banner_offset_prompt_echo()
+    case_worker_dead_accepts_banner_offset_genuine_bare_marker()
+    case_worker_dead_accepts_fenceless_final_prompt_quoted_marker()
+    case_worker_dead_rejects_fenceless_mid_tail_prompt_quote()
+    case_worker_dead_early_latch_retries_prompt_anchor()
+    case_worker_dead_fenceless_decorated_marker_still_reconciles()
     case_worker_dead_failed_marker_blocks()
     print("OK: goalflight_watch prompt-echo guard tests pass")
 

@@ -79,6 +79,38 @@ run_dead_tail_case() {
   cleanup_pidfile "$PIDFILE_STEM"
 }
 
+run_pid_dead_grace_marker_case() {
+  local label="$1"
+  local tail="$2"
+  local prompt="$3"
+  local out="$4"
+  local marker="$5"
+  local expected="$6"
+
+  : > "$tail"
+  sleep 0.6 & WORKER_PID=$!
+  PIDFILE_STEM="$$.bashtail.${WORKER_PID}.jsonl"
+  (
+    sleep 1.2
+    {
+      echo "grok worker completed review"
+      echo "$marker"
+    } >> "$tail"
+  ) & APPENDER_PID=$!
+  bash "$WATCHER" \
+    --pid "$WORKER_PID" --tail "$tail" \
+    --controller-pid "$$" --agent test-bashtail \
+    --session-id "$label" \
+    --ignore-prompt-file "$prompt" \
+    --poll-secs 1 --max-idle-secs 30 \
+    > "$out" 2>&1
+  watcher_exit=$?
+  wait "$WORKER_PID" 2>/dev/null
+  wait "$APPENDER_PID" 2>/dev/null
+  expect_eq "$label exit code" "$expected" "$watcher_exit"
+  cleanup_pidfile "$PIDFILE_STEM"
+}
+
 # Spawn workers directly in the test shell (NOT in a subshell via `$(spawn_fn)`
 # — that kills the child when the subshell exits). Plain background, capture
 # $! from the same shell scope.
@@ -271,6 +303,137 @@ EOF
   echo "worker died before sign-off"
 } > "$TAIL"
 run_dead_tail_case "case-1g dead reconcile rejects prompt echo" "$TAIL" "$PROMPT" "$OUT" "1"
+rm -f "$TAIL" "$PROMPT" "$OUT"
+
+# ---- Case 1g1: codex banner before prompt echo is still fenced on worker-dead reconciliation ----
+TAIL=/tmp/test-watch-dead-reconcile-banner-offset-$$.txt
+PROMPT=/tmp/test-watch-dead-reconcile-banner-offset-$$.prompt
+OUT=/tmp/watcher-out-dead-reconcile-banner-offset-$$.txt
+cat > "$PROMPT" <<'EOF'
+Do the watcher reconciliation.
+The final line must be exactly:
+COMPLETE: gf-fence-offset-fix
+or BLOCKED: reason.
+EOF
+{
+  cat <<'EOF'
+OpenAI Codex v0.137.0
+--------
+workdir: /Users/simonrowland/Repos/goal-flight
+model: gpt-5.5
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: xhigh
+reasoning summaries: none
+session id: 019eb974-0dee-79d2-b315-8d2910167bf4
+--------
+user
+You have a steer mailbox at `$GOALFLIGHT_STEER_FILE`. Read it AT THE TOP OF EACH ITERATION and IMMEDIATELY BEFORE ANY git commit/push. Incorporate new messages into your plan; ack each with `STEER-ACK
+
+EOF
+  cat "$PROMPT"
+  cat <<'EOF'
+worker started
+mcp: context-mode/ctx_execute started
+EOF
+} > "$TAIL"
+run_dead_tail_case "case-1g1 dead reconcile rejects banner-offset prompt echo" "$TAIL" "$PROMPT" "$OUT" "1"
+rm -f "$TAIL" "$PROMPT" "$OUT"
+
+# ---- Case 1g2: codex banner + echo + genuine bare COMPLETE after work reconciles ----
+TAIL=/tmp/test-watch-dead-reconcile-banner-genuine-$$.txt
+PROMPT=/tmp/test-watch-dead-reconcile-banner-genuine-$$.prompt
+OUT=/tmp/watcher-out-dead-reconcile-banner-genuine-$$.txt
+cat > "$PROMPT" <<'EOF'
+Do the watcher reconciliation.
+The final line must be exactly:
+COMPLETE: gf-fence-offset-fix
+or BLOCKED: reason.
+EOF
+{
+  cat <<'EOF'
+OpenAI Codex v0.137.0
+--------
+workdir: /Users/simonrowland/Repos/goal-flight
+model: gpt-5.5
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: xhigh
+reasoning summaries: none
+session id: 019eb974-0dee-79d2-b315-8d2910167bf4
+--------
+user
+You have a steer mailbox at `$GOALFLIGHT_STEER_FILE`. Read it AT THE TOP OF EACH ITERATION and IMMEDIATELY BEFORE ANY git commit/push. Incorporate new messages into your plan; ack each with `STEER-ACK
+
+EOF
+  cat "$PROMPT"
+  cat <<'EOF'
+worker finished real work
+COMPLETE: gf-fence-offset-fix
+post-marker summary
+EOF
+} > "$TAIL"
+run_dead_tail_case "case-1g2 dead reconcile accepts banner-offset genuine COMPLETE" "$TAIL" "$PROMPT" "$OUT" "0"
+rm -f "$TAIL" "$PROMPT" "$OUT"
+
+# ---- Case 1g3: pid-dead grace accepts genuine final marker even when prompt quotes it ----
+TAIL=/tmp/test-watch-dead-grace-fenceless-final-$$.txt
+PROMPT=/tmp/test-watch-dead-grace-fenceless-final-$$.prompt
+OUT=/tmp/watcher-out-dead-grace-fenceless-final-$$.txt
+cat > "$PROMPT" <<'EOF'
+Do the watcher reconciliation.
+Final line of your output MUST be exactly:
+COMPLETE: gf-fence-offset-fix-r2
+EOF
+run_pid_dead_grace_marker_case "case-1g3 pid-dead grace accepts fenceless final COMPLETE" "$TAIL" "$PROMPT" "$OUT" "COMPLETE: gf-fence-offset-fix-r2" "0"
+rm -f "$TAIL" "$PROMPT" "$OUT"
+
+# ---- Case 1g4: early narration equal to prompt line 1 does not leave the real echo unfenced ----
+TAIL=/tmp/test-watch-dead-reconcile-early-latch-$$.txt
+PROMPT=/tmp/test-watch-dead-reconcile-early-latch-$$.prompt
+OUT=/tmp/watcher-out-dead-reconcile-early-latch-$$.txt
+cat > "$PROMPT" <<'EOF'
+Do the watcher reconciliation.
+The final line must be exactly:
+COMPLETE: gf-fence-offset-fix-r2
+or BLOCKED: reason.
+EOF
+{
+  echo "Do the watcher reconciliation."
+  echo "narration line happens to match prompt line one, but this is not the prompt echo"
+  cat "$PROMPT"
+  echo "worker died before sign-off"
+} > "$TAIL"
+run_dead_tail_case "case-1g4 dead reconcile retries second prompt anchor" "$TAIL" "$PROMPT" "$OUT" "1"
+rm -f "$TAIL" "$PROMPT" "$OUT"
+
+# ---- Case 1g5: fence-less prompt-quoted bare marker stays fail-safe, decorated marker reconciles ----
+PROMPT=/tmp/test-watch-dead-reconcile-fenceless-$$.prompt
+cat > "$PROMPT" <<'EOF'
+Do the watcher reconciliation.
+COMPLETE: quoted-only
+EOF
+
+TAIL=/tmp/test-watch-dead-reconcile-fenceless-bare-$$.txt
+OUT=/tmp/watcher-out-dead-reconcile-fenceless-bare-$$.txt
+cat > "$TAIL" <<'EOF'
+tail window starts after the prompt anchor
+COMPLETE: quoted-only
+worker died before sign-off
+EOF
+run_dead_tail_case "case-1g5 dead reconcile rejects fenceless prompt quote" "$TAIL" "$PROMPT" "$OUT" "1"
+rm -f "$TAIL" "$OUT"
+
+TAIL=/tmp/test-watch-dead-reconcile-fenceless-decorated-$$.txt
+OUT=/tmp/watcher-out-dead-reconcile-fenceless-decorated-$$.txt
+cat > "$TAIL" <<'EOF'
+tail window starts after the prompt anchor
+STATUS: COMPLETE: quoted-only
+worker died after decorated sign-off
+EOF
+run_dead_tail_case "case-1g6 dead reconcile accepts fenceless decorated marker" "$TAIL" "$PROMPT" "$OUT" "0"
 rm -f "$TAIL" "$PROMPT" "$OUT"
 
 # ---- Case 1h: diff-ish raw lines are not terminal sign-offs ----

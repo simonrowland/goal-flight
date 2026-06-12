@@ -386,6 +386,7 @@ def _repair_watcher_terminal_status(
         terminal_marker = _final_terminal_marker(
             tail,
             ignore_prefix_lines=ignore_prefix_lines,
+            suppress_unfenced_prompt_markers=True,
         )
     if not terminal_marker:
         terminal_marker = payload.get("terminal_marker")

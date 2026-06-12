@@ -253,20 +253,58 @@ tail = pathlib.Path(sys.argv[1])
 prompt = pathlib.Path(sys.argv[2])
 marker_re = re.compile(sys.argv[3])
 prompt_lines = [line.strip() for line in prompt.read_text(encoding="utf-8", errors="replace").splitlines()]
+anchor_search_lines = 200
+
+def prompt_echo_scan(lines: list[str], prompt_prefix: list[str]):
+    prompt_line_set = {line for line in prompt_prefix if line}
+    first_prompt_idx = None
+    for idx, line in enumerate(prompt_prefix):
+        if line:
+            first_prompt_idx = idx
+            break
+    if first_prompt_idx is None:
+        return set(), False, prompt_line_set
+    first_prompt_line = prompt_prefix[first_prompt_idx]
+    matched_single_lines = []
+    matched_multi_lines = []
+    for idx, line in enumerate(lines[:anchor_search_lines]):
+        if line.strip() != first_prompt_line:
+            continue
+        prompt_idx = first_prompt_idx
+        line_idx = idx
+        span = []
+        while line_idx < len(lines) and prompt_idx < len(prompt_prefix):
+            if lines[line_idx].strip() != prompt_prefix[prompt_idx]:
+                break
+            span.append(line_idx)
+            line_idx += 1
+            prompt_idx += 1
+        if len(span) > 1:
+            matched_multi_lines.extend(span)
+        elif span:
+            matched_single_lines.extend(span)
+    if matched_multi_lines:
+        # Multi-line sequential match = a real echo block; single-line
+        # lookalikes are fenced but do NOT count as a located anchor, so the
+        # fence-less verbatim-quote suppression stays armed (a one-line
+        # coincidence must not unlock reconciliation trust elsewhere).
+        return set(matched_multi_lines) | set(matched_single_lines), True, prompt_line_set
+    if matched_single_lines:
+        return set(matched_single_lines), False, prompt_line_set
+    return set(), False, prompt_line_set
+
 size = tail.stat().st_size
 start = max(0, size - 10 * 1024 * 1024)
 text = tail.read_bytes()[start:].decode(errors="replace")
-can_ignore = start == 0 and bool(prompt_lines)
+lines = text.splitlines()
+prompt_echo_lines, _echo_anchor_found, _prompt_line_set = prompt_echo_scan(lines, prompt_lines)
 in_fence = False
 last_nonempty = ""
 last_in_fence = False
-for idx, line in enumerate(text.splitlines(), start=1):
+for idx, line in enumerate(lines):
     stripped = line.strip()
-    if can_ignore:
-        expected = prompt_lines[idx - 1] if idx <= len(prompt_lines) else None
-        if expected is not None and stripped == expected:
-            continue
-        can_ignore = False
+    if idx in prompt_echo_lines:
+        continue
     lstrip = line.lstrip()
     if lstrip.startswith("```") or lstrip.startswith("~~~"):
         in_fence = not in_fence
@@ -282,7 +320,9 @@ for idx, line in enumerate(text.splitlines(), start=1):
     if stripped:
         last_nonempty = stripped
         last_in_fence = False
-raise SystemExit(0 if last_nonempty and not last_in_fence and marker_re.search(last_nonempty) else 1)
+if last_nonempty and not last_in_fence and marker_re.search(last_nonempty):
+    raise SystemExit(0)
+raise SystemExit(1)
 PY
     return $?
   fi
@@ -307,7 +347,9 @@ marker_re = re.compile(
     r"^(?:-\s+)?`?\**(?:STATUS:\s*)?"
     r"(RESULT|USER-NEED|USER-CONFIRM|BLOCKED|FAILED|COMPLETE|READY):(.*)$"
 )
+bare_marker_re = re.compile(r"^(RESULT|USER-NEED|USER-CONFIRM|BLOCKED|FAILED|COMPLETE|READY):\s*.*$")
 hunk_header_re = re.compile(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@")
+anchor_search_lines = 200
 
 def diff_context(raw_line: str) -> bool:
     return raw_line.startswith((" ", "\t", "+")) or (raw_line.startswith("-") and not raw_line.startswith("- "))
@@ -320,20 +362,59 @@ def strip_decoration(text: str) -> str:
         value = value[:-1].rstrip()
     return value
 
+def prompt_echo_scan(lines: list[str], prompt_prefix: list[str]):
+    prompt_line_set = {line for line in prompt_prefix if line}
+    first_prompt_idx = None
+    for idx, line in enumerate(prompt_prefix):
+        if line:
+            first_prompt_idx = idx
+            break
+    if first_prompt_idx is None:
+        return set(), False, prompt_line_set
+    first_prompt_line = prompt_prefix[first_prompt_idx]
+    matched_single_lines = []
+    matched_multi_lines = []
+    for idx, line in enumerate(lines[:anchor_search_lines]):
+        if line.strip() != first_prompt_line:
+            continue
+        prompt_idx = first_prompt_idx
+        line_idx = idx
+        span = []
+        while line_idx < len(lines) and prompt_idx < len(prompt_prefix):
+            if lines[line_idx].strip() != prompt_prefix[prompt_idx]:
+                break
+            span.append(line_idx)
+            line_idx += 1
+            prompt_idx += 1
+        if len(span) > 1:
+            matched_multi_lines.extend(span)
+        elif span:
+            matched_single_lines.extend(span)
+    if matched_multi_lines:
+        # Multi-line sequential match = a real echo block; single-line
+        # lookalikes are fenced but do NOT count as a located anchor, so the
+        # fence-less verbatim-quote suppression stays armed (a one-line
+        # coincidence must not unlock reconciliation trust elsewhere).
+        return set(matched_multi_lines) | set(matched_single_lines), True, prompt_line_set
+    if matched_single_lines:
+        return set(matched_single_lines), False, prompt_line_set
+    return set(), False, prompt_line_set
+
+def unfenced_prompt_quoted_bare_marker(stripped: str, prompt_line_set: set[str], echo_anchor_found: bool) -> bool:
+    return not echo_anchor_found and stripped in prompt_line_set and bool(bare_marker_re.match(stripped))
+
 size = tail.stat().st_size
 start = max(0, size - 10 * 1024 * 1024)
 text = tail.read_bytes()[start:].decode(errors="replace")
-can_ignore = start == 0 and bool(prompt_lines)
+lines = text.splitlines()
+prompt_echo_lines, echo_anchor_found, prompt_line_set = prompt_echo_scan(lines, prompt_lines)
 in_fence = False
 in_hunk = False
 terminal = None
-for idx, line in enumerate(text.splitlines(), start=1):
+for idx, line in enumerate(lines, start=1):
     stripped = line.strip()
-    if can_ignore:
-        expected = prompt_lines[idx - 1] if idx <= len(prompt_lines) else None
-        if expected is not None and stripped == expected:
-            continue
-        can_ignore = False
+    if idx - 1 in prompt_echo_lines:
+        continue
     lstrip = line.lstrip()
     if lstrip.startswith("```") or lstrip.startswith("~~~"):
         in_fence = not in_fence
@@ -351,6 +432,8 @@ for idx, line in enumerate(text.splitlines(), start=1):
         continue
     match = marker_re.match(stripped)
     if match:
+        if unfenced_prompt_quoted_bare_marker(stripped, prompt_line_set, echo_anchor_found):
+            continue
         terminal = (idx, match.group(1), strip_decoration(match.group(2))[:1000])
 if terminal:
     print(f"{terminal[0]}:{terminal[1]}:{terminal[2]}")

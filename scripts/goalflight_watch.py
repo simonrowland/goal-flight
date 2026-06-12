@@ -39,8 +39,10 @@ FINAL_TERMINAL_MARKER_RE = re.compile(
     r"^(?:-\s+)?`?\**(?:STATUS:\s*)?"
     r"(RESULT|USER-NEED|USER-CONFIRM|BLOCKED|FAILED|COMPLETE|READY):(.*)$"
 )
+BARE_TERMINAL_MARKER_RE = re.compile(r"^(RESULT|USER-NEED|USER-CONFIRM|BLOCKED|FAILED|COMPLETE|READY):\s*.*$")
 HUNK_HEADER_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@")
 TERMINAL_MARKERS = {"RESULT", "USER-NEED", "USER-CONFIRM", "BLOCKED", "COMPLETE", "READY"}
+PROMPT_ECHO_ANCHOR_SEARCH_LINES = 200
 # CPU-sampling-failure grace (codex 2026-05-20 P2): require this many consecutive
 # `wedged` polls before exiting with idle_timeout, so a single transient `ps`
 # failure (cpu→None→wedged for one poll) can't false-positive a healthy worker.
@@ -98,6 +100,62 @@ def _final_terminal_marker_from_line(raw_line: str, line_no: int) -> dict | None
         "kind": match.group(1),
         "text": _strip_marker_decoration(match.group(2))[:1000],
     }
+
+
+def _prompt_echo_scan(lines: list[str], prompt_prefix: list[str]) -> tuple[set[int], bool, set[str]]:
+    prompt_line_set = {line for line in prompt_prefix if line}
+    first_prompt_idx = None
+    for idx, line in enumerate(prompt_prefix):
+        if line:
+            first_prompt_idx = idx
+            break
+    if first_prompt_idx is None:
+        return set(), False, prompt_line_set
+
+    first_prompt_line = prompt_prefix[first_prompt_idx]
+    anchor_limit = min(len(lines), PROMPT_ECHO_ANCHOR_SEARCH_LINES)
+    matched_single_lines: list[int] = []
+    matched_multi_lines: list[int] = []
+    for idx in range(anchor_limit):
+        if lines[idx].strip() != first_prompt_line:
+            continue
+        prompt_idx = first_prompt_idx
+        line_idx = idx
+        span: list[int] = []
+        while line_idx < len(lines) and prompt_idx < len(prompt_prefix):
+            if lines[line_idx].strip() != prompt_prefix[prompt_idx]:
+                break
+            span.append(line_idx)
+            line_idx += 1
+            prompt_idx += 1
+        if len(span) > 1:
+            matched_multi_lines.extend(span)
+        elif span:
+            matched_single_lines.extend(span)
+    if matched_multi_lines:
+        # Multi-line sequential match = a real echo block; single-line
+        # lookalikes are fenced but do NOT count as a located anchor, so the
+        # fence-less verbatim-quote suppression stays armed (a one-line
+        # coincidence must not unlock reconciliation trust elsewhere).
+        return set(matched_multi_lines) | set(matched_single_lines), True, prompt_line_set
+    if matched_single_lines:
+        return set(matched_single_lines), False, prompt_line_set
+    return set(), False, prompt_line_set
+
+
+def _is_unfenced_prompt_quoted_bare_marker(
+    stripped: str,
+    *,
+    prompt_line_set: set[str],
+    echo_anchor_found: bool,
+    suppress_unfenced_prompt_markers: bool,
+) -> bool:
+    return bool(
+        suppress_unfenced_prompt_markers
+        and not echo_anchor_found
+        and stripped in prompt_line_set
+        and BARE_TERMINAL_MARKER_RE.match(stripped)
+    )
 
 
 def alive(pid: int | None) -> bool:
@@ -193,21 +251,19 @@ def extract_markers(path: Path, max_bytes: int = 10 * 1024 * 1024,
     size = path.stat().st_size
     start = max(0, size - max_bytes)
     prompt_prefix = ignore_prefix_lines or []
-    can_ignore_prefix = start == 0 and bool(prompt_prefix)
     markers: list[dict] = []
     in_fence = False
     with path.open("rb") as f:
         f.seek(start)
         text = f.read().decode(errors="replace")
-    for idx, line in enumerate(text.splitlines(), start=1):
+    lines = text.splitlines()
+    prompt_echo_lines, _echo_anchor_found, _prompt_line_set = _prompt_echo_scan(lines, prompt_prefix)
+    for idx, line in enumerate(lines, start=1):
         stripped = line.strip()
         # Skip only the initial echoed-prompt span. If the worker later emits a
         # byte-identical real terminal marker, it must still wake the orchestrator.
-        if can_ignore_prefix:
-            expected = prompt_prefix[idx - 1] if idx <= len(prompt_prefix) else None
-            if expected is not None and stripped == expected:
-                continue
-            can_ignore_prefix = False
+        if idx - 1 in prompt_echo_lines:
+            continue
         # Fence skip (hardening): do not match markers inside ``` or ~~~ blocks.
         # Worker output containing example marker vocab in code fences must not inject terminals.
         lstrip = line.lstrip()
@@ -222,7 +278,10 @@ def extract_markers(path: Path, max_bytes: int = 10 * 1024 * 1024,
     return markers, size
 
 
-def _last_line_is_terminal_marker(path: Path, ignore_prefix_lines: list[str] | None = None) -> dict | None:
+def _last_line_is_terminal_marker(
+    path: Path,
+    ignore_prefix_lines: list[str] | None = None,
+) -> dict | None:
     """Return a terminal marker dict iff the *last non-empty line* of the tail
     (after prefix-echo ignore and skipping inside code fences) matches a
     terminal marker kind. This is the only trustworthy position; mid-output
@@ -233,21 +292,19 @@ def _last_line_is_terminal_marker(path: Path, ignore_prefix_lines: list[str] | N
     size = path.stat().st_size
     start = max(0, size - 10 * 1024 * 1024)
     prompt_prefix = ignore_prefix_lines or []
-    can_ignore_prefix = start == 0 and bool(prompt_prefix)
     in_fence = False
     last_nonempty = ""
     last_in_fence = False
     with path.open("rb") as f:
         f.seek(start)
         text = f.read().decode(errors="replace")
-    for idx, line in enumerate(text.splitlines(), start=1):
+    lines = text.splitlines()
+    prompt_echo_lines, _echo_anchor_found, _prompt_line_set = _prompt_echo_scan(lines, prompt_prefix)
+    for idx, line in enumerate(lines, start=1):
         stripped = line.strip()
-        if can_ignore_prefix:
-            expected = prompt_prefix[idx - 1] if idx <= len(prompt_prefix) else None
-            if expected is not None and stripped == expected:
-                # prefix echo line (even if looks like marker): do not use for last_nonempty terminal decision
-                continue
-            can_ignore_prefix = False
+        if idx - 1 in prompt_echo_lines:
+            # prompt echo line (even if looks like marker): do not use for last_nonempty terminal decision
+            continue
         lstrip = line.lstrip()
         fence_line = lstrip.startswith("```") or lstrip.startswith("~~~")
         if fence_line:
@@ -272,7 +329,12 @@ def _last_line_is_terminal_marker(path: Path, ignore_prefix_lines: list[str] | N
     return None
 
 
-def _final_terminal_marker(path: Path, ignore_prefix_lines: list[str] | None = None) -> dict | None:
+def _final_terminal_marker(
+    path: Path,
+    ignore_prefix_lines: list[str] | None = None,
+    *,
+    suppress_unfenced_prompt_markers: bool = True,
+) -> dict | None:
     """Return the last terminal marker anywhere in the completed post-prompt tail.
 
     Live detection remains last-line-only. This reconciliation scan is for the
@@ -283,20 +345,18 @@ def _final_terminal_marker(path: Path, ignore_prefix_lines: list[str] | None = N
     size = path.stat().st_size
     start = max(0, size - 10 * 1024 * 1024)
     prompt_prefix = ignore_prefix_lines or []
-    can_ignore_prefix = start == 0 and bool(prompt_prefix)
     in_fence = False
     in_hunk = False
     terminal: dict | None = None
     with path.open("rb") as f:
         f.seek(start)
         text = f.read().decode(errors="replace")
-    for idx, line in enumerate(text.splitlines(), start=1):
+    lines = text.splitlines()
+    prompt_echo_lines, echo_anchor_found, prompt_line_set = _prompt_echo_scan(lines, prompt_prefix)
+    for idx, line in enumerate(lines, start=1):
         stripped = line.strip()
-        if can_ignore_prefix:
-            expected = prompt_prefix[idx - 1] if idx <= len(prompt_prefix) else None
-            if expected is not None and stripped == expected:
-                continue
-            can_ignore_prefix = False
+        if idx - 1 in prompt_echo_lines:
+            continue
         lstrip = line.lstrip()
         if lstrip.startswith("```") or lstrip.startswith("~~~"):
             in_fence = not in_fence
@@ -312,6 +372,13 @@ def _final_terminal_marker(path: Path, ignore_prefix_lines: list[str] | None = N
             continue
         candidate = _final_terminal_marker_from_line(line, idx)
         if candidate:
+            if _is_unfenced_prompt_quoted_bare_marker(
+                stripped,
+                prompt_line_set=prompt_line_set,
+                echo_anchor_found=echo_anchor_found,
+                suppress_unfenced_prompt_markers=suppress_unfenced_prompt_markers,
+            ):
+                continue
             terminal = candidate
     return terminal
 
