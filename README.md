@@ -62,33 +62,32 @@ optionally builds a RAG corpus so workers stop re-reading the same project lands
 leave init knowing which agents are available and healthy.
 (`/goal-flight doctor` re-checks all of it any time.)
 
-**2. Capture the requirements.**
+**2. Build the requirements document.**
 
 ```
 /goal-flight ask-questions
 ```
 
-Anticipatory subagents read your repo and goal statement, then surface the few clarifying
-questions actually worth your time — product choices and trade-offs, not trivia the code
-already answers. Your chat answers are treated as requirements and folded into the goal
-files: ten minutes of conversation becomes durable project state that survives compaction.
-The phase exits with the goal file's **north star** settled — the durable statement of
-what the project must do, drafted at init and refined here — and later architecture calls
-and reviews are tested against it.
+Anticipatory subagents read your repo and goal statement, then interview you on the
+product choices and trade-offs the code can't answer — not trivia it can. Your answers
+land in the goal file as it grows into the project's requirements document: the **north
+star** (the durable statement of what the project must do), the validated premises, and
+the open questions. Every later architecture call and review is tested against this file,
+and it survives compaction.
 
-**3. Iterate on the architecture.**
+**3. Build the architecture document.**
 
 ```
 /goal-flight decompose-plan [<plan>]
 ```
 
-Show up with whatever signal you have — a written plan, an architecture doc, or just the
-conversation so far. Decompose-plan breaks it into closed chunks (SCOPE / CHECKLIST /
-ACCEPTANCE / FORBIDDEN), flags what can run in parallel, and runs a reviewer pass over the
-decomposition itself — so the plan gets adversarial scrutiny *before* any code is written.
-Disagree with a chunk? Say so in chat; mid-session steering is requirements input, and the
-plan revises. (With [gstack](https://github.com/garrytan/gstack) installed, `/office-hours`
-and `/plan-eng-review` add structured interrogation at this step.)
+Bring whatever signal you have — a written plan, an architecture doc, or the conversation
+so far — and work it into an architecture the run can execute: closed chunks (SCOPE /
+CHECKLIST / ACCEPTANCE / FORBIDDEN) with parallelism flagged, plus a reviewer pass over
+the decomposition itself, so the design gets adversarial scrutiny *before* any code is
+written. Disagree with a chunk? Say so in chat; mid-session steering is requirements
+input, and the plan revises. (With [gstack](https://github.com/garrytan/gstack) installed,
+`/office-hours` and `/plan-eng-review` add structured interrogation at this step.)
 
 **4. Dispatch the work.**
 
