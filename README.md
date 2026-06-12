@@ -44,7 +44,7 @@ commands are under [Host install notes](#host-install-notes).)
 
 Primary platform is macOS. Linux hosts work too ([docs/hosts/linux.md](docs/hosts/linux.md));
 the macOS-only OS-sandbox backstop is absent there, so workers rely on their own sandbox
-and approval policies. Native Windows is read/plan only — see [Windows](#windows).
+and approval policies. Full Windows support requires WSL — see [Windows](#windows).
 
 Restart the host, then open your project repo in an orchestrator session. From here the
 flow is four moves:
