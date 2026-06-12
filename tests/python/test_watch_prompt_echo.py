@@ -16,6 +16,7 @@ from support import skip_posix_on_native_windows
 skip_posix_on_native_windows("watch prompt echo uses bash-tail and start_new_session")
 
 import json
+import gzip
 import subprocess
 import sys
 import tempfile
@@ -25,6 +26,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = ROOT / "scripts"
 WATCH = ROOT / "scripts" / "goalflight_watch.py"
+ROUND4_EVIDENCE = ROOT / "docs-private" / "research" / "gf-bug-watcher-round4"
+PUBLIC_ROUND4_FIXTURES = ROOT / "tests" / "fixtures" / "watch_prompt_echo"
 sys.path.insert(0, str(SCRIPTS))
 
 import goalflight_watch  # noqa: E402
@@ -612,6 +615,182 @@ def case_worker_dead_failed_marker_blocks() -> None:
     assert term.get("text") == "x", term
 
 
+def _prompt_lines(path: Path) -> list[str]:
+    return [
+        line.strip()
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines()
+    ]
+
+
+def case_round4_public_trimmed_tail_final_marker_wins() -> None:
+    prompt_path = PUBLIC_ROUND4_FIXTURES / "round4-trimmed-assembled.prompt"
+    tail_path = PUBLIC_ROUND4_FIXTURES / "round4-trimmed-tail.txt"
+    expected = "public-watch-round4"
+
+    prompt_lines = _prompt_lines(prompt_path)
+    tail_text = tail_path.read_text(encoding="utf-8", errors="replace")
+    tail_lines = tail_text.splitlines()
+    final_line = len(tail_lines)
+    echo_marker_line = next(
+        idx for idx, line in enumerate(tail_lines, start=1)
+        if line == f"COMPLETE: {expected}"
+    )
+
+    assert prompt_lines[0] == "You have a steer mailbox at `$GOALFLIGHT_STEER_FILE`."
+    assert tail_lines[3] == "Brief task: inspect sanitized watcher output."
+    assert prompt_lines[0] != tail_lines[3]
+    assert sum(1 for line in tail_lines if line.strip() == "```") == 1
+    assert tail_lines[-1] == f"COMPLETE: {expected}"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tail = Path(tmp) / "tail.txt"
+        tail.write_text(tail_text, encoding="utf-8")
+        prompt_echo_lines, echo_anchor_found, _ = goalflight_watch._prompt_echo_scan(
+            tail_lines,
+            prompt_lines,
+        )
+        last = goalflight_watch._last_line_is_terminal_marker(tail, ignore_prefix_lines=prompt_lines)
+        final = goalflight_watch._final_terminal_marker(tail, ignore_prefix_lines=prompt_lines)
+        markers, _size = goalflight_watch.extract_markers(tail, ignore_prefix_lines=prompt_lines)
+
+    assert echo_anchor_found is True
+    assert echo_marker_line - 1 in prompt_echo_lines, prompt_echo_lines
+    assert last == {"line": final_line, "kind": "COMPLETE", "text": expected}, last
+    assert final == {"line": final_line, "kind": "COMPLETE", "text": expected}, final
+    assert markers[-1] == {"line": final_line, "kind": "COMPLETE", "text": expected}, markers[-3:]
+    assert all(marker.get("line") != echo_marker_line for marker in markers), markers[:3]
+
+
+def case_round4_verbatim_tail_final_marker_wins() -> None:
+    prompt_path = ROUND4_EVIDENCE / "evidence-assembled.prompt"
+    tail_gz_path = ROUND4_EVIDENCE / "evidence-tail-65k.gz"
+    if not prompt_path.exists() or not tail_gz_path.exists():
+        print("SKIP: round4 private evidence fixture absent")
+        return
+
+    prompt_lines = _prompt_lines(prompt_path)
+    with tempfile.TemporaryDirectory() as tmp:
+        tail = Path(tmp) / "tail.txt"
+        with gzip.open(tail_gz_path, "rt", errors="replace") as src:
+            tail.write_text(src.read(), encoding="utf-8")
+
+        last = goalflight_watch._last_line_is_terminal_marker(tail, ignore_prefix_lines=prompt_lines)
+        final = goalflight_watch._final_terminal_marker(tail, ignore_prefix_lines=prompt_lines)
+        markers, _size = goalflight_watch.extract_markers(tail, ignore_prefix_lines=prompt_lines)
+
+    expected = "gf-capacity-queue-parity-r2"
+    assert last == {"line": 65073, "kind": "COMPLETE", "text": expected}, last
+    assert final == {"line": 65073, "kind": "COMPLETE", "text": expected}, final
+    assert markers[-1] == {"line": 65073, "kind": "COMPLETE", "text": expected}, markers[-3:]
+    assert all(marker.get("line") != 61 for marker in markers), markers[:3]
+
+
+def case_round4_second_verbatim_tail_final_marker_wins() -> None:
+    tail_gz_path = ROUND4_EVIDENCE / "evidence2-cwd-droppings-tail.gz"
+    if not tail_gz_path.exists():
+        print("SKIP: round4 second private evidence fixture absent")
+        return
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tail = Path(tmp) / "tail.txt"
+        with gzip.open(tail_gz_path, "rt", errors="replace") as src:
+            tail.write_text(src.read(), encoding="utf-8")
+
+        last = goalflight_watch._last_line_is_terminal_marker(tail)
+        final = goalflight_watch._final_terminal_marker(tail)
+        markers, _size = goalflight_watch.extract_markers(tail)
+
+    expected = "gf-cwd-droppings"
+    assert last == {"line": 10068, "kind": "COMPLETE", "text": expected}, last
+    assert final == {"line": 10068, "kind": "COMPLETE", "text": expected}, final
+    assert markers[-1] == {"line": 10068, "kind": "COMPLETE", "text": expected}, markers[-3:]
+
+
+def case_steer_wrapper_prompt_brief_only_echo_anchor() -> None:
+    prompt = (
+        "You have a steer mailbox at `$GOALFLIGHT_STEER_FILE`.\n"
+        "\n"
+        "Do the watcher reconciliation.\n"
+        "Final line of your output MUST be exactly:\n"
+        "COMPLETE: wrapped-brief-only\n"
+        "or BLOCKED: reason.\n"
+    )
+    prompt_lines = [line.strip() for line in prompt.splitlines()]
+    brief_echo = (
+        "OpenAI Codex v0.137.0\n"
+        "--------\n"
+        "user\n"
+        "Do the watcher reconciliation.\n"
+        "Final line of your output MUST be exactly:\n"
+        "COMPLETE: wrapped-brief-only\n"
+        "or BLOCKED: reason.\n"
+        "worker died before sign-off\n"
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        tail = Path(tmp) / "tail.txt"
+        tail.write_text(brief_echo, encoding="utf-8")
+        prompt_echo_lines, echo_anchor_found, _ = goalflight_watch._prompt_echo_scan(
+            brief_echo.splitlines(),
+            prompt_lines,
+        )
+        final = goalflight_watch._final_terminal_marker(tail, ignore_prefix_lines=prompt_lines)
+
+    assert echo_anchor_found is True
+    assert 5 in prompt_echo_lines, prompt_echo_lines
+    assert final is None, final
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tail = Path(tmp) / "tail.txt"
+        tail.write_text(
+            brief_echo + "real work finished\nCOMPLETE: wrapped-brief-only\n",
+            encoding="utf-8",
+        )
+        last = goalflight_watch._last_line_is_terminal_marker(tail, ignore_prefix_lines=prompt_lines)
+        final = goalflight_watch._final_terminal_marker(tail, ignore_prefix_lines=prompt_lines)
+
+    assert last and last.get("text") == "wrapped-brief-only", last
+    assert final and final.get("text") == "wrapped-brief-only", final
+
+
+def case_unbalanced_fence_cannot_blind_final_marker() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        tail = Path(tmp) / "tail.txt"
+        tail.write_text(
+            "work started\n"
+            "    ~~~~^^\n"
+            "traceback underline left the scanner in a fence-like state\n"
+            "COMPLETE: unbalanced-final\n",
+            encoding="utf-8",
+        )
+        last = goalflight_watch._last_line_is_terminal_marker(tail)
+        final = goalflight_watch._final_terminal_marker(tail)
+        markers, _size = goalflight_watch.extract_markers(tail)
+
+    assert last == {"line": 4, "kind": "COMPLETE", "text": "unbalanced-final"}, last
+    assert final == {"line": 4, "kind": "COMPLETE", "text": "unbalanced-final"}, final
+    assert markers[-1] == {"line": 4, "kind": "COMPLETE", "text": "unbalanced-final"}, markers
+
+
+def case_balanced_fence_marker_still_suppressed() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        tail = Path(tmp) / "tail.txt"
+        tail.write_text(
+            "worker quoted an example\n"
+            "```\n"
+            "COMPLETE: fenced-only\n"
+            "```\n"
+            "worker died before sign-off\n",
+            encoding="utf-8",
+        )
+        last = goalflight_watch._last_line_is_terminal_marker(tail)
+        final = goalflight_watch._final_terminal_marker(tail)
+        markers, _size = goalflight_watch.extract_markers(tail)
+
+    assert last is None, last
+    assert final is None, final
+    assert all(marker.get("text") != "fenced-only" for marker in markers), markers
+
+
 def main() -> None:
     case_ignores_echoed_prompt_marker()
     case_without_ignore_trips_on_echo()
@@ -634,6 +813,12 @@ def main() -> None:
     case_worker_dead_early_latch_retries_prompt_anchor()
     case_worker_dead_fenceless_decorated_marker_still_reconciles()
     case_worker_dead_failed_marker_blocks()
+    case_round4_public_trimmed_tail_final_marker_wins()
+    case_round4_verbatim_tail_final_marker_wins()
+    case_round4_second_verbatim_tail_final_marker_wins()
+    case_steer_wrapper_prompt_brief_only_echo_anchor()
+    case_unbalanced_fence_cannot_blind_final_marker()
+    case_balanced_fence_marker_still_suppressed()
     print("OK: goalflight_watch prompt-echo guard tests pass")
 
 

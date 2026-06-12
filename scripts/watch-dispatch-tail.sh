@@ -253,36 +253,64 @@ tail = pathlib.Path(sys.argv[1])
 prompt = pathlib.Path(sys.argv[2])
 marker_re = re.compile(sys.argv[3])
 prompt_lines = [line.strip() for line in prompt.read_text(encoding="utf-8", errors="replace").splitlines()]
+bare_marker_re = re.compile(r"^(RESULT|USER-NEED|USER-CONFIRM|BLOCKED|FAILED|COMPLETE|READY):\s*.*$")
 anchor_search_lines = 200
+max_anchors = 10
+
+def fence_line(raw_line: str) -> bool:
+    lstrip = raw_line.lstrip()
+    return lstrip.startswith("```") or lstrip.startswith("~~~")
+
+def fence_unbalanced(lines: list[str], ignored_lines: set[int]) -> bool:
+    count = 0
+    for idx, line in enumerate(lines):
+        if idx in ignored_lines:
+            continue
+        if fence_line(line):
+            count += 1
+    return count % 2 == 1
+
+def prompt_echo_anchor_indices(prompt_prefix: list[str]) -> list[int]:
+    anchors = []
+    seen = set()
+    at_segment_start = True
+    for idx, line in enumerate(prompt_prefix):
+        if not line:
+            at_segment_start = True
+            continue
+        if at_segment_start and line not in seen and not bare_marker_re.match(line):
+            anchors.append(idx)
+            seen.add(line)
+            if len(anchors) >= max_anchors:
+                break
+        at_segment_start = False
+    return anchors
 
 def prompt_echo_scan(lines: list[str], prompt_prefix: list[str]):
     prompt_line_set = {line for line in prompt_prefix if line}
-    first_prompt_idx = None
-    for idx, line in enumerate(prompt_prefix):
-        if line:
-            first_prompt_idx = idx
-            break
-    if first_prompt_idx is None:
+    anchor_indices = prompt_echo_anchor_indices(prompt_prefix)
+    if not anchor_indices:
         return set(), False, prompt_line_set
-    first_prompt_line = prompt_prefix[first_prompt_idx]
     matched_single_lines = []
     matched_multi_lines = []
     for idx, line in enumerate(lines[:anchor_search_lines]):
-        if line.strip() != first_prompt_line:
-            continue
-        prompt_idx = first_prompt_idx
-        line_idx = idx
-        span = []
-        while line_idx < len(lines) and prompt_idx < len(prompt_prefix):
-            if lines[line_idx].strip() != prompt_prefix[prompt_idx]:
-                break
-            span.append(line_idx)
-            line_idx += 1
-            prompt_idx += 1
-        if len(span) > 1:
-            matched_multi_lines.extend(span)
-        elif span:
-            matched_single_lines.extend(span)
+        stripped_line = line.strip()
+        for anchor_idx in anchor_indices:
+            if stripped_line != prompt_prefix[anchor_idx]:
+                continue
+            prompt_idx = anchor_idx
+            line_idx = idx
+            span = []
+            while line_idx < len(lines) and prompt_idx < len(prompt_prefix):
+                if lines[line_idx].strip() != prompt_prefix[prompt_idx]:
+                    break
+                span.append(line_idx)
+                line_idx += 1
+                prompt_idx += 1
+            if len(span) > 1:
+                matched_multi_lines.extend(span)
+            elif span:
+                matched_single_lines.extend(span)
     if matched_multi_lines:
         # Multi-line sequential match = a real echo block; single-line
         # lookalikes are fenced but do NOT count as a located anchor, so the
@@ -298,6 +326,7 @@ start = max(0, size - 10 * 1024 * 1024)
 text = tail.read_bytes()[start:].decode(errors="replace")
 lines = text.splitlines()
 prompt_echo_lines, _echo_anchor_found, _prompt_line_set = prompt_echo_scan(lines, prompt_lines)
+ignore_fences = fence_unbalanced(lines, prompt_echo_lines)
 in_fence = False
 last_nonempty = ""
 last_in_fence = False
@@ -305,14 +334,13 @@ for idx, line in enumerate(lines):
     stripped = line.strip()
     if idx in prompt_echo_lines:
         continue
-    lstrip = line.lstrip()
-    if lstrip.startswith("```") or lstrip.startswith("~~~"):
+    if fence_line(line):
         in_fence = not in_fence
         if stripped:
             last_nonempty = stripped
-            last_in_fence = in_fence
+            last_in_fence = in_fence and not ignore_fences
         continue
-    if in_fence:
+    if in_fence and not ignore_fences:
         if stripped:
             last_nonempty = stripped
             last_in_fence = True
@@ -350,9 +378,23 @@ marker_re = re.compile(
 bare_marker_re = re.compile(r"^(RESULT|USER-NEED|USER-CONFIRM|BLOCKED|FAILED|COMPLETE|READY):\s*.*$")
 hunk_header_re = re.compile(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@")
 anchor_search_lines = 200
+max_anchors = 10
 
 def diff_context(raw_line: str) -> bool:
     return raw_line.startswith((" ", "\t", "+")) or (raw_line.startswith("-") and not raw_line.startswith("- "))
+
+def fence_line(raw_line: str) -> bool:
+    lstrip = raw_line.lstrip()
+    return lstrip.startswith("```") or lstrip.startswith("~~~")
+
+def fence_unbalanced(lines: list[str], ignored_lines: set[int]) -> bool:
+    count = 0
+    for idx, line in enumerate(lines):
+        if idx in ignored_lines:
+            continue
+        if fence_line(line):
+            count += 1
+    return count % 2 == 1
 
 def strip_decoration(text: str) -> str:
     value = text.strip()
@@ -362,34 +404,47 @@ def strip_decoration(text: str) -> str:
         value = value[:-1].rstrip()
     return value
 
+def prompt_echo_anchor_indices(prompt_prefix: list[str]) -> list[int]:
+    anchors = []
+    seen = set()
+    at_segment_start = True
+    for idx, line in enumerate(prompt_prefix):
+        if not line:
+            at_segment_start = True
+            continue
+        if at_segment_start and line not in seen and not bare_marker_re.match(line):
+            anchors.append(idx)
+            seen.add(line)
+            if len(anchors) >= max_anchors:
+                break
+        at_segment_start = False
+    return anchors
+
 def prompt_echo_scan(lines: list[str], prompt_prefix: list[str]):
     prompt_line_set = {line for line in prompt_prefix if line}
-    first_prompt_idx = None
-    for idx, line in enumerate(prompt_prefix):
-        if line:
-            first_prompt_idx = idx
-            break
-    if first_prompt_idx is None:
+    anchor_indices = prompt_echo_anchor_indices(prompt_prefix)
+    if not anchor_indices:
         return set(), False, prompt_line_set
-    first_prompt_line = prompt_prefix[first_prompt_idx]
     matched_single_lines = []
     matched_multi_lines = []
     for idx, line in enumerate(lines[:anchor_search_lines]):
-        if line.strip() != first_prompt_line:
-            continue
-        prompt_idx = first_prompt_idx
-        line_idx = idx
-        span = []
-        while line_idx < len(lines) and prompt_idx < len(prompt_prefix):
-            if lines[line_idx].strip() != prompt_prefix[prompt_idx]:
-                break
-            span.append(line_idx)
-            line_idx += 1
-            prompt_idx += 1
-        if len(span) > 1:
-            matched_multi_lines.extend(span)
-        elif span:
-            matched_single_lines.extend(span)
+        stripped_line = line.strip()
+        for anchor_idx in anchor_indices:
+            if stripped_line != prompt_prefix[anchor_idx]:
+                continue
+            prompt_idx = anchor_idx
+            line_idx = idx
+            span = []
+            while line_idx < len(lines) and prompt_idx < len(prompt_prefix):
+                if lines[line_idx].strip() != prompt_prefix[prompt_idx]:
+                    break
+                span.append(line_idx)
+                line_idx += 1
+                prompt_idx += 1
+            if len(span) > 1:
+                matched_multi_lines.extend(span)
+            elif span:
+                matched_single_lines.extend(span)
     if matched_multi_lines:
         # Multi-line sequential match = a real echo block; single-line
         # lookalikes are fenced but do NOT count as a located anchor, so the
@@ -403,38 +458,63 @@ def prompt_echo_scan(lines: list[str], prompt_prefix: list[str]):
 def unfenced_prompt_quoted_bare_marker(stripped: str, prompt_line_set: set[str], echo_anchor_found: bool) -> bool:
     return not echo_anchor_found and stripped in prompt_line_set and bool(bare_marker_re.match(stripped))
 
+def terminal_from_line(raw_line: str, line_no: int):
+    if not raw_line.strip() or diff_context(raw_line):
+        return None
+    match = marker_re.match(raw_line.strip())
+    if not match:
+        return None
+    return (line_no, match.group(1), strip_decoration(match.group(2))[:1000])
+
+def scan_final_terminal_marker(lines: list[str], *, prompt_echo_lines: set[int], echo_anchor_found: bool, prompt_line_set: set[str], ignore_fences: bool):
+    in_fence = False
+    in_hunk = False
+    terminal = None
+    for idx, line in enumerate(lines, start=1):
+        stripped = line.strip()
+        if idx - 1 in prompt_echo_lines:
+            continue
+        if fence_line(line):
+            in_fence = not in_fence
+            continue
+        if in_fence and not ignore_fences:
+            continue
+        if in_hunk:
+            if line.startswith((" ", "+", "-", "\\")):
+                continue
+            in_hunk = False
+        if hunk_header_re.match(line):
+            in_hunk = True
+            continue
+        candidate = terminal_from_line(line, idx)
+        if candidate:
+            if unfenced_prompt_quoted_bare_marker(stripped, prompt_line_set, echo_anchor_found):
+                continue
+            terminal = candidate
+    return terminal
+
 size = tail.stat().st_size
 start = max(0, size - 10 * 1024 * 1024)
 text = tail.read_bytes()[start:].decode(errors="replace")
 lines = text.splitlines()
 prompt_echo_lines, echo_anchor_found, prompt_line_set = prompt_echo_scan(lines, prompt_lines)
-in_fence = False
-in_hunk = False
-terminal = None
-for idx, line in enumerate(lines, start=1):
-    stripped = line.strip()
-    if idx - 1 in prompt_echo_lines:
-        continue
-    lstrip = line.lstrip()
-    if lstrip.startswith("```") or lstrip.startswith("~~~"):
-        in_fence = not in_fence
-        continue
-    if in_fence:
-        continue
-    if in_hunk:
-        if line.startswith((" ", "+", "-", "\\")):
-            continue
-        in_hunk = False
-    if hunk_header_re.match(line):
-        in_hunk = True
-        continue
-    if not stripped or diff_context(line):
-        continue
-    match = marker_re.match(stripped)
-    if match:
-        if unfenced_prompt_quoted_bare_marker(stripped, prompt_line_set, echo_anchor_found):
-            continue
-        terminal = (idx, match.group(1), strip_decoration(match.group(2))[:1000])
+terminal = scan_final_terminal_marker(
+    lines,
+    prompt_echo_lines=prompt_echo_lines,
+    echo_anchor_found=echo_anchor_found,
+    prompt_line_set=prompt_line_set,
+    ignore_fences=False,
+)
+if fence_unbalanced(lines, prompt_echo_lines):
+    fence_agnostic_terminal = scan_final_terminal_marker(
+        lines,
+        prompt_echo_lines=prompt_echo_lines,
+        echo_anchor_found=echo_anchor_found,
+        prompt_line_set=prompt_line_set,
+        ignore_fences=True,
+    )
+    if fence_agnostic_terminal and (not terminal or fence_agnostic_terminal[0] >= terminal[0]):
+        terminal = fence_agnostic_terminal
 if terminal:
     print(f"{terminal[0]}:{terminal[1]}:{terminal[2]}")
     raise SystemExit(0)

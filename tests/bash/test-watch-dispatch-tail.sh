@@ -16,6 +16,7 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 WATCHER="$REPO_ROOT/scripts/watch-dispatch-tail.sh"
+FIXTURE_DIR="$REPO_ROOT/tests/fixtures/watch_prompt_echo"
 
 # Hermetic pidfile dir. The watcher honors $GOAL_FLIGHT_PIDFILE_DIR, so exporting
 # it here makes every watcher child register under a private temp dir instead of
@@ -433,11 +434,77 @@ tail window starts after the prompt anchor
 STATUS: COMPLETE: quoted-only
 worker died after decorated sign-off
 EOF
-run_dead_tail_case "case-1g6 dead reconcile accepts fenceless decorated marker" "$TAIL" "$PROMPT" "$OUT" "0"
-rm -f "$TAIL" "$PROMPT" "$OUT"
+	run_dead_tail_case "case-1g6 dead reconcile accepts fenceless decorated marker" "$TAIL" "$PROMPT" "$OUT" "0"
+	rm -f "$TAIL" "$PROMPT" "$OUT"
 
-# ---- Case 1h: diff-ish raw lines are not terminal sign-offs ----
-PROMPT=/tmp/test-watch-dead-reconcile-diff-negative-$$.prompt
+	# ---- Case 1g7: steer wrapper prompt + brief-only echo is still recognized as prompt echo ----
+	PROMPT=/tmp/test-watch-dead-reconcile-brief-only-$$.prompt
+	TAIL=/tmp/test-watch-dead-reconcile-brief-only-$$.txt
+	OUT=/tmp/watcher-out-dead-reconcile-brief-only-$$.txt
+	cat > "$PROMPT" <<'EOF'
+You have a steer mailbox at `$GOALFLIGHT_STEER_FILE`.
+
+Do the watcher reconciliation.
+Final line of your output MUST be exactly:
+COMPLETE: wrapped-brief-only
+or BLOCKED: reason.
+EOF
+	cat > "$TAIL" <<'EOF'
+OpenAI Codex v0.137.0
+--------
+user
+Do the watcher reconciliation.
+Final line of your output MUST be exactly:
+COMPLETE: wrapped-brief-only
+or BLOCKED: reason.
+worker died before sign-off
+EOF
+	run_dead_tail_case "case-1g7 dead reconcile rejects brief-only prompt echo" "$TAIL" "$PROMPT" "$OUT" "1"
+	rm -f "$TAIL" "$PROMPT" "$OUT"
+
+	# ---- Case 1g7a: public round-4 trimmed fixture exercises wrapper echo + unbalanced fence ----
+	PROMPT="$FIXTURE_DIR/round4-trimmed-assembled.prompt"
+	TAIL="$FIXTURE_DIR/round4-trimmed-tail.txt"
+	OUT=/tmp/watcher-out-dead-reconcile-public-round4-$$.txt
+	run_dead_tail_case "case-1g7a public round4 trimmed fixture final COMPLETE" "$TAIL" "$PROMPT" "$OUT" "0"
+	if grep -q "WATCHER-EXIT: marker exit_code=0" "$OUT"; then
+	  expect_eq "case-1g7a marker summary emitted" "yes" "yes"
+	else
+	  expect_eq "case-1g7a marker summary emitted" "yes" "no"
+	fi
+	rm -f "$OUT"
+
+	# ---- Case 1g8: unbalanced fence-like line cannot hide a genuine final marker ----
+	PROMPT=/tmp/test-watch-dead-reconcile-unbalanced-fence-$$.prompt
+	TAIL=/tmp/test-watch-dead-reconcile-unbalanced-fence-$$.txt
+	OUT=/tmp/watcher-out-dead-reconcile-unbalanced-fence-$$.txt
+	: > "$PROMPT"
+	cat > "$TAIL" <<'EOF'
+work started
+    ~~~~^^
+traceback underline left the scanner in a fence-like state
+COMPLETE: unbalanced-final
+EOF
+	run_dead_tail_case "case-1g8 dead reconcile accepts unbalanced-fence final COMPLETE" "$TAIL" "$PROMPT" "$OUT" "0"
+	rm -f "$TAIL" "$PROMPT" "$OUT"
+
+	# ---- Case 1g9: balanced fenced marker remains suppressed ----
+	PROMPT=/tmp/test-watch-dead-reconcile-balanced-fence-$$.prompt
+	TAIL=/tmp/test-watch-dead-reconcile-balanced-fence-$$.txt
+	OUT=/tmp/watcher-out-dead-reconcile-balanced-fence-$$.txt
+	: > "$PROMPT"
+	cat > "$TAIL" <<'EOF'
+worker quoted an example
+```
+COMPLETE: fenced-only
+```
+worker died before sign-off
+EOF
+	run_dead_tail_case "case-1g9 dead reconcile rejects balanced-fence COMPLETE" "$TAIL" "$PROMPT" "$OUT" "1"
+	rm -f "$TAIL" "$PROMPT" "$OUT"
+
+	# ---- Case 1h: diff-ish raw lines are not terminal sign-offs ----
+	PROMPT=/tmp/test-watch-dead-reconcile-diff-negative-$$.prompt
 : > "$PROMPT"
 
 TAIL=/tmp/test-watch-dead-reconcile-delete-nospace-$$.txt

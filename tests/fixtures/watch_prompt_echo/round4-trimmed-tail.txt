@@ -1,0 +1,13 @@
+OpenAI Codex v0.137.0
+--------
+user
+Brief task: inspect sanitized watcher output.
+When finished, quote the final marker shape:
+COMPLETE: public-watch-round4
+Include diagnostic notes only after real work.
+worker started sanitized pass
+diagnostic excerpt follows
+```
+generic fenced output that never closes
+STATUS: still collecting sanitized data
+COMPLETE: public-watch-round4
