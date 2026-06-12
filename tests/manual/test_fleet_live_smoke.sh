@@ -17,6 +17,7 @@ BILLING="${GOALFLIGHT_FLEET_BILLING:-openai/default}"
 FLEET=(python3 scripts/goalflight_fleet.py --fleet-dir "$GOALFLIGHT_FLEET_DIR")
 
 cd "$REPO_ROOT"
+BASE_SHA="${GOALFLIGHT_FLEET_BASE_SHA:-$(git rev-parse HEAD)}"
 
 node_registered() {
   python3 - "$GOALFLIGHT_FLEET_DIR" "$NODE" <<'PY'
@@ -90,6 +91,7 @@ echo "== preview =="
   --node "$NODE" \
   --agent codex-acp \
   --billing-account "$BILLING" \
+  --base-sha "$BASE_SHA" \
   --prompt "$PROMPT" \
   --thin-defaults \
   --json | head -40
@@ -99,6 +101,7 @@ echo "== exec (live SSH) =="
   --node "$NODE" \
   --agent codex-acp \
   --billing-account "$BILLING" \
+  --base-sha "$BASE_SHA" \
   --prompt "$PROMPT" \
   --exec \
   --json

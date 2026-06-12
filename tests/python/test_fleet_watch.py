@@ -51,6 +51,36 @@ def _status_payload(
     return json.dumps(payload)
 
 
+def _dispatch_status_v1_starting_payload(
+    *,
+    dispatch_id: str,
+    updated_at: int = 1780000000,
+    worker_pid: int = 5555,
+) -> str:
+    # Field set copied from goalflight_dispatch.py's detached-launch status writer.
+    identity = {
+        "pid": worker_pid,
+        "lstart": "Thu Jun 11 12:00:00 2026",
+        "comm": "python3",
+    }
+    return json.dumps(
+        {
+            "schema": "goalflight.status.v1",
+            "dispatch_id": dispatch_id,
+            "agent": "codex-acp",
+            "worker_pid": worker_pid,
+            "pgid": worker_pid,
+            "worker_alive": True,
+            "worker_identity": identity,
+            "expected_worker_identity": identity,
+            "tail_path": f"/tmp/goal-flight/{dispatch_id}.tail.log",
+            "state": "starting",
+            "reason": "watcher_launching",
+            "updated_at": updated_at,
+        }
+    )
+
+
 class FakeTransport:
     def __init__(
         self,
@@ -281,6 +311,37 @@ def test_single_poll_backfills_launch_unconfirmed_receipt() -> None:
         assert_true("row receipted", meta.get("row_state") == "launch_receipted")
         assert_true("receipt pid", meta.get("launch_receipt", {}).get("remote_pid") == 5555)
         assert_true("receipt base", meta.get("launch_receipt", {}).get("worktree_base_sha") == BASE_SHA)
+
+
+def test_ingest_accepts_real_dispatch_status_v1_payload() -> None:
+    dispatch_id = "acp-watch-status-v1-live"
+    with tempfile.TemporaryDirectory() as td:
+        fleet_dir = Path(td) / "fleet"
+        _fixture_fleet(fleet_dir)
+        status_path = _write_unconfirmed_dispatch(fleet_dir, dispatch_id=dispatch_id)
+        transport = FakeTransport(
+            {dispatch_id: _dispatch_status_v1_starting_payload(dispatch_id=dispatch_id, worker_pid=6666)}
+        )
+
+        row = fleet_watch.ingest_dispatch_mirror(
+            fleet_dir,
+            dispatch_id,
+            fleet.read_json(status_path.parent / "meta.json"),
+            transport,
+            node_entry=fleet.read_json(fleet_dir / "fleet.json")["nodes"]["build-1"],
+        )
+
+        assert_true("ingested", row.ok and row.action == "ingested")
+        assert_true("seq", row.seq == 178000000020)
+        mirror_payload = json.loads(status_path.read_text())
+        assert_true("normalized schema", mirror_payload.get("schema") == mirror.STATUS_MIRROR_SCHEMA)
+        assert_true("source schema", mirror_payload.get("source_schema") == mirror.DISPATCH_STATUS_SCHEMA)
+        assert_true("state", mirror_payload.get("state") == "starting")
+        assert_true("liveness", mirror_payload.get("liveness_state") == "live")
+        assert_true("identity", mirror_payload.get("worker_identity", {}).get("pid") == 6666)
+        meta = fleet.read_json(status_path.parent / "meta.json")
+        assert_true("unconfirmed cleared", meta.get("launch_unconfirmed") is False)
+        assert_true("receipt pid", meta.get("launch_receipt", {}).get("remote_pid") == 6666)
 
 
 def test_seq_regression_preserves_last_good_mirror() -> None:
@@ -675,6 +736,7 @@ def test_until_terminal_fetch_failure_retries() -> None:
 def main() -> None:
     test_ingest_advances_mirror_and_meta()
     test_single_poll_backfills_launch_unconfirmed_receipt()
+    test_ingest_accepts_real_dispatch_status_v1_payload()
     test_seq_regression_preserves_last_good_mirror()
     test_seq_regression_stops_subsequent_ingest()
     test_validation_failure_does_not_truncate_mirror()

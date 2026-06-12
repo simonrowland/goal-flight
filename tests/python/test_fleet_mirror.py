@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import json
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -26,6 +28,45 @@ def test_valid_fixture_returns_payload_and_last_seq() -> None:
     assert_true("last_seq", result.last_seq == 7)
     assert_true("payload", result.payload is not None)
     assert_true("dispatch_id", result.payload["dispatch_id"] == "acp-codex-fixture-01")
+
+
+def test_dispatch_status_v1_fixture_normalized() -> None:
+    # Field set copied from goalflight_dispatch.py's detached-launch status writer.
+    payload = {
+        "schema": "goalflight.status.v1",
+        "dispatch_id": "gf-live-status-v1",
+        "agent": "codex-acp",
+        "worker_pid": 4242,
+        "pgid": 4242,
+        "worker_alive": True,
+        "worker_identity": {
+            "pid": 4242,
+            "lstart": "Thu Jun 11 12:00:00 2026",
+            "comm": "python3",
+        },
+        "expected_worker_identity": {
+            "pid": 4242,
+            "lstart": "Thu Jun 11 12:00:00 2026",
+            "comm": "python3",
+        },
+        "tail_path": "/tmp/goal-flight/gf-live-status-v1.tail.log",
+        "state": "starting",
+        "reason": "watcher_launching",
+        "updated_at": 1780000000,
+    }
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "status.json"
+        path.write_text(json.dumps(payload) + "\n")
+        result = mirror.read_status_mirror(path)
+
+    assert_true("ok", result.ok is True)
+    assert_true("seq", result.last_seq == 178000000020)
+    assert_true("payload", result.payload is not None)
+    assert_true("normalized schema", result.payload["schema"] == mirror.STATUS_MIRROR_SCHEMA)
+    assert_true("source schema", result.payload["source_schema"] == mirror.DISPATCH_STATUS_SCHEMA)
+    assert_true("state", result.payload["state"] == "starting")
+    assert_true("liveness", result.payload["liveness_state"] == "live")
+    assert_true("identity", result.payload["worker_identity"]["pid"] == 4242)
 
 
 def test_seq_regression_fails_closed() -> None:
@@ -68,6 +109,7 @@ def test_first_read_accepts_seq_zero() -> None:
 
 def main() -> None:
     test_valid_fixture_returns_payload_and_last_seq()
+    test_dispatch_status_v1_fixture_normalized()
     test_seq_regression_fails_closed()
     test_schema_mismatch()
     test_partial_json()

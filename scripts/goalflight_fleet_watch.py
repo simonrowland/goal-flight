@@ -183,17 +183,6 @@ def resolve_remote_status_path(
 
 def validate_remote_content(raw: str, *, last_seq: int | None) -> mirror.MirrorReadResult:
     """Validate fetched JSON without mutating the orchestrator mirror path."""
-    stripped = raw.strip()
-    if stripped:
-        try:
-            parsed = json.loads(stripped)
-        except json.JSONDecodeError:
-            parsed = None
-        if isinstance(parsed, dict) and parsed.get("schema") == mirror.STATUS_MIRROR_SCHEMA:
-            if "seq" not in parsed:
-                parsed = dict(parsed)
-                parsed["seq"] = max(int(parsed.get("events_seen") or 0), 1)
-                raw = json.dumps(parsed)
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
         handle.write(raw)
         staging = Path(handle.name)

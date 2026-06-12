@@ -84,25 +84,31 @@ python3 scripts/goalflight_doctor.py --project-root . --fleet
 ### 1. Preview dispatch (no SSH side effects)
 
 ```bash
+BASE_SHA="$(git rev-parse HEAD)"
 python3 scripts/goalflight_fleet.py dispatch \
   --node mac-studio \
   --agent codex-acp \
   --billing-account openai/default \
+  --base-sha "$BASE_SHA" \
   --prompt README.md \
   --thin-defaults \
   --json
 ```
 
 Inspect the planned remote command, worktree path, and `acp_run` invocation.
+`--base-sha` is required for stale-clone protection: the node fetches and pins
+the remote worktree to the controller-chosen commit before launch.
 
 ### 2. Execute live dispatch
 
 ```bash
 export GOALFLIGHT_LIVE_SSH=1
+BASE_SHA="${GOALFLIGHT_FLEET_BASE_SHA:-$(git rev-parse HEAD)}"
 python3 scripts/goalflight_fleet.py dispatch \
   --node mac-studio \
   --agent codex-acp \
   --billing-account openai/default \
+  --base-sha "$BASE_SHA" \
   --prompt README.md \
   --exec \
   --json
