@@ -10,9 +10,10 @@ skip_posix_on_native_windows("fleet dispatch fixtures use POSIX /tmp paths")
 import io
 import base64
 import json
+import os
 import sys
 import tempfile
-from contextlib import redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -64,6 +65,22 @@ class Args:
             setattr(self, key, value)
 
 
+@contextmanager
+def live_ssh_env(value: str | None):
+    old_live_ssh = os.environ.get("GOALFLIGHT_LIVE_SSH")
+    if value is None:
+        os.environ.pop("GOALFLIGHT_LIVE_SSH", None)
+    else:
+        os.environ["GOALFLIGHT_LIVE_SSH"] = value
+    try:
+        yield
+    finally:
+        if old_live_ssh is None:
+            os.environ.pop("GOALFLIGHT_LIVE_SSH", None)
+        else:
+            os.environ["GOALFLIGHT_LIVE_SSH"] = old_live_ssh
+
+
 def test_explicit_dry_run_preview() -> None:
     with tempfile.TemporaryDirectory() as td:
         fleet_dir = Path(td) / "fleet"
@@ -104,32 +121,122 @@ def test_explicit_dry_run_preview() -> None:
 
 
 def test_red_auth_blocks_exec() -> None:
-    with tempfile.TemporaryDirectory() as td:
-        fleet_dir = Path(td) / "fleet"
-        _fixture_fleet(fleet_dir)
-        billing.write_probe_artifact(
-            fleet_dir,
-            "localhost",
-            {
-                "account_key": "openai/default",
-                "status": "red",
-                "provider": "openai",
-                "probed_at": "2026-05-24T12:00:00+00:00",
-            },
-        )
-        args = Args(
-            fleet_dir=fleet_dir,
-            node="localhost",
-            agent="codex-acp",
-            billing_account="openai/default",
-            prompt="chunk.md",
-            exec=True,
-            thin_defaults=False,
-            stub_remote=True,
-            stub_terminal=False,
-        )
-        code = fleet_dispatch.cmd_dispatch(args)
-        assert_true("blocked", code == 1)
+    with live_ssh_env("1"):
+        with tempfile.TemporaryDirectory() as td:
+            fleet_dir = Path(td) / "fleet"
+            _fixture_fleet(fleet_dir)
+            billing.write_probe_artifact(
+                fleet_dir,
+                "localhost",
+                {
+                    "account_key": "openai/default",
+                    "status": "red",
+                    "provider": "openai",
+                    "probed_at": "2026-05-24T12:00:00+00:00",
+                },
+            )
+            args = Args(
+                fleet_dir=fleet_dir,
+                node="localhost",
+                agent="codex-acp",
+                billing_account="openai/default",
+                prompt="chunk.md",
+                exec=True,
+                thin_defaults=False,
+                stub_remote=True,
+                stub_terminal=False,
+            )
+            stderr = io.StringIO()
+            with redirect_stderr(stderr):
+                code = fleet_dispatch.cmd_dispatch(args)
+            assert_true("blocked", code == 1)
+
+
+def test_exec_without_live_ssh_env_refuses_before_runner() -> None:
+    captured: list[list[str]] = []
+
+    def capture_runner(argv: list[str]) -> tuple[int, str, str]:
+        captured.append(list(argv))
+        return 0, "{}", ""
+
+    with live_ssh_env(None):
+        with tempfile.TemporaryDirectory() as td:
+            fleet_dir = Path(td) / "fleet"
+            _fixture_fleet(fleet_dir)
+            args = Args(
+                fleet_dir=fleet_dir,
+                node="localhost",
+                agent="codex-acp",
+                billing_account="openai/default",
+                prompt="chunk.md",
+                exec=True,
+                thin_defaults=False,
+                stub_remote=False,
+                stub_runner=capture_runner,
+                stub_terminal=True,
+            )
+            stderr = io.StringIO()
+            with redirect_stderr(stderr):
+                code = fleet_dispatch.cmd_dispatch(args)
+            message = stderr.getvalue()
+            assert_true("usage refusal", code == 2)
+            assert_true("runner not called", captured == [])
+            assert_true("env named", "GOALFLIGHT_LIVE_SSH=1" in message)
+            assert_true("hermetic safety", "hermetic suites must never live-SSH" in message)
+
+
+def test_exec_with_live_ssh_env_uses_runner() -> None:
+    captured: list[list[str]] = []
+
+    def capture_runner(argv: list[str]) -> tuple[int, str, str]:
+        captured.append(list(argv))
+        return 0, "{}", ""
+
+    with live_ssh_env("1"):
+        with tempfile.TemporaryDirectory() as td:
+            fleet_dir = Path(td) / "fleet"
+            _fixture_fleet(fleet_dir)
+            args = Args(
+                fleet_dir=fleet_dir,
+                node="localhost",
+                agent="codex-acp",
+                billing_account="openai/default",
+                prompt="chunk.md",
+                dispatch_id="acp-live-opt-in",
+                exec=True,
+                thin_defaults=False,
+                stub_remote=False,
+                stub_runner=capture_runner,
+                stub_terminal=True,
+            )
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                code = fleet_dispatch.cmd_dispatch(args)
+            assert_true("exec ok", code == 0)
+            assert_true("runner called", len(captured) >= 1)
+
+
+def test_preview_ignores_live_ssh_env() -> None:
+    with live_ssh_env(None):
+        with tempfile.TemporaryDirectory() as td:
+            fleet_dir = Path(td) / "fleet"
+            _fixture_fleet(fleet_dir)
+            args = Args(
+                fleet_dir=fleet_dir,
+                node="localhost",
+                agent="codex-acp",
+                billing_account="openai/default",
+                prompt="chunk.md",
+                exec=False,
+                thin_defaults=False,
+                stub_remote=False,
+            )
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                code = fleet_dispatch.cmd_dispatch(args)
+            payload = json.loads(stdout.getvalue())
+            assert_true("preview ok", code == 0)
+            assert_true("dry run", payload["dry_run"] is True)
 
 
 def test_thin_defaults_shows_billing_banner() -> None:
@@ -532,6 +639,9 @@ def test_ledger_remote_lease_id_roundtrip() -> None:
 def main() -> None:
     test_explicit_dry_run_preview()
     test_red_auth_blocks_exec()
+    test_exec_without_live_ssh_env_refuses_before_runner()
+    test_exec_with_live_ssh_env_uses_runner()
+    test_preview_ignores_live_ssh_env()
     test_thin_defaults_shows_billing_banner()
     test_lock_chain_rollback_on_worktree_failure()
     test_remote_failure_surfaces_ssh_details()

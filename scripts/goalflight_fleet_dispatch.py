@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import re
 import shlex
 import uuid
@@ -94,6 +95,16 @@ class DispatchGateError(DispatchError):
     def __init__(self, message: str, *, code: str = "blocked") -> None:
         self.code = code
         super().__init__(message)
+
+
+def assert_live_ssh_opt_in() -> None:
+    if os.environ.get("GOALFLIGHT_LIVE_SSH") == "1":
+        return
+    raise DispatchError(
+        "--exec refused: set GOALFLIGHT_LIVE_SSH=1 to allow live SSH. "
+        "CI/test safety: hermetic suites must never live-SSH; preview mode "
+        "works without this opt-in."
+    )
 
 
 @dataclass
@@ -653,6 +664,12 @@ def cmd_dispatch(args) -> int:
             payload["banner"] = preview.billing_banner
         print(json.dumps(payload, indent=2))
         return 0
+
+    try:
+        assert_live_ssh_opt_in()
+    except DispatchError as exc:
+        print(str(exc), file=__import__("sys").stderr)
+        return 2
 
     try:
         assert_dispatch_gates(args.fleet_dir, node_id=preview.node_id, billing_account=preview.billing_account)

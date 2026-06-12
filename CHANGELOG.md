@@ -96,10 +96,11 @@ Dispatch-reliability + worker-engine release on top of the 1.0.3 dispatch-death 
 - **Terminal marker precedence.** A dead worker that emitted a recognized terminal marker
   is classified terminal regardless of pid liveness (the idle real-pid check applies only
   when no marker is present).
-- **Fleet.** Live remote dispatch works end-to-end; an auth-probe tooling failure
-  (exit 127 / no-JSON) is treated as inconclusive and re-probed instead of cached as an
-  authoritative auth-red; `--prompt`/`--prompt-b64` are redacted across every serialized
-  ssh argv, preview, and failure-output path.
+- **Fleet.** Hermetic fleet dispatch contracts cover planning, auth gating, redaction,
+  and failure handling; live remote dispatch remains pending its first recorded smoke.
+  An auth-probe tooling failure (exit 127 / no-JSON) is treated as inconclusive and
+  re-probed instead of cached as an authoritative auth-red; `--prompt`/`--prompt-b64`
+  are redacted across every serialized ssh argv, preview, and failure-output path.
 - **opencode smoke tests** skip (rather than fail) when the OpenCode/LiteLLM backend is
   unhealthy.
 
@@ -189,7 +190,8 @@ and canonical docs layout.**
 ### Added
 
 - **Fleet layer** — `goalflight_fleet.py` bootstrap/validate/dispatch/watch/reconcile
-  with live SSH remote workers, billing account locks, and status mirror sync.
+  contracts for SSH-backed remote workers, billing account locks, and status mirror sync.
+  Hermetic tests cover the contracts; live remote dispatch is pending its first recorded smoke.
 - **Action router** — `bin/goalflight` unified entrypoint over `config/actions/`
   and `goalflight_actions.py`.
 - **OpenCode orchestrator port** — full ACP + bash-tail + prompt + self-dispatch
@@ -199,7 +201,7 @@ and canonical docs layout.**
 - **Canonical host scripts** — OpenCode helpers under `scripts/hosts/opencode/`
   with flat `scripts/opencode_*.py` compatibility shims.
 - **Manual prompt matrix** — `test/manual/test_acp_prompt_matrix.py` for hermetic
-  and live worker/fleet checks.
+  checks and opt-in live worker/fleet smoke scaffolding.
 
 ### Fixed
 
