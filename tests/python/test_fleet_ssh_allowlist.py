@@ -11,6 +11,8 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import goalflight_fleet_ssh as ssh
 
+BASE_SHA = "0123456789abcdef0123456789abcdef01234567"
+
 
 def assert_true(name: str, condition: bool) -> None:
     if not condition:
@@ -53,6 +55,14 @@ def test_unknown_class_blocked() -> None:
         pass
 
 
+def test_non_allowlisted_launch_shape_blocked() -> None:
+    try:
+        ssh.build_remote_command("launch_detached_shell", repo_root="/srv/goal-flight")
+        assert_true("launch shell blocked", False)
+    except ssh.SshAllowlistError as exc:
+        assert_true("allowlist code", exc.code == "allowlist_blocked")
+
+
 def test_build_ssh_uses_separator() -> None:
     host = ssh.SshHostSpec(alias="build-1", hostname="build-1.local", user="dev", port=2222)
     remote = ssh.build_remote_command("probe_echo")
@@ -65,6 +75,18 @@ def test_build_ssh_uses_separator() -> None:
     assert_true("homebrew path in script", "/opt/homebrew/bin" in cmd[zsh_idx + 2])
     assert_true("local bin path in script", "$HOME/.local/bin" in cmd[zsh_idx + 2])
     assert_true("home bootstrap", "HOME=${HOME:-" in cmd[zsh_idx + 2])
+
+
+def test_node_ssh_lock_path_and_context() -> None:
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        fleet_dir = Path(td) / "fleet"
+        path = ssh.node_lock_path("build/one", fleet_dir=fleet_dir)
+        assert_true("sanitized lock name", path.name == "build_one.lock")
+        with ssh.node_ssh_lock("build/one", fleet_dir=fleet_dir) as held:
+            assert_true("same path", held == path)
+            assert_true("lock exists", path.exists())
 
 
 def test_parse_ssh_config() -> None:
@@ -139,18 +161,91 @@ def test_acp_run_uses_prompt_b64_and_acp_python() -> None:
     )
 
 
+def test_launch_detached_uses_helper_and_prompt_b64() -> None:
+    import base64
+
+    prompt = "Async launch brief"
+    argv = ssh.build_remote_command(
+        "launch_detached",
+        repo_root="/srv/goal-flight",
+        node_id="build-1",
+        state_dir="/Users/dev/.goal-flight",
+        dispatch_id="acp-test",
+        agent="codex-acp",
+        prompt=prompt,
+        cwd="/Users/dev/.goal-flight/worktrees/acp-test",
+        status_json="/Users/dev/.goal-flight/dispatches/acp-test/status.json",
+        python="python3",
+        base_sha=BASE_SHA,
+    )
+    assert_true("helper", argv[1].endswith("goalflight_fleet_launch_detached.py"))
+    assert_true("subcommand", "launch" in argv)
+    b64_idx = argv.index("--prompt-b64")
+    decoded = base64.b64decode(argv[b64_idx + 1].encode("ascii")).decode("utf-8")
+    assert_true("prompt roundtrip", decoded == prompt)
+    assert_true("node id", argv[argv.index("--node-id") + 1] == "build-1")
+    assert_true("status json", argv[argv.index("--status-json") + 1].endswith("status.json"))
+    assert_true("base sha", argv[argv.index("--base-sha") + 1] == BASE_SHA)
+
+
+def test_launch_detached_recovery_flag_is_allowlisted() -> None:
+    argv = ssh.build_remote_command(
+        "launch_detached",
+        repo_root="/srv/goal-flight",
+        node_id="build-1",
+        state_dir="/Users/dev/.goal-flight",
+        dispatch_id="acp-test",
+        agent="codex-acp",
+        prompt="brief",
+        cwd="/Users/dev/.goal-flight/worktrees/acp-test",
+        status_json="/Users/dev/.goal-flight/dispatches/acp-test/status.json",
+        recover_unconfirmed=True,
+        base_sha=BASE_SHA,
+    )
+    assert_true("recover flag", "--recover-unconfirmed" in argv)
+    assert_true("base sha", argv[argv.index("--base-sha") + 1] == BASE_SHA)
+
+
+def test_git_verify_commit_is_allowlisted() -> None:
+    argv = ssh.build_remote_command(
+        "git_verify_commit",
+        repo_root="/srv/goal-flight",
+        sha=BASE_SHA,
+    )
+    assert_true("rev parse", argv[:5] == ["git", "-C", "/srv/goal-flight", "rev-parse", "--verify"])
+    assert_true("commit sha", argv[-1] == f"{BASE_SHA}^{{commit}}")
+
+
+def test_pid_identity_uses_helper() -> None:
+    argv = ssh.build_remote_command(
+        "pid_identity",
+        repo_root="/srv/goal-flight",
+        pid="4242",
+        expected_lstart="Thu Jun 11 12:00:00 2026",
+    )
+    assert_true("helper", argv[1].endswith("goalflight_fleet_launch_detached.py"))
+    assert_true("pid subcommand", "pid-identity" in argv)
+    assert_true("pid", argv[argv.index("--pid") + 1] == "4242")
+
+
 def main() -> None:
     for test in (
         test_allowed_command_classes_build,
         test_shell_metachar_rejected,
         test_unsafe_remote_gate,
         test_unknown_class_blocked,
+        test_non_allowlisted_launch_shape_blocked,
         test_build_ssh_uses_separator,
+        test_node_ssh_lock_path_and_context,
         test_parse_ssh_config,
         test_parse_ssh_config_loopback_without_stanza,
         test_auth_probe_remote_argv_order,
         test_wrap_remote_argv_expands_tilde_paths,
         test_acp_run_uses_prompt_b64_and_acp_python,
+        test_launch_detached_uses_helper_and_prompt_b64,
+        test_launch_detached_recovery_flag_is_allowlisted,
+        test_git_verify_commit_is_allowlisted,
+        test_pid_identity_uses_helper,
     ):
         test()
         print(f"PASS {test.__name__}")

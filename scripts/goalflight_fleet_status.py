@@ -36,6 +36,7 @@ TERMINAL_STATES = frozenset(
         "blocked_adapter_gate",
         "blocked_auth",
         "inconclusive_timeout",
+        "worker_dead",
     }
 )
 RUNNING_STATES = frozenset(

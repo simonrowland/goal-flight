@@ -11,6 +11,7 @@ import io
 import base64
 import json
 import os
+import re
 import sys
 import tempfile
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
@@ -22,9 +23,11 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import goalflight_fleet as fleet
 import goalflight_fleet_billing as billing
 import goalflight_fleet_dispatch as fleet_dispatch
+import goalflight_fleet_launch_detached as fleet_launch
 import goalflight_fleet_status as status
 
 FIXTURES = ROOT / "tests" / "fixtures" / "fleet_mirrors"
+BASE_SHA = "0123456789abcdef0123456789abcdef01234567"
 
 
 def assert_true(name: str, condition: bool) -> None:
@@ -34,6 +37,54 @@ def assert_true(name: str, condition: bool) -> None:
 
 def green_runner(_argv: list[str]) -> tuple[int, str, str]:
     return 0, "logged_in: true\n", ""
+
+
+def _extract_wrapped_flag(argv: list[str], flag: str, default: str) -> str:
+    joined = " ".join(argv)
+    match = re.search(rf"{re.escape(flag)}\s+'?([^'\s]+)'?", joined)
+    if match:
+        return match.group(1)
+    for idx, part in enumerate(argv):
+        if part == flag and idx + 1 < len(argv):
+            return argv[idx + 1]
+    return default
+
+
+def launch_receipt_for_argv(argv: list[str]) -> str:
+    dispatch_id = _extract_wrapped_flag(argv, "--dispatch-id", "acp-test")
+    node_id = _extract_wrapped_flag(argv, "--node-id", "localhost")
+    status_json = _extract_wrapped_flag(
+        argv,
+        "--status-json",
+        f"/tmp/goal-flight-dispatch-test/dispatches/{dispatch_id}/status.json",
+    )
+    base_sha = _extract_wrapped_flag(argv, "--base-sha", BASE_SHA)
+    return json.dumps(
+        {
+            "schema": "goalflight.fleet.launch_receipt.v1",
+            "dispatch_id": dispatch_id,
+            "node_id": node_id,
+            "remote_pid": 4242,
+            "remote_lstart": "Thu Jun 11 12:00:00 2026",
+            "remote_identity": {
+                "pid": 4242,
+                "lstart": "Thu Jun 11 12:00:00 2026",
+                "comm": "python3",
+            },
+            "remote_status_path": status_json,
+            "remote_state_dir": "/tmp/goal-flight-dispatch-test",
+            "launcher_log_path": f"/tmp/goal-flight-dispatch-test/dispatches/{dispatch_id}/dispatcher.log",
+            "started_at": "2026-06-11T12:00:00+00:00",
+            "worktree_base_sha": base_sha,
+        },
+        sort_keys=True,
+    )
+
+
+def receipt_runner(argv: list[str]) -> tuple[int, str, str]:
+    if "goalflight_fleet_launch_detached.py" in " ".join(argv):
+        return 0, launch_receipt_for_argv(argv), ""
+    return 0, "{}", ""
 
 
 def _fixture_fleet(fleet_dir: Path) -> None:
@@ -92,6 +143,7 @@ def test_explicit_dry_run_preview() -> None:
             billing_account="openai/default",
             prompt="chunk.md",
             dispatch_id="acp-dispatch-explicit",
+            base_sha=BASE_SHA,
         )
         payload = preview.to_dict()
         assert_true("node", payload["node"] == "localhost")
@@ -102,21 +154,28 @@ def test_explicit_dry_run_preview() -> None:
         classes = [c["command_class"] for c in payload["remote_commands"]]
         assert_true("cleanup refs", "git_prune_claude_refs" in classes)
         assert_true("git fetch", "git_fetch" in classes)
+        assert_true("verify commit", "git_verify_commit" in classes)
         assert_true("worktree add", "git_worktree_add" in classes)
         assert_true(
             "cleanup before fetch",
             classes.index("git_prune_claude_refs") < classes.index("git_fetch"),
         )
+        assert_true("fetch before verify", classes.index("git_fetch") < classes.index("git_verify_commit"))
+        assert_true("verify before worktree", classes.index("git_verify_commit") < classes.index("git_worktree_add"))
         assert_true("fetch before worktree", classes.index("git_fetch") < classes.index("git_worktree_add"))
+        verify = next(c for c in payload["remote_commands"] if c["command_class"] == "git_verify_commit")
+        assert_true("verify exact base", f"{BASE_SHA}^{{commit}}" in verify["argv"])
         worktree_add = next(c for c in payload["remote_commands"] if c["command_class"] == "git_worktree_add")
-        assert_true("worktree add uses fetched ref", worktree_add["argv"][-1] == "origin/main")
+        assert_true("worktree add uses base sha", worktree_add["argv"][-1] == BASE_SHA)
+        assert_true("worktree add detached", "--detach" in worktree_add["argv"])
         assert_true("worktree add avoids local HEAD", "HEAD" not in worktree_add["argv"])
-        acp = next(c for c in payload["remote_commands"] if c["command_class"] == "acp_run")
-        assert_true("acp cwd worktree", payload["worktree_path"] in acp["argv"])
+        launch = next(c for c in payload["remote_commands"] if c["command_class"] == "launch_detached")
+        assert_true("launch cwd worktree", payload["worktree_path"] in launch["argv"])
+        assert_true("launch base sha", launch["argv"][launch["argv"].index("--base-sha") + 1] == BASE_SHA)
         assert_true(
-            "acp status json",
+            "launch status json",
             "/tmp/goal-flight-dispatch-test/dispatches/acp-dispatch-explicit/status.json"
-            in acp["argv"],
+            in launch["argv"],
         )
 
 
@@ -141,6 +200,7 @@ def test_red_auth_blocks_exec() -> None:
                 agent="codex-acp",
                 billing_account="openai/default",
                 prompt="chunk.md",
+                base_sha=BASE_SHA,
                 exec=True,
                 thin_defaults=False,
                 stub_remote=True,
@@ -169,6 +229,7 @@ def test_exec_without_live_ssh_env_refuses_before_runner() -> None:
                 agent="codex-acp",
                 billing_account="openai/default",
                 prompt="chunk.md",
+                base_sha=BASE_SHA,
                 exec=True,
                 thin_defaults=False,
                 stub_remote=False,
@@ -190,7 +251,7 @@ def test_exec_with_live_ssh_env_uses_runner() -> None:
 
     def capture_runner(argv: list[str]) -> tuple[int, str, str]:
         captured.append(list(argv))
-        return 0, "{}", ""
+        return receipt_runner(argv)
 
     with live_ssh_env("1"):
         with tempfile.TemporaryDirectory() as td:
@@ -203,6 +264,7 @@ def test_exec_with_live_ssh_env_uses_runner() -> None:
                 billing_account="openai/default",
                 prompt="chunk.md",
                 dispatch_id="acp-live-opt-in",
+                base_sha=BASE_SHA,
                 exec=True,
                 thin_defaults=False,
                 stub_remote=False,
@@ -227,6 +289,7 @@ def test_preview_ignores_live_ssh_env() -> None:
                 agent="codex-acp",
                 billing_account="openai/default",
                 prompt="chunk.md",
+                base_sha=BASE_SHA,
                 exec=False,
                 thin_defaults=False,
                 stub_remote=False,
@@ -250,6 +313,7 @@ def test_thin_defaults_shows_billing_banner() -> None:
             billing_account=None,
             prompt="chunk.md",
             thin_mode=True,
+            base_sha=BASE_SHA,
         )
         assert_true("banner", preview.billing_banner is not None)
         assert_true("billing visible", preview.billing_account)
@@ -266,6 +330,7 @@ def test_lock_chain_rollback_on_worktree_failure() -> None:
             billing_account="openai/default",
             prompt="chunk.md",
             dispatch_id="acp-lock-rollback",
+            base_sha=BASE_SHA,
         )
         try:
             fleet_dispatch.acquire_lock_chain(
@@ -298,6 +363,7 @@ def test_remote_failure_surfaces_ssh_details() -> None:
             billing_account="openai/default",
             prompt="chunk.md",
             dispatch_id="acp-remote-failure",
+            base_sha=BASE_SHA,
         )
         try:
             fleet_dispatch.acquire_lock_chain(
@@ -312,6 +378,8 @@ def test_remote_failure_surfaces_ssh_details() -> None:
             assert_true("exit code", "exit 255" in message)
             assert_true("stderr", "real stderr" in message)
             assert_true("ssh argv", "ssh argv:" in message)
+        lock = fleet.load_account_lock(fleet.account_lock_path(fleet_dir, "openai/default"))
+        assert_true("pre-launch account lock released", lock is None or lock.get("state") == "released")
 
 
 def test_cleanup_refs_failure_stops_before_fetch() -> None:
@@ -338,6 +406,7 @@ def test_cleanup_refs_failure_stops_before_fetch() -> None:
             billing_account="openai/default",
             prompt=secret,
             dispatch_id="acp-cleanup-failure",
+            base_sha=BASE_SHA,
         )
         try:
             fleet_dispatch.execute_dispatch(fleet_dir, preview, runner=fail_cleanup)
@@ -351,6 +420,99 @@ def test_cleanup_refs_failure_stops_before_fetch() -> None:
             assert_true("stdout secret redacted", secret not in message)
             assert_true("stderr prompt b64 redacted", prompt_b64 not in message)
             assert_true("failure marker", "<redacted>" in message)
+
+
+def test_pending_row_written_before_remote_mutation() -> None:
+    dispatch_id = "acp-pending-before-ssh"
+
+    def crash_before_remote(_argv: list[str]) -> tuple[int, str, str]:
+        meta = json.loads((fleet_dir / "register" / "dispatches" / dispatch_id / "meta.json").read_text())
+        assert_true("pending row visible", meta.get("row_state") == "launch_pending")
+        raise SystemExit(99)
+
+    with tempfile.TemporaryDirectory() as td:
+        fleet_dir = Path(td) / "fleet"
+        _fixture_fleet(fleet_dir)
+        preview = fleet_dispatch.preview_dispatch(
+            fleet_dir,
+            node_id="localhost",
+            agent="codex-acp",
+            billing_account="openai/default",
+            prompt="chunk.md",
+            dispatch_id=dispatch_id,
+            base_sha=BASE_SHA,
+        )
+        try:
+            fleet_dispatch.execute_dispatch(fleet_dir, preview, runner=crash_before_remote)
+            assert_true("should exit", False)
+        except SystemExit:
+            pass
+        meta = json.loads((fleet_dir / "register" / "dispatches" / dispatch_id / "meta.json").read_text())
+        assert_true("pending row remains", meta.get("row_state") == "launch_pending")
+        aggregate = fleet.read_json(fleet_dir / "register" / "aggregate.json")
+        assert_true("aggregate intent visible", dispatch_id in aggregate.get("active_dispatches", []))
+
+
+def test_base_sha_absent_fails_pre_launch_and_rolls_back() -> None:
+    invoked: list[str] = []
+
+    def missing_base(argv: list[str]) -> tuple[int, str, str]:
+        joined = " ".join(argv)
+        if "goalflight_cleanup_dispatch_refs.py" in joined:
+            invoked.append("git_prune_claude_refs")
+            return 0, '{"deleted":[]}', ""
+        if " fetch " in f" {joined} ":
+            invoked.append("git_fetch")
+            return 0, "", ""
+        if " rev-parse " in f" {joined} ":
+            invoked.append("git_verify_commit")
+            return 128, "", "base commit absent"
+        if "goalflight_fleet_launch_detached.py" in joined:
+            invoked.append("launch_detached")
+        return 0, "{}", ""
+
+    with tempfile.TemporaryDirectory() as td:
+        fleet_dir = Path(td) / "fleet"
+        _fixture_fleet(fleet_dir)
+        preview = fleet_dispatch.preview_dispatch(
+            fleet_dir,
+            node_id="localhost",
+            agent="codex-acp",
+            billing_account="openai/default",
+            prompt="chunk.md",
+            dispatch_id="acp-missing-base",
+            base_sha=BASE_SHA,
+        )
+        try:
+            fleet_dispatch.execute_dispatch(fleet_dir, preview, runner=missing_base)
+            assert_true("should raise", False)
+        except fleet_dispatch.DispatchError as exc:
+            assert_true("verify failure surfaced", "remote git_verify_commit failed" in str(exc))
+        assert_true("launch not issued", invoked == ["git_prune_claude_refs", "git_fetch", "git_verify_commit"])
+        lock = fleet.load_account_lock(fleet.account_lock_path(fleet_dir, "openai/default"))
+        assert_true("account lock released", lock is None or lock.get("state") == "released")
+
+
+def test_dispatch_omitted_base_sha_teaches() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        fleet_dir = Path(td) / "fleet"
+        _fixture_fleet(fleet_dir)
+        args = Args(
+            fleet_dir=fleet_dir,
+            node="localhost",
+            agent="codex-acp",
+            billing_account="openai/default",
+            prompt="chunk.md",
+            exec=False,
+            thin_defaults=False,
+            stub_remote=False,
+        )
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            code = fleet_dispatch.cmd_dispatch(args)
+        message = stderr.getvalue()
+        assert_true("usage refusal", code == 2)
+        assert_true("base sha named", "--base-sha <40-hex commit>" in message)
 
 
 def test_redact_argv_masks_prompt_values_everywhere() -> None:
@@ -381,6 +543,7 @@ def test_redact_argv_masks_prompt_values_everywhere() -> None:
             billing_account="openai/default",
             prompt=secret,
             dispatch_id="acp-redact-preview",
+            base_sha=BASE_SHA,
         )
         preview_payload = preview.to_dict()
         assert_true("preview prompt marker", preview_payload["prompt"] == "<redacted>")
@@ -389,21 +552,25 @@ def test_redact_argv_masks_prompt_values_everywhere() -> None:
         assert_true("preview prompt b64 redacted", prompt_b64 not in serialized)
         assert_true("preview marker", "<redacted>" in serialized)
 
-        def fail_acp(argv: list[str]) -> tuple[int, str, str]:
+        def fail_launch(argv: list[str]) -> tuple[int, str, str]:
             joined = " ".join(argv)
-            if "goalflight_acp_run.py" in joined:
+            if "goalflight_fleet_launch_detached.py" in joined:
                 return 9, f"stdout echoed {secret}", f"stderr echoed --prompt-b64 {prompt_b64}"
             return 0, "{}", ""
 
-        try:
-            fleet_dispatch.acquire_lock_chain(fleet_dir, preview, runner=fail_acp)
-            assert_true("should raise", False)
-        except fleet_dispatch.DispatchError as exc:
-            message = str(exc)
-            assert_true("failure class", "remote acp_run failed" in message)
-            assert_true("failure prompt redacted", secret not in message)
-            assert_true("failure prompt b64 redacted", prompt_b64 not in message)
-            assert_true("failure marker", "<redacted>" in message)
+        chain = fleet_dispatch.acquire_lock_chain(fleet_dir, preview, runner=fail_launch)
+        message = chain.launch_unconfirmed_error or ""
+        assert_true("unconfirmed", chain.launch_unconfirmed is True)
+        assert_true("failure class", "remote launch_detached failed" in message)
+        assert_true("failure prompt redacted", secret not in message)
+        assert_true("failure prompt b64 redacted", prompt_b64 not in message)
+        assert_true("failure marker", "<redacted>" in message)
+        fleet_dispatch.release_lock_chain(
+            fleet_dir,
+            preview,
+            acquired=chain.acquired,
+            fencing_token=chain.fencing_token,
+        )
 
         live_preview = fleet_dispatch.preview_dispatch(
             fleet_dir,
@@ -412,15 +579,16 @@ def test_redact_argv_masks_prompt_values_everywhere() -> None:
             billing_account="openai/default",
             prompt=secret,
             dispatch_id="acp-redact-live",
+            base_sha=BASE_SHA,
         )
 
-        def echo_acp(argv: list[str]) -> tuple[int, str, str]:
+        def echo_launch(argv: list[str]) -> tuple[int, str, str]:
             joined = " ".join(argv)
-            if "goalflight_acp_run.py" in joined:
-                return 0, f"stdout echoed {secret}", f"stderr echoed --prompt-b64 {prompt_b64}"
+            if "goalflight_fleet_launch_detached.py" in joined:
+                return 0, launch_receipt_for_argv(argv), f"stderr echoed --prompt-b64 {prompt_b64}"
             return 0, "{}", ""
 
-        chain = fleet_dispatch.acquire_lock_chain(fleet_dir, live_preview, runner=echo_acp)
+        chain = fleet_dispatch.acquire_lock_chain(fleet_dir, live_preview, runner=echo_launch)
         try:
             live_result = json.dumps({"remote_log": chain.remote_log})
             assert_true("live stdout/stderr prompt redacted", secret not in live_result)
@@ -477,17 +645,244 @@ def test_stub_e2e_terminal_clears_locks() -> None:
             billing_account="openai/default",
             prompt="chunk.md",
             dispatch_id="acp-e2e-stub",
+            base_sha=BASE_SHA,
         )
         result = fleet_dispatch.execute_dispatch(
             fleet_dir,
             preview,
-            runner=lambda _a: (0, "{}", ""),
+            runner=receipt_runner,
             stub_terminal=True,
         )
         assert_true("ok", result["ok"] is True)
-        assert_true("remote lease", result.get("remote_lease_id"))
+        assert_true("launch receipt", result.get("launch_receipt", {}).get("remote_pid") == 4242)
         lock = fleet.load_account_lock(fleet.account_lock_path(fleet_dir, "openai/default"))
         assert_true("lock cleared", lock is None or lock.get("state") == "released")
+
+
+def test_launch_unconfirmed_keeps_account_lock() -> None:
+    def fail_launch(argv: list[str]) -> tuple[int, str, str]:
+        if "goalflight_fleet_launch_detached.py" in " ".join(argv):
+            return 1, "", "ssh connection reset after launch command was issued"
+        return 0, "{}", ""
+
+    with tempfile.TemporaryDirectory() as td:
+        fleet_dir = Path(td) / "fleet"
+        _fixture_fleet(fleet_dir)
+        preview = fleet_dispatch.preview_dispatch(
+            fleet_dir,
+            node_id="localhost",
+            agent="codex-acp",
+            billing_account="openai/default",
+            prompt="chunk.md",
+            dispatch_id="acp-launch-unconfirmed",
+            base_sha=BASE_SHA,
+        )
+        result = fleet_dispatch.execute_dispatch(fleet_dir, preview, runner=fail_launch)
+        assert_true("result ok", result["ok"] is True)
+        assert_true("unconfirmed", result.get("launch_unconfirmed") is True)
+        lock = fleet.load_account_lock(fleet.account_lock_path(fleet_dir, "openai/default"))
+        assert_true("lock remains active", lock is not None and lock.get("state") == "active")
+        meta = json.loads(
+            (fleet_dir / "register" / "dispatches" / "acp-launch-unconfirmed" / "meta.json").read_text()
+        )
+        assert_true("meta unconfirmed", meta.get("launch_unconfirmed") is True)
+        record = json.loads(Path(result["ledger"]["path"]).read_text())
+        assert_true("ledger state", record.get("state") == "launch_unconfirmed")
+
+
+def test_preview_passes_recovery_flag_only_with_unconfirmed_meta() -> None:
+    dispatch_id = "acp-recovery-flag"
+    with tempfile.TemporaryDirectory() as td:
+        fleet_dir = Path(td) / "fleet"
+        _fixture_fleet(fleet_dir)
+        plain = fleet_dispatch.preview_dispatch(
+            fleet_dir,
+            node_id="localhost",
+            agent="codex-acp",
+            billing_account="openai/default",
+            prompt="chunk.md",
+            dispatch_id=dispatch_id,
+            base_sha=BASE_SHA,
+        )
+        plain_launch = next(c for c in plain.remote_commands if c["command_class"] == "launch_detached")
+        assert_true("plain no recover", "--recover-unconfirmed" not in plain_launch["argv"])
+
+        dispatch_dir = fleet_dir / "register" / "dispatches" / dispatch_id
+        dispatch_dir.mkdir(parents=True, exist_ok=True)
+        fleet._atomic_write_json(
+            dispatch_dir / "meta.json",
+            {
+                "dispatch_id": dispatch_id,
+                "node_id": "localhost",
+                "launch_unconfirmed": True,
+            },
+        )
+        recovery = fleet_dispatch.preview_dispatch(
+            fleet_dir,
+            node_id="localhost",
+            agent="codex-acp",
+            billing_account="openai/default",
+            prompt="chunk.md",
+            dispatch_id=dispatch_id,
+            base_sha=BASE_SHA,
+        )
+        recovery_launch = next(c for c in recovery.remote_commands if c["command_class"] == "launch_detached")
+        assert_true("recover flag", "--recover-unconfirmed" in recovery_launch["argv"])
+
+
+def test_launch_unconfirmed_retry_reuses_same_account_lock() -> None:
+    dispatch_id = "acp-launch-retry"
+
+    def fail_first(argv: list[str]) -> tuple[int, str, str]:
+        if "goalflight_fleet_launch_detached.py" in " ".join(argv):
+            return 255, "", "ssh connection lost after remote launch may have started"
+        return 0, "{}", ""
+
+    with tempfile.TemporaryDirectory() as td:
+        fleet_dir = Path(td) / "fleet"
+        _fixture_fleet(fleet_dir)
+        first = fleet_dispatch.preview_dispatch(
+            fleet_dir,
+            node_id="localhost",
+            agent="codex-acp",
+            billing_account="openai/default",
+            prompt="chunk.md",
+            dispatch_id=dispatch_id,
+            base_sha=BASE_SHA,
+        )
+        first_result = fleet_dispatch.execute_dispatch(fleet_dir, first, runner=fail_first)
+        assert_true("first unconfirmed", first_result.get("launch_unconfirmed") is True)
+        first_lock = fleet.load_account_lock(fleet.account_lock_path(fleet_dir, "openai/default"))
+        assert_true("first lock active", first_lock is not None and first_lock.get("state") == "active")
+
+        second = fleet_dispatch.preview_dispatch(
+            fleet_dir,
+            node_id="localhost",
+            agent="codex-acp",
+            billing_account="openai/default",
+            prompt="chunk.md",
+            dispatch_id=dispatch_id,
+            base_sha=BASE_SHA,
+        )
+        launch = next(c for c in second.remote_commands if c["command_class"] == "launch_detached")
+        assert_true("recovery flag", "--recover-unconfirmed" in launch["argv"])
+        second_result = fleet_dispatch.execute_dispatch(fleet_dir, second, runner=receipt_runner)
+        assert_true("second ok", second_result["ok"] is True)
+        assert_true("receipt", second_result.get("launch_receipt", {}).get("remote_pid") == 4242)
+        second_lock = fleet.load_account_lock(fleet.account_lock_path(fleet_dir, "openai/default"))
+        assert_true(
+            "same lock token",
+            second_lock is not None and second_lock.get("fencing_token") == first_lock.get("fencing_token"),
+        )
+
+
+def test_launch_helper_sanitizes_worker_env() -> None:
+    env = fleet_launch._sanitized_env(
+        {
+            "PATH": "/bin",
+            "GOALFLIGHT_STATE_DIR": "/tmp/state",
+            "SSH_AUTH_SOCK": "/tmp/ssh.sock",
+            "CUSTOM_AGENT_SOCK": "/tmp/agent.sock",
+            "UNRELATED_SECRET": "drop",
+        }
+    )
+    assert_true("path kept", env.get("PATH") == "/bin")
+    assert_true("goalflight kept", env.get("GOALFLIGHT_STATE_DIR") == "/tmp/state")
+    assert_true("ssh sock stripped", "SSH_AUTH_SOCK" not in env)
+    assert_true("agent sock stripped", "CUSTOM_AGENT_SOCK" not in env)
+    assert_true("unrelated dropped", "UNRELATED_SECRET" not in env)
+
+
+def test_launch_helper_warn_refuses_duplicate_without_recovery_evidence() -> None:
+    dispatch_id = "acp-refuse-existing"
+    with tempfile.TemporaryDirectory() as td:
+        state_dir = Path(td) / "state"
+        status_json = state_dir / "dispatches" / dispatch_id / "status.json"
+        status_json.parent.mkdir(parents=True, exist_ok=True)
+        status_json.write_text(
+            json.dumps(
+                {
+                    "schema": "goalflight.acp-run.v1",
+                    "seq": 3,
+                    "dispatch_id": dispatch_id,
+                    "state": "running",
+                    "worker_pid": 12345,
+                    "worker_identity": {
+                        "pid": 12345,
+                        "lstart": "Thu Jun 11 12:00:00 2026",
+                        "comm": "python3",
+                    },
+                }
+            )
+        )
+        args = Args(
+            repo_root=str(ROOT),
+            state_dir=str(state_dir),
+            dispatch_id=dispatch_id,
+            node_id="localhost",
+            agent="codex-acp",
+            prompt_b64=base64.b64encode(b"colliding prompt").decode("ascii"),
+            cwd=str(ROOT),
+            status_json=str(status_json),
+            read_only=False,
+            recover_unconfirmed=False,
+            base_sha=BASE_SHA,
+        )
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            code = fleet_launch._launch(args)
+        assert_true("warn refuse", code == 17)
+        assert_true("teaching message", "WARN-REFUSE duplicate dispatch-id" in stderr.getvalue())
+        assert_true("prompt not written", not (status_json.parent / "prompt.md").exists())
+
+
+def test_launch_helper_recovers_existing_status_with_unconfirmed_evidence() -> None:
+    dispatch_id = "acp-reuse-existing"
+    with tempfile.TemporaryDirectory() as td:
+        state_dir = Path(td) / "state"
+        status_json = state_dir / "dispatches" / dispatch_id / "status.json"
+        status_json.parent.mkdir(parents=True, exist_ok=True)
+        status_json.write_text(
+            json.dumps(
+                {
+                    "schema": "goalflight.acp-run.v1",
+                    "seq": 3,
+                    "dispatch_id": dispatch_id,
+                    "state": "running",
+                    "worker_pid": 12345,
+                    "worker_identity": {
+                        "pid": 12345,
+                        "lstart": "Thu Jun 11 12:00:00 2026",
+                        "comm": "python3",
+                    },
+                    "updated_at": "2026-06-11T12:00:00+00:00",
+                }
+            )
+        )
+        args = Args(
+            repo_root=str(ROOT),
+            state_dir=str(state_dir),
+            dispatch_id=dispatch_id,
+            node_id="localhost",
+            agent="codex-acp",
+            prompt_b64=base64.b64encode(b"do not write this prompt").decode("ascii"),
+            cwd=str(ROOT),
+            status_json=str(status_json),
+            read_only=False,
+            recover_unconfirmed=True,
+            base_sha=BASE_SHA,
+        )
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            code = fleet_launch._launch(args)
+        receipt = json.loads(stdout.getvalue())
+        assert_true("launch helper ok", code == 0)
+        assert_true("reused", receipt.get("reused") is True)
+        assert_true("recovered", receipt.get("recovered") is True)
+        assert_true("reuse source", receipt.get("reuse_source") == "status_json")
+        assert_true("existing pid", receipt.get("remote_pid") == 12345)
+        assert_true("base sha echoed", receipt.get("worktree_base_sha") == BASE_SHA)
+        assert_true("prompt not written", not (status_json.parent / "prompt.md").exists())
 
 
 def test_resolve_dispatch_runner_stub_and_live() -> None:
@@ -507,7 +902,7 @@ def test_exec_without_stub_uses_runner() -> None:
 
     def capture_runner(argv: list[str]) -> tuple[int, str, str]:
         captured.append(list(argv))
-        return 0, "{}", ""
+        return receipt_runner(argv)
 
     with tempfile.TemporaryDirectory() as td:
         fleet_dir = Path(td) / "fleet"
@@ -519,6 +914,7 @@ def test_exec_without_stub_uses_runner() -> None:
             billing_account="openai/default",
             prompt="chunk.md",
             dispatch_id="acp-live-runner",
+            base_sha=BASE_SHA,
         )
         args = Args(
             fleet_dir=fleet_dir,
@@ -541,7 +937,7 @@ def test_exec_runner_uses_node_ssh_identity() -> None:
 
     def capture_runner(argv: list[str]) -> tuple[int, str, str]:
         captured.append(list(argv))
-        return 0, "{}", ""
+        return receipt_runner(argv)
 
     with tempfile.TemporaryDirectory() as td:
         fleet_dir = Path(td) / "fleet"
@@ -561,6 +957,7 @@ def test_exec_runner_uses_node_ssh_identity() -> None:
             billing_account="openai/default",
             prompt="chunk.md",
             dispatch_id="acp-node-ssh",
+            base_sha=BASE_SHA,
         )
         fleet_dispatch.execute_dispatch(fleet_dir, preview, runner=capture_runner)
         assert_true("remote commands", len(captured) >= 1)
@@ -571,25 +968,7 @@ def test_exec_runner_uses_node_ssh_identity() -> None:
         assert_true("user host target", "runner@remote.example" in first)
 
 
-def test_sync_finalize_clears_locks() -> None:
-    mirror_json = json.dumps(
-        {
-            "schema": "goalflight.acp-run.v1",
-            "dispatch_id": "acp-sync-finalize",
-            "state": "complete",
-            "agent": "codex-acp",
-            "events_seen": 3,
-        }
-    )
-
-    def mirror_runner(argv: list[str]) -> tuple[int, str, str]:
-        joined = " ".join(argv)
-        if "goalflight_acp_run.py" in joined:
-            return 0, mirror_json, ""
-        if joined.endswith("status.json") or "read_status_file" in joined or " cat " in joined:
-            return 0, mirror_json, ""
-        return 0, "{}", ""
-
+def test_async_launch_receipt_persisted_and_locks_remain() -> None:
     with tempfile.TemporaryDirectory() as td:
         fleet_dir = Path(td) / "fleet"
         _fixture_fleet(fleet_dir)
@@ -599,26 +978,30 @@ def test_sync_finalize_clears_locks() -> None:
             agent="codex-acp",
             billing_account="openai/default",
             prompt="chunk.md",
-            dispatch_id="acp-sync-finalize",
+            dispatch_id="acp-async-launch",
+            base_sha=BASE_SHA,
         )
         result = fleet_dispatch.execute_dispatch(
             fleet_dir,
             preview,
-            runner=mirror_runner,
+            runner=receipt_runner,
             stub_terminal=False,
         )
         assert_true("ok", result["ok"] is True)
-        assert_true("finalize ok", (result.get("finalize") or {}).get("ok") is True)
+        assert_true("finalize skipped", result.get("finalize") is None)
+        assert_true("receipt pid", result.get("launch_receipt", {}).get("remote_pid") == 4242)
         lock = fleet.load_account_lock(fleet.account_lock_path(fleet_dir, "openai/default"))
-        assert_true("lock cleared", lock is None or lock.get("state") == "released")
+        assert_true("lock remains active", lock is not None and lock.get("state") == "active")
         meta = json.loads(
-            (fleet_dir / "register" / "dispatches" / "acp-sync-finalize" / "meta.json").read_text()
+            (fleet_dir / "register" / "dispatches" / "acp-async-launch" / "meta.json").read_text()
         )
         assert_true("remote status path", meta.get("remote_status_path"))
-        assert_true("lease inactive", meta.get("lease_active") is False)
+        assert_true("receipt persisted", meta.get("launch_receipt", {}).get("remote_pid") == 4242)
+        assert_true("lease superseded", meta.get("remote_lease_id_superseded_by") == "launch_receipt")
+        assert_true("lease active", meta.get("lease_active") is True)
 
 
-def test_ledger_remote_lease_id_roundtrip() -> None:
+def test_ledger_launch_receipt_roundtrip() -> None:
     with tempfile.TemporaryDirectory() as td:
         fleet_dir = Path(td) / "fleet"
         _fixture_fleet(fleet_dir)
@@ -629,11 +1012,16 @@ def test_ledger_remote_lease_id_roundtrip() -> None:
             billing_account="openai/default",
             prompt="chunk.md",
             dispatch_id="acp-ledger-lease",
+            base_sha=BASE_SHA,
         )
-        chain = fleet_dispatch.LockChainResult(remote_lease_id="lease-123", acquired=["account"])
+        chain = fleet_dispatch.LockChainResult(
+            launch_receipt={"dispatch_id": "acp-ledger-lease", "remote_pid": 4242},
+            acquired=["account"],
+        )
         info = fleet_dispatch.record_dispatch_ledger(preview, chain)
         record = json.loads(Path(info["path"]).read_text())
-        assert_true("remote_lease_id", record.get("remote_lease_id") == "lease-123")
+        assert_true("remote_lease_id retired", record.get("remote_lease_id") is None)
+        assert_true("receipt", record.get("remote_launch_receipt", {}).get("remote_pid") == 4242)
 
 
 def main() -> None:
@@ -646,13 +1034,22 @@ def main() -> None:
     test_lock_chain_rollback_on_worktree_failure()
     test_remote_failure_surfaces_ssh_details()
     test_redact_argv_masks_prompt_values_everywhere()
+    test_pending_row_written_before_remote_mutation()
+    test_base_sha_absent_fails_pre_launch_and_rolls_back()
+    test_dispatch_omitted_base_sha_teaches()
     test_quarantine_blocks_dispatch()
+    test_launch_unconfirmed_keeps_account_lock()
+    test_preview_passes_recovery_flag_only_with_unconfirmed_meta()
+    test_launch_unconfirmed_retry_reuses_same_account_lock()
+    test_launch_helper_sanitizes_worker_env()
+    test_launch_helper_warn_refuses_duplicate_without_recovery_evidence()
+    test_launch_helper_recovers_existing_status_with_unconfirmed_evidence()
     test_resolve_dispatch_runner_stub_and_live()
     test_exec_without_stub_uses_runner()
     test_exec_runner_uses_node_ssh_identity()
     test_stub_e2e_terminal_clears_locks()
-    test_sync_finalize_clears_locks()
-    test_ledger_remote_lease_id_roundtrip()
+    test_async_launch_receipt_persisted_and_locks_remain()
+    test_ledger_launch_receipt_roundtrip()
     print("OK: fleet dispatch tests pass")
 
 

@@ -13,13 +13,24 @@ unknown, and the last good mirror file is left untouched.
 from __future__ import annotations
 
 import json
+import random
 import tempfile
+import time
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
 import goalflight_fleet_mirror as mirror
+import goalflight_fleet_status as fleet_status
 from goalflight_liveness import write_status
+
+DEFAULT_UNTIL_TIMEOUT_S = 3600.0
+DEFAULT_UNTIL_INTERVAL_S = 45.0
+DEFAULT_UNTIL_JITTER_S = 5.0
+DEFAULT_STALE_S = 300.0
+LAUNCH_UNCONFIRMED_GRACE_POLLS = 2
+LAUNCH_UNCONFIRMED_GRACE_S = 60.0
 
 
 class FleetWatchTransport(Protocol):
@@ -40,6 +51,14 @@ class FleetWatchTransport(Protocol):
 class RemoteFetchResult:
     ok: bool
     content: str | None = None
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class RemoteIdentityResult:
+    ok: bool
+    alive: bool = False
+    identity: dict[str, Any] | None = None
     error: str | None = None
 
 
@@ -73,6 +92,24 @@ class FleetWatchResult:
         }
 
 
+@dataclass(frozen=True)
+class UntilTerminalResult:
+    dispatch_id: str
+    exit_code: int
+    state: str
+    polls: int
+    detail: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "dispatch_id": self.dispatch_id,
+            "exit_code": self.exit_code,
+            "state": self.state,
+            "polls": self.polls,
+            "detail": self.detail,
+        }
+
+
 def dispatch_register_dir(fleet_dir: Path) -> Path:
     return fleet_dir / "register" / "dispatches"
 
@@ -93,6 +130,26 @@ def _read_json_object(path: Path) -> dict[str, Any]:
     except (OSError, json.JSONDecodeError):
         return {}
     return payload if isinstance(payload, dict) else {}
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _utc_now_iso() -> str:
+    return _utc_now().isoformat(timespec="seconds")
+
+
+def _parse_iso_datetime(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
@@ -176,6 +233,270 @@ def _mark_meta_ingested(meta_path: Path, *, seq: int) -> None:
     _atomic_write_json(meta_path, meta)
 
 
+def _mark_meta_identity(
+    meta_path: Path,
+    *,
+    pid_hint: str,
+    identity_result: RemoteIdentityResult,
+) -> None:
+    meta = _read_json_object(meta_path)
+    meta["pid_hint"] = pid_hint
+    meta["last_identity_check_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    if identity_result.identity is not None:
+        meta["remote_pid_last_identity"] = identity_result.identity
+    if identity_result.error:
+        meta["remote_pid_identity_error"] = identity_result.error
+    else:
+        meta.pop("remote_pid_identity_error", None)
+    _atomic_write_json(meta_path, meta)
+
+
+def _mark_launch_unconfirmed_miss(
+    meta_path: Path,
+    *,
+    fetch_error: str | None,
+) -> dict[str, Any]:
+    meta = _read_json_object(meta_path)
+    meta["launch_unconfirmed"] = True
+    meta["row_state"] = "launch_unconfirmed"
+    meta["launch_unconfirmed_status_misses"] = int(meta.get("launch_unconfirmed_status_misses") or 0) + 1
+    meta["launch_unconfirmed_last_miss_at"] = _utc_now_iso()
+    meta.setdefault("launch_unconfirmed_first_seen_at", meta["launch_unconfirmed_last_miss_at"])
+    if fetch_error:
+        meta["launch_unconfirmed_last_fetch_error"] = fetch_error
+    _atomic_write_json(meta_path, meta)
+    return meta
+
+
+def _launch_unconfirmed_reference_time(meta: dict[str, Any]) -> datetime | None:
+    for key in ("launch_issued_at", "launch_unconfirmed_at", "started_at"):
+        parsed = _parse_iso_datetime(meta.get(key))
+        if parsed is not None:
+            return parsed
+    receipt = meta.get("launch_receipt")
+    if isinstance(receipt, dict):
+        parsed = _parse_iso_datetime(receipt.get("started_at"))
+        if parsed is not None:
+            return parsed
+    return _parse_iso_datetime(meta.get("launch_unconfirmed_first_seen_at"))
+
+
+def _launch_unconfirmed_grace_elapsed(meta: dict[str, Any]) -> bool:
+    misses = int(meta.get("launch_unconfirmed_status_misses") or 0)
+    if misses < LAUNCH_UNCONFIRMED_GRACE_POLLS:
+        return False
+    issued_at = _launch_unconfirmed_reference_time(meta)
+    if issued_at is None:
+        return False
+    return (_utc_now() - issued_at).total_seconds() >= LAUNCH_UNCONFIRMED_GRACE_S
+
+
+def _coerce_pid(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _identity_from_payload(payload: dict[str, Any], *, pid: int) -> dict[str, Any] | None:
+    identity = payload.get("worker_identity") or payload.get("expected_worker_identity")
+    if isinstance(identity, dict):
+        result = dict(identity)
+        result.setdefault("pid", pid)
+        return result
+    return {"pid": pid}
+
+
+def _receipt_from_status_payload(
+    *,
+    dispatch_id: str,
+    meta: dict[str, Any],
+    payload: dict[str, Any],
+    remote_status_path: str,
+) -> dict[str, Any] | None:
+    pid = _coerce_pid(payload.get("worker_pid") or payload.get("pid"))
+    if pid is None:
+        return None
+    identity = _identity_from_payload(payload, pid=pid)
+    base_sha = meta.get("worktree_base_sha") or meta.get("base_sha")
+    receipt = {
+        "schema": "goalflight.fleet.launch_receipt.v1",
+        "dispatch_id": dispatch_id,
+        "node_id": str(meta.get("node_id") or ""),
+        "remote_pid": pid,
+        "remote_lstart": identity.get("lstart") if isinstance(identity, dict) else None,
+        "remote_identity": identity,
+        "remote_status_path": remote_status_path,
+        "remote_state_dir": meta.get("remote_state_dir"),
+        "started_at": str(payload.get("updated_at") or datetime.now(timezone.utc).isoformat(timespec="seconds")),
+        "recovered": True,
+        "recovery_source": "poll_status",
+    }
+    if isinstance(base_sha, str) and base_sha:
+        receipt["worktree_base_sha"] = base_sha
+    return receipt
+
+
+def _receipt_from_meta(meta: dict[str, Any], *, dispatch_id: str) -> dict[str, Any] | None:
+    existing = meta.get("launch_receipt")
+    if isinstance(existing, dict) and existing.get("remote_pid"):
+        receipt = dict(existing)
+        receipt.setdefault("dispatch_id", dispatch_id)
+        return receipt
+    pid = _coerce_pid(meta.get("remote_pid"))
+    remote_status_path = meta.get("remote_status_path")
+    if pid is None or not isinstance(remote_status_path, str) or not remote_status_path:
+        return None
+    identity = meta.get("remote_pid_identity")
+    if not isinstance(identity, dict):
+        identity = {"pid": pid}
+    base_sha = meta.get("worktree_base_sha") or meta.get("base_sha")
+    receipt = {
+        "schema": "goalflight.fleet.launch_receipt.v1",
+        "dispatch_id": dispatch_id,
+        "node_id": str(meta.get("node_id") or ""),
+        "remote_pid": pid,
+        "remote_lstart": meta.get("remote_pid_lstart") or identity.get("lstart"),
+        "remote_identity": identity,
+        "remote_status_path": remote_status_path,
+        "remote_state_dir": meta.get("remote_state_dir"),
+        "recovered": True,
+        "recovery_source": "poll_pid_identity",
+    }
+    if isinstance(base_sha, str) and base_sha:
+        receipt["worktree_base_sha"] = base_sha
+    return receipt
+
+
+def _mark_launch_recovered(
+    meta_path: Path,
+    *,
+    receipt: dict[str, Any],
+    seq: int | None,
+) -> None:
+    meta = _read_json_object(meta_path)
+    identity = receipt.get("remote_identity") if isinstance(receipt.get("remote_identity"), dict) else None
+    remote_lstart = receipt.get("remote_lstart") or (identity or {}).get("lstart")
+    meta["launch_unconfirmed"] = False
+    meta.pop("launch_unconfirmed_error", None)
+    meta["launch_receipt"] = receipt
+    meta["launch_recovered"] = True
+    meta["launch_recovered_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    meta["row_state"] = "launch_receipted"
+    meta["pid_hint"] = "alive"
+    meta["remote_pid"] = receipt.get("remote_pid")
+    meta["remote_pid_lstart"] = remote_lstart
+    meta["remote_pid_identity"] = identity
+    meta["remote_status_path"] = receipt.get("remote_status_path") or meta.get("remote_status_path")
+    if seq is not None:
+        meta["last_mirror_seq"] = seq
+    _atomic_write_json(meta_path, meta)
+
+
+def _write_launch_failed_and_release(
+    fleet_dir: Path,
+    dispatch_id: str,
+    *,
+    reason: str,
+) -> DispatchWatchResult:
+    import goalflight_fleet_reconcile as fleet_reconcile
+
+    prior = _read_local_mirror(fleet_dir, dispatch_id)
+    seq = int(prior.last_seq or 0) + 1
+    payload = {
+        "schema": mirror.STATUS_MIRROR_SCHEMA,
+        "seq": seq,
+        "dispatch_id": dispatch_id,
+        "state": "failed",
+        "reason": reason,
+        "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    write_status(dispatch_status_path(fleet_dir, dispatch_id), payload)
+    meta_path = dispatch_meta_path(fleet_dir, dispatch_id)
+    meta = _read_json_object(meta_path)
+    meta["launch_unconfirmed"] = False
+    meta["row_state"] = "failed"
+    meta["pid_hint"] = "dead"
+    meta["last_mirror_seq"] = seq
+    meta["launch_resolution"] = reason
+    _atomic_write_json(meta_path, meta)
+    fleet_reconcile.reconcile_dispatch(fleet_dir, dispatch_id, mutate=True, ssh_reachable=True)
+    return DispatchWatchResult(
+        dispatch_id,
+        ok=True,
+        action="launch_unconfirmed_failed",
+        detail=reason,
+        seq=seq,
+    )
+
+
+def _resolve_unconfirmed_without_status(
+    fleet_dir: Path,
+    dispatch_id: str,
+    meta: dict[str, Any],
+    transport: FleetWatchTransport,
+    *,
+    node_entry: dict[str, Any] | None,
+    fetch_error: str | None,
+) -> DispatchWatchResult:
+    meta_path = dispatch_meta_path(fleet_dir, dispatch_id)
+    meta = _mark_launch_unconfirmed_miss(meta_path, fetch_error=fetch_error)
+    status_absent = not dispatch_status_path(fleet_dir, dispatch_id).exists()
+    receipt = _receipt_from_meta(meta, dispatch_id=dispatch_id)
+    if receipt:
+        identity = _identity_check(
+            transport,
+            node_id=str(meta.get("node_id") or ""),
+            node_entry=node_entry,
+            receipt=receipt,
+        )
+        _mark_meta_identity(
+            meta_path,
+            pid_hint="alive" if identity.ok and identity.alive else "dead" if identity.ok else "unknown",
+            identity_result=identity,
+        )
+        if identity.ok and identity.alive:
+            return DispatchWatchResult(
+                dispatch_id,
+                ok=True,
+                action="launch_unconfirmed",
+                detail="launch_unconfirmed live pid waiting for status",
+                seq=local_mirror_last_seq(fleet_dir, dispatch_id),
+            )
+        latest_meta = _read_json_object(meta_path)
+        if identity.ok and not identity.alive and status_absent and _launch_unconfirmed_grace_elapsed(latest_meta):
+            return _write_launch_failed_and_release(
+                fleet_dir,
+                dispatch_id,
+                reason="launch_unconfirmed_no_status_dead_pid_after_grace",
+            )
+        if identity.ok and not identity.alive:
+            return DispatchWatchResult(
+                dispatch_id,
+                ok=True,
+                action="launch_unconfirmed",
+                detail="launch_unconfirmed dead pid proof pending grace",
+                seq=local_mirror_last_seq(fleet_dir, dispatch_id),
+            )
+        if not identity.ok:
+            return DispatchWatchResult(
+                dispatch_id,
+                ok=True,
+                action="launch_unconfirmed",
+                detail=identity.error or "launch_unconfirmed identity proof unavailable",
+                seq=local_mirror_last_seq(fleet_dir, dispatch_id),
+            )
+    return DispatchWatchResult(
+        dispatch_id,
+        ok=True,
+        action="launch_unconfirmed",
+        detail="launch_unconfirmed waiting for status or no-worker proof",
+        seq=local_mirror_last_seq(fleet_dir, dispatch_id),
+    )
+
+
 def ingest_dispatch_mirror(
     fleet_dir: Path,
     dispatch_id: str,
@@ -213,6 +534,15 @@ def ingest_dispatch_mirror(
         node_entry=node_entry,
     )
     if not fetch.ok or fetch.content is None:
+        if meta.get("launch_unconfirmed") is True:
+            return _resolve_unconfirmed_without_status(
+                fleet_dir,
+                dispatch_id,
+                meta,
+                transport,
+                node_entry=node_entry,
+                fetch_error=fetch.error,
+            )
         return DispatchWatchResult(
             dispatch_id,
             ok=False,
@@ -224,6 +554,14 @@ def ingest_dispatch_mirror(
     validated = validate_remote_content(fetch.content, last_seq=last_seq)
 
     if not validated.ok and validated.error == mirror.ERROR_SEQ_REGRESSION:
+        if validated.last_seq == last_seq:
+            return DispatchWatchResult(
+                dispatch_id,
+                ok=True,
+                action="unchanged",
+                detail=validated.detail,
+                seq=validated.last_seq,
+            )
         _mark_meta_seq_regression(meta_path, detail=validated.detail)
         return DispatchWatchResult(
             dispatch_id,
@@ -246,6 +584,15 @@ def ingest_dispatch_mirror(
     assert validated.payload is not None
     write_status(status_path, validated.payload)
     _mark_meta_ingested(meta_path, seq=int(validated.last_seq or validated.payload["seq"]))
+    if meta.get("launch_unconfirmed") is True:
+        receipt = _receipt_from_status_payload(
+            dispatch_id=dispatch_id,
+            meta=meta,
+            payload=validated.payload,
+            remote_status_path=remote_path,
+        )
+        if receipt is not None:
+            _mark_launch_recovered(meta_path, receipt=receipt, seq=validated.last_seq)
     return DispatchWatchResult(
         dispatch_id,
         ok=True,
@@ -302,9 +649,11 @@ class SshFleetWatchTransport:
         *,
         runner: Callable[[list[str]], tuple[int, str, str]] | None = None,
         dry_run: bool = False,
+        fleet_dir: Path | None = None,
     ) -> None:
         self._runner = runner
         self._dry_run = dry_run
+        self._fleet_dir = fleet_dir
 
     def fetch_remote_status(
         self,
@@ -330,7 +679,8 @@ class SshFleetWatchTransport:
                 status_path=remote_status_path,
             )
             ssh_argv = fleet_ssh.build_ssh_command(host, remote, command_class="read_status_file")
-            run = fleet_ssh.run_ssh(ssh_argv, runner=self._runner, dry_run=self._dry_run)
+            with fleet_ssh.node_ssh_lock(node_id, fleet_dir=self._fleet_dir):
+                run = fleet_ssh.run_ssh(ssh_argv, runner=self._runner, dry_run=self._dry_run)
         except fleet_ssh.SshAllowlistError as exc:
             return RemoteFetchResult(ok=False, error=str(exc))
 
@@ -345,12 +695,248 @@ class SshFleetWatchTransport:
             return RemoteFetchResult(ok=False, error="remote status empty")
         return RemoteFetchResult(ok=True, content=stdout)
 
+    def check_remote_identity(
+        self,
+        *,
+        node_id: str,
+        node_entry: dict[str, Any] | None,
+        receipt: dict[str, Any],
+    ) -> RemoteIdentityResult:
+        import goalflight_fleet_ssh as fleet_ssh
+
+        if node_entry is None:
+            return RemoteIdentityResult(ok=False, error=f"unknown fleet node: {node_id}")
+        try:
+            pid = int(receipt.get("remote_pid"))
+        except (TypeError, ValueError):
+            return RemoteIdentityResult(ok=False, error="launch receipt missing remote_pid")
+        try:
+            host = fleet_ssh.host_from_node_entry(node_id, node_entry)
+            remote = fleet_ssh.build_remote_command(
+                "pid_identity",
+                repo_root=str(node_entry.get("repo_root") or ""),
+                python=str(node_entry.get("python") or "python3"),
+                pid=str(pid),
+                expected_lstart=str(receipt.get("remote_lstart") or ""),
+            )
+            ssh_argv = fleet_ssh.build_ssh_command(host, remote, command_class="pid_identity")
+            with fleet_ssh.node_ssh_lock(node_id, fleet_dir=self._fleet_dir):
+                run = fleet_ssh.run_ssh(ssh_argv, runner=self._runner, dry_run=self._dry_run)
+        except fleet_ssh.SshAllowlistError as exc:
+            return RemoteIdentityResult(ok=False, error=str(exc))
+
+        if not run.get("ok"):
+            stderr = (run.get("stderr") or "").strip()
+            return RemoteIdentityResult(ok=False, error=stderr or f"ssh exit {run.get('exit_code')}")
+        try:
+            payload = json.loads(str(run.get("stdout") or "").strip())
+        except json.JSONDecodeError as exc:
+            return RemoteIdentityResult(ok=False, error=f"invalid identity JSON: {exc}")
+        if not isinstance(payload, dict):
+            return RemoteIdentityResult(ok=False, error="identity response must be a JSON object")
+        return RemoteIdentityResult(
+            ok=True,
+            alive=bool(payload.get("alive")),
+            identity=payload.get("identity") if isinstance(payload.get("identity"), dict) else None,
+        )
+
+
+def _read_local_mirror(fleet_dir: Path, dispatch_id: str) -> mirror.MirrorReadResult:
+    return mirror.read_status_mirror(dispatch_status_path(fleet_dir, dispatch_id))
+
+
+def _mirror_state(result: mirror.MirrorReadResult) -> str | None:
+    if result.ok and result.payload:
+        state = result.payload.get("state")
+        if isinstance(state, str):
+            return state
+    return None
+
+
+def _write_worker_dead_mirror(
+    fleet_dir: Path,
+    dispatch_id: str,
+    *,
+    prior: mirror.MirrorReadResult,
+    identity_result: RemoteIdentityResult,
+) -> None:
+    seq = int(prior.last_seq or 0) + 1
+    payload = {
+        "schema": mirror.STATUS_MIRROR_SCHEMA,
+        "seq": seq,
+        "dispatch_id": dispatch_id,
+        "state": "worker_dead",
+        "reason": "remote_launch_pid_dead",
+        "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    if prior.ok and prior.payload:
+        for key in ("agent", "tail_path", "worker_pid"):
+            if key in prior.payload:
+                payload[key] = prior.payload[key]
+    write_status(dispatch_status_path(fleet_dir, dispatch_id), payload)
+    meta_path = dispatch_meta_path(fleet_dir, dispatch_id)
+    meta = _read_json_object(meta_path)
+    meta["last_mirror_seq"] = seq
+    meta["mirror_stale"] = False
+    meta["pid_hint"] = "dead"
+    meta["row_state"] = "worker_dead"
+    meta["worker_dead_reason"] = "remote_launch_pid_dead"
+    if identity_result.identity is not None:
+        meta["remote_pid_last_identity"] = identity_result.identity
+    _atomic_write_json(meta_path, meta)
+
+
+def _identity_check(
+    transport: FleetWatchTransport,
+    *,
+    node_id: str,
+    node_entry: dict[str, Any] | None,
+    receipt: dict[str, Any],
+) -> RemoteIdentityResult:
+    checker = getattr(transport, "check_remote_identity", None)
+    if checker is None:
+        return RemoteIdentityResult(ok=False, error="transport has no identity checker")
+    return checker(node_id=node_id, node_entry=node_entry, receipt=receipt)
+
+
+def watch_until_terminal(
+    fleet_dir: Path,
+    dispatch_id: str,
+    transport: FleetWatchTransport,
+    *,
+    timeout_s: float = DEFAULT_UNTIL_TIMEOUT_S,
+    interval_s: float = DEFAULT_UNTIL_INTERVAL_S,
+    jitter_s: float = DEFAULT_UNTIL_JITTER_S,
+    stale_s: float = DEFAULT_STALE_S,
+    sleep_fn: Callable[[float], None] = time.sleep,
+    monotonic_fn: Callable[[], float] = time.monotonic,
+) -> UntilTerminalResult:
+    """Poll one remote status mirror until terminal, timeout, or ambiguity."""
+    import goalflight_fleet as fleet
+
+    deadline = monotonic_fn() + max(float(timeout_s), 0.0)
+    polls = 0
+    last_progress_at = monotonic_fn()
+    identity_checked_seq: int | None = None
+    detail: str | None = None
+
+    while True:
+        meta = _read_json_object(dispatch_meta_path(fleet_dir, dispatch_id))
+        if not meta:
+            return UntilTerminalResult(dispatch_id, 2, "unknown", polls, "dispatch meta not found")
+        fleet_doc = fleet.read_json(fleet_dir / "fleet.json")
+        node_id = str(meta.get("node_id") or "")
+        node_entry = (fleet_doc.get("nodes") or {}).get(node_id)
+        if not isinstance(node_entry, dict):
+            node_entry = None
+
+        before = _read_local_mirror(fleet_dir, dispatch_id)
+        before_seq = before.last_seq if before.ok else None
+        row = ingest_dispatch_mirror(
+            fleet_dir,
+            dispatch_id,
+            meta,
+            transport,
+            node_entry=node_entry,
+        )
+        polls += 1
+        after = _read_local_mirror(fleet_dir, dispatch_id)
+        state = _mirror_state(after)
+        after_seq = after.last_seq if after.ok else before_seq
+
+        if after.ok and after_seq != before_seq:
+            last_progress_at = monotonic_fn()
+            identity_checked_seq = None
+
+        if fleet_status.is_terminal_state(state):
+            return UntilTerminalResult(dispatch_id, 0, str(state), polls, row.detail)
+
+        if not row.ok and row.action not in {"fetch_failed"}:
+            detail = row.detail or row.action
+
+        stale_for = monotonic_fn() - last_progress_at
+        receipt = meta.get("launch_receipt") if isinstance(meta.get("launch_receipt"), dict) else {}
+        if (
+            meta.get("launch_unconfirmed") is not True
+            and stale_for >= max(float(stale_s), 0.0)
+            and identity_checked_seq != after_seq
+            and receipt
+        ):
+            identity = _identity_check(transport, node_id=node_id, node_entry=node_entry, receipt=receipt)
+            _mark_meta_identity(
+                dispatch_meta_path(fleet_dir, dispatch_id),
+                pid_hint="alive" if identity.ok and identity.alive else "dead" if identity.ok else "unknown",
+                identity_result=identity,
+            )
+            identity_checked_seq = after_seq
+            if identity.ok and not identity.alive:
+                latest = _read_local_mirror(fleet_dir, dispatch_id)
+                if not fleet_status.is_terminal_state(_mirror_state(latest)):
+                    _write_worker_dead_mirror(
+                        fleet_dir,
+                        dispatch_id,
+                        prior=latest,
+                        identity_result=identity,
+                    )
+                    return UntilTerminalResult(
+                        dispatch_id,
+                        0,
+                        "worker_dead",
+                        polls,
+                        "remote launch pid identity is dead",
+                    )
+            elif not identity.ok:
+                detail = identity.error or "identity check failed"
+
+        now = monotonic_fn()
+        if now >= deadline:
+            latest = _read_local_mirror(fleet_dir, dispatch_id)
+            latest_state = _mirror_state(latest)
+            if fleet_status.is_terminal_state(latest_state):
+                return UntilTerminalResult(dispatch_id, 0, str(latest_state), polls, detail)
+            if latest.ok and fleet_status.is_running_state(latest_state):
+                return UntilTerminalResult(dispatch_id, 1, str(latest_state), polls, detail or "timeout")
+            latest_meta = _read_json_object(dispatch_meta_path(fleet_dir, dispatch_id))
+            if latest_meta.get("launch_unconfirmed") is True:
+                return UntilTerminalResult(
+                    dispatch_id,
+                    1,
+                    "launch_unconfirmed",
+                    polls,
+                    detail or "launch_unconfirmed waiting for status or no-worker proof",
+                )
+            return UntilTerminalResult(dispatch_id, 2, str(latest_state or "unknown"), polls, detail or "timeout")
+
+        sleep_for = max(float(interval_s), 0.0)
+        if jitter_s:
+            sleep_for += random.uniform(0, max(float(jitter_s), 0.0))
+        sleep_fn(min(sleep_for, max(deadline - now, 0.0)))
+
 
 def cmd_watch_fleet(args) -> int:
     import goalflight_fleet as fleet
 
     fleet.bootstrap(args.fleet_dir)
-    transport = SshFleetWatchTransport(dry_run=bool(getattr(args, "dry_run", False)))
+    transport = SshFleetWatchTransport(
+        dry_run=bool(getattr(args, "dry_run", False)),
+        fleet_dir=args.fleet_dir,
+    )
+    until_terminal = getattr(args, "until_terminal", None)
+    if until_terminal:
+        result = watch_until_terminal(
+            args.fleet_dir,
+            str(until_terminal),
+            transport,
+            timeout_s=float(getattr(args, "timeout_s", DEFAULT_UNTIL_TIMEOUT_S)),
+            interval_s=float(getattr(args, "interval", 0.0) or DEFAULT_UNTIL_INTERVAL_S),
+            stale_s=float(getattr(args, "stale_s", DEFAULT_STALE_S)),
+        )
+        if args.json:
+            print(json.dumps(result.to_dict(), indent=2))
+        else:
+            detail = f" ({result.detail})" if result.detail else ""
+            print(f"{result.dispatch_id}\t{result.state}\texit={result.exit_code}{detail}")
+        return result.exit_code
     if args.interval and args.interval > 0 and not args.once:
         import time
 

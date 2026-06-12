@@ -76,7 +76,7 @@ def test_b1_partition_no_release_on_flap() -> None:
             flap_after=1,
             flap_duration_calls=2,
         )
-        transport = fleet_watch.SshFleetWatchTransport(runner=scenario.runner())
+        transport = fleet_watch.SshFleetWatchTransport(runner=scenario.runner(), fleet_dir=fleet_dir)
         fleet_watch.sync_fleet_mirrors(fleet_dir, transport)
         row = fleet_reconcile.reconcile_dispatch(
             fleet_dir,
@@ -98,6 +98,7 @@ def test_b1_restore_consistent_running() -> None:
         _setup(fleet_dir, dispatch_id)
         transport = fleet_watch.SshFleetWatchTransport(
             runner=lambda _argv: (0, running, ""),
+            fleet_dir=fleet_dir,
         )
         fleet_watch.sync_fleet_mirrors(fleet_dir, transport)
         ctx = fleet_reconcile.build_dispatch_context(fleet_dir, dispatch_id, ssh_reachable=True)

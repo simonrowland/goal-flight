@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import re
 import shlex
 from dataclasses import dataclass
@@ -17,6 +18,7 @@ REMOTE_PATH_PREFIX = (
     "$HOME/.local/bin:$HOME/.grok/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 )
 REMOTE_HOME_BOOTSTRAP = 'HOME=${HOME:-$(eval echo ~${USER:-$(whoami)})}'
+NODE_LOCK_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 
 
 def _quote_remote_argv_part(part: str) -> str:
@@ -33,6 +35,30 @@ def _quote_remote_argv_part(part: str) -> str:
         )
         return f'"${{HOME}}/{escaped}"'
     return shlex.quote(part)
+
+
+def node_lock_path(node_id: str, *, fleet_dir: Path | None = None) -> Path:
+    base = fleet_dir or Path.home() / ".goal-flight" / "fleet"
+    safe = NODE_LOCK_RE.sub("_", node_id.strip() or "unknown")
+    return base.expanduser() / "locks" / f"{safe}.lock"
+
+
+@contextlib.contextmanager
+def node_ssh_lock(node_id: str, *, fleet_dir: Path | None = None):
+    path = node_lock_path(node_id, fleet_dir=fleet_dir)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with path.open("a+") as handle:
+        try:
+            import fcntl
+        except ImportError:  # pragma: no cover - non-POSIX fallback
+            yield path
+            return
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            yield path
+        finally:
+            with contextlib.suppress(Exception):
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def wrap_remote_argv(remote_argv: list[str]) -> list[str]:
@@ -52,12 +78,15 @@ ALLOWED_COMMAND_CLASSES = frozenset(
         "capacity",
         "git_prune_claude_refs",
         "acp_run",
+        "launch_detached",
         "git_fetch",
+        "git_verify_commit",
         "git_checkout",
         "git_worktree_add",
         "git_worktree_remove",
         "read_status_file",
         "read_lease_file",
+        "pid_identity",
         "auth_probe",
     }
 )
@@ -183,8 +212,53 @@ def build_remote_command(command_class: str, **params: Any) -> list[str]:
         status_json = str(params.get("status_json") or "").strip()
         if status_json:
             argv.extend(["--status-json", status_json])
+    elif command_class == "launch_detached":
+        dispatch_id = str(params.get("dispatch_id") or "")
+        agent = str(params.get("agent") or "")
+        prompt = str(params.get("prompt") or "")
+        cwd = str(params.get("cwd") or repo_root)
+        node_id = str(params.get("node_id") or "")
+        state_dir = str(params.get("state_dir") or "~/.goal-flight").rstrip("/")
+        status_json = str(params.get("status_json") or "").strip()
+        base_sha = str(params.get("base_sha") or "").strip()
+        if not dispatch_id or not agent or not node_id or not status_json:
+            raise SshAllowlistError("launch_detached requires dispatch_id, node_id, agent, and status_json")
+        if not base_sha:
+            raise SshAllowlistError("launch_detached requires base_sha")
+        prompt_b64 = base64.b64encode(prompt.encode("utf-8")).decode("ascii")
+        launch_python = str(params.get("python") or "python3")
+        argv = [
+            launch_python,
+            f"{repo_root}/scripts/goalflight_fleet_launch_detached.py",
+            "launch",
+            "--repo-root",
+            repo_root,
+            "--node-id",
+            node_id,
+            "--dispatch-id",
+            dispatch_id,
+            "--agent",
+            agent,
+            "--prompt-b64",
+            prompt_b64,
+            "--cwd",
+            cwd,
+            "--state-dir",
+            state_dir,
+            "--status-json",
+            status_json,
+            "--json",
+        ]
+        if bool(params.get("recover_unconfirmed")):
+            argv.append("--recover-unconfirmed")
+        argv.extend(["--base-sha", base_sha])
     elif command_class == "git_fetch":
         argv = ["git", "-C", repo_root, "fetch", "--quiet", "origin"]
+    elif command_class == "git_verify_commit":
+        sha = str(params.get("sha") or "").strip()
+        if not sha:
+            raise SshAllowlistError("git_verify_commit requires sha")
+        argv = ["git", "-C", repo_root, "rev-parse", "--verify", "--quiet", f"{sha}^{{commit}}"]
     elif command_class == "git_checkout":
         ref = str(params.get("ref") or "HEAD")
         argv = ["git", "-C", repo_root, "checkout", ref]
@@ -193,7 +267,10 @@ def build_remote_command(command_class: str, **params: Any) -> list[str]:
         ref = str(params.get("ref") or "HEAD")
         if not path:
             raise SshAllowlistError("git_worktree_add requires worktree_path")
-        argv = ["git", "-C", repo_root, "worktree", "add", path, ref]
+        argv = ["git", "-C", repo_root, "worktree", "add"]
+        if bool(params.get("detach")):
+            argv.append("--detach")
+        argv.extend([path, ref])
     elif command_class == "git_worktree_remove":
         path = str(params.get("worktree_path") or "")
         if not path:
@@ -209,6 +286,23 @@ def build_remote_command(command_class: str, **params: Any) -> list[str]:
         if not lease_path:
             raise SshAllowlistError("read_lease_file requires lease_path")
         argv = ["cat", lease_path]
+    elif command_class == "pid_identity":
+        pid_raw = str(params.get("pid") or "")
+        if not pid_raw.isdigit():
+            raise SshAllowlistError("pid_identity requires numeric pid")
+        expected_lstart = str(params.get("expected_lstart") or "")
+        ident_python = str(params.get("python") or "python3")
+        argv = [
+            ident_python,
+            f"{repo_root}/scripts/goalflight_fleet_launch_detached.py",
+            "pid-identity",
+            "--pid",
+            pid_raw,
+            "--json",
+        ]
+        if expected_lstart:
+            lstart_b64 = base64.b64encode(expected_lstart.encode("utf-8")).decode("ascii")
+            argv.extend(["--expected-lstart-b64", lstart_b64])
     elif command_class == "auth_probe":
         account_key = str(params.get("account_key") or "")
         if not account_key:

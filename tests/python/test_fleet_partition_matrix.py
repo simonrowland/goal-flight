@@ -78,7 +78,8 @@ def scenario_partition_mid_run() -> None:
                 responses=[(0, running, "")],
                 flap_after=0,
                 flap_duration_calls=1,
-            ).runner()
+            ).runner(),
+            fleet_dir=fleet_dir,
         )
         fleet_watch.sync_fleet_mirrors(fleet_dir, transport)
         row = fleet_reconcile.reconcile_dispatch(
