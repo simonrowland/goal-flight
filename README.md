@@ -74,6 +74,9 @@ Anticipatory subagents read your repo and goal statement, then surface the few c
 questions actually worth your time — product choices and trade-offs, not trivia the code
 already answers. Your chat answers are treated as requirements and folded into the goal
 files: ten minutes of conversation becomes durable project state that survives compaction.
+The phase exits with the goal file's **north star** settled — the durable statement of
+what the project must do, drafted at init and refined here — and later architecture calls
+and reviews are tested against it.
 
 **3. Iterate on the architecture.**
 
@@ -138,9 +141,15 @@ reroutes work away from a limited provider.
   self-review to convergence inside the worker loop; commit-worthy chunks then get an
   independent reviewer pass (via [gstack](https://github.com/garrytan/gstack)'s `/review`
   when installed), and milestone reviews sweep at configured cadence with concern-diverse
-  lenses. Caught bug classes are minted as predicates, swept backwards over the code and
-  the saved review archive, and carried forward as standing review lenses
+  lenses. Each new bug shape caught is minted as a durable bug-class predicate; your
+  already-reviewed code and the saved review archive are swept for further instances, and
+  the predicate joins the standing lenses for every later review
   (`protocols/review-mining.md`).
+- **A curated project corpus (RAG).** Optionally at init — or via `build-corpus` later —
+  goal-flight distills your repo and docs into curated corpus slices under
+  `docs-private/rag/`. Dispatch briefs anchor to those files instead of re-pasting
+  project context into every worker prompt, so the read cost lands on workers and the
+  corpus is written once.
 - **Verification-first dispatch.** Wrappers point at files for the agent to investigate,
   not pre-pasted "facts" that go stale on the timescale of minutes. Frontier models trust
   orchestrator-text uncritically; pointers force them to re-verify against live disk and
@@ -243,7 +252,9 @@ Unified CLI: `bin/goalflight <domain> <resource> <verb>` (action router over
   reference-quality code — its home domain is scientific programming. For a small one-shot
   task it is slower than just writing the script.
 
-## Companion tools (strongly recommended)
+## Companion tools
+
+Review skills (recommended — the review gates lean on them):
 
 - **[gstack](https://github.com/garrytan/gstack)** — Garry Tan's skill pack provides
   `/review`, `/office-hours`, `/plan-eng-review`, `/cso`, `/investigate` for both Claude
@@ -261,11 +272,19 @@ Unified CLI: `bin/goalflight <domain> <resource> <verb>` (action router over
   diff-local issues (API footguns, missing tests on touched paths, regression invariants)
   that a structural reviewer may not prioritize. Requires upstream autoreview (typically
   the Cursor autoreview skill or `AUTOREVIEW_HELPER`); doctor reports WARN when absent.
+
+Also recommended:
+
 - **[context-mode](https://github.com/simonrowland/context-mode)** — MCP plugin that
   offloads large command outputs (diffs, integration test runs, codex tail files, large
   greps) to an FTS5 sandbox the orchestrator queries by pattern. On long runs, raw tool
   output fills the orchestrator's context and triggers early compaction; context-mode
   keeps that output out of the session.
+- **[codedb](https://github.com/justrach/codedb)** — code-intelligence MCP (tree,
+  outline, symbol, search, deps) the orchestrator uses to anchor dispatch briefs to exact
+  files and lines, and to spot-check worker findings, at a fraction of the context cost
+  of grep-and-read. Optional; use it when indexed lookup beats a broad grep — most useful
+  on large or unfamiliar codebases.
 
 ## Host install notes
 
@@ -298,44 +317,16 @@ After any install, run doctor:
 
 ### Windows
 
-Native Windows support is read/plan control-plane only. Doctor, status, action
-routing, capacity reads, and ledger reads work. Full worker dispatch requires
-WSL; live worker dispatch and file-backed review jobs refuse on native Windows
-with a WSL next step:
+Windows runs goal-flight through WSL. Ask your agent to set it up — starting with:
 
 ```powershell
 wsl --install
 ```
 
-Use `%USERPROFILE%` / `$env:USERPROFILE`, not `~`, for native Windows paths:
-
-```powershell
-git clone https://github.com/simonrowland/goal-flight.git "$env:USERPROFILE\.goal-flight"
-cd "$env:USERPROFILE\.goal-flight"
-.\bin\goalflight.ps1 core doctor read
-py -3 .\scripts\goalflight_doctor.py --project-root C:\path\to\project --text
-```
-
-Doctor JSON includes a `wsl` field. `wsl.exe` alone is not enough: `wsl -l -q`
-must list at least one installed distro. If install is declined during init, a
-project-local stamp suppresses repeat prompts and native Windows continues as a
-non-feature-complete control plane with degraded tracked-pid cleanup.
-
-Native Windows first action:
-
-```powershell
-py -3 .\tests\run_python.py
-```
-
-That native runner executes the Python suite: Windows-activated tests fire, and
-POSIX-only tests skip with a visible WSL reminder. The bash suite is POSIX/WSL
-only; run `./tests/run.sh` from inside WSL for that layer.
-
-Keep two installs when you dispatch from WSL: one native Windows checkout for
-read/plan, one WSL checkout under the Linux home directory for dispatch. See
-[docs/hosts/windows.md](docs/hosts/windows.md) for the WSL baseline, manual
-real-Windows acceptance gate, capability matrix, launcher details, CRLF caveat,
-and two-install procedure.
+then install goal-flight inside the distro as on Linux. Native Windows (no WSL) is a
+read/plan control plane only: doctor, status, and ledger reads work; dispatch honestly
+refuses. Full details — WSL baseline, capability matrix, two-install procedure, launcher
+and CRLF caveats — are in [docs/hosts/windows.md](docs/hosts/windows.md).
 
 ## Maintainer test tiers
 
