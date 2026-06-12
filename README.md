@@ -102,9 +102,13 @@ and asks for permission gates, destructive choices, auth or capacity hard stops,
 review or test gates, and product choices the plan can't infer; it does not push without
 your permission. Come back
 hours later to reviewed, one-commit-per-chunk work on your branch, with review evidence
-and resume notes on disk. If the session compacts or the laptop sleeps,
-`/goal-flight resume` rebuilds the orchestrator's working state from files and keeps
-going.
+and resume notes on disk.
+
+**Session management.** While a run is active, goal-flight maintains the resume notes — a
+running handoff of repo state, in-flight dispatches, and the next intended action. When
+the session compacts, restarts, or you pick the project up days later, the ritual is one
+command: `/goal-flight resume` reloads the skill, reads the notes and the queue, and
+rebuilds the orchestrator's working state from files. Nothing depends on chat memory.
 
 > **Working signal, not rigid gates**: the skill pins a `goal-<topic>-<date>.md` file at
 > init for compaction-survival, but it's an anchor — not a contract. `decompose-plan`
@@ -167,6 +171,9 @@ reroutes work away from a limited provider.
 - vs. **running one coding session to context exhaustion** — the orchestrator doesn't
   itself write code. It dispatches and verifies, holding requirements and architecture
   while workers burn their own context windows; the run outlives any single session.
+- vs. **agent frameworks with built-in long-horizon memory** — durable cross-session
+  memory (file-backed project state, the RAG corpus, the resume routine) arrives inside
+  your existing Claude Code session, not in a separate runtime you'd have to adopt.
 - vs. **cloud agent swarms or editor agents** — workers run on your machine (or your SSH
   nodes) with your CLIs and provider subscriptions; the orchestrator coordinates them from
   your host session.
