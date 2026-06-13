@@ -73,7 +73,11 @@ package repository; for normal target projects it is skipped as INFO.
     - `--permission-mode`
     - `--os-sandbox`
   - Claude compatibility path: CLI/plugin checks pass before Claude-specific
-    compatibility examples are used.
+    compatibility examples are used. NOTE: presence/PATH only — a green doctor
+    does NOT confirm the **remote** claude-acp credential. Headless subscription
+    seat readiness is verified per node by the fleet auth probe
+    (`claude auth status --json`), not by host-global doctor; pty headroom is
+    covered by `pty_shim_health` (orphan reaping), not a pre-dispatch free-pty gate.
 - Check ACP worker adapters for presence/PATH only: `codex-acp`,
   `cursor-agent`, `claude-code-cli-acp`, `grok agent stdio`.
 - Check `claude_acp_stopgap`; when the stopgap is required but absent, use

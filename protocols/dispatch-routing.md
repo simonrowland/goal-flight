@@ -91,7 +91,11 @@ Claude when it is the right tool or the Claude budget is abundant.
   (the orchestrator drives the iterations), but its transcript is readable.
 - **Remote** Claude work -> **`claude-acp` on a non-sandboxed host**: a full
   remote Claude session over ACP that **supports loop**. It needs a free pty on
-  the node plus a headless `setup-token` credential. The local / sandboxed
+  the node plus a headless subscription credential: run `claude setup-token` on
+  the node and export it there as `CLAUDE_CODE_OAUTH_TOKEN` (e.g. `~/.zshenv`) so
+  non-interactive ssh and the ferried detached worker both see it (`claude auth
+  status` -> `oauth_token`/`firstParty`). Full recipe: `docs/fleet.md` "Remote
+  Claude worker (claude-acp) end-to-end". The local / sandboxed
   `claude-acp` shim is unsupported — no pty under the host sandbox, and the macOS
   Keychain credential is unreachable over a non-interactive ssh — and is
   intentionally not used; the two local surfaces above cover local Claude work.

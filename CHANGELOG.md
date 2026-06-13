@@ -17,8 +17,18 @@ incremented when meaningful skill behaviour changes.
   launcher; fails loudly rather than silently leaving the broken shim). This
   supersedes the opt-in vendored patch from 1.0.4 (now removed). The build
   auto-retires once npm publishes `claude-code-cli-acp > 0.1.1` (the `>0.1.1`
-  gate skips it). Interactive/local claude-acp works with this; the headless
-  remote-worker PTY path is a separate open investigation.
+  gate skips it).
+
+- **Remote claude-acp works end-to-end via the subscription seat.** Local /
+  sandboxed claude-acp is intentionally unsupported (no pty under the host
+  sandbox; Keychain unreachable over non-interactive ssh). The supported Claude
+  worker surface is **remote** claude-acp on a non-sandboxed node, authed by a
+  headless subscription token: run `claude setup-token` on the node, then
+  `export CLAUDE_CODE_OAUTH_TOKEN=<token>` in the node env — ferried to the
+  detached worker via the launch env allow-list (`_sanitized_env`). `claude auth
+  status` then reports `authMethod=oauth_token` / `apiProvider=firstParty`
+  (subscription, not API). End-to-end recipe: `docs/fleet.md` "Remote Claude
+  worker (claude-acp) end-to-end".
 
 ## [1.0.6] — 2026-06-13
 

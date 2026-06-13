@@ -32,4 +32,9 @@ else
 fi
 
 echo ""
-echo "Next: ensure Claude Code is signed in on this machine (claude or Claude.app first run)."
+echo "Next (headless worker): mint a subscription token and persist it for ssh:"
+echo "  claude setup-token        # interactive once; prints a long-lived token"
+echo "  # add to this node's ~/.zshenv:  export CLAUDE_CODE_OAUTH_TOKEN=<token>"
+echo "  claude auth status --json # expect authMethod=oauth_token / apiProvider=firstParty"
+echo "  # (do NOT validate with 'claude -p' -- always API-billed)"
+echo "On an interactive GUI machine, plain 'claude' / Claude.app first-run also works."

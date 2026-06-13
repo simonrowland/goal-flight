@@ -66,7 +66,15 @@ is fine when you use separate worktrees/repos):
 codex login                    # OpenAI
 grok login --device-auth       # headless: URL + code in terminal
 grok login --oauth             # local browser (auth.x.ai)
-claude                         # Anthropic (first run opens browser)
+# Claude (subscription seat, headless): the browser first-run does NOT work over
+# non-interactive ssh (no display; Keychain unreachable). Mint a long-lived token
+# and persist it in THIS node's env instead:
+claude setup-token             # interactive once; prints a long-lived token
+#   add to the node's ~/.zshenv (auto-sourced by `ssh host cmd`):
+#     export CLAUDE_CODE_OAUTH_TOKEN=<token>
+#   verify: claude auth status --json  ->  authMethod=oauth_token / apiProvider=firstParty
+#   do NOT validate with `claude -p` (always API-billed). On an interactive GUI
+#   machine, plain `claude` / Claude.app first-run also works.
 ```
 
 **Cursor over SSH:** `cursor-agent --version` may report “login keychain is
@@ -83,6 +91,33 @@ Validate SSH allowlisting before live dispatch:
 python3 scripts/goalflight_fleet.py validate --fleet-dir ~/.goal-flight/fleet
 python3 scripts/goalflight_doctor.py --project-root . --fleet
 ```
+
+### Remote Claude worker (claude-acp) end-to-end
+
+Claude's only supported remote surface is `claude-acp` on a **non-sandboxed** node
+(the local / sandboxed shim is intentionally unsupported — no pty under the host
+sandbox, Keychain unreachable over non-interactive ssh). One-time per worker:
+
+1. `./install.sh claude-acp` — npm `claude-code-cli-acp` + the pinned `14a5b0c` build.
+2. `claude setup-token` — interactive once; prints a long-lived subscription token.
+3. Persist it in the node's `~/.zshenv` (auto-sourced by `ssh host cmd`):
+   `export CLAUDE_CODE_OAUTH_TOKEN=<token>`. The detached fleet worker inherits it
+   through the launch env allow-list — **the controller never injects it, so the
+   node MUST hold it.**
+4. `claude auth status --json` → expect `authMethod=oauth_token` /
+   `apiProvider=firstParty` (subscription, not API). Do **not** use `claude -p`.
+5. Register the node with `claude-acp` in its allowed transports, then dispatch:
+   ```bash
+   BASE_SHA="$(git rev-parse HEAD)"   # MUST be pushed: the node pins to it via fetch
+   GOALFLIGHT_LIVE_SSH=1 python3 scripts/goalflight_fleet.py dispatch --node <node> \
+     --agent claude-acp --billing-account anthropic/<acct> --base-sha "$BASE_SHA" \
+     --dispatch-mode one-shot --prompt <p.md> --exec --json
+   ```
+
+Pair `--agent claude-acp` with an `anthropic/*` billing account, not an `openai/*`
+one. `--dispatch-mode one-shot` avoids the goal-mode tool-smoke canary gate. The
+fleet auth probe (`claude auth status --json`) gates dispatch and reds on a
+revoked/expired token — re-run `claude setup-token` and refresh the env var.
 
 ## Operator flow
 
@@ -210,6 +245,8 @@ export GOALFLIGHT_FLEET_NODE=localhost   # or your SSH alias
 | Auth blocks `--exec` | `python3 scripts/goalflight_doctor.py --fleet --json` |
 | Stuck billing lock | `reconcile --all-in-flight` |
 | Remote status stale | `watch --once`; verify remote `.goal-flight/status/` |
+| claude-acp auth red / `-32603` | `claude auth status --json` on the node; re-run `claude setup-token` and refresh `CLAUDE_CODE_OAUTH_TOKEN` in the node env |
+| claude-acp pty / orphan shims | `bin/gf-reap-shims` (dry-run) then `--exec`; doctor `pty_shim_health` |
 
 ## Related docs
 
