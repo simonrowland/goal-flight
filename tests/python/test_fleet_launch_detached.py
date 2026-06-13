@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+"""Hermetic tests for the fleet detached-launch helper."""
+
+from __future__ import annotations
+
+import base64
+import io
+import json
+import sys
+import tempfile
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "scripts"))
+
+import goalflight_fleet_launch_detached as fleet_launch
+
+BASE_SHA = "0123456789abcdef0123456789abcdef01234567"
+
+
+def assert_true(name: str, condition: bool) -> None:
+    if not condition:
+        raise AssertionError(name)
+
+
+class FakeProc:
+    def __init__(self, *, pid: int = 4242, returncode: int | None = None) -> None:
+        self.pid = pid
+        self.returncode = returncode
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+
+@contextmanager
+def patched_spawn(returncode: int | None = None):
+    calls: list[dict[str, Any]] = []
+    old_popen = fleet_launch.subprocess.Popen
+    old_identity = fleet_launch._process_identity_after_spawn
+    old_which = fleet_launch.shutil.which
+
+    def fake_popen(argv: list[str], **kwargs: Any) -> FakeProc:
+        calls.append({"argv": list(argv), "kwargs": kwargs})
+        return FakeProc(returncode=returncode)
+
+    fleet_launch.subprocess.Popen = fake_popen
+    fleet_launch._process_identity_after_spawn = lambda pid: {
+        "pid": pid,
+        "lstart": "Thu Jun 11 12:00:00 2026",
+        "comm": "python3",
+    }
+    fleet_launch.shutil.which = lambda _name: None
+    try:
+        yield calls
+    finally:
+        fleet_launch.subprocess.Popen = old_popen
+        fleet_launch._process_identity_after_spawn = old_identity
+        fleet_launch.shutil.which = old_which
+
+
+def _prompt_b64(text: str) -> str:
+    return base64.b64encode(text.encode("utf-8")).decode("ascii")
+
+
+def _args(state_dir: Path, dispatch_id: str, prompt_text: str, *, recover: bool = False) -> SimpleNamespace:
+    return SimpleNamespace(
+        repo_root=str(ROOT),
+        state_dir=str(state_dir),
+        dispatch_id=dispatch_id,
+        node_id="localhost",
+        agent="codex-acp",
+        prompt_b64=_prompt_b64(prompt_text),
+        cwd=str(ROOT),
+        status_json=str(state_dir / "dispatches" / dispatch_id / "status.json"),
+        read_only=False,
+        recover_unconfirmed=recover,
+        base_sha=BASE_SHA,
+    )
+
+
+def _write_marker(state_dir: Path, dispatch_id: str, payload: dict[str, Any]) -> Path:
+    marker_path = fleet_launch._launch_marker_path(state_dir, dispatch_id)
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    marker_path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+    return marker_path
+
+
+def test_clean_first_launch_creates_marker_and_spawns() -> None:
+    dispatch_id = "acp-clean-launch"
+    prompt_text = "first prompt"
+    with tempfile.TemporaryDirectory() as td:
+        state_dir = Path(td) / "state"
+        args = _args(state_dir, dispatch_id, prompt_text)
+        stdout = io.StringIO()
+        with patched_spawn() as calls, redirect_stdout(stdout):
+            code = fleet_launch._launch(args)
+        dispatch_dir = state_dir / "dispatches" / dispatch_id
+        marker = json.loads((dispatch_dir / "launch_marker.json").read_text(encoding="utf-8"))
+        receipt = json.loads(stdout.getvalue())
+        assert_true("launch ok", code == 0)
+        assert_true("spawn once", len(calls) == 1)
+        assert_true("prompt written", (dispatch_dir / "prompt.md").read_text(encoding="utf-8") == prompt_text)
+        assert_true("receipt written", (dispatch_dir / "launch_receipt.json").exists())
+        assert_true("stdout receipt", receipt.get("remote_pid") == 4242)
+        assert_true("marker receipted", marker.get("state") == "receipted")
+        assert_true("marker pid", marker.get("remote_pid") == 4242)
+
+
+def test_duplicate_marker_recovery_without_no_worker_proof_refuses() -> None:
+    dispatch_id = "acp-dup-marker"
+    prompt_text = "retry prompt"
+    with tempfile.TemporaryDirectory() as td:
+        state_dir = Path(td) / "state"
+        dispatch_dir = state_dir / "dispatches" / dispatch_id
+        dispatch_dir.mkdir(parents=True, exist_ok=True)
+        prompt_path = dispatch_dir / "prompt.md"
+        prompt_path.write_text("original prompt", encoding="utf-8")
+        _write_marker(
+            state_dir,
+            dispatch_id,
+            {
+                "schema": fleet_launch.MARKER_SCHEMA,
+                "dispatch_id": dispatch_id,
+                "node_id": "localhost",
+                "state": "launching",
+                "prompt_path": str(prompt_path),
+                "prompt_sha256": fleet_launch._prompt_sha256(prompt_text),
+            },
+        )
+        args = _args(state_dir, dispatch_id, prompt_text, recover=True)
+        stderr = io.StringIO()
+        with patched_spawn() as calls, redirect_stderr(stderr):
+            code = fleet_launch._launch(args)
+        assert_true("refused", code == 17)
+        assert_true("no second spawn", len(calls) == 0)
+        assert_true("prompt not overwritten", prompt_path.read_text(encoding="utf-8") == "original prompt")
+        assert_true("warn refuse", "WARN-REFUSE duplicate dispatch-id" in stderr.getvalue())
+
+
+def test_recovery_with_no_worker_proof_relaunches() -> None:
+    dispatch_id = "acp-recover-dead-marker"
+    prompt_text = "retry prompt"
+    with tempfile.TemporaryDirectory() as td:
+        state_dir = Path(td) / "state"
+        dispatch_dir = state_dir / "dispatches" / dispatch_id
+        dispatch_dir.mkdir(parents=True, exist_ok=True)
+        _write_marker(
+            state_dir,
+            dispatch_id,
+            {
+                "schema": fleet_launch.MARKER_SCHEMA,
+                "dispatch_id": dispatch_id,
+                "node_id": "localhost",
+                "state": "spawn_failed",
+                "prompt_sha256": fleet_launch._prompt_sha256(prompt_text),
+                "error": "prior spawn failed before worker start",
+            },
+        )
+        args = _args(state_dir, dispatch_id, prompt_text, recover=True)
+        stdout = io.StringIO()
+        with patched_spawn() as calls, redirect_stdout(stdout):
+            code = fleet_launch._launch(args)
+        marker = json.loads((dispatch_dir / "launch_marker.json").read_text(encoding="utf-8"))
+        receipt = json.loads(stdout.getvalue())
+        assert_true("launch ok", code == 0)
+        assert_true("spawn once", len(calls) == 1)
+        assert_true("receipt", receipt.get("remote_pid") == 4242)
+        assert_true("marker receipted", marker.get("state") == "receipted")
+        assert_true("proof kept", marker.get("no_worker_proof") == "marker_state_spawn_failed")
+        assert_true("recovery lock cleared", not (dispatch_dir / "launch_recovery.lock").exists())
+
+
+def main() -> None:
+    test_clean_first_launch_creates_marker_and_spawns()
+    test_duplicate_marker_recovery_without_no_worker_proof_refuses()
+    test_recovery_with_no_worker_proof_relaunches()
+    print("OK: fleet launch detached tests pass")
+
+
+if __name__ == "__main__":
+    main()

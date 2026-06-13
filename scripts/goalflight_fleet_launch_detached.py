@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import os
 import shutil
@@ -57,6 +58,31 @@ ENV_ALLOW_PREFIXES = (
 )
 ENV_DENY_EXACT = frozenset({"SSH_AUTH_SOCK", "GPG_AGENT_INFO"})
 ENV_DENY_SUBSTRINGS = ("AUTH_SOCK", "AGENT_SOCK", "SSH_AGENT")
+MARKER_SCHEMA = "goalflight.fleet.launch_marker.v1"
+RECOVERY_LOCK_SCHEMA = "goalflight.fleet.launch_recovery_lock.v1"
+NO_WORKER_PROOF_STATES = frozenset(
+    {
+        "prompt_write_failed",
+        "spawn_failed",
+        "exited_before_receipt",
+    }
+)
+TERMINAL_NO_WORKER_STATES = frozenset(
+    {
+        "blocked",
+        "blocked_auth",
+        "blocked_capacity",
+        "blocked_session_limit",
+        "complete",
+        "failed",
+        "idle_timeout",
+        "orphaned",
+        "released",
+        "superseded",
+        "watcher_stopped",
+        "worker_dead",
+    }
+)
 
 
 def _utc_now() -> str:
@@ -137,12 +163,149 @@ def _receipt_path(state_dir: Path, dispatch_id: str) -> Path:
     return _dispatch_dir(state_dir, dispatch_id) / "launch_receipt.json"
 
 
+def _launch_marker_path(state_dir: Path, dispatch_id: str) -> Path:
+    return _dispatch_dir(state_dir, dispatch_id) / "launch_marker.json"
+
+
+def _recovery_lock_path(state_dir: Path, dispatch_id: str) -> Path:
+    return _dispatch_dir(state_dir, dispatch_id) / "launch_recovery.lock"
+
+
 def _load_json(path: Path) -> dict[str, Any] | None:
     try:
         payload = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError):
         return None
     return payload if isinstance(payload, dict) else None
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _create_json_exclusive(path: Path, payload: dict[str, Any]) -> bool:
+    try:
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        return False
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps(payload, sort_keys=True) + "\n")
+    return True
+
+
+def _remove_file(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _prompt_sha256(prompt_text: str) -> str:
+    return hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()
+
+
+def _marker_base(
+    args: argparse.Namespace,
+    state_dir: Path,
+    status_json: Path,
+    prompt_path: Path,
+    log_path: Path,
+    *,
+    prompt_sha256: str,
+    state: str,
+) -> dict[str, Any]:
+    return {
+        "schema": MARKER_SCHEMA,
+        "dispatch_id": args.dispatch_id,
+        "node_id": args.node_id,
+        "state": state,
+        "remote_state_dir": str(state_dir),
+        "remote_status_path": str(status_json),
+        "prompt_path": str(prompt_path),
+        "prompt_sha256": prompt_sha256,
+        "launcher_log_path": str(log_path),
+        "worktree_base_sha": getattr(args, "base_sha", ""),
+        "updated_at": _utc_now(),
+    }
+
+
+def _update_launch_marker(marker_path: Path, updates: dict[str, Any]) -> None:
+    payload = _load_json(marker_path) or {}
+    payload.update(updates)
+    payload.setdefault("schema", MARKER_SCHEMA)
+    payload["updated_at"] = _utc_now()
+    _atomic_write_json(marker_path, payload)
+
+
+def _recorded_worker_live(pid_raw: Any, identity: Any) -> tuple[bool | None, str]:
+    try:
+        pid = int(pid_raw)
+    except (TypeError, ValueError):
+        return None, "no_pid"
+    current = _process_identity(pid)
+    if current is None:
+        return False, "dead"
+    if not isinstance(identity, dict):
+        return None, "identity_missing"
+    for key in ("lstart", "comm"):
+        if identity.get(key) and current.get(key) and identity[key] != current[key]:
+            return False, f"pid_reused_{key}"
+    return True, "live"
+
+
+def _status_no_worker_proof(status_json: Path) -> tuple[bool, str]:
+    payload = _load_json(status_json)
+    if not payload:
+        return False, "status_missing"
+    pid_raw = payload.get("worker_pid") or payload.get("pid")
+    identity = payload.get("worker_identity") or payload.get("expected_worker_identity")
+    live, reason = _recorded_worker_live(pid_raw, identity)
+    if live is False:
+        return True, f"status_worker_{reason}"
+    if live is True:
+        return False, "status_worker_live"
+    state = str(payload.get("state") or "")
+    if payload.get("worker_alive") is False and state in TERMINAL_NO_WORKER_STATES:
+        return True, f"status_terminal_{state}"
+    return False, reason
+
+
+def _marker_no_worker_proof(marker: dict[str, Any] | None) -> tuple[bool, str]:
+    if not marker:
+        return False, "marker_missing"
+    pid_raw = marker.get("remote_pid") or marker.get("worker_pid")
+    identity = marker.get("remote_identity") or marker.get("worker_identity")
+    live, reason = _recorded_worker_live(pid_raw, identity)
+    if live is False:
+        return True, f"marker_worker_{reason}"
+    if live is True:
+        return False, "marker_worker_live"
+    state = str(marker.get("state") or "")
+    if state in NO_WORKER_PROOF_STATES:
+        return True, f"marker_state_{state}"
+    return False, f"marker_{reason}"
+
+
+def _no_worker_proof(status_json: Path, marker: dict[str, Any] | None) -> tuple[bool, str]:
+    status_ok, status_reason = _status_no_worker_proof(status_json)
+    if status_ok:
+        return True, status_reason
+    marker_ok, marker_reason = _marker_no_worker_proof(marker)
+    if marker_ok:
+        return True, marker_reason
+    return False, f"{status_reason};{marker_reason}"
+
+
+def _warn_refuse_duplicate(reason: str) -> int:
+    print(
+        "WARN-REFUSE duplicate dispatch-id exists on node; "
+        "receipt recovery requires controller launch_unconfirmed evidence "
+        f"and no-worker proof ({reason})",
+        file=sys.stderr,
+    )
+    return 17
 
 
 def _receipt_from_status(args: argparse.Namespace, status_json: Path, state_dir: Path) -> dict[str, Any] | None:
@@ -193,25 +356,87 @@ def _launch(args: argparse.Namespace) -> int:
     dispatch_dir = _dispatch_dir(state_dir, args.dispatch_id)
     dispatch_dir.mkdir(parents=True, exist_ok=True)
     prompt_path = dispatch_dir / "prompt.md"
+    marker_path = _launch_marker_path(state_dir, args.dispatch_id)
+    recovery_lock_path = _recovery_lock_path(state_dir, args.dispatch_id)
 
     status_json = Path(args.status_json).expanduser()
     status_json.parent.mkdir(parents=True, exist_ok=True)
     log_path = dispatch_dir / "dispatcher.log"
+    prompt_text = _decode_b64(args.prompt_b64)
+    prompt_digest = _prompt_sha256(prompt_text)
 
     existing = _existing_receipt(args, status_json, state_dir)
     if existing:
         if not args.recover_unconfirmed:
-            print(
-                "WARN-REFUSE duplicate dispatch-id exists on node; "
-                "receipt recovery requires controller launch_unconfirmed evidence",
-                file=sys.stderr,
-            )
-            return 17
+            return _warn_refuse_duplicate("receipt_or_status_exists")
         existing["recovered"] = True
         print(json.dumps(existing, sort_keys=True))
         return 0
 
-    prompt_path.write_text(_decode_b64(args.prompt_b64))
+    marker_payload = _marker_base(
+        args,
+        state_dir,
+        status_json,
+        prompt_path,
+        log_path,
+        prompt_sha256=prompt_digest,
+        state="launching",
+    )
+    marker_created = _create_json_exclusive(marker_path, marker_payload)
+    recovery_lock_acquired = False
+    if not marker_created:
+        marker = _load_json(marker_path)
+        if not args.recover_unconfirmed:
+            return _warn_refuse_duplicate("launch_marker_exists")
+        if marker and marker.get("prompt_sha256") and marker.get("prompt_sha256") != prompt_digest:
+            return _warn_refuse_duplicate("prompt_hash_mismatch")
+        proof_ok, proof_reason = _no_worker_proof(status_json, marker)
+        if not proof_ok:
+            return _warn_refuse_duplicate(proof_reason)
+        recovery_lock_acquired = _create_json_exclusive(
+            recovery_lock_path,
+            {
+                "schema": RECOVERY_LOCK_SCHEMA,
+                "dispatch_id": args.dispatch_id,
+                "node_id": args.node_id,
+                "no_worker_proof": proof_reason,
+                "created_at": _utc_now(),
+            },
+        )
+        if not recovery_lock_acquired:
+            return _warn_refuse_duplicate("recovery_already_in_progress")
+        previous_state = marker.get("state") if marker else None
+        marker_payload["state"] = "recovery_launching"
+        marker_payload["recovered_from_marker_state"] = previous_state
+        marker_payload["no_worker_proof"] = proof_reason
+        _atomic_write_json(marker_path, marker_payload)
+
+    try:
+        prompt_path.write_text(prompt_text, encoding="utf-8")
+    except OSError as exc:
+        _update_launch_marker(
+            marker_path,
+            {
+                "state": "prompt_write_failed",
+                "error": str(exc),
+            },
+        )
+        if recovery_lock_acquired:
+            _remove_file(recovery_lock_path)
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "dispatch_id": args.dispatch_id,
+                    "node_id": args.node_id,
+                    "error": f"prompt write failed: {exc}",
+                    "prompt_path": str(prompt_path),
+                },
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+        )
+        return 1
 
     dispatch_py = repo_root / "scripts" / "goalflight_dispatch.py"
     cmd = [
@@ -243,20 +468,64 @@ def _launch(args: argparse.Namespace) -> int:
         if nohup:
             popen_cmd = [nohup, *cmd]
 
-    with open(os.devnull, "rb") as stdin_f, open(log_path, "ab") as log_f:
-        proc = subprocess.Popen(
-            popen_cmd,
-            stdin=stdin_f,
-            stdout=log_f,
-            stderr=subprocess.STDOUT,
-            env=env,
-            cwd=str(repo_root),
-            start_new_session=(os.name != "nt"),
-            close_fds=True,
+    try:
+        with open(os.devnull, "rb") as stdin_f, open(log_path, "ab") as log_f:
+            proc = subprocess.Popen(
+                popen_cmd,
+                stdin=stdin_f,
+                stdout=log_f,
+                stderr=subprocess.STDOUT,
+                env=env,
+                cwd=str(repo_root),
+                start_new_session=(os.name != "nt"),
+                close_fds=True,
+            )
+    except OSError as exc:
+        _update_launch_marker(
+            marker_path,
+            {
+                "state": "spawn_failed",
+                "error": str(exc),
+            },
         )
+        if recovery_lock_acquired:
+            _remove_file(recovery_lock_path)
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "dispatch_id": args.dispatch_id,
+                    "node_id": args.node_id,
+                    "error": f"detached dispatcher spawn failed: {exc}",
+                    "launcher_log_path": str(log_path),
+                },
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+        )
+        return 1
 
     identity = _process_identity_after_spawn(proc.pid)
+    _update_launch_marker(
+        marker_path,
+        {
+            "state": "spawned",
+            "remote_pid": proc.pid,
+            "remote_lstart": (identity or {}).get("lstart"),
+            "remote_identity": identity,
+            "spawned_at": _utc_now(),
+        },
+    )
     if proc.poll() is not None:
+        _update_launch_marker(
+            marker_path,
+            {
+                "state": "exited_before_receipt",
+                "exit_code": proc.returncode,
+            },
+        )
+        if recovery_lock_acquired:
+            _remove_file(recovery_lock_path)
         print(
             json.dumps(
                 {
@@ -289,6 +558,19 @@ def _launch(args: argparse.Namespace) -> int:
     }
     receipt_file = _receipt_path(state_dir, args.dispatch_id)
     receipt_file.write_text(json.dumps(receipt, sort_keys=True) + "\n")
+    _update_launch_marker(
+        marker_path,
+        {
+            "state": "receipted",
+            "receipt_path": str(receipt_file),
+            "remote_pid": proc.pid,
+            "remote_lstart": (identity or {}).get("lstart"),
+            "remote_identity": identity,
+            "receipted_at": receipt["started_at"],
+        },
+    )
+    if recovery_lock_acquired:
+        _remove_file(recovery_lock_path)
     print(json.dumps(receipt, sort_keys=True))
     return 0
 
