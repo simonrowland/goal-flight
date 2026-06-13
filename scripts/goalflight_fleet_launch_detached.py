@@ -158,6 +158,26 @@ def _sanitized_env(source: dict[str, str]) -> dict[str, str]:
     return env
 
 
+def _ensure_local_bin_on_path(env: dict[str, str]) -> None:
+    """Prepend ~/.local/bin to PATH in-place so a detached worker can find its shims.
+
+    A non-login ``ssh host cmd`` invocation does not source ``~/.zprofile``, so the
+    node-side PATH can omit ``~/.local/bin`` where ``setup_worker_path`` installs the
+    agent shims -- notably ``claude``, which the claude-code-cli-acp ACP shim must
+    exec. Without this, claude-acp on a non-sandboxed node clears pty allocation and
+    then fails with ``-32603 "spawn claude pty"``. HOME is allow-listed by
+    ``_sanitized_env``, so it reflects the node's home.
+    """
+    home = env.get("HOME")
+    if not home:
+        return
+    local_bin = f"{home}/.local/bin"
+    path = env.get("PATH", "")
+    if local_bin in path.split(os.pathsep):
+        return
+    env["PATH"] = f"{local_bin}{os.pathsep}{path}" if path else local_bin
+
+
 def _dispatch_dir(state_dir: Path, dispatch_id: str) -> Path:
     return state_dir / "dispatches" / dispatch_id
 
@@ -581,6 +601,7 @@ def _launch(args: argparse.Namespace) -> int:
     env = _sanitized_env(os.environ)
     env["GOALFLIGHT_STATE_DIR"] = str(state_dir)
     env["GOALFLIGHT_FLEET_NODE_ID"] = args.node_id
+    _ensure_local_bin_on_path(env)
 
     popen_cmd = cmd
     if os.name != "nt":

@@ -521,8 +521,49 @@ def test_recovery_reclaims_stale_unresolvable_owner_lock() -> None:
         assert_true("recovery lock cleared", not lock_path.exists())
 
 
+def test_ensure_local_bin_prepends_when_absent() -> None:
+    env = {"HOME": "/Users/x", "PATH": "/usr/bin:/bin"}
+    fleet_launch._ensure_local_bin_on_path(env)
+    assert_true("local_bin prepended", env["PATH"] == "/Users/x/.local/bin:/usr/bin:/bin")
+
+
+def test_ensure_local_bin_idempotent_when_present() -> None:
+    env = {"HOME": "/Users/x", "PATH": "/Users/x/.local/bin:/usr/bin"}
+    fleet_launch._ensure_local_bin_on_path(env)
+    assert_true("unchanged when already present", env["PATH"] == "/Users/x/.local/bin:/usr/bin")
+
+
+def test_ensure_local_bin_no_home_noop() -> None:
+    env = {"PATH": "/usr/bin"}
+    fleet_launch._ensure_local_bin_on_path(env)
+    assert_true("no HOME leaves PATH untouched", env["PATH"] == "/usr/bin")
+    assert_true("no HOME adds no HOME key", "HOME" not in env)
+
+
+def test_ensure_local_bin_empty_path() -> None:
+    env = {"HOME": "/Users/x", "PATH": ""}
+    fleet_launch._ensure_local_bin_on_path(env)
+    assert_true("empty PATH becomes local_bin", env["PATH"] == "/Users/x/.local/bin")
+
+
+def test_ensure_local_bin_substring_not_false_match() -> None:
+    # A PATH entry that only CONTAINS local_bin as a substring must not be read as
+    # membership: split on pathsep, never a naive `local_bin in path` check.
+    env = {"HOME": "/Users/x", "PATH": "/Users/x/.local/bin-extra:/usr/bin"}
+    fleet_launch._ensure_local_bin_on_path(env)
+    assert_true(
+        "substring entry does not block prepend",
+        env["PATH"] == "/Users/x/.local/bin:/Users/x/.local/bin-extra:/usr/bin",
+    )
+
+
 def main() -> None:
     tests = [
+        test_ensure_local_bin_prepends_when_absent,
+        test_ensure_local_bin_idempotent_when_present,
+        test_ensure_local_bin_no_home_noop,
+        test_ensure_local_bin_empty_path,
+        test_ensure_local_bin_substring_not_false_match,
         test_clean_first_launch_creates_marker_and_spawns,
         test_duplicate_marker_recovery_without_no_worker_proof_refuses,
         test_recovery_relaunch_resets_status_epoch,
