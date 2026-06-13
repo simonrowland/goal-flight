@@ -26,6 +26,8 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
+from goalflight_liveness import reset_status_lineage
+
 ENV_ALLOW_EXACT = frozenset(
     {
         "CODEX_HOME",
@@ -410,6 +412,9 @@ def _launch(args: argparse.Namespace) -> int:
         marker_payload["recovered_from_marker_state"] = previous_state
         marker_payload["no_worker_proof"] = proof_reason
         _atomic_write_json(marker_path, marker_payload)
+
+    if recovery_lock_acquired:
+        reset_status_lineage(status_json)
 
     try:
         prompt_path.write_text(prompt_text, encoding="utf-8")

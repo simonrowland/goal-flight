@@ -17,6 +17,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import goalflight_fleet_launch_detached as fleet_launch
+import goalflight_liveness
 
 BASE_SHA = "0123456789abcdef0123456789abcdef01234567"
 
@@ -140,6 +141,141 @@ def test_duplicate_marker_recovery_without_no_worker_proof_refuses() -> None:
         assert_true("warn refuse", "WARN-REFUSE duplicate dispatch-id" in stderr.getvalue())
 
 
+def test_recovery_relaunch_resets_status_epoch() -> None:
+    dispatch_id = "acp-recover-epoch-reset"
+    prompt_text = "retry prompt"
+    old_epoch = "status-deadbeef0001"
+    with tempfile.TemporaryDirectory() as td:
+        state_dir = Path(td) / "state"
+        dispatch_dir = state_dir / "dispatches" / dispatch_id
+        dispatch_dir.mkdir(parents=True, exist_ok=True)
+        status_json = dispatch_dir / "status.json"
+        status_json.write_text(
+            json.dumps(
+                {
+                    "schema": "goalflight.acp-run.v1",
+                    "seq": 9,
+                    "dispatch_id": dispatch_id,
+                    "state": "spawn_failed",
+                    "epoch": old_epoch,
+                    "updated_at": "2026-06-11T12:00:00+00:00",
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        _write_marker(
+            state_dir,
+            dispatch_id,
+            {
+                "schema": fleet_launch.MARKER_SCHEMA,
+                "dispatch_id": dispatch_id,
+                "node_id": "localhost",
+                "state": "spawn_failed",
+                "prompt_sha256": fleet_launch._prompt_sha256(prompt_text),
+                "error": "prior spawn failed before worker start",
+            },
+        )
+        args = _args(state_dir, dispatch_id, prompt_text, recover=True)
+        stdout = io.StringIO()
+        with patched_spawn() as calls, redirect_stdout(stdout):
+            code = fleet_launch._launch(args)
+        assert_true("launch ok", code == 0)
+        assert_true("spawn once", len(calls) == 1)
+        assert_true("stale status removed", not status_json.exists())
+        goalflight_liveness.write_status(
+            status_json,
+            {
+                "schema": "goalflight.acp-run.v1",
+                "seq": 1,
+                "dispatch_id": dispatch_id,
+                "state": "running",
+            },
+        )
+        new_epoch = json.loads(status_json.read_text(encoding="utf-8"))["epoch"]
+        assert_true("new epoch minted", new_epoch != old_epoch)
+
+
+def test_read_only_recovery_inspection_preserves_status() -> None:
+    dispatch_id = "acp-recover-readonly"
+    prompt_text = "do not write this prompt"
+    old_epoch = "status-cafebabe0002"
+    with tempfile.TemporaryDirectory() as td:
+        state_dir = Path(td) / "state"
+        dispatch_dir = state_dir / "dispatches" / dispatch_id
+        dispatch_dir.mkdir(parents=True, exist_ok=True)
+        status_json = dispatch_dir / "status.json"
+        status_payload = {
+            "schema": "goalflight.acp-run.v1",
+            "seq": 4,
+            "dispatch_id": dispatch_id,
+            "state": "running",
+            "worker_pid": 12345,
+            "worker_identity": {
+                "pid": 12345,
+                "lstart": "Thu Jun 11 12:00:00 2026",
+                "comm": "python3",
+            },
+            "epoch": old_epoch,
+            "updated_at": "2026-06-11T12:00:00+00:00",
+        }
+        status_json.write_text(json.dumps(status_payload, sort_keys=True) + "\n", encoding="utf-8")
+        reset_calls: list[Path] = []
+        old_reset = goalflight_liveness.reset_status_lineage
+
+        def track_reset(path: Path) -> bool:
+            reset_calls.append(path)
+            return old_reset(path)
+
+        goalflight_liveness.reset_status_lineage = track_reset
+        fleet_launch.reset_status_lineage = track_reset
+        try:
+            args = _args(state_dir, dispatch_id, prompt_text, recover=True)
+            stdout = io.StringIO()
+            with patched_spawn() as calls, redirect_stdout(stdout):
+                code = fleet_launch._launch(args)
+            receipt = json.loads(stdout.getvalue())
+        finally:
+            goalflight_liveness.reset_status_lineage = old_reset
+            fleet_launch.reset_status_lineage = old_reset
+        assert_true("inspection ok", code == 0)
+        assert_true("no spawn", len(calls) == 0)
+        assert_true("reused receipt", receipt.get("reused") is True)
+        assert_true("recovered flag", receipt.get("recovered") is True)
+        assert_true("status preserved", status_json.exists())
+        preserved = json.loads(status_json.read_text(encoding="utf-8"))
+        assert_true("epoch preserved", preserved.get("epoch") == old_epoch)
+        assert_true("no lineage reset", len(reset_calls) == 0)
+        assert_true("prompt not written", not (dispatch_dir / "prompt.md").exists())
+
+
+def test_clean_first_launch_does_not_reset_status_lineage() -> None:
+    dispatch_id = "acp-clean-no-reset"
+    prompt_text = "first prompt"
+    with tempfile.TemporaryDirectory() as td:
+        state_dir = Path(td) / "state"
+        reset_calls: list[Path] = []
+        old_reset = goalflight_liveness.reset_status_lineage
+
+        def track_reset(path: Path) -> bool:
+            reset_calls.append(path)
+            return old_reset(path)
+
+        goalflight_liveness.reset_status_lineage = track_reset
+        fleet_launch.reset_status_lineage = track_reset
+        try:
+            args = _args(state_dir, dispatch_id, prompt_text, recover=False)
+            stdout = io.StringIO()
+            with patched_spawn(), redirect_stdout(stdout):
+                code = fleet_launch._launch(args)
+        finally:
+            goalflight_liveness.reset_status_lineage = old_reset
+            fleet_launch.reset_status_lineage = old_reset
+        assert_true("launch ok", code == 0)
+        assert_true("no lineage reset", len(reset_calls) == 0)
+
+
 def test_recovery_with_no_worker_proof_relaunches() -> None:
     dispatch_id = "acp-recover-dead-marker"
     prompt_text = "retry prompt"
@@ -176,6 +312,9 @@ def test_recovery_with_no_worker_proof_relaunches() -> None:
 def main() -> None:
     test_clean_first_launch_creates_marker_and_spawns()
     test_duplicate_marker_recovery_without_no_worker_proof_refuses()
+    test_recovery_relaunch_resets_status_epoch()
+    test_read_only_recovery_inspection_preserves_status()
+    test_clean_first_launch_does_not_reset_status_lineage()
     test_recovery_with_no_worker_proof_relaunches()
     print("OK: fleet launch detached tests pass")
 

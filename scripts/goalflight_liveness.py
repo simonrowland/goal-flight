@@ -454,6 +454,20 @@ def _status_epoch_for(path: Path) -> str:
     return epoch
 
 
+def reset_status_lineage(path: Path) -> bool:
+    """Remove persisted status so the next ``write_status`` mints a new epoch.
+
+    Clears the in-process epoch cache for ``path`` and deletes the status file
+    when present. Returns True when a file was removed."""
+    resolved = path.expanduser()
+    _STATUS_EPOCH_CACHE.pop(_status_epoch_key(resolved), None)
+    try:
+        resolved.unlink()
+        return True
+    except FileNotFoundError:
+        return False
+
+
 def _ensure_status_epoch(path: Path, payload: dict) -> None:
     if payload.get("schema") not in _STATUS_EPOCH_SCHEMAS:
         return
