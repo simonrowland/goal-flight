@@ -30,6 +30,11 @@ from goalflight_liveness import reset_status_lineage
 
 ENV_ALLOW_EXACT = frozenset(
     {
+        # claude-code-cli-acp reads the headless subscription OAuth token from this
+        # env var (set on the node, e.g. ~/.zshenv). Exact-key, NOT a CLAUDE_ prefix:
+        # ferry only the credential, not other CLAUDE_CODE_* config that could alter
+        # worker behavior. Never serialized to a marker/receipt/log (see _launch).
+        "CLAUDE_CODE_OAUTH_TOKEN",
         "CODEX_HOME",
         "HOME",
         "LANG",

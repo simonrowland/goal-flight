@@ -557,8 +557,33 @@ def test_ensure_local_bin_substring_not_false_match() -> None:
     )
 
 
+def test_sanitized_env_allows_oauth_token_exact_not_prefix() -> None:
+    # claude-code-cli-acp reads CLAUDE_CODE_OAUTH_TOKEN for the headless subscription
+    # seat. It must survive sanitization (the fix) but the allow must be EXACT-key:
+    # other CLAUDE_CODE_* config must NOT be ferried (no CLAUDE_ prefix rule).
+    source = {
+        "CLAUDE_CODE_OAUTH_TOKEN": "oauth-placeholder-not-a-real-token",
+        "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
+        "ANTHROPIC_BASE_URL": "https://example.invalid",
+        "SSH_AUTH_SOCK": "/tmp/agent.sock",
+        "PATH": "/usr/bin",
+        "RANDOM_UNRELATED": "nope",
+    }
+    env = fleet_launch._sanitized_env(source)
+    assert_true(
+        "oauth token preserved",
+        env.get("CLAUDE_CODE_OAUTH_TOKEN") == "oauth-placeholder-not-a-real-token",
+    )
+    assert_true("other CLAUDE_ config stripped (exact, not prefix)", "CLAUDE_CODE_ENABLE_TELEMETRY" not in env)
+    assert_true("anthropic prefix still ferried", env.get("ANTHROPIC_BASE_URL") == "https://example.invalid")
+    assert_true("ssh auth sock still denied", "SSH_AUTH_SOCK" not in env)
+    assert_true("unrelated var stripped", "RANDOM_UNRELATED" not in env)
+    assert_true("path preserved", env.get("PATH") == "/usr/bin")
+
+
 def main() -> None:
     tests = [
+        test_sanitized_env_allows_oauth_token_exact_not_prefix,
         test_ensure_local_bin_prepends_when_absent,
         test_ensure_local_bin_idempotent_when_present,
         test_ensure_local_bin_no_home_noop,
