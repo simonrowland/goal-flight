@@ -443,6 +443,77 @@ def handle_prompt(req_id: int, params: dict) -> None:
         tool_update(session_id, "tool_call", "tool-stuck", status="pending")
         while True:
             time.sleep(1.0)
+    if SCENARIO == "runaway_tool_errors":
+        count = int(os.environ.get("GOALFLIGHT_FAKE_ACP_TOOL_ERROR_COUNT", "6"))
+        for i in range(count):
+            tool_update(
+                session_id,
+                "tool_output_error",
+                "read-loop",
+                title="Read",
+                status="failed",
+                error={"message": f"fake read failure {i}"},
+            )
+        while True:
+            time.sleep(1.0)
+    if SCENARIO == "tool_error_reset":
+        for i in range(2):
+            tool_update(
+                session_id,
+                "tool_output_error",
+                "read-reset",
+                title="Read",
+                status="failed",
+                error={"message": f"fake read failure before reset {i}"},
+            )
+        tool_update(session_id, "tool_call_update", "read-reset", title="Read", status="completed")
+        for i in range(2):
+            tool_update(
+                session_id,
+                "tool_output_error",
+                "read-reset",
+                title="Read",
+                status="failed",
+                error={"message": f"fake read failure after reset {i}"},
+            )
+        text_update(session_id, "COMPLETE: reset respected\n")
+        response(req_id, {"sessionId": session_id, "stopReason": "end_turn"})
+        return
+    if SCENARIO == "tool_error_progress_reset":
+        for i in range(2):
+            tool_update(
+                session_id,
+                "tool_output_error",
+                "read-progress-reset",
+                title="Read",
+                status="failed",
+                error={"message": f"fake read failure before progress {i}"},
+            )
+        text_update(session_id, "STATUS: model progress resets tool errors\n")
+        for i in range(2):
+            tool_update(
+                session_id,
+                "tool_output_error",
+                "read-progress-reset",
+                title="Read",
+                status="failed",
+                error={"message": f"fake read failure after progress {i}"},
+            )
+        text_update(session_id, "COMPLETE: progress reset respected\n")
+        response(req_id, {"sessionId": session_id, "stopReason": "end_turn"})
+        return
+    if SCENARIO == "runaway_event_cap":
+        interval = float(os.environ.get("GOALFLIGHT_FAKE_ACP_INTERVAL", "0.01"))
+        while True:
+            vendor_update(session_id, "noise")
+            time.sleep(interval)
+    if SCENARIO == "normal_many_events":
+        count = int(os.environ.get("GOALFLIGHT_FAKE_ACP_NORMAL_EVENT_COUNT", "172"))
+        for i in range(max(0, count - 1)):
+            text_update(session_id, f"STATUS: tick {i}\n")
+        text_update(session_id, "COMPLETE: many events ok\n")
+        response(req_id, {"sessionId": session_id, "stopReason": "end_turn"})
+        return
     if SCENARIO == "fine_chunks_vendor":
         for chunk in ("COM", "P", "LETE", ": ", "gro", "k ", "sm", "oke", "\n"):
             text_update(session_id, chunk)

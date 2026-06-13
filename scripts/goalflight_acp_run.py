@@ -13,6 +13,11 @@ Timeout model (two signals):
   for one outstanding tool call. Activity-naive. Use a lower value only when you
   know the task is fast; do not use it as the primary stuck-detection knob.
 
+- ``--max-consecutive-tool-errors`` (default 5) and ``--max-acp-events``
+  (default 5000) — **busy-loop safety nets**. These cap workers that keep
+  emitting events but do not converge. They are runaway backstops, not
+  performance limits.
+
 Explicit ``--max-tool-s`` on the command line (or ``GOALFLIGHT_MAX_TOOL_S``)
 still wins over the default.
 """
@@ -43,6 +48,8 @@ import goalflight_compat  # noqa: E402
 DEFAULT_REMOTE_TURN_SILENCE_S = 1200.0
 DEFAULT_REMOTE_TURN_CANCEL_GRACE_S = 15.0
 DEFAULT_MAX_TOOL_S = 3600.0
+DEFAULT_MAX_CONSECUTIVE_TOOL_ERRORS = 5
+DEFAULT_MAX_ACP_EVENTS = 5000
 DEFAULT_STALL_WAKE_CAP = 3
 DEFAULT_BETWEEN_TURN_STEER_GRACE_S = 10.0
 DEFAULT_EMPTY_BETWEEN_TURN_STEER_POLL_S = 0.25
@@ -920,6 +927,130 @@ def _event_kind(event: dict) -> str:
     return str(event.get("params", {}).get("update", {}).get("sessionUpdate") or event.get("method") or "event")
 
 
+_MODEL_PROGRESS_EVENT_KINDS = {"agent_message_chunk", "agent_thought_chunk", "plan"}
+_TOOL_ERROR_EVENT_KINDS = {
+    "tool_output_error",
+    "tool_error",
+    "tool_result_error",
+}
+_TOOL_SUCCESS_EVENT_KINDS = {
+    "tool_output",
+    "tool_result",
+}
+_TOOL_SUCCESS_STATUSES = {"complete", "completed", "success", "succeeded", "ok"}
+_TOOL_ERROR_STATUSES = {"error", "errored", "failed"}
+_RUNAWAY_TERMINAL_REASONS = {"runaway_tool_error_loop", "runaway_event_cap"}
+
+
+def _event_update(event: dict) -> dict:
+    update = (event.get("params") or {}).get("update") or {}
+    return update if isinstance(update, dict) else {}
+
+
+def _compact_event_value(value: object, limit: int = 500) -> str:
+    if isinstance(value, str):
+        text = value
+    else:
+        try:
+            text = json.dumps(value, sort_keys=True, separators=(",", ":"))
+        except (TypeError, ValueError):
+            text = str(value)
+    return text if len(text) <= limit else text[: limit - 3] + "..."
+
+
+def _tool_name_from_event(event: dict) -> str:
+    update = _event_update(event)
+    for container in (update, update.get("toolCall"), update.get("tool_call")):
+        if not isinstance(container, dict):
+            continue
+        for key in ("title", "tool", "toolName", "tool_name", "name", "toolCallId", "tool_call_id", "id"):
+            value = container.get(key)
+            if isinstance(value, str) and value:
+                return _compact_event_value(value, 160)
+    return "unknown"
+
+
+def _tool_error_from_event(event: dict) -> str:
+    update = _event_update(event)
+    content = update.get("content")
+    candidates = [
+        update.get("error"),
+        update.get("message"),
+        update.get("details"),
+        content.get("text") if isinstance(content, dict) else None,
+    ]
+    for value in candidates:
+        if value:
+            return _compact_event_value(value)
+    return _compact_event_value(update)
+
+
+def _event_is_model_progress(event: dict) -> bool:
+    return _event_kind(event) in _MODEL_PROGRESS_EVENT_KINDS
+
+
+def _event_is_tool_success(event: dict) -> bool:
+    kind = _event_kind(event)
+    update = _event_update(event)
+    status = str(update.get("status") or "").lower()
+    return kind in _TOOL_SUCCESS_EVENT_KINDS or status in _TOOL_SUCCESS_STATUSES
+
+
+def _event_is_tool_error(event: dict) -> bool:
+    kind = _event_kind(event)
+    update = _event_update(event)
+    status = str(update.get("status") or "").lower()
+    return kind in _TOOL_ERROR_EVENT_KINDS or (
+        kind in {"tool_call", "tool_call_update"} and status in _TOOL_ERROR_STATUSES
+    )
+
+
+def _is_runaway_terminal(heartbeat_terminal: str | None, heartbeat_error: dict | None) -> bool:
+    return (
+        heartbeat_terminal == "failed"
+        and isinstance(heartbeat_error, dict)
+        and heartbeat_error.get("reason") in _RUNAWAY_TERMINAL_REASONS
+    )
+
+
+class AcpRunawayCaps:
+    def __init__(self, *, max_consecutive_tool_errors: int, max_acp_events: int) -> None:
+        self.max_consecutive_tool_errors = max(1, int(max_consecutive_tool_errors))
+        self.max_acp_events = max(1, int(max_acp_events))
+        self.consecutive_tool_errors = 0
+        self.repeated_tool = "unknown"
+        self.last_tool_error = ""
+
+    def observe(self, event: dict, *, events_seen: int) -> dict[str, object] | None:
+        if _event_is_model_progress(event) or _event_is_tool_success(event):
+            self.consecutive_tool_errors = 0
+            self.repeated_tool = "unknown"
+            self.last_tool_error = ""
+        elif _event_is_tool_error(event):
+            self.consecutive_tool_errors += 1
+            self.repeated_tool = _tool_name_from_event(event)
+            self.last_tool_error = _tool_error_from_event(event)
+            if self.consecutive_tool_errors >= self.max_consecutive_tool_errors:
+                return {
+                    "code": -1,
+                    "message": "runaway_tool_error_loop",
+                    "reason": "runaway_tool_error_loop",
+                    "tool": self.repeated_tool,
+                    "last_error": self.last_tool_error,
+                    "consecutive_tool_errors": self.consecutive_tool_errors,
+                    "max_consecutive_tool_errors": self.max_consecutive_tool_errors,
+                }
+        if events_seen > self.max_acp_events:
+            return {
+                "code": -1,
+                "message": "runaway_event_cap",
+                "reason": "runaway_event_cap",
+                "events_seen": events_seen,
+                "max_acp_events": self.max_acp_events,
+            }
+        return None
+
+
 def decide_terminal_state(
     *,
     result_ok: bool,
@@ -958,6 +1089,8 @@ def decide_terminal_state(
     ``"wedged"`` (the dead-sample wedge is what the kill-without-outcome path is).
     """
     heartbeat_terminal = heartbeat_outcome or ("wedged" if killed_by_heartbeat else None)
+    if _is_runaway_terminal(heartbeat_terminal, heartbeat_error):
+        return "failed", heartbeat_error
     # tool_timeout is an outstanding-tool anomaly, not silence — never masked.
     if heartbeat_terminal == "tool_timeout":
         return "tool_timeout", heartbeat_error or {"code": -1, "message": "tool_timeout"}
@@ -1220,6 +1353,9 @@ async def _run_acp_dispatch_impl(
         "worker_alive": False,
         "pgroup_cpu_pct": None,
         "events_seen": 0,
+        "max_consecutive_tool_errors": int(getattr(cfg, "max_consecutive_tool_errors", DEFAULT_MAX_CONSECUTIVE_TOOL_ERRORS)),
+        "consecutive_tool_errors": 0,
+        "max_acp_events": int(getattr(cfg, "max_acp_events", DEFAULT_MAX_ACP_EVENTS)),
         "acp_dropped_frames": 0,
         "acp_dropped_frame_records": [],
         "last_event_at": None,
@@ -1455,6 +1591,11 @@ async def _run_acp_dispatch_impl(
     # enforces a hard wall (lease lifetime) so a pathological CPU spinner that
     # never emits an event can't hang the runner forever.
     idle_gate = IdleLivenessGate(cfg.cpu_epsilon, cfg.max_quiet_s)
+    runaway_caps = AcpRunawayCaps(
+        max_consecutive_tool_errors=int(getattr(cfg, "max_consecutive_tool_errors", DEFAULT_MAX_CONSECUTIVE_TOOL_ERRORS)),
+        max_acp_events=int(getattr(cfg, "max_acp_events", DEFAULT_MAX_ACP_EVENTS)),
+    )
+    runaway_terminal_error: dict[str, object] | None = None
     awaiting_next_prompt = False
     awaiting_next_prompt_deadline_mono = 0.0
     pending_steer_first_seen_mono: dict[int, float] = {}
@@ -1691,6 +1832,26 @@ async def _run_acp_dispatch_impl(
                 error=error,
                 killed_by_heartbeat=True,
                 wedged_by_heartbeat=wedged_by_heartbeat,
+                updated_at=_now(),
+            )
+            write_status(status_path, payload)
+
+    async def mark_runaway_terminal(error: dict[str, object]) -> None:
+        nonlocal heartbeat_outcome, heartbeat_error, wedged_by_heartbeat
+        if conn is not None:
+            setattr(conn, "killed_by_heartbeat", True)
+            setattr(conn, "heartbeat_outcome", "failed")
+        async with status_lock:
+            heartbeat_outcome = "failed"
+            heartbeat_error = error
+            wedged_by_heartbeat = False
+            payload.update(
+                state="failed",
+                ok=False,
+                error=error,
+                killed_by_heartbeat=True,
+                wedged_by_heartbeat=False,
+                runaway_reason=error.get("reason") or error.get("message"),
                 updated_at=_now(),
             )
             write_status(status_path, payload)
@@ -2030,6 +2191,7 @@ async def _run_acp_dispatch_impl(
             await asyncio.sleep(cfg.heartbeat_interval)
 
     async def note_event(event: dict) -> None:
+        nonlocal runaway_terminal_error
         now_mono = active_monotonic()
         idle_gate.note_event()  # any incoming SDK observer event keeps idle gate alive
         snapshot = activity.snapshot(now_mono)
@@ -2040,9 +2202,19 @@ async def _run_acp_dispatch_impl(
         progress_quiet_s = float(snapshot["progress_quiet_for_s"])
         turn_in_flight = bool(snapshot.get("turn_in_flight"))
         turn_silent_for_s = float(snapshot.get("turn_silent_for_s", 0.0))
+        runaway_error = None
+        if runaway_terminal_error is None:
+            runaway_error = runaway_caps.observe(event, events_seen=seen)
         await update_status(
             state="running",
             events_seen=seen,
+            consecutive_tool_errors=runaway_caps.consecutive_tool_errors,
+            repeated_tool_error_tool=(
+                runaway_caps.repeated_tool if runaway_caps.consecutive_tool_errors else None
+            ),
+            last_tool_error=(
+                runaway_caps.last_tool_error if runaway_caps.consecutive_tool_errors else None
+            ),
             acp_dropped_frames=dropped_frames,
             wedge_progress_seen=progress_seen,
             progress_quiet_for_s=round(progress_quiet_s, 3),
@@ -2056,6 +2228,11 @@ async def _run_acp_dispatch_impl(
             pgid=payload.get("pgid"),
             worker_alive=(proc.returncode is None) if proc else False,
         )
+        if runaway_error is not None:
+            runaway_terminal_error = runaway_error
+            await mark_runaway_terminal(runaway_error)
+            if conn is not None:
+                await conn.kill()
 
     async def on_idle_check() -> bool:
         # Runner's CPU-aware liveness gate for session_prompt's idle path — the
@@ -2428,6 +2605,7 @@ async def _run_acp_dispatch_impl(
             )
             if not proceeded_ok:
                 state = "blocked_permission_denied"
+        runaway_terminal = _is_runaway_terminal(terminal_by_heartbeat, terminal_error)
         final_updates = {
             "state": state,
             "ok": result.ok and state == "complete",
@@ -2456,9 +2634,12 @@ async def _run_acp_dispatch_impl(
             # end_turn; without this the record would be self-contradictory
             # (state=complete, killed_by_heartbeat=true) and mislead an orchestrator
             # keying retry off the flag.
-            "killed_by_heartbeat": state in ("wedged", "tool_timeout", "remote_turn_silence"),
+            "killed_by_heartbeat": state in ("wedged", "tool_timeout", "remote_turn_silence")
+            or runaway_terminal,
             "wedged_by_heartbeat": state == "wedged",
         }
+        if runaway_terminal:
+            final_updates["runaway_reason"] = terminal_error.get("reason") or terminal_error.get("message")
         if _permission_audit_surface_enabled(permission_mode):
             # Extra audit surface is intentionally scoped to inline permission
             # relays and the live ACP matrix. Normal dispatch status/ledger shape
@@ -2577,6 +2758,10 @@ def normalized_acp_dispatch_cfg(args: argparse.Namespace) -> argparse.Namespace:
         values["wedge_samples"] = 4
     if values.get("max_tool_s", 0) <= 0:
         values["max_tool_s"] = DEFAULT_MAX_TOOL_S
+    if values.get("max_consecutive_tool_errors", 0) <= 0:
+        values["max_consecutive_tool_errors"] = DEFAULT_MAX_CONSECUTIVE_TOOL_ERRORS
+    if values.get("max_acp_events", 0) <= 0:
+        values["max_acp_events"] = DEFAULT_MAX_ACP_EVENTS
     if values.get("max_quiet_s", 0) <= 0:
         values["max_quiet_s"] = 3600.0
     if values.get("progress_stall_s", 0) <= 0:
@@ -2787,6 +2972,27 @@ def main(argv: list[str] | None = None) -> int:
              f"{DEFAULT_MAX_TOOL_S:.0f}s, the harness clamp). Activity-naive — "
              "not the primary stuck detector. Lower values are for known-fast "
              "tasks only. Use --progress-stall-s for genuine hangs.",
+    )
+    # Accepted-watch SC-13 posture: numeric behavior-tuning knobs only; not
+    # source, safety-disable, or command overrides, so no GOALFLIGHT_ALLOW gate.
+    parser.add_argument(
+        "--max-consecutive-tool-errors",
+        type=int,
+        default=int(os.environ.get(
+            "GOALFLIGHT_MAX_CONSECUTIVE_TOOL_ERRORS",
+            str(DEFAULT_MAX_CONSECUTIVE_TOOL_ERRORS),
+        )),
+        help="Runaway backstop: fail and kill the ACP worker after this many "
+             "consecutive tool failure events without model progress or a "
+             f"successful tool result (default {DEFAULT_MAX_CONSECUTIVE_TOOL_ERRORS}).",
+    )
+    parser.add_argument(
+        "--max-acp-events",
+        type=int,
+        default=int(os.environ.get("GOALFLIGHT_MAX_ACP_EVENTS", str(DEFAULT_MAX_ACP_EVENTS))),
+        help="Runaway backstop: fail and kill the ACP worker when total ACP "
+             f"events exceed this cap (default {DEFAULT_MAX_ACP_EVENTS}). "
+             "Sized for runaway loops, not normal performance limiting.",
     )
     parser.add_argument(
         "--max-quiet-s",

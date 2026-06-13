@@ -421,6 +421,180 @@ async def case_runner_overlimit_response_status_counts_drop() -> None:
         goalflight_adapter_readiness.ADAPTERS_DIR = old_adapters_dir
 
 
+async def _run_fake_runner_scenario(
+    scenario: str,
+    *,
+    max_consecutive_tool_errors: int = 5,
+    max_acp_events: int = 5000,
+    extra_env: dict[str, str] | None = None,
+) -> tuple[dict, dict]:
+    old_scenario = os.environ.get("GOALFLIGHT_FAKE_ACP_SCENARIO")
+    old_state_dir = os.environ.get("GOALFLIGHT_STATE_DIR")
+    old_pidfile_dir = os.environ.get("GOAL_FLIGHT_PIDFILE_DIR")
+    old_extra = {key: os.environ.get(key) for key in (extra_env or {})}
+    old_agent_command = goalflight_acp_run.agent_command
+    old_adapters_dir = goalflight_adapter_readiness.ADAPTERS_DIR
+    os.environ["GOALFLIGHT_FAKE_ACP_SCENARIO"] = scenario
+    for key, value in (extra_env or {}).items():
+        os.environ[key] = value
+    goalflight_acp_run.agent_command = lambda agent, model=None: (sys.executable, [str(FAKE)])
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            goalflight_adapter_readiness.ADAPTERS_DIR = tmp_path
+            os.environ["GOALFLIGHT_STATE_DIR"] = str(tmp_path / "state")
+            os.environ["GOAL_FLIGHT_PIDFILE_DIR"] = str(tmp_path / "pids")
+            _write_supported_adapter_manifest(tmp_path, "fake-runner")
+            status_path = tmp_path / "status.json"
+            dispatch_id = f"test-{scenario}-{os.getpid()}"
+            payload = await goalflight_acp_run.run(
+                argparse.Namespace(
+                    agent="fake-runner",
+                    cwd=str(ROOT),
+                    session_id=f"{dispatch_id}-session",
+                    dispatch_id=dispatch_id,
+                    prompt_id=None,
+                    prompt=None,
+                    prompt_text="go",
+                    mode="one-shot",
+                    status_json=str(status_path),
+                    idle_timeout=2.0,
+                    heartbeat_interval=5.0,
+                    wedge_samples=100,
+                    max_tool_s=60.0,
+                    max_consecutive_tool_errors=max_consecutive_tool_errors,
+                    max_acp_events=max_acp_events,
+                    max_quiet_s=60.0,
+                    progress_stall_s=60.0,
+                    liveness_profile=None,
+                    remote_turn_silence_s=None,
+                    remote_turn_cancel_grace_s=0.0,
+                    cpu_epsilon=0.1,
+                )
+            )
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+            return payload, status
+    finally:
+        goalflight_acp_run.agent_command = old_agent_command
+        goalflight_adapter_readiness.ADAPTERS_DIR = old_adapters_dir
+        if old_scenario is None:
+            os.environ.pop("GOALFLIGHT_FAKE_ACP_SCENARIO", None)
+        else:
+            os.environ["GOALFLIGHT_FAKE_ACP_SCENARIO"] = old_scenario
+        if old_state_dir is None:
+            os.environ.pop("GOALFLIGHT_STATE_DIR", None)
+        else:
+            os.environ["GOALFLIGHT_STATE_DIR"] = old_state_dir
+        if old_pidfile_dir is None:
+            os.environ.pop("GOAL_FLIGHT_PIDFILE_DIR", None)
+        else:
+            os.environ["GOAL_FLIGHT_PIDFILE_DIR"] = old_pidfile_dir
+        for key, value in old_extra.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+async def case_runner_tool_error_loop_cap_fails_terminal() -> None:
+    payload, status = await _run_fake_runner_scenario(
+        "runaway_tool_errors",
+        max_consecutive_tool_errors=3,
+        max_acp_events=100,
+        extra_env={"GOALFLIGHT_FAKE_ACP_TOOL_ERROR_COUNT": "4"},
+    )
+    assert payload["state"] == "failed", payload
+    assert status["state"] == "failed", status
+    assert status["error"]["message"] == "runaway_tool_error_loop", status
+    assert status["error"]["tool"] == "Read", status
+    assert "fake read failure" in status["error"]["last_error"], status
+    assert status["error"]["consecutive_tool_errors"] == 3, status
+    assert status["worker_alive"] is False, status
+
+
+async def case_runner_tool_error_success_resets_counter() -> None:
+    payload, status = await _run_fake_runner_scenario(
+        "tool_error_reset",
+        max_consecutive_tool_errors=3,
+        max_acp_events=100,
+    )
+    assert payload["state"] == "complete", payload
+    assert status["state"] == "complete", status
+    assert status["ok"] is True, status
+    assert status.get("error") is None, status
+    assert status.get("result_text") and "COMPLETE: reset respected" in status["result_text"], status
+
+
+async def case_runner_tool_error_progress_resets_counter() -> None:
+    payload, status = await _run_fake_runner_scenario(
+        "tool_error_progress_reset",
+        max_consecutive_tool_errors=3,
+        max_acp_events=100,
+    )
+    assert payload["state"] == "complete", payload
+    assert status["state"] == "complete", status
+    assert status["ok"] is True, status
+    assert status.get("error") is None, status
+    assert status.get("result_text") and "COMPLETE: progress reset respected" in status["result_text"], status
+
+
+async def case_runner_tool_error_cap_not_masked_by_later_end_turn() -> None:
+    payload, status = await _run_fake_runner_scenario(
+        "tool_error_reset",
+        max_consecutive_tool_errors=2,
+        max_acp_events=100,
+    )
+    assert payload["state"] == "failed", payload
+    assert status["state"] == "failed", status
+    assert status["ok"] is False, status
+    assert status["error"]["message"] == "runaway_tool_error_loop", status
+    assert status.get("result_text") is None, status
+    assert status.get("runaway_reason") == "runaway_tool_error_loop", status
+
+
+async def case_runner_event_cap_fails_terminal() -> None:
+    payload, status = await _run_fake_runner_scenario(
+        "runaway_event_cap",
+        max_consecutive_tool_errors=100,
+        max_acp_events=5,
+    )
+    assert payload["state"] == "failed", payload
+    assert status["state"] == "failed", status
+    assert status["error"]["message"] == "runaway_event_cap", status
+    assert status["error"]["events_seen"] > 5, status
+    assert status["worker_alive"] is False, status
+
+
+async def case_runner_event_cap_not_masked_by_later_end_turn() -> None:
+    payload, status = await _run_fake_runner_scenario(
+        "normal_many_events",
+        max_consecutive_tool_errors=100,
+        max_acp_events=5,
+        extra_env={"GOALFLIGHT_FAKE_ACP_NORMAL_EVENT_COUNT": "20"},
+    )
+    assert payload["state"] == "failed", payload
+    assert status["state"] == "failed", status
+    assert status["ok"] is False, status
+    assert status["error"]["message"] == "runaway_event_cap", status
+    assert status["error"]["events_seen"] > 5, status
+    assert status.get("result_text") is None, status
+    assert status.get("runaway_reason") == "runaway_event_cap", status
+
+
+async def case_runner_many_events_completes_under_cap() -> None:
+    payload, status = await _run_fake_runner_scenario(
+        "normal_many_events",
+        max_consecutive_tool_errors=3,
+        max_acp_events=200,
+        extra_env={"GOALFLIGHT_FAKE_ACP_NORMAL_EVENT_COUNT": "172"},
+    )
+    assert payload["state"] == "complete", payload
+    assert status["state"] == "complete", status
+    assert status["ok"] is True, status
+    assert status["events_seen"] >= 172, status
+    assert status.get("result_text") and "COMPLETE: many events ok" in status["result_text"], status
+
+
 def _stderr_error_runner_args(dispatch_id: str, status_path: Path) -> argparse.Namespace:
     return argparse.Namespace(
         agent="stderr-runner",
@@ -1805,6 +1979,13 @@ async def amain() -> None:
     await case_stderr_burst_without_newline_drains()
     await case_overlimit_response_fails_cleanly()
     await case_runner_overlimit_response_status_counts_drop()
+    await case_runner_tool_error_loop_cap_fails_terminal()
+    await case_runner_tool_error_success_resets_counter()
+    await case_runner_tool_error_progress_resets_counter()
+    await case_runner_tool_error_cap_not_masked_by_later_end_turn()
+    await case_runner_event_cap_fails_terminal()
+    await case_runner_event_cap_not_masked_by_later_end_turn()
+    await case_runner_many_events_completes_under_cap()
     await case_runner_captures_agent_stderr_on_failure()
     await case_runner_tail_caps_agent_stderr_on_failure()
     await case_runner_blocks_probe_required_adapter()
