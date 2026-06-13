@@ -23,37 +23,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
+import goalflight_dispatch_states as dispatch_states
 import goalflight_fleet_mirror as mirror
 
 PidHint = Literal["alive", "dead", "unknown"]
 
-TERMINAL_STATES = frozenset(
-    {
-        "complete",
-        "error",
-        "failed",
-        "wedged",
-        "blocked",
-        "blocked_adapter_gate",
-        "blocked_auth",
-        "inconclusive_timeout",
-        "worker_dead",
-    }
-)
-SALVAGE_NEEDED_STATES = frozenset(
-    {
-        "salvage_needed",
-        "cleanup_needed",
-    }
-)
-RUNNING_STATES = frozenset(
-    {
-        "starting",
-        "running",
-        "running_quiet",
-        "waiting",
-    }
-)
+TERMINAL_STATES = dispatch_states.TERMINAL_STATES
+SALVAGE_NEEDED_STATES = dispatch_states.SALVAGE_NEEDED_STATES
+RUNNING_STATES = dispatch_states.RUNNING_STATES
 
 QUARANTINE_SSH_PARTITION = "ssh_partition"
 QUARANTINE_MIRROR_STALE = "mirror_stale"
@@ -68,11 +45,11 @@ class DispatchClassification:
 
 
 def is_terminal_state(state: str | None) -> bool:
-    return bool(state and (state in TERMINAL_STATES or state in SALVAGE_NEEDED_STATES))
+    return dispatch_states.is_terminal_state(state)
 
 
 def is_running_state(state: str | None) -> bool:
-    return bool(state and state in RUNNING_STATES)
+    return dispatch_states.is_running_state(state)
 
 
 def remote_state_from_mirror(result: mirror.MirrorReadResult | None) -> str | None:

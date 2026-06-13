@@ -22,6 +22,12 @@ import goalflight_fleet_reconcile as fleet_reconcile
 import goalflight_fleet_status as status
 
 FIXTURES = ROOT / "tests" / "fixtures" / "fleet_mirrors"
+ACP_FINAL_FAILURE_STATES = (
+    "tool_timeout",
+    "stalled",
+    "remote_turn_silence",
+    "failed_worktree",
+)
 
 
 def assert_true(name: str, condition: bool) -> None:
@@ -202,6 +208,40 @@ def test_terminal_failed_release() -> None:
         assert_true("released", row.released is True)
         released = fleet.load_account_lock(fleet.account_lock_path(fleet_dir, "openai/default"))
         assert_true("lock released", released is None or released.get("state") == "released")
+
+
+def test_acp_final_failure_states_release_locks() -> None:
+    for state in ACP_FINAL_FAILURE_STATES:
+        dispatch_id = f"acp-reconcile-{state.replace('_', '-')}"
+        with tempfile.TemporaryDirectory() as td:
+            fleet_dir = Path(td) / "fleet"
+            _fixture_fleet(fleet_dir)
+            _acquire_lock(fleet_dir, dispatch_id)
+            terminal = json.loads((FIXTURES / "valid_ok.json").read_text())
+            terminal["state"] = state
+            dispatch_dir = fleet_dir / "register" / "dispatches" / dispatch_id
+            dispatch_dir.mkdir(parents=True, exist_ok=True)
+            (dispatch_dir / "status.json").write_text(json.dumps(terminal) + "\n")
+            fleet._atomic_write_json(
+                dispatch_dir / "meta.json",
+                {
+                    "dispatch_id": dispatch_id,
+                    "node_id": "localhost",
+                    "lease_active": True,
+                    "pid_hint": "dead",
+                    "ssh_reachable": True,
+                },
+            )
+            _write_aggregate(fleet_dir, [dispatch_id])
+
+            row = fleet_reconcile.reconcile_dispatch(fleet_dir, dispatch_id, mutate=True)
+
+            assert_true(f"{state} release action", row.action == "release_locks")
+            assert_true(f"{state} terminal", row.classification_state == "terminal")
+            assert_true(f"{state} may release", row.may_release is True)
+            assert_true(f"{state} released", row.released is True)
+            released = fleet.load_account_lock(fleet.account_lock_path(fleet_dir, "openai/default"))
+            assert_true(f"{state} lock released", released is None or released.get("state") == "released")
 
 
 def test_terminal_error_release() -> None:
@@ -663,6 +703,10 @@ def main() -> None:
     test_ssh_down_quarantine_no_release()
     test_terminal_dead_pid_release_once()
     test_terminal_failed_release()
+    test_acp_final_failure_states_release_locks()
+    test_terminal_error_release()
+    test_terminal_release_uses_status_json_account_key()
+    test_terminal_release_fails_closed_when_active_lock_unresolved()
     test_pre_status_confirmed_failed_release()
     test_pre_status_dead_before_grace_not_release()
     test_still_live_pre_status_not_release()
@@ -672,7 +716,7 @@ def main() -> None:
     test_salvage_needed_ttl_expired_lock_survives_stale_reconcile()
     test_non_salvage_terminal_ttl_expired_still_reaped()
     test_live_ssh_probe_quarantine_when_unreachable()
-    print("OK: 12 fleet reconcile tests pass")
+    print("OK: 16 fleet reconcile tests pass")
 
 
 if __name__ == "__main__":

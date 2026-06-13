@@ -14,6 +14,12 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import goalflight_fleet_mirror as mirror
 
 FIXTURES = ROOT / "tests" / "fixtures" / "fleet_mirrors"
+ACP_FINAL_FAILURE_STATES = (
+    "tool_timeout",
+    "stalled",
+    "remote_turn_silence",
+    "failed_worktree",
+)
 
 
 def assert_true(name: str, condition: bool) -> None:
@@ -67,6 +73,27 @@ def test_dispatch_status_v1_fixture_normalized() -> None:
     assert_true("state", result.payload["state"] == "starting")
     assert_true("liveness", result.payload["liveness_state"] == "live")
     assert_true("identity", result.payload["worker_identity"]["pid"] == 4242)
+
+
+def test_dispatch_status_v1_acp_final_failure_states_are_terminal() -> None:
+    for index, state in enumerate(ACP_FINAL_FAILURE_STATES, start=1):
+        payload = {
+            "schema": "goalflight.status.v1",
+            "dispatch_id": f"gf-final-failure-{index}",
+            "state": state,
+            "worker_alive": False,
+            "updated_at": 1780000000 + index,
+        }
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "status.json"
+            path.write_text(json.dumps(payload) + "\n")
+            result = mirror.read_status_mirror(path)
+
+        assert_true(f"{state} ok", result.ok is True)
+        assert_true(f"{state} payload", result.payload is not None)
+        assert_true(f"{state} state", result.payload["state"] == state)
+        assert_true(f"{state} liveness", result.payload["liveness_state"] == "terminal")
+        assert_true(f"{state} terminal", result.payload["terminal_state"] == "error")
 
 
 def test_seq_regression_fails_closed() -> None:
@@ -153,6 +180,7 @@ def test_legacy_record_without_epoch_uses_epoch_zero() -> None:
 def main() -> None:
     test_valid_fixture_returns_payload_and_last_seq()
     test_dispatch_status_v1_fixture_normalized()
+    test_dispatch_status_v1_acp_final_failure_states_are_terminal()
     test_seq_regression_fails_closed()
     test_epoch_change_allows_lower_seq()
     test_same_epoch_seq_regression_fails_closed()
@@ -161,7 +189,7 @@ def main() -> None:
     test_missing_file()
     test_first_read_accepts_seq_zero()
     test_legacy_record_without_epoch_uses_epoch_zero()
-    print("OK: fleet mirror tests pass")
+    print("OK: 11 fleet mirror tests pass")
 
 
 if __name__ == "__main__":

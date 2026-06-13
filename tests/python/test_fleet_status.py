@@ -12,6 +12,13 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import goalflight_fleet_mirror as mirror
 import goalflight_fleet_status as status
 
+ACP_FINAL_FAILURE_STATES = (
+    "tool_timeout",
+    "stalled",
+    "remote_turn_silence",
+    "failed_worktree",
+)
+
 
 def assert_true(name: str, condition: bool) -> None:
     if not condition:
@@ -114,6 +121,18 @@ def test_terminal_dead_pid_may_release() -> None:
     assert_true("may release", status.may_release_locks(row) is True)
 
 
+def test_acp_final_failure_states_may_release() -> None:
+    for state in ACP_FINAL_FAILURE_STATES:
+        row = status.classify_dispatch_row(
+            ssh_reachable=True,
+            mirror=_mirror(state),
+            lease_active=True,
+            pid_hint="dead",
+        )
+        assert_true(f"{state} terminal", row.state == "terminal")
+        assert_true(f"{state} may release", status.may_release_locks(row) is True)
+
+
 def test_orphan_lease_dead_pid_may_release() -> None:
     row = status.classify_dispatch_row(
         ssh_reachable=True,
@@ -133,8 +152,9 @@ def main() -> None:
     test_mirror_stale_never_releases()
     test_mirror_stale_unknown_never_releases()
     test_terminal_dead_pid_may_release()
+    test_acp_final_failure_states_may_release()
     test_orphan_lease_dead_pid_may_release()
-    print("OK: fleet status tests pass")
+    print("OK: 9 fleet status tests pass")
 
 
 if __name__ == "__main__":

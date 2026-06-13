@@ -15,6 +15,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import goalflight_dispatch_states as dispatch_states
+
 STATUS_MIRROR_SCHEMA = "goalflight.acp-run.v1"
 DISPATCH_STATUS_SCHEMA = "goalflight.status.v1"
 ACCEPTED_STATUS_SCHEMAS = (STATUS_MIRROR_SCHEMA, DISPATCH_STATUS_SCHEMA)
@@ -84,26 +86,7 @@ def _coerce_updated_at(value: object) -> int | None:
 
 
 def _state_seq_rank(state: object) -> int:
-    if not isinstance(state, str):
-        return 0
-    if state.startswith("blocked"):
-        return 90
-    return {
-        "waiting_capacity": 10,
-        "waiting": 10,
-        "handshaking": 20,
-        "starting": 20,
-        "running": 30,
-        "running_quiet": 40,
-        "watcher_stopped": 45,
-        "complete": 90,
-        "failed": 90,
-        "wedged": 90,
-        "worker_dead": 90,
-        "idle_timeout": 90,
-        "inconclusive_timeout": 90,
-        "controller_dead": 90,
-    }.get(state, 50)
+    return dispatch_states.state_seq_rank(state)
 
 
 def _synthesized_seq(payload: dict[str, Any]) -> int | None:
@@ -120,34 +103,11 @@ def _synthesized_seq(payload: dict[str, Any]) -> int | None:
 
 
 def _normalize_dispatch_state(state: object) -> str | None:
-    if not isinstance(state, str) or not state:
-        return None
-    if state.startswith("blocked"):
-        return "blocked"
-    return {
-        "waiting_capacity": "waiting",
-        "handshaking": "starting",
-        "watcher_stopped": "running_quiet",
-        "idle_timeout": "inconclusive_timeout",
-    }.get(state, state)
+    return dispatch_states.normalize_dispatch_state(state)
 
 
 def _terminal_state_for(state: object, reason: object = None) -> str:
-    if state == "complete":
-        return "complete"
-    if state == "worker_dead":
-        return "worker_dead"
-    if state in {"idle_timeout", "inconclusive_timeout"}:
-        return "idle_timeout"
-    if state == "watcher_stopped":
-        return "watcher_stopped"
-    if state == "controller_dead" or (state == "orphaned" and reason == "controller_dead"):
-        return "controller_dead"
-    if isinstance(state, str) and state.startswith("blocked"):
-        return "blocked"
-    if state in {"failed", "wedged"}:
-        return "error"
-    return "unknown"
+    return dispatch_states.terminal_state_for(state, reason)
 
 
 def _liveness_state_for(payload: dict[str, Any], *, terminal_state: str) -> str:
