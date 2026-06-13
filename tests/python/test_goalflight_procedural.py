@@ -222,7 +222,7 @@ def test_doctor_json_shape() -> None:
     assert_true("autoreview script path", payload["autoreview"]["script_path"].endswith("scripts/autoreview.sh"))
     assert_true("autoreview upstream helper key", "upstream_helper" in payload["autoreview"])
     assert_true("claude_acp_stopgap section", "claude_acp_stopgap" in payload)
-    for key in ("present", "installed_version", "apply_script", "ok"):
+    for key in ("present", "installed_version", "build_script", "ok"):
         assert_true(f"claude_acp_stopgap.{key} present", key in payload["claude_acp_stopgap"])
     # Resolution contract (catches the regression where ok=True but upstream_helper
     # resolves to None — the env-based AUTOREVIEW_HELPER fallback path going silent
@@ -483,7 +483,7 @@ def test_claude_acp_stopgap_warns_until_patch_backup_differs() -> None:
 
             payload = goalflight_doctor.check_claude_acp_stopgap()
             assert_true("unpatched stopgap warns", payload["ok"] is False)
-            assert_true("unpatched detail points at script", "install_claude_acp_patch.sh" in payload["detail"])
+            assert_true("unpatched detail points at install.sh", "install.sh claude-acp" in payload["detail"])
 
             Path(f"{binary}.orig").write_bytes(b"original")
             binary.write_bytes(b"patched")
