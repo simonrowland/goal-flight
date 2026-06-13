@@ -121,11 +121,15 @@ so CI stays hermetic.
 
 ```bash
 python3 scripts/goalflight_fleet.py watch --fleet --once --json
-python3 scripts/goalflight_fleet.py reconcile --all-in-flight --json
+# Block on one dispatch until its mirrored state is terminal (--until-terminal
+# also requires --fleet):
+python3 scripts/goalflight_fleet.py watch --fleet --until-terminal <dispatch-id> --timeout-s 600 --json
+python3 scripts/goalflight_fleet.py reconcile --all-in-flight
 ```
 
 `watch` mirrors remote `status.json` into the orchestrator register. `reconcile`
-releases billing locks when dispatches reach terminal states.
+releases billing locks when dispatches reach terminal states (it prints a text
+summary and does not take `--json`).
 
 ## Router entrypoint
 
