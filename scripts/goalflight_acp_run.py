@@ -2418,8 +2418,13 @@ async def _run_acp_dispatch_impl(
         if test_marker:
             with contextlib.suppress(Exception):
                 Path(test_marker).write_text(str(proc.pid), encoding="utf-8")
+        test_delay_raw = goalflight_compat.allowed_env_override(
+            "GOALFLIGHT_TEST_ACP_BEFORE_PID_LEDGER_UPDATE_S",
+            "",
+            test_mode=True,
+        )
         try:
-            test_delay_s = float(os.environ.get("GOALFLIGHT_TEST_ACP_BEFORE_PID_LEDGER_UPDATE_S", "0") or "0")
+            test_delay_s = float(test_delay_raw or "0")
         except ValueError:
             test_delay_s = 0.0
         if test_delay_s > 0:

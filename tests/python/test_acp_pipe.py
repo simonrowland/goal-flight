@@ -496,6 +496,52 @@ async def _run_fake_runner_scenario(
                 os.environ[key] = value
 
 
+async def _run_pid_ledger_delay_probe(*, test_mode: bool) -> list[float]:
+    delay_s = 12.345
+    calls: list[float] = []
+    old_sleep = asyncio.sleep
+    old_delay = os.environ.get("GOALFLIGHT_TEST_ACP_BEFORE_PID_LEDGER_UPDATE_S")
+    old_test_mode = os.environ.get("GOALFLIGHT_TEST_MODE")
+
+    async def sleep_probe(seconds: float, *args, **kwargs):
+        if seconds == delay_s:
+            calls.append(seconds)
+            return None
+        return await old_sleep(seconds, *args, **kwargs)
+
+    asyncio.sleep = sleep_probe
+    try:
+        os.environ["GOALFLIGHT_TEST_ACP_BEFORE_PID_LEDGER_UPDATE_S"] = str(delay_s)
+        if test_mode:
+            os.environ["GOALFLIGHT_TEST_MODE"] = "1"
+        else:
+            os.environ.pop("GOALFLIGHT_TEST_MODE", None)
+        payload, status = await _run_fake_runner_scenario("echo")
+        assert payload["state"] == "complete", payload
+        assert status["state"] == "complete", status
+        return calls
+    finally:
+        asyncio.sleep = old_sleep
+        if old_delay is None:
+            os.environ.pop("GOALFLIGHT_TEST_ACP_BEFORE_PID_LEDGER_UPDATE_S", None)
+        else:
+            os.environ["GOALFLIGHT_TEST_ACP_BEFORE_PID_LEDGER_UPDATE_S"] = old_delay
+        if old_test_mode is None:
+            os.environ.pop("GOALFLIGHT_TEST_MODE", None)
+        else:
+            os.environ["GOALFLIGHT_TEST_MODE"] = old_test_mode
+
+
+async def case_runner_pid_ledger_delay_ignores_poison_without_test_mode() -> None:
+    calls = await _run_pid_ledger_delay_probe(test_mode=False)
+    assert calls == [], calls
+
+
+async def case_runner_pid_ledger_delay_applies_in_test_mode() -> None:
+    calls = await _run_pid_ledger_delay_probe(test_mode=True)
+    assert calls == [12.345], calls
+
+
 async def case_runner_tool_error_loop_cap_fails_terminal() -> None:
     payload, status = await _run_fake_runner_scenario(
         "runaway_tool_errors",
@@ -1979,6 +2025,8 @@ async def amain() -> None:
     await case_stderr_burst_without_newline_drains()
     await case_overlimit_response_fails_cleanly()
     await case_runner_overlimit_response_status_counts_drop()
+    await case_runner_pid_ledger_delay_ignores_poison_without_test_mode()
+    await case_runner_pid_ledger_delay_applies_in_test_mode()
     await case_runner_tool_error_loop_cap_fails_terminal()
     await case_runner_tool_error_success_resets_counter()
     await case_runner_tool_error_progress_resets_counter()
