@@ -868,8 +868,8 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **controller_does:** The orchestrator maps host aliases and trigger-prone labels to neutral tracked names before creating manifests, filenames, branch names, or commit messages.
 - **failure_mode:** The orchestrator writes a host alias directly into a manifest filename or commit message, making the billing-trigger name git-visible.
 - **skill_md_compressed_form:**
-    - **kind:** literal
-    - **pattern:** "Git-visible trigger aliases stay out of filenames, manifests, and commit messages"
+    - **kind:** regex
+    - **pattern:** "Git-visible trigger aliases stay out of filenames, manifests, and commit\\s+messages"
     - **max_section_lines:** 30
 - **verifier:**
     - **kind:** textual-invariant
@@ -2345,11 +2345,11 @@ chunk-3a rationale:
 - **id:** `reviews-one-shot-fixes-looped`
 - **name:** Reviews are one-shot; fixes are looped
 - **category:** `review-discipline`
-- **controller_does:** The orchestrator dispatches review as a bounded one-shot judgment task, then routes the fix/test/re-review response cycle as loop-shaped implementation work when findings require convergence.
-- **failure_mode:** The orchestrator goal-loops review generation itself or, after receiving findings, hand-edits the response through repeated local fix/test turns.
+- **controller_does:** The orchestrator dispatches review as a bounded one-shot judgment task, then routes the fix/test/re-review response cycle as loop-shaped implementation work when findings require convergence, with substantive fix closures getting a refutation-stance closing pass.
+- **failure_mode:** The orchestrator goal-loops review generation itself, skips the refutation-stance closure pass, or hand-edits the response through repeated local fix/test turns after receiving findings.
 - **skill_md_compressed_form:**
     - **kind:** literal
-    - **pattern:** "Reviews are one-shot; fixes loop to green and re-review."
+    - **pattern:** "Reviews are one-shot; fixes loop to green and re-review"
     - **max_section_lines:** 25
 - **verifier:**
     - **kind:** textual-invariant
