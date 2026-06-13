@@ -71,6 +71,25 @@ def invalid_token_message(account_key: str, node_id: str) -> str:
     return f"account {account_key} on node {node_id} has an invalid/revoked token; re-login required"
 
 
+def stale_probe_membership_message(account_key: str, node_id: str) -> str:
+    return (
+        f"account {account_key} is not a current linked member of node {node_id}; "
+        "run `account link`; stale green probe does not authorize dispatch"
+    )
+
+
+def _recorded_owner_controller_id(node: dict[str, Any], account_key: str) -> str | None:
+    owners = node.get("billing_account_owners")
+    if not isinstance(owners, dict):
+        return None
+    raw = owners.get(account_key)
+    if isinstance(raw, dict):
+        raw = raw.get("controller_id") or raw.get("owner_controller_id")
+    if raw:
+        return str(raw)
+    return None
+
+
 def default_runner(argv: list[str]) -> tuple[int, str, str]:
     import os
 
@@ -351,6 +370,10 @@ def link_account_to_node(
         if account_key not in linked:
             linked.append(account_key)
         node["billing_accounts"] = linked
+        existing_owners = node.get("billing_account_owners")
+        owners = dict(existing_owners) if isinstance(existing_owners, dict) else {}
+        owners[account_key] = str(fleet_doc.get("controller_id") or fleet.controller_id())
+        node["billing_account_owners"] = owners
         nodes[node_id] = node
         fleet_doc["nodes"] = nodes
         schemas.validate_fleet(fleet_doc)
@@ -384,6 +407,13 @@ def unlink_account_from_node(fleet_dir: Path, account_key: str, node_id: str) ->
             raise ValueError(f"unknown node: {node_id}")
         linked = [key for key in (node.get("billing_accounts") or []) if key != account_key]
         node["billing_accounts"] = linked
+        existing_owners = node.get("billing_account_owners")
+        owners = dict(existing_owners) if isinstance(existing_owners, dict) else {}
+        owners.pop(account_key, None)
+        if owners:
+            node["billing_account_owners"] = owners
+        else:
+            node.pop("billing_account_owners", None)
         nodes[node_id] = node
         fleet_doc["nodes"] = nodes
         schemas.validate_fleet(fleet_doc)
@@ -441,23 +471,69 @@ def fleet_auth_doctor(
 
 
 def assert_dispatch_auth(fleet_dir: Path, node_id: str, account_key: str) -> None:
-    payload = read_probe_artifact(fleet_dir, node_id, account_key)
-    if payload is None:
-        raise DispatchAuthError(
-            f"missing auth probe for node={node_id} account={account_key}",
-            auth_probe="red",
-        )
-    status = str(payload.get("status") or "red")
-    if status != "green":
-        if status == "red":
+    import goalflight_fleet as fleet
+    import goalflight_fleet_schemas as schemas
+
+    fleet_path = fleet_dir / "fleet.json"
+    with fleet.RegistryLock(fleet_dir):
+        if not fleet_path.exists():
             raise DispatchAuthError(
-                invalid_token_message(account_key, node_id),
+                f"missing fleet registry for node={node_id} account={account_key}",
+                auth_probe="red",
+            )
+        fleet_doc = fleet.read_json(fleet_path)
+        schemas.validate_fleet(fleet_doc)
+        nodes = fleet_doc.get("nodes") or {}
+        node = nodes.get(node_id)
+        if not isinstance(node, dict):
+            raise DispatchAuthError(
+                f"unknown node {node_id}; account {account_key} is not dispatch-authorized",
+                auth_probe="red",
+            )
+        linked = {str(item) for item in (node.get("billing_accounts") or [])}
+        if account_key not in linked:
+            raise DispatchAuthError(
+                stale_probe_membership_message(account_key, node_id),
+                auth_probe="red",
+            )
+
+        owner_controller_id = _recorded_owner_controller_id(node, account_key)
+        fleet_controller_id = fleet_doc.get("controller_id")
+        if owner_controller_id and not fleet_controller_id:
+            raise DispatchAuthError(
+                (
+                    f"account {account_key} on node {node_id} has recorded owner "
+                    f"{owner_controller_id}, but fleet controller_id is missing; run `account link`"
+                ),
+                auth_probe="red",
+            )
+        if owner_controller_id and str(fleet_controller_id) != owner_controller_id:
+            raise DispatchAuthError(
+                (
+                    f"account {account_key} on node {node_id} is linked to controller "
+                    f"{owner_controller_id}, not fleet controller {fleet_controller_id}; "
+                    "run `account link` to refresh membership"
+                ),
+                auth_probe="red",
+            )
+
+        payload = read_probe_artifact(fleet_dir, node_id, account_key)
+        if payload is None:
+            raise DispatchAuthError(
+                f"missing auth probe for node={node_id} account={account_key}",
+                auth_probe="red",
+            )
+        status = str(payload.get("status") or "red")
+        if status != "green":
+            if status == "red":
+                raise DispatchAuthError(
+                    invalid_token_message(account_key, node_id),
+                    auth_probe=status,
+                )
+            raise DispatchAuthError(
+                f"auth probe {status} for node={node_id} account={account_key}",
                 auth_probe=status,
             )
-        raise DispatchAuthError(
-            f"auth probe {status} for node={node_id} account={account_key}",
-            auth_probe=status,
-        )
 
 
 def cmd_account_link(args) -> int:

@@ -68,6 +68,20 @@ def _fixture_fleet(fleet_dir: Path, *, node_id: str = "localhost") -> None:
     fleet._atomic_write_json(fleet_dir / "fleet.json", fleet_doc)
 
 
+def _write_probe(fleet_dir: Path, node_id: str, account_key: str, status: str) -> None:
+    billing.write_probe_artifact(
+        fleet_dir,
+        node_id,
+        {
+            "schema": billing.AUTH_PROBE_SCHEMA,
+            "account_key": account_key,
+            "provider": account_key.split("/", 1)[0],
+            "status": status,
+            "probed_at": "2026-05-24T12:00:00+00:00",
+        },
+    )
+
+
 def test_account_link_runs_probe_and_writes_artifact() -> None:
     with tempfile.TemporaryDirectory() as td:
         fleet_dir = Path(td) / "fleet"
@@ -82,6 +96,35 @@ def test_account_link_runs_probe_and_writes_artifact() -> None:
         assert_true("probe green", result["auth_probe"]["status"] == "green")
         artifact = billing.read_probe_artifact(fleet_dir, "localhost", "openai/default")
         assert_true("artifact saved", artifact is not None and artifact["status"] == "green")
+
+
+def test_dispatch_auth_refuses_stale_green_probe_without_membership() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        fleet_dir = Path(td) / "fleet"
+        _fixture_fleet(fleet_dir)
+        _write_probe(fleet_dir, "localhost", "openai/default", "green")
+        try:
+            billing.assert_dispatch_auth(fleet_dir, "localhost", "openai/default")
+            assert_true("should block", False)
+        except billing.DispatchAuthError as exc:
+            message = str(exc)
+            assert_true("hard red", exc.auth_probe == "red")
+            assert_true("membership message", "not a current linked member" in message)
+            assert_true("remedy", "account link" in message)
+            assert_true("stale probe", "stale green probe" in message)
+
+
+def test_dispatch_auth_allows_linked_member_with_green_probe() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        fleet_dir = Path(td) / "fleet"
+        _fixture_fleet(fleet_dir)
+        billing.link_account_to_node(
+            fleet_dir,
+            "openai/default",
+            "localhost",
+            runner=green_runner,
+        )
+        billing.assert_dispatch_auth(fleet_dir, "localhost", "openai/default")
 
 
 def test_openai_probe_uses_authenticated_models_check() -> None:
@@ -201,6 +244,29 @@ def test_dispatch_gate_blocks_red_auth() -> None:
             assert_true("should block", False)
         except billing.DispatchAuthError as exc:
             assert_true("red status", exc.auth_probe == "red")
+
+
+def test_dispatch_auth_refuses_recorded_controller_owner_mismatch() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        fleet_dir = Path(td) / "fleet"
+        _fixture_fleet(fleet_dir)
+        billing.link_account_to_node(
+            fleet_dir,
+            "openai/default",
+            "localhost",
+            runner=green_runner,
+        )
+        fleet_doc = fleet.read_json(fleet_dir / "fleet.json")
+        fleet_doc["nodes"]["localhost"]["billing_account_owners"]["openai/default"] = "other-controller"
+        fleet._atomic_write_json(fleet_dir / "fleet.json", fleet_doc)
+        try:
+            billing.assert_dispatch_auth(fleet_dir, "localhost", "openai/default")
+            assert_true("should block", False)
+        except billing.DispatchAuthError as exc:
+            message = str(exc)
+            assert_true("hard red", exc.auth_probe == "red")
+            assert_true("owner mismatch", "not fleet controller" in message)
+            assert_true("owner remedy", "account link" in message)
 
 
 def test_account_unlink_removes_link_and_artifact() -> None:
@@ -420,12 +486,15 @@ def test_cursor_auth_probe_uses_status_not_version() -> None:
 def main() -> None:
     for test in (
         test_account_link_runs_probe_and_writes_artifact,
+        test_dispatch_auth_refuses_stale_green_probe_without_membership,
+        test_dispatch_auth_allows_linked_member_with_green_probe,
         test_openai_probe_uses_authenticated_models_check,
         test_openai_working_token_probe_is_green_and_dispatch_allowed,
         test_openai_revoked_token_probe_is_red_and_dispatch_gate_blocks,
         test_account_link_cli_fails_closed_on_red_probe,
         test_doctor_fleet_shape,
         test_dispatch_gate_blocks_red_auth,
+        test_dispatch_auth_refuses_recorded_controller_owner_mismatch,
         test_account_unlink_removes_link_and_artifact,
         test_doctor_cli_fleet_json,
         test_remote_auth_probe_uses_node_venv_python,
