@@ -74,6 +74,33 @@ orthogonal axes: **iteration pattern** (how many turns) and **comms shape**
     --agent <agent>
   ```
 
+## Claude worker surfaces (loop / one-shot / remote)
+
+When a chunk is routed to a **Claude** worker, the surface follows the iteration
+pattern and local-vs-remote. This is orthogonal to *whether* it should be Claude
+at all: default code-writing to sub-billed CLI workers to preserve the
+orchestrator's own provider budget (controller-provider asymmetry), and reach for
+Claude when it is the right tool or the Claude budget is abundant.
+
+- **Long-running, autonomous, looping** local Claude work -> a **`claude agents`
+  background session**: it can run `/loop` (self-paced), its transcript is
+  readable so the operator can watch live, it authenticates in-process, and it
+  needs no pty.
+- **One-shot, or controller-driven recursion** (the orchestrator re-invokes it
+  each iteration) local Claude work -> a **host subagent**: it cannot self-`/loop`
+  (the orchestrator drives the iterations), but its transcript is readable.
+- **Remote** Claude work -> **`claude-acp` on a non-sandboxed host**: a full
+  remote Claude session over ACP that **supports loop**. It needs a free pty on
+  the node plus a headless `setup-token` credential. The local / sandboxed
+  `claude-acp` shim is unsupported — no pty under the host sandbox, and the macOS
+  Keychain credential is unreachable over a non-interactive ssh — and is
+  intentionally not used; the two local surfaces above cover local Claude work.
+
+These Claude surfaces take no capacity lease and leave no dispatch-ledger entry,
+and they run on the orchestrator's own provider, so do not route heavy code
+fan-out through them (the bypass regression in the skill's Hard Invariants).
+Code-writing still defaults to the sub-billed CLI workers.
+
 ## Worker/controller candidates
 
 Treat routing candidates as first-class only after their readiness gate passes:
