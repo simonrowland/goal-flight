@@ -209,6 +209,60 @@ def case_claude_acp_warns_when_broken_binary_without_cargo() -> None:
     assert "npm > 0.1.1" in payload["detail"]
 
 
+def case_doctor_pty_shim_health_warns_when_orphans_present() -> None:
+    with patch(
+        "goalflight_acp_client.count_orphaned_acp_shims",
+        return_value={
+            "orphan_count": 2,
+            "reapable_count": 1,
+            "count_includes_foreign_shims": True,
+            "orphans": [
+                {"pid": 11, "goalflight_owned": True},
+                {"pid": 12, "goalflight_owned": False},
+            ],
+        },
+    ), patch("goalflight_doctor._read_ptmx_max", return_value=511), \
+        patch("goalflight_doctor._read_ptmx_open_count", return_value=100):
+        payload = goalflight_doctor.check_pty_shim_health()
+    assert payload["level"] == "warning"
+    assert payload["warnings"]
+    assert payload["reapable_shim_count"] == 1
+    assert "2 orphaned claude-code-cli-acp shims" in payload["warnings"][0]
+    assert "ptmx_max=511" in payload["warnings"][0]
+    # NO-GO guard: the warning must NOT imply the reaper clears all orphans; it
+    # distinguishes the goal-flight-owned subset from editor/foreign-launched ones.
+    assert "1 goal-flight-owned" in payload["warnings"][0]
+    assert "editor/foreign-launched" in payload["warnings"][0]
+
+
+def case_doctor_pty_shim_health_all_foreign_says_reaper_wont_act() -> None:
+    with patch(
+        "goalflight_acp_client.count_orphaned_acp_shims",
+        return_value={
+            "orphan_count": 1,
+            "reapable_count": 0,
+            "count_includes_foreign_shims": True,
+            "orphans": [{"pid": 21, "goalflight_owned": False}],
+        },
+    ), patch("goalflight_doctor._read_ptmx_max", return_value=511), \
+        patch("goalflight_doctor._read_ptmx_open_count", return_value=100):
+        payload = goalflight_doctor.check_pty_shim_health()
+    assert payload["level"] == "warning"
+    assert payload["reapable_shim_count"] == 0
+    assert "none are goal-flight-owned (reaper won't act)" in payload["warnings"][0]
+
+
+def case_doctor_pty_shim_health_ok_when_no_orphans() -> None:
+    with patch(
+        "goalflight_acp_client.count_orphaned_acp_shims",
+        return_value={"orphan_count": 0, "orphans": []},
+    ), patch("goalflight_doctor._read_ptmx_max", return_value=511), \
+        patch("goalflight_doctor._read_ptmx_open_count", return_value=100):
+        payload = goalflight_doctor.check_pty_shim_health()
+    assert payload["level"] == "ok"
+    assert payload["warnings"] == []
+
+
 def case_claude_acp_reports_pinned_build_when_orig_differs() -> None:
     with tempfile.TemporaryDirectory(prefix="gf-doctor-claude-acp-") as tmp:
         binary = Path(tmp) / "claude-code-cli-acp"
@@ -235,6 +289,9 @@ def main() -> None:
     case_doctor_reports_wsl_runtime_fields()
     case_claude_acp_newer_npm_retires_pinned_build()
     case_claude_acp_warns_when_broken_binary_without_cargo()
+    case_doctor_pty_shim_health_warns_when_orphans_present()
+    case_doctor_pty_shim_health_all_foreign_says_reaper_wont_act()
+    case_doctor_pty_shim_health_ok_when_no_orphans()
     case_claude_acp_reports_pinned_build_when_orig_differs()
     print("OK: doctor tests pass")
 

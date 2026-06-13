@@ -1125,6 +1125,123 @@ def _claude_acp_platform_binary() -> Path | None:
     return Path(path) if path else None
 
 
+def _read_ptmx_max() -> int | None:
+    if not goalflight_compat.is_macos():
+        return None
+    try:
+        result = subprocess.run(
+            ["sysctl", "-n", "kern.tty.ptmx_max"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        return int(result.stdout.strip())
+    except ValueError:
+        return None
+
+
+def _read_ptmx_open_count() -> int | None:
+    if not goalflight_compat.is_macos():
+        return None
+    try:
+        result = subprocess.run(
+            ["lsof", "-n"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=3,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return sum(1 for line in result.stdout.splitlines() if "/dev/ptmx" in line)
+
+
+def check_pty_shim_health() -> dict:
+    """Warn when orphaned claude-acp shims or pty usage are elevated."""
+    out: dict = {
+        "orphan_shim_count": 0,
+        "reapable_shim_count": 0,
+        "orphans": [],
+        "ptmx_max": None,
+        "ptmx_open_count": None,
+        "warnings": [],
+        "ok": True,
+        "level": "ok",
+    }
+    try:
+        import goalflight_acp_client as acp_client
+
+        orphan_payload = acp_client.count_orphaned_acp_shims()
+        out["orphan_shim_count"] = int(orphan_payload.get("orphan_count") or 0)
+        out["reapable_shim_count"] = int(orphan_payload.get("reapable_count") or 0)
+        out["orphans"] = orphan_payload.get("orphans") or []
+        if orphan_payload.get("skipped"):
+            out["skipped"] = orphan_payload.get("skipped")
+    except Exception as exc:  # pragma: no cover - defensive doctor path
+        out.update({
+            "ok": None,
+            "level": "info",
+            "detail": f"orphan shim probe failed: {type(exc).__name__}: {exc}",
+        })
+        return out
+
+    out["ptmx_max"] = _read_ptmx_max()
+    out["ptmx_open_count"] = _read_ptmx_open_count()
+
+    warnings: list[str] = []
+    ptmx_max = out["ptmx_max"]
+    if out["orphan_shim_count"] > 0:
+        cap = ptmx_max if ptmx_max is not None else "?"
+        reapable = out["reapable_shim_count"]
+        foreign = out["orphan_shim_count"] - reapable
+        # The count may include editor-launched (e.g. Zed) shims goal-flight did
+        # NOT spawn; the reaper only acts on the goal-flight-owned subset. Say so
+        # explicitly so the operator does not assume the reaper clears them all.
+        guidance = (
+            f"reaper handles {reapable} goal-flight-owned"
+            if reapable
+            else "none are goal-flight-owned (reaper won't act)"
+        )
+        if foreign > 0:
+            guidance += (
+                f"; {foreign} appear editor/foreign-launched — restart the "
+                "controlling app (e.g. Zed) to release those"
+            )
+        warnings.append(
+            f"{out['orphan_shim_count']} orphaned claude-code-cli-acp shims holding ptys "
+            f"(ptmx_max={cap}; {guidance})."
+        )
+    if (
+        ptmx_max is not None
+        and out["ptmx_open_count"] is not None
+        and out["ptmx_open_count"] >= max(1, int(ptmx_max * 0.9))
+    ):
+        warnings.append(
+            f"pty usage near cap: {out['ptmx_open_count']}/{ptmx_max} open /dev/ptmx "
+            "— restart heavy pty consumers or raise kern.tty.ptmx_max."
+        )
+    out["warnings"] = warnings
+    if warnings:
+        out["ok"] = False
+        out["level"] = "warning"
+        out["detail"] = warnings[0]
+    else:
+        out["detail"] = "no orphaned claude-acp shims detected"
+    return out
+
+
 def check_claude_acp_stopgap() -> dict:
     """Warn when the Claude ACP npm adapter still needs the pinned fixed build."""
     installed = _claude_acp_installed_version()
@@ -1970,6 +2087,13 @@ def doctor(
     write_probe_agent: str = "grok-code",
 ) -> dict:
     skill_root = SCRIPT_DIR.parent
+    shim_reap: dict = {"skipped": "not_attempted", "reaped": []}
+    try:
+        import goalflight_acp_client as acp_client
+
+        shim_reap = acp_client.resume_startup_reap()
+    except Exception as exc:  # pragma: no cover - defensive doctor path
+        shim_reap = {"error": str(exc), "reaped": []}
     codex_desktop = app_exists("Codex", "com.openai.codex")
     codex_cli = version("codex", "--version")
     cursor_desktop = app_exists("Cursor", "com.todesktop.230313mzl4w4u92")
@@ -2011,6 +2135,8 @@ def doctor(
         ),
         "acp": check_acp(),
         "claude_acp_stopgap": check_claude_acp_stopgap(),
+        "pty_shim_health": check_pty_shim_health(),
+        "pty_shim_reap": shim_reap,
         "project": git_state(repo),
         "worktrees": check_worktrees(repo),
         "project_goalflight_readiness": check_project_goalflight_readiness(repo),
@@ -2251,6 +2377,12 @@ def print_human(payload: dict) -> None:
                 "WSL dispatch baseline",
                 wsl_info.get("next_step"),
             ),
+            *lines,
+        ]
+    pty_shim_health = payload.get("pty_shim_health") or {}
+    for warning in pty_shim_health.get("warnings") or []:
+        lines = [
+            status_line(False, "pty shim health", warning),
             *lines,
         ]
     wsl_filesystems = payload.get("wsl_filesystems") or {}

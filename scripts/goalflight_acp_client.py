@@ -17,8 +17,10 @@ import math
 import os
 from pathlib import Path
 import re
+import shutil
 import signal
 import subprocess
+import sys
 import threading
 import time
 from typing import Any, Callable, Protocol
@@ -287,13 +289,38 @@ def _write_through_pidfile_locked() -> None:
         log.warning("pidfile write failed (%s): %s", own_pidfile, e)
 
 
+CLAUDE_ACP_SHIM_BASENAME = "claude-code-cli-acp"
+DEFAULT_SHIM_ORPHAN_TTL_S = 600.0
+_SHIM_REAP_GRACE_S = 5.0
+# Dedicated provenance marker injected into every goal-flight-launched shim's
+# environment (see spawn_acp_connection). The reaper DEFAULT-DENIES any orphan
+# whose environment does not carry this var: the claude-code-cli-acp shim's
+# primary use is editor-driven (Zed etc.), so an editor-launched shim that
+# orphans to ppid==1 must NEVER be SIGKILLed by us. Presence of the var is the
+# positive proof that goal-flight (not an editor/foreign launcher) owns it.
+GOALFLIGHT_ACP_SHIM_OWNER_ENV = "GOALFLIGHT_ACP_SHIM_OWNER"
+
+
+def _shim_owner_marker() -> str:
+    """Stable, goal-flight-identifying owner value for this orchestrator.
+
+    Stable for the orchestrator's lifetime (keyed on its pid) and prefixed with a
+    fixed sentinel so the value is unmistakably goal-flight provenance. The reaper
+    only checks PRESENCE of the marker var, not the value, but a stable value
+    keeps logs/diagnostics legible across a single orchestrator run.
+    """
+    return f"goal-flight:{os.getpid()}"
+
+
 def cleanup_ghosts(active_worker_pids: set[int] | None = None) -> int:
     """Reap workers recorded by dead orchestrator pidfiles."""
-    if not _PIDFILE_DIR.exists():
-        return 0
     own_pid = os.getpid()
     own_worker_pids = active_worker_pids or set()
     killed = 0
+    if not _PIDFILE_DIR.exists():
+        return killed + _shim_reap_killed_count(
+            reap_orphaned_acp_shims(active_worker_pids=own_worker_pids)
+        )
     skipped_stale = 0
     skipped_live_controller = 0
     skipped_detached = 0
@@ -397,7 +424,428 @@ def cleanup_ghosts(active_worker_pids: set[int] | None = None) -> int:
             skipped_live_controller,
             skipped_detached,
         )
-    return killed
+    return killed + _shim_reap_killed_count(
+        reap_orphaned_acp_shims(active_worker_pids=own_worker_pids)
+    )
+
+
+def _shim_reap_killed_count(result: dict[str, Any]) -> int:
+    reaped = result.get("reaped")
+    if not isinstance(reaped, list):
+        return 0
+    return len(reaped)
+
+
+def _parse_etime_seconds(etime: str) -> float | None:
+    raw = etime.strip()
+    if not raw:
+        return None
+    days = 0
+    if "-" in raw:
+        day_part, raw = raw.split("-", 1)
+        try:
+            days = int(day_part)
+        except ValueError:
+            return None
+    parts = raw.split(":")
+    try:
+        if len(parts) == 3:
+            hours, minutes, seconds = (int(part) for part in parts)
+            return float(days * 86400 + hours * 3600 + minutes * 60 + seconds)
+        if len(parts) == 2:
+            minutes, seconds = (int(part) for part in parts)
+            return float(days * 86400 + minutes * 60 + seconds)
+        if len(parts) == 1:
+            return float(days * 86400 + int(parts[0]))
+    except ValueError:
+        return None
+    return None
+
+
+def _claude_acp_shim_executable_paths() -> set[str]:
+    paths: set[str] = set()
+    launcher = shutil.which(CLAUDE_ACP_SHIM_BASENAME)
+    if launcher:
+        with contextlib.suppress(OSError):
+            paths.add(os.path.realpath(launcher))
+    override = goalflight_compat.allowed_env_override(
+        "GOALFLIGHT_CLAUDE_ACP_BIN_PATH",
+        "GOALFLIGHT_ALLOW_CLAUDE_ACP_BIN_OVERRIDE",
+    )
+    if override:
+        candidate = Path(override).expanduser()
+        if candidate.is_file():
+            with contextlib.suppress(OSError):
+                paths.add(os.path.realpath(str(candidate)))
+    if shutil.which("npm"):
+        try:
+            npm_root = subprocess.run(
+                ["npm", "root", "-g"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=4,
+                check=False,
+            )
+            if npm_root.returncode == 0 and npm_root.stdout.strip():
+                root = Path(npm_root.stdout.strip())
+                platform_name = {
+                    "darwin": "darwin",
+                    "linux": "linux",
+                    "win32": "win32",
+                }.get(sys.platform)
+                machine = os.uname().machine.lower() if hasattr(os, "uname") else ""
+                arch = {
+                    "x86_64": "x64",
+                    "amd64": "x64",
+                    "arm64": "arm64",
+                    "aarch64": "arm64",
+                }.get(machine)
+                if platform_name and arch:
+                    exe = (
+                        f"{CLAUDE_ACP_SHIM_BASENAME}.exe"
+                        if platform_name == "win32"
+                        else CLAUDE_ACP_SHIM_BASENAME
+                    )
+                    candidate = root / f"{CLAUDE_ACP_SHIM_BASENAME}-{platform_name}-{arch}" / "bin" / exe
+                    if candidate.is_file():
+                        with contextlib.suppress(OSError):
+                            paths.add(os.path.realpath(str(candidate)))
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return paths
+
+
+def _is_claude_acp_shim_executable(comm: str, shim_paths: set[str]) -> bool:
+    if comm == CLAUDE_ACP_SHIM_BASENAME:
+        return True
+    if comm in shim_paths:
+        return True
+    basename = os.path.basename(comm)
+    if basename != CLAUDE_ACP_SHIM_BASENAME:
+        return False
+    with contextlib.suppress(OSError):
+        real_comm = os.path.realpath(comm)
+        if real_comm in shim_paths:
+            return True
+    return False
+
+
+def _list_posix_process_rows() -> list[dict[str, Any]]:
+    try:
+        result = subprocess.run(
+            ["ps", "-axo", "pid=,ppid=,etime=,comm="],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        log.warning("shim_reap: process listing failed: %s", exc)
+        return []
+    if result.returncode != 0:
+        log.warning("shim_reap: ps failed rc=%s", result.returncode)
+        return []
+    rows: list[dict[str, Any]] = []
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split(None, 3)
+        if len(parts) < 4:
+            continue
+        try:
+            pid = int(parts[0])
+            ppid = int(parts[1])
+        except ValueError:
+            continue
+        etime = parts[2]
+        comm = parts[3].strip()
+        rows.append(
+            {
+                "pid": pid,
+                "ppid": ppid,
+                "comm": comm,
+                "age_s": _parse_etime_seconds(etime),
+            }
+        )
+    return rows
+
+
+def _read_process_environ(pid: int) -> str | None:
+    """Best-effort read of a process's environment block (POSIX).
+
+    macOS exposes the environment in ``ps -E -ww -o command=`` (the env appears
+    appended to the command column). Returns the raw text on success, or ``None``
+    if it cannot be read (process gone, permission denied, ps error). The caller
+    DEFAULT-DENIES on ``None`` -- an unreadable environment is treated as
+    NOT-goal-flight, never as provenance.
+    """
+    try:
+        result = subprocess.run(
+            ["ps", "-E", "-ww", "-o", "command=", "-p", str(int(pid))],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=4,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        log.warning("shim_reap: env read failed pid=%d: %s", pid, exc)
+        return None
+    if result.returncode != 0:
+        return None
+    text = result.stdout.strip()
+    return text or None
+
+
+def _shim_has_goalflight_provenance(pid: int) -> bool:
+    """DEFAULT-DENY provenance check for an orphaned shim candidate.
+
+    Returns True ONLY when the candidate process's environment carries the
+    dedicated GOALFLIGHT_ACP_SHIM_OWNER marker that spawn_acp_connection injects.
+    If the environment cannot be read OR the marker is absent, returns False so
+    the reaper leaves the process alone. This is the positive goal-flight gate
+    that prevents reaping an editor-launched (Zed etc.) claude-acp shim.
+    """
+    environ = _read_process_environ(pid)
+    if not environ:
+        return False
+    return f"{GOALFLIGHT_ACP_SHIM_OWNER_ENV}=" in environ
+
+
+def _ledger_tracked_worker_pids(active_worker_pids: set[int] | None = None) -> set[int]:
+    tracked = set(active_worker_pids or ())
+    with _registry_lock:
+        tracked.update(_live_connections.keys())
+    if not _PIDFILE_DIR.exists():
+        return tracked
+    for pidfile in _PIDFILE_DIR.glob("*.jsonl"):
+        try:
+            lines = pidfile.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            line = line.strip()
+            if not line or not line.startswith("{"):
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            pid = entry.get("pid")
+            if isinstance(pid, int):
+                tracked.add(pid)
+    return tracked
+
+
+def _orphan_shim_candidates(
+    rows: list[dict[str, Any]],
+    *,
+    tracked_pids: set[int],
+    shim_paths: set[str],
+    min_age_s: float | None,
+    provenance_check: Callable[[int], bool] | None = None,
+) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    for row in rows:
+        pid = row.get("pid")
+        ppid = row.get("ppid")
+        comm = row.get("comm")
+        if not isinstance(pid, int) or not isinstance(ppid, int) or not isinstance(comm, str):
+            continue
+        if ppid != 1:
+            continue
+        if pid in tracked_pids:
+            continue
+        if not _is_claude_acp_shim_executable(comm, shim_paths):
+            continue
+        age_s = row.get("age_s")
+        if min_age_s is not None:
+            if not isinstance(age_s, (int, float)) or float(age_s) <= float(min_age_s):
+                continue
+        # DEFAULT-DENY goal-flight provenance gate (kill path only). When a
+        # provenance_check is supplied, a candidate is reaped ONLY if its env
+        # carries our owner marker; absent/unreadable env => not reaped. The
+        # count path passes no check (reporting is allowed to enumerate all
+        # orphans, including editor-launched ones).
+        if provenance_check is not None and not provenance_check(pid):
+            continue
+        candidates.append(row)
+    return candidates
+
+
+def count_orphaned_acp_shims(
+    *,
+    active_worker_pids: set[int] | None = None,
+    process_rows: list[dict[str, Any]] | None = None,
+    provenance_check: Callable[[int], bool] | None = None,
+) -> dict[str, Any]:
+    """Report orphaned claude-acp shims (ppid==1, not ledger-tracked; no TTL).
+
+    This is REPORTING ONLY (it never kills). ``orphan_count`` enumerates ALL
+    orphaned shims, which MAY include editor-launched (Zed etc.) shims that
+    goal-flight did NOT spawn and would NEVER reap -- the count is informative
+    about PTY pressure, not a count of reapable processes. To avoid implying all
+    orphans are reapable, each orphan is labelled with ``goalflight_owned`` (its
+    provenance) and ``reapable_count`` reports the goal-flight-owned subset that
+    the reaper would actually act on. ``provenance_check`` is injectable (pid ->
+    bool) so callers/tests can avoid the per-pid ``ps`` env read; when omitted it
+    defaults to the real environment probe.
+    """
+    if goalflight_compat.is_windows():
+        return {
+            "orphan_count": 0,
+            "orphans": [],
+            "reapable_count": 0,
+            "count_includes_foreign_shims": True,
+            "skipped": "windows",
+        }
+    shim_paths = _claude_acp_shim_executable_paths()
+    rows = process_rows if process_rows is not None else _list_posix_process_rows()
+    tracked = _ledger_tracked_worker_pids(active_worker_pids)
+    orphans = _orphan_shim_candidates(
+        rows,
+        tracked_pids=tracked,
+        shim_paths=shim_paths,
+        min_age_s=None,
+    )
+    prov = provenance_check or _shim_has_goalflight_provenance
+    labelled: list[dict[str, Any]] = []
+    reapable = 0
+    for row in orphans:
+        owned = bool(prov(int(row["pid"])))
+        if owned:
+            reapable += 1
+        labelled.append(
+            {
+                "pid": row["pid"],
+                "ppid": row["ppid"],
+                "age_s": row.get("age_s"),
+                "comm": row.get("comm"),
+                "goalflight_owned": owned,
+            }
+        )
+    return {
+        "orphan_count": len(orphans),
+        "reapable_count": reapable,
+        # The total may include editor/foreign shims goal-flight never launched
+        # and would never reap; do not present orphan_count as reapable.
+        "count_includes_foreign_shims": True,
+        "orphans": labelled,
+    }
+
+
+def _pgid_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def _terminate_process_group(pgid: int, *, grace_s: float = _SHIM_REAP_GRACE_S) -> str:
+    """Escalate SIGTERM -> SIGKILL for a POSIX process group."""
+    if goalflight_compat.is_windows():
+        return "skipped_windows"
+    target = int(pgid)
+    actions: list[str] = []
+    try:
+        os.killpg(target, signal.SIGTERM)
+        actions.append("SIGTERM")
+    except (ProcessLookupError, PermissionError, OSError):
+        with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+            os.kill(target, signal.SIGTERM)
+            actions.append("SIGTERM(pid)")
+    deadline = time.monotonic() + grace_s
+    while time.monotonic() < deadline:
+        if not _pgid_alive(target):
+            break
+        time.sleep(0.05)
+    if _pgid_alive(target):
+        try:
+            os.killpg(target, getattr(signal, "SIGKILL", signal.SIGTERM))
+            actions.append("SIGKILL")
+        except (ProcessLookupError, PermissionError, OSError):
+            with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+                os.kill(target, getattr(signal, "SIGKILL", signal.SIGTERM))
+                actions.append("SIGKILL(pid)")
+    return "+".join(actions) if actions else "noop"
+
+
+def reap_orphaned_acp_shims(
+    *,
+    active_worker_pids: set[int] | None = None,
+    ttl_s: float = DEFAULT_SHIM_ORPHAN_TTL_S,
+    process_rows: list[dict[str, Any]] | None = None,
+    terminate_group: Callable[[int], str] | None = None,
+    provenance_check: Callable[[int], bool] | None = None,
+) -> dict[str, Any]:
+    """Ledger-independent reaper for orphaned claude-acp shims (ppid==1 past TTL).
+
+    A candidate is reaped ONLY if it passes a DEFAULT-DENY goal-flight provenance
+    gate: its environment must carry the GOALFLIGHT_ACP_SHIM_OWNER marker that
+    spawn_acp_connection injects. An editor-launched (foreign) shim that orphans
+    to ppid==1 past TTL will NOT carry the marker and is left untouched. The
+    provenance_check is injectable (callable pid -> bool) so tests need no real
+    shell-out; it defaults to reading the process environment via ps.
+    """
+    if os.environ.get("GOALFLIGHT_NO_SHIM_REAP", "").strip() in {"1", "true", "yes"}:
+        return {"skipped": "GOALFLIGHT_NO_SHIM_REAP", "reaped": [], "candidates": []}
+    if goalflight_compat.is_windows():
+        return {"skipped": "windows", "reaped": [], "candidates": []}
+    try:
+        shim_paths = _claude_acp_shim_executable_paths()
+        rows = process_rows if process_rows is not None else _list_posix_process_rows()
+        tracked = _ledger_tracked_worker_pids(active_worker_pids)
+        prov = provenance_check or _shim_has_goalflight_provenance
+        candidates = _orphan_shim_candidates(
+            rows,
+            tracked_pids=tracked,
+            shim_paths=shim_paths,
+            min_age_s=ttl_s,
+            provenance_check=prov,
+        )
+        kill_group = terminate_group or _terminate_process_group
+        reaped: list[dict[str, Any]] = []
+        for row in candidates:
+            pid = int(row["pid"])
+            age_s = row.get("age_s")
+            try:
+                pgid = os.getpgid(pid)
+            except (OSError, ProcessLookupError):
+                pgid = pid
+            action = kill_group(pgid)
+            entry = {
+                "pid": pid,
+                "age_s": age_s,
+                "pgid": pgid,
+                "action": action,
+                "comm": row.get("comm"),
+            }
+            reaped.append(entry)
+            log.info(
+                "shim_reap: pid=%d age_s=%s action=%s comm=%s",
+                pid,
+                age_s,
+                action,
+                row.get("comm"),
+            )
+        return {"reaped": reaped, "candidates": candidates, "skipped": None}
+    except Exception as exc:
+        log.warning("shim_reap: failed: %s", exc)
+        return {"reaped": [], "candidates": [], "error": str(exc)}
+
+
+def resume_startup_reap(**kwargs: Any) -> dict[str, Any]:
+    """Reap orphaned claude-acp shims on orchestrator resume startup."""
+    return reap_orphaned_acp_shims(**kwargs)
 
 
 def classify_message(message: dict[str, Any]) -> str:
@@ -1836,6 +2284,16 @@ async def spawn_acp_connection(
         os_sandbox=os_sandbox,
         agent=agent,
     )
+    # Inject a DEDICATED goal-flight provenance marker into the spawned shim's
+    # environment. This GUARANTEES every goal-flight-launched shim is positively
+    # identifiable by the orphan reaper; editor/foreign-launched shims will not
+    # carry it and are therefore default-denied (never reaped). Build off the
+    # caller env if provided, else inherit os.environ so the rest of the worker
+    # environment is preserved. Done for every command (the marker is harmless on
+    # non-claude-acp agents) so the guarantee can't be defeated by an agent-type
+    # branch drifting out of sync.
+    child_env = dict(env if env is not None else os.environ)
+    child_env[GOALFLIGHT_ACP_SHIM_OWNER_ENV] = _shim_owner_marker()
     proc = await asyncio.create_subprocess_exec(
         sandboxed.command,
         *sandboxed.args,
@@ -1845,7 +2303,7 @@ async def spawn_acp_connection(
         cwd=cwd,
         start_new_session=True,
         limit=limit,
-        env=env,
+        env=child_env,
     )
     if proc.stdin is None or proc.stdout is None:
         with contextlib.suppress(ProcessLookupError):
