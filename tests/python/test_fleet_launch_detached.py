@@ -9,6 +9,7 @@ import json
 import sys
 import tempfile
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -44,6 +45,8 @@ def patched_spawn(returncode: int | None = None):
     old_which = fleet_launch.shutil.which
 
     def fake_popen(argv: list[str], **kwargs: Any) -> FakeProc:
+        if argv and Path(str(argv[0])).name == "ps":
+            return old_popen(argv, **kwargs)
         calls.append({"argv": list(argv), "kwargs": kwargs})
         return FakeProc(returncode=returncode)
 
@@ -60,6 +63,16 @@ def patched_spawn(returncode: int | None = None):
         fleet_launch.subprocess.Popen = old_popen
         fleet_launch._process_identity_after_spawn = old_identity
         fleet_launch.shutil.which = old_which
+
+
+@contextmanager
+def patched_process_identity(fn):
+    old_identity = fleet_launch._process_identity
+    fleet_launch._process_identity = fn
+    try:
+        yield
+    finally:
+        fleet_launch._process_identity = old_identity
 
 
 def _prompt_b64(text: str) -> str:
@@ -87,6 +100,32 @@ def _write_marker(state_dir: Path, dispatch_id: str, payload: dict[str, Any]) ->
     marker_path.parent.mkdir(parents=True, exist_ok=True)
     marker_path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
     return marker_path
+
+
+def _write_recoverable_marker(state_dir: Path, dispatch_id: str, prompt_text: str) -> Path:
+    return _write_marker(
+        state_dir,
+        dispatch_id,
+        {
+            "schema": fleet_launch.MARKER_SCHEMA,
+            "dispatch_id": dispatch_id,
+            "node_id": "localhost",
+            "state": "spawn_failed",
+            "prompt_sha256": fleet_launch._prompt_sha256(prompt_text),
+            "error": "prior spawn failed before worker start",
+        },
+    )
+
+
+def _write_recovery_lock(
+    state_dir: Path,
+    dispatch_id: str,
+    payload: dict[str, Any],
+) -> Path:
+    lock_path = fleet_launch._recovery_lock_path(state_dir, dispatch_id)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+    return lock_path
 
 
 def test_clean_first_launch_creates_marker_and_spawns() -> None:
@@ -309,14 +348,195 @@ def test_recovery_with_no_worker_proof_relaunches() -> None:
         assert_true("recovery lock cleared", not (dispatch_dir / "launch_recovery.lock").exists())
 
 
+def test_recovery_reclaims_dead_owner_lock() -> None:
+    dispatch_id = "acp-recover-dead-lock-owner"
+    prompt_text = "retry prompt"
+    old_owner = {
+        "pid": 7777,
+        "lstart": "Thu Jun 11 12:00:00 2026",
+        "comm": "python3",
+    }
+    with tempfile.TemporaryDirectory() as td:
+        state_dir = Path(td) / "state"
+        dispatch_dir = state_dir / "dispatches" / dispatch_id
+        dispatch_dir.mkdir(parents=True, exist_ok=True)
+        _write_recoverable_marker(state_dir, dispatch_id, prompt_text)
+        lock_path = _write_recovery_lock(
+            state_dir,
+            dispatch_id,
+            {
+                "schema": fleet_launch.RECOVERY_LOCK_SCHEMA,
+                "dispatch_id": dispatch_id,
+                "node_id": "localhost",
+                "launcher_pid": old_owner["pid"],
+                "launcher_identity": old_owner,
+                "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            },
+        )
+        args = _args(state_dir, dispatch_id, prompt_text, recover=True)
+        stdout = io.StringIO()
+
+        def fake_identity(pid: int) -> dict[str, Any] | None:
+            if pid == old_owner["pid"]:
+                return None
+            return {"pid": pid, "lstart": "Thu Jun 11 12:00:01 2026", "comm": "python3"}
+
+        with patched_process_identity(fake_identity), patched_spawn() as calls, redirect_stdout(stdout):
+            code = fleet_launch._launch(args)
+        marker = json.loads((dispatch_dir / "launch_marker.json").read_text(encoding="utf-8"))
+        receipt = json.loads(stdout.getvalue())
+        assert_true("launch ok", code == 0)
+        assert_true("spawn once", len(calls) == 1)
+        assert_true("receipt", receipt.get("remote_pid") == 4242)
+        assert_true("dead lock reclaimed", marker.get("reclaimed_recovery_lock") == "owner_dead")
+        assert_true("recovery lock cleared", not lock_path.exists())
+
+
+def test_recovery_reclaims_reused_pid_owner_lock() -> None:
+    dispatch_id = "acp-recover-reused-pid-lock-owner"
+    prompt_text = "retry prompt"
+    old_owner = {
+        "pid": 7779,
+        "lstart": "Thu Jun 11 12:00:00 2026",
+        "comm": "python3",
+    }
+    with tempfile.TemporaryDirectory() as td:
+        state_dir = Path(td) / "state"
+        dispatch_dir = state_dir / "dispatches" / dispatch_id
+        dispatch_dir.mkdir(parents=True, exist_ok=True)
+        _write_recoverable_marker(state_dir, dispatch_id, prompt_text)
+        lock_path = _write_recovery_lock(
+            state_dir,
+            dispatch_id,
+            {
+                "schema": fleet_launch.RECOVERY_LOCK_SCHEMA,
+                "dispatch_id": dispatch_id,
+                "node_id": "localhost",
+                "launcher_pid": old_owner["pid"],
+                "launcher_identity": old_owner,
+                "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            },
+        )
+        args = _args(state_dir, dispatch_id, prompt_text, recover=True)
+
+        def fake_identity(pid: int) -> dict[str, Any] | None:
+            if pid == old_owner["pid"]:
+                return {
+                    "pid": pid,
+                    "lstart": "Thu Jun 11 12:00:01 2026",
+                    "comm": "python3",
+                }
+            return {"pid": pid, "lstart": "Thu Jun 11 12:00:02 2026", "comm": "python3"}
+
+        with patched_process_identity(fake_identity), patched_spawn() as calls, redirect_stdout(io.StringIO()):
+            code = fleet_launch._launch(args)
+        marker = json.loads((dispatch_dir / "launch_marker.json").read_text(encoding="utf-8"))
+        assert_true("launch ok", code == 0)
+        assert_true("spawn once", len(calls) == 1)
+        assert_true(
+            "reused pid lock reclaimed",
+            marker.get("reclaimed_recovery_lock") == "owner_pid_reused_lstart",
+        )
+        assert_true("recovery lock cleared", not lock_path.exists())
+
+
+def test_recovery_live_owner_lock_refuses() -> None:
+    dispatch_id = "acp-recover-live-lock-owner"
+    prompt_text = "retry prompt"
+    live_owner = {
+        "pid": 7778,
+        "lstart": "Thu Jun 11 12:00:00 2026",
+        "comm": "python3",
+    }
+    with tempfile.TemporaryDirectory() as td:
+        state_dir = Path(td) / "state"
+        dispatch_dir = state_dir / "dispatches" / dispatch_id
+        dispatch_dir.mkdir(parents=True, exist_ok=True)
+        _write_recoverable_marker(state_dir, dispatch_id, prompt_text)
+        lock_path = _write_recovery_lock(
+            state_dir,
+            dispatch_id,
+            {
+                "schema": fleet_launch.RECOVERY_LOCK_SCHEMA,
+                "dispatch_id": dispatch_id,
+                "node_id": "localhost",
+                "launcher_pid": live_owner["pid"],
+                "launcher_identity": live_owner,
+                "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            },
+        )
+        args = _args(state_dir, dispatch_id, prompt_text, recover=True)
+        stderr = io.StringIO()
+
+        def fake_identity(pid: int) -> dict[str, Any] | None:
+            if pid == live_owner["pid"]:
+                return dict(live_owner)
+            return {"pid": pid, "lstart": "Thu Jun 11 12:00:01 2026", "comm": "python3"}
+
+        with patched_process_identity(fake_identity), patched_spawn() as calls, redirect_stderr(stderr):
+            code = fleet_launch._launch(args)
+        assert_true("refused", code == 17)
+        assert_true("no second spawn", len(calls) == 0)
+        assert_true("live lock preserved", lock_path.exists())
+        assert_true("warn reason", "recovery_already_in_progress" in stderr.getvalue())
+
+
+def test_recovery_reclaims_stale_unresolvable_owner_lock() -> None:
+    dispatch_id = "acp-recover-stale-lock-owner"
+    prompt_text = "retry prompt"
+    old_created = datetime.now(timezone.utc) - timedelta(
+        seconds=fleet_launch.RECOVERY_LOCK_TTL_SECONDS + 1
+    )
+    with tempfile.TemporaryDirectory() as td:
+        state_dir = Path(td) / "state"
+        dispatch_dir = state_dir / "dispatches" / dispatch_id
+        dispatch_dir.mkdir(parents=True, exist_ok=True)
+        _write_recoverable_marker(state_dir, dispatch_id, prompt_text)
+        lock_path = _write_recovery_lock(
+            state_dir,
+            dispatch_id,
+            {
+                "schema": fleet_launch.RECOVERY_LOCK_SCHEMA,
+                "dispatch_id": dispatch_id,
+                "node_id": "localhost",
+                "launcher_pid": "not-a-pid",
+                "created_at": old_created.isoformat(timespec="seconds"),
+            },
+        )
+        args = _args(state_dir, dispatch_id, prompt_text, recover=True)
+        stdout = io.StringIO()
+
+        def fake_identity(pid: int) -> dict[str, Any] | None:
+            return {"pid": pid, "lstart": "Thu Jun 11 12:00:01 2026", "comm": "python3"}
+
+        with patched_process_identity(fake_identity), patched_spawn() as calls, redirect_stdout(stdout):
+            code = fleet_launch._launch(args)
+        marker = json.loads((dispatch_dir / "launch_marker.json").read_text(encoding="utf-8"))
+        assert_true("launch ok", code == 0)
+        assert_true("spawn once", len(calls) == 1)
+        assert_true(
+            "stale lock reclaimed",
+            marker.get("reclaimed_recovery_lock") == "owner_no_pid_stale_created_at",
+        )
+        assert_true("recovery lock cleared", not lock_path.exists())
+
+
 def main() -> None:
-    test_clean_first_launch_creates_marker_and_spawns()
-    test_duplicate_marker_recovery_without_no_worker_proof_refuses()
-    test_recovery_relaunch_resets_status_epoch()
-    test_read_only_recovery_inspection_preserves_status()
-    test_clean_first_launch_does_not_reset_status_lineage()
-    test_recovery_with_no_worker_proof_relaunches()
-    print("OK: fleet launch detached tests pass")
+    tests = [
+        test_clean_first_launch_creates_marker_and_spawns,
+        test_duplicate_marker_recovery_without_no_worker_proof_refuses,
+        test_recovery_relaunch_resets_status_epoch,
+        test_read_only_recovery_inspection_preserves_status,
+        test_clean_first_launch_does_not_reset_status_lineage,
+        test_recovery_with_no_worker_proof_relaunches,
+        test_recovery_reclaims_dead_owner_lock,
+        test_recovery_reclaims_reused_pid_owner_lock,
+        test_recovery_live_owner_lock_refuses,
+        test_recovery_reclaims_stale_unresolvable_owner_lock,
+    ]
+    for test in tests:
+        test()
+    print(f"OK: {len(tests)} fleet launch detached tests pass")
 
 
 if __name__ == "__main__":

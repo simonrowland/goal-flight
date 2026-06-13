@@ -62,6 +62,7 @@ ENV_DENY_EXACT = frozenset({"SSH_AUTH_SOCK", "GPG_AGENT_INFO"})
 ENV_DENY_SUBSTRINGS = ("AUTH_SOCK", "AGENT_SOCK", "SSH_AGENT")
 MARKER_SCHEMA = "goalflight.fleet.launch_marker.v1"
 RECOVERY_LOCK_SCHEMA = "goalflight.fleet.launch_recovery_lock.v1"
+RECOVERY_LOCK_TTL_SECONDS = 60 * 60
 NO_WORKER_PROOF_STATES = frozenset(
     {
         "prompt_write_failed",
@@ -197,6 +198,26 @@ def _create_json_exclusive(path: Path, payload: dict[str, Any]) -> bool:
     return True
 
 
+def _current_launcher_identity() -> dict[str, Any]:
+    pid = os.getpid()
+    identity = _process_identity(pid)
+    if isinstance(identity, dict):
+        return {**identity, "pid": pid}
+    return {"pid": pid}
+
+
+def _recovery_lock_payload(args: argparse.Namespace, proof_reason: str) -> dict[str, Any]:
+    return {
+        "schema": RECOVERY_LOCK_SCHEMA,
+        "dispatch_id": args.dispatch_id,
+        "node_id": args.node_id,
+        "no_worker_proof": proof_reason,
+        "launcher_pid": os.getpid(),
+        "launcher_identity": _current_launcher_identity(),
+        "created_at": _utc_now(),
+    }
+
+
 def _remove_file(path: Path) -> None:
     try:
         path.unlink()
@@ -255,6 +276,92 @@ def _recorded_worker_live(pid_raw: Any, identity: Any) -> tuple[bool | None, str
         if identity.get(key) and current.get(key) and identity[key] != current[key]:
             return False, f"pid_reused_{key}"
     return True, "live"
+
+
+def _parse_utc_timestamp(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _recovery_lock_stale(path: Path, payload: dict[str, Any]) -> tuple[bool, str]:
+    now = datetime.now(timezone.utc)
+    created = _parse_utc_timestamp(payload.get("created_at"))
+    source = "created_at"
+    if created is None:
+        source = "mtime"
+        try:
+            created = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
+        except OSError:
+            return False, "timestamp_unavailable"
+    age_s = max(0.0, (now - created).total_seconds())
+    if age_s >= RECOVERY_LOCK_TTL_SECONDS:
+        return True, f"stale_{source}"
+    return False, f"fresh_{source}"
+
+
+def _recovery_lock_owner_live(payload: dict[str, Any]) -> tuple[bool | None, str]:
+    pid_raw = payload.get("launcher_pid") or payload.get("owner_pid") or payload.get("pid")
+    identity = (
+        payload.get("launcher_identity")
+        or payload.get("owner_identity")
+        or payload.get("identity")
+    )
+    try:
+        int(pid_raw)
+    except (TypeError, ValueError):
+        return None, "no_pid"
+    if not isinstance(identity, dict) or not identity.get("lstart"):
+        return None, "identity_missing"
+    return _recorded_worker_live(pid_raw, identity)
+
+
+def _reclaim_recovery_lock_if_allowed(path: Path) -> tuple[bool, str]:
+    try:
+        observed = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return True, "lock_missing"
+    except OSError as exc:
+        return False, f"lock_unreadable:{exc.__class__.__name__}"
+
+    try:
+        parsed = json.loads(observed)
+    except json.JSONDecodeError:
+        parsed = {}
+    payload = parsed if isinstance(parsed, dict) else {}
+
+    live, live_reason = _recovery_lock_owner_live(payload)
+    stale, stale_reason = _recovery_lock_stale(path, payload)
+    if live is True:
+        return False, "owner_live"
+    if live is False:
+        reclaim_reason = f"owner_{live_reason}"
+    elif stale:
+        reclaim_reason = f"owner_{live_reason}_{stale_reason}"
+    else:
+        return False, f"owner_{live_reason}_{stale_reason}"
+
+    try:
+        current = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return True, "lock_missing_after_check"
+    except OSError as exc:
+        return False, f"lock_recheck_failed:{exc.__class__.__name__}"
+    if current != observed:
+        return False, "lock_changed_during_reclaim"
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return True, "lock_missing_after_check"
+    except OSError as exc:
+        return False, f"lock_unlink_failed:{exc.__class__.__name__}"
+    return True, reclaim_reason
 
 
 def _status_no_worker_proof(status_json: Path) -> tuple[bool, str]:
@@ -386,6 +493,7 @@ def _launch(args: argparse.Namespace) -> int:
     )
     marker_created = _create_json_exclusive(marker_path, marker_payload)
     recovery_lock_acquired = False
+    recovery_lock_reclaim_reason = ""
     if not marker_created:
         marker = _load_json(marker_path)
         if not args.recover_unconfirmed:
@@ -395,22 +503,29 @@ def _launch(args: argparse.Namespace) -> int:
         proof_ok, proof_reason = _no_worker_proof(status_json, marker)
         if not proof_ok:
             return _warn_refuse_duplicate(proof_reason)
+        recovery_lock_payload = _recovery_lock_payload(args, proof_reason)
         recovery_lock_acquired = _create_json_exclusive(
             recovery_lock_path,
-            {
-                "schema": RECOVERY_LOCK_SCHEMA,
-                "dispatch_id": args.dispatch_id,
-                "node_id": args.node_id,
-                "no_worker_proof": proof_reason,
-                "created_at": _utc_now(),
-            },
+            recovery_lock_payload,
         )
+        if not recovery_lock_acquired:
+            reclaimed, reclaim_reason = _reclaim_recovery_lock_if_allowed(recovery_lock_path)
+            if reclaimed:
+                recovery_lock_reclaim_reason = reclaim_reason
+                recovery_lock_payload["reclaimed_lock_reason"] = reclaim_reason
+                recovery_lock_payload["reclaimed_at"] = _utc_now()
+                recovery_lock_acquired = _create_json_exclusive(
+                    recovery_lock_path,
+                    recovery_lock_payload,
+                )
         if not recovery_lock_acquired:
             return _warn_refuse_duplicate("recovery_already_in_progress")
         previous_state = marker.get("state") if marker else None
         marker_payload["state"] = "recovery_launching"
         marker_payload["recovered_from_marker_state"] = previous_state
         marker_payload["no_worker_proof"] = proof_reason
+        if recovery_lock_reclaim_reason:
+            marker_payload["reclaimed_recovery_lock"] = recovery_lock_reclaim_reason
         _atomic_write_json(marker_path, marker_payload)
 
     if recovery_lock_acquired:
