@@ -100,6 +100,9 @@ package repository; for normal target projects it is skipped as INFO.
   scans the dispatch ledger for provider-level rate-limit signatures over the last
   10 minutes. `[WARN]` per pressured provider with recommended caps and fallback
   providers; `[OK]` when all providers clear.
+- **PTY shim health** (`pty_shim_health`): orphaned claude-acp shims and pty cap
+  pressure. Remediation: `bin/gf-reap-shims --exec` (or
+  `python3 scripts/goalflight_reap_shims.py --exec`).
 
 ## Output
 
