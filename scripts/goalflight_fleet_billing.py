@@ -24,7 +24,8 @@ PROVIDER_BY_ACCOUNT: dict[str, str] = {
 }
 
 LOCAL_PROBE_ARGV: dict[str, list[str]] = {
-    "openai": ["codex", "login", "status"],
+    # Do not use `codex login status`: it can be satisfied by cached identity.
+    "openai": ["codex", "debug", "models"],
     "anthropic-session": ["claude", "--version"],
     "grok": [
         "sh",
@@ -43,7 +44,9 @@ TOOLING_FAILURE_RE = re.compile(
 )
 AUTH_DENIED_RE = re.compile(
     r"(not logged[_ -]?in|not authenticated|unauthenticated|authentication required|"
-    r"login required|no api key|invalid api key|expired credential|not authorized|unauthorized)",
+    r"login required|please log (?:out and )?sign in again|please log in again|"
+    r"no api key|invalid api key|expired credential|expired token|token expired|"
+    r"refresh_token_invalidated|token_invalidated|revoked|\b401\b|not authorized|unauthorized)",
     re.I,
 )
 
@@ -62,6 +65,10 @@ class DispatchAuthError(Exception):
     def __init__(self, message: str, *, auth_probe: str = "red") -> None:
         self.auth_probe = auth_probe
         super().__init__(message)
+
+
+def invalid_token_message(account_key: str, node_id: str) -> str:
+    return f"account {account_key} on node {node_id} has an invalid/revoked token; re-login required"
 
 
 def default_runner(argv: list[str]) -> tuple[int, str, str]:
@@ -133,10 +140,10 @@ def _failed_probe_status(exit_code: int, stdout: str, stderr: str) -> str:
 def interpret_auth_probe(provider: str, exit_code: int, stdout: str, stderr: str) -> str:
     combined = f"{stdout}\n{stderr}"
     if provider == "openai":
-        if exit_code == 0 and re.search(r"logged[_ -]?in", combined, re.I):
-            return "green"
+        if AUTH_DENIED_RE.search(combined):
+            return "red"
         if exit_code == 0:
-            return "yellow"
+            return "green"
         return _failed_probe_status(exit_code, stdout, stderr)
     if provider == "anthropic-session":
         if exit_code == 0 and stdout.strip():
@@ -442,6 +449,11 @@ def assert_dispatch_auth(fleet_dir: Path, node_id: str, account_key: str) -> Non
         )
     status = str(payload.get("status") or "red")
     if status != "green":
+        if status == "red":
+            raise DispatchAuthError(
+                invalid_token_message(account_key, node_id),
+                auth_probe=status,
+            )
         raise DispatchAuthError(
             f"auth probe {status} for node={node_id} account={account_key}",
             auth_probe=status,
@@ -461,10 +473,20 @@ def cmd_account_link(args) -> int:
     except ValueError as exc:
         print(str(exc), file=__import__("sys").stderr)
         return 1
+    probe = result.get("auth_probe") or {}
+    if probe.get("status") == "red":
+        message = invalid_token_message(args.account_key, args.node)
+        if args.json:
+            failed = dict(result)
+            failed["ok"] = False
+            failed["error"] = message
+            print(json.dumps(failed, indent=2))
+        else:
+            print(message, file=__import__("sys").stderr)
+        return 1
     if args.json:
         print(json.dumps(result, indent=2))
     else:
-        probe = result.get("auth_probe") or {}
         print(f"linked {args.account_key} -> {args.node} auth_probe={probe.get('status', 'skipped')}")
     return 0
 

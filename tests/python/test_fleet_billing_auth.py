@@ -32,6 +32,25 @@ def tooling_runner(_argv: list[str]) -> tuple[int, str, str]:
     return 127, "", "python: command not found"
 
 
+def codex_models_runner(argv: list[str]) -> tuple[int, str, str]:
+    assert_true("openai auth argv", argv == ["codex", "debug", "models"])
+    return 0, '{"models":[{"id":"gpt-5"}]}\n', ""
+
+
+REVOKED_CODEX_STDERR = (
+    "Your access token could not be refreshed because your refresh token was revoked.\n"
+    "Please log out and sign in again.\n"
+    "refresh_token_invalidated\n"
+    "repeated 401 on chatgpt.com/backend-api/codex/*\n"
+    'codex_acp::thread "Unhandled error during turn: ... Unauthorized"\n'
+)
+
+
+def revoked_codex_runner(argv: list[str]) -> tuple[int, str, str]:
+    assert_true("openai auth argv", argv == ["codex", "debug", "models"])
+    return 0, "Logged in using ChatGPT\n", REVOKED_CODEX_STDERR
+
+
 def _fixture_fleet(fleet_dir: Path, *, node_id: str = "localhost") -> None:
     fleet.bootstrap(fleet_dir)
     fleet_doc = fleet.read_json(fleet_dir / "fleet.json")
@@ -57,12 +76,88 @@ def test_account_link_runs_probe_and_writes_artifact() -> None:
             fleet_dir,
             "openai/default",
             "localhost",
-            runner=green_runner,
+            runner=codex_models_runner,
         )
         assert_true("link ok", result["ok"] is True)
         assert_true("probe green", result["auth_probe"]["status"] == "green")
         artifact = billing.read_probe_artifact(fleet_dir, "localhost", "openai/default")
         assert_true("artifact saved", artifact is not None and artifact["status"] == "green")
+
+
+def test_openai_probe_uses_authenticated_models_check() -> None:
+    assert_true("openai probe argv", billing.probe_argv("openai") == ["codex", "debug", "models"])
+
+
+def test_openai_working_token_probe_is_green_and_dispatch_allowed() -> None:
+    import goalflight_fleet_dispatch as fleet_dispatch
+
+    with tempfile.TemporaryDirectory() as td:
+        fleet_dir = Path(td) / "fleet"
+        _fixture_fleet(fleet_dir)
+        result = billing.link_account_to_node(
+            fleet_dir,
+            "openai/default",
+            "localhost",
+            runner=codex_models_runner,
+        )
+        assert_true("working token green", result["auth_probe"]["status"] == "green")
+        fleet_dispatch.assert_dispatch_gates(
+            fleet_dir,
+            node_id="localhost",
+            billing_account="openai/default",
+        )
+
+
+def test_openai_revoked_token_probe_is_red_and_dispatch_gate_blocks() -> None:
+    import goalflight_fleet_dispatch as fleet_dispatch
+
+    with tempfile.TemporaryDirectory() as td:
+        fleet_dir = Path(td) / "fleet"
+        _fixture_fleet(fleet_dir)
+        result = billing.link_account_to_node(
+            fleet_dir,
+            "openai/default",
+            "localhost",
+            runner=revoked_codex_runner,
+        )
+        assert_true("revoked token red", result["auth_probe"]["status"] == "red")
+        artifact = billing.read_probe_artifact(fleet_dir, "localhost", "openai/default")
+        assert_true("red artifact saved", artifact is not None and artifact["status"] == "red")
+        try:
+            fleet_dispatch.assert_dispatch_gates(
+                fleet_dir,
+                node_id="localhost",
+                billing_account="openai/default",
+            )
+            assert_true("should block", False)
+        except fleet_dispatch.DispatchGateError as exc:
+            assert_true("auth gate code", exc.code == "auth")
+            message = str(exc)
+            assert_true("invalid token message", "invalid/revoked token" in message)
+            assert_true("re-login message", "re-login required" in message)
+
+
+def test_account_link_cli_fails_closed_on_red_probe() -> None:
+    old_runner = billing.default_runner
+    try:
+        billing.default_runner = revoked_codex_runner
+        with tempfile.TemporaryDirectory() as td:
+            fleet_dir = Path(td) / "fleet"
+            _fixture_fleet(fleet_dir)
+            code = billing.main(
+                [
+                    "--fleet-dir",
+                    str(fleet_dir),
+                    "link",
+                    "--account-key",
+                    "openai/default",
+                    "--node",
+                    "localhost",
+                ]
+            )
+            assert_true("link red exit", code == 1)
+    finally:
+        billing.default_runner = old_runner
 
 
 def test_doctor_fleet_shape() -> None:
@@ -314,11 +409,21 @@ def test_cursor_auth_probe_uses_status_not_version() -> None:
         runner=lambda _a: (0, "cursor-agent 2026.05.20\n", ""),
     )
     assert_true("cursor version-only inconclusive", version_only["status"] == "inconclusive")
+    keychain_locked = billing.run_local_auth_probe(
+        "cursor/shared",
+        {"accounts": [{"account_key": "cursor/shared", "provider": "cursor"}]},
+        runner=lambda _a: (1, "", "login keychain is locked\n"),
+    )
+    assert_true("cursor keychain locked unchanged", keychain_locked["status"] == "yellow")
 
 
 def main() -> None:
     for test in (
         test_account_link_runs_probe_and_writes_artifact,
+        test_openai_probe_uses_authenticated_models_check,
+        test_openai_working_token_probe_is_green_and_dispatch_allowed,
+        test_openai_revoked_token_probe_is_red_and_dispatch_gate_blocks,
+        test_account_link_cli_fails_closed_on_red_probe,
         test_doctor_fleet_shape,
         test_dispatch_gate_blocks_red_auth,
         test_account_unlink_removes_link_and_artifact,
