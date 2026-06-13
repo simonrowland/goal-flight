@@ -1065,6 +1065,69 @@ def test_ledger_launch_receipt_roundtrip() -> None:
         assert_true("receipt", record.get("remote_launch_receipt", {}).get("remote_pid") == 4242)
 
 
+def test_tool_smoke_skip_is_authoritative_even_in_goal_mode() -> None:
+    # --tool-smoke skip is an explicit opt-out and must win even in goal mode
+    # (previously it was a silent no-op there, making the documented escape a lie).
+    assert_true("skip opts out in goal mode", fleet_dispatch._tool_smoke_required("goal", "skip") is False)
+    assert_true("auto still gates goal mode", fleet_dispatch._tool_smoke_required("goal", "auto") is True)
+    assert_true("require gates one-shot", fleet_dispatch._tool_smoke_required("one-shot", "require") is True)
+    assert_true("auto skips one-shot", fleet_dispatch._tool_smoke_required("one-shot", "auto") is False)
+
+
+def test_git_verify_commit_failure_hints_unpushed_base() -> None:
+    message = fleet_dispatch._format_remote_failure(
+        "git_verify_commit",
+        exit_code=1,
+        stdout="",
+        stderr="",
+        ssh_argv=["ssh", "node", "git rev-parse"],
+    )
+    assert_true("verify failure names the unpushed-base cause", "not found on the node's origin" in message)
+    assert_true("verify failure tells the operator to push", "push the controller commit" in message)
+    # A different command class must NOT get the base-sha hint.
+    other = fleet_dispatch._format_remote_failure(
+        "git_fetch", exit_code=1, stdout="", stderr="boom", ssh_argv=["ssh", "node"]
+    )
+    assert_true("hint scoped to git_verify_commit only", "push the controller commit" not in other)
+
+
+def test_lock_chain_removes_worktree_on_midchain_failure() -> None:
+    # git_worktree_add succeeds, then launch_detached hard-fails (confirmed
+    # refusal): rollback must remove the worktree this dispatch created, not just
+    # release the account lock — otherwise detached worktrees accumulate on the node.
+    calls: list[list[str]] = []
+
+    def runner(argv: list[str]) -> tuple[int, str, str]:
+        calls.append(list(argv))
+        if "goalflight_fleet_launch_detached.py" in " ".join(argv):
+            return 17, "WARN-REFUSE duplicate dispatch-id exists", ""
+        return 0, "", ""
+
+    with tempfile.TemporaryDirectory() as td:
+        fleet_dir = Path(td) / "fleet"
+        _fixture_fleet(fleet_dir)
+        preview = fleet_dispatch.preview_dispatch(
+            fleet_dir,
+            node_id="localhost",
+            agent="codex-acp",
+            billing_account="openai/default",
+            prompt="chunk.md",
+            dispatch_id="acp-worktree-cleanup",
+            base_sha=BASE_SHA,
+        )
+        try:
+            fleet_dispatch.acquire_lock_chain(fleet_dir, preview, runner=runner)
+            assert_true("should raise", False)
+        except fleet_dispatch.DispatchError:
+            pass
+        removed = any(
+            "worktree" in " ".join(call) and "remove" in " ".join(call) for call in calls
+        )
+        assert_true("rollback issued git_worktree_remove", removed)
+        lock = fleet.load_account_lock(fleet.account_lock_path(fleet_dir, "openai/default"))
+        assert_true("account lock released too", lock is None or lock.get("state") == "released")
+
+
 def main() -> None:
     test_explicit_dry_run_preview()
     test_red_auth_blocks_exec()
@@ -1092,6 +1155,9 @@ def main() -> None:
     test_stub_e2e_terminal_clears_locks()
     test_async_launch_receipt_persisted_and_locks_remain()
     test_ledger_launch_receipt_roundtrip()
+    test_tool_smoke_skip_is_authoritative_even_in_goal_mode()
+    test_git_verify_commit_failure_hints_unpushed_base()
+    test_lock_chain_removes_worktree_on_midchain_failure()
     print("OK: fleet dispatch tests pass")
 
 

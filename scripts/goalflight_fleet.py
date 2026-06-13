@@ -797,7 +797,8 @@ def main(argv: list[str] | None = None) -> int:
         "--tool-smoke",
         choices=("auto", "require", "skip"),
         default="auto",
-        help="Tool-smoke gate policy. Goal mode is always gated; require gates one-shot/tiny too.",
+        help="Tool-smoke gate policy: auto gates goal mode; require gates every mode; "
+        "skip opts out in EVERY mode (authoritative, incl. goal).",
     )
     dispatch.add_argument(
         "--tool-smoke-sandbox",

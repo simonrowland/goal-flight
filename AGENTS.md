@@ -36,6 +36,14 @@
 - Load order: this agent instruction file, then the installed host wrapper when
   available, then repository `SKILL.md`, then only the `commands/*.md` and
   `protocols/*.md` files referenced by the invoked command.
+- **Remote / multi-node workers (fleet).** To dispatch a worker on another machine
+  over SSH — including a remote **Claude** worker via `claude-acp` — see
+  `docs/fleet.md`: node registration, the per-worker install/auth recipe, and
+  `goalflight_fleet.py dispatch`. Remote Claude needs a headless subscription token
+  on the node (`claude setup-token` → `CLAUDE_CODE_OAUTH_TOKEN` in the node env,
+  ferried to the detached worker); full recipe: docs/fleet.md "Remote Claude worker
+  (claude-acp) end-to-end". Local Claude worker surfaces (loop / one-shot):
+  `protocols/dispatch-routing.md` "Claude worker surfaces".
 - For tests of orchestrator generalization, use a nondestructive task: run doctor,
   make a compact plan, check capacity, launch one read-only worker, and summarize
   status/ledger evidence without writing to the repository.

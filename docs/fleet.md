@@ -119,6 +119,12 @@ one. `--dispatch-mode one-shot` avoids the goal-mode tool-smoke canary gate. The
 fleet auth probe (`claude auth status --json`) gates dispatch and reds on a
 revoked/expired token — re-run `claude setup-token` and refresh the env var.
 
+> **Shared-node note:** the token lives in the worker's environment, so it is
+> readable via `ps -E` / `ps eww` by any local user on the node for the worker's
+> lifetime. goal-flight never writes it to a marker, receipt, log, or ferried
+> file. On a single-operator node this is acceptable; on a shared node, treat the
+> node's local users as trusted with the subscription seat.
+
 ## Operator flow
 
 ### 1. Preview dispatch (no SSH side effects)

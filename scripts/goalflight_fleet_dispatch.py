@@ -89,6 +89,14 @@ def _format_remote_failure(
         details.append(f"stderr:\n{_redact_text(stderr, sensitive_values=sensitive_values).rstrip()}")
     if stdout:
         details.append(f"stdout:\n{_redact_text(stdout, sensitive_values=sensitive_values).rstrip()}")
+    if command_class == "git_verify_commit":
+        # git rev-parse --verify --quiet suppresses its own message, so a
+        # well-formed-but-unpushed base-sha fails with a bare non-zero exit. Name
+        # the most common cause so the operator does not have to guess.
+        details.append(
+            "hint: base-sha not found on the node's origin after fetch — push the "
+            "controller commit (or pick a pushed base) before dispatch."
+        )
     return "\n".join(details)
 
 
@@ -219,6 +227,13 @@ def assert_node_not_quarantined(fleet_dir: Path, node_id: str) -> None:
 def _tool_smoke_required(dispatch_mode: str, tool_smoke_policy: str | None) -> bool:
     policy = str(tool_smoke_policy or "auto").lower()
     mode = str(dispatch_mode or "one-shot").lower()
+    # `skip` is an explicit operator override and is authoritative even in goal
+    # mode: an operator who passes --tool-smoke skip has deliberately opted out of
+    # the canary gate (e.g. the worker is known-good, or no canary exists yet for
+    # a new agent like claude-acp). Silently re-gating it in goal mode made the
+    # flag a no-op and the documented escape misleading.
+    if policy == "skip":
+        return False
     if policy == "require":
         return True
     if mode == "goal":
@@ -490,6 +505,8 @@ def acquire_lock_chain(
 
     result = LockChainResult(account_key=preview.billing_account)
     acquired: list[str] = []
+    worktree_created = False
+    node_entry: dict[str, Any] = {}
     try:
         existing_lock = fleet.load_account_lock(fleet.account_lock_path(fleet_dir, preview.billing_account))
         recovery_allowed = launch_recovery_allowed(
@@ -570,6 +587,13 @@ def acquire_lock_chain(
                         result.acquired = acquired
                         return result
                     raise DispatchError(failure)
+                if cmd["command_class"] == "git_worktree_add":
+                    # Real creation confirmed (code == 0). Track it so a later
+                    # mid-chain failure can roll the worktree back, not just the
+                    # account lock. Only OUR successful add sets this — a failed
+                    # add (e.g. path already exists for a duplicate dispatch) leaves
+                    # it False so we never remove a worktree we did not create.
+                    worktree_created = True
                 if cmd["command_class"] == "launch_detached":
                     try:
                         result.launch_receipt = _parse_launch_receipt(
@@ -590,6 +614,8 @@ def acquire_lock_chain(
         result.acquired = acquired
         return result
     except Exception:
+        if worktree_created and runner is not None:
+            _best_effort_remove_worktree(preview, node_entry, runner=runner, fleet_dir=fleet_dir)
         release_lock_chain(fleet_dir, preview, acquired=acquired, fencing_token=result.fencing_token)
         raise
 
@@ -614,6 +640,39 @@ def release_lock_chain(
                 )
             except fleet.AccountLockError:
                 pass
+
+
+def _best_effort_remove_worktree(
+    preview: DispatchPreview,
+    node_entry: dict[str, Any],
+    *,
+    runner: Callable[[list[str]], tuple[int, str, str]],
+    fleet_dir: Path,
+) -> None:
+    """Remove a remote worktree this dispatch created before it failed mid-chain.
+
+    A `git_worktree_add` that succeeded followed by a later command failure (e.g. a
+    confirmed launch refusal) would otherwise strand a detached worktree on the
+    node, accumulating until `git worktree prune`/salvage. The freshly-added
+    detached worktree is clean (the worker never ran), so a plain remove suffices.
+    Best-effort and never raises: rollback cleanup must not mask the original
+    dispatch error, and the account-lock release below must still run.
+    """
+    try:
+        import goalflight_fleet_ssh as fleet_ssh
+
+        repo_root = str(node_entry.get("repo_root") or "")
+        argv = fleet_ssh.build_remote_command(
+            "git_worktree_remove",
+            repo_root=repo_root,
+            worktree_path=preview.worktree_path,
+        )
+        host = fleet_ssh.host_from_node_entry(preview.node_id, node_entry)
+        ssh_argv = fleet_ssh.build_ssh_command(host, argv, command_class="git_worktree_remove")
+        with fleet_ssh.node_ssh_lock(preview.node_id, fleet_dir=fleet_dir):
+            runner(ssh_argv)
+    except Exception:
+        pass
 
 
 def register_dispatch_meta(
