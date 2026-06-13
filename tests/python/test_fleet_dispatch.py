@@ -246,6 +246,43 @@ def test_exec_without_live_ssh_env_refuses_before_runner() -> None:
             assert_true("hermetic safety", "hermetic suites must never live-SSH" in message)
 
 
+def test_goal_exec_reports_tool_smoke_before_live_ssh_refusal() -> None:
+    captured: list[list[str]] = []
+
+    def capture_runner(argv: list[str]) -> tuple[int, str, str]:
+        captured.append(list(argv))
+        return 0, "{}", ""
+
+    with live_ssh_env(None):
+        with tempfile.TemporaryDirectory() as td:
+            fleet_dir = Path(td) / "fleet"
+            _fixture_fleet(fleet_dir)
+            args = Args(
+                fleet_dir=fleet_dir,
+                node="localhost",
+                agent="grok-acp",
+                billing_account="openai/default",
+                prompt="chunk.md",
+                base_sha=BASE_SHA,
+                exec=True,
+                thin_defaults=False,
+                stub_remote=False,
+                stub_runner=capture_runner,
+                stub_terminal=True,
+                dispatch_mode="goal",
+                tool_smoke="auto",
+                tool_smoke_sandbox="read-only",
+            )
+            stderr = io.StringIO()
+            with redirect_stderr(stderr):
+                code = fleet_dispatch.cmd_dispatch(args)
+            payload = json.loads(stderr.getvalue())
+            assert_true("tool smoke gate", code == 1)
+            assert_true("tool smoke code", payload.get("code") == "tool_smoke")
+            assert_true("diagnosis surfaced", "missing/stale tool-smoke canary" in payload.get("error", ""))
+            assert_true("runner not called", captured == [])
+
+
 def test_exec_with_live_ssh_env_uses_runner() -> None:
     captured: list[list[str]] = []
 
@@ -1032,6 +1069,7 @@ def main() -> None:
     test_explicit_dry_run_preview()
     test_red_auth_blocks_exec()
     test_exec_without_live_ssh_env_refuses_before_runner()
+    test_goal_exec_reports_tool_smoke_before_live_ssh_refusal()
     test_exec_with_live_ssh_env_uses_runner()
     test_preview_ignores_live_ssh_env()
     test_thin_defaults_shows_billing_banner()

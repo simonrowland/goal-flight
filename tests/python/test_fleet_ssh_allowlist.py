@@ -154,6 +154,12 @@ def test_acp_run_uses_prompt_b64_and_acp_python() -> None:
         prompt=prompt,
         cwd="/Users/dev/.goal-flight/worktrees/acp-test",
         status_json="/Users/dev/.goal-flight/dispatches/acp-test/status.json",
+        model="grok-composer-2.5-fast",
+        mode="one-shot",
+        os_sandbox="read-only",
+        idle_timeout=180,
+        max_consecutive_tool_errors=1,
+        max_acp_events=120,
     )
     assert_true("acp venv python", argv[0].endswith("/venvs/acp-0.10/bin/python"))
     b64_idx = argv.index("--prompt-b64")
@@ -165,6 +171,49 @@ def test_acp_run_uses_prompt_b64_and_acp_python() -> None:
         "status json path",
         argv[status_idx + 1] == "/Users/dev/.goal-flight/dispatches/acp-test/status.json",
     )
+    assert_true("model passed", argv[argv.index("--model") + 1] == "grok-composer-2.5-fast")
+    assert_true("mode passed", argv[argv.index("--mode") + 1] == "one-shot")
+    assert_true("sandbox passed", argv[argv.index("--os-sandbox") + 1] == "read-only")
+    assert_true("tool cap passed", argv[argv.index("--max-consecutive-tool-errors") + 1] == "1")
+    assert_true("event cap passed", argv[argv.index("--max-acp-events") + 1] == "120")
+    assert_true("live matrix opt-in only", "GOALFLIGHT_ACP_LIVE_MATRIX=1" not in argv)
+
+
+def test_acp_run_live_matrix_env_is_opt_in() -> None:
+    argv = ssh.build_remote_command(
+        "acp_run",
+        repo_root="/srv/goal-flight",
+        state_dir="/Users/dev/.goal-flight",
+        dispatch_id="acp-test",
+        agent="grok-acp",
+        prompt="brief",
+        cwd="/Users/dev/.goal-flight/worktrees/acp-test",
+        status_json="/Users/dev/.goal-flight/dispatches/acp-test/status.json",
+        live_matrix=True,
+    )
+    assert_true("env prefix", argv[:2] == ["env", "GOALFLIGHT_ACP_LIVE_MATRIX=1"])
+    assert_true("acp venv after env", argv[2].endswith("/venvs/acp-0.10/bin/python"))
+
+
+def test_read_status_file_must_stay_under_state_dispatches() -> None:
+    argv = ssh.build_remote_command(
+        "read_status_file",
+        repo_root="/srv/goal-flight",
+        state_dir="/Users/dev/.goal-flight",
+        status_path="/Users/dev/.goal-flight/dispatches/acp-test/status.json",
+    )
+    assert_true("cat status", argv == ["cat", "/Users/dev/.goal-flight/dispatches/acp-test/status.json"])
+    try:
+        ssh.build_remote_command(
+            "read_status_file",
+            repo_root="/srv/goal-flight",
+            state_dir="/Users/dev/.goal-flight",
+            status_path="/Users/dev/.ssh/config",
+        )
+    except ssh.SshAllowlistError as exc:
+        assert_true("path rejected", "status_path must be under" in str(exc))
+    else:
+        assert_true("expected status path rejection", False)
 
 
 def test_launch_detached_uses_helper_and_prompt_b64() -> None:
@@ -248,6 +297,8 @@ def main() -> None:
         test_auth_probe_remote_argv_order,
         test_wrap_remote_argv_expands_tilde_paths,
         test_acp_run_uses_prompt_b64_and_acp_python,
+        test_acp_run_live_matrix_env_is_opt_in,
+        test_read_status_file_must_stay_under_state_dispatches,
         test_launch_detached_uses_helper_and_prompt_b64,
         test_launch_detached_recovery_flag_is_allowlisted,
         test_git_verify_commit_is_allowlisted,

@@ -139,6 +139,7 @@ def bootstrap(fleet_dir: Path, *, force: bool = False) -> dict[str, str]:
         "locks/accounts",
         "audit",
         "probes",
+        "probes/tool-smoke",
         "register",
         "register/dispatches",
     )
@@ -753,11 +754,49 @@ def main(argv: list[str] | None = None) -> int:
     dispatch.add_argument("--dispatch-id")
     dispatch.add_argument("--base-sha", help="Required 40-hex controller-resolved base for remote worktree creation")
     dispatch.add_argument("--thin-defaults", action="store_true", help="Fill agent/billing from steering")
+    dispatch.add_argument(
+        "--dispatch-mode",
+        choices=("goal", "one-shot", "tiny"),
+        default="goal",
+        help="Goal-loop dispatches require a green tool-smoke canary; one-shot/tiny dispatches opt out",
+    )
+    dispatch.add_argument(
+        "--tool-smoke",
+        choices=("auto", "require", "skip"),
+        default="auto",
+        help="Tool-smoke gate policy. Goal mode is always gated; require gates one-shot/tiny too.",
+    )
+    dispatch.add_argument(
+        "--tool-smoke-sandbox",
+        default="read-only",
+        help="Sandbox/profile identity for tool-smoke cache lookup (default read-only)",
+    )
     dispatch.add_argument("--exec", action="store_true", help="Acquire locks and spawn (default preview)")
     dispatch.add_argument("--stub-remote", action="store_true", help="Use stub SSH runner (tests)")
     dispatch.add_argument("--stub-terminal", action="store_true", help="Complete stub dispatch immediately")
     dispatch.add_argument("--json", action="store_true")
     dispatch.set_defaults(func=cmd_dispatch)
+
+    import goalflight_fleet_tool_smoke as fleet_tool_smoke
+
+    smoke = sub.add_parser("tool-smoke", help="Run/read fleet worker native Read canaries")
+    smoke_sub = smoke.add_subparsers(dest="tool_smoke_cmd", required=True)
+    smoke_run = smoke_sub.add_parser("run", help="Run a live tool-smoke canary (preview unless --exec)")
+    smoke_run.add_argument("--node", required=True)
+    smoke_run.add_argument("--agent", required=True)
+    smoke_run.add_argument("--base-sha", required=True)
+    smoke_run.add_argument("--sandbox", default="read-only")
+    smoke_run.add_argument("--model-version")
+    smoke_run.add_argument("--ttl-s", type=int, default=fleet_tool_smoke.DEFAULT_TTL_S)
+    smoke_run.add_argument("--exec", action="store_true")
+    smoke_run.set_defaults(func=fleet_tool_smoke.cmd_tool_smoke_run)
+    smoke_status = smoke_sub.add_parser("status", help="Read cached tool-smoke verdict")
+    smoke_status.add_argument("--node", required=True)
+    smoke_status.add_argument("--agent", required=True)
+    smoke_status.add_argument("--base-sha", required=True)
+    smoke_status.add_argument("--sandbox", default="read-only")
+    smoke_status.add_argument("--model-version")
+    smoke_status.set_defaults(func=fleet_tool_smoke.cmd_tool_smoke_status)
 
     watch = sub.add_parser("watch", help="Mirror remote dispatch status into orchestrator register")
     watch.add_argument("--fleet", action="store_true", help="Watch all in-flight fleet dispatches")

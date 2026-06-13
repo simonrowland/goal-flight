@@ -2012,6 +2012,7 @@ def doctor(
         })
     if fleet:
         payload["fleet"] = _fleet_auth_summary(fleet_dir, refresh=fleet_probe)
+        payload["fleet_tool_smoke"] = _fleet_tool_smoke_summary(fleet_dir)
         payload["fleet_dispatches"] = _fleet_dispatch_report(fleet_dir)
         payload["fleet_bash_tail_probes"] = _fleet_bash_tail_probe_summary(fleet_dir)
     return payload
@@ -2031,6 +2032,18 @@ def _fleet_auth_summary(
         return fleet_billing.fleet_auth_doctor(target, refresh=refresh)
     except Exception as exc:  # pragma: no cover
         return {"available": False, "reason": f"{type(exc).__name__}: {exc}", "nodes": []}
+
+
+def _fleet_tool_smoke_summary(fleet_dir: Path | None = None) -> dict:
+    if goalflight_fleet is None:
+        return {"available": False, "reason": "goalflight_fleet import failed", "canaries": []}
+    try:
+        import goalflight_fleet_tool_smoke as fleet_tool_smoke
+
+        target = fleet_dir or goalflight_fleet.default_fleet_dir()
+        return fleet_tool_smoke.fleet_tool_smoke_doctor(target)
+    except Exception as exc:  # pragma: no cover
+        return {"available": False, "reason": f"{type(exc).__name__}: {exc}", "canaries": []}
 
 
 def _rate_pressure_summary() -> dict:
@@ -2250,6 +2263,19 @@ def print_human(payload: dict) -> None:
     lines.append(status_line(True, "capacity profile", f"operating={cap.get('operating_cap')} raw={cap.get('raw_ram_ceiling')} ram={cap.get('ram_mb')}MB"))
     project = payload["project"]
     lines.append(status_line(project.get("present"), "git project", f"{project.get('branch')} {project.get('head')} dirty={project.get('dirty')}"))
+    fleet_tool_smoke = payload.get("fleet_tool_smoke")
+    if fleet_tool_smoke:
+        canaries = fleet_tool_smoke.get("canaries") or []
+        states: dict[str, int] = {}
+        for item in canaries:
+            state = str(item.get("cache_state") or item.get("status") or "unknown")
+            states[state] = states.get(state, 0) + 1
+        unhealthy = sum(states.get(key, 0) for key in ("red", "stale", "missing", "unknown"))
+        detail = (
+            f"{len(canaries)} cached; "
+            f"green={states.get('green', 0)} red={states.get('red', 0)} stale={states.get('stale', 0)}"
+        )
+        lines.append(status_line(unhealthy == 0 if canaries else None, "fleet tool-smoke canaries", detail))
     worktrees = payload.get("worktrees") or {}
     stale_worktrees = worktrees.get("stale") or []
     if stale_worktrees:

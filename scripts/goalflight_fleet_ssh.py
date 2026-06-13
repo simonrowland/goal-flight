@@ -234,9 +234,29 @@ def build_remote_command(command_class: str, **params: Any) -> list[str]:
             prompt_b64,
             "--json",
         ]
+        model = str(params.get("model") or "").strip()
+        if model:
+            argv.extend(["--model", model])
         status_json = str(params.get("status_json") or "").strip()
         if status_json:
             argv.extend(["--status-json", status_json])
+        mode = str(params.get("mode") or "").strip()
+        if mode:
+            argv.extend(["--mode", mode])
+        os_sandbox = str(params.get("os_sandbox") or "").strip()
+        if os_sandbox:
+            argv.extend(["--os-sandbox", os_sandbox])
+        idle_timeout = params.get("idle_timeout")
+        if idle_timeout is not None:
+            argv.extend(["--idle-timeout", str(idle_timeout)])
+        max_tool_errors = params.get("max_consecutive_tool_errors")
+        if max_tool_errors is not None:
+            argv.extend(["--max-consecutive-tool-errors", str(max_tool_errors)])
+        max_events = params.get("max_acp_events")
+        if max_events is not None:
+            argv.extend(["--max-acp-events", str(max_events)])
+        if bool(params.get("live_matrix")):
+            argv = ["env", "GOALFLIGHT_ACP_LIVE_MATRIX=1", *argv]
     elif command_class == "launch_detached":
         dispatch_id = str(params.get("dispatch_id") or "")
         agent = str(params.get("agent") or "")
@@ -333,6 +353,12 @@ def build_remote_command(command_class: str, **params: Any) -> list[str]:
         status_path = str(params.get("status_path") or "")
         if not status_path:
             raise SshAllowlistError("read_status_file requires status_path")
+        state_dir = str(params.get("state_dir") or "~/.goal-flight").rstrip("/")
+        status_path = _validate_declared_remote_path(
+            status_path,
+            [f"{state_dir}/dispatches"],
+            field="status_path",
+        )
         argv = ["cat", status_path]
     elif command_class == "read_lease_file":
         lease_path = str(params.get("lease_path") or "")

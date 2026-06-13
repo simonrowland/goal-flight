@@ -21,6 +21,7 @@ from typing import Any, Callable
 import goalflight_fleet_billing as billing
 import goalflight_fleet_status as status
 import goalflight_fleet_status_cli as status_cli
+import goalflight_fleet_tool_smoke as tool_smoke
 
 
 class DispatchError(Exception):
@@ -215,12 +216,49 @@ def assert_node_not_quarantined(fleet_dir: Path, node_id: str) -> None:
             )
 
 
-def assert_dispatch_gates(fleet_dir: Path, *, node_id: str, billing_account: str) -> None:
+def _tool_smoke_required(dispatch_mode: str, tool_smoke_policy: str | None) -> bool:
+    policy = str(tool_smoke_policy or "auto").lower()
+    mode = str(dispatch_mode or "one-shot").lower()
+    if policy == "require":
+        return True
+    if mode == "goal":
+        return True
+    return False
+
+
+def assert_dispatch_gates(
+    fleet_dir: Path,
+    *,
+    node_id: str,
+    billing_account: str,
+    agent: str | None = None,
+    base_sha: str | None = None,
+    dispatch_mode: str = "one-shot",
+    tool_smoke_policy: str | None = "auto",
+    tool_smoke_sandbox: str = tool_smoke.DEFAULT_SANDBOX,
+) -> None:
     assert_node_not_quarantined(fleet_dir, node_id)
     try:
         billing.assert_dispatch_auth(fleet_dir, node_id, billing_account)
     except billing.DispatchAuthError as exc:
         raise DispatchGateError(str(exc), code="auth") from exc
+    if not _tool_smoke_required(dispatch_mode, tool_smoke_policy):
+        return
+    if not agent or not base_sha:
+        raise DispatchGateError(
+            "goal-loop dispatch requires agent and base_sha for tool-smoke canary lookup",
+            code="tool_smoke",
+        )
+    try:
+        tool_smoke.assert_green_canary(
+            fleet_dir,
+            node_id=node_id,
+            agent=agent,
+            base_sha=base_sha,
+            sandbox=tool_smoke_sandbox,
+        )
+    except tool_smoke.ToolSmokeGateError as exc:
+        raise DispatchGateError(str(exc), code="tool_smoke") from exc
 
 
 def remote_status_path_for_dispatch(state_dir: str, dispatch_id: str) -> str:
@@ -785,8 +823,20 @@ def execute_dispatch(
     *,
     runner: Callable[[list[str]], tuple[int, str, str]] | None = None,
     stub_terminal: bool = False,
+    dispatch_mode: str = "one-shot",
+    tool_smoke_policy: str | None = "auto",
+    tool_smoke_sandbox: str = tool_smoke.DEFAULT_SANDBOX,
 ) -> dict[str, Any]:
-    assert_dispatch_gates(fleet_dir, node_id=preview.node_id, billing_account=preview.billing_account)
+    assert_dispatch_gates(
+        fleet_dir,
+        node_id=preview.node_id,
+        billing_account=preview.billing_account,
+        agent=preview.agent,
+        base_sha=preview.base_sha,
+        dispatch_mode=dispatch_mode,
+        tool_smoke_policy=tool_smoke_policy,
+        tool_smoke_sandbox=tool_smoke_sandbox,
+    )
     recovering_unconfirmed = launch_recovery_allowed(
         fleet_dir,
         dispatch_id=preview.dispatch_id,
@@ -889,16 +939,26 @@ def cmd_dispatch(args) -> int:
         return 0
 
     try:
+        dispatch_mode = getattr(args, "dispatch_mode", "one-shot")
+        assert_dispatch_gates(
+            args.fleet_dir,
+            node_id=preview.node_id,
+            billing_account=preview.billing_account,
+            agent=preview.agent,
+            base_sha=preview.base_sha,
+            dispatch_mode=dispatch_mode,
+            tool_smoke_policy=getattr(args, "tool_smoke", "auto"),
+            tool_smoke_sandbox=getattr(args, "tool_smoke_sandbox", tool_smoke.DEFAULT_SANDBOX),
+        )
+    except DispatchGateError as exc:
+        print(json.dumps({"ok": False, "error": str(exc), "code": exc.code}), file=__import__("sys").stderr)
+        return 1
+
+    try:
         assert_live_ssh_opt_in()
     except DispatchError as exc:
         print(str(exc), file=__import__("sys").stderr)
         return 2
-
-    try:
-        assert_dispatch_gates(args.fleet_dir, node_id=preview.node_id, billing_account=preview.billing_account)
-    except DispatchGateError as exc:
-        print(json.dumps({"ok": False, "error": str(exc), "code": exc.code}), file=__import__("sys").stderr)
-        return 1
 
     runner = resolve_dispatch_runner(args)
 
@@ -907,6 +967,9 @@ def cmd_dispatch(args) -> int:
         preview,
         runner=runner,
         stub_terminal=getattr(args, "stub_terminal", False),
+        dispatch_mode=getattr(args, "dispatch_mode", "one-shot"),
+        tool_smoke_policy=getattr(args, "tool_smoke", "auto"),
+        tool_smoke_sandbox=getattr(args, "tool_smoke_sandbox", tool_smoke.DEFAULT_SANDBOX),
     )
     print(json.dumps(result, indent=2))
     return 0
