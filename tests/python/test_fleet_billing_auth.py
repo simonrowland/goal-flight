@@ -21,7 +21,7 @@ def assert_true(name: str, condition: bool) -> None:
 
 
 def green_runner(_argv: list[str]) -> tuple[int, str, str]:
-    return 0, "logged_in: true\n", ""
+    return 0, '{"models":[{"id":"gpt-5"}]}\n', ""
 
 
 def red_runner(_argv: list[str]) -> tuple[int, str, str]:
@@ -35,6 +35,26 @@ def tooling_runner(_argv: list[str]) -> tuple[int, str, str]:
 def codex_models_runner(argv: list[str]) -> tuple[int, str, str]:
     assert_true("openai auth argv", argv == ["codex", "debug", "models"])
     return 0, '{"models":[{"id":"gpt-5"}]}\n', ""
+
+
+def empty_codex_models_runner(argv: list[str]) -> tuple[int, str, str]:
+    assert_true("openai auth argv", argv == ["codex", "debug", "models"])
+    return 0, '{"models":[]}\n', ""
+
+
+def bare_exit_zero_runner(argv: list[str]) -> tuple[int, str, str]:
+    assert_true("openai auth argv", argv == ["codex", "debug", "models"])
+    return 0, "Logged in using ChatGPT\n", ""
+
+
+def claude_auth_status_runner(argv: list[str]) -> tuple[int, str, str]:
+    assert_true("anthropic auth argv", argv == ["claude", "auth", "status", "--json"])
+    return 0, '{"loggedIn":true,"authMethod":"oauth","apiProvider":"anthropic"}\n', ""
+
+
+def claude_logged_out_runner(argv: list[str]) -> tuple[int, str, str]:
+    assert_true("anthropic auth argv", argv == ["claude", "auth", "status", "--json"])
+    return 1, '{"loggedIn":false,"authMethod":"none","apiProvider":"anthropic"}\n', ""
 
 
 REVOKED_CODEX_STDERR = (
@@ -131,6 +151,24 @@ def test_openai_probe_uses_authenticated_models_check() -> None:
     assert_true("openai probe argv", billing.probe_argv("openai") == ["codex", "debug", "models"])
 
 
+def test_openai_bare_exit_zero_probe_is_inconclusive() -> None:
+    payload = billing.run_local_auth_probe(
+        "openai/default",
+        {"accounts": [{"account_key": "openai/default", "provider": "openai"}]},
+        runner=bare_exit_zero_runner,
+    )
+    assert_true("bare exit-zero inconclusive", payload["status"] == "inconclusive")
+
+
+def test_openai_empty_models_probe_is_inconclusive() -> None:
+    payload = billing.run_local_auth_probe(
+        "openai/default",
+        {"accounts": [{"account_key": "openai/default", "provider": "openai"}]},
+        runner=empty_codex_models_runner,
+    )
+    assert_true("empty models inconclusive", payload["status"] == "inconclusive")
+
+
 def test_openai_working_token_probe_is_green_and_dispatch_allowed() -> None:
     import goalflight_fleet_dispatch as fleet_dispatch
 
@@ -180,6 +218,63 @@ def test_openai_revoked_token_probe_is_red_and_dispatch_gate_blocks() -> None:
             assert_true("re-login message", "re-login required" in message)
 
 
+def test_anthropic_probe_uses_auth_status_not_version() -> None:
+    assert_true(
+        "anthropic probe argv",
+        billing.probe_argv("anthropic-session") == ["claude", "auth", "status", "--json"],
+    )
+
+
+def test_anthropic_auth_status_json_is_validated() -> None:
+    green = billing.run_local_auth_probe(
+        "anthropic/session-local",
+        {"accounts": [{"account_key": "anthropic/session-local", "provider": "anthropic-session"}]},
+        runner=claude_auth_status_runner,
+    )
+    assert_true("anthropic logged-in green", green["status"] == "green")
+    red = billing.run_local_auth_probe(
+        "anthropic/session-local",
+        {"accounts": [{"account_key": "anthropic/session-local", "provider": "anthropic-session"}]},
+        runner=claude_logged_out_runner,
+    )
+    assert_true("anthropic logged-out red", red["status"] == "red")
+    inconclusive = billing.run_local_auth_probe(
+        "anthropic/session-local",
+        {"accounts": [{"account_key": "anthropic/session-local", "provider": "anthropic-session"}]},
+        runner=lambda _a: (0, '{"authMethod":"oauth"}\n', ""),
+    )
+    assert_true("anthropic missing loggedIn inconclusive", inconclusive["status"] == "inconclusive")
+
+
+def test_anthropic_logged_in_identity_denial_words_stays_green() -> None:
+    stdout = json.dumps(
+        {
+            "loggedIn": True,
+            "authMethod": "claude.ai",
+            "apiProvider": "firstParty",
+            "email": "user@401-unauthorized.example",
+            "orgName": "Revoked Records LLC",
+            "subscriptionType": "max",
+        }
+    )
+    payload = billing.run_local_auth_probe(
+        "anthropic/session-local",
+        {"accounts": [{"account_key": "anthropic/session-local", "provider": "anthropic-session"}]},
+        runner=lambda _a: (0, stdout, ""),
+    )
+    assert_true("anthropic logged-in identity green", payload["status"] == "green")
+
+
+def test_anthropic_logged_in_stderr_denial_is_red() -> None:
+    stdout = '{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty"}\n'
+    payload = billing.run_local_auth_probe(
+        "anthropic/session-local",
+        {"accounts": [{"account_key": "anthropic/session-local", "provider": "anthropic-session"}]},
+        runner=lambda _a: (1, stdout, "401 unauthorized\n"),
+    )
+    assert_true("anthropic stderr denial red", payload["status"] == "red")
+
+
 def test_account_link_cli_fails_closed_on_red_probe() -> None:
     old_runner = billing.default_runner
     try:
@@ -217,7 +312,7 @@ def test_doctor_fleet_shape() -> None:
             fleet_dir,
             "anthropic/session-local",
             "localhost",
-            runner=lambda _a: (0, "claude 1.2.3\n", ""),
+            runner=claude_auth_status_runner,
         )
         summary = billing.fleet_auth_doctor(fleet_dir, refresh=False)
         assert_true("available", summary["available"] is True)
@@ -267,6 +362,41 @@ def test_dispatch_auth_refuses_recorded_controller_owner_mismatch() -> None:
             assert_true("hard red", exc.auth_probe == "red")
             assert_true("owner mismatch", "not fleet controller" in message)
             assert_true("owner remedy", "account link" in message)
+
+
+def test_dispatch_auth_allows_legacy_usable_fleet_json() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        fleet_dir = Path(td) / "fleet"
+        _fixture_fleet(fleet_dir)
+        fleet_doc = fleet.read_json(fleet_dir / "fleet.json")
+        fleet_doc.pop("schema", None)
+        fleet_doc.pop("schema_version", None)
+        fleet_doc.pop("min_reader_version", None)
+        fleet_doc["nodes"]["localhost"]["billing_accounts"] = ["openai/default"]
+        fleet._atomic_write_json(fleet_dir / "fleet.json", fleet_doc)
+        _write_probe(fleet_dir, "localhost", "openai/default", "green")
+        billing.assert_dispatch_auth(fleet_dir, "localhost", "openai/default")
+
+
+def test_dispatch_auth_legacy_fleet_missing_membership_field_fails_closed() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        fleet_dir = Path(td) / "fleet"
+        _fixture_fleet(fleet_dir)
+        fleet_doc = fleet.read_json(fleet_dir / "fleet.json")
+        fleet_doc.pop("schema", None)
+        fleet_doc.pop("schema_version", None)
+        fleet_doc.pop("min_reader_version", None)
+        fleet_doc["nodes"]["localhost"].pop("billing_accounts", None)
+        fleet._atomic_write_json(fleet_dir / "fleet.json", fleet_doc)
+        _write_probe(fleet_dir, "localhost", "openai/default", "green")
+        try:
+            billing.assert_dispatch_auth(fleet_dir, "localhost", "openai/default")
+            assert_true("should block", False)
+        except billing.DispatchAuthError as exc:
+            message = str(exc)
+            assert_true("hard red", exc.auth_probe == "red")
+            assert_true("membership field message", "billing_accounts list" in message)
+            assert_true("membership remedy", "account link" in message)
 
 
 def test_account_unlink_removes_link_and_artifact() -> None:
@@ -489,12 +619,20 @@ def main() -> None:
         test_dispatch_auth_refuses_stale_green_probe_without_membership,
         test_dispatch_auth_allows_linked_member_with_green_probe,
         test_openai_probe_uses_authenticated_models_check,
+        test_openai_bare_exit_zero_probe_is_inconclusive,
+        test_openai_empty_models_probe_is_inconclusive,
         test_openai_working_token_probe_is_green_and_dispatch_allowed,
         test_openai_revoked_token_probe_is_red_and_dispatch_gate_blocks,
+        test_anthropic_probe_uses_auth_status_not_version,
+        test_anthropic_auth_status_json_is_validated,
+        test_anthropic_logged_in_identity_denial_words_stays_green,
+        test_anthropic_logged_in_stderr_denial_is_red,
         test_account_link_cli_fails_closed_on_red_probe,
         test_doctor_fleet_shape,
         test_dispatch_gate_blocks_red_auth,
         test_dispatch_auth_refuses_recorded_controller_owner_mismatch,
+        test_dispatch_auth_allows_legacy_usable_fleet_json,
+        test_dispatch_auth_legacy_fleet_missing_membership_field_fails_closed,
         test_account_unlink_removes_link_and_artifact,
         test_doctor_cli_fleet_json,
         test_remote_auth_probe_uses_node_venv_python,

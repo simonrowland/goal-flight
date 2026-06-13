@@ -26,7 +26,7 @@ PROVIDER_BY_ACCOUNT: dict[str, str] = {
 LOCAL_PROBE_ARGV: dict[str, list[str]] = {
     # Do not use `codex login status`: it can be satisfied by cached identity.
     "openai": ["codex", "debug", "models"],
-    "anthropic-session": ["claude", "--version"],
+    "anthropic-session": ["claude", "auth", "status", "--json"],
     "grok": [
         "sh",
         "-lc",
@@ -58,6 +58,10 @@ CURSOR_AUTH_NEGATIVE_RE = re.compile(
 CURSOR_AUTH_POSITIVE_RE = re.compile(
     r"logged in as|login successful|✓ logged in",
     re.I,
+)
+OPENAI_AUTH_POSITIVE_RE = re.compile(
+    r'("models"\s*:\s*\[\s*(?:\{|")|\bavailable models\b|^\s*[-*]?\s*(?:(?:gpt|o[0-9])[\w.-]*|codex-[\w.-]*)\b)',
+    re.I | re.M,
 )
 
 
@@ -156,17 +160,54 @@ def _failed_probe_status(exit_code: int, stdout: str, stderr: str) -> str:
     return INCONCLUSIVE_STATUS
 
 
+def _openai_auth_positive(stdout: str, stderr: str) -> bool:
+    combined = f"{stdout}\n{stderr}"
+    try:
+        payload = json.loads(stdout or "{}")
+    except json.JSONDecodeError:
+        payload = None
+    if isinstance(payload, dict):
+        models = payload.get("models")
+        if isinstance(models, list) and models:
+            return True
+    return bool(OPENAI_AUTH_POSITIVE_RE.search(combined))
+
+
+def _anthropic_auth_status(stdout: str) -> str | None:
+    try:
+        payload = json.loads(stdout or "{}")
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    logged_in = payload.get("loggedIn")
+    if logged_in is True:
+        return "green"
+    if logged_in is False:
+        return "red"
+    return None
+
+
 def interpret_auth_probe(provider: str, exit_code: int, stdout: str, stderr: str) -> str:
     combined = f"{stdout}\n{stderr}"
     if provider == "openai":
         if AUTH_DENIED_RE.search(combined):
             return "red"
-        if exit_code == 0:
+        if exit_code == 0 and _openai_auth_positive(stdout, stderr):
             return "green"
+        if exit_code == 0:
+            return INCONCLUSIVE_STATUS
         return _failed_probe_status(exit_code, stdout, stderr)
     if provider == "anthropic-session":
-        if exit_code == 0 and stdout.strip():
-            return "green"
+        auth_status = _anthropic_auth_status(stdout)
+        if auth_status is not None:
+            if auth_status == "green" and AUTH_DENIED_RE.search(stderr):
+                return "red"
+            return auth_status
+        if AUTH_DENIED_RE.search(combined):
+            return "red"
+        if exit_code == 0:
+            return INCONCLUSIVE_STATUS
         return _failed_probe_status(exit_code, stdout, stderr)
     if provider == "grok":
         if exit_code == 0 and re.search(r"logged_in", combined, re.I):
@@ -239,6 +280,39 @@ def read_probe_artifact(fleet_dir: Path, node_id: str, account_key: str) -> dict
         return json.loads(path.read_text())
     except (OSError, json.JSONDecodeError):
         return None
+
+
+def _dispatch_node_entry(fleet_doc: Any, node_id: str, account_key: str) -> dict[str, Any]:
+    if not isinstance(fleet_doc, dict):
+        raise DispatchAuthError(
+            f"fleet registry for node={node_id} account={account_key} is not a JSON object",
+            auth_probe="red",
+        )
+    nodes = fleet_doc.get("nodes")
+    if not isinstance(nodes, dict):
+        raise DispatchAuthError(
+            (
+                f"fleet registry missing usable nodes object for node={node_id} account={account_key}; "
+                "run fleet bootstrap/import or migrate the legacy fleet.json"
+            ),
+            auth_probe="red",
+        )
+    node = nodes.get(node_id)
+    if not isinstance(node, dict):
+        raise DispatchAuthError(
+            f"unknown node {node_id}; account {account_key} is not dispatch-authorized",
+            auth_probe="red",
+        )
+    billing_accounts = node.get("billing_accounts")
+    if not isinstance(billing_accounts, list):
+        raise DispatchAuthError(
+            (
+                f"fleet node {node_id} missing billing_accounts list for account {account_key}; "
+                "run `account link` to refresh dispatch membership"
+            ),
+            auth_probe="red",
+        )
+    return node
 
 
 def _remote_probe_payload_from_stdout(stdout: str) -> dict[str, Any] | None:
@@ -482,14 +556,11 @@ def assert_dispatch_auth(fleet_dir: Path, node_id: str, account_key: str) -> Non
                 auth_probe="red",
             )
         fleet_doc = fleet.read_json(fleet_path)
-        schemas.validate_fleet(fleet_doc)
-        nodes = fleet_doc.get("nodes") or {}
-        node = nodes.get(node_id)
-        if not isinstance(node, dict):
-            raise DispatchAuthError(
-                f"unknown node {node_id}; account {account_key} is not dispatch-authorized",
-                auth_probe="red",
-            )
+        try:
+            schemas.validate_fleet(fleet_doc)
+        except schemas.SchemaError:
+            pass
+        node = _dispatch_node_entry(fleet_doc, node_id, account_key)
         linked = {str(item) for item in (node.get("billing_accounts") or [])}
         if account_key not in linked:
             raise DispatchAuthError(
