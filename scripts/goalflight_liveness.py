@@ -17,6 +17,7 @@ import subprocess
 import sys
 import time
 from typing import Awaitable, Callable
+import uuid
 
 import goalflight_compat
 
@@ -31,6 +32,8 @@ LOW_POWER_RELAX_FACTOR = 3.0
 # preserving the fail-fast / no-multi-hour-hang invariant regardless of config.
 LOW_POWER_RELAX_CAP_S = 600.0
 _SYSTEM_STARVED_CACHE: tuple[float, bool] | None = None
+_STATUS_EPOCH_SCHEMAS = {"goalflight.acp-run.v1", "goalflight.status.v1"}
+_STATUS_EPOCH_CACHE: dict[str, str] = {}
 
 
 def active_monotonic() -> float:
@@ -410,6 +413,57 @@ def progress_stall_decision(
     )
 
 
+def _status_epoch_key(path: Path) -> str:
+    return str(path.expanduser().resolve(strict=False))
+
+
+def _payload_epoch(value: object) -> str | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        if isinstance(value, float) and not value.is_integer():
+            return None
+        return str(int(value))
+    if isinstance(value, str):
+        stripped = value.strip()
+        return stripped or None
+    return None
+
+
+def _read_existing_status_epoch(path: Path) -> str | None:
+    try:
+        existing = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(existing, dict):
+        return None
+    return _payload_epoch(existing.get("epoch"))
+
+
+def _status_epoch_for(path: Path) -> str:
+    key = _status_epoch_key(path)
+    cached = _STATUS_EPOCH_CACHE.get(key)
+    if cached is not None and path.exists():
+        return cached
+    existing = _read_existing_status_epoch(path)
+    if existing is not None:
+        _STATUS_EPOCH_CACHE[key] = existing
+        return existing
+    epoch = f"status-{uuid.uuid4().hex}"
+    _STATUS_EPOCH_CACHE[key] = epoch
+    return epoch
+
+
+def _ensure_status_epoch(path: Path, payload: dict) -> None:
+    if payload.get("schema") not in _STATUS_EPOCH_SCHEMAS:
+        return
+    explicit_epoch = _payload_epoch(payload.get("epoch"))
+    if explicit_epoch is not None:
+        _STATUS_EPOCH_CACHE[_status_epoch_key(path)] = explicit_epoch
+        return
+    payload["epoch"] = _status_epoch_for(path)
+
+
 def write_status(path: Path, payload: dict) -> None:
     """Atomically write status JSON (write temp sibling, then os.replace).
 
@@ -419,6 +473,7 @@ def write_status(path: Path, payload: dict) -> None:
     byte-identical (grok 2026-05-20 DRY note).
     """
     path.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_status_epoch(path, payload)
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
     tmp.replace(path)

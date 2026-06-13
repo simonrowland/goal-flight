@@ -181,13 +181,18 @@ def resolve_remote_status_path(
     return None
 
 
-def validate_remote_content(raw: str, *, last_seq: int | None) -> mirror.MirrorReadResult:
+def validate_remote_content(
+    raw: str,
+    *,
+    last_seq: int | None,
+    last_epoch: object = mirror.LEGACY_EPOCH,
+) -> mirror.MirrorReadResult:
     """Validate fetched JSON without mutating the orchestrator mirror path."""
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
         handle.write(raw)
         staging = Path(handle.name)
     try:
-        return mirror.read_status_mirror(staging, last_seq=last_seq)
+        return mirror.read_status_mirror(staging, last_seq=last_seq, last_epoch=last_epoch)
     finally:
         staging.unlink(missing_ok=True)
 
@@ -211,9 +216,10 @@ def _mark_meta_validation_error(meta_path: Path, *, error: str, detail: str | No
     _atomic_write_json(meta_path, meta)
 
 
-def _mark_meta_ingested(meta_path: Path, *, seq: int) -> None:
+def _mark_meta_ingested(meta_path: Path, *, seq: int, epoch: object = mirror.LEGACY_EPOCH) -> None:
     meta = _read_json_object(meta_path)
     meta["last_mirror_seq"] = seq
+    meta["last_mirror_epoch"] = epoch
     meta["mirror_stale"] = False
     meta.pop("mirror_error", None)
     meta.pop("mirror_error_detail", None)
@@ -508,13 +514,7 @@ def ingest_dispatch_mirror(
             detail="remote_status_path not configured",
         )
 
-    if meta.get("mirror_ingest_stopped") is True:
-        return DispatchWatchResult(
-            dispatch_id,
-            ok=False,
-            action="skipped",
-            detail="mirror ingest stopped after prior seq regression",
-        )
+    stopped_after_regression = meta.get("mirror_ingest_stopped") is True
 
     fetch = transport.fetch_remote_status(
         node_id=node_id,
@@ -539,11 +539,19 @@ def ingest_dispatch_mirror(
             detail=fetch.error or "remote fetch failed",
         )
 
-    last_seq = local_mirror_last_seq(fleet_dir, dispatch_id)
-    validated = validate_remote_content(fetch.content, last_seq=last_seq)
+    last_mirror = mirror.read_status_mirror(status_path)
+    last_seq = last_mirror.last_seq if last_mirror.ok else None
+    last_epoch = last_mirror.epoch if last_mirror.ok else mirror.LEGACY_EPOCH
+    validated = validate_remote_content(fetch.content, last_seq=last_seq, last_epoch=last_epoch)
 
     if not validated.ok and validated.error == mirror.ERROR_SEQ_REGRESSION:
-        if validated.last_seq == last_seq:
+        if validated.last_seq == last_seq and validated.epoch == last_epoch:
+            if stopped_after_regression:
+                _mark_meta_ingested(
+                    meta_path,
+                    seq=int(validated.last_seq or 0),
+                    epoch=validated.epoch,
+                )
             return DispatchWatchResult(
                 dispatch_id,
                 ok=True,
@@ -572,7 +580,11 @@ def ingest_dispatch_mirror(
 
     assert validated.payload is not None
     write_status(status_path, validated.payload)
-    _mark_meta_ingested(meta_path, seq=int(validated.last_seq or validated.payload["seq"]))
+    _mark_meta_ingested(
+        meta_path,
+        seq=int(validated.last_seq or validated.payload["seq"]),
+        epoch=validated.epoch,
+    )
     if meta.get("launch_unconfirmed") is True:
         receipt = _receipt_from_status_payload(
             dispatch_id=dispatch_id,

@@ -76,6 +76,42 @@ def test_seq_regression_fails_closed() -> None:
     assert_true("payload preserved", result.payload is not None)
 
 
+def test_epoch_change_allows_lower_seq() -> None:
+    payload = {
+        "schema": mirror.STATUS_MIRROR_SCHEMA,
+        "epoch": "status-file-birth-2",
+        "seq": 1,
+        "dispatch_id": "acp-codex-fixture-epoch",
+        "state": "running",
+    }
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "status.json"
+        path.write_text(json.dumps(payload) + "\n")
+        result = mirror.read_status_mirror(path, last_seq=5, last_epoch="status-file-birth-1")
+
+    assert_true("ok", result.ok is True)
+    assert_true("last_seq reset", result.last_seq == 1)
+    assert_true("epoch", result.epoch == "status-file-birth-2")
+
+
+def test_same_epoch_seq_regression_fails_closed() -> None:
+    payload = {
+        "schema": mirror.STATUS_MIRROR_SCHEMA,
+        "epoch": "status-file-birth-1",
+        "seq": 1,
+        "dispatch_id": "acp-codex-fixture-epoch",
+        "state": "running",
+    }
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "status.json"
+        path.write_text(json.dumps(payload) + "\n")
+        result = mirror.read_status_mirror(path, last_seq=5, last_epoch="status-file-birth-1")
+
+    assert_true("not ok", result.ok is False)
+    assert_true("error code", result.error == mirror.ERROR_SEQ_REGRESSION)
+    assert_true("epoch preserved", result.epoch == "status-file-birth-1")
+
+
 def test_schema_mismatch() -> None:
     result = mirror.read_status_mirror(FIXTURES / "schema_mismatch.json")
     assert_true("not ok", result.ok is False)
@@ -107,14 +143,24 @@ def test_first_read_accepts_seq_zero() -> None:
         tmp.unlink(missing_ok=True)
 
 
+def test_legacy_record_without_epoch_uses_epoch_zero() -> None:
+    result = mirror.read_status_mirror(FIXTURES / "valid_ok.json")
+    assert_true("ok", result.ok is True)
+    assert_true("epoch", result.epoch == mirror.LEGACY_EPOCH)
+    assert_true("payload epoch", result.payload is not None and result.payload["epoch"] == mirror.LEGACY_EPOCH)
+
+
 def main() -> None:
     test_valid_fixture_returns_payload_and_last_seq()
     test_dispatch_status_v1_fixture_normalized()
     test_seq_regression_fails_closed()
+    test_epoch_change_allows_lower_seq()
+    test_same_epoch_seq_regression_fails_closed()
     test_schema_mismatch()
     test_partial_json()
     test_missing_file()
     test_first_read_accepts_seq_zero()
+    test_legacy_record_without_epoch_uses_epoch_zero()
     print("OK: fleet mirror tests pass")
 
 

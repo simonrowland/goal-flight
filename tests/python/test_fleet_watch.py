@@ -15,6 +15,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import goalflight_fleet as fleet
 import goalflight_fleet_mirror as mirror
 import goalflight_fleet_watch as fleet_watch
+import goalflight_liveness
 
 FIXTURES = ROOT / "tests" / "fixtures" / "fleet_mirrors"
 
@@ -33,6 +34,7 @@ def _status_payload(
     seq: int,
     state: str = "running",
     worker_pid: int | None = None,
+    epoch: object | None = None,
 ) -> str:
     payload = {
         "schema": mirror.STATUS_MIRROR_SCHEMA,
@@ -41,6 +43,8 @@ def _status_payload(
         "state": state,
         "updated_at": "2026-05-24T12:00:00+00:00",
     }
+    if epoch is not None:
+        payload["epoch"] = epoch
     if worker_pid is not None:
         payload["worker_pid"] = worker_pid
         payload["worker_identity"] = {
@@ -56,6 +60,7 @@ def _dispatch_status_v1_starting_payload(
     dispatch_id: str,
     updated_at: int = 1780000000,
     worker_pid: int = 5555,
+    epoch: object | None = None,
 ) -> str:
     # Field set copied from goalflight_dispatch.py's detached-launch status writer.
     identity = {
@@ -63,21 +68,40 @@ def _dispatch_status_v1_starting_payload(
         "lstart": "Thu Jun 11 12:00:00 2026",
         "comm": "python3",
     }
-    return json.dumps(
+    payload = {
+        "schema": "goalflight.status.v1",
+        "dispatch_id": dispatch_id,
+        "agent": "codex-acp",
+        "worker_pid": worker_pid,
+        "pgid": worker_pid,
+        "worker_alive": True,
+        "worker_identity": identity,
+        "expected_worker_identity": identity,
+        "tail_path": f"/tmp/goal-flight/{dispatch_id}.tail.log",
+        "state": "starting",
+        "reason": "watcher_launching",
+        "updated_at": updated_at,
+    }
+    if epoch is not None:
+        payload["epoch"] = epoch
+    return json.dumps(payload)
+
+
+def _write_real_status_v1(path: Path, *, dispatch_id: str, seq: int, state: str = "running") -> None:
+    goalflight_liveness.write_status(
+        path,
         {
             "schema": "goalflight.status.v1",
+            "seq": seq,
             "dispatch_id": dispatch_id,
             "agent": "codex-acp",
-            "worker_pid": worker_pid,
-            "pgid": worker_pid,
+            "worker_pid": 5555,
+            "pgid": 5555,
             "worker_alive": True,
-            "worker_identity": identity,
-            "expected_worker_identity": identity,
             "tail_path": f"/tmp/goal-flight/{dispatch_id}.tail.log",
-            "state": "starting",
-            "reason": "watcher_launching",
-            "updated_at": updated_at,
-        }
+            "state": state,
+            "updated_at": 1780000000 + seq,
+        },
     )
 
 
@@ -158,17 +182,19 @@ def _write_dispatch(
     *,
     dispatch_id: str = "acp-codex-watch-01",
     seq: int = 3,
+    epoch: object | None = None,
 ) -> Path:
     dispatch_dir = fleet_dir / "register" / "dispatches" / dispatch_id
     dispatch_dir.mkdir(parents=True, exist_ok=True)
     status_path = dispatch_dir / "status.json"
-    status_path.write_text(_status_payload(dispatch_id=dispatch_id, seq=seq) + "\n")
+    remote_status_path = f"~/.goal-flight/dispatches/{dispatch_id}/status.json"
+    status_path.write_text(_status_payload(dispatch_id=dispatch_id, seq=seq, epoch=epoch) + "\n")
     fleet._atomic_write_json(
         dispatch_dir / "meta.json",
         {
             "dispatch_id": dispatch_id,
             "node_id": "build-1",
-            "remote_status_path": "/remote/runs/status.json",
+            "remote_status_path": remote_status_path,
             "lease_active": True,
             "last_mirror_seq": seq,
             "pid_hint": "alive",
@@ -183,7 +209,7 @@ def _write_dispatch(
                     "lstart": "Thu Jun 11 12:00:00 2026",
                     "comm": "python3",
                 },
-                "remote_status_path": "/remote/runs/status.json",
+                "remote_status_path": remote_status_path,
             },
         },
     )
@@ -349,9 +375,11 @@ def test_seq_regression_preserves_last_good_mirror() -> None:
     with tempfile.TemporaryDirectory() as td:
         fleet_dir = Path(td) / "fleet"
         _fixture_fleet(fleet_dir)
-        status_path = _write_dispatch(fleet_dir, dispatch_id=dispatch_id, seq=5)
+        status_path = _write_dispatch(fleet_dir, dispatch_id=dispatch_id, seq=5, epoch="run-1")
         before = status_path.read_text()
-        transport = FakeTransport({dispatch_id: _status_payload(dispatch_id=dispatch_id, seq=3)})
+        transport = FakeTransport(
+            {dispatch_id: _status_payload(dispatch_id=dispatch_id, seq=3, epoch="run-1")}
+        )
 
         row = fleet_watch.ingest_dispatch_mirror(
             fleet_dir,
@@ -370,14 +398,16 @@ def test_seq_regression_preserves_last_good_mirror() -> None:
         assert_true("ingest stopped", meta.get("mirror_ingest_stopped") is True)
 
 
-def test_seq_regression_stops_subsequent_ingest() -> None:
+def test_epoch_change_with_lower_seq_resumes_ingest_after_stop() -> None:
     dispatch_id = "acp-codex-watch-03"
     with tempfile.TemporaryDirectory() as td:
         fleet_dir = Path(td) / "fleet"
         _fixture_fleet(fleet_dir)
-        status_path = _write_dispatch(fleet_dir, dispatch_id=dispatch_id, seq=2)
+        status_path = _write_dispatch(fleet_dir, dispatch_id=dispatch_id, seq=2, epoch="run-1")
         meta_path = status_path.parent / "meta.json"
-        transport = FakeTransport({dispatch_id: _status_payload(dispatch_id=dispatch_id, seq=1)})
+        transport = FakeTransport(
+            {dispatch_id: _status_payload(dispatch_id=dispatch_id, seq=1, epoch="run-1")}
+        )
 
         first = fleet_watch.ingest_dispatch_mirror(
             fleet_dir,
@@ -388,7 +418,11 @@ def test_seq_regression_stops_subsequent_ingest() -> None:
         )
         assert_true("first regression", first.action == "seq_regression")
 
-        transport._by_dispatch[dispatch_id] = _status_payload(dispatch_id=dispatch_id, seq=3)
+        transport._by_dispatch[dispatch_id] = _status_payload(
+            dispatch_id=dispatch_id,
+            seq=1,
+            epoch="run-2",
+        )
         second = fleet_watch.ingest_dispatch_mirror(
             fleet_dir,
             dispatch_id,
@@ -396,7 +430,96 @@ def test_seq_regression_stops_subsequent_ingest() -> None:
             transport,
             node_entry=fleet.read_json(fleet_dir / "fleet.json")["nodes"]["build-1"],
         )
-        assert_true("skipped after stop", second.action == "skipped")
+        assert_true("ingested after epoch reset", second.ok and second.action == "ingested")
+        mirror_payload = json.loads(status_path.read_text())
+        assert_true("lower seq accepted", mirror_payload.get("seq") == 1)
+        assert_true("new epoch written", mirror_payload.get("epoch") == "run-2")
+        meta = fleet.read_json(meta_path)
+        assert_true("ingest stop cleared", meta.get("mirror_ingest_stopped") is False)
+        assert_true("stale cleared", meta.get("mirror_stale") is False)
+        assert_true("epoch meta", meta.get("last_mirror_epoch") == "run-2")
+
+
+def test_real_status_writer_epoch_reset_resumes_ingest_after_recreate() -> None:
+    dispatch_id = "acp-codex-watch-real-producer-epoch"
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        fleet_dir = base / "fleet"
+        remote_status = base / "remote-status.json"
+        _fixture_fleet(fleet_dir)
+        status_path = _write_dispatch(fleet_dir, dispatch_id=dispatch_id, seq=5)
+        meta_path = status_path.parent / "meta.json"
+
+        _write_real_status_v1(remote_status, dispatch_id=dispatch_id, seq=5)
+        status_path.write_text(remote_status.read_text(encoding="utf-8"), encoding="utf-8")
+        first_epoch = json.loads(status_path.read_text(encoding="utf-8"))["epoch"]
+
+        _write_real_status_v1(remote_status, dispatch_id=dispatch_id, seq=3)
+        same_epoch_payload = remote_status.read_text(encoding="utf-8")
+        same_epoch = json.loads(same_epoch_payload)["epoch"]
+        assert_true("same writer epoch stable", same_epoch == first_epoch)
+
+        transport = FakeTransport({dispatch_id: same_epoch_payload})
+        first = fleet_watch.ingest_dispatch_mirror(
+            fleet_dir,
+            dispatch_id,
+            fleet.read_json(meta_path),
+            transport,
+            node_entry=fleet.read_json(fleet_dir / "fleet.json")["nodes"]["build-1"],
+        )
+        assert_true("same epoch lower seq rejected", first.action == "seq_regression")
+
+        remote_status.unlink()
+        _write_real_status_v1(remote_status, dispatch_id=dispatch_id, seq=1)
+        recreated_payload = remote_status.read_text(encoding="utf-8")
+        recreated_epoch = json.loads(recreated_payload)["epoch"]
+        assert_true("recreated writer epoch changed", recreated_epoch != first_epoch)
+
+        transport._by_dispatch[dispatch_id] = recreated_payload
+        second = fleet_watch.ingest_dispatch_mirror(
+            fleet_dir,
+            dispatch_id,
+            fleet.read_json(meta_path),
+            transport,
+            node_entry=fleet.read_json(fleet_dir / "fleet.json")["nodes"]["build-1"],
+        )
+        assert_true("recreated lower seq ingested", second.ok and second.action == "ingested")
+        mirror_payload = json.loads(status_path.read_text(encoding="utf-8"))
+        assert_true("lower seq accepted", mirror_payload.get("seq") == 1)
+        assert_true("real epoch written", mirror_payload.get("epoch") == recreated_epoch)
+
+
+def test_successful_direct_read_clears_mirror_ingest_stop() -> None:
+    dispatch_id = "acp-codex-watch-03b"
+    with tempfile.TemporaryDirectory() as td:
+        fleet_dir = Path(td) / "fleet"
+        _fixture_fleet(fleet_dir)
+        status_path = _write_dispatch(fleet_dir, dispatch_id=dispatch_id, seq=2, epoch="run-1")
+        meta_path = status_path.parent / "meta.json"
+        meta = fleet.read_json(meta_path)
+        meta["mirror_stale"] = True
+        meta["mirror_error"] = mirror.ERROR_SEQ_REGRESSION
+        meta["mirror_ingest_stopped"] = True
+        meta["row_state"] = "unknown"
+        fleet._atomic_write_json(meta_path, meta)
+        transport = FakeTransport(
+            {dispatch_id: _status_payload(dispatch_id=dispatch_id, seq=3, epoch="run-1")}
+        )
+
+        row = fleet_watch.ingest_dispatch_mirror(
+            fleet_dir,
+            dispatch_id,
+            fleet.read_json(meta_path),
+            transport,
+            node_entry=fleet.read_json(fleet_dir / "fleet.json")["nodes"]["build-1"],
+        )
+
+        assert_true("direct fetch attempted", len(transport.calls) == 1)
+        assert_true("direct read ingested", row.ok and row.action == "ingested" and row.seq == 3)
+        meta = fleet.read_json(meta_path)
+        assert_true("ingest stop cleared", meta.get("mirror_ingest_stopped") is False)
+        assert_true("stale cleared", meta.get("mirror_stale") is False)
+        assert_true("error cleared", "mirror_error" not in meta)
 
 
 def test_validation_failure_does_not_truncate_mirror() -> None:
@@ -738,7 +861,9 @@ def main() -> None:
     test_single_poll_backfills_launch_unconfirmed_receipt()
     test_ingest_accepts_real_dispatch_status_v1_payload()
     test_seq_regression_preserves_last_good_mirror()
-    test_seq_regression_stops_subsequent_ingest()
+    test_epoch_change_with_lower_seq_resumes_ingest_after_stop()
+    test_real_status_writer_epoch_reset_resumes_ingest_after_recreate()
+    test_successful_direct_read_clears_mirror_ingest_stop()
     test_validation_failure_does_not_truncate_mirror()
     test_sync_fleet_mirrors_batch()
     test_ssh_transport_uses_injected_runner()

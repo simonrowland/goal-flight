@@ -80,6 +80,71 @@ def _tool_update(tool_id: str = "t1", status: str = "running") -> dict:
     }
 
 
+def _read_status(path: Path) -> dict:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def test_write_status_emits_epoch_for_real_status_schemas() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        for schema in ("goalflight.status.v1", "goalflight.acp-run.v1"):
+            status = base / f"{schema}.json"
+            goalflight_liveness.write_status(
+                status,
+                {
+                    "schema": schema,
+                    "seq": 1,
+                    "dispatch_id": f"{schema}-dispatch",
+                    "state": "running",
+                },
+            )
+            payload = _read_status(status)
+            assert isinstance(payload.get("epoch"), str) and payload["epoch"], payload
+
+
+def test_write_status_epoch_stable_until_status_recreation() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        status = Path(td) / "status.json"
+        goalflight_liveness.write_status(
+            status,
+            {
+                "schema": "goalflight.status.v1",
+                "seq": 1,
+                "dispatch_id": "epoch-stability",
+                "state": "running",
+            },
+        )
+        first = _read_status(status)
+
+        goalflight_liveness.write_status(
+            status,
+            {
+                "schema": "goalflight.status.v1",
+                "seq": 2,
+                "dispatch_id": "epoch-stability",
+                "state": "running",
+            },
+        )
+        second = _read_status(status)
+
+        status.unlink()
+        goalflight_liveness.write_status(
+            status,
+            {
+                "schema": "goalflight.status.v1",
+                "seq": 1,
+                "dispatch_id": "epoch-stability",
+                "state": "running",
+            },
+        )
+        recreated = _read_status(status)
+
+    assert second["seq"] == 2, second
+    assert first["epoch"] == second["epoch"], (first, second)
+    assert recreated["seq"] == 1, recreated
+    assert recreated["epoch"] != first["epoch"], (first, recreated)
+
+
 def test_busy_silent_worker_classifies_running_quiet() -> None:
     thresholds = LivenessThresholds(idle_timeout_s=10.0, cpu_epsilon_pct=0.1)
     state = classify_liveness(
@@ -757,6 +822,8 @@ def test_python_watcher_busy_silence_records_running_quiet() -> None:
 
 
 def main() -> None:
+    test_write_status_emits_epoch_for_real_status_schemas()
+    test_write_status_epoch_stable_until_status_recreation()
     test_busy_silent_worker_classifies_running_quiet()
     test_idle_silent_worker_classifies_wedged()
     test_none_cpu_idle_classifies_wedged()

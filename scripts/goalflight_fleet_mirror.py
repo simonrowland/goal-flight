@@ -3,8 +3,8 @@
 
 Mirrors accept the canonical fleet schema ``goalflight.acp-run.v1`` and the
 live dispatch schema ``goalflight.status.v1``. Both are normalized to the fleet
-schema with a strictly increasing ``seq`` when compared against a previously
-observed sequence.
+schema with a strictly increasing ``seq`` inside one epoch when compared
+against a previously observed sequence.
 """
 
 from __future__ import annotations
@@ -24,6 +24,8 @@ ERROR_MISSING_FILE = "missing_file"
 ERROR_PARTIAL_JSON = "partial_json"
 ERROR_SCHEMA_MISMATCH = "schema_mismatch"
 ERROR_SEQ_REGRESSION = "seq_regression"
+LEGACY_EPOCH = 0
+EpochValue = int | str
 
 
 @dataclass(frozen=True)
@@ -32,6 +34,7 @@ class MirrorReadResult:
     error: str | None = None
     payload: dict[str, Any] | None = None
     last_seq: int | None = None
+    epoch: EpochValue = LEGACY_EPOCH
     detail: str | None = None
 
 
@@ -42,6 +45,22 @@ def _coerce_seq(value: object) -> int | None:
         return value
     if isinstance(value, str) and value.strip().isdigit():
         return int(value.strip())
+    return None
+
+
+def _coerce_epoch(value: object) -> EpochValue | None:
+    if value is None:
+        return LEGACY_EPOCH
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped:
+            return stripped
     return None
 
 
@@ -186,6 +205,15 @@ def normalize_status_payload(payload: dict[str, Any]) -> MirrorReadResult:
         normalized["worker_identity"] = dict(identity)
         normalized.setdefault("expected_worker_identity", dict(identity))
 
+    epoch = _coerce_epoch(normalized.get("epoch"))
+    if epoch is None:
+        return MirrorReadResult(
+            ok=False,
+            error=ERROR_SCHEMA_MISMATCH,
+            detail="epoch must be a non-empty string or integer",
+        )
+    normalized["epoch"] = epoch
+
     missing = [field for field in REQUIRED_FIELDS if field not in normalized]
     if missing:
         return MirrorReadResult(
@@ -203,11 +231,16 @@ def normalize_status_payload(payload: dict[str, Any]) -> MirrorReadResult:
         )
     normalized["seq"] = normalized_seq
 
-    return MirrorReadResult(ok=True, payload=normalized, last_seq=normalized_seq)
+    return MirrorReadResult(ok=True, payload=normalized, last_seq=normalized_seq, epoch=epoch)
 
 
-def read_status_mirror(path: Path, *, last_seq: int | None = None) -> MirrorReadResult:
-    """Read one status mirror file with schema + monotonic seq checks."""
+def read_status_mirror(
+    path: Path,
+    *,
+    last_seq: int | None = None,
+    last_epoch: object = LEGACY_EPOCH,
+) -> MirrorReadResult:
+    """Read one status mirror file with schema + same-epoch monotonic seq checks."""
     if not path.exists():
         return MirrorReadResult(
             ok=False,
@@ -253,13 +286,20 @@ def read_status_mirror(path: Path, *, last_seq: int | None = None) -> MirrorRead
 
     assert normalized.payload is not None
     seq = int(normalized.last_seq or 0)
-    if last_seq is not None and seq <= last_seq:
+    baseline_epoch = _coerce_epoch(last_epoch)
+    if baseline_epoch is None:
+        baseline_epoch = LEGACY_EPOCH
+    if last_seq is not None and normalized.epoch == baseline_epoch and seq <= last_seq:
         return MirrorReadResult(
             ok=False,
             error=ERROR_SEQ_REGRESSION,
             payload=normalized.payload,
             last_seq=seq,
-            detail=f"seq {seq} is not strictly greater than last_seq {last_seq}",
+            epoch=normalized.epoch,
+            detail=(
+                f"seq {seq} is not strictly greater than last_seq {last_seq} "
+                f"within epoch {normalized.epoch!r}"
+            ),
         )
 
     return normalized
