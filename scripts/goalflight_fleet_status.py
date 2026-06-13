@@ -30,6 +30,7 @@ PidHint = Literal["alive", "dead", "unknown"]
 TERMINAL_STATES = frozenset(
     {
         "complete",
+        "error",
         "failed",
         "wedged",
         "blocked",

@@ -449,6 +449,10 @@ def test_pending_row_written_before_remote_mutation() -> None:
             pass
         meta = json.loads((fleet_dir / "register" / "dispatches" / dispatch_id / "meta.json").read_text())
         assert_true("pending row remains", meta.get("row_state") == "launch_pending")
+        lock = fleet.load_account_lock(fleet.account_lock_path(fleet_dir, "openai/default"))
+        assert_true("lock active", lock is not None and lock.get("state") == "active")
+        assert_true("meta account key", meta.get("account_key") == "openai/default")
+        assert_true("meta fencing token", meta.get("account_lock_fencing_token") == lock.get("fencing_token"))
         aggregate = fleet.read_json(fleet_dir / "register" / "aggregate.json")
         assert_true("aggregate intent visible", dispatch_id in aggregate.get("active_dispatches", []))
 

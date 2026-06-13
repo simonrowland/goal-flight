@@ -365,7 +365,44 @@ class LockChainResult:
     launch_unconfirmed_error: str | None = None
     fencing_token: str | None = None
     account_key: str | None = None
+    account_lock: dict[str, Any] | None = None
     remote_log: list[dict[str, Any]] = field(default_factory=list)
+
+
+def _account_lock_meta(lock_doc: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(lock_doc, dict):
+        return {}
+    account_key = lock_doc.get("account_key")
+    fencing_token = lock_doc.get("fencing_token")
+    owner_dispatch_id = lock_doc.get("owner_dispatch_id")
+    meta: dict[str, Any] = {}
+    if isinstance(account_key, str) and account_key:
+        meta["account_key"] = account_key
+    if isinstance(fencing_token, str) and fencing_token:
+        meta["account_lock_fencing_token"] = fencing_token
+    if isinstance(owner_dispatch_id, str) and owner_dispatch_id:
+        meta["account_lock_owner_dispatch_id"] = owner_dispatch_id
+    return meta
+
+
+def persist_dispatch_account_lock_link(
+    fleet_dir: Path,
+    preview: DispatchPreview,
+    lock_doc: dict[str, Any],
+) -> None:
+    import goalflight_fleet as fleet
+    import goalflight_fleet_watch as fleet_watch
+
+    meta_path = fleet_watch.dispatch_meta_path(fleet_dir, preview.dispatch_id)
+    try:
+        meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+    except (OSError, json.JSONDecodeError):
+        meta = {}
+    meta.setdefault("dispatch_id", preview.dispatch_id)
+    meta.setdefault("node_id", preview.node_id)
+    meta.setdefault("billing_account", preview.billing_account)
+    meta.update(_account_lock_meta(lock_doc))
+    fleet._atomic_write_json(meta_path, meta)
 
 
 def _parse_launch_receipt(
@@ -438,6 +475,9 @@ def acquire_lock_chain(
             )
             acquired.append("account")
         result.fencing_token = str(lock_doc.get("fencing_token"))
+        result.account_key = str(lock_doc.get("account_key") or preview.billing_account)
+        result.account_lock = dict(lock_doc)
+        persist_dispatch_account_lock_link(fleet_dir, preview, lock_doc)
         if stop_after == "account":
             raise DispatchError("stop_after account")
 
@@ -548,6 +588,7 @@ def register_dispatch_meta(
     launch_unconfirmed: bool = False,
     launch_unconfirmed_error: str | None = None,
     row_state: str | None = None,
+    account_lock: dict[str, Any] | None = None,
 ) -> None:
     import goalflight_fleet as fleet
     import goalflight_fleet_watch as fleet_watch
@@ -581,6 +622,7 @@ def register_dispatch_meta(
         "base_sha": preview.base_sha,
         "worktree_base_sha": preview.base_sha,
     }
+    meta.update(_account_lock_meta(account_lock))
     if row_state:
         meta["row_state"] = row_state
     if launch_unconfirmed_error:
@@ -766,6 +808,7 @@ def execute_dispatch(
         launch_unconfirmed=chain.launch_unconfirmed,
         launch_unconfirmed_error=chain.launch_unconfirmed_error,
         row_state="launch_unconfirmed" if chain.launch_unconfirmed else "launch_receipted",
+        account_lock=chain.account_lock,
     )
     ledger_info = record_dispatch_ledger(
         preview,
@@ -785,6 +828,7 @@ def execute_dispatch(
             launch_unconfirmed=chain.launch_unconfirmed,
             launch_unconfirmed_error=chain.launch_unconfirmed_error,
             row_state="terminal",
+            account_lock=chain.account_lock,
         )
         with ledger.StateLock():
             record = json.loads(Path(ledger_info["path"]).read_text())

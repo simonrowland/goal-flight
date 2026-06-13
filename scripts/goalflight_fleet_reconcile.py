@@ -18,6 +18,16 @@ import goalflight_fleet_status as status
 import goalflight_fleet_status_cli as status_cli
 
 ReconcileAction = Literal["noop", "quarantine", "release_locks", "refresh"]
+PRE_STATUS_FAILED_ROW_STATES = frozenset(
+    {
+        "failed",
+        "launch_failed",
+        "launch_rejected",
+        "dispatcher_rejected",
+        "worker_dead",
+    }
+)
+ACCOUNT_LOCK_META_KEYS = ("account_key", "billing_account", "account_lock_fencing_token")
 
 
 @dataclass(frozen=True)
@@ -95,14 +105,77 @@ def find_account_lock_for_dispatch(fleet_dir: Path, dispatch_id: str) -> dict[st
     return None
 
 
+def account_lock_from_dispatch_meta(fleet_dir: Path, dispatch_id: str, meta: dict[str, Any]) -> dict[str, Any] | None:
+    import goalflight_fleet as fleet
+
+    account_key = meta.get("account_key") or meta.get("billing_account")
+    if not isinstance(account_key, str) or not account_key.strip():
+        return None
+    try:
+        doc = fleet.load_account_lock(fleet.account_lock_path(fleet_dir, account_key.strip()))
+    except Exception:
+        return None
+    if not doc or doc.get("state") != "active":
+        return None
+    if doc.get("owner_dispatch_id") != dispatch_id:
+        return None
+    meta_token = meta.get("account_lock_fencing_token")
+    if isinstance(meta_token, str) and meta_token and doc.get("fencing_token") != meta_token:
+        return None
+    return doc
+
+
+def resolve_account_lock_for_dispatch(
+    fleet_dir: Path,
+    dispatch_id: str,
+    meta: dict[str, Any],
+) -> dict[str, Any] | None:
+    return account_lock_from_dispatch_meta(fleet_dir, dispatch_id, meta) or find_account_lock_for_dispatch(
+        fleet_dir,
+        dispatch_id,
+    )
+
+
+def _merge_status_lock_meta(meta: dict[str, Any], mirror_result: mirror.MirrorReadResult | None) -> None:
+    payload = mirror_result.payload if mirror_result and mirror_result.ok else None
+    if not isinstance(payload, dict):
+        return
+    for key in ACCOUNT_LOCK_META_KEYS:
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip() and not meta.get(key):
+            meta[key] = value.strip()
+
+
 def account_key_for_dispatch(fleet_dir: Path, dispatch_id: str, meta: dict[str, Any]) -> str | None:
     explicit = meta.get("billing_account") or meta.get("account_key")
     if isinstance(explicit, str) and explicit.strip():
         return explicit.strip()
-    lock = find_account_lock_for_dispatch(fleet_dir, dispatch_id)
+    lock = resolve_account_lock_for_dispatch(fleet_dir, dispatch_id, meta)
     if lock and lock.get("account_key"):
         return str(lock["account_key"])
     return None
+
+
+def _pre_status_release_confirmed(meta: dict[str, Any], mirror_result: mirror.MirrorReadResult | None) -> bool:
+    if mirror_result is None or mirror_result.ok or mirror_result.error != mirror.ERROR_MISSING_FILE:
+        return True
+    if meta.get("lease_active") is not True:
+        return True
+    if meta.get("pid_hint") != "dead":
+        return False
+
+    row_state = str(meta.get("row_state") or "")
+    if row_state in PRE_STATUS_FAILED_ROW_STATES:
+        return True
+    if meta.get("launch_unconfirmed") is not True:
+        return False
+
+    try:
+        import goalflight_fleet_watch as fleet_watch
+
+        return bool(fleet_watch._launch_unconfirmed_grace_elapsed(meta))
+    except Exception:
+        return False
 
 
 def build_dispatch_context(
@@ -133,15 +206,17 @@ def build_dispatch_context(
 
     status_path = fleet_watch.dispatch_status_path(fleet_dir, dispatch_id)
     mirror_result = mirror.read_status_mirror(status_path)
+    _merge_status_lock_meta(meta, mirror_result)
     classification = status_cli._classify_dispatch_row(meta, mirror_result)
-    lock = find_account_lock_for_dispatch(fleet_dir, dispatch_id)
+    lock = resolve_account_lock_for_dispatch(fleet_dir, dispatch_id, meta)
     if lock is not None:
         meta.setdefault("lease_active", True)
+    may_release = status.may_release_locks(classification) and _pre_status_release_confirmed(meta, mirror_result)
     return DispatchReconcileContext(
         dispatch_id=dispatch_id,
         meta=meta,
         classification=classification,
-        may_release=status.may_release_locks(classification),
+        may_release=may_release,
         ssh_reachable=bool(meta.get("ssh_reachable", True)),
         account_lock=lock,
         mirror_result=mirror_result,
@@ -216,8 +291,10 @@ def release_dispatch_locks(
         return False, None
     if not ctx.may_release:
         return False, None
-    lock = ctx.account_lock or find_account_lock_for_dispatch(fleet_dir, ctx.dispatch_id)
+    lock = ctx.account_lock or resolve_account_lock_for_dispatch(fleet_dir, ctx.dispatch_id, ctx.meta)
     if not lock:
+        if ctx.meta.get("lease_active") is True:
+            return False, None
         _remove_active_dispatch(fleet_dir, ctx.dispatch_id)
         _mark_dispatch_released(fleet_dir, ctx.dispatch_id, reason=reason)
         return True, None
