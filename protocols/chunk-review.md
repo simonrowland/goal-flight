@@ -27,6 +27,7 @@ rejected by classifiers and forbidden in adapter manifests
 Canonical invocation (worker-internal or controller-side, same shape):
 
 ```bash
+mkdir -p docs-private/reviews/<date>-<slug>   # the redirects below do NOT create it
 codex exec --sandbox read-only -c approval_policy=never \
   -c 'model_reasoning_effort="xhigh"' \
   --enable web_search_cached \
@@ -42,6 +43,18 @@ process inherits the parent shell's stdin and blocks waiting for EOF — the
 observable symptom is 0 bytes of stdout for hours with near-zero CPU. Every
 bash-tail review invocation MUST redirect stdin from `/dev/null` (or pipe the
 prompt into stdin instead of passing it positionally).
+
+**Critical: create the review dir first.** The `>` / `2>` redirects above — and
+any `cat > <dir>/brief.md <<EOF` heredoc you write to scaffold a review prompt —
+do **not** create parent directories (`cat` and shell redirects never `mkdir`).
+A missing `docs-private/reviews/<date>-<slug>/` makes the redirect fail with a
+bare exit 1 that is easy to miss mid-script: the review then produces no output,
+or dispatches with an empty/absent brief, **silently**. `mkdir -p` the dir first
+(as shown), or write briefs/outputs with the path-creating **Write tool** instead
+of `cat >`. Verify the brief is a non-empty file (`test -s <brief>`) before
+launching the reviewer — never confirm it via `git status` (findings/review dirs
+are under gitignored `docs-private/`, so git is blind to them). (Observed: pm2 F2
++ Chunk B review briefs both failed silently this way, 2026-06-13.)
 
 **`--enable web_search_cached` note.** As of codex v0.131 stderr emits a
 deprecation warning about a `[features].web_search_cached` config-toml key
