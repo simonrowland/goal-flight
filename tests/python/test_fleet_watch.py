@@ -204,13 +204,16 @@ def _write_dispatch(
     dispatch_id: str = "acp-codex-watch-01",
     seq: int = 3,
     epoch: object | None = None,
+    worker_pid: int | None = None,
 ) -> Path:
     dispatch_dir = fleet_dir / "register" / "dispatches" / dispatch_id
     dispatch_dir.mkdir(parents=True, exist_ok=True)
     status_path = dispatch_dir / "status.json"
     remote_status_path = f"/home/dev/.goal-flight/dispatches/{dispatch_id}/status.json"
     worktree_path = f"/home/dev/.goal-flight/worktrees/{dispatch_id}"
-    status_path.write_text(_status_payload(dispatch_id=dispatch_id, seq=seq, epoch=epoch) + "\n")
+    status_path.write_text(
+        _status_payload(dispatch_id=dispatch_id, seq=seq, epoch=epoch, worker_pid=worker_pid) + "\n"
+    )
     fleet._atomic_write_json(
         dispatch_dir / "meta.json",
         {
@@ -467,6 +470,114 @@ def test_seq_regression_preserves_last_good_mirror() -> None:
         assert_true("meta error", meta.get("mirror_error") == mirror.ERROR_SEQ_REGRESSION)
         assert_true("row unknown", meta.get("row_state") == "unknown")
         assert_true("ingest stopped", meta.get("mirror_ingest_stopped") is True)
+
+
+def test_validate_remote_content_rejects_same_pid_legacy_replay_with_newer_timestamp() -> None:
+    dispatch_id = "acp-codex-watch-legacy-same-pid"
+    baseline = {
+        "schema": mirror.STATUS_MIRROR_SCHEMA,
+        "seq": 2030,
+        "dispatch_id": dispatch_id,
+        "state": "running",
+        "worker_pid": 4242,
+        "updated_at": 1780000000,
+    }
+    replay = {
+        "schema": mirror.STATUS_MIRROR_SCHEMA,
+        "events_seen": 5,
+        "dispatch_id": dispatch_id,
+        "state": "running",
+        "worker_pid": 4242,
+        "updated_at": 1780000060,
+    }
+
+    first = fleet_watch.validate_remote_content(json.dumps(baseline), last_seq=None)
+    rejected = fleet_watch.validate_remote_content(
+        json.dumps(replay),
+        last_seq=first.last_seq,
+        last_epoch=first.epoch,
+        last_lineage_identity=first.lineage_identity,
+    )
+
+    assert_true("baseline ok", first.ok is True)
+    assert_true("baseline identity", first.lineage_identity == {"worker_pid": 4242})
+    assert_true("same pid replay rejected", rejected.ok is False)
+    assert_true("error code", rejected.error == mirror.ERROR_SEQ_REGRESSION)
+    assert_true("lower replay seq", rejected.last_seq == 530)
+
+
+def test_validate_remote_content_accepts_legacy_reset_with_cold_cache_and_new_pid() -> None:
+    dispatch_id = "acp-codex-watch-legacy-cold-cache"
+    baseline = {
+        "schema": mirror.STATUS_MIRROR_SCHEMA,
+        "seq": 2030,
+        "dispatch_id": dispatch_id,
+        "state": "running",
+        "worker_pid": 1111,
+        "updated_at": 1780000000,
+    }
+    reset = {
+        "schema": mirror.STATUS_MIRROR_SCHEMA,
+        "events_seen": 0,
+        "dispatch_id": dispatch_id,
+        "state": "running",
+        "worker_pid": 2222,
+        "updated_at": 1780000060,
+    }
+
+    first = fleet_watch.validate_remote_content(json.dumps(baseline), last_seq=None)
+    baseline_cache = getattr(mirror, "_BASELINES_BY_DISPATCH_ID", None)
+    if isinstance(baseline_cache, dict):
+        baseline_cache.clear()
+    resumed = fleet_watch.validate_remote_content(
+        json.dumps(reset),
+        last_seq=first.last_seq,
+        last_epoch=first.epoch,
+        last_lineage_identity=first.lineage_identity,
+    )
+
+    assert_true("baseline ok", first.ok is True)
+    assert_true("reset accepted", resumed.ok is True)
+    assert_true("reset seq", resumed.last_seq == 30)
+    assert_true("reset identity", resumed.lineage_identity == {"worker_pid": 2222})
+
+
+def test_legacy_pid_change_with_lower_seq_resumes_ingest_after_stop() -> None:
+    dispatch_id = "acp-codex-watch-legacy-pid-reset"
+    with tempfile.TemporaryDirectory() as td:
+        fleet_dir = Path(td) / "fleet"
+        _fixture_fleet(fleet_dir)
+        status_path = _write_dispatch(fleet_dir, dispatch_id=dispatch_id, seq=2030, worker_pid=1111)
+        meta_path = status_path.parent / "meta.json"
+        meta = fleet.read_json(meta_path)
+        meta["mirror_ingest_stopped"] = True
+        fleet._atomic_write_json(meta_path, meta)
+        reset = {
+            "schema": mirror.STATUS_MIRROR_SCHEMA,
+            "events_seen": 0,
+            "dispatch_id": dispatch_id,
+            "state": "running",
+            "worker_pid": 2222,
+            "updated_at": 1780000060,
+        }
+        transport = FakeTransport({dispatch_id: json.dumps(reset)})
+
+        row = fleet_watch.ingest_dispatch_mirror(
+            fleet_dir,
+            dispatch_id,
+            fleet.read_json(meta_path),
+            transport,
+            node_entry=fleet.read_json(fleet_dir / "fleet.json")["nodes"]["build-1"],
+        )
+
+        assert_true("ingested after pid reset", row.ok and row.action == "ingested")
+        mirror_payload = json.loads(status_path.read_text())
+        assert_true("lower seq accepted", mirror_payload.get("seq") == 30)
+        assert_true("new pid written", mirror_payload.get("worker_pid") == 2222)
+        meta = fleet.read_json(meta_path)
+        assert_true("ingest stop cleared", meta.get("mirror_ingest_stopped") is False)
+        assert_true("stale cleared", meta.get("mirror_stale") is False)
+        assert_true("lineage meta", meta.get("last_mirror_lineage_identity") == {"worker_pid": 2222})
 
 
 def test_epoch_change_with_lower_seq_resumes_ingest_after_stop() -> None:
@@ -1174,6 +1285,9 @@ def main() -> None:
     test_single_poll_backfills_launch_unconfirmed_receipt()
     test_ingest_accepts_real_dispatch_status_v1_payload()
     test_seq_regression_preserves_last_good_mirror()
+    test_validate_remote_content_rejects_same_pid_legacy_replay_with_newer_timestamp()
+    test_validate_remote_content_accepts_legacy_reset_with_cold_cache_and_new_pid()
+    test_legacy_pid_change_with_lower_seq_resumes_ingest_after_stop()
     test_epoch_change_with_lower_seq_resumes_ingest_after_stop()
     test_real_status_writer_epoch_reset_resumes_ingest_after_recreate()
     test_successful_direct_read_clears_mirror_ingest_stop()
@@ -1195,7 +1309,7 @@ def main() -> None:
     test_until_terminal_unconfirmed_dead_pid_before_grace_stays_unconfirmed()
     test_until_terminal_unconfirmed_dead_pid_after_grace_fails_and_releases_lock()
     test_until_terminal_fetch_failure_retries()
-    print("OK: 27 fleet watch tests pass")
+    print("OK: 30 fleet watch tests pass")
 
 
 if __name__ == "__main__":

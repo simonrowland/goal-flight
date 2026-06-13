@@ -442,13 +442,13 @@ def _read_existing_status_epoch(path: Path) -> str | None:
 
 def _status_epoch_for(path: Path) -> str:
     key = _status_epoch_key(path)
-    cached = _STATUS_EPOCH_CACHE.get(key)
-    if cached is not None and path.exists():
-        return cached
     existing = _read_existing_status_epoch(path)
     if existing is not None:
         _STATUS_EPOCH_CACHE[key] = existing
         return existing
+    cached = _STATUS_EPOCH_CACHE.get(key)
+    if cached is not None and path.exists():
+        return cached
     epoch = f"status-{uuid.uuid4().hex}"
     _STATUS_EPOCH_CACHE[key] = epoch
     return epoch

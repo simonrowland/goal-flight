@@ -38,6 +38,7 @@ class MirrorReadResult:
     last_seq: int | None = None
     epoch: EpochValue = LEGACY_EPOCH
     detail: str | None = None
+    lineage_identity: dict[str, Any] | None = None
 
 
 def _coerce_seq(value: object) -> int | None:
@@ -95,11 +96,104 @@ def _synthesized_seq(payload: dict[str, Any]) -> int | None:
         return seq
     events_seen = _coerce_seq(payload.get("events_seen"))
     if events_seen is not None:
-        return events_seen
+        return events_seen * 100 + _state_seq_rank(payload.get("state"))
     updated_at = _coerce_updated_at(payload.get("updated_at"))
     if updated_at is not None:
         return updated_at * 100 + _state_seq_rank(payload.get("state"))
     return None
+
+
+def _first_non_empty_string(values: list[object]) -> str | None:
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _lineage_identity_for(payload: dict[str, Any]) -> dict[str, Any] | None:
+    worker_identity = payload.get("worker_identity")
+    if not isinstance(worker_identity, dict):
+        worker_identity = {}
+    expected_identity = payload.get("expected_worker_identity")
+    if not isinstance(expected_identity, dict):
+        expected_identity = {}
+
+    pid = _coerce_seq(payload.get("worker_pid"))
+    if pid is None:
+        pid = _coerce_seq(payload.get("pid"))
+    if pid is None:
+        pid = _coerce_seq(worker_identity.get("pid"))
+    if pid is None:
+        pid = _coerce_seq(expected_identity.get("pid"))
+    if pid is None:
+        return None
+
+    identity: dict[str, Any] = {"worker_pid": pid}
+    started_at = _first_non_empty_string(
+        [
+            payload.get("worker_start_time"),
+            payload.get("worker_lstart"),
+            payload.get("process_start_time"),
+            payload.get("lstart"),
+            worker_identity.get("lstart"),
+            worker_identity.get("start_time"),
+            worker_identity.get("started_at"),
+            expected_identity.get("lstart"),
+            expected_identity.get("start_time"),
+            expected_identity.get("started_at"),
+        ]
+    )
+    if started_at is not None:
+        identity["worker_start_time"] = started_at
+    return identity
+
+
+def _normalize_lineage_identity(value: object) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    return _lineage_identity_for(value)
+
+
+def _lineage_identity_changed(
+    incoming: dict[str, Any] | None,
+    previous: dict[str, Any] | None,
+) -> bool:
+    if incoming is None or previous is None:
+        return False
+    incoming_pid = _coerce_seq(incoming.get("worker_pid"))
+    previous_pid = _coerce_seq(previous.get("worker_pid"))
+    if incoming_pid is None or previous_pid is None:
+        return False
+    if incoming_pid != previous_pid:
+        return True
+    incoming_start = _first_non_empty_string([incoming.get("worker_start_time")])
+    previous_start = _first_non_empty_string([previous.get("worker_start_time")])
+    return incoming_start is not None and previous_start is not None and incoming_start != previous_start
+
+
+def _legacy_lineage_reset_allowed(
+    payload: dict[str, Any],
+    *,
+    raw_had_epoch: bool,
+    seq: int,
+    last_seq: int,
+    epoch: EpochValue,
+    baseline_epoch: EpochValue,
+    lineage_identity: dict[str, Any] | None,
+    last_lineage_identity: object,
+) -> bool:
+    """Accept legacy status-file recreation while still rejecting stale replays.
+
+    Pre-epoch workers cannot mint a new epoch after status-file recreation, so a
+    reboot can reset ``events_seen`` and produce a lower same-epoch seq forever.
+    Treat that as a new lineage only when the incoming legacy record has no
+    epoch, targets the same epoch-0 dispatch, has a lower seq, and carries a
+    birth signal that differs from the durable last-seen lineage identity.
+    Ambiguous or missing identity evidence fails closed as a stale replay.
+    """
+    if raw_had_epoch or epoch != LEGACY_EPOCH or baseline_epoch != LEGACY_EPOCH or seq >= last_seq:
+        return False
+    return _lineage_identity_changed(lineage_identity, _normalize_lineage_identity(last_lineage_identity))
 
 
 def _normalize_dispatch_state(state: object) -> str | None:
@@ -191,7 +285,13 @@ def normalize_status_payload(payload: dict[str, Any]) -> MirrorReadResult:
         )
     normalized["seq"] = normalized_seq
 
-    return MirrorReadResult(ok=True, payload=normalized, last_seq=normalized_seq, epoch=epoch)
+    return MirrorReadResult(
+        ok=True,
+        payload=normalized,
+        last_seq=normalized_seq,
+        epoch=epoch,
+        lineage_identity=_lineage_identity_for(normalized),
+    )
 
 
 def read_status_mirror(
@@ -199,6 +299,7 @@ def read_status_mirror(
     *,
     last_seq: int | None = None,
     last_epoch: object = LEGACY_EPOCH,
+    last_lineage_identity: object = None,
 ) -> MirrorReadResult:
     """Read one status mirror file with schema + same-epoch monotonic seq checks."""
     if not path.exists():
@@ -240,22 +341,43 @@ def read_status_mirror(
             detail="mirror root must be a JSON object",
         )
 
+    raw_had_epoch = "epoch" in payload
     normalized = normalize_status_payload(payload)
     if not normalized.ok:
         return normalized
 
     assert normalized.payload is not None
     seq = int(normalized.last_seq or 0)
+    lineage_identity = normalized.lineage_identity
     baseline_epoch = _coerce_epoch(last_epoch)
     if baseline_epoch is None:
         baseline_epoch = LEGACY_EPOCH
     if last_seq is not None and normalized.epoch == baseline_epoch and seq <= last_seq:
+        if _legacy_lineage_reset_allowed(
+            normalized.payload,
+            raw_had_epoch=raw_had_epoch,
+            seq=seq,
+            last_seq=last_seq,
+            epoch=normalized.epoch,
+            baseline_epoch=baseline_epoch,
+            lineage_identity=lineage_identity,
+            last_lineage_identity=last_lineage_identity,
+        ):
+            return MirrorReadResult(
+                ok=True,
+                payload=normalized.payload,
+                last_seq=seq,
+                epoch=normalized.epoch,
+                detail="legacy epoch-0 lineage reset accepted because worker birth identity changed",
+                lineage_identity=lineage_identity,
+            )
         return MirrorReadResult(
             ok=False,
             error=ERROR_SEQ_REGRESSION,
             payload=normalized.payload,
             last_seq=seq,
             epoch=normalized.epoch,
+            lineage_identity=lineage_identity,
             detail=(
                 f"seq {seq} is not strictly greater than last_seq {last_seq} "
                 f"within epoch {normalized.epoch!r}"

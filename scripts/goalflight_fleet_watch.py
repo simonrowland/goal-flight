@@ -196,13 +196,19 @@ def validate_remote_content(
     *,
     last_seq: int | None,
     last_epoch: object = mirror.LEGACY_EPOCH,
+    last_lineage_identity: object = None,
 ) -> mirror.MirrorReadResult:
     """Validate fetched JSON without mutating the orchestrator mirror path."""
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
         handle.write(raw)
         staging = Path(handle.name)
     try:
-        return mirror.read_status_mirror(staging, last_seq=last_seq, last_epoch=last_epoch)
+        return mirror.read_status_mirror(
+            staging,
+            last_seq=last_seq,
+            last_epoch=last_epoch,
+            last_lineage_identity=last_lineage_identity,
+        )
     finally:
         staging.unlink(missing_ok=True)
 
@@ -242,10 +248,20 @@ def _mark_meta_validation_error(meta_path: Path, *, error: str, detail: str | No
     _atomic_write_json(meta_path, meta)
 
 
-def _mark_meta_ingested(meta_path: Path, *, seq: int, epoch: object = mirror.LEGACY_EPOCH) -> None:
+def _mark_meta_ingested(
+    meta_path: Path,
+    *,
+    seq: int,
+    epoch: object = mirror.LEGACY_EPOCH,
+    lineage_identity: dict[str, Any] | None = None,
+) -> None:
     meta = _read_json_object(meta_path)
     meta["last_mirror_seq"] = seq
     meta["last_mirror_epoch"] = epoch
+    if lineage_identity is None:
+        meta.pop("last_mirror_lineage_identity", None)
+    else:
+        meta["last_mirror_lineage_identity"] = lineage_identity
     meta["mirror_stale"] = False
     meta.pop("mirror_error", None)
     meta.pop("mirror_error_detail", None)
@@ -568,6 +584,11 @@ def ingest_dispatch_mirror(
     last_mirror = mirror.read_status_mirror(status_path)
     last_seq = last_mirror.last_seq if last_mirror.ok else None
     last_epoch = last_mirror.epoch if last_mirror.ok else mirror.LEGACY_EPOCH
+    last_lineage_identity = (
+        last_mirror.lineage_identity
+        if last_mirror.ok
+        else meta.get("last_mirror_lineage_identity")
+    )
     prepared_content, dispatch_id_error = _prepare_remote_content_for_dispatch(
         fetch.content,
         dispatch_id=dispatch_id,
@@ -586,7 +607,12 @@ def ingest_dispatch_mirror(
             seq=last_seq,
         )
     assert prepared_content is not None
-    validated = validate_remote_content(prepared_content, last_seq=last_seq, last_epoch=last_epoch)
+    validated = validate_remote_content(
+        prepared_content,
+        last_seq=last_seq,
+        last_epoch=last_epoch,
+        last_lineage_identity=last_lineage_identity,
+    )
 
     if not validated.ok and validated.error == mirror.ERROR_SEQ_REGRESSION:
         if validated.last_seq == last_seq and validated.epoch == last_epoch:
@@ -595,6 +621,7 @@ def ingest_dispatch_mirror(
                     meta_path,
                     seq=int(validated.last_seq or 0),
                     epoch=validated.epoch,
+                    lineage_identity=validated.lineage_identity,
                 )
             return DispatchWatchResult(
                 dispatch_id,
@@ -628,6 +655,7 @@ def ingest_dispatch_mirror(
         meta_path,
         seq=int(validated.last_seq or validated.payload["seq"]),
         epoch=validated.epoch,
+        lineage_identity=validated.lineage_identity,
     )
     if meta.get("launch_unconfirmed") is True:
         receipt = _receipt_from_status_payload(
