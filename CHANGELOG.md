@@ -4,10 +4,89 @@ Notable changes to the goal-flight Claude Code skill. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are
 incremented when meaningful skill behaviour changes.
 
-## [1.0.6] — 2026-06-10
+## [1.0.6] — 2026-06-13
+
+Remote-worker (fleet) hardening: the SSH/ACP fleet path is now live-proven
+end-to-end and hardened against the reliability gaps a live-smoke run plus a
+multi-engine audit surfaced. Also folds in worker-engine and review-discipline
+fixes accumulated since 1.0.5.
+
+### Added
+
+- **Start-of-pipe tool-smoke canary.** Before committing a goal-loop to a
+  `(node, agent)`, a cheap one-turn canary exercises a real tool round-trip in
+  the target worktree; a red canary refuses the dispatch with a teaching
+  diagnosis. Catches a worker whose tools are broken in that environment (e.g. a
+  repeated `tool_output_error`) before it burns a goal-loop. Paired with
+  worker-side runaway caps (tool-error-loop + event ceiling) so the failure mode
+  is guarded at both ends of the pipe.
+- **Dirty-worktree salvage.** A worker that dies (pid gone) with uncommitted
+  changes now becomes `salvage_needed` and holds its account lock, instead of a
+  silent terminal that strands the work and frees the lock. `salvage
+  --dispatch-id` records the lock identity in the manifest and `salvage-complete`
+  releases exactly that fenced lock; salvage-held locks are exempt from the TTL
+  reaper.
+- **Worker agent stderr capture.** ACP worker stderr (including the agent
+  server's own errors, e.g. a `-32603` from a revoked upstream token) is captured
+  to the dispatch dir for file-only diagnosis, no live SSH dig required.
+- **Epoch-aware status mirror.** Status records carry a per-lineage epoch, so
+  mirror ingest survives a node reboot / status-file recreation (remote `seq`
+  resets) instead of wedging permanently; a recovery relaunch mints a fresh
+  epoch.
 
 ### Fixed
 
+- **Fleet account-lock lifecycle.** A terminal dispatch now releases its account
+  lock (it could previously be stranded with `account_key=null`, stalling the
+  account); the worker-final states `tool_timeout`, `stalled`,
+  `remote_turn_silence`, and `failed_worktree` are recognized terminal so they
+  release too (centralized in a shared state vocabulary). A dirty-dead worker's
+  lock is held until an explicit post-salvage release.
+- **Auth probe validation.** The dispatch auth probe performs an authenticated
+  check for codex, openai, and anthropic accounts (codex/openai fail closed on a
+  revoked token instead of greening on logged-in *presence*; anthropic uses
+  `claude auth status --json`'s `loggedIn`) and requires current account↔node
+  link membership before dispatch. A transient or empty probe is *inconclusive*
+  (and re-probes) rather than a false red, a logged-in account whose org/email
+  contains a denial keyword is not false-redded, and a legacy `fleet.json` no
+  longer hard-blocks dispatch after upgrade. grok and cursor remain presence checks.
+- **Mirror ingest survives legacy workers and reboots.** Beyond the epoch path
+  above, a legacy (pre-epoch) worker that recreates its status file after a reboot
+  no longer wedges ingest permanently — the consumer resets its baseline on a
+  `worker_pid` birth-signal change (persisted durably so a watcher restart still
+  recovers), and a `starting`→`running` transition is no longer dropped by the
+  seq gate.
+- **Per-node `state_dir` ingest.** A node configured with a non-default
+  `state_dir` no longer has its own status path rejected by the read confinement
+  (which had silently failed ingest for that node). Mirror ingest also rejects a
+  payload whose `dispatch_id` does not match the expected dispatch.
+- **Dirty self-reported-terminal salvage.** A worker that self-reports a failure
+  terminal with a dirty worktree now goes through the same `salvage_needed`
+  lock-hold gate as a pid-dead worker, instead of releasing the lock and stranding
+  the work.
+- **Recovery-lock reclaim.** A launcher killed mid-recovery no longer strands
+  `launch_recovery.lock` and permanently blocks recovery of that dispatch id; the
+  lock records owner pid + start-time and is reclaimed when the owner is dead,
+  pid-reused, or TTL-expired (a live owner still blocks).
+- **Duplicate-launch race.** An atomic node-local launch marker
+  (`O_CREAT|O_EXCL`, written before the prompt and `Popen`) prevents an SSH-drop
+  recovery retry from double-spawning a worker for the same dispatch id.
+- **ACP venv re-exec.** The venv re-exec guard no longer resolves symlinks (the
+  managed-venv python symlinks to the system interpreter); resolving them had
+  collapsed the comparison and broken *all* remote ACP dispatch (`SDK missing`).
+- **Mirror schema + idle-safe updates.** The fleet mirror accepts the real remote
+  status schema written by ACP workers; the worker-CLI update gate skips busy
+  workers so updating codex/grok/claude never crashes an in-flight dispatch.
+- **SC-13 sweep follow-up.** Gated a missed ACP pid-ledger delay test hook
+  through the shared test-mode helper so a stray env var cannot inject a sleep
+  into a production launch.
+- **Chip suppression during runs.** The context-discipline PreToolUse hook now
+  blocks `spawn_task` chips while a goal-flight run is active — reaching even
+  Agent/Workflow subagents that never load the skill — and routes the finding to
+  the goal-queue Backlog instead (chips strand git worktrees). It gates on the
+  authoritative session-status verdict (stale/no-queue/terminal states allow, so
+  it can't over-block), fails open on any error, and honors a
+  `GOALFLIGHT_CHIP_OK=1` override.
 - **grok worker dispatch no longer passes `--permission-mode`.** grok CLI 0.2.39
   regressed so that in single-turn `--prompt-file` mode, **every** `--permission-mode`
   value stops the file-write tool from writing — none produce the file; only
