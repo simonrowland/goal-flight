@@ -63,6 +63,15 @@ class RemoteIdentityResult:
 
 
 @dataclass(frozen=True)
+class WorktreePorcelainResult:
+    ok: bool
+    dirty: bool = False
+    porcelain: str | None = None
+    worktree_path: str | None = None
+    error: str | None = None
+
+
+@dataclass(frozen=True)
 class DispatchWatchResult:
     dispatch_id: str
     ok: bool
@@ -741,6 +750,91 @@ class SshFleetWatchTransport:
             identity=payload.get("identity") if isinstance(payload.get("identity"), dict) else None,
         )
 
+    def check_worktree_porcelain(
+        self,
+        *,
+        node_id: str,
+        node_entry: dict[str, Any] | None,
+        worktree_path: str,
+    ) -> WorktreePorcelainResult:
+        import goalflight_fleet_ssh as fleet_ssh
+
+        if node_entry is None:
+            return WorktreePorcelainResult(
+                ok=False,
+                worktree_path=worktree_path,
+                error=f"unknown fleet node: {node_id}",
+            )
+        try:
+            repo_root = str(node_entry.get("repo_root") or worktree_path)
+            allowed_roots = _remote_allowed_roots(node_entry)
+            host = fleet_ssh.host_from_node_entry(node_id, node_entry)
+            remote = fleet_ssh.build_remote_command(
+                "git_status_porcelain",
+                repo_root=repo_root,
+                worktree_path=worktree_path,
+                allowed_roots=allowed_roots,
+            )
+            ssh_argv = fleet_ssh.build_ssh_command(host, remote, command_class="git_status_porcelain")
+            with fleet_ssh.node_ssh_lock(node_id, fleet_dir=self._fleet_dir):
+                run = fleet_ssh.run_ssh(ssh_argv, runner=self._runner, dry_run=self._dry_run)
+        except fleet_ssh.SshAllowlistError as exc:
+            return WorktreePorcelainResult(ok=False, worktree_path=worktree_path, error=str(exc))
+
+        if not run.get("ok"):
+            stderr = (run.get("stderr") or "").strip()
+            return WorktreePorcelainResult(
+                ok=False,
+                worktree_path=worktree_path,
+                error=stderr or f"ssh exit {run.get('exit_code')}",
+            )
+        stdout = str(run.get("stdout") or "")
+        porcelain = stdout.strip()
+        return WorktreePorcelainResult(
+            ok=True,
+            dirty=bool(porcelain),
+            porcelain=porcelain or None,
+            worktree_path=worktree_path,
+        )
+
+
+def _remote_allowed_roots(node_entry: dict[str, Any]) -> list[str]:
+    repo_root = str(node_entry.get("repo_root") or "").strip()
+    state_dir = str(node_entry.get("state_dir") or "").strip()
+    return [
+        root
+        for root in (
+            repo_root,
+            state_dir,
+            f"{state_dir.rstrip('/')}/worktrees" if state_dir else "",
+        )
+        if root
+    ]
+
+
+def _declared_worktree_path(meta: dict[str, Any]) -> str | None:
+    worktree_path = meta.get("worktree_path")
+    if isinstance(worktree_path, str) and worktree_path.strip():
+        return worktree_path.strip()
+    return None
+
+
+def _worktree_porcelain_check(
+    transport: FleetWatchTransport,
+    *,
+    node_id: str,
+    node_entry: dict[str, Any] | None,
+    worktree_path: str,
+) -> WorktreePorcelainResult:
+    checker = getattr(transport, "check_worktree_porcelain", None)
+    if checker is None:
+        return WorktreePorcelainResult(
+            ok=False,
+            worktree_path=worktree_path,
+            error="transport has no porcelain checker",
+        )
+    return checker(node_id=node_id, node_entry=node_entry, worktree_path=worktree_path)
+
 
 def _read_local_mirror(fleet_dir: Path, dispatch_id: str) -> mirror.MirrorReadResult:
     return mirror.read_status_mirror(dispatch_status_path(fleet_dir, dispatch_id))
@@ -782,6 +876,54 @@ def _write_worker_dead_mirror(
     meta["pid_hint"] = "dead"
     meta["row_state"] = "worker_dead"
     meta["worker_dead_reason"] = "remote_launch_pid_dead"
+    if identity_result.identity is not None:
+        meta["remote_pid_last_identity"] = identity_result.identity
+    _atomic_write_json(meta_path, meta)
+
+
+def _write_salvage_needed_mirror(
+    fleet_dir: Path,
+    dispatch_id: str,
+    *,
+    prior: mirror.MirrorReadResult,
+    identity_result: RemoteIdentityResult,
+    worktree_path: str | None,
+    porcelain_result: WorktreePorcelainResult,
+    reason: str,
+) -> None:
+    seq = int(prior.last_seq or 0) + 1
+    payload: dict[str, Any] = {
+        "schema": mirror.STATUS_MIRROR_SCHEMA,
+        "seq": seq,
+        "dispatch_id": dispatch_id,
+        "state": "salvage_needed",
+        "reason": reason,
+        "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    if worktree_path:
+        payload["worktree_path"] = worktree_path
+    if porcelain_result.porcelain:
+        payload["porcelain"] = porcelain_result.porcelain
+    if porcelain_result.error:
+        payload["porcelain_error"] = porcelain_result.error
+    if prior.ok and prior.payload:
+        for key in ("agent", "tail_path", "worker_pid"):
+            if key in prior.payload:
+                payload[key] = prior.payload[key]
+    write_status(dispatch_status_path(fleet_dir, dispatch_id), payload)
+    meta_path = dispatch_meta_path(fleet_dir, dispatch_id)
+    meta = _read_json_object(meta_path)
+    meta["last_mirror_seq"] = seq
+    meta["mirror_stale"] = False
+    meta["pid_hint"] = "dead"
+    meta["row_state"] = "salvage_needed"
+    meta["salvage_reason"] = reason
+    if worktree_path:
+        meta["worktree_path"] = worktree_path
+    if porcelain_result.porcelain:
+        meta["worktree_porcelain"] = porcelain_result.porcelain
+    if porcelain_result.error:
+        meta["worktree_porcelain_error"] = porcelain_result.error
     if identity_result.identity is not None:
         meta["remote_pid_last_identity"] = identity_result.identity
     _atomic_write_json(meta_path, meta)
@@ -873,6 +1015,61 @@ def watch_until_terminal(
             if identity.ok and not identity.alive:
                 latest = _read_local_mirror(fleet_dir, dispatch_id)
                 if not fleet_status.is_terminal_state(_mirror_state(latest)):
+                    worktree_path = _declared_worktree_path(meta)
+                    if worktree_path is None:
+                        porcelain = WorktreePorcelainResult(
+                            ok=False,
+                            error="dispatch meta missing declared worktree_path",
+                        )
+                        _write_salvage_needed_mirror(
+                            fleet_dir,
+                            dispatch_id,
+                            prior=latest,
+                            identity_result=identity,
+                            worktree_path=None,
+                            porcelain_result=porcelain,
+                            reason="remote_launch_pid_dead_worktree_unknown",
+                        )
+                        return UntilTerminalResult(
+                            dispatch_id,
+                            0,
+                            "salvage_needed",
+                            polls,
+                            porcelain.error,
+                        )
+                    porcelain = _worktree_porcelain_check(
+                        transport,
+                        node_id=node_id,
+                        node_entry=node_entry,
+                        worktree_path=worktree_path,
+                    )
+                    if not porcelain.ok or porcelain.dirty:
+                        salvage_reason = (
+                            "remote_launch_pid_dead_dirty_worktree"
+                            if porcelain.ok and porcelain.dirty
+                            else "remote_launch_pid_dead_porcelain_unavailable"
+                        )
+                        _write_salvage_needed_mirror(
+                            fleet_dir,
+                            dispatch_id,
+                            prior=latest,
+                            identity_result=identity,
+                            worktree_path=worktree_path,
+                            porcelain_result=porcelain,
+                            reason=salvage_reason,
+                        )
+                        detail_msg = (
+                            f"remote launch pid dead with dirty worktree: {worktree_path}"
+                            if porcelain.ok and porcelain.dirty
+                            else porcelain.error or "remote worktree porcelain check failed"
+                        )
+                        return UntilTerminalResult(
+                            dispatch_id,
+                            0,
+                            "salvage_needed",
+                            polls,
+                            detail_msg,
+                        )
                     _write_worker_dead_mirror(
                         fleet_dir,
                         dispatch_id,

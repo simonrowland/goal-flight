@@ -49,6 +49,36 @@ def doctor_may_release_dispatch_locks(classification: status.DispatchClassificat
     return status.may_release_locks(classification)
 
 
+def account_lock_ttl_reapable(fleet_dir, lock_doc: dict[str, Any]) -> bool:
+    """Return whether the TTL stale reaper may release an expired account lock.
+
+    Salvage-classified dispatches are exempt until an explicit salvage/cleanup
+    release. When an owner dispatch id is present but cannot be resolved, prefer
+    safe (hold) over silent release of possible salvage-held locks.
+    """
+    import goalflight_fleet_reconcile as fleet_reconcile
+
+    owner_dispatch_id = lock_doc.get("owner_dispatch_id")
+    if not isinstance(owner_dispatch_id, str) or not owner_dispatch_id.strip():
+        return True
+
+    dispatch_dir = fleet_dir / "register" / "dispatches" / owner_dispatch_id
+    if not dispatch_dir.is_dir():
+        return False
+
+    try:
+        ctx = fleet_reconcile.build_dispatch_context(fleet_dir, owner_dispatch_id)
+    except Exception:
+        return False
+
+    if ctx.classification.state == "salvage":
+        return False
+    remote_state = status.remote_state_from_mirror(ctx.mirror_result)
+    if remote_state in status.SALVAGE_NEEDED_STATES:
+        return False
+    return True
+
+
 def doctor_fleet_stale_release(
     fleet_dir,
     *,

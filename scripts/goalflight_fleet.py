@@ -305,11 +305,15 @@ def stale_account_locks(fleet_dir: Path) -> list[dict]:
 
 
 def release_stale_account_locks(fleet_dir: Path) -> list[str]:
+    import goalflight_fleet_stale as fleet_stale
+
     released: list[str] = []
     for doc in stale_account_locks(fleet_dir):
         account_key = doc.get("account_key")
         fencing_token = doc.get("fencing_token")
         if not account_key or not fencing_token:
+            continue
+        if not fleet_stale.account_lock_ttl_reapable(fleet_dir, doc):
             continue
         try:
             release_account_lock(
@@ -614,6 +618,35 @@ def cmd_salvage(args: argparse.Namespace) -> int:
     return fleet_ferry.cmd_salvage(args)
 
 
+def cmd_salvage_complete(args: argparse.Namespace) -> int:
+    manifest_path = args.manifest.expanduser()
+    if not manifest_path.exists():
+        print(f"missing manifest: {manifest_path}", file=sys.stderr)
+        return 1
+    manifest = read_json(manifest_path)
+    account_key = manifest.get("account_key")
+    fencing_token = manifest.get("fencing_token")
+    if not account_key or not fencing_token:
+        print(
+            "manifest missing account_key or fencing_token; "
+            "re-run salvage with --dispatch-id",
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        doc = release_account_lock(
+            args.fleet_dir,
+            account_key=str(account_key),
+            fencing_token=str(fencing_token),
+            reason=args.reason,
+        )
+    except AccountLockError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(json.dumps(doc, indent=2))
+    return 0
+
+
 def _steering_actor(args: argparse.Namespace) -> dict:
     return {
         "controller_id": controller_id(),
@@ -824,6 +857,7 @@ def main(argv: list[str] | None = None) -> int:
     salvage.add_argument("--node", required=True)
     salvage.add_argument("--worktree-path", required=True)
     salvage.add_argument("--out-dir", type=Path, required=True)
+    salvage.add_argument("--dispatch-id", help="Owning dispatch id (records lock identity in manifest)")
     salvage.add_argument("--purpose", default="salvage")
     salvage.add_argument("--append-only", action="append", default=None, help="Path/pattern excluded from convergence")
     salvage.add_argument("--max-iterations", type=int, default=10)
@@ -831,6 +865,14 @@ def main(argv: list[str] | None = None) -> int:
     salvage.add_argument("--exec", action="store_true", help="Run SSH/rsync (default preview)")
     salvage.add_argument("--json", action="store_true")
     salvage.set_defaults(func=cmd_salvage)
+
+    salvage_complete = sub.add_parser(
+        "salvage-complete",
+        help="Release the account lock recorded in a salvage manifest",
+    )
+    salvage_complete.add_argument("--manifest", type=Path, required=True)
+    salvage_complete.add_argument("--reason", default="salvage_complete")
+    salvage_complete.set_defaults(func=cmd_salvage_complete)
 
     steering = sub.add_parser("steering")
     steering_sub = steering.add_subparsers(dest="steering_cmd", required=True)

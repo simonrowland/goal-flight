@@ -152,6 +152,26 @@ by listing `git status --porcelain` over SSH, rsyncing only the dirty files into
 local quarantine, and re-listing before each pass until the file set converges
 (divergence is reported as a liveness signal, not an error).
 
+Pass `--dispatch-id` when salvaging a `salvage_needed` dispatch so the written
+`salvage-manifest.json` records `dispatch_id`, `account_key`, and `fencing_token`
+for the held account lock. After you have quarantined the dirty worktree, release
+that lock explicitly — either run the `lock_release_command` field from the
+manifest, or:
+
+```bash
+python3 scripts/goalflight_fleet.py salvage-complete --manifest <salvage-dir>/salvage-manifest.json
+```
+
+Manual release is also available when you have the exact lock identity:
+
+```bash
+python3 scripts/goalflight_fleet.py lock-release \
+  --account-key <account_key> --fencing-token <fencing_token> --reason salvage_complete
+```
+
+Salvage-held locks are not TTL-reaped; they stay active until this post-salvage
+release (or an operator `lock-release` with the matching fencing token).
+
 **Credential safety.** Ferry refuses to transfer credential-shaped paths in either
 direction — auth state, private keys, token/secret files — matched on the path, its
 resolved target, and same-inode aliases, so a renamed, symlinked, or hardlinked

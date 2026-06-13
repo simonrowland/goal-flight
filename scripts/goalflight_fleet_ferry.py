@@ -959,6 +959,27 @@ def _merge_append_only_patterns(extra: Iterable[str] | None) -> tuple[str, ...]:
     return tuple(merged)
 
 
+def _salvage_lock_identity(fleet_dir: Path, dispatch_id: str | None) -> dict[str, str]:
+    """Resolve dispatch + account lock fields for post-salvage release."""
+    if not dispatch_id:
+        return {}
+    import goalflight_fleet_reconcile as fleet_reconcile
+    import goalflight_fleet_status_cli as status_cli
+
+    meta = status_cli._collect_dispatch_meta(fleet_dir).get(dispatch_id) or {}
+    lock = fleet_reconcile.resolve_account_lock_for_dispatch(fleet_dir, dispatch_id, meta)
+    identity: dict[str, str] = {"dispatch_id": dispatch_id}
+    if not lock:
+        return identity
+    account_key = lock.get("account_key")
+    fencing_token = lock.get("fencing_token")
+    if isinstance(account_key, str) and account_key:
+        identity["account_key"] = account_key
+    if isinstance(fencing_token, str) and fencing_token:
+        identity["fencing_token"] = fencing_token
+    return identity
+
+
 def salvage_worktree(
     fleet_dir: Path,
     *,
@@ -966,6 +987,7 @@ def salvage_worktree(
     worktree_path: str,
     out_dir: Path,
     purpose: str = "salvage",
+    dispatch_id: str | None = None,
     runner: Callable[[list[str]], tuple[int, str, str]] | None = None,
     max_iterations: int = 10,
     append_only_paths: Iterable[str] | None = None,
@@ -1070,6 +1092,7 @@ def salvage_worktree(
             time.sleep(sleep_s)
 
     files = [_file_entry(out_dir, rel) for rel in target_files]
+    lock_identity = _salvage_lock_identity(fleet_dir, dispatch_id)
     manifest: dict[str, Any] = {
         "schema": "goalflight.fleet.salvage.manifest.v1",
         "ts": _utc_iso(),
@@ -1084,6 +1107,14 @@ def salvage_worktree(
         "converged": converged,
         "initial_receipt": initial_receipt,
     }
+    manifest.update(lock_identity)
+    if lock_identity.get("account_key") and lock_identity.get("fencing_token"):
+        manifest["lock_release_command"] = (
+            "goalflight_fleet.py lock-release "
+            f"--account-key {lock_identity['account_key']} "
+            f"--fencing-token {lock_identity['fencing_token']} "
+            "--reason salvage_complete"
+        )
     if not converged:
         manifest["liveness_signal"] = "worktree still changing - worker may be alive"
     manifest_path = out_dir / "salvage-manifest.json"
@@ -1134,6 +1165,7 @@ def cmd_salvage(args) -> int:
             worktree_path=args.worktree_path,
             out_dir=args.out_dir,
             purpose=args.purpose,
+            dispatch_id=getattr(args, "dispatch_id", None),
             max_iterations=args.max_iterations,
             append_only_paths=args.append_only,
             sleep_s=args.sleep_s,

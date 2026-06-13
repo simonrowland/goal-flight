@@ -115,11 +115,14 @@ class FakeTransport:
             | list[str | fleet_watch.RemoteFetchResult],
         ],
         identity_by_dispatch: dict[str, fleet_watch.RemoteIdentityResult] | None = None,
+        porcelain_by_worktree: dict[str, fleet_watch.WorktreePorcelainResult] | None = None,
     ) -> None:
         self._by_dispatch = by_dispatch
         self._identity_by_dispatch = identity_by_dispatch or {}
+        self._porcelain_by_worktree = porcelain_by_worktree or {}
         self.calls: list[tuple[str, str]] = []
         self.identity_calls: list[str] = []
+        self.porcelain_calls: list[str] = []
 
     def fetch_remote_status(
         self,
@@ -159,6 +162,23 @@ class FakeTransport:
             fleet_watch.RemoteIdentityResult(ok=True, alive=True, identity=receipt.get("remote_identity")),
         )
 
+    def check_worktree_porcelain(
+        self,
+        *,
+        node_id: str,
+        node_entry: dict | None,
+        worktree_path: str,
+    ) -> fleet_watch.WorktreePorcelainResult:
+        self.porcelain_calls.append(worktree_path)
+        if worktree_path in self._porcelain_by_worktree:
+            return self._porcelain_by_worktree[worktree_path]
+        return fleet_watch.WorktreePorcelainResult(
+            ok=True,
+            dirty=False,
+            porcelain=None,
+            worktree_path=worktree_path,
+        )
+
 
 def _fixture_fleet(fleet_dir: Path) -> None:
     fleet.bootstrap(fleet_dir)
@@ -188,6 +208,7 @@ def _write_dispatch(
     dispatch_dir.mkdir(parents=True, exist_ok=True)
     status_path = dispatch_dir / "status.json"
     remote_status_path = f"~/.goal-flight/dispatches/{dispatch_id}/status.json"
+    worktree_path = f"/home/dev/.goal-flight/worktrees/{dispatch_id}"
     status_path.write_text(_status_payload(dispatch_id=dispatch_id, seq=seq, epoch=epoch) + "\n")
     fleet._atomic_write_json(
         dispatch_dir / "meta.json",
@@ -195,6 +216,7 @@ def _write_dispatch(
             "dispatch_id": dispatch_id,
             "node_id": "build-1",
             "remote_status_path": remote_status_path,
+            "worktree_path": worktree_path,
             "lease_active": True,
             "last_mirror_seq": seq,
             "pid_hint": "alive",
@@ -691,6 +713,90 @@ def test_until_terminal_stale_dead_identity_marks_worker_dead() -> None:
         meta = json.loads((status_path.parent / "meta.json").read_text())
         assert_true("meta row state", meta.get("row_state") == "worker_dead")
         assert_true("identity checked once", transport.identity_calls == [dispatch_id])
+        assert_true("porcelain checked", len(transport.porcelain_calls) == 1)
+
+
+def test_until_terminal_stale_dead_identity_dirty_worktree_marks_salvage_needed() -> None:
+    dispatch_id = "acp-watch-stale-dead-dirty"
+    worktree_path = f"/home/dev/.goal-flight/worktrees/{dispatch_id}"
+    with tempfile.TemporaryDirectory() as td:
+        fleet_dir = Path(td) / "fleet"
+        _fixture_fleet(fleet_dir)
+        status_path = _write_dispatch(fleet_dir, dispatch_id=dispatch_id, seq=7)
+        lock = fleet.acquire_account_lock(
+            fleet_dir,
+            account_key="openai/default",
+            owner_dispatch_id=dispatch_id,
+        )
+        assert_true("lock acquired", lock.get("state") == "active")
+        transport = FakeTransport(
+            {dispatch_id: _status_payload(dispatch_id=dispatch_id, seq=7)},
+            identity_by_dispatch={
+                dispatch_id: fleet_watch.RemoteIdentityResult(ok=True, alive=False, identity=None)
+            },
+            porcelain_by_worktree={
+                worktree_path: fleet_watch.WorktreePorcelainResult(
+                    ok=True,
+                    dirty=True,
+                    porcelain=" M scripts/example.py",
+                    worktree_path=worktree_path,
+                )
+            },
+        )
+        result = fleet_watch.watch_until_terminal(
+            fleet_dir,
+            dispatch_id,
+            transport,
+            timeout_s=10,
+            interval_s=0,
+            jitter_s=0,
+            stale_s=0,
+        )
+        assert_true("exit terminal", result.exit_code == 0)
+        assert_true("salvage needed", result.state == "salvage_needed")
+        payload = json.loads(status_path.read_text())
+        assert_true("mirror salvage_needed", payload.get("state") == "salvage_needed")
+        assert_true("porcelain on mirror", payload.get("porcelain") == " M scripts/example.py")
+        meta = json.loads((status_path.parent / "meta.json").read_text())
+        assert_true("meta row state", meta.get("row_state") == "salvage_needed")
+        lock_after = fleet.load_account_lock(fleet.account_lock_path(fleet_dir, "openai/default"))
+        assert_true("lock retained", lock_after is not None and lock_after.get("state") == "active")
+
+
+def test_until_terminal_stale_dead_identity_porcelain_error_marks_salvage_needed() -> None:
+    dispatch_id = "acp-watch-stale-dead-porcelain-error"
+    worktree_path = f"/home/dev/.goal-flight/worktrees/{dispatch_id}"
+    with tempfile.TemporaryDirectory() as td:
+        fleet_dir = Path(td) / "fleet"
+        _fixture_fleet(fleet_dir)
+        status_path = _write_dispatch(fleet_dir, dispatch_id=dispatch_id, seq=7)
+        transport = FakeTransport(
+            {dispatch_id: _status_payload(dispatch_id=dispatch_id, seq=7)},
+            identity_by_dispatch={
+                dispatch_id: fleet_watch.RemoteIdentityResult(ok=True, alive=False, identity=None)
+            },
+            porcelain_by_worktree={
+                worktree_path: fleet_watch.WorktreePorcelainResult(
+                    ok=False,
+                    worktree_path=worktree_path,
+                    error="ssh exit 255: connection refused",
+                )
+            },
+        )
+        result = fleet_watch.watch_until_terminal(
+            fleet_dir,
+            dispatch_id,
+            transport,
+            timeout_s=10,
+            interval_s=0,
+            jitter_s=0,
+            stale_s=0,
+        )
+        assert_true("exit terminal", result.exit_code == 0)
+        assert_true("salvage needed", result.state == "salvage_needed")
+        payload = json.loads(status_path.read_text())
+        assert_true("mirror salvage_needed", payload.get("state") == "salvage_needed")
+        assert_true("not worker_dead", payload.get("state") != "worker_dead")
 
 
 def test_until_terminal_unconfirmed_no_status_live_pid_stays_unconfirmed() -> None:
@@ -871,11 +977,13 @@ def main() -> None:
     test_until_terminal_timeout_exits_live()
     test_until_terminal_backfills_launch_unconfirmed_receipt()
     test_until_terminal_stale_dead_identity_marks_worker_dead()
+    test_until_terminal_stale_dead_identity_dirty_worktree_marks_salvage_needed()
+    test_until_terminal_stale_dead_identity_porcelain_error_marks_salvage_needed()
     test_until_terminal_unconfirmed_no_status_live_pid_stays_unconfirmed()
     test_until_terminal_unconfirmed_dead_pid_before_grace_stays_unconfirmed()
     test_until_terminal_unconfirmed_dead_pid_after_grace_fails_and_releases_lock()
     test_until_terminal_fetch_failure_retries()
-    print("OK: fleet watch tests pass")
+    print("OK: 19 fleet watch tests pass")
 
 
 if __name__ == "__main__":

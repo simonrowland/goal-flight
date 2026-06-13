@@ -877,6 +877,89 @@ def test_ferry_preflight_allowlist_shape_is_narrow() -> None:
     assert_true("payload flag", "--payload-b64" in argv)
 
 
+def test_salvage_manifest_records_lock_identity() -> None:
+    dispatch_id = "acp-salvage-lock-identity"
+    with live_ssh_env("1"):
+        with tempfile.TemporaryDirectory() as td:
+            fleet_dir = Path(td) / "fleet"
+            _fixture_fleet(fleet_dir)
+            lock = fleet.acquire_account_lock(
+                fleet_dir,
+                account_key="openai/default",
+                owner_dispatch_id=dispatch_id,
+            )
+            dispatch_dir = fleet_dir / "register" / "dispatches" / dispatch_id
+            dispatch_dir.mkdir(parents=True, exist_ok=True)
+            fleet._atomic_write_json(
+                dispatch_dir / "meta.json",
+                {
+                    "dispatch_id": dispatch_id,
+                    "node_id": "localhost",
+                    "lease_active": True,
+                    "row_state": "salvage_needed",
+                },
+            )
+            runner = SalvageRunner(" M src/app.py\n", [">fcs....... src/app.py\n", "", ""])
+            manifest = ferry.salvage_worktree(
+                fleet_dir,
+                node_id="localhost",
+                worktree_path="/remote/worktree",
+                out_dir=_staging(fleet_dir, "salvage"),
+                dispatch_id=dispatch_id,
+                runner=runner,
+                sleep_s=0,
+            )
+            assert_true("dispatch id", manifest.get("dispatch_id") == dispatch_id)
+            assert_true("account key", manifest.get("account_key") == "openai/default")
+            assert_true("fencing token", manifest.get("fencing_token") == lock.get("fencing_token"))
+            assert_true("release command", "lock-release" in str(manifest.get("lock_release_command")))
+
+
+def test_salvage_complete_releases_exact_lock() -> None:
+    dispatch_id = "acp-salvage-complete"
+    with tempfile.TemporaryDirectory() as td:
+        fleet_dir = Path(td) / "fleet"
+        _fixture_fleet(fleet_dir)
+        lock = fleet.acquire_account_lock(
+            fleet_dir,
+            account_key="openai/default",
+            owner_dispatch_id=dispatch_id,
+        )
+        other = fleet.acquire_account_lock(
+            fleet_dir,
+            account_key="openai/other",
+            owner_dispatch_id="other-dispatch",
+        )
+        manifest_path = _staging(fleet_dir, "salvage", "salvage-manifest.json")
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "schema": "goalflight.fleet.salvage.manifest.v1",
+                    "dispatch_id": dispatch_id,
+                    "account_key": "openai/default",
+                    "fencing_token": lock.get("fencing_token"),
+                }
+            )
+            + "\n"
+        )
+        rc = fleet.main(
+            [
+                "--fleet-dir",
+                str(fleet_dir),
+                "salvage-complete",
+                "--manifest",
+                str(manifest_path),
+            ]
+        )
+        assert_true("cli rc", rc == 0)
+        released = fleet.load_account_lock(fleet.account_lock_path(fleet_dir, "openai/default"))
+        assert_true("target released", released is None or released.get("state") == "released")
+        held = fleet.load_account_lock(fleet.account_lock_path(fleet_dir, "openai/other"))
+        assert_true("other still active", held is not None and held.get("state") == "active")
+        assert_true("other fencing", held.get("fencing_token") == other.get("fencing_token"))
+
+
 def test_git_status_porcelain_allowlist_shape_is_narrow() -> None:
     argv = fleet_ssh.build_remote_command(
         "git_status_porcelain",
@@ -934,6 +1017,8 @@ def main() -> None:
         test_salvage_skips_denied_dirty_file_visible_note,
         test_salvage_relists_before_rsync_and_aborts_on_changed_set,
         test_cli_salvage_default_append_only_patterns_merge,
+        test_salvage_manifest_records_lock_identity,
+        test_salvage_complete_releases_exact_lock,
         test_ferry_preflight_allowlist_shape_is_narrow,
         test_git_status_porcelain_allowlist_shape_is_narrow,
     )

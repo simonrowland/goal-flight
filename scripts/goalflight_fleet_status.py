@@ -40,6 +40,12 @@ TERMINAL_STATES = frozenset(
         "worker_dead",
     }
 )
+SALVAGE_NEEDED_STATES = frozenset(
+    {
+        "salvage_needed",
+        "cleanup_needed",
+    }
+)
 RUNNING_STATES = frozenset(
     {
         "starting",
@@ -62,7 +68,7 @@ class DispatchClassification:
 
 
 def is_terminal_state(state: str | None) -> bool:
-    return bool(state and state in TERMINAL_STATES)
+    return bool(state and (state in TERMINAL_STATES or state in SALVAGE_NEEDED_STATES))
 
 
 def is_running_state(state: str | None) -> bool:
@@ -102,6 +108,9 @@ def classify_dispatch_row(
             return DispatchClassification("unknown", quarantine_reason=QUARANTINE_MIRROR_UNREADABLE)
         return DispatchClassification("unknown", quarantine_reason=QUARANTINE_MIRROR_UNREADABLE)
 
+    if remote_state in SALVAGE_NEEDED_STATES:
+        return DispatchClassification("salvage")
+
     if is_terminal_state(remote_state):
         return DispatchClassification("terminal")
 
@@ -131,6 +140,8 @@ def may_release_locks(classification: DispatchClassification) -> bool:
     """
     if classification.state == "released":
         return True
+    if classification.state == "salvage":
+        return False
     if classification.state != "reconciling" and classification.state != "terminal":
         return False
     if classification.quarantine_reason == QUARANTINE_MIRROR_STALE:

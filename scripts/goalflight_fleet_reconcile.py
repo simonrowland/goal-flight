@@ -211,7 +211,12 @@ def build_dispatch_context(
     lock = resolve_account_lock_for_dispatch(fleet_dir, dispatch_id, meta)
     if lock is not None:
         meta.setdefault("lease_active", True)
-    may_release = status.may_release_locks(classification) and _pre_status_release_confirmed(meta, mirror_result)
+    remote_state = status.remote_state_from_mirror(mirror_result)
+    may_release = (
+        remote_state not in status.SALVAGE_NEEDED_STATES
+        and status.may_release_locks(classification)
+        and _pre_status_release_confirmed(meta, mirror_result)
+    )
     return DispatchReconcileContext(
         dispatch_id=dispatch_id,
         meta=meta,
@@ -233,6 +238,9 @@ def decide_reconcile_action(ctx: DispatchReconcileContext) -> ReconcileDecision:
 
     if ctx.classification.state == "running":
         return ReconcileDecision("refresh", "running_alive")
+
+    if ctx.classification.state == "salvage":
+        return ReconcileDecision("noop", "salvage_needed_hold_lock")
 
     if ctx.may_release:
         return ReconcileDecision("release_locks", ctx.classification.state)

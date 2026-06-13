@@ -7,6 +7,7 @@ from support import skip_posix_on_native_windows
 
 skip_posix_on_native_windows("fleet reconcile fixtures use POSIX /tmp paths")
 
+import datetime as dt
 import json
 import shutil
 import sys
@@ -76,6 +77,14 @@ def _acquire_lock(fleet_dir: Path, dispatch_id: str, account_key: str = "openai/
         account_key=account_key,
         owner_dispatch_id=dispatch_id,
     )
+
+
+def _expire_lock(fleet_dir: Path, account_key: str = "openai/default") -> None:
+    path = fleet.account_lock_path(fleet_dir, account_key)
+    doc = fleet.load_account_lock(path)
+    assert_true("lock loaded", doc is not None)
+    doc["expires_at"] = fleet.iso(fleet.utc_now() - dt.timedelta(hours=2))
+    fleet._atomic_write_json(path, doc)
 
 
 def _write_aggregate(fleet_dir: Path, dispatch_ids: list[str]) -> None:
@@ -510,6 +519,113 @@ def test_audit_log_appended_on_mutate() -> None:
         assert_true("dispatch id", entry.get("dispatch_id") == dispatch_id)
 
 
+def test_salvage_needed_dead_pid_holds_lock() -> None:
+    dispatch_id = "acp-reconcile-salvage-needed"
+    with tempfile.TemporaryDirectory() as td:
+        fleet_dir = Path(td) / "fleet"
+        _fixture_fleet(fleet_dir)
+        _acquire_lock(fleet_dir, dispatch_id)
+        salvage = json.loads((FIXTURES / "valid_ok.json").read_text())
+        salvage["state"] = "salvage_needed"
+        salvage["reason"] = "remote_launch_pid_dead_dirty_worktree"
+        salvage["worktree_path"] = "/tmp/goal-flight-test/worktrees/acp-reconcile-salvage-needed"
+        salvage["porcelain"] = " M scripts/example.py"
+        dispatch_dir = fleet_dir / "register" / "dispatches" / dispatch_id
+        dispatch_dir.mkdir(parents=True, exist_ok=True)
+        (dispatch_dir / "status.json").write_text(json.dumps(salvage) + "\n")
+        fleet._atomic_write_json(
+            dispatch_dir / "meta.json",
+            {
+                "dispatch_id": dispatch_id,
+                "node_id": "localhost",
+                "lease_active": True,
+                "pid_hint": "dead",
+                "ssh_reachable": True,
+                "row_state": "salvage_needed",
+                "worktree_path": salvage["worktree_path"],
+            },
+        )
+        _write_aggregate(fleet_dir, [dispatch_id])
+
+        row = fleet_reconcile.reconcile_dispatch(fleet_dir, dispatch_id, mutate=True)
+
+        assert_true("noop action", row.action == "noop")
+        assert_true("salvage reason", row.reason == "salvage_needed_hold_lock")
+        assert_true("not released", row.released is False)
+        assert_true("may not release", row.may_release is False)
+        held = fleet.load_account_lock(fleet.account_lock_path(fleet_dir, "openai/default"))
+        assert_true("lock held", held is not None and held.get("state") == "active")
+        meta = fleet.read_json(dispatch_dir / "meta.json")
+        assert_true("not marked released", meta.get("row_state") != "released")
+
+
+def test_salvage_needed_ttl_expired_lock_survives_stale_reconcile() -> None:
+    dispatch_id = "acp-reconcile-salvage-ttl"
+    with tempfile.TemporaryDirectory() as td:
+        fleet_dir = Path(td) / "fleet"
+        _fixture_fleet(fleet_dir)
+        lock = _acquire_lock(fleet_dir, dispatch_id)
+        salvage = json.loads((FIXTURES / "valid_ok.json").read_text())
+        salvage["state"] = "salvage_needed"
+        salvage["reason"] = "remote_launch_pid_dead_dirty_worktree"
+        dispatch_dir = fleet_dir / "register" / "dispatches" / dispatch_id
+        dispatch_dir.mkdir(parents=True, exist_ok=True)
+        (dispatch_dir / "status.json").write_text(json.dumps(salvage) + "\n")
+        fleet._atomic_write_json(
+            dispatch_dir / "meta.json",
+            {
+                "dispatch_id": dispatch_id,
+                "node_id": "localhost",
+                "lease_active": True,
+                "pid_hint": "dead",
+                "ssh_reachable": True,
+                "row_state": "salvage_needed",
+            },
+        )
+        _write_aggregate(fleet_dir, [dispatch_id])
+        _expire_lock(fleet_dir)
+
+        result = fleet.reconcile_fleet(fleet_dir, release_stale=True)
+
+        assert_true("not ttl released", "openai/default" not in (result.get("account_stale_released") or []))
+        held = fleet.load_account_lock(fleet.account_lock_path(fleet_dir, "openai/default"))
+        assert_true("lock still active", held is not None and held.get("state") == "active")
+        assert_true("same fencing", held.get("fencing_token") == lock.get("fencing_token"))
+
+
+def test_non_salvage_terminal_ttl_expired_still_reaped() -> None:
+    dispatch_id = "acp-reconcile-terminal-ttl"
+    with tempfile.TemporaryDirectory() as td:
+        fleet_dir = Path(td) / "fleet"
+        _fixture_fleet(fleet_dir)
+        lock = _acquire_lock(fleet_dir, dispatch_id)
+        terminal = json.loads((FIXTURES / "valid_ok.json").read_text())
+        terminal["state"] = "worker_dead"
+        dispatch_dir = fleet_dir / "register" / "dispatches" / dispatch_id
+        dispatch_dir.mkdir(parents=True, exist_ok=True)
+        (dispatch_dir / "status.json").write_text(json.dumps(terminal) + "\n")
+        fleet._atomic_write_json(
+            dispatch_dir / "meta.json",
+            {
+                "dispatch_id": dispatch_id,
+                "node_id": "localhost",
+                "lease_active": True,
+                "pid_hint": "dead",
+                "ssh_reachable": True,
+                "row_state": "worker_dead",
+            },
+        )
+        _write_aggregate(fleet_dir, [dispatch_id])
+        _expire_lock(fleet_dir)
+
+        result = fleet.reconcile_fleet(fleet_dir, release_stale=True)
+
+        assert_true("ttl released", "openai/default" in (result.get("account_stale_released") or []))
+        released = fleet.load_account_lock(fleet.account_lock_path(fleet_dir, "openai/default"))
+        assert_true("lock released", released is None or released.get("state") == "released")
+        assert_true("fencing was", lock.get("fencing_token"))
+
+
 def test_live_ssh_probe_quarantine_when_unreachable() -> None:
     dispatch_id = "acp-reconcile-live-probe"
     with tempfile.TemporaryDirectory() as td:
@@ -552,8 +668,11 @@ def main() -> None:
     test_still_live_pre_status_not_release()
     test_reconcile_all_in_flight_releases_eligible_only()
     test_audit_log_appended_on_mutate()
+    test_salvage_needed_dead_pid_holds_lock()
+    test_salvage_needed_ttl_expired_lock_survives_stale_reconcile()
+    test_non_salvage_terminal_ttl_expired_still_reaped()
     test_live_ssh_probe_quarantine_when_unreachable()
-    print("OK: fleet reconcile tests pass")
+    print("OK: 12 fleet reconcile tests pass")
 
 
 if __name__ == "__main__":
