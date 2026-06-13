@@ -49,7 +49,8 @@ except Exception:  # pragma: no cover - doctor still reports partial state
     goalflight_agent_traits = None
 
 CLAUDE_ACP_STOPGAP_MAX_VERSION = "0.1.1"
-CLAUDE_ACP_PATCH_SCRIPT = SCRIPT_DIR / "install_claude_acp_patch.sh"
+CLAUDE_ACP_PINNED_FIX_COMMIT = "14a5b0c"
+CLAUDE_ACP_BUILD_SCRIPT = SCRIPT_DIR / "install_claude_acp_patch.sh"
 GSTACK_MINIMAL_SKILLS = ("review", "plan-eng-review", "office-hours")
 GSTACK_EXTERNAL_SKILLS = ("grill-me", "thermo-nuclear-code-quality-review")
 GSTACK_MINIMAL_REQUIRED_SKILLS = GSTACK_MINIMAL_SKILLS + GSTACK_EXTERNAL_SKILLS
@@ -1125,7 +1126,7 @@ def _claude_acp_platform_binary() -> Path | None:
 
 
 def check_claude_acp_stopgap() -> dict:
-    """Warn when the Claude ACP npm adapter still needs the vendored stopgap."""
+    """Warn when the Claude ACP npm adapter still needs the pinned fixed build."""
     installed = _claude_acp_installed_version()
     binary = _claude_acp_platform_binary()
     present = bool(installed or (binary and binary.exists()))
@@ -1133,8 +1134,10 @@ def check_claude_acp_stopgap() -> dict:
         "present": present,
         "installed_version": installed,
         "max_stopgap_version": CLAUDE_ACP_STOPGAP_MAX_VERSION,
+        "pinned_fix_commit": CLAUDE_ACP_PINNED_FIX_COMMIT,
         "binary": str(binary) if binary else None,
-        "apply_script": str(CLAUDE_ACP_PATCH_SCRIPT),
+        "build_script": str(CLAUDE_ACP_BUILD_SCRIPT),
+        "cargo_present": bool(shutil.which("cargo")),
     }
     if not present:
         out.update({
@@ -1150,7 +1153,8 @@ def check_claude_acp_stopgap() -> dict:
             "ok": True,
             "level": "ok",
             "patched": None,
-            "detail": f"installed version {installed or 'unknown'} was not parsed; stopgap skipped",
+            "pinned_build_applied": None,
+            "detail": f"installed version {installed or 'unknown'} was not parsed; pinned build check skipped",
         })
         return out
     if installed_tuple > max_tuple:
@@ -1158,7 +1162,8 @@ def check_claude_acp_stopgap() -> dict:
             "ok": True,
             "level": "ok",
             "patched": None,
-            "detail": f"installed version {installed} is newer than {CLAUDE_ACP_STOPGAP_MAX_VERSION}; stopgap skipped",
+            "pinned_build_applied": None,
+            "detail": f"installed version {installed} is newer than {CLAUDE_ACP_STOPGAP_MAX_VERSION}; npm release should include the fix",
         })
         return out
     if not binary or not binary.exists():
@@ -1166,7 +1171,8 @@ def check_claude_acp_stopgap() -> dict:
             "ok": False,
             "level": "warning",
             "patched": False,
-            "detail": f"claude-code-cli-acp {installed or 'unknown'} installed but platform binary was not resolved; run {CLAUDE_ACP_PATCH_SCRIPT}",
+            "pinned_build_applied": False,
+            "detail": f"claude-code-cli-acp {installed or 'unknown'} installed but platform binary was not resolved; re-run ./install.sh claude-acp",
         })
         return out
 
@@ -1174,24 +1180,38 @@ def check_claude_acp_stopgap() -> dict:
     orig = Path(f"{binary}.orig")
     orig_sha = _sha256_path(orig) if orig.exists() else None
     patched = bool(orig_sha and current_sha and orig_sha != current_sha)
+    cargo_present = bool(shutil.which("cargo"))
     out.update({
         "backup": str(orig),
         "backup_exists": orig.exists(),
         "current_sha256": current_sha,
         "orig_sha256": orig_sha,
         "patched": patched,
+        "pinned_build_applied": patched,
+        "cargo_present": cargo_present,
     })
     if patched:
         out.update({
             "ok": True,
             "level": "ok",
-            "detail": f"stopgap appears applied; backup at {orig}",
+            "detail": f"pinned claude-code-cli-acp build {CLAUDE_ACP_PINNED_FIX_COMMIT} appears installed; backup at {orig}",
         })
     else:
+        if cargo_present:
+            detail = (
+                f"claude-code-cli-acp {installed or 'unknown'} may still be the broken npm binary; "
+                f"run ./install.sh claude-acp to build pinned fix {CLAUDE_ACP_PINNED_FIX_COMMIT}"
+            )
+        else:
+            detail = (
+                f"claude-code-cli-acp {installed or 'unknown'} may still be the broken npm binary; "
+                "install Rust cargo, then run ./install.sh claude-acp "
+                f"(or wait for npm > {CLAUDE_ACP_STOPGAP_MAX_VERSION})"
+            )
         out.update({
             "ok": False,
             "level": "warning",
-            "detail": f"claude-code-cli-acp {installed or 'unknown'} may need Claude Code 2.1.169 stopgap; run {CLAUDE_ACP_PATCH_SCRIPT}",
+            "detail": detail,
         })
     return out
 
@@ -2190,7 +2210,7 @@ def print_human(payload: dict) -> None:
         status_line(payload["grok"].get("headless_flags"), "Grok headless flags", None),
         status_line(
             (payload.get("claude_acp_stopgap") or {}).get("ok"),
-            "Claude ACP TUI-submit stopgap",
+            "Claude ACP pinned TUI-submit fix",
             (payload.get("claude_acp_stopgap") or {}).get("detail"),
         ),
     ]

@@ -1,29 +1,31 @@
-# Vendored Patches
+# Pinned Upstream Builds
 
-## claude-code-cli-acp 2.1.169 TUI submit stopgap
+## claude-code-cli-acp 2.1.169 TUI submit fix
 
 - Upstream repo: https://github.com/moabualruz/claude-code-cli-acp
-- Pinned base commit: `c93f4f4` (`claude-code-cli-acp@0.1.1`)
-- Fix commit used to generate the patch: `136b97e`
+- Pinned merged fix commit: `14a5b0c`
 - Upstream PR: https://github.com/moabualruz/claude-code-cli-acp/pull/1
-- Vendored patch: `patches/claude-code-cli-acp-2.1.169-tui-submit.patch`
 
-This is a STOPGAP for Claude Code 2.1.169 TUI submit behavior until upstream
-merges the PR and ships a fixed `claude-code-cli-acp` release. Do not pin users
-to the PR branch or mutable diff.
+`claude-code-cli-acp@0.1.1` is the current npm release and its per-platform
+binary predates the Claude Code 2.1.169 TUI submit fix. Until npm publishes a
+version newer than `0.1.1`, Goal Flight installs the npm package to lay down the
+launcher, then builds upstream commit `14a5b0c` from source and swaps only the
+installed platform binary.
 
-Apply manually with:
+Default install:
 
 ```sh
-scripts/install_claude_acp_patch.sh
+./install.sh claude-acp
 ```
 
 Requirements:
 
 - `claude-code-cli-acp@0.1.1` or older installed through npm.
 - `git`, `node`, `npm`, and Rust `cargo`.
-- macOS requires ad-hoc re-signing after the binary swap; the apply script runs
+- macOS requires ad-hoc re-signing after the binary swap; the build script runs
   `xattr -c` and `codesign -s - --force` on Darwin.
+- The compatibility script name remains `scripts/install_claude_acp_patch.sh`
+  for older callers, but it no longer applies a local patch.
 
 Revert:
 
@@ -48,5 +50,5 @@ cp "$BIN_PATH.orig" "$BIN_PATH"
 chmod 755 "$BIN_PATH"
 ```
 
-If the npm package now reports a version newer than `0.1.1`, skip this stopgap:
-upstream should carry the fix.
+If the npm package reports a version newer than `0.1.1`, the pinned build is
+skipped: the npm release should carry the fix.

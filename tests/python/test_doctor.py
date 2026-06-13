@@ -6,6 +6,7 @@ from contextlib import ExitStack
 import os
 from pathlib import Path
 import sys
+import tempfile
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -181,6 +182,48 @@ def case_doctor_reports_wsl_runtime_fields() -> None:
     assert payload["dispatch_capability"] == "full"
 
 
+def case_claude_acp_newer_npm_retires_pinned_build() -> None:
+    with patch("goalflight_doctor._claude_acp_installed_version", return_value="0.1.2"), \
+        patch("goalflight_doctor._claude_acp_platform_binary", return_value=None):
+        payload = goalflight_doctor.check_claude_acp_stopgap()
+    assert payload["ok"] is True
+    assert payload["pinned_fix_commit"] == "14a5b0c"
+    assert payload["pinned_build_applied"] is None
+    assert "newer than 0.1.1" in payload["detail"]
+    assert "npm release should include the fix" in payload["detail"]
+
+
+def case_claude_acp_warns_when_broken_binary_without_cargo() -> None:
+    with tempfile.TemporaryDirectory(prefix="gf-doctor-claude-acp-") as tmp:
+        binary = Path(tmp) / "claude-code-cli-acp"
+        binary.write_text("npm-binary\n", encoding="utf-8")
+        with patch("goalflight_doctor._claude_acp_installed_version", return_value="0.1.1"), \
+            patch("goalflight_doctor._claude_acp_platform_binary", return_value=binary), \
+            patch("goalflight_doctor.shutil.which", return_value=None):
+            payload = goalflight_doctor.check_claude_acp_stopgap()
+    assert payload["ok"] is False
+    assert payload["cargo_present"] is False
+    assert payload["pinned_build_applied"] is False
+    assert "broken npm binary" in payload["detail"]
+    assert "install Rust cargo" in payload["detail"]
+    assert "npm > 0.1.1" in payload["detail"]
+
+
+def case_claude_acp_reports_pinned_build_when_orig_differs() -> None:
+    with tempfile.TemporaryDirectory(prefix="gf-doctor-claude-acp-") as tmp:
+        binary = Path(tmp) / "claude-code-cli-acp"
+        binary.write_text("pinned-build\n", encoding="utf-8")
+        Path(f"{binary}.orig").write_text("npm-binary\n", encoding="utf-8")
+        with patch("goalflight_doctor._claude_acp_installed_version", return_value="0.1.1"), \
+            patch("goalflight_doctor._claude_acp_platform_binary", return_value=binary), \
+            patch("goalflight_doctor.shutil.which", return_value="/usr/bin/cargo"):
+            payload = goalflight_doctor.check_claude_acp_stopgap()
+    assert payload["ok"] is True
+    assert payload["pinned_build_applied"] is True
+    assert "14a5b0c" in payload["detail"]
+    assert "backup at" in payload["detail"]
+
+
 def main() -> None:
     case_doctor_reports_platform_fields_for_windows()
     case_doctor_reports_platform_fields_for_linux()
@@ -190,6 +233,9 @@ def main() -> None:
     case_doctor_reports_drvfs_mount_warning_from_fstype()
     case_filesystem_type_branches_stat_for_platforms()
     case_doctor_reports_wsl_runtime_fields()
+    case_claude_acp_newer_npm_retires_pinned_build()
+    case_claude_acp_warns_when_broken_binary_without_cargo()
+    case_claude_acp_reports_pinned_build_when_orig_differs()
     print("OK: doctor tests pass")
 
 

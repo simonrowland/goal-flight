@@ -4,6 +4,22 @@ Notable changes to the goal-flight Claude Code skill. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are
 incremented when meaningful skill behaviour changes.
 
+## [Unreleased]
+
+### Changed
+
+- **claude-acp builds the merged upstream TUI-submit fix by default.** The Claude
+  Code 2.1.169 TUI-submit fix (`claude-code-cli-acp` PR #1, commit `14a5b0c`) is
+  merged upstream but not yet published to npm (latest `0.1.1` ships the broken
+  binary). `install.sh claude-acp` now builds that pinned commit from source and
+  swaps it into the installed launcher by default (Rust/cargo required; resolves
+  the platform binary whether npm placed it top-level or nested under the
+  launcher; fails loudly rather than silently leaving the broken shim). This
+  supersedes the opt-in vendored patch from 1.0.4 (now removed). The build
+  auto-retires once npm publishes `claude-code-cli-acp > 0.1.1` (the `>0.1.1`
+  gate skips it). Interactive/local claude-acp works with this; the headless
+  remote-worker PTY path is a separate open investigation.
+
 ## [1.0.6] — 2026-06-13
 
 Remote-worker (fleet) hardening: the SSH/ACP fleet path is now live-proven

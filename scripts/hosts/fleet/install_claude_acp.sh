@@ -4,6 +4,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 
 if ! command -v npm >/dev/null 2>&1; then
   for prefix in /opt/homebrew/bin /usr/local/bin; do
@@ -21,6 +22,7 @@ fi
 
 npm install -g claude-code-cli-acp
 bash "${SCRIPT_DIR}/setup_worker_path.sh"
+bash "${REPO_ROOT}/scripts/install_claude_acp_patch.sh"
 
 if command -v claude-code-cli-acp >/dev/null 2>&1; then
   echo "claude-code-cli-acp installed: $(command -v claude-code-cli-acp)"

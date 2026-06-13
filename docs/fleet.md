@@ -44,13 +44,18 @@ probes find them:
 # On the worker (interactive SSH session)
 curl -fsSL https://x.ai/cli/install.sh | bash          # Grok Build
 ./install.sh grok                                       # from ~/.goal-flight checkout
-./install.sh claude-acp                                 # npm global claude-code-cli-acp shim
+./install.sh claude-acp                                 # npm launcher + pinned fixed claude-acp build
 bash scripts/hosts/fleet/setup_worker_path.sh         # ~/.local/bin symlinks + PATH
 # Or: ./install.sh worker-path
 
 # Codex / codex-acp / OpenCode via Homebrew are symlinked into ~/.local/bin by
 # setup_worker_path.sh. Claude Code ships inside Claude.app (linked as `claude`);
 # Claude **ACP** uses the separate npm shim `claude-code-cli-acp` (not `claude acp`).
+# Until npm publishes claude-code-cli-acp >0.1.1, install builds upstream fix
+# commit 14a5b0c from source by default, so workers need git, node/npm, and
+# Rust cargo. Missing cargo fails loudly instead of leaving the broken 0.1.1
+# binary in place. Temporary opt-out:
+# GOALFLIGHT_SKIP_CLAUDE_ACP_PINNED_BUILD=1 ./install.sh claude-acp
 # cursor-agent and grok are linked from their install trees into ~/.local/bin too.
 ```
 
