@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -613,6 +614,103 @@ def test_cursor_auth_probe_uses_status_not_version() -> None:
     assert_true("cursor keychain locked unchanged", keychain_locked["status"] == "yellow")
 
 
+def test_dispatch_auth_reprobes_stale_red_and_allows_now_valid() -> None:
+    # Seed bug: a STALE red probe (e.g. written before a token was persisted) must NOT block a
+    # now-valid token. The gate must re-probe live past the freshness window, not trust the cache.
+    with tempfile.TemporaryDirectory() as td:
+        fleet_dir = Path(td) / "fleet"
+        _fixture_fleet(fleet_dir)
+        billing.link_account_to_node(fleet_dir, "openai/default", "localhost", runner=green_runner)
+        _write_probe(fleet_dir, "localhost", "openai/default", "red")  # stale (2026-05-24) red
+        calls: list[int] = []
+
+        def reprobe_green(fleet_dir, node_id, account_key, **_kw):
+            calls.append(1)
+            return {
+                "schema": billing.AUTH_PROBE_SCHEMA,
+                "account_key": account_key,
+                "status": "green",
+                "probed_at": fleet.iso(),
+            }
+
+        billing.assert_dispatch_auth(fleet_dir, "localhost", "openai/default", reprobe=reprobe_green)
+        assert_true("stale red triggered a live re-probe", len(calls) == 1)
+
+
+def test_dispatch_auth_reprobes_stale_green_and_blocks_revoked() -> None:
+    # Security hole: a STALE green probe must NOT pass a since-revoked token. Re-probe -> red -> block.
+    with tempfile.TemporaryDirectory() as td:
+        fleet_dir = Path(td) / "fleet"
+        _fixture_fleet(fleet_dir)
+        billing.link_account_to_node(fleet_dir, "openai/default", "localhost", runner=green_runner)
+        _write_probe(fleet_dir, "localhost", "openai/default", "green")  # stale (2026-05-24) green
+        calls: list[int] = []
+
+        def reprobe_red(fleet_dir, node_id, account_key, **_kw):
+            calls.append(1)
+            return {
+                "schema": billing.AUTH_PROBE_SCHEMA,
+                "account_key": account_key,
+                "status": "red",
+                "probed_at": fleet.iso(),
+            }
+
+        try:
+            billing.assert_dispatch_auth(fleet_dir, "localhost", "openai/default", reprobe=reprobe_red)
+            assert_true("should block revoked-on-reprobe", False)
+        except billing.DispatchAuthError as exc:
+            assert_true("stale green triggered a live re-probe", len(calls) == 1)
+            assert_true("revoked token blocked red", exc.auth_probe == "red")
+
+
+def test_dispatch_auth_trusts_fresh_probe_without_reprobe() -> None:
+    # A FRESH cached green must be trusted as-is — no needless live re-probe per dispatch.
+    with tempfile.TemporaryDirectory() as td:
+        fleet_dir = Path(td) / "fleet"
+        _fixture_fleet(fleet_dir)
+        billing.link_account_to_node(fleet_dir, "openai/default", "localhost", runner=green_runner)
+        calls: list[int] = []
+
+        def reprobe_should_not_run(fleet_dir, node_id, account_key, **_kw):
+            calls.append(1)
+            return {"status": "red", "probed_at": fleet.iso()}
+
+        billing.assert_dispatch_auth(
+            fleet_dir, "localhost", "openai/default", reprobe=reprobe_should_not_run
+        )
+        assert_true("fresh probe was trusted without re-probe", len(calls) == 0)
+
+
+def test_dispatch_auth_default_reprobe_gated_on_live_ssh() -> None:
+    # The default (real-SSH) re-probe must run ONLY under GOALFLIGHT_LIVE_SSH=1, so a non-live
+    # --exec never SSHes before assert_live_ssh_opt_in refuses it. Covers the production
+    # default-reprobe path that the injected-reprobe poison-pairs don't exercise.
+    with tempfile.TemporaryDirectory() as td:
+        fleet_dir = Path(td) / "fleet"
+        _fixture_fleet(fleet_dir)
+        billing.link_account_to_node(fleet_dir, "openai/default", "localhost", runner=green_runner)
+        _write_probe(fleet_dir, "localhost", "openai/default", "green")  # stale green
+        calls: list[int] = []
+        orig = billing.run_node_auth_probe
+        billing.run_node_auth_probe = lambda *a, **k: (
+            calls.append(1) or {"status": "green", "probed_at": fleet.iso()}
+        )
+        old_env = os.environ.get("GOALFLIGHT_LIVE_SSH")
+        try:
+            os.environ.pop("GOALFLIGHT_LIVE_SSH", None)
+            billing.assert_dispatch_auth(fleet_dir, "localhost", "openai/default")
+            assert_true("no default re-probe without LIVE_SSH", len(calls) == 0)
+            os.environ["GOALFLIGHT_LIVE_SSH"] = "1"
+            billing.assert_dispatch_auth(fleet_dir, "localhost", "openai/default")
+            assert_true("default re-probe runs with LIVE_SSH=1", len(calls) == 1)
+        finally:
+            billing.run_node_auth_probe = orig
+            if old_env is None:
+                os.environ.pop("GOALFLIGHT_LIVE_SSH", None)
+            else:
+                os.environ["GOALFLIGHT_LIVE_SSH"] = old_env
+
+
 def main() -> None:
     for test in (
         test_account_link_runs_probe_and_writes_artifact,
@@ -630,6 +728,10 @@ def main() -> None:
         test_account_link_cli_fails_closed_on_red_probe,
         test_doctor_fleet_shape,
         test_dispatch_gate_blocks_red_auth,
+        test_dispatch_auth_reprobes_stale_red_and_allows_now_valid,
+        test_dispatch_auth_reprobes_stale_green_and_blocks_revoked,
+        test_dispatch_auth_trusts_fresh_probe_without_reprobe,
+        test_dispatch_auth_default_reprobe_gated_on_live_ssh,
         test_dispatch_auth_refuses_recorded_controller_owner_mismatch,
         test_dispatch_auth_allows_legacy_usable_fleet_json,
         test_dispatch_auth_legacy_fleet_missing_membership_field_fails_closed,

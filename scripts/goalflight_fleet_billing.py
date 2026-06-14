@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -14,6 +15,10 @@ import goalflight_fleet_ssh as fleet_ssh
 AUTH_PROBE_SCHEMA = "goalflight.fleet.auth-probe.v1"
 ProbeRunner = Callable[[list[str]], tuple[int, str, str]]
 INCONCLUSIVE_STATUS = "inconclusive"
+# Max age of a cached auth probe the dispatch gate will trust before re-probing live.
+# Kept short: a stale GREEN would pass a since-revoked token, and a stale RED would block a
+# now-valid one (observed: a 6h-old pre-token RED blocked a valid claude-acp dispatch).
+AUTH_PROBE_TTL_S = 900
 
 PROVIDER_BY_ACCOUNT: dict[str, str] = {
     "openai": "openai",
@@ -282,6 +287,26 @@ def read_probe_artifact(fleet_dir: Path, node_id: str, account_key: str) -> dict
         return None
 
 
+def probe_is_fresh(payload: dict[str, Any] | None, ttl_s: int) -> bool:
+    """True iff the probe artifact's ``probed_at`` is within ``ttl_s`` of now.
+
+    A cached auth verdict can silently invert with age (token granted/revoked), so the
+    dispatch gate must treat a stale artifact as "must re-probe" rather than trust it.
+    Missing/unparseable ``probed_at`` is treated as stale (fail-closed -> re-probe).
+    """
+    import goalflight_fleet as fleet
+
+    if not isinstance(payload, dict):
+        return False
+    probed = fleet.parse_iso(payload.get("probed_at"))
+    if probed is None:
+        return False
+    try:
+        return (fleet.utc_now() - probed).total_seconds() <= ttl_s
+    except (TypeError, ValueError):
+        return False  # tz-naive / uncomparable timestamp -> treat as stale (re-probe)
+
+
 def _dispatch_node_entry(fleet_doc: Any, node_id: str, account_key: str) -> dict[str, Any]:
     if not isinstance(fleet_doc, dict):
         raise DispatchAuthError(
@@ -544,7 +569,36 @@ def fleet_auth_doctor(
     }
 
 
-def assert_dispatch_auth(fleet_dir: Path, node_id: str, account_key: str) -> None:
+def _run_reprobe(
+    reprobe_fn: Callable[..., dict[str, Any]],
+    fleet_dir: Path,
+    node_id: str,
+    account_key: str,
+) -> dict[str, Any]:
+    """Run a live auth re-probe, normalizing any failure to a red DispatchAuthError.
+
+    A re-probe that raises (unknown node, SSH error, ...) must surface as a clean auth
+    block, not an uncaught traceback through the dispatch gate.
+    """
+    try:
+        return reprobe_fn(fleet_dir, node_id, account_key, write_artifact=True)
+    except DispatchAuthError:
+        raise
+    except Exception as exc:  # normalize ANY probe failure to a red gate
+        raise DispatchAuthError(
+            f"auth re-probe failed for node={node_id} account={account_key}: {exc}",
+            auth_probe="red",
+        ) from exc
+
+
+def assert_dispatch_auth(
+    fleet_dir: Path,
+    node_id: str,
+    account_key: str,
+    *,
+    ttl_s: int = AUTH_PROBE_TTL_S,
+    reprobe: Callable[..., dict[str, Any]] | None = None,
+) -> None:
     import goalflight_fleet as fleet
     import goalflight_fleet_schemas as schemas
 
@@ -589,12 +643,19 @@ def assert_dispatch_auth(fleet_dir: Path, node_id: str, account_key: str) -> Non
             )
 
         payload = read_probe_artifact(fleet_dir, node_id, account_key)
-        if payload is None:
-            raise DispatchAuthError(
-                f"missing auth probe for node={node_id} account={account_key}",
-                auth_probe="red",
-            )
-        status = str(payload.get("status") or "red")
+        if payload is None or not probe_is_fresh(payload, ttl_s):
+            # Stale/missing cached probe must not decide auth: a stale RED would block a
+            # now-valid token, a stale GREEN would pass a since-revoked one. Re-probe live and
+            # decide on the fresh result. The default (real-SSH) re-probe runs ONLY when
+            # GOALFLIGHT_LIVE_SSH=1, so a non-live --exec never SSHes before
+            # assert_live_ssh_opt_in refuses it (an injected reprobe -- tests -- always runs;
+            # a non-live --exec is refused downstream regardless, so the cached verdict is moot).
+            reprobe_fn = reprobe
+            if reprobe_fn is None and os.environ.get("GOALFLIGHT_LIVE_SSH") == "1":
+                reprobe_fn = run_node_auth_probe
+            if reprobe_fn is not None:
+                payload = _run_reprobe(reprobe_fn, fleet_dir, node_id, account_key)
+        status = str((payload or {}).get("status") or "red")
         if status != "green":
             if status == "red":
                 raise DispatchAuthError(

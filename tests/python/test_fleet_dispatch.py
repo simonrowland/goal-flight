@@ -191,7 +191,10 @@ def test_red_auth_blocks_exec() -> None:
                     "account_key": "openai/default",
                     "status": "red",
                     "provider": "openai",
-                    "probed_at": "2026-05-24T12:00:00+00:00",
+                    # Fresh: the gate trusts a recent RED and blocks. A STALE red instead
+                    # triggers a live re-probe (covered by test_fleet_billing_auth's
+                    # stale-red/stale-green poison-pairs), which is non-deterministic here.
+                    "probed_at": fleet.iso(),
                 },
             )
             args = Args(
