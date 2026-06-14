@@ -1230,6 +1230,48 @@ def watch_until_terminal(
         sleep_fn(min(sleep_for, max(deadline - now, 0.0)))
 
 
+def release_lock_on_confirmed_terminal(fleet_dir: Path, dispatch_id: str, state: str) -> bool:
+    """Release a dispatch's account lock once it is CONFIRMED terminal. Best-effort; never raises.
+
+    Closes the lock-lifecycle gap where a terminal dispatch stranded its account lock until the
+    ~1h TTL because the only release path (reconcile) saw a stale mirror. Here the watcher has
+    FRESH terminal confirmation, so releasing is safe — no stale-mirror guessing. Guards:
+    - only on a confirmed terminal state (caller passes exit_code==0 results);
+    - NEVER for a salvage-needed terminal (a dirty worktree must be salvaged before the lock frees);
+    - only OUR own currently-active lock (owner_dispatch_id match) — never another dispatch's.
+    Returns True iff a release was performed.
+    """
+    try:
+        # Self-safe: release ONLY a genuinely terminal, non-salvage state, independent of the
+        # caller's gating — never release a running/unknown dispatch's lock.
+        if not state or not fleet_status.is_terminal_state(state):
+            return False
+        if state in fleet_status.SALVAGE_NEEDED_STATES:
+            return False
+        import goalflight_fleet as fleet
+        import goalflight_fleet_reconcile as fleet_reconcile
+
+        meta = _read_json_object(dispatch_meta_path(fleet_dir, dispatch_id))
+        lock = fleet_reconcile.resolve_account_lock_for_dispatch(fleet_dir, dispatch_id, meta)
+        if not isinstance(lock, dict) or lock.get("state") != "active":
+            return False
+        if lock.get("owner_dispatch_id") != dispatch_id:
+            return False  # someone else's lock — never release it
+        account_key = lock.get("account_key")
+        fencing_token = lock.get("fencing_token")
+        if not account_key or not fencing_token:
+            return False
+        fleet.release_account_lock(
+            fleet_dir,
+            account_key=str(account_key),
+            fencing_token=str(fencing_token),
+            reason=f"terminal_confirmed:{state}",
+        )
+        return True
+    except Exception:
+        return False
+
+
 def cmd_watch_fleet(args) -> int:
     import goalflight_fleet as fleet
 
@@ -1248,6 +1290,10 @@ def cmd_watch_fleet(args) -> int:
             interval_s=float(getattr(args, "interval", 0.0) or DEFAULT_UNTIL_INTERVAL_S),
             stale_s=float(getattr(args, "stale_s", DEFAULT_STALE_S)),
         )
+        if result.exit_code == 0:
+            # Confirmed terminal -> free the account lock now (don't strand it until TTL
+            # waiting on a reconcile that may only ever see a stale mirror).
+            release_lock_on_confirmed_terminal(args.fleet_dir, str(until_terminal), result.state)
         if args.json:
             print(json.dumps(result.to_dict(), indent=2))
         else:

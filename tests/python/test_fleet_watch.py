@@ -1278,6 +1278,78 @@ def test_until_terminal_fetch_failure_retries() -> None:
         assert_true("poll count", result.polls == 2)
 
 
+def test_release_lock_on_confirmed_terminal_releases_own_complete() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        fleet_dir = Path(td) / "fleet"
+        fleet.bootstrap(fleet_dir)
+        fleet.acquire_account_lock(fleet_dir, account_key="anthropic/x", owner_dispatch_id="d1")
+        released = fleet_watch.release_lock_on_confirmed_terminal(fleet_dir, "d1", "complete")
+        assert_true("released on complete", released is True)
+        lock = fleet.load_account_lock(fleet.account_lock_path(fleet_dir, "anthropic/x"))
+        assert_true("lock no longer active", lock is None or lock.get("state") == "released")
+
+
+def test_release_lock_skips_running_state() -> None:
+    # Self-safe: a non-terminal state must NEVER release the lock (don't free a live dispatch).
+    with tempfile.TemporaryDirectory() as td:
+        fleet_dir = Path(td) / "fleet"
+        fleet.bootstrap(fleet_dir)
+        fleet.acquire_account_lock(fleet_dir, account_key="anthropic/x", owner_dispatch_id="d1")
+        released = fleet_watch.release_lock_on_confirmed_terminal(fleet_dir, "d1", "running")
+        assert_true("not released for running", released is False)
+        lock = fleet.load_account_lock(fleet.account_lock_path(fleet_dir, "anthropic/x"))
+        assert_true("running lock still active", lock is not None and lock.get("state") == "active")
+
+
+def test_release_lock_skips_salvage_terminal() -> None:
+    salvage_state = next(iter(fleet_watch.fleet_status.SALVAGE_NEEDED_STATES))
+    with tempfile.TemporaryDirectory() as td:
+        fleet_dir = Path(td) / "fleet"
+        fleet.bootstrap(fleet_dir)
+        fleet.acquire_account_lock(fleet_dir, account_key="anthropic/x", owner_dispatch_id="d1")
+        released = fleet_watch.release_lock_on_confirmed_terminal(fleet_dir, "d1", salvage_state)
+        assert_true("not released for salvage", released is False)
+        lock = fleet.load_account_lock(fleet.account_lock_path(fleet_dir, "anthropic/x"))
+        assert_true("salvage lock held for salvage", lock is not None and lock.get("state") == "active")
+
+
+def test_release_lock_skips_foreign_lock() -> None:
+    # A terminal d1 must NEVER release a lock owned by a different dispatch (d2).
+    with tempfile.TemporaryDirectory() as td:
+        fleet_dir = Path(td) / "fleet"
+        fleet.bootstrap(fleet_dir)
+        fleet.acquire_account_lock(fleet_dir, account_key="anthropic/x", owner_dispatch_id="d2")
+        released = fleet_watch.release_lock_on_confirmed_terminal(fleet_dir, "d1", "complete")
+        assert_true("foreign lock not released", released is False)
+        lock = fleet.load_account_lock(fleet.account_lock_path(fleet_dir, "anthropic/x"))
+        assert_true("foreign lock still active", lock is not None and lock.get("state") == "active")
+
+
+def test_release_lock_releases_clean_failure_terminal() -> None:
+    # Non-salvage FAILURE terminals (e.g. worker_dead) also free the lock, not just `complete`.
+    with tempfile.TemporaryDirectory() as td:
+        fleet_dir = Path(td) / "fleet"
+        fleet.bootstrap(fleet_dir)
+        fleet.acquire_account_lock(fleet_dir, account_key="anthropic/x", owner_dispatch_id="d1")
+        released = fleet_watch.release_lock_on_confirmed_terminal(fleet_dir, "d1", "worker_dead")
+        assert_true("released on clean failure terminal", released is True)
+        lock = fleet.load_account_lock(fleet.account_lock_path(fleet_dir, "anthropic/x"))
+        assert_true("failure-terminal lock freed", lock is None or lock.get("state") == "released")
+
+
+def test_release_lock_no_double_release() -> None:
+    # An already-released lock (a failure path released it first) -> no-op, no error/double-release.
+    with tempfile.TemporaryDirectory() as td:
+        fleet_dir = Path(td) / "fleet"
+        fleet.bootstrap(fleet_dir)
+        lock = fleet.acquire_account_lock(fleet_dir, account_key="anthropic/x", owner_dispatch_id="d1")
+        fleet.release_account_lock(
+            fleet_dir, account_key="anthropic/x", fencing_token=str(lock["fencing_token"]), reason="prior"
+        )
+        again = fleet_watch.release_lock_on_confirmed_terminal(fleet_dir, "d1", "complete")
+        assert_true("no double release", again is False)
+
+
 def main() -> None:
     test_ingest_advances_mirror_and_meta()
     test_ingest_rejects_mismatched_dispatch_id_payload()
@@ -1309,7 +1381,13 @@ def main() -> None:
     test_until_terminal_unconfirmed_dead_pid_before_grace_stays_unconfirmed()
     test_until_terminal_unconfirmed_dead_pid_after_grace_fails_and_releases_lock()
     test_until_terminal_fetch_failure_retries()
-    print("OK: 30 fleet watch tests pass")
+    test_release_lock_on_confirmed_terminal_releases_own_complete()
+    test_release_lock_skips_running_state()
+    test_release_lock_skips_salvage_terminal()
+    test_release_lock_skips_foreign_lock()
+    test_release_lock_releases_clean_failure_terminal()
+    test_release_lock_no_double_release()
+    print("OK: 36 fleet watch tests pass")
 
 
 if __name__ == "__main__":
