@@ -188,9 +188,11 @@ Read `protocols/chunk-review.md`.
 
 - inspect diff
 - run focused tests
-- run at least one independent pre-commit review per `protocols/chunk-review.md`
-  (default gstack `/review` on the chunk diff; `./scripts/autoreview.sh --mode local`
-  may run in parallel as a complementary diff-local pass; background if >10s)
+- run at least **two** independent, **concern-diverse** pre-commit reviews per
+  `protocols/chunk-review.md` (the parallel flight is the FLOOR, not just the norm) — e.g.
+  gstack `/review` on the chunk diff AND `./scripts/autoreview.sh --mode local` in parallel,
+  or two concern-diverse engines; background if >10s. Review each patch **to convergence** —
+  a clean (zero-P0/P1/P2) round, not a round count
 - run executor self-review findings when present in worker output
 - fix P0/P1/P2 from review before commit
 - commit when the active goal-flight workflow completes a chunk (default: one
@@ -209,9 +211,11 @@ Read `protocols/chunk-review.md`.
 
 9. Milestone review (separate from step 8):
 
-At configured cadence or `[milestone]` chunks, run file-backed review flights
-per `protocols/milestone-review.md` via `scripts/goalflight_review_job.py`.
-Missing/stalled/session-limited reviews are inconclusive, not clean.
+At the configured cadence — **default: every 5 commit-worthy chunks since the last milestone
+sweep, unless the active plan sets K** — or on any `[milestone]` chunk, run file-backed review
+flights per `protocols/milestone-review.md` via `scripts/goalflight_review_job.py`. This gate is
+**mandatory and the most-forgotten**: a DUE sweep holds further chunk dispatch until it converges
+(a clean round). Missing/stalled/session-limited reviews are inconclusive, not clean.
 
 10. Resume/handoff:
 

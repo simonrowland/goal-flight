@@ -7,23 +7,29 @@ chunk-level wording into milestone docs or vice versa).
 ## When
 
 After a chunk's implementation and focused tests pass, before the orchestrator
-commits. At least one independent review per chunk — executor self-review
-alone is **not** sufficient.
+commits. At least **two independent, concern-diverse reviews** per commit-worthy
+chunk — executor self-review alone is **not** sufficient, and neither is a single
+reviewer.
 
 **The norm is a parallel review flight, not a single pass.** For a commit-worthy
 chunk, run **≥2 concern-diverse reviewers in parallel** (e.g. gstack `/review` +
 `./scripts/autoreview.sh`, or two concern-diverse engines), and add **model
 diversity** when the change is subtle, security-/contract-bearing, or a fix
-closure. The floor is ≥1; **routinely running only the floor is the under-review
-pathology this protocol exists to prevent** — the failure mode is too FEW passes,
-never too many. Dispatch the legs in parallel (backgrounded), not serially, so
-review breadth costs wall-clock once, not N times.
+closure. **The floor is ≥2** — the parallel concern-diverse flight is the mandatory
+minimum, not merely the norm; a single review does not satisfy it. The failure mode
+is too FEW reviews, never too many (and "too few" now means fewer than two). Dispatch
+the legs in parallel (backgrounded), not serially, so review breadth costs wall-clock
+once, not N times.
 
 **And review each patch TO CONVERGENCE, not one-and-done.** A single parallel pass
 that surfaces findings hasn't *reviewed* the patch — it has *started*. Loop
-review → fix → re-review on the SAME patch until a pass comes back CLEAN (no new
-P0/P1/P2). The two pillars are **parallel breadth** (concern-diverse reviewers at
-once) and **per-patch convergence** (iterate to clean before the patch is done).
+review → fix → re-review on the SAME patch until a review round comes back CLEAN.
+**Convergence is DEFINED by that clean round — a review pass that finds zero
+P0/P1/P2 — NOT by a round count.** It may take one round (the first pass is already
+clean) or several; running N rounds is not "converged", a clean round is, and many
+rounds without a clean one is explicitly NOT converged. The two pillars are
+**parallel breadth** (concern-diverse reviewers at once) and **per-patch
+convergence** (a clean — zero-P0/P1/P2 — round before the patch is done).
 
 ## How the review runs (bash-tail subprocess, not nested ACP tool call)
 
@@ -233,9 +239,10 @@ review time, not dead time.
 | `./scripts/autoreview.sh` (complementary) | Diff-local pre-commit pass, parallel with gstack | Per chunk when orchestrator chooses |
 | Milestone review | `protocols/milestone-review.md` (gstack `/review` + concern-diverse sweep) | At K-commit cadence or `[milestone]` queue chunks |
 
-Minimum before commit: focused tests green **and** at least one independent
-review (the FLOOR). The gstack path satisfies the floor; the NORM is the parallel
-flight above. **Every new bug class a review surfaces triggers the
+Minimum before commit: focused tests green **and** at least **two independent,
+concern-diverse reviews** (the FLOOR), run in parallel and iterated to convergence.
+A single reviewer no longer satisfies the floor; gstack `/review` is one leg, not the
+whole gate. **Every new bug class a review surfaces triggers the
 MINT-generalize loop** (`protocols/review-mining.md`): record the class predicate,
 backwards-sweep code + the saved review archive for more instances, and re-audit
 for it at milestones. Recording new bug shapes and re-auditing for them is part

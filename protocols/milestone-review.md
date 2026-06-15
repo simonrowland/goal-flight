@@ -4,6 +4,24 @@ Milestone-scale review flights at configured cadence or `[milestone]` queue
 chunks. **Separate protocol** from per-chunk pre-commit review
 (`protocols/chunk-review.md`).
 
+## When — mandatory cadence, NOT optional (the most-forgotten review layer)
+
+Two triggers, **mandatory at each** — milestone sweeps are routinely forgotten, so treat
+them as a gate, not a nicety:
+- **K-commit cadence** — every K commit-worthy chunks since the last milestone sweep (K per
+  the active plan / `commands/execute.md`; default 5 when unset).
+- **`[milestone]`-tagged chunks** — run the sweep as soon as that chunk lands.
+
+Track the commit of the last completed milestone sweep (its deposit under
+`docs-private/reviews/<date>-milestone-*/`). When the chunk count since then reaches K — or a
+`[milestone]` chunk lands — the sweep is **DUE**, and further chunk dispatch **waits until it
+COMPLETES — i.e. converges to a clean (zero-P0/P1/P2) round**, not merely launches. A skipped or
+overdue milestone sweep is an **open liability, not a clean state** (same rule as an unswept bug
+class); "I'll do it later" is a skip. The sweep is a **parallel concern-diverse flight reviewed to
+convergence** (the same **≥2-reviewer floor**; the milestone Convergence rule below governs what
+"converged" means here) across the milestone's accumulated diff, plus a backwards-looking pass
+over every chunk landed since the last milestone.
+
 Run reviewers as file-backed jobs:
 
 ```bash
@@ -45,9 +63,11 @@ Convergence rule:
 
 1. Run concern-diverse review flights.
 2. Fix confirmed P0/P1/P2 issues.
-3. Repeat until no new material findings appear or remaining findings are
-   explicitly accepted as backlog.
-4. Do not treat a missing/stalled review as clean.
+3. Repeat until a review round returns **zero P0/P1/P2** — that clean round IS
+   convergence (NOT a round count; remaining P3s or explicitly-accepted backlog
+   aside). One clean round suffices; many rounds without a clean one is NOT converged.
+4. Do not treat a missing/stalled review as clean — and do not treat a round count as
+   a clean round.
 
 **Default reviewer routing**: lean on gstack's `/review` skill (codex-side
 install at `~/.codex/skills/gstack/`). That gives a structured findings-
