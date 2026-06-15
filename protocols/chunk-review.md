@@ -10,6 +10,21 @@ After a chunk's implementation and focused tests pass, before the orchestrator
 commits. At least one independent review per chunk — executor self-review
 alone is **not** sufficient.
 
+**The norm is a parallel review flight, not a single pass.** For a commit-worthy
+chunk, run **≥2 concern-diverse reviewers in parallel** (e.g. gstack `/review` +
+`./scripts/autoreview.sh`, or two concern-diverse engines), and add **model
+diversity** when the change is subtle, security-/contract-bearing, or a fix
+closure. The floor is ≥1; **routinely running only the floor is the under-review
+pathology this protocol exists to prevent** — the failure mode is too FEW passes,
+never too many. Dispatch the legs in parallel (backgrounded), not serially, so
+review breadth costs wall-clock once, not N times.
+
+**And review each patch TO CONVERGENCE, not one-and-done.** A single parallel pass
+that surfaces findings hasn't *reviewed* the patch — it has *started*. Loop
+review → fix → re-review on the SAME patch until a pass comes back CLEAN (no new
+P0/P1/P2). The two pillars are **parallel breadth** (concern-diverse reviewers at
+once) and **per-patch convergence** (iterate to clean before the patch is done).
+
 ## How the review runs (bash-tail subprocess, not nested ACP tool call)
 
 **gstack `/review` is read-only — invoke it as a bash-tail subprocess with
@@ -90,12 +105,15 @@ the gate intercepted it as a write-grade execute.
 
 Both worker and orchestrator can run the same bash-tail shape:
 
-1. **Worker phase (preferred when worker can)**: the goal-mode worker
-   includes a self-review step in its loop. It spawns the bash-tail
-   subprocess above, reads the findings, applies P3-safe-easy inline,
-   surfaces P0/P1/P2 as queue items or holds the chunk open. Worker commit
-   includes review evidence (the `codex-review.final.md` path) in the
-   commit message.
+1. **Worker phase — review ENCLOSED in the goal loop (required whenever the
+   worker can spawn subprocesses)**: the goal-mode worker runs a
+   **review-to-green pass inside its own loop before handoff** — it does NOT
+   emit `COMPLETE` until its enclosed review is green (P0/P1/P2 resolved or
+   explicitly held). It spawns the bash-tail subprocess above, reads the
+   findings, applies P3-safe-easy inline, fixes/holds P0/P1/P2, and loops until
+   clean. Worker commit includes review evidence (the `codex-review.final.md`
+   path) in the commit message. Enclosing review in the loop is the NORM, not an
+   optimization — a converged chunk is a *reviewed* converged chunk.
 2. **Orchestrator phase (fallback / second-opinion)**: if the worker can't
    run the review (e.g., the chunk's authorized scope doesn't include it,
    or the dispatch transport doesn't let the worker spawn subprocesses
@@ -198,6 +216,14 @@ Background long autoreview runs per `commands/execute.md` step 5 — write
 output to `docs-private/reviews/<date>-chunk-<slug>/autoreview.txt` and poll;
 do not block the orchestrator on streaming stdout.
 
+**Backwards-looking cadence (standing, not milestone-only).** Run autoreview
+over already-LANDED chunks *while the next chunk's executor is running* — overlap
+review time with build time so review keeps pace without serializing the queue.
+Don't wait for a milestone to look back: every few commits, sweep the recent
+committed chunks with a backgrounded autoreview pass in parallel with in-flight
+work, and fold any findings as follow-up fix-chunks. Idle-wait on a dispatch is
+review time, not dead time.
+
 ## Layers
 
 | Layer | Role | Cadence |
@@ -208,8 +234,12 @@ do not block the orchestrator on streaming stdout.
 | Milestone review | `protocols/milestone-review.md` (gstack `/review` + concern-diverse sweep) | At K-commit cadence or `[milestone]` queue chunks |
 
 Minimum before commit: focused tests green **and** at least one independent
-review. The gstack path satisfies this; complementary autoreview adds signal
-but does not replace the gstack default.
+review (the FLOOR). The gstack path satisfies the floor; the NORM is the parallel
+flight above. **Every new bug class a review surfaces triggers the
+MINT-generalize loop** (`protocols/review-mining.md`): record the class predicate,
+backwards-sweep code + the saved review archive for more instances, and re-audit
+for it at milestones. Recording new bug shapes and re-auditing for them is part
+of the review cadence — not a separate optional step that lapses.
 
 ## Fallback when both gstack and autoreview are absent
 
@@ -248,6 +278,17 @@ Recommended add-ons at setup/init: **gstack** (default reviewer) and
 autoreview is vendored at `autoreview/scripts/autoreview` (override with
 `AUTOREVIEW_HELPER`). Doctor reports WARN when
 either is absent.
+
+### Optional pre-commit review reminder (off by default)
+
+A double-opt-in pre-commit nudge ships at `scripts/goalflight_review_reminder.py`, wired in
+`hooks/pre-commit`. It is OFF by default and **cannot be forced on a downloader**: git hooks
+aren't distributed with a clone, the repo activates hooks via local `core.hooksPath=hooks`, and
+even then the reminder only fires when enabled (`git config goalflight.reviewReminder true` or
+`GOALFLIGHT_REVIEW_REMINDER=1`). Enabled, it prints a reminder to run the review flight and
+**exits 0 — never blocks**. Strict mode (`git config goalflight.reviewStrict true`) blocks until
+acknowledged. Overrides: `GOALFLIGHT_REVIEW_OK=1` (you reviewed), or `git commit --no-verify`
+(skip all hooks). It is a solo/local nudge, never an enforced gate on downstream sessions.
 
 ## Commit hygiene at chunk completion
 

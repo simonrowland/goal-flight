@@ -8,4 +8,11 @@ REPO_ROOT="$(git rev-parse --show-toplevel)"
 # Pro session to API billing. Keep the literal keywords out of this hook; the
 # guard script stores them base64-encoded and redacts them in output. Background
 # for humans/agents: https://www.reddit.com/r/ClaudeAI/search/?q=Claude%20Code%20git-visible%20billing%20trigger&restrict_sr=1
-exec python3 "$REPO_ROOT/scripts/goalflight_trigger_guard.py" --repo "$REPO_ROOT" --staged
+python3 "$REPO_ROOT/scripts/goalflight_trigger_guard.py" --repo "$REPO_ROOT" --staged
+
+# Optional review reminder (DOUBLE opt-in: repo hooks active AND
+# `git config goalflight.reviewReminder true` / GOALFLIGHT_REVIEW_REMINDER=1).
+# Default = no-op. Enabled = reminder, exit 0 (never blocks). Strict mode
+# (goalflight.reviewStrict) blocks, overridable via GOALFLIGHT_REVIEW_OK=1 or
+# `git commit --no-verify`. See scripts/goalflight_review_reminder.py.
+python3 "$REPO_ROOT/scripts/goalflight_review_reminder.py"
