@@ -64,6 +64,7 @@ PID_DEAD_MARKER_GRACE_SECS=1
 # is the watcher mirror of the runner's intra-decision re-sample grace
 # (goalflight_liveness.cpu_liveness_keep_waiting) — same goal, keep them aligned.
 WEDGE_CONFIRM_SAMPLES=2
+CPU_UNKNOWN_CONFIRM_SAMPLES=$(( WEDGE_CONFIRM_SAMPLES + 2 ))
 # Pidfile dir. Honors $GOAL_FLIGHT_PIDFILE_DIR so tests can redirect registration
 # into an isolated temp dir. Default is unchanged, so in production the watcher and
 # scripts/acp_client.py still share /tmp/goal-flight-acp-pids.d and cleanup_ghosts
@@ -146,7 +147,12 @@ ps_meta() {
 
 pgroup_cpu_pct() {
   local pgid="$1"
-  ps -A -o pgid=,%cpu= 2>/dev/null | awk -v target="$pgid" '
+  local sample
+  if ! sample=$(ps -A -o pgid=,%cpu= 2>/dev/null); then
+    echo "unknown"
+    return 0
+  fi
+  printf '%s\n' "$sample" | awk -v target="$pgid" '
     BEGIN { sum = 0; found = 0 }
     $1 == target { sum += $2 + 0; found = 1 }
     END {
@@ -165,31 +171,50 @@ worker_pgid_current() {
 
 cpu_gt_epsilon() {
   local cpu="$1"
+  case "$cpu" in
+    ""|unknown) return 2 ;;
+  esac
   awk -v cpu="$cpu" -v eps="$CPU_EPSILON" 'BEGIN { exit ! ((cpu + 0) > (eps + 0)) }'
 }
 
 worker_lstart_comm=""
-for _attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-  worker_lstart_comm=$(ps_meta "$WORKER_PID")
-  [ -n "$worker_lstart_comm" ] && break
-  kill -0 "$WORKER_PID" 2>/dev/null || break
-  sleep 0.1
-done
-if [ -z "$worker_lstart_comm" ]; then
-  echo "watcher: worker PID $WORKER_PID not alive at startup; exiting 1" >&2
-  exit 1
+PS_AVAILABLE=1
+if ! ps -o pid= -p "$$" >/dev/null 2>&1; then
+  PS_AVAILABLE=0
 fi
-# Split: lstart is the first 5 whitespace tokens, comm is the rest.
-worker_lstart=$(echo "$worker_lstart_comm" | awk '{print $1, $2, $3, $4, $5}')
-worker_comm=$(echo "$worker_lstart_comm" | awk '{for (i=6; i<=NF; i++) printf "%s%s", $i, (i<NF ? " " : "")}')
+if [ "$PS_AVAILABLE" -eq 0 ]; then
+  if kill -0 "$WORKER_PID" 2>/dev/null; then
+    worker_lstart="unknown"
+    worker_comm="unknown"
+  else
+    echo "watcher: worker PID $WORKER_PID not alive at startup; exiting 1" >&2
+    exit 1
+  fi
+else
+  for _attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    worker_lstart_comm=$(ps_meta "$WORKER_PID")
+    [ -n "$worker_lstart_comm" ] && break
+    kill -0 "$WORKER_PID" 2>/dev/null || break
+    sleep 0.1
+  done
+  if [ -z "$worker_lstart_comm" ]; then
+    echo "watcher: worker PID $WORKER_PID not alive at startup; exiting 1" >&2
+    exit 1
+  fi
+  # Split: lstart is the first 5 whitespace tokens, comm is the rest.
+  worker_lstart=$(echo "$worker_lstart_comm" | awk '{print $1, $2, $3, $4, $5}')
+  worker_comm=$(echo "$worker_lstart_comm" | awk '{for (i=6; i<=NF; i++) printf "%s%s", $i, (i<NF ? " " : "")}')
+fi
 
 worker_pgid=""
-for _attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-  worker_pgid=$(ps -o pgid= -p "$WORKER_PID" 2>/dev/null | tr -d ' ')
-  [ -n "$worker_pgid" ] && break
-  kill -0 "$WORKER_PID" 2>/dev/null || break
-  sleep 0.1
-done
+if [ "$PS_AVAILABLE" -ne 0 ]; then
+  for _attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    worker_pgid=$(ps -o pgid= -p "$WORKER_PID" 2>/dev/null | tr -d ' ')
+    [ -n "$worker_pgid" ] && break
+    kill -0 "$WORKER_PID" 2>/dev/null || break
+    sleep 0.1
+  done
+fi
 [ -z "$worker_pgid" ] && worker_pgid="$WORKER_PID"
 
 mkdir -p "$PIDFILE_DIR"
@@ -611,16 +636,28 @@ while true; do
         current_worker_pgid=$(worker_pgid_current "$WORKER_PID")
         [ -n "$current_worker_pgid" ] && worker_pgid="$current_worker_pgid"
         cpu_pct=$(pgroup_cpu_pct "$worker_pgid")
-        if cpu_gt_epsilon "$cpu_pct"; then
+        cpu_gt_epsilon "$cpu_pct"
+        cpu_check_rc=$?
+        if [ "$cpu_check_rc" -eq 0 ]; then
           wedge_streak=0
           echo "[$(date '+%H:%M:%S')] WATCHER-STATE: running_quiet worker_pid=$WORKER_PID pgid=$worker_pgid pgroup_cpu_pct=$cpu_pct idle_for=${idle_for}s (worker-or-child CPU active)"
           sleep "$POLL_SECS"
           continue
         fi
+        if [ "$cpu_check_rc" -eq 2 ]; then
+          wedge_streak=$(( wedge_streak + 1 ))
+          if [ "$wedge_streak" -lt "$CPU_UNKNOWN_CONFIRM_SAMPLES" ]; then
+            echo "[$(date '+%H:%M:%S')] WATCHER-STATE: running_quiet worker_pid=$WORKER_PID pgid=$worker_pgid pgroup_cpu_pct=unknown idle_for=${idle_for}s (cpu unavailable $wedge_streak/$CPU_UNKNOWN_CONFIRM_SAMPLES) — re-checking"
+            sleep "$POLL_SECS"
+            continue
+          fi
+        fi
         # CPU at/below epsilon: looks wedged. Require consecutive confirmations
         # so a single transient `ps` failure (cpu→0.0 for one poll) can't
         # false-positive a healthy worker into idle-timeout (codex P2 grace).
-        wedge_streak=$(( wedge_streak + 1 ))
+        if [ "$cpu_check_rc" -ne 2 ]; then
+          wedge_streak=$(( wedge_streak + 1 ))
+        fi
         if [ "$wedge_streak" -lt "$WEDGE_CONFIRM_SAMPLES" ]; then
           echo "[$(date '+%H:%M:%S')] WATCHER-STATE: wedge-unconfirmed ($wedge_streak/$WEDGE_CONFIRM_SAMPLES) worker_pid=$WORKER_PID pgid=$worker_pgid pgroup_cpu_pct=$cpu_pct idle_for=${idle_for}s — re-checking"
           sleep "$POLL_SECS"

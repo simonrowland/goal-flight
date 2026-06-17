@@ -74,6 +74,28 @@ orthogonal axes: **iteration pattern** (how many turns) and **comms shape**
     --agent <agent>
   ```
 
+## Durable dispatch queue
+
+- `goalflight_dispatch.py --submit` enqueues without blocking. `dispatch_id` is
+  the idempotency key: same id plus same replay args is a no-op with rc=0; same
+  id plus different args is a collision with rc=64.
+- `goalflight_dispatch.py drain` is short-lived. It launches only work that fits
+  current capacity caps, refreshes stale capacity first, and exits after one
+  pass (normally about a second), so cron or another supervisor may re-run it.
+- Queue rows start as `queued` in status JSON and the dispatch ledger. During a
+  drain claim the queue file carries `claimed` plus recovery metadata until the
+  worker reaches `starting` / `running` or stale-claim recovery resolves it.
+- `goalflight_status.py --done <dispatch-id>` treats `queued` /
+  `waiting_capacity` as still in flight, terminal states as done, and ambiguous
+  stale states as inconclusive until liveness or terminal output resolves them.
+- Claim recovery is launch-token based. A claimed row gets a launch token before
+  spawn intent. Stale token-only claims may be restored as `queued`; once launch
+  or spawn metadata exists, the claim is not restored. If matching worker
+  tracking is lost, recovery records `worker_dead`; legacy no-token claims may
+  still be restored.
+- Worker delivery stays pointer-only: workers write findings, reviews, and long
+  evidence to files, then return paths plus compact status markers.
+
 ## Claude worker surfaces (loop / one-shot / remote)
 
 When a chunk is routed to a **Claude** worker, the surface follows the iteration

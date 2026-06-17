@@ -1659,6 +1659,7 @@ async def _run_acp_dispatch_impl(
                     stderr_path=None,
                     status_path=str(status_path),
                     os_sandbox_json=json.dumps(payload.get("os_sandbox") or {}, sort_keys=True),
+                    queue_launch_token=getattr(cfg, "queue_launch_token", None),
                     state=state,
                     json=True,
                 )

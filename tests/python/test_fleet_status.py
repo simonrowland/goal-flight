@@ -121,6 +121,18 @@ def test_terminal_dead_pid_may_release() -> None:
     assert_true("may release", status.may_release_locks(row) is True)
 
 
+def test_watcher_stopped_alive_worker_does_not_release() -> None:
+    row = status.classify_dispatch_row(
+        ssh_reachable=True,
+        mirror=_mirror("watcher_stopped"),
+        lease_active=True,
+        pid_hint="alive",
+    )
+    assert_true("state", row.state == "running")
+    assert_true("watcher_stopped not terminal", status.is_terminal_state("watcher_stopped") is False)
+    assert_true("no release", status.may_release_locks(row) is False)
+
+
 def test_acp_final_failure_states_may_release() -> None:
     for state in ACP_FINAL_FAILURE_STATES:
         row = status.classify_dispatch_row(
@@ -152,9 +164,10 @@ def main() -> None:
     test_mirror_stale_never_releases()
     test_mirror_stale_unknown_never_releases()
     test_terminal_dead_pid_may_release()
+    test_watcher_stopped_alive_worker_does_not_release()
     test_acp_final_failure_states_may_release()
     test_orphan_lease_dead_pid_may_release()
-    print("OK: 9 fleet status tests pass")
+    print("OK: 10 fleet status tests pass")
 
 
 if __name__ == "__main__":

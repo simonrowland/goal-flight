@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import sys
 import tempfile
+import time
 from contextlib import redirect_stdout
 from pathlib import Path
 
@@ -205,6 +207,15 @@ def test_done_code() -> None:
         "worker_still_alive": False,
     }) == 0)
     check("unknown_no_pid -> 2", S.done_code(recs["amb1"]) == 2)
+    check("controller_dead no pid -> 0",
+          S.done_code({"state": "controller_dead", "classification": "controller_dead"}) == 0)
+    check("controller_dead live pid still terminal -> 0",
+          S.done_code({
+              "state": "controller_dead",
+              "classification": "controller_dead",
+              "worker_pid": 333,
+              "worker_still_alive": True,
+          }) == 0)
     timeout_summary = {
         "dispatch_id": "timeout-live",
         "classification": "idle_timeout",
@@ -283,6 +294,81 @@ def test_done_code() -> None:
         S.goalflight_ledger.identity_matches = orig_identity_matches
     check("stale_* -> 2", S.done_code({"classification": "stale_pid_reuse"}) == 2)
     check("missing classification -> 2 (do not claim done)", S.done_code({}) == 2)
+
+
+def test_output_tail_reconciles_success_marker_after_watcher_death() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        tail = Path(tmp) / "dead-worker.tail"
+        tail.write_text("work finished\nCOMPLETE: done from tail\n", encoding="utf-8")
+        started = S.goalflight_ledger.utc_now()
+        record = {
+            "dispatch_id": "tail-reconciled",
+            "classification": "stale_dead",
+            "state": "running",
+            "terminal_state": "unknown",
+            "agent": "codex",
+            "worker_pid": 999999,
+            "worker_identity": {"lstart": "Tue Jun  9 09:00:00 2026", "comm": "python3"},
+            "stdout_path": str(tail),
+            "started_at": started,
+        }
+        orig_identity_matches = S.goalflight_ledger.identity_matches
+        try:
+            S.goalflight_ledger.identity_matches = lambda _record: (False, "dead")
+            reconciled = S._reconcile_output_tail_record(record)
+            check("stale dead + final COMPLETE tail -> complete",
+                  reconciled.get("classification") == "complete")
+            check("reconciled status is terminal success",
+                  reconciled.get("terminal_state") == "complete" and S.done_code(reconciled) == 0)
+            check("raw stale signal retained",
+                  reconciled.get("raw_classification") == "stale_dead")
+            check("dead-worker reconciliation records gate reason",
+                  reconciled.get("output_tail_reconciliation", {}).get("promoted") is True)
+
+            S.goalflight_ledger.identity_matches = lambda _record: (True, "live")
+            fresh_live = S._reconcile_output_tail_record({**record, "classification": "watcher_stopped"})
+            check("live worker with fresh terminal tail does not reconcile complete",
+                  fresh_live.get("classification") == "watcher_stopped")
+            check("fresh live terminal marker signal retained",
+                  fresh_live.get("terminal_marker", {}).get("kind") == "COMPLETE")
+            check("fresh live reconciliation is explicitly unpromoted",
+                  fresh_live.get("output_tail_reconciliation", {}).get("promoted") is False)
+
+            os.utime(
+                tail,
+                (
+                    time.time() - S._OUTPUT_TAIL_IDLE_RECONCILE_S - 5,
+                    time.time() - S._OUTPUT_TAIL_IDLE_RECONCILE_S - 5,
+                ),
+            )
+            idle_live = dict(record)
+            idle_live.pop("started_at", None)
+            idle_live["classification"] = "idle_timeout"
+            idle_reconciled = S._reconcile_output_tail_record(idle_live)
+            check("live worker with idle terminal tail stays live",
+                  idle_reconciled.get("classification") == "idle_timeout")
+            check("idle live reconciliation is explicitly unpromoted",
+                  idle_reconciled.get("output_tail_reconciliation", {}).get("promoted") is False)
+            check("idle live reconciliation records alive reason",
+                  str(idle_reconciled.get("output_tail_reconciliation", {}).get("reason", "")).startswith("worker_alive_tail_idle:"))
+
+            no_identity = dict(record)
+            no_identity.pop("worker_identity", None)
+            no_identity.pop("started_at", None)
+            no_identity["classification"] = "watcher_stopped"
+            no_identity_reconciled = S._reconcile_output_tail_record(no_identity)
+            check("terminal tail without identity does not reconcile complete",
+                  no_identity_reconciled.get("classification") == "watcher_stopped")
+            check("identity-unavailable reconciliation reason surfaced",
+                  no_identity_reconciled.get("output_tail_reconciliation", {}).get("reason") == "liveness_indeterminate")
+        finally:
+            S.goalflight_ledger.identity_matches = orig_identity_matches
+
+        future = dict(record)
+        future["started_at"] = "2999-01-01T00:00:00+00:00"
+        unchanged = S._reconcile_output_tail_record(future)
+        check("implausible old tail mtime does not reconcile",
+              unchanged.get("classification") == "stale_dead")
 
 
 def test_idle_timeout_live_hint_rendered() -> None:
@@ -436,6 +522,7 @@ def main() -> int:
     test_worktree_scope()
     test_worktree_scope_symlinked_root()
     test_done_code()
+    test_output_tail_reconciles_success_marker_after_watcher_death()
     test_idle_timeout_live_hint_rendered()
     test_rate_pressure_warning_rendered()
     test_cli()

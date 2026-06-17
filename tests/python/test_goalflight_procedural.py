@@ -26,6 +26,7 @@ BLOCKED_CAPACITY_COOLDOWN_S = "300"
 
 import goalflight_doctor
 import goalflight_capacity
+import goalflight_chunk_summary
 import goalflight_review_job
 import goalflight_session_status
 
@@ -112,6 +113,33 @@ def test_chunk_summary_empty_state_dir_json_shape() -> None:
         "decision_hint",
     ):
         assert_true(f"chunk summary key {key}", key in payload)
+
+
+def test_chunk_summary_state_vocabulary() -> None:
+    assert_true(
+        "chunk summary waiting_capacity running",
+        goalflight_chunk_summary.normalize_state({"state": "waiting_capacity"}, None, None) == "running",
+    )
+    assert_true(
+        "chunk summary watcher_stopped running",
+        goalflight_chunk_summary.normalize_state({"state": "watcher_stopped"}, None, None) == "running",
+    )
+    assert_true(
+        "chunk summary running_quiet running",
+        goalflight_chunk_summary.normalize_state({"state": "running_quiet"}, None, None) == "running",
+    )
+    assert_true(
+        "chunk summary idle_timeout wedged",
+        goalflight_chunk_summary.normalize_state({"state": "idle_timeout"}, None, None) == "wedged",
+    )
+    assert_true(
+        "chunk summary blocked_capacity failed",
+        goalflight_chunk_summary.normalize_state({"state": "blocked_capacity"}, None, None) == "failed",
+    )
+    assert_true(
+        "chunk summary controller_dead failed",
+        goalflight_chunk_summary.normalize_state({"state": "controller_dead"}, None, None) == "failed",
+    )
 
 
 def test_capacity_prunes_review_terminal_states() -> None:
@@ -1572,6 +1600,7 @@ def main() -> None:
     tests = [
         test_capacity_acquire_release_cooldown,
         test_chunk_summary_empty_state_dir_json_shape,
+        test_chunk_summary_state_vocabulary,
         test_capacity_prunes_review_terminal_states,
         test_ledger_record_finish_status,
         test_doctor_json_shape,

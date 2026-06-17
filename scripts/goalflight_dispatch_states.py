@@ -19,6 +19,7 @@ TERMINAL_FAILURE_STATES = frozenset(
         "stalled",
         "remote_turn_silence",
         "failed_worktree",
+        "controller_dead",
     }
 )
 
@@ -33,6 +34,7 @@ SALVAGE_NEEDED_STATES = frozenset(
 
 RUNNING_STATES = frozenset(
     {
+        "queued",
         "starting",
         "running",
         "running_quiet",
@@ -41,10 +43,11 @@ RUNNING_STATES = frozenset(
 )
 
 DISPATCH_STATE_ALIASES = {
+    "queued": "waiting",
     "waiting_capacity": "waiting",
     "handshaking": "starting",
-    "watcher_stopped": "running_quiet",
     "idle_timeout": "inconclusive_timeout",
+    "watcher_stopped": "running_quiet",
 }
 
 TERMINAL_ERROR_STATES = frozenset(
@@ -76,11 +79,13 @@ def normalize_dispatch_state(state: object) -> str | None:
 
 
 def is_terminal_state(state: str | None) -> bool:
-    return bool(state and (state in TERMINAL_STATES or state in SALVAGE_NEEDED_STATES))
+    normalized = normalize_dispatch_state(state)
+    return bool(normalized and (normalized in TERMINAL_STATES or normalized in SALVAGE_NEEDED_STATES))
 
 
 def is_running_state(state: str | None) -> bool:
-    return bool(state and state in RUNNING_STATES)
+    normalized = normalize_dispatch_state(state)
+    return bool(normalized and normalized in RUNNING_STATES)
 
 
 def state_seq_rank(state: object) -> int:

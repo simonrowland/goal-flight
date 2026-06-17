@@ -21,6 +21,8 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 import goalflight_capacity
 import goalflight_ledger
+import goalflight_milestone
+from goalflight_watch import _last_line_is_terminal_marker
 
 # Each aggregated record carries a precomputed ``classification`` from
 # goalflight_ledger.classify(): the terminal STATE string when terminal, else one
@@ -30,6 +32,14 @@ import goalflight_ledger
 _LIVE_CLASS = "expected_live"
 _AMBIGUOUS_CLASS = {"unknown_no_pid", "identity_indeterminate", "unknown"}
 _LIVENESS_RECHECK_CLASSES = {"idle_timeout", "watcher_stopped"}
+_OUTPUT_TAIL_SUCCESS_MARKERS = {"READY", "COMPLETE", "RESULT"}
+_OUTPUT_TAIL_IDLE_RECONCILE_S = 30.0
+_OUTPUT_TAIL_RECONCILE_CLASSES = {
+    "worker_dead",
+    "watcher_stopped",
+    "idle_timeout",
+    "inconclusive_timeout",
+}
 
 
 def _has_recorded_worker_identity(record: dict) -> bool:
@@ -64,6 +74,20 @@ def _identity_record_for_liveness_recheck(record: dict) -> dict | None:
     return None
 
 
+def _identity_record_for_output_tail_reconcile(record: dict) -> dict | None:
+    if not record.get("worker_pid"):
+        return None
+    if _has_recorded_worker_identity(record):
+        return record
+    dispatch_id = record.get("dispatch_id")
+    if not dispatch_id:
+        return None
+    for raw in goalflight_ledger.read_records():
+        if raw.get("dispatch_id") == dispatch_id and _has_recorded_worker_identity(raw):
+            return raw
+    return None
+
+
 def _rechecked_worker_alive(record: dict) -> bool:
     if not _needs_liveness_recheck(record):
         return False
@@ -72,6 +96,136 @@ def _rechecked_worker_alive(record: dict) -> bool:
         return False
     ok, _reason = goalflight_ledger.identity_matches(identity_record)
     return ok
+
+
+def _output_tail_reconcile_gate(record: dict, *, tail_mtime: int | None) -> tuple[bool, str]:
+    identity_record = _identity_record_for_output_tail_reconcile(record)
+    if identity_record is None:
+        return False, "liveness_indeterminate"
+    ok, reason = goalflight_ledger.identity_matches(identity_record)
+    if not ok:
+        return True, f"worker_not_live:{reason}"
+    idle_s = time.time() - float(tail_mtime or 0)
+    if idle_s > _OUTPUT_TAIL_IDLE_RECONCILE_S:
+        return False, f"worker_alive_tail_idle:{int(idle_s)}s"
+    return False, f"worker_alive_tail_recent:{int(max(0.0, idle_s))}s"
+
+
+def _ignore_prefix_lines(prompt_path: object) -> list[str]:
+    if not prompt_path:
+        return []
+    try:
+        return [
+            ln.strip()
+            for ln in Path(str(prompt_path)).expanduser().read_text(
+                encoding="utf-8",
+                errors="replace",
+            ).splitlines()
+        ]
+    except OSError:
+        return []
+
+
+def _tail_path_from_record(record: dict) -> Path | None:
+    for key in ("stdout_path", "tail_path"):
+        value = record.get(key)
+        if value:
+            return Path(str(value)).expanduser()
+    status_path = record.get("status_path")
+    if not status_path:
+        return None
+    try:
+        payload = json.loads(Path(str(status_path)).expanduser().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    tail_path = payload.get("tail_path") if isinstance(payload, dict) else None
+    return Path(str(tail_path)).expanduser() if tail_path else None
+
+
+def _tail_mtime_plausible(tail: Path, record: dict) -> tuple[bool, int | None]:
+    try:
+        stat = tail.stat()
+    except OSError:
+        return False, None
+    mtime = float(stat.st_mtime)
+    started = goalflight_ledger.parse_utc(record.get("started_at"))
+    if started and mtime + 2.0 < started.timestamp():
+        return False, int(mtime)
+    if mtime > time.time() + 300.0:
+        return False, int(mtime)
+    return True, int(mtime)
+
+
+def _output_tail_reconcile_candidate(record: dict) -> bool:
+    cls = record.get("classification") or record.get("state") or "unknown"
+    if cls == _LIVE_CLASS:
+        return False
+    if cls in {"queued_capacity", "waiting_capacity", "queued"}:
+        return False
+    reason = str(record.get("reason") or record.get("error") or "")
+    terminal_state = record.get("terminal_state")
+    return bool(
+        cls in _OUTPUT_TAIL_RECONCILE_CLASSES
+        or str(cls).startswith("stale_")
+        or terminal_state in _OUTPUT_TAIL_RECONCILE_CLASSES
+        or "worker_dead_no_terminal_marker" in reason
+    )
+
+
+def _reconcile_output_tail_record(record: dict) -> dict:
+    """Read-only repair for launcher/watcher death after worker success.
+
+    The ledger/status liveness signals remain authoritative for live workers. This
+    only upgrades dead/stale rows when the worker output tail itself ends in a
+    success terminal marker with an mtime compatible with the ledger record.
+    """
+    if not _output_tail_reconcile_candidate(record):
+        return record
+    tail = _tail_path_from_record(record)
+    if tail is None:
+        return record
+    plausible, mtime = _tail_mtime_plausible(tail, record)
+    if not plausible:
+        return record
+    marker = _last_line_is_terminal_marker(
+        tail,
+        ignore_prefix_lines=_ignore_prefix_lines(record.get("prompt_path")),
+    )
+    if not marker or marker.get("kind") not in _OUTPUT_TAIL_SUCCESS_MARKERS:
+        return record
+    should_promote, gate_reason = _output_tail_reconcile_gate(record, tail_mtime=mtime)
+    if not should_promote:
+        out = dict(record)
+        out["terminal_marker"] = marker
+        out["terminal_marker_source"] = "output_tail"
+        out["tail_path"] = str(tail)
+        out["tail_mtime"] = mtime
+        out["output_tail_reconciliation"] = {
+            "candidate": True,
+            "promoted": False,
+            "reason": gate_reason,
+            "idle_threshold_s": _OUTPUT_TAIL_IDLE_RECONCILE_S,
+        }
+        return out
+    out = dict(record)
+    out.setdefault("raw_classification", record.get("classification"))
+    out.setdefault("raw_state", record.get("state"))
+    out.setdefault("raw_terminal_state", record.get("terminal_state"))
+    out["classification"] = "complete"
+    out["state"] = "complete"
+    out["terminal_state"] = "complete"
+    out["reason"] = f"marker:{marker.get('kind')}:output_tail_reconciliation"
+    out["terminal_marker"] = marker
+    out["terminal_marker_source"] = "output_tail"
+    out["tail_path"] = str(tail)
+    out["tail_mtime"] = mtime
+    out["output_tail_reconciliation"] = {
+        "candidate": True,
+        "promoted": True,
+        "reason": gate_reason,
+        "idle_threshold_s": _OUTPUT_TAIL_IDLE_RECONCILE_S,
+    }
+    return out
 
 
 def _reattach_hint(record: dict) -> str:
@@ -100,12 +254,20 @@ def status_payload() -> dict:
         capacity_state = goalflight_capacity.load_state()
     goalflight_capacity.prune_state(capacity_state)
     rate_pressure = goalflight_capacity.current_rate_pressure(argparse.Namespace())
+    dispatch = goalflight_ledger.status_payload()
+    dispatch = dict(
+        dispatch,
+        records=[
+            _reconcile_output_tail_record(record)
+            for record in dispatch.get("records", [])
+        ],
+    )
     return {
         "schema": "goalflight.status.aggregate.v1",
         "capacity": goalflight_capacity.profile(argparse.Namespace()),
         "capacity_state": capacity_state,
         "rate_pressure": rate_pressure,
-        "dispatch": goalflight_ledger.status_payload(),
+        "dispatch": dispatch,
     }
 
 
@@ -140,7 +302,7 @@ def done_code(record: dict) -> int:
         return 1 if _rechecked_worker_alive(record) else 0
     if cls == _LIVE_CLASS:
         return 1
-    if cls in {"queued_capacity", "waiting_capacity"}:
+    if cls in {"queued_capacity", "waiting_capacity", "queued"}:
         # Queued for a capacity slot: live by definition (the launcher is
         # polling acquire; the wait deadline bounds it). Without this branch
         # the raw-state fallback would misreport a queued dispatch as DONE.
@@ -173,6 +335,39 @@ def _dispatch_cells(record: dict) -> str:
     if sig and sig != cls:
         return f"{cls} {agent} {sig}"
     return f"{cls} {agent}"
+
+
+def _milestone_payload(project_root: str | None) -> dict:
+    if not project_root:
+        return {
+            "schema": goalflight_milestone.SCHEMA,
+            "active_cadence": False,
+            "commits_since": None,
+            "K": None,
+            "last_marker": None,
+            "due": False,
+            "reason": "no active cadence",
+            "warnings": [],
+            "error": None,
+        }
+    try:
+        return goalflight_milestone.check_status(
+            project_root=Path(project_root),
+            require_active_queue=True,
+        )
+    except Exception as exc:
+        detail = " ".join(f"{exc.__class__.__name__}: {exc}".split())
+        return {
+            "schema": goalflight_milestone.SCHEMA,
+            "active_cadence": False,
+            "commits_since": None,
+            "K": None,
+            "last_marker": None,
+            "due": False,
+            "reason": "milestone unavailable",
+            "warnings": [],
+            "error": detail,
+        }
 
 
 def _parse_wait_ids(values: list[str] | None) -> list[str]:
@@ -278,6 +473,8 @@ def render_text(payload: dict, limit: int) -> list[str]:
         f"{label}: running{running} done{done} ambig{ambig} "
         f"cooldowns{len(cooldowns)}  machine:{machine}/{cap.get('operating_cap')}"
     ]
+    if payload.get("milestone"):
+        lines.append(goalflight_milestone.format_line(payload["milestone"]))
     # Live/ambiguous first (what the controller is waiting on), then most-recent
     # terminal; cap at --limit.
     live = [r for r in records if done_code(r) != 0]
@@ -371,6 +568,8 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         print(f"{args.dispatch}  {_dispatch_cells(record)}  {record.get('status_path') or '-'}")
         return 0
+
+    payload["milestone"] = _milestone_payload(project_root)
 
     if args.json:
         print(json.dumps(payload, sort_keys=True))

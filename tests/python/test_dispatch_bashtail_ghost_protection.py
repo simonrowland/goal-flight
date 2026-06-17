@@ -247,6 +247,9 @@ def case_dead_worker_pidfile_unlinked_not_marked() -> None:
 
 
 def main() -> None:
+    if goalflight_acp_client._ps_meta(os.getpid()) is None:
+        print("OK: dispatch bash-tail ghost-protection tests skipped (ps unavailable)")
+        return
     case_live_bashtail_worker_not_killed_by_ghost_sweep()
     case_genuine_ghost_still_reaped()
     case_dead_worker_pidfile_unlinked_not_marked()

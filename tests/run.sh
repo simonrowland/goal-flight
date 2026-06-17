@@ -20,6 +20,10 @@ if [ "${1:-}" = "--list" ]; then
   list_only=1
 fi
 
+run_isolated_test_env() {
+  env -u GOALFLIGHT_STEER_FILE -u GOALFLIGHT_ALLOW_EXTERNAL_STEER_FILE "$@"
+}
+
 # Bash tests (tests/bash/test-*.sh)
 cd "$SCRIPT_DIR/bash"
 for test in test-*.sh; do
@@ -28,7 +32,19 @@ for test in test-*.sh; do
     echo "tests/bash/$test"
     continue
   fi
-  if bash "$test" > /tmp/goal-flight-test-$$.out 2>&1; then
+  # Live opencode ACP probes are slow (~300s each) and environment-flaky; they can
+  # wedge the whole suite on a stalled child. Skip EXECUTION by default; opt in
+  # explicitly. Listing above is intentionally unaffected so --list collection
+  # stays stable regardless of GOALFLIGHT_LIVE_OPENCODE.
+  case "$test" in
+    test-opencode-*.sh)
+      if [ "${GOALFLIGHT_LIVE_OPENCODE:-0}" != "1" ]; then
+        echo "SKIP  tests/bash/$test (live opencode ACP probe; set GOALFLIGHT_LIVE_OPENCODE=1 to run)"
+        continue
+      fi
+      ;;
+  esac
+  if run_isolated_test_env bash "$test" > /tmp/goal-flight-test-$$.out 2>&1; then
     echo "PASS  tests/bash/$test"
     pass=$((pass + 1))
   else
@@ -63,7 +79,7 @@ if command -v python3 >/dev/null 2>&1 && [ -d "$REPO_ROOT/tests/python" ]; then
       echo "$test"
       continue
     fi
-    if "$py" "$test" > /tmp/goal-flight-test-$$.out 2>&1; then
+    if run_isolated_test_env "$py" "$test" > /tmp/goal-flight-test-$$.out 2>&1; then
       if [ "$test" = "tests/python/test_skill_structure.py" ]; then
         skill_structure_seen=1
       fi

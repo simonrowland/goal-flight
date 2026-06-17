@@ -23,6 +23,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 import goalflight_compat
 import goalflight_capacity
 import goalflight_ledger
+import goalflight_rate_pressure
 from goalflight_liveness import (
     active_monotonic,
     pgroup_cpu_pct,
@@ -33,6 +34,7 @@ from goalflight_liveness import (
 )
 
 REVIEW_FAILURE_STDERR_TAIL_BYTES = 2048
+CPU_SAMPLE_UNAVAILABLE_GRACE_MULTIPLIER = 3.0
 
 
 def _now() -> str:
@@ -58,6 +60,34 @@ def _read_tail(path: Path, max_bytes: int = 65536) -> str:
             return f.read(max_bytes).decode(errors="replace")
     except OSError:
         return ""
+
+
+def _bounded_text(text: str, max_bytes: int = REVIEW_FAILURE_STDERR_TAIL_BYTES) -> str:
+    data = text.encode("utf-8", errors="replace")
+    if len(data) <= max_bytes:
+        return text
+    return data[-max_bytes:].decode("utf-8", errors="replace")
+
+
+def _combined_failure_text(*parts: object) -> str:
+    return "\n".join(str(part) for part in parts if part not in (None, ""))
+
+
+def _rate_limit_signature_in_text(text: str) -> str | None:
+    lowered = text.lower()
+    for pattern in goalflight_rate_pressure.RATE_LIMIT_PATTERNS:
+        if pattern in lowered:
+            return pattern
+    return None
+
+
+def _review_rate_limit_signature(text: str) -> str | None:
+    signature = _rate_limit_signature_in_text(text)
+    if not signature:
+        return None
+    if not goalflight_rate_pressure.detect_rate_limit_signature({"state": "failed", "error": text}, None):
+        return None
+    return signature
 
 
 def _event_kind(obj: Any) -> str | None:
@@ -254,6 +284,7 @@ def _monitor_process(
     process_group_drained: bool | None = None
     last_cpu: float | None = None
     soft_timeout_elapsed = False
+    cpu_sample_unavailable_seen = False
     heartbeat_interval = max(0.1, heartbeat_interval)
 
     while True:
@@ -296,13 +327,38 @@ def _monitor_process(
         quiet_for_s = max(0.0, active_now - last_progress_active)
         soft_timeout_elapsed = timeout_s > 0 and duration_s >= timeout_s
         cpu_active = last_cpu is not None and last_cpu > cpu_epsilon
+        # CPU-None semantics are GRACE-THEN-REAP, not "never kill". An unavailable
+        # CPU sample (None) must NOT be read as "0% CPU => no progress => kill now"
+        # (the original false-kill bug). Instead it earns an EXTENDED grace window
+        # below; only after the worker stays quiet PAST that grace is it reaped via
+        # no_progress_timeout. "Never killable on CPU-None" would be wrong: under a
+        # ps-denied sandbox CPU is permanently None, so it would make the no-progress
+        # timeout useless and let a genuinely wedged worker run to max_total_s.
+        # Regimes are covered by complementary tests: within-grace quiet worker is
+        # protected (test_cpu_sample_unavailable_does_not_timeout_live_worker);
+        # past-grace stall is reaped (test_no_progress_timeout_kills_process_group).
+        cpu_sample_unavailable = worker_alive and last_cpu is None
+        cpu_sample_unavailable_grace_s = max(
+            max_quiet_s * CPU_SAMPLE_UNAVAILABLE_GRACE_MULTIPLIER,
+            float(timeout_s) if timeout_s > 0 else 0.0,
+        )
+        cpu_sample_unavailable_grace_active = (
+            cpu_sample_unavailable
+            and cpu_sample_unavailable_grace_s > 0
+            and quiet_for_s < cpu_sample_unavailable_grace_s
+        )
+        cpu_sample_unavailable_seen = cpu_sample_unavailable_seen or cpu_sample_unavailable
 
         running_state = "running"
         if final_detected and worker_alive:
             running_state = "final_detected"
         elif soft_timeout_elapsed and worker_alive:
-            running_state = "running_past_timeout" if (cpu_active or quiet_for_s < max_quiet_s) else "running_quiet"
-        elif worker_alive and quiet_for_s >= max_quiet_s and cpu_active:
+            running_state = (
+                "running_past_timeout"
+                if (cpu_active or cpu_sample_unavailable_grace_active or quiet_for_s < max_quiet_s)
+                else "running_quiet"
+            )
+        elif worker_alive and quiet_for_s >= max_quiet_s and (cpu_active or cpu_sample_unavailable_grace_active):
             running_state = "running_quiet"
 
         note = system_sleep_pause_note(freeze_s, total_paused_s) if freeze_s > 0 else None
@@ -314,6 +370,10 @@ def _monitor_process(
                 "pgid": pgid,
                 "worker_alive": worker_alive,
                 "pgroup_cpu_pct": last_cpu,
+                "cpu_sample_unavailable": cpu_sample_unavailable,
+                "cpu_sample_unavailable_grace_s": round(cpu_sample_unavailable_grace_s, 3),
+                "cpu_sample_unavailable_grace_active": cpu_sample_unavailable_grace_active,
+                "cpu_sample_unavailable_seen": cpu_sample_unavailable_seen,
                 "events_seen": stdout_progress.events_seen,
                 "stdout_json_parse_errors": stdout_progress.parse_errors,
                 "last_event_at": stdout_progress.last_event_at,
@@ -355,7 +415,12 @@ def _monitor_process(
             process_group_drained = _terminate_process_group(proc, pgid)
             break
 
-        if max_quiet_s > 0 and quiet_for_s >= max_quiet_s and not cpu_active:
+        if (
+            max_quiet_s > 0
+            and quiet_for_s >= max_quiet_s
+            and not cpu_active
+            and not cpu_sample_unavailable_grace_active
+        ):
             timed_out = True
             timeout_reason = "no_progress_timeout"
             process_group_drained = _terminate_process_group(proc, pgid)
@@ -373,6 +438,7 @@ def _monitor_process(
             "process_group_drained": process_group_drained,
             "worker_alive": returncode is None and _alive(proc.pid),
             "pgroup_cpu_pct": last_cpu,
+            "cpu_sample_unavailable_seen": cpu_sample_unavailable_seen,
             "duration_s": round(time.time() - started_wall, 3),
             "soft_timeout_elapsed": soft_timeout_elapsed,
             "stdout_bytes": _file_size(stdout_path),
@@ -389,15 +455,25 @@ def _monitor_process(
 
 
 def classify(stderr: str, stdout: str, returncode: int | None, timed_out: bool, final_path: Path | None = None) -> str:
+    # timed_out has precedence over a "successful" returncode — e.g. a leak-child
+    # scenario where the parent exits 0 but a child process group is still alive
+    # (process_group_alive_after_parent_exit) is classified inconclusive_timeout,
+    # not complete. Order preserved from pre-W2 review-job classify.
     if timed_out:
         return "inconclusive_timeout"
-    if returncode == 0 and final_path is not None and (not final_path.exists() or final_path.stat().st_size == 0):
+    final_missing = returncode == 0 and final_path is not None and (
+        not final_path.exists() or final_path.stat().st_size == 0
+    )
+    if returncode == 0 and not final_missing:
+        return "complete"
+    text = f"{stderr}\n{stdout}"
+    if _review_rate_limit_signature(text):
+        return "blocked_session_limit"
+    if final_missing:
         return "inconclusive_no_final"
     if returncode == 0:
         return "complete"
-    text = f"{stderr}\n{stdout}".lower()
-    if "session limit" in text or "usage limit" in text:
-        return "blocked_session_limit"
+    lowered = text.lower()
     auth_signals = (
         "unauthorized",
         "not authenticated",
@@ -408,9 +484,24 @@ def classify(stderr: str, stdout: str, returncode: int | None, timed_out: bool, 
         "login required",
         "please log in",
     )
-    if any(signal in text for signal in auth_signals):
+    if any(signal in lowered for signal in auth_signals):
         return "blocked_auth"
     return "failed"
+
+
+def _rate_limit_failure_error(state: str, stderr: str, stdout: str, extra_error: object = None) -> dict[str, str] | None:
+    text = _combined_failure_text(stderr, stdout, extra_error).strip()
+    if not text:
+        return None
+    signature = _review_rate_limit_signature(text)
+    if not signature:
+        return None
+    return {
+        "message": "review_job_rate_limited",
+        "state": state,
+        "rate_limit_signature": signature,
+        "text_excerpt": _bounded_text(text),
+    }
 
 
 def _failure_error_with_stderr(state: str, stderr: str) -> dict[str, str] | None:
@@ -770,7 +861,13 @@ def main(argv: list[str] | None = None) -> int:
     timed_out = bool(monitor_payload.get("timed_out"))
     state = classify(stderr, stdout, returncode, timed_out, final_path)
     failure_error = (
-        _failure_error_with_stderr(
+        _rate_limit_failure_error(
+            state,
+            _read_tail(stderr_path, max_bytes=REVIEW_FAILURE_STDERR_TAIL_BYTES),
+            _read_tail(stdout_path, max_bytes=REVIEW_FAILURE_STDERR_TAIL_BYTES),
+            monitor_payload.get("prompt_stdin_error"),
+        )
+        or _failure_error_with_stderr(
             state,
             _read_tail(stderr_path, max_bytes=REVIEW_FAILURE_STDERR_TAIL_BYTES),
         )

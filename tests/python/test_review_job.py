@@ -143,6 +143,11 @@ def write_fake_codex(path: Path) -> None:
                 emit({"type": "done"})
                 raise SystemExit(0)
 
+            if mode == "quiet_then_complete":
+                time.sleep(0.8)
+                final.write_text("complete\n")
+                raise SystemExit(0)
+
             if mode == "partial_malformed":
                 sys.stdout.write('{"type": "partial"')
                 sys.stdout.flush()
@@ -157,6 +162,11 @@ def write_fake_codex(path: Path) -> None:
             if mode == "stderr_rate_limit_fail":
                 sys.stderr.write("provider blocked: Check your settings to continue\\n")
                 sys.stderr.flush()
+                raise SystemExit(1)
+
+            if mode == "stdout_usage_limit_fail":
+                sys.stdout.write("ERROR: You've hit your usage limit. Please try again at Jun 21st\\n")
+                sys.stdout.flush()
                 raise SystemExit(1)
 
             if mode == "complete_with_stderr":
@@ -502,6 +512,10 @@ def test_final_file_detected_before_process_exit() -> None:
 
 @skipif(os.name == "nt", reason="POSIX process-group kill test")
 def test_no_progress_timeout_kills_process_group() -> None:
+    # PAST-GRACE regime of the CPU-None grace-then-reap design: CPU is unavailable
+    # AND the worker stalls forever, so once quiet exceeds the extended grace it IS
+    # reaped (no_progress_timeout). Complement of the within-grace test below; the
+    # two are NOT contradictory — they cover opposite sides of the grace boundary.
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         state_dir = tmp / "state"
@@ -516,6 +530,8 @@ def test_no_progress_timeout_kills_process_group() -> None:
                 "FAKE_REVIEW_MODE": "stall_with_child",
                 "FAKE_CHILD_PID_FILE": str(child_pid_file),
                 "FAKE_CHILD_TERM_FILE": str(child_term_file),
+                "GOALFLIGHT_TEST_MODE": "1",
+                "GOALFLIGHT_TEST_PGROUP_CPU_PCT": "unavailable",
             },
             check=False,
         )
@@ -524,6 +540,32 @@ def test_no_progress_timeout_kills_process_group() -> None:
         assert_true("stall classified inconclusive timeout", status["state"] == "inconclusive_timeout")
         assert_true("stall reason recorded", status["timeout_reason"] == "no_progress_timeout")
         assert_true("child process group received terminate", child_term_file.exists())
+
+
+@skipif(os.name == "nt", reason="native Windows review-job dispatch is refused in Phase 1")
+def test_cpu_sample_unavailable_does_not_timeout_live_worker() -> None:
+    # WITHIN-GRACE regime of the CPU-None grace-then-reap design: CPU is unavailable
+    # but the worker is only briefly quiet then completes, so it stays inside the
+    # extended grace window and is NOT killed. Complement of the past-grace stall
+    # reap above. (This test asserts within-grace protection, not blanket immunity.)
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        state_dir = tmp / "state"
+        fake = tmp / "fake-codex"
+        write_fake_codex(fake)
+        proc = run(
+            review_command(tmp, fake, "cpu-unknown", timeout_s=2, max_quiet_s=0.2),
+            state_dir=state_dir,
+            env={
+                "FAKE_REVIEW_MODE": "quiet_then_complete",
+                "GOALFLIGHT_TEST_MODE": "1",
+                "GOALFLIGHT_TEST_PGROUP_CPU_PCT": "unavailable",
+            },
+        )
+        status = json.loads((tmp / "out" / "cpu-unknown.status.json").read_text())
+        assert_true("cpu-unknown review succeeds", proc.returncode == 0 and status["state"] == "complete")
+        assert_true("cpu sample unavailable recorded", status.get("cpu_sample_unavailable_seen") is True)
+        assert_true("unknown cpu did not no-progress timeout", status.get("timeout_reason") is None)
 
 
 @skipif(os.name == "nt", reason="native Windows review-job dispatch is refused in Phase 1")
@@ -625,6 +667,8 @@ def test_auth_classifier_ignores_negative_probe_metadata() -> None:
     assert_true("negative auth metadata is not auth block", state == "failed")
     state = goalflight_review_job.classify("authentication failed: please log in", "", 1, False, None)
     assert_true("explicit auth failure still blocked", state == "blocked_auth")
+    state = goalflight_review_job.classify("", "ERROR: You've hit your usage limit", 1, False, None)
+    assert_true("shared rate-limit pattern blocks session", state == "blocked_session_limit")
 
 
 @skipif(os.name == "nt", reason="native Windows review-job dispatch is refused in Phase 1")
@@ -643,10 +687,38 @@ def test_failed_stderr_excerpt_reaches_pressure_scanner() -> None:
         status = json.loads((tmp / "out" / "stderr-rate-limit.status.json").read_text())
         record = json.loads((state_dir / "runs.d" / f"{status['dispatch_id']}.json").read_text())
         scanned = json.dumps(record.get("error")) + json.dumps(status.get("error"))
-        assert_true("stderr failure exits nonzero", proc.returncode != 0 and status["state"] == "failed")
+        assert_true("stderr failure exits nonzero", proc.returncode != 0 and status["state"] == "blocked_session_limit")
+        assert_true("ledger records blocked_session_limit", record["state"] == "blocked_session_limit")
         assert_true("status error carries bounded stderr", "Check your settings to continue" in scanned)
+        assert_true("rate-limit error carries signature", status["error"]["rate_limit_signature"] == "check your settings to continue")
         assert_true(
             "stderr-only provider block reaches scanner",
+            goalflight_rate_pressure.detect_pressure_scope(record, status)
+            == goalflight_rate_pressure.ACCOUNT_RATE_LIMIT_SCOPE,
+        )
+
+
+@skipif(os.name == "nt", reason="native Windows review-job dispatch is refused in Phase 1")
+def test_failed_stdout_rate_limit_is_classified_and_recorded() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        state_dir = tmp / "state"
+        fake = tmp / "fake-codex"
+        write_fake_codex(fake)
+        proc = run(
+            review_command(tmp, fake, "stdout-rate-limit", timeout_s=2, max_quiet_s=5),
+            state_dir=state_dir,
+            env={"FAKE_REVIEW_MODE": "stdout_usage_limit_fail"},
+            check=False,
+        )
+        status = json.loads((tmp / "out" / "stdout-rate-limit.status.json").read_text())
+        record = json.loads((state_dir / "runs.d" / f"{status['dispatch_id']}.json").read_text())
+        scanned = json.dumps(record.get("error")) + json.dumps(status.get("error"))
+        assert_true("stdout limit exits nonzero", proc.returncode != 0 and status["state"] == "blocked_session_limit")
+        assert_true("stdout limit reaches ledger error", "usage limit" in scanned.lower())
+        assert_true("stdout limit signature recorded", status["error"]["rate_limit_signature"] == "usage limit")
+        assert_true(
+            "stdout provider block reaches scanner",
             goalflight_rate_pressure.detect_pressure_scope(record, status)
             == goalflight_rate_pressure.ACCOUNT_RATE_LIMIT_SCOPE,
         )
@@ -681,11 +753,13 @@ def main() -> None:
         test_active_worker_can_complete_after_soft_timeout,
         test_final_file_detected_before_process_exit,
         test_no_progress_timeout_kills_process_group,
+        test_cpu_sample_unavailable_does_not_timeout_live_worker,
         test_jsonl_partial_and_malformed_lines_are_tolerated,
         test_prompt_write_cannot_block_monitor_before_timeout,
         test_parent_exit_with_live_child_is_inconclusive_and_reaped,
         test_auth_classifier_ignores_negative_probe_metadata,
         test_failed_stderr_excerpt_reaches_pressure_scanner,
+        test_failed_stdout_rate_limit_is_classified_and_recorded,
         test_complete_review_does_not_copy_stderr_to_error_fields,
     ]
     for test in tests:

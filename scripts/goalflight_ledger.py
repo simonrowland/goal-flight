@@ -23,6 +23,7 @@ import uuid
 
 import goalflight_compat
 import goalflight_compat as fcntl
+import goalflight_dispatch_states
 
 SCHEMA = "goalflight.dispatch.v1"
 
@@ -42,6 +43,7 @@ WORKER_PATTERNS = (
     "opencode-acp",
     "opencode-bash-tail",
 )
+_POSIX_PS_AVAILABLE: bool | None = None
 
 
 def utc_now() -> str:
@@ -115,6 +117,22 @@ def _ps_field(pid: int, field: str) -> str | None:
     return out or None
 
 
+def _posix_ps_available() -> bool:
+    global _POSIX_PS_AVAILABLE
+    if _POSIX_PS_AVAILABLE is None:
+        try:
+            subprocess.check_call(
+                ["ps", "-p", str(os.getpid()), "-o", "pid="],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except (OSError, subprocess.CalledProcessError):
+            _POSIX_PS_AVAILABLE = False
+        else:
+            _POSIX_PS_AVAILABLE = True
+    return _POSIX_PS_AVAILABLE
+
+
 def process_identity(pid: int | None) -> dict | None:
     if not pid:
         return None
@@ -128,6 +146,14 @@ def process_identity(pid: int | None) -> dict | None:
             "pid": pid,
             "identity_available": False,
             "identity_source": "windows_pid_probe_only",
+        }
+    if not _posix_ps_available():
+        if not goalflight_compat.pid_alive(pid):
+            return None
+        return {
+            "pid": pid,
+            "identity_available": False,
+            "identity_source": "posix_pid_probe_only",
         }
     ident = None
     for attempt in range(20):
@@ -158,6 +184,8 @@ def identity_matches(record: dict) -> tuple[bool, str]:
     prior = record.get("worker_identity") or record.get("controller_identity") or {}
     if goalflight_compat.is_windows() and not current.get("identity_available", True):
         return False, "identity_indeterminate"
+    if not current.get("identity_available", True) or not prior.get("identity_available", True):
+        return True, "identity_indeterminate"
     for key in ("lstart", "comm"):
         if prior.get(key) and current.get(key) and prior[key] != current[key]:
             return False, f"pid_reused_{key}"
@@ -166,24 +194,16 @@ def identity_matches(record: dict) -> tuple[bool, str]:
 
 def classify(record: dict) -> str:
     state = record.get("state", "running")
-    terminal_states = {
-        "complete",
-        "failed",
-        "blocked",
+    legacy_terminal_states = {
         "released",
         "superseded",
-        "blocked_capacity",
         "blocked_session_limit",
-        "blocked_auth",
-        "worker_dead",
-        "idle_timeout",
         "orphaned",
-        "inconclusive_timeout",
         "inconclusive_no_final",
     }
-    if state in terminal_states:
+    if state in legacy_terminal_states or goalflight_dispatch_states.is_terminal_state(state):
         return state
-    if state == "waiting_capacity":
+    if state in {"queued", "waiting_capacity"}:
         # Queued for a capacity slot: no worker exists yet, so the identity
         # checks below would misread this as unknown/ambiguous. It is a live,
         # expected phase of dispatch (bounded by the capacity-wait deadline).
@@ -272,8 +292,8 @@ def terminal_state_for(state: object, reason: object = None) -> str:
         return "blocked"
     if state == "blocked":
         return "blocked"
-    if state in {None, "", "running", "starting", "running_quiet", "handshaking", "waiting_capacity"}:
-        # waiting_capacity = queued for a capacity slot (pre-spawn, live):
+    if state in {None, "", "queued", "running", "starting", "running_quiet", "handshaking", "waiting_capacity"}:
+        # queued/waiting_capacity = queued for a capacity slot (pre-spawn, live):
         # non-terminal, so the reused-dispatch-id guard refuses duplicates
         # while a launcher is queued.
         return "unknown"
@@ -383,6 +403,8 @@ def cmd_record(args: argparse.Namespace) -> int:
         "started_at": utc_now(),
         "hostname": socket.gethostname(),
     }
+    if getattr(args, "queue_launch_token", None):
+        record["queue_launch_token"] = args.queue_launch_token
     with StateLock():
         path = record_path(dispatch_id)
         if path.exists():
@@ -445,7 +467,11 @@ def status_payload() -> dict:
             "elapsed_s": elapsed_seconds(r),
             "worker_still_alive": r.get("worker_still_alive"),
             "worker_pid": r.get("worker_pid"),
+            "worker_identity": r.get("worker_identity"),
             "project_root": r.get("project_root"),
+            "prompt_path": r.get("prompt_path"),
+            "stdout_path": r.get("stdout_path"),
+            "stderr_path": r.get("stderr_path"),
             "status_path": r.get("status_path"),
             "os_sandbox": r.get("os_sandbox"),
             "started_at": r.get("started_at"),
@@ -697,7 +723,7 @@ def build_parser() -> argparse.ArgumentParser:
     fin.add_argument("--dispatch-id", required=True)
     fin.add_argument("--state", default="complete")
     fin.add_argument("--reason")
-    fin.add_argument("--terminal-state", choices=["complete", "worker_dead", "idle_timeout", "controller_dead", "blocked", "error", "unknown"])
+    fin.add_argument("--terminal-state", choices=["complete", "worker_dead", "idle_timeout", "watcher_stopped", "controller_dead", "blocked", "error", "unknown"])
     fin.add_argument("--elapsed-s", type=float)
     fin.set_defaults(func=cmd_finish)
 

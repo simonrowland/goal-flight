@@ -37,20 +37,29 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows fallback path
+    fcntl = None
+import hashlib
 import io
 import json
 import os
 import re
 import signal
 import shutil
+import socket
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
 import goalflight_compat
 import goalflight_capacity
+import goalflight_dispatch_states
 import goalflight_ledger
+import goalflight_rate_pressure
 from goalflight_liveness import active_monotonic, process_group_id, write_status
 from goalflight_watch import (
     _final_terminal_marker,
@@ -62,10 +71,13 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 WATCH_PY = SCRIPT_DIR / "goalflight_watch.py"
 WATCH_TAIL_SH = SCRIPT_DIR / "watch-dispatch-tail.sh"
 DAEMON_SPAWN_ARG = "__goalflight_spawn_daemon"
+DISPATCH_QUEUE_SCHEMA = "goalflight.dispatch-queue.v1"
+QUEUE_CLAIM_STALE_S = 300.0
 PRESET_AGENTS = {"codex", "grok-code", "grok-research"}
 STDIN_PROMPT_AGENTS = {"codex", "grok-code", "grok-research"}
 DEFAULT_MAX_IDLE_SECS = 180.0
 CODE_WRITER_MAX_IDLE_SECS = 600.0
+RATE_LIMIT_TAIL_BYTES = 2048
 CODE_WRITER_AGENTS = {"codex", "codex-acp", "grok-code", "grok-acp", "cursor", "cursor-agent"}
 ACCOUNT_ENGINE_BY_AGENT = {
     "codex": "codex",
@@ -291,18 +303,49 @@ def _status_exit_code(state: object) -> int:
     return 1
 
 
+def _read_tail_excerpt(path: Path, max_bytes: int = RATE_LIMIT_TAIL_BYTES) -> str:
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as f:
+            f.seek(max(0, size - max_bytes))
+            return f.read(max_bytes).decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _rate_limit_signature_in_text(text: str) -> str | None:
+    lowered = text.lower()
+    for pattern in goalflight_rate_pressure.RATE_LIMIT_PATTERNS:
+        if pattern in lowered:
+            return pattern
+    return None
+
+
+def _worker_dead_rate_limit_reason(state: str | None, reason: str | None, tail: Path) -> object:
+    if state != "worker_dead":
+        return reason
+    excerpt = _read_tail_excerpt(tail).strip()
+    if not excerpt:
+        return reason
+    if not goalflight_rate_pressure.detect_rate_limit_signature({"state": "worker_dead", "error": excerpt}, None):
+        return reason
+    signature = _rate_limit_signature_in_text(excerpt)
+    return {
+        "message": "dispatch_worker_rate_limited",
+        "rate_limit_signature": signature or "unknown",
+        "tail_excerpt": excerpt,
+        "reason": reason,
+    }
+
+
 def _is_status_terminal(state: object) -> bool:
-    if state in {
-        "complete",
-        "worker_dead",
-        "idle_timeout",
-        "orphaned",
-        "controller_dead",
-        "watcher_stopped",
-        "failed",
-    }:
+    if state == "orphaned":
         return True
-    return isinstance(state, str) and state.startswith("blocked")
+    return goalflight_dispatch_states.is_terminal_state(state)
+
+
+def _is_live_watcher_stopped(state: object, worker_alive: object) -> bool:
+    return state == "watcher_stopped" and worker_alive is True
 
 
 def _status_matches_current_launch(
@@ -539,6 +582,63 @@ def _state_dir() -> Path:
 
 def _dispatch_base_dir() -> Path:
     return _state_dir() / "dispatch"
+
+
+def _dispatch_queue_dir() -> Path:
+    return _state_dir() / "dispatch-queue"
+
+
+def _safe_dispatch_filename(dispatch_id: str) -> str:
+    safe = "".join(ch if ch.isalnum() or ch in "._-" else "-" for ch in dispatch_id)
+    if safe != dispatch_id:
+        safe = f"{safe}-{hashlib.sha256(dispatch_id.encode()).hexdigest()[:8]}"
+    return safe
+
+
+def _queue_entry_path(dispatch_id: str, *, queue_dir: Path | None = None) -> Path:
+    return (queue_dir or _dispatch_queue_dir()) / f"{_safe_dispatch_filename(dispatch_id)}.json"
+
+
+def _write_json_atomic(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
+    try:
+        tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        tmp.replace(path)
+    except OSError:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
+
+
+@contextlib.contextmanager
+def _queue_mutation_lock(queue_dir: Path):
+    queue_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    lock_path = queue_dir / ".submit.lock"
+    if fcntl is not None:
+        with lock_path.open("a+", encoding="utf-8") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        return
+
+    deadline = time.monotonic() + 30.0
+    lock_fd = None
+    while lock_fd is None:
+        try:
+            lock_fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+        except FileExistsError:
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"timed out waiting for queue mutation lock: {lock_path}")
+            time.sleep(0.05)
+    try:
+        yield
+    finally:
+        os.close(lock_fd)
+        with contextlib.suppress(OSError):
+            lock_path.unlink()
 
 
 def _skill_root() -> Path:
@@ -838,25 +938,41 @@ def _validate_before_side_effects(args, raw_argv: list[str]) -> None:
     _guard_grok_code_research_prompt(args)
 
 
-def _nonterminal_dispatch_reuse_reason(dispatch_id: str) -> str | None:
+def _nonterminal_dispatch_reuse_reason(
+    dispatch_id: str,
+    *,
+    allow_queued: bool = False,
+) -> str | None:
     record = _find_dispatch_record(dispatch_id)
     if record is None:
+        return None
+    if (
+        allow_queued
+        and record.get("state") == "queued"
+        and not record.get("worker_pid")
+    ):
         return None
     terminal = goalflight_ledger.terminal_state_for(
         record.get("state"),
         record.get("reason") or record.get("error"),
     )
-    if terminal != "unknown":
+    if terminal != "unknown" and record.get("state") != "watcher_stopped":
         return None
     classification = goalflight_ledger.classify(record)
+    if record.get("state") == "watcher_stopped" and classification == "watcher_stopped":
+        return None
     return (
         f"classification={classification} state={record.get('state') or 'running'} "
         f"status={record.get('status_path') or '-'}"
     )
 
 
-def _refuse_reused_nonterminal_dispatch_id(dispatch_id: str) -> None:
-    reason = _nonterminal_dispatch_reuse_reason(dispatch_id)
+def _refuse_reused_nonterminal_dispatch_id(
+    dispatch_id: str,
+    *,
+    allow_queued: bool = False,
+) -> None:
+    reason = _nonterminal_dispatch_reuse_reason(dispatch_id, allow_queued=allow_queued)
     if not reason:
         return
     raise DispatchUsageError(
@@ -864,6 +980,13 @@ def _refuse_reused_nonterminal_dispatch_id(dispatch_id: str) -> None:
         f"({reason}). Use a unique --dispatch-id per parallel chunk; in shell "
         "loops, launch each dispatch as its own background command."
     )
+
+
+def _refuse_reused_dispatch_id_for_launch(dispatch_id: str, *, allow_queued: bool = False) -> None:
+    if allow_queued:
+        _refuse_reused_nonterminal_dispatch_id(dispatch_id, allow_queued=True)
+    else:
+        _refuse_reused_nonterminal_dispatch_id(dispatch_id)
 
 
 def _write_windows_dispatch_refusal(args) -> tuple[dict, Path]:
@@ -1382,10 +1505,346 @@ def _record_ledger(args, *, project_root: Path, prompt_path: str | None, status_
                 stderr_path=None,
                 status_path=str(status_json),
                 os_sandbox_json=json.dumps({"shape": "bash", "read_only": bool(args.read_only)}, sort_keys=True),
+                queue_launch_token=getattr(args, "queue_launch_token", None),
                 state=state,
                 json=True,
             )
         )
+
+
+def _record_queued_ledger_fast(args, *, project_root: Path, prompt_path: str | None, status_json: Path, tail: Path) -> None:
+    dispatch_id = args.dispatch_id
+    now = goalflight_ledger.utc_now()
+    record = {
+        "schema": goalflight_ledger.SCHEMA,
+        "dispatch_id": dispatch_id,
+        "prompt_id": None,
+        "prompt_path": prompt_path,
+        "prompt_sha256": goalflight_ledger.sha256_file(prompt_path),
+        "agent": args.agent,
+        "engine": _account_engine(args.agent) or args.agent,
+        "shape": args.shape,
+        "account": args.account or "default",
+        "transport": "dispatch",
+        "project_root": str(project_root),
+        "controller_pid": _controller_pid(args),
+        "controller_identity": None,
+        "worker_pid": None,
+        "worker_identity": None,
+        "worker_pgid": None,
+        "acp_session_id": None,
+        "logical_session_id": dispatch_id,
+        "lease_id": None,
+        "remote_lease_id": None,
+        "stdout_path": str(tail),
+        "stderr_path": None,
+        "status_path": str(status_json),
+        "os_sandbox": {"shape": args.shape, "read_only": bool(args.read_only)},
+        "state": "queued",
+        "terminal_state": goalflight_ledger.terminal_state_for("queued"),
+        "started_at": now,
+        "hostname": socket.gethostname(),
+    }
+    if getattr(args, "queue_launch_token", None):
+        record["queue_launch_token"] = args.queue_launch_token
+    with goalflight_ledger.StateLock():
+        path = goalflight_ledger.record_path(dispatch_id)
+        if path.exists():
+            try:
+                existing = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                existing = {}
+            if existing.get("started_at"):
+                record["started_at"] = existing["started_at"]
+        goalflight_ledger.write_record(record)
+
+
+def _record_queued_status(args, *, project_root: Path, status_json: Path, tail: Path, queue_path: Path) -> None:
+    write_status(
+        status_json,
+        {
+            "schema": "goalflight.status.v1",
+            "dispatch_id": args.dispatch_id,
+            "agent": args.agent,
+            "shape": args.shape,
+            "state": "queued",
+            "reason": "dispatch_queue",
+            "queue_path": str(queue_path),
+            "project_root": str(project_root),
+            "worker_pid": None,
+            "worker_alive": False,
+            "tail_path": str(tail),
+            "updated_at": int(time.time()),
+        },
+    )
+    _record_queued_ledger_fast(
+        args,
+        project_root=project_root,
+        prompt_path=str(Path(args.prompt_file).expanduser()) if args.prompt_file else None,
+        status_json=status_json,
+        tail=tail,
+    )
+
+
+def _insert_before_worker_remainder(argv: list[str], additions: list[str]) -> list[str]:
+    try:
+        split = argv.index("--")
+    except ValueError:
+        split = len(argv)
+    return argv[:split] + additions + argv[split:]
+
+
+def _remove_flag_before_worker_remainder(argv: list[str], flag: str) -> list[str]:
+    try:
+        split = argv.index("--")
+    except ValueError:
+        split = len(argv)
+    return [part for part in argv[:split] if part != flag] + argv[split:]
+
+
+def _set_option_before_worker_remainder(argv: list[str], flag: str, value: str) -> list[str]:
+    try:
+        split = argv.index("--")
+    except ValueError:
+        split = len(argv)
+    head = argv[:split]
+    tail = argv[split:]
+    out: list[str] = []
+    i = 0
+    while i < len(head):
+        if head[i] == flag:
+            i += 2
+            continue
+        out.append(head[i])
+        i += 1
+    out += [flag, value]
+    return out + tail
+
+
+def _canonical_replay_argv(args, raw_argv: list[str], *, tail: Path, status_json: Path) -> list[str]:
+    argv = [
+        "--agent", str(args.agent),
+        "--dispatch-id", str(args.dispatch_id),
+        "--cwd", str(_project_root(args)),
+        "--shape", str(args.shape),
+        "--priority", str(args.priority),
+        "--billing", str(args.billing),
+        "--poll-secs", str(args.poll_secs),
+        "--max-idle-secs", str(args.max_idle_secs),
+        "--tail", str(tail),
+        "--status-json", str(status_json),
+    ]
+    if args.prompt_file:
+        argv += ["--prompt-file", str(Path(args.prompt_file).expanduser())]
+    if args.prompt is not None:
+        argv += ["--prompt", str(args.prompt)]
+    if args.model:
+        argv += ["--model", str(args.model)]
+    if args.read_only:
+        argv.append("--read-only")
+    if args.web_research_ok:
+        argv.append("--web-research-ok")
+    if args.ignore_git_warn:
+        argv.append("--ignore-git-warn")
+    if args.capacity_wait_s is not None:
+        argv += ["--capacity-wait-s", str(args.capacity_wait_s)]
+    if args.account:
+        argv += ["--account", str(args.account)]
+    if args.interactive:
+        argv.append("--interactive")
+    if args.permission_mode:
+        argv += ["--permission-mode", str(args.permission_mode)]
+    if args.permission_dir:
+        argv += ["--permission-dir", str(args.permission_dir)]
+    if args.permission_inline_timeout_s is not None:
+        argv += ["--permission-inline-timeout-s", str(args.permission_inline_timeout_s)]
+    if args.permission_user_timeout_s is not None:
+        argv += ["--permission-user-timeout-s", str(args.permission_user_timeout_s)]
+    if args.controller_pid:
+        argv += ["--controller-pid", str(args.controller_pid)]
+    if raw_argv:
+        argv += ["--", *raw_argv]
+    return argv
+
+
+def _existing_queue_entry_paths(queue_path: Path) -> list[Path]:
+    paths = [queue_path] if queue_path.exists() else []
+    paths.extend(sorted(queue_path.parent.glob(f"{queue_path.name}.claimed-*")))
+    return paths
+
+
+def _cleanup_partial_submit(queue_path: Path, status_json: Path) -> None:
+    with contextlib.suppress(OSError):
+        queue_path.unlink()
+    with contextlib.suppress(OSError):
+        status_json.unlink()
+    with contextlib.suppress(OSError):
+        status_json.with_suffix(status_json.suffix + ".tmp").unlink()
+    for tmp in queue_path.parent.glob(f"{queue_path.name}.tmp.*"):
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+
+
+def _test_submit_status_delay() -> None:
+    raw = os.environ.get("GOALFLIGHT_TEST_SUBMIT_STATUS_DELAY_S")
+    if not raw:
+        return
+    try:
+        delay_s = float(raw)
+    except ValueError:
+        return
+    if delay_s > 0:
+        time.sleep(delay_s)
+
+
+def _queue_launch_token() -> str:
+    return uuid.uuid4().hex
+
+
+def _queue_launch_token_from_entry(entry: dict) -> str | None:
+    token = entry.get("queue_launch_token")
+    if not token:
+        return None
+    return str(token)
+
+
+def _queue_claim_launch_started(entry: dict) -> bool:
+    return bool(entry.get("queue_launch_started") or entry.get("queue_launch_started_at"))
+
+
+def _queue_claim_worker_spawned(entry: dict) -> bool:
+    return bool(entry.get("queue_worker_pid") or entry.get("queue_worker_spawned_at"))
+
+
+def _queue_claim_worker_spawn_intent(entry: dict) -> bool:
+    return bool(entry.get("queue_worker_spawn_intent") or entry.get("queue_worker_spawn_intent_at"))
+
+
+def _queue_claim_launcher_alive(entry: dict) -> bool:
+    try:
+        launcher_pid = int(entry.get("queue_launcher_pid") or 0)
+    except (TypeError, ValueError):
+        return False
+    if launcher_pid <= 0:
+        return False
+    try:
+        ok, _reason = goalflight_ledger.identity_matches(
+            {
+                "worker_pid": launcher_pid,
+                "worker_identity": entry.get("queue_launcher_identity") or {},
+            }
+        )
+        return ok
+    except Exception:
+        return goalflight_compat.pid_alive(launcher_pid)
+
+
+def _queue_claim_worker_alive(entry: dict) -> bool:
+    try:
+        worker_pid = int(entry.get("queue_worker_pid") or 0)
+    except (TypeError, ValueError):
+        return False
+    return worker_pid > 0 and goalflight_compat.pid_alive(worker_pid)
+
+
+def _submit_dispatch(args, raw_argv: list[str], *, base: Path) -> int:
+    project_root = _project_root(args)
+    tail = Path(args.tail) if args.tail else base / f"{args.dispatch_id}.tail"
+    status_json = Path(args.status_json) if args.status_json else base / f"{args.dispatch_id}.status.json"
+    queue_path = _queue_entry_path(args.dispatch_id)
+    dispatch_argv = _canonical_replay_argv(args, raw_argv, tail=tail, status_json=status_json)
+    entry = {
+        "schema": DISPATCH_QUEUE_SCHEMA,
+        "state": "queued",
+        "dispatch_id": args.dispatch_id,
+        "agent": args.agent,
+        "shape": args.shape,
+        "project_root": str(project_root),
+        "process_cwd": str(Path.cwd().resolve()),
+        "created_at": goalflight_ledger.utc_now(),
+        "updated_at": goalflight_ledger.utc_now(),
+        "queue_path": str(queue_path),
+        "dispatch_argv": dispatch_argv,
+        "request": {
+            "agent": args.agent,
+            "prompt_file": str(Path(args.prompt_file).expanduser()) if args.prompt_file else None,
+            "prompt": args.prompt,
+            "priority": args.priority,
+            "dispatch_id": args.dispatch_id,
+            "cwd": str(project_root),
+            "model": args.model,
+            "shape": args.shape,
+            "read_only": bool(args.read_only),
+            "account": args.account,
+            "billing": args.billing,
+            "capacity_wait_s": args.capacity_wait_s,
+            "tail": str(tail),
+            "status_json": str(status_json),
+            "poll_secs": args.poll_secs,
+            "max_idle_secs": args.max_idle_secs,
+            "permission_mode": args.permission_mode,
+            "raw_worker": raw_argv,
+        },
+    }
+    try:
+        with _queue_mutation_lock(queue_path.parent):
+            existing_paths = _existing_queue_entry_paths(queue_path)
+            if existing_paths:
+                conflicts = []
+                matches = []
+                for existing_path in existing_paths:
+                    try:
+                        existing = json.loads(existing_path.read_text(encoding="utf-8"))
+                    except (OSError, json.JSONDecodeError) as exc:
+                        conflicts.append(f"{existing_path.name}:unreadable:{type(exc).__name__}")
+                        continue
+                    if (
+                        existing.get("dispatch_id") == args.dispatch_id
+                        and existing.get("dispatch_argv") == dispatch_argv
+                    ):
+                        matches.append(existing_path)
+                    else:
+                        conflicts.append(existing_path.name)
+                if matches and not conflicts:
+                    print(f"STATUS: queued already {args.dispatch_id}")
+                    return 0
+                print(f"goalflight_dispatch: queued request already exists for {args.dispatch_id}", file=sys.stderr)
+                return 64
+            _write_json_atomic(queue_path, entry)
+            _test_submit_status_delay()
+            try:
+                _record_queued_status(
+                    args,
+                    project_root=project_root,
+                    status_json=status_json,
+                    tail=tail,
+                    queue_path=queue_path,
+                )
+            except (OSError, RuntimeError):
+                _cleanup_partial_submit(queue_path, status_json)
+                raise
+    except (OSError, RuntimeError) as exc:
+        print(
+            f"goalflight_dispatch: submit failed for {args.dispatch_id}: "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        return 1
+    print(
+        "DISPATCH-QUEUED "
+        + json.dumps(
+            {
+                "dispatch_id": args.dispatch_id,
+                "agent": args.agent,
+                "shape": args.shape,
+                "queue_path": str(queue_path),
+                "status_json": str(status_json),
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+    return 0
 
 
 def _attach_worker_to_lease(lease_id: str | None, worker_pid: int) -> None:
@@ -1537,7 +1996,7 @@ def _cleanup_pidfile_if_worker_dead(pidfile: Path | None, worker_pid: int | None
 def _finish_ledger(
     dispatch_id: str,
     state: str,
-    reason: str | None,
+    reason: object,
     *,
     elapsed_s: float | None = None,
     worker_still_alive: bool | None = None,
@@ -1560,6 +2019,484 @@ def _release_capacity(lease_id: str | None, state: str, reason: str | None) -> N
         return
     with contextlib.redirect_stdout(io.StringIO()):
         goalflight_capacity.cmd_release(argparse.Namespace(lease_id=lease_id, state=state, reason=reason, keep=True))
+
+
+def _release_stale_capacity_for_drain() -> None:
+    with contextlib.suppress(Exception), contextlib.redirect_stdout(io.StringIO()):
+        goalflight_capacity.cmd_release_stale(
+            argparse.Namespace(state="expired", reason="drain_stale_worker", keep=True)
+        )
+
+
+def _dispatch_has_worker_record(dispatch_id: str, *, queue_launch_token: str | None = None) -> bool:
+    record = _find_dispatch_record(dispatch_id)
+    if not (record and record.get("worker_pid")):
+        return False
+    if queue_launch_token is not None:
+        return record.get("queue_launch_token") == queue_launch_token
+    return True
+
+
+def _recover_claimed_queue_entries(queue_dir: Path, *, stale_s: float) -> dict:
+    restored = 0
+    cleared = 0
+    pending_launch = 0
+    now = time.time()
+    for claim in sorted(queue_dir.glob("*.json.claimed-*")):
+        if claim.name.endswith(".failed"):
+            continue
+        try:
+            entry = json.loads(claim.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        dispatch_id = str(entry.get("dispatch_id") or "")
+        target_name = claim.name.split(".claimed-", 1)[0]
+        target = queue_dir / target_name
+        launch_token = _queue_launch_token_from_entry(entry)
+        if launch_token:
+            try:
+                age_s = now - claim.stat().st_mtime
+            except OSError:
+                continue
+            is_stale = age_s >= max(0.0, stale_s)
+            if dispatch_id and _dispatch_has_worker_record(dispatch_id, queue_launch_token=launch_token):
+                with contextlib.suppress(OSError):
+                    claim.unlink()
+                cleared += 1
+                continue
+            launch_still_active = _queue_claim_launcher_alive(entry) or _queue_claim_worker_alive(entry)
+            launch_marked = (
+                _queue_claim_launch_started(entry)
+                or _queue_claim_worker_spawn_intent(entry)
+                or _queue_claim_worker_spawned(entry)
+            )
+            if launch_still_active or (launch_marked and not is_stale):
+                pending_launch += 1
+                continue
+            if not launch_marked:
+                if target.exists():
+                    with contextlib.suppress(OSError):
+                        claim.unlink()
+                    cleared += 1
+                    continue
+                for key in (
+                    "queue_launch_token",
+                    "queue_launch_started",
+                    "queue_launch_started_at",
+                    "queue_launcher_pid",
+                    "queue_launcher_identity",
+                    "queue_worker_spawn_intent",
+                    "queue_worker_spawn_intent_at",
+                    "queue_worker_pid",
+                    "queue_worker_spawned_at",
+                ):
+                    entry.pop(key, None)
+                entry["state"] = "queued"
+                entry["updated_at"] = goalflight_ledger.utc_now()
+                with contextlib.suppress(OSError):
+                    _write_json_atomic(target, entry)
+                    claim.unlink()
+                    restored += 1
+                continue
+            _mark_claim_worker_dead(entry, reason="stale_claim_launch_token_lost")
+            with contextlib.suppress(OSError):
+                claim.unlink()
+                cleared += 1
+            continue
+        if dispatch_id and _dispatch_has_worker_record(dispatch_id):
+            pending_launch += 1
+            continue
+        try:
+            age_s = now - claim.stat().st_mtime
+        except OSError:
+            continue
+        if age_s < max(0.0, stale_s):
+            continue
+        if target.exists():
+            with contextlib.suppress(OSError):
+                claim.unlink()
+            cleared += 1
+            continue
+        entry["state"] = "queued"
+        entry["updated_at"] = goalflight_ledger.utc_now()
+        with contextlib.suppress(OSError):
+            _write_json_atomic(target, entry)
+            claim.unlink()
+            restored += 1
+    return {"restored": restored, "cleared": cleared, "pending_launch": pending_launch}
+
+
+def _claim_queue_entry(path: Path) -> Path | None:
+    claim = path.with_name(f"{path.name}.claimed-{os.getpid()}-{int(time.time() * 1000)}")
+    try:
+        path.rename(claim)
+        return claim
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return None
+
+
+def _restore_claimed_entry(claim: Path, entry: dict) -> Path:
+    queue_dir = claim.parent
+    target = queue_dir / claim.name.split(".claimed-", 1)[0]
+    for key in (
+        "queue_launch_token",
+        "queue_launch_started",
+        "queue_launch_started_at",
+        "queue_launcher_pid",
+        "queue_launcher_identity",
+        "queue_worker_spawn_intent",
+        "queue_worker_spawn_intent_at",
+        "queue_worker_pid",
+        "queue_worker_spawned_at",
+    ):
+        entry.pop(key, None)
+    entry["state"] = "queued"
+    entry["updated_at"] = goalflight_ledger.utc_now()
+    _write_json_atomic(target, entry)
+    with contextlib.suppress(OSError):
+        claim.unlink()
+    return target
+
+
+def _mark_queue_claim_launch_started(args) -> None:
+    if not (getattr(args, "from_queue", False) and getattr(args, "queue_claim_path", None)):
+        return
+    token = getattr(args, "queue_launch_token", None)
+    if not token:
+        return
+    claim = Path(str(args.queue_claim_path)).expanduser()
+    try:
+        entry = json.loads(claim.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise DispatchUsageError(f"queue claim launch marker failed: {type(exc).__name__}")
+    if entry.get("queue_launch_token") != token:
+        raise DispatchUsageError("queue claim launch token mismatch")
+    launcher_identity = goalflight_ledger.process_identity(os.getpid()) or {
+        "pid": os.getpid(),
+        "identity_available": False,
+        "identity_source": "pid_probe_unavailable",
+    }
+    now = goalflight_ledger.utc_now()
+    entry["queue_launch_started"] = True
+    entry["queue_launch_started_at"] = now
+    entry["queue_launcher_pid"] = os.getpid()
+    if launcher_identity:
+        entry["queue_launcher_identity"] = launcher_identity
+    entry["updated_at"] = now
+    try:
+        _write_json_atomic(claim, entry)
+    except OSError as exc:
+        raise DispatchUsageError(f"queue claim launch marker failed: {type(exc).__name__}")
+
+
+def _mark_queue_claim_worker_spawn_intent(args) -> None:
+    if not (getattr(args, "from_queue", False) and getattr(args, "queue_claim_path", None)):
+        return
+    token = getattr(args, "queue_launch_token", None)
+    if not token:
+        return
+    claim = Path(str(args.queue_claim_path)).expanduser()
+    try:
+        entry = json.loads(claim.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise DispatchUsageError(f"queue claim worker-spawn marker failed: {type(exc).__name__}")
+    if entry.get("queue_launch_token") != token:
+        raise DispatchUsageError("queue claim launch token mismatch")
+    now = goalflight_ledger.utc_now()
+    entry["queue_worker_spawn_intent"] = True
+    entry["queue_worker_spawn_intent_at"] = now
+    entry["updated_at"] = now
+    try:
+        _write_json_atomic(claim, entry)
+    except OSError as exc:
+        raise DispatchUsageError(f"queue claim worker-spawn marker failed: {type(exc).__name__}")
+
+
+def _mark_queue_claim_worker_spawned(args, worker_pid: int | None) -> None:
+    if not (getattr(args, "from_queue", False) and getattr(args, "queue_claim_path", None)):
+        return
+    token = getattr(args, "queue_launch_token", None)
+    if not (token and worker_pid):
+        return
+    claim = Path(str(args.queue_claim_path)).expanduser()
+    try:
+        entry = json.loads(claim.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    if entry.get("queue_launch_token") != token:
+        return
+    entry["queue_worker_pid"] = int(worker_pid)
+    entry["queue_worker_spawned_at"] = goalflight_ledger.utc_now()
+    entry["updated_at"] = goalflight_ledger.utc_now()
+    with contextlib.suppress(OSError):
+        _write_json_atomic(claim, entry)
+
+
+def _mark_claim_failed(claim: Path, entry: dict, *, reason: str) -> None:
+    entry["state"] = "failed"
+    entry["reason"] = reason
+    entry["updated_at"] = goalflight_ledger.utc_now()
+    failed = claim.with_name(f"{claim.name}.failed")
+    _write_json_atomic(failed, entry)
+    with contextlib.suppress(OSError):
+        claim.unlink()
+
+
+def _drain_launch_argv(
+    dispatch_argv: list[str],
+    *,
+    capacity_wait_s: float,
+    queue_launch_token: str | None = None,
+    queue_claim_path: Path | None = None,
+) -> list[str]:
+    if not dispatch_argv:
+        return []
+    argv = _set_option_before_worker_remainder(
+        list(dispatch_argv),
+        "--capacity-wait-s",
+        str(max(0.0, float(capacity_wait_s))),
+    )
+    additions = ["--from-queue"]
+    if queue_launch_token:
+        additions += ["--queue-launch-token", queue_launch_token]
+    if queue_claim_path is not None:
+        additions += ["--queue-claim-path", str(queue_claim_path)]
+    additions.append("--launch-detached")
+    return _insert_before_worker_remainder(argv, additions)
+
+
+def _queued_args_for_status(entry: dict):
+    request = entry.get("request") if isinstance(entry.get("request"), dict) else {}
+    return argparse.Namespace(
+        dispatch_id=entry.get("dispatch_id"),
+        agent=entry.get("agent") or request.get("agent"),
+        shape=entry.get("shape") or request.get("shape") or "bash",
+        prompt_file=request.get("prompt_file"),
+        account=request.get("account"),
+        read_only=bool(request.get("read_only")),
+        controller_pid=None,
+        queue_launch_token=entry.get("queue_launch_token"),
+    )
+
+
+def _restore_queued_record_from_entry(entry: dict, queue_path: Path) -> None:
+    request = entry.get("request") if isinstance(entry.get("request"), dict) else {}
+    args = _queued_args_for_status(entry)
+    project_root = Path(str(entry.get("project_root") or request.get("cwd") or Path.cwd())).resolve()
+    status_json = Path(str(request.get("status_json") or _dispatch_base_dir() / f"{args.dispatch_id}.status.json"))
+    tail = Path(str(request.get("tail") or _dispatch_base_dir() / f"{args.dispatch_id}.tail"))
+    _record_queued_status(args, project_root=project_root, status_json=status_json, tail=tail, queue_path=queue_path)
+
+
+def _mark_claim_worker_dead(entry: dict, *, reason: str) -> None:
+    dispatch_id = str(entry.get("dispatch_id") or "")
+    if not dispatch_id:
+        return
+    request = entry.get("request") if isinstance(entry.get("request"), dict) else {}
+    args = _queued_args_for_status(entry)
+    project_root = Path(str(entry.get("project_root") or request.get("cwd") or Path.cwd())).resolve()
+    status_json = Path(str(request.get("status_json") or _dispatch_base_dir() / f"{dispatch_id}.status.json"))
+    tail = Path(str(request.get("tail") or _dispatch_base_dir() / f"{dispatch_id}.tail"))
+    if _find_dispatch_record(dispatch_id) is None:
+        with contextlib.suppress(Exception):
+            _record_queued_ledger_fast(
+                args,
+                project_root=project_root,
+                prompt_path=str(Path(args.prompt_file).expanduser()) if args.prompt_file else None,
+                status_json=status_json,
+                tail=tail,
+            )
+    with contextlib.suppress(Exception):
+        _finish_ledger(dispatch_id, "worker_dead", reason, worker_still_alive=False)
+    with contextlib.suppress(Exception):
+        write_status(
+            status_json,
+            {
+                "schema": "goalflight.status.v1",
+                "dispatch_id": dispatch_id,
+                "agent": args.agent,
+                "shape": args.shape,
+                "state": "worker_dead",
+                "terminal_state": "worker_dead",
+                "reason": reason,
+                "project_root": str(project_root),
+                "worker_pid": entry.get("queue_worker_pid"),
+                "worker_alive": False,
+                "tail_path": str(tail),
+                "status_path": str(status_json),
+                "updated_at": int(time.time()),
+            },
+        )
+
+
+def _drain_queue_once(args) -> dict:
+    queue_dir = Path(args.queue_dir).expanduser() if args.queue_dir else _dispatch_queue_dir()
+    queue_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _release_stale_capacity_for_drain()
+    recovery = _recover_claimed_queue_entries(queue_dir, stale_s=args.claim_stale_s)
+    launched = 0
+    left_queued = 0
+    failed = 0
+    pending_claims = 0
+    details: list[dict] = []
+    entries = sorted(queue_dir.glob("*.json"))
+    if args.limit and args.limit > 0:
+        entries = entries[: args.limit]
+    for path in entries:
+        with _queue_mutation_lock(queue_dir):
+            claim = _claim_queue_entry(path)
+        if claim is None:
+            continue
+        try:
+            entry = json.loads(claim.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            failed += 1
+            _mark_claim_failed(claim, {"path": str(claim)}, reason=f"unreadable:{type(exc).__name__}")
+            continue
+        dispatch_id = str(entry.get("dispatch_id") or path.stem)
+        launch_token = _queue_launch_token()
+        entry["state"] = "claimed"
+        entry["queue_launch_token"] = launch_token
+        entry["updated_at"] = goalflight_ledger.utc_now()
+        try:
+            _write_json_atomic(claim, entry)
+        except OSError as exc:
+            failed += 1
+            details.append(
+                {
+                    "dispatch_id": dispatch_id,
+                    "state": "claimed",
+                    "reason": f"claim_token_write_failed:{type(exc).__name__}",
+                }
+            )
+            continue
+        launch_argv = _drain_launch_argv(
+            list(entry.get("dispatch_argv") or []),
+            capacity_wait_s=args.capacity_wait_s,
+            queue_launch_token=launch_token,
+            queue_claim_path=claim,
+        )
+        if not launch_argv:
+            failed += 1
+            _mark_claim_failed(claim, entry, reason="missing_dispatch_argv")
+            continue
+        timeout_s = max(20.0, float(args.capacity_wait_s or 0.0) + 45.0)
+        try:
+            proc = subprocess.run(
+                [sys.executable, str(Path(__file__).resolve()), *launch_argv],
+                cwd=str(Path(entry.get("process_cwd") or entry.get("project_root") or Path.cwd()).resolve()),
+                env=os.environ.copy(),
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=timeout_s,
+            )
+        except subprocess.TimeoutExpired:
+            pending_claims += 1
+            failed += 1
+            details.append(
+                {
+                    "dispatch_id": dispatch_id,
+                    "state": "claimed",
+                    "reason": "launch_timeout_pending_ledger",
+                }
+            )
+            continue
+        launched_ok = proc.returncode == 0 and "DISPATCH-LAUNCHED " in proc.stdout
+        no_capacity = proc.returncode == 2 and "blocked_capacity" in (proc.stdout + proc.stderr)
+        if launched_ok:
+            with contextlib.suppress(OSError):
+                claim.unlink()
+            launched += 1
+            details.append({"dispatch_id": dispatch_id, "state": "launched"})
+            continue
+        if no_capacity:
+            restored = _restore_claimed_entry(claim, entry)
+            _restore_queued_record_from_entry(entry, restored)
+            left_queued += 1
+            details.append({"dispatch_id": dispatch_id, "state": "queued", "reason": "capacity_unavailable"})
+            continue
+        if _dispatch_has_worker_record(dispatch_id, queue_launch_token=launch_token):
+            with contextlib.suppress(OSError):
+                claim.unlink()
+            launched += 1
+            details.append({"dispatch_id": dispatch_id, "state": "launched", "reason": "worker_record_present"})
+            continue
+        pending_claims += 1
+        failed += 1
+        details.append(
+            {
+                "dispatch_id": dispatch_id,
+                "state": "claimed",
+                "reason": f"launch_failed_pending_ledger:{proc.returncode}",
+            }
+        )
+    remaining = len(list(queue_dir.glob("*.json")))
+    return {
+        "schema": f"{DISPATCH_QUEUE_SCHEMA}.drain.v1",
+        "queue_dir": str(queue_dir),
+        "launched": launched,
+        "left_queued": left_queued,
+        "failed": failed,
+        "remaining": remaining,
+        "pending_claims": pending_claims,
+        "recovered_claims": recovery,
+        "details": details,
+    }
+
+
+def _drain_error_payload(args, exc: BaseException) -> dict:
+    queue_dir = Path(args.queue_dir).expanduser() if args.queue_dir else _dispatch_queue_dir()
+    return {
+        "schema": f"{DISPATCH_QUEUE_SCHEMA}.drain.v1",
+        "queue_dir": str(queue_dir),
+        "launched": 0,
+        "left_queued": 0,
+        "failed": 1,
+        "remaining": 0,
+        "pending_claims": 0,
+        "recovered_claims": {"restored": 0, "failed": 0},
+        "details": [],
+        "error": f"{type(exc).__name__}: {exc}",
+    }
+
+
+def _cmd_drain(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description="Drain queued goal-flight dispatch requests.")
+    parser.add_argument("--queue-dir")
+    parser.add_argument("--capacity-wait-s", type=float, default=0.0)
+    parser.add_argument("--claim-stale-s", type=float, default=QUEUE_CLAIM_STALE_S)
+    parser.add_argument("--limit", type=int, default=0, help="maximum queue entries to inspect; 0 = all")
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+    try:
+        payload = _drain_queue_once(args)
+    except (OSError, RuntimeError) as exc:
+        payload = _drain_error_payload(args, exc)
+        if args.json:
+            print(json.dumps(payload, sort_keys=True))
+        else:
+            print(f"goalflight_dispatch: drain failed: {payload['error']}", file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(payload, sort_keys=True))
+    else:
+        print(
+            "DRAIN "
+            + json.dumps(
+                {
+                    "launched": payload["launched"],
+                    "left_queued": payload["left_queued"],
+                    "failed": payload["failed"],
+                    "remaining": payload["remaining"],
+                    "queue_dir": payload["queue_dir"],
+                },
+                sort_keys=True,
+            )
+        )
+    return 0 if payload["failed"] == 0 else 1
 
 
 @contextlib.contextmanager
@@ -1650,6 +2587,7 @@ def _build_acp_cfg(args, *, status_json: Path):
         remote_turn_silence_s=None,
         remote_turn_cancel_grace_s=DEFAULT_REMOTE_TURN_CANCEL_GRACE_S,
         steer_file=str(_steer_file(args.dispatch_id)),
+        queue_launch_token=getattr(args, "queue_launch_token", None),
         cpu_epsilon=0.1,
         json=False,
     )
@@ -1667,6 +2605,238 @@ def _apply_max_idle_default(args) -> None:
         args.max_idle_secs = _default_max_idle_secs(args)
 
 
+def _record_test_acp_running_fast(
+    args,
+    *,
+    project_root: Path,
+    prompt_path: str | None,
+    status_json: Path,
+    tail: Path,
+    worker_pid: int,
+) -> None:
+    now = goalflight_ledger.utc_now()
+    record = {
+        "schema": goalflight_ledger.SCHEMA,
+        "dispatch_id": args.dispatch_id,
+        "prompt_id": None,
+        "prompt_path": prompt_path,
+        "prompt_sha256": goalflight_ledger.sha256_file(prompt_path),
+        "agent": args.agent,
+        "engine": _account_engine(args.agent) or args.agent,
+        "shape": "acp",
+        "account": args.account or "default",
+        "transport": "dispatch",
+        "project_root": str(project_root),
+        "controller_pid": _controller_pid(args),
+        "controller_identity": None,
+        "worker_pid": worker_pid,
+        "worker_identity": None,
+        "worker_pgid": None,
+        "acp_session_id": None,
+        "logical_session_id": args.dispatch_id,
+        "lease_id": None,
+        "remote_lease_id": None,
+        "stdout_path": str(tail),
+        "stderr_path": None,
+        "status_path": str(status_json),
+        "os_sandbox": {"shape": "acp", "read_only": bool(args.read_only)},
+        "state": "running",
+        "terminal_state": goalflight_ledger.terminal_state_for("running"),
+        "started_at": now,
+        "hostname": socket.gethostname(),
+    }
+    if getattr(args, "queue_launch_token", None):
+        record["queue_launch_token"] = args.queue_launch_token
+    with goalflight_ledger.StateLock():
+        path = goalflight_ledger.record_path(args.dispatch_id)
+        if path.exists():
+            try:
+                existing = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                existing = {}
+            if existing.get("started_at"):
+                record["started_at"] = existing["started_at"]
+        goalflight_ledger.write_record(record)
+
+
+def _run_test_acp_shape_if_requested(args, *, base: Path, status_json: Path, tail_path: Path) -> int | None:
+    marker_path = goalflight_compat.allowed_env_override(
+        "GOALFLIGHT_TEST_ACP_DISPATCH_COMPLETE_FILE",
+        "",
+        test_mode=True,
+    )
+    if not marker_path:
+        return None
+    project_root = _project_root(args)
+    worker_pid = os.getpid()
+    tail_path.parent.mkdir(parents=True, exist_ok=True)
+    with tail_path.open("ab") as tail_f:
+        tail_f.write(b"COMPLETE: test acp dispatch\n")
+    _record_test_acp_running_fast(
+        args,
+        project_root=project_root,
+        prompt_path=str(Path(args.prompt_file).expanduser()) if args.prompt_file else None,
+        status_json=status_json,
+        tail=tail_path,
+        worker_pid=worker_pid,
+    )
+    sleep_after_running_s = 0.0
+    with contextlib.suppress(ValueError):
+        sleep_after_running_s = float(
+            goalflight_compat.allowed_env_override(
+                "GOALFLIGHT_TEST_ACP_DISPATCH_SLEEP_AFTER_RUNNING_S",
+                "0",
+                test_mode=True,
+            )
+            or 0.0
+        )
+    if sleep_after_running_s > 0:
+        write_status(
+            status_json,
+            {
+                "schema": "goalflight.status.v1",
+                "dispatch_id": args.dispatch_id,
+                "agent": args.agent,
+                "shape": "acp",
+                "state": "running",
+                "terminal_state": None,
+                "worker_pid": worker_pid,
+                "worker_alive": True,
+                "tail_path": str(tail_path),
+                "status_path": str(status_json),
+                "updated_at": int(time.time()),
+            },
+        )
+        with contextlib.suppress(Exception):
+            Path(marker_path).write_text(str(worker_pid), encoding="utf-8")
+        time.sleep(sleep_after_running_s)
+    write_status(
+        status_json,
+        {
+            "schema": "goalflight.status.v1",
+            "dispatch_id": args.dispatch_id,
+            "agent": args.agent,
+            "shape": "acp",
+            "state": "complete",
+            "terminal_state": "complete",
+            "worker_pid": worker_pid,
+            "worker_alive": False,
+            "tail_path": str(tail_path),
+            "status_path": str(status_json),
+            "updated_at": int(time.time()),
+        },
+    )
+    with contextlib.suppress(Exception):
+        Path(marker_path).write_text(str(worker_pid), encoding="utf-8")
+    print(
+        "DISPATCH-END "
+        + json.dumps(
+            {
+                "dispatch_id": args.dispatch_id,
+                "agent": args.agent,
+                "shape": "acp",
+                "worker_pid": worker_pid,
+                "status_json": str(status_json),
+                "terminal_state": "complete",
+                "worker_still_alive": False,
+                "elapsed_s": 0.0,
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+    return 0
+
+
+def _acp_detached_child_argv(args) -> list[str]:
+    argv = list(getattr(args, "_original_argv", []) or sys.argv[1:])
+    argv = _remove_flag_before_worker_remainder(argv, "--launch-detached")
+    if "--acp-detached-child" not in argv:
+        argv = _insert_before_worker_remainder(argv, ["--acp-detached-child"])
+    return argv
+
+
+def _run_acp_detached_launcher(
+    args,
+    *,
+    status_json: Path,
+    tail_path: Path,
+    account_env: dict[str, str],
+    env_remove: list[str],
+) -> int:
+    _mark_queue_claim_worker_spawn_intent(args)
+    env = os.environ.copy()
+    env.update(account_env)
+    for key in env_remove:
+        env.pop(key, None)
+    child_argv = [sys.executable, str(Path(__file__).resolve()), *_acp_detached_child_argv(args)]
+    child_pid = _spawn_daemonized_process(
+        child_argv,
+        env=env,
+        stdout_path=tail_path,
+        stdout_mode="ab",
+        stderr="stdout",
+        label="acp",
+    )
+    _mark_queue_claim_worker_spawned(args, child_pid)
+    wait_s = max(20.0, float(getattr(args, "capacity_wait_s", 0.0) or 0.0) + 20.0)
+    deadline = time.time() + wait_s
+    last_state = None
+    while time.time() < deadline:
+        record = _find_dispatch_record(args.dispatch_id)
+        if (
+            record
+            and record.get("worker_pid")
+            and record.get("queue_launch_token") == getattr(args, "queue_launch_token", None)
+        ):
+            print(
+                "DISPATCH-LAUNCHED "
+                + json.dumps(
+                    {
+                        "dispatch_id": args.dispatch_id,
+                        "agent": args.agent,
+                        "shape": "acp",
+                        "worker_pid": record.get("worker_pid"),
+                        "launcher_pid": child_pid,
+                        "status_json": str(status_json),
+                        "state": "running",
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+            return 0
+        with contextlib.suppress(OSError, json.JSONDecodeError):
+            status_payload = json.loads(status_json.read_text(encoding="utf-8"))
+            last_state = status_payload.get("state")
+            if str(last_state).startswith("blocked_capacity"):
+                print(
+                    "DISPATCH-BLOCKED "
+                    + json.dumps(
+                        {
+                            "dispatch_id": args.dispatch_id,
+                            "agent": args.agent,
+                            "shape": "acp",
+                            "state": last_state,
+                            "status_json": str(status_json),
+                            "reason": status_payload.get("reason"),
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+                return 2
+        if not goalflight_compat.pid_alive(child_pid):
+            break
+        time.sleep(0.2)
+    print(
+        "goalflight_dispatch: ACP detached launch did not publish a running ledger "
+        f"for {args.dispatch_id} (last_state={last_state!r})",
+        file=sys.stderr,
+    )
+    return 1
+
+
 def _run_acp_shape(args, *, base: Path, account_env: dict[str, str]) -> int:
     from goalflight_acp_run import acp_dispatch_exit_code, run_acp_dispatch
 
@@ -1676,7 +2846,10 @@ def _run_acp_shape(args, *, base: Path, account_env: dict[str, str]) -> int:
             if goalflight_compat.is_windows()
             else _reserve_auto_dispatch_id(args.agent, base)
         )
-    _refuse_reused_nonterminal_dispatch_id(args.dispatch_id)
+    _refuse_reused_dispatch_id_for_launch(
+        args.dispatch_id,
+        allow_queued=getattr(args, "from_queue", False),
+    )
     status_json = Path(args.status_json) if args.status_json else base / f"{args.dispatch_id}.status.json"
     cfg = _build_acp_cfg(args, status_json=status_json)
     env_remove = []
@@ -1695,6 +2868,17 @@ def _run_acp_shape(args, *, base: Path, account_env: dict[str, str]) -> int:
         tail_path=tail_path,
         reset_tail=True,
     )
+    if getattr(args, "launch_detached", False) and not getattr(args, "acp_detached_child", False):
+        return _run_acp_detached_launcher(
+            args,
+            status_json=status_json,
+            tail_path=tail_path,
+            account_env=account_env,
+            env_remove=env_remove,
+        )
+    test_rc = _run_test_acp_shape_if_requested(args, base=base, status_json=status_json, tail_path=tail_path)
+    if test_rc is not None:
+        return test_rc
     if goalflight_compat.is_windows():
         payload = asyncio.run(run_acp_dispatch(cfg))
         print(
@@ -1833,6 +3017,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_spawn_daemon()
     if argv and argv[0] == "steer":
         return _cmd_steer(argv[1:])
+    if argv and argv[0] == "drain":
+        return _cmd_drain(argv[1:])
 
     parser = argparse.ArgumentParser(
         description="Crash-safe worker dispatch: detached worker + decoupled watcher."
@@ -1862,6 +3048,8 @@ def main(argv: list[str] | None = None) -> int:
                              "(re-attempts acquire every ~15s; sleep-excluding clock). Default by "
                              "lane: bulk 900 / normal 600 / critical 120. 0 = fail instantly. "
                              "Env override: GOALFLIGHT_CAPACITY_WAIT_S.")
+    parser.add_argument("--submit", action="store_true",
+                        help="Write a durable dispatch request to the queue and exit without acquiring capacity.")
     parser.add_argument("--account",
                         help="Which subscription account/profile to bill the worker to (shared remote "
                              "worker pools). Codex resolves to CODEX_HOME=~/.goal-flight/accounts/<name>/codex; "
@@ -1903,12 +3091,18 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--controller-pid", type=int,
                         help="If set, watcher exits when this pid dies (orphan guard)")
+    parser.add_argument("--from-queue", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--queue-launch-token", help=argparse.SUPPRESS)
+    parser.add_argument("--queue-claim-path", help=argparse.SUPPRESS)
+    parser.add_argument("--launch-detached", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--acp-detached-child", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--stats", nargs="?", const="7d", metavar="WINDOW",
                         help="No-worker stats view over dispatch history; WINDOW is <N>h, <N>d, or bare <N> days.")
     parser.add_argument("--json", action="store_true", help="With --stats, emit machine-readable JSON.")
     parser.add_argument("worker", nargs=argparse.REMAINDER,
                         help="Optional `-- <cmd...>` raw worker (overrides the preset)")
     args = parser.parse_args(argv)
+    args._original_argv = list(argv)
     if args.stats is not None:
         try:
             payload = goalflight_ledger.stats_payload(args.stats)
@@ -1946,9 +3140,22 @@ def main(argv: list[str] | None = None) -> int:
             dispatch_warnings = _dispatch_warnings(args, raw)
             args.dispatch_warnings = dispatch_warnings
             base = _dispatch_base_dir()
+            if not args.dispatch_id:
+                args.dispatch_id = (
+                    _default_dispatch_id(args.agent)
+                    if goalflight_compat.is_windows()
+                    else _reserve_auto_dispatch_id(args.agent, base)
+                )
+            _refuse_reused_dispatch_id_for_launch(
+                args.dispatch_id,
+                allow_queued=args.from_queue or args.submit,
+            )
+            _mark_queue_claim_launch_started(args)
+            account_env = {} if goalflight_compat.is_windows() else _resolve_account_env(args)
+            if args.submit:
+                return _submit_dispatch(args, raw, base=base)
             if goalflight_compat.is_windows():
                 return _run_acp_shape(args, base=base, account_env={})
-            account_env = _resolve_account_env(args)
             return _run_acp_shape(args, base=base, account_env=account_env)
         except DispatchUsageError as e:
             print(f"goalflight_dispatch: {e}", file=sys.stderr)
@@ -1975,10 +3182,16 @@ def main(argv: list[str] | None = None) -> int:
             print(f"goalflight_dispatch: {e}", file=sys.stderr)
             return 64
     try:
-        _refuse_reused_nonterminal_dispatch_id(args.dispatch_id)
+        _refuse_reused_dispatch_id_for_launch(
+            args.dispatch_id,
+            allow_queued=args.from_queue or args.submit,
+        )
+        _mark_queue_claim_launch_started(args)
     except DispatchUsageError as e:
         print(f"goalflight_dispatch: {e}", file=sys.stderr)
         return 64
+    if args.submit:
+        return _submit_dispatch(args, raw, base=base)
     tail = Path(args.tail) if args.tail else base / f"{args.dispatch_id}.tail"
     status_json = Path(args.status_json) if args.status_json else base / f"{args.dispatch_id}.status.json"
 
@@ -2002,6 +3215,7 @@ def main(argv: list[str] | None = None) -> int:
     pidfile = None
     lease_id = None
     ledger_recorded = False
+    detached_launched = False
     final_state = "failed"
     final_reason = None
     worker_alive = None
@@ -2021,6 +3235,9 @@ def main(argv: list[str] | None = None) -> int:
         # (classified queued_capacity = live) and must trip the reused-id
         # guard for a duplicate explicit --dispatch-id (review P1: the guard
         # is ledger-based, so a ledger-less wait window was bypassable).
+        # Back-compat: ledger consumers now see one extra pre-spawn row per
+        # dispatch; the existing running row is still written after capacity
+        # is acquired and the worker is spawned.
         _record_ledger(
             args,
             project_root=project_root,
@@ -2072,6 +3289,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.billing == "sub" and _account_engine(args.agent) == "codex":
             env.pop("OPENAI_API_KEY", None)  # subscription billing for the selected account, not the API
 
+        _mark_queue_claim_worker_spawn_intent(args)
         worker_pid = _spawn_daemonized_process(
             worker_argv,
             env=env,
@@ -2081,6 +3299,7 @@ def main(argv: list[str] | None = None) -> int:
             stderr="stdout",
             label="worker",
         )
+        _mark_queue_claim_worker_spawned(args, worker_pid)
         started = time.time()
         registration_errors = []
 
@@ -2203,6 +3422,22 @@ def main(argv: list[str] | None = None) -> int:
             label="watcher",
         )
         summary_head.update({"watcher_pid": watcher_pid, "watcher_log": str(watch_log)})
+        if args.launch_detached:
+            detached_launched = True
+            with contextlib.suppress(Exception):
+                print(
+                    "DISPATCH-LAUNCHED "
+                    + json.dumps(
+                        {
+                            **summary_head,
+                            "lease_id": lease_id,
+                            "state": "running",
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+            return 0
         watch_rc, rec, final_reason = _wait_for_detached_watcher(
             status_json=status_json,
             watcher_pid=watcher_pid,
@@ -2266,21 +3501,24 @@ def main(argv: list[str] | None = None) -> int:
         print("DISPATCH-ERROR " + json.dumps({"state": final_state, "reason": final_reason}, sort_keys=True), file=sys.stderr, flush=True)
         return 1
     finally:
-        if ledger_recorded:
+        final_worker_alive = worker_alive
+        if final_worker_alive is None and worker_pid:
+            final_worker_alive = goalflight_compat.pid_alive(worker_pid)
+        keep_live_watcher_open = _is_live_watcher_stopped(final_state, final_worker_alive)
+        if ledger_recorded and not detached_launched and not keep_live_watcher_open:
             with contextlib.suppress(Exception):
-                final_worker_alive = worker_alive
-                if final_worker_alive is None and worker_pid:
-                    final_worker_alive = goalflight_compat.pid_alive(worker_pid)
+                ledger_reason = _worker_dead_rate_limit_reason(final_state, final_reason, tail)
                 _finish_ledger(
                     args.dispatch_id,
                     final_state,
-                    final_reason,
+                    ledger_reason,
                     elapsed_s=round(time.time() - dispatch_started, 3),
                     worker_still_alive=final_worker_alive,
                 )
-        with contextlib.suppress(Exception):
-            _release_capacity(lease_id, final_state, final_reason)
-        _cleanup_pidfile_if_worker_dead(pidfile, worker_pid)
+        if not detached_launched and not keep_live_watcher_open:
+            with contextlib.suppress(Exception):
+                _release_capacity(lease_id, final_state, final_reason)
+            _cleanup_pidfile_if_worker_dead(pidfile, worker_pid)
 
 
 if __name__ == "__main__":

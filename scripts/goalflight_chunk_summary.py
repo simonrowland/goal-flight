@@ -25,11 +25,12 @@ TERMINAL_FAILED = {
     "failed",
     "inconclusive_no_final",
     "inconclusive_timeout",
+    "controller_dead",
     "orphaned",
     "superseded",
     "worker_dead",
 }
-WEDGED_STATES = {"idle_timeout", "running_quiet", "wedged"}
+WEDGED_STATES = {"idle_timeout", "wedged"}
 
 
 def parse_time(value: Any) -> dt.datetime | None:
@@ -172,13 +173,19 @@ def normalize_state(record: dict[str, Any] | None, status: dict[str, Any] | None
         return "complete"
     if marker in {"BLOCKED", "USER-NEED", "USER-CONFIRM"}:
         return "failed"
-    if status_state in WEDGED_STATES:
+    if status_state in WEDGED_STATES or record_state in WEDGED_STATES:
         return "wedged"
     if status_state in TERMINAL_FAILED or record_state in TERMINAL_FAILED:
         return "failed"
-    if status_state and status_state.startswith("running"):
+    if status_state == "watcher_stopped" or record_state == "watcher_stopped":
         return "running"
-    if record_state == "running" or lease:
+    if status_state == "waiting_capacity" or record_state == "waiting_capacity":
+        return "running"
+    if (status_state and status_state.startswith("running")) or (
+        record_state and record_state.startswith("running")
+    ):
+        return "running"
+    if lease:
         return "running"
     return "missing"
 
