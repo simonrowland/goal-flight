@@ -36,7 +36,13 @@ def _default_state_dir() -> Path:
 DEFAULT_STATE_DIR = Path(os.environ.get("GOALFLIGHT_STATE_DIR", _default_state_dir()))
 DEFAULT_RESERVE_MB = 2048
 DEFAULT_WORST_WORKER_MB = 1200
-DEFAULT_HARD_CAP = 20
+# DEFAULT_HARD_CAP raised 20->40 (2026-06-16, operator-requested): (1) unmask the
+# per-agent codex/grok bumps below, and (2) feed the deep-research build's headroom.
+# This is the raw_ceiling INPUT; operating_cap = min(raw_ceiling, tier), and the >64GB
+# tier is raised to 32 (operating_cap_for_ram), so the effective machine total lands at
+# 32. raw_ceiling still = min(this, headroom_mb // worst_worker_mb), so RAM (128GB here)
+# and the acquire-time RSS budget continue to bound real concurrency.
+DEFAULT_HARD_CAP = 40
 DEFAULT_RATE_PRESSURE_WINDOW_SECONDS = 600
 DEFAULT_RATE_PRESSURE_THRESHOLD = 3
 AGENT_RSS_MB = {
@@ -93,16 +99,20 @@ DEFAULT_AGENT_CAPS = {
     # providers under pressure, no saturation alerts. Stress-tested earlier at
     # 49/49 + 13/13 TRUE-simultaneous with zero wedges (2026-05-20); the
     # adaptive walk-back still halves effective caps on real rejections.
-    "codex": 12,
-    "codex-acp": 12,
+    # codex loosened 12->18 (2026-06-16, operator-requested push): watched LIVE via
+    # goalflight_rate_pressure.py (clean baseline: 826 ledger records, 0 providers
+    # under pressure) + the adaptive walk-back backstop. Revisit after logged hours.
+    "codex": 18,
+    "codex-acp": 18,
     # grok loosened 10->14 (2026-06-10): multi-controller queueing observed with
     # ZERO rate-pressure evidence (449 ledger records, no providers under
     # pressure); grok is sub-billed, and the adaptive walk-back halves effective
     # caps at acquire-time if rejections appear. Revisit after more logged hours.
-    "grok": 14,
-    "grok-acp": 14,
-    "grok-code": 14,
-    "grok-research": 14,
+    # grok loosened 14->20 (2026-06-16, operator-requested push): same live monitor.
+    "grok": 20,
+    "grok-acp": 20,
+    "grok-code": 20,
+    "grok-research": 20,
     # Gateway orchestrators: lower cap, longer orchestration latency (Track D).
     "herm-worker": 2,
     "cla-worker": 2,
@@ -359,6 +369,7 @@ TERMINAL_LEASE_STATES = {
     "blocked_auth",
     "worker_dead",
     "idle_timeout",
+    "controller_dead",
     "orphaned",
     "inconclusive_timeout",
     "inconclusive_no_final",
@@ -548,7 +559,13 @@ def operating_cap_for_ram(ram_mb: int, raw_ceiling: int) -> int:
         # (2026-06-10/11: ~1h through three concurrent review storms, zero
         # rate-pressure, no saturation alerts). Going past 20 means revisiting
         # DEFAULT_HARD_CAP with CPU-aware reasoning, not this ladder.
-        tier = 20
+        # raised 20->32 (2026-06-16, operator-requested): a deep-research build needs
+        # agent-count headroom on an 18-CPU / 128GB host where the workers are
+        # NETWORK-bound (grok-research/codex API calls, not local test suites), so this
+        # CPU/blast-radius backstop can rise. 32 ~= 1.8x cores; the acquire-time RSS
+        # budget owns RAM, and per-pool caps + adaptive walk-back + the live
+        # rate-pressure monitor own provider limits.
+        tier = 32
     return max(1, min(raw_ceiling, tier))
 
 

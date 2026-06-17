@@ -136,6 +136,14 @@ RATE_LIMIT_PATTERNS: tuple[str, ...] = (
     "resource_exhausted",       # gRPC/generic quota signal
     "quota exceeded",           # generic billing/quota hard limit
     "check your settings to continue",  # Cursor plan/usage block (full phrase for precision)
+    # codex CLI + xAI/grok additions. NOTE: most
+    # codex/xAI 429 PROSE ("you've exceeded the rate limit", "rate limit reached for
+    # organization", xAI "...reached the rate limit") is ALREADY caught by the
+    # substrings above ("rate limit"/"429"/"too many requests"), so only the
+    # genuinely-uncaught literals are added. Matching stays failure-state-gated.
+    "exceeded retry limit",          # codex CLI retry-wrapper exhaustion (catches retry-exhaust even when the line is not a bare 429)
+    "prepaid credits are depleted",  # xAI hard CREDIT exhaustion — a distinct failure mode (no 429, no "rate limit" text)
+    "payment_required",              # xAI 402 credits-out (code form; safer than a bare "402")
 )
 
 # Substring patterns indicating model-specific capacity, not account-wide quota.
@@ -259,12 +267,15 @@ def detect_pressure_scope(record: dict, status: dict | None) -> str | None:
     if state == "blocked_session_limit":
         return ACCOUNT_RATE_LIMIT_SCOPE
     # Failure-ish states whose error text deserves a pattern scan (coverage
-    # audit 2026-06-10 widened this from {failed, inconclusive_timeout}).
+    # audit 2026-06-10 widened this from {failed, inconclusive_timeout};
+    # dispatch death-classification wiring later added worker_dead because
+    # launcher/watcher failures may be the only place provider limit prose is
+    # preserved).
     # DELIBERATELY EXCLUDED: "blocked_capacity" is goal-flight's OWN capacity
     # gate — counting it would feed our queueing back into the walk-back and
     # falsely halve provider caps (self-referential pressure). "blocked_auth"
     # stays excluded per the note above.
-    if state not in {"failed", "inconclusive_timeout", "blocked", "inconclusive_no_final"}:
+    if state not in {"failed", "inconclusive_timeout", "blocked", "inconclusive_no_final", "worker_dead"}:
         # Successful, pending, capacity-, or auth-blocked dispatches don't count.
         return None
 

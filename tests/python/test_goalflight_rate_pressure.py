@@ -151,6 +151,16 @@ def test_detect_inconclusive_timeout_with_rate_limit_status():
     assert_true("inconclusive_timeout + 429", rp.detect_rate_limit_signature(record, status))
 
 
+def test_detect_worker_dead_with_rate_limit_record_error():
+    """worker_dead + ledger error text triggers after dispatch tail enrichment."""
+    record = {"agent": "codex", "state": "worker_dead", "error": {"tail_excerpt": "usage limit; try again later"}}
+    assert_eq(
+        "worker_dead rate-limit scope",
+        rp.detect_pressure_scope(record, None),
+        rp.ACCOUNT_RATE_LIMIT_SCOPE,
+    )
+
+
 # ----- pressure_per_provider() -----
 
 def _build_record(agent, state, updated_at, dispatch_id="d"):
@@ -426,12 +436,20 @@ def test_coverage_audit_patterns_states_and_guards():
     assert_eq("review-job stderr excerpt in record.error", S({"state": "failed", "error": {"stderr_excerpt": "provider blocked: Check your settings to continue"}}, None), A)
     # ledger record.error is a signal carrier even with no status file
     assert_eq("record.error carrier", S({"state": "failed", "error": "resource_exhausted"}, None), A)
+    assert_eq("worker_dead record.error carrier", S({"state": "worker_dead", "error": {"tail_excerpt": "usage limit"}}, None), A)
     # goal-flight's OWN capacity gate must never count (self-referential
     # pressure would let our queueing falsely halve provider caps)
     assert_eq("blocked_capacity guard", S({"state": "blocked_capacity"}, {"error": "machine_worker_cap rate limit"}), None)
     # auth-blocked and successful dispatches stay excluded even with limit text
     assert_eq("blocked_auth excluded", S({"state": "blocked_auth"}, {"error": "429"}), None)
     assert_eq("complete excluded", S({"state": "complete"}, {"result_text": "rate limit discussion in a review"}), None)
+    # 2026-06-16 fold — codex retry-exhaustion + xAI credit-exhaustion (new modes
+    # not already caught by the "rate limit"/"429" substrings)
+    assert_eq("codex exceeded-retry", S({"state": "failed"}, {"error": "stream error: exceeded retry limit"}), A)
+    assert_eq("xai credits depleted", S({"state": "failed"}, {"result_text": "Your API requests will be automatically rejected once your prepaid credits are depleted."}), A)
+    assert_eq("xai payment_required", S({"state": "failed"}, {"error": "402 payment_required"}), A)
+    # credit-exhaustion text echoed in a SUCCESSFUL run must not false-positive
+    assert_eq("credits text complete excluded", S({"state": "complete"}, {"result_text": "note: prepaid credits are depleted soon"}), None)
 
 
 def _run_tests():
