@@ -45,3 +45,9 @@ codedb.snapshot
 # at runtime; never track a skeleton here (tracked exceptions are how private
 # content gets force-added by accident).
 docs-private/
+
+# Machine-local operator extensions: site-specific add-ons that are not part of
+# the published skill and are loaded at runtime only when present. Fully
+# untracked — never git-add anything here.
+scripts/ext/
+tests/python/ext/
