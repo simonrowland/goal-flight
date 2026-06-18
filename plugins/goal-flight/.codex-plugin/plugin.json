@@ -1,6 +1,6 @@
 {
   "name": "goal-flight",
-  "version": "1.0.6",
+  "version": "1.0.7",
   "description": "Portable goal orchestration for long-running coding work with planning, dispatch, review, recovery, and file-backed handoffs.",
   "skills": "./skills/",
   "interface": {

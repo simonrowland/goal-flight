@@ -6,29 +6,58 @@ incremented when meaningful skill behaviour changes.
 
 ## [Unreleased]
 
+## [1.0.7] — 2026-06-17
+
+Dispatch-reliability release. Closes the launcher-death failure mode (a
+harness-reaped launcher could strand a dispatch with no ledger trace), makes
+worker liveness robust under CPU-sample denial, wires provider rate-limit
+signatures into capacity handling, and adds a milestone-DUE detector.
+
+### Added
+
+- **Durable dispatch queue (`--submit` / `drain`).** `goalflight_dispatch.py
+  --submit` writes a durable, idempotent-by-dispatch-id queue entry and exits
+  without blocking on capacity; `goalflight_dispatch.py drain` is a short-lived,
+  cron-safe pass that launches whatever fits the live capacity caps and exits in
+  ~1s. A reaped launcher can no longer strand a request — state is reconciled
+  from the worker output tail plus terminal marker, and stale-claim recovery is
+  launch-token safe (no double-launch across the spawn/ledger window).
+- **Milestone-DUE detector (`goalflight_milestone.py`).** Commit-cadence
+  milestone detector surfaced in the status payload and text output.
+
 ### Changed
 
-- **claude-acp builds the merged upstream TUI-submit fix by default.** The Claude
-  Code 2.1.169 TUI-submit fix (`claude-code-cli-acp` PR #1, commit `14a5b0c`) is
-  merged upstream but not yet published to npm (latest `0.1.1` ships the broken
-  binary). `install.sh claude-acp` now builds that pinned commit from source and
-  swaps it into the installed launcher by default (Rust/cargo required; resolves
-  the platform binary whether npm placed it top-level or nested under the
-  launcher; fails loudly rather than silently leaving the broken shim). This
-  supersedes the opt-in vendored patch from 1.0.4 (now removed). The build
-  auto-retires once npm publishes `claude-code-cli-acp > 0.1.1` (the `>0.1.1`
-  gate skips it).
+- **Remote claude-acp worker path with a built-by-default launcher fix.** The
+  supported Claude worker surface is remote claude-acp on a non-sandboxed node
+  (local/sandboxed is intentionally unsupported — no pty under the host sandbox,
+  host keychain unreachable over non-interactive ssh); the node is authed by a
+  headless token passed through the launch env allow-list. `install.sh
+  claude-acp` now builds the pinned upstream TUI-submit fix from source by
+  default (Rust/cargo) and auto-retires once it publishes to npm. End-to-end
+  recipe: `docs/fleet.md`.
+- **Dispatch state-machine asymmetry.** `watcher_stopped` stays non-terminal (a
+  live-but-quiet worker may still need salvage, so capacity and ledger stay
+  open) while `controller_dead` is terminal and its leases are pruned.
+- **Review-job no-progress timeout is CPU-sample-aware (grace-then-reap).** An
+  unavailable CPU sample earns an extended grace instead of an instant kill;
+  past the grace a still-quiet worker is reaped — required under sandboxes where
+  CPU sampling is permanently unavailable, so a genuinely wedged worker cannot
+  run unbounded.
+- **Rate-limit signature detection.** Adds retry-wrapper exhaustion and hard
+  credit-depletion signatures (beyond the existing 429 / "rate limit" prose) and
+  scans the worker-dead tail for them; matching stays failure-state-gated.
 
-- **Remote claude-acp works end-to-end via the subscription seat.** Local /
-  sandboxed claude-acp is intentionally unsupported (no pty under the host
-  sandbox; Keychain unreachable over non-interactive ssh). The supported Claude
-  worker surface is **remote** claude-acp on a non-sandboxed node, authed by a
-  headless subscription token: run `claude setup-token` on the node, then
-  `export CLAUDE_CODE_OAUTH_TOKEN=<token>` in the node env — ferried to the
-  detached worker via the launch env allow-list (`_sanitized_env`). `claude auth
-  status` then reports `authMethod=oauth_token` / `apiProvider=firstParty`
-  (subscription, not API). End-to-end recipe: `docs/fleet.md` "Remote Claude
-  worker (claude-acp) end-to-end".
+### Fixed
+
+- **Status tail-reconcile no longer false-promotes a live worker.** Idle output
+  alone is insufficient; promotion to complete requires pid-dead or
+  identity-unavailable.
+
+### Tests
+
+- The slow, environment-flaky live opencode ACP probes are skipped at execution
+  by default (`GOALFLIGHT_LIVE_OPENCODE=1` to run); `--list` collection stays
+  complete.
 
 ## [1.0.6] — 2026-06-13
 
