@@ -461,6 +461,47 @@ bounds the damage; ticket-FIFO is the named rung if sustained saturation ever
 makes starvation real. (ACP-shape and review_job acquires are still
 single-shot — parity is a known follow-up.)
 
+### Pause a vendor until its limit resets (`cooldown`)
+
+When a provider is at or near a budget limit (its 5-hour window, weekly cap, or
+credit balance) and you want to stop feeding it doomed launches until the window
+resets — rather than letting `drain` spam 429s into the abyss — set a per-agent
+cooldown:
+
+```bash
+# pause new launches for a vendor (auto-expires after --seconds):
+python3 <skill-root>/scripts/goalflight_capacity.py cooldown set \
+  --agent <codex|claude|grok> --seconds <secs-until-reset> \
+  --reason "5h limit ~X% left, resets ~HH:MM"
+
+# resume early once the window resets (or just let it auto-expire):
+python3 <skill-root>/scripts/goalflight_capacity.py cooldown clear --agent <codex|claude|grok>
+```
+
+Behaviour — non-destructive and self-healing:
+- New acquisitions for that agent are refused until the cooldown expires. A
+  `drain` still claims and replays each queued entry, but the capacity acquire
+  **blocks on the cooldown** (`decision=wait`) and the entry is **restored to the
+  queue** — so nothing new launches for that vendor. **In-flight workers are not
+  killed** — they finish.
+- Queued `--submit` entries are **held in the durable queue, not lost** (claim →
+  acquire-blocks → restore); the instant the cooldown clears or expires, the next
+  `drain` relaunches them (idempotent by dispatch-id — no double-launch, no
+  re-bounce).
+- Add margin past the nominal reset (e.g. +10 min) so launches don't resume
+  exactly at the boundary and immediately re-exhaust.
+- Cooldown is **machine-local, file-backed runtime state** (`capacity.json` in
+  `GOALFLIGHT_STATE_DIR` / the default state dir, lock-guarded) — NOT repo state,
+  so there is nothing to commit. It pauses that vendor for every dispatcher
+  sharing that state dir — which is the point for a shared provider budget.
+  Reroute vendor-agnostic work to another vendor meanwhile.
+
+This is the **manual** limit lever. It complements the **reactive**
+`rate_pressure` walk-back (auto-reduces caps AFTER clustered failures) and is the
+manual precursor to a **proactive** usage gate (auto-cooldown keyed off real
+provider utilization %). Use `cooldown` when you already know a window is tight;
+let `rate_pressure` catch what you don't.
+
 ## Ledger
 
 After spawn, record PID and prompt:

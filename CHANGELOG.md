@@ -6,6 +6,19 @@ incremented when meaningful skill behaviour changes.
 
 ## [Unreleased]
 
+### Documentation
+
+- **Operator recipe for `cooldown` — pause a vendor until its limit resets.**
+  `protocols/dispatch-routing.md` (`## Capacity gate`) now documents
+  `goalflight_capacity.py cooldown set/clear` as the manual lever to hold a
+  provider's new launches until its 5h / credit window resets: a `drain`'s
+  capacity acquire blocks on the cooldown so the entry is restored (not launched,
+  not lost), in-flight workers finish, and held `--submit` entries auto-relaunch
+  (idempotent) on clear/expiry. Cooldown is machine-local file-backed runtime
+  state (the state dir's `capacity.json`), not repo state. The manual precursor to
+  the planned proactive usage gate. (Command already shipped in the capacity CLI;
+  this makes it discoverable.)
+
 ## [1.0.7] — 2026-06-17
 
 Dispatch-reliability release. Closes the launcher-death failure mode (a
