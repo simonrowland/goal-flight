@@ -48,6 +48,7 @@ docs-private/
 
 # Machine-local operator extensions: site-specific add-ons that are not part of
 # the published skill and are loaded at runtime only when present. Fully
-# untracked — never git-add anything here.
-scripts/ext/
-tests/python/ext/
+# untracked — never git-add anything here. No trailing slash so the rule also
+# covers a symlink at this path (the installed skill symlinks scripts/ext here).
+scripts/ext
+tests/python/ext
