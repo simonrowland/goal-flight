@@ -92,6 +92,17 @@ def _is_fence_line(raw_line: str) -> bool:
     return lstrip.startswith("```") or lstrip.startswith("~~~")
 
 
+def _strip_terminal_marker_prefix(stripped: str) -> str:
+    for prefix in ("+ ", "- ", "> "):
+        if stripped.startswith(prefix):
+            return stripped[len(prefix):].lstrip()
+    if stripped.startswith(("+", "-")):
+        return stripped[1:].lstrip()
+    if stripped.startswith("**"):
+        return stripped[2:].lstrip()
+    return stripped
+
+
 def _fence_state_unbalanced(lines: list[str], ignored_lines: set[int]) -> bool:
     fence_count = 0
     for idx, line in enumerate(lines):
@@ -102,12 +113,23 @@ def _fence_state_unbalanced(lines: list[str], ignored_lines: set[int]) -> bool:
     return fence_count % 2 == 1
 
 
-def _final_terminal_marker_from_line(raw_line: str, line_no: int) -> dict | None:
-    if _is_diff_context_line(raw_line):
+def _final_terminal_marker_from_line(
+    raw_line: str,
+    line_no: int,
+    *,
+    allow_prefixed_marker: bool = False,
+) -> dict | None:
+    if raw_line.startswith((" ", "\t")):
+        return None
+    if _is_diff_context_line(raw_line) and not allow_prefixed_marker:
         return None
     stripped = raw_line.strip()
     if not stripped:
         return None
+    if allow_prefixed_marker:
+        stripped = _strip_terminal_marker_prefix(stripped)
+        if not stripped:
+            return None
     match = FINAL_TERMINAL_MARKER_RE.match(stripped)
     if not match:
         return None
@@ -395,7 +417,7 @@ def _scan_final_terminal_marker(
         if HUNK_HEADER_RE.match(line):
             in_hunk = True
             continue
-        candidate = _final_terminal_marker_from_line(line, idx)
+        candidate = _final_terminal_marker_from_line(line, idx, allow_prefixed_marker=True)
         if candidate:
             if _is_unfenced_prompt_quoted_bare_marker(
                 stripped,

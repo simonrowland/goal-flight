@@ -474,7 +474,6 @@ def case_worker_dead_final_reconciliation_rejects_diff_and_prompt_echo() -> None
     assert not term, term
 
     negative_cases = [
-        ("deletion no space", "-STATUS: COMPLETE: x\n"),
         ("context line leading space", " STATUS: COMPLETE: x\n"),
         ("hunk deletion indented marker", "@@ -1,1 +1,0 @@\n-    COMPLETE: x\n"),
     ]
@@ -492,6 +491,66 @@ def case_worker_dead_final_reconciliation_rejects_diff_and_prompt_echo() -> None
     assert rc == 1, f"prompt echo only must not complete, got rc={rc} ({payload})"
     assert payload.get("reason") == "worker_dead_no_terminal_marker", payload
     assert not term, term
+
+
+def case_worker_dead_accepts_single_prefix_variants_outside_hunk() -> None:
+    cases = [
+        ("plus", "+COMPLETE: x\npost-marker tail\n"),
+        ("plus space", "+ COMPLETE: x\npost-marker tail\n"),
+        ("minus", "-COMPLETE: x\npost-marker tail\n"),
+        ("minus space", "- COMPLETE: x\npost-marker tail\n"),
+        ("quote", "> COMPLETE: x\npost-marker tail\n"),
+        ("bold", "**COMPLETE:** x\npost-marker tail\n"),
+    ]
+    for label, tail_text in cases:
+        rc, _elapsed, term, payload = _run_dead_worker_tail(tail_text)
+        assert rc == 0, f"{label}: prefixed marker should reconcile, got rc={rc} ({payload})"
+        assert payload.get("reason") == "marker:COMPLETE:final_reconciliation", payload
+        assert term.get("kind") == "COMPLETE", term
+        assert term.get("text") == "x", term
+
+
+def case_worker_dead_accepts_prefixed_ready_with_trailing_tail() -> None:
+    rc, _elapsed, term, payload = _run_dead_worker_tail(
+        "Structure check passed: 4 HIGH, 4 MED, 1 LOW, 1 INFO; verdict present.\n"
+        "+READY: docs-private/research/2026-06-19-v4-frame-negotiation/review-frame-adversarial.md\n"
+        "hook: Stop\n"
+        "tokens used\n"
+        "123\n"
+        "Verified: verdict present, counts inline, final line is the requested `READY:` marker.\n"
+    )
+    assert rc == 0, f"prefixed READY must reconcile to exit 0, got rc={rc} ({payload})"
+    assert payload.get("state") == "complete", payload
+    assert payload.get("reason") == "marker:READY:final_reconciliation", payload
+    assert term.get("kind") == "READY", term
+    assert term.get("text") == (
+        "docs-private/research/2026-06-19-v4-frame-negotiation/review-frame-adversarial.md"
+    ), term
+
+
+def case_worker_dead_rejects_prefixed_terminal_inside_diff_hunk() -> None:
+    for marker in ("READY", "COMPLETE"):
+        rc, _elapsed, term, payload = _run_dead_worker_tail(
+            "diff --git a/file.md b/file.md\n"
+            "@@ -1 +1 @@\n"
+            f"+{marker}: docs-private/research/quoted-from-diff.md\n"
+            "worker died before sign-off\n"
+        )
+        assert rc == 1, f"{marker} inside a real hunk must stay worker_dead, got rc={rc} ({payload})"
+        assert payload.get("reason") == "worker_dead_no_terminal_marker", payload
+        assert not term, term
+
+
+def case_plain_ready_last_line_still_works() -> None:
+    rc, _elapsed, term, payload = _run_dead_worker_tail(
+        "TL;DR: audit done\n"
+        "READY: docs-private/research/plain-ready/findings.md\n"
+    )
+    assert rc == 0, f"plain READY terminal marker regressed, got rc={rc} ({payload})"
+    assert payload.get("state") == "complete", payload
+    assert payload.get("reason") == "marker:READY", payload
+    assert term.get("kind") == "READY", term
+    assert term.get("text") == "docs-private/research/plain-ready/findings.md", term
 
 
 def case_worker_dead_rejects_banner_offset_prompt_echo() -> None:
@@ -806,6 +865,10 @@ def main() -> None:
     case_ready_terminal_marker()
     case_worker_dead_final_reconciliation_observed_shapes()
     case_worker_dead_final_reconciliation_rejects_diff_and_prompt_echo()
+    case_worker_dead_accepts_single_prefix_variants_outside_hunk()
+    case_worker_dead_accepts_prefixed_ready_with_trailing_tail()
+    case_worker_dead_rejects_prefixed_terminal_inside_diff_hunk()
+    case_plain_ready_last_line_still_works()
     case_worker_dead_rejects_banner_offset_prompt_echo()
     case_worker_dead_accepts_banner_offset_genuine_bare_marker()
     case_worker_dead_accepts_fenceless_final_prompt_quoted_marker()
