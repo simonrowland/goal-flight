@@ -19,8 +19,13 @@ surface REAL blockers → routing table → grouped fixes → serial integrator`
    modifies/builds-on), the finding schema, the class taxonomy, and the queued-work backlog
    (the BLOCKING yardstick). Write-once-read-many: keeps per-worker prompts tiny.
 2. **Matrix (targets)** — N rows of `domain × lens`, one per worker, disjoint and exhaustive.
+   Row count is driven by COVERAGE (the domains × lenses the audit needs), NOT by how many
+   lanes you have. Lanes only set wall-clock: the durable queue + drainer process rows in
+   waves (≈ ceil(rows / lanes)), priority-ordered, so oversubscription is safe — e.g. 30 rows
+   over 6 lanes runs in ~5 waves on a constrained box. Sizing the matrix to a multiple of the
+   available lanes is an OPTIONAL wall-clock tuning (cleaner waves), never a cap on coverage.
    Lane-split by difficulty: subtle/critical rows → the stronger engine, breadth rows → the
-   cheaper/wider pool, sized to each provider's real lane limit ("fill all lanes").
+   cheaper/wider pool ("fill all lanes" = saturate the pools you have, in waves if needed).
 3. **Audit** — one worker per row, READ-ONLY, **one-shot** (breadth comes from the matrix
    partition, not per-worker loops), inline findings to its tail, BLOCKING first, end `READY:`.
 4. **Harvest** — a write-enabled step parses the worker tails into an append-only
