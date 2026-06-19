@@ -48,6 +48,10 @@ incremented when meaningful skill behaviour changes.
   an alphabetically-earlier backlog. Priority is read per entry and degrades safely to
   `normal` when missing/unrecognized; an unreadable entry is decided authoritatively
   at claim time (the ordering pre-scan never tombstones a valid entry).
+- **`/goal-flight bug-sweep` command.** Discoverable skill-surface entry for the
+  lane-fill bug-sweep campaign (`commands/bug-sweep.md` → `protocols/lane-fill-bug-sweep.md`),
+  with `--mode <milestone|qa|bug-hunt|predicate>` and the `--anchor` re-review knob.
+  Listed in the SKILL.md command router and the protocol index.
 
 ### Fixed
 
