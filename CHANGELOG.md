@@ -51,7 +51,8 @@ incremented when meaningful skill behaviour changes.
 - **`/goal-flight bug-sweep` command.** Discoverable skill-surface entry for the
   lane-fill bug-sweep campaign (`commands/bug-sweep.md` → `protocols/lane-fill-bug-sweep.md`),
   with `--mode <milestone|qa|bug-hunt|predicate>` and the `--anchor` re-review knob.
-  Listed in the SKILL.md command router and the protocol index.
+  Surfaced via the agent command list and the protocol index (kept out of the
+  SKILL.md router table to stay under the lean-router size budget).
 
 ### Fixed
 

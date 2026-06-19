@@ -165,7 +165,6 @@ drift against an in-flight queue.
 | `/goal-flight update` | `commands/update.md` | `tool-readiness` |
 | `/goal-flight validate-dispatch [<slug>]` | `commands/validate-dispatch.md` | `dispatch-routing`, `worker-markers` |
 | `/goal-flight validate-queue [<path>]` | `commands/validate-queue.md` | none |
-| `/goal-flight bug-sweep [--mode <m>] [--anchor <ref>]` | `commands/bug-sweep.md` | `lane-fill-bug-sweep`, `review-mining`, `dispatch-routing` |
 
 Protocol index: `protocols/README.md`.
 
