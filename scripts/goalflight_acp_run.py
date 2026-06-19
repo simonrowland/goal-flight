@@ -1678,16 +1678,7 @@ async def _run_acp_dispatch_impl(
     def detach_lease_to_worker(worker_pid: int, reason: object) -> None:
         if not lease_id:
             return
-        with goalflight_capacity.StateLock():
-            data = goalflight_capacity.load_state()
-            lease = data.get("leases", {}).get(lease_id)
-            if lease:
-                lease["worker_pid"] = worker_pid
-                lease["detached_controller_pid"] = lease.get("controller_pid")
-                lease["controller_pid"] = worker_pid
-                lease["detached_at"] = goalflight_capacity.iso()
-                lease["detached_reason"] = reason
-                goalflight_capacity.save_state(data)
+        goalflight_capacity.detach_lease_to_worker(lease_id, worker_pid, reason)
 
     def stalled_markers(message: str) -> dict[str, list[str]]:
         markers = dict(payload.get("markers") or {})

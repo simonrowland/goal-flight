@@ -671,6 +671,24 @@ def extend_active_lease_expiry(lease_id: str | None, seconds: float) -> bool:
         return True
 
 
+def detach_lease_to_worker(lease_id: str | None, worker_pid: int, reason: object) -> bool:
+    """Re-parent a detached-worker lease from launcher pid to worker pid."""
+    if not lease_id or not worker_pid:
+        return False
+    with StateLock():
+        data = load_state()
+        lease = data.get("leases", {}).get(lease_id)
+        if not lease:
+            return False
+        lease["worker_pid"] = worker_pid
+        lease.setdefault("detached_controller_pid", lease.get("controller_pid"))
+        lease["controller_pid"] = worker_pid
+        lease["detached_at"] = iso()
+        lease["detached_reason"] = reason
+        save_state(data)
+        return True
+
+
 # Bash-tail + dispatch presets that share one engine/provider concurrency budget.
 AGENT_CAP_POOL: dict[str, str] = {
     "grok-code": "grok",
@@ -994,10 +1012,12 @@ def stale_active_leases(data: dict) -> list[dict]:
     for lease in active_leases(data):
         controller_pid = lease.get("controller_pid")
         worker_pid = lease.get("worker_pid")
-        if not pid_alive(controller_pid):
+        if worker_pid is not None:
+            if pid_alive(worker_pid):
+                continue
             stale.append(lease)
             continue
-        if worker_pid is not None and not pid_alive(worker_pid):
+        if not pid_alive(controller_pid):
             stale.append(lease)
     return stale
 

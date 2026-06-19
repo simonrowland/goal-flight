@@ -49,6 +49,20 @@ incremented when meaningful skill behaviour changes.
   `normal` when missing/unrecognized; an unreadable entry is decided authoritatively
   at claim time (the ordering pre-scan never tombstones a valid entry).
 
+### Fixed
+
+- **Detached bash-tail workers no longer killed mid-run (worker-death root cause).**
+  A bash-tail worker launched from the queue (drain/submit) is detached from its
+  short-lived launching controller. Previously its pidfile lacked a `detached`
+  flag, so `cleanup_ghosts` would `kill` the live worker once the launcher pid
+  went dead; and its capacity lease, keyed to the dead launcher pid, was freed by
+  release-stale. Now the detached launch stamps `detached: true` (cleanup_ghosts
+  preserves the live worker, with a process-identity guard against pid reuse, and
+  still unlinks genuinely dead detached pidfiles) and re-parents the lease to the
+  worker pid; release-stale treats a live `worker_pid` as authoritative, so a
+  live detached worker is never reclaimed even if the reparent handoff fails.
+  This was the cause of intermittent `worker_dead_no_terminal_marker` deaths.
+
 ## [1.0.7] — 2026-06-17
 
 Dispatch-reliability release. Closes the launcher-death failure mode (a

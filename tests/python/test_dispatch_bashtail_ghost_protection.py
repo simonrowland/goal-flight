@@ -152,15 +152,18 @@ def case_live_bashtail_worker_not_killed_by_ghost_sweep() -> None:
 
                 # Now the REAL ghost sweep, with the recorded controller treated as
                 # DEAD (the dispatch proc has exited). Real cleanup_ghosts logic.
+                orig_pid_alive = goalflight_compat.pid_alive
+                orig_ps_meta = goalflight_acp_client._ps_meta
+
                 def fake_pid_alive(pid: int) -> bool:
                     if pid == ephemeral_controller:
                         return False  # the ephemeral dispatch proc has exited
-                    return _alive(pid)
+                    return orig_pid_alive(pid)
 
                 def fake_ps_meta(pid: int):
                     if pid == ephemeral_controller:
                         return None  # dead controller -> not a live-controller skip
-                    return goalflight_acp_client._ps_meta(pid)
+                    return orig_ps_meta(pid)
 
                 with patch("goalflight_acp_client._PIDFILE_DIR", pid_dir), \
                         patch("goalflight_compat.pid_alive", side_effect=fake_pid_alive), \
@@ -175,6 +178,95 @@ def case_live_bashtail_worker_not_killed_by_ghost_sweep() -> None:
             os.killpg(os.getpgid(worker_pid), signal.SIGKILL)
         with contextlib.suppress(Exception):
             worker.wait(timeout=5)
+
+
+def case_from_queue_detached_pidfile_spares_live_worker() -> None:
+    """From-queue detached bash-tail pidfiles are protected immediately.
+
+    Queue drain launches with a short-lived controller. The pidfile must already
+    carry ``detached:true`` before that launcher exits; otherwise the next ghost
+    sweep can kill the still-running worker.
+    """
+    worker = _spawn_live_worker()
+    worker_pid = worker.pid
+    try:
+        assert _alive(worker_pid)
+        dead_controller = _free_dead_pid()
+        identity = {"lstart": "test-start", "comm": "python"}
+        pgid = os.getpgid(worker_pid)
+        assert pgid == worker_pid
+
+        with tempfile.TemporaryDirectory() as td:
+            pid_dir = Path(td)
+            with patch.dict(os.environ, {"GOAL_FLIGHT_PIDFILE_DIR": str(pid_dir)}):
+                args = _dispatch_args(
+                    controller_pid=dead_controller,
+                    dispatch_id="bashtail-detached-live",
+                )
+                pidfile = dispatch._write_pidfile(
+                    args,
+                    worker_pid=worker_pid,
+                    pgid=pgid,
+                    identity=identity,
+                    detached=True,
+                )
+            assert pidfile is not None and pidfile.exists()
+            rec = json.loads(pidfile.read_text().splitlines()[0])
+            assert rec.get("detached") is True, rec
+
+            orig_pid_alive = goalflight_compat.pid_alive
+            orig_ps_meta = goalflight_acp_client._ps_meta
+
+            def fake_pid_alive(pid: int) -> bool:
+                if pid == dead_controller:
+                    return False
+                return orig_pid_alive(pid)
+
+            def fake_ps_meta(pid: int):
+                if pid == dead_controller:
+                    return None
+                if pid == worker_pid:
+                    return identity["lstart"], identity["comm"]
+                return orig_ps_meta(pid)
+
+            with patch("goalflight_acp_client._PIDFILE_DIR", pid_dir), \
+                    patch("goalflight_compat.pid_alive", side_effect=fake_pid_alive), \
+                    patch("goalflight_acp_client._ps_meta", side_effect=fake_ps_meta), \
+                    patch("goalflight_compat.kill_pid",
+                          side_effect=AssertionError("LANDMINE: detached live worker killed")):
+                killed = goalflight_acp_client.cleanup_ghosts()
+            assert killed == 0, "detached live worker must not be killed"
+            assert _alive(worker_pid), "detached live worker survived the ghost sweep"
+            assert pidfile.exists(), "live detached worker pidfile remains for later cleanup"
+    finally:
+        with contextlib.suppress(OSError):
+            os.killpg(os.getpgid(worker_pid), signal.SIGKILL)
+        with contextlib.suppress(Exception):
+            worker.wait(timeout=5)
+
+
+def case_dead_detached_pidfile_still_unlinked() -> None:
+    """Detached is not a leak: once the worker pid is dead, cleanup unlinks."""
+    dead_controller = _free_dead_pid()
+    dead_worker = _free_dead_pid()
+    with tempfile.TemporaryDirectory() as td:
+        pid_dir = Path(td)
+        pidfile = pid_dir / f"{dead_controller}.bashtail.{dead_worker}.jsonl"
+        pidfile.write_text(json.dumps({
+            "controller_pid": dead_controller,
+            "pid": dead_worker,
+            "pgid": dead_worker,
+            "started_at": "dead",
+            "cmd": "dead",
+            "agent": "codex-bash-tail",
+            "session_id": "bashtail-detached-dead",
+            "detached": True,
+        }, sort_keys=True) + "\n", encoding="utf-8")
+
+        with patch("goalflight_acp_client._PIDFILE_DIR", pid_dir):
+            killed = goalflight_acp_client.cleanup_ghosts()
+        assert killed == 0, "dead detached worker should not count as a kill"
+        assert not pidfile.exists(), "dead detached pidfile must be unlinked"
 
 
 def case_genuine_ghost_still_reaped() -> None:
@@ -247,8 +339,10 @@ def case_dead_worker_pidfile_unlinked_not_marked() -> None:
 
 
 def main() -> None:
+    case_from_queue_detached_pidfile_spares_live_worker()
+    case_dead_detached_pidfile_still_unlinked()
     if goalflight_acp_client._ps_meta(os.getpid()) is None:
-        print("OK: dispatch bash-tail ghost-protection tests skipped (ps unavailable)")
+        print("OK: dispatch bash-tail ghost-protection detached tests pass (ps-dependent cases skipped)")
         return
     case_live_bashtail_worker_not_killed_by_ghost_sweep()
     case_genuine_ghost_still_reaped()

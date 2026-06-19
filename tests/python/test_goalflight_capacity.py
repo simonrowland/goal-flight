@@ -378,6 +378,54 @@ def case_status_still_reclaims_dead_lease_in_view(state_dir: Path) -> None:
     )
 
 
+def case_release_stale_poison_pair_live_worker_survives_dead_controller(state_dir: Path) -> None:
+    """Poison-pair: no detach markers, dead controller, live worker stays held."""
+    worker = _spawn_live_worker()
+    lease_id = "poison-pair-live-worker-dead-controller"
+    try:
+        lease = _past_ttl_lease(worker_pid=worker.pid, controller_pid=_dead_pid())
+        lease["lease_id"] = lease_id
+        lease["expires_at"] = cap.iso(cap.utc_now() + dt.timedelta(hours=8))
+        assert not any(key.startswith("detached_") for key in lease)
+        cap.save_state(
+            {
+                "schema": cap.SCHEMA,
+                "machine_id": cap.machine_id(),
+                "leases": {lease_id: lease},
+                "cooldowns": {},
+            }
+        )
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = cap.main(["release-stale", "--reason", "poison_pair_test"])
+        payload = json.loads(buf.getvalue())
+        assert rc == 0, rc
+        assert payload["released"] == [], payload
+        data = json.loads(cap.state_path().read_text())
+        assert data["leases"][lease_id]["state"] == "active", (
+            "release-stale reclaimed a live worker keyed to a dead controller"
+        )
+
+        _kill_if_alive(worker.pid)
+        worker.wait()
+        assert not cap.pid_alive(worker.pid), "killed worker pid should read dead"
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = cap.main(["release-stale", "--reason", "poison_pair_test"])
+        payload = json.loads(buf.getvalue())
+        assert rc == 0, rc
+        assert payload["released"] == [lease_id], payload
+        data = json.loads(cap.state_path().read_text())
+        assert lease_id not in data["leases"], (
+            "release-stale failed to reclaim the lease after worker death"
+        )
+    finally:
+        _kill_if_alive(worker.pid)
+        worker.wait()
+
+
 def case_aggregate_status_payload_does_not_persist_prune(state_dir: Path) -> None:
     """goalflight_status.status_payload is a read path; --wait polls it often."""
     lease = _past_ttl_lease(worker_pid=_dead_pid(), controller_pid=_dead_pid())
@@ -605,6 +653,7 @@ def main() -> None:
         try:
             case_status_is_non_mutating_for_live_lease(state_dir)
             case_status_still_reclaims_dead_lease_in_view(state_dir)
+            case_release_stale_poison_pair_live_worker_survives_dead_controller(state_dir)
             case_aggregate_status_payload_does_not_persist_prune(state_dir)
             case_acquire_atomic_gate_still_blocks_over_cap(state_dir)
             case_adaptive_rate_pressure_reduces_codex_effective_cap(state_dir)

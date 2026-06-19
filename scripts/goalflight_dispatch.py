@@ -1887,6 +1887,10 @@ def _attach_worker_to_lease(lease_id: str | None, worker_pid: int) -> None:
             goalflight_capacity.save_state(data)
 
 
+def _detach_lease_to_worker(lease_id: str | None, worker_pid: int, reason: object) -> None:
+    goalflight_capacity.detach_lease_to_worker(lease_id, worker_pid, reason)
+
+
 def _pidfile_dir() -> Path:
     return Path(
         os.environ.get(
@@ -1910,7 +1914,14 @@ def _process_identity_after_spawn(worker_pid: int) -> dict | None:
     return goalflight_ledger.process_identity(worker_pid)
 
 
-def _write_pidfile(args, *, worker_pid: int, pgid: int | None, identity: dict | None = None) -> Path | None:
+def _write_pidfile(
+    args,
+    *,
+    worker_pid: int,
+    pgid: int | None,
+    identity: dict | None = None,
+    detached: bool = False,
+) -> Path | None:
     pidfile_dir = _pidfile_dir()
     pidfile_dir.mkdir(parents=True, exist_ok=True)
     ident = identity or _process_identity_after_spawn(worker_pid)
@@ -1932,6 +1943,8 @@ def _write_pidfile(args, *, worker_pid: int, pgid: int | None, identity: dict | 
         "agent": f"{args.agent}-bash-tail",
         "session_id": args.dispatch_id,
     }
+    if detached:
+        entry["detached"] = True
     pidfile.write_text(json.dumps(entry, sort_keys=True) + "\n", encoding="utf-8")
     return pidfile
 
@@ -3416,12 +3429,27 @@ def main(argv: list[str] | None = None) -> int:
             summary_head["caffeinate_pid"] = caffeinate_pid
         elif sys.platform == "darwin":
             registration_errors.append(_registration_error("caffeinate", RuntimeError(caffeinate_reason or "failed")))
+        # Record worker_pid on the lease FIRST and unconditionally: stale-release
+        # treats a live worker_pid as authoritative, so this must persist even if
+        # the detached reparent below fails (otherwise release-stale could free a
+        # live detached worker's slot when controller_pid is the dead launcher).
         try:
             _attach_worker_to_lease(lease_id, worker_pid)
         except Exception as e:
             registration_errors.append(_registration_error("attach_worker_to_lease", e))
+        if args.launch_detached:
+            try:
+                _detach_lease_to_worker(lease_id, worker_pid, "bash_launch_detached")
+            except Exception as e:
+                registration_errors.append(_registration_error("detach_lease_to_worker", e))
         try:
-            pidfile = _write_pidfile(args, worker_pid=worker_pid, pgid=pgid, identity=worker_identity)
+            pidfile = _write_pidfile(
+                args,
+                worker_pid=worker_pid,
+                pgid=pgid,
+                identity=worker_identity,
+                detached=bool(args.launch_detached),
+            )
         except Exception as e:
             registration_errors.append(_registration_error("write_pidfile", e))
             pidfile = None

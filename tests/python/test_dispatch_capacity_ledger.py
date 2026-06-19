@@ -100,6 +100,8 @@ def _dispatch_command(
     poll_secs: str = "0.2",
     max_idle_secs: str = "20",
     controller_pid: int | None = None,
+    from_queue: bool = False,
+    launch_detached: bool = False,
 ) -> list[str]:
     cmd = [
         sys.executable,
@@ -119,6 +121,10 @@ def _dispatch_command(
     ]
     if controller_pid is not None:
         cmd += ["--controller-pid", str(controller_pid)]
+    if from_queue:
+        cmd += ["--from-queue"]
+    if launch_detached:
+        cmd += ["--launch-detached"]
     cmd += ["--", sys.executable, "-c", worker_code]
     return cmd
 
@@ -133,6 +139,8 @@ def _run_dispatch(
     poll_secs: str = "0.2",
     max_idle_secs: str = "20",
     controller_pid: int | None = None,
+    from_queue: bool = False,
+    launch_detached: bool = False,
     timeout_s: float = 90.0,
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
@@ -144,6 +152,8 @@ def _run_dispatch(
             poll_secs=poll_secs,
             max_idle_secs=max_idle_secs,
             controller_pid=controller_pid,
+            from_queue=from_queue,
+            launch_detached=launch_detached,
         ),
         cwd=ROOT,
         env=env,
@@ -166,6 +176,35 @@ def _dispatch_end(stdout: str) -> dict:
         if line.startswith("DISPATCH-END "):
             return json.loads(line.split(" ", 1)[1])
     raise AssertionError(f"missing DISPATCH-END in stdout:\n{stdout}")
+
+
+def _dispatch_launched(stdout: str) -> dict:
+    for line in stdout.splitlines():
+        if line.startswith("DISPATCH-LAUNCHED "):
+            return json.loads(line.split(" ", 1)[1])
+    raise AssertionError(f"missing DISPATCH-LAUNCHED in stdout:\n{stdout}")
+
+
+def _capacity_release_stale(env: dict[str, str]) -> dict:
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts" / "goalflight_capacity.py"),
+            "release-stale",
+            "--state",
+            "expired",
+            "--reason",
+            "test_release_stale",
+            "--keep",
+        ],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+    )
+    return json.loads(proc.stdout)
 
 
 def _assert_terminal_record_and_lease(env: dict[str, str], dispatch_id: str, state: str) -> None:
@@ -314,6 +353,97 @@ def case_live_controller_pidfile_preserves_blocked_worker_for_reattach() -> None
             _assert_terminal_record_and_lease(env, dispatch_id, "blocked")
         finally:
             _kill_if_alive(worker_pid)
+
+
+def case_from_queue_detached_launch_stamps_pidfile() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        env = _env(tmp)
+        dispatch_id = "dispatch-detached-pidfile"
+        worker_pid = None
+        watcher_pid = None
+        try:
+            proc = _run_dispatch(
+                tmp,
+                env,
+                dispatch_id,
+                "import time; print('worker-start', flush=True); time.sleep(60)",
+                poll_secs="0.1",
+                max_idle_secs="20",
+                from_queue=True,
+                launch_detached=True,
+            )
+            assert proc.returncode == 0, (
+                f"dispatch rc={proc.returncode}\nstdout={proc.stdout}\nstderr={proc.stderr}"
+            )
+            launched = _dispatch_launched(proc.stdout)
+            worker_pid = int(launched["worker_pid"])
+            watcher_pid = int(launched["watcher_pid"])
+            assert worker_pid and _process_exists(worker_pid), launched
+
+            pidfiles = list((tmp / "pids").glob("*.jsonl"))
+            assert len(pidfiles) == 1, pidfiles
+            pid_entry = json.loads(pidfiles[0].read_text().splitlines()[0])
+            assert pid_entry.get("detached") is True, pid_entry
+        finally:
+            _kill_if_alive(worker_pid)
+            _kill_if_alive(watcher_pid)
+
+
+def case_from_queue_detached_launch_reparents_lease_and_survives_release_stale() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        env = _env(tmp)
+        dispatch_id = "dispatch-detached-lease"
+        worker_pid = None
+        watcher_pid = None
+        try:
+            proc = _run_dispatch(
+                tmp,
+                env,
+                dispatch_id,
+                "import time; print('worker-start', flush=True); time.sleep(60)",
+                poll_secs="0.1",
+                max_idle_secs="20",
+                from_queue=True,
+                launch_detached=True,
+            )
+            assert proc.returncode == 0, (
+                f"dispatch rc={proc.returncode}\nstdout={proc.stdout}\nstderr={proc.stderr}"
+            )
+            launched = _dispatch_launched(proc.stdout)
+            worker_pid = int(launched["worker_pid"])
+            watcher_pid = int(launched["watcher_pid"])
+            assert worker_pid and _process_exists(worker_pid), launched
+
+            payload = _status(env)
+            leases = _leases(payload, dispatch_id)
+            assert len(leases) == 1, leases
+            lease = leases[0]
+            assert lease.get("state") == "active", lease
+            assert lease.get("worker_pid") == worker_pid, lease
+            assert lease.get("controller_pid") == worker_pid, lease
+            assert lease.get("detached_controller_pid") not in (None, worker_pid), lease
+            assert lease.get("detached_at"), lease
+            assert lease.get("detached_reason") == "bash_launch_detached", lease
+
+            live_release = _capacity_release_stale(env)
+            assert live_release["count"] == 0, live_release
+            payload = _status(env)
+            live_lease = _leases(payload, dispatch_id)[0]
+            assert live_lease.get("state") == "active", live_lease
+
+            _kill_if_alive(worker_pid)
+            _wait_for(lambda: not _process_exists(worker_pid), timeout_s=10.0)
+            dead_release = _capacity_release_stale(env)
+            assert dead_release["count"] == 1, dead_release
+            payload = _status(env)
+            dead_lease = _leases(payload, dispatch_id)[0]
+            assert dead_lease.get("state") == "expired", dead_lease
+            assert dead_lease.get("reason") == "test_release_stale", dead_lease
+        finally:
+            _kill_if_alive(worker_pid)
+            _kill_if_alive(watcher_pid)
 
 
 def case_capacity_block_does_not_spawn() -> None:
@@ -1120,6 +1250,8 @@ def case_dispatch_stats_window_and_legacy_records() -> None:
 def main() -> None:
     case_status_sees_dispatch_and_lease_releases()
     case_live_controller_pidfile_preserves_blocked_worker_for_reattach()
+    case_from_queue_detached_launch_stamps_pidfile()
+    case_from_queue_detached_launch_reparents_lease_and_survives_release_stale()
     case_capacity_block_does_not_spawn()
     case_capacity_wait_queues_until_slot_frees()
     case_capacity_wait_interrupt_writes_terminal_status()

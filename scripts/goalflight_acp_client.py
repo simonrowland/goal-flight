@@ -338,6 +338,7 @@ def cleanup_ghosts(active_worker_pids: set[int] | None = None) -> int:
             lines = pf.read_text().splitlines()
         except OSError:
             continue
+        preserve_pidfile = False
         for line in lines:
             line = line.strip()
             if not line or not line.startswith("{"):
@@ -354,10 +355,28 @@ def cleanup_ghosts(active_worker_pids: set[int] | None = None) -> int:
                 # stall (D2): the orchestrator exited but deliberately left the
                 # worker running for re-attach, so it is NOT a ghost. Reaping it
                 # here would SIGKILL a live, intentional worker (and across
-                # concurrent projects sharing this pidfile dir). Leave it; the
-                # capacity lease's detached_* markers drive slot reclamation when
-                # the worker actually dies (see goalflight_capacity stale-release).
+                # concurrent projects sharing this pidfile dir). Leave the pidfile
+                # while the worker is live; once the pid is gone, fall through to
+                # unlink the stale pidfile below. The capacity lease's detached_*
+                # markers drive slot reclamation when the worker actually dies
+                # (see goalflight_capacity stale-release).
                 skipped_detached += 1
+                detached_live = False
+                if goalflight_compat.is_windows():
+                    detached_live = goalflight_compat.pid_alive(pid)
+                else:
+                    meta = _ps_meta(pid)
+                    recorded_lstart = entry.get("started_at")
+                    recorded_comm = entry.get("cmd")
+                    recorded_meta = (
+                        (recorded_lstart, recorded_comm)
+                        if isinstance(recorded_lstart, str) and isinstance(recorded_comm, str)
+                        else None
+                    )
+                    detached_live = meta is not None and _same_process(recorded_meta, meta)
+                if detached_live:
+                    preserve_pidfile = True
+                    continue
                 continue
             if goalflight_compat.is_windows():
                 if not goalflight_compat.pid_alive(pid):
@@ -414,7 +433,8 @@ def cleanup_ghosts(active_worker_pids: set[int] | None = None) -> int:
                     killed += 1
             elif goalflight_compat.kill_pid(pid, hard_signal, pgid=pgid, process_group=True):
                 killed += 1
-        pf.unlink(missing_ok=True)
+        if not preserve_pidfile:
+            pf.unlink(missing_ok=True)
     if killed or skipped_stale or skipped_live_controller or skipped_detached:
         log.info(
             "ghost_cleanup: killed=%d skipped_stale=%d skipped_live_controllers=%d "
