@@ -67,6 +67,23 @@ incremented when meaningful skill behaviour changes.
   worker pid; release-stale treats a live `worker_pid` as authoritative, so a
   live detached worker is never reclaimed even if the reparent handoff fails.
   This was the cause of intermittent `worker_dead_no_terminal_marker` deaths.
+- **Terminal-marker scan tolerates diff/markdown-prefixed markers.** A completed
+  worker whose terminal marker is rendered diff-style (e.g. `+READY:`) followed by
+  trailing transcript lines was reported as a false failure: the worker-dead
+  reconcile scan treated the `+`-prefixed marker as diff content, found no marker,
+  and exited nonzero. The scan now strips a single leading `+ `/`- `/`> `/`+`/`-`/`**`
+  prefix and matches the terminal marker **only outside a real `@@` diff hunk** (a
+  `+READY:` genuinely quoted inside a code diff stays non-terminal); live last-line
+  detection and the marker regex are unchanged.
+
+## [1.0.8] — 2026-06-19
+
+Dispatch-reliability + bug-sweep release. Fixes the worker-death root cause
+(detached bash-tail workers killed/reclaimed by cleanup_ghosts/release-stale) and
+the completed-but-reported-failed false-fail (prefixed terminal markers); adds
+drain liveness (no-drainer warning + opportunistic drain-on-submit) and
+priority-ordered draining; ships the lane-fill bug-sweep workflow as a
+discoverable `/goal-flight bug-sweep` command + protocol.
 
 ## [1.0.7] — 2026-06-17
 
