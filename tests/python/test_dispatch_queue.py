@@ -7,6 +7,7 @@ from support import skip_posix_on_native_windows
 
 skip_posix_on_native_windows("dispatch queue tests launch POSIX bash workers")
 
+import argparse
 import contextlib
 import io
 import json
@@ -79,6 +80,85 @@ def _write_fake_codex_acp(tmp: Path) -> Path:
     )
     wrapper.chmod(0o755)
     return wrapper
+
+
+def _drain_args(queue: Path, *, limit: int = 0) -> argparse.Namespace:
+    return argparse.Namespace(
+        queue_dir=str(queue),
+        capacity_wait_s=0.0,
+        claim_stale_s=D.QUEUE_CLAIM_STALE_S,
+        limit=limit,
+    )
+
+
+def _write_queue_entry(
+    queue: Path,
+    dispatch_id: str,
+    *,
+    filename: str,
+    priority: str | None = "normal",
+    created_at: str = "2026-01-01T00:00:00+00:00",
+) -> Path:
+    request = {
+        "agent": "test-dispatch",
+        "priority": priority,
+        "cwd": str(ROOT),
+        "tail": str(queue.parent.parent / f"{dispatch_id}.tail"),
+        "status_json": str(queue.parent.parent / f"{dispatch_id}.status.json"),
+    }
+    if priority is None:
+        request.pop("priority")
+    path = queue / f"{filename}.json"
+    D._write_json_atomic(
+        path,
+        {
+            "schema": D.DISPATCH_QUEUE_SCHEMA,
+            "state": "queued",
+            "dispatch_id": dispatch_id,
+            "agent": "test-dispatch",
+            "shape": "bash",
+            "project_root": str(ROOT),
+            "process_cwd": str(ROOT),
+            "created_at": created_at,
+            "updated_at": created_at,
+            "queue_path": str(path),
+            "dispatch_argv": [
+                "--agent",
+                "test-dispatch",
+                "--dispatch-id",
+                dispatch_id,
+                "--tail",
+                str(queue.parent.parent / f"{dispatch_id}.tail"),
+                "--status-json",
+                str(queue.parent.parent / f"{dispatch_id}.status.json"),
+                "--cwd",
+                str(ROOT),
+                "--",
+                sys.executable,
+                "-c",
+                "print('COMPLETE: queued test')",
+            ],
+            "request": request,
+        },
+    )
+    return path
+
+
+@contextlib.contextmanager
+def _record_drain_launch_order(order: list[str]):
+    old_run = D.subprocess.run
+
+    def fake_run(argv, **_kwargs):
+        argv = list(argv)
+        dispatch_id = argv[argv.index("--dispatch-id") + 1]
+        order.append(dispatch_id)
+        return subprocess.CompletedProcess(argv, 0, stdout=f"DISPATCH-LAUNCHED {dispatch_id}\n", stderr="")
+
+    D.subprocess.run = fake_run
+    try:
+        yield
+    finally:
+        D.subprocess.run = old_run
 
 
 def test_submit_records_replayable_request_without_capacity_acquire() -> None:
@@ -751,6 +831,172 @@ def test_drain_leaves_request_queued_when_capacity_full() -> None:
         assert row and row.get("classification") == "queued_capacity", row
 
 
+def test_drain_orders_by_priority_then_created_at_fifo() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        env = _env(tmp)
+        old_env = os.environ.copy()
+        launched: list[str] = []
+        try:
+            os.environ.clear()
+            os.environ.update(env)
+            queue = tmp / "state" / "dispatch-queue"
+            queue.mkdir(parents=True)
+            paths = [
+                _write_queue_entry(
+                    queue,
+                    "bulk-new",
+                    filename="000-bulk-new",
+                    priority="bulk",
+                    created_at="2026-01-01T00:05:00+00:00",
+                ),
+                _write_queue_entry(
+                    queue,
+                    "normal-new",
+                    filename="001-normal-new",
+                    priority="normal",
+                    created_at="2026-01-01T00:04:00+00:00",
+                ),
+                _write_queue_entry(
+                    queue,
+                    "critical-new",
+                    filename="002-critical-new",
+                    priority="critical",
+                    created_at="2026-01-01T00:03:00+00:00",
+                ),
+                _write_queue_entry(
+                    queue,
+                    "bulk-old",
+                    filename="003-bulk-old",
+                    priority="bulk",
+                    created_at="2026-01-01T00:00:00+00:00",
+                ),
+                _write_queue_entry(
+                    queue,
+                    "normal-old",
+                    filename="004-normal-old",
+                    priority="normal",
+                    created_at="2026-01-01T00:01:00+00:00",
+                ),
+                _write_queue_entry(
+                    queue,
+                    "critical-old",
+                    filename="005-critical-old",
+                    priority="critical",
+                    created_at="2026-01-01T00:02:00+00:00",
+                ),
+            ]
+            for offset, path in enumerate(paths):
+                stamp = time.time() + len(paths) - offset
+                os.utime(path, (stamp, stamp))
+            with _record_drain_launch_order(launched):
+                payload = D._drain_queue_once(_drain_args(queue))
+        finally:
+            os.environ.clear()
+            os.environ.update(old_env)
+        expected = ["critical-old", "critical-new", "normal-old", "normal-new", "bulk-old", "bulk-new"]
+        assert launched == expected
+        assert payload["launched"] == len(expected), payload
+        assert payload["remaining"] == 0, payload
+        assert [row["dispatch_id"] for row in payload["details"]] == expected
+
+
+def test_drain_degrades_unknown_priority_to_normal_and_survives_bad_json_prescan() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        env = _env(tmp)
+        old_env = os.environ.copy()
+        launched: list[str] = []
+        try:
+            os.environ.clear()
+            os.environ.update(env)
+            queue = tmp / "state" / "dispatch-queue"
+            queue.mkdir(parents=True)
+            _write_queue_entry(
+                queue,
+                "bulk-oldest",
+                filename="000-bulk-oldest",
+                priority="bulk",
+                created_at="2026-01-01T00:00:00+00:00",
+            )
+            _write_queue_entry(
+                queue,
+                "missing-priority",
+                filename="010-missing-priority",
+                priority=None,
+                created_at="2026-01-01T00:01:00+00:00",
+            )
+            _write_queue_entry(
+                queue,
+                "garbage-priority",
+                filename="011-garbage-priority",
+                priority="urgent",
+                created_at="2026-01-01T00:02:00+00:00",
+            )
+            bad_json = queue / "012-bad-json.json"
+            bad_json.write_text("{not json", encoding="utf-8")
+            _write_queue_entry(
+                queue,
+                "critical-newer",
+                filename="999-critical-newer",
+                priority="critical",
+                created_at="2026-01-01T00:03:00+00:00",
+            )
+            with _record_drain_launch_order(launched):
+                payload = D._drain_queue_once(_drain_args(queue, limit=4))
+        finally:
+            os.environ.clear()
+            os.environ.update(old_env)
+        assert launched == ["critical-newer", "missing-priority", "garbage-priority"], payload
+        assert payload["launched"] == 3, payload
+        assert payload["failed"] == 1, payload
+        assert payload["remaining"] == 1, payload
+        assert (tmp / "state" / "dispatch-queue" / "000-bulk-oldest.json").exists()
+        assert list((tmp / "state" / "dispatch-queue").glob("012-bad-json.json.claimed-*.failed"))
+
+
+def test_drain_does_not_tombstone_valid_entry_on_stale_prescan_read_error() -> None:
+    """Regression: the pre-scan read is used only for sort ordering; a stale
+    pre-scan read_error (e.g. the entry was mid-restore by a concurrent
+    stale-claim recovery at scan time) must NOT tombstone a now-valid entry.
+    Readability is decided authoritatively from the claimed file."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        env = _env(tmp)
+        old_env = os.environ.copy()
+        old_candidate = D._queue_entry_drain_candidate
+        launched: list[str] = []
+        try:
+            os.environ.clear()
+            os.environ.update(env)
+            queue = tmp / "state" / "dispatch-queue"
+            queue.mkdir(parents=True)
+            _write_queue_entry(
+                queue,
+                "stale-scan-survivor",
+                filename="000-stale-scan-survivor",
+                priority="normal",
+                created_at="2026-01-01T00:00:00+00:00",
+            )
+
+            def stale_candidate(path):
+                # Keep the real (valid) sort key but force a stale pre-scan miss.
+                sort_key, p, _entry, _err = old_candidate(path)
+                return (sort_key, p, None, "StaleSimulated")
+
+            D._queue_entry_drain_candidate = stale_candidate
+            with _record_drain_launch_order(launched):
+                payload = D._drain_queue_once(_drain_args(queue))
+        finally:
+            D._queue_entry_drain_candidate = old_candidate
+            os.environ.clear()
+            os.environ.update(old_env)
+        assert launched == ["stale-scan-survivor"], payload
+        assert payload["launched"] == 1, payload
+        assert payload["failed"] == 0, payload
+        assert not list((tmp / "state" / "dispatch-queue").glob("*.failed")), payload
+
+
 def test_stale_claim_without_worker_record_is_recovered() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
@@ -1000,6 +1246,9 @@ def main() -> None:
     test_drain_write_error_is_json_error_without_traceback()
     test_acp_submit_then_drain_replays_from_queue()
     test_drain_leaves_request_queued_when_capacity_full()
+    test_drain_orders_by_priority_then_created_at_fifo()
+    test_drain_degrades_unknown_priority_to_normal_and_survives_bad_json_prescan()
+    test_drain_does_not_tombstone_valid_entry_on_stale_prescan_read_error()
     test_stale_claim_without_worker_record_is_recovered()
     test_failed_claim_tombstone_is_not_recovered()
     test_stale_claim_launch_token_requires_matching_worker_record()

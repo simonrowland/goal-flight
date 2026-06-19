@@ -34,6 +34,12 @@ incremented when meaningful skill behaviour changes.
   the next scheduled drain. Default on; `--no-drain-on-submit` opts out. The pass
   is claim-token safe (never double-launches) and any failure never fails the
   submit — the durable entry remains.
+- **Priority-ordered drain.** `drain` now launches queued requests in priority-lane
+  order (critical → normal → bulk), then FIFO by submit time within a lane, instead
+  of alphabetical filename order — so a high-priority request no longer waits behind
+  an alphabetically-earlier backlog. Priority is read per entry and degrades safely to
+  `normal` when missing/unrecognized; an unreadable entry is decided authoritatively
+  at claim time (the ordering pre-scan never tombstones a valid entry).
 
 ## [1.0.7] — 2026-06-17
 

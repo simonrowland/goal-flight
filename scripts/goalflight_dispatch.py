@@ -73,6 +73,8 @@ WATCH_TAIL_SH = SCRIPT_DIR / "watch-dispatch-tail.sh"
 DAEMON_SPAWN_ARG = "__goalflight_spawn_daemon"
 DISPATCH_QUEUE_SCHEMA = "goalflight.dispatch-queue.v1"
 QUEUE_CLAIM_STALE_S = 300.0
+QUEUE_PRIORITY_RANK = {lane: rank for rank, lane in enumerate(goalflight_capacity.PRIORITY_LANES)}
+QUEUE_DEFAULT_PRIORITY = "normal"
 PRESET_AGENTS = {"codex", "grok-code", "grok-research"}
 STDIN_PROMPT_AGENTS = {"codex", "grok-code", "grok-research"}
 DEFAULT_MAX_IDLE_SECS = 180.0
@@ -2164,6 +2166,54 @@ def _claim_queue_entry(path: Path) -> Path | None:
         return None
 
 
+def _queue_entry_priority(entry: dict | None) -> str:
+    if not isinstance(entry, dict):
+        return QUEUE_DEFAULT_PRIORITY
+    request = entry.get("request") if isinstance(entry.get("request"), dict) else {}
+    for raw_priority in (entry.get("priority"), request.get("priority")):
+        if not isinstance(raw_priority, str):
+            continue
+        priority = raw_priority.strip().lower()
+        if priority in QUEUE_PRIORITY_RANK:
+            return priority
+    return QUEUE_DEFAULT_PRIORITY
+
+
+def _queue_entry_created_ts(entry: dict | None, path: Path) -> float:
+    if isinstance(entry, dict):
+        parsed = goalflight_ledger.parse_utc(entry.get("created_at"))
+        if parsed is not None:
+            return parsed.timestamp()
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return float("inf")
+
+
+def _queue_entry_drain_candidate(path: Path) -> tuple[tuple[int, float, str], Path, dict | None, str | None]:
+    entry: dict | None = None
+    read_error: str | None = None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(payload, dict):
+            entry = payload
+        else:
+            read_error = "invalid_payload"
+    except (OSError, json.JSONDecodeError) as exc:
+        read_error = type(exc).__name__
+    priority = _queue_entry_priority(entry)
+    return (
+        (
+            QUEUE_PRIORITY_RANK.get(priority, QUEUE_PRIORITY_RANK[QUEUE_DEFAULT_PRIORITY]),
+            _queue_entry_created_ts(entry, path),
+            path.name,
+        ),
+        path,
+        entry,
+        read_error,
+    )
+
+
 def _restore_claimed_entry(claim: Path, entry: dict) -> Path:
     queue_dir = claim.parent
     target = queue_dir / claim.name.split(".claimed-", 1)[0]
@@ -2368,17 +2418,24 @@ def _drain_queue_once(args) -> dict:
     failed = 0
     pending_claims = 0
     details: list[dict] = []
-    entries = sorted(queue_dir.glob("*.json"))
+    entries = sorted(_queue_entry_drain_candidate(path) for path in queue_dir.glob("*.json"))
     if args.limit and args.limit > 0:
         entries = entries[: args.limit]
-    for path in entries:
+    for _sort_key, path, _scan_entry, _scan_read_error in entries:
         with _queue_mutation_lock(queue_dir):
             claim = _claim_queue_entry(path)
         if claim is None:
             continue
+        # The pre-scan read (_scan_entry/_scan_read_error) is best-effort and
+        # used ONLY for sort ordering: it can be stale if the entry was being
+        # restored by a concurrent stale-claim recovery at scan time. Decide
+        # readability authoritatively from the now-owned claim file, so a valid
+        # entry is never tombstoned on a stale pre-scan error.
         try:
             entry = json.loads(claim.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
+            if not isinstance(entry, dict):
+                raise ValueError("invalid_payload")
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
             failed += 1
             _mark_claim_failed(claim, {"path": str(claim)}, reason=f"unreadable:{type(exc).__name__}")
             continue
