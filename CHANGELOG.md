@@ -18,6 +18,14 @@ incremented when meaningful skill behaviour changes.
   state (the state dir's `capacity.json`), not repo state. The manual precursor to
   the planned proactive usage gate. (Command already shipped in the capacity CLI;
   this makes it discoverable.)
+- **Lane-fill bug-sweep protocol (`protocols/lane-fill-bug-sweep.md`).** Light
+  guidance for a multi-worker bug sweep that harvests bugs without saturating
+  controller context: shared frame + domain×lens matrix → lane-fill READ-ONLY
+  one-shot audit → harvest → consolidate (BLOCKING-vs-backlog + speculative class
+  mint) → adversarial verify → surface only verified blockers → routing-tiered,
+  worktree-free grouped fixes via a serial integrator. Records the dispatch
+  reliability rules a self-dogfood proved (out-of-session/launchd launch; codex
+  workers instructed off context-mode). Complements `protocols/review-mining.md`.
 
 ### Added
 

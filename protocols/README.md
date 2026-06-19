@@ -20,6 +20,7 @@ protocol files carry the detailed operating procedures.
 | `worktrees-parallel.md` | `execute --parallel` or merge orchestration |
 | `milestone-review.md` | milestone gstack/Codex review flights |
 | `review-mining.md` | a NEW bug class is caught (mint + backwards sweep), or archiving review verdicts |
+| `lane-fill-bug-sweep.md` | running a multi-worker bug sweep (audit → harvest → consolidate → adversarial verify → grouped fixes) without saturating controller context |
 
 ## Legacy
 

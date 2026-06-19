@@ -59,3 +59,11 @@ sweep question before treating it as one-off cleanup.
 - At milestones: check the durable review archive for noted-but-unswept
   observations (P3s, "pre-existing" remarks, deferred edge cases) and
   promote any that describe a class.
+
+## At scale
+
+See `lane-fill-bug-sweep.md` for the multi-worker sweep that runs this loop at
+scale (audit → harvest → consolidate → adversarial verify → grouped fixes). Its
+consolidator mints `proof_basis: SPECULATIVE` class entries while its context is
+loaded; this review-mining loop promotes them to proven and records the backwards
+sweep once verification confirms them.
