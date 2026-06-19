@@ -1697,6 +1697,32 @@ def _test_submit_status_delay() -> None:
         time.sleep(delay_s)
 
 
+def _drain_on_submit(args, queue_path: Path) -> None:
+    if not getattr(args, "drain_on_submit", True):
+        return
+    drain_args = argparse.Namespace(
+        queue_dir=str(queue_path.parent),
+        capacity_wait_s=0.0,
+        claim_stale_s=QUEUE_CLAIM_STALE_S,
+        limit=1,
+    )
+    try:
+        payload = _drain_queue_once(drain_args)
+    except Exception as exc:
+        print(
+            "goalflight_dispatch: drain-on-submit warning: "
+            f"{type(exc).__name__}: {exc}; queued request remains durable (recoverable on a later drain pass)",
+            file=sys.stderr,
+        )
+        return
+    if int(payload.get("failed") or 0) > 0:
+        print(
+            "goalflight_dispatch: drain-on-submit warning: "
+            f"{payload.get('failed')} drain failure(s); queued request remains durable (recoverable on a later drain pass)",
+            file=sys.stderr,
+        )
+
+
 def _queue_launch_token() -> str:
     return uuid.uuid4().hex
 
@@ -1844,6 +1870,7 @@ def _submit_dispatch(args, raw_argv: list[str], *, base: Path) -> int:
         ),
         flush=True,
     )
+    _drain_on_submit(args, queue_path)
     return 0
 
 
@@ -3050,6 +3077,12 @@ def main(argv: list[str] | None = None) -> int:
                              "Env override: GOALFLIGHT_CAPACITY_WAIT_S.")
     parser.add_argument("--submit", action="store_true",
                         help="Write a durable dispatch request to the queue and exit without acquiring capacity.")
+    drain_submit = parser.add_mutually_exclusive_group()
+    drain_submit.add_argument("--drain-on-submit", dest="drain_on_submit", action="store_true",
+                              help="After --submit writes the durable request, run one non-blocking "
+                                   "drain pass for up to one queued entry (default).")
+    drain_submit.add_argument("--no-drain-on-submit", dest="drain_on_submit", action="store_false",
+                              help="With --submit, only write the durable request; wait for the scheduled drainer.")
     parser.add_argument("--account",
                         help="Which subscription account/profile to bill the worker to (shared remote "
                              "worker pools). Codex resolves to CODEX_HOME=~/.goal-flight/accounts/<name>/codex; "
@@ -3101,6 +3134,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json", action="store_true", help="With --stats, emit machine-readable JSON.")
     parser.add_argument("worker", nargs=argparse.REMAINDER,
                         help="Optional `-- <cmd...>` raw worker (overrides the preset)")
+    parser.set_defaults(drain_on_submit=True)
     args = parser.parse_args(argv)
     args._original_argv = list(argv)
     if args.stats is not None:

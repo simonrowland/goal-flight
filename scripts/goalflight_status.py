@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
 import subprocess
 import time
 from pathlib import Path
@@ -40,6 +41,8 @@ _OUTPUT_TAIL_RECONCILE_CLASSES = {
     "idle_timeout",
     "inconclusive_timeout",
 }
+_DRAIN_LAUNCHD_LABEL = "com.goalflight.drain"
+_QUEUE_PENDING_NO_DRAINER = "queue_pending_no_drainer"
 
 
 def _has_recorded_worker_identity(record: dict) -> bool:
@@ -233,6 +236,80 @@ def _reattach_hint(record: dict) -> str:
     return f"worker still alive - re-attach via goalflight_status.py --done {dispatch_id}"
 
 
+def _dispatch_queue_dir() -> Path:
+    return goalflight_ledger.state_dir() / "dispatch-queue"
+
+
+def _dispatch_queue_depth() -> int:
+    try:
+        return len(list(_dispatch_queue_dir().glob("*.json")))
+    except OSError:
+        return 0
+
+
+def _launchd_drainer_loaded() -> bool:
+    try:
+        proc = subprocess.run(
+            ["launchctl", "list", _DRAIN_LAUNCHD_LABEL],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        return False
+    return proc.returncode == 0
+
+
+def _drain_process_running() -> bool:
+    try:
+        proc = subprocess.run(
+            ["ps", "-axo", "command="],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        return False
+    if proc.returncode != 0:
+        return False
+    for command in proc.stdout.splitlines():
+        try:
+            tokens = shlex.split(command)
+        except ValueError:
+            continue
+        # Match a real drain invocation only: an argv whose program token's
+        # basename is goalflight_dispatch.py immediately followed by the exact
+        # `drain` subcommand. Substring matching false-positives on lookalike
+        # paths, the `--no-drain-on-submit` flag, or a prompt arg containing the
+        # word, which would wrongly suppress the no-drainer WARN.
+        for idx, token in enumerate(tokens[:-1]):
+            if Path(token).name == "goalflight_dispatch.py" and tokens[idx + 1] == "drain":
+                return True
+    return False
+
+
+def _drainer_live() -> bool:
+    return _launchd_drainer_loaded() or _drain_process_running()
+
+
+def _queue_drainer_warnings() -> list[dict]:
+    queue_depth = _dispatch_queue_depth()
+    if queue_depth <= 0 or _drainer_live():
+        return []
+    return [
+        {
+            "code": _QUEUE_PENDING_NO_DRAINER,
+            "severity": "WARN",
+            "queue_depth": queue_depth,
+            "message": f"{queue_depth} queued dispatch request(s) with no live drain worker detected",
+            "remedy": (
+                "confirm with `launchctl list com.goalflight.drain`; "
+                "restore the scheduled drainer or run one manual drain pass"
+            ),
+        }
+    ]
+
+
 def this_project_root() -> str | None:
     """Resolved git toplevel of CWD, or None when not inside a git repo."""
     try:
@@ -268,6 +345,7 @@ def status_payload() -> dict:
         "capacity_state": capacity_state,
         "rate_pressure": rate_pressure,
         "dispatch": dispatch,
+        "warnings": _queue_drainer_warnings(),
     }
 
 
@@ -492,6 +570,11 @@ def render_text(payload: dict, limit: int) -> list[str]:
         )
     for warning in goalflight_capacity.rate_pressure_warnings(payload.get("rate_pressure"), limit=limit):
         lines.append(f"  warning: {warning}")
+    for warning in payload.get("warnings", [])[:limit]:
+        lines.append(
+            f"  WARN {warning.get('code')}: {warning.get('message')}; "
+            f"{warning.get('remedy')}"
+        )
     return lines
 
 

@@ -19,6 +19,22 @@ incremented when meaningful skill behaviour changes.
   the planned proactive usage gate. (Command already shipped in the capacity CLI;
   this makes it discoverable.)
 
+### Added
+
+- **Drain-liveness: no-drainer warning.** `goalflight_status.py` now emits a
+  `queue_pending_no_drainer` WARN (in both the JSON payload and text output) when
+  the dispatch queue has pending requests but no live drainer is detected — a
+  scheduled drain agent or a running `drain` process. Surfaces the otherwise
+  silent stall where queued requests never advance. Drainer detection matches a
+  real `drain` invocation by argv (program basename + exact subcommand), not a
+  substring, so lookalike commands cannot mask the warning.
+- **Drain-liveness: opportunistic drain on submit.** `--submit` runs one
+  non-blocking drain pass after writing the durable queue entry, so a lone
+  request self-launches immediately when capacity allows instead of waiting for
+  the next scheduled drain. Default on; `--no-drain-on-submit` opts out. The pass
+  is claim-token safe (never double-launches) and any failure never fails the
+  submit — the durable entry remains.
+
 ## [1.0.7] — 2026-06-17
 
 Dispatch-reliability release. Closes the launcher-death failure mode (a

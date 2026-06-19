@@ -7,6 +7,8 @@ from support import skip_posix_on_native_windows
 
 skip_posix_on_native_windows("dispatch queue tests launch POSIX bash workers")
 
+import contextlib
+import io
 import json
 import os
 import shlex
@@ -99,6 +101,7 @@ def test_submit_records_replayable_request_without_capacity_acquire() -> None:
                     "--agent",
                     "test-dispatch",
                     "--submit",
+                    "--no-drain-on-submit",
                     "--dispatch-id",
                     "submit-fast",
                     "--tail",
@@ -131,6 +134,150 @@ def test_submit_records_replayable_request_without_capacity_acquire() -> None:
         assert row and row.get("classification") == "queued_capacity", row
 
 
+def test_submit_default_runs_one_drain_pass_after_queue_write() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        env = _env(tmp)
+        old_env = os.environ.copy()
+        old_drain = D._drain_queue_once
+        calls = []
+        try:
+            os.environ.clear()
+            os.environ.update(env)
+
+            def fake_drain(args):
+                calls.append(args)
+                return {
+                    "schema": "test",
+                    "queue_dir": args.queue_dir,
+                    "launched": 0,
+                    "left_queued": 0,
+                    "failed": 0,
+                    "remaining": 1,
+                    "pending_claims": 0,
+                    "recovered_claims": {"restored": 0, "failed": 0},
+                    "details": [],
+                }
+
+            D._drain_queue_once = fake_drain
+            rc = D.main(
+                [
+                    "--agent",
+                    "test-dispatch",
+                    "--submit",
+                    "--dispatch-id",
+                    "submit-drain-default",
+                    "--tail",
+                    str(tmp / "default.tail"),
+                    "--status-json",
+                    str(tmp / "default.status.json"),
+                    "--cwd",
+                    str(ROOT),
+                    "--",
+                    sys.executable,
+                    "-c",
+                    "print('COMPLETE: default drain later')",
+                ]
+            )
+        finally:
+            D._drain_queue_once = old_drain
+            os.environ.clear()
+            os.environ.update(old_env)
+        assert rc == 0
+        assert len(calls) == 1
+        assert Path(calls[0].queue_dir) == tmp / "state" / "dispatch-queue"
+        assert calls[0].capacity_wait_s == 0.0
+        assert calls[0].limit == 1
+        assert (tmp / "state" / "dispatch-queue" / "submit-drain-default.json").exists()
+
+
+def test_submit_drain_on_submit_error_does_not_fail_submit() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        env = _env(tmp)
+        old_env = os.environ.copy()
+        old_drain = D._drain_queue_once
+        stderr = io.StringIO()
+        try:
+            os.environ.clear()
+            os.environ.update(env)
+
+            def fail_drain(_args):
+                raise RuntimeError("synthetic drain failure")
+
+            D._drain_queue_once = fail_drain
+            with contextlib.redirect_stderr(stderr):
+                rc = D.main(
+                    [
+                        "--agent",
+                        "test-dispatch",
+                        "--submit",
+                        "--dispatch-id",
+                        "submit-drain-fails",
+                        "--tail",
+                        str(tmp / "drain-fails.tail"),
+                        "--status-json",
+                        str(tmp / "drain-fails.status.json"),
+                        "--cwd",
+                        str(ROOT),
+                        "--",
+                        sys.executable,
+                        "-c",
+                        "print('COMPLETE: drain failure stays queued')",
+                    ]
+                )
+        finally:
+            D._drain_queue_once = old_drain
+            os.environ.clear()
+            os.environ.update(old_env)
+        assert rc == 0
+        assert "drain-on-submit warning" in stderr.getvalue()
+        assert (tmp / "state" / "dispatch-queue" / "submit-drain-fails.json").exists()
+
+
+def test_submit_default_drain_launches_once_and_duplicate_submit_does_not_double_launch() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        env = _env(tmp)
+        marker = tmp / "default-drain-count.txt"
+        worker_code = (
+            "from pathlib import Path; import time\n"
+            f"p=Path({str(marker)!r})\n"
+            "p.write_text((p.read_text() if p.exists() else '') + 'x')\n"
+            "print('COMPLETE: default drain launched', flush=True)\n"
+            "time.sleep(2.0)\n"
+        )
+        cmd = [
+            sys.executable,
+            str(DISPATCH),
+            "--agent",
+            "test-dispatch",
+            "--submit",
+            "--dispatch-id",
+            "submit-default-launch",
+            "--tail",
+            str(tmp / "default-launch.tail"),
+            "--status-json",
+            str(tmp / "default-launch.status.json"),
+            "--cwd",
+            str(ROOT),
+            "--",
+            sys.executable,
+            "-c",
+            worker_code,
+        ]
+        first = _run(cmd, env)
+        assert first.returncode == 0, (first.stdout, first.stderr)
+        assert _wait_for(lambda: marker.exists() and marker.read_text() == "x"), first.stdout
+        assert not (tmp / "state" / "dispatch-queue" / "submit-default-launch.json").exists()
+
+        duplicate = _run(cmd, env)
+        assert duplicate.returncode == 64, (duplicate.stdout, duplicate.stderr)
+        assert "already has a non-terminal ledger record" in duplicate.stderr
+        time.sleep(0.3)
+        assert marker.read_text() == "x", "duplicate submit launched the worker again"
+
+
 def test_submit_is_idempotent_for_matching_args_and_rejects_collisions() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
@@ -141,6 +288,7 @@ def test_submit_is_idempotent_for_matching_args_and_rejects_collisions() -> None
             "--agent",
             "test-dispatch",
             "--submit",
+            "--no-drain-on-submit",
             "--dispatch-id",
             "submit-idempotent",
             "--tail",
@@ -174,6 +322,7 @@ def test_concurrent_submit_same_id_is_idempotent() -> None:
             "--agent",
             "test-dispatch",
             "--submit",
+            "--no-drain-on-submit",
             "--dispatch-id",
             "submit-race",
             "--tail",
@@ -226,6 +375,7 @@ def test_submit_write_error_is_clean() -> None:
                     "--agent",
                     "test-dispatch",
                     "--submit",
+                    "--no-drain-on-submit",
                     "--dispatch-id",
                     "submit-readonly",
                     "--tail",
@@ -266,6 +416,7 @@ def test_submit_status_write_error_removes_queue_entry() -> None:
                     "--agent",
                     "test-dispatch",
                     "--submit",
+                    "--no-drain-on-submit",
                     "--dispatch-id",
                     "submit-status-fails",
                     "--tail",
@@ -325,6 +476,7 @@ def test_submit_rejects_active_waiting_capacity_ledger() -> None:
                 "--agent",
                 "test-dispatch",
                 "--submit",
+                "--no-drain-on-submit",
                 "--dispatch-id",
                 "dup-wait",
                 "--tail",
@@ -364,6 +516,7 @@ def test_drain_launches_queued_request_once_and_exits() -> None:
                 "--agent",
                 "test-dispatch",
                 "--submit",
+                "--no-drain-on-submit",
                 "--dispatch-id",
                 "drain-launch",
                 "--tail",
@@ -414,6 +567,7 @@ def test_drain_waits_for_submit_status_recording() -> None:
                 "--agent",
                 "test-dispatch",
                 "--submit",
+                "--no-drain-on-submit",
                 "--dispatch-id",
                 "submit-drain-race",
                 "--tail",
@@ -494,6 +648,7 @@ def test_acp_submit_then_drain_replays_from_queue() -> None:
                 "--shape",
                 "acp",
                 "--submit",
+                "--no-drain-on-submit",
                 "--dispatch-id",
                 "acp-drain",
                 "--prompt",
@@ -566,6 +721,7 @@ def test_drain_leaves_request_queued_when_capacity_full() -> None:
                 "--agent",
                 "test-dispatch",
                 "--submit",
+                "--no-drain-on-submit",
                 "--dispatch-id",
                 "drain-no-capacity",
                 "--tail",
@@ -848,6 +1004,9 @@ def main() -> None:
     test_failed_claim_tombstone_is_not_recovered()
     test_stale_claim_launch_token_requires_matching_worker_record()
     test_worker_dead_tail_rate_limit_reaches_pressure_sensor()
+    test_submit_default_runs_one_drain_pass_after_queue_write()
+    test_submit_drain_on_submit_error_does_not_fail_submit()
+    test_submit_default_drain_launches_once_and_duplicate_submit_does_not_double_launch()
     print("OK: dispatch queue tests pass")
 
 

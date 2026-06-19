@@ -403,6 +403,105 @@ def test_rate_pressure_warning_rendered() -> None:
     check("digest shows reduced codex cap", "codex 10->5" in digest)
 
 
+def test_queue_pending_without_drainer_warns_in_json_and_text() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        old_env = os.environ.copy()
+        orig_launchd = S._launchd_drainer_loaded
+        orig_process = S._drain_process_running
+        try:
+            os.environ["GOALFLIGHT_STATE_DIR"] = str(Path(tmp) / "state")
+            queue_dir = Path(tmp) / "state" / "dispatch-queue"
+            queue_dir.mkdir(parents=True)
+            (queue_dir / "pending.json").write_text("{}", encoding="utf-8")
+            S._launchd_drainer_loaded = lambda: False
+            S._drain_process_running = lambda: False
+
+            payload = S.status_payload()
+            warnings = payload.get("warnings", [])
+            digest = "\n".join(S.render_text(payload, 10))
+        finally:
+            S._launchd_drainer_loaded = orig_launchd
+            S._drain_process_running = orig_process
+            os.environ.clear()
+            os.environ.update(old_env)
+
+        check("pending queue without drainer emits one warning", len(warnings) == 1)
+        check("pending queue warning code stable",
+              warnings and warnings[0].get("code") == "queue_pending_no_drainer")
+        check("pending queue warning includes depth",
+              warnings and warnings[0].get("queue_depth") == 1)
+        check("pending queue warning text rendered",
+              "WARN queue_pending_no_drainer" in digest)
+        check("pending queue warning remedy rendered",
+              "restore the scheduled drainer" in digest)
+
+
+def test_queue_pending_warning_silent_when_empty_or_drainer_live() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        old_env = os.environ.copy()
+        orig_launchd = S._launchd_drainer_loaded
+        orig_process = S._drain_process_running
+        try:
+            os.environ["GOALFLIGHT_STATE_DIR"] = str(Path(tmp) / "state")
+            queue_dir = Path(tmp) / "state" / "dispatch-queue"
+            queue_dir.mkdir(parents=True)
+            S._launchd_drainer_loaded = lambda: False
+            S._drain_process_running = lambda: False
+            check("empty queue emits no drainer warning", S._queue_drainer_warnings() == [])
+
+            (queue_dir / "pending.json").write_text("{}", encoding="utf-8")
+            S._launchd_drainer_loaded = lambda: True
+            S._drain_process_running = lambda: False
+            check("loaded drain agent suppresses queue warning", S._queue_drainer_warnings() == [])
+
+            S._launchd_drainer_loaded = lambda: False
+            S._drain_process_running = lambda: True
+            check("running drain process suppresses queue warning", S._queue_drainer_warnings() == [])
+        finally:
+            S._launchd_drainer_loaded = orig_launchd
+            S._drain_process_running = orig_process
+            os.environ.clear()
+            os.environ.update(old_env)
+
+
+def test_drain_process_running_matches_only_real_invocation() -> None:
+    """_drain_process_running must match a real `goalflight_dispatch.py drain`
+    argv only -- never a lookalike path, the --no-drain-on-submit flag, or a
+    prompt arg that merely contains the word (those would wrongly suppress the
+    no-drainer WARN)."""
+    orig_run = S.subprocess.run
+
+    class _Proc:
+        returncode = 0
+
+        def __init__(self, out: str) -> None:
+            self.stdout = out
+
+    def make_ps(lines: list[str]):
+        def fake_run(*_a, **_k):
+            return _Proc("\n".join(lines) + "\n")
+        return fake_run
+
+    try:
+        # Positive: a genuine drain invocation (abs path, `drain` subcommand).
+        S.subprocess.run = make_ps([
+            "/opt/homebrew/bin/python3 /Users/x/.goal-flight/skill/scripts/goalflight_dispatch.py drain --json",
+        ])
+        check("real drain invocation detected", S._drain_process_running() is True)
+
+        # Negatives: lookalikes that must NOT count as a live drainer.
+        S.subprocess.run = make_ps([
+            "python3 scripts/goalflight_dispatch.py --submit --no-drain-on-submit --agent codex",
+            "python3 scripts/not_goalflight_dispatch.py drain --json",
+            "codex exec 'review goalflight_dispatch.py and drain the queue'",
+            "python3 scripts/goalflight_dispatch.py --submit --drain-on-submit",
+        ])
+        check("no false-positive on submit/lookalike/prompt commands",
+              S._drain_process_running() is False)
+    finally:
+        S.subprocess.run = orig_run
+
+
 def test_cli() -> None:
     orig_payload, orig_root = S.status_payload, S.this_project_root
     S.status_payload = sample_payload
@@ -525,6 +624,9 @@ def main() -> int:
     test_output_tail_reconciles_success_marker_after_watcher_death()
     test_idle_timeout_live_hint_rendered()
     test_rate_pressure_warning_rendered()
+    test_queue_pending_without_drainer_warns_in_json_and_text()
+    test_queue_pending_warning_silent_when_empty_or_drainer_live()
+    test_drain_process_running_matches_only_real_invocation()
     test_cli()
     test_wait_cli()
     test_wait_snapshot_uses_single_liveness_result()
