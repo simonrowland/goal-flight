@@ -24,7 +24,7 @@ import goalflight_capacity
 import goalflight_compat
 import goalflight_ledger
 import goalflight_milestone
-from goalflight_watch import _last_line_is_terminal_marker
+from goalflight_watch import _final_terminal_marker
 
 # Each aggregated record carries a precomputed ``classification`` from
 # goalflight_ledger.classify(): the terminal STATE string when terminal, else one
@@ -195,7 +195,13 @@ def _reconcile_output_tail_record(record: dict) -> dict:
     plausible, mtime = _tail_mtime_plausible(tail, record)
     if not plausible:
         return record
-    marker = _last_line_is_terminal_marker(
+    # Reconciliation runs on the worker-dead path, after no more output can
+    # arrive, so it must scan the WHOLE tail for a terminal marker -- not just the
+    # last line. Workers legitimately emit `READY:` then a trailing TL;DR/summary,
+    # which left the marker off the last line and produced a false worker_dead
+    # (D022). _final_terminal_marker is the watcher's own reconciliation-grade scan
+    # (skips fences/diff-hunks/prompt-echoes, takes the last valid marker).
+    marker = _final_terminal_marker(
         tail,
         ignore_prefix_lines=_ignore_prefix_lines(record.get("prompt_path")),
     )
