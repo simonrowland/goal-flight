@@ -29,7 +29,7 @@ Rate-limit signatures vary by vendor. We scan record state + status-file
 error fields for these patterns (case-insensitive substring match):
 
   - "rate_limit", "rate-limit", "rate limit"
-  - "429"  (HTTP)
+  - HTTP-status-context "429"/"529" (not bare numbers in unrelated text)
   - "you've hit your limit", "usage limit"
   - "anthropic.RateLimitError", "openai.RateLimitError"
   - "session_limit"
@@ -117,7 +117,6 @@ RATE_LIMIT_PATTERNS: tuple[str, ...] = (
     "rate_limit",
     "rate-limit",
     "rate limit",
-    "429",
     "you've hit your limit",
     "usage limit",
     "anthropic.ratelimiterror",
@@ -131,7 +130,6 @@ RATE_LIMIT_PATTERNS: tuple[str, ...] = (
     "insufficient_quota",       # OpenAI hard quota
     "rate_limit_error",         # Anthropic API error type
     "overloaded_error",         # Anthropic 529 error type
-    "529",                      # Anthropic overloaded HTTP status (same precedent as bare "429")
     "session limit",            # Claude CLI prose (space form; underscore form above)
     "resource_exhausted",       # gRPC/generic quota signal
     "quota exceeded",           # generic billing/quota hard limit
@@ -139,19 +137,45 @@ RATE_LIMIT_PATTERNS: tuple[str, ...] = (
     # codex CLI + xAI/grok additions. NOTE: most
     # codex/xAI 429 PROSE ("you've exceeded the rate limit", "rate limit reached for
     # organization", xAI "...reached the rate limit") is ALREADY caught by the
-    # substrings above ("rate limit"/"429"/"too many requests"), so only the
+    # substrings above ("rate limit"/"too many requests"), so only the
     # genuinely-uncaught literals are added. Matching stays failure-state-gated.
     "exceeded retry limit",          # codex CLI retry-wrapper exhaustion (catches retry-exhaust even when the line is not a bare 429)
     "prepaid credits are depleted",  # xAI hard CREDIT exhaustion — a distinct failure mode (no 429, no "rate limit" text)
     "payment_required",              # xAI 402 credits-out (code form; safer than a bare "402")
 )
 
+# HTTP status codes require provider-error context — bare "429"/"529" in line
+# numbers, ids, or unrelated prose must not false-positive.
+RATE_LIMIT_HTTP_STATUS_ANCHORS: dict[str, tuple[str, ...]] = {
+    "429": (
+        "http 429",
+        "status 429",
+        "status: 429",
+        "429 too many",
+        "got 429",
+        "error 429",
+        '"code": 429',
+        '"code":429',
+    ),
+    "529": (
+        "http 529",
+        "status 529",
+        "status: 529",
+        "529 overloaded",
+        "got 529",
+        "error 529",
+        "(529)",
+        '"code": 529',
+        '"code":529',
+    ),
+}
+
 # Substring patterns indicating model-specific capacity, not account-wide quota.
-# These reduce only the label that produced the signal.
+# These reduce only the label that produced the signal. Bare "at capacity" is
+# excluded — unrelated prose can mention capacity without a model-scoped signal.
 MODEL_CAPACITY_PATTERNS: tuple[str, ...] = (
     "selected model is at capacity",
     "model is at capacity",
-    "at capacity",
 )
 
 ACCOUNT_RATE_LIMIT_SCOPE = "account_rate_limit"
@@ -252,6 +276,19 @@ def _status_haystack(status: dict | None) -> str:
     return " ".join(haystack_parts).lower()
 
 
+def _haystack_matches_rate_limit(haystack: str) -> bool:
+    """True when haystack carries account/provider rate-limit evidence."""
+    if any(pat in haystack for pat in RATE_LIMIT_PATTERNS):
+        return True
+    for status_code, anchors in RATE_LIMIT_HTTP_STATUS_ANCHORS.items():
+        if any(anchor in haystack for anchor in anchors):
+            return True
+        # overloaded_error already lives in RATE_LIMIT_PATTERNS; keep 529 tied to it.
+        if status_code == "529" and "overloaded_error" in haystack:
+            return True
+    return False
+
+
 def detect_pressure_scope(record: dict, status: dict | None) -> str | None:
     """Return the pressure scope for this dispatch, or None.
 
@@ -287,10 +324,12 @@ def detect_pressure_scope(record: dict, status: dict | None) -> str | None:
         haystack = f"{haystack} {str(record_error).lower()}".strip()
     if not haystack:
         return None
+    # Account-wide rate limits take precedence when both signals appear — mixed
+    # HTTP 429 + model-capacity prose is still provider quota pressure.
+    if _haystack_matches_rate_limit(haystack):
+        return ACCOUNT_RATE_LIMIT_SCOPE
     if any(pat in haystack for pat in MODEL_CAPACITY_PATTERNS):
         return MODEL_CAPACITY_SCOPE
-    if any(pat in haystack for pat in RATE_LIMIT_PATTERNS):
-        return ACCOUNT_RATE_LIMIT_SCOPE
     return None
 
 

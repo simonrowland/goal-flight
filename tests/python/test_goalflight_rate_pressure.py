@@ -452,6 +452,46 @@ def test_coverage_audit_patterns_states_and_guards():
     assert_eq("credits text complete excluded", S({"state": "complete"}, {"result_text": "note: prepaid credits are depleted soon"}), None)
 
 
+def test_detect_d012_poison_pair_patterns():
+    """D012: bare 429/529/at-capacity prose must not false-positive; genuine HTTP
+    429 and mixed 429+capacity must scope as account_rate_limit."""
+    S = rp.detect_pressure_scope
+    A = rp.ACCOUNT_RATE_LIMIT_SCOPE
+    M = rp.MODEL_CAPACITY_SCOPE
+    record = {"agent": "codex", "state": "failed"}
+
+    assert_eq(
+        "bare line-number 429 excluded",
+        S(record, {"error": "Traceback at line 429 in module foo.py"}),
+        None,
+    )
+    assert_eq(
+        "bare request id 429 excluded",
+        S(record, {"error": "request id=429 failed with TypeError"}),
+        None,
+    )
+    assert_eq(
+        "genuine HTTP 429 detected",
+        S(record, {"error": "HTTP 429 Too Many Requests"}),
+        A,
+    )
+    assert_eq(
+        "mixed HTTP 429 + model capacity scopes account rate limit",
+        S(record, {"error": "HTTP 429 Too Many Requests; Selected model is at capacity"}),
+        A,
+    )
+    assert_eq(
+        "bare at-capacity prose excluded",
+        S(record, {"error": "The datacenter is at capacity for unrelated reasons"}),
+        None,
+    )
+    assert_eq(
+        "genuine model-capacity phrase still detected",
+        S(record, {"error": "ERROR: Selected model is at capacity. Please try a different model."}),
+        M,
+    )
+
+
 def _run_tests():
     failed = []
     passed = 0
