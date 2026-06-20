@@ -14,17 +14,16 @@ from pathlib import Path
 from typing import Any, Callable, Literal
 
 import goalflight_fleet_mirror as mirror
+import goalflight_dispatch_states as dispatch_states
 import goalflight_fleet_status as status
 import goalflight_fleet_status_cli as status_cli
 
 ReconcileAction = Literal["noop", "quarantine", "release_locks", "refresh"]
-PRE_STATUS_FAILED_ROW_STATES = frozenset(
+PRE_STATUS_FAILED_ROW_STATES = dispatch_states.FAILURE_TERMINAL_RECORD_STATES | frozenset(
     {
-        "failed",
         "launch_failed",
         "launch_rejected",
         "dispatcher_rejected",
-        "worker_dead",
     }
 )
 ACCOUNT_LOCK_META_KEYS = ("account_key", "billing_account", "account_lock_fencing_token")

@@ -23,6 +23,8 @@ import goalflight_compat
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
+from goalflight_watch import SUCCESS_TERMINAL_MARKERS
+
 try:
     import goalflight_capacity
 except Exception:  # pragma: no cover - doctor still reports partial state
@@ -979,7 +981,7 @@ def worker_write_file_probe(
             status_payload = {}
     target_text = target.read_text(encoding="utf-8", errors="replace") if target.exists() else ""
     terminal_marker = status_payload.get("terminal_marker")
-    marker_ok = bool(terminal_marker and terminal_marker.get("kind") in {"COMPLETE", "RESULT", "READY"})
+    marker_ok = bool(terminal_marker and terminal_marker.get("kind") in SUCCESS_TERMINAL_MARKERS)
     target_ok = target_text.strip() == expected
     ok = proc.returncode == 0 and target_ok and marker_ok
     state = status_payload.get("state") or ("complete" if proc.returncode == 0 else "failed")

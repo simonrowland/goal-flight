@@ -23,6 +23,7 @@ import uuid
 
 import goalflight_compat
 import goalflight_compat as fcntl
+import goalflight_dispatch_states as dispatch_states
 import goalflight_rate_pressure
 from goalflight_liveness import active_monotonic
 
@@ -349,28 +350,15 @@ async def acquire_with_wait_async(
             signum=signum,
         ) from None
 
-TERMINAL_LEASE_STATES = {
-    "released",
-    "expired",
-    "complete",
-    "failed",
-    "wedged",
-    "tool_timeout",
-    # Legacy 0.4.3 terminal state. Current ACP oversized frames drop and
-    # continue; keep this so old lease records still prune.
-    "result_too_large",
-    "blocked",
-    "blocked_capacity",
-    "blocked_session_limit",
-    "blocked_auth",
-    "worker_dead",
-    "idle_timeout",
-    "controller_dead",
-    "orphaned",
-    "inconclusive_timeout",
-    "inconclusive_no_final",
-    "superseded",
-}
+LEASE_ONLY_TERMINAL_STATES = frozenset(
+    {
+        "expired",
+        # Legacy 0.4.3 terminal state. Current ACP oversized frames drop and
+        # continue; keep this so old lease records still prune.
+        "result_too_large",
+    }
+)
+TERMINAL_LEASE_STATES = dispatch_states.TERMINAL_STATES | LEASE_ONLY_TERMINAL_STATES
 
 
 def utc_now() -> dt.datetime:

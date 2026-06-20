@@ -26,6 +26,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
+import goalflight_dispatch_states as dispatch_states
 from goalflight_liveness import reset_status_lineage
 
 ENV_ALLOW_EXACT = frozenset(
@@ -76,22 +77,7 @@ NO_WORKER_PROOF_STATES = frozenset(
         "exited_before_receipt",
     }
 )
-TERMINAL_NO_WORKER_STATES = frozenset(
-    {
-        "blocked",
-        "blocked_auth",
-        "blocked_capacity",
-        "blocked_session_limit",
-        "complete",
-        "failed",
-        "idle_timeout",
-        "orphaned",
-        "released",
-        "superseded",
-        "watcher_stopped",
-        "worker_dead",
-    }
-)
+TERMINAL_NO_WORKER_STATES = dispatch_states.TERMINAL_STATES | {"watcher_stopped"}
 
 
 def _utc_now() -> str:

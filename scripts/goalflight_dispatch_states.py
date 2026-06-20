@@ -3,25 +3,36 @@
 
 from __future__ import annotations
 
-TERMINAL_SUCCESS_STATES = frozenset({"complete"})
+SUCCESS_TERMINAL_RECORD_STATES = frozenset({"complete", "released"})
 
-TERMINAL_FAILURE_STATES = frozenset(
+FAILURE_TERMINAL_RECORD_STATES = frozenset(
     {
         "error",
         "failed",
-        "wedged",
         "blocked",
         "blocked_adapter_gate",
         "blocked_auth",
+        "blocked_capacity",
+        "blocked_session_limit",
+        "blocked_windows_dispatch",
         "inconclusive_timeout",
+        "inconclusive_no_final",
         "worker_dead",
         "tool_timeout",
         "stalled",
         "remote_turn_silence",
         "failed_worktree",
         "controller_dead",
+        "orphaned",
+        "superseded",
     }
 )
+
+WEDGED_TERMINAL_RECORD_STATES = frozenset({"idle_timeout", "wedged"})
+
+TERMINAL_SUCCESS_STATES = SUCCESS_TERMINAL_RECORD_STATES
+
+TERMINAL_FAILURE_STATES = FAILURE_TERMINAL_RECORD_STATES | WEDGED_TERMINAL_RECORD_STATES
 
 TERMINAL_STATES = TERMINAL_SUCCESS_STATES | TERMINAL_FAILURE_STATES
 
@@ -69,6 +80,19 @@ STATE_SEQ_RANKS = {
     "running_quiet": 40,
 }
 
+AMBIGUOUS_LIVE_CLASSES = frozenset({"unknown_no_pid", "identity_indeterminate", "unknown"})
+
+LIVENESS_RECHECK_STATES = frozenset({"idle_timeout", "watcher_stopped"})
+
+OUTPUT_TAIL_RECONCILE_STATES = frozenset(
+    {
+        "worker_dead",
+        "watcher_stopped",
+        "idle_timeout",
+        "inconclusive_timeout",
+    }
+)
+
 
 def normalize_dispatch_state(state: object) -> str | None:
     if not isinstance(state, str) or not state:
@@ -79,6 +103,8 @@ def normalize_dispatch_state(state: object) -> str | None:
 
 
 def is_terminal_state(state: str | None) -> bool:
+    if isinstance(state, str) and (state in TERMINAL_STATES or state in SALVAGE_NEEDED_STATES):
+        return True
     normalized = normalize_dispatch_state(state)
     return bool(normalized and (normalized in TERMINAL_STATES or normalized in SALVAGE_NEEDED_STATES))
 
@@ -95,6 +121,8 @@ def state_seq_rank(state: object) -> int:
         return 45
     if state == "controller_dead":
         return 90
+    if state in TERMINAL_STATES:
+        return 90
     normalized = normalize_dispatch_state(state)
     if normalized is None:
         return 0
@@ -104,19 +132,20 @@ def state_seq_rank(state: object) -> int:
 
 
 def terminal_state_for(state: object, reason: object = None) -> str:
-    normalized = normalize_dispatch_state(state)
-    if normalized == "complete":
+    if state in SUCCESS_TERMINAL_RECORD_STATES:
         return "complete"
-    if normalized == "worker_dead":
+    if state == "worker_dead":
         return "worker_dead"
-    if normalized == "inconclusive_timeout":
+    if state == "idle_timeout" or state == "inconclusive_timeout":
         return "idle_timeout"
     if state == "watcher_stopped":
         return "watcher_stopped"
     if state == "controller_dead" or (state == "orphaned" and reason == "controller_dead"):
         return "controller_dead"
-    if normalized == "blocked":
+    if isinstance(state, str) and state.startswith("blocked"):
         return "blocked"
-    if normalized in TERMINAL_ERROR_STATES:
+    if state in TERMINAL_ERROR_STATES:
         return "error"
+    if state in FAILURE_TERMINAL_RECORD_STATES:
+        return state
     return "unknown"

@@ -13,24 +13,14 @@ import sys
 from typing import Any
 
 import goalflight_compat
+import goalflight_dispatch_states as dispatch_states
+from goalflight_watch import BLOCKING_TERMINAL_MARKERS, SUCCESS_TERMINAL_MARKERS
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_STATE_DIR = goalflight_compat.resolve_state_dir()
-TERMINAL_DONE = {"complete", "released"}
-TERMINAL_FAILED = {
-    "blocked",
-    "blocked_auth",
-    "blocked_capacity",
-    "blocked_session_limit",
-    "failed",
-    "inconclusive_no_final",
-    "inconclusive_timeout",
-    "controller_dead",
-    "orphaned",
-    "superseded",
-    "worker_dead",
-}
-WEDGED_STATES = {"idle_timeout", "wedged"}
+TERMINAL_DONE = dispatch_states.SUCCESS_TERMINAL_RECORD_STATES
+TERMINAL_FAILED = dispatch_states.FAILURE_TERMINAL_RECORD_STATES
+WEDGED_STATES = dispatch_states.WEDGED_TERMINAL_RECORD_STATES
 
 
 def parse_time(value: Any) -> dt.datetime | None:
@@ -169,9 +159,9 @@ def normalize_state(record: dict[str, Any] | None, status: dict[str, Any] | None
     status_state = str(status.get("state")) if status and status.get("state") else None
     record_state = str(record.get("state")) if record and record.get("state") else None
 
-    if marker in {"RESULT", "COMPLETE"} or status_state in TERMINAL_DONE or record_state in TERMINAL_DONE:
+    if marker in SUCCESS_TERMINAL_MARKERS or status_state in TERMINAL_DONE or record_state in TERMINAL_DONE:
         return "complete"
-    if marker in {"BLOCKED", "USER-NEED", "USER-CONFIRM"}:
+    if marker in BLOCKING_TERMINAL_MARKERS:
         return "failed"
     if status_state in WEDGED_STATES or record_state in WEDGED_STATES:
         return "wedged"

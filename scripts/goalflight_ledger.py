@@ -190,14 +190,7 @@ def identity_matches(record: dict) -> tuple[bool, str]:
 
 def classify(record: dict) -> str:
     state = record.get("state", "running")
-    legacy_terminal_states = {
-        "released",
-        "superseded",
-        "blocked_session_limit",
-        "orphaned",
-        "inconclusive_no_final",
-    }
-    if state in legacy_terminal_states or goalflight_dispatch_states.is_terminal_state(state):
+    if goalflight_dispatch_states.is_terminal_state(state):
         return state
     if state in {"queued", "waiting_capacity"}:
         # Queued for a capacity slot: no worker exists yet, so the identity
@@ -274,20 +267,9 @@ def infer_shape(record: dict) -> str:
 
 
 def terminal_state_for(state: object, reason: object = None) -> str:
-    if state == "complete":
-        return "complete"
-    if state == "worker_dead":
-        return "worker_dead"
-    if state == "idle_timeout":
-        return "idle_timeout"
-    if state == "watcher_stopped":
-        return "watcher_stopped"
-    if state == "controller_dead" or (state == "orphaned" and reason == "controller_dead"):
-        return "controller_dead"
-    if isinstance(state, str) and state.startswith("blocked"):
-        return "blocked"
-    if state == "blocked":
-        return "blocked"
+    terminal = goalflight_dispatch_states.terminal_state_for(state, reason)
+    if terminal != "unknown":
+        return terminal
     if state in {None, "", "queued", "running", "starting", "running_quiet", "handshaking", "waiting_capacity"}:
         # queued/waiting_capacity = queued for a capacity slot (pre-spawn, live):
         # non-terminal, so the reused-dispatch-id guard refuses duplicates

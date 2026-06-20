@@ -34,14 +34,35 @@ from goalflight_liveness import (
 # the last non-empty line (post prefix-ignore, outside fence). READY/COMPLETE/RESULT/etc.
 # Prevents cat/echo/print of marker tokens mid-output or inside fenced examples from
 # false-completing the watcher.
-MARKER_RE = re.compile(r"^\**(STATUS|STEER-ACK|RESULT|USER-NEED|USER-CONFIRM|BLOCKED|COMPLETE|READY):\**\s*(.*)$")
+MARKER_KINDS = frozenset(
+    {
+        "STATUS",
+        "STEER-ACK",
+        "RESULT",
+        "USER-NEED",
+        "USER-CONFIRM",
+        "BLOCKED",
+        "FAILED",
+        "COMPLETE",
+        "READY",
+    }
+)
+TERMINAL_MARKERS = frozenset(
+    {"RESULT", "USER-NEED", "USER-CONFIRM", "BLOCKED", "FAILED", "COMPLETE", "READY"}
+)
+TERMINAL_MARKER_KINDS = TERMINAL_MARKERS
+SUCCESS_TERMINAL_MARKERS = frozenset({"RESULT", "COMPLETE", "READY"})
+BLOCKING_TERMINAL_MARKERS = TERMINAL_MARKERS - SUCCESS_TERMINAL_MARKERS
+_MARKER_KIND_ALTERNATION = "STATUS|STEER-ACK|RESULT|USER-NEED|USER-CONFIRM|BLOCKED|FAILED|COMPLETE|READY"
+_TERMINAL_MARKER_KIND_ALTERNATION = "RESULT|USER-NEED|USER-CONFIRM|BLOCKED|FAILED|COMPLETE|READY"
+SHELL_TERMINAL_MARKER_RE = rf"^\**({_TERMINAL_MARKER_KIND_ALTERNATION}):\**"
+MARKER_RE = re.compile(rf"^\**({_MARKER_KIND_ALTERNATION}):\**\s*(.*)$")
 FINAL_TERMINAL_MARKER_RE = re.compile(
     r"^(?:-\s+)?`?\**(?:STATUS:\s*)?"
-    r"(RESULT|USER-NEED|USER-CONFIRM|BLOCKED|FAILED|COMPLETE|READY):(.*)$"
+    rf"({_TERMINAL_MARKER_KIND_ALTERNATION}):(.*)$"
 )
-BARE_TERMINAL_MARKER_RE = re.compile(r"^(RESULT|USER-NEED|USER-CONFIRM|BLOCKED|FAILED|COMPLETE|READY):\s*.*$")
+BARE_TERMINAL_MARKER_RE = re.compile(rf"^({_TERMINAL_MARKER_KIND_ALTERNATION}):\s*.*$")
 HUNK_HEADER_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@")
-TERMINAL_MARKERS = {"RESULT", "USER-NEED", "USER-CONFIRM", "BLOCKED", "COMPLETE", "READY"}
 PROMPT_ECHO_ANCHOR_SEARCH_LINES = 200
 PROMPT_ECHO_MAX_ANCHORS = 10
 # CPU-sampling-failure grace (codex 2026-05-20 P2): require this many consecutive
@@ -53,7 +74,7 @@ WEDGE_CONFIRM_SAMPLES = 2
 
 
 def _marker_state(marker: dict | None) -> str:
-    if marker and marker.get("kind") in {"RESULT", "COMPLETE", "READY"}:
+    if marker and marker.get("kind") in SUCCESS_TERMINAL_MARKERS:
         return "complete"
     return "blocked"
 

@@ -18,14 +18,15 @@ AGGREGATE_SCHEMA = "goalflight.fleet.register.aggregate.v1"
 sys.path.insert(0, str(SCRIPT_DIR))
 
 import goalflight_compat  # noqa: E402
+from goalflight_watch import BLOCKING_TERMINAL_MARKERS, SUCCESS_TERMINAL_MARKERS  # noqa: E402
 
 MARKER_TO_TYPE: dict[str, str] = {
     "STATUS": "status",
-    "RESULT": "result",
+    "STEER-ACK": "monitor",
     "USER-NEED": "user_need",
     "USER-CONFIRM": "user_confirm",
-    "BLOCKED": "blocked",
-    "COMPLETE": "result",
+    **{kind: "result" for kind in SUCCESS_TERMINAL_MARKERS},
+    **{kind: "blocked" for kind in BLOCKING_TERMINAL_MARKERS - {"USER-NEED", "USER-CONFIRM"}},
 }
 
 PRIORITY_BY_TYPE: dict[str, str] = {

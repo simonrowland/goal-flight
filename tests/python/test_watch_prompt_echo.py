@@ -669,7 +669,7 @@ def case_worker_dead_failed_marker_blocks() -> None:
     rc, _elapsed, term, payload = _run_dead_worker_tail("FAILED: x\n")
     assert rc == 4, f"FAILED should map to blocked exit 4, got rc={rc} ({payload})"
     assert payload.get("state") == "blocked", payload
-    assert payload.get("reason") == "marker:FAILED:final_reconciliation", payload
+    assert payload.get("reason") == "marker:FAILED", payload
     assert term.get("kind") == "FAILED", term
     assert term.get("text") == "x", term
 

@@ -22,9 +22,10 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 import goalflight_capacity
 import goalflight_compat
+import goalflight_dispatch_states as dispatch_states
 import goalflight_ledger
 import goalflight_milestone
-from goalflight_watch import _final_terminal_marker
+from goalflight_watch import SUCCESS_TERMINAL_MARKERS, _final_terminal_marker
 
 # Each aggregated record carries a precomputed ``classification`` from
 # goalflight_ledger.classify(): the terminal STATE string when terminal, else one
@@ -32,16 +33,11 @@ from goalflight_watch import _final_terminal_marker
 # records -- the aggregated record may have had identity fields stripped, so
 # re-classifying would misread a live worker as unknown.
 _LIVE_CLASS = "expected_live"
-_AMBIGUOUS_CLASS = {"unknown_no_pid", "identity_indeterminate", "unknown"}
-_LIVENESS_RECHECK_CLASSES = {"idle_timeout", "watcher_stopped"}
-_OUTPUT_TAIL_SUCCESS_MARKERS = {"READY", "COMPLETE", "RESULT"}
+_AMBIGUOUS_CLASS = dispatch_states.AMBIGUOUS_LIVE_CLASSES
+_LIVENESS_RECHECK_CLASSES = dispatch_states.LIVENESS_RECHECK_STATES
+_OUTPUT_TAIL_SUCCESS_MARKERS = SUCCESS_TERMINAL_MARKERS
 _OUTPUT_TAIL_IDLE_RECONCILE_S = 30.0
-_OUTPUT_TAIL_RECONCILE_CLASSES = {
-    "worker_dead",
-    "watcher_stopped",
-    "idle_timeout",
-    "inconclusive_timeout",
-}
+_OUTPUT_TAIL_RECONCILE_CLASSES = dispatch_states.OUTPUT_TAIL_RECONCILE_STATES
 _DRAIN_LAUNCHD_LABEL = "com.goalflight.drain"
 _QUEUE_PENDING_NO_DRAINER = "queue_pending_no_drainer"
 # --wait anti-hang grace: how long a dispatch may stay ambiguous/stale WITH a
