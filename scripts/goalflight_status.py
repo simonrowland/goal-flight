@@ -21,6 +21,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 import goalflight_capacity
+import goalflight_compat
 import goalflight_ledger
 import goalflight_milestone
 from goalflight_watch import _last_line_is_terminal_marker
@@ -43,6 +44,10 @@ _OUTPUT_TAIL_RECONCILE_CLASSES = {
 }
 _DRAIN_LAUNCHD_LABEL = "com.goalflight.drain"
 _QUEUE_PENDING_NO_DRAINER = "queue_pending_no_drainer"
+# --wait anti-hang grace: how long a dispatch may stay ambiguous/stale WITH a
+# confirmed-dead worker before --wait resolves it to a terminal worker_dead
+# verdict (instead of polling to the wait-timeout). >= 2 default poll intervals.
+_WAIT_CRASH_GRACE_S = 90.0
 
 
 def _has_recorded_worker_identity(record: dict) -> bool:
@@ -471,18 +476,72 @@ def _terminal_state(record: dict | None, *, code: int, timed_out: bool = False) 
     return str(record.get("terminal_state") or cls)
 
 
-def _wait_snapshot(payload: dict, wait_ids: list[str], *, timed_out: bool = False) -> list[dict]:
+def _wait_worker_confirmed_dead(record: dict | None) -> bool:
+    """True when an ambiguous/stale (done_code==2) row's worker is provably gone.
+
+    The --wait anti-hang clause. status_payload() has already run
+    reconcile-from-output, so any row that ends in a success terminal marker was
+    already promoted to ``complete`` (done_code 0). A row that is STILL ambiguous
+    here therefore has no success marker; if its worker is also dead the dispatch
+    can never reach a clean terminal on its own, so --wait must resolve it as
+    ``worker_dead`` rather than poll to the timeout.
+
+    Liveness is checked the trustworthy way: identity match when an identity was
+    recorded (survives PID reuse), else a raw pid probe, else (no pid at all) dead.
+    A genuinely-running-but-ambiguous worker (live pid / matching identity) returns
+    False so --wait keeps waiting -- the wait-timeout is the ultimate backstop.
+    """
+    if record is None:
+        return True
+    if _needs_liveness_recheck(record):
+        return not _rechecked_worker_alive(record)
+    if _has_recorded_worker_identity(record):
+        ok, _ = goalflight_ledger.identity_matches(record)
+        return not ok
+    pid = record.get("worker_pid")
+    if pid:
+        try:
+            return not goalflight_compat.pid_alive(int(pid))
+        except (TypeError, ValueError):
+            return True
+    return True
+
+
+def _wait_snapshot(
+    payload: dict,
+    wait_ids: list[str],
+    *,
+    dead_since: dict[str, float] | None = None,
+    now: float | None = None,
+    grace: float = _WAIT_CRASH_GRACE_S,
+) -> list[dict]:
+    if dead_since is None:
+        dead_since = {}
+    if now is None:
+        now = time.monotonic()
     rows: list[dict] = []
     for dispatch_id in wait_ids:
         record = find_record(payload, dispatch_id)
         code = 2 if record is None else done_code(record)
         terminal = code == 0
+        state = _terminal_state(record, code=code)
+        if terminal or code == 1:
+            dead_since.pop(dispatch_id, None)
+        elif code == 2 and _wait_worker_confirmed_dead(record):
+            first = dead_since.setdefault(dispatch_id, now)
+            if now - first >= grace:
+                terminal = True
+                state = "worker_dead"
+            else:
+                state = "worker_dead_pending"
+        else:
+            dead_since.pop(dispatch_id, None)
         rows.append(
             {
                 "dispatch_id": dispatch_id,
                 "done_code": code,
                 "terminal": terminal,
-                "state": _terminal_state(record, code=code, timed_out=timed_out and not terminal),
+                "state": state,
                 "status_path": None if record is None else record.get("status_path"),
             }
         )
@@ -495,6 +554,7 @@ def wait_for_dispatches(
     project_root: str | None,
     timeout_s: float | None,
     poll_s: float,
+    crash_grace_s: float | None = None,
     json_output: bool = False,
 ) -> int:
     if not wait_ids:
@@ -503,9 +563,15 @@ def wait_for_dispatches(
 
     start = time.monotonic()
     poll_s = max(0.05, poll_s)
+    grace = _WAIT_CRASH_GRACE_S if crash_grace_s is None else max(0.0, crash_grace_s)
+    # Per-id monotonic timestamp of when a row first became ambiguous-and-dead.
+    # The grace window means a transient post-submit blip does not flip to
+    # worker_dead, but a genuine crash/premature-exit resolves in bounded time.
+    dead_since: dict[str, float] = {}
     while True:
+        now = time.monotonic()
         payload = scope_payload(status_payload(), project_root)
-        rows = _wait_snapshot(payload, wait_ids)
+        rows = _wait_snapshot(payload, wait_ids, dead_since=dead_since, now=now, grace=grace)
         if all(row["terminal"] for row in rows):
             if json_output:
                 print(json.dumps({"ok": True, "dispatches": rows}, sort_keys=True))
@@ -515,8 +581,10 @@ def wait_for_dispatches(
                     print(f"{row['dispatch_id']} -> {row['state']}")
             return 0
 
-        if timeout_s is not None and time.monotonic() - start >= timeout_s:
-            rows = _wait_snapshot(payload, wait_ids, timed_out=True)
+        if timeout_s is not None and now - start >= timeout_s:
+            for row in rows:
+                if not row["terminal"]:
+                    row["state"] = "timeout"
             terminal = sum(1 for row in rows if row["terminal"])
             pending = [row["dispatch_id"] for row in rows if not row["terminal"]]
             if json_output:
@@ -619,6 +687,17 @@ def main(argv: list[str] | None = None) -> int:
         default=2.0,
         help="seconds between --wait polls",
     )
+    parser.add_argument(
+        "--crash-grace-s",
+        dest="crash_grace_s",
+        type=float,
+        default=None,
+        help=(
+            "seconds an ambiguous/stale dispatch with a confirmed-dead worker may "
+            "persist before --wait resolves it to worker_dead instead of polling to "
+            f"--wait-timeout (default {int(_WAIT_CRASH_GRACE_S)})"
+        ),
+    )
     parser.add_argument("--limit", type=int, default=20)
     args = parser.parse_args(argv)
 
@@ -635,6 +714,7 @@ def main(argv: list[str] | None = None) -> int:
             project_root=project_root,
             timeout_s=args.wait_timeout,
             poll_s=args.poll_s,
+            crash_grace_s=args.crash_grace_s,
             json_output=args.json,
         )
 
