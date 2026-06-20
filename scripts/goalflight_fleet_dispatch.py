@@ -316,7 +316,7 @@ def build_remote_command_plan(
         ("git_prune_claude_refs", {"python": str(node_entry.get("python") or "python3")}),
         ("git_fetch", {}),
         ("git_verify_commit", {"sha": base_sha}),
-        ("git_worktree_add", {"worktree_path": worktree_path, "ref": base_sha, "detach": True}),
+        ("git_worktree_add", {"state_dir": state_dir, "worktree_path": worktree_path, "ref": base_sha, "detach": True}),
         (
             "launch_detached",
             {
@@ -665,6 +665,7 @@ def _best_effort_remove_worktree(
         argv = fleet_ssh.build_remote_command(
             "git_worktree_remove",
             repo_root=repo_root,
+            state_dir=str(node_entry.get("state_dir") or "~/.goal-flight"),
             worktree_path=preview.worktree_path,
         )
         host = fleet_ssh.host_from_node_entry(preview.node_id, node_entry)

@@ -433,6 +433,7 @@ def _ssh_result(
     **params: Any,
 ) -> dict[str, Any]:
     repo_root = str(node_entry.get("repo_root") or "")
+    params.setdefault("state_dir", str(node_entry.get("state_dir") or "~/.goal-flight"))
     host = fleet_ssh.host_from_node_entry(node_id, node_entry)
     remote_argv = fleet_ssh.build_remote_command(command_class, repo_root=repo_root, **params)
     ssh_argv = fleet_ssh.build_ssh_command(host, remote_argv, command_class=command_class)

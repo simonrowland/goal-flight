@@ -917,8 +917,23 @@ def test_launch_helper_recovers_existing_status_with_unconfirmed_evidence() -> N
             base_sha=BASE_SHA,
         )
         stdout = io.StringIO()
-        with redirect_stdout(stdout):
-            code = fleet_launch._launch(args)
+        old_identity = fleet_launch._process_identity
+
+        def fake_identity(pid: int) -> dict | None:
+            if pid == 12345:
+                return {
+                    "pid": 12345,
+                    "lstart": "Thu Jun 11 12:00:00 2026",
+                    "comm": "python3",
+                }
+            return old_identity(pid)
+
+        fleet_launch._process_identity = fake_identity
+        try:
+            with redirect_stdout(stdout):
+                code = fleet_launch._launch(args)
+        finally:
+            fleet_launch._process_identity = old_identity
         receipt = json.loads(stdout.getvalue())
         assert_true("launch helper ok", code == 0)
         assert_true("reused", receipt.get("reused") is True)

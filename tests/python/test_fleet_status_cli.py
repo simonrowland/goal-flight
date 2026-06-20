@@ -107,6 +107,45 @@ def test_build_fleet_status_quarantined_mirror_stale_row() -> None:
         assert_true("auth_probe field", node["accounts"][0]["auth_probe"] == "green")
 
 
+def test_missing_ssh_reachability_fails_closed_for_release_gate() -> None:
+    dispatch_id = "acp-status-missing-reachability"
+    with tempfile.TemporaryDirectory() as td:
+        fleet_dir = Path(td) / "fleet"
+        _fixture_fleet(fleet_dir)
+        dispatch_dir = fleet_dir / "register" / "dispatches" / dispatch_id
+        dispatch_dir.mkdir(parents=True, exist_ok=True)
+        terminal = json.loads((FIXTURES / "valid_ok.json").read_text())
+        terminal["state"] = "complete"
+        (dispatch_dir / "status.json").write_text(json.dumps(terminal) + "\n")
+        fleet._atomic_write_json(
+            dispatch_dir / "meta.json",
+            {
+                "dispatch_id": dispatch_id,
+                "node_id": "localhost",
+                "lease_active": True,
+                "pid_hint": "dead",
+            },
+        )
+        fleet._atomic_write_json(
+            fleet_dir / "register" / "aggregate.json",
+            {
+                "schema": "goalflight.fleet.register.aggregate.v1",
+                "schema_version": 1,
+                "min_reader_version": 1,
+                "open_user_needs": [],
+                "active_dispatches": [dispatch_id],
+                "last_steering": None,
+            },
+        )
+
+        payload = fleet_status_cli.build_fleet_status(fleet_dir)
+        row = payload["dispatches"][0]
+
+        assert_true("missing ssh not terminal", row["state"] != "terminal")
+        assert_true("partition reason", row["quarantine_reason"] == status.QUARANTINE_SSH_PARTITION)
+        assert_true("may not release", row["may_release"] is False)
+
+
 def test_cmd_status_legacy_shape_unchanged() -> None:
     with tempfile.TemporaryDirectory() as td:
         fleet_dir = Path(td) / "fleet"
@@ -151,6 +190,7 @@ class argparse_namespace:
 
 def main() -> None:
     test_build_fleet_status_quarantined_mirror_stale_row()
+    test_missing_ssh_reachability_fails_closed_for_release_gate()
     test_cmd_status_legacy_shape_unchanged()
     test_cmd_status_fleet_json_and_table()
     print("OK: fleet status CLI tests pass")
