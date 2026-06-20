@@ -15,7 +15,7 @@ from typing import Any
 import goalflight_compat
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_STATE_DIR = Path(os.environ.get("GOALFLIGHT_STATE_DIR", goalflight_compat.default_state_dir()))
+DEFAULT_STATE_DIR = goalflight_compat.resolve_state_dir()
 TERMINAL_DONE = {"complete", "released"}
 TERMINAL_FAILED = {
     "blocked",
@@ -277,7 +277,7 @@ def text_summary(payload: dict[str, Any]) -> str:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="summarize one goal-flight chunk dispatch")
     parser.add_argument("--slug", required=True, help="chunk slug or dispatch-id prefix")
-    parser.add_argument("--state-dir", default=str(DEFAULT_STATE_DIR))
+    parser.add_argument("--state-dir", default=str(goalflight_compat.resolve_state_dir()))
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--json", action="store_true", help="emit compact JSON")
     mode.add_argument("--text", action="store_true", help="emit one-line human verdict")

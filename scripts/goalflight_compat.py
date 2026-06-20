@@ -17,7 +17,8 @@ three break on native Windows (``os.name == "nt"``):
     ``docs-private/research/2026-05-29-windows-CONVERGED-HANDOFF.md`` P0-A.
 
 This module is a drop-in subset of ``fcntl`` (``flock`` + ``LOCK_*``) PLUS the
-Windows-safe helpers ``is_windows()`` / ``pid_alive()`` / ``default_state_dir()``.
+Windows-safe helpers ``is_windows()`` / ``pid_alive()`` / ``default_state_dir()`` /
+``resolve_state_dir()``.
 POSIX behavior is preserved byte-for-byte (paths stay under ``/tmp``; ``flock``
 delegates to the real ``fcntl``; ``pid_alive`` is the same ``os.kill(pid, 0)``).
 The Windows branches use stdlib ``ctypes`` / ``msvcrt`` only -- zero new wheels.
@@ -760,10 +761,24 @@ def default_state_dir() -> Path:
     """``<temp_base>/goal-flight-<uid-or-username>``.
 
     On POSIX this equals the historical ``/tmp/goal-flight-<os.getuid()>`` exactly.
-    Callers that honor ``$GOALFLIGHT_STATE_DIR`` keep their own env check and use
-    this as the fallback default.
+    Callers that honor ``$GOALFLIGHT_STATE_DIR`` should use
+    ``resolve_state_dir()`` so blank values fall back consistently.
     """
     return temp_base() / f"goal-flight-{_uid_tag()}"
+
+
+def resolve_state_dir() -> Path:
+    """Resolve ``$GOALFLIGHT_STATE_DIR`` with blank/whitespace falling back.
+
+    ``os.environ.get("GOALFLIGHT_STATE_DIR", default)`` does not use the default
+    when the variable is set to ``""``. Returning ``Path("")`` scatters state
+    into the caller's cwd, so all state-dir users go through this call-time
+    resolver.
+    """
+    raw = os.environ.get("GOALFLIGHT_STATE_DIR", "").strip()
+    if raw:
+        return Path(raw).expanduser()
+    return default_state_dir()
 
 
 # --------------------------------------------------------------------------- #

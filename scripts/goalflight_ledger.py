@@ -28,11 +28,7 @@ import goalflight_dispatch_states
 SCHEMA = "goalflight.dispatch.v1"
 
 
-def _default_state_dir() -> Path:
-    return goalflight_compat.default_state_dir()
-
-
-DEFAULT_STATE_DIR = Path(os.environ.get("GOALFLIGHT_STATE_DIR", _default_state_dir()))
+DEFAULT_STATE_DIR = goalflight_compat.resolve_state_dir()
 WORKER_PATTERNS = (
     "codex",
     "codex-acp",
@@ -63,7 +59,7 @@ def parse_utc(value: object) -> dt.datetime | None:
 
 
 def state_dir() -> Path:
-    return Path(os.environ.get("GOALFLIGHT_STATE_DIR", str(DEFAULT_STATE_DIR))).expanduser()
+    return goalflight_compat.resolve_state_dir()
 
 
 def runs_dir(*, create: bool = True) -> Path:

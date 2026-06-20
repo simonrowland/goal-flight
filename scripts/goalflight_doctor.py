@@ -901,7 +901,7 @@ def worker_write_file_probe(
             "state": "blocked",
             "detail": f"missing dispatcher: {dispatch}",
         }
-    state_dir = Path(os.environ.get("GOALFLIGHT_STATE_DIR", goalflight_compat.default_state_dir()))
+    state_dir = goalflight_compat.resolve_state_dir()
     base = state_dir / "doctor-write-probe"
     base.mkdir(parents=True, exist_ok=True)
     dispatch_id = f"doctor-write-probe-{agent}-{os.getpid()}-{int(time.time())}"
@@ -1652,7 +1652,7 @@ def filesystem_type(path: Path) -> dict:
 
 
 def check_wsl_filesystems(repo: Path, *, fleet_dir: Path | None = None) -> dict:
-    state_dir = Path(os.environ.get("GOALFLIGHT_STATE_DIR", goalflight_compat.default_state_dir())).expanduser()
+    state_dir = goalflight_compat.resolve_state_dir()
     if fleet_dir is not None:
         resolved_fleet_dir = fleet_dir.expanduser()
     elif goalflight_fleet is not None:
@@ -2203,7 +2203,7 @@ def _rate_pressure_summary() -> dict:
     if goalflight_rate_pressure is None:
         return {"available": False, "reason": "goalflight_rate_pressure import failed"}
     try:
-        state_dir = Path(os.environ.get("GOALFLIGHT_STATE_DIR", goalflight_compat.default_state_dir()))
+        state_dir = goalflight_compat.resolve_state_dir()
         records = goalflight_rate_pressure.collect_records(state_dir)
         billing = goalflight_rate_pressure.load_billing_accounts()
         pool_map = goalflight_rate_pressure.agent_limit_pool_map(billing)

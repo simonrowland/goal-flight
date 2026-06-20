@@ -577,9 +577,7 @@ def _project_root(args) -> Path:
 
 
 def _state_dir() -> Path:
-    return Path(
-        os.environ.get("GOALFLIGHT_STATE_DIR", str(goalflight_compat.default_state_dir()))
-    ).expanduser()
+    return goalflight_compat.resolve_state_dir()
 
 
 def _dispatch_base_dir() -> Path:

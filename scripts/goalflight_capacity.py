@@ -29,11 +29,7 @@ from goalflight_liveness import active_monotonic
 SCHEMA = "goalflight.capacity.v1"
 
 
-def _default_state_dir() -> Path:
-    return goalflight_compat.default_state_dir()
-
-
-DEFAULT_STATE_DIR = Path(os.environ.get("GOALFLIGHT_STATE_DIR", _default_state_dir()))
+DEFAULT_STATE_DIR = goalflight_compat.resolve_state_dir()
 DEFAULT_RESERVE_MB = 2048
 DEFAULT_WORST_WORKER_MB = 1200
 # DEFAULT_HARD_CAP raised 20->40 (2026-06-16, operator-requested): (1) unmask the
@@ -395,12 +391,7 @@ def parse_iso(value: str | None) -> dt.datetime | None:
 
 
 def state_dir() -> Path:
-    # A set-but-empty (or whitespace-only) GOALFLIGHT_STATE_DIR must fall back to
-    # DEFAULT_STATE_DIR, NOT resolve to cwd: os.environ.get(key, default) returns ""
-    # when the key is present-but-empty, and Path("").expanduser() == Path(".") (cwd),
-    # which scatters capacity.json / capacity.lock into the current directory.
-    raw = os.environ.get("GOALFLIGHT_STATE_DIR", "").strip()
-    path = Path(raw or DEFAULT_STATE_DIR).expanduser()
+    path = goalflight_compat.resolve_state_dir()
     path.mkdir(parents=True, exist_ok=True, mode=0o700)
     return path
 

@@ -229,7 +229,7 @@ def budget_key_for_agent(agent_label: str, *, pool_map: dict[str, str] | None = 
 
 
 def _default_state_dir() -> Path:
-    return Path(os.environ.get("GOALFLIGHT_STATE_DIR", goalflight_compat.default_state_dir()))
+    return goalflight_compat.resolve_state_dir()
 
 
 def _read_record(path: Path) -> dict | None:
