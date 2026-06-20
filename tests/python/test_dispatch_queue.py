@@ -1367,6 +1367,90 @@ def test_stale_claim_launch_token_requires_matching_worker_record() -> None:
         assert not (tmp / "state" / "dispatch-queue" / "matched.json").exists()
 
 
+def test_drain_replay_argv_injects_queue_control_flags() -> None:
+    """Poison-pair: drain replay must inject _drain_launch_argv queue-control flags.
+
+    Regression guard (audit-r24-1): existing drain tests only checked dispatch_id
+    recording; dropping --from-queue / --queue-launch-token / --queue-claim-path /
+    --launch-detached / --capacity-wait-s from replay argv would not fail CI.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        env = _env(tmp)
+        old_env = os.environ.copy()
+        captured_argv: list[list[str]] = []
+        try:
+            os.environ.clear()
+            os.environ.update(env)
+            queue = tmp / "state" / "dispatch-queue"
+            queue.mkdir(parents=True)
+            _write_queue_entry(queue, "argv-guard", filename="000-argv-guard")
+            old_run = D.subprocess.run
+
+            def fake_run(argv, **kwargs):
+                argv = list(argv)
+                if not any("goalflight_dispatch.py" in str(part) for part in argv):
+                    return old_run(argv, **kwargs)
+                captured_argv.append(argv)
+                try:
+                    dispatch_id = argv[argv.index("--dispatch-id") + 1]
+                    queue_launch_token = argv[argv.index("--queue-launch-token") + 1]
+                except (ValueError, IndexError):
+                    return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+                D.goalflight_ledger.write_record(
+                    {
+                        "schema": D.goalflight_ledger.SCHEMA,
+                        "dispatch_id": dispatch_id,
+                        "agent": "test-dispatch",
+                        "engine": "test-dispatch",
+                        "shape": "bash",
+                        "transport": "dispatch",
+                        "project_root": str(ROOT),
+                        "worker_pid": os.getpid(),
+                        "worker_identity": D.goalflight_ledger.process_identity(os.getpid()),
+                        "stdout_path": str(ROOT / "test.tail"),
+                        "status_path": str(ROOT / "test.status.json"),
+                        "state": "running",
+                        "terminal_state": "unknown",
+                        "queue_launch_token": queue_launch_token,
+                        "started_at": D.goalflight_ledger.utc_now(),
+                    }
+                )
+                return subprocess.CompletedProcess(
+                    argv,
+                    0,
+                    stdout=f"DISPATCH-LAUNCHED {dispatch_id}\n",
+                    stderr="",
+                )
+
+            D.subprocess.run = fake_run
+            payload = D._drain_queue_once(_drain_args(queue, limit=1))
+        finally:
+            D.subprocess.run = old_run
+            os.environ.clear()
+            os.environ.update(old_env)
+        assert payload["launched"] == 1, payload
+        assert len(captured_argv) == 1, captured_argv
+        argv = captured_argv[0]
+        required_flags = (
+            "--from-queue",
+            "--queue-launch-token",
+            "--queue-claim-path",
+            "--launch-detached",
+            "--capacity-wait-s",
+            "--dispatch-id",
+        )
+        for flag in required_flags:
+            assert flag in argv, f"missing queue-control flag {flag!r} in replay argv: {argv}"
+        assert argv[argv.index("--dispatch-id") + 1] == "argv-guard"
+        assert argv[argv.index("--capacity-wait-s") + 1] == "0.0"
+        claim_flag_idx = argv.index("--queue-claim-path")
+        claim_path = Path(argv[claim_flag_idx + 1])
+        assert claim_path.name.startswith("000-argv-guard.json.claimed-"), claim_path
+        token = argv[argv.index("--queue-launch-token") + 1]
+        assert token, "drain must inject a non-empty queue launch token"
+
+
 def test_drain_requires_token_matched_ledger_before_clearing_claim() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
@@ -1680,6 +1764,7 @@ def main() -> None:
     test_failed_claim_tombstone_is_not_recovered()
     test_fresh_token_only_claim_waits_for_stale_window()
     test_stale_claim_launch_token_requires_matching_worker_record()
+    test_drain_replay_argv_injects_queue_control_flags()
     test_drain_requires_token_matched_ledger_before_clearing_claim()
     test_legacy_claim_dead_worker_record_falls_through_to_recovery()
     test_token_mismatch_recovery_preserves_live_worker_record()
