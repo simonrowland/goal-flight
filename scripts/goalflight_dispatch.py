@@ -1671,8 +1671,19 @@ def _canonical_replay_argv(args, raw_argv: list[str], *, tail: Path, status_json
 
 def _existing_queue_entry_paths(queue_path: Path) -> list[Path]:
     paths = [queue_path] if queue_path.exists() else []
-    paths.extend(sorted(queue_path.parent.glob(f"{queue_path.name}.claimed-*")))
+    paths.extend(
+        path
+        for path in sorted(queue_path.parent.glob(f"{queue_path.name}.claimed-*"))
+        if not path.name.endswith(".failed")
+    )
     return paths
+
+
+def _queue_entry_counts_as_active(path: Path, entry: dict) -> bool:
+    if path.name.endswith(".failed"):
+        return False
+    state = entry.get("state")
+    return state in (None, "queued", "claimed")
 
 
 def _cleanup_partial_submit(queue_path: Path, status_json: Path) -> None:
@@ -1814,6 +1825,7 @@ def _submit_dispatch(args, raw_argv: list[str], *, base: Path) -> int:
             "raw_worker": raw_argv,
         },
     }
+    duplicate_active = False
     try:
         with _queue_mutation_lock(queue_path.parent):
             existing_paths = _existing_queue_entry_paths(queue_path)
@@ -1830,27 +1842,29 @@ def _submit_dispatch(args, raw_argv: list[str], *, base: Path) -> int:
                         existing.get("dispatch_id") == args.dispatch_id
                         and existing.get("dispatch_argv") == dispatch_argv
                     ):
-                        matches.append(existing_path)
+                        if _queue_entry_counts_as_active(existing_path, existing):
+                            matches.append(existing_path)
                     else:
                         conflicts.append(existing_path.name)
                 if matches and not conflicts:
-                    print(f"STATUS: queued already {args.dispatch_id}")
-                    return 0
-                print(f"goalflight_dispatch: queued request already exists for {args.dispatch_id}", file=sys.stderr)
-                return 64
-            _write_json_atomic(queue_path, entry)
-            _test_submit_status_delay()
-            try:
-                _record_queued_status(
-                    args,
-                    project_root=project_root,
-                    status_json=status_json,
-                    tail=tail,
-                    queue_path=queue_path,
-                )
-            except (OSError, RuntimeError):
-                _cleanup_partial_submit(queue_path, status_json)
-                raise
+                    duplicate_active = True
+                elif matches or conflicts:
+                    print(f"goalflight_dispatch: queued request already exists for {args.dispatch_id}", file=sys.stderr)
+                    return 64
+            if not duplicate_active:
+                _write_json_atomic(queue_path, entry)
+                _test_submit_status_delay()
+                try:
+                    _record_queued_status(
+                        args,
+                        project_root=project_root,
+                        status_json=status_json,
+                        tail=tail,
+                        queue_path=queue_path,
+                    )
+                except (OSError, RuntimeError):
+                    _cleanup_partial_submit(queue_path, status_json)
+                    raise
     except (OSError, RuntimeError) as exc:
         print(
             f"goalflight_dispatch: submit failed for {args.dispatch_id}: "
@@ -1858,6 +1872,10 @@ def _submit_dispatch(args, raw_argv: list[str], *, base: Path) -> int:
             file=sys.stderr,
         )
         return 1
+    if duplicate_active:
+        print(f"STATUS: queued already {args.dispatch_id}")
+        _drain_on_submit(args, queue_path)
+        return 0
     print(
         "DISPATCH-QUEUED "
         + json.dumps(
@@ -2070,13 +2088,47 @@ def _release_stale_capacity_for_drain() -> None:
         )
 
 
-def _dispatch_has_worker_record(dispatch_id: str, *, queue_launch_token: str | None = None) -> bool:
+def _dispatch_record_is_terminal(record: dict | None) -> bool:
+    if not record:
+        return False
+    terminal = record.get("terminal_state") or goalflight_ledger.terminal_state_for(
+        record.get("state"),
+        record.get("reason") or record.get("error"),
+    )
+    return terminal != "unknown" or goalflight_dispatch_states.is_terminal_state(record.get("state"))
+
+
+def _dispatch_record_has_live_nonterminal_worker(record: dict | None) -> bool:
+    if not (record and record.get("worker_pid")):
+        return False
+    if _dispatch_record_is_terminal(record):
+        return False
+    try:
+        ok, _reason = goalflight_ledger.identity_matches(record)
+    except Exception:
+        return False
+    return ok
+
+
+def _dispatch_has_worker_record(
+    dispatch_id: str,
+    *,
+    queue_launch_token: str | None = None,
+    require_live_nonterminal: bool = False,
+) -> bool:
     record = _find_dispatch_record(dispatch_id)
     if not (record and record.get("worker_pid")):
         return False
     if queue_launch_token is not None:
-        return record.get("queue_launch_token") == queue_launch_token
+        if record.get("queue_launch_token") != queue_launch_token:
+            return False
+    if require_live_nonterminal and not _dispatch_record_has_live_nonterminal_worker(record):
+        return False
     return True
+
+
+def _dispatch_has_terminal_record(dispatch_id: str) -> bool:
+    return _dispatch_record_is_terminal(_find_dispatch_record(dispatch_id))
 
 
 def _recover_claimed_queue_entries(queue_dir: Path, *, stale_s: float) -> dict:
@@ -2116,6 +2168,9 @@ def _recover_claimed_queue_entries(queue_dir: Path, *, stale_s: float) -> dict:
                 pending_launch += 1
                 continue
             if not launch_marked:
+                if not is_stale:
+                    pending_launch += 1
+                    continue
                 if target.exists():
                     with contextlib.suppress(OSError):
                         claim.unlink()
@@ -2140,12 +2195,20 @@ def _recover_claimed_queue_entries(queue_dir: Path, *, stale_s: float) -> dict:
                     claim.unlink()
                     restored += 1
                 continue
+            if dispatch_id and _dispatch_has_worker_record(dispatch_id, require_live_nonterminal=True):
+                pending_launch += 1
+                continue
+            if dispatch_id and _dispatch_has_terminal_record(dispatch_id):
+                with contextlib.suppress(OSError):
+                    claim.unlink()
+                cleared += 1
+                continue
             _mark_claim_worker_dead(entry, reason="stale_claim_launch_token_lost")
             with contextlib.suppress(OSError):
                 claim.unlink()
                 cleared += 1
             continue
-        if dispatch_id and _dispatch_has_worker_record(dispatch_id):
+        if dispatch_id and _dispatch_has_worker_record(dispatch_id, require_live_nonterminal=True):
             pending_launch += 1
             continue
         try:
@@ -2501,9 +2564,10 @@ def _drain_queue_once(args) -> dict:
                 }
             )
             continue
-        launched_ok = proc.returncode == 0 and "DISPATCH-LAUNCHED " in proc.stdout
+        stdout_launched = proc.returncode == 0 and "DISPATCH-LAUNCHED " in proc.stdout
+        ledger_confirmed = _dispatch_has_worker_record(dispatch_id, queue_launch_token=launch_token)
         no_capacity = proc.returncode == 2 and "blocked_capacity" in (proc.stdout + proc.stderr)
-        if launched_ok:
+        if stdout_launched and ledger_confirmed:
             with contextlib.suppress(OSError):
                 claim.unlink()
             launched += 1
@@ -2515,7 +2579,7 @@ def _drain_queue_once(args) -> dict:
             left_queued += 1
             details.append({"dispatch_id": dispatch_id, "state": "queued", "reason": "capacity_unavailable"})
             continue
-        if _dispatch_has_worker_record(dispatch_id, queue_launch_token=launch_token):
+        if ledger_confirmed:
             with contextlib.suppress(OSError):
                 claim.unlink()
             launched += 1
