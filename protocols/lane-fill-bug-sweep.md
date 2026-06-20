@@ -28,6 +28,16 @@ surface REAL blockers → routing table → grouped fixes → serial integrator`
    cheaper/wider pool ("fill all lanes" = saturate the pools you have, in waves if needed).
 3. **Audit** — one worker per row, READ-ONLY, **one-shot** (breadth comes from the matrix
    partition, not per-worker loops), inline findings to its tail, BLOCKING first, end `READY:`.
+   **Self-screen against the backlog (sequential / re-run sweeps):** feed the prior
+   `BUG-LOG`/`BUG-LOG-CONSOLIDATED` (and any known-fixed list) into the frame and have each
+   worker screen its OUTPUT against it — screen the *reporting*, never the *search* (anchoring
+   the search on the backlog causes confirmation bias and misses unlisted bugs). Tag each
+   finding NEW (surface) / KNOWN-OPEN (reference the id, don't re-report the body) /
+   KNOWN-FIXED-confirmed-present → drop, BUT if a backlog-fixed bug is still present that's a
+   REGRESSION → surface as new / UNCERTAIN → surface as "possibly-known" (never hard-suppress
+   on doubt). Hard-suppress only high-confidence exact dups (same file:line + predicate). This
+   only reduces volume; the consolidate + verify stages stay authoritative for dedup/triage.
+   When every worker screens and finds nothing new, that is the worker-level "mined out" signal.
 4. **Harvest** — a write-enabled step parses the worker tails into an append-only
    `BUG-LOG.jsonl` (one finding/line: id, reviewer, sev, class, file, title, detail,
    confidence, bucket). Mandatory: read-only workers can't write the sink themselves.
