@@ -1658,7 +1658,9 @@ def check_wsl_filesystems(repo: Path, *, fleet_dir: Path | None = None) -> dict:
     elif goalflight_fleet is not None:
         resolved_fleet_dir = goalflight_fleet.default_fleet_dir()
     else:
-        resolved_fleet_dir = Path(os.environ.get("GOALFLIGHT_FLEET_DIR", Path.home() / ".goal-flight/fleet")).expanduser()
+        resolved_fleet_dir = goalflight_compat.resolve_env_path(
+            "GOALFLIGHT_FLEET_DIR", Path.home() / ".goal-flight/fleet"
+        )
     paths = {
         "project_root": repo,
         "state_dir": state_dir,

@@ -57,7 +57,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 import time
 from pathlib import Path
@@ -188,7 +187,9 @@ def provider_for(agent_label: str) -> str | None:
 
 
 def default_fleet_dir() -> Path:
-    return Path(os.environ.get("GOALFLIGHT_FLEET_DIR", Path.home() / ".goal-flight" / "fleet")).expanduser()
+    return goalflight_compat.resolve_env_path(
+        "GOALFLIGHT_FLEET_DIR", Path.home() / ".goal-flight" / "fleet"
+    )
 
 
 def load_billing_accounts(fleet_dir: Path | None = None) -> dict | None:

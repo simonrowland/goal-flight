@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
-import os
 import uuid
 from pathlib import Path
 import sys
@@ -15,6 +14,10 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 DEFAULT_CONTRACT = REPO_ROOT / "docs-private" / "architecture" / "contracts" / "goalflight.message.v1.json"
 AGGREGATE_SCHEMA = "goalflight.fleet.register.aggregate.v1"
+
+sys.path.insert(0, str(SCRIPT_DIR))
+
+import goalflight_compat  # noqa: E402
 
 MARKER_TO_TYPE: dict[str, str] = {
     "STATUS": "status",
@@ -53,15 +56,15 @@ def utc_now() -> str:
 
 
 def default_messages_dir() -> Path:
-    return Path(
-        os.environ.get("GOALFLIGHT_MESSAGES_DIR", Path.home() / ".goal-flight" / "messages")
-    ).expanduser()
+    return goalflight_compat.resolve_env_path(
+        "GOALFLIGHT_MESSAGES_DIR", Path.home() / ".goal-flight" / "messages"
+    )
 
 
 def default_fleet_dir() -> Path:
-    return Path(
-        os.environ.get("GOALFLIGHT_FLEET_DIR", Path.home() / ".goal-flight" / "fleet")
-    ).expanduser()
+    return goalflight_compat.resolve_env_path(
+        "GOALFLIGHT_FLEET_DIR", Path.home() / ".goal-flight" / "fleet"
+    )
 
 
 def inbox_path(messages_dir: Path, dispatch_id: str) -> Path:

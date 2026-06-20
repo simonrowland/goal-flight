@@ -781,6 +781,14 @@ def resolve_state_dir() -> Path:
     return default_state_dir()
 
 
+def resolve_env_path(var: str, default) -> Path:
+    """Resolve a path-valued env var with blank/whitespace falling back."""
+    raw = os.environ.get(var, "").strip()
+    if raw:
+        return Path(raw).expanduser()
+    return Path(default).expanduser()
+
+
 # --------------------------------------------------------------------------- #
 # Non-destructive liveness probe.                                            #
 # POSIX: os.kill(pid, 0) (unchanged). Windows: OpenProcess +                  #

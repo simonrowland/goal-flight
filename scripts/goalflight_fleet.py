@@ -26,7 +26,9 @@ import goalflight_fleet_schemas as schemas
 
 
 def default_fleet_dir() -> Path:
-    return Path(os.environ.get("GOALFLIGHT_FLEET_DIR", Path.home() / ".goal-flight" / "fleet")).expanduser()
+    return fcntl.resolve_env_path(
+        "GOALFLIGHT_FLEET_DIR", Path.home() / ".goal-flight" / "fleet"
+    )
 
 
 def utc_now() -> dt.datetime:
