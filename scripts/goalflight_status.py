@@ -24,6 +24,7 @@ import goalflight_capacity
 import goalflight_compat
 import goalflight_dispatch_states as dispatch_states
 import goalflight_ledger
+from goalflight_liveness import cpu_confirmed_idle
 import goalflight_milestone
 from goalflight_watch import SUCCESS_TERMINAL_MARKERS, _final_terminal_marker
 
@@ -648,6 +649,7 @@ def _wait_progress_detail(
 
     cpu_pct = _wait_process_cpu_pct(record)
     cpu_busy = bool(cpu_pct is not None and cpu_pct > cpu_epsilon)
+    cpu_idle = cpu_confirmed_idle(cpu_pct, cpu_epsilon)
     if worker_alive is None:
         worker_alive = _wait_worker_confirmed_alive(record)
     pid = _wait_record_pid(record)
@@ -668,6 +670,7 @@ def _wait_progress_detail(
         "worker_alive": worker_alive,
         "cpu_pct": cpu_pct,
         "cpu_busy": cpu_busy,
+        "cpu_idle": cpu_idle,
         **counts,
     }
 
@@ -785,8 +788,9 @@ def _wait_snapshot(
             )
             tail_changed = bool(progress.get("tail_changed"))
             cpu_busy = bool(progress.get("cpu_busy"))
+            cpu_idle = bool(progress.get("cpu_idle"))
             worker_alive = bool(progress.get("worker_alive"))
-            if tail_grew or tail_changed or cpu_busy or not worker_alive or not tail_known:
+            if tail_grew or tail_changed or cpu_busy or not cpu_idle or not worker_alive or not tail_known:
                 stalled_since.pop(dispatch_id, None)
             else:
                 first = stalled_since.setdefault(

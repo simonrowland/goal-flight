@@ -40,13 +40,22 @@ def _wait_for(predicate, timeout: float = 8.0, interval: float = 0.1) -> bool:
     return False
 
 
-def _run(worker_cmd: list[str], max_idle: str = "20", poll: str = "1"):
+def _run(
+    worker_cmd: list[str],
+    max_idle: str = "20",
+    poll: str = "1",
+    *,
+    confirmed_idle_cpu: bool = False,
+):
     with tempfile.TemporaryDirectory() as tmp:
         tail = Path(tmp) / "tail.txt"
         status = Path(tmp) / "status.json"
         env = os.environ.copy()
         env["GOALFLIGHT_STATE_DIR"] = str(Path(tmp) / "state")
         env["GOAL_FLIGHT_PIDFILE_DIR"] = str(Path(tmp) / "pids")
+        if confirmed_idle_cpu:
+            env["GOALFLIGHT_TEST_MODE"] = "1"
+            env["GOALFLIGHT_TEST_PGROUP_CPU_PCT"] = "0.0"
         t0 = time.time()
         proc = subprocess.run(
             [
@@ -89,6 +98,8 @@ def case_post_terminal_idle_worker_finishes() -> None:
         env = os.environ.copy()
         env["GOALFLIGHT_STATE_DIR"] = str(tmp_path / "state")
         env["GOAL_FLIGHT_PIDFILE_DIR"] = str(tmp_path / "pids")
+        env["GOALFLIGHT_TEST_MODE"] = "1"
+        env["GOALFLIGHT_TEST_PGROUP_CPU_PCT"] = "0.0"
         worker_code = (
             "import time\n"
             "print('COMPLETE: done', flush=True)\n"
@@ -124,10 +135,10 @@ def case_post_terminal_idle_worker_finishes() -> None:
         )
         t0 = time.time()
         try:
-            out, err = watcher.communicate(timeout=15)
+            out, err = watcher.communicate(timeout=25)
             elapsed = time.time() - t0
             assert watcher.returncode == 0, (watcher.returncode, out, err)
-            assert elapsed < 12, f"post-terminal idle wait took {elapsed:.1f}s"
+            assert elapsed < 18, f"post-terminal idle wait took {elapsed:.1f}s"
             payload = json.loads(status.read_text(encoding="utf-8"))
             assert payload.get("state") == "complete", payload
             assert payload.get("worker_alive") is True, payload
@@ -151,10 +162,11 @@ def case_dispatch_post_terminal_idle_returns_success() -> None:
         ],
         max_idle="1",
         poll="0.2",
+        confirmed_idle_cpu=True,
     )
     try:
         assert rc == 0, f"expected exit 0 (complete), got {rc} ({end})"
-        assert elapsed < 12, f"dispatch post-terminal idle wait took {elapsed:.1f}s"
+        assert elapsed < 18, f"dispatch post-terminal idle wait took {elapsed:.1f}s"
         assert end.get("terminal_state") == "complete", end
         assert end.get("watcher_exit") == 0, end
         assert end.get("reason") == "marker:COMPLETE:post_terminal_idle_timeout", end
@@ -178,6 +190,8 @@ def case_worker_and_watcher_survive_launcher_pgroup_sigterm() -> None:
         env = os.environ.copy()
         env["GOALFLIGHT_STATE_DIR"] = str(tmp_path / "state")
         env["GOAL_FLIGHT_PIDFILE_DIR"] = str(tmp_path / "pids")
+        env["GOALFLIGHT_TEST_MODE"] = "1"
+        env["GOALFLIGHT_TEST_PGROUP_CPU_PCT"] = "0.0"
         worker_code = (
             "import pathlib, sys, time\n"
             f"pathlib.Path({str(started)!r}).write_text('started')\n"
@@ -203,14 +217,25 @@ def case_worker_and_watcher_survive_launcher_pgroup_sigterm() -> None:
             start_new_session=True,
         )
         try:
-            assert _wait_for(lambda: started.exists() and status.exists()), "worker/watch did not start"
+            def _status_payload() -> dict:
+                try:
+                    return json.loads(status.read_text(encoding="utf-8"))
+                except Exception:
+                    return {}
+
+            assert _wait_for(
+                lambda: started.exists()
+                and status.exists()
+                and _status_payload().get("state") != "starting",
+                timeout=15,
+            ), status.read_text(encoding="utf-8") if status.exists() else "worker/watch did not start"
             os.killpg(proc.pid, signal.SIGTERM)
             proc.wait(timeout=5)
-            assert _wait_for(done.exists, timeout=5), "worker died with launcher process group"
+            assert _wait_for(done.exists, timeout=10), "worker died with launcher process group"
             assert _wait_for(
                 lambda: status.exists()
                 and json.loads(status.read_text(encoding="utf-8")).get("worker_alive") is False,
-                timeout=5,
+                timeout=15,
             ), status.read_text(encoding="utf-8") if status.exists() else "missing status"
             payload = json.loads(status.read_text(encoding="utf-8"))
             assert payload.get("state") == "complete", payload

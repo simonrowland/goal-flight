@@ -346,6 +346,7 @@ def _hard_gate_escalates(tool_call: Any, cwd: str | None) -> bool:
     return True
 from goalflight_liveness import (
     active_monotonic,
+    cpu_confirmed_idle,
     heartbeat_wedge_decision,
     IdleLivenessGate,
     pgroup_cpu_pct,
@@ -2147,7 +2148,7 @@ async def _run_acp_dispatch_impl(
                 and outstanding_count == 0
                 and quiet_for_s >= cfg.max_quiet_s
                 and pid_alive
-                and (cpu_pct is None or cpu_pct <= cfg.cpu_epsilon)
+                and cpu_confirmed_idle(cpu_pct, cfg.cpu_epsilon)
             ):
                 await mark_heartbeat_terminal(
                     "wedged",

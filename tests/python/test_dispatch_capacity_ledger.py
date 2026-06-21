@@ -886,6 +886,8 @@ def case_idle_timeout_state_releases_and_classifies_terminal() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         env = _env(tmp)
+        env["GOALFLIGHT_TEST_MODE"] = "1"
+        env["GOALFLIGHT_TEST_PGROUP_CPU_PCT"] = "0.0"
         dispatch_id = "dispatch-idle-timeout"
         worker_pid = None
         try:

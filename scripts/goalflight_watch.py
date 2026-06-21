@@ -19,6 +19,7 @@ from goalflight_liveness import (
     LivenessThresholds,
     active_monotonic,
     classify_liveness,
+    cpu_confirmed_idle,
     pgroup_cpu_pct,
     process_group_id,
     system_starved,
@@ -65,11 +66,10 @@ BARE_TERMINAL_MARKER_RE = re.compile(rf"^({_TERMINAL_MARKER_KIND_ALTERNATION}):\
 HUNK_HEADER_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@")
 PROMPT_ECHO_ANCHOR_SEARCH_LINES = 200
 PROMPT_ECHO_MAX_ANCHORS = 10
-# CPU-sampling-failure grace (codex 2026-05-20 P2): require this many consecutive
-# `wedged` polls before exiting with idle_timeout, so a single transient `ps`
-# failure (cpu→None→wedged for one poll) can't false-positive a healthy worker.
-# Watcher mirror of the runner's intra-decision re-sample grace
-# (goalflight_liveness.cpu_liveness_keep_waiting) — same goal, keep aligned.
+# CPU-sampling-failure grace (codex 2026-05-20 P2): idle_timeout exits only on
+# confirmed-idle CPU. Unavailable CPU (ps failure -> None) keeps waiting instead
+# of false-killing a healthy quiet worker. The streak still protects against
+# one-off noisy idle samples.
 WEDGE_CONFIRM_SAMPLES = 2
 
 
@@ -646,8 +646,7 @@ def main() -> int:
             cpu_pct = 0.0
         low_power_relax = (
             worker_is_alive
-            and cpu_pct is not None
-            and cpu_pct <= args.cpu_epsilon
+            and cpu_confirmed_idle(cpu_pct, args.cpu_epsilon)
             and args.max_idle_secs > 0
             and seconds_since_event >= args.max_idle_secs
             and system_starved()

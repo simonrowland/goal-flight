@@ -251,6 +251,52 @@ def test_busy_cpu_worker_never_resolves_worker_stalled() -> None:
             status._wait_process_cpu_pct = saved_cpu  # type: ignore[assignment]
 
 
+def test_unknown_cpu_worker_never_resolves_worker_stalled() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        tail = Path(tmp) / "worker.tail"
+        tail.write_text("started\n", encoding="utf-8")
+        rec = {
+            "dispatch_id": "unknown-cpu",
+            "classification": "unknown",
+            "worker_pid": 4242,
+            "tail_path": str(tail),
+        }
+        payload = _payload(rec)
+        saved_alive = compat.pid_alive
+        saved_cpu = status._wait_process_cpu_pct
+        compat.pid_alive = lambda pid: True  # type: ignore[assignment]
+        status._wait_process_cpu_pct = lambda record: None  # type: ignore[assignment]
+        try:
+            stalled_since: dict[str, float] = {}
+            progress_state: dict[str, dict] = {}
+            dead_since: dict[str, float] = {}
+            _row(
+                payload,
+                "unknown-cpu",
+                now=0.0,
+                grace=90.0,
+                dead_since=dead_since,
+                stale_grace=5.0,
+                stalled_since=stalled_since,
+                progress_state=progress_state,
+            )
+            row = _row(
+                payload,
+                "unknown-cpu",
+                now=100.0,
+                grace=90.0,
+                dead_since=dead_since,
+                stale_grace=5.0,
+                stalled_since=stalled_since,
+                progress_state=progress_state,
+            )
+            assert_eq("unknown cpu not terminal", row["terminal"], False)
+            assert_true("stalled_since clear on unknown cpu", "unknown-cpu" not in stalled_since)
+        finally:
+            compat.pid_alive = saved_alive  # type: ignore[assignment]
+            status._wait_process_cpu_pct = saved_cpu  # type: ignore[assignment]
+
+
 def test_completed_pid_dead_stays_complete_trust_clause() -> None:
     # reconcile-from-output already promoted this row to complete; --wait must
     # report complete, NOT worker_dead, even though the pid is gone.
@@ -338,6 +384,7 @@ def main() -> None:
         test_wedged_alive_worker_resolves_worker_stalled_after_stale_grace,
         test_growing_tail_worker_never_resolves_worker_stalled,
         test_busy_cpu_worker_never_resolves_worker_stalled,
+        test_unknown_cpu_worker_never_resolves_worker_stalled,
         test_completed_pid_dead_stays_complete_trust_clause,
         test_wait_returns_bounded_on_crash_not_at_timeout,
         test_wait_heartbeat_emits_progress_line_at_cadence,

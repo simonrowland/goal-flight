@@ -324,6 +324,11 @@ def pgroup_cpu_pct(pgid_or_pid: int | str | None) -> float | None:
     return parse_ps_pgroup_cpu(output, pgid)
 
 
+def cpu_confirmed_idle(cpu_pct: float | None, epsilon_pct: float) -> bool:
+    """Return true only when CPU was measured and is at/below the idle epsilon."""
+    return cpu_pct is not None and cpu_pct <= epsilon_pct
+
+
 def classify_liveness(
     pid_alive: bool,
     pgroup_cpu: float | None,
@@ -347,9 +352,11 @@ def classify_liveness(
     if not idle_expired:
         return "running"
 
-    if pgroup_cpu is not None and pgroup_cpu > thresholds.cpu_epsilon_pct:
+    if pgroup_cpu is None:
+        return "running"
+    if pgroup_cpu > thresholds.cpu_epsilon_pct:
         return "running_quiet"
-    if low_power_relax and pgroup_cpu is not None:
+    if low_power_relax and cpu_confirmed_idle(pgroup_cpu, thresholds.cpu_epsilon_pct):
         # Absolute hard wall: the relax adds at most LOW_POWER_RELAX_CAP_S of
         # extra grace, never a multiple of a long idle_timeout. min() of the
         # factor form and the additive-cap form means short idles get the factor
@@ -383,8 +390,7 @@ def heartbeat_wedge_decision(
     """
     dead_sample = (
         pid_alive
-        and pgroup_cpu is not None
-        and pgroup_cpu <= cpu_epsilon_pct
+        and cpu_confirmed_idle(pgroup_cpu, cpu_epsilon_pct)
         and wedge_progress_seen == previous_wedge_progress_seen
         and outstanding_count == 0
     )
