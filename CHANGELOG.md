@@ -6,6 +6,35 @@ incremented when meaningful skill behaviour changes.
 
 ## [Unreleased]
 
+## [1.0.10] — 2026-06-21
+
+Dispatch ergonomics + remote-drain + status-trust follow-ups to 1.0.9.
+
+### Added
+- `drain --remote-node <name>`: opt-in dual-drain that launches each claimed queue
+  entry on a fleet node over SSH instead of locally, reusing the queue claim/token
+  single-launch machinery and gating real SSH behind the live opt-in. Local drain is
+  unchanged when the flag is absent. (#10)
+- `scripts/install-drainer.sh`: idempotent installer (install/status/uninstall/
+  `--dry-run`) that renders a portable launchd plist template into the user's
+  LaunchAgents, plus `protocols/drainer.md` documenting the reaper-proof
+  out-of-session drainer model (and a systemd-timer note for Linux controllers). (#14)
+
+### Changed
+- context-mode is now OFF by default for dispatched codex workers (`codex exec` gets
+  `-c mcp_servers.context-mode.enabled=false`; codex-acp posture defaults off too).
+  This removes the exec-mode elicitation wedge at the source instead of relying on
+  per-prompt "no ctx_*" instructions. Opt back in with
+  `GOALFLIGHT_CODEX_CONTEXT_MODE=enabled`; grok-acp/cursor and the user's interactive
+  `~/.codex` config are unaffected. (#18)
+
+### Fixed
+- A detached (drain/launchd-launched) worker is no longer falsely classified
+  `orphaned`/`controller_dead` when its ephemeral launcher exits: controller-pid
+  liveness is non-terminal for detached records and the state is re-derived from the
+  authoritative worker pid+identity (live → live, success-marker tail → complete,
+  genuinely gone → worker_dead). (#28)
+
 ## [1.0.9] — 2026-06-20
 
 Wait-reliability + correctness + architecture release. Makes `--wait` trustworthy
