@@ -2012,12 +2012,25 @@ def _dispatch_has_worker_record(
     require_live_nonterminal: bool = False,
 ) -> bool:
     record = _find_dispatch_record(dispatch_id)
-    if not (record and record.get("worker_pid")):
+    if not record:
         return False
     if queue_launch_token is not None:
         if record.get("queue_launch_token") != queue_launch_token:
             return False
-    if require_live_nonterminal and not _dispatch_record_has_live_nonterminal_worker(record):
+    if record.get("worker_pid"):
+        if require_live_nonterminal and not _dispatch_record_has_live_nonterminal_worker(record):
+            return False
+        return True
+    if record.get("transport") != "fleet-ssh":
+        return False
+    remote_receipt = record.get("remote_launch_receipt")
+    has_remote_launch = bool(
+        record.get("launch_unconfirmed")
+        or (isinstance(remote_receipt, dict) and remote_receipt.get("remote_pid"))
+    )
+    if not has_remote_launch:
+        return False
+    if require_live_nonterminal and _dispatch_record_is_terminal(record):
         return False
     return True
 
@@ -2292,6 +2305,202 @@ def _mark_claim_failed(claim: Path, entry: dict, *, reason: str) -> None:
         claim.unlink()
 
 
+class _RemoteDrainBlocked(RuntimeError):
+    def __init__(self, message: str, *, code: str = "blocked") -> None:
+        self.code = code
+        super().__init__(message)
+
+
+def _remote_drain_node(args) -> str | None:
+    node = getattr(args, "remote_node", None)
+    if node is None:
+        return None
+    node = str(node).strip()
+    return node or None
+
+
+def _remote_drain_fleet_dir(args) -> Path:
+    raw = getattr(args, "fleet_dir", None)
+    if raw:
+        return Path(str(raw)).expanduser()
+    import goalflight_fleet_store as fleet
+
+    return fleet.default_fleet_dir()
+
+
+def _validate_remote_drain_node(args) -> Path:
+    node = _remote_drain_node(args)
+    if not node:
+        raise _RemoteDrainBlocked("--remote-node requires a non-empty node name", code="unknown_node")
+    fleet_dir = _remote_drain_fleet_dir(args)
+    fleet_path = fleet_dir / "fleet.json"
+    if not fleet_path.exists():
+        raise _RemoteDrainBlocked(f"fleet store missing: {fleet_path}", code="fleet_missing")
+    try:
+        import goalflight_fleet_store as fleet
+
+        fleet_doc = fleet.read_json(fleet_path)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise _RemoteDrainBlocked(f"fleet store unreadable: {type(exc).__name__}", code="fleet_unreadable") from exc
+    node_entry = (fleet_doc.get("nodes") or {}).get(node)
+    if not isinstance(node_entry, dict):
+        raise _RemoteDrainBlocked(f"unknown node: {node}", code="unknown_node")
+    return fleet_dir
+
+
+def _remote_drain_agent(entry: dict) -> str:
+    request = entry.get("request") if isinstance(entry.get("request"), dict) else {}
+    raw = str(entry.get("agent") or request.get("agent") or "codex").strip().lower()
+    aliases = {
+        "worker": "codex-acp",
+        "codex": "codex-acp",
+        "codex-acp": "codex-acp",
+        "grok": "grok-acp",
+        "grok-code": "grok-acp",
+        "grok-research": "grok-acp",
+        "grok-acp": "grok-acp",
+        "cursor": "cursor",
+        "cursor-agent": "cursor",
+        "claude": "claude-acp",
+        "claude-acp": "claude-acp",
+        "claude-code-cli-acp": "claude-acp",
+    }
+    agent = aliases.get(raw)
+    if not agent:
+        raise _RemoteDrainBlocked(f"unsupported remote drain agent: {raw}", code="unsupported_agent")
+    return agent
+
+
+def _remote_drain_prompt(entry: dict) -> str:
+    request = entry.get("request") if isinstance(entry.get("request"), dict) else {}
+    prompt = request.get("prompt")
+    if isinstance(prompt, str) and prompt:
+        return prompt
+    prompt_file = request.get("prompt_file")
+    if not prompt_file:
+        raise _RemoteDrainBlocked("remote drain requires a queued --prompt or --prompt-file", code="missing_prompt")
+    path = Path(str(prompt_file)).expanduser()
+    if not path.is_absolute():
+        base = Path(str(entry.get("process_cwd") or entry.get("project_root") or Path.cwd()))
+        path = base / path
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise _RemoteDrainBlocked(f"prompt file unreadable: {type(exc).__name__}: {path}", code="prompt_unreadable") from exc
+
+
+def _remote_drain_base_sha(entry: dict) -> str:
+    request = entry.get("request") if isinstance(entry.get("request"), dict) else {}
+    for raw in (
+        request.get("base_sha"),
+        entry.get("base_sha"),
+        os.environ.get("GOALFLIGHT_FLEET_BASE_SHA"),
+    ):
+        if not raw:
+            continue
+        value = str(raw).strip().lower()
+        if re.fullmatch(r"[0-9a-f]{40}", value):
+            return value
+        raise _RemoteDrainBlocked(f"invalid remote drain base sha: {raw}", code="invalid_base_sha")
+
+    project_root = Path(str(entry.get("project_root") or request.get("cwd") or Path.cwd())).resolve()
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(project_root), "rev-parse", "HEAD"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise _RemoteDrainBlocked(f"base sha probe failed: {type(exc).__name__}", code="base_sha_unavailable") from exc
+    value = proc.stdout.strip().lower()
+    if proc.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}", value):
+        detail = (proc.stderr or proc.stdout or "git rev-parse HEAD failed").strip()
+        raise _RemoteDrainBlocked(f"base sha unavailable: {detail}", code="base_sha_unavailable")
+    return value
+
+
+def _remote_drain_billing_account(entry: dict) -> str | None:
+    request = entry.get("request") if isinstance(entry.get("request"), dict) else {}
+    raw = request.get("billing_account") or entry.get("billing_account")
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    account = request.get("account")
+    if isinstance(account, str) and "/" in account and account.strip():
+        return account.strip()
+    return None
+
+
+def _drain_launch_remote_claim(
+    args,
+    entry: dict,
+    *,
+    dispatch_id: str,
+    launch_token: str,
+    claim: Path,
+) -> subprocess.CompletedProcess[str]:
+    node = _remote_drain_node(args)
+    if not node:
+        raise _RemoteDrainBlocked("--remote-node missing", code="unknown_node")
+    fleet_dir = _validate_remote_drain_node(args)
+    try:
+        import goalflight_fleet_dispatch as fleet_dispatch
+    except ImportError as exc:
+        raise _RemoteDrainBlocked(f"fleet dispatch unavailable: {exc}", code="fleet_unavailable") from exc
+
+    _mark_queue_claim_launch_started(
+        argparse.Namespace(
+            from_queue=True,
+            queue_claim_path=str(claim),
+            queue_launch_token=launch_token,
+        )
+    )
+    try:
+        preview = fleet_dispatch.preview_dispatch(
+            fleet_dir,
+            node_id=node,
+            agent=_remote_drain_agent(entry),
+            billing_account=_remote_drain_billing_account(entry),
+            prompt=_remote_drain_prompt(entry),
+            dispatch_id=dispatch_id,
+            base_sha=_remote_drain_base_sha(entry),
+            thin_mode=True,
+        )
+        runner = getattr(args, "remote_runner", None)
+        if runner is None:
+            fleet_dispatch.assert_live_ssh_opt_in()
+        result = fleet_dispatch.execute_dispatch(
+            fleet_dir,
+            preview,
+            runner=runner,
+            dispatch_mode="one-shot",
+            tool_smoke_policy=getattr(args, "remote_tool_smoke", "auto"),
+            queue_launch_token=launch_token,
+        )
+    except fleet_dispatch.DispatchGateError as exc:
+        raise _RemoteDrainBlocked(str(exc), code=getattr(exc, "code", "blocked")) from exc
+    except fleet_dispatch.DispatchError as exc:
+        raise _RemoteDrainBlocked(str(exc), code="dispatch_error") from exc
+
+    return subprocess.CompletedProcess(
+        ["remote-drain", node, dispatch_id],
+        0,
+        stdout="DISPATCH-LAUNCHED "
+        + json.dumps(
+            {
+                "dispatch_id": dispatch_id,
+                "node": node,
+                "transport": "fleet-ssh",
+                "launch_unconfirmed": bool(result.get("launch_unconfirmed")),
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        stderr="",
+    )
+
+
 def _drain_launch_argv(
     dispatch_argv: list[str],
     *,
@@ -2382,7 +2591,18 @@ def _mark_claim_worker_dead(entry: dict, *, reason: str) -> None:
 def _drain_queue_once(args) -> dict:
     queue_dir = Path(args.queue_dir).expanduser() if args.queue_dir else _dispatch_queue_dir()
     queue_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    _release_stale_capacity_for_drain()
+    remote_node = _remote_drain_node(args)
+    if remote_node:
+        _validate_remote_drain_node(args)
+        if getattr(args, "remote_runner", None) is None:
+            try:
+                import goalflight_fleet_dispatch as fleet_dispatch
+
+                fleet_dispatch.assert_live_ssh_opt_in()
+            except Exception as exc:
+                raise _RemoteDrainBlocked(str(exc), code="live_ssh_required") from exc
+    else:
+        _release_stale_capacity_for_drain()
     recovery = _recover_claimed_queue_entries(queue_dir, stale_s=args.claim_stale_s)
     launched = 0
     left_queued = 0
@@ -2439,15 +2659,36 @@ def _drain_queue_once(args) -> dict:
             continue
         timeout_s = max(20.0, float(args.capacity_wait_s or 0.0) + 45.0)
         try:
-            proc = subprocess.run(
-                [sys.executable, str(Path(__file__).resolve()), *launch_argv],
-                cwd=str(Path(entry.get("process_cwd") or entry.get("project_root") or Path.cwd()).resolve()),
-                env=os.environ.copy(),
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=timeout_s,
+            if remote_node:
+                proc = _drain_launch_remote_claim(
+                    args,
+                    entry,
+                    dispatch_id=dispatch_id,
+                    launch_token=launch_token,
+                    claim=claim,
+                )
+            else:
+                proc = subprocess.run(
+                    [sys.executable, str(Path(__file__).resolve()), *launch_argv],
+                    cwd=str(Path(entry.get("process_cwd") or entry.get("project_root") or Path.cwd()).resolve()),
+                    env=os.environ.copy(),
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=timeout_s,
+                )
+        except _RemoteDrainBlocked as exc:
+            restored = _restore_claimed_entry(claim, entry)
+            _restore_queued_record_from_entry(entry, restored)
+            left_queued += 1
+            details.append(
+                {
+                    "dispatch_id": dispatch_id,
+                    "state": "queued",
+                    "reason": f"remote_blocked:{exc.code}:{exc}",
+                }
             )
+            continue
         except subprocess.TimeoutExpired:
             pending_claims += 1
             failed += 1
@@ -2505,7 +2746,7 @@ def _drain_queue_once(args) -> dict:
 
 def _drain_error_payload(args, exc: BaseException) -> dict:
     queue_dir = Path(args.queue_dir).expanduser() if args.queue_dir else _dispatch_queue_dir()
-    return {
+    payload = {
         "schema": f"{DISPATCH_QUEUE_SCHEMA}.drain.v1",
         "queue_dir": str(queue_dir),
         "launched": 0,
@@ -2517,6 +2758,11 @@ def _drain_error_payload(args, exc: BaseException) -> dict:
         "details": [],
         "error": f"{type(exc).__name__}: {exc}",
     }
+    if isinstance(exc, _RemoteDrainBlocked):
+        payload["blocked"] = True
+        payload["error"] = f"DISPATCH-BLOCKED {exc}"
+        payload["code"] = exc.code
+    return payload
 
 
 def _cmd_drain(argv: list[str]) -> int:
@@ -2525,10 +2771,18 @@ def _cmd_drain(argv: list[str]) -> int:
     parser.add_argument("--capacity-wait-s", type=float, default=0.0)
     parser.add_argument("--claim-stale-s", type=float, default=QUEUE_CLAIM_STALE_S)
     parser.add_argument("--limit", type=int, default=0, help="maximum queue entries to inspect; 0 = all")
+    parser.add_argument("--remote-node", help="Launch claimed queue entries on this fleet node instead of locally.")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     try:
         payload = _drain_queue_once(args)
+    except _RemoteDrainBlocked as exc:
+        payload = _drain_error_payload(args, exc)
+        if args.json:
+            print(json.dumps(payload, sort_keys=True))
+        else:
+            print(payload["error"], file=sys.stderr)
+        return 2
     except (OSError, RuntimeError) as exc:
         payload = _drain_error_payload(args, exc)
         if args.json:

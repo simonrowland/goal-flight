@@ -687,6 +687,7 @@ def register_dispatch_meta(
     launch_unconfirmed_error: str | None = None,
     row_state: str | None = None,
     account_lock: dict[str, Any] | None = None,
+    queue_launch_token: str | None = None,
 ) -> None:
     import goalflight_fleet_store as fleet
     import goalflight_fleet_watch as fleet_watch
@@ -729,6 +730,8 @@ def register_dispatch_meta(
         now = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(timespec="seconds")
         meta["launch_issued_at"] = now
         meta["launch_unconfirmed_at"] = now
+    if queue_launch_token:
+        meta["queue_launch_token"] = queue_launch_token
     if launch_receipt:
         meta.update(
             {
@@ -782,6 +785,7 @@ def record_dispatch_ledger(
     chain: LockChainResult,
     *,
     state: str = "running",
+    queue_launch_token: str | None = None,
 ) -> dict[str, Any]:
     import goalflight_ledger as ledger
 
@@ -803,6 +807,8 @@ def record_dispatch_ledger(
         "started_at": ledger.utc_now(),
         "hostname": __import__("socket").gethostname(),
     }
+    if queue_launch_token:
+        record["queue_launch_token"] = queue_launch_token
     with ledger.StateLock():
         path = ledger.write_record(record)
     return {"ok": True, "path": str(path), "record": record}
@@ -886,6 +892,7 @@ def execute_dispatch(
     dispatch_mode: str = "one-shot",
     tool_smoke_policy: str | None = "auto",
     tool_smoke_sandbox: str = tool_smoke.DEFAULT_SANDBOX,
+    queue_launch_token: str | None = None,
 ) -> dict[str, Any]:
     assert_dispatch_gates(
         fleet_dir,
@@ -908,6 +915,7 @@ def execute_dispatch(
         pid_hint="unknown",
         launch_unconfirmed=recovering_unconfirmed,
         row_state="launch_pending",
+        queue_launch_token=queue_launch_token,
     )
     chain = acquire_lock_chain(fleet_dir, preview, runner=runner)
     register_dispatch_meta(
@@ -919,11 +927,13 @@ def execute_dispatch(
         launch_unconfirmed_error=chain.launch_unconfirmed_error,
         row_state="launch_unconfirmed" if chain.launch_unconfirmed else "launch_receipted",
         account_lock=chain.account_lock,
+        queue_launch_token=queue_launch_token,
     )
     ledger_info = record_dispatch_ledger(
         preview,
         chain,
         state="launch_unconfirmed" if chain.launch_unconfirmed else "running",
+        queue_launch_token=queue_launch_token,
     )
     if stub_terminal:
         import goalflight_ledger as ledger
@@ -939,6 +949,7 @@ def execute_dispatch(
             launch_unconfirmed_error=chain.launch_unconfirmed_error,
             row_state="terminal",
             account_lock=chain.account_lock,
+            queue_launch_token=queue_launch_token,
         )
         with ledger.StateLock():
             record = json.loads(Path(ledger_info["path"]).read_text())
