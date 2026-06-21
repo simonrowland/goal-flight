@@ -307,7 +307,7 @@ def append_ferry_audit(fleet_dir: Path, receipt: dict[str, Any]) -> None:
 
 
 def _load_node_entry(fleet_dir: Path, node_id: str) -> dict[str, Any]:
-    import goalflight_fleet as fleet
+    import goalflight_fleet_store as fleet
 
     fleet.bootstrap(fleet_dir)
     doc = fleet.read_json(fleet_dir / "fleet.json")

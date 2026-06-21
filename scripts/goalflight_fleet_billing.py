@@ -240,7 +240,7 @@ def run_local_auth_probe(
     runner: ProbeRunner | None = None,
     iso_now: str | None = None,
 ) -> dict[str, Any]:
-    import goalflight_fleet as fleet
+    import goalflight_fleet_store as fleet
 
     runner = runner or default_runner
     iso_now = iso_now or fleet.iso()
@@ -294,7 +294,7 @@ def probe_is_fresh(payload: dict[str, Any] | None, ttl_s: int) -> bool:
     dispatch gate must treat a stale artifact as "must re-probe" rather than trust it.
     Missing/unparseable ``probed_at`` is treated as stale (fail-closed -> re-probe).
     """
-    import goalflight_fleet as fleet
+    import goalflight_fleet_store as fleet
 
     if not isinstance(payload, dict):
         return False
@@ -361,7 +361,7 @@ def run_node_auth_probe(
     iso_now: str | None = None,
     write_artifact: bool = True,
 ) -> dict[str, Any]:
-    import goalflight_fleet as fleet
+    import goalflight_fleet_store as fleet
 
     iso_now = iso_now or fleet.iso()
     fleet_path = fleet_dir / "fleet.json"
@@ -443,7 +443,7 @@ def link_account_to_node(
     ssh_runner: ProbeRunner | None = None,
     iso_now: str | None = None,
 ) -> dict[str, Any]:
-    import goalflight_fleet as fleet
+    import goalflight_fleet_store as fleet
     import goalflight_fleet_schemas as schemas
 
     iso_now = iso_now or fleet.iso()
@@ -493,7 +493,7 @@ def link_account_to_node(
 
 
 def unlink_account_from_node(fleet_dir: Path, account_key: str, node_id: str) -> dict[str, Any]:
-    import goalflight_fleet as fleet
+    import goalflight_fleet_store as fleet
     import goalflight_fleet_schemas as schemas
 
     fleet_path = fleet_dir / "fleet.json"
@@ -530,7 +530,7 @@ def fleet_auth_doctor(
     runner: ProbeRunner | None = None,
     ssh_runner: ProbeRunner | None = None,
 ) -> dict[str, Any]:
-    import goalflight_fleet as fleet
+    import goalflight_fleet_store as fleet
 
     fleet_path = fleet_dir / "fleet.json"
     if not fleet_path.exists():
@@ -599,7 +599,7 @@ def assert_dispatch_auth(
     ttl_s: int = AUTH_PROBE_TTL_S,
     reprobe: Callable[..., dict[str, Any]] | None = None,
 ) -> None:
-    import goalflight_fleet as fleet
+    import goalflight_fleet_store as fleet
     import goalflight_fleet_schemas as schemas
 
     fleet_path = fleet_dir / "fleet.json"
@@ -669,7 +669,7 @@ def assert_dispatch_auth(
 
 
 def cmd_account_link(args) -> int:
-    import goalflight_fleet as fleet
+    import goalflight_fleet_store as fleet
 
     try:
         result = link_account_to_node(
@@ -713,7 +713,7 @@ def cmd_account_unlink(args) -> int:
 
 
 def cmd_probe(args) -> int:
-    import goalflight_fleet as fleet
+    import goalflight_fleet_store as fleet
 
     billing_path = args.fleet_dir / "billing-accounts.json"
     billing_doc = fleet.read_json(billing_path) if billing_path.exists() else None
@@ -732,7 +732,7 @@ def cmd_probe(args) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     import argparse
-    import goalflight_fleet as fleet
+    import goalflight_fleet_store as fleet
 
     parser = argparse.ArgumentParser(description="Fleet billing auth probes")
     parser.add_argument("--fleet-dir", type=Path, default=fleet.default_fleet_dir())

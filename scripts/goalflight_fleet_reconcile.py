@@ -77,7 +77,7 @@ def reconcile_audit_path(fleet_dir: Path) -> Path:
 
 
 def append_reconcile_audit(fleet_dir: Path, entry: dict[str, Any]) -> None:
-    from goalflight_fleet import iso
+    from goalflight_fleet_store import iso
 
     payload = dict(entry)
     payload.setdefault("ts", iso())
@@ -87,7 +87,7 @@ def append_reconcile_audit(fleet_dir: Path, entry: dict[str, Any]) -> None:
 
 
 def find_account_lock_for_dispatch(fleet_dir: Path, dispatch_id: str) -> dict[str, Any] | None:
-    import goalflight_fleet as fleet
+    import goalflight_fleet_store as fleet
 
     locks_dir = fleet_dir / "locks" / "accounts"
     if not locks_dir.is_dir():
@@ -105,7 +105,7 @@ def find_account_lock_for_dispatch(fleet_dir: Path, dispatch_id: str) -> dict[st
 
 
 def account_lock_from_dispatch_meta(fleet_dir: Path, dispatch_id: str, meta: dict[str, Any]) -> dict[str, Any] | None:
-    import goalflight_fleet as fleet
+    import goalflight_fleet_store as fleet
 
     account_key = meta.get("account_key") or meta.get("billing_account")
     if not isinstance(account_key, str) or not account_key.strip():
@@ -185,7 +185,7 @@ def build_dispatch_context(
     ssh_reachable: bool | None = None,
     ssh_runner: Callable[[list[str]], tuple[int, str, str]] | None = None,
 ) -> DispatchReconcileContext:
-    import goalflight_fleet as fleet
+    import goalflight_fleet_store as fleet
     import goalflight_fleet_ssh as fleet_ssh
     import goalflight_fleet_watch as fleet_watch
 
@@ -255,7 +255,7 @@ def decide_reconcile_action(ctx: DispatchReconcileContext) -> ReconcileDecision:
 
 
 def _remove_active_dispatch(fleet_dir: Path, dispatch_id: str) -> None:
-    from goalflight_fleet import _atomic_write_json, read_json
+    from goalflight_fleet_store import _atomic_write_json, read_json
 
     aggregate_path = fleet_dir / "register" / "aggregate.json"
     if not aggregate_path.exists():
@@ -279,7 +279,7 @@ def _mark_dispatch_released(fleet_dir: Path, dispatch_id: str, *, reason: str) -
     meta["row_state"] = "released"
     meta["released_reason"] = reason
     meta["lease_active"] = False
-    from goalflight_fleet import _atomic_write_json
+    from goalflight_fleet_store import _atomic_write_json
 
     _atomic_write_json(meta_path, meta)
 
@@ -291,7 +291,7 @@ def release_dispatch_locks(
     reason: str = "reconcile",
 ) -> tuple[bool, str | None]:
     """Release account lock for dispatch when ``may_release_locks`` is True."""
-    import goalflight_fleet as fleet
+    import goalflight_fleet_store as fleet
     import goalflight_fleet_watch as fleet_watch
 
     if ctx.meta.get("row_state") == "released":

@@ -360,7 +360,7 @@ def preview_dispatch(
     base_sha: str | None = None,
     thin_mode: bool = False,
 ) -> DispatchPreview:
-    import goalflight_fleet as fleet
+    import goalflight_fleet_store as fleet
 
     fleet.bootstrap(fleet_dir)
     fleet_doc = fleet.read_json(fleet_dir / "fleet.json")
@@ -443,7 +443,7 @@ def persist_dispatch_account_lock_link(
     preview: DispatchPreview,
     lock_doc: dict[str, Any],
 ) -> None:
-    import goalflight_fleet as fleet
+    import goalflight_fleet_store as fleet
     import goalflight_fleet_watch as fleet_watch
 
     meta_path = fleet_watch.dispatch_meta_path(fleet_dir, preview.dispatch_id)
@@ -501,7 +501,7 @@ def acquire_lock_chain(
     stop_after: str | None = None,
 ) -> LockChainResult:
     """Acquire locks in plan order; rollback on failure."""
-    import goalflight_fleet as fleet
+    import goalflight_fleet_store as fleet
 
     result = LockChainResult(account_key=preview.billing_account)
     acquired: list[str] = []
@@ -627,7 +627,7 @@ def release_lock_chain(
     acquired: list[str],
     fencing_token: str | None,
 ) -> None:
-    import goalflight_fleet as fleet
+    import goalflight_fleet_store as fleet
 
     for step in reversed(acquired):
         if step == "account" and fencing_token:
@@ -688,7 +688,7 @@ def register_dispatch_meta(
     row_state: str | None = None,
     account_lock: dict[str, Any] | None = None,
 ) -> None:
-    import goalflight_fleet as fleet
+    import goalflight_fleet_store as fleet
     import goalflight_fleet_watch as fleet_watch
 
     fleet_doc = fleet.read_json(fleet_dir / "fleet.json")
@@ -972,7 +972,7 @@ def execute_dispatch(
 
 
 def cmd_dispatch(args) -> int:
-    import goalflight_fleet as fleet
+    import goalflight_fleet_store as fleet
 
     fleet.bootstrap(args.fleet_dir)
     thin = bool(getattr(args, "thin_defaults", False))

@@ -99,7 +99,7 @@ def save_node(
     actor: str,
     iso_now: str,
 ) -> dict[str, Any]:
-    import goalflight_fleet as fleet
+    import goalflight_fleet_store as fleet
     import goalflight_fleet_schemas as schemas
 
     fleet_path = fleet_dir / "fleet.json"
@@ -138,7 +138,7 @@ def add_node_from_ssh(
     actor: str = "cli",
     iso_now: str | None = None,
 ) -> dict[str, Any]:
-    import goalflight_fleet as fleet
+    import goalflight_fleet_store as fleet
 
     iso_now = iso_now or fleet.iso()
     node_id = node_id or ssh_alias
@@ -184,7 +184,7 @@ def add_node_from_ssh(
 
 
 def cmd_node_add(args) -> int:
-    import goalflight_fleet as fleet
+    import goalflight_fleet_store as fleet
 
     repo_root = args.repo_root
     state_dir = args.state_dir

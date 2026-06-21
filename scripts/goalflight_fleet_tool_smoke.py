@@ -411,7 +411,7 @@ def assert_green_canary(
 
 
 def _node_entry(fleet_dir: Path, node_id: str) -> dict[str, Any]:
-    import goalflight_fleet as fleet
+    import goalflight_fleet_store as fleet
 
     fleet_doc = fleet.read_json(fleet_dir / "fleet.json")
     node = (fleet_doc.get("nodes") or {}).get(node_id)

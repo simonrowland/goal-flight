@@ -92,7 +92,7 @@ def _classify_dispatch_row(
 
 def build_fleet_status(fleet_dir: Path) -> dict[str, Any]:
     """Aggregate per-node auth probes and dispatch rows for fleet status."""
-    import goalflight_fleet as fleet
+    import goalflight_fleet_store as fleet
 
     fleet_path = fleet_dir / "fleet.json"
     result: dict[str, Any] = {

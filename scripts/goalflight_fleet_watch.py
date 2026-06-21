@@ -695,7 +695,7 @@ def sync_fleet_mirrors(
     dispatch_ids: list[str] | None = None,
 ) -> FleetWatchResult:
     """One-shot sync of orchestrator mirrors from remote status paths."""
-    import goalflight_fleet as fleet
+    import goalflight_fleet_store as fleet
 
     result = FleetWatchResult()
     targets = collect_watch_targets(fleet_dir)
@@ -1103,7 +1103,7 @@ def watch_until_terminal(
     monotonic_fn: Callable[[], float] = time.monotonic,
 ) -> UntilTerminalResult:
     """Poll one remote status mirror until terminal, timeout, or ambiguity."""
-    import goalflight_fleet as fleet
+    import goalflight_fleet_store as fleet
 
     deadline = monotonic_fn() + max(float(timeout_s), 0.0)
     polls = 0
@@ -1273,7 +1273,7 @@ def release_lock_on_confirmed_terminal(fleet_dir: Path, dispatch_id: str, state:
             return False
         if state in fleet_status.SALVAGE_NEEDED_STATES:
             return False
-        import goalflight_fleet as fleet
+        import goalflight_fleet_store as fleet
         import goalflight_fleet_reconcile as fleet_reconcile
 
         meta = _read_json_object(dispatch_meta_path(fleet_dir, dispatch_id))
@@ -1298,7 +1298,7 @@ def release_lock_on_confirmed_terminal(fleet_dir: Path, dispatch_id: str, state:
 
 
 def cmd_watch_fleet(args) -> int:
-    import goalflight_fleet as fleet
+    import goalflight_fleet_store as fleet
 
     fleet.bootstrap(args.fleet_dir)
     transport = SshFleetWatchTransport(

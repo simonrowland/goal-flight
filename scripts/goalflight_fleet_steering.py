@@ -54,13 +54,13 @@ def load_steering_doc(fleet_dir: Path) -> dict:
 
 
 def steering_hash(fleet_dir: Path) -> str:
-    from goalflight_fleet import sha256_file
+    from goalflight_fleet_store import sha256_file
 
     return f"sha256:{sha256_file(steering_path(fleet_dir))}"
 
 
 def _atomic_write_json(path: Path, data: dict) -> None:
-    from goalflight_fleet import _atomic_write_json as write
+    from goalflight_fleet_store import _atomic_write_json as write
 
     write(path, data)
 
