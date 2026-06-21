@@ -2625,7 +2625,7 @@ def _build_acp_cfg(args, *, status_json: Path):
         mode="one-shot",
         idle_timeout=float(args.max_idle_secs or 300.0),
         status_json=str(status_json),
-        context_mode="enabled",
+        context_mode=_acp_context_mode_default(args),
         os_sandbox=os_sandbox,
         permission_mode=getattr(args, "permission_mode", "auto"),
         permission_dir=getattr(args, "permission_dir", None),
@@ -3006,6 +3006,28 @@ def _registration_error(step: str, exc: Exception) -> dict:
     return {"step": step, "reason": f"{type(exc).__name__}: {exc}"}
 
 
+def _codex_context_mode_enabled() -> bool:
+    """Whether a dispatched codex worker should load the context-mode MCP server.
+
+    Default OFF: context-mode's elicitation (ctx_index 'Approve Index Content')
+    issues request_user_input, which codex `exec` does not support -> the worker
+    wedges. Headless workers don't need it. Opt back in (rarely wanted) with
+    GOALFLIGHT_CODEX_CONTEXT_MODE in {1,true,yes,enabled,on}.
+    """
+    raw = os.environ.get("GOALFLIGHT_CODEX_CONTEXT_MODE", "").strip().lower()
+    return raw in {"1", "true", "yes", "enabled", "on"}
+
+
+def _acp_context_mode_default(args) -> str:
+    """codex-acp shares the exec-mode elicitation wedge risk, so default its
+    context-mode posture OFF (opt back in via GOALFLIGHT_CODEX_CONTEXT_MODE).
+    Other acp engines (grok-acp, cursor) keep context-mode enabled."""
+    agent = str(getattr(args, "agent", ""))
+    if agent.startswith("codex") and not _codex_context_mode_enabled():
+        return "disabled"
+    return "enabled"
+
+
 def build_worker(args, prompt_path, raw_argv: list[str]):
     """Return (argv, stdin_path). Explicit `-- <cmd>` overrides any preset.
     Presets encode the canonical SAFE, non-interactive invocation per worker.
@@ -3017,6 +3039,10 @@ def build_worker(args, prompt_path, raw_argv: list[str]):
     if args.agent == "codex":
         argv = ["codex", "exec", "--skip-git-repo-check", "--sandbox", sandbox,
                 "-c", "approval_policy=never"]
+        if not _codex_context_mode_enabled():
+            # Disable context-mode at the worker boundary (see _codex_context_mode_enabled);
+            # leaves the user's ~/.codex/config.toml untouched for interactive use.
+            argv += ["-c", "mcp_servers.context-mode.enabled=false"]
         if model:
             argv += ["--model", str(model)]
         if args.cwd:

@@ -61,9 +61,12 @@ surface REAL blockers → routing table → grouped fixes → serial integrator`
   short-lived controller process can be reaped by `cleanup_ghosts` / release-stale once that
   controller exits — see the D007/D008 class. Out-of-session launch gave ~96% survival vs
   frequent mid-run deaths in-session.
-- **codex workers: instruct "do NOT use context-mode / ctx_* tools"** (use ripgrep/git/read).
-  The exec-mode elicitation wedge that wrecks codex review workers did not fire once when this
-  was stated (0 hits across a verify fleet). Or route to a non-wedging engine.
+- **codex workers: context-mode is now OFF by default** (goal-flight passes
+  `-c mcp_servers.context-mode.enabled=false` to dispatched `codex exec`, and defaults codex-acp's
+  posture off too; opt back in with `GOALFLIGHT_CODEX_CONTEXT_MODE=enabled`). This removes the
+  exec-mode elicitation wedge at the source. The old "do NOT use context-mode / ctx_* tools"
+  brief line is now belt-and-suspenders (for opted-in or externally-launched codex workers); or
+  route to a non-wedging engine.
 - Workers are READ-ONLY in audit/verify; only harvest/consolidate/integrator write.
 
 ## Fixing (thrifty on controller context; controller keeps final say)
