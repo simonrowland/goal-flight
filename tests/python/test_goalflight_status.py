@@ -216,6 +216,65 @@ def test_done_code() -> None:
               "worker_pid": 333,
               "worker_still_alive": True,
           }) == 0)
+    detached_controller_dead = {
+        "dispatch_id": "detached-live-controller-dead",
+        "state": "orphaned",
+        "reason": "controller_dead",
+        "detached": True,
+        "agent": "codex",
+        "worker_pid": 444,
+        "worker_identity": {"lstart": "Tue Jun  9 09:00:00 2026", "comm": "python3"},
+        "project_root": "/repo/A",
+        "started_at": S.goalflight_ledger.utc_now(),
+    }
+    orig_read_records = S.goalflight_ledger.read_records
+    orig_identity_matches = S.goalflight_ledger.identity_matches
+    try:
+        S.goalflight_ledger.read_records = lambda: [detached_controller_dead]
+        S.goalflight_ledger.identity_matches = lambda _record: (True, "live")
+        rows = S.goalflight_ledger.status_payload()["records"]
+        check("detached controller_dead live classified expected_live",
+              rows[0].get("classification") == "expected_live")
+        check("detached controller_dead live terminal unknown",
+              rows[0].get("terminal_state") == "unknown")
+        check("detached controller_dead live --done -> 1",
+              S.done_code(rows[0]) == 1)
+
+        S.goalflight_ledger.identity_matches = lambda _record: (False, "dead")
+        dead_rows = S.goalflight_ledger.status_payload()["records"]
+        check("detached controller_dead dead worker classified worker_dead",
+              dead_rows[0].get("classification") == "worker_dead")
+        check("detached controller_dead dead worker terminal worker_dead",
+              dead_rows[0].get("terminal_state") == "worker_dead")
+    finally:
+        S.goalflight_ledger.read_records = orig_read_records
+        S.goalflight_ledger.identity_matches = orig_identity_matches
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tail = Path(tmp) / "detached-success.tail"
+        started = S.goalflight_ledger.utc_now()
+        tail.write_text("work finished\nCOMPLETE: detached ok\n", encoding="utf-8")
+        success_record = {
+            **detached_controller_dead,
+            "dispatch_id": "detached-success-controller-dead",
+            "stdout_path": str(tail),
+            "started_at": started,
+        }
+        orig_identity_matches = S.goalflight_ledger.identity_matches
+        try:
+            S.goalflight_ledger.identity_matches = lambda _record: (False, "dead")
+            success_row = {
+                **success_record,
+                "classification": S.goalflight_ledger.classify(success_record),
+                "terminal_state": "worker_dead",
+            }
+            reconciled = S._reconcile_output_tail_record(success_row)
+            check("detached controller_dead dead worker + COMPLETE tail -> complete",
+                  reconciled.get("classification") == "complete")
+            check("detached controller_dead reconciled --done -> 0",
+                  S.done_code(reconciled) == 0)
+        finally:
+            S.goalflight_ledger.identity_matches = orig_identity_matches
     timeout_summary = {
         "dispatch_id": "timeout-live",
         "classification": "idle_timeout",

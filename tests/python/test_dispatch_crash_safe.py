@@ -40,6 +40,23 @@ def _wait_for(predicate, timeout: float = 8.0, interval: float = 0.1) -> bool:
     return False
 
 
+def _process_exists(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def _dead_pid() -> int:
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait(timeout=5)
+    assert not _process_exists(proc.pid), f"pid still alive after wait: {proc.pid}"
+    return proc.pid
+
+
 def _run(
     worker_cmd: list[str],
     max_idle: str = "20",
@@ -281,6 +298,91 @@ def case_watcher_sigterm_flushes_non_running_status() -> None:
             worker.wait(timeout=5)
 
 
+def case_detached_watcher_ignores_dead_controller_pid() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        tail = tmp_path / "tail.txt"
+        status = tmp_path / "status.json"
+        tail.write_text("", encoding="utf-8")
+        dead_controller = _dead_pid()
+        worker = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(20)"], start_new_session=True)
+        watcher = subprocess.Popen(
+            [
+                sys.executable, str(WATCH),
+                "--pid", str(worker.pid),
+                "--tail", str(tail),
+                "--status-json", str(status),
+                "--poll-secs", "0.2",
+                "--max-idle-secs", "30",
+                "--controller-pid", str(dead_controller),
+                "--detached",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            start_new_session=True,
+        )
+        try:
+            assert _wait_for(
+                lambda: status.exists()
+                and json.loads(status.read_text(encoding="utf-8")).get("state") in {"running", "running_quiet"},
+                timeout=5,
+            ), status.read_text(encoding="utf-8") if status.exists() else "missing detached watcher status"
+            payload = json.loads(status.read_text(encoding="utf-8"))
+            assert payload.get("detached") is True, payload
+            assert payload.get("state") not in {"orphaned", "controller_dead"}, payload
+            assert watcher.poll() is None, "detached watcher exited on dead controller pid"
+        finally:
+            if watcher.poll() is None:
+                watcher.terminate()
+                watcher.wait(timeout=5)
+            if worker.poll() is None:
+                os.killpg(worker.pid, signal.SIGTERM)
+                worker.wait(timeout=5)
+
+
+def case_non_detached_watcher_dead_controller_remains_orphaned() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        tail = tmp_path / "tail.txt"
+        status = tmp_path / "status.json"
+        tail.write_text("", encoding="utf-8")
+        dead_controller = _dead_pid()
+        worker = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(20)"], start_new_session=True)
+        watcher = subprocess.Popen(
+            [
+                sys.executable, str(WATCH),
+                "--pid", str(worker.pid),
+                "--tail", str(tail),
+                "--status-json", str(status),
+                "--poll-secs", "0.2",
+                "--max-idle-secs", "30",
+                "--controller-pid", str(dead_controller),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            start_new_session=True,
+        )
+        try:
+            out, err = watcher.communicate(timeout=8)
+            assert watcher.returncode == 3, (watcher.returncode, out, err)
+            payload = json.loads(status.read_text(encoding="utf-8"))
+            assert payload.get("state") == "orphaned", payload
+            assert payload.get("reason") == "controller_dead", payload
+        finally:
+            if watcher.poll() is None:
+                watcher.terminate()
+                watcher.wait(timeout=5)
+            if worker.poll() is None:
+                os.killpg(worker.pid, signal.SIGTERM)
+                worker.wait(timeout=5)
+
+
 def main() -> None:
     case_crash_detected_promptly()
     case_finished_via_marker()
@@ -288,6 +390,8 @@ def main() -> None:
     case_dispatch_post_terminal_idle_returns_success()
     case_worker_and_watcher_survive_launcher_pgroup_sigterm()
     case_watcher_sigterm_flushes_non_running_status()
+    case_detached_watcher_ignores_dead_controller_pid()
+    case_non_detached_watcher_dead_controller_remains_orphaned()
     print("OK: goalflight_dispatch crash-safe tests pass")
 
 

@@ -1403,6 +1403,7 @@ def _record_ledger(args, *, project_root: Path, prompt_path: str | None, status_
                 status_path=str(status_json),
                 os_sandbox_json=json.dumps({"shape": "bash", "read_only": bool(args.read_only)}, sort_keys=True),
                 queue_launch_token=getattr(args, "queue_launch_token", None),
+                detached=bool(getattr(args, "launch_detached", False)),
                 state=state,
                 json=True,
             )
@@ -1442,6 +1443,8 @@ def _record_queued_ledger_fast(args, *, project_root: Path, prompt_path: str | N
         "started_at": now,
         "hostname": socket.gethostname(),
     }
+    if getattr(args, "launch_detached", False):
+        record["detached"] = True
     if getattr(args, "queue_launch_token", None):
         record["queue_launch_token"] = args.queue_launch_token
     with goalflight_ledger.StateLock():
@@ -3750,6 +3753,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         if watch_identity_token:
             watch_cmd += ["--worker-identity-json", json.dumps(watch_identity_token, sort_keys=True)]
+        if args.launch_detached:
+            watch_cmd += ["--detached"]
         if args.controller_pid:
             watch_cmd += ["--controller-pid", str(args.controller_pid)]
         if prompt_path:
@@ -3762,6 +3767,7 @@ def main(argv: list[str] | None = None) -> int:
                 "dispatch_id": args.dispatch_id,
                 "agent": args.agent,
                 "worker_pid": worker_pid,
+                "detached": bool(args.launch_detached),
                 "pgid": pgid,
                 "worker_alive": True,
                 "worker_identity": worker_identity_token,

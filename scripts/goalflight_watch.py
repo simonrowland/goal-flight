@@ -93,6 +93,12 @@ def _exit_code_for_state(state: str) -> int:
     return 1
 
 
+def _controller_dead_is_terminal(*, detached: bool) -> bool:
+    if detached:
+        return False
+    return True
+
+
 def _strip_marker_decoration(text: str) -> str:
     value = text.strip()
     while value.startswith("*") or value.startswith("`"):
@@ -510,6 +516,8 @@ def main() -> int:
     parser.add_argument("--cpu-epsilon", type=float, default=0.1)
     parser.add_argument("--pgid", type=int)
     parser.add_argument("--controller-pid", type=int)
+    parser.add_argument("--detached", action="store_true",
+                        help="Ignore launcher/controller pid liveness; worker pid identity is authoritative.")
     parser.add_argument("--worker-identity-json",
                         help="Process identity token captured at spawn; prevents PID-reuse false liveness.")
     parser.add_argument("--ignore-prompt-file",
@@ -537,6 +545,7 @@ def main() -> int:
             "dispatch_id": args.dispatch_id,
             "agent": args.agent,
             "worker_pid": args.pid,
+            "detached": bool(args.detached),
             "state": "blocked_windows_dispatch",
             "reason": goalflight_compat.windows_watcher_skip(),
             "tail_path": str(tail),
@@ -599,6 +608,7 @@ def main() -> int:
             "dispatch_id": args.dispatch_id,
             "agent": args.agent,
             "worker_pid": args.pid,
+            "detached": bool(args.detached),
             "pgid": current_pgid,
             "worker_alive": worker_is_alive,
             "worker_identity_reason": identity_reason,
@@ -663,6 +673,7 @@ def main() -> int:
             "dispatch_id": args.dispatch_id,
             "agent": args.agent,
             "worker_pid": args.pid,
+            "detached": bool(args.detached),
             "pgid": pgid,
             "worker_alive": worker_is_alive,
             "worker_identity_reason": identity_reason,
@@ -698,7 +709,11 @@ def main() -> int:
             exit_reason = terminal_reason
             write_payload(payload, reason=terminal_reason, terminal_write=True)
             break
-        if args.controller_pid and not alive(args.controller_pid):
+        if (
+            args.controller_pid
+            and not alive(args.controller_pid)
+            and _controller_dead_is_terminal(detached=bool(args.detached))
+        ):
             payload["state"] = "orphaned"
             exit_reason = "controller_dead"
             exit_code = 3

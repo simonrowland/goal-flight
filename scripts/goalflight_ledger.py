@@ -188,8 +188,27 @@ def identity_matches(record: dict) -> tuple[bool, str]:
     return True, "live"
 
 
+def _is_detached_controller_dead_record(record: dict) -> bool:
+    if not record.get("detached"):
+        return False
+    state = record.get("state")
+    reason = record.get("reason") or record.get("error")
+    return state == "controller_dead" or (state == "orphaned" and reason == "controller_dead")
+
+
 def classify(record: dict) -> str:
     state = record.get("state", "running")
+    if _is_detached_controller_dead_record(record):
+        ok, reason = identity_matches(record)
+        if ok:
+            return "expected_live"
+        if reason == "dead":
+            return "worker_dead"
+        if reason == "no_pid":
+            return "unknown_no_pid"
+        if reason == "identity_indeterminate":
+            return "identity_indeterminate"
+        return f"stale_{reason}"
     if goalflight_dispatch_states.is_terminal_state(state):
         return state
     if state in {"queued", "waiting_capacity"}:
@@ -378,6 +397,8 @@ def cmd_record(args: argparse.Namespace) -> int:
         "started_at": utc_now(),
         "hostname": socket.gethostname(),
     }
+    if getattr(args, "detached", False):
+        record["detached"] = True
     if getattr(args, "queue_launch_token", None):
         record["queue_launch_token"] = args.queue_launch_token
     with StateLock():
@@ -428,6 +449,18 @@ def status_payload() -> dict:
     records = read_records()
     rows = []
     for r in records:
+        classification = classify(r)
+        terminal_state = r.get("terminal_state") or terminal_state_for(
+            r.get("state"), r.get("reason") or r.get("error")
+        )
+        if _is_detached_controller_dead_record(r):
+            if classification == "expected_live" or classification in {
+                "unknown_no_pid",
+                "identity_indeterminate",
+            } or str(classification).startswith("stale_"):
+                terminal_state = "unknown"
+            elif classification == "worker_dead":
+                terminal_state = "worker_dead"
         row = {
             "dispatch_id": r.get("dispatch_id"),
             "prompt_id": r.get("prompt_id"),
@@ -437,8 +470,8 @@ def status_payload() -> dict:
             "account": r.get("account") or "unknown",
             "transport": r.get("transport"),
             "state": r.get("state"),
-            "classification": classify(r),
-            "terminal_state": r.get("terminal_state") or terminal_state_for(r.get("state"), r.get("reason") or r.get("error")),
+            "classification": classification,
+            "terminal_state": terminal_state,
             "elapsed_s": elapsed_seconds(r),
             "worker_still_alive": r.get("worker_still_alive"),
             "worker_pid": r.get("worker_pid"),
@@ -448,6 +481,7 @@ def status_payload() -> dict:
             "stdout_path": r.get("stdout_path"),
             "stderr_path": r.get("stderr_path"),
             "status_path": r.get("status_path"),
+            "detached": r.get("detached"),
             "os_sandbox": r.get("os_sandbox"),
             "started_at": r.get("started_at"),
             "ended_at": r.get("ended_at"),
@@ -691,6 +725,7 @@ def build_parser() -> argparse.ArgumentParser:
     rec.add_argument("--status-path")
     rec.add_argument("--os-sandbox-json")
     rec.add_argument("--state", default="running")
+    rec.add_argument("--detached", action="store_true")
     rec.add_argument("--json", action="store_true")
     rec.set_defaults(func=cmd_record)
 
