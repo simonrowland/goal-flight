@@ -73,16 +73,8 @@ def _combined_failure_text(*parts: object) -> str:
     return "\n".join(str(part) for part in parts if part not in (None, ""))
 
 
-def _rate_limit_signature_in_text(text: str) -> str | None:
-    lowered = text.lower()
-    for pattern in goalflight_rate_pressure.RATE_LIMIT_PATTERNS:
-        if pattern in lowered:
-            return pattern
-    return None
-
-
 def _review_rate_limit_signature(text: str) -> str | None:
-    signature = _rate_limit_signature_in_text(text)
+    signature = goalflight_rate_pressure.rate_limit_signature_in_text(text)
     if not signature:
         return None
     if not goalflight_rate_pressure.detect_rate_limit_signature({"state": "failed", "error": text}, None):

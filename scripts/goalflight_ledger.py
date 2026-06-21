@@ -212,10 +212,7 @@ def classify(record: dict) -> str:
 
 
 def record_path(dispatch_id: str) -> Path:
-    safe = "".join(ch if ch.isalnum() or ch in "._-" else "-" for ch in dispatch_id)
-    if safe != dispatch_id:
-        safe = f"{safe}-{hashlib.sha256(dispatch_id.encode()).hexdigest()[:8]}"
-    return runs_dir() / f"{safe}.json"
+    return runs_dir() / f"{goalflight_compat.safe_dispatch_filename(dispatch_id)}.json"
 
 
 def write_record(record: dict) -> Path:

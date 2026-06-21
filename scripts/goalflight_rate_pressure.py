@@ -169,6 +169,14 @@ RATE_LIMIT_HTTP_STATUS_ANCHORS: dict[str, tuple[str, ...]] = {
     ),
 }
 
+
+def rate_limit_signature_in_text(text: str) -> str | None:
+    lowered = text.lower()
+    for pattern in RATE_LIMIT_PATTERNS:
+        if pattern in lowered:
+            return pattern
+    return None
+
 # Substring patterns indicating model-specific capacity, not account-wide quota.
 # These reduce only the label that produced the signal. Bare "at capacity" is
 # excluded — unrelated prose can mention capacity without a model-scoped signal.

@@ -5,9 +5,10 @@ from __future__ import annotations
 
 import fnmatch
 import json
-import shlex
 from pathlib import Path
 from typing import Any, Iterable
+
+import goalflight_compat
 
 
 DEFAULT_FORBIDDEN_ARG_PATTERNS = (
@@ -57,16 +58,12 @@ def _load_adapter(adapter: Any) -> Any:
     return adapter
 
 
+def tokenize_args(values: Iterable[str]) -> list[str]:
+    return goalflight_compat.tokenize_args(values)
+
+
 def _tokenize_args(values: Iterable[str]) -> list[str]:
-    tokens: list[str] = []
-    for value in values:
-        if not isinstance(value, str):
-            continue
-        try:
-            tokens.extend(shlex.split(value))
-        except ValueError:
-            tokens.append(value)
-    return tokens
+    return tokenize_args(values)
 
 
 def find_forbidden_args(
@@ -300,5 +297,6 @@ __all__ = [
     "find_forbidden_args",
     "manifest_forbidden_patterns",
     "manifest_gate_contract",
+    "tokenize_args",
     "validate_adapter_gate",
 ]

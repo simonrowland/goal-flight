@@ -41,7 +41,6 @@ try:
     import fcntl
 except ImportError:  # pragma: no cover - Windows fallback path
     fcntl = None
-import hashlib
 import io
 import json
 import os
@@ -315,14 +314,6 @@ def _read_tail_excerpt(path: Path, max_bytes: int = RATE_LIMIT_TAIL_BYTES) -> st
         return ""
 
 
-def _rate_limit_signature_in_text(text: str) -> str | None:
-    lowered = text.lower()
-    for pattern in goalflight_rate_pressure.RATE_LIMIT_PATTERNS:
-        if pattern in lowered:
-            return pattern
-    return None
-
-
 def _worker_dead_rate_limit_reason(state: str | None, reason: str | None, tail: Path) -> object:
     if state != "worker_dead":
         return reason
@@ -331,7 +322,7 @@ def _worker_dead_rate_limit_reason(state: str | None, reason: str | None, tail: 
         return reason
     if not goalflight_rate_pressure.detect_rate_limit_signature({"state": "worker_dead", "error": excerpt}, None):
         return reason
-    signature = _rate_limit_signature_in_text(excerpt)
+    signature = goalflight_rate_pressure.rate_limit_signature_in_text(excerpt)
     return {
         "message": "dispatch_worker_rate_limited",
         "rate_limit_signature": signature or "unknown",
@@ -589,10 +580,7 @@ def _dispatch_queue_dir() -> Path:
 
 
 def _safe_dispatch_filename(dispatch_id: str) -> str:
-    safe = "".join(ch if ch.isalnum() or ch in "._-" else "-" for ch in dispatch_id)
-    if safe != dispatch_id:
-        safe = f"{safe}-{hashlib.sha256(dispatch_id.encode()).hexdigest()[:8]}"
-    return safe
+    return goalflight_compat.safe_dispatch_filename(dispatch_id)
 
 
 def _queue_entry_path(dispatch_id: str, *, queue_dir: Path | None = None) -> Path:

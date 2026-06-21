@@ -27,6 +27,7 @@ The Windows branches use stdlib ``ctypes`` / ``msvcrt`` only -- zero new wheels.
 from __future__ import annotations
 
 import errno
+import hashlib
 import json
 import logging
 import os
@@ -36,6 +37,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -68,12 +70,34 @@ __all__ = [
     "kill_pid",
     "default_state_dir",
     "temp_base",
+    "nearest_existing_path",
+    "safe_dispatch_filename",
+    "tokenize_args",
 ]
 
 
 log = logging.getLogger("goal-flight.compat")
 
 _WSL_WINDOWS_FS_TYPES = {"drvfs", "9p", "v9fs"}
+
+
+def safe_dispatch_filename(dispatch_id: str) -> str:
+    safe = "".join(ch if ch.isalnum() or ch in "._-" else "-" for ch in dispatch_id)
+    if safe != dispatch_id:
+        safe = f"{safe}-{hashlib.sha256(dispatch_id.encode()).hexdigest()[:8]}"
+    return safe
+
+
+def tokenize_args(values: Iterable[str]) -> list[str]:
+    tokens: list[str] = []
+    for value in values:
+        if not isinstance(value, str):
+            continue
+        try:
+            tokens.extend(shlex.split(value))
+        except ValueError:
+            tokens.append(value)
+    return tokens
 
 
 def is_windows() -> bool:
@@ -122,7 +146,7 @@ def _syntactic_wsl_drive_path(path: Path) -> bool:
     )
 
 
-def _nearest_existing_path(path: Path) -> Path | None:
+def nearest_existing_path(path: Path) -> Path | None:
     current = path.expanduser()
     while True:
         if current.exists():
@@ -130,6 +154,10 @@ def _nearest_existing_path(path: Path) -> Path | None:
         if current.parent == current:
             return None
         current = current.parent
+
+
+def _nearest_existing_path(path: Path) -> Path | None:
+    return nearest_existing_path(path)
 
 
 def _decode_mountinfo_path(value: str) -> str:

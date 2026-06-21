@@ -1622,14 +1622,7 @@ def wsl_version_info() -> dict:
     }
 
 
-def _nearest_existing_path(path: Path) -> Path | None:
-    current = path.expanduser()
-    while True:
-        if current.exists():
-            return current
-        if current.parent == current:
-            return None
-        current = current.parent
+_nearest_existing_path = goalflight_compat.nearest_existing_path
 
 
 def filesystem_type(path: Path) -> dict:

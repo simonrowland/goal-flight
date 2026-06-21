@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import json
 import re
-import shlex
 import sys
 from pathlib import Path
 from typing import Any, Iterable
@@ -18,6 +17,7 @@ if str(SCRIPT_DIR) not in sys.path:
 from goalflight_adapter_gate import (  # noqa: E402
     find_forbidden_args,
     manifest_forbidden_patterns,
+    tokenize_args,
 )
 
 
@@ -243,19 +243,11 @@ def validate_against_schema(
 
 
 def _split_tokens(values: Iterable[str]) -> list[str]:
-    tokens: list[str] = []
-    for value in values:
-        if not isinstance(value, str):
-            continue
-        try:
-            tokens.extend(shlex.split(value))
-        except ValueError:
-            tokens.append(value)
-    return tokens
+    return tokenize_args(values)
 
 
 def _looks_like_update_or_registry_probe(argv: list[str]) -> bool:
-    tokens = [token.lower() for token in _split_tokens(argv)]
+    tokens = [token.lower() for token in tokenize_args(argv)]
     if not tokens:
         return False
     if any(token in {"update", "upgrade", "install"} for token in tokens):
