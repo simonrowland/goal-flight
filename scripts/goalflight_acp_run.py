@@ -2138,10 +2138,16 @@ async def _run_acp_dispatch_impl(
                 and outstanding_count == 0
                 and quiet_for_s >= cfg.max_quiet_s
                 and pid_alive
+                and (cpu_pct is None or cpu_pct <= cfg.cpu_epsilon)
             ):
                 await mark_heartbeat_terminal(
                     "wedged",
-                    {"code": -1, "message": "max_quiet_s"},
+                    {
+                        "code": -1,
+                        "message": "max_quiet_s",
+                        "quiet_for_s": round(quiet_for_s, 3),
+                        "cpu_pct": cpu_pct,
+                    },
                 )
                 await conn.kill()
                 return

@@ -44,6 +44,10 @@ _QUEUE_PENDING_NO_DRAINER = "queue_pending_no_drainer"
 # confirmed-dead worker before --wait resolves it to a terminal worker_dead
 # verdict (instead of polling to the wait-timeout). >= 2 default poll intervals.
 _WAIT_CRASH_GRACE_S = 90.0
+_WAIT_STALE_GRACE_S = 600.0
+_WAIT_HEARTBEAT_S = 1200.0
+_WAIT_CPU_EPSILON = 0.1
+_WAIT_TAIL_COUNT_BYTES = 128 * 1024
 
 
 def _has_recorded_worker_identity(record: dict) -> bool:
@@ -509,27 +513,260 @@ def _wait_worker_confirmed_dead(record: dict | None) -> bool:
     return True
 
 
+def _wait_worker_confirmed_alive(record: dict | None) -> bool:
+    if record is None:
+        return False
+    if _needs_liveness_recheck(record):
+        return _rechecked_worker_alive(record)
+    if _has_recorded_worker_identity(record):
+        ok, _ = goalflight_ledger.identity_matches(record)
+        return ok
+    pid = record.get("worker_pid")
+    if pid:
+        try:
+            return goalflight_compat.pid_alive(int(pid))
+        except (TypeError, ValueError):
+            return False
+    return False
+
+
+def _wait_record_pid(record: dict | None) -> int | None:
+    if record is None:
+        return None
+    pid = record.get("worker_pid")
+    if not pid:
+        return None
+    try:
+        return int(pid)
+    except (TypeError, ValueError):
+        return None
+
+
+def _wait_process_cpu_pct(record: dict | None) -> float | None:
+    pid = _wait_record_pid(record)
+    if pid is None:
+        return None
+    try:
+        proc = subprocess.run(
+            ["ps", "-o", "%cpu=", "-p", str(pid)],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=1.0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    for part in proc.stdout.split():
+        try:
+            return float(part)
+        except ValueError:
+            continue
+    return None
+
+
+def _wait_tail_stat(record: dict | None) -> dict:
+    path = _tail_path_from_record(record or {})
+    detail = {"path": None, "size": None, "mtime": None}
+    if path is None:
+        return detail
+    detail["path"] = str(path)
+    try:
+        st = path.stat()
+    except OSError:
+        return detail
+    detail["size"] = int(st.st_size)
+    detail["mtime"] = float(st.st_mtime)
+    return detail
+
+
+def _wait_tail_activity_counts(tail_path: str | None) -> dict:
+    counts = {"json_append_count": None, "tool_use_count": None}
+    if not tail_path:
+        return counts
+    path = Path(tail_path)
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as fh:
+            if size > _WAIT_TAIL_COUNT_BYTES:
+                fh.seek(-_WAIT_TAIL_COUNT_BYTES, 2)
+            data = fh.read().decode("utf-8", errors="replace")
+    except OSError:
+        return counts
+    json_count = 0
+    tool_count = 0
+    for line in data.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        parsed = None
+        if stripped.startswith("{") and stripped.endswith("}"):
+            try:
+                parsed = json.loads(stripped)
+                json_count += 1
+            except json.JSONDecodeError:
+                parsed = None
+        haystack = stripped
+        if isinstance(parsed, dict):
+            haystack = json.dumps(parsed, sort_keys=True)
+        if "tool_use" in haystack or "tool_call" in haystack or "toolCallId" in haystack:
+            tool_count += 1
+    counts["json_append_count"] = json_count
+    counts["tool_use_count"] = tool_count
+    return counts
+
+
+def _wait_progress_detail(
+    dispatch_id: str,
+    record: dict | None,
+    *,
+    now: float,
+    progress_state: dict[str, dict],
+    cpu_epsilon: float = _WAIT_CPU_EPSILON,
+    worker_alive: bool | None = None,
+) -> dict:
+    state = progress_state.setdefault(dispatch_id, {})
+    tail = _wait_tail_stat(record)
+    size = tail.get("size")
+    previous_size = state.get("tail_size")
+    tail_growth_bytes: int | None = None
+    tail_changed = False
+    if isinstance(size, int):
+        if isinstance(previous_size, int):
+            tail_growth_bytes = max(0, size - previous_size)
+            tail_changed = size != previous_size
+        else:
+            tail_growth_bytes = 0
+            tail_changed = True
+        state["tail_size"] = size
+        if tail_changed or "last_growth_mono" not in state:
+            state["last_growth_mono"] = now
+    else:
+        state.pop("tail_size", None)
+        state["last_growth_mono"] = now
+
+    cpu_pct = _wait_process_cpu_pct(record)
+    cpu_busy = bool(cpu_pct is not None and cpu_pct > cpu_epsilon)
+    if worker_alive is None:
+        worker_alive = _wait_worker_confirmed_alive(record)
+    pid = _wait_record_pid(record)
+    counts = _wait_tail_activity_counts(tail.get("path"))
+    last_growth = float(state.get("last_growth_mono", now))
+    mtime = tail.get("mtime")
+    tail_append_age_s = None
+    if isinstance(mtime, float):
+        tail_append_age_s = max(0.0, time.time() - mtime)
+    return {
+        "tail_path": tail.get("path"),
+        "tail_size": size,
+        "tail_growth_bytes": tail_growth_bytes,
+        "tail_changed": tail_changed,
+        "last_growth_age_s": max(0.0, now - last_growth),
+        "tail_append_age_s": tail_append_age_s,
+        "worker_pid": pid,
+        "worker_alive": worker_alive,
+        "cpu_pct": cpu_pct,
+        "cpu_busy": cpu_busy,
+        **counts,
+    }
+
+
+def _fmt_wait_bytes(value: int | None) -> str:
+    if value is None:
+        return "+?B"
+    if value < 1024:
+        return f"+{value}B"
+    return f"+{value / 1024.0:.1f}KB"
+
+
+def _fmt_wait_age(value: float | None) -> str:
+    if value is None:
+        return "unknown"
+    if value < 60:
+        return f"{value:.0f}s"
+    if value < 3600:
+        return f"{value / 60.0:.1f}m"
+    return f"{value / 3600.0:.1f}h"
+
+
+def _format_wait_heartbeat(row: dict) -> str:
+    progress = row.get("progress") if isinstance(row.get("progress"), dict) else {}
+    cpu = progress.get("cpu_pct")
+    cpu_text = "cpu ?%" if cpu is None else f"cpu {float(cpu):.1f}%"
+    pid = progress.get("worker_pid")
+    pid_text = "pid ?" if pid is None else f"pid {pid}"
+    tool_count = progress.get("tool_use_count")
+    json_count = progress.get("json_append_count")
+    activity = []
+    if tool_count is not None:
+        activity.append(f"tool-use {tool_count}")
+    if json_count is not None:
+        activity.append(f"json {json_count}")
+    activity_text = "" if not activity else ", " + "/".join(activity)
+    suffix = ""
+    if row.get("state") == "worker_stalled":
+        suffix = " -> STALE (resolving)"
+    return (
+        f"{row['dispatch_id']}: running, "
+        f"{_fmt_wait_bytes(progress.get('tail_growth_bytes'))} tail since last poll, "
+        f"last append {_fmt_wait_age(progress.get('tail_append_age_s'))} ago, "
+        f"{pid_text}, {cpu_text}{activity_text}{suffix}"
+    )
+
+
 def _wait_snapshot(
     payload: dict,
     wait_ids: list[str],
     *,
     dead_since: dict[str, float] | None = None,
+    stalled_since: dict[str, float] | None = None,
+    progress_state: dict[str, dict] | None = None,
     now: float | None = None,
     grace: float = _WAIT_CRASH_GRACE_S,
+    stale_grace: float = _WAIT_STALE_GRACE_S,
+    cpu_epsilon: float = _WAIT_CPU_EPSILON,
 ) -> list[dict]:
     if dead_since is None:
         dead_since = {}
+    if stalled_since is None:
+        stalled_since = {}
+    if progress_state is None:
+        progress_state = {}
     if now is None:
         now = time.monotonic()
     rows: list[dict] = []
     for dispatch_id in wait_ids:
         record = find_record(payload, dispatch_id)
-        code = 2 if record is None else done_code(record)
+        worker_alive: bool | None = None
+        if record is None:
+            code = 2
+        elif _needs_liveness_recheck(record):
+            worker_alive = _rechecked_worker_alive(record)
+            code = 1 if worker_alive else 0
+        else:
+            code = done_code(record)
         terminal = code == 0
         state = _terminal_state(record, code=code)
+        confirmed_dead = False
+        if code == 2:
+            confirmed_dead = _wait_worker_confirmed_dead(record)
+            worker_alive = not confirmed_dead
+        progress = (
+            {}
+            if terminal
+            else _wait_progress_detail(
+                dispatch_id,
+                record,
+                now=now,
+                progress_state=progress_state,
+                cpu_epsilon=cpu_epsilon,
+                worker_alive=worker_alive,
+            )
+        )
         if terminal or code == 1:
             dead_since.pop(dispatch_id, None)
-        elif code == 2 and _wait_worker_confirmed_dead(record):
+        elif code == 2 and confirmed_dead:
             first = dead_since.setdefault(dispatch_id, now)
             if now - first >= grace:
                 terminal = True
@@ -538,6 +775,27 @@ def _wait_snapshot(
                 state = "worker_dead_pending"
         else:
             dead_since.pop(dispatch_id, None)
+        if terminal or state.startswith("worker_dead"):
+            stalled_since.pop(dispatch_id, None)
+        else:
+            tail_known = isinstance(progress.get("tail_size"), int)
+            tail_grew = bool(
+                isinstance(progress.get("tail_growth_bytes"), int)
+                and progress.get("tail_growth_bytes") > 0
+            )
+            tail_changed = bool(progress.get("tail_changed"))
+            cpu_busy = bool(progress.get("cpu_busy"))
+            worker_alive = bool(progress.get("worker_alive"))
+            if tail_grew or tail_changed or cpu_busy or not worker_alive or not tail_known:
+                stalled_since.pop(dispatch_id, None)
+            else:
+                first = stalled_since.setdefault(
+                    dispatch_id,
+                    max(0.0, now - float(progress.get("last_growth_age_s") or 0.0)),
+                )
+                if now - first >= stale_grace:
+                    terminal = True
+                    state = "worker_stalled"
         rows.append(
             {
                 "dispatch_id": dispatch_id,
@@ -545,6 +803,7 @@ def _wait_snapshot(
                 "terminal": terminal,
                 "state": state,
                 "status_path": None if record is None else record.get("status_path"),
+                "progress": progress,
             }
         )
     return rows
@@ -557,6 +816,8 @@ def wait_for_dispatches(
     timeout_s: float | None,
     poll_s: float,
     crash_grace_s: float | None = None,
+    stale_grace_s: float | None = None,
+    heartbeat_s: float | None = None,
     json_output: bool = False,
 ) -> int:
     if not wait_ids:
@@ -566,14 +827,39 @@ def wait_for_dispatches(
     start = time.monotonic()
     poll_s = max(0.05, poll_s)
     grace = _WAIT_CRASH_GRACE_S if crash_grace_s is None else max(0.0, crash_grace_s)
+    stale_grace = _WAIT_STALE_GRACE_S if stale_grace_s is None else max(0.0, stale_grace_s)
+    heartbeat = _WAIT_HEARTBEAT_S if heartbeat_s is None else max(0.0, heartbeat_s)
     # Per-id monotonic timestamp of when a row first became ambiguous-and-dead.
     # The grace window means a transient post-submit blip does not flip to
     # worker_dead, but a genuine crash/premature-exit resolves in bounded time.
     dead_since: dict[str, float] = {}
+    # Per-id monotonic timestamp of when an alive row last had no progress
+    # evidence. Cleared by tail growth/change, CPU activity, terminal, or death.
+    stalled_since: dict[str, float] = {}
+    progress_state: dict[str, dict] = {}
+    heartbeat_since: dict[str, float] = {dispatch_id: start for dispatch_id in wait_ids}
     while True:
         now = time.monotonic()
         payload = scope_payload(status_payload(), project_root)
-        rows = _wait_snapshot(payload, wait_ids, dead_since=dead_since, now=now, grace=grace)
+        rows = _wait_snapshot(
+            payload,
+            wait_ids,
+            dead_since=dead_since,
+            stalled_since=stalled_since,
+            progress_state=progress_state,
+            now=now,
+            grace=grace,
+            stale_grace=stale_grace,
+        )
+        if not json_output:
+            for row in rows:
+                if row["terminal"]:
+                    heartbeat_since.pop(row["dispatch_id"], None)
+                    continue
+                last = heartbeat_since.setdefault(row["dispatch_id"], start)
+                if now - last >= heartbeat:
+                    print(_format_wait_heartbeat(row), flush=True)
+                    heartbeat_since[row["dispatch_id"]] = now
         if all(row["terminal"] for row in rows):
             if json_output:
                 print(json.dumps({"ok": True, "dispatches": rows}, sort_keys=True))
@@ -700,6 +986,26 @@ def main(argv: list[str] | None = None) -> int:
             f"--wait-timeout (default {int(_WAIT_CRASH_GRACE_S)})"
         ),
     )
+    parser.add_argument(
+        "--stale-grace-s",
+        dest="stale_grace_s",
+        type=float,
+        default=None,
+        help=(
+            "seconds an alive dispatch with no tail growth and no CPU activity may "
+            f"persist before --wait resolves it to worker_stalled (default {int(_WAIT_STALE_GRACE_S)})"
+        ),
+    )
+    parser.add_argument(
+        "--heartbeat-s",
+        dest="heartbeat_s",
+        type=float,
+        default=None,
+        help=(
+            "seconds between --wait progress heartbeats for non-terminal dispatches "
+            f"(default {int(_WAIT_HEARTBEAT_S)})"
+        ),
+    )
     parser.add_argument("--limit", type=int, default=20)
     args = parser.parse_args(argv)
 
@@ -717,6 +1023,8 @@ def main(argv: list[str] | None = None) -> int:
             timeout_s=args.wait_timeout,
             poll_s=args.poll_s,
             crash_grace_s=args.crash_grace_s,
+            stale_grace_s=args.stale_grace_s,
+            heartbeat_s=args.heartbeat_s,
             json_output=args.json,
         )
 
