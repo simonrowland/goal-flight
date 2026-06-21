@@ -6,6 +6,78 @@ incremented when meaningful skill behaviour changes.
 
 ## [Unreleased]
 
+## [1.0.9] — 2026-06-20
+
+Wait-reliability + correctness + architecture release. Makes `--wait` trustworthy
+and bounded so a controller (or an overnight loop) never hangs on a dead or wedged
+worker; fixes a completed-worker false-death class; closes the verified
+dispatch/fleet spine blockers from the bug-sweep dogfood; and consolidates
+duplicated vocabulary / path / env logic with no behaviour change.
+
+### Added
+
+- **`--wait` bounded-on-crash + staleness + heartbeat.** `goalflight_status.py
+  --wait` now resolves a crashed/exited worker to a terminal `worker_dead` after
+  `--crash-grace-s` (default 90s), and an alive-but-wedged worker (frozen tail +
+  confirmed-idle CPU) to `worker_stalled` after `--stale-grace-s`, instead of
+  polling to the wait-timeout — so the call always exits and the caller is
+  re-invoked rather than hanging. Adds a progress heartbeat (`--heartbeat-s`:
+  last-append age, tail growth, CPU%) for long waits. A live / identity-matching
+  worker whose tail is still growing or whose CPU is non-trivial is never resolved
+  (the genuinely-working guard). (#22, #24)
+
+### Fixed
+
+- **Reconcile false-death when the terminal marker is not the last line (D022).**
+  A worker that emits `READY:`/`COMPLETE:` followed by a trailing TL;DR or summary
+  was reported `worker_dead`. Status reconcile now uses the watcher's whole-tail
+  reconciliation scan (skips code fences, diff hunks, and prompt echoes, takes the
+  last valid marker) instead of a last-line-only check.
+- **Blank path env vars no longer resolve to the working directory (D019).** A
+  set-but-blank `GOALFLIGHT_STATE_DIR` / `GOALFLIGHT_FLEET_DIR` /
+  `GOALFLIGHT_MESSAGES_DIR` returned `""`, and `Path("")` is the cwd, so state
+  scattered across modules. Shared `goalflight_compat.resolve_state_dir()` /
+  `resolve_env_path()` (strip-blank, resolved at call time) is now used everywhere.
+- **Only CONFIRMED-idle CPU kills or stalls a worker (#27).** An unmeasurable CPU
+  sample (`None`, e.g. a transient `ps` failure) no longer counts as idle in the
+  watcher, the ACP quiet-kill, or the `--wait` stall path — one shared
+  `goalflight_liveness.cpu_confirmed_idle()` predicate; the time / tail-growth gate
+  stays primary, so a transient probe failure can't terminate a healthy worker.
+- **Dispatch claim/recovery, rate-pressure, and remote-fleet spine.** Hardened the
+  durable queue claim/recovery lifecycle (D001–D006); anchored rate-limit pattern
+  matching and ordered account-rate before model-capacity (D012); hardened the
+  remote-dispatch fleet path including a python-only interpreter allowlist
+  (D013–D018).
+
+### Changed
+
+- **Single source of truth for terminal states + markers (DRY).** The terminal-state
+  and terminal-marker vocabularies were duplicated across modules and had diverged
+  into two latent bugs (states not counted terminal in one consumer; `FAILED`/`READY`
+  missing from a marker set). Consolidated into `goalflight_dispatch_states` and
+  `goalflight_watch`, with every consumer routed through them.
+- **Architecture: shared leaf helpers + broken import cycles.** Extracted the
+  duplicated filename-sanitizer / tokenizer / nearest-path / rate-signature helpers;
+  split the fleet store/locks out of the fleet CLI; broke the
+  `capacity ↔ rate_pressure` and `dispatch ↔ acp_run` import cycles via leaf modules.
+  Behaviour-preserving structural change.
+
+### Tests
+
+- Poison-pair coverage for the wait primitive (crash → `worker_dead`, wedge →
+  `worker_stalled`, growing-tail never-stall, heartbeat), the reconcile false-death,
+  env-path resolution, the terminal vocabulary, and the drain-replay argv +
+  release-stale liveness gates (D020).
+
+## [1.0.8] — 2026-06-19
+
+Dispatch-reliability + bug-sweep release. Fixes the worker-death root cause
+(detached bash-tail workers killed/reclaimed by cleanup_ghosts/release-stale) and
+the completed-but-reported-failed false-fail (prefixed terminal markers); adds
+drain liveness (no-drainer warning + opportunistic drain-on-submit) and
+priority-ordered draining; ships the lane-fill bug-sweep workflow as a
+discoverable `/goal-flight bug-sweep` command + protocol.
+
 ### Documentation
 
 - **Operator recipe for `cooldown` — pause a vendor until its limit resets.**
@@ -75,15 +147,6 @@ incremented when meaningful skill behaviour changes.
   prefix and matches the terminal marker **only outside a real `@@` diff hunk** (a
   `+READY:` genuinely quoted inside a code diff stays non-terminal); live last-line
   detection and the marker regex are unchanged.
-
-## [1.0.8] — 2026-06-19
-
-Dispatch-reliability + bug-sweep release. Fixes the worker-death root cause
-(detached bash-tail workers killed/reclaimed by cleanup_ghosts/release-stale) and
-the completed-but-reported-failed false-fail (prefixed terminal markers); adds
-drain liveness (no-drainer warning + opportunistic drain-on-submit) and
-priority-ordered draining; ships the lane-fill bug-sweep workflow as a
-discoverable `/goal-flight bug-sweep` command + protocol.
 
 ## [1.0.7] — 2026-06-17
 
