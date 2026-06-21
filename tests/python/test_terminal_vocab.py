@@ -11,9 +11,11 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from acp_runner import TERMINAL_MARKERS as ACP_TERMINAL_MARKERS, extract_markers  # noqa: E402
+import goalflight_acp_run  # noqa: E402
 import goalflight_capacity  # noqa: E402
 import goalflight_chunk_summary as chunk_summary  # noqa: E402
 import goalflight_dispatch_states as dispatch_states  # noqa: E402
+import goalflight_fleet_reconcile as fleet_reconcile  # noqa: E402
 import goalflight_fleet_mirror as fleet_mirror  # noqa: E402
 import goalflight_fleet_status as fleet_status  # noqa: E402
 import goalflight_ledger  # noqa: E402
@@ -96,8 +98,61 @@ def test_terminal_state_poison_pairs() -> None:
 
 
 def test_terminal_state_shared_sets_cover_lease_pruning() -> None:
-    assert_true("lease terminal includes canonical inconclusive", "inconclusive_no_final" in goalflight_capacity.TERMINAL_LEASE_STATES)
+    expanded_states = (
+        "released",
+        "blocked_capacity",
+        "blocked_session_limit",
+        "inconclusive_no_final",
+        "orphaned",
+        "superseded",
+    )
+    old = "2000-01-01T00:00:00+00:00"
+    data = {
+        "schema": "goalflight.capacity.v1",
+        "machine_id": "test",
+        "leases": {
+            state: {"lease_id": state, "state": state, "released_at": old}
+            for state in expanded_states
+        },
+        "cooldowns": {},
+    }
+
+    for state in expanded_states:
+        assert_true(
+            f"lease terminal includes {state}",
+            state in goalflight_capacity.TERMINAL_LEASE_STATES,
+        )
+    goalflight_capacity.prune_state(data)
+    assert_eq("expanded terminal leases pruned", data["leases"], {})
     assert_true("lease-only legacy state preserved", "result_too_large" in goalflight_capacity.TERMINAL_LEASE_STATES)
+
+
+def test_terminal_state_for_preserves_specific_failures() -> None:
+    for state in ("orphaned", "superseded", "inconclusive_no_final"):
+        assert_eq(
+            f"{state} terminal_state_for specificity",
+            dispatch_states.terminal_state_for(state),
+            state,
+        )
+        assert_eq(
+            f"{state} ledger terminal_state_for specificity",
+            goalflight_ledger.terminal_state_for(state),
+            state,
+        )
+
+
+def test_fleet_reconcile_pre_status_uses_shared_failure_states() -> None:
+    for state in (
+        "blocked_capacity",
+        "blocked_session_limit",
+        "inconclusive_no_final",
+        "orphaned",
+        "superseded",
+    ):
+        assert_true(
+            f"{state} pre-status failure",
+            state in fleet_reconcile.PRE_STATUS_FAILED_ROW_STATES,
+        )
 
 
 def test_terminal_marker_poison_pairs() -> None:
@@ -128,6 +183,17 @@ def test_terminal_marker_poison_pairs() -> None:
     assert_true("READY success marker", "READY" in goalflight_watch.SUCCESS_TERMINAL_MARKERS)
     assert_true("FAILED blocking marker", "FAILED" in goalflight_watch.BLOCKING_TERMINAL_MARKERS)
     assert_true("ACP terminal markers share watcher set", ACP_TERMINAL_MARKERS is goalflight_watch.TERMINAL_MARKERS)
+    assert_true("ACP turn marker uses READY", goalflight_acp_run._terminal_turn_marker({"READY": ["path"]}))
+    assert_true("ACP turn marker uses FAILED", goalflight_acp_run._terminal_turn_marker({"FAILED": ["missing"]}))
+    assert_true("ACP success marker uses READY", goalflight_acp_run._successful_terminal_marker({"READY": ["path"]}))
+    assert_true(
+        "ACP action marker uses FAILED",
+        goalflight_acp_run._state_after_actionable_terminal_markers(
+            "complete",
+            {"FAILED": ["missing"]},
+        )
+        == "blocked",
+    )
 
     assert_eq(
         "READY chunk summary complete",
@@ -150,6 +216,8 @@ def test_terminal_marker_poison_pairs() -> None:
 def main() -> None:
     test_terminal_state_poison_pairs()
     test_terminal_state_shared_sets_cover_lease_pruning()
+    test_terminal_state_for_preserves_specific_failures()
+    test_fleet_reconcile_pre_status_uses_shared_failure_states()
     test_terminal_marker_poison_pairs()
     print("OK: terminal vocabulary poison-pair tests pass")
 
