@@ -44,6 +44,8 @@ import uuid
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 import goalflight_compat  # noqa: E402
+import goalflight_dispatch_paths  # noqa: E402
+import goalflight_steer_mailbox  # noqa: E402
 
 DEFAULT_REMOTE_TURN_SILENCE_S = 1200.0
 DEFAULT_REMOTE_TURN_CANCEL_GRACE_S = 15.0
@@ -414,9 +416,7 @@ class _SigtermCancelBridge:
 
 
 def _dispatch_base_dir() -> Path:
-    import goalflight_dispatch
-
-    return goalflight_dispatch._dispatch_base_dir()
+    return goalflight_dispatch_paths.dispatch_base_dir()
 
 
 def _default_status_json_path(dispatch_id: str) -> Path:
@@ -569,9 +569,7 @@ def _resolve_steer_file(cfg: argparse.Namespace, dispatch_id: str) -> tuple[Path
 
 
 def _read_steer_entries(path: Path) -> list[dict]:
-    import goalflight_dispatch
-
-    return goalflight_dispatch._read_steer_entries(path)
+    return goalflight_steer_mailbox.read_steer_entries(path)
 
 
 def _steer_ack_seqs(markers: dict[str, list[str]]) -> set[int]:

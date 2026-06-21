@@ -56,7 +56,9 @@ from pathlib import Path
 
 import goalflight_compat
 import goalflight_capacity
+import goalflight_dispatch_paths
 import goalflight_dispatch_states
+import goalflight_steer_mailbox
 import goalflight_ledger
 import goalflight_rate_pressure
 from goalflight_liveness import active_monotonic, process_group_id, write_status
@@ -568,23 +570,23 @@ def _project_root(args) -> Path:
 
 
 def _state_dir() -> Path:
-    return goalflight_compat.resolve_state_dir()
+    return goalflight_dispatch_paths.state_dir()
 
 
 def _dispatch_base_dir() -> Path:
-    return _state_dir() / "dispatch"
+    return goalflight_dispatch_paths.dispatch_base_dir()
 
 
 def _dispatch_queue_dir() -> Path:
-    return _state_dir() / "dispatch-queue"
+    return goalflight_dispatch_paths.dispatch_queue_dir()
 
 
 def _safe_dispatch_filename(dispatch_id: str) -> str:
-    return goalflight_compat.safe_dispatch_filename(dispatch_id)
+    return goalflight_dispatch_paths.safe_dispatch_filename(dispatch_id)
 
 
 def _queue_entry_path(dispatch_id: str, *, queue_dir: Path | None = None) -> Path:
-    return (queue_dir or _dispatch_queue_dir()) / f"{_safe_dispatch_filename(dispatch_id)}.json"
+    return goalflight_dispatch_paths.queue_entry_path(dispatch_id, queue_dir=queue_dir)
 
 
 def _write_json_atomic(path: Path, payload: dict) -> None:
@@ -719,7 +721,7 @@ def _print_status_reminder(
 
 
 def _steer_file(dispatch_id: str) -> Path:
-    return _dispatch_base_dir() / f"{dispatch_id}.steer.jsonl"
+    return goalflight_dispatch_paths.steer_file(dispatch_id)
 
 
 def _raw_worker_args(args) -> list[str]:
@@ -1054,116 +1056,23 @@ def _worker_liveness_warning(record: dict) -> str | None:
 
 
 def _parse_steer_lines(lines: list[str]) -> list[dict]:
-    entries: list[dict] = []
-    for line in lines:
-        if not line.strip():
-            continue
-        try:
-            item = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        try:
-            seq = int(item.get("seq"))
-        except (TypeError, ValueError):
-            continue
-        entries.append({
-            "seq": seq,
-            "ts": str(item.get("ts") or ""),
-            "text": str(item.get("text") or ""),
-        })
-    return entries
+    return goalflight_steer_mailbox.parse_steer_lines(lines)
 
 
 def _read_steer_entries(path: Path) -> list[dict]:
-    if not path.exists():
-        return []
-    with path.open("r", encoding="utf-8", errors="replace") as f:
-        goalflight_compat.flock(f, goalflight_compat.LOCK_SH)
-        try:
-            return _parse_steer_lines(f.read().splitlines())
-        finally:
-            goalflight_compat.flock(f, goalflight_compat.LOCK_UN)
+    return goalflight_steer_mailbox.read_steer_entries(path)
 
 
 def _append_steer_message(dispatch_id: str, text: str) -> tuple[Path, dict]:
-    path = _steer_file(dispatch_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a+", encoding="utf-8") as f:
-        goalflight_compat.flock(f, goalflight_compat.LOCK_EX)
-        try:
-            f.seek(0)
-            existing = _parse_steer_lines(f.read().splitlines())
-            seq = max((entry["seq"] for entry in existing), default=0) + 1
-            entry = {
-                "seq": seq,
-                "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                "text": text,
-            }
-            f.seek(0, os.SEEK_END)
-            f.write(json.dumps(entry, sort_keys=True) + "\n")
-            f.flush()
-            os.fsync(f.fileno())
-            return path, entry
-        finally:
-            goalflight_compat.flock(f, goalflight_compat.LOCK_UN)
+    return goalflight_steer_mailbox.append_steer_message(dispatch_id, text)
 
 
 def _acked_steer_seqs(record: dict) -> set[int]:
-    acked: set[int] = set()
-    for key in ("stdout_path", "status_path"):
-        value = record.get(key)
-        if not value:
-            continue
-        path = Path(str(value))
-        if not path.exists():
-            continue
-        if key == "status_path":
-            try:
-                payload = json.loads(path.read_text(encoding="utf-8", errors="replace"))
-            except (OSError, json.JSONDecodeError):
-                continue
-            markers = payload.get("markers") or []
-            if isinstance(markers, dict):
-                for value in markers.get("STEER-ACK") or []:
-                    try:
-                        acked.add(int(str(value or "").split()[0]))
-                    except (IndexError, ValueError):
-                        pass
-            else:
-                for marker in markers:
-                    if not isinstance(marker, dict) or marker.get("kind") != "STEER-ACK":
-                        continue
-                    try:
-                        acked.add(int(str(marker.get("text") or "").split()[0]))
-                    except (IndexError, ValueError):
-                        pass
-            continue
-        try:
-            text = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        for line in text.splitlines():
-            match = STEER_ACK_RE.match(line.strip())
-            if match:
-                acked.add(int(match.group(1)))
-    return acked
+    return goalflight_steer_mailbox.acked_steer_seqs(record)
 
 
 def _list_steer_messages(dispatch_id: str, record: dict) -> int:
-    mailbox = _steer_file(dispatch_id)
-    entries = _read_steer_entries(mailbox)
-    acked = _acked_steer_seqs(record)
-    print(f"steer mailbox: {mailbox}")
-    if not entries:
-        print("(empty)")
-        return 0
-    print("seq\tts\tacked\ttext")
-    for entry in entries:
-        print(
-            f"{entry['seq']}\t{entry['ts']}\t"
-            f"{str(entry['seq'] in acked).lower()}\t{entry['text']}"
-        )
-    return 0
+    return goalflight_steer_mailbox.list_steer_messages(dispatch_id, record)
 
 
 def _cmd_steer(argv: list[str]) -> int:
