@@ -8,7 +8,7 @@ orchestrator decides whether to act; this script never mutates capacity state.
 
 Provider model
 --------------
-Per-label caps in `goalflight_capacity.DEFAULT_AGENT_CAPS` are PROCESS-COUNT
+Per-label caps in `goalflight_agent_limits.DEFAULT_AGENT_CAPS` are PROCESS-COUNT
 caps (RAM-aware). Rate limits, on the other hand, are vendor/provider-level.
 This script groups workers by the provider whose budget they consume:
 
@@ -63,6 +63,7 @@ from pathlib import Path
 from typing import Any
 
 import goalflight_compat
+from goalflight_agent_limits import DEFAULT_AGENT_CAPS
 
 SCHEMA = "goalflight.rate-pressure.v1"
 
@@ -494,14 +495,7 @@ def main(argv: list[str] | None = None) -> int:
     billing = load_billing_accounts()
     pool_map = agent_limit_pool_map(billing)
 
-    # Read current caps from goalflight_capacity if importable; fall back to a
-    # safe default map. Importing avoids hard-coding the map in two places.
-    try:
-        sys.path.insert(0, str(Path(__file__).parent))
-        from goalflight_capacity import DEFAULT_AGENT_CAPS  # type: ignore
-        current_caps = dict(DEFAULT_AGENT_CAPS)
-    except ImportError:
-        current_caps = {label: 5 for label in AGENT_TO_PROVIDER}
+    current_caps = dict(DEFAULT_AGENT_CAPS)
 
     pressure = pressure_per_provider(records, window_seconds=args.window_seconds, pool_map=pool_map)
     payload = recommend(pressure, current_caps, threshold=args.threshold, pool_map=pool_map)

@@ -23,6 +23,13 @@ import uuid
 
 import goalflight_compat
 import goalflight_compat as fcntl
+from goalflight_agent_limits import (
+    AGENT_CAP_POOL,
+    AGENT_RSS_MB,
+    DEFAULT_AGENT_CAPS,
+    cap_pool,
+    normalize_agent,
+)
 import goalflight_dispatch_states as dispatch_states
 import goalflight_rate_pressure
 from goalflight_liveness import active_monotonic
@@ -42,79 +49,6 @@ DEFAULT_WORST_WORKER_MB = 1200
 DEFAULT_HARD_CAP = 40
 DEFAULT_RATE_PRESSURE_WINDOW_SECONDS = 600
 DEFAULT_RATE_PRESSURE_THRESHOLD = 3
-AGENT_RSS_MB = {
-    "grok": 111,
-    "grok-acp": 111,
-    "grok-code": 111,
-    "grok-research": 111,
-    "codex": 386,
-    "codex-acp": 386,
-    "claude": 614,
-    "claude-code-cli-acp": 614,
-    "cursor": 1203,
-    "cursor-agent": 1203,
-    "opencode": 386,
-    "opencode-acp": 386,
-    "opencode-bash-tail": 386,
-}
-# Per-agent concurrency caps, machine-global across goal-flight sessions.
-# Sized to support multi-session parallel work. The adaptive busy-signal
-# walkback (scripts/goalflight_rate_pressure.py) reduces effective caps at
-# acquire-time when recent dispatch-ledger failures show provider pressure.
-# Static caps below remain starting defaults; the adaptive cap is transient and
-# never mutates this map or capacity.json.
-DEFAULT_AGENT_CAPS = {
-    # cursor-agent talks to Cursor's CLOUD backend, which is SLOW: a trivial prompt
-    # takes ~34s solo and ~57s at 3-concurrent, the whole time at ~0% CPU (blocked
-    # on the network). It DOES run concurrently (3 parallel complete together) but
-    # reliably only up to ~3 — at 5 the mid-stream gaps between chunks exceed the
-    # heartbeat wedge window. The first-token grace (heartbeat_wedge_decision
-    # requires wedge_progress_seen>=1) stops false-kills before the first token;
-    # cap 3 covers the steady-state slowness. (Stress-tested 2026-05-20: 1/2/3
-    # clean, 5 -> 2 recoverable wedges, zero orphan leaks.) cursor and cursor-agent
-    # share one Cursor subscription budget.
-    "cursor": 3,
-    "cursor-agent": 3,
-    "opencode": 10,
-    "opencode-acp": 10,
-    "opencode-bash-tail": 10,
-    # claude-code-cli-acp PTY-drives the interactive Claude TUI and tails the
-    # session transcript with a HARDCODED 120s per-turn timeout (not exposed in
-    # ACP-server mode). 2026-05-20: 4 SIMULTANEOUS dispatches starve each other on
-    # TUI startup (hooks/LSP/keychain/auto-memory/MCP) — even a trivial turn
-    # exceeded 120s (3/4); the SAME 4 with serialized startups ran 4/4. The
-    # contention is STARTUP, not steady-state. goalflight_startup_gate.StartupGate
-    # now serializes the spawn→handshake window for this adapter (handshake-gated,
-    # machine-agnostic — no hardcoded stagger interval), so concurrent TURNS are
-    # safe and the count cap can stay at 5. (`--bare` can't help — it forces
-    # ANTHROPIC_API_KEY, breaking subscription/OAuth auth. For very high Claude
-    # parallelism, the Agent tool is still the native path — no adapter/PTY.)
-    "claude": 5,
-    "claude-code-cli-acp": 5,
-    # codex loosened 10->12 (2026-06-10): monitored ~1h window through three
-    # multi-controller review storms — 483 dispatch-ledger records, zero
-    # providers under pressure, no saturation alerts. Stress-tested earlier at
-    # 49/49 + 13/13 TRUE-simultaneous with zero wedges (2026-05-20); the
-    # adaptive walk-back still halves effective caps on real rejections.
-    # codex loosened 12->18 (2026-06-16, operator-requested push): watched LIVE via
-    # goalflight_rate_pressure.py (clean baseline: 826 ledger records, 0 providers
-    # under pressure) + the adaptive walk-back backstop. Revisit after logged hours.
-    "codex": 18,
-    "codex-acp": 18,
-    # grok loosened 10->14 (2026-06-10): multi-controller queueing observed with
-    # ZERO rate-pressure evidence (449 ledger records, no providers under
-    # pressure); grok is sub-billed, and the adaptive walk-back halves effective
-    # caps at acquire-time if rejections appear. Revisit after more logged hours.
-    # grok loosened 14->20 (2026-06-16, operator-requested push): same live monitor.
-    "grok": 20,
-    "grok-acp": 20,
-    "grok-code": 20,
-    "grok-research": 20,
-    # Gateway orchestrators: lower cap, longer orchestration latency (Track D).
-    "herm-worker": 2,
-    "cla-worker": 2,
-    "paperclip": 2,
-}
 # Priority lanes (2026-06-10): acquire is single-shot try-or-block (no queue),
 # so under multi-controller bursts ("review storms") bulk retries statistically
 # crowd out critical fix dispatches. Lanes reserve headroom instead of queueing:
@@ -666,25 +600,6 @@ def detach_lease_to_worker(lease_id: str | None, worker_pid: int, reason: object
         lease["detached_reason"] = reason
         save_state(data)
         return True
-
-
-# Bash-tail + dispatch presets that share one engine/provider concurrency budget.
-AGENT_CAP_POOL: dict[str, str] = {
-    "grok-code": "grok",
-    "grok-research": "grok",
-    "grok-acp": "grok",
-    "grok-bash-tail": "grok",
-}
-
-
-def normalize_agent(agent: str) -> str:
-    return agent.strip().lower()
-
-
-def cap_pool(agent: str) -> str:
-    """Map agent label to the shared capacity pool key (engine/provider budget)."""
-    agent = normalize_agent(agent)
-    return AGENT_CAP_POOL.get(agent, agent)
 
 
 def active_leases(data: dict) -> list[dict]:
