@@ -2591,6 +2591,46 @@ def _mark_claim_worker_dead(entry: dict, *, reason: str) -> None:
         )
 
 
+def _drain_prelaunch_hook_path() -> Path:
+    """Optional operator pre-launch hook, run once per local drain pass just before
+    workers are launched. Almost always absent; an operator may install one to react
+    to what is about to be launched. Configurable via GOALFLIGHT_DRAIN_PRELAUNCH_HOOK.
+    """
+    env = os.environ.get("GOALFLIGHT_DRAIN_PRELAUNCH_HOOK")
+    if env:
+        return Path(env).expanduser()
+    return SCRIPT_DIR / "ext" / "drain-prelaunch-hook"
+
+
+def _pass_agent_labels(entries) -> list[str]:
+    """Best-effort distinct agent labels from the pre-scan of this drain pass, passed
+    to the optional pre-launch hook so it can scope its work. Pre-scan may be partial,
+    so this is advisory only."""
+    labels: set[str] = set()
+    for _sort_key, _path, scan_entry, _err in entries:
+        if isinstance(scan_entry, dict) and scan_entry.get("agent"):
+            labels.add(str(scan_entry["agent"]))
+    return sorted(labels)
+
+
+def _run_drain_prelaunch_hook(agents: list[str]) -> None:
+    """Run the optional pre-launch hook if installed, passing the agent label(s) for
+    this pass. No-op when absent; best-effort and time-bounded; never blocks or fails
+    a drain (all errors swallowed)."""
+    hook = _drain_prelaunch_hook_path()
+    try:
+        if not hook.exists():
+            return
+        subprocess.run(
+            [str(hook), *agents],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except Exception:
+        pass
+
+
 def _drain_queue_once(args) -> dict:
     queue_dir = Path(args.queue_dir).expanduser() if args.queue_dir else _dispatch_queue_dir()
     queue_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -2615,6 +2655,8 @@ def _drain_queue_once(args) -> dict:
     entries = sorted(_queue_entry_drain_candidate(path) for path in queue_dir.glob("*.json"))
     if args.limit and args.limit > 0:
         entries = entries[: args.limit]
+    if not remote_node and entries:
+        _run_drain_prelaunch_hook(_pass_agent_labels(entries))
     for _sort_key, path, _scan_entry, _scan_read_error in entries:
         with _queue_mutation_lock(queue_dir):
             claim = _claim_queue_entry(path)
