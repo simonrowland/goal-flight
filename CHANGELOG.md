@@ -56,6 +56,25 @@ follow-ups to 1.0.9.
   liveness is non-terminal for detached records and the state is re-derived from the
   authoritative worker pid+identity (live → live, success-marker tail → complete,
   genuinely gone → worker_dead). (#28)
+- Worker-liveness false-death cluster (`goalflight_chunk_summary.py` + `goalflight_status.py`):
+  a watcher-detached-but-alive worker is no longer reported `wedged`/`takeover` (it now
+  reads `running` when identity-matched live); `chunk_summary` rechecks liveness at read
+  time (pid + start-time identity, never the watcher's frozen `worker_alive`) and shares
+  the aggregate's output-tail reconciliation so the two agree; `--done` reports terminal
+  only on real terminal-marker evidence or an unambiguous terminal state (a between-turn
+  lull or a liveness-recheck state no longer falls through to a false `done`); and an
+  output-tail marker observed while the worker is still alive is kept as a diagnostic
+  only, never surfaced as a terminal signal that would false-`done` a live worker.
+- Remote drain now pins each launch to the commit resolved at SUBMIT time (persisted
+  40-hex `base_sha` on entry + request) instead of re-resolving HEAD at drain time, so a
+  checkout that advances between submit and drain can't build the remote worktree at the
+  wrong tree; an entry without a persisted base fails closed. Remote drain also fails
+  closed when a queued account name doesn't map to a fleet billing account instead of
+  silently defaulting. Local drain is unchanged.
+- codedb-for-codex registration fails closed: it auto-approves only an explicit read-only
+  allowlist of codedb tools (never "everything advertised minus a denylist", which would
+  silently approve a future mutating tool), and refuses to modify a config that is invalid
+  TOML instead of replacing it with still-invalid appended content.
 
 ### Docs
 - Controller-side advisory for a transiently-unavailable auto-mode safety classifier:
