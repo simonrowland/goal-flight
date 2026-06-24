@@ -96,6 +96,7 @@ RETIRED_AGENT_LABELS = {
     "grok": "use --agent grok-code (coding) or --agent grok-research (web search)",
 }
 GIT_BASE_PIN_RE = re.compile(r"(?<![A-Za-z0-9_./:-])([0-9A-Fa-f]{7,40})(?![A-Za-z0-9_./:-])")
+LOWER_BASE_SHA_RE = re.compile(r"[0-9a-f]{40}")
 READ_ONLY_INLINE_RETURN_PROMPT_PATTERNS = (
     (
         "return inline",
@@ -766,7 +767,12 @@ def _git_head_for_cwd(cwd: Path) -> str | None:
     if proc.returncode != 0:
         return None
     head = proc.stdout.strip().splitlines()[0].lower() if proc.stdout.strip() else ""
-    return head if re.fullmatch(r"[0-9a-f]{40}", head) else None
+    return head if LOWER_BASE_SHA_RE.fullmatch(head) else None
+
+
+def _valid_lower_base_sha(value: object) -> str | None:
+    raw = str(value or "").strip()
+    return raw if LOWER_BASE_SHA_RE.fullmatch(raw) else None
 
 
 def _git_pin_warning(args) -> str | None:
@@ -1686,6 +1692,7 @@ def _queue_claim_worker_alive(entry: dict) -> bool:
 
 def _submit_dispatch(args, raw_argv: list[str], *, base: Path) -> int:
     project_root = _project_root(args)
+    submit_base_sha = _git_head_for_cwd(project_root)
     tail = Path(args.tail) if args.tail else base / f"{args.dispatch_id}.tail"
     status_json = Path(args.status_json) if args.status_json else base / f"{args.dispatch_id}.status.json"
     queue_path = _queue_entry_path(args.dispatch_id)
@@ -1701,6 +1708,7 @@ def _submit_dispatch(args, raw_argv: list[str], *, base: Path) -> int:
         "created_at": goalflight_ledger.utc_now(),
         "updated_at": goalflight_ledger.utc_now(),
         "queue_path": str(queue_path),
+        "base_sha": submit_base_sha,
         "dispatch_argv": dispatch_argv,
         "request": {
             "agent": args.agent,
@@ -1712,6 +1720,7 @@ def _submit_dispatch(args, raw_argv: list[str], *, base: Path) -> int:
             "model": args.model,
             "shape": args.shape,
             "read_only": bool(args.read_only),
+            "base_sha": submit_base_sha,
             "account": args.account,
             "billing": args.billing,
             "capacity_wait_s": args.capacity_wait_s,
@@ -2394,34 +2403,20 @@ def _remote_drain_prompt(entry: dict) -> str:
 
 def _remote_drain_base_sha(entry: dict) -> str:
     request = entry.get("request") if isinstance(entry.get("request"), dict) else {}
-    for raw in (
-        request.get("base_sha"),
-        entry.get("base_sha"),
-        os.environ.get("GOALFLIGHT_FLEET_BASE_SHA"),
+    for source, raw in (
+        ("request.base_sha", request.get("base_sha")),
+        ("entry.base_sha", entry.get("base_sha")),
     ):
         if not raw:
             continue
-        value = str(raw).strip().lower()
-        if re.fullmatch(r"[0-9a-f]{40}", value):
+        value = str(raw).strip()
+        if _valid_lower_base_sha(value):
             return value
-        raise _RemoteDrainBlocked(f"invalid remote drain base sha: {raw}", code="invalid_base_sha")
-
-    project_root = Path(str(entry.get("project_root") or request.get("cwd") or Path.cwd())).resolve()
-    try:
-        proc = subprocess.run(
-            ["git", "-C", str(project_root), "rev-parse", "HEAD"],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=10,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise _RemoteDrainBlocked(f"base sha probe failed: {type(exc).__name__}", code="base_sha_unavailable") from exc
-    value = proc.stdout.strip().lower()
-    if proc.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}", value):
-        detail = (proc.stderr or proc.stdout or "git rev-parse HEAD failed").strip()
-        raise _RemoteDrainBlocked(f"base sha unavailable: {detail}", code="base_sha_unavailable")
-    return value
+        raise _RemoteDrainBlocked(f"invalid remote drain base sha in {source}: {raw}", code="invalid_base_sha")
+    raise _RemoteDrainBlocked(
+        "remote drain requires a queued submit-time base_sha; re-submit the entry from the intended base",
+        code="base_sha_unavailable",
+    )
 
 
 def _remote_drain_billing_account(entry: dict) -> str | None:
@@ -2430,8 +2425,14 @@ def _remote_drain_billing_account(entry: dict) -> str | None:
     if isinstance(raw, str) and raw.strip():
         return raw.strip()
     account = request.get("account")
-    if isinstance(account, str) and "/" in account and account.strip():
-        return account.strip()
+    if isinstance(account, str) and account.strip():
+        mapped = account.strip()
+        if "/" in mapped:
+            return mapped
+        raise _RemoteDrainBlocked(
+            f"unsupported remote account mapping for queued --account {mapped!r}; persist a fleet billing_account",
+            code="unsupported_account_mapping",
+        )
     return None
 
 

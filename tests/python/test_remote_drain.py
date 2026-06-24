@@ -38,6 +38,49 @@ def green_runner(_argv: list[str]) -> tuple[int, str, str]:
     return 0, "logged_in: true\n", ""
 
 
+def _git(repo: Path, *args: str) -> str:
+    proc = subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    return proc.stdout.strip()
+
+
+def _commit_file(repo: Path, name: str, body: str) -> str:
+    path = repo / name
+    path.write_text(body, encoding="utf-8")
+    _git(repo, "add", name)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "-c",
+            "user.name=Goal Flight Test",
+            "-c",
+            "user.email=goal-flight-test@example.invalid",
+            "commit",
+            "-m",
+            f"test {name}",
+        ],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    return _git(repo, "rev-parse", "HEAD")
+
+
+def _init_project_repo(tmp: Path) -> tuple[Path, str]:
+    repo = tmp / "project"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    return repo, _commit_file(repo, "work.txt", "one\n")
+
+
 @contextlib.contextmanager
 def isolated_env(tmp: Path, fleet_dir: Path):
     old = os.environ.copy()
@@ -80,6 +123,56 @@ def _extract_wrapped_flag(argv: list[str], flag: str, default: str) -> str:
         if part == flag and idx + 1 < len(argv):
             return argv[idx + 1]
     return default
+
+
+def _submit_args(project_root: Path, prompt: Path, dispatch_id: str, *, account: str | None = None) -> argparse.Namespace:
+    return argparse.Namespace(
+        agent="codex",
+        prompt_file=str(prompt),
+        prompt=None,
+        cwd=str(project_root),
+        model=None,
+        read_only=False,
+        priority="normal",
+        web_research_ok=False,
+        ignore_git_warn=True,
+        capacity_wait_s=0.0,
+        submit=True,
+        drain_on_submit=False,
+        account=account,
+        billing="sub",
+        shape="bash",
+        interactive=False,
+        permission_mode="auto",
+        permission_dir=None,
+        permission_inline_timeout_s=None,
+        permission_user_timeout_s=None,
+        tail=None,
+        status_json=None,
+        dispatch_id=dispatch_id,
+        poll_secs=2.0,
+        max_idle_secs=180.0,
+        controller_pid=None,
+        from_queue=False,
+        queue_launch_token=None,
+        queue_claim_path=None,
+        launch_detached=False,
+        acp_detached_child=False,
+        worker=[],
+    )
+
+
+def _submit_remote_queue_entry(project_root: Path, tmp: Path, dispatch_id: str, *, account: str | None = None) -> Path:
+    prompt = tmp / f"{dispatch_id}.prompt.md"
+    prompt.write_text("COMPLETE: remote drain submit test\n", encoding="utf-8")
+    base = tmp / "state" / "dispatch"
+    args = _submit_args(project_root, prompt, dispatch_id, account=account)
+    stdout = io.StringIO()
+    with redirect_stdout(stdout):
+        code = D._submit_dispatch(args, [], base=base)
+    assert_true("submit queued", code == 0)
+    assert_true("submit marker", "DISPATCH-QUEUED" in stdout.getvalue())
+    return tmp / "state" / "dispatch-queue" / f"{dispatch_id}.json"
 
 
 def _receipt_runner(captured: list[list[str]]):
@@ -255,6 +348,58 @@ def test_remote_drain_routes_claimed_entry_through_fleet_launch() -> None:
         assert_true("queue token on fleet meta", meta.get("queue_launch_token") == record.get("queue_launch_token"))
 
 
+def test_remote_drain_uses_submit_time_base_sha_after_head_moves() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        project_root, submit_sha = _init_project_repo(tmp)
+        fleet_dir = tmp / "fleet"
+        _fixture_fleet(fleet_dir)
+        dispatch_id = "remote-drain-submit-base"
+        with isolated_env(tmp, fleet_dir):
+            queued = _submit_remote_queue_entry(project_root, tmp, dispatch_id)
+        entry = json.loads(queued.read_text(encoding="utf-8"))
+        assert_true("entry persisted base", entry.get("base_sha") == submit_sha)
+        assert_true("request persisted base", entry.get("request", {}).get("base_sha") == submit_sha)
+
+        advanced_sha = _commit_file(project_root, "later.txt", "two\n")
+        assert_true("head advanced", advanced_sha != submit_sha)
+        captured: list[list[str]] = []
+
+        with isolated_env(tmp, fleet_dir):
+            payload = D._drain_queue_once(
+                _drain_args(tmp / "state" / "dispatch-queue", fleet_dir, remote_runner=_receipt_runner(captured))
+            )
+
+        launch_calls = [argv for argv in captured if "goalflight_fleet_launch_detached.py" in " ".join(argv)]
+        assert_true("launched", payload["launched"] == 1)
+        assert_true("one remote launch", len(launch_calls) == 1)
+        assert_true("submit-time base passed", _extract_wrapped_flag(launch_calls[0], "--base-sha", "") == submit_sha)
+
+
+def test_remote_drain_short_submit_account_fails_closed() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        project_root, _submit_sha = _init_project_repo(tmp)
+        fleet_dir = tmp / "fleet"
+        _fixture_fleet(fleet_dir)
+        dispatch_id = "remote-drain-account-map"
+        with isolated_env(tmp, fleet_dir):
+            queued = _submit_remote_queue_entry(project_root, tmp, dispatch_id, account="pro")
+        captured: list[list[str]] = []
+
+        with isolated_env(tmp, fleet_dir):
+            payload = D._drain_queue_once(
+                _drain_args(tmp / "state" / "dispatch-queue", fleet_dir, remote_runner=_receipt_runner(captured))
+            )
+
+        reasons = [str(item.get("reason") or "") for item in payload.get("details") or []]
+        assert_true("not launched", payload["launched"] == 0)
+        assert_true("left queued", payload["left_queued"] == 1)
+        assert_true("queue kept", queued.exists())
+        assert_true("unsupported account mapping", any("unsupported_account_mapping" in reason for reason in reasons))
+        assert_true("no remote launch", not any("goalflight_fleet_launch_detached.py" in " ".join(argv) for argv in captured))
+
+
 def test_remote_drain_unknown_node_is_clean_blocked_and_keeps_queue() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
@@ -373,6 +518,8 @@ def test_local_drain_without_remote_node_uses_existing_local_replay() -> None:
 
 def main() -> None:
     test_remote_drain_routes_claimed_entry_through_fleet_launch()
+    test_remote_drain_uses_submit_time_base_sha_after_head_moves()
+    test_remote_drain_short_submit_account_fails_closed()
     test_remote_drain_unknown_node_is_clean_blocked_and_keeps_queue()
     test_remote_drain_claim_token_prevents_second_launch()
     test_local_drain_without_remote_node_uses_existing_local_replay()
