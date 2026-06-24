@@ -6,9 +6,10 @@ incremented when meaningful skill behaviour changes.
 
 ## [Unreleased]
 
-## [1.0.10] — 2026-06-21
+## [1.0.10] — 2026-06-24
 
-Dispatch ergonomics + remote-drain + status-trust follow-ups to 1.0.9.
+Dispatch ergonomics + remote-drain + status-trust + codex-worker-search
+follow-ups to 1.0.9.
 
 ### Added
 - `drain --remote-node <name>`: opt-in dual-drain that launches each claimed queue
@@ -19,6 +20,24 @@ Dispatch ergonomics + remote-drain + status-trust follow-ups to 1.0.9.
   `--dry-run`) that renders a portable launchd plist template into the user's
   LaunchAgents, plus `protocols/drainer.md` documenting the reaper-proof
   out-of-session drainer model (and a systemd-timer note for Linux controllers). (#14)
+- `goalflight_status.py --verify-artifacts <id>`: confirm a worker's declared output
+  paths by direct `open()` of the exact paths named in its terminal marker, never by
+  directory enumeration (`ls`/`find`/`git status`/`grep`) — which can read stale for
+  minutes on local APFS and nearly drove a destructive re-author. Exit 0 = all declared
+  artifacts present + non-empty.
+- Optional per-pass pre-launch hook for local drains (`GOALFLIGHT_DRAIN_PRELAUNCH_HOOK`
+  or `scripts/ext/drain-prelaunch-hook`): a neutral, best-effort extension point run once
+  per local drain pass with the about-to-launch agent labels. Absent hook = no-op; zero
+  account/billing semantics in tracked code.
+- codedb registration for codex workers (`scripts/register-codedb-codex.py`, wired into
+  setup, ON by default; opt out with `GOALFLIGHT_CODEX_CODEDB=0`). codedb is read-only
+  indexed code-intelligence and the safe search swap-in for the disabled context-mode.
+  The registrar writes a per-tool `approval_mode = "approve"` entry for every read-only codedb
+  tool (the server's live advertised surface minus the write tool `codedb_edit`) — load-bearing,
+  because in `codex exec` an MCP call with no approval config is cancelled and for `codedb_context`
+  that cancellation reproduces the exec-mode elicitation wedge (verified 2026-06-24). It repairs an
+  existing codedb server block that lacks those approvals (not just absent configs) and no-ops when
+  the codedb binary is absent (won't register an unspawnnable server).
 
 ### Changed
 - context-mode is now OFF by default for dispatched codex workers (`codex exec` gets
@@ -27,6 +46,9 @@ Dispatch ergonomics + remote-drain + status-trust follow-ups to 1.0.9.
   per-prompt "no ctx_*" instructions. Opt back in with
   `GOALFLIGHT_CODEX_CONTEXT_MODE=enabled`; grok-acp/cursor and the user's interactive
   `~/.codex` config are unaffected. (#18)
+- The installer's codex context-mode registration is now opt-in, aligned with the
+  runtime default-off above: default codex setup no longer writes a context-mode MCP
+  block the worker boundary always disables. Opt in with `GOALFLIGHT_CODEX_CONTEXT_MODE=1`.
 
 ### Fixed
 - A detached (drain/launchd-launched) worker is no longer falsely classified
@@ -34,6 +56,12 @@ Dispatch ergonomics + remote-drain + status-trust follow-ups to 1.0.9.
   liveness is non-terminal for detached records and the state is re-derived from the
   authoritative worker pid+identity (live → live, success-marker tail → complete,
   genuinely gone → worker_dead). (#28)
+
+### Docs
+- Controller-side advisory for a transiently-unavailable auto-mode safety classifier:
+  retrying usually works (the classifier recovers in seconds); if it persists, route
+  read-only tools (which bypass it) and send writes to a sandboxed worker. Never globally
+  disable the safety classifier. (`protocols/dispatch-routing.md`)
 
 ## [1.0.9] — 2026-06-20
 
