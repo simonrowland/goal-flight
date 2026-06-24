@@ -156,6 +156,33 @@ Recovery options:
   to run gstack `/review` when it blocked, the orchestrator MUST run that
   review before commit — the worker can't, but the work isn't reviewed
   unless someone runs it.
+- **Don't conclude a worker's artifacts are missing from `ls`/`find`/`git
+  status`/`grep`** — and never re-author/overwrite on that basis. Those
+  ENUMERATE a directory, and a separate controller process's enumeration view
+  of a just-created file can be **stale for minutes** on local APFS (rpp-kb
+  2026-06-23: `find`+`git status`+`grep`+a fresh re-check all read a complete
+  leaf set as absent for minutes; only a write-collision and running the gates
+  revealed it — nearly drove a destructive re-author).
+
+## Verify artifacts by open, never by enumeration
+
+A worker declares its output path(s) in its terminal `READY:`/`COMPLETE:` marker.
+Verify those exact paths by **opening them**, not by listing their directory —
+opening a known path by name forces a fresh fetch; enumeration can read stale.
+
+- Use **`goalflight_status.py --verify-artifacts <id>`** (exit 0 = all declared
+  artifacts present+non-empty). It extracts the path(s) from the terminal marker
+  and confirms each by direct `open()`, bypassing the stale-enumeration view.
+- Or check the exact path yourself by NAME (never by listing its dir): strongest is
+  a **content read** — `cat <path>` or run the **gate that reads file contents** (the
+  worker's own validators). `test -f <path>` is a by-name `stat` — fresher than
+  directory enumeration, but a content read is the most authoritative.
+- A "missing/incomplete" verdict that would gate **re-authoring or overwrite** is
+  only trustworthy after a **no-clobber write collision** (`set -C; > path`, or
+  `open(path,'x')` raising) **or** a content-reading gate run — never after any
+  number of reads. A transient `--wait` `worker_dead` is likewise a *lead to
+  verify*, not a death: reconcile from the `READY:` marker + `--verify-artifacts`
+  + the reconciled `status.json`.
 
 ## Worker bypass anti-pattern
 

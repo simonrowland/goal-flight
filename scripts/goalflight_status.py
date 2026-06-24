@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shlex
 import subprocess
 import time
@@ -938,6 +939,111 @@ def render_text(payload: dict, limit: int) -> list[str]:
     return lines
 
 
+_MARKER_LINK_RE = re.compile(r"\[[^\]]*\]\(([^)\s]+)\)")  # whole markdown link [text](target)
+_URL_SCHEME_RE = re.compile(r"^[a-z][a-z0-9+.\-]*://", re.I)  # http(s)/ftp/... — not a local path
+_PATH_EXT_RE = re.compile(r"[^/\\]\.[A-Za-z0-9]{1,8}$")       # ends in a file extension
+
+
+def _extract_marker_paths(marker_text: str) -> list[str]:
+    """Pull artifact path(s) out of a SUCCESS terminal marker's text, e.g.
+    ``READY: docs-private/.../findings.md``, ``[findings.md](/abs/findings.md:1)``, or a
+    bare ``findings.md``. Each token is normalized FIRST (strip ``file://`` / ``#anchor``
+    / ``:line``) and then kept iff it ends in a file extension and is not a URL scheme.
+    Over-extraction is harmless (a bogus path just reports MISSING); under-extraction
+    (dropping a real declared artifact) is the dangerous failure, so the filter is lenient."""
+    if not marker_text:
+        return []
+    tokens = [m.group(1) for m in _MARKER_LINK_RE.finditer(marker_text)]
+    tokens += re.split(r"[\s,;`\"'<>()\[\]]+", _MARKER_LINK_RE.sub(" ", marker_text))
+    out: list[str] = []
+    for tok in tokens:
+        tok = tok.strip().strip("`\"'<>.,;")
+        if not tok:
+            continue
+        if tok.startswith("file://"):
+            tok = tok[len("file://"):]
+        elif _URL_SCHEME_RE.match(tok):
+            continue  # http(s)/ftp/etc. are not local artifacts
+        tok = tok.split("#", 1)[0]                      # drop #anchor BEFORE the ext test
+        tok = re.sub(r":\d+(?:-\d+)?$", "", tok)        # drop :line / :line-range
+        if tok and _PATH_EXT_RE.search(tok) and tok not in out:
+            out.append(tok)
+    return out
+
+
+def _verify_record(dispatch_id: str, project_root: str | None) -> dict | None:
+    """Look up a dispatch's ledger record DIRECTLY by id (no aggregate status_payload /
+    no reconcile pass) — the run-ledger lookup is by id, and artifact verification then
+    opens declared paths directly, so nothing here enumerates the worker's output dir."""
+    match = None
+    try:
+        for record in goalflight_ledger.read_records():
+            if record.get("dispatch_id") != dispatch_id:
+                continue
+            if project_root and record.get("project_root") not in (None, project_root):
+                continue
+            match = record  # latest matching record wins
+    except Exception:
+        return None
+    return match
+
+
+def _direct_open_exists(path: Path) -> tuple[bool, int]:
+    """Confirm a path by DIRECT OPEN (a fresh FS fetch), NEVER directory enumeration.
+    On local APFS a separate process's listdir/glob/find view of a just-created file can
+    be stale for MINUTES, while opening a known path by name is fresh (rpp-kb 2026-06-23
+    near-miss: find+git status+grep all read complete artifacts as absent). Opening +
+    reading a byte forces a real content fetch, not just a possibly-cached stat."""
+    try:
+        with open(path, "rb") as fh:
+            fh.read(1)
+        return True, path.stat().st_size
+    except FileNotFoundError:
+        return False, 0
+    except OSError:
+        return False, 0
+
+
+def verify_artifacts(dispatch_id: str, *, project_root: str | None) -> dict:
+    """Report whether a dispatch's DECLARED artifacts (the path(s) named in its terminal
+    READY/COMPLETE/RESULT marker) exist, verified by direct open of each exact path — not
+    by enumerating a directory. This is the trustworthy "did the worker actually write
+    its outputs?" check: a controller must never conclude an artifact is missing (and
+    re-author it) from ls/find/git-status/grep, which share a stale enumeration view."""
+    record = _verify_record(dispatch_id, project_root)
+    if record is None:
+        return {"dispatch_id": dispatch_id, "found": False,
+                "reason": "no ledger record for this id/scope (try --all-projects)"}
+    base = Path(record.get("project_root") or record.get("process_cwd") or Path.cwd()).expanduser()
+    tail = _tail_path_from_record(record)
+    marker = None
+    if tail is not None:
+        marker = _final_terminal_marker(
+            tail, ignore_prefix_lines=_ignore_prefix_lines(record.get("prompt_path")))
+    # Only a SUCCESS marker (READY/COMPLETE/RESULT) declares deliverables — a FAILED:/
+    # BLOCKED: marker that happens to name a path must NOT report it as a present artifact.
+    declared: list[str] = []
+    if marker and marker.get("kind") in SUCCESS_TERMINAL_MARKERS:
+        declared = _extract_marker_paths(marker.get("text", ""))
+    results = []
+    for rel in declared:
+        p = Path(rel).expanduser()
+        if not p.is_absolute():
+            p = base / rel
+        present, nbytes = _direct_open_exists(p)
+        results.append({"path": str(p), "present": present, "bytes": nbytes})
+    all_present = bool(results) and all(r["present"] and r["bytes"] > 0 for r in results)
+    return {
+        "dispatch_id": dispatch_id,
+        "found": True,
+        "classification": record.get("terminal_state") or record.get("state"),
+        "terminal_marker": None if marker is None else marker.get("kind"),
+        "declared_artifacts": declared,
+        "results": results,
+        "all_present": all_present,
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="goal-flight compact status (terse + this-repo by default)"
@@ -1010,6 +1116,16 @@ def main(argv: list[str] | None = None) -> int:
             f"(default {int(_WAIT_HEARTBEAT_S)})"
         ),
     )
+    parser.add_argument(
+        "--verify-artifacts",
+        metavar="ID",
+        dest="verify_artifacts",
+        help=(
+            "verify a dispatch's DECLARED artifacts (named in its terminal marker) exist "
+            "by DIRECT OPEN of each path — never directory enumeration, which can read "
+            "stale for minutes on local APFS. exit 0 = all present+nonempty, 1 = not"
+        ),
+    )
     parser.add_argument("--limit", type=int, default=20)
     args = parser.parse_args(argv)
 
@@ -1031,6 +1147,26 @@ def main(argv: list[str] | None = None) -> int:
             heartbeat_s=args.heartbeat_s,
             json_output=args.json,
         )
+
+    if args.verify_artifacts is not None:
+        result = verify_artifacts(args.verify_artifacts, project_root=project_root)
+        if args.json:
+            print(json.dumps(result, sort_keys=True))
+        elif not result.get("found"):
+            print(f"{args.verify_artifacts}  {result.get('reason')}")
+        else:
+            for r in result["results"]:
+                mark = "OK" if (r["present"] and r["bytes"] > 0) else "MISSING"
+                print(f"  [{mark}] {r['path']} ({r['bytes']}B)")
+            if not result["declared_artifacts"]:
+                print("  (no artifact path declared in the terminal marker)")
+            print(
+                f"{args.verify_artifacts}  all_present={result['all_present']} "
+                f"marker={result.get('terminal_marker')} classif={result.get('classification')}"
+            )
+        if not result.get("found"):
+            return 2
+        return 0 if result.get("all_present") else 1
 
     payload = scope_payload(status_payload(), project_root)
 
