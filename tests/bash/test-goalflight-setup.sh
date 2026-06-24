@@ -84,6 +84,13 @@ printf '%s\n' "$codex_dry" | grep -q 'ADDON_SKIP codex context-mode reason=codex
 if printf '%s\n' "$codex_dry" | grep -q 'register-context-mode-codex.py'; then fail "default codex setup must NOT plan context-mode bootstrap"; fi
 codex_optin_dry="$(GOALFLIGHT_CODEX_CONTEXT_MODE=1 run_setup --agent codex)"
 printf '%s\n' "$codex_optin_dry" | grep -q 'register-context-mode-codex.py' || fail "GOALFLIGHT_CODEX_CONTEXT_MODE=1 should plan codex context-mode bootstrap"
+# codedb registration is ON by default (the SAFE read-only swap-in for the disabled
+# context-mode): default codex setup MUST plan the codedb bootstrap, and the opt-out
+# env must suppress it.
+printf '%s\n' "$codex_dry" | grep -q 'register-codedb-codex.py' || fail "default codex setup should plan codedb bootstrap (default-on)"
+codex_codedb_off_dry="$(GOALFLIGHT_CODEX_CODEDB=0 run_setup --agent codex)"
+printf '%s\n' "$codex_codedb_off_dry" | grep -q 'ADDON_SKIP codex codedb reason=codex_codedb_opt_out' || fail "GOALFLIGHT_CODEX_CODEDB=0 should skip codedb registration"
+if printf '%s\n' "$codex_codedb_off_dry" | grep -q 'register-codedb-codex.py'; then fail "opt-out codex setup must NOT plan codedb bootstrap"; fi
 printf '%s\n' "$codex_dry" | grep -q 'RESTART_REQUIRED codex' || fail "codex restart notice missing"
 printf '%s\n' "$codex_dry" | grep -q 'ACTION copy_or_merge' || fail "codex dry-run action missing"
 printf '%s\n' "$codex_dry" | grep -q 'configs/codex/config.toml' || fail "codex dry-run source missing"

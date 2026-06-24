@@ -255,6 +255,37 @@ def _codex_context_mode_optin() -> bool:
         "1", "true", "yes", "enabled", "on"}
 
 
+def _codedb_codex_optin() -> bool:
+    """Whether to REGISTER codedb for codex at install. Default ON: codedb is the
+    SAFE, read-only swap-in for the disabled context-mode (#18) — it gives codex
+    workers indexed code-intelligence without the exec-mode elicitation wedge,
+    *provided* the per-tool approve entries are present (which register-codedb-codex.py
+    writes; an unconfigured codedb_context call cancels and wedges the worker).
+    The registrar itself no-ops when the codedb binary is absent, so default-on is
+    safe. Opt out with GOALFLIGHT_CODEX_CODEDB in {0,false,no,off,disabled}."""
+    raw = os.environ.get("GOALFLIGHT_CODEX_CODEDB", "").strip().lower()
+    return raw not in {"0", "false", "no", "off", "disabled"}
+
+
+def _run_codex_codedb_registration(repo_root: Path, *, dry_run: bool) -> None:
+    script = repo_root / "scripts" / "register-codedb-codex.py"
+    if not script.exists():
+        raise SetupError(f"codedb registration script missing: {script}")
+    check_argv = [sys.executable, str(script), "--check"]
+    apply_argv = [sys.executable, str(script)]
+    if dry_run:
+        print(f"BOOTSTRAP {_format_command(check_argv)}")
+        print(f"BOOTSTRAP {_format_command(apply_argv)}")
+        return
+    result = subprocess.run(apply_argv, text=True, encoding="utf-8", errors="replace", capture_output=True, check=False)
+    if result.returncode != 0:
+        raise SetupError(
+            "codedb registration failed: "
+            f"{_format_command(apply_argv)}\n{result.stderr.strip() or result.stdout.strip()}"
+        )
+    print(f"BOOTSTRAP {_format_command(apply_argv)}")
+
+
 def _run_codex_context_mode_registration(repo_root: Path, *, dry_run: bool) -> None:
     script = repo_root / "scripts" / "register-context-mode-codex.py"
     if not script.exists():
@@ -556,6 +587,15 @@ def _run_host_bootstrap(
                 )
                 continue
             _run_codex_context_mode_registration(repo_root, dry_run=dry_run)
+        elif mode == "setup" and agent == "codex" and addon.get("id") == "codedb":
+            if not _codedb_codex_optin():
+                print(
+                    f"ADDON_SKIP {agent} {addon['id']} reason=codex_codedb_opt_out "
+                    "detail=GOALFLIGHT_CODEX_CODEDB set to a disabling value; skipping "
+                    "codedb registration"
+                )
+                continue
+            _run_codex_codedb_registration(repo_root, dry_run=dry_run)
         elif mode == "setup" and agent == "cursor" and addon.get("id") == "context-mode":
             records.extend(
                 _run_cursor_context_mode_registration(

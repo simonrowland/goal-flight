@@ -67,6 +67,22 @@ surface REAL blockers → routing table → grouped fixes → serial integrator`
   exec-mode elicitation wedge at the source. The old "do NOT use context-mode / ctx_* tools"
   brief line is now belt-and-suspenders (for opted-in or externally-launched codex workers); or
   route to a non-wedging engine.
+- **codex workers: codedb is the SAFE search swap-in** (registered ON by default at install via
+  `scripts/register-codedb-codex.py`; opt out with `GOALFLIGHT_CODEX_CODEDB=0`). codedb is
+  read-only indexed code-intelligence (`symbol`/`find`/`search`/`callers`/`deps`/`context`) and,
+  *with the per-tool approve entries the registrar writes*, rides along in a headless `codex exec`
+  worker without wedging. **Why the approve entries are load-bearing:** in `codex exec` an MCP tool
+  call with NO `approval_mode` configured is cancelled, and for `codedb_context` that cancellation
+  surfaces as the same exec-mode user-input-elicitation wedge that disabled context-mode (#18) —
+  the worker stalls on an approval the headless runner cannot answer (verified 2026-06-24: with the
+  per-tool entries absent the call is cancelled and wedges; with them present it returns cleanly).
+  So the registrar writes `[mcp_servers.codedb.tools.<tool>] approval_mode = "approve"` for every
+  read-only codedb tool — the server's live advertised surface minus the one write tool
+  (`codedb_edit`, left unconfigured so it's cancelled rather than auto-approved; the OS sandbox, not
+  the approval prompt, is the write boundary). If a worker still wedges on codedb, the config has a
+  codedb server block without those approvals — re-run the registrar: it detects that "incomplete"
+  state and appends the missing approvals (it no-ops only when the config is already complete, and
+  when codedb's binary is absent rather than registering a server that can't spawn).
 - Workers are READ-ONLY in audit/verify; only harvest/consolidate/integrator write.
 
 ## Fixing (thrifty on controller context; controller keeps final say)
