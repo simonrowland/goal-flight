@@ -77,8 +77,13 @@ if printf '%s\n' "$codex_dry" | grep -q 'CONTROLLER_SURFACE codex cli'; then
   fail "codex default setup should not claim optional cli controller"
 fi
 printf '%s\n' "$codex_dry" | grep -q 'WORKER_CHECK codex exec --help' || fail "codex cli worker check missing"
-printf '%s\n' "$codex_dry" | grep -q 'register-context-mode-codex.py --check' || fail "codex context-mode check missing"
-printf '%s\n' "$codex_dry" | grep -q 'register-context-mode-codex.py' || fail "codex context-mode bootstrap missing"
+# codex context-mode registration is OPT-IN (default OFF): dispatched codex workers
+# disable context-mode (exec-mode ctx_index wedge), so the installer must not register
+# it by default. Opt in with GOALFLIGHT_CODEX_CONTEXT_MODE=1.
+printf '%s\n' "$codex_dry" | grep -q 'ADDON_SKIP codex context-mode reason=codex_context_mode_default_off' || fail "codex context-mode should default-skip (opt-in only)"
+if printf '%s\n' "$codex_dry" | grep -q 'register-context-mode-codex.py'; then fail "default codex setup must NOT plan context-mode bootstrap"; fi
+codex_optin_dry="$(GOALFLIGHT_CODEX_CONTEXT_MODE=1 run_setup --agent codex)"
+printf '%s\n' "$codex_optin_dry" | grep -q 'register-context-mode-codex.py' || fail "GOALFLIGHT_CODEX_CONTEXT_MODE=1 should plan codex context-mode bootstrap"
 printf '%s\n' "$codex_dry" | grep -q 'RESTART_REQUIRED codex' || fail "codex restart notice missing"
 printf '%s\n' "$codex_dry" | grep -q 'ACTION copy_or_merge' || fail "codex dry-run action missing"
 printf '%s\n' "$codex_dry" | grep -q 'configs/codex/config.toml' || fail "codex dry-run source missing"
@@ -390,13 +395,15 @@ HOME="$COMBINED_HOME" XDG_STATE_HOME="$COMBINED_STATE" \
   run_setup --uninstall --from-manifest "$combined_manifest" >/tmp/goal-flight-setup-combined-uninstall.out
 grep -q 'legacy skill' "$COMBINED_HOME/.codex/skills/goal-flight/SKILL.md" || fail "combined codex uninstall did not restore legacy personal skill"
 
-apply_out="$(run_setup --apply --yes --agent codex)"
+# Opt in to codex context-mode here so the registration path is still exercised
+# (default is skip; see the dry-run assertions above).
+apply_out="$(GOALFLIGHT_CODEX_CONTEXT_MODE=1 run_setup --apply --yes --agent codex)"
 manifest="$(printf '%s\n' "$apply_out" | awk '/^BACKUP_MANIFEST /{print $2}')"
 [ -n "$manifest" ] || fail "backup manifest path missing"
 [ -f "$manifest" ] || fail "backup manifest not written"
 grep -q 'codex plugin marketplace add' "$GOALFLIGHT_SETUP_FAKE_CODEX_LOG" || fail "fake marketplace command missing"
 grep -q 'codex plugin add goal-flight@goal-flight' "$GOALFLIGHT_SETUP_FAKE_CODEX_LOG" || fail "fake plugin add command missing"
-grep -q 'register-context-mode-codex.py' "$GOALFLIGHT_SETUP_FAKE_CONTEXT_MODE_LOG" || fail "fake context-mode command missing"
+grep -q 'register-context-mode-codex.py' "$GOALFLIGHT_SETUP_FAKE_CONTEXT_MODE_LOG" || fail "fake context-mode command missing (opt-in)"
 [ ! -e "$HOME/.codex/skills/goal-flight" ] || fail "codex legacy personal skill not cleaned up"
 grep -q 'existing = true' "$HOME/.codex/config.toml" || fail "existing codex config lost"
 [ "$(grep -c '# >>> goal-flight codex' "$HOME/.codex/config.toml")" -eq 1 ] || fail "goal-flight block missing after apply"

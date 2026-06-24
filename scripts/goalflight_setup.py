@@ -244,6 +244,17 @@ def _run_codex_plugin_unregistration() -> None:
         print(f"CODEX {_format_command(argv)}")
 
 
+def _codex_context_mode_optin() -> bool:
+    """Whether to REGISTER context-mode for codex at install. Default OFF: dispatched
+    codex workers disable context-mode at the worker boundary (goalflight_dispatch
+    `_codex_context_mode_enabled`) because its ctx_index elicitation wedges `codex exec`.
+    Registering it by default would write a `~/.codex/config.toml` MCP entry the runtime
+    always turns off. Opt in with the SAME switch the runtime honors so install and
+    dispatch agree. Other engines (cursor/opencode) keep context-mode."""
+    return os.environ.get("GOALFLIGHT_CODEX_CONTEXT_MODE", "").strip().lower() in {
+        "1", "true", "yes", "enabled", "on"}
+
+
 def _run_codex_context_mode_registration(repo_root: Path, *, dry_run: bool) -> None:
     script = repo_root / "scripts" / "register-context-mode-codex.py"
     if not script.exists():
@@ -535,6 +546,15 @@ def _run_host_bootstrap(
             )
             continue
         if mode == "setup" and agent == "codex" and addon.get("id") == "context-mode":
+            if not _codex_context_mode_optin():
+                print(
+                    f"ADDON_SKIP {agent} {addon['id']} reason=codex_context_mode_default_off "
+                    "detail=dispatched codex workers disable context-mode at the worker "
+                    "boundary (exec-mode ctx_index elicitation wedge), so registering it "
+                    "would write a config the runtime always turns off; opt in with "
+                    "GOALFLIGHT_CODEX_CONTEXT_MODE=1"
+                )
+                continue
             _run_codex_context_mode_registration(repo_root, dry_run=dry_run)
         elif mode == "setup" and agent == "cursor" and addon.get("id") == "context-mode":
             records.extend(
