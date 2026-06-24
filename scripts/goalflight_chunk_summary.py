@@ -14,6 +14,7 @@ from typing import Any
 
 import goalflight_compat
 import goalflight_dispatch_states as dispatch_states
+import goalflight_status
 from goalflight_watch import BLOCKING_TERMINAL_MARKERS, SUCCESS_TERMINAL_MARKERS
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -46,12 +47,6 @@ def age_mins(value: Any) -> int | None:
         return None
     seconds = (dt.datetime.now(dt.timezone.utc) - parsed).total_seconds()
     return max(0, int(seconds // 60))
-
-
-def pid_alive(pid: Any) -> bool:
-    if pid in (None, ""):
-        return False
-    return goalflight_compat.pid_alive(pid)
 
 
 def read_json(path: Path | None) -> dict[str, Any] | None:
@@ -154,8 +149,38 @@ def last_marker_kind(status: dict[str, Any] | None) -> str | None:
     return None
 
 
-def normalize_state(record: dict[str, Any] | None, status: dict[str, Any] | None, lease: dict[str, Any] | None) -> str:
-    marker = last_marker_kind(status)
+def runtime_record(
+    record: dict[str, Any] | None,
+    status: dict[str, Any] | None,
+    lease: dict[str, Any] | None,
+    status_path: Path | None = None,
+) -> dict[str, Any] | None:
+    combined: dict[str, Any] = {}
+    for source in (lease, record, status):
+        if not isinstance(source, dict):
+            continue
+        for key, value in source.items():
+            if value is not None and value != "":
+                combined[key] = value
+    if status_path is not None:
+        combined.setdefault("status_path", str(status_path))
+    return combined or None
+
+
+def worker_alive_at_read_time(record: dict[str, Any] | None) -> bool:
+    if not record:
+        return False
+    return goalflight_status._wait_worker_confirmed_alive(record)
+
+
+def normalize_state(
+    record: dict[str, Any] | None,
+    status: dict[str, Any] | None,
+    lease: dict[str, Any] | None,
+    *,
+    worker_live: bool = False,
+) -> str:
+    marker = last_marker_kind(status) or last_marker_kind(record)
     status_state = str(status.get("state")) if status and status.get("state") else None
     record_state = str(record.get("state")) if record and record.get("state") else None
 
@@ -164,6 +189,8 @@ def normalize_state(record: dict[str, Any] | None, status: dict[str, Any] | None
     if marker in BLOCKING_TERMINAL_MARKERS:
         return "failed"
     if status_state in WEDGED_STATES or record_state in WEDGED_STATES:
+        if worker_live:
+            return "running"
         return "wedged"
     if status_state in TERMINAL_FAILED or record_state in TERMINAL_FAILED:
         return "failed"
@@ -235,12 +262,15 @@ def summarize(slug: str, state_dir: Path) -> dict[str, Any]:
     records = ledger_records(state_dir)
     record, lease = choose_record(slug, records, leases)
     status, status_path = load_status(slug, record)
-    worker_pid = (status or {}).get("worker_pid") or (record or {}).get("worker_pid") or (lease or {}).get("worker_pid")
-    state = normalize_state(record, status, lease)
+    merged = runtime_record(record, status, lease, status_path)
+    reconciled = goalflight_status._reconcile_output_tail_record(merged) if merged else None
+    worker_pid = (reconciled or {}).get("worker_pid") or (status or {}).get("worker_pid") or (record or {}).get("worker_pid") or (lease or {}).get("worker_pid")
+    worker_live = worker_alive_at_read_time(reconciled or merged)
+    state = normalize_state(reconciled or record, status, lease, worker_live=worker_live)
     mins = age_mins(latest_timestamp(record, status, lease))
-    log_path = (status or {}).get("tail_path") or (record or {}).get("stdout_path") or (record or {}).get("stderr_path")
-    worker_live = pid_alive(worker_pid)
-    dispatch_id = (record or {}).get("dispatch_id") or (lease or {}).get("dispatch_id")
+    log_path = (reconciled or {}).get("tail_path") or (status or {}).get("tail_path") or (record or {}).get("stdout_path") or (record or {}).get("stderr_path")
+    dispatch_id = (reconciled or {}).get("dispatch_id") or (record or {}).get("dispatch_id") or (lease or {}).get("dispatch_id")
+    marker = last_marker_kind(status) or last_marker_kind(reconciled)
     return {
         "slug": slug,
         "dispatch_id": dispatch_id,
@@ -248,7 +278,7 @@ def summarize(slug: str, state_dir: Path) -> dict[str, Any]:
         "worker_pid_alive": worker_live,
         "status_path": str(status_path) if status_path else None,
         "log_path": str(log_path) if log_path else None,
-        "last_marker": last_marker_kind(status),
+        "last_marker": marker,
         "mins_since_last_event": mins,
         "decision_hint": decision_hint(state, worker_live, mins),
     }

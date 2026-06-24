@@ -64,6 +64,46 @@ def _with_dead_worker(fn):
         ledger.identity_matches = saved
 
 
+def _with_live_worker(fn):
+    saved = ledger.identity_matches
+    ledger.identity_matches = lambda rec: (True, "alive")  # identity-matched, still running
+    try:
+        return fn()
+    finally:
+        ledger.identity_matches = saved
+
+
+def test_live_worker_unpromoted_tail_marker_is_not_terminal() -> None:
+    # A LIVE worker (identity-matched) in a liveness-recheck state whose tail already
+    # contains a terminal marker must NOT be reported terminal: the reconcile gate
+    # refuses promotion (worker alive), and the unpromoted record must NOT carry the
+    # marker as `terminal_marker`/`last_marker` (a terminal SIGNAL) — otherwise
+    # done_code -> 0 and chunk_summary -> terminal would false-done a running worker
+    # (independent-review P1, the very false-death class this change set fixes).
+    import goalflight_chunk_summary as cs
+
+    with tempfile.TemporaryDirectory() as d:
+        tail = Path(d) / "live.tail"
+        tail.write_text(TAIL_WITH_TRAILING_TLDR, encoding="utf-8")  # has READY: marker
+        rec = _record_for(tail)
+        rec["classification"] = "watcher_stopped"  # a liveness-recheck state, worker still alive
+        rec["state"] = "watcher_stopped"
+        out = _with_live_worker(lambda: status._reconcile_output_tail_record(rec))
+
+        assert_eq("not promoted", out.get("output_tail_reconciliation", {}).get("promoted"), False)
+        assert_eq("no top-level terminal_marker on unpromoted live record", out.get("terminal_marker"), None)
+        assert_eq("no terminal_marker_source either", out.get("terminal_marker_source"), None)
+        assert_eq("marker kept as diagnostic only",
+                  bool(out.get("output_tail_reconciliation", {}).get("observed_marker")), True)
+        assert_eq("_record_has_terminal_marker False", status._record_has_terminal_marker(out), False)
+        # done_code must recheck liveness (watcher_stopped) and report LIVE, not terminal.
+        assert_eq("done_code == 1 (live, not false-done)",
+                  _with_live_worker(lambda: status.done_code(out)), 1)
+        # chunk_summary must read this as running, never complete/wedged.
+        assert_eq("normalize_state -> running",
+                  cs.normalize_state(out, None, None, worker_live=True), "running")
+
+
 def test_marker_followed_by_tldr_promotes_to_complete() -> None:
     with tempfile.TemporaryDirectory(prefix="gf-recon-") as d:
         tail = Path(d) / "recon.tail"
@@ -92,6 +132,7 @@ def main() -> None:
     tests = [
         test_marker_followed_by_tldr_promotes_to_complete,
         test_no_marker_stays_worker_dead,
+        test_live_worker_unpromoted_tail_marker_is_not_terminal,
     ]
     for test in tests:
         test()

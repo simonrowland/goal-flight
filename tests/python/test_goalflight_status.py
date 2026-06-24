@@ -288,6 +288,7 @@ def test_done_code() -> None:
     }
     orig_read_records = S.goalflight_ledger.read_records
     orig_identity_matches = S.goalflight_ledger.identity_matches
+    orig_pid_alive = S.goalflight_compat.pid_alive
     try:
         captured: list[dict] = []
 
@@ -304,10 +305,12 @@ def test_done_code() -> None:
         check("idle_timeout stale cached worker -> 0", S.done_code(timeout_summary) == 0)
 
         S.goalflight_ledger.read_records = lambda: []
+        S.goalflight_compat.pid_alive = lambda _pid: False
         check("idle_timeout cached flag without identity -> 0", S.done_code(timeout_summary) == 0)
     finally:
         S.goalflight_ledger.read_records = orig_read_records
         S.goalflight_ledger.identity_matches = orig_identity_matches
+        S.goalflight_compat.pid_alive = orig_pid_alive
     watcher_summary = {
         "dispatch_id": "watcher-live",
         "state": "watcher_stopped",
@@ -322,6 +325,7 @@ def test_done_code() -> None:
     }
     orig_read_records = S.goalflight_ledger.read_records
     orig_identity_matches = S.goalflight_ledger.identity_matches
+    orig_pid_alive = S.goalflight_compat.pid_alive
     try:
         captured = []
 
@@ -351,8 +355,22 @@ def test_done_code() -> None:
     finally:
         S.goalflight_ledger.read_records = orig_read_records
         S.goalflight_ledger.identity_matches = orig_identity_matches
+        S.goalflight_compat.pid_alive = orig_pid_alive
     check("stale_* -> 2", S.done_code({"classification": "stale_pid_reuse"}) == 2)
     check("missing classification -> 2 (do not claim done)", S.done_code({}) == 2)
+    check(
+        "running no terminal marker -> 2",
+        S.done_code(
+            {
+                "dispatch_id": "between-turn",
+                "state": "running",
+                "classification": "running",
+                "worker_pid": 333,
+                "worker_still_alive": True,
+            }
+        )
+        == 2,
+    )
 
 
 def test_output_tail_reconciles_success_marker_after_watcher_death() -> None:
@@ -388,10 +406,14 @@ def test_output_tail_reconciles_success_marker_after_watcher_death() -> None:
             fresh_live = S._reconcile_output_tail_record({**record, "classification": "watcher_stopped"})
             check("live worker with fresh terminal tail does not reconcile complete",
                   fresh_live.get("classification") == "watcher_stopped")
-            check("fresh live terminal marker signal retained",
-                  fresh_live.get("terminal_marker", {}).get("kind") == "COMPLETE")
+            check("fresh live unpromoted record carries NO terminal_marker signal",
+                  fresh_live.get("terminal_marker") is None and fresh_live.get("terminal_marker_source") is None)
+            check("fresh live marker kept as diagnostic observed_marker only",
+                  fresh_live.get("output_tail_reconciliation", {}).get("observed_marker", {}).get("kind") == "COMPLETE")
             check("fresh live reconciliation is explicitly unpromoted",
                   fresh_live.get("output_tail_reconciliation", {}).get("promoted") is False)
+            check("fresh live worker is NOT false-done (done_code != 0)",
+                  S.done_code(fresh_live) != 0)
 
             os.utime(
                 tail,

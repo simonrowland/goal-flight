@@ -27,7 +27,7 @@ import goalflight_dispatch_states as dispatch_states
 import goalflight_ledger
 from goalflight_liveness import cpu_confirmed_idle
 import goalflight_milestone
-from goalflight_watch import SUCCESS_TERMINAL_MARKERS, _final_terminal_marker
+from goalflight_watch import BLOCKING_TERMINAL_MARKERS, SUCCESS_TERMINAL_MARKERS, _final_terminal_marker
 
 # Each aggregated record carries a precomputed ``classification`` from
 # goalflight_ledger.classify(): the terminal STATE string when terminal, else one
@@ -38,6 +38,8 @@ _LIVE_CLASS = "expected_live"
 _AMBIGUOUS_CLASS = dispatch_states.AMBIGUOUS_LIVE_CLASSES
 _LIVENESS_RECHECK_CLASSES = dispatch_states.LIVENESS_RECHECK_STATES
 _OUTPUT_TAIL_SUCCESS_MARKERS = SUCCESS_TERMINAL_MARKERS
+_OUTPUT_TAIL_BLOCKING_MARKERS = BLOCKING_TERMINAL_MARKERS
+_OUTPUT_TAIL_TERMINAL_MARKERS = _OUTPUT_TAIL_SUCCESS_MARKERS | _OUTPUT_TAIL_BLOCKING_MARKERS
 _OUTPUT_TAIL_IDLE_RECONCILE_S = 30.0
 _OUTPUT_TAIL_RECONCILE_CLASSES = dispatch_states.OUTPUT_TAIL_RECONCILE_STATES
 _DRAIN_LAUNCHD_LABEL = "com.goalflight.drain"
@@ -98,14 +100,47 @@ def _identity_record_for_output_tail_reconcile(record: dict) -> dict | None:
     return None
 
 
+def _record_pid_alive(record: dict) -> bool:
+    pid = record.get("worker_pid")
+    if not pid:
+        return False
+    try:
+        return goalflight_compat.pid_alive(int(pid))
+    except (TypeError, ValueError):
+        return False
+
+
 def _rechecked_worker_alive(record: dict) -> bool:
     if not _needs_liveness_recheck(record):
         return False
     identity_record = _identity_record_for_liveness_recheck(record)
-    if identity_record is None:
-        return False
-    ok, _reason = goalflight_ledger.identity_matches(identity_record)
-    return ok
+    if identity_record is not None:
+        ok, _reason = goalflight_ledger.identity_matches(identity_record)
+        return ok
+    return _record_pid_alive(record)
+
+
+def _record_terminal_marker_kind(record: dict | None) -> str | None:
+    if not record:
+        return None
+    for key in ("terminal_marker", "last_marker"):
+        marker = record.get(key)
+        if isinstance(marker, dict):
+            value = marker.get("kind")
+            if value:
+                return str(value)
+        elif isinstance(marker, str) and marker:
+            return marker
+    markers = record.get("markers")
+    if isinstance(markers, list):
+        for marker in reversed(markers):
+            if isinstance(marker, dict) and marker.get("kind"):
+                return str(marker["kind"])
+    return None
+
+
+def _record_has_terminal_marker(record: dict | None) -> bool:
+    return _record_terminal_marker_kind(record) in _OUTPUT_TAIL_TERMINAL_MARKERS
 
 
 def _output_tail_reconcile_gate(record: dict, *, tail_mtime: int | None) -> tuple[bool, str]:
@@ -207,29 +242,36 @@ def _reconcile_output_tail_record(record: dict) -> dict:
         tail,
         ignore_prefix_lines=_ignore_prefix_lines(record.get("prompt_path")),
     )
-    if not marker or marker.get("kind") not in _OUTPUT_TAIL_SUCCESS_MARKERS:
+    marker_kind = marker.get("kind") if isinstance(marker, dict) else None
+    if marker_kind not in _OUTPUT_TAIL_TERMINAL_MARKERS:
         return record
     should_promote, gate_reason = _output_tail_reconcile_gate(record, tail_mtime=mtime)
     if not should_promote:
+        # The tail HAS a terminal marker but the gate refused promotion — typically
+        # because the worker is still alive (or the tail is too fresh to trust). We must
+        # NOT surface that marker as `terminal_marker`/`last_marker`: those are terminal
+        # SIGNALS, and a live worker carrying one re-creates the false-done this whole
+        # change set fixes (done_code -> 0, normalize_state -> terminal, for a LIVE
+        # worker). Keep it as a diagnostic-only observation under the reconciliation key.
         out = dict(record)
-        out["terminal_marker"] = marker
-        out["terminal_marker_source"] = "output_tail"
         out["tail_path"] = str(tail)
         out["tail_mtime"] = mtime
         out["output_tail_reconciliation"] = {
             "candidate": True,
             "promoted": False,
             "reason": gate_reason,
+            "observed_marker": marker,  # diagnostic only — NOT a terminal signal
             "idle_threshold_s": _OUTPUT_TAIL_IDLE_RECONCILE_S,
         }
         return out
+    terminal_state = "complete" if marker_kind in _OUTPUT_TAIL_SUCCESS_MARKERS else "blocked"
     out = dict(record)
     out.setdefault("raw_classification", record.get("classification"))
     out.setdefault("raw_state", record.get("state"))
     out.setdefault("raw_terminal_state", record.get("terminal_state"))
-    out["classification"] = "complete"
-    out["state"] = "complete"
-    out["terminal_state"] = "complete"
+    out["classification"] = terminal_state
+    out["state"] = terminal_state
+    out["terminal_state"] = terminal_state
     out["reason"] = f"marker:{marker.get('kind')}:output_tail_reconciliation"
     out["terminal_marker"] = marker
     out["terminal_marker_source"] = "output_tail"
@@ -386,11 +428,15 @@ def scope_payload(payload: dict, project_root: str | None) -> dict:
     return out
 
 
-def done_code(record: dict) -> int:
+def done_code(record: dict, *, worker_alive: bool | None = None) -> int:
     """0 = terminal/done, 1 = live, 2 = ambiguous/unknown."""
     cls = record.get("classification") or record.get("state") or "unknown"
+    if _record_has_terminal_marker(record):
+        return 0
     if _needs_liveness_recheck(record):
-        return 1 if _rechecked_worker_alive(record) else 0
+        if worker_alive is None:
+            worker_alive = _rechecked_worker_alive(record)
+        return 1 if worker_alive else 0
     if cls == _LIVE_CLASS:
         return 1
     if cls in {"queued_capacity", "waiting_capacity", "queued"}:
@@ -400,7 +446,13 @@ def done_code(record: dict) -> int:
         return 1
     if cls in _AMBIGUOUS_CLASS or cls.startswith("stale_"):
         return 2
-    return 0
+    if (
+        dispatch_states.is_terminal_state(cls)
+        or dispatch_states.is_terminal_state(record.get("state"))
+        or dispatch_states.is_terminal_state(record.get("terminal_state"))
+    ):
+        return 0
+    return 2
 
 
 def find_record(payload: dict, dispatch_id: str) -> dict | None:
@@ -747,7 +799,7 @@ def _wait_snapshot(
             code = 2
         elif _needs_liveness_recheck(record):
             worker_alive = _rechecked_worker_alive(record)
-            code = 1 if worker_alive else 0
+            code = done_code(record, worker_alive=worker_alive)
         else:
             code = done_code(record)
         terminal = code == 0
@@ -991,8 +1043,8 @@ def _verify_record(dispatch_id: str, project_root: str | None) -> dict | None:
 def _direct_open_exists(path: Path) -> tuple[bool, int]:
     """Confirm a path by DIRECT OPEN (a fresh FS fetch), NEVER directory enumeration.
     On local APFS a separate process's listdir/glob/find view of a just-created file can
-    be stale for MINUTES, while opening a known path by name is fresh (rpp-kb 2026-06-23
-    near-miss: find+git status+grep all read complete artifacts as absent). Opening +
+    be stale for MINUTES, while opening a known path by name is fresh (2026-06-23 APFS
+    stale-enumeration near-miss: find+git status+grep all read complete artifacts as absent). Opening +
     reading a byte forces a real content fetch, not just a possibly-cached stat."""
     try:
         with open(path, "rb") as fh:
