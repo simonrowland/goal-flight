@@ -45,16 +45,42 @@ def assert_eq(name: str, got: object, expected: object) -> None:
 
 
 # A codedb path that cannot spawn -> advertised_codedb_tools() returns None ->
-# target_tools() falls back to FALLBACK_CODEDB_TOOLS. Keeps tests hermetic (no codedb).
+# target_tools() falls back to the READONLY_CODEDB_TOOLS allowlist. Hermetic (no codedb).
 _NO_CODEDB = "/nonexistent/codedb-binary"
+
+# Tools that MUST never be auto-approved (write / index-mutating / unknown-semantics).
+_MUTATING_CODEDB_TOOLS = ("codedb_edit", "codedb_index", "codedb_snapshot", "codedb_remote")
 
 
 def test_target_tools_fallback_excludes_edit_includes_context() -> None:
     tools = R.target_tools(_NO_CODEDB)  # query fails -> fallback
     assert_true("codedb_context approved", "codedb_context" in tools)
-    assert_true("codedb_edit excluded (write tool)", "codedb_edit" not in tools)
     assert_true("read tools present", "codedb_symbol" in tools and "codedb_search" in tools)
     assert_eq("sorted+unique", tools, sorted(set(tools)))
+    # Fail-closed allowlist: NO mutating/unknown tool is ever in the approve set.
+    for w in _MUTATING_CODEDB_TOOLS:
+        assert_true(f"{w} NOT auto-approved (allowlist is read-only)", w not in tools)
+    # Every approved tool is on the read-only allowlist (invariant by construction).
+    for t in tools:
+        assert_true(f"{t} is on the read-only allowlist", t in R.READONLY_CODEDB_TOOLS)
+
+
+def test_advertised_writer_is_not_approved() -> None:
+    # Even if codedb advertises a mutating tool (e.g. a future codedb_index/_snapshot),
+    # target_tools intersects with the allowlist, so the writer is dropped. Simulate by
+    # monkeypatching the live-discovery to advertise writers alongside read tools.
+    saved = R.advertised_codedb_tools
+    R.advertised_codedb_tools = lambda *a, **k: [  # type: ignore[assignment]
+        "codedb_symbol", "codedb_search", "codedb_context",
+        "codedb_index", "codedb_snapshot", "codedb_edit", "codedb_newfangled_write",
+    ]
+    try:
+        tools = R.target_tools("/whatever")
+        for w in ("codedb_index", "codedb_snapshot", "codedb_edit", "codedb_newfangled_write"):
+            assert_true(f"advertised writer {w} dropped", w not in tools)
+        assert_true("read tools kept", {"codedb_symbol", "codedb_search", "codedb_context"} <= set(tools))
+    finally:
+        R.advertised_codedb_tools = saved  # type: ignore[assignment]
 
 
 def test_render_block_is_valid_toml_and_approves_context() -> None:
@@ -213,6 +239,30 @@ def test_malformed_tools_value_errors() -> None:
         _expect_exit4(cfg, "non-table")
 
 
+def test_invalid_whole_file_toml_is_not_clobbered() -> None:
+    # A config that is INVALID TOML overall (e.g. an unclosed table header) must be
+    # classified "malformed" and left UNTOUCHED — never classified absent and replaced
+    # with appended-but-still-invalid content (convergence-review P2).
+    with tempfile.TemporaryDirectory() as d:
+        cfg = Path(d) / "config.toml"
+        cfg.write_text("[features\nbroken = true\n", encoding="utf-8")  # unclosed [features
+        assert_eq("invalid file -> malformed", R.classify_registration(cfg)[0], "malformed")
+        _expect_exit4(cfg, "not valid TOML")
+
+
+def test_empty_file_is_absent_not_malformed() -> None:
+    # An empty / whitespace-only config parses to {} and must register cleanly (absent),
+    # not be misread as malformed.
+    with tempfile.TemporaryDirectory() as d:
+        cfg = Path(d) / "config.toml"
+        cfg.write_text("\n  \n", encoding="utf-8")
+        assert_eq("empty -> absent", R.classify_registration(cfg)[0], "absent")
+        action, _ = R.register_atomically(cfg, _NO_CODEDB)
+        assert_eq("registered", action, "registered")
+        tomllib.loads(cfg.read_text())  # result must be valid TOML
+        assert_eq("now complete", R.classify_registration(cfg)[0], "complete")
+
+
 def test_register_preserves_curated_complete_config() -> None:
     # A complete config that approves ONLY a curated subset must be left untouched
     # (we don't force-approve tools the user omitted).
@@ -258,6 +308,9 @@ def test_main_check_exit_when_no_codedb() -> None:
 def main() -> None:
     tests = [
         test_target_tools_fallback_excludes_edit_includes_context,
+        test_advertised_writer_is_not_approved,
+        test_invalid_whole_file_toml_is_not_clobbered,
+        test_empty_file_is_absent_not_malformed,
         test_render_block_is_valid_toml_and_approves_context,
         test_render_block_escapes_special_path,
         test_classify_absent_incomplete_complete,

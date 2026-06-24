@@ -159,8 +159,8 @@ Recovery options:
 - **Don't conclude a worker's artifacts are missing from `ls`/`find`/`git
   status`/`grep`** — and never re-author/overwrite on that basis. Those
   ENUMERATE a directory, and a separate controller process's enumeration view
-  of a just-created file can be **stale for minutes** on local APFS (rpp-kb
-  2026-06-23: `find`+`git status`+`grep`+a fresh re-check all read a complete
+  of a just-created file can be **stale for minutes** on local APFS (2026-06-23
+  APFS stale-enumeration near-miss: `find`+`git status`+`grep`+a fresh re-check all read a complete
   leaf set as absent for minutes; only a write-collision and running the gates
   revealed it — nearly drove a destructive re-author).
 

@@ -93,21 +93,19 @@ except ImportError:
     sys.exit(2)
 
 
-# codedb tools we do NOT auto-approve. `codedb_edit` is the lone WRITE tool;
-# leaving it unconfigured means a worker's codedb_edit call is cancelled (not
-# wedged — only codedb_context's user-input elicitation wedges; see docstring),
-# which is the right default since codex has native editing and the OS sandbox,
-# not the approval prompt, is the real write boundary. Keeping it out also keeps
-# the invariant "every auto-approved codedb tool is read-only" TRUE.
-WRITE_DENYLIST = frozenset({"codedb_edit"})
-
-# Hardcoded FALLBACK approval set — the read-only surface of codedb 0.2.x `mcp`
-# (the 23 advertised tools minus WRITE_DENYLIST). Used only when the live
-# tools/list query (advertised_codedb_tools) fails; normally we approve exactly
-# what the installed codedb advertises, so a newer codedb that adds read tools is
-# covered without a code bump. codedb_context — the one tool whose unconfigured
-# cancellation WEDGES the worker — is always in this set.
-FALLBACK_CODEDB_TOOLS = (
+# codedb tools we auto-approve: an explicit READ-ONLY query allowlist (fail-closed),
+# NOT "everything codedb advertises minus a denylist". A denylist silently approves
+# any NEW or misclassified mutating tool a future codedb exposes — e.g. codedb_edit
+# WRITES files, codedb_index builds/writes an index, codedb_snapshot writes a
+# snapshot, codedb_remote touches remote config. Approving only known read-only
+# tools keeps the invariant "every auto-approved codedb tool is read-only" TRUE by
+# construction; a tool NOT on this list is simply never approved (its call is
+# cancelled, never wedged — only codedb_context's cancellation wedges, and it IS in
+# this set). A genuinely new read tool needs a one-line allowlist add — cheap, and
+# the right side to fail on for a safety boundary. This 19-tool set is also exactly
+# the read-only surface of codedb 0.2.x (the 23 advertised tools minus edit/index/
+# snapshot/remote), used as the fallback when the live tools/list query fails.
+READONLY_CODEDB_TOOLS = frozenset({
     "codedb_callers",
     "codedb_callpath",
     "codedb_changes",
@@ -117,20 +115,17 @@ FALLBACK_CODEDB_TOOLS = (
     "codedb_find",
     "codedb_glob",
     "codedb_hot",
-    "codedb_index",
     "codedb_ls",
     "codedb_outline",
     "codedb_projects",
     "codedb_query",
     "codedb_read",
-    "codedb_remote",
     "codedb_search",
-    "codedb_snapshot",
     "codedb_status",
     "codedb_symbol",
     "codedb_tree",
     "codedb_word",
-)
+})
 
 # The one tool whose missing approval reproduces the exec-mode wedge. A codedb
 # registration that lacks THIS approval is "incomplete" and must be repaired.
@@ -142,10 +137,11 @@ def advertised_codedb_tools(codedb_path: str, *, timeout_s: float = 15.0) -> Opt
 
     Spawns `codedb mcp`, performs the minimal JSON-RPC handshake (initialize ->
     initialized notification -> tools/list), and returns the advertised names.
-    Version-proofs the approval set: we approve exactly what THIS codedb exposes
-    (minus WRITE_DENYLIST), so a codedb that adds read tools is covered without a
-    code change. Best-effort — any error (spawn failure, protocol drift, timeout)
-    returns None and the caller falls back to FALLBACK_CODEDB_TOOLS.
+    The caller (target_tools) intersects this with the read-only allowlist, so a
+    newer codedb that adds READ tools is covered without a code bump while a new
+    WRITE tool is never auto-approved. Best-effort — any error (spawn failure,
+    protocol drift, timeout) returns None and the caller falls back to the
+    READONLY_CODEDB_TOOLS allowlist.
     """
     import subprocess
     import select
@@ -212,11 +208,14 @@ def advertised_codedb_tools(codedb_path: str, *, timeout_s: float = 15.0) -> Opt
 
 def target_tools(codedb_path: str) -> list[str]:
     """The codedb tools to auto-approve: the live advertised surface (or the
-    hardcoded fallback) minus WRITE_DENYLIST, with WEDGE_CRITICAL_TOOL guaranteed
-    present. Sorted for stable, diff-friendly output."""
+    read-only allowlist, when the live query fails) INTERSECTED with
+    READONLY_CODEDB_TOOLS, WEDGE_CRITICAL_TOOL guaranteed present. Fail-closed: a
+    tool codedb advertises that is NOT on the allowlist (a write tool, or a new tool
+    of unknown semantics) is never auto-approved. Sorted for stable, diff-friendly
+    output."""
     advertised = advertised_codedb_tools(codedb_path)
-    base = advertised if advertised else list(FALLBACK_CODEDB_TOOLS)
-    keep = {t for t in base if t not in WRITE_DENYLIST}
+    base = set(advertised) if advertised else set(READONLY_CODEDB_TOOLS)
+    keep = {t for t in base if t in READONLY_CODEDB_TOOLS}
     keep.add(WEDGE_CRITICAL_TOOL)  # never omit the wedge-critical tool
     return sorted(keep)
 
@@ -303,8 +302,14 @@ def classify_registration(codex_config: Path) -> tuple[str, set[str]]:
     try:
         data = tomllib.loads(text)
     except tomllib.TOMLDecodeError:
-        # Malformed existing file — treat as "absent" so the caller surfaces the
-        # proper error on append rather than a false-positive skip.
+        # A non-empty file that does not parse is MALFORMED, not absent. Treating it
+        # as absent would append a codedb block and atomically replace the user's
+        # config with still-invalid TOML while reporting success — destroying a
+        # recoverable config. Surface it so the caller refuses to touch the file.
+        # (An empty / whitespace-only file parses to {} above, so this is only
+        # reached for real syntax errors.)
+        if text.strip():
+            return "malformed", set()
         return "absent", set()
     servers = data.get("mcp_servers")
     if not isinstance(servers, dict) or "codedb" not in servers:
@@ -338,8 +343,8 @@ def render_block(codedb_path: str, tools: list[str]) -> str:
         "# LOAD-BEARING: codex exec cancels an unconfigured MCP tool call, and for",
         "# codedb_context that cancellation wedges the worker (an exec-mode",
         "# user-input elicitation the headless runner cannot answer). All",
-        "# auto-approved codedb tools are read-only (codedb_edit is intentionally",
-        "# omitted; see register-codedb-codex.py WRITE_DENYLIST).",
+        "# auto-approved codedb tools are read-only (write/index tools are",
+        "# intentionally omitted; see register-codedb-codex.py READONLY_CODEDB_TOOLS).",
         "[mcp_servers.codedb]",
         f"command = {json.dumps(codedb_path)}",
         'args = ["mcp"]',
@@ -406,6 +411,14 @@ def register_atomically(
         state, approved = classify_registration(codex_config)
         if state == "complete":
             return RACED
+        if state == "malformed":
+            print(
+                f"ERROR: {codex_config} is not valid TOML; refusing to modify it. "
+                "codex cannot load an invalid config either — hand-fix the syntax "
+                "error and re-run (the file is left untouched).",
+                file=sys.stderr,
+            )
+            sys.exit(4)
         tools = target_tools(codedb_path)
         if state == "absent":
             block = render_block(codedb_path, tools)
@@ -465,6 +478,19 @@ def register_atomically(
         if existing and not existing.endswith("\n"):
             existing += "\n"
         new_content = existing + block
+        # Defense in depth: never atomically replace the live config with content
+        # that doesn't parse. If appending the block somehow produced invalid TOML
+        # (an edge the classify/guard checks above didn't catch), abort BEFORE the
+        # replace so the original config is left intact.
+        try:
+            tomllib.loads(new_content)
+        except tomllib.TOMLDecodeError as e:
+            print(
+                f"ERROR: appending the codedb block to {codex_config} would produce "
+                f"invalid TOML ({e}); aborting without modifying the file.",
+                file=sys.stderr,
+            )
+            sys.exit(4)
         tmp_fd, tmp_name = tempfile.mkstemp(
             prefix="config.toml.new.",
             dir=str(codex_config.parent),
@@ -505,6 +531,14 @@ def main(argv: list[str]) -> int:
     if state == "complete":
         print(f"codex: [mcp_servers.codedb] complete in {codex_config}; no-op.")
         return 0
+
+    if state == "malformed":
+        msg = (
+            f"{codex_config} is not valid TOML; refusing to modify it (codex cannot "
+            "load it either). Hand-fix the syntax error and re-run."
+        )
+        print(f"CHECK: {msg}" if args.check else f"ERROR: {msg}", file=sys.stderr)
+        return 1
 
     codedb = shutil.which("codedb")
     if not codedb:

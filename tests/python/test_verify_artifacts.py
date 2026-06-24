@@ -3,7 +3,7 @@
 A controller must verify a worker's declared outputs by OPENING the exact paths named
 in its terminal SUCCESS marker — never by directory enumeration (ls/find/git status/
 grep), which can return a stale view for minutes on local APFS and nearly drove a
-destructive re-author (rpp-kb 2026-06-23). Pins: marker-path extraction edge cases,
+destructive re-author (2026-06-23 APFS stale-enumeration near-miss). Pins: marker-path extraction edge cases,
 success-marker gating, direct-open verification (present vs absent), by-id record
 lookup (no aggregate/enumeration), and exit codes.
 """
