@@ -361,6 +361,69 @@ def extract_markers(path: Path, max_bytes: int = 10 * 1024 * 1024,
     return markers, size
 
 
+# Worker markers the watcher bridges into the controller's mail inbox: a worker
+# blocking on one of these is "you have mail" the controller should see on its next
+# status check. (They are also terminal markers — the worker stops and waits — so
+# each is normally emitted once.)
+WORKER_MAIL_MARKER_KINDS = frozenset({"USER-NEED", "USER-CONFIRM", "BLOCKED"})
+
+# Sentinel parked in the dedup set after any mail-layer failure: the bridge then
+# no-ops for the rest of the watcher run. A real (type, text) key can never equal
+# it (no message type is the empty marker below), so it cannot collide.
+_BRIDGE_DISABLED = ("\x00bridge-disabled", "")
+
+
+def post_worker_mail(dispatch_id: str, markers: list[dict], posted_keys: set) -> None:
+    """Best-effort: post a worker's USER-NEED / USER-CONFIRM / BLOCKED markers as
+    envelopes into the dispatch's mail inbox, so the controller's read-side status
+    mail hint surfaces them with the question/blocker text.
+
+    Liveness comes first and the bridge must never stall or storm the poll loop:
+    - the common poll (no urgent marker) returns immediately and imports nothing —
+      so the watcher's startup/steady path never touches the mail layer;
+    - the inbox is read at most ONCE, lazily, when the first fresh urgent marker
+      appears (rare; these markers are terminal), then the in-memory ``posted_keys``
+      set short-circuits every later poll — no per-poll inbox scan;
+    - each key is marked BEFORE the disk write, so a failed post can never re-attempt
+      the same I/O every poll;
+    - the FIRST mail-layer failure disables the bridge for the rest of the run.
+    """
+    if _BRIDGE_DISABLED in posted_keys:
+        return
+    try:
+        urgent = [m for m in markers if m.get("kind") in WORKER_MAIL_MARKER_KINDS]
+        if not urgent:
+            return
+        import goalflight_messages as gm  # lazy: the watcher must not hard-depend on mail
+
+        messages_dir = gm.default_messages_dir()
+        inbox_seen: set | None = None  # loaded once, only on a fresh urgent marker (restart-safe dedup)
+        for m in urgent:
+            mtype = gm.MARKER_TO_TYPE.get(m["kind"], "blocked")
+            text = _strip_marker_decoration(str(m.get("text") or "")).strip()
+            key = (mtype, text)
+            if key in posted_keys:
+                continue
+            if inbox_seen is None:
+                inbox_seen = {
+                    (str(e.get("type")), str((e.get("payload") or {}).get("text") or "").strip())
+                    for e in gm.read_envelopes(gm.inbox_path(messages_dir, dispatch_id))
+                }
+            posted_keys.add(key)  # mark BEFORE I/O: a failed post must not retry every poll
+            if key in inbox_seen:
+                continue  # already delivered in a prior run; marked above, skip the re-post
+            gm.post_message(
+                dispatch_id=dispatch_id,
+                msg_type=mtype,
+                payload={"text": text},
+                messages_dir=messages_dir,
+                source={"node": "local", "adapter": "watcher", "transport": "marker-bridge"},
+            )
+    except Exception:
+        posted_keys.add(_BRIDGE_DISABLED)  # one failure -> bridge off for this run; liveness first
+        return
+
+
 def _last_line_is_terminal_marker(
     path: Path,
     ignore_prefix_lines: list[str] | None = None,
@@ -634,8 +697,14 @@ def main() -> int:
             signal.signal(sig, handle_signal)
     atexit.register(lambda: flush_terminal_status("watcher_exit"))
 
+    posted_mail_keys: set = set()  # per-run dedup for the worker->controller mail bridge
     while True:
         markers, size = extract_markers(tail, ignore_prefix_lines=ignore_prefix_lines)
+        # Bridge worker USER-NEED/USER-CONFIRM/BLOCKED markers into the dispatch
+        # inbox so the controller's status mail hint surfaces them. Runs BEFORE the
+        # terminal-exit checks below so a need is posted even on the iteration the
+        # watcher resolves (these markers are themselves terminal). Best-effort.
+        post_worker_mail(args.dispatch_id, markers, posted_mail_keys)
         if size != last_size:
             last_size = size
             last_change = active_monotonic()
