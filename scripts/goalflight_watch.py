@@ -397,6 +397,16 @@ def post_worker_mail(dispatch_id: str, markers: list[dict], posted_keys: set) ->
         import goalflight_messages as gm  # lazy: the watcher must not hard-depend on mail
 
         messages_dir = gm.default_messages_dir()
+        inbox = gm.inbox_path(messages_dir, dispatch_id)
+        if inbox.exists() and not inbox.is_file():
+            # Non-regular inbox (FIFO/device): read_envelopes()'s read or
+            # post_message()'s open("a") could block the watcher's liveness loop
+            # FOREVER — the broad except below can't catch a hang. Same hang class
+            # as the read-side collect_inbox_paths guard. Refuse and disable the
+            # bridge for the run; liveness must never wait on the mail layer.
+            # is_file()/exists() are non-blocking stat()s (open() is what blocks).
+            posted_keys.add(_BRIDGE_DISABLED)
+            return
         inbox_seen: set | None = None  # loaded once, only on a fresh urgent marker (restart-safe dedup)
         for m in urgent:
             mtype = gm.MARKER_TO_TYPE.get(m["kind"], "blocked")
@@ -407,7 +417,7 @@ def post_worker_mail(dispatch_id: str, markers: list[dict], posted_keys: set) ->
             if inbox_seen is None:
                 inbox_seen = {
                     (str(e.get("type")), str((e.get("payload") or {}).get("text") or "").strip())
-                    for e in gm.read_envelopes(gm.inbox_path(messages_dir, dispatch_id))
+                    for e in gm.read_envelopes(inbox)
                 }
             posted_keys.add(key)  # mark BEFORE I/O: a failed post must not retry every poll
             if key in inbox_seen:

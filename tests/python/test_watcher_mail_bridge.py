@@ -129,6 +129,42 @@ def test_bridge_is_best_effort_never_raises() -> None:
         M.post_message = saved  # type: ignore[assignment]
 
 
+def test_non_regular_inbox_disables_bridge_without_hang() -> None:
+    # A FIFO/device at the inbox path must NOT be opened: read_envelopes() or
+    # post_message()'s open("a") would block the watcher liveness loop forever (a
+    # broad except cannot catch a hang). The bridge must detect the non-regular
+    # file via a non-blocking stat, disable itself, and return. Alarm-bounded so a
+    # regression FAILS loudly instead of hanging the suite.
+    import signal
+    import stat as _stat
+
+    if not hasattr(signal, "SIGALRM"):
+        return  # no alarm on this platform (e.g. Windows) — skip
+
+    def body(d):
+        msgs = M.default_messages_dir()
+        msgs.mkdir(parents=True, exist_ok=True)
+        inbox = M.inbox_path(msgs, "w")
+        os.mkfifo(inbox)  # would block open() if the bridge tried to read/append
+        keys: set = set()
+
+        def _boom(signum, frame):
+            raise TimeoutError("bridge hung on a non-regular inbox")
+
+        old = signal.signal(signal.SIGALRM, _boom)
+        signal.alarm(5)
+        try:
+            W.post_worker_mail("w", _markers_from("USER-NEED: x\n", d), keys)
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old)
+        return (W._BRIDGE_DISABLED in keys), _stat.S_ISFIFO(os.stat(inbox).st_mode)
+
+    disabled, still_fifo = _with_env(body)
+    assert_true("bridge disabled, no hang", disabled)
+    assert_true("inbox never opened (still a fifo, nothing written)", still_fifo)
+
+
 def main() -> None:
     tests = [
         test_user_need_marker_posts_envelope,
@@ -136,6 +172,7 @@ def main() -> None:
         test_disabled_after_mail_failure_no_retry_storm,
         test_only_urgent_trio_bridged,
         test_bridge_is_best_effort_never_raises,
+        test_non_regular_inbox_disables_bridge_without_hang,
     ]
     for t in tests:
         t()
