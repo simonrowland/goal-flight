@@ -948,6 +948,40 @@ def wait_for_dispatches(
         time.sleep(poll_s)
 
 
+def _mail_summary() -> dict:
+    """Read-side "you have mail" check, computed FRESH on every status call and
+    never stored in any status JSON (per the controller-mail design: the signal
+    is read-side only, never stamped into worker-liveness state). Returns
+    ``{"open_user_needs": N, "dispatch_ids": [...], "hint": "<one-line>"}`` when
+    the controller has open user-needs waiting, else ``{}``.
+
+    Fail-open: ANY error (mail module absent, unreadable inbox, malformed JSONL)
+    returns ``{}`` so a messaging glitch can never break or slow a status call.
+    """
+    try:
+        import goalflight_messages as _gm  # lazy: status must not hard-depend on mail
+
+        aggregate = _gm.build_aggregate(
+            messages_dir=_gm.default_messages_dir(),
+            fleet_dir=_gm.default_fleet_dir(),
+        )
+        needs = aggregate.get("open_user_needs") or []
+        if not needs:
+            return {}
+        ids = sorted({str(n.get("dispatch_id") or "?") for n in needs})
+        shown = ", ".join(ids[:3]) + ("" if len(ids) <= 3 else f" +{len(ids) - 3}")
+        return {
+            "open_user_needs": len(needs),
+            "dispatch_ids": ids,
+            "hint": (
+                f"\U0001f4ec mail: {len(needs)} open user-need(s) from "
+                f"[{shown}] - run: goalflight_messages.py relay"
+            ),
+        }
+    except Exception:
+        return {}
+
+
 def render_text(payload: dict, limit: int) -> list[str]:
     scope = payload.get("scope", {})
     root = scope.get("project_root")
@@ -964,6 +998,9 @@ def render_text(payload: dict, limit: int) -> list[str]:
         f"{label}: running{running} done{done} ambig{ambig} "
         f"cooldowns{len(cooldowns)}  machine:{machine}/{cap.get('operating_cap')}"
     ]
+    mail = payload.get("mail") or {}
+    if mail.get("hint"):
+        lines.append(mail["hint"])
     if payload.get("milestone"):
         lines.append(goalflight_milestone.format_line(payload["milestone"]))
     # Live/ambiguous first (what the controller is waiting on), then most-recent
@@ -1189,6 +1226,12 @@ def main(argv: list[str] | None = None) -> int:
         project_root = this_project_root()
 
     if args.wait:
+        # NOTE: --wait (the long-poll over N workers) is deliberately mail-FREE.
+        # Coupling mail to the wait would mean either waking/returning early on a
+        # message (collapsing the multi-worker wait and forcing the controller to
+        # re-arm the other N-1 waiters) or withholding mail until every worker is
+        # terminal. Mail belongs on the aggregate `status` poll instead — one call
+        # that already covers all workers AND mail, with no waiter teardown.
         return wait_for_dispatches(
             _parse_wait_ids(args.wait),
             project_root=project_root,
@@ -1235,6 +1278,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     payload["milestone"] = _milestone_payload(project_root)
+    # Read-side mail check: piggyback the "you have mail" signal onto the status
+    # call every controller already runs. Computed fresh, fail-open, never stored.
+    payload["mail"] = _mail_summary()
 
     if args.json:
         print(json.dumps(payload, sort_keys=True))

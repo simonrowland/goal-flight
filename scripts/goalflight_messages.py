@@ -303,15 +303,22 @@ def _last_steering(envelopes_by_dispatch: dict[str, list[dict]]) -> dict | None:
 
 
 def collect_inbox_paths(messages_dir: Path, fleet_dir: Path | None = None) -> list[Path]:
+    # Only REGULAR files are inbox candidates. A non-regular `*.jsonl` entry (a
+    # FIFO/device, accidental or hostile) would block a later read_text() open()
+    # indefinitely — which on the read-side status mail check would HANG status
+    # before its fail-open guard could fire. `is_file()` is a non-blocking stat()
+    # (open() is what blocks on a FIFO), so this filter is safe and cheap.
     paths: dict[str, Path] = {}
     if messages_dir.is_dir():
         for path in sorted(messages_dir.glob("*.jsonl")):
-            paths[path.stem] = path
+            if path.is_file():
+                paths[path.stem] = path
     if fleet_dir is not None:
         register_dir = fleet_dir / "register" / "dispatches"
         if register_dir.is_dir():
             for path in sorted(register_dir.glob("*.jsonl")):
-                paths[path.stem] = path
+                if path.is_file():
+                    paths[path.stem] = path
     return list(paths.values())
 
 
