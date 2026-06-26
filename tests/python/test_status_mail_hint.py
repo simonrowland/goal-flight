@@ -151,6 +151,50 @@ def test_non_regular_inbox_file_does_not_hang() -> None:
     assert_eq("real need still surfaced, FIFO skipped without hang", out.get("count"), 1)
 
 
+def test_corrupt_unrelated_inbox_does_not_suppress_owned_need() -> None:
+    # Convergence P2: an UNRELATED controller's malformed inbox must NOT drop this
+    # controller's own need. Scoped reads (own inboxes only) + per-inbox tolerance
+    # in build_aggregate both guard this; previously the global read raised and the
+    # fail-open wrapper returned {}.
+    def body(msgs, fleet):
+        M.post_message(dispatch_id="mine-1", msg_type="user_need", payload={"text": "approve?"}, messages_dir=msgs)
+        (msgs / "theirs-9.jsonl").write_text("{ not valid json\n", encoding="utf-8")  # corrupt, unrelated
+        return S._mail_summary({"mine-1"})
+
+    out = _with_mail_dirs(body)
+    assert_eq("owned need survives a corrupt unrelated inbox", out.get("count"), 1)
+    assert_eq("and it is the owned one", out["needs"][0]["dispatch_id"], "mine-1")
+
+
+def test_post_message_fails_closed_on_non_regular_inbox() -> None:
+    # Convergence P2: the shared writer must fail CLOSED on a FIFO/device inbox
+    # (raise, not block) so CLI/MCP/direct callers cannot hang on open(). Alarm-bounded.
+    import signal
+
+    if not hasattr(signal, "SIGALRM"):
+        return
+
+    def body(msgs, fleet):
+        os.mkfifo(msgs / "w.jsonl")  # FIFO inbox: next_seq read / open("a") would block
+
+        def _boom(signum, frame):
+            raise TimeoutError("post_message hung on a non-regular inbox")
+
+        old = signal.signal(signal.SIGALRM, _boom)
+        signal.alarm(5)
+        raised = None
+        try:
+            M.post_message(dispatch_id="w", msg_type="user_need", payload={"text": "x"}, messages_dir=msgs)
+        except M.MessageError:
+            raised = "MessageError"
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old)
+        return raised
+
+    assert_eq("writer fails closed (MessageError), no hang", _with_mail_dirs(body), "MessageError")
+
+
 def main() -> None:
     tests = [
         test_no_mail_empty_summary,
@@ -160,6 +204,8 @@ def main() -> None:
         test_render_text_includes_hint_when_present,
         test_render_text_silent_when_no_mail,
         test_non_regular_inbox_file_does_not_hang,
+        test_corrupt_unrelated_inbox_does_not_suppress_owned_need,
+        test_post_message_fails_closed_on_non_regular_inbox,
     ]
     for t in tests:
         t()

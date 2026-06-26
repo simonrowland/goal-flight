@@ -93,6 +93,11 @@ def validate_envelope(envelope: dict, *, path: str = "envelope") -> None:
 def read_envelopes(path: Path, *, last_n: int | None = None) -> list[dict]:
     if not path.exists():
         return []
+    if not path.is_file():
+        # Non-regular inbox (FIFO/device): read_text()'s open() would block forever.
+        # is_file() is a non-blocking stat; treat a non-regular inbox as empty so no
+        # reader (build_aggregate, next_seq, the watcher bridge) can hang on it.
+        return []
     envelopes: list[dict] = []
     for line_no, line in enumerate(path.read_text().splitlines(), start=1):
         stripped = line.strip()
@@ -138,6 +143,11 @@ def post_message(
     if not isinstance(payload, dict):
         raise MessageError("payload must be an object")
     path = inbox_path(messages_dir, dispatch_id)
+    if path.exists() and not path.is_file():
+        # Fail CLOSED on a non-regular inbox (FIFO/device) before any open():
+        # open("a") below would block the caller forever. Centralised here so
+        # CLI / MCP / direct writers are all protected, not just the watcher bridge.
+        raise MessageError(f"{path}: inbox is not a regular file; refusing to write")
     resolved_seq = seq if seq is not None else next_seq(path)
     base_source = {
         "node": "local",
@@ -302,22 +312,30 @@ def _last_steering(envelopes_by_dispatch: dict[str, list[dict]]) -> dict | None:
     return latest
 
 
-def collect_inbox_paths(messages_dir: Path, fleet_dir: Path | None = None) -> list[Path]:
+def collect_inbox_paths(
+    messages_dir: Path,
+    fleet_dir: Path | None = None,
+    *,
+    dispatch_ids: set[str] | None = None,
+) -> list[Path]:
     # Only REGULAR files are inbox candidates. A non-regular `*.jsonl` entry (a
     # FIFO/device, accidental or hostile) would block a later read_text() open()
     # indefinitely — which on the read-side status mail check would HANG status
     # before its fail-open guard could fire. `is_file()` is a non-blocking stat()
     # (open() is what blocks on a FIFO), so this filter is safe and cheap.
+    def _want(stem: str) -> bool:
+        return dispatch_ids is None or stem in dispatch_ids
+
     paths: dict[str, Path] = {}
     if messages_dir.is_dir():
         for path in sorted(messages_dir.glob("*.jsonl")):
-            if path.is_file():
+            if path.is_file() and _want(path.stem):
                 paths[path.stem] = path
     if fleet_dir is not None:
         register_dir = fleet_dir / "register" / "dispatches"
         if register_dir.is_dir():
             for path in sorted(register_dir.glob("*.jsonl")):
-                if path.is_file():
+                if path.is_file() and _want(path.stem):
                     paths[path.stem] = path
     return list(paths.values())
 
@@ -326,11 +344,16 @@ def build_aggregate(
     *,
     messages_dir: Path,
     fleet_dir: Path | None = None,
+    dispatch_ids: set[str] | None = None,
 ) -> dict:
     envelopes_by_dispatch: dict[str, list[dict]] = {}
-    for path in collect_inbox_paths(messages_dir, fleet_dir):
-        dispatch_id = path.stem
-        envelopes_by_dispatch[dispatch_id] = read_envelopes(path)
+    for path in collect_inbox_paths(messages_dir, fleet_dir, dispatch_ids=dispatch_ids):
+        try:
+            envelopes_by_dispatch[path.stem] = read_envelopes(path)
+        except MessageError:
+            # One malformed/unreadable inbox must NOT suppress everyone else's mail
+            # (a scoped status reads only its own inbox, but be tolerant regardless).
+            continue
 
     open_user_needs: list[dict] = []
     active_dispatches: list[str] = []
@@ -476,9 +499,13 @@ def controller_mail_summary(
     controller's workers' needs. ``None`` means no ownership filter (e.g. an
     all-projects view). Returns ``{}`` when there is nothing to show.
     """
+    # Read ONLY this controller's own inboxes: an unrelated controller's corrupt or
+    # large inbox can then neither suppress (a parse error elsewhere) nor slow this
+    # scoped status call. build_aggregate is also per-inbox tolerant as a backstop.
     aggregate = build_aggregate(
         messages_dir=messages_dir or default_messages_dir(),
         fleet_dir=fleet_dir if fleet_dir is not None else default_fleet_dir(),
+        dispatch_ids=owned_dispatch_ids,
     )
     needs = aggregate.get("open_user_needs") or []
     if owned_dispatch_ids is not None:
