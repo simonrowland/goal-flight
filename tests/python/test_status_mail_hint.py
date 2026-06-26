@@ -66,31 +66,50 @@ def test_no_mail_empty_summary() -> None:
     assert_eq("empty inbox -> {}", out, {})
 
 
-def test_open_user_need_surfaces_hint() -> None:
+def test_open_user_need_surfaces_hint_with_detail() -> None:
     def body(msgs, fleet):
         M.post_message(
             dispatch_id="worker-7",
             msg_type="user_need",
-            payload={"text": "need a decision on X"},
+            payload={"text": "need a decision on the schema change"},
             messages_dir=msgs,
         )
-        return S._mail_summary()
+        return S._mail_summary({"worker-7"})
 
     out = _with_mail_dirs(body)
-    assert_eq("count", out.get("open_user_needs"), 1)
-    assert_true("dispatch id captured", "worker-7" in (out.get("dispatch_ids") or []))
-    assert_true("hint names the relay command", "goalflight_messages.py relay" in (out.get("hint") or ""))
-    assert_true("hint carries the mail glyph", "\U0001f4ec" in (out.get("hint") or ""))
+    assert_eq("count", out.get("count"), 1)
+    need = (out.get("needs") or [{}])[0]
+    assert_eq("dispatch id", need.get("dispatch_id"), "worker-7")
+    assert_eq("type", need.get("type"), "user_need")
+    hint = out.get("hint") or ""
+    assert_true("hint names the relay command", "goalflight_messages.py relay" in hint)
+    assert_true("hint carries the mail glyph", "\U0001f4ec" in hint)
+    # Enough DETAIL to follow up from a status check: the need text + id appear.
+    assert_true("hint shows the need text", "decision on the schema change" in hint)
+    assert_true("hint shows the dispatch id", "worker-7" in hint)
+
+
+def test_ownership_filter_excludes_other_controllers_workers() -> None:
+    # The mailbox is machine-global; a controller must only see needs from ITS own
+    # dispatches. A need from a dispatch this controller doesn't own is filtered out.
+    def body(msgs, fleet):
+        M.post_message(dispatch_id="mine-1", msg_type="user_need", payload={"text": " mine"}, messages_dir=msgs)
+        M.post_message(dispatch_id="theirs-9", msg_type="blocked", payload={"text": "not mine"}, messages_dir=msgs)
+        return S._mail_summary({"mine-1"})  # only own dispatch
+
+    out = _with_mail_dirs(body)
+    assert_eq("only owned need surfaces", out.get("count"), 1)
+    assert_eq("and it is the owned one", out["needs"][0]["dispatch_id"], "mine-1")
 
 
 def test_mail_check_is_fail_open() -> None:
     # If the mail layer raises, a status call must NOT break -> summary is {}.
-    saved = M.build_aggregate
-    M.build_aggregate = lambda **k: (_ for _ in ()).throw(RuntimeError("boom"))  # type: ignore[assignment]
+    saved = M.controller_mail_summary
+    M.controller_mail_summary = lambda **k: (_ for _ in ()).throw(RuntimeError("boom"))  # type: ignore[assignment]
     try:
-        assert_eq("raise -> {}", S._mail_summary(), {})
+        assert_eq("raise -> {}", S._mail_summary({"x"}), {})
     finally:
-        M.build_aggregate = saved  # type: ignore[assignment]
+        M.controller_mail_summary = saved  # type: ignore[assignment]
 
 
 def test_render_text_includes_hint_when_present() -> None:
@@ -129,13 +148,14 @@ def test_non_regular_inbox_file_does_not_hang() -> None:
             signal.signal(signal.SIGALRM, old)
 
     out = _with_mail_dirs(body)
-    assert_eq("real need still surfaced, FIFO skipped without hang", out.get("open_user_needs"), 1)
+    assert_eq("real need still surfaced, FIFO skipped without hang", out.get("count"), 1)
 
 
 def main() -> None:
     tests = [
         test_no_mail_empty_summary,
-        test_open_user_need_surfaces_hint,
+        test_open_user_need_surfaces_hint_with_detail,
+        test_ownership_filter_excludes_other_controllers_workers,
         test_mail_check_is_fail_open,
         test_render_text_includes_hint_when_present,
         test_render_text_silent_when_no_mail,

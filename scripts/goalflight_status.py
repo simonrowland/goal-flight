@@ -948,36 +948,22 @@ def wait_for_dispatches(
         time.sleep(poll_s)
 
 
-def _mail_summary() -> dict:
+def _mail_summary(owned_dispatch_ids: set[str] | None = None) -> dict:
     """Read-side "you have mail" check, computed FRESH on every status call and
-    never stored in any status JSON (per the controller-mail design: the signal
-    is read-side only, never stamped into worker-liveness state). Returns
-    ``{"open_user_needs": N, "dispatch_ids": [...], "hint": "<one-line>"}`` when
-    the controller has open user-needs waiting, else ``{}``.
+    never stored in any status JSON (the controller-mail signal is read-side only,
+    never stamped into worker-liveness state). Delegates the mail-domain work to
+    goalflight_messages.controller_mail_summary; this wrapper only scopes it to the
+    controller's own dispatches and guarantees fail-open.
 
-    Fail-open: ANY error (mail module absent, unreadable inbox, malformed JSONL)
-    returns ``{}`` so a messaging glitch can never break or slow a status call.
+    ``owned_dispatch_ids`` limits the surfaced needs to this controller's workers
+    (the mailbox is machine-global). Fail-open: ANY error (mail module absent,
+    unreadable inbox, malformed JSONL) returns ``{}`` so a messaging glitch can
+    never break or slow a status call.
     """
     try:
         import goalflight_messages as _gm  # lazy: status must not hard-depend on mail
 
-        aggregate = _gm.build_aggregate(
-            messages_dir=_gm.default_messages_dir(),
-            fleet_dir=_gm.default_fleet_dir(),
-        )
-        needs = aggregate.get("open_user_needs") or []
-        if not needs:
-            return {}
-        ids = sorted({str(n.get("dispatch_id") or "?") for n in needs})
-        shown = ", ".join(ids[:3]) + ("" if len(ids) <= 3 else f" +{len(ids) - 3}")
-        return {
-            "open_user_needs": len(needs),
-            "dispatch_ids": ids,
-            "hint": (
-                f"\U0001f4ec mail: {len(needs)} open user-need(s) from "
-                f"[{shown}] - run: goalflight_messages.py relay"
-            ),
-        }
+        return _gm.controller_mail_summary(owned_dispatch_ids=owned_dispatch_ids)
     except Exception:
         return {}
 
@@ -1000,7 +986,7 @@ def render_text(payload: dict, limit: int) -> list[str]:
     ]
     mail = payload.get("mail") or {}
     if mail.get("hint"):
-        lines.append(mail["hint"])
+        lines.extend(mail["hint"].splitlines())  # hint is multi-line (one detail row per need)
     if payload.get("milestone"):
         lines.append(goalflight_milestone.format_line(payload["milestone"]))
     # Live/ambiguous first (what the controller is waiting on), then most-recent
@@ -1280,7 +1266,14 @@ def main(argv: list[str] | None = None) -> int:
     payload["milestone"] = _milestone_payload(project_root)
     # Read-side mail check: piggyback the "you have mail" signal onto the status
     # call every controller already runs. Computed fresh, fail-open, never stored.
-    payload["mail"] = _mail_summary()
+    # Scope it to THIS controller's own dispatches (the mailbox is machine-global),
+    # using the dispatch ids already in this scoped status view.
+    _owned = {
+        str(r.get("dispatch_id"))
+        for r in payload["dispatch"].get("records", [])
+        if r.get("dispatch_id")
+    }
+    payload["mail"] = _mail_summary(_owned)
 
     if args.json:
         print(json.dumps(payload, sort_keys=True))

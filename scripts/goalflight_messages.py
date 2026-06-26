@@ -441,6 +441,62 @@ def format_controller_relay(aggregate: dict) -> str | None:
     return "USER-NEED relay: " + " | ".join(parts)
 
 
+def _clip(text: object, limit: int = 100) -> str:
+    s = str(text or "").strip().replace("\n", " ")
+    return s if len(s) <= limit else s[: limit - 3] + "..."
+
+
+def _format_mail_hint(items: list[dict]) -> str:
+    """Multi-line controller hint: a header plus one detail line per open need,
+    each with the dispatch id, kind, and a clipped text so the controller can
+    follow up straight from a status check."""
+    head = f"\U0001f4ec mail: {len(items)} open need(s) from your worker(s) - run: goalflight_messages.py relay"
+    lines = [head]
+    for it in items[:5]:
+        lines.append(f"    [{it['dispatch_id']}] {it['type']}: {it['text']}")
+    if len(items) > 5:
+        lines.append(f"    (+{len(items) - 5} more)")
+    return "\n".join(lines)
+
+
+def controller_mail_summary(
+    *,
+    owned_dispatch_ids: set[str] | None = None,
+    messages_dir: Path | None = None,
+    fleet_dir: Path | None = None,
+) -> dict:
+    """Structured "you have mail" summary for a controller's status output.
+
+    Builds the inbox aggregate and returns the OPEN user-needs (user_need /
+    user_confirm / blocked) with enough detail to act on from a status check.
+
+    The mailbox is machine-global (shared across controllers), so when
+    ``owned_dispatch_ids`` is provided only needs from THOSE dispatches — the
+    controller's own workers — are surfaced; a controller must never see another
+    controller's workers' needs. ``None`` means no ownership filter (e.g. an
+    all-projects view). Returns ``{}`` when there is nothing to show.
+    """
+    aggregate = build_aggregate(
+        messages_dir=messages_dir or default_messages_dir(),
+        fleet_dir=fleet_dir if fleet_dir is not None else default_fleet_dir(),
+    )
+    needs = aggregate.get("open_user_needs") or []
+    if owned_dispatch_ids is not None:
+        needs = [n for n in needs if str(n.get("dispatch_id") or "") in owned_dispatch_ids]
+    if not needs:
+        return {}
+    items = [
+        {
+            "dispatch_id": str(n.get("dispatch_id") or "?"),
+            "type": str(n.get("type") or "user_need"),
+            "seq": n.get("seq"),
+            "text": _clip(n.get("text")),
+        }
+        for n in needs
+    ]
+    return {"count": len(items), "needs": items, "hint": _format_mail_hint(items)}
+
+
 def cmd_relay(args: argparse.Namespace) -> int:
     aggregate = build_aggregate(messages_dir=args.messages_dir, fleet_dir=args.fleet_dir)
     line = format_controller_relay(aggregate)
