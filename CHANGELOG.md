@@ -6,6 +6,21 @@ incremented when meaningful skill behaviour changes.
 
 ## [Unreleased]
 
+### Added
+- `goalflight_status.py` now surfaces a read-side **"you have mail"** hint on the
+  aggregate status output (text + the `--json` payload): a fresh, fail-open inbox
+  check that prints `mail: N open user-need(s) from [...]` so a controller learns
+  it has open user-needs without remembering to poll `goalflight_messages relay`.
+  Computed fresh on every call, never stored in any status JSON. It rides the
+  single aggregate poll that already covers every worker — `--wait` stays
+  deliberately mail-free so a message never collapses a multi-worker long-poll.
+
+### Fixed
+- `goalflight_messages.collect_inbox_paths` skips non-regular files: a FIFO/device
+  named `*.jsonl` in an inbox dir would block `read_text()`'s `open()` and hang a
+  status call before the read-side fail-open guard could fire. Protects the new
+  status mail check, `relay`, and every other inbox consumer.
+
 ## [1.0.10] — 2026-06-24
 
 Dispatch ergonomics + remote-drain + status-trust + codex-worker-search
