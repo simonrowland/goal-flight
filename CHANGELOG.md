@@ -9,11 +9,16 @@ incremented when meaningful skill behaviour changes.
 ### Added
 - `goalflight_status.py` now surfaces a read-side **"you have mail"** hint on the
   aggregate status output (text + the `--json` payload): a fresh, fail-open inbox
-  check that prints `mail: N open user-need(s) from [...]` so a controller learns
-  it has open user-needs without remembering to poll `goalflight_messages relay`.
-  Computed fresh on every call, never stored in any status JSON. It rides the
-  single aggregate poll that already covers every worker — `--wait` stays
-  deliberately mail-free so a message never collapses a multi-worker long-poll.
+  check so a controller learns it has open user-needs without remembering to poll
+  `goalflight_messages relay`. The hint lists each open need with its dispatch id,
+  kind, and text — enough detail to follow up straight from a status check — and is
+  **scoped to the controller's own workers** (the mailbox is machine-global, so it
+  never shows another controller's workers' needs). Computed fresh on every call,
+  never stored in any status JSON. It rides the single aggregate poll that already
+  covers every worker — `--wait` stays deliberately mail-free so a message never
+  collapses a multi-worker long-poll. The presentation lives in
+  `goalflight_messages.controller_mail_summary()` (beside the rest of the mail
+  domain); status only delegates.
 
 ### Fixed
 - `goalflight_messages.collect_inbox_paths` skips non-regular files: a FIFO/device
