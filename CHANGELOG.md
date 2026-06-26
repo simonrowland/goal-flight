@@ -6,6 +6,13 @@ incremented when meaningful skill behaviour changes.
 
 ## [Unreleased]
 
+## [1.0.11] — 2026-06-24
+
+The controller-mail system: a worker can reach its controller, and the controller
+learns it has mail from the `status` call it already runs — no separate poll, no
+long-poll teardown. Folds two independent review rounds (read-side hang +
+cross-controller suppression; write-side liveness + retry storm).
+
 ### Added
 - `goalflight_status.py` now surfaces a read-side **"you have mail"** hint on the
   aggregate status output (text + the `--json` payload): a fresh, fail-open inbox
@@ -32,6 +39,13 @@ incremented when meaningful skill behaviour changes.
   named `*.jsonl` in an inbox dir would block `read_text()`'s `open()` and hang a
   status call before the read-side fail-open guard could fire. Protects the new
   status mail check, `relay`, and every other inbox consumer.
+- A scoped status mail check now reads only the controller's own inboxes and is
+  per-inbox tolerant, so an unrelated controller's corrupt or large inbox can
+  neither suppress the controller's own need nor slow the scoped call.
+- The shared mail writer fails closed on a non-regular inbox: `read_envelopes`
+  treats a FIFO/device as empty (non-blocking stat) and `post_message` raises
+  before any `open()`, so CLI/MCP/direct callers — not just the watcher bridge —
+  can never hang on a FIFO inbox.
 
 ## [1.0.10] — 2026-06-24
 
