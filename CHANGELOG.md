@@ -20,6 +20,13 @@ incremented when meaningful skill behaviour changes.
   `goalflight_messages.controller_mail_summary()` (beside the rest of the mail
   domain); status only delegates.
 
+- Worker→controller mail bridge: the watcher posts a worker's `USER-NEED` /
+  `USER-CONFIRM` / `BLOCKED` markers as envelopes into that dispatch's inbox, so the
+  controller's status mail hint surfaces the question/blocker text. Reuses markers
+  workers already emit (no new worker capability), urgent-trio only, deduped
+  (in-memory + restart-safe), and strictly best-effort so it can never stall or storm
+  the watcher's liveness loop.
+
 ### Fixed
 - `goalflight_messages.collect_inbox_paths` skips non-regular files: a FIFO/device
   named `*.jsonl` in an inbox dir would block `read_text()`'s `open()` and hang a
