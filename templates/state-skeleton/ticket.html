@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>goal-flight · item</title>
+<style>
+:root{--bg:#fff;--fg:#1a1d21;--muted:#6b7280;--accent:#2563eb;--border:#e5e7eb;--warn:#b45309;
+  --card:#fff;--chip:#f3f4f6;--chip-fg:#374151;--ok:#15803d;--danger:#b91c1c;--shadow:0 1px 2px rgba(0,0,0,.04),0 1px 3px rgba(0,0,0,.06)}
+@media (prefers-color-scheme:dark){:root{--bg:#0f1115;--fg:#e6e8eb;--muted:#9aa0a6;--accent:#6ea8fe;--border:#262a31;--warn:#f59e0b;
+  --card:#161922;--chip:#222732;--chip-fg:#c4cad4;--ok:#4ade80;--danger:#f87171;--shadow:0 1px 2px rgba(0,0,0,.3)}}
+*{box-sizing:border-box}
+html{font:16px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+body{margin:0;background:var(--bg);color:var(--fg)}
+main{max-width:46rem;margin:0 auto;padding:1.5rem 1.25rem 3rem}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+a:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:.3rem}
+.crumbs{color:var(--muted);font-size:.85rem;margin:0 0 1.2rem}
+.crumbs a{color:var(--muted)}
+.idtag{font:.8rem ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted)}
+h1{font-size:1.35rem;margin:.2em 0 .6em;letter-spacing:-.01em;line-height:1.35}
+.headrow{display:flex;gap:.5rem;flex-wrap:wrap;align-items:center;margin:.2rem 0 1.2rem}
+.kind,.sev,.badge{font:.74rem/1.7 ui-monospace,SFMono-Regular,Menlo,monospace;border-radius:1rem;padding:.05rem .6rem}
+.kind{background:var(--chip);color:var(--chip-fg)}
+.kind-bug{background:rgba(180,83,9,.14);color:var(--warn)}
+.kind-decision{background:rgba(37,99,235,.14);color:var(--accent)}
+.sev{background:rgba(180,83,9,.14);color:var(--warn)}
+.sev-high,.sev-critical{background:rgba(220,38,38,.16);color:var(--danger)}
+.badge{border:1px solid var(--border);color:var(--muted)}
+.badge-decision{color:var(--warn);border-color:var(--warn)}
+.badge-pending{color:var(--accent);border-color:var(--accent)}
+.badge-working{color:var(--accent);border-color:var(--accent)}
+.badge-worker-finished{color:#a855f7;border-color:#a855f7}
+.badge-waiting{color:var(--warn);border-color:var(--warn)}
+.badge-done{color:var(--ok);border-color:var(--ok)}
+dl{display:grid;grid-template-columns:max-content 1fr;gap:.5rem 1rem;margin:0;
+  background:var(--card);border:1px solid var(--border);border-radius:.7rem;padding:1rem 1.1rem;box-shadow:var(--shadow)}
+dt{color:var(--muted);font-size:.82rem;text-transform:uppercase;letter-spacing:.04em;padding-top:.1rem}
+dd{margin:0;min-width:0;word-break:break-word}
+dd ul{margin:0;padding-left:1.1rem}
+.blocker{font:.78rem ui-monospace,SFMono-Regular,Menlo,monospace;border:1px solid var(--warn);color:var(--warn);
+  border-radius:1rem;padding:.02rem .55rem;margin-right:.35rem;display:inline-block}
+.blocker-ok{color:var(--ok);border-color:var(--ok)}
+pre{background:var(--chip);border:1px solid var(--border);border-radius:.5rem;padding:.8rem;overflow:auto;
+  font:.85rem ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;margin:.3rem 0 0}
+.section-title{font-size:.82rem;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin:1.6rem 0 .5rem}
+.notfound{background:var(--card);border:1px solid var(--warn);border-radius:.7rem;padding:1.2rem;color:var(--warn)}
+.idlink{font:inherit ui-monospace,SFMono-Regular,Menlo,monospace}
+footer{max-width:46rem;margin:0 auto;padding:1.5rem 1.25rem 2rem;color:var(--muted);font-size:.78rem}
+</style>
+</head>
+<body>
+<main>
+  <nav class="crumbs" aria-label="Breadcrumb"><a href="tickets.html">← board</a> · <a href="index.html">dashboard</a> · <span class="idtag" id="crumbId"></span></nav>
+  <div id="detail">Loading…</div>
+</main>
+<footer>goal-flight · Tier-2 view</footer>
+
+<script src="tasks-data.js"></script>
+<script src="gf.js"></script>
+<script>
+(function(){
+  "use strict";
+  var mount = document.getElementById("detail");
+  var wantId = GF.qs("id");
+  document.getElementById("crumbId").textContent = wantId ? wantId : "";
+
+  function row(dt, ddHtml){ return "<dt>"+GF.esc(dt)+"</dt><dd>"+ddHtml+"</dd>"; }
+
+  // Allowlist link schemes before emitting an href. links[]/prompt_path are
+  // harvested from worker-authored markdown, so a javascript:/data:/vbscript:
+  // value must never reach the href attribute (esc() entity-encodes but does
+  // NOT neutralize a URL scheme). http(s), mailto, relative paths and #anchors
+  // pass through; anything else is rejected to a dead '#'.
+  function safeHref(url){
+    var u = String(url == null ? "" : url).trim();
+    if(/^\s*(javascript|data|vbscript):/i.test(u)) return "#";
+    // A scheme is "word:" at the very start; allow only http/https/mailto.
+    var m = /^([a-zA-Z][a-zA-Z0-9+.-]*):/.exec(u);
+    if(m && !/^(https?|mailto)$/i.test(m[1])) return "#";
+    return GF.esc(u);
+  }
+
+  function blockerList(ids){
+    if(!ids || !ids.length) return "<span style='color:var(--muted)'>none</span>";
+    return ids.map(function(bid){
+      var b = GF.store.byId[bid];
+      var ok = b && b.done;
+      var cls = "blocker"+(ok?" blocker-ok":"");
+      var glyph = ok ? "✓" : "⏸";
+      var label = GF.esc(bid)+", blocker "+(ok?"resolved":"still blocking")+(b?"":", unknown item");
+      return '<a class="'+cls+'" href="ticket.html?id='+encodeURIComponent(bid)+'" aria-label="'+label+'">'+
+             '<span aria-hidden="true">'+glyph+" </span>"+GF.esc(bid)+(b?'':' (unknown)')+"</a>";
+    }).join(" ");
+  }
+
+  function linkList(links){
+    if(!links || !links.length) return "<span style='color:var(--muted)'>none</span>";
+    return "<ul>"+links.map(function(l){
+      // ids link to ticket.html; other strings link as-is (relative doc/anchor)
+      if(/^[tbq]-\d+$/.test(l) || /^(ADR|bp)-\d+$/i.test(l)){
+        // Flag a link to an id that has no item, so a dangling cross-reference
+        // doesn't masquerade as a live ticket (matches blockerList's guard).
+        var known = GF.store.byId[l];
+        return "<li>"+GF.idLink(l, "idlink")+(known?"":" <span style='color:var(--muted)'>(unknown)</span>")+"</li>";
+      }
+      return "<li><a href='"+safeHref(l)+"'>"+GF.esc(l)+"</a></li>";
+    }).join("")+"</ul>";
+  }
+
+  function render(){
+    var it = wantId ? GF.store.byId[wantId] : null;
+    if(!it){
+      mount.innerHTML =
+        '<div class="notfound"><strong>Item not found</strong><br>'+
+        (wantId ? "No item with id <code>"+GF.esc(wantId)+"</code>." : "No <code>?id=</code> given.")+
+        ' <a href="tickets.html">Back to the board →</a></div>';
+      document.title = "goal-flight · not found";
+      return;
+    }
+    var sec = it._section;
+    document.title = "goal-flight · " + it.id;
+    var html = "<h1>"+GF.autolink(it.title)+"</h1>";
+    html += '<div class="headrow">'+GF.kindBadge(it.kind)+GF.statusBadge(sec)+
+            (it.kind==="bug"&&it.severity?'<span class="sev sev-'+GF.esc(it.severity)+'">'+GF.esc(it.severity)+"</span>":"")+"</div>";
+
+    html += "<dl>";
+    html += row("id", '<span class="idtag">'+GF.esc(it.id)+"</span>");
+    html += row("kind", GF.esc(it.kind));
+    html += row("status", GF.esc(GF.STATUS_LABELS[sec]||sec));
+    html += row("blocked by", blockerList(it.blocked_by));
+    html += row("links", linkList(it.links));
+    if(it.kind==="bug"){
+      if(it.severity) html += row("severity", GF.esc(it.severity));
+      if(it.pattern)  html += row("pattern", GF.idLink(it.pattern, "idlink"));
+      if(it.source)   html += row("source", GF.esc(it.source));
+    }
+    // For non-bug items `source` carries a completion date (bugs use it for the
+    // provenance enum, rendered above). Label it as the date it is, not "done".
+    if(it.source && it.kind!=="bug") html += row("completed", GF.esc(it.source));
+    html += "</dl>";
+
+    if(it.acceptance){
+      html += '<p class="section-title">Acceptance</p><p>'+GF.autolink(it.acceptance)+"</p>";
+    }
+    if(it.prompt){
+      html += '<p class="section-title">Prompt</p><pre>'+GF.esc(it.prompt)+"</pre>";
+    } else if(it.prompt_path){
+      html += '<p class="section-title">Prompt</p><p><a href="'+safeHref(it.prompt_path)+'">'+GF.esc(it.prompt_path)+"</a></p>";
+    }
+    mount.innerHTML = html;
+  }
+
+  GF.attach({ onRender: render, interval: 3000 });
+})();
+</script>
+</body>
+</html>

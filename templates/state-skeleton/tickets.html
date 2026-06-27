@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>goal-flight · board</title>
+<style>
+:root{--bg:#fff;--fg:#1a1d21;--muted:#6b7280;--accent:#2563eb;--accent-solid:#2563eb;--border:#e5e7eb;--warn:#b45309;
+  --card:#fff;--chip:#f3f4f6;--chip-fg:#374151;--ok:#15803d;--danger:#b91c1c;--shadow:0 1px 2px rgba(0,0,0,.04),0 1px 3px rgba(0,0,0,.06)}
+@media (prefers-color-scheme:dark){:root{--bg:#0f1115;--fg:#e6e8eb;--muted:#9aa0a6;--accent:#6ea8fe;--accent-solid:#1d4ed8;--border:#262a31;--warn:#f59e0b;
+  --card:#161922;--chip:#222732;--chip-fg:#c4cad4;--ok:#4ade80;--danger:#f87171;--shadow:0 1px 2px rgba(0,0,0,.3)}}
+/* visually-hidden, but exposed to assistive tech and revealed on focus */
+.visually-hidden{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0}
+.skip-link{position:absolute;left:.5rem;top:-3rem;z-index:20;background:var(--card);color:var(--fg);
+  border:1px solid var(--accent);border-radius:.4rem;padding:.4rem .7rem;transition:top .12s}
+.skip-link:focus{top:.5rem;text-decoration:none}
+*{box-sizing:border-box}
+html{font:16px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+body{margin:0;background:var(--bg);color:var(--fg);-webkit-font-smoothing:antialiased}
+main{max-width:52rem;margin:0 auto;padding:1.5rem 1.25rem 3rem}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+.top{display:flex;align-items:baseline;justify-content:space-between;gap:1rem;flex-wrap:wrap}
+h1{font-size:1.4rem;margin:.2em 0 .1em;letter-spacing:-.01em}
+.crumbs{color:var(--muted);font-size:.85rem}
+.crumbs a{color:var(--muted)}
+/* controls bar */
+.controls{position:sticky;top:0;z-index:5;background:var(--bg);
+  display:flex;gap:.5rem;flex-wrap:wrap;align-items:center;
+  padding:.7rem 0 .6rem;margin:.6rem 0 .4rem;border-bottom:1px solid var(--border);
+  box-shadow:0 4px 6px -4px rgba(0,0,0,.12)}
+.controls .grow{flex:1 1 11rem;min-width:9rem}
+input[type=search],select{font:inherit;color:var(--fg);background:var(--card);
+  border:1px solid var(--border);border-radius:.5rem;padding:.4rem .6rem;width:100%}
+select{width:auto;cursor:pointer}
+input[type=search]{width:100%}
+input:focus-visible,select:focus-visible,button:focus-visible,a:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:.4rem}
+.seg{display:inline-flex;border:1px solid var(--border);border-radius:.5rem;overflow:hidden;background:var(--card)}
+.seg button{font:inherit;border:0;background:transparent;color:var(--muted);padding:.4rem .7rem;cursor:pointer}
+.seg button[aria-pressed=true]{background:var(--accent-solid);color:#fff}
+.seg button+button{border-left:1px solid var(--border)}
+.label{font-size:.78rem;color:var(--muted);margin-right:.15rem}
+.spacer{flex:1 1 auto}
+.mode{font:.72rem ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted);white-space:nowrap}
+.dot{display:inline-block;width:.5rem;height:.5rem;border-radius:50%;background:var(--muted);margin-right:.35rem;vertical-align:middle}
+.mode.live .dot{background:var(--ok);animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+.linkbtn{font:inherit;background:transparent;border:1px solid var(--border);color:var(--fg);
+  border-radius:.5rem;padding:.4rem .7rem;cursor:pointer}
+.linkbtn:hover{border-color:var(--accent);color:var(--accent)}
+/* sections */
+.sec{margin:1.3rem 0 0}
+.sec h2{font-size:.82rem;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);
+  margin:.2em 0 .5em;display:flex;align-items:center;gap:.5rem}
+.sec h2 .count{font:.72rem ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--chip-fg);
+  background:var(--chip);border-radius:1rem;padding:.05rem .5rem;font-weight:600}
+.sec-decision h2{color:var(--warn)}
+ul.rows{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:.4rem}
+.row{display:flex;gap:.75rem;align-items:flex-start;background:var(--card);border:1px solid var(--border);
+  border-radius:.6rem;padding:.6rem .75rem;box-shadow:var(--shadow);transition:border-color .12s,transform .12s}
+.row:hover{border-color:var(--accent);transform:translateY(-1px)}
+.row .id{font:.78rem/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted);
+  min-width:3.4rem;padding-top:.1rem;flex:none}
+.row .body{display:flex;flex-direction:column;gap:.35rem;min-width:0}
+.row .title{word-break:break-word}
+.row .title .idlink{font:.92em ui-monospace,SFMono-Regular,Menlo,monospace}
+.row .tags{display:flex;gap:.4rem;flex-wrap:wrap;align-items:center}
+/* left status rail per section */
+.sec-decision ul.rows .row{border-left:3px solid var(--warn)}
+.sec-working ul.rows .row{border-left:3px solid var(--accent)}
+.sec-review ul.rows .row{border-left:3px solid #a855f7}
+.sec-waiting ul.rows .row{border-left:3px solid var(--warn)}
+.done-list{flex-direction:column}
+.row-done{opacity:.6}
+.row-done .title{text-decoration:none}
+/* chips */
+.kind,.sev,.blocker,.badge{font:.7rem/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;
+  border-radius:1rem;padding:.02rem .5rem;white-space:nowrap}
+.kind{background:var(--chip);color:var(--chip-fg)}
+/* kind = category (neutral); severity = amber→red alert. Keep them distinct so
+   a 'bug' kind chip and a medium/low severity chip don't read as twins. */
+.kind-bug{background:var(--chip);color:var(--chip-fg)}
+.kind-decision{background:rgba(37,99,235,.14);color:var(--accent)}
+.sev{background:rgba(180,83,9,.14);color:var(--warn)}
+.sev-high,.sev-critical{background:rgba(220,38,38,.16);color:var(--danger)}
+.blocker{color:var(--warn);border:1px solid var(--warn)}
+.blocker-ok{color:var(--ok);border-color:var(--ok)}
+.empty{color:var(--muted);padding:2rem 0;text-align:center}
+footer{max-width:52rem;margin:0 auto;padding:1.5rem 1.25rem 2rem;color:var(--muted);font-size:.78rem}
+@media (max-width:520px){.row .id{min-width:0}}
+</style>
+</head>
+<body>
+<a class="skip-link" href="#board">Skip to items</a>
+<main>
+  <div class="top">
+    <div>
+      <h1>Work board</h1>
+      <nav class="crumbs" aria-label="Breadcrumb"><a href="index.html">← dashboard</a> · <a href="current-activity.html">live activity</a> · <a href="questions-for-user.html">decisions</a></nav>
+    </div>
+  </div>
+
+  <div class="controls" role="region" aria-label="Board controls">
+    <input class="grow" type="search" id="q" placeholder="Search id or title…" aria-label="Search items">
+    <span class="seg" role="group" aria-label="Filter by kind" id="kindSeg">
+      <button type="button" data-kind="all" aria-pressed="true">All</button>
+      <button type="button" data-kind="task" aria-pressed="false">Tasks</button>
+      <button type="button" data-kind="bug" aria-pressed="false">Bugs</button>
+      <button type="button" data-kind="decision" aria-pressed="false">Decisions</button>
+    </span>
+    <label class="label" for="statusSel">status</label>
+    <select id="statusSel" aria-label="Filter by status">
+      <option value="all">all</option>
+      <option value="decision">decisions needed</option>
+      <option value="pending">to do</option>
+      <option value="working">in progress</option>
+      <option value="worker-finished">awaiting review</option>
+      <option value="waiting">waiting</option>
+      <option value="done">done</option>
+    </select>
+    <label class="label" for="sortSel">sort</label>
+    <select id="sortSel" aria-label="Sort items">
+      <option value="id">id</option>
+      <option value="status">status</option>
+      <option value="severity">severity</option>
+    </select>
+    <span class="spacer"></span>
+    <span class="mode" id="mode" aria-live="polite"><span class="dot"></span><span id="modeText">loading…</span></span>
+    <button class="linkbtn" type="button" id="refresh" title="Reload data">Refresh</button>
+  </div>
+
+  <div id="board"></div>
+  <p class="visually-hidden" id="boardStatus" role="status" aria-live="polite"></p>
+</main>
+<footer><span id="foot">goal-flight · Tier-2 view</span></footer>
+
+<script src="tasks-data.js"></script>
+<script src="gf.js"></script>
+<script>
+(function(){
+  "use strict";
+  var board = document.getElementById("board");
+  var boardStatus = document.getElementById("boardStatus");
+  var ctrl = { kind:"all", status:"all", q:"", sort:"id" };
+
+  // Announce a concise count delta on a debounce instead of letting the whole
+  // board live-region re-read every row on each keystroke / poll tick.
+  var announceTimer = null;
+  function announce(visible){
+    if(announceTimer) clearTimeout(announceTimer);
+    announceTimer = setTimeout(function(){
+      var total = GF.store.items.length;
+      boardStatus.textContent = "Showing " + visible + " of " + total + " items";
+    }, 350);
+  }
+
+  function render(){ var n = GF.renderBoard(board, ctrl); announce(n); }
+
+  // wire controls
+  document.getElementById("q").addEventListener("input", function(e){ ctrl.q = e.target.value; render(); });
+  document.getElementById("statusSel").addEventListener("change", function(e){ ctrl.status = e.target.value; render(); });
+  document.getElementById("sortSel").addEventListener("change", function(e){ ctrl.sort = e.target.value; render(); });
+  var kindSeg = document.getElementById("kindSeg");
+  kindSeg.addEventListener("click", function(e){
+    var b = e.target.closest("button[data-kind]"); if(!b) return;
+    ctrl.kind = b.getAttribute("data-kind");
+    Array.prototype.forEach.call(kindSeg.querySelectorAll("button"), function(x){
+      x.setAttribute("aria-pressed", String(x===b));
+    });
+    render();
+  });
+  // delegated "clear filters" from the empty state
+  board.addEventListener("click", function(e){
+    if(e.target && e.target.hasAttribute("data-gf-clear")){
+      ctrl = { kind:"all", status:"all", q:"", sort:"id" };
+      document.getElementById("q").value=""; document.getElementById("statusSel").value="all";
+      document.getElementById("sortSel").value="id";
+      Array.prototype.forEach.call(kindSeg.querySelectorAll("button"), function(x){
+        x.setAttribute("aria-pressed", String(x.getAttribute("data-kind")==="all"));
+      });
+      render();
+    }
+  });
+  document.getElementById("refresh").addEventListener("click", function(){ driver.refresh(); });
+
+  function setMode(mode){
+    var el = document.getElementById("mode");
+    var txt = document.getElementById("modeText");
+    if(mode === "served"){ el.classList.add("live"); txt.textContent = "live · polling"; }
+    else { el.classList.remove("live"); txt.textContent = "snapshot · file://"; }
+  }
+
+  var driver = GF.attach({
+    onRender: render,
+    onMode: setMode,
+    interval: 3000
+  });
+  driver.ready.then(function(){
+    document.getElementById("foot").textContent =
+      "goal-flight · " + GF.store.items.length + " items · " + GF.store.mode;
+  });
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>goal-flight</title>
+<style>
+:root{--bg:#fff;--fg:#1a1d21;--muted:#6b7280;--accent:#2563eb;--border:#e5e7eb;--warn:#b45309;
+  --card:#fff;--chip:#f3f4f6;--chip-fg:#374151;--ok:#15803d;--review:#a855f7;--shadow:0 1px 2px rgba(0,0,0,.04),0 1px 3px rgba(0,0,0,.06)}
+@media (prefers-color-scheme:dark){:root{--bg:#0f1115;--fg:#e6e8eb;--muted:#9aa0a6;--accent:#6ea8fe;--border:#262a31;--warn:#f59e0b;
+  --card:#161922;--chip:#222732;--chip-fg:#c4cad4;--ok:#4ade80;--review:#c084fc;--shadow:0 1px 2px rgba(0,0,0,.3)}}
+/* Darker purple for small count text on white (the lane border can stay --review). */
+:root{--review-text:#9333ea}
+@media (prefers-color-scheme:dark){:root{--review-text:#c084fc}}
+*{box-sizing:border-box}
+.visually-hidden{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0}
+.skip-link{position:absolute;left:.5rem;top:-3rem;z-index:20;background:var(--card);color:var(--fg);
+  border:1px solid var(--accent);border-radius:.4rem;padding:.4rem .7rem;transition:top .12s}
+.skip-link:focus{top:.5rem;text-decoration:none}
+html{font:16px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+body{margin:0;background:var(--bg);color:var(--fg)}
+main{max-width:46rem;margin:0 auto;padding:1.5rem 1.25rem 2rem}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+a:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:.3rem}
+.top{display:flex;align-items:baseline;justify-content:space-between;gap:1rem;flex-wrap:wrap}
+h1{font-size:1.5rem;margin:.2em 0 .1em;letter-spacing:-.01em}
+.tagline{color:var(--muted);font-size:.9rem;margin:.1em 0 0}
+.mode{font:.72rem ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted)}
+.dot{display:inline-block;width:.5rem;height:.5rem;border-radius:50%;background:var(--muted);margin-right:.35rem;vertical-align:middle}
+.mode.live .dot{background:var(--ok)}
+h2{font-size:1.0rem;margin:1.7em 0 .5em;border-bottom:1px solid var(--border);padding-bottom:.25em}
+/* count cards */
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(7.2rem,1fr));gap:.6rem;margin:1.2rem 0 .3rem}
+.cards a{display:block;background:var(--card);border:1px solid var(--border);border-radius:.7rem;
+  padding:.7rem .8rem;box-shadow:var(--shadow);transition:border-color .12s,transform .12s}
+.cards a:hover{border-color:var(--accent);text-decoration:none;transform:translateY(-1px)}
+.cards .n{font-size:1.7rem;font-weight:700;line-height:1;letter-spacing:-.02em}
+.cards .k{display:block;margin-top:.3rem;font-size:.78rem;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+.cards .c-decision .n{color:var(--warn)}
+.cards .c-pending .n{color:var(--accent)}
+.cards .c-working .n{color:var(--accent)}
+.cards .c-worker-finished .n{color:var(--review-text)}
+.cards .c-waiting .n{color:var(--warn)}
+.cards .c-done .n{color:var(--ok)}
+/* primary nav */
+.nav{display:grid;grid-template-columns:repeat(auto-fit,minmax(13rem,1fr));gap:.7rem;margin:.6rem 0 .3rem}
+.nav a{display:block;background:var(--card);border:1px solid var(--border);border-radius:.7rem;
+  padding:.85rem 1rem;box-shadow:var(--shadow);transition:border-color .12s}
+.nav a:hover{border-color:var(--accent);text-decoration:none}
+.nav .h{font-weight:600}
+.nav .d{display:block;margin-top:.2rem;font-size:.82rem;color:var(--muted)}
+/* decisions strip */
+.warnstrip a{color:var(--warn)}
+.warnstrip{color:var(--warn);font-size:.92rem}
+.docs a{display:inline-block;margin:.15em .9em .15em 0}
+.docs{margin-top:.3rem}
+footer{max-width:46rem;margin:0 auto;padding:.5rem 1.25rem 2rem;color:var(--muted);font-size:.78rem}
+</style>
+</head>
+<body>
+<a class="skip-link" href="#cards">Skip to status</a>
+<main>
+  <div class="top">
+    <div>
+      <h1>goal-flight</h1>
+      <p class="tagline">project state · live progress dashboard</p>
+    </div>
+    <span class="mode" id="mode"><span class="dot"></span><span id="modeText">loading…</span></span>
+  </div>
+
+  <div class="cards" id="cards" aria-label="Status counts"></div>
+
+  <h2 id="views">Views</h2>
+  <nav class="nav" aria-labelledby="views">
+    <a href="tickets.html"><span class="h">Work board →</span><span class="d">All tasks &amp; bugs · sort, filter, search</span></a>
+    <a href="current-activity.html"><span class="h">Live activity →</span><span class="d">In-progress · awaiting review · recently done</span></a>
+    <a href="questions-for-user.html"><span class="h">Decisions →</span><span class="d">Open questions &amp; the ADR log</span></a>
+  </nav>
+
+  <div class="warnstrip" id="decisions" role="status" aria-live="polite"></div>
+
+  <h2>Documents</h2>
+  <p class="docs">
+    <a href="NORTH-STAR.md">north star</a>
+    <a href="SRS.md">SRS</a>
+    <a href="ARCHITECTURE.md">architecture</a>
+    <a href="ARCHITECTURE-increments.md">increments</a>
+    <a href="TEST-PLAN.md">test plan</a>
+    <a href="task-decomposition.md">tasks</a>
+    <a href="bug-backlog.md">bug backlog</a>
+    <a href="bug-patterns.md">bug patterns</a>
+    <a href="bugs-done.md">bugs done</a>
+    <a href="history.md">history</a>
+    <a href="RESUME-NOTES-2026-06-20.md">resume notes</a>
+    <a href="reviews/">reviews/</a>
+    <a href="research/">research/</a>
+  </p>
+</main>
+<footer><span id="foot">goal-flight · Tier-2 dashboard</span></footer>
+
+<script src="tasks-data.js"></script>
+<script src="gf.js"></script>
+<script>
+(function(){
+  "use strict";
+  var CARD_KEYS = [
+    {key:"decision",label:"decisions",href:"questions-for-user.html"},
+    {key:"pending",label:"to do",href:"tickets.html"},
+    {key:"working",label:"in progress",href:"current-activity.html"},
+    {key:"worker-finished",label:"awaiting review",href:"current-activity.html"},
+    {key:"waiting",label:"waiting",href:"tickets.html"},
+    {key:"done",label:"done",href:"tickets.html"}
+  ];
+
+  function render(){
+    var c = GF.counts();
+    document.getElementById("cards").innerHTML = CARD_KEYS.map(function(s){
+      return '<a class="c-'+s.key+'" href="'+s.href+'" aria-label="'+(c[s.key]||0)+' '+s.label+'">'+
+             '<span class="n">'+(c[s.key]||0)+'</span><span class="k">'+s.label+"</span></a>";
+    }).join("");
+
+    // open-decisions strip
+    var open = GF.store.items.filter(function(it){ return it._section==="decision"; });
+    var strip = document.getElementById("decisions");
+    if(open.length){
+      strip.innerHTML = '<span aria-hidden="true">⚠ </span><span class="visually-hidden">Attention: </span>' +
+       open.map(function(it){
+        // Canonical edge: tasks that declare THIS decision in their blocked_by.
+        // (Fall back to the decision's own links for any legacy mirrored edge.)
+        var holds = GF.store.items.filter(function(t){
+          return (t.blocked_by||[]).indexOf(it.id) >= 0;
+        }).map(function(t){ return t.id; });
+        if(!holds.length && it.links){
+          holds = it.links.filter(function(l){ return /^[tbq]-\d+$/.test(l); });
+        }
+        var tail = holds.length ? " — blocks "+holds.map(function(h){return GF.idLink(h);}).join(", ") : "";
+        return GF.idLink(it.id)+tail;
+      }).join(" · ");
+    } else {
+      strip.innerHTML = "";
+    }
+    document.getElementById("foot").textContent =
+      "goal-flight · " + c._total + " items · " + GF.store.mode;
+  }
+
+  function setMode(mode){
+    var el=document.getElementById("mode"), txt=document.getElementById("modeText");
+    if(mode==="served"){ el.classList.add("live"); txt.textContent="live"; }
+    else { el.classList.remove("live"); txt.textContent="snapshot"; }
+  }
+
+  GF.attach({ onRender: render, onMode: setMode, interval: 4000 });
+})();
+</script>
+</body>
+</html>

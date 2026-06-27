@@ -16,6 +16,22 @@ Private. Read before touching code.
 > (`goalflight_session_status.py --ensure-session` vs the active queue's
 > `current_session.id`).
 
+## Living state — read the newest docs-private/RESUME-NOTES-*.md first
+
+Durable project state lives at fixed paths under `docs-private/` (convention over
+configuration). At session start read the newest `RESUME-NOTES-*.md` (current
+goals, next action, key pins), then re-ground in the docs it points to. Update the
+relevant living doc when its subject changes — don't leave it only in chat.
+Find newest: `ls -1 docs-private/RESUME-NOTES-*.md | sort | tail -1`.
+Grep cheat: `^### ADR-` / `^### Q-` (decisions/questions), `^## (t|b)-\d+` (tasks/bugs).
+
+- `RESUME-NOTES-<date>.md` — living current-state pin (newest); `history.md` — write-once project log
+- `NORTH-STAR.md` · `SRS.md` · `ARCHITECTURE.md` (+ `ARCHITECTURE-increments.md`) · `TEST-PLAN.md`
+- `task-decomposition.md` (to do) / `tasks-done.md` (done) — GENERATED from `tasks.jsonl`; a job is in one, never both
+- `bug-backlog.md` (open) / `bug-patterns.md` (classes) / `bugs-done.md` (fixed)
+- `questions-for-user.md` — open decisions (list the task ids they block) + ADRs
+- `reviews/` · `research/` · `index.html` (browser dashboard)
+
 ## What this project is
 
 <short description>
@@ -53,7 +69,7 @@ Private. Read before touching code.
   outputs, and resume notes there.
 - use the project commands above for verification before closing a chunk.
 - **post-compaction reload**: run the activation check first; if active,
-  read newest `docs-private/RESUME-NOTES-<YYYY-MM-DD>.md` and the active
+  read the newest `docs-private/RESUME-NOTES-*.md` (the living pin) and the active
   goal-queue's frontmatter. Full sequence in `protocols/state-handoff.md`.
 
 ## Git workflow

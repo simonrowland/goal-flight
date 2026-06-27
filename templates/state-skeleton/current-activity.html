@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>goal-flight · live activity</title>
+<style>
+:root{--bg:#fff;--fg:#1a1d21;--muted:#6b7280;--accent:#2563eb;--border:#e5e7eb;--warn:#b45309;
+  --card:#fff;--chip:#f3f4f6;--chip-fg:#374151;--ok:#15803d;--review:#a855f7;--shadow:0 1px 2px rgba(0,0,0,.04),0 1px 3px rgba(0,0,0,.06)}
+@media (prefers-color-scheme:dark){:root{--bg:#0f1115;--fg:#e6e8eb;--muted:#9aa0a6;--accent:#6ea8fe;--border:#262a31;--warn:#f59e0b;
+  --card:#161922;--chip:#222732;--chip-fg:#c4cad4;--ok:#4ade80;--review:#c084fc;--shadow:0 1px 2px rgba(0,0,0,.3)}}
+*{box-sizing:border-box}
+html{font:16px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+body{margin:0;background:var(--bg);color:var(--fg)}
+main{max-width:50rem;margin:0 auto;padding:1.5rem 1.25rem 3rem}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+a:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:.3rem}
+.top{display:flex;align-items:baseline;justify-content:space-between;gap:1rem;flex-wrap:wrap}
+h1{font-size:1.4rem;margin:.2em 0 .1em;letter-spacing:-.01em}
+.crumbs{color:var(--muted);font-size:.85rem}
+.crumbs a{color:var(--muted)}
+.mode{font:.72rem ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted);white-space:nowrap}
+.dot{display:inline-block;width:.5rem;height:.5rem;border-radius:50%;background:var(--muted);margin-right:.35rem;vertical-align:middle}
+.mode.live .dot{background:var(--ok);animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+.cols{display:grid;grid-template-columns:1fr;gap:1.4rem;margin-top:1.2rem}
+@media(min-width:720px){.cols{grid-template-columns:1fr 1fr}}
+.lane h2{font-size:.82rem;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);
+  margin:0 0 .6rem;display:flex;align-items:center;gap:.5rem}
+.lane h2 .count{font:.72rem ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--chip-fg);
+  background:var(--chip);border-radius:1rem;padding:.05rem .5rem;font-weight:600}
+.lane.working h2{color:var(--accent)}
+.lane.review h2{color:var(--review)}
+ul{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:.5rem}
+.card{background:var(--card);border:1px solid var(--border);border-radius:.6rem;padding:.6rem .75rem;box-shadow:var(--shadow)}
+.lane.working .card{border-left:3px solid var(--accent)}
+.lane.review .card{border-left:3px solid var(--review)}
+.card .id{font:.76rem ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted)}
+.card .title{margin-top:.2rem;word-break:break-word}
+.card .title .idlink{font:.92em ui-monospace,SFMono-Regular,Menlo,monospace}
+.empty{color:var(--muted);font-style:italic;padding:.6rem .75rem;
+  border:1px dashed var(--border);border-radius:.6rem;background:transparent}
+/* idle state: when no worker is active, lift the Recently-done feed to primary */
+.idle-banner{margin:1.2rem 0 0;padding:.6rem .8rem;border:1px solid var(--border);
+  border-left:3px solid var(--ok);border-radius:.6rem;background:var(--card);
+  color:var(--fg);font-size:.92rem}
+body.idle .cols{opacity:.7}
+body.idle .feed{margin-top:1.4rem}
+.visually-hidden{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0}
+.skip-link{position:absolute;left:.5rem;top:-3rem;z-index:20;background:var(--card);color:var(--fg);
+  border:1px solid var(--accent);border-radius:.4rem;padding:.4rem .7rem;transition:top .12s}
+.skip-link:focus{top:.5rem;text-decoration:none}
+.feed{margin-top:1.8rem}
+.feed h2{font-size:.82rem;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin:0 0 .6rem;
+  display:flex;align-items:center;gap:.5rem}
+.feed h2 .count{font:.72rem ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--chip-fg);
+  background:var(--chip);border-radius:1rem;padding:.05rem .5rem;font-weight:600}
+.feed ul{gap:0}
+.feed li{display:flex;gap:.7rem;align-items:baseline;padding:.45rem .2rem;border-bottom:1px solid var(--border)}
+.feed li:first-child{animation:flash 1.4s ease-out}
+@keyframes flash{0%{background:rgba(74,222,128,.18)}100%{background:transparent}}
+.feed .id{font:.76rem ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--ok);min-width:3.4rem;flex:none}
+.feed .t{color:var(--fg);word-break:break-word}
+.feed .t .idlink{font:.92em ui-monospace,SFMono-Regular,Menlo,monospace}
+.hint{color:var(--muted);font-size:.82rem;margin:.5rem 0 0}
+footer{max-width:50rem;margin:0 auto;padding:1.5rem 1.25rem 2rem;color:var(--muted);font-size:.78rem}
+</style>
+</head>
+<body>
+<a class="skip-link" href="#activity">Skip to activity</a>
+<main>
+  <div class="top">
+    <div>
+      <h1>Live activity</h1>
+      <nav class="crumbs" aria-label="Breadcrumb"><a href="index.html">← dashboard</a> · <a href="tickets.html">board</a></nav>
+    </div>
+    <span class="mode" id="mode" aria-live="polite"><span class="dot"></span><span id="modeText">loading…</span></span>
+  </div>
+
+  <p class="hint" id="hint"></p>
+
+  <!-- Idle banner shown when no worker is active and nothing awaits review. -->
+  <p class="idle-banner" id="idleBanner" hidden>No active workers — showing recent completions below.</p>
+
+  <div class="cols" id="activity">
+    <div class="lane working">
+      <h2>In progress <span class="count" id="cWorking">0</span></h2>
+      <ul id="working"></ul>
+    </div>
+    <div class="lane review">
+      <h2>Awaiting review <span class="count" id="cReview">0</span></h2>
+      <ul id="review"></ul>
+    </div>
+  </div>
+
+  <div class="feed">
+    <h2>Recently done <span class="count" id="cDone">0</span></h2>
+    <ul id="done"></ul>
+  </div>
+
+  <!-- Single dedicated live region for concise activity announcements. -->
+  <p class="visually-hidden" id="activityStatus" role="status" aria-live="polite"></p>
+</main>
+<footer>goal-flight · activity monitor · assumes served + polling</footer>
+
+<script src="tasks-data.js"></script>
+<script src="gf.js"></script>
+<script>
+(function(){
+  "use strict";
+  var elWorking = document.getElementById("working");
+  var elReview  = document.getElementById("review");
+  var elDone    = document.getElementById("done");
+
+  function card(it){
+    return '<li class="card"><a class="id" href="ticket.html?id='+encodeURIComponent(it.id)+'">'+GF.esc(it.id)+
+           '</a><div class="title">'+GF.autolink(it.title)+"</div></li>";
+  }
+  function feedItem(it){
+    return '<li><a class="id" href="ticket.html?id='+encodeURIComponent(it.id)+'">'+GF.esc(it.id)+
+           '</a><span class="t">'+GF.autolink(it.title)+"</span></li>";
+  }
+  function bySection(key){
+    return GF.store.items.filter(function(it){ return it._section===key; });
+  }
+
+  var prevTopDone = null;     // id of the most-recent done item last render
+  var activityStatus = document.getElementById("activityStatus");
+  var idleBanner = document.getElementById("idleBanner");
+  var firstRender = true;
+
+  function announceActivity(msg){
+    // toggle text so identical consecutive messages still re-announce
+    activityStatus.textContent = "";
+    activityStatus.textContent = msg;
+  }
+
+  function render(){
+    var working = bySection("working");
+    var review  = bySection("worker-finished");
+    var done    = bySection("done").slice().reverse(); // newest-first LIFO
+
+    document.getElementById("cWorking").textContent = working.length;
+    document.getElementById("cReview").textContent  = review.length;
+    document.getElementById("cDone").textContent    = done.length;
+
+    elWorking.innerHTML = working.length ? working.map(card).join("")
+      : '<li class="empty">No worker is running right now.</li>';
+    elReview.innerHTML = review.length ? review.map(card).join("")
+      : '<li class="empty">Nothing awaiting review.</li>';
+    elDone.innerHTML = done.length ? done.slice(0,40).map(feedItem).join("")
+      : '<li class="empty">No completed items yet.</li>';
+
+    // Idle state: no worker active and nothing awaiting review -> calm banner,
+    // de-emphasise the empty lanes, lead with the completions feed.
+    var idle = !working.length && !review.length;
+    document.body.classList.toggle("idle", idle);
+    idleBanner.hidden = !idle;
+
+    // Non-visual companion to the first-child flash: announce a genuinely new
+    // completion (not on the initial paint, and only when the top id changes).
+    var topDone = done.length ? done[0].id : null;
+    if(!firstRender && topDone && topDone !== prevTopDone){
+      announceActivity(topDone + " now done");
+    }
+    prevTopDone = topDone;
+    firstRender = false;
+  }
+
+  function setMode(mode){
+    var el = document.getElementById("mode");
+    var txt = document.getElementById("modeText");
+    var hint = document.getElementById("hint");
+    if(mode === "served"){
+      el.classList.add("live"); txt.textContent = "live · polling every 3s";
+      hint.textContent = "Auto-updating from tasks.jsonl. New activity flashes as it lands.";
+    } else {
+      el.classList.remove("live"); txt.textContent = "snapshot · file://";
+      hint.textContent = "Static snapshot (file://). For true live updates, serve docs-private/ (python3 -m http.server) and reopen over http://. Window focus re-reads the snapshot.";
+    }
+  }
+
+  GF.attach({ onRender: render, onMode: setMode, interval: 3000 });
+})();
+</script>
+</body>
+</html>
