@@ -4,12 +4,9 @@
  * ticket.html, current-activity.html and index.html via a single <script src>.
  *
  * Responsibilities:
- *   - DATA LOADING (dual-mode): served -> fetch('tasks.jsonl', {cache:'no-store'})
- *     and parse JSONL; on any failure (e.g. file://, CORS, 404) fall back to the
- *     window.GF_ITEMS snapshot shipped by tasks-data.js.
- *   - POLLING: served -> cheap HEAD Last-Modified probe ~3s; re-fetch + re-render
- *     ONLY when the resource changed. file:// -> manual Refresh button + re-render
- *     on visibilitychange/focus. No busy-loop, no flicker on a no-op re-render.
+ *   - DATA LOADING: read the window.GF_ITEMS snapshot shipped by tasks-data.js.
+ *   - REFRESH: manual Refresh button + re-render on visibilitychange/focus.
+ *     No busy-loop, no flicker on a no-op re-render.
  *   - RENDER: sectioned status board, kind/status/search filters, sort, counts.
  *   - AUTOLINK: \b[tbq]-\d+\b ids -> ticket.html?id=...
  *
@@ -31,15 +28,6 @@
       return new URLSearchParams(global.location.search).get(name);
     } catch (e) {
       return null;
-    }
-  }
-
-  // Are we on a real http(s) origin (served) or file:// (snapshot)?
-  function isServed() {
-    try {
-      return /^https?:$/.test(global.location.protocol);
-    } catch (e) {
-      return false;
     }
   }
 
@@ -144,16 +132,15 @@
   // Absolute repo root. The helper will write window.GF_ROOT (absolute repo root)
   // into tasks-data.js; honour it if already set. Otherwise DERIVE it from the
   // current location: the views sit at <root>/docs-private/<page>, so stripping
-  // the trailing '/docs-private/<page>' yields the repo root. Works on file://
-  // and served-from-repo-root alike. Returns "" when it can't be derived.
+  // the trailing '/docs-private/<page>' yields the repo root. Returns "" when it
+  // can't be derived.
   function gfRoot() {
     if (typeof global.GF_ROOT === "string" && global.GF_ROOT) {
       // normalize: drop a trailing slash so the under-root prefix test is clean
       return global.GF_ROOT.replace(/\/+$/, "");
     }
     try {
-      // pathname like /Users/u/repo/docs-private/tickets.html (file://) or
-      // /docs-private/tickets.html (served from repo root).
+      // pathname like /Users/u/repo/docs-private/tickets.html (file://).
       var path = decodeURIComponent(global.location.pathname || "");
       var m = /^(.*)\/docs-private\/[^/]*$/.exec(path);
       return m ? m[1] : "";
@@ -221,7 +208,7 @@
         var rel = resolvePathMention(raw);
         if (!rel) return whole; // not linkable -> leave verbatim
         // views sit one level below repo-root, so '../' + rel reaches the file
-        // on both file:// and served-from-repo-root.
+        // from a docs-private view.
         var href = "../" + rel;
         return lead + '<a class="pathlink" href="' + esc(href) + '">' + raw + "</a>";
       });
@@ -249,56 +236,10 @@
 
   /* ------------------------------------------------------------- loading */
 
-  // Parse JSONL (one JSON object per non-blank line). Tolerant: skips bad lines.
-  function parseJSONL(text) {
-    var out = [];
-    var lines = String(text).split(/\r?\n/);
-    for (var i = 0; i < lines.length; i++) {
-      var ln = lines[i].trim();
-      if (!ln) continue;
-      try {
-        out.push(JSON.parse(ln));
-      } catch (e) {
-        /* tolerate a malformed line rather than blow up the whole board */
-      }
-    }
-    return out;
-  }
-
-  var DATA_URL = "tasks.jsonl";
-
-  // Try served fetch first; on any failure resolve with the snapshot.
-  // Resolves { items, mode:'served'|'snapshot', sig } where sig changes on update.
-  function fetchData() {
-    if (!isServed() || typeof global.fetch !== "function") {
-      return Promise.resolve(snapshot());
-    }
-    return global
-      .fetch(DATA_URL, { cache: "no-store" })
-      .then(function (r) {
-        if (!r.ok) throw new Error("HTTP " + r.status);
-        var lm = r.headers.get("Last-Modified") || "";
-        return r.text().then(function (txt) {
-          var raw = parseJSONL(txt);
-          if (!raw.length) throw new Error("empty jsonl");
-          return { items: raw, mode: "served", sig: lm || "len:" + txt.length + ":" + hash(txt) };
-        });
-      })
-      .catch(function () {
-        return snapshot();
-      });
-  }
-
+  // Read the tasks-data.js snapshot. Resolves { items, mode:'snapshot', sig }.
   function snapshot() {
     var arr = Array.isArray(global.GF_ITEMS) ? global.GF_ITEMS : [];
     return { items: arr, mode: "snapshot", sig: "snapshot:" + arr.length };
-  }
-
-  // tiny non-crypto string hash for change detection
-  function hash(s) {
-    var h = 5381;
-    for (var i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
-    return h >>> 0;
   }
 
   /* --------------------------------------------------------------- store */
@@ -463,85 +404,34 @@
     return filtered.length;
   }
 
-  /* ----------------------------------------------------- polling driver */
+  /* ----------------------------------------------------- refresh driver */
 
-  // Drive load + re-render. Served: HEAD Last-Modified probe ~3s, re-fetch on
-  // change. file://: manual Refresh + focus/visibility re-render. onRender gets
-  // the store after each (changed) load; onMode is called once with the mode.
+  // Drive snapshot load + re-render. Manual Refresh forces a render; focus and
+  // visibility changes refresh the snapshot without changing the current view.
+  // onRender gets the store after each changed load; onMode is called once.
   function attach(opts) {
     var onRender = opts.onRender || function () {};
     var onMode = opts.onMode || function () {};
-    var interval = opts.interval || 3000;
-    var timer = null;
     var lastSig = null;
-    var lastProbe = null; // Last-Modified that was actually LOADED (not just seen)
     var destroyed = false;
-    var inFlight = false; // reentrancy guard: at most one load in flight
 
     function loadAndMaybeRender(force) {
-      // Skip overlapping loads; a late-resolving older GET must not clobber
-      // newer bytes (last-writer-wins) nor leave lastProbe advanced past a
-      // failed fetch. The next tick / event retries.
-      if (inFlight) return Promise.resolve(null);
-      inFlight = true;
-      return fetchData()
-        .then(function (res) {
-          store.mode = res.mode;
-          if (force || res.sig !== lastSig) {
-            lastSig = res.sig;
-            store.sig = res.sig;
-            index(res.items);
-            onRender(store);
-          }
-          // Only advance the probe marker once the content has actually loaded,
-          // so a failed/raced GET can never permanently latch the view stale.
-          if (res.mode === "served" && res.sig) lastProbe = res.sig;
-          return res;
-        })
-        .finally(function () {
-          inFlight = false;
-        });
-    }
-
-    // Cheap served probe: HEAD for Last-Modified; only do a full GET on change.
-    function probe() {
-      if (destroyed) return;
-      if (!isServed() || typeof global.fetch !== "function") return;
-      if (inFlight) return; // a load is already running; don't stack
-      global
-        .fetch(DATA_URL, { method: "HEAD", cache: "no-store" })
-        .then(function (r) {
-          if (!r.ok) return;
-          var lm = r.headers.get("Last-Modified") || "";
-          if (lm && lm === lastProbe) return; // unchanged, skip the GET
-          // Do NOT advance lastProbe here — loadAndMaybeRender advances it only
-          // after a successful GET, so a failed GET re-probes next tick.
-          return loadAndMaybeRender(false);
-        })
-        .catch(function () {
-          /* transient; next tick retries */
-        });
-    }
-
-    function startPolling() {
-      if (timer || !isServed()) return;
-      timer = global.setInterval(probe, interval);
-    }
-    function stopPolling() {
-      if (timer) {
-        global.clearInterval(timer);
-        timer = null;
+      var res = snapshot();
+      store.mode = res.mode;
+      if (force || res.sig !== lastSig) {
+        lastSig = res.sig;
+        store.sig = res.sig;
+        index(res.items);
+        onRender(store);
       }
+      return Promise.resolve(res);
     }
 
-    // file:// (and served) re-render on focus/visibility — cheap, snapshot reload
+    // Re-render on focus/visibility — cheap, snapshot-backed reload.
     function onVisible() {
       if (destroyed) return;
       if (global.document && global.document.visibilityState === "visible") {
         loadAndMaybeRender(false);
-        startPolling();
-      } else {
-        stopPolling();
       }
     }
     // Named focus handler so destroy() can actually detach it.
@@ -550,17 +440,14 @@
       loadAndMaybeRender(false);
     }
 
-    // initial load determines the mode, then wires the right refresh path.
-    // lastProbe is seeded inside loadAndMaybeRender (served + sig) so the first
-    // probe tick skips a redundant GET when nothing has changed.
+    // Initial load determines the mode, then wires the refresh path.
     var ready = loadAndMaybeRender(true).then(function (res) {
       onMode(res.mode);
-      if (res.mode === "served") startPolling();
       try {
         global.document.addEventListener("visibilitychange", onVisible);
         global.addEventListener("focus", onFocus);
-        // Tear down timer + listeners when the page goes away so a re-attach
-        // on the same document can't leak an interval or duplicate listeners.
+        // Tear down listeners when the page goes away so a re-attach on the same
+        // document can't duplicate handlers.
         global.addEventListener("pagehide", destroy);
       } catch (e) {}
       return res;
@@ -568,7 +455,6 @@
 
     function destroy() {
       destroyed = true;
-      stopPolling();
       try {
         global.document.removeEventListener("visibilitychange", onVisible);
         global.removeEventListener("focus", onFocus);
@@ -611,7 +497,6 @@
     STATUS_LABELS: STATUS_LABELS,
     esc: esc,
     qs: qs,
-    isServed: isServed,
     autolink: autolink,
     linkifyPaths: linkifyPaths,
     resolvePathMention: resolvePathMention,
@@ -620,8 +505,6 @@
     normalize: normalize,
     sectionKey: sectionKey,
     index: index,
-    fetchData: fetchData,
-    parseJSONL: parseJSONL,
     applyControls: applyControls,
     sortItems: sortItems,
     renderBoard: renderBoard,
@@ -631,13 +514,12 @@
     kindBadge: kindBadge,
     blockerBits: blockerBits,
     store: store,
-    // direct loader (no polling) — resolves the indexed store
+    // direct loader — resolves the indexed store from tasks-data.js
     load: function () {
-      return fetchData().then(function (res) {
-        store.mode = res.mode;
-        store.sig = res.sig;
-        return index(res.items);
-      });
+      var res = snapshot();
+      store.mode = res.mode;
+      store.sig = res.sig;
+      return Promise.resolve(index(res.items));
     }
   };
 })(typeof window !== "undefined" ? window : this);
