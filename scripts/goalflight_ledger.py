@@ -300,6 +300,30 @@ def terminal_state_for(state: object, reason: object = None) -> str:
     return "error"
 
 
+def _split_task_ids(values: object) -> list[str]:
+    out: list[str] = []
+    raw_values = values if isinstance(values, list) else [values]
+    for value in raw_values:
+        if not isinstance(value, str):
+            continue
+        for part in value.split(","):
+            task_id = part.strip()
+            if task_id and task_id not in out:
+                out.append(task_id)
+    return out
+
+
+def task_ids_from_args(args: argparse.Namespace) -> list[str]:
+    values = []
+    values.extend(_split_task_ids(getattr(args, "task_id", None)))
+    values.extend(_split_task_ids(getattr(args, "task_ids", None)))
+    out: list[str] = []
+    for task_id in values:
+        if task_id not in out:
+            out.append(task_id)
+    return out
+
+
 def failure_envelope(reason: object) -> dict | None:
     if reason in (None, ""):
         return None
@@ -403,6 +427,9 @@ def cmd_record(args: argparse.Namespace) -> int:
         "started_at": utc_now(),
         "hostname": socket.gethostname(),
     }
+    task_ids = task_ids_from_args(args)
+    if task_ids:
+        record["task_ids"] = task_ids
     if getattr(args, "queue_launch_token", None):
         record["queue_launch_token"] = args.queue_launch_token
     with StateLock():
@@ -700,6 +727,8 @@ def build_parser() -> argparse.ArgumentParser:
     rec.add_argument("--dispatch-id")
     rec.add_argument("--prompt-id")
     rec.add_argument("--prompt-path")
+    rec.add_argument("--task-id", help="Legacy singular linked task/bug id.")
+    rec.add_argument("--task-ids", action="append", help="Comma-separated linked task/bug ids.")
     rec.add_argument("--agent", required=True)
     rec.add_argument("--engine")
     rec.add_argument("--shape", choices=["bash", "acp", "unknown"])

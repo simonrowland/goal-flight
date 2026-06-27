@@ -7,8 +7,9 @@ description: "Initialize goal-flight state for a project."
 Initialize a project for goal-flight with compact, procedural discovery.
 
 Read `protocols/session-preflight.md`, `protocols/tool-readiness.md`,
-`protocols/premises.md`, `protocols/state-handoff.md`, and
-`protocols/chunk-review.md` (review tooling).
+`protocols/project-state-layout.md`, `protocols/task-lifecycle.md`,
+`protocols/progress-dashboard.md`, `protocols/premises.md`,
+`protocols/state-handoff.md`, and `protocols/chunk-review.md` (review tooling).
 
 ## Steps
 
@@ -131,13 +132,25 @@ fi
 python3 <skill-root>/scripts/goalflight_capacity.py profile --json
 ```
 
-5. Scaffold private project state if missing:
+5. Scaffold private project state if missing. This is create-if-absent only:
+   never overwrite operator files, never force-add ignored state, and preserve
+   the repository's existing `docs-private/` gitignore policy.
 
-- `docs-private/`
+```bash
+python3 <skill-root>/scripts/goalflight_setup.py \
+  --scaffold-project-state \
+  --target-project "$PWD" \
+  --apply --yes
+```
+
+The scaffolder copies missing files from `templates/state-skeleton/`, creates
+the canonical state directories, and creates
+`docs-private/RESUME-NOTES-<YYYY-MM-DD>.md` from `templates/resume-notes.md`
+when no canonical resume pin exists. The canonical state contract is
+`protocols/project-state-layout.md`; task status is `protocols/task-lifecycle.md`;
+HTML view behavior is `protocols/progress-dashboard.md`.
+
 - `docs-private/goal-<topic>-<date>.md` from `templates/goal-statement.md`
-- `docs-private/RESUME-NOTES-<YYYY-MM-DD>.md` from `templates/resume-notes.md`
-  (canonical naming: ISO 8601 date so lexicographic sort = chronological; no
-  topic prefixes — topic context goes inside the file's TL;DR)
 - `AGENTS.md` handling (downstream projects often keep AGENTS.md
   per-operator and gitignored on purpose — that's fine; the file is
   still the local skill entry point):

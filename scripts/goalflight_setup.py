@@ -97,6 +97,131 @@ def _state_root() -> Path:
     return Path.home() / ".local/state/goal-flight"
 
 
+def _git_check_ignored(project_root: Path, relpath: str) -> bool | None:
+    if not (project_root / ".git").exists():
+        return None
+    proc = subprocess.run(
+        ["git", "check-ignore", "-q", relpath],
+        cwd=project_root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if proc.returncode == 0:
+        return True
+    if proc.returncode == 1:
+        return False
+    return None
+
+
+def _template_text(path: Path, replacements: dict[str, str]) -> str:
+    text = path.read_text(encoding="utf-8")
+    for key, value in replacements.items():
+        text = text.replace(key, value)
+    return text
+
+
+def scaffold_project_state(
+    repo_root: Path,
+    target_project: Path,
+    *,
+    apply: bool = False,
+    today: str | None = None,
+) -> dict[str, Any]:
+    """Create the canonical docs-private tree without overwriting operator files."""
+    repo_root = repo_root.resolve()
+    target_project = target_project.resolve()
+    skeleton = repo_root / goalflight_doctor.STATE_SKELETON_REL
+    if not skeleton.is_dir():
+        raise SetupError(f"state skeleton missing: {skeleton}")
+    docs_private = target_project / "docs-private"
+    if docs_private.exists() and not docs_private.is_dir():
+        raise SetupError(f"docs-private exists but is not a directory: {docs_private}")
+    if today is None:
+        today = datetime.now(timezone.utc).date().isoformat()
+
+    created_dirs: list[str] = []
+    would_create_dirs: list[str] = []
+    created_files: list[str] = []
+    would_create_files: list[str] = []
+    skipped_existing_files: list[str] = []
+
+    dirs = [docs_private] + [docs_private / rel for rel in goalflight_doctor.CANONICAL_STATE_DIRS]
+    for path in dirs:
+        rel = path.relative_to(target_project).as_posix() + "/"
+        if path.is_dir():
+            continue
+        if apply:
+            path.mkdir(parents=True, exist_ok=True)
+            created_dirs.append(rel)
+        else:
+            would_create_dirs.append(rel)
+
+    for source in sorted(skeleton.rglob("*")):
+        if not source.is_file():
+            continue
+        rel = source.relative_to(skeleton)
+        dest = docs_private / rel
+        rel_out = dest.relative_to(target_project).as_posix()
+        if dest.exists():
+            skipped_existing_files.append(rel_out)
+            continue
+        if apply:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, dest)
+            created_files.append(rel_out)
+        else:
+            would_create_files.append(rel_out)
+
+    touched_html: list[str] = []
+    if apply:
+        created_file_set = set(created_files)
+        for html_name in goalflight_doctor.HTML_FRESHNESS_SOURCES:
+            html_path = docs_private / html_name
+            rel_out = html_path.relative_to(target_project).as_posix()
+            if rel_out in created_file_set and html_path.exists():
+                html_path.touch()
+                touched_html.append(rel_out)
+
+    resume_notes = sorted(docs_private.glob("RESUME-NOTES-*.md")) if docs_private.exists() else []
+    if not resume_notes:
+        resume_dest = docs_private / f"RESUME-NOTES-{today}.md"
+        rel_out = resume_dest.relative_to(target_project).as_posix()
+        if resume_dest.exists():
+            skipped_existing_files.append(rel_out)
+        elif apply:
+            resume_dest.parent.mkdir(parents=True, exist_ok=True)
+            resume_template = repo_root / "templates/resume-notes.md"
+            resume_dest.write_text(
+                _template_text(resume_template, {"<DATE>": today}),
+                encoding="utf-8",
+            )
+            created_files.append(rel_out)
+        else:
+            would_create_files.append(rel_out)
+
+    skipped = sorted(set(skipped_existing_files))
+    return {
+        "schema": "goalflight.project-state-scaffold.v1",
+        "project_root": str(target_project),
+        "docs_private": str(docs_private),
+        "skeleton": str(skeleton),
+        "apply": apply,
+        "docs_private_gitignored": _git_check_ignored(target_project, "docs-private/"),
+        "created_dirs": created_dirs,
+        "would_create_dirs": would_create_dirs,
+        "created_files": created_files,
+        "would_create_files": would_create_files,
+        "touched_created_html": touched_html,
+        "skipped_existing_files": skipped,
+        "summary": (
+            f"created_files={len(created_files)} would_create_files={len(would_create_files)} "
+            f"skipped_existing_files={len(skipped)}"
+        ),
+    }
+
+
 def _load_manifest(repo_root: Path, agent: str) -> dict[str, Any]:
     path = repo_root / "adapters" / f"{agent}.json"
     if not path.exists():
@@ -1806,6 +1931,12 @@ def main(argv: list[str] | None = None) -> int:
         help="choice when the gstack add-on is selected but host skills are missing",
     )
     parser.add_argument("--target-project", default=".", help="target project for project-local install destinations")
+    parser.add_argument(
+        "--scaffold-project-state",
+        action="store_true",
+        help="scaffold target docs-private/ from templates/state-skeleton without overwriting existing files",
+    )
+    parser.add_argument("--scaffold-date", help=argparse.SUPPRESS)
     parser.add_argument("--apply", action="store_true", help="perform approved writes")
     parser.add_argument("--yes", action="store_true", help="confirm writes for --apply")
     parser.add_argument("--uninstall", action="store_true", help="rollback using --from-manifest")
@@ -1822,6 +1953,17 @@ def main(argv: list[str] | None = None) -> int:
             args.cursor_project or args.opencode_project or args.target_project
         ).expanduser().resolve()
         manifests = _load_manifests(repo_root)
+        if args.scaffold_project_state:
+            if args.apply and not args.yes:
+                raise SetupError("--scaffold-project-state --apply requires --yes")
+            result = scaffold_project_state(
+                repo_root,
+                target_project,
+                apply=args.apply,
+                today=args.scaffold_date,
+            )
+            print(json.dumps(result, indent=2, sort_keys=True))
+            return 0
         if args.uninstall:
             if not args.from_manifest:
                 raise SetupError("--uninstall requires --from-manifest")

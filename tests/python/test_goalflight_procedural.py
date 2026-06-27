@@ -25,6 +25,7 @@ BLOCKED_CAPACITY_WAIT_S = "5"
 BLOCKED_CAPACITY_COOLDOWN_S = "300"
 
 import goalflight_doctor
+import goalflight_setup
 import goalflight_capacity
 import goalflight_chunk_summary
 import goalflight_review_job
@@ -266,7 +267,7 @@ def test_doctor_json_shape() -> None:
     # naming canonical patterns directly in doctor output.
     assert_true("agents_md_state section", "agents_md_state" in payload)
     ams = payload["agents_md_state"]
-    for key in ("present", "tracked", "gitignored", "has_goalflight_section", "ok"):
+    for key in ("present", "tracked", "gitignored", "has_goalflight_section", "pins_newest_resume_notes", "ok"):
         assert_true(f"agents_md_state.{key} present", key in ams)
     assert_true("session_status section", "session_status" in payload)
     ss = payload["session_status"]
@@ -381,10 +382,11 @@ def test_installed_skill_drift_project_symlink_stays_copy_mode() -> None:
 def test_doctor_target_project_readiness_split() -> None:
     with tempfile.TemporaryDirectory() as td:
         repo = Path(td)
-        (repo / "docs-private").mkdir()
+        goalflight_setup.scaffold_project_state(ROOT, repo, apply=True, today="2026-06-27")
         (repo / "docs-private/env-caveats.md").write_text("RAM_MB=1000\n")
         (repo / "SKILL.md").write_text("# Test project\n")
         (repo / "AGENTS.md").write_text(
+            "## Living state -- read the newest docs-private/RESUME-NOTES-*.md first\n"
             "## Goal Flight Routing\n"
             f"- skill-root: ${{GOALFLIGHT_ROOT:-{ROOT}}}\n"
             "- load order: AGENTS.md -> SKILL.md -> commands/*.md\n"
@@ -398,6 +400,8 @@ def test_doctor_target_project_readiness_split() -> None:
         assert_true("target project init done", readiness["init_done"] is True)
         assert_true("target project skill exists", readiness["repo_skill"]["exists"] is True)
         assert_true("target project routing recorded", readiness["routing"]["has_goalflight_block"] is True)
+        assert_true("target project resume pin recorded", readiness["routing"]["pins_newest_resume_notes"] is True)
+        assert_true("target project state layout ok", readiness["state_layout"]["ok"] is True)
         assert_true("test command recorded", readiness["commands"]["test"] == "`pytest`")
         assert_true("skill root resolved from routing", readiness["skill_root"]["source"] == "AGENTS.md")
         assert_true("skill root exists", readiness["skill_root"]["exists"] is True)
@@ -639,6 +643,9 @@ def test_instruction_split_contract() -> None:
     for protocol in [
         "session-preflight.md",
         "tool-readiness.md",
+        "project-state-layout.md",
+        "task-lifecycle.md",
+        "progress-dashboard.md",
         "dispatch-routing.md",
         "worker-markers.md",
         "state-handoff.md",

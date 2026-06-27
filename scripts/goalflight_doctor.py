@@ -57,6 +57,15 @@ GSTACK_MINIMAL_REQUIRED_SKILLS = GSTACK_MINIMAL_SKILLS + GSTACK_EXTERNAL_SKILLS
 AUTOREVIEW_HELPER_OVERRIDE_GATE = "GOALFLIGHT_ALLOW_AUTOREVIEW_HELPER"
 CLAUDE_ACP_BIN_OVERRIDE_GATE = "GOALFLIGHT_ALLOW_CLAUDE_ACP_BIN_OVERRIDE"
 CLAUDE_ACP_VERSION_OVERRIDE_GATE = "GOALFLIGHT_ALLOW_CLAUDE_ACP_VERSION_OVERRIDE"
+STATE_SKELETON_REL = Path("templates/state-skeleton")
+CANONICAL_STATE_DIRS = ("reviews", "research", "dispatch", "mail", "prompts", "rag")
+HTML_FRESHNESS_SOURCES = {
+    "index.html": ("tasks.jsonl", "tasks-data.js"),
+    "tickets.html": ("tasks.jsonl", "tasks-data.js"),
+    "ticket.html": ("tasks.jsonl", "tasks-data.js"),
+    "current-activity.html": ("tasks.jsonl", "tasks-data.js"),
+    "questions-for-user.html": ("questions-for-user.md",),
+}
 
 
 def run(cmd: list[str], cwd: Path | None = None, timeout: float = 8.0) -> dict:
@@ -345,7 +354,21 @@ def check_agents_md_state(project_root: Path) -> dict:
         "tracked": False,
         "gitignored": False,
         "has_goalflight_section": False,
+        "pins_newest_resume_notes": False,
     }
+    agent_text = ""
+    if out["present"]:
+        try:
+            agent_text = agents.read_text(encoding="utf-8", errors="ignore")
+            lower = agent_text.casefold()
+            out["has_goalflight_section"] = "## Goal Flight Routing" in agent_text
+            out["pins_newest_resume_notes"] = (
+                "newest" in lower
+                and "resume-notes" in lower
+                and "docs-private" in lower
+            )
+        except OSError:
+            pass
     if not (project_root / ".git").exists():
         # Non-git project: presence alone isn't enough — empty / frontmatter-
         # only AGENTS.md should be ok=false. Treat as ok only when the file
@@ -356,16 +379,17 @@ def check_agents_md_state(project_root: Path) -> dict:
             except OSError:
                 size = 0
             out["ok"] = size >= 500
+            if not out["pins_newest_resume_notes"]:
+                out["install_hint"] = (
+                    "AGENTS.md present but missing the newest `docs-private/RESUME-NOTES-*.md` "
+                    "living-state pin. Add the `## Living state — read the newest "
+                    "docs-private/RESUME-NOTES-*.md first` block from "
+                    "`templates/project-agents.md`."
+                )
         else:
             out["ok"] = False
         return out
     if out["present"]:
-        try:
-            out["has_goalflight_section"] = "## Goal Flight Routing" in agents.read_text(
-                encoding="utf-8", errors="ignore"
-            )
-        except OSError:
-            pass
         tracked = run(["git", "ls-files", "--error-unmatch", "AGENTS.md"], cwd=project_root)
         out["tracked"] = tracked.get("returncode") == 0
         ignored = run(["git", "check-ignore", "-q", "AGENTS.md"], cwd=project_root)
@@ -387,6 +411,13 @@ def check_agents_md_state(project_root: Path) -> dict:
             "section + activation directive. Run `/goal-flight init` to "
             "append the section. The file's tracked / gitignored state is "
             "preserved."
+        )
+    elif not out["pins_newest_resume_notes"]:
+        out["install_hint"] = (
+            "AGENTS.md present but missing the newest `docs-private/RESUME-NOTES-*.md` "
+            "living-state pin. Add the `## Living state — read the newest "
+            "docs-private/RESUME-NOTES-*.md first` block from "
+            "`templates/project-agents.md`."
         )
     return out
 
@@ -483,6 +514,136 @@ def check_resume_notes_pattern(project_root: Path) -> dict:
             "place; new files should follow the canonical form. See "
             "protocols/state-handoff.md."
         ) if violations else None,
+    }
+
+
+def canonical_state_skeleton_files(skill_root: Path | None = None) -> list[str]:
+    root = skill_root or SCRIPT_DIR.parent
+    skeleton = root / STATE_SKELETON_REL
+    if not skeleton.is_dir():
+        return []
+    return sorted(
+        path.relative_to(skeleton).as_posix()
+        for path in skeleton.rglob("*")
+        if path.is_file()
+    )
+
+
+def _state_layout_warning(message: str, *, path: str | None = None) -> dict:
+    out = {"message": message}
+    if path:
+        out["path"] = path
+    return out
+
+
+def check_project_state_layout(project_root: Path, skill_root: Path | None = None) -> dict:
+    """Verify the canonical docs-private tree and stale HTML view signals."""
+    root = skill_root or SCRIPT_DIR.parent
+    skeleton = root / STATE_SKELETON_REL
+    docs_private = project_root / "docs-private"
+    expected_files = canonical_state_skeleton_files(root)
+    missing_files: list[str] = []
+    missing_dirs: list[str] = []
+    warnings: list[dict] = []
+    stale_html: list[dict] = []
+
+    if not docs_private.is_dir():
+        missing_dirs.append("docs-private/")
+        warnings.append(_state_layout_warning(
+            "missing canonical docs-private directory: docs-private/ "
+            "(run `/goal-flight init`; it creates the private state root)",
+            path="docs-private/",
+        ))
+
+    if not skeleton.is_dir():
+        warnings.append(_state_layout_warning(
+            f"state skeleton missing: {STATE_SKELETON_REL.as_posix()} "
+            "(reinstall goal-flight or check skill-root)",
+            path=STATE_SKELETON_REL.as_posix(),
+        ))
+
+    for rel in expected_files:
+        target = docs_private / rel
+        if not target.is_file():
+            state_path = f"docs-private/{rel}"
+            missing_files.append(state_path)
+            warnings.append(_state_layout_warning(
+                f"missing canonical docs-private file: {state_path} "
+                f"(create from {STATE_SKELETON_REL.as_posix()}/{rel}; "
+                "run `/goal-flight init` to scaffold without overwriting)",
+                path=state_path,
+            ))
+
+    resume_pattern = re.compile(r"^RESUME-NOTES-\d{4}-\d{2}-\d{2}(-rev\d+)?\.md$")
+    resume_notes = [
+        path for path in docs_private.glob("RESUME-NOTES-*.md")
+        if resume_pattern.match(path.name)
+    ] if docs_private.is_dir() else []
+    if not resume_notes:
+        state_path = "docs-private/RESUME-NOTES-<YYYY-MM-DD>.md"
+        missing_files.append(state_path)
+        warnings.append(_state_layout_warning(
+            "missing canonical docs-private file: "
+            f"{state_path} (create from templates/resume-notes.md; "
+            "run `/goal-flight init` to scaffold the living state pin)",
+            path=state_path,
+        ))
+
+    for rel in CANONICAL_STATE_DIRS:
+        target = docs_private / rel
+        if not target.is_dir():
+            state_path = f"docs-private/{rel}/"
+            missing_dirs.append(state_path)
+            warnings.append(_state_layout_warning(
+                f"missing canonical docs-private directory: {state_path} "
+                "(run `/goal-flight init` to create it)",
+                path=state_path,
+            ))
+
+    for html_name, source_names in HTML_FRESHNESS_SOURCES.items():
+        html_path = docs_private / html_name
+        if not html_path.exists():
+            continue
+        stale_sources: list[str] = []
+        try:
+            html_mtime = html_path.stat().st_mtime
+        except OSError:
+            continue
+        for source_name in source_names:
+            source_path = docs_private / source_name
+            if not source_path.exists():
+                continue
+            try:
+                if html_mtime < source_path.stat().st_mtime:
+                    stale_sources.append(f"docs-private/{source_name}")
+            except OSError:
+                continue
+        if stale_sources:
+            entry = {
+                "html": f"docs-private/{html_name}",
+                "older_than": stale_sources,
+                "message": (
+                    f"stale HTML view: docs-private/{html_name} older than "
+                    f"{', '.join(stale_sources)} (refresh the view after source changes)"
+                ),
+            }
+            stale_html.append(entry)
+            warnings.append(_state_layout_warning(entry["message"], path=entry["html"]))
+
+    return {
+        "ok": not warnings,
+        "docs_private": str(docs_private),
+        "skeleton": str(skeleton),
+        "expected_files": [f"docs-private/{rel}" for rel in expected_files],
+        "required_dirs": ["docs-private/"] + [f"docs-private/{rel}/" for rel in CANONICAL_STATE_DIRS],
+        "missing_files": missing_files,
+        "missing_dirs": missing_dirs,
+        "stale_html": stale_html,
+        "warnings": warnings,
+        "install_hint": (
+            "Run `/goal-flight init` to scaffold missing docs-private paths from "
+            "`templates/state-skeleton/` without overwriting existing operator files."
+        ) if warnings else None,
     }
 
 
@@ -1973,6 +2134,12 @@ def check_project_goalflight_readiness(repo: Path) -> dict:
         and ("skill-root" in lower or "goalflight_root" in lower or "commands/" in lower)
         and "skill.md" in lower
     )
+    pins_newest_resume_notes = bool(
+        agent_path
+        and "newest" in lower
+        and "resume-notes" in lower
+        and "docs-private" in lower
+    )
     commands = {
         "test": _command_entry(agent_text, "test"),
         "lint": _command_entry(agent_text, "lint"),
@@ -1980,6 +2147,7 @@ def check_project_goalflight_readiness(repo: Path) -> dict:
     }
     resume_notes = sorted(str(path) for path in docs_private.glob("RESUME-NOTES*.md"))
     skill_root = _goalflight_skill_root(agent_text)
+    state_layout = check_project_state_layout(repo)
     warnings: list[str] = []
     if not env_caveats.exists():
         warnings.append("missing docs-private/env-caveats.md")
@@ -1987,10 +2155,13 @@ def check_project_goalflight_readiness(repo: Path) -> dict:
         warnings.append("missing repo SKILL.md")
     if not has_routing:
         warnings.append("AGENTS.md lacks goal-flight routing")
+    if not pins_newest_resume_notes:
+        warnings.append("AGENTS.md does not pin newest docs-private/RESUME-NOTES-*.md")
     if not skill_root.get("exists"):
         warnings.append("skill-root not resolvable")
     if not commands["test"]:
         warnings.append("project test command not recorded")
+    warnings.extend(item["message"] for item in state_layout.get("warnings", []))
     return {
         "init_done": env_caveats.exists(),
         "env_caveats": str(env_caveats),
@@ -2008,7 +2179,9 @@ def check_project_goalflight_readiness(repo: Path) -> dict:
             "path": str(agent_path) if agent_path else None,
             "exists": bool(agent_path),
             "has_goalflight_block": has_routing,
+            "pins_newest_resume_notes": pins_newest_resume_notes,
         },
+        "state_layout": state_layout,
         "commands": commands,
         "resume_notes": resume_notes,
         "skill_root": skill_root,
@@ -2470,6 +2643,20 @@ def print_human(payload: dict) -> None:
         status_line(readiness.get("init_done"), "project init", readiness.get("env_caveats")),
         status_line(readiness.get("repo_skill", {}).get("exists"), "project SKILL.md", readiness.get("repo_skill", {}).get("path")),
         status_line(readiness.get("routing", {}).get("has_goalflight_block"), "project AGENTS goal-flight routing", readiness.get("routing", {}).get("path")),
+        status_line(
+            readiness.get("routing", {}).get("pins_newest_resume_notes"),
+            "project AGENTS newest RESUME-NOTES pin",
+            readiness.get("routing", {}).get("path"),
+        ),
+        status_line(
+            (readiness.get("state_layout") or {}).get("ok"),
+            "project docs-private canonical tree",
+            (
+                f"missing_files={len((readiness.get('state_layout') or {}).get('missing_files') or [])} "
+                f"missing_dirs={len((readiness.get('state_layout') or {}).get('missing_dirs') or [])} "
+                f"stale_html={len((readiness.get('state_layout') or {}).get('stale_html') or [])}"
+            ),
+        ),
         status_line(
             readiness.get("skill_root", {}).get("exists"),
             "skill-root resolvable",

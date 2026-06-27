@@ -11,10 +11,17 @@ import os
 from pathlib import Path
 import re
 import signal
+import sys
 import time
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+ROOT = SCRIPT_DIR.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 import goalflight_compat
 import goalflight_ledger
+import goalflight_task
 from goalflight_liveness import (
     LivenessThresholds,
     active_monotonic,
@@ -70,6 +77,43 @@ def _exit_code_for_state(state: str) -> int:
     if state == "blocked" or state.startswith("blocked"):
         return 4
     return 1
+
+
+def _split_task_ids(value: str | None) -> list[str]:
+    out: list[str] = []
+    for part in (value or "").split(","):
+        task_id = part.strip()
+        if task_id and task_id not in out:
+            out.append(task_id)
+    return out
+
+
+def _task_state_for_terminal(dispatch_state: object) -> str:
+    return "worker-finished" if dispatch_state == "complete" else "worker-failed"
+
+
+def _status_snapshot(payload: dict) -> dict:
+    keys = (
+        "schema",
+        "dispatch_id",
+        "agent",
+        "shape",
+        "state",
+        "reason",
+        "worker_pid",
+        "pgid",
+        "worker_alive",
+        "worker_identity_reason",
+        "pgroup_cpu_pct",
+        "seconds_since_event",
+        "liveness_state",
+        "tail_path",
+        "status_path",
+        "terminal_marker",
+        "last_marker",
+        "updated_at",
+    )
+    return {key: payload.get(key) for key in keys if payload.get(key) not in (None, "", [], {})}
 
 
 def _strip_marker_decoration(text: str) -> str:
@@ -483,6 +527,8 @@ def main() -> int:
     parser.add_argument("--tail", required=True)
     parser.add_argument("--status-json", required=True)
     parser.add_argument("--dispatch-id")
+    parser.add_argument("--project-root")
+    parser.add_argument("--task-ids")
     parser.add_argument("--agent", default="unknown")
     parser.add_argument("--poll-secs", type=float, default=2.0)
     parser.add_argument("--max-idle-secs", type=float, default=180.0)
@@ -507,6 +553,8 @@ def main() -> int:
                 for ln in _pf.read_text(encoding="utf-8", errors="replace").splitlines()
             ]
     expected_identity = _load_identity(args.worker_identity_json)
+    task_ids = _split_task_ids(args.task_ids)
+    task_project_root = goalflight_task.resolve_project_root(args.project_root)
 
     tail = Path(args.tail)
     status_path = Path(args.status_json)
@@ -542,11 +590,47 @@ def main() -> int:
     last_payload: dict | None = None
     terminal_seen: dict | None = None
     final_status_written = False
+    working_breadcrumb_written = False
+
+    def append_task_breadcrumb(state: str, payload: dict) -> dict | None:
+        if not task_ids:
+            return None
+        try:
+            store = goalflight_task.TaskStore(task_project_root)
+            marker = payload.get("terminal_marker") or payload.get("last_marker")
+            breadcrumb = {
+                "dispatch_id": args.dispatch_id,
+                "state": state,
+                "ts": goalflight_task.utc_now(),
+                "marker": marker,
+                "agent": args.agent,
+                "worker_pid": payload.get("worker_pid"),
+                "status_path": str(status_path),
+                "last_worker_state": _status_snapshot(payload),
+            }
+            store.append_dispatch_breadcrumbs(task_ids, breadcrumb, actor="watcher")
+            return None
+        except Exception as exc:  # task store errors must be durable in status.
+            return {"type": type(exc).__name__, "message": str(exc)}
 
     def write_payload(payload: dict, *, reason: str | None = None, terminal_write: bool = False) -> None:
-        nonlocal last_payload, final_status_written
+        nonlocal last_payload, final_status_written, working_breadcrumb_written
         if reason:
             payload["reason"] = reason
+        if task_ids:
+            payload["task_ids"] = list(task_ids)
+            if not working_breadcrumb_written:
+                working_payload = {**payload, "state": "working"}
+                working_payload.pop("terminal_marker", None)
+                working_payload.pop("last_marker", None)
+                working_breadcrumb_written = True
+                working_error = append_task_breadcrumb("working", working_payload)
+                if working_error:
+                    payload["task_breadcrumb_error"] = working_error
+            if terminal_write:
+                terminal_error = append_task_breadcrumb(_task_state_for_terminal(payload.get("state")), payload)
+                if terminal_error:
+                    payload["task_breadcrumb_error"] = terminal_error
         write_status(status_path, payload)
         last_payload = dict(payload)
         if terminal_write:

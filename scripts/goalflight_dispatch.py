@@ -95,6 +95,7 @@ RETIRED_AGENT_LABELS = {
     "grok": "use --agent grok-code (coding) or --agent grok-research (web search)",
 }
 GIT_BASE_PIN_RE = re.compile(r"(?<![A-Za-z0-9_./:-])([0-9A-Fa-f]{7,40})(?![A-Za-z0-9_./:-])")
+TASK_ID_RE = re.compile(r"^[tb]-\d+$")
 READ_ONLY_INLINE_RETURN_PROMPT_PATTERNS = (
     (
         "return inline",
@@ -574,6 +575,20 @@ def _resolve_prompt_file(args, base: Path) -> str | None:
 
 def _project_root(args) -> Path:
     return Path(args.cwd).resolve() if args.cwd else Path.cwd().resolve()
+
+
+def _parse_task_ids(values: list[str] | None) -> list[str]:
+    out: list[str] = []
+    for value in values or []:
+        for part in value.split(","):
+            task_id = part.strip()
+            if not task_id:
+                continue
+            if not TASK_ID_RE.match(task_id):
+                raise DispatchUsageError(f"--task expects comma-separated t-/b- ids; got {task_id!r}")
+            if task_id not in out:
+                out.append(task_id)
+    return out
 
 
 def _state_dir() -> Path:
@@ -1492,6 +1507,7 @@ def _record_ledger(args, *, project_root: Path, prompt_path: str | None, status_
                 dispatch_id=args.dispatch_id,
                 prompt_id=None,
                 prompt_path=prompt_path,
+                task_ids=getattr(args, "task_ids", []),
                 agent=args.agent,
                 engine=_account_engine(args.agent) or args.agent,
                 shape=args.shape,
@@ -1547,6 +1563,9 @@ def _record_queued_ledger_fast(args, *, project_root: Path, prompt_path: str | N
         "started_at": now,
         "hostname": socket.gethostname(),
     }
+    task_ids = list(getattr(args, "task_ids", []) or [])
+    if task_ids:
+        record["task_ids"] = task_ids
     if getattr(args, "queue_launch_token", None):
         record["queue_launch_token"] = args.queue_launch_token
     with goalflight_ledger.StateLock():
@@ -1577,6 +1596,7 @@ def _record_queued_status(args, *, project_root: Path, status_json: Path, tail: 
             "worker_alive": False,
             "tail_path": str(tail),
             "updated_at": int(time.time()),
+            **({"task_ids": list(args.task_ids)} if getattr(args, "task_ids", None) else {}),
         },
     )
     _record_queued_ledger_fast(
@@ -1640,6 +1660,8 @@ def _canonical_replay_argv(args, raw_argv: list[str], *, tail: Path, status_json
         argv += ["--prompt-file", str(Path(args.prompt_file).expanduser())]
     if args.prompt is not None:
         argv += ["--prompt", str(args.prompt)]
+    if getattr(args, "task_ids", None):
+        argv += ["--task", ",".join(args.task_ids)]
     if args.model:
         argv += ["--model", str(args.model)]
     if args.read_only:
@@ -1793,10 +1815,12 @@ def _submit_dispatch(args, raw_argv: list[str], *, base: Path) -> int:
         "updated_at": goalflight_ledger.utc_now(),
         "queue_path": str(queue_path),
         "dispatch_argv": dispatch_argv,
+        **({"task_ids": list(args.task_ids)} if getattr(args, "task_ids", None) else {}),
         "request": {
             "agent": args.agent,
             "prompt_file": str(Path(args.prompt_file).expanduser()) if args.prompt_file else None,
             "prompt": args.prompt,
+            "task_ids": list(args.task_ids),
             "priority": args.priority,
             "dispatch_id": args.dispatch_id,
             "cwd": str(project_root),
@@ -2368,6 +2392,7 @@ def _queued_args_for_status(entry: dict):
         read_only=bool(request.get("read_only")),
         controller_pid=None,
         queue_launch_token=entry.get("queue_launch_token"),
+        task_ids=list(entry.get("task_ids") or request.get("task_ids") or []),
     )
 
 
@@ -2417,6 +2442,7 @@ def _mark_claim_worker_dead(entry: dict, *, reason: str) -> None:
                 "tail_path": str(tail),
                 "status_path": str(status_json),
                 "updated_at": int(time.time()),
+                **({"task_ids": list(args.task_ids)} if getattr(args, "task_ids", None) else {}),
             },
         )
 
@@ -2657,6 +2683,7 @@ def _build_acp_cfg(args, *, status_json: Path):
         worktree="off",
         session_id=None,
         dispatch_id=args.dispatch_id,
+        task_ids=list(getattr(args, "task_ids", []) or []),
         priority=getattr(args, "priority", "normal"),
         capacity_wait_s=getattr(args, "capacity_wait_s", None),
         prompt_id=None,
@@ -3124,6 +3151,13 @@ def main(argv: list[str] | None = None) -> int:
                         help="Preset (codex|grok-code|grok-research) OR a label when you pass `-- <cmd>`")
     parser.add_argument("--prompt-file", help="Prompt file (preset path)")
     parser.add_argument("--prompt", help="Inline prompt text (preset path; alternative to --prompt-file)")
+    parser.add_argument(
+        "--task",
+        dest="tasks",
+        action="append",
+        default=[],
+        help="Comma-separated linked task/bug ids (t-/b-). May be repeated.",
+    )
     parser.add_argument("--cwd", help="Worker working directory")
     parser.add_argument("--model", default=None,
                         help="Worker model id (grok-code/grok-research/codex --model passthrough). "
@@ -3206,6 +3240,11 @@ def main(argv: list[str] | None = None) -> int:
                         help="Optional `-- <cmd...>` raw worker (overrides the preset)")
     parser.set_defaults(drain_on_submit=True)
     args = parser.parse_args(argv)
+    try:
+        args.task_ids = _parse_task_ids(args.tasks)
+    except DispatchUsageError as e:
+        print(f"goalflight_dispatch: {e}", file=sys.stderr)
+        return 64
     args._original_argv = list(argv)
     if args.stats is not None:
         try:
@@ -3332,6 +3371,8 @@ def main(argv: list[str] | None = None) -> int:
         "tail": str(tail),
         "status_json": str(status_json),
     }
+    if getattr(args, "task_ids", None):
+        summary_head["task_ids"] = list(args.task_ids)
 
     try:
         # Pre-record the ledger BEFORE the capacity queue: the (possibly
@@ -3504,6 +3545,8 @@ def main(argv: list[str] | None = None) -> int:
             "--pgid", str(pgid),
             "--stay-after-terminal",
         ]
+        if getattr(args, "task_ids", None):
+            watch_cmd += ["--project-root", str(project_root), "--task-ids", ",".join(args.task_ids)]
         watch_identity_token = (
             worker_identity_token
             if worker_identity_token and worker_identity_token.get("lstart") and worker_identity_token.get("comm")
@@ -3531,6 +3574,7 @@ def main(argv: list[str] | None = None) -> int:
                 "state": "starting",
                 "reason": "watcher_launching",
                 "updated_at": int(time.time()),
+                **({"task_ids": list(args.task_ids)} if getattr(args, "task_ids", None) else {}),
             })
         watcher_pid = _spawn_daemonized_process(
             watch_cmd,

@@ -7,6 +7,9 @@ protocol files carry the detailed operating procedures.
 |---|---|
 | `session-preflight.md` | command start, drift check, install ambiguity |
 | `tool-readiness.md` | `/goal-flight doctor`, `/goal-flight init`, capability probes |
+| `project-state-layout.md` | `/goal-flight init` or doctor needs the canonical `docs-private/` tree, living RESUME-NOTES pin, or project state file map |
+| `task-lifecycle.md` | task/docket status, `tasks.jsonl`, generated task/bug views, or dispatch status joins |
+| `progress-dashboard.md` | dashboard / ticket / decision HTML view rendering, offline refresh, or stale-view checks |
 | `dispatch-routing.md` | choosing iteration pattern (one-shot / goal-mode) and comms shape (controller-direct / ACP / bash-tail) |
 | `worker-markers.md` | rendering prompts or parsing worker status |
 | `state-handoff.md` | compacting, resume notes, status recovery |

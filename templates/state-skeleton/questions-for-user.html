@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>goal-flight decisions</title>
+<style>
+:root{--bg:#fff;--fg:#1a1d21;--muted:#6b7280;--accent:#2563eb;--border:#e5e7eb;--warn:#b45309}
+@media (prefers-color-scheme:dark){:root{--bg:#0f1115;--fg:#e6e8eb;--muted:#9aa0a6;--accent:#6ea8fe;--border:#262a31;--warn:#f59e0b}}
+*{box-sizing:border-box}
+html{font:16px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+body{margin:0;background:var(--bg);color:var(--fg)}
+main{max-width:46rem;margin:0 auto;padding:1.5rem 1.25rem 2rem}
+h1{font-size:1.4rem;margin:.2em 0 .2em}
+h2{font-size:1.05rem;margin:1.6em 0 .4em;border-bottom:1px solid var(--border);padding-bottom:.25em}
+h2.warn{color:var(--warn);border-color:var(--warn)}
+h3{font-size:.95rem;margin:1.1em 0 .2em}
+h3 .qid{font:.82rem ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted)}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+p{margin:.3em 0}
+.meta,.muted{color:var(--muted);font-size:.85rem}
+section{padding:.2em 0 .6em;border-bottom:1px solid var(--border)}
+.decided section{opacity:.65}
+footer{max-width:46rem;margin:0 auto;padding:.5rem 1.25rem 2rem;color:var(--muted);font-size:.78rem}
+</style>
+</head>
+<body>
+<main>
+<h1>Decisions needed</h1>
+<p class="muted"><a href="index.html">dashboard</a></p>
+
+<h2 class="warn">Open</h2>
+<section id="q-000">
+  <h3><span class="qid">q-000</span> - no open decisions yet</h3>
+  <p>Add open questions in <code>questions-for-user.md</code>; keep each question linked to blocked task ids.</p>
+</section>
+
+<h2>Decided</h2>
+<div class="decided">
+<section id="adr-000">
+  <h3><span class="qid">ADR-000</span> - no ADRs yet</h3>
+  <p>When a question is answered, convert it to an ADR heading in <code>questions-for-user.md</code>.</p>
+</section>
+</div>
+</main>
+<footer>generated from questions-for-user.md</footer>
+</body>
+</html>

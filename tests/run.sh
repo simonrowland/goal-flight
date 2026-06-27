@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Discover and run two test suites:
+# Discover and run test suites:
 #   - tests/bash/test-*.sh — bash tests (installers, codex overrides, fork-detect)
 #   - tests/python/test_*.py — Python tests (ACP client + pool + runner + failure modes)
+#   - tests/js/test_*.js — Node-only hermetic browserless checks
 # One pass/fail per file. Exit code = number of failed tests.
 #
 # Skips tests/python/dispatch_acp_chunk.py (live e2e against real codex-acp, non-hermetic).
@@ -89,6 +90,32 @@ if command -v python3 >/dev/null 2>&1 && [ -d "$REPO_ROOT/tests/python" ]; then
       if [ "$test" = "tests/python/test_skill_structure.py" ]; then
         skill_structure_seen=1
       fi
+      echo "FAIL  $test"
+      cat /tmp/goal-flight-test-$$.out | sed 's/^/      /'
+      fail=$((fail + 1))
+      failed_tests+=("$test")
+    fi
+    rm -f /tmp/goal-flight-test-$$.out
+  done
+fi
+
+# JS tests (tests/js/test_*.js; skipped when node is unavailable)
+if [ -d "$REPO_ROOT/tests/js" ]; then
+  cd "$REPO_ROOT"
+  for test in tests/js/test_*.js; do
+    [ -f "$test" ] || continue
+    if [ "$list_only" -eq 1 ]; then
+      echo "$test"
+      continue
+    fi
+    if ! command -v node >/dev/null 2>&1; then
+      echo "SKIP  $test (node not found on PATH)"
+      continue
+    fi
+    if run_isolated_test_env node "$test" > /tmp/goal-flight-test-$$.out 2>&1; then
+      echo "PASS  $test"
+      pass=$((pass + 1))
+    else
       echo "FAIL  $test"
       cat /tmp/goal-flight-test-$$.out | sed 's/^/      /'
       fail=$((fail + 1))

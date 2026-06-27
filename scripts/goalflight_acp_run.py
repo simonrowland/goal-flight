@@ -1633,6 +1633,7 @@ async def _run_acp_dispatch_impl(
                     dispatch_id=dispatch_id,
                     prompt_id=cfg.prompt_id,
                     prompt_path=cfg.prompt,
+                    task_ids=getattr(cfg, "task_ids", []),
                     agent=cfg.agent,
                     engine=goalflight_ledger.infer_engine(cfg.agent),
                     shape="acp",

@@ -72,8 +72,9 @@ def _write_tasks(project_root: Path, items: list[dict]) -> None:
         "".join(json.dumps(item, separators=(",", ":")) + "\n" for item in items),
         encoding="utf-8",
     )
+    module = _load_goalflight_task_module()
     (docs / "tasks-data.js").write_text(
-        "window.GF_ITEMS = " + json.dumps(items, indent=2) + ";\n",
+        module._items_data_js(items),
         encoding="utf-8",
     )
 
@@ -265,6 +266,101 @@ def test_goalflight_task_status_filters_ledger_by_project_root() -> None:
         assert_true("foreign ledger row ignored", payload["items"][0]["derived_status"] == "pending")
 
 
+def test_goalflight_task_status_uses_latest_dispatch_breadcrumb() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        project = Path(td) / "project-a"
+        state_dir = Path(td) / "state"
+        item = {
+            "id": "t-001",
+            "kind": "task",
+            "title": "Retried worker",
+            "blocked_by": [],
+            "links": [],
+            "done": False,
+            "dispatches": [
+                {
+                    "dispatch_id": "codex-old",
+                    "state": "worker-finished",
+                    "ts": "2026-06-01T00:00:00+00:00",
+                },
+                {
+                    "dispatch_id": "codex-retry",
+                    "state": "working",
+                    "ts": "2026-06-01T00:10:00+00:00",
+                },
+            ],
+        }
+        _write_tasks(project, [item])
+
+        proc = run_task(project, "status", "--json", env={"GOALFLIGHT_STATE_DIR": str(state_dir)})
+        assert_true(f"status exits 0: {proc.stderr}", proc.returncode == 0)
+        payload = json.loads(proc.stdout)
+        assert_true("newest breadcrumb wins", payload["items"][0]["derived_status"] == "working")
+
+
+def test_goalflight_task_sync_appends_plural_task_ids() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project = base / "project-a"
+        state_dir = base / "state"
+        _write_tasks(
+            project,
+            [
+                {
+                    "id": "t-001",
+                    "kind": "task",
+                    "title": "Task dispatch link",
+                    "blocked_by": [],
+                    "links": [],
+                    "done": False,
+                },
+                {
+                    "id": "b-001",
+                    "kind": "bug",
+                    "title": "Bug dispatch link",
+                    "blocked_by": [],
+                    "links": [],
+                    "done": False,
+                },
+            ],
+        )
+        runs = state_dir / "runs.d"
+        runs.mkdir(parents=True)
+        (runs / "dispatch-a.json").write_text(
+            json.dumps(
+                {
+                    "schema": "goalflight.dispatch.v1",
+                    "dispatch_id": "dispatch-a",
+                    "task_ids": ["t-001", "b-001"],
+                    "project_root": str(project),
+                    "state": "complete",
+                    "terminal_state": "complete",
+                    "started_at": "2026-06-01T00:00:00+00:00",
+                    "ended_at": "2026-06-01T00:01:00+00:00",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        proc = run_task(project, "sync", "--by", "watcher", env={"GOALFLIGHT_STATE_DIR": str(state_dir)})
+        assert_true(f"sync exits 0: {proc.stderr}", proc.returncode == 0)
+        proc = run_task(project, "sync", "--by", "watcher", env={"GOALFLIGHT_STATE_DIR": str(state_dir)})
+        assert_true(f"second sync exits 0: {proc.stderr}", proc.returncode == 0)
+
+        items = [
+            json.loads(line)
+            for line in (project / "docs-private" / "tasks.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        for item in items:
+            dispatches = item.get("dispatches")
+            assert_true(f"{item['id']} has one idempotent breadcrumb", isinstance(dispatches, list) and len(dispatches) == 1)
+            crumb = dispatches[0]
+            assert_true(f"{item['id']} breadcrumb state", crumb.get("state") == "worker-finished")
+            assert_true(f"{item['id']} breadcrumb snapshot", isinstance(crumb.get("last_worker_state"), dict))
+
+
 def test_goalflight_task_atomic_write_rejects_bad_content() -> None:
     with tempfile.TemporaryDirectory() as td:
         project = Path(td)
@@ -326,6 +422,113 @@ def test_goalflight_task_sync_repairs_stale_mirror() -> None:
         assert_true("sync repaired mirror", proc.returncode == 0)
 
 
+def test_goalflight_task_data_js_escapes_script_end_and_html() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        project = Path(td)
+        bad_title = "Bad </script><img src=x onerror=alert(1)> t-001"
+        proc = run_task(
+            project,
+            "new",
+            bad_title,
+            "--acceptance",
+            "accept </script><img src=x onerror=alert(1)>",
+            "--prompt",
+            "prompt </script><img src=x onerror=alert(1)>",
+        )
+        assert_true(f"new with script-like title exits 0: {proc.stderr}", proc.returncode == 0)
+        docs = project / "docs-private"
+        data_js = (docs / "tasks-data.js").read_text(encoding="utf-8")
+        assert_true("script end escaped", "</script" not in data_js.lower())
+        assert_true("raw img tag escaped", "<img" not in data_js.lower())
+        assert_true("json payload carries escaped script start", "\\u003c/script" in data_js.lower())
+        proc = run_checker(docs)
+        assert_true("escaped data mirror remains valid", proc.returncode == 0)
+
+
+def test_goalflight_task_sync_generates_markdown_views() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        project = Path(td)
+        items = [
+            {
+                "id": "t-001",
+                "kind": "task",
+                "title": "Task blocked by bug b-001 and decision q-001.",
+                "blocked_by": ["b-001"],
+                "links": ["q-001"],
+                "done": False,
+                "acceptance": "shows in Waiting linked to b-001.",
+            },
+            {
+                "id": "t-002",
+                "kind": "task",
+                "title": "Done task.",
+                "blocked_by": [],
+                "links": [],
+                "done": True,
+            },
+            {
+                "id": "t-003",
+                "kind": "task",
+                "title": "Task whose blocker is already fixed.",
+                "blocked_by": ["b-002"],
+                "links": [],
+                "done": False,
+            },
+            {
+                "id": "b-001",
+                "kind": "bug",
+                "title": "Open bug.",
+                "blocked_by": [],
+                "links": ["t-001"],
+                "done": False,
+                "severity": "high",
+                "source": "test",
+            },
+            {
+                "id": "b-002",
+                "kind": "bug",
+                "title": "Fixed bug.",
+                "blocked_by": [],
+                "links": ["t-003"],
+                "done": True,
+                "severity": "low",
+                "source": "test",
+            },
+            {
+                "id": "q-001",
+                "kind": "decision",
+                "title": "Open decision.",
+                "blocked_by": [],
+                "links": ["t-001"],
+                "done": False,
+            },
+        ]
+        _write_tasks(project, items)
+        proc = run_task(project, "sync", "--by", "watcher")
+        assert_true(f"sync exits 0: {proc.stderr}", proc.returncode == 0)
+
+        docs = project / "docs-private"
+        task_md = (docs / "task-decomposition.md").read_text(encoding="utf-8")
+        done_md = (docs / "tasks-done.md").read_text(encoding="utf-8")
+        bug_md = (docs / "bug-backlog.md").read_text(encoding="utf-8")
+        bugs_done_md = (docs / "bugs-done.md").read_text(encoding="utf-8")
+
+        assert_true("waiting section present", "## Waiting" in task_md)
+        assert_true("unresolved bug blocker linked", "[b-001](ticket.html?id=b-001)" in task_md)
+        assert_true("cross-kind decision link rendered", "[q-001](ticket.html?id=q-001)" in task_md)
+        assert_true("resolved blocker stays to-do", "### t-003" in task_md.split("## In progress", 1)[0])
+        assert_true("done task rendered in done view", "### t-002" in done_md)
+        assert_true("open bug rendered in backlog", "### b-001" in bug_md)
+        assert_true("fixed bug excluded from backlog", "### b-002" not in bug_md)
+        assert_true("fixed bug rendered in done view", "### b-002" in bugs_done_md)
+
+        before = {path.name: path.read_text(encoding="utf-8") for path in docs.glob("*.md")}
+        proc = run_task(project, "sync", "--by", "watcher")
+        assert_true(f"second sync exits 0: {proc.stderr}", proc.returncode == 0)
+        after = {path.name: path.read_text(encoding="utf-8") for path in docs.glob("*.md")}
+        assert_true("generated markdown idempotent", before == after)
+
+
 def main() -> None:
     if not NODE:
         print("SKIP: test_tasks_mirror.py: node not found on PATH")
@@ -343,9 +546,13 @@ def main() -> None:
     test_goalflight_task_new_allocator_concurrency()
     test_goalflight_task_status_uses_breadcrumb_when_ledger_missing()
     test_goalflight_task_status_filters_ledger_by_project_root()
+    test_goalflight_task_status_uses_latest_dispatch_breadcrumb()
+    test_goalflight_task_sync_appends_plural_task_ids()
     test_goalflight_task_atomic_write_rejects_bad_content()
     test_goalflight_task_sync_repairs_stale_mirror()
-    print("OK: 10 tasks mirror/task-store tests pass")
+    test_goalflight_task_data_js_escapes_script_end_and_html()
+    test_goalflight_task_sync_generates_markdown_views()
+    print("OK: 14 tasks mirror/task-store tests pass")
 
 
 if __name__ == "__main__":
