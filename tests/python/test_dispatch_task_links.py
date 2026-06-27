@@ -124,8 +124,8 @@ def case_dispatch_task_ids_update_ledger_and_breadcrumbs() -> None:
         assert_true(f"status exits 0: {status.stderr}", status.returncode == 0)
         payload = json.loads(status.stdout)
         statuses = {item["id"]: item["derived_status"] for item in payload["items"]}
-        assert_true("task derived worker-finished", statuses[task] == "worker-finished")
-        assert_true("bug derived worker-finished", statuses[bug] == "worker-finished")
+        assert_true("task derived awaiting-review", statuses[task] == "awaiting-review")
+        assert_true("bug derived awaiting-review", statuses[bug] == "awaiting-review")
 
 
 def main() -> None:

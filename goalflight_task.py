@@ -19,6 +19,7 @@ from urllib.parse import quote
 
 
 ROOT = Path(__file__).resolve().parent
+LIST_TYPE = list
 SCRIPTS = ROOT / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
@@ -34,22 +35,32 @@ except Exception:  # pragma: no cover - import failures surface at runtime.
 
 
 CHECKER = ROOT / "scripts" / "check_tasks_mirror.js"
+ITEM_SCHEMA_VERSION = 1
 FAMILY_PREFIX_BY_KIND = {"task": "t", "bug": "b", "decision": "q"}
 VALID_FAMILIES = {"t", "b", "q", "ADR"}
 TASK_DISPATCH_STATES = {"working", "worker-finished", "worker-failed"}
 ITEM_ID_RE = re.compile(r"\b((?:ADR|bp|[tbq])-\d+)\b", re.IGNORECASE)
+CANNED_LIST_STATUSES = {
+    "outstanding",
+    "awaiting-review",
+    "working",
+    "delegated",
+    "waiting",
+    "done-reviewed",
+}
 MARKDOWN_SECTIONS = (
     ("pending", "To do"),
     ("working", "In progress"),
-    ("worker-finished", "Awaiting review"),
+    ("awaiting-review", "Awaiting review"),
+    ("worker-failed", "Failed / needs attention"),
     ("waiting", "Waiting"),
 )
 STATUS_LABELS = {
     "pending": "to do",
     "working": "in progress",
-    "worker-finished": "awaiting review",
+    "awaiting-review": "awaiting review",
     "waiting": "waiting",
-    "done": "done",
+    "done-reviewed": "done reviewed",
     "worker-failed": "worker failed",
 }
 
@@ -141,7 +152,7 @@ def _audit(action: str, actor: str, **extra: Any) -> dict[str, Any]:
 
 def _append_audit(item: dict[str, Any], action: str, actor: str, **extra: Any) -> None:
     audit = item.setdefault("audit", [])
-    if not isinstance(audit, list):
+    if not isinstance(audit, LIST_TYPE):
         raise TaskError(f"item {item.get('id', '<unknown>')}: audit must be an array")
     audit.append(_audit(action, actor, **extra))
 
@@ -212,7 +223,7 @@ def _md_value_link(value: Any, lookup: dict[str, str]) -> str:
 
 
 def _md_list(values: Any, lookup: dict[str, str]) -> str:
-    if not isinstance(values, list) or not values:
+    if not isinstance(values, LIST_TYPE) or not values:
         return ""
     return ", ".join(_md_value_link(value, lookup) for value in values if value not in (None, ""))
 
@@ -243,8 +254,22 @@ def _parse_jsonl(path: Path) -> tuple[list[dict[str, Any]], dict[str, int]]:
         if item_id in lines_by_id:
             raise TaskError(f"{path}:{lineno}: duplicate id {item_id} (first seen on line {lines_by_id[item_id]})")
         lines_by_id[item_id] = lineno
-        items.append(obj)
+        items.append(_migrate_item_for_read(obj))
     return items, lines_by_id
+
+
+def _migrate_item_for_read(item: dict[str, Any]) -> dict[str, Any]:
+    migrated = dict(item)
+    legacy = "schema_version" not in migrated
+    version = migrated.get("schema_version")
+    if not isinstance(version, int) or version < 1:
+        migrated["schema_version"] = ITEM_SCHEMA_VERSION
+    migrated.setdefault("blocked_by", [])
+    migrated.setdefault("links", [])
+    migrated.setdefault("done", False)
+    if legacy and migrated.get("done") is True and "done_reviewed" not in migrated:
+        migrated["done_reviewed"] = True
+    return migrated
 
 
 def _validate_items_for_write(items: list[dict[str, Any]], source: str = "tasks.jsonl") -> None:
@@ -252,6 +277,7 @@ def _validate_items_for_write(items: list[dict[str, Any]], source: str = "tasks.
     for lineno, item in enumerate(items, start=1):
         if not isinstance(item, dict):
             raise TaskError(f"{source}: line {lineno}: expected a JSON object")
+        legacy = "schema_version" not in item
         item_id = item.get("id")
         if not isinstance(item_id, str) or not item_id:
             raise TaskError(f"{source}: line {lineno}: missing string id")
@@ -263,10 +289,17 @@ def _validate_items_for_write(items: list[dict[str, Any]], source: str = "tasks.
         item.setdefault("blocked_by", [])
         item.setdefault("links", [])
         item.setdefault("done", False)
-        if not isinstance(item["blocked_by"], list):
+        if legacy and item.get("done") is True and "done_reviewed" not in item:
+            item["done_reviewed"] = True
+        item.setdefault("schema_version", ITEM_SCHEMA_VERSION)
+        if not isinstance(item["blocked_by"], LIST_TYPE):
             raise TaskError(f"{source}: line {lineno}: item {item_id} blocked_by must be an array")
-        if not isinstance(item["links"], list):
+        if not isinstance(item["links"], LIST_TYPE):
             raise TaskError(f"{source}: line {lineno}: item {item_id} links must be an array")
+        if not isinstance(item["schema_version"], int) or item["schema_version"] < 1:
+            raise TaskError(f"{source}: line {lineno}: item {item_id} schema_version must be a positive integer")
+        if "dispatches" in item and not isinstance(item["dispatches"], LIST_TYPE):
+            raise TaskError(f"{source}: line {lineno}: item {item_id} dispatches must be an array")
 
 
 def _run_checker(directory: Path) -> None:
@@ -321,7 +354,7 @@ def _record_terminal_state(record: dict[str, Any]) -> str:
 def _record_task_ids(record: dict[str, Any]) -> list[str]:
     out: list[str] = []
     plural = record.get("task_ids")
-    values = plural if isinstance(plural, list) else ([plural] if isinstance(plural, str) else [])
+    values = plural if isinstance(plural, LIST_TYPE) else ([plural] if isinstance(plural, str) else [])
     legacy = record.get("task_id")
     if isinstance(legacy, str):
         values = [legacy, *values]
@@ -431,7 +464,7 @@ def _breadcrumb_key(crumb: dict[str, Any]) -> str:
 
 def _latest_dispatch_breadcrumb(item: dict[str, Any]) -> dict[str, Any] | None:
     dispatches = item.get("dispatches")
-    if not isinstance(dispatches, list):
+    if not isinstance(dispatches, LIST_TYPE):
         return None
     candidates = []
     for crumb in dispatches:
@@ -442,6 +475,127 @@ def _latest_dispatch_breadcrumb(item: dict[str, Any]) -> dict[str, Any] | None:
     if not candidates:
         return None
     return sorted(candidates, key=_record_sort_time)[-1]
+
+
+def _latest_breadcrumb(item: dict[str, Any], *, role: str | None = None) -> dict[str, Any] | None:
+    dispatches = item.get("dispatches")
+    if not isinstance(dispatches, LIST_TYPE):
+        return None
+    candidates = []
+    for crumb in dispatches:
+        if not isinstance(crumb, dict):
+            continue
+        if role is not None and crumb.get("role") != role:
+            continue
+        candidates.append(crumb)
+    if not candidates:
+        return None
+    return sorted(candidates, key=_record_sort_time)[-1]
+
+
+def _latest_review_breadcrumb(item: dict[str, Any]) -> dict[str, Any] | None:
+    return _latest_breadcrumb(item, role="review")
+
+
+def _iso_from_epoch(epoch: int) -> str | None:
+    if epoch <= 0:
+        return None
+    return dt.datetime.fromtimestamp(epoch, tz=dt.timezone.utc).isoformat(timespec="seconds")
+
+
+def _epoch_from_time(value: Any) -> int:
+    parsed = _parse_time(value)
+    if parsed == dt.datetime.min.replace(tzinfo=dt.timezone.utc):
+        return 0
+    return int(parsed.timestamp())
+
+
+def _parse_since(value: str | None) -> int | None:
+    if value in (None, ""):
+        return None
+    raw = str(value).strip()
+    now = int(dt.datetime.now(dt.timezone.utc).timestamp())
+    match = re.fullmatch(r"(\d+)([smhdw])", raw)
+    if match:
+        amount = int(match.group(1))
+        multiplier = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}[match.group(2)]
+        return now - amount * multiplier
+    match = re.fullmatch(r"now([+-])(\d+)", raw)
+    if match:
+        delta = int(match.group(2))
+        return now - delta if match.group(1) == "-" else now + delta
+    if raw.isdigit():
+        return int(raw)
+    parsed = _parse_time(raw)
+    if parsed == dt.datetime.min.replace(tzinfo=dt.timezone.utc):
+        raise TaskError(f"invalid --since value {value!r}; use 1h, now-3600, epoch seconds, or an ISO timestamp")
+    return int(parsed.timestamp())
+
+
+def _item_query_epoch(item: dict[str, Any]) -> int:
+    epochs = [_epoch_from_time(item.get("created_at"))]
+    crumb = _latest_breadcrumb(item)
+    if crumb:
+        epochs.append(_epoch_from_time(crumb.get("ts") or crumb.get("ended_at") or crumb.get("updated_at") or crumb.get("started_at")))
+    return max(epochs) if epochs else 0
+
+
+def _item_dispatch_epoch(item: dict[str, Any]) -> int:
+    crumb = _latest_dispatch_breadcrumb(item)
+    if not crumb:
+        return 0
+    return _epoch_from_time(crumb.get("ts") or crumb.get("ended_at") or crumb.get("updated_at") or crumb.get("started_at"))
+
+
+def _is_done_reviewed(item: dict[str, Any]) -> bool:
+    if item.get("done_reviewed") is True:
+        return True
+    return item.get("kind") == "decision" and item.get("done") is True
+
+
+def _matches_canned_status(row: dict[str, Any], status: str | None) -> bool:
+    if not status:
+        return True
+    if status == "outstanding":
+        return not _is_done_reviewed(row)
+    if status == "awaiting-review":
+        return not _is_done_reviewed(row) and row.get("derived_status") == "awaiting-review"
+    if status == "working":
+        return not _is_done_reviewed(row) and row.get("derived_status") == "working"
+    if status == "waiting":
+        return not _is_done_reviewed(row) and row.get("derived_status") == "waiting"
+    if status == "delegated":
+        return _latest_dispatch_breadcrumb(row) is not None
+    if status == "done-reviewed":
+        return _is_done_reviewed(row)
+    raise TaskError(f"unknown list status {status!r}; expected one of {', '.join(sorted(CANNED_LIST_STATUSES))}")
+
+
+def _coerce_query(query: Any = None, **overrides: Any) -> dict[str, Any]:
+    if query is None:
+        out: dict[str, Any] = {}
+    elif isinstance(query, str):
+        out = {"status": query}
+    elif isinstance(query, dict):
+        out = dict(query)
+    else:
+        raise TaskError("query must be None, a canned status string, or a dict")
+    out.update({k: v for k, v in overrides.items() if v not in (None, [], {})})
+    blocked_by = out.get("blocked_by")
+    if isinstance(blocked_by, str):
+        out["blocked_by"] = _split_csv([blocked_by])
+    elif isinstance(blocked_by, LIST_TYPE):
+        values: list[str] = []
+        for value in blocked_by:
+            if isinstance(value, str):
+                values.extend(_split_csv([value]))
+        out["blocked_by"] = values
+    status = out.get("status")
+    if status not in (None, "") and status not in CANNED_LIST_STATUSES:
+        raise TaskError(f"unknown list status {status!r}; expected one of {', '.join(sorted(CANNED_LIST_STATUSES))}")
+    if out.get("since") not in (None, ""):
+        out["since_epoch"] = _parse_since(str(out["since"]))
+    return out
 
 
 class TaskStore:
@@ -617,7 +771,7 @@ class TaskStore:
                 if item is None:
                     continue
                 dispatches = item.setdefault("dispatches", [])
-                if not isinstance(dispatches, list):
+                if not isinstance(dispatches, LIST_TYPE):
                     raise TaskError(f"item {task_id}: dispatches must be an array")
                 existing_keys = {
                     _breadcrumb_key(entry)
@@ -655,7 +809,7 @@ class TaskStore:
                 if item is None:
                     raise TaskError(f"{self.tasks_path}: item not found: {task_id}")
                 dispatches = item.setdefault("dispatches", [])
-                if not isinstance(dispatches, list):
+                if not isinstance(dispatches, LIST_TYPE):
                     raise TaskError(f"item {task_id}: dispatches must be an array")
                 dispatches.append(dict(crumb))
                 changed += 1
@@ -675,8 +829,42 @@ class TaskStore:
             item_id = item["id"]
             row = dict(item)
             row["derived_status"] = self._derive_status(item, records_by_task.get(item_id, []), by_id)
+            row["query_epoch"] = _item_query_epoch(row)
+            query_time = _iso_from_epoch(row["query_epoch"])
+            if query_time:
+                row["query_time"] = query_time
             rows.append(row)
         return rows
+
+    def get_item(self, item_id: str) -> dict[str, Any]:
+        for row in self.derived_rows():
+            if row.get("id") == item_id:
+                return row
+        raise TaskError(f"{self.tasks_path}: item not found: {item_id}")
+
+    def query_items(self, query: Any = None, **overrides: Any) -> list[dict[str, Any]]:
+        q = _coerce_query(query, **overrides)
+        rows = self.derived_rows()
+        status = q.get("status")
+        kind = q.get("kind")
+        blockers = q.get("blocked_by") or []
+        since_epoch = q.get("since_epoch")
+
+        def matches(row: dict[str, Any]) -> bool:
+            if status and not _matches_canned_status(row, status):
+                return False
+            if kind and row.get("kind", "task") != kind:
+                return False
+            if blockers:
+                row_blockers = row.get("blocked_by")
+                if not isinstance(row_blockers, LIST_TYPE) or any(blocker not in row_blockers for blocker in blockers):
+                    return False
+            filter_epoch = _item_dispatch_epoch(row) if status == "delegated" else int(row.get("query_epoch") or 0)
+            if since_epoch is not None and filter_epoch < int(since_epoch):
+                return False
+            return True
+
+        return [row for row in rows if matches(row)]
 
     def _derive_status(
         self,
@@ -684,8 +872,8 @@ class TaskStore:
         live_records: list[dict[str, Any]],
         by_id: dict[str, dict[str, Any]],
     ) -> str:
-        if item.get("done") is True:
-            return "done"
+        if _is_done_reviewed(item):
+            return "done-reviewed"
         candidates: list[tuple[dt.datetime, str]] = []
         if live_records:
             for record in live_records:
@@ -697,11 +885,14 @@ class TaskStore:
             status = _dispatch_status_from_record(crumb, live=False)
             if status:
                 candidates.append((_record_sort_time(crumb), status))
+        if item.get("done") is True:
+            candidates.append((_record_sort_time({"ts": item.get("done_at") or item.get("closed_at") or item.get("created_at")}), "awaiting-review"))
         if candidates:
-            return sorted(candidates, key=lambda row: row[0])[-1][1]
+            latest = sorted(candidates, key=lambda row: row[0])[-1][1]
+            return "awaiting-review" if latest == "worker-finished" else latest
         blockers = item.get("blocked_by")
-        if isinstance(blockers, list) and blockers:
-            unresolved = any(not by_id.get(str(blocker), {}).get("done") for blocker in blockers)
+        if isinstance(blockers, LIST_TYPE) and blockers:
+            unresolved = any(not _is_done_reviewed(by_id.get(str(blocker), {})) for blocker in blockers)
             if unresolved:
                 return "waiting"
         return "pending"
@@ -778,13 +969,13 @@ class TaskStore:
         return lines
 
     def _render_task_decomposition(self, tasks: list[dict[str, Any]], lookup: dict[str, str]) -> str:
-        open_tasks = [row for row in tasks if row.get("derived_status") != "done"]
+        open_tasks = [row for row in tasks if row.get("derived_status") != "done-reviewed"]
         lines = self._render_header("goal-flight — Task Decomposition")
         lines.extend(self._render_sections(open_tasks, lookup, MARKDOWN_SECTIONS, empty="_(none)_"))
         return "\n".join(lines).rstrip() + "\n"
 
     def _render_tasks_done(self, tasks: list[dict[str, Any]], lookup: dict[str, str]) -> str:
-        done = [row for row in tasks if row.get("derived_status") == "done"]
+        done = [row for row in tasks if row.get("derived_status") == "done-reviewed"]
         lines = self._render_header("goal-flight — Tasks Done")
         lines.extend(["## Done", ""])
         if done:
@@ -795,13 +986,13 @@ class TaskStore:
         return "\n".join(lines).rstrip() + "\n"
 
     def _render_bug_backlog(self, bugs: list[dict[str, Any]], lookup: dict[str, str]) -> str:
-        open_bugs = [row for row in bugs if row.get("derived_status") != "done"]
+        open_bugs = [row for row in bugs if row.get("derived_status") != "done-reviewed"]
         lines = self._render_header("goal-flight — Bug Backlog")
         lines.extend(self._render_sections(open_bugs, lookup, MARKDOWN_SECTIONS, empty="_(none)_"))
         return "\n".join(lines).rstrip() + "\n"
 
     def _render_bugs_done(self, bugs: list[dict[str, Any]], lookup: dict[str, str]) -> str:
-        done = [row for row in bugs if row.get("derived_status") == "done"]
+        done = [row for row in bugs if row.get("derived_status") == "done-reviewed"]
         lines = self._render_header("goal-flight — Bugs Done")
         lines.extend(["## Done", ""])
         if done:
@@ -831,6 +1022,7 @@ def _cmd_new(store: TaskStore, args: argparse.Namespace) -> int:
         if any(item.get("id") == item_id for item in items):
             raise TaskError(f"{store.tasks_path}: id {item_id} already exists; .task-seq is stale")
         item: dict[str, Any] = {
+            "schema_version": ITEM_SCHEMA_VERSION,
             "id": item_id,
             "kind": args.kind,
             "title": args.title,
@@ -858,10 +1050,7 @@ def _cmd_new(store: TaskStore, args: argparse.Namespace) -> int:
 
 
 def _cmd_show(store: TaskStore, args: argparse.Namespace) -> int:
-    by_id = store.items_by_id()
-    item = by_id.get(args.item_id)
-    if item is None:
-        raise TaskError(f"{store.tasks_path}: item not found: {args.item_id}")
+    item = store.get_item(args.item_id)
     if args.prompt:
         prompt = item.get("prompt")
         if isinstance(prompt, str):
@@ -875,7 +1064,10 @@ def _cmd_show(store: TaskStore, args: argparse.Namespace) -> int:
             print(path.read_text(encoding="utf-8"), end="")
             return 0
         raise TaskError(f"{args.item_id}: no prompt or prompt_path")
-    print(json.dumps(item, indent=2, ensure_ascii=False, sort_keys=True))
+    if args.json:
+        print(json.dumps(item, ensure_ascii=False, sort_keys=True))
+    else:
+        print(json.dumps(item, indent=2, ensure_ascii=False, sort_keys=True))
     return 0
 
 
@@ -891,7 +1083,7 @@ def _cmd_block(store: TaskStore, args: argparse.Namespace) -> int:
         if item is None:
             raise TaskError(f"{store.tasks_path}: item not found: {args.item_id}")
         blocked_by = item.setdefault("blocked_by", [])
-        if not isinstance(blocked_by, list):
+        if not isinstance(blocked_by, LIST_TYPE):
             raise TaskError(f"item {args.item_id}: blocked_by must be an array")
         for blocker in blockers:
             if blocker not in blocked_by:
@@ -913,7 +1105,7 @@ def _cmd_unblock(store: TaskStore, args: argparse.Namespace) -> int:
         if item is None:
             raise TaskError(f"{store.tasks_path}: item not found: {args.item_id}")
         blocked_by = item.setdefault("blocked_by", [])
-        if not isinstance(blocked_by, list):
+        if not isinstance(blocked_by, LIST_TYPE):
             raise TaskError(f"item {args.item_id}: blocked_by must be an array")
         item["blocked_by"] = [value for value in blocked_by if remove and value not in remove] if remove else []
         _append_audit(item, "unblock", actor, on=sorted(remove) if remove else None)
@@ -936,13 +1128,94 @@ def _cmd_done(store: TaskStore, args: argparse.Namespace) -> int:
         if item.get("blocked_by") and not args.force:
             raise TaskError(f"{args.item_id}: blocked_by is non-empty; use --force to close anyway")
         item["done"] = True
-        item["closed_at"] = utc_now()
-        item["closed_by"] = actor
+        item["done_at"] = utc_now()
+        item["done_by"] = actor
+        item.setdefault("closed_at", item["done_at"])
+        item.setdefault("closed_by", actor)
         item["resolution"] = args.resolution
         _append_audit(item, "done", actor, resolution=args.resolution)
 
     store.mutate_items(update)
     print(args.item_id)
+    return 0
+
+
+def _cmd_review(store: TaskStore, args: argparse.Namespace) -> int:
+    actor = _actor(args)
+    crumb: dict[str, Any] = {
+        "dispatch_id": args.dispatch,
+        "role": "review",
+        "verdict": args.verdict,
+        "findings_ref": args.findings,
+        "ts": utc_now(),
+    }
+
+    def update(items: list[dict[str, Any]]) -> None:
+        by_id = {item["id"]: item for item in items}
+        item = by_id.get(args.item_id)
+        if item is None:
+            raise TaskError(f"{store.tasks_path}: item not found: {args.item_id}")
+        dispatches = item.setdefault("dispatches", [])
+        if not isinstance(dispatches, LIST_TYPE):
+            raise TaskError(f"item {args.item_id}: dispatches must be an array")
+        dispatches.append({k: v for k, v in crumb.items() if v not in (None, "", [], {})})
+        _append_audit(item, "review", actor, dispatch_id=args.dispatch, verdict=args.verdict, findings_ref=args.findings)
+
+    store.mutate_items(update, allow_invalid_live_mirror=True)
+    print(args.item_id)
+    return 0
+
+
+def _cmd_accept(store: TaskStore, args: argparse.Namespace) -> int:
+    actor = _actor(args)
+
+    def update(items: list[dict[str, Any]]) -> None:
+        rows = store.derived_rows_for_items(items)
+        by_id = {row["id"]: row for row in rows}
+        row = by_id.get(args.item_id)
+        if row is None:
+            raise TaskError(f"{store.tasks_path}: item not found: {args.item_id}")
+        if _is_done_reviewed(row):
+            raise TaskError(f"{args.item_id}: already done-reviewed")
+        if row.get("derived_status") != "awaiting-review":
+            raise TaskError(f"{args.item_id}: not DONE/awaiting-review; run task done or wait for worker completion first")
+        review = _latest_review_breadcrumb(row)
+        if not review:
+            raise TaskError(f"{args.item_id}: no logged review; run task review before accept")
+        if review.get("verdict") != "clean":
+            raise TaskError(f"{args.item_id}: latest review verdict is {review.get('verdict')!r}, not clean")
+
+        item = next(item for item in items if item.get("id") == args.item_id)
+        item["done"] = True
+        item["done_reviewed"] = True
+        item["done_reviewed_at"] = utc_now()
+        item["done_reviewed_by"] = actor
+        item["closed_at"] = item["done_reviewed_at"]
+        item["closed_by"] = actor
+        item["accepted_review_dispatch_id"] = review.get("dispatch_id")
+        if review.get("findings_ref"):
+            item["accepted_review_findings_ref"] = review.get("findings_ref")
+        _append_audit(item, "accept", actor, review_dispatch_id=review.get("dispatch_id"))
+
+    store.mutate_items(update, allow_invalid_live_mirror=True)
+    print(args.item_id)
+    return 0
+
+
+def _cmd_list(store: TaskStore, args: argparse.Namespace) -> int:
+    rows = store.query_items(
+        {
+            "status": args.status,
+            "kind": args.kind,
+            "blocked_by": args.blocked_by,
+            "since": args.since,
+        }
+    )
+    if args.json:
+        print(json.dumps(rows, ensure_ascii=False, sort_keys=True))
+        return 0
+    for row in rows:
+        print(f"{row['id']} {row['derived_status']} {row.get('title', '')}")
     return 0
 
 
@@ -968,13 +1241,52 @@ def _cmd_sync(store: TaskStore, args: argparse.Namespace) -> int:
     return 0
 
 
+def _api_store(project_root: str | Path | None = None) -> TaskStore:
+    return TaskStore(resolve_project_root(str(project_root) if project_root is not None else None))
+
+
+def get(item_id: str, project_root: str | Path | None = None) -> dict[str, Any]:
+    """Read one item by id with derived status and schema migration applied."""
+    return _api_store(project_root).get_item(item_id)
+
+
+def list(query: Any = None, project_root: str | Path | None = None, **filters: Any) -> list[dict[str, Any]]:  # noqa: A001
+    """Query items with the same row shape emitted by `goalflight_task.py list --json`."""
+    return _api_store(project_root).query_items(query, **filters)
+
+
+def outstanding(project_root: str | Path | None = None, **filters: Any) -> list[dict[str, Any]]:
+    """Return all items that are not DONE-REVIEWED."""
+    return list("outstanding", project_root=project_root, **filters)
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Goal Flight task-backlog store/writer.")
+    examples = """examples:
+  goalflight_task.py new "Tighten review gate" --kind task --prompt-path docs-private/briefs/t-014.md
+  goalflight_task.py show t-014 --json
+  goalflight_task.py block t-014 --on q-002
+  goalflight_task.py done t-014 --resolution worker-complete
+  goalflight_task.py list outstanding
+  goalflight_task.py list delegated --since 1h --json
+  goalflight_task.py review t-014 --verdict clean --dispatch codex-review-123
+  goalflight_task.py accept t-014
+  goalflight_task.py sync
+"""
+    parser = argparse.ArgumentParser(
+        description="Goal Flight task-backlog store/writer.",
+        epilog=examples,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument("--project-root", help="Canonical project root. Defaults to git common-dir parent.")
     parser.add_argument("--by", help="Actor stamp override, e.g. user or watcher.")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    new = sub.add_parser("new", help="Create a task, bug, or decision item.")
+    new = sub.add_parser(
+        "new",
+        help="Create a task, bug, or decision item.",
+        epilog='example: goalflight_task.py new "Fix stale status" --kind bug --blocked-by q-002',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     new.add_argument("--by", help=argparse.SUPPRESS)
     new.add_argument("title")
     new.add_argument("--kind", choices=["task", "bug", "decision"], default="task")
@@ -991,37 +1303,105 @@ def build_parser() -> argparse.ArgumentParser:
     new.add_argument("--json", action="store_true")
     new.set_defaults(func=_cmd_new)
 
-    show = sub.add_parser("show", help="Read one item by id.")
+    show = sub.add_parser(
+        "show",
+        help="Read one item by id.",
+        epilog="examples:\n  goalflight_task.py show t-014\n  goalflight_task.py show t-014 --json\n  goalflight_task.py show t-014 --prompt",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     show.add_argument("--by", help=argparse.SUPPRESS)
     show.add_argument("item_id")
     show.add_argument("--prompt", action="store_true")
+    show.add_argument("--json", action="store_true")
     show.set_defaults(func=_cmd_show)
 
-    block = sub.add_parser("block", help="Add blockers to an item.")
+    block = sub.add_parser(
+        "block",
+        help="Add blockers to an item.",
+        epilog="example: goalflight_task.py block t-014 --on q-002",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     block.add_argument("--by", help=argparse.SUPPRESS)
     block.add_argument("item_id")
     block.add_argument("--on", action="append", required=True)
     block.set_defaults(func=_cmd_block)
 
-    unblock = sub.add_parser("unblock", help="Remove blockers from an item, or all blockers if --on is omitted.")
+    unblock = sub.add_parser(
+        "unblock",
+        help="Remove blockers from an item, or all blockers if --on is omitted.",
+        epilog="example: goalflight_task.py unblock t-014 --on q-002",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     unblock.add_argument("--by", help=argparse.SUPPRESS)
     unblock.add_argument("item_id")
     unblock.add_argument("--on", action="append", default=[])
     unblock.set_defaults(func=_cmd_unblock)
 
-    done = sub.add_parser("done", help="Mark an item done.")
+    done = sub.add_parser(
+        "done",
+        help="Mark an item DONE/awaiting-review; accept moves it to DONE-REVIEWED.",
+        epilog="example: goalflight_task.py done t-014 --resolution worker-complete",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     done.add_argument("--by", help=argparse.SUPPRESS)
     done.add_argument("item_id")
     done.add_argument("--resolution", default="done")
     done.add_argument("--force", action="store_true")
     done.set_defaults(func=_cmd_done)
 
-    status = sub.add_parser("status", help="Print derived task status.")
+    review = sub.add_parser(
+        "review",
+        help="Append a review breadcrumb to an item.",
+        epilog="example: goalflight_task.py review t-014 --verdict clean --dispatch codex-review-123 --findings docs-private/reviews/t-014.md",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    review.add_argument("--by", help=argparse.SUPPRESS)
+    review.add_argument("item_id")
+    review.add_argument("--verdict", choices=["clean", "findings"], required=True)
+    review.add_argument("--dispatch", required=True)
+    review.add_argument("--findings")
+    review.set_defaults(func=_cmd_review)
+
+    accept = sub.add_parser(
+        "accept",
+        help="Move DONE/awaiting-review to DONE-REVIEWED after a clean review.",
+        epilog="example: goalflight_task.py accept t-014",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    accept.add_argument("--by", help=argparse.SUPPRESS)
+    accept.add_argument("item_id")
+    accept.set_defaults(func=_cmd_accept)
+
+    list_cmd = sub.add_parser(
+        "list",
+        help="Query items with canned dashboard statuses and AND filters.",
+        epilog="examples:\n  goalflight_task.py list outstanding\n  goalflight_task.py list awaiting-review --kind task\n  goalflight_task.py list delegated --since 1h --json\n  goalflight_task.py list --blocked-by q-002",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    list_cmd.add_argument("--by", help=argparse.SUPPRESS)
+    list_cmd.add_argument("status", nargs="?", choices=sorted(CANNED_LIST_STATUSES))
+    list_cmd.add_argument("--since", help="UTC lower bound: 1h, now-3600, epoch seconds, or ISO timestamp.")
+    list_cmd.add_argument("--kind", choices=["task", "bug", "decision"])
+    list_cmd.add_argument("--blocked-by", action="append", default=[])
+    list_cmd.add_argument("--json", action="store_true")
+    list_cmd.set_defaults(func=_cmd_list)
+
+    status = sub.add_parser(
+        "status",
+        help="Print derived task status.",
+        epilog="example: goalflight_task.py status --json",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     status.add_argument("--by", help=argparse.SUPPRESS)
     status.add_argument("--json", action="store_true")
     status.set_defaults(func=_cmd_status)
 
-    sync = sub.add_parser("sync", help="Write tasks-data.js and sync project-scoped dispatch breadcrumbs.")
+    sync = sub.add_parser(
+        "sync",
+        help="Write tasks-data.js and sync project-scoped dispatch breadcrumbs.",
+        epilog="example: goalflight_task.py sync",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     sync.add_argument("--by", help=argparse.SUPPRESS)
     sync.set_defaults(func=_cmd_sync)
     return parser

@@ -40,9 +40,9 @@ h2{font-size:1.0rem;margin:1.7em 0 .5em;border-bottom:1px solid var(--border);pa
 .cards .c-decision .n{color:var(--warn)}
 .cards .c-pending .n{color:var(--accent)}
 .cards .c-working .n{color:var(--accent)}
-.cards .c-worker-finished .n{color:var(--review-text)}
+.cards .c-awaiting-review .n{color:var(--review-text)}
 .cards .c-waiting .n{color:var(--warn)}
-.cards .c-done .n{color:var(--ok)}
+.cards .c-done-reviewed .n{color:var(--ok)}
 /* primary nav */
 .nav{display:grid;grid-template-columns:repeat(auto-fit,minmax(13rem,1fr));gap:.7rem;margin:.6rem 0 .3rem}
 .nav a{display:block;background:var(--card);border:1px solid var(--border);border-radius:.7rem;
@@ -108,9 +108,9 @@ footer{max-width:46rem;margin:0 auto;padding:.5rem 1.25rem 2rem;color:var(--mute
     {key:"decision",label:"decisions",href:"questions-for-user.html"},
     {key:"pending",label:"to do",href:"tickets.html"},
     {key:"working",label:"in progress",href:"current-activity.html"},
-    {key:"worker-finished",label:"awaiting review",href:"current-activity.html"},
+    {key:"awaiting-review",label:"awaiting review",href:"current-activity.html"},
     {key:"waiting",label:"waiting",href:"tickets.html"},
-    {key:"done",label:"done",href:"tickets.html"}
+    {key:"done-reviewed",label:"done",href:"tickets.html"}
   ];
 
   function render(){

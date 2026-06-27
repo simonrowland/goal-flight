@@ -52,4 +52,59 @@ assert("renderBoard escapes script terminator", !/<\/script/i.test(mount.innerHT
 assert("renderBoard escapes raw img tag", !/<img/i.test(mount.innerHTML));
 assert("renderBoard includes escaped title", mount.innerHTML.includes("&lt;/script&gt;&lt;img"));
 
+GF.index([
+  {
+    id: "t-legacy",
+    kind: "task",
+    title: "Legacy done",
+    blocked_by: [],
+    links: [],
+    done: true
+  },
+  {
+    schema_version: 1,
+    id: "t-review",
+    kind: "task",
+    title: "Worker done",
+    blocked_by: [],
+    links: [],
+    done: true,
+    done_reviewed: false
+  },
+  {
+    schema_version: 1,
+    id: "t-accepted",
+    kind: "task",
+    title: "Accepted",
+    blocked_by: [],
+    links: [],
+    done: true,
+    done_reviewed: true
+  },
+  {
+    schema_version: 1,
+    id: "t-blocked",
+    kind: "task",
+    title: "Blocked",
+    blocked_by: ["t-review"],
+    links: [],
+    done: false
+  },
+  {
+    schema_version: 1,
+    id: "t-unblocked",
+    kind: "task",
+    title: "Unblocked",
+    blocked_by: ["t-accepted"],
+    links: [],
+    done: false
+  }
+]);
+
+assert("legacy done stays done-reviewed", GF.store.byId["t-legacy"]._section === "done-reviewed");
+assert("v1 done waits for review", GF.store.byId["t-review"]._section === "awaiting-review");
+assert("accepted item is done-reviewed", GF.store.byId["t-accepted"]._section === "done-reviewed");
+assert("awaiting review blocker still blocks", GF.store.byId["t-blocked"]._section === "waiting");
+assert("done-reviewed blocker resolves", GF.store.byId["t-unblocked"]._section === "pending");
+
 console.log("OK: gf.js escaping/autolink test pass");

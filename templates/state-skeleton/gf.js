@@ -33,24 +33,26 @@
 
   /* --------------------------------------------------------------- model */
 
-  // Canonical status order + display metadata. 'working' / 'worker-finished'
-  // are supported even though the seeded snapshot has none yet.
+  // Canonical status order + display metadata. 'worker-finished' remains a
+  // tolerated input state, but the section vocabulary is 'awaiting-review'.
   var SECTIONS = [
     { key: "decision", label: "Decisions needed", cls: "sec-decision" },
     { key: "pending", label: "To do", cls: "sec-pending" },
     { key: "working", label: "In progress", cls: "sec-working" },
-    { key: "worker-finished", label: "Awaiting review", cls: "sec-review" },
+    { key: "awaiting-review", label: "Awaiting review", cls: "sec-review" },
+    { key: "worker-failed", label: "Failed / needs attention", cls: "sec-failed" },
     { key: "waiting", label: "Waiting", cls: "sec-waiting" },
-    { key: "done", label: "Done", cls: "sec-done" }
+    { key: "done-reviewed", label: "Done", cls: "sec-done" }
   ];
 
   var STATUS_LABELS = {
     decision: "decision",
     pending: "to do",
     working: "in progress",
-    "worker-finished": "awaiting review",
+    "awaiting-review": "awaiting review",
+    "worker-failed": "worker failed",
     waiting: "waiting",
-    done: "done"
+    "done-reviewed": "done reviewed"
   };
 
   var SEV_RANK = { critical: 4, high: 3, medium: 2, low: 1 };
@@ -60,10 +62,11 @@
     var it = raw && typeof raw === "object" ? raw : {};
     var id = typeof it.id === "string" && it.id ? it.id : "(no-id)";
     var kind = it.kind === "bug" || it.kind === "decision" ? it.kind : "task";
-    // Canonical done predicate: the boolean OR an explicit status of 'done'.
-    // Keeps the Done bucket (sectionKey) and blocker-resolution (b.done) from
-    // ever disagreeing when status and the boolean diverge.
-    var isDone = !!it.done || it.status === "done";
+    var schemaVersion = typeof it.schema_version === "number" ? it.schema_version : null;
+    var legacyDone = schemaVersion == null && !!it.done && it.done_reviewed == null;
+    var doneReviewed = !!it.done_reviewed || it.status === "done-reviewed" || it.status === "done" ||
+      legacyDone || (kind === "decision" && !!it.done);
+    var workerDone = !doneReviewed && (!!it.done || it.status === "awaiting-review" || it.status === "worker-finished");
     return {
       id: id,
       kind: kind,
@@ -71,7 +74,9 @@
       status: it.status || null, // may be derived below
       blocked_by: Array.isArray(it.blocked_by) ? it.blocked_by.filter(Boolean) : [],
       links: Array.isArray(it.links) ? it.links.filter(Boolean) : [],
-      done: isDone,
+      done: doneReviewed,
+      done_reviewed: doneReviewed,
+      worker_done: workerDone,
       severity: it.severity || null,
       pattern: it.pattern || null,
       source: it.source || null,
@@ -86,16 +91,14 @@
     };
   }
 
-  // Section key for an item. Honours an explicit status; otherwise DERIVES it:
-  //   done -> 'done'; decision kind -> 'decision'/'done'; unresolved blocked_by
-  //   -> 'waiting'; else -> 'pending'. Unknown blockers count as unresolved.
+  // Section key for an item. Honours explicit lifecycle flags; otherwise derives
+  // from status, blockers, and kind. Unknown blockers count as unresolved.
   function sectionKey(it, byId) {
-    if (it.done) return "done";
+    if (it.done_reviewed) return "done-reviewed";
     var s = it.status;
-    // kind:decision flows decision -> done only; it has no dispatch lifecycle,
-    // so kind dominates over a (spurious) working/worker-finished status.
-    if (it.kind === "decision") return s === "done" ? "done" : "decision";
-    if (s === "working" || s === "worker-finished") return s;
+    if (it.kind === "decision") return "decision";
+    if (it.worker_done || s === "worker-finished" || s === "awaiting-review") return "awaiting-review";
+    if (s === "working" || s === "worker-failed") return s;
     // resolve blockers against the item map
     var unresolved = (it.blocked_by || []).some(function (bid) {
       var b = byId[bid];
@@ -103,7 +106,8 @@
     });
     if (unresolved && (it.blocked_by || []).length) return "waiting";
     if (s === "waiting") return "waiting";
-    if (s === "pending" || s === "done" || !s) return s === "done" ? "done" : "pending";
+    if (s === "done" || s === "done-reviewed") return "done-reviewed";
+    if (s === "pending" || !s) return "pending";
     return "pending";
   }
 
@@ -388,11 +392,11 @@
       var rows = groups[sec.key] || [];
       if (!rows.length) return;
       // Done newest-first (LIFO). Others keep the chosen sort.
-      var ordered = sec.key === "done" ? rows.slice().reverse() : rows;
+      var ordered = sec.key === "done-reviewed" ? rows.slice().reverse() : rows;
       html +=
         '<section class="sec ' + sec.cls + '" aria-label="' + esc(sec.label) + '">' +
         '<h2>' + esc(sec.label) + ' <span class="count">' + rows.length + ' <span class="visually-hidden">items</span></span></h2>' +
-        '<ul class="rows' + (sec.key === "done" ? " done-list" : "") + '">' +
+        '<ul class="rows' + (sec.key === "done-reviewed" ? " done-list" : "") + '">' +
         ordered.map(rowHTML).join("") +
         "</ul></section>";
     });

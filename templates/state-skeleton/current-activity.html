@@ -138,8 +138,8 @@ footer{max-width:50rem;margin:0 auto;padding:1.5rem 1.25rem 2rem;color:var(--mut
 
   function render(){
     var working = bySection("working");
-    var review  = bySection("worker-finished");
-    var done    = bySection("done").slice().reverse(); // newest-first LIFO
+    var review  = bySection("awaiting-review");
+    var done    = bySection("done-reviewed").slice().reverse(); // newest-first LIFO
 
     document.getElementById("cWorking").textContent = working.length;
     document.getElementById("cReview").textContent  = review.length;

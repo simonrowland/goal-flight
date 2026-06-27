@@ -10,13 +10,14 @@ If node is unavailable, the whole file SKIPs (runner-recognized "SKIP:" prefix).
 
 from __future__ import annotations
 
+import datetime as dt
+import importlib.util
 import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
-import importlib.util
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -219,7 +220,7 @@ def test_goalflight_task_status_uses_breadcrumb_when_ledger_missing() -> None:
         proc = run_task(project, "status", "--json", env={"GOALFLIGHT_STATE_DIR": str(state_dir)})
         assert_true(f"status exits 0: {proc.stderr}", proc.returncode == 0)
         payload = json.loads(proc.stdout)
-        assert_true("breadcrumb fallback worker-finished", payload["items"][0]["derived_status"] == "worker-finished")
+        assert_true("breadcrumb fallback awaiting-review", payload["items"][0]["derived_status"] == "awaiting-review")
 
 
 def test_goalflight_task_status_filters_ledger_by_project_root() -> None:
@@ -359,6 +360,227 @@ def test_goalflight_task_sync_appends_plural_task_ids() -> None:
             crumb = dispatches[0]
             assert_true(f"{item['id']} breadcrumb state", crumb.get("state") == "worker-finished")
             assert_true(f"{item['id']} breadcrumb snapshot", isinstance(crumb.get("last_worker_state"), dict))
+
+
+def test_goalflight_task_list_filters_outstanding_awaiting_review_since() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        project = Path(td) / "project-a"
+        now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+        items = [
+            {
+                "schema_version": 1,
+                "id": "t-001",
+                "kind": "task",
+                "title": "Open task",
+                "blocked_by": [],
+                "links": [],
+                "done": False,
+                "created_at": "2020-01-01T00:00:00+00:00",
+            },
+            {
+                "schema_version": 1,
+                "id": "t-002",
+                "kind": "task",
+                "title": "Worker done",
+                "blocked_by": [],
+                "links": [],
+                "done": True,
+                "done_reviewed": False,
+                "created_at": "2020-01-01T00:00:00+00:00",
+            },
+            {
+                "schema_version": 1,
+                "id": "t-003",
+                "kind": "task",
+                "title": "Accepted task",
+                "blocked_by": [],
+                "links": [],
+                "done": True,
+                "done_reviewed": True,
+                "created_at": "2020-01-01T00:00:00+00:00",
+            },
+            {
+                "schema_version": 1,
+                "id": "t-004",
+                "kind": "task",
+                "title": "Recent delegation",
+                "blocked_by": [],
+                "links": [],
+                "done": False,
+                "created_at": "2020-01-01T00:00:00+00:00",
+                "dispatches": [{"dispatch_id": "recent", "state": "working", "ts": now}],
+            },
+            {
+                "schema_version": 1,
+                "id": "b-001",
+                "kind": "bug",
+                "title": "Blocked bug",
+                "blocked_by": ["q-001"],
+                "links": [],
+                "done": False,
+                "created_at": "2020-01-01T00:00:00+00:00",
+            },
+            {
+                "schema_version": 1,
+                "id": "t-005",
+                "kind": "task",
+                "title": "Old delegation with recent review",
+                "blocked_by": [],
+                "links": [],
+                "done": False,
+                "created_at": "2020-01-01T00:00:00+00:00",
+                "dispatches": [
+                    {"dispatch_id": "old", "state": "worker-finished", "ts": "2020-01-01T00:10:00+00:00"},
+                    {"dispatch_id": "review-recent", "role": "review", "verdict": "clean", "ts": now},
+                ],
+            },
+            {
+                "schema_version": 1,
+                "id": "q-001",
+                "kind": "decision",
+                "title": "Open decision",
+                "blocked_by": [],
+                "links": [],
+                "done": False,
+                "created_at": "2020-01-01T00:00:00+00:00",
+            },
+        ]
+        _write_tasks(project, items)
+
+        proc = run_task(project, "list", "outstanding", "--json")
+        assert_true(f"list outstanding exits 0: {proc.stderr}", proc.returncode == 0)
+        outstanding = {item["id"]: item for item in json.loads(proc.stdout)}
+        assert_true("done-reviewed excluded from outstanding", "t-003" not in outstanding)
+        assert_true("awaiting review included in outstanding", outstanding["t-002"]["derived_status"] == "awaiting-review")
+        assert_true("waiting included in outstanding", outstanding["b-001"]["derived_status"] == "waiting")
+
+        proc = run_task(project, "list", "awaiting-review", "--json")
+        assert_true(f"list awaiting-review exits 0: {proc.stderr}", proc.returncode == 0)
+        awaiting = json.loads(proc.stdout)
+        assert_true("awaiting-review filter", [item["id"] for item in awaiting] == ["t-002", "t-005"])
+
+        proc = run_task(project, "list", "delegated", "--since", "now-3600", "--json")
+        assert_true(f"list delegated --since exits 0: {proc.stderr}", proc.returncode == 0)
+        delegated = json.loads(proc.stdout)
+        assert_true("recent delegated filter", [item["id"] for item in delegated] == ["t-004"])
+        assert_true("query_epoch is UTC int seconds", isinstance(delegated[0].get("query_epoch"), int) and delegated[0]["query_epoch"] > 0)
+
+        proc = run_task(project, "list", "--kind", "bug", "--blocked-by", "q-001", "--json")
+        assert_true(f"list kind+blocked exits 0: {proc.stderr}", proc.returncode == 0)
+        blocked = json.loads(proc.stdout)
+        assert_true("kind and blocker filters AND", [item["id"] for item in blocked] == ["b-001"])
+
+
+def test_goalflight_task_two_state_accept_and_review_breadcrumb() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        project = Path(td)
+        _write_tasks(
+            project,
+            [
+                {
+                    "schema_version": 1,
+                    "id": "t-001",
+                    "kind": "task",
+                    "title": "Awaiting review",
+                    "blocked_by": [],
+                    "links": [],
+                    "done": True,
+                    "done_reviewed": False,
+                }
+            ],
+        )
+
+        proc = run_task(project, "accept", "t-001")
+        assert_true("accept without review fails", proc.returncode != 0 and "no logged review" in proc.stderr)
+
+        proc = run_task(project, "review", "t-001", "--verdict", "findings", "--dispatch", "review-1", "--findings", "docs-private/reviews/t-001.md")
+        assert_true(f"findings review exits 0: {proc.stderr}", proc.returncode == 0)
+        proc = run_task(project, "accept", "t-001")
+        assert_true("accept with findings review fails", proc.returncode != 0 and "not clean" in proc.stderr)
+
+        proc = run_task(project, "review", "t-001", "--verdict", "clean", "--dispatch", "review-2")
+        assert_true(f"clean review exits 0: {proc.stderr}", proc.returncode == 0)
+        proc = run_task(project, "accept", "t-001", "--by", "controller")
+        assert_true(f"accept exits 0: {proc.stderr}", proc.returncode == 0)
+
+        item = json.loads(run_task(project, "show", "t-001", "--json").stdout)
+        assert_true("accept flips done-reviewed", item["done_reviewed"] is True and item["derived_status"] == "done-reviewed")
+        reviews = [crumb for crumb in item.get("dispatches", []) if crumb.get("role") == "review"]
+        assert_true("review breadcrumbs append", [crumb["dispatch_id"] for crumb in reviews] == ["review-1", "review-2"])
+        assert_true("accepted review recorded", item.get("accepted_review_dispatch_id") == "review-2")
+
+
+def test_goalflight_task_schema_version_tolerance_and_read_api() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        project = Path(td)
+        _write_tasks(
+            project,
+            [
+                {
+                    "id": "t-001",
+                    "kind": "task",
+                    "title": "Legacy open task",
+                    "blocked_by": [],
+                    "links": [],
+                    "done": False,
+                    "extra_future_field": {"kept": True},
+                },
+                {
+                    "schema_version": 99,
+                    "id": "t-002",
+                    "kind": "task",
+                    "title": "Future schema task",
+                    "blocked_by": [],
+                    "links": [],
+                    "done": False,
+                },
+            ],
+        )
+        module = _load_goalflight_task_module()
+
+        one = module.get("t-001", project_root=project)
+        assert_true("missing schema version tolerated", one["schema_version"] == 1)
+        assert_true("unknown optional fields preserved", one["extra_future_field"] == {"kept": True})
+        assert_true("future schema version tolerated", module.get("t-002", project_root=project)["schema_version"] == 99)
+        assert_true("api outstanding same row shape", [item["id"] for item in module.outstanding(project_root=project)] == ["t-001", "t-002"])
+
+        proc = run_task(project, "sync", "--by", "watcher")
+        assert_true(f"sync exits 0: {proc.stderr}", proc.returncode == 0)
+        rows = [
+            json.loads(line)
+            for line in (project / "docs-private" / "tasks.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        assert_true("sync writes schema_version on every item", all(isinstance(item.get("schema_version"), int) for item in rows))
+
+
+def test_goalflight_task_append_dispatch_breadcrumbs_preserves_history() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        project = Path(td)
+        _write_tasks(
+            project,
+            [
+                {
+                    "schema_version": 1,
+                    "id": "t-001",
+                    "kind": "task",
+                    "title": "Retry task",
+                    "blocked_by": [],
+                    "links": [],
+                    "done": False,
+                }
+            ],
+        )
+        module = _load_goalflight_task_module()
+        store = module.TaskStore(project)
+        store.append_dispatch_breadcrumbs(["t-001"], {"dispatch_id": "dispatch-1", "state": "working", "ts": "2026-06-01T00:00:00+00:00"}, "watcher")
+        store.append_dispatch_breadcrumbs(["t-001"], {"dispatch_id": "dispatch-2", "state": "worker-finished", "ts": "2026-06-01T00:10:00+00:00"}, "watcher")
+
+        item = module.get("t-001", project_root=project)
+        dispatches = item.get("dispatches")
+        assert_true("dispatch history is append list", isinstance(dispatches, list) and len(dispatches) == 2)
+        assert_true("subsequent dispatch did not overwrite", [entry["dispatch_id"] for entry in dispatches] == ["dispatch-1", "dispatch-2"])
+        assert_true("latest appended breadcrumb drives status", item["derived_status"] == "awaiting-review")
 
 
 def test_goalflight_task_atomic_write_rejects_bad_content() -> None:
@@ -548,11 +770,15 @@ def main() -> None:
     test_goalflight_task_status_filters_ledger_by_project_root()
     test_goalflight_task_status_uses_latest_dispatch_breadcrumb()
     test_goalflight_task_sync_appends_plural_task_ids()
+    test_goalflight_task_list_filters_outstanding_awaiting_review_since()
+    test_goalflight_task_two_state_accept_and_review_breadcrumb()
+    test_goalflight_task_schema_version_tolerance_and_read_api()
+    test_goalflight_task_append_dispatch_breadcrumbs_preserves_history()
     test_goalflight_task_atomic_write_rejects_bad_content()
     test_goalflight_task_sync_repairs_stale_mirror()
     test_goalflight_task_data_js_escapes_script_end_and_html()
     test_goalflight_task_sync_generates_markdown_views()
-    print("OK: 14 tasks mirror/task-store tests pass")
+    print("OK: 18 tasks mirror/task-store tests pass")
 
 
 if __name__ == "__main__":
