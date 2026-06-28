@@ -143,6 +143,30 @@ def test_scaffold_project_state_preserves_unmanaged_handoff_mentions() -> None:
         assert_true("dry-run warning carried in message", "left unmanaged handoff.md mention untouched" in result["agents"]["message"])
 
 
+def test_scaffold_project_state_preserves_generic_living_state_prose() -> None:
+    with tempfile.TemporaryDirectory(prefix="gf-state-layout-agents-living-") as td:
+        repo = Path(td)
+        subprocess.run(["git", "init"], cwd=repo, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        repo.joinpath("AGENTS.md").write_text(
+            "## Living state\n"
+            "\n"
+            "Operator prose says handoff.md documents old incident practice.\n",
+            encoding="utf-8",
+        )
+
+        result = goalflight_setup.scaffold_project_state(
+            ROOT,
+            repo,
+            apply=True,
+            today="2026-06-27",
+        )
+
+        text = repo.joinpath("AGENTS.md").read_text(encoding="utf-8")
+        assert_true("generic Living state prose preserved", "handoff.md documents old incident practice" in text)
+        assert_true("resume pin still added", "RESUME-NOTES-*.md" in text)
+        assert_true("manual review message emitted", "left unmanaged handoff.md mention untouched" in result["agents"]["message"])
+
+
 def test_scaffold_project_state_refreshes_skewed_managed_view_with_backup() -> None:
     with tempfile.TemporaryDirectory(prefix="gf-state-layout-view-refresh-") as td:
         repo = Path(td)
@@ -170,6 +194,27 @@ def test_scaffold_project_state_refreshes_skewed_managed_view_with_backup() -> N
         assert_true(
             "managed view preimage backed up",
             repo.joinpath(backup["path"], "docs-private/gf.js").read_text(encoding="utf-8") == stale,
+        )
+
+
+def test_scaffold_project_state_preserves_customized_current_managed_view() -> None:
+    with tempfile.TemporaryDirectory(prefix="gf-state-layout-view-custom-") as td:
+        repo = Path(td)
+        subprocess.run(["git", "init"], cwd=repo, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        goalflight_setup.scaffold_project_state(ROOT, repo, apply=True, today="2026-06-27")
+        view = repo / "docs-private/gf.js"
+        customized = ROOT.joinpath("templates/state-skeleton/gf.js").read_text(encoding="utf-8")
+        customized += "\n/* operator customization */\n"
+        view.write_text(customized, encoding="utf-8")
+
+        result = goalflight_setup.scaffold_project_state(ROOT, repo, apply=True, today="2026-06-27")
+
+        assert_true("customized managed view preserved", view.read_text(encoding="utf-8") == customized)
+        assert_true("customized managed view not refreshed", result["refreshed_managed_views"] == [])
+        assert_true("customized managed view no backup", result["backup"] is None)
+        assert_true(
+            "customized managed view manual review message",
+            any("preserve customized managed view asset" in message for message in result["messages"]),
         )
 
 
@@ -243,6 +288,9 @@ def test_scaffold_project_state_backfills_derivable_inflight_ledger_task_ids() -
             updated = result["ledger_task_id_backfill"]["updated"]
             record = json.loads((state / "runs.d/dispatch-t-031.json").read_text(encoding="utf-8"))
             manifest = json.loads((repo / result["backup"]["manifest"]).read_text(encoding="utf-8"))
+            with contextlib.redirect_stdout(io.StringIO()):
+                goalflight_setup._restore_from_manifest(repo / result["backup"]["manifest"])
+            restored_record = json.loads((state / "runs.d/dispatch-t-031.json").read_text(encoding="utf-8"))
         finally:
             if old_state is None:
                 os.environ.pop("GOALFLIGHT_STATE_DIR", None)
@@ -255,6 +303,8 @@ def test_scaffold_project_state_backfills_derivable_inflight_ledger_task_ids() -
         preimages = manifest["ledger_task_id_backfill_preimages"]
         assert_true("ledger preimage recorded", preimages and preimages[0]["dispatch_id"] == "dispatch-t-031")
         assert_true("ledger preimage lacks task_ids", "task_ids" not in preimages[0]["record"])
+        assert_true("ledger restore removed task_ids", "task_ids" not in restored_record)
+        assert_true("ledger restore removed task_id", "task_id" not in restored_record)
 
 
 def test_state_layout_references_newest_resume_notes_not_handoff_file() -> None:
@@ -316,6 +366,23 @@ def test_doctor_state_layout_reports_managed_view_schema_skew() -> None:
         assert_true("refresh path named", "run `/goal-flight init`" in skew[0]["message"])
 
 
+def test_doctor_state_layout_reports_customized_view_as_advisory() -> None:
+    with tempfile.TemporaryDirectory(prefix="gf-state-layout-view-custom-doctor-") as td:
+        repo = Path(td)
+        goalflight_setup.scaffold_project_state(ROOT, repo, apply=True, today="2026-06-27")
+        view = repo / "docs-private/gf.js"
+        view.write_text(
+            ROOT.joinpath("templates/state-skeleton/gf.js").read_text(encoding="utf-8")
+            + "\n/* operator customization */\n",
+            encoding="utf-8",
+        )
+
+        payload = goalflight_doctor.check_project_state_layout(repo, ROOT)
+        assert_true("customized view not schema skew", payload["view_schema_skew"] == [])
+        assert_true("customized view advisory reported", payload["view_customizations"])
+        assert_true("customized view advisory state", payload["ok"] is None)
+
+
 def test_project_readiness_requires_agents_resume_pin() -> None:
     with tempfile.TemporaryDirectory(prefix="gf-state-layout-ready-") as td:
         repo = Path(td)
@@ -342,7 +409,7 @@ def test_project_readiness_requires_agents_resume_pin() -> None:
         assert_true("ready project state layout ok", ready["state_layout"]["ok"] is True)
 
 
-def test_project_readiness_treats_no_backlog_state_layout_absence_as_advisory() -> None:
+def test_project_readiness_treats_initialized_state_layout_absence_as_warning() -> None:
     with tempfile.TemporaryDirectory(prefix="gf-state-layout-no-backlog-") as td:
         repo = Path(td)
         docs_private = repo / "docs-private"
@@ -352,12 +419,12 @@ def test_project_readiness_treats_no_backlog_state_layout_absence_as_advisory() 
         _write_ready_agents(repo)
 
         payload = goalflight_doctor.check_project_goalflight_readiness(repo)
-        assert_true("no-backlog project readiness ok", payload["ok"] is True)
-        assert_true("state layout absence advisory", payload["state_layout"]["ok"] is None)
-        assert_true("state layout advisories present", payload["state_layout"]["advisories"])
+        assert_true("initialized project readiness warns", payload["ok"] is False)
+        assert_true("state layout absence warning", payload["state_layout"]["ok"] is False)
+        assert_true("state layout warnings present", payload["state_layout"]["warnings"])
         assert_true(
-            "missing skeleton not readiness warning",
-            not any("missing canonical docs-private file" in warning for warning in payload["warnings"]),
+            "missing skeleton is readiness warning",
+            any("missing canonical docs-private file" in warning for warning in payload["warnings"]),
         )
 
 
@@ -381,15 +448,18 @@ def main() -> None:
         test_scaffold_project_state_dry_run_makes_no_changes,
         test_scaffold_project_state_creates_backup_before_apply,
         test_scaffold_project_state_preserves_unmanaged_handoff_mentions,
+        test_scaffold_project_state_preserves_generic_living_state_prose,
         test_scaffold_project_state_refreshes_skewed_managed_view_with_backup,
+        test_scaffold_project_state_preserves_customized_current_managed_view,
         test_scaffold_project_state_respects_gitignore_branches,
         test_scaffold_project_state_backfills_derivable_inflight_ledger_task_ids,
         test_state_layout_references_newest_resume_notes_not_handoff_file,
         test_doctor_state_layout_reports_exact_missing_paths,
         test_doctor_state_layout_ignores_static_html_mtime,
         test_doctor_state_layout_reports_managed_view_schema_skew,
+        test_doctor_state_layout_reports_customized_view_as_advisory,
         test_project_readiness_requires_agents_resume_pin,
-        test_project_readiness_treats_no_backlog_state_layout_absence_as_advisory,
+        test_project_readiness_treats_initialized_state_layout_absence_as_warning,
         test_state_protocols_are_discoverable_from_index_and_commands,
     ]
     for test in tests:

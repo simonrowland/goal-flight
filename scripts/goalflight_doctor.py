@@ -67,6 +67,42 @@ MANAGED_VIEW_ASSETS = (
     "current-activity.html",
     "questions-for-user.html",
 )
+MANAGED_VIEW_LEGACY_MARKERS = (
+    "old dashboard vocabulary:",
+    "legacy worker-finished done vocabulary",
+)
+MANAGED_VIEW_LEGACY_SHA256 = {
+    "gf.js": (
+        "e795acb52a4b6c8b86393a8eadd42cce3d2c34c95b11208bd7f29b4877f29815",
+        "a3d1d3442324b5279fd3e4297668868dfbcf7f171afba63947928aaa5347098e",
+        "318554cb97f4293ae2ac0c1ad61eb72d626696a6960c54e0dc614a4826ae5812",
+        "692d369112be556e3b35af7793a5dcb785056ff907889433b85740e7228f4de1",
+    ),
+    "index.html": (
+        "9c0b7c0f8bca04701ba923d48e3fad3b8afec4bc156187468b15620094fd4a92",
+        "ea695e9cbaf27d31e08ffe675de34c08cc7804282ba202f1321f5fe972749b81",
+        "fa346b83c7d76ad4cb295370fac05e861ecc923aadc8c58d369f46a4d7054f30",
+    ),
+    "tickets.html": (
+        "8dd258262722cdada4813774ce8e9db91253738e5b8b133be497e55212cbc75d",
+        "e72ce21e404bc2d0d018c67e12ba4c35edc6799fd4febd5974562c25507b431b",
+        "df77a5e362491886cf8e92fa9af87e7f2e702d2c4e128a9b3b29f786bae32d3c",
+    ),
+    "ticket.html": (
+        "0e95993c23d43df2d3ce73e637c2fae1feec2d3cfa5bf7109966592033cf3a2c",
+        "d5d19cf39f2a5aa0e82a1318e8c11de91e1da3c6ab6221303a13b0284d1efb85",
+        "61a6495e7651771349a63729a13f26a635f8e2356869f52146d47a06e933915f",
+    ),
+    "current-activity.html": (
+        "13e1ee7730f7d1945503abab3bf2d5e62e580655fd3799b619cbf35146a392d4",
+        "0fa62a6793f12738e75a218b49cd5ec3e1e61982d1e7bf1b766673b530daf653",
+        "46a72faec70d248cc646f212ec76b5b4de5a6c4659371f4e443081c021f68519",
+    ),
+    "questions-for-user.html": (
+        "c06f843ee66b75c4b5f7b41d390ab2c268c95fa874e91af7ad0aa60e5701beb8",
+        "7e23376b514f30af7eaba13b5e2123f43151ff3c009c0d76d3a5c042ed0213a8",
+    ),
+}
 
 
 def run(cmd: list[str], cwd: Path | None = None, timeout: float = 8.0) -> dict:
@@ -554,6 +590,28 @@ def _state_layout_adopted(docs_private: Path) -> bool:
     return any((docs_private / rel).exists() for rel in adoption_markers)
 
 
+def _state_layout_init_signal(project_root: Path, docs_private: Path) -> bool:
+    if _state_layout_has_task_store(docs_private) or _state_layout_adopted(docs_private):
+        return True
+    if not (docs_private / "env-caveats.md").exists():
+        return False
+    agent_path, agent_text = _agent_instructions(project_root)
+    lower = agent_text.casefold()
+    has_routing = bool(
+        agent_path
+        and "goal-flight" in lower
+        and ("skill-root" in lower or "goalflight_root" in lower or "commands/" in lower)
+        and "skill.md" in lower
+    )
+    pins_newest_resume_notes = bool(
+        agent_path
+        and "newest" in lower
+        and "resume-notes" in lower
+        and "docs-private" in lower
+    )
+    return bool(has_routing and pins_newest_resume_notes)
+
+
 def _sha256_path(path: Path) -> str | None:
     try:
         h = hashlib.sha256()
@@ -563,6 +621,45 @@ def _sha256_path(path: Path) -> str | None:
         return h.hexdigest()
     except OSError:
         return None
+
+
+def _managed_view_text(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+
+def classify_managed_view_asset(source: Path, target: Path) -> dict:
+    source_hash = _sha256_path(source)
+    target_hash = _sha256_path(target)
+    out = {
+        "source_sha256": source_hash,
+        "target_sha256": target_hash,
+        "status": "unreadable",
+        "needs_refresh": False,
+        "reason": None,
+    }
+    if not source_hash or not target_hash:
+        return out
+    if source_hash == target_hash:
+        out["status"] = "current"
+        return out
+    if target_hash in MANAGED_VIEW_LEGACY_SHA256.get(source.name, ()):
+        out["status"] = "legacy"
+        out["needs_refresh"] = True
+        out["reason"] = f"known legacy hash for {source.name}"
+        return out
+    text = _managed_view_text(target) or ""
+    for marker in MANAGED_VIEW_LEGACY_MARKERS:
+        if marker in text:
+            out["status"] = "legacy"
+            out["needs_refresh"] = True
+            out["reason"] = f"known legacy marker: {marker}"
+            return out
+    out["status"] = "customized"
+    out["reason"] = "differs from template without a known legacy signature"
+    return out
 
 
 def _check_tasks_mirror(project_root: Path, skill_root: Path) -> dict:
@@ -614,7 +711,8 @@ def check_project_state_layout(project_root: Path, skill_root: Path | None = Non
     warnings: list[dict] = []
     advisories: list[dict] = []
     view_schema_skew: list[dict] = []
-    advisory_absence = not _state_layout_adopted(docs_private) and not _state_layout_has_task_store(docs_private)
+    view_customizations: list[dict] = []
+    advisory_absence = not _state_layout_init_signal(project_root, docs_private)
 
     def add_layout_issue(message: str, *, path: str | None = None) -> None:
         item = _state_layout_warning(message, path=path)
@@ -681,23 +779,32 @@ def check_project_state_layout(project_root: Path, skill_root: Path | None = Non
         target = docs_private / rel
         if not target.exists() or not source.exists() or not target.is_file() or not source.is_file():
             continue
-        source_hash = _sha256_path(source)
-        target_hash = _sha256_path(target)
-        if not source_hash or not target_hash or source_hash == target_hash:
+        status = classify_managed_view_asset(source, target)
+        if status["status"] == "current":
             continue
         entry = {
             "asset": f"docs-private/{rel}",
             "template": f"{STATE_SKELETON_REL.as_posix()}/{rel}",
-            "expected_sha256": source_hash,
-            "actual_sha256": target_hash,
-            "message": (
-                f"managed view schema/template skew: docs-private/{rel} differs from "
-                f"{STATE_SKELETON_REL.as_posix()}/{rel}; run `/goal-flight init` "
-                "to back up and refresh managed view assets"
-            ),
+            "expected_sha256": status["source_sha256"],
+            "actual_sha256": status["target_sha256"],
+            "reason": status["reason"],
         }
-        view_schema_skew.append(entry)
-        warnings.append(_state_layout_warning(entry["message"], path=entry["asset"]))
+        if status["needs_refresh"]:
+            entry["message"] = (
+                f"managed view legacy schema: docs-private/{rel} matches "
+                f"{status['reason']}; run `/goal-flight init` to back up and "
+                "refresh managed view assets"
+            )
+            view_schema_skew.append(entry)
+            warnings.append(_state_layout_warning(entry["message"], path=entry["asset"]))
+        elif status["status"] == "customized":
+            entry["message"] = (
+                f"managed view customization preserved: docs-private/{rel} differs "
+                "from the current template but does not match a known legacy "
+                "signature; review manually if this was meant to be stock"
+            )
+            view_customizations.append(entry)
+            advisories.append(_state_layout_warning(entry["message"], path=entry["asset"]))
 
     tasks_mirror = _check_tasks_mirror(project_root, root)
     if tasks_mirror.get("ok") is False:
@@ -723,6 +830,7 @@ def check_project_state_layout(project_root: Path, skill_root: Path | None = Non
         "missing_dirs": missing_dirs,
         "stale_html": [],
         "view_schema_skew": view_schema_skew,
+        "view_customizations": view_customizations,
         "tasks_mirror": tasks_mirror,
         "warnings": warnings,
         "advisories": advisories,
@@ -2743,7 +2851,8 @@ def print_human(payload: dict) -> None:
             (
                 f"missing_files={len((readiness.get('state_layout') or {}).get('missing_files') or [])} "
                 f"missing_dirs={len((readiness.get('state_layout') or {}).get('missing_dirs') or [])} "
-                f"view_skew={len((readiness.get('state_layout') or {}).get('view_schema_skew') or [])}"
+                f"view_skew={len((readiness.get('state_layout') or {}).get('view_schema_skew') or [])} "
+                f"view_customized={len((readiness.get('state_layout') or {}).get('view_customizations') or [])}"
             ),
         ),
         status_line(

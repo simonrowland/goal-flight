@@ -80,6 +80,10 @@ MANAGED_POINTER_PHRASES = (
     "state pointer",
     "handoff-<date>",
 )
+MANAGED_STATE_HEADINGS = {
+    "## living state — read the newest docs-private/resume-notes-*.md first",
+    "## living state -- read the newest docs-private/resume-notes-*.md first",
+}
 
 
 class SetupError(RuntimeError): pass
@@ -141,6 +145,10 @@ def _relative_to_project(project_root: Path, path: Path) -> str:
     return path.relative_to(project_root).as_posix()
 
 
+def _is_managed_state_heading(line: str) -> bool:
+    return line.strip().casefold() in MANAGED_STATE_HEADINGS
+
+
 def _project_agents_template(repo_root: Path, target_project: Path) -> str:
     return _template_text(
         repo_root / "templates/project-agents.md",
@@ -176,8 +184,8 @@ def _replace_state_pointer_text(text: str) -> str:
             in_managed_comment = True
         if stripped.startswith("## "):
             in_managed_section = (
-                "goal flight routing" in lower
-                or "living state" in lower
+                stripped.strip().casefold() == "## goal flight routing"
+                or _is_managed_state_heading(stripped)
             )
         managed_pointer_line = HANDOFF_FILE_RE.search(line) and any(
             phrase in lower for phrase in MANAGED_POINTER_PHRASES
@@ -306,9 +314,7 @@ def _sha256_file(path: Path) -> str | None:
 
 
 def _managed_view_needs_refresh(source: Path, dest: Path) -> bool:
-    source_hash = _sha256_file(source)
-    dest_hash = _sha256_file(dest)
-    return bool(source_hash and dest_hash and source_hash != dest_hash)
+    return bool(goalflight_doctor.classify_managed_view_asset(source, dest).get("needs_refresh"))
 
 
 def _plan_ledger_task_id_backfill(target_project: Path) -> list[dict[str, Any]]:
@@ -444,15 +450,24 @@ def scaffold_project_state(
             if (
                 rel.as_posix() in goalflight_doctor.MANAGED_VIEW_ASSETS
                 and dest.is_file()
-                and _managed_view_needs_refresh(source, dest)
             ):
-                managed_view_replacements.append({
-                    "path": rel_out,
-                    "template": f"{goalflight_doctor.STATE_SKELETON_REL.as_posix()}/{rel.as_posix()}",
-                    "message": "managed view asset differs from template; will back up and refresh",
-                })
-                messages.append(f"refresh managed view asset: {rel_out} (backup before replace)")
-                continue
+                view_status = goalflight_doctor.classify_managed_view_asset(source, dest)
+                if view_status.get("needs_refresh"):
+                    managed_view_replacements.append({
+                        "path": rel_out,
+                        "template": f"{goalflight_doctor.STATE_SKELETON_REL.as_posix()}/{rel.as_posix()}",
+                        "reason": view_status.get("reason"),
+                        "message": "managed view asset matches a known legacy signature; will back up and refresh",
+                    })
+                    messages.append(f"refresh legacy managed view asset: {rel_out} (backup before replace)")
+                    continue
+                if view_status.get("status") == "customized":
+                    skipped_existing_files.append(rel_out)
+                    messages.append(
+                        f"preserve customized managed view asset: {rel_out} "
+                        "(manual review; no known legacy signature)"
+                    )
+                    continue
             skipped_existing_files.append(rel_out)
             messages.append(f"skip existing operator file: {rel_out} (create-if-absent never overwrites)")
             continue
@@ -2072,8 +2087,61 @@ def _write_backup_manifest(path: Path, agent: str, records: list[dict[str, Any]]
     _atomic_write(path, json.dumps(data, indent=2, sort_keys=True) + "\n")
 
 
+def _project_from_state_backup_manifest(path: Path) -> Path:
+    root = path.resolve().parent
+    for _ in range(len(STATE_BACKUP_REL.parts) + 1):
+        root = root.parent
+    return root
+
+
+def _remove_restore_target(target: Path) -> None:
+    if not target.exists() and not target.is_symlink():
+        return
+    if target.is_dir() and not target.is_symlink():
+        shutil.rmtree(target)
+    else:
+        target.unlink()
+
+
+def _restore_project_state_manifest(path: Path, data: dict[str, Any]) -> None:
+    target_project = _project_from_state_backup_manifest(path)
+    for entry in reversed(data.get("entries", [])):
+        rel = entry.get("path")
+        if not isinstance(rel, str):
+            continue
+        target = target_project / rel
+        if entry.get("exists"):
+            backup_rel = entry.get("backup")
+            if not isinstance(backup_rel, str):
+                raise SetupError(f"project-state backup entry missing backup path: {rel}")
+            backup = target_project / backup_rel
+            if not backup.exists() and not backup.is_symlink():
+                raise SetupError(f"backup missing: {backup}")
+            _remove_restore_target(target)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if backup.is_dir() and not backup.is_symlink():
+                shutil.copytree(backup, target, symlinks=True)
+            else:
+                _copy_atomic(backup, target)
+        else:
+            _remove_restore_target(target)
+        print(f"RESTORE {target}")
+    preimages = data.get("ledger_task_id_backfill_preimages") or []
+    if preimages:
+        with goalflight_ledger.StateLock():
+            for item in preimages:
+                record = item.get("record") if isinstance(item, dict) else None
+                if not isinstance(record, dict) or not isinstance(record.get("dispatch_id"), str):
+                    continue
+                goalflight_ledger.write_record(record)
+                print(f"RESTORE ledger {record['dispatch_id']}")
+
+
 def _restore_from_manifest(path: Path) -> None:
     data = json.loads(path.read_text())
+    if data.get("schema") == "goalflight.project-state-backup.v1":
+        _restore_project_state_manifest(path, data)
+        return
     if data.get("schema") != BACKUP_SCHEMA:
         raise SetupError(f"not a Goal Flight setup backup manifest: {path}")
     for record in reversed(data.get("actions", [])):
