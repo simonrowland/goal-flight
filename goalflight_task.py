@@ -6,11 +6,13 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime as dt
+import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -40,6 +42,9 @@ FAMILY_PREFIX_BY_KIND = {"task": "t", "bug": "b", "decision": "q"}
 VALID_FAMILIES = {"t", "b", "q", "ADR"}
 TASK_DISPATCH_STATES = {"working", "worker-finished", "worker-failed"}
 ITEM_ID_RE = re.compile(r"\b((?:ADR|bp|[tbq])-\d+)\b", re.IGNORECASE)
+RESUME_NOTES_RE = re.compile(r"^RESUME-NOTES-(\d{4}-\d{2}-\d{2})(?:-rev(\d+))?\.md$")
+REVIEW_SEVERITY = {"P0": "critical", "P1": "high", "P2": "medium", "P3": "low"}
+HARVEST_DRAFT_TAGS = ("draft", "harvest")
 CANNED_LIST_STATUSES = {
     "outstanding",
     "awaiting-review",
@@ -69,6 +74,23 @@ class TaskError(Exception):
     """User-facing task-store failure."""
 
 
+def require_regular_or_absent(path: Path) -> bool:
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise TaskError(f"{path}: cannot stat safely before open: {exc}") from exc
+    if path.is_symlink() or not stat.S_ISREG(st.st_mode):
+        raise TaskError(f"{path}: refusing to open non-regular file")
+    return True
+
+
+def require_regular_file(path: Path) -> None:
+    if not require_regular_or_absent(path):
+        raise TaskError(f"{path}: missing required regular file")
+
+
 class FileLock:
     def __init__(self, path: Path):
         self.path = path
@@ -76,6 +98,7 @@ class FileLock:
 
     def __enter__(self) -> "FileLock":
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        require_regular_or_absent(self.path)
         self._fh = self.path.open("a+", encoding="utf-8")
         fcntl.flock(self._fh, fcntl.LOCK_EX)
         return self
@@ -157,6 +180,32 @@ def _append_audit(item: dict[str, Any], action: str, actor: str, **extra: Any) -
     audit.append(_audit(action, actor, **extra))
 
 
+def _make_item(
+    item_id: str,
+    *,
+    kind: str,
+    title: str,
+    actor: str,
+    blocked_by: list[Any] | tuple[Any, ...] | None = None,
+    links: list[Any] | tuple[Any, ...] | None = None,
+    tags: list[Any] | tuple[Any, ...] | None = None,
+    audit_action: str = "new",
+) -> dict[str, Any]:
+    return {
+        "schema_version": ITEM_SCHEMA_VERSION,
+        "id": item_id,
+        "kind": kind,
+        "title": title,
+        "blocked_by": _dedupe_strs(blocked_by),
+        "links": _dedupe_strs(links),
+        "done": False,
+        "tags": _dedupe_strs(tags),
+        "created_at": utc_now(),
+        "created_by": actor,
+        "audit": [_audit(audit_action, actor)],
+    }
+
+
 def _canonical_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
@@ -228,12 +277,53 @@ def _md_list(values: Any, lookup: dict[str, str]) -> str:
     return ", ".join(_md_value_link(value, lookup) for value in values if value not in (None, ""))
 
 
+def _dedupe_strs(values: list[Any] | tuple[Any, ...] | None) -> list[str]:
+    out: list[str] = []
+    for value in values or []:
+        if value in (None, ""):
+            continue
+        text = str(value)
+        if text not in out:
+            out.append(text)
+    return out
+
+
+def _clean_markdown_title(value: str) -> str:
+    text = value.strip()
+    text = re.sub(r"^\[[ xX]\]\s+", "", text)
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+    text = text.replace("`", "")
+    text = text.replace("**", "").replace("__", "")
+    text = re.sub(r"\s+", " ", text)
+    return text.strip(" -\t")
+
+
+def _norm_key(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip().lower())
+
+
+def _short_hash(parts: list[Any]) -> str:
+    payload = "\x1f".join(str(part or "") for part in parts)
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _rel_source(project_root: Path, path: Path, line: int | None = None) -> str:
+    try:
+        rel = path.resolve(strict=False).relative_to(project_root.resolve(strict=False))
+        text = rel.as_posix()
+    except ValueError:
+        text = path.as_posix()
+    if line is not None and line > 0:
+        return f"{text}:{line}"
+    return text
+
+
 def _section_rows(rows: list[dict[str, Any]], section: str) -> list[dict[str, Any]]:
     return [row for row in rows if row.get("derived_status") == section]
 
 
 def _parse_jsonl(path: Path) -> tuple[list[dict[str, Any]], dict[str, int]]:
-    if not path.exists():
+    if not require_regular_or_absent(path):
         return [], {}
     items: list[dict[str, Any]] = []
     lines_by_id: dict[str, int] = {}
@@ -632,7 +722,7 @@ class TaskStore:
         self.docs_dir.mkdir(parents=True, exist_ok=True)
         with FileLock(self.seq_lock_path):
             seq = self._read_seq()
-            current = int(seq.get(family, 0))
+            current = max(int(seq.get(family, 0)), self._max_existing_sequence(family))
             next_value = current + 1
             seq[family] = next_value
             tmp = self.seq_path.with_suffix(".tmp")
@@ -640,8 +730,20 @@ class TaskStore:
             tmp.replace(self.seq_path)
         return f"ADR-{next_value:03d}" if family == "ADR" else f"{family}-{next_value:03d}"
 
+    def _max_existing_sequence(self, family: str) -> int:
+        prefix = "ADR-" if family == "ADR" else f"{family}-"
+        max_seen = 0
+        for item in self.load_items():
+            item_id = item.get("id")
+            if not isinstance(item_id, str) or not item_id.startswith(prefix):
+                continue
+            suffix = item_id.removeprefix(prefix)
+            if suffix.isdigit():
+                max_seen = max(max_seen, int(suffix))
+        return max_seen
+
     def _read_seq(self) -> dict[str, int]:
-        if not self.seq_path.exists():
+        if not require_regular_or_absent(self.seq_path):
             return {}
         text = self.seq_path.read_text(encoding="utf-8").strip()
         if not text:
@@ -689,7 +791,7 @@ class TaskStore:
                 self.bug_backlog_path: staging / "bug-backlog.md",
                 self.bugs_done_path: staging / "bugs-done.md",
             }
-            old_bytes = {path: path.read_bytes() if path.exists() else None for path in targets}
+            old_bytes = {path: path.read_bytes() if require_regular_or_absent(path) else None for path in targets}
             try:
                 for target, source in targets.items():
                     source.replace(target)
@@ -711,10 +813,12 @@ class TaskStore:
         tmp.replace(path)
 
     def _snapshot_last_good(self, *, require_valid: bool = True) -> None:
-        if not self.tasks_path.exists() and not self.data_js_path.exists():
+        tasks_exists = require_regular_or_absent(self.tasks_path)
+        data_exists = require_regular_or_absent(self.data_js_path)
+        if not tasks_exists and not data_exists:
             return
-        if not self.tasks_path.exists() or not self.data_js_path.exists():
-            if not require_valid and self.tasks_path.exists():
+        if not tasks_exists or not data_exists:
+            if not require_valid and tasks_exists:
                 return
             raise TaskError(f"{self.docs_dir}: missing tasks.jsonl or tasks-data.js; refusing mutation without a valid last-known-good pair")
         try:
@@ -725,6 +829,8 @@ class TaskStore:
             return
         self.log_dir.mkdir(parents=True, exist_ok=True)
         stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        require_regular_file(self.tasks_path)
+        require_regular_file(self.data_js_path)
         shutil.copy2(self.tasks_path, self.log_dir / f"tasks-{stamp}.jsonl")
         shutil.copy2(self.data_js_path, self.log_dir / f"tasks-data-{stamp}.js")
         self._prune_backups()
@@ -1003,6 +1109,379 @@ class TaskStore:
         return "\n".join(lines).rstrip() + "\n"
 
 
+def _kind_from_reference(value: str, default: str) -> str:
+    lower = value.lower()
+    if lower.startswith(("b-", "bp-")):
+        return "bug"
+    if lower.startswith(("q-", "adr-")):
+        return "decision"
+    if lower.startswith("t-"):
+        return "task"
+    return default
+
+
+def _harvest_candidate(
+    store: TaskStore,
+    *,
+    kind: str,
+    title: str,
+    source_path: Path,
+    source_type: str,
+    line: int | None = None,
+    severity: str | None = None,
+    pattern: str | None = None,
+) -> dict[str, Any] | None:
+    clean_title = _clean_markdown_title(title)
+    if not clean_title or clean_title.lower() in {"none", "(none)"}:
+        return None
+    source_ref = _rel_source(store.project_root, source_path, line)
+    source_file = _rel_source(store.project_root, source_path)
+    tags = [*HARVEST_DRAFT_TAGS, source_type]
+    if pattern:
+        tags.append(pattern)
+    candidate: dict[str, Any] = {
+        "kind": kind,
+        "title": clean_title,
+        "links": [source_ref],
+        "tags": tags,
+        "source": "harvest",
+        "source_ref": source_ref,
+        "harvest_source": source_type,
+        "harvest_key": f"harvest:{_short_hash([kind, _norm_key(clean_title), source_file, source_type])}",
+    }
+    if severity:
+        candidate["severity"] = severity
+    if pattern:
+        candidate["pattern"] = pattern
+    return candidate
+
+
+def _append_candidate(candidates: list[dict[str, Any]], candidate: dict[str, Any] | None) -> None:
+    if candidate is None:
+        return
+    key = candidate.get("harvest_key")
+    if key and any(existing.get("harvest_key") == key for existing in candidates):
+        return
+    candidates.append(candidate)
+
+
+def _block_is_open(block: dict[str, Any]) -> bool:
+    status = _norm_key(block.get("status"))
+    return status not in {"done", "done-reviewed", "closed", "fixed"}
+
+
+def _harvest_heading_blocks(
+    store: TaskStore,
+    path: Path,
+    *,
+    default_kind: str,
+    source_type: str,
+) -> list[dict[str, Any]]:
+    if not require_regular_or_absent(path):
+        return []
+    candidates: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+
+    def flush() -> None:
+        nonlocal current
+        if not current:
+            return
+        if not _block_is_open(current):
+            current = None
+            return
+        title = current.get("title") or current.get("heading") or ""
+        ref = str(current.get("ref") or "")
+        _append_candidate(
+            candidates,
+            _harvest_candidate(
+                store,
+                kind=_kind_from_reference(ref, default_kind),
+                title=str(title),
+                source_path=path,
+                source_type=source_type,
+                line=int(current.get("line") or 0),
+            ),
+        )
+        current = None
+
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    for lineno, line in enumerate(lines, start=1):
+        heading = re.match(r"^###\s+((?:ADR|bp|[tbq])-\d+)\b(?:\s+(.+))?", line, re.IGNORECASE)
+        if heading:
+            flush()
+            current = {
+                "ref": heading.group(1),
+                "heading": heading.group(2) or heading.group(1),
+                "line": lineno,
+            }
+            continue
+        if current is None:
+            list_item = re.match(r"^\s*(?:[-*]\s+|\d+[.)]\s+)(?:\[[ xX]\]\s+)?(.+?)\s*$", line)
+            if list_item and "Status:" not in list_item.group(1):
+                _append_candidate(
+                    candidates,
+                    _harvest_candidate(
+                        store,
+                        kind=default_kind,
+                        title=list_item.group(1),
+                        source_path=path,
+                        source_type=source_type,
+                        line=lineno,
+                    ),
+                )
+            continue
+        bold = re.search(r"\*\*(.+?)\*\*", line)
+        if bold and not current.get("title"):
+            current["title"] = bold.group(1)
+        status = re.match(r"^\s*[-*]\s+Status:\s*(.+?)\s*$", line, re.IGNORECASE)
+        if status:
+            current["status"] = status.group(1)
+    flush()
+    return candidates
+
+
+def _harvest_review_candidates(store: TaskStore) -> list[dict[str, Any]]:
+    review_dir = store.docs_dir / "reviews"
+    if not review_dir.is_dir():
+        return []
+    candidates: list[dict[str, Any]] = []
+    for path in sorted(review_dir.rglob("*.md")):
+        rel_lower = path.relative_to(review_dir).as_posix().lower()
+        if "backlog" not in rel_lower and "finding" not in rel_lower:
+            continue
+        require_regular_file(path)
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        for lineno, line in enumerate(lines, start=1):
+            bold = re.search(r"\*\*(.+?)\*\*", line)
+            if not bold:
+                continue
+            text = _clean_markdown_title(bold.group(1))
+            match = re.match(r"^(P[0-3]|critical|high|medium|low)\b\s*(?:[-:\u2014]\s*)?(.*)$", text, re.IGNORECASE)
+            if not match:
+                continue
+            severity_token = match.group(1).upper()
+            title = match.group(2).strip() or text
+            severity = REVIEW_SEVERITY.get(severity_token, severity_token.lower())
+            _append_candidate(
+                candidates,
+                _harvest_candidate(
+                    store,
+                    kind="bug",
+                    title=title,
+                    source_path=path,
+                    source_type="review-finding",
+                    line=lineno,
+                    severity=severity,
+                ),
+            )
+    return candidates
+
+
+def _resume_sort_key(path: Path) -> tuple[str, int, str]:
+    match = RESUME_NOTES_RE.match(path.name)
+    if not match:
+        return ("0000-00-00", 0, path.name)
+    return (match.group(1), int(match.group(2) or 0), path.name)
+
+
+def _newest_resume_note(docs_dir: Path) -> Path | None:
+    notes = sorted(docs_dir.glob("RESUME-NOTES-*.md"), key=_resume_sort_key)
+    return notes[-1] if notes else None
+
+
+def _harvest_resume_candidates(store: TaskStore) -> list[dict[str, Any]]:
+    path = _newest_resume_note(store.docs_dir)
+    if path is None:
+        return []
+    require_regular_file(path)
+    candidates: list[dict[str, Any]] = []
+    section: str | None = None
+    for lineno, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), start=1):
+        heading = re.match(r"^#{2,6}\s+(.+?)\s*$", line)
+        if heading:
+            title = _norm_key(heading.group(1))
+            if any(key in title for key in ("next action", "current goal", "remaining")):
+                section = "task"
+            elif "do not re-litigate" in title:
+                section = "decision"
+            else:
+                section = None
+            continue
+        if section is None:
+            continue
+        list_item = re.match(r"^\s*(?:[-*]\s+|\d+[.)]\s+)(?:\[[ xX]\]\s+)?(.+?)\s*$", line)
+        if not list_item:
+            continue
+        text = list_item.group(1)
+        kind = "decision" if section == "decision" else "task"
+        _append_candidate(
+            candidates,
+            _harvest_candidate(
+                store,
+                kind=kind,
+                title=text,
+                source_path=path,
+                source_type=f"resume-{section}",
+                line=lineno,
+            ),
+        )
+    return candidates
+
+
+def _collect_harvest_candidates(store: TaskStore) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    bug_paths = [
+        store.docs_dir / "bug-backlog.md",
+        *store.docs_dir.glob("bug-pattern*.md"),
+        *store.docs_dir.glob("bug-patterns/*.md"),
+    ]
+    for path in sorted(bug_paths):
+        candidates.extend(_harvest_heading_blocks(store, path, default_kind="bug", source_type="bug-backlog"))
+    candidates.extend(_harvest_review_candidates(store))
+    candidates.extend(_harvest_resume_candidates(store))
+    deduped: list[dict[str, Any]] = []
+    for candidate in candidates:
+        _append_candidate(deduped, candidate)
+    return deduped
+
+
+def _existing_harvest_keys(items: list[dict[str, Any]]) -> tuple[set[str], set[tuple[str, str]]]:
+    keys: set[str] = set()
+    titles: set[tuple[str, str]] = set()
+    for item in items:
+        key = item.get("harvest_key")
+        if isinstance(key, str) and key:
+            keys.add(key)
+        kind = str(item.get("kind", "task"))
+        title = _norm_key(item.get("title"))
+        if title:
+            titles.add((kind, title))
+    return keys, titles
+
+
+def _add_harvest_candidates(store: TaskStore, items: list[dict[str, Any]], actor: str, candidates: list[dict[str, Any]]) -> dict[str, Any]:
+    existing_keys, existing_titles = _existing_harvest_keys(items)
+    created: list[str] = []
+    skipped = 0
+    for candidate in candidates:
+        key = str(candidate.get("harvest_key") or "")
+        title_key = (str(candidate.get("kind", "task")), _norm_key(candidate.get("title")))
+        if (key and key in existing_keys) or title_key in existing_titles:
+            skipped += 1
+            continue
+        item_id = store.reserve_id(FAMILY_PREFIX_BY_KIND[str(candidate["kind"])])
+        item = _make_item(
+            item_id,
+            kind=str(candidate["kind"]),
+            title=str(candidate["title"]),
+            actor=actor,
+            links=LIST_TYPE(candidate.get("links") or []),
+            tags=LIST_TYPE(candidate.get("tags") or HARVEST_DRAFT_TAGS),
+        )
+        for field in ("source", "source_ref", "harvest_source", "harvest_key", "severity", "pattern"):
+            value = candidate.get(field)
+            if value not in (None, "", [], {}):
+                item[field] = value
+        _append_audit(item, "harvest", actor, source_ref=item.get("source_ref"), harvest_source=item.get("harvest_source"))
+        items.append(item)
+        created.append(item_id)
+        if key:
+            existing_keys.add(key)
+        existing_titles.add(title_key)
+    return {"created": created, "skipped": skipped, "candidates": len(candidates)}
+
+
+def _first_resume_paragraph(lines: list[str], heading: str) -> str:
+    active = False
+    buf: list[str] = []
+    for line in lines:
+        header = re.match(r"^#{2,6}\s+(.+?)\s*$", line)
+        if header:
+            if active and buf:
+                break
+            active = _norm_key(header.group(1)) == _norm_key(heading)
+            continue
+        if not active:
+            continue
+        if not line.strip():
+            if buf:
+                break
+            continue
+        if line.lstrip().startswith(("-", "*")):
+            continue
+        buf.append(_clean_markdown_title(line))
+    return " ".join(buf).strip()
+
+
+def _first_resume_next(lines: list[str]) -> str:
+    active = False
+    for line in lines:
+        header = re.match(r"^#{2,6}\s+(.+?)\s*$", line)
+        if header:
+            active = "next action" in _norm_key(header.group(1))
+            continue
+        if not active:
+            continue
+        item = re.match(r"^\s*(?:[-*]\s+|\d+[.)]\s+)(?:\[[ xX]\]\s+)?(.+?)\s*$", line)
+        if item:
+            return _clean_markdown_title(item.group(1))
+    return ""
+
+
+def _append_resume_history(store: TaskStore, actor: str) -> list[str]:
+    notes = sorted(store.docs_dir.glob("RESUME-NOTES-*.md"), key=_resume_sort_key)
+    if not notes:
+        return []
+    history = store.docs_dir / "history.md"
+    existing = history.read_text(encoding="utf-8") if require_regular_or_absent(history) else (
+        "# goal-flight - History (write-once)\n\n"
+        "> Append-only. One entry per compaction handoff. Never edit prior entries.\n"
+        "> Living state: newest `RESUME-NOTES-*.md`.\n"
+    )
+    appended: list[str] = []
+    by_date: dict[str, list[Path]] = {}
+    for path in notes:
+        date, _, _ = _resume_sort_key(path)
+        by_date.setdefault(date, []).append(path)
+    additions: list[str] = []
+    for path in notes:
+        require_regular_file(path)
+        rel = _rel_source(store.project_root, path)
+        if rel in existing or any(rel in entry for entry in additions):
+            continue
+        date, rev, _ = _resume_sort_key(path)
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        summary = _first_resume_paragraph(lines, "TL;DR") or _clean_markdown_title(lines[0] if lines else path.stem)
+        next_action = _first_resume_next(lines)
+        superseded = [
+            _rel_source(store.project_root, old)
+            for old in by_date.get(date, [])
+            if old != path and _resume_sort_key(old)[1] < rev
+        ]
+        additions.extend(["", f"## {date} - {path.name}", "", f"- Source: {rel}"])
+        if summary:
+            additions.append(f"- Summary: {summary[:280]}")
+        if next_action:
+            additions.append(f"- Next: {next_action[:220]}")
+        if superseded:
+            additions.append(f"- Supersedes: {', '.join(superseded)}")
+        additions.append(f"- Harvested by: {actor}")
+        appended.append(rel)
+    if additions:
+        with store.store_lock():
+            current = history.read_text(encoding="utf-8") if require_regular_or_absent(history) else existing
+            missing = [line for line in additions if line.startswith("- Source: ") and line.removeprefix("- Source: ") not in current]
+            if missing:
+                history.write_text(current.rstrip() + "\n" + "\n".join(additions).rstrip() + "\n", encoding="utf-8")
+            else:
+                appended = []
+    return appended
+
+
+def _review_bug_key(item_id: str, dispatch_id: str, title: str) -> str:
+    return f"review-bug:{_short_hash([item_id, dispatch_id, _norm_key(title)])}"
+
+
 def _split_csv(values: list[str] | None) -> list[str]:
     out: list[str] = []
     for value in values or []:
@@ -1021,19 +1500,15 @@ def _cmd_new(store: TaskStore, args: argparse.Namespace) -> int:
     def update(items: list[dict[str, Any]]) -> str:
         if any(item.get("id") == item_id for item in items):
             raise TaskError(f"{store.tasks_path}: id {item_id} already exists; .task-seq is stale")
-        item: dict[str, Any] = {
-            "schema_version": ITEM_SCHEMA_VERSION,
-            "id": item_id,
-            "kind": args.kind,
-            "title": args.title,
-            "blocked_by": _split_csv(args.blocked_by),
-            "links": _split_csv(args.links),
-            "done": False,
-            "tags": _split_csv(args.tags),
-            "created_at": utc_now(),
-            "created_by": actor,
-            "audit": [_audit("new", actor)],
-        }
+        item = _make_item(
+            item_id,
+            kind=args.kind,
+            title=args.title,
+            actor=actor,
+            blocked_by=_split_csv(args.blocked_by),
+            links=_split_csv(args.links),
+            tags=_split_csv(args.tags),
+        )
         for key in ("acceptance", "prompt", "prompt_path", "pattern", "severity", "source"):
             value = getattr(args, key, None)
             if value not in (None, "", [], {}):
@@ -1061,6 +1536,7 @@ def _cmd_show(store: TaskStore, args: argparse.Namespace) -> int:
             path = Path(prompt_path)
             if not path.is_absolute():
                 path = store.project_root / path
+            require_regular_file(path)
             print(path.read_text(encoding="utf-8"), end="")
             return 0
         raise TaskError(f"{args.item_id}: no prompt or prompt_path")
@@ -1142,6 +1618,11 @@ def _cmd_done(store: TaskStore, args: argparse.Namespace) -> int:
 
 def _cmd_review(store: TaskStore, args: argparse.Namespace) -> int:
     actor = _actor(args)
+    bug_titles = _dedupe_strs(getattr(args, "bugs", []))
+    if bug_titles and args.verdict != "findings":
+        raise TaskError("review --bug requires --verdict findings")
+    if bug_titles and not args.bug_pattern:
+        raise TaskError("review --bug requires --bug-pattern <minted-pattern-id>")
     crumb: dict[str, Any] = {
         "dispatch_id": args.dispatch,
         "role": "review",
@@ -1150,7 +1631,7 @@ def _cmd_review(store: TaskStore, args: argparse.Namespace) -> int:
         "ts": utc_now(),
     }
 
-    def update(items: list[dict[str, Any]]) -> None:
+    def update(items: list[dict[str, Any]]) -> dict[str, Any]:
         by_id = {item["id"]: item for item in items}
         item = by_id.get(args.item_id)
         if item is None:
@@ -1158,11 +1639,76 @@ def _cmd_review(store: TaskStore, args: argparse.Namespace) -> int:
         dispatches = item.setdefault("dispatches", [])
         if not isinstance(dispatches, LIST_TYPE):
             raise TaskError(f"item {args.item_id}: dispatches must be an array")
-        dispatches.append({k: v for k, v in crumb.items() if v not in (None, "", [], {})})
+        review_crumb = {k: v for k, v in crumb.items() if v not in (None, "", [], {})}
+        dispatches.append(review_crumb)
         _append_audit(item, "review", actor, dispatch_id=args.dispatch, verdict=args.verdict, findings_ref=args.findings)
+        existing_keys = {
+            value
+            for value in (existing.get("review_bug_key") for existing in items)
+            if isinstance(value, str) and value
+        }
+        created_bugs: list[str] = []
+        skipped_bugs = 0
+        for title in bug_titles:
+            key = _review_bug_key(args.item_id, args.dispatch, title)
+            if key in existing_keys:
+                skipped_bugs += 1
+                continue
+            bug_id = store.reserve_id("b")
+            links = [args.item_id]
+            if args.findings:
+                links.append(args.findings)
+            bug = _make_item(
+                bug_id,
+                kind="bug",
+                title=title,
+                actor=actor,
+                links=links,
+                tags=["review-finding", args.bug_pattern, *_split_csv(args.bug_tags)],
+            )
+            bug["source"] = "review"
+            bug["pattern"] = args.bug_pattern
+            if args.bug_severity:
+                bug["severity"] = args.bug_severity
+            bug["review_item_id"] = args.item_id
+            bug["review_dispatch_id"] = args.dispatch
+            bug["review_breadcrumb_key"] = _breadcrumb_key(review_crumb)
+            bug["review_bug_key"] = key
+            if args.findings:
+                bug["review_findings_ref"] = args.findings
+            _append_audit(bug, "review-bug-capture", actor, review_dispatch_id=args.dispatch, pattern=args.bug_pattern)
+            items.append(bug)
+            existing_keys.add(key)
+            created_bugs.append(bug_id)
+        return {"item_id": args.item_id, "bugs": created_bugs, "skipped_bugs": skipped_bugs}
 
-    store.mutate_items(update, allow_invalid_live_mirror=True)
-    print(args.item_id)
+    result = store.mutate_items(update, allow_invalid_live_mirror=True)
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    else:
+        print(args.item_id)
+        for bug_id in result["bugs"]:
+            print(bug_id)
+    return 0
+
+
+def _cmd_harvest(store: TaskStore, args: argparse.Namespace) -> int:
+    actor = _actor(args)
+    candidates = _collect_harvest_candidates(store)
+    if args.dry_run:
+        payload = {"created": [], "skipped": 0, "candidates": len(candidates), "history_added": [], "drafts": candidates}
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True) if args.json else "\n".join(str(item["title"]) for item in candidates))
+        return 0
+
+    def update(items: list[dict[str, Any]]) -> dict[str, Any]:
+        return _add_harvest_candidates(store, items, actor, candidates)
+
+    result = store.mutate_items(update, allow_invalid_live_mirror=True)
+    result["history_added"] = [] if args.no_history else _append_resume_history(store, actor)
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    else:
+        print(f"OK: harvest created {len(result['created'])} draft items ({result['skipped']} skipped, {len(result['history_added'])} history entries)")
     return 0
 
 
@@ -1269,6 +1815,8 @@ def build_parser() -> argparse.ArgumentParser:
   goalflight_task.py list outstanding
   goalflight_task.py list delegated --since 1h --json
   goalflight_task.py review t-014 --verdict clean --dispatch codex-review-123
+  goalflight_task.py review t-014 --verdict findings --dispatch codex-review-123 --bug "Unfixed review finding" --bug-pattern bp-001
+  goalflight_task.py harvest --json
   goalflight_task.py accept t-014
   goalflight_task.py sync
 """
@@ -1360,7 +1908,24 @@ def build_parser() -> argparse.ArgumentParser:
     review.add_argument("--verdict", choices=["clean", "findings"], required=True)
     review.add_argument("--dispatch", required=True)
     review.add_argument("--findings")
+    review.add_argument("--bug", dest="bugs", action="append", default=[], help="Confirmed, not-immediately-fixed review finding to capture as a bug item.")
+    review.add_argument("--bug-pattern", help="Minted bug-pattern id/tag for --bug findings, e.g. bp-001.")
+    review.add_argument("--bug-severity", default="medium")
+    review.add_argument("--bug-tag", dest="bug_tags", action="append", default=[])
+    review.add_argument("--json", action="store_true")
     review.set_defaults(func=_cmd_review)
+
+    harvest = sub.add_parser(
+        "harvest",
+        help="Harvest open-work sources into draft task/bug/decision items and backfill history.md from RESUME-NOTES.",
+        epilog="example: goalflight_task.py harvest --json",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    harvest.add_argument("--by", help=argparse.SUPPRESS)
+    harvest.add_argument("--dry-run", action="store_true", help="Print discovered draft candidates without writing items or history.")
+    harvest.add_argument("--no-history", action="store_true", help="Skip RESUME-NOTES -> history.md backfill.")
+    harvest.add_argument("--json", action="store_true")
+    harvest.set_defaults(func=_cmd_harvest)
 
     accept = sub.add_parser(
         "accept",

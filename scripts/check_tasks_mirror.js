@@ -3,9 +3,8 @@
 // mirror of tasks.jsonl.
 //
 // Why this exists: served viewers read tasks.jsonl; file:// viewers read the
-// window.GF_ITEMS array in tasks-data.js. The two are HAND-MAINTAINED (the
-// goalflight_task.py `sync` helper is design/planned, not built), so they drift
-// silently. This checker fails loudly on any drift.
+// window.GF_ITEMS array in tasks-data.js. goalflight_task.py `sync` writes the
+// generated mirror, and this checker fails loudly on any drift.
 //
 // Usage:  node scripts/check_tasks_mirror.js [<dir>]
 //   <dir> holds tasks.jsonl + tasks-data.js.
@@ -38,6 +37,21 @@ function fail(msg) {
     console.error("  " + line);
   }
   process.exit(1);
+}
+
+function requireRegularFile(file) {
+  let st;
+  try {
+    st = fs.lstatSync(file);
+  } catch (err) {
+    if (err && err.code === "ENOENT") {
+      fail(`missing file: ${file}`);
+    }
+    fail(`${file}: cannot stat safely before read: ${err.message}`);
+  }
+  if (st.isSymbolicLink() || !st.isFile()) {
+    fail(`${file}: refusing to read non-regular file`);
+  }
 }
 
 // Recursively sort object keys so JSON.stringify is order-independent.
@@ -130,9 +144,7 @@ function main() {
   const dataJsPath = path.join(dir, "tasks-data.js");
 
   for (const p of [jsonlPath, dataJsPath]) {
-    if (!fs.existsSync(p)) {
-      fail(`missing file: ${p}`);
-    }
+    requireRegularFile(p);
   }
 
   const jsonlItems = parseJsonl(fs.readFileSync(jsonlPath, "utf8"), "tasks.jsonl");

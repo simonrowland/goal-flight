@@ -32,19 +32,24 @@ def assert_true(name: str, condition: bool) -> None:
         raise AssertionError(name)
 
 
-def run_checker(target_dir: Path) -> subprocess.CompletedProcess:
+def run_checker(target_dir: Path, *, timeout: float = 30) -> subprocess.CompletedProcess:
     return subprocess.run(
         [NODE, str(CHECKER), str(target_dir)],
         cwd=str(ROOT),
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        timeout=30,
+        timeout=timeout,
         check=False,
     )
 
 
-def run_task(project_root: Path, *args: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+def run_task(
+    project_root: Path,
+    *args: str,
+    env: dict[str, str] | None = None,
+    timeout: float = 30,
+) -> subprocess.CompletedProcess:
     merged_env = os.environ.copy()
     if env:
         merged_env.update(env)
@@ -55,9 +60,16 @@ def run_task(project_root: Path, *args: str, env: dict[str, str] | None = None) 
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        timeout=30,
+        timeout=timeout,
         check=False,
     )
+
+
+def run_task_no_hang(project_root: Path, *args: str) -> subprocess.CompletedProcess:
+    try:
+        return run_task(project_root, *args, timeout=2)
+    except subprocess.TimeoutExpired as exc:
+        raise AssertionError(f"task command hung on non-regular input: {' '.join(args)}") from exc
 
 
 def _copy_fixture(dst: Path) -> None:
@@ -703,18 +715,21 @@ def test_goalflight_task_harvest_idempotent_with_source_links_and_history() -> N
         proc = run_task(project, "harvest", "--json")
         assert_true(f"harvest exits 0: {proc.stderr}", proc.returncode == 0)
         payload = json.loads(proc.stdout)
-        assert_true("harvest created draft items", len(payload["created"]) == 5)
+        assert_true("harvest created draft items", len(payload["created"]) == 4)
         assert_true("harvest backfilled both resume notes", payload["history_added"] == ["docs-private/RESUME-NOTES-2026-06-01.md", "docs-private/RESUME-NOTES-2026-06-02.md"])
         assert_true("goal queue left as-is", goal_queue.read_text(encoding="utf-8") == queue_before)
 
         items = _read_items(project)
         harvested = [item for item in items if "harvest" in item.get("tags", [])]
         titles = [item["title"] for item in harvested]
+        assert_true("goal queue items not harvested", all(item.get("harvest_source") != "goal-queue" for item in harvested))
+        assert_true("goal queue title ignored", "Queue task needing task-store seed" not in titles)
         assert_true("known backlog bug deduped by title", titles.count("Known backlog bug already tracked") == 0)
         assert_true("source link present on every harvested item", all(item.get("links") and item.get("source_ref") in item.get("links") for item in harvested))
         assert_true("harvested items are draft tagged", all("draft" in item.get("tags", []) for item in harvested))
         assert_true("review finding harvested as bug", any(item["kind"] == "bug" and item.get("severity") == "high" for item in harvested))
         assert_true("ordinary historical review file ignored", "Historical review finding should not be harvested from a non-backlog file." not in titles)
+        assert_true("resume next-action harvested", "Resume-only action to seed." in titles)
         assert_true("resume decision harvested as decision", any(item["kind"] == "decision" and item["title"].startswith("ADR-099") for item in harvested))
 
         history_before = (docs / "history.md").read_text(encoding="utf-8")
@@ -834,6 +849,84 @@ def test_goalflight_task_atomic_write_rejects_bad_content() -> None:
         assert_true("tasks-data.js unchanged after rejected write", (docs / "tasks-data.js").read_text(encoding="utf-8") == before_data)
         proc = run_checker(docs)
         assert_true("live pair still valid", proc.returncode == 0)
+
+
+def _assert_non_regular_task_read_fails(project: Path, *args: str) -> None:
+    proc = run_task_no_hang(project, *args)
+    assert_true(f"{args} rejects non-regular file: stdout={proc.stdout} stderr={proc.stderr}", proc.returncode != 0)
+    assert_true(f"{args} reports non-regular file", "refusing to open non-regular file" in proc.stderr)
+
+
+def test_goalflight_task_rejects_non_regular_store_files_without_hanging() -> None:
+    item = {
+        "schema_version": 1,
+        "id": "t-001",
+        "kind": "task",
+        "title": "Non-regular guard seed",
+        "blocked_by": [],
+        "links": [],
+        "done": False,
+    }
+    commands = [
+        ("status", "--json"),
+        ("show", "t-001", "--json"),
+        ("list", "outstanding", "--json"),
+        ("new", "Should fail before writing"),
+        ("sync",),
+    ]
+
+    with tempfile.TemporaryDirectory() as td:
+        project = Path(td)
+        _write_tasks(project, [item])
+        docs = project / "docs-private"
+        target = docs / "tasks-target.jsonl"
+        target.write_text((docs / "tasks.jsonl").read_text(encoding="utf-8"), encoding="utf-8")
+        (docs / "tasks.jsonl").unlink()
+        (docs / "tasks.jsonl").symlink_to(target)
+
+        for command in commands:
+            _assert_non_regular_task_read_fails(project, *command)
+
+        proc = run_checker(docs, timeout=2)
+        assert_true("checker rejects symlinked tasks.jsonl", proc.returncode != 0)
+        assert_true("checker reports non-regular tasks.jsonl", "refusing to read non-regular file" in proc.stderr)
+
+    with tempfile.TemporaryDirectory() as td:
+        project = Path(td)
+        _write_tasks(project, [item])
+        docs = project / "docs-private"
+        seq_target = docs / "seq-target.json"
+        seq_target.write_text('{"t": 1}\n', encoding="utf-8")
+        (docs / ".task-seq").symlink_to(seq_target)
+        _assert_non_regular_task_read_fails(project, "new", "Should fail on seq")
+
+    with tempfile.TemporaryDirectory() as td:
+        project = Path(td)
+        _write_tasks(project, [item])
+        docs = project / "docs-private"
+        seq_lock_target = docs / "seq-lock-target"
+        seq_lock_target.write_text("", encoding="utf-8")
+        (docs / ".task-seq.lock").symlink_to(seq_lock_target)
+        _assert_non_regular_task_read_fails(project, "new", "Should fail on seq lock")
+
+    with tempfile.TemporaryDirectory() as td:
+        project = Path(td)
+        _write_tasks(project, [item])
+        docs = project / "docs-private"
+        lock_target = docs / "tasks-lock-target"
+        lock_target.write_text("", encoding="utf-8")
+        (docs / "tasks.lock").symlink_to(lock_target)
+        _assert_non_regular_task_read_fails(project, "sync")
+
+    if hasattr(os, "mkfifo"):
+        with tempfile.TemporaryDirectory() as td:
+            project = Path(td)
+            _write_tasks(project, [item])
+            docs = project / "docs-private"
+            (docs / "tasks.jsonl").unlink()
+            os.mkfifo(docs / "tasks.jsonl")
+            for command in commands:
+                _assert_non_regular_task_read_fails(project, *command)
 
 
 def test_goalflight_task_sync_repairs_stale_mirror() -> None:
@@ -992,10 +1085,11 @@ def main() -> None:
     test_goalflight_task_schema_version_tolerance_and_read_api()
     test_goalflight_task_append_dispatch_breadcrumbs_preserves_history()
     test_goalflight_task_atomic_write_rejects_bad_content()
+    test_goalflight_task_rejects_non_regular_store_files_without_hanging()
     test_goalflight_task_sync_repairs_stale_mirror()
     test_goalflight_task_data_js_escapes_script_end_and_html()
     test_goalflight_task_sync_generates_markdown_views()
-    print("OK: 20 tasks mirror/task-store tests pass")
+    print("OK: 21 tasks mirror/task-store tests pass")
 
 
 if __name__ == "__main__":
