@@ -11,6 +11,7 @@ If node is unavailable, the whole file SKIPs (runner-recognized "SKIP:" prefix).
 from __future__ import annotations
 
 import datetime as dt
+import contextlib
 import importlib.util
 import json
 import os
@@ -893,6 +894,114 @@ def test_goalflight_task_harvest_ignores_skeleton_placeholders() -> None:
         assert_true("skeleton placeholders leave task store empty", _read_items(project) == [])
 
 
+def test_goalflight_task_harvest_allows_real_angle_bracket_titles() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        project = Path(td)
+        docs = project / "docs-private"
+        _write_tasks(project, [])
+        (docs / "bug-backlog.md").write_text(
+            "\n".join(
+                [
+                    "# Bug Backlog",
+                    "",
+                    "### bp-020",
+                    "",
+                    "**<one-line bug placeholder>**",
+                    "",
+                    "- Status: to do",
+                    "",
+                    "### bp-021",
+                    "",
+                    "**Fix <Foo> parser regression**",
+                    "",
+                    "- Status: to do",
+                    "",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        review_dir = docs / "reviews"
+        review_dir.mkdir()
+        (review_dir / "angle-backlog.md").write_text(
+            "1. **P1 - XSS via <script> in title**\n",
+            encoding="utf-8",
+        )
+
+        proc = run_task(project, "harvest", "--json")
+        assert_true(f"angle-bracket harvest exits 0: {proc.stderr}", proc.returncode == 0)
+        payload = json.loads(proc.stdout)
+        assert_true("only real angle-bracket items harvested", len(payload["created"]) == 2)
+        titles = [item["title"] for item in _read_items(project)]
+        assert_true("real generic title harvested", "Fix <Foo> parser regression" in titles)
+        assert_true("real review tag title harvested", "XSS via <script> in title" in titles)
+        assert_true("skeleton placeholder still skipped", "<one-line bug placeholder>" not in titles)
+
+
+def test_goalflight_task_harvest_keeps_literal_punctuation_distinct() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        project = Path(td)
+        docs = project / "docs-private"
+        _write_tasks(project, [])
+        (docs / "bug-backlog.md").write_text(
+            "\n".join(
+                [
+                    "# Bug Backlog",
+                    "",
+                    "### bp-030",
+                    "",
+                    "**Fix parser*edge case**",
+                    "",
+                    "- Status: to do",
+                    "",
+                    "### bp-031",
+                    "",
+                    "**Fix parser_edge case**",
+                    "",
+                    "- Status: to do",
+                    "",
+                    "### bp-032",
+                    "",
+                    "**Fix parser~edge case**",
+                    "",
+                    "- Status: to do",
+                    "",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        proc = run_task(project, "harvest", "--json")
+        assert_true(f"punctuation harvest exits 0: {proc.stderr}", proc.returncode == 0)
+        payload = json.loads(proc.stdout)
+        assert_true("literal punctuation titles do not dedupe together", len(payload["created"]) == 3)
+        titles = [item["title"] for item in _read_items(project)]
+        assert_true("literal star title harvested", "Fix parser*edge case" in titles)
+        assert_true("literal underscore title harvested", "Fix parser_edge case" in titles)
+        assert_true("literal tilde title harvested", "Fix parser~edge case" in titles)
+
+
+def test_goalflight_task_harvest_allows_nested_generated_basename_sources() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        project = Path(td)
+        docs = project / "docs-private"
+        _write_tasks(project, [])
+        nested = docs / "reviews" / "findings"
+        nested.mkdir(parents=True)
+        (nested / "task-decomposition.md").write_text(
+            "1. **P2 - Nested generated basename still harvested**\n",
+            encoding="utf-8",
+        )
+
+        proc = run_task(project, "harvest", "--json")
+        assert_true(f"nested basename harvest exits 0: {proc.stderr}", proc.returncode == 0)
+        payload = json.loads(proc.stdout)
+        assert_true("nested generated basename source harvested", len(payload["created"]) == 1)
+        titles = [item["title"] for item in _read_items(project)]
+        assert_true("nested generated basename title present", "Nested generated basename still harvested" in titles)
+
+
 def test_goalflight_task_schema_version_tolerance_and_read_api() -> None:
     with tempfile.TemporaryDirectory() as td:
         project = Path(td)
@@ -1079,6 +1188,51 @@ def test_goalflight_task_resume_history_uses_atomic_writer() -> None:
             module._atomic_write_text = original
 
         assert_true("history target unchanged after atomic failure", history.read_text(encoding="utf-8") == before)
+
+
+def test_goalflight_task_resume_history_filters_subset_race_under_lock() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        project = Path(td)
+        docs = project / "docs-private"
+        docs.mkdir(parents=True, exist_ok=True)
+        for day in ("01", "02"):
+            (docs / f"RESUME-NOTES-2026-06-{day}.md").write_text(
+                "\n".join(
+                    [
+                        f"# RESUME-NOTES 2026-06-{day}",
+                        "",
+                        "## TL;DR",
+                        "",
+                        f"History race candidate {day}.",
+                        "",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+        history = docs / "history.md"
+        history.write_text("existing history\n", encoding="utf-8")
+        module = _load_goalflight_task_module()
+        store = module.TaskStore(project)
+        original_lock = store.store_lock
+        raced_source = "docs-private/RESUME-NOTES-2026-06-01.md"
+
+        @contextlib.contextmanager
+        def racing_lock():
+            with original_lock():
+                history.write_text(
+                    history.read_text(encoding="utf-8")
+                    + f"\n## 2026-06-01 - RESUME-NOTES-2026-06-01.md\n\n- Source: {raced_source}\n- Harvested by: other\n",
+                    encoding="utf-8",
+                )
+                yield
+
+        store.store_lock = racing_lock
+        appended = module._append_resume_history(store, "tester")
+        text = history.read_text(encoding="utf-8")
+        assert_true("history subset race reports only still-missing source", appended == ["docs-private/RESUME-NOTES-2026-06-02.md"])
+        assert_true("raced source not duplicated", text.count(f"- Source: {raced_source}") == 1)
+        assert_true("missing source appended", text.count("- Source: docs-private/RESUME-NOTES-2026-06-02.md") == 1)
 
 
 def _assert_non_regular_task_read_fails(project: Path, *args: str) -> None:
@@ -1315,16 +1469,20 @@ def main() -> None:
     test_goalflight_task_review_captures_confirmed_bug_item()
     test_goalflight_task_harvest_idempotent_with_source_links_and_history()
     test_goalflight_task_harvest_ignores_skeleton_placeholders()
+    test_goalflight_task_harvest_allows_real_angle_bracket_titles()
+    test_goalflight_task_harvest_keeps_literal_punctuation_distinct()
+    test_goalflight_task_harvest_allows_nested_generated_basename_sources()
     test_goalflight_task_schema_version_tolerance_and_read_api()
     test_goalflight_task_append_dispatch_breadcrumbs_preserves_history()
     test_goalflight_task_atomic_write_rejects_bad_content()
     test_goalflight_task_interrupted_publish_marker_repairs_mirror()
     test_goalflight_task_resume_history_uses_atomic_writer()
+    test_goalflight_task_resume_history_filters_subset_race_under_lock()
     test_goalflight_task_rejects_non_regular_store_files_without_hanging()
     test_goalflight_task_sync_repairs_stale_mirror()
     test_goalflight_task_data_js_escapes_script_end_and_html()
     test_goalflight_task_sync_generates_markdown_views()
-    print("OK: 26 tasks mirror/task-store tests pass")
+    print("OK: 30 tasks mirror/task-store tests pass")
 
 
 if __name__ == "__main__":
