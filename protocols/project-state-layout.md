@@ -114,10 +114,11 @@ Bug INSTANCES stay project-local; bug SHAPES are shared.
   repo's ignore-everywhere rule (where present) stays intact.
 - Migrating existing projects is non-destructive and **branches on
    `git check-ignore docs-private/`** (some private repos track it instead of ignoring — both are fine):
-   dry-run the mapping, create canonical paths if absent (never clobber), move
-   ad-hoc files in (e.g. a stray `*-northstar.md` -> `NORTH-STAR.md`). Runtime
-   queue state (`dispatch/`, `*.lock`) is pinned by reference, NEVER relocated.
-   Per-repo mapping: operator-local plan.
+   dry-run the scaffold, create canonical paths if absent (never clobber), and
+   leave ad-hoc file-name mapping as an operator-assisted manual step (e.g. copy
+   a prior `*-northstar.md` into `NORTH-STAR.md` only after reviewing the source).
+   Runtime queue state (`dispatch/`, `*.lock`) is pinned by reference, NEVER
+   relocated. Per-repo mapping: operator-local plan.
 - The migration helper writes a per-repo backup before apply, rewrites only
    managed state-file pointers in `AGENTS.md` through temp+rename, and keeps
    `history.md` additive/write-once. The retired handoff file is not state; the

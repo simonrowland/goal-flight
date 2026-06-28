@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -70,6 +71,15 @@ GSTACK_FULL_INSTALL_HOSTS = {
 STATE_BACKUP_REL = Path("docs-private/log/project-state-backups")
 TASK_ID_PATTERN = re.compile(r"\b[tb]-\d+\b")
 RESUME_PIN_TEXT = "newest docs-private/RESUME-NOTES-*.md"
+HANDOFF_FILE_RE = re.compile(r"(?<!state-)(?<![A-Za-z0-9_/-])handoff\.md(?![A-Za-z0-9_.-])")
+MANAGED_POINTER_PHRASES = (
+    "living current state",
+    "living state",
+    "living pin",
+    "current-state pin",
+    "state pointer",
+    "handoff-<date>",
+)
 
 
 class SetupError(RuntimeError): pass
@@ -138,7 +148,7 @@ def _project_agents_template(repo_root: Path, target_project: Path) -> str:
     )
 
 
-def _replace_state_pointer_text(text: str) -> str:
+def _replace_state_pointer_line(line: str) -> str:
     replacements = (
         ("Living current state is `handoff.md`;", "Living current state is the newest `docs-private/RESUME-NOTES-*.md`;"),
         ("`handoff.md` stays the living pin", "the newest `docs-private/RESUME-NOTES-*.md` stays the living pin"),
@@ -147,11 +157,42 @@ def _replace_state_pointer_text(text: str) -> str:
         ("`handoff-<DATE>.md` files", "`history.md` entries"),
         ("handoff-<DATE>.md", "history.md"),
     )
-    out = text
+    out = line
     for old, new in replacements:
         out = out.replace(old, new)
-    out = re.sub(r"(?<!state-)(?<![A-Za-z0-9_/-])handoff\.md(?![A-Za-z0-9_.-])", RESUME_PIN_TEXT, out)
+    out = HANDOFF_FILE_RE.sub(RESUME_PIN_TEXT, out)
     return out
+
+
+def _replace_state_pointer_text(text: str) -> str:
+    lines = text.splitlines(keepends=True)
+    out: list[str] = []
+    in_managed_comment = False
+    in_managed_section = False
+    for line in lines:
+        lower = line.casefold()
+        stripped = line.lstrip()
+        if "<!-- >>> goal-flight" in lower:
+            in_managed_comment = True
+        if stripped.startswith("## "):
+            in_managed_section = (
+                "goal flight routing" in lower
+                or "living state" in lower
+            )
+        managed_pointer_line = HANDOFF_FILE_RE.search(line) and any(
+            phrase in lower for phrase in MANAGED_POINTER_PHRASES
+        )
+        if in_managed_comment or in_managed_section or managed_pointer_line:
+            out.append(_replace_state_pointer_line(line))
+        else:
+            out.append(line)
+        if "<!-- <<< goal-flight" in lower:
+            in_managed_comment = False
+    return "".join(out)
+
+
+def _has_unmanaged_handoff_pointer(text: str) -> bool:
+    return HANDOFF_FILE_RE.search(_replace_state_pointer_text(text)) is not None
 
 
 def _ensure_agents_state_pin(repo_root: Path, target_project: Path) -> dict[str, Any]:
@@ -172,15 +213,19 @@ def _ensure_agents_state_pin(repo_root: Path, target_project: Path) -> dict[str,
 
     text = agents.read_text(encoding="utf-8", errors="replace")
     updated = _replace_state_pointer_text(text)
+    unmanaged_handoff_pointer = _has_unmanaged_handoff_pointer(text)
     lower = updated.casefold()
     changes: list[str] = []
     if updated != text:
         changes.append("rewrote handoff.md state pointer to newest docs-private/RESUME-NOTES-*.md")
+    if unmanaged_handoff_pointer:
+        changes.append("left unmanaged handoff.md mention untouched; review manually if it is a Goal Flight state pointer")
 
     if not ("newest" in lower and "resume-notes" in lower and "docs-private" in lower):
         living_block = "\n".join(template.splitlines()[18:34]).rstrip() + "\n\n"
         updated = f"{living_block}{updated}"
         changes.append("added living-state pin for newest docs-private/RESUME-NOTES-*.md")
+        lower = updated.casefold()
 
     if "## goal flight routing" not in lower:
         routing_start = template.find("## Goal Flight Routing")
@@ -188,13 +233,14 @@ def _ensure_agents_state_pin(repo_root: Path, target_project: Path) -> dict[str,
         routing_block = template[routing_start:routing_end].rstrip()
         updated = updated.rstrip() + "\n\n" + routing_block + "\n"
         changes.append("appended Goal Flight routing block")
+        lower = updated.casefold()
 
     if updated == text:
         return {
             "path": "AGENTS.md",
             "action": "skip",
             "content": None,
-            "message": "AGENTS.md already pins newest docs-private/RESUME-NOTES-*.md; no rewrite needed",
+            "message": "; ".join(changes) if changes else "AGENTS.md already pins newest docs-private/RESUME-NOTES-*.md; no rewrite needed",
         }
     return {
         "path": "AGENTS.md",
@@ -244,6 +290,27 @@ def _derive_task_ids_from_record(record: dict[str, Any]) -> list[str]:
     return _extract_task_ids_from_text("\n".join(haystacks))
 
 
+def _json_copy(value: Any) -> Any:
+    return json.loads(json.dumps(value, sort_keys=True))
+
+
+def _sha256_file(path: Path) -> str | None:
+    try:
+        h = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
+
+
+def _managed_view_needs_refresh(source: Path, dest: Path) -> bool:
+    source_hash = _sha256_file(source)
+    dest_hash = _sha256_file(dest)
+    return bool(source_hash and dest_hash and source_hash != dest_hash)
+
+
 def _plan_ledger_task_id_backfill(target_project: Path) -> list[dict[str, Any]]:
     updates: list[dict[str, Any]] = []
     target = str(target_project)
@@ -260,6 +327,7 @@ def _plan_ledger_task_id_backfill(target_project: Path) -> list[dict[str, Any]]:
         updates.append({
             "dispatch_id": record.get("dispatch_id"),
             "task_ids": derived,
+            "preimage": _json_copy(record),
             "message": "derived task_ids from dispatch metadata/prompt path",
         })
     return updates
@@ -293,6 +361,7 @@ def _create_project_state_backup(
     rel_paths: list[str],
     *,
     reason: str,
+    ledger_preimages: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     backup_root = target_project / STATE_BACKUP_REL / _now_slug()
     records: list[dict[str, Any]] = []
@@ -318,6 +387,8 @@ def _create_project_state_backup(
         "reason": reason,
         "entries": records,
     }
+    if ledger_preimages:
+        manifest["ledger_task_id_backfill_preimages"] = ledger_preimages
     _atomic_write(backup_root / "manifest.json", json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     return {
         "path": _relative_to_project(target_project, backup_root),
@@ -353,6 +424,7 @@ def scaffold_project_state(
     would_create_dirs: list[str] = []
     would_create_files: list[str] = []
     skipped_existing_files: list[str] = []
+    managed_view_replacements: list[dict[str, str]] = []
     messages: list[str] = []
 
     dirs = [docs_private] + [docs_private / rel for rel in goalflight_doctor.CANONICAL_STATE_DIRS]
@@ -369,6 +441,18 @@ def scaffold_project_state(
         dest = docs_private / rel
         rel_out = _relative_to_project(target_project, dest)
         if dest.exists():
+            if (
+                rel.as_posix() in goalflight_doctor.MANAGED_VIEW_ASSETS
+                and dest.is_file()
+                and _managed_view_needs_refresh(source, dest)
+            ):
+                managed_view_replacements.append({
+                    "path": rel_out,
+                    "template": f"{goalflight_doctor.STATE_SKELETON_REL.as_posix()}/{rel.as_posix()}",
+                    "message": "managed view asset differs from template; will back up and refresh",
+                })
+                messages.append(f"refresh managed view asset: {rel_out} (backup before replace)")
+                continue
             skipped_existing_files.append(rel_out)
             messages.append(f"skip existing operator file: {rel_out} (create-if-absent never overwrites)")
             continue
@@ -399,11 +483,13 @@ def scaffold_project_state(
         or would_create_files
         or agents_plan["action"] in {"create", "update"}
         or ledger_backfill_plan
+        or managed_view_replacements
     )
     backup = None
     created_dirs: list[str] = []
     created_files: list[str] = []
     touched_html: list[str] = []
+    refreshed_managed_views: list[str] = []
     agents_result = {
         "path": agents_plan["path"],
         "action": "would_" + agents_plan["action"] if agents_plan["action"] != "skip" else "skip",
@@ -415,10 +501,20 @@ def scaffold_project_state(
         backup_paths = ["AGENTS.md"]
         if would_create_dirs or would_create_files:
             backup_paths.extend(skipped_existing_files)
+        backup_paths.extend(item["path"] for item in managed_view_replacements)
+        ledger_preimages = [
+            {
+                "dispatch_id": item["dispatch_id"],
+                "task_ids": item["task_ids"],
+                "record": item["preimage"],
+            }
+            for item in ledger_backfill_plan
+        ]
         backup = _create_project_state_backup(
             target_project,
             backup_paths,
             reason="project-state scaffold/migration before apply",
+            ledger_preimages=ledger_preimages,
         )
 
     if apply:
@@ -440,19 +536,19 @@ def scaffold_project_state(
                 source = skeleton / dest.relative_to(docs_private)
                 shutil.copy2(source, dest)
             created_files.append(rel_out)
-        created_file_set = set(created_files)
-        for html_name in goalflight_doctor.HTML_FRESHNESS_SOURCES:
-            html_path = docs_private / html_name
-            rel_out = _relative_to_project(target_project, html_path)
-            if rel_out in created_file_set and html_path.exists():
-                html_path.touch()
-                touched_html.append(rel_out)
+        for item in managed_view_replacements:
+            rel_out = item["path"]
+            dest = target_project / rel_out
+            source = skeleton / Path(rel_out).relative_to("docs-private")
+            if dest.exists() and _managed_view_needs_refresh(source, dest):
+                _copy_atomic(source, dest)
+                refreshed_managed_views.append(rel_out)
         if agents_plan["action"] in {"create", "update"}:
             _atomic_write(target_project / "AGENTS.md", agents_plan["content"])
             agents_result["action"] = agents_plan["action"]
         ledger_backfills = _apply_ledger_task_id_backfill(ledger_backfill_plan)
     else:
-        messages.append("dry-run only: no files, directories, AGENTS.md, backups, or ledger records were changed")
+        messages.append("dry-run only: no files, directories, managed view assets, AGENTS.md, backups, or ledger records were changed")
 
     docs_private_gitignored = _git_check_ignored(target_project, "docs-private/")
     if docs_private_gitignored is True:
@@ -464,6 +560,7 @@ def scaffold_project_state(
 
     would_create_dirs_out = [] if apply else would_create_dirs
     would_create_files_out = [] if apply else would_create_files
+    would_refresh_managed_views = [] if apply else managed_view_replacements
     skipped = sorted(set(skipped_existing_files))
     return {
         "schema": "goalflight.project-state-scaffold.v1",
@@ -478,6 +575,8 @@ def scaffold_project_state(
         "created_files": created_files,
         "would_create_files": would_create_files_out,
         "touched_created_html": touched_html,
+        "refreshed_managed_views": refreshed_managed_views,
+        "would_refresh_managed_views": would_refresh_managed_views,
         "skipped_existing_files": skipped,
         "agents": agents_result,
         "ledger_task_id_backfill": {
@@ -487,7 +586,7 @@ def scaffold_project_state(
         "messages": messages,
         "summary": (
             f"created_files={len(created_files)} would_create_files={len(would_create_files_out)} "
-            f"skipped_existing_files={len(skipped)}"
+            f"refreshed_managed_views={len(refreshed_managed_views)} skipped_existing_files={len(skipped)}"
         ),
     }
 

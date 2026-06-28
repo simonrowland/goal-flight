@@ -59,13 +59,14 @@ CLAUDE_ACP_BIN_OVERRIDE_GATE = "GOALFLIGHT_ALLOW_CLAUDE_ACP_BIN_OVERRIDE"
 CLAUDE_ACP_VERSION_OVERRIDE_GATE = "GOALFLIGHT_ALLOW_CLAUDE_ACP_VERSION_OVERRIDE"
 STATE_SKELETON_REL = Path("templates/state-skeleton")
 CANONICAL_STATE_DIRS = ("reviews", "research", "dispatch", "mail", "prompts", "rag")
-HTML_FRESHNESS_SOURCES = {
-    "index.html": ("tasks.jsonl", "tasks-data.js"),
-    "tickets.html": ("tasks.jsonl", "tasks-data.js"),
-    "ticket.html": ("tasks.jsonl", "tasks-data.js"),
-    "current-activity.html": ("tasks.jsonl", "tasks-data.js"),
-    "questions-for-user.html": ("questions-for-user.md",),
-}
+MANAGED_VIEW_ASSETS = (
+    "gf.js",
+    "index.html",
+    "tickets.html",
+    "ticket.html",
+    "current-activity.html",
+    "questions-for-user.html",
+)
 
 
 def run(cmd: list[str], cwd: Path | None = None, timeout: float = 8.0) -> dict:
@@ -536,8 +537,74 @@ def _state_layout_warning(message: str, *, path: str | None = None) -> dict:
     return out
 
 
+def _state_layout_has_task_store(docs_private: Path) -> bool:
+    return (docs_private / "tasks.jsonl").exists() or (docs_private / "tasks-data.js").exists()
+
+
+def _state_layout_adopted(docs_private: Path) -> bool:
+    if not docs_private.is_dir():
+        return False
+    adoption_markers = (
+        "NORTH-STAR.md",
+        "task-decomposition.md",
+        "tasks.jsonl",
+        "tasks-data.js",
+        "gf.js",
+    )
+    return any((docs_private / rel).exists() for rel in adoption_markers)
+
+
+def _sha256_path(path: Path) -> str | None:
+    try:
+        h = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
+
+
+def _check_tasks_mirror(project_root: Path, skill_root: Path) -> dict:
+    docs_private = project_root / "docs-private"
+    tasks_jsonl = docs_private / "tasks.jsonl"
+    tasks_data = docs_private / "tasks-data.js"
+    if not tasks_jsonl.exists() and not tasks_data.exists():
+        return {"ok": True, "present": False, "skipped": "task store absent"}
+    if not tasks_jsonl.exists() or not tasks_data.exists():
+        missing = "tasks.jsonl" if not tasks_jsonl.exists() else "tasks-data.js"
+        return {
+            "ok": False,
+            "present": True,
+            "message": f"tasks mirror incomplete: docs-private/{missing} missing",
+        }
+    script = skill_root / "scripts/check_tasks_mirror.js"
+    if not script.is_file():
+        return {
+            "ok": False,
+            "present": True,
+            "message": "tasks mirror checker missing: scripts/check_tasks_mirror.js",
+        }
+    if shutil.which("node") is None:
+        return {
+            "ok": True,
+            "present": True,
+            "skipped": "node unavailable; skipped tasks mirror check",
+        }
+    result = run(["node", str(script), str(docs_private)], timeout=8.0)
+    if result.get("ok"):
+        return {"ok": True, "present": True, "detail": first_line(result.get("stdout"))}
+    return {
+        "ok": False,
+        "present": True,
+        "message": first_line(result.get("stderr") or result.get("stdout")) or "tasks mirror check failed",
+        "stdout": result.get("stdout"),
+        "stderr": result.get("stderr"),
+    }
+
+
 def check_project_state_layout(project_root: Path, skill_root: Path | None = None) -> dict:
-    """Verify the canonical docs-private tree and stale HTML view signals."""
+    """Verify the canonical docs-private tree and managed static view assets."""
     root = skill_root or SCRIPT_DIR.parent
     skeleton = root / STATE_SKELETON_REL
     docs_private = project_root / "docs-private"
@@ -545,15 +612,24 @@ def check_project_state_layout(project_root: Path, skill_root: Path | None = Non
     missing_files: list[str] = []
     missing_dirs: list[str] = []
     warnings: list[dict] = []
-    stale_html: list[dict] = []
+    advisories: list[dict] = []
+    view_schema_skew: list[dict] = []
+    advisory_absence = not _state_layout_adopted(docs_private) and not _state_layout_has_task_store(docs_private)
+
+    def add_layout_issue(message: str, *, path: str | None = None) -> None:
+        item = _state_layout_warning(message, path=path)
+        if advisory_absence:
+            advisories.append(item)
+        else:
+            warnings.append(item)
 
     if not docs_private.is_dir():
         missing_dirs.append("docs-private/")
-        warnings.append(_state_layout_warning(
+        add_layout_issue(
             "missing canonical docs-private directory: docs-private/ "
-            "(run `/goal-flight init`; it creates the private state root)",
+            "(run `/goal-flight init` to adopt the v1.1 private state layout)",
             path="docs-private/",
-        ))
+        )
 
     if not skeleton.is_dir():
         warnings.append(_state_layout_warning(
@@ -567,12 +643,12 @@ def check_project_state_layout(project_root: Path, skill_root: Path | None = Non
         if not target.is_file():
             state_path = f"docs-private/{rel}"
             missing_files.append(state_path)
-            warnings.append(_state_layout_warning(
+            add_layout_issue(
                 f"missing canonical docs-private file: {state_path} "
                 f"(create from {STATE_SKELETON_REL.as_posix()}/{rel}; "
                 "run `/goal-flight init` to scaffold without overwriting)",
                 path=state_path,
-            ))
+            )
 
     resume_pattern = re.compile(r"^RESUME-NOTES-\d{4}-\d{2}-\d{2}(-rev\d+)?\.md$")
     resume_notes = [
@@ -582,68 +658,81 @@ def check_project_state_layout(project_root: Path, skill_root: Path | None = Non
     if not resume_notes:
         state_path = "docs-private/RESUME-NOTES-<YYYY-MM-DD>.md"
         missing_files.append(state_path)
-        warnings.append(_state_layout_warning(
+        add_layout_issue(
             "missing canonical docs-private file: "
             f"{state_path} (create from templates/resume-notes.md; "
             "run `/goal-flight init` to scaffold the living state pin)",
             path=state_path,
-        ))
+        )
 
     for rel in CANONICAL_STATE_DIRS:
         target = docs_private / rel
         if not target.is_dir():
             state_path = f"docs-private/{rel}/"
             missing_dirs.append(state_path)
-            warnings.append(_state_layout_warning(
+            add_layout_issue(
                 f"missing canonical docs-private directory: {state_path} "
                 "(run `/goal-flight init` to create it)",
                 path=state_path,
-            ))
+            )
 
-    for html_name, source_names in HTML_FRESHNESS_SOURCES.items():
-        html_path = docs_private / html_name
-        if not html_path.exists():
+    for rel in MANAGED_VIEW_ASSETS:
+        source = skeleton / rel
+        target = docs_private / rel
+        if not target.exists() or not source.exists() or not target.is_file() or not source.is_file():
             continue
-        stale_sources: list[str] = []
-        try:
-            html_mtime = html_path.stat().st_mtime
-        except OSError:
+        source_hash = _sha256_path(source)
+        target_hash = _sha256_path(target)
+        if not source_hash or not target_hash or source_hash == target_hash:
             continue
-        for source_name in source_names:
-            source_path = docs_private / source_name
-            if not source_path.exists():
-                continue
-            try:
-                if html_mtime < source_path.stat().st_mtime:
-                    stale_sources.append(f"docs-private/{source_name}")
-            except OSError:
-                continue
-        if stale_sources:
-            entry = {
-                "html": f"docs-private/{html_name}",
-                "older_than": stale_sources,
-                "message": (
-                    f"stale HTML view: docs-private/{html_name} older than "
-                    f"{', '.join(stale_sources)} (refresh the view after source changes)"
-                ),
-            }
-            stale_html.append(entry)
-            warnings.append(_state_layout_warning(entry["message"], path=entry["html"]))
+        entry = {
+            "asset": f"docs-private/{rel}",
+            "template": f"{STATE_SKELETON_REL.as_posix()}/{rel}",
+            "expected_sha256": source_hash,
+            "actual_sha256": target_hash,
+            "message": (
+                f"managed view schema/template skew: docs-private/{rel} differs from "
+                f"{STATE_SKELETON_REL.as_posix()}/{rel}; run `/goal-flight init` "
+                "to back up and refresh managed view assets"
+            ),
+        }
+        view_schema_skew.append(entry)
+        warnings.append(_state_layout_warning(entry["message"], path=entry["asset"]))
+
+    tasks_mirror = _check_tasks_mirror(project_root, root)
+    if tasks_mirror.get("ok") is False:
+        message = tasks_mirror.get("message") or "tasks.jsonl/tasks-data.js mirror check failed"
+        warnings.append(_state_layout_warning(message, path="docs-private/tasks-data.js"))
+
+    ok: bool | None
+    if warnings:
+        ok = False
+    elif advisories:
+        ok = None
+    else:
+        ok = True
 
     return {
-        "ok": not warnings,
+        "ok": ok,
+        "advisory": bool(advisories and not warnings),
         "docs_private": str(docs_private),
         "skeleton": str(skeleton),
         "expected_files": [f"docs-private/{rel}" for rel in expected_files],
         "required_dirs": ["docs-private/"] + [f"docs-private/{rel}/" for rel in CANONICAL_STATE_DIRS],
         "missing_files": missing_files,
         "missing_dirs": missing_dirs,
-        "stale_html": stale_html,
+        "stale_html": [],
+        "view_schema_skew": view_schema_skew,
+        "tasks_mirror": tasks_mirror,
         "warnings": warnings,
+        "advisories": advisories,
         "install_hint": (
             "Run `/goal-flight init` to scaffold missing docs-private paths from "
             "`templates/state-skeleton/` without overwriting existing operator files."
-        ) if warnings else None,
+        ) if warnings else (
+            "Run `/goal-flight init` to adopt the v1.1 docs-private state layout."
+            if advisories else None
+        ),
     }
 
 
@@ -2654,7 +2743,7 @@ def print_human(payload: dict) -> None:
             (
                 f"missing_files={len((readiness.get('state_layout') or {}).get('missing_files') or [])} "
                 f"missing_dirs={len((readiness.get('state_layout') or {}).get('missing_dirs') or [])} "
-                f"stale_html={len((readiness.get('state_layout') or {}).get('stale_html') or [])}"
+                f"view_skew={len((readiness.get('state_layout') or {}).get('view_schema_skew') or [])}"
             ),
         ),
         status_line(
