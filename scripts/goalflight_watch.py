@@ -57,6 +57,7 @@ PROMPT_ECHO_MAX_ANCHORS = 10
 # Watcher mirror of the runner's intra-decision re-sample grace
 # (goalflight_liveness.cpu_liveness_keep_waiting) — same goal, keep aligned.
 WEDGE_CONFIRM_SAMPLES = 2
+BLOCKED_TASK_BREADCRUMB_STATE = "blocked_task_breadcrumb"
 
 
 def _marker_state(marker: dict | None) -> str:
@@ -613,13 +614,16 @@ def main() -> int:
         except Exception as exc:  # task store errors must be durable in status.
             return {"type": type(exc).__name__, "message": str(exc)}
 
-    def write_payload(payload: dict, *, reason: str | None = None, terminal_write: bool = False) -> None:
+    def write_payload(payload: dict, *, reason: str | None = None, terminal_write: bool = False) -> dict | None:
         nonlocal last_payload, final_status_written, working_breadcrumb_written
         if reason:
             payload["reason"] = reason
+        terminal_error = None
         if task_ids:
             payload["task_ids"] = list(task_ids)
             if not working_breadcrumb_written:
+                # Working breadcrumbs are advisory. Terminal breadcrumbs are
+                # load-bearing for status after volatile dispatch state is reaped.
                 working_payload = {**payload, "state": "working"}
                 working_payload.pop("terminal_marker", None)
                 working_payload.pop("last_marker", None)
@@ -630,11 +634,18 @@ def main() -> int:
             if terminal_write:
                 terminal_error = append_task_breadcrumb(_task_state_for_terminal(payload.get("state")), payload)
                 if terminal_error:
+                    original_state = payload.get("state")
                     payload["task_breadcrumb_error"] = terminal_error
+                    payload["task_breadcrumb_failed_state"] = original_state
+                    if payload.get("reason"):
+                        payload["task_breadcrumb_failed_reason"] = payload.get("reason")
+                    payload["state"] = BLOCKED_TASK_BREADCRUMB_STATE
+                    payload["reason"] = "task_breadcrumb_error"
         write_status(status_path, payload)
         last_payload = dict(payload)
         if terminal_write:
             final_status_written = True
+        return terminal_error
 
     def flush_terminal_status(reason: str) -> None:
         nonlocal final_status_written
@@ -761,12 +772,16 @@ def main() -> int:
             exit_code = _exit_code_for_state(payload["state"])
             exit_reason = terminal_reason
             write_payload(payload, reason=terminal_reason, terminal_write=True)
+            exit_code = _exit_code_for_state(payload["state"])
+            exit_reason = payload.get("reason", exit_reason)
             break
         if args.controller_pid and not alive(args.controller_pid):
             payload["state"] = "orphaned"
             exit_reason = "controller_dead"
             exit_code = 3
             write_payload(payload, reason=exit_reason, terminal_write=True)
+            exit_code = _exit_code_for_state(payload["state"])
+            exit_reason = payload.get("reason", exit_reason)
             break
         if not worker_is_alive:
             reconciled = _final_terminal_marker(tail, ignore_prefix_lines=ignore_prefix_lines)
@@ -785,6 +800,8 @@ def main() -> int:
                 )
                 exit_code = 1
             write_payload(payload, reason=exit_reason, terminal_write=True)
+            exit_code = _exit_code_for_state(payload["state"])
+            exit_reason = payload.get("reason", exit_reason)
             break
         if liveness_state == "wedged":
             wedge_streak += 1
@@ -798,6 +815,8 @@ def main() -> int:
                     exit_reason = "idle_timeout"
                     exit_code = 2
                 write_payload(payload, reason=exit_reason, terminal_write=True)
+                exit_code = _exit_code_for_state(payload["state"])
+                exit_reason = payload.get("reason", exit_reason)
                 break
         else:
             wedge_streak = 0

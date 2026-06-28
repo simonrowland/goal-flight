@@ -60,9 +60,21 @@ def _run_watcher(
     identity: dict | None = None,
     poll_secs: str = "1",
     max_idle_secs: str = "30",
+    dispatch_id: str | None = None,
+    project_root: Path | None = None,
+    task_ids: str | None = None,
+    agent: str | None = None,
 ):
     cmd = [sys.executable, str(WATCH), "--pid", str(worker_pid), "--tail", str(tail),
            "--status-json", str(status), "--poll-secs", poll_secs, "--max-idle-secs", max_idle_secs]
+    if dispatch_id:
+        cmd += ["--dispatch-id", dispatch_id]
+    if project_root is not None:
+        cmd += ["--project-root", str(project_root)]
+    if task_ids:
+        cmd += ["--task-ids", task_ids]
+    if agent:
+        cmd += ["--agent", agent]
     if identity is not None:
         cmd += ["--worker-identity-json", json.dumps(identity, sort_keys=True)]
     if ignore:
@@ -76,6 +88,35 @@ def _run_watcher(
         payload = json.loads(status.read_text(encoding="utf-8"))
         term = (payload.get("terminal_marker") or {})
     return proc.returncode, elapsed, term, payload
+
+
+def _write_task_store(project: Path) -> None:
+    item = {
+        "schema_version": 1,
+        "id": "t-001",
+        "kind": "task",
+        "title": "Linked watcher task",
+        "blocked_by": [],
+        "links": [],
+        "done": False,
+    }
+    docs = project / "docs-private"
+    docs.mkdir(parents=True, exist_ok=True)
+    (docs / "tasks.jsonl").write_text(json.dumps(item, separators=(",", ":")) + "\n", encoding="utf-8")
+    (docs / "tasks-data.js").write_text(
+        goalflight_watch.goalflight_task._items_data_js([item]),
+        encoding="utf-8",
+    )
+
+
+def _read_task(project: Path) -> dict:
+    rows = [
+        json.loads(line)
+        for line in (project / "docs-private" / "tasks.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(rows) == 1, rows
+    return rows[0]
 
 
 def case_ignores_echoed_prompt_marker() -> None:
@@ -379,6 +420,76 @@ def case_ready_terminal_marker() -> None:
         assert rc == 0, f"last-line READY must complete, got {rc}"
         assert term.get("kind") == "READY", term
         assert "findings.md" in term.get("text", ""), term
+
+
+def case_task_terminal_breadcrumb_failure_blocks_completion() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        project = tmp / "project"
+        _write_task_store(project)
+        (project / "docs-private" / "tasks.jsonl").write_text("{bad json\n", encoding="utf-8")
+        tail = tmp / "tail.txt"
+        tail.write_text("work done\nCOMPLETE: linked task\n", encoding="utf-8")
+        worker = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"], start_new_session=True)
+        try:
+            rc, _, term, payload = _run_watcher(
+                tail,
+                tmp / "s.json",
+                tmp / "p.md",
+                ignore=False,
+                worker_pid=worker.pid,
+                poll_secs="0.2",
+                max_idle_secs="2",
+                dispatch_id="watch-task-breadcrumb-fail",
+                project_root=project,
+                task_ids="t-001",
+                agent="codex",
+            )
+        finally:
+            worker.terminate()
+            worker.wait()
+        assert rc == 4, (rc, payload)
+        assert payload["state"] == "blocked_task_breadcrumb", payload
+        assert payload["reason"] == "task_breadcrumb_error", payload
+        assert payload["task_breadcrumb_failed_state"] == "complete", payload
+        assert payload["task_breadcrumb_error"]["type"] in {"JSONDecodeError", "TaskError"}, payload
+        assert term.get("kind") == "COMPLETE", term
+
+
+def case_task_terminal_breadcrumb_happy_path_persists() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        project = tmp / "project"
+        _write_task_store(project)
+        tail = tmp / "tail.txt"
+        tail.write_text("work done\nCOMPLETE: linked task\n", encoding="utf-8")
+        worker = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"], start_new_session=True)
+        try:
+            rc, _, term, payload = _run_watcher(
+                tail,
+                tmp / "s.json",
+                tmp / "p.md",
+                ignore=False,
+                worker_pid=worker.pid,
+                poll_secs="0.2",
+                max_idle_secs="2",
+                dispatch_id="watch-task-breadcrumb-ok",
+                project_root=project,
+                task_ids="t-001",
+                agent="codex",
+            )
+        finally:
+            worker.terminate()
+            worker.wait()
+        assert rc == 0, (rc, payload)
+        assert payload["state"] == "complete", payload
+        assert "task_breadcrumb_error" not in payload, payload
+        assert term.get("kind") == "COMPLETE", term
+        dispatches = _read_task(project).get("dispatches", [])
+        terminal = [entry for entry in dispatches if entry.get("state") == "worker-finished"]
+        assert terminal, dispatches
+        assert terminal[-1]["dispatch_id"] == "watch-task-breadcrumb-ok", terminal[-1]
+        assert terminal[-1]["last_worker_state"]["state"] == "complete", terminal[-1]
 
 
 PYNEC_OBSERVED_TAIL = """
@@ -863,6 +974,8 @@ def main() -> None:
     case_steer_ack_is_non_terminal_marker()
     case_mid_output_marker_ignored()
     case_ready_terminal_marker()
+    case_task_terminal_breadcrumb_failure_blocks_completion()
+    case_task_terminal_breadcrumb_happy_path_persists()
     case_worker_dead_final_reconciliation_observed_shapes()
     case_worker_dead_final_reconciliation_rejects_diff_and_prompt_echo()
     case_worker_dead_accepts_single_prefix_variants_outside_hunk()
