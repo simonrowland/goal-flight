@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 from pathlib import Path
 import subprocess
@@ -36,6 +37,37 @@ def _write_ready_agents(repo: Path) -> None:
         "- test: `pytest`\n",
         encoding="utf-8",
     )
+
+
+PRE_V11_INDEX_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>goal-flight</title>
+</head>
+<body>
+<main>
+<h1>goal-flight</h1>
+<h2>To do</h2>
+<ul>
+  <li><a class="id" href="task-decomposition.md#t-014">t-014</a><span>dashboard generator</span></li>
+</ul>
+<h2>Done</h2>
+<ul class="done-list">
+  <li class="done"><a class="id" href="tasks-done.md#t-011">t-011</a><span>state-layout spec</span></li>
+</ul>
+<h2>Documents</h2>
+<p class="docs">
+  <a href="NORTH-STAR.md">north star</a>
+  <a href="SRS.md">SRS</a>
+  <a href="ARCHITECTURE.md">architecture</a>
+</p>
+</main>
+<footer>generated 2026-06-20</footer>
+</body>
+</html>
+"""
 
 
 def test_scaffold_project_state_is_idempotent_and_respects_existing_files() -> None:
@@ -167,14 +199,21 @@ def test_scaffold_project_state_preserves_generic_living_state_prose() -> None:
         assert_true("manual review message emitted", "left unmanaged handoff.md mention untouched" in result["agents"]["message"])
 
 
-def test_scaffold_project_state_refreshes_skewed_managed_view_with_backup() -> None:
-    with tempfile.TemporaryDirectory(prefix="gf-state-layout-view-refresh-") as td:
+def test_scaffold_project_state_refreshes_pre_v11_dashboard_index_with_backup() -> None:
+    with tempfile.TemporaryDirectory(prefix="gf-state-layout-pre-v11-index-") as td:
         repo = Path(td)
         subprocess.run(["git", "init"], cwd=repo, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         docs_private = repo / "docs-private"
         docs_private.mkdir()
-        stale = "old dashboard vocabulary: worker-finished done\n"
-        docs_private.joinpath("gf.js").write_text(stale, encoding="utf-8")
+        view = docs_private / "index.html"
+        view.write_text(PRE_V11_INDEX_HTML, encoding="utf-8")
+
+        status = goalflight_doctor.classify_managed_view_asset(
+            ROOT / "templates/state-skeleton/index.html",
+            view,
+        )
+        assert_true("pre-v1.1 dashboard classified legacy", status["status"] == "legacy")
+        assert_true("pre-v1.1 dashboard needs refresh", status["needs_refresh"] is True)
 
         result = goalflight_setup.scaffold_project_state(
             ROOT,
@@ -183,18 +222,56 @@ def test_scaffold_project_state_refreshes_skewed_managed_view_with_backup() -> N
             today="2026-06-27",
         )
 
-        assert_true("managed view refreshed", "docs-private/gf.js" in result["refreshed_managed_views"])
+        assert_true("pre-v1.1 dashboard refreshed", "docs-private/index.html" in result["refreshed_managed_views"])
         assert_true(
             "managed view equals template",
-            docs_private.joinpath("gf.js").read_text(encoding="utf-8")
-            == ROOT.joinpath("templates/state-skeleton/gf.js").read_text(encoding="utf-8"),
+            view.read_text(encoding="utf-8")
+            == ROOT.joinpath("templates/state-skeleton/index.html").read_text(encoding="utf-8"),
         )
         backup = result["backup"]
         assert_true("managed view backup recorded", isinstance(backup, dict))
         assert_true(
             "managed view preimage backed up",
-            repo.joinpath(backup["path"], "docs-private/gf.js").read_text(encoding="utf-8") == stale,
+            repo.joinpath(backup["path"], "docs-private/index.html").read_text(encoding="utf-8")
+            == PRE_V11_INDEX_HTML,
         )
+        assert_true(
+            "pre-v1.1 refresh message emitted",
+            any(
+                "legacy goal-flight view (pre-v1.1 renderer); backing up and refreshing" in message
+                for message in result["messages"]
+            ),
+        )
+
+
+def test_scaffold_project_state_refreshes_known_legacy_hash_with_backup() -> None:
+    with tempfile.TemporaryDirectory(prefix="gf-state-layout-known-hash-") as td:
+        repo = Path(td)
+        subprocess.run(["git", "init"], cwd=repo, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        goalflight_setup.scaffold_project_state(ROOT, repo, apply=True, today="2026-06-27")
+        view = repo / "docs-private/gf.js"
+        legacy = "legacy hash fixture\n"
+        legacy_hash = hashlib.sha256(legacy.encode("utf-8")).hexdigest()
+        original_hashes = goalflight_doctor.MANAGED_VIEW_LEGACY_SHA256["gf.js"]
+        goalflight_doctor.MANAGED_VIEW_LEGACY_SHA256["gf.js"] = original_hashes + (legacy_hash,)
+        try:
+            view.write_text(legacy, encoding="utf-8")
+            status = goalflight_doctor.classify_managed_view_asset(
+                ROOT / "templates/state-skeleton/gf.js",
+                view,
+            )
+            assert_true("known hash classified legacy", status["status"] == "legacy")
+
+            result = goalflight_setup.scaffold_project_state(ROOT, repo, apply=True, today="2026-06-27")
+
+            assert_true("known hash refreshed", "docs-private/gf.js" in result["refreshed_managed_views"])
+            assert_true(
+                "known hash preimage backed up",
+                repo.joinpath(result["backup"]["path"], "docs-private/gf.js").read_text(encoding="utf-8")
+                == legacy,
+            )
+        finally:
+            goalflight_doctor.MANAGED_VIEW_LEGACY_SHA256["gf.js"] = original_hashes
 
 
 def test_scaffold_project_state_preserves_customized_current_managed_view() -> None:
@@ -202,9 +279,12 @@ def test_scaffold_project_state_preserves_customized_current_managed_view() -> N
         repo = Path(td)
         subprocess.run(["git", "init"], cwd=repo, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         goalflight_setup.scaffold_project_state(ROOT, repo, apply=True, today="2026-06-27")
-        view = repo / "docs-private/gf.js"
-        customized = ROOT.joinpath("templates/state-skeleton/gf.js").read_text(encoding="utf-8")
-        customized += "\n/* operator customization */\n"
+        view = repo / "docs-private/index.html"
+        customized = ROOT.joinpath("templates/state-skeleton/index.html").read_text(encoding="utf-8")
+        customized = customized.replace(
+            "</style>",
+            ".operator-note{border:1px solid var(--accent)}\n</style>",
+        )
         view.write_text(customized, encoding="utf-8")
 
         result = goalflight_setup.scaffold_project_state(ROOT, repo, apply=True, today="2026-06-27")
@@ -214,7 +294,37 @@ def test_scaffold_project_state_preserves_customized_current_managed_view() -> N
         assert_true("customized managed view no backup", result["backup"] is None)
         assert_true(
             "customized managed view manual review message",
-            any("preserve customized managed view asset" in message for message in result["messages"]),
+            any("preserve customized current managed view asset" in message for message in result["messages"]),
+        )
+
+
+def test_scaffold_project_state_preserves_foreign_managed_path_file() -> None:
+    with tempfile.TemporaryDirectory(prefix="gf-state-layout-view-foreign-") as td:
+        repo = Path(td)
+        subprocess.run(["git", "init"], cwd=repo, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        goalflight_setup.scaffold_project_state(ROOT, repo, apply=True, today="2026-06-27")
+        view = repo / "docs-private/index.html"
+        foreign = "<!doctype html><title>operator portal</title><h1>operator portal</h1>\n"
+        view.write_text(foreign, encoding="utf-8")
+
+        status = goalflight_doctor.classify_managed_view_asset(
+            ROOT / "templates/state-skeleton/index.html",
+            view,
+        )
+        assert_true("foreign managed path classified foreign", status["status"] == "foreign")
+        assert_true("foreign managed path does not refresh", status["needs_refresh"] is False)
+
+        result = goalflight_setup.scaffold_project_state(ROOT, repo, apply=True, today="2026-06-27")
+
+        assert_true("foreign managed path preserved", view.read_text(encoding="utf-8") == foreign)
+        assert_true("foreign managed path not refreshed", result["refreshed_managed_views"] == [])
+        assert_true("foreign managed path no backup", result["backup"] is None)
+        assert_true(
+            "foreign managed path manual review message",
+            any(
+                "unrecognized file at managed view path; left for manual review" in message
+                for message in result["messages"]
+            ),
         )
 
 
@@ -449,8 +559,10 @@ def main() -> None:
         test_scaffold_project_state_creates_backup_before_apply,
         test_scaffold_project_state_preserves_unmanaged_handoff_mentions,
         test_scaffold_project_state_preserves_generic_living_state_prose,
-        test_scaffold_project_state_refreshes_skewed_managed_view_with_backup,
+        test_scaffold_project_state_refreshes_pre_v11_dashboard_index_with_backup,
+        test_scaffold_project_state_refreshes_known_legacy_hash_with_backup,
         test_scaffold_project_state_preserves_customized_current_managed_view,
+        test_scaffold_project_state_preserves_foreign_managed_path_file,
         test_scaffold_project_state_respects_gitignore_branches,
         test_scaffold_project_state_backfills_derivable_inflight_ledger_task_ids,
         test_state_layout_references_newest_resume_notes_not_handoff_file,

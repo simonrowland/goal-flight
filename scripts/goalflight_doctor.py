@@ -630,6 +630,33 @@ def _managed_view_text(path: Path) -> str | None:
         return None
 
 
+def _managed_view_has_renderer_contract(path: Path, text: str) -> bool:
+    lower = text.lower()
+    if path.name == "gf.js":
+        return (
+            "global.gf" in lower
+            and "tasks-data.js" in lower
+            and "renderboard" in lower
+        )
+    if path.suffix == ".html":
+        return (
+            "gf.js" in lower
+            and "tasks-data.js" in lower
+            and ("gf." in lower or "window.gf" in lower)
+        )
+    return False
+
+
+def _managed_view_has_goalflight_signal(path: Path, text: str) -> bool:
+    lower = text.lower()
+    if path.suffix == ".html" and (
+        "<title>goal-flight" in lower
+        or "<h1>goal-flight" in lower
+    ):
+        return "task-decomposition.md" in lower or "tasks-done.md" in lower
+    return any(marker in lower for marker in MANAGED_VIEW_LEGACY_MARKERS)
+
+
 def classify_managed_view_asset(source: Path, target: Path) -> dict:
     source_hash = _sha256_path(source)
     target_hash = _sha256_path(target)
@@ -638,27 +665,39 @@ def classify_managed_view_asset(source: Path, target: Path) -> dict:
         "target_sha256": target_hash,
         "status": "unreadable",
         "needs_refresh": False,
+        "customized": False,
         "reason": None,
     }
     if not source_hash or not target_hash:
         return out
+    text = _managed_view_text(target) or ""
     if source_hash == target_hash:
         out["status"] = "current"
+        out["reason"] = "matches current template"
         return out
     if target_hash in MANAGED_VIEW_LEGACY_SHA256.get(source.name, ()):
         out["status"] = "legacy"
         out["needs_refresh"] = True
         out["reason"] = f"known legacy hash for {source.name}"
         return out
-    text = _managed_view_text(target) or ""
     for marker in MANAGED_VIEW_LEGACY_MARKERS:
         if marker in text:
             out["status"] = "legacy"
             out["needs_refresh"] = True
             out["reason"] = f"known legacy marker: {marker}"
             return out
-    out["status"] = "customized"
-    out["reason"] = "differs from template without a known legacy signature"
+    if _managed_view_has_renderer_contract(target, text):
+        out["status"] = "current"
+        out["customized"] = True
+        out["reason"] = "v1.1 renderer contract present but differs from template"
+        return out
+    if _managed_view_has_goalflight_signal(target, text):
+        out["status"] = "legacy"
+        out["needs_refresh"] = True
+        out["reason"] = "legacy goal-flight view (pre-v1.1 renderer)"
+        return out
+    out["status"] = "foreign"
+    out["reason"] = "unrecognized file at managed view path"
     return out
 
 
@@ -781,6 +820,22 @@ def check_project_state_layout(project_root: Path, skill_root: Path | None = Non
             continue
         status = classify_managed_view_asset(source, target)
         if status["status"] == "current":
+            if status.get("customized"):
+                entry = {
+                    "asset": f"docs-private/{rel}",
+                    "template": f"{STATE_SKELETON_REL.as_posix()}/{rel}",
+                    "expected_sha256": status["source_sha256"],
+                    "actual_sha256": status["target_sha256"],
+                    "reason": status["reason"],
+                    "status": status["status"],
+                }
+                entry["message"] = (
+                    f"managed view customization preserved: docs-private/{rel} carries "
+                    "the v1.1 renderer contract but differs from the current template; "
+                    "review manually if this was meant to be stock"
+                )
+                view_customizations.append(entry)
+                advisories.append(_state_layout_warning(entry["message"], path=entry["asset"]))
             continue
         entry = {
             "asset": f"docs-private/{rel}",
@@ -788,20 +843,21 @@ def check_project_state_layout(project_root: Path, skill_root: Path | None = Non
             "expected_sha256": status["source_sha256"],
             "actual_sha256": status["target_sha256"],
             "reason": status["reason"],
+            "status": status["status"],
         }
         if status["needs_refresh"]:
             entry["message"] = (
-                f"managed view legacy schema: docs-private/{rel} matches "
-                f"{status['reason']}; run `/goal-flight init` to back up and "
+                f"legacy goal-flight view (pre-v1.1 renderer): docs-private/{rel} "
+                f"matches {status['reason']}; run `/goal-flight init` to back up and "
                 "refresh managed view assets"
             )
             view_schema_skew.append(entry)
             warnings.append(_state_layout_warning(entry["message"], path=entry["asset"]))
-        elif status["status"] == "customized":
+        elif status["status"] == "foreign":
             entry["message"] = (
-                f"managed view customization preserved: docs-private/{rel} differs "
-                "from the current template but does not match a known legacy "
-                "signature; review manually if this was meant to be stock"
+                f"unrecognized file at managed view path; left for manual review: "
+                f"docs-private/{rel} (init will not overwrite non-goal-flight "
+                "operator content)"
             )
             view_customizations.append(entry)
             advisories.append(_state_layout_warning(entry["message"], path=entry["asset"]))

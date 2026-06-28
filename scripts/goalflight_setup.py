@@ -457,15 +457,23 @@ def scaffold_project_state(
                         "path": rel_out,
                         "template": f"{goalflight_doctor.STATE_SKELETON_REL.as_posix()}/{rel.as_posix()}",
                         "reason": view_status.get("reason"),
-                        "message": "managed view asset matches a known legacy signature; will back up and refresh",
+                        "message": "legacy goal-flight view (pre-v1.1 renderer); backing up and refreshing",
                     })
-                    messages.append(f"refresh legacy managed view asset: {rel_out} (backup before replace)")
+                    messages.append(
+                        f"legacy goal-flight view (pre-v1.1 renderer); backing up and refreshing: {rel_out}"
+                    )
                     continue
-                if view_status.get("status") == "customized":
+                if view_status.get("status") == "current" and view_status.get("customized"):
                     skipped_existing_files.append(rel_out)
                     messages.append(
-                        f"preserve customized managed view asset: {rel_out} "
-                        "(manual review; no known legacy signature)"
+                        f"preserve customized current managed view asset: {rel_out} "
+                        "(manual review; v1.1 renderer contract present)"
+                    )
+                    continue
+                if view_status.get("status") == "foreign":
+                    skipped_existing_files.append(rel_out)
+                    messages.append(
+                        f"unrecognized file at managed view path; left for manual review: {rel_out}"
                     )
                     continue
             skipped_existing_files.append(rel_out)
