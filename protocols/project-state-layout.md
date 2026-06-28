@@ -21,7 +21,7 @@ handoff/summary to survive.
 - **Living pin = the newest `RESUME-NOTES-<YYYY-MM-DD>[-rev<N>].md`** — current
   goals, where-we-are (HEAD, active increment, in-flight dispatch ids), the next
   action, key pins, do-not-re-litigate. This is the existing convention the
-  runtime already reads (`goalflight_session_status.py`, `state-handoff.md`); we
+  runtime already resolves through the session-status and resume helpers; we
   reuse it, not a new filename. Loop / watchdog prompts reference the *newest*
   RESUME-NOTES and name no specific tasks, so they can't go stale
   (`templates/goalflight-loop-prompt.md`).
@@ -38,8 +38,8 @@ it; private repos may track it — the layout works either way. Flat, minimal:
 
 ```
 docs-private/
-  index.html                  # human dashboard — progress (generated)
-  questions-for-user.html     # human decision view — the questions list (generated)
+  index.html                  # static dashboard; renders from tasks-data.js
+  questions-for-user.html     # static decision view; renders from tasks-data.js
   RESUME-NOTES-<date>.md       # LIVING pin (newest) = loop-prompt target
   history.md                  # write-once project history (append-only, additive)
   NORTH-STAR.md               # invariant goal + non-goals
@@ -60,28 +60,32 @@ docs-private/
   dispatch/  mail/  prompts/  rag/  goal-queue-*.md  *.lock
 ```
 
-`tasks.jsonl` is canonical (ADR-002/004): `task-decomposition.md` / `tasks-done.md`
-/ `index.html` are GENERATED — add/edit tasks via `goalflight_task.py` (don't
-hand-edit the generated views). A task lives in exactly one state; `done` moves it
-to the tasks-done view. Bugs follow the same split. Status is machine-owned — see
-[task-lifecycle.md](task-lifecycle.md).
+`tasks.jsonl` is canonical (ADR-002/004): `task-decomposition.md` /
+`tasks-done.md` / `bug-backlog.md` / `bugs-done.md` are GENERATED snapshots,
+while `index.html` and `questions-for-user.html` are static client-side views
+over `tasks-data.js`. Add/edit tasks via `goalflight_task.py` (don't hand-edit
+generated snapshots). A task lives in exactly one derived state; `done` marks
+DONE/awaiting-review and `accept` moves it to DONE-REVIEWED. Bugs follow the
+same split. Status is machine-owned — see [task-lifecycle.md](task-lifecycle.md).
 
 ## Questions & decisions (questions-for-user.md)
 
-Open decisions that block work live here, each listing the task chunk ids it
-blocks (`Blocks: t-014, t-016`). When answered, the decision becomes a greppable
-`### ADR-NNN —` heading in the same file's "Decided" section — the decision log
-lives in one place agents can grep. Renders to `questions-for-user.html` (a
-first-class human decision view); the dashboard surfaces the OPEN ones with links
-to the tasks they hold up.
+Open decision prose that blocks work lives here, each listing the task chunk ids
+it blocks (`Blocks: t-014, t-016`). When answered, the decision becomes a
+greppable `### ADR-NNN —` heading in the same file's "Decided" section — the
+decision log lives in one place agents can grep. Decision items also live in
+`tasks.jsonl`; `questions-for-user.html` renders the open decision items
+client-side from `tasks-data.js`, and the dashboard surfaces them with links to
+the tasks they hold up.
 
 ## Human views — index.html + questions-for-user.html
 
 The only HTML, in `docs-private/` root (no `dashboard/` subfolder, no separate
-stylesheet — CSS inlined so each page renders standalone in a browser and in the
-chat-console preview). Minimal text: no editorial chrome, no copyright, no live
-HEAD (provenance lives in the RESUME-NOTES pin); footer = generated date. See
-[progress-dashboard.md](progress-dashboard.md) for sections + rendering rules.
+stylesheet — CSS inlined so each page renders standalone in a browser). Markdown
+sources stay chat-console previewable; JS-rendered HTML is browser UI. Minimal
+text: no editorial chrome, no copyright, no live HEAD (provenance lives in the
+RESUME-NOTES pin). See [progress-dashboard.md](progress-dashboard.md) for
+rendering rules and [task-lifecycle.md](task-lifecycle.md) for status sections.
 
 ## AGENTS.md pin (per project)
 
@@ -98,14 +102,16 @@ AGENTS.md carries a block that (a) tells the agent to read the newest
 
 Bug INSTANCES stay project-local; bug SHAPES are shared.
 
-## Migration & generator (follow-on)
+## Migration & sync/view refresh
 
 - `init` scaffolds the layout from `templates/state-skeleton/` (stubs present-even-
   if-empty; the RESUME-NOTES pin comes from `templates/resume-notes.md`); `doctor`
-  checks the tree + the AGENTS.md pin; the generator emits `index.html` /
-  `questions-for-user.html` from `tasks.jsonl` / `questions-for-user.md`. The
-  scaffold dir is named off `docs-private` on purpose so the repo's ignore-
-  everywhere rule (where present) stays intact.
+  checks the tree + the AGENTS.md pin; `goalflight_task.py sync` emits
+  `tasks-data.js` plus markdown snapshots. Static HTML views render client-side
+  from the mirror; `questions-for-user.md` remains the human source for decision
+  prose while `questions-for-user.html` renders open decision items from
+  `tasks-data.js`. The scaffold dir is named off `docs-private` on purpose so the
+  repo's ignore-everywhere rule (where present) stays intact.
 - Migrating existing projects is non-destructive and **branches on
    `git check-ignore docs-private/`** (some private repos track it instead of ignoring — both are fine):
    dry-run the mapping, create canonical paths if absent (never clobber), move

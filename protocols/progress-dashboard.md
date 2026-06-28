@@ -2,7 +2,8 @@
 
 Artifacts split by who edits them. (Layout + what links where:
 [project-state-layout.md](project-state-layout.md); item model:
-[task-lifecycle.md](task-lifecycle.md).)
+[task-lifecycle.md](task-lifecycle.md).) Status buckets and dashboard section
+authority live in `task-lifecycle.md`.
 
 ## Tier 1 — controller-edited docs (markdown, zero-JS, context-light)
 
@@ -17,6 +18,8 @@ console preview. Zero-JS here keeps the controller's *editing* context light
 Views derived from `tasks.jsonl` are STATIC pages + a shared JS include that
 reads the data client-side and renders — there is **no Python page-generator**:
 
+- `index.html` — dashboard status view from the same mirror.
+- `questions-for-user.html` — open decision items rendered from the mirror.
 - `tickets.html` — the work-item list (tasks + bugs) with live sort/filter
   (kind, status, severity).
 - `ticket.html` — item details (`?id=t-014`).

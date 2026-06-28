@@ -1,12 +1,13 @@
 # Task Lifecycle (machine-owned status + id allocation)
 
-> **STATUS: DESIGN / PLANNED.** `goalflight_task.py`, the `--task` flag, the
-> generator, `tasks.jsonl`, and `.task-seq` are not built yet (t-024..t-026).
-> Until they land, the docket is hand-maintained (bare-id headings, manual ids).
+> **STATUS: SHIPPED / AS-BUILT (v1.1).** `goalflight_task.py`, the `--task`
+> flag, `tasks.jsonl`, `.task-seq`, `tasks-data.js`, markdown snapshots, and
+> mirror checks are built. Use the helper as the writer; generated docket views
+> are not hand-maintained.
 
-Goal: the docket (`task-decomposition.md` / `tasks-done.md` / `index.html`) is
-canonical, and its status is owned by the python helpers and driven by the
-dispatch ledger — not hand-maintained — with ids assigned without grepping files.
+Goal: `docs-private/tasks.jsonl` is canonical. The docket
+(`task-decomposition.md` / `tasks-done.md` / `index.html`) is derived from the
+store plus the dispatch ledger, with ids assigned without grepping files.
 
 ## Canonical store
 
@@ -23,16 +24,19 @@ and the Decisions-needed section below). Ids `t-NNN` / `b-NNN` / `q-NNN` /
 `ADR-NNN`, one allocator per family.
 
 The HTML views are self-contained **HTML+JS** filter-views that read the data
-client-side from `tasks-data.js` (a mirror of this file) — no Python page-
+client-side from `tasks-data.js` (a mirror of this file) — no Python page
 generator; see [progress-dashboard.md](progress-dashboard.md). Optional flat
-markdown snapshots (`task-decomposition.md`, `bug-backlog.md`, the goal-queue)
-can be emitted for git-diffability. *"Separate bugs json" vs "filter-view on one
-json" → one json, filter-views* — so cross-kind blockers are trivial (below).
+markdown snapshots (`task-decomposition.md`, `tasks-done.md`, `bug-backlog.md`,
+`bugs-done.md`) are emitted for git-diffability. *"Separate bugs json" vs
+"filter-view on one json" -> one json, filter-views* — so cross-kind blockers
+are trivial (below).
 
-The machine form of the existing **goal-queue**: a task item IS a `/goal` chunk
-(briefing in `prompt`/`prompt_path`); `goal-queue-*.md` is a generated view. A
-bug that needs a worker fix carries its fix briefing the same way and dispatches
-via `--task b-NNN`.
+`goal-queue-*.md` remains execution plumbing for v1.1. It is not migrated into,
+or generated from, `tasks.jsonl`; worker-queued state is derived from dispatch
+breadcrumbs and project-scoped ledger rows. A task or bug that needs a worker
+fix carries its briefing in `prompt` / `prompt_path` and dispatches via
+`--task <id>`. ADR-007's earlier generated goal-queue model is superseded by
+DECISION #5 for v1.1.
 
 ## Concurrency & worktrees (one shared store, never per-worktree)
 
@@ -67,23 +71,24 @@ flag — neither carries task_id today). Status = join task → its ledger recor
 **`(project_root, task_id)`** (filter the ledger to the current `project_root` —
 it is on every record — before joining), mapping the dispatch lifecycle + markers:
 
-| Task status       | Condition |
-|-------------------|-----------|
-| `pending`         | in registry, no dispatch, not blocked |
-| `blocked`/waiting | has `blocked_by` (a question id or task id) |
-| `working`         | a live, non-terminal dispatch carries this `task_id` |
-| `worker-finished` | latest dispatch terminal (`RESULT`/`COMPLETE`), not yet done — awaiting close |
-| `worker-failed`   | dispatch dead PID / no terminal marker / `BLOCKED` / error — needs attention |
-| `done`            | `goalflight_task.py done t-NNN` (reviewed + committed) |
+| Derived status | Condition |
+|---|---|
+| `pending` | in registry, no dispatch, not blocked |
+| `waiting` | has unresolved `blocked_by` (question, task, bug, or decision id) |
+| `working` | a live, non-terminal dispatch carries this `task_id` |
+| `awaiting-review` | **DONE**: latest dispatch terminal (`RESULT`/`COMPLETE`) or `goalflight_task.py done <id>`; review/accept still pending |
+| `worker-failed` | dispatch dead PID / no terminal marker / `BLOCKED` / error — needs attention |
+| `done-reviewed` | **DONE-REVIEWED**: `goalflight_task.py accept <id>` after a logged clean review |
 
-**The dispatch watcher writes these transitions automatically** (via the helper,
-`actor: watcher`): dispatch → `working`; terminal success marker →
-`worker-finished`; dead PID / no terminal marker / `BLOCKED` / error →
-`worker-failed`. So an item never rots in a misleading `open`/`working` state when
-the controller neglects admin (the regolith stale-backlog failure mode). The only
-manual transition left is the final `done` (close after review); `worker-finished`
-(awaiting close) and `worker-failed` are their own dashboard buckets, so the admin
-debt is visible instead of hidden.
+`outstanding` means NOT `done-reviewed`; it includes `awaiting-review`.
+
+**The dispatch watcher writes dispatch breadcrumbs automatically** (via the
+helper, `actor: watcher`): dispatch -> `working`; terminal success marker ->
+`awaiting-review`; dead PID / no terminal marker / `BLOCKED` / error ->
+`worker-failed`. So an item never rots in a misleading `open`/`working` state
+when the controller neglects admin. The manual closure model is two-step:
+`done` marks DONE/awaiting-review, `review` records the review breadcrumb, and
+`accept` moves a cleanly reviewed item to DONE-REVIEWED.
 
 ### Dispatch provenance (durable breadcrumb)
 
@@ -118,26 +123,36 @@ Items enter the ledger automatically, not by hand:
   files for un-filed action items / bugs and expands them into draft items to
   confirm — so things mentioned only in prose aren't stranded.
 
-## Dashboard sections (generated)
+## Dashboard sections
 
-Decisions needed · To do (pending) · In progress (working) · Awaiting close
-(worker-finished) · Failed / needs attention (worker-failed) · Waiting (blocked,
-linked to its blocker) · Done.
+`outstanding` covers every item whose derived status is not `done-reviewed`.
+Markdown snapshots use these sections: To do (pending) · In progress (working)
+· Awaiting review · Failed / needs attention · Waiting. DONE-REVIEWED items move
+to the done snapshots; HTML views may add decision/filter panels from the same
+mirror.
 
-## Helper contract — `goalflight_task.py` (to build)
+## Helper contract — `goalflight_task.py` (built)
 
-- `new "<title>" [--slug S] [--prompt-file F | --prompt "…"]` → allocate id, append record, print `t-NNN`
-- `show t-NNN [--prompt]`  → print the record (or just its prompt) — the read-by-key lookup
-- `block t-NNN --on <id>` / `unblock t-NNN`
-- `done t-NNN`            → mark done (moves to the tasks-done view)
-- `status [--json]`       → per-task computed status (joins the ledger)
-- `sync`                  → write `tasks-data.js` (the browser mirror) + optional markdown snapshots
+- `new "<title>" [--kind task|bug|decision] [--prompt-path F | --prompt "..."] [--json]` -> allocate id, append record, print id
+- `show <id> [--prompt] [--json]` -> read one item or its prompt
+- `block <id> --on <id>` / `unblock <id> [--on <id>]`
+- `done <id> [--resolution R] [--force]` -> mark DONE / awaiting-review
+- `review <id> --verdict clean|findings --dispatch D [--findings F] [--bug "..."]` -> append review breadcrumb and capture review bugs
+- `accept <id>` -> require latest clean review, then mark DONE-REVIEWED
+- `list [outstanding|awaiting-review|working|waiting|delegated|done-reviewed] [--since T] [--kind K] [--blocked-by ID] [--json]`
+- `status [--json]` -> print derived status rows
+- `sync` -> write `tasks-data.js` plus markdown snapshots from the store and project dispatch ledger
+- `harvest [--dry-run] [--no-history] [--json]` -> draft open work from RESUME-NOTES/review sources
+- check: `node scripts/check_tasks_mirror.js docs-private` validates mirror parity; `goalflight_task.py` runs it on writes.
 
-Read-by-key (any agent, no grep):
+Importable Python read API (any agent, no grep):
 
 ```python
-T = {json.loads(l)["id"]: json.loads(l) for l in open("docs-private/tasks.jsonl")}
-prompt = T["t-014"].get("prompt") or open(T["t-014"]["prompt_path"]).read()
+import goalflight_task
+
+item = goalflight_task.get("t-014")
+rows = goalflight_task.list("awaiting-review", kind="task")
+todo = goalflight_task.outstanding()
 ```
 
 Dispatch integration: `--task t-NNN` records `task_id` in the ledger AND resolves
@@ -165,13 +180,13 @@ Agents NEVER hand-edit `tasks.jsonl` — every create / update / close goes thro
    so the browser mirror can't fall out of sync (the mirror test becomes a backstop
    for a rare hand-edit, not the primary guard).
 
-Verbs (CRUD): `new` · `show`/`status` · `edit <id> --set k=v` · `block`/`unblock`
-· `close <id> --resolution R [--note …]` / `reopen <id>` · `done <id>` ·
-`tag`/`link` · `archive <id>` (prefer over delete — keeps the audit). All stamp
-actor + time and re-sync the mirror.
+Built mutation verbs: `new`, `block`, `unblock`, `done`, `review`, `accept`,
+`harvest`, and `sync`. Built read/query verbs: `show`, `list`, `status`, plus
+the importable Python read API above. There is no `edit`, `close`, `reopen`,
+`tag`, `link`, or `archive` CLI surface in v1.1.
 
-## Build tasks
+## As-built scope
 
-- t-024 — `goalflight_task.py` (allocator + registry + status/render)
-- t-025 — add `task_id` to the dispatch record + `--task` flag
-- t-026 — dashboard generator: render the 6 sections from `tasks.jsonl` + ledger
+The v1.1 docket/helper surface above is built. Future work belongs in
+`docs-private/tasks.jsonl` and the generated snapshots; do not duplicate a
+build-task list here.

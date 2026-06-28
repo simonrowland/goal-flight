@@ -12,7 +12,7 @@ protocol files carry the detailed operating procedures.
 | `progress-dashboard.md` | dashboard / ticket / decision HTML view rendering, offline refresh, or stale-view checks |
 | `dispatch-routing.md` | choosing iteration pattern (one-shot / goal-mode) and comms shape (controller-direct / ACP / bash-tail) |
 | `worker-markers.md` | rendering prompts or parsing worker status |
-| `state-handoff.md` | compacting, resume notes, status recovery |
+| `state-handoff.md` | compacting/resume protocol; restore from newest RESUME-NOTES plus status helpers |
 | `user-status-cadence.md` | in-flight worker poll + user progress updates (≤15 min) |
 | `chunk-review.md` | pre-commit gstack `/review` (default; complementary parallel autoreview optional) before chunk land |
 | `dispatched-worker-recovery.md` | orchestrator takeover when an ACP-dispatched worker terminal-blocks before commit |

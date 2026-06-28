@@ -97,21 +97,23 @@ Orchestrator behaviour probes run through portable host adapters, not host-speci
 | status/doctor preflight | Session Pre-Flight | `protocols/session-preflight.md`, `scripts/goalflight_status.py --wait <ids>`, `scripts/goalflight_doctor.py` |
 | **in-flight dispatch monitoring** | Session Pre-Flight | `scripts/goalflight_status.py`/`--wait <ids>`, `scripts/goalflight_watch.py`, `scripts/watch-dispatch-tail.sh` |
 | **active leases / what's in flight** | Capacity and rate limits | `scripts/goalflight_capacity.py status` (surfaces adaptive walkback) |
-| **per-chunk status snapshot** | Session Pre-Flight | `python3 <skill-root>/scripts/goalflight_chunk_summary.py --slug <slug> --json` |
+| **per-chunk status snapshot** | Session Pre-Flight | `scripts/goalflight_chunk_summary.py --slug <slug> --json` |
 | autonomous throughput | Autonomous throughput | `commands/execute.md`, `commands/goal.md` |
 | **chat as requirements** | Chat as requirements | `commands/goal.md`, `protocols/user-status-cadence.md` |
 | context lints | Autonomous throughput | `protocols/engagement-lint.md`, `foreground-duration-hook.md` |
 | user-status-cadence | User progress reporting | `protocols/user-status-cadence.md` |
+| project state layout | State | `protocols/project-state-layout.md` |
+| task lifecycle/docket | State | `protocols/task-lifecycle.md` |
+| dashboard/task views | User progress reporting | `protocols/progress-dashboard.md` |
 | chunk-vs-milestone review | Review layers | `protocols/chunk-review.md`, `protocols/milestone-review.md` |
 | **bug-class mining / backwards sweeps** | Review layers | `protocols/review-mining.md` |
-| dispatch axes (per-task routing table is in Worker Routing) | Dispatch Model, Worker Routing | `protocols/dispatch-routing.md` |
-| **worker permissions / YOLO warning** | Worker Routing | `scripts/goalflight_acp_run.py`, doctor `--worker-write-probe`, `scripts/install_claude_acp_patch.sh` |
+| dispatch axes | Dispatch Model, Worker Routing | `protocols/dispatch-routing.md` |
+| worker permissions | Worker Routing | `scripts/goalflight_acp_run.py`, doctor `--worker-write-probe`, `scripts/install_claude_acp_patch.sh` |
 | **worker blocked: orchestrator takeover** | Worker Routing | `protocols/dispatched-worker-recovery.md` |
 | rate limits & caps | Capacity and rate limits | `scripts/goalflight_capacity.py`, `scripts/goalflight_rate_pressure.py` |
 | worker markers | Worker Markers | `protocols/worker-markers.md`, `scripts/goalflight_watch.py` |
-| resume/compaction (canonical reload order) | State | `commands/resume.md`, `protocols/state-handoff.md`, `scripts/goalflight_session_status.py`, `scripts/goalflight_cleanup_dispatch_refs.py` |
+| resume/compaction | State | `commands/resume.md`, `protocols/state-handoff.md`, `scripts/goalflight_session_status.py` |
 | context discipline | Context Discipline | context-mode, `scripts/goalflight_*.py` |
-| gotchas from real sessions | Gotchas from session traffic | optional local/private evidence: `docs-private/research/goal-flight-gotchas-audit/addendum.md` |
 | **Do Not / safety gates** | Do Not | (read-end-to-end is load-bearing for safety) |
 
 ## Orchestrator Contract
