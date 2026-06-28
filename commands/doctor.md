@@ -40,8 +40,8 @@ capacity, model currency probes, and rate-pressure signals.
 Project-local checks cover `docs-private/env-caveats.md`, the canonical
 `docs-private/` state tree, repository `SKILL.md`, `AGENTS.md` Goal Flight
 routing, the `AGENTS.md` newest-`RESUME-NOTES` living-state pin, project
-verification commands, resume notes, and stale HTML views older than their
-sources.
+verification commands, resume notes, missing state files, managed-view
+schema/template skew, and the `tasks.jsonl` <-> `tasks-data.js` mirror.
 Package plugin validation applies only when `--project-root` is the Goal Flight
 package repository; for normal target projects it is skipped as INFO.
 
@@ -97,8 +97,10 @@ package repository; for normal target projects it is skipped as INFO.
   - `AGENTS.md` pins the newest `docs-private/RESUME-NOTES-*.md` living state
   - project test/lint/build commands
   - optional `docs-private/RESUME-NOTES*.md`
-  - HTML views are not older than their sources (`tasks.jsonl` /
-    `tasks-data.js`; `questions-for-user.md`)
+  - managed static view assets match the templates from
+    `templates/state-skeleton/`; schema/template skew is a layout warning
+  - `docs-private/tasks.jsonl` and `docs-private/tasks-data.js` mirror
+    validation when either task-store file exists
 - Check machine capacity profile.
 - **Cursor model currency** (`cursor_models_probe`): runs `cursor-agent models`,
   identifies the leading internal `composer-X.Y` (non-`-fast`), compares against
