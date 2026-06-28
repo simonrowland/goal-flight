@@ -132,16 +132,18 @@ fi
 python3 <skill-root>/scripts/goalflight_capacity.py profile --json
 ```
 
-5. Scaffold private project state if missing. This is create-if-absent only:
-   never overwrite operator files, never force-add ignored state, and preserve
+5. Scaffold or migrate private project state if missing. Default is dry-run.
+   Apply is create-if-absent only: never overwrite operator files, never
+   force-add ignored state, write a per-repo backup before changes, and preserve
    the repository's existing `docs-private/` gitignore policy.
 
 ```bash
 python3 <skill-root>/scripts/goalflight_setup.py \
   --scaffold-project-state \
-  --target-project "$PWD" \
-  --apply --yes
+  --target-project "$PWD"
 ```
+
+Inspect the dry-run JSON first. To mutate, rerun with `--apply --yes`.
 
 The scaffolder copies missing files from `templates/state-skeleton/`, creates
 the canonical state directories, and creates
@@ -149,6 +151,12 @@ the canonical state directories, and creates
 when no canonical resume pin exists. The canonical state contract is
 `protocols/project-state-layout.md`; task status is `protocols/task-lifecycle.md`;
 HTML view behavior is `protocols/progress-dashboard.md`.
+It updates `AGENTS.md` through temp+rename only when needed so the living-state
+pin names the newest `docs-private/RESUME-NOTES-*.md`, not a retired handoff
+file. It also branches on `git check-ignore docs-private/`: ignored repos stay
+untracked; tracked/private repos keep tracking. In-flight dispatch ledger records
+get `task_ids` backfilled only when derivable from dispatch metadata or the
+prompt path.
 
 - `docs-private/goal-<topic>-<date>.md` from `templates/goal-statement.md`
 - `AGENTS.md` handling (downstream projects often keep AGENTS.md
@@ -181,7 +189,7 @@ Do not paste full probe output.
 
 7. Confirm git hygiene:
 
-- `docs-private/` fully gitignored — create needed directories with `mkdir -p` at init time; never track a skeleton (`.gitkeep` exceptions are how private content gets force-added by accident)
+- `docs-private/` policy recorded from `git check-ignore docs-private/` — ignored public repos stay private; tracked private repos are allowed
 - `AGENTS.md` tracked or intentionally absent
 - root `SKILL.md` tracked or intentionally absent
 - current branch/head/dirty state recorded in resume notes
@@ -196,7 +204,7 @@ init.
 
 - Are readiness warnings actionable?
 - Did init avoid reading large docs/logs into context?
-- Are next steps clear from `RESUME-NOTES.md`?
+- Are next steps clear from the newest `docs-private/RESUME-NOTES-*.md`?
 
 ## Output
 

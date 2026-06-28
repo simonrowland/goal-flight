@@ -31,6 +31,8 @@ if str(SCRIPT_DIR) not in sys.path:
 
 import goalflight_compat  # noqa: E402
 import goalflight_doctor  # noqa: E402
+import goalflight_dispatch_states  # noqa: E402
+import goalflight_ledger  # noqa: E402
 from goalflight_adapter_gate import validate_adapter_gate  # noqa: E402
 
 
@@ -65,6 +67,9 @@ GSTACK_FULL_INSTALL_HOSTS = {
     "codex": "codex",
     "opencode": "opencode",
 }
+STATE_BACKUP_REL = Path("docs-private/log/project-state-backups")
+TASK_ID_PATTERN = re.compile(r"\b[tb]-\d+\b")
+RESUME_PIN_TEXT = "newest docs-private/RESUME-NOTES-*.md"
 
 
 class SetupError(RuntimeError): pass
@@ -122,6 +127,205 @@ def _template_text(path: Path, replacements: dict[str, str]) -> str:
     return text
 
 
+def _relative_to_project(project_root: Path, path: Path) -> str:
+    return path.relative_to(project_root).as_posix()
+
+
+def _project_agents_template(repo_root: Path, target_project: Path) -> str:
+    return _template_text(
+        repo_root / "templates/project-agents.md",
+        {"<PROJECT_NAME>": target_project.name},
+    )
+
+
+def _replace_state_pointer_text(text: str) -> str:
+    replacements = (
+        ("Living current state is `handoff.md`;", "Living current state is the newest `docs-private/RESUME-NOTES-*.md`;"),
+        ("`handoff.md` stays the living pin", "the newest `docs-private/RESUME-NOTES-*.md` stays the living pin"),
+        ("docs-private/handoff.md", RESUME_PIN_TEXT),
+        ("`handoff.md`", "the newest `docs-private/RESUME-NOTES-*.md`"),
+        ("`handoff-<DATE>.md` files", "`history.md` entries"),
+        ("handoff-<DATE>.md", "history.md"),
+    )
+    out = text
+    for old, new in replacements:
+        out = out.replace(old, new)
+    out = re.sub(r"(?<!state-)(?<![A-Za-z0-9_/-])handoff\.md(?![A-Za-z0-9_.-])", RESUME_PIN_TEXT, out)
+    return out
+
+
+def _ensure_agents_state_pin(repo_root: Path, target_project: Path) -> dict[str, Any]:
+    agents = target_project / "AGENTS.md"
+    template = _project_agents_template(repo_root, target_project)
+    if agents.exists() and not agents.is_file():
+        raise SetupError(
+            "refusing to update AGENTS.md because it is not a regular file; "
+            "move it aside or convert it to a file, then rerun init"
+        )
+    if not agents.exists():
+        return {
+            "path": "AGENTS.md",
+            "action": "create",
+            "content": template,
+            "message": "AGENTS.md absent; will create local Goal Flight routing and newest RESUME-NOTES pin",
+        }
+
+    text = agents.read_text(encoding="utf-8", errors="replace")
+    updated = _replace_state_pointer_text(text)
+    lower = updated.casefold()
+    changes: list[str] = []
+    if updated != text:
+        changes.append("rewrote handoff.md state pointer to newest docs-private/RESUME-NOTES-*.md")
+
+    if not ("newest" in lower and "resume-notes" in lower and "docs-private" in lower):
+        living_block = "\n".join(template.splitlines()[18:34]).rstrip() + "\n\n"
+        updated = f"{living_block}{updated}"
+        changes.append("added living-state pin for newest docs-private/RESUME-NOTES-*.md")
+
+    if "## goal flight routing" not in lower:
+        routing_start = template.find("## Goal Flight Routing")
+        routing_end = template.find("## Git workflow")
+        routing_block = template[routing_start:routing_end].rstrip()
+        updated = updated.rstrip() + "\n\n" + routing_block + "\n"
+        changes.append("appended Goal Flight routing block")
+
+    if updated == text:
+        return {
+            "path": "AGENTS.md",
+            "action": "skip",
+            "content": None,
+            "message": "AGENTS.md already pins newest docs-private/RESUME-NOTES-*.md; no rewrite needed",
+        }
+    return {
+        "path": "AGENTS.md",
+        "action": "update",
+        "content": updated,
+        "message": "; ".join(changes),
+    }
+
+
+def _extract_task_ids_from_text(text: str) -> list[str]:
+    out: list[str] = []
+    for task_id in TASK_ID_PATTERN.findall(text):
+        if task_id not in out:
+            out.append(task_id)
+    return out
+
+
+def _existing_task_ids(record: dict[str, Any]) -> list[str]:
+    values: list[str] = []
+    raw_many = record.get("task_ids")
+    if isinstance(raw_many, list):
+        values.extend(str(value) for value in raw_many if isinstance(value, str))
+    raw_one = record.get("task_id")
+    if isinstance(raw_one, str):
+        values.append(raw_one)
+    out: list[str] = []
+    for value in values:
+        if TASK_ID_PATTERN.fullmatch(value) and value not in out:
+            out.append(value)
+    return out
+
+
+def _derive_task_ids_from_record(record: dict[str, Any]) -> list[str]:
+    haystacks: list[str] = []
+    for key in ("dispatch_id", "prompt_id", "prompt_path", "stdout_path", "stderr_path", "status_path"):
+        value = record.get(key)
+        if isinstance(value, str):
+            haystacks.append(value)
+    prompt_path = record.get("prompt_path")
+    if isinstance(prompt_path, str):
+        path = Path(prompt_path).expanduser()
+        try:
+            if path.is_file() and path.stat().st_size <= 1024 * 1024:
+                haystacks.append(path.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            pass
+    return _extract_task_ids_from_text("\n".join(haystacks))
+
+
+def _plan_ledger_task_id_backfill(target_project: Path) -> list[dict[str, Any]]:
+    updates: list[dict[str, Any]] = []
+    target = str(target_project)
+    for record in goalflight_ledger.read_records():
+        if record.get("project_root") != target:
+            continue
+        if goalflight_dispatch_states.is_terminal_state(record.get("state")):
+            continue
+        if _existing_task_ids(record):
+            continue
+        derived = _derive_task_ids_from_record(record)
+        if not derived:
+            continue
+        updates.append({
+            "dispatch_id": record.get("dispatch_id"),
+            "task_ids": derived,
+            "message": "derived task_ids from dispatch metadata/prompt path",
+        })
+    return updates
+
+
+def _apply_ledger_task_id_backfill(updates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    applied: list[dict[str, Any]] = []
+    with goalflight_ledger.StateLock():
+        for update in updates:
+            dispatch_id = update.get("dispatch_id")
+            if not isinstance(dispatch_id, str):
+                continue
+            path = goalflight_ledger.record_path(dispatch_id)
+            try:
+                record = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if _existing_task_ids(record):
+                continue
+            task_ids = list(update["task_ids"])
+            record["task_ids"] = task_ids
+            if len(task_ids) == 1:
+                record["task_id"] = task_ids[0]
+            goalflight_ledger.write_record(record)
+            applied.append(update)
+    return applied
+
+
+def _create_project_state_backup(
+    target_project: Path,
+    rel_paths: list[str],
+    *,
+    reason: str,
+) -> dict[str, Any]:
+    backup_root = target_project / STATE_BACKUP_REL / _now_slug()
+    records: list[dict[str, Any]] = []
+    backup_root.mkdir(parents=True, exist_ok=True)
+    for rel in sorted(set(rel_paths)):
+        source = target_project / rel
+        entry: dict[str, Any] = {"path": rel, "exists": source.exists()}
+        if source.exists():
+            backup = backup_root / rel
+            backup.parent.mkdir(parents=True, exist_ok=True)
+            if source.is_dir() and not source.is_symlink():
+                shutil.copytree(source, backup, symlinks=True)
+            elif source.is_file() or source.is_symlink():
+                shutil.copy2(source, backup)
+            else:
+                entry["skipped"] = "not a regular file or directory"
+            if backup.exists():
+                entry["backup"] = _relative_to_project(target_project, backup)
+        records.append(entry)
+    manifest = {
+        "schema": "goalflight.project-state-backup.v1",
+        "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "reason": reason,
+        "entries": records,
+    }
+    _atomic_write(backup_root / "manifest.json", json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    return {
+        "path": _relative_to_project(target_project, backup_root),
+        "manifest": _relative_to_project(target_project, backup_root / "manifest.json"),
+        "entries": records,
+    }
+
+
 def scaffold_project_state(
     repo_root: Path,
     target_project: Path,
@@ -137,70 +341,129 @@ def scaffold_project_state(
         raise SetupError(f"state skeleton missing: {skeleton}")
     docs_private = target_project / "docs-private"
     if docs_private.exists() and not docs_private.is_dir():
-        raise SetupError(f"docs-private exists but is not a directory: {docs_private}")
+        raise SetupError(
+            f"refusing to scaffold project state because docs-private exists but "
+            f"is not a directory: {docs_private}. Move or rename that path, then "
+            "rerun `/goal-flight init`; init only creates a docs-private directory "
+            "and never overwrites operator files."
+        )
     if today is None:
         today = datetime.now(timezone.utc).date().isoformat()
 
-    created_dirs: list[str] = []
     would_create_dirs: list[str] = []
-    created_files: list[str] = []
     would_create_files: list[str] = []
     skipped_existing_files: list[str] = []
+    messages: list[str] = []
 
     dirs = [docs_private] + [docs_private / rel for rel in goalflight_doctor.CANONICAL_STATE_DIRS]
     for path in dirs:
-        rel = path.relative_to(target_project).as_posix() + "/"
+        rel = _relative_to_project(target_project, path) + "/"
         if path.is_dir():
             continue
-        if apply:
-            path.mkdir(parents=True, exist_ok=True)
-            created_dirs.append(rel)
-        else:
-            would_create_dirs.append(rel)
+        would_create_dirs.append(rel)
 
     for source in sorted(skeleton.rglob("*")):
         if not source.is_file():
             continue
         rel = source.relative_to(skeleton)
         dest = docs_private / rel
-        rel_out = dest.relative_to(target_project).as_posix()
+        rel_out = _relative_to_project(target_project, dest)
         if dest.exists():
             skipped_existing_files.append(rel_out)
+            messages.append(f"skip existing operator file: {rel_out} (create-if-absent never overwrites)")
             continue
-        if apply:
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source, dest)
-            created_files.append(rel_out)
-        else:
+        would_create_files.append(rel_out)
+
+    resume_notes = sorted(docs_private.glob("RESUME-NOTES-*.md")) if docs_private.is_dir() else []
+    if not resume_notes:
+        resume_dest = docs_private / f"RESUME-NOTES-{today}.md"
+        rel_out = _relative_to_project(target_project, resume_dest)
+        if resume_dest.exists():
+            skipped_existing_files.append(rel_out)
+            messages.append(f"skip existing resume note: {rel_out} (create-if-absent never overwrites)")
+        elif rel_out not in would_create_files:
             would_create_files.append(rel_out)
 
+    agents_plan = _ensure_agents_state_pin(repo_root, target_project)
+    if agents_plan["action"] == "skip":
+        messages.append(agents_plan["message"])
+
+    ledger_backfill_plan = _plan_ledger_task_id_backfill(target_project)
+    if ledger_backfill_plan:
+        messages.append(
+            f"will backfill task_ids on {len(ledger_backfill_plan)} in-flight ledger record(s) where derivable"
+        )
+
+    planned_changes = bool(
+        would_create_dirs
+        or would_create_files
+        or agents_plan["action"] in {"create", "update"}
+        or ledger_backfill_plan
+    )
+    backup = None
+    created_dirs: list[str] = []
+    created_files: list[str] = []
     touched_html: list[str] = []
+    agents_result = {
+        "path": agents_plan["path"],
+        "action": "would_" + agents_plan["action"] if agents_plan["action"] != "skip" else "skip",
+        "message": agents_plan["message"],
+    }
+    ledger_backfills: list[dict[str, Any]] = []
+
+    if apply and planned_changes:
+        backup_paths = ["AGENTS.md"]
+        if would_create_dirs or would_create_files:
+            backup_paths.extend(skipped_existing_files)
+        backup = _create_project_state_backup(
+            target_project,
+            backup_paths,
+            reason="project-state scaffold/migration before apply",
+        )
+
     if apply:
+        for rel in would_create_dirs:
+            path = target_project / rel.rstrip("/")
+            path.mkdir(parents=True, exist_ok=True)
+            created_dirs.append(rel)
+        for rel_out in would_create_files:
+            dest = target_project / rel_out
+            if dest.exists():
+                skipped_existing_files.append(rel_out)
+                messages.append(f"skip existing operator file: {rel_out} (create-if-absent never overwrites)")
+                continue
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            if dest.name.startswith("RESUME-NOTES-"):
+                resume_template = repo_root / "templates/resume-notes.md"
+                _atomic_write(dest, _template_text(resume_template, {"<DATE>": today}))
+            else:
+                source = skeleton / dest.relative_to(docs_private)
+                shutil.copy2(source, dest)
+            created_files.append(rel_out)
         created_file_set = set(created_files)
         for html_name in goalflight_doctor.HTML_FRESHNESS_SOURCES:
             html_path = docs_private / html_name
-            rel_out = html_path.relative_to(target_project).as_posix()
+            rel_out = _relative_to_project(target_project, html_path)
             if rel_out in created_file_set and html_path.exists():
                 html_path.touch()
                 touched_html.append(rel_out)
+        if agents_plan["action"] in {"create", "update"}:
+            _atomic_write(target_project / "AGENTS.md", agents_plan["content"])
+            agents_result["action"] = agents_plan["action"]
+        ledger_backfills = _apply_ledger_task_id_backfill(ledger_backfill_plan)
+    else:
+        messages.append("dry-run only: no files, directories, AGENTS.md, backups, or ledger records were changed")
 
-    resume_notes = sorted(docs_private.glob("RESUME-NOTES-*.md")) if docs_private.exists() else []
-    if not resume_notes:
-        resume_dest = docs_private / f"RESUME-NOTES-{today}.md"
-        rel_out = resume_dest.relative_to(target_project).as_posix()
-        if resume_dest.exists():
-            skipped_existing_files.append(rel_out)
-        elif apply:
-            resume_dest.parent.mkdir(parents=True, exist_ok=True)
-            resume_template = repo_root / "templates/resume-notes.md"
-            resume_dest.write_text(
-                _template_text(resume_template, {"<DATE>": today}),
-                encoding="utf-8",
-            )
-            created_files.append(rel_out)
-        else:
-            would_create_files.append(rel_out)
+    docs_private_gitignored = _git_check_ignored(target_project, "docs-private/")
+    if docs_private_gitignored is True:
+        messages.append("docs-private/ is gitignored here; scaffold leaves private state untracked")
+    elif docs_private_gitignored is False:
+        messages.append("docs-private/ is not gitignored here; scaffold preserves this repo's tracking policy")
+    else:
+        messages.append("docs-private/ gitignore status unknown; scaffold does not force-ignore or force-add it")
 
+    would_create_dirs_out = [] if apply else would_create_dirs
+    would_create_files_out = [] if apply else would_create_files
     skipped = sorted(set(skipped_existing_files))
     return {
         "schema": "goalflight.project-state-scaffold.v1",
@@ -208,15 +471,22 @@ def scaffold_project_state(
         "docs_private": str(docs_private),
         "skeleton": str(skeleton),
         "apply": apply,
-        "docs_private_gitignored": _git_check_ignored(target_project, "docs-private/"),
+        "docs_private_gitignored": docs_private_gitignored,
+        "backup": backup,
         "created_dirs": created_dirs,
-        "would_create_dirs": would_create_dirs,
+        "would_create_dirs": would_create_dirs_out,
         "created_files": created_files,
-        "would_create_files": would_create_files,
+        "would_create_files": would_create_files_out,
         "touched_created_html": touched_html,
         "skipped_existing_files": skipped,
+        "agents": agents_result,
+        "ledger_task_id_backfill": {
+            "would_update": ledger_backfill_plan if not apply else [],
+            "updated": ledger_backfills,
+        },
+        "messages": messages,
         "summary": (
-            f"created_files={len(created_files)} would_create_files={len(would_create_files)} "
+            f"created_files={len(created_files)} would_create_files={len(would_create_files_out)} "
             f"skipped_existing_files={len(skipped)}"
         ),
     }

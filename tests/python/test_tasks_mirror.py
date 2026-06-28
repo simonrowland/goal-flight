@@ -80,6 +80,11 @@ def _write_tasks(project_root: Path, items: list[dict]) -> None:
     )
 
 
+def _read_items(project_root: Path) -> list[dict]:
+    path = project_root / "docs-private" / "tasks.jsonl"
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
 def _load_goalflight_task_module():
     spec = importlib.util.spec_from_file_location("goalflight_task", TASK)
     assert_true("goalflight_task.py import spec", spec is not None and spec.loader is not None)
@@ -510,6 +515,216 @@ def test_goalflight_task_two_state_accept_and_review_breadcrumb() -> None:
         assert_true("accepted review recorded", item.get("accepted_review_dispatch_id") == "review-2")
 
 
+def test_goalflight_task_review_captures_confirmed_bug_item() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        project = Path(td)
+        _write_tasks(
+            project,
+            [
+                {
+                    "schema_version": 1,
+                    "id": "t-001",
+                    "kind": "task",
+                    "title": "Awaiting review",
+                    "blocked_by": [],
+                    "links": [],
+                    "done": True,
+                    "done_reviewed": False,
+                }
+            ],
+        )
+
+        proc = run_task(
+            project,
+            "review",
+            "t-001",
+            "--verdict",
+            "findings",
+            "--dispatch",
+            "review-1",
+            "--findings",
+            "docs-private/reviews/t-001.md",
+            "--bug",
+            "Confirmed review finding remains unfixed",
+            "--bug-pattern",
+            "bp-007",
+            "--bug-severity",
+            "high",
+            "--json",
+        )
+        assert_true(f"review bug capture exits 0: {proc.stderr}", proc.returncode == 0)
+        payload = json.loads(proc.stdout)
+        assert_true("review returns one captured bug", len(payload["bugs"]) == 1)
+
+        bug = json.loads(run_task(project, "show", payload["bugs"][0], "--json").stdout)
+        assert_true("review bug kind/source", bug["kind"] == "bug" and bug["source"] == "review")
+        assert_true("review bug pattern tag", bug["pattern"] == "bp-007" and "bp-007" in bug["tags"])
+        assert_true("review bug linked to reviewed item", bug["review_item_id"] == "t-001" and "t-001" in bug["links"])
+        assert_true("review bug linked to review breadcrumb", bug["review_dispatch_id"] == "review-1" and "review-1" in bug["review_breadcrumb_key"])
+        assert_true("review bug links findings file", "docs-private/reviews/t-001.md" in bug["links"])
+
+        proc = run_task(
+            project,
+            "review",
+            "t-001",
+            "--verdict",
+            "findings",
+            "--dispatch",
+            "review-1",
+            "--findings",
+            "docs-private/reviews/t-001.md",
+            "--bug",
+            "Confirmed review finding remains unfixed",
+            "--bug-pattern",
+            "bp-007",
+            "--json",
+        )
+        assert_true(f"review bug recapture exits 0: {proc.stderr}", proc.returncode == 0)
+        payload = json.loads(proc.stdout)
+        assert_true("review bug capture idempotent by review key", payload["bugs"] == [] and payload["skipped_bugs"] == 1)
+
+
+def test_goalflight_task_harvest_idempotent_with_source_links_and_history() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        project = Path(td)
+        docs = project / "docs-private"
+        _write_tasks(
+            project,
+            [
+                {
+                    "schema_version": 1,
+                    "id": "b-001",
+                    "kind": "bug",
+                    "title": "Known backlog bug already tracked",
+                    "blocked_by": [],
+                    "links": [],
+                    "done": False,
+                    "source": "sweep",
+                }
+            ],
+        )
+        goal_queue = docs / "goal-queue-demo.md"
+        goal_queue.write_text(
+            "\n".join(
+                [
+                    "# Goal Queue",
+                    "",
+                    "### t-099",
+                    "",
+                    "**Queue task needing task-store seed**",
+                    "",
+                    "- Status: to do",
+                    "",
+                    "### t-100",
+                    "",
+                    "**Already done queue task**",
+                    "",
+                    "- Status: done",
+                    "",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        queue_before = goal_queue.read_text(encoding="utf-8")
+        (docs / "bug-backlog.md").write_text(
+            "\n".join(
+                [
+                    "# Bug Backlog",
+                    "",
+                    "### bp-001",
+                    "",
+                    "**Known backlog bug already tracked**",
+                    "",
+                    "- Status: to do",
+                    "",
+                    "### bp-002",
+                    "",
+                    "**Harvested backlog bug**",
+                    "",
+                    "- Status: to do",
+                    "",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        review_dir = docs / "reviews"
+        review_dir.mkdir()
+        (review_dir / "backlog-review.md").write_text(
+            "1. **P1 - Review backlog finding not yet tracked.**\n",
+            encoding="utf-8",
+        )
+        (review_dir / "historical-cleanup-review.md").write_text(
+            "1. **P0 - Historical review finding should not be harvested from a non-backlog file.**\n",
+            encoding="utf-8",
+        )
+        (docs / "RESUME-NOTES-2026-06-01.md").write_text(
+            "\n".join(
+                [
+                    "# RESUME-NOTES 2026-06-01",
+                    "",
+                    "## TL;DR",
+                    "",
+                    "Earlier state to backfill.",
+                    "",
+                    "## NEXT ACTIONS",
+                    "",
+                    "1. Older action should only enter history, not draft items.",
+                    "",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (docs / "RESUME-NOTES-2026-06-02.md").write_text(
+            "\n".join(
+                [
+                    "# RESUME-NOTES 2026-06-02",
+                    "",
+                    "## TL;DR",
+                    "",
+                    "Current state for harvest.",
+                    "",
+                    "## NEXT ACTIONS",
+                    "",
+                    "1. Resume-only action to seed.",
+                    "",
+                    "## Decisions - DO NOT re-litigate",
+                    "",
+                    "- ADR-099: Keep this settled decision.",
+                    "",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        proc = run_task(project, "harvest", "--json")
+        assert_true(f"harvest exits 0: {proc.stderr}", proc.returncode == 0)
+        payload = json.loads(proc.stdout)
+        assert_true("harvest created draft items", len(payload["created"]) == 5)
+        assert_true("harvest backfilled both resume notes", payload["history_added"] == ["docs-private/RESUME-NOTES-2026-06-01.md", "docs-private/RESUME-NOTES-2026-06-02.md"])
+        assert_true("goal queue left as-is", goal_queue.read_text(encoding="utf-8") == queue_before)
+
+        items = _read_items(project)
+        harvested = [item for item in items if "harvest" in item.get("tags", [])]
+        titles = [item["title"] for item in harvested]
+        assert_true("known backlog bug deduped by title", titles.count("Known backlog bug already tracked") == 0)
+        assert_true("source link present on every harvested item", all(item.get("links") and item.get("source_ref") in item.get("links") for item in harvested))
+        assert_true("harvested items are draft tagged", all("draft" in item.get("tags", []) for item in harvested))
+        assert_true("review finding harvested as bug", any(item["kind"] == "bug" and item.get("severity") == "high" for item in harvested))
+        assert_true("ordinary historical review file ignored", "Historical review finding should not be harvested from a non-backlog file." not in titles)
+        assert_true("resume decision harvested as decision", any(item["kind"] == "decision" and item["title"].startswith("ADR-099") for item in harvested))
+
+        history_before = (docs / "history.md").read_text(encoding="utf-8")
+        proc = run_task(project, "harvest", "--json")
+        assert_true(f"second harvest exits 0: {proc.stderr}", proc.returncode == 0)
+        payload = json.loads(proc.stdout)
+        assert_true("harvest idempotent", payload["created"] == [] and payload["history_added"] == [])
+        assert_true("history write-once", (docs / "history.md").read_text(encoding="utf-8") == history_before)
+
+
 def test_goalflight_task_schema_version_tolerance_and_read_api() -> None:
     with tempfile.TemporaryDirectory() as td:
         project = Path(td)
@@ -772,13 +987,15 @@ def main() -> None:
     test_goalflight_task_sync_appends_plural_task_ids()
     test_goalflight_task_list_filters_outstanding_awaiting_review_since()
     test_goalflight_task_two_state_accept_and_review_breadcrumb()
+    test_goalflight_task_review_captures_confirmed_bug_item()
+    test_goalflight_task_harvest_idempotent_with_source_links_and_history()
     test_goalflight_task_schema_version_tolerance_and_read_api()
     test_goalflight_task_append_dispatch_breadcrumbs_preserves_history()
     test_goalflight_task_atomic_write_rejects_bad_content()
     test_goalflight_task_sync_repairs_stale_mirror()
     test_goalflight_task_data_js_escapes_script_end_and_html()
     test_goalflight_task_sync_generates_markdown_views()
-    print("OK: 18 tasks mirror/task-store tests pass")
+    print("OK: 20 tasks mirror/task-store tests pass")
 
 
 if __name__ == "__main__":

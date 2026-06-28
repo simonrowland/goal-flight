@@ -26,7 +26,7 @@ handoff/summary to survive.
   RESUME-NOTES and name no specific tasks, so they can't go stale
   (`templates/goalflight-loop-prompt.md`).
 - **`history.md`** — an *additive* write-once project log: one compact entry per
-  compaction/rotation (`## <date> · <HEAD>` + shipped/focus/next), never edited.
+   compaction/rotation (`## <date> · <HEAD>` + shipped/focus/next), never edited.
   One chronological file that's easy to review. Append-only — never read it back;
   under context pressure append a stub and expand later. (Complements RESUME-NOTES;
   does not replace it.)
@@ -107,11 +107,15 @@ Bug INSTANCES stay project-local; bug SHAPES are shared.
   scaffold dir is named off `docs-private` on purpose so the repo's ignore-
   everywhere rule (where present) stays intact.
 - Migrating existing projects is non-destructive and **branches on
-  `git check-ignore docs-private/`** (private repos like rpp-kb track it — fine):
-  dry-run the mapping, create canonical paths if absent (never clobber), move
-  ad-hoc files in (e.g. a stray `*-northstar.md` -> `NORTH-STAR.md`). Runtime
-  queue state (`dispatch/`, `*.lock`) is pinned by reference, NEVER relocated.
-  Per-repo mapping: operator-local plan.
+   `git check-ignore docs-private/`** (some private repos track it instead of ignoring — both are fine):
+   dry-run the mapping, create canonical paths if absent (never clobber), move
+   ad-hoc files in (e.g. a stray `*-northstar.md` -> `NORTH-STAR.md`). Runtime
+   queue state (`dispatch/`, `*.lock`) is pinned by reference, NEVER relocated.
+   Per-repo mapping: operator-local plan.
+- The migration helper writes a per-repo backup before apply, rewrites only
+   managed state-file pointers in `AGENTS.md` through temp+rename, and keeps
+   `history.md` additive/write-once. The retired handoff file is not state; the
+   living pin is always the newest `docs-private/RESUME-NOTES-*.md`.
 
 See also [progress-dashboard.md](progress-dashboard.md) (dashboard rendering) and
 [task-lifecycle.md](task-lifecycle.md) (machine-owned task status + id allocation).
