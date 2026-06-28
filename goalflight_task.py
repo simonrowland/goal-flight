@@ -50,6 +50,7 @@ CANNED_LIST_STATUSES = {
     "awaiting-review",
     "working",
     "delegated",
+    "decision",
     "waiting",
     "done-reviewed",
 }
@@ -64,6 +65,7 @@ STATUS_LABELS = {
     "pending": "to do",
     "working": "in progress",
     "awaiting-review": "awaiting review",
+    "decision": "decision",
     "waiting": "waiting",
     "done-reviewed": "done reviewed",
     "worker-failed": "worker failed",
@@ -392,6 +394,48 @@ def _validate_items_for_write(items: list[dict[str, Any]], source: str = "tasks.
             raise TaskError(f"{source}: line {lineno}: item {item_id} dispatches must be an array")
 
 
+def _fsync_dir(path: Path) -> None:
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _write_text_fsync(path: Path, text: str) -> None:
+    with path.open("w", encoding="utf-8") as fh:
+        fh.write(text)
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
+def _write_bytes_fsync(path: Path, data: bytes) -> None:
+    with path.open("wb") as fh:
+        fh.write(data)
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
+def _atomic_write_text(path: Path, text: str, *, prefix: str = ".tmp-") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=prefix, dir=str(path.parent))
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        tmp.replace(path)
+        _fsync_dir(path.parent)
+    except Exception:
+        with contextlib.suppress(FileNotFoundError):
+            tmp.unlink()
+        raise
+
+
 def _run_checker(directory: Path) -> None:
     node = shutil.which("node")
     if not node:
@@ -652,6 +696,8 @@ def _matches_canned_status(row: dict[str, Any], status: str | None) -> bool:
         return not _is_done_reviewed(row) and row.get("derived_status") == "awaiting-review"
     if status == "working":
         return not _is_done_reviewed(row) and row.get("derived_status") == "working"
+    if status == "decision":
+        return not _is_done_reviewed(row) and row.get("derived_status") == "decision"
     if status == "waiting":
         return not _is_done_reviewed(row) and row.get("derived_status") == "waiting"
     if status == "delegated":
@@ -701,6 +747,7 @@ class TaskStore:
         self.store_lock_path = self.docs_dir / "tasks.lock"
         self.seq_path = self.docs_dir / ".task-seq"
         self.seq_lock_path = self.docs_dir / ".task-seq.lock"
+        self.publish_marker_path = self.docs_dir / ".tasks-publish-incomplete.json"
         self.log_dir = self.docs_dir / "log"
 
     @contextlib.contextmanager
@@ -709,7 +756,9 @@ class TaskStore:
         with FileLock(self.store_lock_path):
             yield
 
-    def load_items(self) -> list[dict[str, Any]]:
+    def load_items(self, *, recover_publish: bool = True) -> list[dict[str, Any]]:
+        if recover_publish:
+            self._recover_interrupted_publish()
         items, _ = _parse_jsonl(self.tasks_path)
         return items
 
@@ -767,8 +816,9 @@ class TaskStore:
 
     def mutate_items(self, update: Callable[[list[dict[str, Any]]], Any], *, allow_invalid_live_mirror: bool = False) -> Any:
         with self.store_lock():
+            self._recover_interrupted_publish_locked()
             self._snapshot_last_good(require_valid=not allow_invalid_live_mirror)
-            items = self.load_items()
+            items = self.load_items(recover_publish=False)
             result = update(items)
             self.save_items_atomic(items)
             return result
@@ -778,10 +828,7 @@ class TaskStore:
         _validate_items_for_write(items)
         staging = Path(tempfile.mkdtemp(prefix=".tasks-stage-", dir=str(self.docs_dir)))
         try:
-            (staging / "tasks.jsonl").write_text(_items_jsonl(items), encoding="utf-8")
-            (staging / "tasks-data.js").write_text(_items_data_js(items), encoding="utf-8")
-            for name, content in self.generated_markdown(items).items():
-                (staging / name).write_text(content, encoding="utf-8")
+            self._write_staged_generation(staging, items)
             _run_checker(staging)
             targets = {
                 self.tasks_path: staging / "tasks.jsonl",
@@ -792,13 +839,18 @@ class TaskStore:
                 self.bugs_done_path: staging / "bugs-done.md",
             }
             old_bytes = {path: path.read_bytes() if require_regular_or_absent(path) else None for path in targets}
+            generation = hashlib.sha256((staging / "tasks.jsonl").read_bytes()).hexdigest()
+            self._write_publish_marker(generation)
             try:
                 for target, source in targets.items():
                     source.replace(target)
+                _fsync_dir(self.docs_dir)
             except OSError:
                 for target, data in old_bytes.items():
                     self._restore_bytes(target, data)
+                self._clear_publish_marker()
                 raise
+            self._clear_publish_marker()
         finally:
             shutil.rmtree(staging, ignore_errors=True)
 
@@ -807,10 +859,84 @@ class TaskStore:
         if data is None:
             with contextlib.suppress(FileNotFoundError):
                 path.unlink()
+            _fsync_dir(path.parent)
             return
         tmp = path.with_suffix(path.suffix + ".restore")
-        tmp.write_bytes(data)
+        _write_bytes_fsync(tmp, data)
         tmp.replace(path)
+        _fsync_dir(path.parent)
+
+    def _write_staged_generation(self, staging: Path, items: list[dict[str, Any]]) -> None:
+        _write_text_fsync(staging / "tasks.jsonl", _items_jsonl(items))
+        _write_text_fsync(staging / "tasks-data.js", _items_data_js(self._mirror_items_for_script(items)))
+        for name, content in self.generated_markdown(items).items():
+            _write_text_fsync(staging / name, content)
+        _fsync_dir(staging)
+
+    def _mirror_items_for_script(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        rows = self.derived_rows_for_items(items)
+        rows_by_id = {row["id"]: row for row in rows}
+        mirrored: list[dict[str, Any]] = []
+        for item in items:
+            out = dict(item)
+            derived = rows_by_id.get(item["id"], {}).get("derived_status")
+            if isinstance(derived, str) and derived:
+                out["derived_status"] = derived
+            mirrored.append(out)
+        return mirrored
+
+    def _write_publish_marker(self, generation: str) -> None:
+        marker = {
+            "schema": "goalflight.tasks.publish.v1",
+            "generation": generation,
+            "canonical": "tasks.jsonl",
+            "artifacts": [
+                "tasks.jsonl",
+                "tasks-data.js",
+                "task-decomposition.md",
+                "tasks-done.md",
+                "bug-backlog.md",
+                "bugs-done.md",
+            ],
+        }
+        _write_text_fsync(self.publish_marker_path, json.dumps(marker, ensure_ascii=False, sort_keys=True) + "\n")
+        _fsync_dir(self.docs_dir)
+
+    def _clear_publish_marker(self) -> None:
+        with contextlib.suppress(FileNotFoundError):
+            self.publish_marker_path.unlink()
+        _fsync_dir(self.docs_dir)
+
+    def _recover_interrupted_publish(self) -> None:
+        if not require_regular_or_absent(self.publish_marker_path):
+            return
+        with self.store_lock():
+            self._recover_interrupted_publish_locked()
+
+    def _recover_interrupted_publish_locked(self) -> None:
+        if not require_regular_or_absent(self.publish_marker_path):
+            return
+        if not require_regular_or_absent(self.tasks_path):
+            raise TaskError(f"{self.publish_marker_path}: interrupted task publish cannot recover because tasks.jsonl is missing")
+        items, _ = _parse_jsonl(self.tasks_path)
+        _validate_items_for_write(items)
+        staging = Path(tempfile.mkdtemp(prefix=".tasks-repair-", dir=str(self.docs_dir)))
+        try:
+            self._write_staged_generation(staging, items)
+            _run_checker(staging)
+            for target, source in {
+                self.tasks_path: staging / "tasks.jsonl",
+                self.data_js_path: staging / "tasks-data.js",
+                self.task_decomposition_path: staging / "task-decomposition.md",
+                self.tasks_done_path: staging / "tasks-done.md",
+                self.bug_backlog_path: staging / "bug-backlog.md",
+                self.bugs_done_path: staging / "bugs-done.md",
+            }.items():
+                source.replace(target)
+            _fsync_dir(self.docs_dir)
+            self._clear_publish_marker()
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
 
     def _snapshot_last_good(self, *, require_valid: bool = True) -> None:
         tasks_exists = require_regular_or_absent(self.tasks_path)
@@ -996,6 +1122,8 @@ class TaskStore:
         if candidates:
             latest = sorted(candidates, key=lambda row: row[0])[-1][1]
             return "awaiting-review" if latest == "worker-finished" else latest
+        if item.get("kind") == "decision":
+            return "decision"
         blockers = item.get("blocked_by")
         if isinstance(blockers, LIST_TYPE) and blockers:
             unresolved = any(not _is_done_reviewed(by_id.get(str(blocker), {})) for blocker in blockers)
@@ -1472,7 +1600,7 @@ def _append_resume_history(store: TaskStore, actor: str) -> list[str]:
             current = history.read_text(encoding="utf-8") if require_regular_or_absent(history) else existing
             missing = [line for line in additions if line.startswith("- Source: ") and line.removeprefix("- Source: ") not in current]
             if missing:
-                history.write_text(current.rstrip() + "\n" + "\n".join(additions).rstrip() + "\n", encoding="utf-8")
+                _atomic_write_text(history, current.rstrip() + "\n" + "\n".join(additions).rstrip() + "\n", prefix=".history-")
             else:
                 appended = []
     return appended

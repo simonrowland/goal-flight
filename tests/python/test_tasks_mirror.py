@@ -185,6 +185,41 @@ def test_drift_injected_status_key_fails() -> None:
     assert_true("status-key reports stray status", "stray `status` key" in proc.stderr)
 
 
+def test_drift_undefined_value_in_data_js_fails() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td)
+        item = {
+            "id": "t-001",
+            "kind": "task",
+            "title": "JSON-only item",
+            "blocked_by": [],
+            "links": [],
+            "done": False,
+        }
+        (d / "tasks.jsonl").write_text(json.dumps(item, separators=(",", ":")) + "\n", encoding="utf-8")
+        (d / "tasks-data.js").write_text(
+            "\n".join(
+                [
+                    "window.GF_ITEMS = [{",
+                    '  "id": "t-001",',
+                    '  "kind": "task",',
+                    '  "title": "JSON-only item",',
+                    '  "blocked_by": [],',
+                    '  "links": [],',
+                    '  "done": false,',
+                    "  \"extra\": undefined",
+                    "}];",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        proc = run_checker(d)
+    assert_true("undefined drift exits non-zero", proc.returncode != 0)
+    assert_true("undefined drift reports undefined", "undefined" in proc.stderr)
+
+
 def test_goalflight_task_new_allocator_concurrency() -> None:
     with tempfile.TemporaryDirectory() as td:
         project = Path(td)
@@ -314,6 +349,67 @@ def test_goalflight_task_status_uses_latest_dispatch_breadcrumb() -> None:
         assert_true(f"status exits 0: {proc.stderr}", proc.returncode == 0)
         payload = json.loads(proc.stdout)
         assert_true("newest breadcrumb wins", payload["items"][0]["derived_status"] == "working")
+
+
+def test_goalflight_task_sync_writes_mirror_only_derived_status() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        project = Path(td) / "project-a"
+        items = [
+            {
+                "schema_version": 1,
+                "id": "t-001",
+                "kind": "task",
+                "title": "Working task",
+                "blocked_by": [],
+                "links": [],
+                "done": False,
+                "dispatches": [{"dispatch_id": "dispatch-1", "state": "working", "ts": "2026-06-01T00:00:00+00:00"}],
+            },
+            {
+                "schema_version": 1,
+                "id": "t-002",
+                "kind": "task",
+                "title": "Finished worker task",
+                "blocked_by": [],
+                "links": [],
+                "done": False,
+                "dispatches": [{"dispatch_id": "dispatch-2", "state": "worker-finished", "ts": "2026-06-01T00:00:00+00:00"}],
+            },
+            {
+                "schema_version": 1,
+                "id": "t-003",
+                "kind": "task",
+                "title": "Done awaiting review",
+                "blocked_by": [],
+                "links": [],
+                "done": True,
+                "done_reviewed": False,
+            },
+            {
+                "schema_version": 1,
+                "id": "q-001",
+                "kind": "decision",
+                "title": "Open decision",
+                "blocked_by": [],
+                "links": [],
+                "done": False,
+            },
+        ]
+        _write_tasks(project, items)
+
+        proc = run_task(project, "sync", "--by", "watcher")
+        assert_true(f"sync exits 0: {proc.stderr}", proc.returncode == 0)
+        docs = project / "docs-private"
+        data_js = (docs / "tasks-data.js").read_text(encoding="utf-8")
+        payload = data_js.split("window.GF_ITEMS = ", 1)[1].split(";\nif", 1)[0]
+        data_items = {item["id"]: item for item in json.loads(payload)}
+        assert_true("working derived status in mirror", data_items["t-001"]["derived_status"] == "working")
+        assert_true("finished worker becomes awaiting review in mirror", data_items["t-002"]["derived_status"] == "awaiting-review")
+        assert_true("done unresolved remains awaiting review in mirror", data_items["t-003"]["derived_status"] == "awaiting-review")
+        assert_true("decision derived status in mirror", data_items["q-001"]["derived_status"] == "decision")
+        assert_true("derived status not persisted", all("derived_status" not in item for item in _read_items(project)))
+        proc = run_checker(docs)
+        assert_true("mirror with derived_status passes checker", proc.returncode == 0)
 
 
 def test_goalflight_task_sync_appends_plural_task_ids() -> None:
@@ -851,6 +947,83 @@ def test_goalflight_task_atomic_write_rejects_bad_content() -> None:
         assert_true("live pair still valid", proc.returncode == 0)
 
 
+def test_goalflight_task_interrupted_publish_marker_repairs_mirror() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        project = Path(td)
+        old_item = {
+            "schema_version": 1,
+            "id": "t-001",
+            "kind": "task",
+            "title": "Old mirror title",
+            "blocked_by": [],
+            "links": [],
+            "done": False,
+        }
+        _write_tasks(project, [old_item])
+        docs = project / "docs-private"
+        new_item = dict(old_item)
+        new_item["title"] = "New canonical title"
+        (docs / "tasks.jsonl").write_text(json.dumps(new_item, separators=(",", ":")) + "\n", encoding="utf-8")
+        (docs / ".tasks-publish-incomplete.json").write_text(
+            json.dumps({"schema": "goalflight.tasks.publish.v1", "canonical": "tasks.jsonl"}) + "\n",
+            encoding="utf-8",
+        )
+
+        proc = run_task(project, "status", "--json")
+        assert_true(f"status repairs interrupted publish: {proc.stderr}", proc.returncode == 0)
+        payload = json.loads(proc.stdout)
+        assert_true("status read canonical item", payload["items"][0]["title"] == "New canonical title")
+        assert_true("publish marker cleared", not (docs / ".tasks-publish-incomplete.json").exists())
+        assert_true("mirror repaired to canonical title", "New canonical title" in (docs / "tasks-data.js").read_text(encoding="utf-8"))
+        assert_true("markdown repaired to canonical title", "New canonical title" in (docs / "task-decomposition.md").read_text(encoding="utf-8"))
+        proc = run_checker(docs)
+        assert_true("repaired pair passes checker", proc.returncode == 0)
+
+
+def test_goalflight_task_resume_history_uses_atomic_writer() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        project = Path(td)
+        docs = project / "docs-private"
+        docs.mkdir(parents=True, exist_ok=True)
+        (docs / "RESUME-NOTES-2026-06-01.md").write_text(
+            "\n".join(
+                [
+                    "# RESUME-NOTES 2026-06-01",
+                    "",
+                    "## TL;DR",
+                    "",
+                    "Atomic history write candidate.",
+                    "",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        history = docs / "history.md"
+        history.write_text("existing history\n", encoding="utf-8")
+        module = _load_goalflight_task_module()
+        store = module.TaskStore(project)
+        before = history.read_text(encoding="utf-8")
+        original = module._atomic_write_text
+
+        def fail_atomic_write(path: Path, text: str, *, prefix: str = ".tmp-") -> None:
+            (path.parent / ".history-forced-partial").write_text("partial write should not replace history\n", encoding="utf-8")
+            raise OSError("forced atomic write failure")
+
+        module._atomic_write_text = fail_atomic_write
+        try:
+            try:
+                module._append_resume_history(store, "tester")
+            except OSError:
+                pass
+            else:
+                raise AssertionError("history write did not use atomic writer")
+        finally:
+            module._atomic_write_text = original
+
+        assert_true("history target unchanged after atomic failure", history.read_text(encoding="utf-8") == before)
+
+
 def _assert_non_regular_task_read_fails(project: Path, *args: str) -> None:
     proc = run_task_no_hang(project, *args)
     assert_true(f"{args} rejects non-regular file: stdout={proc.stdout} stderr={proc.stderr}", proc.returncode != 0)
@@ -1073,10 +1246,12 @@ def main() -> None:
     test_drift_changed_field_fails()
     test_drift_added_id_fails()
     test_drift_injected_status_key_fails()
+    test_drift_undefined_value_in_data_js_fails()
     test_goalflight_task_new_allocator_concurrency()
     test_goalflight_task_status_uses_breadcrumb_when_ledger_missing()
     test_goalflight_task_status_filters_ledger_by_project_root()
     test_goalflight_task_status_uses_latest_dispatch_breadcrumb()
+    test_goalflight_task_sync_writes_mirror_only_derived_status()
     test_goalflight_task_sync_appends_plural_task_ids()
     test_goalflight_task_list_filters_outstanding_awaiting_review_since()
     test_goalflight_task_two_state_accept_and_review_breadcrumb()
@@ -1085,11 +1260,13 @@ def main() -> None:
     test_goalflight_task_schema_version_tolerance_and_read_api()
     test_goalflight_task_append_dispatch_breadcrumbs_preserves_history()
     test_goalflight_task_atomic_write_rejects_bad_content()
+    test_goalflight_task_interrupted_publish_marker_repairs_mirror()
+    test_goalflight_task_resume_history_uses_atomic_writer()
     test_goalflight_task_rejects_non_regular_store_files_without_hanging()
     test_goalflight_task_sync_repairs_stale_mirror()
     test_goalflight_task_data_js_escapes_script_end_and_html()
     test_goalflight_task_sync_generates_markdown_views()
-    print("OK: 21 tasks mirror/task-store tests pass")
+    print("OK: 25 tasks mirror/task-store tests pass")
 
 
 if __name__ == "__main__":

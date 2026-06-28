@@ -30,6 +30,7 @@ const path = require("path");
 const vm = require("vm");
 
 const DEFAULT_DIR = path.join(__dirname, "..", "templates", "state-skeleton");
+const MIRROR_ONLY_FIELDS = new Set(["derived_status"]);
 
 function fail(msg) {
   console.error("FAIL: tasks mirror check");
@@ -54,6 +55,45 @@ function requireRegularFile(file) {
   }
 }
 
+function valuePath(base, key) {
+  return `${base}.${key}`;
+}
+
+function assertJsonValue(value, file, where) {
+  if (value === undefined) {
+    fail(`${file}: ${where} is undefined, which is not valid JSON.`);
+  }
+  if (typeof value === "number" && !Number.isFinite(value)) {
+    fail(`${file}: ${where} is ${String(value)}, which is not valid JSON.`);
+  }
+  if (typeof value === "function" || typeof value === "symbol" || typeof value === "bigint") {
+    fail(`${file}: ${where} has non-JSON type ${typeof value}.`);
+  }
+  if (Array.isArray(value)) {
+    for (let i = 0; i < value.length; i++) {
+      if (!Object.prototype.hasOwnProperty.call(value, i)) {
+        fail(`${file}: ${where}[${i}] is a sparse array hole, which is not valid JSON.`);
+      }
+      assertJsonValue(value[i], file, `${where}[${i}]`);
+    }
+    return;
+  }
+  if (value && typeof value === "object") {
+    if (Object.prototype.toString.call(value) !== "[object Object]") {
+      fail(`${file}: ${where} has non-JSON object type ${Object.prototype.toString.call(value)}.`);
+    }
+    for (const key of Object.keys(value)) {
+      assertJsonValue(value[key], file, valuePath(where, key));
+    }
+  }
+}
+
+function assertJsonItems(items, file) {
+  items.forEach((item, index) => {
+    assertJsonValue(item, file, `GF_ITEMS[${index}]`);
+  });
+}
+
 // Recursively sort object keys so JSON.stringify is order-independent.
 function canonical(value) {
   if (Array.isArray(value)) {
@@ -71,6 +111,16 @@ function canonical(value) {
 
 function canonicalStr(value) {
   return JSON.stringify(canonical(value));
+}
+
+function comparableItem(item) {
+  const out = {};
+  for (const key of Object.keys(item)) {
+    if (!MIRROR_ONLY_FIELDS.has(key)) {
+      out[key] = item[key];
+    }
+  }
+  return out;
 }
 
 function parseJsonl(text, file) {
@@ -149,6 +199,7 @@ function main() {
 
   const jsonlItems = parseJsonl(fs.readFileSync(jsonlPath, "utf8"), "tasks.jsonl");
   const dataItems = loadDataJs(fs.readFileSync(dataJsPath, "utf8"), "tasks-data.js");
+  assertJsonItems(dataItems, "tasks-data.js");
 
   // Check 5 first — a stray status key is a hard fail regardless of mirror state.
   assertNoStatus(jsonlItems, "tasks.jsonl");
@@ -169,17 +220,23 @@ function main() {
 
   // Check 4 — every item deep-equal field-for-field, with per-field diff.
   for (const id of [...jsonlById.keys()].sort()) {
-    const a = jsonlById.get(id);
-    const b = dataById.get(id);
+    const a = comparableItem(jsonlById.get(id));
+    const b = comparableItem(dataById.get(id));
     if (canonicalStr(a) === canonicalStr(b)) continue;
 
     const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
     const diffs = [];
     for (const key of [...keys].sort()) {
+      const hasA = Object.prototype.hasOwnProperty.call(a, key);
+      const hasB = Object.prototype.hasOwnProperty.call(b, key);
+      if (hasA !== hasB) {
+        diffs.push(`field "${key}": tasks.jsonl=${hasA ? canonicalStr(a[key]) : "<absent>"} vs tasks-data.js=${hasB ? canonicalStr(b[key]) : "<absent>"}`);
+        continue;
+      }
       const sa = canonicalStr(a[key]);
       const sb = canonicalStr(b[key]);
       if (sa !== sb) {
-        diffs.push(`field "${key}": tasks.jsonl=${sa === undefined ? "<absent>" : sa} vs tasks-data.js=${sb === undefined ? "<absent>" : sb}`);
+        diffs.push(`field "${key}": tasks.jsonl=${sa} vs tasks-data.js=${sb}`);
       }
     }
     fail(`item ${id} differs between the two files:\n  ` + diffs.join("\n  "));
