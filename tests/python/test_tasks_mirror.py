@@ -708,6 +708,16 @@ def test_goalflight_task_harvest_idempotent_with_source_links_and_history() -> N
                     "links": [],
                     "done": False,
                     "source": "sweep",
+                },
+                {
+                    "schema_version": 1,
+                    "id": "b-002",
+                    "kind": "bug",
+                    "title": "Compare A < B & C already tracked",
+                    "blocked_by": [],
+                    "links": [],
+                    "done": False,
+                    "source": "sweep",
                 }
             ],
         )
@@ -749,6 +759,18 @@ def test_goalflight_task_harvest_idempotent_with_source_links_and_history() -> N
                     "### bp-002",
                     "",
                     "**Harvested backlog bug**",
+                    "",
+                    "- Status: to do",
+                    "",
+                    "### bp-003",
+                    "",
+                    "**Compare A &lt; B &amp; C already tracked**",
+                    "",
+                    "- Status: to do",
+                    "",
+                    "### bp-004",
+                    "",
+                    "**Harvested special A < B & C**",
                     "",
                     "- Status: to do",
                     "",
@@ -811,7 +833,7 @@ def test_goalflight_task_harvest_idempotent_with_source_links_and_history() -> N
         proc = run_task(project, "harvest", "--json")
         assert_true(f"harvest exits 0: {proc.stderr}", proc.returncode == 0)
         payload = json.loads(proc.stdout)
-        assert_true("harvest created draft items", len(payload["created"]) == 4)
+        assert_true("harvest created draft items", len(payload["created"]) == 5)
         assert_true("harvest backfilled both resume notes", payload["history_added"] == ["docs-private/RESUME-NOTES-2026-06-01.md", "docs-private/RESUME-NOTES-2026-06-02.md"])
         assert_true("goal queue left as-is", goal_queue.read_text(encoding="utf-8") == queue_before)
 
@@ -821,6 +843,8 @@ def test_goalflight_task_harvest_idempotent_with_source_links_and_history() -> N
         assert_true("goal queue items not harvested", all(item.get("harvest_source") != "goal-queue" for item in harvested))
         assert_true("goal queue title ignored", "Queue task needing task-store seed" not in titles)
         assert_true("known backlog bug deduped by title", titles.count("Known backlog bug already tracked") == 0)
+        assert_true("html entity backlog title deduped by normalized title", all("Compare A" not in item["title"] for item in harvested))
+        assert_true("html-special backlog title harvested", "Harvested special A < B & C" in titles)
         assert_true("source link present on every harvested item", all(item.get("links") and item.get("source_ref") in item.get("links") for item in harvested))
         assert_true("harvested items are draft tagged", all("draft" in item.get("tags", []) for item in harvested))
         assert_true("review finding harvested as bug", any(item["kind"] == "bug" and item.get("severity") == "high" for item in harvested))
@@ -834,6 +858,39 @@ def test_goalflight_task_harvest_idempotent_with_source_links_and_history() -> N
         payload = json.loads(proc.stdout)
         assert_true("harvest idempotent", payload["created"] == [] and payload["history_added"] == [])
         assert_true("history write-once", (docs / "history.md").read_text(encoding="utf-8") == history_before)
+
+
+def test_goalflight_task_harvest_ignores_skeleton_placeholders() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        project = Path(td)
+        docs = project / "docs-private"
+        _write_tasks(project, [])
+        shutil.copy(FIXTURE / "bug-patterns.md", docs / "bug-patterns.md")
+        (docs / "bug-backlog.md").write_text(
+            "\n".join(
+                [
+                    "# Bug Backlog",
+                    "",
+                    "### bp-010",
+                    "",
+                    "**<one-line bug placeholder>**",
+                    "",
+                    "- Status: to do",
+                    "",
+                    "- Corpus: <SC-xx, or local-only>",
+                    "- Sweep status: <swept @ `<SHA>` | pending>",
+                    "",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        proc = run_task(project, "harvest", "--json")
+        assert_true(f"skeleton harvest exits 0: {proc.stderr}", proc.returncode == 0)
+        payload = json.loads(proc.stdout)
+        assert_true("skeleton placeholders create no items", payload["created"] == [])
+        assert_true("skeleton placeholders leave task store empty", _read_items(project) == [])
 
 
 def test_goalflight_task_schema_version_tolerance_and_read_api() -> None:
@@ -1257,6 +1314,7 @@ def main() -> None:
     test_goalflight_task_two_state_accept_and_review_breadcrumb()
     test_goalflight_task_review_captures_confirmed_bug_item()
     test_goalflight_task_harvest_idempotent_with_source_links_and_history()
+    test_goalflight_task_harvest_ignores_skeleton_placeholders()
     test_goalflight_task_schema_version_tolerance_and_read_api()
     test_goalflight_task_append_dispatch_breadcrumbs_preserves_history()
     test_goalflight_task_atomic_write_rejects_bad_content()
@@ -1266,7 +1324,7 @@ def main() -> None:
     test_goalflight_task_sync_repairs_stale_mirror()
     test_goalflight_task_data_js_escapes_script_end_and_html()
     test_goalflight_task_sync_generates_markdown_views()
-    print("OK: 25 tasks mirror/task-store tests pass")
+    print("OK: 26 tasks mirror/task-store tests pass")
 
 
 if __name__ == "__main__":
