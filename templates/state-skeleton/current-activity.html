@@ -171,8 +171,8 @@ footer{max-width:50rem;margin:0 auto;padding:1.5rem 1.25rem 2rem;color:var(--mut
     var txt = document.getElementById("modeText");
     var hint = document.getElementById("hint");
     el.classList.remove("live");
-    txt.textContent = (mode || "snapshot") + " · file://";
-    hint.textContent = "Static snapshot (file://). Window focus re-reads tasks-data.js.";
+    txt.textContent = (mode || "snapshot") + " · reloads page";
+    hint.textContent = "Static snapshot (file://). Window focus reloads page to read tasks-data.js.";
   }
 
   GF.attach({ onRender: render, onMode: setMode });

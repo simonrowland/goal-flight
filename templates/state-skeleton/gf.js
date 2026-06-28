@@ -5,8 +5,8 @@
  *
  * Responsibilities:
  *   - DATA LOADING: read the window.GF_ITEMS snapshot shipped by tasks-data.js.
- *   - REFRESH: manual Refresh button + re-render on visibilitychange/focus.
- *     No busy-loop, no flicker on a no-op re-render.
+ *   - REFRESH: manual Refresh button + page reload on visibilitychange/focus
+ *     so file:// views pick up a changed tasks-data.js.
  *   - RENDER: sectioned status board, kind/status/search filters, sort, counts.
  *   - AUTOLINK: \b[tbq]-\d+\b ids -> ticket.html?id=...
  *
@@ -29,6 +29,34 @@
     } catch (e) {
       return null;
     }
+  }
+
+  var CONTROL_CHARS_RE = /[\x00-\x1F\x7F]/;
+  var SCHEME_RE = /^[a-zA-Z][a-zA-Z0-9+.-]*:/;
+
+  function isRepoRelativeHref(value) {
+    return value.indexOf("//") !== 0 &&
+      value.charAt(0) !== "/" &&
+      value.indexOf("\\") < 0 &&
+      !SCHEME_RE.test(value) &&
+      !/(^|\/)\.\.(?:\/|$)/.test(value);
+  }
+
+  function safeHref(url) {
+    var raw = String(url == null ? "" : url);
+    if (CONTROL_CHARS_RE.test(raw)) return "#";
+    var value = raw.trim();
+    if (!value) return "#";
+    if (value.charAt(0) === "#") return esc(value);
+    try {
+      var base = "file:///";
+      if (global.location && global.location.href) base = global.location.href;
+      var parsed = new URL(value, base);
+      var protocol = String(parsed.protocol || "").toLowerCase();
+      if (protocol === "http:" || protocol === "https:" || protocol === "mailto:") return esc(value);
+      if (isRepoRelativeHref(value)) return esc(value);
+    } catch (e) {}
+    return "#";
   }
 
   /* --------------------------------------------------------------- model */
@@ -57,6 +85,19 @@
 
   var SEV_RANK = { critical: 4, high: 3, medium: 2, low: 1 };
 
+  function canonicalSection(status) {
+    var s = String(status == null ? "" : status).trim().toLowerCase();
+    if (!s) return null;
+    if (s === "done" || s === "closed") return "done-reviewed";
+    if (s === "worker-finished") return "awaiting-review";
+    if (s === "blocked") return "waiting";
+    if (s === "outstanding") return "pending";
+    if (s === "decision" || s === "pending" || s === "working" ||
+      s === "awaiting-review" || s === "worker-failed" || s === "waiting" ||
+      s === "done-reviewed") return s;
+    return null;
+  }
+
   // Normalize a raw item: fill defaults, never throw on a missing field.
   function normalize(raw) {
     var it = raw && typeof raw === "object" ? raw : {};
@@ -72,6 +113,7 @@
       kind: kind,
       title: typeof it.title === "string" ? it.title : "(untitled)",
       status: it.status || null, // may be derived below
+      derived_status: typeof it.derived_status === "string" ? it.derived_status : null,
       blocked_by: Array.isArray(it.blocked_by) ? it.blocked_by.filter(Boolean) : [],
       links: Array.isArray(it.links) ? it.links.filter(Boolean) : [],
       done: doneReviewed,
@@ -94,6 +136,8 @@
   // Section key for an item. Honours explicit lifecycle flags; otherwise derives
   // from status, blockers, and kind. Unknown blockers count as unresolved.
   function sectionKey(it, byId) {
+    var derived = canonicalSection(it.derived_status);
+    if (derived) return derived;
     if (it.done_reviewed) return "done-reviewed";
     var s = it.status;
     if (it.kind === "decision") return "decision";
@@ -462,8 +506,8 @@
 
   /* ----------------------------------------------------- refresh driver */
 
-  // Drive snapshot load + re-render. Manual Refresh forces a render; focus and
-  // visibility changes refresh the snapshot without changing the current view.
+  // Drive snapshot load + re-render. Manual Refresh and focus/visibility reload
+  // the page so file:// views read a fresh tasks-data.js from disk.
   // onRender gets the store after each changed load; onMode is called once.
   function attach(opts) {
     var onRender = opts.onRender || function () {};
@@ -483,17 +527,28 @@
       return Promise.resolve(res);
     }
 
-    // Re-render on focus/visibility — cheap, snapshot-backed reload.
+    function reloadPage() {
+      if (destroyed) return Promise.resolve(snapshot());
+      try {
+        if (global.location && typeof global.location.reload === "function") {
+          global.location.reload();
+          return Promise.resolve({ items: store.raw, mode: store.mode, sig: store.sig });
+        }
+      } catch (e) {}
+      return loadAndMaybeRender(true);
+    }
+
+    // Reload on focus/visibility so changed tasks-data.js is read from disk.
     function onVisible() {
       if (destroyed) return;
       if (global.document && global.document.visibilityState === "visible") {
-        loadAndMaybeRender(false);
+        reloadPage();
       }
     }
     // Named focus handler so destroy() can actually detach it.
     function onFocus() {
       if (destroyed) return;
-      loadAndMaybeRender(false);
+      reloadPage();
     }
 
     // Initial load determines the mode, then wires the refresh path.
@@ -525,7 +580,7 @@
       },
       // manual Refresh button handler (file:// + always available)
       refresh: function () {
-        return loadAndMaybeRender(true);
+        return reloadPage();
       },
       destroy: destroy
     };
@@ -553,6 +608,8 @@
     STATUS_LABELS: STATUS_LABELS,
     esc: esc,
     qs: qs,
+    safeHref: safeHref,
+    canonicalSection: canonicalSection,
     autolink: autolink,
     linkifyPaths: linkifyPaths,
     resolvePathMention: resolvePathMention,

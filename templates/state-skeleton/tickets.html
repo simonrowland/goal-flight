@@ -113,6 +113,7 @@ footer{max-width:52rem;margin:0 auto;padding:1.5rem 1.25rem 2rem;color:var(--mut
       <option value="pending">to do</option>
       <option value="working">in progress</option>
       <option value="awaiting-review">awaiting review</option>
+      <option value="worker-failed">worker failed</option>
       <option value="waiting">waiting</option>
       <option value="done-reviewed">done</option>
     </select>
@@ -124,7 +125,7 @@ footer{max-width:52rem;margin:0 auto;padding:1.5rem 1.25rem 2rem;color:var(--mut
     </select>
     <span class="spacer"></span>
     <span class="mode" id="mode" aria-live="polite"><span class="dot"></span><span id="modeText">loading…</span></span>
-    <button class="linkbtn" type="button" id="refresh" title="Reload data">Refresh</button>
+    <button class="linkbtn" type="button" id="refresh" title="Reload page to read tasks-data.js">Refresh</button>
   </div>
 
   <div id="board"></div>
@@ -185,7 +186,7 @@ footer{max-width:52rem;margin:0 auto;padding:1.5rem 1.25rem 2rem;color:var(--mut
     var el = document.getElementById("mode");
     var txt = document.getElementById("modeText");
     el.classList.remove("live");
-    txt.textContent = (mode || "snapshot") + " · file://";
+    txt.textContent = (mode || "snapshot") + " · reloads page";
   }
 
   var driver = GF.attach({
@@ -194,7 +195,7 @@ footer{max-width:52rem;margin:0 auto;padding:1.5rem 1.25rem 2rem;color:var(--mut
   });
   driver.ready.then(function(){
     document.getElementById("foot").textContent =
-      "goal-flight · " + GF.store.items.length + " items · " + GF.store.mode;
+      "goal-flight · " + GF.store.items.length + " items · " + GF.store.mode + " · refresh reloads page";
   });
 })();
 </script>

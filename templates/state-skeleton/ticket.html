@@ -74,19 +74,7 @@ footer{max-width:46rem;margin:0 auto;padding:1.5rem 1.25rem 2rem;color:var(--mut
 
   function row(dt, ddHtml){ return "<dt>"+GF.esc(dt)+"</dt><dd>"+ddHtml+"</dd>"; }
 
-  // Allowlist link schemes before emitting an href. links[]/prompt_path are
-  // harvested from worker-authored markdown, so a javascript:/data:/vbscript:
-  // value must never reach the href attribute (esc() entity-encodes but does
-  // NOT neutralize a URL scheme). http(s), mailto, relative paths and #anchors
-  // pass through; anything else is rejected to a dead '#'.
-  function safeHref(url){
-    var u = String(url == null ? "" : url).trim();
-    if(/^\s*(javascript|data|vbscript):/i.test(u)) return "#";
-    // A scheme is "word:" at the very start; allow only http/https/mailto.
-    var m = /^([a-zA-Z][a-zA-Z0-9+.-]*):/.exec(u);
-    if(m && !/^(https?|mailto)$/i.test(m[1])) return "#";
-    return GF.esc(u);
-  }
+  function safeHref(url){ return GF.safeHref(url); }
 
   function blockerList(ids){
     if(!ids || !ids.length) return "<span style='color:var(--muted)'>none</span>";
