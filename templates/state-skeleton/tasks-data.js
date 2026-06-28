@@ -7,6 +7,7 @@ window.GF_ITEMS = [
     "blocked_by": [],
     "links": [],
     "done": false,
+    "derived_status": "pending",
     "acceptance": "this stub is overwritten by a real task during init/decompose."
   },
   {
@@ -20,6 +21,7 @@ window.GF_ITEMS = [
       "NORTH-STAR.md"
     ],
     "done": true,
+    "derived_status": "done-reviewed",
     "acceptance": "shown in the Done section of the dashboard."
   }
 ];

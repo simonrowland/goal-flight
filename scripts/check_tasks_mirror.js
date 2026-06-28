@@ -20,6 +20,7 @@
 //   4. every item is deep-equal field-for-field (canonical: recursively sort
 //      object keys, JSON.stringify both, compare).
 //   5. NO item in EITHER file carries a `status` key (status is render-derived).
+//   6. every mirror item carries non-empty string `derived_status`.
 //
 // On mismatch: prints a clear diff and exits non-zero.
 
@@ -188,6 +189,17 @@ function assertNoStatus(items, file) {
   }
 }
 
+function assertMirrorDerivedStatus(items, file) {
+  items.forEach((item, index) => {
+    const label = typeof item.id === "string" && item.id !== "" ? item.id : `at index ${index}`;
+    // Full stale-value detection needs the canonical ledger; this gate catches
+    // missing/blank generated status fields that the browser would trust first.
+    if (typeof item.derived_status !== "string" || item.derived_status.trim() === "") {
+      fail(`${file}: item ${label} is missing non-empty string \`derived_status\`.`);
+    }
+  });
+}
+
 function main() {
   const dir = process.argv[2] ? path.resolve(process.argv[2]) : DEFAULT_DIR;
   const jsonlPath = path.join(dir, "tasks.jsonl");
@@ -204,6 +216,7 @@ function main() {
   // Check 5 first — a stray status key is a hard fail regardless of mirror state.
   assertNoStatus(jsonlItems, "tasks.jsonl");
   assertNoStatus(dataItems, "tasks-data.js");
+  assertMirrorDerivedStatus(dataItems, "tasks-data.js");
 
   const jsonlById = indexById(jsonlItems, "tasks.jsonl");
   const dataById = indexById(dataItems, "tasks-data.js");

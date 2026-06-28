@@ -188,7 +188,7 @@
       return global.GF_ROOT.replace(/\/+$/, "");
     }
     try {
-      // pathname like /Users/u/repo/docs-private/tickets.html (file://).
+      // pathname like /path/to/repo/docs-private/tickets.html (file://).
       var path = decodeURIComponent(global.location.pathname || "");
       var m = /^(.*)\/docs-private\/[^/]*$/.exec(path);
       return m ? m[1] : "";

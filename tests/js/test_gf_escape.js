@@ -2,12 +2,15 @@
 "use strict";
 
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
+const childProcess = require("child_process");
 const vm = require("vm");
 
 const ROOT = path.resolve(__dirname, "..", "..");
 const GF_JS = path.join(ROOT, "templates", "state-skeleton", "gf.js");
 const TICKET_HTML = path.join(ROOT, "templates", "state-skeleton", "ticket.html");
+const CHECKER = path.join(ROOT, "scripts", "check_tasks_mirror.js");
 
 function assert(name, condition) {
   if (!condition) {
@@ -62,7 +65,32 @@ function renderTicket(item) {
   return elements.detail.innerHTML;
 }
 
+function assertCheckerRejectsMissingDerivedStatus() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gf-mirror-"));
+  try {
+    const item = {
+      schema_version: 1,
+      id: "t-missing-derived",
+      kind: "task",
+      title: "Delegated",
+      blocked_by: [],
+      links: [],
+      done: false,
+      dispatches: [{ dispatch_id: "d1", state: "working", ts: "2026-06-01T00:00:00+00:00" }]
+    };
+    fs.writeFileSync(path.join(dir, "tasks.jsonl"), JSON.stringify(item) + "\n");
+    fs.writeFileSync(path.join(dir, "tasks-data.js"), "window.GF_ITEMS = " + JSON.stringify([item], null, 2) + ";\n");
+    const result = childProcess.spawnSync(process.execPath, [CHECKER, dir], { encoding: "utf8" });
+    const output = String(result.stdout || "") + String(result.stderr || "");
+    assert("checker rejects mirror item missing derived_status", result.status !== 0);
+    assert("checker reports missing derived_status", output.includes("derived_status"));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 const GF = loadGF();
+assertCheckerRejectsMissingDerivedStatus();
 const payload = "</script><img src=x onerror=alert(1)> t-001 docs-private/proof.md";
 const linked = GF.autolink(payload);
 
