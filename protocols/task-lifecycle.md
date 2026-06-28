@@ -11,9 +11,9 @@ store plus the dispatch ledger, with ids assigned without grepping files.
 
 ## Canonical store
 
-`docs-private/tasks.jsonl` is the machine-canonical **work-item** store
-(append-only, house style — mirrors the dispatch ledger). **One store, not two:
-a bug is an item with `kind: bug`.** Record:
+`docs-private/tasks.jsonl` is the machine-canonical **work-item** snapshot store:
+atomic whole-file rewrite, with append-only per-item `audit[]` and `dispatches[]`
+arrays. **One store, not two: a bug is an item with `kind: bug`.** Record:
 `{ id, kind, title, blocked_by, links, done, tags, created_at, created_by, closed_at?, closed_by?, resolution?, audit?, prompt?, prompt_path?, acceptance?, pattern?, severity?, source?, dispatches? }`
 — `kind: task | bug | decision`; `acceptance` for tasks; `pattern`/`severity`/
 `source` (`review|controller|sweep`) for bugs. Decision items (`q-NNN` open
@@ -43,9 +43,9 @@ DECISION #5 for v1.1.
 Under parallel worktrees (`execute --parallel`, `.claude/worktrees/`) the store is
 NOT a per-worktree file. `docs-private/tasks.jsonl` is gitignored — and gitignored
 files are per-working-directory, so a relative path gives each worktree its OWN
-diverging copy, and git does NOT merge them (concurrent appends conflict;
-`merge=union` is fragile and needs commits). Instead, exactly like the dispatch
-ledger: ONE canonical file at the **project-root** `docs-private/` (durable,
+diverging copy, and git does NOT merge them (concurrent snapshot rewrites
+conflict; `merge=union` is fragile and needs commits). Instead, exactly like the
+dispatch ledger: ONE canonical file at the **project-root** `docs-private/` (durable,
 human-visible), and `goalflight_task.py` resolves THAT absolute path (from
 `project_root`, not `cwd`) and `flock`s it for every write. All worktrees + workers
 mutate the one shared store through the helper, serialized. This is the load-bearing
@@ -58,24 +58,25 @@ bridge and the controller-host watcher writes (single-writer invariant).
 
 A counter, not a file scan. `docs-private/.task-seq` holds the last integer;
 `goalflight_task.py new "<title>"` takes the StateLock, increments, returns
-`t-NNN`, appends the record. Mirrors `_reserve_auto_dispatch_id`
+`t-NNN`, adds the record, and writes the updated snapshot. Mirrors `_reserve_auto_dispatch_id`
 (`goalflight_dispatch.py:1253`). Give `.task-seq` its OWN co-located flock — the
 StateLock guards the ledger, not this counter — and keep a single-allocator
 invariant (the controller host mints ids) for fleet safety.
 
 ## Status is DERIVED from the dispatch ledger (the auto-flag)
 
-No hand-set status. Add a `task_id` to the dispatch record (`goalflight_ledger.py
-cmd_record` / `goalflight_dispatch.py _record_ledger`, via a new `--task t-NNN`
-flag — neither carries task_id today). Status = join task → its ledger records by
-**`(project_root, task_id)`** (filter the ledger to the current `project_root` —
-it is on every record — before joining), mapping the dispatch lifecycle + markers:
+No hand-set status. Dispatch records carry plural `task_ids`
+(`goalflight_ledger.py cmd_record` / `goalflight_dispatch.py _record_ledger`,
+via `--task t-NNN`; legacy singular `task_id` is read-compatible). Status = join
+task -> ledger records whose `task_ids` include the item id, scoped by
+**`project_root`** (filter the ledger to the current `project_root` — it is on
+every record — before joining), mapping the dispatch lifecycle + markers:
 
 | Derived status | Condition |
 |---|---|
 | `pending` | in registry, no dispatch, not blocked |
 | `waiting` | has unresolved `blocked_by` (question, task, bug, or decision id) |
-| `working` | a live, non-terminal dispatch carries this `task_id` |
+| `working` | a live, non-terminal dispatch includes this id in `task_ids` |
 | `awaiting-review` | **DONE**: latest dispatch terminal (`RESULT`/`COMPLETE`) or `goalflight_task.py done <id>`; review/accept still pending |
 | `worker-failed` | dispatch dead PID / no terminal marker / `BLOCKED` / error — needs attention |
 | `done-reviewed` | **DONE-REVIEWED**: `goalflight_task.py accept <id>` after a logged clean review |
@@ -155,8 +156,8 @@ rows = goalflight_task.list("awaiting-review", kind="task")
 todo = goalflight_task.outstanding()
 ```
 
-Dispatch integration: `--task t-NNN` records `task_id` in the ledger AND resolves
-the chunk's prompt through the existing `_resolve_prompt_file`
+Dispatch integration: `--task t-NNN` records plural `task_ids` in the ledger AND
+resolves the chunk's prompt through the existing `_resolve_prompt_file`
 (`goalflight_dispatch.py:557`) — which already accepts an inline `--prompt` or a
 `--prompt-file <path>`, so `prompt` / `prompt_path` map straight onto it. The
 watcher's terminal-marker handling (`protocols/worker-markers.md`) then yields
@@ -164,18 +165,20 @@ worker-finished.
 
 ## Mutation surface + audit (the helper is the only writer)
 
-Agents NEVER hand-edit `tasks.jsonl` — every create / update / close goes through
-`goalflight_task.py`. That buys three things:
+Agents NEVER hand-edit `tasks.jsonl` — every create, update, completion, and
+review transition goes through `goalflight_task.py`. That buys three things:
 
 1. **Audit** — each mutation appends an `audit:[]` entry `{ at, actor, action }`
    (`at` = timestamp, the mandatory floor; richer detail — `resolution`, a dispatch
-   ref, the fields changed — layers on top) and sets `closed_by`/`closed_at`. The
-   actor is auto-detected: a dispatched worker via `GOALFLIGHT_DISPATCH_ID` →
-   `worker:<dispatch_id>`; the orchestrator → `controller`; `--by user` for a human.
+   ref, the fields changed — layers on top); completion paths set
+   `closed_by`/`closed_at`. The actor is auto-detected: a dispatched worker via
+   `GOALFLIGHT_DISPATCH_ID` -> `worker:<dispatch_id>`; the orchestrator ->
+   `controller`; `--by user` for a human.
    So every change carries a dated, attributed trail — "who closed this bug, when."
-2. **Invariants** — validates the transition (no double-close; closing with an open
-   `blocked_by` needs `--force`) and forces required fields (`close` needs
-   `--resolution fixed|wontfix|duplicate|cannot-repro`).
+2. **Invariants** — validates the transition (`done` refuses open `blocked_by`
+   unless `--force`; `accept` requires the latest review breadcrumb to be clean).
+   `done <id> [--resolution R]` accepts a free resolution string, defaulting to
+   `done`; v1.1 has no `close` verb or fixed resolution enum.
 3. **No drift** — every write re-emits `tasks-data.js` from the canonical record,
    so the browser mirror can't fall out of sync (the mirror test becomes a backstop
    for a rare hand-edit, not the primary guard).

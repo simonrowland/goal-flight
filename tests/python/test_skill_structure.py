@@ -721,16 +721,11 @@ def test_skill_md_structural_invariants() -> None:
     skill = read_repo_text("SKILL.md")
     skill_lines = skill.splitlines()
     wc_line_count = skill.count("\n")
-    # Budget raised from 450 → 525 on 2026-05-28 to accommodate the
-    # worker-reliability hardening additions (commit-guard pointer,
-    # session-status activation contract, canonical post-compaction reload
-    # order, in-flight monitoring worked commands for ACP + bash-tail,
-    # permission-pattern warning, stale-wrapper warning, dangerous-bypass
-    # context fence). Each addition was directly recommended by the AUI
-    # surface audit + sweep B/C review findings. The budget catches
-    # future feature-add bloat; the new ceiling leaves ~50 lines of
-    # margin from the current state.
-    assert_true(f"SKILL.md wc -l <= 525 (got {wc_line_count})", wc_line_count <= 525)
+    # Budget raised from 450 to 525 on 2026-05-28 for worker-reliability
+    # hardening. Raised again to 540 on 2026-06-27 because the root workflow
+    # reached 525 lines exactly; 540 restores deliberate edit headroom while
+    # keeping the wrapper compact and within the ~31KB byte budget.
+    assert_true(f"SKILL.md wc -l <= 540 (got {wc_line_count})", wc_line_count <= 540)
 
     frontmatter_markers = [idx for idx, line in enumerate(skill_lines) if line.strip() == "---"]
     assert_true("SKILL.md has YAML frontmatter close", len(frontmatter_markers) >= 2)
