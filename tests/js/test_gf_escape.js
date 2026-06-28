@@ -107,4 +107,30 @@ assert("accepted item is done-reviewed", GF.store.byId["t-accepted"]._section ==
 assert("awaiting review blocker still blocks", GF.store.byId["t-blocked"]._section === "waiting");
 assert("done-reviewed blocker resolves", GF.store.byId["t-unblocked"]._section === "pending");
 
+GF.index([
+  {
+    schema_version: 1,
+    id: "q-001",
+    kind: "decision",
+    title: "</script><img src=x onerror=alert(1)> choose path",
+    blocked_by: [],
+    links: [],
+    done: false
+  },
+  {
+    schema_version: 1,
+    id: "t-001",
+    kind: "task",
+    title: "Blocked task",
+    blocked_by: ["q-001"],
+    links: [],
+    done: false
+  }
+]);
+const decisions = GF.renderDecisionList();
+assert("renderDecisionList escapes script terminator", !/<\/script/i.test(decisions));
+assert("renderDecisionList escapes raw img tag", !/<img/i.test(decisions));
+assert("renderDecisionList includes escaped hostile title", decisions.includes("&lt;/script&gt;&lt;img"));
+assert("renderDecisionList links blocked task", decisions.includes('href="ticket.html?id=t-001"'));
+
 console.log("OK: gf.js escaping/autolink test pass");

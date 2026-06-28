@@ -46,6 +46,11 @@ dd ul{margin:0;padding-left:1.1rem}
 pre{background:var(--chip);border:1px solid var(--border);border-radius:.5rem;padding:.8rem;overflow:auto;
   font:.85rem ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;margin:.3rem 0 0}
 .section-title{font-size:.82rem;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin:1.6rem 0 .5rem}
+.dispatches{list-style:none;margin:.2rem 0 0;padding:0;display:flex;flex-direction:column;gap:.45rem}
+.dispatches li{background:var(--card);border:1px solid var(--border);border-radius:.55rem;padding:.65rem .75rem;box-shadow:var(--shadow)}
+.dispatch-meta{display:flex;flex-wrap:wrap;gap:.25rem .8rem;font:.78rem ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--fg)}
+.dispatch-meta strong{color:var(--muted);font-weight:600}
+.dispatch-log{display:inline-block;margin-top:.3rem;word-break:break-all}
 .notfound{background:var(--card);border:1px solid var(--warn);border-radius:.7rem;padding:1.2rem;color:var(--warn)}
 .idlink{font:inherit ui-monospace,SFMono-Regular,Menlo,monospace}
 footer{max-width:46rem;margin:0 auto;padding:1.5rem 1.25rem 2rem;color:var(--muted);font-size:.78rem}
@@ -110,6 +115,33 @@ footer{max-width:46rem;margin:0 auto;padding:1.5rem 1.25rem 2rem;color:var(--mut
     }).join("")+"</ul>";
   }
 
+  function dispatchHistory(dispatches){
+    if(!dispatches || !dispatches.length) return "";
+    var rows = dispatches.map(function(raw){
+      var d = raw && typeof raw === "object" ? raw : {};
+      var dispatchId = d.dispatch_id || d.id || "";
+      var agent = d.agent || "";
+      var state = d.state || d.status || "";
+      var started = d.started_at || d.started || "";
+      var ended = d.ended_at || d.ended || "";
+      var log = d.log || d.path || d.log_path || "";
+      var meta = [
+        ["dispatch_id", dispatchId],
+        ["agent", agent],
+        ["state", state],
+        ["started", started],
+        ["ended", ended]
+      ].map(function(pair){
+        return "<span><strong>"+GF.esc(pair[0])+":</strong> "+GF.esc(pair[1] || "-")+"</span>";
+      }).join("");
+      var logHtml = log
+        ? '<a class="dispatch-log" href="'+safeHref(log)+'">'+GF.esc(log)+'</a>'
+        : '<span class="dispatch-log" style="color:var(--muted)">no log</span>';
+      return "<li><div class=\"dispatch-meta\">"+meta+"</div>"+logHtml+"</li>";
+    }).join("");
+    return rows ? '<p class="section-title">Dispatch history</p><ul class="dispatches">'+rows+"</ul>" : "";
+  }
+
   function render(){
     var it = wantId ? GF.store.byId[wantId] : null;
     if(!it){
@@ -150,10 +182,11 @@ footer{max-width:46rem;margin:0 auto;padding:1.5rem 1.25rem 2rem;color:var(--mut
     } else if(it.prompt_path){
       html += '<p class="section-title">Prompt</p><p><a href="'+safeHref(it.prompt_path)+'">'+GF.esc(it.prompt_path)+"</a></p>";
     }
+    html += dispatchHistory(it.dispatches);
     mount.innerHTML = html;
   }
 
-  GF.attach({ onRender: render, interval: 3000 });
+  GF.attach({ onRender: render });
 })();
 </script>
 </body>

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>goal-flight · live activity</title>
+<title>goal-flight · current activity</title>
 <style>
 :root{--bg:#fff;--fg:#1a1d21;--muted:#6b7280;--accent:#2563eb;--border:#e5e7eb;--warn:#b45309;
   --card:#fff;--chip:#f3f4f6;--chip-fg:#374151;--ok:#15803d;--review:#a855f7;--shadow:0 1px 2px rgba(0,0,0,.04),0 1px 3px rgba(0,0,0,.06)}
@@ -22,8 +22,6 @@ h1{font-size:1.4rem;margin:.2em 0 .1em;letter-spacing:-.01em}
 .crumbs a{color:var(--muted)}
 .mode{font:.72rem ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted);white-space:nowrap}
 .dot{display:inline-block;width:.5rem;height:.5rem;border-radius:50%;background:var(--muted);margin-right:.35rem;vertical-align:middle}
-.mode.live .dot{background:var(--ok);animation:pulse 2s infinite}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
 .cols{display:grid;grid-template-columns:1fr;gap:1.4rem;margin-top:1.2rem}
 @media(min-width:720px){.cols{grid-template-columns:1fr 1fr}}
 .lane h2{font-size:.82rem;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);
@@ -72,7 +70,7 @@ footer{max-width:50rem;margin:0 auto;padding:1.5rem 1.25rem 2rem;color:var(--mut
 <main>
   <div class="top">
     <div>
-      <h1>Live activity</h1>
+      <h1>Current activity</h1>
       <nav class="crumbs" aria-label="Breadcrumb"><a href="index.html">← dashboard</a> · <a href="tickets.html">board</a></nav>
     </div>
     <span class="mode" id="mode" aria-live="polite"><span class="dot"></span><span id="modeText">loading…</span></span>
@@ -102,7 +100,7 @@ footer{max-width:50rem;margin:0 auto;padding:1.5rem 1.25rem 2rem;color:var(--mut
   <!-- Single dedicated live region for concise activity announcements. -->
   <p class="visually-hidden" id="activityStatus" role="status" aria-live="polite"></p>
 </main>
-<footer>goal-flight · activity monitor · assumes served + polling</footer>
+<footer>goal-flight · activity snapshot</footer>
 
 <script src="tasks-data.js"></script>
 <script src="gf.js"></script>
@@ -172,16 +170,12 @@ footer{max-width:50rem;margin:0 auto;padding:1.5rem 1.25rem 2rem;color:var(--mut
     var el = document.getElementById("mode");
     var txt = document.getElementById("modeText");
     var hint = document.getElementById("hint");
-    if(mode === "served"){
-      el.classList.add("live"); txt.textContent = "live · polling every 3s";
-      hint.textContent = "Auto-updating from tasks.jsonl. New activity flashes as it lands.";
-    } else {
-      el.classList.remove("live"); txt.textContent = "snapshot · file://";
-      hint.textContent = "Static snapshot (file://). For true live updates, serve docs-private/ (python3 -m http.server) and reopen over http://. Window focus re-reads the snapshot.";
-    }
+    el.classList.remove("live");
+    txt.textContent = (mode || "snapshot") + " · file://";
+    hint.textContent = "Static snapshot (file://). Window focus re-reads tasks-data.js.";
   }
 
-  GF.attach({ onRender: render, onMode: setMode, interval: 3000 });
+  GF.attach({ onRender: render, onMode: setMode });
 })();
 </script>
 </body>

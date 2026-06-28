@@ -43,8 +43,6 @@ input:focus-visible,select:focus-visible,button:focus-visible,a:focus-visible{ou
 .spacer{flex:1 1 auto}
 .mode{font:.72rem ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted);white-space:nowrap}
 .dot{display:inline-block;width:.5rem;height:.5rem;border-radius:50%;background:var(--muted);margin-right:.35rem;vertical-align:middle}
-.mode.live .dot{background:var(--ok);animation:pulse 2s infinite}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
 .linkbtn{font:inherit;background:transparent;border:1px solid var(--border);color:var(--fg);
   border-radius:.5rem;padding:.4rem .7rem;cursor:pointer}
 .linkbtn:hover{border-color:var(--accent);color:var(--accent)}
@@ -96,7 +94,7 @@ footer{max-width:52rem;margin:0 auto;padding:1.5rem 1.25rem 2rem;color:var(--mut
   <div class="top">
     <div>
       <h1>Work board</h1>
-      <nav class="crumbs" aria-label="Breadcrumb"><a href="index.html">← dashboard</a> · <a href="current-activity.html">live activity</a> · <a href="questions-for-user.html">decisions</a></nav>
+      <nav class="crumbs" aria-label="Breadcrumb"><a href="index.html">← dashboard</a> · <a href="current-activity.html">current activity</a> · <a href="questions-for-user.html">decisions</a></nav>
     </div>
   </div>
 
@@ -186,14 +184,13 @@ footer{max-width:52rem;margin:0 auto;padding:1.5rem 1.25rem 2rem;color:var(--mut
   function setMode(mode){
     var el = document.getElementById("mode");
     var txt = document.getElementById("modeText");
-    if(mode === "served"){ el.classList.add("live"); txt.textContent = "live · polling"; }
-    else { el.classList.remove("live"); txt.textContent = "snapshot · file://"; }
+    el.classList.remove("live");
+    txt.textContent = (mode || "snapshot") + " · file://";
   }
 
   var driver = GF.attach({
     onRender: render,
-    onMode: setMode,
-    interval: 3000
+    onMode: setMode
   });
   driver.ready.then(function(){
     document.getElementById("foot").textContent =

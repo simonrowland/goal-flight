@@ -5,45 +5,50 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>goal-flight decisions</title>
 <style>
-:root{--bg:#fff;--fg:#1a1d21;--muted:#6b7280;--accent:#2563eb;--border:#e5e7eb;--warn:#b45309}
-@media (prefers-color-scheme:dark){:root{--bg:#0f1115;--fg:#e6e8eb;--muted:#9aa0a6;--accent:#6ea8fe;--border:#262a31;--warn:#f59e0b}}
+:root{--bg:#fff;--fg:#1a1d21;--muted:#6b7280;--accent:#2563eb;--border:#e5e7eb;--warn:#b45309;--card:#fff;--chip:#f3f4f6;--shadow:0 1px 2px rgba(0,0,0,.04),0 1px 3px rgba(0,0,0,.06)}
+@media (prefers-color-scheme:dark){:root{--bg:#0f1115;--fg:#e6e8eb;--muted:#9aa0a6;--accent:#6ea8fe;--border:#262a31;--warn:#f59e0b;--card:#161922;--chip:#222732;--shadow:0 1px 2px rgba(0,0,0,.3)}}
 *{box-sizing:border-box}
 html{font:16px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
 body{margin:0;background:var(--bg);color:var(--fg)}
 main{max-width:46rem;margin:0 auto;padding:1.5rem 1.25rem 2rem}
 h1{font-size:1.4rem;margin:.2em 0 .2em}
-h2{font-size:1.05rem;margin:1.6em 0 .4em;border-bottom:1px solid var(--border);padding-bottom:.25em}
-h2.warn{color:var(--warn);border-color:var(--warn)}
-h3{font-size:.95rem;margin:1.1em 0 .2em}
-h3 .qid{font:.82rem ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted)}
+h2{font-size:.95rem;margin:0 0 .35rem}
 a{color:var(--accent);text-decoration:none}
 a:hover{text-decoration:underline}
+a:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:.3rem}
 p{margin:.3em 0}
-.meta,.muted{color:var(--muted);font-size:.85rem}
-section{padding:.2em 0 .6em;border-bottom:1px solid var(--border)}
-.decided section{opacity:.65}
+.crumbs,.meta,.muted{color:var(--muted);font-size:.85rem}
+.crumbs a{color:var(--muted)}
+.section-title{font-size:.82rem;text-transform:uppercase;letter-spacing:.06em;color:var(--warn);margin:1.6rem 0 .6rem;border-bottom:1px solid var(--border);padding-bottom:.25rem}
+.decision-list{display:flex;flex-direction:column;gap:.6rem}
+.decision-item{background:var(--card);border:1px solid var(--border);border-left:3px solid var(--warn);border-radius:.6rem;padding:.75rem .85rem;box-shadow:var(--shadow)}
+.qid{font:.82rem ui-monospace,SFMono-Regular,Menlo,monospace}
+.decision-title{font-weight:600}
+.empty{color:var(--muted);padding:1rem 0}
 footer{max-width:46rem;margin:0 auto;padding:.5rem 1.25rem 2rem;color:var(--muted);font-size:.78rem}
 </style>
 </head>
 <body>
 <main>
-<h1>Decisions needed</h1>
-<p class="muted"><a href="index.html">dashboard</a></p>
+  <h1>Decisions needed</h1>
+  <nav class="crumbs" aria-label="Breadcrumb"><a href="index.html">dashboard</a> · <a href="tickets.html">board</a></nav>
 
-<h2 class="warn">Open</h2>
-<section id="q-000">
-  <h3><span class="qid">q-000</span> - no open decisions yet</h3>
-  <p>Add open questions in <code>questions-for-user.md</code>; keep each question linked to blocked task ids.</p>
-</section>
-
-<h2>Decided</h2>
-<div class="decided">
-<section id="adr-000">
-  <h3><span class="qid">ADR-000</span> - no ADRs yet</h3>
-  <p>When a question is answered, convert it to an ADR heading in <code>questions-for-user.md</code>.</p>
-</section>
-</div>
+  <h2 class="section-title">Open</h2>
+  <div id="decisions">Loading...</div>
 </main>
-<footer>generated from questions-for-user.md</footer>
+<footer>client-side view from tasks-data.js; source: questions-for-user.md</footer>
+
+<script src="tasks-data.js"></script>
+<script src="gf.js"></script>
+<script>
+(function(){
+  "use strict";
+  var mount = document.getElementById("decisions");
+  function render(){
+    mount.innerHTML = GF.renderDecisionList();
+  }
+  GF.attach({ onRender: render });
+})();
+</script>
 </body>
 </html>

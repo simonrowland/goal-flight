@@ -28,7 +28,6 @@ h1{font-size:1.5rem;margin:.2em 0 .1em;letter-spacing:-.01em}
 .tagline{color:var(--muted);font-size:.9rem;margin:.1em 0 0}
 .mode{font:.72rem ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted)}
 .dot{display:inline-block;width:.5rem;height:.5rem;border-radius:50%;background:var(--muted);margin-right:.35rem;vertical-align:middle}
-.mode.live .dot{background:var(--ok)}
 h2{font-size:1.0rem;margin:1.7em 0 .5em;border-bottom:1px solid var(--border);padding-bottom:.25em}
 /* count cards */
 .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(7.2rem,1fr));gap:.6rem;margin:1.2rem 0 .3rem}
@@ -64,7 +63,7 @@ footer{max-width:46rem;margin:0 auto;padding:.5rem 1.25rem 2rem;color:var(--mute
   <div class="top">
     <div>
       <h1>goal-flight</h1>
-      <p class="tagline">project state · live progress dashboard</p>
+      <p class="tagline">project state · snapshot dashboard</p>
     </div>
     <span class="mode" id="mode"><span class="dot"></span><span id="modeText">loading…</span></span>
   </div>
@@ -74,8 +73,8 @@ footer{max-width:46rem;margin:0 auto;padding:.5rem 1.25rem 2rem;color:var(--mute
   <h2 id="views">Views</h2>
   <nav class="nav" aria-labelledby="views">
     <a href="tickets.html"><span class="h">Work board →</span><span class="d">All tasks &amp; bugs · sort, filter, search</span></a>
-    <a href="current-activity.html"><span class="h">Live activity →</span><span class="d">In-progress · awaiting review · recently done</span></a>
-    <a href="questions-for-user.html"><span class="h">Decisions →</span><span class="d">Open questions &amp; the ADR log</span></a>
+    <a href="current-activity.html"><span class="h">Current activity →</span><span class="d">In-progress · awaiting review · recently done</span></a>
+    <a href="questions-for-user.html"><span class="h">Decisions →</span><span class="d">Open decisions blocking work</span></a>
   </nav>
 
   <div class="warnstrip" id="decisions" role="status" aria-live="polite"></div>
@@ -120,37 +119,17 @@ footer{max-width:46rem;margin:0 auto;padding:.5rem 1.25rem 2rem;color:var(--mute
              '<span class="n">'+(c[s.key]||0)+'</span><span class="k">'+s.label+"</span></a>";
     }).join("");
 
-    // open-decisions strip
-    var open = GF.store.items.filter(function(it){ return it._section==="decision"; });
-    var strip = document.getElementById("decisions");
-    if(open.length){
-      strip.innerHTML = '<span aria-hidden="true">⚠ </span><span class="visually-hidden">Attention: </span>' +
-       open.map(function(it){
-        // Canonical edge: tasks that declare THIS decision in their blocked_by.
-        // (Fall back to the decision's own links for any legacy mirrored edge.)
-        var holds = GF.store.items.filter(function(t){
-          return (t.blocked_by||[]).indexOf(it.id) >= 0;
-        }).map(function(t){ return t.id; });
-        if(!holds.length && it.links){
-          holds = it.links.filter(function(l){ return /^[tbq]-\d+$/.test(l); });
-        }
-        var tail = holds.length ? " — blocks "+holds.map(function(h){return GF.idLink(h);}).join(", ") : "";
-        return GF.idLink(it.id)+tail;
-      }).join(" · ");
-    } else {
-      strip.innerHTML = "";
-    }
+    document.getElementById("decisions").innerHTML = GF.renderDecisionStrip();
     document.getElementById("foot").textContent =
       "goal-flight · " + c._total + " items · " + GF.store.mode;
   }
 
   function setMode(mode){
     var el=document.getElementById("mode"), txt=document.getElementById("modeText");
-    if(mode==="served"){ el.classList.add("live"); txt.textContent="live"; }
-    else { el.classList.remove("live"); txt.textContent="snapshot"; }
+    el.classList.remove("live"); txt.textContent=mode || "snapshot";
   }
 
-  GF.attach({ onRender: render, onMode: setMode, interval: 4000 });
+  GF.attach({ onRender: render, onMode: setMode });
 })();
 </script>
 </body>

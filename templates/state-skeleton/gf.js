@@ -354,6 +354,58 @@
     return '<span class="blockers">' + parts.join(" ") + "</span>";
   }
 
+  function openDecisions() {
+    return store.items.filter(function (it) {
+      return it._section === "decision";
+    });
+  }
+
+  function decisionBlockIds(it) {
+    var holds = store.items.filter(function (t) {
+      return (t.blocked_by || []).indexOf(it.id) >= 0;
+    }).map(function (t) {
+      return t.id;
+    });
+    if (!holds.length && it.links) {
+      holds = it.links.filter(function (l) {
+        return /^[tbq]-\d+$/.test(l);
+      });
+    }
+    return holds;
+  }
+
+  function renderDecisionSummary(it) {
+    var holds = decisionBlockIds(it);
+    var tail = holds.length
+      ? " — blocks " + holds.map(function (h) { return idLink(h); }).join(", ")
+      : "";
+    return '<span class="decision-summary">' + idLink(it.id) + tail + "</span>";
+  }
+
+  function renderDecisionStrip() {
+    var open = openDecisions();
+    if (!open.length) return "";
+    return '<span aria-hidden="true">⚠ </span><span class="visually-hidden">Attention: </span>' +
+      open.map(renderDecisionSummary).join(" · ");
+  }
+
+  function renderDecisionList() {
+    var open = openDecisions();
+    if (!open.length) return '<p class="empty decisions-empty">no open decisions</p>';
+    return '<div class="decision-list">' + open.map(function (it) {
+      var holds = decisionBlockIds(it);
+      var blocks = holds.length
+        ? holds.map(function (h) { return idLink(h); }).join(", ")
+        : '<span class="muted">none</span>';
+      var body = it.acceptance ? '<p>' + autolink(it.acceptance) + "</p>" : "";
+      return '<section class="decision-item" id="' + esc(it.id) + '">' +
+        '<h2><span class="qid">' + idLink(it.id) + '</span> <span class="decision-title">' + autolink(it.title) + "</span></h2>" +
+        '<p class="meta">blocks ' + blocks + "</p>" +
+        body +
+        "</section>";
+    }).join("") + "</div>";
+  }
+
   function sevBit(it) {
     if (it.kind !== "bug" || !it.severity) return "";
     return '<span class="sev sev-' + esc(it.severity) + '">' + esc(it.severity) + "</span>";
@@ -512,6 +564,10 @@
     applyControls: applyControls,
     sortItems: sortItems,
     renderBoard: renderBoard,
+    openDecisions: openDecisions,
+    decisionBlockIds: decisionBlockIds,
+    renderDecisionStrip: renderDecisionStrip,
+    renderDecisionList: renderDecisionList,
     attach: attach,
     counts: counts,
     statusBadge: statusBadge,
