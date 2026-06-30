@@ -46,7 +46,15 @@ FINAL_TERMINAL_MARKER_RE = re.compile(
     r"^(?:-\s+)?`?\**(?:STATUS:\s*)?"
     r"(RESULT|USER-NEED|USER-CONFIRM|BLOCKED|FAILED|COMPLETE|READY):(.*)$"
 )
-BARE_TERMINAL_MARKER_RE = re.compile(r"^(RESULT|USER-NEED|USER-CONFIRM|BLOCKED|FAILED|COMPLETE|READY):\s*.*$")
+COMPLETION_SIGNOFF_RE = re.compile(
+    r"^(?:STATUS:\s*)?(DONE|COMPLETE|FINISHED)\s*:?\s*[.!?]?$",
+    re.IGNORECASE,
+)
+BARE_TERMINAL_MARKER_RE = re.compile(
+    r"^(?:(?:RESULT|USER-NEED|USER-CONFIRM|BLOCKED|FAILED|COMPLETE|READY):\s*.*|"
+    r"(?:DONE|COMPLETE|FINISHED)\s*:?\s*[.!?]?)$",
+    re.IGNORECASE,
+)
 HUNK_HEADER_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@")
 TERMINAL_MARKERS = {"RESULT", "USER-NEED", "USER-CONFIRM", "BLOCKED", "COMPLETE", "READY"}
 PROMPT_ECHO_ANCHOR_SEARCH_LINES = 200
@@ -126,6 +134,13 @@ def _strip_marker_decoration(text: str) -> str:
     return value
 
 
+def _completion_signoff_marker(stripped: str, line_no: int) -> dict | None:
+    match = COMPLETION_SIGNOFF_RE.match(_strip_marker_decoration(stripped))
+    if not match:
+        return None
+    return {"line": line_no, "kind": "COMPLETE", "text": ""}
+
+
 def _is_diff_context_line(raw_line: str) -> bool:
     if raw_line.startswith((" ", "\t", "+")):
         return True
@@ -175,6 +190,9 @@ def _final_terminal_marker_from_line(
         stripped = _strip_terminal_marker_prefix(stripped)
         if not stripped:
             return None
+    signoff = _completion_signoff_marker(stripped, line_no)
+    if signoff:
+        return signoff
     match = FINAL_TERMINAL_MARKER_RE.match(stripped)
     if not match:
         return None
@@ -376,6 +394,10 @@ def extract_markers(path: Path, max_bytes: int = 10 * 1024 * 1024,
         match = MARKER_RE.match(stripped)
         if match:
             markers.append({"line": idx, "kind": match.group(1), "text": match.group(2)[:1000]})
+            continue
+        signoff = _completion_signoff_marker(stripped, idx)
+        if signoff:
+            markers.append(signoff)
     return markers, size
 
 
@@ -431,6 +453,9 @@ def _last_line_is_terminal_marker(
     match = MARKER_RE.match(last_nonempty)
     if match and match.group(1) in TERMINAL_MARKERS:
         return {"line": last_nonempty_line, "kind": match.group(1), "text": match.group(2)[:1000]}
+    signoff = _completion_signoff_marker(last_nonempty, last_nonempty_line)
+    if signoff:
+        return signoff
     return None
 
 
@@ -792,6 +817,21 @@ def main() -> int:
                 exit_reason = f"marker:{terminal_seen['kind']}:final_reconciliation"
                 exit_code = _exit_code_for_state(payload["state"])
             else:
+                # Output-is-truth veto, gated on ACTIVE growth (not the whole idle
+                # window): the tracked pid is often a launcher/wrapper that exits while
+                # a detached worker child keeps streaming. Veto worker_dead only while
+                # the tail grew within the last couple of poll cycles. A worker that
+                # emits a final line then crashes goes stale within ~2 polls -> caught
+                # fast (crash-safe); a worker still streaming stays alive. Death stays
+                # bounded by this small window, independent of --max-idle-secs.
+                active_growth_window = max(args.poll_secs * 2.0, 0.2)
+                if seconds_since_event < active_growth_window:
+                    payload["state"] = "running"
+                    payload["liveness_state"] = "running_via_output"
+                    payload["worker_alive"] = True
+                    write_payload(payload, reason="pid_resolved_dead_output_fresh")
+                    time.sleep(args.poll_secs)
+                    continue
                 payload["state"] = "worker_dead"
                 exit_reason = (
                     "worker_dead_no_terminal_marker"

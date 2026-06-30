@@ -90,6 +90,20 @@ def _run_watcher(
     return proc.returncode, elapsed, term, payload
 
 
+def _wait_for_status(status: Path, timeout_s: float = 2.0) -> dict:
+    deadline = time.monotonic() + timeout_s
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        if status.exists():
+            try:
+                return json.loads(status.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as exc:
+                last_error = exc
+        time.sleep(0.05)
+    detail = f"; last error: {last_error}" if last_error else ""
+    raise AssertionError(f"status was not readable within {timeout_s:.1f}s{detail}")
+
+
 def _write_task_store(project: Path) -> None:
     item = {
         "schema_version": 1,
@@ -532,7 +546,7 @@ No live SynchRad run. No commit. `$GOALFLIGHT_STEER_FILE` was unset in tool env,
 """
 
 
-def _run_dead_worker_tail(tail_text: str, prompt_text: str = ""):
+def _run_dead_worker_tail(tail_text: str, prompt_text: str = "", max_idle_secs: str = "0.2"):
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
         prompt = tmp / "prompt.md"
@@ -547,9 +561,77 @@ def _run_dead_worker_tail(tail_text: str, prompt_text: str = ""):
             prompt,
             ignore=True,
             worker_pid=worker.pid,
-            poll_secs="0.2",
-            max_idle_secs="30",
+            poll_secs="0.05",
+            max_idle_secs=max_idle_secs,
         )
+
+
+def case_dead_pid_fresh_output_vetoes_worker_dead() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        prompt = tmp / "prompt.md"
+        prompt.write_text("", encoding="utf-8")
+        tail = tmp / "tail.txt"
+        tail.write_text("still producing output\n", encoding="utf-8")
+        status = tmp / "s.json"
+        worker = subprocess.Popen([sys.executable, "-c", ""], start_new_session=True)
+        worker.wait()
+        cmd = [
+            sys.executable,
+            str(WATCH),
+            "--pid",
+            str(worker.pid),
+            "--tail",
+            str(tail),
+            "--status-json",
+            str(status),
+            "--poll-secs",
+            "0.05",
+            "--max-idle-secs",
+            "3",
+            "--ignore-prompt-file",
+            str(prompt),
+        ]
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            payload = _wait_for_status(status)
+            assert proc.poll() is None, payload
+            assert payload.get("state") == "running", payload
+            assert payload.get("liveness_state") == "running_via_output", payload
+            assert payload.get("worker_alive") is True, payload
+            assert payload.get("reason") == "pid_resolved_dead_output_fresh", payload
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+
+
+def case_dead_pid_stale_output_bounds_worker_dead() -> None:
+    rc, elapsed, term, payload = _run_dead_worker_tail("still producing output\n", max_idle_secs="0.2")
+    assert rc == 1, f"stale output must become worker_dead, got rc={rc} ({payload})"
+    assert elapsed < 3.0, f"worker_dead should be bounded by the fresh window, elapsed={elapsed:.1f}s"
+    assert payload.get("state") == "worker_dead", payload
+    assert payload.get("reason") == "worker_dead_no_terminal_marker", payload
+    assert not term, term
+
+
+def case_dead_pid_done_signoff_completes() -> None:
+    cases = [
+        ("DONE.\n", "marker:COMPLETE"),
+        ("complete\n", "marker:COMPLETE"),
+        ("FINISHED!\npost-marker summary\n", "marker:COMPLETE:final_reconciliation"),
+    ]
+    for tail_text, expected_reason in cases:
+        rc, _elapsed, term, payload = _run_dead_worker_tail(tail_text)
+        assert rc == 0, f"{tail_text!r} must complete, got rc={rc} ({payload})"
+        assert payload.get("state") == "complete", payload
+        assert payload.get("reason") == expected_reason, payload
+        assert term.get("kind") == "COMPLETE", term
+        assert term.get("text") == "", term
+        assert payload.get("markers", [])[-1].get("kind") == "COMPLETE", payload
 
 
 def case_worker_dead_final_reconciliation_observed_shapes() -> None:
@@ -976,6 +1058,9 @@ def main() -> None:
     case_ready_terminal_marker()
     case_task_terminal_breadcrumb_failure_blocks_completion()
     case_task_terminal_breadcrumb_happy_path_persists()
+    case_dead_pid_fresh_output_vetoes_worker_dead()
+    case_dead_pid_stale_output_bounds_worker_dead()
+    case_dead_pid_done_signoff_completes()
     case_worker_dead_final_reconciliation_observed_shapes()
     case_worker_dead_final_reconciliation_rejects_diff_and_prompt_echo()
     case_worker_dead_accepts_single_prefix_variants_outside_hunk()
