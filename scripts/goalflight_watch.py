@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -42,7 +43,11 @@ from goalflight_liveness import (
 # the last non-empty line (post prefix-ignore, outside fence). READY/COMPLETE/RESULT/etc.
 # Prevents cat/echo/print of marker tokens mid-output or inside fenced examples from
 # false-completing the watcher.
-MARKER_RE = re.compile(r"^\**(STATUS|STEER-ACK|RESULT|USER-NEED|USER-CONFIRM|BLOCKED|COMPLETE|READY):\**\s*(.*)$")
+_LIVE_MARKER_KINDS = sorted(goalflight_terminal.TERMINAL_MARKERS | {"STATUS", "STEER-ACK"})
+MARKER_RE = re.compile(
+    r"^\**(" + "|".join(re.escape(kind) for kind in _LIVE_MARKER_KINDS) + r"):\**\s*(.*)$"
+)
+TERMINAL_MARKERS = set(goalflight_terminal.TERMINAL_MARKERS)
 FINAL_TERMINAL_MARKER_RE = re.compile(
     r"^(?:-\s+)?`?\**(?:STATUS:\s*)?"
     r"(RESULT|USER-NEED|USER-CONFIRM|BLOCKED|FAILED|COMPLETE|READY):(.*)$"
@@ -57,7 +62,6 @@ BARE_TERMINAL_MARKER_RE = re.compile(
     re.IGNORECASE,
 )
 HUNK_HEADER_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@")
-TERMINAL_MARKERS = {"RESULT", "USER-NEED", "USER-CONFIRM", "BLOCKED", "COMPLETE", "READY"}
 PROMPT_ECHO_ANCHOR_SEARCH_LINES = 200
 PROMPT_ECHO_MAX_ANCHORS = 10
 # CPU-sampling-failure grace (codex 2026-05-20 P2): require this many consecutive
@@ -102,6 +106,44 @@ def _split_task_ids(value: str | None) -> list[str]:
 
 def _task_state_for_terminal(dispatch_state: object) -> str:
     return "worker-finished" if dispatch_state == "complete" else "worker-failed"
+
+
+def _finish_existing_ledger(
+    dispatch_id: str,
+    state: object,
+    reason: object,
+    *,
+    worker_still_alive: object = None,
+) -> dict | None:
+    if not dispatch_id or not state:
+        return None
+    if state == "watcher_stopped" and worker_still_alive is True:
+        return None
+    path = goalflight_ledger.record_path(dispatch_id, create=False)
+    if not path.exists():
+        return None
+    max_attempts = 3
+    backoff_s = 0.05
+    last_error: dict | None = None
+    for attempt in range(max_attempts):
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                goalflight_ledger.cmd_finish(
+                    argparse.Namespace(
+                        dispatch_id=dispatch_id,
+                        state=str(state),
+                        reason=reason,
+                        terminal_state=None,
+                        elapsed_s=None,
+                        worker_still_alive=worker_still_alive,
+                    )
+                )
+            return None
+        except Exception as exc:
+            last_error = {"type": type(exc).__name__, "message": str(exc)}
+            if attempt + 1 < max_attempts:
+                time.sleep(backoff_s * (attempt + 1))
+    return last_error
 
 
 def _status_snapshot(payload: dict) -> dict:
@@ -651,7 +693,7 @@ def main() -> int:
                 payload.get("state"),
                 payload.get("reason"),
                 tail,
-                success_marker_present=goalflight_terminal.terminal_success_marker_present(
+                terminal_marker_present=goalflight_terminal.terminal_marker_present(
                     payload.get("terminal_marker") or terminal_seen
                 ),
             )
@@ -686,6 +728,16 @@ def main() -> int:
         if terminal_write:
             payload["liveness_state"] = goalflight_terminal.terminal_liveness_state(payload.get("state"))
         write_status(status_path, payload)
+        if terminal_write:
+            ledger_error = _finish_existing_ledger(
+                args.dispatch_id,
+                payload.get("state"),
+                payload.get("reason"),
+                worker_still_alive=payload.get("worker_alive"),
+            )
+            if ledger_error:
+                payload["ledger_finalize_error"] = ledger_error
+                write_status(status_path, payload)
         last_payload = dict(payload)
         if terminal_write:
             final_status_written = True

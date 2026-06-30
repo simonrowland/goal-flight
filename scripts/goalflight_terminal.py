@@ -11,6 +11,7 @@ import goalflight_rate_pressure
 RATE_LIMIT_TAIL_BYTES = 2048
 RATE_LIMITED_STATE = "rate_limited"
 SUCCESS_TERMINAL_MARKERS = {"COMPLETE", "READY", "RESULT"}
+TERMINAL_MARKERS = SUCCESS_TERMINAL_MARKERS | {"FAILED", "BLOCKED", "USER-NEED", "USER-CONFIRM"}
 
 
 def read_tail_excerpt(path: Path, max_bytes: int = RATE_LIMIT_TAIL_BYTES) -> str:
@@ -42,16 +43,21 @@ def terminal_success_marker_present(marker: object) -> bool:
     return isinstance(marker, dict) and marker.get("kind") in SUCCESS_TERMINAL_MARKERS
 
 
+def terminal_marker_present(marker: object) -> bool:
+    return isinstance(marker, dict) and marker.get("kind") in TERMINAL_MARKERS
+
+
 def terminal_rate_limit_outcome(
     state: str | None,
     reason: object,
     tail: Path,
     *,
     success_marker_present: bool = False,
+    terminal_marker_present: bool = False,
 ) -> tuple[str | None, object, bool]:
     if isinstance(reason, dict) and reason.get("message") == "dispatch_worker_rate_limited":
         return RATE_LIMITED_STATE, reason, state != RATE_LIMITED_STATE
-    if success_marker_present:
+    if terminal_marker_present or success_marker_present:
         return state, reason, False
     excerpt = read_tail_excerpt(tail).strip()
     if not excerpt:

@@ -141,6 +141,20 @@ def test_chunk_summary_state_vocabulary() -> None:
         "chunk summary controller_dead failed",
         goalflight_chunk_summary.normalize_state({"state": "controller_dead"}, None, None) == "failed",
     )
+    assert_true(
+        "chunk summary rate_limited failed",
+        goalflight_chunk_summary.normalize_state({"state": "rate_limited"}, None, None) == "failed",
+    )
+    assert_true(
+        "chunk summary rate_limited retry hint",
+        goalflight_chunk_summary.decision_hint(
+            "failed",
+            worker_live=False,
+            mins=0,
+            retryable=goalflight_chunk_summary.retryable_failure_present({"state": "rate_limited"}, None),
+        )
+        == "cooldown_retry",
+    )
 
 
 def test_capacity_prunes_review_terminal_states() -> None:
@@ -189,9 +203,12 @@ def test_ledger_record_finish_status() -> None:
         )
         assert_true("record wrote", rec["ok"])
         run(["python3", "scripts/goalflight_ledger.py", "finish", "--dispatch-id", "weird/id", "--state", "complete"], state_dir=state_dir)
+        run(["python3", "scripts/goalflight_ledger.py", "finish", "--dispatch-id", "weird/id", "--state", "failed", "--reason", "late-watcher-error"], state_dir=state_dir)
         status = json.loads(run(["python3", "scripts/goalflight_ledger.py", "status", "--json"], state_dir=state_dir).stdout)
         assert_true("ledger schema", status["schema"] == "goalflight.dispatch.v1")
         assert_true("finished visible", any(row["state"] == "complete" for row in status["records"]))
+        weird_row = next(row for row in status["records"] if row["dispatch_id"] == "weird/id")
+        assert_true("conflicting terminal finish is idempotent no-op", weird_row["state"] == "complete")
 
         run(
             [

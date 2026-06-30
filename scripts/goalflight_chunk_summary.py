@@ -13,24 +13,20 @@ import sys
 from typing import Any
 
 import goalflight_compat
+import goalflight_dispatch_states
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_STATE_DIR = Path(os.environ.get("GOALFLIGHT_STATE_DIR", goalflight_compat.default_state_dir()))
 TERMINAL_DONE = {"complete", "released"}
-TERMINAL_FAILED = {
-    "blocked",
-    "blocked_auth",
-    "blocked_capacity",
-    "blocked_session_limit",
-    "failed",
-    "inconclusive_no_final",
-    "inconclusive_timeout",
-    "controller_dead",
-    "orphaned",
-    "superseded",
-    "worker_dead",
-}
 WEDGED_STATES = {"idle_timeout", "wedged"}
+RUNNING_NONTERMINAL_STATES = {"watcher_stopped", "waiting_capacity"}
+TERMINAL_FAILED = (
+    set(goalflight_dispatch_states.TERMINAL_FAILURE_STATES)
+    - TERMINAL_DONE
+    - WEDGED_STATES
+    - RUNNING_NONTERMINAL_STATES
+)
+RETRYABLE_FAILED = {"rate_limited"}
 
 
 def parse_time(value: Any) -> dt.datetime | None:
@@ -164,6 +160,22 @@ def last_marker_kind(status: dict[str, Any] | None) -> str | None:
     return None
 
 
+def canonical_state(value: str | None) -> str | None:
+    if not value:
+        return None
+    return goalflight_dispatch_states.normalize_dispatch_state(value) or value
+
+
+def state_in(value: str | None, states: set[str]) -> bool:
+    return bool(value and (value in states or canonical_state(value) in states))
+
+
+def retryable_failure_present(record: dict[str, Any] | None, status: dict[str, Any] | None) -> bool:
+    status_state = str(status.get("state")) if status and status.get("state") else None
+    record_state = str(record.get("state")) if record and record.get("state") else None
+    return state_in(status_state, RETRYABLE_FAILED) or state_in(record_state, RETRYABLE_FAILED)
+
+
 def normalize_state(record: dict[str, Any] | None, status: dict[str, Any] | None, lease: dict[str, Any] | None) -> str:
     marker = last_marker_kind(status)
     status_state = str(status.get("state")) if status and status.get("state") else None
@@ -173,9 +185,9 @@ def normalize_state(record: dict[str, Any] | None, status: dict[str, Any] | None
         return "complete"
     if marker in {"BLOCKED", "USER-NEED", "USER-CONFIRM"}:
         return "failed"
-    if status_state in WEDGED_STATES or record_state in WEDGED_STATES:
+    if state_in(status_state, WEDGED_STATES) or state_in(record_state, WEDGED_STATES):
         return "wedged"
-    if status_state in TERMINAL_FAILED or record_state in TERMINAL_FAILED:
+    if state_in(status_state, TERMINAL_FAILED) or state_in(record_state, TERMINAL_FAILED):
         return "failed"
     if status_state == "watcher_stopped" or record_state == "watcher_stopped":
         return "running"
@@ -223,7 +235,7 @@ def choose_record(slug: str, records: list[dict[str, Any]], leases: list[dict[st
     return record, lease
 
 
-def decision_hint(state: str, worker_live: bool, mins: int | None) -> str:
+def decision_hint(state: str, worker_live: bool, mins: int | None, *, retryable: bool = False) -> str:
     if state == "complete":
         return "done"
     if state == "missing":
@@ -231,6 +243,8 @@ def decision_hint(state: str, worker_live: bool, mins: int | None) -> str:
     if state == "wedged":
         return "takeover"
     if state == "failed":
+        if retryable:
+            return "cooldown_retry"
         return "investigate"
     if not worker_live:
         return "takeover"
@@ -247,6 +261,7 @@ def summarize(slug: str, state_dir: Path) -> dict[str, Any]:
     status, status_path = load_status(slug, record)
     worker_pid = (status or {}).get("worker_pid") or (record or {}).get("worker_pid") or (lease or {}).get("worker_pid")
     state = normalize_state(record, status, lease)
+    retryable = retryable_failure_present(record, status)
     mins = age_mins(latest_timestamp(record, status, lease))
     log_path = (status or {}).get("tail_path") or (record or {}).get("stdout_path") or (record or {}).get("stderr_path")
     worker_live = pid_alive(worker_pid)
@@ -260,7 +275,7 @@ def summarize(slug: str, state_dir: Path) -> dict[str, Any]:
         "log_path": str(log_path) if log_path else None,
         "last_marker": last_marker_kind(status),
         "mins_since_last_event": mins,
-        "decision_hint": decision_hint(state, worker_live, mins),
+        "decision_hint": decision_hint(state, worker_live, mins, retryable=retryable),
     }
 
 

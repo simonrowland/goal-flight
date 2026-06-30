@@ -223,11 +223,11 @@ def classify(record: dict) -> str:
     return f"stale_{reason}"
 
 
-def record_path(dispatch_id: str) -> Path:
+def record_path(dispatch_id: str, *, create: bool = True) -> Path:
     safe = "".join(ch if ch.isalnum() or ch in "._-" else "-" for ch in dispatch_id)
     if safe != dispatch_id:
         safe = f"{safe}-{hashlib.sha256(dispatch_id.encode()).hexdigest()[:8]}"
-    return runs_dir() / f"{safe}.json"
+    return runs_dir(create=create) / f"{safe}.json"
 
 
 def write_record(record: dict) -> Path:
@@ -335,6 +335,13 @@ def failure_envelope(reason: object) -> dict | None:
     if isinstance(reason, list):
         return {"error": reason}
     return {"reason": str(reason)}
+
+
+def _terminal_key(record: dict) -> str:
+    terminal_state = record.get("terminal_state")
+    if terminal_state:
+        return str(terminal_state)
+    return terminal_state_for(record.get("state"), record.get("reason") or record.get("error"))
 
 
 def elapsed_seconds(record: dict, ended_at: str | None = None) -> float | None:
@@ -457,10 +464,24 @@ def cmd_finish(args: argparse.Namespace) -> int:
         return 1
     with StateLock():
         record = json.loads(path.read_text())
+        terminal_state = getattr(args, "terminal_state", None) or terminal_state_for(args.state, args.reason)
+        existing_terminal = _terminal_key(record)
+        if (
+            existing_terminal not in {"", "unknown", "watcher_stopped"}
+            and terminal_state not in {"", "unknown"}
+            and existing_terminal != terminal_state
+        ):
+            print(json.dumps({
+                "ok": True,
+                "dispatch_id": args.dispatch_id,
+                "state": record.get("state"),
+                "idempotent": True,
+                "terminal_state": existing_terminal,
+            }, sort_keys=True))
+            return 0
         record["state"] = args.state
         ended_at = utc_now()
         record["ended_at"] = ended_at
-        terminal_state = getattr(args, "terminal_state", None) or terminal_state_for(args.state, args.reason)
         record["terminal_state"] = terminal_state
         record["liveness_state"] = goalflight_terminal.terminal_liveness_state(args.state)
         elapsed_s = getattr(args, "elapsed_s", None)

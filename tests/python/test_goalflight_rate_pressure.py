@@ -179,6 +179,105 @@ def test_detect_rate_limited_complete_exit_record_error():
     )
 
 
+def test_detect_worker_dead_with_rate_limit_status_reason():
+    record = {"agent": "codex", "state": "worker_dead"}
+    status = {
+        "reason": {
+            "message": "dispatch_worker_rate_limited",
+            "tail_excerpt": "You've hit your usage limit. Please try again later.",
+        }
+    }
+    assert_eq(
+        "worker_dead status reason scope",
+        rp.detect_pressure_scope(record, status),
+        rp.ACCOUNT_RATE_LIMIT_SCOPE,
+    )
+
+
+def test_detect_running_ledger_with_terminal_rate_limited_status_fallback():
+    """Ledger stuck running but status plane terminal must count once."""
+    state_dir = Path("/tmp") / f"goal-flight-test-fallback-{int(time.time())}"
+    runs = state_dir / "runs.d"
+    runs.mkdir(parents=True, exist_ok=True)
+    now_iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+    status_path = state_dir / "status-fallback-rate.status.json"
+    status = {
+        "state": "rate_limited",
+        "reason": {
+            "message": "dispatch_worker_rate_limited",
+            "tail_excerpt": "You've hit your usage limit. Please try again later.",
+        },
+    }
+    status_path.write_text(json.dumps(status), encoding="utf-8")
+    record = {
+        "agent": "codex",
+        "state": "running",
+        "dispatch_id": "status-fallback-rate",
+        "updated_at": now_iso,
+        "status_path": str(status_path),
+    }
+    try:
+        assert_eq(
+            "running ledger + rate_limited status",
+            rp.detect_pressure_scope(record, status),
+            rp.ACCOUNT_RATE_LIMIT_SCOPE,
+        )
+        (runs / "status-fallback-rate.json").write_text(json.dumps(record), encoding="utf-8")
+        (runs / "clean.json").write_text(
+            json.dumps(
+                {
+                    "agent": "codex",
+                    "state": "complete",
+                    "updated_at": now_iso,
+                    "dispatch_id": "clean",
+                }
+            ),
+            encoding="utf-8",
+        )
+        records = rp.collect_records(state_dir)
+        pressure = rp.pressure_per_provider(records, window_seconds=600, now_ts=time.time())
+        assert_eq("fallback counts exactly once", pressure.get("provider:openai"), 1)
+    finally:
+        for path in runs.glob("*.json"):
+            path.unlink()
+        status_path.unlink(missing_ok=True)
+        runs.rmdir()
+        state_dir.rmdir()
+
+
+def test_detect_running_ledger_with_complete_status_not_counted():
+    record = {"agent": "codex", "state": "running", "dispatch_id": "status-fallback-clean"}
+    status = {"state": "complete", "reason": "marker:COMPLETE"}
+    assert_eq(
+        "running ledger + complete status excluded",
+        rp.detect_pressure_scope(record, status),
+        None,
+    )
+
+
+def test_detect_terminal_ledger_not_double_counted_with_status_fallback():
+    """Terminal ledger state wins; status fallback must not add a second hit."""
+    now_iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+    record = {
+        "agent": "codex",
+        "state": "rate_limited",
+        "dispatch_id": "ledger-terminal-once",
+        "updated_at": now_iso,
+        "error": {"message": "dispatch_worker_rate_limited", "tail_excerpt": "usage limit"},
+    }
+    status = {
+        "state": "rate_limited",
+        "reason": {"message": "dispatch_worker_rate_limited", "tail_excerpt": "usage limit"},
+    }
+    assert_eq(
+        "terminal ledger scope",
+        rp.detect_pressure_scope(record, status),
+        rp.ACCOUNT_RATE_LIMIT_SCOPE,
+    )
+    pressure = rp.pressure_per_provider([record], window_seconds=600, now_ts=time.time())
+    assert_eq("terminal ledger counts once", pressure.get("provider:openai"), 1)
+
+
 def test_detect_try_again_at_pattern():
     record = {"agent": "codex", "state": "failed"}
     status = {"error": "You've hit your usage limit. Please try again at 6:13 AM."}

@@ -432,7 +432,7 @@ def _repair_watcher_terminal_status(
         state,
         reason,
         tail,
-        success_marker_present=goalflight_terminal.terminal_success_marker_present(terminal_marker),
+        terminal_marker_present=goalflight_terminal.terminal_marker_present(terminal_marker),
     )
     payload.update({
         "schema": "goalflight.status.v1",
@@ -2424,11 +2424,19 @@ def _mark_claim_worker_dead(entry: dict, *, reason: str) -> None:
                 status_json=status_json,
                 tail=tail,
             )
-    state, final_reason, _rate_limited = goalflight_terminal.terminal_rate_limit_outcome(
-        "worker_dead",
-        reason,
+    ignore_prefix_lines = _ignore_prefix_lines(str(Path(args.prompt_file).expanduser()) if args.prompt_file else None)
+    terminal_marker = _final_terminal_marker(
         tail,
-        success_marker_present=False,
+        ignore_prefix_lines=ignore_prefix_lines,
+        suppress_unfenced_prompt_markers=True,
+    )
+    state = _marker_state_for_terminal(terminal_marker) if terminal_marker else "worker_dead"
+    reason_for_finish = f"marker:{terminal_marker['kind']}:final_reconciliation" if terminal_marker else reason
+    state, final_reason, _rate_limited = goalflight_terminal.terminal_rate_limit_outcome(
+        state,
+        reason_for_finish,
+        tail,
+        terminal_marker_present=goalflight_terminal.terminal_marker_present(terminal_marker),
     )
     with contextlib.suppress(Exception):
         _finish_ledger(dispatch_id, state or "worker_dead", final_reason, worker_still_alive=False)
@@ -2444,6 +2452,7 @@ def _mark_claim_worker_dead(entry: dict, *, reason: str) -> None:
                 "terminal_state": goalflight_ledger.terminal_state_for(state or "worker_dead", final_reason),
                 "reason": final_reason,
                 "liveness_state": goalflight_terminal.terminal_liveness_state(state or "worker_dead"),
+                "terminal_marker": terminal_marker,
                 "project_root": str(project_root),
                 "worker_pid": entry.get("queue_worker_pid"),
                 "worker_alive": False,
@@ -3390,7 +3399,7 @@ def main(argv: list[str] | None = None) -> int:
     detached_launched = False
     final_state = "failed"
     final_reason = None
-    final_success_marker_present = False
+    final_terminal_marker_present = False
     worker_alive = None
     watch_rc = 1
     dispatch_started = time.time()
@@ -3671,7 +3680,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             state = rec.get("state")
             worker_alive = rec.get("worker_alive")
-            final_success_marker_present = goalflight_terminal.terminal_success_marker_present(
+            final_terminal_marker_present = goalflight_terminal.terminal_marker_present(
                 rec.get("terminal_marker")
             )
         except Exception:
@@ -3727,7 +3736,7 @@ def main(argv: list[str] | None = None) -> int:
                     final_state,
                     final_reason,
                     tail,
-                    success_marker_present=final_success_marker_present,
+                    terminal_marker_present=final_terminal_marker_present,
                 )
                 if _rate_limited:
                     final_reason = ledger_reason

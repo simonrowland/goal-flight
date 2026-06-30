@@ -388,6 +388,42 @@ def case_mid_output_marker_ignored() -> None:
         assert term.get("text") == "genuine-payload", term
 
 
+def case_live_failed_marker_blocks_not_rate_limited() -> None:
+    """Live path must recognize FAILED (shared marker set) before idle_timeout."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        tail = tmp / "tail.txt"
+        tail.write_text(
+            "upstream validation failed\n"
+            "FAILED: upstream returned rate limit while validating user input\n",
+            encoding="utf-8",
+        )
+        worker = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(10)"],
+            start_new_session=True,
+        )
+        try:
+            rc, elapsed, term, payload = _run_watcher(
+                tail,
+                tmp / "s.json",
+                tmp / "p.md",
+                ignore=False,
+                worker_pid=worker.pid,
+                poll_secs="0.2",
+                max_idle_secs="3",
+            )
+        finally:
+            worker.terminate()
+            worker.wait()
+        assert rc == 4, f"FAILED live marker must block (rc=4), got rc={rc} ({payload})"
+        assert payload.get("state") == "blocked", payload
+        assert payload.get("liveness_state") == "blocked", payload
+        assert payload.get("reason") != "dispatch_worker_rate_limited", payload
+        assert not isinstance(payload.get("reason"), dict), payload
+        assert term.get("kind") == "FAILED", term
+        assert elapsed < 3.0, f"FAILED must terminate before idle_timeout, elapsed={elapsed}"
+
+
 def case_ready_terminal_marker() -> None:
     """READY: is a terminal marker only on the last non-empty line (Investigator shape)."""
     with tempfile.TemporaryDirectory() as tmp:
@@ -676,6 +712,23 @@ def case_dead_pid_usage_limit_mentions_with_success_marker_complete() -> None:
         assert term.get("kind") in {"COMPLETE", "READY"}, f"{label}: {term}"
 
 
+def case_dead_pid_usage_limit_mentions_with_failure_markers_stay_blocked() -> None:
+    cases = [
+        ("FAILED", "FAILED: upstream returned rate limit while validating user input\n"),
+        ("BLOCKED", "BLOCKED: cannot write sandbox path; prose mentions usage limit\n"),
+        ("USER-NEED", "USER-NEED: docs API rate limit; use cached data or wait?\n"),
+        ("USER-CONFIRM", "USER-CONFIRM: provider at capacity; retry now?\n"),
+    ]
+    for kind, tail_text in cases:
+        rc, _elapsed, term, payload = _run_dead_worker_tail(tail_text)
+        assert rc == 4, f"{kind}: deliberate marker must stay blocked, got rc={rc} ({payload})"
+        assert payload.get("state") == "blocked", f"{kind}: {payload}"
+        assert payload.get("liveness_state") == "blocked", f"{kind}: {payload}"
+        assert payload.get("reason") != "dispatch_worker_rate_limited", f"{kind}: {payload}"
+        assert not isinstance(payload.get("reason"), dict), f"{kind}: {payload}"
+        assert term.get("kind") == kind, f"{kind}: {term}"
+
+
 def case_worker_dead_final_reconciliation_observed_shapes() -> None:
     cases = [
         ("pynec bare complete", PYNEC_OBSERVED_TAIL, "W-pynec-fixes-2"),
@@ -905,7 +958,7 @@ def case_worker_dead_failed_marker_blocks() -> None:
     rc, _elapsed, term, payload = _run_dead_worker_tail("FAILED: x\n")
     assert rc == 4, f"FAILED should map to blocked exit 4, got rc={rc} ({payload})"
     assert payload.get("state") == "blocked", payload
-    assert payload.get("reason") == "marker:FAILED:final_reconciliation", payload
+    assert payload.get("reason") in {"marker:FAILED", "marker:FAILED:final_reconciliation"}, payload
     assert term.get("kind") == "FAILED", term
     assert term.get("text") == "x", term
 
@@ -1098,6 +1151,7 @@ def main() -> None:
     case_incomplete_identity_is_inconclusive_alive()
     case_steer_ack_is_non_terminal_marker()
     case_mid_output_marker_ignored()
+    case_live_failed_marker_blocks_not_rate_limited()
     case_ready_terminal_marker()
     case_task_terminal_breadcrumb_failure_blocks_completion()
     case_task_terminal_breadcrumb_happy_path_persists()
@@ -1106,6 +1160,7 @@ def main() -> None:
     case_dead_pid_done_signoff_completes()
     case_dead_pid_usage_limit_without_success_marker_reclassifies()
     case_dead_pid_usage_limit_mentions_with_success_marker_complete()
+    case_dead_pid_usage_limit_mentions_with_failure_markers_stay_blocked()
     case_worker_dead_final_reconciliation_observed_shapes()
     case_worker_dead_final_reconciliation_rejects_diff_and_prompt_echo()
     case_worker_dead_accepts_single_prefix_variants_outside_hunk()

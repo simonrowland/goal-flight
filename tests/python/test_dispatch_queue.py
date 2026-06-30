@@ -1175,6 +1175,63 @@ def test_stale_claim_launch_token_requires_matching_worker_record() -> None:
         assert not (tmp / "state" / "dispatch-queue" / "matched.json").exists()
 
 
+def test_stale_claim_result_marker_with_rate_limit_text_completes() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        env = _env(tmp)
+        old_env = os.environ.copy()
+        try:
+            os.environ.clear()
+            os.environ.update(env)
+            queue = tmp / "state" / "dispatch-queue"
+            queue.mkdir(parents=True)
+            dispatch_id = "queued-result-rate-mention"
+            tail = tmp / f"{dispatch_id}.tail"
+            status = tmp / f"{dispatch_id}.status.json"
+            tail.write_text(
+                "work finished\nRESULT: completed; notes mention rate limit handling\n",
+                encoding="utf-8",
+            )
+            claim = queue / f"{dispatch_id}.json.claimed-123"
+            claim.write_text(
+                json.dumps(
+                    {
+                        "schema": D.DISPATCH_QUEUE_SCHEMA,
+                        "state": "claimed",
+                        "dispatch_id": dispatch_id,
+                        "agent": "codex",
+                        "shape": "bash",
+                        "project_root": str(ROOT),
+                        "dispatch_argv": ["--agent", "codex"],
+                        "request": {
+                            "agent": "codex",
+                            "cwd": str(ROOT),
+                            "tail": str(tail),
+                            "status_json": str(status),
+                        },
+                        "queue_launch_token": "queued-result-token",
+                        "queue_launch_started": True,
+                        "queue_worker_spawn_intent": True,
+                        "queue_worker_spawn_intent_at": D.goalflight_ledger.utc_now(),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            os.utime(claim, (time.time() - 60, time.time() - 60))
+            recovered = D._recover_claimed_queue_entries(queue, stale_s=0)
+        finally:
+            os.environ.clear()
+            os.environ.update(old_env)
+        assert recovered == {"restored": 0, "cleared": 1, "pending_launch": 0}, recovered
+        record = json.loads((tmp / "state" / "runs.d" / f"{dispatch_id}.json").read_text(encoding="utf-8"))
+        assert record["state"] == "complete", record
+        assert record["terminal_state"] == "complete", record
+        assert record.get("error", {}).get("message") != "dispatch_worker_rate_limited", record
+        status_payload = json.loads(status.read_text(encoding="utf-8"))
+        assert status_payload["state"] == "complete", status_payload
+        assert status_payload.get("terminal_marker", {}).get("kind") == "RESULT", status_payload
+
+
 def test_worker_dead_tail_rate_limit_reaches_pressure_sensor() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
@@ -1255,6 +1312,7 @@ def main() -> None:
     test_stale_claim_without_worker_record_is_recovered()
     test_failed_claim_tombstone_is_not_recovered()
     test_stale_claim_launch_token_requires_matching_worker_record()
+    test_stale_claim_result_marker_with_rate_limit_text_completes()
     test_worker_dead_tail_rate_limit_reaches_pressure_sensor()
     test_submit_default_runs_one_drain_pass_after_queue_write()
     test_submit_drain_on_submit_error_does_not_fail_submit()

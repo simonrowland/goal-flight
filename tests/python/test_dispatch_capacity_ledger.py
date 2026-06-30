@@ -21,6 +21,11 @@ from types import SimpleNamespace
 ROOT = Path(__file__).resolve().parents[2]
 DISPATCH = ROOT / "scripts" / "goalflight_dispatch.py"
 STATUS = ROOT / "scripts" / "goalflight_status.py"
+sys.path.insert(0, str(ROOT / "scripts"))
+
+import goalflight_ledger  # noqa: E402
+import goalflight_rate_pressure as rp  # noqa: E402
+import goalflight_watch  # noqa: E402
 
 
 def _env(tmp: Path) -> dict[str, str]:
@@ -96,6 +101,7 @@ def _dispatch_command(
     dispatch_id: str,
     worker_code: str,
     *,
+    agent: str = "test-dispatch",
     status_path: Path | None = None,
     poll_secs: str = "0.2",
     max_idle_secs: str = "20",
@@ -108,7 +114,7 @@ def _dispatch_command(
         sys.executable,
         str(DISPATCH),
         "--agent",
-        "test-dispatch",
+        agent,
         "--dispatch-id",
         dispatch_id,
         "--tail",
@@ -138,6 +144,7 @@ def _run_dispatch(
     dispatch_id: str,
     worker_code: str,
     *,
+    agent: str = "test-dispatch",
     status_path: Path | None = None,
     poll_secs: str = "0.2",
     max_idle_secs: str = "20",
@@ -152,6 +159,7 @@ def _run_dispatch(
             tmp,
             dispatch_id,
             worker_code,
+            agent=agent,
             status_path=status_path,
             poll_secs=poll_secs,
             max_idle_secs=max_idle_secs,
@@ -524,6 +532,131 @@ def case_direct_default_background_returns_and_preserves_live_controller() -> No
         finally:
             _kill_if_alive(worker_pid)
             _kill_if_alive(watcher_pid)
+
+
+def case_default_background_finalizes_ledger_and_rate_pressure_once() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        env = _env(tmp)
+        rate_id = "background-rate-limited"
+        clean_id = "background-clean-complete"
+
+        rate_proc = _run_dispatch(
+            tmp,
+            env,
+            rate_id,
+            "import sys; print(\"You've hit your usage limit. Please try again later\", flush=True); sys.exit(1)",
+            agent="codex",
+            poll_secs="0.1",
+            max_idle_secs="5",
+            foreground=False,
+            timeout_s=8.0,
+        )
+        assert rate_proc.returncode == 0, (rate_proc.stdout, rate_proc.stderr)
+        assert "DISPATCH-LAUNCHED " in rate_proc.stdout, rate_proc.stdout
+
+        rate_path = tmp / "state" / "runs.d" / f"{rate_id}.json"
+
+        def _rate_limited_record() -> dict | None:
+            if not rate_path.exists():
+                return None
+            record = json.loads(rate_path.read_text(encoding="utf-8"))
+            return record if record.get("state") == "rate_limited" else None
+
+        rate_record = _wait_for(_rate_limited_record, timeout_s=10.0)
+        assert rate_record["terminal_state"] == "rate_limited", rate_record
+        assert rate_record.get("error", {}).get("message") == "dispatch_worker_rate_limited", rate_record
+        assert "usage limit" in json.dumps(rate_record.get("error"), sort_keys=True).lower(), rate_record
+        release = _capacity_release_stale(env)
+        assert release["count"] == 1, release
+
+        clean_proc = _run_dispatch(
+            tmp,
+            env,
+            clean_id,
+            "print('COMPLETE: background done', flush=True)",
+            agent="codex",
+            poll_secs="0.1",
+            max_idle_secs="5",
+            foreground=False,
+            timeout_s=8.0,
+        )
+        assert clean_proc.returncode == 0, (clean_proc.stdout, clean_proc.stderr)
+        clean_path = tmp / "state" / "runs.d" / f"{clean_id}.json"
+
+        def _complete_record() -> dict | None:
+            if not clean_path.exists():
+                return None
+            record = json.loads(clean_path.read_text(encoding="utf-8"))
+            return record if record.get("state") == "complete" else None
+
+        clean_record = _wait_for(_complete_record, timeout_s=10.0)
+        assert clean_record["terminal_state"] == "complete", clean_record
+
+        records = rp.collect_records(tmp / "state")
+        rate_record = next(record for record in records if record.get("dispatch_id") == rate_id)
+        clean_record = next(record for record in records if record.get("dispatch_id") == clean_id)
+        assert rp.detect_pressure_scope(rate_record, None) == rp.ACCOUNT_RATE_LIMIT_SCOPE, rate_record
+        assert rp.detect_pressure_scope(clean_record, None) is None, clean_record
+        pressure = rp.pressure_per_provider(records, window_seconds=600, now_ts=time.time())
+        assert pressure.get("provider:openai") == 1, pressure
+
+
+def case_ledger_finalize_retries_after_transient_failure() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        env = _env(tmp)
+        dispatch_id = "ledger-retry-rate-limited"
+        runs = tmp / "state" / "runs.d"
+        runs.mkdir(parents=True)
+        now_iso = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+        record = {
+            "schema": "goalflight.dispatch.v1",
+            "dispatch_id": dispatch_id,
+            "agent": "codex",
+            "state": "running",
+            "terminal_state": "unknown",
+            "started_at": now_iso,
+            "updated_at": now_iso,
+        }
+        (runs / f"{dispatch_id}.json").write_text(json.dumps(record), encoding="utf-8")
+
+        old_finish = goalflight_ledger.cmd_finish
+        calls: list[int] = []
+
+        def flaky_finish(args):
+            calls.append(1)
+            if len(calls) == 1:
+                raise OSError("transient ledger finalize")
+            return old_finish(args)
+
+        old_env = {key: os.environ.get(key) for key in ("GOALFLIGHT_STATE_DIR",)}
+        try:
+            os.environ.update(env)
+            goalflight_ledger.cmd_finish = flaky_finish
+            reason = {
+                "message": "dispatch_worker_rate_limited",
+                "tail_excerpt": "You've hit your usage limit. Please try again later.",
+            }
+            ledger_error = goalflight_watch._finish_existing_ledger(
+                dispatch_id,
+                "rate_limited",
+                reason,
+            )
+            assert ledger_error is None, ledger_error
+            assert len(calls) == 2, calls
+            finished = json.loads((runs / f"{dispatch_id}.json").read_text(encoding="utf-8"))
+            assert finished["state"] == "rate_limited", finished
+            records = rp.collect_records(tmp / "state")
+            pressure = rp.pressure_per_provider(records, window_seconds=600, now_ts=time.time())
+            assert pressure.get("provider:openai") == 1, pressure
+        finally:
+            goalflight_ledger.cmd_finish = old_finish
+            for key, value in old_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
 
 
 def case_foreground_blocks_until_terminal_state() -> None:
@@ -1390,6 +1523,8 @@ def main() -> None:
     case_from_queue_detached_launch_stamps_pidfile()
     case_from_queue_detached_launch_reparents_lease_and_survives_release_stale()
     case_direct_default_background_returns_and_preserves_live_controller()
+    case_default_background_finalizes_ledger_and_rate_pressure_once()
+    case_ledger_finalize_retries_after_transient_failure()
     case_foreground_blocks_until_terminal_state()
     case_submit_foreground_rejected()
     case_capacity_block_does_not_spawn()

@@ -64,6 +64,7 @@ from pathlib import Path
 from typing import Any
 
 import goalflight_compat
+import goalflight_dispatch_states
 
 SCHEMA = "goalflight.rate-pressure.v1"
 
@@ -230,6 +231,30 @@ def _read_status(record: dict) -> dict | None:
         return None
 
 
+def _pressure_state(record: dict, status: dict | None) -> str:
+    """Resolve the state used for pressure gating.
+
+    Ledger terminal states win. When the ledger is still non-terminal (e.g.
+    background watcher finalize failed) but the status plane already reached a
+    terminal failure, fall back to the status state so caps are not silently
+    under-counted. Successful terminal status (complete) never upgrades a
+    running ledger into pressure.
+    """
+    record_state = record.get("state")
+    record_lower = str(record_state or "").lower()
+    if goalflight_dispatch_states.is_terminal_state(record_state):
+        return record_lower
+    if not status:
+        return record_lower
+    status_state = status.get("state")
+    if not goalflight_dispatch_states.is_terminal_state(status_state):
+        return record_lower
+    normalized = goalflight_dispatch_states.normalize_dispatch_state(status_state)
+    if normalized == "complete":
+        return record_lower
+    return (normalized or str(status_state or "")).lower()
+
+
 def _status_haystack(status: dict | None) -> str:
     if not status:
         return ""
@@ -250,6 +275,12 @@ def _status_haystack(status: dict | None) -> str:
     result_text = status.get("result_text")
     if result_text:
         haystack_parts.append(str(result_text))
+    reason = status.get("reason")
+    if reason:
+        if isinstance(reason, dict):
+            haystack_parts.append(json.dumps(reason))
+        else:
+            haystack_parts.append(str(reason))
     return " ".join(haystack_parts).lower()
 
 
@@ -264,7 +295,7 @@ def detect_pressure_scope(record: dict, status: dict | None) -> str | None:
     credentials) that need credential repair, not cap-halving. Counting them
     here would trigger walkback recommendations that mask the real fix.
     """
-    state = (record.get("state") or "").lower()
+    state = _pressure_state(record, status)
     if state == "blocked_session_limit":
         return ACCOUNT_RATE_LIMIT_SCOPE
     # Failure-ish states whose error text deserves a pattern scan (coverage
