@@ -210,6 +210,68 @@ def case_dead_lease_no_ttl_not_expired() -> None:
     )
 
 
+def case_rate_limited_retained_lease_pruned() -> None:
+    """Retained (--keep) leases in canonical terminal-FAILURE states must prune.
+
+    Regression: TERMINAL_LEASE_STATES was hand-maintained and had drifted from
+    goalflight_dispatch_states.TERMINAL_FAILURE_STATES, so a retained lease in a
+    newer state (rate_limited, stalled, remote_turn_silence, failed_worktree)
+    was never popped by prune_state and accumulated forever in capacity.json.
+    The set is now derived from the canonical vocabulary; assert membership and
+    the actual prune behavior (the path TERMINAL_LEASE_STATES gates).
+    """
+    for state in ("rate_limited", "stalled", "remote_turn_silence", "failed_worktree"):
+        assert state in cap.TERMINAL_LEASE_STATES, (
+            f"{state!r} (a canonical terminal-failure state) missing from "
+            "TERMINAL_LEASE_STATES -> retained leases in it would leak"
+        )
+
+    # >24h-old terminal rate_limited lease is pruned (pids irrelevant on the
+    # terminal-state path; no expires_at so the TTL branch is skipped).
+    old = {
+        "lease_id": "rl-old",
+        "agent": "codex",
+        "state": "rate_limited",
+        "worker_pid": None,
+        "controller_pid": None,
+        "ended_at": cap.iso(cap.utc_now() - dt.timedelta(hours=25)),
+    }
+    data = {"leases": {"rl-old": old}, "cooldowns": {}}
+    cap.prune_state(data)
+    assert "rl-old" not in data["leases"], (
+        "a >24h-old retained rate_limited lease was not pruned"
+    )
+
+    # A terminal rate_limited lease with no terminal timestamp prunes immediately.
+    no_ts = {
+        "lease_id": "rl-no-ts",
+        "agent": "codex",
+        "state": "rate_limited",
+        "worker_pid": None,
+        "controller_pid": None,
+    }
+    data2 = {"leases": {"rl-no-ts": no_ts}, "cooldowns": {}}
+    cap.prune_state(data2)
+    assert "rl-no-ts" not in data2["leases"], (
+        "a terminal rate_limited lease with no terminal_at was not pruned"
+    )
+
+    # A <24h-old terminal rate_limited lease stays (within the prune window).
+    recent = {
+        "lease_id": "rl-recent",
+        "agent": "codex",
+        "state": "rate_limited",
+        "worker_pid": None,
+        "controller_pid": None,
+        "ended_at": cap.iso(cap.utc_now() - dt.timedelta(hours=1)),
+    }
+    data3 = {"leases": {"rl-recent": recent}, "cooldowns": {}}
+    cap.prune_state(data3)
+    assert "rl-recent" in data3["leases"], (
+        "a <24h-old terminal rate_limited lease was pruned too early"
+    )
+
+
 def case_capacity_wait_resolution_precedence() -> None:
     assert cap.resolve_capacity_wait_s(lane="bulk", wait_s=7, env={"GOALFLIGHT_CAPACITY_WAIT_S": "3"}) == 7.0
     assert cap.resolve_capacity_wait_s(lane="critical", wait_s=None, env={"GOALFLIGHT_CAPACITY_WAIT_S": "4.5"}) == 4.5
@@ -634,6 +696,7 @@ def main() -> None:
     case_live_worker_dead_controller_survives_prune()
     case_dead_lease_past_ttl_is_reclaimed()
     case_dead_lease_no_ttl_not_expired()
+    case_rate_limited_retained_lease_pruned()
     case_empty_state_dir_falls_back_not_cwd()
     case_capacity_wait_resolution_precedence()
     case_acquire_with_wait_zero_preserves_single_shot_payload()

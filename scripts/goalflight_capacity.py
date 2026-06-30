@@ -23,6 +23,7 @@ import uuid
 
 import goalflight_compat
 import goalflight_compat as fcntl
+import goalflight_dispatch_states
 import goalflight_rate_pressure
 from goalflight_liveness import active_monotonic
 
@@ -353,28 +354,28 @@ async def acquire_with_wait_async(
             signum=signum,
         ) from None
 
-TERMINAL_LEASE_STATES = {
+# Terminal success / cleanup / lease-specific states (those NOT in the dispatch
+# failure vocabulary), unioned with the canonical terminal-failure states so a
+# newly-introduced failure state (e.g. rate_limited, stalled) cannot silently
+# leak retained (--keep) leases by being omitted here.
+_LEASE_NONFAILURE_TERMINAL = {
     "released",
     "expired",
     "complete",
-    "failed",
-    "wedged",
-    "tool_timeout",
     # Legacy 0.4.3 terminal state. Current ACP oversized frames drop and
     # continue; keep this so old lease records still prune.
     "result_too_large",
-    "blocked",
     "blocked_capacity",
     "blocked_session_limit",
-    "blocked_auth",
-    "worker_dead",
     "idle_timeout",
-    "controller_dead",
     "orphaned",
     "inconclusive_timeout",
     "inconclusive_no_final",
     "superseded",
 }
+TERMINAL_LEASE_STATES = _LEASE_NONFAILURE_TERMINAL | set(
+    goalflight_dispatch_states.TERMINAL_FAILURE_STATES
+)
 
 
 def utc_now() -> dt.datetime:
