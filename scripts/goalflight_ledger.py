@@ -24,6 +24,7 @@ import uuid
 import goalflight_compat
 import goalflight_compat as fcntl
 import goalflight_dispatch_states
+import goalflight_terminal
 
 SCHEMA = "goalflight.dispatch.v1"
 
@@ -282,6 +283,8 @@ def terminal_state_for(state: object, reason: object = None) -> str:
         return "complete"
     if state == "worker_dead":
         return "worker_dead"
+    if state == "rate_limited":
+        return "rate_limited"
     if state == "idle_timeout":
         return "idle_timeout"
     if state == "watcher_stopped":
@@ -459,6 +462,7 @@ def cmd_finish(args: argparse.Namespace) -> int:
         record["ended_at"] = ended_at
         terminal_state = getattr(args, "terminal_state", None) or terminal_state_for(args.state, args.reason)
         record["terminal_state"] = terminal_state
+        record["liveness_state"] = goalflight_terminal.terminal_liveness_state(args.state)
         elapsed_s = getattr(args, "elapsed_s", None)
         if elapsed_s is None:
             elapsed_s = elapsed_seconds(record, ended_at)
@@ -466,7 +470,7 @@ def cmd_finish(args: argparse.Namespace) -> int:
             record["elapsed_s"] = round(float(elapsed_s), 3)
         if hasattr(args, "worker_still_alive"):
             record["worker_still_alive"] = args.worker_still_alive
-        envelope = failure_envelope(args.reason) if terminal_state != "complete" else None
+        envelope = failure_envelope(args.reason)
         record["outcome"] = {"terminal_state": terminal_state}
         if envelope:
             record.update(envelope)
@@ -491,6 +495,7 @@ def status_payload() -> dict:
             "state": r.get("state"),
             "classification": classify(r),
             "terminal_state": r.get("terminal_state") or terminal_state_for(r.get("state"), r.get("reason") or r.get("error")),
+            "liveness_state": r.get("liveness_state"),
             "elapsed_s": elapsed_seconds(r),
             "worker_still_alive": r.get("worker_still_alive"),
             "worker_pid": r.get("worker_pid"),

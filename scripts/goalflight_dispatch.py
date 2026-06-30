@@ -66,7 +66,7 @@ import goalflight_compat
 import goalflight_capacity
 import goalflight_dispatch_states
 import goalflight_ledger
-import goalflight_rate_pressure
+import goalflight_terminal
 from goalflight_liveness import active_monotonic, process_group_id, write_status
 from goalflight_watch import (
     _final_terminal_marker,
@@ -86,7 +86,6 @@ PRESET_AGENTS = {"codex", "grok-code", "grok-research"}
 STDIN_PROMPT_AGENTS = {"codex", "grok-code", "grok-research"}
 DEFAULT_MAX_IDLE_SECS = 180.0
 CODE_WRITER_MAX_IDLE_SECS = 600.0
-RATE_LIMIT_TAIL_BYTES = 2048
 CODE_WRITER_AGENTS = {"codex", "codex-acp", "grok-code", "grok-acp", "cursor", "cursor-agent"}
 ACCOUNT_ENGINE_BY_AGENT = {
     "codex": "codex",
@@ -304,6 +303,8 @@ def _status_exit_code(state: object) -> int:
         return 0
     if state == "worker_dead":
         return 1
+    if state == "rate_limited":
+        return 1
     if state == "idle_timeout":
         return 2
     if state in {"orphaned", "controller_dead"}:
@@ -311,41 +312,6 @@ def _status_exit_code(state: object) -> int:
     if state == "blocked" or (isinstance(state, str) and state.startswith("blocked")):
         return 4
     return 1
-
-
-def _read_tail_excerpt(path: Path, max_bytes: int = RATE_LIMIT_TAIL_BYTES) -> str:
-    try:
-        size = path.stat().st_size
-        with path.open("rb") as f:
-            f.seek(max(0, size - max_bytes))
-            return f.read(max_bytes).decode("utf-8", errors="replace")
-    except OSError:
-        return ""
-
-
-def _rate_limit_signature_in_text(text: str) -> str | None:
-    lowered = text.lower()
-    for pattern in goalflight_rate_pressure.RATE_LIMIT_PATTERNS:
-        if pattern in lowered:
-            return pattern
-    return None
-
-
-def _worker_dead_rate_limit_reason(state: str | None, reason: str | None, tail: Path) -> object:
-    if state != "worker_dead":
-        return reason
-    excerpt = _read_tail_excerpt(tail).strip()
-    if not excerpt:
-        return reason
-    if not goalflight_rate_pressure.detect_rate_limit_signature({"state": "worker_dead", "error": excerpt}, None):
-        return reason
-    signature = _rate_limit_signature_in_text(excerpt)
-    return {
-        "message": "dispatch_worker_rate_limited",
-        "rate_limit_signature": signature or "unknown",
-        "tail_excerpt": excerpt,
-        "reason": reason,
-    }
 
 
 def _is_status_terminal(state: object) -> bool:
@@ -375,7 +341,7 @@ def _status_matches_current_launch(
 
 
 def _reattach_hint(dispatch_id: str) -> str:
-    return f"worker still alive - re-attach via goalflight_status.py --done {dispatch_id}"
+    return f"worker still alive - re-attach via goalflight_status.py --wait {dispatch_id}"
 
 
 def _foreground_wait_interrupt_hint(dispatch_id: str) -> str:
@@ -462,6 +428,12 @@ def _repair_watcher_terminal_status(
         state = "watcher_stopped"
     else:
         state = "worker_dead"
+    state, final_reason, _rate_limited = goalflight_terminal.terminal_rate_limit_outcome(
+        state,
+        reason,
+        tail,
+        success_marker_present=goalflight_terminal.terminal_success_marker_present(terminal_marker),
+    )
     payload.update({
         "schema": "goalflight.status.v1",
         "dispatch_id": args.dispatch_id,
@@ -474,7 +446,8 @@ def _repair_watcher_terminal_status(
         "tail_path": str(tail),
         "terminal_marker": terminal_marker if isinstance(terminal_marker, dict) else None,
         "state": state,
-        "reason": reason,
+        "reason": final_reason,
+        "liveness_state": goalflight_terminal.terminal_liveness_state(state),
         "updated_at": int(time.time()),
     })
     if terminal_pending_state:
@@ -2451,8 +2424,14 @@ def _mark_claim_worker_dead(entry: dict, *, reason: str) -> None:
                 status_json=status_json,
                 tail=tail,
             )
+    state, final_reason, _rate_limited = goalflight_terminal.terminal_rate_limit_outcome(
+        "worker_dead",
+        reason,
+        tail,
+        success_marker_present=False,
+    )
     with contextlib.suppress(Exception):
-        _finish_ledger(dispatch_id, "worker_dead", reason, worker_still_alive=False)
+        _finish_ledger(dispatch_id, state or "worker_dead", final_reason, worker_still_alive=False)
     with contextlib.suppress(Exception):
         write_status(
             status_json,
@@ -2461,9 +2440,10 @@ def _mark_claim_worker_dead(entry: dict, *, reason: str) -> None:
                 "dispatch_id": dispatch_id,
                 "agent": args.agent,
                 "shape": args.shape,
-                "state": "worker_dead",
-                "terminal_state": "worker_dead",
-                "reason": reason,
+                "state": state or "worker_dead",
+                "terminal_state": goalflight_ledger.terminal_state_for(state or "worker_dead", final_reason),
+                "reason": final_reason,
+                "liveness_state": goalflight_terminal.terminal_liveness_state(state or "worker_dead"),
                 "project_root": str(project_root),
                 "worker_pid": entry.get("queue_worker_pid"),
                 "worker_alive": False,
@@ -3410,6 +3390,7 @@ def main(argv: list[str] | None = None) -> int:
     detached_launched = False
     final_state = "failed"
     final_reason = None
+    final_success_marker_present = False
     worker_alive = None
     watch_rc = 1
     dispatch_started = time.time()
@@ -3690,6 +3671,9 @@ def main(argv: list[str] | None = None) -> int:
         try:
             state = rec.get("state")
             worker_alive = rec.get("worker_alive")
+            final_success_marker_present = goalflight_terminal.terminal_success_marker_present(
+                rec.get("terminal_marker")
+            )
         except Exception:
             pass
         if not final_reason and watch_log.exists():
@@ -3739,7 +3723,14 @@ def main(argv: list[str] | None = None) -> int:
         keep_live_watcher_open = _is_live_watcher_stopped(final_state, final_worker_alive)
         if ledger_recorded and not detached_launched and not keep_live_watcher_open:
             with contextlib.suppress(Exception):
-                ledger_reason = _worker_dead_rate_limit_reason(final_state, final_reason, tail)
+                final_state, ledger_reason, _rate_limited = goalflight_terminal.terminal_rate_limit_outcome(
+                    final_state,
+                    final_reason,
+                    tail,
+                    success_marker_present=final_success_marker_present,
+                )
+                if _rate_limited:
+                    final_reason = ledger_reason
                 _finish_ledger(
                     args.dispatch_id,
                     final_state,

@@ -357,14 +357,14 @@ def test_dispatch_end_hint() -> None:
         worker_alive=True,
     )
     check("idle-timeout live worker gets reattach hint",
-          hint == "worker still alive - re-attach via goalflight_status.py --done quiet-worker")
+          hint == "worker still alive - re-attach via goalflight_status.py --wait quiet-worker")
     hint = D._dispatch_end_reattach_hint(
         "marker-worker",
         terminal_state="watcher_stopped",
         worker_alive=True,
     )
     check("watcher-stopped live worker gets reattach hint",
-          hint == "worker still alive - re-attach via goalflight_status.py --done marker-worker")
+          hint == "worker still alive - re-attach via goalflight_status.py --wait marker-worker")
     check("dead idle-timeout gets no hint",
           D._dispatch_end_reattach_hint("dead", terminal_state="idle_timeout", worker_alive=False) is None)
 

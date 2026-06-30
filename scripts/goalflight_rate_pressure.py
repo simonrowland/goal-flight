@@ -120,6 +120,7 @@ RATE_LIMIT_PATTERNS: tuple[str, ...] = (
     "429",
     "you've hit your limit",
     "usage limit",
+    "try again at",
     "anthropic.ratelimiterror",
     "openai.ratelimiterror",
     "session_limit",
@@ -275,7 +276,7 @@ def detect_pressure_scope(record: dict, status: dict | None) -> str | None:
     # gate — counting it would feed our queueing back into the walk-back and
     # falsely halve provider caps (self-referential pressure). "blocked_auth"
     # stays excluded per the note above.
-    if state not in {"failed", "inconclusive_timeout", "blocked", "inconclusive_no_final", "worker_dead"}:
+    if state not in {"failed", "inconclusive_timeout", "blocked", "inconclusive_no_final", "worker_dead", "rate_limited"}:
         # Successful, pending, capacity-, or auth-blocked dispatches don't count.
         return None
 

@@ -233,7 +233,7 @@ def _reconcile_output_tail_record(record: dict) -> dict:
 
 def _reattach_hint(record: dict) -> str:
     dispatch_id = record.get("dispatch_id") or "<id>"
-    return f"worker still alive - re-attach via goalflight_status.py --done {dispatch_id}"
+    return f"worker still alive - re-attach via goalflight_status.py --wait {dispatch_id}"
 
 
 def _dispatch_queue_dir() -> Path:
@@ -467,7 +467,7 @@ def _terminal_state(record: dict | None, *, code: int, timed_out: bool = False) 
         return "timeout" if timed_out else (record.get("classification") or "live")
     cls = record.get("classification") or record.get("state") or "unknown"
     if cls == "idle_timeout":
-        return "worker_dead"
+        return "idle_timeout"
     return str(record.get("terminal_state") or cls)
 
 

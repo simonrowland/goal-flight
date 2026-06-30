@@ -22,8 +22,10 @@ def test_dispatch_state_aliases_and_lifecycle() -> None:
     assert states.is_running_state("watcher_stopped") is True
     assert states.is_terminal_state("watcher_stopped") is False
     assert states.is_terminal_state("controller_dead") is True
+    assert states.is_terminal_state("rate_limited") is True
     assert states.terminal_state_for("watcher_stopped") == "watcher_stopped"
     assert states.terminal_state_for("controller_dead") == "controller_dead"
+    assert states.terminal_state_for("rate_limited") == "rate_limited"
     assert states.state_seq_rank("watcher_stopped") == 45
 
 
@@ -35,6 +37,7 @@ def test_ledger_uses_shared_terminal_vocabulary() -> None:
         "stalled",
         "failed_worktree",
         "blocked_adapter_gate",
+        "rate_limited",
         "wedged",
         "error",
     ):

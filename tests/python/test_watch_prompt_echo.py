@@ -614,6 +614,7 @@ def case_dead_pid_stale_output_bounds_worker_dead() -> None:
     assert rc == 1, f"stale output must become worker_dead, got rc={rc} ({payload})"
     assert elapsed < 3.0, f"worker_dead should be bounded by the fresh window, elapsed={elapsed:.1f}s"
     assert payload.get("state") == "worker_dead", payload
+    assert payload.get("liveness_state") == "worker_dead", payload
     assert payload.get("reason") == "worker_dead_no_terminal_marker", payload
     assert not term, term
 
@@ -628,10 +629,51 @@ def case_dead_pid_done_signoff_completes() -> None:
         rc, _elapsed, term, payload = _run_dead_worker_tail(tail_text)
         assert rc == 0, f"{tail_text!r} must complete, got rc={rc} ({payload})"
         assert payload.get("state") == "complete", payload
+        assert payload.get("liveness_state") == "completed", payload
         assert payload.get("reason") == expected_reason, payload
         assert term.get("kind") == "COMPLETE", term
         assert term.get("text") == "", term
         assert payload.get("markers", [])[-1].get("kind") == "COMPLETE", payload
+
+
+def case_dead_pid_usage_limit_without_success_marker_reclassifies() -> None:
+    rc, _elapsed, term, payload = _run_dead_worker_tail(
+        "You've hit your usage limit. Please try again at 6:13 AM.\n"
+    )
+    assert rc == 1, f"rate limit must be retryable, got rc={rc} ({payload})"
+    assert payload.get("state") == "rate_limited", payload
+    assert payload.get("liveness_state") == "rate_limited", payload
+    reason = payload.get("reason")
+    assert isinstance(reason, dict), payload
+    assert reason.get("message") == "dispatch_worker_rate_limited", reason
+    assert reason.get("rate_limit_signature") == "usage limit", reason
+    assert reason.get("reason") == "worker_dead_no_terminal_marker", reason
+    assert "try again at 6:13 AM" in reason.get("tail_excerpt", ""), reason
+    assert not term, term
+
+
+def case_dead_pid_usage_limit_mentions_with_success_marker_complete() -> None:
+    cases = [
+        (
+            "marker-seen",
+            "Summary mentions usage limit, 429, try again at 6:13 AM, rate limit, at capacity.\n"
+            "COMPLETE: capped terms documented\n",
+            "marker:COMPLETE",
+        ),
+        (
+            "final-reconciliation",
+            "READY: capped terms documented\n"
+            "Summary mentions usage limit, 429, try again at 6:13 AM, rate limit, at capacity.\n",
+            "marker:READY:final_reconciliation",
+        ),
+    ]
+    for label, tail_text, expected_reason in cases:
+        rc, _elapsed, term, payload = _run_dead_worker_tail(tail_text)
+        assert rc == 0, f"{label}: success marker must complete, got rc={rc} ({payload})"
+        assert payload.get("state") == "complete", f"{label}: {payload}"
+        assert payload.get("liveness_state") == "completed", f"{label}: {payload}"
+        assert payload.get("reason") == expected_reason, f"{label}: {payload}"
+        assert term.get("kind") in {"COMPLETE", "READY"}, f"{label}: {term}"
 
 
 def case_worker_dead_final_reconciliation_observed_shapes() -> None:
@@ -650,6 +692,7 @@ def case_worker_dead_final_reconciliation_observed_shapes() -> None:
         rc, _elapsed, term, payload = _run_dead_worker_tail(tail_text)
         assert rc == 0, f"{label}: expected final reconciliation exit 0, got {rc} ({payload})"
         assert payload.get("state") == "complete", f"{label}: {payload}"
+        assert payload.get("liveness_state") == "completed", f"{label}: {payload}"
         assert payload.get("reason") == "marker:COMPLETE:final_reconciliation", f"{label}: {payload}"
         assert term.get("kind") == "COMPLETE", f"{label}: {term}"
         assert term.get("text") == expected_text, f"{label}: {term}"
@@ -1061,6 +1104,8 @@ def main() -> None:
     case_dead_pid_fresh_output_vetoes_worker_dead()
     case_dead_pid_stale_output_bounds_worker_dead()
     case_dead_pid_done_signoff_completes()
+    case_dead_pid_usage_limit_without_success_marker_reclassifies()
+    case_dead_pid_usage_limit_mentions_with_success_marker_complete()
     case_worker_dead_final_reconciliation_observed_shapes()
     case_worker_dead_final_reconciliation_rejects_diff_and_prompt_echo()
     case_worker_dead_accepts_single_prefix_variants_outside_hunk()

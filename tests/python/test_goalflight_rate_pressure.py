@@ -161,6 +161,30 @@ def test_detect_worker_dead_with_rate_limit_record_error():
     )
 
 
+def test_detect_rate_limited_complete_exit_record_error():
+    """A complete/exit-0 dispatch reclassified as rate_limited remains visible."""
+    record = {
+        "agent": "codex",
+        "state": "rate_limited",
+        "error": {
+            "message": "dispatch_worker_rate_limited",
+            "reason": "marker:COMPLETE",
+            "tail_excerpt": "You've hit your usage limit. Please try again at 6:13 AM.",
+        },
+    }
+    assert_eq(
+        "rate_limited complete-exit signal",
+        rp.detect_pressure_scope(record, None),
+        rp.ACCOUNT_RATE_LIMIT_SCOPE,
+    )
+
+
+def test_detect_try_again_at_pattern():
+    record = {"agent": "codex", "state": "failed"}
+    status = {"error": "You've hit your usage limit. Please try again at 6:13 AM."}
+    assert_true("try again at pattern", rp.detect_rate_limit_signature(record, status))
+
+
 # ----- pressure_per_provider() -----
 
 def _build_record(agent, state, updated_at, dispatch_id="d"):

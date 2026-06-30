@@ -14,6 +14,7 @@ TERMINAL_FAILURE_STATES = frozenset(
         "blocked_adapter_gate",
         "blocked_auth",
         "inconclusive_timeout",
+        "rate_limited",
         "worker_dead",
         "tool_timeout",
         "stalled",
@@ -109,6 +110,8 @@ def terminal_state_for(state: object, reason: object = None) -> str:
         return "complete"
     if normalized == "worker_dead":
         return "worker_dead"
+    if normalized == "rate_limited":
+        return "rate_limited"
     if normalized == "inconclusive_timeout":
         return "idle_timeout"
     if state == "watcher_stopped":

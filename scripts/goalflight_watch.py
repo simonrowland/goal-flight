@@ -22,6 +22,7 @@ if str(ROOT) not in sys.path:
 import goalflight_compat
 import goalflight_ledger
 import goalflight_task
+import goalflight_terminal
 from goalflight_liveness import (
     LivenessThresholds,
     active_monotonic,
@@ -78,6 +79,8 @@ def _exit_code_for_state(state: str) -> int:
     if state == "complete":
         return 0
     if state == "worker_dead":
+        return 1
+    if state == "rate_limited":
         return 1
     if state == "idle_timeout":
         return 2
@@ -643,6 +646,19 @@ def main() -> int:
         nonlocal last_payload, final_status_written, working_breadcrumb_written
         if reason:
             payload["reason"] = reason
+        if terminal_write:
+            final_state, final_reason, _rate_limited = goalflight_terminal.terminal_rate_limit_outcome(
+                payload.get("state"),
+                payload.get("reason"),
+                tail,
+                success_marker_present=goalflight_terminal.terminal_success_marker_present(
+                    payload.get("terminal_marker") or terminal_seen
+                ),
+            )
+            payload["state"] = final_state
+            if final_reason not in (None, ""):
+                payload["reason"] = final_reason
+            payload["liveness_state"] = goalflight_terminal.terminal_liveness_state(payload.get("state"))
         terminal_error = None
         if task_ids:
             payload["task_ids"] = list(task_ids)
@@ -666,6 +682,9 @@ def main() -> int:
                         payload["task_breadcrumb_failed_reason"] = payload.get("reason")
                     payload["state"] = BLOCKED_TASK_BREADCRUMB_STATE
                     payload["reason"] = "task_breadcrumb_error"
+                    payload["liveness_state"] = goalflight_terminal.terminal_liveness_state(payload.get("state"))
+        if terminal_write:
+            payload["liveness_state"] = goalflight_terminal.terminal_liveness_state(payload.get("state"))
         write_status(status_path, payload)
         last_payload = dict(payload)
         if terminal_write:

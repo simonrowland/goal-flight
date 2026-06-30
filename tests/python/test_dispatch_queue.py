@@ -1213,9 +1213,11 @@ def test_worker_dead_tail_rate_limit_reaches_pressure_sensor() -> None:
         )
         assert proc.returncode == 1, (proc.stdout, proc.stderr)
         record = json.loads((tmp / "state" / "runs.d" / "tail-rate-limit.json").read_text(encoding="utf-8"))
-        assert record["state"] == "worker_dead", record
+        assert record["state"] == "rate_limited", record
+        assert record["terminal_state"] == "rate_limited", record
         error_text = json.dumps(record.get("error"), sort_keys=True)
         assert "usage limit" in error_text.lower(), record
+        assert record.get("error", {}).get("reason") == "worker_dead_no_terminal_marker", record
         pressure = _run(
             [
                 sys.executable,

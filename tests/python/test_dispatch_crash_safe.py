@@ -33,6 +33,7 @@ WATCH = ROOT / "scripts" / "goalflight_watch.py"
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import goalflight_acp_client  # noqa: E402
+import goalflight_rate_pressure  # noqa: E402
 
 
 def _wait_for(predicate, timeout: float = 8.0, interval: float = 0.1) -> bool:
@@ -95,6 +96,109 @@ def case_finished_via_marker() -> None:
     assert end.get("terminal_state") == "complete", end
 
 
+def _run_dispatch_with_state(dispatch_id: str, worker_code: str, *, max_idle: str = "20", poll: str = "0.2"):
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        tail = tmp_path / "tail.txt"
+        status = tmp_path / "status.json"
+        state_dir = tmp_path / "state"
+        env = os.environ.copy()
+        env["GOALFLIGHT_STATE_DIR"] = str(state_dir)
+        env["GOAL_FLIGHT_PIDFILE_DIR"] = str(tmp_path / "pids")
+        proc = subprocess.run(
+            [
+                sys.executable, str(DISPATCH),
+                "--agent", "codex",
+                "--dispatch-id", dispatch_id,
+                "--tail", str(tail),
+                "--status-json", str(status),
+                "--poll-secs", poll,
+                "--max-idle-secs", max_idle,
+                "--foreground",
+                "--",
+                sys.executable, "-c", worker_code,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=float(max_idle) + 30,
+            env=env,
+        )
+        end = {}
+        for line in proc.stdout.strip().splitlines():
+            if line.startswith("DISPATCH-END "):
+                end = json.loads(line.split(" ", 1)[1])
+        payload = json.loads(status.read_text(encoding="utf-8")) if status.exists() else {}
+        record_path = state_dir / "runs.d" / f"{dispatch_id}.json"
+        record = json.loads(record_path.read_text(encoding="utf-8")) if record_path.exists() else {}
+        return proc.returncode, end, payload, record
+
+
+def case_dispatch_usage_limit_exit_zero_is_retryable() -> None:
+    worker_code = (
+        "print(\"You've hit your usage limit. Please try again at 6:13 AM.\", flush=True)\n"
+    )
+    rc, end, payload, record = _run_dispatch_with_state("usage-limit-exit-zero", worker_code)
+    assert rc == 1, (rc, end, payload, record)
+    assert end.get("terminal_state") == "rate_limited", end
+    assert payload.get("state") == "rate_limited", payload
+    assert payload.get("liveness_state") == "rate_limited", payload
+    reason = payload.get("reason")
+    assert isinstance(reason, dict), payload
+    assert reason.get("message") == "dispatch_worker_rate_limited", reason
+    assert reason.get("reason") == "worker_dead_no_terminal_marker", reason
+    assert record.get("state") == "rate_limited", record
+    assert record.get("terminal_state") == "rate_limited", record
+    assert record.get("liveness_state") == "rate_limited", record
+    assert record.get("error", {}).get("message") == "dispatch_worker_rate_limited", record
+    assert goalflight_rate_pressure.detect_rate_limit_signature(record, None), record
+
+
+def case_dispatch_success_marker_with_limit_terms_stays_complete() -> None:
+    worker_code = (
+        "print('Docs mention usage limit, 429, try again at 6:13 AM, rate limit, at capacity.', flush=True)\n"
+        "print('READY: terminal summary includes rate limit data', flush=True)\n"
+    )
+    rc, end, payload, record = _run_dispatch_with_state("success-marker-limit-terms", worker_code)
+    assert rc == 0, (rc, end, payload, record)
+    assert end.get("terminal_state") == "complete", end
+    assert payload.get("state") == "complete", payload
+    assert payload.get("liveness_state") == "completed", payload
+    assert payload.get("reason") == "marker:READY", payload
+    assert record.get("state") == "complete", record
+    assert record.get("terminal_state") == "complete", record
+    assert record.get("liveness_state") == "completed", record
+    assert "error" not in record, record
+    assert not goalflight_rate_pressure.detect_rate_limit_signature(record, payload), record
+
+
+def case_dispatch_clean_complete_preserves_reason_without_rate_signal() -> None:
+    worker_code = "print('COMPLETE: clean', flush=True)\n"
+    rc, end, payload, record = _run_dispatch_with_state("clean-complete", worker_code)
+    assert rc == 0, (rc, end, payload, record)
+    assert end.get("terminal_state") == "complete", end
+    assert payload.get("state") == "complete", payload
+    assert payload.get("liveness_state") == "completed", payload
+    assert payload.get("reason") == "marker:COMPLETE", payload
+    assert record.get("state") == "complete", record
+    assert record.get("terminal_state") == "complete", record
+    assert record.get("liveness_state") == "completed", record
+    assert record.get("reason") == "marker:COMPLETE", record
+    assert "error" not in record, record
+    assert not goalflight_rate_pressure.detect_rate_limit_signature(record, payload), record
+
+
+def case_dispatch_worker_dead_ledger_liveness() -> None:
+    worker_code = "print('worker crashed before sign-off', flush=True)\nraise SystemExit(9)\n"
+    rc, end, payload, record = _run_dispatch_with_state("worker-dead-liveness", worker_code)
+    assert rc == 1, (rc, end, payload, record)
+    assert end.get("terminal_state") == "worker_dead", end
+    assert payload.get("state") == "worker_dead", payload
+    assert payload.get("liveness_state") == "worker_dead", payload
+    assert record.get("state") == "worker_dead", record
+    assert record.get("terminal_state") == "worker_dead", record
+    assert record.get("liveness_state") == "worker_dead", record
+
+
 def case_post_terminal_idle_worker_finishes() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
@@ -144,6 +248,7 @@ def case_post_terminal_idle_worker_finishes() -> None:
             assert elapsed < 12, f"post-terminal idle wait took {elapsed:.1f}s"
             payload = json.loads(status.read_text(encoding="utf-8"))
             assert payload.get("state") == "complete", payload
+            assert payload.get("liveness_state") == "completed", payload
             assert payload.get("worker_alive") is True, payload
             assert payload.get("reason") == "marker:COMPLETE:post_terminal_idle_timeout", payload
             assert worker.poll() is None, "worker should still be alive until test cleanup"
@@ -228,6 +333,7 @@ def case_worker_and_watcher_survive_launcher_pgroup_sigterm() -> None:
             ), status.read_text(encoding="utf-8") if status.exists() else "missing status"
             payload = json.loads(status.read_text(encoding="utf-8"))
             assert payload.get("state") == "complete", payload
+            assert payload.get("liveness_state") == "completed", payload
         finally:
             if proc.poll() is None:
                 os.killpg(proc.pid, signal.SIGTERM)
@@ -382,6 +488,10 @@ def case_watcher_sigterm_flushes_non_running_status() -> None:
 def main() -> None:
     case_crash_detected_promptly()
     case_finished_via_marker()
+    case_dispatch_usage_limit_exit_zero_is_retryable()
+    case_dispatch_success_marker_with_limit_terms_stays_complete()
+    case_dispatch_clean_complete_preserves_reason_without_rate_signal()
+    case_dispatch_worker_dead_ledger_liveness()
     case_post_terminal_idle_worker_finishes()
     case_dispatch_post_terminal_idle_returns_success()
     case_worker_and_watcher_survive_launcher_pgroup_sigterm()

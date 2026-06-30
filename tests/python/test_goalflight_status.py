@@ -391,7 +391,7 @@ def test_idle_timeout_live_hint_rendered() -> None:
         digest = "\n".join(S.render_text(S.scope_payload(payload, "/repo/A"), 10))
         check("idle-timeout live worker counted running", digest.splitlines()[0].startswith("A: running2"))
         check("idle-timeout live worker hint rendered",
-              "worker still alive - re-attach via goalflight_status.py --done timeout-live" in digest)
+              "worker still alive - re-attach via goalflight_status.py --wait timeout-live" in digest)
     finally:
         S.goalflight_ledger.identity_matches = orig_identity_matches
 
@@ -555,7 +555,7 @@ def test_wait_cli() -> None:
         out = buf.getvalue()
         check("--wait all-terminal returns 0", rc == 0)
         check("--wait prints complete digest", out.splitlines()[0] == "wait complete: 2/2 terminal")
-        check("--wait maps dead idle_timeout to worker_dead", "dead1 -> worker_dead" in out)
+        check("--wait preserves idle_timeout label", "dead1 -> idle_timeout" in out)
 
         buf = io.StringIO()
         with redirect_stdout(buf):
@@ -745,7 +745,7 @@ def test_wait_snapshot_uses_single_liveness_result() -> None:
         rows = S._wait_snapshot(payload, ["timeout-flip"])
         check("--wait snapshot evaluates timeout liveness once", len(calls) == 1)
         check("--wait snapshot keeps terminal decision stable", rows[0]["terminal"] is True)
-        check("--wait snapshot keeps terminal state stable", rows[0]["state"] == "worker_dead")
+        check("--wait snapshot preserves idle-timeout label", rows[0]["state"] == "idle_timeout")
     finally:
         S.goalflight_ledger.identity_matches = orig_identity_matches
 
