@@ -1517,7 +1517,34 @@ def case_dispatch_stats_window_and_legacy_records() -> None:
         assert not (tmp / "state" / "dispatch").exists(), "stats materialized dispatch side effects"
 
 
+def case_ledger_finish_cli_accepts_rate_limited() -> None:
+    """`finish --terminal-state rate_limited` must be accepted by the CLI.
+
+    Regression: the argparse choices for --terminal-state were hand-maintained
+    and omitted rate_limited, so a CLI caller (`finish --terminal-state
+    rate_limited`) was argparse-rejected even though the state is valid and the
+    internal _finish_ledger path handles it. The choices are now derived from
+    goalflight_dispatch_states.TERMINAL_FAILURE_STATES so they can't drift.
+    """
+    import goalflight_dispatch_states as ds
+
+    parser = goalflight_ledger.build_parser()
+    ns = parser.parse_args([
+        "finish", "--dispatch-id", "ledger-cli-rl",
+        "--state", "rate_limited", "--terminal-state", "rate_limited",
+    ])
+    assert ns.terminal_state == "rate_limited", ns
+    # Every canonical terminal-failure state is an accepted --terminal-state.
+    for state in sorted(ds.TERMINAL_FAILURE_STATES):
+        parsed = parser.parse_args([
+            "finish", "--dispatch-id", "x", "--state", state,
+            "--terminal-state", state,
+        ])
+        assert parsed.terminal_state == state, (state, parsed)
+
+
 def main() -> None:
+    case_ledger_finish_cli_accepts_rate_limited()
     case_status_sees_dispatch_and_lease_releases()
     case_live_controller_pidfile_preserves_blocked_worker_for_reattach()
     case_from_queue_detached_launch_stamps_pidfile()

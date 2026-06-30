@@ -778,7 +778,10 @@ def build_parser() -> argparse.ArgumentParser:
     fin.add_argument("--dispatch-id", required=True)
     fin.add_argument("--state", default="complete")
     fin.add_argument("--reason")
-    fin.add_argument("--terminal-state", choices=["complete", "worker_dead", "idle_timeout", "watcher_stopped", "controller_dead", "blocked", "error", "unknown"])
+    fin.add_argument("--terminal-state", choices=sorted(
+        {"complete", "idle_timeout", "watcher_stopped", "unknown"}
+        | set(goalflight_dispatch_states.TERMINAL_FAILURE_STATES)
+    ))
     fin.add_argument("--elapsed-s", type=float)
     fin.set_defaults(func=cmd_finish)
 
