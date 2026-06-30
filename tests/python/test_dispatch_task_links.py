@@ -89,6 +89,7 @@ def case_dispatch_task_ids_update_ledger_and_breadcrumbs() -> None:
                 "0.2",
                 "--max-idle-secs",
                 "10",
+                "--foreground",
                 "--",
                 sys.executable,
                 "-c",

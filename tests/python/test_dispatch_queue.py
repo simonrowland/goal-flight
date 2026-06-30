@@ -1202,6 +1202,7 @@ def test_worker_dead_tail_rate_limit_reaches_pressure_sensor() -> None:
                 "0.1",
                 "--max-idle-secs",
                 "5",
+                "--foreground",
                 "--",
                 sys.executable,
                 "-c",

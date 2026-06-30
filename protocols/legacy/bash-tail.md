@@ -174,10 +174,12 @@ across ACP and bash-tail paths. Filename pattern:
 `<controller-pid>.bashtail.<worker-pid>.jsonl`.
 
 When launching multiple bash-tail dispatches, do not use a sequential
-`for c in A B C; do goalflight_dispatch.py ...; done` loop with reused ids. Each
-parallel chunk must be a separate background launcher with its own
-`--dispatch-id`; otherwise B/C collide with A's status/tail/ledger record. The
-dispatch wrapper refuses reused ids whose prior record is still non-terminal.
+`for c in A B C; do goalflight_dispatch.py ... --foreground; done` loop with
+reused ids. Each parallel chunk must get its own `--dispatch-id`; otherwise B/C
+collide with A's status/tail/ledger record. Direct dispatch returns after launch
+by default, so use status tooling for joins instead of blocking the launcher.
+The dispatch wrapper refuses reused ids whose prior record is still
+non-terminal.
 
 ## Do NOT route the dispatch or the tail through context-mode
 

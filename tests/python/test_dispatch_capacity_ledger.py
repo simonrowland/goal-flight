@@ -102,6 +102,7 @@ def _dispatch_command(
     controller_pid: int | None = None,
     from_queue: bool = False,
     launch_detached: bool = False,
+    foreground: bool = True,
 ) -> list[str]:
     cmd = [
         sys.executable,
@@ -125,6 +126,8 @@ def _dispatch_command(
         cmd += ["--from-queue"]
     if launch_detached:
         cmd += ["--launch-detached"]
+    if foreground and not launch_detached:
+        cmd += ["--foreground"]
     cmd += ["--", sys.executable, "-c", worker_code]
     return cmd
 
@@ -141,6 +144,7 @@ def _run_dispatch(
     controller_pid: int | None = None,
     from_queue: bool = False,
     launch_detached: bool = False,
+    foreground: bool = True,
     timeout_s: float = 90.0,
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
@@ -154,6 +158,7 @@ def _run_dispatch(
             controller_pid=controller_pid,
             from_queue=from_queue,
             launch_detached=launch_detached,
+            foreground=foreground,
         ),
         cwd=ROOT,
         env=env,
@@ -256,6 +261,7 @@ def case_status_sees_dispatch_and_lease_releases() -> None:
                 "0.2",
                 "--max-idle-secs",
                 "20",
+                "--foreground",
                 "--",
                 sys.executable,
                 "-c",
@@ -446,6 +452,131 @@ def case_from_queue_detached_launch_reparents_lease_and_survives_release_stale()
             _kill_if_alive(watcher_pid)
 
 
+def case_direct_default_background_returns_and_preserves_live_controller() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        env = _env(tmp)
+        dispatch_id = "dispatch-default-background"
+        status_path = tmp / f"{dispatch_id}.status.json"
+        worker_pid = None
+        watcher_pid = None
+        controller_pid = os.getpid()
+        try:
+            started = time.monotonic()
+            proc = _run_dispatch(
+                tmp,
+                env,
+                dispatch_id,
+                "import time; print('worker-start', flush=True); time.sleep(60)",
+                status_path=status_path,
+                poll_secs="0.1",
+                max_idle_secs="20",
+                controller_pid=controller_pid,
+                foreground=False,
+                timeout_s=8.0,
+            )
+            elapsed = time.monotonic() - started
+            assert proc.returncode == 0, (
+                f"dispatch rc={proc.returncode}\nstdout={proc.stdout}\nstderr={proc.stderr}"
+            )
+            assert elapsed < 5.0, f"default dispatch waited instead of returning promptly: {elapsed:.3f}s"
+            assert "detached by default (was blocking)" in proc.stderr, proc.stderr
+            assert "DISPATCH-LAUNCHED " in proc.stdout, proc.stdout
+            assert "DISPATCH-END " not in proc.stdout, proc.stdout
+
+            launched = _dispatch_launched(proc.stdout)
+            worker_pid = int(launched["worker_pid"])
+            watcher_pid = int(launched["watcher_pid"])
+            assert _process_exists(worker_pid), launched
+            assert _process_exists(watcher_pid), launched
+
+            def _running_status() -> dict | None:
+                if not status_path.exists():
+                    return None
+                try:
+                    payload = json.loads(status_path.read_text(encoding="utf-8"))
+                except json.JSONDecodeError:
+                    return None
+                return payload if payload.get("state") not in (None, "starting") else None
+
+            status_payload = _wait_for(_running_status, timeout_s=5.0)
+            assert status_payload.get("state") != "controller_dead", status_payload
+            assert status_payload.get("worker_pid") == worker_pid, status_payload
+
+            pidfiles = list((tmp / "pids").glob("*.jsonl"))
+            assert len(pidfiles) == 1, pidfiles
+            pid_entry = json.loads(pidfiles[0].read_text().splitlines()[0])
+            assert pid_entry.get("controller_pid") == controller_pid, pid_entry
+            assert pid_entry.get("detached") is True, pid_entry
+
+            payload = _status(env)
+            leases = _leases(payload, dispatch_id)
+            assert len(leases) == 1, leases
+            lease = leases[0]
+            assert lease.get("state") == "active", lease
+            assert lease.get("worker_pid") == worker_pid, lease
+            assert lease.get("controller_pid") == worker_pid, lease
+            assert lease.get("detached_controller_pid") == controller_pid, lease
+            assert lease.get("detached_reason") == "bash_background_default", lease
+
+            live_release = _capacity_release_stale(env)
+            assert live_release["count"] == 0, live_release
+        finally:
+            _kill_if_alive(worker_pid)
+            _kill_if_alive(watcher_pid)
+
+
+def case_foreground_blocks_until_terminal_state() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        env = _env(tmp)
+        dispatch_id = "dispatch-foreground-blocks"
+        started = time.monotonic()
+        proc = _run_dispatch(
+            tmp,
+            env,
+            dispatch_id,
+            "import time; print('worker-start', flush=True); time.sleep(0.8); print('COMPLETE: worker-done', flush=True)",
+            poll_secs="0.1",
+            max_idle_secs="20",
+            foreground=True,
+            timeout_s=10.0,
+        )
+        elapsed = time.monotonic() - started
+        assert proc.returncode == 0, (
+            f"dispatch rc={proc.returncode}\nstdout={proc.stdout}\nstderr={proc.stderr}"
+        )
+        assert elapsed >= 0.6, f"--foreground returned before worker could finish: {elapsed:.3f}s"
+        assert "detached by default (was blocking)" not in proc.stderr, proc.stderr
+        assert "DISPATCH-END " in proc.stdout, proc.stdout
+        assert "DISPATCH-LAUNCHED " not in proc.stdout, proc.stdout
+
+
+def case_submit_foreground_rejected() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        env = _env(tmp)
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(DISPATCH),
+                "--submit",
+                "--foreground",
+                "--agent",
+                "test-dispatch",
+                "--prompt",
+                "COMPLETE: noop",
+            ],
+            cwd=ROOT,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert proc.returncode == 2, proc
+        assert "--foreground" in proc.stderr and "--submit" in proc.stderr, proc.stderr
+
+
 def case_capacity_block_does_not_spawn() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
@@ -543,6 +674,7 @@ def case_capacity_wait_queues_until_slot_frees() -> None:
                 "--poll-secs", "0.2", "--max-idle-secs", "20",
                 "--tail", str(tmp / "queued.tail"),
                 "--status-json", str(status_path),
+                "--foreground",
                 "--", sys.executable, "-c", worker_code,
             ],
             cwd=ROOT, env=env, text=True,
@@ -580,6 +712,7 @@ def case_capacity_wait_queues_until_slot_frees() -> None:
                 "--capacity-wait-s", "0",
                 "--tail", str(tmp / "reuse.tail"),
                 "--status-json", str(tmp / "reuse.status.json"),
+                "--foreground",
                 "--", sys.executable, "-c", "print('nope')",
             ],
             cwd=ROOT, env=env, text=True,
@@ -628,6 +761,7 @@ def case_capacity_wait_interrupt_writes_terminal_status() -> None:
                 "--capacity-wait-s", "120",
                 "--tail", str(tmp / "interrupted.tail"),
                 "--status-json", str(status_path),
+                "--foreground",
                 "--", sys.executable, "-c", "print('never runs')",
             ],
             cwd=ROOT, env=env, text=True,
@@ -723,6 +857,7 @@ def case_codex_routed_subscription_strips_openai_api_key() -> None:
                     "5",
                     "--billing",
                     "sub",
+                    "--foreground",
                     "--",
                     sys.executable,
                     "-c",
@@ -757,6 +892,7 @@ def case_state_dir_auto_paths() -> None:
                 "0.1",
                 "--max-idle-secs",
                 "5",
+                "--foreground",
                 "--",
                 sys.executable,
                 "-c",
@@ -830,6 +966,7 @@ def case_dispatch_id_collision_suffix() -> None:
                     "0.1",
                     "--max-idle-secs",
                     "5",
+                    "--foreground",
                     "--",
                     sys.executable,
                     "-c",
@@ -1252,6 +1389,9 @@ def main() -> None:
     case_live_controller_pidfile_preserves_blocked_worker_for_reattach()
     case_from_queue_detached_launch_stamps_pidfile()
     case_from_queue_detached_launch_reparents_lease_and_survives_release_stale()
+    case_direct_default_background_returns_and_preserves_live_controller()
+    case_foreground_blocks_until_terminal_state()
+    case_submit_foreground_rejected()
     case_capacity_block_does_not_spawn()
     case_capacity_wait_queues_until_slot_frees()
     case_capacity_wait_interrupt_writes_terminal_status()

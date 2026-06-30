@@ -6,6 +6,17 @@ incremented when meaningful skill behaviour changes.
 
 ## [Unreleased]
 
+### Changed
+
+- **Dispatch is detached/background by default.** Direct `goalflight_dispatch.py`
+  launches now return immediately after `DISPATCH-LAUNCHED` instead of blocking
+  until the worker reaches a terminal state; pass the new `--foreground` flag for
+  the previous synchronous blocking behavior (scripts/tests). Not a breaking
+  change — workers still launch and land identically; only the dispatcher's
+  return timing changes, so it hot-deploys onto existing controllers. A one-line
+  stderr notice fires on the default path so un-migrated callers notice the new
+  timing. `--foreground` is mutually exclusive with `--submit` (already async).
+
 ### Documentation
 
 - **Operator recipe for `cooldown` — pause a vendor until its limit resets.**

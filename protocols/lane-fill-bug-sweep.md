@@ -46,11 +46,12 @@ surface REAL blockers → routing table → grouped fixes → serial integrator`
    rest stays in files.
 
 ## Dispatch (load-bearing reliability rules, dogfood-proven)
-- **Launch sweep/fix workers via the out-of-session (launchd/systemd) drainer**, not in-session
-  (`--submit --no-drain-on-submit`, then kick the drainer). A bash-tail worker launched inside a
-  short-lived controller process can be reaped by `cleanup_ghosts` / release-stale once that
-  controller exits — see the D007/D008 class. Out-of-session launch gave ~96% survival vs
-  frequent mid-run deaths in-session.
+- **Launch sweep/fix workers via the durable queue** (`--submit --drain-on-submit`).
+  Use `--submit --no-drain-on-submit` only when an external launchd/systemd
+  drainer owns launch. A bash-tail worker launched inside a short-lived
+  foreground controller can be reaped by `cleanup_ghosts` / release-stale once
+  that controller exits — see the D007/D008 class. Detached dispatch and
+  out-of-session launch avoid that failure mode.
 - **codex workers: instruct "do NOT use context-mode / ctx_* tools"** (use ripgrep/git/read).
   The exec-mode elicitation wedge that wrecks codex review workers did not fire once when this
   was stated (0 hits across a verify fleet). Or route to a non-wedging engine.

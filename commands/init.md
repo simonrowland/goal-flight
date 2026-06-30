@@ -74,6 +74,11 @@ Default add-ons (same tier as setup prompts):
 python3 <skill-root>/scripts/goalflight_doctor.py --project-root "$PWD" --json
 ```
 
+Dispatch examples in this repo assume the direct default is background:
+`python3 <skill-root>/scripts/goalflight_dispatch.py --agent codex --prompt-file p.md --cwd .`.
+Use `--submit --drain-on-submit` for durable queue launch and `--foreground`
+only for synchronous scripts/tests.
+
    On native Windows, inspect the JSON `wsl` field before any dispatch-shaped
    setup. Goal Flight's full dispatch baseline is WSL, not a native-Win32 port.
    The WSL probe is usable only when **all** are true:

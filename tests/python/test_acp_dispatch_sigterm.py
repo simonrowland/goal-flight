@@ -185,6 +185,7 @@ def case_dispatch_acp_single_finalize() -> None:
                     "0.1",
                     "--max-idle-secs",
                     "5",
+                    "--foreground",
                 ]
             )
             assert rc == 0, rc
@@ -238,6 +239,7 @@ def case_dispatch_interactive_sugar_routes_codex_acp_inline() -> None:
                     "0.1",
                     "--max-idle-secs",
                     "5",
+                    "--foreground",
                 ]
             )
             status = json.loads(status_path.read_text(encoding="utf-8"))
@@ -315,6 +317,7 @@ def case_dispatch_inline_permission_relay_writes_decision_and_worker_proceeds() 
                         "5",
                         "--permission-inline-timeout-s",
                         "5",
+                        "--foreground",
                     ]
                 )
             out = stdout.getvalue()
@@ -370,6 +373,7 @@ def case_dispatch_acp_sigterm_finalizes_and_reaps() -> None:
                 "0.1",
                 "--max-idle-secs",
                 "30",
+                "--foreground",
             ],
             cwd=ROOT,
             env=env,
@@ -461,6 +465,7 @@ def case_dispatch_acp_sigterm_before_pid_update_keeps_ledger_row() -> None:
                 "0.1",
                 "--max-idle-secs",
                 "30",
+                "--foreground",
             ],
             cwd=ROOT,
             env=env,

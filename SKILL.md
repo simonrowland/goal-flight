@@ -347,6 +347,8 @@ Two orthogonal axes:
 - Goal-loop returns converged result, never draft: plan/act/test/self-review until green.
 - Comms shape: `controller-direct`, `acp`, or `bash-tail`.
 Dispatch CLI workers via `scripts/goalflight_dispatch.py`, never bare background exec.
+Default direct dispatch returns `DISPATCH-LAUNCHED`; use `--foreground` only for
+sync scripts/tests. Queue: `--submit --drain-on-submit`.
 Do not hand-iterate (>~3 edit/test cycles) what a goal-loop should converge.
 
 Use ACP or bash-tail plus status polling; do not block on editor task panes.

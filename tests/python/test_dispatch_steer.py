@@ -258,6 +258,7 @@ def case_spawn_exports_steer_env() -> None:
                 "0.1",
                 "--max-idle-secs",
                 "5",
+                "--foreground",
                 "--",
                 sys.executable,
                 "-c",

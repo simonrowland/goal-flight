@@ -52,7 +52,7 @@ def _run(worker_cmd: list[str], max_idle: str = "20", poll: str = "1"):
             [
                 sys.executable, str(DISPATCH),
                 "--agent", "test", "--tail", str(tail), "--status-json", str(status),
-                "--poll-secs", poll, "--max-idle-secs", max_idle, "--", *worker_cmd,
+                "--poll-secs", poll, "--max-idle-secs", max_idle, "--foreground", "--", *worker_cmd,
             ],
             capture_output=True, text=True, timeout=float(max_idle) + 30, env=env,
         )
@@ -191,7 +191,7 @@ def case_worker_and_watcher_survive_launcher_pgroup_sigterm() -> None:
             [
                 sys.executable, str(DISPATCH),
                 "--agent", "test", "--tail", str(tail), "--status-json", str(status),
-                "--poll-secs", "0.2", "--max-idle-secs", "10", "--",
+                "--poll-secs", "0.2", "--max-idle-secs", "10", "--foreground", "--",
                 sys.executable, "-c", worker_code,
             ],
             stdout=subprocess.PIPE,

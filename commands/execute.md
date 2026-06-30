@@ -84,6 +84,25 @@ valid agent only if it preserves the review/implementation concern.
 - Bash-tail fallback: worker stdout/stderr to files plus `scripts/goalflight_watch.py`
 - Review job: `scripts/goalflight_review_job.py`
 
+Canonical direct dispatch is background:
+
+```bash
+python3 <skill-root>/scripts/goalflight_dispatch.py --agent codex --prompt-file p.md --cwd .
+```
+
+For durable queue launch, submit and drain one non-blocking pass:
+
+```bash
+python3 <skill-root>/scripts/goalflight_dispatch.py --submit --drain-on-submit --agent codex --prompt-file p.md --cwd .
+```
+
+Use `--foreground` only for synchronous scripts/tests that need the worker exit
+code:
+
+```bash
+python3 <skill-root>/scripts/goalflight_dispatch.py --agent codex --prompt-file p.md --cwd . --foreground
+```
+
 For `--parallel N` where `N >= 2`, ACP code-writing dispatches must pass
 `--worktree create`; the runner creates `worktrees/<dispatch-id>/` from `HEAD`
 and routes the worker `--cwd` there. Sequential dispatch (`--parallel 1` or no

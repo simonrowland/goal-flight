@@ -1,20 +1,26 @@
 #!/usr/bin/env python3
 """goalflight_dispatch.py — crash-safe worker dispatch with a decoupled watcher.
 
-ONE command, run via the host's background-task mechanism, that dispatches a
-worker AND reliably wakes the orchestrator on every terminal state. It fixes the
+ONE command that dispatches a worker in the background by default, returns
+immediately after launch, and leaves status/tail pointers for follow-up. Use
+the obscure `--foreground` opt-in only for scripts/tests that need the dispatch
+process to block until terminal state. It fixes the
 "orchestrator hangs because the worker crashed/hung and never sent a wakeup" class
 (observed 2026-05-30).
 
 Easy path (agent preset — the common case):
-    python3 goalflight_dispatch.py --agent codex --prompt-file p.md --cwd .
+    python3 goalflight_dispatch.py --agent codex --prompt-file p.md --cwd .      # background/default
     python3 goalflight_dispatch.py --agent codex --prompt-file p.md --read-only   # review/analysis
     python3 goalflight_dispatch.py --agent grok-code --prompt-file p.md --cwd .
+    python3 goalflight_dispatch.py --agent codex --prompt-file p.md --cwd . --foreground  # synchronous scripts/tests
 
 Presets bake in the canonical NON-INTERACTIVE + SAFE flags per worker, so you
 never spell them out (and cannot fat-finger `--dangerously-bypass`). Paths and a
 dispatch id are auto-derived under the state dir; override with --tail /
 --status-json / --dispatch-id if you want.
+
+Durable queue path:
+    python3 goalflight_dispatch.py --submit --drain-on-submit --agent codex --prompt-file p.md --cwd .
 
 Escape hatch (any worker): pass the raw command after `--`:
     python3 goalflight_dispatch.py --agent custom --tail t --status-json s -- <cmd...>
@@ -25,8 +31,9 @@ How it stays crash-safe (validated):
   2. The worker is not this dispatcher's child after launch; the helper is
      reaped immediately and the platform supervisor reaps the worker on exit.
   3. The decoupled watcher (goalflight_watch.py) detects finished(0)/crashed(1)/
-     hung(2)/controller-dead(3)/blocked(4) and we exit with ITS code UNCHANGED,
-     so the host completion notification carries the real terminal state.
+     hung(2)/controller-dead(3)/blocked(4). In default background mode, status
+     tooling reports that result. With --foreground, this dispatcher waits and
+     exits with the watcher's code unchanged for synchronous callers.
 
 Cross-platform: pure stdlib; the watcher uses goalflight_compat.pid_alive, so
 this is also the dispatch path on Windows (where the bash watcher is refused).
@@ -704,8 +711,10 @@ def _status_reminder_lines(
             str(worker_pid),
             "--tail",
             str(tail),
-            "--controller-pid",
-            str(controller_pid if controller_pid is not None else os.getpid()),
+        ]
+        if controller_pid is not None:
+            watch_parts += ["--controller-pid", str(controller_pid)]
+        watch_parts += [
             "--agent",
             agent_label,
             "--session-id",
@@ -745,6 +754,14 @@ def _print_status_reminder(
         max_idle_secs=max_idle_secs,
     ):
         print(line, file=sys.stderr, flush=True)
+
+
+def _print_background_default_notice() -> None:
+    print(
+        "goalflight_dispatch: detached by default (was blocking); pass --foreground to wait for the worker.",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def _steer_file(dispatch_id: str) -> Path:
@@ -2913,6 +2930,8 @@ def _run_acp_detached_launcher(
             and record.get("worker_pid")
             and record.get("queue_launch_token") == getattr(args, "queue_launch_token", None)
         ):
+            if getattr(args, "background_default_notice", False):
+                _print_background_default_notice()
             print(
                 "DISPATCH-LAUNCHED "
                 + json.dumps(
@@ -3179,8 +3198,19 @@ def main(argv: list[str] | None = None) -> int:
                              "(re-attempts acquire every ~15s; sleep-excluding clock). Default by "
                              "lane: bulk 900 / normal 600 / critical 120. 0 = fail instantly. "
                              "Env override: GOALFLIGHT_CAPACITY_WAIT_S.")
-    parser.add_argument("--submit", action="store_true",
-                        help="Write a durable dispatch request to the queue and exit without acquiring capacity.")
+    dispatch_mode = parser.add_mutually_exclusive_group()
+    dispatch_mode.add_argument("--submit", action="store_true",
+                               help="Write a durable dispatch request to the queue and exit without acquiring capacity.")
+    dispatch_mode.add_argument(
+        "--foreground",
+        action="store_true",
+        default=False,
+        help=(
+            "Block until the worker reaches a terminal state and return its exit code "
+            "(synchronous; for scripts/tests). Default is detached/background — the "
+            "worker is launched and the dispatcher returns immediately."
+        ),
+    )
     drain_submit = parser.add_mutually_exclusive_group()
     drain_submit.add_argument("--drain-on-submit", dest="drain_on_submit", action="store_true",
                               help="After --submit writes the durable request, run one non-blocking "
@@ -3297,6 +3327,14 @@ def main(argv: list[str] | None = None) -> int:
             account_env = {} if goalflight_compat.is_windows() else _resolve_account_env(args)
             if args.submit:
                 return _submit_dispatch(args, raw, base=base)
+            if (
+                not args.foreground
+                and not getattr(args, "launch_detached", False)
+                and not getattr(args, "acp_detached_child", False)
+                and not goalflight_compat.is_windows()
+            ):
+                args.launch_detached = True
+                args.background_default_notice = True
             if goalflight_compat.is_windows():
                 return _run_acp_shape(args, base=base, account_env={})
             return _run_acp_shape(args, base=base, account_env=account_env)
@@ -3364,6 +3402,13 @@ def main(argv: list[str] | None = None) -> int:
     worker_alive = None
     watch_rc = 1
     dispatch_started = time.time()
+    background_default_notice = bool(
+        not args.foreground
+        and not args.submit
+        and not getattr(args, "from_queue", False)
+        and not getattr(args, "launch_detached", False)
+    )
+    background_launch = bool(args.launch_detached or not args.foreground)
     summary_head = {
         "dispatch_id": args.dispatch_id,
         "agent": args.agent,
@@ -3478,9 +3523,13 @@ def main(argv: list[str] | None = None) -> int:
             _attach_worker_to_lease(lease_id, worker_pid)
         except Exception as e:
             registration_errors.append(_registration_error("attach_worker_to_lease", e))
-        if args.launch_detached:
+        if background_launch:
             try:
-                _detach_lease_to_worker(lease_id, worker_pid, "bash_launch_detached")
+                _detach_lease_to_worker(
+                    lease_id,
+                    worker_pid,
+                    "bash_launch_detached" if args.launch_detached else "bash_background_default",
+                )
             except Exception as e:
                 registration_errors.append(_registration_error("detach_lease_to_worker", e))
         try:
@@ -3489,7 +3538,7 @@ def main(argv: list[str] | None = None) -> int:
                 worker_pid=worker_pid,
                 pgid=pgid,
                 identity=worker_identity,
-                detached=bool(args.launch_detached),
+                detached=background_launch,
             )
         except Exception as e:
             registration_errors.append(_registration_error("write_pidfile", e))
@@ -3525,7 +3574,7 @@ def main(argv: list[str] | None = None) -> int:
             worker_pid=worker_pid,
             shape="bash",
             agent=args.agent,
-            controller_pid=_controller_pid(args),
+            controller_pid=args.controller_pid,
             poll_secs=args.poll_secs,
             max_idle_secs=args.max_idle_secs,
         )
@@ -3585,8 +3634,10 @@ def main(argv: list[str] | None = None) -> int:
             label="watcher",
         )
         summary_head.update({"watcher_pid": watcher_pid, "watcher_log": str(watch_log)})
-        if args.launch_detached:
+        if background_launch:
             detached_launched = True
+            if background_default_notice:
+                _print_background_default_notice()
             with contextlib.suppress(Exception):
                 print(
                     "DISPATCH-LAUNCHED "

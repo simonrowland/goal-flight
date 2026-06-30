@@ -42,21 +42,22 @@ Advanced setup (dry-run first, omit `--apply --yes`):
 ./setup.sh --apply --yes --cursor-link-claude --addons ''
 ```
 
-## Orchestrator wake on worker completion (Cursor)
+## Worker completion in Cursor
 
 Cursor does **not** use Claude Code's `run_in_background: true` task-notification
-harness. Worker success/fail wakes the orchestrator **only** when a **blocking**
-dispatch shell exits: run `python3 <skill-root>/scripts/goalflight_dispatch.py …`
-as a Cursor **background Shell** (`block_until_ms: 0`), never bare bash `&` /
-`nohup` / `disown` — bare background launches the launcher and returns
-immediately (CHANGELOG 0.2.8 P0), so the agent session is not woken when the
-worker finishes. The dispatch script blocks on `goalflight_watch.py` until a
-terminal state, prints `DISPATCH-END`, then exits; Cursor may surface a **shell
-task completed** notification for that background shell, but that is **not
-guaranteed to auto-resume this chat turn** — treat shell exit as a prompt to
-run `goalflight_status.py --dispatch <id> --all-projects`, read the tail marker,
-and continue execute step 7–8 (review, commit). Workers must emit `COMPLETE:` /
-`BLOCKED:` / `READY:` as the **last non-empty line** of the tail
+harness. Direct `goalflight_dispatch.py` defaults to detached/background: it
+prints `DISPATCH-LAUNCHED` and returns immediately. Track completion with
+`goalflight_status.py --dispatch <id> --all-projects` or `goalflight_status.py
+--wait <id>`; do not use bare bash `&` / `nohup` / `disown`.
+
+Only scripts/tests or deliberate shell-completion workflows should add
+`--foreground`. In that mode the dispatch script blocks on `goalflight_watch.py`
+until a terminal state, prints `DISPATCH-END`, then exits; Cursor may surface a
+**shell task completed** notification, but that is **not guaranteed to
+auto-resume this chat turn** — treat shell exit as a prompt to run status,
+read the tail marker, and continue execute step 7–8 (review, commit). Workers
+must emit `COMPLETE:` / `BLOCKED:` / `READY:` as the **last non-empty line** of
+the tail
 (`protocols/worker-markers.md`); trailing prose after the marker yields
 `worker_dead_no_terminal_marker` and the dispatch shell never exits. While
 workers are in flight, `protocols/user-status-cadence.md` still applies: poll
@@ -74,4 +75,17 @@ python3 ~/.goal-flight/skill/scripts/goalflight_dispatch.py \
   --cwd /path/to/repo-or-worktree \
   --dispatch-id <chunk-id> \
   --max-idle-secs 1200
+```
+
+```bash
+# Synchronous Cursor shell only when a script/test needs the exit code:
+python3 ~/.goal-flight/skill/scripts/goalflight_dispatch.py \
+  --agent cursor \
+  --shape acp \
+  --permission-mode inline \
+  --prompt-file docs-private/dispatch/<chunk>.md \
+  --cwd /path/to/repo-or-worktree \
+  --dispatch-id <chunk-id> \
+  --max-idle-secs 1200 \
+  --foreground
 ```

@@ -77,6 +77,7 @@ def main() -> int:
                 "0.2",
                 "--max-idle-secs",
                 "300",
+                "--foreground",
             ],
             cwd=ROOT,
             env=env,

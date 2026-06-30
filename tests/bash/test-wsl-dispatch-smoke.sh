@@ -38,6 +38,7 @@ GOALFLIGHT_STATE_DIR="$state_dir" python3 "$REPO_ROOT/scripts/goalflight_dispatc
   --status-json "$status" \
   --poll-secs 0.2 \
   --max-idle-secs 20 \
+  --foreground \
   -- \
   python3 -c 'print("STATUS: wsl smoke"); print("COMPLETE: wsl smoke")'
 rc=$?

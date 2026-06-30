@@ -74,6 +74,30 @@ orthogonal axes: **iteration pattern** (how many turns) and **comms shape**
     --agent <agent>
   ```
 
+## Dispatch wrapper default
+
+Canonical direct dispatch is detached/background:
+
+```bash
+python3 <skill-root>/scripts/goalflight_dispatch.py --agent codex --prompt-file p.md --cwd .
+```
+
+The dispatcher prints `DISPATCH-LAUNCHED` with the dispatch id, status JSON,
+tail path, and worker PID, then returns immediately. Follow progress with
+`goalflight_status.py --dispatch <id>` or `goalflight_status.py --wait <id>`.
+
+Durable queue dispatch:
+
+```bash
+python3 <skill-root>/scripts/goalflight_dispatch.py --submit --drain-on-submit --agent codex --prompt-file p.md --cwd .
+```
+
+Synchronous scripts/tests that need the worker exit code must opt in:
+
+```bash
+python3 <skill-root>/scripts/goalflight_dispatch.py --agent codex --prompt-file p.md --cwd . --foreground
+```
+
 ## Durable dispatch queue
 
 - `goalflight_dispatch.py --submit` enqueues without blocking. `dispatch_id` is
@@ -158,11 +182,12 @@ experiments; do not silently dispatch an unmanifested binary.
 
 Each parallel chunk gets exactly one launcher process and one unique
 `--dispatch-id`. Do not run a sequential shell loop that starts dispatch A, waits
-for that launcher to finish, then reuses the same id for B/C. Background each
-dispatch command independently through the host's background-task mechanism and
-assign stable ids per chunk (`chunk-a`, `chunk-b`, `chunk-c`). The dispatcher
-refuses a reused id while the prior ledger record is non-terminal; a duplicate id
-means status, tail, and lease ownership would collide.
+for a synchronous `--foreground` launcher to finish, then reuses the same id for
+B/C. Launch each dispatch independently and assign stable ids per chunk
+(`chunk-a`, `chunk-b`, `chunk-c`). Direct dispatch already returns after launch
+by default. The dispatcher refuses a reused id while the prior ledger record is
+non-terminal; a duplicate id means status, tail, and lease ownership would
+collide.
 
 Shared-tree code writers that run the full suite (`pytest tests/` or equivalent)
 are serialized. Concurrent code-writing is only for file-disjoint chunks whose

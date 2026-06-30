@@ -30,8 +30,9 @@ spending controller context on typos/noise.
    = coverage need; lanes only set wall-clock (rows > lanes drain in waves).
 2. **Lane-fill audit** — one READ-ONLY one-shot worker per row, lane-split by
    difficulty (subtle/critical → stronger engine; breadth → cheaper/wider pool).
-   Findings inline to tails. **Launch via the out-of-session/launchd drainer**
-   (`--submit --no-drain-on-submit` then kick) so workers survive; **codex
+   Findings inline to tails. **Launch via the durable queue**
+   (`--submit --drain-on-submit`; use `--no-drain-on-submit` only when an
+   external drainer owns launch) so workers survive; **codex
    workers: instruct "no context-mode / ctx_* tools"** to avoid the exec-mode
    wedge.
 3. **Harvest** — parse the tails into append-only `BUG-LOG.jsonl` (read-only
