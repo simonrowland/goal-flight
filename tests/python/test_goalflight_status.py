@@ -6,9 +6,9 @@ import io
 import json
 import os
 import sys
-import tempfile
 import time
-from contextlib import redirect_stdout
+import tempfile
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -566,7 +566,7 @@ def test_wait_cli() -> None:
                     "--wait",
                     "amb1",
                     "--wait-timeout",
-                    "0",
+                    "0.01",
                     "--poll-s",
                     "0.01",
                 ]
@@ -584,6 +584,140 @@ def test_wait_cli() -> None:
         check("--wait --json has dispatch row", payload_json["dispatches"][0]["dispatch_id"] == "done1")
     finally:
         S.status_payload, S.this_project_root = orig_payload, orig_root
+
+
+def _wait_payload(dispatch_id: str, classification: str, *, terminal_state: str | None = None) -> dict:
+    record = {
+        "dispatch_id": dispatch_id,
+        "project_root": "/repo/A",
+        "classification": classification,
+        "agent": "codex",
+        "worker_pid": 333,
+        "worker_still_alive": classification == "expected_live",
+    }
+    if terminal_state is not None:
+        record["terminal_state"] = terminal_state
+    return {
+        "schema": "goalflight.status.aggregate.v1",
+        "capacity": {"operating_cap": 16},
+        "capacity_state": {"leases": {}, "cooldowns": {}},
+        "dispatch": {"records": [record], "surplus_processes": []},
+    }
+
+
+def test_wait_default_timeout() -> None:
+    orig_wait, orig_root = S.wait_for_dispatches, S.this_project_root
+    seen: dict = {}
+
+    def fake_wait(wait_ids, *, project_root, timeout_s, poll_s, json_output=False):
+        seen.update(
+            {
+                "wait_ids": wait_ids,
+                "project_root": project_root,
+                "timeout_s": timeout_s,
+                "poll_s": poll_s,
+                "json_output": json_output,
+            }
+        )
+        return 7
+
+    try:
+        S.wait_for_dispatches = fake_wait
+        S.this_project_root = lambda: "/repo/A"
+        rc = S.main(["--wait", "live1"])
+        check("--wait parser default is 1800s", rc == 7 and seen.get("timeout_s") == 1800.0)
+        check("--wait parser keeps wait ids", seen.get("wait_ids") == ["live1"])
+    finally:
+        S.wait_for_dispatches, S.this_project_root = orig_wait, orig_root
+
+
+def test_wait_unbounded_sentinels_and_positive_timeout() -> None:
+    orig_payload = S.status_payload
+    orig_sleep = S.time.sleep
+    orig_monotonic = S.time.monotonic
+
+    def run_unbounded(timeout_s: float | None) -> tuple[int, int, str]:
+        calls = {"count": 0}
+
+        def payload_sequence() -> dict:
+            calls["count"] += 1
+            if calls["count"] == 1:
+                return _wait_payload("flip", "expected_live")
+            return _wait_payload("flip", "complete", terminal_state="complete")
+
+        S.status_payload = payload_sequence
+        S.time.sleep = lambda _seconds: None
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = S.wait_for_dispatches(
+                ["flip"],
+                project_root="/repo/A",
+                timeout_s=timeout_s,
+                poll_s=0.01,
+            )
+        return rc, calls["count"], buf.getvalue()
+
+    try:
+        rc, calls, out = run_unbounded(0)
+        check("--wait-timeout 0 waits unbounded until terminal", rc == 0 and calls == 2)
+        check("--wait-timeout 0 reports eventual terminal state", "flip -> complete" in out)
+
+        rc, calls, out = run_unbounded(None)
+        check("internal None timeout waits unbounded until terminal", rc == 0 and calls == 2)
+        check("internal None reports eventual terminal state", "flip -> complete" in out)
+
+        S.status_payload = lambda: _wait_payload("pending1", "expected_live")
+        times = iter([0.0, 0.2])
+        S.time.monotonic = lambda: next(times)
+        S.time.sleep = lambda _seconds: None
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = S.wait_for_dispatches(
+                ["pending1"],
+                project_root="/repo/A",
+                timeout_s=0.1,
+                poll_s=0.01,
+            )
+        out = buf.getvalue()
+        check("positive --wait-timeout returns nonzero", rc == 1)
+        check("positive --wait-timeout reports pending ids", "pending pending1" in out)
+        check("positive --wait-timeout marks nonterminal timeout", "pending1 -> timeout" in out)
+    finally:
+        S.status_payload = orig_payload
+        S.time.sleep = orig_sleep
+        S.time.monotonic = orig_monotonic
+
+
+def test_wait_keyboard_interrupt_returns_130_without_signal() -> None:
+    orig_payload = S.status_payload
+    orig_sleep = S.time.sleep
+    orig_run = S.subprocess.run
+    subprocess_calls: list[tuple] = []
+
+    def fail_subprocess(*args, **kwargs):
+        subprocess_calls.append(args)
+        raise AssertionError("wait interrupt path must not shell out or signal workers")
+
+    try:
+        S.status_payload = lambda: _wait_payload("live1", "expected_live")
+        S.time.sleep = lambda _seconds: (_ for _ in ()).throw(KeyboardInterrupt())
+        S.subprocess.run = fail_subprocess
+        err = io.StringIO()
+        with redirect_stderr(err):
+            rc = S.wait_for_dispatches(
+                ["live1"],
+                project_root="/repo/A",
+                timeout_s=1800.0,
+                poll_s=0.01,
+            )
+        check("KeyboardInterrupt wait returns 130", rc == 130)
+        check("KeyboardInterrupt wait prints re-attach hint",
+              "goalflight_status.py --wait live1" in err.getvalue())
+        check("KeyboardInterrupt wait sends no subprocess signal", subprocess_calls == [])
+    finally:
+        S.status_payload = orig_payload
+        S.time.sleep = orig_sleep
+        S.subprocess.run = orig_run
 
 
 def test_wait_snapshot_uses_single_liveness_result() -> None:
@@ -629,6 +763,9 @@ def main() -> int:
     test_drain_process_running_matches_only_real_invocation()
     test_cli()
     test_wait_cli()
+    test_wait_default_timeout()
+    test_wait_unbounded_sentinels_and_positive_timeout()
+    test_wait_keyboard_interrupt_returns_130_without_signal()
     test_wait_snapshot_uses_single_liveness_result()
     if _FAILS:
         print(f"\n{len(_FAILS)} FAILED: {_FAILS}")

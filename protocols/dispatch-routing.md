@@ -86,6 +86,21 @@ The dispatcher prints `DISPATCH-LAUNCHED` with the dispatch id, status JSON,
 tail path, and worker PID, then returns immediately. Follow progress with
 `goalflight_status.py --dispatch <id>` or `goalflight_status.py --wait <id>`.
 
+### Background by default; don't block the controller
+
+The controller dispatches workers in the background and self-paces with status
+checks, scheduled wakeups, and queue drains. Background any controller tool call
+expected to run longer than about 10 seconds so typed steers remain visible and
+ESC/Ctrl-C interrupts only the observer surface, not the detached worker.
+
+Blocking waits are for short scripted synchronous needs. Prefer default detached
+dispatch plus `goalflight_status.py --dispatch <id>` or bounded
+`goalflight_status.py --wait <id>`; the `--wait` default is 1800 seconds and
+reports still-pending ids with a nonzero exit. `--wait-timeout 0` is explicit
+unbounded waiting. `goalflight_dispatch.py --foreground` blocks until terminal
+state and should stay rare because it locks the controller terminal and queues
+typed steers behind the wait.
+
 Durable queue dispatch:
 
 ```bash

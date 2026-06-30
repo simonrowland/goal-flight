@@ -378,6 +378,13 @@ def _reattach_hint(dispatch_id: str) -> str:
     return f"worker still alive - re-attach via goalflight_status.py --done {dispatch_id}"
 
 
+def _foreground_wait_interrupt_hint(dispatch_id: str) -> str:
+    return (
+        "interrupted — worker still running (detached); re-attach: "
+        f"goalflight_status.py --wait {dispatch_id}"
+    )
+
+
 def _dispatch_end_reattach_hint(
     dispatch_id: str,
     *,
@@ -495,57 +502,61 @@ def _wait_for_detached_watcher(
 ) -> tuple[int, dict, str | None]:
     sleep_s = min(max(float(poll_secs or 1.0), 0.2), 2.0)
     last_payload: dict = {}
-    while True:
-        try:
-            payload = json.loads(status_json.read_text(encoding="utf-8", errors="replace"))
-            if isinstance(payload, dict):
-                last_payload = payload
-                state = payload.get("state")
-                if _is_status_terminal(state):
-                    if _status_matches_current_launch(
-                        payload,
-                        dispatch_id=args.dispatch_id,
-                        worker_pid=worker_pid,
-                    ):
-                        terminal_marker = payload.get("terminal_marker")
-                        marker_terminal = (
-                            terminal_marker
-                            and isinstance(terminal_marker, dict)
-                            and state == "complete"
-                        )
-                        stale_complete = (
-                            marker_terminal and payload.get("worker_alive") is True
-                            and not (payload.get("reason") or "").endswith(":post_terminal_idle_timeout")
-                        )
-                        if not stale_complete:
-                            return _status_exit_code(state), payload, payload.get("reason")
-                        # Stale 'complete' while the worker is still flagged alive:
-                        # keep waiting for the real worker exit, but ONLY while the
-                        # watcher is alive to refresh status. If the watcher has died
-                        # (e.g. an unwritable status dir froze this payload), do not
-                        # spin forever or trust the false-alive 'complete' -- fall
-                        # through to the watcher-dead repair path below.
-                        if goalflight_compat.pid_alive(watcher_pid):
+    try:
+        while True:
+            try:
+                payload = json.loads(status_json.read_text(encoding="utf-8", errors="replace"))
+                if isinstance(payload, dict):
+                    last_payload = payload
+                    state = payload.get("state")
+                    if _is_status_terminal(state):
+                        if _status_matches_current_launch(
+                            payload,
+                            dispatch_id=args.dispatch_id,
+                            worker_pid=worker_pid,
+                        ):
+                            terminal_marker = payload.get("terminal_marker")
+                            marker_terminal = (
+                                terminal_marker
+                                and isinstance(terminal_marker, dict)
+                                and state == "complete"
+                            )
+                            stale_complete = (
+                                marker_terminal and payload.get("worker_alive") is True
+                                and not (payload.get("reason") or "").endswith(":post_terminal_idle_timeout")
+                            )
+                            if not stale_complete:
+                                return _status_exit_code(state), payload, payload.get("reason")
+                            # Stale 'complete' while the worker is still flagged alive:
+                            # keep waiting for the real worker exit, but ONLY while the
+                            # watcher is alive to refresh status. If the watcher has died
+                            # (e.g. an unwritable status dir froze this payload), do not
+                            # spin forever or trust the false-alive 'complete' -- fall
+                            # through to the watcher-dead repair path below.
+                            if goalflight_compat.pid_alive(watcher_pid):
+                                time.sleep(sleep_s)
+                                continue
+                        elif goalflight_compat.pid_alive(watcher_pid):
                             time.sleep(sleep_s)
                             continue
-                    elif goalflight_compat.pid_alive(watcher_pid):
-                        time.sleep(sleep_s)
-                        continue
-        except Exception:
-            pass
-        if not goalflight_compat.pid_alive(watcher_pid):
-            repaired = _repair_watcher_terminal_status(
-                status_json,
-                args=args,
-                tail=tail,
-                worker_pid=worker_pid,
-                worker_identity=worker_identity,
-                pgid=pgid,
-                prompt_path=prompt_path,
-                reason="watcher_dead_before_terminal_status",
-            )
-            return _status_exit_code(repaired.get("state")), repaired, repaired.get("reason")
-        time.sleep(sleep_s)
+            except Exception:
+                pass
+            if not goalflight_compat.pid_alive(watcher_pid):
+                repaired = _repair_watcher_terminal_status(
+                    status_json,
+                    args=args,
+                    tail=tail,
+                    worker_pid=worker_pid,
+                    worker_identity=worker_identity,
+                    pgid=pgid,
+                    prompt_path=prompt_path,
+                    reason="watcher_dead_before_terminal_status",
+                )
+                return _status_exit_code(repaired.get("state")), repaired, repaired.get("reason")
+            time.sleep(sleep_s)
+    except KeyboardInterrupt:
+        print(_foreground_wait_interrupt_hint(args.dispatch_id), file=sys.stderr)
+        return 130, last_payload, "foreground_wait_interrupted"
 
 
 def _start_caffeinate(worker_pid: int, *, env: dict[str, str], stdout_path: Path) -> tuple[int | None, str | None]:
@@ -3663,6 +3674,13 @@ def main(argv: list[str] | None = None) -> int:
             pgid=pgid,
             prompt_path=str(prompt_path) if prompt_path else None,
         )
+        if watch_rc == 130 and final_reason == "foreground_wait_interrupted":
+            # Preserve only the pidfile protection; capacity/ledger stay live for re-attach.
+            with contextlib.suppress(Exception):
+                _cleanup_pidfile_if_worker_dead(pidfile, worker_pid)
+            detached_launched = True
+            final_state = "interrupted"
+            return 130
 
         # Read the terminal state the watcher recorded (best-effort). worker_still_alive
         # matters: a terminal marker is a NON-DESTRUCTIVE signal (we never kill the

@@ -155,6 +155,25 @@ frontmatter above. New categories require a frontmatter schema bump (raise
 
 ---
 
+## Background Dispatch + Self-Pacing (don't block the controller)
+
+The controller keeps the interactive session responsive by dispatching workers in
+the background and self-pacing from status, scheduled wakeups, and queue drains.
+Any tool call expected to run longer than about 10 seconds is backgrounded so
+typed steers remain visible and ESC/Ctrl-C cancels only the observer, not the
+detached worker.
+
+Blocking waits are reserved for short scripted needs. A foreground launcher locks
+the controller's terminal, queues typed steers behind the blocked call, and makes
+ESC/Ctrl-C interrupt the controller wait surface. Prefer default detached
+dispatch plus `goalflight_status.py --dispatch <id>` or bounded
+`goalflight_status.py --wait <id>`. The `--wait` default is bounded at 1800
+seconds and reports still-pending ids; `--wait-timeout 0` is the explicit
+unbounded footgun. `goalflight_dispatch.py --foreground` is the synchronous
+escape hatch for scripts/tests that truly need the worker exit code.
+
+---
+
 ## Entries
 
 Entries are flat under H2 `## Entries` (this section). Each entry is a single

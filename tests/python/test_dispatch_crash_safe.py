@@ -25,10 +25,14 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 DISPATCH = ROOT / "scripts" / "goalflight_dispatch.py"
 WATCH = ROOT / "scripts" / "goalflight_watch.py"
+sys.path.insert(0, str(ROOT / "scripts"))
+
+import goalflight_acp_client  # noqa: E402
 
 
 def _wait_for(predicate, timeout: float = 8.0, interval: float = 0.1) -> bool:
@@ -38,6 +42,16 @@ def _wait_for(predicate, timeout: float = 8.0, interval: float = 0.1) -> bool:
             return True
         time.sleep(interval)
     return False
+
+
+def _process_exists(pid: int | None) -> bool:
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
 
 
 def _run(worker_cmd: list[str], max_idle: str = "20", poll: str = "1"):
@@ -220,6 +234,115 @@ def case_worker_and_watcher_survive_launcher_pgroup_sigterm() -> None:
                 proc.wait(timeout=5)
 
 
+def case_foreground_keyboard_interrupt_leaves_worker_and_watcher_running() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        tail = tmp_path / "tail.txt"
+        status = tmp_path / "status.json"
+        started = tmp_path / "started"
+        done = tmp_path / "done"
+        env = os.environ.copy()
+        env["GOALFLIGHT_STATE_DIR"] = str(tmp_path / "state")
+        env["GOAL_FLIGHT_PIDFILE_DIR"] = str(tmp_path / "pids")
+        pid_dir = Path(env["GOAL_FLIGHT_PIDFILE_DIR"])
+        worker_code = (
+            "import pathlib, time\n"
+            f"pathlib.Path({str(started)!r}).write_text('started')\n"
+            "print('worker-started', flush=True)\n"
+            "time.sleep(8.0)\n"
+            "print('COMPLETE: interrupt-safe done', flush=True)\n"
+            f"pathlib.Path({str(done)!r}).write_text('done')\n"
+        )
+        proc = subprocess.Popen(
+            [
+                sys.executable, str(DISPATCH),
+                "--agent", "test",
+                "--dispatch-id", "foreground-interrupt",
+                "--tail", str(tail),
+                "--status-json", str(status),
+                "--poll-secs", "0.2",
+                "--max-idle-secs", "10",
+                "--foreground",
+                "--",
+                sys.executable, "-c", worker_code,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+        )
+        worker_pid: int | None = None
+        try:
+            assert _wait_for(lambda: started.exists() and status.exists()), "worker/watch did not start"
+
+            def status_payload() -> dict:
+                try:
+                    return json.loads(status.read_text(encoding="utf-8"))
+                except Exception:
+                    return {}
+
+            def worker_pid_from_status() -> int | None:
+                try:
+                    return int(status_payload().get("worker_pid") or 0) or None
+                except Exception:
+                    return None
+
+            assert _wait_for(
+                lambda: status_payload().get("state") == "running" and worker_pid_from_status() is not None
+            ), "watcher never published running status"
+            worker_pid = worker_pid_from_status()
+            assert _process_exists(worker_pid), "worker not alive before interrupt"
+
+            proc.send_signal(signal.SIGINT)
+            _out, err = proc.communicate(timeout=5)
+            assert proc.returncode == 130, (proc.returncode, err)
+            assert "goalflight_status.py --wait foreground-interrupt" in err, err
+            assert _process_exists(worker_pid), "worker died on launcher KeyboardInterrupt"
+
+            pidfiles = list(pid_dir.glob("*.jsonl"))
+            assert len(pidfiles) == 1, pidfiles
+            pidfile = pidfiles[0]
+            rec = json.loads(pidfile.read_text(encoding="utf-8").splitlines()[0])
+            assert rec.get("pid") == worker_pid, rec
+            assert rec.get("controller_pid") == proc.pid, rec
+            assert rec.get("agent", "").endswith("-bash-tail"), rec
+            assert rec.get("detached") is True, "foreground interrupt must detach-stamp live worker pidfile"
+
+            meta = goalflight_acp_client._ps_meta(worker_pid)
+            if meta is not None:
+                rec["started_at"], rec["cmd"] = meta
+                pidfile.write_text(json.dumps(rec, sort_keys=True) + "\n", encoding="utf-8")
+
+            with patch("goalflight_acp_client._PIDFILE_DIR", pid_dir), \
+                    patch("goalflight_compat.kill_pid",
+                          side_effect=AssertionError("live foreground-interrupt worker killed")):
+                killed = goalflight_acp_client.cleanup_ghosts()
+            assert killed == 0, "detached foreground-interrupt worker must not be reaped"
+            assert _process_exists(worker_pid), "worker died during cleanup_ghosts sweep"
+            if meta is not None:
+                assert pidfile.exists(), "live detached pidfile stays available for re-attach"
+            else:
+                assert not pidfile.exists(), "unverifiable detached pidfile is safely unlinked"
+
+            assert _wait_for(done.exists, timeout=8), "worker did not finish after launcher interrupt"
+            assert _wait_for(
+                lambda: status.exists()
+                and json.loads(status.read_text(encoding="utf-8")).get("state") == "complete",
+                timeout=8,
+            ), status.read_text(encoding="utf-8") if status.exists() else "missing status"
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                proc.wait(timeout=5)
+            if worker_pid and _process_exists(worker_pid):
+                try:
+                    os.killpg(worker_pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+
+
 def case_watcher_sigterm_flushes_non_running_status() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
@@ -262,6 +385,7 @@ def main() -> None:
     case_post_terminal_idle_worker_finishes()
     case_dispatch_post_terminal_idle_returns_success()
     case_worker_and_watcher_survive_launcher_pgroup_sigterm()
+    case_foreground_keyboard_interrupt_leaves_worker_and_watcher_running()
     case_watcher_sigterm_flushes_non_running_status()
     print("OK: goalflight_dispatch crash-safe tests pass")
 

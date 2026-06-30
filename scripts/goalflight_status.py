@@ -489,6 +489,13 @@ def _wait_snapshot(payload: dict, wait_ids: list[str], *, timed_out: bool = Fals
     return rows
 
 
+def _wait_interrupt_hint(wait_ids: list[str]) -> str:
+    return (
+        "interrupted — worker(s) still running (detached); re-attach: "
+        f"goalflight_status.py --wait {','.join(wait_ids)}"
+    )
+
+
 def wait_for_dispatches(
     wait_ids: list[str],
     *,
@@ -503,36 +510,41 @@ def wait_for_dispatches(
 
     start = time.monotonic()
     poll_s = max(0.05, poll_s)
-    while True:
-        payload = scope_payload(status_payload(), project_root)
-        rows = _wait_snapshot(payload, wait_ids)
-        if all(row["terminal"] for row in rows):
-            if json_output:
-                print(json.dumps({"ok": True, "dispatches": rows}, sort_keys=True))
-            else:
-                print(f"wait complete: {len(rows)}/{len(rows)} terminal")
-                for row in rows:
-                    print(f"{row['dispatch_id']} -> {row['state']}")
-            return 0
+    unbounded = timeout_s in (None, 0, 0.0)
+    try:
+        while True:
+            payload = scope_payload(status_payload(), project_root)
+            rows = _wait_snapshot(payload, wait_ids)
+            if all(row["terminal"] for row in rows):
+                if json_output:
+                    print(json.dumps({"ok": True, "dispatches": rows}, sort_keys=True))
+                else:
+                    print(f"wait complete: {len(rows)}/{len(rows)} terminal")
+                    for row in rows:
+                        print(f"{row['dispatch_id']} -> {row['state']}")
+                return 0
 
-        if timeout_s is not None and time.monotonic() - start >= timeout_s:
-            rows = _wait_snapshot(payload, wait_ids, timed_out=True)
-            terminal = sum(1 for row in rows if row["terminal"])
-            pending = [row["dispatch_id"] for row in rows if not row["terminal"]]
-            if json_output:
-                print(
-                    json.dumps(
-                        {"ok": False, "timeout": True, "pending": pending, "dispatches": rows},
-                        sort_keys=True,
+            if not unbounded and time.monotonic() - start >= timeout_s:
+                rows = _wait_snapshot(payload, wait_ids, timed_out=True)
+                terminal = sum(1 for row in rows if row["terminal"])
+                pending = [row["dispatch_id"] for row in rows if not row["terminal"]]
+                if json_output:
+                    print(
+                        json.dumps(
+                            {"ok": False, "timeout": True, "pending": pending, "dispatches": rows},
+                            sort_keys=True,
+                        )
                     )
-                )
-            else:
-                print(f"wait timeout: {terminal}/{len(rows)} terminal; pending {','.join(pending)}")
-                for row in rows:
-                    print(f"{row['dispatch_id']} -> {row['state']}")
-            return 1
+                else:
+                    print(f"wait timeout: {terminal}/{len(rows)} terminal; pending {','.join(pending)}")
+                    for row in rows:
+                        print(f"{row['dispatch_id']} -> {row['state']}")
+                return 1
 
-        time.sleep(poll_s)
+            time.sleep(poll_s)
+    except KeyboardInterrupt:
+        print(_wait_interrupt_hint(wait_ids), file=sys.stderr)
+        return 130
 
 
 def render_text(payload: dict, limit: int) -> list[str]:
@@ -610,8 +622,11 @@ def main(argv: list[str] | None = None) -> int:
         "--timeout-s",
         dest="wait_timeout",
         type=float,
-        default=None,
-        help="max seconds to wait before reporting pending ids",
+        default=1800.0,
+        help=(
+            "max seconds to wait before reporting still-pending ids "
+            "(default 1800 = 30m; 0 = wait unbounded)"
+        ),
     )
     parser.add_argument(
         "--poll-s",
