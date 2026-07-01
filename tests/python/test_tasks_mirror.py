@@ -1389,6 +1389,33 @@ def test_goalflight_task_sync_generates_markdown_views() -> None:
                 "done": False,
             },
             {
+                "id": "t-004",
+                "kind": "task",
+                "title": "Deferred task.",
+                "blocked_by": [],
+                "links": [],
+                "done": False,
+                "lane": "deferred",
+            },
+            {
+                "id": "t-005",
+                "kind": "task",
+                "title": "Held task.",
+                "blocked_by": [],
+                "links": [],
+                "done": False,
+                "lane": "held",
+            },
+            {
+                "id": "t-006",
+                "kind": "task",
+                "title": "Free-text lane task.",
+                "blocked_by": [],
+                "links": [],
+                "done": False,
+                "lane": "release",
+            },
+            {
                 "id": "b-001",
                 "kind": "bug",
                 "title": "Open bug.",
@@ -1431,6 +1458,14 @@ def test_goalflight_task_sync_generates_markdown_views() -> None:
         assert_true("unresolved bug blocker linked", "[b-001](ticket.html?id=b-001)" in task_md)
         assert_true("cross-kind decision link rendered", "[q-001](ticket.html?id=q-001)" in task_md)
         assert_true("resolved blocker stays to-do", "### t-003" in task_md.split("## In progress", 1)[0])
+        assert_true("reserved-lane backlog section present", "## Backlog" in task_md)
+        active_task_md, task_backlog_md = task_md.split("## Backlog", 1)
+        assert_true("deferred task rendered in backlog section", "### t-004" in task_backlog_md)
+        assert_true("held task rendered in backlog section", "### t-005" in task_backlog_md)
+        assert_true("free-text lane excluded from reserved backlog", "### t-006" not in task_backlog_md)
+        assert_true("free-text lane remains in active sections", "### t-006" in active_task_md)
+        assert_true("deferred task excluded from active sections", "### t-004" not in active_task_md)
+        assert_true("held task excluded from active sections", "### t-005" not in active_task_md)
         assert_true("done task rendered in done view", "### t-002" in done_md)
         assert_true("open bug rendered in backlog", "### b-001" in bug_md)
         assert_true("fixed bug excluded from backlog", "### b-002" not in bug_md)

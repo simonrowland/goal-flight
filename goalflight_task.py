@@ -83,6 +83,7 @@ CANNED_LIST_STATUSES = {
     "waiting",
     "done-reviewed",
 }
+RESERVED_LANES = {"deferred", "held"}
 MARKDOWN_SECTIONS = (
     ("pending", "To do"),
     ("working", "In progress"),
@@ -220,9 +221,10 @@ def _make_item(
     blocked_by: list[Any] | tuple[Any, ...] | None = None,
     links: list[Any] | tuple[Any, ...] | None = None,
     tags: list[Any] | tuple[Any, ...] | None = None,
+    lane: str | None = None,
     audit_action: str = "new",
 ) -> dict[str, Any]:
-    return {
+    item = {
         "schema_version": ITEM_SCHEMA_VERSION,
         "id": item_id,
         "kind": kind,
@@ -235,6 +237,9 @@ def _make_item(
         "created_by": actor,
         "audit": [_audit(audit_action, actor)],
     }
+    if lane is not None:
+        item["lane"] = lane
+    return item
 
 
 def _canonical_json(value: Any) -> str:
@@ -432,6 +437,10 @@ def _section_rows(rows: list[dict[str, Any]], section: str) -> list[dict[str, An
     return [row for row in rows if row.get("derived_status") == section]
 
 
+def _is_reserved_lane(row: dict[str, Any]) -> bool:
+    return row.get("lane") in RESERVED_LANES
+
+
 def _parse_jsonl(path: Path) -> tuple[list[dict[str, Any]], dict[str, int]]:
     if not require_regular_or_absent(path):
         return [], {}
@@ -451,6 +460,8 @@ def _parse_jsonl(path: Path) -> tuple[list[dict[str, Any]], dict[str, int]]:
             raise TaskError(f"{path}:{lineno}: missing string id")
         if "status" in obj:
             raise TaskError(f"{path}:{lineno}: top-level status key is forbidden")
+        if "lane" in obj and not isinstance(obj["lane"], str):
+            raise TaskError(f"{path}:{lineno}: item {item_id} lane must be a string")
         if item_id in lines_by_id:
             raise TaskError(f"{path}:{lineno}: duplicate id {item_id} (first seen on line {lines_by_id[item_id]})")
         lines_by_id[item_id] = lineno
@@ -483,6 +494,8 @@ def _validate_items_for_write(items: list[dict[str, Any]], source: str = "tasks.
             raise TaskError(f"{source}: line {lineno}: missing string id")
         if "status" in item:
             raise TaskError(f"{source}: line {lineno}: item {item_id} carries forbidden top-level status key")
+        if "lane" in item and not isinstance(item["lane"], str):
+            raise TaskError(f"{source}: line {lineno}: item {item_id} lane must be a string")
         if item_id in seen:
             raise TaskError(f"{source}: line {lineno}: duplicate id {item_id} (first seen on line {seen[item_id]})")
         seen[item_id] = lineno
@@ -1272,6 +1285,7 @@ class TaskStore:
         if links:
             lines.append(f"- Links: {links}")
         for key, label in (
+            ("lane", "Lane"),
             ("severity", "Severity"),
             ("pattern", "Pattern"),
             ("source", "Source"),
@@ -1310,10 +1324,28 @@ class TaskStore:
             return [empty, ""]
         return lines
 
+    def _render_lane_backlog(self, rows: list[dict[str, Any]], lookup: dict[str, str]) -> list[str]:
+        backlog = [
+            row
+            for row in rows
+            if row.get("derived_status") != "done-reviewed" and _is_reserved_lane(row)
+        ]
+        if not backlog:
+            return []
+        lines = ["## Backlog", ""]
+        for row in backlog:
+            lines.extend(self._render_item_block(row, lookup))
+        return lines
+
     def _render_task_decomposition(self, tasks: list[dict[str, Any]], lookup: dict[str, str]) -> str:
-        open_tasks = [row for row in tasks if row.get("derived_status") != "done-reviewed"]
+        open_tasks = [
+            row
+            for row in tasks
+            if row.get("derived_status") != "done-reviewed" and not _is_reserved_lane(row)
+        ]
         lines = self._render_header("goal-flight — Task Decomposition")
         lines.extend(self._render_sections(open_tasks, lookup, MARKDOWN_SECTIONS, empty="_(none)_"))
+        lines.extend(self._render_lane_backlog(tasks, lookup))
         return "\n".join(lines).rstrip() + "\n"
 
     def _render_tasks_done(self, tasks: list[dict[str, Any]], lookup: dict[str, str]) -> str:
@@ -1328,9 +1360,14 @@ class TaskStore:
         return "\n".join(lines).rstrip() + "\n"
 
     def _render_bug_backlog(self, bugs: list[dict[str, Any]], lookup: dict[str, str]) -> str:
-        open_bugs = [row for row in bugs if row.get("derived_status") != "done-reviewed"]
+        open_bugs = [
+            row
+            for row in bugs
+            if row.get("derived_status") != "done-reviewed" and not _is_reserved_lane(row)
+        ]
         lines = self._render_header("goal-flight — Bug Backlog")
         lines.extend(self._render_sections(open_bugs, lookup, MARKDOWN_SECTIONS, empty="_(none)_"))
+        lines.extend(self._render_lane_backlog(bugs, lookup))
         return "\n".join(lines).rstrip() + "\n"
 
     def _render_bugs_done(self, bugs: list[dict[str, Any]], lookup: dict[str, str]) -> str:
@@ -1761,6 +1798,7 @@ def _cmd_new(store: TaskStore, args: argparse.Namespace) -> int:
             blocked_by=_split_csv(args.blocked_by),
             links=_split_csv(args.links),
             tags=_split_csv(args.tags),
+            lane=args.lane,
         )
         for key in ("acceptance", "prompt", "prompt_path", "pattern", "severity", "source"):
             value = getattr(args, key, None)
@@ -1838,6 +1876,23 @@ def _cmd_unblock(store: TaskStore, args: argparse.Namespace) -> int:
             raise TaskError(f"item {args.item_id}: blocked_by must be an array")
         item["blocked_by"] = [value for value in blocked_by if remove and value not in remove] if remove else []
         _append_audit(item, "unblock", actor, on=sorted(remove) if remove else None)
+
+    store.mutate_items(update)
+    print(args.item_id)
+    return 0
+
+
+def _cmd_lane(store: TaskStore, args: argparse.Namespace) -> int:
+    actor = _actor(args)
+
+    def update(items: list[dict[str, Any]]) -> None:
+        by_id = {item["id"]: item for item in items}
+        item = by_id.get(args.item_id)
+        if item is None:
+            raise TaskError(f"{store.tasks_path}: item not found: {args.item_id}")
+        old_lane = item.get("lane")
+        item["lane"] = args.lane
+        _append_audit(item, "lane", actor, old_lane=old_lane if isinstance(old_lane, str) else None, lane=args.lane)
 
     store.mutate_items(update)
     print(args.item_id)
@@ -2060,18 +2115,24 @@ def outstanding(project_root: str | Path | None = None, **filters: Any) -> list[
 
 
 def build_parser() -> argparse.ArgumentParser:
-    examples = """examples:
-  goalflight_task.py new "Tighten review gate" --kind task --prompt-path docs-private/briefs/t-014.md
-  goalflight_task.py show t-014 --json
-  goalflight_task.py block t-014 --on q-002
-  goalflight_task.py done t-014 --resolution worker-complete
-  goalflight_task.py list outstanding
-  goalflight_task.py list delegated --since 1h --json
-  goalflight_task.py review t-014 --verdict clean --dispatch codex-review-123
-  goalflight_task.py review t-014 --verdict findings --dispatch codex-review-123 --bug "Unfixed review finding" --bug-pattern bp-001
-  goalflight_task.py harvest --json
-  goalflight_task.py accept t-014
-  goalflight_task.py sync
+    examples = """common forms:
+  CAPTURE:
+    goalflight_task.py new "Tighten review gate" --kind task --prompt-path docs-private/briefs/t-014.md
+    goalflight_task.py new "Park follow-up" --lane deferred
+  READ:
+    goalflight_task.py show t-014 --json
+    goalflight_task.py list outstanding
+    goalflight_task.py list delegated --since 1h --json
+  UPDATE:
+    goalflight_task.py block t-014 --on q-002
+    goalflight_task.py lane t-014 held
+    goalflight_task.py review t-014 --verdict clean --dispatch codex-review-123
+    goalflight_task.py review t-014 --verdict findings --dispatch codex-review-123 --bug "Unfixed review finding" --bug-pattern bp-001
+    goalflight_task.py harvest --json
+    goalflight_task.py sync
+  CLOSE:
+    goalflight_task.py done t-014 --resolution worker-complete
+    goalflight_task.py accept t-014
 """
     parser = argparse.ArgumentParser(
         description="Goal Flight task-backlog store/writer.",
@@ -2095,6 +2156,7 @@ def build_parser() -> argparse.ArgumentParser:
     new.add_argument("--blocked-by", action="append", default=[])
     new.add_argument("--link", dest="links", action="append", default=[])
     new.add_argument("--tag", dest="tags", action="append", default=[])
+    new.add_argument("--lane", help="Optional lane name. Reserved lanes: deferred, held.")
     new.add_argument("--acceptance")
     new.add_argument("--prompt")
     new.add_argument("--prompt-path")
@@ -2137,6 +2199,22 @@ def build_parser() -> argparse.ArgumentParser:
     unblock.add_argument("item_id")
     unblock.add_argument("--on", action="append", default=[])
     unblock.set_defaults(func=_cmd_unblock)
+
+    lane = sub.add_parser(
+        "lane",
+        help="UPDATE: set an item's lane.",
+        epilog=(
+            "examples:\n"
+            "  goalflight_task.py lane t-014 held        # park pending re-auth/rethink (reserved)\n"
+            "  goalflight_task.py lane t-014 deferred    # plan for later (reserved)\n"
+            "  goalflight_task.py lane t-014 ui          # a free-text lane"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    lane.add_argument("--by", help=argparse.SUPPRESS)
+    lane.add_argument("item_id")
+    lane.add_argument("lane")
+    lane.set_defaults(func=_cmd_lane)
 
     done = sub.add_parser(
         "done",
