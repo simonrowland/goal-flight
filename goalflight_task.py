@@ -850,6 +850,9 @@ def _coerce_query(query: Any = None, **overrides: Any) -> dict[str, Any]:
     status = out.get("status")
     if status not in (None, "") and status not in CANNED_LIST_STATUSES:
         raise TaskError(f"unknown list status {status!r}; expected one of {', '.join(sorted(CANNED_LIST_STATUSES))}")
+    lane = out.get("lane")
+    if lane is not None:
+        out["lane"] = str(lane)
     if out.get("since") not in (None, ""):
         out["since_epoch"] = _parse_since(str(out["since"]))
     return out
@@ -1199,12 +1202,15 @@ class TaskStore:
         q = _coerce_query(query, **overrides)
         rows = self.derived_rows()
         status = q.get("status")
+        lane = q.get("lane")
         kind = q.get("kind")
         blockers = q.get("blocked_by") or []
         since_epoch = q.get("since_epoch")
 
         def matches(row: dict[str, Any]) -> bool:
             if status and not _matches_canned_status(row, status):
+                return False
+            if lane and row.get("lane") != lane:
                 return False
             if kind and row.get("kind", "task") != kind:
                 return False
@@ -2083,9 +2089,15 @@ def _cmd_accept(store: TaskStore, args: argparse.Namespace) -> int:
 
 
 def _cmd_list(store: TaskStore, args: argparse.Namespace) -> int:
+    facet = args.status
+    status = None if facet in RESERVED_LANES else facet
+    lane = facet if facet in RESERVED_LANES else args.lane
+    if facet in RESERVED_LANES and args.lane:
+        raise TaskError("list reserved-lane positional cannot be combined with --lane")
     rows = store.query_items(
         {
-            "status": args.status,
+            "status": status,
+            "lane": lane,
             "kind": args.kind,
             "blocked_by": args.blocked_by,
             "since": args.since,
@@ -2146,9 +2158,11 @@ def build_parser() -> argparse.ArgumentParser:
     goalflight_task.py capture "Investigate flaky test"        # reflex: task, lane=deferred
     goalflight_task.py new "Tighten review gate" --kind task --prompt-path docs-private/briefs/t-014.md
     goalflight_task.py new "Park follow-up" --lane deferred
-  READ:
+    READ:
     goalflight_task.py show t-014 --json
     goalflight_task.py list outstanding
+    goalflight_task.py list deferred
+    goalflight_task.py list --lane ui
     goalflight_task.py list delegated --since 1h --json
   UPDATE:
     goalflight_task.py block t-014 --on q-002
@@ -2330,12 +2344,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     list_cmd = sub.add_parser(
         "list",
-        help="Query items with canned dashboard statuses and AND filters.",
-        epilog="examples:\n  goalflight_task.py list outstanding\n  goalflight_task.py list awaiting-review --kind task\n  goalflight_task.py list delegated --since 1h --json\n  goalflight_task.py list --blocked-by q-002",
+        help="Query items with canned dashboard statuses, reserved lanes, and AND filters.",
+        epilog=(
+            "examples:\n"
+            "  goalflight_task.py list outstanding\n"
+            "  goalflight_task.py list deferred\n"
+            "  goalflight_task.py list --lane ui\n"
+            "  goalflight_task.py list awaiting-review --kind task\n"
+            "  goalflight_task.py list delegated --since 1h --json\n"
+            "  goalflight_task.py list --blocked-by q-002"
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     list_cmd.add_argument("--by", help=argparse.SUPPRESS)
-    list_cmd.add_argument("status", nargs="?", choices=sorted(CANNED_LIST_STATUSES))
+    list_cmd.add_argument("status", nargs="?", choices=sorted(CANNED_LIST_STATUSES | RESERVED_LANES))
+    list_cmd.add_argument("--lane", help="Filter by any free-text lane; reserved lanes also work as positional facets.")
     list_cmd.add_argument("--since", help="UTC lower bound: 1h, now-3600, epoch seconds, or ISO timestamp.")
     list_cmd.add_argument("--kind", choices=["task", "bug", "decision"])
     list_cmd.add_argument("--blocked-by", action="append", default=[])

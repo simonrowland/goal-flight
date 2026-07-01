@@ -357,6 +357,7 @@ def aggregate_status(project_root: Path, *, ttl_days: int = 7) -> dict:
     newest_notes = newest(notes)
     notes_active, notes_reason = _resume_notes_active(newest_notes, ttl_days=ttl_days)
     active = queue_active or bool(leases_for_project) or notes_active
+    backlog_counts = _task_backlog_counts(project_root)
     return {
         "active": active,
         "queue_file": str(newest_queue.relative_to(project_root)) if newest_queue else None,
@@ -370,8 +371,46 @@ def aggregate_status(project_root: Path, *, ttl_days: int = 7) -> dict:
         "newest_resume_notes": str(newest_notes.relative_to(project_root)) if newest_notes else None,
         "resume_notes_active": notes_active,
         "resume_notes_reason": notes_reason,
+        "backlog_counts": backlog_counts,
         "ttl_days": ttl_days,
     }
+
+
+def _task_backlog_counts(project_root: Path) -> dict[str, int]:
+    try:
+        if str(ROOT) not in sys.path:
+            sys.path.insert(0, str(ROOT))
+        import goalflight_task
+
+        rows = goalflight_task.list(project_root=project_root)
+    except Exception:
+        return {"deferred": 0, "held": 0, "blocked": 0}
+
+    def done_reviewed(row: dict) -> bool:
+        return row.get("done_reviewed") is True or (row.get("kind") == "decision" and row.get("done") is True)
+
+    by_id = {str(row.get("id")): row for row in rows if row.get("id") is not None}
+    counts = {"deferred": 0, "held": 0, "blocked": 0}
+    for row in rows:
+        if done_reviewed(row):
+            continue
+        lane = row.get("lane")
+        if lane in ("deferred", "held"):
+            counts[lane] += 1
+        blockers = row.get("blocked_by")
+        if isinstance(blockers, list) and any(not done_reviewed(by_id.get(str(blocker), {})) for blocker in blockers):
+            counts["blocked"] += 1
+    return counts
+
+
+def _backlog_counts_text(status: dict) -> str | None:
+    counts = status.get("backlog_counts") or {}
+    parts = []
+    for label in ("deferred", "held", "blocked"):
+        value = int(counts.get(label) or 0)
+        if value > 0:
+            parts.append(f"{value} {label}")
+    return " · ".join(parts) if parts else None
 
 
 def _resume_notes_active(notes_path: Path | None, *, ttl_days: int = 7) -> tuple[bool, str]:
@@ -452,14 +491,17 @@ def _active_leases_for(project_root: Path) -> list[dict]:
 
 
 def to_text(status: dict) -> str:
+    counts_text = _backlog_counts_text(status)
     if not status["active"]:
         if status["queue_file"] is None:
-            return "no goal-flight queue files; not an active session"
-        return (
+            text = "no goal-flight queue files; not an active session"
+        else:
+            text = (
             f"no active goal-flight session (queue {status['queue_file']} "
             f"state={status['queue_state'] or 'unset'}; "
             f"{status['queue_reason']})"
-        )
+            )
+        return f"{text}; {counts_text}" if counts_text else text
     pieces = [
         f"active goal-flight session ({status['queue_slug'] or 'unnamed'})",
         f"queue={status['queue_file']}",
@@ -467,6 +509,8 @@ def to_text(status: dict) -> str:
     ]
     if status["queue_last_touched"]:
         pieces.append(f"last-touched={status['queue_last_touched']}")
+    if counts_text:
+        pieces.append(counts_text)
     return "; ".join(pieces)
 
 

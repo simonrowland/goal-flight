@@ -585,6 +585,105 @@ def test_goalflight_task_list_filters_outstanding_awaiting_review_since() -> Non
         assert_true("kind and blocker filters AND", [item["id"] for item in blocked] == ["b-001"])
 
 
+def test_goalflight_task_list_lane_facet_and_status_collision() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        project = Path(td) / "project-a"
+        items = [
+            {
+                "schema_version": 1,
+                "id": "t-001",
+                "kind": "task",
+                "title": "Deferred work",
+                "blocked_by": [],
+                "links": [],
+                "done": False,
+                "lane": "deferred",
+                "created_at": "2020-01-01T00:00:00+00:00",
+            },
+            {
+                "schema_version": 1,
+                "id": "t-002",
+                "kind": "task",
+                "title": "Held work",
+                "blocked_by": [],
+                "links": [],
+                "done": False,
+                "lane": "held",
+                "created_at": "2020-01-01T00:00:00+00:00",
+            },
+            {
+                "schema_version": 1,
+                "id": "t-003",
+                "kind": "task",
+                "title": "UI work",
+                "blocked_by": [],
+                "links": [],
+                "done": False,
+                "lane": "ui",
+                "created_at": "2020-01-01T00:00:00+00:00",
+            },
+            {
+                "schema_version": 1,
+                "id": "t-004",
+                "kind": "task",
+                "title": "Status-word lane but done reviewed",
+                "blocked_by": [],
+                "links": [],
+                "done": True,
+                "done_reviewed": True,
+                "lane": "outstanding",
+                "created_at": "2020-01-01T00:00:00+00:00",
+            },
+            {
+                "schema_version": 1,
+                "id": "t-005",
+                "kind": "task",
+                "title": "Status-word lane and outstanding",
+                "blocked_by": [],
+                "links": [],
+                "done": False,
+                "lane": "outstanding",
+                "created_at": "2020-01-01T00:00:00+00:00",
+            },
+        ]
+        _write_tasks(project, items)
+
+        proc = run_task(project, "list", "deferred", "--json")
+        assert_true(f"list deferred exits 0: {proc.stderr}", proc.returncode == 0)
+        deferred = json.loads(proc.stdout)
+        assert_true("list deferred filters reserved lane", [item["id"] for item in deferred] == ["t-001"])
+
+        proc = run_task(project, "list", "held", "--json")
+        assert_true(f"list held exits 0: {proc.stderr}", proc.returncode == 0)
+        held = json.loads(proc.stdout)
+        assert_true("list held filters reserved lane", [item["id"] for item in held] == ["t-002"])
+
+        proc = run_task(project, "list", "--lane", "ui", "--json")
+        assert_true(f"list --lane ui exits 0: {proc.stderr}", proc.returncode == 0)
+        ui = json.loads(proc.stdout)
+        assert_true("list --lane filters free-text lane", [item["id"] for item in ui] == ["t-003"])
+
+        proc = run_task(project, "list", "ui", "--json")
+        assert_true("bare free-text lane is rejected", proc.returncode != 0)
+
+        proc = run_task(project, "list", "outstanding", "--json")
+        assert_true(f"list outstanding exits 0: {proc.stderr}", proc.returncode == 0)
+        outstanding = {item["id"] for item in json.loads(proc.stdout)}
+        assert_true("positional outstanding remains status", "t-004" not in outstanding and "t-005" in outstanding)
+
+        proc = run_task(project, "list", "--lane", "outstanding", "--json")
+        assert_true(f"list --lane outstanding exits 0: {proc.stderr}", proc.returncode == 0)
+        status_lane = {item["id"] for item in json.loads(proc.stdout)}
+        assert_true("--lane status word filters lane", status_lane == {"t-004", "t-005"})
+
+        proc = run_task(project, "list", "deferred", "--lane", "ui", "--json")
+        assert_true("reserved positional + --lane is rejected", proc.returncode != 0)
+        assert_true(
+            "rejection names the reserved-positional/--lane conflict",
+            "reserved-lane positional cannot be combined with --lane" in proc.stderr,
+        )
+
+
 def test_goalflight_task_two_state_accept_and_review_breadcrumb() -> None:
     with tempfile.TemporaryDirectory() as td:
         project = Path(td)
@@ -1500,6 +1599,7 @@ def main() -> None:
     test_goalflight_task_sync_writes_mirror_only_derived_status()
     test_goalflight_task_sync_appends_plural_task_ids()
     test_goalflight_task_list_filters_outstanding_awaiting_review_since()
+    test_goalflight_task_list_lane_facet_and_status_collision()
     test_goalflight_task_two_state_accept_and_review_breadcrumb()
     test_goalflight_task_review_captures_confirmed_bug_item()
     test_goalflight_task_harvest_idempotent_with_source_links_and_history()
@@ -1517,7 +1617,7 @@ def main() -> None:
     test_goalflight_task_sync_repairs_stale_mirror()
     test_goalflight_task_data_js_escapes_script_end_and_html()
     test_goalflight_task_sync_generates_markdown_views()
-    print("OK: 30 tasks mirror/task-store tests pass")
+    print("OK: 31 tasks mirror/task-store tests pass")
 
 
 if __name__ == "__main__":
