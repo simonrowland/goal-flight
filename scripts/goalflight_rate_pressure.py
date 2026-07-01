@@ -142,6 +142,15 @@ RATE_LIMIT_PATTERNS: tuple[str, ...] = (
     "exceeded retry limit",          # codex CLI retry-wrapper exhaustion (catches retry-exhaust even when the line is not a bare 429)
     "prepaid credits are depleted",  # xAI hard CREDIT exhaustion — a distinct failure mode (no 429, no "rate limit" text)
     "payment_required",              # xAI 402 credits-out (code form; safer than a bare "402")
+    # xAI Grok Build usage-balance exhaustion — OBSERVED LIVE 2026-07-01. The real
+    # grok CLI-proxy text is: 'API error (status 402 Payment Required): Grok Build
+    # usage balance exhausted' (Request URL cli-chat-proxy.grok.com). Neither
+    # "payment_required" (underscore) NOR any 402 anchor (there was none) matched it,
+    # so rate_limit_signature_in_text() returned None: adaptive walk-back never fired,
+    # a whole grok batch failed on 402 and the workers hung (orphan leak), all while
+    # the monitor read pressure=none. Add the actual prose + HTTP reason-phrase form.
+    "usage balance exhausted",       # xAI Grok Build balance gone (prose; unambiguous)
+    "payment required",              # HTTP 402 reason-phrase (space form) as emitted by the grok CLI proxy
 )
 
 # HTTP status codes require provider-error context — bare "429"/"529" in line
@@ -167,6 +176,22 @@ RATE_LIMIT_HTTP_STATUS_ANCHORS: dict[str, tuple[str, ...]] = {
         "(529)",
         '"code": 529',
         '"code":529',
+    ),
+    # 402 Payment Required — xAI hard usage/credit exhaustion (added 2026-07-01,
+    # see RATE_LIMIT_PATTERNS note). 402 is unambiguously a billing/quota wall, so
+    # anchoring on the status is safe.
+    "402": (
+        "http 402",
+        "status 402",
+        "status: 402",
+        "402 payment required",
+        "got 402",
+        "error 402",
+        "(status 402",
+        '"http_status": 402',
+        '"http_status":402',
+        '"code": 402',
+        '"code":402',
     ),
 }
 
