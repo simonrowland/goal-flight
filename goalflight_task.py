@@ -85,6 +85,7 @@ CANNED_LIST_STATUSES = {
 }
 RESERVED_LANES = {"deferred", "held"}
 NEXT_NUDGE_DISPATCH_ID = "task-store"
+NEXT_NUDGE_KIND = "parallel-ready"
 MARKDOWN_SECTIONS = (
     ("pending", "To do"),
     ("working", "In progress"),
@@ -101,6 +102,69 @@ STATUS_LABELS = {
     "done-reviewed": "done reviewed",
     "worker-failed": "worker failed",
 }
+
+
+def _is_insert_delete_near_miss(left: str, right: str) -> bool:
+    if left == right or abs(len(left) - len(right)) != 1:
+        return False
+    short, long = (left, right) if len(left) < len(right) else (right, left)
+    i = j = edits = 0
+    while i < len(short) and j < len(long):
+        if short[i] == long[j]:
+            i += 1
+            j += 1
+            continue
+        edits += 1
+        if edits > 1:
+            return False
+        j += 1
+    return True
+
+
+def _is_transpose_near_miss(left: str, right: str) -> bool:
+    if left == right or len(left) != len(right):
+        return False
+    mismatches = [i for i, (a, b) in enumerate(zip(left, right)) if a != b]
+    if len(mismatches) != 2:
+        return False
+    first, second = mismatches
+    return second == first + 1 and left[first] == right[second] and left[second] == right[first]
+
+
+def _reserved_lane_near_miss(lane: str) -> str | None:
+    raw = lane.strip()
+    if raw in RESERVED_LANES:
+        return None
+    value = raw.lower()
+    if value in RESERVED_LANES:
+        return value
+    for reserved in sorted(RESERVED_LANES):
+        if _is_insert_delete_near_miss(value, reserved) or _is_transpose_near_miss(value, reserved):
+            return reserved
+    return None
+
+
+def _validate_lane_arg(lane: str | None) -> None:
+    if not lane:
+        return
+    hint = _reserved_lane_near_miss(lane)
+    if hint:
+        reserved = ", ".join(sorted(RESERVED_LANES))
+        raise TaskError(
+            f"unknown lane {lane!r}; did you mean {hint!r}? "
+            f"(free-text lanes are allowed; reserved: {reserved})"
+        )
+
+
+def _project_slug(project_root: Path) -> str:
+    resolved = str(project_root.resolve())
+    name = re.sub(r"[^A-Za-z0-9_.-]+", "-", project_root.name).strip("-") or "project"
+    digest = hashlib.sha1(resolved.encode("utf-8")).hexdigest()[:10]
+    return f"{name}-{digest}"
+
+
+def _next_nudge_dispatch_id(project_root: Path) -> str:
+    return f"{NEXT_NUDGE_DISPATCH_ID}:{_project_slug(project_root)}"
 
 
 class TaskError(Exception):
@@ -1801,6 +1865,7 @@ def _split_csv(values: list[str] | None) -> list[str]:
 
 def _create_item(store: TaskStore, args: argparse.Namespace, actor: str) -> str:
     """Reserve an id and append a new item from args. Shared by `new` and `capture`."""
+    _validate_lane_arg(args.lane)
     family = args.id_family or FAMILY_PREFIX_BY_KIND[args.kind]
     item_id = store.reserve_id(family)
 
@@ -1852,7 +1917,7 @@ def _cmd_capture(store: TaskStore, args: argparse.Namespace) -> int:
         print(created)
     # One next-step hint to STDERR (keeps stdout / `--json | jq` clean; never an interrupt).
     print(
-        f"captured {created} ({args.lane}). promote: goalflight_task.py lane {created} <name>",
+        f"captured {created} ({args.lane}). promote: python3 goalflight_task.py lane {created} <name>",
         file=sys.stderr,
     )
     return 0
@@ -1927,6 +1992,7 @@ def _cmd_unblock(store: TaskStore, args: argparse.Namespace) -> int:
 
 def _cmd_lane(store: TaskStore, args: argparse.Namespace) -> int:
     actor = _actor(args)
+    _validate_lane_arg(args.lane)
 
     def update(items: list[dict[str, Any]]) -> None:
         by_id = {item["id"]: item for item in items}
@@ -1939,6 +2005,7 @@ def _cmd_lane(store: TaskStore, args: argparse.Namespace) -> int:
 
     store.mutate_items(update)
     print(args.item_id)
+    print(f"{args.item_id} -> lane {args.lane}", file=sys.stderr)
     return 0
 
 
@@ -2075,10 +2142,16 @@ def _cmd_accept(store: TaskStore, args: argparse.Namespace) -> int:
         if _is_done_reviewed(row):
             raise TaskError(f"{args.item_id}: already done-reviewed")
         if row.get("derived_status") != "awaiting-review":
-            raise TaskError(f"{args.item_id}: not DONE/awaiting-review; run task done or wait for worker completion first")
+            raise TaskError(
+                f"{args.item_id}: not DONE/awaiting-review; "
+                f"run python3 goalflight_task.py done {args.item_id} or wait for worker completion first"
+            )
         review = _latest_review_breadcrumb(row)
         if not review:
-            raise TaskError(f"{args.item_id}: no logged review; run task review before accept")
+            raise TaskError(
+                f"{args.item_id}: no logged review; "
+                f"run python3 goalflight_task.py review {args.item_id} --verdict clean --dispatch <id> before accept"
+            )
         if review.get("verdict") != "clean":
             raise TaskError(f"{args.item_id}: latest review verdict is {review.get('verdict')!r}, not clean")
 
@@ -2122,40 +2195,58 @@ def _cmd_list(store: TaskStore, args: argparse.Namespace) -> int:
     return 0
 
 
-def _post_next_nudge(rows: list[dict[str, Any]]) -> None:
+def _post_next_nudge(rows: list[dict[str, Any]], project_root: Path) -> None:
     if len(rows) < 2:
         return
     try:
         import goalflight_messages as gm  # lazy: task reads must not hard-depend on mail
 
         messages_dir = gm.default_messages_dir()
-        inbox = gm.inbox_path(messages_dir, NEXT_NUDGE_DISPATCH_ID)
+        dispatch_id = _next_nudge_dispatch_id(project_root)
+        inbox = gm.inbox_path(messages_dir, dispatch_id)
         if inbox.exists() and not inbox.is_file():
             return
         ids = sorted(str(row["id"]) for row in rows)
-        key = "parallel-ready:" + ",".join(ids)
+        project_slug = _project_slug(project_root)
+        project_root_text = str(project_root.resolve())
+        key = f"{NEXT_NUDGE_KIND}:{project_slug}:" + ",".join(ids)
         text = f"you've got mail: {len(ids)} parallel-ready ({', '.join(ids)}) -> fan out?"
-        seen = {
-            str((e.get("payload") or {}).get("dedup_key") or "")
-            for e in gm.read_envelopes(inbox)
-            if e.get("type") == "user_need"
-        }
-        if key in seen:
-            return
-        gm.post_message(
-            dispatch_id=NEXT_NUDGE_DISPATCH_ID,
-            msg_type="user_need",
-            payload={"text": text, "dedup_key": key, "frontier_ids": ids},
-            messages_dir=messages_dir,
-            source={"node": "local", "adapter": "task-store", "transport": "next-frontier"},
-        )
+        lock_path = messages_dir / f".{dispatch_id}.lock"
+        messages_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with FileLock(lock_path):
+            envelopes = gm.read_envelopes(inbox)
+            current_nudges = [
+                e
+                for e in envelopes
+                if e.get("type") == "user_need" and (e.get("payload") or {}).get("nudge_kind") == NEXT_NUDGE_KIND
+            ]
+            current_keys = [str((e.get("payload") or {}).get("dedup_key") or "") for e in current_nudges]
+            if key in current_keys:
+                return
+            if current_nudges:
+                stale_ids = {str(e.get("id") or "") for e in current_nudges}
+                gm.rewrite_envelopes(inbox, [e for e in envelopes if str(e.get("id") or "") not in stale_ids])
+            gm.post_message(
+                dispatch_id=dispatch_id,
+                msg_type="user_need",
+                payload={
+                    "text": text,
+                    "dedup_key": key,
+                    "frontier_ids": ids,
+                    "nudge_kind": NEXT_NUDGE_KIND,
+                    "project_root": project_root_text,
+                    "project_slug": project_slug,
+                },
+                messages_dir=messages_dir,
+                source={"node": "local", "adapter": "task-store", "transport": "next-frontier"},
+            )
     except Exception:
         return
 
 
 def _cmd_next(store: TaskStore, args: argparse.Namespace) -> int:
     rows = store.next_frontier()
-    _post_next_nudge(rows)
+    _post_next_nudge(rows, store.project_root)
     if args.json:
         print(json.dumps(rows, ensure_ascii=False, sort_keys=True))
         return 0

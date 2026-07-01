@@ -70,6 +70,7 @@
     { key: "awaiting-review", label: "Awaiting review", cls: "sec-review" },
     { key: "worker-failed", label: "Failed / needs attention", cls: "sec-failed" },
     { key: "waiting", label: "Waiting", cls: "sec-waiting" },
+    { key: "backlog", label: "Backlog", cls: "sec-backlog" },
     { key: "done-reviewed", label: "Done", cls: "sec-done" }
   ];
 
@@ -80,10 +81,12 @@
     "awaiting-review": "awaiting review",
     "worker-failed": "worker failed",
     waiting: "waiting",
+    backlog: "backlog",
     "done-reviewed": "done reviewed"
   };
 
   var SEV_RANK = { critical: 4, high: 3, medium: 2, low: 1 };
+  var RESERVED_LANES = { deferred: true, held: true };
 
   function canonicalSection(status) {
     var s = String(status == null ? "" : status).trim().toLowerCase();
@@ -112,6 +115,7 @@
       id: id,
       kind: kind,
       title: typeof it.title === "string" ? it.title : "(untitled)",
+      lane: typeof it.lane === "string" ? it.lane : null,
       status: it.status || null, // may be derived below
       derived_status: typeof it.derived_status === "string" ? it.derived_status : null,
       blocked_by: Array.isArray(it.blocked_by) ? it.blocked_by.filter(Boolean) : [],
@@ -136,9 +140,10 @@
   // Section key for an item. Honours explicit lifecycle flags; otherwise derives
   // from status, blockers, and kind. Unknown blockers count as unresolved.
   function sectionKey(it, byId) {
+    if (it.done_reviewed) return "done-reviewed";
+    if (RESERVED_LANES[it.lane]) return "backlog";
     var derived = canonicalSection(it.derived_status);
     if (derived) return derived;
-    if (it.done_reviewed) return "done-reviewed";
     var s = it.status;
     if (it.kind === "decision") return "decision";
     if (it.worker_done || s === "worker-finished" || s === "awaiting-review") return "awaiting-review";
@@ -384,6 +389,11 @@
     return '<span class="badge badge-' + esc(section) + '">' + esc(STATUS_LABELS[section] || section) + "</span>";
   }
 
+  function laneBadge(it) {
+    if (!it.lane) return "";
+    return '<span class="badge lane lane-' + esc(it.lane) + '">lane ' + esc(it.lane) + "</span>";
+  }
+
   function blockerBits(it) {
     if (!it.blocked_by || !it.blocked_by.length) return "";
     var parts = it.blocked_by.map(function (bid) {
@@ -462,7 +472,7 @@
       '<a class="id" href="ticket.html?id=' + encodeURIComponent(esc(it.id)) + '">' + esc(it.id) + "</a>" +
       '<span class="body">' +
       '<span class="title">' + autolink(it.title) + "</span>" +
-      '<span class="tags">' + kindBadge(it.kind) + sevBit(it) + blockerBits(it) + "</span>" +
+      '<span class="tags">' + kindBadge(it.kind) + laneBadge(it) + sevBit(it) + blockerBits(it) + "</span>" +
       "</span>" +
       "</li>"
     );

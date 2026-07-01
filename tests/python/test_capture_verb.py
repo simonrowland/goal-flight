@@ -83,6 +83,7 @@ def test_capture_hint_on_stderr_stdout_clean() -> None:
         # plain form: stdout is the bare id, hint goes to stderr
         proc = run_task(project, "capture", "Something")
         assert_true("next-step hint on stderr", "captured" in proc.stderr and "promote:" in proc.stderr)
+        assert_true("next-step hint includes python prefix", "promote: python3 goalflight_task.py lane" in proc.stderr)
         assert_true("stdout carries no hint", "captured" not in proc.stdout)
         assert_true("stdout is a single bare id", proc.stdout.strip().startswith("t-") and "\n" not in proc.stdout.strip())
         # --json form: stdout is clean parseable JSON, hint still on stderr

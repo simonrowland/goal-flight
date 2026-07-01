@@ -127,6 +127,15 @@ def append_envelope(path: Path, envelope: dict) -> None:
         fh.write(line)
 
 
+def rewrite_envelopes(path: Path, envelopes: list[dict]) -> None:
+    lines = [serialize_envelope_line(envelope) for envelope in envelopes]
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    tmp = path.with_name(f".{path.name}.tmp")
+    with tmp.open("w", encoding="utf-8") as fh:
+        fh.writelines(lines)
+    tmp.replace(path)
+
+
 def post_message(
     *,
     dispatch_id: str,

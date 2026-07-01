@@ -68,6 +68,7 @@ ul.rows{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;ga
 .sec-working ul.rows .row{border-left:3px solid var(--accent)}
 .sec-review ul.rows .row{border-left:3px solid #a855f7}
 .sec-waiting ul.rows .row{border-left:3px solid var(--warn)}
+.sec-backlog ul.rows .row{border-left:3px solid var(--muted)}
 .done-list{flex-direction:column}
 .row-done{opacity:.6}
 .row-done .title{text-decoration:none}
@@ -115,6 +116,7 @@ footer{max-width:52rem;margin:0 auto;padding:1.5rem 1.25rem 2rem;color:var(--mut
       <option value="awaiting-review">awaiting review</option>
       <option value="worker-failed">worker failed</option>
       <option value="waiting">waiting</option>
+      <option value="backlog">backlog</option>
       <option value="done-reviewed">done</option>
     </select>
     <label class="label" for="sortSel">sort</label>

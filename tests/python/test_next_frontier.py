@@ -84,6 +84,10 @@ def _env(tmp: Path) -> dict[str, str]:
     return env
 
 
+def _nudge_inbox(env: dict[str, str], project: Path) -> Path:
+    return M.inbox_path(Path(env["GOALFLIGHT_MESSAGES_DIR"]), T._next_nudge_dispatch_id(project))
+
+
 def _frontier_fixture() -> list[dict]:
     return [
         _item("q-001", "Reviewed gate", kind="decision", done=True, done_reviewed=True),
@@ -145,7 +149,7 @@ def test_next_excludes_reserved_lanes_and_posts_no_nudge() -> None:
         proc = _run_task(project, env, "next")
         assert_true(f"next exits 0: {proc.stderr}", proc.returncode == 0)
         assert_eq("reserved lanes excluded from next", proc.stdout.splitlines(), [])
-        inbox = M.inbox_path(Path(env["GOALFLIGHT_MESSAGES_DIR"]), T.NEXT_NUDGE_DISPATCH_ID)
+        inbox = _nudge_inbox(env, project)
         assert_true("reserved-only frontier creates no inbox", not inbox.exists())
 
 
@@ -180,13 +184,93 @@ def test_parallel_nudge_posts_once_for_same_frontier() -> None:
         for _ in range(2):
             proc = _run_task(project, env, "next")
             assert_true(f"next exits 0: {proc.stderr}", proc.returncode == 0)
-        inbox = M.inbox_path(Path(env["GOALFLIGHT_MESSAGES_DIR"]), T.NEXT_NUDGE_DISPATCH_ID)
+        inbox = _nudge_inbox(env, project)
         envelopes = M.read_envelopes(inbox)
         assert_eq("deduped nudge count", len(envelopes), 1)
         payload = envelopes[0]["payload"]
         assert_eq("nudge type", envelopes[0]["type"], "user_need")
         assert_eq("frontier ids sorted", payload["frontier_ids"], ["t-001", "t-002"])
+        assert_eq("project root carried", payload["project_root"], str(project.resolve()))
+        assert_true("project-scoped dispatch id", envelopes[0]["dispatch_id"].startswith("task-store:"))
         assert_true("nudge text asks fan out", "2 parallel-ready (t-001, t-002) -> fan out?" in payload["text"])
+
+
+def test_parallel_nudge_coalesces_changed_frontier_to_single_current() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        project = tmp / "project"
+        env = _env(tmp)
+        _write_items(project, [_item("t-001", "A"), _item("t-002", "B")])
+        proc = _run_task(project, env, "next")
+        assert_true(f"next exits 0: {proc.stderr}", proc.returncode == 0)
+        inbox = _nudge_inbox(env, project)
+        envelopes = M.read_envelopes(inbox)
+        assert_eq("first current nudge count", len(envelopes), 1)
+        assert_eq("first frontier ids", envelopes[0]["payload"]["frontier_ids"], ["t-001", "t-002"])
+
+        _write_items(project, [_item("t-001", "A"), _item("t-002", "B"), _item("t-003", "C")])
+        proc = _run_task(project, env, "next")
+        assert_true(f"next exits 0: {proc.stderr}", proc.returncode == 0)
+        envelopes = M.read_envelopes(inbox)
+        assert_eq("changed frontier remains one current nudge", len(envelopes), 1)
+        assert_eq("current frontier ids replace stale ids", envelopes[0]["payload"]["frontier_ids"], ["t-001", "t-002", "t-003"])
+        assert_true("current nudge text updated", "3 parallel-ready (t-001, t-002, t-003) -> fan out?" in envelopes[0]["payload"]["text"])
+
+
+def test_parallel_nudge_preserves_unrelated_inbox_envelopes_when_coalescing() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        project = tmp / "project"
+        env = _env(tmp)
+        _write_items(project, [_item("t-001", "A"), _item("t-002", "B")])
+        proc = _run_task(project, env, "next")
+        assert_true(f"next exits 0: {proc.stderr}", proc.returncode == 0)
+        inbox = _nudge_inbox(env, project)
+        dispatch_id = T._next_nudge_dispatch_id(project)
+        M.post_message(
+            dispatch_id=dispatch_id,
+            msg_type="status",
+            payload={"text": "unrelated envelope"},
+            messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"]),
+            source={"node": "local", "adapter": "test", "transport": "unit"},
+        )
+
+        _write_items(project, [_item("t-001", "A"), _item("t-002", "B"), _item("t-003", "C")])
+        proc = _run_task(project, env, "next")
+        assert_true(f"next exits 0: {proc.stderr}", proc.returncode == 0)
+        envelopes = M.read_envelopes(inbox)
+        nudges = [
+            env
+            for env in envelopes
+            if env.get("type") == "user_need" and (env.get("payload") or {}).get("nudge_kind") == T.NEXT_NUDGE_KIND
+        ]
+        unrelated = [env for env in envelopes if (env.get("payload") or {}).get("text") == "unrelated envelope"]
+        assert_eq("unrelated envelope survives coalesce", len(unrelated), 1)
+        assert_eq("changed frontier leaves one current nudge", len(nudges), 1)
+        assert_eq("current nudge has changed frontier ids", nudges[0]["payload"]["frontier_ids"], ["t-001", "t-002", "t-003"])
+
+
+def test_parallel_nudge_is_project_scoped_for_same_default_ids() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        env = _env(tmp)
+        project_a = tmp / "project-a"
+        project_b = tmp / "project-b"
+        for project in (project_a, project_b):
+            _write_items(project, [_item("t-001", "A"), _item("t-002", "B")])
+            proc = _run_task(project, env, "next")
+            assert_true(f"next exits 0 for {project.name}: {proc.stderr}", proc.returncode == 0)
+
+        inbox_a = _nudge_inbox(env, project_a)
+        inbox_b = _nudge_inbox(env, project_b)
+        assert_true("project-specific inbox paths differ", inbox_a != inbox_b)
+        env_a = M.read_envelopes(inbox_a)
+        env_b = M.read_envelopes(inbox_b)
+        assert_eq("project A nudge count", len(env_a), 1)
+        assert_eq("project B nudge count", len(env_b), 1)
+        assert_true("dedup keys differ by project", env_a[0]["payload"]["dedup_key"] != env_b[0]["payload"]["dedup_key"])
+        assert_eq("project A root carried", env_a[0]["payload"]["project_root"], str(project_a.resolve()))
+        assert_eq("project B root carried", env_b[0]["payload"]["project_root"], str(project_b.resolve()))
 
 
 def test_parallel_nudge_silent_for_single_frontier() -> None:
@@ -197,7 +281,7 @@ def test_parallel_nudge_silent_for_single_frontier() -> None:
         _write_items(project, [_item("t-001", "Solo")])
         proc = _run_task(project, env, "next")
         assert_true(f"next exits 0: {proc.stderr}", proc.returncode == 0)
-        inbox = M.inbox_path(Path(env["GOALFLIGHT_MESSAGES_DIR"]), T.NEXT_NUDGE_DISPATCH_ID)
+        inbox = _nudge_inbox(env, project)
         assert_true("single frontier creates no inbox", not inbox.exists())
 
 
@@ -261,6 +345,9 @@ def main() -> None:
     test_next_excludes_reserved_lanes_and_posts_no_nudge()
     test_next_includes_promoted_free_text_lane_and_no_lane()
     test_parallel_nudge_posts_once_for_same_frontier()
+    test_parallel_nudge_coalesces_changed_frontier_to_single_current()
+    test_parallel_nudge_preserves_unrelated_inbox_envelopes_when_coalescing()
+    test_parallel_nudge_is_project_scoped_for_same_default_ids()
     test_parallel_nudge_silent_for_single_frontier()
     test_next_still_prints_when_mail_import_fails()
     test_check_tasks_mirror_accepts_next_fixture_without_status()

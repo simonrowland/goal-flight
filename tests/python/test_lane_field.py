@@ -107,6 +107,7 @@ def test_lane_cli_and_reserved_backlog_view() -> None:
 
         proc = run_task(project, "lane", held_id, "held", "--by", "tester")
         assert_true(f"lane <id> held exits 0: {proc.stderr}", proc.returncode == 0)
+        assert_true("lane success echoed to stderr", f"{held_id} -> lane held" in proc.stderr)
 
         proc = run_task(project, "new", "Feature lane task", "--lane", "release", "--by", "tester")
         assert_true(f"new --lane release exits 0: {proc.stderr}", proc.returncode == 0)
@@ -146,12 +147,48 @@ def test_lane_cli_and_reserved_backlog_view() -> None:
         assert_true("tasks-data.js has no status key", all("status" not in item for item in data_items))
 
 
+def test_lane_rejects_reserved_near_miss_but_allows_distinct_free_text() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        project = Path(td)
+        proc = run_task(project, "new", "Park me", "--lane", "deferred", "--by", "tester")
+        assert_true(f"new deferred exits 0: {proc.stderr}", proc.returncode == 0)
+        item_id = proc.stdout.strip()
+
+        proc = run_task(project, "lane", item_id, "hield", "--by", "tester")
+        assert_true("near-miss lane exits nonzero", proc.returncode != 0)
+        assert_true("near-miss hint names held", "did you mean 'held'?" in proc.stderr)
+        item = read_items(project)[0]
+        assert_true("near-miss did not unpark item", item.get("lane") == "deferred")
+
+        proc = run_task(project, "lane", item_id, "Held", "--by", "tester")
+        assert_true("case-variant reserved lane exits nonzero", proc.returncode != 0)
+        assert_true("case-variant hint names held", "did you mean 'held'?" in proc.stderr)
+        item = read_items(project)[0]
+        assert_true("case-variant did not unpark item", item.get("lane") == "deferred")
+
+        for lane in ("help", "hold", "ui"):
+            proc = run_task(project, "lane", item_id, lane, "--by", "tester")
+            assert_true(f"distinct free-text lane {lane} exits 0: {proc.stderr}", proc.returncode == 0)
+            assert_true(f"distinct free-text lane {lane} echoed", f"{item_id} -> lane {lane}" in proc.stderr)
+            item = read_items(project)[0]
+            assert_true(f"distinct free-text lane {lane} stored", item.get("lane") == lane)
+
+        proc = run_task(project, "new", "Bad create lane", "--lane", "hield", "--by", "tester")
+        assert_true("create near-miss lane exits nonzero", proc.returncode != 0)
+        assert_true("create near-miss hint names held", "did you mean 'held'?" in proc.stderr)
+
+        proc = run_task(project, "capture", "Bad capture lane", "--lane", "hield", "--by", "tester")
+        assert_true("capture near-miss lane exits nonzero", proc.returncode != 0)
+        assert_true("capture near-miss hint names held", "did you mean 'held'?" in proc.stderr)
+
+
 def main() -> None:
     if not NODE:
         print("SKIP: test_lane_field.py: node not found on PATH")
         return
     test_lane_validates_as_string()
     test_lane_cli_and_reserved_backlog_view()
+    test_lane_rejects_reserved_near_miss_but_allows_distinct_free_text()
     print("OK: lane field tests pass")
 
 

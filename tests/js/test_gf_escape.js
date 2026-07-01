@@ -195,6 +195,44 @@ assert("derived_status item is not pending", !derivedMount.innerHTML.includes("T
 GF.index([
   {
     schema_version: 1,
+    id: "t-deferred",
+    kind: "task",
+    title: "Deferred task",
+    blocked_by: [],
+    links: [],
+    done: false,
+    derived_status: "pending",
+    lane: "deferred"
+  },
+  {
+    schema_version: 1,
+    id: "t-active",
+    kind: "task",
+    title: "Active task",
+    blocked_by: [],
+    links: [],
+    done: false,
+    derived_status: "pending"
+  }
+]);
+const laneMount = { innerHTML: "" };
+GF.renderBoard(laneMount, {});
+const laneCounts = GF.counts();
+assert("reserved lane carries through normalize", GF.store.byId["t-deferred"].lane === "deferred");
+assert("reserved lane routes to backlog", GF.store.byId["t-deferred"]._section === "backlog");
+assert("active item remains pending", GF.store.byId["t-active"]._section === "pending");
+assert("pending count excludes reserved lane", laneCounts.pending === 1);
+assert("backlog count includes reserved lane", laneCounts.backlog === 1);
+assert("backlog section renders", laneMount.innerHTML.includes("Backlog"));
+assert("lane chip renders escaped lane", laneMount.innerHTML.includes("lane deferred"));
+const backlogOnlyMount = { innerHTML: "" };
+const backlogVisible = GF.renderBoard(backlogOnlyMount, { status: "backlog" });
+assert("backlog filter returns reserved lane", backlogVisible === 1 && backlogOnlyMount.innerHTML.includes("t-deferred"));
+assert("backlog filter hides active task", !backlogOnlyMount.innerHTML.includes("t-active"));
+
+GF.index([
+  {
+    schema_version: 1,
     id: "q-001",
     kind: "decision",
     title: "</script><img src=x onerror=alert(1)> choose path",
@@ -239,6 +277,9 @@ assert("renderDecisionList links blocked task", decisions.includes('href="ticket
   assert(label + " dispatch log sink rejects href", html.includes('<a class="dispatch-log" href="#">'));
   assert(label + " no normalized javascript href", !/href=["']java[\n\r\t]*script:/i.test(html));
 });
+
+const ticketsBody = fs.readFileSync(path.join(STATE_TEMPLATES_DIR, "tickets.html"), "utf8");
+assert("tickets.html exposes backlog status filter", ticketsBody.includes('<option value="backlog">backlog</option>'));
 
 [
   "index.html",

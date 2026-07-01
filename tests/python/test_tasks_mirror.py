@@ -716,12 +716,27 @@ def test_goalflight_task_two_state_accept_and_review_breadcrumb() -> None:
                     "links": [],
                     "done": True,
                     "done_reviewed": False,
+                },
+                {
+                    "schema_version": 1,
+                    "id": "t-002",
+                    "kind": "task",
+                    "title": "Not done",
+                    "blocked_by": [],
+                    "links": [],
+                    "done": False,
+                    "done_reviewed": False,
                 }
             ],
         )
 
         proc = run_task(project, "accept", "t-001")
         assert_true("accept without review fails", proc.returncode != 0 and "no logged review" in proc.stderr)
+        assert_true("accept review hint uses real command", "python3 goalflight_task.py review t-001 --verdict clean --dispatch <id>" in proc.stderr)
+
+        proc = run_task(project, "accept", "t-002")
+        assert_true("accept before done fails", proc.returncode != 0 and "not DONE/awaiting-review" in proc.stderr)
+        assert_true("accept done hint uses real command", "python3 goalflight_task.py done t-002" in proc.stderr)
 
         proc = run_task(project, "review", "t-001", "--verdict", "findings", "--dispatch", "review-1", "--findings", "docs-private/reviews/t-001.md")
         assert_true(f"findings review exits 0: {proc.stderr}", proc.returncode == 0)
