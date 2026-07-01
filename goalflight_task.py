@@ -1782,10 +1782,10 @@ def _split_csv(values: list[str] | None) -> list[str]:
     return out
 
 
-def _cmd_new(store: TaskStore, args: argparse.Namespace) -> int:
+def _create_item(store: TaskStore, args: argparse.Namespace, actor: str) -> str:
+    """Reserve an id and append a new item from args. Shared by `new` and `capture`."""
     family = args.id_family or FAMILY_PREFIX_BY_KIND[args.kind]
     item_id = store.reserve_id(family)
-    actor = _actor(args)
 
     def update(items: list[dict[str, Any]]) -> str:
         if any(item.get("id") == item_id for item in items):
@@ -1807,11 +1807,37 @@ def _cmd_new(store: TaskStore, args: argparse.Namespace) -> int:
         items.append(item)
         return item_id
 
-    created = store.mutate_items(update)
+    return store.mutate_items(update)
+
+
+def _cmd_new(store: TaskStore, args: argparse.Namespace) -> int:
+    created = _create_item(store, args, _actor(args))
     if args.json:
         print(json.dumps({"id": created}, sort_keys=True))
     else:
         print(created)
+    return 0
+
+
+def _cmd_capture(store: TaskStore, args: argparse.Namespace) -> int:
+    # Reflex defaults for the zero-flag common path (`capture "<what>"`): a task
+    # parked in the deferred backlog, sourced to the cwd. --severity implies a bug.
+    if getattr(args, "kind", None) is None:
+        args.kind = "bug" if getattr(args, "severity", None) else "task"
+    if not getattr(args, "lane", None):
+        args.lane = "deferred"
+    if not getattr(args, "source", None):
+        args.source = os.getcwd()
+    created = _create_item(store, args, _actor(args))
+    if args.json:
+        print(json.dumps({"id": created}, sort_keys=True))
+    else:
+        print(created)
+    # One next-step hint to STDERR (keeps stdout / `--json | jq` clean; never an interrupt).
+    print(
+        f"captured {created} ({args.lane}). promote: goalflight_task.py lane {created} <name>",
+        file=sys.stderr,
+    )
     return 0
 
 
@@ -2117,6 +2143,7 @@ def outstanding(project_root: str | Path | None = None, **filters: Any) -> list[
 def build_parser() -> argparse.ArgumentParser:
     examples = """common forms:
   CAPTURE:
+    goalflight_task.py capture "Investigate flaky test"        # reflex: task, lane=deferred
     goalflight_task.py new "Tighten review gate" --kind task --prompt-path docs-private/briefs/t-014.md
     goalflight_task.py new "Park follow-up" --lane deferred
   READ:
@@ -2165,6 +2192,39 @@ def build_parser() -> argparse.ArgumentParser:
     new.add_argument("--source")
     new.add_argument("--json", action="store_true")
     new.set_defaults(func=_cmd_new)
+
+    capture = sub.add_parser(
+        "capture",
+        help='CAPTURE: reflex-create a deferred task (bug if --severity). Common form: capture "<what>".',
+        epilog=(
+            "examples:\n"
+            '  goalflight_task.py capture "Investigate flaky test"       # reflex: task, lane=deferred, source=cwd\n'
+            '  goalflight_task.py capture "Race in retry path" --severity P2   # --severity -> a bug\n'
+            '  goalflight_task.py capture "UI polish" --lane ui           # override the default lane'
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    capture.add_argument("--by", help=argparse.SUPPRESS)
+    capture.add_argument("title")
+    capture.add_argument(
+        "--kind",
+        choices=["task", "bug", "decision"],
+        default=None,
+        help="Default: task (or bug when --severity is given).",
+    )
+    capture.add_argument("--id-family", choices=sorted(VALID_FAMILIES), help="Override id family; default follows --kind.")
+    capture.add_argument("--blocked-by", action="append", default=[])
+    capture.add_argument("--link", dest="links", action="append", default=[])
+    capture.add_argument("--tag", dest="tags", action="append", default=[])
+    capture.add_argument("--lane", help="Default: deferred (the reserved backlog). Reserved lanes: deferred, held.")
+    capture.add_argument("--acceptance")
+    capture.add_argument("--prompt")
+    capture.add_argument("--prompt-path")
+    capture.add_argument("--pattern")
+    capture.add_argument("--severity")
+    capture.add_argument("--source", help="Default: the current working directory.")
+    capture.add_argument("--json", action="store_true")
+    capture.set_defaults(func=_cmd_capture)
 
     show = sub.add_parser(
         "show",
