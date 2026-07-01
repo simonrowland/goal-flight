@@ -33,7 +33,7 @@ def run_adapter_probe(
     runner: Callable[[list[str]], tuple[int, str, str]] | None = None,
     dry_run: bool = False,
 ) -> dict[str, Any]:
-    import goalflight_fleet as fleet
+    import goalflight_fleet_store as fleet
     import goalflight_fleet_ssh as fleet_ssh
 
     started = time.monotonic()
@@ -138,7 +138,7 @@ def load_latest_probes(fleet_dir: Path, node_id: str) -> dict[str, dict[str, Any
 
 def main(argv: list[str] | None = None) -> int:
     import argparse
-    import goalflight_fleet as fleet
+    import goalflight_fleet_store as fleet
 
     parser = argparse.ArgumentParser(description="Fleet bash-tail remote probe (non-gating)")
     parser.add_argument("--fleet-dir", type=Path, default=fleet.default_fleet_dir())

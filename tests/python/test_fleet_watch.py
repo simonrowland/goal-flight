@@ -832,6 +832,40 @@ def test_until_terminal_running_to_terminal() -> None:
         assert_true("polls", result.polls == 2)
 
 
+def test_until_terminal_seq_regression_does_not_accept_stale_terminal() -> None:
+    dispatch_id = "acp-watch-stale-terminal-regression"
+    with tempfile.TemporaryDirectory() as td:
+        fleet_dir = Path(td) / "fleet"
+        _fixture_fleet(fleet_dir)
+        status_path = _write_dispatch(fleet_dir, dispatch_id=dispatch_id, seq=5, epoch="run-1")
+        status_path.write_text(
+            _status_payload(dispatch_id=dispatch_id, seq=5, state="complete", epoch="run-1") + "\n"
+        )
+        lock = fleet.acquire_account_lock(
+            fleet_dir,
+            account_key="openai/default",
+            owner_dispatch_id=dispatch_id,
+        )
+        assert_true("lock acquired", lock.get("state") == "active")
+        transport = FakeTransport(
+            {dispatch_id: _status_payload(dispatch_id=dispatch_id, seq=3, state="running", epoch="run-1")}
+        )
+
+        result = fleet_watch.watch_until_terminal(
+            fleet_dir,
+            dispatch_id,
+            transport,
+            timeout_s=0,
+            interval_s=0,
+            jitter_s=0,
+            stale_s=999,
+        )
+
+        assert_true("stale terminal not success", result.exit_code != 0)
+        lock_after = fleet.load_account_lock(fleet.account_lock_path(fleet_dir, "openai/default"))
+        assert_true("lock retained", lock_after is not None and lock_after.get("state") == "active")
+
+
 def test_until_terminal_timeout_exits_live() -> None:
     dispatch_id = "acp-watch-timeout"
     with tempfile.TemporaryDirectory() as td:
@@ -1368,6 +1402,7 @@ def main() -> None:
     test_ssh_transport_uses_injected_runner()
     test_ssh_transport_uses_node_state_dir_for_custom_status_path()
     test_until_terminal_running_to_terminal()
+    test_until_terminal_seq_regression_does_not_accept_stale_terminal()
     test_until_terminal_timeout_exits_live()
     test_until_terminal_backfills_launch_unconfirmed_receipt()
     test_until_terminal_stale_dead_identity_marks_worker_dead()
@@ -1387,7 +1422,7 @@ def main() -> None:
     test_release_lock_skips_foreign_lock()
     test_release_lock_releases_clean_failure_terminal()
     test_release_lock_no_double_release()
-    print("OK: 36 fleet watch tests pass")
+    print("OK: 37 fleet watch tests pass")
 
 
 if __name__ == "__main__":

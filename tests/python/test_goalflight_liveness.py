@@ -28,6 +28,7 @@ from goalflight_liveness import (  # noqa: E402
     IdleLivenessGate,
     LivenessThresholds,
     classify_liveness,
+    cpu_confirmed_idle,
     cpu_liveness_keep_waiting,
     parse_ps_pgroup_cpu,
     pgroup_cpu_pct,
@@ -205,13 +206,18 @@ def test_idle_silent_worker_classifies_wedged() -> None:
     assert state == "wedged", state
 
 
-def test_none_cpu_idle_classifies_wedged() -> None:
-    # CPU sample unavailable (ps failed) + idle-expired → wedged. This is the
-    # single-sample conservative verdict; the transient-failure grace lives in
-    # cpu_liveness_keep_waiting / the watcher confirm-streak, NOT in the pure
-    # classifier (grok 2026-05-20 P2: assert the None+idle branch explicitly).
+def test_none_cpu_idle_keeps_running() -> None:
+    # CPU sample unavailable (ps failed) + idle-expired does not prove idle.
+    # Keep waiting instead of false-killing a healthy quiet worker.
     thresholds = LivenessThresholds(idle_timeout_s=10.0, cpu_epsilon_pct=0.1)
-    assert classify_liveness(True, None, 100.0, thresholds) == "wedged"
+    assert classify_liveness(True, None, 100.0, thresholds) == "running"
+
+
+def test_cpu_confirmed_idle_requires_measured_cpu() -> None:
+    assert cpu_confirmed_idle(None, 0.1) is False
+    assert cpu_confirmed_idle(0.0, 0.1) is True
+    assert cpu_confirmed_idle(0.1, 0.1) is True
+    assert cpu_confirmed_idle(0.2, 0.1) is False
 
 
 def test_starved_zero_cpu_extends_idle_once_then_wedges() -> None:
@@ -865,7 +871,8 @@ def main() -> None:
     test_write_status_preserves_out_of_band_recreated_epoch()
     test_busy_silent_worker_classifies_running_quiet()
     test_idle_silent_worker_classifies_wedged()
-    test_none_cpu_idle_classifies_wedged()
+    test_none_cpu_idle_keeps_running()
+    test_cpu_confirmed_idle_requires_measured_cpu()
     test_starved_zero_cpu_extends_idle_once_then_wedges()
     test_starved_long_idle_wedges_at_absolute_cap_not_multiplied()
     test_starved_short_idle_still_gets_factor_benefit()

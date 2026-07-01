@@ -216,6 +216,65 @@ def test_done_code() -> None:
               "worker_pid": 333,
               "worker_still_alive": True,
           }) == 0)
+    detached_controller_dead = {
+        "dispatch_id": "detached-live-controller-dead",
+        "state": "orphaned",
+        "reason": "controller_dead",
+        "detached": True,
+        "agent": "codex",
+        "worker_pid": 444,
+        "worker_identity": {"lstart": "Tue Jun  9 09:00:00 2026", "comm": "python3"},
+        "project_root": "/repo/A",
+        "started_at": S.goalflight_ledger.utc_now(),
+    }
+    orig_read_records = S.goalflight_ledger.read_records
+    orig_identity_matches = S.goalflight_ledger.identity_matches
+    try:
+        S.goalflight_ledger.read_records = lambda: [detached_controller_dead]
+        S.goalflight_ledger.identity_matches = lambda _record: (True, "live")
+        rows = S.goalflight_ledger.status_payload()["records"]
+        check("detached controller_dead live classified expected_live",
+              rows[0].get("classification") == "expected_live")
+        check("detached controller_dead live terminal unknown",
+              rows[0].get("terminal_state") == "unknown")
+        check("detached controller_dead live --done -> 1",
+              S.done_code(rows[0]) == 1)
+
+        S.goalflight_ledger.identity_matches = lambda _record: (False, "dead")
+        dead_rows = S.goalflight_ledger.status_payload()["records"]
+        check("detached controller_dead dead worker classified worker_dead",
+              dead_rows[0].get("classification") == "worker_dead")
+        check("detached controller_dead dead worker terminal worker_dead",
+              dead_rows[0].get("terminal_state") == "worker_dead")
+    finally:
+        S.goalflight_ledger.read_records = orig_read_records
+        S.goalflight_ledger.identity_matches = orig_identity_matches
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tail = Path(tmp) / "detached-success.tail"
+        started = S.goalflight_ledger.utc_now()
+        tail.write_text("work finished\nCOMPLETE: detached ok\n", encoding="utf-8")
+        success_record = {
+            **detached_controller_dead,
+            "dispatch_id": "detached-success-controller-dead",
+            "stdout_path": str(tail),
+            "started_at": started,
+        }
+        orig_identity_matches = S.goalflight_ledger.identity_matches
+        try:
+            S.goalflight_ledger.identity_matches = lambda _record: (False, "dead")
+            success_row = {
+                **success_record,
+                "classification": S.goalflight_ledger.classify(success_record),
+                "terminal_state": "worker_dead",
+            }
+            reconciled = S._reconcile_output_tail_record(success_row)
+            check("detached controller_dead dead worker + COMPLETE tail -> complete",
+                  reconciled.get("classification") == "complete")
+            check("detached controller_dead reconciled --done -> 0",
+                  S.done_code(reconciled) == 0)
+        finally:
+            S.goalflight_ledger.identity_matches = orig_identity_matches
     timeout_summary = {
         "dispatch_id": "timeout-live",
         "classification": "idle_timeout",
@@ -229,6 +288,7 @@ def test_done_code() -> None:
     }
     orig_read_records = S.goalflight_ledger.read_records
     orig_identity_matches = S.goalflight_ledger.identity_matches
+    orig_pid_alive = S.goalflight_compat.pid_alive
     try:
         captured: list[dict] = []
 
@@ -245,10 +305,12 @@ def test_done_code() -> None:
         check("idle_timeout stale cached worker -> 0", S.done_code(timeout_summary) == 0)
 
         S.goalflight_ledger.read_records = lambda: []
+        S.goalflight_compat.pid_alive = lambda _pid: False
         check("idle_timeout cached flag without identity -> 0", S.done_code(timeout_summary) == 0)
     finally:
         S.goalflight_ledger.read_records = orig_read_records
         S.goalflight_ledger.identity_matches = orig_identity_matches
+        S.goalflight_compat.pid_alive = orig_pid_alive
     watcher_summary = {
         "dispatch_id": "watcher-live",
         "state": "watcher_stopped",
@@ -263,6 +325,7 @@ def test_done_code() -> None:
     }
     orig_read_records = S.goalflight_ledger.read_records
     orig_identity_matches = S.goalflight_ledger.identity_matches
+    orig_pid_alive = S.goalflight_compat.pid_alive
     try:
         captured = []
 
@@ -292,8 +355,22 @@ def test_done_code() -> None:
     finally:
         S.goalflight_ledger.read_records = orig_read_records
         S.goalflight_ledger.identity_matches = orig_identity_matches
+        S.goalflight_compat.pid_alive = orig_pid_alive
     check("stale_* -> 2", S.done_code({"classification": "stale_pid_reuse"}) == 2)
     check("missing classification -> 2 (do not claim done)", S.done_code({}) == 2)
+    check(
+        "running no terminal marker -> 2",
+        S.done_code(
+            {
+                "dispatch_id": "between-turn",
+                "state": "running",
+                "classification": "running",
+                "worker_pid": 333,
+                "worker_still_alive": True,
+            }
+        )
+        == 2,
+    )
 
 
 def test_output_tail_reconciles_success_marker_after_watcher_death() -> None:
@@ -329,10 +406,14 @@ def test_output_tail_reconciles_success_marker_after_watcher_death() -> None:
             fresh_live = S._reconcile_output_tail_record({**record, "classification": "watcher_stopped"})
             check("live worker with fresh terminal tail does not reconcile complete",
                   fresh_live.get("classification") == "watcher_stopped")
-            check("fresh live terminal marker signal retained",
-                  fresh_live.get("terminal_marker", {}).get("kind") == "COMPLETE")
+            check("fresh live unpromoted record carries NO terminal_marker signal",
+                  fresh_live.get("terminal_marker") is None and fresh_live.get("terminal_marker_source") is None)
+            check("fresh live marker kept as diagnostic observed_marker only",
+                  fresh_live.get("output_tail_reconciliation", {}).get("observed_marker", {}).get("kind") == "COMPLETE")
             check("fresh live reconciliation is explicitly unpromoted",
                   fresh_live.get("output_tail_reconciliation", {}).get("promoted") is False)
+            check("fresh live worker is NOT false-done (done_code != 0)",
+                  S.done_code(fresh_live) != 0)
 
             os.utime(
                 tail,
@@ -609,7 +690,7 @@ def test_wait_default_timeout() -> None:
     orig_wait, orig_root = S.wait_for_dispatches, S.this_project_root
     seen: dict = {}
 
-    def fake_wait(wait_ids, *, project_root, timeout_s, poll_s, json_output=False):
+    def fake_wait(wait_ids, *, project_root, timeout_s, poll_s, json_output=False, **_kwargs):
         seen.update(
             {
                 "wait_ids": wait_ids,
@@ -698,8 +779,13 @@ def test_wait_keyboard_interrupt_returns_130_without_signal() -> None:
         subprocess_calls.append(args)
         raise AssertionError("wait interrupt path must not shell out or signal workers")
 
+    def payload_without_pid() -> dict:
+        payload = _wait_payload("live1", "unknown_no_pid")
+        payload["dispatch"]["records"][0].pop("worker_pid", None)
+        return payload
+
     try:
-        S.status_payload = lambda: _wait_payload("live1", "expected_live")
+        S.status_payload = payload_without_pid
         S.time.sleep = lambda _seconds: (_ for _ in ()).throw(KeyboardInterrupt())
         S.subprocess.run = fail_subprocess
         err = io.StringIO()

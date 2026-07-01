@@ -36,6 +36,7 @@ QUARANTINE_SSH_PARTITION = "ssh_partition"
 QUARANTINE_MIRROR_STALE = "mirror_stale"
 QUARANTINE_MIRROR_UNREADABLE = "mirror_unreadable"
 QUARANTINE_LEASE_MISSING = "lease_missing_incident"
+QUARANTINE_TERMINAL_PID_ALIVE = "terminal_pid_alive"
 
 
 @dataclass(frozen=True)
@@ -89,6 +90,8 @@ def classify_dispatch_row(
         return DispatchClassification("salvage")
 
     if is_terminal_state(remote_state):
+        if pid_hint == "alive":
+            return DispatchClassification("quarantined", quarantine_reason=QUARANTINE_TERMINAL_PID_ALIVE)
         return DispatchClassification("terminal")
 
     if is_running_state(remote_state):

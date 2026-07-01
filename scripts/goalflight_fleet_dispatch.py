@@ -316,7 +316,7 @@ def build_remote_command_plan(
         ("git_prune_claude_refs", {"python": str(node_entry.get("python") or "python3")}),
         ("git_fetch", {}),
         ("git_verify_commit", {"sha": base_sha}),
-        ("git_worktree_add", {"worktree_path": worktree_path, "ref": base_sha, "detach": True}),
+        ("git_worktree_add", {"state_dir": state_dir, "worktree_path": worktree_path, "ref": base_sha, "detach": True}),
         (
             "launch_detached",
             {
@@ -360,7 +360,7 @@ def preview_dispatch(
     base_sha: str | None = None,
     thin_mode: bool = False,
 ) -> DispatchPreview:
-    import goalflight_fleet as fleet
+    import goalflight_fleet_store as fleet
 
     fleet.bootstrap(fleet_dir)
     fleet_doc = fleet.read_json(fleet_dir / "fleet.json")
@@ -443,7 +443,7 @@ def persist_dispatch_account_lock_link(
     preview: DispatchPreview,
     lock_doc: dict[str, Any],
 ) -> None:
-    import goalflight_fleet as fleet
+    import goalflight_fleet_store as fleet
     import goalflight_fleet_watch as fleet_watch
 
     meta_path = fleet_watch.dispatch_meta_path(fleet_dir, preview.dispatch_id)
@@ -501,7 +501,7 @@ def acquire_lock_chain(
     stop_after: str | None = None,
 ) -> LockChainResult:
     """Acquire locks in plan order; rollback on failure."""
-    import goalflight_fleet as fleet
+    import goalflight_fleet_store as fleet
 
     result = LockChainResult(account_key=preview.billing_account)
     acquired: list[str] = []
@@ -627,7 +627,7 @@ def release_lock_chain(
     acquired: list[str],
     fencing_token: str | None,
 ) -> None:
-    import goalflight_fleet as fleet
+    import goalflight_fleet_store as fleet
 
     for step in reversed(acquired):
         if step == "account" and fencing_token:
@@ -665,6 +665,7 @@ def _best_effort_remove_worktree(
         argv = fleet_ssh.build_remote_command(
             "git_worktree_remove",
             repo_root=repo_root,
+            state_dir=str(node_entry.get("state_dir") or "~/.goal-flight"),
             worktree_path=preview.worktree_path,
         )
         host = fleet_ssh.host_from_node_entry(preview.node_id, node_entry)
@@ -686,8 +687,9 @@ def register_dispatch_meta(
     launch_unconfirmed_error: str | None = None,
     row_state: str | None = None,
     account_lock: dict[str, Any] | None = None,
+    queue_launch_token: str | None = None,
 ) -> None:
-    import goalflight_fleet as fleet
+    import goalflight_fleet_store as fleet
     import goalflight_fleet_watch as fleet_watch
 
     fleet_doc = fleet.read_json(fleet_dir / "fleet.json")
@@ -728,6 +730,8 @@ def register_dispatch_meta(
         now = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(timespec="seconds")
         meta["launch_issued_at"] = now
         meta["launch_unconfirmed_at"] = now
+    if queue_launch_token:
+        meta["queue_launch_token"] = queue_launch_token
     if launch_receipt:
         meta.update(
             {
@@ -781,6 +785,7 @@ def record_dispatch_ledger(
     chain: LockChainResult,
     *,
     state: str = "running",
+    queue_launch_token: str | None = None,
 ) -> dict[str, Any]:
     import goalflight_ledger as ledger
 
@@ -802,6 +807,8 @@ def record_dispatch_ledger(
         "started_at": ledger.utc_now(),
         "hostname": __import__("socket").gethostname(),
     }
+    if queue_launch_token:
+        record["queue_launch_token"] = queue_launch_token
     with ledger.StateLock():
         path = ledger.write_record(record)
     return {"ok": True, "path": str(path), "record": record}
@@ -885,6 +892,7 @@ def execute_dispatch(
     dispatch_mode: str = "one-shot",
     tool_smoke_policy: str | None = "auto",
     tool_smoke_sandbox: str = tool_smoke.DEFAULT_SANDBOX,
+    queue_launch_token: str | None = None,
 ) -> dict[str, Any]:
     assert_dispatch_gates(
         fleet_dir,
@@ -907,6 +915,7 @@ def execute_dispatch(
         pid_hint="unknown",
         launch_unconfirmed=recovering_unconfirmed,
         row_state="launch_pending",
+        queue_launch_token=queue_launch_token,
     )
     chain = acquire_lock_chain(fleet_dir, preview, runner=runner)
     register_dispatch_meta(
@@ -918,11 +927,13 @@ def execute_dispatch(
         launch_unconfirmed_error=chain.launch_unconfirmed_error,
         row_state="launch_unconfirmed" if chain.launch_unconfirmed else "launch_receipted",
         account_lock=chain.account_lock,
+        queue_launch_token=queue_launch_token,
     )
     ledger_info = record_dispatch_ledger(
         preview,
         chain,
         state="launch_unconfirmed" if chain.launch_unconfirmed else "running",
+        queue_launch_token=queue_launch_token,
     )
     if stub_terminal:
         import goalflight_ledger as ledger
@@ -938,6 +949,7 @@ def execute_dispatch(
             launch_unconfirmed_error=chain.launch_unconfirmed_error,
             row_state="terminal",
             account_lock=chain.account_lock,
+            queue_launch_token=queue_launch_token,
         )
         with ledger.StateLock():
             record = json.loads(Path(ledger_info["path"]).read_text())
@@ -971,7 +983,7 @@ def execute_dispatch(
 
 
 def cmd_dispatch(args) -> int:
-    import goalflight_fleet as fleet
+    import goalflight_fleet_store as fleet
 
     fleet.bootstrap(args.fleet_dir)
     thin = bool(getattr(args, "thin_defaults", False))

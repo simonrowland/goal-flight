@@ -179,6 +179,38 @@ def test_terminal_dead_pid_release_once() -> None:
         assert_true("fencing was", lock.get("fencing_token"))
 
 
+def test_terminal_mirror_live_pid_holds_lock() -> None:
+    dispatch_id = "acp-reconcile-terminal-live-pid"
+    with tempfile.TemporaryDirectory() as td:
+        fleet_dir = Path(td) / "fleet"
+        _fixture_fleet(fleet_dir)
+        _acquire_lock(fleet_dir, dispatch_id)
+        terminal = json.loads((FIXTURES / "valid_ok.json").read_text())
+        terminal["state"] = "complete"
+        dispatch_dir = fleet_dir / "register" / "dispatches" / dispatch_id
+        dispatch_dir.mkdir(parents=True, exist_ok=True)
+        (dispatch_dir / "status.json").write_text(json.dumps(terminal) + "\n")
+        fleet._atomic_write_json(
+            dispatch_dir / "meta.json",
+            {
+                "dispatch_id": dispatch_id,
+                "node_id": "localhost",
+                "lease_active": True,
+                "pid_hint": "alive",
+                "ssh_reachable": True,
+            },
+        )
+        _write_aggregate(fleet_dir, [dispatch_id])
+
+        row = fleet_reconcile.reconcile_dispatch(fleet_dir, dispatch_id, mutate=True)
+
+        assert_true("live pid does not release", row.action != "release_locks")
+        assert_true("not released", row.released is False)
+        assert_true("may not release", row.may_release is False)
+        held = fleet.load_account_lock(fleet.account_lock_path(fleet_dir, "openai/default"))
+        assert_true("lock held", held is not None and held.get("state") == "active")
+
+
 def test_terminal_failed_release() -> None:
     dispatch_id = "acp-reconcile-terminal-failed"
     with tempfile.TemporaryDirectory() as td:
@@ -702,6 +734,7 @@ def test_live_ssh_probe_quarantine_when_unreachable() -> None:
 def main() -> None:
     test_ssh_down_quarantine_no_release()
     test_terminal_dead_pid_release_once()
+    test_terminal_mirror_live_pid_holds_lock()
     test_terminal_failed_release()
     test_acp_final_failure_states_release_locks()
     test_terminal_error_release()
@@ -716,7 +749,7 @@ def main() -> None:
     test_salvage_needed_ttl_expired_lock_survives_stale_reconcile()
     test_non_salvage_terminal_ttl_expired_still_reaped()
     test_live_ssh_probe_quarantine_when_unreachable()
-    print("OK: 16 fleet reconcile tests pass")
+    print("OK: 17 fleet reconcile tests pass")
 
 
 if __name__ == "__main__":

@@ -44,6 +44,13 @@ import uuid
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 import goalflight_compat  # noqa: E402
+import goalflight_dispatch_paths  # noqa: E402
+import goalflight_steer_mailbox  # noqa: E402
+from goalflight_watch import (  # noqa: E402
+    BLOCKING_TERMINAL_MARKERS,
+    SUCCESS_TERMINAL_MARKERS,
+    TERMINAL_MARKERS,
+)
 
 DEFAULT_REMOTE_TURN_SILENCE_S = 1200.0
 DEFAULT_REMOTE_TURN_CANCEL_GRACE_S = 15.0
@@ -57,6 +64,10 @@ AGENT_STDERR_CAPTURE_BYTES = 64 * 1024
 AGENT_STDERR_ERROR_TAIL_CHARS = 1000
 LIVENESS_PROFILES = {"remote_api", "local_compute", "hybrid"}
 STEER_FILE_ALLOW_ENV = "GOALFLIGHT_ALLOW_EXTERNAL_STEER_FILE"
+USER_CONFIRM_MARKER = "USER-CONFIRM"
+ACTIONABLE_BLOCKING_TERMINAL_MARKERS = BLOCKING_TERMINAL_MARKERS - {
+    USER_CONFIRM_MARKER,
+}
 
 
 def _acp_reexec_target() -> str | None:
@@ -335,6 +346,7 @@ def _hard_gate_escalates(tool_call: Any, cwd: str | None) -> bool:
     return True
 from goalflight_liveness import (
     active_monotonic,
+    cpu_confirmed_idle,
     heartbeat_wedge_decision,
     IdleLivenessGate,
     pgroup_cpu_pct,
@@ -414,9 +426,7 @@ class _SigtermCancelBridge:
 
 
 def _dispatch_base_dir() -> Path:
-    import goalflight_dispatch
-
-    return goalflight_dispatch._dispatch_base_dir()
+    return goalflight_dispatch_paths.dispatch_base_dir()
 
 
 def _default_status_json_path(dispatch_id: str) -> Path:
@@ -569,9 +579,7 @@ def _resolve_steer_file(cfg: argparse.Namespace, dispatch_id: str) -> tuple[Path
 
 
 def _read_steer_entries(path: Path) -> list[dict]:
-    import goalflight_dispatch
-
-    return goalflight_dispatch._read_steer_entries(path)
+    return goalflight_steer_mailbox.read_steer_entries(path)
 
 
 def _steer_ack_seqs(markers: dict[str, list[str]]) -> set[int]:
@@ -610,18 +618,20 @@ def _prompt_with_steer(base_prompt: str, mailbox: Path, entries: list[dict]) -> 
 
 
 def _terminal_turn_marker(markers: dict[str, list[str]]) -> bool:
-    return any(markers.get(kind) for kind in ("RESULT", "COMPLETE", "BLOCKED", "USER-NEED", "USER-CONFIRM"))
+    return any(markers.get(kind) for kind in TERMINAL_MARKERS)
 
 
 def _successful_terminal_marker(markers: dict[str, list[str]]) -> bool:
-    return any(markers.get(kind) for kind in ("RESULT", "COMPLETE", "READY"))
+    return any(markers.get(kind) for kind in SUCCESS_TERMINAL_MARKERS)
 
 
 def _state_after_actionable_terminal_markers(state: str, markers: dict[str, list[str]]) -> str:
     if state == "complete" and (
-        has_actionable_marker_values(markers, "BLOCKED")
-        or has_actionable_marker_values(markers, "USER-NEED")
-        or markers.get("USER-CONFIRM")
+        any(
+            has_actionable_marker_values(markers, kind)
+            for kind in ACTIONABLE_BLOCKING_TERMINAL_MARKERS
+        )
+        or markers.get(USER_CONFIRM_MARKER)
     ):
         return "blocked"
     return state
@@ -2139,10 +2149,16 @@ async def _run_acp_dispatch_impl(
                 and outstanding_count == 0
                 and quiet_for_s >= cfg.max_quiet_s
                 and pid_alive
+                and cpu_confirmed_idle(cpu_pct, cfg.cpu_epsilon)
             ):
                 await mark_heartbeat_terminal(
                     "wedged",
-                    {"code": -1, "message": "max_quiet_s"},
+                    {
+                        "code": -1,
+                        "message": "max_quiet_s",
+                        "quiet_for_s": round(quiet_for_s, 3),
+                        "cpu_pct": cpu_pct,
+                    },
                 )
                 await conn.kill()
                 return

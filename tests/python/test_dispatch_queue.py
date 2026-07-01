@@ -91,6 +91,27 @@ def _drain_args(queue: Path, *, limit: int = 0) -> argparse.Namespace:
     )
 
 
+@contextlib.contextmanager
+def _sleeping_worker():
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        cwd=ROOT,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        assert _wait_for(lambda: D.goalflight_ledger.process_identity(proc.pid) is not None, timeout=5.0)
+        yield proc
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5.0)
+
+
 def _write_queue_entry(
     queue: Path,
     dispatch_id: str,
@@ -150,8 +171,31 @@ def _record_drain_launch_order(order: list[str]):
 
     def fake_run(argv, **_kwargs):
         argv = list(argv)
-        dispatch_id = argv[argv.index("--dispatch-id") + 1]
+        try:
+            dispatch_id = argv[argv.index("--dispatch-id") + 1]
+            queue_launch_token = argv[argv.index("--queue-launch-token") + 1]
+        except (ValueError, IndexError):
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
         order.append(dispatch_id)
+        D.goalflight_ledger.write_record(
+            {
+                "schema": D.goalflight_ledger.SCHEMA,
+                "dispatch_id": dispatch_id,
+                "agent": "test-dispatch",
+                "engine": "test-dispatch",
+                "shape": "bash",
+                "transport": "dispatch",
+                "project_root": str(ROOT),
+                "worker_pid": os.getpid(),
+                "worker_identity": D.goalflight_ledger.process_identity(os.getpid()),
+                "stdout_path": str(ROOT / "test.tail"),
+                "status_path": str(ROOT / "test.status.json"),
+                "state": "running",
+                "terminal_state": "unknown",
+                "queue_launch_token": queue_launch_token,
+                "started_at": D.goalflight_ledger.utc_now(),
+            }
+        )
         return subprocess.CompletedProcess(argv, 0, stdout=f"DISPATCH-LAUNCHED {dispatch_id}\n", stderr="")
 
     D.subprocess.run = fake_run
@@ -390,6 +434,120 @@ def test_submit_is_idempotent_for_matching_args_and_rejects_collisions() -> None
         collision = _run([*cmd[:-1], "print('COMPLETE: different')"], env)
         assert collision.returncode == 64, (collision.stdout, collision.stderr)
         assert "queued request already exists" in collision.stderr
+
+
+def test_submit_ignores_matching_failed_claim_tombstone_for_requeue() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        env = _env(tmp)
+        cmd = [
+            sys.executable,
+            str(DISPATCH),
+            "--agent",
+            "test-dispatch",
+            "--submit",
+            "--no-drain-on-submit",
+            "--dispatch-id",
+            "submit-after-failed-tombstone",
+            "--tail",
+            str(tmp / "failed-tombstone.tail"),
+            "--status-json",
+            str(tmp / "failed-tombstone.status.json"),
+            "--cwd",
+            str(ROOT),
+            "--",
+            sys.executable,
+            "-c",
+            "print('COMPLETE: same after failed tombstone')",
+        ]
+        first = _run(cmd, env)
+        assert first.returncode == 0, (first.stdout, first.stderr)
+        queue_path = tmp / "state" / "dispatch-queue" / "submit-after-failed-tombstone.json"
+        entry = json.loads(queue_path.read_text(encoding="utf-8"))
+        entry["state"] = "failed"
+        failed = queue_path.with_name(f"{queue_path.name}.claimed-123.failed")
+        failed.write_text(json.dumps(entry), encoding="utf-8")
+        queue_path.unlink()
+
+        second = _run(cmd, env)
+        assert second.returncode == 0, (second.stdout, second.stderr)
+        assert "DISPATCH-QUEUED" in second.stdout, second.stdout
+        assert queue_path.exists(), "failed tombstone blocked fresh requeue"
+
+
+def test_duplicate_submit_runs_opportunistic_drain() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        env = _env(tmp)
+        old_env = os.environ.copy()
+        old_drain = D._drain_queue_once
+        calls = []
+        try:
+            os.environ.clear()
+            os.environ.update(env)
+
+            seed_rc = D.main(
+                [
+                    "--agent",
+                    "test-dispatch",
+                    "--submit",
+                    "--no-drain-on-submit",
+                    "--dispatch-id",
+                    "duplicate-drain-nudge",
+                    "--tail",
+                    str(tmp / "dup-drain.tail"),
+                    "--status-json",
+                    str(tmp / "dup-drain.status.json"),
+                    "--cwd",
+                    str(ROOT),
+                    "--",
+                    sys.executable,
+                    "-c",
+                    "print('COMPLETE: duplicate drain nudge')",
+                ]
+            )
+            assert seed_rc == 0
+
+            def fake_drain(args):
+                calls.append(args)
+                return {
+                    "schema": "test",
+                    "queue_dir": args.queue_dir,
+                    "launched": 0,
+                    "left_queued": 0,
+                    "failed": 0,
+                    "remaining": 1,
+                    "pending_claims": 0,
+                    "recovered_claims": {"restored": 0, "cleared": 0, "pending_launch": 0},
+                    "details": [],
+                }
+
+            D._drain_queue_once = fake_drain
+            duplicate_rc = D.main(
+                [
+                    "--agent",
+                    "test-dispatch",
+                    "--submit",
+                    "--dispatch-id",
+                    "duplicate-drain-nudge",
+                    "--tail",
+                    str(tmp / "dup-drain.tail"),
+                    "--status-json",
+                    str(tmp / "dup-drain.status.json"),
+                    "--cwd",
+                    str(ROOT),
+                    "--",
+                    sys.executable,
+                    "-c",
+                    "print('COMPLETE: duplicate drain nudge')",
+                ]
+            )
+        finally:
+            D._drain_queue_once = old_drain
+            os.environ.clear()
+            os.environ.update(old_env)
+        assert duplicate_rc == 0
+        assert len(calls) == 1, "duplicate submit did not retry drain-on-submit"
 
 
 def test_concurrent_submit_same_id_is_idempotent() -> None:
@@ -1060,6 +1218,38 @@ def test_failed_claim_tombstone_is_not_recovered() -> None:
         assert not (tmp / "state" / "dispatch-queue" / "bad.json").exists()
 
 
+def test_fresh_token_only_claim_waits_for_stale_window() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        env = _env(tmp)
+        old_env = os.environ.copy()
+        try:
+            os.environ.clear()
+            os.environ.update(env)
+            queue = tmp / "state" / "dispatch-queue"
+            queue.mkdir(parents=True)
+            claim = queue / "fresh-token-only.json.claimed-123"
+            claim.write_text(
+                json.dumps(
+                    {
+                        "schema": D.DISPATCH_QUEUE_SCHEMA,
+                        "state": "claimed",
+                        "dispatch_id": "fresh-token-only",
+                        "dispatch_argv": ["--agent", "test-dispatch"],
+                        "queue_launch_token": "fresh-token",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            result = D._recover_claimed_queue_entries(queue, stale_s=3600)
+        finally:
+            os.environ.clear()
+            os.environ.update(old_env)
+        assert result == {"restored": 0, "cleared": 0, "pending_launch": 1}, result
+        assert claim.exists()
+        assert not (queue / "fresh-token-only.json").exists()
+
+
 def test_stale_claim_launch_token_requires_matching_worker_record() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
@@ -1155,18 +1345,20 @@ def test_stale_claim_launch_token_requires_matching_worker_record() -> None:
                 encoding="utf-8",
             )
             os.utime(matched_claim, (time.time() - 60, time.time() - 60))
-            D.goalflight_ledger.write_record(
-                {
-                    "schema": D.goalflight_ledger.SCHEMA,
-                    "dispatch_id": "matched",
-                    "state": "running",
-                    "terminal_state": "unknown",
-                    "worker_pid": 123,
-                    "queue_launch_token": "matched-token",
-                    "started_at": D.goalflight_ledger.utc_now(),
-                }
-            )
-            cleared = D._recover_claimed_queue_entries(queue, stale_s=0)
+            with _sleeping_worker() as worker:
+                D.goalflight_ledger.write_record(
+                    {
+                        "schema": D.goalflight_ledger.SCHEMA,
+                        "dispatch_id": "matched",
+                        "state": "running",
+                        "terminal_state": "unknown",
+                        "worker_pid": worker.pid,
+                        "worker_identity": D.goalflight_ledger.process_identity(worker.pid),
+                        "queue_launch_token": "matched-token",
+                        "started_at": D.goalflight_ledger.utc_now(),
+                    }
+                )
+                cleared = D._recover_claimed_queue_entries(queue, stale_s=0)
         finally:
             os.environ.clear()
             os.environ.update(old_env)
@@ -1231,6 +1423,322 @@ def test_stale_claim_result_marker_with_rate_limit_text_completes() -> None:
         assert status_payload["state"] == "complete", status_payload
         assert status_payload.get("terminal_marker", {}).get("kind") == "RESULT", status_payload
 
+
+def test_drain_replay_argv_injects_queue_control_flags() -> None:
+    """Poison-pair: drain replay must inject _drain_launch_argv queue-control flags.
+
+    Regression guard (audit-r24-1): existing drain tests only checked dispatch_id
+    recording; dropping --from-queue / --queue-launch-token / --queue-claim-path /
+    --launch-detached / --capacity-wait-s from replay argv would not fail CI.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        env = _env(tmp)
+        old_env = os.environ.copy()
+        captured_argv: list[list[str]] = []
+        try:
+            os.environ.clear()
+            os.environ.update(env)
+            queue = tmp / "state" / "dispatch-queue"
+            queue.mkdir(parents=True)
+            _write_queue_entry(queue, "argv-guard", filename="000-argv-guard")
+            old_run = D.subprocess.run
+
+            def fake_run(argv, **kwargs):
+                argv = list(argv)
+                if not any("goalflight_dispatch.py" in str(part) for part in argv):
+                    return old_run(argv, **kwargs)
+                captured_argv.append(argv)
+                try:
+                    dispatch_id = argv[argv.index("--dispatch-id") + 1]
+                    queue_launch_token = argv[argv.index("--queue-launch-token") + 1]
+                except (ValueError, IndexError):
+                    return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+                D.goalflight_ledger.write_record(
+                    {
+                        "schema": D.goalflight_ledger.SCHEMA,
+                        "dispatch_id": dispatch_id,
+                        "agent": "test-dispatch",
+                        "engine": "test-dispatch",
+                        "shape": "bash",
+                        "transport": "dispatch",
+                        "project_root": str(ROOT),
+                        "worker_pid": os.getpid(),
+                        "worker_identity": D.goalflight_ledger.process_identity(os.getpid()),
+                        "stdout_path": str(ROOT / "test.tail"),
+                        "status_path": str(ROOT / "test.status.json"),
+                        "state": "running",
+                        "terminal_state": "unknown",
+                        "queue_launch_token": queue_launch_token,
+                        "started_at": D.goalflight_ledger.utc_now(),
+                    }
+                )
+                return subprocess.CompletedProcess(
+                    argv,
+                    0,
+                    stdout=f"DISPATCH-LAUNCHED {dispatch_id}\n",
+                    stderr="",
+                )
+
+            D.subprocess.run = fake_run
+            payload = D._drain_queue_once(_drain_args(queue, limit=1))
+        finally:
+            D.subprocess.run = old_run
+            os.environ.clear()
+            os.environ.update(old_env)
+        assert payload["launched"] == 1, payload
+        assert len(captured_argv) == 1, captured_argv
+        argv = captured_argv[0]
+        required_flags = (
+            "--from-queue",
+            "--queue-launch-token",
+            "--queue-claim-path",
+            "--launch-detached",
+            "--capacity-wait-s",
+            "--dispatch-id",
+        )
+        for flag in required_flags:
+            assert flag in argv, f"missing queue-control flag {flag!r} in replay argv: {argv}"
+        assert argv[argv.index("--dispatch-id") + 1] == "argv-guard"
+        assert argv[argv.index("--capacity-wait-s") + 1] == "0.0"
+        claim_flag_idx = argv.index("--queue-claim-path")
+        claim_path = Path(argv[claim_flag_idx + 1])
+        assert claim_path.name.startswith("000-argv-guard.json.claimed-"), claim_path
+        token = argv[argv.index("--queue-launch-token") + 1]
+        assert token, "drain must inject a non-empty queue launch token"
+
+
+def test_drain_requires_token_matched_ledger_before_clearing_claim() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        env = _env(tmp)
+        old_env = os.environ.copy()
+        old_run = D.subprocess.run
+        try:
+            os.environ.clear()
+            os.environ.update(env)
+            queue = tmp / "state" / "dispatch-queue"
+            queue.mkdir(parents=True)
+            _write_queue_entry(queue, "stdout-only-launch", filename="stdout-only-launch")
+
+            def fake_run(argv, **_kwargs):
+                return subprocess.CompletedProcess(
+                    list(argv),
+                    0,
+                    stdout='DISPATCH-LAUNCHED {"dispatch_id":"stdout-only-launch"}\n',
+                    stderr="",
+                )
+
+            D.subprocess.run = fake_run
+            payload = D._drain_queue_once(_drain_args(queue))
+        finally:
+            D.subprocess.run = old_run
+            os.environ.clear()
+            os.environ.update(old_env)
+        assert payload["launched"] == 0, payload
+        assert payload["pending_claims"] == 1, payload
+        assert payload["failed"] == 1, payload
+        assert list(queue.glob("stdout-only-launch.json.claimed-*")), "claim cleared without ledger confirm"
+
+
+def test_legacy_claim_dead_worker_record_falls_through_to_recovery() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        env = _env(tmp)
+        old_env = os.environ.copy()
+        try:
+            os.environ.clear()
+            os.environ.update(env)
+            queue = tmp / "state" / "dispatch-queue"
+            queue.mkdir(parents=True)
+            worker = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(60)"],
+                cwd=ROOT,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            try:
+                assert _wait_for(lambda: D.goalflight_ledger.process_identity(worker.pid) is not None, timeout=5.0)
+                identity = D.goalflight_ledger.process_identity(worker.pid)
+                dead_pid = worker.pid
+            finally:
+                worker.terminate()
+                worker.wait(timeout=5.0)
+            D.goalflight_ledger.write_record(
+                {
+                    "schema": D.goalflight_ledger.SCHEMA,
+                    "dispatch_id": "legacy-dead-worker",
+                    "state": "running",
+                    "terminal_state": "unknown",
+                    "worker_pid": dead_pid,
+                    "worker_identity": identity,
+                    "started_at": D.goalflight_ledger.utc_now(),
+                }
+            )
+            claim = queue / "legacy-dead-worker.json.claimed-123"
+            claim.write_text(
+                json.dumps(
+                    {
+                        "schema": D.DISPATCH_QUEUE_SCHEMA,
+                        "state": "claimed",
+                        "dispatch_id": "legacy-dead-worker",
+                        "dispatch_argv": ["--agent", "test-dispatch"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            os.utime(claim, (time.time() - 60, time.time() - 60))
+            result = D._recover_claimed_queue_entries(queue, stale_s=0)
+        finally:
+            os.environ.clear()
+            os.environ.update(old_env)
+        assert result == {"restored": 1, "cleared": 0, "pending_launch": 0}, result
+        assert (queue / "legacy-dead-worker.json").exists()
+        assert not claim.exists()
+
+
+def test_token_mismatch_recovery_preserves_live_worker_record() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        env = _env(tmp)
+        old_env = os.environ.copy()
+        try:
+            os.environ.clear()
+            os.environ.update(env)
+            queue = tmp / "state" / "dispatch-queue"
+            queue.mkdir(parents=True)
+            with _sleeping_worker() as worker:
+                D.goalflight_ledger.write_record(
+                    {
+                        "schema": D.goalflight_ledger.SCHEMA,
+                        "dispatch_id": "token-mismatch-live-worker",
+                        "state": "running",
+                        "terminal_state": "unknown",
+                        "worker_pid": worker.pid,
+                        "worker_identity": D.goalflight_ledger.process_identity(worker.pid),
+                        "queue_launch_token": "different-token",
+                        "started_at": D.goalflight_ledger.utc_now(),
+                    }
+                )
+                claim = queue / "token-mismatch-live-worker.json.claimed-123"
+                claim.write_text(
+                    json.dumps(
+                        {
+                            "schema": D.DISPATCH_QUEUE_SCHEMA,
+                            "state": "claimed",
+                            "dispatch_id": "token-mismatch-live-worker",
+                            "agent": "test-dispatch",
+                            "shape": "bash",
+                            "project_root": str(ROOT),
+                            "dispatch_argv": ["--agent", "test-dispatch"],
+                            "request": {
+                                "agent": "test-dispatch",
+                                "cwd": str(ROOT),
+                                "tail": str(tmp / "token-mismatch.tail"),
+                                "status_json": str(tmp / "token-mismatch.status.json"),
+                            },
+                            "queue_launch_token": "claim-token",
+                            "queue_launch_started": True,
+                            "queue_worker_spawn_intent": True,
+                            "queue_worker_spawn_intent_at": D.goalflight_ledger.utc_now(),
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                os.utime(claim, (time.time() - 60, time.time() - 60))
+                result = D._recover_claimed_queue_entries(queue, stale_s=0)
+                record = json.loads(
+                    (tmp / "state" / "runs.d" / "token-mismatch-live-worker.json").read_text(encoding="utf-8")
+                )
+        finally:
+            os.environ.clear()
+            os.environ.update(old_env)
+        assert result == {"restored": 0, "cleared": 0, "pending_launch": 1}, result
+        assert claim.exists()
+        assert record["state"] == "running", record
+        assert record.get("terminal_state") == "unknown", record
+
+
+def test_token_mismatch_recovery_preserves_terminal_worker_record() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        env = _env(tmp)
+        old_env = os.environ.copy()
+        try:
+            os.environ.clear()
+            os.environ.update(env)
+            queue = tmp / "state" / "dispatch-queue"
+            queue.mkdir(parents=True)
+            status_path = tmp / "token-mismatch-terminal.status.json"
+            tail_path = tmp / "token-mismatch-terminal.tail"
+            D.goalflight_ledger.write_record(
+                {
+                    "schema": D.goalflight_ledger.SCHEMA,
+                    "dispatch_id": "token-mismatch-terminal-worker",
+                    "state": "complete",
+                    "terminal_state": "complete",
+                    "worker_pid": os.getpid(),
+                    "worker_identity": D.goalflight_ledger.process_identity(os.getpid()),
+                    "queue_launch_token": "different-token",
+                    "started_at": D.goalflight_ledger.utc_now(),
+                    "ended_at": D.goalflight_ledger.utc_now(),
+                }
+            )
+            D.write_status(
+                status_path,
+                {
+                    "schema": "goalflight.status.v1",
+                    "dispatch_id": "token-mismatch-terminal-worker",
+                    "state": "complete",
+                    "terminal_state": "complete",
+                    "queue_launch_token": "different-token",
+                    "status_path": str(status_path),
+                    "tail_path": str(tail_path),
+                },
+            )
+            claim = queue / "token-mismatch-terminal-worker.json.claimed-123"
+            claim.write_text(
+                json.dumps(
+                    {
+                        "schema": D.DISPATCH_QUEUE_SCHEMA,
+                        "state": "claimed",
+                        "dispatch_id": "token-mismatch-terminal-worker",
+                        "agent": "test-dispatch",
+                        "shape": "bash",
+                        "project_root": str(ROOT),
+                        "dispatch_argv": ["--agent", "test-dispatch"],
+                        "request": {
+                            "agent": "test-dispatch",
+                            "cwd": str(ROOT),
+                            "tail": str(tail_path),
+                            "status_json": str(status_path),
+                        },
+                        "queue_launch_token": "claim-token",
+                        "queue_launch_started": True,
+                        "queue_worker_spawn_intent": True,
+                        "queue_worker_spawn_intent_at": D.goalflight_ledger.utc_now(),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            os.utime(claim, (time.time() - 60, time.time() - 60))
+            result = D._recover_claimed_queue_entries(queue, stale_s=0)
+            record = json.loads(
+                (tmp / "state" / "runs.d" / "token-mismatch-terminal-worker.json").read_text(encoding="utf-8")
+            )
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+        finally:
+            os.environ.clear()
+            os.environ.update(old_env)
+        assert result == {"restored": 0, "cleared": 1, "pending_launch": 0}, result
+        assert not claim.exists()
+        assert not (queue / "token-mismatch-terminal-worker.json").exists()
+        assert record["state"] == "complete", record
+        assert record["terminal_state"] == "complete", record
+        assert record["queue_launch_token"] == "different-token", record
+        assert status["state"] == "complete", status
+        assert status["terminal_state"] == "complete", status
+        assert status["queue_launch_token"] == "different-token", status
 
 def test_worker_dead_tail_rate_limit_reaches_pressure_sensor() -> None:
     with tempfile.TemporaryDirectory() as td:
@@ -1297,6 +1805,8 @@ def test_worker_dead_tail_rate_limit_reaches_pressure_sensor() -> None:
 def main() -> None:
     test_submit_records_replayable_request_without_capacity_acquire()
     test_submit_is_idempotent_for_matching_args_and_rejects_collisions()
+    test_submit_ignores_matching_failed_claim_tombstone_for_requeue()
+    test_duplicate_submit_runs_opportunistic_drain()
     test_concurrent_submit_same_id_is_idempotent()
     test_submit_write_error_is_clean()
     test_submit_status_write_error_removes_queue_entry()
@@ -1311,8 +1821,14 @@ def main() -> None:
     test_drain_does_not_tombstone_valid_entry_on_stale_prescan_read_error()
     test_stale_claim_without_worker_record_is_recovered()
     test_failed_claim_tombstone_is_not_recovered()
+    test_fresh_token_only_claim_waits_for_stale_window()
     test_stale_claim_launch_token_requires_matching_worker_record()
     test_stale_claim_result_marker_with_rate_limit_text_completes()
+    test_drain_replay_argv_injects_queue_control_flags()
+    test_drain_requires_token_matched_ledger_before_clearing_claim()
+    test_legacy_claim_dead_worker_record_falls_through_to_recovery()
+    test_token_mismatch_recovery_preserves_live_worker_record()
+    test_token_mismatch_recovery_preserves_terminal_worker_record()
     test_worker_dead_tail_rate_limit_reaches_pressure_sensor()
     test_submit_default_runs_one_drain_pass_after_queue_write()
     test_submit_drain_on_submit_error_does_not_fail_submit()

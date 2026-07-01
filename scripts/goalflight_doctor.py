@@ -23,6 +23,8 @@ import goalflight_compat
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
+from goalflight_watch import SUCCESS_TERMINAL_MARKERS
+
 try:
     import goalflight_capacity
 except Exception:  # pragma: no cover - doctor still reports partial state
@@ -1315,7 +1317,7 @@ def worker_write_file_probe(
             "state": "blocked",
             "detail": f"missing dispatcher: {dispatch}",
         }
-    state_dir = Path(os.environ.get("GOALFLIGHT_STATE_DIR", goalflight_compat.default_state_dir()))
+    state_dir = goalflight_compat.resolve_state_dir()
     base = state_dir / "doctor-write-probe"
     base.mkdir(parents=True, exist_ok=True)
     dispatch_id = f"doctor-write-probe-{agent}-{os.getpid()}-{int(time.time())}"
@@ -1393,7 +1395,7 @@ def worker_write_file_probe(
             status_payload = {}
     target_text = target.read_text(encoding="utf-8", errors="replace") if target.exists() else ""
     terminal_marker = status_payload.get("terminal_marker")
-    marker_ok = bool(terminal_marker and terminal_marker.get("kind") in {"COMPLETE", "RESULT", "READY"})
+    marker_ok = bool(terminal_marker and terminal_marker.get("kind") in SUCCESS_TERMINAL_MARKERS)
     target_ok = target_text.strip() == expected
     ok = proc.returncode == 0 and target_ok and marker_ok
     state = status_payload.get("state") or ("complete" if proc.returncode == 0 else "failed")
@@ -2034,14 +2036,7 @@ def wsl_version_info() -> dict:
     }
 
 
-def _nearest_existing_path(path: Path) -> Path | None:
-    current = path.expanduser()
-    while True:
-        if current.exists():
-            return current
-        if current.parent == current:
-            return None
-        current = current.parent
+_nearest_existing_path = goalflight_compat.nearest_existing_path
 
 
 def filesystem_type(path: Path) -> dict:
@@ -2066,13 +2061,15 @@ def filesystem_type(path: Path) -> dict:
 
 
 def check_wsl_filesystems(repo: Path, *, fleet_dir: Path | None = None) -> dict:
-    state_dir = Path(os.environ.get("GOALFLIGHT_STATE_DIR", goalflight_compat.default_state_dir())).expanduser()
+    state_dir = goalflight_compat.resolve_state_dir()
     if fleet_dir is not None:
         resolved_fleet_dir = fleet_dir.expanduser()
     elif goalflight_fleet is not None:
         resolved_fleet_dir = goalflight_fleet.default_fleet_dir()
     else:
-        resolved_fleet_dir = Path(os.environ.get("GOALFLIGHT_FLEET_DIR", Path.home() / ".goal-flight/fleet")).expanduser()
+        resolved_fleet_dir = goalflight_compat.resolve_env_path(
+            "GOALFLIGHT_FLEET_DIR", Path.home() / ".goal-flight/fleet"
+        )
     paths = {
         "project_root": repo,
         "state_dir": state_dir,
@@ -2629,7 +2626,7 @@ def _rate_pressure_summary() -> dict:
     if goalflight_rate_pressure is None:
         return {"available": False, "reason": "goalflight_rate_pressure import failed"}
     try:
-        state_dir = Path(os.environ.get("GOALFLIGHT_STATE_DIR", goalflight_compat.default_state_dir()))
+        state_dir = goalflight_compat.resolve_state_dir()
         records = goalflight_rate_pressure.collect_records(state_dir)
         billing = goalflight_rate_pressure.load_billing_accounts()
         pool_map = goalflight_rate_pressure.agent_limit_pool_map(billing)

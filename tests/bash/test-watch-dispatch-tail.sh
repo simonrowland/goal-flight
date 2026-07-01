@@ -507,14 +507,14 @@ EOF
 	PROMPT=/tmp/test-watch-dead-reconcile-diff-negative-$$.prompt
 : > "$PROMPT"
 
-TAIL=/tmp/test-watch-dead-reconcile-delete-nospace-$$.txt
-OUT=/tmp/watcher-out-dead-reconcile-delete-nospace-$$.txt
+TAIL=/tmp/test-watch-dead-reconcile-prefixed-status-$$.txt
+OUT=/tmp/watcher-out-dead-reconcile-prefixed-status-$$.txt
 printf '%s\n' "-STATUS: COMPLETE: x" > "$TAIL"
-run_dead_tail_case "case-1h1 dead reconcile rejects deletion no space" "$TAIL" "$PROMPT" "$OUT" "1"
-if grep -q "WATCHER-EXIT: pid-dead exit_code=1" "$OUT"; then
-  expect_eq "case-1h1 worker_dead_no_terminal_marker classification" "yes" "yes"
+run_dead_tail_case "case-1h1 dead reconcile accepts prefixed STATUS outside hunk" "$TAIL" "$PROMPT" "$OUT" "0"
+if grep -q "WATCHER-EXIT: marker exit_code=0" "$OUT"; then
+  expect_eq "case-1h1 prefixed STATUS marker exit summary" "yes" "yes"
 else
-  expect_eq "case-1h1 worker_dead_no_terminal_marker classification" "yes" "no"
+  expect_eq "case-1h1 prefixed STATUS marker exit summary" "yes" "no"
 fi
 rm -f "$TAIL" "$OUT"
 

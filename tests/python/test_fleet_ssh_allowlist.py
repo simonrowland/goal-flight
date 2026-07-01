@@ -27,9 +27,13 @@ def test_allowed_command_classes_build() -> None:
     porcelain = ssh.build_remote_command(
         "git_status_porcelain",
         repo_root="/srv/goal-flight",
-        worktree_path="/srv/goal-flight-wt",
+        state_dir="/Users/dev/.goal-flight",
+        worktree_path="/Users/dev/.goal-flight/worktrees/acp-test",
     )
-    assert_true("git status porcelain", porcelain[:5] == ["git", "-C", "/srv/goal-flight-wt", "status", "--porcelain"])
+    assert_true(
+        "git status porcelain",
+        porcelain[:5] == ["git", "-C", "/Users/dev/.goal-flight/worktrees/acp-test", "status", "--porcelain"],
+    )
     cleanup = ssh.build_remote_command("git_prune_claude_refs", repo_root="/srv/goal-flight")
     assert_true("cleanup python3", cleanup[0] == "python3")
     assert_true("cleanup helper", cleanup[1].endswith("goalflight_cleanup_dispatch_refs.py"))
@@ -261,6 +265,209 @@ def test_launch_detached_recovery_flag_is_allowlisted() -> None:
     assert_true("base sha", argv[argv.index("--base-sha") + 1] == BASE_SHA)
 
 
+def test_path_args_are_root_scoped_and_dispatch_id_sanitized() -> None:
+    def expect_reject(name: str, command_class: str, **params) -> None:
+        try:
+            ssh.build_remote_command(command_class, repo_root="/srv/goal-flight", **params)
+        except ssh.SshAllowlistError:
+            return
+        raise AssertionError(f"{name} accepted unsafe remote path")
+
+    state_dir = "/Users/dev/.goal-flight"
+    expect_reject(
+        "git worktree add outside roots",
+        "git_worktree_add",
+        state_dir=state_dir,
+        worktree_path="/tmp/escape",
+        ref=BASE_SHA,
+    )
+    expect_reject(
+        "git worktree remove outside roots",
+        "git_worktree_remove",
+        state_dir=state_dir,
+        worktree_path="/tmp/escape",
+    )
+    expect_reject(
+        "acp cwd outside roots",
+        "acp_run",
+        state_dir=state_dir,
+        dispatch_id="acp-test",
+        agent="codex-acp",
+        prompt="brief",
+        cwd="/tmp/escape",
+        status_json=f"{state_dir}/dispatches/acp-test/status.json",
+    )
+    expect_reject(
+        "launch status outside dispatch root",
+        "launch_detached",
+        node_id="build-1",
+        state_dir=state_dir,
+        dispatch_id="acp-test",
+        agent="codex-acp",
+        prompt="brief",
+        cwd=f"{state_dir}/worktrees/acp-test",
+        status_json="/tmp/escape/status.json",
+        base_sha=BASE_SHA,
+    )
+    expect_reject(
+        "dispatch id traversal",
+        "launch_detached",
+        node_id="build-1",
+        state_dir=state_dir,
+        dispatch_id="../escape",
+        agent="codex-acp",
+        prompt="brief",
+        cwd=f"{state_dir}/worktrees/acp-test",
+        status_json=f"{state_dir}/dispatches/acp-test/status.json",
+        base_sha=BASE_SHA,
+    )
+    expect_reject(
+        "lease file outside state",
+        "read_lease_file",
+        state_dir=state_dir,
+        lease_path="/etc/passwd",
+    )
+
+    lease = ssh.build_remote_command(
+        "read_lease_file",
+        repo_root="/srv/goal-flight",
+        state_dir=state_dir,
+        lease_path=f"{state_dir}/fleet/locks/accounts/openai-default.json",
+    )
+    assert_true("lease under state allowed", lease == ["cat", f"{state_dir}/fleet/locks/accounts/openai-default.json"])
+
+
+def test_probe_ferry_and_interpreter_paths_fail_closed() -> None:
+    state_dir = "/Users/dev/.goal-flight"
+
+    def expect_reject(name: str, command_class: str, **params) -> None:
+        try:
+            ssh.build_remote_command(command_class, repo_root="/srv/goal-flight", **params)
+        except ssh.SshAllowlistError:
+            return
+        raise AssertionError(f"{name} accepted unsafe remote path")
+
+    expect_reject(
+        "probe script traversal",
+        "probe_script_exists",
+        script="../.ssh/config",
+    )
+    expect_reject(
+        "ferry preflight root outside repo",
+        "ferry_preflight",
+        root="/etc",
+        files=["passwd"],
+        allowed_roots=["/srv/goal-flight"],
+    )
+    expect_reject(
+        "launch interpreter outside trusted roots",
+        "launch_detached",
+        node_id="build-1",
+        state_dir=state_dir,
+        dispatch_id="acp-test",
+        agent="codex-acp",
+        prompt="brief",
+        cwd=f"{state_dir}/worktrees/acp-test",
+        status_json=f"{state_dir}/dispatches/acp-test/status.json",
+        python="/tmp/evil-python",
+        base_sha=BASE_SHA,
+    )
+
+    probe = ssh.build_remote_command(
+        "probe_script_exists",
+        repo_root="/srv/goal-flight",
+        script="scripts/goalflight_doctor.py",
+    )
+    assert_true("in-scope probe path", probe == ["test", "-x", "/srv/goal-flight/scripts/goalflight_doctor.py"])
+    ferry = ssh.build_remote_command(
+        "ferry_preflight",
+        repo_root="/srv/goal-flight",
+        root="/srv/goal-flight",
+        files=["scripts/goalflight_doctor.py"],
+        allowed_roots=["/srv/goal-flight"],
+        python="/usr/bin/python3",
+    )
+    assert_true("trusted interpreter accepted", ferry[0] == "/usr/bin/python3")
+
+
+def test_interpreter_allowlist_rejects_shells_and_accepts_python() -> None:
+    state_dir = "/Users/dev/.goal-flight"
+
+    def expect_reject(name: str, python: str) -> None:
+        try:
+            ssh.build_remote_command(
+                "launch_detached",
+                repo_root="/srv/goal-flight",
+                node_id="build-1",
+                state_dir=state_dir,
+                dispatch_id="acp-test",
+                agent="codex-acp",
+                prompt="brief",
+                cwd=f"{state_dir}/worktrees/acp-test",
+                status_json=f"{state_dir}/dispatches/acp-test/status.json",
+                python=python,
+                base_sha=BASE_SHA,
+            )
+        except ssh.SshAllowlistError:
+            return
+        raise AssertionError(f"{name} accepted shell interpreter")
+
+    expect_reject("absolute shell", "/bin/sh")
+    expect_reject("bare shell", "sh")
+
+    argv = ssh.build_remote_command(
+        "launch_detached",
+        repo_root="/srv/goal-flight",
+        node_id="build-1",
+        state_dir=state_dir,
+        dispatch_id="acp-test",
+        agent="codex-acp",
+        prompt="brief",
+        cwd=f"{state_dir}/worktrees/acp-test",
+        status_json=f"{state_dir}/dispatches/acp-test/status.json",
+        python="/usr/bin/python3",
+        base_sha=BASE_SHA,
+    )
+    assert_true("real python accepted", argv[0] == "/usr/bin/python3")
+
+
+def test_state_dir_rejects_parent_traversal_and_accepts_in_scope() -> None:
+    bad_state_dir = "/Users/dev/.goal-flight/../escape"
+
+    try:
+        ssh.build_remote_command(
+            "launch_detached",
+            repo_root="/srv/goal-flight",
+            node_id="build-1",
+            state_dir=bad_state_dir,
+            dispatch_id="acp-test",
+            agent="codex-acp",
+            prompt="brief",
+            cwd=f"{bad_state_dir}/worktrees/acp-test",
+            status_json=f"{bad_state_dir}/dispatches/acp-test/status.json",
+            base_sha=BASE_SHA,
+        )
+    except ssh.SshAllowlistError:
+        pass
+    else:
+        raise AssertionError("state_dir with traversal accepted")
+
+    state_dir = "/Users/dev/.goal-flight"
+    argv = ssh.build_remote_command(
+        "launch_detached",
+        repo_root="/srv/goal-flight",
+        node_id="build-1",
+        state_dir=state_dir,
+        dispatch_id="acp-test",
+        agent="codex-acp",
+        prompt="brief",
+        cwd=f"{state_dir}/worktrees/acp-test",
+        status_json=f"{state_dir}/dispatches/acp-test/status.json",
+        base_sha=BASE_SHA,
+    )
+    assert_true("in-scope state accepted", argv[argv.index("--state-dir") + 1] == state_dir)
+
+
 def test_git_verify_commit_is_allowlisted() -> None:
     argv = ssh.build_remote_command(
         "git_verify_commit",
@@ -301,6 +508,10 @@ def main() -> None:
         test_read_status_file_must_stay_under_state_dispatches,
         test_launch_detached_uses_helper_and_prompt_b64,
         test_launch_detached_recovery_flag_is_allowlisted,
+        test_path_args_are_root_scoped_and_dispatch_id_sanitized,
+        test_probe_ferry_and_interpreter_paths_fail_closed,
+        test_interpreter_allowlist_rejects_shells_and_accepts_python,
+        test_state_dir_rejects_parent_traversal_and_accepts_in_scope,
         test_git_verify_commit_is_allowlisted,
         test_pid_identity_uses_helper,
     ):

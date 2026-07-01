@@ -17,6 +17,195 @@ incremented when meaningful skill behaviour changes.
   stderr notice fires on the default path so un-migrated callers notice the new
   timing. `--foreground` is mutually exclusive with `--submit` (already async).
 
+## [1.0.11] — 2026-06-24
+
+The controller-mail system: a worker can reach its controller, and the controller
+learns it has mail from the `status` call it already runs — no separate poll, no
+long-poll teardown. Folds two independent review rounds (read-side hang +
+cross-controller suppression; write-side liveness + retry storm).
+
+### Added
+- `goalflight_status.py` now surfaces a read-side **"you have mail"** hint on the
+  aggregate status output (text + the `--json` payload): a fresh, fail-open inbox
+  check so a controller learns it has open user-needs without remembering to poll
+  `goalflight_messages relay`. The hint lists each open need with its dispatch id,
+  kind, and text — enough detail to follow up straight from a status check — and is
+  **scoped to the controller's own workers** (the mailbox is machine-global, so it
+  never shows another controller's workers' needs). Computed fresh on every call,
+  never stored in any status JSON. It rides the single aggregate poll that already
+  covers every worker — `--wait` stays deliberately mail-free so a message never
+  collapses a multi-worker long-poll. The presentation lives in
+  `goalflight_messages.controller_mail_summary()` (beside the rest of the mail
+  domain); status only delegates.
+
+- Worker→controller mail bridge: the watcher posts a worker's `USER-NEED` /
+  `USER-CONFIRM` / `BLOCKED` markers as envelopes into that dispatch's inbox, so the
+  controller's status mail hint surfaces the question/blocker text. Reuses markers
+  workers already emit (no new worker capability), urgent-trio only, deduped
+  (in-memory + restart-safe), and strictly best-effort so it can never stall or storm
+  the watcher's liveness loop.
+
+### Fixed
+- `goalflight_messages.collect_inbox_paths` skips non-regular files: a FIFO/device
+  named `*.jsonl` in an inbox dir would block `read_text()`'s `open()` and hang a
+  status call before the read-side fail-open guard could fire. Protects the new
+  status mail check, `relay`, and every other inbox consumer.
+- A scoped status mail check now reads only the controller's own inboxes and is
+  per-inbox tolerant, so an unrelated controller's corrupt or large inbox can
+  neither suppress the controller's own need nor slow the scoped call.
+- The shared mail writer fails closed on a non-regular inbox: `read_envelopes`
+  treats a FIFO/device as empty (non-blocking stat) and `post_message` raises
+  before any `open()`, so CLI/MCP/direct callers — not just the watcher bridge —
+  can never hang on a FIFO inbox.
+
+## [1.0.10] — 2026-06-24
+
+Dispatch ergonomics + remote-drain + status-trust + codex-worker-search
+follow-ups to 1.0.9.
+
+### Added
+- `drain --remote-node <name>`: opt-in dual-drain that launches each claimed queue
+  entry on a fleet node over SSH instead of locally, reusing the queue claim/token
+  single-launch machinery and gating real SSH behind the live opt-in. Local drain is
+  unchanged when the flag is absent. (#10)
+- `scripts/install-drainer.sh`: idempotent installer (install/status/uninstall/
+  `--dry-run`) that renders a portable launchd plist template into the user's
+  LaunchAgents, plus `protocols/drainer.md` documenting the reaper-proof
+  out-of-session drainer model (and a systemd-timer note for Linux controllers). (#14)
+- `goalflight_status.py --verify-artifacts <id>`: confirm a worker's declared output
+  paths by direct `open()` of the exact paths named in its terminal marker, never by
+  directory enumeration (`ls`/`find`/`git status`/`grep`) — which can read stale for
+  minutes on local APFS and nearly drove a destructive re-author. Exit 0 = all declared
+  artifacts present + non-empty.
+- Optional per-pass pre-launch hook for local drains (`GOALFLIGHT_DRAIN_PRELAUNCH_HOOK`
+  or `scripts/ext/drain-prelaunch-hook`): a neutral, best-effort extension point run once
+  per local drain pass with the about-to-launch agent labels. Absent hook = no-op; zero
+  account/billing semantics in tracked code.
+- codedb registration for codex workers (`scripts/register-codedb-codex.py`, wired into
+  setup, ON by default; opt out with `GOALFLIGHT_CODEX_CODEDB=0`). codedb is read-only
+  indexed code-intelligence and the safe search swap-in for the disabled context-mode.
+  The registrar writes a per-tool `approval_mode = "approve"` entry for every read-only codedb
+  tool (the server's live advertised surface minus the write tool `codedb_edit`) — load-bearing,
+  because in `codex exec` an MCP call with no approval config is cancelled and for `codedb_context`
+  that cancellation reproduces the exec-mode elicitation wedge (verified 2026-06-24). It repairs an
+  existing codedb server block that lacks those approvals (not just absent configs) and no-ops when
+  the codedb binary is absent (won't register an unspawnnable server).
+
+### Changed
+- context-mode is now OFF by default for dispatched codex workers (`codex exec` gets
+  `-c mcp_servers.context-mode.enabled=false`; codex-acp posture defaults off too).
+  This removes the exec-mode elicitation wedge at the source instead of relying on
+  per-prompt "no ctx_*" instructions. Opt back in with
+  `GOALFLIGHT_CODEX_CONTEXT_MODE=enabled`; grok-acp/cursor and the user's interactive
+  `~/.codex` config are unaffected. (#18)
+- The installer's codex context-mode registration is now opt-in, aligned with the
+  runtime default-off above: default codex setup no longer writes a context-mode MCP
+  block the worker boundary always disables. Opt in with `GOALFLIGHT_CODEX_CONTEXT_MODE=1`.
+
+### Fixed
+- A detached (drain/launchd-launched) worker is no longer falsely classified
+  `orphaned`/`controller_dead` when its ephemeral launcher exits: controller-pid
+  liveness is non-terminal for detached records and the state is re-derived from the
+  authoritative worker pid+identity (live → live, success-marker tail → complete,
+  genuinely gone → worker_dead). (#28)
+- Worker-liveness false-death cluster (`goalflight_chunk_summary.py` + `goalflight_status.py`):
+  a watcher-detached-but-alive worker is no longer reported `wedged`/`takeover` (it now
+  reads `running` when identity-matched live); `chunk_summary` rechecks liveness at read
+  time (pid + start-time identity, never the watcher's frozen `worker_alive`) and shares
+  the aggregate's output-tail reconciliation so the two agree; `--done` reports terminal
+  only on real terminal-marker evidence or an unambiguous terminal state (a between-turn
+  lull or a liveness-recheck state no longer falls through to a false `done`); and an
+  output-tail marker observed while the worker is still alive is kept as a diagnostic
+  only, never surfaced as a terminal signal that would false-`done` a live worker.
+- Remote drain now pins each launch to the commit resolved at SUBMIT time (persisted
+  40-hex `base_sha` on entry + request) instead of re-resolving HEAD at drain time, so a
+  checkout that advances between submit and drain can't build the remote worktree at the
+  wrong tree; an entry without a persisted base fails closed. Remote drain also fails
+  closed when a queued account name doesn't map to a fleet billing account instead of
+  silently defaulting. Local drain is unchanged.
+- codedb-for-codex registration fails closed: it auto-approves only an explicit read-only
+  allowlist of codedb tools (never "everything advertised minus a denylist", which would
+  silently approve a future mutating tool), and refuses to modify a config that is invalid
+  TOML instead of replacing it with still-invalid appended content.
+
+### Docs
+- Controller-side advisory for a transiently-unavailable auto-mode safety classifier:
+  retrying usually works (the classifier recovers in seconds); if it persists, route
+  read-only tools (which bypass it) and send writes to a sandboxed worker. Never globally
+  disable the safety classifier. (`protocols/dispatch-routing.md`)
+
+## [1.0.9] — 2026-06-20
+
+Wait-reliability + correctness + architecture release. Makes `--wait` trustworthy
+and bounded so a controller (or an overnight loop) never hangs on a dead or wedged
+worker; fixes a completed-worker false-death class; closes the verified
+dispatch/fleet spine blockers from the bug-sweep dogfood; and consolidates
+duplicated vocabulary / path / env logic with no behaviour change.
+
+### Added
+
+- **`--wait` bounded-on-crash + staleness + heartbeat.** `goalflight_status.py
+  --wait` now resolves a crashed/exited worker to a terminal `worker_dead` after
+  `--crash-grace-s` (default 90s), and an alive-but-wedged worker (frozen tail +
+  confirmed-idle CPU) to `worker_stalled` after `--stale-grace-s`, instead of
+  polling to the wait-timeout — so the call always exits and the caller is
+  re-invoked rather than hanging. Adds a progress heartbeat (`--heartbeat-s`:
+  last-append age, tail growth, CPU%) for long waits. A live / identity-matching
+  worker whose tail is still growing or whose CPU is non-trivial is never resolved
+  (the genuinely-working guard). (#22, #24)
+
+### Fixed
+
+- **Reconcile false-death when the terminal marker is not the last line (D022).**
+  A worker that emits `READY:`/`COMPLETE:` followed by a trailing TL;DR or summary
+  was reported `worker_dead`. Status reconcile now uses the watcher's whole-tail
+  reconciliation scan (skips code fences, diff hunks, and prompt echoes, takes the
+  last valid marker) instead of a last-line-only check.
+- **Blank path env vars no longer resolve to the working directory (D019).** A
+  set-but-blank `GOALFLIGHT_STATE_DIR` / `GOALFLIGHT_FLEET_DIR` /
+  `GOALFLIGHT_MESSAGES_DIR` returned `""`, and `Path("")` is the cwd, so state
+  scattered across modules. Shared `goalflight_compat.resolve_state_dir()` /
+  `resolve_env_path()` (strip-blank, resolved at call time) is now used everywhere.
+- **Only CONFIRMED-idle CPU kills or stalls a worker (#27).** An unmeasurable CPU
+  sample (`None`, e.g. a transient `ps` failure) no longer counts as idle in the
+  watcher, the ACP quiet-kill, or the `--wait` stall path — one shared
+  `goalflight_liveness.cpu_confirmed_idle()` predicate; the time / tail-growth gate
+  stays primary, so a transient probe failure can't terminate a healthy worker.
+- **Dispatch claim/recovery, rate-pressure, and remote-fleet spine.** Hardened the
+  durable queue claim/recovery lifecycle (D001–D006); anchored rate-limit pattern
+  matching and ordered account-rate before model-capacity (D012); hardened the
+  remote-dispatch fleet path including a python-only interpreter allowlist
+  (D013–D018).
+
+### Changed
+
+- **Single source of truth for terminal states + markers (DRY).** The terminal-state
+  and terminal-marker vocabularies were duplicated across modules and had diverged
+  into two latent bugs (states not counted terminal in one consumer; `FAILED`/`READY`
+  missing from a marker set). Consolidated into `goalflight_dispatch_states` and
+  `goalflight_watch`, with every consumer routed through them.
+- **Architecture: shared leaf helpers + broken import cycles.** Extracted the
+  duplicated filename-sanitizer / tokenizer / nearest-path / rate-signature helpers;
+  split the fleet store/locks out of the fleet CLI; broke the
+  `capacity ↔ rate_pressure` and `dispatch ↔ acp_run` import cycles via leaf modules.
+  Behaviour-preserving structural change.
+
+### Tests
+
+- Poison-pair coverage for the wait primitive (crash → `worker_dead`, wedge →
+  `worker_stalled`, growing-tail never-stall, heartbeat), the reconcile false-death,
+  env-path resolution, the terminal vocabulary, and the drain-replay argv +
+  release-stale liveness gates (D020).
+
+## [1.0.8] — 2026-06-19
+
+Dispatch-reliability + bug-sweep release. Fixes the worker-death root cause
+(detached bash-tail workers killed/reclaimed by cleanup_ghosts/release-stale) and
+the completed-but-reported-failed false-fail (prefixed terminal markers); adds
+drain liveness (no-drainer warning + opportunistic drain-on-submit) and
+priority-ordered draining; ships the lane-fill bug-sweep workflow as a
+discoverable `/goal-flight bug-sweep` command + protocol.
+
 ### Documentation
 
 - **Operator recipe for `cooldown` — pause a vendor until its limit resets.**
@@ -86,15 +275,6 @@ incremented when meaningful skill behaviour changes.
   prefix and matches the terminal marker **only outside a real `@@` diff hunk** (a
   `+READY:` genuinely quoted inside a code diff stays non-terminal); live last-line
   detection and the marker regex are unchanged.
-
-## [1.0.8] — 2026-06-19
-
-Dispatch-reliability + bug-sweep release. Fixes the worker-death root cause
-(detached bash-tail workers killed/reclaimed by cleanup_ghosts/release-stale) and
-the completed-but-reported-failed false-fail (prefixed terminal markers); adds
-drain liveness (no-drainer warning + opportunistic drain-on-submit) and
-priority-ordered draining; ships the lane-fill bug-sweep workflow as a
-discoverable `/goal-flight bug-sweep` command + protocol.
 
 ## [1.0.7] — 2026-06-17
 

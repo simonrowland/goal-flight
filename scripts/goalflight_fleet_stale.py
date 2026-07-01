@@ -7,8 +7,10 @@ Never release when SSH partition alone, mirror stale alone, or PID still alive.
 
 from __future__ import annotations
 
+import argparse
 from typing import Any
 
+import goalflight_fleet_store as fleet
 import goalflight_fleet_status as status
 
 
@@ -79,13 +81,58 @@ def account_lock_ttl_reapable(fleet_dir, lock_doc: dict[str, Any]) -> bool:
     return True
 
 
+def release_stale_account_locks(fleet_dir) -> list[str]:
+    released: list[str] = []
+    for doc in fleet.stale_account_locks(fleet_dir):
+        account_key = doc.get("account_key")
+        fencing_token = doc.get("fencing_token")
+        if not account_key or not fencing_token:
+            continue
+        if not account_lock_ttl_reapable(fleet_dir, doc):
+            continue
+        try:
+            fleet.release_account_lock(
+                fleet_dir,
+                account_key=str(account_key),
+                fencing_token=str(fencing_token),
+                reason="stale_ttl",
+            )
+            released.append(str(account_key))
+        except fleet.AccountLockError:
+            continue
+    return released
+
+
+def reconcile_fleet(fleet_dir, *, release_stale: bool = False) -> dict:
+    result: dict = {"capacity_stale_released": [], "account_stale_released": []}
+    try:
+        import goalflight_capacity
+    except ImportError:
+        result["capacity_error"] = "goalflight_capacity unavailable"
+    else:
+        with goalflight_capacity.StateLock():
+            data = goalflight_capacity.load_state()
+            stale = goalflight_capacity.stale_active_leases(data)
+        result["capacity_stale"] = len(stale)
+        if release_stale and stale:
+            ns = argparse.Namespace(state="expired", reason="stale_controller", keep=False)
+            goalflight_capacity.cmd_release_stale(ns)
+            result["capacity_stale_released"] = [
+                lease.get("lease_id") for lease in stale if lease.get("lease_id")
+            ]
+
+    result["account_stale"] = len(fleet.stale_account_locks(fleet_dir))
+    if release_stale:
+        result["account_stale_released"] = release_stale_account_locks(fleet_dir)
+    return result
+
+
 def doctor_fleet_stale_release(
     fleet_dir,
     *,
     mutate: bool = False,
 ) -> dict[str, Any]:
     """Run stale release for capacity TTL locks + dispatch reconcile releases."""
-    import goalflight_fleet as fleet
     import goalflight_fleet_reconcile as fleet_reconcile
 
     summary: dict[str, Any] = {
@@ -94,7 +141,7 @@ def doctor_fleet_stale_release(
         "dispatch_stale_released": [],
         "dispatch_quarantined": [],
     }
-    base = fleet.reconcile_fleet(fleet_dir, release_stale=mutate)
+    base = reconcile_fleet(fleet_dir, release_stale=mutate)
     summary.update(base)
 
     import goalflight_fleet_status_cli as status_cli

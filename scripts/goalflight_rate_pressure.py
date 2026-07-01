@@ -8,7 +8,7 @@ orchestrator decides whether to act; this script never mutates capacity state.
 
 Provider model
 --------------
-Per-label caps in `goalflight_capacity.DEFAULT_AGENT_CAPS` are PROCESS-COUNT
+Per-label caps in `goalflight_agent_limits.DEFAULT_AGENT_CAPS` are PROCESS-COUNT
 caps (RAM-aware). Rate limits, on the other hand, are vendor/provider-level.
 This script groups workers by the provider whose budget they consume:
 
@@ -29,7 +29,7 @@ Rate-limit signatures vary by vendor. We scan record state + status-file
 error fields for these patterns (case-insensitive substring match):
 
   - "rate_limit", "rate-limit", "rate limit"
-  - "429"  (HTTP)
+  - HTTP-status-context "429"/"529" (not bare numbers in unrelated text)
   - "you've hit your limit", "usage limit"
   - "anthropic.RateLimitError", "openai.RateLimitError"
   - "session_limit"
@@ -57,7 +57,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 import time
 from pathlib import Path
@@ -65,6 +64,7 @@ from typing import Any
 
 import goalflight_compat
 import goalflight_dispatch_states
+from goalflight_agent_limits import DEFAULT_AGENT_CAPS
 
 SCHEMA = "goalflight.rate-pressure.v1"
 
@@ -118,7 +118,6 @@ RATE_LIMIT_PATTERNS: tuple[str, ...] = (
     "rate_limit",
     "rate-limit",
     "rate limit",
-    "429",
     "you've hit your limit",
     "usage limit",
     "try again at",
@@ -133,7 +132,6 @@ RATE_LIMIT_PATTERNS: tuple[str, ...] = (
     "insufficient_quota",       # OpenAI hard quota
     "rate_limit_error",         # Anthropic API error type
     "overloaded_error",         # Anthropic 529 error type
-    "529",                      # Anthropic overloaded HTTP status (same precedent as bare "429")
     "session limit",            # Claude CLI prose (space form; underscore form above)
     "resource_exhausted",       # gRPC/generic quota signal
     "quota exceeded",           # generic billing/quota hard limit
@@ -141,19 +139,53 @@ RATE_LIMIT_PATTERNS: tuple[str, ...] = (
     # codex CLI + xAI/grok additions. NOTE: most
     # codex/xAI 429 PROSE ("you've exceeded the rate limit", "rate limit reached for
     # organization", xAI "...reached the rate limit") is ALREADY caught by the
-    # substrings above ("rate limit"/"429"/"too many requests"), so only the
+    # substrings above ("rate limit"/"too many requests"), so only the
     # genuinely-uncaught literals are added. Matching stays failure-state-gated.
     "exceeded retry limit",          # codex CLI retry-wrapper exhaustion (catches retry-exhaust even when the line is not a bare 429)
     "prepaid credits are depleted",  # xAI hard CREDIT exhaustion — a distinct failure mode (no 429, no "rate limit" text)
     "payment_required",              # xAI 402 credits-out (code form; safer than a bare "402")
 )
 
+# HTTP status codes require provider-error context — bare "429"/"529" in line
+# numbers, ids, or unrelated prose must not false-positive.
+RATE_LIMIT_HTTP_STATUS_ANCHORS: dict[str, tuple[str, ...]] = {
+    "429": (
+        "http 429",
+        "status 429",
+        "status: 429",
+        "429 too many",
+        "got 429",
+        "error 429",
+        '"code": 429',
+        '"code":429',
+    ),
+    "529": (
+        "http 529",
+        "status 529",
+        "status: 529",
+        "529 overloaded",
+        "got 529",
+        "error 529",
+        "(529)",
+        '"code": 529',
+        '"code":529',
+    ),
+}
+
+
+def rate_limit_signature_in_text(text: str) -> str | None:
+    lowered = text.lower()
+    for pattern in RATE_LIMIT_PATTERNS:
+        if pattern in lowered:
+            return pattern
+    return None
+
 # Substring patterns indicating model-specific capacity, not account-wide quota.
-# These reduce only the label that produced the signal.
+# These reduce only the label that produced the signal. Bare "at capacity" is
+# excluded — unrelated prose can mention capacity without a model-scoped signal.
 MODEL_CAPACITY_PATTERNS: tuple[str, ...] = (
     "selected model is at capacity",
     "model is at capacity",
-    "at capacity",
 )
 
 ACCOUNT_RATE_LIMIT_SCOPE = "account_rate_limit"
@@ -166,7 +198,9 @@ def provider_for(agent_label: str) -> str | None:
 
 
 def default_fleet_dir() -> Path:
-    return Path(os.environ.get("GOALFLIGHT_FLEET_DIR", Path.home() / ".goal-flight" / "fleet")).expanduser()
+    return goalflight_compat.resolve_env_path(
+        "GOALFLIGHT_FLEET_DIR", Path.home() / ".goal-flight" / "fleet"
+    )
 
 
 def load_billing_accounts(fleet_dir: Path | None = None) -> dict | None:
@@ -207,7 +241,7 @@ def budget_key_for_agent(agent_label: str, *, pool_map: dict[str, str] | None = 
 
 
 def _default_state_dir() -> Path:
-    return Path(os.environ.get("GOALFLIGHT_STATE_DIR", goalflight_compat.default_state_dir()))
+    return goalflight_compat.resolve_state_dir()
 
 
 def _read_record(path: Path) -> dict | None:
@@ -284,6 +318,19 @@ def _status_haystack(status: dict | None) -> str:
     return " ".join(haystack_parts).lower()
 
 
+def _haystack_matches_rate_limit(haystack: str) -> bool:
+    """True when haystack carries account/provider rate-limit evidence."""
+    if any(pat in haystack for pat in RATE_LIMIT_PATTERNS):
+        return True
+    for status_code, anchors in RATE_LIMIT_HTTP_STATUS_ANCHORS.items():
+        if any(anchor in haystack for anchor in anchors):
+            return True
+        # overloaded_error already lives in RATE_LIMIT_PATTERNS; keep 529 tied to it.
+        if status_code == "529" and "overloaded_error" in haystack:
+            return True
+    return False
+
+
 def detect_pressure_scope(record: dict, status: dict | None) -> str | None:
     """Return the pressure scope for this dispatch, or None.
 
@@ -319,10 +366,12 @@ def detect_pressure_scope(record: dict, status: dict | None) -> str | None:
         haystack = f"{haystack} {str(record_error).lower()}".strip()
     if not haystack:
         return None
+    # Account-wide rate limits take precedence when both signals appear — mixed
+    # HTTP 429 + model-capacity prose is still provider quota pressure.
+    if _haystack_matches_rate_limit(haystack):
+        return ACCOUNT_RATE_LIMIT_SCOPE
     if any(pat in haystack for pat in MODEL_CAPACITY_PATTERNS):
         return MODEL_CAPACITY_SCOPE
-    if any(pat in haystack for pat in RATE_LIMIT_PATTERNS):
-        return ACCOUNT_RATE_LIMIT_SCOPE
     return None
 
 
@@ -478,14 +527,7 @@ def main(argv: list[str] | None = None) -> int:
     billing = load_billing_accounts()
     pool_map = agent_limit_pool_map(billing)
 
-    # Read current caps from goalflight_capacity if importable; fall back to a
-    # safe default map. Importing avoids hard-coding the map in two places.
-    try:
-        sys.path.insert(0, str(Path(__file__).parent))
-        from goalflight_capacity import DEFAULT_AGENT_CAPS  # type: ignore
-        current_caps = dict(DEFAULT_AGENT_CAPS)
-    except ImportError:
-        current_caps = {label: 5 for label in AGENT_TO_PROVIDER}
+    current_caps = dict(DEFAULT_AGENT_CAPS)
 
     pressure = pressure_per_provider(records, window_seconds=args.window_seconds, pool_map=pool_map)
     payload = recommend(pressure, current_caps, threshold=args.threshold, pool_map=pool_map)

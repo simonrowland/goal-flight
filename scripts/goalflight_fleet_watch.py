@@ -288,6 +288,13 @@ def _mark_meta_identity(
     _atomic_write_json(meta_path, meta)
 
 
+def _mark_meta_pid_hint(meta_path: Path, *, pid_hint: str) -> None:
+    meta = _read_json_object(meta_path)
+    meta["pid_hint"] = pid_hint
+    meta["last_identity_check_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    _atomic_write_json(meta_path, meta)
+
+
 def _mark_launch_unconfirmed_miss(
     meta_path: Path,
     *,
@@ -688,7 +695,7 @@ def sync_fleet_mirrors(
     dispatch_ids: list[str] | None = None,
 ) -> FleetWatchResult:
     """One-shot sync of orchestrator mirrors from remote status paths."""
-    import goalflight_fleet as fleet
+    import goalflight_fleet_store as fleet
 
     result = FleetWatchResult()
     targets = collect_watch_targets(fleet_dir)
@@ -1096,7 +1103,7 @@ def watch_until_terminal(
     monotonic_fn: Callable[[], float] = time.monotonic,
 ) -> UntilTerminalResult:
     """Poll one remote status mirror until terminal, timeout, or ambiguity."""
-    import goalflight_fleet as fleet
+    import goalflight_fleet_store as fleet
 
     deadline = monotonic_fn() + max(float(timeout_s), 0.0)
     polls = 0
@@ -1127,6 +1134,12 @@ def watch_until_terminal(
         after = _read_local_mirror(fleet_dir, dispatch_id)
         state = _mirror_state(after)
         after_seq = after.last_seq if after.ok else before_seq
+        fresh_mirror = bool(
+            row.ok
+            and after.ok
+            and after_seq is not None
+            and (after_seq != before_seq or row.action in {"ingested", "unchanged"})
+        )
 
         if after.ok and after_seq != before_seq:
             last_progress_at = monotonic_fn()
@@ -1150,11 +1163,21 @@ def watch_until_terminal(
             if salvage is not None:
                 return salvage
 
-        if fleet_status.is_terminal_state(state):
+        if fresh_mirror and fleet_status.is_terminal_state(state):
+            _mark_meta_pid_hint(dispatch_meta_path(fleet_dir, dispatch_id), pid_hint="dead")
             return UntilTerminalResult(dispatch_id, 0, str(state), polls, row.detail)
 
-        if not row.ok and row.action not in {"fetch_failed"}:
+        if not row.ok:
             detail = row.detail or row.action
+            if fleet_status.is_terminal_state(state):
+                stale_terminal_detail = f"{row.action}: stale terminal mirror ignored"
+                return UntilTerminalResult(
+                    dispatch_id,
+                    2,
+                    str(state),
+                    polls,
+                    stale_terminal_detail if not detail else f"{stale_terminal_detail}; {detail}",
+                )
 
         stale_for = monotonic_fn() - last_progress_at
         receipt = meta.get("launch_receipt") if isinstance(meta.get("launch_receipt"), dict) else {}
@@ -1210,6 +1233,8 @@ def watch_until_terminal(
             latest = _read_local_mirror(fleet_dir, dispatch_id)
             latest_state = _mirror_state(latest)
             if fleet_status.is_terminal_state(latest_state):
+                if stale_terminal_detail:
+                    return UntilTerminalResult(dispatch_id, 2, str(latest_state), polls, stale_terminal_detail)
                 return UntilTerminalResult(dispatch_id, 0, str(latest_state), polls, detail)
             if latest.ok and fleet_status.is_running_state(latest_state):
                 return UntilTerminalResult(dispatch_id, 1, str(latest_state), polls, detail or "timeout")
@@ -1248,7 +1273,7 @@ def release_lock_on_confirmed_terminal(fleet_dir: Path, dispatch_id: str, state:
             return False
         if state in fleet_status.SALVAGE_NEEDED_STATES:
             return False
-        import goalflight_fleet as fleet
+        import goalflight_fleet_store as fleet
         import goalflight_fleet_reconcile as fleet_reconcile
 
         meta = _read_json_object(dispatch_meta_path(fleet_dir, dispatch_id))
@@ -1273,7 +1298,7 @@ def release_lock_on_confirmed_terminal(fleet_dir: Path, dispatch_id: str, state:
 
 
 def cmd_watch_fleet(args) -> int:
-    import goalflight_fleet as fleet
+    import goalflight_fleet_store as fleet
 
     fleet.bootstrap(args.fleet_dir)
     transport = SshFleetWatchTransport(

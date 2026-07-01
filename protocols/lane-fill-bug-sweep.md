@@ -28,6 +28,16 @@ surface REAL blockers → routing table → grouped fixes → serial integrator`
    cheaper/wider pool ("fill all lanes" = saturate the pools you have, in waves if needed).
 3. **Audit** — one worker per row, READ-ONLY, **one-shot** (breadth comes from the matrix
    partition, not per-worker loops), inline findings to its tail, BLOCKING first, end `READY:`.
+   **Self-screen against the backlog (sequential / re-run sweeps):** feed the prior
+   `BUG-LOG`/`BUG-LOG-CONSOLIDATED` (and any known-fixed list) into the frame and have each
+   worker screen its OUTPUT against it — screen the *reporting*, never the *search* (anchoring
+   the search on the backlog causes confirmation bias and misses unlisted bugs). Tag each
+   finding NEW (surface) / KNOWN-OPEN (reference the id, don't re-report the body) /
+   KNOWN-FIXED-confirmed-present → drop, BUT if a backlog-fixed bug is still present that's a
+   REGRESSION → surface as new / UNCERTAIN → surface as "possibly-known" (never hard-suppress
+   on doubt). Hard-suppress only high-confidence exact dups (same file:line + predicate). This
+   only reduces volume; the consolidate + verify stages stay authoritative for dedup/triage.
+   When every worker screens and finds nothing new, that is the worker-level "mined out" signal.
 4. **Harvest** — a write-enabled step parses the worker tails into an append-only
    `BUG-LOG.jsonl` (one finding/line: id, reviewer, sev, class, file, title, detail,
    confidence, bucket). Mandatory: read-only workers can't write the sink themselves.
@@ -52,9 +62,28 @@ surface REAL blockers → routing table → grouped fixes → serial integrator`
   foreground controller can be reaped by `cleanup_ghosts` / release-stale once
   that controller exits — see the D007/D008 class. Detached dispatch and
   out-of-session launch avoid that failure mode.
-- **codex workers: instruct "do NOT use context-mode / ctx_* tools"** (use ripgrep/git/read).
-  The exec-mode elicitation wedge that wrecks codex review workers did not fire once when this
-  was stated (0 hits across a verify fleet). Or route to a non-wedging engine.
+- **codex workers: context-mode is now OFF by default** (goal-flight passes
+  `-c mcp_servers.context-mode.enabled=false` to dispatched `codex exec`, and defaults codex-acp's
+  posture off too; opt back in with `GOALFLIGHT_CODEX_CONTEXT_MODE=enabled`). This removes the
+  exec-mode elicitation wedge at the source. The old "do NOT use context-mode / ctx_* tools"
+  brief line is now belt-and-suspenders (for opted-in or externally-launched codex workers); or
+  route to a non-wedging engine.
+- **codex workers: codedb is the SAFE search swap-in** (registered ON by default at install via
+  `scripts/register-codedb-codex.py`; opt out with `GOALFLIGHT_CODEX_CODEDB=0`). codedb is
+  read-only indexed code-intelligence (`symbol`/`find`/`search`/`callers`/`deps`/`context`) and,
+  *with the per-tool approve entries the registrar writes*, rides along in a headless `codex exec`
+  worker without wedging. **Why the approve entries are load-bearing:** in `codex exec` an MCP tool
+  call with NO `approval_mode` configured is cancelled, and for `codedb_context` that cancellation
+  surfaces as the same exec-mode user-input-elicitation wedge that disabled context-mode (#18) —
+  the worker stalls on an approval the headless runner cannot answer (verified 2026-06-24: with the
+  per-tool entries absent the call is cancelled and wedges; with them present it returns cleanly).
+  So the registrar writes `[mcp_servers.codedb.tools.<tool>] approval_mode = "approve"` for every
+  read-only codedb tool — the server's live advertised surface minus the one write tool
+  (`codedb_edit`, left unconfigured so it's cancelled rather than auto-approved; the OS sandbox, not
+  the approval prompt, is the write boundary). If a worker still wedges on codedb, the config has a
+  codedb server block without those approvals — re-run the registrar: it detects that "incomplete"
+  state and appends the missing approvals (it no-ops only when the config is already complete, and
+  when codedb's binary is absent rather than registering a server that can't spawn).
 - Workers are READ-ONLY in audit/verify; only harvest/consolidate/integrator write.
 
 ## Fixing (thrifty on controller context; controller keeps final say)

@@ -39,6 +39,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 import goalflight_capacity as cap  # noqa: E402
+import goalflight_compat as compat  # noqa: E402
 import goalflight_status as status  # noqa: E402
 
 
@@ -440,6 +441,39 @@ def case_status_still_reclaims_dead_lease_in_view(state_dir: Path) -> None:
     )
 
 
+def case_stale_active_leases_live_worker_not_stale_with_dead_controller() -> None:
+    """Poison-pair: stale_active_leases must skip a lease whose worker_pid is LIVE.
+
+    Regression guard (audit-r24-2 / D008): dead controller + live worker must not
+    be classified stale; both pids dead must be. Dropping the worker_pid liveness
+    gate would mark the live-worker lease stale and fail this test.
+    """
+    worker = _spawn_live_worker()
+    try:
+        live_worker_dead_controller = _past_ttl_lease(
+            worker_pid=worker.pid,
+            controller_pid=_dead_pid(),
+        )
+        both_dead = _past_ttl_lease(worker_pid=_dead_pid(), controller_pid=_dead_pid())
+        data = {
+            "leases": {
+                live_worker_dead_controller["lease_id"]: live_worker_dead_controller,
+                both_dead["lease_id"]: both_dead,
+            },
+            "cooldowns": {},
+        }
+        stale_ids = {lease["lease_id"] for lease in cap.stale_active_leases(data)}
+        assert live_worker_dead_controller["lease_id"] not in stale_ids, (
+            "live worker_pid was classified stale despite dead controller"
+        )
+        assert both_dead["lease_id"] in stale_ids, (
+            "lease with both pids dead was not classified stale"
+        )
+    finally:
+        _kill_if_alive(worker.pid)
+        worker.wait()
+
+
 def case_release_stale_poison_pair_live_worker_survives_dead_controller(state_dir: Path) -> None:
     """Poison-pair: no detach markers, dead controller, live worker stays held."""
     worker = _spawn_live_worker()
@@ -660,12 +694,14 @@ def case_empty_state_dir_falls_back_not_cwd() -> None:
     """
     old_env = os.environ.get("GOALFLIGHT_STATE_DIR")
     old_default = cap.DEFAULT_STATE_DIR
+    old_default_fn = compat.default_state_dir
     old_cwd = os.getcwd()
     with tempfile.TemporaryDirectory() as td:
         default_dir = Path(td) / "default-state"
         work_dir = Path(td) / "work"
         work_dir.mkdir()
         cap.DEFAULT_STATE_DIR = default_dir
+        compat.default_state_dir = lambda: default_dir
         os.chdir(work_dir)
         try:
             for blank in ("", "   "):
@@ -684,6 +720,7 @@ def case_empty_state_dir_falls_back_not_cwd() -> None:
         finally:
             os.chdir(old_cwd)
             cap.DEFAULT_STATE_DIR = old_default
+            compat.default_state_dir = old_default_fn
             if old_env is None:
                 os.environ.pop("GOALFLIGHT_STATE_DIR", None)
             else:
@@ -697,6 +734,7 @@ def main() -> None:
     case_dead_lease_past_ttl_is_reclaimed()
     case_dead_lease_no_ttl_not_expired()
     case_rate_limited_retained_lease_pruned()
+    case_stale_active_leases_live_worker_not_stale_with_dead_controller()
     case_empty_state_dir_falls_back_not_cwd()
     case_capacity_wait_resolution_precedence()
     case_acquire_with_wait_zero_preserves_single_shot_payload()

@@ -21,7 +21,10 @@ fi
 
 mkdir -p "${HOME}/.goal-flight/venvs"
 if command -v uv >/dev/null 2>&1; then
-  uv venv "${ACP_VENV}"
+  if ! uv venv --clear "${ACP_VENV}"; then
+    rm -rf "${ACP_VENV}"
+    uv venv "${ACP_VENV}"
+  fi
   uv pip install --python "${ACP_VENV}/bin/python" -r "${REQ}"
 else
   if [[ -n "${GOALFLIGHT_PYTHON:-}" ]]; then
@@ -34,6 +37,7 @@ else
       GF_PY="python"
     fi
   fi
+  rm -rf "${ACP_VENV}"
   "$GF_PY" -m venv "${ACP_VENV}"
   "${ACP_VENV}/bin/python" -m pip install -r "${REQ}"
 fi

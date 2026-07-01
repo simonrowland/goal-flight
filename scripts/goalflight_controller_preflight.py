@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import shutil
 import subprocess
 import sys
@@ -30,7 +29,9 @@ CONTROLLER_STATUS = {
 
 
 def default_fleet_dir() -> Path:
-    return Path(os.environ.get("GOALFLIGHT_FLEET_DIR", Path.home() / ".goal-flight" / "fleet")).expanduser()
+    return goalflight_compat.resolve_env_path(
+        "GOALFLIGHT_FLEET_DIR", Path.home() / ".goal-flight" / "fleet"
+    )
 
 
 def load_adapter(repo_root: Path, adapter: str) -> dict | None:

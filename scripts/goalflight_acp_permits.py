@@ -81,9 +81,7 @@ def _sanitize(value: str, *, limit: int = 100) -> str:
 
 
 def _default_allowed_permission_roots() -> list[Path]:
-    state_root = Path(
-        os.environ.get("GOALFLIGHT_STATE_DIR", str(goalflight_compat.default_state_dir()))
-    ).expanduser()
+    state_root = goalflight_compat.resolve_state_dir()
     return [state_root, state_root / "dispatch"]
 
 

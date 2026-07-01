@@ -29,11 +29,7 @@ import goalflight_terminal
 SCHEMA = "goalflight.dispatch.v1"
 
 
-def _default_state_dir() -> Path:
-    return goalflight_compat.default_state_dir()
-
-
-DEFAULT_STATE_DIR = Path(os.environ.get("GOALFLIGHT_STATE_DIR", _default_state_dir()))
+DEFAULT_STATE_DIR = goalflight_compat.resolve_state_dir()
 WORKER_PATTERNS = (
     "codex",
     "codex-acp",
@@ -64,7 +60,7 @@ def parse_utc(value: object) -> dt.datetime | None:
 
 
 def state_dir() -> Path:
-    return Path(os.environ.get("GOALFLIGHT_STATE_DIR", str(DEFAULT_STATE_DIR))).expanduser()
+    return goalflight_compat.resolve_state_dir()
 
 
 def runs_dir(*, create: bool = True) -> Path:
@@ -193,16 +189,28 @@ def identity_matches(record: dict) -> tuple[bool, str]:
     return True, "live"
 
 
+def _is_detached_controller_dead_record(record: dict) -> bool:
+    if not record.get("detached"):
+        return False
+    state = record.get("state")
+    reason = record.get("reason") or record.get("error")
+    return state == "controller_dead" or (state == "orphaned" and reason == "controller_dead")
+
+
 def classify(record: dict) -> str:
     state = record.get("state", "running")
-    legacy_terminal_states = {
-        "released",
-        "superseded",
-        "blocked_session_limit",
-        "orphaned",
-        "inconclusive_no_final",
-    }
-    if state in legacy_terminal_states or goalflight_dispatch_states.is_terminal_state(state):
+    if _is_detached_controller_dead_record(record):
+        ok, reason = identity_matches(record)
+        if ok:
+            return "expected_live"
+        if reason == "dead":
+            return "worker_dead"
+        if reason == "no_pid":
+            return "unknown_no_pid"
+        if reason == "identity_indeterminate":
+            return "identity_indeterminate"
+        return f"stale_{reason}"
+    if goalflight_dispatch_states.is_terminal_state(state):
         return state
     if state in {"queued", "waiting_capacity"}:
         # Queued for a capacity slot: no worker exists yet, so the identity
@@ -224,10 +232,7 @@ def classify(record: dict) -> str:
 
 
 def record_path(dispatch_id: str, *, create: bool = True) -> Path:
-    safe = "".join(ch if ch.isalnum() or ch in "._-" else "-" for ch in dispatch_id)
-    if safe != dispatch_id:
-        safe = f"{safe}-{hashlib.sha256(dispatch_id.encode()).hexdigest()[:8]}"
-    return runs_dir(create=create) / f"{safe}.json"
+    return runs_dir(create=create) / f"{goalflight_compat.safe_dispatch_filename(dispatch_id)}.json"
 
 
 def write_record(record: dict) -> Path:
@@ -279,22 +284,9 @@ def infer_shape(record: dict) -> str:
 
 
 def terminal_state_for(state: object, reason: object = None) -> str:
-    if state == "complete":
-        return "complete"
-    if state == "worker_dead":
-        return "worker_dead"
-    if state == "rate_limited":
-        return "rate_limited"
-    if state == "idle_timeout":
-        return "idle_timeout"
-    if state == "watcher_stopped":
-        return "watcher_stopped"
-    if state == "controller_dead" or (state == "orphaned" and reason == "controller_dead"):
-        return "controller_dead"
-    if isinstance(state, str) and state.startswith("blocked"):
-        return "blocked"
-    if state == "blocked":
-        return "blocked"
+    terminal = goalflight_dispatch_states.terminal_state_for(state, reason)
+    if terminal != "unknown":
+        return terminal
     if state in {None, "", "queued", "running", "starting", "running_quiet", "handshaking", "waiting_capacity"}:
         # queued/waiting_capacity = queued for a capacity slot (pre-spawn, live):
         # non-terminal, so the reused-dispatch-id guard refuses duplicates
@@ -440,6 +432,8 @@ def cmd_record(args: argparse.Namespace) -> int:
     task_ids = task_ids_from_args(args)
     if task_ids:
         record["task_ids"] = task_ids
+    if getattr(args, "detached", False):
+        record["detached"] = True
     if getattr(args, "queue_launch_token", None):
         record["queue_launch_token"] = args.queue_launch_token
     with StateLock():
@@ -505,6 +499,18 @@ def status_payload() -> dict:
     records = read_records()
     rows = []
     for r in records:
+        classification = classify(r)
+        terminal_state = r.get("terminal_state") or terminal_state_for(
+            r.get("state"), r.get("reason") or r.get("error")
+        )
+        if _is_detached_controller_dead_record(r):
+            if classification == "expected_live" or classification in {
+                "unknown_no_pid",
+                "identity_indeterminate",
+            } or str(classification).startswith("stale_"):
+                terminal_state = "unknown"
+            elif classification == "worker_dead":
+                terminal_state = "worker_dead"
         row = {
             "dispatch_id": r.get("dispatch_id"),
             "prompt_id": r.get("prompt_id"),
@@ -514,8 +520,8 @@ def status_payload() -> dict:
             "account": r.get("account") or "unknown",
             "transport": r.get("transport"),
             "state": r.get("state"),
-            "classification": classify(r),
-            "terminal_state": r.get("terminal_state") or terminal_state_for(r.get("state"), r.get("reason") or r.get("error")),
+            "classification": classification,
+            "terminal_state": terminal_state,
             "liveness_state": r.get("liveness_state"),
             "elapsed_s": elapsed_seconds(r),
             "worker_still_alive": r.get("worker_still_alive"),
@@ -526,6 +532,7 @@ def status_payload() -> dict:
             "stdout_path": r.get("stdout_path"),
             "stderr_path": r.get("stderr_path"),
             "status_path": r.get("status_path"),
+            "detached": r.get("detached"),
             "os_sandbox": r.get("os_sandbox"),
             "started_at": r.get("started_at"),
             "ended_at": r.get("ended_at"),
@@ -771,6 +778,7 @@ def build_parser() -> argparse.ArgumentParser:
     rec.add_argument("--status-path")
     rec.add_argument("--os-sandbox-json")
     rec.add_argument("--state", default="running")
+    rec.add_argument("--detached", action="store_true")
     rec.add_argument("--json", action="store_true")
     rec.set_defaults(func=cmd_record)
 

@@ -17,6 +17,7 @@ skip_posix_on_native_windows("watch prompt echo uses bash-tail and start_new_ses
 
 import json
 import gzip
+import os
 import subprocess
 import sys
 import tempfile
@@ -79,8 +80,11 @@ def _run_watcher(
         cmd += ["--worker-identity-json", json.dumps(identity, sort_keys=True)]
     if ignore:
         cmd += ["--ignore-prompt-file", str(prompt)]
+    env = os.environ.copy()
+    env["GOALFLIGHT_TEST_MODE"] = "1"
+    env["GOALFLIGHT_TEST_PGROUP_CPU_PCT"] = "0.0"
     t0 = time.time()
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=40)
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=40, env=env)
     elapsed = time.time() - t0
     payload = {}
     term = {}
@@ -958,7 +962,7 @@ def case_worker_dead_failed_marker_blocks() -> None:
     rc, _elapsed, term, payload = _run_dead_worker_tail("FAILED: x\n")
     assert rc == 4, f"FAILED should map to blocked exit 4, got rc={rc} ({payload})"
     assert payload.get("state") == "blocked", payload
-    assert payload.get("reason") in {"marker:FAILED", "marker:FAILED:final_reconciliation"}, payload
+    assert payload.get("reason") == "marker:FAILED", payload
     assert term.get("kind") == "FAILED", term
     assert term.get("text") == "x", term
 

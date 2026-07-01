@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.goalflight.drain</string>
+
+    <!-- Reaper-survivable queue drainer. Fires a fresh ~1s `drain` pass every
+         60s; cron-safe by design (no long-lived loop for the host harness to
+         reap). Launched by launchd, outside any Claude session, so it survives
+         session end / reaper. Each pass tops up live capacity and exits. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>@PYTHON@</string>
+        <string>@SKILL_ROOT@/scripts/goalflight_dispatch.py</string>
+        <string>drain</string>
+        <string>--json</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>@SKILL_ROOT@</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>@HOME@</string>
+        <!-- worker-correct PATH so spawned codex/grok/python resolve -->
+        <key>PATH</key>
+        <string>@PATH@</string>
+    </dict>
+
+    <key>StartInterval</key>
+    <integer>60</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>@LOG@</string>
+    <key>StandardErrorPath</key>
+    <string>@LOG@</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

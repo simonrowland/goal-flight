@@ -28,6 +28,7 @@ from goalflight_liveness import (
     LivenessThresholds,
     active_monotonic,
     classify_liveness,
+    cpu_confirmed_idle,
     pgroup_cpu_pct,
     process_group_id,
     system_starved,
@@ -43,38 +44,52 @@ from goalflight_liveness import (
 # the last non-empty line (post prefix-ignore, outside fence). READY/COMPLETE/RESULT/etc.
 # Prevents cat/echo/print of marker tokens mid-output or inside fenced examples from
 # false-completing the watcher.
-_LIVE_MARKER_KINDS = sorted(goalflight_terminal.TERMINAL_MARKERS | {"STATUS", "STEER-ACK"})
-MARKER_RE = re.compile(
-    r"^\**(" + "|".join(re.escape(kind) for kind in _LIVE_MARKER_KINDS) + r"):\**\s*(.*)$"
+_MARKER_KIND_ORDER = (
+    "STATUS",
+    "STEER-ACK",
+    "RESULT",
+    "USER-NEED",
+    "USER-CONFIRM",
+    "BLOCKED",
+    "FAILED",
+    "COMPLETE",
+    "READY",
 )
-TERMINAL_MARKERS = set(goalflight_terminal.TERMINAL_MARKERS)
+TERMINAL_MARKERS = frozenset(goalflight_terminal.TERMINAL_MARKERS)
+TERMINAL_MARKER_KINDS = TERMINAL_MARKERS
+SUCCESS_TERMINAL_MARKERS = frozenset(goalflight_terminal.SUCCESS_TERMINAL_MARKERS)
+BLOCKING_TERMINAL_MARKERS = TERMINAL_MARKERS - SUCCESS_TERMINAL_MARKERS
+MARKER_KINDS = frozenset(kind for kind in _MARKER_KIND_ORDER if kind in TERMINAL_MARKERS or kind in {"STATUS", "STEER-ACK"})
+_MARKER_KIND_ALTERNATION = "|".join(re.escape(kind) for kind in _MARKER_KIND_ORDER if kind in MARKER_KINDS)
+_TERMINAL_MARKER_KIND_ALTERNATION = "|".join(re.escape(kind) for kind in _MARKER_KIND_ORDER if kind in TERMINAL_MARKERS)
+SHELL_TERMINAL_MARKER_RE = rf"^\**({_TERMINAL_MARKER_KIND_ALTERNATION}):\**"
+MARKER_RE = re.compile(rf"^\**({_MARKER_KIND_ALTERNATION}):\**\s*(.*)$")
 FINAL_TERMINAL_MARKER_RE = re.compile(
     r"^(?:-\s+)?`?\**(?:STATUS:\s*)?"
-    r"(RESULT|USER-NEED|USER-CONFIRM|BLOCKED|FAILED|COMPLETE|READY):(.*)$"
+    rf"({_TERMINAL_MARKER_KIND_ALTERNATION}):(.*)$"
 )
 COMPLETION_SIGNOFF_RE = re.compile(
     r"^(?:STATUS:\s*)?(DONE|COMPLETE|FINISHED)\s*:?\s*[.!?]?$",
     re.IGNORECASE,
 )
 BARE_TERMINAL_MARKER_RE = re.compile(
-    r"^(?:(?:RESULT|USER-NEED|USER-CONFIRM|BLOCKED|FAILED|COMPLETE|READY):\s*.*|"
+    rf"^(?:(?:{_TERMINAL_MARKER_KIND_ALTERNATION}):\s*.*|"
     r"(?:DONE|COMPLETE|FINISHED)\s*:?\s*[.!?]?)$",
     re.IGNORECASE,
 )
 HUNK_HEADER_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@")
 PROMPT_ECHO_ANCHOR_SEARCH_LINES = 200
 PROMPT_ECHO_MAX_ANCHORS = 10
-# CPU-sampling-failure grace (codex 2026-05-20 P2): require this many consecutive
-# `wedged` polls before exiting with idle_timeout, so a single transient `ps`
-# failure (cpu→None→wedged for one poll) can't false-positive a healthy worker.
-# Watcher mirror of the runner's intra-decision re-sample grace
-# (goalflight_liveness.cpu_liveness_keep_waiting) — same goal, keep aligned.
+# CPU-sampling-failure grace (codex 2026-05-20 P2): idle_timeout exits only on
+# confirmed-idle CPU. Unavailable CPU (ps failure -> None) keeps waiting instead
+# of false-killing a healthy quiet worker. The streak still protects against
+# one-off noisy idle samples.
 WEDGE_CONFIRM_SAMPLES = 2
 BLOCKED_TASK_BREADCRUMB_STATE = "blocked_task_breadcrumb"
 
 
 def _marker_state(marker: dict | None) -> str:
-    if marker and marker.get("kind") in {"RESULT", "COMPLETE", "READY"}:
+    if marker and marker.get("kind") in SUCCESS_TERMINAL_MARKERS:
         return "complete"
     return "blocked"
 
@@ -168,6 +183,12 @@ def _status_snapshot(payload: dict) -> dict:
         "updated_at",
     )
     return {key: payload.get(key) for key in keys if payload.get(key) not in (None, "", [], {})}
+
+
+def _controller_dead_is_terminal(*, detached: bool) -> bool:
+    if detached:
+        return False
+    return True
 
 
 def _strip_marker_decoration(text: str) -> str:
@@ -446,6 +467,79 @@ def extract_markers(path: Path, max_bytes: int = 10 * 1024 * 1024,
     return markers, size
 
 
+# Worker markers the watcher bridges into the controller's mail inbox: a worker
+# blocking on one of these is "you have mail" the controller should see on its next
+# status check. (They are also terminal markers — the worker stops and waits — so
+# each is normally emitted once.)
+WORKER_MAIL_MARKER_KINDS = frozenset({"USER-NEED", "USER-CONFIRM", "BLOCKED"})
+
+# Sentinel parked in the dedup set after any mail-layer failure: the bridge then
+# no-ops for the rest of the watcher run. A real (type, text) key can never equal
+# it (no message type is the empty marker below), so it cannot collide.
+_BRIDGE_DISABLED = ("\x00bridge-disabled", "")
+
+
+def post_worker_mail(dispatch_id: str, markers: list[dict], posted_keys: set) -> None:
+    """Best-effort: post a worker's USER-NEED / USER-CONFIRM / BLOCKED markers as
+    envelopes into the dispatch's mail inbox, so the controller's read-side status
+    mail hint surfaces them with the question/blocker text.
+
+    Liveness comes first and the bridge must never stall or storm the poll loop:
+    - the common poll (no urgent marker) returns immediately and imports nothing —
+      so the watcher's startup/steady path never touches the mail layer;
+    - the inbox is read at most ONCE, lazily, when the first fresh urgent marker
+      appears (rare; these markers are terminal), then the in-memory ``posted_keys``
+      set short-circuits every later poll — no per-poll inbox scan;
+    - each key is marked BEFORE the disk write, so a failed post can never re-attempt
+      the same I/O every poll;
+    - the FIRST mail-layer failure disables the bridge for the rest of the run.
+    """
+    if _BRIDGE_DISABLED in posted_keys:
+        return
+    try:
+        urgent = [m for m in markers if m.get("kind") in WORKER_MAIL_MARKER_KINDS]
+        if not urgent:
+            return
+        import goalflight_messages as gm  # lazy: the watcher must not hard-depend on mail
+
+        messages_dir = gm.default_messages_dir()
+        inbox = gm.inbox_path(messages_dir, dispatch_id)
+        if inbox.exists() and not inbox.is_file():
+            # Non-regular inbox (FIFO/device): read_envelopes()'s read or
+            # post_message()'s open("a") could block the watcher's liveness loop
+            # FOREVER — the broad except below can't catch a hang. Same hang class
+            # as the read-side collect_inbox_paths guard. Refuse and disable the
+            # bridge for the run; liveness must never wait on the mail layer.
+            # is_file()/exists() are non-blocking stat()s (open() is what blocks).
+            posted_keys.add(_BRIDGE_DISABLED)
+            return
+        inbox_seen: set | None = None  # loaded once, only on a fresh urgent marker (restart-safe dedup)
+        for m in urgent:
+            mtype = gm.MARKER_TO_TYPE.get(m["kind"], "blocked")
+            text = _strip_marker_decoration(str(m.get("text") or "")).strip()
+            key = (mtype, text)
+            if key in posted_keys:
+                continue
+            if inbox_seen is None:
+                inbox_seen = {
+                    (str(e.get("type")), str((e.get("payload") or {}).get("text") or "").strip())
+                    for e in gm.read_envelopes(inbox)
+                }
+            posted_keys.add(key)  # mark BEFORE I/O: a failed post must not retry every poll
+            if key in inbox_seen:
+                continue  # already delivered in a prior run; marked above, skip the re-post
+            gm.post_message(
+                dispatch_id=dispatch_id,
+                msg_type=mtype,
+                payload={"text": text},
+                messages_dir=messages_dir,
+                source={"node": "local", "adapter": "watcher", "transport": "marker-bridge"},
+            )
+    except Exception:
+        posted_keys.add(_BRIDGE_DISABLED)  # one failure -> bridge off for this run; liveness first
+        return
+
+
 def _last_line_is_terminal_marker(
     path: Path,
     ignore_prefix_lines: list[str] | None = None,
@@ -606,6 +700,8 @@ def main() -> int:
     parser.add_argument("--cpu-epsilon", type=float, default=0.1)
     parser.add_argument("--pgid", type=int)
     parser.add_argument("--controller-pid", type=int)
+    parser.add_argument("--detached", action="store_true",
+                        help="Ignore launcher/controller pid liveness; worker pid identity is authoritative.")
     parser.add_argument("--worker-identity-json",
                         help="Process identity token captured at spawn; prevents PID-reuse false liveness.")
     parser.add_argument("--ignore-prompt-file",
@@ -635,6 +731,7 @@ def main() -> int:
             "dispatch_id": args.dispatch_id,
             "agent": args.agent,
             "worker_pid": args.pid,
+            "detached": bool(args.detached),
             "state": "blocked_windows_dispatch",
             "reason": goalflight_compat.windows_watcher_skip(),
             "tail_path": str(tail),
@@ -769,6 +866,7 @@ def main() -> int:
             "dispatch_id": args.dispatch_id,
             "agent": args.agent,
             "worker_pid": args.pid,
+            "detached": bool(args.detached),
             "pgid": current_pgid,
             "worker_alive": worker_is_alive,
             "worker_identity_reason": identity_reason,
@@ -794,8 +892,14 @@ def main() -> int:
             signal.signal(sig, handle_signal)
     atexit.register(lambda: flush_terminal_status("watcher_exit"))
 
+    posted_mail_keys: set = set()  # per-run dedup for the worker->controller mail bridge
     while True:
         markers, size = extract_markers(tail, ignore_prefix_lines=ignore_prefix_lines)
+        # Bridge worker USER-NEED/USER-CONFIRM/BLOCKED markers into the dispatch
+        # inbox so the controller's status mail hint surfaces them. Runs BEFORE the
+        # terminal-exit checks below so a need is posted even on the iteration the
+        # watcher resolves (these markers are themselves terminal). Best-effort.
+        post_worker_mail(args.dispatch_id, markers, posted_mail_keys)
         if size != last_size:
             last_size = size
             last_change = active_monotonic()
@@ -816,8 +920,7 @@ def main() -> int:
             cpu_pct = 0.0
         low_power_relax = (
             worker_is_alive
-            and cpu_pct is not None
-            and cpu_pct <= args.cpu_epsilon
+            and cpu_confirmed_idle(cpu_pct, args.cpu_epsilon)
             and args.max_idle_secs > 0
             and seconds_since_event >= args.max_idle_secs
             and system_starved()
@@ -834,6 +937,7 @@ def main() -> int:
             "dispatch_id": args.dispatch_id,
             "agent": args.agent,
             "worker_pid": args.pid,
+            "detached": bool(args.detached),
             "pgid": pgid,
             "worker_alive": worker_is_alive,
             "worker_identity_reason": identity_reason,
@@ -871,7 +975,11 @@ def main() -> int:
             exit_code = _exit_code_for_state(payload["state"])
             exit_reason = payload.get("reason", exit_reason)
             break
-        if args.controller_pid and not alive(args.controller_pid):
+        if (
+            args.controller_pid
+            and not alive(args.controller_pid)
+            and _controller_dead_is_terminal(detached=bool(args.detached))
+        ):
             payload["state"] = "orphaned"
             exit_reason = "controller_dead"
             exit_code = 3

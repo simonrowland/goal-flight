@@ -23,6 +23,7 @@ from typing import Any, Callable
 
 from goalflight_acp_client import AcpConnection
 from goalflight_liveness import active_monotonic
+from goalflight_watch import MARKER_KINDS, TERMINAL_MARKERS as WATCH_TERMINAL_MARKERS
 
 
 @dataclass
@@ -323,14 +324,16 @@ async def _run_prompt_locked(
 # stops mid-output prints/cats/fenced examples of RESULT:/COMPLETE:/BLOCKED:/etc
 # from injecting false terminals into extract_markers (used for early cancel and
 # _terminal_turn_marker / result envelopes).
+_ACP_MARKER_KINDS = MARKER_KINDS | {"PERMISSION-OK-PROCEEDED"}
+_ACP_MARKER_KIND_ALTERNATION = "|".join(re.escape(kind) for kind in sorted(_ACP_MARKER_KINDS))
 _MARKERS_RE = re.compile(
-    r"^\**(STATUS|STEER-ACK|RESULT|USER-NEED|USER-CONFIRM|BLOCKED|COMPLETE|READY|PERMISSION-OK-PROCEEDED):\**\s*(.+?)\s*\**$",
+    rf"^\**({_ACP_MARKER_KIND_ALTERNATION}):\**\s*(.+?)\s*\**$",
     re.MULTILINE,
 )
 
 # Terminal kinds for position check (must match goalflight_watch.TERMINAL_MARKERS
 # for the RESULT/COMPLETE/BLOCKED/USER-*/READY; PERMISSION-OK is acp-internal non-terminal).
-TERMINAL_MARKERS = {"RESULT", "USER-NEED", "USER-CONFIRM", "BLOCKED", "COMPLETE", "READY"}
+TERMINAL_MARKERS = WATCH_TERMINAL_MARKERS
 
 
 def extract_markers(text: str) -> dict[str, list[str]]:

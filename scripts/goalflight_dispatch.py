@@ -48,7 +48,6 @@ try:
     import fcntl
 except ImportError:  # pragma: no cover - Windows fallback path
     fcntl = None
-import hashlib
 import io
 import json
 import os
@@ -64,7 +63,9 @@ from pathlib import Path
 
 import goalflight_compat
 import goalflight_capacity
+import goalflight_dispatch_paths
 import goalflight_dispatch_states
+import goalflight_steer_mailbox
 import goalflight_ledger
 import goalflight_terminal
 from goalflight_liveness import active_monotonic, process_group_id, write_status
@@ -102,6 +103,7 @@ RETIRED_AGENT_LABELS = {
 }
 GIT_BASE_PIN_RE = re.compile(r"(?<![A-Za-z0-9_./:-])([0-9A-Fa-f]{7,40})(?![A-Za-z0-9_./:-])")
 TASK_ID_RE = re.compile(r"^[tb]-\d+$")
+LOWER_BASE_SHA_RE = re.compile(r"[0-9a-f]{40}")
 READ_ONLY_INLINE_RETURN_PROMPT_PATTERNS = (
     (
         "return inline",
@@ -312,7 +314,6 @@ def _status_exit_code(state: object) -> int:
     if state == "blocked" or (isinstance(state, str) and state.startswith("blocked")):
         return 4
     return 1
-
 
 def _is_status_terminal(state: object) -> bool:
     if state == "orphaned":
@@ -583,28 +584,23 @@ def _parse_task_ids(values: list[str] | None) -> list[str]:
 
 
 def _state_dir() -> Path:
-    return Path(
-        os.environ.get("GOALFLIGHT_STATE_DIR", str(goalflight_compat.default_state_dir()))
-    ).expanduser()
+    return goalflight_dispatch_paths.state_dir()
 
 
 def _dispatch_base_dir() -> Path:
-    return _state_dir() / "dispatch"
+    return goalflight_dispatch_paths.dispatch_base_dir()
 
 
 def _dispatch_queue_dir() -> Path:
-    return _state_dir() / "dispatch-queue"
+    return goalflight_dispatch_paths.dispatch_queue_dir()
 
 
 def _safe_dispatch_filename(dispatch_id: str) -> str:
-    safe = "".join(ch if ch.isalnum() or ch in "._-" else "-" for ch in dispatch_id)
-    if safe != dispatch_id:
-        safe = f"{safe}-{hashlib.sha256(dispatch_id.encode()).hexdigest()[:8]}"
-    return safe
+    return goalflight_dispatch_paths.safe_dispatch_filename(dispatch_id)
 
 
 def _queue_entry_path(dispatch_id: str, *, queue_dir: Path | None = None) -> Path:
-    return (queue_dir or _dispatch_queue_dir()) / f"{_safe_dispatch_filename(dispatch_id)}.json"
+    return goalflight_dispatch_paths.queue_entry_path(dispatch_id, queue_dir=queue_dir)
 
 
 def _write_json_atomic(path: Path, payload: dict) -> None:
@@ -749,7 +745,7 @@ def _print_background_default_notice() -> None:
 
 
 def _steer_file(dispatch_id: str) -> Path:
-    return _dispatch_base_dir() / f"{dispatch_id}.steer.jsonl"
+    return goalflight_dispatch_paths.steer_file(dispatch_id)
 
 
 def _raw_worker_args(args) -> list[str]:
@@ -794,7 +790,12 @@ def _git_head_for_cwd(cwd: Path) -> str | None:
     if proc.returncode != 0:
         return None
     head = proc.stdout.strip().splitlines()[0].lower() if proc.stdout.strip() else ""
-    return head if re.fullmatch(r"[0-9a-f]{40}", head) else None
+    return head if LOWER_BASE_SHA_RE.fullmatch(head) else None
+
+
+def _valid_lower_base_sha(value: object) -> str | None:
+    raw = str(value or "").strip()
+    return raw if LOWER_BASE_SHA_RE.fullmatch(raw) else None
 
 
 def _git_pin_warning(args) -> str | None:
@@ -1084,116 +1085,23 @@ def _worker_liveness_warning(record: dict) -> str | None:
 
 
 def _parse_steer_lines(lines: list[str]) -> list[dict]:
-    entries: list[dict] = []
-    for line in lines:
-        if not line.strip():
-            continue
-        try:
-            item = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        try:
-            seq = int(item.get("seq"))
-        except (TypeError, ValueError):
-            continue
-        entries.append({
-            "seq": seq,
-            "ts": str(item.get("ts") or ""),
-            "text": str(item.get("text") or ""),
-        })
-    return entries
+    return goalflight_steer_mailbox.parse_steer_lines(lines)
 
 
 def _read_steer_entries(path: Path) -> list[dict]:
-    if not path.exists():
-        return []
-    with path.open("r", encoding="utf-8", errors="replace") as f:
-        goalflight_compat.flock(f, goalflight_compat.LOCK_SH)
-        try:
-            return _parse_steer_lines(f.read().splitlines())
-        finally:
-            goalflight_compat.flock(f, goalflight_compat.LOCK_UN)
+    return goalflight_steer_mailbox.read_steer_entries(path)
 
 
 def _append_steer_message(dispatch_id: str, text: str) -> tuple[Path, dict]:
-    path = _steer_file(dispatch_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a+", encoding="utf-8") as f:
-        goalflight_compat.flock(f, goalflight_compat.LOCK_EX)
-        try:
-            f.seek(0)
-            existing = _parse_steer_lines(f.read().splitlines())
-            seq = max((entry["seq"] for entry in existing), default=0) + 1
-            entry = {
-                "seq": seq,
-                "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                "text": text,
-            }
-            f.seek(0, os.SEEK_END)
-            f.write(json.dumps(entry, sort_keys=True) + "\n")
-            f.flush()
-            os.fsync(f.fileno())
-            return path, entry
-        finally:
-            goalflight_compat.flock(f, goalflight_compat.LOCK_UN)
+    return goalflight_steer_mailbox.append_steer_message(dispatch_id, text)
 
 
 def _acked_steer_seqs(record: dict) -> set[int]:
-    acked: set[int] = set()
-    for key in ("stdout_path", "status_path"):
-        value = record.get(key)
-        if not value:
-            continue
-        path = Path(str(value))
-        if not path.exists():
-            continue
-        if key == "status_path":
-            try:
-                payload = json.loads(path.read_text(encoding="utf-8", errors="replace"))
-            except (OSError, json.JSONDecodeError):
-                continue
-            markers = payload.get("markers") or []
-            if isinstance(markers, dict):
-                for value in markers.get("STEER-ACK") or []:
-                    try:
-                        acked.add(int(str(value or "").split()[0]))
-                    except (IndexError, ValueError):
-                        pass
-            else:
-                for marker in markers:
-                    if not isinstance(marker, dict) or marker.get("kind") != "STEER-ACK":
-                        continue
-                    try:
-                        acked.add(int(str(marker.get("text") or "").split()[0]))
-                    except (IndexError, ValueError):
-                        pass
-            continue
-        try:
-            text = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        for line in text.splitlines():
-            match = STEER_ACK_RE.match(line.strip())
-            if match:
-                acked.add(int(match.group(1)))
-    return acked
+    return goalflight_steer_mailbox.acked_steer_seqs(record)
 
 
 def _list_steer_messages(dispatch_id: str, record: dict) -> int:
-    mailbox = _steer_file(dispatch_id)
-    entries = _read_steer_entries(mailbox)
-    acked = _acked_steer_seqs(record)
-    print(f"steer mailbox: {mailbox}")
-    if not entries:
-        print("(empty)")
-        return 0
-    print("seq\tts\tacked\ttext")
-    for entry in entries:
-        print(
-            f"{entry['seq']}\t{entry['ts']}\t"
-            f"{str(entry['seq'] in acked).lower()}\t{entry['text']}"
-        )
-    return 0
+    return goalflight_steer_mailbox.list_steer_messages(dispatch_id, record)
 
 
 def _cmd_steer(argv: list[str]) -> int:
@@ -1525,6 +1433,7 @@ def _record_ledger(args, *, project_root: Path, prompt_path: str | None, status_
                 status_path=str(status_json),
                 os_sandbox_json=json.dumps({"shape": "bash", "read_only": bool(args.read_only)}, sort_keys=True),
                 queue_launch_token=getattr(args, "queue_launch_token", None),
+                detached=bool(getattr(args, "launch_detached", False)),
                 state=state,
                 json=True,
             )
@@ -1567,6 +1476,8 @@ def _record_queued_ledger_fast(args, *, project_root: Path, prompt_path: str | N
     task_ids = list(getattr(args, "task_ids", []) or [])
     if task_ids:
         record["task_ids"] = task_ids
+    if getattr(args, "launch_detached", False):
+        record["detached"] = True
     if getattr(args, "queue_launch_token", None):
         record["queue_launch_token"] = args.queue_launch_token
     with goalflight_ledger.StateLock():
@@ -1694,8 +1605,19 @@ def _canonical_replay_argv(args, raw_argv: list[str], *, tail: Path, status_json
 
 def _existing_queue_entry_paths(queue_path: Path) -> list[Path]:
     paths = [queue_path] if queue_path.exists() else []
-    paths.extend(sorted(queue_path.parent.glob(f"{queue_path.name}.claimed-*")))
+    paths.extend(
+        path
+        for path in sorted(queue_path.parent.glob(f"{queue_path.name}.claimed-*"))
+        if not path.name.endswith(".failed")
+    )
     return paths
+
+
+def _queue_entry_counts_as_active(path: Path, entry: dict) -> bool:
+    if path.name.endswith(".failed"):
+        return False
+    state = entry.get("state")
+    return state in (None, "queued", "claimed")
 
 
 def _cleanup_partial_submit(queue_path: Path, status_json: Path) -> None:
@@ -1800,6 +1722,7 @@ def _queue_claim_worker_alive(entry: dict) -> bool:
 
 def _submit_dispatch(args, raw_argv: list[str], *, base: Path) -> int:
     project_root = _project_root(args)
+    submit_base_sha = _git_head_for_cwd(project_root)
     tail = Path(args.tail) if args.tail else base / f"{args.dispatch_id}.tail"
     status_json = Path(args.status_json) if args.status_json else base / f"{args.dispatch_id}.status.json"
     queue_path = _queue_entry_path(args.dispatch_id)
@@ -1815,19 +1738,21 @@ def _submit_dispatch(args, raw_argv: list[str], *, base: Path) -> int:
         "created_at": goalflight_ledger.utc_now(),
         "updated_at": goalflight_ledger.utc_now(),
         "queue_path": str(queue_path),
+        "base_sha": submit_base_sha,
         "dispatch_argv": dispatch_argv,
         **({"task_ids": list(args.task_ids)} if getattr(args, "task_ids", None) else {}),
         "request": {
             "agent": args.agent,
             "prompt_file": str(Path(args.prompt_file).expanduser()) if args.prompt_file else None,
             "prompt": args.prompt,
-            "task_ids": list(args.task_ids),
+            "task_ids": list(getattr(args, "task_ids", []) or []),
             "priority": args.priority,
             "dispatch_id": args.dispatch_id,
             "cwd": str(project_root),
             "model": args.model,
             "shape": args.shape,
             "read_only": bool(args.read_only),
+            "base_sha": submit_base_sha,
             "account": args.account,
             "billing": args.billing,
             "capacity_wait_s": args.capacity_wait_s,
@@ -1839,6 +1764,7 @@ def _submit_dispatch(args, raw_argv: list[str], *, base: Path) -> int:
             "raw_worker": raw_argv,
         },
     }
+    duplicate_active = False
     try:
         with _queue_mutation_lock(queue_path.parent):
             existing_paths = _existing_queue_entry_paths(queue_path)
@@ -1855,27 +1781,29 @@ def _submit_dispatch(args, raw_argv: list[str], *, base: Path) -> int:
                         existing.get("dispatch_id") == args.dispatch_id
                         and existing.get("dispatch_argv") == dispatch_argv
                     ):
-                        matches.append(existing_path)
+                        if _queue_entry_counts_as_active(existing_path, existing):
+                            matches.append(existing_path)
                     else:
                         conflicts.append(existing_path.name)
                 if matches and not conflicts:
-                    print(f"STATUS: queued already {args.dispatch_id}")
-                    return 0
-                print(f"goalflight_dispatch: queued request already exists for {args.dispatch_id}", file=sys.stderr)
-                return 64
-            _write_json_atomic(queue_path, entry)
-            _test_submit_status_delay()
-            try:
-                _record_queued_status(
-                    args,
-                    project_root=project_root,
-                    status_json=status_json,
-                    tail=tail,
-                    queue_path=queue_path,
-                )
-            except (OSError, RuntimeError):
-                _cleanup_partial_submit(queue_path, status_json)
-                raise
+                    duplicate_active = True
+                elif matches or conflicts:
+                    print(f"goalflight_dispatch: queued request already exists for {args.dispatch_id}", file=sys.stderr)
+                    return 64
+            if not duplicate_active:
+                _write_json_atomic(queue_path, entry)
+                _test_submit_status_delay()
+                try:
+                    _record_queued_status(
+                        args,
+                        project_root=project_root,
+                        status_json=status_json,
+                        tail=tail,
+                        queue_path=queue_path,
+                    )
+                except (OSError, RuntimeError):
+                    _cleanup_partial_submit(queue_path, status_json)
+                    raise
     except (OSError, RuntimeError) as exc:
         print(
             f"goalflight_dispatch: submit failed for {args.dispatch_id}: "
@@ -1883,6 +1811,10 @@ def _submit_dispatch(args, raw_argv: list[str], *, base: Path) -> int:
             file=sys.stderr,
         )
         return 1
+    if duplicate_active:
+        print(f"STATUS: queued already {args.dispatch_id}")
+        _drain_on_submit(args, queue_path)
+        return 0
     print(
         "DISPATCH-QUEUED "
         + json.dumps(
@@ -2095,13 +2027,60 @@ def _release_stale_capacity_for_drain() -> None:
         )
 
 
-def _dispatch_has_worker_record(dispatch_id: str, *, queue_launch_token: str | None = None) -> bool:
-    record = _find_dispatch_record(dispatch_id)
+def _dispatch_record_is_terminal(record: dict | None) -> bool:
+    if not record:
+        return False
+    terminal = record.get("terminal_state") or goalflight_ledger.terminal_state_for(
+        record.get("state"),
+        record.get("reason") or record.get("error"),
+    )
+    return terminal != "unknown" or goalflight_dispatch_states.is_terminal_state(record.get("state"))
+
+
+def _dispatch_record_has_live_nonterminal_worker(record: dict | None) -> bool:
     if not (record and record.get("worker_pid")):
         return False
+    if _dispatch_record_is_terminal(record):
+        return False
+    try:
+        ok, _reason = goalflight_ledger.identity_matches(record)
+    except Exception:
+        return False
+    return ok
+
+
+def _dispatch_has_worker_record(
+    dispatch_id: str,
+    *,
+    queue_launch_token: str | None = None,
+    require_live_nonterminal: bool = False,
+) -> bool:
+    record = _find_dispatch_record(dispatch_id)
+    if not record:
+        return False
     if queue_launch_token is not None:
-        return record.get("queue_launch_token") == queue_launch_token
+        if record.get("queue_launch_token") != queue_launch_token:
+            return False
+    if record.get("worker_pid"):
+        if require_live_nonterminal and not _dispatch_record_has_live_nonterminal_worker(record):
+            return False
+        return True
+    if record.get("transport") != "fleet-ssh":
+        return False
+    remote_receipt = record.get("remote_launch_receipt")
+    has_remote_launch = bool(
+        record.get("launch_unconfirmed")
+        or (isinstance(remote_receipt, dict) and remote_receipt.get("remote_pid"))
+    )
+    if not has_remote_launch:
+        return False
+    if require_live_nonterminal and _dispatch_record_is_terminal(record):
+        return False
     return True
+
+
+def _dispatch_has_terminal_record(dispatch_id: str) -> bool:
+    return _dispatch_record_is_terminal(_find_dispatch_record(dispatch_id))
 
 
 def _recover_claimed_queue_entries(queue_dir: Path, *, stale_s: float) -> dict:
@@ -2141,6 +2120,9 @@ def _recover_claimed_queue_entries(queue_dir: Path, *, stale_s: float) -> dict:
                 pending_launch += 1
                 continue
             if not launch_marked:
+                if not is_stale:
+                    pending_launch += 1
+                    continue
                 if target.exists():
                     with contextlib.suppress(OSError):
                         claim.unlink()
@@ -2165,12 +2147,20 @@ def _recover_claimed_queue_entries(queue_dir: Path, *, stale_s: float) -> dict:
                     claim.unlink()
                     restored += 1
                 continue
+            if dispatch_id and _dispatch_has_worker_record(dispatch_id, require_live_nonterminal=True):
+                pending_launch += 1
+                continue
+            if dispatch_id and _dispatch_has_terminal_record(dispatch_id):
+                with contextlib.suppress(OSError):
+                    claim.unlink()
+                cleared += 1
+                continue
             _mark_claim_worker_dead(entry, reason="stale_claim_launch_token_lost")
             with contextlib.suppress(OSError):
                 claim.unlink()
                 cleared += 1
             continue
-        if dispatch_id and _dispatch_has_worker_record(dispatch_id):
+        if dispatch_id and _dispatch_has_worker_record(dispatch_id, require_live_nonterminal=True):
             pending_launch += 1
             continue
         try:
@@ -2359,6 +2349,194 @@ def _mark_claim_failed(claim: Path, entry: dict, *, reason: str) -> None:
         claim.unlink()
 
 
+class _RemoteDrainBlocked(RuntimeError):
+    def __init__(self, message: str, *, code: str = "blocked") -> None:
+        self.code = code
+        super().__init__(message)
+
+
+def _remote_drain_node(args) -> str | None:
+    node = getattr(args, "remote_node", None)
+    if node is None:
+        return None
+    node = str(node).strip()
+    return node or None
+
+
+def _remote_drain_fleet_dir(args) -> Path:
+    raw = getattr(args, "fleet_dir", None)
+    if raw:
+        return Path(str(raw)).expanduser()
+    import goalflight_fleet_store as fleet
+
+    return fleet.default_fleet_dir()
+
+
+def _validate_remote_drain_node(args) -> Path:
+    node = _remote_drain_node(args)
+    if not node:
+        raise _RemoteDrainBlocked("--remote-node requires a non-empty node name", code="unknown_node")
+    fleet_dir = _remote_drain_fleet_dir(args)
+    fleet_path = fleet_dir / "fleet.json"
+    if not fleet_path.exists():
+        raise _RemoteDrainBlocked(f"fleet store missing: {fleet_path}", code="fleet_missing")
+    try:
+        import goalflight_fleet_store as fleet
+
+        fleet_doc = fleet.read_json(fleet_path)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise _RemoteDrainBlocked(f"fleet store unreadable: {type(exc).__name__}", code="fleet_unreadable") from exc
+    node_entry = (fleet_doc.get("nodes") or {}).get(node)
+    if not isinstance(node_entry, dict):
+        raise _RemoteDrainBlocked(f"unknown node: {node}", code="unknown_node")
+    return fleet_dir
+
+
+def _remote_drain_agent(entry: dict) -> str:
+    request = entry.get("request") if isinstance(entry.get("request"), dict) else {}
+    raw = str(entry.get("agent") or request.get("agent") or "codex").strip().lower()
+    aliases = {
+        "worker": "codex-acp",
+        "codex": "codex-acp",
+        "codex-acp": "codex-acp",
+        "grok": "grok-acp",
+        "grok-code": "grok-acp",
+        "grok-research": "grok-acp",
+        "grok-acp": "grok-acp",
+        "cursor": "cursor",
+        "cursor-agent": "cursor",
+        "claude": "claude-acp",
+        "claude-acp": "claude-acp",
+        "claude-code-cli-acp": "claude-acp",
+    }
+    agent = aliases.get(raw)
+    if not agent:
+        raise _RemoteDrainBlocked(f"unsupported remote drain agent: {raw}", code="unsupported_agent")
+    return agent
+
+
+def _remote_drain_prompt(entry: dict) -> str:
+    request = entry.get("request") if isinstance(entry.get("request"), dict) else {}
+    prompt = request.get("prompt")
+    if isinstance(prompt, str) and prompt:
+        return prompt
+    prompt_file = request.get("prompt_file")
+    if not prompt_file:
+        raise _RemoteDrainBlocked("remote drain requires a queued --prompt or --prompt-file", code="missing_prompt")
+    path = Path(str(prompt_file)).expanduser()
+    if not path.is_absolute():
+        base = Path(str(entry.get("process_cwd") or entry.get("project_root") or Path.cwd()))
+        path = base / path
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise _RemoteDrainBlocked(f"prompt file unreadable: {type(exc).__name__}: {path}", code="prompt_unreadable") from exc
+
+
+def _remote_drain_base_sha(entry: dict) -> str:
+    request = entry.get("request") if isinstance(entry.get("request"), dict) else {}
+    for source, raw in (
+        ("request.base_sha", request.get("base_sha")),
+        ("entry.base_sha", entry.get("base_sha")),
+    ):
+        if not raw:
+            continue
+        value = str(raw).strip()
+        if _valid_lower_base_sha(value):
+            return value
+        raise _RemoteDrainBlocked(f"invalid remote drain base sha in {source}: {raw}", code="invalid_base_sha")
+    raise _RemoteDrainBlocked(
+        "remote drain requires a queued submit-time base_sha; re-submit the entry from the intended base",
+        code="base_sha_unavailable",
+    )
+
+
+def _remote_drain_billing_account(entry: dict) -> str | None:
+    request = entry.get("request") if isinstance(entry.get("request"), dict) else {}
+    raw = request.get("billing_account") or entry.get("billing_account")
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    account = request.get("account")
+    if isinstance(account, str) and account.strip():
+        mapped = account.strip()
+        if "/" in mapped:
+            return mapped
+        raise _RemoteDrainBlocked(
+            f"unsupported remote account mapping for queued --account {mapped!r}; persist a fleet billing_account",
+            code="unsupported_account_mapping",
+        )
+    return None
+
+
+def _drain_launch_remote_claim(
+    args,
+    entry: dict,
+    *,
+    dispatch_id: str,
+    launch_token: str,
+    claim: Path,
+) -> subprocess.CompletedProcess[str]:
+    node = _remote_drain_node(args)
+    if not node:
+        raise _RemoteDrainBlocked("--remote-node missing", code="unknown_node")
+    fleet_dir = _validate_remote_drain_node(args)
+    try:
+        import goalflight_fleet_dispatch as fleet_dispatch
+    except ImportError as exc:
+        raise _RemoteDrainBlocked(f"fleet dispatch unavailable: {exc}", code="fleet_unavailable") from exc
+
+    _mark_queue_claim_launch_started(
+        argparse.Namespace(
+            from_queue=True,
+            queue_claim_path=str(claim),
+            queue_launch_token=launch_token,
+        )
+    )
+    try:
+        preview = fleet_dispatch.preview_dispatch(
+            fleet_dir,
+            node_id=node,
+            agent=_remote_drain_agent(entry),
+            billing_account=_remote_drain_billing_account(entry),
+            prompt=_remote_drain_prompt(entry),
+            dispatch_id=dispatch_id,
+            base_sha=_remote_drain_base_sha(entry),
+            thin_mode=True,
+        )
+        runner = getattr(args, "remote_runner", None)
+        if runner is None:
+            fleet_dispatch.assert_live_ssh_opt_in()
+        result = fleet_dispatch.execute_dispatch(
+            fleet_dir,
+            preview,
+            runner=runner,
+            dispatch_mode="one-shot",
+            tool_smoke_policy=getattr(args, "remote_tool_smoke", "auto"),
+            queue_launch_token=launch_token,
+        )
+    except fleet_dispatch.DispatchGateError as exc:
+        raise _RemoteDrainBlocked(str(exc), code=getattr(exc, "code", "blocked")) from exc
+    except fleet_dispatch.DispatchError as exc:
+        raise _RemoteDrainBlocked(str(exc), code="dispatch_error") from exc
+
+    return subprocess.CompletedProcess(
+        ["remote-drain", node, dispatch_id],
+        0,
+        stdout="DISPATCH-LAUNCHED "
+        + json.dumps(
+            {
+                "dispatch_id": dispatch_id,
+                "node": node,
+                "transport": "fleet-ssh",
+                "launch_unconfirmed": bool(result.get("launch_unconfirmed")),
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        stderr="",
+    )
+
+
 def _drain_launch_argv(
     dispatch_argv: list[str],
     *,
@@ -2464,10 +2642,61 @@ def _mark_claim_worker_dead(entry: dict, *, reason: str) -> None:
         )
 
 
+def _drain_prelaunch_hook_path() -> Path:
+    """Optional operator pre-launch hook, run once per local drain pass just before
+    workers are launched. Almost always absent; an operator may install one to react
+    to what is about to be launched. Configurable via GOALFLIGHT_DRAIN_PRELAUNCH_HOOK.
+    """
+    env = os.environ.get("GOALFLIGHT_DRAIN_PRELAUNCH_HOOK")
+    if env:
+        return Path(env).expanduser()
+    return SCRIPT_DIR / "ext" / "drain-prelaunch-hook"
+
+
+def _pass_agent_labels(entries) -> list[str]:
+    """Best-effort distinct agent labels from the pre-scan of this drain pass, passed
+    to the optional pre-launch hook so it can scope its work. Pre-scan may be partial,
+    so this is advisory only."""
+    labels: set[str] = set()
+    for _sort_key, _path, scan_entry, _err in entries:
+        if isinstance(scan_entry, dict) and scan_entry.get("agent"):
+            labels.add(str(scan_entry["agent"]))
+    return sorted(labels)
+
+
+def _run_drain_prelaunch_hook(agents: list[str]) -> None:
+    """Run the optional pre-launch hook if installed, passing the agent label(s) for
+    this pass. No-op when absent; best-effort and time-bounded; never blocks or fails
+    a drain (all errors swallowed)."""
+    hook = _drain_prelaunch_hook_path()
+    try:
+        if not hook.exists():
+            return
+        subprocess.run(
+            [str(hook), *agents],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except Exception:
+        pass
+
+
 def _drain_queue_once(args) -> dict:
     queue_dir = Path(args.queue_dir).expanduser() if args.queue_dir else _dispatch_queue_dir()
     queue_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    _release_stale_capacity_for_drain()
+    remote_node = _remote_drain_node(args)
+    if remote_node:
+        _validate_remote_drain_node(args)
+        if getattr(args, "remote_runner", None) is None:
+            try:
+                import goalflight_fleet_dispatch as fleet_dispatch
+
+                fleet_dispatch.assert_live_ssh_opt_in()
+            except Exception as exc:
+                raise _RemoteDrainBlocked(str(exc), code="live_ssh_required") from exc
+    else:
+        _release_stale_capacity_for_drain()
     recovery = _recover_claimed_queue_entries(queue_dir, stale_s=args.claim_stale_s)
     launched = 0
     left_queued = 0
@@ -2477,6 +2706,8 @@ def _drain_queue_once(args) -> dict:
     entries = sorted(_queue_entry_drain_candidate(path) for path in queue_dir.glob("*.json"))
     if args.limit and args.limit > 0:
         entries = entries[: args.limit]
+    if not remote_node and entries:
+        _run_drain_prelaunch_hook(_pass_agent_labels(entries))
     for _sort_key, path, _scan_entry, _scan_read_error in entries:
         with _queue_mutation_lock(queue_dir):
             claim = _claim_queue_entry(path)
@@ -2524,15 +2755,36 @@ def _drain_queue_once(args) -> dict:
             continue
         timeout_s = max(20.0, float(args.capacity_wait_s or 0.0) + 45.0)
         try:
-            proc = subprocess.run(
-                [sys.executable, str(Path(__file__).resolve()), *launch_argv],
-                cwd=str(Path(entry.get("process_cwd") or entry.get("project_root") or Path.cwd()).resolve()),
-                env=os.environ.copy(),
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=timeout_s,
+            if remote_node:
+                proc = _drain_launch_remote_claim(
+                    args,
+                    entry,
+                    dispatch_id=dispatch_id,
+                    launch_token=launch_token,
+                    claim=claim,
+                )
+            else:
+                proc = subprocess.run(
+                    [sys.executable, str(Path(__file__).resolve()), *launch_argv],
+                    cwd=str(Path(entry.get("process_cwd") or entry.get("project_root") or Path.cwd()).resolve()),
+                    env=os.environ.copy(),
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=timeout_s,
+                )
+        except _RemoteDrainBlocked as exc:
+            restored = _restore_claimed_entry(claim, entry)
+            _restore_queued_record_from_entry(entry, restored)
+            left_queued += 1
+            details.append(
+                {
+                    "dispatch_id": dispatch_id,
+                    "state": "queued",
+                    "reason": f"remote_blocked:{exc.code}:{exc}",
+                }
             )
+            continue
         except subprocess.TimeoutExpired:
             pending_claims += 1
             failed += 1
@@ -2544,9 +2796,10 @@ def _drain_queue_once(args) -> dict:
                 }
             )
             continue
-        launched_ok = proc.returncode == 0 and "DISPATCH-LAUNCHED " in proc.stdout
+        stdout_launched = proc.returncode == 0 and "DISPATCH-LAUNCHED " in proc.stdout
+        ledger_confirmed = _dispatch_has_worker_record(dispatch_id, queue_launch_token=launch_token)
         no_capacity = proc.returncode == 2 and "blocked_capacity" in (proc.stdout + proc.stderr)
-        if launched_ok:
+        if stdout_launched and ledger_confirmed:
             with contextlib.suppress(OSError):
                 claim.unlink()
             launched += 1
@@ -2558,7 +2811,7 @@ def _drain_queue_once(args) -> dict:
             left_queued += 1
             details.append({"dispatch_id": dispatch_id, "state": "queued", "reason": "capacity_unavailable"})
             continue
-        if _dispatch_has_worker_record(dispatch_id, queue_launch_token=launch_token):
+        if ledger_confirmed:
             with contextlib.suppress(OSError):
                 claim.unlink()
             launched += 1
@@ -2589,7 +2842,7 @@ def _drain_queue_once(args) -> dict:
 
 def _drain_error_payload(args, exc: BaseException) -> dict:
     queue_dir = Path(args.queue_dir).expanduser() if args.queue_dir else _dispatch_queue_dir()
-    return {
+    payload = {
         "schema": f"{DISPATCH_QUEUE_SCHEMA}.drain.v1",
         "queue_dir": str(queue_dir),
         "launched": 0,
@@ -2601,6 +2854,11 @@ def _drain_error_payload(args, exc: BaseException) -> dict:
         "details": [],
         "error": f"{type(exc).__name__}: {exc}",
     }
+    if isinstance(exc, _RemoteDrainBlocked):
+        payload["blocked"] = True
+        payload["error"] = f"DISPATCH-BLOCKED {exc}"
+        payload["code"] = exc.code
+    return payload
 
 
 def _cmd_drain(argv: list[str]) -> int:
@@ -2609,10 +2867,18 @@ def _cmd_drain(argv: list[str]) -> int:
     parser.add_argument("--capacity-wait-s", type=float, default=0.0)
     parser.add_argument("--claim-stale-s", type=float, default=QUEUE_CLAIM_STALE_S)
     parser.add_argument("--limit", type=int, default=0, help="maximum queue entries to inspect; 0 = all")
+    parser.add_argument("--remote-node", help="Launch claimed queue entries on this fleet node instead of locally.")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     try:
         payload = _drain_queue_once(args)
+    except _RemoteDrainBlocked as exc:
+        payload = _drain_error_payload(args, exc)
+        if args.json:
+            print(json.dumps(payload, sort_keys=True))
+        else:
+            print(payload["error"], file=sys.stderr)
+        return 2
     except (OSError, RuntimeError) as exc:
         payload = _drain_error_payload(args, exc)
         if args.json:
@@ -2710,7 +2976,7 @@ def _build_acp_cfg(args, *, status_json: Path):
         mode="one-shot",
         idle_timeout=float(args.max_idle_secs or 300.0),
         status_json=str(status_json),
-        context_mode="enabled",
+        context_mode=_acp_context_mode_default(args),
         os_sandbox=os_sandbox,
         permission_mode=getattr(args, "permission_mode", "auto"),
         permission_dir=getattr(args, "permission_dir", None),
@@ -3093,6 +3359,28 @@ def _registration_error(step: str, exc: Exception) -> dict:
     return {"step": step, "reason": f"{type(exc).__name__}: {exc}"}
 
 
+def _codex_context_mode_enabled() -> bool:
+    """Whether a dispatched codex worker should load the context-mode MCP server.
+
+    Default OFF: context-mode's elicitation (ctx_index 'Approve Index Content')
+    issues request_user_input, which codex `exec` does not support -> the worker
+    wedges. Headless workers don't need it. Opt back in (rarely wanted) with
+    GOALFLIGHT_CODEX_CONTEXT_MODE in {1,true,yes,enabled,on}.
+    """
+    raw = os.environ.get("GOALFLIGHT_CODEX_CONTEXT_MODE", "").strip().lower()
+    return raw in {"1", "true", "yes", "enabled", "on"}
+
+
+def _acp_context_mode_default(args) -> str:
+    """codex-acp shares the exec-mode elicitation wedge risk, so default its
+    context-mode posture OFF (opt back in via GOALFLIGHT_CODEX_CONTEXT_MODE).
+    Other acp engines (grok-acp, cursor) keep context-mode enabled."""
+    agent = str(getattr(args, "agent", ""))
+    if agent.startswith("codex") and not _codex_context_mode_enabled():
+        return "disabled"
+    return "enabled"
+
+
 def build_worker(args, prompt_path, raw_argv: list[str]):
     """Return (argv, stdin_path). Explicit `-- <cmd>` overrides any preset.
     Presets encode the canonical SAFE, non-interactive invocation per worker.
@@ -3104,6 +3392,10 @@ def build_worker(args, prompt_path, raw_argv: list[str]):
     if args.agent == "codex":
         argv = ["codex", "exec", "--skip-git-repo-check", "--sandbox", sandbox,
                 "-c", "approval_policy=never"]
+        if not _codex_context_mode_enabled():
+            # Disable context-mode at the worker boundary (see _codex_context_mode_enabled);
+            # leaves the user's ~/.codex/config.toml untouched for interactive use.
+            argv += ["-c", "mcp_servers.context-mode.enabled=false"]
         if model:
             argv += ["--model", str(model)]
         if args.cwd:
@@ -3604,6 +3896,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         if watch_identity_token:
             watch_cmd += ["--worker-identity-json", json.dumps(watch_identity_token, sort_keys=True)]
+        if args.launch_detached:
+            watch_cmd += ["--detached"]
         if args.controller_pid:
             watch_cmd += ["--controller-pid", str(args.controller_pid)]
         if prompt_path:
@@ -3616,6 +3910,7 @@ def main(argv: list[str] | None = None) -> int:
                 "dispatch_id": args.dispatch_id,
                 "agent": args.agent,
                 "worker_pid": worker_pid,
+                "detached": bool(args.launch_detached),
                 "pgid": pgid,
                 "worker_alive": True,
                 "worker_identity": worker_identity_token,

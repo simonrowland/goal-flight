@@ -826,16 +826,88 @@ def case_runner_remote_dead_silent_turn_hits_remote_wall() -> None:
 
 
 @skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")
+def case_runner_max_quiet_requires_confirmed_idle_cpu() -> None:
+    returncode, status, stdout, stderr = _run_fake_runner(
+        "long_reasoning_pause",
+        progress_stall_s=30.0,
+        heartbeat_interval=0.05,
+        wedge_samples=99,
+        idle_timeout=5.0,
+        max_quiet_s=0.05,
+        max_tool_s=30.0,
+        extra_env={
+            "GOALFLIGHT_FAKE_ACP_LONG_PAUSE_S": "0.6",
+            "GOALFLIGHT_TEST_MODE": "1",
+            "GOALFLIGHT_TEST_PGROUP_CPU_PCT": "unavailable",
+        },
+        timeout_s=30.0,
+    )
+
+    assert returncode == 0, (stdout, stderr, status)
+    assert status["state"] == "complete", status
+    assert status["ok"] is True, status
+    assert status.get("error") is None, status
+
+
+@skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")
+def case_runner_max_quiet_kills_confirmed_idle_cpu() -> None:
+    returncode, status, stdout, stderr = _run_fake_runner(
+        "long_reasoning_pause",
+        progress_stall_s=30.0,
+        heartbeat_interval=0.05,
+        wedge_samples=99,
+        idle_timeout=5.0,
+        max_quiet_s=0.05,
+        max_tool_s=30.0,
+        extra_env={
+            "GOALFLIGHT_FAKE_ACP_LONG_PAUSE_S": "0.6",
+            "GOALFLIGHT_TEST_MODE": "1",
+            "GOALFLIGHT_TEST_PGROUP_CPU_PCT": "0.0",
+        },
+        timeout_s=30.0,
+    )
+
+    assert returncode != 0, (stdout, stderr, status)
+    assert status["state"] == "wedged", status
+    assert status["error"]["message"] == "max_quiet_s", status
+    assert status["error"]["cpu_pct"] == 0.0, status
+    assert status["worker_alive"] is False, status
+
+
+@skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")
+def case_runner_max_quiet_ignores_busy_cpu() -> None:
+    returncode, status, stdout, stderr = _run_fake_runner(
+        "long_reasoning_pause",
+        progress_stall_s=30.0,
+        heartbeat_interval=0.05,
+        wedge_samples=99,
+        idle_timeout=5.0,
+        max_quiet_s=0.05,
+        max_tool_s=30.0,
+        extra_env={
+            "GOALFLIGHT_FAKE_ACP_LONG_PAUSE_S": "0.6",
+            "GOALFLIGHT_TEST_MODE": "1",
+            "GOALFLIGHT_TEST_PGROUP_CPU_PCT": "5.0",
+        },
+        timeout_s=30.0,
+    )
+
+    assert returncode == 0, (stdout, stderr, status)
+    assert status["state"] == "complete", status
+    assert status["ok"] is True, status
+
+
+@skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")
 def case_runner_thought_stream_survives_progress_stall_wall() -> None:
     returncode, status, stdout, stderr = _run_fake_runner(
         "thought_stream_pause",
-        progress_stall_s=0.3,
+        progress_stall_s=0.5,
         heartbeat_interval=0.05,
         idle_timeout=0.0,
         max_quiet_s=30.0,
         extra_env={
-            "GOALFLIGHT_FAKE_ACP_INTERVAL": "0.2",
-            "GOALFLIGHT_FAKE_ACP_THOUGHT_CHUNKS": "5",
+            "GOALFLIGHT_FAKE_ACP_INTERVAL": "0.1",
+            "GOALFLIGHT_FAKE_ACP_THOUGHT_CHUNKS": "10",
         },
         timeout_s=30.0,
     )
@@ -1441,6 +1513,9 @@ def main() -> None:
     case_runner_progress_then_silent_wedges_and_reaps()
     case_runner_remote_long_reasoning_pause_survives_old_walls()
     case_runner_remote_dead_silent_turn_hits_remote_wall()
+    case_runner_max_quiet_requires_confirmed_idle_cpu()
+    case_runner_max_quiet_kills_confirmed_idle_cpu()
+    case_runner_max_quiet_ignores_busy_cpu()
     case_runner_thought_stream_survives_progress_stall_wall()
     case_terminal_state_endturn_beats_tail_race_wedge()
     case_runner_blocked_none_completes()

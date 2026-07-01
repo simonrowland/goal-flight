@@ -17,7 +17,8 @@ three break on native Windows (``os.name == "nt"``):
     ``docs-private/research/2026-05-29-windows-CONVERGED-HANDOFF.md`` P0-A.
 
 This module is a drop-in subset of ``fcntl`` (``flock`` + ``LOCK_*``) PLUS the
-Windows-safe helpers ``is_windows()`` / ``pid_alive()`` / ``default_state_dir()``.
+Windows-safe helpers ``is_windows()`` / ``pid_alive()`` / ``default_state_dir()`` /
+``resolve_state_dir()``.
 POSIX behavior is preserved byte-for-byte (paths stay under ``/tmp``; ``flock``
 delegates to the real ``fcntl``; ``pid_alive`` is the same ``os.kill(pid, 0)``).
 The Windows branches use stdlib ``ctypes`` / ``msvcrt`` only -- zero new wheels.
@@ -26,6 +27,7 @@ The Windows branches use stdlib ``ctypes`` / ``msvcrt`` only -- zero new wheels.
 from __future__ import annotations
 
 import errno
+import hashlib
 import json
 import logging
 import os
@@ -35,6 +37,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -67,12 +70,34 @@ __all__ = [
     "kill_pid",
     "default_state_dir",
     "temp_base",
+    "nearest_existing_path",
+    "safe_dispatch_filename",
+    "tokenize_args",
 ]
 
 
 log = logging.getLogger("goal-flight.compat")
 
 _WSL_WINDOWS_FS_TYPES = {"drvfs", "9p", "v9fs"}
+
+
+def safe_dispatch_filename(dispatch_id: str) -> str:
+    safe = "".join(ch if ch.isalnum() or ch in "._-" else "-" for ch in dispatch_id)
+    if safe != dispatch_id:
+        safe = f"{safe}-{hashlib.sha256(dispatch_id.encode()).hexdigest()[:8]}"
+    return safe
+
+
+def tokenize_args(values: Iterable[str]) -> list[str]:
+    tokens: list[str] = []
+    for value in values:
+        if not isinstance(value, str):
+            continue
+        try:
+            tokens.extend(shlex.split(value))
+        except ValueError:
+            tokens.append(value)
+    return tokens
 
 
 def is_windows() -> bool:
@@ -121,7 +146,7 @@ def _syntactic_wsl_drive_path(path: Path) -> bool:
     )
 
 
-def _nearest_existing_path(path: Path) -> Path | None:
+def nearest_existing_path(path: Path) -> Path | None:
     current = path.expanduser()
     while True:
         if current.exists():
@@ -129,6 +154,10 @@ def _nearest_existing_path(path: Path) -> Path | None:
         if current.parent == current:
             return None
         current = current.parent
+
+
+def _nearest_existing_path(path: Path) -> Path | None:
+    return nearest_existing_path(path)
 
 
 def _decode_mountinfo_path(value: str) -> str:
@@ -760,10 +789,32 @@ def default_state_dir() -> Path:
     """``<temp_base>/goal-flight-<uid-or-username>``.
 
     On POSIX this equals the historical ``/tmp/goal-flight-<os.getuid()>`` exactly.
-    Callers that honor ``$GOALFLIGHT_STATE_DIR`` keep their own env check and use
-    this as the fallback default.
+    Callers that honor ``$GOALFLIGHT_STATE_DIR`` should use
+    ``resolve_state_dir()`` so blank values fall back consistently.
     """
     return temp_base() / f"goal-flight-{_uid_tag()}"
+
+
+def resolve_state_dir() -> Path:
+    """Resolve ``$GOALFLIGHT_STATE_DIR`` with blank/whitespace falling back.
+
+    ``os.environ.get("GOALFLIGHT_STATE_DIR", default)`` does not use the default
+    when the variable is set to ``""``. Returning ``Path("")`` scatters state
+    into the caller's cwd, so all state-dir users go through this call-time
+    resolver.
+    """
+    raw = os.environ.get("GOALFLIGHT_STATE_DIR", "").strip()
+    if raw:
+        return Path(raw).expanduser()
+    return default_state_dir()
+
+
+def resolve_env_path(var: str, default) -> Path:
+    """Resolve a path-valued env var with blank/whitespace falling back."""
+    raw = os.environ.get(var, "").strip()
+    if raw:
+        return Path(raw).expanduser()
+    return Path(default).expanduser()
 
 
 # --------------------------------------------------------------------------- #

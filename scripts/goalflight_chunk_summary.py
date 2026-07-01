@@ -13,20 +13,16 @@ import sys
 from typing import Any
 
 import goalflight_compat
-import goalflight_dispatch_states
+import goalflight_dispatch_states as dispatch_states
+import goalflight_status
+from goalflight_watch import BLOCKING_TERMINAL_MARKERS, SUCCESS_TERMINAL_MARKERS
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_STATE_DIR = Path(os.environ.get("GOALFLIGHT_STATE_DIR", goalflight_compat.default_state_dir()))
-TERMINAL_DONE = {"complete", "released"}
-WEDGED_STATES = {"idle_timeout", "wedged"}
-RUNNING_NONTERMINAL_STATES = {"watcher_stopped", "waiting_capacity"}
-TERMINAL_FAILED = (
-    set(goalflight_dispatch_states.TERMINAL_FAILURE_STATES)
-    - TERMINAL_DONE
-    - WEDGED_STATES
-    - RUNNING_NONTERMINAL_STATES
-)
-RETRYABLE_FAILED = {"rate_limited"}
+DEFAULT_STATE_DIR = goalflight_compat.resolve_state_dir()
+TERMINAL_DONE = dispatch_states.SUCCESS_TERMINAL_RECORD_STATES
+TERMINAL_FAILED = dispatch_states.FAILURE_TERMINAL_RECORD_STATES
+WEDGED_STATES = dispatch_states.WEDGED_TERMINAL_RECORD_STATES
+RETRYABLE_FAILED = frozenset({"rate_limited"})
 
 
 def parse_time(value: Any) -> dt.datetime | None:
@@ -52,12 +48,6 @@ def age_mins(value: Any) -> int | None:
         return None
     seconds = (dt.datetime.now(dt.timezone.utc) - parsed).total_seconds()
     return max(0, int(seconds // 60))
-
-
-def pid_alive(pid: Any) -> bool:
-    if pid in (None, ""):
-        return False
-    return goalflight_compat.pid_alive(pid)
 
 
 def read_json(path: Path | None) -> dict[str, Any] | None:
@@ -163,10 +153,10 @@ def last_marker_kind(status: dict[str, Any] | None) -> str | None:
 def canonical_state(value: str | None) -> str | None:
     if not value:
         return None
-    return goalflight_dispatch_states.normalize_dispatch_state(value) or value
+    return dispatch_states.normalize_dispatch_state(value) or value
 
 
-def state_in(value: str | None, states: set[str]) -> bool:
+def state_in(value: str | None, states: set[str] | frozenset[str]) -> bool:
     return bool(value and (value in states or canonical_state(value) in states))
 
 
@@ -176,16 +166,48 @@ def retryable_failure_present(record: dict[str, Any] | None, status: dict[str, A
     return state_in(status_state, RETRYABLE_FAILED) or state_in(record_state, RETRYABLE_FAILED)
 
 
-def normalize_state(record: dict[str, Any] | None, status: dict[str, Any] | None, lease: dict[str, Any] | None) -> str:
-    marker = last_marker_kind(status)
+def runtime_record(
+    record: dict[str, Any] | None,
+    status: dict[str, Any] | None,
+    lease: dict[str, Any] | None,
+    status_path: Path | None = None,
+) -> dict[str, Any] | None:
+    combined: dict[str, Any] = {}
+    for source in (lease, record, status):
+        if not isinstance(source, dict):
+            continue
+        for key, value in source.items():
+            if value is not None and value != "":
+                combined[key] = value
+    if status_path is not None:
+        combined.setdefault("status_path", str(status_path))
+    return combined or None
+
+
+def worker_alive_at_read_time(record: dict[str, Any] | None) -> bool:
+    if not record:
+        return False
+    return goalflight_status._wait_worker_confirmed_alive(record)
+
+
+def normalize_state(
+    record: dict[str, Any] | None,
+    status: dict[str, Any] | None,
+    lease: dict[str, Any] | None,
+    *,
+    worker_live: bool = False,
+) -> str:
+    marker = last_marker_kind(status) or last_marker_kind(record)
     status_state = str(status.get("state")) if status and status.get("state") else None
     record_state = str(record.get("state")) if record and record.get("state") else None
 
-    if marker in {"RESULT", "COMPLETE"} or status_state in TERMINAL_DONE or record_state in TERMINAL_DONE:
+    if marker in SUCCESS_TERMINAL_MARKERS or status_state in TERMINAL_DONE or record_state in TERMINAL_DONE:
         return "complete"
-    if marker in {"BLOCKED", "USER-NEED", "USER-CONFIRM"}:
+    if marker in BLOCKING_TERMINAL_MARKERS:
         return "failed"
     if state_in(status_state, WEDGED_STATES) or state_in(record_state, WEDGED_STATES):
+        if worker_live:
+            return "running"
         return "wedged"
     if state_in(status_state, TERMINAL_FAILED) or state_in(record_state, TERMINAL_FAILED):
         return "failed"
@@ -259,13 +281,16 @@ def summarize(slug: str, state_dir: Path) -> dict[str, Any]:
     records = ledger_records(state_dir)
     record, lease = choose_record(slug, records, leases)
     status, status_path = load_status(slug, record)
-    worker_pid = (status or {}).get("worker_pid") or (record or {}).get("worker_pid") or (lease or {}).get("worker_pid")
-    state = normalize_state(record, status, lease)
-    retryable = retryable_failure_present(record, status)
+    merged = runtime_record(record, status, lease, status_path)
+    reconciled = goalflight_status._reconcile_output_tail_record(merged) if merged else None
+    worker_pid = (reconciled or {}).get("worker_pid") or (status or {}).get("worker_pid") or (record or {}).get("worker_pid") or (lease or {}).get("worker_pid")
+    worker_live = worker_alive_at_read_time(reconciled or merged)
+    state = normalize_state(reconciled or record, status, lease, worker_live=worker_live)
+    retryable = retryable_failure_present(reconciled or record, status)
     mins = age_mins(latest_timestamp(record, status, lease))
-    log_path = (status or {}).get("tail_path") or (record or {}).get("stdout_path") or (record or {}).get("stderr_path")
-    worker_live = pid_alive(worker_pid)
-    dispatch_id = (record or {}).get("dispatch_id") or (lease or {}).get("dispatch_id")
+    log_path = (reconciled or {}).get("tail_path") or (status or {}).get("tail_path") or (record or {}).get("stdout_path") or (record or {}).get("stderr_path")
+    dispatch_id = (reconciled or {}).get("dispatch_id") or (record or {}).get("dispatch_id") or (lease or {}).get("dispatch_id")
+    marker = last_marker_kind(status) or last_marker_kind(reconciled)
     return {
         "slug": slug,
         "dispatch_id": dispatch_id,
@@ -273,7 +298,7 @@ def summarize(slug: str, state_dir: Path) -> dict[str, Any]:
         "worker_pid_alive": worker_live,
         "status_path": str(status_path) if status_path else None,
         "log_path": str(log_path) if log_path else None,
-        "last_marker": last_marker_kind(status),
+        "last_marker": marker,
         "mins_since_last_event": mins,
         "decision_hint": decision_hint(state, worker_live, mins, retryable=retryable),
     }
@@ -292,7 +317,7 @@ def text_summary(payload: dict[str, Any]) -> str:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="summarize one goal-flight chunk dispatch")
     parser.add_argument("--slug", required=True, help="chunk slug or dispatch-id prefix")
-    parser.add_argument("--state-dir", default=str(DEFAULT_STATE_DIR))
+    parser.add_argument("--state-dir", default=str(goalflight_compat.resolve_state_dir()))
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--json", action="store_true", help="emit compact JSON")
     mode.add_argument("--text", action="store_true", help="emit one-line human verdict")

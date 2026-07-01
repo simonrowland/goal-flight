@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
-import os
 import uuid
 from pathlib import Path
 import sys
@@ -16,13 +15,18 @@ REPO_ROOT = SCRIPT_DIR.parent
 DEFAULT_CONTRACT = REPO_ROOT / "docs-private" / "architecture" / "contracts" / "goalflight.message.v1.json"
 AGGREGATE_SCHEMA = "goalflight.fleet.register.aggregate.v1"
 
+sys.path.insert(0, str(SCRIPT_DIR))
+
+import goalflight_compat  # noqa: E402
+from goalflight_watch import BLOCKING_TERMINAL_MARKERS, SUCCESS_TERMINAL_MARKERS  # noqa: E402
+
 MARKER_TO_TYPE: dict[str, str] = {
     "STATUS": "status",
-    "RESULT": "result",
+    "STEER-ACK": "monitor",
     "USER-NEED": "user_need",
     "USER-CONFIRM": "user_confirm",
-    "BLOCKED": "blocked",
-    "COMPLETE": "result",
+    **{kind: "result" for kind in SUCCESS_TERMINAL_MARKERS},
+    **{kind: "blocked" for kind in BLOCKING_TERMINAL_MARKERS - {"USER-NEED", "USER-CONFIRM"}},
 }
 
 PRIORITY_BY_TYPE: dict[str, str] = {
@@ -53,15 +57,15 @@ def utc_now() -> str:
 
 
 def default_messages_dir() -> Path:
-    return Path(
-        os.environ.get("GOALFLIGHT_MESSAGES_DIR", Path.home() / ".goal-flight" / "messages")
-    ).expanduser()
+    return goalflight_compat.resolve_env_path(
+        "GOALFLIGHT_MESSAGES_DIR", Path.home() / ".goal-flight" / "messages"
+    )
 
 
 def default_fleet_dir() -> Path:
-    return Path(
-        os.environ.get("GOALFLIGHT_FLEET_DIR", Path.home() / ".goal-flight" / "fleet")
-    ).expanduser()
+    return goalflight_compat.resolve_env_path(
+        "GOALFLIGHT_FLEET_DIR", Path.home() / ".goal-flight" / "fleet"
+    )
 
 
 def inbox_path(messages_dir: Path, dispatch_id: str) -> Path:
@@ -88,6 +92,11 @@ def validate_envelope(envelope: dict, *, path: str = "envelope") -> None:
 
 def read_envelopes(path: Path, *, last_n: int | None = None) -> list[dict]:
     if not path.exists():
+        return []
+    if not path.is_file():
+        # Non-regular inbox (FIFO/device): read_text()'s open() would block forever.
+        # is_file() is a non-blocking stat; treat a non-regular inbox as empty so no
+        # reader (build_aggregate, next_seq, the watcher bridge) can hang on it.
         return []
     envelopes: list[dict] = []
     for line_no, line in enumerate(path.read_text().splitlines(), start=1):
@@ -134,6 +143,11 @@ def post_message(
     if not isinstance(payload, dict):
         raise MessageError("payload must be an object")
     path = inbox_path(messages_dir, dispatch_id)
+    if path.exists() and not path.is_file():
+        # Fail CLOSED on a non-regular inbox (FIFO/device) before any open():
+        # open("a") below would block the caller forever. Centralised here so
+        # CLI / MCP / direct writers are all protected, not just the watcher bridge.
+        raise MessageError(f"{path}: inbox is not a regular file; refusing to write")
     resolved_seq = seq if seq is not None else next_seq(path)
     base_source = {
         "node": "local",
@@ -298,16 +312,31 @@ def _last_steering(envelopes_by_dispatch: dict[str, list[dict]]) -> dict | None:
     return latest
 
 
-def collect_inbox_paths(messages_dir: Path, fleet_dir: Path | None = None) -> list[Path]:
+def collect_inbox_paths(
+    messages_dir: Path,
+    fleet_dir: Path | None = None,
+    *,
+    dispatch_ids: set[str] | None = None,
+) -> list[Path]:
+    # Only REGULAR files are inbox candidates. A non-regular `*.jsonl` entry (a
+    # FIFO/device, accidental or hostile) would block a later read_text() open()
+    # indefinitely — which on the read-side status mail check would HANG status
+    # before its fail-open guard could fire. `is_file()` is a non-blocking stat()
+    # (open() is what blocks on a FIFO), so this filter is safe and cheap.
+    def _want(stem: str) -> bool:
+        return dispatch_ids is None or stem in dispatch_ids
+
     paths: dict[str, Path] = {}
     if messages_dir.is_dir():
         for path in sorted(messages_dir.glob("*.jsonl")):
-            paths[path.stem] = path
+            if path.is_file() and _want(path.stem):
+                paths[path.stem] = path
     if fleet_dir is not None:
         register_dir = fleet_dir / "register" / "dispatches"
         if register_dir.is_dir():
             for path in sorted(register_dir.glob("*.jsonl")):
-                paths[path.stem] = path
+                if path.is_file() and _want(path.stem):
+                    paths[path.stem] = path
     return list(paths.values())
 
 
@@ -315,11 +344,16 @@ def build_aggregate(
     *,
     messages_dir: Path,
     fleet_dir: Path | None = None,
+    dispatch_ids: set[str] | None = None,
 ) -> dict:
     envelopes_by_dispatch: dict[str, list[dict]] = {}
-    for path in collect_inbox_paths(messages_dir, fleet_dir):
-        dispatch_id = path.stem
-        envelopes_by_dispatch[dispatch_id] = read_envelopes(path)
+    for path in collect_inbox_paths(messages_dir, fleet_dir, dispatch_ids=dispatch_ids):
+        try:
+            envelopes_by_dispatch[path.stem] = read_envelopes(path)
+        except MessageError:
+            # One malformed/unreadable inbox must NOT suppress everyone else's mail
+            # (a scoped status reads only its own inbox, but be tolerant regardless).
+            continue
 
     open_user_needs: list[dict] = []
     active_dispatches: list[str] = []
@@ -428,6 +462,66 @@ def format_controller_relay(aggregate: dict) -> str | None:
             text = text[:117] + "..."
         parts.append(f"[{dispatch_id}] {kind}: {text}")
     return "USER-NEED relay: " + " | ".join(parts)
+
+
+def _clip(text: object, limit: int = 100) -> str:
+    s = str(text or "").strip().replace("\n", " ")
+    return s if len(s) <= limit else s[: limit - 3] + "..."
+
+
+def _format_mail_hint(items: list[dict]) -> str:
+    """Multi-line controller hint: a header plus one detail line per open need,
+    each with the dispatch id, kind, and a clipped text so the controller can
+    follow up straight from a status check."""
+    head = f"\U0001f4ec mail: {len(items)} open need(s) from your worker(s) - run: goalflight_messages.py relay"
+    lines = [head]
+    for it in items[:5]:
+        lines.append(f"    [{it['dispatch_id']}] {it['type']}: {it['text']}")
+    if len(items) > 5:
+        lines.append(f"    (+{len(items) - 5} more)")
+    return "\n".join(lines)
+
+
+def controller_mail_summary(
+    *,
+    owned_dispatch_ids: set[str] | None = None,
+    messages_dir: Path | None = None,
+    fleet_dir: Path | None = None,
+) -> dict:
+    """Structured "you have mail" summary for a controller's status output.
+
+    Builds the inbox aggregate and returns the OPEN user-needs (user_need /
+    user_confirm / blocked) with enough detail to act on from a status check.
+
+    The mailbox is machine-global (shared across controllers), so when
+    ``owned_dispatch_ids`` is provided only needs from THOSE dispatches — the
+    controller's own workers — are surfaced; a controller must never see another
+    controller's workers' needs. ``None`` means no ownership filter (e.g. an
+    all-projects view). Returns ``{}`` when there is nothing to show.
+    """
+    # Read ONLY this controller's own inboxes: an unrelated controller's corrupt or
+    # large inbox can then neither suppress (a parse error elsewhere) nor slow this
+    # scoped status call. build_aggregate is also per-inbox tolerant as a backstop.
+    aggregate = build_aggregate(
+        messages_dir=messages_dir or default_messages_dir(),
+        fleet_dir=fleet_dir if fleet_dir is not None else default_fleet_dir(),
+        dispatch_ids=owned_dispatch_ids,
+    )
+    needs = aggregate.get("open_user_needs") or []
+    if owned_dispatch_ids is not None:
+        needs = [n for n in needs if str(n.get("dispatch_id") or "") in owned_dispatch_ids]
+    if not needs:
+        return {}
+    items = [
+        {
+            "dispatch_id": str(n.get("dispatch_id") or "?"),
+            "type": str(n.get("type") or "user_need"),
+            "seq": n.get("seq"),
+            "text": _clip(n.get("text")),
+        }
+        for n in needs
+    ]
+    return {"count": len(items), "needs": items, "hint": _format_mail_hint(items)}
 
 
 def cmd_relay(args: argparse.Namespace) -> int:

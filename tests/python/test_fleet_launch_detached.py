@@ -6,6 +6,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+import os
 import sys
 import tempfile
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
@@ -272,7 +273,12 @@ def test_read_only_recovery_inspection_preserves_status() -> None:
         try:
             args = _args(state_dir, dispatch_id, prompt_text, recover=True)
             stdout = io.StringIO()
-            with patched_spawn() as calls, redirect_stdout(stdout):
+            def fake_identity(pid: int) -> dict[str, Any] | None:
+                if pid == 12345:
+                    return dict(status_payload["worker_identity"])
+                return {"pid": pid, "lstart": "Thu Jun 11 12:00:01 2026", "comm": "python3"}
+
+            with patched_process_identity(fake_identity), patched_spawn() as calls, redirect_stdout(stdout):
                 code = fleet_launch._launch(args)
             receipt = json.loads(stdout.getvalue())
         finally:
@@ -346,6 +352,249 @@ def test_recovery_with_no_worker_proof_relaunches() -> None:
         assert_true("marker receipted", marker.get("state") == "receipted")
         assert_true("proof kept", marker.get("no_worker_proof") == "marker_state_spawn_failed")
         assert_true("recovery lock cleared", not (dispatch_dir / "launch_recovery.lock").exists())
+
+
+def test_recovery_ignores_dead_status_receipt_and_relaunches() -> None:
+    dispatch_id = "acp-recover-dead-status-receipt"
+    prompt_text = "retry prompt"
+    with tempfile.TemporaryDirectory() as td:
+        state_dir = Path(td) / "state"
+        dispatch_dir = state_dir / "dispatches" / dispatch_id
+        dispatch_dir.mkdir(parents=True, exist_ok=True)
+        status_json = dispatch_dir / "status.json"
+        status_json.write_text(
+            json.dumps(
+                {
+                    "schema": "goalflight.acp-run.v1",
+                    "seq": 4,
+                    "dispatch_id": dispatch_id,
+                    "state": "running",
+                    "worker_pid": 9999,
+                    "worker_identity": {
+                        "pid": 9999,
+                        "lstart": "Thu Jun 11 12:00:00 2026",
+                        "comm": "python3",
+                    },
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        args = _args(state_dir, dispatch_id, prompt_text, recover=True)
+        stdout = io.StringIO()
+
+        def fake_identity(pid: int) -> dict[str, Any] | None:
+            if pid == 9999:
+                return None
+            return {"pid": pid, "lstart": "Thu Jun 11 12:00:01 2026", "comm": "python3"}
+
+        with patched_process_identity(fake_identity), patched_spawn() as calls, redirect_stdout(stdout):
+            code = fleet_launch._launch(args)
+        receipt = json.loads(stdout.getvalue())
+        assert_true("launch ok", code == 0)
+        assert_true("spawned replacement", len(calls) == 1)
+        assert_true("new receipt", receipt.get("remote_pid") == 4242)
+        assert_true("not reused dead receipt", receipt.get("reused") is not True)
+
+
+def test_recovery_stale_launching_without_pid_relaunches() -> None:
+    dispatch_id = "acp-recover-stale-launching-no-pid"
+    prompt_text = "retry prompt"
+    old_ts = (
+        datetime.now(timezone.utc)
+        - timedelta(seconds=fleet_launch.LAUNCHING_NO_PID_RECOVERY_SECONDS + 1)
+    ).isoformat(timespec="seconds")
+    with tempfile.TemporaryDirectory() as td:
+        state_dir = Path(td) / "state"
+        dispatch_dir = state_dir / "dispatches" / dispatch_id
+        dispatch_dir.mkdir(parents=True, exist_ok=True)
+        _write_marker(
+            state_dir,
+            dispatch_id,
+            {
+                "schema": fleet_launch.MARKER_SCHEMA,
+                "dispatch_id": dispatch_id,
+                "node_id": "localhost",
+                "state": "launching",
+                "prompt_sha256": fleet_launch._prompt_sha256(prompt_text),
+                "updated_at": old_ts,
+            },
+        )
+        args = _args(state_dir, dispatch_id, prompt_text, recover=True)
+        stdout = io.StringIO()
+        with patched_spawn() as calls, redirect_stdout(stdout):
+            code = fleet_launch._launch(args)
+        marker = json.loads((dispatch_dir / "launch_marker.json").read_text(encoding="utf-8"))
+        assert_true("launch ok", code == 0)
+        assert_true("spawned recovery", len(calls) == 1)
+        assert_true("stale launching proof", marker.get("no_worker_proof") == "marker_state_launching_no_pid_stale")
+
+
+def test_recovery_timestampless_launching_marker_uses_bounded_mtime_recovery() -> None:
+    dispatch_id = "acp-recover-timestampless-launching"
+    prompt_text = "retry prompt"
+    old_ts = datetime.now(timezone.utc) - timedelta(
+        seconds=fleet_launch.LAUNCHING_NO_PID_RECOVERY_SECONDS + 1
+    )
+    with tempfile.TemporaryDirectory() as td:
+        state_dir = Path(td) / "state"
+        dispatch_dir = state_dir / "dispatches" / dispatch_id
+        dispatch_dir.mkdir(parents=True, exist_ok=True)
+        marker_path = _write_marker(
+            state_dir,
+            dispatch_id,
+            {
+                "schema": fleet_launch.MARKER_SCHEMA,
+                "dispatch_id": dispatch_id,
+                "node_id": "localhost",
+                "state": "launching",
+                "prompt_sha256": fleet_launch._prompt_sha256(prompt_text),
+            },
+        )
+        os.utime(marker_path, (old_ts.timestamp(), old_ts.timestamp()))
+        args = _args(state_dir, dispatch_id, prompt_text, recover=True)
+        stdout = io.StringIO()
+        with patched_spawn() as calls, redirect_stdout(stdout):
+            code = fleet_launch._launch(args)
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        assert_true("launch ok", code == 0)
+        assert_true("spawned recovery", len(calls) == 1)
+        assert_true("bounded no-timestamp proof", marker.get("no_worker_proof") == "marker_state_launching_no_pid_stale")
+
+
+def test_recovery_fresh_launching_marker_beats_stale_dead_status() -> None:
+    dispatch_id = "acp-recover-fresh-launching-beats-status"
+    prompt_text = "retry prompt"
+    with tempfile.TemporaryDirectory() as td:
+        state_dir = Path(td) / "state"
+        dispatch_dir = state_dir / "dispatches" / dispatch_id
+        dispatch_dir.mkdir(parents=True, exist_ok=True)
+        status_json = dispatch_dir / "status.json"
+        status_json.write_text(
+            json.dumps(
+                {
+                    "schema": "goalflight.acp-run.v1",
+                    "seq": 4,
+                    "dispatch_id": dispatch_id,
+                    "state": "running",
+                    "worker_pid": 9999,
+                    "worker_identity": {
+                        "pid": 9999,
+                        "lstart": "Thu Jun 11 12:00:00 2026",
+                        "comm": "python3",
+                    },
+                    "updated_at": "2026-06-11T12:00:00+00:00",
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        marker_ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        _write_marker(
+            state_dir,
+            dispatch_id,
+            {
+                "schema": fleet_launch.MARKER_SCHEMA,
+                "dispatch_id": dispatch_id,
+                "node_id": "localhost",
+                "state": "launching",
+                "prompt_sha256": fleet_launch._prompt_sha256(prompt_text),
+                "updated_at": marker_ts,
+            },
+        )
+        args = _args(state_dir, dispatch_id, prompt_text, recover=True)
+        stderr = io.StringIO()
+
+        def fake_identity(pid: int) -> dict[str, Any] | None:
+            if pid == 9999:
+                return None
+            return {"pid": pid, "lstart": "Thu Jun 11 12:00:01 2026", "comm": "python3"}
+
+        with patched_process_identity(fake_identity), patched_spawn() as calls, redirect_stderr(stderr):
+            code = fleet_launch._launch(args)
+        assert_true("refused", code == 17)
+        assert_true("no second spawn", len(calls) == 0)
+        assert_true("fresh marker reason", "marker_state_launching_in_progress" in stderr.getvalue())
+
+
+def test_recover_unconfirmed_dead_status_resets_lineage_before_spawn() -> None:
+    dispatch_id = "acp-recover-dead-status-reset-before-spawn"
+    prompt_text = "retry prompt"
+    with tempfile.TemporaryDirectory() as td:
+        state_dir = Path(td) / "state"
+        dispatch_dir = state_dir / "dispatches" / dispatch_id
+        dispatch_dir.mkdir(parents=True, exist_ok=True)
+        status_json = dispatch_dir / "status.json"
+        status_json.write_text(
+            json.dumps(
+                {
+                    "schema": "goalflight.acp-run.v1",
+                    "seq": 7,
+                    "dispatch_id": dispatch_id,
+                    "state": "failed",
+                    "worker_alive": False,
+                    "worker_pid": 9999,
+                    "worker_identity": {
+                        "pid": 9999,
+                        "lstart": "Thu Jun 11 12:00:00 2026",
+                        "comm": "python3",
+                    },
+                    "epoch": "status-stale0003",
+                    "updated_at": "2026-06-11T12:00:00+00:00",
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        args = _args(state_dir, dispatch_id, prompt_text, recover=True)
+        reset_calls: list[Path] = []
+        status_present_at_spawn: list[bool] = []
+        old_reset = goalflight_liveness.reset_status_lineage
+        old_popen = fleet_launch.subprocess.Popen
+        old_identity = fleet_launch._process_identity
+        old_after_spawn = fleet_launch._process_identity_after_spawn
+        old_which = fleet_launch.shutil.which
+
+        def track_reset(path: Path) -> bool:
+            reset_calls.append(path)
+            return old_reset(path)
+
+        def fake_identity(pid: int) -> dict[str, Any] | None:
+            if pid == 9999:
+                return None
+            return {"pid": pid, "lstart": "Thu Jun 11 12:00:01 2026", "comm": "python3"}
+
+        def fake_popen(argv: list[str], **kwargs: Any) -> FakeProc:
+            status_present_at_spawn.append(status_json.exists())
+            return FakeProc()
+
+        goalflight_liveness.reset_status_lineage = track_reset
+        fleet_launch.reset_status_lineage = track_reset
+        fleet_launch.subprocess.Popen = fake_popen
+        fleet_launch._process_identity = fake_identity
+        fleet_launch._process_identity_after_spawn = lambda pid: fake_identity(pid)
+        fleet_launch.shutil.which = lambda _name: None
+        try:
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                code = fleet_launch._launch(args)
+        finally:
+            goalflight_liveness.reset_status_lineage = old_reset
+            fleet_launch.reset_status_lineage = old_reset
+            fleet_launch.subprocess.Popen = old_popen
+            fleet_launch._process_identity = old_identity
+            fleet_launch._process_identity_after_spawn = old_after_spawn
+            fleet_launch.shutil.which = old_which
+        receipt = json.loads(stdout.getvalue())
+        marker = json.loads((dispatch_dir / "launch_marker.json").read_text(encoding="utf-8"))
+        assert_true("launch ok", code == 0)
+        assert_true("new receipt", receipt.get("remote_pid") == 4242)
+        assert_true("lineage reset", reset_calls == [status_json])
+        assert_true("stale status gone before spawn", status_present_at_spawn == [False])
+        assert_true("recovery marker", marker.get("no_worker_proof") == "preexisting_artifact_no_live_receipt")
 
 
 def test_recovery_reclaims_dead_owner_lock() -> None:
@@ -595,6 +844,11 @@ def main() -> None:
         test_read_only_recovery_inspection_preserves_status,
         test_clean_first_launch_does_not_reset_status_lineage,
         test_recovery_with_no_worker_proof_relaunches,
+        test_recovery_ignores_dead_status_receipt_and_relaunches,
+        test_recovery_stale_launching_without_pid_relaunches,
+        test_recovery_timestampless_launching_marker_uses_bounded_mtime_recovery,
+        test_recovery_fresh_launching_marker_beats_stale_dead_status,
+        test_recover_unconfirmed_dead_status_resets_lineage_before_spawn,
         test_recovery_reclaims_dead_owner_lock,
         test_recovery_reclaims_reused_pid_owner_lock,
         test_recovery_live_owner_lock_refuses,

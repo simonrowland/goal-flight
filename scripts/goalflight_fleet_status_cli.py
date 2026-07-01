@@ -80,8 +80,9 @@ def _classify_dispatch_row(
     mirror_result: mirror.MirrorReadResult | None,
 ) -> status.DispatchClassification:
     mirror_payload = mirror_result.payload if mirror_result and mirror_result.ok else None
+    ssh_value = meta.get("ssh_reachable")
     return status.classify_dispatch_row(
-        ssh_reachable=bool(meta.get("ssh_reachable", True)),
+        ssh_reachable=ssh_value is True,
         mirror=mirror_result,
         mirror_stale=_mirror_stale(meta, mirror_result),
         lease_active=bool(meta.get("lease_active", False)),
@@ -91,7 +92,7 @@ def _classify_dispatch_row(
 
 def build_fleet_status(fleet_dir: Path) -> dict[str, Any]:
     """Aggregate per-node auth probes and dispatch rows for fleet status."""
-    import goalflight_fleet as fleet
+    import goalflight_fleet_store as fleet
 
     fleet_path = fleet_dir / "fleet.json"
     result: dict[str, Any] = {
@@ -131,6 +132,7 @@ def build_fleet_status(fleet_dir: Path) -> dict[str, Any]:
             "dispatch_id": dispatch_id,
             "state": classification.state,
             "quarantine_reason": classification.quarantine_reason,
+            "ssh_reachable": meta.get("ssh_reachable") if isinstance(meta.get("ssh_reachable"), bool) else "unknown",
             "may_release": status.may_release_locks(classification),
         }
         result["dispatches"].append(row)
