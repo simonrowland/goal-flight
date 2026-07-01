@@ -130,6 +130,47 @@ def test_next_json_shape_and_no_status_key() -> None:
         assert_true("no durable status key", all("status" not in row for row in rows))
 
 
+def test_next_excludes_reserved_lanes_and_posts_no_nudge() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        project = tmp / "project"
+        env = _env(tmp)
+        _write_items(
+            project,
+            [
+                _item("t-001", "Deferred task", lane="deferred"),
+                _item("t-002", "Held task", lane="held"),
+            ],
+        )
+        proc = _run_task(project, env, "next")
+        assert_true(f"next exits 0: {proc.stderr}", proc.returncode == 0)
+        assert_eq("reserved lanes excluded from next", proc.stdout.splitlines(), [])
+        inbox = M.inbox_path(Path(env["GOALFLIGHT_MESSAGES_DIR"]), T.NEXT_NUDGE_DISPATCH_ID)
+        assert_true("reserved-only frontier creates no inbox", not inbox.exists())
+
+
+def test_next_includes_promoted_free_text_lane_and_no_lane() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        project = tmp / "project"
+        env = _env(tmp)
+        T.TaskStore(project).save_items_atomic(
+            [
+                _item("t-001", "Promoted task", lane="deferred"),
+                _item("t-002", "No lane task"),
+            ]
+        )
+        proc = _run_task(project, env, "lane", "t-001", "ui")
+        assert_true(f"lane exits 0: {proc.stderr}", proc.returncode == 0)
+        proc = _run_task(project, env, "next")
+        assert_true(f"next exits 0: {proc.stderr}", proc.returncode == 0)
+        assert_eq(
+            "free-text lane and no-lane tasks stay eligible",
+            proc.stdout.splitlines(),
+            ["t-001 Promoted task", "t-002 No lane task"],
+        )
+
+
 def test_parallel_nudge_posts_once_for_same_frontier() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
@@ -217,6 +258,8 @@ def test_check_tasks_mirror_accepts_next_fixture_without_status() -> None:
 def main() -> None:
     test_next_frontier_filters_to_dispatchable_level_zero()
     test_next_json_shape_and_no_status_key()
+    test_next_excludes_reserved_lanes_and_posts_no_nudge()
+    test_next_includes_promoted_free_text_lane_and_no_lane()
     test_parallel_nudge_posts_once_for_same_frontier()
     test_parallel_nudge_silent_for_single_frontier()
     test_next_still_prints_when_mail_import_fails()

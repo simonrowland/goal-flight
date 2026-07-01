@@ -645,13 +645,30 @@ def test_goalflight_task_list_lane_facet_and_status_collision() -> None:
                 "lane": "outstanding",
                 "created_at": "2020-01-01T00:00:00+00:00",
             },
+            {
+                "schema_version": 1,
+                "id": "t-006",
+                "kind": "task",
+                "title": "Deferred but done reviewed",
+                "blocked_by": [],
+                "links": [],
+                "done": True,
+                "done_reviewed": True,
+                "lane": "deferred",
+                "created_at": "2020-01-01T00:00:00+00:00",
+            },
         ]
         _write_tasks(project, items)
 
         proc = run_task(project, "list", "deferred", "--json")
         assert_true(f"list deferred exits 0: {proc.stderr}", proc.returncode == 0)
         deferred = json.loads(proc.stdout)
-        assert_true("list deferred filters reserved lane", [item["id"] for item in deferred] == ["t-001"])
+        assert_true("list deferred filters outstanding reserved lane", [item["id"] for item in deferred] == ["t-001"])
+
+        proc = run_task(project, "list", "done-reviewed", "--lane", "deferred", "--json")
+        assert_true(f"list done-reviewed --lane deferred exits 0: {proc.stderr}", proc.returncode == 0)
+        done_deferred = json.loads(proc.stdout)
+        assert_true("raw lane filter still composes with done-reviewed", [item["id"] for item in done_deferred] == ["t-006"])
 
         proc = run_task(project, "list", "held", "--json")
         assert_true(f"list held exits 0: {proc.stderr}", proc.returncode == 0)

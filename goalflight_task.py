@@ -1232,6 +1232,7 @@ class TaskStore:
             for row in self.derived_rows()
             if row.get("kind", "task") in {"task", "bug"}
             and row.get("derived_status") == "pending"
+            and row.get("lane") not in RESERVED_LANES
             and _latest_dispatch_breadcrumb(row) is None
         ]
 
@@ -2100,7 +2101,7 @@ def _cmd_accept(store: TaskStore, args: argparse.Namespace) -> int:
 
 def _cmd_list(store: TaskStore, args: argparse.Namespace) -> int:
     facet = args.status
-    status = None if facet in RESERVED_LANES else facet
+    status = "outstanding" if facet in RESERVED_LANES else facet
     lane = facet if facet in RESERVED_LANES else args.lane
     if facet in RESERVED_LANES and args.lane:
         raise TaskError("list reserved-lane positional cannot be combined with --lane")

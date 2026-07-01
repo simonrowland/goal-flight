@@ -75,10 +75,10 @@ After a side-mission or compaction, read the store and continue the top
 dispatchable item. Do not stop for a re-prompt when `next` names ordinary
 worker work and no real blocker exists.
 
-The store is a pull surface. Route actionable state through the controller-mail
-bridge as push nudges: done-suggest, `next` parallel-nudge, and resume-nudge.
-The controller should react to those nudges instead of relying on willpower to
-remember the next pull.
+The store is a pull surface. The shipped controller-mail push surface is the
+`next` parallel-nudge. done-suggest and resume-nudge are the same intended
+pattern for future bridge work, not shipped behavior. Controllers still pull
+with `status`, `list`, and `next` when no shipped nudge exists.
 
 Workers-in-flight survive resume because dispatch reliability links
 `dispatch_id` to `task_ids` and the status / worker-state plane is trustworthy.
