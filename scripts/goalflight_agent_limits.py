@@ -6,11 +6,16 @@ Pure leaf module: imports neither goalflight_capacity nor goalflight_rate_pressu
 
 from __future__ import annotations
 
+# grok RSS re-measured live 2026-07-01 (128GB M5, operator flag): a running grok
+# worker is ~144MB self-RSS and ~200-390MB counting its node/MCP child tree, vs
+# the original 111MB. Set to 200 (tree-inclusive, matching codex's tree-ish 386).
+# Immaterial to the RAM ceiling on this box (129GB budget) but keeps the RSS
+# budget honest; the binding grok constraint is the provider cap, not RAM.
 AGENT_RSS_MB = {
-    "grok": 111,
-    "grok-acp": 111,
-    "grok-code": 111,
-    "grok-research": 111,
+    "grok": 200,
+    "grok-acp": 200,
+    "grok-code": 200,
+    "grok-research": 200,
     "codex": 386,
     "codex-acp": 386,
     "claude": 614,
@@ -46,12 +51,19 @@ DEFAULT_AGENT_CAPS = {
     "claude-code-cli-acp": 5,
     # codex and grok caps are intentionally high; adaptive walkback halves
     # effective caps on real provider rejections.
+    # grok pool cap raised 20->30 (2026-07-01, operator-requested): heavy grok
+    # prompt volume on a 128GB/18-core M5 with zero observed provider pressure
+    # (1118-record ledger sweep clean) and grok worker RSS only ~200MB, so RAM is
+    # not the bound. NOTE: grok(30)+codex(18)=48 > the shared global operating
+    # cap (32), so grok reaches 30 only when codex is light; the global cap still
+    # arbitrates joint load. Same "workers are network-bound, not CPU-bound"
+    # reasoning as the 2026-06-16 global 20->32 bump.
     "codex": 18,
     "codex-acp": 18,
-    "grok": 20,
-    "grok-acp": 20,
-    "grok-code": 20,
-    "grok-research": 20,
+    "grok": 30,
+    "grok-acp": 30,
+    "grok-code": 30,
+    "grok-research": 30,
     # Gateway orchestrators: lower cap, longer orchestration latency.
     "herm-worker": 2,
     "cla-worker": 2,
