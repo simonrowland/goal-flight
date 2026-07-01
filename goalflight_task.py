@@ -84,6 +84,7 @@ CANNED_LIST_STATUSES = {
     "done-reviewed",
 }
 RESERVED_LANES = {"deferred", "held"}
+NEXT_NUDGE_DISPATCH_ID = "task-store"
 MARKDOWN_SECTIONS = (
     ("pending", "To do"),
     ("working", "In progress"),
@@ -1225,6 +1226,15 @@ class TaskStore:
 
         return [row for row in rows if matches(row)]
 
+    def next_frontier(self) -> list[dict[str, Any]]:
+        return [
+            row
+            for row in self.derived_rows()
+            if row.get("kind", "task") in {"task", "bug"}
+            and row.get("derived_status") == "pending"
+            and _latest_dispatch_breadcrumb(row) is None
+        ]
+
     def _derive_status(
         self,
         item: dict[str, Any],
@@ -2111,6 +2121,48 @@ def _cmd_list(store: TaskStore, args: argparse.Namespace) -> int:
     return 0
 
 
+def _post_next_nudge(rows: list[dict[str, Any]]) -> None:
+    if len(rows) < 2:
+        return
+    try:
+        import goalflight_messages as gm  # lazy: task reads must not hard-depend on mail
+
+        messages_dir = gm.default_messages_dir()
+        inbox = gm.inbox_path(messages_dir, NEXT_NUDGE_DISPATCH_ID)
+        if inbox.exists() and not inbox.is_file():
+            return
+        ids = sorted(str(row["id"]) for row in rows)
+        key = "parallel-ready:" + ",".join(ids)
+        text = f"you've got mail: {len(ids)} parallel-ready ({', '.join(ids)}) -> fan out?"
+        seen = {
+            str((e.get("payload") or {}).get("dedup_key") or "")
+            for e in gm.read_envelopes(inbox)
+            if e.get("type") == "user_need"
+        }
+        if key in seen:
+            return
+        gm.post_message(
+            dispatch_id=NEXT_NUDGE_DISPATCH_ID,
+            msg_type="user_need",
+            payload={"text": text, "dedup_key": key, "frontier_ids": ids},
+            messages_dir=messages_dir,
+            source={"node": "local", "adapter": "task-store", "transport": "next-frontier"},
+        )
+    except Exception:
+        return
+
+
+def _cmd_next(store: TaskStore, args: argparse.Namespace) -> int:
+    rows = store.next_frontier()
+    _post_next_nudge(rows)
+    if args.json:
+        print(json.dumps(rows, ensure_ascii=False, sort_keys=True))
+        return 0
+    for row in rows:
+        print(f"{row['id']} {row.get('title', '')}")
+    return 0
+
+
 def _cmd_status(store: TaskStore, args: argparse.Namespace) -> int:
     rows = store.derived_rows()
     if args.json:
@@ -2158,8 +2210,9 @@ def build_parser() -> argparse.ArgumentParser:
     goalflight_task.py capture "Investigate flaky test"        # reflex: task, lane=deferred
     goalflight_task.py new "Tighten review gate" --kind task --prompt-path docs-private/briefs/t-014.md
     goalflight_task.py new "Park follow-up" --lane deferred
-    READ:
+  READ:
     goalflight_task.py show t-014 --json
+    goalflight_task.py next
     goalflight_task.py list outstanding
     goalflight_task.py list deferred
     goalflight_task.py list --lane ui
@@ -2364,6 +2417,16 @@ def build_parser() -> argparse.ArgumentParser:
     list_cmd.add_argument("--blocked-by", action="append", default=[])
     list_cmd.add_argument("--json", action="store_true")
     list_cmd.set_defaults(func=_cmd_list)
+
+    next_cmd = sub.add_parser(
+        "next",
+        help="READ: print the flat dispatchable frontier.",
+        epilog="example: goalflight_task.py next --json",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    next_cmd.add_argument("--by", help=argparse.SUPPRESS)
+    next_cmd.add_argument("--json", action="store_true")
+    next_cmd.set_defaults(func=_cmd_next)
 
     status = sub.add_parser(
         "status",
