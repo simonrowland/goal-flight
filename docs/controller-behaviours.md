@@ -2490,13 +2490,13 @@ chunk-3a rationale:
 ### Entry: out-of-scope-findings-backlog-not-chip
 
 - **id:** `out-of-scope-findings-backlog-not-chip`
-- **name:** Autonomous findings are worker tasks; reserve chips for user-interaction tasks
+- **name:** Capture autonomous findings in deferred
 - **category:** `chat-discipline`
-- **controller_does:** During an active run, the orchestrator routes out-of-scope findings (from itself or a worker) into the goal queue Backlog in `docs-private/goal-queue-*.md` as worker tasks the goal-loop executes; it reserves a host `spawn_task`/chip for the narrow case of a context-polluting task that genuinely needs user input/interaction (or a different repo / no active run), harvesting worker RESULT markers before moving on.
-- **failure_mode:** The orchestrator spawns a host `spawn_task`/"chip" for a finding a worker could finish autonomously, orphaning the work from the canonical queue, ledger, and resume plane — chips are the exception (genuinely user-interaction-required tasks), not the default sink for out-of-scope work.
+- **controller_does:** During an active run, the orchestrator routes out-of-scope findings (from itself or a worker) into the store's `deferred` lane via `goalflight_task.py capture`, then lets the goal-loop execute worker-suitable findings; it reserves a host `spawn_task`/chip for the narrow case of a context-polluting task that genuinely needs user input/interaction (or a different repo / no active run), harvesting worker RESULT markers before moving on.
+- **failure_mode:** The orchestrator scribbles an out-of-scope finding into handoff prose or spawns a host `spawn_task`/"chip" for work a worker could finish autonomously, orphaning the work from the canonical store, ledger, and resume plane — chips are the exception (genuinely user-interaction-required tasks), not the default sink for out-of-scope work.
 - **skill_md_compressed_form:**
     - **kind:** literal
-    - **pattern:** "a worker task, not a host `spawn_task`/\"chip\""
+    - **pattern:** "store's `deferred` lane via `goalflight_task.py capture`"
     - **max_section_lines:** 58
 - **verifier:**
     - **kind:** textual-invariant
@@ -2504,8 +2504,8 @@ chunk-3a rationale:
 - **provenance:**
     - **sources:**
       - `SKILL.md`
-      - `commands/resume.md`
-      - `commands/execute.md`
+      - `protocols/task-lifecycle.md`
+      - `protocols/state-handoff.md`
     - **r_numbers:** []
 - **severity:** high
 - **last_reviewed_commit:** 5321d7a

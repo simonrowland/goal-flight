@@ -65,10 +65,41 @@ See `scripts/goalflight_session_status.py --claim` / `--release`.
 ## Before compact or sleep
 
 - run `python3 <skill-root>/scripts/goalflight_status.py`
+- run the store baseline: `python3 goalflight_task.py list outstanding`
+  plus any relevant `list deferred` / `list held` facet
 - update newest `docs-private/RESUME-NOTES-<YYYY-MM-DD>.md` (bump
-  `-rev<N>` if needed) with current git head, queue state, active
-  dispatch IDs, and next command
+  `-rev<N>` if needed) with environment, standing ideas/decisions, durable
+  facts, carrier doc pointers, current git head/provenance commits when
+  relevant, and the last successful store command + timestamp
+- do not transcribe task tables, active dispatch codes, or encyclopedic
+  next-task lists; `status` / `list` / `next` reconstruct those live
 - do not paste raw logs
+
+## Store-backed handoff
+
+The handoff is no longer the mechanical task snapshot. The store owns task
+state, blockers, dispatch breadcrumbs, worker snapshots, `deferred`, and `held`.
+The dispatch-reliability substrate preserves workers-in-flight through the
+`dispatch_id` <-> `task_ids` link plus trustworthy status / worker-state rows.
+
+Handoff prose carries durable content:
+
+- ENVIRONMENT: throttles, machine limits, local setup, unusual constraints
+- IDEAS/DECISIONS: north-star colour, standing decision trees, do-not-re-litigate
+- FACTS: durable project facts the store cannot infer
+- CARRIERS: pointers to docs, reviews, provenance, and evidence files
+
+Mistakes-not-to-make and north-star colour are load-bearing examples, not a
+two-slot template. Keep prose flexible. Append and curate; do not rewrite the
+handoff as a per-rotation scratch snapshot.
+
+Commit hashes stay in handoff/provenance unless a task explicitly links them.
+The store carries `dispatches[]`; do not claim first-class `commits[]`.
+
+Store-unavailable fallback: keep the last store command, timestamp, and compact
+result summary in the handoff. If resume hits a stale or failed store read, use
+that fallback to orient, mark the store read as degraded, and repair/retry
+instead of losing the thread.
 
 ## On resume
 
@@ -89,19 +120,27 @@ activation contract above; **not** for ordinary one-off coding.
    is alive and the id mismatches yours, ANOTHER orchestrator owns this
    run — surface to user before claiming. If `current_session.pid` is
    dead, `--force-release-stale` then claim.
-1. Activation check: `goalflight_session_status.py --text`. Bail out
-   if "no active session".
-2. Read newest RESUME-NOTES via the find-newest one-liner above + queue
-   frontmatter (`state`, `current_session`, `session_history`).
-3. Check git reality.
-4. Run `goalflight_status.py`.
-5. Classify active dispatches:
+1. Activation check: `python3 <skill-root>/scripts/goalflight_session_status.py
+   --text`. Bail out if "no active session".
+2. Store baseline, not optional `next`: run
+   `python3 <skill-root>/scripts/goalflight_status.py` and
+   `python3 <skill-root>/goalflight_task.py list outstanding` (plus
+   `list deferred` / `list held` when relevant). If the store read fails, use
+   the handoff's last store command + timestamp as fallback and flag degraded.
+3. Read newest RESUME-NOTES for environment, ideas/decisions, facts, carriers,
+   mistakes-not-to-make, north-star colour, and provenance commits.
+4. Check git reality.
+5. Run `python3 <skill-root>/scripts/goalflight_status.py` again after reading handoff prose.
+6. Classify active dispatches:
    - expected live
    - stale dead PID
    - stale PID reuse
    - surplus worker-like process
    - cooldown blocked
-6. Continue from status rows, not from memory. Stay orchestrator: dispatch workers
+7. Run `python3 <skill-root>/goalflight_task.py next` when ready to choose work, then continue the
+   top dispatchable item. Do not wait for a re-prompt after compaction or a
+   side-mission when `next` names ordinary worker work.
+8. Continue from status/store rows, not from memory. Stay orchestrator: dispatch workers
    for implementation unless dispatch routing marks the chunk `controller-direct`.
 
 The dispatch ledger validates process identity with PID plus process start/command.

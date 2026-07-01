@@ -38,6 +38,52 @@ fix carries its briefing in `prompt` / `prompt_path` and dispatches via
 `--task <id>`. ADR-007's earlier generated goal-queue model is superseded by
 DECISION #5 for v1.1.
 
+## Store behaviour
+
+Use the store as the home for mechanical work-state:
+
+- task list, bugs, decisions, blockers, lanes, and links
+- dispatch breadcrumbs and worker snapshots
+- `deferred` and `held` work
+- review breadcrumbs and capture fallout
+
+Do not hand-copy that state into loop messages or RESUME-NOTES. Reconstruct it
+with `status`, `list`, and, when choosing action, `next`.
+
+Out-of-scope findings go to `deferred` via `capture`:
+
+```bash
+python3 goalflight_task.py capture "<finding>"
+```
+
+If `--severity` is set, the captured item is a bug. If the work has a real
+blocker, add `blocked_by` or move it to `held`; otherwise leave the default
+`deferred` lane. Do not scribble out-of-scope work into the handoff as the
+primary record. Do not create a host chip for work a worker can do.
+
+Loop messages and handoff prose stay thin. They carry what the store cannot:
+
+- ENVIRONMENT: provider throttles, machine limits, unusual local setup
+- IDEAS/DECISIONS: standing decision trees, do-not-re-litigate calls
+- FACTS: durable facts not derivable from the task store
+- CARRIERS: doc, review, provenance, and design pointers
+
+Replace enumerated next-task lists with "run `next`". `next` is the frontier
+selector; `status` and `list` are the reload baseline.
+
+After a side-mission or compaction, read the store and continue the top
+dispatchable item. Do not stop for a re-prompt when `next` names ordinary
+worker work and no real blocker exists.
+
+The store is a pull surface. Route actionable state through the controller-mail
+bridge as push nudges: done-suggest, `next` parallel-nudge, and resume-nudge.
+The controller should react to those nudges instead of relying on willpower to
+remember the next pull.
+
+Workers-in-flight survive resume because dispatch reliability links
+`dispatch_id` to `task_ids` and the status / worker-state plane is trustworthy.
+Do not describe that as magic persistence. The substrate is the FK plus status.
+
 ## Concurrency & worktrees (one shared store, never per-worktree)
 
 Under parallel worktrees (`execute --parallel`, `.claude/worktrees/`) the store is

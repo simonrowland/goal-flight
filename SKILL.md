@@ -103,7 +103,7 @@ Orchestrator behaviour probes run through portable host adapters, not host-speci
 | context lints | Autonomous throughput | `protocols/engagement-lint.md`, `foreground-duration-hook.md` |
 | user-status-cadence | User progress reporting | `protocols/user-status-cadence.md` |
 | project state layout | State | `protocols/project-state-layout.md` |
-| task lifecycle/docket | State | `protocols/task-lifecycle.md` |
+| task lifecycle/store behaviour | State | `protocols/task-lifecycle.md` |
 | dashboard/task views | User progress reporting | `protocols/progress-dashboard.md` |
 | chunk-vs-milestone review | Review layers | `protocols/chunk-review.md`, `protocols/milestone-review.md` |
 | **bug-class mining / backwards sweeps** | Review layers | `protocols/review-mining.md` |
@@ -242,13 +242,10 @@ inline; fix P0/P1/P2 before commit.
   heavy fan-out can strand the session), and gets NO marker/steer protocol. The
   read-only recon use two bullets up is legitimate; using the Agent to WRITE
   code is the regression.
-- Out-of-scope findings (yours or a worker's) during an active run go to the
-  active goal queue Backlog (`docs-private/goal-queue-*.md`, via `/goal-flight
-  goal` or directly). If a finding can be done autonomously in a goal-loop it is
-  a worker task, not a host `spawn_task`/"chip"; reserve chips for a
-  context-polluting task that genuinely needs user input/interaction (or a
-  different repo / no active run). Workers surface out-of-scope findings in their
-  RESULT; the controller harvests them into the Backlog before moving on.
+- Out-of-scope findings go to the store's `deferred` lane via `goalflight_task.py capture`.
+  Worker-doable findings are worker tasks, not
+  host `spawn_task`/"chip"; reserve chips for user-interaction, different-repo,
+  or no-active-run work. Capture worker RESULT fallout before moving on.
 - No `tail -f` in conversation; liveness authority is the aggregate status command, not raw watcher heartbeat fields.
 - No worker spawn without capacity consideration.
 - No bare `git commit` while workers are in flight — commit guard
@@ -486,11 +483,12 @@ Active run + compaction: if already in play, invoke `/goal-flight resume` for fr
    `ls -1 docs-private/RESUME-NOTES-*.md | sort | tail -1`
    (canonical pattern: `RESUME-NOTES-<YYYY-MM-DD>[-rev<N>].md` — ISO 8601
    date so lexicographic sort = chronological; no topic prefixes).
-5. Read newest queue file at `docs-private/goal-queue-*.md` for the chunk
-   table + frontmatter `state` and `current_session`.
-6. `python3 <skill-root>/scripts/goalflight_status.py` for live
-   capacity + ledger.
-7. Continue from status, not from chat memory.
+5. Run store baseline: `python3 scripts/goalflight_status.py` + `python3
+   goalflight_task.py list`; if degraded, use the handoff's last store command.
+6. Read handoff prose for environment, ideas/decisions, facts, and carriers;
+   task tables, dispatch codes, and next lists live in the store.
+7. Run status again, then `python3 goalflight_task.py next`; continue the top
+   task after compaction or side-mission without waiting for a re-prompt.
 
 ## Context Discipline
 
