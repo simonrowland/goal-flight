@@ -143,7 +143,7 @@ footer{max-width:52rem;margin:0 auto;padding:1.5rem 1.25rem 2rem;color:var(--mut
   var ctrl = { kind:"all", status:"all", q:"", sort:"id" };
 
   // Announce a concise count delta on a debounce instead of letting the whole
-  // board live-region re-read every row on each keystroke / poll tick.
+  // board live-region re-read every row on each keystroke / snapshot refresh.
   var announceTimer = null;
   function announce(visible){
     if(announceTimer) clearTimeout(announceTimer);

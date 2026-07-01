@@ -10,6 +10,7 @@ const vm = require("vm");
 const ROOT = path.resolve(__dirname, "..", "..");
 const GF_JS = path.join(ROOT, "templates", "state-skeleton", "gf.js");
 const TICKET_HTML = path.join(ROOT, "templates", "state-skeleton", "ticket.html");
+const STATE_TEMPLATES_DIR = path.join(ROOT, "templates", "state-skeleton");
 const CHECKER = path.join(ROOT, "scripts", "check_tasks_mirror.js");
 
 function assert(name, condition) {
@@ -237,6 +238,18 @@ assert("renderDecisionList links blocked task", decisions.includes('href="ticket
   assert(label + " prompt_path sink rejects href", html.includes('<p><a href="#">'));
   assert(label + " dispatch log sink rejects href", html.includes('<a class="dispatch-log" href="#">'));
   assert(label + " no normalized javascript href", !/href=["']java[\n\r\t]*script:/i.test(html));
+});
+
+[
+  "index.html",
+  "current-activity.html",
+  "tickets.html",
+  "ticket.html",
+  "gf.js"
+].forEach(function (name) {
+  const body = fs.readFileSync(path.join(STATE_TEMPLATES_DIR, name), "utf8");
+  assert(name + " does not claim live polling", !/live\s*(?:\u00b7|&middot;|\|)?\s*polling/i.test(body));
+  assert(name + " does not claim timed polling", !/(polling\s+every|every\s+\d+s|poll\s+tick)/i.test(body));
 });
 
 console.log("OK: gf.js escaping/autolink test pass");
