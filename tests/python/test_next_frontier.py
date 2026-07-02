@@ -318,7 +318,7 @@ def test_check_tasks_mirror_accepts_next_fixture_without_status() -> None:
         store = T.TaskStore(project)
         store.save_items_atomic(_frontier_fixture())
         proc = subprocess.run(
-            [NODE, str(CHECKER), str(project / "docs-private")],
+            [NODE, str(CHECKER), str(project / "docs-private"), str(project / "dashboard")],
             cwd=str(ROOT),
             text=True,
             stdout=subprocess.PIPE,
@@ -332,7 +332,7 @@ def test_check_tasks_mirror_accepts_next_fixture_without_status() -> None:
             for line in (project / "docs-private" / "tasks.jsonl").read_text(encoding="utf-8").splitlines()
             if line.strip()
         ]
-        data_js = (project / "docs-private" / "tasks-data.js").read_text(encoding="utf-8")
+        data_js = (project / "dashboard" / "tasks-data.js").read_text(encoding="utf-8")
         payload = data_js.split("window.GF_ITEMS = ", 1)[1].split(";\nif (typeof module", 1)[0]
         mirrored = json.loads(payload)
         assert_true("tasks.jsonl has no status key", all("status" not in item for item in raw_items))

@@ -99,7 +99,7 @@ package repository; for normal target projects it is skipped as INFO.
   - optional `docs-private/RESUME-NOTES*.md`
   - managed static view assets match the templates from
     `templates/state-skeleton/`; schema/template skew is a layout warning
-  - `docs-private/tasks.jsonl` and `docs-private/tasks-data.js` mirror
+  - `docs-private/tasks.jsonl` and `dashboard/tasks-data.js` mirror
     validation when either task-store file exists
 - Check machine capacity profile.
 - **Cursor model currency** (`cursor_models_probe`): runs `cursor-agent models`,

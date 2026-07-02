@@ -140,7 +140,9 @@ python3 <skill-root>/scripts/goalflight_capacity.py profile --json
 5. Scaffold or migrate private project state if missing. Default is dry-run.
    Apply is create-if-absent only: never overwrite operator files, never
    force-add ignored state, write a per-repo backup before changes, and preserve
-   the repository's existing `docs-private/` gitignore policy.
+   the repository's existing `docs-private/` gitignore policy. Browser-facing
+   dashboard files are generated into repo-root `dashboard/`; keep that path
+   ignored with an anchored `/dashboard/` rule.
 
 ```bash
 python3 <skill-root>/scripts/goalflight_setup.py \
@@ -150,7 +152,8 @@ python3 <skill-root>/scripts/goalflight_setup.py \
 
 Inspect the dry-run JSON first. To mutate, rerun with `--apply --yes`.
 
-The scaffolder copies missing files from `templates/state-skeleton/`, creates
+The scaffolder copies missing store files into `docs-private/`, copies
+browser-facing HTML/JS plus `tasks-data.js` into repo-root `dashboard/`, creates
 the canonical state directories, and creates
 `docs-private/RESUME-NOTES-<YYYY-MM-DD>.md` from `templates/resume-notes.md`
 when no canonical resume pin exists. The canonical state contract is
@@ -159,9 +162,14 @@ HTML view behavior is `protocols/progress-dashboard.md`.
 It updates `AGENTS.md` through temp+rename only when needed so the living-state
 pin names the newest `docs-private/RESUME-NOTES-*.md`, not a retired handoff
 file. It also branches on `git check-ignore docs-private/`: ignored repos stay
-untracked; tracked/private repos keep tracking. In-flight dispatch ledger records
-get `task_ids` backfilled only when derivable from dispatch metadata or the
-prompt path.
+untracked; tracked/private repos keep tracking. It reports
+`git check-ignore dashboard/` separately; public repos should normally use
+`/dashboard/` because sync regenerates these browser assets. Existing
+`docs-private/*.html`, `docs-private/gf.js`, or `docs-private/tasks-data.js`
+are legacy dashboard locations; init regenerates canonical copies under
+`dashboard/` and leaves those legacy files for operator cleanup. In-flight
+dispatch ledger records get `task_ids` backfilled only when derivable from
+dispatch metadata or the prompt path.
 
 - `docs-private/goal-<topic>-<date>.md` from `templates/goal-statement.md`
 - `AGENTS.md` handling (downstream projects often keep AGENTS.md
@@ -195,6 +203,7 @@ Do not paste full probe output.
 7. Confirm git hygiene:
 
 - `docs-private/` policy recorded from `git check-ignore docs-private/` — ignored public repos stay private; tracked private repos are allowed
+- `dashboard/` policy recorded from `git check-ignore dashboard/` — generated browser views should normally match `/dashboard/`
 - `AGENTS.md` tracked or intentionally absent
 - root `SKILL.md` tracked or intentionally absent
 - current branch/head/dirty state recorded in resume notes

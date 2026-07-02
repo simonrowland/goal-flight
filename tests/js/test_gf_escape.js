@@ -10,6 +10,7 @@ const vm = require("vm");
 const ROOT = path.resolve(__dirname, "..", "..");
 const GF_JS = path.join(ROOT, "templates", "state-skeleton", "gf.js");
 const TICKET_HTML = path.join(ROOT, "templates", "state-skeleton", "ticket.html");
+const BURNDOWN_HTML = path.join(ROOT, "templates", "state-skeleton", "burndown.html");
 const STATE_TEMPLATES_DIR = path.join(ROOT, "templates", "state-skeleton");
 const CHECKER = path.join(ROOT, "scripts", "check_tasks_mirror.js");
 
@@ -21,7 +22,7 @@ function assert(name, condition) {
 
 function loadGF() {
   const win = {
-    location: { href: "file:///repo/docs-private/tickets.html", pathname: "/repo/docs-private/tickets.html", search: "" },
+    location: { href: "file:///repo/dashboard/tickets.html", pathname: "/repo/dashboard/tickets.html", search: "" },
     GF_ITEMS: [],
     GF_PATH_PREFIXES: ["docs-private/"]
   };
@@ -47,8 +48,8 @@ function renderTicket(item) {
   };
   const win = {
     location: {
-      href: "file:///repo/docs-private/ticket.html?id=t-ctrl",
-      pathname: "/repo/docs-private/ticket.html",
+      href: "file:///repo/dashboard/ticket.html?id=t-ctrl",
+      pathname: "/repo/dashboard/ticket.html",
       search: "?id=t-ctrl",
       reload() {}
     },
@@ -64,6 +65,44 @@ function renderTicket(item) {
   const scripts = Array.from(fs.readFileSync(TICKET_HTML, "utf8").matchAll(/<script>([\s\S]*?)<\/script>/g));
   vm.runInContext(scripts[scripts.length - 1][1], context, { filename: TICKET_HTML + "#inline", timeout: 5000 });
   return elements.detail.innerHTML;
+}
+
+function renderBurndownFixture(items) {
+  const elements = {
+    burndownChart: { innerHTML: "" },
+    burndownSummary: { textContent: "" },
+    foot: { textContent: "" },
+    mode: { classList: { remove() {} } },
+    modeText: { textContent: "" }
+  };
+  const doc = {
+    visibilityState: "visible",
+    getElementById(id) {
+      if (!elements[id]) elements[id] = { innerHTML: "", textContent: "", classList: { remove() {} } };
+      return elements[id];
+    },
+    addEventListener() {},
+    removeEventListener() {}
+  };
+  const win = {
+    location: {
+      href: "file:///repo/dashboard/burndown.html",
+      pathname: "/repo/dashboard/burndown.html",
+      search: "",
+      reload() {}
+    },
+    document: doc,
+    GF_ITEMS: items,
+    GF_PATH_PREFIXES: ["docs-private/"],
+    addEventListener() {},
+    removeEventListener() {}
+  };
+  const context = vm.createContext({ window: win, document: doc, URL, URLSearchParams, Number, Date });
+  vm.runInContext(fs.readFileSync(GF_JS, "utf8"), context, { filename: GF_JS, timeout: 5000 });
+  context.GF = context.window.GF;
+  const scripts = Array.from(fs.readFileSync(BURNDOWN_HTML, "utf8").matchAll(/<script>([\s\S]*?)<\/script>/g));
+  vm.runInContext(scripts[scripts.length - 1][1], context, { filename: BURNDOWN_HTML + "#inline", timeout: 5000 });
+  return elements;
 }
 
 function assertCheckerRejectsMissingDerivedStatus() {
@@ -230,6 +269,126 @@ const backlogVisible = GF.renderBoard(backlogOnlyMount, { status: "backlog" });
 assert("backlog filter returns reserved lane", backlogVisible === 1 && backlogOnlyMount.innerHTML.includes("t-deferred"));
 assert("backlog filter hides active task", !backlogOnlyMount.innerHTML.includes("t-active"));
 
+const burndownItems = [
+  {
+    schema_version: 1,
+    id: "t-open",
+    kind: "task",
+    title: "</script><img src=x onerror=alert(1)> open",
+    blocked_by: [],
+    links: [],
+    done: false,
+    created_at: "2026-01-01T00:00:00Z"
+  },
+  {
+    schema_version: 1,
+    id: "t-done",
+    kind: "task",
+    title: "Done",
+    blocked_by: [],
+    links: [],
+    done: true,
+    done_reviewed: true,
+    created_at: "2026-01-01T00:00:00Z",
+    done_at: "2026-01-03T00:00:00Z"
+  },
+  {
+    schema_version: 1,
+    id: "q-open",
+    kind: "decision",
+    title: "Choose",
+    blocked_by: [],
+    links: [],
+    done: false,
+    audit: [{ action: "new", at: "2026-01-02T00:00:00Z" }]
+  },
+  {
+    schema_version: 1,
+    id: "t-legacy-done",
+    kind: "task",
+    title: "Legacy done",
+    blocked_by: [],
+    links: [],
+    done: true,
+    done_reviewed: true,
+    created_at: "2026-01-02T00:00:00Z",
+    closed_at: "2026-01-04T00:00:00Z"
+  },
+  {
+    schema_version: 1,
+    id: "t-waiting",
+    kind: "task",
+    title: "Waiting",
+    blocked_by: ["q-open"],
+    links: [],
+    done: false,
+    created_at: "2026-01-05T00:00:00Z"
+  }
+];
+const burndown = GF.burndownData(burndownItems);
+assert("burndown counts open items", burndown.open === 3);
+assert("burndown counts done items", burndown.done === 2);
+assert("burndown counts timestamped item coverage", burndown.timestamped === 5);
+assert("burndown reconstructs timestamp trend", burndown.points.map((p) => p.open).join(",") === "2,4,3,2,3");
+const burndownMount = { innerHTML: "" };
+const burndownSummary = { textContent: "" };
+GF.renderBurndown(burndownMount, burndownSummary, burndownItems);
+assert("burndown headline renders counts", burndownSummary.textContent.includes("3 open / 2 done"));
+assert("burndown renders svg trend", burndownMount.innerHTML.includes("<svg"));
+assert("burndown omits full-coverage warning", !burndownMount.innerHTML.includes("trend covers"));
+assert("burndown render excludes hostile title text", !burndownMount.innerHTML.includes("<img"));
+const burndownPage = renderBurndownFixture(burndownItems);
+assert("burndown page renders from fixture", burndownPage.burndownSummary.textContent.includes("3 open / 2 done"));
+assert("burndown page remains XSS-safe", !/<\/script|<img/i.test(burndownPage.burndownChart.innerHTML));
+
+const mixedBurndownItems = [
+  {
+    schema_version: 1,
+    id: "t-stamped",
+    kind: "task",
+    title: "Stamped",
+    blocked_by: [],
+    links: [],
+    done: false,
+    created_at: "2026-02-01T00:00:00Z"
+  },
+  {
+    schema_version: 1,
+    id: "t-unstamped",
+    kind: "task",
+    title: "Legacy no stamps",
+    blocked_by: [],
+    links: [],
+    done: false
+  }
+];
+const mixedBurndown = GF.burndownData(mixedBurndownItems);
+assert("mixed burndown counts every open item", mixedBurndown.open === 2);
+assert("mixed burndown counts every item total", mixedBurndown.total === 2);
+assert("mixed burndown reports timestamped subset", mixedBurndown.timestamped === 1);
+const mixedBurndownMount = { innerHTML: "" };
+GF.renderBurndown(mixedBurndownMount, { textContent: "" }, mixedBurndownItems);
+assert(
+  "mixed burndown renders timestamp coverage warning",
+  mixedBurndownMount.innerHTML.includes("trend covers 1 of 2 items (1 lack timestamps)")
+);
+
+const reopenedBurndown = GF.burndownData([
+  {
+    schema_version: 1,
+    id: "t-reopened",
+    kind: "task",
+    title: "Reopened",
+    blocked_by: [],
+    links: [],
+    done: false,
+    created_at: "2026-03-01T00:00:00Z",
+    done_at: "2026-03-03T00:00:00Z"
+  }
+]);
+assert("reopened item remains currently open", reopenedBurndown.open === 1 && reopenedBurndown.done === 0);
+assert("reopened burndown derives open-closed-reopen trend", reopenedBurndown.points.map((p) => p.open).join(",") === "1,0,1");
+
 GF.index([
   {
     schema_version: 1,
@@ -286,6 +445,7 @@ assert("tickets.html exposes backlog status filter", ticketsBody.includes('<opti
   "current-activity.html",
   "tickets.html",
   "ticket.html",
+  "burndown.html",
   "gf.js"
 ].forEach(function (name) {
   const body = fs.readFileSync(path.join(STATE_TEMPLATES_DIR, name), "utf8");

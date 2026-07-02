@@ -36,9 +36,9 @@ def run_task(project_root: Path, *args: str) -> subprocess.CompletedProcess:
     )
 
 
-def run_checker(target_dir: Path) -> subprocess.CompletedProcess:
+def run_checker(project_root: Path) -> subprocess.CompletedProcess:
     return subprocess.run(
-        [NODE, str(CHECKER), str(target_dir)],
+        [NODE, str(CHECKER), str(project_root / "docs-private"), str(project_root / "dashboard")],
         cwd=str(ROOT),
         text=True,
         stdout=subprocess.PIPE,
@@ -63,7 +63,7 @@ def read_items(project_root: Path) -> list[dict]:
 
 
 def read_data_js_items(project_root: Path) -> list[dict]:
-    text = (project_root / "docs-private" / "tasks-data.js").read_text(encoding="utf-8")
+    text = (project_root / "dashboard" / "tasks-data.js").read_text(encoding="utf-8")
     prefix = "window.GF_ITEMS = "
     start = text.index(prefix) + len(prefix)
     end = text.index(";\nif (typeof module", start)
@@ -139,7 +139,7 @@ def test_lane_cli_and_reserved_backlog_view() -> None:
         assert_true("deferred excluded from active sections", f"### {deferred_id}" not in active)
         assert_true("held excluded from active sections", f"### {held_id}" not in active)
 
-        proc = run_checker(docs)
+        proc = run_checker(project)
         assert_true(f"mirror checker accepts lane: {proc.stderr}", proc.returncode == 0)
 
         data_items = read_data_js_items(project)

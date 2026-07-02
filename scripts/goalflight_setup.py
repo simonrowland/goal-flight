@@ -410,18 +410,26 @@ def scaffold_project_state(
     apply: bool = False,
     today: str | None = None,
 ) -> dict[str, Any]:
-    """Create the canonical docs-private tree without overwriting operator files."""
+    """Create the canonical docs-private store and repo-root dashboard."""
     repo_root = repo_root.resolve()
     target_project = target_project.resolve()
     skeleton = repo_root / goalflight_doctor.STATE_SKELETON_REL
     if not skeleton.is_dir():
         raise SetupError(f"state skeleton missing: {skeleton}")
     docs_private = target_project / "docs-private"
+    dashboard = target_project / "dashboard"
     if docs_private.exists() and not docs_private.is_dir():
         raise SetupError(
             f"refusing to scaffold project state because docs-private exists but "
             f"is not a directory: {docs_private}. Move or rename that path, then "
             "rerun `/goal-flight init`; init only creates a docs-private directory "
+            "and never overwrites operator files."
+        )
+    if dashboard.exists() and not dashboard.is_dir():
+        raise SetupError(
+            f"refusing to scaffold project dashboard because dashboard exists but "
+            f"is not a directory: {dashboard}. Move or rename that path, then "
+            "rerun `/goal-flight init`; init only creates a dashboard directory "
             "and never overwrites operator files."
         )
     if today is None:
@@ -433,7 +441,7 @@ def scaffold_project_state(
     managed_view_replacements: list[dict[str, str]] = []
     messages: list[str] = []
 
-    dirs = [docs_private] + [docs_private / rel for rel in goalflight_doctor.CANONICAL_STATE_DIRS]
+    dirs = [docs_private, dashboard] + [docs_private / rel for rel in goalflight_doctor.CANONICAL_STATE_DIRS]
     for path in dirs:
         rel = _relative_to_project(target_project, path) + "/"
         if path.is_dir():
@@ -444,11 +452,13 @@ def scaffold_project_state(
         if not source.is_file():
             continue
         rel = source.relative_to(skeleton)
-        dest = docs_private / rel
+        rel_key = rel.as_posix()
+        dest_root = dashboard if rel_key in goalflight_doctor.DASHBOARD_ASSETS else docs_private
+        dest = dest_root / rel
         rel_out = _relative_to_project(target_project, dest)
         if dest.exists():
             if (
-                rel.as_posix() in goalflight_doctor.MANAGED_VIEW_ASSETS
+                rel_key in goalflight_doctor.MANAGED_VIEW_ASSETS
                 and dest.is_file()
             ):
                 view_status = goalflight_doctor.classify_managed_view_asset(source, dest)
@@ -556,13 +566,14 @@ def scaffold_project_state(
                 resume_template = repo_root / "templates/resume-notes.md"
                 _atomic_write(dest, _template_text(resume_template, {"<DATE>": today}))
             else:
-                source = skeleton / dest.relative_to(docs_private)
-                shutil.copy2(source, dest)
+                rel_from_root = dest.relative_to(dashboard if rel_out.startswith("dashboard/") else docs_private)
+                source = skeleton / rel_from_root
+                _copy_atomic(source, dest)
             created_files.append(rel_out)
         for item in managed_view_replacements:
             rel_out = item["path"]
             dest = target_project / rel_out
-            source = skeleton / Path(rel_out).relative_to("docs-private")
+            source = skeleton / Path(rel_out).relative_to("dashboard")
             if dest.exists() and _managed_view_needs_refresh(source, dest):
                 _copy_atomic(source, dest)
                 refreshed_managed_views.append(rel_out)
@@ -574,12 +585,19 @@ def scaffold_project_state(
         messages.append("dry-run only: no files, directories, managed view assets, AGENTS.md, backups, or ledger records were changed")
 
     docs_private_gitignored = _git_check_ignored(target_project, "docs-private/")
+    dashboard_gitignored = _git_check_ignored(target_project, "dashboard/")
     if docs_private_gitignored is True:
         messages.append("docs-private/ is gitignored here; scaffold leaves private state untracked")
     elif docs_private_gitignored is False:
         messages.append("docs-private/ is not gitignored here; scaffold preserves this repo's tracking policy")
     else:
         messages.append("docs-private/ gitignore status unknown; scaffold does not force-ignore or force-add it")
+    if dashboard_gitignored is True:
+        messages.append("dashboard/ is gitignored here; scaffold leaves generated browser views untracked")
+    elif dashboard_gitignored is False:
+        messages.append("dashboard/ is not gitignored here; add `/dashboard/` to .gitignore for generated browser views")
+    else:
+        messages.append("dashboard/ gitignore status unknown; scaffold does not force-ignore or force-add it")
 
     would_create_dirs_out = [] if apply else would_create_dirs
     would_create_files_out = [] if apply else would_create_files
@@ -589,9 +607,11 @@ def scaffold_project_state(
         "schema": "goalflight.project-state-scaffold.v1",
         "project_root": str(target_project),
         "docs_private": str(docs_private),
+        "dashboard": str(dashboard),
         "skeleton": str(skeleton),
         "apply": apply,
         "docs_private_gitignored": docs_private_gitignored,
+        "dashboard_gitignored": dashboard_gitignored,
         "backup": backup,
         "created_dirs": created_dirs,
         "would_create_dirs": would_create_dirs_out,

@@ -47,6 +47,18 @@ def run_checker(target_dir: Path, *, timeout: float = 30) -> subprocess.Complete
     )
 
 
+def run_live_checker(project_root: Path, *, timeout: float = 30) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [NODE, str(CHECKER), str(project_root / "docs-private"), str(project_root / "dashboard")],
+        cwd=str(ROOT),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=timeout,
+        check=False,
+    )
+
+
 def run_task(
     project_root: Path,
     *args: str,
@@ -83,13 +95,15 @@ def _copy_fixture(dst: Path) -> None:
 
 def _write_tasks(project_root: Path, items: list[dict]) -> None:
     docs = project_root / "docs-private"
+    dashboard = project_root / "dashboard"
     docs.mkdir(parents=True, exist_ok=True)
+    dashboard.mkdir(parents=True, exist_ok=True)
     (docs / "tasks.jsonl").write_text(
         "".join(json.dumps(item, separators=(",", ":")) + "\n" for item in items),
         encoding="utf-8",
     )
     module = _load_goalflight_task_module()
-    (docs / "tasks-data.js").write_text(
+    (dashboard / "tasks-data.js").write_text(
         module._items_data_js(items),
         encoding="utf-8",
     )
@@ -246,7 +260,7 @@ def test_goalflight_task_new_allocator_concurrency() -> None:
         assert_true("ids do not collide", len(set(ids)) == 2)
         assert_true("ids use task family", all(item.startswith("t-") for item in ids))
 
-        proc = run_checker(project / "docs-private")
+        proc = run_live_checker(project)
         assert_true("concurrent allocator mirror valid", proc.returncode == 0)
 
 
@@ -403,7 +417,7 @@ def test_goalflight_task_sync_writes_mirror_only_derived_status() -> None:
         proc = run_task(project, "sync", "--by", "watcher")
         assert_true(f"sync exits 0: {proc.stderr}", proc.returncode == 0)
         docs = project / "docs-private"
-        data_js = (docs / "tasks-data.js").read_text(encoding="utf-8")
+        data_js = (project / "dashboard" / "tasks-data.js").read_text(encoding="utf-8")
         payload = data_js.split("window.GF_ITEMS = ", 1)[1].split(";\nif", 1)[0]
         data_items = {item["id"]: item for item in json.loads(payload)}
         assert_true("working derived status in mirror", data_items["t-001"]["derived_status"] == "working")
@@ -411,7 +425,7 @@ def test_goalflight_task_sync_writes_mirror_only_derived_status() -> None:
         assert_true("done unresolved remains awaiting review in mirror", data_items["t-003"]["derived_status"] == "awaiting-review")
         assert_true("decision derived status in mirror", data_items["q-001"]["derived_status"] == "decision")
         assert_true("derived status not persisted", all("derived_status" not in item for item in _read_items(project)))
-        proc = run_checker(docs)
+        proc = run_live_checker(project)
         assert_true("mirror with derived_status passes checker", proc.returncode == 0)
 
 
@@ -1214,8 +1228,9 @@ def test_goalflight_task_atomic_write_rejects_bad_content() -> None:
         proc = run_task(project, "new", "Good task")
         assert_true(f"seed new exits 0: {proc.stderr}", proc.returncode == 0)
         docs = project / "docs-private"
+        dashboard = project / "dashboard"
         before_jsonl = (docs / "tasks.jsonl").read_text(encoding="utf-8")
-        before_data = (docs / "tasks-data.js").read_text(encoding="utf-8")
+        before_data = (dashboard / "tasks-data.js").read_text(encoding="utf-8")
 
         module = _load_goalflight_task_module()
         store = module.TaskStore(project)
@@ -1241,8 +1256,8 @@ def test_goalflight_task_atomic_write_rejects_bad_content() -> None:
             raise AssertionError("bad write unexpectedly succeeded")
 
         assert_true("tasks.jsonl unchanged after rejected write", (docs / "tasks.jsonl").read_text(encoding="utf-8") == before_jsonl)
-        assert_true("tasks-data.js unchanged after rejected write", (docs / "tasks-data.js").read_text(encoding="utf-8") == before_data)
-        proc = run_checker(docs)
+        assert_true("tasks-data.js unchanged after rejected write", (dashboard / "tasks-data.js").read_text(encoding="utf-8") == before_data)
+        proc = run_live_checker(project)
         assert_true("live pair still valid", proc.returncode == 0)
 
 
@@ -1273,9 +1288,9 @@ def test_goalflight_task_interrupted_publish_marker_repairs_mirror() -> None:
         payload = json.loads(proc.stdout)
         assert_true("status read canonical item", payload["items"][0]["title"] == "New canonical title")
         assert_true("publish marker cleared", not (docs / ".tasks-publish-incomplete.json").exists())
-        assert_true("mirror repaired to canonical title", "New canonical title" in (docs / "tasks-data.js").read_text(encoding="utf-8"))
+        assert_true("mirror repaired to canonical title", "New canonical title" in (project / "dashboard" / "tasks-data.js").read_text(encoding="utf-8"))
         assert_true("markdown repaired to canonical title", "New canonical title" in (docs / "task-decomposition.md").read_text(encoding="utf-8"))
-        proc = run_checker(docs)
+        proc = run_live_checker(project)
         assert_true("repaired pair passes checker", proc.returncode == 0)
 
 
@@ -1542,11 +1557,11 @@ def test_goalflight_task_sync_repairs_stale_mirror() -> None:
         docs = project / "docs-private"
         stale = dict(item)
         stale["title"] = "Stale mirror title"
-        (docs / "tasks-data.js").write_text("window.GF_ITEMS = " + json.dumps([stale], indent=2) + ";\n", encoding="utf-8")
+        (project / "dashboard" / "tasks-data.js").write_text("window.GF_ITEMS = " + json.dumps([stale], indent=2) + ";\n", encoding="utf-8")
 
         proc = run_task(project, "sync", "--by", "watcher")
         assert_true(f"sync exits 0: {proc.stderr}", proc.returncode == 0)
-        proc = run_checker(docs)
+        proc = run_live_checker(project)
         assert_true("sync repaired mirror", proc.returncode == 0)
 
 
@@ -1564,12 +1579,11 @@ def test_goalflight_task_data_js_escapes_script_end_and_html() -> None:
             "prompt </script><img src=x onerror=alert(1)>",
         )
         assert_true(f"new with script-like title exits 0: {proc.stderr}", proc.returncode == 0)
-        docs = project / "docs-private"
-        data_js = (docs / "tasks-data.js").read_text(encoding="utf-8")
+        data_js = (project / "dashboard" / "tasks-data.js").read_text(encoding="utf-8")
         assert_true("script end escaped", "</script" not in data_js.lower())
         assert_true("raw img tag escaped", "<img" not in data_js.lower())
         assert_true("json payload carries escaped script start", "\\u003c/script" in data_js.lower())
-        proc = run_checker(docs)
+        proc = run_live_checker(project)
         assert_true("escaped data mirror remains valid", proc.returncode == 0)
 
 

@@ -6,8 +6,9 @@
 // window.GF_ITEMS array in tasks-data.js. goalflight_task.py `sync` writes the
 // generated mirror, and this checker fails loudly on any drift.
 //
-// Usage:  node scripts/check_tasks_mirror.js [<dir>]
-//   <dir> holds tasks.jsonl + tasks-data.js.
+// Usage:  node scripts/check_tasks_mirror.js [<store-dir> [<dashboard-dir>]]
+//   <store-dir> holds tasks.jsonl.
+//   <dashboard-dir> holds tasks-data.js. If omitted, <store-dir> is used.
 //   Defaults to templates/state-skeleton/ (the tracked known-good fixture).
 //
 // Hermetic: node-only, no network, no localhost. tasks-data.js is loaded inside
@@ -201,9 +202,10 @@ function assertMirrorDerivedStatus(items, file) {
 }
 
 function main() {
-  const dir = process.argv[2] ? path.resolve(process.argv[2]) : DEFAULT_DIR;
-  const jsonlPath = path.join(dir, "tasks.jsonl");
-  const dataJsPath = path.join(dir, "tasks-data.js");
+  const storeDir = process.argv[2] ? path.resolve(process.argv[2]) : DEFAULT_DIR;
+  const dashboardDir = process.argv[3] ? path.resolve(process.argv[3]) : storeDir;
+  const jsonlPath = path.join(storeDir, "tasks.jsonl");
+  const dataJsPath = path.join(dashboardDir, "tasks-data.js");
 
   for (const p of [jsonlPath, dataJsPath]) {
     requireRegularFile(p);
@@ -255,7 +257,8 @@ function main() {
     fail(`item ${id} differs between the two files:\n  ` + diffs.join("\n  "));
   }
 
-  console.log(`OK: tasks mirror in sync — ${jsonlItems.length} items, ids match, no status key (${dir})`);
+  const where = storeDir === dashboardDir ? storeDir : `${storeDir} <-> ${dashboardDir}`;
+  console.log(`OK: tasks mirror in sync — ${jsonlItems.length} items, ids match, no status key (${where})`);
 }
 
 main();

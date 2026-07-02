@@ -31,15 +31,13 @@ handoff/summary to survive.
   under context pressure append a stub and expand later. (Complements RESUME-NOTES;
   does not replace it.)
 
-## Canonical layout (under `docs-private/`)
+## Canonical layout (`docs-private/` store + repo-root `dashboard/`)
 
 `docs-private/` gitignore status is **per-repo** (ADR-006): public repos ignore
 it; private repos may track it — the layout works either way. Flat, minimal:
 
 ```
 docs-private/
-  index.html                  # static dashboard; renders from tasks-data.js
-  questions-for-user.html     # static decision view; renders from tasks-data.js
   RESUME-NOTES-<date>.md       # LIVING pin (newest) = loop-prompt target
   history.md                  # write-once project history (append-only, additive)
   NORTH-STAR.md               # invariant goal + non-goals
@@ -58,12 +56,21 @@ docs-private/
   research/                   # investigations / sweep findings (folder)
   # runtime/infra — machine-owned, pinned by reference, NEVER relocated:
   dispatch/  mail/  prompts/  rag/  goal-queue-*.md  *.lock
+
+dashboard/
+  gf.js                       # shared static renderer
+  tasks-data.js               # generated browser mirror of docs-private/tasks.jsonl
+  index.html                  # static dashboard
+  tickets.html  ticket.html   # ticket list/detail views
+  current-activity.html       # active work view
+  questions-for-user.html     # static decision view
+  burndown.html               # burndown trend view
 ```
 
 `tasks.jsonl` is canonical (ADR-002/004): `task-decomposition.md` /
 `tasks-done.md` / `bug-backlog.md` / `bugs-done.md` are GENERATED snapshots,
-while `index.html` and `questions-for-user.html` are static client-side views
-over `tasks-data.js`. Add/edit tasks via `goalflight_task.py` (don't hand-edit
+while the static client-side views in repo-root `dashboard/` render over
+`dashboard/tasks-data.js`. Add/edit tasks via `goalflight_task.py` (don't hand-edit
 generated snapshots). A task lives in exactly one derived state; `done` marks
 DONE/awaiting-review and `accept` moves it to DONE-REVIEWED. Bugs follow the
 same split. Status is machine-owned — see [task-lifecycle.md](task-lifecycle.md).
@@ -74,18 +81,19 @@ Open decision prose that blocks work lives here, each listing the task chunk ids
 it blocks (`Blocks: t-014, t-016`). When answered, the decision becomes a
 greppable `### ADR-NNN —` heading in the same file's "Decided" section — the
 decision log lives in one place agents can grep. Decision items also live in
-`tasks.jsonl`; `questions-for-user.html` renders the open decision items
-client-side from `tasks-data.js`, and the dashboard surfaces them with links to
-the tasks they hold up.
+`tasks.jsonl`; `dashboard/questions-for-user.html` renders the open decision
+items client-side from `dashboard/tasks-data.js`, and the dashboard surfaces
+them with links to the tasks they hold up.
 
-## Human views — index.html + questions-for-user.html
+## Human views — dashboard/*.html
 
-The only HTML, in `docs-private/` root (no `dashboard/` subfolder, no separate
-stylesheet — CSS inlined so each page renders standalone in a browser). Markdown
-sources stay chat-console previewable; JS-rendered HTML is browser UI. Minimal
-text: no editorial chrome, no copyright, no live HEAD (provenance lives in the
-RESUME-NOTES pin). See [progress-dashboard.md](progress-dashboard.md) for
-rendering rules and [task-lifecycle.md](task-lifecycle.md) for status sections.
+Browser-facing HTML/JS lives in repo-root `dashboard/`; private Markdown and the
+canonical JSONL store stay under `docs-private/`. CSS is inlined so each page
+renders standalone in a browser. Markdown sources stay chat-console previewable;
+JS-rendered HTML is browser UI. Minimal text: no editorial chrome, no copyright,
+no live HEAD (provenance lives in the RESUME-NOTES pin). See
+[progress-dashboard.md](progress-dashboard.md) for rendering rules and
+[task-lifecycle.md](task-lifecycle.md) for status sections.
 
 ## AGENTS.md pin (per project)
 
@@ -107,11 +115,13 @@ Bug INSTANCES stay project-local; bug SHAPES are shared.
 - `init` scaffolds the layout from `templates/state-skeleton/` (stubs present-even-
   if-empty; the RESUME-NOTES pin comes from `templates/resume-notes.md`); `doctor`
   checks the tree + the AGENTS.md pin; `goalflight_task.py sync` emits
-  `tasks-data.js` plus markdown snapshots. Static HTML views render client-side
-  from the mirror; `questions-for-user.md` remains the human source for decision
-  prose while `questions-for-user.html` renders open decision items from
-  `tasks-data.js`. The scaffold dir is named off `docs-private` on purpose so the
-  repo's ignore-everywhere rule (where present) stays intact.
+  `dashboard/tasks-data.js` plus markdown snapshots under `docs-private/`.
+  Static HTML views in `dashboard/` render client-side from the mirror;
+  `docs-private/questions-for-user.md` remains the human source for decision
+  prose while `dashboard/questions-for-user.html` renders open decision items
+  from `dashboard/tasks-data.js`. The scaffold keeps private state under
+  `docs-private/` and browser-facing assets under `dashboard/` so each path can
+  follow its own gitignore policy.
 - Migrating existing projects is non-destructive and **branches on
    `git check-ignore docs-private/`** (some private repos track it instead of ignoring — both are fine):
    dry-run the scaffold, create canonical paths if absent (never clobber), and
