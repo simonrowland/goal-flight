@@ -1,0 +1,242 @@
+#!/usr/bin/env python3
+"""Focused tests for harvest --source manual markdown ingestion."""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+TASK = ROOT / "goalflight_task.py"
+
+
+def assert_true(name: str, condition: bool) -> None:
+    if not condition:
+        raise AssertionError(name)
+
+
+def run_task(project_root: Path, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, str(TASK), "--project-root", str(project_root), *args],
+        cwd=str(ROOT),
+        env=os.environ.copy(),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=30,
+        check=False,
+    )
+
+
+def _load_goalflight_task_module():
+    spec = importlib.util.spec_from_file_location("goalflight_task", TASK)
+    assert_true("goalflight_task.py import spec", spec is not None and spec.loader is not None)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["goalflight_task"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _write_tasks(project_root: Path, items: list[dict]) -> None:
+    docs = project_root / "docs-private"
+    docs.mkdir(parents=True, exist_ok=True)
+    (docs / "tasks.jsonl").write_text(
+        "".join(json.dumps(item, separators=(",", ":")) + "\n" for item in items),
+        encoding="utf-8",
+    )
+    module = _load_goalflight_task_module()
+    (docs / "tasks-data.js").write_text(module._items_data_js(items), encoding="utf-8")
+
+
+def _read_items(project_root: Path) -> list[dict]:
+    path = project_root / "docs-private" / "tasks.jsonl"
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def test_harvest_source_dry_run_json_flags_and_idempotency() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        project = Path(td)
+        docs = project / "docs-private"
+        _write_tasks(project, [])
+        (docs / "known-issues.md").write_text(
+            "\n".join(
+                [
+                    "# Known Issues",
+                    "",
+                    "- Manual issue one",
+                    "* [ ] Manual issue two",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        proc = run_task(project, "harvest", "--source", "docs-private/known-issues.md", "--kind", "bug", "--lane", "triage", "--dry-run", "--json")
+        assert_true(f"source dry-run exits 0: {proc.stderr}", proc.returncode == 0)
+        payload = json.loads(proc.stdout)
+        assert_true("dry-run creates nothing", payload["created"] == [])
+        assert_true("dry-run source summary counts match", payload["source_matches"] == [{"candidates": 2, "matches": 1, "pattern": "docs-private/known-issues.md"}])
+        drafts = payload["drafts"]
+        assert_true("dry-run emits draft shape", len(drafts) == 2)
+        assert_true("source kind applied", all(draft["kind"] == "bug" for draft in drafts))
+        assert_true("source lane applied", all(draft["lane"] == "triage" for draft in drafts))
+        assert_true("source tag applied", all("manual-source" in draft["tags"] for draft in drafts))
+        assert_true("no durable status in drafts", all("status" not in draft for draft in drafts))
+
+        proc = run_task(project, "harvest", "--source", "docs-private/known-issues.md", "--kind", "bug", "--lane", "triage", "--json")
+        assert_true(f"source harvest exits 0: {proc.stderr}", proc.returncode == 0)
+        payload = json.loads(proc.stdout)
+        assert_true("source harvest creates two", len(payload["created"]) == 2)
+        items = _read_items(project)
+        assert_true("stored source items have lane", all(item["lane"] == "triage" for item in items))
+        assert_true("stored source items have kind", all(item["kind"] == "bug" for item in items))
+        assert_true("stored source items have no status", all("status" not in item for item in items))
+
+        proc = run_task(project, "harvest", "--source", "docs-private/known-issues.md", "--kind", "bug", "--lane", "triage", "--json")
+        assert_true(f"second source harvest exits 0: {proc.stderr}", proc.returncode == 0)
+        payload = json.loads(proc.stdout)
+        assert_true("second source harvest dedups", payload["created"] == [] and payload["skipped"] == 2)
+
+
+def test_harvest_source_globs_guards_and_zero_match_summary() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        project = Path(td)
+        docs = project / "docs-private"
+        _write_tasks(project, [])
+        (docs / "known-issues.md").write_text("- Manual glob issue\n", encoding="utf-8")
+        (docs / "task-decomposition.md").write_text("- Managed source should skip\n", encoding="utf-8")
+        (docs / "bug-backlog.md").write_text(
+            "Generated by `goalflight_task.py sync`\n\n- Generated source should skip\n",
+            encoding="utf-8",
+        )
+        nested = project / "notes" / "backlog"
+        nested.mkdir(parents=True)
+        (nested / "todo.md").write_text("1. Nested glob issue\n", encoding="utf-8")
+
+        proc = run_task(
+            project,
+            "harvest",
+            "--source",
+            "docs-private/*.md",
+            "--source",
+            "notes/**/*.md",
+            "--source",
+            "missing-*.md",
+            "--dry-run",
+            "--json",
+        )
+        assert_true(f"glob source dry-run exits 0: {proc.stderr}", proc.returncode == 0)
+        payload = json.loads(proc.stdout)
+        titles = [draft["title"] for draft in payload["drafts"]]
+        assert_true("top-level glob source harvested", "Manual glob issue" in titles)
+        assert_true("nested glob source harvested", "Nested glob issue" in titles)
+        assert_true("managed source skipped", "Managed source should skip" not in titles)
+        assert_true("generated source skipped", "Generated source should skip" not in titles)
+        assert_true("default kind task", all(draft["kind"] == "task" for draft in payload["drafts"]))
+        assert_true("default lane deferred", all(draft["lane"] == "deferred" for draft in payload["drafts"]))
+        assert_true("zero-match glob summarized", any(summary == {"pattern": "missing-*.md", "matches": 0, "candidates": 0} for summary in payload["source_matches"]))
+
+        proc = run_task(project, "harvest", "--source", "missing-*.md", "--dry-run")
+        assert_true(f"zero-match dry-run exits 0: {proc.stderr}", proc.returncode == 0)
+        assert_true("zero-match text summary visible", "0 matches for missing-*.md" in proc.stdout)
+
+        # Broadest glob (`docs-private/*`, no .md filter) sweeps up tasks-data.js
+        # and the generated views — the managed-source guard must skip them all
+        # without error, still harvesting only the legitimate list.
+        proc = run_task(project, "harvest", "--source", "docs-private/*", "--dry-run", "--json")
+        assert_true(f"broad glob dry-run exits 0: {proc.stderr}", proc.returncode == 0)
+        payload = json.loads(proc.stdout)
+        titles = [draft["title"] for draft in payload["drafts"]]
+        assert_true("broad glob still harvests the real list", "Manual glob issue" in titles)
+        assert_true("broad glob skips managed/generated sources", all("should skip" not in title for title in titles))
+        assert_true(
+            "broad glob never emits a tasks-data.js draft",
+            all("tasks-data" not in str(draft.get("source_ref", "")) for draft in payload["drafts"]),
+        )
+
+
+def test_harvest_source_refuses_escaping_and_non_regular_paths() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        project = root / "project"
+        docs = project / "docs-private"
+        _write_tasks(project, [])
+        (root / "outside.md").write_text("- Outside issue\n", encoding="utf-8")
+
+        proc = run_task(project, "harvest", "--source", "../outside.md", "--dry-run")
+        assert_true("escaping source fails", proc.returncode == 1)
+        assert_true("dot-dot syntax refused", "'..' components are not allowed" in proc.stderr)
+
+        # Re-entering syntax (../project/...) lands INSIDE the root but still
+        # violates the project-root-relative contract — refused up front.
+        (docs / "inside.md").write_text("- Inside issue\n", encoding="utf-8")
+        proc = run_task(project, "harvest", "--source", "../project/docs-private/inside.md", "--dry-run")
+        assert_true("dot-dot re-entry fails", proc.returncode == 1)
+        assert_true("dot-dot re-entry refused", "'..' components are not allowed" in proc.stderr)
+
+        # Absolute patterns are refused even when they point inside the root.
+        proc = run_task(project, "harvest", "--source", str(docs / "inside.md"), "--dry-run")
+        assert_true("absolute source fails", proc.returncode == 1)
+        assert_true("absolute source refused", "not absolute" in proc.stderr)
+
+        (docs / "folder.md").mkdir()
+        proc = run_task(project, "harvest", "--source", "docs-private/folder.md", "--dry-run")
+        assert_true("non-regular source fails", proc.returncode == 1)
+        assert_true("non-regular source refused", "non-regular file" in proc.stderr)
+
+        # Symlinks are refused by the is_symlink guard itself — target a file
+        # INSIDE the root so the containment check passes and the symlink
+        # check is what fires. (An outside-target symlink is refused earlier
+        # by containment; that path is covered above.)
+        (docs / "link.md").symlink_to(docs / "inside.md")
+        proc = run_task(project, "harvest", "--source", "docs-private/link.md", "--dry-run")
+        assert_true("symlink source fails", proc.returncode == 1)
+        assert_true("symlink source refused", "non-regular file" in proc.stderr)
+
+
+def test_harvest_without_source_keeps_builtin_behavior() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        project = Path(td)
+        docs = project / "docs-private"
+        _write_tasks(project, [])
+        (docs / "known-issues.md").write_text("- Invisible without --source\n", encoding="utf-8")
+        (docs / "bug-backlog.md").write_text(
+            "\n".join(
+                [
+                    "# Bug Backlog",
+                    "",
+                    "### bp-101",
+                    "",
+                    "**Built-in backlog bug**",
+                    "",
+                    "- Status: to do",
+                    "",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        proc = run_task(project, "harvest", "--json")
+        assert_true(f"builtin harvest exits 0: {proc.stderr}", proc.returncode == 0)
+        payload = json.loads(proc.stdout)
+        assert_true("only builtin candidate created", len(payload["created"]) == 1)
+        assert_true("no-source payload keeps legacy shape", "source_matches" not in payload)
+        items = _read_items(project)
+        assert_true("builtin source remains bug backlog", items[0]["harvest_source"] == "bug-backlog")
+        assert_true("builtin kind remains bug", items[0]["kind"] == "bug")
+        assert_true("builtin item has no source lane", "lane" not in items[0])
+        assert_true("manual list invisible without source", items[0]["title"] == "Built-in backlog bug")
+
+
+if __name__ == "__main__":
+    test_harvest_source_dry_run_json_flags_and_idempotency()
+    test_harvest_source_globs_guards_and_zero_match_summary()
+    test_harvest_source_refuses_escaping_and_non_regular_paths()
+    test_harvest_without_source_keeps_builtin_behavior()
+    print("PASS")

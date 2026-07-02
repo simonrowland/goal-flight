@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime as dt
+import glob
 import hashlib
 import html
 import json
@@ -1535,6 +1536,7 @@ def _harvest_heading_blocks(
     *,
     default_kind: str,
     source_type: str,
+    lane: str | None = None,
 ) -> list[dict[str, Any]]:
     if not require_regular_or_absent(path):
         return []
@@ -1550,17 +1552,17 @@ def _harvest_heading_blocks(
             return
         title = current.get("title") or current.get("heading") or ""
         ref = str(current.get("ref") or "")
-        _append_candidate(
-            candidates,
-            _harvest_candidate(
-                store,
-                kind=_kind_from_reference(ref, default_kind),
-                title=str(title),
-                source_path=path,
-                source_type=source_type,
-                line=int(current.get("line") or 0),
-            ),
+        candidate = _harvest_candidate(
+            store,
+            kind=_kind_from_reference(ref, default_kind),
+            title=str(title),
+            source_path=path,
+            source_type=source_type,
+            line=int(current.get("line") or 0),
         )
+        if candidate is not None and lane is not None:
+            candidate["lane"] = lane
+        _append_candidate(candidates, candidate)
         current = None
 
     text = path.read_text(encoding="utf-8", errors="replace")
@@ -1580,17 +1582,17 @@ def _harvest_heading_blocks(
         if current is None:
             list_item = re.match(r"^\s*(?:[-*]\s+|\d+[.)]\s+)(?:\[[ xX]\]\s+)?(.+?)\s*$", line)
             if list_item and "Status:" not in list_item.group(1) and not _harvest_has_placeholder(list_item.group(1)):
-                _append_candidate(
-                    candidates,
-                    _harvest_candidate(
-                        store,
-                        kind=default_kind,
-                        title=list_item.group(1),
-                        source_path=path,
-                        source_type=source_type,
-                        line=lineno,
-                    ),
+                candidate = _harvest_candidate(
+                    store,
+                    kind=default_kind,
+                    title=list_item.group(1),
+                    source_path=path,
+                    source_type=source_type,
+                    line=lineno,
                 )
+                if candidate is not None and lane is not None:
+                    candidate["lane"] = lane
+                _append_candidate(candidates, candidate)
             continue
         bold = re.search(r"\*\*(.+?)\*\*", line)
         if bold and not current.get("title"):
@@ -1700,8 +1702,49 @@ def _harvest_resume_candidates(store: TaskStore) -> list[dict[str, Any]]:
     return candidates
 
 
-def _collect_harvest_candidates(store: TaskStore) -> list[dict[str, Any]]:
+def _resolve_harvest_source_paths(store: TaskStore, pattern: str) -> tuple[list[Path], dict[str, Any]]:
+    root = store.project_root.resolve(strict=False)
+    # Reject escape-shaped SYNTAX up front (absolute paths, any `..` component) —
+    # the post-glob containment check below catches true escapes, but absolute /
+    # re-entering patterns violate the project-root-relative contract even when
+    # they land inside the root.
+    if Path(pattern).is_absolute():
+        raise TaskError(f"--source {pattern!r}: must be project-root-relative, not absolute")
+    if ".." in Path(pattern).parts:
+        raise TaskError(f"--source {pattern!r}: '..' components are not allowed")
+    matches: list[Path] = []
+    seen: set[str] = set()
+    for raw in glob.glob(str(root / pattern), recursive=True):
+        path = Path(raw)
+        resolved = path.resolve(strict=False)
+        try:
+            resolved.relative_to(root)
+        except ValueError as exc:
+            raise TaskError(f"--source {pattern!r} matched path outside project root: {path}") from exc
+        try:
+            st = os.lstat(resolved)
+        except OSError as exc:
+            raise TaskError(f"{path}: cannot stat safely before open: {exc}") from exc
+        if path.is_symlink() or not stat.S_ISREG(st.st_mode):
+            raise TaskError(f"{path}: refusing to harvest non-regular file")
+        key = resolved.as_posix()
+        if key in seen:
+            continue
+        seen.add(key)
+        matches.append(resolved)
+    matches.sort(key=lambda candidate: candidate.relative_to(root).as_posix())
+    return matches, {"pattern": pattern, "matches": len(matches)}
+
+
+def _collect_harvest_candidates(
+    store: TaskStore,
+    *,
+    source_patterns: list[str] | None = None,
+    source_kind: str = "task",
+    source_lane: str | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     candidates: list[dict[str, Any]] = []
+    source_matches: list[dict[str, Any]] = []
     bug_paths = [
         store.docs_dir / "bug-backlog.md",
         *store.docs_dir.glob("bug-pattern*.md"),
@@ -1711,10 +1754,25 @@ def _collect_harvest_candidates(store: TaskStore) -> list[dict[str, Any]]:
         candidates.extend(_harvest_heading_blocks(store, path, default_kind="bug", source_type="bug-backlog"))
     candidates.extend(_harvest_review_candidates(store))
     candidates.extend(_harvest_resume_candidates(store))
+    for pattern in source_patterns or []:
+        paths, summary = _resolve_harvest_source_paths(store, pattern)
+        before = len(candidates)
+        for path in paths:
+            candidates.extend(
+                _harvest_heading_blocks(
+                    store,
+                    path,
+                    default_kind=source_kind,
+                    source_type="manual-source",
+                    lane=source_lane,
+                )
+            )
+        summary["candidates"] = len(candidates) - before
+        source_matches.append(summary)
     deduped: list[dict[str, Any]] = []
     for candidate in candidates:
         _append_candidate(deduped, candidate)
-    return deduped
+    return deduped, source_matches
 
 
 def _existing_harvest_keys(items: list[dict[str, Any]]) -> tuple[set[str], set[tuple[str, str]]]:
@@ -1749,6 +1807,7 @@ def _add_harvest_candidates(store: TaskStore, items: list[dict[str, Any]], actor
             actor=actor,
             links=LIST_TYPE(candidate.get("links") or []),
             tags=LIST_TYPE(candidate.get("tags") or HARVEST_DRAFT_TAGS),
+            lane=candidate.get("lane"),
         )
         for field in ("source", "source_ref", "harvest_source", "harvest_key", "severity", "pattern"):
             value = candidate.get(field)
@@ -2112,10 +2171,30 @@ def _cmd_review(store: TaskStore, args: argparse.Namespace) -> int:
 
 def _cmd_harvest(store: TaskStore, args: argparse.Namespace) -> int:
     actor = _actor(args)
-    candidates = _collect_harvest_candidates(store)
+    _validate_lane_arg(args.lane)
+    candidates, source_matches = _collect_harvest_candidates(
+        store,
+        source_patterns=args.sources,
+        source_kind=args.kind,
+        source_lane=args.lane if args.sources else None,
+    )
     if args.dry_run:
-        payload = {"created": [], "skipped": 0, "candidates": len(candidates), "history_added": [], "drafts": candidates}
-        print(json.dumps(payload, ensure_ascii=False, sort_keys=True) if args.json else "\n".join(str(item["title"]) for item in candidates))
+        payload = {
+            "created": [],
+            "skipped": 0,
+            "candidates": len(candidates),
+            "history_added": [],
+            "drafts": candidates,
+        }
+        if getattr(args, "sources", None):
+            # Keep the legacy no-source JSON shape byte-stable for existing consumers.
+            payload["source_matches"] = source_matches
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        else:
+            lines = [str(item["title"]) for item in candidates]
+            lines.extend(f"0 matches for {summary['pattern']}" for summary in source_matches if summary["matches"] == 0)
+            print("\n".join(lines))
         return 0
 
     def update(items: list[dict[str, Any]]) -> dict[str, Any]:
@@ -2123,10 +2202,14 @@ def _cmd_harvest(store: TaskStore, args: argparse.Namespace) -> int:
 
     result = store.mutate_items(update, allow_invalid_live_mirror=True)
     result["history_added"] = [] if args.no_history else _append_resume_history(store, actor)
+    if getattr(args, "sources", None):
+        # Keep the legacy no-source JSON shape byte-stable for existing consumers.
+        result["source_matches"] = source_matches
     if args.json:
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     else:
-        print(f"OK: harvest created {len(result['created'])} draft items ({result['skipped']} skipped, {len(result['history_added'])} history entries)")
+        source_summary = "".join(f", 0 matches for {summary['pattern']}" for summary in source_matches if summary["matches"] == 0)
+        print(f"OK: harvest created {len(result['created'])} draft items ({result['skipped']} skipped, {len(result['history_added'])} history entries{source_summary})")
     return 0
 
 
@@ -2468,12 +2551,26 @@ def build_parser() -> argparse.ArgumentParser:
     harvest = sub.add_parser(
         "harvest",
         help="Harvest open-work sources into draft task/bug/decision items and backfill history.md from RESUME-NOTES.",
-        epilog="example: goalflight_task.py harvest --json",
+        epilog=(
+            "examples:\n"
+            "  goalflight_task.py harvest --json\n"
+            "  goalflight_task.py harvest --source docs-private/known-issues.md --kind bug --lane deferred --dry-run --json"
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     harvest.add_argument("--by", help=argparse.SUPPRESS)
     harvest.add_argument("--dry-run", action="store_true", help="Print discovered draft candidates without writing items or history.")
     harvest.add_argument("--no-history", action="store_true", help="Skip RESUME-NOTES -> history.md backfill.")
+    harvest.add_argument(
+        "--source",
+        dest="sources",
+        action="append",
+        default=[],
+        metavar="<glob>",
+        help="Also harvest arbitrary markdown lists matched by a project-root-relative glob, e.g. docs-private/known-issues.md or notes/**/*.md.",
+    )
+    harvest.add_argument("--kind", choices=["task", "bug", "decision"], default="task", help="Default kind for items from --source files.")
+    harvest.add_argument("--lane", default="deferred", help="Lane stamped on items from --source files.")
     harvest.add_argument("--json", action="store_true")
     harvest.set_defaults(func=_cmd_harvest)
 
