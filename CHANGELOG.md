@@ -14,6 +14,13 @@ incremented when meaningful skill behaviour changes.
   including guarded `harvest --source` scanning, `migrate --source` previews,
   source caps, managed-state skip summaries, `append` notes, and `pipe`
   handoff output for queued work.
+- Migration parser depth: markdown table rows with explicit open-work states
+  import as candidates (closed/neutral rows skip); `--headings-as-tasks`
+  promotes work-item headings and captures each promoted section's body as the
+  draft's prompt (context-rich, zero phantom bullet candidates); row-scoped
+  dedup keeps repeated row-local titles while staying idempotent across runs
+  (position-stable semantics documented). Field-proven by migrating this
+  repository's own historical backlog and goal queues into the store.
 - Loop-control verbs and readiness surfaces for continuing queued work from the
   task store, including autonomous resume guidance when ready frontier items
   exist.
