@@ -10,6 +10,7 @@ out unless ``--all-projects`` is given.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import re
 import shlex
@@ -25,6 +26,7 @@ import goalflight_capacity
 import goalflight_compat
 import goalflight_dispatch_states as dispatch_states
 import goalflight_ledger
+import goalflight_quota_stuck
 from goalflight_liveness import cpu_confirmed_idle
 import goalflight_milestone
 from goalflight_watch import BLOCKING_TERMINAL_MARKERS, SUCCESS_TERMINAL_MARKERS, _final_terminal_marker
@@ -52,6 +54,15 @@ _WAIT_STALE_GRACE_S = 600.0
 _WAIT_HEARTBEAT_S = 1200.0
 _WAIT_CPU_EPSILON = 0.1
 _WAIT_TAIL_COUNT_BYTES = 128 * 1024
+_DRAFT_ARTIFACT_FINALITY_FIELDS = frozenset(
+    {
+        "draft_complete",
+        "draft_artifact_complete",
+        "artifact_complete",
+        "output_complete",
+        "final_output",
+    }
+)
 
 
 def _has_recorded_worker_identity(record: dict) -> bool:
@@ -217,6 +228,133 @@ def _output_tail_reconcile_candidate(record: dict) -> bool:
     )
 
 
+def _persist_draft_artifact_reconciliation(record: dict, reconciled: dict) -> None:
+    reconciliation = reconciled.get("draft_artifact_reconciliation") or {}
+    if not reconciliation.get("promoted"):
+        return
+    dispatch_id = record.get("dispatch_id")
+    if not dispatch_id:
+        return
+    path = goalflight_ledger.record_path(str(dispatch_id))
+    if not path.exists():
+        return
+    with contextlib.suppress(Exception):
+        with goalflight_ledger.StateLock():
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if raw.get("terminal_state") == "complete" or raw.get("state") == "complete":
+                return
+            raw.setdefault("raw_state", raw.get("state"))
+            raw.setdefault("raw_terminal_state", raw.get("terminal_state"))
+            raw["state"] = "complete"
+            raw["terminal_state"] = "complete"
+            raw["ended_at"] = raw.get("ended_at") or goalflight_ledger.utc_now()
+            raw["reason"] = reconciled.get("reason")
+            raw["terminal_marker"] = reconciled.get("terminal_marker")
+            raw["terminal_marker_source"] = "draft_artifact"
+            raw["draft_artifact_reconciliation"] = reconciliation
+            raw["outcome"] = {
+                "terminal_state": "complete",
+                "draft_artifact_reconciliation": reconciliation,
+            }
+            goalflight_ledger.write_record(raw)
+
+
+def _status_json_payload(record: dict) -> dict:
+    status_path = record.get("status_path")
+    if not status_path:
+        return {}
+    try:
+        payload = json.loads(Path(str(status_path)).expanduser().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _ledger_record_payload(record: dict) -> dict:
+    dispatch_id = record.get("dispatch_id")
+    if not dispatch_id:
+        return {}
+    for raw in goalflight_ledger.read_records():
+        if raw.get("dispatch_id") == dispatch_id:
+            return raw
+    return {}
+
+
+def _artifact_provenance_final(payload: dict, artifact: Path) -> tuple[bool, str | None]:
+    for key in _DRAFT_ARTIFACT_FINALITY_FIELDS:
+        if payload.get(key) is True:
+            return True, key
+    for key in ("draft_artifact_provenance", "artifact_provenance", "output_artifact_provenance"):
+        provenance = payload.get(key)
+        if isinstance(provenance, dict) and provenance.get("final") is True:
+            return True, key
+    for key in ("final_output_path", "final_artifact_path"):
+        value = payload.get(key)
+        if value and Path(str(value)).expanduser() == artifact:
+            return True, key
+    return False, None
+
+
+def _draft_artifact_finality(record: dict, artifact: Path) -> tuple[bool, str]:
+    marker_kind = _record_terminal_marker_kind(record)
+    if marker_kind in _OUTPUT_TAIL_SUCCESS_MARKERS:
+        return True, f"marker:{marker_kind}"
+    for source, payload in (
+        ("record", record),
+        ("ledger", _ledger_record_payload(record)),
+        ("status", _status_json_payload(record)),
+    ):
+        ok, reason = _artifact_provenance_final(payload, artifact)
+        if ok:
+            return True, f"{source}:{reason}"
+    return False, "missing_finality"
+
+
+def _reconcile_draft_artifact_record(record: dict, *, tail: Path | None, tail_mtime: int | None) -> dict:
+    artifact = goalflight_quota_stuck.draft_artifact_for_record(record)
+    if artifact is None:
+        return record
+    final, finality_reason = _draft_artifact_finality(record, artifact)
+    if not final:
+        out = dict(record)
+        out["draft_artifact_reconciliation"] = {
+            "candidate": True,
+            "promoted": False,
+            "artifact_path": str(artifact),
+            "reason": finality_reason,
+        }
+        if tail is not None:
+            out["tail_path"] = str(tail)
+        out["tail_mtime"] = tail_mtime
+        return out
+    out = dict(record)
+    marker = {
+        "kind": "READY",
+        "payload": str(artifact),
+        "source": "draft_artifact",
+    }
+    out.setdefault("raw_classification", record.get("classification"))
+    out.setdefault("raw_state", record.get("state"))
+    out.setdefault("raw_terminal_state", record.get("terminal_state"))
+    out["classification"] = "complete"
+    out["state"] = "complete"
+    out["terminal_state"] = "complete"
+    out["reason"] = "draft_artifact:output_truth_reconciliation"
+    out["terminal_marker"] = marker
+    out["terminal_marker_source"] = "draft_artifact"
+    if tail is not None:
+        out["tail_path"] = str(tail)
+    out["tail_mtime"] = tail_mtime
+    out["draft_artifact_reconciliation"] = {
+        "candidate": True,
+        "promoted": True,
+        "artifact_path": str(artifact),
+        "reason": finality_reason,
+    }
+    _persist_draft_artifact_reconciliation(record, out)
+    return out
+
+
 def _reconcile_output_tail_record(record: dict) -> dict:
     """Read-only repair for launcher/watcher death after worker success.
 
@@ -228,10 +366,10 @@ def _reconcile_output_tail_record(record: dict) -> dict:
         return record
     tail = _tail_path_from_record(record)
     if tail is None:
-        return record
+        return _reconcile_draft_artifact_record(record, tail=None, tail_mtime=None)
     plausible, mtime = _tail_mtime_plausible(tail, record)
     if not plausible:
-        return record
+        return _reconcile_draft_artifact_record(record, tail=tail, tail_mtime=mtime)
     # Reconciliation runs on the worker-dead path, after no more output can
     # arrive, so it must scan the WHOLE tail for a terminal marker -- not just the
     # last line. Workers legitimately emit `READY:` then a trailing TL;DR/summary,
@@ -244,7 +382,7 @@ def _reconcile_output_tail_record(record: dict) -> dict:
     )
     marker_kind = marker.get("kind") if isinstance(marker, dict) else None
     if marker_kind not in _OUTPUT_TAIL_TERMINAL_MARKERS:
-        return record
+        return _reconcile_draft_artifact_record(record, tail=tail, tail_mtime=mtime)
     should_promote, gate_reason = _output_tail_reconcile_gate(record, tail_mtime=mtime)
     if not should_promote:
         # The tail HAS a terminal marker but the gate refused promotion — typically
@@ -424,6 +562,11 @@ def scope_payload(payload: dict, project_root: str | None) -> dict:
             for r in payload["dispatch"].get("records", [])
             if r.get("project_root") == project_root
         ],
+    )
+    out["rate_pressure"] = goalflight_quota_stuck.decorate_pressure_payload(
+        payload.get("rate_pressure") or {},
+        out["dispatch"].get("records", []),
+        window_seconds=int((payload.get("rate_pressure") or {}).get("window_seconds") or 600),
     )
     return out
 
@@ -968,6 +1111,52 @@ def _mail_summary(owned_dispatch_ids: set[str] | None = None) -> dict:
         return {}
 
 
+def _posted_advisory_keys(messages_dir: Path) -> set[str]:
+    try:
+        import goalflight_messages as _gm
+
+        envelopes = _gm.read_envelopes(
+            _gm.inbox_path(messages_dir, goalflight_quota_stuck.QUOTA_STUCK_CONTROLLER_DISPATCH_ID)
+        )
+    except Exception:
+        return set()
+    keys: set[str] = set()
+    for env in envelopes:
+        payload = env.get("payload") if isinstance(env, dict) else None
+        if isinstance(payload, dict) and payload.get("advisory_key"):
+            keys.add(str(payload["advisory_key"]))
+    return keys
+
+
+def _post_quota_advisories(payload: dict) -> None:
+    pressure = payload.get("rate_pressure") or {}
+    entries = pressure.get("providers_under_pressure") or []
+    if not entries:
+        return
+    try:
+        import goalflight_messages as _gm
+
+        messages_dir = _gm.default_messages_dir()
+        posted = _posted_advisory_keys(messages_dir)
+        for entry in entries:
+            if not entry.get("quota_hard_stop"):
+                continue
+            advisory = goalflight_quota_stuck.advisory_payload(entry)
+            key = str(advisory.get("advisory_key") or "")
+            if not key or key in posted:
+                continue
+            _gm.post_message(
+                dispatch_id=goalflight_quota_stuck.QUOTA_STUCK_CONTROLLER_DISPATCH_ID,
+                msg_type=goalflight_quota_stuck.QUOTA_STUCK_ADVISORY_TYPE,
+                payload=advisory,
+                messages_dir=messages_dir,
+                source={"adapter": "goalflight_status", "transport": "controller"},
+            )
+            posted.add(key)
+    except Exception:
+        return
+
+
 def render_text(payload: dict, limit: int) -> list[str]:
     scope = payload.get("scope", {})
     root = scope.get("project_root")
@@ -987,6 +1176,7 @@ def render_text(payload: dict, limit: int) -> list[str]:
     mail = payload.get("mail") or {}
     if mail.get("hint"):
         lines.extend(mail["hint"].splitlines())  # hint is multi-line (one detail row per need)
+    lines.extend(goalflight_quota_stuck.advisory_lines(payload.get("rate_pressure"), limit=limit))
     if payload.get("milestone"):
         lines.append(goalflight_milestone.format_line(payload["milestone"]))
     # Live/ambiguous first (what the controller is waiting on), then most-recent
@@ -1274,6 +1464,7 @@ def main(argv: list[str] | None = None) -> int:
         if r.get("dispatch_id")
     }
     payload["mail"] = _mail_summary(_owned)
+    _post_quota_advisories(payload)
 
     if args.json:
         print(json.dumps(payload, sort_keys=True))

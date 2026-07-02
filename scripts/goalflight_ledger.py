@@ -488,6 +488,16 @@ def status_payload() -> dict:
             "updated_at": r.get("updated_at"),
             "reason": r.get("reason"),
             "error": r.get("error"),
+            "artifact_path": r.get("artifact_path"),
+            "artifact_paths": r.get("artifact_paths"),
+            "artifacts": r.get("artifacts"),
+            "declared_artifacts": r.get("declared_artifacts"),
+            "draft_path": r.get("draft_path"),
+            "draft_paths": r.get("draft_paths"),
+            "output_path": r.get("output_path"),
+            "output_paths": r.get("output_paths"),
+            "result_path": r.get("result_path"),
+            "result_paths": r.get("result_paths"),
         }
         rows.append(row)
     return {
@@ -733,7 +743,7 @@ def build_parser() -> argparse.ArgumentParser:
     fin.add_argument("--dispatch-id", required=True)
     fin.add_argument("--state", default="complete")
     fin.add_argument("--reason")
-    fin.add_argument("--terminal-state", choices=["complete", "worker_dead", "idle_timeout", "watcher_stopped", "controller_dead", "blocked", "error", "unknown"])
+    fin.add_argument("--terminal-state", choices=["complete", "worker_dead", "idle_timeout", "watcher_stopped", "controller_dead", "blocked", "rate_limited", "error", "unknown"])
     fin.add_argument("--elapsed-s", type=float)
     fin.set_defaults(func=cmd_finish)
 

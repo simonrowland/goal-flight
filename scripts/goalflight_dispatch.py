@@ -60,7 +60,7 @@ import goalflight_dispatch_paths
 import goalflight_dispatch_states
 import goalflight_steer_mailbox
 import goalflight_ledger
-import goalflight_rate_pressure
+import goalflight_quota_stuck
 from goalflight_liveness import active_monotonic, process_group_id, write_status
 from goalflight_watch import (
     _final_terminal_marker,
@@ -80,7 +80,6 @@ PRESET_AGENTS = {"codex", "grok-code", "grok-research"}
 STDIN_PROMPT_AGENTS = {"codex", "grok-code", "grok-research"}
 DEFAULT_MAX_IDLE_SECS = 180.0
 CODE_WRITER_MAX_IDLE_SECS = 600.0
-RATE_LIMIT_TAIL_BYTES = 2048
 CODE_WRITER_AGENTS = {"codex", "codex-acp", "grok-code", "grok-acp", "cursor", "cursor-agent"}
 ACCOUNT_ENGINE_BY_AGENT = {
     "codex": "codex",
@@ -307,31 +306,24 @@ def _status_exit_code(state: object) -> int:
     return 1
 
 
-def _read_tail_excerpt(path: Path, max_bytes: int = RATE_LIMIT_TAIL_BYTES) -> str:
-    try:
-        size = path.stat().st_size
-        with path.open("rb") as f:
-            f.seek(max(0, size - max_bytes))
-            return f.read(max_bytes).decode("utf-8", errors="replace")
-    except OSError:
-        return ""
-
-
-def _worker_dead_rate_limit_reason(state: str | None, reason: str | None, tail: Path) -> object:
-    if state != "worker_dead":
-        return reason
-    excerpt = _read_tail_excerpt(tail).strip()
-    if not excerpt:
-        return reason
-    if not goalflight_rate_pressure.detect_rate_limit_signature({"state": "worker_dead", "error": excerpt}, None):
-        return reason
-    signature = goalflight_rate_pressure.rate_limit_signature_in_text(excerpt)
-    return {
-        "message": "dispatch_worker_rate_limited",
-        "rate_limit_signature": signature or "unknown",
-        "tail_excerpt": excerpt,
-        "reason": reason,
-    }
+def _quota_limited_state_reason(
+    state: str | None,
+    reason: object,
+    tail: Path,
+    *,
+    agent: object,
+) -> tuple[str | None, object]:
+    if state not in {"idle_timeout", "rate_limited", "worker_dead"}:
+        return state, reason
+    quota_reason = goalflight_quota_stuck.quota_limited_reason(
+        agent=agent,
+        tail=tail,
+        previous_state=state,
+        previous_reason=reason,
+    )
+    if not quota_reason:
+        return state, reason
+    return "rate_limited", quota_reason
 
 
 def _is_status_terminal(state: object) -> bool:
@@ -1995,6 +1987,19 @@ def _release_stale_capacity_for_drain() -> None:
         )
 
 
+def _reap_quota_stuck_before_bash_launch() -> None:
+    with contextlib.suppress(Exception):
+        import goalflight_acp_client
+
+        result = goalflight_acp_client.reap_quota_stuck_workers()
+        if result.get("reaped"):
+            print(
+                "QUOTA-STUCK-REAP "
+                + json.dumps({"reaped": result.get("reaped")}, sort_keys=True),
+                flush=True,
+            )
+
+
 def _dispatch_record_is_terminal(record: dict | None) -> bool:
     if not record:
         return False
@@ -2569,8 +2574,10 @@ def _mark_claim_worker_dead(entry: dict, *, reason: str) -> None:
                 status_json=status_json,
                 tail=tail,
             )
+    state, terminal_reason = _quota_limited_state_reason("worker_dead", reason, tail, agent=args.agent)
+    terminal_state = str(state or "worker_dead")
     with contextlib.suppress(Exception):
-        _finish_ledger(dispatch_id, "worker_dead", reason, worker_still_alive=False)
+        _finish_ledger(dispatch_id, terminal_state, terminal_reason, worker_still_alive=False)
     with contextlib.suppress(Exception):
         write_status(
             status_json,
@@ -2579,9 +2586,9 @@ def _mark_claim_worker_dead(entry: dict, *, reason: str) -> None:
                 "dispatch_id": dispatch_id,
                 "agent": args.agent,
                 "shape": args.shape,
-                "state": "worker_dead",
-                "terminal_state": "worker_dead",
-                "reason": reason,
+                "state": terminal_state,
+                "terminal_state": terminal_state,
+                "reason": terminal_reason,
                 "project_root": str(project_root),
                 "worker_pid": entry.get("queue_worker_pid"),
                 "worker_alive": False,
@@ -3598,6 +3605,7 @@ def main(argv: list[str] | None = None) -> int:
     _emit_dispatch_warnings(dispatch_warnings, tail_path=tail, reset_tail=True)
     worker_stdout_mode = "ab" if dispatch_warnings else "wb"
     project_root = _project_root(args)
+    _reap_quota_stuck_before_bash_launch()
     worker_pid = None
     watcher_pid = None
     caffeinate_pid = None
@@ -3912,19 +3920,24 @@ def main(argv: list[str] | None = None) -> int:
         if final_worker_alive is None and worker_pid:
             final_worker_alive = goalflight_compat.pid_alive(worker_pid)
         keep_live_watcher_open = _is_live_watcher_stopped(final_state, final_worker_alive)
+        capacity_state, capacity_reason = _quota_limited_state_reason(
+            final_state,
+            final_reason,
+            tail,
+            agent=args.agent,
+        )
         if ledger_recorded and not detached_launched and not keep_live_watcher_open:
             with contextlib.suppress(Exception):
-                ledger_reason = _worker_dead_rate_limit_reason(final_state, final_reason, tail)
                 _finish_ledger(
                     args.dispatch_id,
-                    final_state,
-                    ledger_reason,
+                    str(capacity_state or final_state),
+                    capacity_reason,
                     elapsed_s=round(time.time() - dispatch_started, 3),
                     worker_still_alive=final_worker_alive,
                 )
         if not detached_launched and not keep_live_watcher_open:
             with contextlib.suppress(Exception):
-                _release_capacity(lease_id, final_state, final_reason)
+                _release_capacity(lease_id, str(capacity_state or final_state), capacity_reason)
             _cleanup_pidfile_if_worker_dead(pidfile, worker_pid)
 
 

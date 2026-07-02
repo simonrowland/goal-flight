@@ -27,6 +27,8 @@ from typing import Any, Callable, Protocol
 
 import goalflight_compat
 import goalflight_acp_permits as permits
+import goalflight_ledger
+import goalflight_quota_stuck
 from goalflight_adapter_readiness import validate_os_sandbox_request
 from goalflight_liveness import active_monotonic
 from goalflight_os_sandbox import OS_SANDBOX_OFF, canonical_os_sandbox, prepare_os_sandbox_command
@@ -318,8 +320,10 @@ def cleanup_ghosts(active_worker_pids: set[int] | None = None) -> int:
     own_worker_pids = active_worker_pids or set()
     killed = 0
     if not _PIDFILE_DIR.exists():
-        return killed + _shim_reap_killed_count(
-            reap_orphaned_acp_shims(active_worker_pids=own_worker_pids)
+        return (
+            killed
+            + _shim_reap_killed_count(reap_orphaned_acp_shims(active_worker_pids=own_worker_pids))
+            + _quota_reap_killed_count(reap_quota_stuck_workers())
         )
     skipped_stale = 0
     skipped_live_controller = 0
@@ -444,12 +448,21 @@ def cleanup_ghosts(active_worker_pids: set[int] | None = None) -> int:
             skipped_live_controller,
             skipped_detached,
         )
-    return killed + _shim_reap_killed_count(
-        reap_orphaned_acp_shims(active_worker_pids=own_worker_pids)
+    return (
+        killed
+        + _shim_reap_killed_count(reap_orphaned_acp_shims(active_worker_pids=own_worker_pids))
+        + _quota_reap_killed_count(reap_quota_stuck_workers())
     )
 
 
 def _shim_reap_killed_count(result: dict[str, Any]) -> int:
+    reaped = result.get("reaped")
+    if not isinstance(reaped, list):
+        return 0
+    return len(reaped)
+
+
+def _quota_reap_killed_count(result: dict[str, Any]) -> int:
     reaped = result.get("reaped")
     if not isinstance(reaped, list):
         return 0
@@ -555,7 +568,7 @@ def _is_claude_acp_shim_executable(comm: str, shim_paths: set[str]) -> bool:
 def _list_posix_process_rows() -> list[dict[str, Any]]:
     try:
         result = subprocess.run(
-            ["ps", "-axo", "pid=,ppid=,etime=,comm="],
+            ["ps", "-axo", "pid=,ppid=,etime=,lstart=,comm="],
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -574,8 +587,8 @@ def _list_posix_process_rows() -> list[dict[str, Any]]:
         line = line.strip()
         if not line:
             continue
-        parts = line.split(None, 3)
-        if len(parts) < 4:
+        parts = line.split(None, 8)
+        if len(parts) < 9:
             continue
         try:
             pid = int(parts[0])
@@ -583,12 +596,14 @@ def _list_posix_process_rows() -> list[dict[str, Any]]:
         except ValueError:
             continue
         etime = parts[2]
-        comm = parts[3].strip()
+        lstart = " ".join(parts[3:8])
+        comm = parts[8].strip()
         rows.append(
             {
                 "pid": pid,
                 "ppid": ppid,
                 "comm": comm,
+                "lstart": lstart,
                 "age_s": _parse_etime_seconds(etime),
             }
         )
@@ -861,6 +876,217 @@ def reap_orphaned_acp_shims(
     except Exception as exc:
         log.warning("shim_reap: failed: %s", exc)
         return {"reaped": [], "candidates": [], "error": str(exc)}
+
+
+def _quota_stuck_record_for_pid(pid: int, records: list[dict[str, Any]]) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    for record in records:
+        try:
+            worker_pid = int(record.get("worker_pid") or 0)
+        except (TypeError, ValueError):
+            continue
+        if worker_pid != pid:
+            continue
+        if _quota_record_is_acp(record):
+            continue
+        info = goalflight_quota_stuck.record_quota_signature(record, require_tail=True)
+        if info:
+            return record, info
+    return None
+
+
+def _quota_record_is_acp(record: dict[str, Any]) -> bool:
+    agent = str(record.get("agent") or "").strip().lower()
+    return bool(
+        str(record.get("shape") or "").strip().lower() == "acp"
+        or str(record.get("transport") or "").strip().lower() == "acp"
+        or agent.endswith("-acp")
+        or record.get("acp_session_id")
+    )
+
+
+def _quota_worker_identity_matches(record: dict[str, Any], row: dict[str, Any]) -> tuple[bool, str]:
+    recorded = record.get("worker_identity")
+    if not isinstance(recorded, dict) or not recorded.get("lstart") or not recorded.get("comm"):
+        return False, "missing_worker_identity"
+    live_lstart = row.get("lstart")
+    live_comm = row.get("comm")
+    if live_lstart and live_comm:
+        if " ".join(str(recorded.get("lstart") or "").split()) != " ".join(str(live_lstart or "").split()):
+            return False, "pid_reused_lstart"
+        if str(recorded.get("comm") or "") != str(live_comm or ""):
+            return False, "pid_reused_comm"
+        return True, "live"
+    ok, reason = goalflight_ledger.identity_matches(record)
+    if ok and reason == "live":
+        return True, reason
+    return False, reason
+
+
+def _quota_no_controller_progress(record: dict[str, Any]) -> bool:
+    state = str(record.get("state") or record.get("classification") or "").strip()
+    if state in goalflight_quota_stuck.RATE_LIMITED_STATES:
+        return True
+    return record.get("worker_alive") is False or record.get("worker_still_alive") is False
+
+
+def _release_quota_stuck_lease(worker_pid: int, *, dispatch_id: object, reason: dict[str, Any]) -> str | None:
+    try:
+        import goalflight_capacity
+    except Exception:
+        return None
+    released: str | None = None
+    with contextlib.suppress(Exception):
+        with goalflight_capacity.StateLock():
+            data = goalflight_capacity.load_state()
+            for lease_id, lease in list((data.get("leases") or {}).items()):
+                if lease.get("state") != "active":
+                    continue
+                same_pid = False
+                with contextlib.suppress(TypeError, ValueError):
+                    same_pid = int(lease.get("worker_pid") or 0) == int(worker_pid)
+                same_dispatch = bool(dispatch_id and lease.get("dispatch_id") == dispatch_id)
+                if not same_pid and not same_dispatch:
+                    continue
+                lease["state"] = "rate_limited"
+                lease["released_at"] = goalflight_capacity.iso()
+                lease["reason"] = reason
+                released = str(lease_id)
+                break
+            if released:
+                goalflight_capacity.save_state(data)
+    return released
+
+
+def _finish_quota_stuck_ledger(record: dict[str, Any], *, reason: dict[str, Any]) -> bool:
+    dispatch_id = record.get("dispatch_id")
+    if not dispatch_id:
+        return False
+    with contextlib.suppress(Exception):
+        path = goalflight_ledger.record_path(str(dispatch_id))
+        if not path.exists():
+            return False
+        with goalflight_ledger.StateLock():
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["state"] = "rate_limited"
+            payload["terminal_state"] = "rate_limited"
+            payload["ended_at"] = payload.get("ended_at") or goalflight_ledger.utc_now()
+            payload["worker_still_alive"] = False
+            payload["reason"] = reason
+            payload["outcome"] = {"terminal_state": "rate_limited", "reason": reason}
+            goalflight_ledger.write_record(payload)
+        return True
+    return False
+
+
+def _terminate_quota_process_group(pgid: int) -> str:
+    if goalflight_compat.is_windows():
+        return "skipped_windows"
+    os.killpg(int(pgid), signal.SIGTERM)
+    return "SIGTERM"
+
+
+def reap_quota_stuck_workers(
+    *,
+    process_rows: list[dict[str, Any]] | None = None,
+    records: list[dict[str, Any]] | None = None,
+    ttl_s: float | None = None,
+    getpgid: Callable[[int], int] | None = None,
+    terminate_group: Callable[[int], str] | None = None,
+    now_ts: float | None = None,
+    enabled: bool | None = None,
+) -> dict[str, Any]:
+    """Reap bash-tail workers proven stuck on provider quota.
+
+    DEFAULT-DENY gates: explicit opt-in, ACP record hard-deny, tail quota
+    signature, aged signature, bash-tail comm allowlist, pgid == pid, and
+    orphan/no-progress evidence. ACP shims stay on the existing ACP-specific
+    teardown path.
+    """
+    if enabled is None:
+        enabled = goalflight_quota_stuck.quota_reap_enabled()
+    if not enabled:
+        return {"skipped": goalflight_quota_stuck.QUOTA_STUCK_REAP_ENABLE_ENV, "reaped": [], "candidates": []}
+    if goalflight_compat.is_windows():
+        return {"skipped": "windows", "reaped": [], "candidates": []}
+    min_age_s = float(ttl_s if ttl_s is not None else goalflight_quota_stuck.quota_reap_min_age_s())
+    rows = process_rows if process_rows is not None else _list_posix_process_rows()
+    ledger_records = records if records is not None else goalflight_ledger.read_records()
+    pgid_for = getpgid or os.getpgid
+    kill_group = terminate_group or _terminate_quota_process_group
+    now = time.time() if now_ts is None else now_ts
+    candidates: list[dict[str, Any]] = []
+    reaped: list[dict[str, Any]] = []
+    for row in rows:
+        pid = row.get("pid")
+        ppid = row.get("ppid")
+        comm = Path(str(row.get("comm") or "")).name
+        if not isinstance(pid, int) or not isinstance(ppid, int):
+            continue
+        if comm not in goalflight_quota_stuck.BASH_TAIL_WORKER_COMM_ALLOWLIST:
+            continue
+        age_s = row.get("age_s")
+        if not isinstance(age_s, (int, float)) or float(age_s) < min_age_s:
+            continue
+        matched = _quota_stuck_record_for_pid(pid, ledger_records)
+        if matched is None:
+            continue
+        record, info = matched
+        tail_mtime = info.get("tail_mtime")
+        if not isinstance(tail_mtime, (int, float)) or float(tail_mtime) > now - min_age_s:
+            continue
+        if ppid != 1 and not _quota_no_controller_progress(record):
+            continue
+        identity_ok, identity_reason = _quota_worker_identity_matches(record, row)
+        if not identity_ok:
+            log.info(
+                "quota_stuck_reap: skip pid=%d dispatch_id=%s identity=%s",
+                pid,
+                record.get("dispatch_id"),
+                identity_reason,
+            )
+            continue
+        try:
+            pgid = int(pgid_for(pid))
+        except (OSError, TypeError, ValueError):
+            continue
+        if pgid != pid:
+            continue
+        reason = {
+            "message": "quota_stuck_worker_reaped",
+            "provider": goalflight_quota_stuck.provider_for_agent(record.get("agent")),
+            "rate_limit_signature": info.get("signature"),
+            "tail_path": info.get("tail_path"),
+        }
+        candidate = {
+            "pid": pid,
+            "ppid": ppid,
+            "pgid": pgid,
+            "comm": comm,
+            "age_s": age_s,
+            "dispatch_id": record.get("dispatch_id"),
+            "provider": reason["provider"],
+            "signature": info.get("signature"),
+        }
+        candidates.append(candidate)
+        try:
+            action = kill_group(pgid)
+        except (ProcessLookupError, PermissionError, OSError) as exc:
+            candidate["action"] = f"failed:{type(exc).__name__}"
+            continue
+        lease_id = _release_quota_stuck_lease(pid, dispatch_id=record.get("dispatch_id"), reason=reason)
+        ledger_updated = _finish_quota_stuck_ledger(record, reason=reason)
+        entry = dict(candidate)
+        entry.update({"action": action, "released_lease_id": lease_id, "ledger_updated": ledger_updated})
+        reaped.append(entry)
+        log.info(
+            "quota_stuck_reap: pid=%d pgid=%d provider=%s signature=%s action=%s",
+            pid,
+            pgid,
+            reason["provider"],
+            info.get("signature"),
+            action,
+        )
+    return {"skipped": None, "reaped": reaped, "candidates": candidates}
 
 
 def resume_startup_reap(**kwargs: Any) -> dict[str, Any]:

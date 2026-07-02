@@ -1684,7 +1684,7 @@ def test_token_mismatch_recovery_preserves_terminal_worker_record() -> None:
         assert status["queue_launch_token"] == "different-token", status
 
 
-def test_worker_dead_tail_rate_limit_reaches_pressure_sensor() -> None:
+def test_quota_tail_classifies_rate_limited_and_reaches_capacity_pressure() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         env = _env(tmp)
@@ -1721,26 +1721,26 @@ def test_worker_dead_tail_rate_limit_reaches_pressure_sensor() -> None:
         )
         assert proc.returncode == 1, (proc.stdout, proc.stderr)
         record = json.loads((tmp / "state" / "runs.d" / "tail-rate-limit.json").read_text(encoding="utf-8"))
-        assert record["state"] == "worker_dead", record
-        error_text = json.dumps(record.get("error"), sort_keys=True)
+        assert record["state"] == "rate_limited", record
+        error_text = json.dumps(record, sort_keys=True)
         assert "usage limit" in error_text.lower(), record
         pressure = _run(
             [
                 sys.executable,
-                str(ROOT / "scripts" / "goalflight_rate_pressure.py"),
-                "--state-dir",
-                str(tmp / "state"),
-                "--threshold",
+                str(CAPACITY),
+                "status",
+                "--rate-pressure-threshold",
                 "1",
                 "--json",
             ],
             env,
         )
         payload = json.loads(pressure.stdout)
+        rate_pressure = payload["rate_pressure"]
         assert any(
             row.get("provider") == "openai" or row.get("budget_key") == "provider:openai"
-            for row in payload["providers_under_pressure"]
-        ), payload
+            for row in rate_pressure["providers_under_pressure"]
+        ), rate_pressure
 
 
 def main() -> None:
@@ -1769,7 +1769,7 @@ def main() -> None:
     test_legacy_claim_dead_worker_record_falls_through_to_recovery()
     test_token_mismatch_recovery_preserves_live_worker_record()
     test_token_mismatch_recovery_preserves_terminal_worker_record()
-    test_worker_dead_tail_rate_limit_reaches_pressure_sensor()
+    test_quota_tail_classifies_rate_limited_and_reaches_capacity_pressure()
     test_submit_default_runs_one_drain_pass_after_queue_write()
     test_submit_drain_on_submit_error_does_not_fail_submit()
     test_submit_default_drain_launches_once_and_duplicate_submit_does_not_double_launch()

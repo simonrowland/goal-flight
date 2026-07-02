@@ -15,6 +15,7 @@ import time
 
 import goalflight_compat
 import goalflight_ledger
+import goalflight_quota_stuck
 from goalflight_liveness import (
     LivenessThresholds,
     active_monotonic,
@@ -655,6 +656,22 @@ def main() -> int:
         if terminal_write:
             final_status_written = True
 
+    def apply_tail_quota_status(
+        payload: dict,
+        *,
+        previous_state: str,
+        previous_reason: object,
+    ) -> bool:
+        if not goalflight_quota_stuck.record_quota_signature({"tail_path": str(tail)}, require_tail=True):
+            return False
+        return goalflight_quota_stuck.apply_rate_limited_status(
+            payload,
+            agent=args.agent,
+            tail=tail,
+            previous_state=previous_state,
+            previous_reason=previous_reason,
+        )
+
     def flush_terminal_status(reason: str) -> None:
         nonlocal final_status_written
         if final_status_written:
@@ -693,8 +710,11 @@ def main() -> int:
             "state": state,
             "updated_at": int(now),
         })
+        if state in {"worker_dead", "watcher_stopped"} and not terminal_seen:
+            apply_tail_quota_status(payload, previous_state=state, previous_reason=reason)
+        write_reason = payload.get("reason") if payload.get("state") == "rate_limited" else reason
         with contextlib.suppress(Exception):
-            write_payload(payload, reason=reason, terminal_write=True)
+            write_payload(payload, reason=write_reason, terminal_write=True)
 
     def handle_signal(signum: int, _frame) -> None:
         name = getattr(signal.Signals(signum), "name", str(signum))
@@ -814,6 +834,8 @@ def main() -> int:
                     else f"worker_identity_mismatch:{identity_reason}"
                 )
                 exit_code = 1
+                if apply_tail_quota_status(payload, previous_state="worker_dead", previous_reason=exit_reason):
+                    exit_reason = payload["reason"]
             write_payload(payload, reason=exit_reason, terminal_write=True)
             break
         if liveness_state == "wedged":
@@ -827,6 +849,9 @@ def main() -> int:
                     payload["state"] = "idle_timeout"
                     exit_reason = "idle_timeout"
                     exit_code = 2
+                    if apply_tail_quota_status(payload, previous_state="idle_timeout", previous_reason=exit_reason):
+                        exit_reason = payload["reason"]
+                        exit_code = 1
                 write_payload(payload, reason=exit_reason, terminal_write=True)
                 break
         else:
