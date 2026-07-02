@@ -687,6 +687,32 @@ def _final_terminal_marker(
     return terminal
 
 
+def _terminal_marker_from_ignored_prompt(
+    path: Path,
+    marker: object,
+    ignore_prefix_lines: list[str] | None,
+) -> bool:
+    if not isinstance(marker, dict) or not ignore_prefix_lines:
+        return False
+    try:
+        line_no = int(marker.get("line") or 0)
+    except (TypeError, ValueError):
+        return False
+    if line_no <= 0 or not path.exists():
+        return False
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return False
+    prompt_echo_lines, _echo_anchor_found, prompt_line_set = _prompt_echo_scan(lines, ignore_prefix_lines)
+    line_idx = line_no - 1
+    if line_idx in prompt_echo_lines:
+        return True
+    if 0 <= line_idx < len(lines) and lines[line_idx].strip() in prompt_line_set:
+        return True
+    return False
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="goal-flight compact log watcher")
     parser.add_argument("--pid", type=int, required=True)
@@ -823,6 +849,16 @@ def main() -> int:
                     payload["state"] = BLOCKED_TASK_BREADCRUMB_STATE
                     payload["reason"] = "task_breadcrumb_error"
                     payload["liveness_state"] = goalflight_terminal.terminal_liveness_state(payload.get("state"))
+                elif (
+                    _task_state_for_terminal(payload.get("state")) == "worker-finished"
+                    and not _terminal_marker_from_ignored_prompt(
+                        tail,
+                        payload.get("terminal_marker") or terminal_seen,
+                        ignore_prefix_lines,
+                    )
+                ):
+                    with contextlib.suppress(Exception):
+                        goalflight_task.post_done_suggest_nudge(task_ids, task_project_root, args.dispatch_id)
         if terminal_write:
             payload["liveness_state"] = goalflight_terminal.terminal_liveness_state(payload.get("state"))
         write_status(status_path, payload)

@@ -9,6 +9,7 @@ import datetime as dt
 import glob
 import hashlib
 import html
+import io
 import json
 import os
 from pathlib import Path
@@ -87,6 +88,8 @@ CANNED_LIST_STATUSES = {
 RESERVED_LANES = {"deferred", "held"}
 NEXT_NUDGE_DISPATCH_ID = "task-store"
 NEXT_NUDGE_KIND = "parallel-ready"
+DONE_SUGGEST_NUDGE_KIND = "done-suggest"
+RESUME_NUDGE_KIND = "resume-ready"
 MARKDOWN_SECTIONS = (
     ("pending", "To do"),
     ("working", "In progress"),
@@ -166,6 +169,10 @@ def _project_slug(project_root: Path) -> str:
 
 def _next_nudge_dispatch_id(project_root: Path) -> str:
     return f"{NEXT_NUDGE_DISPATCH_ID}:{_project_slug(project_root)}"
+
+
+def _nudges_disabled() -> bool:
+    return os.environ.get("GOALFLIGHT_DISABLE_NUDGES", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 class TaskError(Exception):
@@ -2213,6 +2220,77 @@ def _cmd_harvest(store: TaskStore, args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_harvest_json(store: TaskStore, args: argparse.Namespace, *, dry_run: bool) -> dict[str, Any]:
+    harvest_args = argparse.Namespace(
+        by=getattr(args, "by", None),
+        dry_run=dry_run,
+        json=True,
+        kind=args.kind,
+        lane=args.lane,
+        no_history=getattr(args, "no_history", False),
+        sources=LIST_TYPE(args.sources),
+    )
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        rc = _cmd_harvest(store, harvest_args)
+    if rc != 0:
+        raise TaskError(f"harvest exited {rc}")
+    return json.loads(out.getvalue() or "{}")
+
+
+def _source_ref_path(source_ref: object) -> str:
+    text = str(source_ref or "")
+    match = re.match(r"^(.+):\d+$", text)
+    return match.group(1) if match else text
+
+
+def _manual_harvest_drafts(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        draft
+        for draft in LIST_TYPE(payload.get("drafts") or [])
+        if draft.get("harvest_source") == "manual-source"
+    ]
+
+
+def _print_migrate_preview(payload: dict[str, Any]) -> None:
+    drafts = _manual_harvest_drafts(payload)
+    by_source: dict[str, list[str]] = {}
+    for draft in drafts:
+        source = _source_ref_path(draft.get("source_ref")) or "(unknown source)"
+        by_source.setdefault(source, []).append(str(draft.get("title") or "(untitled)"))
+    print(f"PREVIEW: {len(drafts)} source candidate(s)")
+    for source in sorted(by_source):
+        titles = by_source[source]
+        print(f"- {source}: {len(titles)} candidate(s)")
+        for title in titles[:10]:
+            print(f"  - {title}")
+        if len(titles) > 10:
+            print(f"  - ... {len(titles) - 10} more")
+    seen_sources = set(by_source)
+    for summary in LIST_TYPE(payload.get("source_matches") or []):
+        pattern = str(summary.get("pattern") or "")
+        if int(summary.get("matches") or 0) == 0:
+            print(f"- {pattern}: 0 matched file(s)")
+        elif int(summary.get("candidates") or 0) == 0 and pattern not in seen_sources:
+            print(f"- {pattern}: 0 candidate(s)")
+
+
+def _cmd_migrate(store: TaskStore, args: argparse.Namespace) -> int:
+    if not args.sources:
+        raise TaskError("migrate requires at least one --source <glob>")
+    preview = _run_harvest_json(store, args, dry_run=True)
+    _print_migrate_preview(preview)
+    if not args.apply:
+        print("NO CHANGES: re-run with --apply to create harvest draft items")
+        print("NEXT: curate drafts with python3 goalflight_task.py list --tag harvest")
+        return 0
+    result = _run_harvest_json(store, args, dry_run=False)
+    print(f"APPLIED: harvest created {len(result.get('created') or [])} draft item(s) ({result.get('skipped', 0)} skipped)")
+    print("NEXT: list drafts with python3 goalflight_task.py list --tag harvest")
+    print("NEXT: curate with python3 goalflight_task.py done <id>, accept <id>, or lane <id> <lane>")
+    return 0
+
+
 def _cmd_accept(store: TaskStore, args: argparse.Namespace) -> int:
     actor = _actor(args)
 
@@ -2270,6 +2348,8 @@ def _cmd_list(store: TaskStore, args: argparse.Namespace) -> int:
             "since": args.since,
         }
     )
+    for tag in args.tag:
+        rows = [row for row in rows if tag in LIST_TYPE(row.get("tags") or [])]
     if args.json:
         print(json.dumps(rows, ensure_ascii=False, sort_keys=True))
         return 0
@@ -2278,8 +2358,16 @@ def _cmd_list(store: TaskStore, args: argparse.Namespace) -> int:
     return 0
 
 
-def _post_next_nudge(rows: list[dict[str, Any]], project_root: Path) -> None:
-    if len(rows) < 2:
+def _post_task_store_nudge(
+    *,
+    project_root: Path,
+    nudge_kind: str,
+    dedup_suffix: str,
+    text: str,
+    payload: dict[str, Any],
+    transport: str,
+) -> None:
+    if _nudges_disabled():
         return
     try:
         import goalflight_messages as gm  # lazy: task reads must not hard-depend on mail
@@ -2289,11 +2377,9 @@ def _post_next_nudge(rows: list[dict[str, Any]], project_root: Path) -> None:
         inbox = gm.inbox_path(messages_dir, dispatch_id)
         if inbox.exists() and not inbox.is_file():
             return
-        ids = sorted(str(row["id"]) for row in rows)
         project_slug = _project_slug(project_root)
         project_root_text = str(project_root.resolve())
-        key = f"{NEXT_NUDGE_KIND}:{project_slug}:" + ",".join(ids)
-        text = f"you've got mail: {len(ids)} parallel-ready ({', '.join(ids)}) -> fan out?"
+        key = f"{nudge_kind}:{project_slug}:{dedup_suffix}"
         lock_path = messages_dir / f".{dispatch_id}.lock"
         messages_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         with FileLock(lock_path):
@@ -2301,7 +2387,7 @@ def _post_next_nudge(rows: list[dict[str, Any]], project_root: Path) -> None:
             current_nudges = [
                 e
                 for e in envelopes
-                if e.get("type") == "user_need" and (e.get("payload") or {}).get("nudge_kind") == NEXT_NUDGE_KIND
+                if e.get("type") == "user_need" and (e.get("payload") or {}).get("nudge_kind") == nudge_kind
             ]
             current_keys = [str((e.get("payload") or {}).get("dedup_key") or "") for e in current_nudges]
             if key in current_keys:
@@ -2315,16 +2401,61 @@ def _post_next_nudge(rows: list[dict[str, Any]], project_root: Path) -> None:
                 payload={
                     "text": text,
                     "dedup_key": key,
-                    "frontier_ids": ids,
-                    "nudge_kind": NEXT_NUDGE_KIND,
+                    "nudge_kind": nudge_kind,
                     "project_root": project_root_text,
                     "project_slug": project_slug,
+                    **payload,
                 },
                 messages_dir=messages_dir,
-                source={"node": "local", "adapter": "task-store", "transport": "next-frontier"},
+                source={"node": "local", "adapter": "task-store", "transport": transport},
             )
     except Exception:
         return
+
+
+def _post_next_nudge(rows: list[dict[str, Any]], project_root: Path) -> None:
+    if len(rows) < 2:
+        return
+    ids = sorted(str(row["id"]) for row in rows)
+    _post_task_store_nudge(
+        project_root=project_root,
+        nudge_kind=NEXT_NUDGE_KIND,
+        dedup_suffix=",".join(ids),
+        text=f"you've got mail: {len(ids)} parallel-ready ({', '.join(ids)}) -> fan out?",
+        payload={"frontier_ids": ids},
+        transport="next-frontier",
+    )
+
+
+def post_done_suggest_nudge(task_ids: list[str], project_root: str | Path, dispatch_id: str | None) -> None:
+    ids = sorted(_dedupe_strs(task_ids))
+    if not ids or not dispatch_id:
+        return
+    _post_task_store_nudge(
+        project_root=Path(project_root),
+        nudge_kind=DONE_SUGGEST_NUDGE_KIND,
+        dedup_suffix=f"{dispatch_id}:" + ",".join(ids),
+        text=f"worker says done: {', '.join(ids)} -> review + accept?",
+        payload={"task_ids": ids, "worker_dispatch_id": dispatch_id},
+        transport="done-suggest",
+    )
+
+
+def post_resume_nudge(project_root: str | Path) -> None:
+    store = TaskStore(Path(project_root))
+    rows = store.next_frontier()
+    if not rows:
+        return
+    ids = [str(row["id"]) for row in rows]
+    top = ids[0]
+    _post_task_store_nudge(
+        project_root=store.project_root,
+        nudge_kind=RESUME_NUDGE_KIND,
+        dedup_suffix=",".join(ids),
+        text=f"{len(ids)} tasks ready (top: {top}) -> continue?",
+        payload={"frontier_ids": ids, "top_id": top},
+        transport="resume-frontier",
+    )
 
 
 def _cmd_next(store: TaskStore, args: argparse.Namespace) -> int:
@@ -2574,6 +2705,31 @@ def build_parser() -> argparse.ArgumentParser:
     harvest.add_argument("--json", action="store_true")
     harvest.set_defaults(func=_cmd_harvest)
 
+    migrate = sub.add_parser(
+        "migrate",
+        help="Preview and apply harvest from existing project markdown task lists.",
+        epilog=(
+            "examples:\n"
+            "  goalflight_task.py migrate --source docs/tasks.md\n"
+            "  goalflight_task.py migrate --source 'notes/**/*.md' --kind bug --lane deferred --apply"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    migrate.add_argument("--by", help=argparse.SUPPRESS)
+    migrate.add_argument(
+        "--source",
+        dest="sources",
+        action="append",
+        default=[],
+        metavar="<glob>",
+        help="Project-root-relative markdown glob to harvest.",
+    )
+    migrate.add_argument("--kind", choices=["task", "bug", "decision"], default="task")
+    migrate.add_argument("--lane", default="deferred")
+    migrate.add_argument("--no-history", action="store_true", help="Pass through to harvest; skip RESUME-NOTES history backfill.")
+    migrate.add_argument("--apply", action="store_true", help="Create draft items after the preview.")
+    migrate.set_defaults(func=_cmd_migrate)
+
     accept = sub.add_parser(
         "accept",
         help="Move DONE/awaiting-review to DONE-REVIEWED after a clean review.",
@@ -2604,6 +2760,7 @@ def build_parser() -> argparse.ArgumentParser:
     list_cmd.add_argument("--since", help="UTC lower bound: 1h, now-3600, epoch seconds, or ISO timestamp.")
     list_cmd.add_argument("--kind", choices=["task", "bug", "decision"])
     list_cmd.add_argument("--blocked-by", action="append", default=[])
+    list_cmd.add_argument("--tag", action="append", default=[], help="Require tag; repeat for AND filtering.")
     list_cmd.add_argument("--json", action="store_true")
     list_cmd.set_defaults(func=_cmd_list)
 
