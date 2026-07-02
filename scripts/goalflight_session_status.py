@@ -406,6 +406,17 @@ def _task_backlog_counts(project_root: Path) -> tuple[dict[str, int] | None, str
     return counts, None
 
 
+def _post_resume_nudge(project_root: Path) -> None:
+    try:
+        if str(ROOT) not in sys.path:
+            sys.path.insert(0, str(ROOT))
+        import goalflight_task
+
+        goalflight_task.post_resume_nudge(project_root)
+    except Exception:
+        return
+
+
 def _backlog_counts_text(status: dict) -> str | None:
     if status.get("backlog_counts") is None and status.get("backlog_error"):
         return "backlog: store read degraded"
@@ -811,6 +822,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     status = aggregate_status(project_root, ttl_days=args.ttl_days)
+    if args.text:
+        _post_resume_nudge(project_root)
     if args.json or not args.text:
         # Default to JSON for machine consumers; --text for humans.
         if args.text:

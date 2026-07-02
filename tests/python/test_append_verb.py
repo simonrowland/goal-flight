@@ -35,9 +35,11 @@ def run_task(project_root: Path, *args: str) -> subprocess.CompletedProcess:
     )
 
 
-def run_checker(target_dir: Path) -> subprocess.CompletedProcess:
+def run_checker(project_root: Path) -> subprocess.CompletedProcess:
+    # Post-layout-change convention (lane B): store in docs-private/, browser
+    # mirror in dashboard/ — the checker takes both roots.
     return subprocess.run(
-        [NODE, str(CHECKER), str(target_dir)],
+        [NODE, str(CHECKER), str(project_root / "docs-private"), str(project_root / "dashboard")],
         cwd=str(ROOT),
         text=True,
         stdout=subprocess.PIPE,
@@ -53,7 +55,7 @@ def read_items(project_root: Path) -> list[dict]:
 
 
 def read_data_js_items(project_root: Path) -> list[dict]:
-    text = (project_root / "docs-private" / "tasks-data.js").read_text(encoding="utf-8")
+    text = (project_root / "dashboard" / "tasks-data.js").read_text(encoding="utf-8")
     prefix = "window.GF_ITEMS = "
     start = text.index(prefix) + len(prefix)
     end = text.index(";\nif (typeof module", start)
@@ -91,8 +93,7 @@ def test_append_single_and_batch() -> None:
                 any(entry.get("action") == "append" and entry.get("actor") == "tester" for entry in item.get("audit", [])),
             )
 
-        docs = project / "docs-private"
-        proc = run_checker(docs)
+        proc = run_checker(project)
         assert_true(f"mirror checker accepts notes: {proc.stderr}", proc.returncode == 0)
         data_items = read_data_js_items(project)
         assert_true("tasks.jsonl has no status key", all("status" not in item for item in by_id.values()))

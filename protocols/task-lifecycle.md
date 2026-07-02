@@ -75,10 +75,22 @@ After a side-mission or compaction, read the store and continue the top
 dispatchable item. Do not stop for a re-prompt when `next` names ordinary
 worker work and no real blocker exists.
 
-The store is a pull surface. The shipped controller-mail push surface is the
-`next` parallel-nudge. done-suggest and resume-nudge are the same intended
-pattern for future bridge work, not shipped behavior. Controllers still pull
-with `status`, `list`, and `next` when no shipped nudge exists.
+The store remains pull-first, with three turn-boundary controller-mail nudges
+for missed handoffs. All use the per-project `task-store:<slug>` inbox,
+single-current coalescing by nudge kind, and fail-open lazy imports; set
+`GOALFLIGHT_DISABLE_NUDGES=1` to suppress them.
+
+- `next` parallel-nudge: when multiple frontier tasks are ready, post
+  `N parallel-ready (...) -> fan out?`.
+- done-suggest: when the watcher records a terminal successful dispatch
+  breadcrumb for linked `task_ids`, post
+  `worker says done: <ids> -> review + accept?`.
+- resume-nudge: on human `session-status --text`, when the ready frontier is
+  non-empty, post `N tasks ready (top: <id>) -> continue?`. The default JSON
+  path and explicit `--json` stay side-effect-free.
+
+Controllers still pull with `status`, `list`, and `next`; nudges are advisory,
+not blockers.
 
 Workers-in-flight survive resume because dispatch reliability links
 `dispatch_id` to `task_ids` and the status / worker-state plane is trustworthy.
@@ -166,9 +178,12 @@ Items enter the ledger automatically, not by hand:
   This is the canonical capture so review bugs never vanish.
 - **Controller-sourced:** a bug the controller finds that needs a worker dispatch
   becomes an item with a fix `prompt`/`prompt_path`.
-- **Harvest:** `goalflight_task.py harvest` scans the newest RESUME-NOTES + other
-  files for un-filed action items / bugs and expands them into draft items to
-  confirm — so things mentioned only in prose aren't stranded.
+- **Harvest / migrate:** `goalflight_task.py harvest` scans the newest
+  RESUME-NOTES + other files for un-filed action items / bugs and expands them
+  into draft items to confirm — so things mentioned only in prose aren't
+  stranded. `goalflight_task.py migrate --source <glob>` is the guided wrapper
+  for existing markdown task lists: preview first, then `--apply`; source
+  markdown is never deleted, moved, or edited.
 
 ## Dashboard sections
 
@@ -186,10 +201,11 @@ mirror.
 - `done <id> [--resolution R] [--force]` -> mark DONE / awaiting-review
 - `review <id> --verdict clean|findings --dispatch D [--findings F] [--bug "..."]` -> append review breadcrumb and capture review bugs
 - `accept <id>` -> require latest clean review, then mark DONE-REVIEWED
-- `list [outstanding|awaiting-review|working|waiting|delegated|done-reviewed] [--since T] [--kind K] [--blocked-by ID] [--json]`
+- `list [outstanding|awaiting-review|working|waiting|delegated|done-reviewed] [--since T] [--kind K] [--blocked-by ID] [--tag TAG] [--json]`
 - `status [--json]` -> print derived status rows
 - `sync` -> write `tasks-data.js` plus markdown snapshots from the store and project dispatch ledger
-- `harvest [--dry-run] [--no-history] [--json]` -> draft open work from RESUME-NOTES/review sources
+- `harvest [--dry-run] [--source GLOB] [--no-history] [--json]` -> draft open work from RESUME-NOTES/review/source files
+- `migrate --source GLOB [--kind K] [--lane L] [--apply]` -> preview/apply harvest from existing markdown lists
 - check: `node scripts/check_tasks_mirror.js docs-private` validates mirror parity; `goalflight_task.py` runs it on writes.
 
 Importable Python read API (any agent, no grep):
