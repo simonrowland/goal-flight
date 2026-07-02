@@ -1782,24 +1782,29 @@ def test_worker_dead_tail_rate_limit_reaches_pressure_sensor() -> None:
         assert record["terminal_state"] == "rate_limited", record
         error_text = json.dumps(record.get("error"), sort_keys=True)
         assert "usage limit" in error_text.lower(), record
-        assert record.get("error", {}).get("reason") == "worker_dead_no_terminal_marker", record
+        # Merged contract: the quota refinement wraps the pre-quota reason —
+        # the original classification is preserved as previous_reason.
+        error_obj = record.get("error", {})
+        assert error_obj.get("message") == "dispatch_worker_rate_limited", record
+        assert error_obj.get("previous_reason") == "worker_dead_no_terminal_marker", record
+        assert error_obj.get("previous_state") == "worker_dead", record
         pressure = _run(
             [
                 sys.executable,
-                str(ROOT / "scripts" / "goalflight_rate_pressure.py"),
-                "--state-dir",
-                str(tmp / "state"),
-                "--threshold",
+                str(CAPACITY),
+                "status",
+                "--rate-pressure-threshold",
                 "1",
                 "--json",
             ],
             env,
         )
         payload = json.loads(pressure.stdout)
+        rate_pressure = payload["rate_pressure"]
         assert any(
             row.get("provider") == "openai" or row.get("budget_key") == "provider:openai"
-            for row in payload["providers_under_pressure"]
-        ), payload
+            for row in rate_pressure["providers_under_pressure"]
+        ), rate_pressure
 
 
 def main() -> None:

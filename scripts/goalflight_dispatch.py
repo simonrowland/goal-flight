@@ -67,6 +67,7 @@ import goalflight_dispatch_paths
 import goalflight_dispatch_states
 import goalflight_steer_mailbox
 import goalflight_ledger
+import goalflight_quota_stuck
 import goalflight_terminal
 from goalflight_liveness import active_monotonic, process_group_id, write_status
 from goalflight_watch import (
@@ -314,6 +315,27 @@ def _status_exit_code(state: object) -> int:
     if state == "blocked" or (isinstance(state, str) and state.startswith("blocked")):
         return 4
     return 1
+
+
+def _quota_limited_state_reason(
+    state: str | None,
+    reason: object,
+    tail: Path,
+    *,
+    agent: object,
+) -> tuple[str | None, object]:
+    if state not in {"idle_timeout", "rate_limited", "worker_dead"}:
+        return state, reason
+    quota_reason = goalflight_quota_stuck.quota_limited_reason(
+        agent=agent,
+        tail=tail,
+        previous_state=state,
+        previous_reason=reason,
+    )
+    if not quota_reason:
+        return state, reason
+    return "rate_limited", quota_reason
+
 
 def _is_status_terminal(state: object) -> bool:
     if state == "orphaned":
@@ -2027,6 +2049,19 @@ def _release_stale_capacity_for_drain() -> None:
         )
 
 
+def _reap_quota_stuck_before_bash_launch() -> None:
+    with contextlib.suppress(Exception):
+        import goalflight_acp_client
+
+        result = goalflight_acp_client.reap_quota_stuck_workers()
+        if result.get("reaped"):
+            print(
+                "QUOTA-STUCK-REAP "
+                + json.dumps({"reaped": result.get("reaped")}, sort_keys=True),
+                flush=True,
+            )
+
+
 def _dispatch_record_is_terminal(record: dict | None) -> bool:
     if not record:
         return False
@@ -2616,6 +2651,11 @@ def _mark_claim_worker_dead(entry: dict, *, reason: str) -> None:
         tail,
         terminal_marker_present=goalflight_terminal.terminal_marker_present(terminal_marker),
     )
+    # Quota refinement (merge of the quota-stuck line): only rewrites
+    # idle_timeout/rate_limited/worker_dead states, and only on a genuine
+    # error-context quota signature — a marker-reconciled completion above
+    # is never touched.
+    state, final_reason = _quota_limited_state_reason(state, final_reason, tail, agent=args.agent)
     with contextlib.suppress(Exception):
         _finish_ledger(dispatch_id, state or "worker_dead", final_reason, worker_still_alive=False)
     with contextlib.suppress(Exception):
@@ -3682,6 +3722,7 @@ def main(argv: list[str] | None = None) -> int:
     _emit_dispatch_warnings(dispatch_warnings, tail_path=tail, reset_tail=True)
     worker_stdout_mode = "ab" if dispatch_warnings else "wb"
     project_root = _project_root(args)
+    _reap_quota_stuck_before_bash_launch()
     worker_pid = None
     watcher_pid = None
     caffeinate_pid = None
@@ -4025,6 +4066,12 @@ def main(argv: list[str] | None = None) -> int:
         if final_worker_alive is None and worker_pid:
             final_worker_alive = goalflight_compat.pid_alive(worker_pid)
         keep_live_watcher_open = _is_live_watcher_stopped(final_state, final_worker_alive)
+        capacity_state, capacity_reason = _quota_limited_state_reason(
+            final_state,
+            final_reason,
+            tail,
+            agent=args.agent,
+        )
         if ledger_recorded and not detached_launched and not keep_live_watcher_open:
             with contextlib.suppress(Exception):
                 final_state, ledger_reason, _rate_limited = goalflight_terminal.terminal_rate_limit_outcome(
@@ -4037,14 +4084,14 @@ def main(argv: list[str] | None = None) -> int:
                     final_reason = ledger_reason
                 _finish_ledger(
                     args.dispatch_id,
-                    final_state,
-                    ledger_reason,
+                    str(capacity_state or final_state),
+                    capacity_reason,
                     elapsed_s=round(time.time() - dispatch_started, 3),
                     worker_still_alive=final_worker_alive,
                 )
         if not detached_launched and not keep_live_watcher_open:
             with contextlib.suppress(Exception):
-                _release_capacity(lease_id, final_state, final_reason)
+                _release_capacity(lease_id, str(capacity_state or final_state), capacity_reason)
             _cleanup_pidfile_if_worker_dead(pidfile, worker_pid)
 
 

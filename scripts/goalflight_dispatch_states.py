@@ -25,6 +25,7 @@ FAILURE_TERMINAL_RECORD_STATES = frozenset(
         "failed_worktree",
         "controller_dead",
         "orphaned",
+        "rate_limited",
         "superseded",
     }
 )
@@ -91,6 +92,7 @@ OUTPUT_TAIL_RECONCILE_STATES = frozenset(
         "watcher_stopped",
         "idle_timeout",
         "inconclusive_timeout",
+        "rate_limited",
     }
 )
 
@@ -137,6 +139,8 @@ def terminal_state_for(state: object, reason: object = None) -> str:
         return "complete"
     if state == "worker_dead":
         return "worker_dead"
+    if state == "rate_limited":
+        return "rate_limited"
     if state == "idle_timeout" or state == "inconclusive_timeout":
         return "idle_timeout"
     if state == "watcher_stopped":

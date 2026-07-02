@@ -31,6 +31,7 @@ from goalflight_agent_limits import (
     normalize_agent,
 )
 import goalflight_dispatch_states as dispatch_states
+import goalflight_quota_stuck
 import goalflight_rate_pressure
 from goalflight_liveness import active_monotonic
 
@@ -651,10 +652,23 @@ def current_rate_pressure(args: argparse.Namespace | None = None) -> dict:
             window_seconds=window_seconds,
             pool_map=pool_map,
         )
+        quota_pressure = goalflight_quota_stuck.quota_pressure_per_provider(
+            records,
+            window_seconds=window_seconds,
+            pool_map=pool_map,
+        )
+        for key, count in quota_pressure.items():
+            pressure[key] = max(pressure.get(key, 0), count)
         payload = goalflight_rate_pressure.recommend(
             pressure,
             dict(DEFAULT_AGENT_CAPS),
             threshold=threshold,
+            pool_map=pool_map,
+        )
+        payload = goalflight_quota_stuck.decorate_pressure_payload(
+            payload,
+            records,
+            window_seconds=window_seconds,
             pool_map=pool_map,
         )
         payload["state_dir"] = str(state_dir())
@@ -682,13 +696,16 @@ def adaptive_agent_cap(agent: str, base_agent_cap: int, pressure: dict | None = 
         labels = [normalize_agent(str(label)) for label in entry.get("labels") or []]
         if agent not in labels and pool not in labels:
             continue
-        recommended_caps = entry.get("recommended_caps") or {}
+        recommended_caps = entry.get("effective_caps") or entry.get("recommended_caps") or {}
         recommended = recommended_caps.get(agent)
         if recommended is None and pool != agent:
             recommended = recommended_caps.get(pool)
         if recommended is None:
             continue
-        effective_cap = max(1, min(base_agent_cap, _positive_int(recommended, base_agent_cap)))
+        if entry.get("quota_hard_stop") and entry.get("scope") != "agent":
+            effective_cap = 0
+        else:
+            effective_cap = max(1, min(base_agent_cap, _positive_int(recommended, base_agent_cap)))
         if effective_cap >= base_agent_cap:
             continue
         detail = {
@@ -703,6 +720,8 @@ def adaptive_agent_cap(agent: str, base_agent_cap: int, pressure: dict | None = 
             "base_agent_cap": base_agent_cap,
             "effective_agent_cap": effective_cap,
             "recommended_caps": recommended_caps,
+            "quota_hard_stop": bool(entry.get("quota_hard_stop")),
+            "stuck_worker_count": entry.get("stuck_worker_count"),
             "fallback_providers": entry.get("fallback_providers") or [],
         }
         return effective_cap, detail
@@ -717,7 +736,8 @@ def rate_pressure_warnings(pressure: dict | None, limit: int = 5) -> list[str]:
     window = pressure.get("window_seconds")
     for entry in (pressure.get("providers_under_pressure") or [])[:limit]:
         caps = []
-        for label, cap in sorted((entry.get("recommended_caps") or {}).items()):
+        display_caps = entry.get("effective_caps") or entry.get("recommended_caps") or {}
+        for label, cap in sorted(display_caps.items()):
             current = (entry.get("current_caps") or {}).get(label)
             caps.append(f"{label} {current}->{cap}" if current is not None else f"{label}->{cap}")
         if entry.get("scope") == "agent":
@@ -727,6 +747,7 @@ def rate_pressure_warnings(pressure: dict | None, limit: int = 5) -> list[str]:
         warnings.append(
             "adaptive rate pressure "
             f"{subject}: count={entry.get('count')}/{threshold} window={window}s; "
+            f"stuck={entry.get('stuck_worker_count', 0)}; "
             f"effective caps {', '.join(caps) or 'n/a'}; new dispatches wait"
         )
     if pressure.get("error"):
@@ -783,7 +804,7 @@ def cmd_acquire(args: argparse.Namespace) -> int:
         lane_agent_cap = agent_cap
         if priority == "bulk":
             lane_max_total = max(1, max_total - BULK_GLOBAL_RESERVE)
-            lane_agent_cap = max(1, agent_cap - BULK_POOL_RESERVE)
+            lane_agent_cap = 0 if agent_cap <= 0 else max(1, agent_cap - BULK_POOL_RESERVE)
         elif priority == "critical":
             lane_max_total = min(max_total + CRITICAL_GLOBAL_BORROW, prof["raw_ram_ceiling"])
             if adaptive_pressure is None:
