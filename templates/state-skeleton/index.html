@@ -105,11 +105,11 @@ footer{max-width:46rem;margin:0 auto;padding:.5rem 1.25rem 2rem;color:var(--mute
   "use strict";
   var CARD_KEYS = [
     {key:"decision",label:"decisions",href:"questions-for-user.html"},
-    {key:"pending",label:"to do",href:"tickets.html"},
+    {key:"pending",label:"to do",href:"tickets.html?status=pending"},
     {key:"working",label:"in progress",href:"current-activity.html"},
     {key:"awaiting-review",label:"awaiting review",href:"current-activity.html"},
-    {key:"waiting",label:"waiting",href:"tickets.html"},
-    {key:"done-reviewed",label:"done",href:"tickets.html"}
+    {key:"waiting",label:"waiting",href:"tickets.html?status=waiting"},
+    {key:"done-reviewed",label:"done",href:"tickets.html?status=done-reviewed"}
   ];
 
   function render(){
