@@ -54,6 +54,7 @@ HARVEST_TASK_CONTEXT_RE = re.compile(
     re.IGNORECASE,
 )
 HARVEST_METADATA_KEYS = {"id", "title", "priority", "status", "source", "evidence"}
+HARVEST_HEADING_PROMPT_LIMIT = 2000
 HARVEST_GENERIC_HEADING_KEYS = {
     "acceptance",
     "background",
@@ -554,6 +555,16 @@ def _harvest_position_title(value: str) -> str:
 def _is_generic_harvest_heading(value: str) -> bool:
     key = _harvest_title_key(value)
     return key in HARVEST_GENERIC_HEADING_KEYS or any(key.startswith(prefix) for prefix in HARVEST_GENERIC_HEADING_PREFIXES)
+
+
+def _harvest_heading_prompt(lines: list[str]) -> str | None:
+    text = "\n".join(lines).strip()
+    if not text:
+        return None
+    if len(text) <= HARVEST_HEADING_PROMPT_LIMIT:
+        return text
+    truncated = text[:HARVEST_HEADING_PROMPT_LIMIT].rstrip()
+    return f"{truncated}\n\n[truncated after first {HARVEST_HEADING_PROMPT_LIMIT} chars from section body]"
 
 
 def _harvest_list_item_at(lines: list[str], index: int) -> tuple[str, int] | None:
@@ -1896,6 +1907,7 @@ def _harvest_heading_blocks(
         return []
     candidates: list[dict[str, Any]] = []
     current: dict[str, Any] | None = None
+    promoted_section: dict[str, Any] | None = None
 
     def flush() -> None:
         nonlocal current
@@ -1920,6 +1932,18 @@ def _harvest_heading_blocks(
         _append_candidate(candidates, candidate)
         current = None
 
+    def flush_promoted_section() -> None:
+        nonlocal promoted_section
+        if not promoted_section:
+            return
+        candidate = promoted_section.get("candidate")
+        if isinstance(candidate, dict):
+            prompt = _harvest_heading_prompt(LIST_TYPE(promoted_section.get("body_lines") or []))
+            if prompt:
+                candidate["prompt"] = prompt
+            _append_candidate(candidates, candidate)
+        promoted_section = None
+
     text = path.read_text(encoding="utf-8", errors="replace")
     if _skip_harvest_source(path, text):
         return []
@@ -1934,6 +1958,15 @@ def _harvest_heading_blocks(
         if lineno < skip_until_line:
             continue
         generic_heading = re.match(r"^(#{1,6})\s+(.+?)\s*$", line)
+        if promoted_section is not None:
+            section_level = int(promoted_section.get("level") or 0)
+            if generic_heading and len(generic_heading.group(1)) <= section_level:
+                flush_promoted_section()
+            else:
+                body_lines = promoted_section.setdefault("body_lines", [])
+                if isinstance(body_lines, LIST_TYPE):
+                    body_lines.append(line)
+                continue
         if generic_heading:
             level = len(generic_heading.group(1))
             heading_text = generic_heading.group(2)
@@ -1974,7 +2007,9 @@ def _harvest_heading_blocks(
                             candidate["lane"] = lane
                         if candidate is not None:
                             candidate["tags"] = [*LIST_TYPE(candidate.get("tags") or []), "heading-task"]
-                        _append_candidate(candidates, candidate)
+                            flush()
+                            promoted_section = {"level": level, "candidate": candidate, "body_lines": []}
+                            continue
         heading = re.match(r"^#{2,6}\s+((?:ADR|bp|[tbq])-\d+)\b(?:\s+(.+))?", line, re.IGNORECASE)
         if heading:
             flush()
@@ -2035,6 +2070,7 @@ def _harvest_heading_blocks(
         status = re.match(r"^\s*[-*]\s+Status:\s*(.+?)\s*$", line, re.IGNORECASE)
         if status:
             current["status"] = status.group(1)
+    flush_promoted_section()
     flush()
     return candidates
 
@@ -2286,7 +2322,7 @@ def _add_harvest_candidates(store: TaskStore, items: list[dict[str, Any]], actor
             tags=LIST_TYPE(candidate.get("tags") or HARVEST_DRAFT_TAGS),
             lane=candidate.get("lane"),
         )
-        for field in ("source", "source_ref", "harvest_source", "harvest_key", "harvest_scope", "severity", "pattern"):
+        for field in ("source", "source_ref", "harvest_source", "harvest_key", "harvest_scope", "severity", "pattern", "prompt"):
             value = candidate.get(field)
             if value not in (None, "", [], {}):
                 item[field] = value

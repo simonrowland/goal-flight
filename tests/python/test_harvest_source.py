@@ -494,6 +494,83 @@ def test_harvest_source_headings_as_tasks_guarded_opt_in() -> None:
         assert_true("outside prose heading skipped", "Random prose heading" not in titles)
 
 
+def test_harvest_source_promoted_heading_body_capture_and_bullet_rules() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        project = Path(td)
+        docs = project / "docs-private"
+        _write_tasks(project, [])
+        (docs / "body-headings.md").write_text(
+            "\n".join(
+                [
+                    "# Task backlog",
+                    "",
+                    "## Build heading body importer",
+                    "",
+                    "**Symptom**: promoted headings lost their local details.",
+                    "**Fix**: keep the section as candidate prompt text.",
+                    "- first body bullet",
+                    "  - nested body bullet",
+                    "",
+                    "### Implementation notes",
+                    "",
+                    "- lower heading bullet stays in body",
+                    "",
+                    "## Background",
+                    "",
+                    "- prose-section bullet remains harvestable",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        proc = run_task(project, "harvest", "--source", "docs-private/body-headings.md", "--dry-run", "--json")
+        assert_true(f"flag-off body heading harvest exits 0: {proc.stderr}", proc.returncode == 0)
+        payload = json.loads(proc.stdout)
+        titles = [draft["title"] for draft in payload["drafts"]]
+        assert_true("flag off keeps heading unharvested", "Build heading body importer" not in titles)
+        assert_true("flag off keeps body bullet candidates", "first body bullet" in titles)
+        assert_true("flag off keeps nested bullet candidates", "nested body bullet" in titles)
+
+        proc = run_task(
+            project,
+            "harvest",
+            "--source",
+            "docs-private/body-headings.md",
+            "--headings-as-tasks",
+            "--dry-run",
+            "--json",
+        )
+        assert_true(f"body heading harvest exits 0: {proc.stderr}", proc.returncode == 0)
+        payload = json.loads(proc.stdout)
+        drafts = payload["drafts"]
+        titles = [draft["title"] for draft in drafts]
+        heading = next(draft for draft in drafts if draft["title"] == "Build heading body importer")
+        prompt = heading.get("prompt", "")
+        assert_true("promoted heading body attached", "**Symptom**: promoted headings lost their local details." in prompt)
+        assert_true("bold fix paragraph attached", "**Fix**: keep the section as candidate prompt text." in prompt)
+        assert_true("body bullet attached to prompt", "- first body bullet" in prompt)
+        assert_true("lower heading section attached to prompt", "### Implementation notes" in prompt)
+        assert_true("same-level prose heading excluded from prompt", "## Background" not in prompt)
+        assert_true("body bullet suppressed as candidate", "first body bullet" not in titles)
+        assert_true("nested body bullet suppressed as candidate", "nested body bullet" not in titles)
+        assert_true("lower heading bullet suppressed as candidate", "lower heading bullet stays in body" not in titles)
+        assert_true("unpromoted prose-section bullet still harvested", "prose-section bullet remains harvestable" in titles)
+
+        proc = run_task(
+            project,
+            "harvest",
+            "--source",
+            "docs-private/body-headings.md",
+            "--headings-as-tasks",
+            "--json",
+        )
+        assert_true(f"body heading apply exits 0: {proc.stderr}", proc.returncode == 0)
+        items = _read_items(project)
+        stored_heading = next(item for item in items if item["title"] == "Build heading body importer")
+        assert_true("applied heading stores prompt body", "- first body bullet" in stored_heading.get("prompt", ""))
+
+
 def test_harvest_source_table_rows_open_only_and_non_task_tables_ignored() -> None:
     with tempfile.TemporaryDirectory() as td:
         project = Path(td)
@@ -595,6 +672,7 @@ if __name__ == "__main__":
     test_harvest_source_plural_headings_and_metadata_sentence_kept()
     test_harvest_source_does_not_implicitly_resume()
     test_harvest_source_headings_as_tasks_guarded_opt_in()
+    test_harvest_source_promoted_heading_body_capture_and_bullet_rules()
     test_harvest_source_table_rows_open_only_and_non_task_tables_ignored()
     test_harvest_source_row_scoped_dedup_keeps_repeated_row_local_titles()
     print("PASS")
