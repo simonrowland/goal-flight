@@ -69,6 +69,7 @@ FINAL_TERMINAL_MARKER_RE = re.compile(
     r"^(?:-\s+)?`?\**(?:STATUS:\s*)?"
     rf"({_TERMINAL_MARKER_KIND_ALTERNATION}):(.*)$"
 )
+MARKER_VOCAB_BULLET_RE = re.compile(rf"^-\s+`(?:{_MARKER_KIND_ALTERNATION}):`\s*$")
 COMPLETION_SIGNOFF_RE = re.compile(
     r"^(?:STATUS:\s*)?(DONE|COMPLETE|FINISHED)\s*:?\s*[.!?]?$",
     re.IGNORECASE,
@@ -252,6 +253,8 @@ def _final_terminal_marker_from_line(
         return None
     stripped = raw_line.strip()
     if not stripped:
+        return None
+    if allow_prefixed_marker and MARKER_VOCAB_BULLET_RE.match(stripped):
         return None
     if allow_prefixed_marker:
         stripped = _strip_terminal_marker_prefix(stripped)
@@ -813,13 +816,20 @@ def main() -> int:
         if reason:
             payload["reason"] = reason
         if terminal_write:
+            terminal_marker = payload.get("terminal_marker") or terminal_seen
             final_state, final_reason, _rate_limited = goalflight_terminal.terminal_rate_limit_outcome(
                 payload.get("state"),
                 payload.get("reason"),
                 tail,
                 terminal_marker_present=goalflight_terminal.terminal_marker_present(
-                    payload.get("terminal_marker") or terminal_seen
+                    terminal_marker
                 ),
+            )
+            final_state, final_reason, _vetoed = goalflight_terminal.final_reconciliation_error_veto_outcome(
+                final_state,
+                final_reason,
+                tail,
+                terminal_marker,
             )
             payload["state"] = final_state
             if final_reason not in (None, ""):

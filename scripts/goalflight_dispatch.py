@@ -2651,10 +2651,16 @@ def _mark_claim_worker_dead(entry: dict, *, reason: str) -> None:
         tail,
         terminal_marker_present=goalflight_terminal.terminal_marker_present(terminal_marker),
     )
+    state, final_reason, _vetoed_marker = goalflight_terminal.final_reconciliation_error_veto_outcome(
+        state,
+        final_reason,
+        tail,
+        terminal_marker,
+    )
     # Quota refinement (merge of the quota-stuck line): only rewrites
     # idle_timeout/rate_limited/worker_dead states, and only on a genuine
-    # error-context quota signature — a marker-reconciled completion above
-    # is never touched.
+    # error-context quota signature. Surviving marker-reconciled completions
+    # are never touched.
     state, final_reason = _quota_limited_state_reason(state, final_reason, tail, agent=args.agent)
     with contextlib.suppress(Exception):
         _finish_ledger(dispatch_id, state or "worker_dead", final_reason, worker_still_alive=False)

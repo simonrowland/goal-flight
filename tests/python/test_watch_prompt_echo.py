@@ -586,6 +586,26 @@ No live SynchRad run. No commit. `$GOALFLIGHT_STEER_FILE` was unset in tool env,
 """
 
 
+B054_FALSE_COMPLETE_SANITIZED_TAIL = """Long worker and review jobs require a ledger/status path. Status contract requires heartbeat markers for live workers.
+
+Workers communicate with one-line markers:
+- `STATUS:`
+- `STEER-ACK:`
+- `RESULT:`
+- `USER-NEED:`
+- `USER-CONFIRM:`
+- `BLOCKED:`
+- `COMPLETE:`
+
+Details live in `protocols/worker-markers.md`.
+
+ERROR: Selected model is at capacity. Please try a different model.
+ERROR: Selected model is at capacity. Please try a different model.
+tokens used
+179,057
+"""
+
+
 def _run_dead_worker_tail(tail_text: str, prompt_text: str = "", max_idle_secs: str = "0.2"):
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
@@ -690,6 +710,65 @@ def case_dead_pid_usage_limit_without_success_marker_reclassifies() -> None:
     assert reason.get("reason") == "worker_dead_no_terminal_marker", reason
     assert "try again at 6:13 AM" in reason.get("tail_excerpt", ""), reason
     assert not term, term
+
+
+def case_b054_real_evidence_marker_vocab_bullet_reclassifies_rate_limited() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        tail = Path(tmp) / "tail.txt"
+        tail.write_text(B054_FALSE_COMPLETE_SANITIZED_TAIL, encoding="utf-8")
+        final = goalflight_watch._final_terminal_marker(tail)
+
+    assert final is None, final
+
+    rc, _elapsed, term, payload = _run_dead_worker_tail(B054_FALSE_COMPLETE_SANITIZED_TAIL)
+    assert rc == 1, f"b-054 specimen must not complete, got rc={rc} ({payload})"
+    assert payload.get("state") == "rate_limited", payload
+    assert payload.get("liveness_state") == "rate_limited", payload
+    reason = payload.get("reason")
+    assert isinstance(reason, dict), payload
+    assert reason.get("message") == "dispatch_worker_rate_limited", reason
+    assert reason.get("rate_limit_signature") == "selected model is at capacity", reason
+    assert reason.get("reason") == "worker_dead_no_terminal_marker", reason
+    assert not term, term
+
+
+def case_b054_error_after_reconciled_marker_vetoes_complete() -> None:
+    rc, _elapsed, term, payload = _run_dead_worker_tail(
+        "work reported as done before the provider died\n"
+        "COMPLETE: dashboard fold, tests green\n"
+        "ERROR: Selected model is at capacity. Please try a different model.\n"
+        "ERROR: Selected model is at capacity. Please try a different model.\n"
+        "tokens used\n"
+        "179,057\n"
+    )
+    assert rc == 1, f"provider error after candidate marker must veto complete, got rc={rc} ({payload})"
+    assert payload.get("state") == "rate_limited", payload
+    assert payload.get("liveness_state") == "rate_limited", payload
+    assert term.get("kind") == "COMPLETE", term
+    assert term.get("text") == "dashboard fold, tests green", term
+    reason = payload.get("reason")
+    assert isinstance(reason, dict), payload
+    assert reason.get("message") == "dispatch_worker_rate_limited", reason
+    assert reason.get("rate_limit_signature") == "selected model is at capacity", reason
+    assert reason.get("reason") == "marker:COMPLETE:final_reconciliation", reason
+    assert reason.get("vetoed_terminal_marker") == term, reason
+
+
+def case_b054_hook_stop_footer_after_complete_does_not_veto() -> None:
+    rc, _elapsed, term, payload = _run_dead_worker_tail(
+        "COMPLETE: dashboard fold, tests green\n"
+        "hook: Stop\n"
+        "hook: Stop Completed\n"
+        "tokens used\n"
+        "42,000\n"
+        "Verified: dashboard fold and focused tests passed.\n"
+    )
+    assert rc == 0, f"healthy hook footer must stay complete, got rc={rc} ({payload})"
+    assert payload.get("state") == "complete", payload
+    assert payload.get("liveness_state") == "completed", payload
+    assert payload.get("reason") == "marker:COMPLETE:final_reconciliation", payload
+    assert term.get("kind") == "COMPLETE", term
+    assert term.get("text") == "dashboard fold, tests green", term
 
 
 def case_dead_pid_usage_limit_mentions_with_success_marker_complete() -> None:
@@ -1163,6 +1242,9 @@ def main() -> None:
     case_dead_pid_stale_output_bounds_worker_dead()
     case_dead_pid_done_signoff_completes()
     case_dead_pid_usage_limit_without_success_marker_reclassifies()
+    case_b054_real_evidence_marker_vocab_bullet_reclassifies_rate_limited()
+    case_b054_error_after_reconciled_marker_vetoes_complete()
+    case_b054_hook_stop_footer_after_complete_does_not_veto()
     case_dead_pid_usage_limit_mentions_with_success_marker_complete()
     case_dead_pid_usage_limit_mentions_with_failure_markers_stay_blocked()
     case_worker_dead_final_reconciliation_observed_shapes()
