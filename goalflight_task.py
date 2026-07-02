@@ -2068,6 +2068,40 @@ def _cmd_lane(store: TaskStore, args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_append(store: TaskStore, args: argparse.Namespace) -> int:
+    actor = _actor(args)
+    item_ids = _split_csv([args.item_ids])
+    if not item_ids:
+        raise TaskError("append: expected at least one item id")
+    note_text = str(args.note)
+
+    def update(items: list[dict[str, Any]]) -> list[str]:
+        by_id = {item["id"]: item for item in items}
+        missing = [item_id for item_id in item_ids if item_id not in by_id]
+        if missing:
+            raise TaskError(f"{store.tasks_path}: item not found: {', '.join(missing)}")
+        note = {"at": utc_now(), "actor": actor, "text": note_text}
+        changed: list[str] = []
+        for item_id in item_ids:
+            item = by_id[item_id]
+            notes = item.setdefault("notes", [])
+            if not isinstance(notes, LIST_TYPE):
+                raise TaskError(f"item {item_id}: notes must be an array")
+            notes.append(dict(note))
+            _append_audit(item, "append", actor)
+            changed.append(item_id)
+        return changed
+
+    changed = store.mutate_items(update)
+    if args.json:
+        print(json.dumps({"items": changed, "note": note_text}, ensure_ascii=False, sort_keys=True))
+    else:
+        for item_id in changed:
+            print(item_id)
+        print(f"appended note to {len(changed)} item(s)", file=sys.stderr)
+    return 0
+
+
 def _cmd_done(store: TaskStore, args: argparse.Namespace) -> int:
     actor = _actor(args)
 
@@ -2338,6 +2372,135 @@ def _cmd_next(store: TaskStore, args: argparse.Namespace) -> int:
     return 0
 
 
+def _pipe_prompt_path(store: TaskStore, row: dict[str, Any]) -> Path | None:
+    prompt_path = row.get("prompt_path")
+    if not isinstance(prompt_path, str) or not prompt_path:
+        return None
+    path = Path(prompt_path).expanduser()
+    if not path.is_absolute():
+        path = store.project_root / path
+    return path
+
+
+def _pipe_dispatch_cmd(
+    store: TaskStore,
+    row: dict[str, Any],
+    *,
+    agent: str,
+    dispatch_program: Path,
+    drain_on_submit: bool,
+) -> list[str]:
+    cmd = [
+        sys.executable,
+        str(dispatch_program),
+        "--submit",
+        "--agent",
+        agent,
+        "--cwd",
+        str(store.project_root),
+        "--task",
+        str(row["id"]),
+    ]
+    cmd.append("--drain-on-submit" if drain_on_submit else "--no-drain-on-submit")
+    prompt_path = _pipe_prompt_path(store, row)
+    if prompt_path is not None:
+        cmd.extend(["--prompt-file", str(prompt_path)])
+    else:
+        prompt = row.get("prompt")
+        if not isinstance(prompt, str) or not prompt:
+            raise TaskError(f"{row['id']}: no prompt or prompt_path")
+        cmd.extend(["--prompt", prompt])
+    return cmd
+
+
+def _run_pipe_child(cmd: list[str], *, cwd: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        cmd,
+        cwd=str(cwd),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+
+def _cmd_pipe(store: TaskStore, args: argparse.Namespace) -> int:
+    rows = store.next_frontier()
+    dispatch_program = Path(
+        os.environ.get("GOALFLIGHT_TASK_PIPE_DISPATCH")
+        or str(ROOT / "scripts" / "goalflight_dispatch.py")
+    ).expanduser()
+    piped: list[dict[str, str]] = []
+    skipped: list[dict[str, str]] = []
+    for row in rows:
+        prompt_path = _pipe_prompt_path(store, row)
+        prompt = row.get("prompt")
+        has_inline_prompt = isinstance(prompt, str) and bool(prompt)
+        if prompt_path is None and not has_inline_prompt:
+            skipped.append({"id": str(row["id"]), "reason": "no prompt"})
+            continue
+        agent = str(row.get("agent") or args.agent)
+        prompt_ref = str(prompt_path) if prompt_path is not None else "<inline>"
+        piped.append({"id": str(row["id"]), "prompt": prompt_ref, "agent": agent})
+
+    if args.dry_run:
+        if args.json:
+            print(json.dumps({"piped": piped, "skipped": skipped}, ensure_ascii=False, sort_keys=True))
+        else:
+            for entry in piped:
+                print(f"{entry['id']} -> {entry['prompt']} -> {entry['agent']}")
+            for entry in skipped:
+                print(f"{entry['id']} not piped ({entry['reason']})")
+        return 0
+
+    results: list[dict[str, Any]] = []
+    piped_by_id = {entry["id"]: entry for entry in piped}
+    for row in rows:
+        item_id = str(row["id"])
+        entry = piped_by_id.get(item_id)
+        if entry is None:
+            continue
+        cmd = _pipe_dispatch_cmd(
+            store,
+            row,
+            agent=entry["agent"],
+            dispatch_program=dispatch_program,
+            drain_on_submit=False,
+        )
+        proc = _run_pipe_child(cmd, cwd=ROOT)
+        results.append({"id": item_id, "returncode": proc.returncode})
+        if proc.returncode != 0:
+            if proc.stdout:
+                print(proc.stdout, end="")
+            if proc.stderr:
+                print(proc.stderr, end="", file=sys.stderr)
+            return proc.returncode
+
+    if piped:
+        proc = _run_pipe_child(
+            [sys.executable, str(dispatch_program), "drain", "--limit", "1"],
+            cwd=ROOT,
+        )
+        results.append({"drain": True, "returncode": proc.returncode})
+        if proc.returncode != 0:
+            if proc.stdout:
+                print(proc.stdout, end="")
+            if proc.stderr:
+                print(proc.stderr, end="", file=sys.stderr)
+            return proc.returncode
+
+    if args.json:
+        print(json.dumps({"piped": piped, "skipped": skipped, "results": results}, ensure_ascii=False, sort_keys=True))
+    else:
+        for entry in piped:
+            print(f"{entry['id']} piped ({entry['agent']})")
+        for entry in skipped:
+            print(f"{entry['id']} not piped ({entry['reason']})")
+        if piped:
+            print("drain pass requested")
+    return 0
+
+
 def _cmd_status(store: TaskStore, args: argparse.Namespace) -> int:
     rows = store.derived_rows()
     if args.json:
@@ -2395,6 +2558,7 @@ def build_parser() -> argparse.ArgumentParser:
   UPDATE:
     goalflight_task.py block t-014 --on q-002
     goalflight_task.py lane t-014 held
+    goalflight_task.py append t-014,t-015 "shared note"
     goalflight_task.py review t-014 --verdict clean --dispatch codex-review-123
     goalflight_task.py review t-014 --verdict findings --dispatch codex-review-123 --bug "Unfixed review finding" --bug-pattern bp-001
     goalflight_task.py harvest --json
@@ -2518,6 +2682,18 @@ def build_parser() -> argparse.ArgumentParser:
     lane.add_argument("lane")
     lane.set_defaults(func=_cmd_lane)
 
+    append = sub.add_parser(
+        "append",
+        help="UPDATE: append a timestamped note to one or more items.",
+        epilog='example: goalflight_task.py append t-014,t-015 "prompt ready; fill focus area"',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    append.add_argument("--by", help=argparse.SUPPRESS)
+    append.add_argument("item_ids", help="Comma-separated item ids.")
+    append.add_argument("note")
+    append.add_argument("--json", action="store_true")
+    append.set_defaults(func=_cmd_append)
+
     done = sub.add_parser(
         "done",
         help="Mark an item DONE/awaiting-review; accept moves it to DONE-REVIEWED.",
@@ -2616,6 +2792,18 @@ def build_parser() -> argparse.ArgumentParser:
     next_cmd.add_argument("--by", help=argparse.SUPPRESS)
     next_cmd.add_argument("--json", action="store_true")
     next_cmd.set_defaults(func=_cmd_next)
+
+    pipe = sub.add_parser(
+        "pipe",
+        help="Submit prompt-ready frontier items to the dispatch queue, then run one drain pass.",
+        epilog="example: goalflight_task.py pipe --dry-run",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    pipe.add_argument("--by", help=argparse.SUPPRESS)
+    pipe.add_argument("--agent", default="codex", help="Default agent when an item has no agent field.")
+    pipe.add_argument("--dry-run", action="store_true")
+    pipe.add_argument("--json", action="store_true")
+    pipe.set_defaults(func=_cmd_pipe)
 
     status = sub.add_parser(
         "status",
