@@ -9,6 +9,7 @@ place so the runner and watcher can't drift apart.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from dataclasses import dataclass
 import json
 import os
@@ -484,6 +485,11 @@ def _ensure_status_epoch(path: Path, payload: dict) -> None:
     payload["epoch"] = _status_epoch_for(path)
 
 
+def status_tmp_path(path: Path) -> Path:
+    suffix = path.suffix or ".json"
+    return path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}{suffix}.tmp")
+
+
 def write_status(path: Path, payload: dict) -> None:
     """Atomically write status JSON (write temp sibling, then os.replace).
 
@@ -494,9 +500,14 @@ def write_status(path: Path, payload: dict) -> None:
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     _ensure_status_epoch(path, payload)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
-    tmp.replace(path)
+    tmp = status_tmp_path(path)
+    try:
+        tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+        tmp.replace(path)
+    finally:
+        if tmp.exists():
+            with contextlib.suppress(OSError):
+                tmp.unlink()
 
 
 async def cpu_liveness_keep_waiting(

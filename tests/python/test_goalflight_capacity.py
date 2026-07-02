@@ -686,6 +686,19 @@ def case_adaptive_rate_pressure_status_surfaces_warning(state_dir: Path) -> None
     assert f"codex {base_cap}->{max(1, base_cap // 2)}" in out, out
 
 
+def case_rate_pressure_refuses_per_session_policy_override(state_dir: Path) -> None:
+    _seed_codex_at_capacity_records(state_dir, count=3)
+    pressure = cap.current_rate_pressure(
+        argparse.Namespace(rate_pressure_window_s=1, rate_pressure_threshold=99)
+    )
+    assert pressure["window_seconds"] == cap.DEFAULT_RATE_PRESSURE_WINDOW_SECONDS, pressure
+    assert pressure["threshold"] == cap.DEFAULT_RATE_PRESSURE_THRESHOLD, pressure
+    assert pressure["policy"]["override_mode"] == "refuse_per_session", pressure
+    warnings = pressure.get("policy_warnings") or []
+    assert any("window override" in item for item in warnings), warnings
+    assert any("threshold override" in item for item in warnings), warnings
+
+
 def case_empty_state_dir_falls_back_not_cwd() -> None:
     """A present-but-empty (or whitespace-only) GOALFLIGHT_STATE_DIR must resolve
     to DEFAULT_STATE_DIR, NOT cwd. Regression: os.environ.get(key, default)
@@ -759,6 +772,7 @@ def main() -> None:
             case_acquire_atomic_gate_still_blocks_over_cap(state_dir)
             case_adaptive_rate_pressure_reduces_codex_effective_cap(state_dir)
             case_adaptive_rate_pressure_status_surfaces_warning(state_dir)
+            case_rate_pressure_refuses_per_session_policy_override(state_dir)
         finally:
             if old is None:
                 os.environ.pop("GOALFLIGHT_STATE_DIR", None)

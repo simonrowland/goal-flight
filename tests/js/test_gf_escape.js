@@ -159,6 +159,33 @@ assert("renderBoard includes escaped title", mount.innerHTML.includes("&lt;/scri
 
 GF.index([
   {
+    schema_version: 1,
+    id: "t-<&>",
+    kind: "task",
+    title: "Special id",
+    blocked_by: ["b-<&>"],
+    links: [],
+    done: false
+  },
+  {
+    schema_version: 1,
+    id: "b-<&>",
+    kind: "bug",
+    title: "Blocker",
+    blocked_by: [],
+    links: [],
+    done: false
+  }
+]);
+const specialMount = { innerHTML: "" };
+GF.renderBoard(specialMount, {});
+assert("idLink encodes raw id once", GF.idLink("t-<&>").includes('href="ticket.html?id=t-%3C%26%3E"'));
+assert("idLink does not encode escaped entity", !GF.idLink("t-<&>").includes("%26lt%3B"));
+assert("rowHTML href encodes raw id once", specialMount.innerHTML.includes('href="ticket.html?id=t-%3C%26%3E"'));
+assert("blockerBits href encodes raw id once", specialMount.innerHTML.includes('href="ticket.html?id=b-%3C%26%3E"'));
+
+GF.index([
+  {
     id: "t-legacy",
     kind: "task",
     title: "Legacy done",
@@ -414,6 +441,22 @@ assert("renderDecisionList escapes script terminator", !/<\/script/i.test(decisi
 assert("renderDecisionList escapes raw img tag", !/<img/i.test(decisions));
 assert("renderDecisionList includes escaped hostile title", decisions.includes("&lt;/script&gt;&lt;img"));
 assert("renderDecisionList links blocked task", decisions.includes('href="ticket.html?id=t-001"'));
+
+const harvestedTicket = renderTicket({
+  schema_version: 1,
+  id: "t-ctrl",
+  kind: "task",
+  title: "Harvested",
+  blocked_by: [],
+  links: [],
+  done: true,
+  done_reviewed: true,
+  source: "harvest",
+  closed_at: "2026-07-02T00:00:00+00:00"
+});
+assert("ticket labels non-bug source as source", harvestedTicket.includes("<dt>source</dt><dd>harvest</dd>"));
+assert("ticket completion uses completion timestamp", harvestedTicket.includes("<dt>completed</dt><dd>2026-07-02T00:00:00+00:00</dd>"));
+assert("ticket does not label source as completion", !harvestedTicket.includes("<dt>completed</dt><dd>harvest</dd>"));
 
 [
   ["newline", "java\nscript:alert(1)"],

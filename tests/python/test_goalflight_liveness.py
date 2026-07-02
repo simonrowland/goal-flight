@@ -184,6 +184,16 @@ def test_write_status_preserves_out_of_band_recreated_epoch() -> None:
     assert salvaged["epoch"] == "status-out-of-band-recovery", salvaged
 
 
+def test_status_tmp_path_is_unique_sibling() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        status = Path(td) / "status.json"
+        first = goalflight_liveness.status_tmp_path(status)
+        second = goalflight_liveness.status_tmp_path(status)
+        assert first != second, (first, second)
+        assert first.parent == status.parent and second.parent == status.parent
+        assert first.name.startswith(".status.json.") and first.name.endswith(".json.tmp"), first
+
+
 def test_busy_silent_worker_classifies_running_quiet() -> None:
     thresholds = LivenessThresholds(idle_timeout_s=10.0, cpu_epsilon_pct=0.1)
     state = classify_liveness(
@@ -869,6 +879,7 @@ def main() -> None:
     test_write_status_emits_epoch_for_real_status_schemas()
     test_write_status_epoch_stable_until_status_recreation()
     test_write_status_preserves_out_of_band_recreated_epoch()
+    test_status_tmp_path_is_unique_sibling()
     test_busy_silent_worker_classifies_running_quiet()
     test_idle_silent_worker_classifies_wedged()
     test_none_cpu_idle_keeps_running()

@@ -60,6 +60,10 @@
     return "#";
   }
 
+  function ticketHref(id) {
+    return "ticket.html?id=" + encodeURIComponent(String(id == null ? "" : id));
+  }
+
   /* --------------------------------------------------------------- model */
 
   // Canonical status order + display metadata. 'worker-finished' remains a
@@ -291,7 +295,7 @@
   // A single id rendered as a ticket link (with optional class).
   function idLink(id, cls) {
     var c = cls ? ' class="' + cls + '"' : "";
-    return '<a' + c + ' href="ticket.html?id=' + encodeURIComponent(esc(id)) + '">' + esc(id) + "</a>";
+    return '<a' + c + ' href="' + ticketHref(id) + '">' + esc(id) + "</a>";
   }
 
   /* ------------------------------------------------------------- loading */
@@ -414,7 +418,7 @@
       var cls = "blocker" + (resolved ? " blocker-ok" : "");
       var glyph = resolved ? "✓" : "⏸";
       var label = esc(bid) + ", blocker " + (resolved ? "resolved" : "still blocking");
-      return '<a class="' + cls + '" href="ticket.html?id=' + encodeURIComponent(esc(bid)) +
+      return '<a class="' + cls + '" href="' + ticketHref(bid) +
         '" aria-label="' + label + '"><span aria-hidden="true">' + glyph + " </span>" + esc(bid) + "</a>";
     });
     return '<span class="blockers">' + parts.join(" ") + "</span>";
@@ -481,7 +485,7 @@
   function rowHTML(it) {
     return (
       '<li class="row row-' + esc(it._section) + '" data-id="' + esc(it.id) + '">' +
-      '<a class="id" href="ticket.html?id=' + encodeURIComponent(esc(it.id)) + '">' + esc(it.id) + "</a>" +
+      '<a class="id" href="' + ticketHref(it.id) + '">' + esc(it.id) + "</a>" +
       '<span class="body">' +
       '<span class="title">' + autolink(it.title) + "</span>" +
       '<span class="tags">' + kindBadge(it.kind) + laneBadge(it) + sevBit(it) + blockerBits(it) + "</span>" +

@@ -620,18 +620,50 @@ def _positive_int(value: object, default: int) -> int:
     return parsed if parsed > 0 else default
 
 
+def _rate_pressure_requested_policy(args: argparse.Namespace | None = None) -> tuple[object, object]:
+    window_value = getattr(args, "rate_pressure_window_s", None) if args is not None else None
+    threshold_value = getattr(args, "rate_pressure_threshold", None) if args is not None else None
+    if window_value is None:
+        window_value = os.environ.get("GOALFLIGHT_RATE_PRESSURE_WINDOW_SECONDS")
+    if threshold_value is None:
+        threshold_value = os.environ.get("GOALFLIGHT_RATE_PRESSURE_THRESHOLD")
+    return window_value, threshold_value
+
+
+def _rate_pressure_policy(args: argparse.Namespace | None = None) -> dict:
+    # capacity.json is a shared pool across controllers. Per-session windows or
+    # thresholds would let two controllers make different dispatch decisions from
+    # the same leases/ledger, so v1 refuses overrides and reports the refusal.
+    requested_window, requested_threshold = _rate_pressure_requested_policy(args)
+    window_seconds = DEFAULT_RATE_PRESSURE_WINDOW_SECONDS
+    threshold = DEFAULT_RATE_PRESSURE_THRESHOLD
+    warnings: list[str] = []
+    parsed_window = _positive_int(requested_window, window_seconds)
+    parsed_threshold = _positive_int(requested_threshold, threshold)
+    if requested_window not in (None, "") and parsed_window != window_seconds:
+        warnings.append(
+            "ignored per-session rate-pressure window override "
+            f"{requested_window!r}; shared pool uses {window_seconds}s"
+        )
+    if requested_threshold not in (None, "") and parsed_threshold != threshold:
+        warnings.append(
+            "ignored per-session rate-pressure threshold override "
+            f"{requested_threshold!r}; shared pool uses {threshold}"
+        )
+    return {
+        "window_seconds": window_seconds,
+        "threshold": threshold,
+        "override_mode": "refuse_per_session",
+        "warnings": warnings,
+    }
+
+
 def _rate_pressure_window_seconds(args: argparse.Namespace | None = None) -> int:
-    value = getattr(args, "rate_pressure_window_s", None) if args is not None else None
-    if value is None:
-        value = os.environ.get("GOALFLIGHT_RATE_PRESSURE_WINDOW_SECONDS")
-    return _positive_int(value, DEFAULT_RATE_PRESSURE_WINDOW_SECONDS)
+    return int(_rate_pressure_policy(args)["window_seconds"])
 
 
 def _rate_pressure_threshold(args: argparse.Namespace | None = None) -> int:
-    value = getattr(args, "rate_pressure_threshold", None) if args is not None else None
-    if value is None:
-        value = os.environ.get("GOALFLIGHT_RATE_PRESSURE_THRESHOLD")
-    return _positive_int(value, DEFAULT_RATE_PRESSURE_THRESHOLD)
+    return int(_rate_pressure_policy(args)["threshold"])
 
 
 def current_rate_pressure(args: argparse.Namespace | None = None) -> dict:
@@ -641,8 +673,9 @@ def current_rate_pressure(args: argparse.Namespace | None = None) -> dict:
     cooldown source, and the recommendation disappears as those records age out
     of the rolling window. No permanent caps or capacity state are mutated.
     """
-    window_seconds = _rate_pressure_window_seconds(args)
-    threshold = _rate_pressure_threshold(args)
+    policy = _rate_pressure_policy(args)
+    window_seconds = int(policy["window_seconds"])
+    threshold = int(policy["threshold"])
     try:
         billing = goalflight_rate_pressure.load_billing_accounts()
         pool_map = goalflight_rate_pressure.agent_limit_pool_map(billing)
@@ -673,6 +706,12 @@ def current_rate_pressure(args: argparse.Namespace | None = None) -> dict:
         )
         payload["state_dir"] = str(state_dir())
         payload["window_seconds"] = window_seconds
+        payload["policy"] = {
+            "override_mode": policy["override_mode"],
+            "window_seconds": window_seconds,
+            "threshold": threshold,
+        }
+        payload["policy_warnings"] = list(policy["warnings"])
         payload["records_examined"] = len(records)
         payload["limit_pool_map_loaded"] = bool(pool_map)
         return payload
@@ -681,6 +720,12 @@ def current_rate_pressure(args: argparse.Namespace | None = None) -> dict:
             "schema": goalflight_rate_pressure.SCHEMA,
             "threshold": threshold,
             "window_seconds": window_seconds,
+            "policy": {
+                "override_mode": policy["override_mode"],
+                "window_seconds": window_seconds,
+                "threshold": threshold,
+            },
+            "policy_warnings": list(policy["warnings"]),
             "providers_under_pressure": [],
             "providers_observed": [],
             "budget_keys_observed": [],
@@ -732,6 +777,7 @@ def rate_pressure_warnings(pressure: dict | None, limit: int = 5) -> list[str]:
     if not pressure:
         return []
     warnings: list[str] = []
+    warnings.extend(str(item) for item in pressure.get("policy_warnings") or [])
     threshold = pressure.get("threshold")
     window = pressure.get("window_seconds")
     for entry in (pressure.get("providers_under_pressure") or [])[:limit]:

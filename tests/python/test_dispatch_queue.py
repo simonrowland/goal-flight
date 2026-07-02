@@ -1788,6 +1788,17 @@ def test_worker_dead_tail_rate_limit_reaches_pressure_sensor() -> None:
         assert error_obj.get("message") == "dispatch_worker_rate_limited", record
         assert error_obj.get("previous_reason") == "worker_dead_no_terminal_marker", record
         assert error_obj.get("previous_state") == "worker_dead", record
+        # Rate-pressure policy is shared-pool scoped and now refuses per-session
+        # threshold overrides. Duplicate the same terminal signature enough times
+        # to reach the default threshold while keeping this test local.
+        for idx in range(2):
+            clone = dict(record)
+            clone["dispatch_id"] = f"tail-rate-limit-{idx + 2}"
+            clone["updated_at"] = record.get("updated_at")
+            (tmp / "state" / "runs.d" / f"tail-rate-limit-{idx + 2}.json").write_text(
+                json.dumps(clone, sort_keys=True),
+                encoding="utf-8",
+            )
         pressure = _run(
             [
                 sys.executable,
@@ -1801,6 +1812,9 @@ def test_worker_dead_tail_rate_limit_reaches_pressure_sensor() -> None:
         )
         payload = json.loads(pressure.stdout)
         rate_pressure = payload["rate_pressure"]
+        assert any(
+            "threshold override" in item for item in rate_pressure.get("policy_warnings") or []
+        ), rate_pressure
         assert any(
             row.get("provider") == "openai" or row.get("budget_key") == "provider:openai"
             for row in rate_pressure["providers_under_pressure"]

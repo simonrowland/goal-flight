@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
 import json
 import uuid
@@ -70,6 +71,22 @@ def default_fleet_dir() -> Path:
 
 def inbox_path(messages_dir: Path, dispatch_id: str) -> Path:
     return messages_dir / f"{dispatch_id}.jsonl"
+
+
+def mail_lock_path(path: Path) -> Path:
+    return path.with_name(f".{path.name}.lock")
+
+
+@contextlib.contextmanager
+def mail_lock(path: Path):
+    lock = mail_lock_path(path)
+    lock.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with lock.open("w", encoding="utf-8") as fh:
+        goalflight_compat.flock(fh, goalflight_compat.LOCK_EX)
+        try:
+            yield
+        finally:
+            goalflight_compat.flock(fh, goalflight_compat.LOCK_UN)
 
 
 def validate_envelope(envelope: dict, *, path: str = "envelope") -> None:
@@ -157,7 +174,6 @@ def post_message(
         # open("a") below would block the caller forever. Centralised here so
         # CLI / MCP / direct writers are all protected, not just the watcher bridge.
         raise MessageError(f"{path}: inbox is not a regular file; refusing to write")
-    resolved_seq = seq if seq is not None else next_seq(path)
     base_source = {
         "node": "local",
         "adapter": "unknown",
@@ -165,22 +181,24 @@ def post_message(
     }
     if source:
         base_source.update(source)
-    envelope = {
-        "schema": "goalflight.message.v1",
-        "schema_version": 1,
-        "id": str(uuid.uuid4()),
-        "dispatch_id": dispatch_id,
-        "seq": resolved_seq,
-        "ts": utc_now(),
-        "source": base_source,
-        "type": msg_type,
-        "priority": priority or PRIORITY_BY_TYPE.get(msg_type, "normal"),
-        "payload": payload,
-    }
-    line = serialize_envelope_line(envelope)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    with path.open("a", encoding="utf-8") as fh:
-        fh.write(line)
+    with mail_lock(path):
+        resolved_seq = seq if seq is not None else next_seq(path)
+        envelope = {
+            "schema": "goalflight.message.v1",
+            "schema_version": 1,
+            "id": str(uuid.uuid4()),
+            "dispatch_id": dispatch_id,
+            "seq": resolved_seq,
+            "ts": utc_now(),
+            "source": base_source,
+            "type": msg_type,
+            "priority": priority or PRIORITY_BY_TYPE.get(msg_type, "normal"),
+            "payload": payload,
+        }
+        line = serialize_envelope_line(envelope)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(line)
     if update_aggregate and fleet_dir is not None:
         refresh_aggregate(fleet_dir, messages_dir=messages_dir)
     return {"envelope": envelope, "line": line, "path": str(path)}
@@ -305,6 +323,24 @@ def _open_user_needs(envelopes: list[dict]) -> list[dict]:
     return open_items
 
 
+def _open_controller_advisories(envelopes: list[dict]) -> list[dict]:
+    if _dispatch_complete(envelopes):
+        return []
+    open_items: list[dict] = []
+    for env in envelopes:
+        if env.get("dispatch_id") == "controller-quota-advisory" and env.get("type") == "advisory":
+            open_items.append(
+                {
+                    "dispatch_id": env["dispatch_id"],
+                    "seq": env["seq"],
+                    "type": env["type"],
+                    "ts": env["ts"],
+                    "text": env.get("payload", {}).get("text", ""),
+                }
+            )
+    return open_items
+
+
 def _last_steering(envelopes_by_dispatch: dict[str, list[dict]]) -> dict | None:
     latest: dict | None = None
     for envelopes in envelopes_by_dispatch.values():
@@ -333,7 +369,7 @@ def collect_inbox_paths(
     # before its fail-open guard could fire. `is_file()` is a non-blocking stat()
     # (open() is what blocks on a FIFO), so this filter is safe and cheap.
     def _want(stem: str) -> bool:
-        return dispatch_ids is None or stem in dispatch_ids
+        return dispatch_ids is None or stem in dispatch_ids or stem == "controller-quota-advisory"
 
     paths: dict[str, Path] = {}
     if messages_dir.is_dir():
@@ -365,6 +401,7 @@ def build_aggregate(
             continue
 
     open_user_needs: list[dict] = []
+    open_advisories: list[dict] = []
     active_dispatches: list[str] = []
     for dispatch_id, envelopes in sorted(envelopes_by_dispatch.items()):
         if not envelopes:
@@ -372,6 +409,7 @@ def build_aggregate(
         if not _dispatch_complete(envelopes):
             active_dispatches.append(dispatch_id)
         open_user_needs.extend(_open_user_needs(envelopes))
+        open_advisories.extend(_open_controller_advisories(envelopes))
 
     return {
         "schema": AGGREGATE_SCHEMA,
@@ -379,6 +417,7 @@ def build_aggregate(
         "min_reader_version": 1,
         "updated_at": utc_now(),
         "open_user_needs": open_user_needs,
+        "open_advisories": open_advisories,
         "active_dispatches": active_dispatches,
         "last_steering": _last_steering(envelopes_by_dispatch),
     }
@@ -479,10 +518,10 @@ def _clip(text: object, limit: int = 100) -> str:
 
 
 def _format_mail_hint(items: list[dict]) -> str:
-    """Multi-line controller hint: a header plus one detail line per open need,
+    """Multi-line controller hint: a header plus one detail line per open item,
     each with the dispatch id, kind, and a clipped text so the controller can
     follow up straight from a status check."""
-    head = f"\U0001f4ec mail: {len(items)} open need(s) from your worker(s) - run: goalflight_messages.py relay"
+    head = f"\U0001f4ec mail: {len(items)} open item(s) from your worker(s) - run: goalflight_messages.py relay"
     lines = [head]
     for it in items[:5]:
         lines.append(f"    [{it['dispatch_id']}] {it['type']}: {it['text']}")
@@ -499,8 +538,9 @@ def controller_mail_summary(
 ) -> dict:
     """Structured "you have mail" summary for a controller's status output.
 
-    Builds the inbox aggregate and returns the OPEN user-needs (user_need /
-    user_confirm / blocked) with enough detail to act on from a status check.
+    Builds the inbox aggregate and returns OPEN user-needs (user_need /
+    user_confirm / blocked) plus controller quota advisories with enough detail
+    to act on from a status check.
 
     The mailbox is machine-global (shared across controllers), so when
     ``owned_dispatch_ids`` is provided only needs from THOSE dispatches — the
@@ -516,9 +556,14 @@ def controller_mail_summary(
         fleet_dir=fleet_dir if fleet_dir is not None else default_fleet_dir(),
         dispatch_ids=owned_dispatch_ids,
     )
-    needs = aggregate.get("open_user_needs") or []
+    needs = list(aggregate.get("open_user_needs") or [])
+    needs.extend(aggregate.get("open_advisories") or [])
     if owned_dispatch_ids is not None:
-        needs = [n for n in needs if str(n.get("dispatch_id") or "") in owned_dispatch_ids]
+        needs = [
+            n for n in needs
+            if str(n.get("dispatch_id") or "") in owned_dispatch_ids
+            or str(n.get("dispatch_id") or "") == "controller-quota-advisory"
+        ]
     if not needs:
         return {}
     items = [
@@ -567,24 +612,26 @@ def write_steering_envelope(
     messages_dir: Path | None = None,
 ) -> dict:
     path = steering_register_path(fleet_dir)
-    envelope = {
-        "schema": "goalflight.message.v1",
-        "schema_version": 1,
-        "id": str(uuid.uuid4()),
-        "dispatch_id": STEERING_DISPATCH_ID,
-        "seq": next_seq(path),
-        "ts": utc_now(),
-        "source": {"node": "local", "adapter": "fleet", "transport": "controller"},
-        "type": "steering",
-        "priority": "normal",
-        "payload": {
-            "audit_id": audit_id,
-            "proposal_id": proposal_id,
-            "patch": patch,
-            "after_hash": after_hash,
-        },
-    }
-    append_envelope(path, envelope)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with mail_lock(path):
+        envelope = {
+            "schema": "goalflight.message.v1",
+            "schema_version": 1,
+            "id": str(uuid.uuid4()),
+            "dispatch_id": STEERING_DISPATCH_ID,
+            "seq": next_seq(path),
+            "ts": utc_now(),
+            "source": {"node": "local", "adapter": "fleet", "transport": "controller"},
+            "type": "steering",
+            "priority": "normal",
+            "payload": {
+                "audit_id": audit_id,
+                "proposal_id": proposal_id,
+                "patch": patch,
+                "after_hash": after_hash,
+            },
+        }
+        append_envelope(path, envelope)
     refresh_aggregate(fleet_dir, messages_dir=messages_dir or default_messages_dir())
     return envelope
 
@@ -601,16 +648,17 @@ def merge_remote_register(
     remote = read_envelopes(remote_jsonl)
     dest = fleet_dir / "register" / "dispatches" / remote_jsonl.name
     dest.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    existing = read_envelopes(dest) if dest.exists() else []
-    seen_seq = {int(env.get("seq", 0)) for env in existing}
     appended = 0
-    for env in remote:
-        seq = int(env.get("seq", 0))
-        if seq in seen_seq:
-            continue
-        append_envelope(dest, env)
-        seen_seq.add(seq)
-        appended += 1
+    with mail_lock(dest):
+        existing = read_envelopes(dest) if dest.exists() else []
+        seen_seq = {int(env.get("seq", 0)) for env in existing}
+        for env in remote:
+            seq = int(env.get("seq", 0))
+            if seq in seen_seq:
+                continue
+            append_envelope(dest, env)
+            seen_seq.add(seq)
+            appended += 1
     aggregate = refresh_aggregate(fleet_dir, messages_dir=messages_dir or default_messages_dir())
     return {"merged_into": str(dest), "appended": appended, "open_user_needs": len(aggregate.get("open_user_needs") or [])}
 

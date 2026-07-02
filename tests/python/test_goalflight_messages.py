@@ -6,6 +6,8 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
+import threading
+import time
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -188,6 +190,77 @@ def test_mcp_post_matches_file_append() -> None:
         assert_true("serialize helper", serialize_envelope_line(loaded[0]) == lines[0])
 
 
+def test_post_message_allocates_seq_under_mail_lock() -> None:
+    import tempfile
+    import goalflight_messages as messages
+    from goalflight_messages import post_message, read_envelopes
+
+    with tempfile.TemporaryDirectory() as td:
+        messages_dir = Path(td) / "messages"
+        path = messages.inbox_path(messages_dir, "d-race")
+        original_next_seq = messages.next_seq
+        guard = threading.Lock()
+        active = 0
+        max_active = 0
+
+        def slow_next_seq(seq_path: Path) -> int:
+            nonlocal active, max_active
+            with guard:
+                active += 1
+                max_active = max(max_active, active)
+            try:
+                time.sleep(0.05)
+                return original_next_seq(seq_path)
+            finally:
+                with guard:
+                    active -= 1
+
+        messages.next_seq = slow_next_seq  # type: ignore[assignment]
+        try:
+            threads = [
+                threading.Thread(
+                    target=post_message,
+                    kwargs={
+                        "dispatch_id": "d-race",
+                        "msg_type": "status",
+                        "payload": {"text": f"msg-{idx}"},
+                        "messages_dir": messages_dir,
+                    },
+                )
+                for idx in range(2)
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+        finally:
+            messages.next_seq = original_next_seq  # type: ignore[assignment]
+
+        loaded = read_envelopes(path)
+        assert_true("serialized next_seq critical section", max_active == 1)
+        assert_true("two messages", len(loaded) == 2)
+        assert_true("unique monotonic seqs", [env["seq"] for env in loaded] == [1, 2])
+
+
+def test_controller_summary_includes_quota_advisory() -> None:
+    import tempfile
+    from goalflight_messages import controller_mail_summary, post_message
+
+    with tempfile.TemporaryDirectory() as td:
+        messages_dir = Path(td) / "messages"
+        post_message(
+            dispatch_id="controller-quota-advisory",
+            msg_type="advisory",
+            payload={"text": "openai quota exhausted"},
+            messages_dir=messages_dir,
+        )
+        summary = controller_mail_summary(owned_dispatch_ids={"mine-1"}, messages_dir=messages_dir)
+        assert_true("advisory surfaced", summary["count"] == 1)
+        assert_true("advisory dispatch id", summary["needs"][0]["dispatch_id"] == "controller-quota-advisory")
+        assert_true("advisory kind", summary["needs"][0]["type"] == "advisory")
+        assert_true("advisory hint", "openai quota exhausted" in summary["hint"])
+
+
 def test_mcp_stdio_tools_call() -> None:
     import json
     import subprocess
@@ -238,6 +311,8 @@ def main() -> None:
         test_aggregate_open_user_need,
         test_relay_user_need_e2e,
         test_mcp_post_matches_file_append,
+        test_post_message_allocates_seq_under_mail_lock,
+        test_controller_summary_includes_quota_advisory,
         test_mcp_stdio_tools_call,
     ):
         test()

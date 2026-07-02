@@ -157,9 +157,9 @@ footer{max-width:46rem;margin:0 auto;padding:1.5rem 1.25rem 2rem;color:var(--mut
       if(it.pattern)  html += row("pattern", GF.idLink(it.pattern, "idlink"));
       if(it.source)   html += row("source", GF.esc(it.source));
     }
-    // For non-bug items `source` carries a completion date (bugs use it for the
-    // provenance enum, rendered above). Label it as the date it is, not "done".
-    if(it.source && it.kind!=="bug") html += row("completed", GF.esc(it.source));
+    if(it.source && it.kind!=="bug") html += row("source", GF.esc(it.source));
+    var completedAt = it.completed_at || it.done_at || it.closed_at;
+    if(completedAt) html += row("completed", GF.esc(completedAt));
     html += "</dl>";
 
     if(it.acceptance){
