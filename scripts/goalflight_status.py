@@ -154,7 +154,7 @@ def _record_has_terminal_marker(record: dict | None) -> bool:
     return _record_terminal_marker_kind(record) in _OUTPUT_TAIL_TERMINAL_MARKERS
 
 
-def _output_tail_reconcile_gate(record: dict, *, tail_mtime: int | None) -> tuple[bool, str]:
+def _output_tail_reconcile_gate(record: dict, *, tail_mtime: float | None) -> tuple[bool, str]:
     identity_record = _identity_record_for_output_tail_reconcile(record)
     if identity_record is None:
         return False, "liveness_indeterminate"
@@ -198,7 +198,7 @@ def _tail_path_from_record(record: dict) -> Path | None:
     return Path(str(tail_path)).expanduser() if tail_path else None
 
 
-def _tail_mtime_plausible(tail: Path, record: dict) -> tuple[bool, int | None]:
+def _tail_mtime_plausible(tail: Path, record: dict) -> tuple[bool, float | None]:
     try:
         stat = tail.stat()
     except OSError:
@@ -206,10 +206,10 @@ def _tail_mtime_plausible(tail: Path, record: dict) -> tuple[bool, int | None]:
     mtime = float(stat.st_mtime)
     started = goalflight_ledger.parse_utc(record.get("started_at"))
     if started and mtime + 2.0 < started.timestamp():
-        return False, int(mtime)
+        return False, mtime
     if mtime > time.time() + 300.0:
-        return False, int(mtime)
-    return True, int(mtime)
+        return False, mtime
+    return True, mtime
 
 
 def _output_tail_reconcile_candidate(record: dict) -> bool:
@@ -310,7 +310,7 @@ def _draft_artifact_finality(record: dict, artifact: Path) -> tuple[bool, str]:
     return False, "missing_finality"
 
 
-def _reconcile_draft_artifact_record(record: dict, *, tail: Path | None, tail_mtime: int | None) -> dict:
+def _reconcile_draft_artifact_record(record: dict, *, tail: Path | None, tail_mtime: float | None) -> dict:
     artifact = goalflight_quota_stuck.draft_artifact_for_record(record)
     if artifact is None:
         return record

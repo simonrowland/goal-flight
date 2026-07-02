@@ -929,39 +929,58 @@ def _quota_no_controller_progress(record: dict[str, Any]) -> bool:
     return record.get("worker_alive") is False or record.get("worker_still_alive") is False
 
 
-def _release_quota_stuck_lease(worker_pid: int, *, dispatch_id: object, reason: dict[str, Any]) -> str | None:
+def _release_quota_stuck_lease(worker_pid: int, *, dispatch_id: object, reason: dict[str, Any]) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "released_lease_id": None,
+        "lease_expected": bool(dispatch_id),
+        "lease_release_error": None,
+    }
     try:
         import goalflight_capacity
-    except Exception:
-        return None
-    released: str | None = None
-    with contextlib.suppress(Exception):
+    except Exception as exc:
+        result["lease_release_error"] = str(exc)
+        log.error("quota_stuck_reap: lease release import failed: %s", exc)
+        return result
+    try:
         with goalflight_capacity.StateLock():
             data = goalflight_capacity.load_state()
             for lease_id, lease in list((data.get("leases") or {}).items()):
                 if lease.get("state") != "active":
                     continue
                 same_pid = False
-                with contextlib.suppress(TypeError, ValueError):
-                    same_pid = int(lease.get("worker_pid") or 0) == int(worker_pid)
+                lease_pid = lease.get("worker_pid")
+                lease_has_pid = lease_pid not in (None, "")
+                if lease_has_pid:
+                    with contextlib.suppress(TypeError, ValueError):
+                        same_pid = int(lease_pid) == int(worker_pid)
                 same_dispatch = bool(dispatch_id and lease.get("dispatch_id") == dispatch_id)
-                if not same_pid and not same_dispatch:
+                if same_dispatch:
+                    result["lease_expected"] = True
+                if not same_pid and not (same_dispatch and not lease_has_pid):
                     continue
                 lease["state"] = "rate_limited"
                 lease["released_at"] = goalflight_capacity.iso()
                 lease["reason"] = reason
-                released = str(lease_id)
+                result["released_lease_id"] = str(lease_id)
                 break
-            if released:
+            if result["released_lease_id"]:
                 goalflight_capacity.save_state(data)
-    return released
+    except Exception as exc:
+        result["lease_release_error"] = str(exc)
+        log.error(
+            "quota_stuck_reap: lease release failed pid=%s dispatch_id=%s: %s",
+            worker_pid,
+            dispatch_id,
+            exc,
+        )
+    return result
 
 
 def _finish_quota_stuck_ledger(record: dict[str, Any], *, reason: dict[str, Any]) -> bool:
     dispatch_id = record.get("dispatch_id")
     if not dispatch_id:
         return False
-    with contextlib.suppress(Exception):
+    try:
         path = goalflight_ledger.record_path(str(dispatch_id))
         if not path.exists():
             return False
@@ -975,14 +994,13 @@ def _finish_quota_stuck_ledger(record: dict[str, Any], *, reason: dict[str, Any]
             payload["outcome"] = {"terminal_state": "rate_limited", "reason": reason}
             goalflight_ledger.write_record(payload)
         return True
+    except Exception as exc:
+        log.error("quota_stuck_reap: ledger update failed dispatch_id=%s: %s", dispatch_id, exc)
     return False
 
 
 def _terminate_quota_process_group(pgid: int) -> str:
-    if goalflight_compat.is_windows():
-        return "skipped_windows"
-    os.killpg(int(pgid), signal.SIGTERM)
-    return "SIGTERM"
+    return _terminate_process_group(int(pgid))
 
 
 def reap_quota_stuck_workers(
@@ -1073,10 +1091,35 @@ def reap_quota_stuck_workers(
         except (ProcessLookupError, PermissionError, OSError) as exc:
             candidate["action"] = f"failed:{type(exc).__name__}"
             continue
-        lease_id = _release_quota_stuck_lease(pid, dispatch_id=record.get("dispatch_id"), reason=reason)
+        lease_result = _release_quota_stuck_lease(pid, dispatch_id=record.get("dispatch_id"), reason=reason)
         ledger_updated = _finish_quota_stuck_ledger(record, reason=reason)
         entry = dict(candidate)
-        entry.update({"action": action, "released_lease_id": lease_id, "ledger_updated": ledger_updated})
+        entry.update(
+            {
+                "action": action,
+                "released_lease_id": lease_result.get("released_lease_id"),
+                "ledger_updated": ledger_updated,
+            }
+        )
+        bookkeeping_errors: list[str] = []
+        if lease_result.get("lease_release_error"):
+            bookkeeping_errors.append(f"lease_release_error:{lease_result['lease_release_error']}")
+        if lease_result.get("lease_expected") and not lease_result.get("released_lease_id"):
+            bookkeeping_errors.append("lease_not_released")
+        if not ledger_updated:
+            bookkeeping_errors.append("ledger_not_updated")
+        if bookkeeping_errors:
+            entry["partial_failure"] = True
+            entry["bookkeeping_errors"] = bookkeeping_errors
+            candidates[-1]["partial_failure"] = True
+            candidates[-1]["bookkeeping_errors"] = bookkeeping_errors
+            log.error(
+                "quota_stuck_reap: partial bookkeeping failure pid=%d dispatch_id=%s errors=%s",
+                pid,
+                record.get("dispatch_id"),
+                ",".join(bookkeeping_errors),
+            )
+            continue
         reaped.append(entry)
         log.info(
             "quota_stuck_reap: pid=%d pgid=%d provider=%s signature=%s action=%s",
@@ -1086,7 +1129,8 @@ def reap_quota_stuck_workers(
             info.get("signature"),
             action,
         )
-    return {"skipped": None, "reaped": reaped, "candidates": candidates}
+    partial_failures = [candidate for candidate in candidates if candidate.get("partial_failure")]
+    return {"skipped": None, "reaped": reaped, "partial_failures": partial_failures, "candidates": candidates}
 
 
 def resume_startup_reap(**kwargs: Any) -> dict[str, Any]:

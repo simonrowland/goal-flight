@@ -75,6 +75,7 @@ HARVEST_PLACEHOLDER_PHRASES = (
     "Example open task - replace with your first real chunk.",
     "Example open task — replace with your first real chunk.",
 )
+_NEXT_NUDGE_LOGGED_FAILURES: set[str] = set()
 CANNED_LIST_STATUSES = {
     "outstanding",
     "awaiting-review",
@@ -964,15 +965,13 @@ class TaskStore:
             current = max(int(seq.get(family, 0)), self._max_existing_sequence(family))
             next_value = current + 1
             seq[family] = next_value
-            tmp = self.seq_path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(seq, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-            tmp.replace(self.seq_path)
+            _atomic_write_text(self.seq_path, json.dumps(seq, indent=2, sort_keys=True) + "\n", prefix=".task-seq-")
         return f"ADR-{next_value:03d}" if family == "ADR" else f"{family}-{next_value:03d}"
 
     def _max_existing_sequence(self, family: str) -> int:
         prefix = "ADR-" if family == "ADR" else f"{family}-"
         max_seen = 0
-        for item in self.load_items():
+        for item in self.load_items(recover_publish=False):
             item_id = item.get("id")
             if not isinstance(item_id, str) or not item_id.startswith(prefix):
                 continue
@@ -2315,6 +2314,7 @@ def _cmd_list(store: TaskStore, args: argparse.Namespace) -> int:
 def _post_next_nudge(rows: list[dict[str, Any]], project_root: Path) -> None:
     if len(rows) < 2:
         return
+    failure_key = f"{NEXT_NUDGE_KIND}:{_project_slug(project_root)}:<pre-key>"
     try:
         import goalflight_messages as gm  # lazy: task reads must not hard-depend on mail
 
@@ -2327,6 +2327,7 @@ def _post_next_nudge(rows: list[dict[str, Any]], project_root: Path) -> None:
         project_slug = _project_slug(project_root)
         project_root_text = str(project_root.resolve())
         key = f"{NEXT_NUDGE_KIND}:{project_slug}:" + ",".join(ids)
+        failure_key = key
         text = f"you've got mail: {len(ids)} parallel-ready ({', '.join(ids)}) -> fan out?"
         lock_path = messages_dir / f".{dispatch_id}.lock"
         messages_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -2357,7 +2358,10 @@ def _post_next_nudge(rows: list[dict[str, Any]], project_root: Path) -> None:
                 messages_dir=messages_dir,
                 source={"node": "local", "adapter": "task-store", "transport": "next-frontier"},
             )
-    except Exception:
+    except Exception as exc:
+        if failure_key not in _NEXT_NUDGE_LOGGED_FAILURES:
+            _NEXT_NUDGE_LOGGED_FAILURES.add(failure_key)
+            print(f"goalflight_task: next nudge failed key={failure_key}: {exc}", file=sys.stderr)
         return
 
 

@@ -9,6 +9,7 @@ import datetime as dt
 import io
 import json
 import os
+import signal
 import sys
 import tempfile
 import time
@@ -251,6 +252,102 @@ def test_quota_reaper_default_deny_guards_and_release() -> None:
         assert_eq("ledger state rate_limited", persisted["state"], "rate_limited")
 
 
+def test_quota_reaper_escalates_sigkill_when_sigterm_does_not_exit() -> None:
+    calls: list[tuple[int, int]] = []
+    original_killpg = acp.os.killpg
+    original_alive = acp._pgid_alive
+    original_monotonic = acp.time.monotonic
+    try:
+        acp.os.killpg = lambda pgid, sig: calls.append((pgid, sig))  # type: ignore[assignment]
+        acp._pgid_alive = lambda pgid: True  # type: ignore[assignment]
+        ticks = iter([100.0, 106.0])
+        acp.time.monotonic = lambda: next(ticks, 106.0)  # type: ignore[assignment]
+        action = acp._terminate_quota_process_group(777)
+    finally:
+        acp.os.killpg = original_killpg  # type: ignore[assignment]
+        acp._pgid_alive = original_alive  # type: ignore[assignment]
+        acp.time.monotonic = original_monotonic  # type: ignore[assignment]
+    assert_eq("quota reap escalation action", action, "SIGTERM+SIGKILL")
+    assert_eq("quota reap escalation signals", calls, [(777, signal.SIGTERM), (777, signal.SIGKILL)])
+
+
+def test_quota_reaper_partial_failure_not_counted_as_reaped() -> None:
+    with tempfile.TemporaryDirectory() as td, temp_env(GOALFLIGHT_STATE_DIR=str(Path(td) / "state")):
+        tmp = Path(td)
+        record = quota_record(tmp, dispatch_id="qpartial", pid=321, state="running_quiet")
+        cap.save_state(
+            {
+                "schema": cap.SCHEMA,
+                "machine_id": "test",
+                "leases": {
+                    "lease-qpartial": {
+                        "lease_id": "lease-qpartial",
+                        "dispatch_id": "qpartial",
+                        "agent": "grok-code",
+                        "state": "active",
+                        "worker_pid": 321,
+                        "controller_pid": os.getpid(),
+                        "mem_mb": 1,
+                        "started_at": cap.iso(),
+                        "expires_at": cap.iso(cap.utc_now() + dt.timedelta(hours=1)),
+                    }
+                },
+                "cooldowns": {},
+            }
+        )
+        result = acp.reap_quota_stuck_workers(
+            process_rows=[process_row(321)],
+            records=[record],
+            ttl_s=180.0,
+            getpgid=lambda pid: pid,
+            terminate_group=lambda pgid: "SIGTERM+SIGKILL",
+            now_ts=time.time(),
+            enabled=True,
+        )
+        assert_eq("partial failure not reaped", result["reaped"], [])
+        assert_eq("partial failure count", len(result["partial_failures"]), 1)
+        assert_true("partial failure reports ledger", "ledger_not_updated" in result["partial_failures"][0]["bookkeeping_errors"])
+
+
+def test_quota_reaper_refuses_dispatch_lease_when_worker_pid_mismatches() -> None:
+    with tempfile.TemporaryDirectory() as td, temp_env(GOALFLIGHT_STATE_DIR=str(Path(td) / "state")):
+        tmp = Path(td)
+        record = quota_record(tmp, dispatch_id="qpidlease", pid=331, state="running_quiet")
+        ledger.write_record(record)
+        cap.save_state(
+            {
+                "schema": cap.SCHEMA,
+                "machine_id": "test",
+                "leases": {
+                    "lease-qpidlease": {
+                        "lease_id": "lease-qpidlease",
+                        "dispatch_id": "qpidlease",
+                        "agent": "grok-code",
+                        "state": "active",
+                        "worker_pid": 999,
+                        "controller_pid": os.getpid(),
+                        "mem_mb": 1,
+                        "started_at": cap.iso(),
+                        "expires_at": cap.iso(cap.utc_now() + dt.timedelta(hours=1)),
+                    }
+                },
+                "cooldowns": {},
+            }
+        )
+        result = acp.reap_quota_stuck_workers(
+            process_rows=[process_row(331)],
+            records=ledger.read_records(),
+            ttl_s=180.0,
+            getpgid=lambda pid: pid,
+            terminate_group=lambda pgid: "SIGTERM+SIGKILL",
+            now_ts=time.time(),
+            enabled=True,
+        )
+        assert_eq("pid mismatch not fully reaped", result["reaped"], [])
+        assert_true("pid mismatch reports lease", "lease_not_released" in result["partial_failures"][0]["bookkeeping_errors"])
+        assert_eq("mismatched lease remains active", cap.load_state()["leases"]["lease-qpidlease"]["state"], "active")
+
+
 def test_quota_reaper_rejects_no_signature_young_pgid_mismatch_and_acp_shim() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
@@ -488,12 +585,49 @@ def test_draft_artifact_reconcile_requires_finality_before_complete() -> None:
         assert_eq("missing artifact stays worker_dead", out_missing["state"], "worker_dead")
 
 
+def test_draft_artifact_rejects_paths_outside_project_root() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        outside = tmp.parent / f"{tmp.name}-outside.md"
+        outside.write_text("outside artifact\n", encoding="utf-8")
+        try:
+            record = {
+                "schema": "goalflight.dispatch.v1",
+                "dispatch_id": "draft-escape",
+                "agent": "codex",
+                "state": "worker_dead",
+                "project_root": str(tmp),
+                "draft_path": str(outside),
+                "started_at": iso_now(),
+            }
+            assert_eq("outside absolute artifact rejected", quota.draft_artifact_for_record(record), None)
+            relative_escape = dict(record, dispatch_id="draft-relative-escape", draft_path=f"../{outside.name}")
+            assert_eq("outside relative artifact rejected", quota.draft_artifact_for_record(relative_escape), None)
+        finally:
+            outside.unlink(missing_ok=True)
+
+
+def test_tail_quota_signature_preserves_float_mtime() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tail = Path(td) / "quota.tail"
+        tail.write_text("ERROR: insufficient_quota\n", encoding="utf-8")
+        ts = time.time() - 240.375
+        os.utime(tail, (ts, ts))
+        info = quota.tail_quota_signature(tail)
+        assert_true("signature found", info is not None)
+        assert_true("mtime remains float", isinstance(info["tail_mtime"], float))
+        assert_true("mtime keeps subsecond precision", abs(float(info["tail_mtime"]) - ts) < 0.01)
+
+
 def main() -> None:
     tests = [
         test_tail_signature_classifies_rate_limited_provider,
         test_capacity_hard_stops_provider_launches,
         test_status_banner_and_advisory_mail,
         test_quota_reaper_default_deny_guards_and_release,
+        test_quota_reaper_escalates_sigkill_when_sigterm_does_not_exit,
+        test_quota_reaper_partial_failure_not_counted_as_reaped,
+        test_quota_reaper_refuses_dispatch_lease_when_worker_pid_mismatches,
         test_quota_reaper_rejects_no_signature_young_pgid_mismatch_and_acp_shim,
         test_quota_reaper_default_off_requires_explicit_enable,
         test_prompt_echo_quota_text_is_not_counted_or_hard_stopped,
@@ -501,6 +635,8 @@ def main() -> None:
         test_quota_reaper_hard_denies_acp_shaped_record_with_allowed_comm,
         test_quota_reaper_rejects_pid_reuse_identity_mismatch,
         test_draft_artifact_reconcile_requires_finality_before_complete,
+        test_draft_artifact_rejects_paths_outside_project_root,
+        test_tail_quota_signature_preserves_float_mtime,
     ]
     for test in tests:
         test()

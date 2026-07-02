@@ -13,12 +13,14 @@ from __future__ import annotations
 import datetime as dt
 import contextlib
 import importlib.util
+import io
 import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import types
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -1444,6 +1446,87 @@ def test_goalflight_task_rejects_non_regular_store_files_without_hanging() -> No
                 _assert_non_regular_task_read_fails(project, *command)
 
 
+def test_goalflight_task_sequence_write_uses_atomic_fsync_writer() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        project = Path(td)
+        _write_tasks(project, [])
+        module = _load_goalflight_task_module()
+        store = module.TaskStore(project)
+        calls: list[tuple[Path, str]] = []
+        original = module._atomic_write_text
+
+        def tracking_atomic_write(path: Path, text: str, *, prefix: str = ".tmp-") -> None:
+            calls.append((path, prefix))
+            original(path, text, prefix=prefix)
+
+        module._atomic_write_text = tracking_atomic_write
+        try:
+            item_id = store.reserve_id("t")
+        finally:
+            module._atomic_write_text = original
+        assert_true("reserved first task id", item_id == "t-001")
+        assert_true("sequence used atomic writer", len(calls) == 1)
+        assert_true("sequence atomic path", calls[0][0].resolve() == (project / "docs-private" / ".task-seq").resolve())
+        assert_true("sequence atomic prefix", calls[0][1] == ".task-seq-")
+        assert_true("sequence file written", json.loads((project / "docs-private" / ".task-seq").read_text())["t"] == 1)
+
+
+def test_goalflight_task_max_sequence_avoids_publish_recovery_under_store_lock() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        project = Path(td)
+        _write_tasks(
+            project,
+            [
+                {
+                    "schema_version": 1,
+                    "id": "t-005",
+                    "kind": "task",
+                    "title": "Existing task",
+                    "blocked_by": [],
+                    "links": [],
+                    "done": False,
+                }
+            ],
+        )
+        module = _load_goalflight_task_module()
+        store = module.TaskStore(project)
+        store.publish_marker_path.write_text('{"generation":"survived-crash"}\n', encoding="utf-8")
+
+        def fail_recovery() -> None:
+            raise AssertionError("publish recovery re-entered while store lock was held")
+
+        store._recover_interrupted_publish = fail_recovery
+        with store.store_lock():
+            item_id = store.reserve_id("t")
+        assert_true("sequence advanced without publish recovery", item_id == "t-006")
+
+
+def test_goalflight_task_next_nudge_logs_failure_once_per_key() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        project = Path(td)
+        module = _load_goalflight_task_module()
+        module._NEXT_NUDGE_LOGGED_FAILURES.clear()
+        rows = [{"id": "t-001"}, {"id": "t-002"}]
+        fake_messages = types.SimpleNamespace(
+            default_messages_dir=lambda: (_ for _ in ()).throw(RuntimeError("mail unavailable"))
+        )
+        original_messages = sys.modules.get("goalflight_messages")
+        sys.modules["goalflight_messages"] = fake_messages
+        stderr = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(stderr):
+                module._post_next_nudge(rows, project)
+                module._post_next_nudge(rows, project)
+        finally:
+            if original_messages is None:
+                sys.modules.pop("goalflight_messages", None)
+            else:
+                sys.modules["goalflight_messages"] = original_messages
+        text = stderr.getvalue()
+        assert_true("nudge failure logged once", text.count("next nudge failed") == 1)
+        assert_true("nudge failure includes exception", "mail unavailable" in text)
+
+
 def test_goalflight_task_sync_repairs_stale_mirror() -> None:
     with tempfile.TemporaryDirectory() as td:
         project = Path(td)
@@ -1646,10 +1729,13 @@ def main() -> None:
     test_goalflight_task_resume_history_uses_atomic_writer()
     test_goalflight_task_resume_history_filters_subset_race_under_lock()
     test_goalflight_task_rejects_non_regular_store_files_without_hanging()
+    test_goalflight_task_sequence_write_uses_atomic_fsync_writer()
+    test_goalflight_task_max_sequence_avoids_publish_recovery_under_store_lock()
+    test_goalflight_task_next_nudge_logs_failure_once_per_key()
     test_goalflight_task_sync_repairs_stale_mirror()
     test_goalflight_task_data_js_escapes_script_end_and_html()
     test_goalflight_task_sync_generates_markdown_views()
-    print("OK: 31 tasks mirror/task-store tests pass")
+    print("OK: 34 tasks mirror/task-store tests pass")
 
 
 if __name__ == "__main__":

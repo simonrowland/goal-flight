@@ -176,7 +176,7 @@ def tail_quota_signature(path: Path | str | None) -> dict[str, Any] | None:
         "signature": signature,
         "tail_path": str(p),
         "tail_excerpt": excerpt.strip(),
-        "tail_mtime": int(mtime) if mtime is not None else None,
+        "tail_mtime": mtime,
     }
 
 
@@ -456,6 +456,31 @@ def advisory_lines(pressure: dict | None, *, limit: int = 5) -> list[str]:
     return lines
 
 
+def _contained_path(path: Path, *, root: Path | None) -> Path | None:
+    if root is None:
+        return None
+    try:
+        resolved_root = root.expanduser().resolve()
+        resolved_path = path.expanduser()
+        if not resolved_path.is_absolute():
+            resolved_path = resolved_root / resolved_path
+        resolved_path = resolved_path.resolve()
+        resolved_path.relative_to(resolved_root)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return resolved_path
+
+
+def _record_project_root(record: dict) -> Path | None:
+    raw = record.get("project_root")
+    if not raw:
+        return None
+    try:
+        return Path(str(raw)).expanduser().resolve()
+    except (OSError, RuntimeError):
+        return None
+
+
 def _coerce_artifact_path(value: object, *, base: Path | None) -> Path | None:
     if not value:
         return None
@@ -465,9 +490,7 @@ def _coerce_artifact_path(value: object, *, base: Path | None) -> Path | None:
         return None
     raw = value.strip().strip("`'\"")
     path = Path(raw).expanduser()
-    if not path.is_absolute() and base is not None:
-        path = base / path
-    return path
+    return _contained_path(path, root=base)
 
 
 def _candidate_artifact_values(record: dict, tail_text: str) -> list[object]:
@@ -501,11 +524,14 @@ def _candidate_artifact_values(record: dict, tail_text: str) -> list[object]:
 
 
 def _artifact_mtime_ok(path: Path, record: dict) -> bool:
+    contained = _contained_path(path, root=_record_project_root(record))
+    if contained is None:
+        return False
     try:
-        stat = path.stat()
+        stat = contained.stat()
     except OSError:
         return False
-    if not path.is_file() or stat.st_size <= 0:
+    if not contained.is_file() or stat.st_size <= 0:
         return False
     started = goalflight_ledger.parse_utc(record.get("started_at"))
     if started and stat.st_mtime + 2.0 < started.timestamp():
@@ -518,7 +544,7 @@ def _artifact_mtime_ok(path: Path, record: dict) -> bool:
 def draft_artifact_for_record(record: dict) -> Path | None:
     tail = tail_path_from_record(record)
     tail_text = tail_excerpt(tail)
-    base = Path(str(record.get("project_root"))).expanduser() if record.get("project_root") else None
+    base = _record_project_root(record)
     seen: set[str] = set()
     for value in _candidate_artifact_values(record, tail_text):
         path = _coerce_artifact_path(value, base=base)
