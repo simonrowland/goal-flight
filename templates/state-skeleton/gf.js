@@ -1,7 +1,8 @@
 /* gf.js — shared client engine for the goal-flight Tier-2 views.
  *
  * Zero dependencies, no build step, no backend. Loaded by tickets.html,
- * ticket.html, current-activity.html and index.html via a single <script src>.
+ * ticket.html, current-activity.html, burndown.html and index.html via a
+ * single <script src>.
  *
  * Responsibilities:
  *   - DATA LOADING: read the window.GF_ITEMS snapshot shipped by tasks-data.js.
@@ -129,6 +130,12 @@
       acceptance: it.acceptance || null,
       prompt: it.prompt || null,
       prompt_path: it.prompt_path || null,
+      created_at: it.created_at || null,
+      done_at: it.done_at || null,
+      closed_at: it.closed_at || null,
+      reviewed_at: it.reviewed_at || null,
+      completed_at: it.completed_at || null,
+      audit: Array.isArray(it.audit) ? it.audit.filter(Boolean) : [],
       // Durable dispatch breadcrumb (ADR-011 / task-lifecycle.md "Dispatch
       // provenance"). Each entry: { dispatch_id, agent, log, started_at,
       // ended_at, state, marker, worker_pid? }. Absent on hand-maintained items.
@@ -184,18 +191,18 @@
 
   // Absolute repo root. The helper will write window.GF_ROOT (absolute repo root)
   // into tasks-data.js; honour it if already set. Otherwise DERIVE it from the
-  // current location: the views sit at <root>/docs-private/<page>, so stripping
-  // the trailing '/docs-private/<page>' yields the repo root. Returns "" when it
-  // can't be derived.
+  // current location: the views sit at <root>/dashboard/<page> (or legacy
+  // <root>/docs-private/<page>), so stripping that trailing segment yields the
+  // repo root. Returns "" when it can't be derived.
   function gfRoot() {
     if (typeof global.GF_ROOT === "string" && global.GF_ROOT) {
       // normalize: drop a trailing slash so the under-root prefix test is clean
       return global.GF_ROOT.replace(/\/+$/, "");
     }
     try {
-      // pathname like /path/to/repo/docs-private/tickets.html (file://).
+      // pathname like /path/to/repo/dashboard/tickets.html (file://).
       var path = decodeURIComponent(global.location.pathname || "");
-      var m = /^(.*)\/docs-private\/[^/]*$/.exec(path);
+      var m = /^(.*)\/(?:dashboard|docs-private)\/[^/]*$/.exec(path);
       return m ? m[1] : "";
     } catch (e) {
       return "";
@@ -261,7 +268,7 @@
         var rel = resolvePathMention(raw);
         if (!rel) return whole; // not linkable -> leave verbatim
         // views sit one level below repo-root, so '../' + rel reaches the file
-        // from a docs-private view.
+        // from a dashboard view.
         var href = "../" + rel;
         return lead + '<a class="pathlink" href="' + esc(href) + '">' + raw + "</a>";
       });
@@ -306,7 +313,7 @@
     sig: null
   };
 
-  function index(rawItems) {
+  function deriveItems(rawItems) {
     var items = (rawItems || []).map(normalize);
     var byId = {};
     items.forEach(function (it) {
@@ -316,9 +323,14 @@
     items.forEach(function (it) {
       it._section = sectionKey(it, byId);
     });
+    return { items: items, byId: byId };
+  }
+
+  function index(rawItems) {
+    var derived = deriveItems(rawItems);
     store.raw = rawItems || [];
-    store.items = items;
-    store.byId = byId;
+    store.items = derived.items;
+    store.byId = derived.byId;
     return store;
   }
 
@@ -611,6 +623,170 @@
     return c;
   }
 
+  /* ------------------------------------------------------------ burndown */
+
+  function parseTime(value) {
+    if (typeof value !== "string" || !value.trim()) return null;
+    var n = Date.parse(value);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  function firstAuditTime(it, actions) {
+    var audit = Array.isArray(it.audit) ? it.audit : [];
+    for (var i = 0; i < audit.length; i++) {
+      var row = audit[i] || {};
+      if (actions.indexOf(String(row.action || "")) < 0) continue;
+      var t = parseTime(row.at || row.ts || row.time);
+      if (t != null) return t;
+    }
+    return null;
+  }
+
+  function itemCreatedTime(it) {
+    return parseTime(it.created_at) || firstAuditTime(it, ["new", "harvest", "review-bug-capture"]);
+  }
+
+  function itemDoneTime(it) {
+    return parseTime(it.done_at) || parseTime(it.closed_at) || parseTime(it.reviewed_at) ||
+      parseTime(it.completed_at) || firstAuditTime(it, ["done", "close", "closed", "review", "accept"]);
+  }
+
+  function itemReopenTime(it, finished) {
+    var reopened = firstAuditTime(it, ["reopen", "reopened", "open", "opened", "undo-done", "undone", "mark-open"]);
+    if (reopened != null && (finished == null || reopened >= finished)) return reopened;
+    if (finished != null && it.done === false) return finished + 1;
+    return null;
+  }
+
+  function fmtDate(ms) {
+    try {
+      return new Date(ms).toISOString().slice(0, 10);
+    } catch (e) {
+      return "";
+    }
+  }
+
+  function burndownData(rawItems) {
+    var raw = rawItems || store.raw || [];
+    var derived = deriveItems(raw);
+    var done = 0;
+    var open = 0;
+    var events = [];
+    var timestamped = 0;
+
+    derived.items.forEach(function (it) {
+      var isDone = it._section === "done-reviewed";
+      if (isDone) done += 1;
+      else open += 1;
+
+      var created = itemCreatedTime(it);
+      if (created == null) return;
+      timestamped += 1;
+      events.push({ t: created, delta: 1 });
+      var finished = itemDoneTime(it);
+      if (finished != null && finished >= created) {
+        if (isDone) {
+          events.push({ t: finished, delta: -1 });
+        } else {
+          events.push({ t: finished, delta: -1 });
+          events.push({ t: itemReopenTime(it, finished), delta: 1 });
+        }
+      }
+    });
+
+    events.sort(function (a, b) {
+      return a.t - b.t || b.delta - a.delta;
+    });
+
+    var points = [];
+    var running = 0;
+    for (var i = 0; i < events.length;) {
+      var t = events[i].t;
+      var delta = 0;
+      while (i < events.length && events[i].t === t) {
+        delta += events[i].delta;
+        i += 1;
+      }
+      running += delta;
+      points.push({ t: t, open: Math.max(0, running) });
+    }
+
+    var burnRate = null;
+    if (points.length >= 2) {
+      var first = points[0];
+      var last = points[points.length - 1];
+      var days = Math.max((last.t - first.t) / 86400000, 1);
+      burnRate = (first.open - last.open) / days;
+    }
+
+    return {
+      open: open,
+      done: done,
+      total: derived.items.length,
+      points: points,
+      burnRate: burnRate,
+      timestamped: timestamped
+    };
+  }
+
+  function burndownCoverageNote(data) {
+    if (!data || data.timestamped >= data.total) return "";
+    var missing = data.total - data.timestamped;
+    return '<p class="mode coverage-note">trend covers ' + data.timestamped + " of " + data.total +
+      " items (" + missing + " lack timestamps)</p>";
+  }
+
+  function renderBurndownSvg(points) {
+    if (!points || points.length < 2) {
+      return '<p class="empty">Trend unavailable until items include created/done timestamps.</p>';
+    }
+    var w = 720;
+    var h = 260;
+    var pad = 34;
+    var minT = points[0].t;
+    var maxT = points[points.length - 1].t;
+    var maxOpen = Math.max.apply(null, points.map(function (p) { return p.open; }).concat([1]));
+    var span = Math.max(maxT - minT, 1);
+    function x(t) {
+      return pad + ((t - minT) / span) * (w - pad * 2);
+    }
+    function y(open) {
+      return h - pad - (open / maxOpen) * (h - pad * 2);
+    }
+    var d = "";
+    points.forEach(function (p, i) {
+      var px = x(p.t).toFixed(1);
+      var py = y(p.open).toFixed(1);
+      if (i === 0) d += "M " + px + " " + py;
+      else {
+        var prev = points[i - 1];
+        d += " H " + px + " V " + py;
+      }
+    });
+    return '<svg class="burndown-svg" viewBox="0 0 ' + w + " " + h + '" role="img" aria-label="Open item count trend">' +
+      '<line class="axis" x1="' + pad + '" y1="' + (h - pad) + '" x2="' + (w - pad) + '" y2="' + (h - pad) + '"></line>' +
+      '<line class="axis" x1="' + pad + '" y1="' + pad + '" x2="' + pad + '" y2="' + (h - pad) + '"></line>' +
+      '<text class="tick" x="' + pad + '" y="' + (h - 10) + '">' + esc(fmtDate(minT)) + "</text>" +
+      '<text class="tick end" x="' + (w - pad) + '" y="' + (h - 10) + '">' + esc(fmtDate(maxT)) + "</text>" +
+      '<text class="tick" x="6" y="' + y(maxOpen).toFixed(1) + '">' + maxOpen + "</text>" +
+      '<path class="series" d="' + d + '"></path>' +
+      points.map(function (p) {
+        return '<circle class="point" cx="' + x(p.t).toFixed(1) + '" cy="' + y(p.open).toFixed(1) + '" r="3"></circle>';
+      }).join("") +
+      "</svg>";
+  }
+
+  function renderBurndown(mount, summaryMount, rawItems) {
+    var data = burndownData(rawItems);
+    var rate = data.burnRate == null ? "n/a" : Math.abs(data.burnRate).toFixed(1) + "/day " +
+      (data.burnRate >= 0 ? "down" : "up");
+    if (summaryMount) {
+      summaryMount.textContent = data.open + " open / " + data.done + " done / burn rate " + rate;
+    }
+    mount.innerHTML = burndownCoverageNote(data) + renderBurndownSvg(data.points);
+    return data;
+  }
+
   /* --------------------------------------------------------------- export */
 
   global.GF = {
@@ -627,6 +803,7 @@
     idLink: idLink,
     normalize: normalize,
     sectionKey: sectionKey,
+    deriveItems: deriveItems,
     index: index,
     applyControls: applyControls,
     sortItems: sortItems,
@@ -640,6 +817,10 @@
     statusBadge: statusBadge,
     kindBadge: kindBadge,
     blockerBits: blockerBits,
+    burndownData: burndownData,
+    burndownCoverageNote: burndownCoverageNote,
+    renderBurndownSvg: renderBurndownSvg,
+    renderBurndown: renderBurndown,
     store: store,
     // direct loader — resolves the indexed store from tasks-data.js
     load: function () {

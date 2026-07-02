@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>goal-flight burndown</title>
+<style>
+:root{--bg:#fff;--fg:#1a1d21;--muted:#6b7280;--accent:#2563eb;--border:#e5e7eb;--card:#fff;--ok:#15803d;--shadow:0 1px 2px rgba(0,0,0,.04),0 1px 3px rgba(0,0,0,.06)}
+@media (prefers-color-scheme:dark){:root{--bg:#0f1115;--fg:#e6e8eb;--muted:#9aa0a6;--accent:#6ea8fe;--border:#262a31;--card:#161922;--ok:#4ade80;--shadow:0 1px 2px rgba(0,0,0,.3)}}
+*{box-sizing:border-box}
+.visually-hidden{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0}
+.skip-link{position:absolute;left:.5rem;top:-3rem;z-index:20;background:var(--card);color:var(--fg);border:1px solid var(--accent);border-radius:.4rem;padding:.4rem .7rem;transition:top .12s}
+.skip-link:focus{top:.5rem;text-decoration:none}
+html{font:16px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+body{margin:0;background:var(--bg);color:var(--fg)}
+main{max-width:50rem;margin:0 auto;padding:1.5rem 1.25rem 2rem}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+a:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:.3rem}
+.top{display:flex;align-items:baseline;justify-content:space-between;gap:1rem;flex-wrap:wrap}
+h1{font-size:1.5rem;margin:.2em 0 .1em;letter-spacing:-.01em}
+.tagline{color:var(--muted);font-size:.9rem;margin:.1em 0 0}
+.mode{font:.72rem ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted)}
+.dot{display:inline-block;width:.5rem;height:.5rem;border-radius:50%;background:var(--muted);margin-right:.35rem;vertical-align:middle}
+.crumb{font-size:.86rem;margin:1rem 0;color:var(--muted)}
+.summary{font-size:1.15rem;font-weight:650;margin:1.1rem 0 .75rem}
+.panel{background:var(--card);border:1px solid var(--border);border-radius:.7rem;box-shadow:var(--shadow);padding:1rem}
+.coverage-note{margin:.1rem 0 .75rem}
+.burndown-svg{display:block;width:100%;height:auto;min-height:15rem}
+.axis{stroke:var(--border);stroke-width:1}
+.series{fill:none;stroke:var(--accent);stroke-width:3;stroke-linejoin:round;stroke-linecap:round}
+.point{fill:var(--ok)}
+.tick{fill:var(--muted);font:12px ui-monospace,SFMono-Regular,Menlo,monospace}
+.tick.end{text-anchor:end}
+.empty{color:var(--muted);margin:.2rem 0}
+footer{max-width:50rem;margin:0 auto;padding:.5rem 1.25rem 2rem;color:var(--muted);font-size:.78rem}
+</style>
+</head>
+<body>
+<a class="skip-link" href="#burndownChart">Skip to burndown</a>
+<main>
+  <div class="top">
+    <div>
+      <h1>burndown</h1>
+      <p class="tagline">open count trend · snapshot dashboard</p>
+    </div>
+    <span class="mode" id="mode"><span class="dot"></span><span id="modeText">loading...</span></span>
+  </div>
+
+  <p class="crumb"><a href="index.html">dashboard</a> / burndown</p>
+  <p class="summary" id="burndownSummary">loading...</p>
+  <div class="panel" id="burndownChart" aria-live="polite"></div>
+</main>
+<footer><span id="foot">goal-flight · Tier-2 dashboard</span></footer>
+
+<script src="tasks-data.js"></script>
+<script src="gf.js"></script>
+<script>
+(function(){
+  "use strict";
+  function render(){
+    var data = GF.renderBurndown(
+      document.getElementById("burndownChart"),
+      document.getElementById("burndownSummary")
+    );
+    document.getElementById("foot").textContent =
+      "goal-flight · " + data.total + " items · " + GF.store.mode;
+  }
+
+  function setMode(mode){
+    var el=document.getElementById("mode"), txt=document.getElementById("modeText");
+    el.classList.remove("live"); txt.textContent=(mode || "snapshot") + " · reloads page";
+  }
+
+  GF.attach({ onRender: render, onMode: setMode });
+})();
+</script>
+</body>
+</html>

@@ -68,7 +68,9 @@ MANAGED_VIEW_ASSETS = (
     "ticket.html",
     "current-activity.html",
     "questions-for-user.html",
+    "burndown.html",
 )
+DASHBOARD_ASSETS = MANAGED_VIEW_ASSETS + ("tasks-data.js",)
 MANAGED_VIEW_LEGACY_MARKERS = (
     "old dashboard vocabulary:",
     "legacy worker-finished done vocabulary",
@@ -564,7 +566,19 @@ def canonical_state_skeleton_files(skill_root: Path | None = None) -> list[str]:
     return sorted(
         path.relative_to(skeleton).as_posix()
         for path in skeleton.rglob("*")
-        if path.is_file()
+        if path.is_file() and path.relative_to(skeleton).as_posix() not in DASHBOARD_ASSETS
+    )
+
+
+def canonical_dashboard_files(skill_root: Path | None = None) -> list[str]:
+    root = skill_root or SCRIPT_DIR.parent
+    skeleton = root / STATE_SKELETON_REL
+    if not skeleton.is_dir():
+        return []
+    return sorted(
+        rel
+        for rel in DASHBOARD_ASSETS
+        if (skeleton / rel).is_file()
     )
 
 
@@ -575,25 +589,30 @@ def _state_layout_warning(message: str, *, path: str | None = None) -> dict:
     return out
 
 
-def _state_layout_has_task_store(docs_private: Path) -> bool:
-    return (docs_private / "tasks.jsonl").exists() or (docs_private / "tasks-data.js").exists()
+def _state_layout_has_task_store(docs_private: Path, dashboard: Path) -> bool:
+    return (docs_private / "tasks.jsonl").exists() or (dashboard / "tasks-data.js").exists()
 
 
-def _state_layout_adopted(docs_private: Path) -> bool:
-    if not docs_private.is_dir():
+def _state_layout_adopted(docs_private: Path, dashboard: Path) -> bool:
+    if not docs_private.is_dir() and not dashboard.is_dir():
         return False
-    adoption_markers = (
+    docs_markers = (
         "NORTH-STAR.md",
         "task-decomposition.md",
         "tasks.jsonl",
+    )
+    dashboard_markers = (
         "tasks-data.js",
         "gf.js",
     )
-    return any((docs_private / rel).exists() for rel in adoption_markers)
+    return any((docs_private / rel).exists() for rel in docs_markers) or any(
+        (dashboard / rel).exists() for rel in dashboard_markers
+    )
 
 
 def _state_layout_init_signal(project_root: Path, docs_private: Path) -> bool:
-    if _state_layout_has_task_store(docs_private) or _state_layout_adopted(docs_private):
+    dashboard = project_root / "dashboard"
+    if _state_layout_has_task_store(docs_private, dashboard) or _state_layout_adopted(docs_private, dashboard):
         return True
     if not (docs_private / "env-caveats.md").exists():
         return False
@@ -705,16 +724,17 @@ def classify_managed_view_asset(source: Path, target: Path) -> dict:
 
 def _check_tasks_mirror(project_root: Path, skill_root: Path) -> dict:
     docs_private = project_root / "docs-private"
+    dashboard = project_root / "dashboard"
     tasks_jsonl = docs_private / "tasks.jsonl"
-    tasks_data = docs_private / "tasks-data.js"
+    tasks_data = dashboard / "tasks-data.js"
     if not tasks_jsonl.exists() and not tasks_data.exists():
         return {"ok": True, "present": False, "skipped": "task store absent"}
     if not tasks_jsonl.exists() or not tasks_data.exists():
-        missing = "tasks.jsonl" if not tasks_jsonl.exists() else "tasks-data.js"
+        missing = "docs-private/tasks.jsonl" if not tasks_jsonl.exists() else "dashboard/tasks-data.js"
         return {
             "ok": False,
             "present": True,
-            "message": f"tasks mirror incomplete: docs-private/{missing} missing",
+            "message": f"tasks mirror incomplete: {missing} missing",
         }
     script = skill_root / "scripts/check_tasks_mirror.js"
     if not script.is_file():
@@ -729,7 +749,7 @@ def _check_tasks_mirror(project_root: Path, skill_root: Path) -> dict:
             "present": True,
             "skipped": "node unavailable; skipped tasks mirror check",
         }
-    result = run(["node", str(script), str(docs_private)], timeout=8.0)
+    result = run(["node", str(script), str(docs_private), str(dashboard)], timeout=8.0)
     if result.get("ok"):
         return {"ok": True, "present": True, "detail": first_line(result.get("stdout"))}
     return {
@@ -746,13 +766,16 @@ def check_project_state_layout(project_root: Path, skill_root: Path | None = Non
     root = skill_root or SCRIPT_DIR.parent
     skeleton = root / STATE_SKELETON_REL
     docs_private = project_root / "docs-private"
+    dashboard = project_root / "dashboard"
     expected_files = canonical_state_skeleton_files(root)
+    expected_dashboard_files = canonical_dashboard_files(root)
     missing_files: list[str] = []
     missing_dirs: list[str] = []
     warnings: list[dict] = []
     advisories: list[dict] = []
     view_schema_skew: list[dict] = []
     view_customizations: list[dict] = []
+    legacy_dashboard_views: list[dict] = []
     advisory_absence = not _state_layout_init_signal(project_root, docs_private)
 
     def add_layout_issue(message: str, *, path: str | None = None) -> None:
@@ -770,6 +793,14 @@ def check_project_state_layout(project_root: Path, skill_root: Path | None = Non
             path="docs-private/",
         )
 
+    if not dashboard.is_dir():
+        missing_dirs.append("dashboard/")
+        add_layout_issue(
+            "missing browser-facing dashboard directory: dashboard/ "
+            "(run `/goal-flight init` to scaffold static views at repo root)",
+            path="dashboard/",
+        )
+
     if not skeleton.is_dir():
         warnings.append(_state_layout_warning(
             f"state skeleton missing: {STATE_SKELETON_REL.as_posix()} "
@@ -784,6 +815,18 @@ def check_project_state_layout(project_root: Path, skill_root: Path | None = Non
             missing_files.append(state_path)
             add_layout_issue(
                 f"missing canonical docs-private file: {state_path} "
+                f"(create from {STATE_SKELETON_REL.as_posix()}/{rel}; "
+                "run `/goal-flight init` to scaffold without overwriting)",
+                path=state_path,
+            )
+
+    for rel in expected_dashboard_files:
+        target = dashboard / rel
+        if not target.is_file():
+            state_path = f"dashboard/{rel}"
+            missing_files.append(state_path)
+            add_layout_issue(
+                f"missing browser-facing dashboard file: {state_path} "
                 f"(create from {STATE_SKELETON_REL.as_posix()}/{rel}; "
                 "run `/goal-flight init` to scaffold without overwriting)",
                 path=state_path,
@@ -817,14 +860,14 @@ def check_project_state_layout(project_root: Path, skill_root: Path | None = Non
 
     for rel in MANAGED_VIEW_ASSETS:
         source = skeleton / rel
-        target = docs_private / rel
+        target = dashboard / rel
         if not target.exists() or not source.exists() or not target.is_file() or not source.is_file():
             continue
         status = classify_managed_view_asset(source, target)
         if status["status"] == "current":
             if status.get("customized"):
                 entry = {
-                    "asset": f"docs-private/{rel}",
+                    "asset": f"dashboard/{rel}",
                     "template": f"{STATE_SKELETON_REL.as_posix()}/{rel}",
                     "expected_sha256": status["source_sha256"],
                     "actual_sha256": status["target_sha256"],
@@ -832,7 +875,7 @@ def check_project_state_layout(project_root: Path, skill_root: Path | None = Non
                     "status": status["status"],
                 }
                 entry["message"] = (
-                    f"managed view customization preserved: docs-private/{rel} carries "
+                    f"managed view customization preserved: dashboard/{rel} carries "
                     "the v1.1 renderer contract but differs from the current template; "
                     "review manually if this was meant to be stock"
                 )
@@ -840,7 +883,7 @@ def check_project_state_layout(project_root: Path, skill_root: Path | None = Non
                 advisories.append(_state_layout_warning(entry["message"], path=entry["asset"]))
             continue
         entry = {
-            "asset": f"docs-private/{rel}",
+            "asset": f"dashboard/{rel}",
             "template": f"{STATE_SKELETON_REL.as_posix()}/{rel}",
             "expected_sha256": status["source_sha256"],
             "actual_sha256": status["target_sha256"],
@@ -849,7 +892,7 @@ def check_project_state_layout(project_root: Path, skill_root: Path | None = Non
         }
         if status["needs_refresh"]:
             entry["message"] = (
-                f"legacy goal-flight view (pre-v1.1 renderer): docs-private/{rel} "
+                f"legacy goal-flight view (pre-v1.1 renderer): dashboard/{rel} "
                 f"matches {status['reason']}; run `/goal-flight init` to back up and "
                 "refresh managed view assets"
             )
@@ -858,16 +901,37 @@ def check_project_state_layout(project_root: Path, skill_root: Path | None = Non
         elif status["status"] == "foreign":
             entry["message"] = (
                 f"unrecognized file at managed view path; left for manual review: "
-                f"docs-private/{rel} (init will not overwrite non-goal-flight "
+                f"dashboard/{rel} (init will not overwrite non-goal-flight "
                 "operator content)"
             )
             view_customizations.append(entry)
             advisories.append(_state_layout_warning(entry["message"], path=entry["asset"]))
 
+    for rel in DASHBOARD_ASSETS:
+        legacy = docs_private / rel
+        canonical = dashboard / rel
+        if legacy.exists() and legacy.is_file():
+            entry = {
+                "legacy": f"docs-private/{rel}",
+                "canonical": f"dashboard/{rel}",
+                "message": (
+                    f"legacy browser-facing dashboard asset remains at docs-private/{rel}; "
+                    f"dashboard/{rel} is the canonical file:// location"
+                ),
+            }
+            legacy_dashboard_views.append(entry)
+            if canonical.exists():
+                advisories.append(_state_layout_warning(entry["message"], path=entry["legacy"]))
+            else:
+                warnings.append(_state_layout_warning(
+                    entry["message"] + "; run `/goal-flight init` to regenerate the dashboard copy",
+                    path=entry["canonical"],
+                ))
+
     tasks_mirror = _check_tasks_mirror(project_root, root)
     if tasks_mirror.get("ok") is False:
         message = tasks_mirror.get("message") or "tasks.jsonl/tasks-data.js mirror check failed"
-        warnings.append(_state_layout_warning(message, path="docs-private/tasks-data.js"))
+        warnings.append(_state_layout_warning(message, path="dashboard/tasks-data.js"))
 
     ok: bool | None
     if warnings:
@@ -881,19 +945,22 @@ def check_project_state_layout(project_root: Path, skill_root: Path | None = Non
         "ok": ok,
         "advisory": bool(advisories and not warnings),
         "docs_private": str(docs_private),
+        "dashboard": str(dashboard),
         "skeleton": str(skeleton),
         "expected_files": [f"docs-private/{rel}" for rel in expected_files],
-        "required_dirs": ["docs-private/"] + [f"docs-private/{rel}/" for rel in CANONICAL_STATE_DIRS],
+        "expected_dashboard_files": [f"dashboard/{rel}" for rel in expected_dashboard_files],
+        "required_dirs": ["docs-private/", "dashboard/"] + [f"docs-private/{rel}/" for rel in CANONICAL_STATE_DIRS],
         "missing_files": missing_files,
         "missing_dirs": missing_dirs,
         "stale_html": [],
         "view_schema_skew": view_schema_skew,
         "view_customizations": view_customizations,
+        "legacy_dashboard_views": legacy_dashboard_views,
         "tasks_mirror": tasks_mirror,
         "warnings": warnings,
         "advisories": advisories,
         "install_hint": (
-            "Run `/goal-flight init` to scaffold missing docs-private paths from "
+            "Run `/goal-flight init` to scaffold missing docs-private/dashboard paths from "
             "`templates/state-skeleton/` without overwriting existing operator files."
         ) if warnings else (
             "Run `/goal-flight init` to adopt the v1.1 docs-private state layout."
