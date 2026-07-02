@@ -548,7 +548,7 @@ def _active_leases_for(project_root: Path) -> list[dict]:
 
 def to_text(status: dict) -> str:
     counts_text = _backlog_counts_text(status)
-    resume_text = _resume_directive_text(status) if status.get("active") else None
+    resume_text = _resume_directive_text(status)
     if not status["active"]:
         if status["queue_file"] is None:
             text = "no goal-flight queue files; not an active session"
@@ -558,7 +558,12 @@ def to_text(status: dict) -> str:
             f"state={status['queue_state'] or 'unset'}; "
             f"{status['queue_reason']})"
             )
-        return f"{text}; {counts_text}" if counts_text else text
+        pieces = [text]
+        if counts_text:
+            pieces.append(counts_text)
+        if resume_text:
+            pieces.append(resume_text)
+        return "; ".join(pieces)
     pieces = [
         f"active goal-flight session ({status['queue_slug'] or 'unnamed'})",
         f"queue={status['queue_file']}",

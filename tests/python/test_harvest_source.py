@@ -160,6 +160,67 @@ def test_harvest_source_globs_guards_and_zero_match_summary() -> None:
         )
 
 
+def test_harvest_source_skips_managed_state_with_summary() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        project = Path(td)
+        docs = project / "docs-private"
+        _write_tasks(project, [])
+        (docs / "RESUME-NOTES-2026-07-02.md").write_text("- branch: core-v1.2\n", encoding="utf-8")
+
+        proc = run_task(project, "harvest", "--source", "docs-private/tasks.jsonl", "--dry-run")
+        assert_true(f"managed tasks source exits 0: {proc.stderr}", proc.returncode == 0)
+        assert_true("managed tasks source prints skip summary", "skipped 1 managed source(s)" in proc.stdout)
+        assert_true("managed tasks source stdout not blank", proc.stdout.strip() != "")
+
+        proc = run_task(project, "harvest", "--source", "docs-private/RESUME-NOTES-*.md", "--dry-run")
+        assert_true(f"resume source exits 0: {proc.stderr}", proc.returncode == 0)
+        assert_true("resume source prints skip summary", "RESUME-NOTES-2026-07-02.md" in proc.stdout)
+        assert_true("resume source does not ingest resume prose", "branch: core-v1.2" not in proc.stdout)
+
+        proc = run_task(project, "migrate", "--source", "docs-private/tasks.jsonl")
+        assert_true(f"managed migrate exits 0: {proc.stderr}", proc.returncode == 0)
+        assert_true("migrate preview prints managed skip", "skipped 1 managed source(s)" in proc.stdout)
+
+
+def test_harvest_source_limit_reports_dropped_matches() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        project = Path(td)
+        docs = project / "docs-private"
+        _write_tasks(project, [])
+        for index in range(3):
+            (docs / f"source-{index}.md").write_text(f"- Source issue {index}\n", encoding="utf-8")
+
+        proc = run_task(
+            project,
+            "harvest",
+            "--source",
+            "docs-private/source-*.md",
+            "--source-limit",
+            "2",
+            "--dry-run",
+            "--json",
+        )
+        assert_true(f"limited source exits 0: {proc.stderr}", proc.returncode == 0)
+        payload = json.loads(proc.stdout)
+        summary = payload["source_matches"][0]
+        assert_true("source limit keeps two matches", summary["matches"] == 2)
+        assert_true("source limit reports one dropped", summary["dropped"] == 1)
+        assert_true("source limit reports override value", summary["source_limit"] == 2)
+        assert_true("source limit only emits two drafts", len(payload["drafts"]) == 2)
+
+        proc = run_task(
+            project,
+            "harvest",
+            "--source",
+            "docs-private/source-*.md",
+            "--source-limit",
+            "2",
+            "--dry-run",
+        )
+        assert_true("limited text exits 0", proc.returncode == 0)
+        assert_true("limited text reports dropped count", "dropped 1 matched file(s)" in proc.stdout)
+
+
 def test_harvest_source_refuses_escaping_and_non_regular_paths() -> None:
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
@@ -237,6 +298,8 @@ def test_harvest_without_source_keeps_builtin_behavior() -> None:
 if __name__ == "__main__":
     test_harvest_source_dry_run_json_flags_and_idempotency()
     test_harvest_source_globs_guards_and_zero_match_summary()
+    test_harvest_source_skips_managed_state_with_summary()
+    test_harvest_source_limit_reports_dropped_matches()
     test_harvest_source_refuses_escaping_and_non_regular_paths()
     test_harvest_without_source_keeps_builtin_behavior()
     print("PASS")

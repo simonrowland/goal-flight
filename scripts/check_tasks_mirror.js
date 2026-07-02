@@ -9,7 +9,7 @@
 // Usage:  node scripts/check_tasks_mirror.js [<store-dir> [<dashboard-dir>]]
 //   <store-dir> holds tasks.jsonl.
 //   <dashboard-dir> holds tasks-data.js. If omitted, <store-dir> is used.
-//   Defaults to templates/state-skeleton/ (the tracked known-good fixture).
+//   Defaults to templates/state-skeleton/ (the tracked empty scaffold mirror).
 //
 // Hermetic: node-only, no network, no localhost. tasks-data.js is loaded inside
 // a node `vm` sandbox with a `window` shim — never eval'd into real globals.

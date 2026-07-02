@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -71,6 +72,8 @@ GSTACK_FULL_INSTALL_HOSTS = {
 STATE_BACKUP_REL = Path("docs-private/log/project-state-backups")
 TASK_ID_PATTERN = re.compile(r"\b[tb]-\d+\b")
 RESUME_PIN_TEXT = "newest docs-private/RESUME-NOTES-*.md"
+GOALFLIGHT_SKILL_ROOT_PIN = "${GOALFLIGHT_ROOT:-~/.goal-flight/skill}"
+LEGACY_GOALFLIGHT_ROOT_PIN_RE = re.compile(r"\$\{GOALFLIGHT_ROOT:-~/\.goal-flight\}(?!/skill)")
 HANDOFF_FILE_RE = re.compile(r"(?<!state-)(?<![A-Za-z0-9_/-])handoff\.md(?![A-Za-z0-9_.-])")
 MANAGED_POINTER_PHRASES = (
     "living current state",
@@ -156,6 +159,10 @@ def _project_agents_template(repo_root: Path, target_project: Path) -> str:
     )
 
 
+def _replace_skill_root_pin_text(text: str) -> str:
+    return LEGACY_GOALFLIGHT_ROOT_PIN_RE.sub(GOALFLIGHT_SKILL_ROOT_PIN, text)
+
+
 def _replace_state_pointer_line(line: str) -> str:
     replacements = (
         ("Living current state is `handoff.md`;", "Living current state is the newest `docs-private/RESUME-NOTES-*.md`;"),
@@ -226,6 +233,11 @@ def _ensure_agents_state_pin(repo_root: Path, target_project: Path) -> dict[str,
     changes: list[str] = []
     if updated != text:
         changes.append("rewrote handoff.md state pointer to newest docs-private/RESUME-NOTES-*.md")
+    skill_root_updated = _replace_skill_root_pin_text(updated)
+    if skill_root_updated != updated:
+        updated = skill_root_updated
+        lower = updated.casefold()
+        changes.append("rewrote goal-flight skill-root pin to ~/.goal-flight/skill")
     if unmanaged_handoff_pointer:
         changes.append("left unmanaged handoff.md mention untouched; review manually if it is a Goal Flight state pointer")
 
@@ -300,6 +312,30 @@ def _derive_task_ids_from_record(record: dict[str, Any]) -> list[str]:
 
 def _json_copy(value: Any) -> Any:
     return json.loads(json.dumps(value, sort_keys=True))
+
+
+def _load_goalflight_task_module() -> Any:
+    spec = importlib.util.spec_from_file_location("goalflight_task_for_setup", REPO_ROOT / "goalflight_task.py")
+    if spec is None or spec.loader is None:
+        raise SetupError("goalflight_task.py import spec unavailable")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _tasks_data_js_for_project(project_root: Path) -> str:
+    module = _load_goalflight_task_module()
+    store = module.TaskStore(project_root)
+    items = store.load_items(recover_publish=False)
+    return module._items_data_js(store._mirror_items_for_script(items))
+
+
+def _scaffold_create_order(rel_out: str) -> tuple[int, str]:
+    if rel_out == "docs-private/tasks.jsonl":
+        return (0, rel_out)
+    if rel_out == "dashboard/tasks-data.js":
+        return (2, rel_out)
+    return (1, rel_out)
 
 
 def _sha256_file(path: Path) -> str | None:
@@ -555,7 +591,7 @@ def scaffold_project_state(
             path = target_project / rel.rstrip("/")
             path.mkdir(parents=True, exist_ok=True)
             created_dirs.append(rel)
-        for rel_out in would_create_files:
+        for rel_out in sorted(would_create_files, key=_scaffold_create_order):
             dest = target_project / rel_out
             if dest.exists():
                 skipped_existing_files.append(rel_out)
@@ -565,6 +601,8 @@ def scaffold_project_state(
             if dest.name.startswith("RESUME-NOTES-"):
                 resume_template = repo_root / "templates/resume-notes.md"
                 _atomic_write(dest, _template_text(resume_template, {"<DATE>": today}))
+            elif rel_out == "dashboard/tasks-data.js":
+                _atomic_write(dest, _tasks_data_js_for_project(target_project))
             else:
                 rel_from_root = dest.relative_to(dashboard if rel_out.startswith("dashboard/") else docs_private)
                 source = skeleton / rel_from_root

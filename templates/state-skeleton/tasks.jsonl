@@ -1,2 +1,0 @@
-{"id":"t-001","kind":"task","title":"Example open task — replace with your first real chunk.","blocked_by":[],"links":[],"done":false,"acceptance":"this stub is overwritten by a real task during init/decompose."}
-{"id":"t-002","kind":"task","title":"Example done task — mirrors a completed chunk.","blocked_by":["t-001"],"links":["NORTH-STAR.md"],"done":true,"acceptance":"shown in the Done section of the dashboard."}

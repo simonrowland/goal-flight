@@ -24,6 +24,8 @@ Options:
 - `--source <glob>` may be repeated. Globs are project-root-relative.
 - `--kind task|bug|decision` sets the default kind for source-list items.
 - `--lane <lane>` stamps created source-list drafts; default `deferred`.
+- `--source-limit N` caps files consumed per glob before reporting dropped
+  matches; raise it for intentionally large imports.
 - `--no-history` passes through to harvest and skips RESUME-NOTES history backfill.
 - `--apply` creates draft items after printing the same preview.
 

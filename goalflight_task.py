@@ -77,6 +77,7 @@ HARVEST_PLACEHOLDER_PHRASES = (
     "Example open task - replace with your first real chunk.",
     "Example open task — replace with your first real chunk.",
 )
+DEFAULT_SOURCE_LIMIT = 200
 _NEXT_NUDGE_LOGGED_FAILURES: set[str] = set()
 CANNED_LIST_STATUSES = {
     "outstanding",
@@ -480,12 +481,20 @@ def _matches_state_skeleton_stub(path: Path, text: str) -> bool:
         return False
 
 
-def _skip_harvest_source(path: Path, text: str) -> bool:
+def _harvest_source_skip_reason(path: Path, text: str, *, manual_source: bool = False) -> str | None:
+    if manual_source and _is_top_level_state_source(path) and RESUME_NOTES_RE.match(path.name):
+        return "managed RESUME-NOTES state file"
     if _is_managed_harvest_source(path):
-        return True
+        return "managed state source"
     if _is_top_level_state_source(path, "bug-backlog.md") and HARVEST_GENERATED_HEADER in text:
-        return True
-    return _matches_state_skeleton_stub(path, text)
+        return "generated state source"
+    if _matches_state_skeleton_stub(path, text):
+        return "state skeleton stub"
+    return None
+
+
+def _skip_harvest_source(path: Path, text: str, *, manual_source: bool = False) -> bool:
+    return _harvest_source_skip_reason(path, text, manual_source=manual_source) is not None
 
 
 def _norm_key(value: Any) -> str:
@@ -1717,7 +1726,14 @@ def _harvest_resume_candidates(store: TaskStore) -> list[dict[str, Any]]:
     return candidates
 
 
-def _resolve_harvest_source_paths(store: TaskStore, pattern: str) -> tuple[list[Path], dict[str, Any]]:
+def _resolve_harvest_source_paths(
+    store: TaskStore,
+    pattern: str,
+    *,
+    source_limit: int | None = DEFAULT_SOURCE_LIMIT,
+) -> tuple[list[Path], dict[str, Any]]:
+    if source_limit is not None and source_limit < 1:
+        raise TaskError("--source-limit must be a positive integer")
     root = store.project_root.resolve(strict=False)
     # Reject escape-shaped SYNTAX up front (absolute paths, any `..` component) —
     # the post-glob containment check below catches true escapes, but absolute /
@@ -1748,7 +1764,17 @@ def _resolve_harvest_source_paths(store: TaskStore, pattern: str) -> tuple[list[
         seen.add(key)
         matches.append(resolved)
     matches.sort(key=lambda candidate: candidate.relative_to(root).as_posix())
-    return matches, {"pattern": pattern, "matches": len(matches)}
+    total_matches = len(matches)
+    dropped = 0
+    if source_limit is not None and total_matches > source_limit:
+        dropped = total_matches - source_limit
+        matches = matches[:source_limit]
+    summary: dict[str, Any] = {"pattern": pattern, "matches": len(matches)}
+    if dropped:
+        summary["dropped"] = dropped
+        summary["source_limit"] = source_limit
+        summary["total_matches"] = total_matches
+    return matches, summary
 
 
 def _collect_harvest_candidates(
@@ -1757,6 +1783,7 @@ def _collect_harvest_candidates(
     source_patterns: list[str] | None = None,
     source_kind: str = "task",
     source_lane: str | None = None,
+    source_limit: int | None = DEFAULT_SOURCE_LIMIT,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     candidates: list[dict[str, Any]] = []
     source_matches: list[dict[str, Any]] = []
@@ -1770,9 +1797,18 @@ def _collect_harvest_candidates(
     candidates.extend(_harvest_review_candidates(store))
     candidates.extend(_harvest_resume_candidates(store))
     for pattern in source_patterns or []:
-        paths, summary = _resolve_harvest_source_paths(store, pattern)
+        paths, summary = _resolve_harvest_source_paths(store, pattern, source_limit=source_limit)
         before = len(candidates)
+        skipped_sources: list[dict[str, str]] = []
         for path in paths:
+            text = path.read_text(encoding="utf-8", errors="replace")
+            skip_reason = _harvest_source_skip_reason(path, text, manual_source=True)
+            if skip_reason is not None:
+                skipped_sources.append({
+                    "path": _rel_source(store.project_root, path),
+                    "reason": skip_reason,
+                })
+                continue
             candidates.extend(
                 _harvest_heading_blocks(
                     store,
@@ -1783,6 +1819,9 @@ def _collect_harvest_candidates(
                 )
             )
         summary["candidates"] = len(candidates) - before
+        if skipped_sources:
+            summary["skipped_source_count"] = len(skipped_sources)
+            summary["skipped_sources"] = skipped_sources
         source_matches.append(summary)
     deduped: list[dict[str, Any]] = []
     for candidate in candidates:
@@ -2088,6 +2127,14 @@ def _cmd_append(store: TaskStore, args: argparse.Namespace) -> int:
     item_ids = _split_csv([args.item_ids])
     if not item_ids:
         raise TaskError("append: expected at least one item id")
+    seen_ids: set[str] = set()
+    duplicate_ids: list[str] = []
+    for item_id in item_ids:
+        if item_id in seen_ids and item_id not in duplicate_ids:
+            duplicate_ids.append(item_id)
+        seen_ids.add(item_id)
+    if duplicate_ids:
+        raise TaskError(f"append: duplicate item id(s) in batch: {', '.join(duplicate_ids)}")
     note_text = str(args.note)
 
     def update(items: list[dict[str, Any]]) -> list[str]:
@@ -2226,6 +2273,7 @@ def _cmd_harvest(store: TaskStore, args: argparse.Namespace) -> int:
         source_patterns=args.sources,
         source_kind=args.kind,
         source_lane=args.lane if args.sources else None,
+        source_limit=getattr(args, "source_limit", DEFAULT_SOURCE_LIMIT),
     )
     if args.dry_run:
         payload = {
@@ -2242,7 +2290,7 @@ def _cmd_harvest(store: TaskStore, args: argparse.Namespace) -> int:
             print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
         else:
             lines = [str(item["title"]) for item in candidates]
-            lines.extend(f"0 matches for {summary['pattern']}" for summary in source_matches if summary["matches"] == 0)
+            lines.extend(_source_match_text_lines(source_matches))
             print("\n".join(lines))
         return 0
 
@@ -2257,7 +2305,7 @@ def _cmd_harvest(store: TaskStore, args: argparse.Namespace) -> int:
     if args.json:
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     else:
-        source_summary = "".join(f", 0 matches for {summary['pattern']}" for summary in source_matches if summary["matches"] == 0)
+        source_summary = _source_match_summary_suffix(source_matches)
         print(f"OK: harvest created {len(result['created'])} draft items ({result['skipped']} skipped, {len(result['history_added'])} history entries{source_summary})")
     return 0
 
@@ -2271,6 +2319,7 @@ def _run_harvest_json(store: TaskStore, args: argparse.Namespace, *, dry_run: bo
         lane=args.lane,
         no_history=getattr(args, "no_history", False),
         sources=LIST_TYPE(args.sources),
+        source_limit=getattr(args, "source_limit", DEFAULT_SOURCE_LIMIT),
     )
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
@@ -2294,6 +2343,36 @@ def _manual_harvest_drafts(payload: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
+def _source_match_text_lines(source_matches: list[dict[str, Any]]) -> list[str]:
+    lines: list[str] = []
+    for summary in source_matches:
+        pattern = str(summary.get("pattern") or "")
+        if int(summary.get("matches") or 0) == 0:
+            lines.append(f"0 matches for {pattern}")
+        skipped = LIST_TYPE(summary.get("skipped_sources") or [])
+        if skipped:
+            preview = ", ".join(
+                f"{item.get('path')} ({item.get('reason')})"
+                for item in skipped[:5]
+                if isinstance(item, dict)
+            )
+            more = f", +{len(skipped) - 5} more" if len(skipped) > 5 else ""
+            lines.append(f"skipped {len(skipped)} managed source(s) for {pattern}: {preview}{more}")
+        dropped = int(summary.get("dropped") or 0)
+        if dropped:
+            limit = int(summary.get("source_limit") or DEFAULT_SOURCE_LIMIT)
+            lines.append(
+                f"dropped {dropped} matched file(s) for {pattern} after --source-limit {limit}; "
+                "use --source-limit N to include more"
+            )
+    return lines
+
+
+def _source_match_summary_suffix(source_matches: list[dict[str, Any]]) -> str:
+    notes = _source_match_text_lines(source_matches)
+    return "" if not notes else "; " + "; ".join(notes)
+
+
 def _print_migrate_preview(payload: dict[str, Any]) -> None:
     drafts = _manual_harvest_drafts(payload)
     by_source: dict[str, list[str]] = {}
@@ -2315,6 +2394,10 @@ def _print_migrate_preview(payload: dict[str, Any]) -> None:
             print(f"- {pattern}: 0 matched file(s)")
         elif int(summary.get("candidates") or 0) == 0 and pattern not in seen_sources:
             print(f"- {pattern}: 0 candidate(s)")
+        for line in _source_match_text_lines([summary]):
+            if line.startswith("0 matches for "):
+                continue
+            print(f"- {line}")
 
 
 def _cmd_migrate(store: TaskStore, args: argparse.Namespace) -> int:
@@ -2381,6 +2464,7 @@ def _cmd_list(store: TaskStore, args: argparse.Namespace) -> int:
     lane = facet if facet in RESERVED_LANES else args.lane
     if facet in RESERVED_LANES and args.lane:
         raise TaskError("list reserved-lane positional cannot be combined with --lane")
+    _validate_lane_arg(args.lane)
     rows = store.query_items(
         {
             "status": status,
@@ -2900,6 +2984,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     harvest.add_argument("--kind", choices=["task", "bug", "decision"], default="task", help="Default kind for items from --source files.")
     harvest.add_argument("--lane", default="deferred", help="Lane stamped on items from --source files.")
+    harvest.add_argument("--source-limit", type=int, default=DEFAULT_SOURCE_LIMIT, help=f"Maximum files consumed per --source glob before reporting dropped matches (default: {DEFAULT_SOURCE_LIMIT}).")
     harvest.add_argument("--json", action="store_true")
     harvest.set_defaults(func=_cmd_harvest)
 
@@ -2924,6 +3009,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     migrate.add_argument("--kind", choices=["task", "bug", "decision"], default="task")
     migrate.add_argument("--lane", default="deferred")
+    migrate.add_argument("--source-limit", type=int, default=DEFAULT_SOURCE_LIMIT, help=f"Maximum files consumed per --source glob before reporting dropped matches (default: {DEFAULT_SOURCE_LIMIT}).")
     migrate.add_argument("--no-history", action="store_true", help="Pass through to harvest; skip RESUME-NOTES history backfill.")
     migrate.add_argument("--apply", action="store_true", help="Create draft items after the preview.")
     migrate.set_defaults(func=_cmd_migrate)

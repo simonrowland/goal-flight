@@ -3,7 +3,7 @@
 Private. Read before touching code.
 
 > **Goal Flight is installed in this project.** Check active state FIRST:
-> `python3 ${GOALFLIGHT_ROOT:-~/.goal-flight}/scripts/goalflight_session_status.py --text`
+> `python3 ${GOALFLIGHT_ROOT:-~/.goal-flight/skill}/scripts/goalflight_session_status.py --text`
 > — definitive verdict. If **active**, follow the load order in
 > "Goal Flight Routing" below. If **no active session**, do NOT auto-load
 > goal-flight's SKILL.md — only load when the user invokes `/goal-flight`.
@@ -58,9 +58,9 @@ Grep cheat: `^### ADR-` / `^### Q-` (decisions/questions), `^## (t|b)-\d+` (task
 
 ## Goal Flight Routing
 
-- skill-root: `${GOALFLIGHT_ROOT:-~/.goal-flight}`
+- skill-root: `${GOALFLIGHT_ROOT:-~/.goal-flight/skill}`
 - **activation check** (run before loading the skill):
-  `python3 ${GOALFLIGHT_ROOT:-~/.goal-flight}/scripts/goalflight_session_status.py --text`.
+  `python3 ${GOALFLIGHT_ROOT:-~/.goal-flight/skill}/scripts/goalflight_session_status.py --text`.
   Only proceed with the rest of the load order when the verdict is active.
 - load order: this `AGENTS.md` → installed host wrapper (codex/grok/cursor/
   opencode hold a copy; native Claude symlinks) → repository `SKILL.md` →

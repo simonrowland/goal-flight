@@ -2,7 +2,8 @@
 """Hermetic test for the tasks.jsonl <-> tasks-data.js mirror checker.
 
 Drives scripts/check_tasks_mirror.js (node-only; no network, no localhost):
-  - PASS on the tracked known-good fixture templates/state-skeleton/.
+  - PASS on the tracked empty scaffold templates/state-skeleton/.
+  - PASS on the non-empty fixture tests/fixtures/tasks-mirror/.
   - FAIL on planted-drift temp copies (changed field / added id / stray status).
 
 If node is unavailable, the whole file SKIPs (runner-recognized "SKIP:" prefix).
@@ -25,7 +26,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 CHECKER = ROOT / "scripts" / "check_tasks_mirror.js"
-FIXTURE = ROOT / "templates" / "state-skeleton"
+SKELETON = ROOT / "templates" / "state-skeleton"
+FIXTURE = ROOT / "tests" / "fixtures" / "tasks-mirror"
 TASK = ROOT / "goalflight_task.py"
 NODE = shutil.which("node")
 
@@ -124,7 +126,7 @@ def _load_goalflight_task_module():
 
 
 def test_default_fixture_passes() -> None:
-    # No dir arg -> checker defaults to templates/state-skeleton/.
+    # No dir arg -> checker defaults to the empty templates/state-skeleton/.
     proc = subprocess.run(
         [NODE, str(CHECKER)],
         cwd=str(ROOT),
@@ -136,6 +138,8 @@ def test_default_fixture_passes() -> None:
     )
     assert_true("default fixture exit 0", proc.returncode == 0)
     assert_true("default fixture OK line", "OK: tasks mirror in sync" in proc.stdout)
+    assert_true("default scaffold store is empty", (SKELETON / "tasks.jsonl").read_text(encoding="utf-8") == "")
+    assert_true("default scaffold mirror is empty", "window.GF_ITEMS = [];" in (SKELETON / "tasks-data.js").read_text(encoding="utf-8"))
 
 
 def test_explicit_fixture_passes() -> None:
@@ -1013,7 +1017,7 @@ def test_goalflight_task_harvest_ignores_skeleton_placeholders() -> None:
         project = Path(td)
         docs = project / "docs-private"
         _write_tasks(project, [])
-        shutil.copy(FIXTURE / "bug-patterns.md", docs / "bug-patterns.md")
+        shutil.copy(SKELETON / "bug-patterns.md", docs / "bug-patterns.md")
         (docs / "bug-backlog.md").write_text(
             "\n".join(
                 [

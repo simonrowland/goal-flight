@@ -2387,9 +2387,12 @@ def _goalflight_skill_root(agent_text: str) -> dict:
         if "<path-to-goal-flight-clone>" not in candidate:
             resolved = Path(candidate).expanduser()
             source = "AGENTS.md"
+    session_status = resolved / "scripts" / "goalflight_session_status.py"
     return {
         "path": str(resolved),
         "exists": resolved.exists(),
+        "session_status_path": str(session_status),
+        "session_status_exists": session_status.is_file(),
         "source": source,
         "raw": raw,
     }
@@ -2476,6 +2479,8 @@ def check_project_goalflight_readiness(repo: Path) -> dict:
         warnings.append("AGENTS.md does not pin newest docs-private/RESUME-NOTES-*.md")
     if not skill_root.get("exists"):
         warnings.append("skill-root not resolvable")
+    elif not skill_root.get("session_status_exists"):
+        warnings.append("skill-root missing scripts/goalflight_session_status.py")
     if not commands["test"]:
         warnings.append("project test command not recorded")
     warnings.extend(item["message"] for item in state_layout.get("warnings", []))

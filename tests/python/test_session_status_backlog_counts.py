@@ -248,7 +248,7 @@ def test_session_status_resume_directive_active_ready_only() -> None:
         assert_true("json carries ready top id", payload["ready_frontier"]["top_id"] == "t-001")
 
 
-def test_session_status_resume_directive_silent_when_inactive_or_no_ready() -> None:
+def test_session_status_resume_directive_prints_when_inactive_ready() -> None:
     with tempfile.TemporaryDirectory() as td:
         project = Path(td)
         write_tasks(
@@ -267,7 +267,10 @@ def test_session_status_resume_directive_silent_when_inactive_or_no_ready() -> N
         )
         proc = run_session_status(project, "--text")
         assert_true(f"inactive text exits 0: {proc.stderr}", proc.returncode == 0)
-        assert_true("inactive ready has no directive", "resume:" not in proc.stdout)
+        assert_true(
+            "inactive ready carries resume directive",
+            "resume: run python3 goalflight_task.py next -> continue the top task (t-001 Ready but inactive)" in proc.stdout,
+        )
 
     with tempfile.TemporaryDirectory() as td:
         project = Path(td)
@@ -299,7 +302,7 @@ def main() -> None:
     test_session_status_does_not_double_count_reserved_blocked_items()
     test_session_status_degrades_present_unreadable_store()
     test_session_status_resume_directive_active_ready_only()
-    test_session_status_resume_directive_silent_when_inactive_or_no_ready()
+    test_session_status_resume_directive_prints_when_inactive_ready()
     print("OK: 7 session-status backlog count tests pass")
 
 

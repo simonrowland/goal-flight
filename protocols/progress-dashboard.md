@@ -73,4 +73,4 @@ covers that, so it isn't worth a dependency.
     dir or machine. An absolute path with a foreign prefix stays plain text.
 
 Links resolve on `file://` with no server — a relative `../specs/…` href from
-`…/docs-private/tickets.html` opens `…/specs/…` directly in the browser.
+`…/dashboard/tickets.html` opens `…/specs/…` directly in the browser.

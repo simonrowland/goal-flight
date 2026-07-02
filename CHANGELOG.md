@@ -6,6 +6,19 @@ incremented when meaningful skill behaviour changes.
 
 ## [Unreleased]
 
+## [1.2.0] — 2026-07-02
+
+### Added
+
+- Task-store migration flow for importing existing markdown lists as draft items,
+  including guarded `--source` harvesting, source caps, managed-state skip
+  summaries, and draft curation through the task lifecycle verbs.
+- Loop-control verbs and readiness surfaces for continuing queued work from the
+  task store, including autonomous resume guidance when ready frontier items
+  exist.
+- Dashboard layout under `dashboard/`, backed by `docs-private/tasks.jsonl` and
+  a generated `dashboard/tasks-data.js` mirror.
+
 ### Changed
 
 - **Dispatch is detached/background by default.** Direct `goalflight_dispatch.py`
@@ -16,6 +29,24 @@ incremented when meaningful skill behaviour changes.
   return timing changes, so it hot-deploys onto existing controllers. A one-line
   stderr notice fires on the default path so un-migrated callers notice the new
   timing. `--foreground` is mutually exclusive with `--submit` (already async).
+- Project scaffolding now ships an empty task store by default and generates the
+  dashboard mirror from an existing `docs-private/tasks.jsonl` when one is
+  present.
+- Installed project instructions pin the runtime root to `~/.goal-flight/skill`;
+  init rewrites older generated pins and doctor verifies the resolved root
+  contains `scripts/goalflight_session_status.py`.
+- Quota and dispatch lifecycle reporting keeps ephemeral status derived from
+  runtime state rather than durable task fields.
+
+### Fixed
+
+- Fresh scaffolds no longer seed example task ids that can contaminate `next` or
+  resume output.
+- `session_status --text` prints the resume directive whenever the ready frontier
+  is non-empty, even if no queue file is active.
+- `append` rejects duplicate ids in a batch before mutating items, and `list
+  --lane` now reports reserved-lane near misses instead of silently returning an
+  empty result.
 
 ## [1.0.11] — 2026-06-24
 

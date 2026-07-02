@@ -111,12 +111,24 @@ def test_append_unknown_id_is_atomic() -> None:
         assert_true("unknown append did not mutate existing item", "notes" not in item)
 
 
+def test_append_duplicate_ids_rejected_before_mutation() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        project = Path(td)
+        item_id = run_task(project, "new", "Only task", "--by", "tester").stdout.strip()
+        proc = run_task(project, "append", f"{item_id},{item_id}", "should not land", "--by", "tester")
+        assert_true("duplicate append exits nonzero", proc.returncode != 0)
+        assert_true("duplicate append names duplicate id", f"duplicate item id(s) in batch: {item_id}" in proc.stderr)
+        item = read_items(project)[0]
+        assert_true("duplicate append did not mutate item", "notes" not in item)
+
+
 def main() -> None:
     if not NODE:
         print("SKIP: test_append_verb.py: node not found on PATH")
         return
     test_append_single_and_batch()
     test_append_unknown_id_is_atomic()
+    test_append_duplicate_ids_rejected_before_mutation()
     print("OK: append verb tests pass")
 
 

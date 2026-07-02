@@ -182,6 +182,17 @@ def test_lane_rejects_reserved_near_miss_but_allows_distinct_free_text() -> None
         assert_true("capture near-miss hint names held", "did you mean 'held'?" in proc.stderr)
 
 
+def test_list_lane_rejects_reserved_near_miss() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        project = Path(td)
+        proc = run_task(project, "new", "Visible task", "--by", "tester")
+        assert_true(f"new exits 0: {proc.stderr}", proc.returncode == 0)
+
+        proc = run_task(project, "list", "--lane", "hield")
+        assert_true("list --lane near-miss exits nonzero", proc.returncode != 0)
+        assert_true("list --lane near-miss hint names held", "did you mean 'held'?" in proc.stderr)
+
+
 def main() -> None:
     if not NODE:
         print("SKIP: test_lane_field.py: node not found on PATH")
@@ -189,6 +200,7 @@ def main() -> None:
     test_lane_validates_as_string()
     test_lane_cli_and_reserved_backlog_view()
     test_lane_rejects_reserved_near_miss_but_allows_distinct_free_text()
+    test_list_lane_rejects_reserved_near_miss()
     print("OK: lane field tests pass")
 
 

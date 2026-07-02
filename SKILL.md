@@ -1,7 +1,7 @@
 ---
 name: goal-flight
-version: 1.0.0
-description: "Portable Goal Flight orchestrator workflow for planning, dispatching, reviewing, recovering, and resuming long-running repository work from file-backed state."
+version: 1.2.0
+description: "Portable Goal Flight workflow for long-running repo work: planning, dispatch, review, recovery, file-backed resume."
 tags:
   - orchestration
   - orchestrator
@@ -160,6 +160,7 @@ drift against an in-flight queue.
 | `/goal-flight ask-questions [<scope>]` | `commands/ask-questions.md` | `dispatch-routing` |
 | `/goal-flight execute [--parallel <N>]` | `commands/execute.md` | `dispatch-routing`, `worker-markers`, `state-handoff`, `user-status-cadence`, `chunk-review`, `milestone-review`; add `worktrees-parallel` for `--parallel` |
 | `/goal-flight doctor` | `commands/doctor.md` | `tool-readiness` |
+| `/goal-flight migrate [<flags>]` | `commands/migrate.md` | `project-state-layout`, `task-lifecycle` |
 | `/goal-flight build-corpus [<flags>]` | `commands/build-corpus.md` | corpus docs referenced there |
 | `/goal-flight resume` | `commands/resume.md` | `state-handoff` |
 | `/goal-flight goal <SLUG>` | `commands/goal.md` | none |

@@ -1,0 +1,2 @@
+{"id":"t-001","kind":"task","title":"Fixture open task - replace with real project work.","blocked_by":[],"links":[],"done":false,"acceptance":"used by mirror drift tests."}
+{"id":"t-002","kind":"task","title":"Fixture done task - mirrors a completed chunk.","blocked_by":["t-001"],"links":["NORTH-STAR.md"],"done":true,"done_reviewed":true,"acceptance":"shown in the Done section of fixture views."}

@@ -27,6 +27,14 @@ def assert_true(name: str, condition: bool) -> None:
         raise AssertionError(name)
 
 
+def _dashboard_items(repo: Path) -> list[dict]:
+    text = repo.joinpath("dashboard/tasks-data.js").read_text(encoding="utf-8")
+    prefix = "window.GF_ITEMS = "
+    start = text.index(prefix) + len(prefix)
+    end = text.index(";\nif (typeof module", start)
+    return json.loads(text[start:end])
+
+
 def _write_ready_agents(repo: Path) -> None:
     repo.joinpath("AGENTS.md").write_text(
         "## Living state -- read the newest docs-private/RESUME-NOTES-*.md first\n"
@@ -103,6 +111,54 @@ def test_scaffold_project_state_is_idempotent_and_respects_existing_files() -> N
         assert_true("second run creates no files", second["created_files"] == [])
         assert_true("second run creates no dirs", second["created_dirs"] == [])
         assert_true("second run no backup", second["backup"] is None)
+
+
+def test_scaffold_project_state_empty_store_has_no_ready_frontier() -> None:
+    with tempfile.TemporaryDirectory(prefix="gf-state-layout-empty-store-") as td:
+        repo = Path(td)
+        result = goalflight_setup.scaffold_project_state(ROOT, repo, apply=True, today="2026-06-27")
+
+        assert_true("tasks store scaffolded empty", repo.joinpath("docs-private/tasks.jsonl").read_text(encoding="utf-8") == "")
+        assert_true("dashboard mirror scaffolded empty", _dashboard_items(repo) == [])
+        assert_true("empty store created", "docs-private/tasks.jsonl" in result["created_files"])
+        proc = subprocess.run(
+            [sys.executable, str(ROOT / "goalflight_task.py"), "--project-root", str(repo), "next", "--json"],
+            cwd=str(ROOT),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30,
+            check=False,
+        )
+        assert_true(f"next exits 0: {proc.stderr}", proc.returncode == 0)
+        assert_true("fresh scaffold has no ready frontier", json.loads(proc.stdout) == [])
+
+
+def test_scaffold_project_state_generates_dashboard_mirror_from_legacy_store() -> None:
+    with tempfile.TemporaryDirectory(prefix="gf-state-layout-legacy-store-") as td:
+        repo = Path(td)
+        docs_private = repo / "docs-private"
+        docs_private.mkdir()
+        docs_private.joinpath("tasks.jsonl").write_text(
+            json.dumps({
+                "schema_version": 1,
+                "id": "t-009",
+                "kind": "task",
+                "title": "Legacy imported task",
+                "blocked_by": [],
+                "links": [],
+                "done": False,
+            }, separators=(",", ":"))
+            + "\n",
+            encoding="utf-8",
+        )
+
+        goalflight_setup.scaffold_project_state(ROOT, repo, apply=True, today="2026-06-27")
+        items = _dashboard_items(repo)
+        assert_true("legacy mirror has one item", len(items) == 1)
+        assert_true("legacy mirror keeps id", items[0]["id"] == "t-009")
+        assert_true("legacy mirror derives status", items[0]["derived_status"] == "pending")
+        assert_true("legacy mirror not skeleton stub", "t-001" not in repo.joinpath("dashboard/tasks-data.js").read_text(encoding="utf-8"))
 
 
 def test_scaffold_project_state_dry_run_makes_no_changes() -> None:
@@ -541,6 +597,49 @@ def test_project_readiness_requires_agents_resume_pin() -> None:
         assert_true("ready project state layout ok", ready["state_layout"]["ok"] is True)
 
 
+def test_scaffold_project_state_rewrites_legacy_goalflight_root_pin() -> None:
+    with tempfile.TemporaryDirectory(prefix="gf-state-layout-root-pin-") as td:
+        repo = Path(td)
+        repo.joinpath("AGENTS.md").write_text(
+            "## Living state -- read the newest docs-private/RESUME-NOTES-*.md first\n"
+            "## Goal Flight Routing\n"
+            "- skill-root: `${GOALFLIGHT_ROOT:-~/.goal-flight}`\n"
+            "- activation check: `python3 ${GOALFLIGHT_ROOT:-~/.goal-flight}/scripts/goalflight_session_status.py --text`\n"
+            "- load order: AGENTS.md -> SKILL.md -> commands/*.md\n"
+            "## Commands\n"
+            "- test: `pytest`\n",
+            encoding="utf-8",
+        )
+
+        result = goalflight_setup.scaffold_project_state(ROOT, repo, apply=True, today="2026-06-27")
+        text = repo.joinpath("AGENTS.md").read_text(encoding="utf-8")
+        assert_true("init updates legacy skill root pin", "${GOALFLIGHT_ROOT:-~/.goal-flight/skill}" in text)
+        assert_true("init rewrites activation check pin", "${GOALFLIGHT_ROOT:-~/.goal-flight}/scripts" not in text)
+        assert_true("rewrite message reported", "rewrote goal-flight skill-root pin" in result["agents"]["message"])
+
+
+def test_project_readiness_requires_session_status_under_skill_root() -> None:
+    with tempfile.TemporaryDirectory(prefix="gf-state-layout-root-script-") as td:
+        repo = Path(td)
+        goalflight_setup.scaffold_project_state(ROOT, repo, apply=True, today="2026-06-27")
+        repo.joinpath("docs-private/env-caveats.md").write_text("ok\n", encoding="utf-8")
+        repo.joinpath("SKILL.md").write_text("# Project\n", encoding="utf-8")
+        fake_root = repo / "fake-skill"
+        fake_root.mkdir()
+        repo.joinpath("AGENTS.md").write_text(
+            "## Living state -- read the newest docs-private/RESUME-NOTES-*.md first\n"
+            "## Goal Flight Routing\n"
+            f"- skill-root: `{fake_root}`\n"
+            "- load order: AGENTS.md -> SKILL.md -> commands/*.md\n"
+            "## Commands\n"
+            "- test: `pytest`\n",
+            encoding="utf-8",
+        )
+
+        payload = goalflight_doctor.check_project_goalflight_readiness(repo)
+        assert_true("missing session status script warned", "skill-root missing scripts/goalflight_session_status.py" in payload["warnings"])
+
+
 def test_project_readiness_treats_initialized_state_layout_absence_as_warning() -> None:
     with tempfile.TemporaryDirectory(prefix="gf-state-layout-no-backlog-") as td:
         repo = Path(td)
@@ -577,6 +676,8 @@ def test_state_protocols_are_discoverable_from_index_and_commands() -> None:
 def main() -> None:
     tests = [
         test_scaffold_project_state_is_idempotent_and_respects_existing_files,
+        test_scaffold_project_state_empty_store_has_no_ready_frontier,
+        test_scaffold_project_state_generates_dashboard_mirror_from_legacy_store,
         test_scaffold_project_state_dry_run_makes_no_changes,
         test_scaffold_project_state_creates_backup_before_apply,
         test_scaffold_project_state_preserves_unmanaged_handoff_mentions,
@@ -596,6 +697,8 @@ def main() -> None:
         test_doctor_state_layout_reports_managed_view_schema_skew,
         test_doctor_state_layout_reports_customized_view_as_advisory,
         test_project_readiness_requires_agents_resume_pin,
+        test_scaffold_project_state_rewrites_legacy_goalflight_root_pin,
+        test_project_readiness_requires_session_status_under_skill_root,
         test_project_readiness_treats_initialized_state_layout_absence_as_warning,
         test_state_protocols_are_discoverable_from_index_and_commands,
     ]
