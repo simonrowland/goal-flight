@@ -58,14 +58,46 @@ cleanup_pidfile() {
   local stem="$1"
   rm -f "$PIDFILE_DIR/$stem"
 }
+wait_for_file() {
+  local path="$1" attempts="${2:-50}" i
+  i=0
+  while [ "$i" -lt "$attempts" ]; do
+    [ -f "$path" ] && return 0
+    sleep 0.1
+    i=$((i + 1))
+  done
+  [ -f "$path" ]
+}
+start_isolated_sleep() {
+  local duration="$1"
+  python3 - "$duration" <<'PY'
+import subprocess
+import sys
+
+duration = sys.argv[1]
+proc = subprocess.Popen(
+    ["sleep", duration],
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+    start_new_session=True,
+)
+print(proc.pid)
+PY
+}
 run_dead_tail_case() {
   local label="$1"
   local tail="$2"
   local prompt="$3"
   local out="$4"
   local expected="$5"
+  local worker_sleep="5"
 
-  sleep 1 & WORKER_PID=$!
+  # Negative dead-tail cases need enough startup margin for the watcher to
+  # register the worker before it exits; otherwise they fail before emitting the
+  # WATCHER-EXIT summary the case is checking.
+  [ "$expected" = "1" ] && worker_sleep="2.5"
+  sleep "$worker_sleep" & WORKER_PID=$!
   PIDFILE_STEM="$$.bashtail.${WORKER_PID}.jsonl"
   bash "$WATCHER" \
     --pid "$WORKER_PID" --tail "$tail" \
@@ -75,6 +107,7 @@ run_dead_tail_case() {
     --poll-secs 1 --max-idle-secs 30 \
     > "$out" 2>&1
   watcher_exit=$?
+  kill "$WORKER_PID" 2>/dev/null
   wait "$WORKER_PID" 2>/dev/null
   expect_eq "$label exit code" "$expected" "$watcher_exit"
   cleanup_pidfile "$PIDFILE_STEM"
@@ -89,15 +122,14 @@ run_pid_dead_grace_marker_case() {
   local expected="$6"
 
   : > "$tail"
-  sleep 0.6 & WORKER_PID=$!
-  PIDFILE_STEM="$$.bashtail.${WORKER_PID}.jsonl"
   (
-    sleep 1.2
+    sleep 2.5
     {
       echo "grok worker completed review"
       echo "$marker"
     } >> "$tail"
-  ) & APPENDER_PID=$!
+  ) & WORKER_PID=$!
+  PIDFILE_STEM="$$.bashtail.${WORKER_PID}.jsonl"
   bash "$WATCHER" \
     --pid "$WORKER_PID" --tail "$tail" \
     --controller-pid "$$" --agent test-bashtail \
@@ -107,14 +139,15 @@ run_pid_dead_grace_marker_case() {
     > "$out" 2>&1
   watcher_exit=$?
   wait "$WORKER_PID" 2>/dev/null
-  wait "$APPENDER_PID" 2>/dev/null
   expect_eq "$label exit code" "$expected" "$watcher_exit"
   cleanup_pidfile "$PIDFILE_STEM"
 }
 
-# Spawn workers directly in the test shell (NOT in a subshell via `$(spawn_fn)`
-# — that kills the child when the subshell exits). Plain background, capture
-# $! from the same shell scope.
+# Spawn most workers directly in the test shell (NOT in a subshell via
+# `$(spawn_fn)` — that kills ordinary background children when the subshell
+# exits). `start_isolated_sleep` is the exception: Python starts a new session
+# and prints the orphaned sleep PID so same-PGID test harness CPU cannot mask a
+# quiet fake worker as running_quiet.
 
 # ---- Case 1: terminal marker → exit 0 ----
 TAIL=/tmp/test-watch-marker-$$.txt
@@ -131,10 +164,9 @@ bash "$WATCHER" \
   --poll-secs 1 --max-idle-secs 30 \
   > /tmp/watcher-out-marker-$$.txt 2>&1 &
 WATCHER_PID=$!
-sleep 1
 
 # Verify pidfile exists
-if [ -f "$PIDFILE_DIR/$PIDFILE_STEM" ]; then
+if wait_for_file "$PIDFILE_DIR/$PIDFILE_STEM" 50; then
   expect_eq "case-1 pidfile written at startup" "yes" "yes"
 else
   expect_eq "case-1 pidfile written at startup" "yes" "no"
@@ -602,8 +634,12 @@ cleanup_pidfile "$PIDFILE_STEM"
 # ---- Case 3: idle timeout → exit 2 ----
 TAIL=/tmp/test-watch-idle-$$.txt
 : > "$TAIL"
-sleep 30 & WORKER_PID=$!
+WORKER_PID="$(start_isolated_sleep 8)"
 PIDFILE_STEM="$$.bashtail.${WORKER_PID}.jsonl"
+
+# Regression guard: a CPU-busy sibling in the test harness PGID must not mask
+# the quiet fake worker as running_quiet. The worker owns a separate session.
+(while :; do :; done) & CASE3_BURNER_PID=$!
 
 # Aggressive: max-idle-secs=2 so test runs in seconds. Real defaults are 180s.
 bash "$WATCHER" \
@@ -628,6 +664,8 @@ if [ -f "$PIDFILE_DIR/$PIDFILE_STEM" ]; then
 else
   expect_eq "case-3 pidfile preserved (worker still alive after idle timeout)" "preserved" "removed"
 fi
+kill "$CASE3_BURNER_PID" 2>/dev/null
+wait "$CASE3_BURNER_PID" 2>/dev/null
 kill "$WORKER_PID" 2>/dev/null
 wait "$WORKER_PID" 2>/dev/null
 rm -f "$TAIL" /tmp/watcher-out-idle-$$.txt
@@ -651,7 +689,7 @@ bash "$WATCHER" \
   --poll-secs 1 --max-idle-secs 1 \
   > /tmp/watcher-out-running-quiet-$$.txt 2>&1 &
 WATCHER_PID=$!
-sleep 3
+sleep 5
 running_quiet_watcher_alive=no
 if kill -0 "$WATCHER_PID" 2>/dev/null; then
   running_quiet_watcher_alive=yes
