@@ -32,6 +32,10 @@
     }
   }
 
+  function hasOwn(obj, key) {
+    return Object.prototype.hasOwnProperty.call(obj, key);
+  }
+
   var CONTROL_CHARS_RE = /[\x00-\x1F\x7F]/;
   var SCHEME_RE = /^[a-zA-Z][a-zA-Z0-9+.-]*:/;
 
@@ -100,6 +104,7 @@
     if (s === "worker-finished") return "awaiting-review";
     if (s === "blocked") return "waiting";
     if (s === "outstanding") return "pending";
+    if (s === "delegated") return "working";
     if (s === "decision" || s === "pending" || s === "working" ||
       s === "awaiting-review" || s === "worker-failed" || s === "waiting" ||
       s === "done-reviewed") return s;
@@ -148,6 +153,19 @@
     };
   }
 
+  function blockerResolved(bid, byId) {
+    var b = byId && byId[bid];
+    return !!(b && b.done);
+  }
+
+  function unresolvedBlockerIds(it, byId) {
+    var out = [];
+    (it.blocked_by || []).forEach(function (bid) {
+      if (!blockerResolved(bid, byId)) out.push(bid);
+    });
+    return out;
+  }
+
   // Section key for an item. Honours explicit lifecycle flags; otherwise derives
   // from status, blockers, and kind. Unknown blockers count as unresolved.
   function sectionKey(it, byId) {
@@ -159,12 +177,7 @@
     if (it.kind === "decision") return "decision";
     if (it.worker_done || s === "worker-finished" || s === "awaiting-review") return "awaiting-review";
     if (s === "working" || s === "worker-failed") return s;
-    // resolve blockers against the item map
-    var unresolved = (it.blocked_by || []).some(function (bid) {
-      var b = byId[bid];
-      return !b || !b.done; // missing or not-done blocker => still blocked
-    });
-    if (unresolved && (it.blocked_by || []).length) return "waiting";
+    if (unresolvedBlockerIds(it, byId).length) return "waiting";
     if (s === "waiting") return "waiting";
     if (s === "done" || s === "done-reviewed") return "done-reviewed";
     if (s === "pending" || !s) return "pending";
@@ -318,7 +331,11 @@
   };
 
   function deriveItems(rawItems) {
-    var items = (rawItems || []).map(normalize);
+    var items = (rawItems || []).map(function (raw, idx) {
+      var it = normalize(raw);
+      it._pos = idx;
+      return it;
+    });
     var byId = {};
     items.forEach(function (it) {
       byId[it.id] = it;
@@ -370,6 +387,9 @@
 
   function sortItems(items, sort) {
     var arr = items.slice();
+    if (sort === "frontier") {
+      return arr;
+    }
     if (sort === "severity") {
       arr.sort(function (a, b) {
         return (SEV_RANK[b.severity] || 0) - (SEV_RANK[a.severity] || 0) || idNum(a.id) - idNum(b.id);
@@ -395,6 +415,10 @@
     return arr;
   }
 
+  function normalizedSort(sort) {
+    return sort === "id" || sort === "status" || sort === "severity" ? sort : "frontier";
+  }
+
   /* --------------------------------------------------------------- render */
 
   function kindBadge(kind) {
@@ -413,8 +437,7 @@
   function blockerBits(it) {
     if (!it.blocked_by || !it.blocked_by.length) return "";
     var parts = it.blocked_by.map(function (bid) {
-      var b = store.byId[bid];
-      var resolved = b && b.done;
+      var resolved = blockerResolved(bid, store.byId);
       var cls = "blocker" + (resolved ? " blocker-ok" : "");
       var glyph = resolved ? "✓" : "⏸";
       var label = esc(bid) + ", blocker " + (resolved ? "resolved" : "still blocking");
@@ -481,44 +504,244 @@
     return '<span class="sev sev-' + esc(it.severity) + '">' + esc(it.severity) + "</span>";
   }
 
+  function cyclicBit(enabled) {
+    if (!enabled) return "";
+    return '<span class="badge cyclic" title="dependency cycle">⟳ cyclic</span>';
+  }
+
+  function blockedMissingBit(ids) {
+    if (!ids || !ids.length) return "";
+    var label = ids.length === 1 ? "⚠ blocked by missing " + ids[0] : "⚠ blocked by missing " + ids.length;
+    return '<span class="blocker blocked-missing" title="' +
+      esc("blocked by missing: " + ids.join(", ")) + '">' + esc(label) + "</span>";
+  }
+
   // One list row. Title autolinks ids; id is itself a ticket link.
-  function rowHTML(it) {
+  function rowHTML(it, opts) {
+    opts = opts || {};
     return (
       '<li class="row row-' + esc(it._section) + '" data-id="' + esc(it.id) + '">' +
       '<a class="id" href="' + ticketHref(it.id) + '">' + esc(it.id) + "</a>" +
       '<span class="body">' +
       '<span class="title">' + autolink(it.title) + "</span>" +
-      '<span class="tags">' + kindBadge(it.kind) + laneBadge(it) + sevBit(it) + blockerBits(it) + "</span>" +
+      '<span class="tags">' + kindBadge(it.kind) + statusBadge(it._section) + laneBadge(it) + sevBit(it) +
+        blockerBits(it) + blockedMissingBit(opts.blockedMissing) + cyclicBit(opts.cyclic) + "</span>" +
       "</span>" +
       "</li>"
     );
   }
 
+  function dependencyLayers(openItems, byId) {
+    var ids = [];
+    var idSet = Object.create(null);
+    var pos = Object.create(null);
+    openItems.forEach(function (it, idx) {
+      ids.push(it.id);
+      idSet[it.id] = true;
+      pos[it.id] = typeof it._pos === "number" ? it._pos : idx;
+    });
+
+    var deps = Object.create(null);
+    var external = Object.create(null);
+    var remaining = Object.create(null);
+    ids.forEach(function (id) {
+      remaining[id] = true;
+    });
+    openItems.forEach(function (it) {
+      deps[it.id] = [];
+      external[it.id] = [];
+      unresolvedBlockerIds(it, byId).forEach(function (bid) {
+        if (idSet[bid]) deps[it.id].push(bid);
+        else external[it.id].push(bid);
+      });
+    });
+
+    var levels = Object.create(null);
+    var cyclic = Object.create(null);
+    var blockedMissing = Object.create(null);
+    var peeled = Object.create(null);
+    var level = 0;
+
+    function mergeMissing(id, missingIds) {
+      if (!missingIds || !missingIds.length) return false;
+      if (!blockedMissing[id]) blockedMissing[id] = [];
+      var changed = false;
+      missingIds.forEach(function (missingId) {
+        if (blockedMissing[id].indexOf(missingId) < 0) {
+          blockedMissing[id].push(missingId);
+          changed = true;
+        }
+      });
+      return changed;
+    }
+
+    ids.forEach(function (id) {
+      mergeMissing(id, external[id]);
+    });
+
+    while (true) {
+      var ready = ids.filter(function (id) {
+        return remaining[id] && !external[id].length && deps[id].every(function (bid) {
+          return peeled[bid];
+        });
+      });
+      if (!ready.length) break;
+      ready.sort(function (a, b) {
+        return pos[a] - pos[b];
+      });
+      ready.forEach(function (id) {
+        levels[id] = level;
+        peeled[id] = true;
+        delete remaining[id];
+      });
+      level += 1;
+    }
+
+    var changed = true;
+    while (changed) {
+      changed = false;
+      ids.forEach(function (id) {
+        if (!remaining[id]) return;
+        deps[id].forEach(function (bid) {
+          if (blockedMissing[bid]) changed = mergeMissing(id, blockedMissing[bid]) || changed;
+        });
+      });
+    }
+
+    var visiting = Object.create(null);
+    var visited = Object.create(null);
+    var stack = [];
+
+    function markCycle(start) {
+      for (var i = start; i < stack.length; i += 1) cyclic[stack[i]] = true;
+    }
+
+    function visit(id) {
+      if (visited[id] || blockedMissing[id]) return;
+      visiting[id] = stack.length;
+      stack.push(id);
+      deps[id].forEach(function (bid) {
+        if (!remaining[bid] || blockedMissing[bid]) return;
+        if (hasOwn(visiting, bid)) {
+          markCycle(visiting[bid]);
+        } else {
+          visit(bid);
+        }
+      });
+      stack.pop();
+      delete visiting[id];
+      visited[id] = true;
+    }
+
+    ids.forEach(function (id) {
+      if (remaining[id]) visit(id);
+    });
+
+    return { levels: levels, cyclic: cyclic, blockedMissing: blockedMissing };
+  }
+
+  function laneName(it) {
+    return it.lane ? String(it.lane) : "";
+  }
+
+  function laneKind(name) {
+    if (!name) return "default";
+    return RESERVED_LANES[name] ? "parked" : "active";
+  }
+
+  function laneGroups(rows) {
+    var byName = Object.create(null);
+    var groups = [];
+    rows.forEach(function (it) {
+      var name = laneName(it);
+      var group = byName[name];
+      if (!group) {
+        group = { name: name, kind: laneKind(name), firstPos: it._pos || 0, rows: [] };
+        byName[name] = group;
+        groups.push(group);
+      }
+      group.rows.push(it);
+      if (typeof it._pos === "number" && it._pos < group.firstPos) group.firstPos = it._pos;
+    });
+
+    function byFirstPos(a, b) {
+      return a.firstPos - b.firstPos;
+    }
+
+    return groups.filter(function (g) { return g.kind === "default"; }).sort(byFirstPos)
+      .concat(groups.filter(function (g) { return g.kind === "active"; }).sort(byFirstPos))
+      .concat(groups.filter(function (g) { return g.kind === "parked"; }).sort(byFirstPos));
+  }
+
+  function orderedLaneRows(rows, layerInfo) {
+    return rows.slice().sort(function (a, b) {
+      var ac = !!layerInfo.cyclic[a.id];
+      var bc = !!layerInfo.cyclic[b.id];
+      if (ac !== bc) return ac ? 1 : -1;
+      var al = hasOwn(layerInfo.levels, a.id) ? layerInfo.levels[a.id] : 0;
+      var bl = hasOwn(layerInfo.levels, b.id) ? layerInfo.levels[b.id] : 0;
+      return (al - bl) || ((a._pos || 0) - (b._pos || 0));
+    });
+  }
+
+  function renderLaneGroup(group, layerInfo, sort) {
+    var parked = group.kind === "parked";
+    var label = group.name ? esc(group.name) : "No lane";
+    var rows = sort === "frontier" ? orderedLaneRows(group.rows, layerInfo) : group.rows.slice();
+    return '<section class="lane-group lane-group-' + group.kind + (parked ? " lane-group-parked" : "") + '">' +
+      '<h3><span class="lane-name">' + label + '</span> ' +
+      '<span class="count" data-lane-count="' + group.rows.length + '">' + group.rows.length +
+      ' open</span>' + (parked ? ' <span class="parked-label">parked</span>' : "") + "</h3>" +
+      '<ul class="rows">' +
+      rows.map(function (it) {
+        return rowHTML(it, {
+          blockedMissing: layerInfo.blockedMissing[it.id],
+          cyclic: !!layerInfo.cyclic[it.id]
+        });
+      }).join("") +
+      "</ul></section>";
+  }
+
+  function renderOpenLaneGroups(rows, layerInfo, sort) {
+    if (!rows.length) return "";
+    return '<section class="sec sec-open-lanes" aria-label="Open tickets">' +
+      '<h2>Open tickets <span class="count" data-open-count="' + rows.length + '">' + rows.length +
+      ' <span class="visually-hidden">items</span></span></h2>' +
+      laneGroups(rows).map(function (group) {
+        return renderLaneGroup(group, layerInfo, sort);
+      }).join("") +
+      "</section>";
+  }
+
   // Render the full sectioned board into `mount`, honouring controls.
   // Returns total visible count.
   function renderBoard(mount, ctrl) {
-    var filtered = applyControls(store.items, ctrl || {});
-    var sorted = sortItems(filtered, (ctrl && ctrl.sort) || "id");
-
-    // group by section
-    var groups = {};
-    SECTIONS.forEach(function (s) {
-      groups[s.key] = [];
+    ctrl = ctrl || {};
+    var sort = normalizedSort(ctrl.sort);
+    var filtered = applyControls(store.items, ctrl);
+    var sorted = sort === "frontier" ? filtered.slice() : sortItems(filtered, sort);
+    var openAll = store.items.filter(function (it) {
+      return it._section !== "done-reviewed";
     });
-    sorted.forEach(function (it) {
-      (groups[it._section] || (groups[it._section] = [])).push(it);
+    var layerInfo = dependencyLayers(openAll, store.byId);
+    var openRows = sorted.filter(function (it) {
+      return it._section !== "done-reviewed";
+    });
+    var doneRows = sorted.filter(function (it) {
+      return it._section === "done-reviewed";
     });
 
     var html = "";
+    html += renderOpenLaneGroups(openRows, layerInfo, sort);
     SECTIONS.forEach(function (sec) {
-      var rows = groups[sec.key] || [];
-      if (!rows.length) return;
-      // Done newest-first (LIFO). Others keep the chosen sort.
-      var ordered = sec.key === "done-reviewed" ? rows.slice().reverse() : rows;
+      if (sec.key !== "done-reviewed") return;
+      if (!doneRows.length) return;
+      // Done newest-first (LIFO), preserving the previous done section behaviour.
+      var ordered = sort === "frontier" ? doneRows.slice().reverse() : doneRows;
       html +=
         '<section class="sec ' + sec.cls + '" aria-label="' + esc(sec.label) + '">' +
-        '<h2>' + esc(sec.label) + ' <span class="count">' + rows.length + ' <span class="visually-hidden">items</span></span></h2>' +
-        '<ul class="rows' + (sec.key === "done-reviewed" ? " done-list" : "") + '">' +
+        '<h2>' + esc(sec.label) + ' <span class="count">' + doneRows.length + ' <span class="visually-hidden">items</span></span></h2>' +
+        '<ul class="rows done-list">' +
         ordered.map(rowHTML).join("") +
         "</ul></section>";
     });
@@ -675,13 +898,17 @@
     var derived = deriveItems(raw);
     var done = 0;
     var open = 0;
+    var inFlight = 0;
     var events = [];
     var timestamped = 0;
 
     derived.items.forEach(function (it) {
       var isDone = it._section === "done-reviewed";
       if (isDone) done += 1;
-      else open += 1;
+      else {
+        open += 1;
+        if (it._section === "working") inFlight += 1;
+      }
 
       var created = itemCreatedTime(it);
       if (created == null) return;
@@ -729,7 +956,9 @@
       total: derived.items.length,
       points: points,
       burnRate: burnRate,
-      timestamped: timestamped
+      timestamped: timestamped,
+      inFlight: inFlight,
+      projection: inFlight > 0 ? { open: Math.max(0, open - inFlight), inFlight: inFlight } : null
     };
   }
 
@@ -740,7 +969,7 @@
       " items (" + missing + " lack timestamps)</p>";
   }
 
-  function renderBurndownSvg(points) {
+  function renderBurndownSvg(points, projection) {
     if (!points || points.length < 2) {
       return '<p class="empty">Trend unavailable until items include created/done timestamps.</p>';
     }
@@ -749,10 +978,14 @@
     var pad = 34;
     var minT = points[0].t;
     var maxT = points[points.length - 1].t;
-    var maxOpen = Math.max.apply(null, points.map(function (p) { return p.open; }).concat([1]));
+    var maxOpen = Math.max.apply(null, points.map(function (p) { return p.open; }).concat([
+      projection ? projection.open : 1,
+      1
+    ]));
     var span = Math.max(maxT - minT, 1);
+    var plotRight = projection ? w - pad - 96 : w - pad;
     function x(t) {
-      return pad + ((t - minT) / span) * (w - pad * 2);
+      return pad + ((t - minT) / span) * (plotRight - pad);
     }
     function y(open) {
       return h - pad - (open / maxOpen) * (h - pad * 2);
@@ -767,16 +1000,31 @@
         d += " H " + px + " V " + py;
       }
     });
-    return '<svg class="burndown-svg" viewBox="0 0 ' + w + " " + h + '" role="img" aria-label="Open item count trend">' +
+    var projectionHtml = "";
+    if (projection) {
+      var last = points[points.length - 1];
+      var px = w - pad;
+      var py = y(projection.open);
+      var ly = Math.max(pad + 12, py - 10);
+      projectionHtml =
+        '<path class="projection" d="M ' + x(last.t).toFixed(1) + " " + y(last.open).toFixed(1) +
+        " H " + px.toFixed(1) + " V " + py.toFixed(1) + '"></path>' +
+        '<circle class="projection-point" cx="' + px.toFixed(1) + '" cy="' + py.toFixed(1) + '" r="5"></circle>' +
+        '<text class="projection-label" x="' + px.toFixed(1) + '" y="' + ly.toFixed(1) +
+        '">if in-flight completes: ' + esc(projection.open) + "</text>";
+    }
+    return '<svg class="burndown-svg" viewBox="0 0 ' + w + " " + h + '" role="img" aria-label="Open item count trend' +
+      (projection ? " with projected in-flight completion point" : "") + '">' +
       '<line class="axis" x1="' + pad + '" y1="' + (h - pad) + '" x2="' + (w - pad) + '" y2="' + (h - pad) + '"></line>' +
       '<line class="axis" x1="' + pad + '" y1="' + pad + '" x2="' + pad + '" y2="' + (h - pad) + '"></line>' +
       '<text class="tick" x="' + pad + '" y="' + (h - 10) + '">' + esc(fmtDate(minT)) + "</text>" +
-      '<text class="tick end" x="' + (w - pad) + '" y="' + (h - 10) + '">' + esc(fmtDate(maxT)) + "</text>" +
+      '<text class="tick end" x="' + plotRight.toFixed(1) + '" y="' + (h - 10) + '">' + esc(fmtDate(maxT)) + "</text>" +
       '<text class="tick" x="6" y="' + y(maxOpen).toFixed(1) + '">' + maxOpen + "</text>" +
       '<path class="series" d="' + d + '"></path>' +
       points.map(function (p) {
         return '<circle class="point" cx="' + x(p.t).toFixed(1) + '" cy="' + y(p.open).toFixed(1) + '" r="3"></circle>';
       }).join("") +
+      projectionHtml +
       "</svg>";
   }
 
@@ -787,7 +1035,7 @@
     if (summaryMount) {
       summaryMount.textContent = data.open + " open / " + data.done + " done / burn rate " + rate;
     }
-    mount.innerHTML = burndownCoverageNote(data) + renderBurndownSvg(data.points);
+    mount.innerHTML = burndownCoverageNote(data) + renderBurndownSvg(data.points, data.projection);
     return data;
   }
 

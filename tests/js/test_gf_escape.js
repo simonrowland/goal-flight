@@ -10,7 +10,9 @@ const vm = require("vm");
 const ROOT = path.resolve(__dirname, "..", "..");
 const GF_JS = path.join(ROOT, "templates", "state-skeleton", "gf.js");
 const TICKET_HTML = path.join(ROOT, "templates", "state-skeleton", "ticket.html");
+const TICKETS_HTML = path.join(ROOT, "templates", "state-skeleton", "tickets.html");
 const BURNDOWN_HTML = path.join(ROOT, "templates", "state-skeleton", "burndown.html");
+const INDEX_HTML = path.join(ROOT, "templates", "state-skeleton", "index.html");
 const STATE_TEMPLATES_DIR = path.join(ROOT, "templates", "state-skeleton");
 const CHECKER = path.join(ROOT, "scripts", "check_tasks_mirror.js");
 
@@ -103,6 +105,113 @@ function renderBurndownFixture(items) {
   const scripts = Array.from(fs.readFileSync(BURNDOWN_HTML, "utf8").matchAll(/<script>([\s\S]*?)<\/script>/g));
   vm.runInContext(scripts[scripts.length - 1][1], context, { filename: BURNDOWN_HTML + "#inline", timeout: 5000 });
   return elements;
+}
+
+function makeElement(extra) {
+  const attrs = {};
+  return Object.assign({
+    innerHTML: "",
+    textContent: "",
+    value: "",
+    listeners: {},
+    classList: { remove() {}, add() {} },
+    addEventListener(type, fn) { this.listeners[type] = fn; },
+    removeEventListener() {},
+    setAttribute(name, value) { attrs[name] = String(value); },
+    getAttribute(name) { return attrs[name]; },
+    hasAttribute(name) { return Object.prototype.hasOwnProperty.call(attrs, name); }
+  }, extra || {});
+}
+
+function renderTicketsFixture(items, search) {
+  const kindButtons = ["all", "task", "bug", "decision"].map((kind) => {
+    const button = makeElement({
+      closest() { return button; }
+    });
+    button.setAttribute("data-kind", kind);
+    return button;
+  });
+  const elements = {
+    board: makeElement(),
+    boardStatus: makeElement(),
+    q: makeElement(),
+    statusSel: makeElement(),
+    sortSel: makeElement(),
+    kindSeg: makeElement({
+      querySelectorAll(selector) {
+        return selector === "button" || selector === "button[data-kind]" ? kindButtons : [];
+      }
+    }),
+    refresh: makeElement(),
+    mode: makeElement(),
+    modeText: makeElement()
+  };
+  const doc = {
+    visibilityState: "visible",
+    getElementById(id) {
+      if (!elements[id]) elements[id] = makeElement();
+      return elements[id];
+    },
+    addEventListener() {},
+    removeEventListener() {}
+  };
+  const win = {
+    location: {
+      href: "file:///repo/dashboard/tickets.html" + (search || ""),
+      pathname: "/repo/dashboard/tickets.html",
+      search: search || "",
+      reload() {}
+    },
+    history: {
+      replaceState(_state, _title, url) {
+        const next = new URL(url, win.location.href);
+        win.location.href = next.href;
+        win.location.pathname = next.pathname;
+        win.location.search = next.search;
+      }
+    },
+    document: doc,
+    GF_ITEMS: items,
+    GF_PATH_PREFIXES: ["docs-private/"],
+    addEventListener() {},
+    removeEventListener() {}
+  };
+  const context = vm.createContext({
+    window: win,
+    document: doc,
+    URL,
+    URLSearchParams,
+    setTimeout(fn) { fn(); return 1; },
+    clearTimeout() {}
+  });
+  vm.runInContext(fs.readFileSync(GF_JS, "utf8"), context, { filename: GF_JS, timeout: 5000 });
+  context.GF = context.window.GF;
+  const scripts = Array.from(fs.readFileSync(TICKETS_HTML, "utf8").matchAll(/<script>([\s\S]*?)<\/script>/g));
+  vm.runInContext(scripts[scripts.length - 1][1], context, { filename: TICKETS_HTML + "#inline", timeout: 5000 });
+  elements.kindButtons = kindButtons;
+  elements.window = win;
+  return elements;
+}
+
+function renderedIds(html) {
+  return Array.from(html.matchAll(/data-id="([^"]+)"/g)).map((m) => m[1]);
+}
+
+function numericAttrs(html, attr) {
+  return Array.from(html.matchAll(new RegExp(attr + '="(\\d+)"', "g"))).map((m) => Number(m[1]));
+}
+
+function dispatchStored(el, type, event) {
+  assert(type + " listener is wired", el.listeners && typeof el.listeners[type] === "function");
+  el.listeners[type](Object.assign({ target: el }, event || {}));
+}
+
+function rowSlice(html, id) {
+  const start = html.indexOf('data-id="' + id + '"');
+  assert("row exists for " + id, start >= 0);
+  const end = html.indexOf("</li>", start);
+  assert("row closes for " + id, end >= start);
+  return html.slice(start, end);
 }
 
 function assertCheckerRejectsMissingDerivedStatus() {
@@ -255,7 +364,7 @@ GF.index([
 const derivedMount = { innerHTML: "" };
 GF.renderBoard(derivedMount, {});
 assert("derived_status wins over dispatch breadcrumbs", GF.store.byId["t-derived"]._section === "awaiting-review");
-assert("derived_status renders awaiting review section", derivedMount.innerHTML.includes("Awaiting review"));
+assert("derived_status renders awaiting review badge", derivedMount.innerHTML.includes("awaiting review"));
 assert("derived_status item is not pending", !derivedMount.innerHTML.includes("To do"));
 
 GF.index([
@@ -289,12 +398,243 @@ assert("reserved lane routes to backlog", GF.store.byId["t-deferred"]._section =
 assert("active item remains pending", GF.store.byId["t-active"]._section === "pending");
 assert("pending count excludes reserved lane", laneCounts.pending === 1);
 assert("backlog count includes reserved lane", laneCounts.backlog === 1);
-assert("backlog section renders", laneMount.innerHTML.includes("Backlog"));
+assert("reserved lane renders parked", laneMount.innerHTML.includes("lane-group-parked"));
+assert("reserved lane labels parked", laneMount.innerHTML.includes("parked"));
 assert("lane chip renders escaped lane", laneMount.innerHTML.includes("lane deferred"));
 const backlogOnlyMount = { innerHTML: "" };
 const backlogVisible = GF.renderBoard(backlogOnlyMount, { status: "backlog" });
 assert("backlog filter returns reserved lane", backlogVisible === 1 && backlogOnlyMount.innerHTML.includes("t-deferred"));
 assert("backlog filter hides active task", !backlogOnlyMount.innerHTML.includes("t-active"));
+
+GF.index([
+  {
+    schema_version: 1,
+    id: "b-10",
+    kind: "bug",
+    title: "Low bug",
+    severity: "low",
+    blocked_by: [],
+    links: [],
+    done: false
+  },
+  {
+    schema_version: 1,
+    id: "b-2",
+    kind: "bug",
+    title: "Critical bug",
+    severity: "critical",
+    blocked_by: [],
+    links: [],
+    done: false
+  },
+  {
+    schema_version: 1,
+    id: "t-working",
+    kind: "task",
+    title: "Working task",
+    blocked_by: [],
+    links: [],
+    done: false,
+    derived_status: "working"
+  },
+  {
+    schema_version: 1,
+    id: "t-done-control",
+    kind: "task",
+    title: "Done control",
+    blocked_by: [],
+    links: [],
+    done: true,
+    done_reviewed: true
+  }
+]);
+const idSortMount = { innerHTML: "" };
+GF.renderBoard(idSortMount, { sort: "id" });
+const idSortOrder = renderedIds(idSortMount.innerHTML);
+assert("id sort control orders ids", idSortOrder.indexOf("b-2") < idSortOrder.indexOf("b-10"));
+const severityMount = { innerHTML: "" };
+const severityVisible = GF.renderBoard(severityMount, { kind: "bug", sort: "severity" });
+const severityOrder = renderedIds(severityMount.innerHTML);
+assert("severity sort control filters bugs", severityVisible === 2 && !severityMount.innerHTML.includes("t-working"));
+assert("severity sort control orders bugs high first", severityOrder.indexOf("b-2") < severityOrder.indexOf("b-10"));
+const workingMount = { innerHTML: "" };
+const workingVisible = GF.renderBoard(workingMount, { status: "working" });
+assert("status control filters to working section", workingVisible === 1 && workingMount.innerHTML.includes("t-working"));
+assert("status control hides non-working rows", !workingMount.innerHTML.includes("b-2") && !workingMount.innerHTML.includes("t-done-control"));
+
+const controlPage = renderTicketsFixture(GF.store.raw, "?status=done-reviewed");
+assert("ticket controls read initial status URL", controlPage.statusSel.value === "done-reviewed");
+controlPage.statusSel.value = "working";
+dispatchStored(controlPage.statusSel, "change");
+assert("status listener filters board", controlPage.board.innerHTML.includes("t-working") && !controlPage.board.innerHTML.includes("t-done-control"));
+assert("status listener syncs URL", new URLSearchParams(controlPage.window.location.search).get("status") === "working");
+controlPage.statusSel.value = "all";
+dispatchStored(controlPage.statusSel, "change");
+assert("status listener clears URL param", !new URLSearchParams(controlPage.window.location.search).has("status"));
+dispatchStored(controlPage.kindSeg, "click", { target: controlPage.kindButtons[2] });
+assert("kind listener filters board", controlPage.board.innerHTML.includes("b-2") && !controlPage.board.innerHTML.includes("t-working"));
+assert("kind listener syncs URL", new URLSearchParams(controlPage.window.location.search).get("kind") === "bug");
+controlPage.sortSel.value = "severity";
+dispatchStored(controlPage.sortSel, "change");
+const controlSeverityOrder = renderedIds(controlPage.board.innerHTML);
+assert("sort listener orders board", controlSeverityOrder.indexOf("b-2") < controlSeverityOrder.indexOf("b-10"));
+assert("sort listener syncs URL", new URLSearchParams(controlPage.window.location.search).get("sort") === "severity");
+controlPage.q.value = "Critical";
+dispatchStored(controlPage.q, "input");
+assert("search listener filters board", controlPage.board.innerHTML.includes("b-2") && !controlPage.board.innerHTML.includes("b-10"));
+assert("search listener syncs URL", new URLSearchParams(controlPage.window.location.search).get("q") === "Critical");
+const clearButton = makeElement();
+clearButton.setAttribute("data-gf-clear", "");
+dispatchStored(controlPage.board, "click", { target: clearButton });
+assert("clear listener resets board", controlPage.board.innerHTML.includes("t-working") && controlPage.board.innerHTML.includes("t-done-control"));
+assert("clear listener removes URL filters", controlPage.window.location.search === "");
+
+const hostileLane = "<img src=x onerror=alert(1)>";
+GF.index([
+  {
+    schema_version: 1,
+    id: "t-c",
+    kind: "task",
+    title: "Third",
+    lane: hostileLane,
+    blocked_by: ["t-b"],
+    links: [],
+    done: false
+  },
+  {
+    schema_version: 1,
+    id: "t-default",
+    kind: "task",
+    title: "Default lane item",
+    blocked_by: [],
+    links: [],
+    done: false
+  },
+  {
+    schema_version: 1,
+    id: "t-b",
+    kind: "task",
+    title: "Second",
+    lane: hostileLane,
+    blocked_by: ["t-a"],
+    links: [],
+    done: false
+  },
+  {
+    schema_version: 1,
+    id: "t-a",
+    kind: "task",
+    title: "First",
+    lane: hostileLane,
+    blocked_by: [],
+    links: [],
+    done: false
+  },
+  {
+    schema_version: 1,
+    id: "t-e",
+    kind: "task",
+    title: "Cycle E",
+    lane: "ops",
+    blocked_by: ["t-d"],
+    links: [],
+    done: false
+  },
+  {
+    schema_version: 1,
+    id: "t-d",
+    kind: "task",
+    title: "Cycle D",
+    lane: "ops",
+    blocked_by: ["t-e"],
+    links: [],
+    done: false
+  },
+  {
+    schema_version: 1,
+    id: "t-f",
+    kind: "task",
+    title: "Ops frontier",
+    lane: "ops",
+    blocked_by: [],
+    links: [],
+    done: false
+  },
+  {
+    schema_version: 1,
+    id: "t-park",
+    kind: "task",
+    title: "Deferred",
+    lane: "deferred",
+    blocked_by: [],
+    links: [],
+    done: false
+  },
+  {
+    schema_version: 1,
+    id: "t-done",
+    kind: "task",
+    title: "Done",
+    blocked_by: [],
+    links: [],
+    done: true,
+    done_reviewed: true
+  }
+]);
+const groupedMount = { innerHTML: "" };
+const groupedVisible = GF.renderBoard(groupedMount, {});
+const groupedHtml = groupedMount.innerHTML;
+const groupedOrder = renderedIds(groupedHtml);
+const openHeadline = numericAttrs(groupedHtml, "data-open-count")[0];
+const groupCountSum = numericAttrs(groupedHtml, "data-lane-count").reduce((acc, n) => acc + n, 0);
+assert("lane fixture visible count includes open plus done", groupedVisible === 9);
+assert("open headline excludes done", openHeadline === 8);
+assert("lane group counts sum to open headline", groupCountSum === openHeadline);
+assert("hostile lane name escaped", groupedHtml.includes("&lt;img src=x onerror=alert(1)&gt;"));
+assert("hostile lane name not raw html", !/<img/i.test(groupedHtml));
+assert("default group leads", groupedHtml.indexOf("No lane") < groupedHtml.indexOf("&lt;img src=x onerror=alert(1)&gt;"));
+assert("reserved parked group follows active lanes", groupedHtml.indexOf(">ops<") < groupedHtml.indexOf(">deferred<"));
+assert("reserved parked group precedes done section", groupedHtml.indexOf(">deferred<") < groupedHtml.indexOf(">Done<"));
+assert("dependency chain renders frontier first", groupedOrder.indexOf("t-a") < groupedOrder.indexOf("t-b") && groupedOrder.indexOf("t-b") < groupedOrder.indexOf("t-c"));
+assert("cycle marker renders", groupedHtml.includes("⟳ cyclic"));
+assert("cyclic rows render after ops frontier", groupedOrder.indexOf("t-f") < groupedOrder.indexOf("t-e") && groupedOrder.indexOf("t-f") < groupedOrder.indexOf("t-d"));
+assert("cyclic rows keep store order", groupedOrder.indexOf("t-e") < groupedOrder.indexOf("t-d"));
+
+GF.index([
+  {
+    schema_version: 1,
+    id: "t-missing",
+    kind: "task",
+    title: "Missing blocker",
+    blocked_by: ["nonexistent"],
+    links: [],
+    done: false
+  },
+  {
+    schema_version: 1,
+    id: "t-cycle-a",
+    kind: "task",
+    title: "Cycle A",
+    blocked_by: ["t-cycle-b"],
+    links: [],
+    done: false
+  },
+  {
+    schema_version: 1,
+    id: "t-cycle-b",
+    kind: "task",
+    title: "Cycle B",
+    blocked_by: ["t-cycle-a"],
+    links: [],
+    done: false
+  }
+]);
+const missingCycleMount = { innerHTML: "" };
+GF.renderBoard(missingCycleMount, {});
+const missingCycleHtml = missingCycleMount.innerHTML;
+assert("missing blocker renders missing badge", missingCycleHtml.includes("⚠ blocked by missing nonexistent"));
+assert("missing blocker is not cyclic", !rowSlice(missingCycleHtml, "t-missing").includes("⟳ cyclic"));
+assert("real cycle still renders cyclic badge", rowSlice(missingCycleHtml, "t-cycle-a").includes("⟳ cyclic") && rowSlice(missingCycleHtml, "t-cycle-b").includes("⟳ cyclic"));
 
 const burndownItems = [
   {
@@ -363,10 +703,56 @@ GF.renderBurndown(burndownMount, burndownSummary, burndownItems);
 assert("burndown headline renders counts", burndownSummary.textContent.includes("3 open / 2 done"));
 assert("burndown renders svg trend", burndownMount.innerHTML.includes("<svg"));
 assert("burndown omits full-coverage warning", !burndownMount.innerHTML.includes("trend covers"));
+assert("burndown omits projection when no in-flight", !burndownMount.innerHTML.includes("if in-flight completes"));
 assert("burndown render excludes hostile title text", !burndownMount.innerHTML.includes("<img"));
 const burndownPage = renderBurndownFixture(burndownItems);
 assert("burndown page renders from fixture", burndownPage.burndownSummary.textContent.includes("3 open / 2 done"));
 assert("burndown page remains XSS-safe", !/<\/script|<img/i.test(burndownPage.burndownChart.innerHTML));
+
+const projectedBurndownItems = [
+  {
+    schema_version: 1,
+    id: "t-open-projected",
+    kind: "task",
+    title: "Open projected",
+    blocked_by: [],
+    links: [],
+    done: false,
+    created_at: "2026-04-01T00:00:00Z"
+  },
+  {
+    schema_version: 1,
+    id: "t-working-projected",
+    kind: "task",
+    title: "</script><img src=x onerror=alert(1)> working",
+    blocked_by: [],
+    links: [],
+    done: false,
+    derived_status: "delegated",
+    created_at: "2026-04-02T00:00:00Z"
+  },
+  {
+    schema_version: 1,
+    id: "t-done-projected",
+    kind: "task",
+    title: "Done projected",
+    blocked_by: [],
+    links: [],
+    done: true,
+    done_reviewed: true,
+    created_at: "2026-04-01T00:00:00Z",
+    done_at: "2026-04-03T00:00:00Z"
+  }
+];
+const projectedBurndown = GF.burndownData(projectedBurndownItems);
+assert("burndown projection counts in-flight", projectedBurndown.inFlight === 1);
+assert("burndown projection deducts in-flight from open", projectedBurndown.projection.open === 1);
+const projectedMount = { innerHTML: "" };
+GF.renderBurndown(projectedMount, { textContent: "" }, projectedBurndownItems);
+assert("burndown renders dashed projection segment", projectedMount.innerHTML.includes('class="projection"'));
+assert("burndown renders hollow projection point", projectedMount.innerHTML.includes('class="projection-point"'));
+assert("burndown labels projection as conditional", projectedMount.innerHTML.includes("if in-flight completes: 1"));
+assert("burndown projection remains XSS-safe", !/<\/script|<img/i.test(projectedMount.innerHTML));
 
 const mixedBurndownItems = [
   {
@@ -482,6 +868,33 @@ assert("ticket does not label source as completion", !harvestedTicket.includes("
 
 const ticketsBody = fs.readFileSync(path.join(STATE_TEMPLATES_DIR, "tickets.html"), "utf8");
 assert("tickets.html exposes backlog status filter", ticketsBody.includes('<option value="backlog">backlog</option>'));
+assert("tickets.html exposes frontier sort truth", ticketsBody.includes('<option value="frontier">frontier</option>'));
+const indexBody = fs.readFileSync(INDEX_HTML, "utf8");
+assert("index done card links to done status filter", indexBody.includes('href:"tickets.html?status=done-reviewed"'));
+const doneFilterPage = renderTicketsFixture([
+  {
+    schema_version: 1,
+    id: "t-open-link",
+    kind: "task",
+    title: "Open link",
+    blocked_by: [],
+    links: [],
+    done: false
+  },
+  {
+    schema_version: 1,
+    id: "t-done-link",
+    kind: "task",
+    title: "Done link",
+    blocked_by: [],
+    links: [],
+    done: true,
+    done_reviewed: true
+  }
+], "?status=done-reviewed");
+assert("tickets page reads done status from URL", doneFilterPage.statusSel.value === "done-reviewed");
+assert("done status URL shows done row", doneFilterPage.board.innerHTML.includes("t-done-link"));
+assert("done status URL hides open row", !doneFilterPage.board.innerHTML.includes("t-open-link"));
 
 [
   "index.html",

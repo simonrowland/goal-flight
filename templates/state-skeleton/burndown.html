@@ -5,8 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>goal-flight burndown</title>
 <style>
-:root{--bg:#fff;--fg:#1a1d21;--muted:#6b7280;--accent:#2563eb;--border:#e5e7eb;--card:#fff;--ok:#15803d;--shadow:0 1px 2px rgba(0,0,0,.04),0 1px 3px rgba(0,0,0,.06)}
-@media (prefers-color-scheme:dark){:root{--bg:#0f1115;--fg:#e6e8eb;--muted:#9aa0a6;--accent:#6ea8fe;--border:#262a31;--card:#161922;--ok:#4ade80;--shadow:0 1px 2px rgba(0,0,0,.3)}}
+:root{--bg:#fff;--fg:#1a1d21;--muted:#6b7280;--accent:#2563eb;--border:#e5e7eb;--card:#fff;--ok:#15803d;--projected:#b45309;--shadow:0 1px 2px rgba(0,0,0,.04),0 1px 3px rgba(0,0,0,.06)}
+@media (prefers-color-scheme:dark){:root{--bg:#0f1115;--fg:#e6e8eb;--muted:#9aa0a6;--accent:#6ea8fe;--border:#262a31;--card:#161922;--ok:#4ade80;--projected:#fbbf24;--shadow:0 1px 2px rgba(0,0,0,.3)}}
 *{box-sizing:border-box}
 .visually-hidden{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0}
 .skip-link{position:absolute;left:.5rem;top:-3rem;z-index:20;background:var(--card);color:var(--fg);border:1px solid var(--accent);border-radius:.4rem;padding:.4rem .7rem;transition:top .12s}
@@ -30,6 +30,9 @@ h1{font-size:1.5rem;margin:.2em 0 .1em;letter-spacing:-.01em}
 .axis{stroke:var(--border);stroke-width:1}
 .series{fill:none;stroke:var(--accent);stroke-width:3;stroke-linejoin:round;stroke-linecap:round}
 .point{fill:var(--ok)}
+.projection{fill:none;stroke:var(--projected);stroke-width:2.5;stroke-dasharray:7 5;stroke-linejoin:round;stroke-linecap:round}
+.projection-point{fill:var(--card);stroke:var(--projected);stroke-width:3}
+.projection-label{fill:var(--projected);font:12px ui-monospace,SFMono-Regular,Menlo,monospace;font-weight:700;text-anchor:end}
 .tick{fill:var(--muted);font:12px ui-monospace,SFMono-Regular,Menlo,monospace}
 .tick.end{text-anchor:end}
 .empty{color:var(--muted);margin:.2rem 0}
