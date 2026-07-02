@@ -35,5 +35,13 @@ Options:
 - `--dry-run --json` prints the harvest-shaped JSON preview without applying.
 - `--apply` creates draft items after printing the same preview.
 
+## Caveats
+
+Source-row dedup is position-stable, not edit-stable. Re-running the same
+unchanged source skips rows by source file and row/table position, but editing a
+source so rows shift or move can re-import those rows as new drafts. Preview
+before `--apply`; curation and duplicate-by-title checks catch most obvious
+repeats.
+
 The wrapper composes `harvest`; it does not duplicate harvest parsing or move
 the source markdown.

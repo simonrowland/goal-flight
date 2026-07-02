@@ -432,6 +432,157 @@ def test_harvest_source_does_not_implicitly_resume() -> None:
         assert_true("resume candidate excluded", "Resume candidate should not appear" not in titles)
 
 
+def test_harvest_source_headings_as_tasks_guarded_opt_in() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        project = Path(td)
+        docs = project / "docs-private"
+        _write_tasks(project, [])
+        (docs / "headings.md").write_text(
+            "\n".join(
+                [
+                    "# Parser backlog",
+                    "",
+                    "## 1. Implement heading parser",
+                    "",
+                    "notes only",
+                    "",
+                    "## Durable table migration",
+                    "",
+                    "Migration work item carried by the heading.",
+                    "",
+                    "## Background",
+                    "",
+                    "- Prose bullet should remain a bullet, not a heading task",
+                    "",
+                    "## (Add new backlog items above this line; sort newest first or by area.)",
+                    "",
+                    "## If you are codex / grok / cursor / opencode",
+                    "",
+                    "# Overview",
+                    "",
+                    "## Random prose heading",
+                    "",
+                    "- This is reference prose outside a task context",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        proc = run_task(project, "harvest", "--source", "docs-private/headings.md", "--dry-run", "--json")
+        assert_true(f"default heading harvest exits 0: {proc.stderr}", proc.returncode == 0)
+        titles = [draft["title"] for draft in json.loads(proc.stdout)["drafts"]]
+        assert_true("heading task off by default", "Implement heading parser" not in titles)
+        assert_true("plain heading off by default", "Durable table migration" not in titles)
+
+        proc = run_task(
+            project,
+            "harvest",
+            "--source",
+            "docs-private/headings.md",
+            "--headings-as-tasks",
+            "--dry-run",
+            "--json",
+        )
+        assert_true(f"heading harvest exits 0: {proc.stderr}", proc.returncode == 0)
+        titles = [draft["title"] for draft in json.loads(proc.stdout)["drafts"]]
+        assert_true("numbered heading harvested", "Implement heading parser" in titles)
+        assert_true("context heading harvested", "Durable table migration" in titles)
+        assert_true("generic prose heading skipped", "Background" not in titles)
+        assert_true("terminal placeholder heading skipped", all(not title.startswith("(Add new backlog items") for title in titles))
+        assert_true("tool prose heading skipped", "If you are codex / grok / cursor / opencode" not in titles)
+        assert_true("outside prose heading skipped", "Random prose heading" not in titles)
+
+
+def test_harvest_source_table_rows_open_only_and_non_task_tables_ignored() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        project = Path(td)
+        docs = project / "docs-private"
+        _write_tasks(project, [])
+        (docs / "queue.md").write_text(
+            "\n".join(
+                [
+                    "# Generalised Messaging Goal Queue",
+                    "",
+                    "## Progress",
+                    "",
+                    "| Goal | Status | Commit |",
+                    "|------|--------|--------|",
+                    "| 1. `message-schema-v1` | TODO | - |",
+                    "| 2. `marker-to-envelope` | BLOCKED | - |",
+                    "| 3. `done-row` | DONE | abc123 |",
+                    "| 4. `neutral-row` | green | - |",
+                    "| 5. Fix A\\|B parser | TODO | - |",
+                    "| 6. malformed short row |",
+                    "",
+                    "| Task |",
+                    "|------|",
+                    "| Complete parser migration |",
+                    "",
+                    "## Reference",
+                    "",
+                    "| Name | Value |",
+                    "|------|-------|",
+                    "| alpha | beta |",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        proc = run_task(project, "harvest", "--source", "docs-private/queue.md", "--dry-run", "--json")
+        assert_true(f"table harvest exits 0: {proc.stderr}", proc.returncode == 0)
+        payload = json.loads(proc.stdout)
+        titles = [draft["title"] for draft in payload["drafts"]]
+        assert_true("todo table row harvested", "message-schema-v1" in titles)
+        assert_true("blocked table row harvested", "marker-to-envelope" in titles)
+        assert_true("done table row skipped", "done-row" not in titles)
+        assert_true("neutral status row skipped", "neutral-row" not in titles)
+        assert_true("malformed short row skipped", "malformed short row" not in titles)
+        assert_true("title-only complete row harvested", "Complete parser migration" in titles)
+        assert_true("escaped pipe table title parsed", "Fix A|B parser" in titles)
+        assert_true("non-task table ignored", "alpha" not in titles and "beta" not in titles)
+        assert_true("table row tag added", all("table-row" in draft["tags"] for draft in payload["drafts"]))
+
+
+def test_harvest_source_row_scoped_dedup_keeps_repeated_row_local_titles() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        project = Path(td)
+        docs = project / "docs-private"
+        _write_tasks(project, [])
+        repeated = "Implement or archive the smallest chunk satisfying the row state."
+        (docs / "rows.md").write_text(
+            "\n".join(
+                [
+                    "# Backlog",
+                    "",
+                    "## Row A",
+                    "",
+                    f"- {repeated}",
+                    "",
+                    "## Row B",
+                    "",
+                    f"- {repeated}",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        proc = run_task(project, "harvest", "--source", "docs-private/rows.md", "--json")
+        assert_true(f"row scoped harvest exits 0: {proc.stderr}", proc.returncode == 0)
+        payload = json.loads(proc.stdout)
+        assert_true("row-local repeats both created", len(payload["created"]) == 2)
+        items = _read_items(project)
+        assert_true("same title preserved twice", [item["title"] for item in items].count(repeated) == 2)
+        assert_true("scopes differ", len({item.get("harvest_scope") for item in items}) == 2)
+
+        proc = run_task(project, "harvest", "--source", "docs-private/rows.md", "--json")
+        assert_true(f"second row scoped harvest exits 0: {proc.stderr}", proc.returncode == 0)
+        payload = json.loads(proc.stdout)
+        assert_true("row-scoped second harvest idempotent", payload["created"] == [] and payload["skipped"] == 2)
+
+
 if __name__ == "__main__":
     test_harvest_source_dry_run_json_flags_and_idempotency()
     test_harvest_source_globs_guards_and_zero_match_summary()
@@ -443,4 +594,7 @@ if __name__ == "__main__":
     test_harvest_source_filters_sections_metadata_and_continuations()
     test_harvest_source_plural_headings_and_metadata_sentence_kept()
     test_harvest_source_does_not_implicitly_resume()
+    test_harvest_source_headings_as_tasks_guarded_opt_in()
+    test_harvest_source_table_rows_open_only_and_non_task_tables_ignored()
+    test_harvest_source_row_scoped_dedup_keeps_repeated_row_local_titles()
     print("PASS")

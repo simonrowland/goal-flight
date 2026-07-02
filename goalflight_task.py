@@ -49,7 +49,48 @@ RESUME_NOTES_RE = re.compile(r"^RESUME-NOTES-(\d{4}-\d{2}-\d{2})(?:-rev(\d+))?\.
 REVIEW_SEVERITY = {"P0": "critical", "P1": "high", "P2": "medium", "P3": "low"}
 HARVEST_DRAFT_TAGS = ("draft", "harvest")
 HARVEST_SOURCE_SECTION_RE = re.compile(r"\b(tasks?|backlogs?|actions?|to-?dos?|open|next)\b", re.IGNORECASE)
+HARVEST_TASK_CONTEXT_RE = re.compile(
+    r"\b(tasks?|backlogs?|queues?|goals?|actions?|to-?dos?|open|next|progress)\b",
+    re.IGNORECASE,
+)
 HARVEST_METADATA_KEYS = {"id", "title", "priority", "status", "source", "evidence"}
+HARVEST_GENERIC_HEADING_KEYS = {
+    "acceptance",
+    "background",
+    "checklist",
+    "dispatch",
+    "forbidden",
+    "notes",
+    "overview",
+    "preconditions",
+    "progress",
+    "root cause",
+    "scope",
+    "source",
+    "suggested approach",
+    "suggested design",
+    "symptom",
+    "universal preconditions",
+    "what we know",
+}
+HARVEST_GENERIC_HEADING_PREFIXES = (
+    "(add new backlog items",
+    "backlog",
+    "background",
+    "if you are ",
+    "notes",
+    "overview",
+    "progress",
+    "what this task fixes",
+    "universal preconditions",
+)
+HARVEST_TABLE_STATE_HEADERS = {"state", "status", "lane", "queued as", "queued-as"}
+HARVEST_TABLE_TITLE_HEADER_RE = re.compile(r"\b(action|description|goal|item|request|task|title|work|fix)\b", re.IGNORECASE)
+HARVEST_TABLE_OPEN_RE = re.compile(
+    r"\b(open|pending|todo|to do|blocked|fix|needs?-fix|needs? action|in[- ]progress|wip|not started|ready|new|active|now|next|deferred|held)\b",
+    re.IGNORECASE,
+)
+HARVEST_TABLE_CLOSED_RE = re.compile(r"\b(done|closed|fixed|resolved|complete|completed)\b", re.IGNORECASE)
 HARVEST_MANAGED_SOURCE_NAMES = {
     "task-decomposition.md",
     "tasks-done.md",
@@ -499,6 +540,22 @@ def _heading_allows_harvest_bullets(value: str) -> bool:
     return HARVEST_SOURCE_SECTION_RE.search(_clean_markdown_title(value)) is not None
 
 
+def _heading_allows_harvest_context(value: str) -> bool:
+    return HARVEST_TASK_CONTEXT_RE.search(_clean_markdown_title(value)) is not None
+
+
+def _harvest_position_title(value: str) -> str:
+    text = _clean_markdown_title(value)
+    text = re.sub(r"^\d+[.)]\s+", "", text).strip()
+    text = re.sub(r"^/goal\s+", "", text, flags=re.IGNORECASE).strip()
+    return text
+
+
+def _is_generic_harvest_heading(value: str) -> bool:
+    key = _harvest_title_key(value)
+    return key in HARVEST_GENERIC_HEADING_KEYS or any(key.startswith(prefix) for prefix in HARVEST_GENERIC_HEADING_PREFIXES)
+
+
 def _harvest_list_item_at(lines: list[str], index: int) -> tuple[str, int] | None:
     match = re.match(r"^\s*(?:[-*]\s+|\d+[.)]\s+)(?:\[[ xX]\]\s+)?(.+?)\s*$", lines[index])
     if not match:
@@ -521,6 +578,133 @@ def _harvest_list_item_at(lines: list[str], index: int) -> tuple[str, int] | Non
             continue
         break
     return " ".join(parts), next_index
+
+
+def _split_markdown_table_row(line: str) -> list[str]:
+    text = line.strip()
+    if not text.startswith("|"):
+        return []
+    text = text[1:]
+    if text.endswith("|"):
+        text = text[:-1]
+    return [cell.replace(r"\|", "|").strip() for cell in re.split(r"(?<!\\)\|", text)]
+
+
+def _is_markdown_table_separator(cells: list[str]) -> bool:
+    if not cells:
+        return False
+    for cell in cells:
+        marker = cell.strip().replace(" ", "")
+        if not re.fullmatch(r":?-{3,}:?", marker):
+            return False
+    return True
+
+
+def _harvest_table_title_indexes(headers: list[str]) -> list[int]:
+    indexes: list[int] = []
+    for index, header in enumerate(headers):
+        if HARVEST_TABLE_TITLE_HEADER_RE.search(_clean_markdown_title(header)):
+            indexes.append(index)
+    return indexes
+
+
+def _harvest_table_state_indexes(headers: list[str]) -> list[int]:
+    indexes: list[int] = []
+    for index, header in enumerate(headers):
+        if _harvest_title_key(header) in HARVEST_TABLE_STATE_HEADERS:
+            indexes.append(index)
+    return indexes
+
+
+def _harvest_table_row_closed(cells: list[str], state_indexes: list[int]) -> bool:
+    if not state_indexes:
+        return False
+    state_cells = [cells[index] for index in state_indexes if index < len(cells)]
+    haystack = " ".join(state_cells)
+    return HARVEST_TABLE_CLOSED_RE.search(haystack) is not None
+
+
+def _harvest_table_row_open(cells: list[str], state_indexes: list[int]) -> bool:
+    if not state_indexes:
+        return False
+    state_cells = [cells[index] for index in state_indexes if index < len(cells)]
+    haystack = " ".join(state_cells)
+    return HARVEST_TABLE_OPEN_RE.search(haystack) is not None
+
+
+def _harvest_table_row_title(cells: list[str], state_indexes: list[int], title_indexes: list[int]) -> str:
+    for index in title_indexes:
+        if index < len(cells):
+            title = _harvest_position_title(cells[index])
+            if title:
+                return title
+    for index, cell in enumerate(cells):
+        if index in state_indexes:
+            continue
+        title = _harvest_position_title(cell)
+        if title:
+            return title
+    return ""
+
+
+def _harvest_table_at(
+    store: TaskStore,
+    path: Path,
+    lines: list[str],
+    index: int,
+    *,
+    default_kind: str,
+    source_type: str,
+    lane: str | None,
+    active_task_context: bool,
+) -> tuple[list[dict[str, Any]], int] | None:
+    header = _split_markdown_table_row(lines[index])
+    if not header or index + 1 >= len(lines):
+        return None
+    separator = _split_markdown_table_row(lines[index + 1])
+    if not _is_markdown_table_separator(separator):
+        return None
+
+    next_index = index + 2
+    rows: list[tuple[int, list[str]]] = []
+    while next_index < len(lines):
+        cells = _split_markdown_table_row(lines[next_index])
+        if not cells:
+            break
+        rows.append((next_index + 1, cells))
+        next_index += 1
+
+    state_indexes = _harvest_table_state_indexes(header)
+    title_indexes = _harvest_table_title_indexes(header)
+    table_is_task_shaped = bool(state_indexes or title_indexes)
+    if not table_is_task_shaped or (not active_task_context and not state_indexes):
+        return [], next_index
+
+    candidates: list[dict[str, Any]] = []
+    for row_lineno, cells in rows:
+        if state_indexes:
+            if _harvest_table_row_closed(cells, state_indexes):
+                continue
+            if not _harvest_table_row_open(cells, state_indexes):
+                continue
+        title = _harvest_table_row_title(cells, state_indexes, title_indexes)
+        if not title or _harvest_has_placeholder(title):
+            continue
+        candidate = _harvest_candidate(
+            store,
+            kind=default_kind,
+            title=title,
+            source_path=path,
+            source_type=source_type,
+            line=row_lineno,
+            position_key=f"table:{index + 1}:{row_lineno}",
+        )
+        if candidate is not None:
+            if lane is not None:
+                candidate["lane"] = lane
+            candidate["tags"] = [*LIST_TYPE(candidate.get("tags") or []), "table-row"]
+            candidates.append(candidate)
+    return candidates, next_index
 
 
 def _is_top_level_state_source(path: Path, name: str | None = None) -> bool:
@@ -1634,6 +1818,7 @@ def _harvest_candidate(
     line: int | None = None,
     severity: str | None = None,
     pattern: str | None = None,
+    position_key: str | None = None,
 ) -> dict[str, Any] | None:
     clean_title = _clean_markdown_title(title)
     if not clean_title or clean_title.lower() in {"none", "(none)"}:
@@ -1642,6 +1827,10 @@ def _harvest_candidate(
         return None
     source_ref = _rel_source(store.project_root, source_path, line)
     source_file = _rel_source(store.project_root, source_path)
+    harvest_scope = f"{source_file}:{position_key}" if source_type == "manual-source" and position_key else None
+    harvest_key_parts = [kind, _harvest_title_key(clean_title), source_file, source_type]
+    if harvest_scope:
+        harvest_key_parts.append(harvest_scope)
     tags = [*HARVEST_DRAFT_TAGS, source_type]
     if pattern:
         tags.append(pattern)
@@ -1653,8 +1842,10 @@ def _harvest_candidate(
         "source": "harvest",
         "source_ref": source_ref,
         "harvest_source": source_type,
-        "harvest_key": f"harvest:{_short_hash([kind, _harvest_title_key(clean_title), source_file, source_type])}",
+        "harvest_key": f"harvest:{_short_hash(harvest_key_parts)}",
     }
+    if harvest_scope:
+        candidate["harvest_scope"] = harvest_scope
     if severity:
         candidate["severity"] = severity
     if pattern:
@@ -1668,8 +1859,20 @@ def _append_candidate(candidates: list[dict[str, Any]], candidate: dict[str, Any
     key = candidate.get("harvest_key")
     if key and any(existing.get("harvest_key") == key for existing in candidates):
         return
-    title_key = (str(candidate.get("kind", "task")), _harvest_title_key(candidate.get("title")))
-    if title_key[1] and any((str(existing.get("kind", "task")), _harvest_title_key(existing.get("title"))) == title_key for existing in candidates):
+    title_key = (
+        str(candidate.get("kind", "task")),
+        _harvest_title_key(candidate.get("title")),
+        str(candidate.get("harvest_scope") or ""),
+    )
+    if title_key[1] and any(
+        (
+            str(existing.get("kind", "task")),
+            _harvest_title_key(existing.get("title")),
+            str(existing.get("harvest_scope") or ""),
+        )
+        == title_key
+        for existing in candidates
+    ):
         return
     candidates.append(candidate)
 
@@ -1687,6 +1890,7 @@ def _harvest_heading_blocks(
     source_type: str,
     lane: str | None = None,
     all_bullets: bool = True,
+    headings_as_tasks: bool = False,
 ) -> list[dict[str, Any]]:
     if not require_regular_or_absent(path):
         return []
@@ -1709,6 +1913,7 @@ def _harvest_heading_blocks(
             source_path=path,
             source_type=source_type,
             line=int(current.get("line") or 0),
+            position_key=str(current.get("position_key") or "") or None,
         )
         if candidate is not None and lane is not None:
             candidate["lane"] = lane
@@ -1719,8 +1924,10 @@ def _harvest_heading_blocks(
     if _skip_harvest_source(path, text):
         return []
     lines = text.splitlines()
-    heading_stack: list[tuple[int, bool]] = []
+    heading_stack: list[tuple[int, bool, bool, int, str]] = []
     active_bullet_section = all_bullets
+    active_task_context = all_bullets
+    current_heading_position = "top"
     skip_until_line = 0
     for index, line in enumerate(lines):
         lineno = index + 1
@@ -1729,9 +1936,45 @@ def _harvest_heading_blocks(
         generic_heading = re.match(r"^(#{1,6})\s+(.+?)\s*$", line)
         if generic_heading:
             level = len(generic_heading.group(1))
-            heading_stack = [(prior_level, allowed) for prior_level, allowed in heading_stack if prior_level < level]
-            heading_stack.append((level, _heading_allows_harvest_bullets(generic_heading.group(2))))
-            active_bullet_section = all_bullets or any(allowed for _, allowed in heading_stack)
+            heading_text = generic_heading.group(2)
+            heading_stack = [
+                (prior_level, bullet_allowed, context_allowed, prior_lineno, prior_title)
+                for prior_level, bullet_allowed, context_allowed, prior_lineno, prior_title in heading_stack
+                if prior_level < level
+            ]
+            parent_task_context = all_bullets or any(context_allowed for _, _, context_allowed, _, _ in heading_stack)
+            heading_stack.append(
+                (
+                    level,
+                    _heading_allows_harvest_bullets(heading_text),
+                    _heading_allows_harvest_context(heading_text),
+                    lineno,
+                    heading_text,
+                )
+            )
+            active_bullet_section = all_bullets or any(allowed for _, allowed, _, _, _ in heading_stack)
+            active_task_context = all_bullets or any(allowed for _, _, allowed, _, _ in heading_stack)
+            current_heading_position = f"heading:{lineno}:{_harvest_title_key(heading_text)}"
+            if headings_as_tasks and (parent_task_context or _heading_allows_harvest_context(heading_text)):
+                heading_title = _harvest_position_title(heading_text)
+                id_like = re.match(r"^(?:ADR|bp|[tbq])-\d+\b", heading_title, re.IGNORECASE)
+                numbered = re.match(r"^\d+[.)]\s+", _clean_markdown_title(heading_text)) is not None
+                if heading_title and not id_like and not _is_generic_harvest_heading(heading_title):
+                    if parent_task_context or numbered:
+                        candidate = _harvest_candidate(
+                            store,
+                            kind=default_kind,
+                            title=heading_title,
+                            source_path=path,
+                            source_type=source_type,
+                            line=lineno,
+                            position_key=f"heading:{lineno}",
+                        )
+                        if candidate is not None and lane is not None:
+                            candidate["lane"] = lane
+                        if candidate is not None:
+                            candidate["tags"] = [*LIST_TYPE(candidate.get("tags") or []), "heading-task"]
+                        _append_candidate(candidates, candidate)
         heading = re.match(r"^#{2,6}\s+((?:ADR|bp|[tbq])-\d+)\b(?:\s+(.+))?", line, re.IGNORECASE)
         if heading:
             flush()
@@ -1740,10 +1983,27 @@ def _harvest_heading_blocks(
                     "ref": heading.group(1),
                     "heading": heading.group(2) or heading.group(1),
                     "line": lineno,
+                    "position_key": f"heading:{lineno}",
                 }
                 if active_bullet_section
                 else None
             )
+            continue
+        table = _harvest_table_at(
+            store,
+            path,
+            lines,
+            index,
+            default_kind=default_kind,
+            source_type=source_type,
+            lane=lane,
+            active_task_context=active_task_context,
+        )
+        if table is not None:
+            table_candidates, next_index = table
+            for candidate in table_candidates:
+                _append_candidate(candidates, candidate)
+            skip_until_line = next_index + 1
             continue
         if current is None:
             list_item = _harvest_list_item_at(lines, index)
@@ -1763,6 +2023,7 @@ def _harvest_heading_blocks(
                     source_path=path,
                     source_type=source_type,
                     line=lineno,
+                    position_key=current_heading_position,
                 )
                 if candidate is not None and lane is not None:
                     candidate["lane"] = lane
@@ -1936,6 +2197,7 @@ def _collect_harvest_candidates(
     source_limit: int | None = DEFAULT_SOURCE_LIMIT,
     all_bullets: bool = False,
     no_implicit_resume: bool = False,
+    headings_as_tasks: bool = False,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     candidates: list[dict[str, Any]] = []
     source_matches: list[dict[str, Any]] = []
@@ -1972,6 +2234,7 @@ def _collect_harvest_candidates(
                     source_type="manual-source",
                     lane=source_lane,
                     all_bullets=all_bullets,
+                    headings_as_tasks=headings_as_tasks,
                 )
             )
         summary["candidates"] = len(candidates) - before
@@ -1985,9 +2248,9 @@ def _collect_harvest_candidates(
     return deduped, source_matches
 
 
-def _existing_harvest_keys(items: list[dict[str, Any]]) -> tuple[set[str], set[tuple[str, str]]]:
+def _existing_harvest_keys(items: list[dict[str, Any]]) -> tuple[set[str], set[tuple[str, str, str]]]:
     keys: set[str] = set()
-    titles: set[tuple[str, str]] = set()
+    titles: set[tuple[str, str, str]] = set()
     for item in items:
         key = item.get("harvest_key")
         if isinstance(key, str) and key:
@@ -1995,7 +2258,7 @@ def _existing_harvest_keys(items: list[dict[str, Any]]) -> tuple[set[str], set[t
         kind = str(item.get("kind", "task"))
         title = _harvest_title_key(item.get("title"))
         if title:
-            titles.add((kind, title))
+            titles.add((kind, title, str(item.get("harvest_scope") or "")))
     return keys, titles
 
 
@@ -2005,7 +2268,11 @@ def _add_harvest_candidates(store: TaskStore, items: list[dict[str, Any]], actor
     skipped = 0
     for candidate in candidates:
         key = str(candidate.get("harvest_key") or "")
-        title_key = (str(candidate.get("kind", "task")), _harvest_title_key(candidate.get("title")))
+        title_key = (
+            str(candidate.get("kind", "task")),
+            _harvest_title_key(candidate.get("title")),
+            str(candidate.get("harvest_scope") or ""),
+        )
         if (key and key in existing_keys) or title_key in existing_titles:
             skipped += 1
             continue
@@ -2019,7 +2286,7 @@ def _add_harvest_candidates(store: TaskStore, items: list[dict[str, Any]], actor
             tags=LIST_TYPE(candidate.get("tags") or HARVEST_DRAFT_TAGS),
             lane=candidate.get("lane"),
         )
-        for field in ("source", "source_ref", "harvest_source", "harvest_key", "severity", "pattern"):
+        for field in ("source", "source_ref", "harvest_source", "harvest_key", "harvest_scope", "severity", "pattern"):
             value = candidate.get(field)
             if value not in (None, "", [], {}):
                 item[field] = value
@@ -2429,6 +2696,7 @@ def _cmd_harvest(store: TaskStore, args: argparse.Namespace) -> int:
         source_limit=getattr(args, "source_limit", DEFAULT_SOURCE_LIMIT),
         all_bullets=getattr(args, "all_bullets", False),
         no_implicit_resume=getattr(args, "no_implicit_resume", False),
+        headings_as_tasks=getattr(args, "headings_as_tasks", False),
     )
     if args.dry_run:
         payload = {
@@ -2477,6 +2745,7 @@ def _run_harvest_json(store: TaskStore, args: argparse.Namespace, *, dry_run: bo
         source_limit=getattr(args, "source_limit", DEFAULT_SOURCE_LIMIT),
         all_bullets=getattr(args, "all_bullets", False),
         no_implicit_resume=getattr(args, "no_implicit_resume", False),
+        headings_as_tasks=getattr(args, "headings_as_tasks", False),
     )
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
@@ -3160,6 +3429,7 @@ def build_parser() -> argparse.ArgumentParser:
     harvest.add_argument("--lane", default="deferred", help="Lane stamped on items from --source files.")
     harvest.add_argument("--source-limit", type=int, default=DEFAULT_SOURCE_LIMIT, help=f"Maximum files consumed per --source glob before reporting dropped matches (default: {DEFAULT_SOURCE_LIMIT}).")
     harvest.add_argument("--all-bullets", action="store_true", help="Harvest bullets from any section in --source files instead of only task/backlog/action/TODO/open/next sections.")
+    harvest.add_argument("--headings-as-tasks", action="store_true", help="Also harvest guarded work-item headings from --source files; off by default to avoid prose-heading noise.")
     harvest.add_argument("--no-implicit-resume", action="store_true", help="Skip implicit RESUME-NOTES candidates during built-in harvest.")
     harvest.add_argument("--json", action="store_true")
     harvest.set_defaults(func=_cmd_harvest)
@@ -3188,6 +3458,7 @@ def build_parser() -> argparse.ArgumentParser:
     migrate.add_argument("--source-limit", type=int, default=DEFAULT_SOURCE_LIMIT, help=f"Maximum files consumed per --source glob before reporting dropped matches (default: {DEFAULT_SOURCE_LIMIT}).")
     migrate.add_argument("--no-history", action="store_true", help="Pass through to harvest; skip RESUME-NOTES history backfill.")
     migrate.add_argument("--all-bullets", action="store_true", help="Pass through to harvest; include bullets outside task/backlog/action/TODO/open/next sections.")
+    migrate.add_argument("--headings-as-tasks", action="store_true", help="Pass through to harvest; opt in to guarded work-item heading candidates.")
     migrate.add_argument("--no-implicit-resume", action="store_true", help="Pass through to harvest; skip implicit RESUME-NOTES candidates.")
     migrate.add_argument("--dry-run", action="store_true", help="Alias for the default preview mode; combine with --json for harvest-shaped JSON preview.")
     migrate.add_argument("--json", action="store_true", help="Print harvest-shaped JSON for preview, or preview/apply JSON with --apply.")
