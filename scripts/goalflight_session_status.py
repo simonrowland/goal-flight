@@ -358,6 +358,7 @@ def aggregate_status(project_root: Path, *, ttl_days: int = 7) -> dict:
     notes_active, notes_reason = _resume_notes_active(newest_notes, ttl_days=ttl_days)
     active = queue_active or bool(leases_for_project) or notes_active
     backlog_counts, backlog_error = _task_backlog_counts(project_root)
+    ready_frontier, ready_frontier_error = _ready_frontier(project_root)
     return {
         "active": active,
         "queue_file": str(newest_queue.relative_to(project_root)) if newest_queue else None,
@@ -373,6 +374,8 @@ def aggregate_status(project_root: Path, *, ttl_days: int = 7) -> dict:
         "resume_notes_reason": notes_reason,
         "backlog_counts": backlog_counts,
         "backlog_error": backlog_error,
+        "ready_frontier": ready_frontier,
+        "ready_frontier_error": ready_frontier_error,
         "ttl_days": ttl_days,
     }
 
@@ -406,6 +409,30 @@ def _task_backlog_counts(project_root: Path) -> tuple[dict[str, int] | None, str
     return counts, None
 
 
+def _ready_frontier(project_root: Path) -> tuple[dict[str, object] | None, str | None]:
+    tasks_path = project_root / "docs-private" / "tasks.jsonl"
+    if not tasks_path.exists():
+        return {"count": 0}, None
+    try:
+        if str(ROOT) not in sys.path:
+            sys.path.insert(0, str(ROOT))
+        import goalflight_task
+
+        rows = goalflight_task.TaskStore(project_root).next_frontier()
+    except Exception as exc:
+        return None, f"{tasks_path}: {exc}"
+    if not rows:
+        return {"count": 0}, None
+    top = rows[0]
+    prompt_path = top.get("prompt_path")
+    return {
+        "count": len(rows),
+        "top_id": str(top.get("id") or ""),
+        "top_title": str(top.get("title") or ""),
+        "prompt_path": prompt_path if isinstance(prompt_path, str) and prompt_path else None,
+    }, None
+
+
 def _post_resume_nudge(project_root: Path) -> None:
     try:
         if str(ROOT) not in sys.path:
@@ -427,6 +454,19 @@ def _backlog_counts_text(status: dict) -> str | None:
         if value > 0:
             parts.append(f"{value} {label}")
     return " · ".join(parts) if parts else None
+
+
+def _resume_directive_text(status: dict) -> str | None:
+    frontier = status.get("ready_frontier")
+    if not isinstance(frontier, dict):
+        return None
+    count = int(frontier.get("count") or 0)
+    if count <= 0:
+        return None
+    top_id = str(frontier.get("top_id") or "").strip()
+    top_title = str(frontier.get("top_title") or "").strip().replace("\n", " ")
+    top = f" ({top_id} {top_title})" if top_id else ""
+    return f"resume: run python3 goalflight_task.py next -> continue the top task{top}"
 
 
 def _resume_notes_active(notes_path: Path | None, *, ttl_days: int = 7) -> tuple[bool, str]:
@@ -508,6 +548,7 @@ def _active_leases_for(project_root: Path) -> list[dict]:
 
 def to_text(status: dict) -> str:
     counts_text = _backlog_counts_text(status)
+    resume_text = _resume_directive_text(status) if status.get("active") else None
     if not status["active"]:
         if status["queue_file"] is None:
             text = "no goal-flight queue files; not an active session"
@@ -527,6 +568,8 @@ def to_text(status: dict) -> str:
         pieces.append(f"last-touched={status['queue_last_touched']}")
     if counts_text:
         pieces.append(counts_text)
+    if resume_text:
+        pieces.append(resume_text)
     return "; ".join(pieces)
 
 

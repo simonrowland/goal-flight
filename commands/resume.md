@@ -37,13 +37,16 @@ Do not act on any resume state until STEP 0 is satisfied.
 ## STEP 1 — Reload order + handoff
 
 Follow `AGENTS.md`, then the canonical post-compaction reload order in `SKILL.md`
-(session-status verdict → `SKILL.md` end-to-end → newest RESUME-NOTES → newest
-queue → `goalflight_status.py`). Read `protocols/state-handoff.md`.
+and `protocols/state-handoff.md`: session-status verdict, `SKILL.md` end-to-end,
+store baseline, handoff prose, status, `next`, then continue the top task without
+waiting for a re-prompt when no real blocker exists.
 
 ## STEP 2 — Rebuild status
 
 ```bash
 python3 <skill-root>/scripts/goalflight_status.py
+python3 <skill-root>/goalflight_task.py list outstanding
+python3 <skill-root>/goalflight_task.py next
 git status --short
 git log -1 --oneline
 ```
@@ -53,7 +56,8 @@ Then summarize:
 - current branch/head/dirty state
 - active dispatches and classifications
 - capacity cooldowns
-- next non-DONE queue item
+- store baseline (`list outstanding`, plus `list deferred` / `list held` when relevant)
+- `CONTINUE:` directive from `goalflight_task.py next`
 - first safe command to run next
 
 Do not reconstruct state from raw worker logs when status JSON exists.

@@ -149,6 +149,7 @@ def test_next_excludes_reserved_lanes_and_posts_no_nudge() -> None:
         proc = _run_task(project, env, "next")
         assert_true(f"next exits 0: {proc.stderr}", proc.returncode == 0)
         assert_eq("reserved lanes excluded from next", proc.stdout.splitlines(), [])
+        assert_true("empty frontier has no CONTINUE directive", "CONTINUE:" not in proc.stderr)
         inbox = _nudge_inbox(env, project)
         assert_true("reserved-only frontier creates no inbox", not inbox.exists())
 
@@ -173,6 +174,39 @@ def test_next_includes_promoted_free_text_lane_and_no_lane() -> None:
             proc.stdout.splitlines(),
             ["t-001 Promoted task", "t-002 No lane task"],
         )
+
+
+def test_next_prints_continue_directive_for_top_task() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        project = tmp / "project"
+        env = _env(tmp)
+        _write_items(
+            project,
+            [
+                _item("t-001", "Ready task", prompt_path="prompts/t-001.md"),
+                _item("t-002", "Second task"),
+            ],
+        )
+        proc = _run_task(project, env, "next")
+        assert_true(f"next exits 0: {proc.stderr}", proc.returncode == 0)
+        assert_eq("stdout remains row list", proc.stdout.splitlines(), ["t-001 Ready task", "t-002 Second task"])
+        expected_prompt = (project / "prompts" / "t-001.md").resolve()
+        assert_true(
+            "stderr carries CONTINUE directive",
+            f"CONTINUE: t-001 Ready task (prompt: {expected_prompt})" in proc.stderr,
+        )
+
+
+def test_next_continue_directive_uses_dash_without_prompt() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        project = tmp / "project"
+        env = _env(tmp)
+        _write_items(project, [_item("t-001", "Ready task")])
+        proc = _run_task(project, env, "next")
+        assert_true(f"next exits 0: {proc.stderr}", proc.returncode == 0)
+        assert_true("dash prompt marker", "CONTINUE: t-001 Ready task (prompt: -)" in proc.stderr)
 
 
 def test_parallel_nudge_posts_once_for_same_frontier() -> None:
@@ -344,6 +378,8 @@ def main() -> None:
     test_next_json_shape_and_no_status_key()
     test_next_excludes_reserved_lanes_and_posts_no_nudge()
     test_next_includes_promoted_free_text_lane_and_no_lane()
+    test_next_prints_continue_directive_for_top_task()
+    test_next_continue_directive_uses_dash_without_prompt()
     test_parallel_nudge_posts_once_for_same_frontier()
     test_parallel_nudge_coalesces_changed_frontier_to_single_current()
     test_parallel_nudge_preserves_unrelated_inbox_envelopes_when_coalescing()

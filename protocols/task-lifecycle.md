@@ -89,8 +89,10 @@ single-current coalescing by nudge kind, and fail-open lazy imports; set
   non-empty, post `N tasks ready (top: <id>) -> continue?`. The default JSON
   path and explicit `--json` stay side-effect-free.
 
-Controllers still pull with `status`, `list`, and `next`; nudges are advisory,
-not blockers.
+Consumption path: the controller's habitual `goalflight_status.py` read-side
+mail summary scopes worker inboxes plus the current project's `task-store:<slug>`
+pseudo-inbox, then renders those nudges through the normal mail hint. Controllers
+still pull with `status`, `list`, and `next`; nudges are advisory, not blockers.
 
 Workers-in-flight survive resume because dispatch reliability links
 `dispatch_id` to `task_ids` and the status / worker-state plane is trustworthy.

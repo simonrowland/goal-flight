@@ -2474,6 +2474,13 @@ def _post_next_nudge(rows: list[dict[str, Any]], project_root: Path) -> None:
     )
 
 
+def _continue_directive(store: TaskStore, row: dict[str, Any]) -> str:
+    title = str(row.get("title") or "").strip().replace("\n", " ")
+    prompt_path = _pipe_prompt_path(store, row)
+    prompt_ref = str(prompt_path) if prompt_path is not None else "-"
+    return f"CONTINUE: {row['id']} {title} (prompt: {prompt_ref})"
+
+
 def post_done_suggest_nudge(task_ids: list[str], project_root: str | Path, dispatch_id: str | None) -> None:
     ids = sorted(_dedupe_strs(task_ids))
     if not ids or not dispatch_id:
@@ -2511,6 +2518,8 @@ def _cmd_next(store: TaskStore, args: argparse.Namespace) -> int:
     if args.json:
         print(json.dumps(rows, ensure_ascii=False, sort_keys=True))
         return 0
+    if rows:
+        print(_continue_directive(store, rows[0]), file=sys.stderr)
     for row in rows:
         print(f"{row['id']} {row.get('title', '')}")
     return 0

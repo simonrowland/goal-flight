@@ -311,13 +311,16 @@ def _open_user_needs(envelopes: list[dict]) -> list[dict]:
     open_items: list[dict] = []
     for env in envelopes:
         if env.get("type") in {"user_need", "user_confirm", "blocked"}:
+            payload = env.get("payload", {}) or {}
             open_items.append(
                 {
                     "dispatch_id": env["dispatch_id"],
                     "seq": env["seq"],
                     "type": env["type"],
+                    "nudge_kind": payload.get("nudge_kind"),
                     "ts": env["ts"],
-                    "text": env.get("payload", {}).get("text", ""),
+                    "text": payload.get("text", ""),
+                    "payload": payload,
                 }
             )
     return open_items
@@ -517,11 +520,123 @@ def _clip(text: object, limit: int = 100) -> str:
     return s if len(s) <= limit else s[: limit - 3] + "..."
 
 
+def _task_store_dispatch_id(project_root: Path) -> str | None:
+    try:
+        if str(REPO_ROOT) not in sys.path:
+            sys.path.insert(0, str(REPO_ROOT))
+        import goalflight_task  # type: ignore
+
+        # Resolve the CANONICAL project root (git common-dir parent) exactly
+        # like the nudge WRITER does — a raw worktree path hashes to a
+        # different slug and the reader would silently watch the wrong inbox
+        # (live consumption-gap regression caught 2026-07-02). Anchored git
+        # discovery covers ANY linked worktree, not just managed ones.
+        root = Path(project_root)
+        try:
+            import subprocess
+
+            common_raw = subprocess.check_output(
+                ["git", "rev-parse", "--git-common-dir"],
+                cwd=str(root),
+                text=True,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+            common = Path(common_raw)
+            if not common.is_absolute():
+                common = (root / common).resolve()
+            root = common.parent
+        except Exception:
+            root = Path(goalflight_task.resolve_project_root(str(project_root)))
+        return goalflight_task._next_nudge_dispatch_id(root)
+    except Exception:
+        return None
+
+
+def _owned_with_task_store(
+    owned_dispatch_ids: set[str] | None,
+    task_store_project_root: Path | None,
+) -> set[str] | None:
+    if owned_dispatch_ids is None or task_store_project_root is None:
+        return owned_dispatch_ids
+    dispatch_id = _task_store_dispatch_id(task_store_project_root)
+    if not dispatch_id:
+        return owned_dispatch_ids
+    scoped = set(owned_dispatch_ids)
+    scoped.add(dispatch_id)
+    return scoped
+
+
+def _current_frontier_ids(project_root: Path) -> list[str] | None:
+    try:
+        if str(REPO_ROOT) not in sys.path:
+            sys.path.insert(0, str(REPO_ROOT))
+        import goalflight_task  # type: ignore
+
+        return [str(row["id"]) for row in goalflight_task.TaskStore(Path(project_root)).next_frontier()]
+    except Exception:
+        return None
+
+
+def _task_items_by_id(project_root: Path) -> dict[str, dict] | None:
+    try:
+        if str(REPO_ROOT) not in sys.path:
+            sys.path.insert(0, str(REPO_ROOT))
+        import goalflight_task  # type: ignore
+
+        return {str(row.get("id") or ""): row for row in goalflight_task.list(project_root=Path(project_root))}
+    except Exception:
+        return None
+
+
+def _done_reviewed(row: dict | None) -> bool:
+    if not row:
+        return True
+    return row.get("done_reviewed") is True or (row.get("kind") == "decision" and row.get("done") is True)
+
+
+def _task_store_nudge_is_current(item: dict, project_root: Path) -> bool:
+    payload = item.get("payload") or {}
+    nudge_kind = str(payload.get("nudge_kind") or "")
+    if nudge_kind == "done-suggest":
+        task_ids = [str(value) for value in (payload.get("task_ids") or [])]
+        if not task_ids:
+            return True
+        rows_by_id = _task_items_by_id(project_root)
+        if rows_by_id is None:
+            return True
+        return any(not _done_reviewed(rows_by_id.get(task_id)) for task_id in task_ids)
+    if nudge_kind not in {"parallel-ready", "resume-ready"}:
+        return True
+    frontier_ids = _current_frontier_ids(project_root)
+    if frontier_ids is None:
+        return True
+    payload_ids = [str(value) for value in (payload.get("frontier_ids") or [])]
+    if not payload_ids:
+        return True
+    if nudge_kind == "parallel-ready":
+        return len(frontier_ids) >= 2 and frontier_ids == payload_ids
+    return bool(frontier_ids) and frontier_ids == payload_ids
+
+
+def _filter_task_store_nudges(items: list[dict], task_store_project_root: Path | None) -> list[dict]:
+    if task_store_project_root is None:
+        return items
+    dispatch_id = _task_store_dispatch_id(task_store_project_root)
+    if not dispatch_id:
+        return items
+    return [
+        item
+        for item in items
+        if str(item.get("dispatch_id") or "") != dispatch_id
+        or _task_store_nudge_is_current(item, task_store_project_root)
+    ]
+
+
 def _format_mail_hint(items: list[dict]) -> str:
     """Multi-line controller hint: a header plus one detail line per open item,
     each with the dispatch id, kind, and a clipped text so the controller can
     follow up straight from a status check."""
-    head = f"\U0001f4ec mail: {len(items)} open item(s) from your worker(s) - run: goalflight_messages.py relay"
+    head = f"\U0001f4ec mail: {len(items)} open item(s) from your worker(s)/task store - run: goalflight_messages.py relay"
     lines = [head]
     for it in items[:5]:
         lines.append(f"    [{it['dispatch_id']}] {it['type']}: {it['text']}")
@@ -533,6 +648,7 @@ def _format_mail_hint(items: list[dict]) -> str:
 def controller_mail_summary(
     *,
     owned_dispatch_ids: set[str] | None = None,
+    task_store_project_root: Path | None = None,
     messages_dir: Path | None = None,
     fleet_dir: Path | None = None,
 ) -> dict:
@@ -544,32 +660,35 @@ def controller_mail_summary(
 
     The mailbox is machine-global (shared across controllers), so when
     ``owned_dispatch_ids`` is provided only needs from THOSE dispatches — the
-    controller's own workers — are surfaced; a controller must never see another
-    controller's workers' needs. ``None`` means no ownership filter (e.g. an
-    all-projects view). Returns ``{}`` when there is nothing to show.
+    controller's own workers — plus ``task_store_project_root``'s pseudo-inbox are
+    surfaced; a controller must never see another controller's workers' needs.
+    ``None`` means no ownership filter (e.g. an all-projects view). Returns ``{}``
+    when there is nothing to show.
     """
     # Read ONLY this controller's own inboxes: an unrelated controller's corrupt or
     # large inbox can then neither suppress (a parse error elsewhere) nor slow this
     # scoped status call. build_aggregate is also per-inbox tolerant as a backstop.
+    scoped_dispatch_ids = _owned_with_task_store(owned_dispatch_ids, task_store_project_root)
     aggregate = build_aggregate(
         messages_dir=messages_dir or default_messages_dir(),
         fleet_dir=fleet_dir if fleet_dir is not None else default_fleet_dir(),
-        dispatch_ids=owned_dispatch_ids,
+        dispatch_ids=scoped_dispatch_ids,
     )
     needs = list(aggregate.get("open_user_needs") or [])
     needs.extend(aggregate.get("open_advisories") or [])
-    if owned_dispatch_ids is not None:
+    if scoped_dispatch_ids is not None:
         needs = [
             n for n in needs
-            if str(n.get("dispatch_id") or "") in owned_dispatch_ids
+            if str(n.get("dispatch_id") or "") in scoped_dispatch_ids
             or str(n.get("dispatch_id") or "") == "controller-quota-advisory"
         ]
+    needs = _filter_task_store_nudges(needs, task_store_project_root)
     if not needs:
         return {}
     items = [
         {
             "dispatch_id": str(n.get("dispatch_id") or "?"),
-            "type": str(n.get("type") or "user_need"),
+            "type": str(n.get("nudge_kind") or n.get("type") or "user_need"),
             "seq": n.get("seq"),
             "text": _clip(n.get("text")),
         }

@@ -69,11 +69,12 @@ MAX_IDLE_SECS=180
 CPU_EPSILON=0.1
 PID_DEAD_MARKER_GRACE_SECS=1
 # CPU-sampling-failure grace (codex 2026-05-20 P2): require this many consecutive
-# wedged polls before exiting idle-timeout, so one transient `ps` failure can't
-# false-positive a healthy worker. Not a flag — mirrors goalflight_watch.py. This
-# is the watcher mirror of the runner's intra-decision re-sample grace
-# (goalflight_liveness.cpu_liveness_keep_waiting) — same goal, keep them aligned.
-WEDGE_CONFIRM_SAMPLES=2
+# wedged polls before exiting idle-timeout, so transient `ps` low/zero samples
+# can't false-positive a healthy CPU-busy worker. Full-suite load on macOS can
+# produce several low process-group samples even while the worker is active.
+# Not a flag — this is the watcher mirror of the runner's intra-decision
+# re-sample grace (goalflight_liveness.cpu_liveness_keep_waiting).
+WEDGE_CONFIRM_SAMPLES=5
 CPU_UNKNOWN_CONFIRM_SAMPLES=$(( WEDGE_CONFIRM_SAMPLES + 2 ))
 # Pidfile dir. Honors $GOAL_FLIGHT_PIDFILE_DIR so tests can redirect registration
 # into an isolated temp dir. Default is unchanged, so in production the watcher and

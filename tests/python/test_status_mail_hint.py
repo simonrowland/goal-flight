@@ -14,10 +14,12 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import goalflight_status as S  # noqa: E402
 import goalflight_messages as M  # noqa: E402
+import goalflight_task as T  # noqa: E402
 
 
 def assert_true(name: str, cond: bool) -> None:
@@ -61,6 +63,20 @@ def _bare_payload(mail: dict) -> dict:
     }
 
 
+def _task_item(item_id: str, title: str) -> dict:
+    return {
+        "schema_version": 1,
+        "id": item_id,
+        "kind": "task",
+        "title": title,
+        "blocked_by": [],
+        "links": [],
+        "done": False,
+        "created_at": "2026-07-01T00:00:00+00:00",
+        "created_by": "test",
+    }
+
+
 def test_no_mail_empty_summary() -> None:
     out = _with_mail_dirs(lambda m, f: S._mail_summary())
     assert_eq("empty inbox -> {}", out, {})
@@ -100,6 +116,78 @@ def test_ownership_filter_excludes_other_controllers_workers() -> None:
     out = _with_mail_dirs(body)
     assert_eq("only owned need surfaces", out.get("count"), 1)
     assert_eq("and it is the owned one", out["needs"][0]["dispatch_id"], "mine-1")
+
+
+def test_task_store_inbox_id_agrees_between_worktree_and_main_root() -> None:
+    # Live regression (2026-07-02): the nudge WRITER resolves the canonical
+    # git common-dir parent, but the reader hashed the raw worktree path —
+    # reader and writer watched DIFFERENT inboxes in any linked worktree.
+    import subprocess
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        main = base / "mainrepo"
+        main.mkdir()
+        env = os.environ.copy()
+        env.update({"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@x", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@x"})
+        for cmd in (
+            ["git", "init", "-q"],
+            ["git", "commit", "-q", "--allow-empty", "-m", "root"],
+            ["git", "worktree", "add", "-q", str(base / "wt"), "-b", "wt-branch"],
+        ):
+            subprocess.run(cmd, cwd=str(main), env=env, check=True, capture_output=True)
+        from_main = M._task_store_dispatch_id(main)
+        from_wt = M._task_store_dispatch_id(base / "wt")
+        assert_true("main root derives an id", bool(from_main))
+        assert_true(
+            f"worktree and main root agree on the inbox id ({from_wt} vs {from_main})",
+            from_wt == from_main,
+        )
+
+
+def test_scoped_status_mail_includes_project_task_store_nudge() -> None:
+    def body(msgs, fleet):
+        project = msgs.parent / "project"
+        store = T.TaskStore(project)
+        store.save_items_atomic([_task_item("t-001", "A"), _task_item("t-002", "B")])
+        T._post_next_nudge(store.next_frontier(), project)
+        return S._mail_summary(set(), project_root=project)
+
+    out = _with_mail_dirs(body)
+    assert_eq("task-store nudge count", out.get("count"), 1)
+    need = out["needs"][0]
+    assert_true("task-store dispatch surfaced", need["dispatch_id"].startswith("task-store:"))
+    assert_eq("nudge kind surfaced", need["type"], T.NEXT_NUDGE_KIND)
+    assert_true("hint shows nudge text", "2 parallel-ready (t-001, t-002) -> fan out?" in out["hint"])
+
+
+def test_stale_task_store_parallel_nudge_stays_silent() -> None:
+    def body(msgs, fleet):
+        project = msgs.parent / "project"
+        store = T.TaskStore(project)
+        store.save_items_atomic([_task_item("t-001", "A"), _task_item("t-002", "B")])
+        T._post_next_nudge(store.next_frontier(), project)
+        store.save_items_atomic([_task_item("t-001", "A")])
+        return S._mail_summary(set(), project_root=project)
+
+    out = _with_mail_dirs(body)
+    assert_eq("stale task-store nudge suppressed", out, {})
+
+
+def test_reviewed_done_suggest_nudge_stays_silent() -> None:
+    def body(msgs, fleet):
+        project = msgs.parent / "project"
+        store = T.TaskStore(project)
+        store.save_items_atomic([{**_task_item("t-001", "Done work"), "done": True}])
+        T.post_done_suggest_nudge(["t-001"], project, "worker-1")
+        current = S._mail_summary(set(), project_root=project)
+        store.save_items_atomic([{**_task_item("t-001", "Done work"), "done": True, "done_reviewed": True}])
+        stale = S._mail_summary(set(), project_root=project)
+        return current, stale
+
+    current, stale = _with_mail_dirs(body)
+    assert_eq("current done-suggest surfaced", current.get("needs", [{}])[0].get("type"), T.DONE_SUGGEST_NUDGE_KIND)
+    assert_eq("reviewed done-suggest suppressed", stale, {})
 
 
 def test_mail_check_is_fail_open() -> None:
@@ -200,6 +288,10 @@ def main() -> None:
         test_no_mail_empty_summary,
         test_open_user_need_surfaces_hint_with_detail,
         test_ownership_filter_excludes_other_controllers_workers,
+        test_task_store_inbox_id_agrees_between_worktree_and_main_root,
+        test_scoped_status_mail_includes_project_task_store_nudge,
+        test_stale_task_store_parallel_nudge_stays_silent,
+        test_reviewed_done_suggest_nudge_stays_silent,
         test_mail_check_is_fail_open,
         test_render_text_includes_hint_when_present,
         test_render_text_silent_when_no_mail,

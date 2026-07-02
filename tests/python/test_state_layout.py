@@ -427,6 +427,32 @@ def test_state_layout_references_newest_resume_notes_not_handoff_file() -> None:
         assert_true(f"{path.name} drops handoff.md", re.search(r"(?<!state-)handoff\.md", text) is None)
 
 
+def test_loop_prompt_is_store_first() -> None:
+    text = (ROOT / "templates/goalflight-loop-prompt.md").read_text(encoding="utf-8")
+    status_idx = text.index("goalflight_session_status.py --text")
+    next_idx = text.index("goalflight_task.py next")
+    notes_idx = text.index("RESUME-NOTES")
+    assert_true("loop prompt starts from session-status", status_idx < next_idx)
+    assert_true("loop prompt reads notes after next", next_idx < notes_idx)
+    assert_true("loop prompt names CONTINUE directive", "CONTINUE:" in text)
+    assert_true("loop prompt names store as task state", "The living task state is the\nstore" in text)
+
+
+def test_resume_command_is_store_first() -> None:
+    text = (ROOT / "commands/resume.md").read_text(encoding="utf-8")
+    assert_true("resume command runs list outstanding", "goalflight_task.py list outstanding" in text)
+    assert_true("resume command runs next", "goalflight_task.py next" in text)
+    assert_true("resume command names CONTINUE directive", "CONTINUE:" in text)
+    assert_true("resume command drops pre-store queue wording", "next non-DONE queue item" not in text)
+
+
+def test_task_lifecycle_names_nudge_consumption_path() -> None:
+    text = (ROOT / "protocols/task-lifecycle.md").read_text(encoding="utf-8")
+    assert_true("lifecycle names task-store pseudo-inbox", "task-store:<slug>" in text)
+    assert_true("lifecycle names status consumption path", "goalflight_status.py" in text)
+    assert_true("lifecycle names read-side mail summary", "read-side\nmail summary" in text)
+
+
 def test_doctor_state_layout_reports_exact_missing_paths() -> None:
     with tempfile.TemporaryDirectory(prefix="gf-state-layout-missing-") as td:
         repo = Path(td)
@@ -562,6 +588,9 @@ def main() -> None:
         test_scaffold_project_state_respects_gitignore_branches,
         test_scaffold_project_state_backfills_derivable_inflight_ledger_task_ids,
         test_state_layout_references_newest_resume_notes_not_handoff_file,
+        test_loop_prompt_is_store_first,
+        test_resume_command_is_store_first,
+        test_task_lifecycle_names_nudge_consumption_path,
         test_doctor_state_layout_reports_exact_missing_paths,
         test_doctor_state_layout_ignores_static_html_mtime,
         test_doctor_state_layout_reports_managed_view_schema_skew,

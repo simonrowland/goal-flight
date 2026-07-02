@@ -634,7 +634,8 @@ cleanup_pidfile "$PIDFILE_STEM"
 # ---- Case 3: idle timeout → exit 2 ----
 TAIL=/tmp/test-watch-idle-$$.txt
 : > "$TAIL"
-WORKER_PID="$(start_isolated_sleep 8)"
+# Keep the fake wedged worker alive longer than the idle confirmation grace.
+WORKER_PID="$(start_isolated_sleep 20)"
 PIDFILE_STEM="$$.bashtail.${WORKER_PID}.jsonl"
 
 # Regression guard: a CPU-busy sibling in the test harness PGID must not mask

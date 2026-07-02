@@ -1104,7 +1104,7 @@ def wait_for_dispatches(
         return 130
 
 
-def _mail_summary(owned_dispatch_ids: set[str] | None = None) -> dict:
+def _mail_summary(owned_dispatch_ids: set[str] | None = None, *, project_root: Path | None = None) -> dict:
     """Read-side "you have mail" check, computed FRESH on every status call and
     never stored in any status JSON (the controller-mail signal is read-side only,
     never stamped into worker-liveness state). Delegates the mail-domain work to
@@ -1112,6 +1112,7 @@ def _mail_summary(owned_dispatch_ids: set[str] | None = None) -> dict:
     controller's own dispatches and guarantees fail-open.
 
     ``owned_dispatch_ids`` limits the surfaced needs to this controller's workers
+    plus this project's task-store pseudo-inbox when ``project_root`` is provided
     (the mailbox is machine-global). Fail-open: ANY error (mail module absent,
     unreadable inbox, malformed JSONL) returns ``{}`` so a messaging glitch can
     never break or slow a status call.
@@ -1119,7 +1120,10 @@ def _mail_summary(owned_dispatch_ids: set[str] | None = None) -> dict:
     try:
         import goalflight_messages as _gm  # lazy: status must not hard-depend on mail
 
-        return _gm.controller_mail_summary(owned_dispatch_ids=owned_dispatch_ids)
+        return _gm.controller_mail_summary(
+            owned_dispatch_ids=owned_dispatch_ids,
+            task_store_project_root=project_root,
+        )
     except Exception:
         return {}
 
@@ -1473,13 +1477,14 @@ def main(argv: list[str] | None = None) -> int:
     # Read-side mail check: piggyback the "you have mail" signal onto the status
     # call every controller already runs. Computed fresh, fail-open, never stored.
     # Scope it to THIS controller's own dispatches (the mailbox is machine-global),
-    # using the dispatch ids already in this scoped status view.
+    # using the dispatch ids already in this scoped status view, plus the current
+    # project's task-store pseudo-inbox for resume/parallel/done nudges.
     _owned = {
         str(r.get("dispatch_id"))
         for r in payload["dispatch"].get("records", [])
         if r.get("dispatch_id")
     }
-    payload["mail"] = _mail_summary(_owned)
+    payload["mail"] = _mail_summary(_owned, project_root=project_root)
     _post_quota_advisories(payload)
 
     if args.json:
