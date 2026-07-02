@@ -104,9 +104,29 @@ def test_migrate_rejects_traversal_sources() -> None:
         assert_true("absolute source refused", "not absolute" in proc.stderr)
 
 
+def test_migrate_dry_run_json_alias_matches_harvest_shape() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        project = Path(td)
+        docs_private = project / "docs-private"
+        docs_private.mkdir(parents=True)
+        (docs_private / "tasks.jsonl").write_text("", encoding="utf-8")
+        source = project / "docs" / "open-work.md"
+        source.parent.mkdir()
+        source.write_text("# Open work\n\n- JSON preview task\n", encoding="utf-8")
+
+        proc = run_task(project, "migrate", "--source", "docs/open-work.md", "--dry-run", "--json")
+        assert_true(f"migrate dry-run json exits 0: {proc.stderr}", proc.returncode == 0)
+        payload = json.loads(proc.stdout)
+        assert_true("json alias is dry", payload["created"] == [])
+        assert_true("json alias emits candidates", payload["candidates"] == 1)
+        assert_true("json alias emits drafts", payload["drafts"][0]["title"] == "JSON preview task")
+        assert_true("json alias emits source summary", payload["source_matches"] == [{"candidates": 1, "matches": 1, "pattern": "docs/open-work.md"}])
+
+
 def main() -> None:
     test_migrate_previews_applies_and_leaves_sources_untouched()
     test_migrate_rejects_traversal_sources()
+    test_migrate_dry_run_json_alias_matches_harvest_shape()
     print("OK: migrate wrapper tests pass")
 
 

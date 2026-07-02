@@ -46,11 +46,11 @@ For bash-tail workers use `scripts/hosts/opencode/bash_tail.py`, not bare `openc
 
 Install source for project `opencode.json`: `configs/opencode/opencode.json`.
 
-## Remote bash-tail (beta)
+## Remote bash-tail
 
 Local bash-tail via the HTTP API is supported. **Remote fleet bash-tail marker
 tail** (streaming `BLOCKED:` / `USER-NEED:` markers from a worker on another
-machine) is **beta** in 1.0.0:
+machine) was introduced as a 1.0-era beta surface:
 
 - Probe-only validation: `python3 scripts/goalflight_fleet_bash_tail_probe.py`
   and `tests/python/test_fleet_bash_tail_probe.py`

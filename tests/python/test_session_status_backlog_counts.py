@@ -42,6 +42,10 @@ def run_session_status(project: Path, *args: str) -> subprocess.CompletedProcess
     )
 
 
+def message_files(project: Path) -> list[Path]:
+    return sorted(project.joinpath(".messages").glob("*.jsonl"))
+
+
 def write_active_notes(project: Path) -> None:
     docs = project / "docs-private"
     docs.mkdir(parents=True, exist_ok=True)
@@ -240,6 +244,7 @@ def test_session_status_resume_directive_active_ready_only() -> None:
             "active ready text carries resume directive",
             "resume: run python3 goalflight_task.py next -> continue the top task (t-001 Ready work)" in proc.stdout,
         )
+        assert_true("active ready posts resume nudge", len(message_files(project)) == 1)
 
         proc = run_session_status(project, "--json")
         assert_true(f"session-status json exits 0: {proc.stderr}", proc.returncode == 0)
@@ -271,6 +276,7 @@ def test_session_status_resume_directive_prints_when_inactive_ready() -> None:
             "inactive ready carries resume directive",
             "resume: run python3 goalflight_task.py next -> continue the top task (t-001 Ready but inactive)" in proc.stdout,
         )
+        assert_true("inactive ready does not post resume nudge", message_files(project) == [])
 
     with tempfile.TemporaryDirectory() as td:
         project = Path(td)

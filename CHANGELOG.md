@@ -11,8 +11,9 @@ incremented when meaningful skill behaviour changes.
 ### Added
 
 - Task-store migration flow for importing existing markdown lists as draft items,
-  including guarded `--source` harvesting, source caps, managed-state skip
-  summaries, and draft curation through the task lifecycle verbs.
+  including guarded `harvest --source` scanning, `migrate --source` previews,
+  source caps, managed-state skip summaries, `append` notes, and `pipe`
+  handoff output for queued work.
 - Loop-control verbs and readiness surfaces for continuing queued work from the
   task store, including autonomous resume guidance when ready frontier items
   exist.
@@ -24,11 +25,11 @@ incremented when meaningful skill behaviour changes.
 - **Dispatch is detached/background by default.** Direct `goalflight_dispatch.py`
   launches now return immediately after `DISPATCH-LAUNCHED` instead of blocking
   until the worker reaches a terminal state; pass the new `--foreground` flag for
-  the previous synchronous blocking behavior (scripts/tests). Not a breaking
-  change — workers still launch and land identically; only the dispatcher's
-  return timing changes, so it hot-deploys onto existing controllers. A one-line
-  stderr notice fires on the default path so un-migrated callers notice the new
-  timing. `--foreground` is mutually exclusive with `--submit` (already async).
+  the previous synchronous blocking behavior. This is an operator-visible timing
+  change: script callers that need to block until terminal status must pass
+  `--foreground`. A one-line stderr notice fires on the default path so
+  un-migrated callers notice the new timing. `--foreground` is mutually exclusive
+  with `--submit` (already async).
 - Project scaffolding now ships an empty task store by default and generates the
   dashboard mirror from an existing `docs-private/tasks.jsonl` when one is
   present.

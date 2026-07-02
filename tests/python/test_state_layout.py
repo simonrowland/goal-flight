@@ -120,6 +120,10 @@ def test_scaffold_project_state_empty_store_has_no_ready_frontier() -> None:
 
         assert_true("tasks store scaffolded empty", repo.joinpath("docs-private/tasks.jsonl").read_text(encoding="utf-8") == "")
         assert_true("dashboard mirror scaffolded empty", _dashboard_items(repo) == [])
+        for rel in ("docs-private/task-decomposition.md", "docs-private/tasks-done.md", "docs-private/bug-patterns.md", "dashboard/gf.js"):
+            text = repo.joinpath(rel).read_text(encoding="utf-8")
+            for stale_id in ("t-001", "t-002", "bp-001"):
+                assert_true(f"{rel} has no scaffold stub {stale_id}", stale_id not in text)
         assert_true("empty store created", "docs-private/tasks.jsonl" in result["created_files"])
         proc = subprocess.run(
             [sys.executable, str(ROOT / "goalflight_task.py"), "--project-root", str(repo), "next", "--json"],
@@ -132,6 +136,25 @@ def test_scaffold_project_state_empty_store_has_no_ready_frontier() -> None:
         )
         assert_true(f"next exits 0: {proc.stderr}", proc.returncode == 0)
         assert_true("fresh scaffold has no ready frontier", json.loads(proc.stdout) == [])
+
+
+def test_scaffold_project_state_corrupt_legacy_store_fails_clean() -> None:
+    with tempfile.TemporaryDirectory(prefix="gf-state-layout-corrupt-store-") as td:
+        repo = Path(td)
+        docs_private = repo / "docs-private"
+        docs_private.mkdir()
+        docs_private.joinpath("tasks.jsonl").write_text("{not-json}\n", encoding="utf-8")
+
+        try:
+            goalflight_setup.scaffold_project_state(ROOT, repo, apply=True, today="2026-06-27")
+        except Exception as exc:
+            assert_true("corrupt store reported", "invalid JSON" in str(exc))
+        else:
+            raise AssertionError("corrupt legacy store should fail scaffold")
+
+        assert_true("no dashboard dir after preflight failure", not repo.joinpath("dashboard").exists())
+        assert_true("no AGENTS after preflight failure", not repo.joinpath("AGENTS.md").exists())
+        assert_true("no tasks-data partial after failure", not repo.joinpath("dashboard/tasks-data.js").exists())
 
 
 def test_scaffold_project_state_generates_dashboard_mirror_from_legacy_store() -> None:
@@ -214,10 +237,8 @@ def test_scaffold_project_state_preserves_unmanaged_handoff_mentions() -> None:
     with tempfile.TemporaryDirectory(prefix="gf-state-layout-agents-prose-") as td:
         repo = Path(td)
         subprocess.run(["git", "init"], cwd=repo, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        repo.joinpath("AGENTS.md").write_text(
-            "Operator note: legacy docs mention handoff.md for historical context.\n",
-            encoding="utf-8",
-        )
+        original = "Operator note: legacy docs mention handoff.md for historical context.\n"
+        repo.joinpath("AGENTS.md").write_text(original, encoding="utf-8")
 
         result = goalflight_setup.scaffold_project_state(
             ROOT,
@@ -227,21 +248,22 @@ def test_scaffold_project_state_preserves_unmanaged_handoff_mentions() -> None:
         )
 
         text = repo.joinpath("AGENTS.md").read_text(encoding="utf-8")
-        assert_true("unmanaged handoff mention preserved", "handoff.md for historical context" in text)
-        assert_true("resume pin added", "RESUME-NOTES-*.md" in text)
-        assert_true("dry-run warning carried in message", "left unmanaged handoff.md mention untouched" in result["agents"]["message"])
+        assert_true("custom AGENTS unchanged", text == original)
+        assert_true("custom AGENTS not rewritten", result["agents"]["action"] == "skip")
+        assert_true("guidance emitted", "custom AGENTS.md left unchanged" in result["agents"]["message"])
+        assert_true("manual review warning carried in message", "unmanaged handoff.md mention requires manual review" in result["agents"]["message"])
 
 
 def test_scaffold_project_state_preserves_generic_living_state_prose() -> None:
     with tempfile.TemporaryDirectory(prefix="gf-state-layout-agents-living-") as td:
         repo = Path(td)
         subprocess.run(["git", "init"], cwd=repo, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        repo.joinpath("AGENTS.md").write_text(
+        original = (
             "## Living state\n"
             "\n"
-            "Operator prose says handoff.md documents old incident practice.\n",
-            encoding="utf-8",
+            "Operator prose says handoff.md documents old incident practice.\n"
         )
+        repo.joinpath("AGENTS.md").write_text(original, encoding="utf-8")
 
         result = goalflight_setup.scaffold_project_state(
             ROOT,
@@ -251,9 +273,28 @@ def test_scaffold_project_state_preserves_generic_living_state_prose() -> None:
         )
 
         text = repo.joinpath("AGENTS.md").read_text(encoding="utf-8")
-        assert_true("generic Living state prose preserved", "handoff.md documents old incident practice" in text)
-        assert_true("resume pin still added", "RESUME-NOTES-*.md" in text)
-        assert_true("manual review message emitted", "left unmanaged handoff.md mention untouched" in result["agents"]["message"])
+        assert_true("generic Living state prose unchanged", text == original)
+        assert_true("custom living prose not rewritten", result["agents"]["action"] == "skip")
+        assert_true("guidance emitted", "custom AGENTS.md left unchanged" in result["agents"]["message"])
+
+
+def test_scaffold_project_state_rejects_symlinked_state_dir() -> None:
+    with tempfile.TemporaryDirectory(prefix="gf-state-layout-symlink-") as td:
+        base = Path(td)
+        repo = base / "repo"
+        repo.mkdir()
+        outside = base / "outside-state"
+        outside.mkdir()
+        repo.joinpath("docs-private").symlink_to(outside, target_is_directory=True)
+
+        try:
+            goalflight_setup.scaffold_project_state(ROOT, repo, apply=True, today="2026-06-27")
+        except goalflight_setup.SetupError as exc:
+            assert_true("symlink rejected", "docs-private is a symlink" in str(exc))
+        else:
+            raise AssertionError("symlinked docs-private should be rejected")
+
+        assert_true("dashboard not created after symlink failure", not repo.joinpath("dashboard").exists())
 
 
 def test_scaffold_project_state_migrates_pre_v11_dashboard_index_to_root_dashboard() -> None:
@@ -507,6 +548,28 @@ def test_task_lifecycle_names_nudge_consumption_path() -> None:
     assert_true("lifecycle names task-store pseudo-inbox", "task-store:<slug>" in text)
     assert_true("lifecycle names status consumption path", "goalflight_status.py" in text)
     assert_true("lifecycle names read-side mail summary", "read-side\nmail summary" in text)
+    assert_true("lifecycle is v1.2 as-built", "AS-BUILT (v1.2)" in text)
+    assert_true("lifecycle names append verb", "`append <id> [<id> ...]" in text)
+    assert_true("lifecycle names pipe verb", "`pipe [--agent AGENT]" in text)
+    assert_true("lifecycle names harvest source", "`harvest [--dry-run] [--source GLOB]" in text)
+    assert_true("lifecycle names migrate source", "`migrate --source GLOB" in text)
+    assert_true("mirror check names both roots", "check_tasks_mirror.js docs-private dashboard" in text)
+
+
+def test_opencode_remote_bash_tail_wording_is_historical() -> None:
+    text = (ROOT / "docs/hosts/opencode.md").read_text(encoding="utf-8")
+    assert_true("opencode wording marks 1.0 as historical", "was introduced as a 1.0-era beta surface" in text)
+    assert_true("opencode wording drops present-tense 1.0 beta", "is **beta** in 1.0.0" not in text)
+
+
+def test_changelog_names_v12_task_surface_and_dispatch_timing() -> None:
+    text = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    section = text.split("## [1.2.0]", 1)[1].split("## [1.0.11]", 1)[0]
+    for phrase in ("harvest --source", "migrate --source", "`append` notes", "`pipe`"):
+        assert_true(f"changelog names {phrase}", phrase in section)
+    assert_true("changelog names operator-visible timing", "operator-visible timing\n  change" in section)
+    assert_true("changelog tells blocking callers to pass foreground", "must pass\n  `--foreground`" in section)
+    assert_true("changelog drops not-breaking claim", "Not a breaking\n  change" not in section)
 
 
 def test_doctor_state_layout_reports_exact_missing_paths() -> None:
@@ -677,11 +740,13 @@ def main() -> None:
     tests = [
         test_scaffold_project_state_is_idempotent_and_respects_existing_files,
         test_scaffold_project_state_empty_store_has_no_ready_frontier,
+        test_scaffold_project_state_corrupt_legacy_store_fails_clean,
         test_scaffold_project_state_generates_dashboard_mirror_from_legacy_store,
         test_scaffold_project_state_dry_run_makes_no_changes,
         test_scaffold_project_state_creates_backup_before_apply,
         test_scaffold_project_state_preserves_unmanaged_handoff_mentions,
         test_scaffold_project_state_preserves_generic_living_state_prose,
+        test_scaffold_project_state_rejects_symlinked_state_dir,
         test_scaffold_project_state_migrates_pre_v11_dashboard_index_to_root_dashboard,
         test_scaffold_project_state_refreshes_known_legacy_hash_with_backup,
         test_scaffold_project_state_preserves_customized_current_managed_view,
@@ -692,6 +757,8 @@ def main() -> None:
         test_loop_prompt_is_store_first,
         test_resume_command_is_store_first,
         test_task_lifecycle_names_nudge_consumption_path,
+        test_opencode_remote_bash_tail_wording_is_historical,
+        test_changelog_names_v12_task_surface_and_dispatch_timing,
         test_doctor_state_layout_reports_exact_missing_paths,
         test_doctor_state_layout_ignores_static_html_mtime,
         test_doctor_state_layout_reports_managed_view_schema_skew,

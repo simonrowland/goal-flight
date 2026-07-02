@@ -1265,6 +1265,54 @@ def test_goalflight_task_atomic_write_rejects_bad_content() -> None:
         assert_true("live pair still valid", proc.returncode == 0)
 
 
+def test_goalflight_task_refuses_symlinked_state_write_dirs() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        project = root / "project"
+        project.mkdir()
+        escaped_docs = root / "escaped-docs"
+        escaped_docs.mkdir()
+        (project / "docs-private").symlink_to(escaped_docs)
+
+        proc = run_task(project, "new", "Should not write outside")
+        assert_true("symlinked docs-private write fails", proc.returncode == 1)
+        assert_true("docs-private failure names state dir", "docs-private" in proc.stderr)
+        assert_true("docs-private failure is containment/symlink", "escapes project root" in proc.stderr or "symlink" in proc.stderr)
+        assert_true("no tasks written outside docs-private", not (escaped_docs / "tasks.jsonl").exists())
+        assert_true("no seq written outside docs-private", not (escaped_docs / ".task-seq").exists())
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        project = root / "project"
+        docs = project / "docs-private"
+        docs.mkdir(parents=True)
+        (docs / "tasks.jsonl").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "id": "t-001",
+                    "kind": "task",
+                    "title": "Seed",
+                    "blocked_by": [],
+                    "links": [],
+                    "done": False,
+                },
+                separators=(",", ":"),
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        escaped_dashboard = root / "escaped-dashboard"
+        escaped_dashboard.mkdir()
+        (project / "dashboard").symlink_to(escaped_dashboard)
+
+        proc = run_task(project, "sync")
+        assert_true("symlinked dashboard write fails", proc.returncode == 1)
+        assert_true("dashboard failure names state dir", "dashboard" in proc.stderr)
+        assert_true("dashboard failure is containment/symlink", "escapes project root" in proc.stderr or "symlink" in proc.stderr)
+        assert_true("no tasks-data written outside dashboard", not (escaped_dashboard / "tasks-data.js").exists())
+
+
 def test_goalflight_task_interrupted_publish_marker_repairs_mirror() -> None:
     with tempfile.TemporaryDirectory() as td:
         project = Path(td)
@@ -1743,6 +1791,7 @@ def main() -> None:
     test_goalflight_task_schema_version_tolerance_and_read_api()
     test_goalflight_task_append_dispatch_breadcrumbs_preserves_history()
     test_goalflight_task_atomic_write_rejects_bad_content()
+    test_goalflight_task_refuses_symlinked_state_write_dirs()
     test_goalflight_task_interrupted_publish_marker_repairs_mirror()
     test_goalflight_task_resume_history_uses_atomic_writer()
     test_goalflight_task_resume_history_filters_subset_race_under_lock()
@@ -1753,7 +1802,7 @@ def main() -> None:
     test_goalflight_task_sync_repairs_stale_mirror()
     test_goalflight_task_data_js_escapes_script_end_and_html()
     test_goalflight_task_sync_generates_markdown_views()
-    print("OK: 34 tasks mirror/task-store tests pass")
+    print("OK: 35 tasks mirror/task-store tests pass")
 
 
 if __name__ == "__main__":

@@ -5,10 +5,4 @@
 
 ## Done
 
-### t-002
-
-**Example done task — mirrors a completed chunk.**
-
-- Blocked by: [t-001](ticket.html?id=t-001)
-- Links: NORTH-STAR.md
-- Acceptance: shown in the Done section of the dashboard.
+_(none)_

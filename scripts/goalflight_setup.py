@@ -152,6 +152,22 @@ def _is_managed_state_heading(line: str) -> bool:
     return line.strip().casefold() in MANAGED_STATE_HEADINGS
 
 
+def _has_goalflight_managed_content(text: str) -> bool:
+    lower = text.casefold()
+    if "<!-- >>> goal-flight" in lower or "## goal flight routing" in lower:
+        return True
+    for line in text.splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith("## ") and _is_managed_state_heading(stripped):
+            return True
+        line_lower = line.casefold()
+        if HANDOFF_FILE_RE.search(line) and any(
+            phrase in line_lower for phrase in MANAGED_POINTER_PHRASES
+        ):
+            return True
+    return False
+
+
 def _project_agents_template(repo_root: Path, target_project: Path) -> str:
     return _template_text(
         repo_root / "templates/project-agents.md",
@@ -227,6 +243,21 @@ def _ensure_agents_state_pin(repo_root: Path, target_project: Path) -> dict[str,
         }
 
     text = agents.read_text(encoding="utf-8", errors="replace")
+    if not _has_goalflight_managed_content(text):
+        message = (
+            "custom AGENTS.md left unchanged; add the Goal Flight routing block "
+            "from templates/project-agents.md manually if this project should "
+            "carry local Goal Flight instructions"
+        )
+        if HANDOFF_FILE_RE.search(text):
+            message += "; unmanaged handoff.md mention requires manual review"
+        return {
+            "path": "AGENTS.md",
+            "action": "skip",
+            "content": None,
+            "message": message,
+        }
+
     updated = _replace_state_pointer_text(text)
     unmanaged_handoff_pointer = _has_unmanaged_handoff_pointer(text)
     lower = updated.casefold()
@@ -336,6 +367,33 @@ def _scaffold_create_order(rel_out: str) -> tuple[int, str]:
     if rel_out == "dashboard/tasks-data.js":
         return (2, rel_out)
     return (1, rel_out)
+
+
+def _validate_scaffold_state_dir(project_root: Path, path: Path) -> None:
+    rel = _relative_to_project(project_root, path)
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise SetupError(f"refusing to scaffold project state because {rel} cannot be statted safely: {exc}") from exc
+    if path.is_symlink():
+        raise SetupError(
+            f"refusing to scaffold project state because {rel} is a symlink; "
+            "move or replace it with a real directory under the project root, then rerun init"
+        )
+    if not path.is_dir():
+        raise SetupError(
+            f"refusing to scaffold project state because {rel} exists but is not a directory: {path}. "
+            "Move or rename that path, then rerun `/goal-flight init`; init only creates state directories "
+            "and never overwrites operator files."
+        )
+    try:
+        path.resolve().relative_to(project_root)
+    except ValueError as exc:
+        raise SetupError(
+            f"refusing to scaffold project state because {rel} resolves outside the project root: {path.resolve()}"
+        ) from exc
 
 
 def _sha256_file(path: Path) -> str | None:
@@ -454,20 +512,8 @@ def scaffold_project_state(
         raise SetupError(f"state skeleton missing: {skeleton}")
     docs_private = target_project / "docs-private"
     dashboard = target_project / "dashboard"
-    if docs_private.exists() and not docs_private.is_dir():
-        raise SetupError(
-            f"refusing to scaffold project state because docs-private exists but "
-            f"is not a directory: {docs_private}. Move or rename that path, then "
-            "rerun `/goal-flight init`; init only creates a docs-private directory "
-            "and never overwrites operator files."
-        )
-    if dashboard.exists() and not dashboard.is_dir():
-        raise SetupError(
-            f"refusing to scaffold project dashboard because dashboard exists but "
-            f"is not a directory: {dashboard}. Move or rename that path, then "
-            "rerun `/goal-flight init`; init only creates a dashboard directory "
-            "and never overwrites operator files."
-        )
+    _validate_scaffold_state_dir(target_project, docs_private)
+    _validate_scaffold_state_dir(target_project, dashboard)
     if today is None:
         today = datetime.now(timezone.utc).date().isoformat()
 
@@ -479,6 +525,7 @@ def scaffold_project_state(
 
     dirs = [docs_private, dashboard] + [docs_private / rel for rel in goalflight_doctor.CANONICAL_STATE_DIRS]
     for path in dirs:
+        _validate_scaffold_state_dir(target_project, path)
         rel = _relative_to_project(target_project, path) + "/"
         if path.is_dir():
             continue
@@ -547,6 +594,10 @@ def scaffold_project_state(
             f"will backfill task_ids on {len(ledger_backfill_plan)} in-flight ledger record(s) where derivable"
         )
 
+    tasks_data_js = None
+    if apply and "dashboard/tasks-data.js" in would_create_files:
+        tasks_data_js = _tasks_data_js_for_project(target_project)
+
     planned_changes = bool(
         would_create_dirs
         or would_create_files
@@ -602,7 +653,7 @@ def scaffold_project_state(
                 resume_template = repo_root / "templates/resume-notes.md"
                 _atomic_write(dest, _template_text(resume_template, {"<DATE>": today}))
             elif rel_out == "dashboard/tasks-data.js":
-                _atomic_write(dest, _tasks_data_js_for_project(target_project))
+                _atomic_write(dest, tasks_data_js if tasks_data_js is not None else _tasks_data_js_for_project(target_project))
             else:
                 rel_from_root = dest.relative_to(dashboard if rel_out.startswith("dashboard/") else docs_private)
                 source = skeleton / rel_from_root

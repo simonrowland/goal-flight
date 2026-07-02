@@ -82,6 +82,34 @@ def make_stub(tmp: Path) -> tuple[Path, Path]:
     return stub, log
 
 
+def make_failing_stub(tmp: Path) -> tuple[Path, Path]:
+    log = tmp / "dispatch-failing-calls.jsonl"
+    stub = tmp / "dispatch-failing-stub.py"
+    stub.write_text(
+        textwrap.dedent(
+            f"""\
+            #!/usr/bin/env python3
+            import json
+            import sys
+            from pathlib import Path
+
+            Path({str(log)!r}).parent.mkdir(parents=True, exist_ok=True)
+            with Path({str(log)!r}).open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(sys.argv[1:]) + "\\n")
+            if sys.argv[1:2] == ["drain"]:
+                print("DRAIN should not run")
+                raise SystemExit(0)
+            print("dispatch stdout before failure")
+            print("dispatch stderr before failure", file=sys.stderr)
+            raise SystemExit(7)
+            """
+        ),
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+    return stub, log
+
+
 def read_calls(log: Path) -> list[list[str]]:
     if not log.exists():
         return []
@@ -171,9 +199,57 @@ def test_pipe_submits_with_task_linkage_and_one_drain() -> None:
         assert_true("inline prompt submitted", second_call[second_call.index("--prompt") + 1] == "inline prompt")
 
 
+def test_prompt_path_reads_are_project_contained() -> None:
+    cases = [
+        ("absolute outside", lambda root, project, prompts: root / "outside.md", "resolves outside project root"),
+        ("dot-dot outside", lambda root, project, prompts: Path("../outside.md"), "contains '..' component"),
+        ("symlink path", lambda root, project, prompts: prompts / "link.md", "refusing to open non-regular file"),
+    ]
+    for name, path_factory, expected in cases:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            project = root / "project"
+            prompts = project / "docs-private" / "prompts"
+            prompts.mkdir(parents=True)
+            (root / "outside.md").write_text("outside prompt\n", encoding="utf-8")
+            (prompts / "inside.md").write_text("inside prompt\n", encoding="utf-8")
+            (prompts / "link.md").symlink_to(prompts / "inside.md")
+            prompt_path = path_factory(root, project, prompts)
+            item_id = run_task(project, "new", f"Prompt path {name}", "--prompt-path", str(prompt_path), "--by", "tester").stdout.strip()
+
+            proc = run_task(project, "show", item_id, "--prompt")
+            assert_true(f"show rejects {name}", proc.returncode == 1)
+            assert_true(f"show reports {name}", expected in proc.stderr)
+
+            proc = run_task(project, "pipe", "--dry-run")
+            assert_true(f"pipe rejects {name}", proc.returncode == 1)
+            assert_true(f"pipe reports {name}", expected in proc.stderr)
+
+
+def test_pipe_json_emits_summary_on_dispatch_failure() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        project = tmp / "project"
+        prompt = project / "docs-private" / "prompts" / "first.md"
+        prompt.parent.mkdir(parents=True)
+        prompt.write_text("first prompt\n", encoding="utf-8")
+        item_id = run_task(project, "new", "Prompt path task", "--prompt-path", "docs-private/prompts/first.md", "--by", "tester").stdout.strip()
+        stub, log = make_failing_stub(tmp)
+
+        proc = run_task(project, "pipe", "--json", env={"GOALFLIGHT_TASK_PIPE_DISPATCH": str(stub)})
+        assert_true("pipe returns failing dispatch code", proc.returncode == 7)
+        payload = json.loads(proc.stdout)
+        assert_true("json summary includes piped item", payload["piped"][0]["id"] == item_id)
+        assert_true("json summary includes failure result", payload["results"] == [{"id": item_id, "returncode": 7}])
+        assert_true("child stdout moved to stderr for json", "dispatch stdout before failure" in proc.stderr)
+        assert_true("drain not attempted after submit failure", all(call[:1] != ["drain"] for call in read_calls(log)))
+
+
 def main() -> None:
     test_pipe_dry_run_and_no_prompt_exclusion()
     test_pipe_submits_with_task_linkage_and_one_drain()
+    test_prompt_path_reads_are_project_contained()
+    test_pipe_json_emits_summary_on_dispatch_failure()
     print("OK: store pipe tests pass")
 
 

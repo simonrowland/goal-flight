@@ -1,6 +1,6 @@
 # Task Lifecycle (machine-owned status + id allocation)
 
-> **STATUS: SHIPPED / AS-BUILT (v1.1).** `goalflight_task.py`, the `--task`
+> **STATUS: SHIPPED / AS-BUILT (v1.2).** `goalflight_task.py`, the `--task`
 > flag, `tasks.jsonl`, `.task-seq`, `tasks-data.js`, markdown snapshots, and
 > mirror checks are built. Use the helper as the writer; generated docket views
 > are not hand-maintained.
@@ -31,7 +31,7 @@ markdown snapshots (`task-decomposition.md`, `tasks-done.md`, `bug-backlog.md`,
 "filter-view on one json" -> one json, filter-views* — so cross-kind blockers
 are trivial (below).
 
-`goal-queue-*.md` remains execution plumbing for v1.1. It is not migrated into,
+`goal-queue-*.md` remains execution plumbing for v1.2. It is not migrated into,
 or generated from, `tasks.jsonl`; worker-queued state is derived from dispatch
 breadcrumbs and project-scoped ledger rows. A task or bug that needs a worker
 fix carries its briefing in `prompt` / `prompt_path` and dispatches via
@@ -202,13 +202,15 @@ mirror.
 - `block <id> --on <id>` / `unblock <id> [--on <id>]`
 - `done <id> [--resolution R] [--force]` -> mark DONE / awaiting-review
 - `review <id> --verdict clean|findings --dispatch D [--findings F] [--bug "..."]` -> append review breadcrumb and capture review bugs
+- `append <id> [<id> ...] "<note>" [--json]` -> append an audit note to one or more items
 - `accept <id>` -> require latest clean review, then mark DONE-REVIEWED
 - `list [outstanding|awaiting-review|working|waiting|delegated|done-reviewed] [--since T] [--kind K] [--blocked-by ID] [--tag TAG] [--json]`
 - `status [--json]` -> print derived status rows
 - `sync` -> write `tasks-data.js` plus markdown snapshots from the store and project dispatch ledger
-- `harvest [--dry-run] [--source GLOB] [--no-history] [--json]` -> draft open work from RESUME-NOTES/review/source files
+- `harvest [--dry-run] [--source GLOB] [--no-history] [--kind K] [--lane L] [--json]` -> draft open work from RESUME-NOTES/review/source files
 - `migrate --source GLOB [--kind K] [--lane L] [--apply]` -> preview/apply harvest from existing markdown lists
-- check: `node scripts/check_tasks_mirror.js docs-private` validates mirror parity; `goalflight_task.py` runs it on writes.
+- `pipe [--agent AGENT] [--dry-run] [--json]` -> emit queue-ready task prompts for worker dispatch
+- check: `node scripts/check_tasks_mirror.js docs-private dashboard` validates mirror parity; `goalflight_task.py` runs it on writes.
 
 Importable Python read API (any agent, no grep):
 
@@ -247,13 +249,14 @@ review transition goes through `goalflight_task.py`. That buys three things:
    so the browser mirror can't fall out of sync (the mirror test becomes a backstop
    for a rare hand-edit, not the primary guard).
 
-Built mutation verbs: `new`, `block`, `unblock`, `done`, `review`, `accept`,
-`harvest`, and `sync`. Built read/query verbs: `show`, `list`, `status`, plus
-the importable Python read API above. There is no `edit`, `close`, `reopen`,
-`tag`, `link`, or `archive` CLI surface in v1.1.
+Built mutation verbs: `new`, `capture`, `block`, `unblock`, `lane`, `append`,
+`done`, `review`, `harvest`, `migrate`, `accept`, and `sync`. Built read/query
+verbs: `show`, `list`, `next`, `pipe`, `status`, plus the importable Python read
+API above. There is no `edit`, `close`, `reopen`, `tag`, `link`, or `archive`
+CLI surface in v1.2.
 
 ## As-built scope
 
-The v1.1 docket/helper surface above is built. Future work belongs in
+The v1.2 docket/helper surface above is built. Future work belongs in
 `docs-private/tasks.jsonl` and the generated snapshots; do not duplicate a
 build-task list here.

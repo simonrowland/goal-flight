@@ -5,12 +5,7 @@
 
 ## To do
 
-### t-001
-
-**Example open task — replace with your first real chunk.**
-
-- Status: to do
-- Acceptance: this stub is overwritten by a real task during init/decompose.
+_(none)_
 
 ## In progress
 

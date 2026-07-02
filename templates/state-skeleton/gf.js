@@ -361,7 +361,7 @@
     return m ? parseInt(m[1], 10) : 0;
   }
 
-  // Full alphabetic prefix of an id (e.g. 'bp' for 'bp-001', 'b' for 'b-001',
+  // Full alphabetic prefix of an id (e.g. 'bp' for 'bp-100', 'b' for 'b-100',
   // 'ADR' for 'ADR-002'). Used so distinct prefixes never collapse in id-sort.
   function idPrefix(id) {
     var m = /^([A-Za-z]+)/.exec(id || "");
@@ -384,7 +384,7 @@
       });
     } else {
       // id (alpha prefix, then numeric within prefix, then full-id fallback so
-      // distinct ids sharing a prefix+number — e.g. b-001 vs bp-001 — order
+      // distinct ids sharing a prefix+number — e.g. b-100 vs bp-100 — order
       // deterministically rather than by input order)
       arr.sort(function (a, b) {
         return idPrefix(a.id).localeCompare(idPrefix(b.id)) ||

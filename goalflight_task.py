@@ -45,9 +45,11 @@ FAMILY_PREFIX_BY_KIND = {"task": "t", "bug": "b", "decision": "q"}
 VALID_FAMILIES = {"t", "b", "q", "ADR"}
 TASK_DISPATCH_STATES = {"working", "worker-finished", "worker-failed"}
 ITEM_ID_RE = re.compile(r"\b((?:ADR|bp|[tbq])-\d+)\b", re.IGNORECASE)
-RESUME_NOTES_RE = re.compile(r"^RESUME-NOTES-(\d{4}-\d{2}-\d{2})(?:-rev(\d+))?\.md$")
+RESUME_NOTES_RE = re.compile(r"^RESUME-NOTES-(\d{4}-\d{2}-\d{2})(?:-rev(\d+))?\.md$", re.IGNORECASE)
 REVIEW_SEVERITY = {"P0": "critical", "P1": "high", "P2": "medium", "P3": "low"}
 HARVEST_DRAFT_TAGS = ("draft", "harvest")
+HARVEST_SOURCE_SECTION_RE = re.compile(r"\b(tasks?|backlogs?|actions?|to-?dos?|open|next)\b", re.IGNORECASE)
+HARVEST_METADATA_KEYS = {"id", "title", "priority", "status", "source", "evidence"}
 HARVEST_MANAGED_SOURCE_NAMES = {
     "task-decomposition.md",
     "tasks-done.md",
@@ -197,6 +199,36 @@ def require_regular_or_absent(path: Path) -> bool:
 def require_regular_file(path: Path) -> None:
     if not require_regular_or_absent(path):
         raise TaskError(f"{path}: missing required regular file")
+
+
+def _path_has_symlink_component(path: Path, *, base: Path | None = None) -> Path | None:
+    if base is not None:
+        try:
+            rel = path.relative_to(base)
+        except ValueError:
+            rel = path.resolve(strict=False).relative_to(base.resolve(strict=False))
+        current = base
+        parts = rel.parts
+    else:
+        current = Path(path.anchor) if path.is_absolute() else Path()
+        parts = path.parts[1:] if path.is_absolute() else path.parts
+    for part in parts:
+        current = current / part
+        try:
+            st = os.lstat(current)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise TaskError(f"{current}: cannot stat safely before open: {exc}") from exc
+        if stat.S_ISLNK(st.st_mode):
+            return current
+    return None
+
+
+def _require_no_symlink_components(path: Path, *, base: Path | None = None) -> None:
+    symlink = _path_has_symlink_component(path, base=base)
+    if symlink is not None:
+        raise TaskError(f"{symlink}: refusing symlink path component")
 
 
 class FileLock:
@@ -451,12 +483,63 @@ def _harvest_has_placeholder(value: Any) -> bool:
     return False
 
 
+def _is_harvest_metadata_bullet(value: str) -> bool:
+    match = re.match(r"^\s*([A-Za-z][A-Za-z0-9_-]*)\s*:\s+(\S.*)$", value)
+    if not match or match.group(1).lower() not in HARVEST_METADATA_KEYS:
+        return False
+    # A short field value ("status: open", "priority: P1", "id: t-5") is
+    # metadata; a real task that happens to begin with a metadata keyword
+    # ("Status: fix the login flow") has a sentence value and MUST NOT be
+    # dropped — silent-false-negative guard (SC-15). Bias toward keeping:
+    # only skip when the value reads like a bare field, not an action.
+    return len(match.group(2).split()) <= 3
+
+
+def _heading_allows_harvest_bullets(value: str) -> bool:
+    return HARVEST_SOURCE_SECTION_RE.search(_clean_markdown_title(value)) is not None
+
+
+def _harvest_list_item_at(lines: list[str], index: int) -> tuple[str, int] | None:
+    match = re.match(r"^\s*(?:[-*]\s+|\d+[.)]\s+)(?:\[[ xX]\]\s+)?(.+?)\s*$", lines[index])
+    if not match:
+        return None
+    parts = [match.group(1).strip()]
+    next_index = index + 1
+    while next_index < len(lines):
+        line = lines[next_index]
+        if not line.strip():
+            break
+        if re.match(r"^\s*(?:[-*]\s+|\d+[.)]\s+)(?:\[[ xX]\]\s+)?", line):
+            break
+        if re.match(r"^#{1,6}\s+", line):
+            break
+        if re.match(r"^\s*\|", line):
+            break
+        if line.startswith("\t") or re.match(r"^\s{2,}\S", line):
+            parts.append(line.strip())
+            next_index += 1
+            continue
+        break
+    return " ".join(parts), next_index
+
+
 def _is_top_level_state_source(path: Path, name: str | None = None) -> bool:
-    return path.parent.name in {"docs-private", "dashboard"} and (name is None or path.name == name)
+    parent = path.parent.name.lower()
+    path_name = path.name.lower()
+    expected = name.lower() if name is not None else None
+    return parent in {"docs-private", "dashboard"} and (expected is None or path_name == expected)
 
 
 def _is_managed_harvest_source(path: Path) -> bool:
-    return _is_top_level_state_source(path) and path.name in HARVEST_MANAGED_SOURCE_NAMES
+    return _is_top_level_state_source(path) and path.name.lower() in HARVEST_MANAGED_SOURCE_NAMES
+
+
+def _is_under_state_root(path: Path) -> bool:
+    return any(part.lower() in {"docs-private", "dashboard"} for part in path.parts)
+
+
+def _has_resume_notes_component(path: Path) -> bool:
+    return any(RESUME_NOTES_RE.match(part) for part in path.parts)
 
 
 def _history_has_source(text: str, rel: str) -> bool:
@@ -482,11 +565,11 @@ def _matches_state_skeleton_stub(path: Path, text: str) -> bool:
 
 
 def _harvest_source_skip_reason(path: Path, text: str, *, manual_source: bool = False) -> str | None:
-    if manual_source and _is_top_level_state_source(path) and RESUME_NOTES_RE.match(path.name):
+    if manual_source and _is_under_state_root(path) and _has_resume_notes_component(path):
         return "managed RESUME-NOTES state file"
     if _is_managed_harvest_source(path):
         return "managed state source"
-    if _is_top_level_state_source(path, "bug-backlog.md") and HARVEST_GENERATED_HEADER in text:
+    if _is_under_state_root(path) and HARVEST_GENERATED_HEADER in text:
         return "generated state source"
     if _matches_state_skeleton_stub(path, text):
         return "state skeleton stub"
@@ -515,6 +598,29 @@ def _rel_source(project_root: Path, path: Path, line: int | None = None) -> str:
     if line is not None and line > 0:
         return f"{text}:{line}"
     return text
+
+
+def _resolve_item_prompt_path(
+    store: "TaskStore",
+    prompt_path: str,
+    *,
+    item_id: str,
+    require_exists: bool = True,
+) -> Path:
+    raw = Path(prompt_path).expanduser()
+    if ".." in raw.parts:
+        raise TaskError(f"{item_id}: prompt_path {prompt_path!r} contains '..' component")
+    root = store.project_root.resolve(strict=False)
+    candidate = raw if raw.is_absolute() else store.project_root / raw
+    resolved = candidate.resolve(strict=False)
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise TaskError(f"{item_id}: prompt_path {prompt_path!r} resolves outside project root") from exc
+    _require_no_symlink_components(candidate, base=store.project_root)
+    if require_exists:
+        require_regular_file(candidate)
+    return resolved
 
 
 def _section_rows(rows: list[dict[str, Any]], section: str) -> list[dict[str, Any]]:
@@ -962,9 +1068,29 @@ class TaskStore:
         self.publish_marker_path = self.docs_dir / ".tasks-publish-incomplete.json"
         self.log_dir = self.docs_dir / "log"
 
+    def _require_state_dir_safe(self, path: Path, label: str) -> None:
+        root = self.project_root.resolve(strict=False)
+        resolved = path.resolve(strict=False)
+        try:
+            resolved.relative_to(root)
+        except ValueError as exc:
+            raise TaskError(f"{label}: resolved state directory escapes project root: {resolved}") from exc
+        _require_no_symlink_components(path, base=self.project_root)
+
+    def _ensure_docs_dir_for_write(self) -> None:
+        self._require_state_dir_safe(self.docs_dir, "docs-private")
+        self.docs_dir.mkdir(parents=True, exist_ok=True)
+        self._require_state_dir_safe(self.docs_dir, "docs-private")
+
+    def _ensure_state_dirs_for_write(self) -> None:
+        self._ensure_docs_dir_for_write()
+        self._require_state_dir_safe(self.dashboard_dir, "dashboard")
+        self.dashboard_dir.mkdir(parents=True, exist_ok=True)
+        self._require_state_dir_safe(self.dashboard_dir, "dashboard")
+
     @contextlib.contextmanager
     def store_lock(self):
-        self.docs_dir.mkdir(parents=True, exist_ok=True)
+        self._ensure_docs_dir_for_write()
         with FileLock(self.store_lock_path):
             yield
 
@@ -980,7 +1106,7 @@ class TaskStore:
     def reserve_id(self, family: str) -> str:
         if family not in VALID_FAMILIES:
             raise TaskError(f"unknown id family {family!r}; expected one of {', '.join(sorted(VALID_FAMILIES))}")
-        self.docs_dir.mkdir(parents=True, exist_ok=True)
+        self._ensure_docs_dir_for_write()
         with FileLock(self.seq_lock_path):
             seq = self._read_seq()
             current = max(int(seq.get(family, 0)), self._max_existing_sequence(family))
@@ -1034,8 +1160,7 @@ class TaskStore:
             return result
 
     def save_items_atomic(self, items: list[dict[str, Any]]) -> None:
-        self.docs_dir.mkdir(parents=True, exist_ok=True)
-        self.dashboard_dir.mkdir(parents=True, exist_ok=True)
+        self._ensure_state_dirs_for_write()
         _validate_items_for_write(items)
         staging = Path(tempfile.mkdtemp(prefix=".tasks-stage-", dir=str(self.docs_dir)))
         try:
@@ -1132,7 +1257,7 @@ class TaskStore:
             raise TaskError(f"{self.publish_marker_path}: interrupted task publish cannot recover because tasks.jsonl is missing")
         items, _ = _parse_jsonl(self.tasks_path)
         _validate_items_for_write(items)
-        self.dashboard_dir.mkdir(parents=True, exist_ok=True)
+        self._ensure_state_dirs_for_write()
         staging = Path(tempfile.mkdtemp(prefix=".tasks-repair-", dir=str(self.docs_dir)))
         try:
             self._write_staged_generation(staging, items)
@@ -1561,6 +1686,7 @@ def _harvest_heading_blocks(
     default_kind: str,
     source_type: str,
     lane: str | None = None,
+    all_bullets: bool = True,
 ) -> list[dict[str, Any]]:
     if not require_regular_or_absent(path):
         return []
@@ -1593,23 +1719,47 @@ def _harvest_heading_blocks(
     if _skip_harvest_source(path, text):
         return []
     lines = text.splitlines()
-    for lineno, line in enumerate(lines, start=1):
+    heading_stack: list[tuple[int, bool]] = []
+    active_bullet_section = all_bullets
+    skip_until_line = 0
+    for index, line in enumerate(lines):
+        lineno = index + 1
+        if lineno < skip_until_line:
+            continue
+        generic_heading = re.match(r"^(#{1,6})\s+(.+?)\s*$", line)
+        if generic_heading:
+            level = len(generic_heading.group(1))
+            heading_stack = [(prior_level, allowed) for prior_level, allowed in heading_stack if prior_level < level]
+            heading_stack.append((level, _heading_allows_harvest_bullets(generic_heading.group(2))))
+            active_bullet_section = all_bullets or any(allowed for _, allowed in heading_stack)
         heading = re.match(r"^#{2,6}\s+((?:ADR|bp|[tbq])-\d+)\b(?:\s+(.+))?", line, re.IGNORECASE)
         if heading:
             flush()
-            current = {
-                "ref": heading.group(1),
-                "heading": heading.group(2) or heading.group(1),
-                "line": lineno,
-            }
+            current = (
+                {
+                    "ref": heading.group(1),
+                    "heading": heading.group(2) or heading.group(1),
+                    "line": lineno,
+                }
+                if active_bullet_section
+                else None
+            )
             continue
         if current is None:
-            list_item = re.match(r"^\s*(?:[-*]\s+|\d+[.)]\s+)(?:\[[ xX]\]\s+)?(.+?)\s*$", line)
-            if list_item and "Status:" not in list_item.group(1) and not _harvest_has_placeholder(list_item.group(1)):
+            list_item = _harvest_list_item_at(lines, index)
+            if not list_item:
+                continue
+            text, next_index = list_item
+            skip_until_line = next_index + 1
+            if (
+                active_bullet_section
+                and not _is_harvest_metadata_bullet(text)
+                and not _harvest_has_placeholder(text)
+            ):
                 candidate = _harvest_candidate(
                     store,
                     kind=default_kind,
-                    title=list_item.group(1),
+                    title=text,
                     source_path=path,
                     source_type=source_type,
                     line=lineno,
@@ -1784,18 +1934,23 @@ def _collect_harvest_candidates(
     source_kind: str = "task",
     source_lane: str | None = None,
     source_limit: int | None = DEFAULT_SOURCE_LIMIT,
+    all_bullets: bool = False,
+    no_implicit_resume: bool = False,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     candidates: list[dict[str, Any]] = []
     source_matches: list[dict[str, Any]] = []
-    bug_paths = [
-        store.docs_dir / "bug-backlog.md",
-        *store.docs_dir.glob("bug-pattern*.md"),
-        *store.docs_dir.glob("bug-patterns/*.md"),
-    ]
-    for path in sorted(bug_paths):
-        candidates.extend(_harvest_heading_blocks(store, path, default_kind="bug", source_type="bug-backlog"))
-    candidates.extend(_harvest_review_candidates(store))
-    candidates.extend(_harvest_resume_candidates(store))
+    explicit_sources = bool(source_patterns)
+    if not explicit_sources:
+        bug_paths = [
+            store.docs_dir / "bug-backlog.md",
+            *store.docs_dir.glob("bug-pattern*.md"),
+            *store.docs_dir.glob("bug-patterns/*.md"),
+        ]
+        for path in sorted(bug_paths):
+            candidates.extend(_harvest_heading_blocks(store, path, default_kind="bug", source_type="bug-backlog"))
+        candidates.extend(_harvest_review_candidates(store))
+        if not no_implicit_resume:
+            candidates.extend(_harvest_resume_candidates(store))
     for pattern in source_patterns or []:
         paths, summary = _resolve_harvest_source_paths(store, pattern, source_limit=source_limit)
         before = len(candidates)
@@ -1816,6 +1971,7 @@ def _collect_harvest_candidates(
                     default_kind=source_kind,
                     source_type="manual-source",
                     lane=source_lane,
+                    all_bullets=all_bullets,
                 )
             )
         summary["candidates"] = len(candidates) - before
@@ -2045,10 +2201,7 @@ def _cmd_show(store: TaskStore, args: argparse.Namespace) -> int:
             return 0
         prompt_path = item.get("prompt_path")
         if isinstance(prompt_path, str) and prompt_path:
-            path = Path(prompt_path)
-            if not path.is_absolute():
-                path = store.project_root / path
-            require_regular_file(path)
+            path = _resolve_item_prompt_path(store, prompt_path, item_id=str(item.get("id") or args.item_id))
             print(path.read_text(encoding="utf-8"), end="")
             return 0
         raise TaskError(f"{args.item_id}: no prompt or prompt_path")
@@ -2274,6 +2427,8 @@ def _cmd_harvest(store: TaskStore, args: argparse.Namespace) -> int:
         source_kind=args.kind,
         source_lane=args.lane if args.sources else None,
         source_limit=getattr(args, "source_limit", DEFAULT_SOURCE_LIMIT),
+        all_bullets=getattr(args, "all_bullets", False),
+        no_implicit_resume=getattr(args, "no_implicit_resume", False),
     )
     if args.dry_run:
         payload = {
@@ -2298,7 +2453,7 @@ def _cmd_harvest(store: TaskStore, args: argparse.Namespace) -> int:
         return _add_harvest_candidates(store, items, actor, candidates)
 
     result = store.mutate_items(update, allow_invalid_live_mirror=True)
-    result["history_added"] = [] if args.no_history else _append_resume_history(store, actor)
+    result["history_added"] = [] if args.no_history or args.sources else _append_resume_history(store, actor)
     if getattr(args, "sources", None):
         # Keep the legacy no-source JSON shape byte-stable for existing consumers.
         result["source_matches"] = source_matches
@@ -2320,6 +2475,8 @@ def _run_harvest_json(store: TaskStore, args: argparse.Namespace, *, dry_run: bo
         no_history=getattr(args, "no_history", False),
         sources=LIST_TYPE(args.sources),
         source_limit=getattr(args, "source_limit", DEFAULT_SOURCE_LIMIT),
+        all_bullets=getattr(args, "all_bullets", False),
+        no_implicit_resume=getattr(args, "no_implicit_resume", False),
     )
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
@@ -2403,7 +2560,16 @@ def _print_migrate_preview(payload: dict[str, Any]) -> None:
 def _cmd_migrate(store: TaskStore, args: argparse.Namespace) -> int:
     if not args.sources:
         raise TaskError("migrate requires at least one --source <glob>")
+    if getattr(args, "dry_run", False) and args.apply:
+        raise TaskError("migrate --dry-run cannot be combined with --apply")
     preview = _run_harvest_json(store, args, dry_run=True)
+    if getattr(args, "json", False) and not args.apply:
+        print(json.dumps(preview, ensure_ascii=False, sort_keys=True))
+        return 0
+    if getattr(args, "json", False) and args.apply:
+        result = _run_harvest_json(store, args, dry_run=False)
+        print(json.dumps({"apply": result, "preview": preview}, ensure_ascii=False, sort_keys=True))
+        return 0
     _print_migrate_preview(preview)
     if not args.apply:
         print("NO CHANGES: re-run with --apply to create harvest draft items")
@@ -2560,7 +2726,7 @@ def _post_next_nudge(rows: list[dict[str, Any]], project_root: Path) -> None:
 
 def _continue_directive(store: TaskStore, row: dict[str, Any]) -> str:
     title = str(row.get("title") or "").strip().replace("\n", " ")
-    prompt_path = _pipe_prompt_path(store, row)
+    prompt_path = _pipe_prompt_path(store, row, require_exists=False)
     prompt_ref = str(prompt_path) if prompt_path is not None else "-"
     return f"CONTINUE: {row['id']} {title} (prompt: {prompt_ref})"
 
@@ -2609,14 +2775,16 @@ def _cmd_next(store: TaskStore, args: argparse.Namespace) -> int:
     return 0
 
 
-def _pipe_prompt_path(store: TaskStore, row: dict[str, Any]) -> Path | None:
+def _pipe_prompt_path(store: TaskStore, row: dict[str, Any], *, require_exists: bool = True) -> Path | None:
     prompt_path = row.get("prompt_path")
     if not isinstance(prompt_path, str) or not prompt_path:
         return None
-    path = Path(prompt_path).expanduser()
-    if not path.is_absolute():
-        path = store.project_root / path
-    return path
+    return _resolve_item_prompt_path(
+        store,
+        prompt_path,
+        item_id=str(row.get("id") or "(unknown)"),
+        require_exists=require_exists,
+    )
 
 
 def _pipe_dispatch_cmd(
@@ -2661,6 +2829,13 @@ def _run_pipe_child(cmd: list[str], *, cwd: Path) -> subprocess.CompletedProcess
     )
 
 
+def _emit_pipe_child_output(proc: subprocess.CompletedProcess[str], *, json_mode: bool) -> None:
+    if proc.stdout:
+        print(proc.stdout, end="", file=sys.stderr if json_mode else sys.stdout)
+    if proc.stderr:
+        print(proc.stderr, end="", file=sys.stderr)
+
+
 def _cmd_pipe(store: TaskStore, args: argparse.Namespace) -> int:
     rows = store.next_frontier()
     dispatch_program = Path(
@@ -2692,6 +2867,7 @@ def _cmd_pipe(store: TaskStore, args: argparse.Namespace) -> int:
 
     results: list[dict[str, Any]] = []
     piped_by_id = {entry["id"]: entry for entry in piped}
+    exit_code = 0
     for row in rows:
         item_id = str(row["id"])
         entry = piped_by_id.get(item_id)
@@ -2707,24 +2883,19 @@ def _cmd_pipe(store: TaskStore, args: argparse.Namespace) -> int:
         proc = _run_pipe_child(cmd, cwd=ROOT)
         results.append({"id": item_id, "returncode": proc.returncode})
         if proc.returncode != 0:
-            if proc.stdout:
-                print(proc.stdout, end="")
-            if proc.stderr:
-                print(proc.stderr, end="", file=sys.stderr)
-            return proc.returncode
+            _emit_pipe_child_output(proc, json_mode=args.json)
+            exit_code = proc.returncode
+            break
 
-    if piped:
+    if piped and exit_code == 0:
         proc = _run_pipe_child(
             [sys.executable, str(dispatch_program), "drain", "--limit", "1"],
             cwd=ROOT,
         )
         results.append({"drain": True, "returncode": proc.returncode})
         if proc.returncode != 0:
-            if proc.stdout:
-                print(proc.stdout, end="")
-            if proc.stderr:
-                print(proc.stderr, end="", file=sys.stderr)
-            return proc.returncode
+            _emit_pipe_child_output(proc, json_mode=args.json)
+            exit_code = proc.returncode
 
     if args.json:
         print(json.dumps({"piped": piped, "skipped": skipped, "results": results}, ensure_ascii=False, sort_keys=True))
@@ -2734,8 +2905,11 @@ def _cmd_pipe(store: TaskStore, args: argparse.Namespace) -> int:
         for entry in skipped:
             print(f"{entry['id']} not piped ({entry['reason']})")
         if piped:
-            print("drain pass requested")
-    return 0
+            if exit_code == 0:
+                print("drain pass completed")
+            else:
+                print(f"pipe stopped after recoverable dispatch/drain failure (exit {exit_code})")
+    return exit_code
 
 
 def _cmd_status(store: TaskStore, args: argparse.Namespace) -> int:
@@ -2985,6 +3159,8 @@ def build_parser() -> argparse.ArgumentParser:
     harvest.add_argument("--kind", choices=["task", "bug", "decision"], default="task", help="Default kind for items from --source files.")
     harvest.add_argument("--lane", default="deferred", help="Lane stamped on items from --source files.")
     harvest.add_argument("--source-limit", type=int, default=DEFAULT_SOURCE_LIMIT, help=f"Maximum files consumed per --source glob before reporting dropped matches (default: {DEFAULT_SOURCE_LIMIT}).")
+    harvest.add_argument("--all-bullets", action="store_true", help="Harvest bullets from any section in --source files instead of only task/backlog/action/TODO/open/next sections.")
+    harvest.add_argument("--no-implicit-resume", action="store_true", help="Skip implicit RESUME-NOTES candidates during built-in harvest.")
     harvest.add_argument("--json", action="store_true")
     harvest.set_defaults(func=_cmd_harvest)
 
@@ -3011,6 +3187,10 @@ def build_parser() -> argparse.ArgumentParser:
     migrate.add_argument("--lane", default="deferred")
     migrate.add_argument("--source-limit", type=int, default=DEFAULT_SOURCE_LIMIT, help=f"Maximum files consumed per --source glob before reporting dropped matches (default: {DEFAULT_SOURCE_LIMIT}).")
     migrate.add_argument("--no-history", action="store_true", help="Pass through to harvest; skip RESUME-NOTES history backfill.")
+    migrate.add_argument("--all-bullets", action="store_true", help="Pass through to harvest; include bullets outside task/backlog/action/TODO/open/next sections.")
+    migrate.add_argument("--no-implicit-resume", action="store_true", help="Pass through to harvest; skip implicit RESUME-NOTES candidates.")
+    migrate.add_argument("--dry-run", action="store_true", help="Alias for the default preview mode; combine with --json for harvest-shaped JSON preview.")
+    migrate.add_argument("--json", action="store_true", help="Print harvest-shaped JSON for preview, or preview/apply JSON with --apply.")
     migrate.add_argument("--apply", action="store_true", help="Create draft items after the preview.")
     migrate.set_defaults(func=_cmd_migrate)
 

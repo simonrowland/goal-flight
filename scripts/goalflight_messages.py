@@ -516,7 +516,8 @@ def format_controller_relay(aggregate: dict) -> str | None:
 
 
 def _clip(text: object, limit: int = 100) -> str:
-    s = str(text or "").strip().replace("\n", " ")
+    s = "".join(" " if ord(ch) < 32 or ord(ch) == 127 else ch for ch in str(text or ""))
+    s = " ".join(s.split())
     return s if len(s) <= limit else s[: limit - 3] + "..."
 
 

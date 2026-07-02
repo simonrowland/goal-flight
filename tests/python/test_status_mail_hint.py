@@ -105,6 +105,25 @@ def test_open_user_need_surfaces_hint_with_detail() -> None:
     assert_true("hint shows the dispatch id", "worker-7" in hint)
 
 
+def test_mail_hint_strips_control_chars() -> None:
+    def body(msgs, fleet):
+        M.post_message(
+            dispatch_id="worker-esc",
+            msg_type="user_need",
+            payload={"text": "needs\x1b[31m review\rnow\nplease"},
+            messages_dir=msgs,
+        )
+        return S._mail_summary({"worker-esc"})
+
+    out = _with_mail_dirs(body)
+    text = out["needs"][0]["text"]
+    hint = out["hint"]
+    for bad in ("\x1b", "\r"):
+        assert_true("need text strips C0 controls", bad not in text)
+        assert_true("hint strips C0 controls", bad not in hint)
+    assert_true("escaped bracket text remains inert", "[31m review now please" in hint)
+
+
 def test_ownership_filter_excludes_other_controllers_workers() -> None:
     # The mailbox is machine-global; a controller must only see needs from ITS own
     # dispatches. A need from a dispatch this controller doesn't own is filtered out.
@@ -287,6 +306,7 @@ def main() -> None:
     tests = [
         test_no_mail_empty_summary,
         test_open_user_need_surfaces_hint_with_detail,
+        test_mail_hint_strips_control_chars,
         test_ownership_filter_excludes_other_controllers_workers,
         test_task_store_inbox_id_agrees_between_worktree_and_main_root,
         test_scoped_status_mail_includes_project_task_store_nudge,

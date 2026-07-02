@@ -57,6 +57,12 @@ def _write_items(project: Path, items: list[dict]) -> None:
     )
 
 
+def _write_active_notes(project: Path) -> None:
+    docs = project / "docs-private"
+    docs.mkdir(parents=True, exist_ok=True)
+    docs.joinpath("RESUME-NOTES-2026-07-02.md").write_text("---\nstate: active\n---\n", encoding="utf-8")
+
+
 def _env(tmp: Path) -> dict[str, str]:
     env = os.environ.copy()
     env["GOALFLIGHT_MESSAGES_DIR"] = str(tmp / "messages")
@@ -153,6 +159,7 @@ def test_resume_nudge_posts_on_text_only_and_coalesces() -> None:
         project = tmp / "project"
         env = _env(tmp)
         _write_items(project, [_item("t-001", "Ready A"), _item("t-002", "Ready B")])
+        _write_active_notes(project)
 
         proc = _run_session_status(project, env, "--json")
         assert_true(f"session-status --json exits 0: {proc.stderr}", proc.returncode == 0)

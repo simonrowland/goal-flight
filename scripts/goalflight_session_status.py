@@ -870,7 +870,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     status = aggregate_status(project_root, ttl_days=args.ttl_days)
-    if args.text:
+    if args.text and status.get("active"):
         _post_resume_nudge(project_root)
     if args.json or not args.text:
         # Default to JSON for machine consumers; --text for humans.
