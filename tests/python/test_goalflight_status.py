@@ -836,6 +836,165 @@ def test_wait_snapshot_uses_single_liveness_result() -> None:
         S.goalflight_ledger.identity_matches = orig_identity_matches
 
 
+def test_wait_explicit_id_uses_drain_status_identity_across_scope() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        status_path = Path(tmp) / "drain-live.status.json"
+        status_path.write_text(
+            json.dumps(
+                {
+                    "schema": "goalflight.status.v1",
+                    "dispatch_id": "drain-live",
+                    "state": "running",
+                    "worker_pid": 4242,
+                    "worker_alive": True,
+                    "expected_worker_identity": {
+                        "pid": 4242,
+                        "lstart": "Thu Jul  2 17:53:52 2026",
+                        "comm": "node",
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        machine_payload = {
+            "schema": "goalflight.status.aggregate.v1",
+            "capacity": {"operating_cap": 16},
+            "capacity_state": {"leases": {}, "cooldowns": {}},
+            "dispatch": {
+                "records": [
+                    {
+                        "dispatch_id": "drain-live",
+                        "project_root": "/repo/drain-worktree",
+                        "classification": "unknown",
+                        "state": "running",
+                        "agent": "codex",
+                        "worker_pid": 98515,
+                        "status_path": str(status_path),
+                    }
+                ],
+                "surplus_processes": [],
+            },
+        }
+        orig_payload = S.status_payload
+        orig_read_records = S.goalflight_ledger.read_records
+        orig_identity_matches = S.goalflight_ledger.identity_matches
+        orig_pid_alive = S.goalflight_compat.pid_alive
+        orig_progress = S._wait_progress_detail
+        orig_sleep = S.time.sleep
+        orig_monotonic = S.time.monotonic
+        seen: list[dict] = []
+        times = iter([0.0, 0.2])
+        try:
+            S.status_payload = lambda: machine_payload
+            S.goalflight_ledger.read_records = lambda: []
+            S.goalflight_compat.pid_alive = lambda _pid: False
+            S.goalflight_ledger.identity_matches = lambda record: seen.append(record) or (True, "live")
+            S._wait_progress_detail = lambda *_args, **kwargs: {
+                "worker_alive": bool(kwargs.get("worker_alive")),
+                "tail_size": None,
+            }
+            S.time.sleep = lambda _seconds: None
+            S.time.monotonic = lambda: next(times)
+            out = io.StringIO()
+            with redirect_stdout(out):
+                rc = S.wait_for_dispatches(
+                    ["drain-live"],
+                    project_root="/repo/controller-worktree",
+                    timeout_s=0.1,
+                    poll_s=0.01,
+                    crash_grace_s=0.0,
+                )
+            text = out.getvalue()
+            check("drain live wait times out instead of worker_dead", rc == 1)
+            check("drain live wait never reports worker_dead", "worker_dead" not in text)
+            check("drain live wait used status identity pid",
+                  seen and seen[-1].get("worker_pid") == 4242)
+        finally:
+            S.status_payload = orig_payload
+            S.goalflight_ledger.read_records = orig_read_records
+            S.goalflight_ledger.identity_matches = orig_identity_matches
+            S.goalflight_compat.pid_alive = orig_pid_alive
+            S._wait_progress_detail = orig_progress
+            S.time.sleep = orig_sleep
+            S.time.monotonic = orig_monotonic
+
+
+def test_wait_dead_drain_status_identity_still_verdicts_worker_dead() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        status_path = Path(tmp) / "drain-dead.status.json"
+        status_path.write_text(
+            json.dumps(
+                {
+                    "schema": "goalflight.status.v1",
+                    "dispatch_id": "drain-dead",
+                    "state": "running",
+                    "worker_pid": 4242,
+                    "worker_alive": False,
+                    "expected_worker_identity": {
+                        "pid": 4242,
+                        "lstart": "Thu Jul  2 17:53:52 2026",
+                        "comm": "node",
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        machine_payload = {
+            "schema": "goalflight.status.aggregate.v1",
+            "capacity": {"operating_cap": 16},
+            "capacity_state": {"leases": {}, "cooldowns": {}},
+            "dispatch": {
+                "records": [
+                    {
+                        "dispatch_id": "drain-dead",
+                        "project_root": "/repo/drain-worktree",
+                        "classification": "unknown",
+                        "state": "running",
+                        "agent": "codex",
+                        "worker_pid": 98515,
+                        "status_path": str(status_path),
+                    }
+                ],
+                "surplus_processes": [],
+            },
+        }
+        orig_payload = S.status_payload
+        orig_read_records = S.goalflight_ledger.read_records
+        orig_identity_matches = S.goalflight_ledger.identity_matches
+        orig_pid_alive = S.goalflight_compat.pid_alive
+        orig_sleep = S.time.sleep
+        orig_monotonic = S.time.monotonic
+        times = iter([0.0, 0.0])
+        try:
+            S.status_payload = lambda: machine_payload
+            S.goalflight_ledger.read_records = lambda: []
+            S.goalflight_compat.pid_alive = lambda _pid: False
+            S.goalflight_ledger.identity_matches = lambda _record: (False, "dead")
+            S.time.sleep = lambda _seconds: None
+            S.time.monotonic = lambda: next(times)
+            out = io.StringIO()
+            with redirect_stdout(out):
+                rc = S.wait_for_dispatches(
+                    ["drain-dead"],
+                    project_root="/repo/controller-worktree",
+                    timeout_s=0.1,
+                    poll_s=0.01,
+                    crash_grace_s=0.0,
+                )
+            text = out.getvalue()
+            check("dead drain wait exits terminal", rc == 0)
+            check("dead drain wait reports worker_dead", "drain-dead -> worker_dead" in text)
+        finally:
+            S.status_payload = orig_payload
+            S.goalflight_ledger.read_records = orig_read_records
+            S.goalflight_ledger.identity_matches = orig_identity_matches
+            S.goalflight_compat.pid_alive = orig_pid_alive
+            S.time.sleep = orig_sleep
+            S.time.monotonic = orig_monotonic
+
+
 def main() -> int:
     test_scope()
     test_worktree_scope()
@@ -853,6 +1012,8 @@ def main() -> int:
     test_wait_unbounded_sentinels_and_positive_timeout()
     test_wait_keyboard_interrupt_returns_130_without_signal()
     test_wait_snapshot_uses_single_liveness_result()
+    test_wait_explicit_id_uses_drain_status_identity_across_scope()
+    test_wait_dead_drain_status_identity_still_verdicts_worker_dead()
     if _FAILS:
         print(f"\n{len(_FAILS)} FAILED: {_FAILS}")
         return 1

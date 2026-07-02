@@ -77,6 +77,82 @@ def _has_recorded_worker_identity(record: dict) -> bool:
     )
 
 
+def _status_json_worker_record(record: dict) -> dict | None:
+    status = _status_json_payload(record)
+    if not status:
+        return None
+    dispatch_id = record.get("dispatch_id")
+    if dispatch_id and status.get("dispatch_id") not in (None, dispatch_id):
+        return None
+    identity = status.get("expected_worker_identity")
+    if not isinstance(identity, dict):
+        identity = status.get("worker_identity")
+    if not isinstance(identity, dict):
+        identity = None
+    pid = status.get("worker_pid") or (identity or {}).get("pid")
+    if not pid:
+        return None
+    out = dict(record)
+    out["worker_pid"] = pid
+    if identity is not None:
+        out["worker_identity"] = identity
+    if status.get("tail_path") and not out.get("stdout_path"):
+        out["stdout_path"] = status.get("tail_path")
+    if status.get("state") and not out.get("state"):
+        out["state"] = status.get("state")
+    if status.get("status_path") and not out.get("status_path"):
+        out["status_path"] = status.get("status_path")
+    return out
+
+
+def _raw_ledger_record_for_dispatch(dispatch_id: object) -> dict | None:
+    if not dispatch_id:
+        return None
+    dispatch_id = str(dispatch_id)
+    try:
+        path = goalflight_ledger.record_path(dispatch_id, create=False)
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        raw = None
+    if isinstance(raw, dict):
+        return raw
+    for raw_record in goalflight_ledger.read_records():
+        if raw_record.get("dispatch_id") == dispatch_id:
+            return raw_record
+    return raw if isinstance(raw, dict) else None
+
+
+def _wait_liveness_record(record: dict | None) -> dict | None:
+    """Return the richest worker-identity row for wait/dead decisions.
+
+    Aggregate status rows can be scoped, stale, or stripped. The drainer/watcher
+    source of truth is the raw run ledger plus status.json expected worker
+    identity, so death checks must resolve back to those records before falling
+    back to a pid-only probe.
+    """
+    if record is None:
+        return None
+    dispatch_id = record.get("dispatch_id")
+    if dispatch_id:
+        raw = _raw_ledger_record_for_dispatch(dispatch_id)
+        if raw is not None and raw.get("worker_pid"):
+            if _has_recorded_worker_identity(raw):
+                return raw
+            raw_with_pid = raw
+        else:
+            raw_with_pid = None
+    else:
+        raw_with_pid = None
+    status_record = _status_json_worker_record(record)
+    if status_record is not None and _has_recorded_worker_identity(status_record):
+        return status_record
+    if raw_with_pid is not None:
+        return raw_with_pid
+    if status_record is not None:
+        return status_record
+    return record
+
+
 def _needs_liveness_recheck(record: dict) -> bool:
     cls = record.get("classification")
     state = record.get("state")
@@ -84,35 +160,22 @@ def _needs_liveness_recheck(record: dict) -> bool:
 
 
 def _identity_record_for_liveness_recheck(record: dict) -> dict | None:
-    if not record.get("worker_pid"):
-        return None
-    if _has_recorded_worker_identity(record):
-        return record
-    dispatch_id = record.get("dispatch_id")
-    if not dispatch_id:
-        return None
-    for raw in goalflight_ledger.read_records():
-        if raw.get("dispatch_id") == dispatch_id and _has_recorded_worker_identity(raw):
-            return raw
+    source = _wait_liveness_record(record)
+    if source is not None and source.get("worker_pid") and _has_recorded_worker_identity(source):
+        return source
     return None
 
 
 def _identity_record_for_output_tail_reconcile(record: dict) -> dict | None:
-    if not record.get("worker_pid"):
-        return None
-    if _has_recorded_worker_identity(record):
-        return record
-    dispatch_id = record.get("dispatch_id")
-    if not dispatch_id:
-        return None
-    for raw in goalflight_ledger.read_records():
-        if raw.get("dispatch_id") == dispatch_id and _has_recorded_worker_identity(raw):
-            return raw
+    source = _wait_liveness_record(record)
+    if source is not None and source.get("worker_pid") and _has_recorded_worker_identity(source):
+        return source
     return None
 
 
 def _record_pid_alive(record: dict) -> bool:
-    pid = record.get("worker_pid")
+    source = _wait_liveness_record(record) or record
+    pid = source.get("worker_pid")
     if not pid:
         return False
     try:
@@ -605,6 +668,25 @@ def find_record(payload: dict, dispatch_id: str) -> dict | None:
     return None
 
 
+def _payload_with_explicit_wait_records(scoped_payload: dict, machine_payload: dict, wait_ids: list[str]) -> dict:
+    scoped_records = list(scoped_payload["dispatch"].get("records", []))
+    present = {r.get("dispatch_id") for r in scoped_records}
+    missing = [dispatch_id for dispatch_id in wait_ids if dispatch_id not in present]
+    if not missing:
+        return scoped_payload
+    machine_records = machine_payload.get("dispatch", {}).get("records", [])
+    additions = [
+        r
+        for r in machine_records
+        if r.get("dispatch_id") in missing and r.get("dispatch_id") not in present
+    ]
+    if not additions:
+        return scoped_payload
+    out = dict(scoped_payload)
+    out["dispatch"] = dict(scoped_payload["dispatch"], records=scoped_records + additions)
+    return out
+
+
 def _signal(record: dict) -> str:
     pid = record.get("worker_pid")
     if _rechecked_worker_alive(record):
@@ -689,13 +771,16 @@ def _wait_worker_confirmed_dead(record: dict | None) -> bool:
     can never reach a clean terminal on its own, so --wait must resolve it as
     ``worker_dead`` rather than poll to the timeout.
 
-    Liveness is checked the trustworthy way: identity match when an identity was
-    recorded (survives PID reuse), else a raw pid probe, else (no pid at all) dead.
-    A genuinely-running-but-ambiguous worker (live pid / matching identity) returns
-    False so --wait keeps waiting -- the wait-timeout is the ultimate backstop.
+    Liveness is checked the trustworthy way: identity match from the raw run
+    ledger or status.json expected worker identity (survives PID reuse), else a
+    raw pid probe. Missing rows/ids are not proof of death; they keep waiting
+    until timeout rather than fabricating a worker_dead verdict.
     """
     if record is None:
-        return True
+        return False
+    source = _wait_liveness_record(record)
+    if source is not None:
+        record = source
     if _needs_liveness_recheck(record):
         return not _rechecked_worker_alive(record)
     if _has_recorded_worker_identity(record):
@@ -713,6 +798,9 @@ def _wait_worker_confirmed_dead(record: dict | None) -> bool:
 def _wait_worker_confirmed_alive(record: dict | None) -> bool:
     if record is None:
         return False
+    source = _wait_liveness_record(record)
+    if source is not None:
+        record = source
     if _needs_liveness_recheck(record):
         return _rechecked_worker_alive(record)
     if _has_recorded_worker_identity(record):
@@ -730,7 +818,8 @@ def _wait_worker_confirmed_alive(record: dict | None) -> bool:
 def _wait_record_pid(record: dict | None) -> int | None:
     if record is None:
         return None
-    pid = record.get("worker_pid")
+    source = _wait_liveness_record(record) or record
+    pid = source.get("worker_pid")
     if not pid:
         return None
     try:
@@ -1050,7 +1139,12 @@ def wait_for_dispatches(
     try:
         while True:
             now = time.monotonic()
-            payload = scope_payload(status_payload(), project_root)
+            machine_payload = status_payload()
+            payload = _payload_with_explicit_wait_records(
+                scope_payload(machine_payload, project_root),
+                machine_payload,
+                wait_ids,
+            )
             rows = _wait_snapshot(
                 payload,
                 wait_ids,
