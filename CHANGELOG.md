@@ -14,6 +14,14 @@ incremented when meaningful skill behaviour changes.
   including guarded `harvest --source` scanning, `migrate --source` previews,
   source caps, managed-state skip summaries, `append` notes, and `pipe`
   handoff output for queued work.
+- Work-package file adapter: `harvest --source <glob> --file-as-task` imports
+  one draft item per matched file — title from the first H1 (work-package
+  label prefixes stripped precisely; prose headings preserved), `**Status:**`
+  header token mapped (READY/TODO/IN_PROGRESS import, DONE/SUPERSEDED skip
+  with counts), `**Priority:**` as a tag, capped body as the draft prompt,
+  edit-stable file-path-scoped dedup, and whole-file consumption (no bullet
+  or table leakage). Field-proven on a 55-file work-package corpus:
+  1,867 bullet fragments → 48 clean file items.
 - Migration parser depth: markdown table rows with explicit open-work states
   import as candidates (closed/neutral rows skip); `--headings-as-tasks`
   promotes work-item headings and captures each promoted section's body as the
