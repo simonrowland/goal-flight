@@ -660,6 +660,162 @@ def test_harvest_source_row_scoped_dedup_keeps_repeated_row_local_titles() -> No
         assert_true("row-scoped second harvest idempotent", payload["created"] == [] and payload["skipped"] == 2)
 
 
+def test_harvest_source_file_as_task_imports_file_units_and_counts() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        project = Path(td)
+        docs = project / "docs-private"
+        _write_tasks(project, [])
+        tasks_file = docs / "tasks.jsonl"
+
+        (docs / "pkg-alpha.md").write_text(
+            "\n".join(
+                [
+                    "# TASK-ALPHA: Build file package importer",
+                    "",
+                    "**Status:** READY",
+                    "**Priority:** P1",
+                    "",
+                    "Implement the file-level importer.",
+                    "",
+                    "## Blocked By",
+                    "",
+                    "- pkg-beta.md",
+                    "- package gamma",
+                    "",
+                    "## Checklist",
+                    "",
+                    "- Bullet detail must stay in the prompt, not become another draft",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        (docs / "pkg-delta.md").write_text(
+            "\n".join(
+                [
+                    "# TASK \u2014 Keep active package visible",
+                    "",
+                    "Status: IN_PROGRESS (worker has local notes)",
+                    "Priority: High",
+                    "",
+                    "- Active package detail",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        (docs / "pkg-done.md").write_text(
+            "# TASK: Closed package\n\n**Status:** DONE (F1-F5 fixed, 2026-04-05)\n\n- Closed detail\n",
+            encoding="utf-8",
+        )
+        (docs / "pkg-superseded.md").write_text(
+            "# TASK: Old package\n\n**Status:** SUPERSEDED \u2014 2026-04-07\n",
+            encoding="utf-8",
+        )
+        (docs / "pkg-no-header.md").write_text(
+            "**Status:** TODO\n\n- No title to guess from\n",
+            encoding="utf-8",
+        )
+
+        before = tasks_file.read_text(encoding="utf-8")
+        proc = run_task(
+            project,
+            "harvest",
+            "--source",
+            "docs-private/pkg-*.md",
+            "--file-as-task",
+            "--lane",
+            "packages",
+            "--dry-run",
+            "--json",
+        )
+        assert_true(f"file-as-task dry-run exits 0: {proc.stderr}", proc.returncode == 0)
+        assert_true("dry-run leaves store unchanged", tasks_file.read_text(encoding="utf-8") == before)
+        payload = json.loads(proc.stdout)
+        summary = payload["source_matches"][0]
+        assert_true("file-as-task summary marked", summary["file_as_task"] is True)
+        assert_true("file-as-task files matched", summary["files_matched"] == 5 and summary["matches"] == 5)
+        assert_true("file-as-task imported count", summary["imported"] == 2 and summary["candidates"] == 2)
+        assert_true("file-as-task closed count", summary["closed_skipped"] == 2)
+        assert_true("file-as-task no-header count", summary["no_header_skipped"] == 1)
+
+        drafts = payload["drafts"]
+        titles = [draft["title"] for draft in drafts]
+        assert_true("task label stripped", "Build file package importer" in titles)
+        assert_true("em dash task label stripped", "Keep active package visible" in titles)
+        assert_true("closed package skipped", "Closed package" not in titles and "Old package" not in titles)
+        assert_true("no-header package skipped", all("No title to guess" not in title for title in titles))
+        assert_true("file mode suppresses bullet leakage", "Bullet detail must stay in the prompt, not become another draft" not in titles)
+
+        alpha = next(draft for draft in drafts if draft["title"] == "Build file package importer")
+        assert_true("file task scope is path-stable", alpha["harvest_scope"] == "docs-private/pkg-alpha.md:file")
+        assert_true("priority tag attached", "priority:p1" in alpha["tags"])
+        assert_true("lane respected", alpha["lane"] == "packages")
+        assert_true("blocked-by raw names retained", "pkg-beta.md" in alpha.get("prompt", "") and "package gamma" in alpha.get("prompt", ""))
+        delta = next(draft for draft in drafts if draft["title"] == "Keep active package visible")
+        assert_true("in-progress tagged wip", "wip" in delta["tags"])
+        assert_true("priority high tag attached", "priority:high" in delta["tags"])
+
+        proc = run_task(project, "harvest", "--source", "docs-private/pkg-*.md", "--file-as-task", "--lane", "packages", "--json")
+        assert_true(f"file-as-task apply exits 0: {proc.stderr}", proc.returncode == 0)
+        payload = json.loads(proc.stdout)
+        assert_true("file-as-task apply creates only open packages", len(payload["created"]) == 2)
+        items = _read_items(project)
+        keys_before = {item["title"]: item["harvest_key"] for item in items}
+
+        (docs / "pkg-alpha.md").write_text(
+            "\n".join(
+                [
+                    "# TASK-ALPHA: Build file package importer",
+                    "",
+                    "**Status:** TODO (body edited after first import)",
+                    "**Priority:** P2",
+                    "",
+                    "Edited body must not create a duplicate.",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        proc = run_task(project, "harvest", "--source", "docs-private/pkg-*.md", "--file-as-task", "--lane", "packages", "--json")
+        assert_true(f"second file-as-task apply exits 0: {proc.stderr}", proc.returncode == 0)
+        payload = json.loads(proc.stdout)
+        assert_true("second file-as-task harvest dedups open files", payload["created"] == [] and payload["skipped"] == 2)
+        items = _read_items(project)
+        assert_true("body edit created no duplicate", len(items) == 2)
+        assert_true("path-stable harvest key unchanged", keys_before["Build file package importer"] == items[0]["harvest_key"])
+
+        proc = run_task(project, "harvest", "--source", "docs-private/pkg-*.md", "--file-as-task", "--dry-run")
+        assert_true(f"file-as-task text dry-run exits 0: {proc.stderr}", proc.returncode == 0)
+        assert_true("file-as-task text summary visible", "file-as-task for docs-private/pkg-*.md: 5 matched, 2 imported, 2 closed_skipped, 1 no_header_skipped" in proc.stdout)
+
+
+def test_harvest_file_task_title_strip_precision() -> None:
+    module = _load_goalflight_task_module()
+    strip = module._harvest_file_task_title
+    assert_true("joined id stripped", strip("TASK-ALPHA: Build importer") == "Build importer")
+    assert_true("plain label stripped", strip("TASK: Build importer") == "Build importer")
+    assert_true(
+        "hyphenated work-package with digit id stripped",
+        strip("Work-package F1: Build the thing") == "Build the thing",
+    )
+    assert_true("space-separated digit id stripped", strip("TASK 12: Foo") == "Foo")
+    assert_true(
+        "prose 'Task force' heading preserved",
+        strip("Task force: Improve triage") == "Task force: Improve triage",
+    )
+    assert_true("plain heading preserved", strip("Improve triage") == "Improve triage")
+
+
+def test_harvest_file_as_task_requires_source() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        project = Path(td)
+        _write_tasks(project, [])
+        proc = run_task(project, "harvest", "--file-as-task", "--dry-run")
+        assert_true("file-as-task without source fails", proc.returncode == 1)
+        assert_true("file-as-task requires source message", "--file-as-task requires at least one --source" in proc.stderr)
+
+
 if __name__ == "__main__":
     test_harvest_source_dry_run_json_flags_and_idempotency()
     test_harvest_source_globs_guards_and_zero_match_summary()
@@ -675,4 +831,7 @@ if __name__ == "__main__":
     test_harvest_source_promoted_heading_body_capture_and_bullet_rules()
     test_harvest_source_table_rows_open_only_and_non_task_tables_ignored()
     test_harvest_source_row_scoped_dedup_keeps_repeated_row_local_titles()
+    test_harvest_source_file_as_task_imports_file_units_and_counts()
+    test_harvest_file_task_title_strip_precision()
+    test_harvest_file_as_task_requires_source()
     print("PASS")

@@ -55,6 +55,8 @@ HARVEST_TASK_CONTEXT_RE = re.compile(
 )
 HARVEST_METADATA_KEYS = {"id", "title", "priority", "status", "source", "evidence"}
 HARVEST_HEADING_PROMPT_LIMIT = 2000
+HARVEST_FILE_OPEN_STATUSES = {"READY", "TODO", "IN_PROGRESS"}
+HARVEST_FILE_CLOSED_STATUSES = {"DONE", "SUPERSEDED"}
 HARVEST_GENERIC_HEADING_KEYS = {
     "acceptance",
     "background",
@@ -565,6 +567,62 @@ def _harvest_heading_prompt(lines: list[str]) -> str | None:
         return text
     truncated = text[:HARVEST_HEADING_PROMPT_LIMIT].rstrip()
     return f"{truncated}\n\n[truncated after first {HARVEST_HEADING_PROMPT_LIMIT} chars from section body]"
+
+
+def _harvest_first_h1(lines: list[str]) -> tuple[int, str] | None:
+    for lineno, line in enumerate(lines, start=1):
+        match = re.match(r"^#(?!#)\s+(.+?)\s*#*\s*$", line)
+        if match:
+            return lineno, match.group(1)
+    return None
+
+
+def _harvest_file_task_title(value: str) -> str:
+    text = _clean_markdown_title(value)
+    # Label id after a bare space must contain a digit ("TASK 12:", "Work-package F1:")
+    # so prose like "Task force: Improve triage" is never stripped; explicitly
+    # joined ids ("TASK-ALPHA:", "TASK #12:") may be any token.
+    match = re.match(
+        r"^(?:task|work[\s-]?package)"
+        r"(?:\s*[-#]\s*[A-Za-z0-9_.-]+|\s+[A-Za-z0-9_.-]*\d[A-Za-z0-9_.-]*)?"
+        r"\s*(?::|[-\u2013\u2014])\s*(.+)$",
+        text,
+        flags=re.IGNORECASE,
+    )
+    return _clean_markdown_title(match.group(1)) if match else text
+
+
+def _harvest_file_metadata_value(lines: list[str], key: str) -> str | None:
+    field = re.escape(key)
+    pattern = re.compile(
+        rf"^\s*(?:[-*]\s*)?(?:\*\*)?\s*{field}\s*(?::\s*(?:\*\*)?|\*\*\s*:)\s*(.+?)\s*$",
+        re.IGNORECASE,
+    )
+    for line in lines:
+        match = pattern.match(line)
+        if match:
+            return _strip_markdown_wrappers(match.group(1).strip())
+    return None
+
+
+def _harvest_file_status_token(value: str | None) -> str | None:
+    if value is None:
+        return None
+    text = _clean_markdown_title(value)
+    if re.match(r"^in[\s_-]+progress\b", text, flags=re.IGNORECASE):
+        return "IN_PROGRESS"
+    match = re.match(r"^([A-Za-z]+(?:_[A-Za-z]+)*)\b", text)
+    if not match:
+        return None
+    return match.group(1).upper().replace("-", "_")
+
+
+def _harvest_priority_tag(value: str | None) -> str | None:
+    if value is None:
+        return None
+    text = _clean_markdown_title(value).lower()
+    text = re.sub(r"\s+", "-", text).strip("-")
+    return f"priority:{text}" if text else None
 
 
 def _harvest_list_item_at(lines: list[str], index: int) -> tuple[str, int] | None:
@@ -1830,6 +1888,7 @@ def _harvest_candidate(
     severity: str | None = None,
     pattern: str | None = None,
     position_key: str | None = None,
+    key_scope_only: bool = False,
 ) -> dict[str, Any] | None:
     clean_title = _clean_markdown_title(title)
     if not clean_title or clean_title.lower() in {"none", "(none)"}:
@@ -1839,9 +1898,12 @@ def _harvest_candidate(
     source_ref = _rel_source(store.project_root, source_path, line)
     source_file = _rel_source(store.project_root, source_path)
     harvest_scope = f"{source_file}:{position_key}" if source_type == "manual-source" and position_key else None
-    harvest_key_parts = [kind, _harvest_title_key(clean_title), source_file, source_type]
-    if harvest_scope:
-        harvest_key_parts.append(harvest_scope)
+    if key_scope_only and harvest_scope:
+        harvest_key_parts = [kind, source_type, harvest_scope]
+    else:
+        harvest_key_parts = [kind, _harvest_title_key(clean_title), source_file, source_type]
+        if harvest_scope:
+            harvest_key_parts.append(harvest_scope)
     tags = [*HARVEST_DRAFT_TAGS, source_type]
     if pattern:
         tags.append(pattern)
@@ -2075,6 +2137,57 @@ def _harvest_heading_blocks(
     return candidates
 
 
+def _harvest_file_task_candidate(
+    store: TaskStore,
+    path: Path,
+    text: str,
+    *,
+    default_kind: str,
+    source_type: str,
+    lane: str | None = None,
+) -> tuple[dict[str, Any] | None, str]:
+    lines = text.splitlines()
+    first_h1 = _harvest_first_h1(lines)
+    if first_h1 is None:
+        return None, "no_header_skipped"
+    h1_lineno, raw_title = first_h1
+    title = _harvest_file_task_title(raw_title)
+    if not title:
+        return None, "no_header_skipped"
+
+    status_token = _harvest_file_status_token(_harvest_file_metadata_value(lines, "status"))
+    if status_token in HARVEST_FILE_CLOSED_STATUSES:
+        return None, "closed_skipped"
+    if status_token is not None and status_token not in HARVEST_FILE_OPEN_STATUSES:
+        status_token = None
+
+    candidate = _harvest_candidate(
+        store,
+        kind=default_kind,
+        title=title,
+        source_path=path,
+        source_type=source_type,
+        line=h1_lineno,
+        position_key="file",
+        key_scope_only=True,
+    )
+    if candidate is None:
+        return None, "no_header_skipped"
+    if lane is not None:
+        candidate["lane"] = lane
+    tags = [*LIST_TYPE(candidate.get("tags") or []), "file-task"]
+    if status_token == "IN_PROGRESS":
+        tags.append("wip")
+    priority_tag = _harvest_priority_tag(_harvest_file_metadata_value(lines, "priority"))
+    if priority_tag:
+        tags.append(priority_tag)
+    candidate["tags"] = _dedupe_strs(tags)
+    prompt = _harvest_heading_prompt(lines[h1_lineno:])
+    if prompt:
+        candidate["prompt"] = prompt
+    return candidate, "imported"
+
+
 def _harvest_review_candidates(store: TaskStore) -> list[dict[str, Any]]:
     review_dir = store.docs_dir / "reviews"
     if not review_dir.is_dir():
@@ -2234,6 +2347,7 @@ def _collect_harvest_candidates(
     all_bullets: bool = False,
     no_implicit_resume: bool = False,
     headings_as_tasks: bool = False,
+    file_as_task: bool = False,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     candidates: list[dict[str, Any]] = []
     source_matches: list[dict[str, Any]] = []
@@ -2253,6 +2367,12 @@ def _collect_harvest_candidates(
         paths, summary = _resolve_harvest_source_paths(store, pattern, source_limit=source_limit)
         before = len(candidates)
         skipped_sources: list[dict[str, str]] = []
+        if file_as_task:
+            summary["file_as_task"] = True
+            summary["files_matched"] = summary["matches"]
+            summary["imported"] = 0
+            summary["closed_skipped"] = 0
+            summary["no_header_skipped"] = 0
         for path in paths:
             text = path.read_text(encoding="utf-8", errors="replace")
             skip_reason = _harvest_source_skip_reason(path, text, manual_source=True)
@@ -2261,6 +2381,25 @@ def _collect_harvest_candidates(
                     "path": _rel_source(store.project_root, path),
                     "reason": skip_reason,
                 })
+                continue
+            if file_as_task:
+                candidate, outcome = _harvest_file_task_candidate(
+                    store,
+                    path,
+                    text,
+                    default_kind=source_kind,
+                    source_type="manual-source",
+                    lane=source_lane,
+                )
+                if outcome == "imported":
+                    prior_count = len(candidates)
+                    _append_candidate(candidates, candidate)
+                    if len(candidates) > prior_count:
+                        summary["imported"] = int(summary["imported"]) + 1
+                elif outcome == "closed_skipped":
+                    summary["closed_skipped"] = int(summary["closed_skipped"]) + 1
+                elif outcome == "no_header_skipped":
+                    summary["no_header_skipped"] = int(summary["no_header_skipped"]) + 1
                 continue
             candidates.extend(
                 _harvest_heading_blocks(
@@ -2724,6 +2863,8 @@ def _cmd_review(store: TaskStore, args: argparse.Namespace) -> int:
 def _cmd_harvest(store: TaskStore, args: argparse.Namespace) -> int:
     actor = _actor(args)
     _validate_lane_arg(args.lane)
+    if getattr(args, "file_as_task", False) and not args.sources:
+        raise TaskError("--file-as-task requires at least one --source <glob>")
     candidates, source_matches = _collect_harvest_candidates(
         store,
         source_patterns=args.sources,
@@ -2733,6 +2874,7 @@ def _cmd_harvest(store: TaskStore, args: argparse.Namespace) -> int:
         all_bullets=getattr(args, "all_bullets", False),
         no_implicit_resume=getattr(args, "no_implicit_resume", False),
         headings_as_tasks=getattr(args, "headings_as_tasks", False),
+        file_as_task=getattr(args, "file_as_task", False),
     )
     if args.dry_run:
         payload = {
@@ -2782,6 +2924,7 @@ def _run_harvest_json(store: TaskStore, args: argparse.Namespace, *, dry_run: bo
         all_bullets=getattr(args, "all_bullets", False),
         no_implicit_resume=getattr(args, "no_implicit_resume", False),
         headings_as_tasks=getattr(args, "headings_as_tasks", False),
+        file_as_task=getattr(args, "file_as_task", False),
     )
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
@@ -2811,6 +2954,13 @@ def _source_match_text_lines(source_matches: list[dict[str, Any]]) -> list[str]:
         pattern = str(summary.get("pattern") or "")
         if int(summary.get("matches") or 0) == 0:
             lines.append(f"0 matches for {pattern}")
+        if summary.get("file_as_task"):
+            lines.append(
+                f"file-as-task for {pattern}: {int(summary.get('files_matched') or 0)} matched, "
+                f"{int(summary.get('imported') or 0)} imported, "
+                f"{int(summary.get('closed_skipped') or 0)} closed_skipped, "
+                f"{int(summary.get('no_header_skipped') or 0)} no_header_skipped"
+            )
         skipped = LIST_TYPE(summary.get("skipped_sources") or [])
         if skipped:
             preview = ", ".join(
@@ -3466,6 +3616,7 @@ def build_parser() -> argparse.ArgumentParser:
     harvest.add_argument("--source-limit", type=int, default=DEFAULT_SOURCE_LIMIT, help=f"Maximum files consumed per --source glob before reporting dropped matches (default: {DEFAULT_SOURCE_LIMIT}).")
     harvest.add_argument("--all-bullets", action="store_true", help="Harvest bullets from any section in --source files instead of only task/backlog/action/TODO/open/next sections.")
     harvest.add_argument("--headings-as-tasks", action="store_true", help="Also harvest guarded work-item headings from --source files; off by default to avoid prose-heading noise.")
+    harvest.add_argument("--file-as-task", action="store_true", help="Import each matched --source file as one draft item, using its first H1 as the title.")
     harvest.add_argument("--no-implicit-resume", action="store_true", help="Skip implicit RESUME-NOTES candidates during built-in harvest.")
     harvest.add_argument("--json", action="store_true")
     harvest.set_defaults(func=_cmd_harvest)
