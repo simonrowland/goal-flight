@@ -2,9 +2,21 @@
 """Shared agent capacity defaults for goal-flight.
 
 Pure leaf module: imports neither goalflight_capacity nor goalflight_rate_pressure.
+
+The values below are the *committed generic baseline*. They are deliberately
+conservative-by-scaling: the machine-global operating cap in goalflight_capacity
+is RAM-tiered, so on a small box these high per-agent caps are never reached.
+A single operator's aggressive tuning for a specific big box must NOT be baked
+into this tracked file (that would export one machine's settings to every user).
+Per-machine tuning lives in a gitignored local conf loaded at import time -- see
+``load_local_overrides`` at the bottom of this module.
 """
 
 from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
 
 # grok RSS re-measured live 2026-07-01 (128GB M5, operator flag): a running grok
 # worker is ~144MB self-RSS and ~200-390MB counting its node/MCP child tree, vs
@@ -87,3 +99,90 @@ def cap_pool(agent: str) -> str:
     """Map agent label to the shared capacity pool key."""
     agent = normalize_agent(agent)
     return AGENT_CAP_POOL.get(agent, agent)
+
+
+# --------------------------------------------------------------------------- #
+# Machine-local capacity overrides (per-operator, gitignored, NOT committed).  #
+#                                                                              #
+# Concurrency headroom is a property of the *machine*, not of the repo: an     #
+# always-on 128GB Studio and a 16GB laptop want very different caps. Baking    #
+# one operator's numbers into the tracked defaults above would ship those      #
+# settings to every user of the skill. Instead, per-machine tuning lives in a  #
+# small JSON file loaded here at import time and merged over the committed      #
+# baseline. Absent file -> baseline stands (the common case for a fresh user). #
+#                                                                              #
+# Resolution order for the conf path:                                          #
+#   1. $GOALFLIGHT_CAPACITY_CONF (explicit path; also how tests isolate)       #
+#   2. ~/.goal-flight/capacity.local.json (durable, machine-global, outside    #
+#      any repo -> inherently git-invisible; the state dir under $TMPDIR is     #
+#      wiped on reboot and is the wrong home for durable tuning)               #
+#                                                                              #
+# Recognized keys (all optional):                                              #
+#   "agent_caps":   {agent: int}  merged over DEFAULT_AGENT_CAPS               #
+#   "agent_rss_mb": {agent: int}  merged over AGENT_RSS_MB                      #
+#   "hard_cap":     int           raw ceiling for goalflight_capacity          #
+#   "operating_total"|"max_total": int  persistent machine operating cap       #
+#      (equivalent to $GOALFLIGHT_CAPACITY_MAX_TOTAL but durable; the explicit  #
+#      env var and CLI --max-total still win)                                   #
+# --------------------------------------------------------------------------- #
+
+
+def _local_conf_path() -> Path:
+    raw = os.environ.get("GOALFLIGHT_CAPACITY_CONF", "").strip()
+    if raw:
+        return Path(raw).expanduser()
+    return Path.home() / ".goal-flight" / "capacity.local.json"
+
+
+def load_local_overrides(path: Path | None = None) -> dict:
+    """Return machine-local capacity overrides, or {} if absent/malformed.
+
+    Never raises: a missing or unparseable conf must degrade to the committed
+    baseline, never break dispatch.
+    """
+    conf_path = path if path is not None else _local_conf_path()
+    try:
+        raw = conf_path.read_text()
+    except (OSError, ValueError):
+        return {}
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _merge_int_map(target: dict, override: object) -> None:
+    if not isinstance(override, dict):
+        return
+    for key, value in override.items():
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            continue
+        if parsed > 0:
+            target[normalize_agent(str(key))] = parsed
+
+
+LOCAL_OVERRIDES = load_local_overrides()
+_merge_int_map(DEFAULT_AGENT_CAPS, LOCAL_OVERRIDES.get("agent_caps"))
+_merge_int_map(AGENT_RSS_MB, LOCAL_OVERRIDES.get("agent_rss_mb"))
+
+
+def _positive_int_or(value: object, default):
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def local_hard_cap(default: int) -> int:
+    """Conf ``hard_cap`` if set to a positive int, else ``default``."""
+    return _positive_int_or(LOCAL_OVERRIDES.get("hard_cap"), default)
+
+
+def local_operating_total() -> int | None:
+    """Conf ``operating_total`` (or ``max_total``) as a positive int, else None."""
+    value = LOCAL_OVERRIDES.get("operating_total", LOCAL_OVERRIDES.get("max_total"))
+    return _positive_int_or(value, None)

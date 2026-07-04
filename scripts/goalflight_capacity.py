@@ -28,6 +28,8 @@ from goalflight_agent_limits import (
     AGENT_RSS_MB,
     DEFAULT_AGENT_CAPS,
     cap_pool,
+    local_hard_cap,
+    local_operating_total,
     normalize_agent,
 )
 import goalflight_dispatch_states as dispatch_states
@@ -41,13 +43,15 @@ SCHEMA = "goalflight.capacity.v1"
 DEFAULT_STATE_DIR = goalflight_compat.resolve_state_dir()
 DEFAULT_RESERVE_MB = 2048
 DEFAULT_WORST_WORKER_MB = 1200
-# DEFAULT_HARD_CAP raised 20->40 (2026-06-16, operator-requested): (1) unmask the
-# per-agent codex/grok bumps below, and (2) feed the deep-research build's headroom.
-# This is the raw_ceiling INPUT; operating_cap = min(raw_ceiling, tier), and the >64GB
-# tier is raised to 32 (operating_cap_for_ram), so the effective machine total lands at
-# 32. raw_ceiling still = min(this, headroom_mb // worst_worker_mb), so RAM (128GB here)
-# and the acquire-time RSS budget continue to bound real concurrency.
-DEFAULT_HARD_CAP = 40
+# DEFAULT_HARD_CAP is the committed generic baseline raw_ceiling INPUT;
+# operating_cap = min(raw_ceiling, tier|conf|env), and raw_ceiling itself =
+# min(this, headroom_mb // worst_worker_mb), so RAM and the acquire-time RSS
+# budget continue to bound real concurrency. A specific big box that wants a
+# higher ceiling sets "hard_cap" in its gitignored capacity.local.json rather
+# than editing this tracked default (which would export one machine's tuning to
+# every user of the skill). local_hard_cap() returns the committed baseline when
+# no conf is present.
+DEFAULT_HARD_CAP = local_hard_cap(40)
 DEFAULT_RATE_PRESSURE_WINDOW_SECONDS = 600
 DEFAULT_RATE_PRESSURE_THRESHOLD = 3
 # Priority lanes (2026-06-10): acquire is single-shot try-or-block (no queue),
@@ -452,6 +456,12 @@ def operating_cap_for_ram(ram_mb: int, raw_ceiling: int) -> int:
             return max(1, min(raw_ceiling, int(override)))
         except ValueError:
             pass
+    # Persistent per-machine operating cap from capacity.local.json. Behaves
+    # exactly like GOALFLIGHT_CAPACITY_MAX_TOTAL but durable; the explicit env
+    # var above (and CLI --max-total in profile()) still take precedence.
+    conf_total = local_operating_total()
+    if conf_total:
+        return max(1, min(raw_ceiling, conf_total))
     if ram_mb <= 0:
         tier = 2
     elif ram_mb <= 8 * 1024:

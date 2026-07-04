@@ -22,7 +22,13 @@ if [ "${1:-}" = "--list" ]; then
 fi
 
 run_isolated_test_env() {
-  env -u GOALFLIGHT_STEER_FILE -u GOALFLIGHT_ALLOW_EXTERNAL_STEER_FILE "$@"
+  # GOALFLIGHT_CAPACITY_CONF -> /dev/null forces the committed baseline caps:
+  # /dev/null reads empty, the loader falls back, so a machine with a live
+  # per-operator capacity.local.json can't skew suite assertions (same reason
+  # the suite isolates GOALFLIGHT_STATE_DIR). An explicit outer value passes
+  # through for tests that deliberately exercise a real conf.
+  env -u GOALFLIGHT_STEER_FILE -u GOALFLIGHT_ALLOW_EXTERNAL_STEER_FILE \
+    GOALFLIGHT_CAPACITY_CONF="${GOALFLIGHT_CAPACITY_CONF:-/dev/null}" "$@"
 }
 
 # Bash tests (tests/bash/test-*.sh)

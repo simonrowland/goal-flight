@@ -55,6 +55,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    # Force the committed baseline capacity caps: /dev/null reads empty so the
+    # per-operator capacity.local.json loader falls back, keeping suite
+    # assertions machine-independent (the bash harness does the same). Child
+    # subprocesses inherit this via os.environ.
+    os.environ.setdefault("GOALFLIGHT_CAPACITY_CONF", os.devnull)
+
     if args.list:
         for test in _test_files():
             print(test.relative_to(ROOT).as_posix())
