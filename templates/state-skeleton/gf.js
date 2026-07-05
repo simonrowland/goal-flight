@@ -226,6 +226,65 @@
     }
   }
 
+  // Repo/project name = basename of the derived repo root. Used to brand every
+  // view so sibling-repo dashboards are distinguishable at a glance. "" when the
+  // root can't be derived (branding is then a no-op; the on-disk skeleton stands).
+  function gfRepoName() {
+    var root = gfRoot();
+    if (!root) return "";
+    var segs = root.split("/").filter(Boolean);
+    return segs.length ? segs[segs.length - 1] : "";
+  }
+
+  // Brand the current view with the repo name: prepend it to <title> (so it is
+  // the leading, non-truncated token in the browser tab) and inject a slim repo
+  // banner as the first child of <main> (every view has one). Runs once per page;
+  // touches only the live DOM, never the on-disk skeleton, so the doctor
+  // "<title>goal-flight"/"<h1>goal-flight" markers and byte-equality checks hold.
+  var repoBrandingApplied = false;
+  function applyRepoBranding() {
+    if (repoBrandingApplied) return;
+    repoBrandingApplied = true;
+    var repo = gfRepoName();
+    var doc = global.document;
+    if (!repo || !doc) return;
+    try {
+      if (typeof doc.title === "string" && doc.title.indexOf(repo + " · ") !== 0) {
+        doc.title = repo + " · " + doc.title;
+      }
+    } catch (e) {}
+    try {
+      var main = doc.querySelector && doc.querySelector("main");
+      if (!main || doc.getElementById("gf-repobar")) return;
+      if (!doc.getElementById("gf-repobar-style")) {
+        var st = doc.createElement("style");
+        st.id = "gf-repobar-style";
+        st.textContent =
+          "#gf-repobar{font:.8rem ui-monospace,SFMono-Regular,Menlo,monospace;" +
+          "color:var(--muted);letter-spacing:.02em;margin:0 0 .6rem;display:flex;" +
+          "align-items:baseline;gap:.4rem;flex-wrap:wrap}" +
+          "#gf-repobar .gf-repo{color:var(--fg);font-weight:600;letter-spacing:-.01em}" +
+          "#gf-repobar .gf-sep{opacity:.5}";
+        (doc.head || doc.body || main).appendChild(st);
+      }
+      var bar = doc.createElement("div");
+      bar.id = "gf-repobar";
+      bar.setAttribute("aria-label", "Project");
+      var name = doc.createElement("span");
+      name.className = "gf-repo";
+      name.textContent = repo;
+      var sep = doc.createElement("span");
+      sep.className = "gf-sep";
+      sep.textContent = "·";
+      var mark = doc.createElement("span");
+      mark.textContent = "goal-flight";
+      bar.appendChild(name);
+      bar.appendChild(sep);
+      bar.appendChild(mark);
+      main.insertBefore(bar, main.firstChild);
+    } catch (e) {}
+  }
+
   // Build the path regex once from the configurable prefix + ext lists. A path
   // token is a run of path-ish chars; we then validate prefix/ext in the handler
   // (cheaper + clearer than a monster regex). Optional leading '/' captures the
@@ -763,6 +822,9 @@
     var onMode = opts.onMode || function () {};
     var lastSig = null;
     var destroyed = false;
+
+    // Brand every view with the repo name (tab title + top-of-main banner).
+    applyRepoBranding();
 
     function loadAndMaybeRender(force) {
       var res = snapshot();
