@@ -89,6 +89,75 @@ STDIN_PROMPT_AGENTS = {"codex", "grok-code", "grok-research"}
 DEFAULT_MAX_IDLE_SECS = 180.0
 CODE_WRITER_MAX_IDLE_SECS = 600.0
 CODE_WRITER_AGENTS = {"codex", "codex-acp", "grok-code", "grok-acp", "cursor", "cursor-agent"}
+
+# --os-sandbox: opt-in, per-dispatch OS sandbox profile for the bash-shape codex
+# worker. Unset -> "workspace-write" (the unchanged default — every existing
+# dispatch is unaffected). "off" runs codex with its macOS Seatbelt sandbox
+# DISABLED (codex --sandbox danger-full-access) so a TRUSTED LOCAL GPU/perf worker
+# can (a) reach Metal/MPS for GPU verification and (b) write the linked worktree's
+# .git/worktrees/<name> metadata to self-commit. "off" is a sanctioned adapter
+# profile (adapters/codex.json os_sandbox.supported_profiles), DISTINCT from the
+# always-forbidden --dangerously-*/--no-sandbox approval-and-sandbox bypass flags
+# (which the presets never emit and this never enables). "read-only" == --read-only.
+OS_SANDBOX_PROFILES = ("workspace-write", "read-only", "off")
+_CODEX_SANDBOX_VALUE = {
+    "workspace-write": "workspace-write",
+    "read-only": "read-only",
+    "off": "danger-full-access",  # codex's sanctioned "no Seatbelt" sandbox value
+}
+
+
+def _effective_os_sandbox(args) -> str:
+    """Resolve the effective OS sandbox profile (non-raising, safe anywhere).
+
+    Precedence: explicit --os-sandbox > legacy --read-only alias > default
+    "workspace-write". Conflicts are surfaced separately by
+    _validate_os_sandbox_conflict.
+    """
+    explicit = getattr(args, "os_sandbox", None)
+    if explicit in OS_SANDBOX_PROFILES:
+        return explicit
+    return "read-only" if getattr(args, "read_only", False) else "workspace-write"
+
+
+def _effective_read_only(args) -> bool:
+    return _effective_os_sandbox(args) == "read-only"
+
+
+def _validate_os_sandbox_conflict(args) -> None:
+    explicit = getattr(args, "os_sandbox", None)
+    if explicit and getattr(args, "read_only", False) and explicit != "read-only":
+        raise DispatchUsageError(
+            f"--read-only conflicts with --os-sandbox {explicit} "
+            "(opposite write postures); pass only one."
+        )
+
+
+def _os_sandbox_warning(args) -> str | None:
+    """Dispatch-time advisory: log when 'off' is selected (required), and when an
+    explicit --os-sandbox is a no-op on a worker that can't honor it."""
+    explicit = getattr(args, "os_sandbox", None)
+    profile = _effective_os_sandbox(args)
+    # Only the bash-shape codex worker maps a profile to codex --sandbox here.
+    codex_bash = (
+        str(getattr(args, "agent", "")) == "codex"
+        and getattr(args, "shape", "bash") != "acp"
+    )
+    if profile == "off" and codex_bash:
+        return (
+            "OS SANDBOX DISABLED (--os-sandbox off): codex --sandbox "
+            "danger-full-access — Seatbelt off for TRUSTED LOCAL GPU/perf work "
+            "(Metal/MPS reachable; linked-worktree git metadata writable to "
+            "self-commit). Commit-guard (explicit pathspecs, no auto-push) + "
+            "capacity/ledger tracking unchanged."
+        )
+    if explicit and not codex_bash:
+        return (
+            f"--os-sandbox {explicit} only affects bash-shape codex workers; "
+            f"ignored for agent={getattr(args, 'agent', '?')} "
+            f"shape={getattr(args, 'shape', '?')}."
+        )
+    return None
 ACCOUNT_ENGINE_BY_AGENT = {
     "codex": "codex",
     "codex-acp": "codex",
@@ -863,6 +932,7 @@ def _dispatch_warnings(args, raw_argv: list[str]) -> list[str]:
     for warning in (
         _git_pin_warning(args),
         _grok_model_passthrough_warning(args),
+        _os_sandbox_warning(args),
     ):
         if warning:
             warnings.append(warning)
@@ -894,7 +964,7 @@ def _emit_dispatch_warnings(
 
 
 def _read_only_write_prompt_reason(args) -> str | None:
-    if not getattr(args, "read_only", False) or not _prompt_requested(args):
+    if not _effective_read_only(args) or not _prompt_requested(args):
         return None
     text = _read_prompt_for_guard(args)
     if not text:
@@ -926,7 +996,7 @@ def _research_intent_reason(args) -> str | None:
     # --read-only dispatches are review/analysis posture, not live web research
     # (the same inline-return lesson as the B5c guard). Genuine web research
     # belongs on --agent grok-research regardless.
-    if getattr(args, "read_only", False):
+    if _effective_read_only(args):
         return None
     if not _prompt_requested(args):
         return None
@@ -975,6 +1045,7 @@ def _validate_before_side_effects(args, raw_argv: list[str]) -> None:
         )
     if args.prompt_file and not Path(args.prompt_file).expanduser().exists():
         raise DispatchUsageError(f"prompt file not found: {args.prompt_file}")
+    _validate_os_sandbox_conflict(args)
     _guard_read_only_write_prompt(args)
     _guard_grok_code_research_prompt(args)
 
@@ -1453,7 +1524,7 @@ def _record_ledger(args, *, project_root: Path, prompt_path: str | None, status_
                 stdout_path=str(tail),
                 stderr_path=None,
                 status_path=str(status_json),
-                os_sandbox_json=json.dumps({"shape": "bash", "read_only": bool(args.read_only)}, sort_keys=True),
+                os_sandbox_json=json.dumps({"shape": "bash", "read_only": bool(args.read_only), "os_sandbox_profile": _effective_os_sandbox(args)}, sort_keys=True),
                 queue_launch_token=getattr(args, "queue_launch_token", None),
                 detached=bool(getattr(args, "launch_detached", False)),
                 state=state,
@@ -1489,7 +1560,7 @@ def _record_queued_ledger_fast(args, *, project_root: Path, prompt_path: str | N
         "stdout_path": str(tail),
         "stderr_path": None,
         "status_path": str(status_json),
-        "os_sandbox": {"shape": args.shape, "read_only": bool(args.read_only)},
+        "os_sandbox": {"shape": args.shape, "read_only": bool(args.read_only), "os_sandbox_profile": _effective_os_sandbox(args)},
         "state": "queued",
         "terminal_state": goalflight_ledger.terminal_state_for("queued"),
         "started_at": now,
@@ -1598,7 +1669,9 @@ def _canonical_replay_argv(args, raw_argv: list[str], *, tail: Path, status_json
         argv += ["--task", ",".join(args.task_ids)]
     if args.model:
         argv += ["--model", str(args.model)]
-    if args.read_only:
+    if getattr(args, "os_sandbox", None):
+        argv += ["--os-sandbox", str(args.os_sandbox)]
+    elif args.read_only:
         argv.append("--read-only")
     if args.web_research_ok:
         argv.append("--web-research-ok")
@@ -1774,6 +1847,7 @@ def _submit_dispatch(args, raw_argv: list[str], *, base: Path) -> int:
             "model": args.model,
             "shape": args.shape,
             "read_only": bool(args.read_only),
+            "os_sandbox": getattr(args, "os_sandbox", None),
             "base_sha": submit_base_sha,
             "account": args.account,
             "billing": args.billing,
@@ -2604,6 +2678,7 @@ def _queued_args_for_status(entry: dict):
         prompt_file=request.get("prompt_file"),
         account=request.get("account"),
         read_only=bool(request.get("read_only")),
+        os_sandbox=request.get("os_sandbox"),
         controller_pid=None,
         queue_launch_token=entry.get("queue_launch_token"),
         task_ids=list(entry.get("task_ids") or request.get("task_ids") or []),
@@ -3048,7 +3123,7 @@ def _build_acp_cfg(args, *, status_json: Path):
 
 
 def _default_max_idle_secs(args) -> float:
-    if not getattr(args, "read_only", False) and str(getattr(args, "agent", "")) in CODE_WRITER_AGENTS:
+    if not _effective_read_only(args) and str(getattr(args, "agent", "")) in CODE_WRITER_AGENTS:
         return CODE_WRITER_MAX_IDLE_SECS
     return DEFAULT_MAX_IDLE_SECS
 
@@ -3433,7 +3508,9 @@ def build_worker(args, prompt_path, raw_argv: list[str]):
     `prompt_path` is the already-materialized prompt file (or None for raw)."""
     if raw_argv:
         return raw_argv, None  # raw escape hatch; stdin = DEVNULL
-    sandbox = "read-only" if args.read_only else "workspace-write"
+    # codex's own --sandbox value for the effective OS sandbox profile.
+    # "off" -> danger-full-access (Seatbelt disabled) for trusted local GPU/perf.
+    sandbox = _CODEX_SANDBOX_VALUE[_effective_os_sandbox(args)]
     model = getattr(args, "model", None)
     if args.agent == "codex":
         argv = ["codex", "exec", "--skip-git-repo-check", "--sandbox", sandbox,
@@ -3520,7 +3597,17 @@ def main(argv: list[str] | None = None) -> int:
                         help="Worker model id (grok-code/grok-research/codex --model passthrough). "
                              "Default = agent label's own default.")
     parser.add_argument("--read-only", action="store_true",
-                        help="Read-only sandbox (review/analysis dispatches)")
+                        help="Read-only sandbox (review/analysis dispatches). Equivalent to "
+                             "--os-sandbox read-only.")
+    parser.add_argument("--os-sandbox", choices=list(OS_SANDBOX_PROFILES), default=None,
+                        help="Opt-in OS sandbox profile for the bash-shape codex worker. Unset = "
+                             "workspace-write (the unchanged default; existing dispatches are "
+                             "unaffected). 'off' disables codex's Seatbelt sandbox "
+                             "(codex --sandbox danger-full-access) for TRUSTED LOCAL GPU/perf work — "
+                             "lets the worker reach Metal/MPS and write .git/worktrees/<name> to "
+                             "self-commit. Sanctioned adapter profile, DISTINCT from the always-"
+                             "forbidden --dangerously-*/--no-sandbox bypass flags. Commit-guard "
+                             "(explicit pathspecs, no auto-push) + capacity/ledger tracking unchanged.")
     parser.add_argument("--priority", choices=["critical", "normal", "bulk"], default="normal",
                         help="Capacity lane. bulk = review storms / batch work (reserves the last "
                              "machine+pool slots for others); critical = fix dispatches (may borrow "
@@ -3647,6 +3734,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise DispatchUsageError("--shape acp requires --prompt or --prompt-file")
             if args.prompt_file and not Path(args.prompt_file).expanduser().exists():
                 raise DispatchUsageError(f"prompt file not found: {args.prompt_file}")
+            _validate_os_sandbox_conflict(args)
             _guard_read_only_write_prompt(args)
             dispatch_warnings = _dispatch_warnings(args, raw)
             args.dispatch_warnings = dispatch_warnings
