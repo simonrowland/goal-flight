@@ -652,10 +652,12 @@ def test_instruction_split_contract() -> None:
     # future feature-add bloat.
     assert_true(
         # Budget raised 28.7KB -> 31KB on 2026-06-08 for the deliberate, compacted
-        # "Gotchas from session traffic" section (one-liners; the line budget at
-        # test_skill_structure is already satisfied). Catches future bloat.
-        f"SKILL under 31KB (got {len(skill.encode())}B)",
-        len(skill.encode()) <= 31_000,
+        # "Gotchas from session traffic" section. Raised 31KB -> 32.5KB on 2026-07-05
+        # for the deliberate "Command danger classification" taxonomy (concise; the
+        # full detail + drainer daemon + incident writeup live in
+        # protocols/dispatch-danger.md, off the SKILL budget). Catches future bloat.
+        f"SKILL under 32.5KB (got {len(skill.encode())}B)",
+        len(skill.encode()) <= 32_500,
     )
     for protocol in [
         "session-preflight.md",

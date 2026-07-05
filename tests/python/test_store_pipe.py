@@ -180,6 +180,7 @@ def test_pipe_submits_with_task_linkage_and_one_drain() -> None:
             "pipe",
             "--agent",
             "codex",
+            "--autodispatch-confirm",
             env={"GOALFLIGHT_TASK_PIPE_DISPATCH": str(stub)},
         )
         assert_true(f"pipe exits 0: {proc.stderr}", proc.returncode == 0)
@@ -197,6 +198,32 @@ def test_pipe_submits_with_task_linkage_and_one_drain() -> None:
         second_call = next(call for call in submit_calls if call[call.index("--task") + 1] == second)
         assert_true("prompt-path submitted as absolute prompt-file", first_call[first_call.index("--prompt-file") + 1] == str((prompts / "first.md").resolve()))
         assert_true("inline prompt submitted", second_call[second_call.index("--prompt") + 1] == "inline prompt")
+
+
+def test_pipe_refuses_fanout_without_confirm() -> None:
+    """The fan-out safety gate: without --autodispatch-confirm, pipe must refuse
+    and dispatch NOTHING (incident 2026-07-05)."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        project = tmp / "project"
+        prompts = project / "docs-private" / "prompts"
+        prompts.mkdir(parents=True)
+        run_task(project, "new", "Inline prompt task", "--prompt", "inline prompt", "--by", "tester")
+        stub, log = make_stub(tmp)
+
+        proc = run_task(project, "pipe", "--agent", "codex", env={"GOALFLIGHT_TASK_PIPE_DISPATCH": str(stub)})
+        # Refuses fan-out without the explicit confirm flag...
+        assert_true(f"gate refuses without confirm (rc=2): {proc.stderr}", proc.returncode == 2)
+        assert_true("gate points at --autodispatch-confirm", "--autodispatch-confirm" in proc.stderr)
+        # ...names the worker count + target cwd...
+        assert_true("gate names the worker count", "about to dispatch 1 worker(s)" in proc.stderr)
+        assert_true("gate names the target cwd", str(project.resolve()) in proc.stderr)
+        # ...and explains the queue->drain consequence (N queued, drainer launches them).
+        assert_true("gate explains N are QUEUED", "QUEUES those 1 task(s)" in proc.stderr)
+        assert_true("gate names the drainer daemon", "com.goalflight.drain" in proc.stderr)
+        assert_true("gate says the daemon LAUNCHES them", "LAUNCHES" in proc.stderr)
+        # ...while dispatching NOTHING itself.
+        assert_true("gate dispatches NOTHING", read_calls(log) == [])
 
 
 def test_prompt_path_reads_are_project_contained() -> None:
@@ -236,7 +263,7 @@ def test_pipe_json_emits_summary_on_dispatch_failure() -> None:
         item_id = run_task(project, "new", "Prompt path task", "--prompt-path", "docs-private/prompts/first.md", "--by", "tester").stdout.strip()
         stub, log = make_failing_stub(tmp)
 
-        proc = run_task(project, "pipe", "--json", env={"GOALFLIGHT_TASK_PIPE_DISPATCH": str(stub)})
+        proc = run_task(project, "pipe", "--json", "--autodispatch-confirm", env={"GOALFLIGHT_TASK_PIPE_DISPATCH": str(stub)})
         assert_true("pipe returns failing dispatch code", proc.returncode == 7)
         payload = json.loads(proc.stdout)
         assert_true("json summary includes piped item", payload["piped"][0]["id"] == item_id)
@@ -248,6 +275,7 @@ def test_pipe_json_emits_summary_on_dispatch_failure() -> None:
 def main() -> None:
     test_pipe_dry_run_and_no_prompt_exclusion()
     test_pipe_submits_with_task_linkage_and_one_drain()
+    test_pipe_refuses_fanout_without_confirm()
     test_prompt_path_reads_are_project_contained()
     test_pipe_json_emits_summary_on_dispatch_failure()
     print("OK: store pipe tests pass")

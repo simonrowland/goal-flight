@@ -3323,6 +3323,30 @@ def _cmd_pipe(store: TaskStore, args: argparse.Namespace) -> int:
     results: list[dict[str, Any]] = []
     piped_by_id = {entry["id"]: entry for entry in piped}
     exit_code = 0
+
+    # Fan-out safety gate. This command spawns ONE worker per frontier item —
+    # each leases capacity, costs money, and runs in the target cwd. Auto-spawning
+    # a fleet must never be the default: refuse without explicit opt-in. (--dry-run
+    # returned above, so reaching here means a real dispatch was requested.)
+    if piped and not getattr(args, "autodispatch_confirm", False):
+        task_ids = ", ".join(entry["id"] for entry in piped)
+        print(
+            f"about to dispatch {len(piped)} worker(s) (tasks: {task_ids}) "
+            f"into {store.project_root}",
+            file=sys.stderr,
+        )
+        print(
+            f"This QUEUES those {len(piped)} task(s) as workers — it is NOT a queue "
+            "drainer despite the name. The always-on com.goalflight.drain launchd "
+            "daemon then LAUNCHES every queued worker (~60s cadence), so all "
+            f"{len(piped)} will run even after this command returns. They run in the "
+            "SHARED project root (collision risk if agents already hold that "
+            "worktree) with the RAW task prompt (no mandate/5-layer briefing).",
+            file=sys.stderr,
+        )
+        print("Re-run with --autodispatch-confirm to proceed (or --dry-run to preview).", file=sys.stderr)
+        return 2
+
     for row in rows:
         item_id = str(row["id"])
         entry = piped_by_id.get(item_id)
@@ -3500,7 +3524,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     show = sub.add_parser(
         "show",
-        help="Read one item by id.",
+        help="READ-ONLY (safe, free): read one item by id.",
         epilog="examples:\n  goalflight_task.py show t-014\n  goalflight_task.py show t-014 --json\n  goalflight_task.py show t-014 --prompt",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -3664,7 +3688,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     list_cmd = sub.add_parser(
         "list",
-        help="Query items with canned dashboard statuses, reserved lanes, and AND filters.",
+        help="READ-ONLY (safe, free): query items with canned dashboard statuses, reserved lanes, and AND filters.",
         epilog=(
             "examples:\n"
             "  goalflight_task.py list outstanding\n"
@@ -3688,7 +3712,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     next_cmd = sub.add_parser(
         "next",
-        help="READ: print the flat dispatchable frontier.",
+        help="READ-ONLY (safe, free): print the flat dispatchable frontier. Does NOT dispatch — to fan it out use dispatch-frontier.",
         epilog="example: goalflight_task.py next --json",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -3697,20 +3721,33 @@ def build_parser() -> argparse.ArgumentParser:
     next_cmd.set_defaults(func=_cmd_next)
 
     pipe = sub.add_parser(
-        "pipe",
-        help="Submit prompt-ready frontier items to the dispatch queue, then run one drain pass.",
-        epilog="example: goalflight_task.py pipe --dry-run",
+        "dispatch-frontier",
+        aliases=["pipe"],
+        help="⚠ DISPATCHES WORKERS: fan out the prompt-ready frontier as one worker "
+             "per item (spawns processes, leases capacity, costs money, runs in --cwd). "
+             "Requires --autodispatch-confirm. NOT a queue drainer (the com.goalflight.drain "
+             "daemon drains automatically).",
+        epilog=(
+            "examples:\n"
+            "  goalflight_task.py dispatch-frontier --dry-run          # safe preview, no dispatch\n"
+            "  goalflight_task.py dispatch-frontier --autodispatch-confirm\n"
+            "note: 'pipe' is a legacy alias for this command; the name misleads "
+            "(it does not 'flush a pipe' — it fans out the frontier as workers)."
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     pipe.add_argument("--by", help=argparse.SUPPRESS)
     pipe.add_argument("--agent", default="codex", help="Default agent when an item has no agent field.")
-    pipe.add_argument("--dry-run", action="store_true")
+    pipe.add_argument("--dry-run", action="store_true",
+                      help="Preview what WOULD dispatch (id -> prompt -> agent) without spawning anything. Safe/free.")
+    pipe.add_argument("--autodispatch-confirm", action="store_true",
+                      help="Required to actually fan out: confirm dispatching N workers into the target cwd.")
     pipe.add_argument("--json", action="store_true")
     pipe.set_defaults(func=_cmd_pipe)
 
     status = sub.add_parser(
         "status",
-        help="Print derived task status.",
+        help="READ-ONLY (safe, free): print derived task status.",
         epilog="example: goalflight_task.py status --json",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )

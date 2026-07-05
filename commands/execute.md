@@ -6,6 +6,11 @@ description: "Execute queued goal chunks with capacity-aware workers."
 
 Execute the next goal-queue chunks with procedural workers and compact status.
 
+> ⚠ **DISPATCHES WORKERS.** Spawns worker processes, leases capacity (costs
+> money), and may mutate a worktree. See "Command danger classification" in
+> `SKILL.md`. The standing `com.goalflight.drain` daemon (every ~60s, always-on)
+> launches anything queued — draining is automatic, not a manual step.
+
 Read:
 
 - `protocols/session-preflight.md`

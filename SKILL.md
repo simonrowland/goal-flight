@@ -171,6 +171,23 @@ drift against an in-flight queue.
 
 Protocol index: `protocols/README.md`.
 
+## Command danger classification
+
+Full detail + the drainer daemon + the incident writeup: `protocols/dispatch-danger.md`.
+
+**READ-ONLY (safe, free):** `goalflight_task.py status` · `list` · `next` · `show` —
+read/derive from the store only. `next` prints the frontier; it does NOT dispatch it.
+
+**⚠ DISPATCHES WORKERS (spawns processes, leases capacity, costs money, may mutate a
+worktree):** `dispatch-frontier` (legacy alias `pipe`) fans out the WHOLE frontier as
+one worker per item — it is NOT a drainer, needs `--autodispatch-confirm`, and runs in
+the shared project root with the raw prompt (no mandate). `/goal-flight execute` and
+`goalflight_dispatch.py --submit`/`dispatch` also spawn workers.
+
+**Always-on drainer:** the `com.goalflight.drain` launchd daemon runs `goalflight_dispatch.py
+drain --json` every ~60s and LAUNCHES anything queued — queuing is not free, and the
+ledger/queue are shared across projects (identify origin by `project_root`).
+
 ## Review layers
 
 Review layers: executor self-review, chunk review, milestone review.
