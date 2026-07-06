@@ -14,6 +14,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 TASK = ROOT / "goalflight_task.py"
 
+sys.path.insert(0, str(ROOT))
+import goalflight_task as _gft  # noqa: E402
+
+
+def _canonical_docs(project_root: Path) -> Path:
+    """Canonical (out-of-tree) store docs dir for white-box seeding/inspection."""
+    return _gft.resolve_task_store_dir(project_root) / "docs-private"
+
 
 def assert_true(name: str, condition: bool) -> None:
     if not condition:
@@ -41,12 +49,20 @@ def run_task(
 
 
 def read_items(project_root: Path) -> list[dict]:
-    path = project_root / "docs-private" / "tasks.jsonl"
+    # Prefer the canonical (out-of-tree) store; fall back to the in-tree legacy
+    # file when the store has not migrated yet (read-through).
+    path = _canonical_docs(project_root) / "tasks.jsonl"
+    if not path.exists():
+        path = project_root / "docs-private" / "tasks.jsonl"
+    if not path.exists():
+        return []
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
 def write_items(project_root: Path, items: list[dict]) -> None:
-    docs = project_root / "docs-private"
+    # Write the CANONICAL tasks.jsonl (the tool reads canonical, not the in-tree
+    # export), then `sync` regenerates the mirror + export from it.
+    docs = _canonical_docs(project_root)
     docs.mkdir(parents=True, exist_ok=True)
     (docs / "tasks.jsonl").write_text(
         "".join(json.dumps(item, separators=(",", ":")) + "\n" for item in items),

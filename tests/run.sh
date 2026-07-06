@@ -11,6 +11,16 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# Isolate the durable canonical task-store base so no test writes to the real
+# ~/.local/state/goal-flight (mirrors the per-test GOALFLIGHT_STATE_DIR isolation).
+# Only mint + clean a temp base when the outer env did not provide one.
+if [ -z "${GOALFLIGHT_TASK_STORE_DIR:-}" ]; then
+  _GF_TASK_STORE_BASE="$(mktemp -d "${TMPDIR:-/tmp}/gf-test-taskstore-XXXXXX")"
+  trap 'rm -rf "$_GF_TASK_STORE_BASE" 2>/dev/null || true' EXIT
+else
+  _GF_TASK_STORE_BASE="$GOALFLIGHT_TASK_STORE_DIR"
+fi
+
 pass=0
 fail=0
 failed_tests=()
@@ -28,7 +38,8 @@ run_isolated_test_env() {
   # the suite isolates GOALFLIGHT_STATE_DIR). An explicit outer value passes
   # through for tests that deliberately exercise a real conf.
   env -u GOALFLIGHT_STEER_FILE -u GOALFLIGHT_ALLOW_EXTERNAL_STEER_FILE \
-    GOALFLIGHT_CAPACITY_CONF="${GOALFLIGHT_CAPACITY_CONF:-/dev/null}" "$@"
+    GOALFLIGHT_CAPACITY_CONF="${GOALFLIGHT_CAPACITY_CONF:-/dev/null}" \
+    GOALFLIGHT_TASK_STORE_DIR="${GOALFLIGHT_TASK_STORE_DIR:-$_GF_TASK_STORE_BASE}" "$@"
 }
 
 # Bash tests (tests/bash/test-*.sh)

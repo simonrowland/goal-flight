@@ -31,6 +31,24 @@ FIXTURE = ROOT / "tests" / "fixtures" / "tasks-mirror"
 TASK = ROOT / "goalflight_task.py"
 NODE = shutil.which("node")
 
+# The canonical task store now lives OUT of the project tree (durable base,
+# per-repo namespaced). The in-tree docs-private/dashboard are a one-way EXPORT
+# plus the home for human/external inputs. White-box pokes at store-internal
+# machine state (tasks.jsonl read as canonical, the publish marker, seq files,
+# tasks.lock, generated markdown/mirror views, live-checker pair) must target
+# the CANONICAL location; human/external inputs (reviews, RESUME-NOTES,
+# history.md, harvest source markdown) stay in-tree.
+sys.path.insert(0, str(ROOT))
+import goalflight_task as _gft  # noqa: E402
+
+
+def _canonical_docs(project_root: Path) -> Path:
+    return _gft.resolve_task_store_dir(project_root) / "docs-private"
+
+
+def _canonical_dashboard(project_root: Path) -> Path:
+    return _gft.resolve_task_store_dir(project_root) / "dashboard"
+
 
 def assert_true(name: str, condition: bool) -> None:
     if not condition:
@@ -51,7 +69,7 @@ def run_checker(target_dir: Path, *, timeout: float = 30) -> subprocess.Complete
 
 def run_live_checker(project_root: Path, *, timeout: float = 30) -> subprocess.CompletedProcess:
     return subprocess.run(
-        [NODE, str(CHECKER), str(project_root / "docs-private"), str(project_root / "dashboard")],
+        [NODE, str(CHECKER), str(_canonical_docs(project_root)), str(_canonical_dashboard(project_root))],
         cwd=str(ROOT),
         text=True,
         stdout=subprocess.PIPE,
@@ -96,8 +114,11 @@ def _copy_fixture(dst: Path) -> None:
 
 
 def _write_tasks(project_root: Path, items: list[dict]) -> None:
-    docs = project_root / "docs-private"
-    dashboard = project_root / "dashboard"
+    # Seed the CANONICAL store the tool reads (out of the project tree), plus
+    # its dashboard mirror, so a subsequent read/mutation sees this state as
+    # canonical rather than migrating an in-tree legacy file.
+    docs = _canonical_docs(project_root)
+    dashboard = _canonical_dashboard(project_root)
     docs.mkdir(parents=True, exist_ok=True)
     dashboard.mkdir(parents=True, exist_ok=True)
     (docs / "tasks.jsonl").write_text(
@@ -112,7 +133,7 @@ def _write_tasks(project_root: Path, items: list[dict]) -> None:
 
 
 def _read_items(project_root: Path) -> list[dict]:
-    path = project_root / "docs-private" / "tasks.jsonl"
+    path = _canonical_docs(project_root) / "tasks.jsonl"
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
@@ -420,8 +441,7 @@ def test_goalflight_task_sync_writes_mirror_only_derived_status() -> None:
 
         proc = run_task(project, "sync", "--by", "watcher")
         assert_true(f"sync exits 0: {proc.stderr}", proc.returncode == 0)
-        docs = project / "docs-private"
-        data_js = (project / "dashboard" / "tasks-data.js").read_text(encoding="utf-8")
+        data_js = (_canonical_dashboard(project) / "tasks-data.js").read_text(encoding="utf-8")
         payload = data_js.split("window.GF_ITEMS = ", 1)[1].split(";\nif", 1)[0]
         data_items = {item["id"]: item for item in json.loads(payload)}
         assert_true("working derived status in mirror", data_items["t-001"]["derived_status"] == "working")
@@ -485,7 +505,7 @@ def test_goalflight_task_sync_appends_plural_task_ids() -> None:
 
         items = [
             json.loads(line)
-            for line in (project / "docs-private" / "tasks.jsonl").read_text(encoding="utf-8").splitlines()
+            for line in (_canonical_docs(project) / "tasks.jsonl").read_text(encoding="utf-8").splitlines()
             if line.strip()
         ]
         for item in items:
@@ -847,7 +867,10 @@ def test_goalflight_task_review_captures_confirmed_bug_item() -> None:
 def test_goalflight_task_harvest_idempotent_with_source_links_and_history() -> None:
     with tempfile.TemporaryDirectory() as td:
         project = Path(td)
+        # Harvest sources + history.md are human/external inputs the tool reads
+        # in-tree; the canonical store lives elsewhere (seeded by _write_tasks).
         docs = project / "docs-private"
+        docs.mkdir(parents=True, exist_ok=True)
         _write_tasks(
             project,
             [
@@ -1016,6 +1039,7 @@ def test_goalflight_task_harvest_ignores_skeleton_placeholders() -> None:
     with tempfile.TemporaryDirectory() as td:
         project = Path(td)
         docs = project / "docs-private"
+        docs.mkdir(parents=True, exist_ok=True)
         _write_tasks(project, [])
         shutil.copy(SKELETON / "bug-patterns.md", docs / "bug-patterns.md")
         (docs / "bug-backlog.md").write_text(
@@ -1049,6 +1073,7 @@ def test_goalflight_task_harvest_allows_real_angle_bracket_titles() -> None:
     with tempfile.TemporaryDirectory() as td:
         project = Path(td)
         docs = project / "docs-private"
+        docs.mkdir(parents=True, exist_ok=True)
         _write_tasks(project, [])
         (docs / "bug-backlog.md").write_text(
             "\n".join(
@@ -1093,6 +1118,7 @@ def test_goalflight_task_harvest_keeps_literal_punctuation_distinct() -> None:
     with tempfile.TemporaryDirectory() as td:
         project = Path(td)
         docs = project / "docs-private"
+        docs.mkdir(parents=True, exist_ok=True)
         _write_tasks(project, [])
         (docs / "bug-backlog.md").write_text(
             "\n".join(
@@ -1191,7 +1217,7 @@ def test_goalflight_task_schema_version_tolerance_and_read_api() -> None:
         assert_true(f"sync exits 0: {proc.stderr}", proc.returncode == 0)
         rows = [
             json.loads(line)
-            for line in (project / "docs-private" / "tasks.jsonl").read_text(encoding="utf-8").splitlines()
+            for line in (_canonical_docs(project) / "tasks.jsonl").read_text(encoding="utf-8").splitlines()
             if line.strip()
         ]
         assert_true("sync writes schema_version on every item", all(isinstance(item.get("schema_version"), int) for item in rows))
@@ -1231,8 +1257,8 @@ def test_goalflight_task_atomic_write_rejects_bad_content() -> None:
         project = Path(td)
         proc = run_task(project, "new", "Good task")
         assert_true(f"seed new exits 0: {proc.stderr}", proc.returncode == 0)
-        docs = project / "docs-private"
-        dashboard = project / "dashboard"
+        docs = _canonical_docs(project)
+        dashboard = _canonical_dashboard(project)
         before_jsonl = (docs / "tasks.jsonl").read_text(encoding="utf-8")
         before_data = (dashboard / "tasks-data.js").read_text(encoding="utf-8")
 
@@ -1326,7 +1352,7 @@ def test_goalflight_task_interrupted_publish_marker_repairs_mirror() -> None:
             "done": False,
         }
         _write_tasks(project, [old_item])
-        docs = project / "docs-private"
+        docs = _canonical_docs(project)
         new_item = dict(old_item)
         new_item["title"] = "New canonical title"
         (docs / "tasks.jsonl").write_text(json.dumps(new_item, separators=(",", ":")) + "\n", encoding="utf-8")
@@ -1340,7 +1366,7 @@ def test_goalflight_task_interrupted_publish_marker_repairs_mirror() -> None:
         payload = json.loads(proc.stdout)
         assert_true("status read canonical item", payload["items"][0]["title"] == "New canonical title")
         assert_true("publish marker cleared", not (docs / ".tasks-publish-incomplete.json").exists())
-        assert_true("mirror repaired to canonical title", "New canonical title" in (project / "dashboard" / "tasks-data.js").read_text(encoding="utf-8"))
+        assert_true("mirror repaired to canonical title", "New canonical title" in (_canonical_dashboard(project) / "tasks-data.js").read_text(encoding="utf-8"))
         assert_true("markdown repaired to canonical title", "New canonical title" in (docs / "task-decomposition.md").read_text(encoding="utf-8"))
         proc = run_live_checker(project)
         assert_true("repaired pair passes checker", proc.returncode == 0)
@@ -1462,7 +1488,7 @@ def test_goalflight_task_rejects_non_regular_store_files_without_hanging() -> No
     with tempfile.TemporaryDirectory() as td:
         project = Path(td)
         _write_tasks(project, [item])
-        docs = project / "docs-private"
+        docs = _canonical_docs(project)
         target = docs / "tasks-target.jsonl"
         target.write_text((docs / "tasks.jsonl").read_text(encoding="utf-8"), encoding="utf-8")
         (docs / "tasks.jsonl").unlink()
@@ -1478,7 +1504,7 @@ def test_goalflight_task_rejects_non_regular_store_files_without_hanging() -> No
     with tempfile.TemporaryDirectory() as td:
         project = Path(td)
         _write_tasks(project, [item])
-        docs = project / "docs-private"
+        docs = _canonical_docs(project)
         seq_target = docs / "seq-target.json"
         seq_target.write_text('{"t": 1}\n', encoding="utf-8")
         (docs / ".task-seq").symlink_to(seq_target)
@@ -1487,7 +1513,7 @@ def test_goalflight_task_rejects_non_regular_store_files_without_hanging() -> No
     with tempfile.TemporaryDirectory() as td:
         project = Path(td)
         _write_tasks(project, [item])
-        docs = project / "docs-private"
+        docs = _canonical_docs(project)
         seq_lock_target = docs / "seq-lock-target"
         seq_lock_target.write_text("", encoding="utf-8")
         (docs / ".task-seq.lock").symlink_to(seq_lock_target)
@@ -1496,7 +1522,7 @@ def test_goalflight_task_rejects_non_regular_store_files_without_hanging() -> No
     with tempfile.TemporaryDirectory() as td:
         project = Path(td)
         _write_tasks(project, [item])
-        docs = project / "docs-private"
+        docs = _canonical_docs(project)
         lock_target = docs / "tasks-lock-target"
         lock_target.write_text("", encoding="utf-8")
         (docs / "tasks.lock").symlink_to(lock_target)
@@ -1506,7 +1532,7 @@ def test_goalflight_task_rejects_non_regular_store_files_without_hanging() -> No
         with tempfile.TemporaryDirectory() as td:
             project = Path(td)
             _write_tasks(project, [item])
-            docs = project / "docs-private"
+            docs = _canonical_docs(project)
             (docs / "tasks.jsonl").unlink()
             os.mkfifo(docs / "tasks.jsonl")
             for command in commands:
@@ -1533,9 +1559,9 @@ def test_goalflight_task_sequence_write_uses_atomic_fsync_writer() -> None:
             module._atomic_write_text = original
         assert_true("reserved first task id", item_id == "t-001")
         assert_true("sequence used atomic writer", len(calls) == 1)
-        assert_true("sequence atomic path", calls[0][0].resolve() == (project / "docs-private" / ".task-seq").resolve())
+        assert_true("sequence atomic path", calls[0][0].resolve() == (_canonical_docs(project) / ".task-seq").resolve())
         assert_true("sequence atomic prefix", calls[0][1] == ".task-seq-")
-        assert_true("sequence file written", json.loads((project / "docs-private" / ".task-seq").read_text())["t"] == 1)
+        assert_true("sequence file written", json.loads((_canonical_docs(project) / ".task-seq").read_text())["t"] == 1)
 
 
 def test_goalflight_task_max_sequence_avoids_publish_recovery_under_store_lock() -> None:
@@ -1606,10 +1632,9 @@ def test_goalflight_task_sync_repairs_stale_mirror() -> None:
             "done": False,
         }
         _write_tasks(project, [item])
-        docs = project / "docs-private"
         stale = dict(item)
         stale["title"] = "Stale mirror title"
-        (project / "dashboard" / "tasks-data.js").write_text("window.GF_ITEMS = " + json.dumps([stale], indent=2) + ";\n", encoding="utf-8")
+        (_canonical_dashboard(project) / "tasks-data.js").write_text("window.GF_ITEMS = " + json.dumps([stale], indent=2) + ";\n", encoding="utf-8")
 
         proc = run_task(project, "sync", "--by", "watcher")
         assert_true(f"sync exits 0: {proc.stderr}", proc.returncode == 0)
@@ -1631,7 +1656,7 @@ def test_goalflight_task_data_js_escapes_script_end_and_html() -> None:
             "prompt </script><img src=x onerror=alert(1)>",
         )
         assert_true(f"new with script-like title exits 0: {proc.stderr}", proc.returncode == 0)
-        data_js = (project / "dashboard" / "tasks-data.js").read_text(encoding="utf-8")
+        data_js = (_canonical_dashboard(project) / "tasks-data.js").read_text(encoding="utf-8")
         assert_true("script end escaped", "</script" not in data_js.lower())
         assert_true("raw img tag escaped", "<img" not in data_js.lower())
         assert_true("json payload carries escaped script start", "\\u003c/script" in data_js.lower())
@@ -1728,7 +1753,7 @@ def test_goalflight_task_sync_generates_markdown_views() -> None:
         proc = run_task(project, "sync", "--by", "watcher")
         assert_true(f"sync exits 0: {proc.stderr}", proc.returncode == 0)
 
-        docs = project / "docs-private"
+        docs = _canonical_docs(project)
         task_md = (docs / "task-decomposition.md").read_text(encoding="utf-8")
         done_md = (docs / "tasks-done.md").read_text(encoding="utf-8")
         bug_md = (docs / "bug-backlog.md").read_text(encoding="utf-8")

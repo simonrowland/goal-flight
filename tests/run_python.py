@@ -4,9 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 
@@ -60,6 +63,15 @@ def main(argv: list[str] | None = None) -> int:
     # assertions machine-independent (the bash harness does the same). Child
     # subprocesses inherit this via os.environ.
     os.environ.setdefault("GOALFLIGHT_CAPACITY_CONF", os.devnull)
+
+    # Isolate the durable canonical task-store base so no test writes to the real
+    # ~/.local/state/goal-flight. Each test's unique tmp project path hashes to
+    # its own store beneath this base; per-test GOALFLIGHT_TASK_STORE_DIR still
+    # wins. Cleaned at interpreter exit.
+    if "GOALFLIGHT_TASK_STORE_DIR" not in os.environ:
+        _ts_base = tempfile.mkdtemp(prefix="gf-test-taskstore-")
+        os.environ["GOALFLIGHT_TASK_STORE_DIR"] = _ts_base
+        atexit.register(shutil.rmtree, _ts_base, ignore_errors=True)
 
     if args.list:
         for test in _test_files():

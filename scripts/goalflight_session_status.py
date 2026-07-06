@@ -381,9 +381,10 @@ def aggregate_status(project_root: Path, *, ttl_days: int = 7) -> dict:
 
 
 def _task_backlog_counts(project_root: Path) -> tuple[dict[str, int] | None, str | None]:
+    # Read through the canonical store, not the in-tree export: the export can be
+    # absent/stale (e.g. a sync race removed it) while the durable store is intact.
+    # goalflight_task.list() reads canonical and returns [] for an absent store.
     tasks_path = project_root / "docs-private" / "tasks.jsonl"
-    if not tasks_path.exists():
-        return {"deferred": 0, "held": 0, "blocked": 0}, None
     try:
         if str(ROOT) not in sys.path:
             sys.path.insert(0, str(ROOT))
@@ -410,9 +411,9 @@ def _task_backlog_counts(project_root: Path) -> tuple[dict[str, int] | None, str
 
 
 def _ready_frontier(project_root: Path) -> tuple[dict[str, object] | None, str | None]:
+    # Read through the canonical store, not the in-tree export (which can be
+    # absent/stale after a sync race); next_frontier() reads canonical.
     tasks_path = project_root / "docs-private" / "tasks.jsonl"
-    if not tasks_path.exists():
-        return {"count": 0}, None
     try:
         if str(ROOT) not in sys.path:
             sys.path.insert(0, str(ROOT))

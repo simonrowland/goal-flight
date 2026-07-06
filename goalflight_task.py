@@ -342,6 +342,49 @@ def resolve_project_root(value: str | None = None) -> Path:
     return _strip_managed_worktree(top)
 
 
+def _durable_state_base() -> Path:
+    """Durable machine-local base for the canonical task store.
+
+    Deliberately NOT goalflight_compat.resolve_state_dir(): that defaults to the
+    /tmp scratch dir macOS reaps after ~3 days idle, which is correct for
+    disposable dispatch/capacity state but would silently lose an idle project's
+    durable task backlog. Canonical task data lives under XDG_STATE_HOME
+    (~/.local/state) instead.
+    """
+    xdg = os.environ.get("XDG_STATE_HOME", "").strip()
+    base = Path(xdg).expanduser() if xdg else Path.home() / ".local" / "state"
+    return base / "goal-flight"
+
+
+def _task_store_slug(main_root: Path) -> str:
+    """Repo-named, collision-safe folder name: ``<repo-slug>-<pathhash>``.
+
+    Leads with the repo basename so ``ls task-stores/`` is legible across the N
+    projects on one machine; the 10-char hash of the absolute project path
+    disambiguates two *different* repos that share a basename (e.g. ~/work/api
+    vs ~/experiments/api) so they never collide into one shared store.
+    """
+    name = main_root.name or "root"
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-") or "root"
+    digest = hashlib.sha1(str(main_root).encode("utf-8")).hexdigest()[:10]
+    return f"{slug}-{digest}"
+
+
+def resolve_task_store_dir(project_root: Path) -> Path:
+    """Durable, per-repo, worktree-invariant canonical store directory.
+
+    ``$GOALFLIGHT_TASK_STORE_DIR`` overrides the base (tests/CI point it at a
+    mktemp dir); per-repo namespacing is still applied beneath it, so multiple
+    projects in one test stay isolated. ``main_root`` is worktree-stripped so
+    every worktree of the same project collapses to the same store (one shared
+    backlog) — intentional.
+    """
+    main_root = _strip_managed_worktree(project_root)
+    override = os.environ.get("GOALFLIGHT_TASK_STORE_DIR", "").strip()
+    base = Path(override).expanduser() if override else _durable_state_base()
+    return (base / "task-stores" / _task_store_slug(main_root)).resolve(strict=False)
+
+
 def _actor(args: argparse.Namespace) -> str:
     if getattr(args, "by", None):
         return args.by
@@ -1000,6 +1043,23 @@ def _atomic_write_text(path: Path, text: str, *, prefix: str = ".tmp-") -> None:
         raise
 
 
+def _atomic_write_bytes(path: Path, data: bytes, *, prefix: str = ".tmp-") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=prefix, dir=str(path.parent))
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        tmp.replace(path)
+        _fsync_dir(path.parent)
+    except Exception:
+        with contextlib.suppress(FileNotFoundError):
+            tmp.unlink()
+        raise
+
+
 def _run_checker(store_dir: Path, dashboard_dir: Path | None = None) -> None:
     node = shutil.which("node")
     if not node:
@@ -1307,8 +1367,19 @@ def _coerce_query(query: Any = None, **overrides: Any) -> dict[str, Any]:
 class TaskStore:
     def __init__(self, project_root: Path):
         self.project_root = _strip_managed_worktree(project_root)
-        self.docs_dir = self.project_root / "docs-private"
-        self.dashboard_dir = self.project_root / "dashboard"
+        # Canonical store lives OUT of the (possibly Dropbox-synced) project tree
+        # so the sync daemon never owns the live mutation target. All the atomic
+        # machinery (staging, checker, marker, snapshots, lock, seq) operates
+        # entirely within store_dir; the project tree only receives a one-way
+        # export (see _export_to_project_tree).
+        self.store_dir = resolve_task_store_dir(self.project_root)
+        self.docs_dir = self.store_dir / "docs-private"
+        self.dashboard_dir = self.store_dir / "dashboard"
+        # One-way export targets in the project tree: the dashboard and any agent
+        # that python-reads the JSON read THESE copies; they are regenerated from
+        # canonical on every write, so a sync rollback of an export is cosmetic.
+        self.export_docs_dir = self.project_root / "docs-private"
+        self.export_dashboard_dir = self.project_root / "dashboard"
         self.tasks_path = self.docs_dir / "tasks.jsonl"
         self.data_js_path = self.dashboard_dir / "tasks-data.js"
         self.task_decomposition_path = self.docs_dir / "task-decomposition.md"
@@ -1320,8 +1391,21 @@ class TaskStore:
         self.seq_lock_path = self.docs_dir / ".task-seq.lock"
         self.publish_marker_path = self.docs_dir / ".tasks-publish-incomplete.json"
         self.log_dir = self.docs_dir / "log"
+        self._migrated = False
 
-    def _require_state_dir_safe(self, path: Path, label: str) -> None:
+    def _require_state_dir_safe(self, path: Path, label: str, *, base: Path | None = None) -> None:
+        root = (base or self.store_dir).resolve(strict=False)
+        resolved = path.resolve(strict=False)
+        try:
+            resolved.relative_to(root)
+        except ValueError as exc:
+            raise TaskError(f"{label}: resolved state directory escapes {root}: {resolved}") from exc
+        _require_no_symlink_components(path, base=(base or self.store_dir))
+
+    def _require_export_dir_safe(self, path: Path, label: str) -> None:
+        """Refuse a symlinked/escaping project-tree export dir. A symlinked
+        docs-private/dashboard could redirect the one-way export to overwrite
+        arbitrary files, so this is a HARD failure, checked before any write."""
         root = self.project_root.resolve(strict=False)
         resolved = path.resolve(strict=False)
         try:
@@ -1335,11 +1419,20 @@ class TaskStore:
         self.docs_dir.mkdir(parents=True, exist_ok=True)
         self._require_state_dir_safe(self.docs_dir, "docs-private")
 
+    def _ensure_export_dirs_for_write(self) -> None:
+        for path, label in ((self.export_docs_dir, "docs-private"), (self.export_dashboard_dir, "dashboard")):
+            self._require_export_dir_safe(path, label)
+            path.mkdir(parents=True, exist_ok=True)
+            self._require_export_dir_safe(path, label)
+
     def _ensure_state_dirs_for_write(self) -> None:
         self._ensure_docs_dir_for_write()
         self._require_state_dir_safe(self.dashboard_dir, "dashboard")
         self.dashboard_dir.mkdir(parents=True, exist_ok=True)
         self._require_state_dir_safe(self.dashboard_dir, "dashboard")
+        # Validate the project-tree export targets up front so a symlinked
+        # docs-private/dashboard fails the whole write before anything leaks.
+        self._ensure_export_dirs_for_write()
 
     @contextlib.contextmanager
     def store_lock(self):
@@ -1347,10 +1440,143 @@ class TaskStore:
         with FileLock(self.store_lock_path):
             yield
 
+    def _ensure_store_ready(self) -> None:
+        """One-time, lock-safe migration of a legacy in-tree store to the durable
+        canonical location. Cheap no-op after the first call. MUST be invoked
+        only when no store lock is held (it acquires its own); every public
+        entrypoint calls it before locking, so the under-lock re-entries see the
+        memoized flag and skip."""
+        if self._migrated:
+            return
+        # New canonical already present -> nothing to migrate (idempotent).
+        if require_regular_or_absent(self.tasks_path):
+            self._migrated = True
+            return
+        legacy_tasks = self.export_docs_dir / "tasks.jsonl"
+        legacy_live = require_regular_or_absent(legacy_tasks)
+        # A legacy store to migrate = a live tasks.jsonl OR any surviving log
+        # snapshot. If a sync race removed the live file but snapshots remain,
+        # we must still recover from them, not treat the project as fresh.
+        if not legacy_live and not self._legacy_snapshot_paths():
+            self._migrated = True
+            return
+        with self.store_lock():
+            # Re-check under lock: a concurrent process may have migrated first.
+            if require_regular_or_absent(self.tasks_path):
+                self._migrated = True
+                return
+            # Refuse a symlinked/escaping in-tree export dir BEFORE reading or
+            # backing up through it (the backup write predates save's own guard).
+            self._require_export_dir_safe(self.export_docs_dir, "docs-private")
+            items = self._read_legacy_best_known_good()
+            if require_regular_or_absent(legacy_tasks):
+                self._backup_legacy_original(legacy_tasks)
+            # Establish canonical only; do NOT export (would clobber in-tree
+            # markdown/harvest sources before the triggering mutation reads them).
+            self.save_items_atomic(items, export=False)
+            self._write_store_moved_pointer()
+            self._migrated = True
+        print(
+            f"goalflight_task: migrated task store out of the project tree to {self.store_dir}",
+            file=sys.stderr,
+        )
+
+    def _legacy_snapshot_paths(self) -> list[Path]:
+        try:
+            return sorted(
+                (self.export_docs_dir / "log").glob("tasks-*.jsonl"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+        except OSError:
+            return []
+
+    @staticmethod
+    def _generation_key(items: list[dict[str, Any]]) -> tuple[int, dt.datetime]:
+        epoch = dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+        latest = max((_record_sort_time(item) for item in items), default=epoch)
+        return (len(items), latest)
+
+    def _read_legacy_best_known_good(self) -> list[dict[str, Any]]:
+        """Migrate the best-known-good legacy generation. Considers the live
+        legacy tasks.jsonl AND every valid log snapshot, and picks the most
+        advanced by (item count, newest item timestamp): more items always wins
+        (this store never deletes items, so counts are monotonic); a same-count
+        tie is broken by the newest item timestamp, so a sync rollback to an
+        older *same-count* generation loses to the fresher snapshot. Considering
+        snapshots also covers the case where the live file was removed entirely
+        but snapshots survive."""
+        legacy_docs = self.export_docs_dir
+        candidates: list[tuple[tuple[int, dt.datetime], list[dict[str, Any]]]] = []
+        for path in [legacy_docs / "tasks.jsonl", *self._legacy_snapshot_paths()]:
+            try:
+                if not require_regular_or_absent(path):
+                    continue
+                items, _ = _parse_jsonl(path)
+                _validate_items_for_write(items)
+            except TaskError:
+                continue
+            candidates.append((self._generation_key(items), items))
+        if not candidates:
+            raise TaskError(
+                f"legacy task-store migration: no valid tasks.jsonl or snapshot under {legacy_docs}"
+            )
+        candidates.sort(key=lambda candidate: candidate[0])
+        return candidates[-1][1]
+
+    def _backup_legacy_original(self, legacy_tasks: Path) -> None:
+        """Preserve the exact pre-migration legacy bytes once, before the export
+        overwrites the in-tree copy. Non-fatal."""
+        try:
+            data = legacy_tasks.read_bytes()
+            stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            backup = legacy_tasks.with_name(f"tasks.jsonl.migrated-{stamp}")
+            if not backup.exists():
+                _write_bytes_fsync(backup, data)
+        except OSError as exc:
+            print(f"goalflight_task: legacy store backup skipped (non-fatal): {exc}", file=sys.stderr)
+
+    def _write_store_moved_pointer(self) -> None:
+        pointer = self.export_docs_dir / "STORE-MOVED.txt"
+        text = (
+            "goal-flight: the canonical task store moved OUT of this (possibly synced) tree.\n"
+            f"Canonical store: {self.store_dir}\n\n"
+            "tasks.jsonl / tasks-data.js / *.md here are now a one-way generated EXPORT.\n"
+            "Edit tasks only through the goal-flight tooling; do not hand-edit these files.\n"
+            "tasks.jsonl.migrated-<stamp> is a one-time pre-migration backup (delete once verified).\n"
+        )
+        try:
+            _atomic_write_text(pointer, text)
+        except OSError as exc:
+            print(f"goalflight_task: STORE-MOVED.txt skipped (non-fatal): {exc}", file=sys.stderr)
+
+    def _effective_tasks_path(self) -> Path:
+        """Where reads load from. Canonical when it exists; otherwise the legacy
+        in-tree store (read-through until the first mutation migrates it); if the
+        live legacy file is gone but a sync race left log snapshots behind, the
+        newest snapshot (so a reader is not shown empty while data survives);
+        otherwise the (absent) canonical path so a fresh store reads empty."""
+        if require_regular_or_absent(self.tasks_path):
+            return self.tasks_path
+        legacy = self.export_docs_dir / "tasks.jsonl"
+        if require_regular_or_absent(legacy):
+            return legacy
+        snaps = self._legacy_snapshot_paths()
+        if snaps:
+            return snaps[0]
+        return self.tasks_path
+
     def load_items(self, *, recover_publish: bool = True) -> list[dict[str, Any]]:
-        if recover_publish:
-            self._recover_interrupted_publish()
-        items, _ = _parse_jsonl(self.tasks_path)
+        if require_regular_or_absent(self.tasks_path):
+            # Canonical present: normal path (recover interrupted publish, read it).
+            if recover_publish:
+                self._recover_interrupted_publish()
+            items, _ = _parse_jsonl(self.tasks_path)
+            return items
+        # No canonical yet: read-through the legacy in-tree store. Migration is
+        # lazy and happens on the first mutation (mutate_items/reserve_id), never
+        # on a pure read — so read-only consumers of a legacy store keep working.
+        items, _ = _parse_jsonl(self._effective_tasks_path())
         return items
 
     def items_by_id(self) -> dict[str, dict[str, Any]]:
@@ -1359,6 +1585,7 @@ class TaskStore:
     def reserve_id(self, family: str) -> str:
         if family not in VALID_FAMILIES:
             raise TaskError(f"unknown id family {family!r}; expected one of {', '.join(sorted(VALID_FAMILIES))}")
+        self._ensure_store_ready()
         self._ensure_docs_dir_for_write()
         with FileLock(self.seq_lock_path):
             seq = self._read_seq()
@@ -1404,6 +1631,7 @@ class TaskStore:
         return out
 
     def mutate_items(self, update: Callable[[list[dict[str, Any]]], Any], *, allow_invalid_live_mirror: bool = False) -> Any:
+        self._ensure_store_ready()
         with self.store_lock():
             self._recover_interrupted_publish_locked()
             self._snapshot_last_good(require_valid=not allow_invalid_live_mirror)
@@ -1412,7 +1640,7 @@ class TaskStore:
             self.save_items_atomic(items)
             return result
 
-    def save_items_atomic(self, items: list[dict[str, Any]]) -> None:
+    def save_items_atomic(self, items: list[dict[str, Any]], *, export: bool = True) -> None:
         self._ensure_state_dirs_for_write()
         _validate_items_for_write(items)
         staging = Path(tempfile.mkdtemp(prefix=".tasks-stage-", dir=str(self.docs_dir)))
@@ -1441,8 +1669,42 @@ class TaskStore:
                 self._clear_publish_marker()
                 raise
             self._clear_publish_marker()
+            # Canonical is committed; publish the one-way export last. Best-effort:
+            # a failed/rolled-back export is cosmetic and self-heals next write.
+            # Skipped during migration so the in-tree markdown sources (which
+            # double as harvest inputs) are not clobbered before the triggering
+            # mutation reads them — that mutation's own save exports right after.
+            if export:
+                self._export_to_project_tree()
         finally:
             shutil.rmtree(staging, ignore_errors=True)
+
+    def _export_to_project_tree(self) -> None:
+        """Copy the canonical views into the project tree for the dashboard and
+        for agents that python-read the JSON directly. One-way and non-fatal: the
+        canonical store is already committed before this runs, so any failure
+        (including a sync daemon racing these copies) never corrupts the store."""
+        exports = [
+            (self.tasks_path, self.export_docs_dir / "tasks.jsonl"),
+            (self.data_js_path, self.export_dashboard_dir / "tasks-data.js"),
+            (self.task_decomposition_path, self.export_docs_dir / "task-decomposition.md"),
+            (self.tasks_done_path, self.export_docs_dir / "tasks-done.md"),
+            (self.bug_backlog_path, self.export_docs_dir / "bug-backlog.md"),
+            (self.bugs_done_path, self.export_docs_dir / "bugs-done.md"),
+        ]
+        try:
+            self.export_docs_dir.mkdir(parents=True, exist_ok=True)
+            self.export_dashboard_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            print(f"goalflight_task: task-store export skipped (mkdir failed: {exc})", file=sys.stderr)
+            return
+        for src, dst in exports:
+            try:
+                if not require_regular_or_absent(src):
+                    continue
+                _atomic_write_bytes(dst, src.read_bytes())
+            except (OSError, TaskError) as exc:
+                print(f"goalflight_task: export of {dst.name} failed (non-fatal): {exc}", file=sys.stderr)
 
     @staticmethod
     def _restore_bytes(path: Path, data: bytes | None) -> None:
@@ -1538,7 +1800,7 @@ class TaskStore:
         if not tasks_exists or not data_exists:
             if not require_valid and tasks_exists:
                 return
-            raise TaskError(f"{self.project_root}: missing docs-private/tasks.jsonl or dashboard/tasks-data.js; refusing mutation without a valid last-known-good pair")
+            raise TaskError(f"{self.store_dir}: missing docs-private/tasks.jsonl or dashboard/tasks-data.js; refusing mutation without a valid last-known-good pair")
         try:
             _run_checker(self.docs_dir, self.dashboard_dir)
         except TaskError:
@@ -2189,7 +2451,9 @@ def _harvest_file_task_candidate(
 
 
 def _harvest_review_candidates(store: TaskStore) -> list[dict[str, Any]]:
-    review_dir = store.docs_dir / "reviews"
+    # Reviews are placed in the PROJECT tree by external review agents/CLI, not
+    # machine state — read them in-tree, not from the relocated canonical store.
+    review_dir = store.export_docs_dir / "reviews"
     if not review_dir.is_dir():
         return []
     candidates: list[dict[str, Any]] = []
@@ -2243,7 +2507,9 @@ def _newest_resume_note(docs_dir: Path) -> Path | None:
 
 
 def _harvest_resume_candidates(store: TaskStore) -> list[dict[str, Any]]:
-    path = _newest_resume_note(store.docs_dir)
+    # RESUME-NOTES-*.md are authored in the PROJECT tree by humans/agents — read
+    # them in-tree, not from the relocated canonical store.
+    path = _newest_resume_note(store.export_docs_dir)
     if path is None:
         return []
     require_regular_file(path)
@@ -2353,10 +2619,14 @@ def _collect_harvest_candidates(
     source_matches: list[dict[str, Any]] = []
     explicit_sources = bool(source_patterns)
     if not explicit_sources:
+        # Harvest sources (bug-backlog.md + bug-pattern lists) are seeded in the
+        # PROJECT tree by users/agents — read them in-tree. The store also EXPORTS
+        # a generated bug-backlog.md here, so idempotent re-harvests see the same
+        # in-tree file whether it was hand-seeded or store-generated.
         bug_paths = [
-            store.docs_dir / "bug-backlog.md",
-            *store.docs_dir.glob("bug-pattern*.md"),
-            *store.docs_dir.glob("bug-patterns/*.md"),
+            store.export_docs_dir / "bug-backlog.md",
+            *store.export_docs_dir.glob("bug-pattern*.md"),
+            *store.export_docs_dir.glob("bug-patterns/*.md"),
         ]
         for path in sorted(bug_paths):
             candidates.extend(_harvest_heading_blocks(store, path, default_kind="bug", source_type="bug-backlog"))
@@ -2512,10 +2782,12 @@ def _first_resume_next(lines: list[str]) -> str:
 
 
 def _append_resume_history(store: TaskStore, actor: str) -> list[str]:
-    notes = sorted(store.docs_dir.glob("RESUME-NOTES-*.md"), key=_resume_sort_key)
+    # RESUME-NOTES-*.md and the history.md ledger they feed are project-tree,
+    # human-facing files (not race-critical machine state) — keep them in-tree.
+    notes = sorted(store.export_docs_dir.glob("RESUME-NOTES-*.md"), key=_resume_sort_key)
     if not notes:
         return []
-    history = store.docs_dir / "history.md"
+    history = store.export_docs_dir / "history.md"
     existing = history.read_text(encoding="utf-8") if require_regular_or_absent(history) else (
         "# goal-flight - History (write-once)\n\n"
         "> Append-only. One entry per compaction handoff. Never edit prior entries.\n"
