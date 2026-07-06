@@ -722,10 +722,11 @@ def test_skill_md_structural_invariants() -> None:
     skill_lines = skill.splitlines()
     wc_line_count = skill.count("\n")
     # Budget raised from 450 to 525 on 2026-05-28 for worker-reliability
-    # hardening. Raised again to 540 on 2026-06-27 because the root workflow
-    # reached 525 lines exactly; 540 restores deliberate edit headroom while
-    # keeping the wrapper compact and within the ~31KB byte budget.
-    assert_true(f"SKILL.md wc -l <= 540 (got {wc_line_count})", wc_line_count <= 540)
+    # hardening. Raised to 540 on 2026-06-27 because the root workflow reached
+    # 525 lines exactly. Raised to 545 on 2026-07-06 for the fan-out safety-gate
+    # "Command danger classification" section; still compact and within the byte
+    # budget.
+    assert_true(f"SKILL.md wc -l <= 545 (got {wc_line_count})", wc_line_count <= 545)
 
     frontmatter_markers = [idx for idx, line in enumerate(skill_lines) if line.strip() == "---"]
     assert_true("SKILL.md has YAML frontmatter close", len(frontmatter_markers) >= 2)
