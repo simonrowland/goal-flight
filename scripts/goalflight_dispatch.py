@@ -44,6 +44,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import datetime as dt
+import hashlib
 try:
     import fcntl
 except ImportError:  # pragma: no cover - Windows fallback path
@@ -87,6 +89,11 @@ QUEUE_DEFAULT_PRIORITY = "normal"
 PRESET_AGENTS = {"codex", "grok-code", "grok-research"}
 STDIN_PROMPT_AGENTS = {"codex", "grok-code", "grok-research"}
 DEFAULT_MAX_IDLE_SECS = 180.0
+_DASHBOARD_REFRESH_SUBCOMMAND = "dashboard-refresh"
+_DASHBOARD_REFRESH_MARKER = "goalflight-dashboard-refresh-v1"
+_DASHBOARD_REFRESH_QUEUED_GRACE_S = 60 * 60
+_DASHBOARD_REFRESH_MAX_LIFETIME_S = 4 * 60 * 60
+_DASHBOARD_REFRESH_CLAIM_STALE_S = 30.0
 CODE_WRITER_MAX_IDLE_SECS = 600.0
 CODE_WRITER_AGENTS = {"codex", "codex-acp", "grok-code", "grok-acp", "cursor", "cursor-agent"}
 
@@ -573,8 +580,10 @@ def _wait_for_detached_watcher(
 ) -> tuple[int, dict, str | None]:
     sleep_s = min(max(float(poll_secs or 1.0), 0.2), 2.0)
     last_payload: dict = {}
+    project_root = _project_root(args)
     try:
         while True:
+            _export_dashboard_status_for_project(project_root)
             try:
                 payload = json.loads(status_json.read_text(encoding="utf-8", errors="replace"))
                 if isinstance(payload, dict):
@@ -597,6 +606,7 @@ def _wait_for_detached_watcher(
                                 and not (payload.get("reason") or "").endswith(":post_terminal_idle_timeout")
                             )
                             if not stale_complete:
+                                _export_dashboard_status_for_project(project_root)
                                 return _status_exit_code(state), payload, payload.get("reason")
                             # Stale 'complete' while the worker is still flagged alive:
                             # keep waiting for the real worker exit, but ONLY while the
@@ -623,6 +633,7 @@ def _wait_for_detached_watcher(
                     prompt_path=prompt_path,
                     reason="watcher_dead_before_terminal_status",
                 )
+                _export_dashboard_status_for_project(project_root)
                 return _status_exit_code(repaired.get("state")), repaired, repaired.get("reason")
             time.sleep(sleep_s)
     except KeyboardInterrupt:
@@ -712,6 +723,271 @@ def _write_json_atomic(path: Path, payload: dict) -> None:
         with contextlib.suppress(OSError):
             tmp.unlink()
         raise
+
+
+def _dashboard_refresh_key(project_root: Path) -> str:
+    return hashlib.sha256(str(project_root.resolve()).encode("utf-8")).hexdigest()[:16]
+
+
+def _dashboard_refresh_paths(project_root: Path) -> tuple[Path, Path]:
+    base = _dispatch_base_dir()
+    key = _dashboard_refresh_key(project_root)
+    return base / f"dashboard-refresh-{key}.pid", base / f"dashboard-refresh-{key}.log"
+
+
+def _dashboard_refresh_claim_path(pidfile: Path) -> Path:
+    return pidfile.with_name(f"{pidfile.stem}.claim")
+
+
+def _read_dashboard_refresh_pidfile(pidfile: Path) -> dict:
+    try:
+        text = pidfile.read_text(encoding="utf-8").strip()
+    except OSError:
+        return {}
+    if not text:
+        return {}
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        try:
+            return {"pid": int(text)}
+        except ValueError:
+            return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _dashboard_refresh_cmdline_matches(identity: dict, project_root: Path) -> bool:
+    args = str(identity.get("args") or "")
+    return (
+        _DASHBOARD_REFRESH_SUBCOMMAND in args
+        and "--project-root" in args
+        and str(project_root.resolve()) in args
+    )
+
+
+def _dashboard_refresh_identity_matches(recorded: object, current: object, project_root: Path) -> bool:
+    if not isinstance(recorded, dict) or not isinstance(current, dict):
+        return False
+    if not recorded.get("identity_available", True) or not current.get("identity_available", True):
+        return False
+    for key in ("lstart", "comm"):
+        if not recorded.get(key) or not current.get(key) or recorded.get(key) != current.get(key):
+            return False
+    return _dashboard_refresh_cmdline_matches(current, project_root)
+
+
+def _dashboard_refresh_pidfile_is_current(pidfile: Path, project_root: Path) -> tuple[bool, str]:
+    payload = _read_dashboard_refresh_pidfile(pidfile)
+    try:
+        pid = int(payload.get("pid"))
+    except (TypeError, ValueError):
+        return False, "missing_pid"
+    if payload.get("marker") != _DASHBOARD_REFRESH_MARKER:
+        return False, "missing_marker"
+    if payload.get("subcommand") != _DASHBOARD_REFRESH_SUBCOMMAND:
+        return False, "wrong_subcommand"
+    if payload.get("project_key") != _dashboard_refresh_key(project_root):
+        return False, "wrong_project_key"
+    if payload.get("project_root") != str(project_root.resolve()):
+        return False, "wrong_project_root"
+    if not goalflight_compat.pid_alive(pid):
+        return False, "dead"
+    current = goalflight_ledger.process_identity(pid)
+    if current is None:
+        return False, "dead"
+    if not _dashboard_refresh_identity_matches(payload.get("identity"), current, project_root):
+        return False, "identity_mismatch"
+    return True, "live"
+
+
+def _try_claim_dashboard_refresh_start(claim_path: Path) -> bool:
+    claim_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        fd = os.open(str(claim_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        return False
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps({"pid": os.getpid(), "created_at": time.time()}) + "\n")
+    return True
+
+
+def _remove_stale_dashboard_refresh_claim(claim_path: Path) -> bool:
+    try:
+        age_s = time.time() - claim_path.stat().st_mtime
+    except OSError:
+        return False
+    if age_s <= _DASHBOARD_REFRESH_CLAIM_STALE_S:
+        return False
+    with contextlib.suppress(OSError):
+        claim_path.unlink()
+    return True
+
+
+def _wait_for_dashboard_refresh_claim(pidfile: Path, claim_path: Path, project_root: Path) -> bool:
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        ok, _reason = _dashboard_refresh_pidfile_is_current(pidfile, project_root)
+        if ok:
+            return True
+        if not claim_path.exists():
+            return False
+        time.sleep(0.05)
+    return False
+
+
+def _write_dashboard_refresh_pidfile(pidfile: Path, project_root: Path, pid: int) -> None:
+    identity = goalflight_ledger.process_identity(pid)
+    payload = {
+        "schema": 1,
+        "marker": _DASHBOARD_REFRESH_MARKER,
+        "subcommand": _DASHBOARD_REFRESH_SUBCOMMAND,
+        "pid": pid,
+        "identity": identity,
+        "project_root": str(project_root.resolve()),
+        "project_key": _dashboard_refresh_key(project_root),
+        "started_at": goalflight_ledger.utc_now(),
+    }
+    _write_json_atomic(pidfile, payload)
+
+
+def _export_dashboard_status_for_project(project_root: Path | None) -> None:
+    if project_root is None:
+        return
+    try:
+        import goalflight_status
+
+        goalflight_status.export_dashboard_status(project_root)
+    except Exception:
+        pass
+
+
+def _dashboard_record_seen_at(record: dict) -> dt.datetime | None:
+    for key in ("updated_at", "started_at"):
+        parsed = goalflight_ledger.parse_utc(record.get(key))
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _dashboard_queued_record_within_grace(record: dict, *, now: dt.datetime) -> bool:
+    seen_at = _dashboard_record_seen_at(record)
+    if seen_at is None:
+        return False
+    return (now - seen_at).total_seconds() <= _DASHBOARD_REFRESH_QUEUED_GRACE_S
+
+
+def _dashboard_refresh_record_counts_as_live(record: dict, *, now: dt.datetime, goalflight_status) -> bool:
+    classification = goalflight_ledger.classify(record)
+    queued_states = {"queued", "queued_capacity", "waiting_capacity"}
+    if str(record.get("state") or "") in queued_states or str(classification or "") in queued_states:
+        return _dashboard_queued_record_within_grace(record, now=now)
+    terminal_state = record.get("terminal_state") or goalflight_ledger.terminal_state_for(
+        record.get("state"),
+        record.get("reason") or record.get("error"),
+    )
+    status_record = dict(record, classification=classification, terminal_state=terminal_state)
+    return goalflight_status.done_code(status_record) == 1
+
+
+def _dashboard_project_has_live_dispatch(project_root: Path) -> bool:
+    try:
+        import goalflight_status
+
+        root = str(project_root.resolve())
+        now = dt.datetime.now(dt.timezone.utc)
+        records = [
+            record
+            for record in goalflight_ledger.read_records()
+            if record.get("project_root") == root
+        ]
+    except Exception:
+        return False
+    return any(
+        _dashboard_refresh_record_counts_as_live(record, now=now, goalflight_status=goalflight_status)
+        for record in records
+    )
+
+
+def _dashboard_refresh_loop(
+    project_root: Path,
+    *,
+    interval_s: float,
+    max_lifetime_s: float = _DASHBOARD_REFRESH_MAX_LIFETIME_S,
+) -> int:
+    if not (project_root / "dashboard").is_dir():
+        return 0
+    interval = min(max(float(interval_s or 15.0), 1.0), 15.0)
+    started = time.monotonic()
+    while True:
+        _export_dashboard_status_for_project(project_root)
+        if time.monotonic() - started >= float(max_lifetime_s):
+            return 0
+        if not _dashboard_project_has_live_dispatch(project_root):
+            return 0
+        time.sleep(interval)
+
+
+def _cmd_dashboard_refresh(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description=argparse.SUPPRESS)
+    parser.add_argument("--project-root", required=True)
+    parser.add_argument("--interval-s", type=float, default=15.0)
+    parser.add_argument("--max-lifetime-s", type=float, default=_DASHBOARD_REFRESH_MAX_LIFETIME_S)
+    args = parser.parse_args(argv)
+    return _dashboard_refresh_loop(
+        Path(args.project_root).resolve(),
+        interval_s=args.interval_s,
+        max_lifetime_s=args.max_lifetime_s,
+    )
+
+
+def _start_dashboard_refresh_for_project(project_root: Path | None) -> None:
+    if project_root is None or not (project_root / "dashboard").is_dir():
+        return
+    pidfile, log_path = _dashboard_refresh_paths(project_root)
+    claim_path = _dashboard_refresh_claim_path(pidfile)
+    for _attempt in range(2):
+        with contextlib.suppress(Exception):
+            ok, _reason = _dashboard_refresh_pidfile_is_current(pidfile, project_root)
+            if ok:
+                return
+        if not _try_claim_dashboard_refresh_start(claim_path):
+            if _remove_stale_dashboard_refresh_claim(claim_path):
+                continue
+            with contextlib.suppress(Exception):
+                if _wait_for_dashboard_refresh_claim(pidfile, claim_path, project_root):
+                    return
+            return
+        try:
+            with contextlib.suppress(Exception):
+                ok, _reason = _dashboard_refresh_pidfile_is_current(pidfile, project_root)
+                if ok:
+                    return
+                pidfile.unlink()
+            log_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            with log_path.open("ab") as log:
+                proc = subprocess.Popen(
+                    [
+                        sys.executable,
+                        str(Path(__file__).resolve()),
+                        _DASHBOARD_REFRESH_SUBCOMMAND,
+                        "--project-root",
+                        str(project_root.resolve()),
+                        "--interval-s",
+                        "15",
+                        "--max-lifetime-s",
+                        str(_DASHBOARD_REFRESH_MAX_LIFETIME_S),
+                    ],
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    **_detached_popen_kwargs(),
+                )
+            _write_dashboard_refresh_pidfile(pidfile, project_root, int(proc.pid))
+            return
+        except Exception:
+            return
+        finally:
+            with contextlib.suppress(OSError):
+                claim_path.unlink()
 
 
 @contextlib.contextmanager
@@ -1539,6 +1815,9 @@ def _record_ledger(args, *, project_root: Path, prompt_path: str | None, status_
                 json=True,
             )
         )
+    _export_dashboard_status_for_project(project_root)
+    if state in {"waiting_capacity", "starting", "running"}:
+        _start_dashboard_refresh_for_project(project_root)
 
 
 def _record_queued_ledger_fast(args, *, project_root: Path, prompt_path: str | None, status_json: Path, tail: Path) -> None:
@@ -1591,6 +1870,8 @@ def _record_queued_ledger_fast(args, *, project_root: Path, prompt_path: str | N
             if existing.get("started_at"):
                 record["started_at"] = existing["started_at"]
         goalflight_ledger.write_record(record)
+    _export_dashboard_status_for_project(project_root)
+    _start_dashboard_refresh_for_project(project_root)
 
 
 def _record_queued_status(args, *, project_root: Path, status_json: Path, tail: Path, queue_path: Path) -> None:
@@ -1619,6 +1900,8 @@ def _record_queued_status(args, *, project_root: Path, status_json: Path, tail: 
         status_json=status_json,
         tail=tail,
     )
+    _export_dashboard_status_for_project(project_root)
+    _start_dashboard_refresh_for_project(project_root)
 
 
 def _insert_before_worker_remainder(argv: list[str], additions: list[str]) -> list[str]:
@@ -3244,6 +3527,8 @@ def _run_test_acp_shape_if_requested(args, *, base: Path, status_json: Path, tai
                 "updated_at": int(time.time()),
             },
         )
+        _export_dashboard_status_for_project(project_root)
+        _start_dashboard_refresh_for_project(project_root)
         with contextlib.suppress(Exception):
             Path(marker_path).write_text(str(worker_pid), encoding="utf-8")
         time.sleep(sleep_after_running_s)
@@ -3263,6 +3548,7 @@ def _run_test_acp_shape_if_requested(args, *, base: Path, status_json: Path, tai
             "updated_at": int(time.time()),
         },
     )
+    _export_dashboard_status_for_project(project_root)
     with contextlib.suppress(Exception):
         Path(marker_path).write_text(str(worker_pid), encoding="utf-8")
     print(
@@ -3586,6 +3872,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_steer(argv[1:])
     if argv and argv[0] == "drain":
         return _cmd_drain(argv[1:])
+    if argv and argv[0] == "dashboard-refresh":
+        return _cmd_dashboard_refresh(argv[1:])
 
     parser = argparse.ArgumentParser(
         description="Crash-safe worker dispatch: detached worker + decoupled watcher."
@@ -4070,6 +4358,8 @@ def main(argv: list[str] | None = None) -> int:
                 "updated_at": int(time.time()),
                 **({"task_ids": list(args.task_ids)} if getattr(args, "task_ids", None) else {}),
             })
+        _export_dashboard_status_for_project(project_root)
+        _start_dashboard_refresh_for_project(project_root)
         watcher_pid = _spawn_daemonized_process(
             watch_cmd,
             env=os.environ.copy(),
@@ -4201,6 +4491,7 @@ def main(argv: list[str] | None = None) -> int:
             with contextlib.suppress(Exception):
                 _release_capacity(lease_id, str(capacity_state or final_state), capacity_reason)
             _cleanup_pidfile_if_worker_dead(pidfile, worker_pid)
+            _export_dashboard_status_for_project(project_root)
 
 
 if __name__ == "__main__":

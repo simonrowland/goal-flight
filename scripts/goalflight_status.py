@@ -11,11 +11,14 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import datetime as dt
 import json
+import os
 import re
 import shlex
 import subprocess
 import time
+import tempfile
 from pathlib import Path
 import sys
 
@@ -54,6 +57,7 @@ _WAIT_STALE_GRACE_S = 600.0
 _WAIT_HEARTBEAT_S = 1200.0
 _WAIT_CPU_EPSILON = 0.1
 _WAIT_TAIL_COUNT_BYTES = 128 * 1024
+_DASHBOARD_COUNT_KEYS = ("running", "worker_finished", "worker_failed", "worker_dead", "stalled")
 _DRAFT_ARTIFACT_FINALITY_FIELDS = frozenset(
     {
         "draft_complete",
@@ -632,6 +636,272 @@ def scope_payload(payload: dict, project_root: str | None) -> dict:
         window_seconds=int((payload.get("rate_pressure") or {}).get("window_seconds") or 600),
     )
     return out
+
+
+def _dashboard_status_row(record: dict) -> dict:
+    classification = goalflight_ledger.classify(record)
+    terminal_state = record.get("terminal_state") or goalflight_ledger.terminal_state_for(
+        record.get("state"),
+        record.get("reason") or record.get("error"),
+    )
+    if goalflight_ledger._is_detached_controller_dead_record(record):  # noqa: SLF001
+        if classification == "expected_live" or classification in {
+            "unknown_no_pid",
+            "identity_indeterminate",
+        } or str(classification).startswith("stale_"):
+            terminal_state = "unknown"
+        elif classification == "worker_dead":
+            terminal_state = "worker_dead"
+    return {
+        "dispatch_id": record.get("dispatch_id"),
+        "agent": record.get("agent"),
+        "engine": str(record.get("engine") or goalflight_ledger.infer_engine(record.get("agent"))),
+        "shape": goalflight_ledger.infer_shape(record),
+        "transport": record.get("transport"),
+        "state": record.get("state"),
+        "classification": classification,
+        "terminal_state": terminal_state,
+        "liveness_state": record.get("liveness_state"),
+        "worker_pid": record.get("worker_pid"),
+        "worker_identity": record.get("worker_identity"),
+        "project_root": record.get("project_root"),
+        "prompt_path": record.get("prompt_path"),
+        "stdout_path": record.get("stdout_path"),
+        "stderr_path": record.get("stderr_path"),
+        "status_path": record.get("status_path"),
+        "started_at": record.get("started_at"),
+        "ended_at": record.get("ended_at"),
+        "updated_at": record.get("updated_at"),
+        "reason": record.get("reason"),
+        "error": record.get("error"),
+        "task_id": record.get("task_id"),
+        "task_ids": record.get("task_ids"),
+    }
+
+
+def _dashboard_status_records(project_root: str | None) -> list[dict]:
+    records = goalflight_ledger.read_records()
+    if project_root is not None:
+        records = [record for record in records if record.get("project_root") == project_root]
+    return [
+        _reconcile_output_tail_record(_dashboard_status_row(record))
+        for record in records
+    ]
+
+
+def _utc_now() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+
+
+def _parse_utc(value: object) -> dt.datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def _elapsed_s(started_at: object, *, now: dt.datetime) -> float | None:
+    started = _parse_utc(started_at)
+    if started is None:
+        return None
+    elapsed = (now - started).total_seconds()
+    if elapsed < 0:
+        return None
+    return round(elapsed, 1)
+
+
+def _split_task_ids(value: object) -> list[str]:
+    values = value if isinstance(value, list) else [value]
+    out: list[str] = []
+    for raw in values:
+        if not isinstance(raw, str):
+            continue
+        for part in raw.split(","):
+            item = part.strip()
+            if item and item not in out:
+                out.append(item)
+    return out
+
+
+def _task_ids_by_dispatch(records: list[dict]) -> dict[str, list[str]]:
+    out: dict[str, list[str]] = {}
+    for record in records:
+        dispatch_id = record.get("dispatch_id")
+        if not isinstance(dispatch_id, str) or not dispatch_id:
+            continue
+        task_ids = []
+        task_ids.extend(_split_task_ids(record.get("task_id")))
+        task_ids.extend(_split_task_ids(record.get("task_ids")))
+        for task_id in task_ids:
+            out.setdefault(dispatch_id, [])
+            if task_id not in out[dispatch_id]:
+                out[dispatch_id].append(task_id)
+    return out
+
+
+def _read_json_object(path_value: object) -> dict:
+    if not isinstance(path_value, str) or not path_value:
+        return {}
+    try:
+        payload = json.loads(Path(path_value).read_text(encoding="utf-8", errors="replace"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _last_nonempty_tail_line(path_value: object) -> str | None:
+    if not isinstance(path_value, str) or not path_value:
+        return None
+    path = Path(path_value)
+    try:
+        with path.open("rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            start = max(0, size - 64 * 1024)
+            fh.seek(start)
+            text = fh.read().decode("utf-8", errors="replace")
+            if start > 0:
+                text = text.lstrip("\ufffd")
+    except OSError:
+        return None
+    for line in reversed(text.splitlines()):
+        stripped = line.strip()
+        if stripped:
+            return stripped[:200]
+    return None
+
+
+def _dashboard_marker(value: object) -> dict[str, str] | None:
+    if not isinstance(value, dict):
+        return None
+    kind = value.get("kind")
+    text = value.get("text")
+    if not isinstance(kind, str) or not kind:
+        return None
+    return {"kind": kind, "text": text if isinstance(text, str) else ""}
+
+
+def _dashboard_count_bucket(record: dict) -> str:
+    cls = str(record.get("classification") or record.get("state") or "")
+    state = str(record.get("state") or "")
+    terminal = str(record.get("terminal_state") or "")
+    if done_code(record) == 1:
+        return "running"
+    if cls in {"worker_dead", "stale_dead"} or state == "worker_dead" or terminal == "worker_dead":
+        return "worker_dead"
+    if cls in {"idle_timeout", "wedged", "stalled"} or state in {"idle_timeout", "wedged", "stalled"}:
+        return "stalled"
+    if cls in dispatch_states.SUCCESS_TERMINAL_RECORD_STATES or terminal == "complete":
+        return "worker_finished"
+    return "worker_failed"
+
+
+def dashboard_status_payload(project_root: str | Path | None) -> dict:
+    root = str(Path(project_root).resolve()) if project_root is not None else None
+    generated_at = _utc_now()
+    now = dt.datetime.now(dt.timezone.utc)
+    records = _dashboard_status_records(root)
+    task_ids_by_dispatch = _task_ids_by_dispatch(records)
+    counts = {key: 0 for key in _DASHBOARD_COUNT_KEYS}
+    dispatches: list[dict] = []
+    for record in records:
+        bucket = _dashboard_count_bucket(record)
+        if bucket in counts:
+            counts[bucket] += 1
+        status_sidecar = _read_json_object(record.get("status_path"))
+        marker = _dashboard_marker(
+            status_sidecar.get("terminal_marker")
+            or status_sidecar.get("last_marker")
+        )
+        tail_path = status_sidecar.get("tail_path") or record.get("stdout_path")
+        dispatches.append(
+            {
+                "dispatch_id": record.get("dispatch_id"),
+                "agent": record.get("agent"),
+                "shape": record.get("shape"),
+                "state": record.get("state"),
+                "classification": record.get("classification"),
+                "task_ids": task_ids_by_dispatch.get(str(record.get("dispatch_id")), []),
+                "started_at": record.get("started_at"),
+                "ended_at": record.get("ended_at"),
+                "age_s": _elapsed_s(record.get("started_at"), now=now),
+                "idle_s": (
+                    round(float(status_sidecar["seconds_since_event"]), 1)
+                    if isinstance(status_sidecar.get("seconds_since_event"), (int, float))
+                    else None
+                ),
+                "tail_last_line": _last_nonempty_tail_line(tail_path),
+                "marker": marker,
+                "status_path": record.get("status_path"),
+            }
+        )
+    return {
+        "schema": 1,
+        "generated_at": generated_at,
+        "project_root": root,
+        "dispatches": dispatches,
+        "counts": counts,
+    }
+
+
+def _json_for_script(value: object) -> str:
+    return (
+        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True)
+        .replace("&", "\\u0026")
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
+
+
+def _write_status_data_js(path: Path, payload: dict) -> None:
+    text = (
+        "// status-data.js - generated by goalflight_status.py; do not edit by hand.\n"
+        "window.GF_STATUS = "
+        + _json_for_script(payload)
+        + ";\n"
+    )
+    tmp_name: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            delete=False,
+        ) as fh:
+            tmp_name = fh.name
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_name, path)
+    except Exception:
+        if tmp_name:
+            with contextlib.suppress(OSError):
+                Path(tmp_name).unlink()
+        raise
+
+
+def export_dashboard_status(project_root: str | Path | None, path: str | Path | None = None) -> Path | None:
+    if project_root is None:
+        return None
+    root = Path(project_root).resolve()
+    target = Path(path).expanduser().resolve() if path is not None else root / "dashboard" / "status-data.js"
+    if not target.parent.is_dir():
+        return None
+    try:
+        _write_status_data_js(target, dashboard_status_payload(root))
+    except OSError:
+        if not target.parent.is_dir():
+            return None
+        raise
+    return target
 
 
 def done_code(record: dict, *, worker_alive: bool | None = None) -> int:
@@ -1505,6 +1775,13 @@ def main(argv: list[str] | None = None) -> int:
             "stale for minutes on local APFS. exit 0 = all present+nonempty, 1 = not"
         ),
     )
+    parser.add_argument(
+        "--export-dashboard",
+        nargs="?",
+        const="",
+        metavar="PATH",
+        help="write dashboard/status-data.js for the scoped project (no-op when dashboard dir is absent)",
+    )
     parser.add_argument("--limit", type=int, default=20)
     args = parser.parse_args(argv)
 
@@ -1514,6 +1791,10 @@ def main(argv: list[str] | None = None) -> int:
         project_root = str(Path(args.project).resolve())
     else:
         project_root = this_project_root()
+
+    if args.export_dashboard is not None:
+        export_dashboard_status(project_root, args.export_dashboard or None)
+        return 0
 
     if args.wait:
         # NOTE: --wait (the long-poll over N workers) is deliberately mail-FREE.

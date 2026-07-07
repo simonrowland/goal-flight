@@ -31,6 +31,11 @@ FIXTURE = ROOT / "tests" / "fixtures" / "tasks-mirror"
 TASK = ROOT / "goalflight_task.py"
 NODE = shutil.which("node")
 
+os.environ.setdefault(
+    "GOALFLIGHT_TASK_STORE_DIR",
+    tempfile.mkdtemp(prefix="goalflight-task-store-test-"),
+)
+
 # The canonical task store now lives OUT of the project tree (durable base,
 # per-repo namespaced). The in-tree docs-private/dashboard are a one-way EXPORT
 # plus the home for human/external inputs. White-box pokes at store-internal
@@ -444,10 +449,17 @@ def test_goalflight_task_sync_writes_mirror_only_derived_status() -> None:
         data_js = (_canonical_dashboard(project) / "tasks-data.js").read_text(encoding="utf-8")
         payload = data_js.split("window.GF_ITEMS = ", 1)[1].split(";\nif", 1)[0]
         data_items = {item["id"]: item for item in json.loads(payload)}
+        meta_payload = data_js.split("window.GF_META = ", 1)[1].rsplit(";\n", 1)[0]
+        meta = json.loads(meta_payload)
         assert_true("working derived status in mirror", data_items["t-001"]["derived_status"] == "working")
         assert_true("finished worker becomes awaiting review in mirror", data_items["t-002"]["derived_status"] == "awaiting-review")
         assert_true("done unresolved remains awaiting review in mirror", data_items["t-003"]["derived_status"] == "awaiting-review")
         assert_true("decision derived status in mirror", data_items["q-001"]["derived_status"] == "decision")
+        assert_true("GF_META schema", meta["schema"] == 1)
+        assert_true("GF_META generated_at string", isinstance(meta["generated_at"], str) and meta["generated_at"])
+        assert_true("GF_META counts working", meta["counts"]["working"] == 1)
+        assert_true("GF_META counts awaiting-review", meta["counts"]["awaiting-review"] == 2)
+        assert_true("GF_META counts decision", meta["counts"]["decision"] == 1)
         assert_true("derived status not persisted", all("derived_status" not in item for item in _read_items(project)))
         proc = run_live_checker(project)
         assert_true("mirror with derived_status passes checker", proc.returncode == 0)

@@ -6,6 +6,7 @@ incremented when meaningful skill behaviour changes.
 
 ## [Unreleased]
 
+- Dashboard task exports now include a `GF_META` freshness stamp and dispatches refresh live `status-data.js` for file:// status views.
 - ACP workers now receive `GOALFLIGHT_PROMPT_FILE` plus the prompt re-read preamble.
 
 ## [1.2.1] — 2026-07-07
