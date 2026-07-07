@@ -321,7 +321,12 @@
   // '..' (docs-private/../SKILL.md must stay plain text).
   var PATH_TOKEN_RE = /^\/?(?:[\w.\-]+\/)*[\w.\-]+$/;
 
+  // Length cap: untrusted data (status feeds, hostile items) must not be able
+  // to request an arbitrarily huge — if syntactically valid — link token.
+  var PATH_TOKEN_MAX = 512;
+
   function isSafePathToken(p) {
+    if (String(p).length > PATH_TOKEN_MAX) return false;
     if (!PATH_TOKEN_RE.test(p)) return false;
     var segs = String(p).split("/");
     for (var i = 0; i < segs.length; i++) {

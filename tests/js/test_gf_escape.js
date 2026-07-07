@@ -325,6 +325,7 @@ assert("renderMention rejects quote/angle path", !GF.renderMention('docs-private
 assert("renderMention rejects control-char path", !GF.renderMention("docs-private/a\n.md").includes("<a "));
 assert("renderMention rejects backslash path", !GF.renderMention("docs-private\\evil.md").includes("<a "));
 assert("renderMention rejects dot-segment inside path", GF.renderMention("docs-private/./x/../../SKILL.md").indexOf("<code>") === 0);
+assert("renderMention rejects overlong path token", !GF.renderMention("docs-private/" + "a".repeat(5000) + ".md").includes("<a "));
 assert("autolink leaves traversal path unlinked", !GF.autolink("see docs-private/../SKILL.md now").includes("<a "));
 const idOnlyHostile = GF.renderIdOnly("docs-private/../SKILL.md");
 assert("renderIdOnly never path-links", !idOnlyHostile.includes("<a ") && idOnlyHostile.includes("<code>"));
