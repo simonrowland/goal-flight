@@ -977,12 +977,12 @@ def _read_only_write_prompt_reason(args) -> str | None:
     text = _read_prompt_for_guard(args)
     if not text:
         return None
-    for label, pattern in READ_ONLY_WRITE_PROMPT_PATTERNS:
-        if pattern.search(text):
-            return label
     for _label, pattern in READ_ONLY_INLINE_RETURN_PROMPT_PATTERNS:
         if pattern.search(text):
             return None
+    for label, pattern in READ_ONLY_WRITE_PROMPT_PATTERNS:
+        if pattern.search(text):
+            return label
     return None
 
 

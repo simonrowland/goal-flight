@@ -139,9 +139,25 @@ def test_read_only_review_artifact_guard() -> None:
     try:
         D._guard_read_only_write_prompt(args)
     except D.DispatchUsageError as exc:
-        check("mixed write path plus inline prompt is refused", "cannot write review files" in str(exc))
+        check(f"mixed write path plus inline prompt is allowed ({exc})", False)
     else:
-        check("mixed write path plus inline prompt is refused", False)
+        check("mixed write path plus inline prompt is allowed", True)
+
+    args = _args(
+        read_only=True,
+        prompt=(
+            "Review the staged diff. The sandbox has no write access. "
+            "Output: return everything inline in your final response "
+            "(the sandbox is read-only; inline is the expected delivery). "
+            "Findings as `P0|P1|P2|P3 - <file:line> - <claim> - <fix>`."
+        ),
+    )
+    try:
+        D._guard_read_only_write_prompt(args)
+    except D.DispatchUsageError as exc:
+        check(f"collocated write-access findings prompt with inline contract is allowed ({exc})", False)
+    else:
+        check("collocated write-access findings prompt with inline contract is allowed", True)
 
 
 def test_grok_code_research_intent_guard() -> None:
