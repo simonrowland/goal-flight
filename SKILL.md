@@ -1,6 +1,6 @@
 ---
 name: goal-flight
-version: 1.2.0
+version: 1.3.0
 description: "Portable Goal Flight workflow for long-running repo work: planning, dispatch, review, recovery, file-backed resume."
 tags:
   - orchestration
@@ -22,7 +22,6 @@ allowed-tools:
   - Grep
   - Agent
   - Skill
-  - TodoWrite
   - AskUserQuestion
 triggers:
   - /goal-flight
@@ -30,15 +29,16 @@ triggers:
   - begin chunked work
   - set up orchestrator for unattended run
   - decompose this plan into goal chunks
+  - resume the goal-flight run
+  - continue the goal queue
+  - recover a dispatched worker
 ---
 
 > ⚠️ **Read this skill end-to-end, including Worker Routing, State, and Context Discipline** before acting; also read Do Not. The back half carries routing, state, marker, rate-limit, permission, and safety contracts.
 
-This checked-in `SKILL.md` is the compiled orchestrator distillation of
-`docs/controller-behaviours.md`. It is the Claude Code-compatible wrapper for
-the portable core. Keep front matter and `allowed-tools` compatible until
-generated wrappers own host bindings, tool names, invocation details, and
-packaging.
+Frontier-tier controllers: this core is complete; proceed on it alone. Other controllers — and any controller that catches itself about to violate a rule it just read — load `protocols/guidance-extended.md` before continuing. That file elaborates only (worked examples, expanded rationale); every rule and fact lives in this core, and any rule found only there must be moved back here.
+
+This checked-in `SKILL.md` is compiled from `docs/controller-behaviours.md` and is the Claude Code-compatible wrapper for the portable core; keep front matter and `allowed-tools` compatible until generated wrappers own host bindings, tool names, invocation details, and packaging.
 
 ## Activation Check
 
@@ -49,15 +49,15 @@ goal-flight session", you are NOT in a goal-flight run — do regular coding
 without loading the back half. Only load end-to-end when the verdict is
 "active" or when the user explicitly invokes `/goal-flight <command>`.
 
-**Skill-freshness + designated-controller check.** If your context has a
-"skill: goal-flight (previously invoked)" reminder but you can't quote
-this preamble verbatim, your loaded skill body is STALE — system reminders
-carry truncated content across compactions and silently drop load-bearing
-rules. Re-invoke `/goal-flight` to reload SKILL.md end-to-end before
-acting on its rules. Then check your terminal session ID
-(`scripts/goalflight_session_status.py --ensure-session`) against the
-active queue's `current_session.id` — if they match, you are the
-designated orchestrator; if not, surface to user before claiming.
+`<skill-root>` = this repo when working in goal-flight itself; for downstream projects it is the installed skill checkout (see per-host pointers) — resolve it before running scripts.
+
+**Skill-freshness + designated-controller check.** If a previous-invocation
+reminder exists but you can't quote this preamble verbatim, reload via State's
+canonical resume order before acting; then compare
+`scripts/goalflight_session_status.py --ensure-session` with the active queue's
+`current_session.id`: match → you are the designated orchestrator; mismatch →
+surface to the user before claiming.
+Extended: `protocols/guidance-extended.md` §activation-check
 
 ## Per-host pointers
 
@@ -115,6 +115,7 @@ Orchestrator behaviour probes run through portable host adapters, not host-speci
 | resume/compaction | State | `commands/resume.md`, `protocols/state-handoff.md`, `scripts/goalflight_session_status.py` |
 | context discipline | Context Discipline | context-mode, `scripts/goalflight_*.py` |
 | **Do Not / safety gates** | Do Not | (read-end-to-end is load-bearing for safety) |
+| extended controller guidance | preamble | `protocols/guidance-extended.md` |
 
 ## Orchestrator Contract
 
@@ -129,6 +130,8 @@ Always:
 - run helpers for machine facts, status, logs, capacity, and tool probes
 - keep raw logs and long reviews in files; reason over compact summaries
 - Analyze/search/count/filter with procedural code or context-mode
+- Explicit user-directed mission outranks the store frontier: park the queue, register the mission as store tasks, record the parking decision in RESUME-NOTES; do not silently hijack into the old frontier or work outside the store.
+- Hosts may defer optional tool schemas (ToolSearch era): load/discover a deferred host or MCP tool's schema before first use; do not assume preload.
 
 Never load fork, ACP, corpus, review, or tool-specific details just because the
 skill loaded. Load those protocols on demand.
@@ -150,6 +153,7 @@ python3 <skill-root>/scripts/goalflight_doctor.py --project-root "$PWD" --json
 Surface only actionable warnings: install ambiguity, missing required tool,
 capacity cooldown, stale dispatch, surplus worker-like process, or fingerprint
 drift against an in-flight queue.
+`goalflight_messages.py relay` output is unbounded and cross-project — scope it (pipe through `head`, or filter for the current project) before running it in controller context.
 
 ## Commands
 
@@ -182,7 +186,7 @@ read/derive from the store only. `next` prints the frontier; it does NOT dispatc
 worktree):** `dispatch-frontier` (legacy alias `pipe`) fans out the WHOLE frontier as
 one worker per item — it is NOT a drainer, needs `--autodispatch-confirm`, and runs in
 the shared project root with the raw prompt (no mandate). `/goal-flight execute` and
-`goalflight_dispatch.py --submit`/`dispatch` also spawn workers.
+`goalflight_dispatch.py` also spawn workers — dispatcher default is a detached launch; `--submit` writes a durable queue entry AND runs one immediate drain pass by default (`--no-drain-on-submit` for queue-only).
 
 **Always-on drainer:** the `com.goalflight.drain` launchd daemon runs `goalflight_dispatch.py
 drain --json` every ~60s and LAUNCHES anything queued — queuing is not free, and the
@@ -237,33 +241,20 @@ inline; fix P0/P1/P2 before commit.
   target files, and assumptions before editing.
 - Background anything expected to run longer than 10 seconds.
 - Subagent / Agent / Task / Explore dispatches whose returns may exceed
-  ~5KB MUST instruct the worker to write findings to
+  ~5KB MUST write findings to
   `docs-private/research/<date>-<slug>/findings.md` and return a TL;DR +
-  severity-tagged finding count, then `READY: <path>` as the **last**
+  severity count, then `READY: <path>` as the **last**
   non-empty line (terminal marker — emit TL;DR/findings before it). The
-  orchestrator reads the TL;DR; opens the file only when TL;DR signals a
-  real action. Returning a 9KB report inline defeats the dispatch — the
-  bytes land back in orchestrator context anyway.
+  orchestrator reads the TL;DR and opens the file only when it signals real action.
 - Read >5KB without an expected Edit follow-up within 2 turns → use
-  `Agent` (Explore for read-only, general-purpose for tool-using
-  investigation) with a defined prompt instead. Recon-Reads pull the
-  full body into orchestrator context; an Agent dispatch returns a
-  conclusion at ~10x compression.
+  `Agent`/Explore with a defined prompt; do not pull recon bodies into
+  controller context.
 - The host Agent / Task / Explore tool is for recon, analysis, and review ONLY
-  — NEVER a code executor. Code-writing (execution) chunks go through
-  `scripts/goalflight_dispatch.py` (a file-tracked, capacity-leased `codex`/`grok-code`
-  CLI worker), or controller-direct only when the chunk is tiny. Running a
-  code-writing chunk as a host Agent is the documented bypass regression: it
-  takes NO capacity lease (over-subscribes the machine), leaves NO ledger/status
-  trace (the watchdog, `goalflight_status.py`, and resume go blind to it), burns
-  the controller's OWN provider (the controller-provider-asymmetry violation —
-  heavy fan-out can strand the session), and gets NO marker/steer protocol. The
-  read-only recon use two bullets up is legitimate; using the Agent to WRITE
-  code is the regression.
+  — NEVER a code executor. Code-writing chunks use
+  `scripts/goalflight_dispatch.py`, or controller-direct only when tiny.
 - Out-of-scope findings go to the store's `deferred` lane via `goalflight_task.py capture`.
-  Worker-doable findings are worker tasks, not
-  host `spawn_task`/"chip"; reserve chips for user-interaction, different-repo,
-  or no-active-run work. Capture worker RESULT fallout before moving on.
+  Worker-doable findings are worker tasks, not host `spawn_task`/"chip"; capture
+  worker RESULT fallout before moving on.
 - No `tail -f` in conversation; liveness authority is the aggregate status command, not raw watcher heartbeat fields.
 - No worker spawn without capacity consideration.
 - No bare `git commit` while workers are in flight — commit guard
@@ -276,11 +267,10 @@ inline; fix P0/P1/P2 before commit.
 - Missing or stalled review is inconclusive, not clean.
 - Ask the user only for real product/permission blockers, destructive choices,
   or irreducible ambiguity.
-- During an active goal-flight run, keep shipping through decompose -> execute
-  until the queue is done or a real blocker stops you.
 - Report progress at least every 15 minutes unless context is tight.
-- Workers escalate sandbox / permission / tool blocks via `BLOCKED:` and return to the orchestrator. They do NOT execute workarounds (alternate APIs, git plumbing, inline content dumps when a file-write is blocked). Push and out-of-standard-path commits are the orchestrator's call, not the worker's. Detail + session examples: `protocols/dispatched-worker-recovery.md` §"Worker bypass anti-pattern".
+- Workers escalate sandbox / permission / tool blocks via `BLOCKED:` and return to the orchestrator. They do NOT execute workarounds; push and out-of-standard-path commits are the orchestrator's call.
 - Keep `docs-private/` private.
+Extended: `protocols/guidance-extended.md` §hard-invariants
 
 ## Gotchas from session traffic
 
@@ -299,8 +289,9 @@ Mined from repo-local failure traffic (full evidence when present: `docs-private
 
 ## Capacity and rate limits
 
-Consider capacity before any worker spawn. Capacity checks apply default
-per-agent caps from `scripts/goalflight_capacity.py` (`DEFAULT_AGENT_CAPS`).
+Consider capacity before any worker spawn. Defaults come from
+`scripts/goalflight_agent_limits.py` (`DEFAULT_AGENT_CAPS`, imported by
+`goalflight_capacity.py`).
 Capacity acquire waits on machine, agent, RSS, or cooldown pressure.
 
 Hard caps are RAM/process safeguards, not provider truth. Learn rate pressure from ledger, not constants. `scripts/goalflight_rate_pressure.py` reads recent
@@ -320,12 +311,9 @@ When the user invoked goal-flight, approved a plan, or gave scope:
 - Keep working through code, tests, queue/ledger/resume updates, review, and
   commits until decomposition/execute drains or a real blocker stops it.
 - Default is continue, not confirm.
-- Do not use engagement prompts or permission-boxes over obvious matters ("I
-  found a problem: fix it?", "shall I continue?", "are you still there?" — the
-  Netflix are-you-still-there anti-pattern). If an action is the obvious next
-  step toward the goal and is not destructive/irreversible/a genuine product
-  choice, just DO it and report. Reserve questions for the real USER-NEED /
-  USER-CONFIRM blockers below.
+- Do not use engagement prompts or permission-boxes over obvious matters; if an
+  action is the obvious next step and not destructive/irreversible/a genuine
+  product choice, do it and report.
 - Record non-blocking uncertainty in files, then proceed with the plan default.
 - Commits during execute follow **one commit per completed chunk**.
 - Push to a remote only after the relevant tests pass and the user has permitted publish.
@@ -333,6 +321,7 @@ When the user invoked goal-flight, approved a plan, or gave scope:
 Stop only for `USER-NEED` / `USER-CONFIRM` blockers: permission, destructive
 or irreversible action without a plan default, product choice the plan cannot
 infer, auth/capacity hard stop, or explicit command gate.
+Extended: `protocols/guidance-extended.md` §autonomous-throughput
 
 ## Chat as requirements
 
@@ -401,14 +390,13 @@ Default routing by task:
 | Analysis / reflection | controller-direct | - | - |
 | Voice-sensitive prose | orchestrator judgment per chunk | - | - |
 
-‡ **Host Agent as code executor = LAST RESORT, never a co-equal fallback.** Only
-when EVERY CLI worker (codex, grok-code) is genuinely unreachable — not merely slow or
-friction-y. When forced to it: (1) confirm all CLI workers are actually down
-(doctor/probe, not assumption); (2) `log()` + record in RESUME-NOTES that you are
-in degraded host-Agent fallback and why; (3) return to `goalflight_dispatch.py`
-the moment a CLI worker recovers. A transient CLI hiccup is not a license to make
-the host Agent your default executor — that IS the bypass regression. (Read-only
-review/analysis via Explore/Agent is fine — see Hard Invariants.)
+‡ **Host Agent as code executor = LAST RESORT, never a co-equal fallback.** Use
+only when EVERY CLI worker (codex, grok-code) is genuinely unreachable, not slow.
+1. Confirm CLI workers are down with doctor/probe.
+2. `log()` + record degraded host-Agent fallback and why in RESUME-NOTES.
+3. Return to `goalflight_dispatch.py` when a CLI worker recovers.
+Read-only review/analysis via Explore/Agent is covered by Hard Invariants.
+Extended: `protocols/guidance-extended.md` §worker-routing
 
 Use adapter manifests and doctor probes for current host/model details; do not
 hardcode yesterday's model list. Cursor internal models do not need passthrough
@@ -417,9 +405,11 @@ unless that chunk explicitly needs the vendor. ACP SDK dispatch uses the managed
 
 ### Hard caps
 
-Hard caps are defined in `scripts/goalflight_capacity.py`; they are placeholders,
-not laws. Capacity checks apply default per-agent caps and provider-level rate
-budgets may be shared by multiple labels.
+`DEFAULT_AGENT_CAPS` lives in `scripts/goalflight_agent_limits.py` and is
+imported by `goalflight_capacity.py`. Capacity checks apply default per-agent caps.
+Per-machine overrides come from `$GOALFLIGHT_CAPACITY_CONF` else
+`~/.goal-flight/capacity.local.json`; `agent_caps` merge over defaults.
+Hard caps are placeholders, not laws; provider budgets may be shared by labels.
 
 ### Adaptive walkback
 
@@ -454,9 +444,12 @@ Workers communicate with one-line markers:
 - `USER-NEED:`
 - `USER-CONFIRM:`
 - `BLOCKED:`
+- `FAILED:`
 - `COMPLETE:`
+- `READY:`
 
-Details live in `protocols/worker-markers.md`.
+`PERMISSION-OK-PROCEEDED:` is ACP-only. Details live in
+`protocols/worker-markers.md`.
 
 ## State
 

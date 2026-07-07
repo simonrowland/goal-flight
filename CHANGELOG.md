@@ -6,6 +6,35 @@ incremented when meaningful skill behaviour changes.
 
 ## [Unreleased]
 
+## [1.3.0] — 2026-07-07
+
+### Changed
+
+- Split controller guidance into a terse canonical `SKILL.md` core plus
+  on-demand `protocols/guidance-extended.md` elaboration, with tiered
+  controller guidance for when to load the extended file.
+- Corrected the worker marker grammar and capacity-default documentation to
+  match the script authority: `goalflight_watch.py` marker kinds and
+  `goalflight_agent_limits.py` capacity defaults.
+- Added compact rules for explicit-mission precedence over the store frontier,
+  scoped `goalflight_messages.py relay` usage, deferred tool-schema discovery,
+  and `<skill-root>` resolution.
+- Corrected `--submit` semantics in dispatch prose: drain-on-submit is the
+  default (bare `--submit` queues and immediately drains once); only
+  `--no-drain-on-submit` is queue-only.
+
+### Migration (1.2.0 → 1.3.0)
+
+- Claude Code (native): the skill loads from the installed skill checkout;
+  update that checkout to this version. No wrapper regeneration needed.
+- Codex Desktop plugin: re-run `./install.sh codex` — the plugin cache path is
+  version-pinned, so the 1.3.0 cache registers only on re-install.
+- grok / cursor / opencode copied wrappers: re-run `./install.sh <host>`;
+  symlink/link-mode installs track the checkout automatically.
+- Compatible: no command-interface changes; all `SKILL.md` section anchors
+  preserved; new protocol files ship with the repo; `allowed-tools` narrowed
+  only by removing unused `TodoWrite`.
+
 ## [1.2.0] — 2026-07-02
 
 ### Added
