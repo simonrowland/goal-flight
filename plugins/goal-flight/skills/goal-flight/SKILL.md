@@ -47,10 +47,12 @@ backup manifest for rollback.
 
 For Codex, setup registers the desktop-facing plugin and checks the CLI worker
 surface. Codex Desktop is the likely orchestrator; `codex exec` remains the worker
-path. Setup also registers the context-mode MCP server when needed. For Cursor,
-setup installs global agent instructions, a personal skill, rules, and Cursor
-MCP config for context-mode. Use `--cursor-project <project>` for per-project
-`.cursor/` wrappers, `--cursor-agents-standard` for `~/.agents/skills/`, or
+path. Codex setup registers codedb by default when available; context-mode
+registration is opt-in with `GOALFLIGHT_CODEX_CONTEXT_MODE=1` because dispatched
+Codex workers disable context-mode by default. For Cursor, setup installs global
+agent instructions, a personal skill, rules, and Cursor MCP config for
+context-mode. Use `--cursor-project <project>` for per-project `.cursor/`
+wrappers, `--cursor-agents-standard` for `~/.agents/skills/`, or
 `--cursor-link-claude --addons ''` to symlink Cursor to an existing Claude skill
 checkout.
 

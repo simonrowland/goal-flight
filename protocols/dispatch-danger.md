@@ -28,9 +28,12 @@ Safe to run anytime, as often as you like.
   `prompts/dispatch-wrapper.md` mandate. `--parallel N≥2` isolates each worker in its
   own git worktree (`scripts/goalflight_acp_run.py --worktree create`); sequential
   dispatch stays in the project root.
-- **`goalflight_dispatch.py --submit` / `dispatch`** — queues/launches a single worker.
-- **`--submit --drain-on-submit`** (and `dispatch-frontier`'s trailing drain pass) —
-  submits **and** immediately launches; double-dispatch.
+- **Dispatcher CLI (`scripts/goalflight_dispatch.py`)** — without `--submit`, launches
+  one worker in default detached mode. With `--submit`, writes a durable queue entry
+  **and** runs one immediate non-blocking drain pass — drain-on-submit is the
+  DEFAULT (so bare `--submit` already launches; same for `dispatch-frontier`'s
+  trailing drain pass). Only `--submit --no-drain-on-submit` is queue-only, and even
+  then the standing drainer below launches it within ~60s.
 
 ## The standing drainer daemon — `com.goalflight.drain`
 
@@ -46,7 +49,7 @@ Consequences:
   returned and even if you did no manual drain. There is no drain step to forget —
   draining is automatic and always-on.
 - **The ledger/queue are shared across projects.** Workers from different repos interleave
-  in one `$GOALFLIGHT_STATE_DIR/runs.d/` (ledger) and `queue.d/` (queue). Identify a
+  in one `$GOALFLIGHT_STATE_DIR/runs.d/` (ledger) and `dispatch-queue/` (queue). Identify a
   worker's origin project by its record's `project_root`. The same task id can appear in
   two projects at once.
 - To pause the daemon: `launchctl unload ~/Library/LaunchAgents/com.goalflight.drain.plist`

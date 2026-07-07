@@ -66,7 +66,7 @@ the call here unnecessarily.
 Before decomposing, **offer the user a polish-skill pass** on the plan source (the file arg, the in-session conversation, or whichever signal you found in step 0). The polish-skill class has two sub-classes with different outputs:
 
 - **Interrogative skills** (return *validated user answers* — load these into the premises file): gstack `/office-hours` (YC-style forcing questions), `/grill-me` (adversarial interrogation). These ask the user; the user replies; the replies are the artifact.
-- **Reviewer skills** (return *findings*, not answers — surface as backlog for the user to triage): gstack `/plan-eng-review` (engineering critique), `/eng-design-review` (design review). These produce P0/P1/P2/P3 lists about the plan; nothing in the output is itself a validated premise.
+- **Reviewer skills** (return *findings*, not answers — surface as backlog for the user to triage): gstack `/plan-eng-review` (engineering critique), gstack `/review` with design-review framing (or the bundled review fallback prompt when gstack is absent). These produce P0/P1/P2/P3 lists about the plan; nothing in the output is itself a validated premise.
 
 Most often `/office-hours` (interrogative, default). The frontier model can pick differently based on what the plan most needs, or embody the gist directly in its own assistant text. See `protocols/premises.md` for the polish-skill class and the architectural rule.
 

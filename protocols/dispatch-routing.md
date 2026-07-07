@@ -444,8 +444,9 @@ transport rules, not co-equal choice:
 
 Scope note: this demotes CURSOR; it does not displace codex, which remains
 the overall code-writing default in the SKILL.md Worker Routing table. The
-grok lane is the high-capacity second executor lane (pool cap 14 vs
-cursor's 3 in `DEFAULT_AGENT_CAPS`).
+grok lane is the high-capacity second executor lane (pool cap 30 vs
+cursor's 3 in `scripts/goalflight_agent_limits.py`, imported by
+`scripts/goalflight_capacity.py`).
 
 Why grok over cursor here:
 
@@ -475,6 +476,10 @@ python3 <skill-root>/scripts/goalflight_capacity.py acquire \
 
 If decision is `wait`, do not spawn. Use another agent only if the concern
 coverage remains valid.
+
+Machine-local caps may override the documented defaults — the override path and
+merge rule are a shared-core fact (`SKILL.md` §Hard caps; source:
+`scripts/goalflight_agent_limits.py`). Check them before reasoning from defaults.
 
 ### Priority lanes (`--priority {critical,normal,bulk}`)
 
