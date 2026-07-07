@@ -273,6 +273,130 @@ def case_spawn_exports_steer_env() -> None:
         assert str(_mailbox(tmp, dispatch_id)) in tail.read_text(encoding="utf-8"), tail.read_text(encoding="utf-8")
 
 
+def _run_prompt_env_case(tmp: Path, dispatch_id: str, prompt_args: list[str], seen_path: Path) -> str:
+    worker_code = (
+        "import os; "
+        "from pathlib import Path; "
+        f"Path({str(seen_path)!r}).write_text("
+        "os.environ.get('GOALFLIGHT_PROMPT_FILE', '') + '\\n' + "
+        "os.environ.get('GOALFLIGHT_STEER_FILE', ''), encoding='utf-8'); "
+        "print('COMPLETE: prompt env seen', flush=True)"
+    )
+
+    old_build_worker = goalflight_dispatch.build_worker
+
+    def fake_build_worker(_args, _prompt_path, _raw_argv):
+        return [sys.executable, "-c", worker_code], None
+
+    try:
+        goalflight_dispatch.build_worker = fake_build_worker
+        with _state_dir(tmp):
+            proc_out = io.StringIO()
+            proc_err = io.StringIO()
+            with contextlib.redirect_stdout(proc_out), contextlib.redirect_stderr(proc_err):
+                rc = goalflight_dispatch.main(
+                    [
+                        "--agent",
+                        "codex",
+                        "--dispatch-id",
+                        dispatch_id,
+                        "--tail",
+                        str(tmp / f"{dispatch_id}.tail"),
+                        "--status-json",
+                        str(tmp / f"{dispatch_id}.status.json"),
+                        "--poll-secs",
+                        "0.1",
+                        "--max-idle-secs",
+                        "5",
+                        "--capacity-wait-s",
+                        "0",
+                        "--foreground",
+                        "--ignore-git-warn",
+                        *prompt_args,
+                    ]
+                )
+    finally:
+        goalflight_dispatch.build_worker = old_build_worker
+
+    assert rc == 0, proc_out.getvalue() + proc_err.getvalue()
+    return seen_path.read_text(encoding="utf-8")
+
+
+def case_inline_prompt_exports_original_prompt_file() -> None:
+    if skip_case_posix_on_native_windows(
+        "case_inline_prompt_exports_original_prompt_file",
+        "prompt env export launches a POSIX/WSL bash-tail dispatch worker",
+    ):
+        return
+
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        dispatch_id = "inline-prompt-env"
+        prompt_text = "Line one\n\nLine three\n"
+        seen = tmp / "seen-inline.txt"
+        seen_text = _run_prompt_env_case(tmp, dispatch_id, ["--prompt", prompt_text], seen)
+        prompt_env, steer_env = seen_text.splitlines()
+        expected_prompt = tmp / "dispatch" / f"{dispatch_id}.prompt"
+
+        assert Path(prompt_env) == expected_prompt, seen_text
+        assert expected_prompt.read_text(encoding="utf-8") == prompt_text
+        assert steer_env == str(_mailbox(tmp, dispatch_id)), seen_text
+
+
+def case_prompt_file_exports_given_path() -> None:
+    if skip_case_posix_on_native_windows(
+        "case_prompt_file_exports_given_path",
+        "prompt env export launches a POSIX/WSL bash-tail dispatch worker",
+    ):
+        return
+
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        dispatch_id = "file-prompt-env"
+        prompt_file = tmp / "brief.md"
+        prompt_file.write_text("Read the durable brief.\n", encoding="utf-8")
+        seen = tmp / "seen-file.txt"
+        seen_text = _run_prompt_env_case(tmp, dispatch_id, ["--prompt-file", str(prompt_file)], seen)
+        prompt_env, steer_env = seen_text.splitlines()
+
+        # Export contract: resolved absolute path (symlink-canonical), so the
+        # worker's re-read works from any cwd.
+        assert Path(prompt_env) == prompt_file.resolve(), seen_text
+        assert steer_env == str(_mailbox(tmp, dispatch_id)), seen_text
+
+
+def case_relative_prompt_file_exports_resolved_absolute_path() -> None:
+    if skip_case_posix_on_native_windows(
+        "case_relative_prompt_file_exports_resolved_absolute_path",
+        "prompt env export launches a POSIX/WSL bash-tail dispatch worker",
+    ):
+        return
+
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        dispatch_id = "rel-prompt-env"
+        prompt_dir = tmp / "prompts"
+        prompt_dir.mkdir()
+        brief = prompt_dir / "brief.md"
+        brief.write_text("Read the durable brief.\n", encoding="utf-8")
+        seen = tmp / "seen-rel.txt"
+        prev_cwd = os.getcwd()
+        try:
+            os.chdir(prompt_dir)
+            seen_text = _run_prompt_env_case(
+                tmp, dispatch_id, ["--prompt-file", "brief.md"], seen
+            )
+        finally:
+            os.chdir(prev_cwd)
+        prompt_env, _steer_env = seen_text.splitlines()
+
+        # A relative --prompt-file must export resolved+absolute: the worker
+        # re-reads $GOALFLIGHT_PROMPT_FILE from its OWN cwd, where a relative
+        # path resolves against the wrong root.
+        assert Path(prompt_env).is_absolute(), seen_text
+        assert Path(prompt_env) == brief.resolve(), seen_text
+
+
 def case_prompt_preamble_is_materialized() -> None:
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
@@ -283,6 +407,9 @@ def case_prompt_preamble_is_materialized() -> None:
 
         assert text.startswith(goalflight_dispatch.STEER_PROMPT_PREAMBLE + "\n\n"), text
         assert "`STEER-ACK: <seq>`" in text, text
+        assert "$GOALFLIGHT_PROMPT_FILE" in text, text
+        assert "Re-read it after any internal compaction/summarization" in text, text
+        assert "disk file is authoritative" in text, text
         assert "COMPLETE: done" in text, text
         assert assembled.name == "prompt-case.assembled.prompt", assembled
 
@@ -304,6 +431,8 @@ def case_grok_prompt_adds_execution_and_terminal_contract() -> None:
 
         expected_prefix = (
             goalflight_dispatch.STEER_PROMPT_PREAMBLE
+            + "\n\n"
+            + goalflight_dispatch.PROMPT_FILE_PREAMBLE
             + "\n\n"
             + goalflight_dispatch.GROK_EXECUTION_PREAMBLE
             + "\n\n"
@@ -330,7 +459,13 @@ def case_codex_prompt_does_not_add_grok_contract() -> None:
         )
         text = assembled.read_text(encoding="utf-8")
 
-        assert text.startswith(goalflight_dispatch.STEER_PROMPT_PREAMBLE + "\n\n"), text
+        expected_prefix = (
+            goalflight_dispatch.STEER_PROMPT_PREAMBLE
+            + "\n\n"
+            + goalflight_dispatch.PROMPT_FILE_PREAMBLE
+            + "\n\n"
+        )
+        assert text.startswith(expected_prefix), text
         assert goalflight_dispatch.GROK_EXECUTION_PREAMBLE not in text, text
 
 
@@ -344,10 +479,9 @@ def case_preamble_routing_matrix() -> None:
         assert grok_marker not in goalflight_dispatch._worker_prompt_preamble(agent), agent
     # The steer preamble is always present regardless of agent.
     for agent in ("grok-code", "grok-research", "codex", None):
-        assert (
-            goalflight_dispatch.STEER_PROMPT_PREAMBLE
-            in goalflight_dispatch._worker_prompt_preamble(agent)
-        ), agent
+        preamble = goalflight_dispatch._worker_prompt_preamble(agent)
+        assert goalflight_dispatch.STEER_PROMPT_PREAMBLE in preamble, agent
+        assert goalflight_dispatch.PROMPT_FILE_PREAMBLE in preamble, agent
 
 
 def main() -> None:
@@ -358,11 +492,18 @@ def main() -> None:
     case_steer_is_no_worker_early_exit()
     case_concurrent_appends_have_monotonic_unique_seq()
     case_spawn_exports_steer_env()
+    case_inline_prompt_exports_original_prompt_file()
+    case_prompt_file_exports_given_path()
+    case_relative_prompt_file_exports_resolved_absolute_path()
     case_prompt_preamble_is_materialized()
     case_grok_prompt_adds_execution_and_terminal_contract()
     case_codex_prompt_does_not_add_grok_contract()
     case_preamble_routing_matrix()
     print("OK: goalflight_dispatch steer tests pass")
+
+
+def test_dispatch_steer_cases() -> None:
+    main()
 
 
 if __name__ == "__main__":

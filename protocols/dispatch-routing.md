@@ -15,6 +15,22 @@ orthogonal axes: **iteration pattern** (how many turns) and **comms shape**
   review-revise cycles, exceeds one turn, or the worker should keep refining
   until a marker fires.
 
+Right-size the shape — three loop failure modes to avoid:
+
+- **Don't dispatch what one look fixes.** A serialized worker round-trip
+  (spawn, orient, loop, review, report) costs minutes; when the controller can
+  see the fix directly, controller-direct is correct even mid-run. The inverse
+  rule (don't hand-iterate >~3 edit/test cycles) still holds — right-sizing
+  cuts both ways.
+- **In-loop review convergence is severity-gated.** P0–P2 findings block loop
+  exit. Safe/easy in-scope P3s may be applied inline when mechanical (per
+  `protocols/chunk-review.md`) — but they never drive another iteration;
+  uncertain, non-mechanical, or out-of-scope P3s go into the worker's report
+  for store capture. Never keep looping solely for P3 polish.
+- **Loops are iteration-bounded.** No new green progress across ~3 consecutive
+  iterations → stop and return `BLOCKED:` with evidence (the fix so far OR the
+  next honest reason), not more laps.
+
 ## Axis 2 — Comms shape
 
 - `controller-direct`: no worker spawned. The orchestrator does the edit itself.
@@ -50,7 +66,7 @@ orthogonal axes: **iteration pattern** (how many turns) and **comms shape**
   and the Claude cap is 5.
 
   Cursor tool-use or file-writing chunks need `--permission-mode inline`
-  (or `--interactive`, which expands to ACP inline mode). Plain `auto`
+  (alias: `--interactive`). Plain `auto`
   permission mode can surface shell/tool escalation as `USER-CONFIRM` and block
   the worker even though the same chunk completes when inline permission routing
   is active.
@@ -61,6 +77,13 @@ orthogonal axes: **iteration pattern** (how many turns) and **comms shape**
   event, so a healthy worker emitting periodic STATUS markers never trips it.
   Override with `--max-idle-secs <secs>` (or `--max-idle-secs 0` for no idle
   gate, relying on PID liveness + the worker's terminal marker).
+  **grok caveat:** bash-tail grok can run with an EMPTY tail until a single
+  final write (empty/no-op tails observed across permission-mode variants,
+  2026-06-10) — treat tail silence as normal there, never as death by itself;
+  PID identity + final marker are the liveness signals. grok over ACP still
+  emits turn/tool events but can be event-quiet through a long generation —
+  give research one-shots a generous idle override rather than the 180s
+  read-only default.
 - `bash-tail`: worker writes stdout/stderr to files; the orchestrator watches
   via marker grep. Fallback only when no ACP adapter is available. See
   `protocols/legacy/bash-tail.md` for recipes and hazards (incl. the
@@ -85,6 +108,14 @@ python3 <skill-root>/scripts/goalflight_dispatch.py --agent codex --prompt-file 
 The dispatcher prints `DISPATCH-LAUNCHED` with the dispatch id, status JSON,
 tail path, and worker PID, then returns immediately. Follow progress with
 `goalflight_status.py --dispatch <id>` or `goalflight_status.py --wait <id>`.
+
+Prefer `--prompt-file` over inline `--prompt` for anything beyond a short
+one-shot, and always when prompt text exceeds ~2KB: workers compact too — an
+inline prompt is unrecoverable after the worker's own auto-compaction, while a
+file path survives summarization and supports a standing re-read instruction
+(`$GOALFLIGHT_PROMPT_FILE`; `protocols/worker-context-package.md` §Pin durability). Likely-long chunks
+default to the goal-loop shape so tests-green + review convergence — not the
+worker's memory of the prompt — is the exit condition.
 
 ### Background by default; don't block the controller
 
@@ -168,12 +199,17 @@ Code-writing still defaults to the sub-billed CLI workers.
 
 ## Worker/controller candidates
 
+You, the reader, are already the orchestrator — there is no orchestrator to pick
+at dispatch time. The per-chunk routing decision is the **Worker** column; the
+**Controller-host** column is an install/handoff fact (which hosts CAN run this
+skill as the controller, e.g. on a remote node or after a session move).
+
 Treat routing candidates as first-class only after their readiness gate passes:
 
-| Candidate | Orchestrator use | Worker use | Readiness gate |
+| Candidate | Controller-host capable (install fact) | Worker routing (per-chunk) | Readiness gate |
 |---|---|---|---|
 | Codex | yes | yes | Desktop/CLI available when needed, context-mode registered for large-output work, ACP handshake passes for structured dispatch. |
-| Cursor | yes | yes | Cursor Desktop or CLI path present for orchestrator use; `cursor-agent` present and ACP handshake passes for worker use; model-currency probe is current or explicitly accepted as stale. |
+| Cursor | yes | yes | Cursor Desktop or CLI path present for the controller-host role; `cursor-agent` present and ACP handshake passes for worker use; model-currency probe is current or explicitly accepted as stale. |
 | Grok | yes | read-only analysis/research only until write probe passes | Grok Build/headless flags present; structured ACP path passes before ACP dispatch; bash-tail is fallback-only and must obey the marker limits in Composition rules. File-writing is not routable unless `goalflight_doctor.py --worker-write-probe --write-probe-agent grok-code` passes in the current environment. |
 | OpenCode | yes | helper/raw passthrough only | `opencode` on PATH; host-specific helpers under `scripts/hosts/opencode/` and live smokes in `tests/bash/test-opencode-*`; raw `goalflight_dispatch.py -- <cmd>` passthrough is allowed when the caller owns the command contract. Not a `goalflight_dispatch.py --agent opencode` preset. |
 | Claude compatibility path | yes | yes | Adapter-owned CLI/plugin probes pass; startup gate applies where the adapter requires serialized initialization. |
@@ -378,7 +414,7 @@ Both transports run codex's **native** `/goal` loop unchanged: the prompt and
 `features.goals` config are identical, so codex — not goal-flight's wrapper — drives the
 iteration either way (it is NOT a simulated/partial goal-mode on bash-tail).
 The transports therefore differ for codex only in that ACP can relay per-tool
-permission decisions live (`--interactive` = `--permission-mode inline`) and
+permission decisions live (`--interactive`) and
 reads terminal state from structured events instead of a tail marker. Default:
 
 | The codex goal-loop is… | Transport | Why |
@@ -478,7 +514,7 @@ If decision is `wait`, do not spawn. Use another agent only if the concern
 coverage remains valid.
 
 Machine-local caps may override the documented defaults — the override path and
-merge rule are a shared-core fact (`SKILL.md` §Hard caps; source:
+merge rule are a shared-core fact (the `SKILL.md` Hard caps section; source:
 `scripts/goalflight_agent_limits.py`). Check them before reasoning from defaults.
 
 ### Priority lanes (`--priority {critical,normal,bulk}`)

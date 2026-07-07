@@ -22,6 +22,10 @@ incremented when meaningful skill behaviour changes.
 - Corrected `--submit` semantics in dispatch prose: drain-on-submit is the
   default (bare `--submit` queues and immediately drains once); only
   `--no-drain-on-submit` is queue-only.
+- Prompted bash-tail workers launched by `goalflight_dispatch.py` now receive
+  their resolved prompt path (`GOALFLIGHT_PROMPT_FILE`) plus a standing re-read
+  instruction, so pinned briefs survive worker-side compaction (ACP wiring is a
+  tracked follow-up).
 
 ### Migration (1.2.0 → 1.3.0)
 

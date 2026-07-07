@@ -260,6 +260,12 @@ STEER_PROMPT_PREAMBLE = (
     "into your plan; ack each with `STEER-ACK: <seq>` on its own line; a steer may "
     "redirect or HALT you — honor it."
 )
+PROMPT_FILE_PREAMBLE = (
+    "Your FULL original brief is at `$GOALFLIGHT_PROMPT_FILE`. Re-read it after any "
+    "internal compaction/summarization, at the start of each long-run goal-loop "
+    "iteration, and before final commit/exit; the disk file is authoritative over "
+    "summarized memory."
+)
 GROK_EXECUTION_PREAMBLE = (
     "Grok worker execution contract:\n"
     "- Use your available tools to actually perform the requested filesystem, shell, "
@@ -647,7 +653,9 @@ def _start_caffeinate(worker_pid: int, *, env: dict[str, str], stdout_path: Path
 def _resolve_prompt_file(args, base: Path) -> str | None:
     """Normalize --prompt/--prompt-file to a file path (for stdin-fed workers)."""
     if args.prompt_file:
-        return str(Path(args.prompt_file).expanduser())
+        # Absolute path: workers re-read via $GOALFLIGHT_PROMPT_FILE from their
+        # own cwd, so a relative path would resolve against the wrong root.
+        return str(Path(args.prompt_file).expanduser().resolve())
     if args.prompt is not None:
         base.mkdir(parents=True, exist_ok=True)
         pf = base / f"{args.dispatch_id}.prompt"
@@ -1239,7 +1247,7 @@ def _cmd_steer(argv: list[str]) -> int:
 
 
 def _worker_prompt_preamble(agent: str | None) -> str:
-    preambles = [STEER_PROMPT_PREAMBLE]
+    preambles = [STEER_PROMPT_PREAMBLE, PROMPT_FILE_PREAMBLE]
     if agent in {"grok-code", "grok-research"}:
         preambles.append(GROK_EXECUTION_PREAMBLE)
     return "\n\n".join(preambles)
@@ -3804,6 +3812,7 @@ def main(argv: list[str] | None = None) -> int:
 
     steer_file = _steer_file(args.dispatch_id)
     prompt_path = None if raw else _resolve_prompt_file(args, base)
+    original_prompt_path = prompt_path
     if prompt_path:
         prompt_path = _materialize_steer_prompt(prompt_path, base, args.dispatch_id, agent=args.agent)
     worker_argv, stdin_path = build_worker(args, prompt_path, raw)
@@ -3899,6 +3908,10 @@ def main(argv: list[str] | None = None) -> int:
         env = dict(os.environ)
         env.update(account_env)
         env["GOALFLIGHT_STEER_FILE"] = str(steer_file)
+        if original_prompt_path:
+            env["GOALFLIGHT_PROMPT_FILE"] = str(original_prompt_path)
+        else:
+            env.pop("GOALFLIGHT_PROMPT_FILE", None)
         if args.account and _account_engine(args.agent) == "grok":
             env.pop("GROK_API_KEY", None)
             env.pop("XAI_API_KEY", None)
