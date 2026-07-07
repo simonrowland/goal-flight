@@ -10,6 +10,7 @@
  *     so file:// views pick up a changed tasks-data.js.
  *   - RENDER: sectioned status board, kind/status/search filters, sort, counts.
  *   - AUTOLINK: \b[tbq]-\d+\b ids -> ticket.html?id=...
+ *   - MENTIONS: single ids/path mentions -> safe links, everything else code.
  *
  * Public surface: window.GF = { load, items, status, autolink, ... }.
  */
@@ -141,6 +142,7 @@
       prompt_path: it.prompt_path || null,
       created_at: it.created_at || null,
       done_at: it.done_at || null,
+      done_reviewed_at: it.done_reviewed_at || null,
       closed_at: it.closed_at || null,
       reviewed_at: it.reviewed_at || null,
       completed_at: it.completed_at || null,
@@ -190,6 +192,7 @@
   // ADR-/bp- (case-insensitive, to match idLink/linkList which already accept
   // ADR-/bp- and Q-). The captured id is emitted verbatim so casing is preserved.
   var ID_RE = /\b((?:ADR|bp|[tbq])-\d+)\b/gi;
+  var ID_EXACT_RE = /^(?:ADR|bp|[tbq])-\d+$/i;
 
   // Allowlisted repo-root-relative directory prefixes for file-path autolinking
   // (ADR-012 / progress-dashboard.md "Autolinking"). Configurable: a deployment
@@ -310,11 +313,30 @@
     return false;
   }
 
+  // Canonical path-token grammar shared by every link sink: the same charset
+  // the autolink tokenizer (PATH_RE) accepts, enforced here so direct callers
+  // (renderMention) can't smuggle quotes, angle brackets, control chars,
+  // backslashes, spaces, or scheme-ish strings into an href — PLUS a
+  // dot-segment ban so an allowlisted prefix can't be escaped with a later
+  // '..' (docs-private/../SKILL.md must stay plain text).
+  var PATH_TOKEN_RE = /^\/?(?:[\w.\-]+\/)*[\w.\-]+$/;
+
+  function isSafePathToken(p) {
+    if (!PATH_TOKEN_RE.test(p)) return false;
+    var segs = String(p).split("/");
+    for (var i = 0; i < segs.length; i++) {
+      if (segs[i] === "." || segs[i] === "..") return false;
+    }
+    return true;
+  }
+
   // Resolve a raw path mention to a repo-root-relative form, or null if it must
   // stay plain text. Handles: repo-root-relative (allowlisted prefix), and
   // absolute-under-GF_ROOT (stripped to relative). Absolute paths NOT under the
-  // repo, or relative paths outside the allowlist, return null (plain text).
+  // repo, relative paths outside the allowlist, and anything failing the path
+  // token grammar (hostile chars, dot segments) return null (plain text).
   function resolvePathMention(raw) {
+    if (!isSafePathToken(raw)) return null;
     if (!hasAllowedExt(raw)) return null;
     var rel = raw;
     if (raw.charAt(0) === "/") {
@@ -368,6 +390,37 @@
   function idLink(id, cls) {
     var c = cls ? ' class="' + cls + '"' : "";
     return '<a' + c + ' href="' + ticketHref(id) + '">' + esc(id) + "</a>";
+  }
+
+  // Policy: a trailing ':NNN' is always a line reference — the href drops it,
+  // the visible text keeps it. This is unambiguous because ':' is outside the
+  // path-token grammar, so a literal colon-containing filename is never
+  // linkable in the first place.
+  function stripPathLineSuffix(raw) {
+    return String(raw == null ? "" : raw).trim().replace(/:\d+$/, "");
+  }
+
+  // Id-only mention sink for fields whose CONTRACT is item ids (e.g. live
+  // worker task_ids): exact id -> ticket link, anything else -> inert code
+  // text. Path-shaped values in an ids field must not become path links.
+  function renderIdOnly(raw, cls) {
+    var text = String(raw == null ? "" : raw).trim();
+    if (!text) return "<code></code>";
+    if (ID_EXACT_RE.test(text)) return idLink(text, cls || "idlink");
+    return "<code>" + esc(text) + "</code>";
+  }
+
+  // A single mention sink for detail views. It intentionally emits only:
+  // item-id ticket links; allowlisted repo path links; or inert code text.
+  function renderMention(raw, cls) {
+    var text = String(raw == null ? "" : raw).trim();
+    if (!text) return "<code></code>";
+    if (ID_EXACT_RE.test(text)) return idLink(text, cls || "idlink");
+    var rel = resolvePathMention(stripPathLineSuffix(text));
+    if (rel) {
+      return '<a class="pathlink" href="' + esc("../" + rel) + '">' + esc(text) + "</a>";
+    }
+    return "<code>" + esc(text) + "</code>";
   }
 
   /* ------------------------------------------------------------- loading */
@@ -920,6 +973,76 @@
     return Number.isFinite(n) ? n : null;
   }
 
+  function formatDurationMs(ms) {
+    if (!Number.isFinite(ms) || ms < 0) return "";
+    var total = Math.max(0, Math.round(ms / 1000));
+    if (total < 60) return total + "s";
+    var minutes = Math.round(total / 60);
+    if (minutes < 60) return minutes + "m";
+    var hours = Math.floor(minutes / 60);
+    var remMinutes = minutes % 60;
+    if (hours < 24) return hours + "h" + (remMinutes ? " " + remMinutes + "m" : "");
+    var days = Math.floor(hours / 24);
+    var remHours = hours % 24;
+    return days + "d" + (remHours ? " " + remHours + "h" : "");
+  }
+
+  function formatDurationSeconds(seconds) {
+    var n = Number(seconds);
+    return Number.isFinite(n) ? formatDurationMs(n * 1000) : "";
+  }
+
+  function fmtClock(ms) {
+    if (!Number.isFinite(ms)) return "";
+    try {
+      return new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    } catch (e) {
+      return "";
+    }
+  }
+
+  function fmtDayLabel(ms) {
+    if (!Number.isFinite(ms)) return "";
+    try {
+      return new Date(ms).toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" });
+    } catch (e) {
+      return "";
+    }
+  }
+
+  function freshnessInfo(meta, staleMs, prefix) {
+    if (!meta || typeof meta !== "object" || meta.schema !== 1) return null;
+    var t = parseTime(meta.generated_at);
+    if (t == null) return null;
+    var age = Math.max(0, Date.now() - t);
+    var label = prefix || "data as of";
+    return {
+      generatedAt: t,
+      ageMs: age,
+      stale: age > staleMs,
+      text: label + " " + fmtClock(t) + " · " + formatDurationMs(age) + " ago"
+    };
+  }
+
+  function metaFreshness(staleMs) {
+    return freshnessInfo(global.GF_META, staleMs == null ? 10 * 60 * 1000 : staleMs, "data as of");
+  }
+
+  function statusFreshness(staleMs) {
+    return freshnessInfo(global.GF_STATUS, staleMs == null ? 90 * 1000 : staleMs, "live as of");
+  }
+
+  function statusSnapshot() {
+    var status = global.GF_STATUS;
+    if (!status || typeof status !== "object" || status.schema !== 1) return null;
+    return {
+      generated_at: status.generated_at || null,
+      project_root: status.project_root || "",
+      dispatches: Array.isArray(status.dispatches) ? status.dispatches : [],
+      counts: status.counts && typeof status.counts === "object" ? status.counts : {}
+    };
+  }
+
   function firstAuditTime(it, actions) {
     var audit = Array.isArray(it.audit) ? it.audit : [];
     for (var i = 0; i < audit.length; i++) {
@@ -1113,6 +1236,8 @@
     autolink: autolink,
     linkifyPaths: linkifyPaths,
     resolvePathMention: resolvePathMention,
+    renderMention: renderMention,
+    renderIdOnly: renderIdOnly,
     gfRoot: gfRoot,
     idLink: idLink,
     normalize: normalize,
@@ -1131,6 +1256,14 @@
     statusBadge: statusBadge,
     kindBadge: kindBadge,
     blockerBits: blockerBits,
+    parseTime: parseTime,
+    fmtClock: fmtClock,
+    fmtDayLabel: fmtDayLabel,
+    formatDurationMs: formatDurationMs,
+    formatDurationSeconds: formatDurationSeconds,
+    metaFreshness: metaFreshness,
+    statusFreshness: statusFreshness,
+    statusSnapshot: statusSnapshot,
     burndownData: burndownData,
     burndownCoverageNote: burndownCoverageNote,
     renderBurndownSvg: renderBurndownSvg,

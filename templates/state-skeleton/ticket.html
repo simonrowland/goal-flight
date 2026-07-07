@@ -51,6 +51,19 @@ pre{background:var(--chip);border:1px solid var(--border);border-radius:.5rem;pa
 .dispatch-meta{display:flex;flex-wrap:wrap;gap:.25rem .8rem;font:.78rem ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--fg)}
 .dispatch-meta strong{color:var(--muted);font-weight:600}
 .dispatch-log{display:inline-block;margin-top:.3rem;word-break:break-all}
+.timeline{list-style:none;margin:.2rem 0 0;padding:0;display:flex;flex-direction:column;gap:.35rem}
+.timeline-day{font:.75rem ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted);
+  text-transform:uppercase;letter-spacing:.05em;margin:.65rem 0 .15rem}
+.timeline-event{display:grid;grid-template-columns:3.8rem 1fr;gap:.7rem;align-items:start;
+  border-left:2px solid var(--border);padding:.2rem 0 .45rem .8rem}
+.timeline-time{font:.76rem ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted);white-space:nowrap}
+.timeline-title{font-weight:600}
+.timeline-meta{display:block;margin-top:.12rem;color:var(--muted);font-size:.86rem}
+.timeline-meta code,.dispatches code{font:.88em ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--fg);
+  background:var(--chip);border:1px solid var(--border);border-radius:.35rem;padding:.02rem .25rem}
+.timeline-chips{display:flex;gap:.35rem;flex-wrap:wrap;margin:.35rem 0 .55rem}
+.duration-chip{font:.72rem/1.7 ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--chip);
+  color:var(--chip-fg);border:1px solid var(--border);border-radius:1rem;padding:.02rem .55rem}
 .notfound{background:var(--card);border:1px solid var(--warn);border-radius:.7rem;padding:1.2rem;color:var(--warn)}
 .idlink{font:inherit ui-monospace,SFMono-Regular,Menlo,monospace}
 footer{max-width:46rem;margin:0 auto;padding:1.5rem 1.25rem 2rem;color:var(--muted);font-size:.78rem}
@@ -64,6 +77,7 @@ footer{max-width:46rem;margin:0 auto;padding:1.5rem 1.25rem 2rem;color:var(--mut
 <footer>goal-flight · Tier-2 view</footer>
 
 <script src="tasks-data.js"></script>
+<script src="status-data.js"></script>
 <script src="gf.js"></script>
 <script>
 (function(){
@@ -73,8 +87,6 @@ footer{max-width:46rem;margin:0 auto;padding:1.5rem 1.25rem 2rem;color:var(--mut
   document.getElementById("crumbId").textContent = wantId ? wantId : "";
 
   function row(dt, ddHtml){ return "<dt>"+GF.esc(dt)+"</dt><dd>"+ddHtml+"</dd>"; }
-
-  function safeHref(url){ return GF.safeHref(url); }
 
   function blockerList(ids){
     if(!ids || !ids.length) return "<span style='color:var(--muted)'>none</span>";
@@ -92,15 +104,22 @@ footer{max-width:46rem;margin:0 auto;padding:1.5rem 1.25rem 2rem;color:var(--mut
   function linkList(links){
     if(!links || !links.length) return "<span style='color:var(--muted)'>none</span>";
     return "<ul>"+links.map(function(l){
-      // ids link to ticket.html; other strings link as-is (relative doc/anchor)
-      if(/^[tbq]-\d+$/.test(l) || /^(ADR|bp)-\d+$/i.test(l)){
+      var text = String(l == null ? "" : l).trim();
+      if(/^(?:ADR|bp|[tbq])-\d+$/i.test(text)){
         // Flag a link to an id that has no item, so a dangling cross-reference
         // doesn't masquerade as a live ticket (matches blockerList's guard).
-        var known = GF.store.byId[l];
-        return "<li>"+GF.idLink(l, "idlink")+(known?"":" <span style='color:var(--muted)'>(unknown)</span>")+"</li>";
+        var known = GF.store.byId[text];
+        return "<li>"+GF.renderMention(text, "idlink")+(known?"":" <span style='color:var(--muted)'>(unknown)</span>")+"</li>";
       }
-      return "<li><a href='"+safeHref(l)+"'>"+GF.esc(l)+"</a></li>";
+      return "<li>"+GF.renderMention(text)+"</li>";
     }).join("")+"</ul>";
+  }
+
+  function metaBits(pairs){
+    return pairs.filter(function(pair){ return pair[1] != null && String(pair[1]).trim() !== ""; })
+      .map(function(pair){
+        return "<span><strong>"+GF.esc(pair[0])+":</strong> "+GF.esc(pair[1])+"</span>";
+      }).join("");
   }
 
   function dispatchHistory(dispatches){
@@ -108,26 +127,147 @@ footer{max-width:46rem;margin:0 auto;padding:1.5rem 1.25rem 2rem;color:var(--mut
     var rows = dispatches.map(function(raw){
       var d = raw && typeof raw === "object" ? raw : {};
       var dispatchId = d.dispatch_id || d.id || "";
-      var agent = d.agent || "";
-      var state = d.state || d.status || "";
-      var started = d.started_at || d.started || "";
-      var ended = d.ended_at || d.ended || "";
-      var log = d.log || d.path || d.log_path || "";
-      var meta = [
-        ["dispatch_id", dispatchId],
-        ["agent", agent],
-        ["state", state],
-        ["started", started],
-        ["ended", ended]
-      ].map(function(pair){
-        return "<span><strong>"+GF.esc(pair[0])+":</strong> "+GF.esc(pair[1] || "-")+"</span>";
-      }).join("");
-      var logHtml = log
-        ? '<a class="dispatch-log" href="'+safeHref(log)+'">'+GF.esc(log)+'</a>'
-        : '<span class="dispatch-log" style="color:var(--muted)">no log</span>';
-      return "<li><div class=\"dispatch-meta\">"+meta+"</div>"+logHtml+"</li>";
+      var isReview = !!(d.role || d.verdict || d.findings_ref);
+      var meta = isReview
+        ? metaBits([
+            ["dispatch_id", dispatchId],
+            ["role", d.role],
+            ["verdict", d.verdict],
+            ["ts", d.ts]
+          ])
+        : metaBits([
+            ["dispatch_id", dispatchId],
+            ["agent", d.agent],
+            ["state", d.state || d.status],
+            ["started", d.started_at || d.started || d.ts],
+            ["ended", d.ended_at || d.ended]
+          ]);
+      var extras = [];
+      if(isReview && d.findings_ref) extras.push('<span class="dispatch-log">'+GF.renderMention(d.findings_ref)+'</span>');
+      if(!isReview && d.marker && typeof d.marker === "object"){
+        var marker = [d.marker.kind, d.marker.text].filter(Boolean).join(": ");
+        if(marker) extras.push('<span class="dispatch-log">'+GF.autolink(marker)+'</span>');
+      }
+      var statusPath = d.status_path || d.log || d.path || d.log_path || "";
+      if(statusPath) extras.push('<span class="dispatch-log">'+GF.renderMention(statusPath)+'</span>');
+      return "<li><div class=\"dispatch-meta\">"+meta+"</div>"+extras.join("")+"</li>";
     }).join("");
     return rows ? '<p class="section-title">Dispatch history</p><ul class="dispatches">'+rows+"</ul>" : "";
+  }
+
+  function firstAuditTime(it, actions){
+    var audit = Array.isArray(it.audit) ? it.audit : [];
+    for(var i=0;i<audit.length;i++){
+      var row = audit[i] || {};
+      if(actions.indexOf(String(row.action || "")) < 0) continue;
+      var t = GF.parseTime(row.at || row.ts || row.time);
+      if(t != null) return t;
+    }
+    return null;
+  }
+
+  function pushEvent(events, at, order, titleHtml, metaHtml){
+    var t = GF.parseTime(at);
+    if(t == null) return;
+    events.push({ t:t, order:order, title:titleHtml, meta:metaHtml || "" });
+  }
+
+  function auditMeta(row){
+    var bits = [];
+    if(row.dispatch_id) bits.push("dispatch " + GF.renderMention(row.dispatch_id));
+    if(row.review_dispatch_id) bits.push("review " + GF.renderMention(row.review_dispatch_id));
+    ["verdict","resolution","note","append_note","append","state","lane"].forEach(function(k){
+      if(row[k] != null && String(row[k]).trim() !== "") bits.push(GF.esc(k) + " " + GF.autolink(row[k]));
+    });
+    ["findings_ref","source_ref","harvest_source"].forEach(function(k){
+      if(row[k] != null && String(row[k]).trim() !== "") bits.push(GF.esc(k) + " " + GF.renderMention(row[k]));
+    });
+    return bits.join(" · ");
+  }
+
+  function dispatchEventMeta(d, isReview){
+    var bits = [];
+    var dispatchId = d.dispatch_id || d.id || "";
+    if(dispatchId) bits.push("dispatch " + GF.renderMention(dispatchId));
+    if(isReview && d.role) bits.push("role " + GF.esc(d.role));
+    if(!isReview && d.agent) bits.push("agent " + GF.esc(d.agent));
+    if(d.started_at || d.started) bits.push("started " + GF.esc(GF.fmtClock(GF.parseTime(d.started_at || d.started))));
+    if(d.ended_at || d.ended) bits.push("ended " + GF.esc(GF.fmtClock(GF.parseTime(d.ended_at || d.ended))));
+    if(d.findings_ref) bits.push("findings " + GF.renderMention(d.findings_ref));
+    if(d.marker && typeof d.marker === "object"){
+      var marker = [d.marker.kind, d.marker.text].filter(Boolean).join(": ");
+      if(marker) bits.push("marker " + GF.autolink(marker));
+    }
+    return bits.join(" · ");
+  }
+
+  function durationChips(it){
+    var logged = GF.parseTime(it.created_at) || firstAuditTime(it, ["new","harvest","review-bug-capture"]);
+    var firstStart = null;
+    (it.dispatches || []).forEach(function(d){
+      var t = GF.parseTime((d && (d.started_at || d.started || d.ts)) || "");
+      if(t != null && (firstStart == null || t < firstStart)) firstStart = t;
+    });
+    var done = GF.parseTime(it.done_at) || GF.parseTime(it.closed_at) || GF.parseTime(it.completed_at) ||
+      firstAuditTime(it, ["done","close","closed"]);
+    var reviewed = GF.parseTime(it.done_reviewed_at) || GF.parseTime(it.reviewed_at) ||
+      firstAuditTime(it, ["review","accept"]);
+    var chips = [];
+    function chip(label, a, b){
+      if(a == null || b == null || b < a) return;
+      var dur = GF.formatDurationMs(b - a);
+      if(dur) chips.push('<span class="duration-chip">'+GF.esc(label)+" "+GF.esc(dur)+"</span>");
+    }
+    chip("logged→dispatch", logged, firstStart);
+    chip("start→done", firstStart, done);
+    chip("done→reviewed", done, reviewed);
+    return chips.length ? '<div class="timeline-chips">'+chips.join("")+"</div>" : "";
+  }
+
+  function timeline(it){
+    var events = [];
+    var created = it.created_at || null;
+    if(!created){
+      var c = firstAuditTime(it, ["new","harvest","review-bug-capture"]);
+      created = c == null ? null : new Date(c).toISOString();
+    }
+    pushEvent(events, created, 0, "created", "");
+
+    (it.audit || []).forEach(function(row, idx){
+      row = row && typeof row === "object" ? row : {};
+      var action = String(row.action || "audit");
+      var actor = row.actor ? " by " + GF.esc(row.actor) : "";
+      pushEvent(events, row.at || row.ts || row.time, 10 + idx, GF.esc(action) + actor, auditMeta(row));
+    });
+
+    (it.dispatches || []).forEach(function(raw, idx){
+      var d = raw && typeof raw === "object" ? raw : {};
+      var isReview = !!(d.role || d.verdict || d.findings_ref);
+      var label = isReview
+        ? "review" + (d.verdict ? " " + GF.esc(d.verdict) : "")
+        : "dispatch" + (d.state || d.status ? " " + GF.esc(d.state || d.status) : "");
+      pushEvent(events, d.started_at || d.started || d.ts || d.ended_at || d.ended, 500 + idx, label, dispatchEventMeta(d, isReview));
+    });
+
+    pushEvent(events, it.done_at || it.closed_at || it.completed_at, 900, "done", "");
+    pushEvent(events, it.done_reviewed_at || it.reviewed_at, 901, "reviewed", "");
+    events.sort(function(a,b){ return a.t - b.t || a.order - b.order; });
+    if(!events.length) return "";
+
+    var lastDay = "";
+    var rows = events.map(function(ev){
+      var day = new Date(ev.t).toDateString();
+      var dayHtml = "";
+      if(day !== lastDay){
+        lastDay = day;
+        dayHtml = '<li class="timeline-day">'+GF.esc(GF.fmtDayLabel(ev.t))+"</li>";
+      }
+      return dayHtml + '<li class="timeline-event"><span class="timeline-time">'+GF.esc(GF.fmtClock(ev.t))+
+        '</span><span><span class="timeline-title">'+ev.title+'</span>'+
+        (ev.meta ? '<span class="timeline-meta">'+ev.meta+"</span>" : "")+
+        "</span></li>";
+    }).join("");
+    return '<p class="section-title">Timeline</p>'+durationChips(it)+'<ul class="timeline">'+rows+"</ul>";
   }
 
   function render(){
@@ -168,9 +308,10 @@ footer{max-width:46rem;margin:0 auto;padding:1.5rem 1.25rem 2rem;color:var(--mut
     if(it.prompt){
       html += '<p class="section-title">Prompt</p><pre>'+GF.esc(it.prompt)+"</pre>";
     } else if(it.prompt_path){
-      html += '<p class="section-title">Prompt</p><p><a href="'+safeHref(it.prompt_path)+'">'+GF.esc(it.prompt_path)+"</a></p>";
+      html += '<p class="section-title">Prompt</p><p>'+GF.renderMention(it.prompt_path)+"</p>";
     }
     html += dispatchHistory(it.dispatches);
+    html += timeline(it);
     mount.innerHTML = html;
   }
 

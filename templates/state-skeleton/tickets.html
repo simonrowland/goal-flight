@@ -42,6 +42,8 @@ input:focus-visible,select:focus-visible,button:focus-visible,a:focus-visible{ou
 .label{font-size:.78rem;color:var(--muted);margin-right:.15rem}
 .spacer{flex:1 1 auto}
 .mode{font:.72rem ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted);white-space:nowrap}
+.freshness{margin-left:.45rem}
+.stale-muted{color:var(--warn);opacity:.8}
 .dot{display:inline-block;width:.5rem;height:.5rem;border-radius:50%;background:var(--muted);margin-right:.35rem;vertical-align:middle}
 .linkbtn{font:inherit;background:transparent;border:1px solid var(--border);color:var(--fg);
   border-radius:.5rem;padding:.4rem .7rem;cursor:pointer}
@@ -140,7 +142,7 @@ footer{max-width:52rem;margin:0 auto;padding:1.5rem 1.25rem 2rem;color:var(--mut
       <option value="severity">severity</option>
     </select>
     <span class="spacer"></span>
-    <span class="mode" id="mode" aria-live="polite"><span class="dot"></span><span id="modeText">loading…</span></span>
+    <span class="mode" id="mode" aria-live="polite"><span class="dot"></span><span id="modeText">loading…</span><span id="freshness" class="freshness"></span></span>
     <button class="linkbtn" type="button" id="refresh" title="Reload page to read tasks-data.js">Refresh</button>
   </div>
 
@@ -150,6 +152,7 @@ footer{max-width:52rem;margin:0 auto;padding:1.5rem 1.25rem 2rem;color:var(--mut
 <footer><span id="foot">goal-flight · Tier-2 view</span></footer>
 
 <script src="tasks-data.js"></script>
+<script src="status-data.js"></script>
 <script src="gf.js"></script>
 <script>
 (function(){
@@ -186,7 +189,18 @@ footer{max-width:52rem;margin:0 auto;padding:1.5rem 1.25rem 2rem;color:var(--mut
     }, 350);
   }
 
-  function render(){ var n = GF.renderBoard(board, ctrl); announce(n); }
+  function setStale(el, stale){
+    if(el.classList && typeof el.classList.toggle === "function") el.classList.toggle("stale-muted", stale);
+  }
+
+  function updateFreshness(){
+    var el = document.getElementById("freshness");
+    var info = GF.metaFreshness();
+    el.textContent = info ? info.text : "";
+    setStale(el, !!(info && info.stale));
+  }
+
+  function render(){ var n = GF.renderBoard(board, ctrl); announce(n); updateFreshness(); }
 
   function syncUrl(){
     if(!window.history || typeof window.history.replaceState !== "function") return;
@@ -241,6 +255,7 @@ footer{max-width:52rem;margin:0 auto;padding:1.5rem 1.25rem 2rem;color:var(--mut
     var txt = document.getElementById("modeText");
     el.classList.remove("live");
     txt.textContent = (mode || "snapshot") + " · reloads page";
+    updateFreshness();
   }
 
   var driver = GF.attach({

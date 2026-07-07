@@ -27,7 +27,11 @@ a:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius
 h1{font-size:1.5rem;margin:.2em 0 .1em;letter-spacing:-.01em}
 .tagline{color:var(--muted);font-size:.9rem;margin:.1em 0 0}
 .mode{font:.72rem ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted)}
+.freshness{margin-left:.45rem}
+.stale-muted{color:var(--warn);opacity:.8}
 .dot{display:inline-block;width:.5rem;height:.5rem;border-radius:50%;background:var(--muted);margin-right:.35rem;vertical-align:middle}
+.live-strip{margin:.9rem 0 0;padding:.45rem .65rem;border:1px solid var(--border);border-radius:.6rem;
+  background:var(--card);color:var(--muted);font:.78rem ui-monospace,SFMono-Regular,Menlo,monospace}
 h2{font-size:1.0rem;margin:1.7em 0 .5em;border-bottom:1px solid var(--border);padding-bottom:.25em}
 /* count cards */
 .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(7.2rem,1fr));gap:.6rem;margin:1.2rem 0 .3rem}
@@ -65,8 +69,10 @@ footer{max-width:46rem;margin:0 auto;padding:.5rem 1.25rem 2rem;color:var(--mute
       <h1>goal-flight</h1>
       <p class="tagline">project state · snapshot dashboard</p>
     </div>
-    <span class="mode" id="mode"><span class="dot"></span><span id="modeText">loading…</span></span>
+    <span class="mode" id="mode"><span class="dot"></span><span id="modeText">loading…</span><span id="freshness" class="freshness"></span></span>
   </div>
+
+  <p class="live-strip" id="liveStrip" hidden></p>
 
   <div class="cards" id="cards" aria-label="Status counts"></div>
 
@@ -99,6 +105,7 @@ footer{max-width:46rem;margin:0 auto;padding:.5rem 1.25rem 2rem;color:var(--mute
 <footer><span id="foot">goal-flight · Tier-2 dashboard</span></footer>
 
 <script src="tasks-data.js"></script>
+<script src="status-data.js"></script>
 <script src="gf.js"></script>
 <script>
 (function(){
@@ -122,11 +129,40 @@ footer{max-width:46rem;margin:0 auto;padding:.5rem 1.25rem 2rem;color:var(--mute
     document.getElementById("decisions").innerHTML = GF.renderDecisionStrip();
     document.getElementById("foot").textContent =
       "goal-flight · " + c._total + " items · " + GF.store.mode;
+    updateFreshness();
+    renderLiveStrip();
+  }
+
+  function setStale(el, stale){
+    if(el.classList && typeof el.classList.toggle === "function") el.classList.toggle("stale-muted", stale);
+  }
+
+  function updateFreshness(){
+    var el = document.getElementById("freshness");
+    var info = GF.metaFreshness();
+    el.textContent = info ? info.text : "";
+    setStale(el, !!(info && info.stale));
+  }
+
+  function renderLiveStrip(){
+    var strip = document.getElementById("liveStrip");
+    var status = GF.statusSnapshot();
+    if(!status){ strip.hidden = true; return; }
+    var counts = status.counts || {};
+    var running = Number(counts.running || 0);
+    var awaiting = Number(counts.worker_finished || 0);
+    var freshness = GF.statusFreshness();
+    strip.hidden = false;
+    setStale(strip, !!(freshness && freshness.stale));
+    strip.textContent = running + " running · " + awaiting + " awaiting harvest" +
+      (freshness && freshness.stale ? " · live data stale" : "");
   }
 
   function setMode(mode){
     var el=document.getElementById("mode"), txt=document.getElementById("modeText");
     el.classList.remove("live"); txt.textContent=(mode || "snapshot") + " · reloads page";
+    updateFreshness();
+    renderLiveStrip();
   }
 
   GF.attach({ onRender: render, onMode: setMode });

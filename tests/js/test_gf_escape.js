@@ -13,6 +13,7 @@ const TICKET_HTML = path.join(ROOT, "templates", "state-skeleton", "ticket.html"
 const TICKETS_HTML = path.join(ROOT, "templates", "state-skeleton", "tickets.html");
 const BURNDOWN_HTML = path.join(ROOT, "templates", "state-skeleton", "burndown.html");
 const INDEX_HTML = path.join(ROOT, "templates", "state-skeleton", "index.html");
+const CURRENT_HTML = path.join(ROOT, "templates", "state-skeleton", "current-activity.html");
 const STATE_TEMPLATES_DIR = path.join(ROOT, "templates", "state-skeleton");
 const CHECKER = path.join(ROOT, "scripts", "check_tasks_mirror.js");
 
@@ -114,7 +115,7 @@ function makeElement(extra) {
     textContent: "",
     value: "",
     listeners: {},
-    classList: { remove() {}, add() {} },
+    classList: { remove() {}, add() {}, toggle() {} },
     addEventListener(type, fn) { this.listeners[type] = fn; },
     removeEventListener() {},
     setAttribute(name, value) { attrs[name] = String(value); },
@@ -123,7 +124,8 @@ function makeElement(extra) {
   }, extra || {});
 }
 
-function renderTicketsFixture(items, search) {
+function renderTicketsFixture(items, search, opts) {
+  opts = opts || {};
   const kindButtons = ["all", "task", "bug", "decision"].map((kind) => {
     const button = makeElement({
       closest() { return button; }
@@ -172,6 +174,8 @@ function renderTicketsFixture(items, search) {
     },
     document: doc,
     GF_ITEMS: items,
+    GF_META: opts.meta || undefined,
+    GF_STATUS: opts.status || undefined,
     GF_PATH_PREFIXES: ["docs-private/"],
     addEventListener() {},
     removeEventListener() {}
@@ -190,6 +194,66 @@ function renderTicketsFixture(items, search) {
   vm.runInContext(scripts[scripts.length - 1][1], context, { filename: TICKETS_HTML + "#inline", timeout: 5000 });
   elements.kindButtons = kindButtons;
   elements.window = win;
+  return elements;
+}
+
+function renderCurrentActivityFixture(items, opts) {
+  opts = opts || {};
+  const elements = {
+    working: makeElement(),
+    review: makeElement(),
+    done: makeElement(),
+    cWorking: makeElement(),
+    cReview: makeElement(),
+    cDone: makeElement(),
+    activityStatus: makeElement(),
+    idleBanner: makeElement({ hidden: true }),
+    mode: makeElement(),
+    modeText: makeElement(),
+    hint: makeElement(),
+    freshness: makeElement(),
+    liveWorkersLane: makeElement({ hidden: true }),
+    liveWorkers: makeElement(),
+    cLiveWorkers: makeElement(),
+    liveFreshness: makeElement()
+  };
+  const doc = {
+    visibilityState: opts.visibilityState || "visible",
+    body: makeElement(),
+    getElementById(id) {
+      if (!elements[id]) elements[id] = makeElement();
+      return elements[id];
+    },
+    addEventListener() {},
+    removeEventListener() {}
+  };
+  let reloads = 0;
+  let intervalMs = null;
+  const win = {
+    location: {
+      href: "file:///repo/dashboard/current-activity.html",
+      pathname: "/repo/dashboard/current-activity.html",
+      search: "",
+      reload() { reloads += 1; }
+    },
+    document: doc,
+    GF_ITEMS: items,
+    GF_META: opts.meta || undefined,
+    GF_STATUS: opts.status || undefined,
+    GF_PATH_PREFIXES: ["docs-private/"],
+    addEventListener() {},
+    removeEventListener() {},
+    setInterval(_fn, ms) { intervalMs = ms; return 7; },
+    clearInterval() {}
+  };
+  const context = vm.createContext({ window: win, document: doc, URL, URLSearchParams, Date, Number });
+  vm.runInContext(fs.readFileSync(GF_JS, "utf8"), context, { filename: GF_JS, timeout: 5000 });
+  context.GF = context.window.GF;
+  const scripts = Array.from(fs.readFileSync(CURRENT_HTML, "utf8").matchAll(/<script>([\s\S]*?)<\/script>/g));
+  vm.runInContext(scripts[scripts.length - 1][1], context, { filename: CURRENT_HTML + "#inline", timeout: 5000 });
+  elements.window = win;
+  elements.reloads = () => reloads;
+  elements.intervalMs = () => intervalMs;
   return elements;
 }
 
@@ -248,6 +312,24 @@ assert("autolink escapes raw img tag", !/<img/i.test(linked));
 assert("autolink preserves escaped text", linked.includes("&lt;/script&gt;&lt;img"));
 assert("autolink emits item id link", linked.includes('href="ticket.html?id=t-001"'));
 assert("autolink emits allowlisted path link", linked.includes('href="../docs-private/proof.md"'));
+const mentionPath = GF.renderMention("docs-private/proof.md:42");
+assert("renderMention strips line suffix from href", mentionPath.includes('href="../docs-private/proof.md"'));
+assert("renderMention preserves line suffix in visible text", mentionPath.includes("docs-private/proof.md:42"));
+assert("renderMention leaves bare protocol doc inert", GF.renderMention("task-lifecycle.md") === "<code>task-lifecycle.md</code>");
+assert("renderMention leaves absolute tmp path inert", GF.renderMention("/tmp/status.json") === "<code>/tmp/status.json</code>");
+// rA P1: the allowlist must not be escapable with dot segments, and hostile
+// path tokens must stay inert code text — in every sink that builds hrefs.
+assert("renderMention rejects path traversal", GF.renderMention("docs-private/../SKILL.md") === "<code>docs-private/../SKILL.md</code>");
+assert("renderMention rejects absolute traversal", !GF.renderMention("/repo/docs-private/../SKILL.md").includes("<a "));
+assert("renderMention rejects quote/angle path", !GF.renderMention('docs-private/a"><img src=x>.md').includes("<a "));
+assert("renderMention rejects control-char path", !GF.renderMention("docs-private/a\n.md").includes("<a "));
+assert("renderMention rejects backslash path", !GF.renderMention("docs-private\\evil.md").includes("<a "));
+assert("renderMention rejects dot-segment inside path", GF.renderMention("docs-private/./x/../../SKILL.md").indexOf("<code>") === 0);
+assert("autolink leaves traversal path unlinked", !GF.autolink("see docs-private/../SKILL.md now").includes("<a "));
+const idOnlyHostile = GF.renderIdOnly("docs-private/../SKILL.md");
+assert("renderIdOnly never path-links", !idOnlyHostile.includes("<a ") && idOnlyHostile.includes("<code>"));
+assert("renderIdOnly links exact ids", GF.renderIdOnly("t-152").includes('href="ticket.html?id=t-152"'));
+assert("renderIdOnly escapes hostile text", !/<img/i.test(GF.renderIdOnly('t-1"><img src=x>')));
 
 GF.index([
   {
@@ -844,6 +926,44 @@ assert("ticket labels non-bug source as source", harvestedTicket.includes("<dt>s
 assert("ticket completion uses completion timestamp", harvestedTicket.includes("<dt>completed</dt><dd>2026-07-02T00:00:00+00:00</dd>"));
 assert("ticket does not label source as completion", !harvestedTicket.includes("<dt>completed</dt><dd>harvest</dd>"));
 
+const timelineTicket = renderTicket({
+  schema_version: 1,
+  id: "t-ctrl",
+  kind: "task",
+  title: "Timeline docs-private/title.md",
+  blocked_by: [],
+  links: ["docs-private/BACKLOG.md:6", "task-lifecycle.md", "/tmp/status.json", "t-missing"],
+  prompt_path: "docs-private/prompts/wA.md:12",
+  created_at: "2026-07-07T10:00:00Z",
+  done_at: "2026-07-07T12:30:00Z",
+  done_reviewed_at: "2026-07-07T12:33:00Z",
+  audit: [
+    { action: "new", at: "2026-07-07T10:00:00Z", actor: "store" },
+    { action: "append", at: "2026-07-07T10:30:00Z", actor: "worker", dispatch_id: "d-exec", note: "<img src=x> t-001 docs-private/note.md" },
+    { action: "review", at: "2026-07-07T12:32:00Z", actor: "reviewer", review_dispatch_id: "d-review", verdict: "GO" }
+  ],
+  dispatches: [
+    { dispatch_id: "d-review", role: "reviewer", verdict: "GO", ts: "2026-07-07T12:31:00Z", findings_ref: "docs-private/reviews/review.md:9" },
+    { dispatch_id: "d-exec", agent: "codex", state: "worker-finished", started_at: "2026-07-07T11:00:00Z", ended_at: "2026-07-07T12:20:00Z", status_path: "/tmp/status.json", marker: { kind: "COMPLETE", text: "done t-001" } }
+  ],
+  done: true,
+  done_reviewed: true
+});
+assert("ticket linkList line suffix href resolves from dashboard", timelineTicket.includes('href="../docs-private/BACKLOG.md"'));
+assert("ticket linkList keeps line suffix visible", timelineTicket.includes("docs-private/BACKLOG.md:6"));
+assert("ticket bare protocol doc is inert code", timelineTicket.includes("<code>task-lifecycle.md</code>"));
+assert("ticket absolute path is inert code", timelineTicket.includes("<code>/tmp/status.json</code>"));
+assert("ticket prompt_path uses mention renderer", timelineTicket.includes('href="../docs-private/prompts/wA.md"'));
+assert("ticket review dispatch renders role", timelineTicket.includes("<strong>role:</strong> reviewer"));
+assert("ticket review dispatch renders verdict", timelineTicket.includes("<strong>verdict:</strong> GO"));
+assert("ticket review findings link strips suffix", timelineTicket.includes('href="../docs-private/reviews/review.md"'));
+assert("ticket executor dispatch renders marker text safely", timelineTicket.includes("COMPLETE: done") && timelineTicket.includes('href="ticket.html?id=t-001"'));
+assert("ticket dispatch history omits placeholder dash", !timelineTicket.includes("</strong> -</span>"));
+assert("ticket timeline renders section", timelineTicket.includes('<p class="section-title">Timeline</p>'));
+assert("ticket timeline escapes audit note", timelineTicket.includes("&lt;img src=x&gt;"));
+assert("ticket timeline renders logged to dispatch chip", timelineTicket.includes("logged→dispatch 1h"));
+assert("ticket timeline renders done to reviewed chip", timelineTicket.includes("done→reviewed 3m"));
+
 [
   ["newline", "java\nscript:alert(1)"],
   ["tab", "java\tscript:alert(1)"],
@@ -860,9 +980,10 @@ assert("ticket does not label source as completion", !harvestedTicket.includes("
     dispatches: [{ dispatch_id: "d1", state: "worker-finished", log: href }],
     done: false
   });
-  assert(label + " link sink rejects href", html.includes("<a href='#'>"));
-  assert(label + " prompt_path sink rejects href", html.includes('<p><a href="#">'));
-  assert(label + " dispatch log sink rejects href", html.includes('<a class="dispatch-log" href="#">'));
+  assert(label + " link sink renders inert code", html.includes("<code>java"));
+  assert(label + " prompt_path sink renders inert code", !html.includes('<p><a href="#">'));
+  assert(label + " dispatch log sink renders inert code", html.includes('<span class="dispatch-log"><code>java'));
+  assert(label + " no dead href placeholder", !html.includes('href="#"') && !html.includes("href='#'"));
   assert(label + " no normalized javascript href", !/href=["']java[\n\r\t]*script:/i.test(html));
 });
 
@@ -895,6 +1016,54 @@ const doneFilterPage = renderTicketsFixture([
 assert("tickets page reads done status from URL", doneFilterPage.statusSel.value === "done-reviewed");
 assert("done status URL shows done row", doneFilterPage.board.innerHTML.includes("t-done-link"));
 assert("done status URL hides open row", !doneFilterPage.board.innerHTML.includes("t-open-link"));
+
+const freshBoard = renderTicketsFixture([
+  {
+    schema_version: 1,
+    id: "t-fresh",
+    kind: "task",
+    title: "Fresh",
+    blocked_by: [],
+    links: [],
+    done: false
+  }
+], "", { meta: { schema: 1, generated_at: new Date().toISOString() } });
+assert("tickets page renders GF_META freshness", freshBoard.freshness.textContent.includes("data as of"));
+
+const liveActivity = renderCurrentActivityFixture([
+  {
+    schema_version: 1,
+    id: "t-123",
+    kind: "task",
+    title: "Live target",
+    blocked_by: [],
+    links: [],
+    done: false,
+    status: "working"
+  }
+], {
+  meta: { schema: 1, generated_at: new Date().toISOString() },
+  status: {
+    schema: 1,
+    generated_at: new Date().toISOString(),
+    project_root: "/repo",
+    dispatches: [
+      { dispatch_id: "d-stalled", agent: "codex<script>", state: "running", classification: "stalled", task_ids: ["t-123"], age_s: 120, idle_s: 61, tail_last_line: "<img src=x onerror=alert(1)> tail" },
+      { dispatch_id: "d-failed", agent: "codex", state: "worker_failed", classification: "worker_failed", task_ids: ["docs-private/../SKILL.md"], age_s: 3600, idle_s: 30, tail_last_line: "failed" }
+    ],
+    counts: { running: 1, worker_finished: 1, worker_failed: 1, worker_dead: 0, stalled: 1 }
+  }
+});
+assert("current activity wires 15s visible refresh", liveActivity.intervalMs() === 15000);
+assert("current activity renders live worker count", liveActivity.cLiveWorkers.textContent === "2");
+assert("current activity links live task ids", liveActivity.liveWorkers.innerHTML.includes('href="ticket.html?id=t-123"'));
+assert("current activity never path-links task ids", !liveActivity.liveWorkers.innerHTML.includes('href="../docs-private'));
+assert("current activity renders path-shaped task id inert", liveActivity.liveWorkers.innerHTML.includes("<code>docs-private/../SKILL.md</code>"));
+assert("current activity escapes live worker agent", liveActivity.liveWorkers.innerHTML.includes("codex&lt;script&gt;"));
+assert("current activity escapes live tail", liveActivity.liveWorkers.innerHTML.includes("&lt;img src=x onerror=alert(1)&gt; tail"));
+assert("current activity marks stalled worker amber", liveActivity.liveWorkers.innerHTML.includes('class="card stalled"'));
+assert("current activity marks failed worker red", liveActivity.liveWorkers.innerHTML.includes('class="card danger"'));
+assert("current activity renders live freshness", liveActivity.liveFreshness.textContent.includes("live as of"));
 
 [
   "index.html",

@@ -5,10 +5,10 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>goal-flight · current activity</title>
 <style>
-:root{--bg:#fff;--fg:#1a1d21;--muted:#6b7280;--accent:#2563eb;--border:#e5e7eb;--warn:#b45309;
+:root{--bg:#fff;--fg:#1a1d21;--muted:#6b7280;--accent:#2563eb;--border:#e5e7eb;--warn:#b45309;--danger:#b91c1c;
   --card:#fff;--chip:#f3f4f6;--chip-fg:#374151;--ok:#15803d;--review:#a855f7;--shadow:0 1px 2px rgba(0,0,0,.04),0 1px 3px rgba(0,0,0,.06)}
 @media (prefers-color-scheme:dark){:root{--bg:#0f1115;--fg:#e6e8eb;--muted:#9aa0a6;--accent:#6ea8fe;--border:#262a31;--warn:#f59e0b;
-  --card:#161922;--chip:#222732;--chip-fg:#c4cad4;--ok:#4ade80;--review:#c084fc;--shadow:0 1px 2px rgba(0,0,0,.3)}}
+  --danger:#f87171;--card:#161922;--chip:#222732;--chip-fg:#c4cad4;--ok:#4ade80;--review:#c084fc;--shadow:0 1px 2px rgba(0,0,0,.3)}}
 *{box-sizing:border-box}
 html{font:16px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
 body{margin:0;background:var(--bg);color:var(--fg)}
@@ -21,6 +21,8 @@ h1{font-size:1.4rem;margin:.2em 0 .1em;letter-spacing:-.01em}
 .crumbs{color:var(--muted);font-size:.85rem}
 .crumbs a{color:var(--muted)}
 .mode{font:.72rem ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted);white-space:nowrap}
+.freshness{margin-left:.45rem}
+.stale-muted{color:var(--warn);opacity:.8}
 .dot{display:inline-block;width:.5rem;height:.5rem;border-radius:50%;background:var(--muted);margin-right:.35rem;vertical-align:middle}
 .cols{display:grid;grid-template-columns:1fr;gap:1.4rem;margin-top:1.2rem}
 @media(min-width:720px){.cols{grid-template-columns:1fr 1fr}}
@@ -30,10 +32,25 @@ h1{font-size:1.4rem;margin:.2em 0 .1em;letter-spacing:-.01em}
   background:var(--chip);border-radius:1rem;padding:.05rem .5rem;font-weight:600}
 .lane.working h2{color:var(--accent)}
 .lane.review h2{color:var(--review)}
+.live-workers{margin-top:1.2rem}
+.live-workers h2{font-size:.82rem;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);
+  margin:0 0 .6rem;display:flex;align-items:center;gap:.5rem;flex-wrap:wrap}
+.live-workers h2 .count{font:.72rem ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--chip-fg);
+  background:var(--chip);border-radius:1rem;padding:.05rem .5rem;font-weight:600}
 ul{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:.5rem}
 .card{background:var(--card);border:1px solid var(--border);border-radius:.6rem;padding:.6rem .75rem;box-shadow:var(--shadow)}
 .lane.working .card{border-left:3px solid var(--accent)}
 .lane.review .card{border-left:3px solid var(--review)}
+.live-workers .card{border-left:3px solid var(--accent)}
+.live-workers .card.stalled{border-left-color:var(--warn)}
+.live-workers .card.danger{border-left-color:var(--danger)}
+.worker-head{display:flex;gap:.5rem;align-items:baseline;flex-wrap:wrap}
+.worker-head code{font:.78rem ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--chip);
+  border:1px solid var(--border);border-radius:.35rem;padding:.02rem .25rem;color:var(--fg)}
+.worker-meta{display:flex;gap:.35rem .8rem;flex-wrap:wrap;margin-top:.25rem;
+  font:.76rem ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted)}
+.worker-tasks{margin-top:.25rem;font-size:.86rem}
+.worker-tail{margin-top:.25rem;color:var(--muted);font-size:.86rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .card .id{font:.76rem ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted)}
 .card .title{margin-top:.2rem;word-break:break-word}
 .card .title .idlink{font:.92em ui-monospace,SFMono-Regular,Menlo,monospace}
@@ -73,13 +90,18 @@ footer{max-width:50rem;margin:0 auto;padding:1.5rem 1.25rem 2rem;color:var(--mut
       <h1>Current activity</h1>
       <nav class="crumbs" aria-label="Breadcrumb"><a href="index.html">← dashboard</a> · <a href="tickets.html">board</a></nav>
     </div>
-    <span class="mode" id="mode" aria-live="polite"><span class="dot"></span><span id="modeText">loading…</span></span>
+    <span class="mode" id="mode" aria-live="polite"><span class="dot"></span><span id="modeText">loading…</span><span id="freshness" class="freshness"></span></span>
   </div>
 
   <p class="hint" id="hint"></p>
 
   <!-- Idle banner shown when no worker is active and nothing awaits review. -->
   <p class="idle-banner" id="idleBanner" hidden>No active workers — showing recent completions below.</p>
+
+  <section class="live-workers" id="liveWorkersLane" hidden>
+    <h2>Live workers <span class="count" id="cLiveWorkers">0</span><span class="freshness" id="liveFreshness"></span></h2>
+    <ul id="liveWorkers"></ul>
+  </section>
 
   <div class="cols" id="activity">
     <div class="lane working">
@@ -103,6 +125,7 @@ footer{max-width:50rem;margin:0 auto;padding:1.5rem 1.25rem 2rem;color:var(--mut
 <footer>goal-flight · activity snapshot</footer>
 
 <script src="tasks-data.js"></script>
+<script src="status-data.js"></script>
 <script src="gf.js"></script>
 <script>
 (function(){
@@ -110,6 +133,9 @@ footer{max-width:50rem;margin:0 auto;padding:1.5rem 1.25rem 2rem;color:var(--mut
   var elWorking = document.getElementById("working");
   var elReview  = document.getElementById("review");
   var elDone    = document.getElementById("done");
+  var liveLane  = document.getElementById("liveWorkersLane");
+  var liveList  = document.getElementById("liveWorkers");
+  var liveFreshness = document.getElementById("liveFreshness");
 
   function card(it){
     return '<li class="card"><a class="id" href="ticket.html?id='+encodeURIComponent(it.id)+'">'+GF.esc(it.id)+
@@ -121,6 +147,66 @@ footer{max-width:50rem;margin:0 auto;padding:1.5rem 1.25rem 2rem;color:var(--mut
   }
   function bySection(key){
     return GF.store.items.filter(function(it){ return it._section===key; });
+  }
+
+  function setStale(el, stale){
+    if(el.classList && typeof el.classList.toggle === "function") el.classList.toggle("stale-muted", stale);
+  }
+
+  function updateFreshness(){
+    var el = document.getElementById("freshness");
+    var info = GF.metaFreshness();
+    el.textContent = info ? info.text : "";
+    setStale(el, !!(info && info.stale));
+  }
+
+  function compactLine(value){
+    return String(value == null ? "" : value).replace(/\s+/g, " ").trim();
+  }
+
+  function liveClass(d){
+    var state = String(d.state || "").toLowerCase();
+    var cls = String(d.classification || "").toLowerCase();
+    if(state === "worker_dead" || state === "worker_failed" || cls === "worker_dead" || cls === "worker_failed") return " danger";
+    if(state === "stalled" || cls === "stalled") return " stalled";
+    return "";
+  }
+
+  function workerCard(d){
+    d = d && typeof d === "object" ? d : {};
+    var taskIds = Array.isArray(d.task_ids) ? d.task_ids : [];
+    var age = GF.formatDurationSeconds(d.age_s);
+    var idle = GF.formatDurationSeconds(d.idle_s);
+    var state = d.state || d.classification || "";
+    var meta = [
+      d.agent ? "agent " + GF.esc(d.agent) : "",
+      state ? "state " + GF.esc(state) : "",
+      age ? "age " + GF.esc(age) : "",
+      idle ? "idle " + GF.esc(idle) : ""
+    ].filter(Boolean).join(" · ");
+    var tasks = taskIds.length
+      ? '<div class="worker-tasks">tasks '+taskIds.map(function(id){ return GF.renderIdOnly(id); }).join(" ")+"</div>"
+      : "";
+    var tail = compactLine(d.tail_last_line);
+    return '<li class="card'+liveClass(d)+'"><div class="worker-head"><code>'+GF.esc(d.dispatch_id || "(no-id)")+
+      "</code><span>"+GF.esc(d.agent || "worker")+"</span></div>"+
+      (meta ? '<div class="worker-meta">'+meta+"</div>" : "")+
+      tasks+
+      (tail ? '<div class="worker-tail">'+GF.esc(tail)+"</div>" : "")+
+      "</li>";
+  }
+
+  function renderLiveWorkers(){
+    var status = GF.statusSnapshot();
+    if(!status){ liveLane.hidden = true; return; }
+    var dispatches = status.dispatches || [];
+    liveLane.hidden = false;
+    document.getElementById("cLiveWorkers").textContent = String(dispatches.length);
+    var freshness = GF.statusFreshness();
+    liveFreshness.textContent = freshness ? freshness.text + (freshness.stale ? " · live data stale" : "") : "";
+    setStale(liveFreshness, !!(freshness && freshness.stale));
+    liveList.innerHTML = dispatches.length ? dispatches.map(workerCard).join("")
+      : '<li class="empty">No live worker snapshots.</li>';
   }
 
   var prevTopDone = null;     // id of the most-recent done item last render
@@ -149,6 +235,8 @@ footer{max-width:50rem;margin:0 auto;padding:1.5rem 1.25rem 2rem;color:var(--mut
       : '<li class="empty">Nothing awaiting review.</li>';
     elDone.innerHTML = done.length ? done.slice(0,40).map(feedItem).join("")
       : '<li class="empty">No completed items yet.</li>';
+    updateFreshness();
+    renderLiveWorkers();
 
     // Idle state: no worker active and nothing awaiting review -> calm banner,
     // de-emphasise the empty lanes, lead with the completions feed.
@@ -173,9 +261,33 @@ footer{max-width:50rem;margin:0 auto;padding:1.5rem 1.25rem 2rem;color:var(--mut
     el.classList.remove("live");
     txt.textContent = (mode || "snapshot") + " · reloads page";
     hint.textContent = "Static snapshot (file://). Window focus reloads page to read tasks-data.js.";
+    updateFreshness();
+    renderLiveWorkers();
   }
 
-  GF.attach({ onRender: render, onMode: setMode });
+  var driver = GF.attach({ onRender: render, onMode: setMode });
+
+  var autoRefreshTimer = null;
+  function reloadIfVisible(){
+    if(document.visibilityState !== "visible") return;
+    try{ window.location.reload(); }catch(e){ driver.refresh(); }
+  }
+  function startAutoRefresh(){
+    if(!window.setInterval || !window.clearInterval) return;
+    if(autoRefreshTimer != null || document.visibilityState !== "visible") return;
+    autoRefreshTimer = window.setInterval(reloadIfVisible, 15000);
+  }
+  function stopAutoRefresh(){
+    if(autoRefreshTimer == null) return;
+    window.clearInterval(autoRefreshTimer);
+    autoRefreshTimer = null;
+  }
+  document.addEventListener("visibilitychange", function(){
+    if(document.visibilityState === "visible") startAutoRefresh();
+    else stopAutoRefresh();
+  });
+  if(window.addEventListener) window.addEventListener("pagehide", stopAutoRefresh);
+  startAutoRefresh();
 })();
 </script>
 </body>
