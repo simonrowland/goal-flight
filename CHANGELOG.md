@@ -6,9 +6,39 @@ incremented when meaningful skill behaviour changes.
 
 ## [Unreleased]
 
-- Managed dashboard views now record install-hash provenance and can be refreshed across registered projects with `goalflight_setup.py --refresh-views --all-projects`.
-- Dashboard task exports now include a `GF_META` freshness stamp and dispatches refresh live `status-data.js` for file:// status views.
+## [1.2.2] — 2026-07-07
+
+### Added
+
+- Ticket pages render a collapsible per-item Timeline: audit rows, dispatch
+  breadcrumbs, and lifecycle stamps merged into one day-grouped ledger with
+  stage-duration chips; dispatch history is a collapsed disclosure section
+  rendered per breadcrumb shape (review vs executor fields).
+- Live worker visibility for the file:// dashboard: dispatches maintain an
+  atomically written `status-data.js` (refreshed at most every 15s by a
+  single identity-verified per-project refresher with bounded lifetime);
+  current-activity shows workers in flight — filtered by a reconciled
+  per-row liveness verdict, never raw recorded state — with stalled/failed
+  flagging and a visible-tab auto-refresh; task exports carry a `GF_META`
+  freshness stamp surfaced on every view.
+- Managed dashboard views record install-hash provenance at scaffold time;
+  projects self-register in a global index; `goalflight_setup.py
+  --refresh-views [--all-projects] [--dry-run]` refreshes unmodified
+  installs of older releases across registered projects while leaving
+  operator-customized views untouched, and the doctor prints that exact
+  remedy when it detects view skew.
 - ACP workers now receive `GOALFLIGHT_PROMPT_FILE` plus the prompt re-read preamble.
+
+### Fixed
+
+- Ticket-view link sinks: repo-relative links from dashboard pages now
+  resolve correctly (`../` prefix), `:line` suffixes are dropped from hrefs
+  only, and everything outside a strict path-token grammar (dot segments,
+  control characters, overlong tokens, absolute paths) renders as inert
+  code text instead of a dead or wrong link.
+- Behavior-harness phrase checks scan model output only, not echoed prompts.
+- Read-only dispatch guard: prompts declaring an inline-return contract are
+  no longer misblocked by write-pattern collocation.
 
 ## [1.2.1] — 2026-07-07
 
