@@ -12,7 +12,10 @@ worker dispatch, review flights, or handoff notes that survive context loss.
 
 1. Read the repository `AGENTS.md` first when present.
 2. Read the repository root `SKILL.md` as the canonical Goal Flight workflow.
-3. Read the newest relevant `docs-private/RESUME-NOTES-*.md` only when the task
+3. Read `protocols/guidance-extended.md` by default — non-frontier controllers
+   benefit from its worked examples and expanded rationale for the core's rules;
+   skip only when context is tight (the core alone is complete).
+4. Read the newest relevant `docs-private/RESUME-NOTES-*.md` only when the task
    asks to resume prior Goal Flight work.
 
 ## Operating Rules
