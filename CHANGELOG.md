@@ -6,7 +6,7 @@ incremented when meaningful skill behaviour changes.
 
 ## [Unreleased]
 
-## [1.3.0] — 2026-07-07
+## [1.2.1] — 2026-07-07
 
 ### Changed
 
@@ -27,12 +27,12 @@ incremented when meaningful skill behaviour changes.
   instruction, so pinned briefs survive worker-side compaction (ACP wiring is a
   tracked follow-up).
 
-### Migration (1.2.0 → 1.3.0)
+### Migration (1.2.0 → 1.2.1)
 
 - Claude Code (native): the skill loads from the installed skill checkout;
   update that checkout to this version. No wrapper regeneration needed.
 - Codex Desktop plugin: re-run `./install.sh codex` — the plugin cache path is
-  version-pinned, so the 1.3.0 cache registers only on re-install.
+  version-pinned, so the 1.2.1 cache registers only on re-install.
 - grok / cursor / opencode copied wrappers: re-run `./install.sh <host>`;
   symlink/link-mode installs track the checkout automatically.
 - Compatible: no command-interface changes; all `SKILL.md` section anchors
