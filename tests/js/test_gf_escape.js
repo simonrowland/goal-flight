@@ -960,7 +960,8 @@ assert("ticket review dispatch renders verdict", timelineTicket.includes("<stron
 assert("ticket review findings link strips suffix", timelineTicket.includes('href="../docs-private/reviews/review.md"'));
 assert("ticket executor dispatch renders marker text safely", timelineTicket.includes("COMPLETE: done") && timelineTicket.includes('href="ticket.html?id=t-001"'));
 assert("ticket dispatch history omits placeholder dash", !timelineTicket.includes("</strong> -</span>"));
-assert("ticket timeline renders section", timelineTicket.includes('<p class="section-title">Timeline</p>'));
+assert("ticket timeline renders collapsible open section", /<details class="log-section" open><summary class="section-title">Timeline \(\d+ events\)<\/summary>/.test(timelineTicket));
+assert("ticket dispatch history renders collapsed section", /<details class="log-section"><summary class="section-title">Dispatch history \(\d+\)<\/summary>/.test(timelineTicket));
 assert("ticket timeline escapes audit note", timelineTicket.includes("&lt;img src=x&gt;"));
 assert("ticket timeline renders logged to dispatch chip", timelineTicket.includes("logged→dispatch 1h"));
 assert("ticket timeline renders done to reviewed chip", timelineTicket.includes("done→reviewed 3m"));
@@ -1049,22 +1050,48 @@ const liveActivity = renderCurrentActivityFixture([
     generated_at: new Date().toISOString(),
     project_root: "/repo",
     dispatches: [
-      { dispatch_id: "d-stalled", agent: "codex<script>", state: "running", classification: "stalled", task_ids: ["t-123"], age_s: 120, idle_s: 61, tail_last_line: "<img src=x onerror=alert(1)> tail" },
-      { dispatch_id: "d-failed", agent: "codex", state: "worker_failed", classification: "worker_failed", task_ids: ["docs-private/../SKILL.md"], age_s: 3600, idle_s: 30, tail_last_line: "failed" }
+      { dispatch_id: "d-running", agent: "codex", state: "running", classification: "running", live: true, task_ids: ["docs-private/../SKILL.md"], age_s: 45, idle_s: 3, tail_last_line: "working" },
+      { dispatch_id: "d-queued", agent: "codex", state: "queued", classification: "queued", live: true, task_ids: [], age_s: null, idle_s: null, tail_last_line: "" },
+      { dispatch_id: "d-stalled", agent: "codex<script>", state: "running", classification: "stalled", live: true, task_ids: ["t-123"], age_s: 120, idle_s: 61, tail_last_line: "<img src=x onerror=alert(1)> tail" },
+      // Reconciled-terminal rows stay in the export for counts but must NOT
+      // render as workers in flight — including stale rows whose RAW state
+      // still claims running (the acp-ghost case).
+      { dispatch_id: "d-failed", agent: "codex", state: "worker_failed", classification: "worker_failed", live: false, task_ids: [], age_s: 3600, idle_s: 30, tail_last_line: "failed" },
+      { dispatch_id: "d-stale-ghost", agent: "codex", state: "running", classification: "unknown_no_pid", live: false, task_ids: [], age_s: 86400, idle_s: null, tail_last_line: "" }
     ],
     counts: { running: 1, worker_finished: 1, worker_failed: 1, worker_dead: 0, stalled: 1 }
   }
 });
 assert("current activity wires 15s visible refresh", liveActivity.intervalMs() === 15000);
-assert("current activity renders live worker count", liveActivity.cLiveWorkers.textContent === "2");
+assert("current activity renders only in-flight workers", liveActivity.cLiveWorkers.textContent === "3");
+assert("current activity queued row omits null durations", !/age 0s|idle 0s/.test(liveActivity.liveWorkers.innerHTML));
+assert("gf null duration formats empty", GF.formatDurationSeconds(null) === "");
+assert("current activity hides terminal rows", !liveActivity.liveWorkers.innerHTML.includes("d-failed"));
+assert("current activity hides stale raw-running ghosts", !liveActivity.liveWorkers.innerHTML.includes("d-stale-ghost"));
 assert("current activity links live task ids", liveActivity.liveWorkers.innerHTML.includes('href="ticket.html?id=t-123"'));
 assert("current activity never path-links task ids", !liveActivity.liveWorkers.innerHTML.includes('href="../docs-private'));
 assert("current activity renders path-shaped task id inert", liveActivity.liveWorkers.innerHTML.includes("<code>docs-private/../SKILL.md</code>"));
 assert("current activity escapes live worker agent", liveActivity.liveWorkers.innerHTML.includes("codex&lt;script&gt;"));
 assert("current activity escapes live tail", liveActivity.liveWorkers.innerHTML.includes("&lt;img src=x onerror=alert(1)&gt; tail"));
 assert("current activity marks stalled worker amber", liveActivity.liveWorkers.innerHTML.includes('class="card stalled"'));
-assert("current activity marks failed worker red", liveActivity.liveWorkers.innerHTML.includes('class="card danger"'));
 assert("current activity renders live freshness", liveActivity.liveFreshness.textContent.includes("live as of"));
+
+// Legacy export without live flags: fall back to showing every row.
+const legacyActivity = renderCurrentActivityFixture([], {
+  status: {
+    schema: 1,
+    generated_at: new Date().toISOString(),
+    project_root: "/repo",
+    dispatches: [
+      { dispatch_id: "d-old-a", agent: "codex", state: "running", task_ids: [], age_s: 10, idle_s: 1, tail_last_line: "x" },
+      { dispatch_id: "d-old-b", agent: "codex", state: "worker_finished", task_ids: [], age_s: 60, idle_s: 5, tail_last_line: "y" }
+    ],
+    counts: { running: 1, worker_finished: 1, worker_failed: 0, worker_dead: 0, stalled: 0 }
+  }
+});
+assert("legacy unflagged export shows all rows", legacyActivity.cLiveWorkers.textContent === "2");
+// Empty task store + live rows: the live lane must suppress the idle banner.
+assert("live rows suppress idle banner", legacyActivity.idleBanner.hidden === true);
 
 [
   "index.html",

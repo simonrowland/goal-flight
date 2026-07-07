@@ -993,6 +993,10 @@
   }
 
   function formatDurationSeconds(seconds) {
+    // null would coerce to 0 and claim "0s" for rows that never started
+    // (e.g. capacity-queued dispatches with no started_at) — treat it like
+    // undefined/absent instead.
+    if (seconds == null) return "";
     var n = Number(seconds);
     return Number.isFinite(n) ? formatDurationMs(n * 1000) : "";
   }

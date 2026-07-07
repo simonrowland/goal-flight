@@ -169,6 +169,10 @@ def test_export_dashboard_writes_schema_valid_running_and_terminal_dispatches() 
         assert by_id["running-one"]["idle_s"] == 4.2
         assert len(by_id["running-one"]["tail_last_line"]) == 200
         assert by_id["done-one"]["marker"] == {"kind": "COMPLETE", "text": "finished fixture"}
+        # Reconciled liveness verdict for the live-workers lane: running rows
+        # are in flight, terminal rows are not (raw state must not decide).
+        assert by_id["running-one"]["live"] is True
+        assert by_id["done-one"]["live"] is False
 
 
 def test_export_dashboard_absent_dashboard_dir_is_noop() -> None:

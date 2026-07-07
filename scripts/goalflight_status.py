@@ -826,6 +826,10 @@ def dashboard_status_payload(project_root: str | Path | None) -> dict:
                 "shape": record.get("shape"),
                 "state": record.get("state"),
                 "classification": record.get("classification"),
+                # Reconciled liveness verdict for the lane consumer: stale
+                # ledger rows can claim state=running forever, so raw state
+                # must not decide what counts as "in flight".
+                "live": bucket in ("running", "stalled"),
                 "task_ids": task_ids_by_dispatch.get(str(record.get("dispatch_id")), []),
                 "started_at": record.get("started_at"),
                 "ended_at": record.get("ended_at"),

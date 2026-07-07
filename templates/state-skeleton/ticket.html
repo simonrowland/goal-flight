@@ -46,6 +46,11 @@ dd ul{margin:0;padding-left:1.1rem}
 pre{background:var(--chip);border:1px solid var(--border);border-radius:.5rem;padding:.8rem;overflow:auto;
   font:.85rem ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;margin:.3rem 0 0}
 .section-title{font-size:.82rem;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin:1.6rem 0 .5rem}
+/* Collapsible activity logs: summary keeps the section-title look plus the
+   native disclosure triangle. */
+.log-section>summary.section-title{cursor:pointer;user-select:none;display:list-item}
+.log-section>summary.section-title:hover{color:var(--fg)}
+.log-section[open]>summary.section-title{margin-bottom:.5rem}
 .dispatches{list-style:none;margin:.2rem 0 0;padding:0;display:flex;flex-direction:column;gap:.45rem}
 .dispatches li{background:var(--card);border:1px solid var(--border);border-radius:.55rem;padding:.65rem .75rem;box-shadow:var(--shadow)}
 .dispatch-meta{display:flex;flex-wrap:wrap;gap:.25rem .8rem;font:.78rem ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--fg)}
@@ -152,7 +157,9 @@ footer{max-width:46rem;margin:0 auto;padding:1.5rem 1.25rem 2rem;color:var(--mut
       if(statusPath) extras.push('<span class="dispatch-log">'+GF.renderMention(statusPath)+'</span>');
       return "<li><div class=\"dispatch-meta\">"+meta+"</div>"+extras.join("")+"</li>";
     }).join("");
-    return rows ? '<p class="section-title">Dispatch history</p><ul class="dispatches">'+rows+"</ul>" : "";
+    if(!rows) return "";
+    return '<details class="log-section"><summary class="section-title">Dispatch history ('+dispatches.length+')</summary>'+
+      '<ul class="dispatches">'+rows+"</ul></details>";
   }
 
   function firstAuditTime(it, actions){
@@ -267,7 +274,8 @@ footer{max-width:46rem;margin:0 auto;padding:1.5rem 1.25rem 2rem;color:var(--mut
         (ev.meta ? '<span class="timeline-meta">'+ev.meta+"</span>" : "")+
         "</span></li>";
     }).join("");
-    return '<p class="section-title">Timeline</p>'+durationChips(it)+'<ul class="timeline">'+rows+"</ul>";
+    return '<details class="log-section" open><summary class="section-title">Timeline ('+events.length+' events)</summary>'+
+      durationChips(it)+'<ul class="timeline">'+rows+"</ul></details>";
   }
 
   function render(){

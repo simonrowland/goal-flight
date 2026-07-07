@@ -196,17 +196,26 @@ footer{max-width:50rem;margin:0 auto;padding:1.5rem 1.25rem 2rem;color:var(--mut
       "</li>";
   }
 
+  // Renders the lane and returns the number of workers actually in flight,
+  // so the idle banner can agree with the live lane.
   function renderLiveWorkers(){
     var status = GF.statusSnapshot();
-    if(!status){ liveLane.hidden = true; return; }
-    var dispatches = status.dispatches || [];
+    if(!status){ liveLane.hidden = true; return 0; }
+    // The export carries the project's full dispatch history for counts; the
+    // lane is workers IN FLIGHT only. Rows carry a reconciled `live` verdict
+    // (raw recorded state can claim running forever on stale rows). Older
+    // exports without the flag fall back to showing every row, as before.
+    var all = status.dispatches || [];
+    var flagged = all.some(function(d){ return d && typeof d === "object" && "live" in d; });
+    var dispatches = flagged ? all.filter(function(d){ return d && d.live === true; }) : all;
     liveLane.hidden = false;
     document.getElementById("cLiveWorkers").textContent = String(dispatches.length);
     var freshness = GF.statusFreshness();
     liveFreshness.textContent = freshness ? freshness.text + (freshness.stale ? " · live data stale" : "") : "";
     setStale(liveFreshness, !!(freshness && freshness.stale));
     liveList.innerHTML = dispatches.length ? dispatches.map(workerCard).join("")
-      : '<li class="empty">No live worker snapshots.</li>';
+      : '<li class="empty">No workers in flight.</li>';
+    return dispatches.length;
   }
 
   var prevTopDone = null;     // id of the most-recent done item last render
@@ -236,11 +245,13 @@ footer{max-width:50rem;margin:0 auto;padding:1.5rem 1.25rem 2rem;color:var(--mut
     elDone.innerHTML = done.length ? done.slice(0,40).map(feedItem).join("")
       : '<li class="empty">No completed items yet.</li>';
     updateFreshness();
-    renderLiveWorkers();
+    var liveCount = renderLiveWorkers();
 
-    // Idle state: no worker active and nothing awaiting review -> calm banner,
-    // de-emphasise the empty lanes, lead with the completions feed.
-    var idle = !working.length && !review.length;
+    // Idle state: no worker active, nothing awaiting review, and no live
+    // dispatch in flight -> calm banner, de-emphasise the empty lanes, lead
+    // with the completions feed. (Live rows must suppress the banner or the
+    // page contradicts its own live lane.)
+    var idle = !working.length && !review.length && !liveCount;
     document.body.classList.toggle("idle", idle);
     idleBanner.hidden = !idle;
 
