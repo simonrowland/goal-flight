@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -678,9 +679,40 @@ def _managed_view_has_goalflight_signal(path: Path, text: str) -> bool:
     return any(marker in lower for marker in MANAGED_VIEW_LEGACY_MARKERS)
 
 
-def classify_managed_view_asset(source: Path, target: Path) -> dict:
+def _managed_view_manifest_entry(manifest: dict | None, rel_path: str | None, source: Path) -> dict | None:
+    if not isinstance(manifest, dict):
+        return None
+    views = manifest.get("views")
+    if not isinstance(views, dict):
+        return None
+    key = rel_path or f"dashboard/{source.name}"
+    entry = views.get(key)
+    return entry if isinstance(entry, dict) else None
+
+
+def _load_project_view_manifest(project_root: Path) -> dict:
+    try:
+        if str(SCRIPT_DIR.parent) not in sys.path:
+            sys.path.insert(0, str(SCRIPT_DIR.parent))
+        import goalflight_task  # type: ignore
+
+        return goalflight_task.load_view_manifest(project_root)
+    except Exception:
+        return {}
+
+
+def _managed_view_refresh_command(skill_root: Path, project_root: Path) -> str:
+    setup = skill_root / "scripts" / "goalflight_setup.py"
+    return (
+        f"python3 {shlex.quote(str(setup))} --refresh-views "
+        f"--target-project {shlex.quote(str(project_root.resolve(strict=False)))}"
+    )
+
+
+def classify_managed_view_asset(source: Path, target: Path, manifest: dict | None = None, rel_path: str | None = None) -> dict:
     source_hash = _sha256_path(source)
     target_hash = _sha256_path(target)
+    manifest_entry = _managed_view_manifest_entry(manifest, rel_path, source)
     out = {
         "source_sha256": source_hash,
         "target_sha256": target_hash,
@@ -689,6 +721,9 @@ def classify_managed_view_asset(source: Path, target: Path) -> dict:
         "customized": False,
         "reason": None,
     }
+    if manifest_entry is not None:
+        out["manifest_rel_path"] = rel_path or f"dashboard/{source.name}"
+        out["installed_source_sha256"] = manifest_entry.get("installed_source_sha256")
     if not source_hash or not target_hash:
         return out
     text = _managed_view_text(target) or ""
@@ -696,6 +731,18 @@ def classify_managed_view_asset(source: Path, target: Path) -> dict:
         out["status"] = "current"
         out["reason"] = "matches current template"
         return out
+    if manifest_entry is not None:
+        installed_hash = manifest_entry.get("installed_source_sha256")
+        if isinstance(installed_hash, str) and installed_hash:
+            if target_hash == installed_hash:
+                out["status"] = "managed-stale"
+                out["needs_refresh"] = True
+                out["reason"] = "unmodified install of an older release"
+                return out
+            out["status"] = "customized"
+            out["customized"] = True
+            out["reason"] = "differs from recorded install hash; preserving operator edits"
+            return out
     if target_hash in MANAGED_VIEW_LEGACY_SHA256.get(source.name, ()):
         out["status"] = "legacy"
         out["needs_refresh"] = True
@@ -777,6 +824,8 @@ def check_project_state_layout(project_root: Path, skill_root: Path | None = Non
     view_customizations: list[dict] = []
     legacy_dashboard_views: list[dict] = []
     advisory_absence = not _state_layout_init_signal(project_root, docs_private)
+    view_manifest = _load_project_view_manifest(project_root)
+    refresh_command = _managed_view_refresh_command(root, project_root)
 
     def add_layout_issue(message: str, *, path: str | None = None) -> None:
         item = _state_layout_warning(message, path=path)
@@ -863,11 +912,12 @@ def check_project_state_layout(project_root: Path, skill_root: Path | None = Non
         target = dashboard / rel
         if not target.exists() or not source.exists() or not target.is_file() or not source.is_file():
             continue
-        status = classify_managed_view_asset(source, target)
+        state_path = f"dashboard/{rel}"
+        status = classify_managed_view_asset(source, target, manifest=view_manifest, rel_path=state_path)
         if status["status"] == "current":
             if status.get("customized"):
                 entry = {
-                    "asset": f"dashboard/{rel}",
+                    "asset": state_path,
                     "template": f"{STATE_SKELETON_REL.as_posix()}/{rel}",
                     "expected_sha256": status["source_sha256"],
                     "actual_sha256": status["target_sha256"],
@@ -882,8 +932,24 @@ def check_project_state_layout(project_root: Path, skill_root: Path | None = Non
                 view_customizations.append(entry)
                 advisories.append(_state_layout_warning(entry["message"], path=entry["asset"]))
             continue
+        if status.get("customized"):
+            entry = {
+                "asset": state_path,
+                "template": f"{STATE_SKELETON_REL.as_posix()}/{rel}",
+                "expected_sha256": status["source_sha256"],
+                "actual_sha256": status["target_sha256"],
+                "reason": status["reason"],
+                "status": status["status"],
+            }
+            entry["message"] = (
+                f"managed view customization preserved: {state_path} differs from "
+                "the recorded install hash; review manually if this was meant to be stock"
+            )
+            view_customizations.append(entry)
+            advisories.append(_state_layout_warning(entry["message"], path=entry["asset"]))
+            continue
         entry = {
-            "asset": f"dashboard/{rel}",
+            "asset": state_path,
             "template": f"{STATE_SKELETON_REL.as_posix()}/{rel}",
             "expected_sha256": status["source_sha256"],
             "actual_sha256": status["target_sha256"],
@@ -891,10 +957,11 @@ def check_project_state_layout(project_root: Path, skill_root: Path | None = Non
             "status": status["status"],
         }
         if status["needs_refresh"]:
+            entry["remedy"] = refresh_command
             entry["message"] = (
-                f"legacy goal-flight view (pre-v1.1 renderer): dashboard/{rel} "
-                f"matches {status['reason']}; run `/goal-flight init` to back up and "
-                "refresh managed view assets"
+                f"managed goal-flight view is stale: {state_path} matches "
+                f"{status['reason']}; run `{refresh_command}` to back up and refresh "
+                "managed view assets"
             )
             view_schema_skew.append(entry)
             warnings.append(_state_layout_warning(entry["message"], path=entry["asset"]))

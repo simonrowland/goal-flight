@@ -133,6 +133,7 @@ Bug INSTANCES stay project-local; bug SHAPES are shared.
    managed state-file pointers in `AGENTS.md` through temp+rename, and keeps
    `history.md` additive/write-once. The retired handoff file is not state; the
    living pin is always the newest `docs-private/RESUME-NOTES-*.md`.
+- After updating goal-flight, run `python3 scripts/goalflight_setup.py --refresh-views --all-projects` to sweep registered projects for unmodified managed dashboard views that need the new templates.
 
 See also [progress-dashboard.md](progress-dashboard.md) (dashboard rendering) and
 [task-lifecycle.md](task-lifecycle.md) (machine-owned task status + id allocation).

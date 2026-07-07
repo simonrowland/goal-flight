@@ -861,6 +861,23 @@ def _export_dashboard_status_for_project(project_root: Path | None) -> None:
         pass
 
 
+def _upsert_project_registry_for_dispatch(project_root: Path | None) -> None:
+    if project_root is None:
+        return
+    try:
+        root = SCRIPT_DIR.parent
+        if str(root) not in sys.path:
+            sys.path.insert(0, str(root))
+        import goalflight_task  # type: ignore
+
+        goalflight_task.upsert_project_registry(
+            project_root,
+            throttle_s=goalflight_task.PROJECT_REGISTRY_THROTTLE_S,
+        )
+    except Exception:
+        pass
+
+
 def _dashboard_record_seen_at(record: dict) -> dt.datetime | None:
     for key in ("updated_at", "started_at"):
         parsed = goalflight_ledger.parse_utc(record.get(key))
@@ -1816,6 +1833,7 @@ def _record_ledger(args, *, project_root: Path, prompt_path: str | None, status_
             )
         )
     _export_dashboard_status_for_project(project_root)
+    _upsert_project_registry_for_dispatch(project_root)
     if state in {"waiting_capacity", "starting", "running"}:
         _start_dashboard_refresh_for_project(project_root)
 

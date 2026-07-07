@@ -41,6 +41,10 @@ except Exception:  # pragma: no cover - import failures surface at runtime.
 
 CHECKER = ROOT / "scripts" / "check_tasks_mirror.js"
 ITEM_SCHEMA_VERSION = 1
+PROJECT_REGISTRY_INDEX_SCHEMA = "goalflight.projects-index.v1"
+PROJECT_STORE_META_SCHEMA = "goalflight.project-store-meta.v1"
+VIEW_MANIFEST_SCHEMA = "goalflight.view-manifest.v1"
+PROJECT_REGISTRY_THROTTLE_S = 3600
 FAMILY_PREFIX_BY_KIND = {"task": "t", "bug": "b", "decision": "q"}
 VALID_FAMILIES = {"t", "b", "q", "ADR"}
 TASK_DISPATCH_STATES = {"working", "worker-finished", "worker-failed"}
@@ -356,6 +360,11 @@ def _durable_state_base() -> Path:
     return base / "goal-flight"
 
 
+def resolve_state_base_dir() -> Path:
+    override = os.environ.get("GOALFLIGHT_TASK_STORE_DIR", "").strip()
+    return Path(override).expanduser() if override else _durable_state_base()
+
+
 def _task_store_slug(main_root: Path) -> str:
     """Repo-named, collision-safe folder name: ``<repo-slug>-<pathhash>``.
 
@@ -380,9 +389,199 @@ def resolve_task_store_dir(project_root: Path) -> Path:
     backlog) — intentional.
     """
     main_root = _strip_managed_worktree(project_root)
-    override = os.environ.get("GOALFLIGHT_TASK_STORE_DIR", "").strip()
-    base = Path(override).expanduser() if override else _durable_state_base()
+    base = resolve_state_base_dir()
     return (base / "task-stores" / _task_store_slug(main_root)).resolve(strict=False)
+
+
+def project_registry_index_path() -> Path:
+    return (resolve_state_base_dir() / "projects.json").resolve(strict=False)
+
+
+def _read_json_object(path: Path) -> dict[str, Any]:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _skill_version() -> str | None:
+    try:
+        for line in (ROOT / "SKILL.md").read_text(encoding="utf-8").splitlines():
+            if line.startswith("version:"):
+                return line.split(":", 1)[1].strip().strip('"').strip("'") or None
+    except OSError:
+        return None
+    return None
+
+
+def current_skill_version() -> str | None:
+    return _skill_version()
+
+
+def _parse_utc_iso(value: Any) -> dt.datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def _project_registry_entry(project_root: Path, *, skill_version: str | None, now: str) -> dict[str, Any]:
+    root = _strip_managed_worktree(project_root).resolve(strict=False)
+    return {
+        "project_root": str(root),
+        "last_seen": now,
+        "skill_version": skill_version or _skill_version(),
+    }
+
+
+def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_write_text(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
+
+
+def _upsert_project_registry_impl(
+    project_root: Path,
+    *,
+    skill_version: str | None = None,
+    throttle_s: int | float = 0,
+    now: str | None = None,
+) -> dict[str, Any]:
+    root = _strip_managed_worktree(project_root).resolve(strict=False)
+    store_dir = resolve_task_store_dir(root)
+    store_meta_path = store_dir / "store-meta.json"
+    now_text = now or utc_now()
+    entry = _project_registry_entry(root, skill_version=skill_version, now=now_text)
+    entry["store_dir"] = str(store_dir)
+
+    existing_meta = _read_json_object(store_meta_path)
+    if throttle_s and existing_meta.get("project_root") == entry["project_root"]:
+        last_seen = _parse_utc_iso(existing_meta.get("last_seen"))
+        current_seen = _parse_utc_iso(now_text)
+        if last_seen is not None and current_seen is not None:
+            if (current_seen - last_seen).total_seconds() < float(throttle_s):
+                return {
+                    "ok": True,
+                    "project_root": entry["project_root"],
+                    "store_meta": str(store_meta_path),
+                    "projects_index": str(project_registry_index_path()),
+                    "skipped": "throttled",
+                }
+
+    store_payload = {
+        "schema": PROJECT_STORE_META_SCHEMA,
+        "project_root": entry["project_root"],
+        "last_seen": entry["last_seen"],
+        "skill_version": entry["skill_version"],
+    }
+    _write_json_atomic(store_meta_path, store_payload)
+
+    index_path = project_registry_index_path()
+    lock_path = index_path.with_name(f"{index_path.name}.lock")
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    with FileLock(lock_path):
+        existing_index = _read_json_object(index_path)
+        by_root: dict[str, dict[str, Any]] = {}
+        raw_projects = existing_index.get("projects")
+        if isinstance(raw_projects, LIST_TYPE):
+            for item in raw_projects:
+                if isinstance(item, dict) and isinstance(item.get("project_root"), str):
+                    by_root[item["project_root"]] = dict(item)
+        by_root[entry["project_root"]] = entry
+        index_payload = {
+            "schema": PROJECT_REGISTRY_INDEX_SCHEMA,
+            "updated_at": now_text,
+            "projects": [by_root[key] for key in sorted(by_root)],
+        }
+        _write_json_atomic(index_path, index_payload)
+
+    return {
+        "ok": True,
+        "project_root": entry["project_root"],
+        "store_meta": str(store_meta_path),
+        "projects_index": str(index_path),
+    }
+
+
+def upsert_project_registry(
+    project_root: Path,
+    *,
+    skill_version: str | None = None,
+    throttle_s: int | float = 0,
+    now: str | None = None,
+) -> dict[str, Any]:
+    try:
+        return _upsert_project_registry_impl(
+            project_root,
+            skill_version=skill_version,
+            throttle_s=throttle_s,
+            now=now,
+        )
+    except Exception as exc:  # pragma: no cover - callers must treat upkeep as best-effort
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
+def read_project_registry() -> list[dict[str, Any]]:
+    payload = _read_json_object(project_registry_index_path())
+    projects = payload.get("projects")
+    if not isinstance(projects, LIST_TYPE):
+        return []
+    return [dict(item) for item in projects if isinstance(item, dict)]
+
+
+def view_manifest_path(project_root: Path) -> Path:
+    return resolve_task_store_dir(project_root) / "view-manifest.json"
+
+
+def load_view_manifest(project_root: Path) -> dict[str, Any]:
+    payload = _read_json_object(view_manifest_path(project_root))
+    views = payload.get("views")
+    if not isinstance(views, dict):
+        payload["views"] = {}
+    return payload
+
+
+def update_view_manifest(
+    project_root: Path,
+    entries: list[dict[str, Any]],
+    *,
+    skill_version: str | None = None,
+    now: str | None = None,
+) -> dict[str, Any]:
+    if not entries:
+        return load_view_manifest(project_root)
+    path = view_manifest_path(project_root)
+    payload = load_view_manifest(project_root)
+    views = payload.get("views")
+    if not isinstance(views, dict):
+        views = {}
+    installed_at = now or utc_now()
+    version = skill_version or _skill_version()
+    for item in entries:
+        rel_path = item.get("rel_path")
+        source_hash = item.get("installed_source_sha256")
+        if not isinstance(rel_path, str) or not rel_path:
+            continue
+        if not isinstance(source_hash, str) or not source_hash:
+            continue
+        views[rel_path] = {
+            "rel_path": rel_path,
+            "installed_source_sha256": source_hash,
+            "skill_version": version,
+            "installed_at": installed_at,
+        }
+    out = {
+        "schema": VIEW_MANIFEST_SCHEMA,
+        "updated_at": installed_at,
+        "views": {key: views[key] for key in sorted(views)},
+    }
+    _write_json_atomic(path, out)
+    return out
 
 
 def _actor(args: argparse.Namespace) -> str:
@@ -1691,6 +1890,11 @@ class TaskStore:
             # mutation reads them — that mutation's own save exports right after.
             if export:
                 self._export_to_project_tree()
+            with contextlib.suppress(Exception):
+                upsert_project_registry(
+                    self.project_root,
+                    throttle_s=PROJECT_REGISTRY_THROTTLE_S,
+                )
         finally:
             shutil.rmtree(staging, ignore_errors=True)
 

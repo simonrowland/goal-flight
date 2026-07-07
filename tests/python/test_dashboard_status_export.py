@@ -33,6 +33,7 @@ def _isolated_env(tmp: Path):
     old_env = os.environ.copy()
     env = old_env.copy()
     env["GOALFLIGHT_STATE_DIR"] = str(tmp / "state")
+    env["GOALFLIGHT_TASK_STORE_DIR"] = str(tmp / "task-store")
     env["GOAL_FLIGHT_PIDFILE_DIR"] = str(tmp / "pids")
     env["GOALFLIGHT_CAPACITY_WAIT_S"] = "0"
     env["GOALFLIGHT_CAPACITY_CONF"] = "/dev/null"
@@ -497,9 +498,11 @@ def test_foreground_dispatch_refreshes_dashboard_status_data() -> None:
                 timeout=30,
             )
             payload = _payload_from_status_js(project / "dashboard" / "status-data.js")
+            projects_index = json.loads((tmp / "task-store" / "projects.json").read_text(encoding="utf-8"))
 
         assert proc.returncode == 0, (proc.stdout, proc.stderr)
         row = next(row for row in payload["dispatches"] if row["dispatch_id"] == "dashboard-watch")
         assert row["task_ids"] == []
         assert row["tail_last_line"] == "COMPLETE: dashboard worker done"
         assert payload["counts"]["worker_finished"] == 1
+        assert any(item["project_root"] == str(project.resolve()) for item in projects_index["projects"])

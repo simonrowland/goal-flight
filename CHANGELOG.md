@@ -6,6 +6,7 @@ incremented when meaningful skill behaviour changes.
 
 ## [Unreleased]
 
+- Managed dashboard views now record install-hash provenance and can be refreshed across registered projects with `goalflight_setup.py --refresh-views --all-projects`.
 - Dashboard task exports now include a `GF_META` freshness stamp and dispatches refresh live `status-data.js` for file:// status views.
 - ACP workers now receive `GOALFLIGHT_PROMPT_FILE` plus the prompt re-read preamble.
 

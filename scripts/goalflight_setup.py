@@ -39,6 +39,7 @@ from goalflight_adapter_gate import validate_adapter_gate  # noqa: E402
 
 
 BACKUP_SCHEMA = "goalflight.setup-backup.v1"
+VIEW_MANIFEST_SCHEMA = "goalflight.view-manifest.v1"
 MERGE_START = "# >>> goal-flight"
 MERGE_END = "# <<< goal-flight"
 SETUP_ALLOWED_GATE_REASONS = {"allowed", "candidate", "config_only", "not_installed", "probe_required", "unsupported"}
@@ -407,8 +408,74 @@ def _sha256_file(path: Path) -> str | None:
         return None
 
 
-def _managed_view_needs_refresh(source: Path, dest: Path) -> bool:
-    return bool(goalflight_doctor.classify_managed_view_asset(source, dest).get("needs_refresh"))
+def _managed_view_needs_refresh(source: Path, dest: Path, manifest: dict | None = None, rel_path: str | None = None) -> bool:
+    return bool(
+        goalflight_doctor.classify_managed_view_asset(
+            source,
+            dest,
+            manifest=manifest,
+            rel_path=rel_path,
+        ).get("needs_refresh")
+    )
+
+
+def _skill_version(repo_root: Path) -> str | None:
+    try:
+        for line in (repo_root / "SKILL.md").read_text(encoding="utf-8").splitlines():
+            if line.startswith("version:"):
+                return line.split(":", 1)[1].strip().strip('"').strip("'") or None
+    except OSError:
+        return None
+    return None
+
+
+def _view_manifest_entry(manifest: dict | None, rel_path: str) -> dict | None:
+    if not isinstance(manifest, dict):
+        return None
+    views = manifest.get("views")
+    if not isinstance(views, dict):
+        return None
+    entry = views.get(rel_path)
+    return entry if isinstance(entry, dict) else None
+
+
+def _view_manifest_needs_update(manifest: dict | None, rel_path: str, source_hash: str | None, skill_version: str | None) -> bool:
+    if not source_hash:
+        return False
+    entry = _view_manifest_entry(manifest, rel_path)
+    if entry is None:
+        return True
+    return (
+        entry.get("installed_source_sha256") != source_hash
+        or entry.get("skill_version") != skill_version
+    )
+
+
+def _view_manifest_update(rel_path: str, source: Path) -> dict[str, str] | None:
+    source_hash = _sha256_file(source)
+    if not source_hash:
+        return None
+    return {
+        "rel_path": rel_path,
+        "installed_source_sha256": source_hash,
+    }
+
+
+def _load_project_view_manifest(project_root: Path) -> dict[str, Any]:
+    module = _load_goalflight_task_module()
+    return module.load_view_manifest(project_root)
+
+
+def _write_project_view_manifest(project_root: Path, entries: list[dict[str, str]], *, skill_version: str | None) -> dict[str, Any] | None:
+    if not entries:
+        return None
+    module = _load_goalflight_task_module()
+    return module.update_view_manifest(project_root, entries, skill_version=skill_version)
+
+
+def _upsert_project_registry(project_root: Path, *, skill_version: str | None, throttle_s: int = 0) -> dict[str, Any]:
+    module = _load_goalflight_task_module()
+    return module.upsert_project_registry(project_root, skill_version=skill_version, throttle_s=throttle_s)
 
 
 def _plan_ledger_task_id_backfill(target_project: Path) -> list[dict[str, Any]]:
@@ -516,11 +583,14 @@ def scaffold_project_state(
     _validate_scaffold_state_dir(target_project, dashboard)
     if today is None:
         today = datetime.now(timezone.utc).date().isoformat()
+    skill_version = _skill_version(repo_root)
+    view_manifest = _load_project_view_manifest(target_project)
 
     would_create_dirs: list[str] = []
     would_create_files: list[str] = []
     skipped_existing_files: list[str] = []
     managed_view_replacements: list[dict[str, str]] = []
+    view_manifest_updates: list[dict[str, str]] = []
     messages: list[str] = []
 
     dirs = [docs_private, dashboard] + [docs_private / rel for rel in goalflight_doctor.CANONICAL_STATE_DIRS]
@@ -544,25 +614,39 @@ def scaffold_project_state(
                 rel_key in goalflight_doctor.MANAGED_VIEW_ASSETS
                 and dest.is_file()
             ):
-                view_status = goalflight_doctor.classify_managed_view_asset(source, dest)
+                view_status = goalflight_doctor.classify_managed_view_asset(
+                    source,
+                    dest,
+                    manifest=view_manifest,
+                    rel_path=rel_out,
+                )
                 if view_status.get("needs_refresh"):
                     managed_view_replacements.append({
                         "path": rel_out,
                         "template": f"{goalflight_doctor.STATE_SKELETON_REL.as_posix()}/{rel.as_posix()}",
                         "reason": view_status.get("reason"),
-                        "message": "legacy goal-flight view (pre-v1.1 renderer); backing up and refreshing",
+                        "message": "managed goal-flight view is stale; backing up and refreshing",
                     })
                     messages.append(
-                        f"legacy goal-flight view (pre-v1.1 renderer); backing up and refreshing: {rel_out}"
+                        f"managed goal-flight view is stale; backing up and refreshing: {rel_out}"
                     )
                     continue
-                if view_status.get("status") == "current" and view_status.get("customized"):
+                if view_status.get("customized"):
                     skipped_existing_files.append(rel_out)
                     messages.append(
-                        f"preserve customized current managed view asset: {rel_out} "
-                        "(manual review; v1.1 renderer contract present)"
+                        f"preserve customized managed view asset: {rel_out} "
+                        f"(manual review; {view_status.get('reason')})"
                     )
                     continue
+                if view_status.get("status") == "current":
+                    update = _view_manifest_update(rel_out, source)
+                    if update and _view_manifest_needs_update(
+                        view_manifest,
+                        rel_out,
+                        update["installed_source_sha256"],
+                        skill_version,
+                    ):
+                        view_manifest_updates.append(update)
                 if view_status.get("status") == "foreign":
                     skipped_existing_files.append(rel_out)
                     messages.append(
@@ -610,6 +694,8 @@ def scaffold_project_state(
     created_files: list[str] = []
     touched_html: list[str] = []
     refreshed_managed_views: list[str] = []
+    view_manifest_result = None
+    registry_result = None
     agents_result = {
         "path": agents_plan["path"],
         "action": "would_" + agents_plan["action"] if agents_plan["action"] != "skip" else "skip",
@@ -658,18 +744,36 @@ def scaffold_project_state(
                 rel_from_root = dest.relative_to(dashboard if rel_out.startswith("dashboard/") else docs_private)
                 source = skeleton / rel_from_root
                 _copy_atomic(source, dest)
+                if rel_out.startswith("dashboard/") and rel_from_root.as_posix() in goalflight_doctor.MANAGED_VIEW_ASSETS:
+                    update = _view_manifest_update(rel_out, source)
+                    if update:
+                        view_manifest_updates.append(update)
             created_files.append(rel_out)
         for item in managed_view_replacements:
             rel_out = item["path"]
             dest = target_project / rel_out
             source = skeleton / Path(rel_out).relative_to("dashboard")
-            if dest.exists() and _managed_view_needs_refresh(source, dest):
+            if dest.exists() and _managed_view_needs_refresh(source, dest, manifest=view_manifest, rel_path=rel_out):
                 _copy_atomic(source, dest)
                 refreshed_managed_views.append(rel_out)
+                update = _view_manifest_update(rel_out, source)
+                if update:
+                    view_manifest_updates.append(update)
         if agents_plan["action"] in {"create", "update"}:
             _atomic_write(target_project / "AGENTS.md", agents_plan["content"])
             agents_result["action"] = agents_plan["action"]
         ledger_backfills = _apply_ledger_task_id_backfill(ledger_backfill_plan)
+        deduped_view_manifest_updates = {
+            item["rel_path"]: item
+            for item in view_manifest_updates
+            if item.get("rel_path") and item.get("installed_source_sha256")
+        }
+        view_manifest_result = _write_project_view_manifest(
+            target_project,
+            [deduped_view_manifest_updates[key] for key in sorted(deduped_view_manifest_updates)],
+            skill_version=skill_version,
+        )
+        registry_result = _upsert_project_registry(target_project, skill_version=skill_version)
     else:
         messages.append("dry-run only: no files, directories, managed view assets, AGENTS.md, backups, or ledger records were changed")
 
@@ -708,6 +812,11 @@ def scaffold_project_state(
         "would_create_files": would_create_files_out,
         "touched_created_html": touched_html,
         "refreshed_managed_views": refreshed_managed_views,
+        "view_manifest": {
+            "path": str(_load_goalflight_task_module().view_manifest_path(target_project)),
+            "updated": sorted({item["rel_path"] for item in view_manifest_updates if item.get("rel_path")}) if view_manifest_result else [],
+        },
+        "registry": registry_result,
         "would_refresh_managed_views": would_refresh_managed_views,
         "skipped_existing_files": skipped,
         "agents": agents_result,
@@ -721,6 +830,209 @@ def scaffold_project_state(
             f"refreshed_managed_views={len(refreshed_managed_views)} skipped_existing_files={len(skipped)}"
         ),
     }
+
+
+def refresh_managed_views(repo_root: Path, target_project: Path, *, dry_run: bool = False) -> dict[str, Any]:
+    repo_root = repo_root.resolve()
+    target_project = target_project.resolve()
+    skeleton = repo_root / goalflight_doctor.STATE_SKELETON_REL
+    if not skeleton.is_dir():
+        raise SetupError(f"state skeleton missing: {skeleton}")
+    skill_version = _skill_version(repo_root)
+    view_manifest = _load_project_view_manifest(target_project)
+    rows: list[dict[str, Any]] = []
+    refresh_paths: list[str] = []
+    manifest_updates: list[dict[str, str]] = []
+
+    for rel in goalflight_doctor.MANAGED_VIEW_ASSETS:
+        rel_out = f"dashboard/{rel}"
+        source = skeleton / rel
+        target = target_project / rel_out
+        row: dict[str, Any] = {"path": rel_out, "action": "skip", "reason": None}
+        if not source.is_file():
+            row["reason"] = "template missing"
+            rows.append(row)
+            continue
+        if not target.exists():
+            row["reason"] = "target missing"
+            rows.append(row)
+            continue
+        if not target.is_file():
+            row["reason"] = "target is not a regular file"
+            rows.append(row)
+            continue
+
+        status = goalflight_doctor.classify_managed_view_asset(
+            source,
+            target,
+            manifest=view_manifest,
+            rel_path=rel_out,
+        )
+        row.update({
+            "status": status.get("status"),
+            "reason": status.get("reason"),
+            "source_sha256": status.get("source_sha256"),
+            "target_sha256": status.get("target_sha256"),
+        })
+        if status.get("needs_refresh"):
+            row["action"] = "would-refresh" if dry_run else "refresh"
+            refresh_paths.append(rel_out)
+            update = _view_manifest_update(rel_out, source)
+            if update:
+                manifest_updates.append(update)
+            rows.append(row)
+            continue
+        if status.get("status") == "current":
+            row["action"] = "current"
+            update = _view_manifest_update(rel_out, source)
+            if update and _view_manifest_needs_update(
+                view_manifest,
+                rel_out,
+                update["installed_source_sha256"],
+                skill_version,
+            ):
+                manifest_updates.append(update)
+            rows.append(row)
+            continue
+        if status.get("customized"):
+            row["action"] = "skip-customized"
+        elif status.get("status") == "foreign":
+            row["action"] = "skip-foreign"
+        rows.append(row)
+
+    backup = None
+    refreshed: list[str] = []
+    view_manifest_result = None
+    registry_result = None
+    if not dry_run and refresh_paths:
+        try:
+            backup = _create_project_state_backup(
+                target_project,
+                refresh_paths,
+                reason="managed view refresh before apply",
+            )
+            for rel_out in refresh_paths:
+                source = skeleton / Path(rel_out).relative_to("dashboard")
+                _copy_atomic(source, target_project / rel_out)
+                refreshed.append(rel_out)
+        except OSError as exc:
+            raise SetupError(f"managed view refresh failed: {exc}") from exc
+
+    if not dry_run:
+        deduped_updates = {
+            item["rel_path"]: item
+            for item in manifest_updates
+            if item.get("rel_path") and item.get("installed_source_sha256")
+        }
+        try:
+            view_manifest_result = _write_project_view_manifest(
+                target_project,
+                [deduped_updates[key] for key in sorted(deduped_updates)],
+                skill_version=skill_version,
+            )
+        except OSError as exc:
+            raise SetupError(f"view manifest update failed: {exc}") from exc
+        registry_result = _upsert_project_registry(target_project, skill_version=skill_version)
+
+    return {
+        "schema": "goalflight.managed-view-refresh.v1",
+        "project_root": str(target_project),
+        "dry_run": dry_run,
+        "backup": backup,
+        "rows": rows,
+        "refreshed": refreshed,
+        "would_refresh": refresh_paths if dry_run else [],
+        "skipped": [row for row in rows if str(row.get("action", "")).startswith("skip")],
+        "view_manifest": {
+            "path": str(_load_goalflight_task_module().view_manifest_path(target_project)),
+            "updated": sorted({item["rel_path"] for item in manifest_updates if item.get("rel_path")}) if view_manifest_result else [],
+        },
+        "registry": registry_result,
+        "summary": (
+            f"refreshed={len(refreshed)} would_refresh={len(refresh_paths) if dry_run else 0} "
+            f"skipped={sum(1 for row in rows if str(row.get('action', '')).startswith('skip'))} "
+            f"current={sum(1 for row in rows if row.get('action') == 'current')}"
+        ),
+    }
+
+
+def refresh_managed_views_all(repo_root: Path, *, dry_run: bool = False) -> dict[str, Any]:
+    module = _load_goalflight_task_module()
+    projects = module.read_project_registry()
+    results: list[dict[str, Any]] = []
+    gc_candidates: list[dict[str, str]] = []
+    errors: list[dict[str, str]] = []
+    for entry in projects:
+        raw_root = entry.get("project_root")
+        if not isinstance(raw_root, str) or not raw_root:
+            continue
+        # Registry content is untrusted (corruption, hostile edits, dead
+        # mounts): one bad entry must degrade to a reported row, never abort
+        # the sweep for the valid projects after it.
+        try:
+            project_root = Path(raw_root).expanduser().resolve(strict=False)
+            if not project_root.exists():
+                gc_candidates.append({
+                    "project_root": str(project_root),
+                    "reason": "project root missing",
+                })
+                continue
+            results.append(refresh_managed_views(repo_root, project_root, dry_run=dry_run))
+        except Exception as exc:  # noqa: BLE001 - per-entry containment by design
+            errors.append({
+                "project_root": raw_root,
+                "reason": f"{type(exc).__name__}: {exc}",
+            })
+    return {
+        "schema": "goalflight.managed-view-refresh-all.v1",
+        "dry_run": dry_run,
+        "projects_index": str(module.project_registry_index_path()),
+        "project_count": len(results),
+        "gc_candidates": gc_candidates,
+        "errors": errors,
+        "results": results,
+        "summary": (
+            f"projects={len(results)} gc_candidates={len(gc_candidates)} "
+            f"errors={len(errors)} "
+            f"refreshed={sum(len(item.get('refreshed') or []) for item in results)} "
+            f"would_refresh={sum(len(item.get('would_refresh') or []) for item in results)}"
+        ),
+    }
+
+
+def _tsv_cell(value: Any) -> str:
+    """Control characters in untrusted registry paths must not break the
+    one-row-per-line TSV contract of the sweep table."""
+    text = str(value)
+    return text.replace("\\", "\\\\").replace("\t", "\\t").replace("\n", "\\n").replace("\r", "\\r")
+
+
+def _print_refresh_views_result(payload: dict[str, Any]) -> None:
+    if payload.get("schema") == "goalflight.managed-view-refresh-all.v1":
+        print("project\trefreshed\twould_refresh\tskipped\tcurrent\tstatus")
+        for item in payload.get("results") or []:
+            rows = item.get("rows") or []
+            print(
+                "\t".join([
+                    _tsv_cell(item.get("project_root")),
+                    str(len(item.get("refreshed") or [])),
+                    str(len(item.get("would_refresh") or [])),
+                    str(sum(1 for row in rows if str(row.get("action", "")).startswith("skip"))),
+                    str(sum(1 for row in rows if row.get("action") == "current")),
+                    "dry-run" if item.get("dry_run") else "ok",
+                ])
+            )
+        for item in payload.get("gc_candidates") or []:
+            print(f"{_tsv_cell(item.get('project_root'))}\t0\t0\t0\t0\tgc-candidate: {_tsv_cell(item.get('reason'))}")
+        for item in payload.get("errors") or []:
+            print(f"{_tsv_cell(item.get('project_root'))}\t0\t0\t0\t0\terror: {_tsv_cell(item.get('reason'))}")
+        print(f"SUMMARY: {payload.get('summary')}")
+        return
+
+    print("path\taction\treason")
+    for row in payload.get("rows") or []:
+        print(f"{_tsv_cell(row.get('path'))}\t{row.get('action')}\t{_tsv_cell(row.get('reason') or '')}")
+    print(f"SUMMARY: {payload.get('summary')}")
 
 
 def _load_manifest(repo_root: Path, agent: str) -> dict[str, Any]:
@@ -2550,6 +2862,21 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="scaffold target docs-private/ from templates/state-skeleton without overwriting existing files",
     )
+    parser.add_argument(
+        "--refresh-views",
+        action="store_true",
+        help="refresh unmodified managed dashboard views from templates/state-skeleton",
+    )
+    parser.add_argument(
+        "--all-projects",
+        action="store_true",
+        help="with --refresh-views, sweep every project in the local goal-flight registry",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="with --refresh-views, report changes without writing backups, views, manifests, or registry state",
+    )
     parser.add_argument("--scaffold-date", help=argparse.SUPPRESS)
     parser.add_argument("--apply", action="store_true", help="perform approved writes")
     parser.add_argument("--yes", action="store_true", help="confirm writes for --apply")
@@ -2567,6 +2894,16 @@ def main(argv: list[str] | None = None) -> int:
             args.cursor_project or args.opencode_project or args.target_project
         ).expanduser().resolve()
         manifests = _load_manifests(repo_root)
+        if args.all_projects and not args.refresh_views:
+            raise SetupError("--all-projects requires --refresh-views")
+        if args.refresh_views:
+            result = (
+                refresh_managed_views_all(repo_root, dry_run=args.dry_run)
+                if args.all_projects
+                else refresh_managed_views(repo_root, target_project, dry_run=args.dry_run)
+            )
+            _print_refresh_views_result(result)
+            return 0
         if args.scaffold_project_state:
             if args.apply and not args.yes:
                 raise SetupError("--scaffold-project-state --apply requires --yes")

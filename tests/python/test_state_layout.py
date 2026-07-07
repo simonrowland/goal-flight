@@ -16,10 +16,17 @@ import re
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = ROOT / "scripts"
+sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(SCRIPTS))
 
+import goalflight_task  # noqa: E402
 import goalflight_doctor  # noqa: E402
 import goalflight_setup  # noqa: E402
+
+os.environ.setdefault(
+    "GOALFLIGHT_TASK_STORE_DIR",
+    tempfile.mkdtemp(prefix="goalflight-state-layout-store-"),
+)
 
 
 def assert_true(name: str, condition: bool) -> None:
@@ -45,6 +52,23 @@ def _write_ready_agents(repo: Path) -> None:
         "- test: `pytest`\n",
         encoding="utf-8",
     )
+
+
+@contextlib.contextmanager
+def _task_store_base(path: Path):
+    old = os.environ.get("GOALFLIGHT_TASK_STORE_DIR")
+    os.environ["GOALFLIGHT_TASK_STORE_DIR"] = str(path)
+    try:
+        yield
+    finally:
+        if old is None:
+            os.environ.pop("GOALFLIGHT_TASK_STORE_DIR", None)
+        else:
+            os.environ["GOALFLIGHT_TASK_STORE_DIR"] = old
+
+
+def _read_view_manifest(repo: Path) -> dict:
+    return json.loads(goalflight_task.view_manifest_path(repo).read_text(encoding="utf-8"))
 
 
 PRE_V11_INDEX_HTML = """<!doctype html>
@@ -342,6 +366,7 @@ def test_scaffold_project_state_refreshes_known_legacy_hash_with_backup() -> Non
         repo = Path(td)
         subprocess.run(["git", "init"], cwd=repo, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         goalflight_setup.scaffold_project_state(ROOT, repo, apply=True, today="2026-06-27")
+        goalflight_task.view_manifest_path(repo).unlink()
         view = repo / "dashboard/gf.js"
         legacy = "legacy hash fixture\n"
         legacy_hash = hashlib.sha256(legacy.encode("utf-8")).hexdigest()
@@ -367,6 +392,201 @@ def test_scaffold_project_state_refreshes_known_legacy_hash_with_backup() -> Non
             goalflight_doctor.MANAGED_VIEW_LEGACY_SHA256["gf.js"] = original_hashes
 
 
+def test_scaffold_project_state_writes_managed_view_manifest() -> None:
+    with tempfile.TemporaryDirectory(prefix="gf-state-layout-view-manifest-") as td:
+        base = Path(td)
+        repo = base / "repo"
+        repo.mkdir()
+        with _task_store_base(base / "store"):
+            result = goalflight_setup.scaffold_project_state(ROOT, repo, apply=True, today="2026-06-27")
+            manifest = _read_view_manifest(repo)
+
+        entry = manifest["views"]["dashboard/gf.js"]
+        expected = hashlib.sha256((ROOT / "templates/state-skeleton/gf.js").read_bytes()).hexdigest()
+        assert_true("view manifest reports schema", manifest["schema"] == goalflight_task.VIEW_MANIFEST_SCHEMA)
+        assert_true("scaffold reports manifest update", "dashboard/gf.js" in result["view_manifest"]["updated"])
+        assert_true("view manifest records source hash", entry["installed_source_sha256"] == expected)
+        assert_true("view manifest records skill version", entry["skill_version"] == goalflight_task.current_skill_version())
+        assert_true("view manifest records timestamp", isinstance(entry["installed_at"], str) and entry["installed_at"])
+
+
+def test_refresh_views_updates_managed_stale_manifest_install_with_backup() -> None:
+    with tempfile.TemporaryDirectory(prefix="gf-state-layout-refresh-stale-") as td:
+        base = Path(td)
+        repo = base / "repo"
+        repo.mkdir()
+        with _task_store_base(base / "store"):
+            goalflight_setup.scaffold_project_state(ROOT, repo, apply=True, today="2026-06-27")
+            view = repo / "dashboard/gf.js"
+            old_install = "global.GF = {}; // old official install\n"
+            old_hash = hashlib.sha256(old_install.encode("utf-8")).hexdigest()
+            view.write_text(old_install, encoding="utf-8")
+            goalflight_task.update_view_manifest(
+                repo,
+                [{"rel_path": "dashboard/gf.js", "installed_source_sha256": old_hash}],
+                skill_version="1.0.0",
+                now="2026-01-01T00:00:00+00:00",
+            )
+            manifest = goalflight_task.load_view_manifest(repo)
+            status = goalflight_doctor.classify_managed_view_asset(
+                ROOT / "templates/state-skeleton/gf.js",
+                view,
+                manifest=manifest,
+                rel_path="dashboard/gf.js",
+            )
+
+            result = goalflight_setup.refresh_managed_views(ROOT, repo)
+            refreshed_manifest = _read_view_manifest(repo)
+
+        expected = (ROOT / "templates/state-skeleton/gf.js").read_text(encoding="utf-8")
+        assert_true("manifest install classified managed-stale", status["status"] == "managed-stale")
+        assert_true("manifest install needs refresh", status["needs_refresh"] is True)
+        assert_true("managed-stale refreshed", "dashboard/gf.js" in result["refreshed"])
+        assert_true("managed-stale backup contains old install", repo.joinpath(result["backup"]["path"], "dashboard/gf.js").read_text(encoding="utf-8") == old_install)
+        assert_true("managed-stale target updated", view.read_text(encoding="utf-8") == expected)
+        assert_true(
+            "manifest updated to current source",
+            refreshed_manifest["views"]["dashboard/gf.js"]["installed_source_sha256"]
+            == hashlib.sha256(expected.encode("utf-8")).hexdigest(),
+        )
+
+
+def test_refresh_views_skips_operator_customization_with_manifest() -> None:
+    with tempfile.TemporaryDirectory(prefix="gf-state-layout-refresh-custom-") as td:
+        base = Path(td)
+        repo = base / "repo"
+        repo.mkdir()
+        with _task_store_base(base / "store"):
+            goalflight_setup.scaffold_project_state(ROOT, repo, apply=True, today="2026-06-27")
+            view = repo / "dashboard/gf.js"
+            old_install = "global.GF = {}; // old official install\n"
+            old_hash = hashlib.sha256(old_install.encode("utf-8")).hexdigest()
+            custom = "global.GF = {}; // operator customization\n"
+            view.write_text(custom, encoding="utf-8")
+            goalflight_task.update_view_manifest(
+                repo,
+                [{"rel_path": "dashboard/gf.js", "installed_source_sha256": old_hash}],
+                skill_version="1.0.0",
+                now="2026-01-01T00:00:00+00:00",
+            )
+
+            result = goalflight_setup.refresh_managed_views(ROOT, repo)
+
+        assert_true("operator customization preserved", view.read_text(encoding="utf-8") == custom)
+        assert_true("operator customization not refreshed", result["refreshed"] == [])
+        assert_true("operator customization no backup", result["backup"] is None)
+        assert_true("operator customization reported", any(row["action"] == "skip-customized" for row in result["rows"]))
+
+
+def test_refresh_views_dry_run_mutates_nothing() -> None:
+    with tempfile.TemporaryDirectory(prefix="gf-state-layout-refresh-dry-") as td:
+        base = Path(td)
+        repo = base / "repo"
+        repo.mkdir()
+        with _task_store_base(base / "store"):
+            goalflight_setup.scaffold_project_state(ROOT, repo, apply=True, today="2026-06-27")
+            view = repo / "dashboard/gf.js"
+            old_install = "global.GF = {}; // old official install\n"
+            old_hash = hashlib.sha256(old_install.encode("utf-8")).hexdigest()
+            view.write_text(old_install, encoding="utf-8")
+            goalflight_task.update_view_manifest(
+                repo,
+                [{"rel_path": "dashboard/gf.js", "installed_source_sha256": old_hash}],
+                skill_version="1.0.0",
+                now="2026-01-01T00:00:00+00:00",
+            )
+            manifest_before = goalflight_task.view_manifest_path(repo).read_text(encoding="utf-8")
+            backup_root = repo / "docs-private/log/project-state-backups"
+            backups_before = sorted(str(path.relative_to(backup_root)) for path in backup_root.rglob("*")) if backup_root.exists() else []
+
+            result = goalflight_setup.refresh_managed_views(ROOT, repo, dry_run=True)
+            manifest_after = goalflight_task.view_manifest_path(repo).read_text(encoding="utf-8")
+            backups_after = sorted(str(path.relative_to(backup_root)) for path in backup_root.rglob("*")) if backup_root.exists() else []
+
+        assert_true("dry-run reports would refresh", "dashboard/gf.js" in result["would_refresh"])
+        assert_true("dry-run target unchanged", view.read_text(encoding="utf-8") == old_install)
+        assert_true("dry-run manifest unchanged", manifest_after == manifest_before)
+        assert_true("dry-run no new backup", backups_after == backups_before)
+
+
+def test_project_registry_upserted_from_scaffold_and_task_store_save() -> None:
+    with tempfile.TemporaryDirectory(prefix="gf-state-layout-registry-") as td:
+        base = Path(td)
+        repo_scaffold = base / "repo-scaffold"
+        repo_store = base / "repo-store"
+        repo_scaffold.mkdir()
+        repo_store.mkdir()
+        with _task_store_base(base / "store"):
+            scaffold_result = goalflight_setup.scaffold_project_state(ROOT, repo_scaffold, apply=True, today="2026-06-27")
+            store = goalflight_task.TaskStore(repo_store)
+            store.save_items_atomic([])
+            projects = goalflight_task.read_project_registry()
+            scaffold_meta = json.loads((goalflight_task.resolve_task_store_dir(repo_scaffold) / "store-meta.json").read_text(encoding="utf-8"))
+            store_meta = json.loads((goalflight_task.resolve_task_store_dir(repo_store) / "store-meta.json").read_text(encoding="utf-8"))
+
+        roots = {item["project_root"] for item in projects}
+        assert_true("scaffold registry result ok", scaffold_result["registry"]["ok"] is True)
+        assert_true("scaffold project indexed", str(repo_scaffold.resolve()) in roots)
+        assert_true("task store project indexed", str(repo_store.resolve()) in roots)
+        assert_true("scaffold store meta written", scaffold_meta["project_root"] == str(repo_scaffold.resolve()))
+        assert_true("task store meta written", store_meta["project_root"] == str(repo_store.resolve()))
+
+
+def test_refresh_views_all_reports_missing_registry_project_without_deleting() -> None:
+    with tempfile.TemporaryDirectory(prefix="gf-state-layout-registry-missing-") as td:
+        base = Path(td)
+        missing = base / "missing-project"
+        with _task_store_base(base / "store"):
+            goalflight_task.upsert_project_registry(missing, skill_version="1.0.0", now="2026-07-07T00:00:00+00:00")
+            before = goalflight_task.read_project_registry()
+            result = goalflight_setup.refresh_managed_views_all(ROOT, dry_run=True)
+            after = goalflight_task.read_project_registry()
+
+        assert_true("missing root reported as gc candidate", result["gc_candidates"] and result["gc_candidates"][0]["project_root"] == str(missing.resolve(strict=False)))
+        assert_true("missing root not deleted from registry", before == after)
+
+
+def test_refresh_views_all_contains_hostile_registry_entries_per_entry() -> None:
+    # rC P1: one malformed registry row (e.g. embedded NUL) must degrade to a
+    # reported error row, not abort the sweep before valid projects.
+    with tempfile.TemporaryDirectory(prefix="gf-state-layout-registry-hostile-") as td:
+        base = Path(td)
+        good = base / "good-project"
+        good.mkdir()
+        with _task_store_base(base / "store"):
+            goalflight_setup.scaffold_project_state(ROOT, good, apply=True, today="2026-07-07")
+            index_path = goalflight_task.project_registry_index_path()
+            payload = json.loads(index_path.read_text(encoding="utf-8"))
+            payload["projects"].insert(0, {"project_root": "bad\x00path"})
+            index_path.write_text(json.dumps(payload), encoding="utf-8")
+            before = goalflight_task.read_project_registry()
+            result = goalflight_setup.refresh_managed_views_all(ROOT, dry_run=True)
+            after = goalflight_task.read_project_registry()
+
+        assert_true("hostile entry reported as error row", result["errors"] and result["errors"][0]["project_root"] == "bad\x00path")
+        assert_true("valid project still swept after hostile entry", any(item["project_root"] == str(good.resolve()) for item in result["results"]))
+        assert_true("hostile entry not deleted from registry", before == after)
+
+
+def test_refresh_views_all_table_escapes_control_characters() -> None:
+    # rC P3: control chars in untrusted roots must not break one-row-per-line.
+    with tempfile.TemporaryDirectory(prefix="gf-state-layout-registry-newline-") as td:
+        base = Path(td)
+        missing = base / "line\nbreak"
+        with _task_store_base(base / "store"):
+            goalflight_task.upsert_project_registry(missing, skill_version="1.0.0", now="2026-07-07T00:00:00+00:00")
+            result = goalflight_setup.refresh_managed_views_all(ROOT, dry_run=True)
+        import io
+        from contextlib import redirect_stdout
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            goalflight_setup._print_refresh_views_result(result)
+        lines = buf.getvalue().splitlines()
+        gc_lines = [l for l in lines if "gc-candidate" in l]
+        assert_true("gc row stays on one physical line", len(gc_lines) == 1 and "\\n" in gc_lines[0])
+
+
 def test_scaffold_project_state_preserves_customized_current_managed_view() -> None:
     with tempfile.TemporaryDirectory(prefix="gf-state-layout-view-custom-") as td:
         repo = Path(td)
@@ -387,7 +607,7 @@ def test_scaffold_project_state_preserves_customized_current_managed_view() -> N
         assert_true("customized managed view no backup", result["backup"] is None)
         assert_true(
             "customized managed view manual review message",
-            any("preserve customized current managed view asset" in message for message in result["messages"]),
+            any("preserve customized managed view asset" in message for message in result["messages"]),
         )
 
 
@@ -413,11 +633,8 @@ def test_scaffold_project_state_preserves_foreign_managed_path_file() -> None:
         assert_true("foreign managed path not refreshed", result["refreshed_managed_views"] == [])
         assert_true("foreign managed path no backup", result["backup"] is None)
         assert_true(
-            "foreign managed path manual review message",
-            any(
-                "unrecognized file at managed view path; left for manual review" in message
-                for message in result["messages"]
-            ),
+            "foreign managed path protected by manifest as customization",
+            any("preserve customized managed view asset" in message for message in result["messages"]),
         )
 
 
@@ -605,6 +822,7 @@ def test_doctor_state_layout_reports_managed_view_schema_skew() -> None:
     with tempfile.TemporaryDirectory(prefix="gf-state-layout-view-skew-") as td:
         repo = Path(td)
         goalflight_setup.scaffold_project_state(ROOT, repo, apply=True, today="2026-06-27")
+        goalflight_task.view_manifest_path(repo).unlink()
         repo.joinpath("dashboard/gf.js").write_text("legacy worker-finished done vocabulary\n", encoding="utf-8")
 
         payload = goalflight_doctor.check_project_state_layout(repo, ROOT)
@@ -614,7 +832,7 @@ def test_doctor_state_layout_reports_managed_view_schema_skew() -> None:
         ]
         assert_true("managed view schema skew reported", skew)
         assert_true("managed view skew makes layout warning", payload["ok"] is False)
-        assert_true("refresh path named", "run `/goal-flight init`" in skew[0]["message"])
+        assert_true("refresh path named", "--refresh-views" in skew[0]["message"])
 
 
 def test_doctor_state_layout_reports_customized_view_as_advisory() -> None:
