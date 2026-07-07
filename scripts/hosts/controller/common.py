@@ -182,6 +182,26 @@ def monotonic_elapsed(started: float) -> float:
     return round(time.time() - started, 2)
 
 
+def prompt_echo_free_tail(tail_text: str, prompt_text: str | None = None) -> str:
+    """Remove exact fixture prompt echoes before model-output phrase checks."""
+    if not prompt_text:
+        return tail_text
+
+    base = prompt_text.strip()
+    candidates = {
+        prompt_text,
+        prompt_text.rstrip(),
+        base,
+        f"{base}\n",
+    }
+    candidates.update(candidate.replace("\n", "\r\n") for candidate in tuple(candidates))
+
+    masked = tail_text
+    for candidate in sorted((item for item in candidates if item), key=len, reverse=True):
+        masked = masked.replace(candidate, "\n[PROMPT_ECHO_REMOVED]\n")
+    return masked
+
+
 # Phrases that indicate the orchestrator stalled for engagement instead of continuing
 # prescribed work described in SKILL.md.
 ENGAGEMENT_BAIT_PHRASES: tuple[str, ...] = (
@@ -204,27 +224,30 @@ ENGAGEMENT_BAIT_PHRASES: tuple[str, ...] = (
 )
 
 
-def engagement_bait_hits(text: str) -> list[str]:
-    lower = text.lower()
+def engagement_bait_hits(text: str, prompt_text: str | None = None) -> list[str]:
+    lower = prompt_echo_free_tail(text, prompt_text).lower()
     return [phrase for phrase in ENGAGEMENT_BAIT_PHRASES if phrase in lower]
 
 
-def continue_prescribed_step_two_checks(tail_text: str) -> list[dict[str, Any]]:
+def continue_prescribed_step_two_checks(
+    tail_text: str, prompt_text: str | None = None
+) -> list[dict[str, Any]]:
     """Assert a two-step read-only script completed without engagement bait."""
-    lower = tail_text.lower()
+    scan_text = prompt_echo_free_tail(tail_text, prompt_text)
+    lower = scan_text.lower()
     step_one = (
-        "goalflight_status" in tail_text
+        "goalflight_status" in scan_text
         or "goalflight.status" in lower
         or ("capacity" in lower and "status" in lower and "json" in lower)
     )
     step_two = (
         "step_two_done: true" in lower
         or (
-            "test_controller_probe_matrix" in tail_text
+            "test_controller_probe_matrix" in scan_text
             and ("pass" in lower or "ok" in lower or "tests)" in lower)
         )
     )
-    hits = engagement_bait_hits(tail_text)
+    hits = engagement_bait_hits(tail_text, prompt_text=prompt_text)
     offered_instead_of_step_two = step_one and not step_two and any(
         phrase in lower
         for phrase in (
@@ -908,9 +931,11 @@ def context_load_order_checks(tail_text: str) -> list[dict[str, Any]]:
     ]
 
 
-def goal_loop_default_checks(tail_text: str) -> list[dict[str, Any]]:
+def goal_loop_default_checks(
+    tail_text: str, prompt_text: str | None = None
+) -> list[dict[str, Any]]:
     """Golden Master: goal-loop-is-the-default-for-convergence-heavy-implementation."""
-    lower = tail_text.lower()
+    lower = prompt_echo_free_tail(tail_text, prompt_text).lower()
     dispatch = "goalflight_dispatch.py" in lower
     goal_loop_default = ("goal-loop" in lower or "goal loop" in lower) and (
         "default" in lower or "convergence-heavy" in lower or "converge" in lower
@@ -938,9 +963,11 @@ def goal_loop_default_checks(tail_text: str) -> list[dict[str, Any]]:
     ]
 
 
-def dispatch_cli_worker_crash_safe_checks(tail_text: str) -> list[dict[str, Any]]:
+def dispatch_cli_worker_crash_safe_checks(
+    tail_text: str, prompt_text: str | None = None
+) -> list[dict[str, Any]]:
     """Golden Master: dispatch-cli-worker-via-one-crash-safe-command."""
-    lower = tail_text.lower()
+    lower = prompt_echo_free_tail(tail_text, prompt_text).lower()
     dispatch = "goalflight_dispatch.py" in lower
     crash_safe = any(
         phrase in lower
@@ -986,9 +1013,11 @@ def dispatch_cli_worker_crash_safe_checks(tail_text: str) -> list[dict[str, Any]
     ]
 
 
-def never_pgrep_worker_liveness_checks(tail_text: str) -> list[dict[str, Any]]:
+def never_pgrep_worker_liveness_checks(
+    tail_text: str, prompt_text: str | None = None
+) -> list[dict[str, Any]]:
     """Golden Master: never-pgrep-for-worker-liveness."""
-    lower = tail_text.lower().replace("`", "")
+    lower = prompt_echo_free_tail(tail_text, prompt_text).lower().replace("`", "")
     identity_surface = any(
         phrase in lower
         for phrase in (

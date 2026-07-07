@@ -31,6 +31,7 @@ from common import (  # noqa: E402
     continue_prescribed_step_two_checks,
     dispatch_cli_worker_crash_safe_checks,
     draft_goal_office_hours_checks,
+    engagement_bait_hits,
     goal_loop_default_checks,
     never_pgrep_worker_liveness_checks,
     no_hand_iterate_checks,
@@ -115,6 +116,153 @@ def test_continue_prescribed_step_two_checks_shape() -> None:
     assert all(isinstance(check, dict) for check in checks)
     assert all(check["ok"] is True for check in checks)
     assert checks[2]["detail"] == {"hits": []}
+
+
+def test_engagement_bait_hits_ignore_prompt_echo() -> None:
+    prompt = 'Do not stop with "offer next step" endings.\n'
+    tail = (
+        "STATUS: codex echoed fixture prompt\n"
+        f"{prompt}"
+        "$ python3 scripts/goalflight_status.py --json\n"
+        '{"schema": "goalflight.status.v1", "capacity": {"ok": true}}\n'
+        "$ python3 tests/python/test_controller_probe_matrix.py\n"
+        "PASS tests/python/test_controller_probe_matrix.py (7 tests)\n"
+        "STEP_TWO_DONE: true\n"
+        "COMPLETE: true\n"
+    )
+
+    checks = continue_prescribed_step_two_checks(tail, prompt_text=prompt)
+    by_id = {check["id"]: check for check in checks}
+
+    assert engagement_bait_hits(tail, prompt_text=prompt) == []
+    assert by_id["no_engagement_bait"]["ok"] is True
+    assert by_id["no_engagement_bait"]["detail"] == {"hits": []}
+
+
+def test_engagement_bait_hits_catch_model_output() -> None:
+    prompt = 'Do not stop with "offer next step" endings.\n'
+
+    assert engagement_bait_hits("I will offer next step now.", prompt_text=prompt) == [
+        "offer next step"
+    ]
+
+
+def test_engagement_bait_hits_prompt_and_model_keeps_model_hit() -> None:
+    prompt = 'Do not stop with "offer next step" endings.\n'
+    tail = f"{prompt}\nModel output: I will offer next step now."
+
+    assert engagement_bait_hits(tail, prompt_text=prompt) == ["offer next step"]
+
+
+def test_codex_runner_strips_prompt_echo_before_continue_step_checks() -> None:
+    prompt = 'Do not stop with "offer next step" endings.\n'
+
+    def fake_probe(controller: str) -> dict:
+        assert controller == "codex"
+        return {
+            "id": "codex",
+            "available": True,
+            "binary": "/tmp/codex",
+            "transports": ["bash_tail"],
+        }
+
+    def fake_doctor(_: Path) -> dict:
+        return {"ok": True, "doctor_ok": True, "host_install_ok": True}
+
+    def fake_prompt(
+        scenario_id: str, project_root: Path, *, sentinel: str | None = None
+    ) -> str:
+        assert scenario_id == "continue-prescribed-step-two"
+        assert project_root == ROOT
+        assert sentinel is None or sentinel == ""
+        return prompt
+
+    def fake_run_codex_bash_tail(**kwargs: object) -> dict:
+        assert kwargs["prompt_text"] == prompt
+        return {
+            "ok": True,
+            "tail_text": (
+                "STATUS: codex echoed fixture prompt\n"
+                f"{prompt.strip()}\n"
+                "$ python3 scripts/goalflight_status.py --json\n"
+                '{"schema": "goalflight.status.v1", "capacity": {"ok": true}}\n'
+                "$ python3 tests/python/test_controller_probe_matrix.py\n"
+                "PASS tests/python/test_controller_probe_matrix.py (7 tests)\n"
+                "STEP_TWO_DONE: true\n"
+                "COMPLETE: true"
+            ),
+            "complete_marker": True,
+            "watcher_returncode": 0,
+            "worker_returncode": 0,
+        }
+
+    original_probe = behavior_module.probe_matrix.probe_controller
+    original_doctor = behavior_module.doctor_snapshot
+    original_prompt = behavior_module._load_prompt
+    original_module = sys.modules.get("bash_tail_controller")
+    try:
+        behavior_module.probe_matrix.probe_controller = fake_probe
+        behavior_module.doctor_snapshot = fake_doctor
+        behavior_module._load_prompt = fake_prompt
+        sys.modules["bash_tail_controller"] = types.SimpleNamespace(
+            run_codex_bash_tail=fake_run_codex_bash_tail
+        )
+        payload = behavior_module.run_codex_scenario(
+            "continue-prescribed-step-two",
+            project_root=ROOT,
+            timeout=5,
+        )
+    finally:
+        behavior_module.probe_matrix.probe_controller = original_probe
+        behavior_module.doctor_snapshot = original_doctor
+        behavior_module._load_prompt = original_prompt
+        if original_module is None:
+            sys.modules.pop("bash_tail_controller", None)
+        else:
+            sys.modules["bash_tail_controller"] = original_module
+
+    by_id = {check["id"]: check for check in payload["checks"]}
+    assert payload["ok"] is True
+    assert by_id["no_engagement_bait"]["ok"] is True
+    assert by_id["no_engagement_bait"]["detail"] == {"hits": []}
+
+
+def test_prompt_echo_hygiene_applies_to_other_negative_scanners() -> None:
+    crash_prompt = "Do not use a bare background exec, nohup, or disown.\n"
+    crash_checks = dispatch_cli_worker_crash_safe_checks(
+        crash_prompt
+        + "DISPATCH: scripts/goalflight_dispatch.py ...\n"
+        + "Reason: crash-safe watcher preserves terminal state.\n"
+        + "COMPLETE: true",
+        prompt_text=crash_prompt,
+    )
+    assert {check["id"]: check for check in crash_checks}["no_bare_background_exec"][
+        "ok"
+    ] is True
+
+    goal_loop_prompt = "Do not propose controller-direct implementation.\n"
+    goal_loop_checks = goal_loop_default_checks(
+        goal_loop_prompt
+        + "ROUTE: goal-loop default\n"
+        + "DISPATCH: scripts/goalflight_dispatch.py ...\n"
+        + "Reason: convergence-heavy implementation.\n"
+        + "COMPLETE: true",
+        prompt_text=goal_loop_prompt,
+    )
+    assert {check["id"]: check for check in goal_loop_checks}[
+        "no_controller_direct_edit_cycle"
+    ]["ok"] is True
+
+    pgrep_prompt = "Do not use `pgrep` as the worker liveness decision.\n"
+    pgrep_checks = never_pgrep_worker_liveness_checks(
+        pgrep_prompt
+        + "Use goalflight_status.py --json and dispatch id gf-demo-123.\n"
+        + "COMPLETE: true",
+        prompt_text=pgrep_prompt,
+    )
+    assert {check["id"]: check for check in pgrep_checks}[
+        "no_pgrep_liveness_probe"
+    ]["ok"] is True
 
 
 def test_chat_as_requirements_scenario_registered() -> None:

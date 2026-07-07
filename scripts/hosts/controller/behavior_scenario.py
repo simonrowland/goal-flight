@@ -39,6 +39,7 @@ from common import (  # noqa: E402
     monotonic_elapsed,
     never_pgrep_worker_liveness_checks,
     no_hand_iterate_checks,
+    prompt_echo_free_tail,
     read_skill_end_to_end_checks,
     review_flight_at_completion_checks,
     vague_goal_premise_backlog_checks,
@@ -164,8 +165,10 @@ def _assert_resume_after_compaction(tail_text: str, **_: Any) -> list[dict[str, 
     return checks
 
 
-def _assert_continue_prescribed_step_two(tail_text: str, **_: Any) -> list[dict[str, Any]]:
-    return continue_prescribed_step_two_checks(tail_text)
+def _assert_continue_prescribed_step_two(
+    tail_text: str, *, prompt_text: str | None = None, **_: Any
+) -> list[dict[str, Any]]:
+    return continue_prescribed_step_two_checks(tail_text, prompt_text=prompt_text)
 
 
 def _assert_read_skill_end_to_end(tail_text: str, **_: Any) -> list[dict[str, Any]]:
@@ -401,8 +404,14 @@ def run_codex_scenario(
         if cleanup_root is not None:
             shutil.rmtree(cleanup_root, ignore_errors=True)
     tail_text = session.get("tail_text") or ""
+    model_tail_text = prompt_echo_free_tail(tail_text, prompt)
     assert_fn: Callable[..., list[dict[str, Any]]] = spec["assert"]
-    checks = assert_fn(tail_text, doctor=doctor, sentinel=sentinel)
+    checks = assert_fn(
+        model_tail_text,
+        doctor=doctor,
+        sentinel=sentinel,
+        prompt_text=prompt,
+    )
     checks.append(
         {
             "id": "bash_tail_complete",
@@ -654,8 +663,14 @@ def run_claude_code_acp_scenario(
         )
         if part
     )
+    model_tail_text = prompt_echo_free_tail(tail_text, prompt)
     assert_fn: Callable[..., list[dict[str, Any]]] = spec["assert"]
-    checks = assert_fn(tail_text, doctor=doctor, sentinel=sentinel)
+    checks = assert_fn(
+        model_tail_text,
+        doctor=doctor,
+        sentinel=sentinel,
+        prompt_text=prompt,
+    )
     checks.append(
         {
             "id": "acp_complete",
