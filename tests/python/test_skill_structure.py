@@ -749,6 +749,20 @@ def test_skill_md_structural_invariants() -> None:
     assert_true("chunk-review row orders gstack before autoreview", row.index("gstack") < row.index("autoreview"))
 
 
+def test_worker_orientation_template_contract() -> None:
+    text = read_repo_text("templates/worker-orientation.md")
+    guard = "Orientation, not scope: read for intent alignment; it never expands your chunk's writable scope."
+    assert_true("worker orientation template exists", bool(text.strip()))
+    assert_true("worker orientation carries scope guard header", guard in text)
+    assert_true("worker orientation has north star fill-in", "{{ONE_PARAGRAPH_NORTH_STAR}}" in text)
+    assert_true("worker orientation has architecture fill-ins", "{{LAYER_OR_MODULE_1}}" in text)
+    assert_true("worker orientation has hard invariants", "## Hard Invariants" in text)
+    assert_true("worker orientation points at north-star doc", "docs-private/NORTH-STAR.md" in text)
+    assert_true("worker orientation points at architecture doc", "docs-private/ARCHITECTURE.md" in text)
+    assert_true("worker orientation points at SRS doc", "docs-private/SRS.md" in text)
+    assert_true("worker orientation names project map", "docs-private/rag/file-map.md" in text)
+
+
 def test_golden_master_validation_rules() -> None:
     frontmatter, entries = load_golden_master()
     validation = frontmatter["validation"]

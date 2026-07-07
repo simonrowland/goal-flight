@@ -216,10 +216,18 @@ Do not paste full probe output.
 - root `SKILL.md` tracked or intentionally absent
 - current branch/head/dirty state recorded in resume notes
 
-9. Optional corpus:
+9. Worker orientation + optional corpus:
 
-If the repo is large and the user wants reusable dispatch context, run
-`/goal-flight build-corpus`. Do not run corpus construction by default during
+Instantiate `docs-private/rag/ORIENTATION.md` from
+`templates/worker-orientation.md` plus the project's `docs-private/NORTH-STAR.md`,
+`docs-private/ARCHITECTURE.md`, `docs-private/SRS.md`, and project map. This is
+the first-class per-project orientation artifact; dispatch tooling points
+substantive workers at it automatically, and it never expands a chunk's writable
+scope.
+
+If the repo is large and the user wants the broader reusable dispatch corpus,
+continue with `/goal-flight build-corpus` so the orientation sits beside the
+other `docs-private/rag/` slices. Do not build the full corpus by default during
 init.
 
 10. Self-review:

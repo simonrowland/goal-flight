@@ -116,6 +116,9 @@ file path survives summarization and supports a standing re-read instruction
 (`$GOALFLIGHT_PROMPT_FILE`; `protocols/worker-context-package.md` §Pin durability). Likely-long chunks
 default to the goal-loop shape so tests-green + review convergence — not the
 worker's memory of the prompt — is the exit condition.
+Per-project orientation rides as an auto-injected pointer when
+`docs-private/rag/ORIENTATION.md` exists; see
+`protocols/worker-context-package.md` §Canned orientation.
 
 ### Background by default; don't block the controller
 

@@ -4,7 +4,9 @@ description: "Build or refresh the private dispatch-context corpus."
 
 # build-corpus [--slice <name>] [--next-wave [<N>]] [--all] [--rebuild]
 
-Build, extend, or rebuild the `docs-private/rag/` corpus after `init` step 3.5 has already created it. Same 4-pass pipeline; invocation outside init.
+Build, extend, or rebuild the `docs-private/rag/` corpus after `init` step 9 has
+created `docs-private/rag/ORIENTATION.md`. Same 4-pass pipeline; invocation
+outside init.
 
 ## Modes
 
@@ -16,11 +18,17 @@ Build, extend, or rebuild the `docs-private/rag/` corpus after `init` step 3.5 h
 | `--all` | Full rebuild — re-run all slices from scratch |
 | `--rebuild` | Re-run every existing slice but don't add new ones |
 
-## 4-pass pipeline (same shape as init step 3.5)
+## 4-pass pipeline
 
-Schema reference: `templates/rag-corpus-schema.md.tpl` (directory shape + per-slice word budgets + `verified-at: <commit-SHA>` frontmatter convention).
+Schema reference: `templates/rag-corpus-schema.md.tpl` (directory shape + per-slice word budgets + `verified-at: <commit-SHA>` frontmatter convention). Orientation reference: `templates/worker-orientation.md` writes the canonical `docs-private/rag/ORIENTATION.md` brief.
 
-**Pass 1 — slice builders (parallel workers via the orchestrator's host `delegate` mechanism).** For each target slice, dispatch a builder through a ready adapter. Brief: read the slice's source materials (paths come from the source-list table in `commands/init.md` step 3.5), produce a slice file at the schema-defined path with frontmatter `verified-at: <current-HEAD-SHA>`. Builder OVERWRITES for `--all` / `--rebuild`; WRITES new for `--slice` / `--next-wave`. No prompt-template file needed — the slice schema + source-list + verification-first principle are sufficient brief.
+**Pass 0 — orientation refresh (orchestrator inline).** Rebuild
+`docs-private/rag/ORIENTATION.md` from `templates/worker-orientation.md` and the
+project's north-star, architecture, SRS, and project-map docs before dispatching
+slice builders. Keep it pointer-heavy and scoped: orientation only, never scope
+expansion.
+
+**Pass 1 — slice builders (parallel workers via the orchestrator's host `delegate` mechanism).** For each target slice, dispatch a builder through a ready adapter. Brief: read the slice's source materials (the orchestrator names the project docs each slice distills — north star, architecture, SRS, protocol/spec files — when it picks the slice), produce a slice file at the schema-defined path with frontmatter `verified-at: <current-HEAD-SHA>`. Builder OVERWRITES for `--all` / `--rebuild`; WRITES new for `--slice` / `--next-wave`. No prompt-template file needed — the slice schema + source-list + verification-first principle are sufficient brief.
 
 **Pass 2 — per-slice reviewers (parallel workers via the orchestrator's host `delegate` mechanism).** Each reviewer scores its slice 1–5 per rubric (Factual / Complete / Voice / Dispatch-ready) and surfaces P0/P1/P2 findings. Block Pass 3+4 until P0+P1 patched.
 
@@ -37,13 +45,14 @@ Schema reference: `templates/rag-corpus-schema.md.tpl` (directory shape + per-sl
 
 ## What this command does NOT do
 
-- Modify the skill itself. If the slice schema needs to change, the user edits `templates/rag-corpus-schema.md.tpl` + the source-list table in `commands/init.md` step 3.5 — separate work.
+- Modify the skill itself. If the slice schema needs to change, the user edits `templates/rag-corpus-schema.md.tpl` — separate work.
 - Delete slices. Obsolete slices are removed manually.
 - Dispatch `/goal` work that USES the corpus. That's `/goal-flight execute`.
 
 ## When NOT to invoke
 
-- Right after `init` — init step 3.5 already built the first-wave corpus.
+- Right after `init` when only orientation is needed — init step 9 already wrote
+  `docs-private/rag/ORIENTATION.md`.
 - When source documents haven't drifted and the corpus has no known gaps. Milestone drift review (`commands/execute.md` step 4) catches incidental drift; explicit rebuild is the heavier intervention.
 
 ## Cost

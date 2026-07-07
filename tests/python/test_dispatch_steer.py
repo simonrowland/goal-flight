@@ -322,6 +322,33 @@ def _run_prompt_env_case(tmp: Path, dispatch_id: str, prompt_args: list[str], se
     return seen_path.read_text(encoding="utf-8")
 
 
+def _run_git(repo: Path, *args: str) -> None:
+    subprocess.run(
+        ["git", "-C", str(repo), *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=True,
+    )
+
+
+def _repo_with_orientation(tmp: Path) -> tuple[Path, Path, Path]:
+    repo = tmp / "repo"
+    worktree = tmp / "linked-worktree"
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+    _run_git(repo, "config", "user.email", "goalflight@example.test")
+    _run_git(repo, "config", "user.name", "Goal Flight Test")
+    repo.joinpath("README.md").write_text("fixture\n", encoding="utf-8")
+    _run_git(repo, "add", "README.md")
+    _run_git(repo, "commit", "-m", "fixture")
+    orientation = repo / "docs-private" / "rag" / "ORIENTATION.md"
+    orientation.parent.mkdir(parents=True)
+    orientation.write_text("fixture orientation\n", encoding="utf-8")
+    _run_git(repo, "worktree", "add", "--detach", str(worktree), "HEAD")
+    return repo, worktree, orientation
+
+
 def case_inline_prompt_exports_original_prompt_file() -> None:
     if skip_case_posix_on_native_windows(
         "case_inline_prompt_exports_original_prompt_file",
@@ -401,10 +428,19 @@ def case_prompt_preamble_is_materialized() -> None:
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
         body = tmp / "body.md"
-        body.write_text("Do work.\nCOMPLETE: done\n", encoding="utf-8")
+        body_text = "Do work.\nCOMPLETE: done\n"
+        body.write_text(body_text, encoding="utf-8")
         assembled = Path(goalflight_dispatch._materialize_steer_prompt(str(body), tmp / "dispatch", "prompt-case"))
         text = assembled.read_text(encoding="utf-8")
+        expected = (
+            goalflight_dispatch.STEER_PROMPT_PREAMBLE
+            + "\n\n"
+            + goalflight_dispatch.PROMPT_FILE_PREAMBLE
+            + "\n\n"
+            + body_text
+        )
 
+        assert text == expected, text
         assert text.startswith(goalflight_dispatch.STEER_PROMPT_PREAMBLE + "\n\n"), text
         assert "`STEER-ACK: <seq>`" in text, text
         assert "$GOALFLIGHT_PROMPT_FILE" in text, text
@@ -412,6 +448,64 @@ def case_prompt_preamble_is_materialized() -> None:
         assert "disk file is authoritative" in text, text
         assert "COMPLETE: done" in text, text
         assert assembled.name == "prompt-case.assembled.prompt", assembled
+
+
+def case_orientation_preamble_is_materialized_when_present() -> None:
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        repo, _worktree, orientation = _repo_with_orientation(tmp)
+        body = tmp / "body.md"
+        body.write_text("Decide and implement.\n", encoding="utf-8")
+        orientation_path = goalflight_dispatch._project_orientation_path(repo)
+        assert orientation_path == orientation.resolve(), orientation_path
+
+        assembled = Path(
+            goalflight_dispatch._materialize_steer_prompt(
+                str(body),
+                tmp / "dispatch",
+                "orientation-case",
+                agent="codex",
+                orientation_path=orientation_path,
+            )
+        )
+        text = assembled.read_text(encoding="utf-8")
+
+        assert "PROJECT ORIENTATION\n" in text, text
+        assert f"Path: {orientation.resolve()}" in text, text
+        assert goalflight_dispatch.PROJECT_ORIENTATION_SCOPE_RULE in text, text
+        assert "Decide and implement." in text, text
+
+
+def case_no_orientation_suppresses_orientation_path() -> None:
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        repo, _worktree, _orientation = _repo_with_orientation(tmp)
+        assert goalflight_dispatch._project_orientation_path(repo, disabled=True) is None
+
+
+def case_orientation_path_resolves_linked_worktree_to_main_root() -> None:
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        _repo, worktree, orientation = _repo_with_orientation(tmp)
+        resolved = goalflight_dispatch._project_orientation_path(worktree)
+        assert resolved == orientation.resolve(), resolved
+
+
+def case_orientation_path_resolves_from_repo_subdirectory() -> None:
+    # rE P1: git emits a RELATIVE --git-common-dir from the command cwd, so a
+    # dispatch cwd nested inside the checkout must still resolve the repo root
+    # (resolving the relative form against toplevel walked out of the tree).
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        repo, worktree, orientation = _repo_with_orientation(tmp)
+        subdir = repo / "nested" / "leaf"
+        subdir.mkdir(parents=True)
+        resolved = goalflight_dispatch._project_orientation_path(subdir)
+        assert resolved == orientation.resolve(), resolved
+        wt_subdir = worktree / "nested" / "leaf"
+        wt_subdir.mkdir(parents=True)
+        wt_resolved = goalflight_dispatch._project_orientation_path(wt_subdir)
+        assert wt_resolved == orientation.resolve(), wt_resolved
 
 
 def case_grok_prompt_adds_execution_and_terminal_contract() -> None:
@@ -496,6 +590,10 @@ def main() -> None:
     case_prompt_file_exports_given_path()
     case_relative_prompt_file_exports_resolved_absolute_path()
     case_prompt_preamble_is_materialized()
+    case_orientation_preamble_is_materialized_when_present()
+    case_no_orientation_suppresses_orientation_path()
+    case_orientation_path_resolves_linked_worktree_to_main_root()
+    case_orientation_path_resolves_from_repo_subdirectory()
     case_grok_prompt_adds_execution_and_terminal_contract()
     case_codex_prompt_does_not_add_grok_contract()
     case_preamble_routing_matrix()

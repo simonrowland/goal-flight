@@ -6,6 +6,10 @@ incremented when meaningful skill behaviour changes.
 
 ## [Unreleased]
 
+- Added first-class per-project worker orientation: a canonical
+  `templates/worker-orientation.md`, `docs-private/rag/ORIENTATION.md` upkeep
+  guidance, and dispatch prompt auto-pointers with `--no-orientation` opt-out.
+
 ## [1.2.2] — 2026-07-07
 
 ### Added

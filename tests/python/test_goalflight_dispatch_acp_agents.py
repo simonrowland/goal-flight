@@ -92,6 +92,34 @@ def case_build_acp_cfg_agent_liveness_defaults() -> None:
         assert cfg.capacity_wait_s == 12.5
 
 
+def case_build_acp_cfg_injects_orientation_prompt_text() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        prompt = tmp / "prompt.md"
+        prompt.write_text("Do ACP work.\n", encoding="utf-8")
+        orientation = tmp / "docs-private" / "rag" / "ORIENTATION.md"
+        orientation.parent.mkdir(parents=True)
+        orientation.write_text("project orientation\n", encoding="utf-8")
+
+        args = _base_acp_args(tmp, agent="codex-acp", dispatch_id="orientation-acp")
+        args.prompt = None
+        args.prompt_file = str(prompt)
+        cfg = dispatch_mod._build_acp_cfg(args, status_json=tmp / "orientation.json")
+
+        assert cfg.prompt is None
+        assert cfg.original_prompt_file == str(prompt.resolve())
+        assert "PROJECT ORIENTATION\n" in cfg.prompt_text
+        assert f"Path: {orientation.resolve()}" in cfg.prompt_text
+        assert dispatch_mod.PROJECT_ORIENTATION_SCOPE_RULE in cfg.prompt_text
+        assert "Do ACP work." in cfg.prompt_text
+
+        args.no_orientation = True
+        suppressed = dispatch_mod._build_acp_cfg(args, status_json=tmp / "suppressed.json")
+        assert suppressed.prompt == str(prompt.resolve())
+        assert suppressed.prompt_text is None
+        assert suppressed.original_prompt_file == str(prompt.resolve())
+
+
 def _capacity_env(state_dir: Path, **extra: str) -> dict[str, str]:
     env = os.environ.copy()
     env["GOALFLIGHT_STATE_DIR"] = str(state_dir)
@@ -495,6 +523,7 @@ def case_subscription_env_scrub_for_cursor_and_claude_acp() -> None:
 def main() -> None:
     case_normalize_acp_agents()
     case_build_acp_cfg_agent_liveness_defaults()
+    case_build_acp_cfg_injects_orientation_prompt_text()
     case_acp_capacity_wait_queues_until_slot_frees()
     case_acp_capacity_wait_deadline_blocks()
     case_acp_capacity_wait_zero_single_shot()

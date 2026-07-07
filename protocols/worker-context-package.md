@@ -14,6 +14,20 @@ generalizes — was pinning a per-lane context package into every dispatch.
 path", "the ingest schema"). Pinning is per-lane, not per-project: most lanes need
 nothing beyond the standard five-layer briefing.
 
+## Canned orientation
+
+`docs-private/rag/ORIENTATION.md` is the per-project orientation brief, generated
+from `templates/worker-orientation.md` during init and refreshed by
+`/goal-flight build-corpus`. It carries the north star, architecture shape, hard
+invariants, and pointers to deeper docs. Dispatch auto-injects only a pointer to
+the absolute path, with the standing rule: orientation only, never scope
+expansion.
+
+Judgment-bearing chunks need this grounding before they decide tradeoffs or
+design details. Mechanical chunks can ride the same auto-pointer harmlessly. This
+artifact does not replace lane packages: triggered lanes still require the
+verbatim pinned brief/spec/test package below.
+
 ## Triggering signals — when a lane needs a package
 
 The controller MUST evaluate these at `init`, at `decompose-plan`, and again before

@@ -273,6 +273,8 @@ PROMPT_FILE_PREAMBLE = (
     "iteration, and before final commit/exit; the disk file is authoritative over "
     "summarized memory."
 )
+PROJECT_ORIENTATION_RELATIVE = Path("docs-private") / "rag" / "ORIENTATION.md"
+PROJECT_ORIENTATION_SCOPE_RULE = "Read it before starting; orientation only, never scope expansion."
 GROK_EXECUTION_PREAMBLE = (
     "Grok worker execution contract:\n"
     "- Use your available tools to actually perform the requested filesystem, shell, "
@@ -673,6 +675,53 @@ def _resolve_prompt_file(args, base: Path) -> str | None:
         pf.write_text(args.prompt, encoding="utf-8")
         return str(pf)
     return None
+
+
+def _main_repo_root_for_orientation(project_root: Path) -> Path:
+    root = project_root.expanduser().resolve(strict=False)
+    try:
+        top_raw = subprocess.check_output(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=str(root),
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+        common_raw = subprocess.check_output(
+            ["git", "rev-parse", "--git-common-dir"],
+            cwd=str(root),
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return root
+    top = Path(top_raw).expanduser()
+    common = Path(common_raw).expanduser()
+    if not common.is_absolute():
+        # git emits --git-common-dir relative to the COMMAND CWD, not the
+        # toplevel; resolving against top sends a subdirectory dispatch to the
+        # wrong tree entirely (rE P1).
+        common = root / common
+    common = common.resolve(strict=False)
+    if common.name == ".git":
+        return common.parent
+    return top.resolve(strict=False)
+
+
+def _project_orientation_path(project_root: Path, *, disabled: bool = False) -> Path | None:
+    if disabled:
+        return None
+    path = _main_repo_root_for_orientation(project_root) / PROJECT_ORIENTATION_RELATIVE
+    if not path.is_file():
+        return None
+    return path.resolve(strict=False)
+
+
+def _project_orientation_preamble(orientation_path: Path) -> str:
+    return (
+        "PROJECT ORIENTATION\n"
+        f"Path: {orientation_path}\n"
+        f"{PROJECT_ORIENTATION_SCOPE_RULE}"
+    )
 
 
 def _project_root(args) -> Path:
@@ -1539,8 +1588,10 @@ def _cmd_steer(argv: list[str]) -> int:
     return 0
 
 
-def _worker_prompt_preamble(agent: str | None) -> str:
+def _worker_prompt_preamble(agent: str | None, *, orientation_path: Path | None = None) -> str:
     preambles = [STEER_PROMPT_PREAMBLE, PROMPT_FILE_PREAMBLE]
+    if orientation_path is not None:
+        preambles.append(_project_orientation_preamble(orientation_path))
     if agent in {"grok-code", "grok-research"}:
         preambles.append(GROK_EXECUTION_PREAMBLE)
     return "\n\n".join(preambles)
@@ -1552,12 +1603,13 @@ def _materialize_steer_prompt(
     dispatch_id: str,
     *,
     agent: str | None = None,
+    orientation_path: Path | None = None,
 ) -> str | None:
     if not prompt_path:
         return None
     body_path = Path(prompt_path)
     body = body_path.read_text(encoding="utf-8", errors="replace")
-    full_prompt = f"{_worker_prompt_preamble(agent)}\n\n{body}"
+    full_prompt = f"{_worker_prompt_preamble(agent, orientation_path=orientation_path)}\n\n{body}"
     assembled = base / f"{dispatch_id}.assembled.prompt"
     assembled.parent.mkdir(parents=True, exist_ok=True)
     assembled.write_text(full_prompt, encoding="utf-8")
@@ -1986,6 +2038,8 @@ def _canonical_replay_argv(args, raw_argv: list[str], *, tail: Path, status_json
         argv.append("--web-research-ok")
     if args.ignore_git_warn:
         argv.append("--ignore-git-warn")
+    if getattr(args, "no_orientation", False):
+        argv.append("--no-orientation")
     if args.capacity_wait_s is not None:
         argv += ["--capacity-wait-s", str(args.capacity_wait_s)]
     if args.account:
@@ -2166,6 +2220,7 @@ def _submit_dispatch(args, raw_argv: list[str], *, base: Path) -> int:
             "poll_secs": args.poll_secs,
             "max_idle_secs": args.max_idle_secs,
             "permission_mode": args.permission_mode,
+            "no_orientation": bool(getattr(args, "no_orientation", False)),
             "raw_worker": raw_argv,
         },
     }
@@ -3386,6 +3441,16 @@ def _build_acp_cfg(args, *, status_json: Path, base: Path | None = None):
 
     project_root = _project_root(args)
     prompt_path = _resolve_prompt_file(args, base or _dispatch_base_dir())
+    orientation_path = _project_orientation_path(
+        project_root,
+        disabled=bool(getattr(args, "no_orientation", False)),
+    )
+    acp_prompt_path = prompt_path
+    acp_prompt_text = None if prompt_path else args.prompt
+    if orientation_path is not None and prompt_path:
+        body = Path(prompt_path).read_text(encoding="utf-8", errors="replace")
+        acp_prompt_path = None
+        acp_prompt_text = f"{_project_orientation_preamble(orientation_path)}\n\n{body}"
     os_sandbox = "read-only" if args.read_only and goalflight_compat.is_macos() else OS_SANDBOX_OFF
     liveness_profile = "remote_api" if args.agent in {"cursor", "claude"} else None
     cfg = argparse.Namespace(
@@ -3400,8 +3465,8 @@ def _build_acp_cfg(args, *, status_json: Path, base: Path | None = None):
         priority=getattr(args, "priority", "normal"),
         capacity_wait_s=getattr(args, "capacity_wait_s", None),
         prompt_id=None,
-        prompt=prompt_path,
-        prompt_text=None if prompt_path else args.prompt,
+        prompt=acp_prompt_path,
+        prompt_text=acp_prompt_text,
         prompt_b64=None,
         original_prompt_file=prompt_path,
         mode="one-shot",
@@ -3933,6 +3998,8 @@ def main(argv: list[str] | None = None) -> int:
                              "--agent grok-research, whose model can actually drive web tools).")
     parser.add_argument("--ignore-git-warn", action="store_true",
                         help="Suppress advisory git-base-pin warnings for git-repo cwd prompts.")
+    parser.add_argument("--no-orientation", action="store_true",
+                        help="Do not auto-add the docs-private/rag/ORIENTATION.md pointer preamble.")
     parser.add_argument("--capacity-wait-s", type=float, default=None,
                         help="How long to QUEUE for a capacity slot before DISPATCH-BLOCKED "
                              "(re-attempts acquire every ~15s; sleep-excluding clock). Default by "
@@ -4120,8 +4187,18 @@ def main(argv: list[str] | None = None) -> int:
     steer_file = _steer_file(args.dispatch_id)
     prompt_path = None if raw else _resolve_prompt_file(args, base)
     original_prompt_path = prompt_path
+    orientation_path = None if raw else _project_orientation_path(
+        _project_root(args),
+        disabled=bool(getattr(args, "no_orientation", False)),
+    )
     if prompt_path:
-        prompt_path = _materialize_steer_prompt(prompt_path, base, args.dispatch_id, agent=args.agent)
+        prompt_path = _materialize_steer_prompt(
+            prompt_path,
+            base,
+            args.dispatch_id,
+            agent=args.agent,
+            orientation_path=orientation_path,
+        )
     worker_argv, stdin_path = build_worker(args, prompt_path, raw)
     if not worker_argv:
         print("goalflight_dispatch: no worker — use `--agent codex --prompt-file X [--cwd .]` "
