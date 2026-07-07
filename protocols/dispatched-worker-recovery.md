@@ -184,6 +184,64 @@ opening a known path by name forces a fresh fetch; enumeration can read stale.
   verify*, not a death: reconcile from the `READY:` marker + `--verify-artifacts`
   + the reconciled `status.json`.
 
+## Worker death with tail bytes present (tail harvest)
+
+`worker_dead_no_terminal_marker` is a liveness verdict, not a work verdict.
+Tail-bytes-present does **not** mean lost work. It can be a false negative for
+completed work because live watching accepts a terminal marker only as the last
+non-empty tail line (`scripts/goalflight_watch.py` `_last_line_is_terminal_marker`),
+while dead/stale reconciliation scans the completed tail and promotes the last
+valid terminal marker from anywhere (`_final_terminal_marker`;
+`goalflight_status.py` `_reconcile_output_tail_record`). Source anchors:
+`scripts/goalflight_watch.py:547-555`, `scripts/goalflight_watch.py:646-655`,
+`scripts/goalflight_status.py:421-487`.
+
+Classification for a dispatch reported dead:
+
+| Tail | Terminal marker anywhere in completed tail | Claimed artifacts after direct open | Verdict |
+|---|---|---|---|
+| Empty or missing | No | Absent | No harvest. Verify status JSON + ledger, then redispatch after fixing the launch cause. |
+| Empty or missing | No | Present | Artifact-only recovery. Check current git first, then accept-and-close or document the inconsistency. |
+| Empty or missing | Yes | Absent | Inconsistent evidence. Re-open `tail_path` by name and re-read status JSON before acting. |
+| Empty or missing | Yes | Present | Inconsistent but recoverable. Re-open tail/status by name, then accept only if artifacts/git prove the work. |
+| Bytes present | Yes | Absent | Tail harvest. Reconcile marker, harvest tail findings, check current git, then salvage or redispatch with quoted progress. |
+| Bytes present | Yes | Present | Strong recovery. Reconcile marker, verify artifacts, check current git, then accept-and-close. |
+| Bytes present | No | Present | Artifact harvest. Open claimed paths directly; `docs-private/` is gitignored, so git is blind to private findings. |
+| Bytes present | No | Absent | Partial harvest. Read the tail for progress/findings, then salvage notes or redispatch with quoted progress. |
+
+Harvest procedure:
+
+1. Read the status JSON named by the dispatch row. Record `state`, `reason`,
+   `worker_pid`, `worker_identity`, `tail_path`, `status_path`,
+   `terminal_marker`, and any artifact/finding path claims.
+2. Open the tail directly by `tail_path`. Do not infer absence from
+   `ls`/`find`/`git status`/`grep`.
+3. If the tail has bytes and the worker is dead/stale, scan for the last valid
+   terminal marker anywhere in the completed tail. Use
+   `goalflight_status.py --verify-artifacts <id>` when marker paths are present,
+   or mirror its rule: extract exact paths and open each by name.
+4. Check every claimed artifact path on the filesystem. `docs-private/` is
+   gitignored; git cannot prove those findings exist or are absent.
+5. Check current git state **before** salvaging or redispatching: `git status
+   --short`, `git log --oneline -- <scope-files>`, and a focused diff/log
+   against the chunk's files. A later pass may already have committed or merged
+   the work.
+6. Choose one outcome:
+   - **accept-and-close** when terminal marker/artifacts exist and current git
+     or private findings already contain the work.
+   - **salvage partial** when the tail contains useful analysis but no complete
+     deliverable. Copy harvested findings into the chunk's research dir, with
+     dispatch id + tail path.
+   - **redispatch** when no usable artifact exists. Quote the tail's last known
+     progress and the failed state so the next worker does not restart blind.
+
+Suspect the death report itself when the evidence is PID/`comm` only, one stale
+field, or a controller-session rollover. Reconcile the full set before acting:
+pid+start-time identity, status JSON, ledger, tail marker, output mtime, and
+dirty tree. This is the `SKILL.md` gotcha: "False worker death" says not to
+discard work on PID/`comm`/one stale field and names the same evidence bundle
+(the "False worker death" entry in `SKILL.md` Gotchas).
+
 ## Worker bypass anti-pattern
 
 Distinct from the recovery cases above. Here the worker SHOULD have stopped

@@ -5,6 +5,7 @@
 Long-lived in-session drain loops die with the controlling session. That is the
 D007/D008 worker-death family: a controller exits, the host reaper tears down
 the loop, and queued dispatch rows stop launching.
+For dead-worker rows that already have tail bytes, run `protocols/dispatched-worker-recovery.md` §"Worker death with tail bytes present (tail harvest)" before treating the work as lost.
 
 `com.goalflight.drain` avoids that failure mode. Launchd starts a fresh short
 `goalflight_dispatch.py drain --json` pass every 60 seconds, outside any Claude,
