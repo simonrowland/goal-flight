@@ -6,6 +6,8 @@ incremented when meaningful skill behaviour changes.
 
 ## [Unreleased]
 
+- ACP workers now receive `GOALFLIGHT_PROMPT_FILE` plus the prompt re-read preamble.
+
 ## [1.2.1] — 2026-07-07
 
 ### Changed

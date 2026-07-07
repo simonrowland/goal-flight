@@ -64,6 +64,7 @@ AGENT_STDERR_CAPTURE_BYTES = 64 * 1024
 AGENT_STDERR_ERROR_TAIL_CHARS = 1000
 LIVENESS_PROFILES = {"remote_api", "local_compute", "hybrid"}
 STEER_FILE_ALLOW_ENV = "GOALFLIGHT_ALLOW_EXTERNAL_STEER_FILE"
+PROMPT_FILE_ENV = "GOALFLIGHT_PROMPT_FILE"
 USER_CONFIRM_MARKER = "USER-CONFIRM"
 ACTIONABLE_BLOCKING_TERMINAL_MARKERS = BLOCKING_TERMINAL_MARKERS - {
     USER_CONFIRM_MARKER,
@@ -576,6 +577,36 @@ def _resolve_steer_file(cfg: argparse.Namespace, dispatch_id: str) -> tuple[Path
             f"({roots}) unless {STEER_FILE_ALLOW_ENV}=1"
         )
     return _default_steer_file(dispatch_id), "default"
+
+
+def _prompt_file_preamble() -> str:
+    from goalflight_dispatch import PROMPT_FILE_PREAMBLE
+
+    return PROMPT_FILE_PREAMBLE
+
+
+def _resolve_original_prompt_file(cfg: argparse.Namespace) -> str | None:
+    configured = getattr(cfg, "original_prompt_file", None)
+    prompt_path = configured or getattr(cfg, "prompt", None)
+    if not prompt_path:
+        return None
+    return str(Path(str(prompt_path)).expanduser().resolve())
+
+
+def _worker_spawn_env(cfg: argparse.Namespace, original_prompt_file: str | None) -> dict[str, str]:
+    install_slot = getattr(cfg, "install_slot", None)
+    spawn_env = dispatch_env(cfg.agent, install_slot)
+    if original_prompt_file:
+        spawn_env[PROMPT_FILE_ENV] = original_prompt_file
+    else:
+        spawn_env.pop(PROMPT_FILE_ENV, None)
+    return spawn_env
+
+
+def _prompt_with_original_prompt_file_preamble(base_prompt: str, original_prompt_file: str | None) -> str:
+    if not original_prompt_file:
+        return base_prompt
+    return f"{_prompt_file_preamble()}\n\n{base_prompt}"
 
 
 def _read_steer_entries(path: Path) -> list[dict]:
@@ -1299,6 +1330,7 @@ async def _run_acp_dispatch_impl(
         remote_turn_cancel_grace_s = DEFAULT_REMOTE_TURN_CANCEL_GRACE_S
     dispatch_id = cfg.dispatch_id or f"acp-{cfg.agent}-{uuid.uuid4().hex[:8]}"
     steer_file, steer_file_source = _resolve_steer_file(cfg, dispatch_id)
+    original_prompt_file = _resolve_original_prompt_file(cfg)
     run_started = time.time()
     project_root = Path(cfg.cwd).resolve()
     permission_mode = str(getattr(cfg, "permission_mode", "auto") or "auto")
@@ -1427,7 +1459,7 @@ async def _run_acp_dispatch_impl(
         return payload
     try:
         if cfg.prompt:
-            prompt = Path(cfg.prompt).read_text()
+            prompt = Path(original_prompt_file or cfg.prompt).read_text()
         elif getattr(cfg, "prompt_b64", None):
             import base64
 
@@ -1436,14 +1468,14 @@ async def _run_acp_dispatch_impl(
             prompt = cfg.prompt_text
         if not prompt:
             raise ValueError("--prompt, --prompt-text, or --prompt-b64 required")
+        prompt = _prompt_with_original_prompt_file_preamble(prompt, original_prompt_file)
     except Exception as e:
         payload.update({"state": "failed", "error": f"{type(e).__name__}: {e}"})
         write_status(status_path, payload)
         return payload
 
     command, acp_args = agent_command(cfg.agent, model=getattr(cfg, "model", None))
-    install_slot = getattr(cfg, "install_slot", None)
-    spawn_env = dispatch_env(cfg.agent, install_slot)
+    spawn_env = _worker_spawn_env(cfg, original_prompt_file)
     gate = validate_acp_dispatch_readiness(cfg.agent, [command, *acp_args])
     if gate is not None:
         payload.update({"state": "blocked_adapter_gate", "error": gate})
@@ -2863,6 +2895,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--prompt-id")
     parser.add_argument("--prompt")
+    parser.add_argument("--original-prompt-file", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--prompt-text")
     parser.add_argument(
         "--prompt-b64",

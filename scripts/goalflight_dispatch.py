@@ -3075,7 +3075,7 @@ def _normalize_acp_agent(args) -> None:
         )
 
 
-def _build_acp_cfg(args, *, status_json: Path):
+def _build_acp_cfg(args, *, status_json: Path, base: Path | None = None):
     from goalflight_acp_run import (
         DEFAULT_MAX_TOOL_S,
         DEFAULT_REMOTE_TURN_CANCEL_GRACE_S,
@@ -3084,7 +3084,7 @@ def _build_acp_cfg(args, *, status_json: Path):
     )
 
     project_root = _project_root(args)
-    prompt_path = str(Path(args.prompt_file).expanduser()) if args.prompt_file else None
+    prompt_path = _resolve_prompt_file(args, base or _dispatch_base_dir())
     os_sandbox = "read-only" if args.read_only and goalflight_compat.is_macos() else OS_SANDBOX_OFF
     liveness_profile = "remote_api" if args.agent in {"cursor", "claude"} else None
     cfg = argparse.Namespace(
@@ -3102,6 +3102,7 @@ def _build_acp_cfg(args, *, status_json: Path):
         prompt=prompt_path,
         prompt_text=None if prompt_path else args.prompt,
         prompt_b64=None,
+        original_prompt_file=prompt_path,
         mode="one-shot",
         idle_timeout=float(args.max_idle_secs or 300.0),
         status_json=str(status_json),

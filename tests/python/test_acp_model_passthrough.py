@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 from pathlib import Path
 import sys
+import tempfile
 
 from support import skip_posix_on_native_windows
 
@@ -16,6 +18,7 @@ skip_posix_on_native_windows("ACP runner import is POSIX-only in this suite")
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
+os.environ.setdefault("GOALFLIGHT_ACP_PYTHON", sys.executable)
 
 import goalflight_acp_run as acp  # noqa: E402
 import goalflight_dispatch as dispatch  # noqa: E402
@@ -178,6 +181,101 @@ def case_retired_bare_grok_agent_label() -> None:
         raise AssertionError("expected DispatchUsageError for --agent grok")
 
 
+def _acp_dispatch_args(*, cwd: Path, prompt_file: str | None = None, prompt: str | None = None):
+    return argparse.Namespace(
+        agent="codex-acp",
+        model=None,
+        cwd=str(cwd),
+        read_only=False,
+        dispatch_id="acp-prompt-env",
+        task_ids=[],
+        priority="normal",
+        capacity_wait_s=None,
+        prompt_file=prompt_file,
+        prompt=prompt,
+        max_idle_secs=300.0,
+        poll_secs=0.1,
+        permission_mode="auto",
+        permission_dir=None,
+        permission_inline_timeout_s=None,
+        permission_user_timeout_s=None,
+        interactive=False,
+        queue_launch_token=None,
+    )
+
+
+def case_dispatch_acp_cfg_passes_resolved_prompt_file() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        prompt = tmp / "brief.md"
+        prompt.write_text("do work\n", encoding="utf-8")
+        old_cwd = Path.cwd()
+        os.chdir(tmp)
+        try:
+            args = _acp_dispatch_args(cwd=tmp, prompt_file="brief.md")
+            cfg = dispatch._build_acp_cfg(args, status_json=tmp / "status.json", base=tmp / "dispatch")
+        finally:
+            os.chdir(old_cwd)
+
+        assert cfg.prompt == str(prompt.resolve()), cfg.prompt
+        assert cfg.original_prompt_file == str(prompt.resolve()), cfg.original_prompt_file
+        env = acp._worker_spawn_env(cfg, acp._resolve_original_prompt_file(cfg))
+        assert env["GOALFLIGHT_PROMPT_FILE"] == str(prompt.resolve()), env.get("GOALFLIGHT_PROMPT_FILE")
+
+
+def case_direct_acp_prompt_exports_resolved_prompt_file() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        prompt = tmp / "direct.md"
+        prompt.write_text("direct work\n", encoding="utf-8")
+        old_cwd = Path.cwd()
+        old_env = os.environ.get("GOALFLIGHT_PROMPT_FILE")
+        os.environ["GOALFLIGHT_PROMPT_FILE"] = "stale"
+        os.chdir(tmp)
+        try:
+            cfg = argparse.Namespace(agent="codex-acp", install_slot=None, prompt="direct.md", original_prompt_file=None)
+            resolved = acp._resolve_original_prompt_file(cfg)
+            env = acp._worker_spawn_env(cfg, resolved)
+        finally:
+            os.chdir(old_cwd)
+            if old_env is None:
+                os.environ.pop("GOALFLIGHT_PROMPT_FILE", None)
+            else:
+                os.environ["GOALFLIGHT_PROMPT_FILE"] = old_env
+
+        assert resolved == str(prompt.resolve()), resolved
+        assert env["GOALFLIGHT_PROMPT_FILE"] == str(prompt.resolve()), env.get("GOALFLIGHT_PROMPT_FILE")
+
+
+def case_promptless_acp_spawn_env_clears_prompt_file() -> None:
+    old_env = os.environ.get("GOALFLIGHT_PROMPT_FILE")
+    os.environ["GOALFLIGHT_PROMPT_FILE"] = "stale"
+    try:
+        cfg = argparse.Namespace(agent="codex-acp", install_slot=None, prompt=None, original_prompt_file=None)
+        env = acp._worker_spawn_env(cfg, acp._resolve_original_prompt_file(cfg))
+    finally:
+        if old_env is None:
+            os.environ.pop("GOALFLIGHT_PROMPT_FILE", None)
+        else:
+            os.environ["GOALFLIGHT_PROMPT_FILE"] = old_env
+
+    assert "GOALFLIGHT_PROMPT_FILE" not in env, env.get("GOALFLIGHT_PROMPT_FILE")
+
+
+def case_acp_prompt_file_preamble_is_shared() -> None:
+    assembled = acp._prompt_with_original_prompt_file_preamble("body\n", "/tmp/brief.md")
+    assert dispatch.PROMPT_FILE_PREAMBLE in assembled, assembled
+    assert assembled.endswith("body\n"), assembled
+    assert acp._prompt_with_original_prompt_file_preamble("body", None) == "body"
+
+
+def test_acp_prompt_file_env_and_preamble() -> None:
+    case_dispatch_acp_cfg_passes_resolved_prompt_file()
+    case_direct_acp_prompt_exports_resolved_prompt_file()
+    case_promptless_acp_spawn_env_clears_prompt_file()
+    case_acp_prompt_file_preamble_is_shared()
+
+
 def main() -> None:
     case_agent_command_per_agent_placement()
     case_grok_acp_default_model()
@@ -185,6 +283,10 @@ def main() -> None:
     case_claude_model_applies_after_session_new()
     case_build_worker_injects_model()
     case_retired_bare_grok_agent_label()
+    case_dispatch_acp_cfg_passes_resolved_prompt_file()
+    case_direct_acp_prompt_exports_resolved_prompt_file()
+    case_promptless_acp_spawn_env_clears_prompt_file()
+    case_acp_prompt_file_preamble_is_shared()
     print("OK: model passthrough tests pass")
 
 
