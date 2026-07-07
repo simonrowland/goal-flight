@@ -16,6 +16,8 @@ Read:
 - `protocols/session-preflight.md`
 - `protocols/dispatch-routing.md`
 - `protocols/worker-markers.md`
+- `protocols/worker-context-package.md`
+- `protocols/worker-contract.md`
 - `protocols/state-handoff.md`
 - `protocols/user-status-cadence.md`
 - `protocols/chunk-review.md`
@@ -85,6 +87,12 @@ valid agent only if it preserves the review/implementation concern.
 
 5. Dispatch:
 
+Before dispatching each wave, run the `protocols/worker-context-package.md`
+self-check: for every chunk in a pinned lane, does the prompt prepend the lane
+brief verbatim and quote its ground truth? Missing or stale package means
+building or refreshing it is the wave's first chunk. Reviewer dispatches into a
+pinned lane get the same brief prepended.
+
 - ACP: `scripts/goalflight_acp_run.py`
 - Bash-tail fallback: worker stdout/stderr to files plus `scripts/goalflight_watch.py`
 - Review job: `scripts/goalflight_review_job.py`
@@ -120,15 +128,8 @@ the worker prompt.
 
 6. Record status:
 
-Every spawned worker must have:
-
-- dispatch id
-- prompt path/hash
-- agent/transport
-- worker PID and process identity
-- status path
-- capacity lease id when applicable
-
+Every spawned worker must be recorded with the dispatch ledger/status field
+contract in `protocols/worker-contract.md`.
 Use `scripts/goalflight_ledger.py record` directly only when a runner did not
 already record the worker.
 
@@ -147,59 +148,8 @@ Exit 0 means every requested dispatch is terminal; exit 1 means pending/timeout.
 Read status JSON. Do not inspect raw logs unless the status script reports that
 the log is corrupt or missing.
 
-For Agent / Task / Explore dispatches that may produce > 5KB of findings, the
-dispatch prompt MUST instruct the subagent to write findings to a file under
-`docs-private/research/<date>-<slug>/` and return ONLY a one-paragraph TL;DR +
-the file path + severity-tagged finding count. Do not consume the subagent's
-full investigation report in conversation — that defeats the dispatch and
-silently doubles the context cost (worker read + orchestrator read of same
-content).
-
-**Return contract by worker class.** Dispatch prompts must specify which
-shape the worker should emit so the orchestrator can parse the headline
-without reading the body.
-
-*Investigator (read-only — reviewer, auditor, plan-validator):*
-
-```
-TL;DR: <≤3 lines>
-
-Findings: <P0> P0, <P1> P1, <P2> P2, <P3> P3
-Strongest concern: <one line>
-
-READY: <findings-path>
-```
-
-*Executor (writes + commits — implementation chunk worker):*
-
-```
-COMMIT: <local sha>
-
-TL;DR: <≤3 lines — what shipped>
-
-DETAILED: <findings-path with diff narrative + reviewer-pass notes>
-Files: <changed-file-list>
-Tests: <X/Y passed>
-Reviewer pass: <none | gstack-review-clean | findings-applied>
-Strongest residual concern: <one line>
-```
-
-*Blocked (any worker class — sandbox / permission / hook / tool block):*
-
-```
-BLOCKED: <intended-step> blocked due to <reason>
-
-TL;DR: <≤3 lines — what was drafted, what blocked>
-
-Recommended orchestrator action: <one line>
-```
-
-Workers DO NOT execute workarounds (alternate APIs, git plumbing, inline
-content dumps when file-write was blocked) — they return BLOCKED and the
-orchestrator decides. Push is NEVER worker-authorized; commit-and-push is a
-two-step gate where the worker commits locally (if its envelope permits)
-and the orchestrator pushes (only with explicit user permission per the
-push-discipline invariant).
+Dispatch prompts use the file-backed findings, return-shape, no-bypass, marker,
+and verify-survival contract in `protocols/worker-contract.md`.
 
 The orchestrator reads TL;DR + headline (READY path / COMMIT sha / BLOCKED
 reason) on first pass. Open DETAILED only when TL;DR raises a flag,

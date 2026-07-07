@@ -9,7 +9,8 @@ Initialize a project for goal-flight with compact, procedural discovery.
 Read `protocols/session-preflight.md`, `protocols/tool-readiness.md`,
 `protocols/project-state-layout.md`, `protocols/task-lifecycle.md`,
 `protocols/progress-dashboard.md`, `protocols/premises.md`,
-`protocols/state-handoff.md`, and `protocols/chunk-review.md` (review tooling).
+`protocols/state-handoff.md`, `protocols/worker-context-package.md`, and
+`protocols/chunk-review.md` (review tooling).
 
 ## Steps
 
@@ -190,7 +191,14 @@ dispatch metadata or the prompt path.
     — operator decides.
 - `SKILL.md` from `templates/project-skill.md` when project has no root skill
 
-6. Write only compact environment facts into `docs-private/env-caveats.md`:
+6. Lane inventory:
+
+Evaluate the triggering-signals table in `protocols/worker-context-package.md`
+for each subsystem the plan will touch. Record a per-lane verdict in the state
+skeleton: `package needed` or `not needed`. Explicit no-package verdicts are
+recorded too.
+
+7. Write only compact environment facts into `docs-private/env-caveats.md`:
 
 - doctor summary path/result
 - capacity profile
@@ -200,7 +208,7 @@ dispatch metadata or the prompt path.
 
 Do not paste full probe output.
 
-7. Confirm git hygiene:
+8. Confirm git hygiene:
 
 - `docs-private/` policy recorded from `git check-ignore docs-private/` — ignored public repos stay private; tracked private repos are allowed
 - `dashboard/` policy recorded from `git check-ignore dashboard/` — generated browser views should normally match `/dashboard/`
@@ -208,13 +216,13 @@ Do not paste full probe output.
 - root `SKILL.md` tracked or intentionally absent
 - current branch/head/dirty state recorded in resume notes
 
-8. Optional corpus:
+9. Optional corpus:
 
 If the repo is large and the user wants reusable dispatch context, run
 `/goal-flight build-corpus`. Do not run corpus construction by default during
 init.
 
-9. Self-review:
+10. Self-review:
 
 - Are readiness warnings actionable?
 - Did init avoid reading large docs/logs into context?

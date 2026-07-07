@@ -108,6 +108,7 @@ Orchestrator behaviour probes run through portable host adapters, not host-speci
 | chunk-vs-milestone review | Review layers | `protocols/chunk-review.md`, `protocols/milestone-review.md` |
 | **bug-class mining / backwards sweeps** | Review layers | `protocols/review-mining.md` |
 | dispatch axes | Dispatch Model, Worker Routing | `protocols/dispatch-routing.md` |
+| worker context packages / lane pinning | Dispatch Model | `protocols/worker-context-package.md` |
 | worker permissions | Worker Routing | `scripts/goalflight_acp_run.py`, doctor `--worker-write-probe`, `scripts/install_claude_acp_patch.sh` |
 | **worker blocked: orchestrator takeover** | Worker Routing | `protocols/dispatched-worker-recovery.md` |
 | rate limits & caps | Capacity and rate limits | `scripts/goalflight_capacity.py`, `scripts/goalflight_rate_pressure.py` |
@@ -357,6 +358,7 @@ Do not hand-iterate (>~3 edit/test cycles) what a goal-loop should converge.
 
 Use ACP or bash-tail plus status polling; do not block on editor task panes.
 Abstract tool roles resolve through host tool-name maps. Type dispatches as executor, reviewer, or planner. Dispatch prompts need the five-layer wrapper. Parallel fix clusters need explicit forbid lists. Split chunks likely to touch many files. Controller-direct only for tiny or plan-marked chunks. Same-provider policy controls review routing trust.
+Lanes with spec-resident invariants, hot-path constraints, regression history, or shared seams need a pinned context package before dispatch — protocols/worker-context-package.md; the execute pre-wave check is mandatory.
 
 Fabricated approval rejected: Never invent user approval for a gated step.
 Orchestrator dispatch waits for declared readiness requirements. Orchestrator live gate requires supported capability and ready local state. Worker live gate also requires requested transport verified. Discovery probes do not use network or model calls. Discovery probes stay within manifest budget caps.
@@ -505,7 +507,7 @@ Active run + compaction: if already in play, invoke `/goal-flight resume` for fr
 
 Read for edits narrowly. Analyze/search/count/filter with procedural code or
 context-mode. Store long artifacts in files and return paths plus summaries.
-Prebuild corpus; do not inline landscape per dispatch. Keep worker-context optional when canonical docs fit.
+Prebuild corpus; do not inline landscape per dispatch. Keep worker-context optional when canonical docs fit; triggered lanes are the exception — they REQUIRE a pinned context package (`protocols/worker-context-package.md`).
 
 When in doubt, move deterministic logic into `scripts/goalflight_*.py`; keep the
 model responsible for judgment: choosing next action, interpreting findings, and

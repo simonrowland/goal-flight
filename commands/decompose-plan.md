@@ -8,6 +8,7 @@ Read:
 
 - `protocols/premises.md`
 - `protocols/dispatch-routing.md`
+- `protocols/worker-context-package.md`
 
 Break a plan into numbered `/goal` chunks. The plan source can come from:
 
@@ -95,12 +96,14 @@ This is the front-end complement to inline-office-hours' per-chunk premise-check
 
 **Drafter** (general-purpose worker via the host `delegate` operation; current Claude wrapper: general-purpose subagent; other hosts: adapter delegate equivalent): produce the numbered `/goal` decomposition.
 
-> "Read the plan below. Decompose it into N self-contained `/goal` chunks. Each chunk must have SCOPE / CHECKLIST / ACCEPTANCE / FORBIDDEN sections (skeleton at the bottom of this prompt). Smallest-first; imperative voice. Number them 1..N. Surface anything in the plan that resists decomposition or requires controller-side judgement. Plan: <paste plan text or path>.
+> "Read the plan below. Decompose it into N self-contained `/goal` chunks. Each chunk must name its lane and have SCOPE / CHECKLIST / ACCEPTANCE / FORBIDDEN sections (skeleton at the bottom of this prompt). Smallest-first; imperative voice. Number them 1..N. For chunks in a lane that trips `protocols/worker-context-package.md` triggering signals, apply §Ticket recipe at decompose time: quoted ground truth, RED-first evidence requirement, named-seam scope guards, honest-outcome acceptance, and sanctioned-edit carve-outs. Surface anything in the plan that resists decomposition or requires controller-side judgement. Plan: <paste plan text or path>.
 >
 > Per-chunk skeleton:
 > ```
 > ## <N>. /goal <SLUG>
 > STATUS (optional — pin observed reality if goal is touched post-write)
+> LANE
+> <subsystem lane name; `package needed` or `not needed` verdict>
 > SCOPE
 > <1-3 sentence problem + boundary; what module(s), what contract>
 >
