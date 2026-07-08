@@ -6,6 +6,9 @@ incremented when meaningful skill behaviour changes.
 
 ## [Unreleased]
 
+## [1.2.3] — 2026-07-08
+
+- grok-code and grok-research workers no longer pin a grok model — the harness injects no `--model`, so grok's own CLI default (grok-4.5 as of this release) applies and auto-tracks forward instead of pinning a version that goes stale. Retires the old `grok-composer-2.5-fast` (coding) and `grok-build` (research, now unlisted by `grok models`) pins; either remains reachable via an explicit `--model`. grok-research keeps web tools enabled.
 - Review cadence made concrete + enforced: milestone review now has a defined `K=5` committed-chunk cadence (plus `[milestone]` tags and before-push), surfaced by a status nudge; worker self-review is tiered; and a null-hypothesis floor is universal for every patch — carried in the actual worker-prompt surfaces and the controller per-chunk gate. A contract test (`test_review_cadence_contract.py`) guards the demand against future terseness passes.
 - Added `set-prompt-path` and `set` (lane / blocked_by) subcommands so an existing task item can be edited after creation (e.g. wiring a post-creation rendered prompt into dispatch-frontier).
 - Added a persistent mail read cursor plus `mark-read`, `read --unseen --ack`, and `relay --new` surfaces for compact mailbox catch-up.

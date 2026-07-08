@@ -268,11 +268,11 @@ def test_grok_model_passthrough_warning() -> None:
     warning = D._grok_model_passthrough_warning(
         _args(agent="grok-code", model="grok-composer-2.5-fast")
     )
-    check("grok-code --model warns", warning is not None and "harness wires grok model ids" in warning)
+    check("grok-code --model note", warning is not None and "your explicit --model is honored" in warning)
     warning = D._grok_model_passthrough_warning(
         _args(agent="grok-research", model="grok-build")
     )
-    check("grok-research --model warns", warning is not None and "provider id drift" in warning)
+    check("grok-research --model note", warning is not None and "pin a non-default grok model" in warning)
     check("codex --model is silent", D._grok_model_passthrough_warning(_args(agent="codex", model="gpt-5")) is None)
     check("grok without --model is silent", D._grok_model_passthrough_warning(_args(agent="grok-code")) is None)
 

@@ -23,10 +23,10 @@ os.environ.setdefault("GOALFLIGHT_ACP_PYTHON", sys.executable)
 import goalflight_acp_run as acp  # noqa: E402
 import goalflight_dispatch as dispatch  # noqa: E402
 
-MODEL = "grok-composer-2.5-fast"
-# grok-research defaults to grok-build (grok's purpose-built web model); the old
-# composer-2.5-fast stopgap could not reliably web_fetch (re-validated 2026-06-09).
-RESEARCH_MODEL = "grok-build"
+MODEL = "grok-composer-2.5-fast"  # a valid explicit --model pin (still selectable)
+# Both grok presets inject NO --model by default — grok's own CLI default
+# (grok-4.5 as of 2026-07-08) applies, auto-tracking forward. An explicit
+# --model still passes through (tested with MODEL above).
 
 
 class _FakeProc:
@@ -141,19 +141,14 @@ def case_build_worker_injects_model() -> None:
     # codex has no default model: none passed -> no --model.
     argv_codex = _build("codex", None)
     assert "--model" not in argv_codex, argv_codex
-    # grok-code defaults to the fast coding model (Composer 2.5) when none is passed.
+    # grok-code / grok-research inject NO --model by default — grok's own CLI
+    # default (grok-4.5) applies, auto-tracking forward. Explicit --model above
+    # still passes through.
     argv_code = _build("grok-code", None)
-    assert (
-        "--model" in argv_code
-        and argv_code[argv_code.index("--model") + 1] == "grok-composer-2.5-fast"
-    ), argv_code
-    # grok-research defaults to grok-build (grok's web model); composer is a coding
-    # model and could not reliably web_fetch. grok-code stays on composer above.
+    assert "--model" not in argv_code, argv_code
     argv_research = _build("grok-research", None)
-    assert (
-        "--model" in argv_research
-        and argv_research[argv_research.index("--model") + 1] == RESEARCH_MODEL
-    ), argv_research
+    assert "--model" not in argv_research, argv_research
+    # grok-research keeps web tools ON (grok-4.5 supports web_search/web_fetch).
     assert "--disable-web-search" not in argv_research, argv_research
     # grok 0.2.39 regression: in single-turn `--prompt-file` mode EVERY
     # `--permission-mode` value stops the file-write tool from writing (none produce

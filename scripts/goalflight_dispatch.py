@@ -1269,9 +1269,9 @@ def _grok_model_passthrough_warning(args) -> str | None:
     if args.agent not in {"grok-code", "grok-research"} or not getattr(args, "model", None):
         return None
     return (
-        f"WARN: --model with --agent {args.agent} is advisory-only; "
-        "the harness wires grok model ids, so the flag is unnecessary and can break "
-        "silently on provider id drift"
+        f"NOTE: --agent {args.agent} omits --model by default so grok's CLI "
+        "default applies and auto-tracks; your explicit --model is honored — "
+        "pass it only to pin a non-default grok model"
     )
 
 
@@ -3906,18 +3906,18 @@ def build_worker(args, prompt_path, raw_argv: list[str]):
     if args.agent in ("grok-code", "grok-research"):
         # Read the prompt from a FILE, not argv `-p` — long goal-flight prompts
         # (5-20KB) would hit E2BIG / argv truncation (grok review #5).
-        # Model PER TASK:
-        #   grok-code     (coding, no web) -> grok-composer-2.5-fast
-        #   grok-research (web search/fetch) -> grok-build (grok's purpose-built
-        #                  web model and grok.com's default)
-        # The earlier "grok-build dies at ~28s empty under web-search" note is
-        # STALE: re-validated 2026-06-09, grok-build returned good, primary-source-
-        # cited research in ~43s, recovering via web_search from the intermittent
-        # `web_fetch` tool_output_error flakiness that hits BOTH models. composer
-        # is a coding model and yields thin, weakly-sourced research, so it is the
-        # wrong default for grok-research (observed live: composer web_fetch errors
-        # + Wikipedia-only answers vs grok-build's nature.com primary source).
-        default_model = "grok-build" if args.agent == "grok-research" else "grok-composer-2.5-fast"
+        # Model PER TASK — inject NO --model for either preset: grok's own CLI
+        # default applies (grok-4.5 as of 2026-07-08, per `grok models` "Default
+        # model"), so the flagship is used without pinning a version that goes
+        # stale when grok ships the next default. This retires the old explicit
+        # pins — grok-build for research (now unlisted by `grok models`) and the
+        # coding-specialised grok-composer-2.5-fast for coding; either remains
+        # reachable via an explicit --model. Web tools stay at grok's CLI default
+        # (ON) for both presets; the coding-vs-research split is the agent label
+        # + research-intent guard, not a --disable-web-search difference.
+        # Trade-off: the dispatch ledger no longer records which grok model ran
+        # (it's grok's default), in exchange for auto-tracking + no stale pin.
+        default_model = None
         # PERMISSION MODE — pass NO `--permission-mode` flag (do not "fix" by
         # swapping the value). grok 0.2.39 regression (verified 2026-06-10): in
         # single-turn `--prompt-file` mode, EVERY `--permission-mode` value stops
@@ -3940,7 +3940,11 @@ def build_worker(args, prompt_path, raw_argv: list[str]):
         # (tests/python/test_acp_model_passthrough.py). Same lesson as the stale
         # model note above: grok flags drift; re-validate before trusting one.
         argv = ["grok", "--prompt-file", str(prompt_path)]
-        argv += ["--model", str(model) if model else default_model]
+        # Only pin a model when one is EXPLICITLY requested; otherwise omit the
+        # flag entirely and let grok's CLI default (grok-4.5) apply.
+        selected_model = str(model) if model else default_model
+        if selected_model:
+            argv += ["--model", selected_model]
         if args.cwd:
             argv += ["--cwd", args.cwd]
         return argv, None
