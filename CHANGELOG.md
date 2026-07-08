@@ -6,6 +6,9 @@ incremented when meaningful skill behaviour changes.
 
 ## [Unreleased]
 
+- Review cadence made concrete + enforced: milestone review now has a defined `K=5` committed-chunk cadence (plus `[milestone]` tags and before-push), surfaced by a status nudge; worker self-review is tiered; and a null-hypothesis floor is universal for every patch — carried in the actual worker-prompt surfaces and the controller per-chunk gate. A contract test (`test_review_cadence_contract.py`) guards the demand against future terseness passes.
+- Added `set-prompt-path` and `set` (lane / blocked_by) subcommands so an existing task item can be edited after creation (e.g. wiring a post-creation rendered prompt into dispatch-frontier).
+- Added a persistent mail read cursor plus `mark-read`, `read --unseen --ack`, and `relay --new` surfaces for compact mailbox catch-up.
 - Restored `TodoWrite` to the controller `allowed-tools` as the optional
   ephemeral in-session tactical checklist layer (controller-direct only, no
   task-store conflict); documented its boundary in the State layers section.
