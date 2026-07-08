@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Callable
 import contextlib
 import datetime as dt
 import json
+import os
 import uuid
 from pathlib import Path
 import sys
@@ -15,6 +17,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 DEFAULT_CONTRACT = REPO_ROOT / "docs-private" / "architecture" / "contracts" / "goalflight.message.v1.json"
 AGGREGATE_SCHEMA = "goalflight.fleet.register.aggregate.v1"
+READ_CURSOR_FILE = ".read-cursor.json"
 
 sys.path.insert(0, str(SCRIPT_DIR))
 
@@ -53,6 +56,14 @@ class MessageError(Exception):
     pass
 
 
+def require_positive_int_seq(value: object, *, path: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise MessageError(f"{path}: seq must be an integer >= 1")
+    if value < 1:
+        raise MessageError(f"{path}: seq must be an integer >= 1")
+    return value
+
+
 def utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
 
@@ -89,6 +100,66 @@ def mail_lock(path: Path):
             goalflight_compat.flock(fh, goalflight_compat.LOCK_UN)
 
 
+def read_cursor_path(messages_dir: Path) -> Path:
+    return messages_dir / READ_CURSOR_FILE
+
+
+def load_read_cursor(path: Path) -> dict[str, int]:
+    """Best-effort cursor load; absent/corrupt state means everything is unseen."""
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    cursor: dict[str, int] = {}
+    for key, value in raw.items():
+        if not isinstance(key, str):
+            continue
+        try:
+            seq = int(value)
+        except (TypeError, ValueError):
+            continue
+        cursor[key] = max(0, seq)
+    return cursor
+
+
+def write_read_cursor(path: Path, cursor: dict[str, int]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    clean = {str(key): max(0, int(value)) for key, value in sorted(cursor.items())}
+    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_text(json.dumps(clean, sort_keys=True) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+
+
+def advance_read_cursor(
+    path: Path,
+    advances: dict[str, int] | None = None,
+    *,
+    max_scan: Callable[[], dict[str, int]] | None = None,
+) -> list[dict[str, object]]:
+    """Advance cursor entries under lock; never rewind existing last-seen seq."""
+    results: list[dict[str, object]] = []
+    with mail_lock(path):
+        resolved_advances = dict(advances or {})
+        if max_scan is not None:
+            for key, through in max_scan().items():
+                old_target = int(resolved_advances.get(key, 0))
+                resolved_advances[key] = max(old_target, int(through))
+        cursor = load_read_cursor(path)
+        for key, through in sorted(resolved_advances.items()):
+            old = int(cursor.get(key, 0))
+            new = max(old, int(through))
+            cursor[key] = new
+            results.append({"inbox": key, "old": old, "new": new, "advanced": new > old})
+        write_read_cursor(path, cursor)
+    return results
+
+
 def validate_envelope(envelope: dict, *, path: str = "envelope") -> None:
     if not isinstance(envelope, dict):
         raise MessageError(f"{path}: expected object")
@@ -99,6 +170,7 @@ def validate_envelope(envelope: dict, *, path: str = "envelope") -> None:
         raise MessageError(f"{path}: schema must be goalflight.message.v1")
     if envelope.get("schema_version") != 1:
         raise MessageError(f"{path}: unsupported schema_version")
+    require_positive_int_seq(envelope.get("seq"), path=f"{path}.seq")
     source = envelope.get("source")
     if not isinstance(source, dict):
         raise MessageError(f"{path}.source: expected object")
@@ -174,6 +246,7 @@ def post_message(
         # open("a") below would block the caller forever. Centralised here so
         # CLI / MCP / direct writers are all protected, not just the watcher bridge.
         raise MessageError(f"{path}: inbox is not a regular file; refusing to write")
+    provided_seq = require_positive_int_seq(seq, path="seq") if seq is not None else None
     base_source = {
         "node": "local",
         "adapter": "unknown",
@@ -183,7 +256,10 @@ def post_message(
         base_source.update(source)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     with mail_lock(path):
-        resolved_seq = seq if seq is not None else next_seq(path)
+        resolved_seq = require_positive_int_seq(
+            provided_seq if provided_seq is not None else next_seq(path),
+            path="seq",
+        )
         envelope = {
             "schema": "goalflight.message.v1",
             "schema_version": 1,
@@ -388,6 +464,69 @@ def collect_inbox_paths(
     return list(paths.values())
 
 
+def max_seq_by_inbox(
+    *,
+    messages_dir: Path,
+    fleet_dir: Path | None = None,
+    dispatch_ids: set[str] | None = None,
+) -> dict[str, int]:
+    maxes: dict[str, int] = {}
+    for path in collect_inbox_paths(messages_dir, fleet_dir, dispatch_ids=dispatch_ids):
+        try:
+            envelopes = read_envelopes(path)
+        except MessageError:
+            continue
+        maxes[path.stem] = max((int(env.get("seq", 0)) for env in envelopes), default=0)
+    return maxes
+
+
+def unseen_envelopes_for_paths(
+    paths: list[Path],
+    *,
+    cursor: dict[str, int],
+    last_n: int | None = None,
+    tolerate_errors: bool = False,
+) -> tuple[list[dict], dict[str, int], dict[str, int]]:
+    shown: list[dict] = []
+    counts: dict[str, int] = {}
+    ack_advances: dict[str, int] = {}
+    for path in paths:
+        key = path.stem
+        try:
+            envelopes = read_envelopes(path)
+        except MessageError:
+            if tolerate_errors:
+                continue
+            raise
+        unseen = [env for env in envelopes if int(env.get("seq", 0)) > int(cursor.get(key, 0))]
+        counts[key] = len(unseen)
+        if last_n is not None and last_n >= 0:
+            unseen = unseen[-last_n:] if last_n else []
+        shown.extend(unseen)
+        if unseen:
+            ack_advances[key] = max(int(env.get("seq", 0)) for env in unseen)
+    return shown, counts, ack_advances
+
+
+def format_unseen_counts(counts: dict[str, int]) -> str:
+    if not counts:
+        return "unseen counts: none"
+    return "unseen counts: " + " ".join(f"{key}={value}" for key, value in sorted(counts.items()))
+
+
+def print_cursor_advances(results: list[dict[str, object]]) -> None:
+    if not results:
+        print("mark-read: no inboxes")
+        return
+    for result in results:
+        status = "advanced" if result["advanced"] else "unchanged"
+        print(f"mark-read: {result['inbox']} {result['old']}->{result['new']} ({status})")
+
+
+def warn_cursor_not_advanced(exc: BaseException) -> None:
+    print(f"WARNING: cursor not advanced: {type(exc).__name__}: {exc}", file=sys.stderr)
+
+
 def build_aggregate(
     *,
     messages_dir: Path,
@@ -493,9 +632,70 @@ def cmd_post(args: argparse.Namespace) -> int:
 
 
 def cmd_read(args: argparse.Namespace) -> int:
+    if args.ack and not args.unseen:
+        print("read --ack requires --unseen", file=sys.stderr)
+        return 2
     path = inbox_path(args.messages_dir, args.dispatch_id)
+    if args.unseen:
+        cursor_path = read_cursor_path(args.messages_dir)
+        cursor = load_read_cursor(cursor_path)
+        envelopes, counts, ack_advances = unseen_envelopes_for_paths(
+            [path],
+            cursor=cursor,
+            last_n=args.last,
+        )
+        print(json.dumps(envelopes, indent=2 if args.json else None))
+        print(format_unseen_counts(counts))
+        if args.ack:
+            try:
+                advance_read_cursor(cursor_path, ack_advances)
+            except (OSError, ValueError, TypeError) as exc:
+                warn_cursor_not_advanced(exc)
+                return 1
+        return 0
     envelopes = read_envelopes(path, last_n=args.last)
     print(json.dumps(envelopes, indent=2 if args.json else None))
+    return 0
+
+
+def cmd_mark_read(args: argparse.Namespace) -> int:
+    if args.all and args.dispatch_id:
+        print("mark-read: --all cannot be combined with --dispatch-id", file=sys.stderr)
+        return 2
+    if args.all and args.through is not None:
+        print("mark-read: --through requires --dispatch-id", file=sys.stderr)
+        return 2
+    if not args.all and not args.dispatch_id:
+        print("mark-read: provide --dispatch-id or --all", file=sys.stderr)
+        return 2
+
+    dispatch_id = str(args.dispatch_id) if args.dispatch_id else None
+    scan: Callable[[], dict[str, int]] | None = None
+    if args.all:
+        advances = {}
+
+        def scan() -> dict[str, int]:
+            return max_seq_by_inbox(messages_dir=args.messages_dir, fleet_dir=args.fleet_dir)
+
+    elif args.through is not None:
+        advances = {str(dispatch_id): args.through}
+    else:
+        advances = {}
+
+        def scan() -> dict[str, int]:
+            current = max_seq_by_inbox(
+                messages_dir=args.messages_dir,
+                fleet_dir=args.fleet_dir,
+                dispatch_ids={str(dispatch_id)},
+            )
+            return {str(dispatch_id): current.get(str(dispatch_id), 0)}
+
+    try:
+        results = advance_read_cursor(read_cursor_path(args.messages_dir), advances, max_scan=scan)
+    except (OSError, ValueError, TypeError) as exc:
+        warn_cursor_not_advanced(exc)
+        return 1
+    print_cursor_advances(results)
     return 0
 
 
@@ -699,6 +899,27 @@ def controller_mail_summary(
 
 
 def cmd_relay(args: argparse.Namespace) -> int:
+    if args.ack and not args.new:
+        print("relay --ack requires --new", file=sys.stderr)
+        return 2
+    if args.new:
+        paths = collect_inbox_paths(args.messages_dir, args.fleet_dir)
+        cursor_path = read_cursor_path(args.messages_dir)
+        cursor = load_read_cursor(cursor_path)
+        envelopes, counts, ack_advances = unseen_envelopes_for_paths(
+            paths,
+            cursor=cursor,
+            tolerate_errors=True,
+        )
+        print(json.dumps(envelopes))
+        print(format_unseen_counts(counts))
+        if args.ack:
+            try:
+                advance_read_cursor(cursor_path, ack_advances)
+            except (OSError, ValueError, TypeError) as exc:
+                warn_cursor_not_advanced(exc)
+                return 1
+        return 0
     aggregate = build_aggregate(messages_dir=args.messages_dir, fleet_dir=args.fleet_dir)
     line = format_controller_relay(aggregate)
     if line:
@@ -842,13 +1063,23 @@ def main(argv: list[str] | None = None) -> int:
     read.add_argument("--dispatch-id", required=True)
     read.add_argument("--last", type=int, default=None)
     read.add_argument("--json", action="store_true")
+    read.add_argument("--unseen", action="store_true", help="Show only envelopes after this inbox's read cursor")
+    read.add_argument("--ack", action="store_true", help="With --unseen, advance the cursor through shown envelopes")
     read.set_defaults(func=cmd_read)
+
+    mark_read = sub.add_parser("mark-read", help="Advance read cursor state")
+    mark_read.add_argument("--dispatch-id")
+    mark_read.add_argument("--through", type=int)
+    mark_read.add_argument("--all", action="store_true")
+    mark_read.set_defaults(func=cmd_mark_read)
 
     status = sub.add_parser("status")
     status.add_argument("--write-aggregate", action="store_true")
     status.set_defaults(func=cmd_status)
 
     relay = sub.add_parser("relay")
+    relay.add_argument("--new", action="store_true", help="Show only envelopes after each inbox read cursor")
+    relay.add_argument("--ack", action="store_true", help="With --new, advance cursors through shown envelopes")
     relay.set_defaults(func=cmd_relay)
 
     mirror = sub.add_parser("mirror")

@@ -229,6 +229,22 @@ def test_render_text_silent_when_no_mail() -> None:
     assert_true("no mail line when inbox empty", not any("mail:" in ln for ln in lines))
 
 
+def test_render_text_includes_milestone_count_nudge() -> None:
+    payload = _bare_payload({})
+    payload["milestone"] = {
+        "active_cadence": True,
+        "commits_since": 4,
+        "K": 5,
+        "due": False,
+        "last_marker": {"commit": "abcdef1234567890"},
+    }
+    lines = S.render_text(payload, 20)
+    assert_true(
+        "milestone count nudge present",
+        any("chunks since last milestone sweep = 4 (sweep due at 5)" in ln for ln in lines),
+    )
+
+
 def test_non_regular_inbox_file_does_not_hang() -> None:
     # A FIFO/device named *.jsonl in the inbox dir must be SKIPPED, not opened:
     # read_text()'s open() would block forever on a FIFO and hang status before
@@ -315,6 +331,7 @@ def main() -> None:
         test_mail_check_is_fail_open,
         test_render_text_includes_hint_when_present,
         test_render_text_silent_when_no_mail,
+        test_render_text_includes_milestone_count_nudge,
         test_non_regular_inbox_file_does_not_hang,
         test_corrupt_unrelated_inbox_does_not_suppress_owned_need,
         test_post_message_fails_closed_on_non_regular_inbox,
