@@ -1825,11 +1825,11 @@ def main(argv: list[str] | None = None) -> int:
         )
         try:
             commit = goalflight_milestone.current_head(repo)
-            path = goalflight_milestone.write_marker(commit=commit, verdict="clean")
+            path = goalflight_milestone.write_marker(commit=commit, verdict="clean", project_root=repo)
         except (OSError, RuntimeError) as exc:
             print(f"goalflight_status: milestone mark failed: {exc}", file=sys.stderr)
             return 2
-        marker = goalflight_milestone.read_marker() or {"commit": commit, "verdict": "clean"}
+        marker = goalflight_milestone.read_marker(project_root=repo) or {"commit": commit, "verdict": "clean"}
         if args.json:
             print(json.dumps({"marker_path": str(path), "marker": marker}, sort_keys=True))
         else:

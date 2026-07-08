@@ -29,8 +29,8 @@ def run(repo: Path, *args: str) -> str:
     return proc.stdout.strip()
 
 
-def init_repo(tmp_path: Path) -> Path:
-    repo = tmp_path / "repo"
+def init_repo(tmp_path: Path, name: str = "repo") -> Path:
+    repo = tmp_path / name
     repo.mkdir()
     run(repo, "init", "-b", "main")
     run(repo, "config", "user.email", "tests@example.invalid")
@@ -148,15 +148,17 @@ def test_unknown_nested_milestone_cadence_warns_and_uses_default(tmp_path: Path)
 
 
 def test_marker_round_trip(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path)
     state = tmp_path / "state"
     marker = M.write_marker(
         commit="abc1234",
         verdict="clean",
         root=state,
+        project_root=repo,
         now="2026-06-15T00:00:00Z",
     )
-    assert marker == state / "milestone-marker.json"
-    assert M.read_marker(state) == {
+    assert marker == M.marker_path(state, project_root=repo)
+    assert M.read_marker(state, project_root=repo) == {
         "commit": "abc1234",
         "ts": "2026-06-15T00:00:00Z",
         "verdict": "clean",
@@ -164,15 +166,17 @@ def test_marker_round_trip(tmp_path: Path) -> None:
 
 
 def test_non_clean_marker_round_trip_preserves_verdict(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path)
     state = tmp_path / "state"
     M.write_marker(
         commit="def5678",
         verdict="inconclusive_timeout",
         root=state,
+        project_root=repo,
         now="2026-06-15T00:00:00Z",
     )
 
-    assert M.read_marker(state) == {
+    assert M.read_marker(state, project_root=repo) == {
         "commit": "def5678",
         "ts": "2026-06-15T00:00:00Z",
         "verdict": "inconclusive_timeout",
@@ -185,18 +189,19 @@ def test_malformed_marker_json_is_treated_as_no_marker(tmp_path: Path) -> None:
     commit_file(repo, "one", "one")
     state = tmp_path / "state"
     state.mkdir()
-    (state / M.MARKER_NAME).write_text("{not-json", encoding="utf-8")
+    M.marker_path(state, project_root=repo).parent.mkdir(parents=True, exist_ok=True)
+    M.marker_path(state, project_root=repo).write_text("{not-json", encoding="utf-8")
     queue = write_queue(tmp_path / "queue.md", cadence=5)
 
     payload = M.check_status(repo=repo, project_root=repo, root=state, queue=queue)
 
-    assert M.read_marker(state) is None
+    assert M.read_marker(state, project_root=repo) is None
     assert payload["last_marker"] is None
     assert payload["arc_start"] == run(repo, "merge-base", "main", "HEAD")
     assert payload["commits_since"] == 1
 
-    (state / M.MARKER_NAME).write_bytes(b"\xff\xfe{")
-    assert M.read_marker(state) is None
+    M.marker_path(state, project_root=repo).write_bytes(b"\xff\xfe{")
+    assert M.read_marker(state, project_root=repo) is None
 
 
 def test_legacy_marker_without_verdict_still_anchors_as_clean(tmp_path: Path) -> None:
@@ -207,7 +212,8 @@ def test_legacy_marker_without_verdict_still_anchors_as_clean(tmp_path: Path) ->
     commit_file(repo, "two", "two")
     state = tmp_path / "state"
     state.mkdir()
-    (state / M.MARKER_NAME).write_text(
+    M.marker_path(state, project_root=repo).parent.mkdir(parents=True, exist_ok=True)
+    M.marker_path(state, project_root=repo).write_text(
         json.dumps({"commit": base, "ts": "2026-06-15T00:00:00Z"}) + "\n",
         encoding="utf-8",
     )
@@ -346,7 +352,7 @@ def test_commits_since_count_and_due_when_cadence_reached(tmp_path: Path) -> Non
     commit_file(repo, "two", "two")
     commit_file(repo, "three", "three")
     state = tmp_path / "state"
-    M.write_marker(commit=base, verdict="clean", root=state, now="2026-06-15T00:00:00Z")
+    M.write_marker(commit=base, verdict="clean", root=state, project_root=repo, now="2026-06-15T00:00:00Z")
     queue = write_queue(tmp_path / "queue.md", cadence=3)
 
     payload = M.check_status(repo=repo, project_root=repo, root=state, queue=queue)
@@ -370,6 +376,54 @@ def test_no_marker_bootstraps_from_merge_base(tmp_path: Path) -> None:
     assert payload["arc_start"] == run(repo, "merge-base", "main", "HEAD")
     assert payload["commits_since"] == 2
     assert payload["due"] is False
+
+
+def test_no_marker_on_local_main_counts_outgoing_origin_commits(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path)
+    remote = tmp_path / "origin.git"
+    run(repo, "init", "--bare", str(remote))
+    run(repo, "remote", "add", "origin", str(remote))
+    run(repo, "push", "-u", "origin", "main")
+    origin_main = run(repo, "rev-parse", "origin/main")
+    for index in range(5):
+        commit_file(repo, f"outgoing-{index}", f"outgoing {index}")
+    queue = write_queue(tmp_path / "queue.md", cadence=5)
+
+    payload = M.check_status(repo=repo, project_root=repo, root=tmp_path / "state", queue=queue)
+
+    assert payload["last_marker"] is None
+    assert payload["arc_start"] == origin_main
+    assert payload["commits_since"] == 5
+    assert payload["due"] is True
+    assert payload["reason"] == "commit cadence reached"
+
+
+def test_status_recorded_marker_is_project_scoped(tmp_path: Path, monkeypatch) -> None:
+    repo_a = init_repo(tmp_path, "repo-a")
+    repo_b = init_repo(tmp_path, "repo-b")
+    commit_a = run(repo_a, "rev-parse", "HEAD")
+    state = tmp_path / "state"
+    monkeypatch.setattr(M, "state_dir", lambda: state)
+    buf = io.StringIO()
+
+    with redirect_stdout(buf):
+        rc = S.main(["--project", str(repo_a), "--record-milestone-sweep", "--json"])
+
+    assert rc == 0
+    recorded = json.loads(buf.getvalue())
+    assert f"{M.MARKER_DIR}/repo-a-" in recorded["marker_path"]
+    assert M.read_marker(state, project_root=repo_a)["commit"] == commit_a
+    assert M.read_marker(state, project_root=repo_b) is None
+
+    run(repo_b, "checkout", "-b", "feature")
+    commit_file(repo_b, "one", "one")
+    queue = write_queue(tmp_path / "queue-b.md", cadence=5)
+    payload = M.check_status(repo=repo_b, project_root=repo_b, root=state, queue=queue)
+
+    assert payload["last_marker"] is None
+    assert payload["error"] is None
+    assert payload["reason"] == "ok"
+    assert payload["commits_since"] == 1
 
 
 def assert_unavailable_probe(payload: dict[str, object], reason_fragment: str) -> None:
@@ -402,7 +456,7 @@ def test_unreachable_clean_marker_reports_milestone_unavailable(tmp_path: Path) 
     run(repo, "checkout", "-b", "feature")
     commit_file(repo, "one", "one")
     state = tmp_path / "state"
-    M.write_marker(commit="deadbeef", verdict="clean", root=state, now="2026-06-15T00:00:00Z")
+    M.write_marker(commit="deadbeef", verdict="clean", root=state, project_root=repo, now="2026-06-15T00:00:00Z")
     queue = write_queue(tmp_path / "queue.md", cadence=5)
 
     payload = M.check_status(repo=repo, project_root=repo, root=state, queue=queue)
@@ -456,7 +510,7 @@ def test_milestone_tag_trigger_when_landed_since_marker(tmp_path: Path) -> None:
     run(repo, "checkout", "-b", "feature")
     landed = commit_file(repo, "one", "one")
     state = tmp_path / "state"
-    M.write_marker(commit=base, verdict="clean", root=state, now="2026-06-15T00:00:00Z")
+    M.write_marker(commit=base, verdict="clean", root=state, project_root=repo, now="2026-06-15T00:00:00Z")
     queue = write_queue(
         tmp_path / "queue.md",
         cadence=5,
@@ -520,7 +574,7 @@ def test_milestone_tag_with_blank_commit_does_not_repeat_after_marker(tmp_path: 
     run(repo, "checkout", "-b", "feature")
     commit_file(repo, "one", "one")
     state = tmp_path / "state"
-    M.write_marker(commit=base, verdict="clean", root=state, now="2026-06-15T00:00:00Z")
+    M.write_marker(commit=base, verdict="clean", root=state, project_root=repo, now="2026-06-15T00:00:00Z")
     queue = write_queue(
         tmp_path / "queue.md",
         cadence=5,

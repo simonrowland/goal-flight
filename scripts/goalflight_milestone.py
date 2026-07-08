@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import os
 import re
@@ -21,6 +22,7 @@ import goalflight_session_status
 
 SCHEMA = "goalflight.milestone.v1"
 MARKER_NAME = "milestone-marker.json"
+MARKER_DIR = "milestone-markers"
 DEFAULT_K = 5
 CLEAN_VERDICT = "clean"
 CLEAN_VERDICTS = {CLEAN_VERDICT, "converged"}
@@ -47,8 +49,46 @@ def state_dir() -> Path:
     return goalflight_capacity.state_dir()
 
 
-def marker_path(root: Path | None = None) -> Path:
-    return (root or state_dir()) / MARKER_NAME
+def _resolve_loose(path: Path) -> Path:
+    return path.expanduser().resolve(strict=False)
+
+
+def _strip_managed_worktree(path: Path) -> Path:
+    resolved = _resolve_loose(path)
+    parts = resolved.parts
+    for index, part in enumerate(parts[:-2]):
+        if part == ".claude" and parts[index + 1] == "worktrees":
+            return _resolve_loose(Path(*parts[:index]))
+    return resolved
+
+
+def _project_slug_root(project_root: Path) -> Path:
+    project = _resolve_loose(project_root)
+    try:
+        common_raw = _git(project, ["rev-parse", "--git-common-dir"])
+    except RuntimeError:
+        return _strip_managed_worktree(project)
+    common = Path(common_raw)
+    if not common.is_absolute():
+        common = project / common
+    if common.name == ".git":
+        return _strip_managed_worktree(common.parent)
+    return _strip_managed_worktree(project)
+
+
+def _project_state_slug(project_root: Path) -> str:
+    main_root = _project_slug_root(project_root)
+    name = main_root.name or "root"
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-") or "root"
+    digest = hashlib.sha1(str(main_root).encode("utf-8")).hexdigest()[:10]
+    return f"{slug}-{digest}"
+
+
+def marker_path(root: Path | None = None, project_root: Path | None = None) -> Path:
+    base = root or state_dir()
+    if project_root is None:
+        return base / MARKER_NAME
+    return base / MARKER_DIR / _project_state_slug(project_root) / MARKER_NAME
 
 
 def git_root(cwd: Path | None = None) -> Path | None:
@@ -102,8 +142,8 @@ def short_commit(value: str | None) -> str | None:
     return value[:7]
 
 
-def read_marker(root: Path | None = None) -> dict[str, Any] | None:
-    path = marker_path(root)
+def read_marker(root: Path | None = None, project_root: Path | None = None) -> dict[str, Any] | None:
+    path = marker_path(root, project_root=project_root)
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
@@ -148,13 +188,14 @@ def write_marker(
     commit: str,
     verdict: str,
     root: Path | None = None,
+    project_root: Path | None = None,
     now: str | None = None,
 ) -> Path:
-    path = marker_path(root)
+    path = marker_path(root, project_root=project_root)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     payload = {"commit": commit, "ts": now or utc_now(), "verdict": verdict}
     if str(verdict).strip().lower() not in CLEAN_VERDICTS:
-        previous_clean = clean_marker_details(read_marker(root))
+        previous_clean = clean_marker_details(read_marker(root, project_root=project_root))
         if previous_clean:
             payload["clean_commit"] = previous_clean["commit"]
             payload["clean_ts"] = previous_clean.get("ts")
@@ -400,6 +441,48 @@ def merge_base(repo: Path, base_ref: str) -> str | None:
         return None
 
 
+def current_branch(repo: Path) -> str | None:
+    try:
+        return _git(repo, ["symbolic-ref", "--quiet", "--short", "HEAD"])
+    except RuntimeError:
+        return None
+
+
+def remote_default_base_ref(repo: Path) -> str | None:
+    try:
+        ref = _git(repo, ["symbolic-ref", "refs/remotes/origin/HEAD"])
+    except RuntimeError:
+        ref = ""
+    prefix = "refs/remotes/"
+    if ref.startswith(prefix):
+        return ref[len(prefix) :]
+    if ref.startswith("origin/"):
+        return ref
+    if _git_ok(repo, ["rev-parse", "--verify", "origin/main^{commit}"]):
+        return "origin/main"
+    return None
+
+
+def _remote_branch_name(remote_ref: str) -> str | None:
+    remote, sep, branch = remote_ref.partition("/")
+    if remote != "origin" or not sep or not branch:
+        return None
+    return branch
+
+
+def no_marker_base_ref(repo: Path, base_ref: str) -> str:
+    remote_ref = remote_default_base_ref(repo)
+    if not remote_ref:
+        return base_ref
+    branch = current_branch(repo)
+    remote_branch = _remote_branch_name(remote_ref)
+    if branch and remote_branch and branch == remote_branch:
+        return remote_ref
+    if branch and branch == base_ref and remote_ref == f"origin/{base_ref}":
+        return remote_ref
+    return base_ref
+
+
 def commits_since(repo: Path, start_commit: str) -> int:
     raw = _git(repo, ["rev-list", "--count", f"{start_commit}..HEAD"])
     return int(raw or "0")
@@ -424,7 +507,7 @@ def check_status(
         active = bool(queue_status.get("active")) and queue is not None
     else:
         queue = queue.resolve()
-    marker = read_marker(root)
+    marker = read_marker(root, project_root=project)
     clean_marker = clean_marker_details(marker)
     clean_marker_commit = clean_marker.get("commit") if clean_marker else None
     repo_error = None
@@ -450,7 +533,7 @@ def check_status(
             "warnings": [],
             "error": None,
             "queue_file": None,
-            "marker_path": str(marker_path(root)),
+            "marker_path": str(marker_path(root, project_root=project)),
         }
 
     if repo_error:
@@ -459,13 +542,14 @@ def check_status(
     elif marker_anchor:
         start = marker_anchor
     else:
-        arc_start = merge_base(repo_root, base_ref)
+        arc_base_ref = no_marker_base_ref(repo_root, base_ref)
+        arc_start = merge_base(repo_root, arc_base_ref)
         start = arc_start
         if clean_marker_commit and not marker_anchor:
             count_error = "clean marker commit unreachable"
     if start is None:
         count = None
-        count_error = count_error or f"no merge-base {base_ref}"
+        count_error = count_error or f"no merge-base {arc_base_ref if 'arc_base_ref' in locals() else base_ref}"
     else:
         try:
             count = commits_since(repo_root, start)
@@ -499,7 +583,7 @@ def check_status(
         "warnings": cadence_warnings,
         "error": count_error,
         "queue_file": str(queue.relative_to(project)) if queue and _is_relative_to(queue, project) else (str(queue) if queue else None),
-        "marker_path": str(marker_path(root)),
+        "marker_path": str(marker_path(root, project_root=project)),
         "arc_start": arc_start,
         "tagged_milestone": tagged,
         "milestone_rows": rows,
@@ -558,11 +642,11 @@ def cmd_mark(args: argparse.Namespace) -> int:
         return 2
     root = Path(args.state_dir).expanduser() if args.state_dir else None
     try:
-        path = write_marker(commit=commit, verdict=args.verdict, root=root)
+        path = write_marker(commit=commit, verdict=args.verdict, root=root, project_root=repo)
     except OSError as exc:
         print(f"goalflight_milestone: mark failed: {exc}", file=sys.stderr)
         return 2
-    payload = read_marker(root) or {"commit": commit, "ts": None, "verdict": args.verdict}
+    payload = read_marker(root, project_root=repo) or {"commit": commit, "ts": None, "verdict": args.verdict}
     if args.json:
         print(json.dumps({"marker_path": str(path), "marker": payload}, sort_keys=True))
     else:
