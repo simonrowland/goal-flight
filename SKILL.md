@@ -23,6 +23,7 @@ allowed-tools:
   - Agent
   - Skill
   - AskUserQuestion
+  - TodoWrite
 triggers:
   - /goal-flight
   - start a long refactor
@@ -460,7 +461,7 @@ Workers communicate with one-line markers:
 Use three state layers:
 - project: git, tests, docs, queue
 - machine: capacity leases, dispatch ledger, cooldowns
-- conversation: current decisions and unresolved questions
+- conversation: current decisions, unresolved questions, optional controller-only TodoWrite tactical checklist (ephemeral, dies on compaction; never durable state — that is the queue + RESUME-NOTES)
 
 Repository files are the canonical memory backend.
 Memory writeback requires migration lock ownership.

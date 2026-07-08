@@ -6,6 +6,9 @@ incremented when meaningful skill behaviour changes.
 
 ## [Unreleased]
 
+- Restored `TodoWrite` to the controller `allowed-tools` as the optional
+  ephemeral in-session tactical checklist layer (controller-direct only, no
+  task-store conflict); documented its boundary in the State layers section.
 - Added first-class per-project worker orientation: a canonical
   `templates/worker-orientation.md`, `docs-private/rag/ORIENTATION.md` upkeep
   guidance, and dispatch prompt auto-pointers with `--no-orientation` opt-out.
