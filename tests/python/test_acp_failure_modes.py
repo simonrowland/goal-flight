@@ -262,7 +262,9 @@ def case_manifest_acp_command_defaults() -> None:
 
     binary, args = agent_command("grok-acp")
     assert Path(binary).name == "grok"
-    assert args == ["agent", "--model", "grok-composer-2.5-fast", "stdio"]
+    # grok-acp now omits --model too (grok's CLI default grok-4.5 applies and
+    # writes reliably through ACP); an explicit model still passes through.
+    assert args == ["agent", "stdio"]
 
     binary, args = agent_command("cursor")
     assert Path(binary).name == "cursor-agent"

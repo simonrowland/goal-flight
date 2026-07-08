@@ -95,9 +95,15 @@ def case_agent_command_per_agent_placement() -> None:
 
 
 def case_grok_acp_default_model() -> None:
+    # grok-acp now omits --model by default — grok's CLI default (grok-4.5)
+    # applies and writes reliably through ACP (validated live 2026-07-08); the
+    # old composer ACP pin is retired.
     _, args = acp.agent_command("grok-acp")
-    assert args[-3:] == ["--model", MODEL, "stdio"], args
-    _, args_explicit = acp.agent_command("grok-acp", model=None)
+    assert args == ["agent", "stdio"], args
+    _, args_none = acp.agent_command("grok-acp", model=None)
+    assert args_none == ["agent", "stdio"], args_none
+    # an explicit model still passes through (before the stdio terminal).
+    _, args_explicit = acp.agent_command("grok-acp", model=MODEL)
     assert args_explicit == ["agent", "--model", MODEL, "stdio"], args_explicit
 
 

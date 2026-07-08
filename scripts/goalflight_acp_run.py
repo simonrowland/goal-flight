@@ -785,14 +785,14 @@ def _uses_session_model(agent: str) -> bool:
 
 # Quality-by-default: when no model is selected, dispatch the agent's strongest
 # model where it is UNAMBIGUOUS and above the agent's own default. codex already
-# defaults strong (user config), grok-code/grok-research bash-tail keep their own
-# task-dependent defaults, grok-acp pins Composer 2.5 for ACP writes, cursor/opencode
-# "strongest" is ambiguous, and claude-code-cli-acp must be launched with no argv
-# flags to stay in ACP server mode.
-_GROK_ACP_DEFAULT_MODEL = "grok-composer-2.5-fast"
-_DEFAULT_STRONG_MODEL: dict[str, str] = {
-    "grok-acp": _GROK_ACP_DEFAULT_MODEL,
-}
+# defaults strong (user config). grok (bash AND acp) now omits --model so grok's
+# own CLI default applies (grok-4.5) — it writes reliably through ACP (validated
+# 2026-07-08 via a live grok-acp file-write smoke), retiring the old
+# grok-composer-2.5-fast ACP pin and auto-tracking grok's default forward.
+# cursor/opencode "strongest" is ambiguous, and claude-code-cli-acp must be
+# launched with no argv flags to stay in ACP server mode. An explicit --model
+# still passes through for any agent.
+_DEFAULT_STRONG_MODEL: dict[str, str] = {}
 
 
 def _grok_acp_base_command() -> tuple[str, list[str]]:
