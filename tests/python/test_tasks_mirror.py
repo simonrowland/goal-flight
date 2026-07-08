@@ -939,7 +939,7 @@ def test_goalflight_task_set_blocked_by_rejects_invalid_item_ids_without_mutatio
             assert_true("invalid blocked_by replacement leaves item unchanged", _read_items(project) == before)
 
 
-def test_goalflight_task_set_prompt_path_dispatch_frontier_dry_run_uses_prompt_file() -> None:
+def test_goalflight_task_set_prompt_path_dispatch_frontier_dry_run_uses_prompt_summary() -> None:
     with tempfile.TemporaryDirectory() as td:
         project = Path(td) / "project-a"
         prompts = project / "prompts"
@@ -971,7 +971,8 @@ def test_goalflight_task_set_prompt_path_dispatch_frontier_dry_run_uses_prompt_f
         proc = run_task(project, "dispatch-frontier", "--dry-run")
         assert_true(f"dispatch-frontier --dry-run exits 0: {proc.stderr}", proc.returncode == 0)
         resolved = prompt_file.resolve(strict=False)
-        assert_true("dispatch-frontier dry-run emits prompt file flag", f"--prompt-file {resolved}" in proc.stdout)
+        assert_true("dispatch-frontier dry-run emits prompt path summary", f"t-040 -> {resolved} -> codex" in proc.stdout)
+        assert_true("dispatch-frontier dry-run omits dispatch flag", "--prompt-file" not in proc.stdout)
         assert_true("dispatch-frontier dry-run keeps item and agent", "t-040 ->" in proc.stdout and "-> codex" in proc.stdout)
 
 
@@ -2043,7 +2044,7 @@ def main() -> None:
     test_goalflight_task_edit_existing_item_fields_and_audit()
     test_goalflight_task_set_prompt_path_rejects_unsafe_paths_without_mutation()
     test_goalflight_task_set_blocked_by_rejects_invalid_item_ids_without_mutation()
-    test_goalflight_task_set_prompt_path_dispatch_frontier_dry_run_uses_prompt_file()
+    test_goalflight_task_set_prompt_path_dispatch_frontier_dry_run_uses_prompt_summary()
     test_goalflight_task_two_state_accept_and_review_breadcrumb()
     test_goalflight_task_review_captures_confirmed_bug_item()
     test_goalflight_task_harvest_idempotent_with_source_links_and_history()

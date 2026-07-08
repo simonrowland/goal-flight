@@ -3904,7 +3904,7 @@ def _cmd_pipe(store: TaskStore, args: argparse.Namespace) -> int:
             print(json.dumps({"piped": piped, "skipped": skipped}, ensure_ascii=False, sort_keys=True))
         else:
             for entry in piped:
-                prompt_ref = entry["prompt"] if entry["prompt"] == "<inline>" else f"--prompt-file {entry['prompt']}"
+                prompt_ref = entry["prompt"]
                 print(f"{entry['id']} -> {prompt_ref} -> {entry['agent']}")
             for entry in skipped:
                 print(f"{entry['id']} not piped ({entry['reason']})")

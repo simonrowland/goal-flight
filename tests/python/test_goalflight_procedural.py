@@ -655,9 +655,11 @@ def test_instruction_split_contract() -> None:
         # "Gotchas from session traffic" section. Raised 31KB -> 32.5KB on 2026-07-05
         # for the deliberate "Command danger classification" taxonomy (concise; the
         # full detail + drainer daemon + incident writeup live in
-        # protocols/dispatch-danger.md, off the SKILL budget). Catches future bloat.
-        f"SKILL under 32.5KB (got {len(skill.encode())}B)",
-        len(skill.encode()) <= 32_500,
+        # protocols/dispatch-danger.md, off the SKILL budget). Raised 32.5KB -> 33.5KB
+        # on 2026-07-08 for load-bearing review-cadence hardening; wc-line <=545
+        # remains the primary budget. Catches future bloat.
+        f"SKILL under 33.5KB (got {len(skill.encode())}B)",
+        len(skill.encode()) <= 33_500,
     )
     for protocol in [
         "session-preflight.md",
