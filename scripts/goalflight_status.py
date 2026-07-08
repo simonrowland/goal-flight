@@ -1012,6 +1012,21 @@ def _milestone_payload(project_root: str | None) -> dict:
         }
 
 
+def _milestone_nudge_line(status: dict) -> str | None:
+    if not status.get("active_cadence"):
+        return None
+    if status.get("error"):
+        return None
+    count = status.get("commits_since")
+    count_s = "?" if count is None else str(count)
+    cadence = status.get("K") or "?"
+    verdict = "DUE" if status.get("due") else "ok"
+    return (
+        "milestone nudge: "
+        f"chunks since last milestone sweep = {count_s} (sweep due at {cadence}) -> {verdict}"
+    )
+
+
 def _parse_wait_ids(values: list[str] | None) -> list[str]:
     ids: list[str] = []
     seen: set[str] = set()
@@ -1564,6 +1579,9 @@ def render_text(payload: dict, limit: int) -> list[str]:
     lines.extend(goalflight_quota_stuck.advisory_lines(payload.get("rate_pressure"), limit=limit))
     if payload.get("milestone"):
         lines.append(goalflight_milestone.format_line(payload["milestone"]))
+        nudge = _milestone_nudge_line(payload["milestone"])
+        if nudge:
+            lines.append(nudge)
     # Live/ambiguous first (what the controller is waiting on), then most-recent
     # terminal; cap at --limit.
     live = [r for r in records if done_code(r) != 0]
@@ -1786,6 +1804,11 @@ def main(argv: list[str] | None = None) -> int:
         metavar="PATH",
         help="write dashboard/status-data.js for the scoped project (no-op when dashboard dir is absent)",
     )
+    parser.add_argument(
+        "--record-milestone-sweep",
+        action="store_true",
+        help="record HEAD as the last clean milestone sweep in the Goal Flight state dir",
+    )
     parser.add_argument("--limit", type=int, default=20)
     args = parser.parse_args(argv)
 
@@ -1795,6 +1818,23 @@ def main(argv: list[str] | None = None) -> int:
         project_root = str(Path(args.project).resolve())
     else:
         project_root = this_project_root()
+
+    if args.record_milestone_sweep:
+        repo = Path(project_root).resolve() if project_root else (
+            goalflight_milestone.git_root(Path.cwd()) or Path.cwd()
+        )
+        try:
+            commit = goalflight_milestone.current_head(repo)
+            path = goalflight_milestone.write_marker(commit=commit, verdict="clean")
+        except (OSError, RuntimeError) as exc:
+            print(f"goalflight_status: milestone mark failed: {exc}", file=sys.stderr)
+            return 2
+        marker = goalflight_milestone.read_marker() or {"commit": commit, "verdict": "clean"}
+        if args.json:
+            print(json.dumps({"marker_path": str(path), "marker": marker}, sort_keys=True))
+        else:
+            print(f"marked milestone sweep @ {goalflight_milestone.short_commit(commit)} -> {path}")
+        return 0
 
     if args.export_dashboard is not None:
         export_dashboard_status(project_root, args.export_dashboard or None)

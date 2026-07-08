@@ -34,7 +34,7 @@ This is a soft-check, not a guarantee. The heuristics catch common failure modes
    - **Layer 2** — pointer at canonical pattern (`docs-private/rag/patterns/<X>.md` if corpus exists). Framing: *"Investigate as starting hypothesis; verify before mirroring."*
    - **Layer 3** — pointer at file-map (`docs-private/rag/file-map.md`). Framing: *"Use as navigation; verify every file:line before relying."*
    - **Layer 4** — environment caveats. Only what the agent can't discover in <5s.
-   - **Layer 5** — abstract self-review categories from `prompts/executor-self-review.md`. **Executor specializes in the REPORT, not in this prompt.**
+   - **Layer 5** — abstract self-review categories from `prompts/executor-self-review.md` plus the universal null-hypothesis floor. **Executor specializes in the REPORT, not in this prompt.**
    - **Layer 6** — marker vocabulary (one line: instruct the worker to emit `STATUS:`, `RESULT:`, `USER-NEED:`, `USER-CONFIRM:`, `BLOCKED:`, `COMPLETE:` per `protocols/worker-markers.md`).
 
 3. Print in a fenced block with header (slug, layer set, byte count).
@@ -47,7 +47,7 @@ Surfaced as warnings or P0 blockers. None is sufficient on its own; treat as sug
 - **Byte count < 800 B** → WARN. Likely missing layers.
 - **Layer 0 missing for worktree-isolated dispatch** OR **expected-SHA is empty / matches `<PASTE_HERE>` placeholder / no `git fetch origin` was run in the past minute** → P0 BLOCKER. Do not dispatch; the worktree-base failure mode is real, and a stale local `main` SHA fails the spirit of the check. ("Worktree-isolated dispatch" = the executor's filesystem is a separate `git worktree` branched off some base; relevant whenever the selected adapter declares worktree-isolated delegation OR when parallel mode spawns chunks under `<repo>/.claude/worktrees/*` per `commands/execute.md` step 3. Non-isolated dispatches — `codex exec`, single-shot non-isolated delegation, all run in the orchestrator's cwd — skip Layer 0.)
 - **Any layer (2/3/4) contains `:line-number` anchors without verification framing nearby** (the strings "verify", "starting hypothesis", "before relying", "map", "investigate" within the same paragraph) → WARN. Pre-paste regression. Counts the anchors, NOT just presence — > 10 file:line anchors total is the threshold (the pointer pattern usually has 3–5).
-- **Layer 5 contains chunk-specific specialization** (anything beyond the 7 abstract category names + "specialize in the report") → WARN. Layer 5 stays abstract in the prompt; specialization moves to the executor's report.
+- **Layer 5 contains chunk-specific specialization** (anything beyond the 7 abstract category names + universal null-hypothesis floor + "specialize in the report") → WARN. Layer 5 stays abstract in the prompt; the null-hypothesis line is expected, and chunk-specific specialization moves to the executor's report.
 - **Layer 6 missing the marker-vocabulary line** (no instruction telling the worker to emit `STATUS:` / `RESULT:` / `USER-NEED:` / `USER-CONFIRM:` / `BLOCKED:` / `COMPLETE:`) → WARN. Without the marker instruction, the worker can't signal back through the marker channel — it falls back to free-form prose the orchestrator can't parse for USER-NEED / BLOCKED.
 - **Goal text section is missing or empty** → P0 BLOCKER.
 

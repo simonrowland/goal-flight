@@ -96,6 +96,40 @@ rules here.
   start and before the commit gate (`protocols/worker-context-package.md`
   §Pin durability).
 
+## Self-review floor and tiers
+
+Before handoff, every worker applies the universal null-hypothesis floor and
+states the null hypothesis for its patch: this change did NOT achieve its stated
+purpose, is a no-op, or introduced a regression. The worker actively tries to
+confirm that null by running the failing case when one exists, diffing observed
+before/after behavior, and checking that the stated objective actually moved.
+Handoff is allowed only when evidence rejects the null; "it should work" is not
+evidence.
+
+Then the worker self-reviews to the tier its change actually earned. The worker
+trivial tier includes the seven-category self-review plus the universal
+null-hypothesis floor above; it does not add the controller chunk-review layer's
+separate >=2 concern-diverse floor.
+
+- **Trivial/mechanical**: run the existing seven-category self-review plus
+  universal null-hypothesis floor to green.
+- **Non-trivial**: run self-review to convergence with at least two
+  concern-diverse lenses. This is the floor, not the target; add perspectives
+  as complexity warrants. When a second engine is abundant, run at least one pass
+  on a different engine than the author. Convergence means a clean round with
+  zero P0/P1/P2 findings, not a round count.
+- **Complicated** (optimizer, search, numeric, objective-bearing paths): run
+  more than two concern-diverse perspectives, add deeper domain/adversarial
+  checks, and use a different engine when abundant.
+
+Axis rule for non-trivial worker self-review: perspectives are the floor and
+primary axis; engine diversity is a second axis that escalates by stakes. If
+only one engine is abundant, run the multi-angle lenses on it, note that engine
+diversity was unavailable, and do not strand budget or skip review chasing a
+second engine. Separately, controller chunk review keeps a universal >=2
+concern-diverse floor for every commit-worthy chunk, and milestone sweeps keep
+at least two concern-diverse reviewers/lenses as their floor.
+
 ## Worker workaround prohibition
 
 Workers DO NOT execute workarounds (alternate APIs, git plumbing, inline

@@ -7,15 +7,20 @@ chunk-level wording into milestone docs or vice versa).
 ## When
 
 After a chunk's implementation and focused tests pass, before the orchestrator
-commits. At least **two independent, concern-diverse reviews** per commit-worthy
-chunk — executor self-review alone is **not** sufficient, and neither is a single
-reviewer.
+commits. Per-ticket gate: on receipt, the controller re-takes the
+null-hypothesis stance itself, not the worker's claim — assume the change did
+NOT achieve its stated purpose, is a no-op, or introduced a regression. The
+patch is not done until controller-held evidence rejects that null and shows a
+neighbor did not break. The controller review is **mandatory for each returning
+chunk** and is distinct from the milestone sweep. At least **two independent,
+concern-diverse reviews** per commit-worthy chunk is the floor, not the target —
+executor self-review alone is **not** sufficient, and neither is a single reviewer.
 
 **The norm is a parallel review flight, not a single pass.** For a commit-worthy
 chunk, run **≥2 concern-diverse reviewers in parallel** (e.g. gstack `/review` +
 `./scripts/autoreview.sh`, or two concern-diverse engines), and add **model
 diversity** when the change is subtle, security-/contract-bearing, or a fix
-closure. **The floor is ≥2** — the parallel concern-diverse flight is the mandatory
+closure. **The floor is ≥2, not the target** — the parallel concern-diverse flight is the mandatory
 minimum, not merely the norm; a single review does not satisfy it. The failure mode
 is too FEW reviews, never too many (and "too few" now means fewer than two). Dispatch
 the legs in parallel (backgrounded), not serially, so review breadth costs wall-clock
@@ -30,6 +35,18 @@ clean) or several; running N rounds is not "converged", a clean round is, and ma
 rounds without a clean one is explicitly NOT converged. The two pillars are
 **parallel breadth** (concern-diverse reviewers at once) and **per-patch
 convergence** (a clean — zero-P0/P1/P2 — round before the patch is done).
+
+## Review axes
+
+Concern diversity is the universal floor, not the target: every non-trivial
+review uses at least two lenses, and complicated or high-risk work scales above
+two. Engine diversity is a second axis that escalates with stakes: optional for
+trivial/mechanical changes, expected when abundant for non-trivial changes, and
+strongly expected for complicated optimizer, search, numeric, or
+objective-bearing paths. The null-hypothesis stance is universal for every
+patch, including trivial ones; it is not a complexity tier. If only one engine
+is abundant, run the multi-angle lenses on it and record that engine diversity
+was unavailable; never skip review or strand budget to chase another engine.
 
 ## How the review runs (bash-tail subprocess, not nested ACP tool call)
 
@@ -237,10 +254,11 @@ review time, not dead time.
 | Executor self-review | In-worker pass (`prompts/executor-self-review.md`) | Every chunk (inside worker output) |
 | **Chunk review — `gstack /review` (default)** | **Pre-commit independent structural review** | **Every commit-worthy chunk** |
 | `./scripts/autoreview.sh` (complementary) | Diff-local pre-commit pass, parallel with gstack | Per chunk when orchestrator chooses |
-| Milestone review | `protocols/milestone-review.md` (gstack `/review` + concern-diverse sweep) | At K-commit cadence or `[milestone]` queue chunks |
+| Milestone review | `protocols/milestone-review.md` (gstack `/review` + concern-diverse sweep) | Default 5 chunks, `[milestone]`, or before push |
 
 Minimum before commit: focused tests green **and** at least **two independent,
-concern-diverse reviews** (the FLOOR), run in parallel and iterated to convergence.
+concern-diverse reviews** (the FLOOR, not the target; scale above it for
+complicated or high-risk work), run in parallel and iterated to convergence.
 A single reviewer no longer satisfies the floor; gstack `/review` is one leg, not the
 whole gate. **Every new bug class a review surfaces triggers the
 MINT-generalize loop** (`protocols/review-mining.md`): record the class predicate,
@@ -274,7 +292,7 @@ Do not skip review entirely when tests pass.
   gstack is absent. This is the R19 regression class.
 - **Folding milestone-review semantics into this protocol.** Milestone
   reviews live in `protocols/milestone-review.md` and follow a separate
-  cadence (K commits or `[milestone]` queue chunks). Do not cross-reference
+  cadence (default 5 chunks, `[milestone]`, or before push). Do not cross-reference
   milestone protocol body into this file or vice versa.
 
 ## Install

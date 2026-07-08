@@ -162,11 +162,14 @@ Read `protocols/chunk-review.md`.
 
 - inspect diff
 - run focused tests
+- re-take the null-hypothesis stance yourself: prove the patch did the stated
+  thing and did not no-op or break a neighbor before accepting worker evidence
 - run at least **two** independent, **concern-diverse** pre-commit reviews per
-  `protocols/chunk-review.md` (the parallel flight is the FLOOR, not just the norm) — e.g.
+  `protocols/chunk-review.md` (the parallel flight is the FLOOR, not the target) — e.g.
   gstack `/review` on the chunk diff AND `./scripts/autoreview.sh --mode local` in parallel,
-  or two concern-diverse engines; background if >10s. Review each patch **to convergence** —
-  a clean (zero-P0/P1/P2) round, not a round count
+  or two concern-diverse engines; scale above two as complexity rises; background
+  if >10s. Review each patch **to convergence** — a clean (zero-P0/P1/P2) round,
+  not a round count
 - run executor self-review findings when present in worker output
 - fix P0/P1/P2 from review before commit
 - commit when the active goal-flight workflow completes a chunk (default: one
@@ -186,10 +189,15 @@ Read `protocols/chunk-review.md`.
 9. Milestone review (separate from step 8):
 
 At the configured cadence — **default: every 5 commit-worthy chunks since the last milestone
-sweep, unless the active plan sets K** — or on any `[milestone]` chunk, run file-backed review
-flights per `protocols/milestone-review.md` via `scripts/goalflight_review_job.py`. This gate is
-**mandatory and the most-forgotten**: a DUE sweep holds further chunk dispatch until it converges
-(a clean round). Missing/stalled/session-limited reviews are inconclusive, not clean.
+sweep, unless the active plan sets K** — on any `[milestone]` chunk, or before any push, run
+file-backed review flights per `protocols/milestone-review.md` via
+`scripts/goalflight_review_job.py`. Routine status surfaces the commit-count/tag nudge,
+`chunks since last milestone sweep = M (sweep due at K)`; it does not infer push intent or
+block dispatch/drain by itself. After a clean sweep, record it with
+`goalflight_status.py --record-milestone-sweep`. This gate is **mandatory and the
+most-forgotten**: a DUE sweep is an open liability; do not dispatch new implementation
+chunks or push until it converges to a clean round.
+Missing/stalled/session-limited reviews are inconclusive, not clean.
 
 10. Resume/handoff:
 

@@ -22,11 +22,18 @@ Right-size the shape — three loop failure modes to avoid:
   see the fix directly, controller-direct is correct even mid-run. The inverse
   rule (don't hand-iterate >~3 edit/test cycles) still holds — right-sizing
   cuts both ways.
-- **In-loop review convergence is severity-gated.** P0–P2 findings block loop
-  exit. Safe/easy in-scope P3s may be applied inline when mechanical (per
-  `protocols/chunk-review.md`) — but they never drive another iteration;
-  uncertain, non-mechanical, or out-of-scope P3s go into the worker's report
-  for store capture. Never keep looping solely for P3 polish.
+- **Every loop exits through a null-hypothesis check.** Before handoff, the
+  worker states the null hypothesis for the patch, actively tries to confirm it,
+  and hands off only when evidence rejects it; "it should work" is not evidence.
+- **In-loop review convergence is severity-gated and floor-based.** P0–P2
+  findings block loop exit. Trivial/mechanical chunks self-review the seven
+  categories to green; non-trivial chunks add at least two concern-diverse lenses
+  as the floor, not the target; complicated optimizer/search/numeric or
+  objective-bearing chunks use more than two perspectives, deeper checks, and a
+  different-engine pass when abundant. Safe/easy in-scope P3s may be applied
+  inline when mechanical (per `protocols/chunk-review.md`) — but they never drive
+  another iteration; uncertain, non-mechanical, or out-of-scope P3s go into the
+  worker's report for store capture. Never keep looping solely for P3 polish.
 - **Loops are iteration-bounded.** No new green progress across ~3 consecutive
   iterations → stop and return `BLOCKED:` with evidence (the fix so far OR the
   next honest reason), not more laps.

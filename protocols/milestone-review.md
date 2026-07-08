@@ -1,26 +1,33 @@
 # Milestone Review Protocol
 
-Milestone-scale review flights at configured cadence or `[milestone]` queue
-chunks. **Separate protocol** from per-chunk pre-commit review
+Milestone-scale review flights at default cadence, before push, or on
+`[milestone]` queue chunks. **Separate protocol** from per-chunk pre-commit review
 (`protocols/chunk-review.md`).
 
 ## When — mandatory cadence, NOT optional (the most-forgotten review layer)
 
-Two triggers, **mandatory at each** — milestone sweeps are routinely forgotten, so treat
-them as a gate, not a nicety:
-- **K-commit cadence** — every K commit-worthy chunks since the last milestone sweep (K per
-  the active plan / `commands/execute.md`; default 5 when unset).
+Three triggers, **mandatory at each** — milestone sweeps are routinely forgotten, so treat
+them as a controller-enforced gate, not a nicety:
+- **K-commit cadence** — default K=5 commit-worthy chunks since the last clean
+  milestone sweep unless the active plan configures another positive K.
 - **`[milestone]`-tagged chunks** — run the sweep as soon as that chunk lands.
+- **Before any push** — if the cadence state has not been swept clean for the
+  outgoing delta, run and record the sweep before publish.
 
-Track the commit of the last completed milestone sweep (its deposit under
-`docs-private/reviews/<date>-milestone-*/`). When the chunk count since then reaches K — or a
-`[milestone]` chunk lands — the sweep is **DUE**, and further chunk dispatch **waits until it
-COMPLETES — i.e. converges to a clean (zero-P0/P1/P2) round**, not merely launches. A skipped or
-overdue milestone sweep is an **open liability, not a clean state** (same rule as an unswept bug
-class); "I'll do it later" is a skip. The sweep is a **parallel concern-diverse flight reviewed to
-convergence** (the same **≥2-reviewer floor**; the milestone Convergence rule below governs what
-"converged" means here) across the milestone's accumulated diff, plus a backwards-looking pass
-over every chunk landed since the last milestone.
+`goalflight_status.py` surfaces the forcing nudge in routine status from
+commit-count and `[milestone]` tag state:
+`chunks since last milestone sweep = M (sweep due at K)`. It does not infer push
+intent and does not block dispatch/drain by itself. Record a clean sweep with
+`goalflight_status.py --record-milestone-sweep` after the review converges; the
+marker lives under the Goal Flight state dir. When the chunk count reaches K, a
+`[milestone]` chunk lands, or push is next, the sweep is **DUE**. A due sweep is
+an **open liability, not a clean state** (same rule as an unswept bug class): do
+not dispatch new implementation chunks or push while due. The controller enforces
+that obligation by checking the status nudge and this protocol before launch or
+publish; "I'll do it later" is a skip. The sweep is an aggressive
+concern-diverse flight with at least two concern-diverse reviewers/lenses as the
+floor: whole-delta walk, cross-lane-seam pass, and backwards look over every
+chunk landed since the last milestone.
 
 Run reviewers as file-backed jobs:
 

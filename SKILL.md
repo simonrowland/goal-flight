@@ -200,18 +200,18 @@ Review layers: executor self-review, chunk review, milestone review.
 
 | Layer | Gate | Default |
 |---|---|---|
-| Executor self-review | In-worker prompt before handoff | Executor self-review covers seven categories before handing off a chunk |
-| Chunk review | Every commit-worthy chunk | default gstack `/review`; `./scripts/autoreview.sh` as a complementary parallel option |
-| Milestone review | K-commit cadence or `[milestone]` chunks | `protocols/milestone-review.md`, gstack `/review` + concern-diverse sweep |
+| Executor self-review | In-worker prompt before handoff | Executor self-review covers seven categories before handing off a chunk; every worker states and rejects a null hypothesis with evidence; non-trivial adds ≥2 concern-diverse lenses as floor, not target |
+| Chunk review | Every commit-worthy chunk | mandatory controller review; default gstack `/review`; `./scripts/autoreview.sh` as a complementary parallel option |
+| Milestone review | 5 committed chunks since last clean sweep, `[milestone]` chunks, or before push | `protocols/milestone-review.md`, gstack `/review` + concern-diverse sweep |
 
-On chunk completion, dispatch gstack `/review` before committing.
+On chunk completion, dispatch gstack `/review` before committing; controller reviews EACH returning chunk with ≥2 concern-diverse lenses as floor, not target, re-takes the null stance, and scales above the floor by complexity before commit.
 Reviews go through gstack `/review` and `/challenge`; do not hand-roll review prompts.
 Reviewer misses become regression tests, not trust exemptions. Write review rubrics before first wave dispatch.
 Review results are saved durably (`docs-private/reviews/` or the chunk's research dir) — never /tmp-only; tails die at reboot and unsaved verdicts cannot be mined.
 Every NEW bug class triggers the MINT-generalize loop (`protocols/review-mining.md`): mint the class predicate, sweep BACKWARDS over code + the saved review archive for more instances, record the sweep (no-hit included), encode the class as a forward review lens. One catch, one class, one sweep.
 Reviews are one-shot; fixes loop to green and re-review; substantive fix closures get a refutation-stance closing pass that attacks the resolutions.
-Diversify reviewer concern, not just model. Use consolidation review for cross-slice contradictions.
-Milestone review is a separate gate from chunk review.
+Diversify reviewer concern, not just model: perspectives are the floor, not target; complicated work scales above two, while engine diversity escalates by stakes when abundant. Use consolidation review for cross-slice contradictions.
+Milestone review is a separate gate from chunk review; status prints chunks since last sweep; skipped due sweep = open liability.
 
 ## Nested Review Invocation
 
