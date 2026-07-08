@@ -3189,22 +3189,120 @@ def _cmd_unblock(store: TaskStore, args: argparse.Namespace) -> int:
     return 0
 
 
+def _item_for_update(store: TaskStore, items: list[dict[str, Any]], item_id: str) -> dict[str, Any]:
+    by_id = {item["id"]: item for item in items}
+    item = by_id.get(item_id)
+    if item is None:
+        raise TaskError(f"{store.tasks_path}: item not found: {item_id}")
+    return item
+
+
+def _set_item_lane(item: dict[str, Any], item_id: str, lane: str, actor: str) -> None:
+    _validate_lane_arg(lane)
+    old_lane = item.get("lane")
+    item["lane"] = lane
+    _append_audit(item, "lane", actor, old_lane=old_lane if isinstance(old_lane, str) else None, lane=lane)
+
+
+def _set_item_prompt_path(
+    store: TaskStore,
+    item: dict[str, Any],
+    item_id: str,
+    prompt_path: str,
+    actor: str,
+) -> None:
+    resolved = _resolve_item_prompt_path(store, prompt_path, item_id=item_id)
+    stored_prompt_path = resolved.relative_to(store.project_root.resolve(strict=False)).as_posix()
+    old = item.get("prompt_path")
+    item["prompt_path"] = stored_prompt_path
+    _append_audit(
+        item,
+        "set-prompt-path",
+        actor,
+        old_prompt_path=old if isinstance(old, str) else None,
+        prompt_path=stored_prompt_path,
+    )
+
+
+def _validate_set_blockers(items: list[dict[str, Any]], item_id: str, blockers: list[str]) -> None:
+    item_ids = {str(item.get("id")) for item in items if item.get("id")}
+    for blocker in blockers:
+        if blocker == item_id:
+            raise TaskError(f"{item_id}: blocked_by cannot include itself")
+        if blocker not in item_ids:
+            raise TaskError(f"{item_id}: blocked_by item not found: {blocker}")
+
+
+def _set_item_blocked_by(item: dict[str, Any], item_id: str, blockers: list[str], actor: str) -> None:
+    existing = item.setdefault("blocked_by", [])
+    if not isinstance(existing, LIST_TYPE):
+        raise TaskError(f"item {item_id}: blocked_by must be an array")
+    item["blocked_by"] = [value for value in blockers]
+    _append_audit(
+        item,
+        "set-blocked-by",
+        actor,
+        old_blocked_by=[value for value in existing],
+        blocked_by=[value for value in blockers],
+    )
+
+
 def _cmd_lane(store: TaskStore, args: argparse.Namespace) -> int:
     actor = _actor(args)
     _validate_lane_arg(args.lane)
 
     def update(items: list[dict[str, Any]]) -> None:
-        by_id = {item["id"]: item for item in items}
-        item = by_id.get(args.item_id)
-        if item is None:
-            raise TaskError(f"{store.tasks_path}: item not found: {args.item_id}")
-        old_lane = item.get("lane")
-        item["lane"] = args.lane
-        _append_audit(item, "lane", actor, old_lane=old_lane if isinstance(old_lane, str) else None, lane=args.lane)
+        item = _item_for_update(store, items, args.item_id)
+        _set_item_lane(item, args.item_id, args.lane, actor)
 
     store.mutate_items(update)
     print(args.item_id)
     print(f"{args.item_id} -> lane {args.lane}", file=sys.stderr)
+    return 0
+
+
+def _cmd_set_prompt_path(store: TaskStore, args: argparse.Namespace) -> int:
+    """Set/replace an existing item's prompt_path (canonical on-disk dispatch source).
+
+    Retrofits the structured field for items created before it was supplied; `new`/`capture`
+    set it at creation. Validates path safety + existence via the same resolver dispatch uses.
+    """
+    actor = _actor(args)
+
+    def update(items: list[dict[str, Any]]) -> None:
+        item = _item_for_update(store, items, args.item_id)
+        _set_item_prompt_path(store, item, args.item_id, args.prompt_path, actor)
+
+    store.mutate_items(update)
+    print(args.item_id)
+    print(f"{args.item_id} -> prompt_path {args.prompt_path}", file=sys.stderr)
+    return 0
+
+
+def _cmd_set(store: TaskStore, args: argparse.Namespace) -> int:
+    has_prompt_path = args.prompt_path is not None
+    has_lane = args.lane is not None
+    has_blocked_by = args.blocked_by is not None
+    if not (has_prompt_path or has_lane or has_blocked_by):
+        raise TaskError("set: expected at least one of --prompt-path, --lane, --blocked-by")
+    if has_lane:
+        _validate_lane_arg(args.lane)
+    blockers = _dedupe_strs(_split_csv(args.blocked_by)) if has_blocked_by else None
+    actor = _actor(args)
+
+    def update(items: list[dict[str, Any]]) -> None:
+        item = _item_for_update(store, items, args.item_id)
+        if blockers is not None:
+            _validate_set_blockers(items, args.item_id, blockers)
+        if has_prompt_path:
+            _set_item_prompt_path(store, item, args.item_id, args.prompt_path, actor)
+        if has_lane:
+            _set_item_lane(item, args.item_id, args.lane, actor)
+        if blockers is not None:
+            _set_item_blocked_by(item, args.item_id, blockers, actor)
+
+    store.mutate_items(update)
+    print(args.item_id)
     return 0
 
 
@@ -3806,7 +3904,8 @@ def _cmd_pipe(store: TaskStore, args: argparse.Namespace) -> int:
             print(json.dumps({"piped": piped, "skipped": skipped}, ensure_ascii=False, sort_keys=True))
         else:
             for entry in piped:
-                print(f"{entry['id']} -> {entry['prompt']} -> {entry['agent']}")
+                prompt_ref = entry["prompt"] if entry["prompt"] == "<inline>" else f"--prompt-file {entry['prompt']}"
+                print(f"{entry['id']} -> {prompt_ref} -> {entry['agent']}")
             for entry in skipped:
                 print(f"{entry['id']} not piped ({entry['reason']})")
         return 0
@@ -4074,6 +4173,32 @@ def build_parser() -> argparse.ArgumentParser:
     append.add_argument("note")
     append.add_argument("--json", action="store_true")
     append.set_defaults(func=_cmd_append)
+
+    set_prompt_path = sub.add_parser(
+        "set-prompt-path",
+        help="Set/replace an existing item's prompt_path (canonical on-disk dispatch source).",
+    )
+    set_prompt_path.add_argument("--by", help=argparse.SUPPRESS)
+    set_prompt_path.add_argument("item_id")
+    set_prompt_path.add_argument("prompt_path")
+    set_prompt_path.set_defaults(func=_cmd_set_prompt_path)
+
+    set_item = sub.add_parser(
+        "set",
+        help="UPDATE: replace editable fields on an existing item.",
+        epilog=(
+            "examples:\n"
+            "  goalflight_task.py set t-014 --prompt-path docs-private/prompts/t-014.md\n"
+            "  goalflight_task.py set t-014 --lane held --blocked-by q-002,q-003"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    set_item.add_argument("--by", help=argparse.SUPPRESS)
+    set_item.add_argument("item_id")
+    set_item.add_argument("--prompt-path")
+    set_item.add_argument("--lane", help="Set lane, including reserved lanes deferred and held.")
+    set_item.add_argument("--blocked-by", action="append", help="Replace the blocker list; comma-separated, repeatable, or empty to clear.")
+    set_item.set_defaults(func=_cmd_set)
 
     done = sub.add_parser(
         "done",

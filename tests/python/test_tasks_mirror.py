@@ -753,6 +753,228 @@ def test_goalflight_task_list_lane_facet_and_status_collision() -> None:
         )
 
 
+def test_goalflight_task_edit_existing_item_fields_and_audit() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        project = Path(td) / "project-a"
+        prompts = project / "prompts"
+        prompts.mkdir(parents=True)
+        (prompts / "initial.md").write_text("initial prompt\n", encoding="utf-8")
+        (prompts / "rendered.md").write_text("rendered prompt\n", encoding="utf-8")
+        items = [
+            {
+                "schema_version": 1,
+                "id": "t-010",
+                "kind": "task",
+                "title": "Rendered prompt task",
+                "blocked_by": ["q-001"],
+                "links": [],
+                "done": False,
+                "lane": "ui",
+                "created_at": "2020-01-01T00:00:00+00:00",
+                "audit": [{"at": "2020-01-01T00:00:00+00:00", "actor": "test", "action": "new"}],
+            },
+        ]
+        items.extend(
+            {
+                "schema_version": 1,
+                "id": blocker_id,
+                "kind": "task",
+                "title": f"Blocker {blocker_id}",
+                "blocked_by": [],
+                "links": [],
+                "done": False,
+                "created_at": "2020-01-01T00:00:00+00:00",
+                "audit": [{"at": "2020-01-01T00:00:00+00:00", "actor": "test", "action": "new"}],
+            }
+            for blocker_id in ["q-001", "q-002", "q-003"]
+        )
+        _write_tasks(project, items)
+        proc = run_task(project, "sync")
+        assert_true(f"seed sync exits 0: {proc.stderr}", proc.returncode == 0)
+
+        proc = run_task(project, "set-prompt-path", "t-010", str(prompts / "initial.md"))
+        assert_true(f"set-prompt-path exits 0: {proc.stderr}", proc.returncode == 0)
+        item = _read_items(project)[0]
+        assert_true("set-prompt-path stores absolute inside-root path as relative", item["prompt_path"] == "prompts/initial.md")
+        prompt_audit = item["audit"][-1]
+        assert_true("set-prompt-path audit action", prompt_audit["action"] == "set-prompt-path")
+        assert_true("set-prompt-path audit new path is relative", prompt_audit["prompt_path"] == "prompts/initial.md")
+        proc = run_task(project, "show", "t-010", "--json")
+        assert_true(f"show --json exits 0: {proc.stderr}", proc.returncode == 0)
+        assert_true("show serves relative prompt_path", json.loads(proc.stdout)["prompt_path"] == "prompts/initial.md")
+        proc = run_task(project, "show", "t-010", "--prompt")
+        assert_true(f"show --prompt exits 0: {proc.stderr}", proc.returncode == 0)
+        assert_true("relative-stored prompt_path still serves prompt content", proc.stdout == "initial prompt\n")
+
+        proc = run_task(
+            project,
+            "set",
+            "t-010",
+            "--prompt-path",
+            "prompts/rendered.md",
+            "--lane",
+            "held",
+            "--blocked-by",
+            "q-002,q-003",
+        )
+        assert_true(f"set exits 0: {proc.stderr}", proc.returncode == 0)
+        item = _read_items(project)[0]
+        assert_true("set updates prompt_path", item["prompt_path"] == "prompts/rendered.md")
+        assert_true("set updates reserved lane", item["lane"] == "held")
+        assert_true("set replaces blocked_by", item["blocked_by"] == ["q-002", "q-003"])
+        audit_tail = item["audit"][-3:]
+        assert_true("set writes per-field audit actions", [entry["action"] for entry in audit_tail] == ["set-prompt-path", "lane", "set-blocked-by"])
+        assert_true("set prompt audit old path", audit_tail[0]["old_prompt_path"] == "prompts/initial.md")
+        assert_true("set prompt audit new path", audit_tail[0]["prompt_path"] == "prompts/rendered.md")
+        assert_true("set lane audit old lane", audit_tail[1]["old_lane"] == "ui")
+        assert_true("set lane audit new lane", audit_tail[1]["lane"] == "held")
+        assert_true("set blocked_by audit old list", audit_tail[2]["old_blocked_by"] == ["q-001"])
+        assert_true("set blocked_by audit new list", audit_tail[2]["blocked_by"] == ["q-002", "q-003"])
+
+        proc = run_task(project, "set", "t-010")
+        assert_true("set rejects missing field flags", proc.returncode != 0)
+        assert_true("set missing flags error is clear", "expected at least one" in proc.stderr)
+
+        proc = run_task(project, "set", "missing", "--lane", "held")
+        assert_true("set rejects unknown item", proc.returncode != 0)
+        assert_true("set unknown item error is clear", "item not found: missing" in proc.stderr)
+
+        before = _read_items(project)
+        proc = run_task(project, "set-prompt-path", "missing", "prompts/initial.md")
+        assert_true("set-prompt-path rejects unknown item", proc.returncode != 0)
+        assert_true("set-prompt-path unknown item error is clear", "item not found: missing" in proc.stderr)
+        assert_true("set-prompt-path unknown item leaves store unchanged", _read_items(project) == before)
+
+
+def test_goalflight_task_set_prompt_path_rejects_unsafe_paths_without_mutation() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        project = root / "project-a"
+        prompts = project / "prompts"
+        prompts.mkdir(parents=True)
+        (prompts / "ok.md").write_text("ok prompt\n", encoding="utf-8")
+        (prompts / "target.md").write_text("target prompt\n", encoding="utf-8")
+        (prompts / "link.md").symlink_to(prompts / "target.md")
+        outside = root / "outside.md"
+        outside.write_text("outside prompt\n", encoding="utf-8")
+        items = [
+            {
+                "schema_version": 1,
+                "id": "t-020",
+                "kind": "task",
+                "title": "Unsafe prompt path task",
+                "blocked_by": [],
+                "links": [],
+                "done": False,
+                "prompt_path": "prompts/ok.md",
+                "created_at": "2020-01-01T00:00:00+00:00",
+                "audit": [{"at": "2020-01-01T00:00:00+00:00", "actor": "test", "action": "new"}],
+            },
+        ]
+        _write_tasks(project, items)
+        proc = run_task(project, "sync")
+        assert_true(f"seed sync exits 0: {proc.stderr}", proc.returncode == 0)
+
+        unsafe_cases = [
+            (str(outside), "resolves outside project root"),
+            ("../outside.md", "contains '..' component"),
+            ("prompts/link.md", "refusing symlink path component"),
+        ]
+        for prompt_path, expected_error in unsafe_cases:
+            proc = run_task(project, "set-prompt-path", "t-020", prompt_path)
+            assert_true(f"set-prompt-path rejects {prompt_path!r}", proc.returncode != 0)
+            assert_true(f"set-prompt-path reports {expected_error}", expected_error in proc.stderr)
+            item = _read_items(project)[0]
+            assert_true("unsafe set-prompt-path leaves prompt_path unchanged", item["prompt_path"] == "prompts/ok.md")
+            assert_true("unsafe set-prompt-path leaves audit unchanged", [entry["action"] for entry in item["audit"]] == ["new"])
+
+            before = _read_items(project)
+            proc = run_task(project, "set", "t-020", "--prompt-path", prompt_path, "--lane", "held")
+            assert_true(f"set --prompt-path rejects {prompt_path!r}", proc.returncode != 0)
+            assert_true(f"set --prompt-path reports {expected_error}", expected_error in proc.stderr)
+            assert_true("unsafe set --prompt-path leaves item unchanged", _read_items(project) == before)
+
+
+def test_goalflight_task_set_blocked_by_rejects_invalid_item_ids_without_mutation() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        project = Path(td) / "project-a"
+        items = [
+            {
+                "schema_version": 1,
+                "id": "t-030",
+                "kind": "task",
+                "title": "Blocked replacement task",
+                "blocked_by": ["t-031"],
+                "links": [],
+                "done": False,
+                "lane": "ui",
+                "created_at": "2020-01-01T00:00:00+00:00",
+                "audit": [{"at": "2020-01-01T00:00:00+00:00", "actor": "test", "action": "new"}],
+            },
+            {
+                "schema_version": 1,
+                "id": "t-031",
+                "kind": "task",
+                "title": "Existing blocker",
+                "blocked_by": [],
+                "links": [],
+                "done": False,
+                "created_at": "2020-01-01T00:00:00+00:00",
+                "audit": [{"at": "2020-01-01T00:00:00+00:00", "actor": "test", "action": "new"}],
+            },
+        ]
+        _write_tasks(project, items)
+        proc = run_task(project, "sync")
+        assert_true(f"seed sync exits 0: {proc.stderr}", proc.returncode == 0)
+
+        cases = [
+            ("t-030", "blocked_by cannot include itself"),
+            ("t-999", "blocked_by item not found: t-999"),
+        ]
+        for blocker, expected_error in cases:
+            before = _read_items(project)
+            proc = run_task(project, "set", "t-030", "--lane", "held", "--blocked-by", blocker)
+            assert_true(f"set rejects invalid blocked_by {blocker}", proc.returncode != 0)
+            assert_true(f"set reports invalid blocked_by {blocker}", expected_error in proc.stderr)
+            assert_true("invalid blocked_by replacement leaves item unchanged", _read_items(project) == before)
+
+
+def test_goalflight_task_set_prompt_path_dispatch_frontier_dry_run_uses_prompt_file() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        project = Path(td) / "project-a"
+        prompts = project / "prompts"
+        prompts.mkdir(parents=True)
+        prompt_file = prompts / "frontier.md"
+        prompt_file.write_text("frontier prompt\n", encoding="utf-8")
+        items = [
+            {
+                "schema_version": 1,
+                "id": "t-040",
+                "kind": "task",
+                "title": "Frontier prompt task",
+                "blocked_by": [],
+                "links": [],
+                "done": False,
+                "created_at": "2020-01-01T00:00:00+00:00",
+                "audit": [{"at": "2020-01-01T00:00:00+00:00", "actor": "test", "action": "new"}],
+            },
+        ]
+        _write_tasks(project, items)
+        proc = run_task(project, "sync")
+        assert_true(f"seed sync exits 0: {proc.stderr}", proc.returncode == 0)
+
+        proc = run_task(project, "set-prompt-path", "t-040", "prompts/frontier.md")
+        assert_true(f"set-prompt-path exits 0: {proc.stderr}", proc.returncode == 0)
+        item = _read_items(project)[0]
+        assert_true("set-prompt-path retrofits prompt_path", item["prompt_path"] == "prompts/frontier.md")
+
+        proc = run_task(project, "dispatch-frontier", "--dry-run")
+        assert_true(f"dispatch-frontier --dry-run exits 0: {proc.stderr}", proc.returncode == 0)
+        resolved = prompt_file.resolve(strict=False)
+        assert_true("dispatch-frontier dry-run emits prompt file flag", f"--prompt-file {resolved}" in proc.stdout)
+        assert_true("dispatch-frontier dry-run keeps item and agent", "t-040 ->" in proc.stdout and "-> codex" in proc.stdout)
+
+
 def test_goalflight_task_two_state_accept_and_review_breadcrumb() -> None:
     with tempfile.TemporaryDirectory() as td:
         project = Path(td)
@@ -1818,6 +2040,10 @@ def main() -> None:
     test_goalflight_task_sync_appends_plural_task_ids()
     test_goalflight_task_list_filters_outstanding_awaiting_review_since()
     test_goalflight_task_list_lane_facet_and_status_collision()
+    test_goalflight_task_edit_existing_item_fields_and_audit()
+    test_goalflight_task_set_prompt_path_rejects_unsafe_paths_without_mutation()
+    test_goalflight_task_set_blocked_by_rejects_invalid_item_ids_without_mutation()
+    test_goalflight_task_set_prompt_path_dispatch_frontier_dry_run_uses_prompt_file()
     test_goalflight_task_two_state_accept_and_review_breadcrumb()
     test_goalflight_task_review_captures_confirmed_bug_item()
     test_goalflight_task_harvest_idempotent_with_source_links_and_history()
@@ -1839,7 +2065,7 @@ def main() -> None:
     test_goalflight_task_sync_repairs_stale_mirror()
     test_goalflight_task_data_js_escapes_script_end_and_html()
     test_goalflight_task_sync_generates_markdown_views()
-    print("OK: 35 tasks mirror/task-store tests pass")
+    print("OK: 39 tasks mirror/task-store tests pass")
 
 
 if __name__ == "__main__":
