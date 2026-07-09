@@ -204,12 +204,12 @@
     "dispatch_presets": {
       "grok-code": {
         "transport": "cli",
-        "default_model": "grok-composer-2.5-fast",
-        "notes": "Coding worker; replaces retired bare grok dispatch label."
+        "default_model": "grok-4.5",
+        "notes": "Default flagged to grok-4.5 (2026-07-08, user directive); grok-composer-2.5-fast is the coding-specialised model, reachable via explicit --model."
       },
       "grok-research": {
         "transport": "cli",
-        "default_model": "grok-composer-2.5-fast",
+        "default_model": "grok-4.5",
         "web_search": "enabled_by_default",
         "notes": "Research/search worker; CLI has --disable-web-search only (no enable flag)."
       }
