@@ -868,10 +868,35 @@ def _harvest_file_status_token(value: str | None) -> str | None:
     text = _clean_markdown_title(value)
     if re.match(r"^in[\s_-]+progress\b", text, flags=re.IGNORECASE):
         return "IN_PROGRESS"
-    match = re.match(r"^([A-Za-z]+(?:_[A-Za-z]+)*)\b", text)
+    match = re.match(r"^([A-Za-z]+(?:[-_][A-Za-z]+)*)\b", text)
     if not match:
         return None
     return match.group(1).upper().replace("-", "_")
+
+
+def _harvest_status_vocabulary(value: str | None, default: set[str]) -> set[str]:
+    if value is None:
+        return set(default)
+    tokens = {_harvest_file_status_token(part.strip()) for part in value.split(",")}
+    return {token for token in tokens if token}
+
+
+def _harvest_flat_frontmatter(lines: list[str]) -> tuple[dict[str, str] | None, int, bool]:
+    """Parse the flat key: value frontmatter used by registry source files (not general YAML)."""
+    if not lines or lines[0].strip() != "---":
+        return None, 0, False
+    closing = next((index for index, line in enumerate(lines[1:], start=1) if line.strip() == "---"), None)
+    if closing is None:
+        return None, 0, True
+    values: dict[str, str] = {}
+    for line in lines[1:closing]:
+        match = re.match(r"^\s*([A-Za-z][A-Za-z0-9_-]*)\s*:\s*(.*?)\s*$", line)
+        if match:
+            value = match.group(2).strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+                value = value[1:-1]
+            values[match.group(1).lower().replace("-", "_")] = _strip_markdown_wrappers(value)
+    return values, closing + 1, False
 
 
 def _harvest_priority_tag(value: str | None) -> str | None:
@@ -2626,21 +2651,47 @@ def _harvest_file_task_candidate(
     default_kind: str,
     source_type: str,
     lane: str | None = None,
+    open_statuses: set[str] | None = None,
+    closed_statuses: set[str] | None = None,
+    status_key: str = "status",
 ) -> tuple[dict[str, Any] | None, str]:
     lines = text.splitlines()
-    first_h1 = _harvest_first_h1(lines)
+    frontmatter, body_start, malformed_frontmatter = _harvest_flat_frontmatter(lines)
+    title_from_frontmatter = (frontmatter or {}).get("title")
+    def outcome(value: str) -> str:
+        return f"malformed_frontmatter+{value}" if malformed_frontmatter else value
+
+    first_h1 = _harvest_first_h1(lines[body_start:])
+    if first_h1 is not None:
+        first_h1 = (first_h1[0] + body_start, first_h1[1])
+    if title_from_frontmatter:
+        first_h1 = (1, title_from_frontmatter)
     if first_h1 is None:
-        return None, "no_header_skipped"
+        return None, outcome("no_header_skipped")
     h1_lineno, raw_title = first_h1
     title = _harvest_file_task_title(raw_title)
     if not title:
-        return None, "no_header_skipped"
+        return None, outcome("no_header_skipped")
 
-    status_token = _harvest_file_status_token(_harvest_file_metadata_value(lines, "status"))
-    if status_token in HARVEST_FILE_CLOSED_STATUSES:
-        return None, "closed_skipped"
-    if status_token is not None and status_token not in HARVEST_FILE_OPEN_STATUSES:
-        status_token = None
+    normalized_status_key = status_key.lower().replace("-", "_")
+    selected_status_missing = (
+        normalized_status_key != "status"
+        and frontmatter is not None
+        and normalized_status_key not in frontmatter
+    )
+    status_value = (frontmatter or {}).get(normalized_status_key)
+    if normalized_status_key == "status" or selected_status_missing:
+        status_value = status_value or (frontmatter or {}).get("status") or (frontmatter or {}).get("disclosure_status")
+    if frontmatter is None:
+        status_value = _harvest_file_metadata_value(lines, "status")
+        selected_status_missing = normalized_status_key != "status"
+    status_token = _harvest_file_status_token(status_value)
+    effective_open = open_statuses if open_statuses is not None else HARVEST_FILE_OPEN_STATUSES
+    effective_closed = closed_statuses if closed_statuses is not None else HARVEST_FILE_CLOSED_STATUSES
+    if status_token in effective_closed:
+        closed_outcome = "closed_skipped+unknown_status" if selected_status_missing else "closed_skipped"
+        return None, outcome(closed_outcome)
+    unknown_status = selected_status_missing or (status_token is not None and status_token not in effective_open)
 
     candidate = _harvest_candidate(
         store,
@@ -2653,20 +2704,30 @@ def _harvest_file_task_candidate(
         key_scope_only=True,
     )
     if candidate is None:
-        return None, "no_header_skipped"
+        return None, outcome("no_header_skipped")
     if lane is not None:
         candidate["lane"] = lane
     tags = [*LIST_TYPE(candidate.get("tags") or []), "file-task"]
     if status_token == "IN_PROGRESS":
         tags.append("wip")
-    priority_tag = _harvest_priority_tag(_harvest_file_metadata_value(lines, "priority"))
+    if frontmatter and frontmatter.get("id"):
+        tags.append(f"src-id:{frontmatter['id']}")
+    priority_value = (frontmatter or {}).get("priority") if frontmatter is not None else _harvest_file_metadata_value(lines, "priority")
+    priority_tag = _harvest_priority_tag(priority_value)
     if priority_tag:
         tags.append(priority_tag)
+    if frontmatter and frontmatter.get("novelty"):
+        novelty = re.sub(r"\s+", "-", _clean_markdown_title(frontmatter["novelty"]).lower()).strip("-")
+        if novelty:
+            tags.append(f"novelty:{novelty}")
     candidate["tags"] = _dedupe_strs(tags)
-    prompt = _harvest_heading_prompt(lines[h1_lineno:])
+    prompt_lines = lines[body_start:] if title_from_frontmatter else lines[h1_lineno:]
+    prompt = _harvest_heading_prompt(prompt_lines)
     if prompt:
         candidate["prompt"] = prompt
-    return candidate, "imported"
+    if unknown_status:
+        return candidate, outcome("unknown_status")
+    return candidate, outcome("imported")
 
 
 def _harvest_review_candidates(store: TaskStore) -> list[dict[str, Any]]:
@@ -2833,6 +2894,9 @@ def _collect_harvest_candidates(
     no_implicit_resume: bool = False,
     headings_as_tasks: bool = False,
     file_as_task: bool = False,
+    open_statuses: set[str] | None = None,
+    closed_statuses: set[str] | None = None,
+    status_key: str = "status",
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     candidates: list[dict[str, Any]] = []
     source_matches: list[dict[str, Any]] = []
@@ -2862,6 +2926,8 @@ def _collect_harvest_candidates(
             summary["imported"] = 0
             summary["closed_skipped"] = 0
             summary["no_header_skipped"] = 0
+            summary["unknown_status"] = 0
+            summary["malformed_frontmatter"] = 0
         for path in paths:
             text = path.read_text(encoding="utf-8", errors="replace")
             skip_reason = _harvest_source_skip_reason(path, text, manual_source=True)
@@ -2879,16 +2945,29 @@ def _collect_harvest_candidates(
                     default_kind=source_kind,
                     source_type="manual-source",
                     lane=source_lane,
+                    open_statuses=open_statuses,
+                    closed_statuses=closed_statuses,
+                    status_key=status_key,
                 )
-                if outcome == "imported":
+                if outcome.endswith("imported") or "unknown_status" in outcome:
                     prior_count = len(candidates)
                     _append_candidate(candidates, candidate)
                     if len(candidates) > prior_count:
                         summary["imported"] = int(summary["imported"]) + 1
-                elif outcome == "closed_skipped":
+                    if "unknown_status" in outcome:
+                        summary["unknown_status"] = int(summary["unknown_status"]) + 1
+                    if "malformed_frontmatter" in outcome:
+                        summary["malformed_frontmatter"] = int(summary["malformed_frontmatter"]) + 1
+                elif "closed_skipped" in outcome:
                     summary["closed_skipped"] = int(summary["closed_skipped"]) + 1
-                elif outcome == "no_header_skipped":
+                    if "unknown_status" in outcome:
+                        summary["unknown_status"] = int(summary["unknown_status"]) + 1
+                    if "malformed_frontmatter" in outcome:
+                        summary["malformed_frontmatter"] = int(summary["malformed_frontmatter"]) + 1
+                elif "no_header_skipped" in outcome:
                     summary["no_header_skipped"] = int(summary["no_header_skipped"]) + 1
+                    if "malformed_frontmatter" in outcome:
+                        summary["malformed_frontmatter"] = int(summary["malformed_frontmatter"]) + 1
                 continue
             candidates.extend(
                 _harvest_heading_blocks(
@@ -3758,6 +3837,12 @@ def _cmd_harvest(store: TaskStore, args: argparse.Namespace) -> int:
     _validate_lane_arg(args.lane)
     if getattr(args, "file_as_task", False) and not args.sources:
         raise TaskError("--file-as-task requires at least one --source <glob>")
+    if (getattr(args, "open_status", None) is not None or getattr(args, "closed_status", None) is not None or getattr(args, "status_key", None) is not None) and not getattr(args, "file_as_task", False):
+        raise TaskError("--status-key, --open-status, and --closed-status require --file-as-task")
+    open_statuses = _harvest_status_vocabulary(getattr(args, "open_status", None), HARVEST_FILE_OPEN_STATUSES)
+    closed_statuses = _harvest_status_vocabulary(getattr(args, "closed_status", None), HARVEST_FILE_CLOSED_STATUSES)
+    if open_statuses & closed_statuses:
+        raise TaskError("--open-status and --closed-status must not overlap")
     candidates, source_matches = _collect_harvest_candidates(
         store,
         source_patterns=args.sources,
@@ -3768,6 +3853,9 @@ def _cmd_harvest(store: TaskStore, args: argparse.Namespace) -> int:
         no_implicit_resume=getattr(args, "no_implicit_resume", False),
         headings_as_tasks=getattr(args, "headings_as_tasks", False),
         file_as_task=getattr(args, "file_as_task", False),
+        open_statuses=open_statuses,
+        closed_statuses=closed_statuses,
+        status_key=getattr(args, "status_key", None) or "status",
     )
     if args.dry_run:
         payload = {
@@ -3818,6 +3906,9 @@ def _run_harvest_json(store: TaskStore, args: argparse.Namespace, *, dry_run: bo
         no_implicit_resume=getattr(args, "no_implicit_resume", False),
         headings_as_tasks=getattr(args, "headings_as_tasks", False),
         file_as_task=getattr(args, "file_as_task", False),
+        open_status=getattr(args, "open_status", None),
+        closed_status=getattr(args, "closed_status", None),
+        status_key=getattr(args, "status_key", None),
     )
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
@@ -3852,7 +3943,9 @@ def _source_match_text_lines(source_matches: list[dict[str, Any]]) -> list[str]:
                 f"file-as-task for {pattern}: {int(summary.get('files_matched') or 0)} matched, "
                 f"{int(summary.get('imported') or 0)} imported, "
                 f"{int(summary.get('closed_skipped') or 0)} closed_skipped, "
-                f"{int(summary.get('no_header_skipped') or 0)} no_header_skipped"
+                f"{int(summary.get('no_header_skipped') or 0)} no_header_skipped, "
+                f"{int(summary.get('unknown_status') or 0)} unknown_status, "
+                f"{int(summary.get('malformed_frontmatter') or 0)} malformed_frontmatter"
             )
         skipped = LIST_TYPE(summary.get("skipped_sources") or [])
         if skipped:
@@ -4573,6 +4666,9 @@ def build_parser() -> argparse.ArgumentParser:
     harvest.add_argument("--all-bullets", action="store_true", help="Harvest bullets from any section in --source files instead of only task/backlog/action/TODO/open/next sections.")
     harvest.add_argument("--headings-as-tasks", action="store_true", help="Also harvest guarded work-item headings from --source files; off by default to avoid prose-heading noise.")
     harvest.add_argument("--file-as-task", action="store_true", help="Import each matched --source file as one draft item, using its first H1 as the title.")
+    harvest.add_argument("--status-key", metavar="<name>", help="Frontmatter status key for --file-as-task (default: status; default key falls back to disclosure_status).")
+    harvest.add_argument("--open-status", metavar="<csv>", help="Comma-separated open status vocabulary for --file-as-task.")
+    harvest.add_argument("--closed-status", metavar="<csv>", help="Comma-separated closed status vocabulary for --file-as-task.")
     harvest.add_argument("--no-implicit-resume", action="store_true", help="Skip implicit RESUME-NOTES candidates during built-in harvest.")
     harvest.add_argument("--json", action="store_true")
     harvest.set_defaults(func=_cmd_harvest)

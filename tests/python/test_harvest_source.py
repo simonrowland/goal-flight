@@ -787,7 +787,136 @@ def test_harvest_source_file_as_task_imports_file_units_and_counts() -> None:
 
         proc = run_task(project, "harvest", "--source", "docs-private/pkg-*.md", "--file-as-task", "--dry-run")
         assert_true(f"file-as-task text dry-run exits 0: {proc.stderr}", proc.returncode == 0)
-        assert_true("file-as-task text summary visible", "file-as-task for docs-private/pkg-*.md: 5 matched, 2 imported, 2 closed_skipped, 1 no_header_skipped" in proc.stdout)
+        assert_true("file-as-task text summary visible", "file-as-task for docs-private/pkg-*.md: 5 matched, 2 imported, 2 closed_skipped, 1 no_header_skipped, 0 unknown_status, 0 malformed_frontmatter" in proc.stdout)
+
+
+def test_harvest_file_as_task_frontmatter_vocabulary_and_fallbacks() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        project = Path(td)
+        docs = project / "docs-private"
+        _write_tasks(project, [])
+        (docs / "registry-open.md").write_text(
+            """---
+type: "innovation"
+id: 'INN-042'
+title: "Frontmatter title wins"
+status: 'SEARCHED-CLEAR'
+created: "2026-01-02"
+updated: '2026-02-03'
+novelty: "High confidence"
+disclosure_status: 'FILED'
+---
+# TASK: Fallback title must lose
+
+## Description
+Synthetic heat-recovery concept.
+
+**Status:** DONE
+# TASK: Body heading must not double-trigger
+
+## Prior Art
+Neutral comparison notes.
+
+## Patent Search Queries
+- synthetic query phrase
+""",
+            encoding="utf-8",
+        )
+        (docs / "registry-h1.md").write_text(
+            "---\ntype: innovation\nstatus: HOLD-FOR-FILING\npriority: P2\n---\n# TASK: H1 fallback title\n\n## Description\nFallback body.\n",
+            encoding="utf-8",
+        )
+        (docs / "registry-closed.md").write_text(
+            "---\ntitle: Filed concept\nstatus: FILED\n---\n# Ignored H1\n",
+            encoding="utf-8",
+        )
+        (docs / "registry-disclosure-closed.md").write_text(
+            "---\ntitle: Released disclosure\ndisclosure_status: RELEASED\n---\n# Ignored H1\n",
+            encoding="utf-8",
+        )
+        (docs / "registry-unknown.md").write_text(
+            "---\ntitle: Keep unknown concept\nstatus: NEEDS-REVIEW\n---\n## Description\nBias to keep.\n",
+            encoding="utf-8",
+        )
+        (docs / "registry-dual-status.md").write_text(
+            '---\ntitle: Dual lifecycle and pipeline status\nstatus: draft\ndisclosure_status: "UNSEARCHED"\n---\n## Description\nOpen pipeline item.\n',
+            encoding="utf-8",
+        )
+        (docs / "registry-malformed.md").write_text(
+            "---\nid: BROKEN-1\n# TASK: Prose fallback survives malformed frontmatter\n\n**Status:** TODO\n",
+            encoding="utf-8",
+        )
+        (docs / "registry-malformed-closed.md").write_text(
+            "---\nid: BROKEN-2\n# TASK: Malformed closed fallback\n\n**Status:** FILED\n",
+            encoding="utf-8",
+        )
+        (docs / "registry-malformed-no-h1.md").write_text(
+            "---\nid: BROKEN-3\n**Status:** TODO\n",
+            encoding="utf-8",
+        )
+        proc = run_task(
+            project, "harvest", "--source", "docs-private/registry-*.md", "--file-as-task",
+            "--open-status", "UNSEARCHED,SEARCHED-CLEAR,SEARCHED-CONFLICT,HOLD-FOR-FILING",
+            "--closed-status", "FILED,RELEASED", "--dry-run", "--json",
+        )
+        assert_true(f"frontmatter harvest exits 0: {proc.stderr}", proc.returncode == 0)
+        payload = json.loads(proc.stdout)
+        summary = payload["source_matches"][0]
+        assert_true("frontmatter counts", summary["imported"] == 5 and summary["closed_skipped"] == 3)
+        assert_true("unknown status counted", summary["unknown_status"] == 3)
+        assert_true("malformed frontmatter counted independently", summary["malformed_frontmatter"] == 3)
+        assert_true("malformed no-H1 retains no-header count", summary["no_header_skipped"] == 1)
+        drafts = payload["drafts"]
+        assert_true("whole-file exclusivity", len(drafts) == 5)
+        open_item = next(item for item in drafts if item["title"] == "Frontmatter title wins")
+        assert_true("frontmatter status wins over disclosure and prose", "src-id:INN-042" in open_item["tags"])
+        assert_true("novelty tag attached", "novelty:high-confidence" in open_item["tags"])
+        assert_true("frontmatter tags are quote-free", all("'" not in tag and '"' not in tag for tag in open_item["tags"]))
+        assert_true("body captured", "Patent Search Queries" in open_item.get("prompt", ""))
+        h1_item = next(item for item in drafts if item["title"] == "H1 fallback title")
+        assert_true("frontmatter priority tag attached", "priority:p2" in h1_item["tags"])
+        assert_true("fallback H1 not duplicated in prompt", "# TASK: H1 fallback title" not in h1_item.get("prompt", ""))
+        assert_true("unknown imported open", any(item["title"] == "Keep unknown concept" for item in drafts))
+        assert_true("malformed falls back to prose", any(item["title"] == "Prose fallback survives malformed frontmatter" for item in drafts))
+
+        quoted_known = run_task(
+            project, "harvest", "--source", "docs-private/registry-open.md", "--file-as-task",
+            "--open-status", "UNSEARCHED,SEARCHED-CLEAR", "--closed-status", "FILED", "--dry-run", "--json",
+        )
+        assert_true(f"quoted known-status harvest exits 0: {quoted_known.stderr}", quoted_known.returncode == 0)
+        quoted_payload = json.loads(quoted_known.stdout)
+        assert_true("quoted known status matches vocabulary", quoted_payload["source_matches"][0]["unknown_status"] == 0)
+        assert_true("quoted title is clean", quoted_payload["drafts"][0]["title"] == "Frontmatter title wins")
+
+        default_key = run_task(
+            project, "harvest", "--source", "docs-private/registry-dual-status.md", "--file-as-task",
+            "--open-status", "UNSEARCHED", "--dry-run", "--json",
+        )
+        default_payload = json.loads(default_key.stdout)
+        assert_true("default status key treats lifecycle draft as unknown", default_payload["source_matches"][0]["unknown_status"] == 1)
+
+        disclosure_key = run_task(
+            project, "harvest", "--source", "docs-private/registry-dual-status.md", "--file-as-task",
+            "--status-key", "disclosure_status", "--open-status", "UNSEARCHED", "--dry-run", "--json",
+        )
+        assert_true(f"disclosure status-key harvest exits 0: {disclosure_key.stderr}", disclosure_key.returncode == 0)
+        disclosure_payload = json.loads(disclosure_key.stdout)
+        assert_true("disclosure status key is recognized open", disclosure_payload["source_matches"][0]["unknown_status"] == 0)
+        assert_true("disclosure status key imports open item", len(disclosure_payload["drafts"]) == 1)
+
+
+def test_harvest_status_vocab_requires_file_as_task() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        project = Path(td)
+        _write_tasks(project, [])
+        proc = run_task(project, "harvest", "--source", "docs-private/*.md", "--open-status", "READY", "--dry-run")
+        assert_true("status vocab outside file mode fails", proc.returncode == 1)
+        assert_true("status vocab validation message", "require --file-as-task" in proc.stderr)
+        proc = run_task(project, "harvest", "--source", "docs-private/*.md", "--status-key", "disclosure_status", "--dry-run")
+        assert_true("status key outside file mode fails", proc.returncode == 1)
+        assert_true("status key validation message", "require --file-as-task" in proc.stderr)
+        proc = run_task(project, "harvest", "--source", "docs-private/*.md", "--status-key", "status", "--dry-run")
+        assert_true("explicit default status key outside file mode fails", proc.returncode == 1)
 
 
 def test_harvest_file_task_title_strip_precision() -> None:
@@ -832,6 +961,8 @@ if __name__ == "__main__":
     test_harvest_source_table_rows_open_only_and_non_task_tables_ignored()
     test_harvest_source_row_scoped_dedup_keeps_repeated_row_local_titles()
     test_harvest_source_file_as_task_imports_file_units_and_counts()
+    test_harvest_file_as_task_frontmatter_vocabulary_and_fallbacks()
+    test_harvest_status_vocab_requires_file_as_task()
     test_harvest_file_task_title_strip_precision()
     test_harvest_file_as_task_requires_source()
     print("PASS")
