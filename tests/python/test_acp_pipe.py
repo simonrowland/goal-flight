@@ -371,7 +371,7 @@ async def case_runner_overlimit_response_status_counts_drop() -> None:
     old_adapters_dir = goalflight_adapter_readiness.ADAPTERS_DIR
     os.environ["GOALFLIGHT_FAKE_ACP_SCENARIO"] = "overlimit_response"
     os.environ["GOALFLIGHT_ACP_LIMIT"] = "4k"
-    goalflight_acp_run.agent_command = lambda agent, model=None: (sys.executable, [str(FAKE)])
+    goalflight_acp_run.agent_command = lambda agent, model=None, fast=False: (sys.executable, [str(FAKE)])
     try:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -437,7 +437,7 @@ async def _run_fake_runner_scenario(
     os.environ["GOALFLIGHT_FAKE_ACP_SCENARIO"] = scenario
     for key, value in (extra_env or {}).items():
         os.environ[key] = value
-    goalflight_acp_run.agent_command = lambda agent, model=None: (sys.executable, [str(FAKE)])
+    goalflight_acp_run.agent_command = lambda agent, model=None, fast=False: (sys.executable, [str(FAKE)])
     try:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -676,7 +676,7 @@ async def case_runner_captures_agent_stderr_on_failure() -> None:
             tmp_path = Path(tmp)
             agent = tmp_path / "stderr_error_agent.py"
             _write_stderr_error_agent(agent)
-            goalflight_acp_run.agent_command = lambda _agent, model=None: (sys.executable, [str(agent)])
+            goalflight_acp_run.agent_command = lambda _agent, model=None, fast=False: (sys.executable, [str(agent)])
             goalflight_adapter_readiness.ADAPTERS_DIR = tmp_path
             os.environ["GOALFLIGHT_STATE_DIR"] = str(tmp_path / "state")
             os.environ["GOAL_FLIGHT_PIDFILE_DIR"] = str(tmp_path / "pids")
@@ -726,7 +726,7 @@ async def case_runner_tail_caps_agent_stderr_on_failure() -> None:
             tmp_path = Path(tmp)
             agent = tmp_path / "stderr_error_agent.py"
             _write_stderr_error_agent(agent)
-            goalflight_acp_run.agent_command = lambda _agent, model=None: (sys.executable, [str(agent)])
+            goalflight_acp_run.agent_command = lambda _agent, model=None, fast=False: (sys.executable, [str(agent)])
             goalflight_adapter_readiness.ADAPTERS_DIR = tmp_path
             os.environ["GOALFLIGHT_STATE_DIR"] = str(tmp_path / "state")
             os.environ["GOAL_FLIGHT_PIDFILE_DIR"] = str(tmp_path / "pids")
@@ -768,7 +768,7 @@ async def case_runner_tail_caps_agent_stderr_on_failure() -> None:
 async def case_runner_blocks_probe_required_adapter() -> None:
     old_agent_command = goalflight_acp_run.agent_command
     old_adapters_dir = goalflight_adapter_readiness.ADAPTERS_DIR
-    goalflight_acp_run.agent_command = lambda agent, model=None: (sys.executable, [str(FAKE)])
+    goalflight_acp_run.agent_command = lambda agent, model=None, fast=False: (sys.executable, [str(FAKE)])
     try:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -826,7 +826,7 @@ async def case_runner_blocks_probe_required_adapter() -> None:
 async def case_runner_blocks_invalid_adapter_manifest() -> None:
     old_agent_command = goalflight_acp_run.agent_command
     old_adapters_dir = goalflight_adapter_readiness.ADAPTERS_DIR
-    goalflight_acp_run.agent_command = lambda agent, model=None: (sys.executable, [str(FAKE)])
+    goalflight_acp_run.agent_command = lambda agent, model=None, fast=False: (sys.executable, [str(FAKE)])
     try:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -865,7 +865,7 @@ async def case_runner_blocks_invalid_adapter_manifest() -> None:
 async def case_runner_blocks_missing_adapter_manifest() -> None:
     old_agent_command = goalflight_acp_run.agent_command
     old_adapters_dir = goalflight_adapter_readiness.ADAPTERS_DIR
-    goalflight_acp_run.agent_command = lambda agent, model=None: (sys.executable, [str(FAKE)])
+    goalflight_acp_run.agent_command = lambda agent, model=None, fast=False: (sys.executable, [str(FAKE)])
     try:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -905,7 +905,7 @@ def case_direct_default_status_uses_dispatch_state_dir() -> None:
     old_adapters_dir = goalflight_adapter_readiness.ADAPTERS_DIR
     old_state_dir = os.environ.get("GOALFLIGHT_STATE_DIR")
     old_pidfile_dir = os.environ.get("GOAL_FLIGHT_PIDFILE_DIR")
-    goalflight_acp_run.agent_command = lambda agent, model=None: (sys.executable, [str(FAKE)])
+    goalflight_acp_run.agent_command = lambda agent, model=None, fast=False: (sys.executable, [str(FAKE)])
     try:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -956,7 +956,7 @@ def case_direct_explicit_status_json_wins() -> None:
     old_adapters_dir = goalflight_adapter_readiness.ADAPTERS_DIR
     old_state_dir = os.environ.get("GOALFLIGHT_STATE_DIR")
     old_pidfile_dir = os.environ.get("GOAL_FLIGHT_PIDFILE_DIR")
-    goalflight_acp_run.agent_command = lambda agent, model=None: (sys.executable, [str(FAKE)])
+    goalflight_acp_run.agent_command = lambda agent, model=None, fast=False: (sys.executable, [str(FAKE)])
     try:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)

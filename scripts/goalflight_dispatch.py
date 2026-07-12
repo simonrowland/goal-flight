@@ -3459,6 +3459,7 @@ def _build_acp_cfg(args, *, status_json: Path, base: Path | None = None):
     cfg = argparse.Namespace(
         agent=args.agent,
         model=getattr(args, "model", None),
+        fast=bool(getattr(args, "fast", False)),
         install_slot=None,
         cwd=str(project_root),
         worktree="off",
@@ -3883,12 +3884,12 @@ def _acp_context_mode_default(args) -> str:
     return "enabled"
 
 
-# --fast: worker CLIs that support a "fast"/priority processing tier, mapped to the
-# argv that enables it. codex -> OpenAI's `priority` service tier (faster processing
-# at premium cost, ~1.5x spend). Engines absent here still get the queue-skip that
-# --fast applies (critical priority) but no tier change. Extend this map (and add the
-# one-line `argv += _fast_tier_argv(args)` call in that engine's build_worker branch)
-# as other worker CLIs expose a priority-tier flag.
+# --fast premium-tier paths: codex bash-shape uses this map; codex-acp injects the
+# same OpenAI `priority` service tier in goalflight_acp_run.py. Both get faster
+# processing at premium cost (~1.5x spend). Other engines/shapes still get the
+# queue-skip that --fast applies (critical priority) but no tier change. Extend this
+# map (and add the one-line `argv += _fast_tier_argv(args)` call in that engine's
+# build_worker branch) as other bash-shape worker CLIs expose a priority-tier flag.
 FAST_TIER_ARGV: dict[str, list[str]] = {
     "codex": ["-c", "service_tier=priority"],
 }
@@ -3904,14 +3905,12 @@ def _fast_tier_argv(args) -> list[str]:
 
 def _apply_fast_mode(args) -> None:
     """Normalize --fast after arg parsing: it forces the urgent lane (critical
-    priority -> skip the queue) for EVERY engine/shape. The per-engine premium TIER
-    is injected AND announced in build_worker (see _fast_tier_argv), because only
-    build_worker knows the fully-resolved shape/agent and is the one place that
-    actually adds the argv. Announcing the premium there (not here) means the claim
-    can never lie on a path build_worker never reaches — e.g. --shape acp, where the
-    agent is later remapped to codex-acp and dispatch goes via goalflight_acp_run.py
-    (queue-skip only, no tier). Idempotent: runs again on the detached/queue replay;
-    the note prints only on the user's initial invocation to avoid tail noise."""
+    priority -> skip the queue) for EVERY engine/shape. The premium tier is injected
+    AND announced only at each argv injection site: build_worker for codex bash-shape,
+    and agent_command in goalflight_acp_run.py for codex-acp. Other engines/shapes get
+    queue-skip only. Keeping the announcement at the injection site prevents a false
+    premium claim. Idempotent: runs again on the detached/queue replay; the priority
+    note here prints only on the user's initial invocation to avoid tail noise."""
     if not getattr(args, "fast", False):
         return
     if getattr(args, "priority", None) != "critical":
@@ -4049,9 +4048,9 @@ def main(argv: list[str] | None = None) -> int:
                              "beyond the operating cap, never past the RAM ceiling). Default normal.")
     parser.add_argument("--fast", action="store_true",
                         help="Urgent + premium: forces --priority critical (skip the queue) AND, for "
-                             "engines that support it (codex bash-shape: OpenAI service_tier=priority, "
-                             "~1.5x token spend for faster processing), injects the fast processing tier. "
-                             "Other engines/shapes (incl. --shape acp) get the queue-skip only. See "
+                             "engines that support it (codex bash-shape and codex-acp: OpenAI "
+                             "service_tier=priority, ~1.5x token spend for faster processing), injects "
+                             "the fast processing tier. Other engines/shapes get the queue-skip only. See "
                              "FAST_TIER_ARGV. NOTE: --priority critical may borrow beyond the operating "
                              "cap, so --fast is for a SINGLE urgent dispatch — do NOT use it across a wide "
                              "fan-out (every worker would borrow past the cap and starve normal/bulk work).")

@@ -779,6 +779,13 @@ def _acp_model_args(agent: str, args: list[str], model: str) -> list[str]:
     return ["--model", model, *args]
 
 
+def _acp_fast_tier_args(agent: str, args: list[str]) -> list[str]:
+    """Insert the OpenAI priority service tier into codex ACP flags."""
+    if agent.strip().lower() in ("codex", "codex-acp"):
+        return ["-c", "service_tier=priority", *args]
+    return args
+
+
 def _uses_session_model(agent: str) -> bool:
     return agent.strip().lower() in {"claude", "claude-acp"}
 
@@ -799,7 +806,11 @@ def _grok_acp_base_command() -> tuple[str, list[str]]:
     return _resolve_manifest_binary("grok"), ["agent", "stdio"]
 
 
-def agent_command(agent: str, model: str | None = None) -> tuple[str, list[str]]:
+def agent_command(
+    agent: str,
+    model: str | None = None,
+    fast: bool = False,
+) -> tuple[str, list[str]]:
     agent_key = str(agent).strip().lower()
     manifest_command = _manifest_acp_command(agent)
     if manifest_command is not None:
@@ -814,6 +825,14 @@ def agent_command(agent: str, model: str | None = None) -> tuple[str, list[str]]
         model = _DEFAULT_STRONG_MODEL.get(agent_key)
     if model:
         args = _acp_model_args(agent, args, str(model))
+    if fast:
+        fast_args = _acp_fast_tier_args(agent, args)
+        if fast_args != args:
+            print(
+                "FAST: codex-acp service_tier=priority — premium processing (~1.5x token spend)",
+                file=sys.stderr,
+            )
+        args = fast_args
     return binary, args
 
 
@@ -1474,7 +1493,11 @@ async def _run_acp_dispatch_impl(
         write_status(status_path, payload)
         return payload
 
-    command, acp_args = agent_command(cfg.agent, model=getattr(cfg, "model", None))
+    command, acp_args = agent_command(
+        cfg.agent,
+        model=getattr(cfg, "model", None),
+        fast=getattr(cfg, "fast", False),
+    )
     spawn_env = _worker_spawn_env(cfg, original_prompt_file)
     gate = validate_acp_dispatch_readiness(cfg.agent, [command, *acp_args])
     if gate is not None:

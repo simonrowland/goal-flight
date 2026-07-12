@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
+import io
 import os
 from pathlib import Path
 import sys
@@ -24,6 +26,8 @@ import goalflight_acp_run as acp  # noqa: E402
 import goalflight_dispatch as dispatch  # noqa: E402
 
 MODEL = "grok-composer-2.5-fast"  # a valid explicit --model pin (still selectable)
+FAST_TIER = "service_tier=priority"
+FAST_NOTE = "FAST: codex-acp service_tier=priority — premium processing (~1.5x token spend)"
 # Both grok presets inject NO --model by default — grok's own CLI default
 # (grok-4.5 as of 2026-07-08) applies, auto-tracking forward. An explicit
 # --model still passes through (tested with MODEL above).
@@ -92,6 +96,29 @@ def case_agent_command_per_agent_placement() -> None:
     for agent in ("claude", "claude-acp"):
         _, args = acp.agent_command(agent, model=MODEL)
         assert args == [], (agent, args)
+
+
+def case_agent_command_fast_tier() -> None:
+    stderr = io.StringIO()
+    with contextlib.redirect_stderr(stderr):
+        _, fast_args = acp.agent_command("codex-acp", fast=True)
+    assert fast_args[:2] == ["-c", FAST_TIER], fast_args
+    assert stderr.getvalue().strip() == FAST_NOTE, stderr.getvalue()
+
+    _, default_args = acp.agent_command("codex-acp", fast=False)
+    assert FAST_TIER not in default_args, default_args
+
+    stderr = io.StringIO()
+    with contextlib.redirect_stderr(stderr):
+        _, grok_args = acp.agent_command("grok-acp", fast=True)
+    assert FAST_TIER not in grok_args and grok_args[-1] == "stdio", grok_args
+    assert stderr.getvalue() == "", stderr.getvalue()
+
+    stderr = io.StringIO()
+    with contextlib.redirect_stderr(stderr):
+        _, combined_args = acp.agent_command("codex-acp", model="X", fast=True)
+    assert combined_args[:4] == ["-c", FAST_TIER, "-c", "model=X"], combined_args
+    assert stderr.getvalue().strip() == FAST_NOTE, stderr.getvalue()
 
 
 def case_grok_acp_default_model() -> None:
@@ -182,10 +209,17 @@ def case_retired_bare_grok_agent_label() -> None:
         raise AssertionError("expected DispatchUsageError for --agent grok")
 
 
-def _acp_dispatch_args(*, cwd: Path, prompt_file: str | None = None, prompt: str | None = None):
+def _acp_dispatch_args(
+    *,
+    cwd: Path,
+    prompt_file: str | None = None,
+    prompt: str | None = None,
+    fast: bool = False,
+):
     return argparse.Namespace(
         agent="codex-acp",
         model=None,
+        fast=fast,
         cwd=str(cwd),
         read_only=False,
         dispatch_id="acp-prompt-env",
@@ -222,6 +256,14 @@ def case_dispatch_acp_cfg_passes_resolved_prompt_file() -> None:
         assert cfg.original_prompt_file == str(prompt.resolve()), cfg.original_prompt_file
         env = acp._worker_spawn_env(cfg, acp._resolve_original_prompt_file(cfg))
         assert env["GOALFLIGHT_PROMPT_FILE"] == str(prompt.resolve()), env.get("GOALFLIGHT_PROMPT_FILE")
+
+
+def case_dispatch_acp_cfg_passes_fast() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        args = _acp_dispatch_args(cwd=tmp, prompt="do work", fast=True)
+        cfg = dispatch._build_acp_cfg(args, status_json=tmp / "status.json")
+    assert cfg.fast is True, cfg.fast
 
 
 def case_direct_acp_prompt_exports_resolved_prompt_file() -> None:
@@ -279,12 +321,14 @@ def test_acp_prompt_file_env_and_preamble() -> None:
 
 def main() -> None:
     case_agent_command_per_agent_placement()
+    case_agent_command_fast_tier()
     case_grok_acp_default_model()
     case_agent_command_defaults()
     case_claude_model_applies_after_session_new()
     case_build_worker_injects_model()
     case_retired_bare_grok_agent_label()
     case_dispatch_acp_cfg_passes_resolved_prompt_file()
+    case_dispatch_acp_cfg_passes_fast()
     case_direct_acp_prompt_exports_resolved_prompt_file()
     case_promptless_acp_spawn_env_clears_prompt_file()
     case_acp_prompt_file_preamble_is_shared()
