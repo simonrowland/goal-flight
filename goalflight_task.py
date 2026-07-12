@@ -3125,6 +3125,310 @@ def _cmd_capture(store: TaskStore, args: argparse.Namespace) -> int:
     return 0
 
 
+def _import_content_key(kind: str, title: str) -> str:
+    return f"import:{_short_hash([kind, _norm_key(title)])}"
+
+
+def _import_content_signature(record: dict[str, Any], blocker_keys: dict[str, str]) -> tuple[Any, ...]:
+    # Agent-authored sidecars may re-emit set-like fields in nondeterministic
+    # order; treating that order as content would duplicate records on re-import.
+    return (
+        str(record.get("lane", "deferred")),
+        tuple(sorted(_dedupe_strs(record.get("tags", [])))),
+        tuple(sorted(blocker_keys.get(ref, ref) for ref in _dedupe_strs(record.get("blocked_by", [])))),
+        tuple(sorted(_dedupe_strs(record.get("links", [])))),
+    )
+
+
+def _read_import_records(path: Path) -> tuple[list[dict[str, Any]], list[str]]:
+    records: list[dict[str, Any]] = []
+    errors: list[str] = []
+    seen_drafts: dict[str, int] = {}
+    for lineno, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        if not raw.strip():
+            continue
+        try:
+            record = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            errors.append(f"line {lineno}: invalid JSON: {exc.msg}")
+            continue
+        if not isinstance(record, dict):
+            errors.append(f"line {lineno}: expected a JSON object")
+            continue
+        prefix = f"line {lineno}"
+        draft_id = record.get("id")
+        if not isinstance(draft_id, str) or not draft_id.startswith("draft-") or draft_id == "draft-":
+            if isinstance(draft_id, str) and ITEM_ID_RE.fullmatch(draft_id):
+                errors.append(f"{prefix}: id {draft_id!r} looks like a real store id; expected draft-<anything>")
+            else:
+                errors.append(f"{prefix}: id must be draft-<anything>")
+        elif draft_id in seen_drafts:
+            errors.append(f"{prefix}: duplicate draft id {draft_id!r} (first seen on line {seen_drafts[draft_id]})")
+        else:
+            seen_drafts[draft_id] = lineno
+        if record.get("schema_version") != 1:
+            errors.append(f"{prefix}: schema_version must be 1")
+        kind = record.get("kind")
+        if kind not in FAMILY_PREFIX_BY_KIND:
+            errors.append(f"{prefix}: kind must be task, bug, or decision")
+        title = record.get("title")
+        if not isinstance(title, str) or not title.strip():
+            errors.append(f"{prefix}: title must be a non-empty string")
+        lane = record.get("lane", "deferred")
+        if not isinstance(lane, str) or not lane.strip():
+            errors.append(f"{prefix}: lane must be a non-empty string")
+        for field in ("blocked_by", "links", "tags"):
+            value = record.get(field, [])
+            if not isinstance(value, LIST_TYPE) or any(not isinstance(entry, str) for entry in value):
+                errors.append(f"{prefix}: {field} must be an array of strings")
+        if isinstance(draft_id, str) and draft_id.startswith("draft-") and isinstance(kind, str) and isinstance(title, str):
+            normalized = dict(record)
+            normalized["title"] = title.strip()
+            normalized["lane"] = lane
+            for field in ("blocked_by", "links", "tags"):
+                value = normalized.get(field, [])
+                normalized[field] = value if isinstance(value, LIST_TYPE) and all(isinstance(entry, str) for entry in value) else []
+            normalized["_line"] = lineno
+            normalized["import_key"] = _import_content_key(kind, title)
+            records.append(normalized)
+    return records, errors
+
+
+def _preview_import_ids(store: TaskStore, families: list[str]) -> list[str]:
+    seq = store._read_seq()
+    current = {family: max(int(seq.get(family, 0)), store._max_existing_sequence(family)) for family in set(families)}
+    out: list[str] = []
+    for family in families:
+        current[family] += 1
+        out.append(f"{family}-{current[family]:03d}")
+    return out
+
+
+def _cmd_import(store: TaskStore, args: argparse.Namespace) -> int:
+    source = Path(args.sidecar)
+    if not source.is_absolute():
+        source = (Path.cwd() / source).resolve(strict=False)
+    require_regular_file(source)
+    records, errors = _read_import_records(source)
+    existing_items = store.load_items()
+    existing_by_id = {str(item["id"]): item for item in existing_items}
+    draft_ids = {str(record["id"]) for record in records}
+    unknown_refs = sorted({
+        ref
+        for record in records
+        for ref in record.get("blocked_by", [])
+        if ref not in draft_ids and ref not in existing_by_id
+    })
+    if unknown_refs:
+        errors.append(f"unknown blocked_by reference(s): {', '.join(unknown_refs)}")
+    draft_key_by_id = {str(record["id"]): str(record["import_key"]) for record in records}
+    existing_key_by_id = {
+        str(item["id"]): str(item["import_key"])
+        for item in existing_items
+        if isinstance(item.get("import_key"), str) and item.get("import_key")
+    }
+    blocker_keys = {**existing_key_by_id, **draft_key_by_id}
+    self_refs = sorted({
+        str(record["id"])
+        for record in records
+        if any(blocker_keys.get(ref, ref) == str(record["import_key"]) for ref in record.get("blocked_by", []))
+    })
+    if self_refs:
+        errors.append(f"self blocked_by reference(s): {', '.join(self_refs)}")
+    draft_edges = {
+        str(record["id"]): [
+            ref for ref in record.get("blocked_by", [])
+            if ref in draft_ids and ref != str(record["id"])
+        ]
+        for record in records
+    }
+    visiting: set[str] = set()
+    visited: set[str] = set()
+    path: list[str] = []
+    cycle: list[str] | None = None
+
+    def find_cycle(draft_id: str) -> None:
+        nonlocal cycle
+        if cycle is not None or draft_id in visited:
+            return
+        if draft_id in visiting:
+            start = path.index(draft_id)
+            cycle = path[start:] + [draft_id]
+            return
+        visiting.add(draft_id)
+        path.append(draft_id)
+        for blocker in draft_edges[draft_id]:
+            find_cycle(blocker)
+            if cycle is not None:
+                break
+        path.pop()
+        visiting.remove(draft_id)
+        visited.add(draft_id)
+
+    for draft_id in draft_edges:
+        find_cycle(draft_id)
+        if cycle is not None:
+            errors.append(f"dependency cycle among draft ids: {' -> '.join(cycle)}")
+            break
+    records_by_key: dict[str, list[dict[str, Any]]] = {}
+    for record in records:
+        records_by_key.setdefault(str(record["import_key"]), []).append(record)
+    for key_records in records_by_key.values():
+        first = key_records[0]
+        first_signature = _import_content_signature(first, blocker_keys)
+        for other in key_records[1:]:
+            if _import_content_signature(other, blocker_keys) != first_signature:
+                errors.append(
+                    "import content collision: "
+                    f"{first['id']} (line {first['_line']}) and {other['id']} (line {other['_line']}) "
+                    "share kind/title but differ in lane, tags, blocked_by, or links"
+                )
+    existing_by_key = {
+        str(item["import_key"]): item
+        for item in existing_items
+        if isinstance(item.get("import_key"), str) and item.get("import_key")
+    }
+    for record in records:
+        existing = existing_by_key.get(str(record["import_key"]))
+        if existing is not None and _import_content_signature(record, blocker_keys) != _import_content_signature(existing, blocker_keys):
+            errors.append(
+                "import content collision: "
+                f"{record['id']} (line {record['_line']}) and existing item {existing['id']} "
+                "share kind/title but differ in lane, tags, blocked_by, or links"
+            )
+    if errors:
+        summary = {"imported": 0, "skipped_duplicates": 0, "errors": len(errors), "error_messages": errors}
+        if args.json:
+            print(json.dumps(summary, ensure_ascii=False, sort_keys=True))
+        else:
+            for error in errors:
+                print(f"ERROR: {error}", file=sys.stderr)
+        return 1
+
+    existing_keys = {
+        str(item["import_key"]): str(item["id"])
+        for item in existing_items
+        if isinstance(item.get("import_key"), str) and item.get("import_key")
+    }
+    new_keys: list[str] = []
+    key_to_record: dict[str, dict[str, Any]] = {}
+    for record in records:
+        key = str(record["import_key"])
+        if key not in existing_keys and key not in key_to_record:
+            new_keys.append(key)
+            key_to_record[key] = record
+    families = [FAMILY_PREFIX_BY_KIND[str(key_to_record[key]["kind"])] for key in new_keys]
+
+    if args.dry_run:
+        allocated = _preview_import_ids(store, families)
+        key_to_id = {**existing_keys, **dict(zip(new_keys, allocated))}
+        mapping = {str(record["id"]): key_to_id[str(record["import_key"])] for record in records}
+        summary = {
+            "imported": len(new_keys),
+            "skipped_duplicates": len(records) - len(new_keys),
+            "errors": 0,
+            "id_mapping": mapping,
+        }
+    else:
+        actor = _actor(args)
+        reserved_families: list[str] = []
+
+        def update(items: list[dict[str, Any]]) -> dict[str, Any]:
+            live_keys = {
+                str(item["import_key"]): str(item["id"])
+                for item in items
+                if isinstance(item.get("import_key"), str) and item.get("import_key")
+            }
+            live_by_key = {
+                str(item["import_key"]): item
+                for item in items
+                if isinstance(item.get("import_key"), str) and item.get("import_key")
+            }
+            live_key_by_id = {str(item["id"]): key for key, item in live_by_key.items()}
+            live_blocker_keys = {**live_key_by_id, **draft_key_by_id}
+            for record in records:
+                existing = live_by_key.get(str(record["import_key"]))
+                if existing is not None and _import_content_signature(record, live_blocker_keys) != _import_content_signature(existing, live_blocker_keys):
+                    raise TaskError(
+                        "import content collision: "
+                        f"{record['id']} (line {record['_line']}) and existing item {existing['id']} "
+                        "share kind/title but differ in lane, tags, blocked_by, or links"
+                    )
+            key_to_id = dict(live_keys)
+            created_records: list[dict[str, Any]] = []
+            missing_records: list[dict[str, Any]] = []
+            missing_keys: set[str] = set()
+            for record in records:
+                key = str(record["import_key"])
+                if key not in key_to_id and key not in missing_keys:
+                    missing_keys.add(key)
+                    missing_records.append(record)
+            reserved_families[:] = [FAMILY_PREFIX_BY_KIND[str(record["kind"])] for record in missing_records]
+            allocated = _preview_import_ids(store, reserved_families)
+            allocated_iter = iter(allocated)
+            for record in records:
+                key = str(record["import_key"])
+                if key in key_to_id:
+                    continue
+                item_id = next(allocated_iter)
+                key_to_id[key] = item_id
+                created_records.append(record)
+            mapping = {str(record["id"]): key_to_id[str(record["import_key"])] for record in records}
+            for record in created_records:
+                item_id = key_to_id[str(record["import_key"])]
+                blockers = [mapping.get(ref, ref) for ref in record.get("blocked_by", [])]
+                item = _make_item(
+                    item_id,
+                    kind=str(record["kind"]),
+                    title=str(record["title"]),
+                    actor=actor,
+                    blocked_by=blockers,
+                    links=[],
+                    tags=[],
+                    lane=str(record["lane"]),
+                    audit_action="import",
+                )
+                item["links"] = LIST_TYPE(record.get("links", []))
+                item["tags"] = LIST_TYPE(record.get("tags", []))
+                item["import_key"] = str(record["import_key"])
+                item["import_source"] = str(source)
+                item["import_draft_id"] = str(record["id"])
+                item["original_draft_id"] = str(record["id"])
+                items.append(item)
+            return {
+                "imported": len(created_records),
+                "skipped_duplicates": len(records) - len(created_records),
+                "errors": 0,
+                "id_mapping": mapping,
+            }
+
+        store._ensure_store_ready()
+        with store.store_lock():
+            store._recover_interrupted_publish_locked()
+            store._snapshot_last_good(require_valid=True)
+            items = store.load_items(recover_publish=False)
+            with FileLock(store.seq_lock_path):
+                summary = update(items)
+                # save_items_atomic performs the complete store validation and
+                # publish before counters advance. A crash after publish but
+                # before this counter write is recovered by max-existing-id.
+                store.save_items_atomic(items)
+                seq = store._read_seq()
+                for family in set(reserved_families):
+                    seq[family] = max(int(seq.get(family, 0)), store._max_existing_sequence(family))
+                if reserved_families:
+                    _atomic_write_text(store.seq_path, json.dumps(seq, indent=2, sort_keys=True) + "\n", prefix=".task-seq-")
+
+    if args.json:
+        print(json.dumps(summary, ensure_ascii=False, sort_keys=True))
+    else:
+        mode = "would import" if args.dry_run else "imported"
+        print(f"{mode} {summary['imported']}; skipped duplicates {summary['skipped_duplicates']}; errors 0")
+        for draft_id, item_id in summary["id_mapping"].items():
+            print(f"{draft_id} -> {item_id}")
+    return 0
+
+
 def _cmd_show(store: TaskStore, args: argparse.Namespace) -> int:
     item = store.get_item(args.item_id)
     if args.prompt:
@@ -4111,6 +4415,18 @@ def build_parser() -> argparse.ArgumentParser:
     capture.add_argument("--source", help="Default: the current working directory.")
     capture.add_argument("--json", action="store_true")
     capture.set_defaults(func=_cmd_capture)
+
+    import_cmd = sub.add_parser(
+        "import",
+        help="Import agent-authored draft records from a JSONL sidecar.",
+        epilog="example: goalflight_task.py import drafts.jsonl --dry-run --json",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    import_cmd.add_argument("--by", help=argparse.SUPPRESS)
+    import_cmd.add_argument("sidecar")
+    import_cmd.add_argument("--dry-run", action="store_true", help="Preview allocations and draft-id mapping without writing.")
+    import_cmd.add_argument("--json", action="store_true", help="Print an import summary as JSON.")
+    import_cmd.set_defaults(func=_cmd_import)
 
     show = sub.add_parser(
         "show",
