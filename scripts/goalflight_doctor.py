@@ -17,6 +17,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 import goalflight_compat
@@ -1550,6 +1551,201 @@ def worker_write_file_probe(
     }
 
 
+def worker_linked_worktree_commit_probe(
+    repo: Path,
+    *,
+    enabled: bool = False,
+    timeout_s: float = 180.0,
+) -> dict:
+    """Prove a workspace-write Codex worker can commit in a linked worktree."""
+    agent = "codex"
+    if not enabled:
+        return {
+            "enabled": False,
+            "kind": "linked-worktree-commit",
+            "agent": agent,
+            "ok": None,
+            "state": "not_run",
+            "detail": (
+                "run doctor with --worker-write-probe linked-worktree-commit "
+                "to validate a sandboxed linked-worktree commit"
+            ),
+        }
+    dispatch = SCRIPT_DIR / "goalflight_dispatch.py"
+    if not dispatch.exists():
+        return {
+            "enabled": True,
+            "kind": "linked-worktree-commit",
+            "agent": agent,
+            "ok": False,
+            "state": "blocked",
+            "detail": f"missing dispatcher: {dispatch}",
+        }
+
+    nonce = f"{os.getpid()}-{time.time_ns()}"
+    branch = f"goalflight-doctor-{nonce}"
+    temp_root = Path(tempfile.mkdtemp(prefix="goalflight-worktree-commit-probe-"))
+    worktree = temp_root / "worktree"
+    state_dir = temp_root / "state"
+    state_dir.mkdir()
+    dispatch_id = f"doctor-worktree-commit-{nonce}"
+    prompt = temp_root / "prompt.md"
+    status = temp_root / "status.json"
+    tail = temp_root / "tail.log"
+    target_name = "goalflight-doctor-probe.txt"
+    expected = f"goalflight-doctor-worktree-commit:{dispatch_id}"
+    base_sha = ""
+    proc: subprocess.CompletedProcess[str] | None = None
+    head_sha = ""
+    committed_text = ""
+    cleanup_errors: list[str] = []
+    result: dict | None = None
+    worktree_add_attempted = False
+    try:
+        base = run(["git", "-C", str(repo), "rev-parse", "HEAD"], timeout=10)
+        if not base["ok"]:
+            result = {
+                "enabled": True,
+                "kind": "linked-worktree-commit",
+                "agent": agent,
+                "ok": False,
+                "state": "blocked",
+                "detail": f"cannot resolve repo HEAD: {first_line(base['stderr'])}",
+            }
+            return result
+        base_sha = base["stdout"].strip()
+        worktree_add_attempted = True
+        added = run(
+            ["git", "-C", str(repo), "worktree", "add", "-b", branch, str(worktree), "HEAD"],
+            timeout=30,
+        )
+        if not added["ok"]:
+            detail = added["stderr"].strip().splitlines()
+            result = {
+                "enabled": True,
+                "kind": "linked-worktree-commit",
+                "agent": agent,
+                "ok": False,
+                "state": "blocked",
+                "detail": f"git worktree add failed: {detail[-1] if detail else 'unknown error'}",
+            }
+            return result
+        prompt.write_text(
+            "\n".join(
+                [
+                    "Goal Flight linked-worktree commit probe. Do only this task.",
+                    f"In the current worktree, write exactly `{expected}` plus a newline to `{target_name}`.",
+                    f"Run `git add -- {target_name}`.",
+                    f"Run `git commit -m 'doctor: linked worktree commit probe' -- {target_name}`.",
+                    "Verify `git rev-parse HEAD` succeeds, then emit `COMPLETE: linked-worktree commit probe`.",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        cmd = [
+            sys.executable,
+            str(dispatch),
+            "--agent",
+            agent,
+            "--dispatch-id",
+            dispatch_id,
+            "--prompt-file",
+            str(prompt),
+            "--cwd",
+            str(worktree),
+            "--os-sandbox",
+            "workspace-write",
+            "--foreground",
+            "--poll-secs",
+            "0.5",
+            "--max-idle-secs",
+            str(max(30.0, min(timeout_s, 300.0))),
+            "--tail",
+            str(tail),
+            "--status-json",
+            str(status),
+        ]
+        env = os.environ.copy()
+        env.update(
+            GOALFLIGHT_STATE_DIR=str(state_dir),
+            GIT_AUTHOR_NAME="Goal Flight Doctor",
+            GIT_AUTHOR_EMAIL="goal-flight-doctor@example.invalid",
+            GIT_COMMITTER_NAME="Goal Flight Doctor",
+            GIT_COMMITTER_EMAIL="goal-flight-doctor@example.invalid",
+        )
+        proc = subprocess.run(
+            cmd,
+            cwd=repo,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=max(timeout_s + 30.0, 60.0),
+        )
+        head = run(["git", "-C", str(worktree), "rev-parse", "HEAD"], timeout=10)
+        if head["ok"]:
+            head_sha = head["stdout"].strip()
+        shown = run(
+            ["git", "-C", str(worktree), "show", f"HEAD:{target_name}"], timeout=10
+        )
+        if shown["ok"]:
+            committed_text = shown["stdout"].strip()
+        sha_ok = bool(re.fullmatch(r"[0-9a-f]{40}", head_sha)) and head_sha != base_sha
+        content_ok = committed_text == expected
+        ok = proc.returncode == 0 and sha_ok and content_ok
+        reason = first_line(proc.stderr) or first_line(proc.stdout)
+        result = {
+            "enabled": True,
+            "kind": "linked-worktree-commit",
+            "agent": agent,
+            "ok": ok,
+            "state": "complete" if ok else "failed",
+            "detail": (
+                f"rc={proc.returncode} sha_ok={sha_ok} content_ok={content_ok}"
+                + (f" reason={reason}" if reason else "")
+            ),
+            "commit_sha": head_sha or None,
+            "dispatch_id": dispatch_id,
+            "status_json": str(status),
+            "tail": str(tail),
+        }
+        return result
+    except subprocess.TimeoutExpired as exc:
+        result = {
+            "enabled": True,
+            "kind": "linked-worktree-commit",
+            "agent": agent,
+            "ok": False,
+            "state": "timeout",
+            "detail": f"dispatch timed out after {exc.timeout}s",
+            "dispatch_id": dispatch_id,
+            "status_json": str(status),
+            "tail": str(tail),
+        }
+        return result
+    finally:
+        if worktree.exists():
+            removed = run(
+                ["git", "-C", str(repo), "worktree", "remove", "--force", str(worktree)],
+                timeout=30,
+            )
+            if not removed["ok"]:
+                cleanup_errors.append(first_line(removed["stderr"]) or "worktree remove failed")
+        if worktree_add_attempted:
+            deleted = run(["git", "-C", str(repo), "branch", "-D", branch], timeout=10)
+            if not deleted["ok"] and "not found" not in deleted["stderr"].lower():
+                cleanup_errors.append(first_line(deleted["stderr"]) or "branch delete failed")
+        shutil.rmtree(temp_root, ignore_errors=True)
+        if cleanup_errors and result is not None:
+            result["ok"] = False
+            result["state"] = "cleanup_failed"
+            result["cleanup_errors"] = cleanup_errors
+            result["detail"] = (
+                f"{result.get('detail', '')} "
+                f"cleanup_failed={' | '.join(cleanup_errors)}"
+            ).strip()
+
+
 def _npm_registry_version(pkg: str, timeout: float = 6.0) -> str | None:
     """Return the published latest version of an npm package, or None on failure.
 
@@ -2645,7 +2841,7 @@ def doctor(
     fleet: bool = False,
     fleet_dir: Path | None = None,
     fleet_probe: bool = False,
-    worker_write_probe: bool = False,
+    worker_write_probe: bool | str = False,
     write_probe_agent: str = "grok-code",
 ) -> dict:
     skill_root = SCRIPT_DIR.parent
@@ -2659,6 +2855,10 @@ def doctor(
     codex_desktop = app_exists("Codex", "com.openai.codex")
     codex_cli = version("codex", "--version")
     cursor_desktop = app_exists("Cursor", "com.todesktop.230313mzl4w4u92")
+    probe_kind = (
+        worker_write_probe if isinstance(worker_write_probe, str)
+        else "write-file" if worker_write_probe else None
+    )
     payload = {
         "schema": "goalflight.doctor.v1",
         "repo": str(repo),
@@ -2690,10 +2890,16 @@ def doctor(
         },
         "opencode": version("opencode", "--version"),
         "grok": check_grok(),
-        "worker_write_probe": worker_write_file_probe(
-            repo,
-            agent=write_probe_agent,
-            enabled=worker_write_probe,
+        "worker_write_probe": (
+            worker_linked_worktree_commit_probe(
+                repo, enabled=probe_kind == "linked-worktree-commit"
+            )
+            if probe_kind == "linked-worktree-commit"
+            else worker_write_file_probe(
+                repo,
+                agent=write_probe_agent,
+                enabled=probe_kind == "write-file",
+            )
         ),
         "acp": check_acp(),
         "claude_acp_stopgap": check_claude_acp_stopgap(),
@@ -2905,7 +3111,7 @@ def print_human(payload: dict) -> None:
     write_probe = payload.get("worker_write_probe") or {}
     lines.append(status_line(
         write_probe.get("ok"),
-        f"{write_probe.get('agent', 'worker')} write-file e2e probe",
+        f"{write_probe.get('agent', 'worker')} {write_probe.get('kind', 'write-file')} e2e probe",
         write_probe.get("detail"),
     ))
     if goalflight_compat.is_windows():
@@ -3174,8 +3380,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--worker-write-probe",
-        action="store_true",
-        help="Run a real worker dispatch that writes a file and emits a terminal marker",
+        nargs="?",
+        const="write-file",
+        choices=("write-file", "linked-worktree-commit"),
+        help=(
+            "Run a real worker write probe. Bare flag keeps the write-file probe; "
+            "linked-worktree-commit creates a temporary linked worktree and asserts "
+            "a workspace-write Codex worker commits successfully."
+        ),
     )
     parser.add_argument(
         "--write-probe-agent",

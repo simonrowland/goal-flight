@@ -9,6 +9,8 @@ from pathlib import Path
 import platform
 import shutil
 import tempfile
+
+from goalflight_codex_sandbox import linked_worktree_writable_roots
 from typing import Any
 
 import goalflight_compat
@@ -192,6 +194,9 @@ def macos_write_roots(cwd: str, profile: str, *, agent: str | None = None, comma
     roots: list[str] = []
     if profile == OS_SANDBOX_WORKSPACE_WRITE:
         roots.append(cwd)
+        label = (agent or "").lower()
+        if label in {"codex", "codex-acp"}:
+            roots.extend(linked_worktree_writable_roots(cwd))
     tmpdir = tempfile.gettempdir()
     temp_roots = _unique_real_paths([
         tmpdir,

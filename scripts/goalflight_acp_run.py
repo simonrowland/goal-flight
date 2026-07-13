@@ -108,6 +108,7 @@ from goalflight_adapter_readiness import (
     validate_os_sandbox_request,
 )
 from goalflight_acp_boundaries import permission_boundary_warning
+from goalflight_codex_sandbox import codex_workspace_write_args
 from goalflight_acp_client import (
     AcpConnection,
     AcpError,
@@ -836,6 +837,18 @@ def agent_command(
     return binary, args
 
 
+def _codex_workspace_write_acp_args(
+    agent: str,
+    args: list[str],
+    *,
+    cwd: str | None,
+    os_sandbox: str | None,
+) -> list[str]:
+    if str(agent).strip().lower() not in {"codex", "codex-acp"}:
+        return args
+    return [*codex_workspace_write_args(cwd, os_sandbox), *args]
+
+
 def _compact_tool_call_summaries(tool_calls: list[Any], limit: int = 50) -> list[dict[str, object]]:
     """Small status-safe surface for live matrix assertions."""
     out: list[dict[str, object]] = []
@@ -1497,6 +1510,9 @@ async def _run_acp_dispatch_impl(
         cfg.agent,
         model=getattr(cfg, "model", None),
         fast=getattr(cfg, "fast", False),
+    )
+    acp_args = _codex_workspace_write_acp_args(
+        cfg.agent, acp_args, cwd=worker_cwd, os_sandbox=os_sandbox_profile
     )
     spawn_env = _worker_spawn_env(cfg, original_prompt_file)
     gate = validate_acp_dispatch_readiness(cfg.agent, [command, *acp_args])
@@ -2359,6 +2375,14 @@ async def _run_acp_dispatch_impl(
                 )
                 return payload
             worker_cwd = str(created)
+            command, acp_args = agent_command(
+                cfg.agent,
+                model=getattr(cfg, "model", None),
+                fast=getattr(cfg, "fast", False),
+            )
+            acp_args = _codex_workspace_write_acp_args(
+                cfg.agent, acp_args, cwd=worker_cwd, os_sandbox=os_sandbox_profile
+            )
             await update_status(
                 state="worktree_created",
                 worker_cwd=worker_cwd,

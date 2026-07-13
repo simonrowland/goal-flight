@@ -71,6 +71,7 @@ import goalflight_steer_mailbox
 import goalflight_ledger
 import goalflight_quota_stuck
 import goalflight_terminal
+from goalflight_codex_sandbox import codex_workspace_write_args
 from goalflight_liveness import active_monotonic, process_group_id, write_status
 from goalflight_watch import (
     _final_terminal_marker,
@@ -3936,6 +3937,7 @@ def build_worker(args, prompt_path, raw_argv: list[str]):
     if args.agent == "codex":
         argv = ["codex", "exec", "--skip-git-repo-check", "--sandbox", sandbox,
                 "-c", "approval_policy=never"]
+        argv += codex_workspace_write_args(args.cwd, _effective_os_sandbox(args))
         if not _codex_context_mode_enabled():
             # Disable context-mode at the worker boundary (see _codex_context_mode_enabled);
             # leaves the user's ~/.codex/config.toml untouched for interactive use.
