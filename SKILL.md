@@ -209,7 +209,7 @@ three.
 | Type 3 — dictionary deep-sweep | After every class mint; under-searched SC predicates | `commands/bug-sweep.md --mode predicate/bug-hunt` + `protocols/review-mining.md`; exit at marginal_real_yield ≈ 0 |
 
 On chunk completion, dispatch gstack `/review` before committing; controller reviews EACH returning chunk with ≥2 concern-diverse lenses as floor, not target, re-takes the null stance, and scales above the floor by complexity before commit.
-Reviews go through gstack `/review` and `/challenge`; do not hand-roll review prompts.
+Review routing follows `protocols/review-types.md` by subject; code-diff finders may use the gstack `/review` frame, non-code flights use `prompts/gstack-*.md` fallbacks — never ad-hoc composition. [RT-005]
 Reviewer misses become regression tests, not trust exemptions. Write review rubrics before first wave dispatch.
 Review results are saved durably (`docs-private/reviews/` or the chunk's research dir) — never /tmp-only; tails die at reboot and unsaved verdicts cannot be mined.
 Every NEW bug class triggers the MINT-generalize loop (`protocols/review-mining.md`): mint the class predicate, sweep BACKWARDS over code + the saved review archive for more instances, record the sweep (no-hit included), encode the class as a forward review lens. One catch, one class, one sweep.
@@ -391,7 +391,7 @@ Default routing by task:
 |---|---|---|---|
 | Code-writing chunks | `goalflight_dispatch.py` codex worker | Alternate marker-reliable CLI worker with passing write-file probe | Host Agent — LAST RESORT only ‡ |
 | Research / web search | `goalflight_dispatch.py` `--agent grok-research` (read-only) | controller-direct | - |
-| Reviewer dispatches | gstack `/review` via review worker + concern-diverse sweep | any one alone | Claude Agent only when others unreachable |
+| Reviewer dispatches | per `protocols/review-types.md` (Type-1 find/fix; Types 2/3 via bug-sweep) | stakes carve-down: single concern-diverse reviewer for trivial chunks ONLY [RT-004] | Claude Agent only when others unreachable |
 | Planning / decompose | code/planning worker | controller-direct | Claude Agent |
 | Anticipatory questions | strongest interactive planner | controller-direct | - |
 | Analysis / reflection | controller-direct | - | - |
