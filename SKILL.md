@@ -196,13 +196,17 @@ ledger/queue are shared across projects (identify origin by `project_root`).
 
 ## Review layers
 
-Review layers: executor self-review, chunk review, milestone review.
+Reviews are cut by SUBJECT into three types — `protocols/review-types.md` is
+the operative contract (locked 2026-07-17: two review waves + 3-cluster field
+pilot). Executor self-review remains the universal in-loop floor beneath all
+three.
 
-| Layer | Gate | Default |
+| Layer / Type | Gate | Default |
 |---|---|---|
-| Executor self-review | In-worker prompt before handoff | Executor self-review covers seven categories before handing off a chunk; every worker states and rejects a null hypothesis with evidence; non-trivial adds ≥2 concern-diverse lenses as floor, not target |
-| Chunk review | Every commit-worthy chunk | mandatory controller review; default gstack `/review`; `./scripts/autoreview.sh` as a complementary parallel option |
-| Milestone review | 5 committed chunks since last clean sweep, `[milestone]` chunks, or before push | `protocols/milestone-review.md`, gstack `/review` + concern-diverse sweep |
+| Executor self-review (floor) | In-worker prompt before handoff; exit = self-refutation DRY | seven categories; every worker states and rejects a null hypothesis with evidence; non-trivial adds ≥2 concern-diverse lenses as floor, not target. NEVER a substitute for the Type-1 FIND wave (field: dry-claimed builds carried 9 P1s) |
+| Type 1 — patch multi-review | Every commit-worthy chunk / bug patch | FIND/FIX split per `protocols/review-types.md`: N read-only lens-finders (escrowed pinned findings, gstack `/review` frame usable per-finder) → ONE non-finder fixer, per-hunk attribution, per-fix null-hypothesis (`protocols/review-fix-report.md`); controller verify + sampled deep-check |
+| Type 2 — milestone review | 5 committed chunks since last clean sweep, `[milestone]` chunks, or before push | `commands/bug-sweep.md --mode milestone/qa` + `protocols/milestone-review.md`; adversarial verify; DISJOINT fix-groups |
+| Type 3 — dictionary deep-sweep | After every class mint; under-searched SC predicates | `commands/bug-sweep.md --mode predicate/bug-hunt` + `protocols/review-mining.md`; exit at marginal_real_yield ≈ 0 |
 
 On chunk completion, dispatch gstack `/review` before committing; controller reviews EACH returning chunk with ≥2 concern-diverse lenses as floor, not target, re-takes the null stance, and scales above the floor by complexity before commit.
 Reviews go through gstack `/review` and `/challenge`; do not hand-roll review prompts.
