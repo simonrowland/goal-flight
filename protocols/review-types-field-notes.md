@@ -6,6 +6,28 @@ note to the rule-id it touches so it stays traceable. Newest first.
 
 ---
 
+## 2026-07-17 (later) — re-review width escalation (battery bugs controller, relayed via operator)
+
+**[Type-1 FIND/re-review — gap] Yield-triggered width escalation is stated for the
+first FIND wave but silent on re-review after a fix.** Field: a C2 patchset serialized
+~8 narrow review rounds; the controller started 3-wide (initial finder wave) then
+narrowed every re-review to 1-wide — that narrowing is what serialized it. The
+residuals were *different classes* (publish-bypass, source-flag copy, missing test
+teeth, non-binding citation), and different classes are found by different lenses,
+not by re-running one lens deeper.
+
+Rule to ratify: **re-review width inherits from the previous round's yield.** A
+still-yielding subject gets 3-4 diverse lenses in one round; a wide round returning
+~nothing new is a stronger convergence signal than a narrow one. Limits (part of the
+rule, not caveats to drop): (1) some serialization is intrinsic — residuals that only
+become reachable after a fix lands can't be found pre-fix, so the realistic target is
+~2 wide rounds, not 1; (2) width = lens diversity, not reviewer count — identical
+reviewers redundantly find the same top issue; (3) batch-find never implies batch-fix
+— the fix side stays single-fixer (Type-1) or disjoint groups (Type-2); (4) adaptive,
+not blanket — trigger on first-round yield, don't widen clean-majority patchsets.
+Also a controller-token win: collapsing 4 narrow rounds into ~2 wide ones saves the
+per-round read+dispatch+monitor orchestration cost.
+
 ## 2026-07-17 — 3-cluster field pilot + backlog burn-down (bugfix controller)
 
 Ran the taxonomy end-to-end: C1 (CalculiX export, BUILD→FIND→FIX→VERIFY),

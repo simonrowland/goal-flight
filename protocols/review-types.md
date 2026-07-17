@@ -45,6 +45,15 @@ non-trivial chunks and ALWAYS when the diff touches path-sensitive files.
   remainder); declared file:line ranges are binding. Unattributed hunks or
   range excess = mechanical REDO. Sketch drift = re-escrow (finder steer-ack
   or controller approval) BEFORE applying.
+- RE-REVIEW WIDTH [field-note 2026-07-17 later]: after a fix, re-review width
+  INHERITS from the previous round's yield — a still-yielding subject gets 3-4
+  diverse-lens finders in ONE round, never serialized singles (field: narrowing
+  3-wide→1-wide serialized a patchset into ~8 rounds; the residual classes were
+  distinct and lens-specific). A wide round returning ~nothing new is the
+  convergence signal. Width = lens diversity, not reviewer count; batch-find
+  never implies batch-fix (the fix side stays ONE fixer); trigger on yield, do
+  not blanket-widen clean patchsets; ~2 wide rounds is the realistic floor since
+  fix-revealed residuals are intrinsically serial.
 - FINDER DISAGREEMENT [field-note gap 2]: when finders conflict on the same
   code, resolve against GROUND TRUTH (decision-locks, specs, real oracles) —
   NEVER by vote-counting or majority. (Field: two finders split on a
