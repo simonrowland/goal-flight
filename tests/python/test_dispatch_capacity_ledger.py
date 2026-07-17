@@ -1322,7 +1322,7 @@ def case_wait_ignores_stale_terminal_status_for_prior_worker() -> None:
                 status_json=status_path,
                 watcher_pid=999999,
                 poll_secs=0.2,
-                args=SimpleNamespace(dispatch_id=dispatch_id, agent="test-dispatch"),
+                args=SimpleNamespace(dispatch_id=dispatch_id, agent="test-dispatch", cwd=None),
                 tail=tail,
                 worker_pid=current_worker_pid,
                 worker_identity=None,
