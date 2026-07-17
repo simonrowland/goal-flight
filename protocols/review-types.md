@@ -21,13 +21,23 @@ non-trivial chunks and ALWAYS when the diff touches path-sensitive files.
 - FINDINGS ESCROW: each finder emits structured findings to stdout/tail —
   highest severity first, BEFORE any discussion prose:
   `FINDING <finder-label>-<n> | P<0-3> | <one-line>` (ids namespaced per finder [RT-OP-06]) + Evidence path:line + Fix shape +
-  "Test must assert: <falsifiable behavior>" + patch sketch. The tail is the
+  "Test must assert: <CONCRETE input -> wrong-output pair, never a vague
+  property — 'the gate works' is rejected>" + patch sketch. [field-note gap 4:
+  the whole chain anchors on this clause; the CONTROLLER sanity-checks all
+  assertion clauses in the escrow BEFORE dispatching the fixer — weak clauses
+  go back to the finder, not forward to the fixer.] The tail is the
   append-only escrow; a fix can never erase its finding.
 - FIX: exactly ONE fixer — the original executor re-entering or a fresh boot;
   NEVER a wave finder. ENTRY GATE [FID-002]: fixer enters only under
   EXCLUSIVE HANDOFF — all finders terminal AND the executor terminal (marker
   + reconcile) AND the worktree lease released; machine-checkable from
-  dispatch records. Never concurrent with any live worker in that worktree. Applies findings
+  dispatch records; death WITHOUT a marker is the COMMON case, not the edge —
+  reconcile via `protocols/dispatched-worker-recovery.md` before treating any
+  worker as terminal. FIXER DEATH MID-FIX [field-note gap 5]: the attribution
+  map is the recovery tool — hunks attributable to escrowed findings are
+  keepable after verification; unattributed partial hunks are reverted; the
+  replacement fixer resumes from the escrow, not from the corpse's diff.
+  Never concurrent with any live worker in that worktree. Applies findings
   with per-fix NULL-HYPOTHESIS A/B evidence (without fix repro fails; with
   fix passes; record both runs) and a regression test asserting EXACTLY the
   finder-pinned behavior. Report shape: `protocols/review-fix-report.md`.
@@ -35,10 +45,15 @@ non-trivial chunks and ALWAYS when the diff touches path-sensitive files.
   remainder); declared file:line ranges are binding. Unattributed hunks or
   range excess = mechanical REDO. Sketch drift = re-escrow (finder steer-ack
   or controller approval) BEFORE applying.
+- FINDER DISAGREEMENT [field-note gap 2]: when finders conflict on the same
+  code, resolve against GROUND TRUTH (decision-locks, specs, real oracles) —
+  NEVER by vote-counting or majority. (Field: two finders split on a
+  hardcoded spectrum method; the decision-lock settled it; a vote would have
+  shipped the wrong call.)
 - CONTROLLER VERIFY: escrow-vs-report diff [RT-OP-04]: extract `^FINDING`
   lines from each finder tail and from the fixer report; diff the two sets —
   ids, severities, and 'Test must assert' clauses must match exactly · attribution map vs `git diff` ·
-  re-run the gate yourself · deep-verify a deterministic sample [RT-OP-02]:
+  re-run the gate yourself — BROAD scope, never the fixer's touched-set (field: a touched-set-green fix broke a contract encoded in a different test file; only the wide sweep caught it) [field-note gap 3] · deep-verify a deterministic sample [RT-OP-02]:
   sample iff int(sha1(fixer_dispatch_id_utf8).hexdigest(),16) % k == 0 with
   k=3 initially; the repo's current k lives in its CANNED-CONTEXT.md (walk
   toward k=10 as fix-survival proves clean, snap to k=1 on degradation —
