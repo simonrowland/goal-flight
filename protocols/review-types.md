@@ -85,3 +85,29 @@ re-review.
   found/fixed/deferred) — deferred findings enter the store, not the void.
 - Single-fixer vs fix-groups is determined by the subject: shared-context
   diff → one fixer; independent discoveries → disjoint groups.
+
+## Field notes — 2026-07-17 (bugfix flight; PHYS + OPT clusters, n=2)
+Sharpen three universal rules with second-cluster field data. Both clusters
+independently confirmed FIND-after-green; these tighten the framing.
+
+- [a] SELF-REFUTATION-DRY AND TESTS-GREEN ARE ~ZERO EVIDENCE, NOT PARTIAL —
+  treat both as adversarial-until-proven. In BOTH field clusters the dry/green
+  claim was not merely insufficient, it was WRONG: PHYS BUILD claimed
+  self-refutation-dry + 147 green and carried 9 P1s; OPT fixer claimed 31 FIXED
+  + 1,153 green and the confirming review found 1 P1 + 2 P2, one INSIDE the
+  fixer's own fix. Corollary: a dry/green claim NEVER justifies reducing N or
+  skipping the FIND wave.
+- [b] GREEN-GATE ⊥ FIX-CORRECTNESS (orthogonal, not overlapping). "Re-run the
+  gate yourself" proves NO-REGRESSION; it CANNOT prove the fix is correct —
+  every field bug the FIND wave caught lived in UNTESTED behavior (the gate was
+  honestly green because no test covered the EvalSpec-missing path / the
+  spatial-conflation residual). The gate and the FIND wave verify different
+  things; green gate is NEVER evidence of fix correctness, only of not-breaking
+  what was already tested.
+- [d] DEFERRED/CARVE-OUT → STORE IS A MACHINE-CHECKABLE EXIT CONDITION, not a
+  best-effort. Field miss: 56 verified sweep SURVIVES + 13 OPT carve-outs lived
+  in research files, invisible to the store, until the operator asked. Make it
+  a hard cluster-close gate alongside attribution-complete: every REPORTED /
+  carve-out / deferred finding is `capture`-d to the store (deferred lane,
+  citing the finding id) BEFORE the cluster closes — an unstored deferred
+  finding blocks close the same way an unattributed hunk blocks accept.
