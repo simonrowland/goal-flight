@@ -41,7 +41,9 @@ non-trivial chunks and ALWAYS when the diff touches path-sensitive files.
   re-run the gate yourself · deep-verify a deterministic sample [RT-OP-02]:
   sample iff int(sha1(fixer_dispatch_id_utf8).hexdigest(),16) % k == 0 with
   k=3 initially; the repo's current k lives in its CANNED-CONTEXT.md (walk
-  toward k=10 as fix-survival proves clean, snap to k=1 on degradation) · path-sensitive fixes ALWAYS get full depth + finder re-check. The
+  toward k=10 as fix-survival proves clean, snap to k=1 on degradation —
+  LADDER UNVALIDATED at n=2 field clusters: hold k=3 until the fix-survival
+  ledger has real history [field-note (e), 2026-07-17]) · path-sensitive fixes ALWAYS get full depth + finder re-check. The
   path-sensitive list (fail-closed gates, validators, PROVENANCE checks,
   cross-contract surfaces) lives in the repo's CANNED-CONTEXT.md
   'PATH-SENSITIVE' section — named source of truth, controller-maintained. [FID-004]
