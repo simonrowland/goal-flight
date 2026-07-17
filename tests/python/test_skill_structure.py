@@ -260,7 +260,56 @@ EXPECTED_ENTRY_IDS = {
     "ready-terminal-last-line",
 }
 
-KNOWN_SKILL_ALIGNMENT_GAPS = {}
+KNOWN_SKILL_ALIGNMENT_GAPS = {
+    "autoreview-complementary-not-default": {
+        "fix_chunk": "review-types taxonomy migration",
+        "kind": "literal",
+        "pattern": "`./scripts/autoreview.sh` as a complementary parallel option",
+        "current_substitute": "`./scripts/autoreview.sh` is a complementary parallel option, never the default; gstack `/review` remains default.",
+        "current_substitute_section": "## Verification and test gates",
+    },
+    "executor-self-review-7categories": {
+        "fix_chunk": "review-types taxonomy migration",
+        "kind": "literal",
+        "pattern": "Executor self-review covers seven categories before handing off a chunk",
+        "current_substitute": (
+            "| Executor self-review (floor) | Before handoff; self-refutation DRY | "
+            "seven categories + null hypothesis"
+        ),
+        "current_substitute_section": "## Review layers",
+    },
+    "gstack-default-review-chunk": {
+        "fix_chunk": "review-types taxonomy migration",
+        "kind": "literal",
+        "pattern": "default gstack `/review`",
+        "current_substitute": "On chunk completion, dispatch gstack `/review` before committing",
+        "current_substitute_section": "## Review layers",
+    },
+    "gstack-review-and-challenge-canonical": {
+        "fix_chunk": "review-types taxonomy migration",
+        "kind": "literal",
+        "pattern": "Reviews go through gstack `/review` and `/challenge`; do not hand-roll review prompts",
+        "current_substitute": "`/challenge` as the canonical adversarial frame; never hand-roll review prompts",
+        "current_substitute_section": "## Review layers",
+    },
+    "review-layers-three-distinct": {
+        "fix_chunk": "review-types taxonomy migration",
+        "kind": "literal",
+        "pattern": "Review layers: executor self-review, chunk review, milestone review",
+        "current_substitute": (
+            "| Executor self-review (floor) | Before handoff; self-refutation DRY | seven categories + null hypothesis; "
+            "non-trivial: ≥2 lenses. Never replaces Type-1 FIND (field: 9 P1s) |\n"
+            "| Type 1 — patch multi-review | Every commit-worthy chunk | `protocols/review-types.md`: N FIND reviewers → "
+            "one non-finder FIX executor; pinned findings, per-hunk attribution, fix null hypotheses "
+            "(`protocols/review-fix-report.md`); controller samples |\n"
+            "| Type 2 — milestone review | 5 chunks, `[milestone]`, or pre-push | milestone/QA bug sweep; adversarial "
+            "verify; disjoint fix groups |\n"
+            "| Type 3 — dictionary deep-sweep | Each class mint; under-searched predicates | predicate bug sweep; "
+            "exit at marginal_real_yield ≈ 0 |"
+        ),
+        "current_substitute_section": "## Review layers",
+    },
+}
 
 KNOWN_PROTOCOL_LITERAL_GAPS = {}
 
@@ -676,11 +725,19 @@ def test_skill_md_matches_golden_master() -> None:
             known_metadata_drift.append(f"{entry_id}: current substitute count {substitute_count}")
         else:
             substitute_line_index = skill[: skill.index(expected["current_substitute"])].count("\n")
-            substitute_section, _content_lines = skill_section_budget_measure(skill_lines, substitute_line_index)
+            substitute_section, content_line_count = skill_section_budget_measure(skill_lines, substitute_line_index)
             if substitute_section != expected["current_substitute_section"]:
                 known_metadata_drift.append(
                     f"{entry_id}: current substitute section {substitute_section!r}"
                 )
+            if "max_section_lines" in compressed:
+                budget = int(str(compressed["max_section_lines"]))
+                if content_line_count > budget:
+                    section_budget_gaps[entry_id] = {
+                        "max_section_lines": budget,
+                        "actual_content_lines": content_line_count,
+                        "section_heading": substitute_section,
+                    }
 
     unknown_missing = {key: value for key, value in missing.items() if key not in KNOWN_SKILL_ALIGNMENT_GAPS}
     resolved_known = sorted(set(KNOWN_SKILL_ALIGNMENT_GAPS) - set(missing))
