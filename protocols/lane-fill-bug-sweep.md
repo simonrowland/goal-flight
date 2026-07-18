@@ -107,6 +107,16 @@ surface REAL blockers → routing table → grouped fixes → serial integrator`
 4. pattern-search keyed to under-searched predicates in the shared sweep-corpus (the class-hunt
 arm; mint/promote per `protocols/review-mining.md`).
 
+## Base freshness (standing pre-wave gate; operator directive 2026-07-18)
+Before writing the frame: fetch and verify the sweep worktree sits at the CURRENT
+integration tip (origin/<trunk> or the repo's designated head). Behind ⇒ sync or
+re-create the worktree at tip FIRST — a sweep against a stale base finds
+already-fixed bugs and produces conflicting fixes, invalidating the run. Record
+the verified anchor SHA in the manifest (it is the AUDIT-ANCHOR below unless the
+experiment deliberately pins an older ref). The base then stays pinned for the
+whole campaign; the NEXT campaign re-syncs. This is the controller's job every
+run — never wait for the operator to notice staleness.
+
 ## Re-review as a controlled experiment
 Bake a single named knob (the **AUDIT-ANCHOR**, e.g. latest-HEAD vs N-commits-back) into the
 frame and record each run in a manifest. A re-review changes ONLY that knob; compare the

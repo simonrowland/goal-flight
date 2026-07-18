@@ -6,6 +6,17 @@ note to the rule-id it touches so it stays traceable. Newest first.
 
 ---
 
+## 2026-07-18 — worktree/base freshness (operator directive)
+
+**[universal — gap] Bugfix controllers only sync their worktrees to head/origin
+when the operator reminds them.** Sweeps and fixes then run against stale
+software: findings may already be fixed, fixes conflict on merge, and the run's
+evidence describes a version nobody ships. Ratified as a standing universal rule
+(review-types.md) + a pre-wave gate in lane-fill-bug-sweep.md: sync/verify the
+anchor at every cluster/campaign start, record the anchor SHA, pin during the
+cycle, re-sync at the next boundary. Tooling task filed for a deterministic
+staleness check (status WARN when a working base trails the integration tip).
+
 ## 2026-07-17 (later) — re-review width escalation (battery bugs controller, relayed via operator)
 
 **[Type-1 FIND/re-review — gap] Yield-triggered width escalation is stated for the

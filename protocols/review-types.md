@@ -101,6 +101,17 @@ vote-counting. EXIT: `marginal_real_yield ≈ 0` (mined out) via the --anchor
 re-review.
 
 ## Universal rules (all types; field-proven)
+- BASE FRESHNESS IS A STANDING DISCIPLINE, never operator-prompted [operator
+  directive 2026-07-18]: before EVERY find wave, bug-sweep, or fix cluster, the
+  controller verifies its worktree/branch is at the CURRENT integration tip
+  (fetch; compare against origin/<trunk> or the repo's designated head; sync or
+  re-anchor BEFORE dispatching) and records the anchor SHA in the run
+  manifest/dispatch brief. Sweeping or fixing against a stale base is
+  invalid-by-default: findings may be already-fixed, fixes may conflict, and
+  the whole cluster's evidence is against software nobody ships. Freshness is
+  checked at CLUSTER BOUNDARIES only — once a cluster's FIND wave starts, the
+  base stays pinned until the cluster closes (re-anchoring mid-cycle
+  invalidates the escrow); the next cluster re-syncs first.
 - FIND-after-green is non-negotiable: a build claiming tests-green +
   self-refutation-dry still carried 9 corroborated P1s in the field pilot.
   "Worker COMPLETE + green" is never a stopping signal.
