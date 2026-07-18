@@ -78,7 +78,18 @@ non-trivial chunks and ALWAYS when the diff touches path-sensitive files.
   lane) citing the finding id. This IS the fix-survival ledger.
 - Authority carve-outs (report-only + sketch, all types): physics-semantics
   calls, decision-gated items (neutral evidence), cross-repo contracts.
-- EXIT: attribution complete + gate green + sample clean.
+- SEPARATION-FF before commit [field-note 2026-07-17 latest]: when a fixer diff
+  mixes CONFIRMED-clean and HELD findings in shared files (a by-pathspec commit
+  can't split them), keep the confirmed hunks + their RED tests, REVERT the held
+  hunks, UN-MASK any test the held fix narrowed, and verify the un-masked test
+  passes with the confirmed fix ALONE (proving the regression was purely the held
+  part). Commit the confirmed part; `capture` the held part as a scoped deferred
+  task citing its precise requirement + the finding id. Never let a
+  masked-regression's test-narrowing ride along on the clean commit; don't hold a
+  real fix hostage to a deep one. The confirmed hunks are the
+  attributable-and-verified set; the held hunks are exactly what you revert.
+- EXIT: attribution complete + gate green + sample clean + (if the diff was
+  mixed) separation-FF done — held findings stored, no held hunk in the commit.
 - Known residual, accepted: unsampled non-path-sensitive fixes carry
   coherence-level assurance until next-cluster traversal; priced by
   fix-survival, revisit the sampling ladder if it degrades.

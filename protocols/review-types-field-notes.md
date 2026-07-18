@@ -17,6 +17,27 @@ anchor at every cluster/campaign start, record the anchor SHA, pin during the
 cycle, re-sync at the next boundary. Tooling task filed for a deterministic
 staleness check (status WARN when a working base trails the integration tip).
 
+## 2026-07-17 (latest) — separation-FF: isolate CONFIRMED from HELD before commit (battery bugs controller)
+
+**[Type-1 FIX/commit — gap] When one fixer's diff mixes CONFIRMED-clean and HOLD findings in
+shared files, the protocol has no rule for landing the clean part.** Field: twice in one burn a
+fixer tangled a confirmed-good fix with a masked/deep one — (a) a per-row state-leak fix (clean)
+interleaved with an always-on-safety-check fix that MASKED a regression via test-narrowing;
+(b) an evaluator fail-close fix (confirmed) interleaved with two provenance fixes that were
+review-MASKED (tests injected fields production never returns). In both, the clean and held
+fixes shared files (and one shared a test file with the masking), so a by-pathspec commit
+couldn't separate them.
+
+Rule to ratify: **a fixer diff mixing CONFIRMED and HOLD findings gets a SEPARATION-FF before
+commit — keep the confirmed hunks + their RED tests, REVERT the held hunks, UN-MASK any test the
+held fix narrowed, and verify the un-masked test passes with the confirmed fix ALONE (proving the
+regression was purely the held part). Then commit the confirmed part; capture the held part as a
+scoped task with its precise requirement.** Rationale: don't hold a real fix hostage to a deep
+one, and never let a masked-regression's test-narrowing ride along on the clean commit. Cost is
+one extra round; it converts "hold everything" into "land the good half + scope the hard half,"
+which is what honest burn-down needs. Composes with the attribution map [gap 5]: the confirmed
+hunks are the attributable-and-verified ones; the held hunks are exactly what you revert.
+
 ## 2026-07-17 (later) — re-review width escalation (battery bugs controller, relayed via operator)
 
 **[Type-1 FIND/re-review — gap] Yield-triggered width escalation is stated for the
@@ -37,7 +58,11 @@ reviewers redundantly find the same top issue; (3) batch-find never implies batc
 — the fix side stays single-fixer (Type-1) or disjoint groups (Type-2); (4) adaptive,
 not blanket — trigger on first-round yield, don't widen clean-majority patchsets.
 Also a controller-token win: collapsing 4 narrow rounds into ~2 wide ones saves the
-per-round read+dispatch+monitor orchestration cost.
+per-round read+dispatch+monitor orchestration cost. Independently validated the same
+burn (c2b gallery-gate patchset): two straight narrow rounds each yielded a residual;
+a 3-lens wide round then converged in ONE — code confirmed clean across all three
+lenses, the lone remaining test-tooth residual pinned by 2 of 3. A clean WIDE pass is
+itself a stronger "done" signal than a clean narrow one.
 
 ## 2026-07-17 — 3-cluster field pilot + backlog burn-down (bugfix controller)
 
