@@ -30,6 +30,7 @@ AGENT_RSS_MB = {
     "grok-research": 200,
     "codex": 386,
     "codex-acp": 386,
+    "kimi": 386,
     "claude": 614,
     "claude-code-cli-acp": 614,
     "cursor": 1203,
@@ -72,6 +73,7 @@ DEFAULT_AGENT_CAPS = {
     # reasoning as the 2026-06-16 global 20->32 bump.
     "codex": 18,
     "codex-acp": 18,
+    "kimi": 6,
     "grok": 30,
     "grok-acp": 30,
     "grok-code": 30,

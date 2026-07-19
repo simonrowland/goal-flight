@@ -87,8 +87,8 @@ DISPATCH_QUEUE_SCHEMA = "goalflight.dispatch-queue.v1"
 QUEUE_CLAIM_STALE_S = 300.0
 QUEUE_PRIORITY_RANK = {lane: rank for rank, lane in enumerate(goalflight_capacity.PRIORITY_LANES)}
 QUEUE_DEFAULT_PRIORITY = "normal"
-PRESET_AGENTS = {"codex", "grok-code", "grok-research"}
-STDIN_PROMPT_AGENTS = {"codex", "grok-code", "grok-research"}
+PRESET_AGENTS = {"codex", "grok-code", "grok-research", "kimi"}
+STDIN_PROMPT_AGENTS = {"codex", "grok-code", "grok-research", "kimi"}
 DEFAULT_MAX_IDLE_SECS = 180.0
 _DASHBOARD_REFRESH_SUBCOMMAND = "dashboard-refresh"
 _DASHBOARD_REFRESH_MARKER = "goalflight-dashboard-refresh-v1"
@@ -96,7 +96,7 @@ _DASHBOARD_REFRESH_QUEUED_GRACE_S = 60 * 60
 _DASHBOARD_REFRESH_MAX_LIFETIME_S = 4 * 60 * 60
 _DASHBOARD_REFRESH_CLAIM_STALE_S = 30.0
 CODE_WRITER_MAX_IDLE_SECS = 600.0
-CODE_WRITER_AGENTS = {"codex", "codex-acp", "grok-code", "grok-acp", "cursor", "cursor-agent"}
+CODE_WRITER_AGENTS = {"codex", "codex-acp", "grok-code", "grok-acp", "kimi", "cursor", "cursor-agent"}
 
 # --os-sandbox: opt-in, per-dispatch OS sandbox profile for the bash-shape codex
 # worker. Unset -> "workspace-write" (the unchanged default — every existing
@@ -173,6 +173,7 @@ ACCOUNT_ENGINE_BY_AGENT = {
     "grok-code": "grok",
     "grok-research": "grok",
     "grok-acp": "grok",
+    "kimi": "kimi",
     "cursor": "cursor",
     "cursor-agent": "cursor",
 }
@@ -276,8 +277,8 @@ PROMPT_FILE_PREAMBLE = (
 )
 PROJECT_ORIENTATION_RELATIVE = Path("docs-private") / "rag" / "ORIENTATION.md"
 PROJECT_ORIENTATION_SCOPE_RULE = "Read it before starting; orientation only, never scope expansion."
-GROK_EXECUTION_PREAMBLE = (
-    "Grok worker execution contract:\n"
+WORKER_EXECUTION_PREAMBLE = (
+    "Worker execution contract:\n"
     "- Use your available tools to actually perform the requested filesystem, shell, "
     "research, or analysis actions before answering. Do not only plan, summarize, or "
     "describe commands.\n"
@@ -515,12 +516,14 @@ def _repair_watcher_terminal_status(
     terminal_marker = _last_line_is_terminal_marker(
         tail,
         ignore_prefix_lines=ignore_prefix_lines,
+        kimi_output=getattr(args, "agent", None) == "kimi",
     )
     if not terminal_marker and not worker_is_alive:
         terminal_marker = _final_terminal_marker(
             tail,
             ignore_prefix_lines=ignore_prefix_lines,
             suppress_unfenced_prompt_markers=True,
+            kimi_output=getattr(args, "agent", None) == "kimi",
         )
     if not terminal_marker:
         terminal_marker = payload.get("terminal_marker")
@@ -1387,7 +1390,7 @@ def _validate_before_side_effects(args, raw_argv: list[str]) -> None:
     if args.agent not in PRESET_AGENTS:
         raise DispatchUsageError(
             "no worker preset for --agent "
-            f"{args.agent!r} — use --agent codex|grok-code|grok-research with "
+            f"{args.agent!r} — use --agent codex|grok-code|grok-research|kimi with "
             "--prompt/--prompt-file, or pass a raw worker after `-- <cmd...>`"
         )
     if args.agent in STDIN_PROMPT_AGENTS and not _prompt_requested(args):
@@ -1593,8 +1596,8 @@ def _worker_prompt_preamble(agent: str | None, *, orientation_path: Path | None 
     preambles = [STEER_PROMPT_PREAMBLE, PROMPT_FILE_PREAMBLE]
     if orientation_path is not None:
         preambles.append(_project_orientation_preamble(orientation_path))
-    if agent in {"grok-code", "grok-research"}:
-        preambles.append(GROK_EXECUTION_PREAMBLE)
+    if agent in {"grok-code", "grok-research", "kimi"}:
+        preambles.append(WORKER_EXECUTION_PREAMBLE)
     return "\n\n".join(preambles)
 
 
@@ -3085,6 +3088,7 @@ def _mark_claim_worker_dead(entry: dict, *, reason: str) -> None:
         tail,
         ignore_prefix_lines=ignore_prefix_lines,
         suppress_unfenced_prompt_markers=True,
+        kimi_output=getattr(args, "agent", None) == "kimi",
     )
     state = _marker_state_for_terminal(terminal_marker) if terminal_marker else "worker_dead"
     reason_for_finish = f"marker:{terminal_marker['kind']}:final_reconciliation" if terminal_marker else reason
@@ -4000,6 +4004,18 @@ def build_worker(args, prompt_path, raw_argv: list[str]):
         if args.cwd:
             argv += ["--cwd", args.cwd]
         return argv, None
+    if args.agent == "kimi":
+        # kimi has no --cwd, is off-PATH, takes the prompt as an argv value, and -p auto-runs
+        # tools (no --auto/-y — those are rejected with -p). Resolve the binary and cd in a
+        # login shell, exec kimi so the pid IS kimi (bash-tail pgid handling unaffected).
+        prompt_text = Path(prompt_path).read_text()
+        script = ('bin="$(command -v kimi || printf %s "$HOME/.kimi-code/bin/kimi")"; '
+                  'test -x "$bin" || { echo "kimi binary not found/executable: $bin" >&2; exit 127; }; '
+                  'prompt=$1; shift; cd "$0" && exec "$bin" -p "$prompt" --output-format text "$@"')
+        extra = (["--model", args.model] if getattr(args, "model", None) else []) \
+                + ["--add-dir", args.cwd or "."]
+        argv = ["/bin/sh", "-lc", script, args.cwd or ".", prompt_text, *extra]
+        return argv, None
     return None, None  # unknown preset + no raw command
 
 
@@ -4018,7 +4034,7 @@ def main(argv: list[str] | None = None) -> int:
         description="Crash-safe worker dispatch: detached worker + decoupled watcher."
     )
     parser.add_argument("--agent", default="worker",
-                        help="Preset (codex|grok-code|grok-research) OR a label when you pass `-- <cmd>`")
+                        help="Preset (codex|grok-code|grok-research|kimi) OR a label when you pass `-- <cmd>`")
     parser.add_argument("--prompt-file", help="Prompt file (preset path)")
     parser.add_argument("--prompt", help="Inline prompt text (preset path; alternative to --prompt-file)")
     parser.add_argument(
@@ -4030,7 +4046,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--cwd", help="Worker working directory")
     parser.add_argument("--model", default=None,
-                        help="Worker model id (grok-code/grok-research/codex --model passthrough). "
+                        help="Worker model id (grok-code/grok-research/kimi/codex --model passthrough). "
                              "Default = agent label's own default.")
     parser.add_argument("--read-only", action="store_true",
                         help="Read-only sandbox (review/analysis dispatches). Equivalent to "

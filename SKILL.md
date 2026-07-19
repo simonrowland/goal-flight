@@ -385,7 +385,7 @@ Default routing by task:
 
 | Task | Default | Fallback 1 | Fallback 2 |
 |---|---|---|---|
-| Code-writing chunks | `goalflight_dispatch.py` codex worker | Alternate marker-reliable CLI worker with passing write-file probe | Host Agent — LAST RESORT only ‡ |
+| Code-writing chunks | `goalflight_dispatch.py` codex worker | Alternate marker-reliable CLI worker (`grok-code` or `kimi`) with passing write-file probe | Host Agent — LAST RESORT only ‡ |
 | Research / web search | `goalflight_dispatch.py` `--agent grok-research` (read-only) | controller-direct | - |
 | Reviewer dispatches | gstack `/review` via review worker + concern-diverse sweep | any one alone | Claude Agent only when others unreachable |
 | Planning / decompose | code/planning worker | controller-direct | Claude Agent |
@@ -394,7 +394,7 @@ Default routing by task:
 | Voice-sensitive prose | orchestrator judgment per chunk | - | - |
 
 ‡ **Host Agent as code executor = LAST RESORT, never a co-equal fallback.** Use
-only when EVERY CLI worker (codex, grok-code) is genuinely unreachable, not slow.
+only when EVERY CLI worker (codex, grok-code, kimi) is genuinely unreachable, not slow.
 1. Confirm CLI workers are down with doctor/probe.
 2. `log()` + record degraded host-Agent fallback and why in RESUME-NOTES.
 3. Return to `goalflight_dispatch.py` when a CLI worker recovers.
@@ -461,7 +461,7 @@ Workers communicate with one-line markers:
 Use three state layers:
 - project: git, tests, docs, queue
 - machine: capacity leases, dispatch ledger, cooldowns
-- conversation: current decisions, unresolved questions, optional controller-only TodoWrite tactical checklist (ephemeral, dies on compaction; never durable state — that is the queue + RESUME-NOTES)
+- conversation: current decisions, unresolved questions, optional controller-only tactical checklist (ephemeral, dies on compaction; never durable state — that is the queue + RESUME-NOTES)
 
 Repository files are the canonical memory backend.
 Memory writeback requires migration lock ownership.

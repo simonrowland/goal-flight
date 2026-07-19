@@ -49,6 +49,7 @@
         "codex",
         "cursor",
         "grok",
+        "kimi",
         "gemini",
         "qwen",
         "opencode",
@@ -69,6 +70,7 @@
         "codex",
         "cursor",
         "grok",
+        "kimi",
         "gemini",
         "qwen",
         "opencode",
@@ -91,8 +93,8 @@
       "additionalProperties": false,
       "required": ["controller_provider", "model_provider", "same_provider_policy"],
       "properties": {
-        "controller_provider": {"enum": ["anthropic", "openai", "google", "xai", "github", "local", "mixed", "none", "unknown"]},
-        "model_provider": {"enum": ["anthropic", "openai", "google", "xai", "github", "local", "mixed", "unknown"]},
+        "controller_provider": {"enum": ["anthropic", "openai", "google", "xai", "moonshot", "github", "local", "mixed", "none", "unknown"]},
+        "model_provider": {"enum": ["anthropic", "openai", "google", "xai", "moonshot", "github", "local", "mixed", "unknown"]},
         "same_provider_policy": {"enum": ["allow", "lower_trust_weight", "require_cross_provider_review", "forbid_self_review"]}
       }
     },

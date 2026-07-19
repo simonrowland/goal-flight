@@ -25,6 +25,7 @@ _CLI_AGENT_LABELS: dict[str, set[str]] = {
     "grok-code": {"grok", "grok-code", "grok-research", "grok-acp"},
     "grok-research": {"grok", "grok-code", "grok-research", "grok-acp"},
     "grok-acp": {"grok", "grok-code", "grok-research", "grok-acp"},
+    "kimi": {"kimi"},
     "cursor": {"cursor", "cursor-agent"},
     "cursor-agent": {"cursor", "cursor-agent"},
     "claude": {"claude", "claude-acp"},

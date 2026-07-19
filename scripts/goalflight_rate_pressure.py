@@ -89,6 +89,7 @@ AGENT_TO_PROVIDER: dict[str, str] = {
     "grok-code": "xai",
     "grok-research": "xai",
     "grok-bash-tail": "xai",
+    "kimi": "moonshot",
     "cursor": "cursor",
     "cursor-agent": "cursor",
     "opencode": "openai",

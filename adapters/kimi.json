@@ -1,0 +1,150 @@
+{
+  "schema": "goalflight.agent-adapter.v1",
+  "agent_id": "kimi",
+  "display_name": "Kimi Code CLI",
+  "agent_family": "kimi",
+  "providers": {
+    "controller_provider": "moonshot",
+    "model_provider": "moonshot",
+    "same_provider_policy": "forbid_self_review"
+  },
+  "support": {
+    "controller": {
+      "capability": "supported",
+      "evidence": ["live probe: Kimi Code CLI v0.27.0 supports noninteractive print mode", "live probe: bare -p writes files and emits completion markers"],
+      "readiness_requirements": ["binary", "version", "auth_optional", "safe_args", "status_contract"],
+      "fallback": "worker_only"
+    },
+    "worker": {
+      "capability": "supported",
+      "transport": ["cli_json", "tail_file"],
+      "readiness_requirements": ["binary", "version", "noninteractive", "status_contract", "safe_args"],
+      "fallback": "tail_file"
+    }
+  },
+  "local_readiness_state": {
+    "storage": "machine-local, never checked in",
+    "path_pattern": "$XDG_STATE_HOME/goal-flight/readiness/<agent>.json",
+    "controller": "probe_required",
+    "worker": "probe_required",
+    "last_probe_ids": ["kimi-path", "kimi-version", "kimi-help"],
+    "updated_at": null
+  },
+  "live_gate": {
+    "function": "validate_adapter_gate",
+    "controller_allowed_expr": "support.controller.capability == supported && local_readiness.controller == ready",
+    "worker_allowed_expr": "support.worker.capability == supported && local_readiness.worker == ready && requested_transport is verified",
+    "default": "deny",
+    "support_status_enum": ["unsupported", "config_only", "probe_required", "candidate", "not_installed", "forbidden-arg", "failed", "blocked"],
+    "return_fields": ["allowed", "reason", "required_probe_ids", "blocked_fields", "safe_next_action", "live_controller_allowed", "live_worker_dispatch_allowed"]
+  },
+  "tool_name_map": {
+    "shell_exec": {"host_tools": ["Kimi CLI", "shell"], "constraints": ["safe probes only"]},
+    "read_file": {"host_tools": ["workspace file read"], "constraints": ["workspace reads only"]},
+    "write_file": {"host_tools": ["workspace edit"], "constraints": ["authorized edit scope only"]},
+    "search": {"host_tools": ["workspace search"], "constraints": ["filtered search"]},
+    "delegate": {"host_tools": ["Kimi print mode"], "constraints": ["requires live gate readiness"]},
+    "ask_user": {"host_tools": ["USER-NEED marker"], "constraints": ["block on ambiguity"]},
+    "plan_update": {"host_tools": ["status markers"], "constraints": ["controller tracks plan externally"]},
+    "memory_search": {"host_tools": ["repo resume notes", "Kimi session state"], "constraints": ["repo files remain canonical"]},
+    "browser_ui": {"host_tools": ["browser tool if host exposes one"], "constraints": ["only when available"]}
+  },
+  "invocation": {
+    "skill_triggers": ["goal-flight", "Kimi worker"],
+    "commands": ["kimi -p <prompt> --output-format text"],
+    "exec": {
+      "kind": "cli",
+      "binary": "kimi",
+      "args": ["-p", "--output-format", "text"],
+      "arg_policy": {
+        "required_safe_args": ["-p", "--output-format", "--add-dir"],
+        "forbidden_args": ["--auto", "-y", "--yolo", "--dangerously-*", "--dangerously-bypass-approvals-and-sandbox", "--dangerously-skip-permissions", "--allow-dangerously-skip-permissions", "--always-approve", "--allow-all-tools", "--trust-all-tools", "--auto-approve", "--auto-accept", "--skip-permissions", "--no-sandbox", "--disable-sandbox", "--sandbox-disable"],
+        "requires_explicit_justification": ["--bare", "--batch-api", "--headless-with-approval-bypass"],
+        "reject_in": ["invocation", "probes", "generated_wrappers", "checked_in_configs"]
+      },
+      "stdin": "none",
+      "cwd_policy": "repo_required",
+      "output_contract": {
+        "parser": "markers",
+        "completion_detection": "final_regex",
+        "final_event": null,
+        "final_regex": "^COMPLETE: ",
+        "exit_code_policy": "mapped",
+        "resume_args": [],
+        "goal_mode_eligible": true
+      }
+    }
+  },
+  "permission_surface": {
+    "file_reads": ["workspace files"],
+    "file_writes": ["authorized edit scope only"],
+    "shell": {"allowed_families": ["safe probes", "test runner"], "forbidden_families": ["permission bypass", "destructive reset", "raw web fetch"]},
+    "network": {"allowed": false, "user_gate": true, "notes": "Auth/model calls are not discovery probes."},
+    "browser_ui": {"allowed": false, "user_gate": true, "notes": "No verified browser UI contract."},
+    "memory_writes": {"allowed": false, "backend": "repo_files"},
+    "plugin_sandbox": {"mode": "none", "declared_permissions": []},
+    "os_sandbox": {
+      "supported_profiles": ["off", "read-only", "workspace-write"],
+      "default_profile": "off",
+      "implementation": "runner:sandbox-exec",
+      "platform_supported_profiles": {
+        "darwin": ["off", "read-only", "workspace-write"],
+        "linux": ["off"],
+        "wsl": ["off"],
+        "windows": ["off"]
+      },
+      "notes": "Dispatch-level worker subprocess wrapper; not a Kimi CLI flag. Permits temp and Kimi host-state writes while fencing project writes by profile."
+    },
+    "auto_approve_detection": {"probes": ["kimi-args-scan"], "strict_fail": true},
+    "secrets": [],
+    "irreversible_ops": ["git reset --hard", "force push", "rm -rf"]
+  },
+  "memory_backend": {
+    "canonical": "repo_files",
+    "repo_files": [".goal-flight/**"],
+    "host_native": {"role": "advisory", "backend": "Kimi session state"},
+    "mirror_writeback": false,
+    "source_epoch": "goal-flight-1.2.3",
+    "snapshot_id": "kimi-host-adapter",
+    "migration_lock_required_for_writeback": true,
+    "drift_policy": "warn_and_prefer_repo"
+  },
+  "packaging": {
+    "checked_in_wrappers": [],
+    "generated_outputs": [],
+    "install_actions": [],
+    "plugin_manifest": {"supported": false, "path": null, "api_status": "unsupported"},
+    "mcp": {"required": false, "servers": []},
+    "validation": ["json parse", "schema required groups", "candidate gate stays deny"]
+  },
+  "discovery": {
+    "budget": {"max_path_probes": 4, "max_version_probes": 1, "max_help_probes": 1, "max_ms_per_probe": 6000, "max_total_ms_per_agent": 20000, "max_total_ms_all_agents": 90000, "max_stdout_bytes_per_probe": 4096, "max_stderr_bytes_per_probe": 4096, "network_default": "deny", "model_consuming": "forbidden"},
+    "probes": [
+      {"id": "kimi-path", "class": "path", "argv": ["sh", "-lc", "command -v kimi || test -x ~/.kimi-code/bin/kimi"], "safe_for_setup": true, "network": false, "model_consuming": false, "env_scrub": true},
+      {"id": "kimi-version", "class": "version", "argv": ["sh", "-lc", "bin=$(command -v kimi || printf '%s' \"$HOME/.kimi-code/bin/kimi\"); test -x \"$bin\" && \"$bin\" --version"], "safe_for_setup": true, "network": false, "model_consuming": false, "env_scrub": true},
+      {"id": "kimi-help", "class": "help", "argv": ["sh", "-lc", "bin=$(command -v kimi || printf '%s' \"$HOME/.kimi-code/bin/kimi\"); test -x \"$bin\" && \"$bin\" --help"], "safe_for_setup": true, "network": false, "model_consuming": false, "env_scrub": true}
+    ]
+  },
+  "status_contract": {
+    "schema": "goalflight.acp-run.v1",
+    "liveness_profile": "remote_api",
+    "heartbeat_required": true,
+    "dispatcher_owns_heartbeat": true,
+    "status_file": ".goal-flight/status/<dispatch_id>.json",
+    "transport_instance_id": "kimi:<pid>:<dispatch_id>",
+    "seq": "monotonic integer",
+    "parser_type": "bash_tail",
+    "marker_namespace": "goalflight:<dispatch_id>:<transport>:<seq>",
+    "stale_after_s": 180,
+    "terminal_states": ["complete", "failed", "blocked", "wedged"]
+  },
+  "host_projection": {
+    "dispatch_presets": {
+      "kimi": {
+        "transport": "bash_tail",
+        "default_model": "kimi-code/k3",
+        "notes": "Print-mode coding worker; bare -p auto-runs tools and rejects --auto/--yolo."
+      }
+    }
+  }
+}

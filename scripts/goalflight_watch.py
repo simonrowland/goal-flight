@@ -231,6 +231,13 @@ def _strip_terminal_marker_prefix(stripped: str) -> str:
     return stripped
 
 
+def _strip_kimi_terminal_marker_prefix(stripped: str) -> str:
+    """Strip Kimi text renderer's first-line bullet; whitespace is stripped by callers."""
+    if stripped.startswith("• "):
+        return stripped[2:].lstrip()
+    return stripped
+
+
 def _fence_state_unbalanced(lines: list[str], ignored_lines: set[int]) -> bool:
     fence_count = 0
     for idx, line in enumerate(lines):
@@ -246,8 +253,13 @@ def _final_terminal_marker_from_line(
     line_no: int,
     *,
     allow_prefixed_marker: bool = False,
+    kimi_output: bool = False,
 ) -> dict | None:
-    if raw_line.startswith((" ", "\t")):
+    kimi_continuation = raw_line.startswith("  ") and not raw_line.startswith("   ")
+    if raw_line.startswith("\t") or (
+        raw_line.startswith(" ")
+        and not (allow_prefixed_marker and kimi_output and kimi_continuation)
+    ):
         return None
     if _is_diff_context_line(raw_line) and not allow_prefixed_marker:
         return None
@@ -258,6 +270,8 @@ def _final_terminal_marker_from_line(
         return None
     if allow_prefixed_marker:
         stripped = _strip_terminal_marker_prefix(stripped)
+        if kimi_output:
+            stripped = _strip_kimi_terminal_marker_prefix(stripped)
         if not stripped:
             return None
     signoff = _completion_signoff_marker(stripped, line_no)
@@ -547,6 +561,8 @@ def post_worker_mail(dispatch_id: str, markers: list[dict], posted_keys: set) ->
 def _last_line_is_terminal_marker(
     path: Path,
     ignore_prefix_lines: list[str] | None = None,
+    *,
+    kimi_output: bool = False,
 ) -> dict | None:
     """Return a terminal marker dict iff the *last non-empty line* of the tail
     (after prefix-echo ignore and skipping inside code fences) matches a
@@ -593,6 +609,8 @@ def _last_line_is_terminal_marker(
             last_in_fence = False
     if not last_nonempty or last_in_fence:
         return None
+    if kimi_output:
+        last_nonempty = _strip_kimi_terminal_marker_prefix(last_nonempty)
     match = MARKER_RE.match(last_nonempty)
     if match and match.group(1) in TERMINAL_MARKERS:
         return {"line": last_nonempty_line, "kind": match.group(1), "text": match.group(2)[:1000]}
@@ -610,6 +628,7 @@ def _scan_final_terminal_marker(
     prompt_line_set: set[str],
     suppress_unfenced_prompt_markers: bool,
     ignore_fences: bool,
+    kimi_output: bool = False,
 ) -> dict | None:
     in_fence = False
     in_hunk = False
@@ -630,7 +649,12 @@ def _scan_final_terminal_marker(
         if HUNK_HEADER_RE.match(line):
             in_hunk = True
             continue
-        candidate = _final_terminal_marker_from_line(line, idx, allow_prefixed_marker=True)
+        candidate = _final_terminal_marker_from_line(
+            line,
+            idx,
+            allow_prefixed_marker=True,
+            kimi_output=kimi_output,
+        )
         if candidate:
             if _is_unfenced_prompt_quoted_bare_marker(
                 stripped,
@@ -648,6 +672,7 @@ def _final_terminal_marker(
     ignore_prefix_lines: list[str] | None = None,
     *,
     suppress_unfenced_prompt_markers: bool = True,
+    kimi_output: bool = False,
 ) -> dict | None:
     """Return the last terminal marker anywhere in the completed post-prompt tail.
 
@@ -671,6 +696,7 @@ def _final_terminal_marker(
         prompt_line_set=prompt_line_set,
         suppress_unfenced_prompt_markers=suppress_unfenced_prompt_markers,
         ignore_fences=False,
+        kimi_output=kimi_output,
     )
     if not _fence_state_unbalanced(lines, prompt_echo_lines):
         return terminal
@@ -681,6 +707,7 @@ def _final_terminal_marker(
         prompt_line_set=prompt_line_set,
         suppress_unfenced_prompt_markers=suppress_unfenced_prompt_markers,
         ignore_fences=True,
+        kimi_output=kimi_output,
     )
     if (
         fence_agnostic_terminal
@@ -971,13 +998,21 @@ def main() -> int:
             last_change = active_monotonic()
         now = time.time()
         seconds_since_event = active_monotonic() - last_change
-        terminal = _last_line_is_terminal_marker(tail, ignore_prefix_lines=ignore_prefix_lines)
+        terminal = _last_line_is_terminal_marker(
+            tail,
+            ignore_prefix_lines=ignore_prefix_lines,
+            kimi_output=args.agent == "kimi",
+        )
         if terminal:
             # Stability recheck (minimal gap protection): if bytes arrive within a short
             # window after a terminal marker became the last line, it was a mid-output
             # emission; discard and keep watching. Genuine sign-off is worker's final act.
             time.sleep(0.05)
-            terminal = _last_line_is_terminal_marker(tail, ignore_prefix_lines=ignore_prefix_lines)
+            terminal = _last_line_is_terminal_marker(
+                tail,
+                ignore_prefix_lines=ignore_prefix_lines,
+                kimi_output=args.agent == "kimi",
+            )
         worker_is_alive, identity_reason, current_identity = worker_alive(args.pid, expected_identity)
         if worker_is_alive:
             pgid = args.pgid or process_group_id(args.pid) or pgid
@@ -1054,7 +1089,11 @@ def main() -> int:
             exit_reason = payload.get("reason", exit_reason)
             break
         if not worker_is_alive:
-            reconciled = _final_terminal_marker(tail, ignore_prefix_lines=ignore_prefix_lines)
+            reconciled = _final_terminal_marker(
+                tail,
+                ignore_prefix_lines=ignore_prefix_lines,
+                kimi_output=args.agent == "kimi",
+            )
             if reconciled:
                 terminal_seen = reconciled
                 payload["terminal_marker"] = terminal_seen

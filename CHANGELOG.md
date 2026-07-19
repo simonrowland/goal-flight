@@ -6,6 +6,8 @@ incremented when meaningful skill behaviour changes.
 
 ## [Unreleased]
 
+- Added the `kimi` bash-tail coding-worker preset with off-PATH binary resolution, cwd-safe print-mode execution, Moonshot provider/capacity wiring, adapter validation, Kimi-rendered marker tolerance, and live-smoke coverage. Bare `-p` auto-runs tools; incompatible `--auto` and `-y`/`--yolo` flags are forbidden.
+
 ## [1.2.3] — 2026-07-08
 
 - grok-code, grok-research, AND grok-acp workers no longer pin a grok model — the harness injects no `--model`, so grok's own CLI default (grok-4.5 as of this release) applies and auto-tracks forward instead of pinning a version that goes stale. Retires the old `grok-composer-2.5-fast` (coding + the ACP-write pin) and `grok-build` (research, now unlisted by `grok models`) pins; either remains reachable via an explicit `--model`. grok-4.5 was validated to write reliably through ACP (live grok-acp file-write smoke); grok-research keeps web tools enabled.
