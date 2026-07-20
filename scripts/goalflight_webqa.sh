@@ -200,7 +200,9 @@ capture_stdout console "$OUT/console.txt" console --errors || exit 5
 capture_stdout network "$OUT/network.txt" network || exit 5
 capture_stdout a11y "$OUT/a11y.txt" accessibility || exit 5
 capture_stdout snapshot "$OUT/snapshot.txt" snapshot -i || exit 5
-screenshot_tmp="$OUT/screen.png.tmp.$$"
+# The browser infers image format from the EXTENSION, so the temp file must keep
+# a .png suffix: a bare ".tmp.$$" yields `unsupported mime type "null"`.
+screenshot_tmp="$OUT/screen.tmp.$$.png"
 rm -f -- "$OUT/screen.png" "$screenshot_tmp"
 if ! gbt screenshot "$screenshot_tmp" >/dev/null 2>&1; then
   rm -f -- "$screenshot_tmp"
