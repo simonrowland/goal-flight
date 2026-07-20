@@ -1386,11 +1386,30 @@ def test_stale_claim_launch_token_requires_matching_worker_record() -> None:
         finally:
             os.environ.clear()
             os.environ.update(old_env)
+        # The carrier is redundant but UNLINKED (no task_ids on either side), so
+        # fail-closed parks it in quarantine: never deleted, never restored, live
+        # record untouched — the same contract pinned for live unlinked carriers
+        # by test_b065_unlinked_early_terminal_and_live_carriers_quarantine. The
+        # earlier "preserve as pending" expectation assumed INDETERMINATE
+        # admission, but the token-matched live record is merged by
+        # _entry_with_record_identity, upgrading admission to LIVE, where the
+        # designed unlinked outcome is quarantine, not deferral.
+        assert cleared["restored"] == 0, cleared  # never re-launch a live dispatch
         assert cleared["cleared"] == 0, cleared
-        assert cleared["quarantined"] == 0, cleared
-        assert cleared["pending_launch"] >= 1, cleared
-        assert matched_claim.exists(), "indeterminate identity must preserve carrier"
+        assert cleared["quarantined"] == 1, cleared
+        # pending_launch == 2: the matched ledger row (LIVE → deferred by the
+        # carrier-less ledger scan after its carrier was parked) plus the
+        # carrier-less "queued" token-only row left over from the phase-1 restore.
+        assert cleared["pending_launch"] == 2, cleared
+        assert cleared["ledger_terminalized"] == 0, cleared
+        assert not matched_claim.exists(), "carrier is parked, not left in the launch glob"
+        parked = queue / "quarantine" / "matched.json.claimed-123.quarantined"
+        assert parked.exists(), "quarantine retains the envelope (never deletes)"
+        parked_entry = json.loads(parked.read_text(encoding="utf-8"))
+        assert parked_entry.get("quarantine_reason") == "live_worker_unlinked_claim_carrier", parked_entry
         assert not (tmp / "state" / "dispatch-queue" / "matched.json").exists()
+        record = json.loads((tmp / "state" / "runs.d" / "matched.json").read_text(encoding="utf-8"))
+        assert record["state"] == "running", record  # live worker record untouched
 
 
 def test_stale_claim_result_marker_with_rate_limit_text_completes() -> None:
