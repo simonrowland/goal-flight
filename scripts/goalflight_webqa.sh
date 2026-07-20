@@ -225,15 +225,53 @@ do
   fi
 done
 
+# Count signal lines in a browse artifact, ignoring the tool's own chrome.
+#
+# A naive `grep -c` over the whole artifact counts two kinds of NON-signal text,
+# and both were observed reporting console_errors=1 on a provably clean page:
+#   1. The wrapper banner "--- BEGIN UNTRUSTED EXTERNAL CONTENT (source: <url>) ---".
+#      The URL is caller-supplied, so any page under a path like /error-page or
+#      /failed-login inflates every count on every run.
+#   2. The empty-state sentinel the tool prints when it has nothing to report.
+#      `console --errors` prints literally "(no console errors)", which contains
+#      "error" and so scored itself as an error.
+#
+# The sentinel rule is deliberately narrow: a LONE "(no ...)" line means empty,
+# but as soon as there is other content every line is counted, including any
+# sentinel-shaped one. So a page that logs "(no console errors)" alongside real
+# errors over-counts by one rather than suppressing them -- the failure direction
+# points at reporting a problem, never at hiding one.
 count_matches() {
-  local pattern="$1" artifact="$2" count status
+  local pattern="$1" artifact="$2"
   [ -r "$artifact" ] || return 2
-  count="$(grep -ciE "$pattern" "$artifact")"
-  status=$?
-  case "$status" in
-    0|1) printf '%s\n' "$count" ;;
-    *) return "$status" ;;
-  esac
+  python3 - "$pattern" "$artifact" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+# The browser wraps page-derived output in one of two banner dialects, and may
+# indent them. Match both rather than one exact prefix, so a dialect change
+# leaves chrome in the count instead of silently re-introducing the bug:
+#   --- BEGIN UNTRUSTED EXTERNAL CONTENT (source: <url>) ---
+#   ═══ BEGIN UNTRUSTED WEB CONTENT ═══
+CHROME_RE = re.compile(r"^[\s\-=═]*(?:BEGIN|END) UNTRUSTED [A-Z]+ CONTENT\b")
+
+# Empty-state sentinels are exactly three words -- "(no console errors)",
+# "(no console messages)", "(no network requests)". Anchoring on that shape
+# instead of "(no …)" keeps real page output that merely opens with "(no "
+# countable: a lone "(no stack available for this error)" is signal, not chrome.
+SENTINEL_RE = re.compile(r"\(no \w+ \w+\)")
+
+pattern, path = sys.argv[1], sys.argv[2]
+lines = [
+    line
+    for line in Path(path).read_text(errors="replace").splitlines()
+    if line.strip() and not CHROME_RE.match(line)
+]
+if len(lines) == 1 and SENTINEL_RE.fullmatch(lines[0].strip()):
+    lines = []
+print(sum(1 for line in lines if re.search(pattern, line, re.IGNORECASE)))
+PY
 }
 
 if ! ERRS="$(count_matches 'error|exception|uncaught' "$OUT/console.txt")"; then
