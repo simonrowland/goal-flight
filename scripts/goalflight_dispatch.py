@@ -45,6 +45,8 @@ import argparse
 import asyncio
 import contextlib
 import datetime as dt
+from dataclasses import dataclass, field
+from enum import Enum
 import hashlib
 try:
     import fcntl
@@ -74,6 +76,7 @@ import goalflight_terminal
 from goalflight_codex_sandbox import codex_workspace_write_args
 from goalflight_liveness import active_monotonic, process_group_id, write_status
 from goalflight_watch import (
+    SUCCESS_TERMINAL_MARKERS,
     _final_terminal_marker,
     _last_line_is_terminal_marker,
     _marker_state as _marker_state_for_terminal,
@@ -85,6 +88,13 @@ WATCH_TAIL_SH = SCRIPT_DIR / "watch-dispatch-tail.sh"
 DAEMON_SPAWN_ARG = "__goalflight_spawn_daemon"
 DISPATCH_QUEUE_SCHEMA = "goalflight.dispatch-queue.v1"
 QUEUE_CLAIM_STALE_S = 300.0
+LAUNCH_TIMEOUT_S = QUEUE_CLAIM_STALE_S
+MAX_CLAIM_RECOVERY_REQUEUES = 1
+RECONCILE_DOWNSTREAM_LOCK_BUDGET_S = 0.100
+RECONCILE_LOCK_POLL_S = 0.010
+PRELAUNCH_CANDIDATE_STATES = frozenset(
+    {"queued", "waiting_capacity", "starting", "submitted", "claimed"}
+)
 QUEUE_PRIORITY_RANK = {lane: rank for rank, lane in enumerate(goalflight_capacity.PRIORITY_LANES)}
 QUEUE_DEFAULT_PRIORITY = "normal"
 PRESET_AGENTS = {"codex", "grok-code", "grok-research"}
@@ -97,6 +107,121 @@ _DASHBOARD_REFRESH_MAX_LIFETIME_S = 4 * 60 * 60
 _DASHBOARD_REFRESH_CLAIM_STALE_S = 30.0
 CODE_WRITER_MAX_IDLE_SECS = 600.0
 CODE_WRITER_AGENTS = {"codex", "codex-acp", "grok-code", "grok-acp", "cursor", "cursor-agent"}
+
+
+class PreAdmitClass(Enum):
+    LIVE = "live"
+    INDETERMINATE = "indeterminate"
+    CONFIRMED_DEAD = "confirmed_dead"
+    PID_REUSED = "pid_reused"
+    STALE_NO_SPAWN = "stale_no_spawn"
+    NOT_STALE = "not_stale"
+    REMOTE_AUTHORITY_REQUIRED = "remote_authority_required"
+
+
+class AdmissionAction(Enum):
+    ADMIT_TO_GATE = "admit_to_gate"
+    DEFER_UNCHANGED = "defer_unchanged"
+
+
+ADMISSION_DECISION = {
+    PreAdmitClass.LIVE: AdmissionAction.DEFER_UNCHANGED,
+    PreAdmitClass.INDETERMINATE: AdmissionAction.DEFER_UNCHANGED,
+    PreAdmitClass.CONFIRMED_DEAD: AdmissionAction.ADMIT_TO_GATE,
+    PreAdmitClass.PID_REUSED: AdmissionAction.ADMIT_TO_GATE,
+    PreAdmitClass.STALE_NO_SPAWN: AdmissionAction.ADMIT_TO_GATE,
+    PreAdmitClass.NOT_STALE: AdmissionAction.DEFER_UNCHANGED,
+    PreAdmitClass.REMOTE_AUTHORITY_REQUIRED: AdmissionAction.DEFER_UNCHANGED,
+}
+
+
+class ReconciliationMode(Enum):
+    LOCAL_FLOCK = "local_flock"
+    FALLBACK_PID_IDENTITY = "fallback_pid_identity"
+    DEFER_TO_NODE = "defer_to_node"
+    FAIL_CLOSED_DEFER = "fail_closed_defer"
+
+
+class FlockCapability(Enum):
+    COHERENT_LOCAL = "coherent_local"
+    COHERENT_CROSS_NODE = "coherent_cross_node"
+    UNAVAILABLE = "unavailable"
+    UNPROVEN = "unproven"
+
+
+@dataclass(frozen=True)
+class FilesystemIdentity:
+    device: int | None
+    mount_path: str
+    filesystem_type: str
+    locality: str
+
+
+class ProducerSetState(Enum):
+    LIVE = "live"
+    DEAD = "dead"
+    PID_REUSED = "pid_reused"
+    INDETERMINATE = "indeterminate"
+
+
+@dataclass(frozen=True)
+class ProducerIdentity:
+    pid: int
+    ppid: int
+    pgid: int
+    command: str
+    identity: dict
+
+
+@dataclass(frozen=True)
+class ProducerSetResult:
+    state: ProducerSetState
+    members: tuple[ProducerIdentity, ...] = ()
+    reason: str = ""
+
+
+class TerminalCommitKind(Enum):
+    CREATED_TERMINAL = "created_terminal"
+    UPDATED_TERMINAL = "updated_terminal"
+    EXISTING_TERMINAL = "existing_terminal"
+    DEFERRED = "deferred"
+
+
+@dataclass(frozen=True)
+class TerminalCommitResult:
+    kind: TerminalCommitKind
+    durable_state: str | None
+    committed: bool
+
+
+class AcquireResult(Enum):
+    ACQUIRED_ALL = "acquired_all"
+    DEFER_UNCHANGED = "defer_unchanged"
+
+
+@dataclass
+class _ReconcileTransaction:
+    entry: dict
+    tail: Path
+    admission: PreAdmitClass
+    mode: ReconciliationMode
+    filesystem: FilesystemIdentity
+    flock_capability: FlockCapability
+    tail_gate: object | None = None
+    downstream: list[object] = field(default_factory=list)
+    queue_locked: bool = False
+    task_store_locked: bool = False
+    ledger_locked: bool = False
+
+    def release(self) -> None:
+        for handle in reversed(self.downstream):
+            with contextlib.suppress(Exception):
+                handle.release()
+        self.downstream.clear()
+        if self.tail_gate is not None:
+            with contextlib.suppress(Exception):
+                self.tail_gate.__exit__(None, None, None)
+            self.tail_gate = None
 
 # --os-sandbox: opt-in, per-dispatch OS sandbox profile for the bash-shape codex
 # worker. Unset -> "workspace-write" (the unchanged default — every existing
@@ -317,6 +442,7 @@ def _cmd_spawn_daemon() -> int:
         argv = spec["argv"]
         stdin_path = spec.get("stdin_path")
         stdout_path = spec.get("stdout_path")
+        serialize_stdout = bool(spec.get("serialize_stdout"))
         stdout_mode = spec.get("stdout_mode") or "wb"
         stderr_mode = spec.get("stderr") or "stdout"
         with contextlib.ExitStack() as stack:
@@ -328,6 +454,12 @@ def _cmd_spawn_daemon() -> int:
                 stdout_file = Path(stdout_path)
                 stdout_file.parent.mkdir(parents=True, exist_ok=True)
                 stdout_f = stack.enter_context(open(stdout_file, stdout_mode))
+                if serialize_stdout and fcntl is not None:
+                    # The child inherits this locked stdout file description.
+                    # Reconciliation takes the same flock before its final
+                    # completion read + durable write, so it cannot pass a
+                    # COMPLETE still buffered in a live worker's stdout path.
+                    fcntl.flock(stdout_f.fileno(), fcntl.LOCK_EX)
             else:
                 stdout_f = subprocess.DEVNULL
             stderr_f = subprocess.STDOUT if stderr_mode == "stdout" else subprocess.DEVNULL
@@ -354,6 +486,7 @@ def _spawn_daemonized_process(
     stdout_path: Path | None = None,
     stdout_mode: str = "wb",
     stderr: str = "stdout",
+    serialize_stdout: bool = False,
     label: str,
 ) -> int:
     """Spawn a child through the private daemon helper and return the child's pid."""
@@ -363,6 +496,7 @@ def _spawn_daemonized_process(
         "stdout_path": str(stdout_path) if stdout_path else None,
         "stdout_mode": stdout_mode,
         "stderr": stderr,
+        "serialize_stdout": bool(stdout_path and serialize_stdout),
     }
     helper = subprocess.run(
         [sys.executable, str(Path(__file__).resolve()), DAEMON_SPAWN_ARG],
@@ -767,8 +901,16 @@ def _write_json_atomic(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
     try:
-        tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        with tmp.open("w", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
         tmp.replace(path)
+        dir_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
     except OSError:
         with contextlib.suppress(OSError):
             tmp.unlink()
@@ -1085,6 +1227,291 @@ def _queue_mutation_lock(queue_dir: Path):
         os.close(lock_fd)
         with contextlib.suppress(OSError):
             lock_path.unlink()
+
+
+class _QueueTryLock:
+    def __init__(self, path: Path, *, fh=None, fd: int | None = None):
+        self.path = path
+        self.fh = fh
+        self.fd = fd
+
+    def release(self) -> None:
+        if self.fh is not None:
+            try:
+                fcntl.flock(self.fh.fileno(), fcntl.LOCK_UN)
+            finally:
+                self.fh.close()
+                self.fh = None
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+            with contextlib.suppress(OSError):
+                self.path.unlink()
+
+
+def try_acquire_queue_lock(queue_dir: Path, *, deadline_s: float) -> _QueueTryLock | None:
+    queue_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path = queue_dir / ".submit.lock"
+    if fcntl is not None:
+        fh = path.open("a+", encoding="utf-8")
+        while True:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return _QueueTryLock(path, fh=fh)
+            except BlockingIOError:
+                if time.monotonic() >= deadline_s:
+                    fh.close()
+                    return None
+                time.sleep(min(RECONCILE_LOCK_POLL_S, max(0.0, deadline_s - time.monotonic())))
+            except OSError:
+                fh.close()
+                raise
+    while True:
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+            return _QueueTryLock(path, fd=fd)
+        except FileExistsError:
+            if time.monotonic() >= deadline_s:
+                return None
+            time.sleep(min(RECONCILE_LOCK_POLL_S, max(0.0, deadline_s - time.monotonic())))
+
+
+def _tail_lock_path(tail: Path) -> Path:
+    return tail.with_name(f".{tail.name}.completion.lock")
+
+
+class _TailLockBusy(RuntimeError):
+    """The worker still owns its stdout tail, so reconciliation must skip."""
+
+
+@contextlib.contextmanager
+def _tail_mutation_lock(tail: Path):
+    """Serialize worker tail appends with completion decisions and writes."""
+    tail.parent.mkdir(parents=True, exist_ok=True)
+    if fcntl is not None:
+        with tail.open("a+b") as tail_file:
+            fcntl.flock(tail_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(tail_file.fileno(), fcntl.LOCK_UN)
+        return
+
+    lock_path = _tail_lock_path(tail)
+    deadline = time.monotonic() + 30.0
+    lock_fd = None
+    while lock_fd is None:
+        try:
+            lock_fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+        except FileExistsError:
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"timed out waiting for tail mutation lock: {lock_path}")
+            time.sleep(0.05)
+    try:
+        yield
+    finally:
+        os.close(lock_fd)
+        with contextlib.suppress(OSError):
+            lock_path.unlink()
+
+
+@contextlib.contextmanager
+def _tail_reconciliation_lock(tail: Path):
+    """Acquire a proven local worker-held tail flock, immediately or defer.
+
+    Platform selection lives in ``resolve_reconciliation_mode``. The old
+    O_EXCL fallback was not worker-held and therefore cannot establish EOF.
+    """
+    tail.parent.mkdir(parents=True, exist_ok=True)
+    if fcntl is None:
+        raise _TailLockBusy(f"unavailable worker-held flock: {tail}")
+    with tail.open("a+b") as tail_file:
+        try:
+            fcntl.flock(tail_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise _TailLockBusy(str(tail)) from exc
+        try:
+            yield
+        finally:
+            fcntl.flock(tail_file.fileno(), fcntl.LOCK_UN)
+
+
+@contextlib.contextmanager
+def _fallback_reconciliation_lock(tail: Path):
+    """Serialize reconcilers only after whole-set producer death is proven."""
+    path = _tail_lock_path(tail)
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+    except FileExistsError as exc:
+        raise _TailLockBusy(str(tail)) from exc
+    try:
+        yield
+    finally:
+        os.close(fd)
+        with contextlib.suppress(OSError):
+            path.unlink()
+
+
+_FLOCK_CAPABILITY_CACHE: dict[tuple, FlockCapability] = {}
+
+
+def _tail_filesystem_identity(tail: Path, *, locality: str) -> FilesystemIdentity:
+    resolved = tail.expanduser().resolve(strict=False)
+    parent = resolved.parent
+    probe_parent = parent
+    while not probe_parent.exists() and probe_parent != probe_parent.parent:
+        probe_parent = probe_parent.parent
+    try:
+        stat_result = probe_parent.stat()
+        device = int(stat_result.st_dev)
+    except OSError:
+        return FilesystemIdentity(None, str(parent), "unknown", "unknown")
+    fs_type = "unknown"
+    identity_mount = f"dev:{device}"
+    if sys.platform == "darwin":
+        try:
+            mounts = subprocess.run(
+                ["mount"],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                timeout=1.0,
+            )
+        except (OSError, subprocess.SubprocessError):
+            mounts = None
+        best: tuple[int, str, str] | None = None
+        if mounts is not None and mounts.returncode == 0:
+            for line in mounts.stdout.splitlines():
+                match = re.search(r" on (.+?) \(([^, )]+)", line)
+                if not match:
+                    continue
+                mount_path, candidate_type = match.group(1), match.group(2)
+                if str(probe_parent).startswith(mount_path.rstrip("/") + "/") or str(probe_parent) == mount_path:
+                    candidate = (len(mount_path), candidate_type.lower(), mount_path)
+                    if best is None or candidate[0] > best[0]:
+                        best = candidate
+            if best is not None:
+                fs_type = best[1]
+                identity_mount = best[2]
+    commands = (["stat", "-f", "-c", "%T", str(probe_parent)],)
+    for command in commands:
+        try:
+            result = subprocess.run(
+                command,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                timeout=1.0,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if result.returncode == 0 and result.stdout.strip():
+            fs_type = result.stdout.strip().lower()
+            break
+    shared_types = {"nfs", "nfs4", "smbfs", "cifs", "afpfs", "sshfs", "fuse.sshfs"}
+    effective_locality = "shared" if any(name in fs_type for name in shared_types) else locality
+    return FilesystemIdentity(device, identity_mount, fs_type, effective_locality)
+
+
+def _probe_flock_capability(
+    *,
+    transport: str,
+    node: str | None,
+    tail_path: Path,
+    filesystem: FilesystemIdentity,
+) -> FlockCapability:
+    if fcntl is None:
+        return FlockCapability.UNAVAILABLE
+    key = (
+        transport,
+        node,
+        str(tail_path.expanduser().resolve(strict=False)),
+        filesystem.device,
+        filesystem.mount_path,
+        filesystem.filesystem_type,
+        filesystem.locality,
+    )
+    cached = _FLOCK_CAPABILITY_CACHE.get(key)
+    if cached is not None:
+        return cached
+    if filesystem.device is None or filesystem.locality not in {"local", "shared"}:
+        return FlockCapability.UNPROVEN
+    probe_parent = tail_path.expanduser().resolve(strict=False).parent
+    while not probe_parent.exists() and probe_parent != probe_parent.parent:
+        probe_parent = probe_parent.parent
+    probe = probe_parent / f".goalflight-flock-probe-{os.getpid()}"
+    child = (
+        "import fcntl,sys; f=open(sys.argv[1],'a+b'); "
+        "\ntry: fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)"
+        "\nexcept BlockingIOError: sys.exit(0)"
+        "\nelse: sys.exit(3)"
+    )
+    capability = FlockCapability.UNPROVEN
+    try:
+        with probe.open("a+b") as held:
+            fcntl.flock(held.fileno(), fcntl.LOCK_EX)
+            blocked = subprocess.run(
+                [sys.executable, "-c", child, str(probe)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=2.0,
+            )
+            fcntl.flock(held.fileno(), fcntl.LOCK_UN)
+        acquired = subprocess.run(
+            [sys.executable, "-c", "import fcntl,sys; f=open(sys.argv[1],'a+b'); fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)", str(probe)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2.0,
+        )
+        if blocked.returncode == 0 and acquired.returncode == 0:
+            # Both contenders ran on this host. This can prove only local
+            # coherence, even when the path happens to be a shared mount.
+            # Cross-node authority requires an actual node-side probe.
+            capability = FlockCapability.COHERENT_LOCAL
+    except (OSError, subprocess.SubprocessError):
+        capability = FlockCapability.UNPROVEN
+    finally:
+        with contextlib.suppress(OSError):
+            probe.unlink()
+    _FLOCK_CAPABILITY_CACHE[key] = capability
+    return capability
+
+
+def resolve_reconciliation_mode(
+    *,
+    transport: str,
+    node: str | None,
+    locality: str,
+    tail_path: Path,
+    tail_filesystem: FilesystemIdentity,
+    flock_probe: FlockCapability,
+    producer_set_authoritative: bool = False,
+    node_authority_available: bool = False,
+    worker_tail_lock_contract: bool = True,
+) -> ReconciliationMode:
+    """Fail-closed platform resolver, rebound and revalidated every attempt."""
+    _ = tail_path
+    if transport == "fleet" or locality == "remote":
+        if (
+            flock_probe is FlockCapability.COHERENT_CROSS_NODE
+            and worker_tail_lock_contract
+        ):
+            return ReconciliationMode.LOCAL_FLOCK
+        return ReconciliationMode.DEFER_TO_NODE if node and node_authority_available else ReconciliationMode.FAIL_CLOSED_DEFER
+    if (
+        transport in {"bash", "acp"}
+        and tail_filesystem.locality == "local"
+        and flock_probe is FlockCapability.COHERENT_LOCAL
+        and worker_tail_lock_contract
+    ):
+        return ReconciliationMode.LOCAL_FLOCK
+    if (
+        transport in {"bash", "acp"}
+        and flock_probe in {FlockCapability.UNAVAILABLE, FlockCapability.UNPROVEN}
+        and producer_set_authoritative
+    ):
+        return ReconciliationMode.FALLBACK_PID_IDENTITY
+    return ReconciliationMode.FAIL_CLOSED_DEFER
 
 
 def _skill_root() -> Path:
@@ -1493,6 +1920,7 @@ def _refuse_windows_dispatch(args) -> int:
             },
             sort_keys=True,
         ),
+        file=sys.stderr,
         flush=True,
     )
     return 2
@@ -2155,30 +2583,496 @@ def _queue_claim_worker_spawn_intent(entry: dict) -> bool:
 
 
 def _queue_claim_launcher_alive(entry: dict) -> bool:
+    status, _reason = _queue_claim_identity_status(
+        entry.get("queue_launcher_pid"),
+        entry.get("queue_launcher_identity"),
+    )
+    # identity_indeterminate returns ok=True from identity_matches; treat as
+    # alive for "still launching" protection so we never kill a maybe-live process.
+    return status in {"live", "indeterminate"}
+
+
+def _queue_claim_identity_status(
+    pid_value: object,
+    identity: object,
+) -> tuple[str, str]:
+    """Return (status, reason) for claim launcher/worker liveness.
+
+    status is one of: live | dead | indeterminate | no_pid.
+    Only confirmed-dead (or pid-reused) authorizes terminalization/relaunch;
+    identity_indeterminate and identity-provider exceptions must preserve and
+    alert (b-065 amendment C) — never map unknown/exception → dead.
+    """
     try:
-        launcher_pid = int(entry.get("queue_launcher_pid") or 0)
+        pid = int(pid_value or 0)
     except (TypeError, ValueError):
-        return False
-    if launcher_pid <= 0:
-        return False
+        return "no_pid", "no_pid"
+    if pid <= 0:
+        return "no_pid", "no_pid"
     try:
-        ok, _reason = goalflight_ledger.identity_matches(
+        ok, reason = goalflight_ledger.identity_matches(
             {
-                "worker_pid": launcher_pid,
-                "worker_identity": entry.get("queue_launcher_identity") or {},
+                "worker_pid": pid,
+                "worker_identity": identity if isinstance(identity, dict) else {},
             }
         )
-        return ok
-    except Exception:
-        return goalflight_compat.pid_alive(launcher_pid)
+    except Exception as exc:
+        # Provider failure is indeterminate whether or not the PID is currently
+        # alive — a transient probe error must never authorize terminalization.
+        return "indeterminate", f"identity_provider_exception:{type(exc).__name__}"
+    if reason == "identity_indeterminate" or str(reason).startswith("identity_check_error"):
+        return "indeterminate", reason
+    if ok:
+        return "live", reason
+    if reason in {"dead", "no_pid"} or str(reason).startswith("pid_reused"):
+        return "dead", reason
+    # Unknown identity story — preserve + alert, never treat as confirmed-dead.
+    return "indeterminate", reason or "identity_unknown"
 
 
 def _queue_claim_worker_alive(entry: dict) -> bool:
+    status, _reason = _queue_claim_identity_status(
+        entry.get("queue_worker_pid"),
+        entry.get("queue_worker_identity"),
+    )
+    return status == "live"
+
+
+def _queue_claim_worker_status(entry: dict) -> tuple[str, str]:
+    return _queue_claim_identity_status(
+        entry.get("queue_worker_pid"),
+        entry.get("queue_worker_identity"),
+    )
+
+
+def _queue_claim_launcher_status(entry: dict) -> tuple[str, str]:
+    return _queue_claim_identity_status(
+        entry.get("queue_launcher_pid"),
+        entry.get("queue_launcher_identity"),
+    )
+
+
+def _entry_transport(entry: dict, record: dict | None = None) -> str:
+    request = entry.get("request") if isinstance(entry.get("request"), dict) else {}
+    raw = str(
+        entry.get("transport")
+        or (record or {}).get("transport")
+        or request.get("transport")
+        or entry.get("shape")
+        or request.get("shape")
+        or "bash"
+    ).lower()
+    if raw in {"fleet", "fleet-ssh", "ssh", "remote"}:
+        return "fleet"
+    return "acp" if raw == "acp" or str(entry.get("shape") or "").lower() == "acp" else "bash"
+
+
+def _entry_node(entry: dict, record: dict | None = None) -> str | None:
+    request = entry.get("request") if isinstance(entry.get("request"), dict) else {}
+    raw = entry.get("node") or entry.get("remote_node") or (record or {}).get("node") or request.get("remote_node")
+    return str(raw) if raw else None
+
+
+def _entry_with_record_identity(
+    entry: dict,
+    record: dict | None,
+    *,
+    prefer_record: bool = False,
+) -> dict:
+    merged = dict(entry)
+    if not isinstance(record, dict):
+        return merged
+    if entry.get("queue_launch_token") and record.get("queue_launch_token") not in {
+        None,
+        entry.get("queue_launch_token"),
+    }:
+        if prefer_record:
+            merged["queue_launch_token"] = record.get("queue_launch_token")
+        return merged
+    mapping = {
+        "queue_worker_pid": "worker_pid",
+        "queue_worker_identity": "worker_identity",
+        "queue_worker_pgid": "worker_pgid",
+        "queue_worker_group_leader_identity": "worker_group_leader_identity",
+        "queue_worker_identity_snapshot_at": "worker_identity_snapshot_at",
+        "queue_producer_descendants": "producer_descendants",
+    }
+    for target, source in mapping.items():
+        if (prefer_record or not merged.get(target)) and record.get(source) is not None:
+            merged[target] = record[source]
+    if prefer_record and record.get("queue_launch_token") is not None:
+        merged["queue_launch_token"] = record.get("queue_launch_token")
+    if merged.get("queue_worker_pgid"):
+        merged.setdefault("queue_producer_group_contract", bool(record.get("producer_group_contract")))
+        merged.setdefault(
+            "queue_producer_group_contract_enforced",
+            bool(record.get("producer_group_contract_enforced")),
+        )
+    return merged
+
+
+def _process_snapshot() -> list[dict] | None:
+    """Return one bounded process-table snapshot, or None when not authoritative."""
     try:
-        worker_pid = int(entry.get("queue_worker_pid") or 0)
+        proc = subprocess.run(
+            ["ps", "-axo", "pid=,ppid=,pgid=,command="],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=2.0,
+            check=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    rows: list[dict] = []
+    for raw in proc.stdout.splitlines():
+        parts = raw.strip().split(None, 3)
+        if len(parts) < 3:
+            continue
+        try:
+            pid, ppid, pgid = (int(parts[0]), int(parts[1]), int(parts[2]))
+        except ValueError:
+            continue
+        rows.append({"pid": pid, "ppid": ppid, "pgid": pgid, "command": parts[3] if len(parts) > 3 else ""})
+    return rows
+
+
+def _persisted_descendant_identities(entry: dict) -> list[dict]:
+    raw = entry.get("queue_producer_descendants")
+    return [item for item in raw if isinstance(item, dict)] if isinstance(raw, list) else []
+
+
+def enumerate_token_producers(
+    entry: dict,
+    process_snapshot: list[dict] | None = None,
+) -> ProducerSetResult:
+    """Conservatively classify the complete launch-token-bound producer set."""
+    if not _queue_launch_token_from_entry(entry):
+        return ProducerSetResult(ProducerSetState.INDETERMINATE, reason="missing_launch_token")
+    if not bool(entry.get("queue_producer_group_contract")) or not bool(
+        entry.get("queue_producer_group_contract_enforced")
+    ):
+        return ProducerSetResult(ProducerSetState.INDETERMINATE, reason="missing_group_contract")
+    try:
+        pgid = int(entry.get("queue_worker_pgid") or 0)
     except (TypeError, ValueError):
-        return False
-    return worker_pid > 0 and goalflight_compat.pid_alive(worker_pid)
+        pgid = 0
+    if pgid <= 0:
+        return ProducerSetResult(ProducerSetState.INDETERMINATE, reason="missing_worker_pgid")
+
+    probes: list[tuple[str, str]] = []
+    if entry.get("queue_launcher_pid"):
+        probes.append(_queue_claim_launcher_status(entry))
+    if entry.get("queue_worker_pid"):
+        probes.append(_queue_claim_worker_status(entry))
+    else:
+        return ProducerSetResult(ProducerSetState.INDETERMINATE, reason="post_spawn_worker_pid_missing")
+    descendants = _persisted_descendant_identities(entry)
+    group_leader_identity = entry.get("queue_worker_group_leader_identity")
+    if not isinstance(group_leader_identity, dict):
+        return ProducerSetResult(ProducerSetState.INDETERMINATE, reason="missing_group_leader_identity")
+    probes.append(_queue_claim_identity_status(pgid, group_leader_identity))
+    for descendant in descendants:
+        probes.append(
+            _queue_claim_identity_status(descendant.get("pid"), descendant.get("identity"))
+        )
+    if any(status == "live" for status, _reason in probes):
+        return ProducerSetResult(ProducerSetState.LIVE, reason="recorded_producer_live")
+    if any(status == "indeterminate" for status, _reason in probes):
+        return ProducerSetResult(ProducerSetState.INDETERMINATE, reason="producer_identity_indeterminate")
+
+    snapshot = _process_snapshot() if process_snapshot is None else process_snapshot
+    if snapshot is None:
+        return ProducerSetResult(ProducerSetState.INDETERMINATE, reason="process_snapshot_unavailable")
+    by_pid = {int(row["pid"]): row for row in snapshot if isinstance(row, dict) and row.get("pid")}
+    group_rows = [row for row in snapshot if int(row.get("pgid") or 0) == pgid]
+    seed_pids = {
+        int(value)
+        for value in (entry.get("queue_launcher_pid"), entry.get("queue_worker_pid"), pgid)
+        if str(value or "").isdigit() and int(value) > 0
+    }
+    bound_pids = {int(row["pid"]) for row in group_rows}
+    changed = True
+    while changed:
+        changed = False
+        for row in snapshot:
+            pid = int(row.get("pid") or 0)
+            if pid in bound_pids:
+                continue
+            if int(row.get("ppid") or 0) in seed_pids | bound_pids:
+                bound_pids.add(pid)
+                changed = True
+    if bound_pids:
+        members: list[ProducerIdentity] = []
+        for pid in sorted(bound_pids):
+            row = by_pid.get(pid, {})
+            identity = goalflight_ledger.process_identity(pid)
+            if not isinstance(identity, dict) or identity.get("identity_available") is False:
+                return ProducerSetResult(ProducerSetState.INDETERMINATE, reason="member_identity_unavailable")
+            members.append(
+                ProducerIdentity(
+                    pid=pid,
+                    ppid=int(row.get("ppid") or 0),
+                    pgid=int(row.get("pgid") or 0),
+                    command=str(row.get("command") or ""),
+                    identity=identity,
+                )
+            )
+        return ProducerSetResult(ProducerSetState.LIVE, tuple(members), "token_bound_member_live")
+
+    reasons = [reason for status, reason in probes if status == "dead"]
+    if not reasons:
+        return ProducerSetResult(ProducerSetState.INDETERMINATE, reason="producer_seed_unproven")
+    if all(str(reason).startswith("pid_reused") for reason in reasons):
+        return ProducerSetResult(ProducerSetState.PID_REUSED, reason="whole_set_pid_reused")
+    return ProducerSetResult(ProducerSetState.DEAD, reason="whole_set_dead")
+
+
+def classify_reconciliation_admission(
+    entry: dict,
+    now_s: float,
+    *,
+    stale_s: float = QUEUE_CLAIM_STALE_S,
+) -> PreAdmitClass:
+    """Read-only layered liveness classification; elapsed time never proves death."""
+    record = _find_dispatch_record(str(entry.get("dispatch_id") or ""))
+    probe_entry = _entry_with_record_identity(entry, record)
+    if _entry_transport(probe_entry, record) == "fleet" or _entry_node(probe_entry, record):
+        return PreAdmitClass.REMOTE_AUTHORITY_REQUIRED
+
+    launcher_status, launcher_reason = _queue_claim_launcher_status(probe_entry)
+    worker_status, worker_reason = _queue_claim_worker_status(probe_entry)
+    crossed_spawn = _queue_claim_worker_spawn_intent(probe_entry) or _queue_claim_worker_spawned(probe_entry)
+
+    if launcher_status == "live" or worker_status == "live":
+        return PreAdmitClass.LIVE
+    if crossed_spawn and not probe_entry.get("queue_worker_pid"):
+        # A detached helper may exist between durable spawn-intent and worker
+        # PID publication, even after the launcher exits.
+        return PreAdmitClass.INDETERMINATE
+    if launcher_status == "indeterminate" or worker_status == "indeterminate":
+        return PreAdmitClass.INDETERMINATE
+
+    has_seed = any(
+        probe_entry.get(key)
+        for key in (
+            "queue_launch_started",
+            "queue_launch_started_at",
+            "queue_worker_spawn_intent",
+            "queue_worker_spawn_intent_at",
+            "queue_worker_spawned_at",
+            "queue_launcher_pid",
+            "queue_worker_pid",
+            "queue_worker_pgid",
+        )
+    )
+    age_stamp = _launch_age_timestamp_s(probe_entry)
+    age_s = max(0.0, float(now_s) - age_stamp) if age_stamp is not None else 0.0
+    if not has_seed:
+        return PreAdmitClass.STALE_NO_SPAWN if age_s >= max(0.0, stale_s) else PreAdmitClass.NOT_STALE
+    reasons = [reason for status, reason in ((launcher_status, launcher_reason), (worker_status, worker_reason)) if status == "dead"]
+    if not reasons:
+        return PreAdmitClass.INDETERMINATE
+    if all(str(reason).startswith("pid_reused") for reason in reasons):
+        return PreAdmitClass.PID_REUSED
+    return PreAdmitClass.CONFIRMED_DEAD
+
+
+def _parse_timestamp_s(value: object) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            ts = float(value)
+        except (TypeError, ValueError):
+            return None
+        # Accept unix seconds; reject clearly bogus values.
+        if ts > 1_000_000_000:
+            return ts
+        return None
+    if isinstance(value, str):
+        # Bare integer/float strings (status updated_at style) — only used when
+        # the field is a launch-progress stamp, never as the sole age authority
+        # for heartbeat fields.
+        stripped = value.strip()
+        if stripped and stripped.replace(".", "", 1).isdigit():
+            try:
+                ts = float(stripped)
+            except ValueError:
+                ts = None
+            if ts is not None and ts > 1_000_000_000:
+                return ts
+        parsed = goalflight_ledger.parse_utc(value)
+        if parsed is not None:
+            return parsed.timestamp()
+    return None
+
+
+def _launch_age_timestamp_s(payload: dict | None, *, carrier_mtime: float | None = None) -> float | None:
+    """Newest trustworthy launch-progress time. NEVER uses updated_at (b-065 A).
+
+    ``carrier_mtime`` is accepted for call-site compatibility but intentionally
+    ignored: claim-file heartbeats rewrite mtime and would starve the 300s
+    orphan clock if included in the newest-wins set. Age derives solely from
+    immutable / first-seen stamps.
+    """
+    _ = carrier_mtime
+    if not isinstance(payload, dict):
+        payload = {}
+    candidates: list[float] = []
+    for key in (
+        "queue_worker_spawned_at",
+        "queue_worker_spawn_intent_at",
+        "queue_launch_started_at",
+        "started_at",
+        "created_at",
+        "orphan_first_seen_at",
+    ):
+        ts = _parse_timestamp_s(payload.get(key))
+        if ts is not None:
+            candidates.append(ts)
+    # Nested request may carry started_at for legacy rows.
+    request = payload.get("request") if isinstance(payload.get("request"), dict) else {}
+    for key in ("started_at", "created_at"):
+        ts = _parse_timestamp_s(request.get(key))
+        if ts is not None:
+            candidates.append(ts)
+    if not candidates:
+        return None
+    return max(candidates)
+
+
+def _claim_launch_age_s(entry: dict, claim: Path, *, now: float | None = None) -> float:
+    """Age of a claim for orphan detection — ignores updated_at and carrier mtime."""
+    _ = claim  # path kept for call-site compatibility; mtime is not an age source
+    now_s = time.time() if now is None else float(now)
+    stamp = _launch_age_timestamp_s(entry)
+    if stamp is None:
+        return 0.0
+    return max(0.0, now_s - stamp)
+
+
+def _entry_task_ids(entry: dict | None, record: dict | None = None) -> list[str]:
+    ids: list[str] = []
+    for source in (entry, record):
+        if not isinstance(source, dict):
+            continue
+        raw = source.get("task_ids")
+        if isinstance(raw, list):
+            ids.extend(str(x) for x in raw if x)
+        single = source.get("task_id")
+        if single:
+            ids.append(str(single))
+        request = source.get("request") if isinstance(source.get("request"), dict) else {}
+        raw_req = request.get("task_ids")
+        if isinstance(raw_req, list):
+            ids.extend(str(x) for x in raw_req if x)
+    # Preserve order, drop empties/dupes.
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in ids:
+        item = item.strip()
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return out
+
+
+def _is_task_linked(entry: dict | None, record: dict | None = None) -> bool:
+    return bool(_entry_task_ids(entry, record))
+
+
+def _claim_recovery_count(entry: dict | None) -> int:
+    if not isinstance(entry, dict):
+        return 0
+    try:
+        return max(0, int(entry.get("claim_recovery_count") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _queue_quarantine_dir(queue_dir: Path) -> Path:
+    path = queue_dir / "quarantine"
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return path
+
+
+def _quarantine_claim(claim: Path, entry: dict, *, reason: str) -> Path | None:
+    """Park an unlinked orphan claim out of the active launch glob. Never deletes."""
+    queue_dir = claim.parent
+    quarantine = _queue_quarantine_dir(queue_dir)
+    entry = dict(entry)
+    entry["state"] = "quarantined"
+    entry["quarantine_reason"] = reason
+    entry["quarantined_at"] = goalflight_ledger.utc_now()
+    entry["updated_at"] = entry["quarantined_at"]
+    dest = quarantine / f"{claim.name}.quarantined"
+    # Retry the same durable quarantine commit instead of minting duplicates
+    # when the prior attempt committed the destination but crashed before
+    # unlinking the claim carrier.
+    if dest.exists():
+        try:
+            existing = json.loads(dest.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            existing = None
+        same_commit = bool(
+            isinstance(existing, dict)
+            and existing.get("dispatch_id") == entry.get("dispatch_id")
+            and existing.get("queue_launch_token") == entry.get("queue_launch_token")
+            and existing.get("quarantine_reason") == reason
+        )
+        if not same_commit:
+            token = re.sub(r"[^A-Za-z0-9_.-]", "-", str(entry.get("queue_launch_token") or "collision"))
+            dest = quarantine / f"{claim.name}.quarantined-{token[:16]}"
+            if dest.exists():
+                return None
+    try:
+        if not dest.exists():
+            _write_json_atomic(dest, entry)
+        claim.unlink()
+    except OSError:
+        return None
+    print(
+        "CLAIM-RECOVERY-ALERT "
+        + json.dumps(
+            {
+                "dispatch_id": entry.get("dispatch_id"),
+                "action": "quarantine",
+                "reason": reason,
+                "path": str(dest),
+            },
+            sort_keys=True,
+        ),
+        file=sys.stderr,
+        flush=True,
+    )
+    return dest
+
+
+def _persist_orphan_first_seen(entry: dict, *, now_iso: str | None = None) -> str:
+    """Pure staged value helper; caller owns any carrier/ledger write."""
+    if entry.get("orphan_first_seen_at"):
+        return str(entry["orphan_first_seen_at"])
+    return now_iso or goalflight_ledger.utc_now()
+
+
+def _alert_identity_indeterminate(dispatch_id: str, *, where: str, reason: str) -> None:
+    print(
+        "CLAIM-RECOVERY-ALERT "
+        + json.dumps(
+            {
+                "dispatch_id": dispatch_id,
+                "action": "preserve",
+                "reason": "identity_indeterminate",
+                "where": where,
+                "detail": reason,
+            },
+            sort_keys=True,
+        ),
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def _submit_dispatch(args, raw_argv: list[str], *, base: Path) -> int:
@@ -2560,11 +3454,1217 @@ def _dispatch_has_terminal_record(dispatch_id: str) -> bool:
     return _dispatch_record_is_terminal(_find_dispatch_record(dispatch_id))
 
 
+def _claim_has_active_carrier(queue_dir: Path, dispatch_id: str) -> bool:
+    """True if a canonical queue envelope or live claim still exists for dispatch_id."""
+    if not dispatch_id:
+        return False
+    safe = goalflight_compat.safe_dispatch_filename(dispatch_id)
+    # Canonical name is usually "<dispatch_id>.json" but may be priority-prefixed.
+    for path in queue_dir.glob("*.json"):
+        if path.name.endswith(".failed"):
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            if path.stem == dispatch_id or path.stem == safe:
+                return True
+            continue
+        if isinstance(payload, dict) and str(payload.get("dispatch_id") or "") == dispatch_id:
+            return True
+    for claim in queue_dir.glob("*.json.claimed-*"):
+        if claim.name.endswith(".failed"):
+            continue
+        try:
+            payload = json.loads(claim.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            if claim.name.split(".claimed-", 1)[0].removesuffix(".json") == dispatch_id:
+                return True
+            continue
+        if isinstance(payload, dict) and str(payload.get("dispatch_id") or "") == dispatch_id:
+            return True
+    return False
+
+
+def _scan_entry_completion_marker(entry: dict) -> dict | None:
+    """Best-effort terminal-marker scan from claim/request tail path."""
+    request = entry.get("request") if isinstance(entry.get("request"), dict) else {}
+    dispatch_id = str(entry.get("dispatch_id") or "")
+    tail_raw = request.get("tail")
+    if not tail_raw and dispatch_id:
+        tail_raw = str(_dispatch_base_dir() / f"{dispatch_id}.tail")
+    if not tail_raw:
+        return None
+    tail = Path(str(tail_raw))
+    prompt = request.get("prompt_file") or entry.get("prompt_file")
+    ignore_prefix_lines = _ignore_prefix_lines(str(Path(prompt).expanduser()) if prompt else None)
+    try:
+        return _final_terminal_marker(
+            tail,
+            ignore_prefix_lines=ignore_prefix_lines,
+            suppress_unfenced_prompt_markers=True,
+        )
+    except Exception:
+        return None
+
+
+def _entry_tail_path(entry: dict, record: dict | None = None) -> Path:
+    request = entry.get("request") if isinstance(entry.get("request"), dict) else {}
+    dispatch_id = str(entry.get("dispatch_id") or "")
+    raw = (
+        request.get("tail")
+        or (record.get("stdout_path") if isinstance(record, dict) else None)
+        or (record.get("tail_path") if isinstance(record, dict) else None)
+        or (_dispatch_base_dir() / f"{dispatch_id}.tail")
+    )
+    return Path(str(raw)).expanduser()
+
+
+# Local-path tokens in SUCCESS marker text (READY/COMPLETE/RESULT). Mirrors
+# goalflight_status._extract_marker_paths — kept local so recovery never depends
+# on status module load order inside the drain hot path.
+_MARKER_LINK_RE = re.compile(r"\[[^\]]*\]\(([^)\s]+)\)")
+_URL_SCHEME_RE = re.compile(r"^[a-z][a-z0-9+.\-]*://", re.I)
+_PATH_EXT_RE = re.compile(r"[^/\\]\.[A-Za-z0-9]{1,8}$")
+
+
+def _extract_marker_artifact_paths(marker_text: str) -> list[str]:
+    if not marker_text:
+        return []
+    tokens = [m.group(1) for m in _MARKER_LINK_RE.finditer(marker_text)]
+    tokens += re.split(r"[\s,;`\"'<>()\[\]]+", _MARKER_LINK_RE.sub(" ", marker_text))
+    out: list[str] = []
+    for tok in tokens:
+        tok = tok.strip().strip("`\"'<>.,;")
+        if not tok:
+            continue
+        if tok.startswith("file://"):
+            tok = tok[len("file://") :]
+        elif _URL_SCHEME_RE.match(tok):
+            continue
+        tok = tok.split("#", 1)[0]
+        tok = re.sub(r":\d+(?:-\d+)?$", "", tok)
+        if tok and _PATH_EXT_RE.search(tok) and tok not in out:
+            out.append(tok)
+    return out
+
+
+def _direct_open_nonempty(path: Path) -> bool:
+    """Confirm path by direct open + non-empty size. Never use git/ls/find."""
+    try:
+        with open(path, "rb") as fh:
+            chunk = fh.read(1)
+        if chunk:
+            return True
+        return path.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def _project_root_for_entry(entry: dict, record: dict | None = None) -> Path:
+    request = entry.get("request") if isinstance(entry.get("request"), dict) else {}
+    raw = (
+        entry.get("project_root")
+        or request.get("cwd")
+        or (record.get("project_root") if isinstance(record, dict) else None)
+        or Path.cwd()
+    )
+    return Path(str(raw)).expanduser().resolve()
+
+
+def _marker_declared_artifacts_ok(marker: dict | None, project_root: Path) -> bool:
+    """True when marker is a SUCCESS kind and every declared artifact opens non-empty.
+
+    Markers with no declared paths (bare COMPLETE) are valid without FS checks.
+    Markers that declare paths require every path present and non-empty.
+    """
+    if not isinstance(marker, dict):
+        return False
+    if marker.get("kind") not in SUCCESS_TERMINAL_MARKERS:
+        return False
+    declared = _extract_marker_artifact_paths(str(marker.get("text") or ""))
+    if not declared:
+        return True
+    for rel in declared:
+        path = Path(rel).expanduser()
+        if not path.is_absolute():
+            path = project_root / rel
+        if not _direct_open_nonempty(path):
+            return False
+    return True
+
+
+def _task_row_durably_complete(row: dict | None) -> bool:
+    if not isinstance(row, dict):
+        return False
+    if row.get("done_reviewed") is True:
+        return True
+    if row.get("done") is True:
+        return True
+    derived = str(row.get("derived_status") or "")
+    return derived in {"done-reviewed", "awaiting-review", "worker-finished"}
+
+
+def _ledger_task_ids_advanced(task_ids: list[str], *, self_dispatch_id: str) -> tuple[int, int, bool]:
+    """Return counts plus whether ledger authority was read conclusively."""
+    if not task_ids:
+        return 0, 0, True
+    wanted = set(task_ids)
+    complete_tasks: set[str] = set()
+    advanced_tasks: set[str] = set()
+    try:
+        records = goalflight_ledger.read_records()
+    except Exception:
+        return 0, 0, False
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        if str(record.get("dispatch_id") or "") == self_dispatch_id:
+            continue
+        rec_ids = set(_entry_task_ids(None, record))
+        overlap = wanted & rec_ids
+        if not overlap:
+            continue
+        state = str(record.get("state") or "")
+        terminal = str(
+            record.get("terminal_state")
+            or goalflight_ledger.terminal_state_for(state, record.get("reason") or record.get("error"))
+            or ""
+        )
+        if (
+            state in goalflight_dispatch_states.SUCCESS_TERMINAL_RECORD_STATES
+            or terminal in goalflight_dispatch_states.SUCCESS_TERMINAL_RECORD_STATES
+            or state == "complete"
+            or terminal == "complete"
+        ):
+            complete_tasks |= overlap
+            advanced_tasks |= overlap
+            continue
+        # Neutral reconciliation outcomes and live work both count as "advanced"
+        # enough to block unsplit re-enqueue of this envelope.
+        if state in {"superseded", "worker_dead"} or terminal in {"superseded", "worker_dead"}:
+            advanced_tasks |= overlap
+            continue
+        if state and not goalflight_dispatch_states.is_terminal_state(state):
+            if state not in {"queued", "waiting_capacity", "submitted"}:
+                advanced_tasks |= overlap
+    return len(complete_tasks), len(advanced_tasks), True
+
+
+def _linked_task_truth(
+    entry: dict,
+    record: dict | None = None,
+    *,
+    task_store_locked: bool = False,
+) -> str:
+    """Return all_complete | some_advanced | none | indeterminate | unlinked."""
+    task_ids = _entry_task_ids(entry, record)
+    if not task_ids:
+        return "unlinked"
+    project_root = _project_root_for_entry(entry, record)
+    store_complete = 0
+    store_seen = 0
+    store_conclusive = True
+    try:
+        root = SCRIPT_DIR.parent
+        if str(root) not in sys.path:
+            sys.path.insert(0, str(root))
+        import goalflight_task  # type: ignore
+
+        store = goalflight_task.TaskStore(project_root)
+        if task_store_locked and store.publish_marker_path.exists():
+            store._recover_interrupted_publish_locked()
+        by_id = {
+            str(item.get("id")): item
+            for item in store.load_items(recover_publish=False)
+        }
+        for task_id in task_ids:
+            row = by_id.get(task_id)
+            if row is None:
+                continue
+            store_seen += 1
+            if _task_row_durably_complete(row):
+                store_complete += 1
+    except Exception:
+        store_complete = 0
+        store_seen = 0
+        store_conclusive = False
+
+    self_id = str(entry.get("dispatch_id") or (record or {}).get("dispatch_id") or "")
+    ledger_complete, ledger_advanced, ledger_conclusive = _ledger_task_ids_advanced(
+        task_ids,
+        self_dispatch_id=self_id,
+    )
+
+    # Prefer explicit store truth when every linked id is present and complete.
+    if store_seen == len(task_ids) and store_complete == len(task_ids):
+        return "all_complete"
+    if ledger_complete >= len(task_ids):
+        return "all_complete"
+    # Mix of store + ledger completions covering all ids.
+    if store_complete + ledger_complete >= len(task_ids) and (store_complete > 0 or ledger_complete > 0):
+        # Conservative: only when store_complete alone is full, or ledger alone.
+        # Partial overlap of different ids is handled by some_advanced below.
+        covered = store_complete  # already counted store-complete ids
+        if covered >= len(task_ids):
+            return "all_complete"
+
+    advanced = max(store_complete, ledger_advanced, ledger_complete)
+    # Also treat partial store completion as advanced.
+    if store_complete > 0 and store_complete < len(task_ids):
+        return "some_advanced"
+    if 0 < advanced < len(task_ids) or (ledger_advanced > 0 and ledger_complete < len(task_ids)):
+        return "some_advanced"
+    if store_complete >= len(task_ids) or ledger_complete >= len(task_ids):
+        return "all_complete"
+    if not store_conclusive or not ledger_conclusive:
+        return "indeterminate"
+    return "none"
+
+
+def _entry_completion_authority(
+    entry: dict,
+    record: dict | None = None,
+    *,
+    task_store_locked: bool = False,
+) -> dict | None:
+    """Full completion-authority ladder (design §Reconciliation).
+
+    Returns a decision dict when ANY leg proves completion/finality:
+      {"state": "complete"|"superseded", "reason": str, "marker": dict|None, "source": str}
+    Returns None only when every leg is not-done (re-enqueue may still apply
+    only if also provably pre-spawn).
+    """
+    dispatch_id = str(entry.get("dispatch_id") or "")
+    if not isinstance(record, dict) and dispatch_id:
+        try:
+            record = _find_dispatch_record(dispatch_id)
+        except Exception:
+            return {
+                "state": "deferred",
+                "reason": "ledger_authority_indeterminate",
+                "marker": None,
+                "source": "authority",
+            }
+
+    # Leg 0: already-terminal ledger for this dispatch (first-terminal-wins).
+    has_terminal_record = bool(dispatch_id and _dispatch_record_is_terminal(record))
+    if has_terminal_record:
+        existing = record or _find_dispatch_record(dispatch_id) or {}
+        existing_state = str(existing.get("state") or existing.get("terminal_state") or "")
+        if existing_state in {
+            "complete",
+            "superseded",
+            "worker_dead",
+        } | set(goalflight_dispatch_states.SUCCESS_TERMINAL_RECORD_STATES):
+            return {
+                "state": existing_state,
+                "reason": "existing_terminal_record",
+                "marker": None,
+                "source": "ledger",
+            }
+
+    project_root = _project_root_for_entry(entry, record)
+    marker = _scan_entry_completion_marker(entry)
+
+    # Leg 1: worker terminal output marker (SUCCESS kinds).
+    # Leg 2: direct-open of declared artifacts (required when paths are named).
+    if marker and marker.get("kind") in SUCCESS_TERMINAL_MARKERS:
+        if _marker_declared_artifacts_ok(marker, project_root):
+            return {
+                "state": "complete",
+                "reason": f"marker:{marker.get('kind')}:final_reconciliation",
+                "marker": marker,
+                "source": "output",
+            }
+        # Declared artifacts missing → not completion authority; fall through.
+
+    # Leg 3: linked task store / later-pass durable completion.
+    task_truth = _linked_task_truth(entry, record, task_store_locked=task_store_locked)
+    if task_truth == "all_complete":
+        return {
+            "state": "superseded",
+            "reason": "task_store:all_complete",
+            "marker": None,
+            "source": "task_store",
+            "resolution_source": "task_store",
+        }
+    if task_truth == "some_advanced":
+        return {
+            "state": "worker_dead",
+            "reason": "partial_task_supersession",
+            "marker": None,
+            "source": "task_store",
+            "salvage_required": True,
+        }
+    if task_truth == "indeterminate":
+        return {
+            "state": "deferred",
+            "reason": "completion_authority_indeterminate",
+            "marker": None,
+            "source": "authority",
+        }
+    return None
+
+
+def _completion_decision_blocks_restore(decision: dict | None) -> bool:
+    if not isinstance(decision, dict):
+        return False
+    state = str(decision.get("state") or "")
+    return state in {
+        "complete",
+        "superseded",
+        "worker_dead",
+        "deferred",
+    } | set(goalflight_dispatch_states.SUCCESS_TERMINAL_RECORD_STATES)
+
+
+def _completion_decision_is_deferred(decision: dict | None) -> bool:
+    return isinstance(decision, dict) and decision.get("state") == "deferred"
+
+
+@contextlib.contextmanager
+def _task_store_mutation_lock(entry: dict, record: dict | None = None):
+    """Freeze linked task truth while a completion decision is persisted."""
+    if not _entry_task_ids(entry, record):
+        yield
+        return
+    root = SCRIPT_DIR.parent
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    import goalflight_task  # type: ignore
+
+    store = goalflight_task.TaskStore(_project_root_for_entry(entry, record))
+    with store.store_lock():
+        yield
+
+
+def try_acquire_task_store_lock(
+    entry: dict,
+    record: dict | None,
+    *,
+    deadline_s: float,
+):
+    root = SCRIPT_DIR.parent
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    import goalflight_task  # type: ignore
+
+    store = goalflight_task.TaskStore(_project_root_for_entry(entry, record))
+    return store.try_store_lock(deadline_s=deadline_s)
+
+
+def try_acquire_ledger_lock(*, deadline_s: float):
+    return goalflight_ledger.StateLock.try_acquire(deadline_s)
+
+
+def acquire_reconcile_locks(
+    txn: _ReconcileTransaction,
+    *,
+    queue_dir: Path,
+    need_queue: bool,
+    need_task_store: bool,
+    need_ledger: bool,
+) -> AcquireResult:
+    """Acquire Q then S then L against one absolute 100 ms deadline."""
+    deadline = time.monotonic() + RECONCILE_DOWNSTREAM_LOCK_BUDGET_S
+    acquired: list[object] = []
+    record = _find_dispatch_record(str(txn.entry.get("dispatch_id") or ""))
+    try:
+        if need_queue:
+            handle = try_acquire_queue_lock(queue_dir, deadline_s=deadline)
+            if handle is None:
+                return AcquireResult.DEFER_UNCHANGED
+            acquired.append(handle)
+            txn.queue_locked = True
+        if need_task_store:
+            handle = try_acquire_task_store_lock(txn.entry, record, deadline_s=deadline)
+            if handle is None:
+                return AcquireResult.DEFER_UNCHANGED
+            acquired.append(handle)
+            txn.task_store_locked = True
+        if need_ledger:
+            handle = try_acquire_ledger_lock(deadline_s=deadline)
+            if handle is None:
+                return AcquireResult.DEFER_UNCHANGED
+            acquired.append(handle)
+            txn.ledger_locked = True
+        txn.downstream.extend(acquired)
+        return AcquireResult.ACQUIRED_ALL
+    except Exception:
+        return AcquireResult.DEFER_UNCHANGED
+    finally:
+        if len(txn.downstream) < len(acquired):
+            for handle in reversed(acquired):
+                with contextlib.suppress(Exception):
+                    handle.release()
+
+
+def _producer_set_authoritative(entry: dict, admission: PreAdmitClass) -> bool:
+    if admission is PreAdmitClass.STALE_NO_SPAWN:
+        return True
+    record = _find_dispatch_record(str(entry.get("dispatch_id") or ""))
+    result = enumerate_token_producers(_entry_with_record_identity(entry, record))
+    return result.state in {ProducerSetState.DEAD, ProducerSetState.PID_REUSED}
+
+
+def _begin_reconcile_transaction(
+    entry: dict,
+    *,
+    queue_dir: Path,
+    stale_s: float,
+    need_queue: bool,
+    need_task_store: bool,
+    need_ledger: bool,
+    admission: PreAdmitClass | None = None,
+) -> _ReconcileTransaction | None:
+    admission = admission or classify_reconciliation_admission(entry, time.time(), stale_s=stale_s)
+    if ADMISSION_DECISION[admission] is not AdmissionAction.ADMIT_TO_GATE:
+        return None
+    record = _find_dispatch_record(str(entry.get("dispatch_id") or ""))
+    tail = _entry_tail_path(entry, record)
+    transport = _entry_transport(entry, record)
+    node = _entry_node(entry, record)
+    locality = "remote" if transport == "fleet" or node else "local"
+    filesystem = _tail_filesystem_identity(tail, locality=locality)
+    capability = _probe_flock_capability(
+        transport=transport,
+        node=node,
+        tail_path=tail,
+        filesystem=filesystem,
+    )
+    producer_authoritative = _producer_set_authoritative(entry, admission)
+    mode = resolve_reconciliation_mode(
+        transport=transport,
+        node=node,
+        locality=locality,
+        tail_path=tail,
+        tail_filesystem=filesystem,
+        flock_probe=capability,
+        producer_set_authoritative=producer_authoritative,
+        node_authority_available=False,
+        worker_tail_lock_contract=bool(entry.get("queue_tail_flock_contract", True)),
+    )
+    if mode in {ReconciliationMode.DEFER_TO_NODE, ReconciliationMode.FAIL_CLOSED_DEFER}:
+        return None
+    txn = _ReconcileTransaction(entry, tail, admission, mode, filesystem, capability)
+    gate = _tail_reconciliation_lock(tail) if mode is ReconciliationMode.LOCAL_FLOCK else _fallback_reconciliation_lock(tail)
+    try:
+        gate.__enter__()
+    except (_TailLockBusy, OSError):
+        return None
+    txn.tail_gate = gate
+    if acquire_reconcile_locks(
+        txn,
+        queue_dir=queue_dir,
+        need_queue=need_queue,
+        need_task_store=need_task_store,
+        need_ledger=need_ledger,
+    ) is not AcquireResult.ACQUIRED_ALL:
+        txn.release()
+        return None
+    return txn
+
+
+def _reconcile_transaction_still_valid(
+    txn: _ReconcileTransaction,
+    fresh: dict,
+) -> bool:
+    if fresh.get("queue_launch_token") != txn.entry.get("queue_launch_token"):
+        return False
+    fresh_tail = _entry_tail_path(fresh, _find_dispatch_record(str(fresh.get("dispatch_id") or "")))
+    if fresh_tail.expanduser().resolve(strict=False) != txn.tail.expanduser().resolve(strict=False):
+        return False
+    transport = _entry_transport(fresh)
+    node = _entry_node(fresh)
+    locality = "remote" if transport == "fleet" or node else "local"
+    filesystem = _tail_filesystem_identity(fresh_tail, locality=locality)
+    if filesystem != txn.filesystem:
+        return False
+    capability = _probe_flock_capability(
+        transport=transport,
+        node=node,
+        tail_path=fresh_tail,
+        filesystem=filesystem,
+    )
+    mode = resolve_reconciliation_mode(
+        transport=transport,
+        node=node,
+        locality=locality,
+        tail_path=fresh_tail,
+        tail_filesystem=filesystem,
+        flock_probe=capability,
+        producer_set_authoritative=_producer_set_authoritative(fresh, txn.admission),
+        node_authority_available=False,
+        worker_tail_lock_contract=bool(fresh.get("queue_tail_flock_contract", True)),
+    )
+    if mode is not txn.mode:
+        return False
+    if mode is ReconciliationMode.FALLBACK_PID_IDENTITY:
+        if txn.admission is PreAdmitClass.STALE_NO_SPAWN:
+            return (
+                classify_reconciliation_admission(fresh, time.time(), stale_s=0.0)
+                is PreAdmitClass.STALE_NO_SPAWN
+            )
+        probe_entry = _entry_with_record_identity(
+            fresh,
+            _find_dispatch_record(str(fresh.get("dispatch_id") or "")),
+        )
+        first = enumerate_token_producers(probe_entry)
+        second = enumerate_token_producers(probe_entry)
+        if first.state not in {ProducerSetState.DEAD, ProducerSetState.PID_REUSED}:
+            return False
+        if second.state is not first.state or second.members != first.members:
+            return False
+    return True
+
+
+def _apply_completion_authority(
+    entry: dict,
+    decision: dict,
+    *,
+    claim: Path | None = None,
+) -> str:
+    """Compatibility entry routed through the single transaction owner."""
+    if claim is not None:
+        return _reconcile_claim_transaction(
+            claim,
+            entry,
+            queue_dir=claim.parent,
+            reason=str(decision.get("reason") or "completion_authority"),
+            stale_s=0.0,
+        )
+    state = str(decision.get("state") or "complete")
+    reason = decision.get("reason") or "completion_authority"
+    if state in goalflight_dispatch_states.SUCCESS_TERMINAL_RECORD_STATES or state in {
+        "complete",
+        "superseded",
+        "worker_dead",
+    }:
+        # Reuse terminalize path (scans again + first-terminal-wins). For
+        # superseded/complete we still go through _mark_claim_worker_dead which
+        # re-reads the tail; override via reason + finish lock recheck.
+        persisted = _mark_claim_worker_dead(
+            entry,
+            reason=str(reason),
+            force_state=state if state in {"complete", "superseded"} else None,
+            salvage_required=bool(decision.get("salvage_required")),
+            resolution_source=decision.get("resolution_source"),
+            claim=claim,
+        )
+        if not persisted:
+            return "pending"
+    return "cleared"
+
+
+def _entry_pre_spawn(entry: dict) -> bool:
+    """True when the claim never crossed launch-start / spawn-intent / spawn."""
+    return not (
+        _queue_claim_launch_started(entry)
+        or _queue_claim_worker_spawn_intent(entry)
+        or _queue_claim_worker_spawned(entry)
+    )
+
+
+def _sanitize_restore_envelope(entry: dict, *, increment_recovery_count: bool) -> dict:
+    restored = dict(entry)
+    for key in (
+        "queue_launch_token",
+        "queue_launch_started",
+        "queue_launch_started_at",
+        "queue_launcher_pid",
+        "queue_launcher_identity",
+        "queue_worker_spawn_intent",
+        "queue_worker_spawn_intent_at",
+        "queue_worker_pid",
+        "queue_worker_spawned_at",
+        "queue_worker_identity",
+        "queue_worker_pgid",
+        "queue_worker_group_leader_identity",
+        "queue_worker_identity_snapshot_at",
+        "queue_producer_descendants",
+        "queue_producer_group_contract",
+        "queue_producer_group_contract_enforced",
+        "queue_producer_group_contract_reason",
+        "queue_tail_flock_contract",
+    ):
+        restored.pop(key, None)
+    if increment_recovery_count:
+        restored["claim_recovery_count"] = _claim_recovery_count(entry) + 1
+    return restored
+
+
+def _commit_restore_transaction(
+    txn: _ReconcileTransaction,
+    claim: Path,
+    fresh: dict,
+    *,
+    increment_recovery_count: bool,
+    reason: str,
+) -> tuple[Path | None, dict | None]:
+    """Prepared queue → queued ledger commit → publish queue → unlink claim."""
+    if not (txn.queue_locked and txn.ledger_locked):
+        return None, None
+    if not _reconcile_transaction_still_valid(txn, fresh):
+        return None, None
+    target = claim.parent / claim.name.split(".claimed-", 1)[0]
+    record = _find_dispatch_record(str(fresh.get("dispatch_id") or ""))
+    decision = _entry_completion_authority(fresh, task_store_locked=txn.task_store_locked)
+    if _completion_decision_is_deferred(decision):
+        return None, decision
+    if _completion_decision_blocks_restore(decision):
+        if target.exists():
+            try:
+                abandoned = json.loads(target.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                return None, None
+            if (
+                isinstance(abandoned, dict)
+                and abandoned.get("state") in {"restore_prepared", "queued"}
+                and abandoned.get("dispatch_id") == fresh.get("dispatch_id")
+                and abandoned.get("restore_txn_id")
+            ):
+                try:
+                    target.unlink()
+                except OSError:
+                    return None, None
+        return None, decision
+    if (
+        record is not None
+        and _dispatch_record_is_terminal(record)
+        and str(record.get("state") or "") not in {"blocked_capacity"}
+    ):
+        return None, {
+            "state": str(record.get("state") or record.get("terminal_state") or "complete"),
+            "reason": "existing_terminal_record",
+            "source": "ledger",
+        }
+
+    restore_txn_id: str | None = None
+    prepared: dict
+    if target.exists():
+        try:
+            prepared = json.loads(target.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None, None
+        if not isinstance(prepared, dict):
+            return None, None
+        restore_txn_id = str(prepared.get("restore_txn_id") or "") or None
+        if not restore_txn_id:
+            return None, None
+        if prepared.get("state") == "queued":
+            if not record or record.get("restore_txn_id") != restore_txn_id or record.get("state") != "queued":
+                return None, None
+            try:
+                claim.unlink()
+            except OSError:
+                return None, None
+            return target, None
+        if prepared.get("state") != "restore_prepared":
+            return None, None
+    else:
+        restore_txn_id = uuid.uuid4().hex
+        prepared = _sanitize_restore_envelope(
+            fresh,
+            increment_recovery_count=increment_recovery_count,
+        )
+        prepared.update(
+            {
+                "state": "restore_prepared",
+                "restore_txn_id": restore_txn_id,
+                "restore_reason": reason,
+                "updated_at": goalflight_ledger.utc_now(),
+            }
+        )
+        try:
+            _write_json_atomic(target, prepared)
+        except OSError:
+            return None, None
+
+    # A prepared queue envelope is resumable. If a crash happened before the
+    # ledger commit point, complete that same transaction id now. A different
+    # queued transaction is not ours and must remain untouched.
+    if not record or record.get("restore_txn_id") != restore_txn_id or record.get("state") != "queued":
+        ledger_record = record or _new_reconciliation_record(fresh)
+        if (
+            _dispatch_record_is_terminal(ledger_record)
+            and str(ledger_record.get("state") or "") not in {"blocked_capacity"}
+        ):
+            with contextlib.suppress(OSError):
+                target.unlink()
+            return None, {
+                "state": str(ledger_record.get("state") or ledger_record.get("terminal_state")),
+                "reason": "existing_terminal_record",
+                "source": "ledger",
+            }
+        if record is not None and record.get("state") == "queued" and record.get("restore_txn_id"):
+            return None, None
+        ledger_record.update(
+            {
+                "state": "queued",
+                "terminal_state": "unknown",
+                "liveness_state": "queued",
+                "worker_still_alive": False,
+                "queue_launch_token": None,
+                "queue_path": str(target),
+                "restore_reason": reason,
+                "restore_txn_id": restore_txn_id,
+                "claim_recovery_count": int(prepared.get("claim_recovery_count") or 0),
+            }
+        )
+        try:
+            goalflight_ledger.write_record(ledger_record)
+        except Exception:
+            return None, None
+
+    # Durable ledger row above is the cross-file commit point.
+    try:
+        published = json.loads(target.read_text(encoding="utf-8"))
+        if not isinstance(published, dict) or published.get("restore_txn_id") != restore_txn_id:
+            return None, None
+        published["state"] = "queued"
+        published["updated_at"] = goalflight_ledger.utc_now()
+        _write_json_atomic(target, published)
+        claim.unlink()
+    except (OSError, json.JSONDecodeError):
+        return None, None
+    return target, None
+
+
+def _bounded_restore_claim(claim: Path, entry: dict, queue_dir: Path) -> tuple[bool, dict | None]:
+    """Stale recovery restore under frozen T→Q→S→L ordering."""
+    target_name = claim.name.split(".claimed-", 1)[0]
+    target = queue_dir / target_name
+    if target.exists():
+        try:
+            existing_target = json.loads(target.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False, None
+        if not isinstance(existing_target, dict) or existing_target.get("state") not in {"restore_prepared", "queued"}:
+            return False, None
+    if not list(entry.get("dispatch_argv") or []):
+        return False, None
+    if _claim_recovery_count(entry) >= MAX_CLAIM_RECOVERY_REQUEUES:
+        return False, None
+    txn = _begin_reconcile_transaction(
+        entry,
+        queue_dir=queue_dir,
+        stale_s=0.0,
+        need_queue=True,
+        need_task_store=_is_task_linked(entry, _find_dispatch_record(str(entry.get("dispatch_id") or ""))),
+        need_ledger=True,
+    )
+    if txn is None:
+        return False, None
+    try:
+        try:
+            fresh = json.loads(claim.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False, None
+        if not isinstance(fresh, dict):
+            return False, None
+        if _claim_recovery_count(fresh) >= MAX_CLAIM_RECOVERY_REQUEUES or not _entry_pre_spawn(fresh):
+            return False, None
+        restored, decision = _commit_restore_transaction(
+            txn,
+            claim,
+            fresh,
+            increment_recovery_count=True,
+            reason="stale_claim_recovery",
+        )
+        return restored is not None, decision
+    finally:
+        txn.release()
+
+
+def _restore_claim_if_incomplete(
+    claim: Path,
+    entry: dict,
+    queue_dir: Path,
+) -> tuple[Path | None, dict | None]:
+    """Normal-drain restore through the same held T→Q→S→L transaction."""
+    try:
+        observed = json.loads(claim.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None, None
+    if not isinstance(observed, dict) or observed.get("queue_launch_token") != entry.get("queue_launch_token"):
+        return None, None
+    txn = _begin_reconcile_transaction(
+        observed,
+        queue_dir=queue_dir,
+        stale_s=0.0,
+        need_queue=True,
+        need_task_store=_is_task_linked(
+            observed,
+            _find_dispatch_record(str(observed.get("dispatch_id") or "")),
+        ),
+        need_ledger=True,
+    )
+    if txn is None:
+        return None, None
+    try:
+        try:
+            fresh = json.loads(claim.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None, None
+        if not isinstance(fresh, dict) or fresh.get("queue_launch_token") != entry.get("queue_launch_token"):
+            return None, None
+        if not _reconcile_transaction_still_valid(txn, fresh):
+            return None, None
+        if classify_reconciliation_admission(fresh, time.time(), stale_s=0.0) is not txn.admission:
+            return None, None
+        restored, decision = _commit_restore_transaction(
+            txn,
+            claim,
+            fresh,
+            increment_recovery_count=False,
+            reason="normal_drain_restore",
+        )
+        if decision is not None:
+            if _completion_decision_is_deferred(decision):
+                return None, None
+            if not _is_task_linked(fresh, _find_dispatch_record(str(fresh.get("dispatch_id") or ""))):
+                if _quarantine_claim(claim, fresh, reason="normal_restore_completion_unlinked"):
+                    return None, {**decision, "_committed": True, "state": "quarantined"}
+                return None, None
+            result, _marker = _commit_claim_terminal_in_txn(
+                txn,
+                fresh,
+                reason=str(decision.get("reason") or "completion_authority"),
+                force_state=str(decision.get("state") or "complete"),
+                salvage_required=bool(decision.get("salvage_required")),
+                resolution_source=decision.get("resolution_source"),
+            )
+            if not result.committed:
+                return None, None
+            with contextlib.suppress(OSError):
+                claim.unlink()
+            return None, {**decision, "_committed": True, "state": result.durable_state}
+        return restored, None
+    finally:
+        txn.release()
+
+
+def _commit_claim_terminal_in_txn(
+    txn: _ReconcileTransaction,
+    entry: dict,
+    *,
+    reason: str,
+    force_state: str | None = None,
+    salvage_required: bool = False,
+    resolution_source: str | None = None,
+) -> tuple[TerminalCommitResult, dict | None]:
+    args = _queued_args_for_status(entry)
+    prompt_path = str(Path(args.prompt_file).expanduser()) if args.prompt_file else None
+    tail = _entry_tail_path(entry)
+    state, final_reason, marker = _resolve_claim_terminal_outcome(
+        entry,
+        reason=reason,
+        tail=tail,
+        ignore_prefix_lines=_ignore_prefix_lines(prompt_path),
+        agent=args.agent,
+    )
+    if force_state in {"complete", "superseded"} and state == "worker_dead":
+        state = force_state
+        final_reason = reason
+    result = commit_reconciled_terminal(
+        txn,
+        entry,
+        {
+            "state": state,
+            "reason": final_reason,
+            "salvage_required": salvage_required,
+            "resolution_source": resolution_source,
+        },
+    )
+    return result, marker
+
+
+def _write_reconciled_terminal_status(entry: dict, marker: dict | None) -> None:
+    """Idempotent post-commit mirror sourced only from durable ledger truth."""
+    dispatch_id = str(entry.get("dispatch_id") or "")
+    record = _find_dispatch_record(dispatch_id)
+    if not record or not _dispatch_record_is_terminal(record):
+        return
+    request = entry.get("request") if isinstance(entry.get("request"), dict) else {}
+    args = _queued_args_for_status(entry)
+    project_root = Path(str(entry.get("project_root") or request.get("cwd") or Path.cwd())).resolve()
+    status_json = Path(str(request.get("status_json") or record.get("status_path") or _dispatch_base_dir() / f"{dispatch_id}.status.json"))
+    tail = Path(str(request.get("tail") or record.get("stdout_path") or _dispatch_base_dir() / f"{dispatch_id}.tail"))
+    state = str(record.get("state") or record.get("terminal_state") or "worker_dead")
+    reason = record.get("reason") or record.get("error") or "claim_reconciliation"
+    with contextlib.suppress(Exception):
+        write_status(
+            status_json,
+            {
+                "schema": "goalflight.status.v1",
+                "dispatch_id": dispatch_id,
+                "agent": args.agent,
+                "shape": args.shape,
+                "state": state,
+                "terminal_state": str(record.get("terminal_state") or goalflight_ledger.terminal_state_for(state, reason)),
+                "reason": reason,
+                "liveness_state": goalflight_terminal.terminal_liveness_state(state),
+                "terminal_marker": marker,
+                "project_root": str(project_root),
+                "worker_pid": entry.get("queue_worker_pid"),
+                "worker_alive": False,
+                "tail_path": str(tail),
+                "status_path": str(status_json),
+                "updated_at": int(time.time()),
+                "reconciliation": record.get("outcome", {}).get("reconciliation", {}),
+                **({"task_ids": list(args.task_ids)} if getattr(args, "task_ids", None) else {}),
+            },
+        )
+
+
+def _positive_live_carrier_cleanup(claim: Path, entry: dict, queue_dir: Path) -> str:
+    """Narrow LIVE exception: Q-only redundant-carrier cleanup after revalidation."""
+    dispatch_id = str(entry.get("dispatch_id") or "")
+    token = _queue_launch_token_from_entry(entry)
+    record = _find_dispatch_record(dispatch_id) if dispatch_id else None
+    if not (
+        dispatch_id
+        and token
+        and _dispatch_has_worker_record(
+            dispatch_id,
+            queue_launch_token=token,
+            require_live_nonterminal=True,
+        )
+    ):
+        return "pending"
+    handle = try_acquire_queue_lock(
+        queue_dir,
+        deadline_s=time.monotonic() + RECONCILE_DOWNSTREAM_LOCK_BUDGET_S,
+    )
+    if handle is None:
+        return "pending"
+    try:
+        try:
+            fresh = json.loads(claim.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return "pending"
+        if not isinstance(fresh, dict):
+            return "pending"
+        if classify_reconciliation_admission(fresh, time.time(), stale_s=0.0) is not PreAdmitClass.LIVE:
+            return "pending"
+        if fresh.get("queue_launch_token") != token:
+            return "pending"
+        if not _dispatch_has_worker_record(
+            dispatch_id,
+            queue_launch_token=token,
+            require_live_nonterminal=True,
+        ):
+            return "pending"
+        if not _is_task_linked(fresh, _find_dispatch_record(dispatch_id)):
+            return "quarantined" if _quarantine_claim(
+                claim,
+                fresh,
+                reason="live_worker_unlinked_claim_carrier",
+            ) else "pending"
+        claim.unlink()
+        return "cleared"
+    except OSError:
+        return "pending"
+    finally:
+        handle.release()
+
+
+def _reconcile_claim_transaction(
+    claim: Path,
+    entry: dict,
+    *,
+    queue_dir: Path,
+    reason: str,
+    stale_s: float,
+) -> str:
+    admission = classify_reconciliation_admission(entry, time.time(), stale_s=stale_s)
+    if admission is PreAdmitClass.LIVE:
+        return _positive_live_carrier_cleanup(claim, entry, queue_dir)
+    if admission is PreAdmitClass.INDETERMINATE:
+        _alert_identity_indeterminate(
+            str(entry.get("dispatch_id") or claim.name),
+            where="claim",
+            reason="pre_admit_indeterminate",
+        )
+    if ADMISSION_DECISION[admission] is AdmissionAction.DEFER_UNCHANGED:
+        return "pending"
+
+    record = _find_dispatch_record(str(entry.get("dispatch_id") or ""))
+    linked = _is_task_linked(entry, record)
+    txn = _begin_reconcile_transaction(
+        entry,
+        queue_dir=queue_dir,
+        stale_s=stale_s,
+        need_queue=True,
+        need_task_store=linked,
+        need_ledger=linked or record is not None,
+        admission=admission,
+    )
+    if txn is None:
+        return "pending"
+    mirror: tuple[dict, Path] | None = None
+    terminal_mirror: tuple[dict, dict | None] | None = None
+    try:
+        try:
+            fresh = json.loads(claim.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return "pending"
+        if not isinstance(fresh, dict) or not _reconcile_transaction_still_valid(txn, fresh):
+            return "pending"
+        if classify_reconciliation_admission(fresh, time.time(), stale_s=stale_s) is not admission:
+            return "pending"
+        record = _find_dispatch_record(str(fresh.get("dispatch_id") or ""))
+        linked = _is_task_linked(fresh, record)
+        carrier_stamp = str(fresh.get("orphan_first_seen_at") or "") or None
+        if carrier_stamp and record is not None and not record.get("orphan_first_seen_at"):
+            if _stamp_ledger_orphan_first_seen(record, txn=txn, stamp=carrier_stamp) is None:
+                return "pending"
+            record = _find_dispatch_record(str(fresh.get("dispatch_id") or ""))
+        age_stamp = _launch_age_timestamp_s(fresh)
+        if age_stamp is None and not (
+            admission is PreAdmitClass.STALE_NO_SPAWN and stale_s <= 0
+        ):
+            stamp = _persist_orphan_first_seen(fresh)
+            staged = dict(fresh)
+            staged["orphan_first_seen_at"] = stamp
+            staged["updated_at"] = goalflight_ledger.utc_now()
+            try:
+                _write_json_atomic(claim, staged)
+            except OSError:
+                return "pending"
+            if record is not None and txn.ledger_locked:
+                if _stamp_ledger_orphan_first_seen(record, txn=txn, stamp=stamp) is None:
+                    return "pending"
+            return "pending"
+        if age_stamp is not None and max(0.0, time.time() - age_stamp) < max(0.0, stale_s):
+            return "pending"
+        if record is not None and _dispatch_record_is_terminal(record):
+            if not linked:
+                return "quarantined" if _quarantine_claim(
+                    claim,
+                    fresh,
+                    reason=f"{reason}_unlinked_terminal",
+                ) else "pending"
+            try:
+                claim.unlink()
+            except OSError:
+                return "pending"
+            return "cleared"
+
+        decision = _entry_completion_authority(
+            fresh,
+            record,
+            task_store_locked=txn.task_store_locked,
+        )
+        if _completion_decision_blocks_restore(decision):
+            if _completion_decision_is_deferred(decision):
+                return "pending"
+            result, _marker = _commit_claim_terminal_in_txn(
+                txn,
+                fresh,
+                reason=str(decision.get("reason") or reason),
+                force_state=str(decision.get("state") or "complete"),
+                salvage_required=bool(decision.get("salvage_required")),
+                resolution_source=decision.get("resolution_source"),
+            )
+            if not result.committed:
+                return "pending"
+            terminal_mirror = (fresh, _marker)
+            if not linked:
+                return "quarantined" if _quarantine_claim(
+                    claim,
+                    fresh,
+                    reason=f"{reason}_unlinked_completion",
+                ) else "pending"
+            try:
+                claim.unlink()
+            except OSError:
+                return "pending"
+            return "cleared"
+
+        if not linked:
+            return "quarantined" if _quarantine_claim(claim, fresh, reason=f"{reason}_unlinked") else "pending"
+
+        target = queue_dir / claim.name.split(".claimed-", 1)[0]
+        pre_spawn = _entry_pre_spawn(fresh)
+        if pre_spawn and list(fresh.get("dispatch_argv") or []) and _claim_recovery_count(fresh) < MAX_CLAIM_RECOVERY_REQUEUES:
+            restored, locked_decision = _restore_claimed_entry(
+                claim,
+                fresh,
+                txn=txn,
+                increment_recovery_count=True,
+                reason=reason,
+            )
+            if restored is not None:
+                mirror = (_sanitize_restore_envelope(fresh, increment_recovery_count=True), restored)
+                return "restored"
+            if locked_decision is not None:
+                result, _marker = _commit_claim_terminal_in_txn(
+                    txn,
+                    fresh,
+                    reason=str(locked_decision.get("reason") or reason),
+                    force_state=str(locked_decision.get("state") or "complete"),
+                )
+                if result.committed:
+                    terminal_mirror = (fresh, _marker)
+                    with contextlib.suppress(OSError):
+                        claim.unlink()
+                    return "cleared"
+                return "pending"
+        if target.exists():
+            try:
+                claim.unlink()
+            except OSError:
+                return "pending"
+            return "cleared"
+
+        terminal_reason = (
+            "claim_recovery_exhausted"
+            if pre_spawn and _claim_recovery_count(fresh) >= MAX_CLAIM_RECOVERY_REQUEUES
+            else reason
+        )
+        result, _marker = _commit_claim_terminal_in_txn(txn, fresh, reason=terminal_reason)
+        if not result.committed:
+            return "pending"
+        terminal_mirror = (fresh, _marker)
+        try:
+            claim.unlink()
+        except OSError:
+            return "pending"
+        return "cleared"
+    finally:
+        txn.release()
+        if mirror is not None:
+            mirror_entry, mirror_path = mirror
+            _restore_queued_record_from_entry(mirror_entry, mirror_path)
+        if terminal_mirror is not None:
+            mirror_entry, marker = terminal_mirror
+            _write_reconciled_terminal_status(mirror_entry, marker)
+
+
+def _act_on_orphan_claim(
+    claim: Path,
+    entry: dict,
+    *,
+    queue_dir: Path,
+    reason: str,
+) -> str:
+    """Compatibility wrapper for the single transaction owner."""
+    return _reconcile_claim_transaction(
+        claim,
+        entry,
+        queue_dir=queue_dir,
+        reason=reason,
+        stale_s=0.0,
+    )
+
+
 def _recover_claimed_queue_entries(queue_dir: Path, *, stale_s: float) -> dict:
+    """Run each carrier through the single PRE-ADMIT→T→Q→S→L owner."""
     restored = 0
     cleared = 0
     pending_launch = 0
-    now = time.time()
+    quarantined = 0
     for claim in sorted(queue_dir.glob("*.json.claimed-*")):
         if claim.name.endswith(".failed"):
             continue
@@ -2572,92 +4672,216 @@ def _recover_claimed_queue_entries(queue_dir: Path, *, stale_s: float) -> dict:
             entry = json.loads(claim.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             continue
-        dispatch_id = str(entry.get("dispatch_id") or "")
-        target_name = claim.name.split(".claimed-", 1)[0]
-        target = queue_dir / target_name
-        launch_token = _queue_launch_token_from_entry(entry)
-        if launch_token:
-            try:
-                age_s = now - claim.stat().st_mtime
-            except OSError:
-                continue
-            is_stale = age_s >= max(0.0, stale_s)
-            if dispatch_id and _dispatch_has_worker_record(dispatch_id, queue_launch_token=launch_token):
-                with contextlib.suppress(OSError):
-                    claim.unlink()
-                cleared += 1
-                continue
-            launch_still_active = _queue_claim_launcher_alive(entry) or _queue_claim_worker_alive(entry)
-            launch_marked = (
-                _queue_claim_launch_started(entry)
-                or _queue_claim_worker_spawn_intent(entry)
-                or _queue_claim_worker_spawned(entry)
-            )
-            if launch_still_active or (launch_marked and not is_stale):
-                pending_launch += 1
-                continue
-            if not launch_marked:
-                if not is_stale:
-                    pending_launch += 1
-                    continue
-                if target.exists():
-                    with contextlib.suppress(OSError):
-                        claim.unlink()
-                    cleared += 1
-                    continue
-                for key in (
-                    "queue_launch_token",
-                    "queue_launch_started",
-                    "queue_launch_started_at",
-                    "queue_launcher_pid",
-                    "queue_launcher_identity",
-                    "queue_worker_spawn_intent",
-                    "queue_worker_spawn_intent_at",
-                    "queue_worker_pid",
-                    "queue_worker_spawned_at",
-                ):
-                    entry.pop(key, None)
-                entry["state"] = "queued"
-                entry["updated_at"] = goalflight_ledger.utc_now()
-                with contextlib.suppress(OSError):
-                    _write_json_atomic(target, entry)
-                    claim.unlink()
-                    restored += 1
-                continue
-            if dispatch_id and _dispatch_has_worker_record(dispatch_id, require_live_nonterminal=True):
-                pending_launch += 1
-                continue
-            if dispatch_id and _dispatch_has_terminal_record(dispatch_id):
-                with contextlib.suppress(OSError):
-                    claim.unlink()
-                cleared += 1
-                continue
-            _mark_claim_worker_dead(entry, reason="stale_claim_launch_token_lost")
-            with contextlib.suppress(OSError):
-                claim.unlink()
-                cleared += 1
+        if not isinstance(entry, dict):
             continue
-        if dispatch_id and _dispatch_has_worker_record(dispatch_id, require_live_nonterminal=True):
-            pending_launch += 1
-            continue
-        try:
-            age_s = now - claim.stat().st_mtime
-        except OSError:
-            continue
-        if age_s < max(0.0, stale_s):
-            continue
-        if target.exists():
-            with contextlib.suppress(OSError):
-                claim.unlink()
-            cleared += 1
-            continue
-        entry["state"] = "queued"
-        entry["updated_at"] = goalflight_ledger.utc_now()
-        with contextlib.suppress(OSError):
-            _write_json_atomic(target, entry)
-            claim.unlink()
+        action = _reconcile_claim_transaction(
+            claim,
+            entry,
+            queue_dir=queue_dir,
+            reason=(
+                "stale_claim_pre_spawn"
+                if _entry_pre_spawn(entry)
+                else "stale_claim_launch_token_lost"
+            ),
+            stale_s=stale_s,
+        )
+        if action == "restored":
             restored += 1
-    return {"restored": restored, "cleared": cleared, "pending_launch": pending_launch}
+        elif action == "cleared":
+            cleared += 1
+        elif action == "quarantined":
+            quarantined += 1
+        else:
+            pending_launch += 1
+
+    ledger_stats = _reconcile_ledger_prelaunch_orphans(queue_dir, stale_s=stale_s, now=time.time())
+    ledger_terminalized = int(ledger_stats.get("terminalized") or 0)
+    pending_launch += int(ledger_stats.get("pending") or 0)
+    quarantined += int(ledger_stats.get("quarantined") or 0)
+    # cleared includes carriers removed after terminalization; quarantined is
+    # reported separately so callers can distinguish park-vs-delete without
+    # breaking older exact-dict assertions that only key restored/cleared/pending.
+    return {
+        "restored": restored,
+        "cleared": cleared,
+        "pending_launch": pending_launch,
+        "quarantined": quarantined,
+        "ledger_terminalized": ledger_terminalized,
+    }
+
+
+def _reconcile_ledger_prelaunch_orphans(
+    queue_dir: Path,
+    *,
+    stale_s: float,
+    now: float | None = None,
+) -> dict:
+    """Reconcile carrier-less rows with the same typed admission and held gate."""
+    now_s = time.time() if now is None else float(now)
+    terminalized = 0
+    pending = 0
+    quarantined = 0
+    try:
+        records = goalflight_ledger.read_records()
+    except Exception:
+        return {"terminalized": 0, "pending": 0, "quarantined": 0}
+
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        dispatch_id = str(record.get("dispatch_id") or "")
+        if not dispatch_id:
+            continue
+        if _dispatch_record_is_terminal(record):
+            continue
+        state = str(record.get("state") or "")
+        if state not in PRELAUNCH_CANDIDATE_STATES and state not in {"running", "running_quiet"}:
+            # running with dead worker + no carrier is also a post-spawn orphan.
+            if state not in {"running", "running_quiet", "starting", "queued", "waiting_capacity", "submitted"}:
+                continue
+        if record.get("transport") == "fleet-ssh":
+            continue
+        if _claim_has_active_carrier(queue_dir, dispatch_id):
+            continue
+
+        entry = {
+            "dispatch_id": dispatch_id,
+            "agent": record.get("agent") or "unknown",
+            "shape": record.get("shape") or "bash",
+            "project_root": record.get("project_root"),
+            "queue_launch_token": record.get("queue_launch_token"),
+            "queue_worker_pid": record.get("worker_pid"),
+            "queue_worker_identity": record.get("worker_identity"),
+            "queue_worker_pgid": record.get("worker_pgid"),
+            "queue_worker_group_leader_identity": record.get("worker_group_leader_identity"),
+            "queue_worker_identity_snapshot_at": record.get("worker_identity_snapshot_at"),
+            "queue_producer_descendants": list(record.get("producer_descendants") or []),
+            "queue_producer_group_contract": bool(record.get("producer_group_contract")),
+            "queue_producer_group_contract_enforced": bool(
+                record.get("producer_group_contract_enforced")
+            ),
+            "queue_tail_flock_contract": record.get("transport") != "fleet-ssh",
+            "queue_worker_spawned_at": record.get("queue_worker_spawned_at") or record.get("started_at"),
+            # Post-spawn once a worker_pid was ever recorded OR state left pure queue.
+            "queue_launch_started": bool(record.get("worker_pid") or state not in {"queued", "waiting_capacity", "submitted"}),
+            "queue_worker_spawn_intent": bool(record.get("worker_pid") or state in {"starting", "running", "running_quiet"}),
+            "task_ids": list(record.get("task_ids") or []),
+            "request": {
+                "agent": record.get("agent"),
+                "cwd": record.get("project_root"),
+                "tail": record.get("stdout_path") or record.get("tail_path"),
+                "status_json": record.get("status_path"),
+                "task_ids": list(record.get("task_ids") or []),
+            },
+            "dispatch_argv": [],  # carrier missing — cannot restore
+            "claim_recovery_count": int(record.get("claim_recovery_count") or MAX_CLAIM_RECOVERY_REQUEUES),
+            "orphan_first_seen_at": record.get("orphan_first_seen_at"),
+            "started_at": record.get("started_at"),
+        }
+        admission = classify_reconciliation_admission(entry, now_s, stale_s=stale_s)
+        if admission is PreAdmitClass.INDETERMINATE:
+            _alert_identity_indeterminate(dispatch_id, where="ledger", reason="pre_admit_indeterminate")
+            pending += 1
+            continue
+        if ADMISSION_DECISION[admission] is AdmissionAction.DEFER_UNCHANGED:
+            pending += 1
+            continue
+        linked = _is_task_linked(entry, record)
+        age_stamp = _launch_age_timestamp_s(entry)
+        if age_stamp is None:
+            txn = _begin_reconcile_transaction(
+                entry,
+                queue_dir=queue_dir,
+                stale_s=stale_s,
+                need_queue=False,
+                need_task_store=False,
+                need_ledger=True,
+                admission=admission,
+            )
+            if txn is None:
+                pending += 1
+                continue
+            try:
+                stamped = _stamp_ledger_orphan_first_seen(record, txn=txn)
+            finally:
+                txn.release()
+            if stamped is None:
+                pending += 1
+                continue
+            pending += 1
+            continue
+        if max(0.0, now_s - age_stamp) < max(0.0, stale_s):
+            pending += 1
+            continue
+        if linked:
+            if _mark_claim_worker_dead(
+                entry,
+                reason="claim_carrier_missing",
+                stale_s=stale_s,
+            ):
+                terminalized += 1
+            else:
+                pending += 1
+        else:
+            # Unlinked ledger-only zombie: alert, do not auto-terminalize (E).
+            print(
+                "CLAIM-RECOVERY-ALERT "
+                + json.dumps(
+                    {
+                        "dispatch_id": dispatch_id,
+                        "action": "preserve_unlinked_ledger_orphan",
+                        "reason": "claim_carrier_missing_unlinked",
+                        "state": state,
+                    },
+                    sort_keys=True,
+                ),
+                file=sys.stderr,
+                flush=True,
+            )
+            quarantined += 1
+    return {"terminalized": terminalized, "pending": pending, "quarantined": quarantined}
+
+
+def _stamp_ledger_orphan_first_seen(
+    record: dict,
+    *,
+    txn: _ReconcileTransaction,
+    stamp: str | None = None,
+) -> str | None:
+    """Stamp an existing row under caller-held T→L; never creates a row."""
+    if not txn.ledger_locked:
+        return None
+    dispatch_id = str(record.get("dispatch_id") or "")
+    if not dispatch_id:
+        return None
+    if record.get("orphan_first_seen_at"):
+        return str(record["orphan_first_seen_at"])
+    stamp = stamp or goalflight_ledger.utc_now()
+    path = goalflight_ledger.record_path(dispatch_id)
+    if not path.exists():
+        return None
+    try:
+        fresh = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if fresh.get("orphan_first_seen_at"):
+        return str(fresh["orphan_first_seen_at"])
+    if _dispatch_record_is_terminal(fresh):
+        return None
+    fresh_entry = _entry_with_record_identity(txn.entry, fresh, prefer_record=True)
+    if not _reconcile_transaction_still_valid(txn, fresh_entry):
+        return None
+    if (
+        classify_reconciliation_admission(fresh_entry, time.time(), stale_s=0.0)
+        is not txn.admission
+    ):
+        return None
+    fresh["orphan_first_seen_at"] = stamp
+    try:
+        goalflight_ledger.write_record(fresh)
+    except Exception:
+        return None
+    return stamp
 
 
 def _claim_queue_entry(path: Path) -> Path | None:
@@ -2719,27 +4943,49 @@ def _queue_entry_drain_candidate(path: Path) -> tuple[tuple[int, float, str], Pa
     )
 
 
-def _restore_claimed_entry(claim: Path, entry: dict) -> Path:
-    queue_dir = claim.parent
-    target = queue_dir / claim.name.split(".claimed-", 1)[0]
-    for key in (
-        "queue_launch_token",
-        "queue_launch_started",
-        "queue_launch_started_at",
-        "queue_launcher_pid",
-        "queue_launcher_identity",
-        "queue_worker_spawn_intent",
-        "queue_worker_spawn_intent_at",
-        "queue_worker_pid",
-        "queue_worker_spawned_at",
-    ):
-        entry.pop(key, None)
-    entry["state"] = "queued"
-    entry["updated_at"] = goalflight_ledger.utc_now()
-    _write_json_atomic(target, entry)
-    with contextlib.suppress(OSError):
-        claim.unlink()
-    return target
+def _restore_claimed_entry(
+    claim: Path,
+    entry: dict,
+    *,
+    txn: _ReconcileTransaction,
+    increment_recovery_count: bool = False,
+    reason: str = "claim_restore",
+) -> tuple[Path | None, dict | None]:
+    """Leaf restore; caller must own the complete T→Q→S→L transaction."""
+    return _commit_restore_transaction(
+        txn,
+        claim,
+        entry,
+        increment_recovery_count=increment_recovery_count,
+        reason=reason,
+    )
+
+
+def _update_launch_owned_claim(
+    claim: Path,
+    token: str,
+    updater,
+    *,
+    error_label: str,
+    silent: bool = False,
+) -> bool:
+    """Q-only acting-owner mutation; releases Q before any reconcile path."""
+    try:
+        with _queue_mutation_lock(claim.parent):
+            entry = json.loads(claim.read_text(encoding="utf-8"))
+            if not isinstance(entry, dict) or entry.get("queue_launch_token") != token:
+                if silent:
+                    return False
+                raise DispatchUsageError("queue claim launch token mismatch")
+            updater(entry)
+            _write_json_atomic(claim, entry)
+        return True
+    except DispatchUsageError:
+        raise
+    except (OSError, json.JSONDecodeError) as exc:
+        if silent:
+            return False
+        raise DispatchUsageError(f"{error_label}: {type(exc).__name__}") from exc
 
 
 def _mark_queue_claim_launch_started(args) -> None:
@@ -2749,28 +4995,27 @@ def _mark_queue_claim_launch_started(args) -> None:
     if not token:
         return
     claim = Path(str(args.queue_claim_path)).expanduser()
-    try:
-        entry = json.loads(claim.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise DispatchUsageError(f"queue claim launch marker failed: {type(exc).__name__}")
-    if entry.get("queue_launch_token") != token:
-        raise DispatchUsageError("queue claim launch token mismatch")
     launcher_identity = goalflight_ledger.process_identity(os.getpid()) or {
         "pid": os.getpid(),
         "identity_available": False,
         "identity_source": "pid_probe_unavailable",
     }
     now = goalflight_ledger.utc_now()
-    entry["queue_launch_started"] = True
-    entry["queue_launch_started_at"] = now
-    entry["queue_launcher_pid"] = os.getpid()
-    if launcher_identity:
-        entry["queue_launcher_identity"] = launcher_identity
-    entry["updated_at"] = now
-    try:
-        _write_json_atomic(claim, entry)
-    except OSError as exc:
-        raise DispatchUsageError(f"queue claim launch marker failed: {type(exc).__name__}")
+    def update(entry: dict) -> None:
+        entry["queue_launch_started"] = True
+        entry["queue_launch_started_at"] = now
+        entry["queue_launcher_pid"] = os.getpid()
+        if launcher_identity:
+            entry["queue_launcher_identity"] = launcher_identity
+        entry["queue_tail_flock_contract"] = True
+        entry["updated_at"] = now
+
+    _update_launch_owned_claim(
+        claim,
+        str(token),
+        update,
+        error_label="queue claim launch marker failed",
+    )
 
 
 def _mark_queue_claim_worker_spawn_intent(args) -> None:
@@ -2780,20 +5025,19 @@ def _mark_queue_claim_worker_spawn_intent(args) -> None:
     if not token:
         return
     claim = Path(str(args.queue_claim_path)).expanduser()
-    try:
-        entry = json.loads(claim.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise DispatchUsageError(f"queue claim worker-spawn marker failed: {type(exc).__name__}")
-    if entry.get("queue_launch_token") != token:
-        raise DispatchUsageError("queue claim launch token mismatch")
     now = goalflight_ledger.utc_now()
-    entry["queue_worker_spawn_intent"] = True
-    entry["queue_worker_spawn_intent_at"] = now
-    entry["updated_at"] = now
-    try:
-        _write_json_atomic(claim, entry)
-    except OSError as exc:
-        raise DispatchUsageError(f"queue claim worker-spawn marker failed: {type(exc).__name__}")
+    def update(entry: dict) -> None:
+        entry["queue_worker_spawn_intent"] = True
+        entry["queue_worker_spawn_intent_at"] = now
+        entry["queue_tail_flock_contract"] = True
+        entry["updated_at"] = now
+
+    _update_launch_owned_claim(
+        claim,
+        str(token),
+        update,
+        error_label="queue claim worker-spawn marker failed",
+    )
 
 
 def _mark_queue_claim_worker_spawned(args, worker_pid: int | None) -> None:
@@ -2803,27 +5047,88 @@ def _mark_queue_claim_worker_spawned(args, worker_pid: int | None) -> None:
     if not (token and worker_pid):
         return
     claim = Path(str(args.queue_claim_path)).expanduser()
-    try:
-        entry = json.loads(claim.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return
-    if entry.get("queue_launch_token") != token:
-        return
-    entry["queue_worker_pid"] = int(worker_pid)
-    entry["queue_worker_spawned_at"] = goalflight_ledger.utc_now()
-    entry["updated_at"] = goalflight_ledger.utc_now()
+    worker_pid_i = int(worker_pid)
+    now = goalflight_ledger.utc_now()
+    # b-065 C: capture process identity at spawn so recovery can use the same
+    # PID/start-time/command test as the ledger (not bare-PID liveness).
+    worker_identity = goalflight_ledger.process_identity(worker_pid_i) or {
+        "pid": worker_pid_i,
+        "identity_available": False,
+        "identity_source": "pid_probe_unavailable",
+    }
+    pgid = process_group_id(worker_pid_i)
+    group_leader_identity = None
+    if pgid:
+        group_leader_identity = (
+            goalflight_ledger.process_identity(int(pgid))
+            or {"pid": int(pgid), "identity_available": False, "identity_source": "pid_probe_unavailable"}
+        )
+    # PGID capture is evidence, not a no-daemon-escape guarantee. Current
+    # launchers do not prevent a descendant from reparenting/changing groups,
+    # so PID fallback must remain fail-closed if flock is unavailable.
+    snapshot = _process_snapshot()
+    descendants: list[dict] = []
+    if snapshot is not None:
+        member_pids = {worker_pid_i}
+        changed = True
+        while changed:
+            changed = False
+            for row in snapshot:
+                pid = int(row.get("pid") or 0)
+                if pid in member_pids:
+                    continue
+                if int(row.get("ppid") or 0) in member_pids:
+                    member_pids.add(pid)
+                    changed = True
+        for pid in sorted(member_pids - {worker_pid_i}):
+            identity = goalflight_ledger.process_identity(pid)
+            if isinstance(identity, dict):
+                descendants.append({"pid": pid, "identity": identity})
+    def update(entry: dict) -> None:
+        entry["queue_worker_pid"] = worker_pid_i
+        entry["queue_worker_spawned_at"] = now
+        entry["queue_worker_identity"] = worker_identity
+        if pgid:
+            entry["queue_worker_pgid"] = int(pgid)
+            entry["queue_worker_group_leader_identity"] = group_leader_identity
+        entry["queue_worker_identity_snapshot_at"] = now
+        entry["queue_producer_group_contract"] = bool(pgid)
+        entry["queue_producer_group_contract_enforced"] = False
+        entry["queue_producer_group_contract_reason"] = "pgid_observed_no_escape_not_enforced"
+        entry["queue_tail_flock_contract"] = True
+        entry["queue_producer_descendants"] = descendants
+        entry["updated_at"] = now
+
+    _update_launch_owned_claim(
+        claim,
+        str(token),
+        update,
+        error_label="queue claim worker-spawn marker failed",
+        silent=True,
+    )
+
+
+def _mark_claim_failed_locked(claim: Path, entry: dict, *, reason: str) -> None:
+    """Pre-spawn failure write; caller owns Q."""
+    fresh = dict(entry)
+    fresh["state"] = "failed"
+    fresh["reason"] = reason
+    fresh["updated_at"] = goalflight_ledger.utc_now()
+    failed = claim.with_name(f"{claim.name}.failed")
+    _write_json_atomic(failed, fresh)
     with contextlib.suppress(OSError):
-        _write_json_atomic(claim, entry)
+        claim.unlink()
 
 
 def _mark_claim_failed(claim: Path, entry: dict, *, reason: str) -> None:
-    entry["state"] = "failed"
-    entry["reason"] = reason
-    entry["updated_at"] = goalflight_ledger.utc_now()
-    failed = claim.with_name(f"{claim.name}.failed")
-    _write_json_atomic(failed, entry)
-    with contextlib.suppress(OSError):
-        claim.unlink()
+    with _queue_mutation_lock(claim.parent):
+        try:
+            fresh = json.loads(claim.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            fresh = dict(entry)
+        if fresh.get("queue_launch_token") != entry.get("queue_launch_token"):
+            return
+        _mark_claim_failed_locked(claim, fresh, reason=reason)
 
 
 class _RemoteDrainBlocked(RuntimeError):
@@ -3054,40 +5359,76 @@ def _queued_args_for_status(entry: dict):
 
 
 def _restore_queued_record_from_entry(entry: dict, queue_path: Path) -> None:
+    """Post-commit queued status/dashboard mirror; ledger truth is already durable."""
     request = entry.get("request") if isinstance(entry.get("request"), dict) else {}
     args = _queued_args_for_status(entry)
     project_root = Path(str(entry.get("project_root") or request.get("cwd") or Path.cwd())).resolve()
     status_json = Path(str(request.get("status_json") or _dispatch_base_dir() / f"{args.dispatch_id}.status.json"))
     tail = Path(str(request.get("tail") or _dispatch_base_dir() / f"{args.dispatch_id}.tail"))
-    _record_queued_status(args, project_root=project_root, status_json=status_json, tail=tail, queue_path=queue_path)
-
-
-def _mark_claim_worker_dead(entry: dict, *, reason: str) -> None:
-    dispatch_id = str(entry.get("dispatch_id") or "")
-    if not dispatch_id:
-        return
-    request = entry.get("request") if isinstance(entry.get("request"), dict) else {}
-    args = _queued_args_for_status(entry)
-    project_root = Path(str(entry.get("project_root") or request.get("cwd") or Path.cwd())).resolve()
-    status_json = Path(str(request.get("status_json") or _dispatch_base_dir() / f"{dispatch_id}.status.json"))
-    tail = Path(str(request.get("tail") or _dispatch_base_dir() / f"{dispatch_id}.tail"))
-    if _find_dispatch_record(dispatch_id) is None:
-        with contextlib.suppress(Exception):
-            _record_queued_ledger_fast(
-                args,
-                project_root=project_root,
-                prompt_path=str(Path(args.prompt_file).expanduser()) if args.prompt_file else None,
-                status_json=status_json,
-                tail=tail,
-            )
-    ignore_prefix_lines = _ignore_prefix_lines(str(Path(args.prompt_file).expanduser()) if args.prompt_file else None)
-    terminal_marker = _final_terminal_marker(
-        tail,
-        ignore_prefix_lines=ignore_prefix_lines,
-        suppress_unfenced_prompt_markers=True,
+    lock = goalflight_ledger.StateLock.try_acquire(
+        time.monotonic() + RECONCILE_DOWNSTREAM_LOCK_BUDGET_S
     )
+    if lock is None:
+        return
+    try:
+        record = _find_dispatch_record(str(args.dispatch_id or ""))
+        if not record or _dispatch_record_is_terminal(record) or record.get("state") != "queued":
+            return
+        if record.get("restore_txn_id") != entry.get("restore_txn_id") and entry.get("restore_txn_id"):
+            return
+        write_status(
+            status_json,
+            {
+                "schema": "goalflight.status.v1",
+                "dispatch_id": args.dispatch_id,
+                "agent": args.agent,
+                "shape": args.shape,
+                "state": "queued",
+                "reason": "dispatch_queue_restore",
+                "queue_path": str(queue_path),
+                "project_root": str(project_root),
+                "worker_pid": None,
+                "worker_alive": False,
+                "tail_path": str(tail),
+                "updated_at": int(time.time()),
+                **({"task_ids": list(args.task_ids)} if getattr(args, "task_ids", None) else {}),
+            },
+        )
+    finally:
+        lock.release()
+    _export_dashboard_status_for_project(project_root)
+    _start_dashboard_refresh_for_project(project_root)
+
+
+def _resolve_claim_terminal_outcome(
+    entry: dict,
+    *,
+    reason: str,
+    tail: Path,
+    ignore_prefix_lines: list[str],
+    agent: str,
+) -> tuple[str, object, dict | None]:
+    """Scan tail (with amendment-G recheck) and return (state, reason, marker)."""
+
+    def _scan_marker() -> dict | None:
+        try:
+            return _final_terminal_marker(
+                tail,
+                ignore_prefix_lines=ignore_prefix_lines,
+                suppress_unfenced_prompt_markers=True,
+            )
+        except Exception:
+            return None
+
+    terminal_marker = _scan_marker()
+    # Final recheck immediately before outcome is used for a write (G).
+    recheck = _scan_marker()
+    if recheck is not None:
+        terminal_marker = recheck
     state = _marker_state_for_terminal(terminal_marker) if terminal_marker else "worker_dead"
-    reason_for_finish = f"marker:{terminal_marker['kind']}:final_reconciliation" if terminal_marker else reason
+    reason_for_finish = (
+        f"marker:{terminal_marker['kind']}:final_reconciliation" if terminal_marker else reason
+    )
     state, final_reason, _rate_limited = goalflight_terminal.terminal_rate_limit_outcome(
         state,
         reason_for_finish,
@@ -3100,13 +5441,223 @@ def _mark_claim_worker_dead(entry: dict, *, reason: str) -> None:
         tail,
         terminal_marker,
     )
-    # Quota refinement (merge of the quota-stuck line): only rewrites
-    # idle_timeout/rate_limited/worker_dead states, and only on a genuine
-    # error-context quota signature. Surviving marker-reconciled completions
-    # are never touched.
-    state, final_reason = _quota_limited_state_reason(state, final_reason, tail, agent=args.agent)
+    state, final_reason = _quota_limited_state_reason(state, final_reason, tail, agent=agent)
+    return state or "worker_dead", final_reason, terminal_marker
+
+
+def _new_reconciliation_record(entry: dict) -> dict:
+    request = entry.get("request") if isinstance(entry.get("request"), dict) else {}
+    dispatch_id = str(entry.get("dispatch_id") or "")
+    return {
+        "schema": goalflight_ledger.SCHEMA,
+        "dispatch_id": dispatch_id,
+        "agent": entry.get("agent") or request.get("agent") or "unknown",
+        "shape": entry.get("shape") or request.get("shape") or "bash",
+        "transport": "dispatch",
+        "project_root": str(entry.get("project_root") or request.get("cwd") or Path.cwd()),
+        "stdout_path": str(request.get("tail") or _dispatch_base_dir() / f"{dispatch_id}.tail"),
+        "status_path": str(request.get("status_json") or _dispatch_base_dir() / f"{dispatch_id}.status.json"),
+        "task_ids": _entry_task_ids(entry),
+        "queue_launch_token": entry.get("queue_launch_token"),
+        "worker_pid": entry.get("queue_worker_pid"),
+        "worker_identity": entry.get("queue_worker_identity"),
+        "worker_pgid": entry.get("queue_worker_pgid"),
+        "worker_group_leader_identity": entry.get("queue_worker_group_leader_identity"),
+        "producer_descendants": list(entry.get("queue_producer_descendants") or []),
+        "producer_group_contract": bool(entry.get("queue_producer_group_contract")),
+        "producer_group_contract_enforced": bool(
+            entry.get("queue_producer_group_contract_enforced")
+        ),
+        "started_at": entry.get("started_at") or entry.get("created_at") or goalflight_ledger.utc_now(),
+    }
+
+
+def commit_reconciled_terminal(
+    txn: _ReconcileTransaction,
+    entry: dict,
+    decision: dict,
+) -> TerminalCommitResult:
+    """Create/update a terminal directly under caller-held T→[Q]→S→L."""
+    if not txn.ledger_locked or (_is_task_linked(entry) and not txn.task_store_locked):
+        return TerminalCommitResult(TerminalCommitKind.DEFERRED, None, False)
+    if not _reconcile_transaction_still_valid(txn, entry):
+        return TerminalCommitResult(TerminalCommitKind.DEFERRED, None, False)
+    dispatch_id = str(entry.get("dispatch_id") or "")
+    if not dispatch_id:
+        return TerminalCommitResult(TerminalCommitKind.DEFERRED, None, False)
+    path = goalflight_ledger.record_path(dispatch_id)
+    created = not path.exists()
+    if created:
+        record = _new_reconciliation_record(entry)
+    else:
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return TerminalCommitResult(TerminalCommitKind.DEFERRED, None, False)
+        if not isinstance(record, dict):
+            return TerminalCommitResult(TerminalCommitKind.DEFERRED, None, False)
+
+    existing_terminal = goalflight_ledger._terminal_key(record)
+    if existing_terminal not in {"", "unknown", "watcher_stopped"}:
+        return TerminalCommitResult(
+            TerminalCommitKind.EXISTING_TERMINAL,
+            str(record.get("state") or existing_terminal),
+            True,
+        )
+
+    state = str(decision.get("state") or "worker_dead")
+    reason = decision.get("reason") or "claim_reconciliation"
+    authority = _entry_completion_authority(entry, record, task_store_locked=True)
+    if authority is not None:
+        if _completion_decision_is_deferred(authority):
+            return TerminalCommitResult(TerminalCommitKind.DEFERRED, None, False)
+        state = str(authority.get("state") or state)
+        reason = authority.get("reason") or reason
+        decision = {**decision, **authority}
+    terminal_state = goalflight_ledger.terminal_state_for(state, reason)
+    if terminal_state in {"", "unknown", "watcher_stopped"}:
+        return TerminalCommitResult(TerminalCommitKind.DEFERRED, None, False)
+
+    ended_at = goalflight_ledger.utc_now()
+    record.update(
+        {
+            "state": state,
+            "ended_at": ended_at,
+            "terminal_state": terminal_state,
+            "liveness_state": goalflight_terminal.terminal_liveness_state(state),
+            "worker_still_alive": False,
+        }
+    )
+    reconciliation = {
+        "source": "drain_claim_recovery",
+        "launch_timeout_s": LAUNCH_TIMEOUT_S,
+        "queue_launch_token": entry.get("queue_launch_token") or record.get("queue_launch_token"),
+        "claim_recovery_count": _claim_recovery_count(entry),
+        "checked_output": True,
+        "checked_task_ids": _entry_task_ids(entry, record),
+    }
+    if decision.get("resolution_source"):
+        reconciliation["resolution_source"] = decision["resolution_source"]
+    if decision.get("salvage_required"):
+        reconciliation["salvage_required"] = True
+        record["salvage_required"] = True
+    record["outcome"] = {"terminal_state": terminal_state, "reconciliation": reconciliation}
+    envelope = goalflight_ledger.failure_envelope(reason)
+    if envelope:
+        record.update(envelope)
+        record["outcome"].update(envelope)
+    try:
+        goalflight_ledger.write_record(record)
+    except Exception:
+        return TerminalCommitResult(TerminalCommitKind.DEFERRED, None, False)
+    return TerminalCommitResult(
+        TerminalCommitKind.CREATED_TERMINAL if created else TerminalCommitKind.UPDATED_TERMINAL,
+        state,
+        True,
+    )
+
+
+def _finish_ledger_under_lock(
+    txn: _ReconcileTransaction,
+    entry: dict,
+    decision: dict,
+) -> TerminalCommitResult:
+    """Leaf terminal commit; never acquires locks or reports apparent success."""
+    return commit_reconciled_terminal(txn, entry, decision)
+
+
+def _mark_claim_worker_dead(
+    entry: dict,
+    *,
+    reason: str,
+    force_state: str | None = None,
+    salvage_required: bool = False,
+    resolution_source: str | None = None,
+    claim: Path | None = None,
+    stale_s: float = 0.0,
+) -> bool:
+    """Terminalize a claim/ledger orphan. Sets record ``state`` (not only
+    ``terminal_state``) so ``goalflight_status.py --wait`` resolves (b-065 B).
+
+    Amendment G: re-scan completion evidence inside the ledger critical section
+    before terminalizing so a late COMPLETE wins over worker_dead.
+
+    ``force_state`` selects a system-owned terminal (``complete`` / ``superseded``)
+    when the completion-authority ladder already decided; the locked finish path
+    still rechecks the tail so a late COMPLETE can win over worker_dead.
+    """
+    dispatch_id = str(entry.get("dispatch_id") or "")
+    if not dispatch_id:
+        return False
+    request = entry.get("request") if isinstance(entry.get("request"), dict) else {}
+    args = _queued_args_for_status(entry)
+    project_root = Path(str(entry.get("project_root") or request.get("cwd") or Path.cwd())).resolve()
+    status_json = Path(str(request.get("status_json") or _dispatch_base_dir() / f"{dispatch_id}.status.json"))
+    tail = Path(str(request.get("tail") or _dispatch_base_dir() / f"{dispatch_id}.tail"))
+    ignore_prefix_lines = _ignore_prefix_lines(
+        str(Path(args.prompt_file).expanduser()) if args.prompt_file else None
+    )
+    state, final_reason, terminal_marker = _resolve_claim_terminal_outcome(
+        entry,
+        reason=reason,
+        tail=tail,
+        ignore_prefix_lines=ignore_prefix_lines,
+        agent=args.agent,
+    )
+    # Prefer a real SUCCESS tail scan over a forced state. Allow force_state for
+    # complete/superseded only when the tail did not already produce a terminal
+    # success (ladder proved task-store / system-owned outcome).
+    if force_state in {"complete", "superseded"} and state == "worker_dead":
+        state = force_state
+        final_reason = reason
+    queue_dir = claim.parent if claim is not None else _dispatch_queue_dir()
+    txn = _begin_reconcile_transaction(
+        entry,
+        queue_dir=queue_dir,
+        stale_s=stale_s,
+        need_queue=claim is not None,
+        need_task_store=_is_task_linked(entry, _find_dispatch_record(dispatch_id)),
+        need_ledger=True,
+    )
+    if txn is None:
+        return False
+    try:
+        fresh = entry
+        if claim is not None:
+            try:
+                loaded = json.loads(claim.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                return False
+            if not isinstance(loaded, dict):
+                return False
+            fresh = loaded
+        result = _finish_ledger_under_lock(
+            txn,
+            fresh,
+            {
+                "state": state,
+                "reason": final_reason,
+                "salvage_required": salvage_required,
+                "resolution_source": resolution_source,
+            },
+        )
+        if not result.committed:
+            return False
+        durable_state = result.durable_state or state
+        if claim is not None:
+            try:
+                claim.unlink()
+            except OSError:
+                return False
+    finally:
+        txn.release()
+    # Re-read for status mirror if finish preserved a prior terminal.
     with contextlib.suppress(Exception):
-        _finish_ledger(dispatch_id, state or "worker_dead", final_reason, worker_still_alive=False)
+        record = _find_dispatch_record(dispatch_id)
+        if record and record.get("state"):
+            durable_state = str(record.get("state"))
+            if record.get("terminal_state"):
+                final_reason = record.get("reason") or record.get("error") or final_reason
     with contextlib.suppress(Exception):
         write_status(
             status_json,
@@ -3115,10 +5666,14 @@ def _mark_claim_worker_dead(entry: dict, *, reason: str) -> None:
                 "dispatch_id": dispatch_id,
                 "agent": args.agent,
                 "shape": args.shape,
-                "state": state or "worker_dead",
-                "terminal_state": goalflight_ledger.terminal_state_for(state or "worker_dead", final_reason),
+                "state": durable_state or "worker_dead",
+                "terminal_state": goalflight_ledger.terminal_state_for(
+                    durable_state or "worker_dead", final_reason
+                ),
                 "reason": final_reason,
-                "liveness_state": goalflight_terminal.terminal_liveness_state(state or "worker_dead"),
+                "liveness_state": goalflight_terminal.terminal_liveness_state(
+                    durable_state or "worker_dead"
+                ),
                 "terminal_marker": terminal_marker,
                 "project_root": str(project_root),
                 "worker_pid": entry.get("queue_worker_pid"),
@@ -3126,9 +5681,19 @@ def _mark_claim_worker_dead(entry: dict, *, reason: str) -> None:
                 "tail_path": str(tail),
                 "status_path": str(status_json),
                 "updated_at": int(time.time()),
+                "reconciliation": {
+                    "source": "drain_claim_recovery",
+                    "launch_timeout_s": LAUNCH_TIMEOUT_S,
+                    "queue_launch_token": entry.get("queue_launch_token"),
+                    "claim_recovery_count": _claim_recovery_count(entry),
+                    "checked_output": True,
+                    **({"resolution_source": resolution_source} if resolution_source else {}),
+                    **({"salvage_required": True} if salvage_required else {}),
+                },
                 **({"task_ids": list(args.task_ids)} if getattr(args, "task_ids", None) else {}),
             },
         )
+    return result.committed
 
 
 def _drain_prelaunch_hook_path() -> Path:
@@ -3192,46 +5757,61 @@ def _drain_queue_once(args) -> dict:
     failed = 0
     pending_claims = 0
     details: list[dict] = []
-    entries = sorted(_queue_entry_drain_candidate(path) for path in queue_dir.glob("*.json"))
+    entries = sorted(
+        candidate
+        for path in queue_dir.glob("*.json")
+        for candidate in (_queue_entry_drain_candidate(path),)
+        if not (
+            isinstance(candidate[2], dict)
+            and candidate[2].get("state") == "restore_prepared"
+        )
+    )
     if args.limit and args.limit > 0:
         entries = entries[: args.limit]
     if not remote_node and entries:
         _run_drain_prelaunch_hook(_pass_agent_labels(entries))
     for _sort_key, path, _scan_entry, _scan_read_error in entries:
+        claim_error: Exception | None = None
+        entry: dict | None = None
+        launch_token = _queue_launch_token()
         with _queue_mutation_lock(queue_dir):
             claim = _claim_queue_entry(path)
+            if claim is not None:
+                try:
+                    payload = json.loads(claim.read_text(encoding="utf-8"))
+                    if not isinstance(payload, dict):
+                        raise ValueError("invalid_payload")
+                except (OSError, json.JSONDecodeError, ValueError) as exc:
+                    claim_error = exc
+                    with contextlib.suppress(OSError):
+                        _mark_claim_failed_locked(
+                            claim,
+                            {"path": str(claim)},
+                            reason=f"unreadable:{type(exc).__name__}",
+                        )
+                else:
+                    entry = payload
+                    entry["state"] = "claimed"
+                    entry["queue_launch_token"] = launch_token
+                    entry["updated_at"] = goalflight_ledger.utc_now()
+                    try:
+                        _write_json_atomic(claim, entry)
+                    except OSError as exc:
+                        claim_error = exc
         if claim is None:
             continue
-        # The pre-scan read (_scan_entry/_scan_read_error) is best-effort and
-        # used ONLY for sort ordering: it can be stale if the entry was being
-        # restored by a concurrent stale-claim recovery at scan time. Decide
-        # readability authoritatively from the now-owned claim file, so a valid
-        # entry is never tombstoned on a stale pre-scan error.
-        try:
-            entry = json.loads(claim.read_text(encoding="utf-8"))
-            if not isinstance(entry, dict):
-                raise ValueError("invalid_payload")
-        except (OSError, json.JSONDecodeError, ValueError) as exc:
+        if claim_error is not None or entry is None:
             failed += 1
-            _mark_claim_failed(claim, {"path": str(claim)}, reason=f"unreadable:{type(exc).__name__}")
+            if entry is not None:
+                details.append(
+                    {
+                        "dispatch_id": str(entry.get("dispatch_id") or path.stem),
+                        "state": "claimed",
+                        "reason": f"claim_token_write_failed:{type(claim_error).__name__}",
+                    }
+                )
             continue
         dispatch_id = str(entry.get("dispatch_id") or path.stem)
-        launch_token = _queue_launch_token()
-        entry["state"] = "claimed"
-        entry["queue_launch_token"] = launch_token
-        entry["updated_at"] = goalflight_ledger.utc_now()
-        try:
-            _write_json_atomic(claim, entry)
-        except OSError as exc:
-            failed += 1
-            details.append(
-                {
-                    "dispatch_id": dispatch_id,
-                    "state": "claimed",
-                    "reason": f"claim_token_write_failed:{type(exc).__name__}",
-                }
-            )
-            continue
         launch_argv = _drain_launch_argv(
             list(entry.get("dispatch_argv") or []),
             capacity_wait_s=args.capacity_wait_s,
@@ -3263,7 +5843,27 @@ def _drain_queue_once(args) -> dict:
                     timeout=timeout_s,
                 )
         except _RemoteDrainBlocked as exc:
-            restored = _restore_claimed_entry(claim, entry)
+            restored, decision = _restore_claim_if_incomplete(claim, entry, queue_dir)
+            if decision is not None:
+                details.append(
+                    {
+                        "dispatch_id": dispatch_id,
+                        "state": str(decision.get("state") or "complete"),
+                        "reason": str(decision.get("reason") or "completion_authority"),
+                    }
+                )
+                continue
+            if restored is None:
+                pending_claims += 1
+                failed += 1
+                details.append(
+                    {
+                        "dispatch_id": dispatch_id,
+                        "state": "claimed",
+                        "reason": "remote_blocked_restore_raced",
+                    }
+                )
+                continue
             _restore_queued_record_from_entry(entry, restored)
             left_queued += 1
             details.append(
@@ -3286,23 +5886,50 @@ def _drain_queue_once(args) -> dict:
             )
             continue
         stdout_launched = proc.returncode == 0 and "DISPATCH-LAUNCHED " in proc.stdout
-        ledger_confirmed = _dispatch_has_worker_record(dispatch_id, queue_launch_token=launch_token)
+        # Drain launch accounting: a token-matched worker_pid means launch occurred
+        # (worker may already be dead). Recovery must NOT treat that weak presence
+        # as "claim safe to drop without terminalizing" — see
+        # _recover_claimed_queue_entries (require_live_nonterminal) + ledger-only
+        # orphan scan. Clearing the claim here is fine because reconcile will
+        # terminalize a task-linked zombie from the ledger.
+        ledger_confirmed = _dispatch_has_worker_record(
+            dispatch_id,
+            queue_launch_token=launch_token,
+        )
         no_capacity = proc.returncode == 2 and "blocked_capacity" in (proc.stdout + proc.stderr)
         if stdout_launched and ledger_confirmed:
-            with contextlib.suppress(OSError):
-                claim.unlink()
+            _positive_live_carrier_cleanup(claim, entry, queue_dir)
             launched += 1
             details.append({"dispatch_id": dispatch_id, "state": "launched"})
             continue
         if no_capacity:
-            restored = _restore_claimed_entry(claim, entry)
+            restored, decision = _restore_claim_if_incomplete(claim, entry, queue_dir)
+            if decision is not None:
+                details.append(
+                    {
+                        "dispatch_id": dispatch_id,
+                        "state": str(decision.get("state") or "complete"),
+                        "reason": str(decision.get("reason") or "completion_authority"),
+                    }
+                )
+                continue
+            if restored is None:
+                pending_claims += 1
+                failed += 1
+                details.append(
+                    {
+                        "dispatch_id": dispatch_id,
+                        "state": "claimed",
+                        "reason": "capacity_restore_raced",
+                    }
+                )
+                continue
             _restore_queued_record_from_entry(entry, restored)
             left_queued += 1
             details.append({"dispatch_id": dispatch_id, "state": "queued", "reason": "capacity_unavailable"})
             continue
         if ledger_confirmed:
-            with contextlib.suppress(OSError):
-                claim.unlink()
+            _positive_live_carrier_cleanup(claim, entry, queue_dir)
             launched += 1
             details.append({"dispatch_id": dispatch_id, "state": "launched", "reason": "worker_record_present"})
             continue
@@ -3687,6 +6314,7 @@ def _run_acp_detached_launcher(
         stdout_path=tail_path,
         stdout_mode="ab",
         stderr="stdout",
+        serialize_stdout=True,
         label="acp",
     )
     _mark_queue_claim_worker_spawned(args, child_pid)
@@ -4377,6 +7005,7 @@ def main(argv: list[str] | None = None) -> int:
             stdout_path=tail,
             stdout_mode=worker_stdout_mode,
             stderr="stdout",
+            serialize_stdout=True,
             label="worker",
         )
         _mark_queue_claim_worker_spawned(args, worker_pid)

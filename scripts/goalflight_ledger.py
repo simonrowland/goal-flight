@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import errno
 import hashlib
 import json
 import math
@@ -77,14 +78,54 @@ def lock_path() -> Path:
 
 
 class StateLock:
+    def __init__(self):
+        self._fh = None
+        self._acquired = False
+
     def __enter__(self):
-        self._fh = lock_path().open("w")
-        fcntl.flock(self._fh, fcntl.LOCK_EX)
+        if not self._acquired:
+            self._fh = lock_path().open("a+")
+            fcntl.flock(self._fh, fcntl.LOCK_EX)
+            self._acquired = True
         return self
 
     def __exit__(self, exc_type, exc, tb):
-        fcntl.flock(self._fh, fcntl.LOCK_UN)
-        self._fh.close()
+        self.release()
+
+    def release(self) -> None:
+        """Release once; safe for reverse-order transaction teardown."""
+        if not self._acquired or self._fh is None:
+            return
+        try:
+            fcntl.flock(self._fh, fcntl.LOCK_UN)
+        finally:
+            self._fh.close()
+            self._fh = None
+            self._acquired = False
+
+    @classmethod
+    def try_acquire(cls, deadline_s: float, *, poll_s: float = 0.010) -> "StateLock | None":
+        """Acquire against an absolute monotonic deadline without blocking."""
+        lock = cls()
+        lock._fh = lock_path().open("a+")
+        while True:
+            try:
+                fcntl.flock(lock._fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                lock._acquired = True
+                return lock
+            except (BlockingIOError, OSError) as exc:
+                if isinstance(exc, OSError) and exc.errno not in {
+                    errno.EACCES,
+                    errno.EAGAIN,
+                }:
+                    lock._fh.close()
+                    lock._fh = None
+                    raise
+                if time.monotonic() >= deadline_s:
+                    lock._fh.close()
+                    lock._fh = None
+                    return None
+                time.sleep(min(poll_s, max(0.0, deadline_s - time.monotonic())))
 
 
 def sha256_file(path: str | None) -> str | None:
@@ -239,8 +280,16 @@ def write_record(record: dict) -> Path:
     record["updated_at"] = utc_now()
     path = record_path(record["dispatch_id"])
     tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
+    with tmp.open("w", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, indent=2, sort_keys=True) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
     tmp.replace(path)
+    dir_fd = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
     return path
 
 

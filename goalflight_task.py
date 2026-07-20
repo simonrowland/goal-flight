@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime as dt
+import errno
 import glob
 import hashlib
 import html
@@ -19,6 +20,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Any, Callable
 from urllib.parse import quote
 
@@ -285,16 +287,53 @@ class FileLock:
         self._fh = None
 
     def __enter__(self) -> "FileLock":
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        require_regular_or_absent(self.path)
-        self._fh = self.path.open("a+", encoding="utf-8")
-        fcntl.flock(self._fh, fcntl.LOCK_EX)
+        if self._fh is None:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            require_regular_or_absent(self.path)
+            self._fh = self.path.open("a+", encoding="utf-8")
+            fcntl.flock(self._fh, fcntl.LOCK_EX)
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        assert self._fh is not None
-        fcntl.flock(self._fh, fcntl.LOCK_UN)
-        self._fh.close()
+        self.release()
+
+    def release(self) -> None:
+        """Release once; safe for reverse-order transaction teardown."""
+        if self._fh is None:
+            return
+        try:
+            fcntl.flock(self._fh, fcntl.LOCK_UN)
+        finally:
+            self._fh.close()
+            self._fh = None
+
+    @classmethod
+    def try_acquire(
+        cls,
+        path: Path,
+        *,
+        deadline_s: float,
+        poll_s: float = 0.010,
+    ) -> "FileLock | None":
+        """Acquire against an absolute monotonic deadline without blocking."""
+        lock = cls(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        require_regular_or_absent(path)
+        lock._fh = path.open("a+", encoding="utf-8")
+        while True:
+            try:
+                fcntl.flock(lock._fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return lock
+            except (BlockingIOError, OSError) as exc:
+                if isinstance(exc, OSError) and exc.errno not in {errno.EACCES, errno.EAGAIN}:
+                    lock._fh.close()
+                    lock._fh = None
+                    raise
+                if time.monotonic() >= deadline_s:
+                    lock._fh.close()
+                    lock._fh = None
+                    return None
+                time.sleep(min(poll_s, max(0.0, deadline_s - time.monotonic())))
 
 
 def utc_now() -> str:
@@ -1653,6 +1692,11 @@ class TaskStore:
         self._ensure_docs_dir_for_write()
         with FileLock(self.store_lock_path):
             yield
+
+    def try_store_lock(self, *, deadline_s: float) -> FileLock | None:
+        """Reconciliation-only deadline-aware store lock acquisition."""
+        self._ensure_docs_dir_for_write()
+        return FileLock.try_acquire(self.store_lock_path, deadline_s=deadline_s)
 
     def _ensure_store_ready(self) -> None:
         """One-time, lock-safe migration of a legacy in-tree store to the durable

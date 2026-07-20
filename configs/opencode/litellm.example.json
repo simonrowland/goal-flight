@@ -1,0 +1,16 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": [
+    "opencode-plugin-litellm@latest"
+  ],
+  "provider": {
+    "litellm": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "LiteLLM",
+      "options": {
+        "baseURL": "{env:LITELLM_BASE_URL}",
+        "apiKey": "{env:LITELLM_API_KEY}"
+      }
+    }
+  }
+}
