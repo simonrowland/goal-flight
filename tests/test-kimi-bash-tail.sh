@@ -55,7 +55,7 @@ bash "$WATCHER" \
   --pid "$WORKER_PID" \
   --tail "$TAIL" \
   --controller-pid "$$" \
-  --agent kimi-bash-tail \
+  --agent kimi \
   --session-id kimi-bash-tail-smoke \
   --poll-secs 1 \
   --max-idle-secs 120 \

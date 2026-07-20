@@ -325,8 +325,13 @@
           "opencode-acp-worker"
         ],
         "install_mode": "init_self_check",
-        "commands": ["test -x ~/.claude/skills/gstack/browse/dist/browse"],
-        "paths": ["~/.claude/skills/gstack/browse/dist/browse", "~/.claude/skills/gstack/qa"]
+        "commands": ["test -x \"${GSTACK_BROWSE_BIN:-}\" || test -x ~/.claude/skills/gstack/browse/dist/browse || test -x ~/.gstack/repos/gstack/browse/dist/browse"],
+        "paths": [
+          "~/.claude/skills/gstack/browse/dist/browse",
+          "~/.gstack/repos/gstack/browse/dist/browse",
+          "~/.claude/skills/gstack/qa",
+          "~/.gstack/repos/gstack/qa"
+        ]
       },
       {
         "id": "autoreview",

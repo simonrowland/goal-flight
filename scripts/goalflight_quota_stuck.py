@@ -33,6 +33,7 @@ BASH_TAIL_WORKER_COMM_ALLOWLIST = frozenset(
         "cursor-agent",
         "gemini",
         "grok",
+        "kimi",
         "opencode",
     }
 )

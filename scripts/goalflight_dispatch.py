@@ -99,15 +99,17 @@ CODE_WRITER_MAX_IDLE_SECS = 600.0
 CODE_WRITER_AGENTS = {"codex", "codex-acp", "grok-code", "grok-acp", "kimi", "cursor", "cursor-agent"}
 
 # --os-sandbox: opt-in, per-dispatch OS sandbox profile for the bash-shape codex
-# worker. Unset -> "workspace-write" (the unchanged default — every existing
-# dispatch is unaffected). "off" runs codex with its macOS Seatbelt sandbox
+# worker. Unset -> "workspace-write" for existing workers; Kimi is the explicit
+# exception because its manifest supports only "off" until b-079 lands. "off"
+# runs codex with its macOS Seatbelt sandbox
 # DISABLED (codex --sandbox danger-full-access) so a TRUSTED LOCAL GPU/perf worker
 # can (a) reach Metal/MPS for GPU verification and (b) write the linked worktree's
 # .git/worktrees/<name> metadata to self-commit. "off" is a sanctioned adapter
 # profile (adapters/codex.json os_sandbox.supported_profiles), DISTINCT from the
 # always-forbidden --dangerously-*/--no-sandbox approval-and-sandbox bypass flags
 # (which the presets never emit and this never enables). "read-only" == --read-only.
-OS_SANDBOX_PROFILES = ("workspace-write", "read-only", "off")
+OS_SANDBOX_OFF = "off"
+OS_SANDBOX_PROFILES = ("workspace-write", "read-only", OS_SANDBOX_OFF)
 _CODEX_SANDBOX_VALUE = {
     "workspace-write": "workspace-write",
     "read-only": "read-only",
@@ -118,14 +120,18 @@ _CODEX_SANDBOX_VALUE = {
 def _effective_os_sandbox(args) -> str:
     """Resolve the effective OS sandbox profile (non-raising, safe anywhere).
 
-    Precedence: explicit --os-sandbox > legacy --read-only alias > default
-    "workspace-write". Conflicts are surfaced separately by
+    Precedence: explicit --os-sandbox > legacy --read-only alias > agent default
+    (Kimi "off", otherwise "workspace-write"). Conflicts are surfaced separately by
     _validate_os_sandbox_conflict.
     """
     explicit = getattr(args, "os_sandbox", None)
     if explicit in OS_SANDBOX_PROFILES:
         return explicit
-    return "read-only" if getattr(args, "read_only", False) else "workspace-write"
+    if getattr(args, "read_only", False):
+        return "read-only"
+    if str(getattr(args, "agent", "")) == "kimi":
+        return OS_SANDBOX_OFF
+    return "workspace-write"
 
 
 def _effective_read_only(args) -> bool:
@@ -138,6 +144,15 @@ def _validate_os_sandbox_conflict(args) -> None:
         raise DispatchUsageError(
             f"--read-only conflicts with --os-sandbox {explicit} "
             "(opposite write postures); pass only one."
+        )
+
+
+def _validate_agent_os_sandbox(args) -> None:
+    profile = _effective_os_sandbox(args)
+    if str(getattr(args, "agent", "")) == "kimi" and profile != OS_SANDBOX_OFF:
+        raise DispatchUsageError(
+            f"--agent kimi supports only --os-sandbox {OS_SANDBOX_OFF}; "
+            f"requested profile {profile!r} is not enforced (b-079)"
         )
 
 
@@ -166,6 +181,48 @@ def _os_sandbox_warning(args) -> str | None:
             f"shape={getattr(args, 'shape', '?')}."
         )
     return None
+
+
+# SECURITY-2 structural fix: the unsandboxed browser daemon is a *granted*
+# capability, not ambient. Default OFF — only --web-qa provisions the worker
+# with GOALFLIGHT_WEB_QA + BROWSE_STATE_FILE. Without that grant,
+# scripts/goalflight_webqa.sh fails closed, and a worker cannot self-grant by
+# guessing the project state-file path (wrapper requires both the grant marker
+# and an explicit BROWSE_STATE_FILE; dispatch strips ambient values when the
+# flag is absent).
+WEB_QA_GRANT_ENV = "GOALFLIGHT_WEB_QA"
+WEB_QA_STATE_ENV = "BROWSE_STATE_FILE"
+
+
+def _web_qa_env_plan(args, project_root: Path) -> tuple[dict[str, str], list[str]]:
+    """Return (env_updates, env_remove) for controller-gated web-QA.
+
+    Matches the --web-research-ok / --os-sandbox pattern: an explicit
+    dispatch-level flag is the only opt-in; default is off.
+    """
+    if getattr(args, "web_qa", False):
+        updates = {
+            WEB_QA_GRANT_ENV: "1",
+            WEB_QA_STATE_ENV: str(Path(project_root) / ".gstack" / "browse.json"),
+        }
+        browse = goalflight_compat.resolve_gstack_browse_bin()
+        if browse is not None:
+            updates["GSTACK_BROWSE_BIN"] = str(browse)
+        return updates, []
+    # Strip ambient grants inherited from a controller shell so a non-opt-in
+    # dispatch cannot silently inherit web-QA.
+    return {}, [WEB_QA_GRANT_ENV, WEB_QA_STATE_ENV]
+
+
+def _apply_web_qa_env(env: dict, args, project_root: Path) -> dict:
+    """Mutate worker env for --web-qa grant (or strip ambient when absent)."""
+    updates, remove = _web_qa_env_plan(args, project_root)
+    env.update(updates)
+    for key in remove:
+        env.pop(key, None)
+    return env
+
+
 ACCOUNT_ENGINE_BY_AGENT = {
     "codex": "codex",
     "codex-acp": "codex",
@@ -173,7 +230,7 @@ ACCOUNT_ENGINE_BY_AGENT = {
     "grok-code": "grok",
     "grok-research": "grok",
     "grok-acp": "grok",
-    "kimi": "kimi",
+    # Kimi is single-account by design; no rotation/profile knob is exposed.
     "cursor": "cursor",
     "cursor-agent": "cursor",
 }
@@ -1128,7 +1185,13 @@ def _status_reminder_lines(
             f"--status-json {status_path}"
         )
     else:
-        agent_label = f"{agent}-bash-tail" if agent else "worker-bash-tail"
+        # Kimi renderer normalization keys off the production preset label;
+        # synthetic -bash-tail aliases are not first-class dispatch agents.
+        agent_label = (
+            "kimi"
+            if agent == "kimi"
+            else (f"{agent}-bash-tail" if agent else "worker-bash-tail")
+        )
         watch_parts = [
             "bash",
             str(WATCH_TAIL_SH.resolve()),
@@ -1400,6 +1463,7 @@ def _validate_before_side_effects(args, raw_argv: list[str]) -> None:
     if args.prompt_file and not Path(args.prompt_file).expanduser().exists():
         raise DispatchUsageError(f"prompt file not found: {args.prompt_file}")
     _validate_os_sandbox_conflict(args)
+    _validate_agent_os_sandbox(args)
     _guard_read_only_write_prompt(args)
     _guard_grok_code_research_prompt(args)
 
@@ -2042,6 +2106,8 @@ def _canonical_replay_argv(args, raw_argv: list[str], *, tail: Path, status_json
         argv.append("--fast")
     if args.web_research_ok:
         argv.append("--web-research-ok")
+    if getattr(args, "web_qa", False):
+        argv.append("--web-qa")
     if args.ignore_git_warn:
         argv.append("--ignore-git-warn")
     if getattr(args, "no_orientation", False):
@@ -2132,6 +2198,40 @@ def _drain_on_submit(args, queue_path: Path) -> None:
             f"{payload.get('failed')} drain failure(s); queued request remains durable (recoverable on a later drain pass)",
             file=sys.stderr,
         )
+    _warn_if_stranded_without_drainer(queue_path)
+
+
+def _warn_if_stranded_without_drainer(queue_path: Path) -> None:
+    """Warn when THIS request is still queued and nothing will launch it.
+
+    Ordering is load-bearing: this runs AFTER the entry is lodged and after the
+    drain-on-submit pass. Checking earlier is useless — on an idle queue the
+    depth is 0, so a queue-depth guard suppresses exactly the warning that
+    matters. Evaluated here, `queue_path.exists()` is a precise "my entry is
+    still queued" signal: a successful drain claims the file (renames it), so a
+    surviving file means nothing launched it.
+
+    Field evidence (2026-07-20): the launchd drainer was absent, three dispatches
+    parked silently, and the pull-only status WARN never reached the controller —
+    who was standing right here with the context to fix it.
+    """
+    if not queue_path.exists():
+        return  # drain claimed it — nothing stranded
+    try:
+        import goalflight_status
+
+        if goalflight_status._drainer_live():
+            return  # a drainer exists; it will pick this up on its next pass
+    except Exception:
+        return  # never let an advisory check break a dispatch
+    print(
+        "goalflight_dispatch: WARNING — request is STILL QUEUED after the "
+        "drain-on-submit pass and no live drainer was detected, so nothing will "
+        "launch it. (A peer drainer may still claim it momentarily.) Remedy:\n"
+        "  python3 <skill-root>/scripts/goalflight_dispatch.py drain --json   # launch it now\n"
+        "  bash <skill-root>/scripts/install-drainer.sh                       # restore the standing drainer",
+        file=sys.stderr,
+    )
 
 
 def _queue_launch_token() -> str:
@@ -2218,6 +2318,7 @@ def _submit_dispatch(args, raw_argv: list[str], *, base: Path) -> int:
             "shape": args.shape,
             "read_only": bool(args.read_only),
             "os_sandbox": getattr(args, "os_sandbox", None),
+            "web_qa": bool(getattr(args, "web_qa", False)),
             "base_sha": submit_base_sha,
             "account": args.account,
             "billing": args.billing,
@@ -3684,6 +3785,7 @@ def _run_acp_detached_launcher(
     env.update(account_env)
     for key in env_remove:
         env.pop(key, None)
+    _apply_web_qa_env(env, args, _project_root(args))
     child_argv = [sys.executable, str(Path(__file__).resolve()), *_acp_detached_child_argv(args)]
     child_pid = _spawn_daemonized_process(
         child_argv,
@@ -3830,7 +3932,10 @@ def _run_acp_shape(args, *, base: Path, account_env: dict[str, str]) -> int:
         ),
         flush=True,
     )
-    with _temporary_env(account_env, remove=env_remove):
+    web_qa_updates, web_qa_remove = _web_qa_env_plan(args, _project_root(args))
+    acp_env = {**account_env, **web_qa_updates}
+    acp_remove = list(env_remove) + list(web_qa_remove)
+    with _temporary_env(acp_env, remove=acp_remove):
         payload = asyncio.run(run_acp_dispatch(cfg))
     worker_pid = payload.get("worker_pid")
     if worker_pid:
@@ -4012,9 +4117,10 @@ def build_worker(args, prompt_path, raw_argv: list[str]):
         script = ('bin="$(command -v kimi || printf %s "$HOME/.kimi-code/bin/kimi")"; '
                   'test -x "$bin" || { echo "kimi binary not found/executable: $bin" >&2; exit 127; }; '
                   'prompt=$1; shift; cd "$0" && exec "$bin" -p "$prompt" --output-format text "$@"')
+        resolved_cwd = os.path.abspath(args.cwd or ".")
         extra = (["--model", args.model] if getattr(args, "model", None) else []) \
-                + ["--add-dir", args.cwd or "."]
-        argv = ["/bin/sh", "-lc", script, args.cwd or ".", prompt_text, *extra]
+                + ["--add-dir", resolved_cwd]
+        argv = ["/bin/sh", "-lc", script, resolved_cwd, prompt_text, *extra]
         return argv, None
     return None, None  # unknown preset + no raw command
 
@@ -4076,6 +4182,18 @@ def main(argv: list[str] | None = None) -> int:
                         help="Override the grok-code research-intent guard: confirm this prompt is "
                              "a coding task that merely mentions the web (web research belongs on "
                              "--agent grok-research, whose model can actually drive web tools).")
+    parser.add_argument(
+        "--web-qa",
+        action="store_true",
+        default=False,
+        help=(
+            "Opt-in web-QA capability for this dispatch only (DEFAULT OFF). Provisions "
+            "GOALFLIGHT_WEB_QA=1 and BROWSE_STATE_FILE so scripts/goalflight_webqa.sh can "
+            "drive the gstack headless browser. Without this flag the wrapper fails closed "
+            "and workers do not receive the browser state-file path — browser access is a "
+            "controller-granted capability, not ambient (SECURITY-2)."
+        ),
+    )
     parser.add_argument("--ignore-git-warn", action="store_true",
                         help="Suppress advisory git-base-pin warnings for git-repo cwd prompts.")
     parser.add_argument("--no-orientation", action="store_true",
@@ -4384,6 +4502,7 @@ def main(argv: list[str] | None = None) -> int:
             env.pop("CURSOR_API_KEY", None)
         if args.billing == "sub" and _account_engine(args.agent) == "codex":
             env.pop("OPENAI_API_KEY", None)  # subscription billing for the selected account, not the API
+        _apply_web_qa_env(env, args, project_root)
 
         _mark_queue_claim_worker_spawn_intent(args)
         worker_pid = _spawn_daemonized_process(

@@ -97,6 +97,7 @@ def _replay_args(**over) -> argparse.Namespace:
         agent="codex", dispatch_id="codex-1-1", cwd=None, shape="bash", priority="critical",
         billing="sub", poll_secs=2.0, max_idle_secs=600.0, prompt_file=None, prompt="hi",
         task_ids=[], model=None, os_sandbox=None, read_only=False, web_research_ok=False,
+        web_qa=False,
         ignore_git_warn=False, no_orientation=False, capacity_wait_s=None, account=None,
         interactive=False, permission_mode=None, permission_dir=None,
         permission_inline_timeout_s=None, permission_user_timeout_s=None,

@@ -125,7 +125,9 @@ if [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then
   # Create a synthetic JSONL with a fake session ID that didn't exist at write time.
   FAKE_SID="ffff0000-test-test-test-${RANDOM}aaaa"
   # Find or create the project subdir matching our cwd shape
-  SUBDIR=$(ls -d "$PROJ_DIR"/* 2>/dev/null | head -1)
+  # Prefer find over ls: colored `ls` embeds ANSI escapes in SUBDIR and
+  # breaks the redirect below (pre-existing isolation flake under CLICOLOR).
+  SUBDIR=$(find "$PROJ_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -1)
   if [ -z "$SUBDIR" ]; then
     echo "test8 SKIP: no project dirs under ~/.claude/projects/"
   else
@@ -177,7 +179,9 @@ fi
 # Test 11: monitor exits 1 on FORK-BLOCKED.
 if [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then
   PROJ_DIR="$HOME/.claude/projects"
-  SUBDIR=$(ls -d "$PROJ_DIR"/* 2>/dev/null | head -1)
+  # Prefer find over ls: colored `ls` embeds ANSI escapes in SUBDIR and
+  # breaks the redirect below (pre-existing isolation flake under CLICOLOR).
+  SUBDIR=$(find "$PROJ_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -1)
   if [ -n "$SUBDIR" ]; then
     FAKE_BLOCKED_SID="bbbb1111-test-test-test-${RANDOM}cccc"
     FAKE_BLOCKED_JSONL="$SUBDIR/${FAKE_BLOCKED_SID}.jsonl"
@@ -205,7 +209,9 @@ fi
 # Test 12: monitor exits 2 on FORK-NEED (intervention required).
 if [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then
   PROJ_DIR="$HOME/.claude/projects"
-  SUBDIR=$(ls -d "$PROJ_DIR"/* 2>/dev/null | head -1)
+  # Prefer find over ls: colored `ls` embeds ANSI escapes in SUBDIR and
+  # breaks the redirect below (pre-existing isolation flake under CLICOLOR).
+  SUBDIR=$(find "$PROJ_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -1)
   if [ -n "$SUBDIR" ]; then
     FAKE_NEED_SID="cccc1111-test-test-test-${RANDOM}dddd"
     FAKE_NEED_JSONL="$SUBDIR/${FAKE_NEED_SID}.jsonl"

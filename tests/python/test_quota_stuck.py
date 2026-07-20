@@ -14,6 +14,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -250,6 +251,57 @@ def test_quota_reaper_default_deny_guards_and_release() -> None:
         assert_eq("lease released rate_limited", state["leases"]["lease-qkill"]["state"], "rate_limited")
         persisted = json.loads(ledger.record_path("qkill").read_text(encoding="utf-8"))
         assert_eq("ledger state rate_limited", persisted["state"], "rate_limited")
+
+
+def test_kimi_quota_reaper_and_surplus_discovery() -> None:
+    with tempfile.TemporaryDirectory() as td, temp_env(GOALFLIGHT_STATE_DIR=str(Path(td) / "state")):
+        tmp = Path(td)
+        record = quota_record(tmp, dispatch_id="kimi-quota", pid=42, state="running_quiet")
+        kimi_comm = "/Users/x/.kimi-code/bin/kimi"
+        record["agent"] = "kimi"
+        record["worker_identity"] = worker_identity(42, comm=kimi_comm)
+        write_tail(Path(record["stdout_path"]), "ERROR: reached account max rpm 60\n")
+        ledger.write_record(record)
+        cap.save_state(
+            {
+                "schema": cap.SCHEMA,
+                "machine_id": "test",
+                "leases": {
+                    "lease-kimi-quota": {
+                        "lease_id": "lease-kimi-quota",
+                        "dispatch_id": "kimi-quota",
+                        "agent": "kimi",
+                        "state": "active",
+                        "worker_pid": 42,
+                        "controller_pid": os.getpid(),
+                        "mem_mb": 1,
+                        "started_at": cap.iso(),
+                        "expires_at": cap.iso(cap.utc_now() + dt.timedelta(hours=1)),
+                    }
+                },
+                "cooldowns": {},
+            }
+        )
+        killed: list[int] = []
+        result = acp.reap_quota_stuck_workers(
+            process_rows=[process_row(42, comm=kimi_comm)],
+            records=[record],
+            ttl_s=180.0,
+            getpgid=lambda pid: pid,
+            terminate_group=lambda pgid: killed.append(pgid) or "SIGTERM",
+            now_ts=time.time(),
+            enabled=True,
+        )
+        assert_eq("kimi quota worker reaped", killed, [42])
+        assert_eq("kimi quota candidate recorded", result["reaped"][0]["dispatch_id"], "kimi-quota")
+
+        ps = (
+            "42 /Users/x/.kimi-code/bin/kimi /Users/x/.kimi-code/bin/kimi -p work\n"
+            "43 python python docs mention kimi\n"
+        )
+        with mock.patch.object(ledger.subprocess, "check_output", return_value=ps):
+            surplus = ledger.scan_surplus([])
+        assert_eq("only Kimi executable is surplus", [item["pid"] for item in surplus], [42])
 
 
 def test_quota_reaper_escalates_sigkill_when_sigterm_does_not_exit() -> None:
@@ -625,6 +677,7 @@ def main() -> None:
         test_capacity_hard_stops_provider_launches,
         test_status_banner_and_advisory_mail,
         test_quota_reaper_default_deny_guards_and_release,
+        test_kimi_quota_reaper_and_surplus_discovery,
         test_quota_reaper_escalates_sigkill_when_sigterm_does_not_exit,
         test_quota_reaper_partial_failure_not_counted_as_reaped,
         test_quota_reaper_refuses_dispatch_lease_when_worker_pid_mismatches,

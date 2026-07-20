@@ -339,18 +339,34 @@ def check_gstack() -> dict:
 
 
 def check_gstack_browser() -> dict:
-    browser = Path.home() / ".claude/skills/gstack/browse/dist/browse"
-    qa_skill = Path.home() / ".claude/skills/gstack/qa"
-    present = browser.is_file() and os.access(browser, os.X_OK)
+    # Cover Claude-host and canonical ~/.gstack installs (ADAPTER-4).
+    browser = goalflight_compat.resolve_gstack_browse_bin()
+    present = browser is not None
+    browser_path = (
+        str(browser)
+        if browser is not None
+        else str(Path.home() / ".claude/skills/gstack/browse/dist/browse")
+    )
+    # qa skill rides next to either install root.
+    qa_candidates = [
+        Path.home() / ".claude/skills/gstack/qa",
+        Path.home() / ".gstack/repos/gstack/qa",
+    ]
+    if browser is not None:
+        qa_candidates.insert(0, browser.parent.parent / "qa")
+    qa_skill = next((p for p in qa_candidates if p.is_dir()), qa_candidates[0])
     return {
         "present": present,
         "level": "info",
-        "path": str(browser),
+        "path": browser_path,
         "qa_skill": str(qa_skill),
         "detail": (
-            str(browser)
+            browser_path
             if present
-            else "build with: (cd ~/.claude/skills/gstack/browse && bun install && bun run build)"
+            else (
+                "build with: (cd ~/.claude/skills/gstack/browse && bun install && bun run build) "
+                "or (cd ~/.gstack/repos/gstack/browse && bun install && bun run build)"
+            )
         ),
     }
 

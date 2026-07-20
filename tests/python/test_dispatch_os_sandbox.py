@@ -89,6 +89,7 @@ def _replay(**kw):
                 priority="normal", billing="sub", poll_secs=2.0, max_idle_secs=600.0,
                 prompt_file="/tmp/p.md", prompt=None, task_ids=[], model=None,
                 read_only=False, os_sandbox=None, web_research_ok=False,
+                web_qa=False,
                 ignore_git_warn=False, capacity_wait_s=None, account=None,
                 interactive=False, permission_mode="auto", permission_dir=None,
                 permission_inline_timeout_s=None, permission_user_timeout_s=None,

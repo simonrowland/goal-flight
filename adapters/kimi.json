@@ -4,20 +4,20 @@
   "display_name": "Kimi Code CLI",
   "agent_family": "kimi",
   "providers": {
-    "controller_provider": "moonshot",
+    "controller_provider": "none",
     "model_provider": "moonshot",
     "same_provider_policy": "forbid_self_review"
   },
   "support": {
     "controller": {
-      "capability": "supported",
-      "evidence": ["live probe: Kimi Code CLI v0.27.0 supports noninteractive print mode", "live probe: bare -p writes files and emits completion markers"],
-      "readiness_requirements": ["binary", "version", "auth_optional", "safe_args", "status_contract"],
-      "fallback": "worker_only"
+      "capability": "unsupported",
+      "evidence": ["routing contract: Kimi is a print-mode worker, not a Goal Flight controller surface"],
+      "readiness_requirements": [],
+      "fallback": "unsupported"
     },
     "worker": {
       "capability": "supported",
-      "transport": ["cli_json", "tail_file"],
+      "transport": ["tail_file"],
       "readiness_requirements": ["binary", "version", "noninteractive", "status_contract", "safe_args"],
       "fallback": "tail_file"
     }
@@ -25,7 +25,7 @@
   "local_readiness_state": {
     "storage": "machine-local, never checked in",
     "path_pattern": "$XDG_STATE_HOME/goal-flight/readiness/<agent>.json",
-    "controller": "probe_required",
+    "controller": "unsupported",
     "worker": "probe_required",
     "last_probe_ids": ["kimi-path", "kimi-version", "kimi-help"],
     "updated_at": null
@@ -84,16 +84,10 @@
     "memory_writes": {"allowed": false, "backend": "repo_files"},
     "plugin_sandbox": {"mode": "none", "declared_permissions": []},
     "os_sandbox": {
-      "supported_profiles": ["off", "read-only", "workspace-write"],
+      "supported_profiles": ["off"],
       "default_profile": "off",
-      "implementation": "runner:sandbox-exec",
-      "platform_supported_profiles": {
-        "darwin": ["off", "read-only", "workspace-write"],
-        "linux": ["off"],
-        "wsl": ["off"],
-        "windows": ["off"]
-      },
-      "notes": "Dispatch-level worker subprocess wrapper; not a Kimi CLI flag. Permits temp and Kimi host-state writes while fencing project writes by profile."
+      "implementation": "unsupported",
+      "notes": "Kimi bash-tail dispatch does not yet enforce an OS sandbox; b-079 tracks the shared non-Codex enforcement gap."
     },
     "auto_approve_detection": {"probes": ["kimi-args-scan"], "strict_fail": true},
     "secrets": [],
@@ -118,20 +112,7 @@
     "validation": ["json parse", "schema required groups", "candidate gate stays deny"]
   },
   "setup": {
-    "controller_destinations": [
-      {
-        "id": "kimi-cli-controller",
-        "label": "Kimi Code CLI controller",
-        "role": "controller",
-        "surface": "cli",
-        "default": false,
-        "probe_ids": ["kimi-path", "kimi-version"],
-        "install_action_sources": [],
-        "commands": ["kimi -p <prompt> --output-format text"],
-        "paths": ["$(command -v kimi)", "~/.kimi-code/bin/kimi"],
-        "requires_restart": false
-      }
-    ],
+    "controller_destinations": [],
     "worker_destinations": [
       {
         "id": "kimi-cli-worker",
@@ -152,12 +133,16 @@
         "label": "gstack headless browser (web-QA)",
         "default": false,
         "compatible_destination_ids": [
-          "kimi-cli-controller",
           "kimi-cli-worker"
         ],
         "install_mode": "init_self_check",
-        "commands": ["test -x ~/.claude/skills/gstack/browse/dist/browse"],
-        "paths": ["~/.claude/skills/gstack/browse/dist/browse", "~/.claude/skills/gstack/qa"]
+        "commands": ["test -x \"${GSTACK_BROWSE_BIN:-}\" || test -x ~/.claude/skills/gstack/browse/dist/browse || test -x ~/.gstack/repos/gstack/browse/dist/browse"],
+        "paths": [
+          "~/.claude/skills/gstack/browse/dist/browse",
+          "~/.gstack/repos/gstack/browse/dist/browse",
+          "~/.claude/skills/gstack/qa",
+          "~/.gstack/repos/gstack/qa"
+        ]
       }
     ]
   },

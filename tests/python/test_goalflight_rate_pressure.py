@@ -320,28 +320,28 @@ def test_detect_moonshot_kimi_signatures():
         S(kimi_failed, {"error": "error, status code: 429, message: slow down please"}),
         A,
     )
-    # full documented envelope forms end-to-end (official error reference)
+    # Full documented envelope form end-to-end (official error reference).
     assert_eq(
         "moonshot envelope + engine prose",
         S(kimi_failed, {"error": "error, status code: 429, message: The engine is currently overloaded, please try again later"}),
         A,
     )
+    # These three carrier-specific cases replace quota/code strings already
+    # covered by the pre-existing "usage limit" / "rate_limit" substrings.
+    # Each depends on a new Moonshot signature and returns None on main.
     assert_eq(
-        "moonshot 5h rolling quota prose",
-        S(kimi_failed, {"error": "error, status code: 429, message: You've reached your usage limit for this period. Your quota will be refreshed in the next period."}),
+        "moonshot CLI class in ledger error",
+        S({"agent": "kimi", "state": "failed", "error": "APIProviderRateLimitError: request failed"}, None),
         A,
     )
     assert_eq(
-        "moonshot monthly quota prose",
-        S(kimi_failed, {"error": "error, status code: 429, message: You've reached kimi monthly usage limit for this billing cycle. Your quota will be refreshed in the next cycle."}),
+        "moonshot engine overload in result text",
+        S(kimi_failed, {"result_text": "The engine is currently overloaded, please try again later"}),
         A,
     )
-    # kimi-code headless print-mode error shape (VERIFIED v0.27.0:
-    # 'error: failed to run prompt: <code>: <message>') with the CLI's
-    # rate-limit error code — matches via existing "rate_limit" substring
     assert_eq(
-        "kimi headless provider.rate_limit code",
-        S(kimi_failed, {"error": "error: failed to run prompt: provider.rate_limit: engine busy"}),
+        "moonshot envelope in text excerpt",
+        S(kimi_failed, {"text_excerpt": "error, status code: 429, message: slow down please"}),
         A,
     )
 
@@ -371,6 +371,24 @@ def test_detect_moonshot_non_rate_limit_text_excluded():
         "bare 429 in a request id excluded",
         S(kimi_failed, {"error": "request id=4298817 failed with TypeError"}),
         None,
+    )
+    assert_eq(
+        "ordinary motor max-rpm prose excluded globally",
+        S(
+            {"agent": "codex", "state": "failed"},
+            {"error": "configure max rpm for the spindle motor to 24000"},
+        ),
+        None,
+    )
+    assert_eq(
+        "bare max-rpm signature excluded",
+        rp.rate_limit_signature_in_text("// max rpm setting"),
+        None,
+    )
+    assert_eq(
+        "anchored max-rpm signature retained",
+        rp.rate_limit_signature_in_text("reached account max rpm 60"),
+        "reached ... max rpm",
     )
     # and the same prose on a SUCCESSFUL dispatch is still ignored outright
     assert_eq(
@@ -610,6 +628,14 @@ def test_recommend_fallback_providers_populated():
     fallback = pup["fallback_providers"]
     assert_true("fallback list non-empty", len(fallback) > 0)
     assert_true("fallback contains codex", "codex" in fallback)
+
+
+def test_recommend_moonshot_fallback_providers_populated():
+    """One Kimi account means Moonshot pressure requires cross-provider rerouting."""
+    out = rp.recommend({"provider:moonshot": 3}, {"kimi": 6}, threshold=3)
+    pup = out["providers_under_pressure"][0]
+    assert_eq("moonshot kimi cap halved", pup["recommended_caps"], {"kimi": 3})
+    assert_eq("moonshot cross-provider fallback", pup["fallback_providers"], ["codex", "grok"])
 
 
 def test_limit_pool_pressure_aggregation(tmp_path: Path | None = None):

@@ -22,12 +22,27 @@ ensure_mac_worker_bins() {
 }
 
 report_gstack_browser_readiness() {
-  local browser="${HOME:-}/.claude/skills/gstack/browse/dist/browse"
-  if [[ -x "$browser" ]]; then
+  # Cover Claude-host and canonical ~/.gstack installs (ADAPTER-4).
+  local browser=""
+  local candidate
+  if [[ -n "${GSTACK_BROWSE_BIN:-}" && -x "${GSTACK_BROWSE_BIN}" ]]; then
+    browser="${GSTACK_BROWSE_BIN}"
+  else
+    for candidate in \
+      "${HOME:-}/.claude/skills/gstack/browse/dist/browse" \
+      "${HOME:-}/.gstack/repos/gstack/browse/dist/browse"
+    do
+      if [[ -x "$candidate" ]]; then
+        browser="$candidate"
+        break
+      fi
+    done
+  fi
+  if [[ -n "$browser" ]]; then
     printf 'NOTE gstack-browser: present (%s)\n' "$browser"
   else
     printf '%s\n' \
-      'NOTE gstack-browser: absent; optional web-QA addon. Build with: (cd ~/.claude/skills/gstack/browse && bun install && bun run build)'
+      'NOTE gstack-browser: absent; optional web-QA addon. Build with: (cd ~/.claude/skills/gstack/browse && bun install && bun run build) or (cd ~/.gstack/repos/gstack/browse && bun install && bun run build)'
   fi
 }
 

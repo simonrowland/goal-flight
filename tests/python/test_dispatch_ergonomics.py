@@ -301,6 +301,70 @@ def test_kimi_worker_argv() -> None:
         model_argv, _ = D.build_worker(args, prompt, [])
         check("kimi passes explicit model", model_argv[-4:] == ["--model", "kimi-code/k3-preview", "--add-dir", "/tmp/x"])
 
+        repo = Path(td) / "repo"
+        relative_cwd = repo / "tests"
+        relative_cwd.mkdir(parents=True)
+        original_cwd = Path.cwd()
+        os.chdir(repo)
+        try:
+            relative_args = _args(agent="kimi", cwd="tests")
+            resolved_relative_cwd = os.path.abspath("tests")
+            relative_argv, _ = D.build_worker(relative_args, prompt, [])
+        finally:
+            os.chdir(original_cwd)
+        check(
+            "kimi resolves relative cwd once for shell and add-dir",
+            relative_argv[3] == resolved_relative_cwd
+            and relative_argv[-2:] == ["--add-dir", resolved_relative_cwd],
+        )
+
+    check("kimi single-account design omits account engine", D._account_engine("kimi") is None)
+    try:
+        D._resolve_account_env(_args(agent="kimi", account="alternate"))
+    except D.DispatchUsageError as exc:
+        check(
+            "kimi named account is rejected before profile resolution",
+            "--account is not configured for --agent 'kimi'" in str(exc),
+        )
+    else:
+        check("kimi named account is rejected before profile resolution", False)
+
+    for sandbox_args in (
+        _args(agent="kimi", read_only=True, os_sandbox=None),
+        _args(agent="kimi", read_only=False, os_sandbox="workspace-write"),
+    ):
+        try:
+            D._validate_agent_os_sandbox(sandbox_args)
+        except D.DispatchUsageError as exc:
+            check(
+                f"kimi rejects unenforced sandbox {D._effective_os_sandbox(sandbox_args)}",
+                "supports only --os-sandbox off" in str(exc) and "b-079" in str(exc),
+            )
+        else:
+            check(f"kimi rejects unenforced sandbox {D._effective_os_sandbox(sandbox_args)}", False)
+    try:
+        D._validate_agent_os_sandbox(_args(agent="kimi", os_sandbox="off"))
+    except D.DispatchUsageError as exc:
+        check(f"kimi accepts explicit sandbox off ({exc})", False)
+    else:
+        check("kimi accepts explicit sandbox off", True)
+    check(
+        "kimi default sandbox posture records off",
+        D._effective_os_sandbox(_args(agent="kimi", os_sandbox=None)) == "off",
+    )
+    try:
+        D._validate_before_side_effects(
+            _args(agent="kimi", read_only=True, os_sandbox=None),
+            [],
+        )
+    except D.DispatchUsageError as exc:
+        check(
+            "kimi read-only dispatch is rejected before side effects",
+            "requested profile 'read-only' is not enforced" in str(exc),
+        )
+    else:
+        check("kimi read-only dispatch is rejected before side effects", False)
+
 
 def test_kimi_worker_dash_execution() -> None:
     injected = Path("/tmp/injected")

@@ -593,22 +593,29 @@ def _last_line_is_terminal_marker(
         if fence_line:
             in_fence = not in_fence
             if stripped:
-                last_nonempty = stripped
+                last_nonempty = line
                 last_nonempty_line = idx
                 last_in_fence = in_fence and not ignore_fences
             continue
         if in_fence and not ignore_fences:
             if stripped:
-                last_nonempty = stripped
+                last_nonempty = line
                 last_nonempty_line = idx
                 last_in_fence = True
             continue
         if stripped:
-            last_nonempty = stripped
+            # Preserve leading whitespace until the agent-specific check below.
+            # Stripping here lets indented examples false-complete live workers.
+            last_nonempty = line
             last_nonempty_line = idx
             last_in_fence = False
     if not last_nonempty or last_in_fence:
         return None
+    if last_nonempty.startswith((" ", "\t")):
+        kimi_continuation = last_nonempty.startswith("  ") and not last_nonempty.startswith("   ")
+        if not (kimi_output and kimi_continuation):
+            return None
+    last_nonempty = last_nonempty.strip()
     if kimi_output:
         last_nonempty = _strip_kimi_terminal_marker_prefix(last_nonempty)
     match = MARKER_RE.match(last_nonempty)
@@ -656,8 +663,14 @@ def _scan_final_terminal_marker(
             kimi_output=kimi_output,
         )
         if candidate:
+            prompt_candidate = stripped
+            if kimi_output:
+                # Compare Kimi's renderer-normalized marker to normalized prompt
+                # lines; otherwise a bullet-prefixed prompt echo evades poison
+                # suppression during worker-dead reconciliation.
+                prompt_candidate = _strip_kimi_terminal_marker_prefix(prompt_candidate)
             if _is_unfenced_prompt_quoted_bare_marker(
-                stripped,
+                prompt_candidate,
                 prompt_line_set=prompt_line_set,
                 echo_anchor_found=echo_anchor_found,
                 suppress_unfenced_prompt_markers=suppress_unfenced_prompt_markers,
