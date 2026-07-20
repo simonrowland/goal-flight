@@ -31,7 +31,10 @@ error fields for these patterns (case-insensitive substring match):
   - "rate_limit", "rate-limit", "rate limit"
   - HTTP-status-context "429"/"529" (not bare numbers in unrelated text)
   - "you've hit your limit", "usage limit"
-  - "anthropic.RateLimitError", "openai.RateLimitError"
+  - "anthropic.RateLimitError", "openai.RateLimitError",
+    "APIProviderRateLimitError" (kimi-code CLI class)
+  - moonshot/kimi: "the engine is currently overloaded", "max rpm",
+    envelope anchor "status code: 429"
   - "session_limit"
   - "blocked_session_limit"  (goal-flight's own classification)
   - "Selected model is at capacity" / "model is at capacity" (label-scoped)
@@ -154,6 +157,19 @@ RATE_LIMIT_PATTERNS: tuple[str, ...] = (
     # the monitor read pressure=none. Add the actual prose + HTTP reason-phrase form.
     "usage balance exhausted",       # xAI Grok Build balance gone (prose; unambiguous)
     "payment required",              # HTTP 402 reason-phrase (space form) as emitted by the grok CLI proxy
+    # Moonshot/Kimi additions (2026-07-20 kimi-worker dogfood). `kimi` maps to
+    # provider "moonshot" in AGENT_TO_PROVIDER but had ZERO signatures, so a
+    # rate-limited kimi worker went undetected. Sources: the installed
+    # kimi-code v0.27.0 binary (~/.kimi-code/bin/kimi) and the official error
+    # reference (https://www.kimi.com/code/docs/en/kimi-code/error-reference.html).
+    # NOTE what is deliberately NOT added: "provider.rate_limit" (kimi-code's
+    # error code) and "rate_limit_exceeded" already match via the "rate_limit"
+    # substring above; the documented 429 prose "We're receiving too many
+    # requests" and every "You've reached ... usage limit ..." variant already
+    # match via "too many requests" / "usage limit".
+    "apiproviderratelimiterror",     # kimi-code CLI error class (VERIFIED in v0.27.0 binary: APIProviderRateLimitError extends APIStatusError, this.name = "APIProviderRateLimitError"); appears in error dumps like the anthropic/openai dotted forms above
+    "the engine is currently overloaded",  # moonshot 429 inference-overload prose (VERIFIED official error reference: 'error, status code: 429, message: The engine is currently overloaded, please try again later')
+    "max rpm",                       # moonshot RPM-cap prose family "reached ... max rpm" — kimi-code's own matcher regex /reached .*max rpm/ (VERIFIED in v0.27.0 binary PROVIDER_RATE_LIMIT_MESSAGE_PATTERNS); exact server text UNVERIFIED, substring is distinctive
 )
 
 # HTTP status codes require provider-error context — bare "429"/"529" in line
@@ -168,6 +184,11 @@ RATE_LIMIT_HTTP_STATUS_ANCHORS: dict[str, tuple[str, ...]] = {
         "error 429",
         '"code": 429',
         '"code":429',
+        # Moonshot/Kimi error envelope (VERIFIED official error reference +
+        # kimi-code v0.27.0 headless error shape): errors render as
+        # 'error, status code: 429, message: <prose>'. "status code: 429" is
+        # NOT caught by "status: 429" above ("code" sits between).
+        "status code: 429",
     ),
     "529": (
         "http 529",

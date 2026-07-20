@@ -117,6 +117,50 @@
     "mcp": {"required": false, "servers": []},
     "validation": ["json parse", "schema required groups", "candidate gate stays deny"]
   },
+  "setup": {
+    "controller_destinations": [
+      {
+        "id": "kimi-cli-controller",
+        "label": "Kimi Code CLI controller",
+        "role": "controller",
+        "surface": "cli",
+        "default": false,
+        "probe_ids": ["kimi-path", "kimi-version"],
+        "install_action_sources": [],
+        "commands": ["kimi -p <prompt> --output-format text"],
+        "paths": ["$(command -v kimi)", "~/.kimi-code/bin/kimi"],
+        "requires_restart": false
+      }
+    ],
+    "worker_destinations": [
+      {
+        "id": "kimi-cli-worker",
+        "label": "Kimi Code CLI worker",
+        "role": "worker",
+        "surface": "cli",
+        "default": false,
+        "probe_ids": ["kimi-path", "kimi-version", "kimi-help"],
+        "install_action_sources": [],
+        "commands": ["kimi -p <prompt> --output-format text"],
+        "paths": ["$(command -v kimi)", "~/.kimi-code/bin/kimi"],
+        "requires_restart": false
+      }
+    ],
+    "addons": [
+      {
+        "id": "gstack-browser",
+        "label": "gstack headless browser (web-QA)",
+        "default": false,
+        "compatible_destination_ids": [
+          "kimi-cli-controller",
+          "kimi-cli-worker"
+        ],
+        "install_mode": "init_self_check",
+        "commands": ["test -x ~/.claude/skills/gstack/browse/dist/browse"],
+        "paths": ["~/.claude/skills/gstack/browse/dist/browse", "~/.claude/skills/gstack/qa"]
+      }
+    ]
+  },
   "discovery": {
     "budget": {"max_path_probes": 4, "max_version_probes": 1, "max_help_probes": 1, "max_ms_per_probe": 6000, "max_total_ms_per_agent": 20000, "max_total_ms_all_agents": 90000, "max_stdout_bytes_per_probe": 4096, "max_stderr_bytes_per_probe": 4096, "network_default": "deny", "model_consuming": "forbidden"},
     "probes": [

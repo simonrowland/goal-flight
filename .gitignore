@@ -56,3 +56,4 @@ docs-private/
 # covers a symlink at this path (the installed skill symlinks scripts/ext here).
 scripts/ext
 tests/python/ext
+.gstack/

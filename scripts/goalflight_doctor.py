@@ -338,6 +338,23 @@ def check_gstack() -> dict:
     }
 
 
+def check_gstack_browser() -> dict:
+    browser = Path.home() / ".claude/skills/gstack/browse/dist/browse"
+    qa_skill = Path.home() / ".claude/skills/gstack/qa"
+    present = browser.is_file() and os.access(browser, os.X_OK)
+    return {
+        "present": present,
+        "level": "info",
+        "path": str(browser),
+        "qa_skill": str(qa_skill),
+        "detail": (
+            str(browser)
+            if present
+            else "build with: (cd ~/.claude/skills/gstack/browse && bun install && bun run build)"
+        ),
+    }
+
+
 def check_autoreview(skill_root: Path) -> dict:
     script_path = skill_root / "scripts/autoreview.sh"
     helper_env = goalflight_compat.allowed_env_override(
@@ -2877,6 +2894,7 @@ def doctor(
         "cursor_context_mode": check_cursor_context_mode(skill_root, repo),
         "opencode_context_mode": check_opencode_context_mode(skill_root, repo),
         "gstack": check_gstack(),
+        "gstack_browser": check_gstack_browser(),
         "agent_traits": check_agent_traits(),
         "autoreview": check_autoreview(skill_root),
         "agents_md_state": check_agents_md_state(repo),
@@ -3090,6 +3108,11 @@ def print_human(payload: dict) -> None:
             False if payload["gstack"].get("level") == "warning" else payload["gstack"].get("present"),
             "gstack",
             payload["gstack"].get("detail") or payload["gstack"].get("version"),
+        ),
+        status_line(
+            None,
+            f"gstack-browser: {'present' if payload['gstack_browser'].get('present') else 'absent'}",
+            payload["gstack_browser"].get("detail"),
         ),
         status_line(
             (payload.get("agent_traits") or {}).get("ok"),

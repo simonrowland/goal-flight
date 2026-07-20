@@ -21,6 +21,16 @@ ensure_mac_worker_bins() {
   fi
 }
 
+report_gstack_browser_readiness() {
+  local browser="${HOME:-}/.claude/skills/gstack/browse/dist/browse"
+  if [[ -x "$browser" ]]; then
+    printf 'NOTE gstack-browser: present (%s)\n' "$browser"
+  else
+    printf '%s\n' \
+      'NOTE gstack-browser: absent; optional web-QA addon. Build with: (cd ~/.claude/skills/gstack/browse && bun install && bun run build)'
+  fi
+}
+
 detect_host_from_args() {
   local sub="${1:-}"
   case "$sub" in
@@ -130,6 +140,7 @@ run_setup_and_traits() {
   "$SETUP" "${setup_args[@]}"
   local rc=$?
   maybe_offer_agent_traits || true
+  report_gstack_browser_readiness || true
   return "$rc"
 }
 
@@ -176,6 +187,7 @@ if [[ $# -ge 1 ]]; then
       bash "${REPO_ROOT}/scripts/hosts/fleet/install_claude_acp.sh" "$@"
       rc=$?
       maybe_offer_agent_traits || true
+      report_gstack_browser_readiness || true
       exit "$rc"
       ;;
     worker-path)

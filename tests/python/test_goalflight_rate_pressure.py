@@ -284,6 +284,129 @@ def test_detect_try_again_at_pattern():
     assert_true("try again at pattern", rp.detect_rate_limit_signature(record, status))
 
 
+# ----- moonshot/kimi signatures (2026-07-20 kimi-worker dogfood) -----
+
+def test_detect_moonshot_kimi_signatures():
+    """Each new moonshot/kimi signature classifies a failed kimi worker as
+    account rate-limit pressure. Sources per signature noted inline."""
+    S = rp.detect_pressure_scope
+    A = rp.ACCOUNT_RATE_LIMIT_SCOPE
+    kimi_failed = {"agent": "kimi", "state": "failed"}
+    # kimi-code CLI error class dump (VERIFIED: v0.27.0 binary,
+    # APIProviderRateLimitError extends APIStatusError)
+    assert_eq(
+        "kimi CLI error class name",
+        S(kimi_failed, {"error": "APIProviderRateLimitError: request failed"}),
+        A,
+    )
+    # moonshot 429 engine-overload prose alone (VERIFIED: official error
+    # reference) — no envelope here, so the prose pattern itself must match
+    assert_eq(
+        "moonshot engine-overload prose",
+        S(kimi_failed, {"error": "The engine is currently overloaded, please try again later"}),
+        A,
+    )
+    # moonshot RPM-cap prose (source: kimi-code's own matcher regex
+    # /reached .*max rpm/ in the v0.27.0 binary; exact server text UNVERIFIED)
+    assert_eq(
+        "moonshot max-rpm prose",
+        S(kimi_failed, {"error": "reached account max rpm 60"}),
+        A,
+    )
+    # moonshot error envelope status anchor with prose NO other pattern
+    # catches — proves the "status code: 429" anchor independently
+    assert_eq(
+        "moonshot envelope status anchor",
+        S(kimi_failed, {"error": "error, status code: 429, message: slow down please"}),
+        A,
+    )
+    # full documented envelope forms end-to-end (official error reference)
+    assert_eq(
+        "moonshot envelope + engine prose",
+        S(kimi_failed, {"error": "error, status code: 429, message: The engine is currently overloaded, please try again later"}),
+        A,
+    )
+    assert_eq(
+        "moonshot 5h rolling quota prose",
+        S(kimi_failed, {"error": "error, status code: 429, message: You've reached your usage limit for this period. Your quota will be refreshed in the next period."}),
+        A,
+    )
+    assert_eq(
+        "moonshot monthly quota prose",
+        S(kimi_failed, {"error": "error, status code: 429, message: You've reached kimi monthly usage limit for this billing cycle. Your quota will be refreshed in the next cycle."}),
+        A,
+    )
+    # kimi-code headless print-mode error shape (VERIFIED v0.27.0:
+    # 'error: failed to run prompt: <code>: <message>') with the CLI's
+    # rate-limit error code — matches via existing "rate_limit" substring
+    assert_eq(
+        "kimi headless provider.rate_limit code",
+        S(kimi_failed, {"error": "error: failed to run prompt: provider.rate_limit: engine busy"}),
+        A,
+    )
+
+
+def test_detect_moonshot_non_rate_limit_text_excluded():
+    """Precision guard: ordinary prose containing 'limit', moonshot's 400
+    request-format 'exceeds limit' error, and bare 429 in ids must NOT
+    classify as rate-limit pressure."""
+    S = rp.detect_pressure_scope
+    kimi_failed = {"agent": "kimi", "state": "failed"}
+    assert_eq(
+        "ordinary prose with 'limit'",
+        S(kimi_failed, {"error": "the limit of this buffer is 4096 bytes"}),
+        None,
+    )
+    assert_eq(
+        "moonshot 400 size-format error excluded",
+        S(kimi_failed, {"error": "error, status code: 400, message: total message size 5943865 exceeds limit 2097152"}),
+        None,
+    )
+    assert_eq(
+        "moonshot 400 token-limit error excluded",
+        S(kimi_failed, {"error": "Invalid request: Your request exceeded model token limit: 262144 (requested: 558009)"}),
+        None,
+    )
+    assert_eq(
+        "bare 429 in a request id excluded",
+        S(kimi_failed, {"error": "request id=4298817 failed with TypeError"}),
+        None,
+    )
+    # and the same prose on a SUCCESSFUL dispatch is still ignored outright
+    assert_eq(
+        "complete state ignores quota echo",
+        S({"agent": "kimi", "state": "complete"}, {"result_text": "docs discuss the engine is currently overloaded banner"}),
+        None,
+    )
+
+
+def test_pressure_kimi_worker_maps_to_moonshot():
+    """A kimi worker failing with moonshot rate-limit prose counts once under
+    provider:moonshot (AGENT_TO_PROVIDER wiring, end to end)."""
+    now = time.time()
+    recent_iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now - 60))
+    records = [
+        {
+            "dispatch_id": "k1",
+            "agent": "kimi",
+            "state": "failed",
+            "updated_at": recent_iso,
+            "status_path": None,
+            "error": "error, status code: 429, message: The engine is currently overloaded, please try again later",
+        },
+        {
+            "dispatch_id": "k2",
+            "agent": "kimi",
+            "state": "failed",
+            "updated_at": recent_iso,
+            "status_path": None,
+            "error": "column limit reached in local CSV parser",  # NOT a rate signal
+        },
+    ]
+    counts = rp.pressure_per_provider(records, window_seconds=600, now_ts=now)
+    assert_eq("kimi rate-limit record → moonshot", counts.get("provider:moonshot"), 1)
+
+
 # ----- pressure_per_provider() -----
 
 def _build_record(agent, state, updated_at, dispatch_id="d"):
