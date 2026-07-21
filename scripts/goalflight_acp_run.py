@@ -780,13 +780,6 @@ def _acp_model_args(agent: str, args: list[str], model: str) -> list[str]:
     return ["--model", model, *args]
 
 
-def _acp_fast_tier_args(agent: str, args: list[str]) -> list[str]:
-    """Insert the OpenAI priority service tier into codex ACP flags."""
-    if agent.strip().lower() in ("codex", "codex-acp"):
-        return ["-c", "service_tier=priority", *args]
-    return args
-
-
 def _uses_session_model(agent: str) -> bool:
     return agent.strip().lower() in {"claude", "claude-acp"}
 
@@ -810,7 +803,6 @@ def _grok_acp_base_command() -> tuple[str, list[str]]:
 def agent_command(
     agent: str,
     model: str | None = None,
-    fast: bool = False,
 ) -> tuple[str, list[str]]:
     agent_key = str(agent).strip().lower()
     manifest_command = _manifest_acp_command(agent)
@@ -826,14 +818,6 @@ def agent_command(
         model = _DEFAULT_STRONG_MODEL.get(agent_key)
     if model:
         args = _acp_model_args(agent, args, str(model))
-    if fast:
-        fast_args = _acp_fast_tier_args(agent, args)
-        if fast_args != args:
-            print(
-                "FAST: codex-acp service_tier=priority — premium processing (~1.5x token spend)",
-                file=sys.stderr,
-            )
-        args = fast_args
     return binary, args
 
 
@@ -1509,7 +1493,6 @@ async def _run_acp_dispatch_impl(
     command, acp_args = agent_command(
         cfg.agent,
         model=getattr(cfg, "model", None),
-        fast=getattr(cfg, "fast", False),
     )
     acp_args = _codex_workspace_write_acp_args(
         cfg.agent, acp_args, cwd=worker_cwd, os_sandbox=os_sandbox_profile
@@ -2378,7 +2361,6 @@ async def _run_acp_dispatch_impl(
             command, acp_args = agent_command(
                 cfg.agent,
                 model=getattr(cfg, "model", None),
-                fast=getattr(cfg, "fast", False),
             )
             acp_args = _codex_workspace_write_acp_args(
                 cfg.agent, acp_args, cwd=worker_cwd, os_sandbox=os_sandbox_profile
