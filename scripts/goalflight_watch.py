@@ -79,6 +79,8 @@ BARE_TERMINAL_MARKER_RE = re.compile(
     r"(?:DONE|COMPLETE|FINISHED)\s*:?\s*[.!?]?)$",
     re.IGNORECASE,
 )
+HARNESS_HOOK_TRAILER_LINES = frozenset({"hook: Stop", "hook: Stop Completed"})
+HARNESS_TOKEN_COUNT_RE = re.compile(r"^\d{1,3}(?:,\d{3})*$|^\d+$")
 HUNK_HEADER_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@")
 PROMPT_ECHO_ANCHOR_SEARCH_LINES = 200
 PROMPT_ECHO_MAX_ANCHORS = 10
@@ -221,13 +223,13 @@ def _is_fence_line(raw_line: str) -> bool:
 
 
 def _strip_terminal_marker_prefix(stripped: str) -> str:
-    for prefix in ("+ ", "- ", "> "):
-        if stripped.startswith(prefix):
-            return stripped[len(prefix):].lstrip()
-    if stripped.startswith(("+", "-")):
-        return stripped[1:].lstrip()
-    if stripped.startswith("**"):
+    if stripped.startswith("> "):
         return stripped[2:].lstrip()
+    if stripped.startswith(("+", "-")):
+        # Strip exactly one diff marker and at most its one separator space.
+        # Keeping any further indentation makes the anchored marker regex fail.
+        remainder = stripped[1:]
+        return remainder[1:] if remainder.startswith(" ") else remainder
     return stripped
 
 
@@ -253,6 +255,7 @@ def _final_terminal_marker_from_line(
     line_no: int,
     *,
     allow_prefixed_marker: bool = False,
+    allow_status_prefix: bool = False,
     kimi_output: bool = False,
 ) -> dict | None:
     kimi_continuation = raw_line.startswith("  ") and not raw_line.startswith("   ")
@@ -274,6 +277,9 @@ def _final_terminal_marker_from_line(
             stripped = _strip_kimi_terminal_marker_prefix(stripped)
         if not stripped:
             return None
+    direct_match = MARKER_RE.match(stripped)
+    if not allow_status_prefix and direct_match and direct_match.group(1) == "STATUS":
+        return None
     signoff = _completion_signoff_marker(stripped, line_no)
     if signoff:
         return signoff
@@ -575,9 +581,7 @@ def _last_line_is_terminal_marker(
     start = max(0, size - 10 * 1024 * 1024)
     prompt_prefix = ignore_prefix_lines or []
     in_fence = False
-    last_nonempty = ""
-    last_nonempty_line = -1
-    last_in_fence = False
+    candidates: list[tuple[int, str, bool]] = []
     with path.open("rb") as f:
         f.seek(start)
         text = f.read().decode(errors="replace")
@@ -593,37 +597,62 @@ def _last_line_is_terminal_marker(
         if fence_line:
             in_fence = not in_fence
             if stripped:
-                last_nonempty = line
-                last_nonempty_line = idx
-                last_in_fence = in_fence and not ignore_fences
+                candidates.append((idx, line, in_fence and not ignore_fences))
             continue
         if in_fence and not ignore_fences:
             if stripped:
-                last_nonempty = line
-                last_nonempty_line = idx
-                last_in_fence = True
+                candidates.append((idx, line, True))
             continue
         if stripped:
             # Preserve leading whitespace until the agent-specific check below.
             # Stripping here lets indented examples false-complete live workers.
-            last_nonempty = line
-            last_nonempty_line = idx
-            last_in_fence = False
-    if not last_nonempty or last_in_fence:
+            candidates.append((idx, line, False))
+    if not candidates:
         return None
-    if last_nonempty.startswith((" ", "\t")):
-        kimi_continuation = last_nonempty.startswith("  ") and not last_nonempty.startswith("   ")
-        if not (kimi_output and kimi_continuation):
+
+    candidate_idx = len(candidates) - 1
+    trailing = candidates[candidate_idx][1].strip()
+    if HARNESS_TOKEN_COUNT_RE.fullmatch(trailing):
+        if candidate_idx == 0 or candidates[candidate_idx - 1][1].strip() != "tokens used":
             return None
-    last_nonempty = last_nonempty.strip()
-    if kimi_output:
-        last_nonempty = _strip_kimi_terminal_marker_prefix(last_nonempty)
-    match = MARKER_RE.match(last_nonempty)
-    if match and match.group(1) in TERMINAL_MARKERS:
-        return {"line": last_nonempty_line, "kind": match.group(1), "text": match.group(2)[:1000]}
-    signoff = _completion_signoff_marker(last_nonempty, last_nonempty_line)
-    if signoff:
-        return signoff
+        candidate_idx -= 2
+    elif trailing == "tokens used":
+        candidate_idx -= 1
+    while (
+        candidate_idx >= 0
+        and candidates[candidate_idx][1].strip() in HARNESS_HOOK_TRAILER_LINES
+    ):
+        candidate_idx -= 1
+    if candidate_idx < 0:
+        return None
+
+    line_no, candidate_line, candidate_in_fence = candidates[candidate_idx]
+    if candidate_in_fence:
+        return None
+    return _final_terminal_marker_from_line(
+        candidate_line,
+        line_no,
+        allow_prefixed_marker=True,
+        kimi_output=kimi_output,
+    )
+
+
+def _recorded_terminal_success_marker(payload: dict) -> dict | None:
+    """Return a schema-valid success marker already recorded by the watcher."""
+    terminal_marker = payload.get("terminal_marker")
+    if isinstance(terminal_marker, dict):
+        candidates = (terminal_marker,)
+    else:
+        candidates = (payload.get("last_marker"),)
+    for marker in candidates:
+        if not isinstance(marker, dict) or marker.get("kind") not in SUCCESS_TERMINAL_MARKERS:
+            continue
+        try:
+            line_no = int(marker.get("line") or 0)
+        except (TypeError, ValueError):
+            continue
+        if line_no > 0:
+            return marker
     return None
 
 
@@ -660,6 +689,7 @@ def _scan_final_terminal_marker(
             line,
             idx,
             allow_prefixed_marker=True,
+            allow_status_prefix=True,
             kimi_output=kimi_output,
         )
         if candidate:
@@ -1107,6 +1137,16 @@ def main() -> int:
                 ignore_prefix_lines=ignore_prefix_lines,
                 kimi_output=args.agent == "kimi",
             )
+            if not reconciled:
+                recorded = _recorded_terminal_success_marker(payload)
+                if (
+                    recorded
+                    and terminal
+                    and recorded.get("line") == terminal.get("line")
+                ):
+                    # A generic last_marker can be a mid-tail prompt quote. It
+                    # only wins after the same final-line scan validates it.
+                    reconciled = recorded
             if reconciled:
                 terminal_seen = reconciled
                 payload["terminal_marker"] = terminal_seen
