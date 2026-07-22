@@ -6330,7 +6330,6 @@ def _build_acp_cfg(args, *, status_json: Path, base: Path | None = None):
     cfg = argparse.Namespace(
         agent=args.agent,
         model=getattr(args, "model", None),
-        fast=bool(getattr(args, "fast", False)),
         install_slot=None,
         cwd=str(project_root),
         worktree="off",
@@ -6760,33 +6759,11 @@ def _acp_context_mode_default(args) -> str:
     return "enabled"
 
 
-# --fast premium-tier paths: codex bash-shape uses this map; codex-acp injects the
-# same OpenAI `priority` service tier in goalflight_acp_run.py. Both get faster
-# processing at premium cost (~1.5x spend). Other engines/shapes still get the
-# queue-skip that --fast applies (critical priority) but no tier change. Extend this
-# map (and add the one-line `argv += _fast_tier_argv(args)` call in that engine's
-# build_worker branch) as other bash-shape worker CLIs expose a priority-tier flag.
-FAST_TIER_ARGV: dict[str, list[str]] = {
-    "codex": ["-c", "service_tier=priority"],
-}
-
-
-def _fast_tier_argv(args) -> list[str]:
-    """Per-engine fast-tier argv to inject when --fast is set (empty otherwise or
-    when the agent has no registered fast tier)."""
-    if not getattr(args, "fast", False):
-        return []
-    return list(FAST_TIER_ARGV.get(args.agent, []))
-
-
 def _apply_fast_mode(args) -> None:
-    """Normalize --fast after arg parsing: it forces the urgent lane (critical
-    priority -> skip the queue) for EVERY engine/shape. The premium tier is injected
-    AND announced only at each argv injection site: build_worker for codex bash-shape,
-    and agent_command in goalflight_acp_run.py for codex-acp. Other engines/shapes get
-    queue-skip only. Keeping the announcement at the injection site prevents a false
-    premium claim. Idempotent: runs again on the detached/queue replay; the priority
-    note here prints only on the user's initial invocation to avoid tail noise."""
+    """Normalize --fast after arg parsing: force the urgent lane (critical
+    priority -> skip the queue) for every engine/shape. Idempotent: runs again on
+    detached/queue replay; the note prints only on the user's initial invocation
+    to avoid tail noise."""
     if not getattr(args, "fast", False):
         return
     if getattr(args, "priority", None) != "critical":
@@ -6794,9 +6771,7 @@ def _apply_fast_mode(args) -> None:
     if not (getattr(args, "from_queue", False)
             or getattr(args, "launch_detached", False)
             or getattr(args, "acp_detached_child", False)):
-        print("FAST: urgent — forcing --priority critical to skip the queue "
-              "(premium processing tier, where supported, is announced at worker launch)",
-              file=sys.stderr)
+        print("FAST: urgent — forcing --priority critical to skip the queue", file=sys.stderr)
 
 
 def build_worker(args, prompt_path, raw_argv: list[str]):
@@ -6817,13 +6792,6 @@ def build_worker(args, prompt_path, raw_argv: list[str]):
             # Disable context-mode at the worker boundary (see _codex_context_mode_enabled);
             # leaves the user's ~/.codex/config.toml untouched for interactive use.
             argv += ["-c", "mcp_servers.context-mode.enabled=false"]
-        fast_tier = _fast_tier_argv(args)  # --fast -> -c service_tier=priority (premium/faster)
-        if fast_tier:
-            # Announce the premium HERE (the injection site) so the ~1.5x claim only
-            # ever prints when the tier is genuinely added to this codex argv.
-            print(f"FAST: codex {fast_tier[-1]} — premium processing (~1.5x token spend)",
-                  file=sys.stderr)
-        argv += fast_tier
         if model:
             argv += ["--model", str(model)]
         if args.cwd:
@@ -6937,13 +6905,10 @@ def main(argv: list[str] | None = None) -> int:
                              "machine+pool slots for others); critical = fix dispatches (may borrow "
                              "beyond the operating cap, never past the RAM ceiling). Default normal.")
     parser.add_argument("--fast", action="store_true",
-                        help="Urgent + premium: forces --priority critical (skip the queue) AND, for "
-                             "engines that support it (codex bash-shape and codex-acp: OpenAI "
-                             "service_tier=priority, ~1.5x token spend for faster processing), injects "
-                             "the fast processing tier. Other engines/shapes get the queue-skip only. See "
-                             "FAST_TIER_ARGV. NOTE: --priority critical may borrow beyond the operating "
-                             "cap, so --fast is for a SINGLE urgent dispatch — do NOT use it across a wide "
-                             "fan-out (every worker would borrow past the cap and starve normal/bulk work).")
+                        help="Urgent: forces --priority critical (skip the queue) for a SINGLE urgent "
+                             "dispatch. NOTE: critical may borrow beyond the operating cap (never past "
+                             "the RAM ceiling) — do NOT use across a wide fan-out, or every worker "
+                             "borrows past the cap and starves normal/bulk work.")
     parser.add_argument("--web-research-ok", action="store_true",
                         help="Override the grok-code research-intent guard: confirm this prompt is "
                              "a coding task that merely mentions the web (web research belongs on "
@@ -7047,7 +7012,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"goalflight_dispatch: {e}", file=sys.stderr)
         return 64
     args._original_argv = list(argv)
-    _apply_fast_mode(args)  # --fast -> critical priority (skip queue) + per-engine premium tier
+    _apply_fast_mode(args)  # --fast -> critical priority (skip queue)
     if args.stats is not None:
         try:
             payload = goalflight_ledger.stats_payload(args.stats)

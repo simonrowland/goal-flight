@@ -58,7 +58,29 @@ case "$command_name" in
   html|accessibility|snapshot)
     echo "$command_name output"
     ;;
-  console|network|wait|closetab)
+  console)
+    # Mirror the real CLI shape: page-derived output is banner-wrapped, and an
+    # empty result is a parenthesised sentinel whose wording tracks --errors.
+    # A fake that printed nothing here is what let a sentinel-counted-as-signal
+    # bug reach a live run.
+    echo "--- BEGIN UNTRUSTED EXTERNAL CONTENT (source: $(cat "$FAKE_BROWSE_URL_FILE")) ---"
+    if [ -n "${FAKE_BROWSE_CONSOLE_BODY:-}" ]; then
+      printf '%b\n' "$FAKE_BROWSE_CONSOLE_BODY"
+    elif [ "${2:-}" = "--errors" ]; then
+      echo "(no console errors)"
+    else
+      echo "(no console messages)"
+    fi
+    echo "--- END UNTRUSTED EXTERNAL CONTENT ---"
+    ;;
+  network)
+    if [ -n "${FAKE_BROWSE_NETWORK_BODY:-}" ]; then
+      printf '%b\n' "$FAKE_BROWSE_NETWORK_BODY"
+    else
+      echo "GET $(cat "$FAKE_BROWSE_URL_FILE") → 200 (1ms, 100B)"
+    fi
+    ;;
+  wait|closetab)
     ;;
   screenshot)
     printf 'fake png' > "$2"
@@ -216,5 +238,67 @@ clean_status=$?
 summary_count="$(grep -c '^WEBQA ' "$CLEAN_OUTPUT")"
 [ "$summary_count" -eq 1 ] || fail "WEBQA summary line count=$summary_count"
 assert_contains "$CLEAN_OUTPUT" "console_errors=0 network_suspect=0 artifacts=$CLEAN_ARTIFACTS"
+
+# Real console errors must still be counted. The sentinel/banner exclusions must
+# suppress tool chrome only -- not blind the counter to actual page output.
+: > "$FAKE_LOG"
+ERRORS_OUTPUT="$TMP_ROOT/errors.out"
+# Body uses the REAL entry shape "[iso] [level] text" (verified live against the
+# browse CLI). The previous fake used bare strings, which is how a chrome-vs-signal
+# bug reached production once already.
+run_webqa "https://example.test" "$TMP_ROOT/errors-artifacts" "$ERRORS_OUTPUT" \
+  'FAKE_BROWSE_CONSOLE_BODY=[2026-07-20T22:18:32.882Z] [error] Uncaught TypeError: x is not a function\n[2026-07-20T22:18:33.001Z] [error] Error: boom'
+errors_status=$?
+[ "$errors_status" -eq 0 ] || fail "console-errors capture exit=$errors_status"
+assert_contains "$ERRORS_OUTPUT" "console_errors=2"
+
+# The banner carries the caller-supplied URL. A page whose path contains "error"
+# must not inflate the count -- the banner is tool chrome, not page output.
+: > "$FAKE_LOG"
+BANNER_OUTPUT="$TMP_ROOT/banner.out"
+run_webqa "https://example.test/error-page" "$TMP_ROOT/banner-artifacts" "$BANNER_OUTPUT"
+banner_status=$?
+[ "$banner_status" -eq 0 ] || fail "banner-url capture exit=$banner_status"
+assert_contains "$BANNER_OUTPUT" "console_errors=0"
+
+# Adversarial: a page that logs the sentinel string alongside real errors must
+# NOT hide them. Both lines count (over-count by one) because the sentinel is
+# only honoured when it stands alone.
+: > "$FAKE_LOG"
+SPOOF_OUTPUT="$TMP_ROOT/spoof.out"
+run_webqa "https://example.test" "$TMP_ROOT/spoof-artifacts" "$SPOOF_OUTPUT" \
+  'FAKE_BROWSE_CONSOLE_BODY=(no console errors)\nUncaught TypeError: real failure'
+spoof_status=$?
+[ "$spoof_status" -eq 0 ] || fail "sentinel-spoof capture exit=$spoof_status"
+assert_contains "$SPOOF_OUTPUT" "console_errors=2"
+
+# Network failures are still detected after the chrome-stripping change.
+: > "$FAKE_LOG"
+NETFAIL_OUTPUT="$TMP_ROOT/netfail.out"
+run_webqa "https://example.test" "$TMP_ROOT/netfail-artifacts" "$NETFAIL_OUTPUT" \
+  'FAKE_BROWSE_NETWORK_BODY=GET https://example.test/a → 200 (1ms, 10B)\nGET https://example.test/b → 500 (2ms, 0B)'
+netfail_status=$?
+[ "$netfail_status" -eq 0 ] || fail "network-failure capture exit=$netfail_status"
+assert_contains "$NETFAIL_OUTPUT" "network_suspect=1"
+
+# The browser has a SECOND banner dialect (scoped, non-root tokens). Stripping only
+# the root "--- … ---" form left this one counting its own sentinel as an error.
+: > "$FAKE_LOG"
+SCOPED_OUTPUT="$TMP_ROOT/scoped.out"
+run_webqa "https://example.test" "$TMP_ROOT/scoped-artifacts" "$SCOPED_OUTPUT" \
+  'FAKE_BROWSE_CONSOLE_BODY=═══ BEGIN UNTRUSTED WEB CONTENT ═══\n(no console errors)\n═══ END UNTRUSTED WEB CONTENT ═══'
+scoped_status=$?
+[ "$scoped_status" -eq 0 ] || fail "scoped-envelope capture exit=$scoped_status"
+assert_contains "$SCOPED_OUTPUT" "console_errors=0"
+
+# Real page output that merely OPENS with "(no " is signal, not an empty-state
+# sentinel. The sentinel shape is exactly three words; anything longer counts.
+: > "$FAKE_LOG"
+NOTSENTINEL_OUTPUT="$TMP_ROOT/not-sentinel.out"
+run_webqa "https://example.test" "$TMP_ROOT/not-sentinel-artifacts" "$NOTSENTINEL_OUTPUT" \
+  'FAKE_BROWSE_CONSOLE_BODY=(no stack available for this error)'
+not_sentinel_status=$?
+[ "$not_sentinel_status" -eq 0 ] || fail "non-sentinel capture exit=$not_sentinel_status"
+assert_contains "$NOTSENTINEL_OUTPUT" "console_errors=1"
 
 echo "OK: goalflight web-QA wrapper tests pass"

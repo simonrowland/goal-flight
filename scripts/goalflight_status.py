@@ -32,7 +32,12 @@ import goalflight_ledger
 import goalflight_quota_stuck
 from goalflight_liveness import cpu_confirmed_idle
 import goalflight_milestone
-from goalflight_watch import BLOCKING_TERMINAL_MARKERS, SUCCESS_TERMINAL_MARKERS, _final_terminal_marker
+from goalflight_watch import (
+    BLOCKING_TERMINAL_MARKERS,
+    SUCCESS_TERMINAL_MARKERS,
+    _final_terminal_marker,
+    _last_line_is_terminal_marker,
+)
 
 # Each aggregated record carries a precomputed ``classification`` from
 # goalflight_ledger.classify(): the terminal STATE string when terminal, else one
@@ -1250,6 +1255,37 @@ def _wait_progress_detail(
     }
 
 
+def _wait_output_is_active(progress: dict, *, poll_s: float) -> bool:
+    """Mirror the watcher's output-is-truth veto for identity-based death."""
+    tail_grew = bool(
+        isinstance(progress.get("tail_growth_bytes"), int)
+        and progress.get("tail_growth_bytes") > 0
+    )
+    tail_changed = bool(progress.get("tail_changed"))
+    append_age = progress.get("tail_append_age_s")
+    active_growth_window = max(poll_s * 2.0, 0.2)
+    tail_fresh = bool(
+        isinstance(append_age, (int, float))
+        and append_age < active_growth_window
+    )
+    return tail_grew or tail_changed or tail_fresh
+
+
+def _wait_terminal_success_marker(record: dict | None) -> dict | None:
+    """Rescan a dead, quiet worker tail before resolving it as worker_dead."""
+    tail = _tail_path_from_record(record or {})
+    if tail is None:
+        return None
+    marker = _last_line_is_terminal_marker(
+        tail,
+        ignore_prefix_lines=_ignore_prefix_lines((record or {}).get("prompt_path")),
+        kimi_output=(record or {}).get("agent") == "kimi",
+    )
+    if marker and marker.get("kind") in SUCCESS_TERMINAL_MARKERS:
+        return marker
+    return None
+
+
 def _fmt_wait_bytes(value: int | None) -> str:
     if value is None:
         return "+?B"
@@ -1304,6 +1340,7 @@ def _wait_snapshot(
     grace: float = _WAIT_CRASH_GRACE_S,
     stale_grace: float = _WAIT_STALE_GRACE_S,
     cpu_epsilon: float = _WAIT_CPU_EPSILON,
+    poll_s: float = 2.0,
 ) -> list[dict]:
     if dead_since is None:
         dead_since = {}
@@ -1342,6 +1379,28 @@ def _wait_snapshot(
                 worker_alive=worker_alive,
             )
         )
+        terminal_marker = None
+        output_active = bool(
+            code == 2
+            and confirmed_dead
+            and _wait_output_is_active(progress, poll_s=poll_s)
+        )
+        if output_active:
+            # A launcher exec can preserve pid/lstart while changing comm, so
+            # identity alone can call a live worker dead. Match the watcher's
+            # class-level veto: actively growing/fresh output is stronger live
+            # evidence for this poll, while a quiet tail still resolves dead.
+            confirmed_dead = False
+            worker_alive = True
+            progress["worker_alive"] = True
+            progress["worker_alive_via_output"] = True
+            state = "running"
+        elif code == 2 and confirmed_dead:
+            terminal_marker = _wait_terminal_success_marker(record)
+            if terminal_marker:
+                code = 0
+                terminal = True
+                state = "complete"
         if terminal or code == 1:
             dead_since.pop(dispatch_id, None)
         elif code == 2 and confirmed_dead:
@@ -1375,16 +1434,17 @@ def _wait_snapshot(
                 if now - first >= stale_grace:
                     terminal = True
                     state = "worker_stalled"
-        rows.append(
-            {
-                "dispatch_id": dispatch_id,
-                "done_code": code,
-                "terminal": terminal,
-                "state": state,
-                "status_path": None if record is None else record.get("status_path"),
-                "progress": progress,
-            }
-        )
+        row = {
+            "dispatch_id": dispatch_id,
+            "done_code": code,
+            "terminal": terminal,
+            "state": state,
+            "status_path": None if record is None else record.get("status_path"),
+            "progress": progress,
+        }
+        if terminal_marker:
+            row["terminal_marker"] = terminal_marker
+        rows.append(row)
     return rows
 
 
@@ -1444,6 +1504,7 @@ def wait_for_dispatches(
                 now=now,
                 grace=grace,
                 stale_grace=stale_grace,
+                poll_s=poll_s,
             )
             if not json_output:
                 for row in rows:

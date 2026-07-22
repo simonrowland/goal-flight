@@ -280,12 +280,108 @@ def test_terminal_marker_poison_pairs() -> None:
     assert_eq("ACP extract FAILED", extract_markers("FAILED: missing final artifact\n")["FAILED"], ["missing final artifact"])
 
 
+def test_diff_prefixed_terminal_markers() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        diff_complete_tail = base / "diff-complete.txt"
+        diff_complete_tail.write_text("+COMPLETE: diff report written\n", encoding="utf-8")
+        diff_ready_tail = base / "diff-ready.txt"
+        diff_ready_tail.write_text("+ READY: docs-private/research/findings.md\n", encoding="utf-8")
+
+        diff_complete = goalflight_watch._last_line_is_terminal_marker(diff_complete_tail)
+        diff_ready = goalflight_watch._last_line_is_terminal_marker(diff_ready_tail)
+
+    assert_eq("diff-prefixed COMPLETE terminal", diff_complete["kind"], "COMPLETE")
+    assert_eq("diff-prefixed READY terminal", diff_ready["kind"], "READY")
+
+
+def test_marker_before_known_harness_trailer() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tail = Path(td) / "harness-trailer.txt"
+        tail.write_text(
+            "COMPLETE: worker finished\n"
+            "hook: Stop\n"
+            "hook: Stop Completed\n"
+            "tokens used\n"
+            "123,456\n",
+            encoding="utf-8",
+        )
+        marker = goalflight_watch._last_line_is_terminal_marker(tail)
+
+    assert_eq("marker before harness trailer terminal", marker["kind"], "COMPLETE")
+
+
+def test_recorded_terminal_success_marker() -> None:
+    recorded_complete = {"kind": "COMPLETE", "line": 1823, "text": "review complete"}
+    assert_eq(
+        "recorded terminal success is honored",
+        goalflight_watch._recorded_terminal_success_marker({"last_marker": recorded_complete}),
+        recorded_complete,
+    )
+    assert_true(
+        "recorded blocking marker is not promoted to success",
+        goalflight_watch._recorded_terminal_success_marker(
+            {"last_marker": {"kind": "FAILED", "line": 4, "text": "broken"}}
+        )
+        is None,
+    )
+    assert_true(
+        "recorded blocking terminal marker overrides earlier success",
+        goalflight_watch._recorded_terminal_success_marker(
+            {
+                "terminal_marker": {"kind": "FAILED", "line": 5, "text": "broken"},
+                "last_marker": recorded_complete,
+            }
+        )
+        is None,
+    )
+    assert_true(
+        "recorded success without a source line is not trusted",
+        goalflight_watch._recorded_terminal_success_marker(
+            {"last_marker": {"kind": "COMPLETE", "text": "unlocated"}}
+        )
+        is None,
+    )
+
+
+def test_false_death_marker_poison_pairs() -> None:
+    cases = {
+        "unknown trailer": "COMPLETE: not final\narbitrary trailing content\n",
+        "marker-like prose": "the task is now complete.\n",
+        "done prose": "the task is now done.\n",
+        "ready prose": "the task is now ready.\n",
+        "verdict prose": "the final verdict appears below.\n",
+        "diff prose mentioning marker": "+ this note explains the COMPLETE: contract\n",
+        "finished prose": "the task is now finished.\n",
+        "printed shell command": 'echo "COMPLETE: done"\n',
+        "fenced marker example": "here is an example:\n```\nCOMPLETE: x\n```\nsee above\n",
+        "deep indentation": "      COMPLETE: x\n",
+        "diff prefix plus deep indentation": "+      COMPLETE: x\n",
+        "double diff prefix": "++COMPLETE: x\n",
+        "scoped-out VERDICT vocabulary": "VERDICT: REVISE\n",
+        "scoped-out PARTIAL vocabulary": "PARTIAL\n",
+    }
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        for name, text in cases.items():
+            tail = base / f"{name.replace(' ', '-')}.txt"
+            tail.write_text(text, encoding="utf-8")
+            assert_true(
+                f"{name} remains non-terminal",
+                goalflight_watch._last_line_is_terminal_marker(tail) is None,
+            )
+
+
 def main() -> None:
     test_terminal_state_poison_pairs()
     test_terminal_state_shared_sets_cover_lease_pruning()
     test_terminal_state_for_preserves_specific_failures()
     test_fleet_reconcile_pre_status_uses_shared_failure_states()
     test_terminal_marker_poison_pairs()
+    test_diff_prefixed_terminal_markers()
+    test_marker_before_known_harness_trailer()
+    test_recorded_terminal_success_marker()
+    test_false_death_marker_poison_pairs()
     print("OK: terminal vocabulary poison-pair tests pass")
 
 

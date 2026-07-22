@@ -11,6 +11,7 @@ stays `complete`, not `worker_dead`).
 from __future__ import annotations
 
 import io
+import os
 import sys
 import tempfile
 import time
@@ -117,6 +118,137 @@ def test_live_but_ambiguous_worker_is_not_killed() -> None:
         assert_true("dead_since not armed for live worker", "live" not in dead_since)
     finally:
         compat.pid_alive = saved  # type: ignore[assignment]
+
+
+def test_identity_mismatch_with_growing_tail_vetoes_worker_dead() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        tail = Path(tmp) / "worker.tail"
+        tail.write_text("started\n", encoding="utf-8")
+        rec = {
+            "dispatch_id": "identity-mismatch-growing",
+            "classification": "unknown",
+            "worker_pid": 4242,
+            "worker_identity": {
+                "pid": 4242,
+                "lstart": "Tue Jul 21 12:00:00 2026",
+                "comm": "sh",
+            },
+            "tail_path": str(tail),
+        }
+        payload = _payload(rec)
+        saved_identity_matches = status.goalflight_ledger.identity_matches
+        saved_cpu = status._wait_process_cpu_pct
+        status.goalflight_ledger.identity_matches = (  # type: ignore[assignment]
+            lambda record: (False, "pid_reused_comm")
+        )
+        status._wait_process_cpu_pct = lambda record: 0.0  # type: ignore[assignment]
+        try:
+            initial_size = tail.stat().st_size
+            tail.write_text("started\nstill working\n", encoding="utf-8")
+            dead_since: dict[str, float] = {}
+            row = _row(
+                payload,
+                rec["dispatch_id"],
+                now=10.0,
+                grace=0.0,
+                dead_since=dead_since,
+                progress_state={
+                    rec["dispatch_id"]: {
+                        "tail_size": initial_size,
+                        "last_growth_mono": 0.0,
+                    }
+                },
+            )
+            assert_eq("growing mismatch stays non-terminal", row["terminal"], False)
+            assert_eq("growing mismatch reports running", row["state"], "running")
+            assert_eq("growing mismatch reports alive via output", row["progress"]["worker_alive"], True)
+            assert_true("growing mismatch does not arm death", rec["dispatch_id"] not in dead_since)
+        finally:
+            status.goalflight_ledger.identity_matches = saved_identity_matches  # type: ignore[assignment]
+            status._wait_process_cpu_pct = saved_cpu  # type: ignore[assignment]
+
+
+def test_identity_mismatch_with_quiet_tail_still_resolves_worker_dead() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        tail = Path(tmp) / "worker.tail"
+        tail.write_text("stopped\n", encoding="utf-8")
+        os.utime(tail, (time.time() - 100.0, time.time() - 100.0))
+        rec = {
+            "dispatch_id": "identity-mismatch-quiet",
+            "classification": "unknown",
+            "worker_pid": 4242,
+            "worker_identity": {
+                "pid": 4242,
+                "lstart": "Tue Jul 21 12:00:00 2026",
+                "comm": "sh",
+            },
+            "tail_path": str(tail),
+        }
+        payload = _payload(rec)
+        saved_identity_matches = status.goalflight_ledger.identity_matches
+        saved_cpu = status._wait_process_cpu_pct
+        status.goalflight_ledger.identity_matches = (  # type: ignore[assignment]
+            lambda record: (False, "pid_reused_comm")
+        )
+        status._wait_process_cpu_pct = lambda record: 0.0  # type: ignore[assignment]
+        try:
+            row = _row(
+                payload,
+                rec["dispatch_id"],
+                now=100.0,
+                grace=0.0,
+                dead_since={},
+                progress_state={
+                    rec["dispatch_id"]: {
+                        "tail_size": tail.stat().st_size,
+                        "last_growth_mono": 0.0,
+                    }
+                },
+            )
+            assert_eq("quiet mismatch is terminal", row["terminal"], True)
+            assert_eq("quiet mismatch stays worker_dead", row["state"], "worker_dead")
+        finally:
+            status.goalflight_ledger.identity_matches = saved_identity_matches  # type: ignore[assignment]
+            status._wait_process_cpu_pct = saved_cpu  # type: ignore[assignment]
+
+
+def test_dead_quiet_worker_with_success_marker_completes() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        tail = Path(tmp) / "worker.tail"
+        tail.write_text("DONE.\n", encoding="utf-8")
+        os.utime(tail, (time.time() - 100.0, time.time() - 100.0))
+        rec = {
+            "dispatch_id": "dead-quiet-complete",
+            "classification": "unknown",
+            "worker_pid": 4242,
+            "tail_path": str(tail),
+        }
+        payload = _payload(rec)
+        saved_alive = compat.pid_alive
+        saved_cpu = status._wait_process_cpu_pct
+        compat.pid_alive = lambda pid: False  # type: ignore[assignment]
+        status._wait_process_cpu_pct = lambda record: 0.0  # type: ignore[assignment]
+        try:
+            row = _row(
+                payload,
+                rec["dispatch_id"],
+                now=100.0,
+                grace=0.0,
+                dead_since={},
+                progress_state={
+                    rec["dispatch_id"]: {
+                        "tail_size": tail.stat().st_size,
+                        "last_growth_mono": 0.0,
+                    }
+                },
+            )
+            assert_eq("dead marker is terminal", row["terminal"], True)
+            assert_eq("dead marker completes", row["state"], "complete")
+            assert_eq("dead marker done code", row["done_code"], 0)
+            assert_eq("dead marker surfaced", row["terminal_marker"]["kind"], "COMPLETE")
+        finally:
+            compat.pid_alive = saved_alive  # type: ignore[assignment]
+            status._wait_process_cpu_pct = saved_cpu  # type: ignore[assignment]
 
 
 def test_wedged_alive_worker_resolves_worker_stalled_after_stale_grace() -> None:
@@ -381,6 +513,9 @@ def main() -> None:
         test_crashed_worker_resolves_worker_dead_after_grace_not_before,
         test_stale_dead_with_dead_pid_resolves_worker_dead,
         test_live_but_ambiguous_worker_is_not_killed,
+        test_identity_mismatch_with_growing_tail_vetoes_worker_dead,
+        test_identity_mismatch_with_quiet_tail_still_resolves_worker_dead,
+        test_dead_quiet_worker_with_success_marker_completes,
         test_wedged_alive_worker_resolves_worker_stalled_after_stale_grace,
         test_growing_tail_worker_never_resolves_worker_stalled,
         test_busy_cpu_worker_never_resolves_worker_stalled,
