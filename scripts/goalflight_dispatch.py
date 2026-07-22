@@ -97,8 +97,8 @@ PRELAUNCH_CANDIDATE_STATES = frozenset(
 )
 QUEUE_PRIORITY_RANK = {lane: rank for rank, lane in enumerate(goalflight_capacity.PRIORITY_LANES)}
 QUEUE_DEFAULT_PRIORITY = "normal"
-PRESET_AGENTS = {"codex", "grok-code", "grok-research"}
-STDIN_PROMPT_AGENTS = {"codex", "grok-code", "grok-research"}
+PRESET_AGENTS = {"codex", "grok-code", "grok-research", "kimi"}
+STDIN_PROMPT_AGENTS = {"codex", "grok-code", "grok-research", "kimi"}
 DEFAULT_MAX_IDLE_SECS = 180.0
 _DASHBOARD_REFRESH_SUBCOMMAND = "dashboard-refresh"
 _DASHBOARD_REFRESH_MARKER = "goalflight-dashboard-refresh-v1"
@@ -106,7 +106,7 @@ _DASHBOARD_REFRESH_QUEUED_GRACE_S = 60 * 60
 _DASHBOARD_REFRESH_MAX_LIFETIME_S = 4 * 60 * 60
 _DASHBOARD_REFRESH_CLAIM_STALE_S = 30.0
 CODE_WRITER_MAX_IDLE_SECS = 600.0
-CODE_WRITER_AGENTS = {"codex", "codex-acp", "grok-code", "grok-acp", "cursor", "cursor-agent"}
+CODE_WRITER_AGENTS = {"codex", "codex-acp", "grok-code", "grok-acp", "kimi", "cursor", "cursor-agent"}
 
 
 class PreAdmitClass(Enum):
@@ -224,15 +224,17 @@ class _ReconcileTransaction:
             self.tail_gate = None
 
 # --os-sandbox: opt-in, per-dispatch OS sandbox profile for the bash-shape codex
-# worker. Unset -> "workspace-write" (the unchanged default — every existing
-# dispatch is unaffected). "off" runs codex with its macOS Seatbelt sandbox
+# worker. Unset -> "workspace-write" for existing workers; Kimi is the explicit
+# exception because its manifest supports only "off" until b-079 lands. "off"
+# runs codex with its macOS Seatbelt sandbox
 # DISABLED (codex --sandbox danger-full-access) so a TRUSTED LOCAL GPU/perf worker
 # can (a) reach Metal/MPS for GPU verification and (b) write the linked worktree's
 # .git/worktrees/<name> metadata to self-commit. "off" is a sanctioned adapter
 # profile (adapters/codex.json os_sandbox.supported_profiles), DISTINCT from the
 # always-forbidden --dangerously-*/--no-sandbox approval-and-sandbox bypass flags
 # (which the presets never emit and this never enables). "read-only" == --read-only.
-OS_SANDBOX_PROFILES = ("workspace-write", "read-only", "off")
+OS_SANDBOX_OFF = "off"
+OS_SANDBOX_PROFILES = ("workspace-write", "read-only", OS_SANDBOX_OFF)
 _CODEX_SANDBOX_VALUE = {
     "workspace-write": "workspace-write",
     "read-only": "read-only",
@@ -243,14 +245,18 @@ _CODEX_SANDBOX_VALUE = {
 def _effective_os_sandbox(args) -> str:
     """Resolve the effective OS sandbox profile (non-raising, safe anywhere).
 
-    Precedence: explicit --os-sandbox > legacy --read-only alias > default
-    "workspace-write". Conflicts are surfaced separately by
+    Precedence: explicit --os-sandbox > legacy --read-only alias > agent default
+    (Kimi "off", otherwise "workspace-write"). Conflicts are surfaced separately by
     _validate_os_sandbox_conflict.
     """
     explicit = getattr(args, "os_sandbox", None)
     if explicit in OS_SANDBOX_PROFILES:
         return explicit
-    return "read-only" if getattr(args, "read_only", False) else "workspace-write"
+    if getattr(args, "read_only", False):
+        return "read-only"
+    if str(getattr(args, "agent", "")) == "kimi":
+        return OS_SANDBOX_OFF
+    return "workspace-write"
 
 
 def _effective_read_only(args) -> bool:
@@ -263,6 +269,15 @@ def _validate_os_sandbox_conflict(args) -> None:
         raise DispatchUsageError(
             f"--read-only conflicts with --os-sandbox {explicit} "
             "(opposite write postures); pass only one."
+        )
+
+
+def _validate_agent_os_sandbox(args) -> None:
+    profile = _effective_os_sandbox(args)
+    if str(getattr(args, "agent", "")) == "kimi" and profile != OS_SANDBOX_OFF:
+        raise DispatchUsageError(
+            f"--agent kimi supports only --os-sandbox {OS_SANDBOX_OFF}; "
+            f"requested profile {profile!r} is not enforced (b-079)"
         )
 
 
@@ -291,6 +306,48 @@ def _os_sandbox_warning(args) -> str | None:
             f"shape={getattr(args, 'shape', '?')}."
         )
     return None
+
+
+# SECURITY-2 structural fix: the unsandboxed browser daemon is a *granted*
+# capability, not ambient. Default OFF — only --web-qa provisions the worker
+# with GOALFLIGHT_WEB_QA + BROWSE_STATE_FILE. Without that grant,
+# scripts/goalflight_webqa.sh fails closed, and a worker cannot self-grant by
+# guessing the project state-file path (wrapper requires both the grant marker
+# and an explicit BROWSE_STATE_FILE; dispatch strips ambient values when the
+# flag is absent).
+WEB_QA_GRANT_ENV = "GOALFLIGHT_WEB_QA"
+WEB_QA_STATE_ENV = "BROWSE_STATE_FILE"
+
+
+def _web_qa_env_plan(args, project_root: Path) -> tuple[dict[str, str], list[str]]:
+    """Return (env_updates, env_remove) for controller-gated web-QA.
+
+    Matches the --web-research-ok / --os-sandbox pattern: an explicit
+    dispatch-level flag is the only opt-in; default is off.
+    """
+    if getattr(args, "web_qa", False):
+        updates = {
+            WEB_QA_GRANT_ENV: "1",
+            WEB_QA_STATE_ENV: str(Path(project_root) / ".gstack" / "browse.json"),
+        }
+        browse = goalflight_compat.resolve_gstack_browse_bin()
+        if browse is not None:
+            updates["GSTACK_BROWSE_BIN"] = str(browse)
+        return updates, []
+    # Strip ambient grants inherited from a controller shell so a non-opt-in
+    # dispatch cannot silently inherit web-QA.
+    return {}, [WEB_QA_GRANT_ENV, WEB_QA_STATE_ENV]
+
+
+def _apply_web_qa_env(env: dict, args, project_root: Path) -> dict:
+    """Mutate worker env for --web-qa grant (or strip ambient when absent)."""
+    updates, remove = _web_qa_env_plan(args, project_root)
+    env.update(updates)
+    for key in remove:
+        env.pop(key, None)
+    return env
+
+
 ACCOUNT_ENGINE_BY_AGENT = {
     "codex": "codex",
     "codex-acp": "codex",
@@ -298,6 +355,7 @@ ACCOUNT_ENGINE_BY_AGENT = {
     "grok-code": "grok",
     "grok-research": "grok",
     "grok-acp": "grok",
+    # Kimi is single-account by design; no rotation/profile knob is exposed.
     "cursor": "cursor",
     "cursor-agent": "cursor",
 }
@@ -401,8 +459,8 @@ PROMPT_FILE_PREAMBLE = (
 )
 PROJECT_ORIENTATION_RELATIVE = Path("docs-private") / "rag" / "ORIENTATION.md"
 PROJECT_ORIENTATION_SCOPE_RULE = "Read it before starting; orientation only, never scope expansion."
-GROK_EXECUTION_PREAMBLE = (
-    "Grok worker execution contract:\n"
+WORKER_EXECUTION_PREAMBLE = (
+    "Worker execution contract:\n"
     "- Use your available tools to actually perform the requested filesystem, shell, "
     "research, or analysis actions before answering. Do not only plan, summarize, or "
     "describe commands.\n"
@@ -649,12 +707,14 @@ def _repair_watcher_terminal_status(
     terminal_marker = _last_line_is_terminal_marker(
         tail,
         ignore_prefix_lines=ignore_prefix_lines,
+        kimi_output=getattr(args, "agent", None) == "kimi",
     )
     if not terminal_marker and not worker_is_alive:
         terminal_marker = _final_terminal_marker(
             tail,
             ignore_prefix_lines=ignore_prefix_lines,
             suppress_unfenced_prompt_markers=True,
+            kimi_output=getattr(args, "agent", None) == "kimi",
         )
     if not terminal_marker:
         terminal_marker = payload.get("terminal_marker")
@@ -1552,7 +1612,13 @@ def _status_reminder_lines(
             f"--status-json {status_path}"
         )
     else:
-        agent_label = f"{agent}-bash-tail" if agent else "worker-bash-tail"
+        # Kimi renderer normalization keys off the production preset label;
+        # synthetic -bash-tail aliases are not first-class dispatch agents.
+        agent_label = (
+            "kimi"
+            if agent == "kimi"
+            else (f"{agent}-bash-tail" if agent else "worker-bash-tail")
+        )
         watch_parts = [
             "bash",
             str(WATCH_TAIL_SH.resolve()),
@@ -1814,7 +1880,7 @@ def _validate_before_side_effects(args, raw_argv: list[str]) -> None:
     if args.agent not in PRESET_AGENTS:
         raise DispatchUsageError(
             "no worker preset for --agent "
-            f"{args.agent!r} — use --agent codex|grok-code|grok-research with "
+            f"{args.agent!r} — use --agent codex|grok-code|grok-research|kimi with "
             "--prompt/--prompt-file, or pass a raw worker after `-- <cmd...>`"
         )
     if args.agent in STDIN_PROMPT_AGENTS and not _prompt_requested(args):
@@ -1824,6 +1890,7 @@ def _validate_before_side_effects(args, raw_argv: list[str]) -> None:
     if args.prompt_file and not Path(args.prompt_file).expanduser().exists():
         raise DispatchUsageError(f"prompt file not found: {args.prompt_file}")
     _validate_os_sandbox_conflict(args)
+    _validate_agent_os_sandbox(args)
     _guard_read_only_write_prompt(args)
     _guard_grok_code_research_prompt(args)
 
@@ -2021,8 +2088,8 @@ def _worker_prompt_preamble(agent: str | None, *, orientation_path: Path | None 
     preambles = [STEER_PROMPT_PREAMBLE, PROMPT_FILE_PREAMBLE]
     if orientation_path is not None:
         preambles.append(_project_orientation_preamble(orientation_path))
-    if agent in {"grok-code", "grok-research"}:
-        preambles.append(GROK_EXECUTION_PREAMBLE)
+    if agent in {"grok-code", "grok-research", "kimi"}:
+        preambles.append(WORKER_EXECUTION_PREAMBLE)
     return "\n\n".join(preambles)
 
 
@@ -2467,6 +2534,8 @@ def _canonical_replay_argv(args, raw_argv: list[str], *, tail: Path, status_json
         argv.append("--fast")
     if args.web_research_ok:
         argv.append("--web-research-ok")
+    if getattr(args, "web_qa", False):
+        argv.append("--web-qa")
     if args.ignore_git_warn:
         argv.append("--ignore-git-warn")
     if getattr(args, "no_orientation", False):
@@ -2557,6 +2626,40 @@ def _drain_on_submit(args, queue_path: Path) -> None:
             f"{payload.get('failed')} drain failure(s); queued request remains durable (recoverable on a later drain pass)",
             file=sys.stderr,
         )
+    _warn_if_stranded_without_drainer(queue_path)
+
+
+def _warn_if_stranded_without_drainer(queue_path: Path) -> None:
+    """Warn when THIS request is still queued and nothing will launch it.
+
+    Ordering is load-bearing: this runs AFTER the entry is lodged and after the
+    drain-on-submit pass. Checking earlier is useless — on an idle queue the
+    depth is 0, so a queue-depth guard suppresses exactly the warning that
+    matters. Evaluated here, `queue_path.exists()` is a precise "my entry is
+    still queued" signal: a successful drain claims the file (renames it), so a
+    surviving file means nothing launched it.
+
+    Field evidence (2026-07-20): the launchd drainer was absent, three dispatches
+    parked silently, and the pull-only status WARN never reached the controller —
+    who was standing right here with the context to fix it.
+    """
+    if not queue_path.exists():
+        return  # drain claimed it — nothing stranded
+    try:
+        import goalflight_status
+
+        if goalflight_status._drainer_live():
+            return  # a drainer exists; it will pick this up on its next pass
+    except Exception:
+        return  # never let an advisory check break a dispatch
+    print(
+        "goalflight_dispatch: WARNING — request is STILL QUEUED after the "
+        "drain-on-submit pass and no live drainer was detected, so nothing will "
+        "launch it. (A peer drainer may still claim it momentarily.) Remedy:\n"
+        "  python3 <skill-root>/scripts/goalflight_dispatch.py drain --json   # launch it now\n"
+        "  bash <skill-root>/scripts/install-drainer.sh                       # restore the standing drainer",
+        file=sys.stderr,
+    )
 
 
 def _queue_launch_token() -> str:
@@ -3075,6 +3178,23 @@ def _alert_identity_indeterminate(dispatch_id: str, *, where: str, reason: str) 
     )
 
 
+def _alert_launched_carrier_pending(dispatch_id: str, *, where: str) -> None:
+    print(
+        "CLAIM-RECOVERY-ALERT "
+        + json.dumps(
+            {
+                "dispatch_id": dispatch_id,
+                "action": "preserve",
+                "reason": "launched_carrier_cleanup_pending",
+                "where": where,
+            },
+            sort_keys=True,
+        ),
+        file=sys.stderr,
+        flush=True,
+    )
+
+
 def _submit_dispatch(args, raw_argv: list[str], *, base: Path) -> int:
     project_root = _project_root(args)
     submit_base_sha = _git_head_for_cwd(project_root)
@@ -3109,6 +3229,7 @@ def _submit_dispatch(args, raw_argv: list[str], *, base: Path) -> int:
             "shape": args.shape,
             "read_only": bool(args.read_only),
             "os_sandbox": getattr(args, "os_sandbox", None),
+            "web_qa": bool(getattr(args, "web_qa", False)),
             "base_sha": submit_base_sha,
             "account": args.account,
             "billing": args.billing,
@@ -3439,10 +3560,12 @@ def _dispatch_has_worker_record(
     if record.get("transport") != "fleet-ssh":
         return False
     remote_receipt = record.get("remote_launch_receipt")
-    has_remote_launch = bool(
-        record.get("launch_unconfirmed")
-        or (isinstance(remote_receipt, dict) and remote_receipt.get("remote_pid"))
-    )
+    # Only a durable remote launch receipt is positive launch evidence.
+    # launch_unconfirmed is deliberately NOT counted: the launch command was
+    # issued but no receipt confirms the remote process started, so the
+    # dispatch may be live yet unaccounted — fail closed and retain the
+    # carrier until a real receipt or a genuinely terminal record exists.
+    has_remote_launch = bool(isinstance(remote_receipt, dict) and remote_receipt.get("remote_pid"))
     if not has_remote_launch:
         return False
     if require_live_nonterminal and _dispatch_record_is_terminal(record):
@@ -4417,18 +4540,70 @@ def _write_reconciled_terminal_status(entry: dict, marker: dict | None) -> None:
         )
 
 
-def _positive_live_carrier_cleanup(claim: Path, entry: dict, queue_dir: Path) -> str:
-    """Narrow LIVE exception: Q-only redundant-carrier cleanup after revalidation."""
+def _fleet_terminal_accounted_record(record: dict | None, token: str) -> bool:
+    """Terminal fleet ledger record with a matching launch token.
+
+    The remote node is the liveness authority for a fleet dispatch; once its
+    ledger record is terminal the dispatch is provably finished and accounted
+    for, so the claim carrier is a redundant tombstone.
+
+    A "launch_unconfirmed" state is NOT terminal accounting: the launch was
+    attempted but no receipt confirms it started, and the generic
+    terminal_state_for fallback would misread that unknown state as terminal
+    ("error"). Exclude it so an ambiguous, potentially still-live remote
+    launch keeps its carrier until a real receipt or terminal record exists.
+    """
+    return bool(
+        isinstance(record, dict)
+        and record.get("transport") == "fleet-ssh"
+        and record.get("queue_launch_token") == token
+        and record.get("state") != "launch_unconfirmed"
+        and _dispatch_record_is_terminal(record)
+    )
+
+
+def _positive_live_carrier_cleanup(
+    claim: Path,
+    entry: dict,
+    queue_dir: Path,
+    *,
+    worker_record_sufficient: bool = False,
+) -> str:
+    """Narrow positive-accounting exception: Q-only redundant-carrier cleanup
+    after revalidation. A carrier is clearable only when its dispatch is
+    provably accounted for by the ledger:
+
+    - local: a token-matched live non-terminal worker record;
+    - fleet: a token-matched fleet-ssh record that is non-terminal with a
+      durable remote launch receipt (via _dispatch_has_worker_record), or
+      genuinely terminal. An ambiguous launch (launch_unconfirmed, no
+      receipt) is NOT accounting: it defers like any unaccounted dispatch.
+
+    Anything less returns "pending" so a still-unaccounted dispatch — local
+    or remote — keeps its carrier and can never look re-launchable.
+
+    worker_record_sufficient is for the drain's own post-launch cleanup: the
+    drain has just confirmed the launch against the ledger (token-matched
+    worker/receipt record), so the carrier is redundant even when a fast
+    worker and its launcher have already exited — that fresh ledger
+    confirmation supersedes the local worker-liveness and admission
+    re-checks, and reconcile terminalizes the zombie from the ledger.
+    Recovery callers keep both strict gates, and an ambiguous fleet launch
+    (launch_unconfirmed, no receipt) still never qualifies.
+    """
     dispatch_id = str(entry.get("dispatch_id") or "")
     token = _queue_launch_token_from_entry(entry)
     record = _find_dispatch_record(dispatch_id) if dispatch_id else None
     if not (
         dispatch_id
         and token
-        and _dispatch_has_worker_record(
-            dispatch_id,
-            queue_launch_token=token,
-            require_live_nonterminal=True,
+        and (
+            _dispatch_has_worker_record(
+                dispatch_id,
+                queue_launch_token=token,
+                require_live_nonterminal=not worker_record_sufficient,
+            )
+            or _fleet_terminal_accounted_record(record, token)
         )
     ):
         return "pending"
@@ -4445,14 +4620,22 @@ def _positive_live_carrier_cleanup(claim: Path, entry: dict, queue_dir: Path) ->
             return "pending"
         if not isinstance(fresh, dict):
             return "pending"
-        if classify_reconciliation_admission(fresh, time.time(), stale_s=0.0) is not PreAdmitClass.LIVE:
+        if not worker_record_sufficient and classify_reconciliation_admission(
+            fresh, time.time(), stale_s=0.0
+        ) not in (
+            PreAdmitClass.LIVE,
+            PreAdmitClass.REMOTE_AUTHORITY_REQUIRED,
+        ):
             return "pending"
         if fresh.get("queue_launch_token") != token:
             return "pending"
-        if not _dispatch_has_worker_record(
-            dispatch_id,
-            queue_launch_token=token,
-            require_live_nonterminal=True,
+        if not (
+            _dispatch_has_worker_record(
+                dispatch_id,
+                queue_launch_token=token,
+                require_live_nonterminal=not worker_record_sufficient,
+            )
+            or _fleet_terminal_accounted_record(_find_dispatch_record(dispatch_id), token)
         ):
             return "pending"
         if not _is_task_linked(fresh, _find_dispatch_record(dispatch_id)):
@@ -4487,6 +4670,15 @@ def _reconcile_claim_transaction(
             reason="pre_admit_indeterminate",
         )
     if ADMISSION_DECISION[admission] is AdmissionAction.DEFER_UNCHANGED:
+        if admission is PreAdmitClass.REMOTE_AUTHORITY_REQUIRED:
+            # The remote node remains the liveness authority: never restore or
+            # terminalize a remote-authority carrier from this ladder. But a
+            # carrier whose fleet dispatch is positively accounted for (durable
+            # remote launch receipt or terminal ledger record) is a redundant
+            # tombstone — clear it under the same revalidation as the LIVE
+            # case. Unaccounted carriers return "pending" here, which is
+            # exactly DEFER_UNCHANGED.
+            return _positive_live_carrier_cleanup(claim, entry, queue_dir)
         return "pending"
 
     record = _find_dispatch_record(str(entry.get("dispatch_id") or ""))
@@ -5267,13 +5459,6 @@ def _drain_launch_remote_claim(
     except ImportError as exc:
         raise _RemoteDrainBlocked(f"fleet dispatch unavailable: {exc}", code="fleet_unavailable") from exc
 
-    _mark_queue_claim_launch_started(
-        argparse.Namespace(
-            from_queue=True,
-            queue_claim_path=str(claim),
-            queue_launch_token=launch_token,
-        )
-    )
     try:
         preview = fleet_dispatch.preview_dispatch(
             fleet_dir,
@@ -5284,6 +5469,18 @@ def _drain_launch_remote_claim(
             dispatch_id=dispatch_id,
             base_sha=_remote_drain_base_sha(entry),
             thin_mode=True,
+        )
+        # Stamp launch-started only once the preview gate has passed: the gate
+        # fails closed before any remote side effect, so a blocked carrier must
+        # stay pre-launch-shaped to remain restorable. The stamp still precedes
+        # execute_dispatch, keeping the crash guard over every window in which
+        # a remote launch may actually be in flight.
+        _mark_queue_claim_launch_started(
+            argparse.Namespace(
+                from_queue=True,
+                queue_claim_path=str(claim),
+                queue_launch_token=launch_token,
+            )
         )
         runner = getattr(args, "remote_runner", None)
         if runner is None:
@@ -5416,6 +5613,7 @@ def _resolve_claim_terminal_outcome(
                 tail,
                 ignore_prefix_lines=ignore_prefix_lines,
                 suppress_unfenced_prompt_markers=True,
+                kimi_output=agent == "kimi",
             )
         except Exception:
             return None
@@ -5898,9 +6096,33 @@ def _drain_queue_once(args) -> dict:
         )
         no_capacity = proc.returncode == 2 and "blocked_capacity" in (proc.stdout + proc.stderr)
         if stdout_launched and ledger_confirmed:
-            _positive_live_carrier_cleanup(claim, entry, queue_dir)
-            launched += 1
-            details.append({"dispatch_id": dispatch_id, "state": "launched"})
+            carrier_cleanup = _positive_live_carrier_cleanup(
+                claim,
+                entry,
+                queue_dir,
+                # This drain just ledger-confirmed the launch (token-matched
+                # record), so the carrier is redundant even if a fast worker
+                # already exited; reconcile terminalizes from the ledger.
+                worker_record_sufficient=True,
+            )
+            if carrier_cleanup == "pending":
+                # Launch is durably ledger-confirmed, but the carrier could
+                # not be cleared: surface it instead of silently reporting
+                # success. "launched" means launched AND carrier resolved, so
+                # a pending cleanup is counted as pending only — never as a
+                # launch.
+                pending_claims += 1
+                _alert_launched_carrier_pending(dispatch_id, where="drain")
+                details.append(
+                    {
+                        "dispatch_id": dispatch_id,
+                        "state": "claimed",
+                        "reason": "launched_carrier_cleanup_pending",
+                    }
+                )
+            else:
+                launched += 1
+                details.append({"dispatch_id": dispatch_id, "state": "launched"})
             continue
         if no_capacity:
             restored, decision = _restore_claim_if_incomplete(claim, entry, queue_dir)
@@ -5929,9 +6151,30 @@ def _drain_queue_once(args) -> dict:
             details.append({"dispatch_id": dispatch_id, "state": "queued", "reason": "capacity_unavailable"})
             continue
         if ledger_confirmed:
-            _positive_live_carrier_cleanup(claim, entry, queue_dir)
-            launched += 1
-            details.append({"dispatch_id": dispatch_id, "state": "launched", "reason": "worker_record_present"})
+            carrier_cleanup = _positive_live_carrier_cleanup(
+                claim,
+                entry,
+                queue_dir,
+                # This drain just ledger-confirmed the launch (token-matched
+                # record), so the carrier is redundant even if a fast worker
+                # already exited; reconcile terminalizes from the ledger.
+                worker_record_sufficient=True,
+            )
+            if carrier_cleanup == "pending":
+                # Same accounting contract as the stdout_launched branch: a
+                # pending cleanup is pending, not a launch.
+                pending_claims += 1
+                _alert_launched_carrier_pending(dispatch_id, where="drain")
+                details.append(
+                    {
+                        "dispatch_id": dispatch_id,
+                        "state": "claimed",
+                        "reason": "worker_record_present_carrier_cleanup_pending",
+                    }
+                )
+            else:
+                launched += 1
+                details.append({"dispatch_id": dispatch_id, "state": "launched", "reason": "worker_record_present"})
             continue
         pending_claims += 1
         failed += 1
@@ -6307,6 +6550,7 @@ def _run_acp_detached_launcher(
     env.update(account_env)
     for key in env_remove:
         env.pop(key, None)
+    _apply_web_qa_env(env, args, _project_root(args))
     child_argv = [sys.executable, str(Path(__file__).resolve()), *_acp_detached_child_argv(args)]
     child_pid = _spawn_daemonized_process(
         child_argv,
@@ -6454,7 +6698,10 @@ def _run_acp_shape(args, *, base: Path, account_env: dict[str, str]) -> int:
         ),
         flush=True,
     )
-    with _temporary_env(account_env, remove=env_remove):
+    web_qa_updates, web_qa_remove = _web_qa_env_plan(args, _project_root(args))
+    acp_env = {**account_env, **web_qa_updates}
+    acp_remove = list(env_remove) + list(web_qa_remove)
+    with _temporary_env(acp_env, remove=acp_remove):
         payload = asyncio.run(run_acp_dispatch(cfg))
     worker_pid = payload.get("worker_pid")
     if worker_pid:
@@ -6628,6 +6875,19 @@ def build_worker(args, prompt_path, raw_argv: list[str]):
         if args.cwd:
             argv += ["--cwd", args.cwd]
         return argv, None
+    if args.agent == "kimi":
+        # kimi has no --cwd, is off-PATH, takes the prompt as an argv value, and -p auto-runs
+        # tools (no --auto/-y — those are rejected with -p). Resolve the binary and cd in a
+        # login shell, exec kimi so the pid IS kimi (bash-tail pgid handling unaffected).
+        prompt_text = Path(prompt_path).read_text()
+        script = ('bin="$(command -v kimi || printf %s "$HOME/.kimi-code/bin/kimi")"; '
+                  'test -x "$bin" || { echo "kimi binary not found/executable: $bin" >&2; exit 127; }; '
+                  'prompt=$1; shift; cd "$0" && exec "$bin" -p "$prompt" --output-format text "$@"')
+        resolved_cwd = os.path.abspath(args.cwd or ".")
+        extra = (["--model", args.model] if getattr(args, "model", None) else []) \
+                + ["--add-dir", resolved_cwd]
+        argv = ["/bin/sh", "-lc", script, resolved_cwd, prompt_text, *extra]
+        return argv, None
     return None, None  # unknown preset + no raw command
 
 
@@ -6646,7 +6906,7 @@ def main(argv: list[str] | None = None) -> int:
         description="Crash-safe worker dispatch: detached worker + decoupled watcher."
     )
     parser.add_argument("--agent", default="worker",
-                        help="Preset (codex|grok-code|grok-research) OR a label when you pass `-- <cmd>`")
+                        help="Preset (codex|grok-code|grok-research|kimi) OR a label when you pass `-- <cmd>`")
     parser.add_argument("--prompt-file", help="Prompt file (preset path)")
     parser.add_argument("--prompt", help="Inline prompt text (preset path; alternative to --prompt-file)")
     parser.add_argument(
@@ -6658,7 +6918,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--cwd", help="Worker working directory")
     parser.add_argument("--model", default=None,
-                        help="Worker model id (grok-code/grok-research/codex --model passthrough). "
+                        help="Worker model id (grok-code/grok-research/kimi/codex --model passthrough). "
                              "Default = agent label's own default.")
     parser.add_argument("--read-only", action="store_true",
                         help="Read-only sandbox (review/analysis dispatches). Equivalent to "
@@ -6688,6 +6948,18 @@ def main(argv: list[str] | None = None) -> int:
                         help="Override the grok-code research-intent guard: confirm this prompt is "
                              "a coding task that merely mentions the web (web research belongs on "
                              "--agent grok-research, whose model can actually drive web tools).")
+    parser.add_argument(
+        "--web-qa",
+        action="store_true",
+        default=False,
+        help=(
+            "Opt-in web-QA capability for this dispatch only (DEFAULT OFF). Provisions "
+            "GOALFLIGHT_WEB_QA=1 and BROWSE_STATE_FILE so scripts/goalflight_webqa.sh can "
+            "drive the gstack headless browser. Without this flag the wrapper fails closed "
+            "and workers do not receive the browser state-file path — browser access is a "
+            "controller-granted capability, not ambient (SECURITY-2)."
+        ),
+    )
     parser.add_argument("--ignore-git-warn", action="store_true",
                         help="Suppress advisory git-base-pin warnings for git-repo cwd prompts.")
     parser.add_argument("--no-orientation", action="store_true",
@@ -6996,6 +7268,7 @@ def main(argv: list[str] | None = None) -> int:
             env.pop("CURSOR_API_KEY", None)
         if args.billing == "sub" and _account_engine(args.agent) == "codex":
             env.pop("OPENAI_API_KEY", None)  # subscription billing for the selected account, not the API
+        _apply_web_qa_env(env, args, project_root)
 
         _mark_queue_claim_worker_spawn_intent(args)
         worker_pid = _spawn_daemonized_process(

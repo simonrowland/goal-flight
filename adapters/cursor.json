@@ -332,6 +332,26 @@
         "paths": ["~/.gstack", "~/.cursor/skills/"]
       },
       {
+        "id": "gstack-browser",
+        "label": "gstack headless browser (web-QA)",
+        "default": false,
+        "compatible_destination_ids": [
+          "cursor-desktop-controller",
+          "cursor-project-controller",
+          "cursor-agents-standard-controller",
+          "cursor-claude-link-controller",
+          "cursor-cli-worker"
+        ],
+        "install_mode": "init_self_check",
+        "commands": ["test -x \"${GSTACK_BROWSE_BIN:-}\" || test -x ~/.claude/skills/gstack/browse/dist/browse || test -x ~/.gstack/repos/gstack/browse/dist/browse"],
+        "paths": [
+          "~/.claude/skills/gstack/browse/dist/browse",
+          "~/.gstack/repos/gstack/browse/dist/browse",
+          "~/.claude/skills/gstack/qa",
+          "~/.gstack/repos/gstack/qa"
+        ]
+      },
+      {
         "id": "autoreview",
         "label": "autoreview chunk review",
         "default": true,

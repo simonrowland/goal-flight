@@ -4,7 +4,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 
 python3 "$REPO_ROOT/scripts/goalflight_validate_adapters.py" >/tmp/goal-flight-adapters-$$.out
-grep -q "schema_validates=16/16" /tmp/goal-flight-adapters-$$.out || {
+grep -q "schema_validates=17/17" /tmp/goal-flight-adapters-$$.out || {
   cat /tmp/goal-flight-adapters-$$.out
   rm -f /tmp/goal-flight-adapters-$$.out
   exit 1
@@ -36,6 +36,11 @@ def load(name):
 
 
 codex = load("codex")
+kimi = load("kimi")
+
+kimi_sandbox = kimi["permission_surface"]["os_sandbox"]
+if kimi_sandbox["supported_profiles"] != ["off"] or kimi_sandbox["implementation"] != "unsupported":
+    raise SystemExit(f"kimi must not advertise an unenforced OS sandbox: {kimi_sandbox}")
 
 
 def expect_error(label, manifest, needle):
@@ -225,6 +230,30 @@ expect_denied(
     role="worker",
     requested_transport="acp",
 )
+
+expect_denied(
+    "kimi-worker-only-controller",
+    kimi,
+    "unsupported",
+    role="controller",
+    local_state={"controller": "ready", "worker": "ready"},
+)
+expect_denied(
+    "kimi-cli-json-not-implemented",
+    kimi,
+    "probe_required",
+    role="worker",
+    requested_transport="cli_json",
+    local_state={"controller": "ready", "worker": "ready"},
+)
+kimi_tail = validate_adapter_gate(
+    kimi,
+    role="worker",
+    requested_transport="tail_file",
+    local_state={"controller": "ready", "worker": "ready"},
+)
+if not kimi_tail["allowed"]:
+    raise SystemExit(f"kimi tail-file worker should remain allowed when ready: {kimi_tail}")
 
 config_only = copy.deepcopy(codex)
 config_only["support"]["controller"]["capability"] = "unsupported"

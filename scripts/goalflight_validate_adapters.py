@@ -26,6 +26,7 @@ EXPECTED_ADAPTERS = {
     "codex",
     "cursor",
     "grok",
+    "kimi",
     "gemini",
     "qwen",
     "opencode",

@@ -338,6 +338,39 @@ def check_gstack() -> dict:
     }
 
 
+def check_gstack_browser() -> dict:
+    # Cover Claude-host and canonical ~/.gstack installs (ADAPTER-4).
+    browser = goalflight_compat.resolve_gstack_browse_bin()
+    present = browser is not None
+    browser_path = (
+        str(browser)
+        if browser is not None
+        else str(Path.home() / ".claude/skills/gstack/browse/dist/browse")
+    )
+    # qa skill rides next to either install root.
+    qa_candidates = [
+        Path.home() / ".claude/skills/gstack/qa",
+        Path.home() / ".gstack/repos/gstack/qa",
+    ]
+    if browser is not None:
+        qa_candidates.insert(0, browser.parent.parent / "qa")
+    qa_skill = next((p for p in qa_candidates if p.is_dir()), qa_candidates[0])
+    return {
+        "present": present,
+        "level": "info",
+        "path": browser_path,
+        "qa_skill": str(qa_skill),
+        "detail": (
+            browser_path
+            if present
+            else (
+                "build with: (cd ~/.claude/skills/gstack/browse && bun install && bun run build) "
+                "or (cd ~/.gstack/repos/gstack/browse && bun install && bun run build)"
+            )
+        ),
+    }
+
+
 def check_autoreview(skill_root: Path) -> dict:
     script_path = skill_root / "scripts/autoreview.sh"
     helper_env = goalflight_compat.allowed_env_override(
@@ -2877,6 +2910,7 @@ def doctor(
         "cursor_context_mode": check_cursor_context_mode(skill_root, repo),
         "opencode_context_mode": check_opencode_context_mode(skill_root, repo),
         "gstack": check_gstack(),
+        "gstack_browser": check_gstack_browser(),
         "agent_traits": check_agent_traits(),
         "autoreview": check_autoreview(skill_root),
         "agents_md_state": check_agents_md_state(repo),
@@ -3090,6 +3124,11 @@ def print_human(payload: dict) -> None:
             False if payload["gstack"].get("level") == "warning" else payload["gstack"].get("present"),
             "gstack",
             payload["gstack"].get("detail") or payload["gstack"].get("version"),
+        ),
+        status_line(
+            None,
+            f"gstack-browser: {'present' if payload['gstack_browser'].get('present') else 'absent'}",
+            payload["gstack_browser"].get("detail"),
         ),
         status_line(
             (payload.get("agent_traits") or {}).get("ok"),

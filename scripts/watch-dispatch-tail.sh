@@ -314,7 +314,7 @@ PY
     fi
     return 1
   fi
-  PYTHONPATH="$SCRIPT_DIR" python3 - "$TAIL_PATH" "${IGNORE_PROMPT_FILE:-}" <<'PY'
+  PYTHONPATH="$SCRIPT_DIR" python3 - "$TAIL_PATH" "${IGNORE_PROMPT_FILE:-}" "$AGENT_LABEL" <<'PY'
 import pathlib
 import sys
 
@@ -322,12 +322,17 @@ from goalflight_watch import _last_line_is_terminal_marker
 
 tail = pathlib.Path(sys.argv[1])
 prompt_arg = sys.argv[2]
+agent = sys.argv[3]
 prompt_lines = []
 if prompt_arg:
     prompt = pathlib.Path(prompt_arg)
     if prompt.exists():
         prompt_lines = [line.strip() for line in prompt.read_text(encoding="utf-8", errors="replace").splitlines()]
-marker = _last_line_is_terminal_marker(tail, ignore_prefix_lines=prompt_lines)
+marker = _last_line_is_terminal_marker(
+    tail,
+    ignore_prefix_lines=prompt_lines,
+    kimi_output=agent == "kimi",
+)
 if marker:
     print(f"{marker['line']}:{marker['kind']}:{marker['text']}")
     raise SystemExit(0)
@@ -337,7 +342,7 @@ PY
 
 final_terminal_marker() {
   [ -f "$TAIL_PATH" ] || return 1
-  PYTHONPATH="$SCRIPT_DIR" python3 - "$TAIL_PATH" "${IGNORE_PROMPT_FILE:-}" <<'PY'
+  PYTHONPATH="$SCRIPT_DIR" python3 - "$TAIL_PATH" "${IGNORE_PROMPT_FILE:-}" "$AGENT_LABEL" <<'PY'
 import pathlib
 import sys
 
@@ -345,12 +350,17 @@ from goalflight_watch import _final_terminal_marker
 
 tail = pathlib.Path(sys.argv[1])
 prompt_arg = sys.argv[2]
+agent = sys.argv[3]
 prompt_lines = []
 if prompt_arg:
     prompt = pathlib.Path(prompt_arg)
     if prompt.exists():
         prompt_lines = [line.strip() for line in prompt.read_text(encoding="utf-8", errors="replace").splitlines()]
-marker = _final_terminal_marker(tail, ignore_prefix_lines=prompt_lines)
+marker = _final_terminal_marker(
+    tail,
+    ignore_prefix_lines=prompt_lines,
+    kimi_output=agent == "kimi",
+)
 if marker:
     print(f"{marker['line']}:{marker['kind']}:{marker['text']}")
     raise SystemExit(0)

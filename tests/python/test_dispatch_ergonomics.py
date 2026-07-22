@@ -6,6 +6,7 @@ from __future__ import annotations
 import sys
 import contextlib
 import io
+import os
 import subprocess
 import tempfile
 from pathlib import Path
@@ -72,6 +73,10 @@ def test_default_idle_windows() -> None:
     args = _args(agent="grok-code")
     D._apply_max_idle_default(args)
     check("grok-code write default idle is 600s", args.max_idle_secs == 600.0)
+
+    args = _args(agent="kimi")
+    D._apply_max_idle_default(args)
+    check("kimi write default idle is 600s", args.max_idle_secs == 600.0)
 
     args = _args(agent="codex", read_only=True)
     D._apply_max_idle_default(args)
@@ -277,6 +282,152 @@ def test_grok_model_passthrough_warning() -> None:
     check("grok without --model is silent", D._grok_model_passthrough_warning(_args(agent="grok-code")) is None)
 
 
+def test_kimi_worker_argv() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        prompt = Path(td) / "prompt.md"
+        prompt.write_text("Implement the change.\n", encoding="utf-8")
+        args = _args(agent="kimi", cwd="/tmp/x")
+        argv, stdin_path = D.build_worker(args, prompt, [])
+        joined = " ".join(argv)
+        check("kimi uses login-shell cwd wrapper", argv[:2] == ["/bin/sh", "-lc"] and 'cd "$0"' in argv[2])
+        check("kimi resolves off-PATH fallback", 'command -v kimi' in argv[2] and '$HOME/.kimi-code/bin/kimi' in argv[2])
+        check("kimi uses print text mode", ' -p "$prompt" --output-format text ' in argv[2])
+        check("kimi omits incompatible permission flags", "--auto" not in joined and "-y" not in argv and "--yolo" not in argv)
+        check("kimi passes cwd as shell arg and add-dir", argv[3] == "/tmp/x" and argv[-2:] == ["--add-dir", "/tmp/x"])
+        check("kimi passes prompt by argv", argv[4] == "Implement the change.\n" and stdin_path is None)
+        check("kimi omits model by default", "--model" not in argv)
+
+        args.model = "kimi-code/k3-preview"
+        model_argv, _ = D.build_worker(args, prompt, [])
+        check("kimi passes explicit model", model_argv[-4:] == ["--model", "kimi-code/k3-preview", "--add-dir", "/tmp/x"])
+
+        repo = Path(td) / "repo"
+        relative_cwd = repo / "tests"
+        relative_cwd.mkdir(parents=True)
+        original_cwd = Path.cwd()
+        os.chdir(repo)
+        try:
+            relative_args = _args(agent="kimi", cwd="tests")
+            resolved_relative_cwd = os.path.abspath("tests")
+            relative_argv, _ = D.build_worker(relative_args, prompt, [])
+        finally:
+            os.chdir(original_cwd)
+        check(
+            "kimi resolves relative cwd once for shell and add-dir",
+            relative_argv[3] == resolved_relative_cwd
+            and relative_argv[-2:] == ["--add-dir", resolved_relative_cwd],
+        )
+
+    check("kimi single-account design omits account engine", D._account_engine("kimi") is None)
+    try:
+        D._resolve_account_env(_args(agent="kimi", account="alternate"))
+    except D.DispatchUsageError as exc:
+        check(
+            "kimi named account is rejected before profile resolution",
+            "--account is not configured for --agent 'kimi'" in str(exc),
+        )
+    else:
+        check("kimi named account is rejected before profile resolution", False)
+
+    for sandbox_args in (
+        _args(agent="kimi", read_only=True, os_sandbox=None),
+        _args(agent="kimi", read_only=False, os_sandbox="workspace-write"),
+    ):
+        try:
+            D._validate_agent_os_sandbox(sandbox_args)
+        except D.DispatchUsageError as exc:
+            check(
+                f"kimi rejects unenforced sandbox {D._effective_os_sandbox(sandbox_args)}",
+                "supports only --os-sandbox off" in str(exc) and "b-079" in str(exc),
+            )
+        else:
+            check(f"kimi rejects unenforced sandbox {D._effective_os_sandbox(sandbox_args)}", False)
+    try:
+        D._validate_agent_os_sandbox(_args(agent="kimi", os_sandbox="off"))
+    except D.DispatchUsageError as exc:
+        check(f"kimi accepts explicit sandbox off ({exc})", False)
+    else:
+        check("kimi accepts explicit sandbox off", True)
+    check(
+        "kimi default sandbox posture records off",
+        D._effective_os_sandbox(_args(agent="kimi", os_sandbox=None)) == "off",
+    )
+    try:
+        D._validate_before_side_effects(
+            _args(agent="kimi", read_only=True, os_sandbox=None),
+            [],
+        )
+    except D.DispatchUsageError as exc:
+        check(
+            "kimi read-only dispatch is rejected before side effects",
+            "requested profile 'read-only' is not enforced" in str(exc),
+        )
+    else:
+        check("kimi read-only dispatch is rejected before side effects", False)
+
+
+def test_kimi_worker_dash_execution() -> None:
+    injected = Path("/tmp/injected")
+    check("kimi injection sentinel absent before test", not injected.exists())
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        cwd = base / "cwd with spaces"
+        fake_bin = base / "bin"
+        cwd.mkdir()
+        fake_bin.mkdir()
+        prompt_text = '\"; touch /tmp/injected #'
+        prompt = base / "prompt.md"
+        prompt.write_text(prompt_text, encoding="utf-8")
+        args_file = base / "args.txt"
+        cwd_file = base / "cwd.txt"
+        fake_kimi = fake_bin / "kimi"
+        fake_kimi.write_text(
+            '#!/bin/sh\nprintf "%s\\n" "$@" > "$KIMI_ARGS_FILE"\npwd > "$KIMI_CWD_FILE"\n',
+            encoding="utf-8",
+        )
+        fake_kimi.chmod(0o755)
+
+        args = _args(agent="kimi", cwd=str(cwd), model="m")
+        argv, stdin_path = D.build_worker(args, prompt, [])
+        env = os.environ.copy()
+        env["PATH"] = f"{fake_bin}{os.pathsep}{env.get('PATH', '')}"
+        env["KIMI_ARGS_FILE"] = str(args_file)
+        env["KIMI_CWD_FILE"] = str(cwd_file)
+        proc = subprocess.run(
+            ["/bin/dash", *argv[1:]],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            check=False,
+        )
+        received = args_file.read_text(encoding="utf-8").splitlines() if args_file.exists() else []
+        check("kimi generated wrapper executes under dash", proc.returncode == 0)
+        check(
+            "kimi dash wrapper preserves exact argv",
+            received == [
+                "-p",
+                prompt_text,
+                "--output-format",
+                "text",
+                "--model",
+                "m",
+                "--add-dir",
+                str(cwd),
+            ],
+        )
+        check("kimi dash wrapper preserves cwd with spaces", cwd_file.read_text(encoding="utf-8").strip() == str(cwd))
+        check("kimi dash wrapper keeps prompt as data", not injected.exists())
+        check("kimi dash wrapper keeps prompt off stdin", stdin_path is None)
+
+
+def test_kimi_worker_preamble_is_neutral() -> None:
+    preamble = D._worker_prompt_preamble("kimi")
+    check("kimi preamble contains COMPLETE contract", "COMPLETE: <summary>" in preamble)
+    check("kimi preamble has neutral worker identity", "Grok worker" not in preamble)
+
+
 def test_windows_acp_warnings_written_to_tail() -> None:
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)
@@ -391,6 +542,9 @@ def main() -> int:
     test_grok_code_research_intent_guard()
     test_git_pin_warning()
     test_grok_model_passthrough_warning()
+    test_kimi_worker_argv()
+    test_kimi_worker_dash_execution()
+    test_kimi_worker_preamble_is_neutral()
     test_windows_acp_warnings_written_to_tail()
     test_reused_nonterminal_dispatch_id_guard()
     test_dispatch_end_hint()

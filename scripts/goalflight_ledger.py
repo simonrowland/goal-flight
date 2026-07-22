@@ -41,6 +41,7 @@ WORKER_PATTERNS = (
     "opencode-acp",
     "opencode-bash-tail",
 )
+KIMI_WORKER_BASENAME = "kimi"
 _POSIX_PS_AVAILABLE: bool | None = None
 
 
@@ -426,7 +427,11 @@ def scan_surplus(records: list[dict], limit: int = 20) -> list[dict]:
         comm = parts[1]
         args = parts[2] if len(parts) > 2 else ""
         haystack = f"{comm} {args}"
-        if any(pattern in haystack for pattern in WORKER_PATTERNS):
+        # Kimi executes from an off-PATH absolute location. Match its executable
+        # basename, not arbitrary argv prose mentioning "kimi".
+        if Path(comm).name == KIMI_WORKER_BASENAME or any(
+            pattern in haystack for pattern in WORKER_PATTERNS
+        ):
             surplus.append({"pid": pid, "comm": comm, "args": args[:240]})
         if len(surplus) >= limit:
             break

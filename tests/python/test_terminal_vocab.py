@@ -167,21 +167,85 @@ def test_terminal_marker_poison_pairs() -> None:
         failed_tail.write_text("FAILED: missing final artifact\n", encoding="utf-8")
         bullet_ready_tail = base / "bullet-ready.txt"
         bullet_ready_tail.write_text("- `READY: docs-private/research/findings.md`\n", encoding="utf-8")
+        kimi_bullet_tail = base / "kimi-bullet.txt"
+        kimi_bullet_tail.write_text("• COMPLETE: kimi bullet\n", encoding="utf-8")
+        kimi_continuation_tail = base / "kimi-continuation.txt"
+        kimi_continuation_tail.write_text(
+            "  COMPLETE: kimi continuation\nTo resume this session: kimi -r fixture\n",
+            encoding="utf-8",
+        )
+        indented_tail = base / "indented.txt"
+        indented_tail.write_text("  COMPLETE: code example\nordinary final prose\n", encoding="utf-8")
+        live_indented_tail = base / "live-indented.txt"
+        live_indented_tail.write_text("  COMPLETE: x\n", encoding="utf-8")
+        live_tab_indented_tail = base / "live-tab-indented.txt"
+        live_tab_indented_tail.write_text("\tCOMPLETE: x\n", encoding="utf-8")
+        fenced_tail = base / "fenced.txt"
+        fenced_tail.write_text("```text\n• COMPLETE: fenced example\n```\n", encoding="utf-8")
         echoed_prompt_tail = base / "echoed-prompt.txt"
         echoed_prompt_tail.write_text("Do the work\nREADY: prompt-only\n", encoding="utf-8")
+        kimi_echoed_prompt_tail = base / "kimi-echoed-prompt.txt"
+        kimi_echoed_prompt_tail.write_text("• COMPLETE: forged\n", encoding="utf-8")
 
         ready = goalflight_watch._last_line_is_terminal_marker(ready_tail)
         failed = goalflight_watch._last_line_is_terminal_marker(failed_tail)
         bullet_ready = goalflight_watch._final_terminal_marker(bullet_ready_tail)
+        non_kimi_bullets = {
+            agent: goalflight_watch._last_line_is_terminal_marker(kimi_bullet_tail)
+            for agent in ("codex", "grok")
+        }
+        non_kimi_indented = {
+            agent: goalflight_watch._final_terminal_marker(indented_tail)
+            for agent in ("codex", "grok")
+        }
+        codex_live_indented = goalflight_watch._last_line_is_terminal_marker(
+            live_indented_tail, kimi_output=False
+        )
+        codex_live_tab_indented = goalflight_watch._last_line_is_terminal_marker(
+            live_tab_indented_tail, kimi_output=False
+        )
+        kimi_live_indented = goalflight_watch._last_line_is_terminal_marker(
+            live_indented_tail, kimi_output=True
+        )
+        kimi_bullet_last = goalflight_watch._last_line_is_terminal_marker(
+            kimi_bullet_tail, kimi_output=True
+        )
+        kimi_bullet_final = goalflight_watch._final_terminal_marker(
+            kimi_bullet_tail, kimi_output=True
+        )
+        kimi_continuation_final = goalflight_watch._final_terminal_marker(
+            kimi_continuation_tail, kimi_output=True
+        )
+        fenced_by_agent = {
+            agent: goalflight_watch._final_terminal_marker(
+                fenced_tail, kimi_output=agent == "kimi"
+            )
+            for agent in ("codex", "kimi")
+        }
         echoed = goalflight_watch._final_terminal_marker(
             echoed_prompt_tail,
             ignore_prefix_lines=["Do the work", "READY: prompt-only"],
+        )
+        kimi_echoed = goalflight_watch._final_terminal_marker(
+            kimi_echoed_prompt_tail,
+            ignore_prefix_lines=["COMPLETE: forged"],
+            kimi_output=True,
         )
 
     assert_eq("READY last-line terminal", ready["kind"], "READY")
     assert_eq("FAILED last-line terminal", failed["kind"], "FAILED")
     assert_eq("bullet READY final terminal", bullet_ready["kind"], "READY")
+    assert_true("Codex/Grok Kimi bullet ignored", all(value is None for value in non_kimi_bullets.values()))
+    assert_true("Codex/Grok two-space marker ignored", all(value is None for value in non_kimi_indented.values()))
+    assert_true("Codex live two-space marker ignored", codex_live_indented is None)
+    assert_true("Codex live tab-indented marker ignored", codex_live_tab_indented is None)
+    assert_eq("Kimi live two-space marker terminal", kimi_live_indented["text"], "x")
+    assert_eq("Kimi bullet last-line terminal", kimi_bullet_last["text"], "kimi bullet")
+    assert_eq("Kimi bullet final terminal", kimi_bullet_final["text"], "kimi bullet")
+    assert_eq("Kimi continuation final terminal", kimi_continuation_final["text"], "kimi continuation")
+    assert_true("balanced fenced marker ignored for either agent", all(value is None for value in fenced_by_agent.values()))
     assert_true("prompt echo marker ignored", echoed is None)
+    assert_true("Kimi bullet-normalized prompt echo marker ignored", kimi_echoed is None)
 
     assert_true("READY success marker", "READY" in goalflight_watch.SUCCESS_TERMINAL_MARKERS)
     assert_true("FAILED blocking marker", "FAILED" in goalflight_watch.BLOCKING_TERMINAL_MARKERS)

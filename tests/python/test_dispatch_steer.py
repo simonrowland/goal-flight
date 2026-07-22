@@ -528,7 +528,7 @@ def case_grok_prompt_adds_execution_and_terminal_contract() -> None:
             + "\n\n"
             + goalflight_dispatch.PROMPT_FILE_PREAMBLE
             + "\n\n"
-            + goalflight_dispatch.GROK_EXECUTION_PREAMBLE
+            + goalflight_dispatch.WORKER_EXECUTION_PREAMBLE
             + "\n\n"
         )
         assert text.startswith(expected_prefix), text
@@ -560,17 +560,16 @@ def case_codex_prompt_does_not_add_grok_contract() -> None:
             + "\n\n"
         )
         assert text.startswith(expected_prefix), text
-        assert goalflight_dispatch.GROK_EXECUTION_PREAMBLE not in text, text
+        assert goalflight_dispatch.WORKER_EXECUTION_PREAMBLE not in text, text
 
 
 def case_preamble_routing_matrix() -> None:
-    # Lock the grok-execution-preamble routing across every agent label:
-    # only grok-code / grok-research receive it; all others (and None) do not.
-    grok_marker = goalflight_dispatch.GROK_EXECUTION_PREAMBLE
-    for agent in ("grok-code", "grok-research"):
-        assert grok_marker in goalflight_dispatch._worker_prompt_preamble(agent), agent
+    # Lock the shared execution-preamble routing across every agent label.
+    worker_marker = goalflight_dispatch.WORKER_EXECUTION_PREAMBLE
+    for agent in ("grok-code", "grok-research", "kimi"):
+        assert worker_marker in goalflight_dispatch._worker_prompt_preamble(agent), agent
     for agent in ("codex", "cursor", "claude", "claude-acp", "codex-acp", "opencode", None):
-        assert grok_marker not in goalflight_dispatch._worker_prompt_preamble(agent), agent
+        assert worker_marker not in goalflight_dispatch._worker_prompt_preamble(agent), agent
     # The steer preamble is always present regardless of agent.
     for agent in ("grok-code", "grok-research", "codex", None):
         preamble = goalflight_dispatch._worker_prompt_preamble(agent)

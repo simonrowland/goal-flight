@@ -163,12 +163,15 @@ def case_claude_model_applies_after_session_new() -> None:
 
 def _build(agent, model, *, raw=None):
     ns = argparse.Namespace(agent=agent, cwd="/tmp/x", read_only=False, model=model)
-    argv, _ = dispatch.build_worker(ns, "/tmp/p.md", raw)
-    return argv
+    with tempfile.TemporaryDirectory() as td:
+        prompt = Path(td) / "prompt.md"
+        prompt.write_text("model passthrough fixture\n", encoding="utf-8")
+        argv, _ = dispatch.build_worker(ns, prompt, raw)
+        return argv
 
 
 def case_build_worker_injects_model() -> None:
-    for agent in ("codex", "grok-code", "grok-research"):
+    for agent in ("codex", "grok-code", "grok-research", "kimi"):
         argv = _build(agent, MODEL)
         assert "--model" in argv and argv[argv.index("--model") + 1] == MODEL, (agent, argv)
     # codex has no default model: none passed -> no --model.
@@ -181,6 +184,10 @@ def case_build_worker_injects_model() -> None:
     assert "--model" not in argv_code, argv_code
     argv_research = _build("grok-research", None)
     assert "--model" not in argv_research, argv_research
+    argv_kimi = _build("kimi", None)
+    assert "--model" not in argv_kimi, argv_kimi
+    assert ' -p "$prompt" --output-format text ' in argv_kimi[2], argv_kimi
+    assert "--auto" not in " ".join(argv_kimi) and "-y" not in argv_kimi, argv_kimi
     # grok-research keeps web tools ON (grok-4.5 supports web_search/web_fetch).
     assert "--disable-web-search" not in argv_research, argv_research
     # grok 0.2.39 regression: in single-turn `--prompt-file` mode EVERY

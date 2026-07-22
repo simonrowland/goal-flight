@@ -446,6 +446,7 @@ def _reconcile_output_tail_record(record: dict) -> dict:
     marker = _final_terminal_marker(
         tail,
         ignore_prefix_lines=_ignore_prefix_lines(record.get("prompt_path")),
+        kimi_output=record.get("agent") == "kimi",
     )
     marker_kind = marker.get("kind") if isinstance(marker, dict) else None
     if marker_kind not in _OUTPUT_TAIL_TERMINAL_MARKERS:
@@ -1687,7 +1688,10 @@ def verify_artifacts(dispatch_id: str, *, project_root: str | None) -> dict:
     marker = None
     if tail is not None:
         marker = _final_terminal_marker(
-            tail, ignore_prefix_lines=_ignore_prefix_lines(record.get("prompt_path")))
+            tail,
+            ignore_prefix_lines=_ignore_prefix_lines(record.get("prompt_path")),
+            kimi_output=record.get("agent") == "kimi",
+        )
     # Only a SUCCESS marker (READY/COMPLETE/RESULT) declares deliverables — a FAILED:/
     # BLOCKED: marker that happens to name a path must NOT report it as a present artifact.
     declared: list[str] = []

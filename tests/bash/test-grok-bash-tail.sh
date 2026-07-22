@@ -4,7 +4,7 @@
 
 set -u
 
-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 WATCHER="$REPO_ROOT/scripts/watch-dispatch-tail.sh"
 
 GROK="$(command -v grok 2>/dev/null || true)"
@@ -13,7 +13,7 @@ if [ -z "$GROK" ] && [ -x "$HOME/.grok/bin/grok" ]; then
 fi
 
 if [ -z "$GROK" ]; then
-  echo "SKIP  tests/test-grok-bash-tail.sh (grok not installed)"
+  echo "SKIP  tests/bash/test-grok-bash-tail.sh (grok not installed)"
   exit 0
 fi
 
@@ -36,13 +36,13 @@ trap cleanup EXIT
 auth_skip_if_needed() {
   local log="$1"
   if grep -qiE 'auth|login|api.?key|unauthorized|sign[ -]?in|authentication|not logged' "$log"; then
-    echo "SKIP  tests/test-grok-bash-tail.sh (grok not authenticated)"
+    echo "SKIP  tests/bash/test-grok-bash-tail.sh (grok not authenticated)"
     exit 0
   fi
 }
 
 if ! command -v timeout >/dev/null 2>&1; then
-  echo "SKIP  tests/test-grok-bash-tail.sh (timeout command missing)"
+  echo "SKIP  tests/bash/test-grok-bash-tail.sh (timeout command missing)"
   exit 0
 fi
 
@@ -72,7 +72,7 @@ wait "$WATCHER_PID" || WATCHER_RC=$?
 if [ "$WORKER_RC" -ne 0 ] || [ "$WATCHER_RC" -ne 0 ]; then
   auth_skip_if_needed "$TAIL"
   auth_skip_if_needed "$WATCHER_OUT"
-  echo "FAIL  tests/test-grok-bash-tail.sh (worker=$WORKER_RC watcher=$WATCHER_RC)"
+  echo "FAIL  tests/bash/test-grok-bash-tail.sh (worker=$WORKER_RC watcher=$WATCHER_RC)"
   sed 's/^/      /' "$TAIL" || true
   sed 's/^/      /' "$WATCHER_OUT" || true
   exit 1
@@ -80,16 +80,16 @@ fi
 
 if ! grep -q '^COMPLETE: true$' "$TAIL"; then
   auth_skip_if_needed "$TAIL"
-  echo "FAIL  tests/test-grok-bash-tail.sh (missing COMPLETE marker)"
+  echo "FAIL  tests/bash/test-grok-bash-tail.sh (missing COMPLETE marker)"
   sed 's/^/      /' "$TAIL" || true
   exit 1
 fi
 
 if [ ! -f "$TARGET" ] || [ "$(tr -d '\n' < "$TARGET")" != "done" ]; then
-  echo "FAIL  tests/test-grok-bash-tail.sh (expected file with content 'done')"
+  echo "FAIL  tests/bash/test-grok-bash-tail.sh (expected file with content 'done')"
   ls -la "$WORKDIR" | sed 's/^/      /' || true
   sed 's/^/      /' "$TAIL" || true
   exit 1
 fi
 
-echo "PASS  tests/test-grok-bash-tail.sh"
+echo "PASS  tests/bash/test-grok-bash-tail.sh"

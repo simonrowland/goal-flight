@@ -817,6 +817,45 @@ def resolve_env_path(var: str, default) -> Path:
     return Path(default).expanduser()
 
 
+def gstack_browse_bin_candidates() -> list[Path]:
+    """Candidate paths for the gstack headless browse binary.
+
+    Order: explicit GSTACK_BROWSE_BIN, Claude-host install, canonical
+    ~/.gstack install. Shared by doctor, setup, and dispatch provisioning so a
+    ~/.gstack-only install is not falsely reported absent (ADAPTER-4).
+    """
+    candidates: list[Path] = []
+    raw = os.environ.get("GSTACK_BROWSE_BIN", "").strip()
+    if raw:
+        candidates.append(Path(raw).expanduser())
+    home = Path.home()
+    candidates.extend(
+        [
+            home / ".claude/skills/gstack/browse/dist/browse",
+            home / ".gstack/repos/gstack/browse/dist/browse",
+        ]
+    )
+    seen: set[Path] = set()
+    unique: list[Path] = []
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        unique.append(candidate)
+    return unique
+
+
+def resolve_gstack_browse_bin() -> Path | None:
+    """First executable gstack browse binary among known install locations."""
+    for candidate in gstack_browse_bin_candidates():
+        try:
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return candidate
+        except OSError:
+            continue
+    return None
+
+
 # --------------------------------------------------------------------------- #
 # Non-destructive liveness probe.                                            #
 # POSIX: os.kill(pid, 0) (unchanged). Windows: OpenProcess +                  #

@@ -221,6 +221,7 @@ Treat routing candidates as first-class only after their readiness gate passes:
 | Codex | yes | yes | Desktop/CLI available when needed, context-mode registered for large-output work, ACP handshake passes for structured dispatch. |
 | Cursor | yes | yes | Cursor Desktop or CLI path present for the controller-host role; `cursor-agent` present and ACP handshake passes for worker use; model-currency probe is current or explicitly accepted as stale. |
 | Grok | yes | read-only analysis/research only until write probe passes | Grok Build/headless flags present; structured ACP path passes before ACP dispatch; bash-tail is fallback-only and must obey the marker limits in Composition rules. File-writing is not routable unless `goalflight_doctor.py --worker-write-probe --write-probe-agent grok-code` passes in the current environment. |
+| Kimi | worker only | yes, bash-tail coding | `kimi` is on PATH or executable at `~/.kimi-code/bin/kimi`; OAuth is ready; bare `-p` write probe passes. The preset resolves the off-PATH fallback, changes to the requested cwd, and emits text markers without `--auto`/`--yolo` (both conflict with print mode). |
 | OpenCode | yes | helper/raw passthrough only | `opencode` on PATH; host-specific helpers under `scripts/hosts/opencode/` and live smokes in `tests/bash/test-opencode-*`; raw `goalflight_dispatch.py -- <cmd>` passthrough is allowed when the caller owns the command contract. Not a `goalflight_dispatch.py --agent opencode` preset. |
 | Claude compatibility path | yes | yes | Adapter-owned CLI/plugin probes pass; startup gate applies where the adapter requires serialized initialization. |
 
@@ -463,6 +464,7 @@ flag and its position differ — a blind append breaks codex/grok ACP), so pass 
 |---|---|---|
 | grok-code | `--agent grok-code` (no `--model` — harness picks) | `grok agent stdio` (harness inserts the model) |
 | grok-research | `--agent grok-research` (no `--model` — harness picks) | `grok agent stdio` (harness inserts the model) |
+| kimi | `--agent kimi` (default `kimi-code/k3`) | bash-tail only; explicit `--model <id>` passes through |
 | claude (speed) | `--agent claude --model haiku` | `claude-code-cli-acp --model <id>` |
 | codex | `--agent codex --model o3` | bash `codex exec --model <id>`; ACP `-c model=<id>` |
 | cursor | `--agent cursor --model sonnet-4` | `cursor-agent --model <id> acp` (best-effort) |

@@ -1485,6 +1485,33 @@ def test_stale_claim_result_marker_with_rate_limit_text_completes() -> None:
         assert status_payload.get("terminal_marker", {}).get("kind") == "RESULT", status_payload
 
 
+def test_claim_recovery_terminal_marker_normalization_is_kimi_only() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tail = Path(td) / "normalized-marker.tail"
+        tail.write_text("  COMPLETE: normalized terminal marker\n", encoding="utf-8")
+
+        for agent in ("codex", "grok"):
+            state, reason, marker = D._resolve_claim_terminal_outcome(
+                {},
+                reason="stale_claim_launch_token_lost",
+                tail=tail,
+                ignore_prefix_lines=[],
+                agent=agent,
+            )
+            assert state == "worker_dead", (agent, state, reason, marker)
+            assert marker is None, (agent, marker)
+
+        state, reason, marker = D._resolve_claim_terminal_outcome(
+            {},
+            reason="stale_claim_launch_token_lost",
+            tail=tail,
+            ignore_prefix_lines=[],
+            agent="kimi",
+        )
+        assert state == "complete", (state, reason, marker)
+        assert marker and marker["kind"] == "COMPLETE", marker
+
+
 def test_drain_replay_argv_injects_queue_control_flags() -> None:
     """Poison-pair: drain replay must inject _drain_launch_argv queue-control flags.
 
@@ -3971,6 +3998,7 @@ def main() -> None:
     test_fresh_token_only_claim_waits_for_stale_window()
     test_stale_claim_launch_token_requires_matching_worker_record()
     test_stale_claim_result_marker_with_rate_limit_text_completes()
+    test_claim_recovery_terminal_marker_normalization_is_kimi_only()
     test_drain_replay_argv_injects_queue_control_flags()
     test_drain_requires_token_matched_ledger_before_clearing_claim()
     test_legacy_claim_dead_worker_without_token_defers_fail_closed()

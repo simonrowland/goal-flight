@@ -212,6 +212,18 @@ def _receipt_runner(captured: list[list[str]]):
     return run
 
 
+def _ambiguous_launch_runner(captured: list[list[str]]):
+    """Launch command fails ambiguously AFTER being issued: no receipt, launch_unconfirmed."""
+
+    def run(argv: list[str]) -> tuple[int, str, str]:
+        captured.append(list(argv))
+        if "goalflight_fleet_launch_detached.py" not in " ".join(argv):
+            return 0, "{}", ""
+        return 255, "", "connection lost after launch command"
+
+    return run
+
+
 def _drain_args(queue: Path, fleet_dir: Path, *, remote_runner=None) -> argparse.Namespace:
     return argparse.Namespace(
         queue_dir=str(queue),
@@ -445,6 +457,69 @@ def test_remote_drain_claim_token_prevents_second_launch() -> None:
         assert_true("one remote launch", len(launch_calls) == 1)
 
 
+def test_remote_drain_launch_unconfirmed_retains_carrier() -> None:
+    # b-065 round 2 (review P1): an ambiguous remote launch (launch command
+    # issued, then the transport died — no receipt) is NOT positive launch
+    # evidence. The carrier must be retained so a later reconciliation with a
+    # real receipt can resolve it; the drain must not report it launched.
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        fleet_dir = tmp / "fleet"
+        _fixture_fleet(fleet_dir)
+        queue = tmp / "state" / "dispatch-queue"
+        queue.mkdir(parents=True)
+        _write_remote_queue_entry(queue, "remote-drain-ambiguous")
+        captured: list[list[str]] = []
+        args = _drain_args(queue, fleet_dir, remote_runner=_ambiguous_launch_runner(captured))
+        with isolated_env(tmp, fleet_dir):
+            first = D._drain_queue_once(args)
+            second = D._drain_queue_once(args)
+
+        record = json.loads((tmp / "state" / "runs.d" / "remote-drain-ambiguous.json").read_text())
+        assert_true("ledger launch_unconfirmed", record.get("launch_unconfirmed") is True)
+        assert_true("ledger has no receipt", not record.get("remote_launch_receipt"))
+        assert_true("ambiguous launch not counted launched", first["launched"] == 0)
+        carriers = list(queue.glob("*.json.claimed-*"))
+        assert_true("carrier retained in queue root", len(carriers) == 1)
+        assert_true("carrier not quarantined-as-resolved", not list((queue / "quarantine").glob("*")))
+        assert_true("second drain retains carrier", len(list(queue.glob("*.json.claimed-*"))) == 1)
+        assert_true("second drain no launch", second["launched"] == 0)
+        launch_calls = [argv for argv in captured if "goalflight_fleet_launch_detached.py" in " ".join(argv)]
+        assert_true("exactly one launch attempt", len(launch_calls) == 1)
+
+
+def test_remote_drain_pending_carrier_cleanup_is_not_counted_as_launch() -> None:
+    # b-065 round 2 (review P2): a ledger-confirmed launch whose carrier
+    # cleanup comes back "pending" is counted as pending (plus the alert),
+    # never as launched — "launched" means launched AND carrier resolved.
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        fleet_dir = tmp / "fleet"
+        _fixture_fleet(fleet_dir)
+        queue = tmp / "state" / "dispatch-queue"
+        queue.mkdir(parents=True)
+        _write_remote_queue_entry(queue, "remote-drain-pending-cleanup")
+        captured: list[list[str]] = []
+        old_cleanup = D._positive_live_carrier_cleanup
+        stderr = io.StringIO()
+        with isolated_env(tmp, fleet_dir):
+            D._positive_live_carrier_cleanup = lambda *_a, **_k: "pending"
+            try:
+                with contextlib.redirect_stderr(stderr):
+                    payload = D._drain_queue_once(
+                        _drain_args(queue, fleet_dir, remote_runner=_receipt_runner(captured))
+                    )
+            finally:
+                D._positive_live_carrier_cleanup = old_cleanup
+
+        launch_calls = [argv for argv in captured if "goalflight_fleet_launch_detached.py" in " ".join(argv)]
+        assert_true("one remote launch", len(launch_calls) == 1)
+        assert_true("pending cleanup not launched", payload["launched"] == 0)
+        assert_true("pending claim counted", payload["pending_claims"] == 1)
+        assert_true("alert emitted", "CLAIM-RECOVERY-ALERT" in stderr.getvalue())
+        assert_true("carrier left in root", len(list(queue.glob("*.json.claimed-*"))) == 1)
+
+
 def test_local_drain_without_remote_node_uses_existing_local_replay() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
@@ -522,6 +597,8 @@ def main() -> None:
     test_remote_drain_short_submit_account_fails_closed()
     test_remote_drain_unknown_node_is_clean_blocked_and_keeps_queue()
     test_remote_drain_claim_token_prevents_second_launch()
+    test_remote_drain_launch_unconfirmed_retains_carrier()
+    test_remote_drain_pending_carrier_cleanup_is_not_counted_as_launch()
     test_local_drain_without_remote_node_uses_existing_local_replay()
     print("OK: remote drain tests pass")
 
