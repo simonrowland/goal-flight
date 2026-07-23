@@ -6,7 +6,34 @@ incremented when meaningful skill behaviour changes.
 
 ## [Unreleased]
 
-- Added the `kimi` bash-tail coding-worker preset with off-PATH binary resolution, cwd-safe print-mode execution, Moonshot provider/capacity wiring, adapter validation, Kimi-rendered marker tolerance, and live-smoke coverage. Bare `-p` auto-runs tools; incompatible `--auto` and `-y`/`--yolo` flags are forbidden.
+## [1.2.4] — 2026-07-23
+
+### Fixed
+
+- False worker-death: bounded output-is-truth veto on `--wait`, broader terminal-marker
+  recall (diff-prefixed and harness-echoed markers), and dead-pid markers honored.
+- Quiet workers are not dead workers: a second liveness channel reads the worker's own
+  session journal; recent journal growth extends idle deadlines and forces re-verification
+  before any terminal dead verdict, and long-running workers escalate to non-terminal
+  attention states instead of being terminated.
+- ACP sessions that close cleanly with no output and no terminal marker now classify
+  `failed` (`empty_session`) instead of `complete` — no more silent no-op false greens.
+- A read-only dispatch to an agent without OS-sandbox support now proceeds with
+  equivalent permission-layer enforcement and a visible fallback notice instead of
+  dying `blocked_os_sandbox`; agents without an enforcing layer still refuse.
+- Web-QA screenshot suffix and page-signal counting fixes; stale-claim test alignment.
+- `/goal-flight usage` claude row: fast reader pass and degraded-but-reported rows kept.
+
+### Added
+
+- `/goal-flight usage`: one table of provider headroom with local reset times, humanized
+  deltas, health flags, `--json`, and a soonest-reset summary line. Optional local readers
+  degrade to unavailable rows.
+- Late-bound per-dispatch worker homes at launch on both transports, with
+  `effective_account` recorded by both ledger writers, a durable request envelope on the
+  ledger row, bounded at-most-once auto-requeue for requeueable terminal classes, and
+  per-path home cleanup ownership.
+- The `kimi` bash-tail coding-worker preset with off-PATH binary resolution, cwd-safe print-mode execution, Moonshot provider/capacity wiring, adapter validation, Kimi-rendered marker tolerance, and live-smoke coverage. Bare `-p` auto-runs tools; incompatible `--auto` and `-y`/`--yolo` flags are forbidden.
 
 ## [1.2.3] — 2026-07-08
 
