@@ -24,13 +24,17 @@ class ReaderSpec:
     key: str
     provider: str
     filename: str
+    # extra_args: the claude sweep defaults to full TUI captures, which exceed the
+    # aggregator's per-reader timeout; the table only needs the fast login-health
+    # pass (run the reader directly for full numbers).
+    extra_args: tuple = ()
 
 
 READERS = (
     ReaderSpec("codex", "codex", "codex_usage.py"),
     ReaderSpec("kimi", "kimi-code", "kimi_usage.py"),
     ReaderSpec("cursor", "cursor", "cursor_usage.py"),
-    ReaderSpec("claude", "claude", "claude_usage.py"),
+    ReaderSpec("claude", "claude", "claude_usage.py", ("--skip-tui",)),
 )
 
 ROW_KEYS = ("provider", "account", "remaining", "reset_at", "flags")
@@ -469,15 +473,20 @@ def run_reader(
         if not reader_path.is_file():
             return [unavailable_row(spec.provider)]
         completed = subprocess.run(
-            [sys.executable, str(reader_path), "--json"],
+            [sys.executable, str(reader_path), "--json", *spec.extra_args],
             capture_output=True,
             text=True,
             timeout=timeout_s,
             check=False,
         )
-        if completed.returncode != 0:
+        # A nonzero exit with parseable rows is a reader REPORTING problems
+        # (stale logins, cooling seats), not failing to report - keep the rows.
+        try:
+            payload = json.loads(completed.stdout)
+        except (json.JSONDecodeError, ValueError):
             return [unavailable_row(spec.provider)]
-        payload = json.loads(completed.stdout)
+        if completed.returncode != 0 and not payload:
+            return [unavailable_row(spec.provider)]
         return normalize_payload(spec, payload, now=now)
     except (OSError, subprocess.TimeoutExpired, UnicodeError, ValueError):
         return [unavailable_row(spec.provider)]

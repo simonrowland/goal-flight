@@ -316,3 +316,37 @@ def test_table_renders_health_flags():
     assert "unavailable  ⚠unavailable" in rendered
     assert "needs-login  ⚠auth" in rendered
     assert rendered.endswith("soonest reset: none")
+
+
+def test_claude_reader_invoked_with_skip_tui(tmp_path):
+    """The claude sweep's full-TUI default exceeds the reader timeout; the
+    aggregator must request the fast login-health pass (t-189)."""
+    from goalflight_usage import READERS, run_reader
+
+    spec = next(s for s in READERS if s.key == "claude")
+    assert "--skip-tui" in spec.extra_args
+
+    reader = tmp_path / spec.filename
+    reader.write_text(
+        "import json, sys\n"
+        "if '--skip-tui' not in sys.argv: sys.exit(3)\n"
+        "print(json.dumps([{'label': 'x', 'logged_in': False}]))\n"
+    )
+    rows = run_reader(spec, readers_dir=tmp_path, timeout_s=10.0, now=0.0)
+    assert rows and 'unavailable' not in (rows[0].get('flags') or ())
+
+
+def test_nonzero_exit_with_valid_rows_is_kept(tmp_path):
+    """A reader that exits nonzero while emitting valid rows is reporting
+    degraded accounts, not failing - its rows must reach the table (t-189)."""
+    from goalflight_usage import ReaderSpec, run_reader
+
+    spec = ReaderSpec("claude", "claude", "r.py", ("--skip-tui",))
+    reader = tmp_path / "r.py"
+    reader.write_text(
+        "import json, sys\n"
+        "print(json.dumps([{'label': 'x', 'logged_in': False}]))\n"
+        "sys.exit(1)\n"
+    )
+    rows = run_reader(spec, readers_dir=tmp_path, timeout_s=10.0, now=0.0)
+    assert rows and 'unavailable' not in (rows[0].get('flags') or ())
