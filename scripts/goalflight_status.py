@@ -601,7 +601,7 @@ def status_payload() -> dict:
     dispatch = dict(
         dispatch,
         records=[
-            _reconcile_output_tail_record(record)
+            _decorate_trace_status(_reconcile_output_tail_record(record))
             for record in dispatch.get("records", [])
         ],
     )
@@ -613,6 +613,22 @@ def status_payload() -> dict:
         "dispatch": dispatch,
         "warnings": _queue_drainer_warnings(),
     }
+
+
+def _decorate_trace_status(record: dict) -> dict:
+    """Surface the watcher's cached second liveness channel without classifying."""
+    sidecar = _status_json_payload(record)
+    if not sidecar:
+        return record
+    out = dict(record)
+    for key in ("trace_path", "trace_mtime", "trace_active"):
+        if key in sidecar:
+            out[key] = sidecar[key]
+    if sidecar.get("liveness_state") == "running_via_trace":
+        out["liveness_state"] = "running_via_trace"
+    if sidecar.get("state") in {"long_running", "long_running_review"}:
+        out["trace_attention_state"] = sidecar["state"]
+    return out
 
 
 def scope_payload(payload: dict, project_root: str | None) -> dict:
@@ -968,6 +984,10 @@ def _payload_with_explicit_wait_records(scoped_payload: dict, machine_payload: d
 
 
 def _signal(record: dict) -> str:
+    if record.get("trace_active"):
+        attention = record.get("trace_attention_state")
+        suffix = f"; {attention}" if attention else ""
+        return f"quiet console, active trace{suffix}"
     pid = record.get("worker_pid")
     if _rechecked_worker_alive(record):
         return f"pid{pid}; {_reattach_hint(record)}"

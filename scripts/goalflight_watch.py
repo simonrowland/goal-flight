@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import re
 import signal
+import subprocess
 import sys
 import time
 
@@ -90,6 +91,270 @@ PROMPT_ECHO_MAX_ANCHORS = 10
 # one-off noisy idle samples.
 WEDGE_CONFIRM_SAMPLES = 2
 BLOCKED_TASK_BREADCRUMB_STATE = "blocked_task_breadcrumb"
+TRACE_RESOLUTION_RETRY_SECS = 300.0
+TRACE_LSOF_TIMEOUT_SECS = 1.0
+TRACE_LONG_RUNNING_SECS = 12 * 60 * 60.0
+TRACE_REVIEW_SECS = 48 * 60 * 60.0
+
+
+def _known_trace_roots(*, state_dir: Path | None = None, home: Path | None = None) -> tuple[Path, ...]:
+    user_home = (home or Path.home()).expanduser().resolve(strict=False)
+    machine_state = (state_dir or goalflight_ledger.state_dir()).expanduser().resolve(strict=False)
+    roots = [
+        user_home / ".codex" / "sessions",
+        user_home / ".kimi-code" / "sessions",
+    ]
+    dispatch_homes = (machine_state / "dispatch-homes").resolve(strict=False)
+    try:
+        roots.extend(
+            path / "sessions"
+            for path in dispatch_homes.iterdir()
+            if path.is_dir()
+            and not path.is_symlink()
+            and path.resolve(strict=False).parent == dispatch_homes
+        )
+    except OSError:
+        pass
+    return tuple(path.resolve(strict=False) for path in roots)
+
+
+def _path_under_known_trace_root(path: Path, roots: tuple[Path, ...]) -> bool:
+    try:
+        resolved = path.expanduser().resolve(strict=False)
+        return any(resolved != root and resolved.is_relative_to(root) for root in roots)
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def _newest_trace_file(root: Path, roots: tuple[Path, ...]) -> Path | None:
+    try:
+        candidates = [
+            path.resolve(strict=False)
+            for path in root.rglob("*")
+            if path.is_file() and _path_under_known_trace_root(path, roots)
+        ]
+        return max(candidates, key=lambda path: (path.stat().st_mtime, str(path))) if candidates else None
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _worker_process_tree(pid: int, *, ps_runner=None) -> tuple[int, ...]:
+    runner = ps_runner or subprocess.run
+    try:
+        proc = runner(
+            ["ps", "-axo", "pid=,ppid="],
+            capture_output=True,
+            text=True,
+            timeout=TRACE_LSOF_TIMEOUT_SECS,
+            check=False,
+        )
+        children: dict[int, list[int]] = {}
+        for line in (proc.stdout or "").splitlines():
+            child_text, parent_text = line.split()
+            children.setdefault(int(parent_text), []).append(int(child_text))
+        found: list[int] = []
+        pending = [pid]
+        while pending:
+            current = pending.pop()
+            if current in found:
+                continue
+            found.append(current)
+            pending.extend(children.get(current, ()))
+        return tuple(found)
+    except (OSError, subprocess.TimeoutExpired, TypeError, ValueError):
+        return (pid,)
+
+
+def _trace_from_lsof(
+    pid: int,
+    roots: tuple[Path, ...],
+    *,
+    lsof_runner=None,
+    ps_runner=None,
+) -> Path | None:
+    runner = lsof_runner or subprocess.run
+    pids = _worker_process_tree(pid, ps_runner=ps_runner)
+    try:
+        proc = runner(
+            ["lsof", "-Fn", "-p", ",".join(str(value) for value in pids)],
+            capture_output=True,
+            text=True,
+            timeout=TRACE_LSOF_TIMEOUT_SECS,
+            check=False,
+        )
+        candidates = []
+        for line in (proc.stdout or "").splitlines():
+            if not line.startswith("n"):
+                continue
+            path = Path(line[1:])
+            if _path_under_known_trace_root(path, roots) and path.is_file():
+                candidates.append(path.resolve(strict=False))
+        return max(candidates, key=lambda path: (path.stat().st_mtime, str(path))) if candidates else None
+    except (OSError, subprocess.TimeoutExpired, RuntimeError, ValueError):
+        return None
+
+
+class TraceLiveness:
+    """Resolve a deterministic worker trace once, then use stat-only polling."""
+
+    def __init__(
+        self,
+        *,
+        dispatch_id: str | None,
+        worker_pid: int,
+        effective_account: str | None = None,
+        cached_path: str | None = None,
+        state_dir: Path | None = None,
+        home: Path | None = None,
+        started_mono: float | None = None,
+        retry_secs: float = TRACE_RESOLUTION_RETRY_SECS,
+        lsof_runner=None,
+        ps_runner=None,
+    ):
+        self.dispatch_id = dispatch_id
+        self.worker_pid = worker_pid
+        self.effective_account = effective_account
+        self.state_dir = (state_dir or goalflight_ledger.state_dir()).resolve(strict=False)
+        self.roots = _known_trace_roots(state_dir=self.state_dir, home=home)
+        self.started_mono = active_monotonic() if started_mono is None else started_mono
+        self.retry_secs = retry_secs
+        self.lsof_runner = lsof_runner
+        self.ps_runner = ps_runner
+        self.path = None
+        if cached_path:
+            candidate = Path(cached_path)
+            if _path_under_known_trace_root(candidate, self.roots):
+                self.path = candidate.resolve(strict=False)
+
+    def _resolve(self, now_mono: float) -> None:
+        if self.path is not None or now_mono - self.started_mono > self.retry_secs:
+            return
+        if self.dispatch_id and self.effective_account:
+            dispatch_homes = (self.state_dir / "dispatch-homes").resolve(strict=False)
+            dispatch_home = (dispatch_homes / self.dispatch_id).resolve(strict=False)
+            if dispatch_home.parent == dispatch_homes:
+                pinned_root = (dispatch_home / "sessions").resolve(strict=False)
+                if pinned_root.parent == dispatch_home:
+                    pinned_roots = self.roots + (pinned_root,)
+                    self.path = _newest_trace_file(pinned_root, pinned_roots)
+                    if self.path is not None:
+                        self.roots = pinned_roots
+                        return
+        self.path = _trace_from_lsof(
+            self.worker_pid,
+            self.roots,
+            lsof_runner=self.lsof_runner,
+            ps_runner=self.ps_runner,
+        )
+
+    def sample(self, *, now_epoch: float, now_mono: float, idle_threshold: float) -> dict:
+        try:
+            self._resolve(now_mono)
+            if self.path is None:
+                return {}
+            mtime = self.path.stat().st_mtime
+            return {
+                "trace_path": str(self.path),
+                "trace_mtime": mtime,
+                "trace_active": bool(
+                    idle_threshold > 0
+                    and 0 <= now_epoch - mtime < idle_threshold
+                ),
+            }
+        except (OSError, RuntimeError, ValueError):
+            return {"trace_path": str(self.path)} if self.path is not None else {}
+
+
+def _trace_vetoes_idle(*, trace_active: bool) -> bool:
+    # reports of my death are greatly exaggerated.
+    return bool(trace_active)
+
+
+def _trace_attention_state(
+    *,
+    trace_active: bool,
+    runtime_secs: float,
+    long_running_secs: float,
+    review_secs: float,
+) -> str | None:
+    if not trace_active:
+        return None
+    if review_secs > 0 and runtime_secs >= review_secs:
+        return "long_running_review"
+    if long_running_secs > 0 and runtime_secs >= long_running_secs:
+        return "long_running"
+    return None
+
+
+def post_trace_attention(
+    dispatch_id: str | None,
+    state: str | None,
+    posted_states: set[str],
+    *,
+    post_func=None,
+) -> None:
+    if not dispatch_id or state not in {"long_running", "long_running_review"} or state in posted_states:
+        return
+    posted_states.add(state)
+    try:
+        if post_func is None:
+            import goalflight_messages as gm
+
+            def post_func(**kwargs):
+                return gm.post_message(messages_dir=gm.default_messages_dir(), **kwargs)
+
+        post_func(
+            dispatch_id=dispatch_id,
+            msg_type="monitor",
+            payload={
+                "text": (
+                    f"{state}: quiet console with an actively growing session trace; "
+                    "worker remains live and requires controller attention."
+                )
+            },
+            source={"node": "local", "adapter": "watcher", "transport": "trace-liveness"},
+        )
+    except Exception:
+        return
+
+
+def _trace_ledger_account(dispatch_id: str | None) -> str | None:
+    if not dispatch_id:
+        return None
+    try:
+        payload = json.loads(
+            goalflight_ledger.record_path(dispatch_id, create=False).read_text(
+                encoding="utf-8"
+            )
+        )
+        account = payload.get("effective_account")
+        return account if isinstance(account, str) and account else None
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return None
+
+
+def _trace_ledger_started_epoch(dispatch_id: str | None) -> float | None:
+    if not dispatch_id:
+        return None
+    try:
+        payload = json.loads(
+            goalflight_ledger.record_path(dispatch_id, create=False).read_text(
+                encoding="utf-8"
+            )
+        )
+        started = goalflight_ledger.parse_utc(payload.get("started_at"))
+        return started.timestamp() if started is not None else None
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return None
+
+
+def _cached_trace_path(status_path: Path) -> str | None:
+    try:
+        payload = json.loads(status_path.read_text(encoding="utf-8"))
+        value = payload.get("trace_path")
+        return value if isinstance(value, str) and value else None
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return None
 
 
 def _marker_state(marker: dict | None) -> str:
@@ -222,6 +487,9 @@ def _status_snapshot(payload: dict) -> dict:
         "liveness_state",
         "tail_path",
         "status_path",
+        "trace_path",
+        "trace_mtime",
+        "trace_active",
         "terminal_marker",
         "last_marker",
         "updated_at",
@@ -838,6 +1106,18 @@ def main() -> int:
     parser.add_argument("--poll-secs", type=float, default=2.0)
     parser.add_argument("--max-idle-secs", type=float, default=180.0)
     parser.add_argument("--cpu-epsilon", type=float, default=0.1)
+    parser.add_argument(
+        "--trace-long-running-secs",
+        type=float,
+        default=TRACE_LONG_RUNNING_SECS,
+        help="Active-trace runtime before a non-terminal long_running notice.",
+    )
+    parser.add_argument(
+        "--trace-review-secs",
+        type=float,
+        default=TRACE_REVIEW_SECS,
+        help="Active-trace absolute runtime before long_running_review (never auto-kills).",
+    )
     parser.add_argument("--pgid", type=int)
     parser.add_argument("--controller-pid", type=int)
     parser.add_argument("--detached", action="store_true",
@@ -886,13 +1166,21 @@ def main() -> int:
         print(json.dumps({"state": payload["state"], "reason": payload["reason"], "status_path": str(status_path)}, sort_keys=True))
         return 4
     last_size = -1
+    trace_liveness = TraceLiveness(
+        dispatch_id=args.dispatch_id,
+        worker_pid=args.pid,
+        effective_account=_trace_ledger_account(args.dispatch_id),
+        cached_path=_cached_trace_path(status_path),
+    )
     # Idle accounting uses the sleep-excluding clock (active_monotonic):
     # macOS CLOCK_UPTIME_RAW / Linux CLOCK_MONOTONIC freeze across system
     # sleep, so a lid-close suspend does NOT count as worker idle time —
     # wall-clock deltas here produced phantom idle_timeout kills on wake
     # (same class as watch-dispatch-tail.sh's suspend-gap fix, 2026-06-09).
-    # time.time() remains for epoch display fields (updated_at) only.
+    # time.time() remains for epoch display fields and the deliberate wall-clock
+    # controller-attention thresholds; it never drives idle termination.
     last_change = active_monotonic()
+    watcher_started_epoch = _trace_ledger_started_epoch(args.dispatch_id) or time.time()
     terminal = None
     markers: list[dict] = []
     exit_reason = "unknown"
@@ -1079,6 +1367,7 @@ def main() -> int:
     atexit.register(lambda: flush_terminal_status("watcher_exit"))
 
     posted_mail_keys: set = set()  # per-run dedup for the worker->controller mail bridge
+    posted_trace_attention: set[str] = set()
     while True:
         markers, size = extract_markers(tail, ignore_prefix_lines=ignore_prefix_lines)
         # Bridge worker USER-NEED/USER-CONFIRM/BLOCKED markers into the dispatch
@@ -1091,6 +1380,11 @@ def main() -> int:
             last_change = active_monotonic()
         now = time.time()
         seconds_since_event = active_monotonic() - last_change
+        trace_sample = trace_liveness.sample(
+            now_epoch=now,
+            now_mono=active_monotonic(),
+            idle_threshold=args.max_idle_secs,
+        )
         terminal = _last_line_is_terminal_marker(
             tail,
             ignore_prefix_lines=ignore_prefix_lines,
@@ -1126,6 +1420,14 @@ def main() -> int:
             thresholds,
             low_power_relax=low_power_relax,
         )
+        trace_idle_veto = (
+            liveness_state == "wedged"
+            and _trace_vetoes_idle(
+                trace_active=bool(trace_sample.get("trace_active")),
+            )
+        )
+        if trace_idle_veto:
+            liveness_state = "running_via_trace"
         payload = {
             "schema": "goalflight.status.v1",
             "dispatch_id": args.dispatch_id,
@@ -1147,6 +1449,23 @@ def main() -> int:
             "state": "running_quiet" if liveness_state == "running_quiet" else "running",
             "updated_at": int(now),
         }
+        payload.update(trace_sample)
+        if trace_idle_veto:
+            payload["reason"] = "quiet_console_active_trace"
+        trace_attention = _trace_attention_state(
+            trace_active=bool(trace_sample.get("trace_active")),
+            runtime_secs=max(0.0, now - watcher_started_epoch),
+            long_running_secs=args.trace_long_running_secs,
+            review_secs=args.trace_review_secs,
+        )
+        if trace_attention:
+            payload["state"] = trace_attention
+            payload["reason"] = "quiet_console_active_trace"
+            post_trace_attention(
+                args.dispatch_id,
+                trace_attention,
+                posted_trace_attention,
+            )
         if low_power_relax:
             payload["low_power_relax"] = True
         if terminal:
@@ -1174,6 +1493,34 @@ def main() -> int:
             and not alive(args.controller_pid)
             and _controller_dead_is_terminal(detached=bool(args.detached))
         ):
+            if bool(trace_sample.get("trace_active")):
+                # A dead launcher/controller is not authoritative while the
+                # validated worker trace is still advancing. Reconcile both
+                # process identity and output before considering an orphan
+                # verdict; the veto naturally expires when trace mtime ages
+                # past the activity window.
+                worker_is_alive, identity_reason, current_identity = worker_alive(
+                    args.pid, expected_identity
+                )
+                reconciled = _final_terminal_marker(
+                    tail,
+                    ignore_prefix_lines=ignore_prefix_lines,
+                    kimi_output=args.agent == "kimi",
+                )
+                if reconciled:
+                    terminal_seen = reconciled
+                    payload["terminal_marker"] = terminal_seen
+                    payload["state"] = _marker_state(terminal_seen)
+                    exit_reason = f"marker:{terminal_seen['kind']}:final_reconciliation"
+                    exit_code = _exit_code_for_state(payload["state"])
+                    write_payload(payload, reason=exit_reason, terminal_write=True)
+                    break
+                payload["worker_alive"] = worker_is_alive
+                payload["worker_identity_reason"] = identity_reason
+                payload["worker_identity"] = _identity_token(current_identity)
+                write_payload(payload, reason="controller_dead_active_trace_reverify")
+                time.sleep(args.poll_secs)
+                continue
             payload["state"] = "orphaned"
             exit_reason = "controller_dead"
             exit_code = 3
@@ -1204,6 +1551,34 @@ def main() -> int:
                 exit_reason = f"marker:{terminal_seen['kind']}:final_reconciliation"
                 exit_code = _exit_code_for_state(payload["state"])
             else:
+                if bool(trace_sample.get("trace_active")):
+                    # Re-check identity and output at the terminal boundary.
+                    # A genuinely dead pid cannot keep its validated trace
+                    # fresh, so this veto is bounded by the trace activity
+                    # window without adding a separate confirmation counter.
+                    worker_is_alive, identity_reason, current_identity = worker_alive(
+                        args.pid, expected_identity
+                    )
+                    reconciled = _final_terminal_marker(
+                        tail,
+                        ignore_prefix_lines=ignore_prefix_lines,
+                        kimi_output=args.agent == "kimi",
+                    )
+                    if reconciled:
+                        terminal_seen = reconciled
+                        payload["terminal_marker"] = terminal_seen
+                        payload["state"] = _marker_state(terminal_seen)
+                        exit_reason = f"marker:{terminal_seen['kind']}:trace_reconciliation"
+                        exit_code = _exit_code_for_state(payload["state"])
+                        write_payload(payload, reason=exit_reason, terminal_write=True)
+                        break
+                    payload["worker_alive"] = worker_is_alive
+                    payload["worker_identity_reason"] = identity_reason
+                    payload["worker_identity"] = _identity_token(current_identity)
+                    payload["liveness_state"] = "running_via_trace"
+                    write_payload(payload, reason="pid_resolved_dead_active_trace_reverify")
+                    time.sleep(args.poll_secs)
+                    continue
                 # Output-is-truth veto, gated on ACTIVE growth (not the whole idle
                 # window): the tracked pid is often a launcher/wrapper that exits while
                 # a detached worker child keeps streaming. Veto worker_dead only while
