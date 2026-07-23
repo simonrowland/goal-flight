@@ -914,9 +914,14 @@ def case_runner_thought_stream_survives_progress_stall_wall() -> None:
         timeout_s=30.0,
     )
 
-    assert returncode == 0, (stdout, stderr, status)
-    assert status["state"] == "complete", status
-    assert status["ok"] is True, status
+    # Thought/progress events prove the worker was live, but they are not final
+    # assistant output. The transport completed without a required terminal
+    # marker, so the result must not be reported as complete.
+    assert returncode != 0, (stdout, stderr, status)
+    assert status["state"] == "failed", status
+    assert status["ok"] is False, status
+    assert status["reason"] == "empty_session", status
+    assert status["error"]["reason"] == "empty_session", status
     assert status["wedge_progress_seen"] >= 1, status
     assert status["worker_alive"] is False, status
     assert not _pid_alive(status.get("worker_pid")), (status, stderr)
@@ -931,6 +936,7 @@ def case_terminal_state_endturn_beats_tail_race_wedge() -> None:
     state, error = decide_terminal_state(
         result_ok=True,
         result_error=None,
+        result_text="Completed work.",
         heartbeat_outcome="wedged",
         killed_by_heartbeat=True,
         cancelled_for_marker=False,

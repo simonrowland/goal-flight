@@ -1133,12 +1133,16 @@ def decide_terminal_state(
     result_ok: bool,
     result_error: dict | None,
     result_text: str | None = None,
+    assistant_output: str | None = None,
     stop_reason: str | None = None,
+    agent: str | None = None,
+    events_seen: int = 0,
     heartbeat_outcome: str | None,
     killed_by_heartbeat: bool,
     cancelled_for_marker: bool,
     early_marker: str | None,
     heartbeat_error: dict | None,
+    terminal_marker_present: bool = False,
     successful_terminal_marker: bool = False,
 ) -> tuple[str, dict | None]:
     """Resolve the runner's terminal (state, error) from the prompt result and
@@ -1151,8 +1155,8 @@ def decide_terminal_state(
     ``finally`` cancels it, so a worker that has ALREADY completed its turn is
     briefly alive-and-silent (returned from the turn, waiting to be closed) and
     on an aggressive cadence one of them can trip in that tail AFTER end_turn was
-    received. The worker *spoke* (a terminal end_turn), so it was not silently
-    wedged: result_ok wins. This can never mask a real silence wedge, because a
+    received. result_ok wins that race, then still has to satisfy the completion
+    evidence gate below. This can never mask a real silence wedge, because a
     worker killed mid-turn cannot emit end_turn (the SDK rejects the pending
     prompt on the closed pipe), so a real wedge always has ``result_ok`` False.
 
@@ -1164,6 +1168,11 @@ def decide_terminal_state(
 
     A killed-but-no-recorded-outcome race defaults to the silence-class
     ``"wedged"`` (the dead-sample wedge is what the kill-without-outcome path is).
+
+    Clean close and end_turn are transport evidence, not work evidence. Complete
+    therefore also requires a terminal marker or non-whitespace assistant output.
+    Tool activity alone, regardless of ``events_seen``, is not sufficient: Goal
+    Flight workers are required to emit a terminal marker.
     """
     heartbeat_terminal = heartbeat_outcome or ("wedged" if killed_by_heartbeat else None)
     if _is_runaway_terminal(heartbeat_terminal, heartbeat_error):
@@ -1192,6 +1201,26 @@ def decide_terminal_state(
                     "signature": signature,
                     "excerpt": excerpt,
                 }
+        has_terminal_marker = terminal_marker_present or successful_terminal_marker
+        has_assistant_output = bool(
+            str(result_text or "").strip() or str(assistant_output or "").strip()
+        )
+        if not has_terminal_marker and not has_assistant_output:
+            empty_error: dict[str, object] = {
+                "code": -1,
+                "message": "empty_session",
+                "reason": "empty_session",
+                "events_seen": max(0, int(events_seen)),
+            }
+            if stop_reason:
+                empty_error["stop_reason"] = stop_reason
+            if str(agent or "").lower().startswith("claude"):
+                empty_error["hint"] = (
+                    "Check Claude worker authentication with `claude auth status`."
+                )
+            else:
+                empty_error["hint"] = "Check worker authentication for the selected agent."
+            return "failed", empty_error
         return "complete", result_error
     return "failed", result_error
 
@@ -2748,12 +2777,16 @@ async def _run_acp_dispatch_impl(
             result_ok=result.ok,
             result_error=final_prompt_result.error,
             result_text=final_prompt_result.text,
+            assistant_output=result.text,
             stop_reason=final_prompt_result.stop_reason,
+            agent=cfg.agent,
+            events_seen=int(payload.get("events_seen") or 0),
             heartbeat_outcome=terminal_by_heartbeat,
             killed_by_heartbeat=bool(getattr(conn, "killed_by_heartbeat", False)),
             cancelled_for_marker=result.cancelled_for_marker,
             early_marker=result.early_marker,
             heartbeat_error=terminal_error,
+            terminal_marker_present=_terminal_turn_marker(markers),
             successful_terminal_marker=_successful_terminal_marker(markers),
         )
         state = _state_after_actionable_terminal_markers(state, markers)
@@ -2803,6 +2836,9 @@ async def _run_acp_dispatch_impl(
             or runaway_terminal,
             "wedged_by_heartbeat": state == "wedged",
         }
+        if isinstance(error, dict) and error.get("reason") == "empty_session":
+            final_updates["reason"] = "empty_session"
+            final_updates["hint"] = error.get("hint")
         if runaway_terminal:
             final_updates["runaway_reason"] = terminal_error.get("reason") or terminal_error.get("message")
         if _permission_audit_surface_enabled(permission_mode):
