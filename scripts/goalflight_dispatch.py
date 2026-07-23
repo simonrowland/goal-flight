@@ -286,6 +286,23 @@ def _os_sandbox_warning(args) -> str | None:
     explicit --os-sandbox is a no-op on a worker that can't honor it."""
     explicit = getattr(args, "os_sandbox", None)
     profile = _effective_os_sandbox(args)
+    if (
+        getattr(args, "shape", "bash") == "acp"
+        and _effective_read_only(args)
+        and str(getattr(args, "agent", "")) in {"claude", "claude-acp"}
+    ):
+        from goalflight_acp_run import acp_permission_read_only_supported
+        from goalflight_adapter_readiness import validate_os_sandbox_request
+
+        if (
+            acp_permission_read_only_supported(getattr(args, "agent", None))
+            and validate_os_sandbox_request(getattr(args, "agent", None), profile)
+            is not None
+        ):
+            return (
+                "SANDBOX FALLBACK: requested=read-only -> applied=off -> "
+                "enforcement=acp-permissions"
+            )
     # Only the bash-shape codex worker maps a profile to codex --sandbox here.
     codex_bash = (
         str(getattr(args, "agent", "")) == "codex"
@@ -6872,7 +6889,16 @@ def _build_acp_cfg(args, *, status_json: Path, base: Path | None = None):
         body = Path(prompt_path).read_text(encoding="utf-8", errors="replace")
         acp_prompt_path = None
         acp_prompt_text = f"{_project_orientation_preamble(orientation_path)}\n\n{body}"
-    os_sandbox = "read-only" if args.read_only and goalflight_compat.is_macos() else OS_SANDBOX_OFF
+    explicit_os_sandbox = getattr(args, "os_sandbox", None)
+    if explicit_os_sandbox:
+        os_sandbox = explicit_os_sandbox
+    else:
+        os_sandbox = (
+            "read-only"
+            if args.read_only
+            and (goalflight_compat.is_macos() or args.agent == "claude")
+            else OS_SANDBOX_OFF
+        )
     liveness_profile = "remote_api" if args.agent in {"cursor", "claude"} else None
     cfg = argparse.Namespace(
         agent=args.agent,
@@ -6900,7 +6926,7 @@ def _build_acp_cfg(args, *, status_json: Path, base: Path | None = None):
         permission_dir=getattr(args, "permission_dir", None),
         permission_inline_timeout_s=getattr(args, "permission_inline_timeout_s", None),
         permission_user_timeout_s=getattr(args, "permission_user_timeout_s", None),
-        read_only=bool(getattr(args, "read_only", False)),
+        read_only=_effective_read_only(args),
         interactive=bool(getattr(args, "interactive", False)),
         permission_allow_tool_title_pattern=[],
         heartbeat_interval=max(float(args.poll_secs or 0.0), 0.1),

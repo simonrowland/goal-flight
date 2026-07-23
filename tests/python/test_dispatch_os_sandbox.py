@@ -11,6 +11,7 @@ Repo convention: case_* functions invoked by main(), run as `python <file>.py`.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -22,7 +23,8 @@ import goalflight_dispatch as d  # noqa: E402
 
 def _args(**kw):
     base = dict(agent="codex", shape="bash", read_only=False, os_sandbox=None,
-                model=None, cwd="/tmp/x")
+                model=None, cwd="/tmp/x", prompt=None, prompt_file=None,
+                ignore_git_warn=True)
     base.update(kw)
     return argparse.Namespace(**base)
 
@@ -84,6 +86,26 @@ def case_off_is_logged() -> None:
     assert w2 and "only affects bash-shape codex" in w2, w2
 
 
+def case_claude_acp_read_only_fallback_notice_is_pinned() -> None:
+    args = _args(agent="claude", shape="acp", read_only=True)
+    warning = d._os_sandbox_warning(args)
+    assert warning == (
+        "SANDBOX FALLBACK: requested=read-only -> applied=off -> "
+        "enforcement=acp-permissions"
+    ), warning
+    explicit = _args(
+        agent="claude", shape="acp", read_only=False, os_sandbox="read-only"
+    )
+    assert d._os_sandbox_warning(explicit) == warning
+
+
+def case_acp_supported_and_unrequested_warning_paths_are_unchanged() -> None:
+    supported = _args(agent="codex-acp", shape="acp", read_only=True)
+    unrequested = _args(agent="claude", shape="acp", read_only=False)
+    assert json.dumps(d._dispatch_warnings(supported, []), sort_keys=True) == "[]"
+    assert json.dumps(d._dispatch_warnings(unrequested, []), sort_keys=True) == "[]"
+
+
 def _replay(**kw):
     base = dict(agent="codex", dispatch_id="dx", cwd="/tmp/x", shape="bash",
                 priority="normal", billing="sub", poll_secs=2.0, max_idle_secs=600.0,
@@ -118,6 +140,8 @@ def main() -> None:
     case_off_never_leaks_forbidden_flags()
     case_conflict_guard()
     case_off_is_logged()
+    case_claude_acp_read_only_fallback_notice_is_pinned()
+    case_acp_supported_and_unrequested_warning_paths_are_unchanged()
     case_profile_survives_submit_drain()
     print("test_dispatch_os_sandbox: all cases passed")
 

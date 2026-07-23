@@ -191,7 +191,7 @@ def case_repo_runner_sandbox_adapters_are_platform_scoped() -> None:
         assert os_sandbox.get("platform_supported_profiles") == expected, path.name
 
 
-def case_dispatch_acp_cfg_disables_os_sandbox_off_darwin() -> None:
+def case_dispatch_acp_cfg_preserves_existing_codex_platform_behavior() -> None:
     old_is_macos = goalflight_dispatch.goalflight_compat.is_macos
     args = argparse.Namespace(
         agent="codex-acp",
@@ -215,6 +215,31 @@ def case_dispatch_acp_cfg_disables_os_sandbox_off_darwin() -> None:
         goalflight_dispatch.goalflight_compat.is_macos = lambda: True
         darwin_cfg = goalflight_dispatch._build_acp_cfg(args, status_json=ROOT / "status.json")
         assert darwin_cfg.os_sandbox == OS_SANDBOX_READ_ONLY
+    finally:
+        goalflight_dispatch.goalflight_compat.is_macos = old_is_macos
+
+
+def case_claude_read_only_requests_profile_on_unsupported_platform() -> None:
+    old_is_macos = goalflight_dispatch.goalflight_compat.is_macos
+    args = argparse.Namespace(
+        agent="claude",
+        cwd=str(ROOT),
+        prompt_file=None,
+        prompt="probe",
+        dispatch_id="claude-read-only-fallback",
+        read_only=True,
+        permission_mode="auto",
+        permission_dir=None,
+        permission_inline_timeout_s=None,
+        permission_user_timeout_s=None,
+        max_idle_secs=30.0,
+        poll_secs=0.2,
+    )
+    try:
+        goalflight_dispatch.goalflight_compat.is_macos = lambda: False
+        cfg = goalflight_dispatch._build_acp_cfg(args, status_json=ROOT / "status.json")
+        assert cfg.os_sandbox == OS_SANDBOX_READ_ONLY
+        assert cfg.read_only is True
     finally:
         goalflight_dispatch.goalflight_compat.is_macos = old_is_macos
 
@@ -573,6 +598,7 @@ def case_runner_workspace_write_blocks_home_write() -> None:
     assert payload["state"] == "complete", payload
     assert payload["ok"] is True, payload
     assert payload["os_sandbox"]["profile"] == OS_SANDBOX_WORKSPACE_WRITE
+    assert "sandbox_fallback" not in payload
     assert "inside_write=true" in payload["text_excerpt"], payload["text_excerpt"]
     assert "outside_write=false" in payload["text_excerpt"], payload["text_excerpt"]
 
@@ -630,6 +656,7 @@ def case_runner_blocks_undeclared_os_sandbox_before_capacity() -> None:
                     permission_dir=None,
                     permission_inline_timeout_s=None,
                     permission_user_timeout_s=None,
+                    read_only=True,
                     os_sandbox=OS_SANDBOX_WORKSPACE_WRITE,
                     json=True,
                 )
@@ -644,6 +671,150 @@ def case_runner_blocks_undeclared_os_sandbox_before_capacity() -> None:
             os.environ.pop("GOALFLIGHT_STATE_DIR", None)
         else:
             os.environ["GOALFLIGHT_STATE_DIR"] = old_state_dir
+
+
+def case_runner_translates_claude_read_only_to_acp_permissions() -> None:
+    old_agent_command = goalflight_acp_run.agent_command
+    old_spawn = goalflight_acp_run.spawn_and_handshake_with_retry
+    old_adapters_dir = goalflight_adapter_readiness.ADAPTERS_DIR
+    old_state_dir = os.environ.get("GOALFLIGHT_STATE_DIR")
+    old_scenario = os.environ.get("GOALFLIGHT_FAKE_ACP_SCENARIO")
+    goalflight_acp_run.agent_command = (
+        lambda agent, model=None, fast=False: (sys.executable, [str(FAKE)])
+    )
+    captured: dict[str, object] = {}
+
+    async def capture_spawn(*args, **kwargs):
+        captured["permission_policy"] = kwargs.get("permission_policy")
+        captured["os_sandbox"] = kwargs.get("os_sandbox")
+        return await old_spawn(*args, **kwargs)
+
+    goalflight_acp_run.spawn_and_handshake_with_retry = capture_spawn
+    try:
+        with tempfile.TemporaryDirectory(prefix="gf-os-sandbox-fallback-") as tmp:
+            tmp_path = Path(tmp)
+            goalflight_adapter_readiness.ADAPTERS_DIR = tmp_path
+            os.environ["GOALFLIGHT_STATE_DIR"] = str(tmp_path / "state")
+            os.environ["GOALFLIGHT_FAKE_ACP_SCENARIO"] = "echo"
+            _write_supported_adapter_manifest(tmp_path, "claude-code")
+            manifest_path = tmp_path / "claude-code.json"
+            manifest = json.loads(manifest_path.read_text())
+            manifest["permission_surface"]["os_sandbox"].update(
+                {
+                    "supported_profiles": ["off"],
+                    "default_profile": "off",
+                    "implementation": "unsupported",
+                }
+            )
+            manifest_path.write_text(json.dumps(manifest))
+            status_path = tmp_path / "status.json"
+            payload = asyncio.run(
+                goalflight_acp_run.run(
+                    argparse.Namespace(
+                        agent="claude",
+                        cwd=str(ROOT),
+                        session_id="claude-read-only-fallback",
+                        dispatch_id=f"test-claude-read-only-fallback-{os.getpid()}",
+                        prompt_id=None,
+                        prompt=None,
+                        prompt_text="COMPLETE: fallback probe",
+                        mode="one-shot",
+                        status_json=str(status_path),
+                        idle_timeout=5.0,
+                        heartbeat_interval=0.2,
+                        wedge_samples=100,
+                        max_tool_s=60.0,
+                        max_quiet_s=60.0,
+                        progress_stall_s=60.0,
+                        liveness_profile="local_compute",
+                        remote_turn_silence_s=None,
+                        remote_turn_cancel_grace_s=0.0,
+                        cpu_epsilon=0.1,
+                        context_mode="disabled",
+                        permission_mode="auto",
+                        permission_dir=None,
+                        permission_inline_timeout_s=None,
+                        permission_user_timeout_s=None,
+                        permission_allow_tool_title_pattern=[],
+                        read_only=True,
+                        os_sandbox=OS_SANDBOX_READ_ONLY,
+                        json=True,
+                    )
+                )
+            )
+            expected = {
+                "requested": "read-only",
+                "applied": "off",
+                "enforcement": "acp-permissions",
+            }
+            assert payload["state"] == "complete", payload
+            assert payload["sandbox_fallback"] == expected, payload
+            assert json.loads(status_path.read_text())["sandbox_fallback"] == expected
+            assert captured["os_sandbox"] == OS_SANDBOX_OFF, captured
+            policy = captured["permission_policy"]
+            assert callable(policy), captured
+            assert policy(
+                {"kind": "edit", "locations": [{"path": str(ROOT / "README.md")}]},
+                [],
+                str(ROOT),
+            ) == "deny"
+
+            no_flag_status = tmp_path / "no-flag.status.json"
+            no_flag_payload = asyncio.run(
+                goalflight_acp_run.run(
+                    argparse.Namespace(
+                        agent="claude",
+                        cwd=str(ROOT),
+                        session_id="claude-no-sandbox-request",
+                        dispatch_id=f"test-claude-no-sandbox-request-{os.getpid()}",
+                        prompt_id=None,
+                        prompt=None,
+                        prompt_text="COMPLETE: no-flag probe",
+                        mode="one-shot",
+                        status_json=str(no_flag_status),
+                        idle_timeout=5.0,
+                        heartbeat_interval=0.2,
+                        wedge_samples=100,
+                        max_tool_s=60.0,
+                        max_quiet_s=60.0,
+                        progress_stall_s=60.0,
+                        liveness_profile="local_compute",
+                        remote_turn_silence_s=None,
+                        remote_turn_cancel_grace_s=0.0,
+                        cpu_epsilon=0.1,
+                        context_mode="disabled",
+                        permission_mode="auto",
+                        permission_dir=None,
+                        permission_inline_timeout_s=None,
+                        permission_user_timeout_s=None,
+                        permission_allow_tool_title_pattern=[],
+                        read_only=False,
+                        os_sandbox=OS_SANDBOX_OFF,
+                        json=True,
+                    )
+                )
+            )
+            assert no_flag_payload["state"] == "complete", no_flag_payload
+            assert "sandbox_fallback" not in no_flag_payload
+            assert json.loads(no_flag_status.read_text())["os_sandbox"] == {
+                "requested": "off",
+                "profile": "off",
+                "enabled": False,
+                "implementation": None,
+                "write_roots": [],
+            }, no_flag_payload["os_sandbox"]
+    finally:
+        goalflight_acp_run.agent_command = old_agent_command
+        goalflight_acp_run.spawn_and_handshake_with_retry = old_spawn
+        goalflight_adapter_readiness.ADAPTERS_DIR = old_adapters_dir
+        if old_state_dir is None:
+            os.environ.pop("GOALFLIGHT_STATE_DIR", None)
+        else:
+            os.environ["GOALFLIGHT_STATE_DIR"] = old_state_dir
+        if old_scenario is None:
+            os.environ.pop("GOALFLIGHT_FAKE_ACP_SCENARIO", None)
+        else:
+            os.environ["GOALFLIGHT_FAKE_ACP_SCENARIO"] = old_scenario
 
 
 def case_runner_blocks_temp_cwd_before_capacity() -> None:
@@ -812,7 +983,8 @@ def main() -> None:
     case_requested_sandbox_fails_closed_on_unsupported_hosts()
     case_adapter_os_sandbox_is_platform_scoped()
     case_repo_runner_sandbox_adapters_are_platform_scoped()
-    case_dispatch_acp_cfg_disables_os_sandbox_off_darwin()
+    case_dispatch_acp_cfg_preserves_existing_codex_platform_behavior()
+    case_claude_read_only_requests_profile_on_unsupported_platform()
     case_shell_wrapper_guards_os_sandbox_to_darwin()
     case_prepare_wrapper_blocks_home_write()
     case_profile_string_escapes_workspace_path()
@@ -823,6 +995,7 @@ def main() -> None:
     case_runner_workspace_write_blocks_home_write()
     case_runner_read_only_blocks_workspace_write()
     case_runner_blocks_undeclared_os_sandbox_before_capacity()
+    case_runner_translates_claude_read_only_to_acp_permissions()
     case_runner_blocks_temp_cwd_before_capacity()
     case_pool_canonicalizes_os_sandbox_alias_for_reuse()
     case_pool_blocks_undeclared_os_sandbox()

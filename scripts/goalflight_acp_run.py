@@ -115,6 +115,7 @@ from goalflight_acp_client import (
     AcpLivenessActivity,
     MAX_PERMISSION_ROUTER_DECISIONS,
     PERMISSION_ALLOW,
+    PERMISSION_DENY,
     cleanup_ghosts,
     mark_connection_detached,
     default_permission_policy,
@@ -122,6 +123,30 @@ from goalflight_acp_client import (
 )
 import goalflight_acp_permits as permits
 import re as _re
+
+
+_ACP_PERMISSION_READ_ONLY_AGENTS = frozenset({"claude", "claude-acp"})
+
+
+def acp_permission_read_only_supported(agent: str | None) -> bool:
+    """Whether this adapter routes writes through ACP request_permission.
+
+    Keep this allowlist explicit. Cursor/Grok bypass the permission gate for
+    writes, and Codex is deliberately excluded because its existing sandbox
+    behavior is outside the fallback introduced for Claude ACP.
+    """
+    return str(agent or "").strip().lower() in _ACP_PERMISSION_READ_ONLY_AGENTS
+
+
+def _read_only_permission_policy(tool_call, options, cwd):
+    """Deny all permission-gated writes; retain the normal read-safe policy."""
+    try:
+        from goalflight_acp_client import _WRITE_KINDS, _tc_get
+    except ImportError:
+        return PERMISSION_DENY
+    if str(_tc_get(tool_call, "kind") or "") in _WRITE_KINDS:
+        return PERMISSION_DENY
+    return default_permission_policy(tool_call, options, cwd)
 
 
 _CODEX_CONTEXT_MODE_TABLE_RE = _re.compile(
@@ -1388,6 +1413,7 @@ async def _run_acp_dispatch_impl(
     liveness_profile = getattr(cfg, "liveness_profile", None) or manifest_profile
     if liveness_profile not in LIVENESS_PROFILES:
         liveness_profile = "local_compute"
+    read_only_dispatch = bool(getattr(cfg, "read_only", False))
     requested_os_sandbox = getattr(cfg, "os_sandbox", OS_SANDBOX_OFF)
     try:
         os_sandbox_profile: str | None = canonical_os_sandbox(requested_os_sandbox)
@@ -1396,6 +1422,19 @@ async def _run_acp_dispatch_impl(
         os_sandbox_error = str(e)
     else:
         os_sandbox_error = None
+    sandbox_fallback: dict[str, str] | None = None
+    read_only_intent = (
+        read_only_dispatch or os_sandbox_profile == "read-only"
+    )
+    if os_sandbox_error is None and read_only_intent:
+        os_sandbox_gate = validate_os_sandbox_request(cfg.agent, os_sandbox_profile)
+        if os_sandbox_gate is not None and acp_permission_read_only_supported(cfg.agent):
+            sandbox_fallback = {
+                "requested": str(os_sandbox_profile),
+                "applied": OS_SANDBOX_OFF,
+                "enforcement": "acp-permissions",
+            }
+            os_sandbox_profile = OS_SANDBOX_OFF
     remote_turn_silence_s = getattr(cfg, "remote_turn_silence_s", None)
     if remote_turn_silence_s is None:
         remote_turn_silence_s = manifest_remote_turn_silence_s
@@ -1418,7 +1457,6 @@ async def _run_acp_dispatch_impl(
     run_started = time.time()
     project_root = Path(cfg.cwd).resolve()
     permission_mode = str(getattr(cfg, "permission_mode", "auto") or "auto")
-    read_only_dispatch = bool(getattr(cfg, "read_only", False))
     resolved_permission_dir: str | None = None
     resolved_permission_dir_source: str | None = None
     if permission_mode == "inline":
@@ -1508,6 +1546,8 @@ async def _run_acp_dispatch_impl(
         "permission_decisions": [],
         "updated_at": _now(),
     }
+    if sandbox_fallback is not None:
+        payload["sandbox_fallback"] = sandbox_fallback
     boundary_warning = permission_boundary_warning(
         agent=cfg.agent,
         permission_mode=permission_mode,
@@ -2577,6 +2617,10 @@ async def _run_acp_dispatch_impl(
                 )
         else:
             permission_policy = None
+        if sandbox_fallback is not None:
+            # Read-only is a hard posture: title allowlists must not re-enable
+            # located edits after the OS sandbox has been removed.
+            permission_policy = _read_only_permission_policy
 
         async with StartupGate(cfg.agent):
             proc, conn = await spawn_and_handshake_with_retry(
