@@ -170,6 +170,7 @@ drift against an in-flight queue.
 | `/goal-flight build-corpus [<flags>]` | `commands/build-corpus.md` | corpus docs referenced there |
 | `/goal-flight resume` | `commands/resume.md` | `state-handoff` |
 | `/goal-flight goal <SLUG>` | `commands/goal.md` | none |
+| `/goal-flight usage` | `commands/usage.md` | none |
 | `/goal-flight register-codex [<path>]` | `commands/register-codex.md` | `tool-readiness` |
 | `/goal-flight update` | `commands/update.md` | `tool-readiness` |
 | `/goal-flight validate-dispatch [<slug>]` | `commands/validate-dispatch.md` | `dispatch-routing`, `worker-markers` |
