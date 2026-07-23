@@ -124,6 +124,26 @@ import goalflight_acp_permits as permits
 import re as _re
 
 
+_CODEX_CONTEXT_MODE_TABLE_RE = _re.compile(
+    r"""(?mx)
+    ^\s*\[\s*mcp_servers\s*\.\s*
+    (?:"context-mode"|'context-mode'|context-mode)
+    \s*\]\s*(?:\#.*)?$
+    """
+)
+
+
+def _codex_context_mode_defined(env: dict[str, str]) -> bool:
+    """Fail-safe local check used even when dispatcher integration is absent."""
+    raw_home = env.get("CODEX_HOME")
+    home = Path(raw_home).expanduser() if raw_home else Path.home() / ".codex"
+    try:
+        config = (home / "config.toml").read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return False
+    return _CODEX_CONTEXT_MODE_TABLE_RE.search(config) is not None
+
+
 def _tool_call_title(tool_call: Any) -> str:
     """Extract a tool-call title without depending on the client's _tc_get helper."""
     for key in ("title", "Title"):
@@ -1272,16 +1292,18 @@ async def run_acp_dispatch(cfg: argparse.Namespace) -> dict:
         return payload
     bridge = _SigtermCancelBridge(asyncio.get_running_loop(), asyncio.current_task())
     bridge.install()
+    result: dict | None = None
     try:
-        return await _run_acp_dispatch_impl(
+        result = await _run_acp_dispatch_impl(
             cfg,
             sigterm_received=lambda: bridge.received,
             signal_signum=lambda: bridge.signum,
         )
+        return result
     except asyncio.CancelledError:
         if bridge.received:
             dispatch_id = cfg.dispatch_id or f"acp-{cfg.agent}-{uuid.uuid4().hex[:8]}"
-            return {
+            result = {
                 "schema": "goalflight.acp-run.v1",
                 "dispatch_id": dispatch_id,
                 "lease_id": None,
@@ -1295,9 +1317,26 @@ async def run_acp_dispatch(cfg: argparse.Namespace) -> dict:
                 "worker_alive": False,
                 "updated_at": _now(),
             }
+            return result
         raise
     finally:
         bridge.restore()
+        if (
+            getattr(cfg, "_codex_dispatch_home_resolved", False)
+            and not (isinstance(result, dict) and result.get("worker_still_alive") is True)
+        ):
+            try:
+                import goalflight_dispatch
+
+                goalflight_dispatch.cleanup_codex_dispatch_home(
+                    str(getattr(cfg, "dispatch_id", "") or "")
+                )
+            except BaseException as exc:
+                print(
+                    "goalflight_acp_run: per-dispatch home cleanup warning: "
+                    f"{type(exc).__name__}",
+                    file=sys.stderr,
+                )
 
 
 async def _run_acp_dispatch_impl(
@@ -1643,6 +1682,7 @@ async def _run_acp_dispatch_impl(
     heartbeat_task: asyncio.Task | None = None
     ledger_recorded = False
     state = "failed"
+    effective_account: str | None = None
     activity = AcpLivenessActivity()
     heartbeat_outcome: str | None = None
     heartbeat_error: dict[str, object] | None = None
@@ -1701,7 +1741,15 @@ async def _run_acp_dispatch_impl(
                     agent=cfg.agent,
                     engine=goalflight_ledger.infer_engine(cfg.agent),
                     shape="acp",
-                    account="default",
+                    account=getattr(cfg, "account", None) or "default",
+                    effective_account=effective_account,
+                    request_envelope_json=(
+                        json.dumps(cfg.request_envelope, sort_keys=True)
+                        if isinstance(
+                            getattr(cfg, "request_envelope", None), dict
+                        )
+                        else None
+                    ),
                     transport="acp",
                     # project_root MUST be the original --cwd (main repo
                     # toplevel), NOT worker_cwd. For a worktree dispatch
@@ -2345,6 +2393,48 @@ async def _run_acp_dispatch_impl(
         if attempt > 0:
             updates["handshake_attempt"] = attempt + 1
         await update_status(**updates)
+
+    # Non-Codex agents keep the captured environment and avoid importing the
+    # optional dispatcher-side Codex integration.
+    is_local_codex = (
+        not goalflight_compat.is_windows()
+        and goalflight_ledger.infer_engine(cfg.agent) == "codex"
+    )
+    if is_local_codex:
+        setattr(cfg, "_codex_dispatch_home_resolved", False)
+        # The adapter spawn consumes this captured dict, so re-finalize the
+        # Codex environment only after capacity succeeds and immediately before
+        # the starting-ledger/spawn block.
+        spawn_env = dict(spawn_env)
+        dispatch_module = None
+        try:
+            import goalflight_dispatch as dispatch_module
+        except BaseException:
+            dispatch_module = None
+        codex_home = None
+        if dispatch_module is not None:
+            try:
+                codex_home, effective_account = dispatch_module.resolve_codex_home(
+                    project_root,
+                    getattr(cfg, "account", None),
+                    dispatch_id,
+                )
+            except BaseException:
+                codex_home, effective_account = None, None
+        if codex_home is not None:
+            spawn_env["CODEX_HOME"] = codex_home
+            setattr(cfg, "_codex_dispatch_home_resolved", True)
+        if getattr(cfg, "context_mode", "enabled") == "disabled":
+            try:
+                context_mode_defined = (
+                    dispatch_module.codex_context_mode_defined(spawn_env)
+                    if dispatch_module is not None
+                    else _codex_context_mode_defined(spawn_env)
+                )
+            except BaseException:
+                context_mode_defined = _codex_context_mode_defined(spawn_env)
+            if not context_mode_defined:
+                cfg.context_mode = "enabled"
 
     try:
         if worktree_path is not None:

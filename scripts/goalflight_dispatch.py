@@ -2231,6 +2231,110 @@ def _resolve_account_env(args) -> dict[str, str]:
     raise DispatchUsageError(f"--account unsupported for engine {engine!r}")
 
 
+_CODEX_SEAT_API_UNSET = object()
+_CODEX_SEAT_API_CACHE = _CODEX_SEAT_API_UNSET
+
+
+def _codex_seat_api():
+    """Return the optional local launch library, or None on any import failure."""
+    global _CODEX_SEAT_API_CACHE
+    if _CODEX_SEAT_API_CACHE is not _CODEX_SEAT_API_UNSET:
+        return _CODEX_SEAT_API_CACHE
+    try:
+        from ext import codex_seat_lib
+    except BaseException:
+        codex_seat_lib = None
+    _CODEX_SEAT_API_CACHE = codex_seat_lib
+    return _CODEX_SEAT_API_CACHE
+
+
+def resolve_codex_home(
+    project_root: Path | str,
+    explicit_account: str | None,
+    dispatch_id: str,
+) -> tuple[str | None, str | None]:
+    """Resolve one launch snapshot without ever failing the dispatch."""
+    api = _codex_seat_api()
+    if api is None:
+        return None, None
+    try:
+        resolved = api.resolve_codex_seat(
+            str(project_root),
+            explicit_account,
+            dispatch_id,
+        )
+        if not isinstance(resolved, tuple) or len(resolved) != 2:
+            return None, None
+        home, effective_account = resolved
+        if home is None and effective_account is None:
+            return None, None
+        if not isinstance(home, str) or not home:
+            return None, None
+        if not isinstance(effective_account, str) or not effective_account:
+            return None, None
+        return home, effective_account
+    except BaseException:
+        return None, None
+
+
+def cleanup_codex_dispatch_home(dispatch_id: str) -> None:
+    """Best-effort cleanup through the same guarded optional-library seam."""
+    api = _codex_seat_api()
+    if api is None:
+        return
+    try:
+        api.cleanup_dispatch_home(dispatch_id)
+    except BaseException as exc:
+        print(
+            "goalflight_dispatch: per-dispatch home cleanup warning: "
+            f"{type(exc).__name__}",
+            file=sys.stderr,
+        )
+
+
+_CONTEXT_MODE_TABLE_RE = re.compile(
+    r"""(?mx)
+    ^\s*\[\s*mcp_servers\s*\.\s*
+    (?:"context-mode"|'context-mode'|context-mode)
+    \s*\]\s*(?:\#.*)?$
+    """
+)
+_CONTEXT_MODE_DISABLE_KEY = "mcp_servers.context-mode.enabled=false"
+
+
+def codex_context_mode_defined(env: dict[str, str]) -> bool:
+    """Whether the effective worker home defines the server being disabled."""
+    raw_home = env.get("CODEX_HOME")
+    home = Path(raw_home).expanduser() if raw_home else Path.home() / ".codex"
+    try:
+        config = (home / "config.toml").read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return False
+    return _CONTEXT_MODE_TABLE_RE.search(config) is not None
+
+
+def _guard_codex_context_mode_disable(
+    argv: list[str],
+    env: dict[str, str],
+) -> list[str]:
+    """Drop only the disable override when its base config table is absent."""
+    if codex_context_mode_defined(env):
+        return argv
+    guarded: list[str] = []
+    index = 0
+    while index < len(argv):
+        if (
+            argv[index] == "-c"
+            and index + 1 < len(argv)
+            and argv[index + 1] == _CONTEXT_MODE_DISABLE_KEY
+        ):
+            index += 2
+            continue
+        guarded.append(argv[index])
+        index += 1
+    return guarded
+
+
 CAPACITY_WAIT_DEFAULTS_S = goalflight_capacity.CAPACITY_WAIT_DEFAULTS_S
 _CAPACITY_WAIT_POLL_S = goalflight_capacity.CAPACITY_WAIT_POLL_S
 
@@ -2350,8 +2454,56 @@ def _acquire_capacity(args, *, project_root: Path, status_json: Path) -> str | N
     raise SystemExit(2)
 
 
+def _queue_request_envelope(args) -> dict | None:
+    """Copy the durable child-request inputs from a live queue claim."""
+    if not (
+        getattr(args, "from_queue", False)
+        and getattr(args, "queue_claim_path", None)
+    ):
+        return None
+    try:
+        entry = json.loads(
+            Path(str(args.queue_claim_path))
+            .expanduser()
+            .read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(entry, dict):
+        return None
+    launch_token = getattr(args, "queue_launch_token", None)
+    if launch_token and entry.get("queue_launch_token") != launch_token:
+        return None
+    dispatch_argv = entry.get("dispatch_argv")
+    request = entry.get("request")
+    if not isinstance(dispatch_argv, list) or not dispatch_argv:
+        return None
+    if not isinstance(request, dict):
+        return None
+    envelope = {
+        key: entry[key]
+        for key in (
+            "schema",
+            "dispatch_id",
+            "agent",
+            "shape",
+            "project_root",
+            "process_cwd",
+            "base_sha",
+            "task_ids",
+            "requeued_from",
+        )
+        if key in entry
+    }
+    envelope["dispatch_argv"] = list(dispatch_argv)
+    envelope["request"] = dict(request)
+    return envelope
+
+
 def _record_ledger(args, *, project_root: Path, prompt_path: str | None, status_json: Path,
-                   tail: Path, lease_id: str | None, worker_pid: int | None, state: str) -> None:
+                   tail: Path, lease_id: str | None, worker_pid: int | None, state: str,
+                   effective_account: str | None = None,
+                   request_envelope: dict | None = None) -> None:
     with contextlib.redirect_stdout(io.StringIO()):
         goalflight_ledger.cmd_record(
             argparse.Namespace(
@@ -2363,6 +2515,12 @@ def _record_ledger(args, *, project_root: Path, prompt_path: str | None, status_
                 engine=_account_engine(args.agent) or args.agent,
                 shape=args.shape,
                 account=args.account or "default",
+                effective_account=effective_account,
+                request_envelope_json=(
+                    json.dumps(request_envelope, sort_keys=True)
+                    if request_envelope is not None
+                    else None
+                ),
                 transport="dispatch",
                 project_root=str(project_root),
                 controller_pid=_controller_pid(args),
@@ -4902,6 +5060,113 @@ def _recover_claimed_queue_entries(queue_dir: Path, *, stale_s: float) -> dict:
     }
 
 
+def _ledger_request_entry(record: dict) -> dict:
+    """Rebuild the queue-facing entry from the ledger's durable envelope."""
+    envelope = (
+        dict(record["request_envelope"])
+        if isinstance(record.get("request_envelope"), dict)
+        else {}
+    )
+    request = (
+        dict(envelope["request"])
+        if isinstance(envelope.get("request"), dict)
+        else {}
+    )
+    request.setdefault("agent", record.get("agent"))
+    request.setdefault("cwd", record.get("project_root"))
+    request.setdefault(
+        "tail", record.get("stdout_path") or record.get("tail_path")
+    )
+    request.setdefault("status_json", record.get("status_path"))
+    request.setdefault("task_ids", list(record.get("task_ids") or []))
+    entry = dict(envelope)
+    entry.update(
+        {
+            "dispatch_id": str(record.get("dispatch_id") or ""),
+            "agent": record.get("agent") or envelope.get("agent") or "unknown",
+            "shape": record.get("shape") or envelope.get("shape") or "bash",
+            "project_root": (
+                record.get("project_root") or envelope.get("project_root")
+            ),
+            "queue_launch_token": record.get("queue_launch_token"),
+            "queue_worker_pid": record.get("worker_pid"),
+            "queue_worker_identity": record.get("worker_identity"),
+            "queue_worker_pgid": record.get("worker_pgid"),
+            "queue_worker_group_leader_identity": record.get(
+                "worker_group_leader_identity"
+            ),
+            "queue_worker_identity_snapshot_at": record.get(
+                "worker_identity_snapshot_at"
+            ),
+            "queue_producer_descendants": list(
+                record.get("producer_descendants") or []
+            ),
+            "queue_producer_group_contract": bool(
+                record.get("producer_group_contract")
+            ),
+            "queue_producer_group_contract_enforced": bool(
+                record.get("producer_group_contract_enforced")
+            ),
+            "queue_tail_flock_contract": record.get("transport") != "fleet-ssh",
+            "queue_worker_spawned_at": (
+                record.get("queue_worker_spawned_at")
+                or record.get("started_at")
+            ),
+            "queue_launch_started": bool(
+                record.get("worker_pid")
+                or str(record.get("state") or "")
+                not in {"queued", "waiting_capacity", "submitted"}
+            ),
+            "queue_worker_spawn_intent": bool(
+                record.get("worker_pid")
+                or str(record.get("state") or "")
+                in {"starting", "running", "running_quiet"}
+            ),
+            "task_ids": list(
+                record.get("task_ids") or envelope.get("task_ids") or []
+            ),
+            "request": request,
+            "dispatch_argv": list(envelope.get("dispatch_argv") or []),
+            "claim_recovery_count": int(
+                record.get("claim_recovery_count")
+                or MAX_CLAIM_RECOVERY_REQUEUES
+            ),
+            "orphan_first_seen_at": record.get("orphan_first_seen_at"),
+            "started_at": record.get("started_at"),
+        }
+    )
+    return entry
+
+
+def _terminal_ledger_requeue_pending(
+    record: dict,
+    entry: dict,
+    *,
+    queue_dir: Path,
+) -> bool:
+    """Whether a terminal queue launch still needs its one child transaction."""
+    if not isinstance(record.get("request_envelope"), dict):
+        return False
+    request = (
+        entry.get("request") if isinstance(entry.get("request"), dict) else {}
+    )
+    if entry.get("requeued_from") or request.get("requeued_from"):
+        return False
+    effective_account = record.get("effective_account")
+    if not isinstance(effective_account, str) or not effective_account:
+        return False
+    tail = _entry_tail_path(entry, record)
+    if _requeue_failure_kind(record, tail) not in {"auth", "quota"}:
+        return False
+    intent = record.get("requeue")
+    child_id = intent.get("child_id") if isinstance(intent, dict) else None
+    return not (
+        isinstance(child_id, str)
+        and child_id
+        and _requeue_child_exists(queue_dir, child_id)
+    )
+
+
 def _reconcile_ledger_prelaunch_orphans(
     queue_dir: Path,
     *,
@@ -4924,7 +5189,24 @@ def _reconcile_ledger_prelaunch_orphans(
         dispatch_id = str(record.get("dispatch_id") or "")
         if not dispatch_id:
             continue
+        entry = _ledger_request_entry(record)
         if _dispatch_record_is_terminal(record):
+            if (
+                not _claim_has_active_carrier(queue_dir, dispatch_id)
+                and _is_task_linked(entry, record)
+                and _terminal_ledger_requeue_pending(
+                    record,
+                    entry,
+                    queue_dir=queue_dir,
+                )
+            ):
+                if not _mark_claim_worker_dead(
+                    entry,
+                    reason="watcher_terminal_reconcile",
+                    queue_dir=queue_dir,
+                    stale_s=stale_s,
+                ):
+                    pending += 1
             continue
         state = str(record.get("state") or "")
         if state not in PRELAUNCH_CANDIDATE_STATES and state not in {"running", "running_quiet"}:
@@ -4936,40 +5218,6 @@ def _reconcile_ledger_prelaunch_orphans(
         if _claim_has_active_carrier(queue_dir, dispatch_id):
             continue
 
-        entry = {
-            "dispatch_id": dispatch_id,
-            "agent": record.get("agent") or "unknown",
-            "shape": record.get("shape") or "bash",
-            "project_root": record.get("project_root"),
-            "queue_launch_token": record.get("queue_launch_token"),
-            "queue_worker_pid": record.get("worker_pid"),
-            "queue_worker_identity": record.get("worker_identity"),
-            "queue_worker_pgid": record.get("worker_pgid"),
-            "queue_worker_group_leader_identity": record.get("worker_group_leader_identity"),
-            "queue_worker_identity_snapshot_at": record.get("worker_identity_snapshot_at"),
-            "queue_producer_descendants": list(record.get("producer_descendants") or []),
-            "queue_producer_group_contract": bool(record.get("producer_group_contract")),
-            "queue_producer_group_contract_enforced": bool(
-                record.get("producer_group_contract_enforced")
-            ),
-            "queue_tail_flock_contract": record.get("transport") != "fleet-ssh",
-            "queue_worker_spawned_at": record.get("queue_worker_spawned_at") or record.get("started_at"),
-            # Post-spawn once a worker_pid was ever recorded OR state left pure queue.
-            "queue_launch_started": bool(record.get("worker_pid") or state not in {"queued", "waiting_capacity", "submitted"}),
-            "queue_worker_spawn_intent": bool(record.get("worker_pid") or state in {"starting", "running", "running_quiet"}),
-            "task_ids": list(record.get("task_ids") or []),
-            "request": {
-                "agent": record.get("agent"),
-                "cwd": record.get("project_root"),
-                "tail": record.get("stdout_path") or record.get("tail_path"),
-                "status_json": record.get("status_path"),
-                "task_ids": list(record.get("task_ids") or []),
-            },
-            "dispatch_argv": [],  # carrier missing — cannot restore
-            "claim_recovery_count": int(record.get("claim_recovery_count") or MAX_CLAIM_RECOVERY_REQUEUES),
-            "orphan_first_seen_at": record.get("orphan_first_seen_at"),
-            "started_at": record.get("started_at"),
-        }
         admission = classify_reconciliation_admission(entry, now_s, stale_s=stale_s)
         if admission is PreAdmitClass.INDETERMINATE:
             _alert_identity_indeterminate(dispatch_id, where="ledger", reason="pre_admit_indeterminate")
@@ -5009,6 +5257,7 @@ def _reconcile_ledger_prelaunch_orphans(
             if _mark_claim_worker_dead(
                 entry,
                 reason="claim_carrier_missing",
+                queue_dir=queue_dir,
                 stale_s=stale_s,
             ):
                 terminalized += 1
@@ -5109,6 +5358,15 @@ def _queue_entry_created_ts(entry: dict | None, path: Path) -> float:
         return path.stat().st_mtime
     except OSError:
         return float("inf")
+
+
+def _queue_entry_not_before_ts(entry: dict | None) -> float | None:
+    if not isinstance(entry, dict):
+        return None
+    request = entry.get("request") if isinstance(entry.get("request"), dict) else {}
+    raw = entry.get("not_before") or request.get("not_before")
+    parsed = goalflight_ledger.parse_utc(raw)
+    return parsed.timestamp() if parsed is not None else None
 
 
 def _queue_entry_drain_candidate(path: Path) -> tuple[tuple[int, float, str], Path, dict | None, str | None]:
@@ -5764,6 +6022,255 @@ def _finish_ledger_under_lock(
     return commit_reconciled_terminal(txn, entry, decision)
 
 
+_CODEX_AUTH_FAILURE_RE = re.compile(
+    r"""(?ix)
+    (?:
+        \b(?:error|failed|failure|fatal|http|status|unauthorized|authentication)\b
+        [^\r\n]{0,160}\b401\b
+      |
+        \b401\b[^\r\n]{0,160}\b(?:unauthorized|authentication|token)\b
+      |
+        \b(?:access|bearer|authentication)\s+token\b[^\r\n]{0,120}
+        \b(?:expired|invalid|rejected)\b
+    )
+    """
+)
+
+
+def _requeue_failure_kind(record: dict, tail: Path) -> str | None:
+    state = str(record.get("state") or record.get("terminal_state") or "")
+    if state == "rate_limited":
+        return "quota"
+    if state == "blocked_auth":
+        return "auth"
+    if (
+        state in goalflight_dispatch_states.SUCCESS_TERMINAL_RECORD_STATES
+        or state not in goalflight_dispatch_states.TERMINAL_FAILURE_STATES
+    ):
+        return None
+    parts: list[str] = []
+    for key in ("reason", "error", "outcome"):
+        value = record.get(key)
+        if value not in (None, ""):
+            parts.append(
+                json.dumps(value, sort_keys=True)
+                if isinstance(value, (dict, list))
+                else str(value)
+            )
+    parts.append(goalflight_terminal.read_tail_excerpt(tail, 8192))
+    return "auth" if _CODEX_AUTH_FAILURE_RE.search("\n".join(parts)) else None
+
+
+def _effective_account_cooldown(effective_account: str) -> str | None:
+    """Read only the daemon's non-secret health record for quota scheduling."""
+    configured = os.environ.get("GOALFLIGHT_CODEX_STATE_DIR")
+    state_root = (
+        Path(configured).expanduser()
+        if configured
+        else Path.home() / ".goal-flight"
+    )
+    try:
+        payload = json.loads(
+            (state_root / "codex-seat-states.json").read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    if (
+        not isinstance(payload, dict)
+        or payload.get("version") != 1
+        or not isinstance(payload.get("seats"), dict)
+    ):
+        return None
+    record = payload["seats"].get(effective_account)
+    if not isinstance(record, dict):
+        return None
+    cooldown = record.get("cooldown_until")
+    return cooldown if isinstance(cooldown, str) and cooldown else None
+
+
+def _write_json_exclusive(path: Path, payload: dict) -> bool:
+    """Durably create one queue entry without ever replacing an existing path."""
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        return False
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    dir_fd = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+    return True
+
+
+def _requeue_child_exists(queue_dir: Path, child_id: str) -> bool:
+    queue_path = _queue_entry_path(child_id, queue_dir=queue_dir)
+    if queue_path.exists() or any(
+        queue_path.parent.glob(f"{queue_path.name}.claimed-*")
+    ):
+        return True
+    return goalflight_ledger.record_path(child_id, create=False).exists()
+
+
+def _requeue_child_entry(
+    entry: dict,
+    *,
+    child_id: str,
+    requeued_from: str,
+    queue_dir: Path,
+    not_before: str | None,
+) -> dict | None:
+    dispatch_argv = list(entry.get("dispatch_argv") or [])
+    if not dispatch_argv:
+        return None
+    base = _dispatch_base_dir()
+    tail = base / f"{child_id}.tail"
+    status_json = base / f"{child_id}.status.json"
+    dispatch_argv = _set_option_before_worker_remainder(
+        dispatch_argv, "--dispatch-id", child_id
+    )
+    dispatch_argv = _set_option_before_worker_remainder(
+        dispatch_argv, "--tail", str(tail)
+    )
+    dispatch_argv = _set_option_before_worker_remainder(
+        dispatch_argv, "--status-json", str(status_json)
+    )
+    now = goalflight_ledger.utc_now()
+    queue_path = _queue_entry_path(child_id, queue_dir=queue_dir)
+    child = _sanitize_restore_envelope(entry, increment_recovery_count=False)
+    request = (
+        dict(child.get("request"))
+        if isinstance(child.get("request"), dict)
+        else {}
+    )
+    request.update(
+        {
+            "dispatch_id": child_id,
+            "tail": str(tail),
+            "status_json": str(status_json),
+            "requeued_from": requeued_from,
+        }
+    )
+    child.update(
+        {
+            "schema": DISPATCH_QUEUE_SCHEMA,
+            "state": "queued",
+            "dispatch_id": child_id,
+            "created_at": now,
+            "updated_at": now,
+            "queue_path": str(queue_path),
+            "dispatch_argv": dispatch_argv,
+            "request": request,
+            "requeued_from": requeued_from,
+        }
+    )
+    for key in (
+        "requeue",
+        "restore_txn_id",
+        "restore_reason",
+        "claim_recovery_count",
+        "orphan_first_seen_at",
+    ):
+        child.pop(key, None)
+    if not_before:
+        child["not_before"] = not_before
+        request["not_before"] = not_before
+    else:
+        child.pop("not_before", None)
+        request.pop("not_before", None)
+    return child
+
+
+def _maybe_requeue_terminal_claim(
+    txn: _ReconcileTransaction,
+    entry: dict,
+    *,
+    queue_dir: Path,
+    tail: Path,
+) -> bool:
+    """Run the flag-first, fixed-child-id first-failure transaction.
+
+    True means the old claim may be unlinked. False preserves it for recovery.
+    """
+    if not (txn.queue_locked and txn.ledger_locked):
+        return False
+    request = entry.get("request") if isinstance(entry.get("request"), dict) else {}
+    if entry.get("requeued_from") or request.get("requeued_from"):
+        return True
+    dispatch_id = str(entry.get("dispatch_id") or "")
+    if not dispatch_id:
+        return True
+    record_path = goalflight_ledger.record_path(dispatch_id, create=False)
+    try:
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return True
+    if not isinstance(record, dict):
+        return True
+
+    intent = record.get("requeue")
+    if intent is None:
+        effective_account = record.get("effective_account")
+        if not isinstance(effective_account, str) or not effective_account:
+            return True
+        if _requeue_failure_kind(record, tail) not in {"auth", "quota"}:
+            return True
+        child_id = f"{dispatch_id}-retry-{uuid.uuid4().hex[:8]}"
+        intent = {
+            "child_id": child_id,
+            "requeued_at": goalflight_ledger.utc_now(),
+        }
+        record["requeue"] = intent
+        try:
+            goalflight_ledger.write_record(record)
+        except BaseException as exc:
+            print(
+                "goalflight_dispatch: requeue intent warning: "
+                f"{type(exc).__name__}",
+                file=sys.stderr,
+            )
+            return False
+    if not isinstance(intent, dict):
+        return False
+    child_id = intent.get("child_id")
+    if not isinstance(child_id, str) or not child_id:
+        return False
+    if _requeue_child_exists(queue_dir, child_id):
+        return True
+
+    failure_kind = _requeue_failure_kind(record, tail)
+    effective_account = record.get("effective_account")
+    not_before = (
+        _effective_account_cooldown(effective_account)
+        if failure_kind == "quota" and isinstance(effective_account, str)
+        else None
+    )
+    child = _requeue_child_entry(
+        entry,
+        child_id=child_id,
+        requeued_from=dispatch_id,
+        queue_dir=queue_dir,
+        not_before=not_before,
+    )
+    if child is None:
+        return False
+    child_path = _queue_entry_path(child_id, queue_dir=queue_dir)
+    try:
+        created = _write_json_exclusive(child_path, child)
+    except BaseException as exc:
+        print(
+            "goalflight_dispatch: requeue child warning: "
+            f"{type(exc).__name__}",
+            file=sys.stderr,
+        )
+        return False
+    return created or _requeue_child_exists(queue_dir, child_id)
+
+
 def _mark_claim_worker_dead(
     entry: dict,
     *,
@@ -5772,6 +6279,7 @@ def _mark_claim_worker_dead(
     salvage_required: bool = False,
     resolution_source: str | None = None,
     claim: Path | None = None,
+    queue_dir: Path | None = None,
     stale_s: float = 0.0,
 ) -> bool:
     """Terminalize a claim/ledger orphan. Sets record ``state`` (not only
@@ -5808,12 +6316,16 @@ def _mark_claim_worker_dead(
     if force_state in {"complete", "superseded"} and state == "worker_dead":
         state = force_state
         final_reason = reason
-    queue_dir = claim.parent if claim is not None else _dispatch_queue_dir()
+    queue_dir = (
+        claim.parent
+        if claim is not None
+        else queue_dir or _dispatch_queue_dir()
+    )
     txn = _begin_reconcile_transaction(
         entry,
         queue_dir=queue_dir,
         stale_s=stale_s,
-        need_queue=claim is not None,
+        need_queue=True,
         need_task_store=_is_task_linked(entry, _find_dispatch_record(dispatch_id)),
         need_ledger=True,
     )
@@ -5842,6 +6354,13 @@ def _mark_claim_worker_dead(
         if not result.committed:
             return False
         durable_state = result.durable_state or state
+        if not _maybe_requeue_terminal_claim(
+            txn,
+            fresh,
+            queue_dir=queue_dir,
+            tail=tail,
+        ):
+            return False
         if claim is not None:
             try:
                 claim.unlink()
@@ -5964,6 +6483,34 @@ def _drain_queue_once(args) -> dict:
             and candidate[2].get("state") == "restore_prepared"
         )
     )
+    now_s = time.time()
+    deferred_entries = [
+        candidate
+        for candidate in entries
+        if (
+            _queue_entry_not_before_ts(candidate[2]) is not None
+            and _queue_entry_not_before_ts(candidate[2]) > now_s
+        )
+    ]
+    entries = [candidate for candidate in entries if candidate not in deferred_entries]
+    left_queued += len(deferred_entries)
+    for _sort_key, path, entry, _read_error in deferred_entries:
+        details.append(
+            {
+                "dispatch_id": (
+                    str(entry.get("dispatch_id"))
+                    if isinstance(entry, dict) and entry.get("dispatch_id")
+                    else path.stem
+                ),
+                "state": "queued",
+                "reason": "not_before",
+                "not_before": (
+                    entry.get("not_before")
+                    if isinstance(entry, dict)
+                    else None
+                ),
+            }
+        )
     if args.limit and args.limit > 0:
         entries = entries[: args.limit]
     if not remote_node and entries:
@@ -6331,6 +6878,7 @@ def _build_acp_cfg(args, *, status_json: Path, base: Path | None = None):
         agent=args.agent,
         model=getattr(args, "model", None),
         install_slot=None,
+        account=getattr(args, "account", None),
         cwd=str(project_root),
         worktree="off",
         session_id=None,
@@ -6365,6 +6913,7 @@ def _build_acp_cfg(args, *, status_json: Path, base: Path | None = None):
         remote_turn_cancel_grace_s=DEFAULT_REMOTE_TURN_CANCEL_GRACE_S,
         steer_file=str(_steer_file(args.dispatch_id)),
         queue_launch_token=getattr(args, "queue_launch_token", None),
+        request_envelope=_queue_request_envelope(args),
         cpu_epsilon=0.1,
         json=False,
     )
@@ -7147,6 +7696,9 @@ def main(argv: list[str] | None = None) -> int:
     lease_id = None
     ledger_recorded = False
     detached_launched = False
+    codex_dispatch_home = None
+    effective_account = None
+    request_envelope = None
     final_state = "failed"
     final_reason = None
     final_terminal_marker_present = False
@@ -7205,6 +7757,19 @@ def main(argv: list[str] | None = None) -> int:
                 if specific:
                     final_reason = f"capacity_wait:{specific}"
             raise
+        if (
+            _account_engine(args.agent) == "codex"
+            and not goalflight_compat.is_windows()
+        ):
+            try:
+                codex_dispatch_home, effective_account = resolve_codex_home(
+                    project_root,
+                    args.account,
+                    args.dispatch_id,
+                )
+            except BaseException:
+                codex_dispatch_home, effective_account = None, None
+        request_envelope = _queue_request_envelope(args)
         _record_ledger(
             args,
             project_root=project_root,
@@ -7214,6 +7779,8 @@ def main(argv: list[str] | None = None) -> int:
             lease_id=lease_id,
             worker_pid=None,
             state="starting",
+            effective_account=effective_account,
+            request_envelope=request_envelope,
         )
 
         # 1. Launch the worker DETACHED, output -> tail (prompt -> stdin for codex).
@@ -7221,6 +7788,8 @@ def main(argv: list[str] | None = None) -> int:
         # resolved environment here.
         env = dict(os.environ)
         env.update(account_env)
+        if codex_dispatch_home is not None:
+            env["CODEX_HOME"] = codex_dispatch_home
         env["GOALFLIGHT_STEER_FILE"] = str(steer_file)
         if original_prompt_path:
             env["GOALFLIGHT_PROMPT_FILE"] = str(original_prompt_path)
@@ -7234,6 +7803,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.billing == "sub" and _account_engine(args.agent) == "codex":
             env.pop("OPENAI_API_KEY", None)  # subscription billing for the selected account, not the API
         _apply_web_qa_env(env, args, project_root)
+        if _account_engine(args.agent) == "codex":
+            worker_argv = _guard_codex_context_mode_disable(worker_argv, env)
 
         _mark_queue_claim_worker_spawn_intent(args)
         worker_pid = _spawn_daemonized_process(
@@ -7310,6 +7881,8 @@ def main(argv: list[str] | None = None) -> int:
                 lease_id=lease_id,
                 worker_pid=worker_pid,
                 state="running",
+                effective_account=effective_account,
+                request_envelope=request_envelope,
             )
         except Exception as e:
             registration_errors.append(_registration_error("record_ledger_running", e))
@@ -7362,6 +7935,8 @@ def main(argv: list[str] | None = None) -> int:
             watch_cmd += ["--worker-identity-json", json.dumps(watch_identity_token, sort_keys=True)]
         if args.launch_detached:
             watch_cmd += ["--detached"]
+        if codex_dispatch_home is not None:
+            watch_cmd += ["--codex-dispatch-home-resolved"]
         if args.controller_pid:
             watch_cmd += ["--controller-pid", str(args.controller_pid)]
         if prompt_path:
@@ -7519,6 +8094,12 @@ def main(argv: list[str] | None = None) -> int:
                 _release_capacity(lease_id, str(capacity_state or final_state), capacity_reason)
             _cleanup_pidfile_if_worker_dead(pidfile, worker_pid)
             _export_dashboard_status_for_project(project_root)
+        if (
+            codex_dispatch_home is not None
+            and not detached_launched
+            and final_worker_alive is not True
+        ):
+            cleanup_codex_dispatch_home(args.dispatch_id)
 
 
 if __name__ == "__main__":

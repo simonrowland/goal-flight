@@ -28,7 +28,7 @@ def _normalize(agent: str) -> str:
     return args.agent
 
 
-def case_normalize_acp_agents() -> None:
+def test_normalize_acp_agents() -> None:
     assert _normalize("worker") == "codex-acp"
     assert _normalize("codex") == "codex-acp"
     assert _normalize("codex-acp") == "codex-acp"
@@ -70,7 +70,7 @@ def _base_acp_args(tmp: Path, *, agent: str, dispatch_id: str) -> SimpleNamespac
     )
 
 
-def case_build_acp_cfg_agent_liveness_defaults() -> None:
+def test_build_acp_cfg_agent_liveness_defaults() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         for agent in ("cursor", "claude"):
@@ -87,12 +87,14 @@ def case_build_acp_cfg_agent_liveness_defaults() -> None:
         args = _base_acp_args(tmp, agent="codex-acp", dispatch_id="priority-cfg")
         args.priority = "bulk"
         args.capacity_wait_s = 12.5
+        args.account = "explicit-seat"
         cfg = dispatch_mod._build_acp_cfg(args, status_json=tmp / "priority.json")
         assert cfg.priority == "bulk"
         assert cfg.capacity_wait_s == 12.5
+        assert cfg.account == "explicit-seat"
 
 
-def case_build_acp_cfg_injects_orientation_prompt_text() -> None:
+def test_build_acp_cfg_injects_orientation_prompt_text() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         prompt = tmp / "prompt.md"
@@ -290,7 +292,7 @@ def _run_acp_thread(cfg: SimpleNamespace):
     return thread, result
 
 
-def case_acp_capacity_wait_queues_until_slot_frees() -> None:
+def test_acp_capacity_wait_queues_until_slot_frees() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         state_dir = tmp / "state"
@@ -327,7 +329,7 @@ def case_acp_capacity_wait_queues_until_slot_frees() -> None:
         assert final["state"] == "complete", final
 
 
-def case_acp_capacity_wait_deadline_blocks() -> None:
+def test_acp_capacity_wait_deadline_blocks() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         state_dir = tmp / "state"
@@ -358,7 +360,7 @@ def case_acp_capacity_wait_deadline_blocks() -> None:
         assert status["reason"]["waited_s"] >= 0.0, status
 
 
-def case_acp_capacity_wait_zero_single_shot() -> None:
+def test_acp_capacity_wait_zero_single_shot() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         state_dir = tmp / "state"
@@ -387,7 +389,7 @@ def case_acp_capacity_wait_zero_single_shot() -> None:
         assert "attempts" not in status["reason"] and "waited_s" not in status["reason"], status
 
 
-def case_acp_capacity_wait_sigterm_terminalizes() -> None:
+def test_acp_capacity_wait_sigterm_terminalizes() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         state_dir = tmp / "state"
@@ -471,7 +473,7 @@ def _main_capture_for(agent: str) -> tuple[int, dict[str, object]]:
     return rc, captured
 
 
-def case_auto_shape_routes_cursor_and_claude_to_acp() -> None:
+def test_auto_shape_routes_cursor_and_claude_to_acp() -> None:
     rc, captured = _main_capture_for("cursor")
     assert rc == 0
     assert captured["shape"] == "acp"
@@ -515,21 +517,21 @@ def _run_acp_shape_env_capture(agent: str, env_key: str) -> dict[str, str | None
     return captured
 
 
-def case_subscription_env_scrub_for_cursor_and_claude_acp() -> None:
+def test_subscription_env_scrub_for_cursor_and_claude_acp() -> None:
     assert _run_acp_shape_env_capture("cursor", "CURSOR_API_KEY")["CURSOR_API_KEY"] is None
     assert _run_acp_shape_env_capture("claude", "ANTHROPIC_API_KEY")["ANTHROPIC_API_KEY"] is None
 
 
 def main() -> None:
-    case_normalize_acp_agents()
-    case_build_acp_cfg_agent_liveness_defaults()
-    case_build_acp_cfg_injects_orientation_prompt_text()
-    case_acp_capacity_wait_queues_until_slot_frees()
-    case_acp_capacity_wait_deadline_blocks()
-    case_acp_capacity_wait_zero_single_shot()
-    case_acp_capacity_wait_sigterm_terminalizes()
-    case_auto_shape_routes_cursor_and_claude_to_acp()
-    case_subscription_env_scrub_for_cursor_and_claude_acp()
+    test_normalize_acp_agents()
+    test_build_acp_cfg_agent_liveness_defaults()
+    test_build_acp_cfg_injects_orientation_prompt_text()
+    test_acp_capacity_wait_queues_until_slot_frees()
+    test_acp_capacity_wait_deadline_blocks()
+    test_acp_capacity_wait_zero_single_shot()
+    test_acp_capacity_wait_sigterm_terminalizes()
+    test_auto_shape_routes_cursor_and_claude_to_acp()
+    test_subscription_env_scrub_for_cursor_and_claude_acp()
     print("OK: goalflight_dispatch ACP agent tests pass")
 
 

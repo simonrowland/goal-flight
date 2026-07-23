@@ -127,42 +127,82 @@ def _task_state_for_terminal(dispatch_state: object) -> str:
     return "worker-finished" if dispatch_state == "complete" else "worker-failed"
 
 
+def _cleanup_codex_dispatch_home(
+    dispatch_id: str,
+    agent: object,
+    *,
+    detached: bool,
+    home_resolved: bool,
+) -> None:
+    """Best-effort watcher ownership for terminal detached-bash cleanup."""
+    if (
+        not detached
+        or not home_resolved
+        or goalflight_ledger.infer_engine(agent) != "codex"
+    ):
+        return
+    try:
+        import goalflight_dispatch
+
+        goalflight_dispatch.cleanup_codex_dispatch_home(dispatch_id)
+    except BaseException as exc:
+        print(
+            "goalflight_watch: per-dispatch home cleanup warning: "
+            f"{type(exc).__name__}",
+            file=sys.stderr,
+        )
+
+
 def _finish_existing_ledger(
     dispatch_id: str,
     state: object,
     reason: object,
     *,
     worker_still_alive: object = None,
+    agent: object = "unknown",
+    detached: bool = False,
+    codex_dispatch_home_resolved: bool = False,
 ) -> dict | None:
     if not dispatch_id or not state:
         return None
     if state == "watcher_stopped" and worker_still_alive is True:
         return None
-    path = goalflight_ledger.record_path(dispatch_id, create=False)
-    if not path.exists():
-        return None
-    max_attempts = 3
-    backoff_s = 0.05
-    last_error: dict | None = None
-    for attempt in range(max_attempts):
-        try:
-            with contextlib.redirect_stdout(io.StringIO()):
-                goalflight_ledger.cmd_finish(
-                    argparse.Namespace(
-                        dispatch_id=dispatch_id,
-                        state=str(state),
-                        reason=reason,
-                        terminal_state=None,
-                        elapsed_s=None,
-                        worker_still_alive=worker_still_alive,
-                    )
-                )
+    try:
+        path = goalflight_ledger.record_path(dispatch_id, create=False)
+        if not path.exists():
             return None
-        except Exception as exc:
-            last_error = {"type": type(exc).__name__, "message": str(exc)}
-            if attempt + 1 < max_attempts:
-                time.sleep(backoff_s * (attempt + 1))
-    return last_error
+        max_attempts = 3
+        backoff_s = 0.05
+        last_error: dict | None = None
+        for attempt in range(max_attempts):
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    goalflight_ledger.cmd_finish(
+                        argparse.Namespace(
+                            dispatch_id=dispatch_id,
+                            state=str(state),
+                            reason=reason,
+                            terminal_state=None,
+                            elapsed_s=None,
+                            worker_still_alive=worker_still_alive,
+                        )
+                    )
+                return None
+            except Exception as exc:
+                last_error = {"type": type(exc).__name__, "message": str(exc)}
+                if attempt + 1 < max_attempts:
+                    time.sleep(backoff_s * (attempt + 1))
+        return last_error
+    finally:
+        _cleanup_codex_dispatch_home(
+            dispatch_id,
+            agent,
+            detached=detached,
+            home_resolved=(
+                codex_dispatch_home_resolved
+                and worker_still_alive is not True
+            ),
+        )
 
 
 def _status_snapshot(payload: dict) -> dict:
@@ -802,6 +842,11 @@ def main() -> int:
     parser.add_argument("--controller-pid", type=int)
     parser.add_argument("--detached", action="store_true",
                         help="Ignore launcher/controller pid liveness; worker pid identity is authoritative.")
+    parser.add_argument(
+        "--codex-dispatch-home-resolved",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--worker-identity-json",
                         help="Process identity token captured at spawn; prevents PID-reuse false liveness.")
     parser.add_argument("--ignore-prompt-file",
@@ -948,6 +993,11 @@ def main() -> int:
                 payload.get("state"),
                 payload.get("reason"),
                 worker_still_alive=payload.get("worker_alive"),
+                agent=args.agent,
+                detached=bool(args.detached),
+                codex_dispatch_home_resolved=bool(
+                    args.codex_dispatch_home_resolved
+                ),
             )
             if ledger_error:
                 payload["ledger_finalize_error"] = ledger_error

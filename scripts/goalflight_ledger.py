@@ -483,6 +483,17 @@ def cmd_record(args: argparse.Namespace) -> int:
         "started_at": utc_now(),
         "hostname": socket.gethostname(),
     }
+    effective_account = getattr(args, "effective_account", None)
+    if effective_account:
+        record["effective_account"] = effective_account
+    request_envelope_json = getattr(args, "request_envelope_json", None)
+    if request_envelope_json:
+        try:
+            request_envelope = json.loads(request_envelope_json)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            request_envelope = None
+        if isinstance(request_envelope, dict):
+            record["request_envelope"] = request_envelope
     task_ids = task_ids_from_args(args)
     if task_ids:
         record["task_ids"] = task_ids
@@ -499,6 +510,11 @@ def cmd_record(args: argparse.Namespace) -> int:
                 existing = {}
             if existing.get("started_at"):
                 record["started_at"] = existing["started_at"]
+            if (
+                "request_envelope" not in record
+                and isinstance(existing.get("request_envelope"), dict)
+            ):
+                record["request_envelope"] = existing["request_envelope"]
         path = write_record(record)
     payload = {"ok": True, "dispatch_id": dispatch_id, "path": str(path), "state": record["state"]}
     print(json.dumps(payload, indent=None if args.json else 2, sort_keys=True))
@@ -572,6 +588,7 @@ def status_payload() -> dict:
             "engine": str(r.get("engine") or infer_engine(r.get("agent"))),
             "shape": infer_shape(r),
             "account": r.get("account") or "unknown",
+            "effective_account": r.get("effective_account"),
             "transport": r.get("transport"),
             "state": r.get("state"),
             "classification": classification,
@@ -830,6 +847,8 @@ def build_parser() -> argparse.ArgumentParser:
     rec.add_argument("--engine")
     rec.add_argument("--shape", choices=["bash", "acp", "unknown"])
     rec.add_argument("--account")
+    rec.add_argument("--effective-account")
+    rec.add_argument("--request-envelope-json", help=argparse.SUPPRESS)
     rec.add_argument("--transport", default="unknown")
     rec.add_argument("--project-root")
     rec.add_argument("--controller-pid", type=int)
