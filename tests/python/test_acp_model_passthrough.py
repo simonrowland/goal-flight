@@ -176,15 +176,18 @@ def case_build_worker_injects_model() -> None:
     assert "--auto" not in " ".join(argv_kimi) and "-y" not in argv_kimi, argv_kimi
     # grok-research keeps web tools ON (grok-4.5 supports web_search/web_fetch).
     assert "--disable-web-search" not in argv_research, argv_research
-    # grok 0.2.39 regression: in single-turn `--prompt-file` mode EVERY
-    # `--permission-mode` value stops the file-write tool from writing (none produce
-    # the file); the empty no-ops surface as worker_dead_no_terminal_marker. Omitting
-    # the flag is the only invocation that writes in-cwd non-interactively. Lock the
-    # omit for both presets so a future "re-add acceptEdits" cannot regress
-    # edit-heavy chunks.
+    # grok single-turn `--prompt-file` write behavior is permission-mode-dependent
+    # and drifts across releases (build_worker carries the full per-version probe
+    # log). grok 0.2.111 (2026-07-24): omit/default/acceptEdits/dontAsk are silent
+    # 1-byte no-ops (worker_dead_no_terminal_marker); only `auto` and
+    # `bypassPermissions` actually write. Ship the least-privileged value that
+    # writes — `--permission-mode auto` — and lock it so a future "just omit the
+    # flag" cannot re-break edit-heavy chunks, while keeping the blanket bypass out.
     for agent in ("grok-code", "grok-research"):
         argv = _build(agent, None)
-        assert "--permission-mode" not in argv, (agent, argv)
+        assert "--permission-mode" in argv, (agent, argv)
+        assert argv[argv.index("--permission-mode") + 1] == "auto", (agent, argv)
+        assert "bypassPermissions" not in argv, (agent, argv)
         assert "acceptEdits" not in argv, (agent, argv)
     # raw `-- <cmd>` passthrough ignores model (the orchestrator supplies the cmd).
     assert _build("x", MODEL, raw=["echo", "hi"]) == ["echo", "hi"]
