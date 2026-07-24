@@ -1614,6 +1614,7 @@ def _status_reminder_lines(
     tail = Path(tail_path).resolve()
     status_py = root / "scripts" / "goalflight_status.py"
     watch_py = root / "scripts" / "goalflight_watch.py"
+    messages_py = root / "scripts" / "goalflight_messages.py"
     lines = [
         f"[goal-flight] dispatched {dispatch_id} ({shape}). Check status with the python "
         "tooling — do NOT hand-roll ps/tail -f/backgrounded watchers (they race the worker "
@@ -1622,6 +1623,7 @@ def _status_reminder_lines(
         f"  wait:   python3 {status_py} --wait {dispatch_id}",
         f"  done?:  python3 {status_py} --done {dispatch_id}   "
         "# exit 0=terminal, 1=running, 2=ambiguous",
+        f"  mail:   python3 {messages_py} relay   # current project, open + unread",
     ]
     if shape == "acp":
         lines.append(

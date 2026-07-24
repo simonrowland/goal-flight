@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import os
 import subprocess
@@ -12,6 +13,7 @@ import threading
 import time
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from acp_runner import extract_markers, extract_message_envelopes
@@ -23,7 +25,21 @@ def assert_true(name: str, condition: bool) -> None:
         raise AssertionError(name)
 
 
-def run_messages_cli(messages_dir: Path, fleet_dir: Path, args: list[str]) -> subprocess.CompletedProcess[str]:
+def run_messages_cli(
+    messages_dir: Path,
+    fleet_dir: Path,
+    args: list[str],
+    *,
+    cwd: Path = ROOT,
+) -> subprocess.CompletedProcess[str]:
+    env = dict(os.environ)
+    env.update(
+        {
+            "GOALFLIGHT_MESSAGES_DIR": str(messages_dir),
+            "GOALFLIGHT_FLEET_DIR": str(fleet_dir),
+            "GOALFLIGHT_STATE_DIR": str(messages_dir.parent / "state"),
+        }
+    )
     return subprocess.run(
         [
             sys.executable,
@@ -34,10 +50,40 @@ def run_messages_cli(messages_dir: Path, fleet_dir: Path, args: list[str]) -> su
             str(fleet_dir),
             *args,
         ],
+        cwd=str(cwd),
+        env=env,
         capture_output=True,
         text=True,
         check=False,
     )
+
+
+def write_ledger_record(
+    base: Path,
+    dispatch_id: str,
+    project_root: Path,
+    *,
+    state: str = "running",
+    task_ids: list[str] | None = None,
+    started_at: str = "2026-07-23T00:00:00+00:00",
+) -> None:
+    runs_dir = base / "state" / "runs.d"
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    record = {
+        "schema": "goalflight.dispatch.v1",
+        "dispatch_id": dispatch_id,
+        "project_root": str(project_root.resolve()),
+        "state": state,
+        "started_at": started_at,
+    }
+    if task_ids:
+        record["task_ids"] = task_ids
+    (runs_dir / f"{dispatch_id}.json").write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+
+def init_git_project(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-q"], cwd=path, check=True)
 
 
 def test_marker_mapping() -> None:
@@ -147,7 +193,13 @@ def test_relay_user_need_e2e() -> None:
         )
         env = {**dict(os.environ), "GOALFLIGHT_MESSAGES_DIR": str(messages_dir), "GOALFLIGHT_FLEET_DIR": str(fleet_dir)}
         relay = subprocess.run(
-            [sys.executable, str(ROOT / "scripts" / "goalflight_messages.py"), "relay"],
+            [
+                sys.executable,
+                str(ROOT / "scripts" / "goalflight_messages.py"),
+                "relay",
+                "--all-projects",
+                "--history",
+            ],
             env=env,
             capture_output=True,
             text=True,
@@ -161,7 +213,13 @@ def test_relay_user_need_e2e() -> None:
             markers_to_envelopes({"COMPLETE": ["answered"]}, dispatch_id=dispatch_id, seq_start=2)[0],
         )
         relay2 = subprocess.run(
-            [sys.executable, str(ROOT / "scripts" / "goalflight_messages.py"), "relay"],
+            [
+                sys.executable,
+                str(ROOT / "scripts" / "goalflight_messages.py"),
+                "relay",
+                "--all-projects",
+                "--history",
+            ],
             env=env,
             capture_output=True,
             text=True,
@@ -524,7 +582,11 @@ def test_ack_cursor_write_failure_warns_without_traceback() -> None:
         assert_true("read warning", "WARNING: cursor not advanced:" in read.stderr)
         assert_true("read no traceback", "Traceback" not in read.stderr)
 
-        relay = run_messages_cli(messages_dir, fleet_dir, ["relay", "--new", "--ack"])
+        relay = run_messages_cli(
+            messages_dir,
+            fleet_dir,
+            ["relay", "--new", "--ack", "--all-projects"],
+        )
         assert_true("relay ack exits nonzero", relay.returncode == 1)
         assert_true("relay still shows envelope", json.loads(relay.stdout.splitlines()[0])[0]["seq"] == 1)
         assert_true("relay count printed", relay.stdout.splitlines()[1] == "unseen counts: d-ack-fail=1")
@@ -575,7 +637,7 @@ def test_corrupt_or_absent_cursor_means_all_unseen() -> None:
         assert_true("corrupt shows all", [env["seq"] for env in json.loads(corrupt.stdout.splitlines()[0])] == [1, 2])
 
 
-def test_seen_but_open_user_need_still_surfaces_in_normal_relay() -> None:
+def test_seen_open_user_need_requires_history_relay() -> None:
     import tempfile
     from goalflight_messages import append_envelope, inbox_path, markers_to_envelopes
 
@@ -599,12 +661,21 @@ def test_seen_but_open_user_need_still_surfaces_in_normal_relay() -> None:
 
         unseen = run_messages_cli(messages_dir, fleet_dir, ["read", "--dispatch-id", dispatch_id, "--unseen"])
         assert_true("seen hidden from unseen", json.loads(unseen.stdout.splitlines()[0]) == [])
-        relay = run_messages_cli(messages_dir, fleet_dir, ["relay"])
-        assert_true("normal relay still open", relay.returncode == 2)
-        assert_true("open user_need remains", "USER-NEED relay: [d-open-seen] user_need: answer required" in relay.stdout)
+        relay = run_messages_cli(messages_dir, fleet_dir, ["relay", "--all-projects"])
+        assert_true("default relay hides read item", relay.returncode == 0)
+        history = run_messages_cli(
+            messages_dir,
+            fleet_dir,
+            ["relay", "--all-projects", "--history"],
+        )
+        assert_true("history relay keeps open item", history.returncode == 2)
+        assert_true(
+            "open user_need remains in history",
+            "USER-NEED relay: [d-open-seen] user_need: answer required" in history.stdout,
+        )
 
 
-def test_default_read_and_relay_output_unchanged_without_cursor_ops() -> None:
+def test_default_read_and_relay_respect_independent_read_cursor() -> None:
     import tempfile
     from goalflight_messages import append_envelope, inbox_path, markers_to_envelopes
 
@@ -619,6 +690,7 @@ def test_default_read_and_relay_output_unchanged_without_cursor_ops() -> None:
         fleet_dir = base / "fleet"
         fleet_dir.mkdir()
         dispatch_id = "d-default"
+        write_ledger_record(base, dispatch_id, ROOT)
         path = inbox_path(messages_dir, dispatch_id)
         envelope = markers_to_envelopes({"USER-NEED": ["byte stable"]}, dispatch_id=dispatch_id)[0]
         append_envelope(path, envelope)
@@ -629,7 +701,7 @@ def test_default_read_and_relay_output_unchanged_without_cursor_ops() -> None:
 
         relay = run_messages_cli(messages_dir, fleet_dir, ["relay"])
         assert_true("relay default exit 2", relay.returncode == 2)
-        assert_true("relay bytes stable", relay.stdout == "USER-NEED relay: [d-default] user_need: byte stable\n")
+        assert_true("relay one-line item", relay.stdout == "[d-default] user_need: byte stable\n")
 
         status = run_messages_cli(messages_dir, fleet_dir, ["status"])
         assert_true("status default exit 0", status.returncode == 0)
@@ -643,12 +715,236 @@ def test_default_read_and_relay_output_unchanged_without_cursor_ops() -> None:
         assert_true("read after cursor bytes stable", read_after.stdout == read.stdout)
 
         relay_after = run_messages_cli(messages_dir, fleet_dir, ["relay"])
-        assert_true("relay after cursor exit 2", relay_after.returncode == 2)
-        assert_true("relay after cursor bytes stable", relay_after.stdout == relay.stdout)
+        assert_true("relay after cursor exit 0", relay_after.returncode == 0)
+        assert_true("relay after cursor hides item", relay_after.stdout == "no open unread items\n")
+
+        history_after = run_messages_cli(messages_dir, fleet_dir, ["relay", "--history"])
+        assert_true("history after cursor exit 2", history_after.returncode == 2)
+        assert_true("history after cursor keeps item", dispatch_id in history_after.stdout)
 
         status_after = run_messages_cli(messages_dir, fleet_dir, ["status"])
         assert_true("status after cursor exit 0", status_after.returncode == 0)
         assert_true("status stable fields unchanged", stable_status(status_after.stdout) == stable_before)
+
+
+def test_default_relay_is_bounded_newest_first_with_elision() -> None:
+    import tempfile
+    from goalflight_messages import append_envelope, inbox_path, markers_to_envelopes
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project = base / "project"
+        messages_dir = base / "messages"
+        fleet_dir = base / "fleet"
+        init_git_project(project)
+        fleet_dir.mkdir()
+        for index in range(80):
+            dispatch_id = f"d-large-{index:03d}"
+            stamp = f"2026-07-23T00:{index // 60:02d}:{index % 60:02d}+00:00"
+            write_ledger_record(
+                base,
+                dispatch_id,
+                project,
+                started_at=stamp,
+            )
+            envelope = markers_to_envelopes(
+                {"USER-NEED": [f"fixture {index} " + ("x" * 180)]},
+                dispatch_id=dispatch_id,
+                ts=stamp,
+            )[0]
+            append_envelope(inbox_path(messages_dir, dispatch_id), envelope)
+
+        relay = run_messages_cli(messages_dir, fleet_dir, ["relay"], cwd=project)
+        assert_true("bounded relay exits with mail", relay.returncode == 2)
+        assert_true("hard byte cap", len(relay.stdout.encode("utf-8")) <= 4096)
+        lines = relay.stdout.splitlines()
+        assert_true("item cap plus elision", len(lines) <= 21)
+        assert_true("newest item first", lines[0].startswith("[d-large-079]"))
+        assert_true("elision line present", lines[-1].startswith("(+") and lines[-1].endswith("elided)"))
+
+
+def test_default_relay_excludes_cross_project_mail() -> None:
+    import tempfile
+    from goalflight_messages import append_envelope, inbox_path, markers_to_envelopes
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project = base / "mine"
+        other = base / "other"
+        messages_dir = base / "messages"
+        fleet_dir = base / "fleet"
+        init_git_project(project)
+        init_git_project(other)
+        fleet_dir.mkdir()
+        write_ledger_record(base, "mine-dispatch", project)
+        write_ledger_record(base, "other-dispatch", other)
+        for dispatch_id in ("mine-dispatch", "other-dispatch"):
+            append_envelope(
+                inbox_path(messages_dir, dispatch_id),
+                markers_to_envelopes(
+                    {"USER-NEED": [f"{dispatch_id} need"]},
+                    dispatch_id=dispatch_id,
+                )[0],
+            )
+
+        scoped = run_messages_cli(messages_dir, fleet_dir, ["relay"], cwd=project)
+        assert_true("scoped relay has own mail", "mine-dispatch" in scoped.stdout)
+        assert_true("scoped relay excludes other mail", "other-dispatch" not in scoped.stdout)
+        all_projects = run_messages_cli(
+            messages_dir,
+            fleet_dir,
+            ["relay", "--all-projects"],
+            cwd=project,
+        )
+        assert_true("explicit all-projects includes own mail", "mine-dispatch" in all_projects.stdout)
+        assert_true("explicit all-projects includes other mail", "other-dispatch" in all_projects.stdout)
+
+
+def test_ack_stale_expires_exact_stale_set_and_preserves_read_cursor() -> None:
+    import tempfile
+    import goalflight_task as T
+    from goalflight_messages import (
+        ACK_CURSOR_FILE,
+        READ_CURSOR_FILE,
+        append_envelope,
+        inbox_path,
+        markers_to_envelopes,
+    )
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project = base / "project"
+        messages_dir = base / "messages"
+        fleet_dir = base / "fleet"
+        init_git_project(project)
+        fleet_dir.mkdir()
+
+        def task(task_id: str, *, done: bool = False) -> dict:
+            return {
+                "schema_version": 1,
+                "id": task_id,
+                "kind": "task",
+                "title": task_id,
+                "blocked_by": [],
+                "links": [],
+                "done": done,
+                "created_at": "2026-07-23T00:00:00+00:00",
+                "created_by": "test",
+            }
+
+        T.TaskStore(project).save_items_atomic(
+            [
+                task("t-closed", done=True),
+                task("t-superseded"),
+                task("t-live", done=True),
+                task("t-current"),
+            ]
+        )
+        now = dt.datetime.now(dt.timezone.utc)
+        taskless_old_at = (now - dt.timedelta(hours=25)).isoformat()
+        taskless_recent_at = (now - dt.timedelta(hours=1)).isoformat()
+        write_ledger_record(
+            base,
+            "d-closed",
+            project,
+            state="complete",
+            task_ids=["t-closed"],
+            started_at="2026-07-23T00:00:00+00:00",
+        )
+        write_ledger_record(
+            base,
+            "d-old",
+            project,
+            state="failed",
+            task_ids=["t-superseded"],
+            started_at="2026-07-23T00:01:00+00:00",
+        )
+        write_ledger_record(
+            base,
+            "d-new",
+            project,
+            state="running",
+            task_ids=["t-superseded"],
+            started_at="2026-07-23T00:02:00+00:00",
+        )
+        write_ledger_record(
+            base,
+            "d-live",
+            project,
+            state="running",
+            task_ids=["t-live"],
+            started_at="2026-07-23T00:03:00+00:00",
+        )
+        write_ledger_record(
+            base,
+            "d-current",
+            project,
+            state="failed",
+            task_ids=["t-current"],
+            started_at="2026-07-23T00:04:00+00:00",
+        )
+        write_ledger_record(
+            base,
+            "d-taskless-old",
+            project,
+            state="failed",
+            started_at=taskless_old_at,
+        )
+        write_ledger_record(
+            base,
+            "d-taskless-recent",
+            project,
+            state="failed",
+            started_at=taskless_recent_at,
+        )
+        write_ledger_record(
+            base,
+            "d-taskless-live",
+            project,
+            state="running",
+            started_at=taskless_old_at,
+        )
+        for dispatch_id in (
+            "d-closed",
+            "d-old",
+            "d-live",
+            "d-current",
+            "d-taskless-old",
+            "d-taskless-recent",
+            "d-taskless-live",
+        ):
+            append_envelope(
+                inbox_path(messages_dir, dispatch_id),
+                markers_to_envelopes(
+                    {"BLOCKED": [f"{dispatch_id} escalation"]},
+                    dispatch_id=dispatch_id,
+                )[0],
+            )
+
+        stale = run_messages_cli(messages_dir, fleet_dir, ["ack", "--stale"], cwd=project)
+        assert_true("ack stale succeeds", stale.returncode == 0)
+        assert_true("exact stale dispatch count", "3 dispatch(es), 3 open item(s)" in stale.stdout)
+        relay = run_messages_cli(messages_dir, fleet_dir, ["relay"], cwd=project)
+        assert_true("live escalation survives", "d-live" in relay.stdout)
+        assert_true("current terminal escalation survives", "d-current" in relay.stdout)
+        assert_true("recent task-less terminal escalation survives", "d-taskless-recent" in relay.stdout)
+        assert_true("task-less live escalation survives", "d-taskless-live" in relay.stdout)
+        assert_true("closed task escalation expired", "d-closed" not in relay.stdout)
+        assert_true("superseded escalation expired", "d-old" not in relay.stdout)
+        assert_true("old task-less terminal escalation expired", "d-taskless-old" not in relay.stdout)
+        ack_cursor = json.loads((messages_dir / ACK_CURSOR_FILE).read_text())
+        assert_true(
+            "ack cursor exact stale keys",
+            set(ack_cursor) == {"d-closed", "d-old", "d-taskless-old"},
+        )
+        assert_true("read cursor remains untouched", not (messages_dir / READ_CURSOR_FILE).exists())
+
+        explicit = run_messages_cli(messages_dir, fleet_dir, ["ack", "d-live"], cwd=project)
+        assert_true("explicit ack succeeds", explicit.returncode == 0)
+        relay_after = run_messages_cli(messages_dir, fleet_dir, ["relay"], cwd=project)
+        assert_true("explicit ack removes live escalation", "d-live" not in relay_after.stdout)
+        assert_true("unacked current escalation remains", "d-current" in relay_after.stdout)
+        assert_true("explicit ack still leaves read cursor untouched", not (messages_dir / READ_CURSOR_FILE).exists())
 
 
 def main() -> None:
@@ -673,8 +969,11 @@ def main() -> None:
         test_ack_cursor_write_failure_warns_without_traceback,
         test_mark_read_cursor_write_failure_warns_without_traceback,
         test_corrupt_or_absent_cursor_means_all_unseen,
-        test_seen_but_open_user_need_still_surfaces_in_normal_relay,
-        test_default_read_and_relay_output_unchanged_without_cursor_ops,
+        test_seen_open_user_need_requires_history_relay,
+        test_default_read_and_relay_respect_independent_read_cursor,
+        test_default_relay_is_bounded_newest_first_with_elision,
+        test_default_relay_excludes_cross_project_mail,
+        test_ack_stale_expires_exact_stale_set_and_preserves_read_cursor,
     ):
         test()
         print(f"PASS {test.__name__}")

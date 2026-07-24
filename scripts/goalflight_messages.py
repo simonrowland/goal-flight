@@ -9,6 +9,7 @@ import contextlib
 import datetime as dt
 import json
 import os
+import subprocess
 import uuid
 from pathlib import Path
 import sys
@@ -18,6 +19,10 @@ REPO_ROOT = SCRIPT_DIR.parent
 DEFAULT_CONTRACT = REPO_ROOT / "docs-private" / "architecture" / "contracts" / "goalflight.message.v1.json"
 AGGREGATE_SCHEMA = "goalflight.fleet.register.aggregate.v1"
 READ_CURSOR_FILE = ".read-cursor.json"
+ACK_CURSOR_FILE = ".ack-cursor.json"
+DEFAULT_RELAY_ITEM_LIMIT = 20
+DEFAULT_RELAY_BYTE_LIMIT = 4096
+TASKLESS_TERMINAL_STALE_AFTER = dt.timedelta(hours=24)
 
 sys.path.insert(0, str(SCRIPT_DIR))
 
@@ -102,6 +107,10 @@ def mail_lock(path: Path):
 
 def read_cursor_path(messages_dir: Path) -> Path:
     return messages_dir / READ_CURSOR_FILE
+
+
+def ack_cursor_path(messages_dir: Path) -> Path:
+    return messages_dir / ACK_CURSOR_FILE
 
 
 def load_read_cursor(path: Path) -> dict[str, int]:
@@ -381,12 +390,15 @@ def _dispatch_complete(envelopes: list[dict]) -> bool:
     return False
 
 
-def _open_user_needs(envelopes: list[dict]) -> list[dict]:
+def _open_user_needs(envelopes: list[dict], *, acked_through: int = 0) -> list[dict]:
     if _dispatch_complete(envelopes):
         return []
     open_items: list[dict] = []
     for env in envelopes:
-        if env.get("type") in {"user_need", "user_confirm", "blocked"}:
+        if (
+            env.get("type") in {"user_need", "user_confirm", "blocked"}
+            and int(env.get("seq", 0)) > acked_through
+        ):
             payload = env.get("payload", {}) or {}
             open_items.append(
                 {
@@ -402,12 +414,16 @@ def _open_user_needs(envelopes: list[dict]) -> list[dict]:
     return open_items
 
 
-def _open_controller_advisories(envelopes: list[dict]) -> list[dict]:
+def _open_controller_advisories(envelopes: list[dict], *, acked_through: int = 0) -> list[dict]:
     if _dispatch_complete(envelopes):
         return []
     open_items: list[dict] = []
     for env in envelopes:
-        if env.get("dispatch_id") == "controller-quota-advisory" and env.get("type") == "advisory":
+        if (
+            env.get("dispatch_id") == "controller-quota-advisory"
+            and env.get("type") == "advisory"
+            and int(env.get("seq", 0)) > acked_through
+        ):
             open_items.append(
                 {
                     "dispatch_id": env["dispatch_id"],
@@ -534,6 +550,7 @@ def build_aggregate(
     dispatch_ids: set[str] | None = None,
 ) -> dict:
     envelopes_by_dispatch: dict[str, list[dict]] = {}
+    ack_cursor = load_read_cursor(ack_cursor_path(messages_dir))
     for path in collect_inbox_paths(messages_dir, fleet_dir, dispatch_ids=dispatch_ids):
         try:
             envelopes_by_dispatch[path.stem] = read_envelopes(path)
@@ -550,8 +567,11 @@ def build_aggregate(
             continue
         if not _dispatch_complete(envelopes):
             active_dispatches.append(dispatch_id)
-        open_user_needs.extend(_open_user_needs(envelopes))
-        open_advisories.extend(_open_controller_advisories(envelopes))
+        acked_through = int(ack_cursor.get(dispatch_id, 0))
+        open_user_needs.extend(_open_user_needs(envelopes, acked_through=acked_through))
+        open_advisories.extend(
+            _open_controller_advisories(envelopes, acked_through=acked_through)
+        )
 
     return {
         "schema": AGGREGATE_SCHEMA,
@@ -715,6 +735,48 @@ def format_controller_relay(aggregate: dict) -> str | None:
     return "USER-NEED relay: " + " | ".join(parts)
 
 
+def format_bounded_relay(
+    items: list[dict],
+    *,
+    item_limit: int = DEFAULT_RELAY_ITEM_LIMIT,
+    byte_limit: int = DEFAULT_RELAY_BYTE_LIMIT,
+) -> str | None:
+    """Newest-first one-line relay with a hard UTF-8 output budget."""
+    if not items:
+        return None
+    ordered = sorted(
+        items,
+        key=lambda item: (
+            str(item.get("ts") or ""),
+            int(item.get("seq") or 0),
+            str(item.get("dispatch_id") or ""),
+        ),
+        reverse=True,
+    )
+    selected: list[str] = []
+    total = len(ordered)
+    for item in ordered:
+        if len(selected) >= item_limit:
+            break
+        line = (
+            f"[{_clip(item.get('dispatch_id'), 64)}] "
+            f"{_clip(item.get('type') or 'user_need', 32)}: "
+            f"{_clip(item.get('text'), 200)}"
+        )
+        candidate = [*selected, line]
+        omitted = total - len(candidate)
+        if omitted:
+            candidate.append(f"(+{omitted} more open unread item(s) elided)")
+        rendered = "\n".join(candidate) + "\n"
+        if len(rendered.encode("utf-8")) > byte_limit:
+            break
+        selected.append(line)
+    omitted = total - len(selected)
+    if omitted:
+        selected.append(f"(+{omitted} more open unread item(s) elided)")
+    return "\n".join(selected)
+
+
 def _clip(text: object, limit: int = 100) -> str:
     s = "".join(" " if ord(ch) < 32 or ord(ch) == 127 else ch for ch in str(text or ""))
     s = " ".join(s.split())
@@ -767,6 +829,44 @@ def _owned_with_task_store(
     return scoped
 
 
+def _current_project_root() -> Path | None:
+    """Resolve the current git root exactly like goalflight_status."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return Path(result.stdout.strip()).resolve()
+    except Exception:
+        pass
+    return None
+
+
+def _project_ledger_records(project_root: Path) -> list[dict]:
+    try:
+        import goalflight_ledger  # type: ignore
+
+        root = str(project_root.resolve())
+        return [
+            record
+            for record in goalflight_ledger.read_records()
+            if record.get("project_root") == root
+        ]
+    except Exception:
+        return []
+
+
+def _project_dispatch_ids(project_root: Path) -> set[str]:
+    return {
+        str(record["dispatch_id"])
+        for record in _project_ledger_records(project_root)
+        if record.get("dispatch_id")
+    }
+
+
 def _current_frontier_ids(project_root: Path) -> list[str] | None:
     try:
         if str(REPO_ROOT) not in sys.path:
@@ -793,6 +893,85 @@ def _done_reviewed(row: dict | None) -> bool:
     if not row:
         return True
     return row.get("done_reviewed") is True or (row.get("kind") == "decision" and row.get("done") is True)
+
+
+def _record_task_ids(record: dict) -> list[str]:
+    values = record.get("task_ids")
+    raw = values if isinstance(values, list) else [values]
+    task_ids: list[str] = []
+    for value in raw:
+        if not isinstance(value, str):
+            continue
+        for part in value.split(","):
+            task_id = part.strip()
+            if task_id and task_id not in task_ids:
+                task_ids.append(task_id)
+    return task_ids
+
+
+def _record_time(record: dict) -> dt.datetime:
+    for key in ("started_at", "updated_at", "ended_at"):
+        value = record.get(key)
+        if not isinstance(value, str) or not value:
+            continue
+        try:
+            parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=dt.timezone.utc)
+        return parsed.astimezone(dt.timezone.utc)
+    return dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+
+
+def _record_is_terminal(record: dict) -> bool:
+    try:
+        import goalflight_dispatch_states as dispatch_states  # type: ignore
+
+        return dispatch_states.is_terminal_state(record.get("state")) or dispatch_states.is_terminal_state(
+            record.get("terminal_state")
+        )
+    except Exception:
+        return False
+
+
+def _stale_dispatch_ids(project_root: Path, open_dispatch_ids: set[str]) -> set[str]:
+    """Terminal escalations stale by task lifecycle or task-less expiry."""
+    records = _project_ledger_records(project_root)
+    rows_by_id = _task_items_by_id(project_root) or {}
+    now = dt.datetime.now(dt.timezone.utc)
+    unknown_time = dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+    stale: set[str] = set()
+    for record in records:
+        dispatch_id = str(record.get("dispatch_id") or "")
+        task_ids = _record_task_ids(record)
+        if (
+            not dispatch_id
+            or dispatch_id not in open_dispatch_ids
+            or not _record_is_terminal(record)
+        ):
+            continue
+        record_time = _record_time(record)
+        if not task_ids:
+            if (
+                record_time != unknown_time
+                and record_time < now - TASKLESS_TERMINAL_STALE_AFTER
+            ):
+                stale.add(dispatch_id)
+            continue
+        superseded = {
+            task_id
+            for other in records
+            if str(other.get("dispatch_id") or "") != dispatch_id
+            and _record_time(other) > record_time
+            for task_id in _record_task_ids(other)
+        }
+        if all(
+            bool((rows_by_id.get(task_id) or {}).get("done")) or task_id in superseded
+            for task_id in task_ids
+        ):
+            stale.add(dispatch_id)
+    return stale
 
 
 def _task_store_nudge_is_current(item: dict, project_root: Path) -> bool:
@@ -837,7 +1016,10 @@ def _format_mail_hint(items: list[dict]) -> str:
     """Multi-line controller hint: a header plus one detail line per open item,
     each with the dispatch id, kind, and a clipped text so the controller can
     follow up straight from a status check."""
-    head = f"\U0001f4ec mail: {len(items)} open item(s) from your worker(s)/task store - run: goalflight_messages.py relay"
+    head = (
+        f"\U0001f4ec mail: {len(items)} open unread item(s) from your worker(s)/task store "
+        "- run scoped: goalflight_messages.py relay"
+    )
     lines = [head]
     for it in items[:5]:
         lines.append(f"    [{it['dispatch_id']}] {it['type']}: {it['text']}")
@@ -852,6 +1034,7 @@ def controller_mail_summary(
     task_store_project_root: Path | None = None,
     messages_dir: Path | None = None,
     fleet_dir: Path | None = None,
+    unread_only: bool = True,
 ) -> dict:
     """Structured "you have mail" summary for a controller's status output.
 
@@ -870,8 +1053,9 @@ def controller_mail_summary(
     # large inbox can then neither suppress (a parse error elsewhere) nor slow this
     # scoped status call. build_aggregate is also per-inbox tolerant as a backstop.
     scoped_dispatch_ids = _owned_with_task_store(owned_dispatch_ids, task_store_project_root)
+    resolved_messages_dir = messages_dir or default_messages_dir()
     aggregate = build_aggregate(
-        messages_dir=messages_dir or default_messages_dir(),
+        messages_dir=resolved_messages_dir,
         fleet_dir=fleet_dir if fleet_dir is not None else default_fleet_dir(),
         dispatch_ids=scoped_dispatch_ids,
     )
@@ -884,6 +1068,14 @@ def controller_mail_summary(
             or str(n.get("dispatch_id") or "") == "controller-quota-advisory"
         ]
     needs = _filter_task_store_nudges(needs, task_store_project_root)
+    if unread_only:
+        read_cursor = load_read_cursor(read_cursor_path(resolved_messages_dir))
+        needs = [
+            item
+            for item in needs
+            if not isinstance(item.get("seq"), int)
+            or int(item["seq"]) > int(read_cursor.get(str(item.get("dispatch_id") or ""), 0))
+        ]
     if not needs:
         return {}
     items = [
@@ -891,19 +1083,105 @@ def controller_mail_summary(
             "dispatch_id": str(n.get("dispatch_id") or "?"),
             "type": str(n.get("nudge_kind") or n.get("type") or "user_need"),
             "seq": n.get("seq"),
-            "text": _clip(n.get("text")),
+            "ts": n.get("ts"),
+            "text": _clip(n.get("text"), 120),
         }
         for n in needs
     ]
     return {"count": len(items), "needs": items, "hint": _format_mail_hint(items)}
 
 
+def _mail_scope(*, all_projects: bool) -> tuple[Path | None, set[str] | None]:
+    if all_projects:
+        return None, None
+    project_root = _current_project_root()
+    if project_root is None:
+        raise MessageError("no current git project; pass --all-projects explicitly")
+    return project_root, _project_dispatch_ids(project_root)
+
+
+def _ack_dispatches(
+    *,
+    messages_dir: Path,
+    items: list[dict],
+    dispatch_ids: set[str],
+) -> tuple[int, int]:
+    advances: dict[str, int] = {}
+    item_count = 0
+    for item in items:
+        dispatch_id = str(item.get("dispatch_id") or "")
+        if dispatch_id not in dispatch_ids or not isinstance(item.get("seq"), int):
+            continue
+        advances[dispatch_id] = max(advances.get(dispatch_id, 0), int(item["seq"]))
+        item_count += 1
+    if advances:
+        advance_read_cursor(ack_cursor_path(messages_dir), advances)
+    return len(advances), item_count
+
+
+def cmd_ack(args: argparse.Namespace) -> int:
+    if bool(args.dispatch_id) == bool(args.stale):
+        print("ack: provide one dispatch id or --stale", file=sys.stderr)
+        return 2
+    try:
+        project_root, owned_dispatch_ids = _mail_scope(all_projects=False)
+    except MessageError as exc:
+        print(f"ack: {exc}", file=sys.stderr)
+        return 2
+    assert project_root is not None and owned_dispatch_ids is not None
+    scoped_dispatch_ids = _owned_with_task_store(owned_dispatch_ids, project_root) or set()
+    if args.dispatch_id and args.dispatch_id not in scoped_dispatch_ids:
+        print(f"ack: {args.dispatch_id} is not owned by the current project", file=sys.stderr)
+        return 2
+    summary = controller_mail_summary(
+        owned_dispatch_ids=owned_dispatch_ids,
+        task_store_project_root=project_root,
+        messages_dir=args.messages_dir,
+        fleet_dir=args.fleet_dir,
+        unread_only=False,
+    )
+    items = list(summary.get("needs") or [])
+    targets = (
+        _stale_dispatch_ids(
+            project_root,
+            {str(item.get("dispatch_id") or "") for item in items},
+        )
+        if args.stale
+        else {str(args.dispatch_id)}
+    )
+    try:
+        dispatch_count, item_count = _ack_dispatches(
+            messages_dir=args.messages_dir,
+            items=items,
+            dispatch_ids=targets,
+        )
+    except (OSError, ValueError, TypeError) as exc:
+        print(f"WARNING: ack cursor not advanced: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+    label = "ack --stale" if args.stale else f"ack {args.dispatch_id}"
+    print(f"{label}: {dispatch_count} dispatch(es), {item_count} open item(s) acknowledged")
+    return 0
+
+
 def cmd_relay(args: argparse.Namespace) -> int:
     if args.ack and not args.new:
         print("relay --ack requires --new", file=sys.stderr)
         return 2
+    if args.new and args.history:
+        print("relay: --new cannot be combined with --history", file=sys.stderr)
+        return 2
+    try:
+        project_root, owned_dispatch_ids = _mail_scope(all_projects=args.all_projects)
+    except MessageError as exc:
+        print(f"relay: {exc}", file=sys.stderr)
+        return 2
     if args.new:
-        paths = collect_inbox_paths(args.messages_dir, args.fleet_dir)
+        scoped_dispatch_ids = _owned_with_task_store(owned_dispatch_ids, project_root)
+        paths = collect_inbox_paths(
+            args.messages_dir,
+            args.fleet_dir,
+            dispatch_ids=scoped_dispatch_ids,
+        )
         cursor_path = read_cursor_path(args.messages_dir)
         cursor = load_read_cursor(cursor_path)
         envelopes, counts, ack_advances = unseen_envelopes_for_paths(
@@ -920,12 +1198,23 @@ def cmd_relay(args: argparse.Namespace) -> int:
                 warn_cursor_not_advanced(exc)
                 return 1
         return 0
-    aggregate = build_aggregate(messages_dir=args.messages_dir, fleet_dir=args.fleet_dir)
-    line = format_controller_relay(aggregate)
+    summary = controller_mail_summary(
+        owned_dispatch_ids=owned_dispatch_ids,
+        task_store_project_root=project_root,
+        messages_dir=args.messages_dir,
+        fleet_dir=args.fleet_dir,
+        unread_only=not args.history,
+    )
+    items = list(summary.get("needs") or [])
+    line = (
+        format_controller_relay({"open_user_needs": items})
+        if args.history
+        else format_bounded_relay(items)
+    )
     if line:
         print(line)
         return 2
-    print("no open user_needs")
+    print("no open unread items" if not args.history else "no open user_needs")
     return 0
 
 
@@ -1073,6 +1362,15 @@ def main(argv: list[str] | None = None) -> int:
     mark_read.add_argument("--all", action="store_true")
     mark_read.set_defaults(func=cmd_mark_read)
 
+    ack = sub.add_parser("ack", help="Acknowledge open escalation lifecycle items")
+    ack.add_argument("dispatch_id", nargs="?")
+    ack.add_argument(
+        "--stale",
+        action="store_true",
+        help="Acknowledge terminal task-linked escalations closed or superseded",
+    )
+    ack.set_defaults(func=cmd_ack)
+
     status = sub.add_parser("status")
     status.add_argument("--write-aggregate", action="store_true")
     status.set_defaults(func=cmd_status)
@@ -1080,6 +1378,16 @@ def main(argv: list[str] | None = None) -> int:
     relay = sub.add_parser("relay")
     relay.add_argument("--new", action="store_true", help="Show only envelopes after each inbox read cursor")
     relay.add_argument("--ack", action="store_true", help="With --new, advance cursors through shown envelopes")
+    relay.add_argument(
+        "--all-projects",
+        action="store_true",
+        help="Include inboxes outside the current project",
+    )
+    relay.add_argument(
+        "--history",
+        action="store_true",
+        help="Include read open items and use the legacy unbounded summary",
+    )
     relay.set_defaults(func=cmd_relay)
 
     mirror = sub.add_parser("mirror")

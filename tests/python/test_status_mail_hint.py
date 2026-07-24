@@ -36,11 +36,21 @@ def _with_mail_dirs(fn):
     with tempfile.TemporaryDirectory() as d:
         msgs = Path(d) / "messages"
         fleet = Path(d) / "fleet"
+        state = Path(d) / "state"
         msgs.mkdir()
         fleet.mkdir()
-        saved = {k: os.environ.get(k) for k in ("GOALFLIGHT_MESSAGES_DIR", "GOALFLIGHT_FLEET_DIR")}
+        state.mkdir()
+        saved = {
+            k: os.environ.get(k)
+            for k in (
+                "GOALFLIGHT_MESSAGES_DIR",
+                "GOALFLIGHT_FLEET_DIR",
+                "GOALFLIGHT_STATE_DIR",
+            )
+        }
         os.environ["GOALFLIGHT_MESSAGES_DIR"] = str(msgs)
         os.environ["GOALFLIGHT_FLEET_DIR"] = str(fleet)
+        os.environ["GOALFLIGHT_STATE_DIR"] = str(state)
         try:
             return fn(msgs, fleet)
         finally:
@@ -103,6 +113,33 @@ def test_open_user_need_surfaces_hint_with_detail() -> None:
     # Enough DETAIL to follow up from a status check: the need text + id appear.
     assert_true("hint shows the need text", "decision on the schema change" in hint)
     assert_true("hint shows the dispatch id", "worker-7" in hint)
+
+
+def test_headline_count_matches_default_relay_and_ack_lifecycle() -> None:
+    def body(msgs, fleet):
+        for dispatch_id in ("worker-read", "worker-open"):
+            M.post_message(
+                dispatch_id=dispatch_id,
+                msg_type="user_need",
+                payload={"text": f"{dispatch_id} decision"},
+                messages_dir=msgs,
+            )
+        M.advance_read_cursor(M.read_cursor_path(msgs), {"worker-read": 1})
+        summary = S._mail_summary({"worker-read", "worker-open"})
+        relay = M.format_bounded_relay(list(summary.get("needs") or [])) or ""
+        M.advance_read_cursor(M.ack_cursor_path(msgs), {"worker-open": 1})
+        after_ack = S._mail_summary({"worker-read", "worker-open"})
+        read_cursor = M.load_read_cursor(M.read_cursor_path(msgs))
+        return summary, relay, after_ack, read_cursor
+
+    summary, relay, after_ack, read_cursor = _with_mail_dirs(body)
+    relay_items = [line for line in relay.splitlines() if not line.startswith("(+")]
+    assert_eq("headline count equals relay item count", summary.get("count"), len(relay_items))
+    assert_eq("only unread open item counted", summary.get("count"), 1)
+    assert_true("default relay contains unread item", "worker-open" in relay)
+    assert_true("default relay excludes read item", "worker-read" not in relay)
+    assert_eq("ack moves status open count", after_ack, {})
+    assert_eq("ack does not alter read cursor", read_cursor, {"worker-read": 1})
 
 
 def test_mail_hint_strips_control_chars() -> None:
@@ -322,6 +359,7 @@ def main() -> None:
     tests = [
         test_no_mail_empty_summary,
         test_open_user_need_surfaces_hint_with_detail,
+        test_headline_count_matches_default_relay_and_ack_lifecycle,
         test_mail_hint_strips_control_chars,
         test_ownership_filter_excludes_other_controllers_workers,
         test_task_store_inbox_id_agrees_between_worktree_and_main_root,
