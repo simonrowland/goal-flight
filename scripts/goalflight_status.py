@@ -1674,7 +1674,9 @@ def render_text(payload: dict, limit: int) -> list[str]:
     )
     for r in (live + terminal)[:limit]:
         did = (r.get("dispatch_id") or "?")[:30]
-        lines.append(f"  {did:<30} {_dispatch_cells(r)}  {r.get('status_path') or '-'}")
+        account = r.get("effective_account")
+        seat = f" [seat {account}]" if isinstance(account, str) and account else ""
+        lines.append(f"  {did:<30} {_dispatch_cells(r)}{seat}  {r.get('status_path') or '-'}")
     for item in list(cooldowns.values())[:limit]:
         lines.append(
             f"  cooldown {item.get('agent')}: {item.get('reason')} until {item.get('until')}"

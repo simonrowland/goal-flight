@@ -477,6 +477,48 @@ def test_idle_timeout_live_hint_rendered() -> None:
         S.goalflight_ledger.identity_matches = orig_identity_matches
 
 
+def _single_status_record_payload(record: dict) -> dict:
+    return {
+        "capacity": {"operating_cap": 16},
+        "capacity_state": {"leases": {}, "cooldowns": {}},
+        "dispatch": {"records": [record]},
+        "scope": {"project_root": "/repo/A", "machine_active_leases": 0},
+    }
+
+
+def test_effective_account_status_line_regression_pair() -> None:
+    record = {
+        "dispatch_id": "seatprobe",
+        "classification": "complete",
+        "terminal_state": "complete",
+        "agent": "codex",
+        "status_path": "/tmp/seatprobe.status.json",
+    }
+    absent = "\n".join(S.render_text(_single_status_record_payload(record), 10))
+    absent_none = "\n".join(
+        S.render_text(
+            _single_status_record_payload({**record, "effective_account": None}),
+            10,
+        )
+    )
+    expected_absent_line = (
+        f"  {'seatprobe':<30} complete codex  /tmp/seatprobe.status.json"
+    )
+    assert absent == absent_none
+    assert expected_absent_line in absent.splitlines()
+
+    present = S.render_text(
+        _single_status_record_payload(
+            {**record, "effective_account": "seat-a"}
+        ),
+        10,
+    )
+    assert (
+        f"  {'seatprobe':<30} complete codex [seat seat-a]  "
+        "/tmp/seatprobe.status.json"
+    ) in present
+
+
 def test_rate_pressure_warning_rendered() -> None:
     digest = "\n".join(S.render_text(sample_pressure_payload(), 10))
     check("digest surfaces adaptive rate-pressure warning",
@@ -1002,6 +1044,7 @@ def main() -> int:
     test_done_code()
     test_output_tail_reconciles_success_marker_after_watcher_death()
     test_idle_timeout_live_hint_rendered()
+    test_effective_account_status_line_regression_pair()
     test_rate_pressure_warning_rendered()
     test_queue_pending_without_drainer_warns_in_json_and_text()
     test_queue_pending_warning_silent_when_empty_or_drainer_live()

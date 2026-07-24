@@ -63,6 +63,7 @@ def _watcher(
     controller_pid: int | None = None,
     long_running_secs: float = 3600,
     review_secs: float = 7200,
+    dispatch_id: str | None = None,
 ) -> tuple[subprocess.Popen, Path, Path]:
     tail = root / "worker.tail"
     status_path = root / "status.json"
@@ -88,6 +89,8 @@ def _watcher(
         "--trace-review-secs",
         str(review_secs),
     ]
+    if dispatch_id is not None:
+        argv.extend(["--dispatch-id", dispatch_id])
     if controller_pid is not None:
         argv.extend(["--controller-pid", str(controller_pid)])
     process = subprocess.Popen(
@@ -289,6 +292,52 @@ def test_status_surfaces_quiet_console_active_trace() -> None:
         assert row["trace_mtime"] == 10.0
         assert row["trace_attention_state"] == "long_running"
         assert status._signal(row) == "quiet console, active trace; long_running"
+
+
+def test_watcher_status_snapshot_carries_ledger_effective_account() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        dispatch_id = "seatprobe"
+        runs = root / "state" / "runs.d"
+        runs.mkdir(parents=True)
+        (runs / f"{dispatch_id}.json").write_text(
+            json.dumps(
+                {
+                    "dispatch_id": dispatch_id,
+                    "effective_account": "seat-a",
+                }
+            ),
+            encoding="utf-8",
+        )
+        trace = (
+            root
+            / "state"
+            / "dispatch-homes"
+            / dispatch_id
+            / "sessions"
+            / "turn.jsonl"
+        )
+        trace.parent.mkdir(parents=True)
+        trace.write_text("{}\n", encoding="utf-8")
+        process, status_path, _tail = _watcher(
+            root,
+            worker_pid=_dead_pid(),
+            trace=trace,
+            dispatch_id=dispatch_id,
+        )
+        try:
+            assert _wait_for(
+                lambda: status_path.exists()
+                and _payload(status_path).get("effective_account") == "seat-a"
+            ), _payload(status_path)
+            assert (
+                watch._status_snapshot(_payload(status_path))["effective_account"]
+                == "seat-a"
+            )
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGTERM)
+                process.wait(timeout=2)
 
 
 def test_channel_absent_keeps_verdict_identical() -> None:

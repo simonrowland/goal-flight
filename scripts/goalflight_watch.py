@@ -476,6 +476,7 @@ def _status_snapshot(payload: dict) -> dict:
         "dispatch_id",
         "agent",
         "shape",
+        "effective_account",
         "state",
         "reason",
         "worker_pid",
@@ -1150,6 +1151,7 @@ def main() -> int:
 
     tail = Path(args.tail)
     status_path = Path(args.status_json)
+    effective_account = _trace_ledger_account(args.dispatch_id)
     if goalflight_compat.is_windows():
         payload = {
             "schema": "goalflight.status.v1",
@@ -1162,6 +1164,8 @@ def main() -> int:
             "tail_path": str(tail),
             "updated_at": int(time.time()),
         }
+        if effective_account:
+            payload["effective_account"] = effective_account
         write_status(status_path, payload)
         print(json.dumps({"state": payload["state"], "reason": payload["reason"], "status_path": str(status_path)}, sort_keys=True))
         return 4
@@ -1169,7 +1173,7 @@ def main() -> int:
     trace_liveness = TraceLiveness(
         dispatch_id=args.dispatch_id,
         worker_pid=args.pid,
-        effective_account=_trace_ledger_account(args.dispatch_id),
+        effective_account=effective_account,
         cached_path=_cached_trace_path(status_path),
     )
     # Idle accounting uses the sleep-excluding clock (active_monotonic):
@@ -1216,6 +1220,8 @@ def main() -> int:
 
     def write_payload(payload: dict, *, reason: str | None = None, terminal_write: bool = False) -> dict | None:
         nonlocal last_payload, final_status_written, working_breadcrumb_written
+        if effective_account:
+            payload["effective_account"] = effective_account
         if reason:
             payload["reason"] = reason
         if terminal_write:
