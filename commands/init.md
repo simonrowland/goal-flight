@@ -230,6 +230,16 @@ continue with `/goal-flight build-corpus` so the orientation sits beside the
 other `docs-private/rag/` slices. Do not build the full corpus by default during
 init.
 
+Also seed `docs-private/docs-to-maintain.md`: the registry of documents coupled
+to code, so changes carry their documentation patch instead of leaving the
+prose to rot. One row per document — path, what it is coupled to (subsystem,
+contract, or benchmark), and who consumes it. Seed it from what the project
+already keeps: north-star, architecture, specifications, design records,
+interface contracts, benchmark standards. An empty registry with a header is a
+valid start; record it either way so scouts and workers know the list exists.
+`protocols/scout.md` describes how a scout resolves the affected rows into
+documentation-upkeep sites in a worker brief.
+
 10. Self-review:
 
 - Are readiness warnings actionable?
@@ -240,7 +250,7 @@ init.
 
 Print:
 
-- created/updated file paths
+- created/updated file paths (including the documentation registry)
 - doctor WARN/FAIL count
 - capacity operating cap
 - next command suggestion
