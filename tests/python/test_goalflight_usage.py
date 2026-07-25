@@ -184,6 +184,123 @@ def test_claude_unknown_login_error_is_not_reported_healthy():
     assert row["flags"] == ["auth-broken"]
 
 
+def test_claude_multi_label_payload_becomes_one_row_per_label():
+    """The reader sweeps every saved label; each label keeps its own state and
+    gets its own table row (t-193)."""
+    claude = usage.ReaderSpec("claude", "claude", "claude_usage.py")
+    now = 2_000_000_000.0
+
+    rows = usage.normalize_payload(
+        claude,
+        [
+            {
+                "label": "third",
+                "logged_in": True,
+                "login_status": "ok",
+                "session_used_percent": None,
+                "weekly_used_percent": None,
+                "weekly_sonnet_used_percent": None,
+                "source": "claude_auth_status",
+            },
+            {
+                "label": "personal",
+                "logged_in": None,
+                "login_status": "pending",
+                "source": "claude_auth_status",
+            },
+            {
+                "label": "work",
+                "logged_in": False,
+                "login_status": "expired",
+                "source": "claude_auth_status",
+            },
+        ],
+        now=now,
+    )
+
+    assert [row["account"] for row in rows] == ["third", "personal", "work"]
+    assert [row["remaining"] for row in rows] == ["ok", "pending", "needs-login"]
+    assert [row["flags"] for row in rows] == [[], [], ["auth-broken"]]
+    assert all(tuple(row) == usage.ROW_KEYS for row in rows)
+    assert all(row["provider"] == "claude" for row in rows)
+    assert all(row["reset_at"] is None for row in rows)
+    # Null resets must not shadow a real upcoming reset from another provider.
+    codex = usage.normalize_payload(
+        usage.ReaderSpec("codex", "codex", "codex_usage.py"),
+        [{"seat": "seat-a", "used_percent": 10, "reset_at": now + 600, "ok": True}],
+        now=now,
+    )
+    assert usage.soonest_reset(rows + codex, now=now) is codex[0]
+    assert usage.soonest_reset(rows, now=now) is None
+
+    rendered = usage.render_table(rows, now=now)
+    assert "claude third      ok" in rendered
+    assert "claude personal   pending" in rendered
+    assert "claude work       needs-login  ⚠auth" in rendered
+
+
+def test_claude_pending_label_outranks_probe_error_text():
+    """A not-yet-materialized label reports 'pending', never 'unavailable' or a
+    misleading auth flag, even when the reader attaches a probe reason."""
+    claude = usage.ReaderSpec("claude", "claude", "claude_usage.py")
+
+    row = usage.normalize_payload(
+        claude,
+        [
+            {
+                "label": "personal",
+                "logged_in": None,
+                "login_status": "pending",
+                "error": "keychain sync must finish before materializing",
+                "error_stage": "materialize",
+            }
+        ],
+    )[0]
+
+    assert row["remaining"] == "pending"
+    assert row["flags"] == []
+
+
+def test_claude_error_stage_row_stays_degraded():
+    """login_status 'error (<stage>)' keeps the existing failure treatment."""
+    claude = usage.ReaderSpec("claude", "claude", "claude_usage.py")
+
+    rows = usage.normalize_payload(
+        claude,
+        [
+            {
+                "label": "auth-broken",
+                "logged_in": None,
+                "login_status": "error (auth)",
+                "error": "claude auth status failed",
+            },
+            {
+                "label": "probe-broken",
+                "logged_in": None,
+                "login_status": "error (probe)",
+                "error": "unexpected OSError",
+            },
+        ],
+    )
+
+    assert rows[0]["remaining"] == "needs-login"
+    assert rows[0]["flags"] == ["auth-broken"]
+    assert rows[1]["remaining"] == "unavailable"
+    assert rows[1]["flags"] == ["unavailable"]
+
+
+def test_claude_indeterminate_label_is_unknown_not_ok():
+    claude = usage.ReaderSpec("claude", "claude", "claude_usage.py")
+
+    row = usage.normalize_payload(
+        claude,
+        [{"label": "mystery", "logged_in": None, "login_status": "unknown"}],
+    )[0]
+
+    assert row["remaining"] == "unknown"
+    assert row["flags"] == []
+
+
 @pytest.mark.parametrize(
     ("filename", "body", "timeout_s"),
     [
@@ -350,3 +467,21 @@ def test_nonzero_exit_with_valid_rows_is_kept(tmp_path):
     )
     rows = run_reader(spec, readers_dir=tmp_path, timeout_s=10.0, now=0.0)
     assert rows and 'unavailable' not in (rows[0].get('flags') or ())
+
+
+def test_token_lapsed_renders_auto_heal_not_needs_login(tmp_path):
+    """A reader error starting token_lapsed maps to 'lapsed (auto-heals)'
+    with no auth flag - it self-repairs on the provider CLI's next use."""
+    from goalflight_usage import ReaderSpec, run_reader
+    import json as _json
+
+    spec = ReaderSpec("kimi", "kimi-code", "r.py")
+    reader = tmp_path / "r.py"
+    reader.write_text(
+        "import json\n"
+        "print(json.dumps([{'label': 'kimi-code', 'ok': False,"
+        " 'error': 'token_lapsed: auto-heals on next kimi use'}]))\n"
+    )
+    rows = run_reader(spec, readers_dir=tmp_path, timeout_s=10.0, now=0.0)
+    assert rows[0]["remaining"] == "lapsed (auto-heals)"
+    assert "auth-broken" not in (rows[0].get("flags") or ())

@@ -171,6 +171,10 @@ def _failed_record(record: Mapping[str, Any]) -> tuple[str, str] | None:
         return None
     error = record.get("error")
     lowered = error.lower() if isinstance(error, str) else ""
+    # A lapsed token with a live refresh grant auto-heals on the provider
+    # CLI's next use — real headroom state unknown, but no human login needed.
+    if lowered.startswith("token_lapsed"):
+        return "lapsed (auto-heals)", ""
     if any(marker in lowered for marker in AUTH_MARKERS):
         return "needs-login", "auth-broken"
     return "unavailable", "unavailable"
@@ -336,8 +340,22 @@ def _first_numeric(*values: object) -> float | None:
     return None
 
 
+# The claude reader emits one record per saved account label, each carrying its
+# own "login_status": "ok", "pending" (saved but not materialized yet),
+# "expired"/"logged out", "error (<stage>)", or "unknown".  Every record becomes
+# its own table row so a healthy label is never masked by a stale sibling.
+CLAUDE_LOGGED_OUT_STATES = ("expired", "logged out", "logged-out")
+CLAUDE_PENDING_STATES = ("pending",)
+
+
+def _claude_login_status(record: Mapping[str, Any]) -> str:
+    status = _label(record.get("login_status"))
+    return status.lower() if status else ""
+
+
 def _normalize_claude(record: Mapping[str, Any], now: float) -> dict[str, object]:
     account = _label(record.get("label"))
+    status = _claude_login_status(record)
     usage = record.get("usage")
     usage_mapping = usage if isinstance(usage, Mapping) else {}
     resets = _reset_candidates(record) + _reset_candidates(usage_mapping)
@@ -346,7 +364,7 @@ def _normalize_claude(record: Mapping[str, Any], now: float) -> dict[str, object
     if reset_at is None and cooldown_s is not None and cooldown_s > 0:
         reset_at = now + cooldown_s
 
-    if record.get("logged_in") is False:
+    if record.get("logged_in") is False or status in CLAUDE_LOGGED_OUT_STATES:
         return _row(
             "claude",
             account=account,
@@ -354,7 +372,19 @@ def _normalize_claude(record: Mapping[str, Any], now: float) -> dict[str, object
             reset_at=reset_at,
             flags=("auth-broken",),
         )
-    if record.get("logged_in") is None and record.get("error"):
+    # Pending is a saved label whose credentials have not been materialized yet:
+    # honestly distinct from "unknown" (indeterminate) and "unavailable" (the
+    # reader itself failed), so it is reported before any error treatment.
+    if status in CLAUDE_PENDING_STATES:
+        return _row(
+            "claude",
+            account=account,
+            remaining="pending",
+            reset_at=reset_at,
+        )
+    if status.startswith("error") or (
+        record.get("logged_in") is None and record.get("error")
+    ):
         failure = _failed_record({**record, "ok": False})
         assert failure is not None
         remaining, flag = failure
@@ -414,7 +444,12 @@ def _normalize_claude(record: Mapping[str, Any], now: float) -> dict[str, object
         remaining = ", ".join(parts)
     else:
         remaining, remaining_value, used = _usage_remaining(usage)
-        remaining = remaining or "unknown"
+        if not remaining:
+            # A login the reader confirmed is healthy but carries no usage
+            # numbers (the fast --skip-tui pass) is "ok", not "unknown" - the
+            # login state IS known, only the percentages are missing.
+            healthy = status == "ok" or record.get("logged_in") is True
+            remaining = "ok" if healthy else "unknown"
         walled = walled or (
             remaining_value is not None and remaining_value <= 0
         )
