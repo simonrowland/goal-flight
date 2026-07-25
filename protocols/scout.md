@@ -418,6 +418,32 @@ For a campaign wave with shared invariants, run:
 Save the reports side by side in one durable review or lane-research
 directory. Cross-check adjacent reports before folding them into the wave.
 
+### Batching — amortize scout sessions along shared surfaces
+
+Each scout session pays a fixed cost: boot, orientation, and tree
+familiarization on the lane's surfaces. Batch to amortize it, along exactly
+the axes where knowledge is shared:
+
+- **The batch unit is a shared surface, never a count.** One scout covers all
+  the prompts in a lane, wave, or subsystem — read once, verify many — and
+  reports per-prompt verdict rows plus the cross-prompt contradiction section
+  that only a batch can produce (contradictions live *between* prompts and are
+  invisible to any single-prompt scout). Do not batch across unrelated
+  subsystems: breadth dilutes depth and produces echo rows.
+- **Prompt chains get two tiers with different rot rates.** At decomposition
+  time, one chain-contract scout covers the whole set: dependency order,
+  interface handoffs between chunks, ownership boundaries, and
+  decision conformance — findings that rot slowly. During execution, rolling
+  just-in-time freshness checks (light VERIFY passes on the next one or two
+  chunks while the current chunk builds) cover the fast-rotting surfaces:
+  anchors, pins, and work-state. A long chain costs one heavy session plus a
+  few light ones instead of one heavy session per chunk.
+- **AUTHOR batches only tightly-coupled pairs; VERIFY batches widely.** A
+  scout authoring two briefs in one session gives the second less depth, so
+  reserve AUTHOR batching for prompts that share an interface seam — where
+  co-authoring also prevents the inter-brief interface drift that two
+  parallel authors would create.
+
 ## Routing and capacity
 
 Give a stronger-reasoning host-subagent tier a modest, deliberate scout slice
