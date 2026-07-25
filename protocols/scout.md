@@ -28,12 +28,16 @@ deliverable is a verified prompt, not an implementation and not a substitute
 for chunk review.
 
 Scouting optimizes, in order: output quality first, build wall-clock second,
-tokens a distant third. Token savings are a common dividend — verified state
-replaces defensive check-first hedging and shrinks the fired prompt — but
-they are never the gate. The economics that matter: one avoided
+tokens a distant third. The real trade is not scout-versus-nothing but
+scout-versus-reviewer: both purchase the same good — defect removal — and the
+pre-fire purchase is usually the better exchange rate, because one avoided
 iterate-review-refire cycle on a long write-mode precision loop dwarfs any
-scouting spend, so the more complicated the project, the more scouting pays.
-Skip scouting only where it has nothing to verify (see the skip rule below).
+scouting spend. The standing policy is to keep buying quality until the
+return per token flattens — spend to the knee of that curve, not to a token
+budget — and the more complicated the project, the further out the knee
+sits. Token savings are a common dividend (verified state replaces defensive
+check-first hedging and shrinks the fired prompt) but never the gate. Skip
+scouting only where it has nothing to verify (see the skip rule below).
 
 Scouting compresses the **front** of the funnel: do not dispatch work that is
 done, blocked, mis-anchored, or unanswerable. It does nothing for rounds caused
