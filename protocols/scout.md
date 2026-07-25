@@ -28,12 +28,12 @@ deliverable is a verified prompt, not an implementation and not a substitute
 for chunk review.
 
 Scouting optimizes, in order: output quality first, build wall-clock second,
-tokens third. It is usually token-positive as a side effect — a bounced
-dispatch spends a worker run, a review, and a refire, and verified state
+tokens a distant third. Token savings are a common dividend — verified state
 replaces defensive check-first hedging and shrinks the fired prompt — but
-token savings are a dividend, not a requirement: a scout that prevents one
-wrong build at net token cost is still a clear win. Apply the cost floor
-below when none of the three are likely to move.
+they are never the gate. The economics that matter: one avoided
+iterate-review-refire cycle on a long write-mode precision loop dwarfs any
+scouting spend, so the more complicated the project, the more scouting pays.
+Skip scouting only where it has nothing to verify (see the skip rule below).
 
 Scouting compresses the **front** of the funnel: do not dispatch work that is
 done, blocked, mis-anchored, or unanswerable. It does nothing for rounds caused
@@ -350,9 +350,10 @@ change, a prior contradiction, or an unproved test state. Broadly checking
 everything produces low-value confirmation rows and can still miss the actual
 uncertainty.
 
-Apply a cost floor. Skip scouting for trivial mechanical work when a failed
-fire is cheaper than verification and the premises are already obvious from
-fresh evidence.
+The skip rule. Skip scouting only for trivial mechanical work whose premises
+are already obvious from fresh evidence — where a scout would have nothing to
+verify. Do not skip on token arithmetic: quality is the objective, and the
+expensive failure is the wrong build, not the scout.
 
 ## Staleness menu
 
@@ -487,12 +488,11 @@ Every judgment-bearing host-subagent scout begins with
 `protocols/subagent-preamble.md`, followed by the lane's north star, the draft
 prompt, and any required context package.
 
-Provider pools are not fungible. Compute the scouting cost floor against the
-pool the scout runs on, not against tokens in general: when a research-grade
-pool is abundant, deepen the menu, widen the batch, and add empirical checks
-freely — de-risking spent from an abundant pool protects the scarce
-precision-coding pool from bounce rounds, which is the trade the knob exists
-to make. Ration scout depth only on pools that are themselves scarce.
+Provider pools are not fungible. When a research-grade pool is abundant,
+deepen the menu, widen the batch, and add empirical checks freely — without
+going overboard into echo-row breadth — because de-risking spent from an
+abundant pool protects the scarce precision-coding pool from bounce rounds.
+Ration scout depth only on pools that are themselves scarce.
 
 ### Tier-calibrated brief detail
 
