@@ -123,6 +123,29 @@ scout; judgment choices become one-line controller TL;DRs; human-only choices
 go to ask-questions. Do not let the worker make an implicit architecture or
 scope decision by accident.
 
+### Context brokerage and documentation upkeep
+
+Two further deliverables, both cheap because the scout is already reading the
+tree for this task:
+
+**Task-scoped context slice.** Resolve the documentation, specifications, and
+corpus material that bear on *this* work item and hand the worker pointed
+excerpts with locations — not a blanket instruction to read a package. A
+resolved slice is shorter than the package it replaces and removes the
+missing-or-contradicting-context failure at its source.
+
+**Documentation-upkeep sites.** A project may declare its code-coupled
+documents — architecture notes, specifications, design records, benchmark
+standards — in a maintained registry (for example `docs-to-maintain.md`) that
+names each document, what it is coupled to, and who consumes it. The scout
+resolves which of those documents this change invalidates, names the specific
+section, and writes the upkeep site into the brief so the worker's changeset
+carries the documentation patch alongside the code. The worker's prose is a
+draft: whoever folds the changeset may rewrite it freely. The point is that
+the prompt names the site at all, so coupled documentation cannot rot silently
+while the code moves. Where no registry exists, the scout may propose the
+first list from what the lane actually cites.
+
 ## Ordering — truth before well-formed
 
 Run the lenses sequentially by default:
