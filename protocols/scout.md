@@ -39,6 +39,10 @@ Scouting compresses the **front** of the funnel: do not dispatch work that is
 done, blocked, mis-anchored, or unanswerable. It does nothing for rounds caused
 by shallow first fixes; review depth is a separate lever.
 
+Scouting is prompt de-risking: the staleness menu is the risk register, the
+premises table is the evidence, and the verdict is an explicit residual-risk
+acceptance before the expensive write-mode fire.
+
 ## Modes — VERIFY and AUTHOR
 
 The two co-equal scout modes are:
@@ -459,6 +463,13 @@ both jobs fail together. Keep campaign fan-out within current capacity limits.
 Every judgment-bearing host-subagent scout begins with
 `protocols/subagent-preamble.md`, followed by the lane's north star, the draft
 prompt, and any required context package.
+
+Provider pools are not fungible. Compute the scouting cost floor against the
+pool the scout runs on, not against tokens in general: when a research-grade
+pool is abundant, deepen the menu, widen the batch, and add empirical checks
+freely — de-risking spent from an abundant pool protects the scarce
+precision-coding pool from bounce rounds, which is the trade the knob exists
+to make. Ration scout depth only on pools that are themselves scarce.
 
 ### Tier-calibrated brief detail
 
