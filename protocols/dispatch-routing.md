@@ -22,9 +22,10 @@ Right-size the shape — three loop failure modes to avoid:
   see the fix directly, controller-direct is correct even mid-run. The inverse
   rule (don't hand-iterate >~3 edit/test cycles) still holds — right-sizing
   cuts both ways.
-- **Every loop exits through a null-hypothesis check.** Before handoff, the
-  worker states the null hypothesis for the patch, actively tries to confirm it,
-  and hands off only when evidence rejects it; "it should work" is not evidence.
+- **Every loop exits through defensive failure-condition verification.** Before
+  handoff, the worker states the concrete failure conditions for the patch,
+  runs checks capable of exposing them, and hands off only when evidence shows
+  those conditions are absent; "it should work" is not evidence.
 - **In-loop review convergence is severity-gated and floor-based.** P0–P2
   findings block loop exit. Trivial/mechanical chunks self-review the seven
   categories to green; non-trivial chunks add at least two concern-diverse lenses
@@ -126,6 +127,10 @@ worker's memory of the prompt — is the exit condition.
 Per-project orientation rides as an auto-injected pointer when
 `docs-private/rag/ORIENTATION.md` exists; see
 `protocols/worker-context-package.md` §Canned orientation.
+
+Before launch, look up any recorded blocked reason for the same work item and
+re-fire only when its disposition has changed; repeated diagnosed blocks are a
+dispatch-gate concern, not a scouting concern.
 
 ### Background by default; don't block the controller
 

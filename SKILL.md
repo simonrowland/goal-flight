@@ -1,6 +1,6 @@
 ---
 name: goal-flight
-version: 1.2.4
+version: 1.3.0
 description: "Portable Goal Flight workflow for long-running repo work: planning, dispatch, review, recovery, file-backed resume."
 tags:
   - orchestration
@@ -100,6 +100,7 @@ Orchestrator behaviour probes run through portable host adapters, not host-speci
 | **active leases / what's in flight** | Capacity and rate limits | `scripts/goalflight_capacity.py status` (surfaces adaptive walkback) |
 | **per-chunk status snapshot** | Session Pre-Flight | `scripts/goalflight_chunk_summary.py --slug <slug> --json` |
 | autonomous throughput | Autonomous throughput | `commands/execute.md`, `commands/goal.md` |
+| pre-dispatch premise scouting | Dispatch Model, Worker Routing | `protocols/scout.md` |
 | **chat as requirements** | Chat as requirements | `commands/goal.md`, `protocols/user-status-cadence.md` |
 | context lints | Autonomous throughput | `protocols/engagement-lint.md`, `foreground-duration-hook.md` |
 | user-status-cadence | User progress reporting | `protocols/user-status-cadence.md` |
@@ -201,7 +202,7 @@ Review layers: executor self-review, chunk review, milestone review.
 
 | Layer | Gate | Default |
 |---|---|---|
-| Executor self-review | In-worker prompt before handoff | Executor self-review covers seven categories before handing off a chunk; every worker states and rejects a null hypothesis with evidence; non-trivial adds ≥2 concern-diverse lenses as floor, not target |
+| Executor self-review | In-worker prompt before handoff | Executor self-review covers seven categories before handing off a chunk; every worker states concrete failure conditions and verifies defensively with evidence that they are absent; non-trivial adds ≥2 concern-diverse lenses as floor, not target |
 | Chunk review | Every commit-worthy chunk | mandatory controller review; default gstack `/review`; `./scripts/autoreview.sh` as a complementary parallel option |
 | Milestone review | 5 committed chunks since last clean sweep, `[milestone]` chunks, or before push | `protocols/milestone-review.md`, gstack `/review` + concern-diverse sweep |
 
@@ -393,6 +394,8 @@ Default routing by task:
 | Anticipatory questions | strongest interactive planner | controller-direct | - |
 | Analysis / reflection | controller-direct | - | - |
 | Voice-sensitive prose | orchestrator judgment per chunk | - | - |
+
+Give a stronger-reasoning host-subagent tier a modest, deliberate judgment-heavy and read-heavy slice: nonzero in sustained runs, but never drain the limited pool; use it to relieve controller context, not to substitute for abundant CLI-worker capacity. Every judgment-bearing host-subagent prompt MUST begin with `protocols/subagent-preamble.md`. Scouts run before critical-path prompts with unverified premises fire; follow `protocols/scout.md`.
 
 ‡ **Host Agent as code executor = LAST RESORT, never a co-equal fallback.** Use
 only when EVERY CLI worker (codex, grok-code, kimi) is genuinely unreachable, not slow.

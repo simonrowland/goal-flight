@@ -6,6 +6,29 @@ incremented when meaningful skill behaviour changes.
 
 ## [Unreleased]
 
+## [1.3.0] — 2026-07-25
+
+### Added
+
+- `protocols/scout.md`: the scout doctrine — pre-dispatch verification that a worker brief is
+  TRUE against the current tree, distinct from prompt review (well-formedness). Two modes
+  (VERIFY an existing prompt; AUTHOR a blind-fire brief from a stub), a measured four-line
+  staleness menu (package+pins, work-state+premise, anchors+ownership, can-it-run-and-land),
+  six deliverables including implicit-decision extraction and a blocker forecast, binary
+  verdicts with a fold-in gate that blocks unamended prompts, truth-before-well-formed
+  ordering, scout-ahead pipelining during worker waits, and read-only defaults with a gated
+  patching exception.
+- `protocols/subagent-preamble.md`: a canned orientation block (project context, standing
+  rules, claims-are-hypotheses) mandatory for judgment-bearing host-subagent dispatches.
+- Worker-routing guidance: a modest stronger-tier subagent slice for scouts/prompt reviews/
+  small fixes; tier-calibrated brief density with safety invariants never tier-gated.
+
+### Changed
+
+- `protocols/dispatch-routing.md` and the executor self-review row: write-worker self-review
+  reworded as functional, defensive verification (evidence burden preserved); explicit
+  refutation stances stay in read-only scout/review dispatches.
+
 ## [1.2.4] — 2026-07-23
 
 ### Fixed
