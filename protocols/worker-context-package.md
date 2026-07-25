@@ -1,14 +1,11 @@
 # Worker context package (lane pinning)
 
-Workers are codex/grok; they do not get smarter when the controller does, and they
-load NOTHING the dispatch prompt does not carry or point at. When a project's
-correctness laws live in prose specs, workers (and their reviewers) will repeatedly
-regress the same subsystem while reporting green. Dated incident (2026-07-07,
-downstream project): multiple high-effort workers and their reviewers repeatedly
-inserted per-element procedural code into a vectorized hot loop and shipped
-structurally impossible outputs, because the domain invariants lived in spec
-documents no worker ever loaded. The fix that worked — and that this protocol
-generalizes — was pinning a per-lane context package into every dispatch.
+Workers do not inherit the controller's accumulated context; they load only what
+the dispatch prompt carries or points at. When a project's correctness laws live
+in prose specifications, workers and reviewers can repeatedly regress the same
+subsystem while reporting green. Pin a per-lane context package into every
+dispatch whose lane trips the signals below so the governing invariants travel
+with the work.
 
 **A lane** = a subsystem + the family of chunks that touch it (e.g. "the solver hot
 path", "the ingest schema"). Pinning is per-lane, not per-project: most lanes need
@@ -27,6 +24,15 @@ Judgment-bearing chunks need this grounding before they decide tradeoffs or
 design details. Mechanical chunks can ride the same auto-pointer harmlessly. This
 artifact does not replace lane packages: triggered lanes still require the
 verbatim pinned brief/spec/test package below.
+
+Task-scoped scout slices follow the inverse boundary. For a lane that does
+**not** trip a package signal, a slice may replace generic blanket-reading
+instructions with task-relevant sources and excerpts; needing that slice alone
+does not create a package. For a triggered or already pinned lane, the slice is
+never a substitute or compression for the mandatory verbatim brief, quoted
+ground truth, guard tests, stable paths, and re-read contract. A scout may
+propose a package correction, but the controller applies it through this
+protocol's normal build/refresh and review gate before dispatch.
 
 ## Triggering signals — when a lane needs a package
 
@@ -73,7 +79,7 @@ equivalent), one directory per lane, four parts:
 ## Pin durability — workers compact too
 
 A verbatim prepend is necessary but not durable: on long runs the worker's OWN
-session can compact (codex auto-compaction) or simply decay attention to turn-1,
+  session can auto-compact or simply decay attention to turn-1,
 and a lossy summary flattens exactly the high-value content — forbidden-moves
 tables, citations, arbiter clauses — into "follow the spec". Defend in the
 environment, not in the worker's memory:
@@ -93,7 +99,7 @@ environment, not in the worker's memory:
   the exit gate a worker cannot forget its way past: RED-first evidence plus
   controller-side re-verification means a worker that lost the spec still
   cannot leave green without re-satisfying it.
-- Known gap: the codex goal-loop iterates inside ONE session, so iteration
+- Known gap: an internal goal-loop may iterate inside ONE session, so iteration
   boundaries are not automatic re-injection points — the re-read instruction
   above is the current defense; a harness-driven external iteration loop
   (fresh worker per cycle, re-seeded with brief + spec + diff + last test
@@ -136,5 +142,4 @@ remembering. Therefore:
   or stale (spec changed since brief written): build/refresh it first; that is the
   wave's first chunk, not a deferrable chore.
 - Reviewer dispatches into a pinned lane get the SAME brief prepended — the
-  observed incident included reviewers approving structurally impossible outputs
-  for want of the same context the executors lacked.
+  reviewer needs the same governing context as the executor.

@@ -162,10 +162,10 @@ drift against an in-flight queue.
 
 | Command | File | Required protocols |
 |---|---|---|
-| `/goal-flight init <topic>` | `commands/init.md` | `session-preflight`, `tool-readiness`, `premises`, `state-handoff` |
-| `/goal-flight decompose-plan [<plan>]` | `commands/decompose-plan.md` | `premises`, `dispatch-routing` |
+| `/goal-flight init <topic>` | `commands/init.md` | `session-preflight`, `tool-readiness`, `premises`, `scout`, `state-handoff` |
+| `/goal-flight decompose-plan [<plan>]` | `commands/decompose-plan.md` | `premises`, `dispatch-routing`, `scout` |
 | `/goal-flight ask-questions [<scope>]` | `commands/ask-questions.md` | `dispatch-routing` |
-| `/goal-flight execute [--parallel <N>]` | `commands/execute.md` | `dispatch-routing`, `worker-markers`, `state-handoff`, `user-status-cadence`, `chunk-review`, `milestone-review`; add `worktrees-parallel` for `--parallel` |
+| `/goal-flight execute [--parallel <N>]` | `commands/execute.md` | `dispatch-routing`, `worker-markers`, `scout`, `state-handoff`, `user-status-cadence`, `chunk-review`, `milestone-review`; add `worktrees-parallel` for `--parallel` |
 | `/goal-flight doctor` | `commands/doctor.md` | `tool-readiness` |
 | `/goal-flight migrate [<flags>]` | `commands/migrate.md` | `project-state-layout`, `task-lifecycle` |
 | `/goal-flight build-corpus [<flags>]` | `commands/build-corpus.md` | corpus docs referenced there |

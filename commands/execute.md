@@ -17,6 +17,7 @@ Read:
 - `protocols/dispatch-routing.md`
 - `protocols/worker-markers.md`
 - `protocols/worker-context-package.md`
+- `protocols/scout.md`
 - `protocols/worker-contract.md`
 - `protocols/state-handoff.md`
 - `protocols/user-status-cadence.md`
@@ -50,26 +51,19 @@ operator visibility without mutating `capacity.json`.
 
 If `providers_under_pressure` is non-empty:
 - Emit a single `STATUS: rate-pressure provider=<p> count=<n>` line.
-- For the next chunk, prefer the first available `fallback_providers`
-  entry over the pressured provider's default (anthropic-session
-  pressured → route code-writing to codex/cursor instead of Claude
-  Agent). `recommended_caps` is advisory — apply by routing decision,
-  not by mutating capacity state.
-- If pressure crosses **two providers** in the same probe, surface
-  `BLOCKED: rate-pressure across providers` to the user and pause.
+- For the next chunk, prefer the first ready `fallback_providers` entry whose
+  adapter capabilities preserve the task and review concern.
+  `recommended_caps` is advisory — apply it through routing, not by mutating
+  capacity state.
+- If pressure crosses **two independent provider pools** in the same probe,
+  surface `BLOCKED: rate-pressure across providers` to the user and pause.
 
-**Active monitoring under `--parallel N`**: provider-specific, not a
-flat N threshold. Empirically:
-- Codex (OpenAI sub) scales cleanly through N=10; no bouncing observed.
-- Grok / cursor (vendor subs) similar — sub-billed providers tolerate
-  goal-flight-shaped parallelism comfortably.
-- Claude Agent subagents (anthropic-session) start bouncing around
-  N=10 in practice — they share the orchestrator's session budget.
-
-So: re-probe between dispatches when **3+ in-flight workers map to
-the same anthropic-* provider** (especially anthropic-session). For
-codex / grok / cursor-only parallel workloads (the routing-table
-default), the pre-flight check alone is sufficient — no polling.
+**Active monitoring under `--parallel N`** is pool-specific, not a flat
+threshold. Re-probe between dispatches when a pool's in-flight count approaches
+the current adapter cap, or when status reports adaptive walkback, cooldown, or
+shared-session pressure. Otherwise the pre-flight probe is sufficient. Treat
+unknown pool state conservatively; do not infer capacity from a vendor name or
+past anecdote.
 
 Read-only probe; the orchestrator decides whether to act. See SKILL.md
 "Worker Routing" for the per-task fallback table.
@@ -87,6 +81,22 @@ valid agent only if it preserves the review/implementation concern.
 
 5. Dispatch:
 
+Before each wave, invoke the rolling just-in-time freshness scout in
+`protocols/scout.md` for the next one or two near-frontier prompts whose named
+risk or staleness signals are armed. While the current worker or review job is
+waiting, use that protocol's **Scout ahead** loop to prepare those reports.
+Immediately before each dispatch, compare the scout's observed `HEAD` and
+named surfaces with the current tree; apply **Re-scout on tree motion** when a
+named anchor, dependency, invariant, guard test, or prerequisite changed.
+
+Every prompt row included in a scout or batch report must have its own verdict
+and completed fold-in gate. A trivial prompt skipped under
+`protocols/scout.md` records the evidence-backed skip disposition instead of a
+fabricated verdict. A blocking verdict stops only that chunk;
+already-evidenced siblings may proceed. This freshness step complements the
+pinned-package gate below: it never replaces or shortens a mandatory lane
+package.
+
 Before dispatching each wave, run the `protocols/worker-context-package.md`
 self-check: for every chunk in a pinned lane, does the prompt prepend the lane
 brief verbatim and quote its ground truth? Missing or stale package means
@@ -100,20 +110,20 @@ pinned lane get the same brief prepended.
 Canonical direct dispatch is background:
 
 ```bash
-python3 <skill-root>/scripts/goalflight_dispatch.py --agent codex --prompt-file p.md --cwd .
+python3 <skill-root>/scripts/goalflight_dispatch.py --agent <ready-agent> --prompt-file p.md --cwd .
 ```
 
 For durable queue launch, submit and drain one non-blocking pass:
 
 ```bash
-python3 <skill-root>/scripts/goalflight_dispatch.py --submit --drain-on-submit --agent codex --prompt-file p.md --cwd .
+python3 <skill-root>/scripts/goalflight_dispatch.py --submit --drain-on-submit --agent <ready-agent> --prompt-file p.md --cwd .
 ```
 
 Use `--foreground` only for synchronous scripts/tests that need the worker exit
 code:
 
 ```bash
-python3 <skill-root>/scripts/goalflight_dispatch.py --agent codex --prompt-file p.md --cwd . --foreground
+python3 <skill-root>/scripts/goalflight_dispatch.py --agent <ready-agent> --prompt-file p.md --cwd . --foreground
 ```
 
 For `--parallel N` where `N >= 2`, ACP code-writing dispatches must pass
@@ -122,9 +132,11 @@ and routes the worker `--cwd` there. Sequential dispatch (`--parallel 1` or no
 flag) stays in the project root.
 
 Parallel worktrees start from committed `HEAD`; they do not include uncommitted
-controller-root edits. Commit prerequisite changes before dispatch; stash or
-discard unrelated dirt, or fold uncommitted prerequisite content directly into
-the worker prompt.
+controller-root edits. Preserve unrelated WIP. Dispatch from committed `HEAD`
+in an isolated worktree and carry only authorized prerequisite facts or content
+into the worker brief; commit prerequisite changes first only when they have
+passed their own review gate. Never stash, move, or discard another owner's WIP
+without an explicit operator decision naming the exact paths and operation.
 
 6. Record status:
 

@@ -28,16 +28,30 @@ deliverable is a verified prompt, not an implementation and not a substitute
 for chunk review.
 
 Scouting optimizes, in order: output quality first, build wall-clock second,
-tokens a distant third. The real trade is not scout-versus-nothing but
-scout-versus-reviewer: both purchase the same good — defect removal — and the
-pre-fire purchase is usually the better exchange rate, because one avoided
-iterate-review-refire cycle on a long write-mode precision loop dwarfs any
-scouting spend. The standing policy is to keep buying quality until the
-return per token flattens — spend to the knee of that curve, not to a token
-budget — and the more complicated the project, the further out the knee
-sits. Token savings are a common dividend (verified state replaces defensive
-check-first hedging and shrinks the fired prompt) but never the gate. Skip
-scouting only where it has nothing to verify (see the skip rule below).
+tokens a distant third. The economic comparison includes
+scout-versus-reviewer spend, but the gates are not substitutes: scouts retire
+unverified pre-fire premises, adversarial prompt review closes wording
+loopholes, and chunk review judges the implementation. Pre-fire findings often
+have the better exchange rate because one avoided iterate-review-refire cycle
+on a long write-mode loop can exceed the scout cost.
+
+Use the return-per-token knee only to bound optional scout depth after every
+armed surface has evidence and a verdict. For each lane, record a recent-pass
+window `N` (default `2`), the mean cost of one scout pass, and the lane's mean
+bounce cost from the dispatch ledger when available. Stop deepening when
+either:
+
+- the last `N` passes over the same armed surface produced zero non-trivial
+  findings, where non-trivial means a finding that changes prompt wording,
+  scope, ordering, ownership, or verdict; or
+- across the last `N` passes, `non-trivial findings / passes × lane bounce
+  cost` is less than or equal to the mean cost of another scout pass.
+
+If either cost is unknown, do not widen on an assumed abundance signal: finish
+the armed surfaces and at most one clean follow-up pass. More complicated work
+may arm more named surfaces, but it uses the same stop conditions. Token
+savings are a dividend, never the gate. Skip scouting only where it has
+nothing to verify (see the skip rule below).
 
 Scouting compresses the **front** of the funnel: do not dispatch work that is
 done, blocked, mis-anchored, or unanswerable. It does nothing for rounds caused
@@ -116,11 +130,21 @@ The controller names which deliverables each scout must produce:
    block or question one disposition: `PRE-ANSWER` in the prompt,
    `PRE-PROVISION` before firing, or `QUEUE-TO-OPERATOR` through one batched
    pre-fire ask-questions pass.
+7. **Task-scoped context slice** — for an **unpinned** lane whose task needs
+   more than standard orientation, record the source path, semantic
+   anchor/excerpt, task relevance, and where it belongs in the prompt. The
+   slice replaces only generic blanket-reading instructions. It does not
+   create or replace a lane package.
+8. **Documentation-upkeep sites** — record the registry row, document and
+   section, class (`DESCRIPTIVE` or `NORMATIVE`), coupled surface, consumers,
+   and required action for every code-coupled document this task invalidates.
 
 Keep the menu light. VERIFY scouts produce only the controller-scoped subset;
 a narrow staleness re-check usually needs one or two. AUTHOR scouts produce
-all six. Required report metadata, one verdict, and terminal markers remain
-present regardless of the selected content deliverables.
+items 1-6 plus each applicable item 7-8; they record `NOT-APPLICABLE` with a
+reason for either omitted item. Required report metadata, one verdict per
+prompt row, and terminal markers remain present regardless of the selected
+content deliverables.
 
 Decision routing stays explicit: tree-settleable choices are answered by the
 scout; judgment choices become one-line controller TL;DRs; human-only choices
@@ -129,26 +153,32 @@ scope decision by accident.
 
 ### Context brokerage and documentation upkeep
 
-Two further deliverables, both cheap because the scout is already reading the
-tree for this task:
+Context slices and pinned packages complement one another; neither is an
+alternate spelling for the other:
 
-**Task-scoped context slice.** Resolve the documentation, specifications, and
-corpus material that bear on *this* work item and hand the worker pointed
-excerpts with locations — not a blanket instruction to read a package. A
-resolved slice is shorter than the package it replaces and removes the
-missing-or-contradicting-context failure at its source.
+- **Unpinned lane:** item 7 may replace a generic "read the docs" instruction
+  with the task-relevant sources and excerpts. Needing a slice alone does not
+  trigger a package.
+- **Pinned lane:** the package gate still requires the lane brief verbatim,
+  quoted ground truth, guard tests, stable paths, and re-read instructions from
+  `protocols/worker-context-package.md`. A slice never satisfies or shortens
+  that package. A scout may propose a package correction, but the controller
+  applies it through the normal build/refresh and package-review process before
+  dispatch.
 
-**Documentation-upkeep sites.** A project may declare its code-coupled
-documents — architecture notes, specifications, design records, benchmark
-standards — in a maintained registry (for example `docs-to-maintain.md`) that
-names each document, what it is coupled to, and who consumes it. The scout
-resolves which of those documents this change invalidates, names the specific
-section, and writes the upkeep site into the brief so the worker's changeset
-carries the documentation patch alongside the code. The worker's prose is a
-draft: whoever folds the changeset may rewrite it freely. The point is that
-the prompt names the site at all, so coupled documentation cannot rot silently
-while the code moves. Where no registry exists, the scout may propose the
-first list from what the lane actually cites.
+Documentation upkeep is also a closed handoff, not a suggestion. Treat a
+missing, header-only, or incomplete registry as unresolved and propose the
+smallest idempotent row additions from documents the lane actually cites.
+Fold only the rows named by the scout into worker scope:
+
+- `DESCRIPTIVE` prose is patched in the same worker changeset as the coupled
+  code, named in acceptance, and checked by the normal chunk review.
+- `NORMATIVE` or change-controlled material — specifications, standards,
+  contracts, tolerances, or golden values — is not edited automatically. The
+  worker attaches a `PROPOSED` diff to the changeset handoff; the controller
+  applies it only through the project's decision and review gate.
+
+Workers do not sweep or patch registry rows the scout did not name.
 
 ## Ordering — truth before well-formed
 
@@ -200,8 +230,8 @@ clean, or discard concurrent work. You may run focused tests or probes that do
 not mutate tracked sources, inspect history, and create disposable scratch
 outputs. Verify the current tree, including uncommitted work. Return the
 complete report inline for controller capture: STATUS, findings, numbered
-REFINEMENTS for each named prompt file, one VERDICT from the required enum, and
-a RESULT one-liner.
+REFINEMENTS for each named prompt file, one VERDICT from the required enum per
+prompt row (one total for a single-prompt scout), and a RESULT one-liner.
 ```
 
 With a hard read-only transport, the controller persists the inline report in
@@ -217,9 +247,13 @@ Every scout report records:
 
 1. the observed `HEAD`;
 2. whether the worktree had relevant uncommitted changes;
-3. the draft prompt version or digest inspected;
-4. the exact surfaces included; and
-5. the exact surfaces not swept.
+3. for each prompt row, its stable ID and draft prompt version or digest;
+4. for each prompt row, the exact surfaces included; and
+5. for each prompt row, the exact surfaces not swept.
+
+A single-prompt report has one prompt row. A batch report repeats the complete
+row contract for every prompt and adds one batch-level cross-prompt section;
+the batch itself has no aggregate verdict.
 
 Write suspect premises as falsifiable sub-questions before investigating them.
 Every question must permit `NONE + recommendation` when the expected owner,
@@ -263,7 +297,9 @@ blocking verdict.
 
 ## Verdicts
 
-Premise and prompt scouts use exactly one:
+Each prompt row uses exactly one verdict. A single-prompt report therefore has
+one verdict; a batch report has one verdict per prompt row. Premise and prompt
+rows use:
 
 | Verdict | Meaning |
 |---|---|
@@ -292,8 +328,11 @@ and the controller spot-checks that evidence before closing or re-scoping work.
 ## THE FOLD-IN GATE
 
 `NEEDS-REFINEMENT` (including mapped `NEEDS-REANCHOR`), `PROMPT-INVALID`, and
-`NEEDS-CONTROLLER` block the affected chunk. A scout report beside an
-unchanged worker prompt is not a completed scout gate.
+`NEEDS-CONTROLLER` block the affected prompt row and chunk. A scout report
+beside an unchanged worker prompt is not a completed scout gate. In a batch,
+apply this gate independently to every row and fold cross-prompt findings into
+each affected row; never let one clean row or a batch-level summary clear
+another row.
 
 Before firing the chunk, the controller must:
 
@@ -458,9 +497,11 @@ the axes where knowledge is shared:
 
 - **The batch unit is a shared surface, never a count.** One scout covers all
   the prompts in a lane, wave, or subsystem — read once, verify many — and
-  reports per-prompt verdict rows plus the cross-prompt contradiction section
-  that only a batch can produce (contradictions live *between* prompts and are
-  invisible to any single-prompt scout). Do not batch across unrelated
+  emits one complete row and exactly one verdict for every prompt, plus one
+  batch-level cross-prompt contradiction section. The one-verdict rule applies
+  per row, not per batch report; the batch has no aggregate verdict.
+  Contradictions live *between* prompts and are invisible to a single-prompt
+  scout. Fold and gate every row independently. Do not batch across unrelated
   subsystems: breadth dilutes depth and produces echo rows.
 - **Prompt chains get two tiers with different rot rates.** At decomposition
   time, one chain-contract scout covers the whole set: dependency order,
@@ -475,6 +516,19 @@ the axes where knowledge is shared:
   reserve AUTHOR batching for prompts that share an interface seam — where
   co-authoring also prevents the inter-brief interface drift that two
   parallel authors would create.
+
+### Invocation sites
+
+- `commands/decompose-plan.md` invokes the chain-contract batch after the full
+  chunk set is drafted and before decomposition review or approval. It checks
+  whole-set ordering, interfaces, ownership, and decision conformance, then
+  applies the per-row fold-in gate.
+- `commands/execute.md` invokes rolling just-in-time VERIFY passes for the near
+  frontier, uses the scout-ahead loop during current worker or review waits,
+  and applies the tree-motion freshness check immediately before dispatch.
+
+These are mandatory stage hooks for their named risk signals, not blanket
+scouts over unrelated surfaces.
 
 ## Routing and capacity
 
@@ -492,11 +546,12 @@ Every judgment-bearing host-subagent scout begins with
 `protocols/subagent-preamble.md`, followed by the lane's north star, the draft
 prompt, and any required context package.
 
-Provider pools are not fungible. When a research-grade pool is abundant,
-deepen the menu, widen the batch, and add empirical checks freely — without
-going overboard into echo-row breadth — because de-risking spent from an
-abundant pool protects the scarce precision-coding pool from bounce rounds.
-Ration scout depth only on pools that are themselves scarce.
+Provider pools are not fungible. An abundant research pool may widen the
+default menu, batch, or empirical-check set inside the armed surfaces, but the
+same zero-finding and marginal-catch stop conditions above bound that breadth.
+Pool state chooses routing and the initial optional depth; it never overrides
+the stop. When pool state or cost evidence is unknown, use the bounded
+unknown-state default rather than assuming abundance.
 
 ### Tier-calibrated brief detail
 

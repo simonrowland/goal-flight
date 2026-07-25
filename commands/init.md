@@ -9,8 +9,8 @@ Initialize a project for goal-flight with compact, procedural discovery.
 Read `protocols/session-preflight.md`, `protocols/tool-readiness.md`,
 `protocols/project-state-layout.md`, `protocols/task-lifecycle.md`,
 `protocols/progress-dashboard.md`, `protocols/premises.md`,
-`protocols/state-handoff.md`, `protocols/worker-context-package.md`, and
-`protocols/chunk-review.md` (review tooling).
+`protocols/state-handoff.md`, `protocols/worker-context-package.md`,
+`protocols/scout.md`, and `protocols/chunk-review.md` (review tooling).
 
 ## Steps
 
@@ -232,13 +232,31 @@ init.
 
 Also seed `docs-private/docs-to-maintain.md`: the registry of documents coupled
 to code, so changes carry their documentation patch instead of leaving the
-prose to rot. One row per document — path, what it is coupled to (subsystem,
-contract, or benchmark), and who consumes it. Seed it from what the project
-already keeps: north-star, architecture, specifications, design records,
-interface contracts, benchmark standards. An empty registry with a header is a
-valid start; record it either way so scouts and workers know the list exists.
-`protocols/scout.md` describes how a scout resolves the affected rows into
-documentation-upkeep sites in a worker brief.
+prose to rot. Use this canonical header:
+
+```markdown
+| Document | Class | Coupled surface | Consumers |
+|---|---|---|---|
+```
+
+`Class` is `DESCRIPTIVE` for explanatory prose or `NORMATIVE` for
+change-controlled specifications, standards, contracts, tolerances, and golden
+values. Seed rows from what the project already keeps: north-star,
+architecture, specifications, design records, interface contracts, and
+benchmark standards.
+
+Registry mutation follows init's dry-run/apply transaction. The dry run lists
+`create`, `merge-row`, or `no-op` actions; apply creates the file if absent and
+merge-adds missing document paths or fills blank cells in an existing row.
+Never overwrite a populated operator value or add a duplicate path. Treat a
+missing, header-only, or incomplete registry as the same discovery case and
+propose the smallest missing rows or cells. Include the registry actions in the
+init receipt.
+
+`protocols/scout.md` describes how a scout resolves only the affected rows into
+worker scope: descriptive prose is patched in the same reviewed changeset;
+normative material is attached as a `PROPOSED` diff and waits for the project's
+decision/review gate.
 
 10. Self-review:
 

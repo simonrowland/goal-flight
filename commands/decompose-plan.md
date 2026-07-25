@@ -9,6 +9,7 @@ Read:
 - `protocols/premises.md`
 - `protocols/dispatch-routing.md`
 - `protocols/worker-context-package.md`
+- `protocols/scout.md`
 
 Break a plan into numbered `/goal` chunks. The plan source can come from:
 
@@ -183,6 +184,25 @@ Tags (see SKILL.md for full definitions):
 ```
 
 If a same-day file exists, append new chunks numbered after the last existing entry (do not duplicate). Tags `[parallel-safe:<group>]` come from the analyst (step 2 above); other tags applied by analyst or orchestrator as judgment dictates.
+
+### 3.5. Run the chain-contract scout
+
+After the complete chunk set is written and before decomposition review or
+approval, invoke the chain-contract batch in `protocols/scout.md` against every
+new prompt row. The read-only scout checks the whole set for:
+
+- dependency and execution order;
+- interface handoffs between chunks;
+- edit-surface and ownership boundaries; and
+- conformance with the plan's settled decisions.
+
+Persist one batch report in the topic's private research directory. It carries
+one complete row and exactly one verdict per prompt, plus the batch-level
+cross-prompt contradiction section. Apply the scout fold-in gate independently
+to every row: refine or replan each blocking row, fold cross-prompt corrections
+into every affected prompt, and re-scout changed rows. Do not advance to step 4
+or present the queue for approval while any prompt row still has a blocking
+verdict.
 
 ### 4. Review the decomposition itself (parallel reviewers)
 

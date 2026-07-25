@@ -48,6 +48,16 @@ patch, including trivial ones; it is not a complexity tier. If only one engine
 is abundant, run the multi-angle lenses on it and record that engine diversity
 was unavailable; never skip review or strand budget to chase another engine.
 
+When a scout names documentation-upkeep rows, chunk review checks only those
+rows:
+
+- every named `DESCRIPTIVE` path is in the same changeset and acceptance scope,
+  and its patch matches the coupled code change;
+- every named `NORMATIVE` path remains unchanged while its `PROPOSED` diff is
+  attached to the handoff with the project's decision/review gate recorded;
+  and
+- no registry row outside the scout's named set was swept into worker scope.
+
 ## How the review runs (bash-tail subprocess, not nested ACP tool call)
 
 **gstack `/review` is read-only — invoke it as a bash-tail subprocess with
@@ -91,16 +101,15 @@ or dispatches with an empty/absent brief, **silently**. `mkdir -p` the dir first
 (as shown), or write briefs/outputs with the path-creating **Write tool** instead
 of `cat >`. Verify the brief is a non-empty file (`test -s <brief>`) before
 launching the reviewer — never confirm it via `git status` (findings/review dirs
-are under gitignored `docs-private/`, so git is blind to them). (Observed: pm2 F2
-+ Chunk B review briefs both failed silently this way, 2026-06-13.)
+are under gitignored `docs-private/`, so git is blind to them). This prevents a
+missing parent directory from silently turning a required review into an empty
+or absent artifact.
 
-**`--enable web_search_cached` note.** As of codex v0.131 stderr emits a
-deprecation warning about a `[features].web_search_cached` config-toml key
-(not the CLI flag) — web search is now enabled by default. The CLI flag
-`--enable web_search_cached` itself still works and is the supported way to
-trust hook execution for this invocation. Do NOT replace it with
-`-c features.web_search="cached"` — that is a different (string-vs-boolean)
-key shape and codex rejects it as a config type error.
+**`--enable web_search_cached` note.** A deprecation warning may name a
+similarly spelled configuration key rather than the CLI flag. Keep the
+adapter-declared CLI flag when the invocation succeeds. Do NOT substitute a
+different string-valued configuration key for the boolean feature flag; the
+shapes are not interchangeable.
 
 Parse the captured stdout (`codex-review.final.md`) for severity-tagged
 findings (P0/P1/P2/P3) and apply per the chunk-review policy below.
@@ -119,10 +128,10 @@ structured `execute_command` tool, which is what nested ACP-routed
 review-dispatches do). A bash-tail subprocess spawned with the inner sandbox
 flag set is a different path — the inner codex's sandbox is the safety
 boundary, and the worker's outer permission gate doesn't intercept the
-already-sandboxed read-only operation. The 2026-05-27 chunk-2/3a/12 blocking
-class came from nesting `codex exec /review` as a tool call without the
-read-only sandbox, non-interactive approval policy, and closed stdin shape, so
-the gate intercepted it as a write-grade execute.
+already-sandboxed read-only operation. Nesting the review as a tool call
+without the read-only sandbox, non-interactive approval policy, and closed
+stdin shape lets the outer gate classify it as a write-grade execute; the
+canonical subprocess shape avoids that ambiguity.
 
 ## Where the review runs
 
@@ -282,8 +291,8 @@ Do not skip review entirely when tests pass.
 - **Inverting the default policy.** `gstack /review` is the default chunk
   reviewer; `./scripts/autoreview.sh` is the complementary parallel option.
   Do not rewrite this protocol or the surrounding doc surfaces to elevate
-  autoreview to default — that displaces the canonical structural reviewer
-  and is the regression class R9 in the 2026-05-24 handoff backlog.
+  autoreview to default — that displaces the canonical structural reviewer and
+  violates the default-owner rule above.
 - **Hand-rolling review prompts when gstack is installed.** Do not write a
   custom "please review this diff for bugs" prompt and dispatch it directly
   against a worker via `goalflight_acp_run.py --agent <x> --prompt <custom>`
