@@ -56,7 +56,7 @@ convention.
 
 5. Run the install:
    - Default (mirror on): `bash <skill-root>/scripts/install-codex-overrides.sh <path>`
-   - User said no to mirror: `bash <skill-root>/scripts/install-codex-overrides.sh --no-project-mirror <path>`
+   - Mirror declined: `bash <skill-root>/scripts/install-codex-overrides.sh --no-project-mirror <path>`
 
 6. Re-run `--check` and report the verification block to the user.
 
