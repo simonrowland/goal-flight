@@ -27,10 +27,13 @@ Scouting moves tree discovery ahead of the expensive write-mode fire. Its
 deliverable is a verified prompt, not an implementation and not a substitute
 for chunk review.
 
-Scouting must also be token-positive. A bounced dispatch spends a worker run,
-a review, and a refire; verified state should instead replace defensive
-check-first hedging and shrink the fired prompt. Apply the cost floor below
-when that saving is unlikely.
+Scouting optimizes, in order: output quality first, build wall-clock second,
+tokens third. It is usually token-positive as a side effect — a bounced
+dispatch spends a worker run, a review, and a refire, and verified state
+replaces defensive check-first hedging and shrinks the fired prompt — but
+token savings are a dividend, not a requirement: a scout that prevents one
+wrong build at net token cost is still a clear win. Apply the cost floor
+below when none of the three are likely to move.
 
 Scouting compresses the **front** of the funnel: do not dispatch work that is
 done, blocked, mis-anchored, or unanswerable. It does nothing for rounds caused
