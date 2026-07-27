@@ -48,7 +48,15 @@ READERS = (
     ReaderSpec("codex", "codex", "codex_usage.py"),
     ReaderSpec("kimi", "kimi-code", "kimi_usage.py"),
     ReaderSpec("cursor", "cursor", "cursor_usage.py"),
-    ReaderSpec("claude", "claude", "claude_usage.py", ("--skip-tui",), deep_args=()),
+    # QUARANTINED: no deep variant. Letting the claude reader run its full TUI
+    # capture is not merely slow, it is unsafe - the capture does not reliably
+    # isolate per account. Observed 2026-07-27: a sweep left the 'work' label
+    # resolving to the live account instead of its own, and the sweep's
+    # sync-back then propagates that into the label's stored backup, so one
+    # account's credential silently replaces another's. It also never yields the
+    # reset text it exists to collect (percentages parse, reset lines do not).
+    # Restore deep_args=() only once per-account isolation is proven.
+    ReaderSpec("claude", "claude", "claude_usage.py", ("--skip-tui",)),
 )
 
 ROW_KEYS = ("provider", "account", "remaining", "reset_at", "flags")

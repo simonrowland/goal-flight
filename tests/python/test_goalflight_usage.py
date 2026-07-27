@@ -454,26 +454,47 @@ def test_claude_reader_invoked_with_skip_tui(tmp_path):
     assert rows and 'unavailable' not in (rows[0].get('flags') or ())
 
 
-def test_deep_drops_skip_tui_for_the_claude_reader_only(tmp_path):
-    """--deep buys the slow capture that carries headroom and reset times;
-    readers with no deep variant must see the same argv either way."""
+def test_no_shipped_reader_opts_into_the_deep_capture(tmp_path):
+    """--deep exists as a mechanism, but nothing opts into it yet.
+
+    The claude reader is quarantined: its TUI capture does not isolate per
+    account, and a sweep was observed leaving one label resolving to a different
+    account, which its sync-back then writes through to that label's stored
+    backup. Until isolation is proven, --deep must not change any reader's argv.
+    """
     from goalflight_usage import READERS, run_reader
 
     claude = next(s for s in READERS if s.key == "claude")
-    assert claude.args_for(deep=False) == ("--skip-tui",)
-    assert claude.args_for(deep=True) == ()
+    assert "--skip-tui" in claude.extra_args
     for spec in READERS:
-        if spec.key != "claude":
-            assert spec.args_for(deep=True) == spec.extra_args
+        assert spec.deep_args is None
+        assert spec.args_for(deep=True) == spec.extra_args
+        assert spec.args_for(deep=False) == spec.extra_args
 
+    # The reader still receives --skip-tui under --deep, so the safe fast path
+    # is what actually runs.
     reader = tmp_path / claude.filename
     reader.write_text(
+        "import json, sys\n"
+        "if '--skip-tui' not in sys.argv: sys.exit(3)\n"
+        "print(json.dumps([{'label': 'x', 'logged_in': True}]))\n"
+    )
+    rows = run_reader(claude, readers_dir=tmp_path, timeout_s=10.0, now=0.0, deep=True)
+    assert rows and "unavailable" not in (rows[0].get("flags") or ())
+
+
+def test_deep_variant_plumbing_still_works_when_a_spec_opts_in(tmp_path):
+    """The mechanism itself must stay correct so the quarantine can be lifted."""
+    from goalflight_usage import ReaderSpec, run_reader
+
+    spec = ReaderSpec("claude", "claude", "r.py", ("--skip-tui",), deep_args=())
+    (tmp_path / "r.py").write_text(
         "import json, sys\n"
         "if '--skip-tui' in sys.argv: sys.exit(3)\n"
         "print(json.dumps([{'label': 'x', 'logged_in': True,\n"
         "                   'weekly_reset_at': 1000.0}]))\n"
     )
-    rows = run_reader(claude, readers_dir=tmp_path, timeout_s=10.0, now=0.0, deep=True)
+    rows = run_reader(spec, readers_dir=tmp_path, timeout_s=10.0, now=0.0, deep=True)
     assert rows and rows[0].get("reset_at") == 1000.0
 
 
