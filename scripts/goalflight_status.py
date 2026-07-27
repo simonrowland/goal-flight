@@ -1464,8 +1464,39 @@ def _wait_snapshot(
         }
         if terminal_marker:
             row["terminal_marker"] = terminal_marker
+        # Carry the marker kind on every terminal row. The state taxonomy
+        # collapses all non-success terminals to "blocked", which makes an
+        # expected checkpoint (USER-NEED) print identically to a wedged worker
+        # (BLOCKED) - the reader learns which only by opening the tail. The
+        # kind is already known here; surfacing it costs nothing.
+        marker_info: dict | None = None
+        if record is not None:
+            for key in ("terminal_marker", "last_marker"):
+                candidate = record.get(key)
+                if isinstance(candidate, dict) and candidate.get("kind"):
+                    marker_info = candidate
+                    break
+        if marker_info is None and terminal_marker:
+            marker_info = terminal_marker
+        if marker_info:
+            row["marker_kind"] = marker_info.get("kind")
+            row["marker_headline"] = str(marker_info.get("text") or "")[:120]
         rows.append(row)
     return rows
+
+
+def _wait_verdict_line(row: dict) -> str:
+    """One verdict line per dispatch, with the marker kind where it adds truth.
+
+    "blocked" is a collapsed state; when the underlying marker distinguishes an
+    expected checkpoint from a genuine block, print the distinction.
+    """
+    base = f"{row['dispatch_id']} -> {row['state']}"
+    kind = row.get("marker_kind")
+    if not kind or row.get("state") in ("complete", "timeout"):
+        return base
+    headline = str(row.get("marker_headline") or "").strip()
+    return f"{base} [{kind}] {headline}".rstrip()
 
 
 def _wait_interrupt_hint(wait_ids: list[str]) -> str:
@@ -1541,7 +1572,7 @@ def wait_for_dispatches(
                 else:
                     print(f"wait complete: {len(rows)}/{len(rows)} terminal")
                     for row in rows:
-                        print(f"{row['dispatch_id']} -> {row['state']}")
+                        print(_wait_verdict_line(row))
                 return 0
 
             if timeout_s is not None and now - start >= timeout_s:
@@ -1560,7 +1591,7 @@ def wait_for_dispatches(
                 else:
                     print(f"wait timeout: {terminal}/{len(rows)} terminal; pending {','.join(pending)}")
                     for row in rows:
-                        print(f"{row['dispatch_id']} -> {row['state']}")
+                        print(_wait_verdict_line(row))
                 return 1
 
             time.sleep(poll_s)

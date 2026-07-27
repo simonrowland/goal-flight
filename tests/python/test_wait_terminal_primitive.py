@@ -441,6 +441,55 @@ def test_completed_pid_dead_stays_complete_trust_clause() -> None:
     assert_true("dead_since untouched for complete", "done" not in dead_since)
 
 
+def test_terminal_row_carries_marker_kind_and_verdict_distinguishes_checkpoint() -> None:
+    # "blocked" is a collapsed state: USER-NEED (expected checkpoint) and
+    # BLOCKED (wedged) must not print identically, or the reader opens every
+    # tail to learn which. The row carries the kind; the verdict line shows it.
+    rec = {
+        "dispatch_id": "chk",
+        "classification": "blocked",
+        "terminal_state": "blocked",
+        "terminal_marker": {
+            "kind": "USER-NEED",
+            "text": "landing checkpoint - session abc123; log /tmp/x.log",
+            "line": 42,
+        },
+    }
+    row = _row(_payload(rec), "chk", now=10_000.0, grace=90.0, dead_since={})
+    assert_eq("terminal", row["terminal"], True)
+    assert_eq("marker kind on row", row.get("marker_kind"), "USER-NEED")
+    line = status._wait_verdict_line(row)
+    assert_true("kind in verdict", "[USER-NEED]" in line)
+    assert_true("headline in verdict", "landing checkpoint" in line)
+
+    wedged = {
+        "dispatch_id": "wdg",
+        "classification": "blocked",
+        "terminal_state": "blocked",
+        "terminal_marker": {"kind": "BLOCKED", "text": "sandbox refused bind", "line": 9},
+    }
+    wline = status._wait_verdict_line(
+        _row(_payload(wedged), "wdg", now=10_000.0, grace=90.0, dead_since={})
+    )
+    assert_true("wedged shows BLOCKED kind", "[BLOCKED]" in wline)
+    assert_true("the two verdicts differ", line != wline)
+
+
+def test_verdict_line_stays_bare_for_complete_and_timeout() -> None:
+    rec = {
+        "dispatch_id": "done",
+        "classification": "complete",
+        "terminal_marker": {"kind": "COMPLETE", "text": "all good", "line": 1},
+    }
+    row = _row(_payload(rec), "done", now=10_000.0, grace=90.0, dead_since={})
+    assert_eq("complete bare", status._wait_verdict_line(row), "done -> complete")
+    assert_eq(
+        "timeout bare",
+        status._wait_verdict_line({"dispatch_id": "t", "state": "timeout", "marker_kind": "STATUS"}),
+        "t -> timeout",
+    )
+
+
 def test_wait_returns_bounded_on_crash_not_at_timeout() -> None:
     # End-to-end: a crashed dispatch must make wait_for_dispatches RETURN well
     # before the wait-timeout. Poison: without the anti-hang clause this row never
@@ -527,6 +576,8 @@ def main() -> None:
     for test in tests:
         test()
     print(f"PASS tests/python/test_wait_terminal_primitive.py ({len(tests)} tests)")
+    test_terminal_row_carries_marker_kind_and_verdict_distinguishes_checkpoint()
+    test_verdict_line_stays_bare_for_complete_and_timeout()
 
 
 if __name__ == "__main__":
