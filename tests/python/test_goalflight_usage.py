@@ -301,15 +301,16 @@ def test_claude_indeterminate_label_is_unknown_not_ok():
     assert row["flags"] == []
 
 
+# A timed-out reader no longer degrades to "unavailable" - it reports a distinct
+# timeout row, covered by test_reader_timeout_is_distinct_from_reader_failure.
 @pytest.mark.parametrize(
     ("filename", "body", "timeout_s"),
     [
         ("error.py", "raise SystemExit(2)\n", 1),
         ("garbage.py", "print('not-json')\n", 1),
-        ("timeout.py", "import time\ntime.sleep(2)\nprint('[]')\n", 0.05),
     ],
 )
-def test_erroring_garbage_and_timeout_readers_degrade(
+def test_erroring_and_garbage_readers_degrade(
     tmp_path: Path,
     filename: str,
     body: str,
@@ -453,6 +454,29 @@ def test_claude_reader_invoked_with_skip_tui(tmp_path):
     assert rows and 'unavailable' not in (rows[0].get('flags') or ())
 
 
+def test_deep_drops_skip_tui_for_the_claude_reader_only(tmp_path):
+    """--deep buys the slow capture that carries headroom and reset times;
+    readers with no deep variant must see the same argv either way."""
+    from goalflight_usage import READERS, run_reader
+
+    claude = next(s for s in READERS if s.key == "claude")
+    assert claude.args_for(deep=False) == ("--skip-tui",)
+    assert claude.args_for(deep=True) == ()
+    for spec in READERS:
+        if spec.key != "claude":
+            assert spec.args_for(deep=True) == spec.extra_args
+
+    reader = tmp_path / claude.filename
+    reader.write_text(
+        "import json, sys\n"
+        "if '--skip-tui' in sys.argv: sys.exit(3)\n"
+        "print(json.dumps([{'label': 'x', 'logged_in': True,\n"
+        "                   'weekly_reset_at': 1000.0}]))\n"
+    )
+    rows = run_reader(claude, readers_dir=tmp_path, timeout_s=10.0, now=0.0, deep=True)
+    assert rows and rows[0].get("reset_at") == 1000.0
+
+
 def test_nonzero_exit_with_valid_rows_is_kept(tmp_path):
     """A reader that exits nonzero while emitting valid rows is reporting
     degraded accounts, not failing - its rows must reach the table (t-189)."""
@@ -485,3 +509,21 @@ def test_token_lapsed_renders_auto_heal_not_needs_login(tmp_path):
     rows = run_reader(spec, readers_dir=tmp_path, timeout_s=10.0, now=0.0)
     assert rows[0]["remaining"] == "lapsed (auto-heals)"
     assert "auth-broken" not in (rows[0].get("flags") or ())
+
+
+def test_reader_timeout_is_distinct_from_reader_failure(tmp_path):
+    """A reader that ran out of budget measured nothing; it did not measure a
+    broken account. Collapsing the two sends the operator to debug the account
+    while the real fault is the harness budget."""
+    from goalflight_usage import ReaderSpec, run_reader
+
+    spec = ReaderSpec("claude", "claude", "slow.py")
+    (tmp_path / "slow.py").write_text("import time\ntime.sleep(5)\n")
+    rows = run_reader(spec, readers_dir=tmp_path, timeout_s=0.4, now=0.0)
+    assert rows[0]["flags"] == ["timeout"]
+    assert rows[0]["remaining"] == "timed out"
+
+    spec = ReaderSpec("claude", "claude", "broken.py")
+    (tmp_path / "broken.py").write_text("print('not json')\n")
+    rows = run_reader(spec, readers_dir=tmp_path, timeout_s=10.0, now=0.0)
+    assert rows[0]["flags"] == ["unavailable"]

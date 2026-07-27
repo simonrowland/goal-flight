@@ -16,6 +16,12 @@ from typing import Any, Mapping, Sequence
 
 
 DEFAULT_TIMEOUT_S = 20.0
+# --deep opens a real TUI per Claude account. A measured three-account sweep runs
+# ~120s, but per-capture time is highly variable and a capture can overrun its
+# own nominal cap, so a budget sized to the typical case turns a slow run into a
+# fake failure. This bound exists only to stop a genuine hang, not to pace the
+# work - size it far above the observed worst case.
+DEEP_TIMEOUT_S = 900.0
 DEFAULT_READERS_DIR = Path(__file__).resolve().parent / "ext"
 
 
@@ -28,13 +34,21 @@ class ReaderSpec:
     # aggregator's per-reader timeout; the table only needs the fast login-health
     # pass (run the reader directly for full numbers).
     extra_args: tuple = ()
+    # deep_args: what --deep passes instead, for readers whose headroom and reset
+    # numbers are only reachable through a slow capture. None keeps extra_args.
+    deep_args: tuple | None = None
+
+    def args_for(self, deep: bool) -> tuple:
+        if deep and self.deep_args is not None:
+            return self.deep_args
+        return self.extra_args
 
 
 READERS = (
     ReaderSpec("codex", "codex", "codex_usage.py"),
     ReaderSpec("kimi", "kimi-code", "kimi_usage.py"),
     ReaderSpec("cursor", "cursor", "cursor_usage.py"),
-    ReaderSpec("claude", "claude", "claude_usage.py", ("--skip-tui",)),
+    ReaderSpec("claude", "claude", "claude_usage.py", ("--skip-tui",), deep_args=()),
 )
 
 ROW_KEYS = ("provider", "account", "remaining", "reset_at", "flags")
@@ -50,6 +64,7 @@ FLAG_TEXT = {
     "walled": "⛔wall",
     "auth-broken": "⚠auth",
     "unavailable": "⚠unavailable",
+    "timeout": "⚠timeout",
 }
 
 
@@ -163,6 +178,22 @@ def unavailable_row(provider: str) -> dict[str, object]:
         remaining="unavailable",
         reset_at=None,
         flags=("unavailable",),
+    )
+
+
+def timed_out_row(provider: str) -> dict[str, object]:
+    """A reader that ran out of budget measured nothing - it did not measure bad.
+
+    Rendering that as "unavailable" is the same mistake as reporting a missing
+    binary as a version mismatch: it points the reader at the account when the
+    fault is in the harness, and the account then gets debugged for hours.
+    """
+    return _row(
+        provider,
+        account=None,
+        remaining="timed out",
+        reset_at=None,
+        flags=("timeout",),
     )
 
 
@@ -501,6 +532,7 @@ def run_reader(
     readers_dir: Path = DEFAULT_READERS_DIR,
     timeout_s: float = DEFAULT_TIMEOUT_S,
     now: float | None = None,
+    deep: bool = False,
 ) -> list[dict[str, object]]:
     """Run one optional reader; every failure becomes one unavailable row."""
     reader_path = readers_dir / spec.filename
@@ -508,7 +540,7 @@ def run_reader(
         if not reader_path.is_file():
             return [unavailable_row(spec.provider)]
         completed = subprocess.run(
-            [sys.executable, str(reader_path), "--json", *spec.extra_args],
+            [sys.executable, str(reader_path), "--json", *spec.args_for(deep)],
             capture_output=True,
             text=True,
             timeout=timeout_s,
@@ -523,7 +555,9 @@ def run_reader(
         if completed.returncode != 0 and not payload:
             return [unavailable_row(spec.provider)]
         return normalize_payload(spec, payload, now=now)
-    except (OSError, subprocess.TimeoutExpired, UnicodeError, ValueError):
+    except subprocess.TimeoutExpired:
+        return [timed_out_row(spec.provider)]
+    except (OSError, UnicodeError, ValueError):
         return [unavailable_row(spec.provider)]
     except Exception:
         return [unavailable_row(spec.provider)]
@@ -535,6 +569,7 @@ def collect_usage(
     timeout_s: float = DEFAULT_TIMEOUT_S,
     reader_specs: Sequence[ReaderSpec] = READERS,
     now: float | None = None,
+    deep: bool = False,
 ) -> list[dict[str, object]]:
     current_time = time.time() if now is None else now
     rows = []
@@ -545,6 +580,7 @@ def collect_usage(
                 readers_dir=readers_dir,
                 timeout_s=timeout_s,
                 now=current_time,
+                deep=deep,
             )
         )
     return rows
@@ -644,6 +680,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--json", action="store_true", help="emit normalized JSON rows")
     parser.add_argument(
+        "--deep",
+        action="store_true",
+        help=(
+            "let slow readers run their full capture so Claude rows carry "
+            "headroom and reset times (minutes, not seconds)"
+        ),
+    )
+    parser.add_argument(
         "--readers-dir",
         type=Path,
         default=DEFAULT_READERS_DIR,
@@ -655,7 +699,12 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     now = time.time()
-    rows = collect_usage(readers_dir=args.readers_dir, now=now)
+    rows = collect_usage(
+        readers_dir=args.readers_dir,
+        timeout_s=DEEP_TIMEOUT_S if args.deep else DEFAULT_TIMEOUT_S,
+        now=now,
+        deep=args.deep,
+    )
     if args.json:
         print(json.dumps(rows, indent=2))
     else:
