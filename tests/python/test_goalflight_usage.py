@@ -398,14 +398,16 @@ def test_json_cli_shape_and_unavailable_exit_zero(tmp_path: Path, capsys):
     assert usage.main(["--json", "--readers-dir", str(tmp_path)]) == 0
     rows = json.loads(capsys.readouterr().out)
 
-    assert len(rows) == 4
+    # One row per registered reader; derived, so adding a provider does not
+    # fail this test for the wrong reason.
+    assert len(rows) == len(usage.READERS)
     assert rows[0]["remaining"] == "99%"
     assert all(tuple(row) == usage.ROW_KEYS for row in rows)
     assert [row["provider"] for row in rows[1:]] == [
-        "kimi-code",
-        "cursor",
-        "claude",
+        spec.provider for spec in usage.READERS if spec.key != "codex"
     ]
+    # Every reader but the one written above is absent, so each degrades to a
+    # single unavailable row rather than vanishing from the table.
     assert all(row["flags"] == ["unavailable"] for row in rows[1:])
 
 
@@ -548,3 +550,42 @@ def test_reader_timeout_is_distinct_from_reader_failure(tmp_path):
     (tmp_path / "broken.py").write_text("print('not json')\n")
     rows = run_reader(spec, readers_dir=tmp_path, timeout_s=10.0, now=0.0)
     assert rows[0]["flags"] == ["unavailable"]
+
+
+def test_grok_row_renders_as_a_resetting_window():
+    """grok is a subscription credit pool, so it normalizes like a seat window."""
+    spec = usage.ReaderSpec("grok", "grok", "grok_usage.py")
+    row = usage.normalize_payload(
+        spec,
+        [{"label": "grok", "ok": True, "used_percent": 41.0, "reset_at": 2_000_000_000}],
+    )[0]
+    assert row == {
+        "provider": "grok",
+        "account": None,
+        "remaining": "59%",
+        "reset_at": 2_000_000_000.0,
+        "flags": [],
+    }
+
+
+def test_grok_reader_failure_never_renders_as_headroom():
+    """The backing endpoint is undocumented; a contract change must not become
+    a confident percentage."""
+    spec = usage.ReaderSpec("grok", "grok", "grok_usage.py")
+    row = usage.normalize_payload(
+        spec,
+        [{"label": "grok", "ok": False, "error": "billing response lacks config"}],
+    )[0]
+    assert row["remaining"] != "100%"
+    assert not str(row["remaining"]).endswith("%")
+
+    exhausted = usage.normalize_payload(
+        spec, [{"label": "grok", "ok": True, "used_percent": 100.0}]
+    )[0]
+    assert exhausted["remaining"] == "0%"
+    assert exhausted["flags"] == ["walled"]
+
+
+def test_grok_is_registered_in_readers_and_normalizers():
+    assert "grok" in usage.NORMALIZERS
+    assert any(spec.key == "grok" for spec in usage.READERS)

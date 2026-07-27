@@ -46,6 +46,7 @@ class ReaderSpec:
 
 READERS = (
     ReaderSpec("codex", "codex", "codex_usage.py"),
+    ReaderSpec("grok", "grok", "grok_usage.py"),
     ReaderSpec("kimi", "kimi-code", "kimi_usage.py"),
     ReaderSpec("cursor", "cursor", "cursor_usage.py"),
     # QUARANTINED: no deep variant. Letting the claude reader run its full TUI
@@ -290,6 +291,40 @@ def _normalize_codex(record: Mapping[str, Any], now: float) -> dict[str, object]
     )
 
 
+def _normalize_grok(record: Mapping[str, Any], now: float) -> dict[str, object]:
+    """One subscription credit pool, shaped like a codex seat window.
+
+    A reader failure keeps its reason rather than resolving to a percentage:
+    the backing endpoint is undocumented, so a contract change must read as
+    "could not measure", never as full headroom.
+    """
+    del now
+    reset_at = parse_reset(record.get("reset_at"))
+    failure = _failed_record(record)
+    if failure is not None:
+        remaining, flag = failure
+        return _row(
+            "grok",
+            account=None,
+            remaining=remaining,
+            reset_at=reset_at,
+            flags=(flag,) if flag else (),
+        )
+
+    used = _number(record.get("used_percent"))
+    if used is None:
+        return _row("grok", account=None, remaining="unknown", reset_at=reset_at)
+    remaining_value = _percent_remaining(used)
+    flags = ("walled",) if used >= 100 or remaining_value <= 0 else ()
+    return _row(
+        "grok",
+        account=None,
+        remaining=f"{_format_number(remaining_value)}%",
+        reset_at=reset_at,
+        flags=flags,
+    )
+
+
 def _normalize_kimi(record: Mapping[str, Any], now: float) -> dict[str, object]:
     del now
     source = record.get("source")
@@ -504,6 +539,7 @@ def _normalize_claude(record: Mapping[str, Any], now: float) -> dict[str, object
 
 NORMALIZERS = {
     "codex": _normalize_codex,
+    "grok": _normalize_grok,
     "kimi": _normalize_kimi,
     "cursor": _normalize_cursor,
     "claude": _normalize_claude,
