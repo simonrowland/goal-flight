@@ -138,11 +138,16 @@ The controller names which deliverables each scout must produce:
 8. **Documentation-upkeep sites** — record the registry row, document and
    section, class (`DESCRIPTIVE` or `NORMATIVE`), coupled surface, consumers,
    and required action for every code-coupled document this task invalidates.
+9. **Proposed store changes** — any row this scout's findings would close,
+   re-scope, re-point, or annotate, listed for controller review as described
+   under the fold-in gate. `ACTIONS: NONE` when there are none.
 
 Keep the menu light. VERIFY scouts produce only the controller-scoped subset;
 a narrow staleness re-check usually needs one or two. AUTHOR scouts produce
-items 1-6 plus each applicable item 7-8; they record `NOT-APPLICABLE` with a
-reason for either omitted item. Required report metadata, one verdict per
+items 1-6 plus each applicable item 7-9; they record `NOT-APPLICABLE` with a
+reason for any omitted item. Item 9 is never optional for a backlog AUTHOR
+scout: those scouts are the main source of `ALREADY-FIXED` and re-scope
+conclusions, so exempting them would exempt the case the rule exists for. Required report metadata, one verdict per
 prompt row, and terminal markers remain present regardless of the selected
 content deliverables.
 
@@ -340,16 +345,63 @@ Before firing the chunk, the controller must:
    evidence-backed disposition that changes the verdict;
 2. add the `SCOUTED STATE` block below;
 3. resolve ownership, ordering, and already-satisfied scope in the queue or
-   prompt; and
-4. ensure the resulting write-mode language satisfies the classifier-safe
+   prompt;
+4. review every proposed store-change record, spot-check its cited evidence,
+   mark it `ACCEPT` or `REJECT`, then apply only the `ACCEPT` records through
+   that reviewed proposal — never by ad-hoc edits alongside it; and
+5. ensure the resulting write-mode language satisfies the classifier-safe
    framing rule.
 
 `PROMPT-INVALID` requires re-planning and a new scoutable prompt.
-`ALREADY-FIXED` closes or re-scopes the backlog row instead of firing it.
+`ALREADY-FIXED` closes or re-scopes the backlog row instead of firing it — as a
+proposed write the controller executes, never one the scout performs.
 
 Scouting gates **unverified premises**, not the whole wave. Sibling chunks whose
 premises are already evidence-backed may fire in parallel with outstanding
 scouts.
+
+### Store writes — propose, never mutate
+
+**A scout never mutates the task store. Any store change its findings imply is
+listed as a proposal, with evidence, for the controller to review and apply.**
+This is a free-standing rule, not a consequence of the read-only constraint
+above: that constraint governs project files, and the store often lives outside
+the tree, so a scout with store access would otherwise be unconstrained.
+
+The proposal is a plain list of action records — one record per proposed change,
+carrying action, evidence, and controller-decision fields — not a script to
+execute blind:
+
+```text
+ACTIONS <chunk-or-batch> — proposed store changes. Controller applies; scout does not.
+<store-verb> <row-id> <argument>
+  EVIDENCE: <path:symbol, command + observed output, or commit>
+  ACCEPT | REJECT   <- controller marks each line before applying
+```
+
+Use the store's own command vocabulary so the controller can apply a line
+without translating it. Accept and reject line by line: rejecting one line never
+invalidates the others.
+
+Why it is worth the extra step: a scout verdict is an **inference**, and the
+store is where a wrong inference is silent. `ALREADY-FIXED` on a row that was
+only partially satisfied closes live work with no diff to notice and no failing
+test to catch it.
+
+Scope, stated once and used everywhere it is referenced: **any row this scout's
+findings would close, re-scope, re-point, or annotate.** A scout with no such
+findings writes `ACTIONS: NONE` — omission is not the same as nothing to do.
+
+Transport follows the report. Under a hard read-only dispatch, return the
+proposal inline with the report and let the controller persist it. Under a
+report-only writable dispatch, include it in the named report. Write a separate
+`ACTIONS` file only when that exact path is explicitly authorized.
+
+A batch scout emits one proposal covering every row it swept, grouped by row;
+each group contains proposed changes or `ACTIONS <row-id>: NONE`.
+
+If two scouts propose changes to the same row, the controller re-verifies
+current store and tree state before applying either, and applies at most one.
 
 ## `SCOUTED STATE` fold-in
 
@@ -591,7 +643,10 @@ Use this form for stale or mined backlogs. A store row is a lead, not ground
 truth. Starting from the controller's intent and acceptance stub, verify each
 row live, choose a backlog-verification verdict, then author the full follow-on
 worker prompt to the mandated, tier-calibrated template. Return a manifest with
-`id`, `verdict`, `evidence`, and `prompt path`.
+`id`, `verdict`, `evidence`, and `prompt path`, plus deliverable 9 for every row
+within the store-change scope defined under the fold-in gate. Verifying rows
+live is exactly what makes this form the largest source of store changes; it
+proposes them and never applies them.
 
 ### Recon or dossier scout
 
@@ -619,7 +674,12 @@ directory, for example:
 ```text
 docs-private/research/<lane>/BRIEF-<chunk>-SCOUT.md
 docs-private/research/<lane>/SCOUT-REPORT-<chunk>.md
+docs-private/research/<lane>/ACTIONS-<chunk>.txt
 ```
+
+The `ACTIONS` path applies only where a separate proposal file was authorized;
+otherwise the proposal lives inside the report. Either way, retain it after the
+controller applies it, as the record of which rows moved and on what evidence.
 
 Never leave the only verdict or refinement list in a temporary directory,
 terminal transcript, task pane, or chat message. Queue state may reference the

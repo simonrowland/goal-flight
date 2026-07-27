@@ -6,6 +6,32 @@ incremented when meaningful skill behaviour changes.
 
 ## [Unreleased]
 
+### Added
+
+- `protocols/scout.md`: store-write doctrine. A scout never mutates the task store; any row
+  its findings would close, re-scope, re-point, or annotate is listed as a proposal carrying
+  the evidence for each record, and the controller reviews, marks accept/reject per record,
+  and applies only accepted ones. Wired into the deliverable menu (item 9, never optional for
+  backlog AUTHOR scouts), the fold-in gate, the AUTHOR backlog form, and durable reports.
+  Rationale: a scout verdict is an inference, and the store is where a wrong one is silent —
+  a wrongly closed row leaves no diff and no failing test.
+
+### Fixed
+
+- The Python suite could not be run by directory. `scripts/goalflight_acp_run.py` invoked
+  `_ensure_acp_sdk_python()` at import, replacing the running interpreter; pytest importing
+  any module on that path lost its own process to an interpreter without pytest, and pytest's
+  output capture swallowed the failure — so `pytest tests/python` exited non-zero with zero
+  bytes on both streams. The re-exec now happens only under `__main__`.
+- Test modules are executed one per subprocess by a collection driver, preserving the
+  per-file isolation the shell runner relied on, so guarded script-style modules cannot
+  become zero-test greens.
+- Isolated test children inherited ambient runtime state (pidfile directory, live capacity
+  config, task store, steer variables); each module now gets its own temporary state.
+- `goalflight_usage.py`: a reader that exhausts its budget reports `timed out` instead of
+  rendering as an unavailable account, and the deep-capture budget is sized well above the
+  observed worst case.
+
 ## [1.3.0] — 2026-07-25
 
 ### Added
