@@ -482,6 +482,120 @@ host-specific helper or raw passthrough command, not `goalflight_dispatch.py
 on `grok-code` are bounced with a hint (composer can't drive web tools — use
 `grok-research`, or `--web-research-ok` to override a false positive).
 
+### Tier routing — scout-carried, class-based
+
+Frontier effort is the default for architecture-class work and a waste on
+mechanical work. Route by chunk class, and let the scout verdict carry the
+recommendation — the scout has just read the surface and is the best-positioned
+judge of whether a chunk is genuinely mechanical:
+
+- **CP/H class** (architecture, cross-cutting invariants, non-obvious
+  algorithms, anything whose failure is silent): codex at its strong default.
+- **Stitch class** (pin bumps, fixture moves, mechanical repairs, rename
+  sweeps, well-specified single-surface fixes): route to `grok-code`. A tightly
+  specified brief is the load-bearing input; grok's weaker self-review is
+  covered by the landing review chain regardless.
+- When in doubt, the scout says so and the chunk gets the strong tier —
+  misrouting a load-bearing chunk down costs more than misrouting a stitch up.
+
+Tier the BRIEF with the worker: a strong-tier brief explains judgment calls; a
+stitch brief is a spec with acceptance checks. Safety and process invariants
+(read-only defaults, `BLOCKED:` escalation, marker vocabulary) are never
+tier-gated.
+
+## Checkpointed dispatches — steer, don't re-dispatch
+
+Every fresh dispatch re-pays orientation (tens of thousands of tokens of
+AGENTS/plan/contract reads) before it writes a line. Where the transport keeps
+a session alive (ACP steers; any host with a working steer channel), prefer
+**one worker, checkpointed**, over a chain of fresh workers:
+
+1. **Design checkpoint** (CP/H-class chunks): the worker's first deliverable is
+   the design + contract — interfaces, invariants, acceptance checks, test
+   names — written to the lane's research directory. It emits
+   `USER-NEED: design ready for approval at <path>` and pauses. The controller
+   reviews (optionally with a read-only review flight), then steers back
+   approval or corrections. The worker builds only after approval, so a wrong
+   design costs a steer, not a build.
+2. **Landing checkpoint**: when the worker believes the chunk is done, it
+   reports `RESULT: gate=deferred-to-controller` and its focused-suite results,
+   then **exits** on a non-success terminal that carries the resume handle:
+
+   ```text
+   USER-NEED: landing checkpoint — focused suites green; full gate +
+   independent review deferred to controller; session <resume-id>; log <path>
+   ```
+
+   The gate-deferred line is a status record, never a terminal, and never a
+   success claim; the terminal marker stays within the worker-markers
+   vocabulary, and a `COMPLETE:` here would read as landable before the gate
+   ran. The controller then runs the full gate and the landing review chain
+   (the chunk-review floor: two or more concern-diverse legs, to a clean
+   round), and delivers findings as a resume-prompt revision. Revisions land
+   in a context that already holds the surface — no re-orientation, no fresh
+   ramp.
+
+This is also the correct home for the review work that used to run as in-loop
+independent fleets: the worker's own self-review stays; the independent floor
+runs at the checkpoint, controller-side. **Landing still requires both** the
+controller full gate green and the converged review floor — the checkpoint
+relocates the reviews, it does not discount them.
+
+Three delivery forms, in order of preference by situation:
+
+- **Session resume — the default for revisions where the transport has a
+  durable, addressable session.** The worker EXITS at the checkpoint; nothing
+  is parked, no lease is held, no liveness machinery sees an idle process.
+  When the controller has revisions, it resumes the recorded session with the
+  revision list as the new prompt — the context comes back from disk with the
+  surface already loaded. Verified form today: `codex exec resume
+  <session-id> "<revisions>"` on codex ≥0.144.5. The resume handle is the
+  session UUID codex prints at startup (also the rollout filename under the
+  dispatch home's `sessions/` tree); harvest it into the dispatch collateral
+  at checkpoint time — resolving it later via `--last` guesses, and guesses
+  resume the wrong session. Do not assume other agents can resume until their
+  form is verified; for them, use warm-steer or the fresh-dispatch fallback.
+  Condition: the session must not be near its context ceiling — resuming an
+  overfilled context buys back orientation but leaves no room to work, and a
+  compaction-mangled session is worse than a fresh one. Long noisy runs are
+  better re-dispatched with the durable artifact folded in.
+- **Warm steer** (ACP and other live steer channels): keep the worker alive
+  through the checkpoint only when the controller will respond within its own
+  watch cadence — a paused worker holds a capacity lease and looks idle to
+  liveness machinery. Never park workers overnight; exit-and-resume instead.
+- **Fresh dispatch + durable artifact** (fallback, and the only form that needs
+  no transport support): the design/contract artifact is written to the lane's
+  research directory at checkpoint time in every form, so falling back loses
+  the warm context but never the decision. The artifact, not the context, is
+  the part that must survive.
+
+**Session as lane cache.** On large domain codebases (hundreds of kLoC of
+physics/chemistry/engineering), the dominant per-dispatch cost is not the
+briefing reads — it is the worker loading enough of the domain surface to edit
+it safely. That understanding is exactly what a resumed session preserves, so
+consecutive chunks on the SAME surface may chain through one resumed session
+instead of each re-orienting from zero. Bounds, all load-bearing:
+
+- same lane and surface only — a session oriented on the RF kernel is not a
+  discount on the thermal solver, and scope bleed between chunks is a real
+  failure mode;
+- the session's memory of the tree goes stale exactly like a prompt does:
+  every resume prompt MUST open with a fresh `SCOUTED STATE` block (current
+  HEAD, what landed since, dirty paths) — the worker's recollection of the
+  tree is a lead to verify, not ground truth. Do not resume across a rebase,
+  reset, or another lane's force-land without a re-scout, and a dirty tree
+  left by a prior non-landed chunk is not a free cache — reconcile it first;
+- watch the fill: retire the session and start fresh well before the context
+  ceiling — a compaction-mangled session silently loses exactly the standing
+  rules you were reusing it for;
+- the session is a cache, never a store of record — durable artifacts and
+  markers are written per chunk as if each were a fresh dispatch.
+- Scout relationship: scouting verifies premises cheaply and authors the brief;
+  the design checkpoint is for chunks whose *shape* is still open once the
+  premises are true. A scout report whose DECISION EXTRACTION lines surface
+  implicit architecture choices is the trigger to promote a chunk from
+  plain-scouted to design-checkpointed.
+
 ### Composer-class routing: prefer grok over cursor (operator steer 2026-06-11)
 
 For composer-2.5-class coding work, default to the grok lane and route to

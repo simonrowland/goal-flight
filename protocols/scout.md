@@ -648,6 +648,18 @@ within the store-change scope defined under the fold-in gate. Verifying rows
 live is exactly what makes this form the largest source of store changes; it
 proposes them and never applies them.
 
+### Design-first promotion
+
+When a scout's DECISION EXTRACTION surfaces implicit architecture or shape
+choices the tree cannot settle, do not fold answers into the prompt and fire —
+promote the chunk to a **checkpointed dispatch** (see
+`protocols/dispatch-routing.md` §Checkpointed dispatches): the worker's first
+deliverable is the design + contract, the controller approves or steers before
+any build, and revisions prefer session resume where the transport supports
+it — otherwise a fresh dispatch with the design artifact folded in.
+Scouting establishes that the premises are true; the design checkpoint is for
+chunks whose shape is still open once they are.
+
 ### Recon or dossier scout
 
 Use this form before a design fork: build an option dossier with feasibility,

@@ -8,6 +8,29 @@ incremented when meaningful skill behaviour changes.
 
 ### Added
 
+- `scripts/goalflight_gate.py`: quiet gate wrapper — full test output to a log
+  file, summary/failures/log-path to the caller, exit code passed through. The
+  expensive part of a gate run is the output stream read back into an agent's
+  context; this spends it on disk instead.
+- Gate discipline in the worker brief template and `protocols/chunk-review.md`:
+  workers run focused suites only and report `RESULT: gate=deferred-to-controller`
+  before their marker-vocabulary terminal; the authoritative full gate is
+  controller-side at landing (worker sandbox runs skip tests silently, so a
+  worker-claimed green was never a landing). Independent review is now
+  explicitly controller-side only — the old worker-enclosed review phase is
+  retired, worker self-review stays uncapped but counts toward no review leg,
+  and the pre-commit minimum now names the controller full gate alongside the
+  two-leg review floor. Also: prefer codedb over grep sweeps for navigation.
+- `protocols/dispatch-routing.md`: tier routing (scout-carried CP/H vs stitch
+  class; stitch-class routes to grok) and checkpointed dispatches — design
+  checkpoint before build, landing checkpoint instead of exit, revisions
+  delivered by session resume (`codex exec resume <id> "<revisions>"`) so a
+  fix lands in a context that already holds the surface instead of re-paying
+  orientation; session-as-lane-cache bounds for large domain codebases.
+- `protocols/scout.md`: design-first promotion — a scout whose decision
+  extraction surfaces open shape choices promotes the chunk to a checkpointed
+  dispatch rather than folding answers and firing.
+
 - `protocols/scout.md`: store-write doctrine. A scout never mutates the task store; any row
   its findings would close, re-scope, re-point, or annotate is listed as a proposal carrying
   the evidence for each record, and the controller reviews, marks accept/reject per record,

@@ -44,7 +44,7 @@ Rules:
 - {{RULE_VALIDATION — e.g., validate facts before downstream claims}}
 - Only run safe read/diagnostic commands unless explicitly authorized to edit.
 - **Emit marker lines** when you hit ambiguous points, need user input, or finish. One marker per line in your output. Vocabulary (see goal-flight SKILL.md §Worker message passing): `STATUS: <update>` (informational), `RESULT: <key>=<value>` (structured output), `USER-NEED: <question>` (you can't decide without user input — stop and emit this; the controller will relay), `USER-CONFIRM: <action> [Y/N]` (irreversible op needs authorization), `BLOCKED: <reason>` (unrecoverable), `COMPLETE: <summary>` (task done). Emit a `STATUS:` line at least every ~8 minutes and before any long step; work incrementally so the controller sees live progress. The controller polls these from the tail file and relays `USER-NEED:` / `USER-CONFIRM:` to the user via the orchestrator's conversational surface. Don't guess past an ambiguous point — emit `USER-NEED:` and stop.
-- **End-of-convergence-attempt self-review.** When you think the goal is met (test gates green AND acceptance criteria satisfied), DO NOT yet emit `Goal complete: true`. First run the 7-category adversarial self-review from `prompts/executor-self-review.md` (INVARIANT GAP / SCOPE LEAK / MUTATION PURITY / BEHAVIOR DRIFT / DEAD CODE / CONTRACT LEAK / INTEGRITY), specialized to this chunk's project nouns and grep patterns, plus the universal null-hypothesis floor: state the null hypothesis (this change did NOT achieve its purpose / is a no-op / introduced a regression), actively try to CONFIRM it, and hand off only when observed before/after evidence REJECTS it. Severity-rank findings P0/P1/P2/P3. **Any P0 or P1 is a continue-iterating signal** — fix it in-loop (which becomes another plan/act/test cycle) and re-run the self-review pass. Emit `Goal complete: true` only when the self-review pass yields no P0/P1 and the null hypothesis is rejected by evidence, OR when every flagged P0/P1 was resolved in-loop with test gates still green and the null hypothesis is rejected by evidence. **Cadence**: ONE self-review pass per "I think I'm done" attempt — NOT after every micro-step. Typical: 1-3 passes total per chunk.
+- **End-of-convergence-attempt self-review.** When you think the goal is met (FOCUSED test gates green — the full gate is controller-side — AND acceptance criteria satisfied), DO NOT yet emit `Goal complete: true`. First run the 7-category adversarial self-review from `prompts/executor-self-review.md` (INVARIANT GAP / SCOPE LEAK / MUTATION PURITY / BEHAVIOR DRIFT / DEAD CODE / CONTRACT LEAK / INTEGRITY), specialized to this chunk's project nouns and grep patterns, plus the universal null-hypothesis floor: state the null hypothesis (this change did NOT achieve its purpose / is a no-op / introduced a regression), actively try to CONFIRM it, and hand off only when observed before/after evidence REJECTS it. Severity-rank findings P0/P1/P2/P3. **Any P0 or P1 is a continue-iterating signal** — fix it in-loop (which becomes another plan/act/test cycle) and re-run the self-review pass. Emit `Goal complete: true` only when the self-review pass yields no P0/P1 and the null hypothesis is rejected by evidence, OR when every flagged P0/P1 was resolved in-loop with test gates still green and the null hypothesis is rejected by evidence. **Cadence**: ONE self-review pass per "I think I'm done" attempt — NOT after every micro-step. Typical: 1-3 passes total per chunk.
 
 Acceptance criteria:
 - {{ACCEPT_INSPECT — what to inspect/read first, by file path}}
@@ -58,6 +58,31 @@ Acceptance criteria:
 Test gates (must remain true throughout):
 - {{TEST_GATE_1 — e.g., pytest tests/test_invariants.py stays green}}
 - {{TEST_GATE_2 — e.g., grep -c "forbidden_pattern" returns 0 in <paths>}}
+
+Gate discipline (token economy — these are standing rules, not suggestions):
+- **Run FOCUSED suites only** — the test files named in your gates above, plus
+  any test you add or touch. Do NOT run the project's full test gate in your
+  loop: it costs minutes of output read back into your context per iteration,
+  and your sandboxed run is not authoritative anyway (sandbox restrictions can
+  skip tests your run then silently omits). The controller re-runs the full
+  gate at landing; that run is the verdict.
+- In your final response, BEFORE the terminal marker, report the literal line
+  `RESULT: gate=deferred-to-controller` plus the focused-suite results you did
+  run. This is a status record, not a success claim — never claim full-gate
+  green. Your terminal marker stays per the marker vocabulary (`COMPLETE:` for
+  a finished chunk; the `USER-NEED:` landing-checkpoint form only when this
+  brief orders a landing checkpoint).
+- If the chunk genuinely requires a broader run (e.g., a conftest/harness
+  change), wrap it: `python3 <skill-root>/scripts/goalflight_gate.py -- <cmd>`
+  — full output goes to a log file; read the summary lines only.
+- **Navigation**: prefer `codedb_search` / `codedb_symbol` / `codedb_outline`
+  (MCP, already indexed) over `grep`/`find` sweeps and whole-file reads for
+  locating code. Read narrowly, only what you are about to edit.
+- **No internal independent review fleets.** Your end-of-attempt self-review
+  (below) stays, uncapped. Do NOT additionally spawn or simulate independent
+  refutation/review passes unless this brief explicitly orders them (reserved
+  for security/credential-class chunks): landing reviews are the controller's
+  chain, and duplicating them in-loop is pure token burn.
 
 If a review tool or required artifact is blocked or unavailable:
 - {{BLOCKER_PROTOCOL — e.g., write a NEEDS-RESOLUTION note to docs-private/<topic>-blockers.md, surface in Final response, do NOT attempt to bypass the gate}}

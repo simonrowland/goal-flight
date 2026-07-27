@@ -135,23 +135,26 @@ canonical subprocess shape avoids that ambiguity.
 
 ## Where the review runs
 
-Both worker and orchestrator can run the same bash-tail shape:
+**Independent review is controller-side.** The landing chain runs at least two
+independent, concern-diverse review legs to convergence after the worker hands
+off; findings return as inline fixes (P3-safe-easy), follow-up commits, or —
+on checkpointed dispatches — as a session-resume revision prompt (see
+`protocols/dispatch-routing.md` §Checkpointed dispatches).
 
-1. **Worker phase — review ENCLOSED in the goal loop (required whenever the
-   worker can spawn subprocesses)**: the goal-mode worker runs a
-   **review-to-green pass inside its own loop before handoff** — it does NOT
-   emit `COMPLETE` until its enclosed review is green (P0/P1/P2 resolved or
-   explicitly held). It spawns the bash-tail subprocess above, reads the
-   findings, applies P3-safe-easy inline, fixes/holds P0/P1/P2, and loops until
-   clean. Worker commit includes review evidence (the `codex-review.final.md`
-   path) in the commit message. Enclosing review in the loop is the NORM, not an
-   optimization — a converged chunk is a *reviewed* converged chunk.
-2. **Orchestrator phase (fallback / second-opinion)**: if the worker can't
-   run the review (e.g., the chunk's authorized scope doesn't include it,
-   or the dispatch transport doesn't let the worker spawn subprocesses
-   cleanly), the orchestrator runs the same bash-tail invocation
-   controller-direct after the worker's commit. Findings flow back as
-   inline fixes (P3-safe-easy) or follow-up commits (P0/P1/P2).
+The worker's own end-of-attempt self-review stays mandatory and uncapped, but
+it is **not a leg of the independent floor** — it is the worker checking
+itself, and the floor exists precisely because self-checks share the author's
+blind spots. Workers do not additionally spawn independent review subprocesses
+in-loop: that duplicated the controller chain at frontier-worker prices while
+counting toward nothing (an in-loop pass and a landing pass of the same
+reviewer find the same defects twice). The only exception is a brief that
+explicitly orders an enclosed review for a security/credential-class chunk;
+such an ordered pass supplements the floor, never replaces it.
+
+**Landing requires both**: (a) the controller-side full gate green (see §The
+landing gate is controller-side and quiet), and (b) the independent floor —
+two or more concern-diverse legs, converged. Worker self-review evidence and a
+`gate=deferred` marker satisfy neither.
 
 The non-canonical path (nested `codex exec` as ACP tool call without sandbox
 flags) is the one to avoid — that's what triggers the chunk-2/3a/12 blocking
@@ -265,15 +268,35 @@ review time, not dead time.
 | `./scripts/autoreview.sh` (complementary) | Diff-local pre-commit pass, parallel with gstack | Per chunk when orchestrator chooses |
 | Milestone review | `protocols/milestone-review.md` (gstack `/review` + concern-diverse sweep) | Default 5 chunks, `[milestone]`, or before push |
 
-Minimum before commit: focused tests green **and** at least **two independent,
-concern-diverse reviews** (the FLOOR, not the target; scale above it for
-complicated or high-risk work), run in parallel and iterated to convergence.
+Minimum before commit: **the controller-side full gate green** (quiet wrapper;
+a worker-claimed green does not count), focused-suite evidence from the worker,
+**and** at least **two independent, concern-diverse reviews** (the FLOOR, not
+the target; scale above it for complicated or high-risk work), run in parallel
+and iterated to convergence.
 A single reviewer no longer satisfies the floor; gstack `/review` is one leg, not the
 whole gate. **Every new bug class a review surfaces triggers the
 MINT-generalize loop** (`protocols/review-mining.md`): record the class predicate,
 backwards-sweep code + the saved review archive for more instances, and re-audit
 for it at milestones. Recording new bug shapes and re-auditing for them is part
 of the review cadence — not a separate optional step that lapses.
+
+## The landing gate is controller-side and quiet
+
+Workers run focused suites only and end with `GATE: DEFERRED-TO-CONTROLLER`
+(see the goal-prompt template): their sandboxed full-gate runs are both
+expensive (minutes of output read back into worker context per iteration) and
+non-authoritative (sandbox restrictions silently skip tests). The controller
+runs the authoritative full gate at landing — through the quiet wrapper so the
+stream stays on disk:
+
+```shell
+python3 <skill-root>/scripts/goalflight_gate.py            # default python suite
+python3 <skill-root>/scripts/goalflight_gate.py -- <cmd>   # any project gate
+```
+
+The wrapper passes the exit code through unchanged and prints only the summary,
+failures, and log path. A worker-claimed green without the controller-side run
+is not a landing.
 
 ## Fallback when both gstack and autoreview are absent
 
