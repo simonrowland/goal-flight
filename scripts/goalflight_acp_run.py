@@ -95,9 +95,6 @@ def _ensure_acp_sdk_python() -> None:
     if target is not None:
         os.execv(target, [target, *sys.argv])
 
-
-_ensure_acp_sdk_python()
-
 import goalflight_capacity
 import goalflight_ledger
 from goalflight_rate_pressure import RATE_LIMIT_PATTERNS
@@ -3305,4 +3302,5 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    _ensure_acp_sdk_python()
     raise SystemExit(main())

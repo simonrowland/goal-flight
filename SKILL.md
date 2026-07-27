@@ -278,18 +278,18 @@ Extended: `protocols/guidance-extended.md` §hard-invariants
 
 ## Gotchas from session traffic
 
-Mined from repo-local failure traffic (full evidence when present: `docs-private/research/goal-flight-gotchas-audit/addendum.md`):
+Evidence: `docs-private/research/goal-flight-gotchas-audit/addendum.md`.
 
-- **Stale skill body on resume.** Can't quote current Hard Invariants -> reload AGENTS -> host wrapper -> `SKILL.md` -> `commands/resume.md` before queue/status/git.
-- **Inline output flood.** Logs/diffs/JSONL/review transcripts -> files/context-mode; controller reads status JSON + TL;DR + `READY: <path>`, not raw streams.
-- **Nested review permission trap.** Don't run gstack/codex review as a nested ACP tool call inside the worker; use bash-tail read-only review (`--sandbox read-only`, `-c approval_policy=never`, `< /dev/null`).
+- **Stale skill body on resume.** Reload AGENTS -> host wrapper -> `SKILL.md` -> `commands/resume.md` before queue/status/git.
+- **Inline output flood.** Logs/diffs/JSONL/review transcripts -> files/context-mode; read status JSON + TL;DR + `READY: <path>`.
+- **Nested review permission trap.** Use bash-tail read-only review (`--sandbox read-only`, `-c approval_policy=never`, `< /dev/null`), not nested ACP.
 - **Stdin wedge.** `codex exec` reads stdin to EOF even with a positional prompt; missing `< /dev/null` on bash-tail review hangs.
-- **Command-form drift.** Deprecated/forbidden exec flags in old docs aren't precedent; adapter `forbidden_args` + the current canonical invocation win.
-- **Worker bypass.** A worker hitting a sandbox/permission/write/commit block returns `BLOCKED:`; alternate delivery paths are orchestrator-only.
-- **False worker death.** Don't discard work on PID/`comm`/one stale field; reconcile pid+start-time, status JSON, ledger, tail marker, output mtime, dirty tree.
-- **Quiet is not dead.** Network waits + child-process test runs show no controller-visible output/CPU; liveness needs terminal markers + process-tree + idle confirmation.
-- **Terminal marker not final until reconciled.** A live-but-quiet worker after COMPLETE/RESULT/READY must still pass idle/controller-dead logic.
-- **Rollover loses notifications, not state.** Background completion signals are best-effort/session-local; status JSON, ledgers, resume/reconcile are authoritative.
+- **Command-form drift.** Adapter `forbidden_args` + the current invocation override old docs.
+- **Worker bypass.** On sandbox/permission/write/commit block, return `BLOCKED:`; alternate delivery is orchestrator-only.
+- **False worker death.** Reconcile pid+start-time, status, ledger, tail marker, output mtime, and dirty tree before discarding work.
+- **Quiet is not dead.** Network waits and child tests may show no output/CPU; confirm terminal markers, process tree, and idle.
+- **Terminal marker not final until reconciled.** COMPLETE/RESULT/READY still needs idle/controller-dead logic.
+- **Rollover loses notifications, not state.** Status JSON, ledgers, resume/reconcile are authoritative.
 
 ## Capacity and rate limits
 

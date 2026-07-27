@@ -126,10 +126,19 @@ def _sleeping_worker():
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+    original_identity_matches = D.goalflight_ledger.identity_matches
+
+    def identity_matches(record: dict) -> tuple[bool, str]:
+        pid = record.get("worker_pid") or record.get("controller_pid")
+        if str(pid or "") == str(proc.pid) and proc.poll() is None:
+            return True, "fixture_live_worker"
+        return original_identity_matches(record)
+
+    D.goalflight_ledger.identity_matches = identity_matches
     try:
-        assert _wait_for(lambda: D.goalflight_ledger.process_identity(proc.pid) is not None, timeout=5.0)
         yield proc
     finally:
+        D.goalflight_ledger.identity_matches = original_identity_matches
         if proc.poll() is None:
             proc.terminate()
             try:

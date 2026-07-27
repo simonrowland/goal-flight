@@ -20,6 +20,12 @@ ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
+TEST_RUNTIME = tempfile.TemporaryDirectory(prefix="goal-flight-procedural-tests-")
+TEST_RUNTIME_ROOT = Path(TEST_RUNTIME.name)
+os.environ["GOALFLIGHT_CAPACITY_CONF"] = os.devnull
+os.environ["GOALFLIGHT_TASK_STORE_DIR"] = str(TEST_RUNTIME_ROOT / "task-store")
+os.environ["GOAL_FLIGHT_PIDFILE_DIR"] = str(TEST_RUNTIME_ROOT / "pids")
+
 REVIEW_JOB_TEST_TIMEOUT_S = "10"
 BLOCKED_CAPACITY_WAIT_S = "5"
 BLOCKED_CAPACITY_COOLDOWN_S = "300"
@@ -42,6 +48,7 @@ def run(
     env = os.environ.copy()
     env.pop("GOALFLIGHT_STEER_FILE", None)
     env.pop("GOAL_FLIGHT_PERMISSION_DIR", None)
+    env["GOALFLIGHT_CAPACITY_CONF"] = os.devnull
     if state_dir:
         env["GOALFLIGHT_STATE_DIR"] = str(state_dir)
     if extra_env:

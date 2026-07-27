@@ -32,7 +32,7 @@ def assert_true(name: str, condition: bool) -> None:
 
 
 def green_runner(_argv: list[str]) -> tuple[int, str, str]:
-    return 0, "logged_in: true\n", ""
+    return 0, '{"models":[{"id":"gpt-5"}]}\n', ""
 
 
 def _read_tool_calls(absolute_path: str = "/tmp/goal-flight/worktree/README.md") -> list[dict]:

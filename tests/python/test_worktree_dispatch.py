@@ -21,6 +21,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 
+TEST_RUNTIME = tempfile.TemporaryDirectory(prefix="goal-flight-worktree-tests-")
+TEST_RUNTIME_ROOT = Path(TEST_RUNTIME.name)
+os.environ["GOALFLIGHT_CAPACITY_CONF"] = os.devnull
+os.environ["GOALFLIGHT_TASK_STORE_DIR"] = str(TEST_RUNTIME_ROOT / "task-store")
+os.environ["GOAL_FLIGHT_PIDFILE_DIR"] = str(TEST_RUNTIME_ROOT / "pids")
+os.environ.pop("GOALFLIGHT_STEER_FILE", None)
+os.environ.pop("GOALFLIGHT_ALLOW_EXTERNAL_STEER_FILE", None)
+
 import goalflight_acp_run
 import goalflight_capacity
 import goalflight_doctor
@@ -279,7 +287,11 @@ def test_execute_parallel_docs_require_worktree_create() -> None:
     assert_true("parallel threshold documented", "`--parallel N` where `N >= 2`" in text)
     assert_true("sequential stays root", "Sequential dispatch" in text and "project root" in text)
     assert_true("HEAD-only base documented", "committed `HEAD`" in text)
-    assert_true("stash not prerequisite visibility", "stash or\ndiscard unrelated dirt" in text)
+    assert_true("preserve unrelated WIP", "Preserve unrelated WIP." in text)
+    assert_true(
+        "never move another owner's WIP",
+        "Never stash, move, or discard another owner's WIP" in text,
+    )
 
 
 class FakeProc:

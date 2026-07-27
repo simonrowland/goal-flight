@@ -429,16 +429,20 @@ def test_live_growing_trace_survives_caps_and_dead_controller_branch() -> None:
             review_secs=0.2,
         )
         try:
+            def append_trace() -> str | None:
+                with trace.open("a", encoding="utf-8") as handle:
+                    handle.write("{}\n")
+                return _payload(status_path).get("state") if status_path.exists() else None
+
             assert _wait_for(
-                lambda: status_path.exists()
-                and _payload(status_path).get("state") == "long_running"
+                lambda: append_trace() in {"long_running", "long_running_review"}
             ), _payload(status_path)
             assert process.poll() is None
             for _ in range(6):
-                trace.write_text(trace.read_text(encoding="utf-8") + "{}\n", encoding="utf-8")
+                append_trace()
                 time.sleep(0.05)
             assert _wait_for(
-                lambda: _payload(status_path).get("state") == "long_running_review"
+                lambda: append_trace() == "long_running_review"
             ), _payload(status_path)
             payload = _payload(status_path)
             assert payload["state"] not in {

@@ -82,7 +82,7 @@ if command -v python3 >/dev/null 2>&1 && [ -d "$REPO_ROOT/tests/python" ]; then
     [ -f "$test" ] || continue
     py="python3"
     case "$test" in
-      tests/python/test_acp_*.py)
+      tests/python/test_acp_*.py|tests/python/test_os_sandbox.py)
         py="$ACP_PY"
         ;;
     esac
