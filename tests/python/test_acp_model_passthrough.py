@@ -319,3 +319,27 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+def test_cursor_defaults_to_kimi_and_grok_is_one_flag_away():
+    """cursor's surface carries several vendors' models, so its default is a
+    routing choice: Kimi K3 by default, Grok via an explicit id, both on the
+    cursor account rather than each vendor's own service."""
+    import goalflight_acp_run as acp
+
+    # Ids are recorded for explicit use, NOT auto-applied: the no-default-model
+    # invariant (which retired the grok ACP pin) still holds for every agent.
+    assert acp._DEFAULT_STRONG_MODEL == {}
+    assert acp.CURSOR_KIMI_MODEL == "kimi-k3-high"
+    assert acp.CURSOR_GROK_MODEL == "cursor-grok-4.5-high"
+
+    # Position matters: cursor takes --model ahead of its subcommand.
+    argv = acp._acp_model_args("cursor", ["acp"], acp.CURSOR_KIMI_MODEL)
+    assert argv == ["--model", "kimi-k3-high", "acp"]
+    grok_argv = acp._acp_model_args("cursor", ["acp"], acp.CURSOR_GROK_MODEL)
+    assert grok_argv == ["--model", "cursor-grok-4.5-high", "acp"]
+
+    # The default must never leak onto agents that reject or ignore it.
+    assert "claude" not in acp._DEFAULT_STRONG_MODEL
+    assert "codex" not in acp._DEFAULT_STRONG_MODEL
+    assert "grok" not in acp._DEFAULT_STRONG_MODEL

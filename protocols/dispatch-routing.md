@@ -554,11 +554,30 @@ Three delivery forms, in order of preference by situation:
   ```shell
   CODEX_HOME=~/.goal-flight/dispatch-homes/<dispatch-id> \
     codex exec --sandbox workspace-write -c approval_policy=never \
-    resume <session-id> "<revisions>"
+    resume <session-id> "<revisions>" < /dev/null
   ```
 
-  Flags go BEFORE the `resume` subcommand — appended after it they are parsed
-  as part of the prompt. And the rollout lives under the PER-DISPATCH
+  **Resume survives seat rotation — do not pin seats to preserve it.** A codex
+  rollout is local transcript state, not server-side account-bound state, so
+  ANY valid codex auth can resume ANY rollout. Verified 2026-07-28: a session
+  created under one seat, resumed under a home authenticated as a different
+  seat, returned its full prior context and answered a question only the
+  earlier conversation could answer. The resume therefore needs the rollout
+  FILE, not the original seat — rebuild the dispatch home with the rollout
+  intact and whatever seat is currently healthy.
+
+  Seat continuity is worth a little, but only a little: staying on the same
+  seat may keep the vendor-side prompt cache warm (short-lived, on the order of
+  minutes), while a lost session costs the entire accumulated context. So
+  prefer the original seat when it is healthy and free, and never refuse,
+  block, or delay a resume to obtain it. Falling back to the current seat is
+  always correct.
+
+  Three mechanics, each of which fails in a way that looks like something else.
+  `< /dev/null` is mandatory: `codex exec` reads stdin to EOF even with a
+  positional prompt, so without it the resume hangs and reads as a stalled
+  worker. Flags go BEFORE the `resume` subcommand — appended after it they are
+  parsed as part of the prompt. And the rollout lives under the PER-DISPATCH
   `CODEX_HOME` (`~/.goal-flight/dispatch-homes/<dispatch-id>`), not the global
   `~/.codex` — a resume without that env var looks in the wrong home and
   cannot find the session. The resume handle is the session UUID codex prints
@@ -606,6 +625,39 @@ instead of each re-orienting from zero. Bounds, all load-bearing:
   premises are true. A scout report whose DECISION EXTRACTION lines surface
   implicit architecture choices is the trigger to promote a chunk from
   plain-scouted to design-checkpointed.
+
+### Cursor's agent surface: Kimi and Grok
+
+`cursor-agent` carries several vendors' models, so choosing one here is a
+routing decision rather than a strength claim. The two wanted on this lane:
+
+```shell
+--agent cursor --model kimi-k3-high            # Kimi K3
+--agent cursor --model cursor-grok-4.5-high    # Grok 4.5
+```
+
+Pass the id explicitly. goal-flight deliberately pins no default model for any
+agent — a pinned id goes stale and stops tracking the CLI's own default, which
+is why the grok ACP pin was retired; cursor is not exempt from that.
+
+The Kimi default is a **hosting** decision, and the reason must survive: Kimi's
+own CLI sends prompts and repository contents to its vendor's service, while
+cursor serves the same model family from US infrastructure under the cursor
+account. Same model, different jurisdiction for the data. Anyone tempted to
+"simplify" by routing Kimi work back through the direct CLI is trading that
+away, not removing a redundant hop.
+
+Model ids on this surface change without notice — confirm against
+`cursor-agent --list-models` before pinning a new one.
+
+**Untrusted-directory gotcha:** in a directory cursor has not been trusted for,
+`cursor-agent -p` stops for a trust decision and **exits 0 with no result** — a
+dispatcher scores that as success with an empty tail. Pass `-f` for dispatched
+runs.
+
+`--agent kimi` remains the DIRECT Kimi CLI (bash-tail transport, its own
+account and sandbox rules); it is a different route to the same model family,
+not an alias of the cursor lane.
 
 ### Composer-class routing: prefer grok over cursor (operator steer 2026-06-11)
 

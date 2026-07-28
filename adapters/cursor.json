@@ -11,14 +11,34 @@
   "support": {
     "controller": {
       "capability": "supported",
-      "evidence": ["survey: cursor-agent supports native agent acp and print mode", "repo: ACP runner maps cursor to cursor-agent acp", "smoke: cursor-agent print controller review completed on 2026-05-22"],
-      "readiness_requirements": ["binary", "version", "auth_optional", "safe_args", "status_contract"],
+      "evidence": [
+        "survey: cursor-agent supports native agent acp and print mode",
+        "repo: ACP runner maps cursor to cursor-agent acp",
+        "smoke: cursor-agent print controller review completed on 2026-05-22"
+      ],
+      "readiness_requirements": [
+        "binary",
+        "version",
+        "auth_optional",
+        "safe_args",
+        "status_contract"
+      ],
       "fallback": "worker_only"
     },
     "worker": {
       "capability": "supported",
-      "transport": ["acp", "cli_json", "tail_file"],
-      "readiness_requirements": ["binary", "version", "noninteractive", "status_contract", "safe_args"],
+      "transport": [
+        "acp",
+        "cli_json",
+        "tail_file"
+      ],
+      "readiness_requirements": [
+        "binary",
+        "version",
+        "noninteractive",
+        "status_contract",
+        "safe_args"
+      ],
       "fallback": "tail_file"
     }
   },
@@ -27,7 +47,11 @@
     "path_pattern": "$XDG_STATE_HOME/goal-flight/readiness/<agent>.json",
     "controller": "probe_required",
     "worker": "probe_required",
-    "last_probe_ids": ["cursor-agent-path", "cursor-agent-version", "cursor-agent-models"],
+    "last_probe_ids": [
+      "cursor-agent-path",
+      "cursor-agent-version",
+      "cursor-agent-models"
+    ],
     "updated_at": null
   },
   "live_gate": {
@@ -35,32 +59,150 @@
     "controller_allowed_expr": "support.controller.capability == supported && local_readiness.controller == ready",
     "worker_allowed_expr": "support.worker.capability == supported && local_readiness.worker == ready && requested_transport is verified",
     "default": "deny",
-    "support_status_enum": ["unsupported", "config_only", "probe_required", "candidate", "not_installed", "forbidden-arg", "failed", "blocked"],
-    "return_fields": ["allowed", "reason", "required_probe_ids", "blocked_fields", "safe_next_action", "live_controller_allowed", "live_worker_dispatch_allowed"]
+    "support_status_enum": [
+      "unsupported",
+      "config_only",
+      "probe_required",
+      "candidate",
+      "not_installed",
+      "forbidden-arg",
+      "failed",
+      "blocked"
+    ],
+    "return_fields": [
+      "allowed",
+      "reason",
+      "required_probe_ids",
+      "blocked_fields",
+      "safe_next_action",
+      "live_controller_allowed",
+      "live_worker_dispatch_allowed"
+    ]
   },
   "tool_name_map": {
-    "shell_exec": {"host_tools": ["cursor terminal", "cursor-agent"], "constraints": ["safe probes only"]},
-    "read_file": {"host_tools": ["workspace file read"], "constraints": ["workspace reads only"]},
-    "write_file": {"host_tools": ["workspace edit"], "constraints": ["authorized edit scope only"]},
-    "search": {"host_tools": ["workspace search"], "constraints": ["filtered search"]},
-    "delegate": {"host_tools": ["cursor-agent acp"], "constraints": ["requires live gate readiness"]},
-    "ask_user": {"host_tools": ["USER-NEED marker"], "constraints": ["block on ambiguity"]},
-    "plan_update": {"host_tools": ["status markers"], "constraints": ["controller tracks plan externally"]},
-    "memory_search": {"host_tools": ["repo resume notes", "Cursor chat state"], "constraints": ["repo files remain canonical"]},
-    "browser_ui": {"host_tools": ["Cursor browser affordances"], "constraints": ["only when available"]}
+    "shell_exec": {
+      "host_tools": [
+        "cursor terminal",
+        "cursor-agent"
+      ],
+      "constraints": [
+        "safe probes only"
+      ]
+    },
+    "read_file": {
+      "host_tools": [
+        "workspace file read"
+      ],
+      "constraints": [
+        "workspace reads only"
+      ]
+    },
+    "write_file": {
+      "host_tools": [
+        "workspace edit"
+      ],
+      "constraints": [
+        "authorized edit scope only"
+      ]
+    },
+    "search": {
+      "host_tools": [
+        "workspace search"
+      ],
+      "constraints": [
+        "filtered search"
+      ]
+    },
+    "delegate": {
+      "host_tools": [
+        "cursor-agent acp"
+      ],
+      "constraints": [
+        "requires live gate readiness"
+      ]
+    },
+    "ask_user": {
+      "host_tools": [
+        "USER-NEED marker"
+      ],
+      "constraints": [
+        "block on ambiguity"
+      ]
+    },
+    "plan_update": {
+      "host_tools": [
+        "status markers"
+      ],
+      "constraints": [
+        "controller tracks plan externally"
+      ]
+    },
+    "memory_search": {
+      "host_tools": [
+        "repo resume notes",
+        "Cursor chat state"
+      ],
+      "constraints": [
+        "repo files remain canonical"
+      ]
+    },
+    "browser_ui": {
+      "host_tools": [
+        "Cursor browser affordances"
+      ],
+      "constraints": [
+        "only when available"
+      ]
+    }
   },
   "invocation": {
-    "skill_triggers": ["goal-flight", "Cursor Agent worker"],
-    "commands": ["cursor-agent acp", "agent -p --output-format stream-json"],
+    "skill_triggers": [
+      "goal-flight",
+      "Cursor Agent worker"
+    ],
+    "commands": [
+      "cursor-agent acp",
+      "agent -p --output-format stream-json"
+    ],
     "exec": {
       "kind": "acp",
       "binary": "cursor-agent",
-      "args": ["acp"],
+      "args": [
+        "acp"
+      ],
       "arg_policy": {
-        "required_safe_args": ["acp"],
-        "forbidden_args": ["--yolo", "-y", "--dangerously-*", "--dangerously-bypass-approvals-and-sandbox", "--dangerously-skip-permissions", "--allow-dangerously-skip-permissions", "--always-approve", "--allow-all-tools", "--trust-all-tools", "--auto-approve", "--auto-accept", "--skip-permissions", "--no-sandbox", "--disable-sandbox", "--sandbox-disable"],
-        "requires_explicit_justification": ["--bare", "--auto", "--force", "--headless-with-approval-bypass"],
-        "reject_in": ["invocation", "probes", "generated_wrappers", "checked_in_configs"]
+        "required_safe_args": [
+          "acp"
+        ],
+        "forbidden_args": [
+          "--yolo",
+          "-y",
+          "--dangerously-*",
+          "--dangerously-bypass-approvals-and-sandbox",
+          "--dangerously-skip-permissions",
+          "--allow-dangerously-skip-permissions",
+          "--always-approve",
+          "--allow-all-tools",
+          "--trust-all-tools",
+          "--auto-approve",
+          "--auto-accept",
+          "--skip-permissions",
+          "--no-sandbox",
+          "--disable-sandbox",
+          "--sandbox-disable"
+        ],
+        "requires_explicit_justification": [
+          "--bare",
+          "--auto",
+          "--force",
+          "--headless-with-approval-bypass"
+        ],
+        "reject_in": [
+          "invocation",
+          "probes",
+          "generated_wrappers",
+          "checked_in_configs"
+        ]
       },
       "stdin": "prompt",
       "cwd_policy": "repo_required",
@@ -70,39 +212,104 @@
         "final_event": "ACP prompt result",
         "final_regex": "Goal complete: (true|false)",
         "exit_code_policy": "mapped",
-        "resume_args": ["--continue", "--resume"],
+        "resume_args": [
+          "--continue",
+          "--resume"
+        ],
         "goal_mode_eligible": true
       }
-    }
+    },
+    "model_notes": "Pass the model id explicitly; no default is pinned (a pinned id goes stale and stops tracking the CLI's own default - the reason the grok ACP pin was retired). Kimi: --model kimi-k3-high. Grok: --model cursor-grok-4.5-high. Kimi via cursor is a HOSTING choice, not a strength claim - Kimi's own CLI sends prompts and repo contents to its vendor's service, while cursor serves the same model family from US infrastructure. Ids are volatile: confirm against `cursor-agent --list-models`. In an untrusted directory `cursor-agent -p` stops for a trust decision and exits 0 with no result, so dispatched runs need -f."
   },
   "permission_surface": {
-    "file_reads": ["workspace files"],
-    "file_writes": ["authorized edit scope only"],
-    "shell": {"allowed_families": ["safe probes", "test runner"], "forbidden_families": ["permission bypass", "destructive reset", "raw web fetch"]},
-    "network": {"allowed": false, "user_gate": true, "notes": "Auth/model probes must stay non-consuming."},
-    "browser_ui": {"allowed": true, "user_gate": true, "notes": "Host availability varies."},
-    "memory_writes": {"allowed": false, "backend": "repo_files"},
-    "plugin_sandbox": {"mode": "narrow", "declared_permissions": ["workspace rules", "agent CLI"]},
+    "file_reads": [
+      "workspace files"
+    ],
+    "file_writes": [
+      "authorized edit scope only"
+    ],
+    "shell": {
+      "allowed_families": [
+        "safe probes",
+        "test runner"
+      ],
+      "forbidden_families": [
+        "permission bypass",
+        "destructive reset",
+        "raw web fetch"
+      ]
+    },
+    "network": {
+      "allowed": false,
+      "user_gate": true,
+      "notes": "Auth/model probes must stay non-consuming."
+    },
+    "browser_ui": {
+      "allowed": true,
+      "user_gate": true,
+      "notes": "Host availability varies."
+    },
+    "memory_writes": {
+      "allowed": false,
+      "backend": "repo_files"
+    },
+    "plugin_sandbox": {
+      "mode": "narrow",
+      "declared_permissions": [
+        "workspace rules",
+        "agent CLI"
+      ]
+    },
     "os_sandbox": {
-      "supported_profiles": ["off", "read-only", "workspace-write"],
+      "supported_profiles": [
+        "off",
+        "read-only",
+        "workspace-write"
+      ],
       "default_profile": "off",
       "implementation": "runner:sandbox-exec",
       "platform_supported_profiles": {
-        "darwin": ["off", "read-only", "workspace-write"],
-        "linux": ["off"],
-        "wsl": ["off"],
-        "windows": ["off"]
+        "darwin": [
+          "off",
+          "read-only",
+          "workspace-write"
+        ],
+        "linux": [
+          "off"
+        ],
+        "wsl": [
+          "off"
+        ],
+        "windows": [
+          "off"
+        ]
       },
       "notes": "Dispatch-level worker subprocess wrapper; not a cursor-agent flag. Permits temp and Cursor host-state writes while fencing project writes by profile."
     },
-    "auto_approve_detection": {"probes": ["cursor-args-scan"], "strict_fail": true},
-    "secrets": ["CURSOR_API_KEY"],
-    "irreversible_ops": ["git reset --hard", "force push", "rm -rf"]
+    "auto_approve_detection": {
+      "probes": [
+        "cursor-args-scan"
+      ],
+      "strict_fail": true
+    },
+    "secrets": [
+      "CURSOR_API_KEY"
+    ],
+    "irreversible_ops": [
+      "git reset --hard",
+      "force push",
+      "rm -rf"
+    ]
   },
   "memory_backend": {
     "canonical": "repo_files",
-    "repo_files": [".goal-flight/**"],
-    "host_native": {"role": "advisory", "backend": "Cursor chat and rules state"},
+    "repo_files": [
+      ".goal-flight/**"
+    ],
+    "host_native": {
+      "role": "advisory",
+      "backend": "Cursor chat and rules state"
+    },
     "mirror_writeback": false,
     "source_epoch": "goal-flight-0.5.0",
     "snapshot_id": "cursor-host-adapter",
@@ -115,7 +322,9 @@
       "configs/cursor/rules/goal-flight.mdc",
       "configs/cursor/skills/goal-flight/SKILL.md"
     ],
-    "generated_outputs": ["dist/cursor/"],
+    "generated_outputs": [
+      "dist/cursor/"
+    ],
     "install_actions": [
       {
         "kind": "copy_or_merge",
@@ -126,7 +335,9 @@
         "user_gate": true,
         "backup_path": "~/.cursor/AGENTS.md.goal-flight.bak",
         "rollback": "restore_backup",
-        "destinations": ["cursor-desktop-controller"]
+        "destinations": [
+          "cursor-desktop-controller"
+        ]
       },
       {
         "kind": "copy",
@@ -137,7 +348,9 @@
         "user_gate": true,
         "backup_path": "~/.cursor/skills/goal-flight/SKILL.md.goal-flight.bak",
         "rollback": "restore_backup",
-        "destinations": ["cursor-desktop-controller"]
+        "destinations": [
+          "cursor-desktop-controller"
+        ]
       },
       {
         "kind": "copy",
@@ -148,7 +361,9 @@
         "user_gate": true,
         "backup_path": "${GOALFLIGHT_TARGET_PROJECT}/.cursor/skills/goal-flight/SKILL.md.goal-flight.bak",
         "rollback": "restore_backup",
-        "destinations": ["cursor-project-controller"]
+        "destinations": [
+          "cursor-project-controller"
+        ]
       },
       {
         "kind": "copy",
@@ -159,7 +374,9 @@
         "user_gate": true,
         "backup_path": "~/.cursor/rules/goal-flight.mdc.goal-flight.bak",
         "rollback": "restore_backup",
-        "destinations": ["cursor-desktop-controller"]
+        "destinations": [
+          "cursor-desktop-controller"
+        ]
       },
       {
         "kind": "copy_or_merge",
@@ -170,7 +387,9 @@
         "user_gate": true,
         "backup_path": "${GOALFLIGHT_TARGET_PROJECT}/.cursor/AGENTS.md.goal-flight.bak",
         "rollback": "restore_backup",
-        "destinations": ["cursor-project-controller"]
+        "destinations": [
+          "cursor-project-controller"
+        ]
       },
       {
         "kind": "copy",
@@ -181,7 +400,9 @@
         "user_gate": true,
         "backup_path": "${GOALFLIGHT_TARGET_PROJECT}/.cursor/rules/goal-flight.mdc.goal-flight.bak",
         "rollback": "restore_backup",
-        "destinations": ["cursor-project-controller"]
+        "destinations": [
+          "cursor-project-controller"
+        ]
       },
       {
         "kind": "copy",
@@ -192,7 +413,9 @@
         "user_gate": true,
         "backup_path": "~/.agents/skills/goal-flight/SKILL.md.goal-flight.bak",
         "rollback": "restore_backup",
-        "destinations": ["cursor-agents-standard-controller"]
+        "destinations": [
+          "cursor-agents-standard-controller"
+        ]
       },
       {
         "kind": "link",
@@ -203,12 +426,27 @@
         "user_gate": true,
         "backup_path": "~/.cursor/skills/goal-flight.goal-flight.bak",
         "rollback": "restore_backup",
-        "destinations": ["cursor-claude-link-controller"]
+        "destinations": [
+          "cursor-claude-link-controller"
+        ]
       }
     ],
-    "plugin_manifest": {"supported": false, "path": null, "api_status": "probe_required"},
-    "mcp": {"required": false, "servers": ["context-mode"]},
-    "validation": ["json parse", "schema required groups", "candidate gate stays deny"]
+    "plugin_manifest": {
+      "supported": false,
+      "path": null,
+      "api_status": "probe_required"
+    },
+    "mcp": {
+      "required": false,
+      "servers": [
+        "context-mode"
+      ]
+    },
+    "validation": [
+      "json parse",
+      "schema required groups",
+      "candidate gate stays deny"
+    ]
   },
   "setup": {
     "controller_destinations": [
@@ -218,13 +456,17 @@
         "role": "controller",
         "surface": "desktop",
         "default": true,
-        "probe_ids": ["cursor-desktop-app"],
+        "probe_ids": [
+          "cursor-desktop-app"
+        ],
         "install_action_sources": [
           "configs/cursor/AGENTS.md",
           "configs/cursor/skills/goal-flight/SKILL.md",
           "configs/cursor/rules/goal-flight.mdc"
         ],
-        "commands": ["open -a Cursor <repo>"],
+        "commands": [
+          "open -a Cursor <repo>"
+        ],
         "paths": [
           "/Applications/Cursor.app",
           "~/.cursor/AGENTS.md",
@@ -245,7 +487,9 @@
           "configs/cursor/skills/goal-flight/SKILL.md",
           "configs/cursor/rules/goal-flight.mdc"
         ],
-        "commands": ["./setup.sh --cursor-project <project> --apply --yes"],
+        "commands": [
+          "./setup.sh --cursor-project <project> --apply --yes"
+        ],
         "paths": [
           "<project>/.cursor/AGENTS.md",
           "<project>/.cursor/skills/goal-flight/SKILL.md",
@@ -264,8 +508,12 @@
         "install_action_sources": [
           "configs/cursor/skills/goal-flight/SKILL.md"
         ],
-        "commands": ["./setup.sh --cursor-agents-standard --apply --yes"],
-        "paths": ["~/.agents/skills/goal-flight/SKILL.md"],
+        "commands": [
+          "./setup.sh --cursor-agents-standard --apply --yes"
+        ],
+        "paths": [
+          "~/.agents/skills/goal-flight/SKILL.md"
+        ],
         "requires_restart": true
       },
       {
@@ -278,7 +526,9 @@
         "install_action_sources": [
           "~/.claude/skills/goal-flight"
         ],
-        "commands": ["./setup.sh --cursor-link-claude --apply --yes"],
+        "commands": [
+          "./setup.sh --cursor-link-claude --apply --yes"
+        ],
         "paths": [
           "~/.claude/skills/goal-flight",
           "~/.cursor/skills/goal-flight"
@@ -293,10 +543,18 @@
         "role": "worker",
         "surface": "cli",
         "default": true,
-        "probe_ids": ["cursor-agent-path", "cursor-agent-version"],
+        "probe_ids": [
+          "cursor-agent-path",
+          "cursor-agent-version"
+        ],
         "install_action_sources": [],
-        "commands": ["cursor-agent acp"],
-        "paths": ["$(command -v cursor-agent)", "~/.local/bin/cursor-agent"],
+        "commands": [
+          "cursor-agent acp"
+        ],
+        "paths": [
+          "$(command -v cursor-agent)",
+          "~/.local/bin/cursor-agent"
+        ],
         "requires_restart": false
       }
     ],
@@ -313,8 +571,13 @@
           "cursor-cli-worker"
         ],
         "install_mode": "setup",
-        "commands": ["${GOALFLIGHT_PYTHON} scripts/register-context-mode-cursor.py --scope global"],
-        "paths": ["~/.cursor/mcp.json", "<project>/.cursor/mcp.json"]
+        "commands": [
+          "${GOALFLIGHT_PYTHON} scripts/register-context-mode-cursor.py --scope global"
+        ],
+        "paths": [
+          "~/.cursor/mcp.json",
+          "<project>/.cursor/mcp.json"
+        ]
       },
       {
         "id": "gstack",
@@ -328,8 +591,13 @@
           "cursor-cli-worker"
         ],
         "install_mode": "init_self_check",
-        "commands": ["test -d ~/.gstack/repos/gstack/.agents/skills"],
-        "paths": ["~/.gstack", "~/.cursor/skills/"]
+        "commands": [
+          "test -d ~/.gstack/repos/gstack/.agents/skills"
+        ],
+        "paths": [
+          "~/.gstack",
+          "~/.cursor/skills/"
+        ]
       },
       {
         "id": "gstack-browser",
@@ -343,7 +611,9 @@
           "cursor-cli-worker"
         ],
         "install_mode": "init_self_check",
-        "commands": ["test -x \"${GSTACK_BROWSE_BIN:-}\" || test -x ~/.claude/skills/gstack/browse/dist/browse || test -x ~/.gstack/repos/gstack/browse/dist/browse"],
+        "commands": [
+          "test -x \"${GSTACK_BROWSE_BIN:-}\" || test -x ~/.claude/skills/gstack/browse/dist/browse || test -x ~/.gstack/repos/gstack/browse/dist/browse"
+        ],
         "paths": [
           "~/.claude/skills/gstack/browse/dist/browse",
           "~/.gstack/repos/gstack/browse/dist/browse",
@@ -363,18 +633,83 @@
           "cursor-cli-worker"
         ],
         "install_mode": "init_self_check",
-        "commands": ["test -x scripts/autoreview.sh"],
-        "paths": ["scripts/autoreview.sh", "scripts/autoreview_claude_acp", "~/.cursor/skills/autoreview"]
+        "commands": [
+          "test -x scripts/autoreview.sh"
+        ],
+        "paths": [
+          "scripts/autoreview.sh",
+          "scripts/autoreview_claude_acp",
+          "~/.cursor/skills/autoreview"
+        ]
       }
     ]
   },
   "discovery": {
-    "budget": {"max_path_probes": 4, "max_version_probes": 1, "max_help_probes": 1, "max_ms_per_probe": 6000, "max_total_ms_per_agent": 20000, "max_total_ms_all_agents": 90000, "max_stdout_bytes_per_probe": 4096, "max_stderr_bytes_per_probe": 4096, "network_default": "deny", "model_consuming": "forbidden"},
+    "budget": {
+      "max_path_probes": 4,
+      "max_version_probes": 1,
+      "max_help_probes": 1,
+      "max_ms_per_probe": 6000,
+      "max_total_ms_per_agent": 20000,
+      "max_total_ms_all_agents": 90000,
+      "max_stdout_bytes_per_probe": 4096,
+      "max_stderr_bytes_per_probe": 4096,
+      "network_default": "deny",
+      "model_consuming": "forbidden"
+    },
     "probes": [
-      {"id": "cursor-desktop-app", "class": "path", "argv": ["sh", "-lc", "test -d /Applications/Cursor.app && printf /Applications/Cursor.app"], "safe_for_setup": true, "network": false, "model_consuming": false, "env_scrub": true},
-      {"id": "cursor-agent-path", "class": "path", "argv": ["sh", "-lc", "command -v cursor-agent || test -x ~/.local/bin/cursor-agent"], "safe_for_setup": true, "network": false, "model_consuming": false, "env_scrub": true},
-      {"id": "cursor-agent-version", "class": "version", "argv": ["sh", "-lc", "bin=$(command -v cursor-agent || printf '%s' \"$HOME/.local/bin/cursor-agent\"); test -x \"$bin\" && \"$bin\" --version"], "safe_for_setup": true, "network": false, "model_consuming": false, "env_scrub": true},
-      {"id": "cursor-agent-models", "class": "auth_status", "argv": ["sh", "-lc", "bin=$(command -v cursor-agent || printf '%s' \"$HOME/.local/bin/cursor-agent\"); test -x \"$bin\" && \"$bin\" models"], "safe_for_setup": true, "network": false, "model_consuming": false, "env_scrub": true}
+      {
+        "id": "cursor-desktop-app",
+        "class": "path",
+        "argv": [
+          "sh",
+          "-lc",
+          "test -d /Applications/Cursor.app && printf /Applications/Cursor.app"
+        ],
+        "safe_for_setup": true,
+        "network": false,
+        "model_consuming": false,
+        "env_scrub": true
+      },
+      {
+        "id": "cursor-agent-path",
+        "class": "path",
+        "argv": [
+          "sh",
+          "-lc",
+          "command -v cursor-agent || test -x ~/.local/bin/cursor-agent"
+        ],
+        "safe_for_setup": true,
+        "network": false,
+        "model_consuming": false,
+        "env_scrub": true
+      },
+      {
+        "id": "cursor-agent-version",
+        "class": "version",
+        "argv": [
+          "sh",
+          "-lc",
+          "bin=$(command -v cursor-agent || printf '%s' \"$HOME/.local/bin/cursor-agent\"); test -x \"$bin\" && \"$bin\" --version"
+        ],
+        "safe_for_setup": true,
+        "network": false,
+        "model_consuming": false,
+        "env_scrub": true
+      },
+      {
+        "id": "cursor-agent-models",
+        "class": "auth_status",
+        "argv": [
+          "sh",
+          "-lc",
+          "bin=$(command -v cursor-agent || printf '%s' \"$HOME/.local/bin/cursor-agent\"); test -x \"$bin\" && \"$bin\" models"
+        ],
+        "safe_for_setup": true,
+        "network": false,
+        "model_consuming": false,
+        "env_scrub": true
+      }
     ]
   },
   "status_contract": {
@@ -388,7 +723,12 @@
     "parser_type": "acp",
     "marker_namespace": "goalflight:<dispatch_id>:<transport>:<seq>",
     "stale_after_s": 180,
-    "terminal_states": ["complete", "failed", "blocked", "wedged"]
+    "terminal_states": [
+      "complete",
+      "failed",
+      "blocked",
+      "wedged"
+    ]
   },
   "host_projection": {}
 }

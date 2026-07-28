@@ -832,9 +832,24 @@ def _uses_session_model(agent: str) -> bool:
 # own CLI default applies (grok-4.5) — it writes reliably through ACP (validated
 # 2026-07-08 via a live grok-acp file-write smoke), retiring the old
 # grok-composer-2.5-fast ACP pin and auto-tracking grok's default forward.
-# cursor/opencode "strongest" is ambiguous, and claude-code-cli-acp must be
-# launched with no argv flags to stay in ACP server mode. An explicit --model
-# still passes through for any agent.
+# opencode "strongest" is ambiguous, and claude-code-cli-acp must be launched
+# with no argv flags to stay in ACP server mode. An explicit --model still
+# passes through for any agent.
+#
+# cursor resolves differently: its surface carries several vendors' models, so
+# the default is a ROUTING choice rather than a strength claim. Kimi K3 is the
+# default here for a HOSTING reason - Kimi's own CLI sends prompts and repo
+# contents to its vendor's service, while cursor serves the same model family
+# from US infrastructure under the cursor account. Same model, different
+# jurisdiction for the data; do not "simplify" this back to the direct CLI.
+# `--model cursor-grok-4.5-high` selects Grok on the same lane. Verify any id
+# against `cursor-agent --list-models` before pinning it - that list changes
+# without notice.
+# NOT auto-applied: pinning an id here would violate the no-default-model
+# invariant that retired the grok ACP pin in 2026-07 (pinned ids go stale and
+# stop tracking the CLI's own default). These are the ids to pass explicitly.
+CURSOR_KIMI_MODEL = "kimi-k3-high"
+CURSOR_GROK_MODEL = "cursor-grok-4.5-high"
 _DEFAULT_STRONG_MODEL: dict[str, str] = {}
 
 
