@@ -127,7 +127,16 @@ def main(argv: list[str] | None = None) -> int:
         log_dir.mkdir(parents=True, exist_ok=True)
         log_path = log_dir / f"gate-{int(time.time())}.log"
 
-    return run_gate(cmd or DEFAULT_CMD, log_path=log_path, tail=args.tail)
+    rc = run_gate(cmd or DEFAULT_CMD, log_path=log_path, tail=args.tail)
+    try:
+        import goalflight_messages
+    except Exception:
+        pass
+    else:
+        goalflight_messages.emit_controller_mail_notice(
+            project_root=Path.cwd(),
+        )
+    return rc
 
 
 if __name__ == "__main__":

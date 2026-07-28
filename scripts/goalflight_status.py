@@ -1778,7 +1778,7 @@ def render_text(payload: dict, limit: int) -> list[str]:
     ]
     mail = payload.get("mail") or {}
     if mail.get("hint"):
-        lines.extend(mail["hint"].splitlines())  # hint is multi-line (one detail row per need)
+        lines.extend(mail["hint"].splitlines())  # compatibility for caller-supplied payloads
     lines.extend(goalflight_quota_stuck.advisory_lines(payload.get("rate_pressure"), limit=limit))
     if payload.get("milestone"):
         lines.append(goalflight_milestone.format_line(payload["milestone"]))
@@ -2101,17 +2101,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     payload["milestone"] = _milestone_payload(project_root)
-    # Read-side mail check: piggyback the "you have mail" signal onto the status
-    # call every controller already runs. Computed fresh, fail-open, never stored.
-    # Scope it to THIS controller's own dispatches (the mailbox is machine-global),
-    # using the dispatch ids already in this scoped status view, plus the current
-    # project's task-store pseudo-inbox for resume/parallel/done nudges.
     _owned = {
         str(r.get("dispatch_id"))
         for r in payload["dispatch"].get("records", [])
         if r.get("dispatch_id")
     }
-    payload["mail"] = _mail_summary(_owned, project_root=project_root)
     _post_quota_advisories(payload)
 
     if args.json:
@@ -2120,6 +2114,17 @@ def main(argv: list[str] | None = None) -> int:
 
     for line in render_text(payload, args.limit):
         print(line)
+    # Read-side only: compute fresh after rendering, never add mail to the
+    # status JSON or worker-liveness payload.
+    try:
+        import goalflight_messages as _gm
+    except Exception:
+        pass
+    else:
+        _gm.emit_controller_mail_notice(
+            owned_dispatch_ids=_owned,
+            project_root=Path(project_root) if project_root else None,
+        )
     return 0
 
 

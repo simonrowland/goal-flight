@@ -92,7 +92,7 @@ def test_no_mail_empty_summary() -> None:
     assert_eq("empty inbox -> {}", out, {})
 
 
-def test_open_user_need_surfaces_hint_with_detail() -> None:
+def test_open_user_need_surfaces_body_free_notice() -> None:
     def body(msgs, fleet):
         M.post_message(
             dispatch_id="worker-7",
@@ -109,10 +109,13 @@ def test_open_user_need_surfaces_hint_with_detail() -> None:
     assert_eq("type", need.get("type"), "user_need")
     hint = out.get("hint") or ""
     assert_true("hint names the relay command", "goalflight_messages.py relay" in hint)
-    assert_true("hint carries the mail glyph", "\U0001f4ec" in hint)
-    # Enough DETAIL to follow up from a status check: the need text + id appear.
-    assert_true("hint shows the need text", "decision on the schema change" in hint)
-    assert_true("hint shows the dispatch id", "worker-7" in hint)
+    assert_eq(
+        "hint is the shared one-line notice",
+        hint,
+        "1 new mail; read: goalflight_messages.py relay --new (--ack to mark read)",
+    )
+    assert_true("hint does not print the body", "decision on the schema change" not in hint)
+    assert_true("hint does not print the dispatch id", "worker-7" not in hint)
 
 
 def test_headline_count_matches_default_relay_and_ack_lifecycle() -> None:
@@ -157,11 +160,7 @@ def test_mail_hint_sanitizes_newline_and_csi() -> None:
     hint = out["hint"]
     expected = r"needs FORGED\x1b[31m review"
     assert_eq("structured need text is inert", text, expected)
-    assert_eq(
-        "mail hint keeps one detail row",
-        hint.splitlines()[1:],
-        [f"    [worker-esc] user_need: {expected}"],
-    )
+    assert_eq("mail hint is one body-free line", hint.splitlines(), [M.format_mail_notice(1)])
     assert_true("mail hint has no raw CSI", "\x1b" not in hint)
 
 
@@ -218,7 +217,7 @@ def test_scoped_status_mail_includes_project_task_store_nudge() -> None:
     need = out["needs"][0]
     assert_true("task-store dispatch surfaced", need["dispatch_id"].startswith("task-store:"))
     assert_eq("nudge kind surfaced", need["type"], T.NEXT_NUDGE_KIND)
-    assert_true("hint shows nudge text", "2 parallel-ready (t-001, t-002) -> fan out?" in out["hint"])
+    assert_eq("task-store hint is body-free", out["hint"], M.format_mail_notice(1))
 
 
 def test_stale_task_store_parallel_nudge_stays_silent() -> None:
@@ -362,7 +361,7 @@ def test_post_message_fails_closed_on_non_regular_inbox() -> None:
 def main() -> None:
     tests = [
         test_no_mail_empty_summary,
-        test_open_user_need_surfaces_hint_with_detail,
+        test_open_user_need_surfaces_body_free_notice,
         test_headline_count_matches_default_relay_and_ack_lifecycle,
         test_mail_hint_sanitizes_newline_and_csi,
         test_ownership_filter_excludes_other_controllers_workers,

@@ -3860,6 +3860,14 @@ def _cmd_next(store: TaskStore, args: argparse.Namespace) -> int:
         print(_continue_directive(store, rows[0]), file=sys.stderr)
     for row in rows:
         print(f"{row['id']} {row.get('title', '')}")
+    try:
+        import goalflight_messages as gm
+    except Exception:
+        pass
+    else:
+        gm.emit_controller_mail_notice(
+            project_root=store.project_root,
+        )
     return 0
 
 
@@ -4033,6 +4041,14 @@ def _cmd_status(store: TaskStore, args: argparse.Namespace) -> int:
         return 0
     for row in rows:
         print(f"{row['id']} {row['derived_status']} {row.get('title', '')}")
+    try:
+        import goalflight_messages as gm
+    except Exception:
+        pass
+    else:
+        gm.emit_controller_mail_notice(
+            project_root=store.project_root,
+        )
     return 0
 
 

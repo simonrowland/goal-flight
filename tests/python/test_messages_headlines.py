@@ -249,3 +249,55 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+def _dated(ts, did="d", seq=1, body="body text"):
+    return {
+        "dispatch_id": did, "seq": seq, "type": "status", "ts": ts,
+        "payload": {"text": body},
+    }
+
+
+def test_bodies_are_withheld_for_stale_mail():
+    """An unacked envelope reappears on every check, so a backlog nobody acks
+    re-floods the reader forever. Bodies are for mail you have not seen."""
+    import datetime as _dt
+    now = _dt.datetime(2026, 7, 28, 12, 0, tzinfo=_dt.timezone.utc)
+    fresh_ts = (now - _dt.timedelta(hours=3)).isoformat()
+    stale_ts = (now - _dt.timedelta(days=5)).isoformat()
+
+    fresh, stale = msg.split_fresh_and_stale(
+        [_dated(fresh_ts, did="new"), _dated(stale_ts, did="old")],
+        now=now.timestamp(),
+    )
+    assert [e["dispatch_id"] for e in fresh] == ["new"]
+    assert [e["dispatch_id"] for e in stale] == ["old"]
+
+
+def test_boundary_is_inclusive_of_recent_mail():
+    import datetime as _dt
+    now = _dt.datetime(2026, 7, 28, 12, 0, tzinfo=_dt.timezone.utc)
+    just_inside = (now - _dt.timedelta(seconds=msg.STALE_BODY_AGE_S - 60)).isoformat()
+    just_outside = (now - _dt.timedelta(seconds=msg.STALE_BODY_AGE_S + 60)).isoformat()
+    fresh, stale = msg.split_fresh_and_stale(
+        [_dated(just_inside, did="in"), _dated(just_outside, did="out")],
+        now=now.timestamp(),
+    )
+    assert [e["dispatch_id"] for e in fresh] == ["in"]
+    assert [e["dispatch_id"] for e in stale] == ["out"]
+
+
+def test_undateable_mail_is_treated_as_fresh():
+    """Withholding a body we cannot date would silently hide NEW mail, which is
+    the worse failure. Fail toward showing it."""
+    for bad_ts in (None, "", "not-a-date", 12345):
+        env = {"dispatch_id": "x", "seq": 1, "type": "status", "payload": {"text": "b"}}
+        if bad_ts is not None:
+            env["ts"] = bad_ts
+        fresh, stale = msg.split_fresh_and_stale([env])
+        assert len(fresh) == 1 and not stale, bad_ts
+
+
+def test_naive_timestamps_do_not_crash_the_split():
+    fresh, stale = msg.split_fresh_and_stale([_dated("2026-07-28T12:00:00")])
+    assert len(fresh) + len(stale) == 1

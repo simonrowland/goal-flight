@@ -753,6 +753,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps(rows, indent=2))
     else:
         print(render_table(rows, now=now))
+        try:
+            import goalflight_messages
+        except Exception:
+            pass
+        else:
+            goalflight_messages.emit_controller_mail_notice(
+                project_root=Path.cwd(),
+            )
     return 0
 
 

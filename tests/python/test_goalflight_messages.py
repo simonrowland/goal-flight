@@ -368,7 +368,8 @@ def test_controller_summary_includes_quota_advisory() -> None:
         assert_true("advisory surfaced", summary["count"] == 1)
         assert_true("advisory dispatch id", summary["needs"][0]["dispatch_id"] == "controller-quota-advisory")
         assert_true("advisory kind", summary["needs"][0]["type"] == "advisory")
-        assert_true("advisory hint", "openai quota exhausted" in summary["hint"])
+        assert_true("advisory hint is body-free", "openai quota exhausted" not in summary["hint"])
+        assert_true("advisory hint has relay command", "goalflight_messages.py relay --new" in summary["hint"])
 
 
 def test_mcp_stdio_tools_call() -> None:

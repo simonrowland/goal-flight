@@ -9,6 +9,7 @@ import contextlib
 import datetime as dt
 import json
 import os
+import re
 import subprocess
 import uuid
 from pathlib import Path
@@ -23,6 +24,8 @@ ACK_CURSOR_FILE = ".ack-cursor.json"
 DEFAULT_RELAY_ITEM_LIMIT = 20
 DEFAULT_RELAY_BYTE_LIMIT = 4096
 TASKLESS_TERMINAL_STALE_AFTER = dt.timedelta(hours=24)
+PROJECT_MAIL_ALIASES_ENV = "GOALFLIGHT_PROJECT_MAIL_ALIASES"
+MIN_DERIVED_PROJECT_ALIAS_LEN = 4
 
 sys.path.insert(0, str(SCRIPT_DIR))
 
@@ -811,17 +814,104 @@ def _task_store_dispatch_id(project_root: Path) -> str | None:
         return None
 
 
-def _owned_with_task_store(
+def _canonical_project_root(project_root: Path) -> Path:
+    """Resolve linked worktrees to the main repository root when possible."""
+    root = Path(project_root).resolve()
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--git-common-dir"],
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            common = Path(result.stdout.strip())
+            if not common.is_absolute():
+                common = (root / common).resolve()
+            return common.parent
+    except Exception:
+        pass
+    return root
+
+
+def _normalize_project_mail_alias(value: object) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "-", str(value or "")).strip("-")
+
+
+def _project_mailbox_aliases(project_root: Path) -> set[str]:
+    """Address aliases: basename, safe leading segment, and explicit overrides."""
+    root = _canonical_project_root(project_root)
+    basename = _normalize_project_mail_alias(root.name) or "project"
+    aliases = {basename}
+    leading = basename.split("-", 1)[0]
+    if leading != basename and len(leading) >= MIN_DERIVED_PROJECT_ALIAS_LEN:
+        aliases.add(leading)
+    for raw in os.environ.get(PROJECT_MAIL_ALIASES_ENV, "").split(","):
+        alias = _normalize_project_mail_alias(raw)
+        if alias:
+            aliases.add(alias)
+    return aliases
+
+
+def _dispatch_id_addresses_project(dispatch_id: str, project_aliases: set[str]) -> bool:
+    """Whether an inbox id carries one of this project's address aliases.
+
+    Addressing rule: an alias must be the whole inbox id, its leading
+    ``<alias>-`` token, or its trailing ``-<alias>`` token. Aliases comprise the
+    canonical repository basename, a derived leading hyphen segment only when
+    it is at least four characters, and optional comma-separated
+    ``GOALFLIGHT_PROJECT_MAIL_ALIASES`` overrides. Edge matching supports both
+    ``pm2-controller-note`` and ``controller-note-pm2`` without treating an
+    arbitrary substring as an address. We use inbox ids rather than envelope
+    bodies so scoped readers select paths before opening them; this preserves
+    the no-cross-project-flood and corrupt-unrelated-inbox guarantees.
+    """
+    candidate = dispatch_id.casefold()
+    aliases = {alias.casefold() for alias in project_aliases if alias}
+    return any(
+        candidate == alias
+        or candidate.startswith(f"{alias}-")
+        or candidate.endswith(f"-{alias}")
+        for alias in aliases
+    )
+
+
+def _project_addressed_dispatch_ids(
+    project_root: Path,
+    *,
+    messages_dir: Path,
+    fleet_dir: Path | None,
+) -> set[str]:
+    aliases = _project_mailbox_aliases(project_root)
+    return {
+        path.stem
+        for path in collect_inbox_paths(messages_dir, fleet_dir)
+        if _dispatch_id_addresses_project(path.stem, aliases)
+    }
+
+
+def _owned_with_project_mail(
     owned_dispatch_ids: set[str] | None,
     task_store_project_root: Path | None,
+    *,
+    messages_dir: Path,
+    fleet_dir: Path | None,
 ) -> set[str] | None:
-    if owned_dispatch_ids is None or task_store_project_root is None:
-        return owned_dispatch_ids
-    dispatch_id = _task_store_dispatch_id(task_store_project_root)
-    if not dispatch_id:
+    if owned_dispatch_ids is None:
         return owned_dispatch_ids
     scoped = set(owned_dispatch_ids)
-    scoped.add(dispatch_id)
+    if task_store_project_root is not None:
+        dispatch_id = _task_store_dispatch_id(task_store_project_root)
+        if dispatch_id:
+            scoped.add(dispatch_id)
+        scoped.update(
+            _project_addressed_dispatch_ids(
+                task_store_project_root,
+                messages_dir=messages_dir,
+                fleet_dir=fleet_dir,
+            )
+        )
     return scoped
 
 
@@ -1008,24 +1098,12 @@ def _filter_task_store_nudges(items: list[dict], task_store_project_root: Path |
     ]
 
 
-def _format_mail_hint(items: list[dict]) -> str:
-    """Multi-line controller hint: a header plus one detail line per open item,
-    each with the dispatch id, kind, and a clipped text so the controller can
-    follow up straight from a status check."""
-    head = (
-        f"\U0001f4ec mail: {len(items)} open unread item(s) from your worker(s)/task store "
-        "- read headlines: goalflight_messages.py relay --new (--ack to mark read)"
+def format_mail_notice(count: int) -> str:
+    """One body-free notice shared by every controller entry point."""
+    return (
+        f"{count} new mail; read: "
+        "goalflight_messages.py relay --new (--ack to mark read)"
     )
-    lines = [head]
-    for it in items[:5]:
-        lines.append(
-            f"    [{sanitize_display(it.get('dispatch_id') or '?', limit=64)}] "
-            f"{sanitize_display(it.get('type') or 'user_need', limit=32)}: "
-            f"{sanitize_display(it.get('text') or '', limit=120)}"
-        )
-    if len(items) > 5:
-        lines.append(f"    (+{len(items) - 5} more)")
-    return "\n".join(lines)
 
 
 def controller_mail_summary(
@@ -1039,24 +1117,30 @@ def controller_mail_summary(
     """Structured "you have mail" summary for a controller's status output.
 
     Builds the inbox aggregate and returns OPEN user-needs (user_need /
-    user_confirm / blocked) plus controller quota advisories with enough detail
-    to act on from a status check.
+    user_confirm / blocked) plus controller quota advisories.
 
     The mailbox is machine-global (shared across controllers), so when
     ``owned_dispatch_ids`` is provided only needs from THOSE dispatches — the
-    controller's own workers — plus ``task_store_project_root``'s pseudo-inbox are
-    surfaced; a controller must never see another controller's workers' needs.
-    ``None`` means no ownership filter (e.g. an all-projects view). Returns ``{}``
-    when there is nothing to show.
+    controller's own workers — plus ``task_store_project_root``'s pseudo-inbox
+    and explicitly project-addressed inbox ids are surfaced; a controller must
+    never see another controller's workers' needs. ``None`` means no ownership
+    filter (e.g. an all-projects view). Returns ``{}`` when there is nothing to
+    show.
     """
     # Read ONLY this controller's own inboxes: an unrelated controller's corrupt or
     # large inbox can then neither suppress (a parse error elsewhere) nor slow this
     # scoped status call. build_aggregate is also per-inbox tolerant as a backstop.
-    scoped_dispatch_ids = _owned_with_task_store(owned_dispatch_ids, task_store_project_root)
     resolved_messages_dir = messages_dir or default_messages_dir()
+    resolved_fleet_dir = fleet_dir if fleet_dir is not None else default_fleet_dir()
+    scoped_dispatch_ids = _owned_with_project_mail(
+        owned_dispatch_ids,
+        task_store_project_root,
+        messages_dir=resolved_messages_dir,
+        fleet_dir=resolved_fleet_dir,
+    )
     aggregate = build_aggregate(
         messages_dir=resolved_messages_dir,
-        fleet_dir=fleet_dir if fleet_dir is not None else default_fleet_dir(),
+        fleet_dir=resolved_fleet_dir,
         dispatch_ids=scoped_dispatch_ids,
     )
     needs = list(aggregate.get("open_user_needs") or [])
@@ -1088,7 +1172,45 @@ def controller_mail_summary(
         }
         for n in needs
     ]
-    return {"count": len(items), "needs": items, "hint": _format_mail_hint(items)}
+    return {"count": len(items), "needs": items, "hint": format_mail_notice(len(items))}
+
+
+def emit_controller_mail_notice(
+    *,
+    owned_dispatch_ids: set[str] | None = None,
+    project_root: Path | None = None,
+    messages_dir: Path | None = None,
+    fleet_dir: Path | None = None,
+    stream=None,
+) -> str | None:
+    """Compute and print the shared one-line mail notice, always fail-open."""
+    try:
+        resolved_owned_dispatch_ids = owned_dispatch_ids
+        if resolved_owned_dispatch_ids is None:
+            resolved_owned_dispatch_ids = (
+                _project_dispatch_ids(_canonical_project_root(project_root))
+                if project_root is not None
+                else set()
+            )
+        summary = controller_mail_summary(
+            owned_dispatch_ids=resolved_owned_dispatch_ids,
+            task_store_project_root=project_root,
+            messages_dir=messages_dir,
+            fleet_dir=fleet_dir,
+        )
+        count = int(summary.get("count") or 0)
+        if count < 1:
+            return None
+        notice = format_mail_notice(count)
+        # STDERR by default: several callers' stdout is a DATA CONTRACT that
+        # other tooling parses (goalflight_task.py `next` yields the task list;
+        # `--json` modes emit documents). An advisory line on stdout corrupts
+        # those consumers - test_next_frontier caught exactly that. Notices are
+        # advice; stdout is data.
+        print(notice, file=sys.stderr if stream is None else stream)
+        return notice
+    except Exception:
+        return None
 
 
 def _mail_scope(*, all_projects: bool) -> tuple[Path | None, set[str] | None]:
@@ -1129,7 +1251,12 @@ def cmd_ack(args: argparse.Namespace) -> int:
         print(f"ack: {exc}", file=sys.stderr)
         return 2
     assert project_root is not None and owned_dispatch_ids is not None
-    scoped_dispatch_ids = _owned_with_task_store(owned_dispatch_ids, project_root) or set()
+    scoped_dispatch_ids = _owned_with_project_mail(
+        owned_dispatch_ids,
+        project_root,
+        messages_dir=args.messages_dir,
+        fleet_dir=args.fleet_dir,
+    ) or set()
     if args.dispatch_id and args.dispatch_id not in scoped_dispatch_ids:
         print(f"ack: {args.dispatch_id} is not owned by the current project", file=sys.stderr)
         return 2
@@ -1161,6 +1288,49 @@ def cmd_ack(args: argparse.Namespace) -> int:
     label = "ack --stale" if args.stale else f"ack {args.dispatch_id}"
     print(f"{label}: {dispatch_count} dispatch(es), {item_count} open item(s) acknowledged")
     return 0
+
+
+# Bodies are for mail you have not seen yet. An unacked envelope reappears on
+# every check, so a backlog that nobody acks re-floods the reader indefinitely -
+# the headline listing fixed the per-message cost but not the per-check one.
+# Anything older than this degrades to a headline even under --bodies.
+STALE_BODY_AGE_S = 2 * 24 * 3600
+
+
+def _envelope_age_s(envelope: dict, *, now: float | None = None) -> float | None:
+    """Seconds since the envelope was posted, or None when unparseable."""
+    ts = envelope.get("ts") if isinstance(envelope, dict) else None
+    if not isinstance(ts, str) or not ts:
+        return None
+    try:
+        posted = dt.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if posted.tzinfo is None:
+        posted = posted.replace(tzinfo=dt.timezone.utc)
+    current = (
+        dt.datetime.now(dt.timezone.utc)
+        if now is None
+        else dt.datetime.fromtimestamp(now, dt.timezone.utc)
+    )
+    return (current - posted).total_seconds()
+
+
+def split_fresh_and_stale(
+    envelopes: list, *, max_age_s: float = STALE_BODY_AGE_S, now: float | None = None
+) -> tuple[list, list]:
+    """Partition envelopes into (fresh enough for bodies, headline-only).
+
+    An envelope with an unreadable timestamp is treated as FRESH: withholding a
+    body we cannot date would silently hide new mail, which is the worse error.
+    """
+    fresh, stale = [], []
+    for env in envelopes:
+        if not isinstance(env, dict):
+            continue
+        age = _envelope_age_s(env, now=now)
+        (stale if age is not None and age > max_age_s else fresh).append(env)
+    return fresh, stale
 
 
 HEADLINE_MAX = 96
@@ -1258,7 +1428,12 @@ def cmd_relay(args: argparse.Namespace) -> int:
         print(f"relay: {exc}", file=sys.stderr)
         return 2
     if args.new:
-        scoped_dispatch_ids = _owned_with_task_store(owned_dispatch_ids, project_root)
+        scoped_dispatch_ids = _owned_with_project_mail(
+            owned_dispatch_ids,
+            project_root,
+            messages_dir=args.messages_dir,
+            fleet_dir=args.fleet_dir,
+        )
         paths = collect_inbox_paths(
             args.messages_dir,
             args.fleet_dir,
@@ -1272,7 +1447,15 @@ def cmd_relay(args: argparse.Namespace) -> int:
             tolerate_errors=True,
         )
         if getattr(args, "bodies", False):
-            print(json.dumps(envelopes))
+            fresh, stale = split_fresh_and_stale(envelopes)
+            print(json.dumps(fresh))
+            if stale:
+                print(
+                    f"{len(stale)} envelope(s) older than "
+                    f"{int(STALE_BODY_AGE_S // 3600)}h shown as headlines only:"
+                )
+                print(format_envelope_headlines(stale))
+                print("read one in full with: `read --dispatch-id <id>`")
         else:
             headlines = format_envelope_headlines(envelopes)
             if headlines:

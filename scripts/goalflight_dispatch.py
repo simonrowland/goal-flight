@@ -2195,6 +2195,7 @@ def _assert_no_nonterminal_codex_resume_child(
     home: Path,
     session_id: str,
     exclude_dispatch_id: str | None = None,
+    reconcile_dead_preclaim: bool = False,
 ) -> None:
     for candidate in goalflight_ledger.read_records():
         candidate_id = candidate.get("dispatch_id")
@@ -2227,6 +2228,29 @@ def _assert_no_nonterminal_codex_resume_child(
             and isinstance(candidate_home, str)
             and Path(candidate_home).expanduser().resolve(strict=False) == home
         ):
+            identity_matches, identity_reason = goalflight_ledger.identity_matches(
+                candidate
+            )
+            confirmed_dead_preclaim = (
+                candidate.get("state") == "waiting_capacity"
+                and not candidate.get("worker_pid")
+                and not identity_matches
+                and (
+                    identity_reason == "dead"
+                    or str(identity_reason).startswith("pid_reused_")
+                )
+                and isinstance(candidate_id, str)
+                and bool(candidate_id)
+            )
+            if confirmed_dead_preclaim:
+                if reconcile_dead_preclaim:
+                    _finish_ledger(
+                        candidate_id,
+                        "failed",
+                        f"stale_codex_resume_preclaim:{identity_reason}",
+                        worker_still_alive=False,
+                    )
+                continue
             raise DispatchUsageError(
                 f"dispatch {dispatch_id} already has non-terminal resume child "
                 f"{candidate_id} for session {session_id}"
@@ -2254,6 +2278,7 @@ def _validate_codex_resume_source(
     dispatch_id: str,
     *,
     exclude_dispatch_id: str | None = None,
+    reconcile_dead_preclaim: bool = False,
 ) -> tuple[dict, Path, str, str]:
     record = _find_dispatch_record(dispatch_id)
     if record is None:
@@ -2281,8 +2306,14 @@ def _validate_codex_resume_source(
         home=home,
         session_id=session_id,
         exclude_dispatch_id=exclude_dispatch_id,
+        reconcile_dead_preclaim=reconcile_dead_preclaim,
     )
     return record, home, session_id, home_owner_dispatch_id
+
+
+_CODEX_RESUME_CLAIM_VALIDATED_HOOK = None
+_CODEX_RESUME_DURABLE_CLAIM_HOOK = None
+_CODEX_RESUME_BEFORE_REPLACE_HOOK = None
 
 
 def _codex_resume_lock_path(home: Path, session_id: str) -> Path:
@@ -2321,6 +2352,7 @@ def _revalidate_codex_resume_claim(
         _validate_codex_resume_source(
             parent_dispatch_id,
             exclude_dispatch_id=exclude_dispatch_id,
+            reconcile_dead_preclaim=True,
         )
     )
     if (
@@ -2369,6 +2401,12 @@ def _rebuild_codex_resume_home(
     saved_home_id = f"resume-save-{uuid.uuid4().hex}"
     failed_home_id = f"resume-failed-{uuid.uuid4().hex}"
     saved_home = root / saved_home_id
+    if _CODEX_RESUME_BEFORE_REPLACE_HOOK is not None:
+        _CODEX_RESUME_BEFORE_REPLACE_HOOK(
+            expected_home,
+            session_id,
+            parent_dispatch_id,
+        )
     expected_home.replace(saved_home)
     try:
         rebuilt_home, effective_account = resolve_codex_home(
@@ -8215,6 +8253,12 @@ def main(argv: list[str] | None = None) -> int:
                     expected_session_id=args.codex_session_id,
                     expected_home_owner_dispatch_id=codex_home_owner_dispatch_id,
                 )
+                if _CODEX_RESUME_CLAIM_VALIDATED_HOOK is not None:
+                    _CODEX_RESUME_CLAIM_VALIDATED_HOOK(
+                        resume_home,
+                        args.codex_session_id,
+                        args.parent_dispatch_id,
+                    )
                 _record_ledger(
                     args,
                     project_root=project_root,
@@ -8225,6 +8269,12 @@ def main(argv: list[str] | None = None) -> int:
                     worker_pid=None,
                     state="waiting_capacity",
                 )
+                if _CODEX_RESUME_DURABLE_CLAIM_HOOK is not None:
+                    _CODEX_RESUME_DURABLE_CLAIM_HOOK(
+                        resume_home,
+                        args.codex_session_id,
+                        args.dispatch_id,
+                    )
         else:
             _record_ledger(
                 args,

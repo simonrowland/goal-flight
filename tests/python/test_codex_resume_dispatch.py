@@ -4,9 +4,10 @@
 from __future__ import annotations
 
 import json
+import multiprocessing as mp
 import os
+import queue
 import sys
-import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -163,6 +164,72 @@ def _stub_detached_runtime(
 
     monkeypatch.setattr(D, "_spawn_daemonized_process", spawn)
     return spawn_calls, leases
+
+
+def _stub_forked_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    home: Path,
+) -> Path:
+    """Use real ledger/home code while replacing provider and process launches."""
+    markers = tmp_path / "process-markers"
+    markers.mkdir(exist_ok=True)
+    monkeypatch.setattr(D, "_reap_quota_stuck_before_bash_launch", lambda: None)
+
+    def acquire(*_args, **_kwargs) -> str:
+        (markers / f"{os.getpid()}-capacity").write_text("acquired")
+        return f"lease-{os.getpid()}"
+
+    def resolve(*_args, **_kwargs) -> tuple[str, str]:
+        home.mkdir(parents=True, exist_ok=True)
+        (home / "auth.json").write_text("new-seat", encoding="utf-8")
+        return str(home), "new-seat"
+
+    def spawn(argv: list[str], **kwargs) -> int:
+        label = kwargs["label"]
+        (markers / f"{os.getpid()}-{label}").write_text(
+            json.dumps(list(argv)),
+            encoding="utf-8",
+        )
+        return 500_000 + (os.getpid() % 10_000) + len(list(markers.iterdir()))
+
+    monkeypatch.setattr(D, "_acquire_capacity", acquire)
+    monkeypatch.setattr(D, "resolve_codex_home", resolve)
+    monkeypatch.setattr(D, "_spawn_daemonized_process", spawn)
+    monkeypatch.setattr(D, "_mark_queue_claim_launch_started", lambda _args: None)
+    monkeypatch.setattr(
+        D, "_mark_queue_claim_worker_spawn_intent", lambda _args: None
+    )
+    monkeypatch.setattr(
+        D, "_mark_queue_claim_worker_spawned", lambda _args, _pid: None
+    )
+    monkeypatch.setattr(
+        D,
+        "_process_identity_after_spawn",
+        lambda pid: {
+            "pid": pid,
+            "pgid": pid,
+            "lstart": "Mon Jul 28 12:00:00 2026",
+            "comm": "codex",
+        },
+    )
+    monkeypatch.setattr(D, "process_group_id", lambda pid: pid)
+    monkeypatch.setattr(
+        D, "_start_caffeinate", lambda *_args, **_kwargs: (None, None)
+    )
+    monkeypatch.setattr(D, "_attach_worker_to_lease", lambda *_args: None)
+    monkeypatch.setattr(D, "_detach_lease_to_worker", lambda *_args: None)
+    monkeypatch.setattr(D, "_write_pidfile", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        D, "_export_dashboard_status_for_project", lambda *_args: None
+    )
+    monkeypatch.setattr(
+        D, "_upsert_project_registry_for_dispatch", lambda *_args: None
+    )
+    monkeypatch.setattr(
+        D, "_start_dashboard_refresh_for_project", lambda *_args: None
+    )
+    return markers
 
 
 def test_watcher_harvests_session_handle_into_status_and_ledger(
@@ -455,86 +522,175 @@ def test_concurrent_resumes_claim_before_capacity_and_only_one_launches(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """Both callers pass the old pre-claim check; the locked claim admits one."""
+    """Two processes pass the old check; one claims and holds the replace lock."""
     parent_id = "concurrent-parent"
     home = _dispatch_home(tmp_path, parent_id)
     _write_rollout(home)
     _write_parent_record(tmp_path, dispatch_id=parent_id, home=home)
     prompt = tmp_path / "revisions.md"
     prompt.write_text("Apply the same revision once.", encoding="utf-8")
-    spawn_calls, leases = _stub_detached_runtime(monkeypatch)
+    markers = _stub_forked_runtime(monkeypatch, tmp_path, home)
+    ctx = mp.get_context("fork")
 
     original_validate = D._validate_codex_resume_source
-    initial_barrier = threading.Barrier(2)
-    first_inner_entered = threading.Event()
-    second_inner_entered = threading.Event()
-    release_first_inner = threading.Event()
-    calls_by_thread: dict[str, int] = {}
-    calls_guard = threading.Lock()
+    initial_barrier = ctx.Barrier(2)
+    claim_entries = ctx.Value("i", 0)
+    first_claim_validation = ctx.Event()
+    second_claim_validation = ctx.Event()
+    release_first_claim = ctx.Event()
+    before_replace = ctx.Event()
+    release_replace = ctx.Event()
+    validation_calls = 0
 
     def synchronized_validate(*args, **kwargs):
+        nonlocal validation_calls
         result = original_validate(*args, **kwargs)
-        name = threading.current_thread().name
-        with calls_guard:
-            call_number = calls_by_thread.get(name, 0) + 1
-            calls_by_thread[name] = call_number
-            first_inner = (
-                call_number == 2 and not first_inner_entered.is_set()
-            )
-        if call_number == 1:
+        validation_calls += 1
+        if validation_calls == 1:
             initial_barrier.wait(timeout=5)
-        elif first_inner:
-            first_inner_entered.set()
-            assert release_first_inner.wait(timeout=5)
-        elif call_number == 2:
-            second_inner_entered.set()
         return result
 
+    def claim_validated(*_args) -> None:
+        with claim_entries.get_lock():
+            claim_entries.value += 1
+            entry = claim_entries.value
+        if entry == 1:
+            first_claim_validation.set()
+            assert release_first_claim.wait(timeout=5)
+        else:
+            second_claim_validation.set()
+
+    def replace_boundary(*_args) -> None:
+        before_replace.set()
+        assert release_replace.wait(timeout=5)
+
     monkeypatch.setattr(D, "_validate_codex_resume_source", synchronized_validate)
+    monkeypatch.setattr(D, "_CODEX_RESUME_CLAIM_VALIDATED_HOOK", claim_validated)
+    monkeypatch.setattr(D, "_CODEX_RESUME_BEFORE_REPLACE_HOOK", replace_boundary)
     monkeypatch.setattr(
         D,
         "_reserve_auto_dispatch_id",
-        lambda _agent, _base: (
-            "resume-child-a"
-            if threading.current_thread().name == "resume-a"
-            else "resume-child-b"
-        ),
+        lambda _agent, _base: f"resume-child-{os.getpid()}",
     )
 
-    results: dict[str, int] = {}
+    results = ctx.Queue()
 
     def run_resume() -> None:
-        results[threading.current_thread().name] = D._cmd_resume(
-            [parent_id, "--prompt-file", str(prompt)]
+        results.put(
+            (
+                os.getpid(),
+                D._cmd_resume([parent_id, "--prompt-file", str(prompt)]),
+            )
         )
 
-    threads = [
-        threading.Thread(target=run_resume, name="resume-a"),
-        threading.Thread(target=run_resume, name="resume-b"),
+    processes = [
+        ctx.Process(target=run_resume),
+        ctx.Process(target=run_resume),
     ]
-    for thread in threads:
-        thread.start()
-    assert first_inner_entered.wait(timeout=5)
-    lock_serialized = not second_inner_entered.wait(timeout=0.5)
-    release_first_inner.set()
-    for thread in threads:
-        thread.join(timeout=5)
-        assert not thread.is_alive()
+    for process in processes:
+        process.start()
+    assert first_claim_validation.wait(timeout=5)
+    claim_is_interprocess = not second_claim_validation.wait(timeout=0.5)
+    release_first_claim.set()
+    assert before_replace.wait(timeout=5)
 
-    assert lock_serialized, "owner-home/session claim must be revalidated under lock"
-    assert sorted(results.values()) == [0, 64]
-    assert len(leases) == 1
-    assert [call["label"] for call in spawn_calls].count("worker") == 1
-    assert [call["label"] for call in spawn_calls].count("watcher") == 1
+    loser_pid, loser_rc = results.get(timeout=5)
+    assert loser_rc == 64
+
+    probe_results = ctx.Queue()
+
+    def probe_replace_lock() -> None:
+        with D._codex_resume_lock(home, SESSION_ID):
+            probe_results.put("acquired")
+
+    probe = ctx.Process(target=probe_replace_lock)
+    probe.start()
+    try:
+        probe_results.get(timeout=0.5)
+        replace_was_locked = False
+    except queue.Empty:
+        replace_was_locked = True
+
+    release_replace.set()
+    if replace_was_locked:
+        assert probe_results.get(timeout=5) == "acquired"
+    winner_pid, winner_rc = results.get(timeout=5)
+    assert winner_rc == 0
+    for process in [*processes, probe]:
+        process.join(timeout=5)
+        assert not process.is_alive()
+        assert process.exitcode == 0
+
+    assert claim_is_interprocess, (
+        "owner-home/session claim validation must use an inter-process lock"
+    )
+    assert replace_was_locked, "the owner-home/session lock must cover replace"
+    assert winner_pid != loser_pid
+    assert len(list(markers.glob("*-capacity"))) == 1
+    assert len(list(markers.glob("*-worker"))) == 1
+    assert len(list(markers.glob("*-watcher"))) == 1
     child_records = [
         path
-        for path in (
-            L.record_path("resume-child-a"),
-            L.record_path("resume-child-b"),
-        )
+        for path in (L.record_path(f"resume-child-{process.pid}") for process in processes)
         if path.exists()
     ]
     assert len(child_records) == 1
+
+
+def test_dead_preclaim_is_reconciled_before_retry(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A hard-killed claimant cannot strand the Codex rollout lineage."""
+    parent_id = "crash-parent"
+    home = _dispatch_home(tmp_path, parent_id)
+    _write_rollout(home)
+    _write_parent_record(tmp_path, dispatch_id=parent_id, home=home)
+    prompt = tmp_path / "revisions.md"
+    prompt.write_text("Retry after the claimant dies.", encoding="utf-8")
+    _stub_forked_runtime(monkeypatch, tmp_path, home)
+    ctx = mp.get_context("fork")
+    durable_claimed = ctx.Event()
+
+    def pause_after_durable_claim(*_args) -> None:
+        durable_claimed.set()
+        ctx.Event().wait(timeout=30)
+
+    monkeypatch.setattr(
+        D,
+        "_CODEX_RESUME_DURABLE_CLAIM_HOOK",
+        pause_after_durable_claim,
+    )
+    monkeypatch.setattr(
+        D,
+        "_reserve_auto_dispatch_id",
+        lambda _agent, _base: f"resume-child-{os.getpid()}",
+    )
+
+    claimant = ctx.Process(
+        target=lambda: D._cmd_resume(
+            [parent_id, "--prompt-file", str(prompt)]
+        )
+    )
+    claimant.start()
+    assert durable_claimed.wait(timeout=5)
+    stale_id = f"resume-child-{claimant.pid}"
+    assert L.record_path(stale_id).is_file()
+    claimant.kill()
+    claimant.join(timeout=5)
+    assert not claimant.is_alive()
+
+    monkeypatch.setattr(D, "_CODEX_RESUME_DURABLE_CLAIM_HOOK", None)
+    assert D._cmd_resume([parent_id, "--prompt-file", str(prompt)]) == 0
+
+    stale = json.loads(L.record_path(stale_id).read_text(encoding="utf-8"))
+    assert stale["state"] == "failed"
+    assert stale["terminal_state"] == "error"
+    assert str(stale["reason"]).startswith("stale_codex_resume_preclaim:")
+    retry = json.loads(
+        L.record_path(f"resume-child-{os.getpid()}").read_text(encoding="utf-8")
+    )
+    assert retry["state"] == "running"
 
 
 def test_parent_child_grandchild_resume_preserves_original_home_owner(

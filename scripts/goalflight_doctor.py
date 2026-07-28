@@ -3481,6 +3481,14 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(payload, sort_keys=True))
     else:
         print_human(payload)
+        try:
+            import goalflight_messages
+        except Exception:
+            pass
+        else:
+            goalflight_messages.emit_controller_mail_notice(
+                project_root=Path(args.project_root).resolve(),
+            )
     plugin = payload["plugin"]
     if not plugin.get("skipped") and (
         plugin.get("manifest_exists") is False or plugin.get("validate_ok") is False
