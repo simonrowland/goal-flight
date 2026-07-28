@@ -552,9 +552,9 @@ Three delivery forms, in order of preference by situation:
   learned mechanics included:
 
   ```shell
-  CODEX_HOME=~/.goal-flight/dispatch-homes/<dispatch-id> \
+  CODEX_HOME=~/.goal-flight/dispatch-homes/<home-owner-dispatch-id> \
     codex exec --sandbox workspace-write -c approval_policy=never \
-    resume <session-id> "<revisions>" < /dev/null
+    resume <session-id> - < revisions.md
   ```
 
   **Resume survives seat rotation — do not pin seats to preserve it.** A codex
@@ -574,11 +574,15 @@ Three delivery forms, in order of preference by situation:
   always correct.
 
   Three mechanics, each of which fails in a way that looks like something else.
-  `< /dev/null` is mandatory: `codex exec` reads stdin to EOF even with a
-  positional prompt, so without it the resume hangs and reads as a stalled
-  worker. Flags go BEFORE the `resume` subcommand — appended after it they are
+  **Stdin must reach EOF**: `codex exec` reads stdin to EOF even with a
+  positional prompt, so a dangling stdin hangs the resume and reads as a
+  stalled worker. Either satisfies that — `< /dev/null` when the prompt is
+  positional, or `resume <id> -` with stdin fed from the prompt FILE, which is
+  what tooling should do because a long revision list (gate failures plus
+  review findings) passed positionally hits argv truncation. The requirement is
+  EOF, not the literal `/dev/null`. Flags go BEFORE the `resume` subcommand — appended after it they are
   parsed as part of the prompt. And the rollout lives under the PER-DISPATCH
-  `CODEX_HOME` (`~/.goal-flight/dispatch-homes/<dispatch-id>`), not the global
+  `CODEX_HOME` (`~/.goal-flight/dispatch-homes/<home-owner-dispatch-id>`), not the global
   `~/.codex` — a resume without that env var looks in the wrong home and
   cannot find the session. The resume handle is the session UUID codex prints
   at startup (also the rollout filename under that home's `sessions/` tree);

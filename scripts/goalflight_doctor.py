@@ -48,6 +48,11 @@ except Exception:  # pragma: no cover - doctor still reports partial state
     goalflight_os_sandbox = None
 
 try:
+    import goalflight_agent_limits
+except Exception:  # pragma: no cover - doctor still reports partial state
+    goalflight_agent_limits = None
+
+try:
     import goalflight_agent_traits
 except Exception:  # pragma: no cover - doctor still reports partial state
     goalflight_agent_traits = None
@@ -1099,6 +1104,26 @@ def app_exists(name: str, bundle_id: str | None = None) -> bool | None:
         result = run(["mdfind", f"kMDItemCFBundleIdentifier == '{bundle_id}'"], timeout=3)
         return bool(result["stdout"])
     return False
+
+
+def check_capacity_profile() -> dict:
+    """Ensure the machine has a capacity profile, seeding one when absent.
+
+    Nothing in the installer or init used to create
+    ~/.goal-flight/capacity.local.json, so a fresh machine silently ran on the
+    committed generic baseline while the tuned values lived only in a
+    hand-written file on one box. Seeding here means every install gets a
+    profile sized to its own RAM, with the reason recorded in the file.
+    """
+    if goalflight_agent_limits is None:
+        return {"ok": False, "reason": "goalflight_agent_limits import failed"}
+    try:
+        result = goalflight_agent_limits.seed_capacity_conf()
+    except Exception as exc:  # never let a doctor check abort the run
+        return {"ok": False, "reason": f"seed failed: {type(exc).__name__}"}
+    result["recommended_hard_cap"] = goalflight_agent_limits.recommended_hard_cap()
+    result["ok"] = result.get("status") in {"created", "exists"}
+    return result
 
 
 def check_platform() -> dict:
@@ -2896,6 +2921,7 @@ def doctor(
         "schema": "goalflight.doctor.v1",
         "repo": str(repo),
         "platform": check_platform(),
+        "capacity_profile": check_capacity_profile(),
         "plugin": check_plugin(repo),
         "host_goalflight_install": check_host_goalflight_install(),
         "installed_skill_drift": check_installed_skill_drift(skill_root, repo),

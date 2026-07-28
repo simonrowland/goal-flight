@@ -294,6 +294,22 @@ def write_record(record: dict) -> Path:
     return path
 
 
+def record_codex_session_id(dispatch_id: str, session_id: str) -> Path:
+    """Attach a harvested Codex rollout UUID without replacing launch metadata."""
+    with StateLock():
+        path = record_path(dispatch_id)
+        if not path.exists():
+            raise FileNotFoundError(f"missing dispatch ledger record: {dispatch_id}")
+        record = json.loads(path.read_text(encoding="utf-8"))
+        existing = record.get("codex_session_id")
+        if existing not in (None, "", session_id):
+            raise ValueError(
+                f"dispatch {dispatch_id} already records codex session {existing}"
+            )
+        record["codex_session_id"] = session_id
+        return write_record(record)
+
+
 def read_records() -> list[dict]:
     records: list[dict] = []
     path = runs_dir(create=False)
@@ -486,6 +502,15 @@ def cmd_record(args: argparse.Namespace) -> int:
     effective_account = getattr(args, "effective_account", None)
     if effective_account:
         record["effective_account"] = effective_account
+    for key in (
+        "codex_session_id",
+        "codex_home",
+        "codex_home_owner_dispatch_id",
+        "parent_dispatch_id",
+    ):
+        value = getattr(args, key, None)
+        if value:
+            record[key] = value
     request_envelope_json = getattr(args, "request_envelope_json", None)
     if request_envelope_json:
         try:
@@ -515,6 +540,14 @@ def cmd_record(args: argparse.Namespace) -> int:
                 and isinstance(existing.get("request_envelope"), dict)
             ):
                 record["request_envelope"] = existing["request_envelope"]
+            for key in (
+                "codex_session_id",
+                "codex_home",
+                "codex_home_owner_dispatch_id",
+                "parent_dispatch_id",
+            ):
+                if key not in record and existing.get(key):
+                    record[key] = existing[key]
         path = write_record(record)
     payload = {"ok": True, "dispatch_id": dispatch_id, "path": str(path), "state": record["state"]}
     print(json.dumps(payload, indent=None if args.json else 2, sort_keys=True))
@@ -589,6 +622,12 @@ def status_payload() -> dict:
             "shape": infer_shape(r),
             "account": r.get("account") or "unknown",
             "effective_account": r.get("effective_account"),
+            "codex_session_id": r.get("codex_session_id"),
+            "codex_home": r.get("codex_home"),
+            "codex_home_owner_dispatch_id": r.get(
+                "codex_home_owner_dispatch_id"
+            ),
+            "parent_dispatch_id": r.get("parent_dispatch_id"),
             "transport": r.get("transport"),
             "state": r.get("state"),
             "classification": classification,

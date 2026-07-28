@@ -67,6 +67,7 @@ from pathlib import Path
 
 import goalflight_compat
 import goalflight_capacity
+import goalflight_codex_sessions
 import goalflight_dispatch_paths
 import goalflight_dispatch_states
 import goalflight_steer_mailbox
@@ -2103,6 +2104,364 @@ def _cmd_steer(argv: list[str]) -> int:
     return 0
 
 
+def _codex_dispatch_homes_dir() -> Path:
+    state_dir = Path(
+        os.environ.get("GOALFLIGHT_CODEX_STATE_DIR", "~/.goal-flight")
+    ).expanduser()
+    return state_dir.resolve(strict=False) / "dispatch-homes"
+
+
+def _codex_resume_home(record: dict, dispatch_id: str) -> tuple[Path, str]:
+    root = _codex_dispatch_homes_dir()
+    home_owner_dispatch_id = record.get("codex_home_owner_dispatch_id") or dispatch_id
+    if not isinstance(home_owner_dispatch_id, str) or not home_owner_dispatch_id:
+        raise DispatchUsageError(
+            f"dispatch {dispatch_id} has invalid recorded codex home owner"
+        )
+    recorded = record.get("codex_home")
+    home = (
+        Path(recorded).expanduser()
+        if isinstance(recorded, str) and recorded
+        else root / home_owner_dispatch_id
+    )
+    resolved = home.resolve(strict=False)
+    if (
+        resolved.parent != root
+        or resolved.name != home_owner_dispatch_id
+    ):
+        raise DispatchUsageError(
+            f"dispatch {dispatch_id} has invalid recorded codex home: {home}"
+        )
+    return resolved, home_owner_dispatch_id
+
+
+def _codex_resume_status(record: dict, dispatch_id: str) -> dict | None:
+    status_path = record.get("status_path")
+    if not isinstance(status_path, str) or not status_path:
+        return None
+    try:
+        status = json.loads(
+            Path(status_path).expanduser().read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(status, dict) or status.get("dispatch_id") != dispatch_id:
+        return None
+    return status
+
+
+def _assert_codex_resume_source_not_live(record: dict, dispatch_id: str) -> None:
+    status = _codex_resume_status(record, dispatch_id) or {}
+    record_pid = record.get("worker_pid")
+    status_pid = status.get("worker_pid")
+    worker_pid = record_pid or status_pid
+    worker_identity = record.get("worker_identity") if record_pid else None
+    if (
+        not isinstance(worker_identity, dict)
+        and status_pid
+        and str(status_pid) == str(worker_pid)
+    ):
+        worker_identity = status.get("expected_worker_identity")
+        if not isinstance(worker_identity, dict):
+            worker_identity = status.get("worker_identity")
+    identity_state, _identity_reason = _queue_claim_identity_status(
+        worker_pid,
+        worker_identity,
+    )
+    if identity_state == "live":
+        raise DispatchUsageError(
+            f"dispatch {dispatch_id} is still live; wait for terminal before resume"
+        )
+    if identity_state == "indeterminate":
+        raise DispatchUsageError(
+            f"dispatch {dispatch_id} liveness is indeterminate; refusing codex resume"
+        )
+    if identity_state == "dead":
+        return
+
+    source_state = status.get("state") or record.get("state")
+    source_reason = status.get("reason") or record.get("reason")
+    if status.get("worker_alive") is True or (
+        goalflight_ledger.terminal_state_for(source_state, source_reason) == "unknown"
+    ):
+        raise DispatchUsageError(
+            f"dispatch {dispatch_id} liveness is indeterminate; refusing codex resume"
+        )
+
+
+def _assert_no_nonterminal_codex_resume_child(
+    *,
+    dispatch_id: str,
+    home: Path,
+    session_id: str,
+    exclude_dispatch_id: str | None = None,
+) -> None:
+    for candidate in goalflight_ledger.read_records():
+        candidate_id = candidate.get("dispatch_id")
+        if (
+            candidate_id in {dispatch_id, exclude_dispatch_id}
+            or not candidate.get("parent_dispatch_id")
+        ):
+            continue
+        if (
+            goalflight_ledger.infer_engine(
+                candidate.get("engine") or candidate.get("agent")
+            )
+            != "codex"
+        ):
+            continue
+        if (
+            goalflight_ledger.terminal_state_for(
+                candidate.get("state"),
+                candidate.get("reason") or candidate.get("error"),
+            )
+            != "unknown"
+        ):
+            continue
+        candidate_session_id = goalflight_codex_sessions.valid_session_id(
+            candidate.get("codex_session_id")
+        )
+        candidate_home = candidate.get("codex_home")
+        if (
+            candidate_session_id == session_id
+            and isinstance(candidate_home, str)
+            and Path(candidate_home).expanduser().resolve(strict=False) == home
+        ):
+            raise DispatchUsageError(
+                f"dispatch {dispatch_id} already has non-terminal resume child "
+                f"{candidate_id} for session {session_id}"
+            )
+
+
+def _recorded_codex_session_id(record: dict, dispatch_id: str) -> str | None:
+    candidates = [record.get("codex_session_id")]
+    status = _codex_resume_status(record, dispatch_id)
+    if status is not None:
+        candidates.append(status.get("codex_session_id"))
+    recorded: set[str] = set()
+    for candidate in candidates:
+        session_id = goalflight_codex_sessions.valid_session_id(candidate)
+        if session_id is not None:
+            recorded.add(session_id)
+    if len(recorded) > 1:
+        raise DispatchUsageError(
+            f"dispatch {dispatch_id} has conflicting recorded codex session handles"
+        )
+    return next(iter(recorded), None)
+
+
+def _validate_codex_resume_source(
+    dispatch_id: str,
+    *,
+    exclude_dispatch_id: str | None = None,
+) -> tuple[dict, Path, str, str]:
+    record = _find_dispatch_record(dispatch_id)
+    if record is None:
+        raise DispatchUsageError(f"no ledger record for dispatch {dispatch_id}")
+    if goalflight_ledger.infer_engine(record.get("engine") or record.get("agent")) != "codex":
+        raise DispatchUsageError(f"dispatch {dispatch_id} is not a codex dispatch")
+    _assert_codex_resume_source_not_live(record, dispatch_id)
+    session_id = _recorded_codex_session_id(record, dispatch_id)
+    if session_id is None:
+        raise DispatchUsageError(
+            f"dispatch {dispatch_id} has no recorded codex session handle"
+        )
+    home, home_owner_dispatch_id = _codex_resume_home(record, dispatch_id)
+    if not home.is_dir():
+        raise DispatchUsageError(
+            f"dispatch home missing for {dispatch_id}: {home}"
+        )
+    if goalflight_codex_sessions.rollout_path(home, session_id) is None:
+        raise DispatchUsageError(
+            f"rollout missing for dispatch {dispatch_id}: session {session_id} "
+            f"under {home / 'sessions'}"
+        )
+    _assert_no_nonterminal_codex_resume_child(
+        dispatch_id=dispatch_id,
+        home=home,
+        session_id=session_id,
+        exclude_dispatch_id=exclude_dispatch_id,
+    )
+    return record, home, session_id, home_owner_dispatch_id
+
+
+def _codex_resume_lock_path(home: Path, session_id: str) -> Path:
+    key = hashlib.sha256(
+        f"{home.resolve(strict=False)}\0{session_id}".encode("utf-8")
+    ).hexdigest()
+    return home.parent / ".resume-locks" / f"{key}.lock"
+
+
+@contextlib.contextmanager
+def _codex_resume_lock(home: Path, session_id: str):
+    """Serialize claims and home rebuilds for one recorded Codex rollout."""
+    if fcntl is None:  # pragma: no cover - resume is refused on native Windows
+        raise DispatchUsageError("codex resume requires local file locking")
+    lock_path = _codex_resume_lock_path(home, session_id)
+    lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    with os.fdopen(fd, "a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _revalidate_codex_resume_claim(
+    *,
+    parent_dispatch_id: str,
+    expected_home: Path,
+    expected_session_id: str,
+    expected_home_owner_dispatch_id: str,
+    exclude_dispatch_id: str | None = None,
+) -> None:
+    """Recheck lineage and exclusivity while the owner-home lock is held."""
+    _record, home, session_id, home_owner_dispatch_id = (
+        _validate_codex_resume_source(
+            parent_dispatch_id,
+            exclude_dispatch_id=exclude_dispatch_id,
+        )
+    )
+    if (
+        home != expected_home
+        or session_id != expected_session_id
+        or home_owner_dispatch_id != expected_home_owner_dispatch_id
+    ):
+        raise DispatchUsageError(
+            f"dispatch {parent_dispatch_id} codex resume lineage changed while claiming"
+        )
+
+
+def _restore_codex_resume_home(
+    original_home: Path,
+    saved_home: Path,
+    *,
+    failed_home_id: str,
+) -> None:
+    failed_home = saved_home.parent / failed_home_id
+    if original_home.exists():
+        original_home.replace(failed_home)
+    saved_home.replace(original_home)
+    cleanup_codex_dispatch_home(failed_home_id)
+
+
+def _rebuild_codex_resume_home(
+    project_root: Path,
+    parent_dispatch_id: str,
+    expected_home: Path,
+    session_id: str,
+    *,
+    home_owner_dispatch_id: str | None = None,
+) -> tuple[str, str]:
+    """Refresh auth/config in the original home while preserving its rollout."""
+    if not expected_home.is_dir():
+        raise DispatchUsageError(
+            f"dispatch home missing for {parent_dispatch_id}: {expected_home}"
+        )
+    if goalflight_codex_sessions.rollout_path(expected_home, session_id) is None:
+        raise DispatchUsageError(
+            f"rollout missing for dispatch {parent_dispatch_id}: session "
+            f"{session_id} under {expected_home / 'sessions'}"
+        )
+
+    root = expected_home.parent
+    saved_home_id = f"resume-save-{uuid.uuid4().hex}"
+    failed_home_id = f"resume-failed-{uuid.uuid4().hex}"
+    saved_home = root / saved_home_id
+    expected_home.replace(saved_home)
+    try:
+        rebuilt_home, effective_account = resolve_codex_home(
+            project_root,
+            None,
+            home_owner_dispatch_id or parent_dispatch_id,
+        )
+        if (
+            rebuilt_home is None
+            or effective_account is None
+            or Path(rebuilt_home).resolve(strict=False) != expected_home
+        ):
+            raise DispatchUsageError(
+                f"could not rebuild dispatch home for {parent_dispatch_id} "
+                "with a healthy codex seat"
+            )
+        saved_sessions = saved_home / "sessions"
+        rebuilt_sessions = expected_home / "sessions"
+        if not saved_sessions.is_dir() or rebuilt_sessions.exists():
+            raise DispatchUsageError(
+                f"could not preserve rollout while rebuilding dispatch home "
+                f"for {parent_dispatch_id}"
+            )
+        saved_sessions.replace(rebuilt_sessions)
+    except BaseException:
+        _restore_codex_resume_home(
+            expected_home,
+            saved_home,
+            failed_home_id=failed_home_id,
+        )
+        raise
+    cleanup_codex_dispatch_home(saved_home_id)
+    return str(expected_home), effective_account
+
+
+def _cmd_resume(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog=f"{Path(sys.argv[0]).name} resume",
+        description="Resume a recorded Codex rollout as a tracked dispatch.",
+    )
+    parser.add_argument("dispatch_id")
+    parser.add_argument("--prompt-file", required=True)
+    args = parser.parse_args(argv)
+
+    prompt_path = Path(args.prompt_file).expanduser()
+    if not prompt_path.is_file():
+        print(
+            f"goalflight_dispatch: prompt file not found: {args.prompt_file}",
+            file=sys.stderr,
+        )
+        return 64
+    try:
+        record, home, session_id, home_owner_dispatch_id = (
+            _validate_codex_resume_source(args.dispatch_id)
+        )
+        child_dispatch_id = _reserve_auto_dispatch_id(
+            "codex-resume", _dispatch_base_dir()
+        )
+    except DispatchUsageError as exc:
+        print(f"goalflight_dispatch: {exc}", file=sys.stderr)
+        return 64
+
+    project_root = Path(
+        str(record.get("project_root") or Path.cwd())
+    ).expanduser().resolve(strict=False)
+    launch_argv = [
+        "--agent",
+        "codex",
+        "--shape",
+        "bash",
+        "--dispatch-id",
+        child_dispatch_id,
+        "--cwd",
+        str(project_root),
+        "--prompt-file",
+        str(prompt_path),
+        "--parent-dispatch-id",
+        args.dispatch_id,
+        "--codex-session-id",
+        session_id,
+        "--codex-resume-home",
+        str(home),
+        "--codex-home-owner-dispatch-id",
+        home_owner_dispatch_id,
+    ]
+    task_ids = record.get("task_ids")
+    if isinstance(task_ids, list):
+        for task_id in task_ids:
+            if isinstance(task_id, str) and task_id:
+                launch_argv.extend(["--task", task_id])
+    return main(launch_argv)
+
+
 def _worker_prompt_preamble(agent: str | None, *, orientation_path: Path | None = None) -> str:
     preambles = [STEER_PROMPT_PREAMBLE, PROMPT_FILE_PREAMBLE]
     if orientation_path is not None:
@@ -2367,6 +2726,53 @@ def _capacity_wait_seconds(args) -> float:
     )
 
 
+def _codex_home_owner_dispatch_id(args) -> str | None:
+    recorded = getattr(args, "codex_home_owner_dispatch_id", None)
+    if isinstance(recorded, str) and recorded:
+        return recorded
+    if (
+        _account_engine(getattr(args, "agent", None)) == "codex"
+        and not goalflight_compat.is_windows()
+    ):
+        return str(args.dispatch_id)
+    return None
+
+
+def _prelaunch_status_metadata(
+    args,
+    *,
+    codex_home: str | None = None,
+    codex_session_id: str | None = None,
+) -> dict:
+    metadata = {
+        "schema": "goalflight.status.v1",
+        "dispatch_id": args.dispatch_id,
+        "agent": args.agent,
+        "shape": args.shape,
+    }
+    task_ids = list(getattr(args, "task_ids", []) or [])
+    if task_ids:
+        metadata["task_ids"] = task_ids
+    parent_dispatch_id = getattr(args, "parent_dispatch_id", None)
+    if parent_dispatch_id:
+        metadata["parent_dispatch_id"] = parent_dispatch_id
+    resolved_session_id = (
+        codex_session_id
+        or goalflight_codex_sessions.valid_session_id(
+            getattr(args, "codex_session_id", None)
+        )
+    )
+    if resolved_session_id:
+        metadata["codex_session_id"] = resolved_session_id
+    resolved_home = codex_home or getattr(args, "codex_resume_home", None)
+    if resolved_home:
+        metadata["codex_home"] = str(resolved_home)
+    home_owner_dispatch_id = _codex_home_owner_dispatch_id(args)
+    if home_owner_dispatch_id:
+        metadata["codex_home_owner_dispatch_id"] = home_owner_dispatch_id
+    return metadata
+
+
 def _acquire_capacity(args, *, project_root: Path, status_json: Path) -> str | None:
     lease_ttl_s = max(int(args.max_idle_secs or 300) * 4, 3600)
     acquire_args = argparse.Namespace(
@@ -2395,9 +2801,7 @@ def _acquire_capacity(args, *, project_root: Path, status_json: Path) -> str | N
         write_status(
             status_json,
             {
-                "schema": "goalflight.status.v1",
-                "dispatch_id": args.dispatch_id,
-                "agent": args.agent,
+                **_prelaunch_status_metadata(args),
                 "state": "blocked_capacity",
                 "reason": blocked_payload,
                 "worker_alive": False,
@@ -2416,9 +2820,7 @@ def _acquire_capacity(args, *, project_root: Path, status_json: Path) -> str | N
         write_status(
             status_json,
             {
-                "schema": "goalflight.status.v1",
-                "dispatch_id": args.dispatch_id,
-                "agent": args.agent,
+                **_prelaunch_status_metadata(args),
                 "state": "waiting_capacity",
                 "reason": reason,
                 "waited_s": waited_s,
@@ -2522,6 +2924,7 @@ def _queue_request_envelope(args) -> dict | None:
 def _record_ledger(args, *, project_root: Path, prompt_path: str | None, status_json: Path,
                    tail: Path, lease_id: str | None, worker_pid: int | None, state: str,
                    effective_account: str | None = None,
+                   codex_home: str | None = None,
                    request_envelope: dict | None = None) -> None:
     with contextlib.redirect_stdout(io.StringIO()):
         goalflight_ledger.cmd_record(
@@ -2546,6 +2949,10 @@ def _record_ledger(args, *, project_root: Path, prompt_path: str | None, status_
                 worker_pid=worker_pid,
                 acp_session_id=None,
                 logical_session_id=args.dispatch_id,
+                codex_session_id=getattr(args, "codex_session_id", None),
+                codex_home=codex_home or getattr(args, "codex_resume_home", None),
+                codex_home_owner_dispatch_id=_codex_home_owner_dispatch_id(args),
+                parent_dispatch_id=getattr(args, "parent_dispatch_id", None),
                 lease_id=lease_id,
                 stdout_path=str(tail),
                 stderr_path=None,
@@ -2596,6 +3003,8 @@ def _record_queued_ledger_fast(args, *, project_root: Path, prompt_path: str | N
         "started_at": now,
         "hostname": socket.gethostname(),
     }
+    record.update(_prelaunch_status_metadata(args))
+    record["schema"] = goalflight_ledger.SCHEMA
     task_ids = list(getattr(args, "task_ids", []) or [])
     if task_ids:
         record["task_ids"] = task_ids
@@ -2621,10 +3030,7 @@ def _record_queued_status(args, *, project_root: Path, status_json: Path, tail: 
     write_status(
         status_json,
         {
-            "schema": "goalflight.status.v1",
-            "dispatch_id": args.dispatch_id,
-            "agent": args.agent,
-            "shape": args.shape,
+            **_prelaunch_status_metadata(args),
             "state": "queued",
             "reason": "dispatch_queue",
             "queue_path": str(queue_path),
@@ -2633,7 +3039,6 @@ def _record_queued_status(args, *, project_root: Path, status_json: Path, tail: 
             "worker_alive": False,
             "tail_path": str(tail),
             "updated_at": int(time.time()),
-            **({"task_ids": list(args.task_ids)} if getattr(args, "task_ids", None) else {}),
         },
     )
     _record_queued_ledger_fast(
@@ -7373,6 +7778,24 @@ def build_worker(args, prompt_path, raw_argv: list[str]):
             argv += ["--model", str(model)]
         if args.cwd:
             argv += ["-C", args.cwd]
+        codex_session_id = goalflight_codex_sessions.valid_session_id(
+            getattr(args, "codex_session_id", None)
+        )
+        if getattr(args, "parent_dispatch_id", None):
+            if codex_session_id is None:
+                raise DispatchUsageError(
+                    "codex resume launch requires a recorded session handle"
+                )
+            if not prompt_path:
+                raise DispatchUsageError("codex resume launch requires a prompt file")
+            # `-` makes codex read the prompt from stdin, same as the non-resume
+            # path below. Passing the text in argv instead would re-introduce the
+            # E2BIG/truncation failure this file already records for grok:
+            # revision prompts carry gate failures plus review findings and are
+            # exactly the long kind. Returning prompt_path also keeps stdin fed
+            # from a real file rather than DEVNULL, so codex never waits on EOF.
+            argv += ["resume", codex_session_id, "-"]
+            return argv, prompt_path
         argv += ["-"]  # codex reads the prompt from stdin
         return argv, prompt_path
     if args.agent in ("grok-code", "grok-research"):
@@ -7442,6 +7865,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_spawn_daemon()
     if argv and argv[0] == "steer":
         return _cmd_steer(argv[1:])
+    if argv and argv[0] == "resume":
+        return _cmd_resume(argv[1:])
     if argv and argv[0] == "drain":
         return _cmd_drain(argv[1:])
     if argv and argv[0] == "dashboard-refresh":
@@ -7576,6 +8001,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--queue-claim-path", help=argparse.SUPPRESS)
     parser.add_argument("--launch-detached", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--acp-detached-child", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--parent-dispatch-id", help=argparse.SUPPRESS)
+    parser.add_argument("--codex-session-id", help=argparse.SUPPRESS)
+    parser.add_argument("--codex-resume-home", help=argparse.SUPPRESS)
+    parser.add_argument("--codex-home-owner-dispatch-id", help=argparse.SUPPRESS)
     parser.add_argument("--stats", nargs="?", const="7d", metavar="WINDOW",
                         help="No-worker stats view over dispatch history; WINDOW is <N>h, <N>d, or bare <N> days.")
     parser.add_argument("--json", action="store_true", help="With --stats, emit machine-readable JSON.")
@@ -7706,7 +8135,11 @@ def main(argv: list[str] | None = None) -> int:
             agent=args.agent,
             orientation_path=orientation_path,
         )
-    worker_argv, stdin_path = build_worker(args, prompt_path, raw)
+    try:
+        worker_argv, stdin_path = build_worker(args, prompt_path, raw)
+    except DispatchUsageError as e:
+        print(f"goalflight_dispatch: {e}", file=sys.stderr)
+        return 64
     if not worker_argv:
         print("goalflight_dispatch: no worker — use `--agent codex --prompt-file X [--cwd .]` "
               "or `-- <cmd...>`", file=sys.stderr)
@@ -7725,6 +8158,9 @@ def main(argv: list[str] | None = None) -> int:
     ledger_recorded = False
     detached_launched = False
     codex_dispatch_home = None
+    codex_session_id = goalflight_codex_sessions.valid_session_id(
+        getattr(args, "codex_session_id", None)
+    )
     effective_account = None
     request_envelope = None
     final_state = "failed"
@@ -7749,6 +8185,15 @@ def main(argv: list[str] | None = None) -> int:
     }
     if getattr(args, "task_ids", None):
         summary_head["task_ids"] = list(args.task_ids)
+    if getattr(args, "parent_dispatch_id", None):
+        summary_head["parent_dispatch_id"] = args.parent_dispatch_id
+    if codex_session_id is not None:
+        summary_head["codex_session_id"] = codex_session_id
+    codex_home_owner_dispatch_id = _codex_home_owner_dispatch_id(args)
+    if codex_home_owner_dispatch_id is not None:
+        summary_head["codex_home_owner_dispatch_id"] = (
+            codex_home_owner_dispatch_id
+        )
 
     try:
         # Pre-record the ledger BEFORE the capacity queue: the (possibly
@@ -7759,16 +8204,38 @@ def main(argv: list[str] | None = None) -> int:
         # Back-compat: ledger consumers now see one extra pre-spawn row per
         # dispatch; the existing running row is still written after capacity
         # is acquired and the worker is spawned.
-        _record_ledger(
-            args,
-            project_root=project_root,
-            prompt_path=prompt_path,
-            status_json=status_json,
-            tail=tail,
-            lease_id=None,
-            worker_pid=None,
-            state="waiting_capacity",
-        )
+        if getattr(args, "parent_dispatch_id", None):
+            resume_home = Path(args.codex_resume_home).expanduser().resolve(
+                strict=False
+            )
+            with _codex_resume_lock(resume_home, args.codex_session_id):
+                _revalidate_codex_resume_claim(
+                    parent_dispatch_id=args.parent_dispatch_id,
+                    expected_home=resume_home,
+                    expected_session_id=args.codex_session_id,
+                    expected_home_owner_dispatch_id=codex_home_owner_dispatch_id,
+                )
+                _record_ledger(
+                    args,
+                    project_root=project_root,
+                    prompt_path=prompt_path,
+                    status_json=status_json,
+                    tail=tail,
+                    lease_id=None,
+                    worker_pid=None,
+                    state="waiting_capacity",
+                )
+        else:
+            _record_ledger(
+                args,
+                project_root=project_root,
+                prompt_path=prompt_path,
+                status_json=status_json,
+                tail=tail,
+                lease_id=None,
+                worker_pid=None,
+                state="waiting_capacity",
+            )
         ledger_recorded = True
         try:
             lease_id = _acquire_capacity(args, project_root=project_root, status_json=status_json)
@@ -7789,14 +8256,36 @@ def main(argv: list[str] | None = None) -> int:
             _account_engine(args.agent) == "codex"
             and not goalflight_compat.is_windows()
         ):
-            try:
-                codex_dispatch_home, effective_account = resolve_codex_home(
-                    project_root,
-                    args.account,
-                    args.dispatch_id,
+            if getattr(args, "parent_dispatch_id", None):
+                resume_home = Path(args.codex_resume_home).expanduser().resolve(
+                    strict=False
                 )
-            except BaseException:
-                codex_dispatch_home, effective_account = None, None
+                with _codex_resume_lock(resume_home, args.codex_session_id):
+                    _revalidate_codex_resume_claim(
+                        parent_dispatch_id=args.parent_dispatch_id,
+                        expected_home=resume_home,
+                        expected_session_id=args.codex_session_id,
+                        expected_home_owner_dispatch_id=codex_home_owner_dispatch_id,
+                        exclude_dispatch_id=args.dispatch_id,
+                    )
+                    codex_dispatch_home, effective_account = (
+                        _rebuild_codex_resume_home(
+                            project_root,
+                            args.parent_dispatch_id,
+                            resume_home,
+                            args.codex_session_id,
+                            home_owner_dispatch_id=codex_home_owner_dispatch_id,
+                        )
+                    )
+            else:
+                try:
+                    codex_dispatch_home, effective_account = resolve_codex_home(
+                        project_root,
+                        args.account,
+                        args.dispatch_id,
+                    )
+                except BaseException:
+                    codex_dispatch_home, effective_account = None, None
         request_envelope = _queue_request_envelope(args)
         _record_ledger(
             args,
@@ -7808,6 +8297,7 @@ def main(argv: list[str] | None = None) -> int:
             worker_pid=None,
             state="starting",
             effective_account=effective_account,
+            codex_home=codex_dispatch_home,
             request_envelope=request_envelope,
         )
 
@@ -7818,6 +8308,7 @@ def main(argv: list[str] | None = None) -> int:
         env.update(account_env)
         if codex_dispatch_home is not None:
             env["CODEX_HOME"] = codex_dispatch_home
+            summary_head["codex_home"] = codex_dispatch_home
         env["GOALFLIGHT_STEER_FILE"] = str(steer_file)
         if original_prompt_path:
             env["GOALFLIGHT_PROMPT_FILE"] = str(original_prompt_path)
@@ -7910,6 +8401,7 @@ def main(argv: list[str] | None = None) -> int:
                 worker_pid=worker_pid,
                 state="running",
                 effective_account=effective_account,
+                codex_home=codex_dispatch_home,
                 request_envelope=request_envelope,
             )
         except Exception as e:
@@ -7965,6 +8457,16 @@ def main(argv: list[str] | None = None) -> int:
             watch_cmd += ["--detached"]
         if codex_dispatch_home is not None:
             watch_cmd += ["--codex-dispatch-home-resolved"]
+            watch_cmd += ["--codex-dispatch-home", codex_dispatch_home]
+        if codex_session_id is not None:
+            watch_cmd += ["--codex-session-id", codex_session_id]
+        if getattr(args, "parent_dispatch_id", None):
+            watch_cmd += ["--parent-dispatch-id", args.parent_dispatch_id]
+        if codex_home_owner_dispatch_id is not None:
+            watch_cmd += [
+                "--codex-home-owner-dispatch-id",
+                codex_home_owner_dispatch_id,
+            ]
         if args.controller_pid:
             watch_cmd += ["--controller-pid", str(args.controller_pid)]
         if prompt_path:
@@ -7973,9 +8475,11 @@ def main(argv: list[str] | None = None) -> int:
         watch_log = base / f"{args.dispatch_id}.watcher.log"
         with contextlib.suppress(Exception):
             write_status(status_json, {
-                "schema": "goalflight.status.v1",
-                "dispatch_id": args.dispatch_id,
-                "agent": args.agent,
+                **_prelaunch_status_metadata(
+                    args,
+                    codex_home=codex_dispatch_home,
+                    codex_session_id=codex_session_id,
+                ),
                 "worker_pid": worker_pid,
                 "detached": bool(args.launch_detached),
                 "pgid": pgid,
@@ -7986,7 +8490,6 @@ def main(argv: list[str] | None = None) -> int:
                 "state": "starting",
                 "reason": "watcher_launching",
                 "updated_at": int(time.time()),
-                **({"task_ids": list(args.task_ids)} if getattr(args, "task_ids", None) else {}),
             })
         _export_dashboard_status_for_project(project_root)
         _start_dashboard_refresh_for_project(project_root)
@@ -8044,6 +8547,12 @@ def main(argv: list[str] | None = None) -> int:
         try:
             state = rec.get("state")
             worker_alive = rec.get("worker_alive")
+            codex_session_id = (
+                goalflight_codex_sessions.valid_session_id(
+                    rec.get("codex_session_id")
+                )
+                or codex_session_id
+            )
             final_terminal_marker_present = goalflight_terminal.terminal_marker_present(
                 rec.get("terminal_marker")
             )
@@ -8084,6 +8593,11 @@ def main(argv: list[str] | None = None) -> int:
         return watch_rc
     except SystemExit:
         raise
+    except DispatchUsageError as e:
+        final_state = "failed"
+        final_reason = str(e)
+        print(f"goalflight_dispatch: {e}", file=sys.stderr)
+        return 64
     except Exception as e:
         final_state = "failed"
         final_reason = f"{type(e).__name__}: {e}"
@@ -8126,6 +8640,7 @@ def main(argv: list[str] | None = None) -> int:
             codex_dispatch_home is not None
             and not detached_launched
             and final_worker_alive is not True
+            and codex_session_id is None
         ):
             cleanup_codex_dispatch_home(args.dispatch_id)
 

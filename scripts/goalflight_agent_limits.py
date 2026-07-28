@@ -167,6 +167,10 @@ def _merge_int_map(target: dict, override: object) -> None:
 
 
 LOCAL_OVERRIDES = load_local_overrides()
+# Snapshot the committed baseline BEFORE local overrides are merged in place:
+# seeding a fresh machine must plant the shipped defaults, not whatever this
+# particular box happens to have been hand-tuned to.
+COMMITTED_AGENT_CAPS = dict(DEFAULT_AGENT_CAPS)
 _merge_int_map(DEFAULT_AGENT_CAPS, LOCAL_OVERRIDES.get("agent_caps"))
 _merge_int_map(AGENT_RSS_MB, LOCAL_OVERRIDES.get("agent_rss_mb"))
 
@@ -188,3 +192,83 @@ def local_operating_total() -> int | None:
     """Conf ``operating_total`` (or ``max_total``) as a positive int, else None."""
     value = LOCAL_OVERRIDES.get("operating_total", LOCAL_OVERRIDES.get("max_total"))
     return _positive_int_or(value, None)
+
+
+# --- capacity profile seeding -------------------------------------------------
+# A fresh machine had no capacity profile at all: nothing in the installer, init,
+# or doctor created ~/.goal-flight/capacity.local.json, so every new install ran
+# on the committed generic baseline while the tuned values lived only in one
+# operator's hand-written file. Seeding gives every install a profile with real
+# provenance.
+
+CAPACITY_RESERVE_MB = 3072          # leave this much for the OS and the controller
+CAPACITY_MB_PER_AGENT = 400         # fleet-average worker RSS; the acquire-time
+                                    # RSS budget and worst_worker_mb still clamp
+                                    # real concurrency, so this sizes the CEILING
+                                    # input, not the achievable parallelism.
+
+
+def _system_memory_mb() -> int | None:
+    """Physical RAM in MB, or None when it cannot be determined."""
+    try:
+        import subprocess
+
+        out = subprocess.run(
+            ["sysctl", "-n", "hw.memsize"], capture_output=True, text=True, timeout=5
+        )
+        if out.returncode == 0 and out.stdout.strip().isdigit():
+            return int(out.stdout.strip()) // (1024 * 1024)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    try:
+        pages = os.sysconf("SC_PHYS_PAGES")
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        if pages > 0 and page_size > 0:
+            return (pages * page_size) // (1024 * 1024)
+    except (ValueError, OSError, AttributeError):
+        pass
+    return None
+
+
+def recommended_hard_cap(default: int = 40) -> int:
+    """Machine ceiling from RAM: (total - reserve) / per-agent.
+
+    Returns ``default`` when memory cannot be read, so an unknown machine gets
+    the conservative committed baseline rather than a guess.
+    """
+    total_mb = _system_memory_mb()
+    if not total_mb or total_mb <= CAPACITY_RESERVE_MB:
+        return default
+    return max(1, (total_mb - CAPACITY_RESERVE_MB) // CAPACITY_MB_PER_AGENT)
+
+
+def seed_capacity_conf(path: Path | None = None, *, force: bool = False) -> dict:
+    """Write a starter capacity profile when none exists.
+
+    Never overwrites an existing profile without ``force``: the file is the
+    operator's tuning record, and clobbering it would discard measurements the
+    committed defaults cannot reproduce.
+    """
+    target = Path(path) if path is not None else _local_conf_path()
+    if target.exists() and not force:
+        return {"status": "exists", "path": str(target)}
+    cap = recommended_hard_cap()
+    profile = {
+        "_comment": (
+            "Machine-local goal-flight capacity tuning. Gitignored by location. "
+            "hard_cap seeded from (system memory - "
+            f"{CAPACITY_RESERVE_MB}MB reserve) / {CAPACITY_MB_PER_AGENT}MB per agent; "
+            "the acquire-time RSS budget and worst_worker_mb still bound real "
+            "concurrency. agent_caps are measured provider tolerances. Record a "
+            "reason and a date when you change a value."
+        ),
+        "hard_cap": cap,
+        "operating_total": cap,
+        "agent_caps": dict(COMMITTED_AGENT_CAPS),
+    }
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(profile, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    except OSError as exc:
+        return {"status": "error", "path": str(target), "error": str(exc)}
+    return {"status": "created", "path": str(target), "hard_cap": cap}

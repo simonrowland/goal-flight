@@ -22,6 +22,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import goalflight_compat
+import goalflight_codex_sessions
 import goalflight_ledger
 import goalflight_quota_stuck
 import goalflight_task
@@ -398,11 +399,13 @@ def _cleanup_codex_dispatch_home(
     *,
     detached: bool,
     home_resolved: bool,
+    codex_session_id: str | None = None,
 ) -> None:
     """Best-effort watcher ownership for terminal detached-bash cleanup."""
     if (
         not detached
         or not home_resolved
+        or codex_session_id is not None
         or goalflight_ledger.infer_engine(agent) != "codex"
     ):
         return
@@ -427,6 +430,7 @@ def _finish_existing_ledger(
     agent: object = "unknown",
     detached: bool = False,
     codex_dispatch_home_resolved: bool = False,
+    codex_session_id: str | None = None,
 ) -> dict | None:
     if not dispatch_id or not state:
         return None
@@ -467,6 +471,7 @@ def _finish_existing_ledger(
                 codex_dispatch_home_resolved
                 and worker_still_alive is not True
             ),
+            codex_session_id=codex_session_id,
         )
 
 
@@ -477,6 +482,10 @@ def _status_snapshot(payload: dict) -> dict:
         "agent",
         "shape",
         "effective_account",
+        "codex_session_id",
+        "codex_home",
+        "codex_home_owner_dispatch_id",
+        "parent_dispatch_id",
         "state",
         "reason",
         "worker_pid",
@@ -1128,6 +1137,10 @@ def main() -> int:
         action="store_true",
         help=argparse.SUPPRESS,
     )
+    parser.add_argument("--codex-dispatch-home", help=argparse.SUPPRESS)
+    parser.add_argument("--codex-session-id", help=argparse.SUPPRESS)
+    parser.add_argument("--codex-home-owner-dispatch-id", help=argparse.SUPPRESS)
+    parser.add_argument("--parent-dispatch-id", help=argparse.SUPPRESS)
     parser.add_argument("--worker-identity-json",
                         help="Process identity token captured at spawn; prevents PID-reuse false liveness.")
     parser.add_argument("--ignore-prompt-file",
@@ -1152,6 +1165,15 @@ def main() -> int:
     tail = Path(args.tail)
     status_path = Path(args.status_json)
     effective_account = _trace_ledger_account(args.dispatch_id)
+    codex_home = (
+        Path(args.codex_dispatch_home).expanduser()
+        if args.codex_dispatch_home
+        else None
+    )
+    codex_session_id = goalflight_codex_sessions.valid_session_id(
+        args.codex_session_id
+    )
+    codex_session_recorded = False
     if goalflight_compat.is_windows():
         payload = {
             "schema": "goalflight.status.v1",
@@ -1166,6 +1188,16 @@ def main() -> int:
         }
         if effective_account:
             payload["effective_account"] = effective_account
+        if args.codex_home_owner_dispatch_id:
+            payload["codex_home_owner_dispatch_id"] = (
+                args.codex_home_owner_dispatch_id
+            )
+        if args.parent_dispatch_id:
+            payload["parent_dispatch_id"] = args.parent_dispatch_id
+        if codex_session_id is not None:
+            payload["codex_session_id"] = codex_session_id
+        if codex_home is not None:
+            payload["codex_home"] = str(codex_home)
         write_status(status_path, payload)
         print(json.dumps({"state": payload["state"], "reason": payload["reason"], "status_path": str(status_path)}, sort_keys=True))
         return 4
@@ -1219,9 +1251,35 @@ def main() -> int:
             return {"type": type(exc).__name__, "message": str(exc)}
 
     def write_payload(payload: dict, *, reason: str | None = None, terminal_write: bool = False) -> dict | None:
+        nonlocal codex_session_id, codex_session_recorded
         nonlocal last_payload, final_status_written, working_breadcrumb_written
         if effective_account:
             payload["effective_account"] = effective_account
+        if codex_home is not None:
+            payload["codex_home"] = str(codex_home)
+            if codex_session_id is None:
+                codex_session_id = goalflight_codex_sessions.discover_session_id(
+                    codex_home
+                )
+        if codex_session_id is not None:
+            payload["codex_session_id"] = codex_session_id
+            if not codex_session_recorded and args.dispatch_id:
+                try:
+                    goalflight_ledger.record_codex_session_id(
+                        args.dispatch_id, codex_session_id
+                    )
+                    codex_session_recorded = True
+                except Exception as exc:
+                    payload["codex_session_record_error"] = {
+                        "type": type(exc).__name__,
+                        "message": str(exc),
+                    }
+        if args.parent_dispatch_id:
+            payload["parent_dispatch_id"] = args.parent_dispatch_id
+        if args.codex_home_owner_dispatch_id:
+            payload["codex_home_owner_dispatch_id"] = (
+                args.codex_home_owner_dispatch_id
+            )
         if reason:
             payload["reason"] = reason
         if terminal_write:
@@ -1292,6 +1350,7 @@ def main() -> int:
                 codex_dispatch_home_resolved=bool(
                     args.codex_dispatch_home_resolved
                 ),
+                codex_session_id=codex_session_id,
             )
             if ledger_error:
                 payload["ledger_finalize_error"] = ledger_error

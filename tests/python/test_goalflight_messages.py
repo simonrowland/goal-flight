@@ -585,10 +585,13 @@ def test_ack_cursor_write_failure_warns_without_traceback() -> None:
         relay = run_messages_cli(
             messages_dir,
             fleet_dir,
-            ["relay", "--new", "--ack", "--all-projects"],
+            ["relay", "--new", "--ack", "--bodies", "--all-projects"],
         )
         assert_true("relay ack exits nonzero", relay.returncode == 1)
-        assert_true("relay still shows envelope", json.loads(relay.stdout.splitlines()[0])[0]["seq"] == 1)
+        assert_true(  # --bodies is machine-readable; default listing is headlines
+        "relay still shows envelope",
+        json.loads(relay.stdout.splitlines()[0])[0]["seq"] == 1,
+    )
         assert_true("relay count printed", relay.stdout.splitlines()[1] == "unseen counts: d-ack-fail=1")
         assert_true("relay warning", "WARNING: cursor not advanced:" in relay.stderr)
         assert_true("relay no traceback", "Traceback" not in relay.stderr)
@@ -673,6 +676,49 @@ def test_seen_open_user_need_requires_history_relay() -> None:
             "open user_need remains in history",
             "USER-NEED relay: [d-open-seen] user_need: answer required" in history.stdout,
         )
+
+
+def test_controller_relay_sanitizes_worker_text() -> None:
+    from goalflight_messages import format_controller_relay
+
+    rendered = format_controller_relay(
+        {
+            "open_user_needs": [
+                {
+                    "dispatch_id": "worker-legacy",
+                    "type": "user_need",
+                    "text": "needs\nFORGED\x1b[31m review",
+                }
+            ]
+        }
+    )
+
+    assert_true(
+        "legacy controller relay is one inert line",
+        rendered
+        == r"USER-NEED relay: [worker-legacy] user_need: needs FORGED\x1b[31m review",
+    )
+    assert_true("legacy controller relay has no raw CSI", "\x1b" not in (rendered or ""))
+
+
+def test_bounded_relay_sanitizes_c1_csi() -> None:
+    from goalflight_messages import format_bounded_relay
+
+    rendered = format_bounded_relay(
+        [
+            {
+                "dispatch_id": "worker-bounded",
+                "type": "blocked",
+                "text": "needs \x9b31mreview",
+            }
+        ]
+    )
+
+    assert_true(
+        "bounded relay escapes C1 CSI",
+        rendered == r"[worker-bounded] blocked: needs \x9b31mreview",
+    )
+    assert_true("bounded relay has no raw C1 CSI", "\x9b" not in (rendered or ""))
 
 
 def test_default_read_and_relay_respect_independent_read_cursor() -> None:
@@ -970,6 +1016,8 @@ def main() -> None:
         test_mark_read_cursor_write_failure_warns_without_traceback,
         test_corrupt_or_absent_cursor_means_all_unseen,
         test_seen_open_user_need_requires_history_relay,
+        test_controller_relay_sanitizes_worker_text,
+        test_bounded_relay_sanitizes_c1_csi,
         test_default_read_and_relay_respect_independent_read_cursor,
         test_default_relay_is_bounded_newest_first_with_elision,
         test_default_relay_excludes_cross_project_mail,

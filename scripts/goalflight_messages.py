@@ -527,7 +527,9 @@ def unseen_envelopes_for_paths(
 def format_unseen_counts(counts: dict[str, int]) -> str:
     if not counts:
         return "unseen counts: none"
-    return "unseen counts: " + " ".join(f"{key}={value}" for key, value in sorted(counts.items()))
+    return "unseen counts: " + " ".join(
+        f"{sanitize_display(key)}={value}" for key, value in sorted(counts.items())
+    )
 
 
 def print_cursor_advances(results: list[dict[str, object]]) -> None:
@@ -633,6 +635,8 @@ def cmd_append(args: argparse.Namespace) -> int:
 
 def cmd_post(args: argparse.Namespace) -> int:
     payload = json.loads(args.payload) if args.payload else {"text": args.text or ""}
+    if getattr(args, "subject", None) and isinstance(payload, dict):
+        payload.setdefault("subject", args.subject)
     source = {
         "node": args.node,
         "adapter": args.adapter,
@@ -726,11 +730,9 @@ def format_controller_relay(aggregate: dict) -> str | None:
         return None
     parts: list[str] = []
     for item in needs:
-        dispatch_id = item.get("dispatch_id", "?")
-        kind = item.get("type", "user_need")
-        text = (item.get("text") or "").strip()
-        if len(text) > 120:
-            text = text[:117] + "..."
+        dispatch_id = sanitize_display(item.get("dispatch_id") or "?")
+        kind = sanitize_display(item.get("type") or "user_need")
+        text = sanitize_display(item.get("text") or "", limit=120)
         parts.append(f"[{dispatch_id}] {kind}: {text}")
     return "USER-NEED relay: " + " | ".join(parts)
 
@@ -759,9 +761,9 @@ def format_bounded_relay(
         if len(selected) >= item_limit:
             break
         line = (
-            f"[{_clip(item.get('dispatch_id'), 64)}] "
-            f"{_clip(item.get('type') or 'user_need', 32)}: "
-            f"{_clip(item.get('text'), 200)}"
+            f"[{sanitize_display(item.get('dispatch_id') or '', limit=64)}] "
+            f"{sanitize_display(item.get('type') or 'user_need', limit=32)}: "
+            f"{sanitize_display(item.get('text') or '', limit=200)}"
         )
         candidate = [*selected, line]
         omitted = total - len(candidate)
@@ -775,12 +777,6 @@ def format_bounded_relay(
     if omitted:
         selected.append(f"(+{omitted} more open unread item(s) elided)")
     return "\n".join(selected)
-
-
-def _clip(text: object, limit: int = 100) -> str:
-    s = "".join(" " if ord(ch) < 32 or ord(ch) == 127 else ch for ch in str(text or ""))
-    s = " ".join(s.split())
-    return s if len(s) <= limit else s[: limit - 3] + "..."
 
 
 def _task_store_dispatch_id(project_root: Path) -> str | None:
@@ -1018,11 +1014,15 @@ def _format_mail_hint(items: list[dict]) -> str:
     follow up straight from a status check."""
     head = (
         f"\U0001f4ec mail: {len(items)} open unread item(s) from your worker(s)/task store "
-        "- run scoped: goalflight_messages.py relay"
+        "- read headlines: goalflight_messages.py relay --new (--ack to mark read)"
     )
     lines = [head]
     for it in items[:5]:
-        lines.append(f"    [{it['dispatch_id']}] {it['type']}: {it['text']}")
+        lines.append(
+            f"    [{sanitize_display(it.get('dispatch_id') or '?', limit=64)}] "
+            f"{sanitize_display(it.get('type') or 'user_need', limit=32)}: "
+            f"{sanitize_display(it.get('text') or '', limit=120)}"
+        )
     if len(items) > 5:
         lines.append(f"    (+{len(items) - 5} more)")
     return "\n".join(lines)
@@ -1084,7 +1084,7 @@ def controller_mail_summary(
             "type": str(n.get("nudge_kind") or n.get("type") or "user_need"),
             "seq": n.get("seq"),
             "ts": n.get("ts"),
-            "text": _clip(n.get("text"), 120),
+            "text": sanitize_display(n.get("text") or "", limit=120),
         }
         for n in needs
     ]
@@ -1163,6 +1163,88 @@ def cmd_ack(args: argparse.Namespace) -> int:
     return 0
 
 
+HEADLINE_MAX = 96
+
+
+def sanitize_display(value: object, *, limit: int | None = None) -> str:
+    """Render and optionally truncate untrusted mail text for human display."""
+    text = value if isinstance(value, str) else str(value)
+    safe: list[str] = []
+    for char in text:
+        codepoint = ord(char)
+        if char in {"\r", "\n"} or codepoint in {0x85, 0x2028, 0x2029}:
+            safe.append(" ")
+        elif codepoint < 0x20 or 0x7F <= codepoint <= 0x9F:
+            safe.append(f"\\x{codepoint:02x}")
+        else:
+            safe.append(char)
+    rendered = " ".join("".join(safe).split())
+    if limit is None or len(rendered) <= limit:
+        return rendered
+    if limit <= 0:
+        return ""
+    if limit <= 3:
+        return "." * limit
+    return rendered[: limit - 3] + "..."
+
+
+def envelope_headline(envelope: dict) -> str:
+    """One scannable line for an envelope.
+
+    Mail is read by agents whose context is the scarce resource, so the default
+    listing must be scannable rather than complete: an explicit subject when the
+    sender set one, otherwise the first meaningful line of the body. Bodies are
+    fetched deliberately, never dumped by default.
+    """
+    payload = envelope.get("payload")
+    payload = payload if isinstance(payload, dict) else {}
+    subject = payload.get("subject")
+    if isinstance(subject, str) and subject.strip():
+        text = subject
+    else:
+        body = payload.get("text")
+        body = body if isinstance(body, str) else ""
+        # No subject: the first two meaningful lines usually carry the sender's
+        # own headline, which beats one truncated line of a long opener.
+        meaningful = []
+        for line in body.splitlines():
+            cleaned = sanitize_display(line)
+            if cleaned:
+                meaningful.append(cleaned)
+        text = " / ".join(meaningful[:2])
+    return sanitize_display(text, limit=HEADLINE_MAX) or "(no text)"
+
+
+def envelope_from(envelope: dict) -> str:
+    """Who sent it: the source node/adapter when recorded, else the inbox id."""
+    source = envelope.get("source")
+    source = source if isinstance(source, dict) else {}
+    for key in ("adapter", "node"):
+        value = source.get(key)
+        if isinstance(value, str) and value.strip() and value.strip() != "unknown":
+            return sanitize_display(value)
+    return sanitize_display(envelope.get("dispatch_id") or "?")
+
+
+def format_envelope_headlines(envelopes: list) -> str:
+    """Render unseen envelopes as one line each: FROM, subject, and body size."""
+    lines = []
+    for env in envelopes:
+        if not isinstance(env, dict):
+            continue
+        payload = env.get("payload")
+        payload = payload if isinstance(payload, dict) else {}
+        body = payload.get("text")
+        size = len(body) if isinstance(body, str) else 0
+        lines.append(
+            f"{sanitize_display(env.get('dispatch_id', '?'))} "
+            f"#{sanitize_display(env.get('seq', '?'))} "
+            f"[{sanitize_display(env.get('type', '?'))}] from {envelope_from(env)}: "
+            f"{envelope_headline(env)}  ({size}c)"
+        )
+    return "\n".join(lines)
+
+
 def cmd_relay(args: argparse.Namespace) -> int:
     if args.ack and not args.new:
         print("relay --ack requires --new", file=sys.stderr)
@@ -1189,7 +1271,13 @@ def cmd_relay(args: argparse.Namespace) -> int:
             cursor=cursor,
             tolerate_errors=True,
         )
-        print(json.dumps(envelopes))
+        if getattr(args, "bodies", False):
+            print(json.dumps(envelopes))
+        else:
+            headlines = format_envelope_headlines(envelopes)
+            if headlines:
+                print(headlines)
+                print("bodies: re-run with --bodies, or read one inbox with `read`")
         print(format_unseen_counts(counts))
         if args.ack:
             try:
@@ -1337,6 +1425,10 @@ def main(argv: list[str] | None = None) -> int:
     post.add_argument("--type", required=True)
     post.add_argument("--payload", help="JSON object payload")
     post.add_argument("--text", help="Shorthand payload.text when --payload omitted")
+    post.add_argument(
+        "--subject",
+        help="Short scannable subject; shown in relay listings instead of the first body line",
+    )
     post.add_argument("--node", default="local")
     post.add_argument("--adapter", default="unknown")
     post.add_argument(
@@ -1382,6 +1474,11 @@ def main(argv: list[str] | None = None) -> int:
         "--all-projects",
         action="store_true",
         help="Include inboxes outside the current project",
+    )
+    relay.add_argument(
+        "--bodies",
+        action="store_true",
+        help="With --new, print full envelope JSON instead of one headline per message",
     )
     relay.add_argument(
         "--history",

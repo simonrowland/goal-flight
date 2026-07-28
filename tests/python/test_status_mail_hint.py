@@ -142,12 +142,12 @@ def test_headline_count_matches_default_relay_and_ack_lifecycle() -> None:
     assert_eq("ack does not alter read cursor", read_cursor, {"worker-read": 1})
 
 
-def test_mail_hint_strips_control_chars() -> None:
+def test_mail_hint_sanitizes_newline_and_csi() -> None:
     def body(msgs, fleet):
         M.post_message(
             dispatch_id="worker-esc",
             msg_type="user_need",
-            payload={"text": "needs\x1b[31m review\rnow\nplease"},
+            payload={"text": "needs\nFORGED\x1b[31m review"},
             messages_dir=msgs,
         )
         return S._mail_summary({"worker-esc"})
@@ -155,10 +155,14 @@ def test_mail_hint_strips_control_chars() -> None:
     out = _with_mail_dirs(body)
     text = out["needs"][0]["text"]
     hint = out["hint"]
-    for bad in ("\x1b", "\r"):
-        assert_true("need text strips C0 controls", bad not in text)
-        assert_true("hint strips C0 controls", bad not in hint)
-    assert_true("escaped bracket text remains inert", "[31m review now please" in hint)
+    expected = r"needs FORGED\x1b[31m review"
+    assert_eq("structured need text is inert", text, expected)
+    assert_eq(
+        "mail hint keeps one detail row",
+        hint.splitlines()[1:],
+        [f"    [worker-esc] user_need: {expected}"],
+    )
+    assert_true("mail hint has no raw CSI", "\x1b" not in hint)
 
 
 def test_ownership_filter_excludes_other_controllers_workers() -> None:
@@ -360,7 +364,7 @@ def main() -> None:
         test_no_mail_empty_summary,
         test_open_user_need_surfaces_hint_with_detail,
         test_headline_count_matches_default_relay_and_ack_lifecycle,
-        test_mail_hint_strips_control_chars,
+        test_mail_hint_sanitizes_newline_and_csi,
         test_ownership_filter_excludes_other_controllers_workers,
         test_task_store_inbox_id_agrees_between_worktree_and_main_root,
         test_scoped_status_mail_includes_project_task_store_nudge,

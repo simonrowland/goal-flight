@@ -280,6 +280,46 @@ backwards-sweep code + the saved review archive for more instances, and re-audit
 for it at milestones. Recording new bug shapes and re-auditing for them is part
 of the review cadence — not a separate optional step that lapses.
 
+## Seams — what per-chunk review structurally cannot see
+
+Per-chunk review is scoped to one chunk's diff, so it is blind by construction
+to defects that live BETWEEN chunks: a shared schema each side implements
+slightly differently, an invariant every chunk half-maintains, two chunks that
+each answer a question and disagree, a catalog entry nobody owns. Field
+evidence from a multi-chunk milestone: per-chunk output graded well and nearly
+every escaped defect was cross-chunk. Adding review passes of the same shape
+does not help — the scope, not the effort, is what misses.
+
+Two gates catch seams, and both are standing requirements at a milestone, not
+optional extras:
+
+1. **Integrated-tip gate.** Run the full gate against the integrated tip — all
+   chunks landed together — not against each chunk in isolation. A suite that
+   passed per-chunk can fail integrated, and that failure IS the seam.
+2. **Cross-chunk review pass.** One review whose unit is the milestone, not the
+   diff: scoped explicitly at the shared surfaces — schemas, invariants,
+   catalogs, contracts touched by more than one chunk — and asked where two
+   chunks disagree. Give it the chunk list and the shared surfaces, not the
+   concatenated diffs; the question is consistency, not correctness-in-detail.
+
+Neither replaces the per-chunk floor; they close a different hole. A milestone
+that ran two concern-diverse reviews per chunk and never asked a cross-chunk
+question has satisfied the floor and still not looked where the defects were.
+
+### Three recurring weaknesses worth naming in review briefs
+
+Observed repeatedly enough to be worth an explicit prompt line rather than
+hoping a reviewer notices:
+
+- **Architecture landing ahead of vertical slices** — scaffolding accretes
+  before any end-to-end path exercises it, so nothing disproves the design.
+- **Tests proving the implementation rather than the invariant** — a test that
+  restates what the code does passes forever and catches nothing; ask what
+  observable property would break if the implementation were wrong.
+- **Doc upkeep lagging schema growth** — the schema moves, the document that
+  describes it does not, and the drift is invisible until someone trusts the
+  doc.
+
 ## The landing gate is controller-side and quiet
 
 Workers run focused suites only and end with `GATE: DEFERRED-TO-CONTROLLER`

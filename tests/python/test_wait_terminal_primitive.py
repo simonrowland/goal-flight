@@ -11,6 +11,7 @@ stays `complete`, not `worker_dead`).
 from __future__ import annotations
 
 import io
+import json
 import os
 import sys
 import tempfile
@@ -65,6 +66,38 @@ def _row(
         stale_grace=stale_grace,
     )
     return rows[0]
+
+
+def _aggregate_record_with_status_marker(
+    directory: Path,
+    *,
+    dispatch_id: str,
+    marker_kind: str,
+    marker_text: str,
+    classification: str = "blocked",
+    status_state: str | None = None,
+) -> dict:
+    status_path = directory / f"{dispatch_id}.status.json"
+    status_path.write_text(
+        json.dumps(
+            {
+                "dispatch_id": dispatch_id,
+                "state": status_state or classification,
+                "terminal_marker": {
+                    "kind": marker_kind,
+                    "text": marker_text,
+                    "line": 1,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return {
+        "dispatch_id": dispatch_id,
+        "classification": classification,
+        "state": classification,
+        "status_path": str(status_path),
+    }
 
 
 def test_crashed_worker_resolves_worker_dead_after_grace_not_before() -> None:
@@ -445,34 +478,44 @@ def test_terminal_row_carries_marker_kind_and_verdict_distinguishes_checkpoint()
     # "blocked" is a collapsed state: USER-NEED (expected checkpoint) and
     # BLOCKED (wedged) must not print identically, or the reader opens every
     # tail to learn which. The row carries the kind; the verdict line shows it.
-    rec = {
-        "dispatch_id": "chk",
-        "classification": "blocked",
-        "terminal_state": "blocked",
-        "terminal_marker": {
-            "kind": "USER-NEED",
-            "text": "landing checkpoint - session abc123; log /tmp/x.log",
-            "line": 42,
-        },
-    }
-    row = _row(_payload(rec), "chk", now=10_000.0, grace=90.0, dead_since={})
-    assert_eq("terminal", row["terminal"], True)
-    assert_eq("marker kind on row", row.get("marker_kind"), "USER-NEED")
-    line = status._wait_verdict_line(row)
-    assert_true("kind in verdict", "[USER-NEED]" in line)
-    assert_true("headline in verdict", "landing checkpoint" in line)
+    with tempfile.TemporaryDirectory() as tmp:
+        directory = Path(tmp)
+        rec = _aggregate_record_with_status_marker(
+            directory,
+            dispatch_id="chk",
+            marker_kind="USER-NEED",
+            marker_text="landing checkpoint - session abc123; log /tmp/x.log",
+        )
+        row = _row(
+            _payload(rec),
+            "chk",
+            now=10_000.0,
+            grace=90.0,
+            dead_since={},
+        )
+        assert_eq("terminal", row["terminal"], True)
+        assert_eq("marker kind on row", row.get("marker_kind"), "USER-NEED")
+        line = status._wait_verdict_line(row)
+        assert_true("kind in verdict", "[USER-NEED]" in line)
+        assert_true("headline in verdict", "landing checkpoint" in line)
 
-    wedged = {
-        "dispatch_id": "wdg",
-        "classification": "blocked",
-        "terminal_state": "blocked",
-        "terminal_marker": {"kind": "BLOCKED", "text": "sandbox refused bind", "line": 9},
-    }
-    wline = status._wait_verdict_line(
-        _row(_payload(wedged), "wdg", now=10_000.0, grace=90.0, dead_since={})
-    )
-    assert_true("wedged shows BLOCKED kind", "[BLOCKED]" in wline)
-    assert_true("the two verdicts differ", line != wline)
+        wedged = _aggregate_record_with_status_marker(
+            directory,
+            dispatch_id="wdg",
+            marker_kind="BLOCKED",
+            marker_text="sandbox refused bind",
+        )
+        wline = status._wait_verdict_line(
+            _row(
+                _payload(wedged),
+                "wdg",
+                now=10_000.0,
+                grace=90.0,
+                dead_since={},
+            )
+        )
+        assert_true("wedged shows BLOCKED kind", "[BLOCKED]" in wline)
+        assert_true("the two verdicts differ", line != wline)
 
 
 def test_verdict_line_stays_bare_for_complete_and_timeout() -> None:
@@ -488,6 +531,125 @@ def test_verdict_line_stays_bare_for_complete_and_timeout() -> None:
         status._wait_verdict_line({"dispatch_id": "t", "state": "timeout", "marker_kind": "STATUS"}),
         "t -> timeout",
     )
+
+
+def test_marker_kind_is_read_from_the_status_FILE_not_just_the_record() -> None:
+    """The aggregated payload record carries no marker fields - only the
+    per-dispatch status JSON does. A lookup that reads the record alone passes
+    against a hand-built record and yields nothing on every real dispatch,
+    which is exactly how this shipped broken the first time.
+    """
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        status_path = os.path.join(tmp, "chk.status.json")
+        with open(status_path, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "dispatch_id": "chk",
+                    "state": "blocked",
+                    "terminal_marker": {
+                        "kind": "USER-NEED",
+                        "text": "landing checkpoint - session abc123",
+                        "line": 5,
+                    },
+                },
+                handle,
+            )
+        # Record shaped like the REAL aggregate: state + status_path, no marker.
+        rec = {
+            "dispatch_id": "chk",
+            "classification": "blocked",
+            "state": "blocked",
+            "status_path": status_path,
+        }
+        row = _row(_payload(rec), "chk", now=10_000.0, grace=90.0, dead_since={})
+        assert_eq("kind recovered from file", row.get("marker_kind"), "USER-NEED")
+        line = status._wait_verdict_line(row)
+        assert_true("kind in verdict", "[USER-NEED]" in line)
+
+    # Unreadable/missing status file must degrade quietly, not raise.
+    rec = {
+        "dispatch_id": "gone",
+        "classification": "blocked",
+        "state": "blocked",
+        "status_path": "/nonexistent/nope.json",
+    }
+    row = _row(_payload(rec), "gone", now=10_000.0, grace=90.0, dead_since={})
+    assert_eq("no kind, no crash", row.get("marker_kind"), None)
+    assert_eq("bare verdict", status._wait_verdict_line(row), "gone -> blocked")
+
+
+def test_marker_helpers_share_production_status_file_fallback() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        rec = _aggregate_record_with_status_marker(
+            Path(tmp),
+            dispatch_id="done-from-status",
+            marker_kind="COMPLETE",
+            marker_text="finished",
+            classification="expected_live",
+            status_state="complete",
+        )
+
+        assert_eq(
+            "terminal marker kind",
+            status._record_terminal_marker_kind(rec),
+            "COMPLETE",
+        )
+        assert_eq("terminal marker present", status._record_has_terminal_marker(rec), True)
+        assert_eq("done code sees status marker", status.done_code(rec), 0)
+
+
+def test_status_marker_fallback_rejects_nonterminal_and_wrong_dispatch() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        status_path = Path(tmp) / "marker.status.json"
+        rec = {
+            "dispatch_id": "expected",
+            "classification": "blocked",
+            "state": "blocked",
+            "status_path": str(status_path),
+        }
+        status_path.write_text(
+            json.dumps(
+                {
+                    "dispatch_id": "expected",
+                    "last_marker": {"kind": "STATUS", "text": "still working"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        assert_eq("STATUS is not terminal", status._record_marker_info(rec), None)
+        assert_eq(
+            "STATUS omitted from verdict",
+            status._wait_verdict_line(
+                _row(
+                    _payload(rec),
+                    "expected",
+                    now=10_000.0,
+                    grace=90.0,
+                    dead_since={},
+                )
+            ),
+            "expected -> blocked",
+        )
+
+        status_path.write_text(
+            json.dumps(
+                {
+                    "dispatch_id": "different",
+                    "terminal_marker": {
+                        "kind": "BLOCKED",
+                        "text": "wrong dispatch",
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        assert_eq(
+            "mismatched dispatch ignored",
+            status._record_marker_info(rec),
+            None,
+        )
 
 
 def test_wait_returns_bounded_on_crash_not_at_timeout() -> None:
@@ -578,6 +740,7 @@ def main() -> None:
     print(f"PASS tests/python/test_wait_terminal_primitive.py ({len(tests)} tests)")
     test_terminal_row_carries_marker_kind_and_verdict_distinguishes_checkpoint()
     test_verdict_line_stays_bare_for_complete_and_timeout()
+    test_marker_kind_is_read_from_the_status_FILE_not_just_the_record()
 
 
 if __name__ == "__main__":

@@ -1,0 +1,882 @@
+#!/usr/bin/env python3
+"""Focused regressions for tracked Codex rollout resume dispatches."""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+import threading
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "scripts"))
+
+import goalflight_codex_sessions as S  # noqa: E402
+import goalflight_dispatch as D  # noqa: E402
+import goalflight_ledger as L  # noqa: E402
+import goalflight_watch as W  # noqa: E402
+
+
+SESSION_ID = "12345678-1234-4abc-8def-1234567890ab"
+
+
+pytestmark = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Codex rollout resume is local POSIX-only",
+)
+
+
+@pytest.fixture(autouse=True)
+def _isolated_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    state = tmp_path / "state"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(state))
+    monkeypatch.setenv("GOALFLIGHT_CODEX_STATE_DIR", str(state))
+    monkeypatch.setenv("GOALFLIGHT_TASK_STORE_DIR", str(tmp_path / "task-store"))
+    monkeypatch.setenv("GOALFLIGHT_CAPACITY_CONF", "/dev/null")
+    monkeypatch.setenv("GOALFLIGHT_CAPACITY_WAIT_S", "0")
+    monkeypatch.setenv("GOALFLIGHT_DISABLE_NUDGES", "1")
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    monkeypatch.delenv("GOALFLIGHT_CODEX_CONTEXT_MODE", raising=False)
+
+
+def _dispatch_home(tmp_path: Path, dispatch_id: str) -> Path:
+    return tmp_path / "state" / "dispatch-homes" / dispatch_id
+
+
+def _write_rollout(home: Path, session_id: str = SESSION_ID) -> Path:
+    rollout = (
+        home
+        / "sessions"
+        / "2026"
+        / "07"
+        / "28"
+        / f"rollout-2026-07-28T12-00-00-{session_id}.jsonl"
+    )
+    rollout.parent.mkdir(parents=True, exist_ok=True)
+    rollout.write_text('{"type":"session_meta"}\n', encoding="utf-8")
+    return rollout
+
+
+def _write_parent_record(
+    tmp_path: Path,
+    *,
+    dispatch_id: str = "parent-dispatch",
+    session_id: str | None = SESSION_ID,
+    home: Path | None = None,
+) -> dict:
+    status_path = tmp_path / f"{dispatch_id}.status.json"
+    record = {
+        "schema": L.SCHEMA,
+        "dispatch_id": dispatch_id,
+        "agent": "codex",
+        "engine": "codex",
+        "shape": "bash",
+        "account": "old-seat",
+        "transport": "dispatch",
+        "project_root": str(tmp_path),
+        "status_path": str(status_path),
+        "state": "blocked",
+        "terminal_state": "blocked",
+        "started_at": L.utc_now(),
+        "task_ids": ["t-123"],
+    }
+    if session_id is not None:
+        record["codex_session_id"] = session_id
+    if home is not None:
+        record["codex_home"] = str(home)
+        record["codex_home_owner_dispatch_id"] = dispatch_id
+    L.write_record(record)
+    return record
+
+
+def _stub_detached_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[list[dict], list[str]]:
+    spawn_calls: list[dict] = []
+    leases: list[str] = []
+    monkeypatch.setattr(D, "_reap_quota_stuck_before_bash_launch", lambda: None)
+    monkeypatch.setattr(
+        D,
+        "_acquire_capacity",
+        lambda *_args, **_kwargs: leases.append("lease-resume") or "lease-resume",
+    )
+    monkeypatch.setattr(
+        D,
+        "_rebuild_codex_resume_home",
+        lambda _root, _parent, expected_home, _session, **_kwargs: (
+            str(expected_home),
+            "new-seat",
+        ),
+    )
+    monkeypatch.setattr(D, "_mark_queue_claim_launch_started", lambda _args: None)
+    monkeypatch.setattr(
+        D, "_mark_queue_claim_worker_spawn_intent", lambda _args: None
+    )
+    monkeypatch.setattr(
+        D, "_mark_queue_claim_worker_spawned", lambda _args, _pid: None
+    )
+    monkeypatch.setattr(
+        D,
+        "_process_identity_after_spawn",
+        lambda pid: {
+            "pid": pid,
+            "pgid": pid,
+            "lstart": "Mon Jul 28 12:00:00 2026",
+            "comm": "codex",
+        },
+    )
+    monkeypatch.setattr(D, "process_group_id", lambda pid: pid)
+    monkeypatch.setattr(
+        D, "_start_caffeinate", lambda *_args, **_kwargs: (None, None)
+    )
+    monkeypatch.setattr(D, "_attach_worker_to_lease", lambda *_args: None)
+    monkeypatch.setattr(D, "_detach_lease_to_worker", lambda *_args: None)
+    monkeypatch.setattr(D, "_write_pidfile", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        D, "_export_dashboard_status_for_project", lambda *_args: None
+    )
+    monkeypatch.setattr(
+        D, "_upsert_project_registry_for_dispatch", lambda *_args: None
+    )
+    monkeypatch.setattr(
+        D, "_start_dashboard_refresh_for_project", lambda *_args: None
+    )
+
+    def spawn(argv: list[str], **kwargs) -> int:
+        spawn_calls.append(
+            {
+                "argv": list(argv),
+                "env": dict(kwargs.get("env") or {}),
+                "stdin_path": kwargs.get("stdin_path"),
+                "label": kwargs["label"],
+            }
+        )
+        return 42000 + len(spawn_calls)
+
+    monkeypatch.setattr(D, "_spawn_daemonized_process", spawn)
+    return spawn_calls, leases
+
+
+def test_watcher_harvests_session_handle_into_status_and_ledger(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    dispatch_id = "harvest-session"
+    home = _dispatch_home(tmp_path, dispatch_id)
+    _write_rollout(home)
+    _write_parent_record(
+        tmp_path,
+        dispatch_id=dispatch_id,
+        session_id=None,
+        home=home,
+    )
+    tail = tmp_path / "worker.tail"
+    tail.write_text("", encoding="utf-8")
+    status_path = tmp_path / "worker.status.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "goalflight_watch.py",
+            "--pid",
+            "99999999",
+            "--tail",
+            str(tail),
+            "--status-json",
+            str(status_path),
+            "--dispatch-id",
+            dispatch_id,
+            "--agent",
+            "codex",
+            "--codex-dispatch-home-resolved",
+            "--codex-dispatch-home",
+            str(home),
+            "--codex-home-owner-dispatch-id",
+            dispatch_id,
+            "--poll-secs",
+            "0.01",
+        ],
+    )
+
+    assert W.main() != 0
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+    ledger = json.loads(L.record_path(dispatch_id).read_text(encoding="utf-8"))
+    assert status["codex_session_id"] == SESSION_ID
+    assert status["codex_home"] == str(home)
+    assert status["codex_home_owner_dispatch_id"] == dispatch_id
+    assert ledger["codex_session_id"] == SESSION_ID
+    assert ledger["codex_home_owner_dispatch_id"] == dispatch_id
+    assert home.is_dir(), "recorded sessions must survive terminal cleanup"
+
+
+def test_handle_harvest_never_guesses_among_multiple_rollouts(
+    tmp_path: Path,
+) -> None:
+    home = _dispatch_home(tmp_path, "ambiguous-sessions")
+    _write_rollout(home)
+    _write_rollout(home, "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")
+
+    assert S.discover_session_id(home) is None
+
+
+def test_resume_argv_places_flags_before_subcommand_and_feeds_prompt_via_stdin(
+    tmp_path: Path,
+) -> None:
+    prompt = tmp_path / "revisions.md"
+    prompt.write_text("Apply the reviewed revisions.", encoding="utf-8")
+    args = SimpleNamespace(
+        agent="codex",
+        codex_session_id=SESSION_ID,
+        parent_dispatch_id="parent-dispatch",
+        cwd=str(tmp_path),
+        model=None,
+        os_sandbox=None,
+        read_only=False,
+    )
+
+    argv, stdin_path = D.build_worker(args, str(prompt), [])
+
+    resume_index = argv.index("resume")
+    assert argv[:2] == ["codex", "exec"]
+    assert argv.index("--skip-git-repo-check") < resume_index
+    assert argv.index("--sandbox") < resume_index
+    assert argv.index("-c") < resume_index
+    assert argv.index("-C") < resume_index
+    assert argv[resume_index:] == [
+        "resume",
+        SESSION_ID,
+        "-",  # prompt via stdin: argv would truncate long revision lists
+    ]
+    # The prompt is fed from a file, so codex never blocks waiting on EOF and a
+    # long revision list cannot overflow argv.
+    assert stdin_path == str(prompt)
+
+
+def test_resume_rebuild_allows_cross_seat_and_preserves_rollout(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    dispatch_id = "cross-seat-parent"
+    home = _dispatch_home(tmp_path, dispatch_id)
+    rollout = _write_rollout(home)
+    (home / "auth.json").write_text("old-seat", encoding="utf-8")
+    calls: list[tuple[Path, str | None, str]] = []
+
+    def resolve(
+        project_root: Path,
+        explicit_account: str | None,
+        resolved_dispatch_id: str,
+    ) -> tuple[str, str]:
+        calls.append((project_root, explicit_account, resolved_dispatch_id))
+        home.mkdir(parents=True)
+        (home / "auth.json").write_text("new-seat", encoding="utf-8")
+        return str(home), "new-seat"
+
+    monkeypatch.setattr(D, "resolve_codex_home", resolve)
+    monkeypatch.setattr(D, "cleanup_codex_dispatch_home", lambda _dispatch_id: None)
+
+    rebuilt, effective_account = D._rebuild_codex_resume_home(
+        tmp_path,
+        dispatch_id,
+        home,
+        SESSION_ID,
+    )
+
+    assert calls == [(tmp_path, None, dispatch_id)]
+    assert rebuilt == str(home)
+    assert effective_account == "new-seat"
+    assert (home / "auth.json").read_text(encoding="utf-8") == "new-seat"
+    assert S.rollout_path(home, SESSION_ID) == rollout
+
+
+def test_failed_seat_rebuild_restores_original_home(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    dispatch_id = "restore-parent"
+    home = _dispatch_home(tmp_path, dispatch_id)
+    _write_rollout(home)
+    (home / "auth.json").write_text("old-seat", encoding="utf-8")
+
+    def fail_resolve(
+        _project_root: Path,
+        explicit_account: str | None,
+        _dispatch_id: str,
+    ) -> tuple[None, None]:
+        assert explicit_account is None
+        return None, None
+
+    monkeypatch.setattr(D, "resolve_codex_home", fail_resolve)
+    monkeypatch.setattr(D, "cleanup_codex_dispatch_home", lambda _dispatch_id: None)
+
+    with pytest.raises(D.DispatchUsageError) as exc_info:
+        D._rebuild_codex_resume_home(
+            tmp_path,
+            dispatch_id,
+            home,
+            SESSION_ID,
+        )
+
+    assert str(exc_info.value) == (
+        "could not rebuild dispatch home for restore-parent with a healthy codex seat"
+    )
+    assert (home / "auth.json").read_text(encoding="utf-8") == "old-seat"
+    assert S.rollout_path(home, SESSION_ID) is not None
+
+
+def test_resume_verb_passes_lineage_and_tasks_to_normal_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    parent_id = "verb-parent"
+    home = _dispatch_home(tmp_path, parent_id)
+    _write_rollout(home)
+    _write_parent_record(tmp_path, dispatch_id=parent_id, home=home)
+    prompt = tmp_path / "revisions.md"
+    prompt.write_text("Revise the implementation.", encoding="utf-8")
+    captured: list[list[str]] = []
+    monkeypatch.setattr(
+        D,
+        "_reserve_auto_dispatch_id",
+        lambda _agent, _base: "codex-resume-child",
+    )
+    monkeypatch.setattr(
+        D,
+        "main",
+        lambda argv=None: captured.append(list(argv or [])) or 0,
+    )
+
+    assert D._cmd_resume([parent_id, "--prompt-file", str(prompt)]) == 0
+
+    launch = captured[0]
+    assert launch[launch.index("--dispatch-id") + 1] == "codex-resume-child"
+    assert launch[launch.index("--parent-dispatch-id") + 1] == parent_id
+    assert launch[launch.index("--codex-session-id") + 1] == SESSION_ID
+    assert launch[launch.index("--codex-resume-home") + 1] == str(home)
+    assert (
+        launch[launch.index("--codex-home-owner-dispatch-id") + 1]
+        == parent_id
+    )
+    assert launch[launch.index("--task") + 1] == "t-123"
+    assert "--account" not in launch
+
+
+def test_resumed_turn_uses_normal_tracking_surfaces(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    parent_id = "tracked-parent"
+    child_id = "tracked-child"
+    home = _dispatch_home(tmp_path, parent_id)
+    _write_rollout(home)
+    _write_parent_record(tmp_path, dispatch_id=parent_id, home=home)
+    prompt = tmp_path / "revisions.md"
+    prompt.write_text("Apply revision one.", encoding="utf-8")
+    tail = tmp_path / "child.tail"
+    status_path = tmp_path / "child.status.json"
+    spawn_calls, leases = _stub_detached_runtime(monkeypatch)
+
+    rc = D.main(
+        [
+            "--agent",
+            "codex",
+            "--shape",
+            "bash",
+            "--dispatch-id",
+            child_id,
+            "--cwd",
+            str(tmp_path),
+            "--prompt-file",
+            str(prompt),
+            "--tail",
+            str(tail),
+            "--status-json",
+            str(status_path),
+            "--parent-dispatch-id",
+            parent_id,
+            "--codex-session-id",
+            SESSION_ID,
+            "--codex-resume-home",
+            str(home),
+            "--codex-home-owner-dispatch-id",
+            parent_id,
+            "--launch-detached",
+        ]
+    )
+
+    assert rc == 0
+    assert leases == ["lease-resume"]
+    worker = next(call for call in spawn_calls if call["label"] == "worker")
+    watcher = next(call for call in spawn_calls if call["label"] == "watcher")
+    assert worker["env"]["CODEX_HOME"] == str(home)
+    assert worker["stdin_path"] is not None  # prompt fed from file, not argv
+    assert worker["argv"][worker["argv"].index("resume") + 1] == SESSION_ID
+    assert (
+        watcher["argv"][watcher["argv"].index("--codex-dispatch-home") + 1]
+        == str(home)
+    )
+    assert "--codex-session-id" in watcher["argv"]
+    assert "--parent-dispatch-id" in watcher["argv"]
+
+    ledger = json.loads(L.record_path(child_id).read_text(encoding="utf-8"))
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+    assert ledger["state"] == "running"
+    assert ledger["lease_id"] == "lease-resume"
+    assert ledger["parent_dispatch_id"] == parent_id
+    assert ledger["codex_session_id"] == SESSION_ID
+    assert ledger["codex_home"] == str(home)
+    assert ledger["codex_home_owner_dispatch_id"] == parent_id
+    assert ledger["effective_account"] == "new-seat"
+    assert status["state"] == "starting"
+    assert status["parent_dispatch_id"] == parent_id
+    assert status["codex_session_id"] == SESSION_ID
+    assert status["codex_home"] == str(home)
+    assert status["codex_home_owner_dispatch_id"] == parent_id
+    aggregate = next(
+        row
+        for row in L.status_payload()["records"]
+        if row["dispatch_id"] == child_id
+    )
+    assert aggregate["parent_dispatch_id"] == parent_id
+    assert aggregate["codex_session_id"] == SESSION_ID
+    assert aggregate["codex_home"] == str(home)
+    assert aggregate["codex_home_owner_dispatch_id"] == parent_id
+
+
+def test_concurrent_resumes_claim_before_capacity_and_only_one_launches(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Both callers pass the old pre-claim check; the locked claim admits one."""
+    parent_id = "concurrent-parent"
+    home = _dispatch_home(tmp_path, parent_id)
+    _write_rollout(home)
+    _write_parent_record(tmp_path, dispatch_id=parent_id, home=home)
+    prompt = tmp_path / "revisions.md"
+    prompt.write_text("Apply the same revision once.", encoding="utf-8")
+    spawn_calls, leases = _stub_detached_runtime(monkeypatch)
+
+    original_validate = D._validate_codex_resume_source
+    initial_barrier = threading.Barrier(2)
+    first_inner_entered = threading.Event()
+    second_inner_entered = threading.Event()
+    release_first_inner = threading.Event()
+    calls_by_thread: dict[str, int] = {}
+    calls_guard = threading.Lock()
+
+    def synchronized_validate(*args, **kwargs):
+        result = original_validate(*args, **kwargs)
+        name = threading.current_thread().name
+        with calls_guard:
+            call_number = calls_by_thread.get(name, 0) + 1
+            calls_by_thread[name] = call_number
+            first_inner = (
+                call_number == 2 and not first_inner_entered.is_set()
+            )
+        if call_number == 1:
+            initial_barrier.wait(timeout=5)
+        elif first_inner:
+            first_inner_entered.set()
+            assert release_first_inner.wait(timeout=5)
+        elif call_number == 2:
+            second_inner_entered.set()
+        return result
+
+    monkeypatch.setattr(D, "_validate_codex_resume_source", synchronized_validate)
+    monkeypatch.setattr(
+        D,
+        "_reserve_auto_dispatch_id",
+        lambda _agent, _base: (
+            "resume-child-a"
+            if threading.current_thread().name == "resume-a"
+            else "resume-child-b"
+        ),
+    )
+
+    results: dict[str, int] = {}
+
+    def run_resume() -> None:
+        results[threading.current_thread().name] = D._cmd_resume(
+            [parent_id, "--prompt-file", str(prompt)]
+        )
+
+    threads = [
+        threading.Thread(target=run_resume, name="resume-a"),
+        threading.Thread(target=run_resume, name="resume-b"),
+    ]
+    for thread in threads:
+        thread.start()
+    assert first_inner_entered.wait(timeout=5)
+    lock_serialized = not second_inner_entered.wait(timeout=0.5)
+    release_first_inner.set()
+    for thread in threads:
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+
+    assert lock_serialized, "owner-home/session claim must be revalidated under lock"
+    assert sorted(results.values()) == [0, 64]
+    assert len(leases) == 1
+    assert [call["label"] for call in spawn_calls].count("worker") == 1
+    assert [call["label"] for call in spawn_calls].count("watcher") == 1
+    child_records = [
+        path
+        for path in (
+            L.record_path("resume-child-a"),
+            L.record_path("resume-child-b"),
+        )
+        if path.exists()
+    ]
+    assert len(child_records) == 1
+
+
+def test_parent_child_grandchild_resume_preserves_original_home_owner(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    parent_id = "resume-parent"
+    child_id = "resume-child"
+    grandchild_id = "resume-grandchild"
+    home = _dispatch_home(tmp_path, parent_id)
+    _write_rollout(home)
+    _write_parent_record(tmp_path, dispatch_id=parent_id, home=home)
+    prompt = tmp_path / "revisions.md"
+    prompt.write_text("Apply the next reviewed revision.", encoding="utf-8")
+    dispatch_base = tmp_path / "dispatch"
+    dispatch_base.mkdir()
+
+    _stub_detached_runtime(monkeypatch)
+    reserved_ids = iter((child_id, grandchild_id))
+    monkeypatch.setattr(
+        D,
+        "_reserve_auto_dispatch_id",
+        lambda _agent, _base: next(reserved_ids),
+    )
+    monkeypatch.setattr(D, "_dispatch_base_dir", lambda: dispatch_base)
+
+    assert D._cmd_resume([parent_id, "--prompt-file", str(prompt)]) == 0
+    child = json.loads(L.record_path(child_id).read_text(encoding="utf-8"))
+    assert child["parent_dispatch_id"] == parent_id
+    assert child["codex_home"] == str(home)
+    assert child["codex_home_owner_dispatch_id"] == parent_id
+
+    child.update(
+        {
+            "state": "blocked",
+            "terminal_state": "blocked",
+            "worker_pid": None,
+            "worker_identity": None,
+        }
+    )
+    L.write_record(child)
+
+    assert D._cmd_resume([child_id, "--prompt-file", str(prompt)]) == 0
+    grandchild = json.loads(
+        L.record_path(grandchild_id).read_text(encoding="utf-8")
+    )
+    assert grandchild["parent_dispatch_id"] == child_id
+    assert grandchild["codex_session_id"] == SESSION_ID
+    assert grandchild["codex_home"] == str(home)
+    assert grandchild["codex_home_owner_dispatch_id"] == parent_id
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "missing_handle",
+        "missing_home",
+        "missing_rollout",
+    ],
+)
+def test_resume_fails_honestly_without_fresh_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    case: str,
+) -> None:
+    parent_id = "failure-parent"
+    home = _dispatch_home(tmp_path, parent_id)
+    session_id = None if case == "missing_handle" else SESSION_ID
+    if case in {"missing_handle", "missing_rollout"}:
+        home.mkdir(parents=True)
+    if case == "missing_handle":
+        _write_rollout(home)
+    _write_parent_record(
+        tmp_path,
+        dispatch_id=parent_id,
+        session_id=session_id,
+        home=home,
+    )
+    prompt = tmp_path / "revisions.md"
+    prompt.write_text("Apply revisions.", encoding="utf-8")
+    monkeypatch.setattr(
+        D,
+        "_reserve_auto_dispatch_id",
+        lambda *_args, **_kwargs: pytest.fail(
+            "honest failure must not allocate a fresh dispatch"
+        ),
+    )
+
+    rc = D.main(["resume", parent_id, "--prompt-file", str(prompt)])
+
+    assert rc == 64
+    expected = {
+        "missing_handle": (
+            "goalflight_dispatch: dispatch failure-parent has no recorded "
+            "codex session handle\n"
+        ),
+        "missing_home": (
+            f"goalflight_dispatch: dispatch home missing for failure-parent: {home}\n"
+        ),
+        "missing_rollout": (
+            "goalflight_dispatch: rollout missing for dispatch failure-parent: "
+            f"session {SESSION_ID} under {home / 'sessions'}\n"
+        ),
+    }[case]
+    assert capsys.readouterr().err == expected
+
+
+@pytest.mark.parametrize(
+    ("identity_result", "expected"),
+    [
+        (
+            (True, "live"),
+            "goalflight_dispatch: dispatch live-parent is still live; "
+            "wait for terminal before resume\n",
+        ),
+        (
+            (True, "identity_indeterminate"),
+            "goalflight_dispatch: dispatch live-parent liveness is indeterminate; "
+            "refusing codex resume\n",
+        ),
+    ],
+)
+def test_resume_refuses_live_or_indeterminate_source_with_exact_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    identity_result: tuple[bool, str],
+    expected: str,
+) -> None:
+    parent_id = "live-parent"
+    home = _dispatch_home(tmp_path, parent_id)
+    _write_rollout(home)
+    record = _write_parent_record(
+        tmp_path,
+        dispatch_id=parent_id,
+        home=home,
+    )
+    record.update(
+        {
+            "state": "running",
+            "terminal_state": "unknown",
+            "worker_pid": 43210,
+            "worker_identity": {
+                "pid": 43210,
+                "lstart": "Mon Jul 28 12:00:00 2026",
+                "comm": "codex",
+            },
+        }
+    )
+    L.write_record(record)
+    prompt = tmp_path / "revisions.md"
+    prompt.write_text("Apply revisions.", encoding="utf-8")
+    monkeypatch.setattr(L, "identity_matches", lambda _record: identity_result)
+    monkeypatch.setattr(
+        D,
+        "_reserve_auto_dispatch_id",
+        lambda *_args, **_kwargs: pytest.fail(
+            "live-source refusal must not allocate a child dispatch"
+        ),
+    )
+
+    rc = D.main(["resume", parent_id, "--prompt-file", str(prompt)])
+
+    assert rc == 64
+    assert capsys.readouterr().err == expected
+
+
+def test_resume_refuses_existing_nonterminal_child_for_same_session(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    parent_id = "duplicate-parent"
+    child_id = "duplicate-child"
+    home = _dispatch_home(tmp_path, parent_id)
+    _write_rollout(home)
+    _write_parent_record(tmp_path, dispatch_id=parent_id, home=home)
+    child = _write_parent_record(
+        tmp_path,
+        dispatch_id=child_id,
+        home=home,
+    )
+    child.update(
+        {
+            "state": "running",
+            "terminal_state": "unknown",
+            "parent_dispatch_id": parent_id,
+            "codex_home_owner_dispatch_id": parent_id,
+        }
+    )
+    L.write_record(child)
+    prompt = tmp_path / "revisions.md"
+    prompt.write_text("Apply revisions.", encoding="utf-8")
+    monkeypatch.setattr(
+        D,
+        "_reserve_auto_dispatch_id",
+        lambda *_args, **_kwargs: pytest.fail(
+            "duplicate-child refusal must not allocate another child"
+        ),
+    )
+
+    rc = D.main(["resume", parent_id, "--prompt-file", str(prompt)])
+
+    assert rc == 64
+    assert capsys.readouterr().err == (
+        "goalflight_dispatch: dispatch duplicate-parent already has non-terminal "
+        f"resume child duplicate-child for session {SESSION_ID}\n"
+    )
+
+
+def test_main_reports_resume_build_usage_error_without_traceback(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    prompt = tmp_path / "revisions.md"
+    prompt.write_text("Apply revisions.", encoding="utf-8")
+
+    rc = D.main(
+        [
+            "--agent",
+            "codex",
+            "--shape",
+            "bash",
+            "--dispatch-id",
+            "invalid-resume-child",
+            "--cwd",
+            str(tmp_path),
+            "--prompt-file",
+            str(prompt),
+            "--parent-dispatch-id",
+            "invalid-resume-parent",
+        ]
+    )
+
+    assert rc == 64
+    assert capsys.readouterr().err == (
+        "goalflight_dispatch: codex resume launch requires a recorded session handle\n"
+    )
+
+
+def test_main_reports_resume_rebuild_usage_error_without_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    parent_id = "rebuild-parent"
+    child_id = "rebuild-child"
+    home = _dispatch_home(tmp_path, parent_id)
+    _write_rollout(home)
+    _write_parent_record(tmp_path, dispatch_id=parent_id, home=home)
+    prompt = tmp_path / "revisions.md"
+    prompt.write_text("Apply revisions.", encoding="utf-8")
+    _stub_detached_runtime(monkeypatch)
+
+    def fail_rebuild(*_args, **_kwargs):
+        raise D.DispatchUsageError("resume home rebuild refused")
+
+    monkeypatch.setattr(D, "_rebuild_codex_resume_home", fail_rebuild)
+
+    rc = D.main(
+        [
+            "--agent",
+            "codex",
+            "--shape",
+            "bash",
+            "--dispatch-id",
+            child_id,
+            "--cwd",
+            str(tmp_path),
+            "--prompt-file",
+            str(prompt),
+            "--parent-dispatch-id",
+            parent_id,
+            "--codex-session-id",
+            SESSION_ID,
+            "--codex-resume-home",
+            str(home),
+            "--codex-home-owner-dispatch-id",
+            parent_id,
+            "--launch-detached",
+        ]
+    )
+
+    assert rc == 64
+    assert capsys.readouterr().err == (
+        "goalflight_dispatch: resume home rebuild refused\n"
+    )
+
+
+def test_blocked_capacity_resume_status_preserves_full_lineage(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    parent_id = "capacity-parent"
+    child_id = "capacity-child"
+    home = _dispatch_home(tmp_path, parent_id)
+    status_path = tmp_path / "capacity.status.json"
+    waiting_payloads: list[dict] = []
+    args = SimpleNamespace(
+        agent="codex",
+        dispatch_id=child_id,
+        shape="bash",
+        task_ids=["t-123"],
+        parent_dispatch_id=parent_id,
+        codex_session_id=SESSION_ID,
+        codex_resume_home=str(home),
+        codex_home_owner_dispatch_id=parent_id,
+        max_idle_secs=300,
+        priority="normal",
+        controller_pid=None,
+        capacity_wait_s=0,
+    )
+
+    def deny_capacity(_args, *, on_wait, **_kwargs):
+        on_wait(1, 0.0, {"reason": "agent_worker_cap"})
+        waiting_payloads.append(
+            json.loads(status_path.read_text(encoding="utf-8"))
+        )
+        return {"decision": "deny", "reason": "agent_worker_cap"}
+
+    monkeypatch.setattr(
+        D.goalflight_capacity,
+        "acquire_with_wait",
+        deny_capacity,
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        D._acquire_capacity(
+            args,
+            project_root=tmp_path,
+            status_json=status_path,
+        )
+
+    assert exc_info.value.code == 2
+    blocked = json.loads(status_path.read_text(encoding="utf-8"))
+    for payload, state in (
+        (waiting_payloads[0], "waiting_capacity"),
+        (blocked, "blocked_capacity"),
+    ):
+        assert payload["state"] == state
+        assert payload["parent_dispatch_id"] == parent_id
+        assert payload["codex_session_id"] == SESSION_ID
+        assert payload["codex_home"] == str(home)
+        assert payload["codex_home_owner_dispatch_id"] == parent_id

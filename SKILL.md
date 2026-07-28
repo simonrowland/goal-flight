@@ -156,7 +156,7 @@ python3 <skill-root>/scripts/goalflight_doctor.py --project-root "$PWD" --json
 Surface only actionable warnings: install ambiguity, missing required tool,
 capacity cooldown, stale dispatch, surplus worker-like process, or fingerprint
 drift against an in-flight queue.
-`goalflight_messages.py relay` output is unbounded and cross-project — scope it (pipe through `head`, or filter for the current project) before running it in controller context.
+Check mail with `relay --new` (one FROM/subject headline per unseen message) plus `--ack` to advance the read cursor. Fetch bodies deliberately (`--bodies`, or `read --dispatch-id <id>`); post with `--subject`.
 
 ## Commands
 

@@ -1465,7 +1465,7 @@ def test_session_status_helper_contract() -> None:
 
 def test_no_unsafe_codex_exec_invocations_across_docs() -> None:
     """Worker-reliability regression: scan all doc + prompt + command files
-    for `codex exec` invocations that omit `< /dev/null`. Sweep A P0
+    for `codex exec` invocations that leave stdin unredirected. Sweep A P0
     (2026-05-27) found SKILL.md:154 had a duplicate of the bash-tail
     canonical block without the stdin redirect; this test prevents that
     class from recurring elsewhere.
@@ -1517,9 +1517,20 @@ def test_no_unsafe_codex_exec_invocations_across_docs() -> None:
             else:
                 window_end = min(len(tail), 1200)
             window = tail[:window_end]
-            # An invocation is safe if it contains `< /dev/null` OR is
-            # piped-into via stdin (heredoc / |) elsewhere.
-            if "< /dev/null" in window or "<<EOF" in window or "<<'" in window:
+            # The invariant is that STDIN REACHES EOF, not the literal
+            # `/dev/null`. `codex exec` reads stdin to EOF even with a
+            # positional prompt, so any redirect from a file or heredoc is
+            # equally safe - and `resume <id> - < revisions.md` is the form
+            # tooling must use, because a positional prompt would hit argv
+            # truncation on a long revision list. Asserting the literal
+            # string here would forbid the correct invocation.
+            # Strip <placeholder> tokens BEFORE looking for a redirect: doc
+            # examples are full of `<session-id>` / `<date>`, and a naive `<`
+            # search matches those, making this check unable to fail. (It
+            # shipped that way once - the relaxation that allowed a real
+            # `< revisions.md` also accidentally allowed no redirect at all.)
+            probe = re.sub(r"<[^<>\s]*>", "", window)
+            if re.search(r"<\s*\S", probe) or "<<EOF" in window or "<<'" in window:
                 continue
             # Allow informational mentions where the codex exec line is
             # quoted inside backticks without a full multi-line invocation:
@@ -1529,7 +1540,7 @@ def test_no_unsafe_codex_exec_invocations_across_docs() -> None:
                 continue
             bad.append(f"{rel}:{text[:start].count(chr(10)) + 1}")
     assert_true(
-        f"no `codex exec --sandbox` invocations missing `< /dev/null` (found: {bad})",
+        f"no `codex exec --sandbox` invocations leave stdin unredirected (found: {bad})",
         not bad,
     )
 

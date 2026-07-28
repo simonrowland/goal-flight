@@ -204,22 +204,8 @@ def _rechecked_worker_alive(record: dict) -> bool:
 
 
 def _record_terminal_marker_kind(record: dict | None) -> str | None:
-    if not record:
-        return None
-    for key in ("terminal_marker", "last_marker"):
-        marker = record.get(key)
-        if isinstance(marker, dict):
-            value = marker.get("kind")
-            if value:
-                return str(value)
-        elif isinstance(marker, str) and marker:
-            return marker
-    markers = record.get("markers")
-    if isinstance(markers, list):
-        for marker in reversed(markers):
-            if isinstance(marker, dict) and marker.get("kind"):
-                return str(marker["kind"])
-    return None
+    marker = _record_marker_info(record)
+    return str(marker["kind"]) if marker is not None else None
 
 
 def _record_has_terminal_marker(record: dict | None) -> bool:
@@ -1291,6 +1277,60 @@ def _wait_output_is_active(progress: dict, *, poll_s: float) -> bool:
     return tail_grew or tail_changed or tail_fresh
 
 
+def _validated_terminal_marker(payload: dict) -> dict | None:
+    for key in ("terminal_marker", "last_marker"):
+        candidate = payload.get(key)
+        if isinstance(candidate, dict):
+            kind = candidate.get("kind")
+            if kind in _OUTPUT_TAIL_TERMINAL_MARKERS:
+                return candidate
+        elif (
+            isinstance(candidate, str)
+            and candidate in _OUTPUT_TAIL_TERMINAL_MARKERS
+        ):
+            return {"kind": str(candidate)}
+    markers = payload.get("markers")
+    if isinstance(markers, list):
+        for candidate in reversed(markers):
+            if (
+                isinstance(candidate, dict)
+                and candidate.get("kind") in _OUTPUT_TAIL_TERMINAL_MARKERS
+            ):
+                return candidate
+    return None
+
+
+def _record_marker_info(record: dict | None) -> dict | None:
+    """Best available terminal marker for a row, from record or status file.
+
+    The aggregated payload record does NOT carry marker fields - only the
+    per-dispatch status JSON does - so reading the record alone silently yields
+    nothing on every real dispatch while looking correct against a hand-built
+    record.
+    """
+    if record is None:
+        return None
+    candidate = _validated_terminal_marker(record)
+    if candidate is not None:
+        return candidate
+    status_path = record.get("status_path")
+    if not isinstance(status_path, str) or not status_path:
+        return None
+    try:
+        with open(status_path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    dispatch_id = record.get("dispatch_id")
+    if (
+        not isinstance(data, dict)
+        or not dispatch_id
+        or data.get("dispatch_id") != dispatch_id
+    ):
+        return None
+    return _validated_terminal_marker(data)
+
+
 def _wait_terminal_success_marker(record: dict | None) -> dict | None:
     """Rescan a dead, quiet worker tail before resolving it as worker_dead."""
     tail = _tail_path_from_record(record or {})
@@ -1467,22 +1507,63 @@ def _wait_snapshot(
         # Carry the marker kind on every terminal row. The state taxonomy
         # collapses all non-success terminals to "blocked", which makes an
         # expected checkpoint (USER-NEED) print identically to a wedged worker
-        # (BLOCKED) - the reader learns which only by opening the tail. The
-        # kind is already known here; surfacing it costs nothing.
-        marker_info: dict | None = None
-        if record is not None:
-            for key in ("terminal_marker", "last_marker"):
-                candidate = record.get(key)
-                if isinstance(candidate, dict) and candidate.get("kind"):
-                    marker_info = candidate
-                    break
-        if marker_info is None and terminal_marker:
-            marker_info = terminal_marker
+        # (BLOCKED) - the reader learns which only by opening the tail.
+        marker_info = _record_marker_info(record) or terminal_marker
         if marker_info:
             row["marker_kind"] = marker_info.get("kind")
             row["marker_headline"] = str(marker_info.get("text") or "")[:120]
+        if record is not None:
+            reason = record.get("reason") or record.get("blocked_reason")
+            if isinstance(reason, str) and reason:
+                row["block_reason"] = reason[:400]
         rows.append(row)
     return rows
+
+
+# Known dispatch-configuration failures and the invocation that actually works.
+# These are misconfigurations, not worker faults: the worker never ran, so the
+# only useful output is the corrected command. Each signature below cost real
+# dispatches before it was written down.
+SANDBOX_REMEDIATIONS: tuple[tuple[str, str], ...] = (
+    (
+        "cannot enforce workspace boundaries when cwd is inside allowed temp root",
+        "cwd is inside the temp root the sandbox already allows, so it cannot "
+        "fence the workspace: dispatch with --cwd pointing at a real project or "
+        "scratch repo outside /tmp (or --os-sandbox off if the work genuinely "
+        "needs no fence).",
+    ),
+    (
+        "no writable temporary directory",
+        "a worker that RUNS TESTS cannot be dispatched read-only at all: both "
+        "--read-only and --os-sandbox read-only resolve to `codex --sandbox "
+        "read-only`, which blocks the temp writes pytest needs. Re-dispatch "
+        "with neither flag (workspace-write) and constrain scope in the brief "
+        "plus the verify-diff, or accept an analysis-only review that runs "
+        "nothing. Verified 2026-07-28 after --os-sandbox read-only failed "
+        "identically to --read-only.",
+    ),
+    (
+        "not inside a trusted directory",
+        "the agent refuses an untrusted cwd: add --skip-git-repo-check for a "
+        "non-git workspace, or dispatch from inside the project.",
+    ),
+    (
+        "writing is blocked by read-only sandbox",
+        "the chunk edits files but was dispatched read-only: drop --read-only "
+        "and use --os-sandbox workspace-write.",
+    ),
+)
+
+
+def sandbox_remediation(text: str | None) -> str | None:
+    """Return the corrective invocation for a known sandbox misconfiguration."""
+    if not isinstance(text, str) or not text:
+        return None
+    lowered = text.lower()
+    for signature, remedy in SANDBOX_REMEDIATIONS:
+        if signature in lowered:
+            return remedy
+    return None
 
 
 def _wait_verdict_line(row: dict) -> str:
@@ -1493,9 +1574,18 @@ def _wait_verdict_line(row: dict) -> str:
     """
     base = f"{row['dispatch_id']} -> {row['state']}"
     kind = row.get("marker_kind")
+    headline = str(row.get("marker_headline") or "").strip()
+
+    # A misconfigured dispatch never ran the work; say how to re-run it rather
+    # than leaving the controller to rediscover the flag by trial.
+    remedy = sandbox_remediation(row.get("block_reason") or headline)
+    if remedy is None and str(row.get("state", "")).startswith("blocked_os_sandbox"):
+        remedy = "dispatch was refused by the OS sandbox before launch; re-dispatch with a corrected --cwd/--os-sandbox."
+    if remedy:
+        return f"{base} — DISPATCH MISCONFIGURED, kill and retry: {remedy}"
+
     if not kind or row.get("state") in ("complete", "timeout"):
         return base
-    headline = str(row.get("marker_headline") or "").strip()
     return f"{base} [{kind}] {headline}".rstrip()
 
 
