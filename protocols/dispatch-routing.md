@@ -548,12 +548,23 @@ Three delivery forms, in order of preference by situation:
   is parked, no lease is held, no liveness machinery sees an idle process.
   When the controller has revisions, it resumes the recorded session with the
   revision list as the new prompt — the context comes back from disk with the
-  surface already loaded. Verified form today: `codex exec resume
-  <session-id> "<revisions>"` on codex ≥0.144.5. The resume handle is the
-  session UUID codex prints at startup (also the rollout filename under the
-  dispatch home's `sessions/` tree); harvest it into the dispatch collateral
-  at checkpoint time — resolving it later via `--last` guesses, and guesses
-  resume the wrong session. Do not assume other agents can resume until their
+  surface already loaded. Verified form today (codex ≥0.144.5), two field-
+  learned mechanics included:
+
+  ```shell
+  CODEX_HOME=~/.goal-flight/dispatch-homes/<dispatch-id> \
+    codex exec --sandbox workspace-write -c approval_policy=never \
+    resume <session-id> "<revisions>"
+  ```
+
+  Flags go BEFORE the `resume` subcommand — appended after it they are parsed
+  as part of the prompt. And the rollout lives under the PER-DISPATCH
+  `CODEX_HOME` (`~/.goal-flight/dispatch-homes/<dispatch-id>`), not the global
+  `~/.codex` — a resume without that env var looks in the wrong home and
+  cannot find the session. The resume handle is the session UUID codex prints
+  at startup (also the rollout filename under that home's `sessions/` tree);
+  harvest it into the dispatch collateral at checkpoint time — resolving it
+  later via `--last` guesses, and guesses resume the wrong session. Do not assume other agents can resume until their
   form is verified; for them, use warm-steer or the fresh-dispatch fallback.
   Condition: the session must not be near its context ceiling — resuming an
   overfilled context buys back orientation but leaves no room to work, and a
