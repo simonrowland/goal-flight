@@ -37,7 +37,13 @@ from goalflight_acp_client import (  # noqa: E402
     _classify_oversized_json_rpc_head,
 )
 from goalflight_acp_run import (  # noqa: E402
+    _apply_user_confirm_reply_batch,
+    _read_user_confirm_replies_denying_expired,
     _resolve_steer_file,
+    _user_confirm_deadline_reached,
+    _user_confirm_denies_run,
+    _user_confirm_is_resolved,
+    _wait_for_user_confirm_replies,
     adapter_liveness_config,
     agent_command,
     decide_terminal_state,
@@ -399,6 +405,7 @@ def _run_fake_runner(
     liveness_profile: str | None = None,
     remote_turn_silence_s: float | None = None,
     remote_turn_cancel_grace_s: float = 0.1,
+    user_confirm_timeout_s: float | None = None,
     stall_kill: bool = False,
     extra_env: dict[str, str] | None = None,
     state_snapshot: dict | None = None,
@@ -417,6 +424,7 @@ def _run_fake_runner(
         env.update(
             {
                 "GOALFLIGHT_STATE_DIR": str(state_dir),
+                "GOALFLIGHT_MESSAGES_DIR": str(tmp / "messages"),
                 "GOALFLIGHT_FAKE_ACP_SCENARIO": scenario,
                 "GOALFLIGHT_FAKE_ACP_INTERVAL": "0.05",
                 "GOALFLIGHT_ACP_PYTHON": sys.executable,
@@ -456,6 +464,8 @@ def _run_fake_runner(
         if remote_turn_silence_s is not None:
             args.extend(["--remote-turn-silence-s", str(remote_turn_silence_s)])
             args.extend(["--remote-turn-cancel-grace-s", str(remote_turn_cancel_grace_s)])
+        if user_confirm_timeout_s is not None:
+            args.extend(["--user-confirm-timeout-s", str(user_confirm_timeout_s)])
         if stall_kill:
             args.append("--stall-kill")
         proc = subprocess.Popen(
@@ -1026,6 +1036,7 @@ def case_runner_blocked_none_completes() -> None:
     assert status["ok"] is True, status
     assert status["error"] is None, status
     assert status["markers"]["BLOCKED"] == ["none"], status
+    assert status["markers"]["RESULT"] == ["work done"], status
     assert status["markers"]["COMPLETE"] == ["goal done"], status
     assert not has_actionable_marker_values(status["markers"], "BLOCKED")
 
@@ -1047,6 +1058,232 @@ def case_runner_blocked_substantive_cancels() -> None:
     assert status["error"]["marker"] == "BLOCKED", status
     assert status["error"]["message"] == "early_marker_cancelled", status
     assert status["markers"]["BLOCKED"] == ["need maintainer"], status
+
+
+@skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")
+def case_runner_user_confirm_then_blocked_preserves_pending_question_and_partial() -> None:
+    returncode, status, stdout, stderr = _run_fake_runner(
+        "user_confirm_then_blocked",
+        progress_stall_s=30.0,
+        heartbeat_interval=1.0,
+        wedge_samples=999,
+        idle_timeout=5.0,
+        user_confirm_timeout_s=0.2,
+        timeout_s=20.0,
+    )
+
+    assert returncode != 0, (stdout, stderr, status)
+    assert status["state"] == "blocked", status
+    assert status["error"]["marker"] == "BLOCKED", status
+    assert status["markers"]["USER-CONFIRM"] == ["approve guarded action? [Y/N]"], status
+    assert status["markers"]["BLOCKED"] == ["unrelated hard blocker"], status
+    assert status["markers"]["RESULT"] == ["partial=survives"], status
+    assert "RESULT: partial=survives" in (status.get("result_text") or ""), status
+    pending = status.get("user_confirm_pending") or []
+    assert len(pending) == 1, status
+    assert status.get("user_confirm_resolved") == [], status
+    assert pending[0]["dispatch_id"] == status["dispatch_id"], status
+    assert pending[0]["origin"] == "worker_marker", status
+    assert pending[0]["text"] == "approve guarded action? [Y/N]", status
+    assert pending[0]["guarded_action_authorized"] is False, status
+    assert pending[0]["question_id"], status
+
+
+def case_user_confirm_denial_arbitration_is_order_independent_and_sticky() -> None:
+    def question(question_id: str) -> dict[str, object]:
+        return {
+            "question_id": question_id,
+            "origin": "worker_marker",
+            "guarded_action_authorized": False,
+        }
+
+    questions = {name: question(name) for name in ("yes-no", "no-yes", "later-no")}
+    accepted: set[int] = set()
+    rejected: set[int] = set()
+    _apply_user_confirm_reply_batch(
+        [
+            {"seq": 1, "reply_to": "yes-no", "decision": "yes"},
+            {"seq": 2, "reply_to": "yes-no", "decision": "no"},
+            {"seq": 3, "reply_to": "no-yes", "decision": "no"},
+            {"seq": 4, "reply_to": "no-yes", "decision": "yes"},
+            {"seq": 5, "reply_to": "later-no", "decision": "yes"},
+        ],
+        questions,
+        accepted,
+        rejected,
+        wall_clock=lambda: 0,
+    )
+    _apply_user_confirm_reply_batch(
+        [{"seq": 6, "reply_to": "later-no", "decision": "no"}],
+        questions,
+        accepted,
+        rejected,
+        wall_clock=lambda: -3600,
+    )
+    _apply_user_confirm_reply_batch(
+        [{"seq": 7, "reply_to": "later-no", "decision": "yes"}],
+        questions,
+        accepted,
+        rejected,
+        wall_clock=lambda: 999999,
+    )
+
+    for row in questions.values():
+        assert _user_confirm_is_resolved(row), row
+        assert row["controller_decision"] == "no", row
+        assert row["guarded_action_authorized"] is False, row
+        assert _user_confirm_denies_run(row), row
+    assert 7 in rejected
+
+
+def case_user_confirm_clocks_are_independent_without_sleeping() -> None:
+    wall = [1000]
+    awake = [9.0]
+    question = {
+        "question_id": "clock-question",
+        "origin": "worker_marker",
+        "guarded_action_authorized": False,
+    }
+    accepted: set[int] = set()
+    rejected: set[int] = set()
+    _apply_user_confirm_reply_batch(
+        [{"seq": 1, "reply_to": "clock-question", "decision": "yes"}],
+        {"clock-question": question},
+        accepted,
+        rejected,
+        wall_clock=lambda: wall[0],
+    )
+    assert question["resolved_at"] == 1000
+    assert not _user_confirm_deadline_reached(10.0, awake_clock=lambda: awake[0])
+    wall[0] = -86400
+    assert not _user_confirm_deadline_reached(10.0, awake_clock=lambda: awake[0])
+    awake[0] = 10.0
+    assert _user_confirm_deadline_reached(10.0, awake_clock=lambda: awake[0])
+
+    async def late_reply_after_awake_deadline() -> None:
+        fake_awake = [9.0]
+        reads = [0]
+        applied: list[dict] = []
+
+        async def advance_awake(_delay: float) -> None:
+            fake_awake[0] = 10.001
+
+        def read_entries() -> list[dict]:
+            reads[0] += 1
+            return [{"seq": 2, "reply_to": "late", "decision": "yes"}]
+
+        result = await _wait_for_user_confirm_replies(
+            deadline_mono=10.0,
+            poll_s=0.1,
+            read_entries=read_entries,
+            apply_replies=lambda entries: applied.extend(entries) or set(),
+            has_denial=lambda: False,
+            awake_clock=lambda: fake_awake[0],
+            sleep=advance_awake,
+        )
+        assert result == []
+        assert reads == [0], "reply mailbox was read after the awake deadline"
+        assert applied == [], "late yes was applied before timeout denial"
+
+    asyncio.run(late_reply_after_awake_deadline())
+
+    async def late_reply_crosses_deadline_during_poll_read() -> None:
+        fake_awake = [9.0]
+        applied: list[dict] = []
+
+        async def keep_awake(_delay: float) -> None:
+            return None
+
+        def read_entries() -> list[dict]:
+            fake_awake[0] = 10.001
+            return [{"seq": 2, "reply_to": "late-read", "decision": "yes"}]
+
+        result = await _wait_for_user_confirm_replies(
+            deadline_mono=10.0,
+            poll_s=0.1,
+            read_entries=read_entries,
+            apply_replies=lambda entries: applied.extend(entries) or set(),
+            has_denial=lambda: False,
+            awake_clock=lambda: fake_awake[0],
+            sleep=keep_awake,
+        )
+        assert result == []
+        assert applied == [], "mailbox read crossed the deadline before applying yes"
+
+    asyncio.run(late_reply_crosses_deadline_during_poll_read())
+
+    async def late_reply_while_reading_mailbox() -> None:
+        fake_awake = [9.0]
+        question = {
+            "question_id": "read-boundary",
+            "origin": "worker_marker",
+            "guarded_action_authorized": False,
+        }
+        questions = {"read-boundary": question}
+        accepted: set[int] = set()
+        rejected: set[int] = set()
+
+        def read_entries() -> list[dict]:
+            fake_awake[0] = 10.001
+            return [{"seq": 1, "reply_to": "read-boundary", "decision": "yes"}]
+
+        def expired_questions() -> list[dict[str, object]]:
+            return (
+                [question]
+                if _user_confirm_deadline_reached(
+                    10.0, awake_clock=lambda: fake_awake[0]
+                )
+                else []
+            )
+
+        async def deny_expired(_questions: list[dict[str, object]]) -> None:
+            _apply_user_confirm_reply_batch(
+                [{"seq": 2, "reply_to": "read-boundary", "decision": "no"}],
+                questions,
+                accepted,
+                rejected,
+                wall_clock=lambda: 0,
+            )
+
+        entries, expired, accepted_now = (
+            await _read_user_confirm_replies_denying_expired(
+                read_entries=read_entries,
+                expired_questions=expired_questions,
+                deny_expired=deny_expired,
+                apply_replies=lambda entries: _apply_user_confirm_reply_batch(
+                    entries,
+                    questions,
+                    accepted,
+                    rejected,
+                    wall_clock=lambda: 1,
+                ),
+            )
+        )
+        assert entries and expired == [question]
+        assert accepted_now == set(), accepted_now
+        assert question["controller_decision"] == "no", question
+        assert question["guarded_action_authorized"] is False, question
+        assert 1 in rejected, rejected
+
+    asyncio.run(late_reply_while_reading_mailbox())
+
+
+def case_user_confirm_wait_is_not_remote_silence_reaped() -> None:
+    returncode, status, stdout, stderr = _run_fake_runner(
+        "user_confirm_continue",
+        progress_stall_s=0.1,
+        heartbeat_interval=0.05,
+        idle_timeout=0.1,
+        liveness_profile="remote_api",
+        remote_turn_silence_s=0.1,
+        user_confirm_timeout_s=0.2,
+        extra_env={"GOALFLIGHT_FAKE_ACP_FIRST_TURN_SLEEP": "0.5"},
+    )
+    assert returncode != 0, (stdout, stderr, status)
+    assert status["state"] == "blocked_user_confirm_denied", status
+    assert status.get("user_confirm_timeout_count") == 1, status
+    assert status.get("had_user_confirm_denial") is True, status
+    assert "RESULT: draft=preserved-before-question" in status["result_text"], status
 
 
 @skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")
@@ -1528,6 +1765,10 @@ def main() -> None:
     case_terminal_state_endturn_beats_tail_race_wedge()
     case_runner_blocked_none_completes()
     case_runner_blocked_substantive_cancels()
+    case_runner_user_confirm_then_blocked_preserves_pending_question_and_partial()
+    case_user_confirm_denial_arbitration_is_order_independent_and_sticky()
+    case_user_confirm_clocks_are_independent_without_sleeping()
+    case_user_confirm_wait_is_not_remote_silence_reaped()
     case_runner_user_need_none_completes()
     case_runner_idle_silent_idle_timeout_reaps()
     case_runner_oversized_frame_dropped_then_completes()

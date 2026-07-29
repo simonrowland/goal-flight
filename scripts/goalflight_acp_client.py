@@ -1747,6 +1747,29 @@ _PERMISSION_ROUTER_OPTIONS_MAX = 8
 # targets we cannot see (no locations) cannot be proven in-worktree -> escalate.
 _WRITE_KINDS = frozenset({"edit", "delete", "move"})
 _READ_SAFE_KINDS = frozenset({"", "read", "search", "think"})
+# Once a worker has asked USER-CONFIRM, kindless requests lose the narrow
+# compatibility exemption above: only an explicitly read-only kind may proceed
+# until the correlated question is resolved. A kindless adapter request could be
+# state-changing, so treating it as safe while authorization is outstanding
+# would turn the question into implicit approval.
+_USER_CONFIRM_READ_SAFE_KINDS = frozenset({"read", "search", "think"})
+_USER_CONFIRM_MARKER_RE = re.compile(r"^\**USER-CONFIRM:\**\s*(.+?)\s*\**$")
+
+
+def _has_actionable_user_confirm_marker(text: str) -> bool:
+    """Match USER-CONFIRM with the same fence/payload rules as acp_runner."""
+    in_fence = False
+    for line in str(text or "").splitlines():
+        lstrip = line.lstrip()
+        if lstrip.startswith("```") or lstrip.startswith("~~~"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        match = _USER_CONFIRM_MARKER_RE.match(line.strip())
+        if match and match.group(1).rstrip("* \t"):
+            return True
+    return False
 
 
 def _compact_router_str(value: Any, limit: int = _PERMISSION_ROUTER_STR_MAX) -> str | None:
@@ -1915,9 +1938,17 @@ class GoalflightClient(ClientBase):  # type: ignore[misc, valid-type]
         # boundary crossings; permission_escalations alone only records the
         # escalation half.
         self.permission_router_decisions: list[dict[str, Any]] = []
+        # A worker-marker USER-CONFIRM closes every non-read permission gate until
+        # the controller resolves it. The marker cannot name an ACP tool call, so
+        # fail closed across writes/execute/fetch/unknown kinds while safe reads
+        # and thinking may continue.
+        self.user_confirm_guard = "none"
+        self._user_confirm_marker_buffer = ""
+        self._user_confirm_typed_updates_start = 0
         # Escalation TRANSPORT. "auto" (default): an escalated request is answered
-        # with a cancel immediately and surfaced via permission_escalations ->
-        # USER-CONFIRM -> re-dispatch. "inline": HOLD the request open, publish it
+        # with a cancel immediately and surfaced via permission_escalations. The
+        # unattended runner routes that question while preserving the turn; legacy
+        # direct run_prompt callers may still cancel the turn. "inline": HOLD the request open, publish it
         # via file IPC (goalflight_acp_permits), poll for the orchestrator's decision,
         # and return the real outcome IN PLACE -- it never re-dispatches. Two-phase
         # awake-time timeout: orchestrator window (permission_inline_timeout_s) then,
@@ -1978,6 +2009,12 @@ class GoalflightClient(ClientBase):  # type: ignore[misc, valid-type]
 
     def set_turn_queue(self, queue: asyncio.Queue[dict[str, Any]] | None) -> None:
         self.turn_queue = queue
+        if queue is not None:
+            self._user_confirm_marker_buffer = ""
+            self._user_confirm_typed_updates_start = len(self.typed_updates)
+
+    def set_user_confirm_guard(self, state: str) -> None:
+        self.user_confirm_guard = state if state in {"none", "pending", "denied"} else "pending"
 
     def _append_permission_router_decision(self, record: dict[str, Any]) -> None:
         self.permission_router_decisions.append(_compact_router_record(record))
@@ -1989,6 +2026,15 @@ class GoalflightClient(ClientBase):  # type: ignore[misc, valid-type]
         if StreamDirection is not None and event.direction != StreamDirection.INCOMING:
             return
         message = dict(event.message)
+        params = message.get("params") or {}
+        update = params.get("update") or {}
+        update_kind = update.get("sessionUpdate") or update.get("session_update")
+        content = update.get("content") or {}
+        if update_kind == "agent_message_chunk" and isinstance(content, dict):
+            # Keep the current turn's complete text for a permission-boundary
+            # check. Do not activate the guard from raw regex here: chunks may
+            # contain fenced examples or split a marker across updates.
+            self._user_confirm_marker_buffer += str(content.get("text") or "")
         kind = self.activity.note_message(message)
         if self.turn_queue is not None:
             self.turn_queue.put_nowait({"source": "observer", "kind": kind, "message": message})
@@ -2027,6 +2073,20 @@ class GoalflightClient(ClientBase):  # type: ignore[misc, valid-type]
 
     async def request_permission(self, options: list[Any], session_id: str, tool_call: Any, **kwargs: Any) -> Any:
         tool_id = _tc_get(tool_call, "tool_call_id", "toolCallId", "id")
+        if self.user_confirm_guard == "none":
+            recent_text = self._user_confirm_marker_buffer
+            if not recent_text:
+                for event in self.typed_updates[self._user_confirm_typed_updates_start :]:
+                    update = ((event.get("params") or {}).get("update") or {})
+                    if (
+                        update.get("sessionUpdate") or update.get("session_update")
+                    ) != "agent_message_chunk":
+                        continue
+                    content = update.get("content") or {}
+                    if isinstance(content, dict):
+                        recent_text += str(content.get("text") or "")
+            if _has_actionable_user_confirm_marker(recent_text):
+                self.user_confirm_guard = "pending"
         # Always clear pending-permission liveness tracking: we ARE answering the
         # request, on every path below (grant OR deny).
         self.activity.resolve_permission(str(tool_id) if tool_id else None)
@@ -2042,8 +2102,9 @@ class GoalflightClient(ClientBase):  # type: ignore[misc, valid-type]
         # Controller-as-auto-mode router: decide allow / deny / escalate. The
         # decision must ALWAYS resolve the (synchronous) request promptly so the
         # worker never wedges on the permission channel -- escalation answers with
-        # a cancel and is surfaced to the user out-of-band (runner -> blocked ->
-        # USER-CONFIRM -> re-dispatch), never by holding the request open.
+        # a cancel and is surfaced to the user out-of-band. The unattended runner
+        # may keep unrelated work alive, but never holds or retroactively approves
+        # this already-denied request.
         policy = self.permission_policy or default_permission_policy
         title = _tc_get(tool_call, "title") or "?"
         base_record = {
@@ -2060,6 +2121,21 @@ class GoalflightClient(ClientBase):  # type: ignore[misc, valid-type]
                 for o in (options or [])
             ],
         }
+        kind = str(base_record.get("kind") or "")
+        if (
+            self.user_confirm_guard in {"pending", "denied"}
+            and kind not in _USER_CONFIRM_READ_SAFE_KINDS
+        ):
+            record = dict(base_record)
+            record.update(
+                {
+                    "decision": PERMISSION_DENY,
+                    "reason": f"user_confirm_{self.user_confirm_guard}",
+                }
+            )
+            self._append_permission_router_decision(record)
+            log.info("deny permission while USER-CONFIRM is %s: %s", self.user_confirm_guard, title)
+            return RequestPermissionResponse(outcome=DeniedOutcome(outcome="cancelled"))
         try:
             decision = policy(tool_call, options, self.cwd)
         except Exception:

@@ -60,6 +60,7 @@ DEFAULT_MAX_ACP_EVENTS = 5000
 DEFAULT_STALL_WAKE_CAP = 3
 DEFAULT_BETWEEN_TURN_STEER_GRACE_S = 10.0
 DEFAULT_EMPTY_BETWEEN_TURN_STEER_POLL_S = 0.25
+DEFAULT_USER_CONFIRM_TIMEOUT_S = 600.0
 AGENT_STDERR_CAPTURE_BYTES = 64 * 1024
 AGENT_STDERR_ERROR_TAIL_CHARS = 1000
 LIVENESS_PROFILES = {"remote_api", "local_compute", "hybrid"}
@@ -667,10 +668,240 @@ def _steer_ack_seqs(markers: dict[str, list[str]]) -> set[int]:
 
 
 def _pending_steer_entries(mailbox: Path, seen_seqs: set[int]) -> list[dict]:
-    return [entry for entry in _read_steer_entries(mailbox) if entry["seq"] not in seen_seqs]
+    return [
+        entry
+        for entry in goalflight_steer_mailbox.worker_entries(_read_steer_entries(mailbox))
+        if entry["seq"] not in seen_seqs
+    ]
 
 
-def _steer_turn_prompt(mailbox: Path, entries: list[dict]) -> str:
+def _user_confirm_reply(entry: dict) -> tuple[str, str] | None:
+    question_id = str(entry.get("reply_to") or "").strip()
+    decision = str(entry.get("decision") or "").strip().lower()
+    if not question_id:
+        match = _re.match(
+            r"^\s*USER-CONFIRM-ANSWER:\s*(\S+)\s+(yes|no)\b",
+            str(entry.get("text") or ""),
+            _re.IGNORECASE,
+        )
+        if match:
+            question_id, decision = match.group(1), match.group(2).lower()
+    if not question_id or decision not in {"yes", "no"}:
+        return None
+    return question_id, decision
+
+
+def _user_confirm_is_resolved(question: dict[str, object]) -> bool:
+    return question.get("controller_decision") in {"yes", "no"}
+
+
+def _user_confirm_denies_run(question: dict[str, object]) -> bool:
+    """Return whether this resolved question permanently qualifies the run."""
+    if not _user_confirm_is_resolved(question):
+        return False
+    return not (
+        question.get("origin") == "worker_marker"
+        and question.get("controller_decision") == "yes"
+    )
+
+
+def _user_confirm_decision_scope(question: dict[str, object]) -> str:
+    """Return the fail-closed arbitration cohort for one guarded decision."""
+    return str(question.get("decision_scope") or question.get("question_id") or "")
+
+
+def _refresh_user_confirm_authorizations(
+    questions: dict[str, dict[str, object]],
+) -> None:
+    """Recompute authorization within each decision cohort, never session-wide."""
+    denied_scopes = {
+        _user_confirm_decision_scope(question)
+        for question in questions.values()
+        if _user_confirm_denies_run(question)
+    }
+    for question in questions.values():
+        question["guarded_action_authorized"] = bool(
+            _user_confirm_decision_scope(question) not in denied_scopes
+            and question.get("origin") == "worker_marker"
+            and question.get("controller_decision") == "yes"
+        )
+
+
+def _apply_user_confirm_reply_batch(
+    entries: list[dict],
+    questions: dict[str, dict[str, object]],
+    accepted_reply_seqs: set[int],
+    rejected_reply_seqs: set[int],
+    *,
+    wall_clock: Callable[[], int] | None = None,
+    defer_yes: bool = False,
+) -> set[int]:
+    """Apply one mailbox batch with permanent, deny-biased arbitration."""
+    resolved_at = wall_clock or _now
+    accepted: set[int] = set()
+    candidates: dict[str, list[tuple[int, str]]] = {}
+    for entry in entries:
+        reply = _user_confirm_reply(entry)
+        if reply is None:
+            continue
+        seq = int(entry["seq"])
+        if seq in accepted_reply_seqs:
+            accepted.add(seq)
+            continue
+        question_id, decision = reply
+        candidates.setdefault(question_id, []).append((seq, decision))
+
+    for question_id, replies in candidates.items():
+        question = questions.get(question_id)
+        if question is None:
+            rejected_reply_seqs.update(seq for seq, _decision in replies)
+            continue
+
+        no_replies = sorted(seq for seq, decision in replies if decision == "no")
+        yes_replies = sorted(seq for seq, decision in replies if decision == "yes")
+        prior_decision = question.get("controller_decision")
+
+        if prior_decision == "no":
+            rejected_reply_seqs.update(seq for seq, _decision in replies)
+            continue
+
+        if no_replies:
+            winning_seq = no_replies[0]
+            provisional_yes_seq = question.pop(
+                "provisional_yes_reply_steer_seq", None
+            )
+            if prior_decision == "yes":
+                question["superseded_reply_steer_seq"] = question.get("reply_steer_seq")
+            question["controller_decision"] = "no"
+            question["reply_steer_seq"] = winning_seq
+            question["resolved_at"] = resolved_at()
+            question["guarded_action_authorized"] = False
+            if prior_decision == "yes" or provisional_yes_seq is not None or yes_replies:
+                question["decision_conflict"] = True
+            accepted_reply_seqs.add(winning_seq)
+            accepted.add(winning_seq)
+            if provisional_yes_seq is not None:
+                rejected_reply_seqs.add(int(provisional_yes_seq))
+            rejected_reply_seqs.update(no_replies[1:])
+            rejected_reply_seqs.update(yes_replies)
+            continue
+
+        if prior_decision == "yes":
+            rejected_reply_seqs.update(yes_replies)
+            continue
+
+        winning_seq = yes_replies[0]
+        if defer_yes:
+            provisional_yes_seq = question.get("provisional_yes_reply_steer_seq")
+            if provisional_yes_seq is None:
+                question["provisional_yes_reply_steer_seq"] = winning_seq
+                rejected_reply_seqs.update(yes_replies[1:])
+            else:
+                rejected_reply_seqs.update(
+                    seq for seq in yes_replies if seq != provisional_yes_seq
+                )
+            continue
+        question["controller_decision"] = "yes"
+        question["reply_steer_seq"] = winning_seq
+        question["resolved_at"] = resolved_at()
+        accepted_reply_seqs.add(winning_seq)
+        accepted.add(winning_seq)
+        rejected_reply_seqs.update(yes_replies[1:])
+
+    _refresh_user_confirm_authorizations(questions)
+    return accepted
+
+
+def _finalize_provisional_user_confirm_yes(
+    questions: list[dict[str, object]],
+    all_questions: dict[str, dict[str, object]],
+    accepted_reply_seqs: set[int],
+    *,
+    wall_clock: Callable[[], int] | None = None,
+) -> None:
+    """Resolve timely affirmative replies only after arbitration closes."""
+    resolved_at = wall_clock or _now
+    for candidate in questions:
+        question = all_questions.get(str(candidate.get("question_id")))
+        if question is None:
+            continue
+        if _user_confirm_is_resolved(question):
+            continue
+        reply_seq = question.pop("provisional_yes_reply_steer_seq", None)
+        if reply_seq is None:
+            continue
+        question["controller_decision"] = "yes"
+        question["reply_steer_seq"] = int(reply_seq)
+        question["resolved_at"] = resolved_at()
+        accepted_reply_seqs.add(int(reply_seq))
+
+    _refresh_user_confirm_authorizations(all_questions)
+
+
+def _user_confirm_deadline_reached(
+    deadline_mono: float,
+    *,
+    awake_clock: Callable[[], float] = active_monotonic,
+) -> bool:
+    return awake_clock() >= deadline_mono
+
+
+async def _wait_for_user_confirm_replies(
+    *,
+    deadline_mono: float,
+    poll_s: float,
+    read_entries: Callable[[], list[dict]],
+    apply_replies: Callable[[list[dict]], set[int]],
+    has_denial: Callable[[], bool],
+    awake_clock: Callable[[], float] = active_monotonic,
+    sleep: Callable[[float], Any] = asyncio.sleep,
+) -> list[dict]:
+    """Collect replies through the deadline; only an explicit denial ends early.
+
+    An affirmative reply stays provisional so another controller's later denial
+    can join arbitration before any authorizing prompt reaches the worker.
+    """
+    entries: list[dict] = []
+    while not _user_confirm_deadline_reached(deadline_mono, awake_clock=awake_clock):
+        await sleep(poll_s)
+        if _user_confirm_deadline_reached(deadline_mono, awake_clock=awake_clock):
+            break
+        entries = read_entries()
+        if _user_confirm_deadline_reached(deadline_mono, awake_clock=awake_clock):
+            entries = []
+            break
+        apply_replies(entries)
+        if has_denial():
+            break
+    return entries
+
+
+async def _read_user_confirm_replies_denying_expired(
+    *,
+    read_entries: Callable[[], list[dict]],
+    expired_questions: Callable[[], list[dict[str, object]]],
+    deny_expired: Callable[[list[dict[str, object]]], Any],
+    apply_replies: Callable[[list[dict]], set[int]],
+) -> tuple[list[dict], list[dict[str, object]], set[int]]:
+    """Read a mailbox boundary, making any crossed deadline sticky first."""
+    entries = read_entries()
+    expired = expired_questions()
+    if expired:
+        await deny_expired(expired)
+        # Expiry settlement can append a structured timeout denial. Re-read
+        # under the now-sticky decision so that generated evidence is delivered
+        # at this same boundary and any late affirmative reply stays inert.
+        entries = read_entries()
+    accepted = apply_replies(entries)
+    return entries, expired, accepted
+
+
+def _steer_turn_prompt(
+    mailbox: Path,
+    entries: list[dict],
+    accepted_user_confirm_reply_seqs: set[int],
+    user_confirm_questions: dict[str, dict[str, object]] | None = None,
+) -> str:
     lines = [
         "Orchestrator steer messages are queued for this dispatch.",
         f"Mailbox: {mailbox}",
@@ -681,14 +912,68 @@ def _steer_turn_prompt(mailbox: Path, entries: list[dict]) -> str:
         "Queued steer entries:",
     ]
     for entry in entries:
-        lines.append(f"{entry['seq']}: {entry['text']}")
+        reply = _user_confirm_reply(entry)
+        if reply is None:
+            lines.append(f"{entry['seq']}: {entry['text']}")
+            continue
+        if int(entry["seq"]) not in accepted_user_confirm_reply_seqs:
+            lines.append(
+                f"{entry['seq']}: ignored USER-CONFIRM reply: no outstanding "
+                "question matched. No action is authorized."
+            )
+            continue
+        question_id, decision = reply
+        question = (user_confirm_questions or {}).get(question_id, {})
+        if question.get("origin") == "permission_escalation":
+            lines.append(
+                f"{entry['seq']}: Controller response recorded for {question_id}: "
+                f"{'affirmative acknowledgment' if decision == 'yes' else 'denied'}. "
+                "The ACP tool call remains denied and this response authorizes no retry "
+                "or alternate route. Use inline permission mode or a new explicitly "
+                "authorized dispatch for that action."
+            )
+        elif question.get("guarded_action_authorized") is True:
+            lines.append(
+                f"{entry['seq']}: USER-CONFIRM-ANSWER: {question_id} yes. "
+                f"Controller note: {entry['text']}"
+            )
+        elif decision == "yes":
+            lines.append(
+                f"{entry['seq']}: USER-CONFIRM-ANSWER: {question_id} "
+                "recorded-yes-not-authorized. No action is authorized."
+            )
+        else:
+            lines.append(
+                f"{entry['seq']}: USER-CONFIRM-ANSWER: {question_id} no. "
+                "The action remains denied; no action is authorized."
+            )
+    if any(_user_confirm_reply(entry) for entry in entries):
+        lines.extend(
+            [
+                "",
+                "Only a correlated `yes` for a worker-marker question whose status says "
+                "`guarded_action_authorized=true` authorizes that action. A permission-"
+                "escalation response is acknowledgment only.",
+                "A steer ACK, mailbox read, unrelated steer, or silence is not approval.",
+                "A denied ACP tool call stays denied; prose cannot retroactively authorize it.",
+            ]
+        )
     return "\n".join(lines)
 
 
-def _prompt_with_steer(base_prompt: str, mailbox: Path, entries: list[dict]) -> str:
+def _prompt_with_steer(
+    base_prompt: str,
+    mailbox: Path,
+    entries: list[dict],
+    accepted_user_confirm_reply_seqs: set[int],
+    user_confirm_questions: dict[str, dict[str, object]] | None = None,
+) -> str:
     if not entries:
         return base_prompt
-    return f"{_steer_turn_prompt(mailbox, entries)}\n\nOriginal task:\n{base_prompt}"
+    return (
+        f"{_steer_turn_prompt(mailbox, entries, accepted_user_confirm_reply_seqs, user_confirm_questions)}"
+        f"\n\nOriginal task:\n{base_prompt}"
+    )
 
 
 def _terminal_turn_marker(markers: dict[str, list[str]]) -> bool:
@@ -700,12 +985,9 @@ def _successful_terminal_marker(markers: dict[str, list[str]]) -> bool:
 
 
 def _state_after_actionable_terminal_markers(state: str, markers: dict[str, list[str]]) -> str:
-    if state == "complete" and (
-        any(
-            has_actionable_marker_values(markers, kind)
-            for kind in ACTIONABLE_BLOCKING_TERMINAL_MARKERS
-        )
-        or markers.get(USER_CONFIRM_MARKER)
+    if state == "complete" and any(
+        has_actionable_marker_values(markers, kind)
+        for kind in ACTIONABLE_BLOCKING_TERMINAL_MARKERS
     ):
         return "blocked"
     return state
@@ -1351,7 +1633,12 @@ async def spawn_and_handshake_with_retry(
     raise AcpError(f"handshake failed after {max(1, attempts)} attempt(s): {last_err}")
 
 
-async def run_acp_dispatch(cfg: argparse.Namespace) -> dict:
+async def run_acp_dispatch(
+    cfg: argparse.Namespace,
+    *,
+    wall_clock: Callable[[], int] | None = None,
+    awake_clock: Callable[[], float] | None = None,
+) -> dict:
     """Run one ACP dispatch with a SIGTERM bridge that preserves finalizers."""
     if goalflight_compat.is_windows():
         payload, _status_path = write_windows_refusal_status(cfg)
@@ -1364,6 +1651,8 @@ async def run_acp_dispatch(cfg: argparse.Namespace) -> dict:
             cfg,
             sigterm_received=lambda: bridge.received,
             signal_signum=lambda: bridge.signum,
+            wall_clock=wall_clock,
+            awake_clock=awake_clock,
         )
         return result
     except asyncio.CancelledError:
@@ -1410,12 +1699,16 @@ async def _run_acp_dispatch_impl(
     *,
     sigterm_received: Callable[[], bool] | None = None,
     signal_signum: Callable[[], int | None] | None = None,
+    wall_clock: Callable[[], int] | None = None,
+    awake_clock: Callable[[], float] | None = None,
 ) -> dict:
     """Run one ACP dispatch from an argparse.Namespace config.
 
     Not thread-callable: ACP connection registries and pidfiles are process-
     scoped, and the asyncio objects created here are bound to the active loop.
     """
+    wall_now = wall_clock or _now
+    awake_now = awake_clock or active_monotonic
     progress_stall_s = getattr(cfg, "progress_stall_s", None)
     if progress_stall_s is None:
         progress_stall_s = 300.0
@@ -1469,6 +1762,15 @@ async def _run_acp_dispatch_impl(
     run_started = time.time()
     project_root = Path(cfg.cwd).resolve()
     permission_mode = str(getattr(cfg, "permission_mode", "auto") or "auto")
+    try:
+        user_confirm_timeout_s = float(
+            getattr(cfg, "user_confirm_timeout_s", DEFAULT_USER_CONFIRM_TIMEOUT_S)
+            or DEFAULT_USER_CONFIRM_TIMEOUT_S
+        )
+    except (TypeError, ValueError):
+        user_confirm_timeout_s = DEFAULT_USER_CONFIRM_TIMEOUT_S
+    if user_confirm_timeout_s <= 0:
+        user_confirm_timeout_s = DEFAULT_USER_CONFIRM_TIMEOUT_S
     resolved_permission_dir: str | None = None
     resolved_permission_dir_source: str | None = None
     if permission_mode == "inline":
@@ -1502,6 +1804,26 @@ async def _run_acp_dispatch_impl(
     cfg.status_json = str(status_path)
     agent_stderr_path = _agent_stderr_log_path(status_path)
     agent_stderr_capture = AgentStderrCapture(agent_stderr_path)
+    user_confirm_generation = uuid.uuid4().hex
+    prior_user_confirm_tombstones: list[dict[str, object]] = []
+    try:
+        prior_payload = json.loads(status_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        prior_payload = {}
+    if (
+        isinstance(prior_payload, dict)
+        and prior_payload.get("dispatch_id") == dispatch_id
+    ):
+        for raw_question in (prior_payload.get("user_confirm_pending") or [])[:100]:
+            if not isinstance(raw_question, dict) or not raw_question.get("question_id"):
+                continue
+            tombstone = dict(raw_question)
+            tombstone["origin"] = tombstone.get("origin") or "worker_marker"
+            tombstone["controller_decision"] = "no"
+            tombstone["guarded_action_authorized"] = False
+            tombstone["resolved_at"] = wall_now()
+            tombstone["resolution_reason"] = "runner_restarted"
+            prior_user_confirm_tombstones.append(tombstone)
     payload: dict = {
         "schema": "goalflight.acp-run.v1",
         "dispatch_id": dispatch_id,
@@ -1552,6 +1874,10 @@ async def _run_acp_dispatch_impl(
             "enabled": os_sandbox_profile not in {None, OS_SANDBOX_OFF},
         },
         "permission_mode": permission_mode,
+        "user_confirm_timeout_s": user_confirm_timeout_s,
+        "user_confirm_generation": user_confirm_generation,
+        "user_confirm_pending": [],
+        "user_confirm_resolved": prior_user_confirm_tombstones,
         "permission_dir": resolved_permission_dir,
         "permission_dir_source": resolved_permission_dir_source,
         "pending_permissions": [],
@@ -1772,6 +2098,19 @@ async def _run_acp_dispatch_impl(
     stall_wake_count = 0
     stall_detach_event = asyncio.Event()
     relayed_permission_keys: set[str] = set()
+    user_confirm_questions: dict[str, dict[str, object]] = {
+        str(question["question_id"]): question
+        for question in prior_user_confirm_tombstones
+    }
+    user_confirm_keys: dict[tuple[str, str], str] = {}
+    user_confirm_deadlines_mono: dict[str, float] = {}
+    accepted_user_confirm_reply_seqs: set[int] = set()
+    rejected_user_confirm_reply_seqs: set[int] = set()
+    user_confirm_sequence = 0
+    user_confirm_timeout_continuations = 0
+    user_confirm_exhausted = False
+    awaiting_user_confirm = False
+    user_confirm_expiry_lock = asyncio.Lock()
     # CPU-aware idle gate: keeps a busy-but-silent worker (running_quiet) but
     # enforces a hard wall (lease lifetime) so a pathological CPU spinner that
     # never emits an event can't hang the runner forever.
@@ -1880,6 +2219,244 @@ async def _run_acp_dispatch_impl(
         values.append(message)
         markers["STALLED"] = values[-DEFAULT_STALL_WAKE_CAP:]
         return markers
+
+    def user_confirm_status_lists() -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+        pending: list[dict[str, object]] = []
+        resolved: list[dict[str, object]] = []
+        for question in user_confirm_questions.values():
+            target = resolved if _user_confirm_is_resolved(question) else pending
+            target.append(dict(question))
+        return pending, resolved
+
+    def refresh_user_confirm_guard() -> None:
+        questions = list(user_confirm_questions.values())
+        if any(_user_confirm_denies_run(question) for question in questions):
+            state = "denied"
+        elif any(not _user_confirm_is_resolved(question) for question in questions):
+            state = "pending"
+        else:
+            state = "none"
+        setter = getattr(getattr(conn, "client", None), "set_user_confirm_guard", None)
+        if callable(setter):
+            setter(state)
+
+    def apply_user_confirm_replies(entries: list[dict]) -> set[int]:
+        accepted = _apply_user_confirm_reply_batch(
+            entries,
+            user_confirm_questions,
+            accepted_user_confirm_reply_seqs,
+            rejected_user_confirm_reply_seqs,
+            wall_clock=wall_now,
+            defer_yes=True,
+        )
+        refresh_user_confirm_guard()
+        return accepted
+
+    async def deny_timed_out_user_confirms(
+        questions: list[dict[str, object]],
+    ) -> list[dict]:
+        nonlocal user_confirm_timeout_continuations
+        timeout_entries: list[dict] = []
+        for question in questions:
+            timeout_entries.append(
+                await asyncio.to_thread(
+                    goalflight_steer_mailbox.append_steer_entry,
+                    steer_file,
+                    (
+                        "No controller answer arrived before the unattended timeout. "
+                        "The guarded action remains denied. Continue only independent "
+                        "safe work; do not take the requested action."
+                    ),
+                    dispatch_id=dispatch_id,
+                    kind="user_confirm_reply",
+                    reply_to=str(question["question_id"]),
+                    decision="no",
+                )
+            )
+        user_confirm_timeout_continuations += 1
+        apply_user_confirm_replies(timeout_entries)
+        return timeout_entries
+
+    async def settle_expired_user_confirms(
+        questions: list[dict[str, object]],
+    ) -> list[dict]:
+        unanswered = [
+            question
+            for question in questions
+            if question.get("provisional_yes_reply_steer_seq") is None
+        ]
+        timeout_entries = (
+            await deny_timed_out_user_confirms(unanswered) if unanswered else []
+        )
+        _finalize_provisional_user_confirm_yes(
+            questions,
+            user_confirm_questions,
+            accepted_user_confirm_reply_seqs,
+            wall_clock=wall_now,
+        )
+        refresh_user_confirm_guard()
+        return timeout_entries
+
+    def expired_user_confirm_questions() -> list[dict[str, object]]:
+        now_mono = awake_now()
+        pending, _resolved = user_confirm_status_lists()
+        return [
+            question
+            for question in pending
+            if user_confirm_deadlines_mono.get(
+                str(question["question_id"]),
+                now_mono + user_confirm_timeout_s,
+            )
+            <= now_mono
+        ]
+
+    async def expire_midturn_user_confirms() -> bool:
+        """Deny crossed deadlines and end the temporary liveness exemption."""
+        nonlocal awaiting_user_confirm
+        async with user_confirm_expiry_lock:
+            expired = expired_user_confirm_questions()
+            if not expired:
+                return False
+            await deny_timed_out_user_confirms(expired)
+            awaiting_user_confirm = False
+            confirm_pending, confirm_resolved = user_confirm_status_lists()
+            await update_status(
+                user_confirm_overdue=True,
+                user_confirm_overdue_question_ids=[
+                    str(question["question_id"]) for question in expired
+                ],
+                user_confirm_timeout_count=user_confirm_timeout_continuations,
+                user_confirm_pending=confirm_pending,
+                user_confirm_resolved=confirm_resolved,
+            )
+            return True
+
+    async def route_user_confirm(event: dict[str, Any]) -> None:
+        nonlocal user_confirm_sequence, awaiting_user_confirm
+        origin = str(event.get("origin") or "worker_marker")
+        question_text = str(event.get("text") or "authorization required").strip()
+        permission_key = (
+            str((event.get("permission") or {}).get("key") or "")
+            if isinstance(event.get("permission"), dict)
+            else ""
+        )
+        key = (origin, f"{permission_key}:{question_text}")
+        prior_id = user_confirm_keys.get(key)
+        if prior_id and not _user_confirm_is_resolved(user_confirm_questions.get(prior_id, {})):
+            return
+
+        user_confirm_sequence += 1
+        question_id = f"{dispatch_id}-{user_confirm_generation}-q{user_confirm_sequence}"
+        permission = event.get("permission")
+        permission_context: dict[str, object] | None = None
+        if isinstance(permission, dict):
+            permission_context = {
+                field: permission.get(field)
+                for field in (
+                    "title",
+                    "kind",
+                    "targets_outside_cwd",
+                    "locations",
+                    "tool_call_id",
+                )
+                if permission.get(field) not in (None, [], "")
+            }
+        partial_text = str(event.get("result_text") or "")
+        question: dict[str, object] = {
+            "question_id": question_id,
+            "dispatch_id": dispatch_id,
+            "origin": origin,
+            "text": question_text,
+            "turn_index": int(turn_index),
+            # Multiple questions emitted in one turn are one authorization
+            # decision: a crossed denial poisons that cohort. A later turn or
+            # restarted generation gets a new cohort, so historical denials do
+            # not silently suppress a fresh, explicitly answered question.
+            "decision_scope": f"{user_confirm_generation}:turn:{int(turn_index)}",
+            "asked_at": wall_now(),
+            "guarded_action_authorized": False,
+        }
+        if permission_context:
+            question["permission"] = permission_context
+        user_confirm_questions[question_id] = question
+        user_confirm_keys[key] = question_id
+        user_confirm_deadlines_mono[question_id] = awake_now() + user_confirm_timeout_s
+        awaiting_user_confirm = True
+        refresh_user_confirm_guard()
+
+        relay_errors: list[str] = []
+        mailbox_context = {
+            "origin": origin,
+            "turn_index": question["turn_index"],
+            "guarded_action_authorized": False,
+            "result_excerpt": partial_text[-1000:],
+        }
+        if permission_context:
+            mailbox_context["permission"] = permission_context
+        try:
+            entry = await asyncio.to_thread(
+                goalflight_steer_mailbox.append_user_confirm,
+                steer_file,
+                dispatch_id=dispatch_id,
+                question_id=question_id,
+                text=question_text,
+                context=mailbox_context,
+            )
+            question["question_mailbox_seq"] = int(entry["seq"])
+        except Exception as exc:
+            relay_errors.append(f"steer:{type(exc).__name__}: {exc}")
+
+        try:
+            import goalflight_messages
+
+            posted = await asyncio.to_thread(
+                goalflight_messages.post_message,
+                dispatch_id=dispatch_id,
+                msg_type="user_confirm",
+                payload={
+                    "question_id": question_id,
+                    "text": question_text,
+                    "origin": origin,
+                    "turn_index": question["turn_index"],
+                    "guarded_action_authorized": False,
+                    "context": mailbox_context,
+                },
+                messages_dir=goalflight_messages.default_messages_dir(),
+                source={
+                    "node": "local",
+                    "adapter": str(cfg.agent),
+                    "transport": "acp-user-confirm",
+                },
+            )
+            question["controller_mail_seq"] = int(posted["envelope"]["seq"])
+        except Exception as exc:
+            relay_errors.append(f"controller-mail:{type(exc).__name__}: {exc}")
+
+        markers = dict(payload.get("markers") or {})
+        marker_values = list(markers.get(USER_CONFIRM_MARKER) or [])
+        if question_text not in marker_values:
+            marker_values.append(question_text)
+        markers[USER_CONFIRM_MARKER] = marker_values
+        for kind, values in extract_markers(partial_text).items():
+            existing = list(markers.get(kind) or [])
+            existing.extend(value for value in values if value not in existing)
+            markers[kind] = existing
+        pending, resolved = user_confirm_status_lists()
+        updates: dict[str, object] = {
+            "state": "running_user_confirm",
+            "markers": markers,
+            "last_marker": {USER_CONFIRM_MARKER: question_text},
+            "user_confirm_pending": pending,
+            "user_confirm_resolved": resolved,
+            # Persist the full partial turn at the moment the question is routed.
+            # A later liveness failure must not erase pre-question RESULT lines.
+            "result_text": partial_text or payload.get("result_text"),
+            "text_excerpt": partial_text[-4000:] or payload.get("text_excerpt"),
+        }
+        if relay_errors:
+            question["relay_errors"] = relay_errors
+            updates["user_confirm_relay_errors"] = relay_errors
+        await update_status(**updates)
 
     async def relay_inline_permissions() -> None:
         if permission_mode != "inline" or not resolved_permission_dir:
@@ -2130,6 +2707,42 @@ async def _run_acp_dispatch_impl(
                 await conn.kill()
                 return
             if (
+                awaiting_user_confirm
+                and turn_in_flight
+                and outstanding_count == 0
+                and pid_alive
+            ):
+                overdue = await expire_midturn_user_confirms()
+                if not overdue:
+                    # A prose USER-CONFIRM is not an ACP permission hold. Before
+                    # its absolute awake-time deadline the worker may keep doing
+                    # safe work or wait to end its turn without being reaped as
+                    # silence. Once the deadline crosses, the question is
+                    # explicitly denied above and every normal silence/wedge
+                    # backstop below is active again.
+                    dead_samples = 0
+                    confirm_pending, confirm_resolved = user_confirm_status_lists()
+                    await update_status(
+                        state="awaiting_user_confirm",
+                        user_confirm_pending=confirm_pending,
+                        user_confirm_resolved=confirm_resolved,
+                        worker_pid=proc.pid,
+                        pgid=pgid,
+                        worker_alive=pid_alive,
+                        pgroup_cpu_pct=cpu_pct,
+                        heartbeat_at=_now(),
+                        heartbeat_dead_samples=dead_samples,
+                        wedge_progress_seen=progress_seen,
+                        outstanding_tool_calls=outstanding_count,
+                        acp_dropped_frames=dropped_frames,
+                        quiet_for_s=round(quiet_for_s, 3),
+                        progress_quiet_for_s=round(progress_quiet_s, 3),
+                        turn_in_flight=True,
+                        turn_silent_for_s=round(turn_silent_for_s, 3),
+                    )
+                    await asyncio.sleep(cfg.heartbeat_interval)
+                    continue
+            if (
                 liveness_profile == "remote_api"
                 and turn_in_flight
                 and outstanding_count == 0
@@ -2245,7 +2858,11 @@ async def _run_acp_dispatch_impl(
                 dead_samples = 0
                 last_sample_progress_seen = progress_seen
                 await update_status(
-                    state="awaiting_next_prompt",
+                    state=(
+                        "awaiting_user_confirm"
+                        if awaiting_user_confirm
+                        else "awaiting_next_prompt"
+                    ),
                     steer_pending_seqs=[
                         int(entry["seq"]) for entry in pending_steer_entries
                     ] or payload.get("steer_pending_seqs", []),
@@ -2436,6 +3053,19 @@ async def _run_acp_dispatch_impl(
         # wedged ⇒ let the runner cancel.
         if proc is None or proc.returncode is not None:
             return False
+        if awaiting_user_confirm and activity.turn_in_flight():
+            overdue = await expire_midturn_user_confirms()
+            if not overdue:
+                confirm_pending, confirm_resolved = user_confirm_status_lists()
+                await update_status(
+                    state="awaiting_user_confirm",
+                    user_confirm_pending=confirm_pending,
+                    user_confirm_resolved=confirm_resolved,
+                    worker_alive=True,
+                    heartbeat_at=_now(),
+                    turn_in_flight=True,
+                )
+                return True
         if liveness_profile == "remote_api" and activity.turn_in_flight():
             now_mono = active_monotonic()
             await update_status(
@@ -2654,6 +3284,7 @@ async def _run_acp_dispatch_impl(
                 env=spawn_env,
                 stderr_capture=agent_stderr_capture,
             )
+        refresh_user_confirm_guard()
         await update_status(os_sandbox=getattr(conn, "os_sandbox_metadata", None) or payload["os_sandbox"])
         test_marker = goalflight_compat.allowed_env_override(
             "GOALFLIGHT_TEST_ACP_BEFORE_PID_LEDGER_UPDATE_FILE",
@@ -2685,20 +3316,60 @@ async def _run_acp_dispatch_impl(
         next_prompt = prompt
         while True:
             seen_steer_seqs = delivered_steer_seqs | acked_steer_seqs
-            pending_steers = _pending_steer_entries(steer_file, seen_steer_seqs)
+            (
+                pending_steers,
+                expired_questions,
+                valid_confirm_reply_seqs,
+            ) = await _read_user_confirm_replies_denying_expired(
+                read_entries=lambda: _pending_steer_entries(
+                    steer_file, seen_steer_seqs
+                ),
+                expired_questions=expired_user_confirm_questions,
+                deny_expired=settle_expired_user_confirms,
+                apply_replies=apply_user_confirm_replies,
+            )
+            if expired_questions:
+                confirm_pending, confirm_resolved = user_confirm_status_lists()
+                await update_status(
+                    user_confirm_timeout_count=user_confirm_timeout_continuations,
+                    user_confirm_pending=confirm_pending,
+                    user_confirm_resolved=confirm_resolved,
+                    steer_pending_seqs=[
+                        int(entry["seq"]) for entry in pending_steers
+                    ],
+                )
+            if not user_confirm_status_lists()[0]:
+                awaiting_user_confirm = False
             turn_steer_seqs: set[int] = set()
             if pending_steers:
                 pending_seqs = [int(entry["seq"]) for entry in pending_steers]
                 turn_steer_seqs = set(pending_seqs)
+                confirm_pending, confirm_resolved = user_confirm_status_lists()
                 await update_status(
                     steer_pending_seqs=pending_seqs,
                     steer_delivery_state="delivering_at_turn_boundary",
                     steer_turn_index=turn_index,
+                    user_confirm_pending=confirm_pending,
+                    user_confirm_resolved=confirm_resolved,
+                    user_confirm_rejected_reply_seqs=(
+                        sorted(rejected_user_confirm_reply_seqs) or None
+                    ),
                 )
                 next_prompt = (
-                    _prompt_with_steer(prompt, steer_file, pending_steers)
+                    _prompt_with_steer(
+                        prompt,
+                        steer_file,
+                        pending_steers,
+                        valid_confirm_reply_seqs,
+                        user_confirm_questions,
+                    )
                     if turn_index == 0
-                    else _steer_turn_prompt(steer_file, pending_steers)
+                    else _steer_turn_prompt(
+                        steer_file,
+                        pending_steers,
+                        valid_confirm_reply_seqs,
+                        user_confirm_questions,
+                    )
                 )
                 delivered_steer_seqs.update(pending_seqs)
             elif turn_index == 0:
@@ -2717,6 +3388,8 @@ async def _run_acp_dispatch_impl(
                 idle_timeout=cfg.idle_timeout,
                 on_event=note_event,
                 on_idle=on_idle_check,
+                user_confirm_policy="route",
+                on_user_confirm=route_user_confirm,
             ))
             await asyncio.sleep(0)
             awaiting_next_prompt = False
@@ -2751,22 +3424,114 @@ async def _run_acp_dispatch_impl(
                 if awaiting_next_prompt and between_turn_steer_grace_s > 0
                 else 0.0
             )
-            pending_after_turn = _pending_steer_entries(
-                steer_file,
-                delivered_steer_seqs | acked_steer_seqs,
-            )
-            await update_status(
-                steer_pending_seqs=[int(entry["seq"]) for entry in pending_after_turn],
-                steer_delivered_seqs=sorted(delivered_steer_seqs),
-                steer_acked_seqs=sorted(acked_steer_seqs),
-                steer_delivery_state="between_turns",
-            )
             turn_index += 1
             current_turn_was_steer = bool(turn_steer_seqs)
             if not turn_result.ok or turn_result.cancelled_for_marker:
                 awaiting_next_prompt = False
                 awaiting_next_prompt_deadline_mono = 0.0
+                confirm_pending, confirm_resolved = user_confirm_status_lists()
+                await update_status(
+                    steer_delivered_seqs=sorted(delivered_steer_seqs),
+                    steer_acked_seqs=sorted(acked_steer_seqs),
+                    steer_delivery_state="between_turns",
+                    user_confirm_pending=confirm_pending,
+                    user_confirm_resolved=confirm_resolved,
+                )
                 break
+            (
+                pending_after_turn,
+                _expired_after_turn,
+                _valid_after_turn_reply_seqs,
+            ) = await _read_user_confirm_replies_denying_expired(
+                read_entries=lambda: _pending_steer_entries(
+                    steer_file,
+                    delivered_steer_seqs | acked_steer_seqs,
+                ),
+                expired_questions=expired_user_confirm_questions,
+                deny_expired=settle_expired_user_confirms,
+                apply_replies=apply_user_confirm_replies,
+            )
+            confirm_pending, confirm_resolved = user_confirm_status_lists()
+            if not confirm_pending:
+                awaiting_user_confirm = False
+            await update_status(
+                steer_pending_seqs=[int(entry["seq"]) for entry in pending_after_turn],
+                steer_delivered_seqs=sorted(delivered_steer_seqs),
+                steer_acked_seqs=sorted(acked_steer_seqs),
+                steer_delivery_state="between_turns",
+                user_confirm_pending=confirm_pending,
+                user_confirm_resolved=confirm_resolved,
+            )
+            if confirm_pending:
+                if user_confirm_timeout_continuations >= 1:
+                    # One fail-closed denial continuation already ran. A fresh
+                    # USER-CONFIRM means the worker could not separate safe work
+                    # from the guarded action; preserve the run and stop cleanly.
+                    user_confirm_exhausted = True
+                    awaiting_next_prompt = False
+                    awaiting_next_prompt_deadline_mono = 0.0
+                    break
+
+                poll_s = min(max(float(cfg.heartbeat_interval or 0.1), 0.05), 0.25)
+                confirm_deadline_mono = min(
+                    user_confirm_deadlines_mono.get(
+                        str(question["question_id"]),
+                        awake_now() + user_confirm_timeout_s,
+                    )
+                    for question in confirm_pending
+                )
+                awaiting_user_confirm = True
+                awaiting_next_prompt = True
+                awaiting_next_prompt_deadline_mono = confirm_deadline_mono
+                await update_status(
+                    state="awaiting_user_confirm",
+                    user_confirm_pending=confirm_pending,
+                    user_confirm_resolved=confirm_resolved,
+                    user_confirm_timeout_at_mono=round(confirm_deadline_mono, 3),
+                )
+                pending_after_turn = await _wait_for_user_confirm_replies(
+                    deadline_mono=confirm_deadline_mono,
+                    poll_s=poll_s,
+                    read_entries=lambda: _pending_steer_entries(
+                        steer_file,
+                        delivered_steer_seqs | acked_steer_seqs,
+                    ),
+                    apply_replies=apply_user_confirm_replies,
+                    has_denial=lambda: any(
+                        question.get("controller_decision") == "no"
+                        for question in user_confirm_questions.values()
+                    ),
+                    awake_clock=awake_now,
+                )
+                confirm_pending, confirm_resolved = user_confirm_status_lists()
+                if confirm_pending and _user_confirm_deadline_reached(
+                    confirm_deadline_mono,
+                    awake_clock=awake_now,
+                ):
+                    # Timeout assumption: 600 awake seconds is long enough for
+                    # normal mailbox polls. Silence is a DENIAL, never approval.
+                    # The deadline wins over unrelated steer already waiting at
+                    # this boundary. Send one correlated "no" turn so the worker
+                    # can finish independent work; a repeated question blocks.
+                    await settle_expired_user_confirms(confirm_pending)
+                    pending_after_turn = _pending_steer_entries(
+                        steer_file,
+                        delivered_steer_seqs | acked_steer_seqs,
+                    )
+                    confirm_pending, confirm_resolved = user_confirm_status_lists()
+                    await update_status(
+                        user_confirm_timeout_count=user_confirm_timeout_continuations,
+                        user_confirm_pending=confirm_pending,
+                        user_confirm_resolved=confirm_resolved,
+                        steer_pending_seqs=[
+                            int(entry["seq"]) for entry in pending_after_turn
+                        ],
+                    )
+                awaiting_user_confirm = False
+                awaiting_next_prompt = False
+                awaiting_next_prompt_deadline_mono = 0.0
+                next_prompt = ""
+                continue
             if (
                 not pending_after_turn
                 and not _terminal_turn_marker(turn_markers)
@@ -2816,6 +3581,19 @@ async def _run_acp_dispatch_impl(
                 break
             next_prompt = ""
 
+        # No asynchronous status writer may survive into terminal
+        # reconciliation. Otherwise a final heartbeat sampled during the
+        # between-turn grace can overwrite state=complete with
+        # state=awaiting_next_prompt after completion evidence is recorded.
+        awaiting_user_confirm = False
+        awaiting_next_prompt = False
+        awaiting_next_prompt_deadline_mono = 0.0
+        if heartbeat_task is not None:
+            heartbeat_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await heartbeat_task
+            heartbeat_task = None
+
         result = _merge_prompt_results(prompt_results)
         final_prompt_result = _last_prompt_result(prompt_results, result)
         markers = extract_markers(result.text)
@@ -2824,8 +3602,26 @@ async def _run_acp_dispatch_impl(
             merged_markers = dict(relay_markers)
             for kind, values in markers.items():
                 merged_markers.setdefault(kind, [])
-                merged_markers[kind].extend(values)
+                merged_markers[kind].extend(
+                    value for value in values if value not in merged_markers[kind]
+                )
             markers = merged_markers
+        # A harder terminal marker can cancel the turn before the streaming
+        # callback observes a preceding USER-CONFIRM chunk. Reconcile the final
+        # marker evidence so the unanswered question remains visible and denied.
+        for question_text in markers.get(USER_CONFIRM_MARKER) or []:
+            if any(
+                question.get("text") == question_text
+                for question in user_confirm_questions.values()
+            ):
+                continue
+            await route_user_confirm(
+                {
+                    "origin": "worker_marker",
+                    "text": question_text,
+                    "result_text": result.text,
+                }
+            )
         async with status_lock:
             terminal_by_heartbeat = heartbeat_outcome or getattr(conn, "heartbeat_outcome", None)
             terminal_error = heartbeat_error
@@ -2846,6 +3642,40 @@ async def _run_acp_dispatch_impl(
             successful_terminal_marker=_successful_terminal_marker(markers),
         )
         state = _state_after_actionable_terminal_markers(state, markers)
+        confirm_pending, confirm_resolved = user_confirm_status_lists()
+        if state == "complete" and (confirm_pending or user_confirm_exhausted):
+            state = "blocked_user_confirm"
+            error = {
+                "code": 0,
+                "message": (
+                    "user_confirm_unresolved_after_denial"
+                    if user_confirm_exhausted
+                    else "user_confirm_unresolved"
+                ),
+                "question_ids": [
+                    str(question.get("question_id")) for question in confirm_pending
+                ],
+            }
+        denied_questions = [
+            question for question in confirm_resolved if _user_confirm_denies_run(question)
+        ]
+        if state == "complete" and denied_questions:
+            permission_denied = any(
+                question.get("origin") == "permission_escalation"
+                for question in denied_questions
+            )
+            state = (
+                "blocked_permission_denied"
+                if permission_denied
+                else "blocked_user_confirm_denied"
+            )
+            error = {
+                "code": 0,
+                "message": "requested_action_denied_safe_work_preserved",
+                "question_ids": [
+                    str(question.get("question_id")) for question in denied_questions
+                ],
+            }
         # Sweep B P1 (2026-05-27): denied permissions can look like success.
         # If the worker had any inline permission auto-declined (timeout or
         # explicit deny) and no PERMISSION-OK-PROCEEDED marker says it
@@ -2868,12 +3698,27 @@ async def _run_acp_dispatch_impl(
             "markers": markers,
             "last_marker": {kind: values[-1] for kind, values in markers.items() if values} or None,
             "text_excerpt": result.text[-4000:],
-            "result_text": result.text if state == "complete" else None,
+            # Full output is evidence even when the turn blocks or fails. Keeping
+            # it only for complete states destroyed all pre-question work.
+            "result_text": result.text or payload.get("result_text"),
+            "user_confirm_pending": confirm_pending,
+            "user_confirm_resolved": confirm_resolved,
+            "user_confirm_timeout_count": (
+                user_confirm_timeout_continuations or None
+            ),
+            "had_denied_action": bool(denied_questions),
+            "had_user_confirm_denial": any(
+                question.get("controller_decision") == "no"
+                for question in confirm_resolved
+            ),
+            "user_confirm_rejected_reply_seqs": (
+                sorted(rejected_user_confirm_reply_seqs) or None
+            ),
             "out_of_scope_writes": result.out_of_scope_writes,
             # Permission requests the orchestrator router escalated to the user
-            # (boundary crossings it would not auto-allow). state is "blocked"
-            # (marker USER-CONFIRM); the orchestrator surfaces these, gets a user
-            # decision, and re-dispatches. None when nothing was escalated.
+            # (boundary crossings it would not auto-allow). The individual ACP
+            # action was denied before the question was routed. The worker may
+            # continue safe work, but prose never retroactively authorizes it.
             "permission_pending": result.permission_escalations or None,
             # Inline permissions the orchestrator auto-declined on timeout. Sweep B
             # P1: this list NOW influences terminal state — if non-empty and the
@@ -2909,6 +3754,30 @@ async def _run_acp_dispatch_impl(
             payload.pop("permission_router_decisions", None)
             payload.pop("tool_calls", None)
         payload.update(final_updates)
+        if user_confirm_questions and state == "complete":
+            try:
+                import goalflight_messages
+
+                await asyncio.to_thread(
+                    goalflight_messages.post_message,
+                    dispatch_id=dispatch_id,
+                    msg_type="result",
+                    payload={
+                        "complete": True,
+                        "text": "USER-CONFIRM resolved; dispatch completed.",
+                        "question_ids": sorted(user_confirm_questions),
+                    },
+                    messages_dir=goalflight_messages.default_messages_dir(),
+                    source={
+                        "node": "local",
+                        "adapter": str(cfg.agent),
+                        "transport": "acp-user-confirm",
+                    },
+                )
+            except Exception as exc:
+                payload["user_confirm_resolution_relay_error"] = (
+                    f"{type(exc).__name__}: {exc}"
+                )
     except asyncio.CancelledError:
         if sigterm_received is not None and sigterm_received():
             payload.update(
@@ -3019,6 +3888,17 @@ def normalized_acp_dispatch_cfg(args: argparse.Namespace) -> argparse.Namespace:
         values["max_consecutive_tool_errors"] = DEFAULT_MAX_CONSECUTIVE_TOOL_ERRORS
     if values.get("max_acp_events", 0) <= 0:
         values["max_acp_events"] = DEFAULT_MAX_ACP_EVENTS
+    if not values.get("user_confirm_timeout_s"):
+        values["user_confirm_timeout_s"] = os.environ.get(
+            "GOALFLIGHT_USER_CONFIRM_TIMEOUT_S",
+            DEFAULT_USER_CONFIRM_TIMEOUT_S,
+        )
+    try:
+        values["user_confirm_timeout_s"] = float(values["user_confirm_timeout_s"])
+    except (TypeError, ValueError):
+        values["user_confirm_timeout_s"] = DEFAULT_USER_CONFIRM_TIMEOUT_S
+    if values["user_confirm_timeout_s"] <= 0:
+        values["user_confirm_timeout_s"] = DEFAULT_USER_CONFIRM_TIMEOUT_S
     if values.get("max_quiet_s", 0) <= 0:
         values["max_quiet_s"] = 3600.0
     if values.get("progress_stall_s", 0) <= 0:
@@ -3137,6 +4017,23 @@ def main(argv: list[str] | None = None) -> int:
         help="File-IPC steer mailbox for between-turn ACP steer delivery.",
     )
     parser.add_argument(
+        "--user-confirm-timeout-s",
+        type=float,
+        default=float(
+            os.environ.get(
+                "GOALFLIGHT_USER_CONFIRM_TIMEOUT_S",
+                str(DEFAULT_USER_CONFIRM_TIMEOUT_S),
+            )
+        ),
+        help=(
+            "Awake-second deadline for a correlated unattended USER-CONFIRM reply "
+            "(default 600). Timeout is fail-closed at the next safe turn boundary: "
+            "append one explicit 'no' continuation so safe independent work can "
+            "finish; do not kill an in-flight asking turn merely for waiting. A "
+            "repeated question then blocks with partial output preserved."
+        ),
+    )
+    parser.add_argument(
         "--context-mode",
         choices=["enabled", "disabled"],
         default="enabled",
@@ -3161,8 +4058,9 @@ def main(argv: list[str] | None = None) -> int:
         choices=["auto", "inline"],
         default="auto",
         help="Escalation transport for boundary-crossing permission requests. "
-             "'auto' (default): answer with a cancel and surface permission_pending "
-             "(USER-CONFIRM -> re-dispatch). 'inline': HOLD the worker open and "
+             "'auto' (default): deny the individual request, route USER-CONFIRM "
+             "to controller mail, and keep the turn alive for safe independent work. "
+             "'inline': HOLD the worker open and "
              "authorize in place via the --permission-dir file IPC (an orchestrator "
              "drains the dir, optionally write_ack to defer to the user, writes a "
              "decision) -- it never re-dispatches. Two-phase awake-time timeout: if "

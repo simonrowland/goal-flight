@@ -168,6 +168,139 @@ def request_permission(
 
 def handle_prompt(req_id: int, params: dict) -> None:
     session_id = params.get("sessionId", "")
+    if SCENARIO in {
+        "user_confirm_continue",
+        "user_confirm_split_marker",
+        "user_confirm_repeat_after_no",
+        "permission_escalate_continue",
+        "user_confirm_fenced_example",
+        "user_confirm_kindless_guard",
+        "user_confirm_same_turn_guard",
+    }:
+        session = sessions.setdefault(session_id, {})
+        turn = int(session.get("turn", 0)) + 1
+        session["turn"] = turn
+        guarded_file = os.environ.get("GOALFLIGHT_FAKE_ACP_GUARDED_FILE")
+        if turn == 1:
+            marker = os.environ.get("GOALFLIGHT_FAKE_ACP_TURN1_FILE")
+            if marker:
+                with open(marker, "w", encoding="utf-8") as f:
+                    f.write("turn1\n")
+            if SCENARIO in {
+                "user_confirm_fenced_example",
+                "user_confirm_kindless_guard",
+                "user_confirm_same_turn_guard",
+            }:
+                text_update(session_id, "RESULT: draft=preserved-before-question\n")
+                if SCENARIO == "user_confirm_fenced_example":
+                    text_update(
+                        session_id,
+                        "```text\nUSER-CONFIRM: example only; do not guard\n```\n",
+                    )
+                else:
+                    text_update(
+                        session_id,
+                        "USER-CONFIRM: authorize guarded sentinel write? [Y/N]\n",
+                    )
+                time.sleep(0.1)
+                selected = request_permission(
+                    session_id,
+                    "marker-guard-continue",
+                    options=CODEX_PERMISSION_OPTIONS,
+                    title="Write guarded sentinel after marker",
+                    kind="" if SCENARIO == "user_confirm_kindless_guard" else "edit",
+                    locations=(
+                        None
+                        if SCENARIO == "user_confirm_kindless_guard"
+                        else [
+                            {
+                                "path": os.environ.get(
+                                    "GOALFLIGHT_FAKE_ACP_PERMISSION_LOCATION",
+                                    guarded_file or "/outside/guarded",
+                                )
+                            }
+                        ]
+                    ),
+                )
+                if selected and guarded_file:
+                    with open(guarded_file, "w", encoding="utf-8") as f:
+                        f.write("authorized\n")
+                text_update(
+                    session_id,
+                    f"RESULT: same_turn_guarded_action_taken={str(bool(selected)).lower()}\n",
+                )
+                text_update(session_id, "COMPLETE: same-turn safe work preserved\n")
+            elif SCENARIO == "permission_escalate_continue":
+                selected = request_permission(
+                    session_id,
+                    "perm-continue",
+                    options=CODEX_PERMISSION_OPTIONS,
+                    title="Write guarded sentinel",
+                    locations=[{"path": guarded_file or "/outside/guarded"}],
+                )
+                if selected and guarded_file:
+                    with open(guarded_file, "w", encoding="utf-8") as f:
+                        f.write("authorized\n")
+                text_update(
+                    session_id,
+                    f"RESULT: permission={selected or 'denied'} safe_work=preserved\n",
+                )
+                text_update(session_id, "COMPLETE: permission-denied work preserved\n")
+            else:
+                text_update(session_id, "RESULT: draft=preserved-before-question\n")
+                if SCENARIO == "user_confirm_split_marker":
+                    text_update(session_id, "USER-CONFIRM: authorize guarded")
+                    text_update(
+                        session_id,
+                        " sentinel write? [Y/N]\n",
+                    )
+                else:
+                    text_update(
+                        session_id,
+                        "USER-CONFIRM: authorize guarded sentinel write? [Y/N]\n",
+                    )
+                time.sleep(
+                    float(os.environ.get("GOALFLIGHT_FAKE_ACP_FIRST_TURN_SLEEP", "0.5"))
+                )
+            response(req_id, {"sessionId": session_id, "stopReason": "end_turn"})
+            return
+
+        prompt = prompt_text(params)
+        decision = "yes" if " yes." in prompt or " yes " in prompt else "no"
+        if SCENARIO == "user_confirm_repeat_after_no" and decision == "no":
+            text_update(session_id, "RESULT: independent_work=preserved_after_denial\n")
+            text_update(
+                session_id,
+                "USER-CONFIRM: authorize guarded sentinel write? [Y/N]\n",
+            )
+            response(req_id, {"sessionId": session_id, "stopReason": "end_turn"})
+            return
+        if decision == "yes" and guarded_file:
+            with open(guarded_file, "w", encoding="utf-8") as f:
+                f.write("authorized\n")
+        for line in prompt.splitlines():
+            if line.lstrip().startswith(tuple(f"{i}:" for i in range(1, 20))):
+                seq = line.split(":", 1)[0].strip()
+                text_update(session_id, f"STEER-ACK: {seq}\n")
+                break
+        text_update(
+            session_id,
+            f"RESULT: guarded_action_taken={str(decision == 'yes').lower()}\n",
+        )
+        text_update(session_id, "COMPLETE: continued after explicit decision\n")
+        response(req_id, {"sessionId": session_id, "stopReason": "end_turn"})
+        return
+    if SCENARIO == "user_confirm_then_blocked":
+        text_update(
+            session_id,
+            "RESULT: partial=survives\n"
+            "USER-CONFIRM: approve guarded action? [Y/N]\n"
+            "BLOCKED: unrelated hard blocker\n",
+        )
+        while True:
+            message = read_message()
+            if message is None or message.get("method") == "session/cancel":
+                return
     if SCENARIO in {"steer_multiturn", "steer_nonterminal_then_complete"}:
         session = sessions.setdefault(session_id, {})
         turn = int(session.get("turn", 0)) + 1

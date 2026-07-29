@@ -73,11 +73,29 @@ Right-size the shape — three loop failure modes to avoid:
   `claude-code-cli-acp` PTY session path; `StartupGate` serializes spawn→handshake
   and the Claude cap is 5.
 
-  Cursor tool-use or file-writing chunks need `--permission-mode inline`
-  (alias: `--interactive`). Plain `auto`
-  permission mode can surface shell/tool escalation as `USER-CONFIRM` and block
-  the worker even though the same chunk completes when inline permission routing
-  is active.
+  Cursor tool-use or file-writing chunks that need attended in-place approval
+  use `--permission-mode inline` (alias: `--interactive`). Plain `auto` denies
+  the individual boundary-crossing tool request, routes `USER-CONFIRM` to
+  controller mail, and keeps the turn alive for independent safe work. A
+  correlated steer answer can guide the next turn, but cannot retroactively
+  authorize the already-denied tool call; use inline mode or a fresh explicitly
+  authorized dispatch when that action itself must proceed.
+  For permission-escalation questions, even a correlated `yes` is acknowledgment
+  only: it does not authorize a retry or alternate route. Any `no` is permanent
+  and deny-biased across conflicting controller replies.
+  Answer a routed question with
+  `USER-CONFIRM-ANSWER: <question_id> yes|no <optional note>` in
+  `goalflight_dispatch.py steer`. The `<question_id>` must match an outstanding
+  mailbox question exactly; unknown, stale, and duplicate replies are delivered
+  only as explicit non-authorization notices. Unanswered questions have a
+  600-awake-second deadline by default and fail closed to `no` at the next safe
+  turn boundary. If the worker keeps its current ACP turn open to wait, the
+  harness does not reap that turn merely for being quiet: ACP cannot inject a
+  second prompt while the turn owns the session lock, so the overdue denial is
+  delivered as soon as that turn returns. Tool walls and real hard blockers are
+  unchanged. Safe work may be preserved in `result_text`, but a run with a
+  denied requested action ends in a qualified blocked state, never clean
+  `complete`/`ok=true`.
 
   **`--max-idle-secs` gates quiet workers.** Default: 600s for write-capable
   code workers and 180s for read-only, research, or custom workers. The idle

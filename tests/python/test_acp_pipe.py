@@ -594,7 +594,7 @@ async def case_runner_tool_error_cap_not_masked_by_later_end_turn() -> None:
     assert status["state"] == "failed", status
     assert status["ok"] is False, status
     assert status["error"]["message"] == "runaway_tool_error_loop", status
-    assert status.get("result_text") is None, status
+    assert "COMPLETE: reset respected" in (status.get("result_text") or ""), status
     assert status.get("runaway_reason") == "runaway_tool_error_loop", status
 
 
@@ -623,7 +623,7 @@ async def case_runner_event_cap_not_masked_by_later_end_turn() -> None:
     assert status["ok"] is False, status
     assert status["error"]["message"] == "runaway_event_cap", status
     assert status["error"]["events_seen"] > 5, status
-    assert status.get("result_text") is None, status
+    assert "COMPLETE: many events ok" in (status.get("result_text") or ""), status
     assert status.get("runaway_reason") == "runaway_event_cap", status
 
 

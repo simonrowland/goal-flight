@@ -8695,5 +8695,46 @@ def main(argv: list[str] | None = None) -> int:
             cleanup_codex_dispatch_home(args.dispatch_id)
 
 
+def _ensure_acp_sdk_interpreter(argv: list[str] | None = None) -> None:
+    """Re-exec into the ACP SDK venv before any ACP work begins.
+
+    goalflight_acp_run guards this in its own __main__, but the dispatch path
+    IMPORTS that module (lazily, inside _run_acp_shape) rather than executing
+    it, so that guard never fires here. The SDK import in goalflight_acp_client
+    then fails under the system interpreter and every ACP dispatch dies with
+    "SDK missing" even though the SDK is installed correctly in the venv.
+
+    Done at __main__ entry, before main() parses args or takes any lease, so
+    the execv restart repeats no side effects. Only fires for acp-shaped
+    invocations, so bash-shape dispatch is untouched.
+    """
+    argv = list(sys.argv[1:] if argv is None else argv)
+
+    def _opt(name: str) -> str | None:
+        for i, tok in enumerate(argv):
+            if tok == name and i + 1 < len(argv):
+                return argv[i + 1]
+            if tok.startswith(name + "="):
+                return tok.split("=", 1)[1]
+        return None
+
+    shape = _opt("--shape") or "auto"
+    if shape == "auto":
+        agent = _opt("--agent")
+        shape = (
+            "acp"
+            if agent in ("cursor", "claude-acp", "claude") or "--interactive" in argv
+            else "bash"
+        )
+    if shape != "acp":
+        return
+    try:
+        import goalflight_acp_run  # noqa: PLC0415
+    except BaseException:
+        return
+    goalflight_acp_run._ensure_acp_sdk_python()
+
+
 if __name__ == "__main__":
+    _ensure_acp_sdk_interpreter()
     raise SystemExit(main())

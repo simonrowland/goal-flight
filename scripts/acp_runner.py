@@ -43,9 +43,10 @@ class PromptResult:
     early_marker: str | None = None
     permission_escalations: list[dict[str, Any]] = field(default_factory=list)
     """Permission requests the orchestrator's router escalated to the user (the
-    worker asked to cross a boundary it couldn't auto-decide). When non-empty the
-    turn was cancelled (early_marker='USER-CONFIRM'); the orchestrator surfaces
-    these to the user, records a decision, and re-dispatches."""
+    worker asked to cross a boundary it couldn't auto-decide). In the legacy
+    ``cancel`` policy these cancel the turn. The unattended dispatch runner uses
+    the ``route`` policy: the requested tool remains denied, the question is
+    relayed, and the rest of the turn may continue."""
     permission_auto_declined: list[dict[str, Any]] = field(default_factory=list)
     """Inline permissions the orchestrator auto-declined (it did not answer within
     the inline timeout / IPC failed); the worker was denied and CONTINUED --
@@ -66,6 +67,8 @@ async def run_prompt(
     keep_raw: bool = False,
     on_event: Callable[[dict], Any] | None = None,
     on_idle: Callable[[], Any] | None = None,
+    user_confirm_policy: str = "cancel",
+    on_user_confirm: Callable[[dict[str, Any]], Any] | None = None,
 ) -> PromptResult:
     """Run one prompt on a connection; concurrent reuse of one connection is unsupported."""
     if getattr(conn.client, "_prompt_in_use", False):
@@ -82,6 +85,8 @@ async def run_prompt(
             keep_raw=keep_raw,
             on_event=on_event,
             on_idle=on_idle,
+            user_confirm_policy=user_confirm_policy,
+            on_user_confirm=on_user_confirm,
         )
     finally:
         conn.client._prompt_in_use = False
@@ -95,6 +100,8 @@ async def _run_prompt_locked(
     keep_raw: bool = False,
     on_event: Callable[[dict], Any] | None = None,
     on_idle: Callable[[], Any] | None = None,
+    user_confirm_policy: str = "cancel",
+    on_user_confirm: Callable[[dict[str, Any]], Any] | None = None,
 ) -> PromptResult:
     """Send a prompt through an already-initialized ACP connection.
 
@@ -115,6 +122,10 @@ async def _run_prompt_locked(
     Passed straight through to AcpConnection.session_prompt.
     """
     result = PromptResult()
+    if user_confirm_policy not in {"cancel", "route"}:
+        raise ValueError(f"unsupported user_confirm_policy: {user_confirm_policy!r}")
+    if user_confirm_policy == "route" and on_user_confirm is None:
+        raise ValueError("user_confirm_policy='route' requires on_user_confirm")
     turn_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
     conn.client.set_turn_queue(turn_queue)
     # Permission escalations are per-turn: clear any from a prior turn on a reused
@@ -131,6 +142,8 @@ async def _run_prompt_locked(
     prompt_task = asyncio.create_task(conn.prompt(text))
     last_event_time = active_monotonic()
     timeout_enabled = idle_timeout is not None and idle_timeout > 0
+    routed_marker_values: set[str] = set()
+    routed_permission_keys: set[str] = set()
 
     def _pending_escalations() -> list[dict[str, Any]]:
         return list(getattr(conn.client, "permission_escalations", None) or [])
@@ -156,6 +169,13 @@ async def _run_prompt_locked(
         if on_event is None:
             return
         maybe_awaitable = on_event(message)
+        if inspect.isawaitable(maybe_awaitable):
+            await maybe_awaitable
+
+    async def _call_on_user_confirm(payload: dict[str, Any]) -> None:
+        if on_user_confirm is None:
+            return
+        maybe_awaitable = on_user_confirm(payload)
         if inspect.isawaitable(maybe_awaitable):
             await maybe_awaitable
 
@@ -185,7 +205,50 @@ async def _run_prompt_locked(
                     result.plan_entries.append(entry_text)
 
     def _early_marker() -> str | None:
-        return early_actionable_marker(extract_markers(result.text))
+        markers = extract_markers(result.text)
+        if user_confirm_policy == "route":
+            markers = dict(markers)
+            markers.pop("USER-CONFIRM", None)
+        return early_actionable_marker(markers)
+
+    async def _route_new_user_confirm_markers(*, allow_unterminated: bool = False) -> None:
+        if user_confirm_policy != "route":
+            return
+        # Streaming chunks can split one marker payload across updates. Route only
+        # newline-complete marker lines while the turn is live; the final drain may
+        # accept an unterminated last line.
+        if result.text and not result.text.endswith(("\n", "\r")) and not allow_unterminated:
+            return
+        for value in extract_markers(result.text).get("USER-CONFIRM") or []:
+            normalized = str(value or "").strip()
+            if not normalized or normalized in routed_marker_values:
+                continue
+            routed_marker_values.add(normalized)
+            await _call_on_user_confirm(
+                {
+                    "origin": "worker_marker",
+                    "text": normalized,
+                    "result_text": result.text,
+                }
+            )
+
+    async def _route_new_permission_escalations(escalations: list[dict[str, Any]]) -> None:
+        if user_confirm_policy != "route":
+            return
+        for index, escalation in enumerate(escalations):
+            key = str(escalation.get("key") or escalation.get("tool_call_id") or index)
+            if key in routed_permission_keys:
+                continue
+            routed_permission_keys.add(key)
+            title = str(escalation.get("title") or "permission required").strip()
+            await _call_on_user_confirm(
+                {
+                    "origin": "permission_escalation",
+                    "text": title,
+                    "permission": dict(escalation),
+                    "result_text": result.text,
+                }
+            )
 
     async def _cancel_prompt(reason: str) -> None:
         with contextlib.suppress(Exception):
@@ -212,7 +275,10 @@ async def _run_prompt_locked(
     try:
         while True:
             esc = _pending_escalations()
-            if esc and not result.cancelled_for_marker:
+            if esc:
+                result.permission_escalations = esc
+                await _route_new_permission_escalations(esc)
+            if esc and user_confirm_policy == "cancel" and not result.cancelled_for_marker:
                 # The orchestrator's permission router escalated a request to the
                 # user. The ACP request was ALREADY answered (cancel), so the
                 # worker is not held open; stop the turn and surface the deferral
@@ -224,14 +290,31 @@ async def _run_prompt_locked(
                 _copy_permission_router_decisions()
                 return result
             if prompt_task.done():
-                await asyncio.sleep(0)
-                while not turn_queue.empty():
-                    event = turn_queue.get_nowait()
+                # The SDK can resolve the prompt response one scheduler tick
+                # before its stream observer publishes the immediately
+                # preceding notification. A one-shot queue drain then loses a
+                # trailing COMPLETE/USER-CONFIRM into the next turn, where it
+                # looks like a fresh question. Drain until a short quiet grace
+                # after end_turn so turn evidence stays attached to its turn.
+                while True:
+                    try:
+                        event = turn_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        try:
+                            event = await asyncio.wait_for(
+                                turn_queue.get(),
+                                timeout=0.05,
+                            )
+                        except asyncio.TimeoutError:
+                            break
                     message = event.get("message") or {}
                     await _call_on_event(message)
                     _accumulate(message)
+                    await _route_new_user_confirm_markers(allow_unterminated=True)
                     marker = _early_marker()
-                    if marker:
+                    if marker and not (
+                        marker == "USER-CONFIRM" and user_confirm_policy == "route"
+                    ):
                         await _cancel_prompt(marker)
                         _copy_permission_auto_declined()
                         _copy_permission_router_decisions()
@@ -275,8 +358,11 @@ async def _run_prompt_locked(
             last_event_time = active_monotonic()
             await _call_on_event(message)
             _accumulate(message)
+            await _route_new_user_confirm_markers()
             marker = _early_marker()
-            if marker:
+            if marker and not (
+                marker == "USER-CONFIRM" and user_confirm_policy == "route"
+            ):
                 await _cancel_prompt(marker)
                 _copy_permission_auto_declined()
                 _copy_permission_router_decisions()
@@ -309,6 +395,7 @@ async def _run_prompt_locked(
         result.out_of_scope_writes = _scan_out_of_scope_paths(result.tool_calls, cwd)
     _copy_permission_auto_declined()
     _copy_permission_router_decisions()
+    result.permission_escalations = _pending_escalations()
     return result
 
 
@@ -403,7 +490,7 @@ def has_actionable_marker_values(markers: dict[str, list[str]], kind: str) -> bo
 
 
 def early_actionable_marker(markers: dict[str, list[str]]) -> str | None:
-    for marker in ("BLOCKED", "USER-CONFIRM", "USER-NEED"):
+    for marker in ("BLOCKED", "USER-NEED", "USER-CONFIRM"):
         if has_actionable_marker_values(markers, marker):
             return marker
     return None

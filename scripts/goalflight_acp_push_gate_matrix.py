@@ -380,7 +380,7 @@ def _auto_and_locations(spec: AgentSpec, state_root: Path, work_root: Path) -> t
     boundary_ok = (
         bool(escalate_rows)
         and (boundary_run.payload or {}).get("permission_pending")
-        and boundary_state in {"blocked", "blocked_permission_denied"}
+        and boundary_state in {"blocked", "blocked_permission_denied", "complete"}
         and not outside.exists()
     )
 

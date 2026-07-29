@@ -13,6 +13,9 @@ import goalflight_dispatch_paths
 
 
 STEER_ACK_RE = re.compile(r"^\**STEER-ACK:\**\s*(\d+)\b")
+TO_WORKER = "controller_to_worker"
+TO_CONTROLLER = "worker_to_controller"
+STEER_DIRECTIONS = frozenset({TO_WORKER, TO_CONTROLLER})
 
 
 def steer_file(dispatch_id: str, state_dir: Path | str | None = None) -> Path:
@@ -32,11 +35,21 @@ def parse_steer_lines(lines: list[str]) -> list[dict]:
             seq = int(item.get("seq"))
         except (TypeError, ValueError):
             continue
-        entries.append({
+        direction = str(item.get("direction") or TO_WORKER)
+        if direction not in STEER_DIRECTIONS:
+            continue
+        entry = {
             "seq": seq,
             "ts": str(item.get("ts") or ""),
             "text": str(item.get("text") or ""),
-        })
+        }
+        if "direction" in item:
+            entry["direction"] = direction
+        for key in ("dispatch_id", "kind", "question_id", "reply_to", "decision", "context"):
+            value = item.get(key)
+            if value is not None:
+                entry[key] = value
+        entries.append(entry)
     return entries
 
 
@@ -51,7 +64,21 @@ def read_steer_entries(path: Path) -> list[dict]:
             goalflight_compat.flock(f, goalflight_compat.LOCK_UN)
 
 
-def append_steer_entry(path: Path, message: str, *, seq: int | None = None) -> dict:
+def append_steer_entry(
+    path: Path,
+    message: str,
+    *,
+    seq: int | None = None,
+    direction: str = TO_WORKER,
+    dispatch_id: str | None = None,
+    kind: str = "steer",
+    question_id: str | None = None,
+    reply_to: str | None = None,
+    decision: str | None = None,
+    context: dict | None = None,
+) -> dict:
+    if direction not in STEER_DIRECTIONS:
+        raise ValueError(f"unsupported steer direction: {direction!r}")
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a+", encoding="utf-8") as f:
         goalflight_compat.flock(f, goalflight_compat.LOCK_EX)
@@ -64,6 +91,20 @@ def append_steer_entry(path: Path, message: str, *, seq: int | None = None) -> d
                 "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 "text": message,
             }
+            if direction != TO_WORKER:
+                entry["direction"] = direction
+            if kind != "steer":
+                entry["kind"] = kind
+            if dispatch_id:
+                entry["dispatch_id"] = dispatch_id
+            if question_id:
+                entry["question_id"] = question_id
+            if reply_to:
+                entry["reply_to"] = reply_to
+            if decision:
+                entry["decision"] = decision
+            if context:
+                entry["context"] = context
             f.seek(0, os.SEEK_END)
             f.write(json.dumps(entry, sort_keys=True) + "\n")
             f.flush()
@@ -73,9 +114,52 @@ def append_steer_entry(path: Path, message: str, *, seq: int | None = None) -> d
             goalflight_compat.flock(f, goalflight_compat.LOCK_UN)
 
 
-def append_steer_message(dispatch_id: str, text: str) -> tuple[Path, dict]:
+def append_steer_message(
+    dispatch_id: str,
+    text: str,
+    *,
+    reply_to: str | None = None,
+    decision: str | None = None,
+) -> tuple[Path, dict]:
     path = steer_file(dispatch_id)
-    return path, append_steer_entry(path, text)
+    kind = "user_confirm_reply" if reply_to else "steer"
+    return path, append_steer_entry(
+        path,
+        text,
+        dispatch_id=dispatch_id,
+        kind=kind,
+        reply_to=reply_to,
+        decision=decision,
+    )
+
+
+def append_user_confirm(
+    path: Path,
+    *,
+    dispatch_id: str,
+    question_id: str,
+    text: str,
+    context: dict | None = None,
+) -> dict:
+    """Post a worker question without making it deliverable back to that worker."""
+    return append_steer_entry(
+        path,
+        text,
+        direction=TO_CONTROLLER,
+        dispatch_id=dispatch_id,
+        kind="user_confirm",
+        question_id=question_id,
+        context=context,
+    )
+
+
+def worker_entries(entries: list[dict]) -> list[dict]:
+    """Controller-authored entries eligible for delivery to the worker.
+
+    Legacy rows have no direction on disk and parse as controller_to_worker.
+    Worker-authored questions must never self-echo as authorization or steer.
+    """
+    return [entry for entry in entries if entry.get("direction", TO_WORKER) == TO_WORKER]
 
 
 def acked_steer_seqs(record: dict) -> set[int]:
@@ -127,10 +211,12 @@ def list_steer_messages(dispatch_id: str, record: dict) -> int:
     if not entries:
         print("(empty)")
         return 0
-    print("seq\tts\tacked\ttext")
+    print("seq\tts\tacked\ttext\tdirection\tkind")
     for entry in entries:
+        deliverable = entry.get("direction", TO_WORKER) == TO_WORKER
         print(
             f"{entry['seq']}\t{entry['ts']}\t"
-            f"{str(entry['seq'] in acked).lower()}\t{entry['text']}"
+            f"{str(deliverable and entry['seq'] in acked).lower()}\t{entry['text']}\t"
+            f"{entry.get('direction', TO_WORKER)}\t{entry.get('kind', 'steer')}"
         )
     return 0
