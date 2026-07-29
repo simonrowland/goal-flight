@@ -65,12 +65,22 @@ BLOCKING_TERMINAL_MARKERS = TERMINAL_MARKERS - SUCCESS_TERMINAL_MARKERS
 MARKER_KINDS = frozenset(kind for kind in _MARKER_KIND_ORDER if kind in TERMINAL_MARKERS or kind in {"STATUS", "STEER-ACK"})
 _MARKER_KIND_ALTERNATION = "|".join(re.escape(kind) for kind in _MARKER_KIND_ORDER if kind in MARKER_KINDS)
 _TERMINAL_MARKER_KIND_ALTERNATION = "|".join(re.escape(kind) for kind in _MARKER_KIND_ORDER if kind in TERMINAL_MARKERS)
-# Optional `!` sigil ahead of a marker kind. Workers are taught to emit the
-# sigil form (`!COMPLETE: ...`); the bare form stays accepted because deployed
-# skill installs and other repos still emit it, and a sigil-only scanner would
-# turn every one of those workers into a false-DEATH (never terminal, reaped on
-# idle) -- strictly worse than the false-COMPLETE the sigil exists to prevent.
-# Retire the bare form only once `marker_sigil_seen` shows the fleet has moved.
+# Optional `!` sigil ahead of a marker kind, ACCEPTED HERE ONLY -- nothing
+# teaches it yet, deliberately.
+#
+# A first attempt taught `!COMPLETE:` in the prompt template and this protocol.
+# That was a safety regression: the marker grammar is parsed in at least four
+# places (this watcher, acp_runner.extract_markers, the ACP permission guard,
+# and steer ACK parsing), and only this one was made sigil-aware. A worker
+# following the new instruction emitted `!USER-CONFIRM: ...`, ACP extraction
+# returned {}, the confirmation guard never engaged, and the following edit
+# reached auto-allow with no human approval -- the syntax disabled the very
+# mechanism it shipped alongside.
+#
+# Accepting the sigil is harmless and backward-compatible; INSTRUCTING it is not,
+# until every parser shares one grammar. Do not teach it in any template,
+# protocol, or dispatch preamble until that unification lands, with end-to-end
+# coverage on the ACP path for each marker kind.
 _MARKER_SIGIL = "!"
 _SIGIL_OPT = rf"{re.escape(_MARKER_SIGIL)}?"
 SHELL_TERMINAL_MARKER_RE = rf"^{_SIGIL_OPT}\**({_TERMINAL_MARKER_KIND_ALTERNATION}):\**"

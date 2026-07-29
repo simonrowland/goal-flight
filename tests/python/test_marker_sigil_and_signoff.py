@@ -150,7 +150,51 @@ def test_real_marker_after_a_loop_still_wakes_controller() -> None:
         )
 
 
+def test_nothing_teaches_the_sigil_until_every_parser_agrees() -> None:
+    """Teaching a marker syntax one parser rejects is a safety regression.
+
+    This fired for real: the prompt template was changed to instruct
+    `!USER-CONFIRM: ...` while acp_runner.extract_markers remained sigil-blind.
+    On the ACP path extraction returned {}, so the confirmation guard never
+    engaged and the following edit reached auto-allow with no human approval --
+    the taught syntax disabled the mechanism it shipped beside.
+
+    Accepting the sigil is harmless; instructing it is not, until the grammar is
+    shared. This test is self-limiting: once the ACP path understands the sigil,
+    the unification has landed and teaching becomes safe, so the check retires
+    itself rather than blocking the migration it exists to sequence.
+    """
+    sys.path.insert(0, str(ROOT / "scripts"))
+    import acp_runner  # noqa: PLC0415
+
+    if acp_runner.extract_markers("!COMPLETE: unified"):
+        return  # ACP understands the sigil: grammar unified, teaching is safe.
+
+    offenders: list[str] = []
+    for rel in ("templates", "protocols"):
+        base = ROOT / rel
+        if not base.is_dir():
+            continue
+        for path in base.rglob("*"):
+            if not path.is_file() or path.suffix not in {".md", ".tpl"}:
+                continue
+            try:
+                body = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            for kind in ("COMPLETE", "USER-CONFIRM", "USER-NEED", "BLOCKED", "RESULT", "STATUS"):
+                if f"!{kind}:" in body:
+                    offenders.append(f"{path.relative_to(ROOT)} teaches !{kind}:")
+
+    assert_true(
+        "no template/protocol instructs the sigil while ACP rejects it: "
+        + "; ".join(sorted(set(offenders))),
+        not offenders,
+    )
+
+
 def main() -> None:
+    test_nothing_teaches_the_sigil_until_every_parser_agrees()
     test_extract_markers_stays_permissive_about_bare_signoff()
     test_trailing_signoff_still_terminal()
     test_sigil_markers_are_accepted()
