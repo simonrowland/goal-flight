@@ -920,7 +920,23 @@ def done_code(record: dict, *, worker_alive: bool | None = None) -> int:
     """0 = terminal/done, 1 = live, 2 = ambiguous/unknown."""
     cls = record.get("classification") or record.get("state") or "unknown"
     if _record_has_terminal_marker(record):
-        return 0
+        # A terminal marker is scraped from worker OUTPUT, so ordinary text can
+        # forge one: a shell loop's `done` terminator matches the bare sign-off
+        # pattern, which reported a live, mid-task worker as COMPLETE -- a
+        # verdict a controller acts on by gating, committing and pushing
+        # unfinished work. The watcher itself was not fooled (it kept
+        # state=running); only this verdict was.
+        #
+        # A process we can still see running has not finished, whatever its
+        # output says, so a marker must never outrank CONFIRMED liveness.
+        # Unconfirmed liveness deliberately keeps the marker verdict: failing to
+        # observe a process is not evidence that it lives, and treating it as
+        # such would turn every unobservable worker into a hang.
+        marker_worker_alive = worker_alive
+        if marker_worker_alive is None:
+            marker_worker_alive = _wait_worker_confirmed_alive(record)
+        if not marker_worker_alive:
+            return 0
     if _needs_liveness_recheck(record):
         if worker_alive is None:
             worker_alive = _rechecked_worker_alive(record)

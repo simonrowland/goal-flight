@@ -65,10 +65,18 @@ BLOCKING_TERMINAL_MARKERS = TERMINAL_MARKERS - SUCCESS_TERMINAL_MARKERS
 MARKER_KINDS = frozenset(kind for kind in _MARKER_KIND_ORDER if kind in TERMINAL_MARKERS or kind in {"STATUS", "STEER-ACK"})
 _MARKER_KIND_ALTERNATION = "|".join(re.escape(kind) for kind in _MARKER_KIND_ORDER if kind in MARKER_KINDS)
 _TERMINAL_MARKER_KIND_ALTERNATION = "|".join(re.escape(kind) for kind in _MARKER_KIND_ORDER if kind in TERMINAL_MARKERS)
-SHELL_TERMINAL_MARKER_RE = rf"^\**({_TERMINAL_MARKER_KIND_ALTERNATION}):\**"
-MARKER_RE = re.compile(rf"^\**({_MARKER_KIND_ALTERNATION}):\**\s*(.*)$")
+# Optional `!` sigil ahead of a marker kind. Workers are taught to emit the
+# sigil form (`!COMPLETE: ...`); the bare form stays accepted because deployed
+# skill installs and other repos still emit it, and a sigil-only scanner would
+# turn every one of those workers into a false-DEATH (never terminal, reaped on
+# idle) -- strictly worse than the false-COMPLETE the sigil exists to prevent.
+# Retire the bare form only once `marker_sigil_seen` shows the fleet has moved.
+_MARKER_SIGIL = "!"
+_SIGIL_OPT = rf"{re.escape(_MARKER_SIGIL)}?"
+SHELL_TERMINAL_MARKER_RE = rf"^{_SIGIL_OPT}\**({_TERMINAL_MARKER_KIND_ALTERNATION}):\**"
+MARKER_RE = re.compile(rf"^\**{_SIGIL_OPT}\**({_MARKER_KIND_ALTERNATION}):\**\s*(.*)$")
 FINAL_TERMINAL_MARKER_RE = re.compile(
-    r"^(?:-\s+)?`?\**(?:STATUS:\s*)?"
+    rf"^(?:-\s+)?`?\**{_SIGIL_OPT}\**(?:STATUS:\s*)?"
     rf"({_TERMINAL_MARKER_KIND_ALTERNATION}):(.*)$"
 )
 MARKER_VOCAB_BULLET_RE = re.compile(rf"^-\s+`(?:{_MARKER_KIND_ALTERNATION}):`\s*$")
@@ -803,6 +811,17 @@ def extract_markers(path: Path, max_bytes: int = 10 * 1024 * 1024,
         if match:
             markers.append({"line": idx, "kind": match.group(1), "text": match.group(2)[:1000]})
             continue
+        # Bare sign-off ("Done.", "complete", "FINISHED!") carries no payload and
+        # is indistinguishable from ordinary output -- notably the `done`
+        # terminator of a shell loop a worker echoes into its tail.
+        #
+        # It is deliberately NOT filtered here. This list feeds the mail bridge
+        # and status; the terminal DECISION for a live worker goes through
+        # _last_line_is_terminal_marker (position-disciplined), and for a dead
+        # worker through final reconciliation, which must still honour a sign-off
+        # followed by a trailing summary (D022). Filtering by position here would
+        # break that case. Consumers that turn markers into a terminal verdict
+        # must cross-check liveness -- see goalflight_status wait verdicts.
         signoff = _completion_signoff_marker(stripped, idx)
         if signoff:
             markers.append(signoff)

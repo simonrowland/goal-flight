@@ -1,6 +1,23 @@
 # Worker Marker Protocol
 
-Workers emit parseable markers on their own lines:
+Workers emit parseable markers on their own lines. **Prefix each marker with the
+`!` sigil** — `!COMPLETE: <finished state>`. The sigil is what separates a real
+marker from the same words occurring in ordinary output, and it costs one
+character:
+
+```text
+!STATUS: running the load loop
+!RESULT: passes=6 failures=0
+!COMPLETE: fold hardened and verified
+```
+
+The un-sigiled form (`COMPLETE: ...`) is still accepted so that already-installed
+workers keep working, but new and regenerated prompts should teach the sigil.
+
+Sigil or not, a marker must be **its own line**. A marker kind appearing inside a
+fenced block or an echoed command is deliberately ignored.
+
+Marker kinds:
 
 - `STATUS: <current activity>`
 - `STEER-ACK: <seq>` — steer mailbox message acknowledged
