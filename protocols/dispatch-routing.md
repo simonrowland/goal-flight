@@ -93,14 +93,15 @@ Right-size the shape — three loop failure modes to avoid:
   cohort uses `recorded-yes-not-authorized` instead. Quoted copies of the
   authorize grammar in ordinary steer text or controller notes are rewritten
   to `quoted-yes-not-authorization` before worker delivery. An affirmative remains
-  provisional through the first mailbox-reconciliation boundary at or after
-  the question's arbitration deadline, so any `no` visible at that cutoff wins.
+  provisional through the question's arbitration deadline. Mailbox rows carry
+  durable awake-monotonic arrival timestamps: only a `yes` proven written by
+  the deadline participates, while any `no` remains deny-biased.
   After a finalized answer is exposed to the worker, later replies are rejected
   as audit-only because they cannot undo an action. Unanswered questions have a
   600-awake-second deadline by default and fail closed to correlated `no`.
   If the worker keeps its current ACP turn open to wait, the harness exempts
-  quiet only until that deadline. On expiry it first reconciles a correlated
-  reply already in the mailbox; without one it records
+  quiet only until that deadline. On expiry it first reconciles a correlated,
+  provably timely reply already in the mailbox; without one it records
   `user_confirm_overdue=true` and denies. Either settlement re-enables ordinary
   silence/wedge detection, so a turn that never releases the session lock
   terminates detectably.

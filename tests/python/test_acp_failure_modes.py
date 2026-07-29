@@ -45,6 +45,7 @@ from goalflight_acp_run import (  # noqa: E402
     _user_confirm_deadline_reached,
     _user_confirm_denies_run,
     _user_confirm_is_resolved,
+    _user_confirm_reply_arrived_before_deadline,
     _wait_for_user_confirm_replies,
     adapter_liveness_config,
     agent_command,
@@ -53,6 +54,7 @@ from goalflight_acp_run import (  # noqa: E402
 )
 import goalflight_acp_permits  # noqa: E402
 import goalflight_compat  # noqa: E402
+import goalflight_steer_mailbox  # noqa: E402
 from acp_runner import has_actionable_marker_values  # noqa: E402
 from goalflight_liveness import heartbeat_wedge_decision, pgroup_cpu_pct, progress_stall_decision  # noqa: E402
 
@@ -1374,6 +1376,47 @@ def case_user_confirm_clocks_are_independent_without_sleeping() -> None:
     asyncio.run(late_reply_while_reading_mailbox())
 
 
+def case_user_confirm_arrival_stamp_is_strict_and_round_trips() -> None:
+    question = {
+        "question_id": "strict-cutoff",
+        "reply_deadline_awake_mono_ns": 100,
+    }
+    assert _user_confirm_reply_arrived_before_deadline(
+        {"awake_mono_ns": 100}, question, "yes"
+    )
+    for invalid in (101, 0, -1, None, True, 100.0, "100"):
+        assert not _user_confirm_reply_arrived_before_deadline(
+            {"awake_mono_ns": invalid}, question, "yes"
+        ), invalid
+    assert not _user_confirm_reply_arrived_before_deadline(
+        {"awake_mono_ns": 100},
+        {"reply_deadline_awake_mono_ns": True},
+        "yes",
+    )
+    assert _user_confirm_reply_arrived_before_deadline({}, question, "no")
+    assert _user_confirm_reply_arrived_before_deadline(
+        {}, {"question_id": "legacy-without-deadline"}, "yes"
+    )
+
+    lines = [
+        json.dumps({"seq": 1, "text": "valid", "awake_mono_ns": 100}),
+        json.dumps({"seq": 2, "text": "bool", "awake_mono_ns": True}),
+        json.dumps({"seq": 3, "text": "float", "awake_mono_ns": 100.0}),
+        json.dumps({"seq": 4, "text": "string", "awake_mono_ns": "100"}),
+    ]
+    parsed = goalflight_steer_mailbox.parse_steer_lines(lines)
+    assert parsed[0]["awake_mono_ns"] == 100, parsed
+    assert all("awake_mono_ns" not in entry for entry in parsed[1:]), parsed
+
+    with tempfile.TemporaryDirectory() as td:
+        mailbox = Path(td) / "steer.jsonl"
+        appended = goalflight_steer_mailbox.append_steer_entry(mailbox, "round-trip")
+        reread = goalflight_steer_mailbox.read_steer_entries(mailbox)
+        assert isinstance(appended["awake_mono_ns"], int), appended
+        assert appended["awake_mono_ns"] > 0, appended
+        assert reread[0]["awake_mono_ns"] == appended["awake_mono_ns"], reread
+
+
 def case_closed_user_confirm_arbitration_rejects_late_no() -> None:
     question = {
         "question_id": "closed-question",
@@ -2009,6 +2052,7 @@ def main() -> None:
     case_steer_prompt_sanitizes_quoted_authorize_grammar()
     case_post_user_confirm_denial_keeps_continuation_read_only()
     case_user_confirm_clocks_are_independent_without_sleeping()
+    case_user_confirm_arrival_stamp_is_strict_and_round_trips()
     case_closed_user_confirm_arbitration_rejects_late_no()
     case_user_confirm_wait_is_not_remote_silence_reaped()
     case_user_confirm_midturn_deadline_reenables_remote_silence_terminal()

@@ -76,9 +76,10 @@ Unattended-dispatch contract (read this before your first tool call):
   answer explicitly authorizes it. A steer ACK, unrelated steer, mailbox read,
   timeout, or silence is not approval. Continue independent safe work while the
   question is outstanding. At the unattended deadline the harness reconciles a
-  correlated answer already in the mailbox; without one it answers `no`.
-  Waiting alone does not kill the turn, but normal silence/wedge limits resume
-  after settlement. Respect a denial and finish whatever safe deliverable remains.
+  correlated affirmative whose durable arrival stamp met the cutoff; without
+  one it answers `no`. Waiting alone does not kill the turn, but normal
+  silence/wedge limits resume after settlement. Respect a denial and finish
+  whatever safe deliverable remains.
 - If you are blocked by the ENVIRONMENT rather than by a decision (a refused
   sandbox operation, a missing tool), that is `BLOCKED:` with the exact refusal
   — not a question.

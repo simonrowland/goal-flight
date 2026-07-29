@@ -717,12 +717,15 @@ def _user_confirm_reply_arrived_before_deadline(
     if deadline_raw is None:
         # Unit/legacy records created before this field have no active deadline.
         return True
-    try:
-        arrival_ns = int(entry.get("awake_mono_ns"))
-        deadline_ns = int(deadline_raw)
-    except (TypeError, ValueError):
+    arrival_ns = entry.get("awake_mono_ns")
+    if (
+        not isinstance(arrival_ns, int)
+        or isinstance(arrival_ns, bool)
+        or not isinstance(deadline_raw, int)
+        or isinstance(deadline_raw, bool)
+    ):
         return False
-    return 0 < arrival_ns <= deadline_ns
+    return 0 < arrival_ns <= deadline_raw
 
 
 def _user_confirm_is_resolved(question: dict[str, object]) -> bool:
@@ -949,14 +952,7 @@ async def _read_user_confirm_replies_denying_expired(
     deny_expired: Callable[[list[dict[str, object]]], Any],
     apply_replies: Callable[[list[dict]], set[int]],
 ) -> tuple[list[dict], list[dict[str, object]], set[int]]:
-    """Arbitrate rows visible at the deadline boundary, then fail closed.
-
-    Mailbox timestamps are not a trustworthy monotonic clock. The explicit
-    timeout assumption is therefore that the first reconciliation boundary at
-    or after the awake-time deadline is the cutoff: correlated rows already
-    visible there participate in arbitration; only a still-unanswered question
-    receives the generated denial.
-    """
+    """Arbitrate provably timely rows at the deadline boundary, then deny."""
     entries = read_entries()
     accepted = apply_replies(entries)
     expired = expired_questions()
@@ -2449,8 +2445,9 @@ async def _run_acp_dispatch_impl(
             # An open ACP prompt holds the turn lock, so ordinary between-turn
             # polling cannot observe a controller reply. Reconcile the mailbox
             # once at the first expiry boundary before synthesizing a denial.
-            # A correlated row already present is explicit authorization, not
-            # implicit approval; unanswered questions still fail closed.
+            # Only a correlated affirmative stamped at or before its deadline
+            # is explicit authorization; late or unstamped yes rows and
+            # unanswered questions still fail closed.
             pending_reply_entries = _pending_steer_entries(
                 steer_file,
                 accepted_user_confirm_reply_seqs
@@ -4234,11 +4231,12 @@ def main(argv: list[str] | None = None) -> int:
         ),
         help=(
             "Awake-second deadline for a correlated unattended USER-CONFIRM reply "
-            "(default 600). At the deadline, reconcile any reply already in the "
-            "mailbox, otherwise append one explicit 'no' continuation so safe "
-            "independent work can finish. The question alone does not kill the "
-            "turn, but after settlement normal silence/wedge limits apply again. "
-            "A repeated question then blocks with partial output preserved."
+            "(default 600). At the deadline, reconcile affirmatives whose durable "
+            "awake-monotonic arrival stamp is at or before the cutoff; otherwise "
+            "append one explicit 'no' continuation so safe independent work can "
+            "finish. The question alone does not kill the turn, but after "
+            "settlement normal silence/wedge limits apply again. A repeated "
+            "question then blocks with partial output preserved."
         ),
     )
     parser.add_argument(

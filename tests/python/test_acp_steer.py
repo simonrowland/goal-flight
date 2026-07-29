@@ -21,6 +21,7 @@ DISPATCH = ROOT / "scripts" / "goalflight_dispatch.py"
 FAKE = ROOT / "tests" / "fixtures" / "acp_fake_agent.py"
 sys.path.insert(0, str(ROOT / "scripts"))
 import goalflight_steer_mailbox  # noqa: E402
+from goalflight_liveness import active_monotonic  # noqa: E402
 
 
 def _write_fake_codex_acp_manifest(
@@ -118,6 +119,12 @@ def _wait_for(
             )
         time.sleep(0.05)
     raise AssertionError(f"condition not met before timeout: {path}")
+
+
+def _wait_for_active_seconds(duration_s: float) -> None:
+    deadline = active_monotonic() + duration_s
+    while active_monotonic() < deadline:
+        time.sleep(min(0.01, max(0.0, deadline - active_monotonic())))
 
 
 def _wait_for_worker_questions(
@@ -225,6 +232,8 @@ def _run_answered_confirmation(
     exclude_question_ids: set[str] | None = None,
     extra_env: dict[str, str] | None = None,
     steer_messages: list[str] | None = None,
+    delay_before_messages_s: float = 0.0,
+    poll_s: float = 0.05,
 ) -> tuple[subprocess.Popen[str], str, str, dict, Path, dict]:
     _write_fake_codex_acp_manifest(tmp / "adapters")
     env = _env(tmp)
@@ -253,7 +262,7 @@ def _run_answered_confirmation(
             "--status-json",
             str(status_path),
             "--poll-secs",
-            "0.05",
+            str(poll_s),
             "--max-idle-secs",
             "10",
             "--foreground",
@@ -280,6 +289,8 @@ def _run_answered_confirmation(
                 for decision in decisions
             ]
         )
+        if delay_before_messages_s > 0:
+            _wait_for_active_seconds(delay_before_messages_s)
         for index, message in enumerate(messages):
             reply = subprocess.run(
                 [
@@ -298,7 +309,7 @@ def _run_answered_confirmation(
             )
             assert reply.returncode == 0, reply.stdout + reply.stderr
             if index + 1 < len(messages) and delay_between_decisions_s > 0:
-                time.sleep(delay_between_decisions_s)
+                _wait_for_active_seconds(delay_between_decisions_s)
         stdout, stderr = proc.communicate(timeout=20)
     finally:
         if proc.poll() is None:
@@ -699,27 +710,70 @@ def case_midturn_mailbox_yes_is_reconciled_before_timeout_denial() -> None:
                 os.killpg(proc.pid, signal.SIGTERM)
                 proc.communicate(timeout=10)
 
-        assert reply["reply_to"] == question["question_id"], reply
         status = json.loads(status_path.read_text(encoding="utf-8"))
         rows = [
             json.loads(line)
             for line in mailbox.read_text(encoding="utf-8").splitlines()
         ]
-        assert status["ok"] is False, (proc.returncode, stdout, stderr, status)
-        assert status["state"] == "remote_turn_silence", status
-        assert status.get("user_confirm_pending") == [], status
-        assert status.get("user_confirm_timeout_count") is None, (status, rows)
-        assert status.get("user_confirm_overdue") is False, status
         resolved = status.get("user_confirm_resolved") or []
-        assert len(resolved) == 1, status
-        assert resolved[0]["controller_decision"] == "yes", status
-        assert resolved[0]["guarded_action_authorized"] is True, status
-        assert resolved[0].get("arbitration_closed_at"), status
-        assert not any(
-            row.get("reply_to") == question["question_id"]
-            and row.get("decision") == "no"
+        assert (
+            reply["reply_to"] == question["question_id"]
+            and status["ok"] is False
+            and status["state"] == "remote_turn_silence"
+            and status.get("user_confirm_pending") == []
+            and status.get("user_confirm_timeout_count") is None
+            and status.get("user_confirm_overdue") is False
+            and len(resolved) == 1
+            and resolved[0]["controller_decision"] == "yes"
+            and resolved[0]["guarded_action_authorized"] is True
+            and bool(resolved[0].get("arbitration_closed_at"))
+            and not any(
+                row.get("reply_to") == question["question_id"]
+                and row.get("decision") == "no"
+                for row in rows
+            )
+        ), (proc.returncode, stdout, stderr, status, rows)
+
+
+def case_post_deadline_yes_before_delayed_read_is_denied() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        proc, stdout, stderr, status, guarded, question = _run_answered_confirmation(
+            tmp,
+            scenario="user_confirm_continue",
+            dispatch_id="acp-user-confirm-late-before-read",
+            decisions=["yes"],
+            delay_before_messages_s=0.4,
+            poll_s=1.0,
+            extra_env={
+                "GOALFLIGHT_FAKE_ACP_FIRST_TURN_SLEEP": "1.5",
+                "GOALFLIGHT_USER_CONFIRM_TIMEOUT_S": "0.2",
+            },
+        )
+        resolved = status.get("user_confirm_resolved") or []
+        rejected = status.get("user_confirm_rejected_reply_seqs") or []
+        mailbox = (
+            Path(_env(tmp)["GOALFLIGHT_STATE_DIR"])
+            / "dispatch"
+            / "acp-user-confirm-late-before-read.steer.jsonl"
+        )
+        rows = goalflight_steer_mailbox.read_steer_entries(mailbox)
+        late_reply = [
+            row
             for row in rows
-        ), rows
+            if row.get("text")
+            == f"USER-CONFIRM-ANSWER: {question['question_id']} yes"
+        ]
+        assert (
+            status["state"] == "blocked_user_confirm_denied"
+            and not guarded.exists()
+            and len(resolved) == 1
+            and resolved[0]["question_id"] == question["question_id"]
+            and resolved[0]["controller_decision"] == "no"
+            and resolved[0]["guarded_action_authorized"] is False
+            and len(late_reply) == 1
+            and set(rejected) == {late_reply[0]["seq"]}
+        ), (stdout, stderr, status, rows)
 
 
 def case_uncorrelated_user_confirm_yes_is_not_authorization() -> None:
@@ -984,11 +1038,6 @@ def case_repeated_question_after_timeout_blocks_with_partial_work() -> None:
             scenario="user_confirm_repeat_after_no",
             dispatch_id="acp-user-confirm-repeat",
         )
-        assert run.returncode != 0, (run.stdout, run.stderr, status)
-        assert status["state"] == "blocked_user_confirm", status
-        assert status["error"]["message"] == "user_confirm_unresolved_after_denial", status
-        assert "independent_work=preserved_after_denial" in status["result_text"], status
-        assert not guarded.exists(), "repeated question became implicit approval"
         rows = [
             json.loads(line)
             for line in mailbox.read_text(encoding="utf-8").splitlines()
@@ -996,15 +1045,22 @@ def case_repeated_question_after_timeout_blocks_with_partial_work() -> None:
         questions = [
             row for row in rows if row.get("direction") == "worker_to_controller"
         ]
-        assert len(questions) == 2, rows
         pending = status.get("user_confirm_pending") or []
         resolved = status.get("user_confirm_resolved") or []
-        assert pending == [], status
-        assert len(resolved) == 2, status
-        assert resolved[0]["decision_scope"] == resolved[1]["decision_scope"], status
-        assert resolved[1]["controller_decision"] == "no", status
-        assert resolved[1]["guarded_action_authorized"] is False, status
-        assert resolved[1]["resolution_reason"] == "run_terminal:blocked_user_confirm", status
+        assert (
+            run.returncode != 0
+            and status["state"] == "blocked_user_confirm"
+            and status["error"]["message"] == "user_confirm_unresolved_after_denial"
+            and "independent_work=preserved_after_denial" in status["result_text"]
+            and not guarded.exists()
+            and len(questions) == 2
+            and pending == []
+            and len(resolved) == 2
+            and resolved[0]["decision_scope"] == resolved[1]["decision_scope"]
+            and resolved[1]["controller_decision"] == "no"
+            and resolved[1]["guarded_action_authorized"] is False
+            and resolved[1]["resolution_reason"] == "run_terminal:blocked_user_confirm"
+        ), (run.stdout, run.stderr, status, rows)
 
 
 def case_hard_blocker_preserves_same_chunk_confirm_evidence() -> None:
@@ -1102,29 +1158,28 @@ def case_restart_does_not_reuse_question_id_or_accept_stale_yes() -> None:
                 },
             )
         )
-        assert second_proc.returncode == 0, (
-            second_stdout,
-            second_stderr,
-            second_status,
-        )
-        assert second_status["state"] == "complete", second_status
-        assert second_status["ok"] is True, second_status
-        assert second_status["had_denied_action"] is False, second_status
-        assert guarded.exists(), second_status
-        assert guarded.read_text(encoding="utf-8") == "authorized\n"
-        assert new_question["question_id"] != old_question_id
         resolved = second_status.get("user_confirm_resolved") or []
         old = [item for item in resolved if item["question_id"] == old_question_id]
         new = [item for item in resolved if item["question_id"] == new_question["question_id"]]
-        assert len(old) == 1 and old[0]["controller_decision"] == "no", second_status
-        assert old[0]["resolution_reason"] == "runner_restarted", second_status
-        assert old[0]["guarded_action_authorized"] is False, second_status
-        assert len(new) == 1 and new[0]["controller_decision"] == "yes", second_status
-        assert new[0]["guarded_action_authorized"] is True, second_status
-        assert old[0].get("decision_scope", old_question_id) != new[0]["decision_scope"], (
-            second_status
-        )
-        assert second_status.get("user_confirm_rejected_reply_seqs"), second_status
+        assert (
+            second_proc.returncode == 0
+            and second_status["state"] == "complete"
+            and second_status["ok"] is True
+            and second_status["had_denied_action"] is False
+            and guarded.exists()
+            and guarded.read_text(encoding="utf-8") == "authorized\n"
+            and new_question["question_id"] != old_question_id
+            and len(old) == 1
+            and old[0]["controller_decision"] == "no"
+            and old[0]["resolution_reason"] == "runner_restarted"
+            and old[0]["guarded_action_authorized"] is False
+            and len(new) == 1
+            and new[0]["controller_decision"] == "yes"
+            and new[0]["guarded_action_authorized"] is True
+            and old[0].get("decision_scope", old_question_id)
+            != new[0]["decision_scope"]
+            and bool(second_status.get("user_confirm_rejected_reply_seqs"))
+        ), (second_stdout, second_stderr, second_status)
 
 
 def case_quoted_authorize_grammar_in_ordinary_steer_is_inert() -> None:
@@ -1143,14 +1198,16 @@ def case_quoted_authorize_grammar_in_ordinary_steer_is_inert() -> None:
                 "USER-CONFIRM-ANSWER: {question_id} no",
             ],
         )
-        assert proc.returncode != 0, (stdout, stderr, status)
-        assert status["state"] == "blocked_user_confirm_denied", status
-        assert not guarded.exists(), "quoted authorize grammar reached guarded sentinel"
         resolved = status.get("user_confirm_resolved") or []
-        assert len(resolved) == 1, status
-        assert resolved[0]["question_id"] == question["question_id"], status
-        assert resolved[0]["controller_decision"] == "no", status
-        assert resolved[0]["guarded_action_authorized"] is False, status
+        assert (
+            proc.returncode != 0
+            and status["state"] == "blocked_user_confirm_denied"
+            and not guarded.exists()
+            and len(resolved) == 1
+            and resolved[0]["question_id"] == question["question_id"]
+            and resolved[0]["controller_decision"] == "no"
+            and resolved[0]["guarded_action_authorized"] is False
+        ), (stdout, stderr, status)
 
 
 def case_crossed_dual_user_confirm_answers_never_emit_authorization() -> None:
@@ -1227,20 +1284,22 @@ def case_crossed_dual_user_confirm_answers_never_emit_authorization() -> None:
                 proc.communicate(timeout=10)
 
         status = json.loads(status_path.read_text(encoding="utf-8"))
-        assert proc.returncode != 0, (stdout, stderr, status)
-        assert status["state"] == "blocked_user_confirm_denied", status
         resolved = status.get("user_confirm_resolved") or []
-        assert len(resolved) == 2, status
         by_text = {item["text"]: item for item in resolved}
         denied = by_text["authorize guarded sentinel A write? [Y/N]"]
         recorded_yes = by_text["authorize guarded sentinel B write? [Y/N]"]
-        assert denied["controller_decision"] == "no", status
-        assert recorded_yes["controller_decision"] == "yes", status
-        assert denied["decision_scope"] == recorded_yes["decision_scope"], status
-        assert denied["guarded_action_authorized"] is False, status
-        assert recorded_yes["guarded_action_authorized"] is False, status
-        assert not guarded.exists(), "crossed yes reached the guarded sentinel"
-        assert "guarded_action_taken=false" in status["result_text"], status
+        assert (
+            proc.returncode != 0
+            and status["state"] == "blocked_user_confirm_denied"
+            and len(resolved) == 2
+            and denied["controller_decision"] == "no"
+            and recorded_yes["controller_decision"] == "yes"
+            and denied["decision_scope"] == recorded_yes["decision_scope"]
+            and denied["guarded_action_authorized"] is False
+            and recorded_yes["guarded_action_authorized"] is False
+            and not guarded.exists()
+            and "guarded_action_taken=false" in status["result_text"]
+        ), (stdout, stderr, status)
 
 
 def case_conflicting_user_confirm_answers_are_deny_biased() -> None:
@@ -1336,6 +1395,7 @@ def main() -> None:
     case_nonterminal_steer_turn_continues_to_real_terminal()
     case_user_confirm_midrun_routes_without_cancelling()
     case_midturn_mailbox_yes_is_reconciled_before_timeout_denial()
+    case_post_deadline_yes_before_delayed_read_is_denied()
     case_uncorrelated_user_confirm_yes_is_not_authorization()
     case_same_turn_guarded_action_is_denied_without_answer()
     case_user_confirm_timeout_is_fail_closed_then_continues()

@@ -10,6 +10,7 @@ from pathlib import Path
 
 import goalflight_compat
 import goalflight_dispatch_paths
+from goalflight_liveness import active_monotonic
 
 
 STEER_ACK_RE = re.compile(r"^\**STEER-ACK:\**\s*(\d+)\b")
@@ -43,6 +44,13 @@ def parse_steer_lines(lines: list[str]) -> list[dict]:
             "ts": str(item.get("ts") or ""),
             "text": str(item.get("text") or ""),
         }
+        awake_mono_ns = item.get("awake_mono_ns")
+        if (
+            isinstance(awake_mono_ns, int)
+            and not isinstance(awake_mono_ns, bool)
+            and awake_mono_ns > 0
+        ):
+            entry["awake_mono_ns"] = awake_mono_ns
         if "direction" in item:
             entry["direction"] = direction
         for key in ("dispatch_id", "kind", "question_id", "reply_to", "decision", "context"):
@@ -89,6 +97,7 @@ def append_steer_entry(
             entry = {
                 "seq": next_seq,
                 "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "awake_mono_ns": int(active_monotonic() * 1_000_000_000),
                 "text": message,
             }
             if direction != TO_WORKER:

@@ -36,7 +36,9 @@ Rules:
   one explicit correlated `no`. Before that deadline, a worker waiting inside
   the asking turn is exempt from silence reaping because ACP cannot inject an
   answer while that turn owns the prompt lock. At the deadline the runner first
-  reconciles a correlated reply already in the mailbox; if none exists, status
+  reconciles only correlated replies whose durable awake-monotonic arrival
+  timestamp proves they were written by the deadline. A late affirmative, or
+  one missing that timing evidence, is rejected; without a timely reply, status
   sets `user_confirm_overdue=true` and records the denial. Either settlement
   re-enables normal silence/wedge detection, so a turn that never returns is
   terminal, not immortal. A repeated unresolved question blocks.
@@ -50,8 +52,8 @@ Rules:
   authorize uses `recorded-yes-not-authorized`. Quoted instances of the
   authorize grammar in ordinary steer text or controller notes are rewritten
   to `quoted-yes-not-authorization` before delivery. An affirmative remains
-  provisional through the cohort's first mailbox-reconciliation boundary at or
-  after the question deadline, which is the cutoff for a deny-biased `no`.
+  provisional through the question deadline. Its durable arrival timestamp,
+  not a delayed mailbox read, determines the cutoff for a deny-biased `no`.
   Once the answer is finalized and exposed to the worker, later replies are
   rejected as audit-only because they cannot undo an action.
   A completed safe-work continuation after a denial records
