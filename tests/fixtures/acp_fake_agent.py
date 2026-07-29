@@ -184,6 +184,7 @@ def handle_prompt(req_id: int, params: dict) -> None:
         "user_confirm_fenced_example",
         "user_confirm_kindless_guard",
         "user_confirm_same_turn_guard",
+        "user_confirm_prefixed_same_turn_guard",
     }:
         session = sessions.setdefault(session_id, {})
         turn = int(session.get("turn", 0)) + 1
@@ -222,6 +223,7 @@ def handle_prompt(req_id: int, params: dict) -> None:
                 "user_confirm_fenced_example",
                 "user_confirm_kindless_guard",
                 "user_confirm_same_turn_guard",
+                "user_confirm_prefixed_same_turn_guard",
             }:
                 text_update(session_id, "RESULT: draft=preserved-before-question\n")
                 if SCENARIO == "user_confirm_fenced_example":
@@ -232,7 +234,11 @@ def handle_prompt(req_id: int, params: dict) -> None:
                 else:
                     text_update(
                         session_id,
-                        "USER-CONFIRM: authorize guarded sentinel write? [Y/N]\n",
+                        (
+                            "!USER-CONFIRM: authorize guarded sentinel write? [Y/N]\n"
+                            if SCENARIO == "user_confirm_prefixed_same_turn_guard"
+                            else "USER-CONFIRM: authorize guarded sentinel write? [Y/N]\n"
+                        ),
                     )
                 time.sleep(0.1)
                 selected = request_permission(

@@ -4,16 +4,16 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import time
 from pathlib import Path
 
 import goalflight_compat
 import goalflight_dispatch_paths
+import goalflight_terminal
 from goalflight_liveness import active_monotonic
 
 
-STEER_ACK_RE = re.compile(r"^\**STEER-ACK:\**\s*(\d+)\b")
+STEER_ACK_RE = goalflight_terminal.STEER_ACK_RE
 TO_WORKER = "controller_to_worker"
 TO_CONTROLLER = "worker_to_controller"
 STEER_DIRECTIONS = frozenset({TO_WORKER, TO_CONTROLLER})

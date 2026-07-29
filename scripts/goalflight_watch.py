@@ -65,37 +65,25 @@ BLOCKING_TERMINAL_MARKERS = TERMINAL_MARKERS - SUCCESS_TERMINAL_MARKERS
 MARKER_KINDS = frozenset(kind for kind in _MARKER_KIND_ORDER if kind in TERMINAL_MARKERS or kind in {"STATUS", "STEER-ACK"})
 _MARKER_KIND_ALTERNATION = "|".join(re.escape(kind) for kind in _MARKER_KIND_ORDER if kind in MARKER_KINDS)
 _TERMINAL_MARKER_KIND_ALTERNATION = "|".join(re.escape(kind) for kind in _MARKER_KIND_ORDER if kind in TERMINAL_MARKERS)
-# Optional `!` sigil ahead of a marker kind, ACCEPTED HERE ONLY -- nothing
-# teaches it yet, deliberately.
-#
-# A first attempt taught `!COMPLETE:` in the prompt template and this protocol.
-# That was a safety regression: the marker grammar is parsed in at least four
-# places (this watcher, acp_runner.extract_markers, the ACP permission guard,
-# and steer ACK parsing), and only this one was made sigil-aware. A worker
-# following the new instruction emitted `!USER-CONFIRM: ...`, ACP extraction
-# returned {}, the confirmation guard never engaged, and the following edit
-# reached auto-allow with no human approval -- the syntax disabled the very
-# mechanism it shipped alongside.
-#
-# Accepting the sigil is harmless and backward-compatible; INSTRUCTING it is not,
-# until every parser shares one grammar. Do not teach it in any template,
-# protocol, or dispatch preamble until that unification lands, with end-to-end
-# coverage on the ACP path for each marker kind.
-_MARKER_SIGIL = "!"
-_SIGIL_OPT = rf"{re.escape(_MARKER_SIGIL)}?"
+# Optional `!` comes from the shared grammar used by ACP extraction, permission
+# guarding, ACK parsing, and this watcher. Consumer-specific fence, prompt-echo,
+# markdown, and terminal-position rules remain local.
+_SIGIL_OPT = goalflight_terminal.MARKER_SIGIL_OPT_RE
 SHELL_TERMINAL_MARKER_RE = rf"^{_SIGIL_OPT}\**({_TERMINAL_MARKER_KIND_ALTERNATION}):\**"
 MARKER_RE = re.compile(rf"^\**{_SIGIL_OPT}\**({_MARKER_KIND_ALTERNATION}):\**\s*(.*)$")
 FINAL_TERMINAL_MARKER_RE = re.compile(
     rf"^(?:-\s+)?`?\**{_SIGIL_OPT}\**(?:STATUS:\s*)?"
     rf"({_TERMINAL_MARKER_KIND_ALTERNATION}):(.*)$"
 )
-MARKER_VOCAB_BULLET_RE = re.compile(rf"^-\s+`(?:{_MARKER_KIND_ALTERNATION}):`\s*$")
+MARKER_VOCAB_BULLET_RE = re.compile(
+    rf"^-\s+`{_SIGIL_OPT}(?:{_MARKER_KIND_ALTERNATION}):`\s*$"
+)
 COMPLETION_SIGNOFF_RE = re.compile(
     r"^(?:STATUS:\s*)?(DONE|COMPLETE|FINISHED)\s*:?\s*[.!?]?$",
     re.IGNORECASE,
 )
 BARE_TERMINAL_MARKER_RE = re.compile(
-    rf"^(?:(?:{_TERMINAL_MARKER_KIND_ALTERNATION}):\s*.*|"
+    rf"^(?:{_SIGIL_OPT}(?:{_TERMINAL_MARKER_KIND_ALTERNATION}):\s*.*|"
     r"(?:DONE|COMPLETE|FINISHED)\s*:?\s*[.!?]?)$",
     re.IGNORECASE,
 )

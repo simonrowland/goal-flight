@@ -1,21 +1,25 @@
 # Worker Marker Protocol
 
-Workers emit parseable markers on their own lines:
+New workers emit sigiled, parseable markers on their own lines:
 
-- `STATUS: <current activity>`
-- `STEER-ACK: <seq>` — steer mailbox message acknowledged
-- `RESULT: <summary of completed work>`
-- `USER-NEED: <specific blocker requiring user input>`
-- `USER-CONFIRM: <specific confirmation needed before risky action>`
-- `BLOCKED: <blocker and evidence>`
-- `FAILED: <failure and evidence>`
-- `COMPLETE: <finished state>`
-- `READY: <findings-path>` — Investigator file-backed findings (path only in the marker line)
+- `!STATUS: <current activity>`
+- `!STEER-ACK: <seq>` — steer mailbox message acknowledged
+- `!RESULT: <summary of completed work>`
+- `!USER-NEED: <specific blocker requiring user input>`
+- `!USER-CONFIRM: <specific confirmation needed before risky action>`
+- `!BLOCKED: <blocker and evidence>`
+- `!FAILED: <failure and evidence>`
+- `!COMPLETE: <finished state>`
+- `!READY: <findings-path>` — Investigator file-backed findings (path only in the marker line)
 
-ACP transport also recognizes `PERMISSION-OK-PROCEEDED: <reason>` as an
+The leading `!` is optional to parsers for backward compatibility: unprefixed
+markers from deployed skills and older workers still work unchanged. New worker
+instructions and emissions use the prefixed form.
+
+ACP transport also recognizes `!PERMISSION-OK-PROCEEDED: <reason>` as an
 ACP-only non-terminal permission modifier. It is not part of the bash-tail
 watcher vocabulary. Use it only when the worker knows it worked around an
-auto-declined permission cleanly; otherwise a `COMPLETE` after an auto-declined
+auto-declined permission cleanly; otherwise a `!COMPLETE` after an auto-declined
 permission downgrades to `blocked_permission_denied`.
 
 Rules:
@@ -24,7 +28,7 @@ Rules:
   `USER-NEED`, `USER-CONFIRM`, `BLOCKED`. Transport policy decides whether a
   recognized marker stops the current loop.
 - The live watcher recognizes a terminal marker only as the worker's **final** non-empty line (mid-output / code-fence markers are ignored — the injection guard).
-- Dead/stale reconciliation may promote the last valid terminal marker from anywhere in the completed post-prompt tail. This handles workers that emit `READY:` and then a trailing TL;DR after the marker.
+- Dead/stale reconciliation may promote the last valid terminal marker from anywhere in the completed post-prompt tail. This handles workers that emit `!READY:` and then a trailing TL;DR after the marker.
 - `RESULT` and `COMPLETE` mean done unless the status JSON shows a process error.
 - `COMPLETE`, `READY`, and `RESULT` are success terminals; `FAILED` is a failure terminal.
 - `USER-NEED`, `BLOCKED`, and `FAILED` stop the dispatch loop and surface to the orchestrator.
@@ -70,7 +74,7 @@ Rules:
   fresh explicitly authorized dispatch.
   Restart tombstones stay denied and audit-visible, but belong to the dead ACP
   connection and cannot poison a clean confirmation in the new generation. If
-  `BLOCKED:`, `USER-NEED:`, or another hard terminal condition ends the run
+  `!BLOCKED:`, `!USER-NEED:`, or another hard terminal condition ends the run
   first, unresolved questions become terminal denials without replacing the
   harder terminal state or discarding partial output.
 - `PERMISSION-OK-PROCEEDED` is non-terminal; it modifies how the

@@ -424,7 +424,7 @@ def test_kimi_worker_dash_execution() -> None:
 
 def test_kimi_worker_preamble_is_neutral() -> None:
     preamble = D._worker_prompt_preamble("kimi")
-    check("kimi preamble contains COMPLETE contract", "COMPLETE: <summary>" in preamble)
+    check("kimi preamble contains sigiled COMPLETE contract", "!COMPLETE: <summary>" in preamble)
     check("kimi preamble has neutral worker identity", "Grok worker" not in preamble)
 
 

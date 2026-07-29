@@ -33,6 +33,18 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import goalflight_watch  # noqa: E402
 
+ACP_MARKER_KINDS = (
+    "STATUS",
+    "RESULT",
+    "USER-NEED",
+    "USER-CONFIRM",
+    "BLOCKED",
+    "FAILED",
+    "COMPLETE",
+    "READY",
+    "PERMISSION-OK-PROCEEDED",
+)
+
 
 def assert_true(name: str, condition: bool) -> None:
     if not condition:
@@ -127,6 +139,76 @@ def test_sigil_does_not_bypass_fence_skip() -> None:
         assert_true("sigil marker inside a fence is ignored", kinds == [])
 
 
+def test_acp_sigil_vocabulary_matches_legacy() -> None:
+    """Every ACP marker kind must dual-accept the same payload."""
+    import acp_runner  # noqa: PLC0415
+
+    failures: list[str] = []
+    for kind in ACP_MARKER_KINDS:
+        value = f"payload-for-{kind.lower()}"
+        expected = {kind: [value]}
+        bare = acp_runner.extract_markers(f"{kind}: {value}\n")
+        sigiled = acp_runner.extract_markers(f"!{kind}: {value}\n")
+        if bare != expected or sigiled != bare:
+            failures.append(
+                f"{kind}: expected={expected!r} bare={bare!r} sigiled={sigiled!r}"
+            )
+    assert_true(
+        "ACP prefixed and unprefixed marker extraction agree for every kind: "
+        + "; ".join(failures),
+        not failures,
+    )
+
+
+def test_sigil_keeps_injection_suppressions() -> None:
+    """Fence, prompt-echo, vocabulary-example, and position rules still win."""
+    import acp_runner  # noqa: PLC0415
+    from goalflight_acp_client import _has_actionable_user_confirm_marker  # noqa: PLC0415
+
+    failures: list[str] = []
+    if acp_runner.extract_markers("```text\n!COMPLETE: fenced ACP example\n```\n"):
+        failures.append("ACP fence skip accepted a prefixed example")
+    if not _has_actionable_user_confirm_marker("!USER-CONFIRM: approve edit? [Y/N]\n"):
+        failures.append("ACP permission guard rejected a prefixed confirmation")
+    if _has_actionable_user_confirm_marker(
+        "```text\n!USER-CONFIRM: fenced example only\n```\n"
+    ):
+        failures.append("ACP permission guard accepted a fenced prefixed example")
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+
+        prompt_echo = tmp / "prompt-echo.tail"
+        prompt_echo.write_text(
+            "tail began after the prompt anchor\n!COMPLETE: prompt-only\n",
+            encoding="utf-8",
+        )
+        prompt_lines = ["Do the work", "!COMPLETE: prompt-only"]
+        if goalflight_watch._final_terminal_marker(
+            prompt_echo,
+            ignore_prefix_lines=prompt_lines,
+        ) is not None:
+            failures.append("prefixed prompt echo reconciled as terminal")
+
+        vocabulary_bullet = tmp / "vocabulary-bullet.tail"
+        vocabulary_bullet.write_text("- `!COMPLETE:`\n", encoding="utf-8")
+        if goalflight_watch._final_terminal_marker(vocabulary_bullet) is not None:
+            failures.append("prefixed marker-vocabulary bullet reconciled as terminal")
+
+        early = tmp / "early.tail"
+        early.write_text(
+            "!COMPLETE: too early\nordinary output continues\n",
+            encoding="utf-8",
+        )
+        if goalflight_watch._last_line_is_terminal_marker(early) is not None:
+            failures.append("prefixed non-final marker bypassed last-line discipline")
+
+    assert_true(
+        "prefixed markers preserve injection suppressions: " + "; ".join(failures),
+        not failures,
+    )
+
+
 def test_real_marker_after_a_loop_still_wakes_controller() -> None:
     """A genuine sigil marker after a loop must still be the resolving one.
 
@@ -200,6 +282,8 @@ def main() -> None:
     test_sigil_markers_are_accepted()
     test_legacy_bare_kind_markers_still_accepted()
     test_sigil_does_not_bypass_fence_skip()
+    test_acp_sigil_vocabulary_matches_legacy()
+    test_sigil_keeps_injection_suppressions()
     test_real_marker_after_a_loop_still_wakes_controller()
     print("OK: marker sigil and sign-off position tests pass")
 

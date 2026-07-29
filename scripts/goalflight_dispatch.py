@@ -466,7 +466,7 @@ RESEARCH_INTENT_SUPPRESSOR_PATTERNS = (
 STEER_PROMPT_PREAMBLE = (
     "You have a steer mailbox at `$GOALFLIGHT_STEER_FILE`. Read it AT THE TOP OF EACH "
     "ITERATION and IMMEDIATELY BEFORE ANY git commit/push. Incorporate new messages "
-    "into your plan; ack each with `STEER-ACK: <seq>` on its own line; a steer may "
+    "into your plan; ack each with `!STEER-ACK: <seq>` on its own line; a steer may "
     "redirect or HALT you — honor it."
 )
 PROMPT_FILE_PREAMBLE = (
@@ -483,11 +483,12 @@ WORKER_EXECUTION_PREAMBLE = (
     "research, or analysis actions before answering. Do not only plan, summarize, or "
     "describe commands.\n"
     "- For successful completion, emit a final line outside any Markdown fence in this "
-    "exact shape: `COMPLETE: <summary>`.\n"
-    "- The `COMPLETE: <summary>` line must be the last non-empty line of your output. "
-    "Do not print anything after it."
+    "exact shape: `!COMPLETE: <summary>`.\n"
+    "- The `!COMPLETE: <summary>` line must be the last non-empty line of your output. "
+    "Do not print anything after it.\n"
+    "- Legacy unprefixed marker lines remain accepted; new emissions use the `!` prefix."
 )
-STEER_ACK_RE = re.compile(r"^\**STEER-ACK:\**\s*(\d+)\b")
+STEER_ACK_RE = goalflight_terminal.STEER_ACK_RE
 
 
 class DispatchUsageError(Exception):

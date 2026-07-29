@@ -29,6 +29,7 @@ import goalflight_compat
 import goalflight_acp_permits as permits
 import goalflight_ledger
 import goalflight_quota_stuck
+import goalflight_terminal
 from goalflight_adapter_readiness import validate_os_sandbox_request
 from goalflight_liveness import active_monotonic
 from goalflight_os_sandbox import OS_SANDBOX_OFF, canonical_os_sandbox, prepare_os_sandbox_command
@@ -1753,7 +1754,10 @@ _READ_SAFE_KINDS = frozenset({"", "read", "search", "think"})
 # state-changing, so treating it as safe while authorization is outstanding
 # would turn the question into implicit approval.
 _USER_CONFIRM_READ_SAFE_KINDS = frozenset({"read", "search", "think"})
-_USER_CONFIRM_MARKER_RE = re.compile(r"^\**USER-CONFIRM:\**\s*(.+?)\s*\**$")
+_USER_CONFIRM_MARKER_RE = re.compile(
+    rf"^\**{goalflight_terminal.MARKER_SIGIL_OPT_RE}\**"
+    r"USER-CONFIRM:\**\s*(.+?)\s*\**$"
+)
 
 
 def _has_actionable_user_confirm_marker(text: str) -> bool:

@@ -992,6 +992,42 @@ def case_same_turn_guarded_action_is_denied_without_answer() -> None:
         assert not guarded.exists(), "same-turn action ran before confirmation"
 
 
+def case_prefixed_same_turn_guarded_action_is_denied_without_answer() -> None:
+    """The sigiled marker must engage the guard before the next tool request."""
+    with tempfile.TemporaryDirectory() as td:
+        run, status, guarded, _mailbox = _run_confirmation_scenario(
+            Path(td),
+            scenario="user_confirm_prefixed_same_turn_guard",
+            dispatch_id="acp-user-confirm-prefixed-same-turn-guard",
+            live_matrix=True,
+        )
+        decisions = [
+            decision
+            for decision in (status.get("permission_router_decisions") or [])
+            if decision.get("tool_call_id") == "marker-guard-continue"
+        ]
+        guarded_denial = any(
+            decision.get("decision") == "deny"
+            and decision.get("reason") in {"user_confirm_pending", "user_confirm_denied"}
+            for decision in decisions
+        )
+        failures = []
+        if guarded.exists():
+            failures.append("guarded action reached auto-allow and wrote its sentinel")
+        if not guarded_denial or any(
+            decision.get("decision") == "allow" for decision in decisions
+        ):
+            failures.append(f"permission router did not fail closed: {decisions!r}")
+        if run.returncode == 0 or status.get("state") != "blocked_user_confirm_denied":
+            failures.append(
+                f"confirmation was not routed as a blocker: rc={run.returncode} "
+                f"state={status.get('state')!r}"
+            )
+        if "same_turn_guarded_action_taken=false" not in (status.get("result_text") or ""):
+            failures.append("worker did not observe a denied same-turn action")
+        assert not failures, (failures, run.stdout, run.stderr, status)
+
+
 def case_user_confirm_timeout_is_fail_closed_then_continues() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
@@ -1607,6 +1643,7 @@ def main() -> None:
     case_post_deadline_yes_before_delayed_read_is_denied()
     case_uncorrelated_user_confirm_yes_is_not_authorization()
     case_same_turn_guarded_action_is_denied_without_answer()
+    case_prefixed_same_turn_guarded_action_is_denied_without_answer()
     case_user_confirm_timeout_is_fail_closed_then_continues()
     case_split_user_confirm_routes_once()
     case_fenced_user_confirm_example_does_not_activate_guard()

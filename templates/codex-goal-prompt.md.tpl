@@ -17,7 +17,7 @@ PID=$!
 
 **Flags explanation**:
 - `--skip-git-repo-check` — codex refuses non-interactive runs in non-git directories by default. `[goal-mode]` chunks under `<repo>/.claude/worktrees/` ARE git repos and don't need this flag; chunks dispatched into `/tmp/` or other non-git workspaces do.
-- `--sandbox workspace-write -c approval_policy=never` — autonomous goal-mode dispatch needs to edit files without interactive human approval. `--sandbox workspace-write` permits edits within `-C <workdir>`; `-c approval_policy=never` stops codex prompting on each action. Without write permission codex emits `patch rejected: writing is blocked by read-only sandbox` on the first edit and the chunk fails with `BLOCKED:` (empirically verified 2026-05-17: a goal prompt that can write completes the edit → pytest → green loop in ~92 seconds; a read-only sandbox emits `BLOCKED:` after pytest and the patch attempt). **Do NOT use `--dangerously-bypass-approvals-and-sandbox`**: it removes the sandbox entirely (codex could edit anywhere and run arbitrary shell) AND it is rejected by some controllers' auto-mode safety classifiers, so the dispatch never starts. `workspace-write` is both safer and classifier-safe. **The safety story still depends on `-C <workdir>`** pointing at an isolated tree: when `<workdir>` is a sibling worktree under `.claude/worktrees/<slug>/` (i.e., `--parallel` mode), the worktree boundary plus the per-chunk verify-diff catches scope leaks before cherry-pick to main. When `<workdir>` is the controller cwd (sequential mode against the main worktree), `workspace-write` still bounds writes to that tree and the verify-diff step remains the fence; sequential mode against a repo with uncommitted unrelated work is still risky, so prefer parallel-isolate.
+- `--sandbox workspace-write -c approval_policy=never` — autonomous goal-mode dispatch needs to edit files without interactive human approval. `--sandbox workspace-write` permits edits within `-C <workdir>`; `-c approval_policy=never` stops codex prompting on each action. Without write permission codex emits `patch rejected: writing is blocked by read-only sandbox` on the first edit and the chunk fails with `!BLOCKED:` (empirically verified 2026-05-17: a goal prompt that can write completes the edit → pytest → green loop in ~92 seconds; a read-only sandbox emits `!BLOCKED:` after pytest and the patch attempt). **Do NOT use `--dangerously-bypass-approvals-and-sandbox`**: it removes the sandbox entirely (codex could edit anywhere and run arbitrary shell) AND it is rejected by some controllers' auto-mode safety classifiers, so the dispatch never starts. `workspace-write` is both safer and classifier-safe. **The safety story still depends on `-C <workdir>`** pointing at an isolated tree: when `<workdir>` is a sibling worktree under `.claude/worktrees/<slug>/` (i.e., `--parallel` mode), the worktree boundary plus the per-chunk verify-diff catches scope leaks before cherry-pick to main. When `<workdir>` is the controller cwd (sequential mode against the main worktree), `workspace-write` still bounds writes to that tree and the verify-diff step remains the fence; sequential mode against a repo with uncommitted unrelated work is still risky, so prefer parallel-isolate.
 
 **No `timeout 300` wrapper** — `/goal` mode is designed for multi-hour autonomous runs. The controller monitors the tail file for the "Final response" block specified at the bottom of the prompt; the dispatch is complete when that block appears with the agreed schema. Watchdog inactivity thresholds from `SKILL.md` §Codex reliability do NOT apply (long pauses during plan/act/test/review-to-convergence cycles are expected).
 
@@ -43,7 +43,7 @@ Rules:
 - {{RULE_EDIT_SCOPE — e.g., do not edit code unless needed for diagnostic tables/plots}}
 - {{RULE_VALIDATION — e.g., validate facts before downstream claims}}
 - Only run safe read/diagnostic commands unless explicitly authorized to edit.
-- **Emit marker lines** when you hit ambiguous points, need user input, or finish. One marker per line in your output. Vocabulary (see goal-flight SKILL.md §Worker message passing): `STATUS: <update>` (informational), `RESULT: <key>=<value>` (structured output), `USER-NEED: <question>` (you can't decide without user input — stop and emit this; the controller will relay), `USER-CONFIRM: <action> [Y/N]` (irreversible op needs authorization), `BLOCKED: <reason>` (unrecoverable), `COMPLETE: <summary>` (task done). Emit a `STATUS:` line at least every ~8 minutes and before any long step; work incrementally so the controller sees live progress. The controller relays `USER-NEED:` / `USER-CONFIRM:` to its conversational surface. Reserve them for the narrow cases below: `USER-NEED:` and `BLOCKED:` end the turn; unattended `USER-CONFIRM:` is routed without discarding the partial turn, but the guarded action remains unauthorized until a correlated answer arrives. Only the exact worker-facing token `USER-CONFIRM-ANSWER: <question_id> yes` together with status `guarded_action_authorized=true` authorizes that question; `recorded-yes-not-authorized`, `no`, silence, restart state, and permission-escalation acknowledgment authorize nothing. Ordinary ambiguity is still resolved by deciding and recording the assumption, not by asking.
+- **Emit marker lines** when you hit ambiguous points, need user input, or finish. One marker per line in your output. New emissions use the `!` prefix; parsers still accept every unprefixed form from deployed or older workers. Vocabulary (see goal-flight SKILL.md §Worker message passing): `!STATUS: <update>` (informational), `!RESULT: <key>=<value>` (structured output), `!USER-NEED: <question>` (you can't decide without user input — stop and emit this; the controller will relay), `!USER-CONFIRM: <action> [Y/N]` (irreversible op needs authorization), `!BLOCKED: <reason>` (unrecoverable), `!COMPLETE: <summary>` (task done). Emit a `!STATUS:` line at least every ~8 minutes and before any long step; work incrementally so the controller sees live progress. The controller relays `!USER-NEED:` / `!USER-CONFIRM:` to its conversational surface. Reserve them for the narrow cases below: `!USER-NEED:` and `!BLOCKED:` end the turn; unattended `!USER-CONFIRM:` is routed without discarding the partial turn, but the guarded action remains unauthorized until a correlated answer arrives. Only the exact worker-facing token `USER-CONFIRM-ANSWER: <question_id> yes` together with status `guarded_action_authorized=true` authorizes that question; `recorded-yes-not-authorized`, `no`, silence, restart state, and permission-escalation acknowledgment authorize nothing. Ordinary ambiguity is still resolved by deciding and recording the assumption, not by asking.
 - **End-of-convergence-attempt self-review.** When you think the goal is met (FOCUSED test gates green — the full gate is controller-side — AND acceptance criteria satisfied), DO NOT yet emit `Goal complete: true`. First run the 7-category adversarial self-review from `prompts/executor-self-review.md` (INVARIANT GAP / SCOPE LEAK / MUTATION PURITY / BEHAVIOR DRIFT / DEAD CODE / CONTRACT LEAK / INTEGRITY), specialized to this chunk's project nouns and grep patterns, plus the universal null-hypothesis floor: state the null hypothesis (this change did NOT achieve its purpose / is a no-op / introduced a regression), actively try to CONFIRM it, and hand off only when observed before/after evidence REJECTS it. Severity-rank findings P0/P1/P2/P3. **Any P0 or P1 is a continue-iterating signal** — fix it in-loop (which becomes another plan/act/test cycle) and re-run the self-review pass. Emit `Goal complete: true` only when the self-review pass yields no P0/P1 and the null hypothesis is rejected by evidence, OR when every flagged P0/P1 was resolved in-loop with test gates still green and the null hypothesis is rejected by evidence. **Cadence**: ONE self-review pass per "I think I'm done" attempt — NOT after every micro-step. Typical: 1-3 passes total per chunk.
 
 Acceptance criteria:
@@ -62,17 +62,17 @@ Test gates (must remain true throughout):
 Unattended-dispatch contract (read this before your first tool call):
 - **Do NOT ask the controller ordinary judgement questions mid-run.** This is
   an unattended dispatch: nobody is continuously watching the stream. The
-  harness routes a genuine `USER-CONFIRM:` question and preserves your partial
+  harness routes a genuine `!USER-CONFIRM:` question and preserves your partial
   turn, but authorization may not arrive promptly.
 - Where this brief leaves a judgement open, **make the call, state the
   assumption you made, and continue.** A defensible decision with its
   reasoning recorded is worth far more than a question nobody can answer.
-- `USER-NEED:` / `USER-CONFIRM:` are for the cases where proceeding would be
+- `!USER-NEED:` / `!USER-CONFIRM:` are for the cases where proceeding would be
   genuinely unsafe or would destroy work — an irreversible action you were not
   authorized to take, or a contradiction that makes the brief impossible. They
   are not for preferences, tie-breaks, or "which of these two reasonable
   designs did you want".
-- After `USER-CONFIRM:`, **do not take the guarded action** unless a correlated
+- After `!USER-CONFIRM:`, **do not take the guarded action** unless a correlated
   answer explicitly authorizes it. A steer ACK, unrelated steer, mailbox read,
   timeout, or silence is not approval. Continue independent safe work while the
   question is outstanding. At the unattended deadline the harness reconciles a
@@ -81,7 +81,7 @@ Unattended-dispatch contract (read this before your first tool call):
   silence/wedge limits resume after settlement. Respect a denial and finish
   whatever safe deliverable remains.
 - If you are blocked by the ENVIRONMENT rather than by a decision (a refused
-  sandbox operation, a missing tool), that is `BLOCKED:` with the exact refusal
+  sandbox operation, a missing tool), that is `!BLOCKED:` with the exact refusal
   — not a question.
 
 Gate discipline (token economy — these are standing rules, not suggestions):
@@ -92,10 +92,10 @@ Gate discipline (token economy — these are standing rules, not suggestions):
   skip tests your run then silently omits). The controller re-runs the full
   gate at landing; that run is the verdict.
 - In your final response, BEFORE the terminal marker, report the literal line
-  `RESULT: gate=deferred-to-controller` plus the focused-suite results you did
+  `!RESULT: gate=deferred-to-controller` plus the focused-suite results you did
   run. This is a status record, not a success claim — never claim full-gate
-  green. Your terminal marker stays per the marker vocabulary (`COMPLETE:` for
-  a finished chunk; the `USER-NEED:` landing-checkpoint form only when this
+  green. Your terminal marker stays per the marker vocabulary (`!COMPLETE:` for
+  a finished chunk; the `!USER-NEED:` landing-checkpoint form only when this
   brief orders a landing checkpoint).
 - If the chunk genuinely requires a broader run (e.g., a conftest/harness
   change), wrap it: `python3 <skill-root>/scripts/goalflight_gate.py -- <cmd>`

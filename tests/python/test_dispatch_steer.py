@@ -22,6 +22,8 @@ sys.path.insert(0, str(SCRIPTS))
 
 import goalflight_dispatch  # noqa: E402
 import goalflight_ledger  # noqa: E402
+import goalflight_steer_mailbox  # noqa: E402
+import goalflight_terminal  # noqa: E402
 
 
 @contextlib.contextmanager
@@ -155,6 +157,33 @@ def case_acp_list_reads_status_ack_dict() -> None:
         listed = _run_steer(tmp, dispatch_id, "--list")
         assert listed.returncode == 0, listed.stderr
         assert "\ttrue\tredirect" in listed.stdout, listed.stdout
+
+
+def case_prefixed_ack_is_parsed_by_both_call_sites() -> None:
+    with tempfile.TemporaryDirectory() as d:
+        tail = Path(d) / "tail.log"
+        tail.write_text("!STEER-ACK: 7\n", encoding="utf-8")
+        record = {"stdout_path": str(tail)}
+        mailbox_acks = goalflight_steer_mailbox.acked_steer_seqs(record)
+        dispatch_acks = goalflight_dispatch._acked_steer_seqs(record)
+        regexes_share_definition = (
+            goalflight_dispatch.STEER_ACK_RE
+            is goalflight_steer_mailbox.STEER_ACK_RE
+            is goalflight_terminal.STEER_ACK_RE
+        )
+        regex_values = [
+            match.group(1) if match else None
+            for match in (
+                goalflight_dispatch.STEER_ACK_RE.match("!STEER-ACK: 7"),
+                goalflight_steer_mailbox.STEER_ACK_RE.match("!STEER-ACK: 7"),
+            )
+        ]
+        assert (
+            mailbox_acks == {7}
+            and dispatch_acks == {7}
+            and regexes_share_definition
+            and regex_values == ["7", "7"]
+        ), (mailbox_acks, dispatch_acks, regexes_share_definition, regex_values)
 
 
 def case_dead_worker_warns_but_appends() -> None:
@@ -442,7 +471,7 @@ def case_prompt_preamble_is_materialized() -> None:
 
         assert text == expected, text
         assert text.startswith(goalflight_dispatch.STEER_PROMPT_PREAMBLE + "\n\n"), text
-        assert "`STEER-ACK: <seq>`" in text, text
+        assert "`!STEER-ACK: <seq>`" in text, text
         assert "$GOALFLIGHT_PROMPT_FILE" in text, text
         assert "Re-read it after any internal compaction/summarization" in text, text
         assert "disk file is authoritative" in text, text
@@ -533,7 +562,8 @@ def case_grok_prompt_adds_execution_and_terminal_contract() -> None:
         )
         assert text.startswith(expected_prefix), text
         assert "Use your available tools to actually perform" in text, text
-        assert "`COMPLETE: <summary>`" in text, text
+        assert "`!COMPLETE: <summary>`" in text, text
+        assert "Legacy unprefixed marker lines remain accepted" in text, text
         assert "last non-empty line" in text, text
         assert "Write target.txt with ok." in text, text
 
@@ -581,6 +611,7 @@ def main() -> None:
     case_bash_append_and_list_with_ack()
     case_shape_routing_and_missing_record()
     case_acp_list_reads_status_ack_dict()
+    case_prefixed_ack_is_parsed_by_both_call_sites()
     case_dead_worker_warns_but_appends()
     case_steer_is_no_worker_early_exit()
     case_concurrent_appends_have_monotonic_unique_seq()

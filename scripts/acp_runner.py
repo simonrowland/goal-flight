@@ -24,6 +24,7 @@ from typing import Any, Callable
 from goalflight_acp_client import AcpConnection
 from goalflight_liveness import active_monotonic
 from goalflight_watch import MARKER_KINDS, TERMINAL_MARKERS as WATCH_TERMINAL_MARKERS
+import goalflight_terminal
 
 
 @dataclass
@@ -414,7 +415,8 @@ async def _run_prompt_locked(
 _ACP_MARKER_KINDS = MARKER_KINDS | {"PERMISSION-OK-PROCEEDED"}
 _ACP_MARKER_KIND_ALTERNATION = "|".join(re.escape(kind) for kind in sorted(_ACP_MARKER_KINDS))
 _MARKERS_RE = re.compile(
-    rf"^\**({_ACP_MARKER_KIND_ALTERNATION}):\**\s*(.+?)\s*\**$",
+    rf"^\**{goalflight_terminal.MARKER_SIGIL_OPT_RE}\**"
+    rf"({_ACP_MARKER_KIND_ALTERNATION}):\**\s*(.+?)\s*\**$",
     re.MULTILINE,
 )
 

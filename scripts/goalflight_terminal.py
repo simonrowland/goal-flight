@@ -14,6 +14,14 @@ RATE_LIMITED_STATE = "rate_limited"
 SUCCESS_TERMINAL_MARKERS = {"COMPLETE", "READY", "RESULT"}
 TERMINAL_MARKERS = SUCCESS_TERMINAL_MARKERS | {"FAILED", "BLOCKED", "USER-NEED", "USER-CONFIRM"}
 TOKEN_COUNT_RE = re.compile(r"^\d[\d,]*$")
+# One optional worker-marker sigil grammar shared by every parser. Keep this as
+# a regex fragment so each consumer can preserve its existing markdown/fence/
+# position rules around the marker token.
+MARKER_SIGIL = "!"
+MARKER_SIGIL_OPT_RE = rf"{re.escape(MARKER_SIGIL)}?"
+STEER_ACK_RE = re.compile(
+    rf"^\**{MARKER_SIGIL_OPT_RE}\**STEER-ACK:\**\s*(\d+)\b"
+)
 
 
 def read_tail_excerpt(path: Path, max_bytes: int = RATE_LIMIT_TAIL_BYTES) -> str:
