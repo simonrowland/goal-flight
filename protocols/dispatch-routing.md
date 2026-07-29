@@ -81,8 +81,9 @@ Right-size the shape — three loop failure modes to avoid:
   authorize the already-denied tool call; use inline mode or a fresh explicitly
   authorized dispatch when that action itself must proceed.
   For permission-escalation questions, even a correlated `yes` is acknowledgment
-  only: it does not authorize a retry or alternate route. Any `no` is permanent
-  and deny-biased across conflicting controller replies.
+  only: it does not authorize a retry or alternate route. It also does not join
+  or poison an independent worker-marker decision cohort from the same turn.
+  Any `no` is permanent and deny-biased across conflicting controller replies.
   Answer a routed question with
   `USER-CONFIRM-ANSWER: <question_id> yes|no <optional note>` in
   `goalflight_dispatch.py steer`. The `<question_id>` must match an outstanding
@@ -105,12 +106,14 @@ Right-size the shape — three loop failure modes to avoid:
   `user_confirm_overdue=true` and denies. Either settlement re-enables ordinary
   silence/wedge detection, so a turn that never releases the session lock
   terminates detectably.
-  Questions in one decision cohort fail closed together; historical restart
-  tombstones stay audit-visible but do not poison the fresh connection or its
-  terminal qualification. After any denial, continuation on that ACP
-  connection is intentionally read-only; a later confirmation does not reopen
-  non-read permission routing. If another hard terminal condition
-  ends the run first, every still-open question is recorded as denied while the
+  Questions in one same-origin decision cohort fail closed together. An explicit
+  or synthesized `no` makes every question in that generation non-authorizing
+  and keeps the ACP connection read-only; a later recorded `yes` is delivered as
+  `recorded-yes-not-authorized` with a fresh-dispatch instruction and does not
+  reopen non-read permission routing. Historical restart tombstones stay
+  audit-visible but do not poison the fresh connection or its terminal
+  qualification. If another hard terminal condition ends the run first, every
+  still-open question is recorded as denied while the
   harder terminal state and error remain authoritative. Safe work may be preserved in
   `result_text`, but a run with a denied requested action ends in a qualified
   blocked state, never clean `complete`/`ok=true`.

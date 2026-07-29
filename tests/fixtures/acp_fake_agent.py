@@ -178,7 +178,9 @@ def handle_prompt(req_id: int, params: dict) -> None:
         "user_confirm_hang_after_marker",
         "user_confirm_split_marker",
         "user_confirm_repeat_after_no",
+        "user_confirm_later_after_no",
         "permission_escalate_continue",
+        "permission_escalation_and_marker",
         "user_confirm_fenced_example",
         "user_confirm_kindless_guard",
         "user_confirm_same_turn_guard",
@@ -187,12 +189,36 @@ def handle_prompt(req_id: int, params: dict) -> None:
         turn = int(session.get("turn", 0)) + 1
         session["turn"] = turn
         guarded_file = os.environ.get("GOALFLIGHT_FAKE_ACP_GUARDED_FILE")
+        escalation_file = os.environ.get(
+            "GOALFLIGHT_FAKE_ACP_ESCALATION_FILE",
+            f"{guarded_file}-escalation" if guarded_file else "/outside/escalation",
+        )
         if turn == 1:
             marker = os.environ.get("GOALFLIGHT_FAKE_ACP_TURN1_FILE")
             if marker:
                 with open(marker, "w", encoding="utf-8") as f:
                     f.write("turn1\n")
-            if SCENARIO in {
+            if SCENARIO == "permission_escalation_and_marker":
+                selected = request_permission(
+                    session_id,
+                    "perm-and-marker",
+                    options=CODEX_PERMISSION_OPTIONS,
+                    title="Write permission-escalation sentinel",
+                    locations=[{"path": escalation_file}],
+                )
+                if selected:
+                    with open(escalation_file, "w", encoding="utf-8") as f:
+                        f.write("authorized\n")
+                text_update(
+                    session_id,
+                    "USER-CONFIRM: authorize independent worker-marker action? [Y/N]\n",
+                )
+                text_update(
+                    session_id,
+                    f"RESULT: permission={selected or 'denied'} safe_work=preserved\n",
+                )
+                text_update(session_id, "COMPLETE: same-turn questions routed\n")
+            elif SCENARIO in {
                 "user_confirm_fenced_example",
                 "user_confirm_kindless_guard",
                 "user_confirm_same_turn_guard",
@@ -269,6 +295,11 @@ def handle_prompt(req_id: int, params: dict) -> None:
                         session_id,
                         " sentinel write? [Y/N]\n",
                     )
+                elif SCENARIO == "user_confirm_later_after_no":
+                    text_update(
+                        session_id,
+                        "USER-CONFIRM: authorize guarded sentinel A write? [Y/N]\n",
+                    )
                 else:
                     text_update(
                         session_id,
@@ -293,6 +324,14 @@ def handle_prompt(req_id: int, params: dict) -> None:
 
         prompt = prompt_text(params)
         decision = "yes" if AUTHORIZE_TOKEN.search(prompt) else "no"
+        if SCENARIO == "user_confirm_later_after_no" and turn == 2:
+            text_update(session_id, "RESULT: independent_work=preserved_after_denial\n")
+            text_update(
+                session_id,
+                "USER-CONFIRM: authorize guarded sentinel B write? [Y/N]\n",
+            )
+            response(req_id, {"sessionId": session_id, "stopReason": "end_turn"})
+            return
         if SCENARIO == "user_confirm_repeat_after_no" and decision == "no":
             text_update(session_id, "RESULT: independent_work=preserved_after_denial\n")
             text_update(
@@ -302,7 +341,60 @@ def handle_prompt(req_id: int, params: dict) -> None:
             response(req_id, {"sessionId": session_id, "stopReason": "end_turn"})
             return
         action_authorized = decision == "yes"
-        if (
+        if SCENARIO == "permission_escalation_and_marker":
+            selected = request_permission(
+                session_id,
+                "marker-after-permission-escalation",
+                options=CODEX_PERMISSION_OPTIONS,
+                title="Write independent worker-marker sentinel",
+                kind="edit",
+                locations=[
+                    {
+                        "path": os.environ.get(
+                            "GOALFLIGHT_FAKE_ACP_PERMISSION_LOCATION",
+                            guarded_file or "/outside/guarded",
+                        )
+                    }
+                ],
+            )
+            action_authorized = action_authorized and bool(selected)
+            text_update(
+                session_id,
+                (
+                    "RESULT: "
+                    f"marker_permission_selected={str(bool(selected)).lower()}\n"
+                ),
+            )
+        elif SCENARIO == "user_confirm_later_after_no":
+            selected = request_permission(
+                session_id,
+                "guarded-after-prior-denial",
+                options=CODEX_PERMISSION_OPTIONS,
+                title="Write guarded sentinel after prior denial",
+                kind="edit",
+                locations=[
+                    {
+                        "path": os.environ.get(
+                            "GOALFLIGHT_FAKE_ACP_PERMISSION_LOCATION",
+                            guarded_file or "/outside/guarded",
+                        )
+                    }
+                ],
+            )
+            action_authorized = action_authorized and bool(selected)
+            read_only_reason_seen = (
+                "Connection is read-only after a prior denial" in prompt
+            )
+            text_update(
+                session_id,
+                (
+                    "RESULT: "
+                    f"authorization_token_seen={str(decision == 'yes').lower()} "
+                    f"read_only_reason_seen={str(read_only_reason_seen).lower()} "
+                    f"permission_selected={str(bool(selected)).lower()}\n"
+                ),
+            )
+        elif (
             action_authorized
             and os.environ.get("GOALFLIGHT_FAKE_ACP_REQUEST_GUARDED_PERMISSION")
             == "1"

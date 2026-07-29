@@ -319,6 +319,83 @@ def _run_answered_confirmation(
     return proc, stdout, stderr, status, guarded, question
 
 
+def _answer_confirmation(
+    *,
+    dispatch_id: str,
+    question_id: str,
+    decision: str,
+    cwd: Path,
+    env: dict[str, str],
+) -> None:
+    reply = subprocess.run(
+        [
+            sys.executable,
+            str(DISPATCH),
+            "steer",
+            dispatch_id,
+            f"USER-CONFIRM-ANSWER: {question_id} {decision}",
+        ],
+        cwd=cwd,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=10,
+    )
+    assert reply.returncode == 0, reply.stdout + reply.stderr
+
+
+def _start_confirmation_runner(
+    tmp: Path,
+    *,
+    scenario: str,
+    dispatch_id: str,
+    extra_env: dict[str, str] | None = None,
+) -> tuple[subprocess.Popen[str], dict[str, str], Path, Path, Path]:
+    _write_fake_codex_acp_manifest(tmp / "adapters")
+    env = _env(tmp)
+    env["GOALFLIGHT_FAKE_ACP_SCENARIO"] = scenario
+    env["GOALFLIGHT_USER_CONFIRM_TIMEOUT_S"] = "5"
+    env.update(extra_env or {})
+    guarded = tmp / f"{dispatch_id}-guarded"
+    env["GOALFLIGHT_FAKE_ACP_GUARDED_FILE"] = str(guarded)
+    status_path = tmp / f"{dispatch_id}.status.json"
+    mailbox = (
+        Path(env["GOALFLIGHT_STATE_DIR"])
+        / "dispatch"
+        / f"{dispatch_id}.steer.jsonl"
+    )
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            str(DISPATCH),
+            "--shape",
+            "acp",
+            "--agent",
+            "codex-acp",
+            "--dispatch-id",
+            dispatch_id,
+            "--cwd",
+            str(ROOT),
+            "--prompt",
+            "initial task",
+            "--status-json",
+            str(status_path),
+            "--poll-secs",
+            "0.05",
+            "--max-idle-secs",
+            "10",
+            "--foreground",
+        ],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    return proc, env, guarded, status_path, mailbox
+
+
 def case_acp_mailbox_steer_delivered_at_next_turn_and_acked() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
@@ -1302,6 +1379,138 @@ def case_crossed_dual_user_confirm_answers_never_emit_authorization() -> None:
         ), (stdout, stderr, status)
 
 
+def case_prior_denial_blocks_later_scope_in_same_generation() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        dispatch_id = "acp-user-confirm-prior-denial"
+        proc, env, guarded, status_path, mailbox = _start_confirmation_runner(
+            tmp,
+            scenario="user_confirm_later_after_no",
+            dispatch_id=dispatch_id,
+            extra_env={
+                "GOALFLIGHT_FAKE_ACP_FIRST_TURN_SLEEP": "0.5",
+                "GOALFLIGHT_ACP_LIVE_MATRIX": "1",
+                "GOALFLIGHT_FAKE_ACP_PERMISSION_LOCATION": str(
+                    ROOT / ".goalflight-fake-guard-target"
+                ),
+            },
+        )
+        try:
+            first = _wait_for_worker_question(mailbox)
+            _answer_confirmation(
+                dispatch_id=dispatch_id,
+                question_id=first["question_id"],
+                decision="no",
+                cwd=ROOT,
+                env=env,
+            )
+            second = _wait_for_worker_question(
+                mailbox,
+                exclude_question_ids={first["question_id"]},
+            )
+            _answer_confirmation(
+                dispatch_id=dispatch_id,
+                question_id=second["question_id"],
+                decision="yes",
+                cwd=ROOT,
+                env=env,
+            )
+            stdout, stderr = proc.communicate(timeout=20)
+        finally:
+            if proc.poll() is None:
+                proc.send_signal(signal.SIGTERM)
+                proc.communicate(timeout=10)
+
+        status = json.loads(status_path.read_text(encoding="utf-8"))
+        resolved = status.get("user_confirm_resolved") or []
+        by_text = {item["text"]: item for item in resolved}
+        denied = by_text["authorize guarded sentinel A write? [Y/N]"]
+        recorded_yes = by_text["authorize guarded sentinel B write? [Y/N]"]
+        permission_decisions = status.get("permission_router_decisions") or []
+        assert (
+            proc.returncode != 0
+            and status["state"] == "blocked_user_confirm_denied"
+            and len(resolved) == 2
+            and denied["controller_decision"] == "no"
+            and recorded_yes["controller_decision"] == "yes"
+            and denied["generation"] == recorded_yes["generation"]
+            and denied["decision_scope"] != recorded_yes["decision_scope"]
+            and denied["guarded_action_authorized"] is False
+            and recorded_yes["guarded_action_authorized"] is False
+            and not guarded.exists()
+            and "authorization_token_seen=false" in status["result_text"]
+            and "read_only_reason_seen=true" in status["result_text"]
+            and "permission_selected=false" in status["result_text"]
+            and any(
+                decision.get("reason") == "user_confirm_denied"
+                for decision in permission_decisions
+            )
+        ), (stdout, stderr, status)
+
+
+def case_same_turn_permission_escalation_does_not_strand_marker_yes() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        dispatch_id = "acp-permission-and-marker"
+        escalation_target = tmp / f"{dispatch_id}-escalation"
+        proc, env, guarded, status_path, mailbox = _start_confirmation_runner(
+            tmp,
+            scenario="permission_escalation_and_marker",
+            dispatch_id=dispatch_id,
+            extra_env={
+                "GOALFLIGHT_ACP_LIVE_MATRIX": "1",
+                "GOALFLIGHT_FAKE_ACP_ESCALATION_FILE": str(escalation_target),
+                "GOALFLIGHT_FAKE_ACP_PERMISSION_LOCATION": str(
+                    ROOT / ".goalflight-fake-guard-target"
+                ),
+            },
+        )
+        try:
+            questions = _wait_for_worker_questions(mailbox, count=2)
+            for question in questions:
+                _answer_confirmation(
+                    dispatch_id=dispatch_id,
+                    question_id=question["question_id"],
+                    decision="yes",
+                    cwd=ROOT,
+                    env=env,
+                )
+            stdout, stderr = proc.communicate(timeout=20)
+        finally:
+            if proc.poll() is None:
+                proc.send_signal(signal.SIGTERM)
+                proc.communicate(timeout=10)
+
+        status = json.loads(status_path.read_text(encoding="utf-8"))
+        resolved = status.get("user_confirm_resolved") or []
+        by_origin = {item["origin"]: item for item in resolved}
+        escalation = by_origin["permission_escalation"]
+        marker = by_origin["worker_marker"]
+        permission_decisions = status.get("permission_router_decisions") or []
+        assert (
+            proc.returncode != 0
+            and status["state"] == "blocked_permission_denied"
+            and status["had_denied_action"] is True
+            and len(resolved) == 2
+            and escalation["controller_decision"] == "yes"
+            and marker["controller_decision"] == "yes"
+            and escalation["generation"] == marker["generation"]
+            and escalation["turn_index"] == marker["turn_index"]
+            and escalation["decision_scope"] != marker["decision_scope"]
+            and escalation["guarded_action_authorized"] is False
+            and marker["guarded_action_authorized"] is True
+            and not escalation_target.exists()
+            and "marker_permission_selected=true" in status["result_text"]
+            and any(
+                decision.get("decision") == "allow"
+                and decision.get("tool_call_id")
+                == "marker-after-permission-escalation"
+                for decision in permission_decisions
+            )
+            and guarded.read_text(encoding="utf-8") == "authorized\n"
+        ), (stdout, stderr, status)
+
+
 def case_conflicting_user_confirm_answers_are_deny_biased() -> None:
     with tempfile.TemporaryDirectory() as td:
         proc, stdout, stderr, status, guarded, _question = _run_answered_confirmation(
@@ -1407,6 +1616,8 @@ def main() -> None:
     case_restart_does_not_reuse_question_id_or_accept_stale_yes()
     case_quoted_authorize_grammar_in_ordinary_steer_is_inert()
     case_crossed_dual_user_confirm_answers_never_emit_authorization()
+    case_prior_denial_blocks_later_scope_in_same_generation()
+    case_same_turn_permission_escalation_does_not_strand_marker_yes()
     case_conflicting_user_confirm_answers_are_deny_biased()
     case_correlated_worker_marker_yes_authorizes_only_its_action()
     case_permission_escalation_yes_is_acknowledgment_not_authorization()

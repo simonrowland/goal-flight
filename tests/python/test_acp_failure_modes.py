@@ -40,6 +40,7 @@ from goalflight_acp_run import (  # noqa: E402
     _apply_user_confirm_reply_batch,
     _finalize_provisional_user_confirm_yes,
     _read_user_confirm_replies_denying_expired,
+    _refresh_user_confirm_authorizations,
     _resolve_steer_file,
     _steer_turn_prompt,
     _user_confirm_deadline_reached,
@@ -1169,6 +1170,56 @@ def case_user_confirm_scope_requires_every_member_yes() -> None:
     assert questions["b"]["guarded_action_authorized"] is False, questions
 
 
+def case_user_confirm_generation_key_is_hashable_and_fail_closed() -> None:
+    questions = {
+        "bad-no": {
+            "question_id": "bad-no",
+            "generation": [],
+            "decision_scope": "scope-no",
+            "origin": "worker_marker",
+            "controller_decision": "no",
+            "guarded_action_authorized": False,
+        },
+        "bad-yes": {
+            "question_id": "bad-yes",
+            "generation": {},
+            "decision_scope": "scope-yes",
+            "origin": "worker_marker",
+            "controller_decision": "yes",
+            "guarded_action_authorized": False,
+        },
+        "fresh-yes": {
+            "question_id": "fresh-yes",
+            "generation": "fresh",
+            "decision_scope": "scope-fresh",
+            "origin": "worker_marker",
+            "controller_decision": "yes",
+            "guarded_action_authorized": False,
+        },
+    }
+    _refresh_user_confirm_authorizations(questions)
+    prompt = _steer_turn_prompt(
+        Path("/tmp/unused-user-confirm-mailbox"),
+        [
+            {
+                "seq": 2,
+                "reply_to": "bad-yes",
+                "decision": "yes",
+                "text": "USER-CONFIRM-ANSWER: bad-yes yes",
+            }
+        ],
+        {2},
+        questions,
+    )
+    assert (
+        questions["bad-no"]["guarded_action_authorized"] is False
+        and questions["bad-yes"]["guarded_action_authorized"] is False
+        and questions["fresh-yes"]["guarded_action_authorized"] is True
+        and "USER-CONFIRM-ANSWER: bad-yes yes" not in prompt
+        and "Connection is read-only after a prior denial" in prompt
+    ), (questions, prompt)
+
+
 def case_steer_prompt_sanitizes_quoted_authorize_grammar() -> None:
     questions = {
         "qa": {
@@ -2049,6 +2100,7 @@ def main() -> None:
     case_runner_user_confirm_then_blocked_preserves_denial_and_partial()
     case_user_confirm_denial_arbitration_is_order_independent_and_sticky()
     case_user_confirm_scope_requires_every_member_yes()
+    case_user_confirm_generation_key_is_hashable_and_fail_closed()
     case_steer_prompt_sanitizes_quoted_authorize_grammar()
     case_post_user_confirm_denial_keeps_continuation_read_only()
     case_user_confirm_clocks_are_independent_without_sleeping()

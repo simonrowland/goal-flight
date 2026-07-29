@@ -42,11 +42,15 @@ Rules:
   sets `user_confirm_overdue=true` and records the denial. Either settlement
   re-enables normal silence/wedge detection, so a turn that never returns is
   terminal, not immortal. A repeated unresolved question blocks.
-  Questions emitted in the same decision cohort are deny-biased together: an
-  unanswered member or any non-authorizing resolution keeps every member
-  unauthorized, and a repeated same-action question in the same runner
-  inherits that cohort. Restart tombstones retain their old cohort, while a
-  fresh post-restart question receives a new one. The worker receives the bare
+  Questions sharing a same-origin decision cohort are deny-biased
+  together: an unanswered member or any non-authorizing resolution keeps every
+  member unauthorized, and a repeated same-action question in the same runner
+  inherits that cohort. Permission-escalation acknowledgments use a separate
+  cohort from worker markers emitted in the same turn; their `yes` remains
+  non-authorizing for the already-denied ACP call without stranding an
+  independently confirmed marker action. Restart tombstones retain their old
+  cohort, while a fresh post-restart question receives a new one. The worker
+  receives the bare
   `USER-CONFIRM-ANSWER: <id> yes` token only when status also records
   `guarded_action_authorized=true`; a recorded affirmative that cannot
   authorize uses `recorded-yes-not-authorized`. Quoted instances of the
@@ -59,9 +63,11 @@ Rules:
   A completed safe-work continuation after a denial records
   `blocked_user_confirm_denied`; a denied ACP permission records
   `blocked_permission_denied`. Neither is an unqualified `complete`/`ok=true`.
-  Post-denial continuation is intentionally read-only for the remainder of the
-  ACP connection. A later consent flag is necessary but not sufficient to
-  reopen non-read permissions; use a fresh explicitly authorized dispatch.
+  After an explicit or synthesized `no`, every question in that generation is
+  non-authorizing and continuation is read-only for the remainder of the ACP
+  connection. A later recorded `yes` uses
+  `recorded-yes-not-authorized` and cannot reopen non-read permissions; use a
+  fresh explicitly authorized dispatch.
   Restart tombstones stay denied and audit-visible, but belong to the dead ACP
   connection and cannot poison a clean confirmation in the new generation. If
   `BLOCKED:`, `USER-NEED:`, or another hard terminal condition ends the run

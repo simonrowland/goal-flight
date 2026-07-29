@@ -733,13 +733,22 @@ def _user_confirm_is_resolved(question: dict[str, object]) -> bool:
 
 
 def _user_confirm_denies_run(question: dict[str, object]) -> bool:
-    """Return whether this resolved question permanently qualifies the run."""
-    if not _user_confirm_is_resolved(question):
-        return False
-    return not (
-        question.get("origin") == "worker_marker"
-        and question.get("controller_decision") == "yes"
+    """Return whether an explicit or synthesized denial qualifies the run."""
+    return question.get("controller_decision") == "no"
+
+
+def _user_confirm_records_denied_action(question: dict[str, object]) -> bool:
+    """Return whether the resolved row records an action that stayed denied."""
+    return _user_confirm_is_resolved(question) and (
+        _user_confirm_denies_run(question)
+        or question.get("origin") == "permission_escalation"
     )
+
+
+def _user_confirm_generation(question: dict[str, object]) -> str:
+    """Return a hashable generation key, grouping malformed legacy values."""
+    generation = question.get("generation")
+    return generation if isinstance(generation, str) else ""
 
 
 def _user_confirm_decision_scope(question: dict[str, object]) -> str:
@@ -750,16 +759,26 @@ def _user_confirm_decision_scope(question: dict[str, object]) -> str:
 def _refresh_user_confirm_authorizations(
     questions: dict[str, dict[str, object]],
 ) -> None:
-    """Recompute authorization within each decision cohort, never session-wide."""
-    questions_by_scope: dict[str, list[dict[str, object]]] = {}
+    """Recompute authorization by generation and decision cohort."""
+    questions_by_scope: dict[tuple[str, str], list[dict[str, object]]] = {}
+    denied_generations = {
+        _user_confirm_generation(question)
+        for question in questions.values()
+        if _user_confirm_denies_run(question)
+    }
     for question in questions.values():
         questions_by_scope.setdefault(
-            _user_confirm_decision_scope(question), []
+            (
+                _user_confirm_generation(question),
+                _user_confirm_decision_scope(question),
+            ),
+            [],
         ).append(question)
     authorized_scopes = {
-        scope
-        for scope, members in questions_by_scope.items()
-        if members
+        generation_scope
+        for generation_scope, members in questions_by_scope.items()
+        if generation_scope[0] not in denied_generations
+        and members
         and all(
             member.get("origin") == "worker_marker"
             and member.get("controller_decision") == "yes"
@@ -768,7 +787,11 @@ def _refresh_user_confirm_authorizations(
     }
     for question in questions.values():
         question["guarded_action_authorized"] = bool(
-            _user_confirm_decision_scope(question) in authorized_scopes
+            (
+                _user_confirm_generation(question),
+                _user_confirm_decision_scope(question),
+            )
+            in authorized_scopes
             and question.get("origin") == "worker_marker"
             and question.get("controller_decision") == "yes"
         )
@@ -1020,9 +1043,21 @@ def _steer_turn_prompt(
                 f"{controller_note}"
             )
         elif decision == "yes":
+            generation_denied = any(
+                _user_confirm_generation(candidate)
+                == _user_confirm_generation(question)
+                and _user_confirm_denies_run(candidate)
+                for candidate in (user_confirm_questions or {}).values()
+            )
+            reason = (
+                "Connection is read-only after a prior denial; a new dispatch "
+                "is required to authorize this."
+                if generation_denied
+                else "No action is authorized."
+            )
             lines.append(
                 f"{entry['seq']}: USER-CONFIRM-ANSWER: {question_id} "
-                "recorded-yes-not-authorized. No action is authorized."
+                f"recorded-yes-not-authorized. {reason}"
             )
         else:
             lines.append(
@@ -2314,7 +2349,7 @@ async def _run_acp_dispatch_impl(
         return [
             question
             for question in user_confirm_questions.values()
-            if question.get("generation") == user_confirm_generation
+            if _user_confirm_generation(question) == user_confirm_generation
         ]
 
     def refresh_user_confirm_guard() -> None:
@@ -2500,7 +2535,10 @@ async def _run_acp_dispatch_impl(
         decision_scope = (
             _user_confirm_decision_scope(prior_question)
             if prior_question
-            else f"{user_confirm_generation}:turn:{int(turn_index)}"
+            else (
+                f"{user_confirm_generation}:turn:{int(turn_index)}:"
+                f"{origin}"
+            )
         )
 
         user_confirm_sequence += 1
@@ -2527,11 +2565,12 @@ async def _run_acp_dispatch_impl(
             "origin": origin,
             "text": question_text,
             "turn_index": int(turn_index),
-            # Multiple questions emitted in one turn are one authorization
-            # decision: a crossed denial poisons that cohort. Repeating the same
-            # guarded action keeps its prior cohort; a different later action or
-            # restarted generation gets a new cohort, so historical denials do
-            # not suppress a fresh, explicitly answered question.
+            # Multiple same-origin questions emitted in one turn are one
+            # authorization decision: a crossed denial poisons that cohort.
+            # Permission escalations are acknowledgment-only and cannot join a
+            # worker-marker cohort. Repeating the same guarded action keeps its
+            # prior cohort; a different later action or restarted generation gets
+            # a new cohort.
             "decision_scope": decision_scope,
             "asked_at": wall_now(),
             "reply_deadline_awake_mono_ns": int(
@@ -3861,7 +3900,7 @@ async def _run_acp_dispatch_impl(
         denied_questions = [
             question
             for question in current_generation_user_confirms()
-            if _user_confirm_denies_run(question)
+            if _user_confirm_records_denied_action(question)
         ]
         if state == "complete" and denied_questions:
             permission_denied = any(
