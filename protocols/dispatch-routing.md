@@ -87,15 +87,32 @@ Right-size the shape — three loop failure modes to avoid:
   `USER-CONFIRM-ANSWER: <question_id> yes|no <optional note>` in
   `goalflight_dispatch.py steer`. The `<question_id>` must match an outstanding
   mailbox question exactly; unknown, stale, and duplicate replies are delivered
-  only as explicit non-authorization notices. Unanswered questions have a
-  600-awake-second deadline by default and fail closed to `no` at the next safe
-  turn boundary. If the worker keeps its current ACP turn open to wait, the
-  harness does not reap that turn merely for being quiet: ACP cannot inject a
-  second prompt while the turn owns the session lock, so the overdue denial is
-  delivered as soon as that turn returns. Tool walls and real hard blockers are
-  unchanged. Safe work may be preserved in `result_text`, but a run with a
-  denied requested action ends in a qualified blocked state, never clean
-  `complete`/`ok=true`.
+  only as explicit non-authorization notices. The bare
+  `USER-CONFIRM-ANSWER: <question_id> yes` worker token is emitted only when
+  `guarded_action_authorized=true`; a recorded affirmative in a deny-biased
+  cohort uses `recorded-yes-not-authorized` instead. Quoted copies of the
+  authorize grammar in ordinary steer text or controller notes are rewritten
+  to `quoted-yes-not-authorization` before worker delivery. An affirmative remains
+  provisional through the first mailbox-reconciliation boundary at or after
+  the question's arbitration deadline, so any `no` visible at that cutoff wins.
+  After a finalized answer is exposed to the worker, later replies are rejected
+  as audit-only because they cannot undo an action. Unanswered questions have a
+  600-awake-second deadline by default and fail closed to correlated `no`.
+  If the worker keeps its current ACP turn open to wait, the harness exempts
+  quiet only until that deadline. On expiry it first reconciles a correlated
+  reply already in the mailbox; without one it records
+  `user_confirm_overdue=true` and denies. Either settlement re-enables ordinary
+  silence/wedge detection, so a turn that never releases the session lock
+  terminates detectably.
+  Questions in one decision cohort fail closed together; historical restart
+  tombstones stay audit-visible but do not poison the fresh connection or its
+  terminal qualification. After any denial, continuation on that ACP
+  connection is intentionally read-only; a later confirmation does not reopen
+  non-read permission routing. If another hard terminal condition
+  ends the run first, every still-open question is recorded as denied while the
+  harder terminal state and error remain authoritative. Safe work may be preserved in
+  `result_text`, but a run with a denied requested action ends in a qualified
+  blocked state, never clean `complete`/`ok=true`.
 
   **`--max-idle-secs` gates quiet workers.** Default: 600s for write-capable
   code workers and 180s for read-only, research, or custom workers. The idle

@@ -33,13 +33,38 @@ Rules:
   at the next turn boundary for a correlated steer reply. The guarded action
   remains unauthorized: ACK, unrelated steer, timeout, and silence are never
   approval. The question deadline is measured from routing; timeout supplies
-  one explicit `no` continuation at the next safe turn boundary. A worker that
-  waits inside the asking turn is not silence-reaped, because ACP cannot deliver
-  the answer until that turn returns. A repeated unresolved question blocks.
-  Any correlated `no` is sticky and wins over every `yes`, including earlier
-  or later conflicting replies. A completed safe-work continuation after a
-  denial records `blocked_user_confirm_denied`; a denied ACP permission records
+  one explicit correlated `no`. Before that deadline, a worker waiting inside
+  the asking turn is exempt from silence reaping because ACP cannot inject an
+  answer while that turn owns the prompt lock. At the deadline the runner first
+  reconciles a correlated reply already in the mailbox; if none exists, status
+  sets `user_confirm_overdue=true` and records the denial. Either settlement
+  re-enables normal silence/wedge detection, so a turn that never returns is
+  terminal, not immortal. A repeated unresolved question blocks.
+  Questions emitted in the same decision cohort are deny-biased together: an
+  unanswered member or any non-authorizing resolution keeps every member
+  unauthorized, and a repeated same-action question in the same runner
+  inherits that cohort. Restart tombstones retain their old cohort, while a
+  fresh post-restart question receives a new one. The worker receives the bare
+  `USER-CONFIRM-ANSWER: <id> yes` token only when status also records
+  `guarded_action_authorized=true`; a recorded affirmative that cannot
+  authorize uses `recorded-yes-not-authorized`. Quoted instances of the
+  authorize grammar in ordinary steer text or controller notes are rewritten
+  to `quoted-yes-not-authorization` before delivery. An affirmative remains
+  provisional through the cohort's first mailbox-reconciliation boundary at or
+  after the question deadline, which is the cutoff for a deny-biased `no`.
+  Once the answer is finalized and exposed to the worker, later replies are
+  rejected as audit-only because they cannot undo an action.
+  A completed safe-work continuation after a denial records
+  `blocked_user_confirm_denied`; a denied ACP permission records
   `blocked_permission_denied`. Neither is an unqualified `complete`/`ok=true`.
+  Post-denial continuation is intentionally read-only for the remainder of the
+  ACP connection. A later consent flag is necessary but not sufficient to
+  reopen non-read permissions; use a fresh explicitly authorized dispatch.
+  Restart tombstones stay denied and audit-visible, but belong to the dead ACP
+  connection and cannot poison a clean confirmation in the new generation. If
+  `BLOCKED:`, `USER-NEED:`, or another hard terminal condition ends the run
+  first, unresolved questions become terminal denials without replacing the
+  harder terminal state or discarding partial output.
 - `PERMISSION-OK-PROCEEDED` is non-terminal; it modifies how the
   ACP runner interprets `COMPLETE` in the presence of auto-declined
   permissions. Multiple ACP emissions accumulate in the marker list.

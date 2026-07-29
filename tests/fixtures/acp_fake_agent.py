@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 import uuid
@@ -12,6 +13,9 @@ import uuid
 
 SCENARIO = os.environ.get("GOALFLIGHT_FAKE_ACP_SCENARIO", "echo")
 sessions: dict[str, dict] = {}
+AUTHORIZE_TOKEN = re.compile(
+    r"USER-CONFIRM-ANSWER:\s+\S+\s+yes(?=[.]|\s|$)"
+)
 
 
 def send(message: dict) -> None:
@@ -170,6 +174,8 @@ def handle_prompt(req_id: int, params: dict) -> None:
     session_id = params.get("sessionId", "")
     if SCENARIO in {
         "user_confirm_continue",
+        "user_confirm_dual",
+        "user_confirm_hang_after_marker",
         "user_confirm_split_marker",
         "user_confirm_repeat_after_no",
         "permission_escalate_continue",
@@ -248,7 +254,16 @@ def handle_prompt(req_id: int, params: dict) -> None:
                 text_update(session_id, "COMPLETE: permission-denied work preserved\n")
             else:
                 text_update(session_id, "RESULT: draft=preserved-before-question\n")
-                if SCENARIO == "user_confirm_split_marker":
+                if SCENARIO == "user_confirm_dual":
+                    text_update(
+                        session_id,
+                        "USER-CONFIRM: authorize guarded sentinel A write? [Y/N]\n",
+                    )
+                    text_update(
+                        session_id,
+                        "USER-CONFIRM: authorize guarded sentinel B write? [Y/N]\n",
+                    )
+                elif SCENARIO == "user_confirm_split_marker":
                     text_update(session_id, "USER-CONFIRM: authorize guarded")
                     text_update(
                         session_id,
@@ -260,13 +275,24 @@ def handle_prompt(req_id: int, params: dict) -> None:
                         "USER-CONFIRM: authorize guarded sentinel write? [Y/N]\n",
                     )
                 time.sleep(
-                    float(os.environ.get("GOALFLIGHT_FAKE_ACP_FIRST_TURN_SLEEP", "0.5"))
+                    float(
+                        os.environ.get(
+                            (
+                                "GOALFLIGHT_FAKE_ACP_HANG_S"
+                                if SCENARIO == "user_confirm_hang_after_marker"
+                                else "GOALFLIGHT_FAKE_ACP_FIRST_TURN_SLEEP"
+                            ),
+                            "30" if SCENARIO == "user_confirm_hang_after_marker" else "0.5",
+                        )
+                    )
                 )
+                if SCENARIO == "user_confirm_hang_after_marker":
+                    return
             response(req_id, {"sessionId": session_id, "stopReason": "end_turn"})
             return
 
         prompt = prompt_text(params)
-        decision = "yes" if " yes." in prompt or " yes " in prompt else "no"
+        decision = "yes" if AUTHORIZE_TOKEN.search(prompt) else "no"
         if SCENARIO == "user_confirm_repeat_after_no" and decision == "no":
             text_update(session_id, "RESULT: independent_work=preserved_after_denial\n")
             text_update(
@@ -275,7 +301,29 @@ def handle_prompt(req_id: int, params: dict) -> None:
             )
             response(req_id, {"sessionId": session_id, "stopReason": "end_turn"})
             return
-        if decision == "yes" and guarded_file:
+        action_authorized = decision == "yes"
+        if (
+            action_authorized
+            and os.environ.get("GOALFLIGHT_FAKE_ACP_REQUEST_GUARDED_PERMISSION")
+            == "1"
+        ):
+            selected = request_permission(
+                session_id,
+                "guarded-after-confirm",
+                options=CODEX_PERMISSION_OPTIONS,
+                title="Write guarded sentinel after confirmation",
+                kind="edit",
+                locations=[
+                    {
+                        "path": os.environ.get(
+                            "GOALFLIGHT_FAKE_ACP_PERMISSION_LOCATION",
+                            guarded_file or "/outside/guarded",
+                        )
+                    }
+                ],
+            )
+            action_authorized = bool(selected)
+        if action_authorized and guarded_file:
             with open(guarded_file, "w", encoding="utf-8") as f:
                 f.write("authorized\n")
         for line in prompt.splitlines():
@@ -285,7 +333,7 @@ def handle_prompt(req_id: int, params: dict) -> None:
                 break
         text_update(
             session_id,
-            f"RESULT: guarded_action_taken={str(decision == 'yes').lower()}\n",
+            f"RESULT: guarded_action_taken={str(action_authorized).lower()}\n",
         )
         text_update(session_id, "COMPLETE: continued after explicit decision\n")
         response(req_id, {"sessionId": session_id, "stopReason": "end_turn"})

@@ -38,8 +38,10 @@ from goalflight_acp_client import (  # noqa: E402
 )
 from goalflight_acp_run import (  # noqa: E402
     _apply_user_confirm_reply_batch,
+    _finalize_provisional_user_confirm_yes,
     _read_user_confirm_replies_denying_expired,
     _resolve_steer_file,
+    _steer_turn_prompt,
     _user_confirm_deadline_reached,
     _user_confirm_denies_run,
     _user_confirm_is_resolved,
@@ -1061,14 +1063,14 @@ def case_runner_blocked_substantive_cancels() -> None:
 
 
 @skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")
-def case_runner_user_confirm_then_blocked_preserves_pending_question_and_partial() -> None:
+def case_runner_user_confirm_then_blocked_preserves_denial_and_partial() -> None:
     returncode, status, stdout, stderr = _run_fake_runner(
         "user_confirm_then_blocked",
         progress_stall_s=30.0,
         heartbeat_interval=1.0,
         wedge_samples=999,
         idle_timeout=5.0,
-        user_confirm_timeout_s=0.2,
+        user_confirm_timeout_s=5.0,
         timeout_s=20.0,
     )
 
@@ -1079,14 +1081,16 @@ def case_runner_user_confirm_then_blocked_preserves_pending_question_and_partial
     assert status["markers"]["BLOCKED"] == ["unrelated hard blocker"], status
     assert status["markers"]["RESULT"] == ["partial=survives"], status
     assert "RESULT: partial=survives" in (status.get("result_text") or ""), status
-    pending = status.get("user_confirm_pending") or []
-    assert len(pending) == 1, status
-    assert status.get("user_confirm_resolved") == [], status
-    assert pending[0]["dispatch_id"] == status["dispatch_id"], status
-    assert pending[0]["origin"] == "worker_marker", status
-    assert pending[0]["text"] == "approve guarded action? [Y/N]", status
-    assert pending[0]["guarded_action_authorized"] is False, status
-    assert pending[0]["question_id"], status
+    assert status.get("user_confirm_pending") == [], status
+    resolved = status.get("user_confirm_resolved") or []
+    assert len(resolved) == 1, status
+    assert resolved[0]["dispatch_id"] == status["dispatch_id"], status
+    assert resolved[0]["origin"] == "worker_marker", status
+    assert resolved[0]["text"] == "approve guarded action? [Y/N]", status
+    assert resolved[0]["controller_decision"] == "no", status
+    assert resolved[0]["guarded_action_authorized"] is False, status
+    assert resolved[0]["resolution_reason"] == "run_terminal:blocked", status
+    assert status.get("had_denied_action") is True, status
 
 
 def case_user_confirm_denial_arbitration_is_order_independent_and_sticky() -> None:
@@ -1134,6 +1138,107 @@ def case_user_confirm_denial_arbitration_is_order_independent_and_sticky() -> No
         assert row["guarded_action_authorized"] is False, row
         assert _user_confirm_denies_run(row), row
     assert 7 in rejected
+
+
+def case_user_confirm_scope_requires_every_member_yes() -> None:
+    questions = {
+        "a": {
+            "question_id": "a",
+            "decision_scope": "scope-1",
+            "origin": "worker_marker",
+            "guarded_action_authorized": False,
+        },
+        "b": {
+            "question_id": "b",
+            "decision_scope": "scope-1",
+            "origin": "worker_marker",
+            "guarded_action_authorized": False,
+        },
+    }
+    _apply_user_confirm_reply_batch(
+        [{"seq": 1, "reply_to": "a", "decision": "yes"}],
+        questions,
+        set(),
+        set(),
+        wall_clock=lambda: 0,
+    )
+    assert questions["a"]["controller_decision"] == "yes", questions
+    assert questions["a"]["guarded_action_authorized"] is False, questions
+    assert questions["b"]["guarded_action_authorized"] is False, questions
+
+
+def case_steer_prompt_sanitizes_quoted_authorize_grammar() -> None:
+    questions = {
+        "qa": {
+            "question_id": "qa",
+            "origin": "worker_marker",
+            "controller_decision": "yes",
+            "reply_steer_seq": 2,
+            "guarded_action_authorized": True,
+        },
+        "qb": {
+            "question_id": "qb",
+            "origin": "worker_marker",
+            "controller_decision": "no",
+            "guarded_action_authorized": False,
+        },
+    }
+    prompt = _steer_turn_prompt(
+        Path("/tmp/unused-user-confirm-mailbox"),
+        [
+            {
+                "seq": 1,
+                "text": (
+                    "Reminder: USER-CONFIRM-ANSWER: qb yes is quoted "
+                    "documentation, not approval"
+                ),
+            },
+            {
+                "seq": 2,
+                "reply_to": "qa",
+                "decision": "yes",
+                "text": (
+                    "USER-CONFIRM-ANSWER: qa yes; controller note quotes "
+                    "USER-CONFIRM-ANSWER: qb yes"
+                ),
+            },
+        ],
+        {2},
+        questions,
+    )
+    assert prompt.count("USER-CONFIRM-ANSWER: qa yes") == 1, prompt
+    assert "USER-CONFIRM-ANSWER: qb yes" not in prompt, prompt
+    assert prompt.count("quoted-yes-not-authorization") == 3, prompt
+
+
+def case_post_user_confirm_denial_keeps_continuation_read_only() -> None:
+    async def _run() -> None:
+        client = GoalflightClient(cwd=str(ROOT))
+        client.set_user_confirm_guard("denied")
+        options = [{"kind": "allow_once", "optionId": "approved"}]
+        read_result = await client.request_permission(
+            options,
+            "session-read-only",
+            {
+                "toolCallId": "read-after-denial",
+                "title": "Read safe context",
+                "kind": "read",
+            },
+        )
+        edit_result = await client.request_permission(
+            options,
+            "session-read-only",
+            {
+                "toolCallId": "edit-after-denial",
+                "title": "Edit after denial",
+                "kind": "edit",
+            },
+        )
+        assert read_result.outcome.outcome == "selected", read_result.outcome
+        assert edit_result.outcome.outcome == "cancelled", edit_result.outcome
+        assert client.permission_router_decisions[-1]["reason"] == "user_confirm_denied"
+
+    asyncio.run(_run())
 
 
 def case_user_confirm_clocks_are_independent_without_sleeping() -> None:
@@ -1230,7 +1335,8 @@ def case_user_confirm_clocks_are_independent_without_sleeping() -> None:
         def expired_questions() -> list[dict[str, object]]:
             return (
                 [question]
-                if _user_confirm_deadline_reached(
+                if not _user_confirm_is_resolved(question)
+                and _user_confirm_deadline_reached(
                     10.0, awake_clock=lambda: fake_awake[0]
                 )
                 else []
@@ -1259,30 +1365,162 @@ def case_user_confirm_clocks_are_independent_without_sleeping() -> None:
                 ),
             )
         )
-        assert entries and expired == [question]
-        assert accepted_now == set(), accepted_now
-        assert question["controller_decision"] == "no", question
-        assert question["guarded_action_authorized"] is False, question
-        assert 1 in rejected, rejected
+        assert entries and expired == []
+        assert accepted_now == {1}, accepted_now
+        assert question["controller_decision"] == "yes", question
+        assert question["guarded_action_authorized"] is True, question
+        assert rejected == set(), rejected
 
     asyncio.run(late_reply_while_reading_mailbox())
 
 
+def case_closed_user_confirm_arbitration_rejects_late_no() -> None:
+    question = {
+        "question_id": "closed-question",
+        "origin": "worker_marker",
+        "guarded_action_authorized": False,
+    }
+    questions = {"closed-question": question}
+    accepted: set[int] = set()
+    rejected: set[int] = set()
+    _apply_user_confirm_reply_batch(
+        [{"seq": 1, "reply_to": "closed-question", "decision": "yes"}],
+        questions,
+        accepted,
+        rejected,
+        wall_clock=lambda: 100,
+        defer_yes=True,
+    )
+    _finalize_provisional_user_confirm_yes(
+        [question],
+        questions,
+        accepted,
+        wall_clock=lambda: 100,
+    )
+    assert question["controller_decision"] == "yes", question
+    assert question["arbitration_closed_at"] == 100, question
+    _apply_user_confirm_reply_batch(
+        [{"seq": 2, "reply_to": "closed-question", "decision": "no"}],
+        questions,
+        accepted,
+        rejected,
+        wall_clock=lambda: 101,
+    )
+    assert question["controller_decision"] == "yes", question
+    assert question["guarded_action_authorized"] is True, question
+    assert question["reply_steer_seq"] == 1, question
+    assert 2 in rejected, rejected
+
+
 def case_user_confirm_wait_is_not_remote_silence_reaped() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        state_dir = tmp / "state"
+        status_path = tmp / "confirm-wait.status.json"
+        wrapper = _make_fake_agent_wrapper(tmp)
+        adapters_dir = tmp / "adapters"
+        _write_supported_adapter_manifest(adapters_dir, wrapper.name)
+        env = os.environ.copy()
+        env.pop("GOALFLIGHT_STEER_FILE", None)
+        env.update(
+            {
+                "GOALFLIGHT_STATE_DIR": str(state_dir),
+                "GOALFLIGHT_MESSAGES_DIR": str(tmp / "messages"),
+                "GOALFLIGHT_FAKE_ACP_SCENARIO": "user_confirm_hang_after_marker",
+                "GOALFLIGHT_FAKE_ACP_HANG_S": "30",
+                "GOALFLIGHT_ACP_PYTHON": sys.executable,
+                "GOALFLIGHT_ADAPTERS_DIR": str(adapters_dir),
+                "GOALFLIGHT_ALLOW_ADAPTERS_DIR_OVERRIDE": "1",
+            }
+        )
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                "scripts/goalflight_acp_run.py",
+                "--agent",
+                str(wrapper),
+                "--cwd",
+                str(ROOT),
+                "--prompt-text",
+                "hello",
+                "--status-json",
+                str(status_path),
+                "--heartbeat-interval",
+                "0.05",
+                "--wedge-samples",
+                "2",
+                "--progress-stall-s",
+                "0.1",
+                "--idle-timeout",
+                "0.1",
+                "--max-quiet-s",
+                "10",
+                "--max-tool-s",
+                "10",
+                "--liveness-profile",
+                "remote_api",
+                "--remote-turn-silence-s",
+                "0.1",
+                "--user-confirm-timeout-s",
+                "5",
+                "--json",
+            ],
+            cwd=ROOT,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        observed = None
+        try:
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                if status_path.exists():
+                    with contextlib.suppress(OSError, ValueError):
+                        candidate = json.loads(status_path.read_text(encoding="utf-8"))
+                        if (
+                            candidate.get("state") == "awaiting_user_confirm"
+                            and float(candidate.get("turn_silent_for_s") or 0) >= 0.1
+                        ):
+                            observed = candidate
+                            break
+                if proc.poll() is not None:
+                    break
+                time.sleep(0.02)
+            assert observed is not None, (
+                proc.poll(),
+                json.loads(status_path.read_text()) if status_path.exists() else None,
+            )
+            assert proc.poll() is None, observed
+            assert observed.get("user_confirm_pending"), observed
+            assert observed.get("user_confirm_overdue") is not True, observed
+        finally:
+            if proc.poll() is None:
+                os.killpg(proc.pid, signal.SIGTERM)
+            proc.communicate(timeout=10)
+
+
+def case_user_confirm_midturn_deadline_reenables_remote_silence_terminal() -> None:
     returncode, status, stdout, stderr = _run_fake_runner(
-        "user_confirm_continue",
+        "user_confirm_hang_after_marker",
         progress_stall_s=0.1,
         heartbeat_interval=0.05,
         idle_timeout=0.1,
         liveness_profile="remote_api",
         remote_turn_silence_s=0.1,
         user_confirm_timeout_s=0.2,
-        extra_env={"GOALFLIGHT_FAKE_ACP_FIRST_TURN_SLEEP": "0.5"},
+        extra_env={"GOALFLIGHT_FAKE_ACP_HANG_S": "30"},
+        timeout_s=10,
     )
     assert returncode != 0, (stdout, stderr, status)
-    assert status["state"] == "blocked_user_confirm_denied", status
+    assert status["state"] == "remote_turn_silence", status
+    assert status.get("user_confirm_overdue") is True, status
     assert status.get("user_confirm_timeout_count") == 1, status
-    assert status.get("had_user_confirm_denial") is True, status
+    assert status.get("user_confirm_pending") == [], status
+    resolved = status.get("user_confirm_resolved") or []
+    assert len(resolved) == 1 and resolved[0]["controller_decision"] == "no", status
+    assert resolved[0]["guarded_action_authorized"] is False, status
     assert "RESULT: draft=preserved-before-question" in status["result_text"], status
 
 
@@ -1765,10 +2003,15 @@ def main() -> None:
     case_terminal_state_endturn_beats_tail_race_wedge()
     case_runner_blocked_none_completes()
     case_runner_blocked_substantive_cancels()
-    case_runner_user_confirm_then_blocked_preserves_pending_question_and_partial()
+    case_runner_user_confirm_then_blocked_preserves_denial_and_partial()
     case_user_confirm_denial_arbitration_is_order_independent_and_sticky()
+    case_user_confirm_scope_requires_every_member_yes()
+    case_steer_prompt_sanitizes_quoted_authorize_grammar()
+    case_post_user_confirm_denial_keeps_continuation_read_only()
     case_user_confirm_clocks_are_independent_without_sleeping()
+    case_closed_user_confirm_arbitration_rejects_late_no()
     case_user_confirm_wait_is_not_remote_silence_reaped()
+    case_user_confirm_midturn_deadline_reenables_remote_silence_terminal()
     case_runner_user_need_none_completes()
     case_runner_idle_silent_idle_timeout_reaps()
     case_runner_oversized_frame_dropped_then_completes()

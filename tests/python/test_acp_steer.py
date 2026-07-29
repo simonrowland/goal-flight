@@ -19,6 +19,8 @@ import time
 ROOT = Path(__file__).resolve().parents[2]
 DISPATCH = ROOT / "scripts" / "goalflight_dispatch.py"
 FAKE = ROOT / "tests" / "fixtures" / "acp_fake_agent.py"
+sys.path.insert(0, str(ROOT / "scripts"))
+import goalflight_steer_mailbox  # noqa: E402
 
 
 def _write_fake_codex_acp_manifest(
@@ -118,16 +120,44 @@ def _wait_for(
     raise AssertionError(f"condition not met before timeout: {path}")
 
 
-def _wait_for_worker_question(path: Path, timeout_s: float = 10.0) -> dict:
+def _wait_for_worker_questions(
+    path: Path,
+    *,
+    count: int = 1,
+    exclude_question_ids: set[str] | None = None,
+    timeout_s: float = 10.0,
+) -> list[dict]:
+    excluded = exclude_question_ids or set()
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         if path.exists():
-            for line in path.read_text(encoding="utf-8").splitlines():
-                entry = json.loads(line)
-                if entry.get("direction") == "worker_to_controller":
-                    return entry
+            questions = [
+                entry
+                for entry in (
+                    json.loads(line)
+                    for line in path.read_text(encoding="utf-8").splitlines()
+                )
+                if entry.get("direction") == "worker_to_controller"
+                and entry.get("question_id") not in excluded
+            ]
+            if len(questions) >= count:
+                return questions[:count]
         time.sleep(0.05)
     raise AssertionError(f"worker USER-CONFIRM not routed before timeout: {path}")
+
+
+def _wait_for_worker_question(
+    path: Path,
+    timeout_s: float = 10.0,
+    *,
+    exclude_question_ids: set[str] | None = None,
+) -> dict:
+    return _wait_for_worker_questions(
+        path,
+        count=1,
+        exclude_question_ids=exclude_question_ids,
+        timeout_s=timeout_s,
+    )[0]
 
 
 def _run_confirmation_scenario(
@@ -192,12 +222,16 @@ def _run_answered_confirmation(
     dispatch_id: str,
     decisions: list[str],
     delay_between_decisions_s: float = 0.0,
+    exclude_question_ids: set[str] | None = None,
+    extra_env: dict[str, str] | None = None,
+    steer_messages: list[str] | None = None,
 ) -> tuple[subprocess.Popen[str], str, str, dict, Path, dict]:
     _write_fake_codex_acp_manifest(tmp / "adapters")
     env = _env(tmp)
     env["GOALFLIGHT_FAKE_ACP_SCENARIO"] = scenario
     env["GOALFLIGHT_FAKE_ACP_FIRST_TURN_SLEEP"] = "0.5"
     env["GOALFLIGHT_USER_CONFIRM_TIMEOUT_S"] = "5"
+    env.update(extra_env or {})
     guarded = tmp / f"{dispatch_id}-guarded"
     env["GOALFLIGHT_FAKE_ACP_GUARDED_FILE"] = str(guarded)
     status_path = tmp / f"{dispatch_id}.status.json"
@@ -231,15 +265,29 @@ def _run_answered_confirmation(
         stderr=subprocess.PIPE,
     )
     try:
-        question = _wait_for_worker_question(mailbox)
-        for index, decision in enumerate(decisions):
+        question = _wait_for_worker_question(
+            mailbox,
+            exclude_question_ids=exclude_question_ids,
+        )
+        messages = (
+            [
+                message.format(question_id=question["question_id"])
+                for message in steer_messages
+            ]
+            if steer_messages is not None
+            else [
+                f"USER-CONFIRM-ANSWER: {question['question_id']} {decision}"
+                for decision in decisions
+            ]
+        )
+        for index, message in enumerate(messages):
             reply = subprocess.run(
                 [
                     sys.executable,
                     str(DISPATCH),
                     "steer",
                     dispatch_id,
-                    f"USER-CONFIRM-ANSWER: {question['question_id']} {decision}",
+                    message,
                 ],
                 cwd=ROOT,
                 env=env,
@@ -249,7 +297,7 @@ def _run_answered_confirmation(
                 timeout=10,
             )
             assert reply.returncode == 0, reply.stdout + reply.stderr
-            if index + 1 < len(decisions) and delay_between_decisions_s > 0:
+            if index + 1 < len(messages) and delay_between_decisions_s > 0:
                 time.sleep(delay_between_decisions_s)
         stdout, stderr = proc.communicate(timeout=20)
     finally:
@@ -470,10 +518,7 @@ def case_nonterminal_steer_turn_continues_to_real_terminal() -> None:
 def case_user_confirm_midrun_routes_without_cancelling() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
-        _write_fake_codex_acp_manifest(
-            tmp / "adapters",
-            remote_turn_silence_s=0.01,
-        )
+        _write_fake_codex_acp_manifest(tmp / "adapters")
         env = _env(tmp)
         env["GOALFLIGHT_FAKE_ACP_SCENARIO"] = "user_confirm_continue"
         env["GOALFLIGHT_FAKE_ACP_FIRST_TURN_SLEEP"] = "0.5"
@@ -559,6 +604,7 @@ def case_user_confirm_midrun_routes_without_cancelling() -> None:
             "guarded_action_taken=true",
         ], status
         assert "RESULT: draft=preserved-before-question" in status["result_text"], status
+        assert guarded.exists(), status
         assert guarded.read_text(encoding="utf-8") == "authorized\n"
         resolved = status.get("user_confirm_resolved") or []
         assert resolved and resolved[0]["controller_decision"] == "yes", status
@@ -574,6 +620,108 @@ def case_user_confirm_midrun_routes_without_cancelling() -> None:
         assert envelopes[0]["payload"]["question_id"] == question["question_id"], envelopes
 
 
+def case_midturn_mailbox_yes_is_reconciled_before_timeout_denial() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        _write_fake_codex_acp_manifest(
+            tmp / "adapters",
+            remote_turn_silence_s=0.1,
+        )
+        env = _env(tmp)
+        env["GOALFLIGHT_FAKE_ACP_SCENARIO"] = "user_confirm_hang_after_marker"
+        env["GOALFLIGHT_FAKE_ACP_HANG_S"] = "30"
+        env["GOALFLIGHT_HEARTBEAT_INTERVAL"] = "0.05"
+        env["GOALFLIGHT_USER_CONFIRM_TIMEOUT_S"] = "2"
+        dispatch_id = "acp-user-confirm-midturn-yes"
+        status_path = tmp / "status.json"
+        mailbox = (
+            Path(env["GOALFLIGHT_STATE_DIR"])
+            / "dispatch"
+            / f"{dispatch_id}.steer.jsonl"
+        )
+        env["GOALFLIGHT_STEER_FILE"] = str(mailbox)
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                str(ROOT / "scripts" / "goalflight_acp_run.py"),
+                "--agent",
+                "codex-acp",
+                "--dispatch-id",
+                dispatch_id,
+                "--cwd",
+                str(ROOT),
+                "--prompt-text",
+                "initial task",
+                "--status-json",
+                str(status_path),
+                "--heartbeat-interval",
+                "0.05",
+                "--wedge-samples",
+                "2",
+                "--progress-stall-s",
+                "0.1",
+                "--idle-timeout",
+                "0.1",
+                "--max-quiet-s",
+                "10",
+                "--max-tool-s",
+                "10",
+                "--liveness-profile",
+                "remote_api",
+                "--remote-turn-silence-s",
+                "0.1",
+                "--remote-turn-cancel-grace-s",
+                "0.1",
+                "--user-confirm-timeout-s",
+                "2",
+                "--json",
+            ],
+            cwd=ROOT,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        try:
+            question = _wait_for_worker_question(mailbox, timeout_s=10)
+            reply = goalflight_steer_mailbox.append_steer_entry(
+                mailbox,
+                f"USER-CONFIRM-ANSWER: {question['question_id']} yes",
+                dispatch_id=dispatch_id,
+                kind="user_confirm_reply",
+                reply_to=question["question_id"],
+                decision="yes",
+            )
+            stdout, stderr = proc.communicate(timeout=10)
+        finally:
+            if proc.poll() is None:
+                os.killpg(proc.pid, signal.SIGTERM)
+                proc.communicate(timeout=10)
+
+        assert reply["reply_to"] == question["question_id"], reply
+        status = json.loads(status_path.read_text(encoding="utf-8"))
+        rows = [
+            json.loads(line)
+            for line in mailbox.read_text(encoding="utf-8").splitlines()
+        ]
+        assert status["ok"] is False, (proc.returncode, stdout, stderr, status)
+        assert status["state"] == "remote_turn_silence", status
+        assert status.get("user_confirm_pending") == [], status
+        assert status.get("user_confirm_timeout_count") is None, (status, rows)
+        assert status.get("user_confirm_overdue") is False, status
+        resolved = status.get("user_confirm_resolved") or []
+        assert len(resolved) == 1, status
+        assert resolved[0]["controller_decision"] == "yes", status
+        assert resolved[0]["guarded_action_authorized"] is True, status
+        assert resolved[0].get("arbitration_closed_at"), status
+        assert not any(
+            row.get("reply_to") == question["question_id"]
+            and row.get("decision") == "no"
+            for row in rows
+        ), rows
+
+
 def case_uncorrelated_user_confirm_yes_is_not_authorization() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
@@ -581,8 +729,8 @@ def case_uncorrelated_user_confirm_yes_is_not_authorization() -> None:
         env = _env(tmp)
         env["GOALFLIGHT_FAKE_ACP_SCENARIO"] = "user_confirm_continue"
         env["GOALFLIGHT_FAKE_ACP_FIRST_TURN_SLEEP"] = "0.5"
-        # The unrelated/unknown reply is already pending when the absolute
-        # question deadline expires. It must not postpone fail-closed denial.
+        # The unrelated/unknown reply must remain non-authorizing whether it
+        # lands just before or just after the absolute fail-closed deadline.
         env["GOALFLIGHT_USER_CONFIRM_TIMEOUT_S"] = "0.2"
         guarded = tmp / "guarded-uncorrelated-action"
         env["GOALFLIGHT_FAKE_ACP_GUARDED_FILE"] = str(guarded)
@@ -643,9 +791,18 @@ def case_uncorrelated_user_confirm_yes_is_not_authorization() -> None:
         assert reply.returncode == 0, reply.stdout + reply.stderr
         assert proc.returncode != 0, f"rc={proc.returncode}\nstdout={stdout}\nstderr={stderr}"
         status = json.loads(status_path.read_text(encoding="utf-8"))
+        wrong_reply_seq = next(
+            int(entry["seq"])
+            for entry in (
+                json.loads(line)
+                for line in mailbox.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            )
+            if entry.get("text") == "USER-CONFIRM-ANSWER: wrong-question-id yes"
+        )
         assert status["state"] == "blocked_user_confirm_denied", status
         assert status["ok"] is False, status
-        assert status.get("user_confirm_rejected_reply_seqs") == [2], status
+        assert status.get("user_confirm_rejected_reply_seqs") == [wrong_reply_seq], status
         assert status.get("user_confirm_timeout_count") == 1, status
         resolved = status.get("user_confirm_resolved") or []
         assert resolved and resolved[0]["question_id"] == question["question_id"], status
@@ -813,7 +970,8 @@ def case_kindless_permission_is_denied_while_confirm_pending() -> None:
         decisions = status.get("permission_router_decisions") or []
         assert any(
             decision.get("decision") == "deny"
-            and decision.get("reason") == "user_confirm_pending"
+            and decision.get("reason")
+            in {"user_confirm_pending", "user_confirm_denied"}
             and not decision.get("kind")
             for decision in decisions
         ), decisions
@@ -839,6 +997,14 @@ def case_repeated_question_after_timeout_blocks_with_partial_work() -> None:
             row for row in rows if row.get("direction") == "worker_to_controller"
         ]
         assert len(questions) == 2, rows
+        pending = status.get("user_confirm_pending") or []
+        resolved = status.get("user_confirm_resolved") or []
+        assert pending == [], status
+        assert len(resolved) == 2, status
+        assert resolved[0]["decision_scope"] == resolved[1]["decision_scope"], status
+        assert resolved[1]["controller_decision"] == "no", status
+        assert resolved[1]["guarded_action_authorized"] is False, status
+        assert resolved[1]["resolution_reason"] == "run_terminal:blocked_user_confirm", status
 
 
 def case_hard_blocker_preserves_same_chunk_confirm_evidence() -> None:
@@ -847,12 +1013,17 @@ def case_hard_blocker_preserves_same_chunk_confirm_evidence() -> None:
             Path(td),
             scenario="user_confirm_then_blocked",
             dispatch_id="acp-user-confirm-hard-block",
+            timeout_s=5.0,
         )
         assert run.returncode != 0, (run.stdout, run.stderr, status)
         assert status["state"] == "blocked", status
         assert "RESULT: partial=survives" in status["result_text"], status
-        pending = status.get("user_confirm_pending") or []
-        assert len(pending) == 1, status
+        assert status.get("user_confirm_pending") == [], status
+        resolved = status.get("user_confirm_resolved") or []
+        assert len(resolved) == 1, status
+        assert resolved[0]["controller_decision"] == "no", status
+        assert resolved[0]["guarded_action_authorized"] is False, status
+        assert resolved[0]["resolution_reason"] == "run_terminal:blocked", status
         rows = [
             json.loads(line)
             for line in mailbox.read_text(encoding="utf-8").splitlines()
@@ -861,7 +1032,7 @@ def case_hard_blocker_preserves_same_chunk_confirm_evidence() -> None:
             row for row in rows if row.get("direction") == "worker_to_controller"
         ]
         assert len(questions) == 1, rows
-        assert questions[0]["question_id"] == pending[0]["question_id"], (rows, status)
+        assert questions[0]["question_id"] == resolved[0]["question_id"], (rows, status)
 
 
 def case_restart_does_not_reuse_question_id_or_accept_stale_yes() -> None:
@@ -872,11 +1043,32 @@ def case_restart_does_not_reuse_question_id_or_accept_stale_yes() -> None:
             tmp,
             scenario="user_confirm_then_blocked",
             dispatch_id=dispatch_id,
+            timeout_s=5,
         )
         assert first_run.returncode != 0, (first_run.stdout, first_run.stderr, first_status)
-        first_pending = first_status.get("user_confirm_pending") or []
-        assert len(first_pending) == 1, first_status
-        old_question_id = first_pending[0]["question_id"]
+        first_questions = (
+            first_status.get("user_confirm_pending")
+            or first_status.get("user_confirm_resolved")
+            or []
+        )
+        assert len(first_questions) == 1, first_status
+        pending_snapshot = dict(first_questions[0])
+        old_question_id = pending_snapshot["question_id"]
+        for field in (
+            "controller_decision",
+            "reply_steer_seq",
+            "resolved_at",
+            "resolution_reason",
+        ):
+            pending_snapshot.pop(field, None)
+        pending_snapshot["guarded_action_authorized"] = False
+        restart_status = dict(first_status)
+        restart_status["user_confirm_pending"] = [pending_snapshot]
+        restart_status["user_confirm_resolved"] = []
+        (tmp / f"{dispatch_id}.status.json").write_text(
+            json.dumps(restart_status),
+            encoding="utf-8",
+        )
 
         stale_reply = subprocess.run(
             [
@@ -895,23 +1087,160 @@ def case_restart_does_not_reuse_question_id_or_accept_stale_yes() -> None:
         )
         assert stale_reply.returncode == 0, stale_reply.stdout + stale_reply.stderr
 
-        second_run, second_status, guarded, _mailbox = _run_confirmation_scenario(
-            tmp,
-            scenario="user_confirm_continue",
-            dispatch_id=dispatch_id,
+        second_proc, second_stdout, second_stderr, second_status, guarded, new_question = (
+            _run_answered_confirmation(
+                tmp,
+                scenario="user_confirm_continue",
+                dispatch_id=dispatch_id,
+                decisions=["yes"],
+                exclude_question_ids={old_question_id},
+                extra_env={
+                    "GOALFLIGHT_FAKE_ACP_REQUEST_GUARDED_PERMISSION": "1",
+                    "GOALFLIGHT_FAKE_ACP_PERMISSION_LOCATION": str(
+                        ROOT / ".goalflight-fake-guard-target"
+                    ),
+                },
+            )
         )
-        assert second_run.returncode != 0, (
-            second_run.stdout,
-            second_run.stderr,
+        assert second_proc.returncode == 0, (
+            second_stdout,
+            second_stderr,
             second_status,
         )
-        assert not guarded.exists(), "a stale yes authorized the restarted run"
+        assert second_status["state"] == "complete", second_status
+        assert second_status["ok"] is True, second_status
+        assert second_status["had_denied_action"] is False, second_status
+        assert guarded.exists(), second_status
+        assert guarded.read_text(encoding="utf-8") == "authorized\n"
+        assert new_question["question_id"] != old_question_id
         resolved = second_status.get("user_confirm_resolved") or []
         old = [item for item in resolved if item["question_id"] == old_question_id]
-        new = [item for item in resolved if item["question_id"] != old_question_id]
+        new = [item for item in resolved if item["question_id"] == new_question["question_id"]]
         assert len(old) == 1 and old[0]["controller_decision"] == "no", second_status
         assert old[0]["resolution_reason"] == "runner_restarted", second_status
-        assert len(new) == 1 and new[0]["controller_decision"] == "no", second_status
+        assert old[0]["guarded_action_authorized"] is False, second_status
+        assert len(new) == 1 and new[0]["controller_decision"] == "yes", second_status
+        assert new[0]["guarded_action_authorized"] is True, second_status
+        assert old[0].get("decision_scope", old_question_id) != new[0]["decision_scope"], (
+            second_status
+        )
+        assert second_status.get("user_confirm_rejected_reply_seqs"), second_status
+
+
+def case_quoted_authorize_grammar_in_ordinary_steer_is_inert() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        proc, stdout, stderr, status, guarded, question = _run_answered_confirmation(
+            tmp,
+            scenario="user_confirm_continue",
+            dispatch_id="acp-user-confirm-quoted-token",
+            decisions=[],
+            steer_messages=[
+                (
+                    "Reminder: USER-CONFIRM-ANSWER: {question_id} yes is quoted "
+                    "documentation, not approval"
+                ),
+                "USER-CONFIRM-ANSWER: {question_id} no",
+            ],
+        )
+        assert proc.returncode != 0, (stdout, stderr, status)
+        assert status["state"] == "blocked_user_confirm_denied", status
+        assert not guarded.exists(), "quoted authorize grammar reached guarded sentinel"
+        resolved = status.get("user_confirm_resolved") or []
+        assert len(resolved) == 1, status
+        assert resolved[0]["question_id"] == question["question_id"], status
+        assert resolved[0]["controller_decision"] == "no", status
+        assert resolved[0]["guarded_action_authorized"] is False, status
+
+
+def case_crossed_dual_user_confirm_answers_never_emit_authorization() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        dispatch_id = "acp-user-confirm-dual-crossed"
+        _write_fake_codex_acp_manifest(tmp / "adapters")
+        env = _env(tmp)
+        env["GOALFLIGHT_FAKE_ACP_SCENARIO"] = "user_confirm_dual"
+        env["GOALFLIGHT_FAKE_ACP_FIRST_TURN_SLEEP"] = "0.5"
+        env["GOALFLIGHT_USER_CONFIRM_TIMEOUT_S"] = "5"
+        guarded = tmp / f"{dispatch_id}-guarded"
+        env["GOALFLIGHT_FAKE_ACP_GUARDED_FILE"] = str(guarded)
+        status_path = tmp / f"{dispatch_id}.status.json"
+        mailbox = (
+            Path(env["GOALFLIGHT_STATE_DIR"])
+            / "dispatch"
+            / f"{dispatch_id}.steer.jsonl"
+        )
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                str(DISPATCH),
+                "--shape",
+                "acp",
+                "--agent",
+                "codex-acp",
+                "--dispatch-id",
+                dispatch_id,
+                "--cwd",
+                str(ROOT),
+                "--prompt",
+                "initial task",
+                "--status-json",
+                str(status_path),
+                "--poll-secs",
+                "0.05",
+                "--max-idle-secs",
+                "10",
+                "--foreground",
+            ],
+            cwd=ROOT,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            questions = _wait_for_worker_questions(mailbox, count=2)
+            for question, decision in zip(questions, ("no", "yes"), strict=True):
+                reply = subprocess.run(
+                    [
+                        sys.executable,
+                        str(DISPATCH),
+                        "steer",
+                        dispatch_id,
+                        (
+                            f"USER-CONFIRM-ANSWER: {question['question_id']} "
+                            f"{decision}"
+                        ),
+                    ],
+                    cwd=ROOT,
+                    env=env,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=10,
+                )
+                assert reply.returncode == 0, reply.stdout + reply.stderr
+            stdout, stderr = proc.communicate(timeout=20)
+        finally:
+            if proc.poll() is None:
+                proc.send_signal(signal.SIGTERM)
+                proc.communicate(timeout=10)
+
+        status = json.loads(status_path.read_text(encoding="utf-8"))
+        assert proc.returncode != 0, (stdout, stderr, status)
+        assert status["state"] == "blocked_user_confirm_denied", status
+        resolved = status.get("user_confirm_resolved") or []
+        assert len(resolved) == 2, status
+        by_text = {item["text"]: item for item in resolved}
+        denied = by_text["authorize guarded sentinel A write? [Y/N]"]
+        recorded_yes = by_text["authorize guarded sentinel B write? [Y/N]"]
+        assert denied["controller_decision"] == "no", status
+        assert recorded_yes["controller_decision"] == "yes", status
+        assert denied["decision_scope"] == recorded_yes["decision_scope"], status
+        assert denied["guarded_action_authorized"] is False, status
+        assert recorded_yes["guarded_action_authorized"] is False, status
+        assert not guarded.exists(), "crossed yes reached the guarded sentinel"
+        assert "guarded_action_taken=false" in status["result_text"], status
 
 
 def case_conflicting_user_confirm_answers_are_deny_biased() -> None:
@@ -1006,6 +1335,7 @@ def main() -> None:
     case_mid_turn_steer_does_not_extend_wedge_deadline()
     case_nonterminal_steer_turn_continues_to_real_terminal()
     case_user_confirm_midrun_routes_without_cancelling()
+    case_midturn_mailbox_yes_is_reconciled_before_timeout_denial()
     case_uncorrelated_user_confirm_yes_is_not_authorization()
     case_same_turn_guarded_action_is_denied_without_answer()
     case_user_confirm_timeout_is_fail_closed_then_continues()
@@ -1015,6 +1345,8 @@ def main() -> None:
     case_repeated_question_after_timeout_blocks_with_partial_work()
     case_hard_blocker_preserves_same_chunk_confirm_evidence()
     case_restart_does_not_reuse_question_id_or_accept_stale_yes()
+    case_quoted_authorize_grammar_in_ordinary_steer_is_inert()
+    case_crossed_dual_user_confirm_answers_never_emit_authorization()
     case_conflicting_user_confirm_answers_are_deny_biased()
     case_correlated_worker_marker_yes_authorizes_only_its_action()
     case_permission_escalation_yes_is_acknowledgment_not_authorization()

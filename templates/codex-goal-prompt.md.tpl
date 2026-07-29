@@ -43,7 +43,7 @@ Rules:
 - {{RULE_EDIT_SCOPE — e.g., do not edit code unless needed for diagnostic tables/plots}}
 - {{RULE_VALIDATION — e.g., validate facts before downstream claims}}
 - Only run safe read/diagnostic commands unless explicitly authorized to edit.
-- **Emit marker lines** when you hit ambiguous points, need user input, or finish. One marker per line in your output. Vocabulary (see goal-flight SKILL.md §Worker message passing): `STATUS: <update>` (informational), `RESULT: <key>=<value>` (structured output), `USER-NEED: <question>` (you can't decide without user input — stop and emit this; the controller will relay), `USER-CONFIRM: <action> [Y/N]` (irreversible op needs authorization), `BLOCKED: <reason>` (unrecoverable), `COMPLETE: <summary>` (task done). Emit a `STATUS:` line at least every ~8 minutes and before any long step; work incrementally so the controller sees live progress. The controller relays `USER-NEED:` / `USER-CONFIRM:` to its conversational surface. Reserve them for the narrow cases below: `USER-NEED:` and `BLOCKED:` end the turn; unattended `USER-CONFIRM:` is routed without discarding the partial turn, but the guarded action remains unauthorized until a correlated answer arrives. Ordinary ambiguity is still resolved by deciding and recording the assumption, not by asking.
+- **Emit marker lines** when you hit ambiguous points, need user input, or finish. One marker per line in your output. Vocabulary (see goal-flight SKILL.md §Worker message passing): `STATUS: <update>` (informational), `RESULT: <key>=<value>` (structured output), `USER-NEED: <question>` (you can't decide without user input — stop and emit this; the controller will relay), `USER-CONFIRM: <action> [Y/N]` (irreversible op needs authorization), `BLOCKED: <reason>` (unrecoverable), `COMPLETE: <summary>` (task done). Emit a `STATUS:` line at least every ~8 minutes and before any long step; work incrementally so the controller sees live progress. The controller relays `USER-NEED:` / `USER-CONFIRM:` to its conversational surface. Reserve them for the narrow cases below: `USER-NEED:` and `BLOCKED:` end the turn; unattended `USER-CONFIRM:` is routed without discarding the partial turn, but the guarded action remains unauthorized until a correlated answer arrives. Only the exact worker-facing token `USER-CONFIRM-ANSWER: <question_id> yes` together with status `guarded_action_authorized=true` authorizes that question; `recorded-yes-not-authorized`, `no`, silence, restart state, and permission-escalation acknowledgment authorize nothing. Ordinary ambiguity is still resolved by deciding and recording the assumption, not by asking.
 - **End-of-convergence-attempt self-review.** When you think the goal is met (FOCUSED test gates green — the full gate is controller-side — AND acceptance criteria satisfied), DO NOT yet emit `Goal complete: true`. First run the 7-category adversarial self-review from `prompts/executor-self-review.md` (INVARIANT GAP / SCOPE LEAK / MUTATION PURITY / BEHAVIOR DRIFT / DEAD CODE / CONTRACT LEAK / INTEGRITY), specialized to this chunk's project nouns and grep patterns, plus the universal null-hypothesis floor: state the null hypothesis (this change did NOT achieve its purpose / is a no-op / introduced a regression), actively try to CONFIRM it, and hand off only when observed before/after evidence REJECTS it. Severity-rank findings P0/P1/P2/P3. **Any P0 or P1 is a continue-iterating signal** — fix it in-loop (which becomes another plan/act/test cycle) and re-run the self-review pass. Emit `Goal complete: true` only when the self-review pass yields no P0/P1 and the null hypothesis is rejected by evidence, OR when every flagged P0/P1 was resolved in-loop with test gates still green and the null hypothesis is rejected by evidence. **Cadence**: ONE self-review pass per "I think I'm done" attempt — NOT after every micro-step. Typical: 1-3 passes total per chunk.
 
 Acceptance criteria:
@@ -74,11 +74,11 @@ Unattended-dispatch contract (read this before your first tool call):
   designs did you want".
 - After `USER-CONFIRM:`, **do not take the guarded action** unless a correlated
   answer explicitly authorizes it. A steer ACK, unrelated steer, mailbox read,
-   timeout, or silence is not approval. Continue independent safe work while the
-   question is outstanding. On unattended timeout the harness answers `no` at
-   the next safe turn boundary; it will not kill an in-flight turn solely
-   because you chose to wait. Respect that denial and finish whatever safe
-   deliverable remains.
+  timeout, or silence is not approval. Continue independent safe work while the
+  question is outstanding. At the unattended deadline the harness reconciles a
+  correlated answer already in the mailbox; without one it answers `no`.
+  Waiting alone does not kill the turn, but normal silence/wedge limits resume
+  after settlement. Respect a denial and finish whatever safe deliverable remains.
 - If you are blocked by the ENVIRONMENT rather than by a decision (a refused
   sandbox operation, a missing tool), that is `BLOCKED:` with the exact refusal
   — not a question.

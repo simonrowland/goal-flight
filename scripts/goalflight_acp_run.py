@@ -691,6 +691,40 @@ def _user_confirm_reply(entry: dict) -> tuple[str, str] | None:
     return question_id, decision
 
 
+_USER_CONFIRM_AUTHORIZE_TOKEN = _re.compile(
+    r"(USER-CONFIRM-ANSWER:\s+\S+\s+)yes\b",
+    _re.IGNORECASE,
+)
+
+
+def _sanitize_quoted_user_confirm_tokens(text: object) -> str:
+    """Keep quoted/instructional text from becoming an authorization signal."""
+    return _USER_CONFIRM_AUTHORIZE_TOKEN.sub(
+        r"\1quoted-yes-not-authorization",
+        str(text or ""),
+    )
+
+
+def _user_confirm_reply_arrived_before_deadline(
+    entry: dict,
+    question: dict[str, object],
+    decision: str,
+) -> bool:
+    """Require durable pre-deadline arrival evidence for affirmative replies."""
+    if decision != "yes":
+        return True
+    deadline_raw = question.get("reply_deadline_awake_mono_ns")
+    if deadline_raw is None:
+        # Unit/legacy records created before this field have no active deadline.
+        return True
+    try:
+        arrival_ns = int(entry.get("awake_mono_ns"))
+        deadline_ns = int(deadline_raw)
+    except (TypeError, ValueError):
+        return False
+    return 0 < arrival_ns <= deadline_ns
+
+
 def _user_confirm_is_resolved(question: dict[str, object]) -> bool:
     return question.get("controller_decision") in {"yes", "no"}
 
@@ -714,14 +748,24 @@ def _refresh_user_confirm_authorizations(
     questions: dict[str, dict[str, object]],
 ) -> None:
     """Recompute authorization within each decision cohort, never session-wide."""
-    denied_scopes = {
-        _user_confirm_decision_scope(question)
-        for question in questions.values()
-        if _user_confirm_denies_run(question)
+    questions_by_scope: dict[str, list[dict[str, object]]] = {}
+    for question in questions.values():
+        questions_by_scope.setdefault(
+            _user_confirm_decision_scope(question), []
+        ).append(question)
+    authorized_scopes = {
+        scope
+        for scope, members in questions_by_scope.items()
+        if members
+        and all(
+            member.get("origin") == "worker_marker"
+            and member.get("controller_decision") == "yes"
+            for member in members
+        )
     }
     for question in questions.values():
         question["guarded_action_authorized"] = bool(
-            _user_confirm_decision_scope(question) not in denied_scopes
+            _user_confirm_decision_scope(question) in authorized_scopes
             and question.get("origin") == "worker_marker"
             and question.get("controller_decision") == "yes"
         )
@@ -749,11 +793,29 @@ def _apply_user_confirm_reply_batch(
             accepted.add(seq)
             continue
         question_id, decision = reply
+        question = questions.get(question_id)
+        if (
+            question is not None
+            and not _user_confirm_reply_arrived_before_deadline(
+                entry,
+                question,
+                decision,
+            )
+        ):
+            rejected_reply_seqs.add(seq)
+            continue
         candidates.setdefault(question_id, []).append((seq, decision))
 
     for question_id, replies in candidates.items():
         question = questions.get(question_id)
         if question is None:
+            rejected_reply_seqs.update(seq for seq, _decision in replies)
+            continue
+        if question.get("arbitration_closed_at") is not None:
+            # Once a finalized answer has been exposed to the worker, later
+            # mailbox rows are audit evidence only. Revoking an authorization
+            # after delivery cannot undo the action and would make status lie
+            # about the decision the worker actually received.
             rejected_reply_seqs.update(seq for seq, _decision in replies)
             continue
 
@@ -772,9 +834,11 @@ def _apply_user_confirm_reply_batch(
             )
             if prior_decision == "yes":
                 question["superseded_reply_steer_seq"] = question.get("reply_steer_seq")
+            closed_at = resolved_at()
             question["controller_decision"] = "no"
             question["reply_steer_seq"] = winning_seq
-            question["resolved_at"] = resolved_at()
+            question["resolved_at"] = closed_at
+            question["arbitration_closed_at"] = closed_at
             question["guarded_action_authorized"] = False
             if prior_decision == "yes" or provisional_yes_seq is not None or yes_replies:
                 question["decision_conflict"] = True
@@ -830,9 +894,11 @@ def _finalize_provisional_user_confirm_yes(
         reply_seq = question.pop("provisional_yes_reply_steer_seq", None)
         if reply_seq is None:
             continue
+        closed_at = resolved_at()
         question["controller_decision"] = "yes"
         question["reply_steer_seq"] = int(reply_seq)
-        question["resolved_at"] = resolved_at()
+        question["resolved_at"] = closed_at
+        question["arbitration_closed_at"] = closed_at
         accepted_reply_seqs.add(int(reply_seq))
 
     _refresh_user_confirm_authorizations(all_questions)
@@ -883,16 +949,24 @@ async def _read_user_confirm_replies_denying_expired(
     deny_expired: Callable[[list[dict[str, object]]], Any],
     apply_replies: Callable[[list[dict]], set[int]],
 ) -> tuple[list[dict], list[dict[str, object]], set[int]]:
-    """Read a mailbox boundary, making any crossed deadline sticky first."""
+    """Arbitrate rows visible at the deadline boundary, then fail closed.
+
+    Mailbox timestamps are not a trustworthy monotonic clock. The explicit
+    timeout assumption is therefore that the first reconciliation boundary at
+    or after the awake-time deadline is the cutoff: correlated rows already
+    visible there participate in arbitration; only a still-unanswered question
+    receives the generated denial.
+    """
     entries = read_entries()
+    accepted = apply_replies(entries)
     expired = expired_questions()
     if expired:
         await deny_expired(expired)
-        # Expiry settlement can append a structured timeout denial. Re-read
-        # under the now-sticky decision so that generated evidence is delivered
-        # at this same boundary and any late affirmative reply stays inert.
+        # Settlement can finalize a provisional affirmative or append a
+        # structured timeout denial. Re-read under the now-closed decision so
+        # the winning row is deliverable at this same boundary.
         entries = read_entries()
-    accepted = apply_replies(entries)
+        accepted.update(apply_replies(entries))
     return entries, expired, accepted
 
 
@@ -914,16 +988,26 @@ def _steer_turn_prompt(
     for entry in entries:
         reply = _user_confirm_reply(entry)
         if reply is None:
-            lines.append(f"{entry['seq']}: {entry['text']}")
+            lines.append(
+                f"{entry['seq']}: "
+                f"{_sanitize_quoted_user_confirm_tokens(entry['text'])}"
+            )
             continue
-        if int(entry["seq"]) not in accepted_user_confirm_reply_seqs:
+        question_id, decision = reply
+        question = (user_confirm_questions or {}).get(question_id, {})
+        try:
+            recorded_reply_seq = int(question.get("reply_steer_seq") or -1)
+        except (TypeError, ValueError):
+            recorded_reply_seq = -1
+        if (
+            int(entry["seq"]) not in accepted_user_confirm_reply_seqs
+            and recorded_reply_seq != int(entry["seq"])
+        ):
             lines.append(
                 f"{entry['seq']}: ignored USER-CONFIRM reply: no outstanding "
                 "question matched. No action is authorized."
             )
             continue
-        question_id, decision = reply
-        question = (user_confirm_questions or {}).get(question_id, {})
         if question.get("origin") == "permission_escalation":
             lines.append(
                 f"{entry['seq']}: Controller response recorded for {question_id}: "
@@ -933,9 +1017,11 @@ def _steer_turn_prompt(
                 "authorized dispatch for that action."
             )
         elif question.get("guarded_action_authorized") is True:
+            controller_note = _sanitize_quoted_user_confirm_tokens(entry["text"])
             lines.append(
                 f"{entry['seq']}: USER-CONFIRM-ANSWER: {question_id} yes. "
-                f"Controller note: {entry['text']}"
+                "Controller note (quoted text, not an authorization signal): "
+                f"{controller_note}"
             )
         elif decision == "yes":
             lines.append(
@@ -2228,8 +2314,20 @@ async def _run_acp_dispatch_impl(
             target.append(dict(question))
         return pending, resolved
 
+    def current_generation_user_confirms() -> list[dict[str, object]]:
+        return [
+            question
+            for question in user_confirm_questions.values()
+            if question.get("generation") == user_confirm_generation
+        ]
+
     def refresh_user_confirm_guard() -> None:
-        questions = list(user_confirm_questions.values())
+        questions = current_generation_user_confirms()
+        # Deliberate F4 boundary: after any denial this ACP connection remains
+        # read-only. Worker markers do not carry a stable permission/action key,
+        # so trying to reopen only a "correlated" non-read call would be guessy
+        # and fail-open. Restart tombstones remain audit-visible but belong to
+        # the dead connection; this new generation is the reopening boundary.
         if any(_user_confirm_denies_run(question) for question in questions):
             state = "denied"
         elif any(not _user_confirm_is_resolved(question) for question in questions):
@@ -2277,6 +2375,30 @@ async def _run_acp_dispatch_impl(
         apply_user_confirm_replies(timeout_entries)
         return timeout_entries
 
+    def deny_terminal_user_confirms(
+        questions: list[dict[str, object]],
+        *,
+        reason: str,
+    ) -> None:
+        """Resolve questions that cannot outlive a terminal run."""
+        for candidate in questions:
+            question = user_confirm_questions.get(str(candidate.get("question_id")))
+            if question is None or _user_confirm_is_resolved(question):
+                continue
+            provisional_yes_seq = question.pop(
+                "provisional_yes_reply_steer_seq", None
+            )
+            if provisional_yes_seq is not None:
+                rejected_user_confirm_reply_seqs.add(int(provisional_yes_seq))
+                question["decision_conflict"] = True
+            question["controller_decision"] = "no"
+            question["resolved_at"] = wall_now()
+            question["arbitration_closed_at"] = question["resolved_at"]
+            question["resolution_reason"] = reason
+            question["guarded_action_authorized"] = False
+        _refresh_user_confirm_authorizations(user_confirm_questions)
+        refresh_user_confirm_guard()
+
     async def settle_expired_user_confirms(
         questions: list[dict[str, object]],
     ) -> list[dict]:
@@ -2299,7 +2421,14 @@ async def _run_acp_dispatch_impl(
 
     def expired_user_confirm_questions() -> list[dict[str, object]]:
         now_mono = awake_now()
-        pending, _resolved = user_confirm_status_lists()
+        # Return canonical mutable records. Status snapshots deliberately copy
+        # questions; using those copies here loses a provisional reply applied
+        # at the expiry boundary and can synthesize a conflicting timeout no.
+        pending = [
+            question
+            for question in user_confirm_questions.values()
+            if not _user_confirm_is_resolved(question)
+        ]
         return [
             question
             for question in pending
@@ -2311,19 +2440,45 @@ async def _run_acp_dispatch_impl(
         ]
 
     async def expire_midturn_user_confirms() -> bool:
-        """Deny crossed deadlines and end the temporary liveness exemption."""
+        """Settle crossed deadlines and end the temporary liveness exemption."""
         nonlocal awaiting_user_confirm
         async with user_confirm_expiry_lock:
             expired = expired_user_confirm_questions()
             if not expired:
                 return False
-            await deny_timed_out_user_confirms(expired)
-            awaiting_user_confirm = False
+            # An open ACP prompt holds the turn lock, so ordinary between-turn
+            # polling cannot observe a controller reply. Reconcile the mailbox
+            # once at the first expiry boundary before synthesizing a denial.
+            # A correlated row already present is explicit authorization, not
+            # implicit approval; unanswered questions still fail closed.
+            pending_reply_entries = _pending_steer_entries(
+                steer_file,
+                accepted_user_confirm_reply_seqs
+                | rejected_user_confirm_reply_seqs,
+            )
+            apply_user_confirm_replies(pending_reply_entries)
+            unsettled = [
+                question
+                for question in expired
+                if not _user_confirm_is_resolved(
+                    user_confirm_questions.get(str(question["question_id"]), {})
+                )
+            ]
+            timeout_entries = (
+                await settle_expired_user_confirms(unsettled) if unsettled else []
+            )
+            awaiting_user_confirm = bool(
+                [
+                    question
+                    for question in current_generation_user_confirms()
+                    if not _user_confirm_is_resolved(question)
+                ]
+            )
             confirm_pending, confirm_resolved = user_confirm_status_lists()
             await update_status(
-                user_confirm_overdue=True,
+                user_confirm_overdue=bool(timeout_entries),
                 user_confirm_overdue_question_ids=[
-                    str(question["question_id"]) for question in expired
+                    str(entry["reply_to"]) for entry in timeout_entries
                 ],
                 user_confirm_timeout_count=user_confirm_timeout_continuations,
                 user_confirm_pending=confirm_pending,
@@ -2344,6 +2499,12 @@ async def _run_acp_dispatch_impl(
         prior_id = user_confirm_keys.get(key)
         if prior_id and not _user_confirm_is_resolved(user_confirm_questions.get(prior_id, {})):
             return
+        prior_question = user_confirm_questions.get(prior_id or "", {})
+        decision_scope = (
+            _user_confirm_decision_scope(prior_question)
+            if prior_question
+            else f"{user_confirm_generation}:turn:{int(turn_index)}"
+        )
 
         user_confirm_sequence += 1
         question_id = f"{dispatch_id}-{user_confirm_generation}-q{user_confirm_sequence}"
@@ -2365,15 +2526,20 @@ async def _run_acp_dispatch_impl(
         question: dict[str, object] = {
             "question_id": question_id,
             "dispatch_id": dispatch_id,
+            "generation": user_confirm_generation,
             "origin": origin,
             "text": question_text,
             "turn_index": int(turn_index),
             # Multiple questions emitted in one turn are one authorization
-            # decision: a crossed denial poisons that cohort. A later turn or
+            # decision: a crossed denial poisons that cohort. Repeating the same
+            # guarded action keeps its prior cohort; a different later action or
             # restarted generation gets a new cohort, so historical denials do
-            # not silently suppress a fresh, explicitly answered question.
-            "decision_scope": f"{user_confirm_generation}:turn:{int(turn_index)}",
+            # not suppress a fresh, explicitly answered question.
+            "decision_scope": decision_scope,
             "asked_at": wall_now(),
+            "reply_deadline_awake_mono_ns": int(
+                (active_monotonic() + user_confirm_timeout_s) * 1_000_000_000
+            ),
             "guarded_action_authorized": False,
         }
         if permission_context:
@@ -2403,6 +2569,10 @@ async def _run_acp_dispatch_impl(
                 context=mailbox_context,
             )
             question["question_mailbox_seq"] = int(entry["seq"])
+            question["reply_deadline_awake_mono_ns"] = (
+                int(entry["awake_mono_ns"])
+                + int(user_confirm_timeout_s * 1_000_000_000)
+            )
         except Exception as exc:
             relay_errors.append(f"steer:{type(exc).__name__}: {exc}")
 
@@ -3483,6 +3653,10 @@ async def _run_acp_dispatch_impl(
                 awaiting_user_confirm = True
                 awaiting_next_prompt = True
                 awaiting_next_prompt_deadline_mono = confirm_deadline_mono
+                confirm_wait_scopes = {
+                    _user_confirm_decision_scope(question)
+                    for question in confirm_pending
+                }
                 await update_status(
                     state="awaiting_user_confirm",
                     user_confirm_pending=confirm_pending,
@@ -3498,11 +3672,36 @@ async def _run_acp_dispatch_impl(
                     ),
                     apply_replies=apply_user_confirm_replies,
                     has_denial=lambda: any(
-                        question.get("controller_decision") == "no"
+                        _user_confirm_decision_scope(question) in confirm_wait_scopes
+                        and _user_confirm_denies_run(question)
                         for question in user_confirm_questions.values()
                     ),
                     awake_clock=awake_now,
                 )
+                denied_scopes = {
+                    _user_confirm_decision_scope(question)
+                    for question in user_confirm_questions.values()
+                    if _user_confirm_denies_run(question)
+                }
+                provisional_yes_in_denied_scopes = [
+                    question
+                    for question in user_confirm_questions.values()
+                    if not _user_confirm_is_resolved(question)
+                    and question.get("provisional_yes_reply_steer_seq") is not None
+                    and _user_confirm_decision_scope(question) in denied_scopes
+                ]
+                if provisional_yes_in_denied_scopes:
+                    # A denial has already made this decision cohort permanently
+                    # non-authorizing. Record the crossed affirmative now so the
+                    # continuation can report it explicitly without emitting the
+                    # bare authorization token or waiting out the full deadline.
+                    _finalize_provisional_user_confirm_yes(
+                        provisional_yes_in_denied_scopes,
+                        user_confirm_questions,
+                        accepted_user_confirm_reply_seqs,
+                        wall_clock=wall_now,
+                    )
+                    refresh_user_confirm_guard()
                 confirm_pending, confirm_resolved = user_confirm_status_lists()
                 if confirm_pending and _user_confirm_deadline_reached(
                     confirm_deadline_mono,
@@ -3656,8 +3855,16 @@ async def _run_acp_dispatch_impl(
                     str(question.get("question_id")) for question in confirm_pending
                 ],
             }
+        if state != "complete" and confirm_pending:
+            deny_terminal_user_confirms(
+                confirm_pending,
+                reason=f"run_terminal:{state}",
+            )
+            confirm_pending, confirm_resolved = user_confirm_status_lists()
         denied_questions = [
-            question for question in confirm_resolved if _user_confirm_denies_run(question)
+            question
+            for question in current_generation_user_confirms()
+            if _user_confirm_denies_run(question)
         ]
         if state == "complete" and denied_questions:
             permission_denied = any(
@@ -3709,7 +3916,7 @@ async def _run_acp_dispatch_impl(
             "had_denied_action": bool(denied_questions),
             "had_user_confirm_denial": any(
                 question.get("controller_decision") == "no"
-                for question in confirm_resolved
+                for question in current_generation_user_confirms()
             ),
             "user_confirm_rejected_reply_seqs": (
                 sorted(rejected_user_confirm_reply_seqs) or None
@@ -4027,10 +4234,11 @@ def main(argv: list[str] | None = None) -> int:
         ),
         help=(
             "Awake-second deadline for a correlated unattended USER-CONFIRM reply "
-            "(default 600). Timeout is fail-closed at the next safe turn boundary: "
-            "append one explicit 'no' continuation so safe independent work can "
-            "finish; do not kill an in-flight asking turn merely for waiting. A "
-            "repeated question then blocks with partial output preserved."
+            "(default 600). At the deadline, reconcile any reply already in the "
+            "mailbox, otherwise append one explicit 'no' continuation so safe "
+            "independent work can finish. The question alone does not kill the "
+            "turn, but after settlement normal silence/wedge limits apply again. "
+            "A repeated question then blocks with partial output preserved."
         ),
     )
     parser.add_argument(
