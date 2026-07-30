@@ -39,8 +39,15 @@ def test_cursor_is_not_told_to_read_the_prompt_file_env_var() -> None:
             "delivered inline" in text,
         )
         assert_true(
-            f"{agent}: worker is told not to shell out for the brief",
-            "Do NOT shell out for the brief" in text,
+            f"{agent}: worker is told not to shell out for its own brief",
+            "Do not run shell commands to locate" in text,
+        )
+        # Naming the variable in order to forbid it planted it: workers read it
+        # anyway. The cursor preamble must not mention it at all -- there is
+        # nothing to look up, so nothing should suggest there is.
+        assert_true(
+            f"{agent}: prompt-file env var is not named at all",
+            "GOALFLIGHT_PROMPT_FILE" not in text,
         )
 
 

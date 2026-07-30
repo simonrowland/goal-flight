@@ -661,10 +661,22 @@ def _resolve_original_prompt_file(cfg: argparse.Namespace) -> str | None:
     return str(Path(str(prompt_path)).expanduser().resolve())
 
 
+# Transports whose command reviewer escalates a read of the prompt-file path.
+# Publishing the variable to those workers is worse than useless: the value is
+# visible in their environment, so they try to read it, the read is escalated,
+# nobody approves it unattended, and the run ends non-clean. Instruction does not
+# help -- workers read it even when told not to, and even when the preamble never
+# names it, because they can see it for themselves. Removing it is the only thing
+# that works, and costs nothing here: these workers receive the brief inline and
+# cannot re-read from disk anyway.
+_PROMPT_FILE_ENV_WITHHELD_AGENTS = {"cursor", "cursor-agent"}
+
+
 def _worker_spawn_env(cfg: argparse.Namespace, original_prompt_file: str | None) -> dict[str, str]:
     install_slot = getattr(cfg, "install_slot", None)
     spawn_env = dispatch_env(cfg.agent, install_slot)
-    if original_prompt_file:
+    withhold = str(getattr(cfg, "agent", "")).strip().lower() in _PROMPT_FILE_ENV_WITHHELD_AGENTS
+    if original_prompt_file and not withhold:
         spawn_env[PROMPT_FILE_ENV] = original_prompt_file
     else:
         spawn_env.pop(PROMPT_FILE_ENV, None)
