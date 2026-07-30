@@ -201,10 +201,16 @@ def normalize_state(
     status_state = str(status.get("state")) if status and status.get("state") else None
     record_state = str(record.get("state")) if record and record.get("state") else None
 
-    if marker in SUCCESS_TERMINAL_MARKERS or status_state in TERMINAL_DONE or record_state in TERMINAL_DONE:
+    if marker in SUCCESS_TERMINAL_MARKERS or marker in BLOCKING_TERMINAL_MARKERS:
+        combined = runtime_record(record, status, lease)
+        marker_code = goalflight_status.terminal_marker_done_code(
+            combined or {},
+            worker_alive=worker_live,
+        )
+        if marker_code == 0:
+            return "complete" if marker in SUCCESS_TERMINAL_MARKERS else "failed"
+    if status_state in TERMINAL_DONE or record_state in TERMINAL_DONE:
         return "complete"
-    if marker in BLOCKING_TERMINAL_MARKERS:
-        return "failed"
     if state_in(status_state, WEDGED_STATES) or state_in(record_state, WEDGED_STATES):
         if worker_live:
             return "running"

@@ -603,7 +603,7 @@ def case_nonterminal_steer_turn_continues_to_real_terminal() -> None:
         assert "STATUS: steer accepted; continuing" in (status.get("text_excerpt") or ""), status
 
 
-def case_user_confirm_midrun_routes_without_cancelling() -> None:
+def case_user_confirm_midrun_yes_records_consent_without_authorizing_action() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         _write_fake_codex_acp_manifest(tmp / "adapters")
@@ -614,6 +614,11 @@ def case_user_confirm_midrun_routes_without_cancelling() -> None:
         env["GOALFLIGHT_USER_CONFIRM_TIMEOUT_S"] = "5"
         guarded = tmp / "guarded-action"
         env["GOALFLIGHT_FAKE_ACP_GUARDED_FILE"] = str(guarded)
+        env["GOALFLIGHT_FAKE_ACP_REQUEST_GUARDED_PERMISSION"] = "1"
+        env["GOALFLIGHT_ACP_LIVE_MATRIX"] = "1"
+        env["GOALFLIGHT_FAKE_ACP_PERMISSION_LOCATION"] = str(
+            ROOT / ".goalflight-fake-guard-target"
+        )
         dispatch_id = "acp-user-confirm-route"
         status_path = tmp / "status.json"
         mailbox = Path(env["GOALFLIGHT_STATE_DIR"]) / "dispatch" / f"{dispatch_id}.steer.jsonl"
@@ -689,14 +694,19 @@ def case_user_confirm_midrun_routes_without_cancelling() -> None:
         ], status
         assert markers.get("RESULT") == [
             "draft=preserved-before-question",
-            "guarded_action_taken=true",
+            "marker_redirect_seen=true",
+            "guarded_action_taken=false",
         ], status
         assert "RESULT: draft=preserved-before-question" in status["result_text"], status
-        assert guarded.exists(), status
-        assert guarded.read_text(encoding="utf-8") == "authorized\n"
+        assert not guarded.exists(), status
         resolved = status.get("user_confirm_resolved") or []
         assert resolved and resolved[0]["controller_decision"] == "yes", status
-        assert resolved[0]["guarded_action_authorized"] is True, status
+        assert resolved[0]["guarded_action_authorized"] is False, status
+        assert any(
+            decision.get("reason") == "user_confirm_denied"
+            and decision.get("tool_call_id") == "guarded-after-confirm"
+            for decision in (status.get("permission_router_decisions") or [])
+        ), status
 
         controller_inbox = Path(env["GOALFLIGHT_MESSAGES_DIR"]) / f"{dispatch_id}.jsonl"
         envelopes = [
@@ -802,7 +812,7 @@ def case_midturn_mailbox_yes_is_reconciled_before_timeout_denial() -> None:
             and status.get("user_confirm_overdue") is False
             and len(resolved) == 1
             and resolved[0]["controller_decision"] == "yes"
-            and resolved[0]["guarded_action_authorized"] is True
+            and resolved[0]["guarded_action_authorized"] is False
             and bool(resolved[0].get("arbitration_closed_at"))
             and not any(
                 row.get("reply_to") == question["question_id"]
@@ -1265,6 +1275,7 @@ def case_restart_does_not_reuse_question_id_or_accept_stale_yes() -> None:
                 exclude_question_ids={old_question_id},
                 extra_env={
                     "GOALFLIGHT_FAKE_ACP_REQUEST_GUARDED_PERMISSION": "1",
+                    "GOALFLIGHT_ACP_LIVE_MATRIX": "1",
                     "GOALFLIGHT_FAKE_ACP_PERMISSION_LOCATION": str(
                         ROOT / ".goalflight-fake-guard-target"
                     ),
@@ -1274,13 +1285,13 @@ def case_restart_does_not_reuse_question_id_or_accept_stale_yes() -> None:
         resolved = second_status.get("user_confirm_resolved") or []
         old = [item for item in resolved if item["question_id"] == old_question_id]
         new = [item for item in resolved if item["question_id"] == new_question["question_id"]]
+        permission_decisions = second_status.get("permission_router_decisions") or []
         assert (
             second_proc.returncode == 0
             and second_status["state"] == "complete"
             and second_status["ok"] is True
             and second_status["had_denied_action"] is False
-            and guarded.exists()
-            and guarded.read_text(encoding="utf-8") == "authorized\n"
+            and not guarded.exists()
             and new_question["question_id"] != old_question_id
             and len(old) == 1
             and old[0]["controller_decision"] == "no"
@@ -1288,10 +1299,16 @@ def case_restart_does_not_reuse_question_id_or_accept_stale_yes() -> None:
             and old[0]["guarded_action_authorized"] is False
             and len(new) == 1
             and new[0]["controller_decision"] == "yes"
-            and new[0]["guarded_action_authorized"] is True
+            and new[0]["guarded_action_authorized"] is False
             and old[0].get("decision_scope", old_question_id)
             != new[0]["decision_scope"]
             and bool(second_status.get("user_confirm_rejected_reply_seqs"))
+            and "marker_redirect_seen=true" in second_status["result_text"]
+            and any(
+                decision.get("reason") == "user_confirm_denied"
+                and decision.get("tool_call_id") == "guarded-after-confirm"
+                for decision in permission_decisions
+            )
         ), (second_stdout, second_stderr, second_status)
 
 
@@ -1484,7 +1501,7 @@ def case_prior_denial_blocks_later_scope_in_same_generation() -> None:
         ), (stdout, stderr, status)
 
 
-def case_same_turn_permission_escalation_does_not_strand_marker_yes() -> None:
+def case_same_turn_permission_escalation_and_marker_yes_both_stay_closed() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         dispatch_id = "acp-permission-and-marker"
@@ -1534,16 +1551,17 @@ def case_same_turn_permission_escalation_does_not_strand_marker_yes() -> None:
             and escalation["turn_index"] == marker["turn_index"]
             and escalation["decision_scope"] != marker["decision_scope"]
             and escalation["guarded_action_authorized"] is False
-            and marker["guarded_action_authorized"] is True
+            and marker["guarded_action_authorized"] is False
             and not escalation_target.exists()
-            and "marker_permission_selected=true" in status["result_text"]
+            and "marker_permission_selected=false" in status["result_text"]
+            and "marker_redirect_seen=true" in status["result_text"]
             and any(
-                decision.get("decision") == "allow"
+                decision.get("reason") == "user_confirm_denied"
                 and decision.get("tool_call_id")
                 == "marker-after-permission-escalation"
                 for decision in permission_decisions
             )
-            and guarded.read_text(encoding="utf-8") == "authorized\n"
+            and not guarded.exists()
         ), (stdout, stderr, status)
 
 
@@ -1568,23 +1586,37 @@ def case_conflicting_user_confirm_answers_are_deny_biased() -> None:
         assert "guarded_action_taken=false" in status["result_text"], status
 
 
-def case_correlated_worker_marker_yes_authorizes_only_its_action() -> None:
+def case_correlated_worker_marker_yes_never_opens_non_read_permissions() -> None:
     with tempfile.TemporaryDirectory() as td:
         proc, stdout, stderr, status, guarded, _question = _run_answered_confirmation(
             Path(td),
             scenario="user_confirm_continue",
             dispatch_id="acp-user-confirm-yes",
             decisions=["yes"],
+            extra_env={
+                "GOALFLIGHT_FAKE_ACP_REQUEST_GUARDED_PERMISSION": "1",
+                "GOALFLIGHT_ACP_LIVE_MATRIX": "1",
+                "GOALFLIGHT_FAKE_ACP_PERMISSION_LOCATION": str(
+                    ROOT / ".goalflight-fake-guard-target"
+                ),
+            },
         )
         assert proc.returncode == 0, (stdout, stderr, status)
         assert status["state"] == "complete", status
         assert status["ok"] is True, status
-        assert guarded.read_text(encoding="utf-8") == "authorized\n"
+        assert not guarded.exists(), status
         resolved = status.get("user_confirm_resolved") or []
         assert len(resolved) == 1, status
         assert resolved[0]["controller_decision"] == "yes", status
-        assert resolved[0]["guarded_action_authorized"] is True, status
+        assert resolved[0]["guarded_action_authorized"] is False, status
         assert status["had_denied_action"] is False, status
+        assert "marker_redirect_seen=true" in status["result_text"], status
+        assert "guarded_action_taken=false" in status["result_text"], status
+        assert any(
+            decision.get("reason") == "user_confirm_denied"
+            and decision.get("tool_call_id") == "guarded-after-confirm"
+            for decision in (status.get("permission_router_decisions") or [])
+        ), status
 
 
 def case_permission_escalation_yes_is_acknowledgment_not_authorization() -> None:
@@ -1638,7 +1670,7 @@ def main() -> None:
     case_acp_mailbox_steer_delivered_at_next_turn_and_acked()
     case_mid_turn_steer_does_not_extend_wedge_deadline()
     case_nonterminal_steer_turn_continues_to_real_terminal()
-    case_user_confirm_midrun_routes_without_cancelling()
+    case_user_confirm_midrun_yes_records_consent_without_authorizing_action()
     case_midturn_mailbox_yes_is_reconciled_before_timeout_denial()
     case_post_deadline_yes_before_delayed_read_is_denied()
     case_uncorrelated_user_confirm_yes_is_not_authorization()
@@ -1654,9 +1686,9 @@ def main() -> None:
     case_quoted_authorize_grammar_in_ordinary_steer_is_inert()
     case_crossed_dual_user_confirm_answers_never_emit_authorization()
     case_prior_denial_blocks_later_scope_in_same_generation()
-    case_same_turn_permission_escalation_does_not_strand_marker_yes()
+    case_same_turn_permission_escalation_and_marker_yes_both_stay_closed()
     case_conflicting_user_confirm_answers_are_deny_biased()
-    case_correlated_worker_marker_yes_authorizes_only_its_action()
+    case_correlated_worker_marker_yes_never_opens_non_read_permissions()
     case_permission_escalation_yes_is_acknowledgment_not_authorization()
     case_permission_escalation_records_correlated_no_and_nonclean_terminal()
     print("OK: ACP steer tests pass")

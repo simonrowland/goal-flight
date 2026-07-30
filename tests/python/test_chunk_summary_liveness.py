@@ -122,7 +122,7 @@ def test_recycled_pid_identity_mismatch_is_not_alive() -> None:
     assert_eq("identity mismatch is not live", live, False)
 
 
-def test_missing_identity_falls_back_to_pid_liveness() -> None:
+def test_missing_identity_does_not_claim_pid_ownership() -> None:
     saved = status.goalflight_compat.pid_alive
     try:
         status.goalflight_compat.pid_alive = lambda _pid: True
@@ -137,7 +137,43 @@ def test_missing_identity_falls_back_to_pid_liveness() -> None:
     finally:
         status.goalflight_compat.pid_alive = saved
 
-    assert_eq("pid-only liveness fallback", live, True)
+    assert_eq("pid-only liveness is not confirmed ownership", live, False)
+
+
+def test_confirmed_live_worker_with_scraped_complete_stays_running_wait() -> None:
+    with tempfile.TemporaryDirectory(prefix="gf-summary-live-marker-") as d:
+        base = Path(d)
+        state_dir = base / "state"
+        tail = base / "live-marker.tail"
+        status_path = base / "live-marker.status.json"
+        tail.write_text("shell loop\nfor x in y; do :; done\n", encoding="utf-8")
+        record = _record(
+            dispatch_id="live-marker",
+            state="running",
+            tail=tail,
+            status_path=status_path,
+        )
+        _write_dispatch(
+            state_dir,
+            record,
+            {
+                "dispatch_id": "live-marker",
+                "state": "running",
+                "worker_pid": 4242,
+                "tail_path": str(tail),
+                "terminal_marker": {"kind": "COMPLETE", "text": "", "line": 2},
+            },
+        )
+
+        payload = _with_identity(
+            True,
+            "live",
+            lambda: summary.summarize("live-marker", state_dir),
+        )
+
+    assert_eq("live scraped marker state", payload["state"], "running")
+    assert_eq("live scraped marker hint", payload["decision_hint"], "wait")
+    assert_eq("live scraped marker remains diagnostic", payload["last_marker"], "COMPLETE")
 
 
 def test_summary_agrees_with_status_tail_reconciled_complete() -> None:
@@ -169,7 +205,8 @@ def main() -> None:
         test_idle_detached_identity_live_reads_running_wait,
         test_dead_worker_complete_tail_reads_complete,
         test_recycled_pid_identity_mismatch_is_not_alive,
-        test_missing_identity_falls_back_to_pid_liveness,
+        test_missing_identity_does_not_claim_pid_ownership,
+        test_confirmed_live_worker_with_scraped_complete_stays_running_wait,
         test_summary_agrees_with_status_tail_reconciled_complete,
     ]
     for test in tests:

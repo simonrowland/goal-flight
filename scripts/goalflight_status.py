@@ -52,6 +52,9 @@ _OUTPUT_TAIL_BLOCKING_MARKERS = BLOCKING_TERMINAL_MARKERS
 _OUTPUT_TAIL_TERMINAL_MARKERS = _OUTPUT_TAIL_SUCCESS_MARKERS | _OUTPUT_TAIL_BLOCKING_MARKERS
 _OUTPUT_TAIL_IDLE_RECONCILE_S = 30.0
 _OUTPUT_TAIL_RECONCILE_CLASSES = dispatch_states.OUTPUT_TAIL_RECONCILE_STATES
+_WAIT_LIVENESS_CONFIRMED_ALIVE = "confirmed_alive"
+_WAIT_LIVENESS_CONFIRMED_DEAD = "confirmed_dead"
+_WAIT_LIVENESS_INDETERMINATE = "indeterminate"
 _DRAIN_LAUNCHD_LABEL = "com.goalflight.drain"
 _QUEUE_PENDING_NO_DRAINER = "queue_pending_no_drainer"
 # --wait anti-hang grace: how long a dispatch may stay ambiguous/stale WITH a
@@ -218,6 +221,12 @@ def _output_tail_reconcile_gate(record: dict, *, tail_mtime: float | None) -> tu
         return False, "liveness_indeterminate"
     ok, reason = goalflight_ledger.identity_matches(identity_record)
     if not ok:
+        idle_s = time.time() - float(tail_mtime or 0)
+        if str(reason).startswith("pid_reused_") and idle_s <= _OUTPUT_TAIL_IDLE_RECONCILE_S:
+            return (
+                False,
+                f"worker_identity_mismatch_tail_recent:{reason}:{int(max(0.0, idle_s))}s",
+            )
         return True, f"worker_not_live:{reason}"
     idle_s = time.time() - float(tail_mtime or 0)
     if idle_s > _OUTPUT_TAIL_IDLE_RECONCILE_S:
@@ -916,27 +925,30 @@ def export_dashboard_status(project_root: str | Path | None, path: str | Path | 
     return target
 
 
+def terminal_marker_done_code(
+    record: dict,
+    *,
+    worker_alive: bool | None = None,
+) -> int | None:
+    """Return the shared marker/liveness verdict, or None without a marker."""
+    if not _record_has_terminal_marker(record):
+        return None
+    if worker_alive is None:
+        liveness = _wait_worker_liveness(record)
+        worker_alive = liveness == _WAIT_LIVENESS_CONFIRMED_ALIVE
+    return 1 if worker_alive else 0
+
+
 def done_code(record: dict, *, worker_alive: bool | None = None) -> int:
     """0 = terminal/done, 1 = live, 2 = ambiguous/unknown."""
     cls = record.get("classification") or record.get("state") or "unknown"
-    if _record_has_terminal_marker(record):
+    marker_code = terminal_marker_done_code(record, worker_alive=worker_alive)
+    if marker_code is not None:
         # A terminal marker is scraped from worker OUTPUT, so ordinary text can
-        # forge one: a shell loop's `done` terminator matches the bare sign-off
-        # pattern, which reported a live, mid-task worker as COMPLETE -- a
-        # verdict a controller acts on by gating, committing and pushing
-        # unfinished work. The watcher itself was not fooled (it kept
-        # state=running); only this verdict was.
-        #
-        # A process we can still see running has not finished, whatever its
-        # output says, so a marker must never outrank CONFIRMED liveness.
-        # Unconfirmed liveness deliberately keeps the marker verdict: failing to
-        # observe a process is not evidence that it lives, and treating it as
-        # such would turn every unobservable worker into a hang.
-        marker_worker_alive = worker_alive
-        if marker_worker_alive is None:
-            marker_worker_alive = _wait_worker_confirmed_alive(record)
-        if not marker_worker_alive:
-            return 0
+        # forge one. Only identity-confirmed liveness suppresses it. PID-only
+        # ownership is indeterminate and deliberately resolves on the marker:
+        # failing to identify the process is not evidence that it is this worker.
+        return marker_code
     if _needs_liveness_recheck(record):
         if worker_alive is None:
             worker_alive = _rechecked_worker_alive(record)
@@ -1078,6 +1090,37 @@ def _terminal_state(record: dict | None, *, code: int, timed_out: bool = False) 
     return str(record.get("terminal_state") or cls)
 
 
+def _wait_worker_liveness_detail(record: dict | None) -> tuple[str, str]:
+    """Classify marker liveness without treating a bare live PID as ownership."""
+    if record is None:
+        return _WAIT_LIVENESS_INDETERMINATE, "missing_record"
+    source = _wait_liveness_record(record)
+    if source is not None:
+        record = source
+    if _has_recorded_worker_identity(record):
+        ok, reason = goalflight_ledger.identity_matches(record)
+        if reason == "identity_indeterminate":
+            return _WAIT_LIVENESS_INDETERMINATE, str(reason)
+        return (
+            (_WAIT_LIVENESS_CONFIRMED_ALIVE if ok else _WAIT_LIVENESS_CONFIRMED_DEAD),
+            str(reason),
+        )
+    pid = record.get("worker_pid")
+    if pid:
+        try:
+            pid_live = goalflight_compat.pid_alive(int(pid))
+        except (TypeError, ValueError):
+            return _WAIT_LIVENESS_CONFIRMED_DEAD, "invalid_pid"
+        if pid_live:
+            return _WAIT_LIVENESS_INDETERMINATE, "pid_alive_without_identity"
+        return _WAIT_LIVENESS_CONFIRMED_DEAD, "pid_dead"
+    return _WAIT_LIVENESS_CONFIRMED_DEAD, "no_pid"
+
+
+def _wait_worker_liveness(record: dict | None) -> str:
+    return _wait_worker_liveness_detail(record)[0]
+
+
 def _wait_worker_confirmed_dead(record: dict | None) -> bool:
     """True when an ambiguous/stale (done_code==2) row's worker is provably gone.
 
@@ -1089,47 +1132,15 @@ def _wait_worker_confirmed_dead(record: dict | None) -> bool:
     ``worker_dead`` rather than poll to the timeout.
 
     Liveness is checked the trustworthy way: identity match from the raw run
-    ledger or status.json expected worker identity (survives PID reuse), else a
-    raw pid probe. Missing rows/ids are not proof of death; they keep waiting
-    until timeout rather than fabricating a worker_dead verdict.
+    ledger or status.json expected worker identity (survives PID reuse).
+    A live PID without identity is indeterminate; a dead PID or a row with no
+    recorded PID follows the existing crash-grace path.
     """
-    if record is None:
-        return False
-    source = _wait_liveness_record(record)
-    if source is not None:
-        record = source
-    if _needs_liveness_recheck(record):
-        return not _rechecked_worker_alive(record)
-    if _has_recorded_worker_identity(record):
-        ok, _ = goalflight_ledger.identity_matches(record)
-        return not ok
-    pid = record.get("worker_pid")
-    if pid:
-        try:
-            return not goalflight_compat.pid_alive(int(pid))
-        except (TypeError, ValueError):
-            return True
-    return True
+    return _wait_worker_liveness(record) == _WAIT_LIVENESS_CONFIRMED_DEAD
 
 
 def _wait_worker_confirmed_alive(record: dict | None) -> bool:
-    if record is None:
-        return False
-    source = _wait_liveness_record(record)
-    if source is not None:
-        record = source
-    if _needs_liveness_recheck(record):
-        return _rechecked_worker_alive(record)
-    if _has_recorded_worker_identity(record):
-        ok, _ = goalflight_ledger.identity_matches(record)
-        return ok
-    pid = record.get("worker_pid")
-    if pid:
-        try:
-            return goalflight_compat.pid_alive(int(pid))
-        except (TypeError, ValueError):
-            return False
-    return False
+    return _wait_worker_liveness(record) == _WAIT_LIVENESS_CONFIRMED_ALIVE
 
 
 def _wait_record_pid(record: dict | None) -> int | None:
@@ -1430,8 +1441,35 @@ def _wait_snapshot(
     for dispatch_id in wait_ids:
         record = find_record(payload, dispatch_id)
         worker_alive: bool | None = None
+        progress: dict = {}
         if record is None:
             code = 2
+        elif _record_has_terminal_marker(record):
+            liveness, liveness_reason = _wait_worker_liveness_detail(record)
+            worker_alive = (
+                True
+                if liveness == _WAIT_LIVENESS_CONFIRMED_ALIVE
+                else False
+                if liveness == _WAIT_LIVENESS_CONFIRMED_DEAD
+                else None
+            )
+            if (
+                liveness == _WAIT_LIVENESS_CONFIRMED_DEAD
+                and liveness_reason.startswith("pid_reused_")
+            ):
+                progress = _wait_progress_detail(
+                    dispatch_id,
+                    record,
+                    now=now,
+                    progress_state=progress_state,
+                    cpu_epsilon=cpu_epsilon,
+                    worker_alive=False,
+                )
+                if _wait_output_is_active(progress, poll_s=poll_s):
+                    worker_alive = True
+                    progress["worker_alive"] = True
+                    progress["worker_alive_via_output"] = True
+            code = done_code(record, worker_alive=worker_alive)
         elif _needs_liveness_recheck(record):
             worker_alive = _rechecked_worker_alive(record)
             code = done_code(record, worker_alive=worker_alive)
@@ -1439,22 +1477,25 @@ def _wait_snapshot(
             code = done_code(record)
         terminal = code == 0
         state = _terminal_state(record, code=code)
+        if progress.get("worker_alive_via_output") and not terminal:
+            state = "running"
         confirmed_dead = False
         if code == 2:
             confirmed_dead = _wait_worker_confirmed_dead(record)
             worker_alive = not confirmed_dead
-        progress = (
-            {}
-            if terminal
-            else _wait_progress_detail(
-                dispatch_id,
-                record,
-                now=now,
-                progress_state=progress_state,
-                cpu_epsilon=cpu_epsilon,
-                worker_alive=worker_alive,
+        if not progress:
+            progress = (
+                {}
+                if terminal
+                else _wait_progress_detail(
+                    dispatch_id,
+                    record,
+                    now=now,
+                    progress_state=progress_state,
+                    cpu_epsilon=cpu_epsilon,
+                    worker_alive=worker_alive,
+                )
             )
-        )
         terminal_marker = None
         output_active = bool(
             code == 2

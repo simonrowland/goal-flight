@@ -95,10 +95,54 @@ def case_unconfirmed_liveness_keeps_the_marker_verdict() -> None:
         )
 
 
+def case_pid_only_live_process_is_indeterminate_and_marker_resolves() -> None:
+    """A live PID without identity may belong to an unrelated recycled process."""
+    with tempfile.TemporaryDirectory() as td:
+        record = _record_with_marker(Path(td), pid=os.getpid(), state="running")
+        assert_true(
+            "pid-only live process is indeterminate",
+            goalflight_status._wait_worker_liveness(record)
+            == goalflight_status._WAIT_LIVENESS_INDETERMINATE,
+        )
+        assert_true(
+            "pid-only indeterminate ownership does not suppress COMPLETE",
+            goalflight_status.done_code(record) == 0,
+        )
+
+
+def case_explicitly_indeterminate_identity_is_neither_alive_nor_dead() -> None:
+    record = {
+        "worker_pid": os.getpid(),
+        "worker_identity": {"creation_time": 123},
+    }
+    saved = goalflight_status.goalflight_ledger.identity_matches
+    goalflight_status.goalflight_ledger.identity_matches = (
+        lambda _record: (False, "identity_indeterminate")
+    )
+    try:
+        assert_true(
+            "explicitly indeterminate identity stays tri-state indeterminate",
+            goalflight_status._wait_worker_liveness(record)
+            == goalflight_status._WAIT_LIVENESS_INDETERMINATE,
+        )
+        assert_true(
+            "indeterminate identity is not confirmed alive",
+            not goalflight_status._wait_worker_confirmed_alive(record),
+        )
+        assert_true(
+            "indeterminate identity is not confirmed dead",
+            not goalflight_status._wait_worker_confirmed_dead(record),
+        )
+    finally:
+        goalflight_status.goalflight_ledger.identity_matches = saved
+
+
 def main() -> None:
     case_marker_does_not_beat_a_live_worker()
     case_marker_resolves_a_dead_worker()
     case_unconfirmed_liveness_keeps_the_marker_verdict()
+    case_pid_only_live_process_is_indeterminate_and_marker_resolves()
+    case_explicitly_indeterminate_identity_is_neither_alive_nor_dead()
     print("OK: wait marker-vs-liveness tests pass")
 
 

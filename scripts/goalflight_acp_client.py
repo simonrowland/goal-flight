@@ -1942,10 +1942,12 @@ class GoalflightClient(ClientBase):  # type: ignore[misc, valid-type]
         # boundary crossings; permission_escalations alone only records the
         # escalation half.
         self.permission_router_decisions: list[dict[str, Any]] = []
-        # A worker-marker USER-CONFIRM closes every non-read permission gate until
-        # the controller resolves it. The marker cannot name an ACP tool call, so
-        # fail closed across writes/execute/fetch/unknown kinds while safe reads
-        # and thinking may continue.
+        # A worker-marker USER-CONFIRM permanently closes every non-read
+        # permission gate on this ACP connection. The marker cannot name an ACP
+        # tool call, kind, or canonical target, so even a correlated yes records
+        # consent without authorizing a later request. Safe reads and thinking
+        # may continue; inline permission mode or a new explicitly authorized
+        # dispatch is the non-read path.
         self.user_confirm_guard = "none"
         self._user_confirm_marker_buffer = ""
         self._user_confirm_typed_updates_start = 0
@@ -2018,7 +2020,12 @@ class GoalflightClient(ClientBase):  # type: ignore[misc, valid-type]
             self._user_confirm_typed_updates_start = len(self.typed_updates)
 
     def set_user_confirm_guard(self, state: str) -> None:
-        self.user_confirm_guard = state if state in {"none", "pending", "denied"} else "pending"
+        next_state = state if state in {"none", "pending", "denied"} else "pending"
+        if self.user_confirm_guard == "denied":
+            return
+        if self.user_confirm_guard == "pending" and next_state == "none":
+            return
+        self.user_confirm_guard = next_state
 
     def _append_permission_router_decision(self, record: dict[str, Any]) -> None:
         self.permission_router_decisions.append(_compact_router_record(record))

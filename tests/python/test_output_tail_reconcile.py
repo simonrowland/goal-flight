@@ -118,6 +118,31 @@ def test_marker_followed_by_tldr_promotes_to_complete() -> None:
         )
 
 
+def test_fresh_identity_mismatch_marker_stays_unpromoted() -> None:
+    with tempfile.TemporaryDirectory(prefix="gf-recon-mismatch-") as d:
+        tail = Path(d) / "mismatch.tail"
+        tail.write_text("still running\nCOMPLETE: scraped too early\n", encoding="utf-8")
+        rec = _record_for(tail)
+        rec["classification"] = "watcher_stopped"
+        saved = ledger.identity_matches
+        ledger.identity_matches = lambda _rec: (False, "pid_reused_comm")
+        try:
+            out = status._reconcile_output_tail_record(rec)
+        finally:
+            ledger.identity_matches = saved
+
+    reconciliation = out.get("output_tail_reconciliation") or {}
+    assert_eq("fresh mismatch marker not promoted", reconciliation.get("promoted"), False)
+    assert_eq("fresh mismatch has no terminal signal", out.get("terminal_marker"), None)
+    assert_eq(
+        "fresh mismatch reason reaches output veto",
+        str(reconciliation.get("reason") or "").startswith(
+            "worker_identity_mismatch_tail_recent:pid_reused_comm:"
+        ),
+        True,
+    )
+
+
 def test_no_marker_stays_worker_dead() -> None:
     # Negative control: a genuinely-crashed tail with NO marker must NOT be
     # promoted (guards against the anywhere-scan over-promoting).
@@ -131,6 +156,7 @@ def test_no_marker_stays_worker_dead() -> None:
 def main() -> None:
     tests = [
         test_marker_followed_by_tldr_promotes_to_complete,
+        test_fresh_identity_mismatch_marker_stays_unpromoted,
         test_no_marker_stays_worker_dead,
         test_live_worker_unpromoted_tail_marker_is_not_terminal,
     ]

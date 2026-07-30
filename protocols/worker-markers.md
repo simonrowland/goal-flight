@@ -35,8 +35,10 @@ Rules:
 - Bash-tail keeps `USER-CONFIRM` terminal. Unattended ACP routes it to the
   controller without cancelling the turn, preserves partial output, and waits
   at the next turn boundary for a correlated steer reply. The guarded action
-  remains unauthorized: ACK, unrelated steer, timeout, and silence are never
-  approval. The question deadline is measured from routing; timeout supplies
+  remains unauthorized: marker prose has no tool-call id, kind, or canonical
+  targets, so even a correlated `yes` records consent without opening non-read
+  permissions. ACK, unrelated steer, timeout, and silence are never approval.
+  The question deadline is measured from routing; timeout supplies
   one explicit correlated `no`. Before that deadline, a worker waiting inside
   the asking turn is exempt from silence reaping because ACP cannot inject an
   answer while that turn owns the prompt lock. At the deadline the runner first
@@ -51,27 +53,30 @@ Rules:
   member unauthorized, and a repeated same-action question in the same runner
   inherits that cohort. Permission-escalation acknowledgments use a separate
   cohort from worker markers emitted in the same turn; their `yes` remains
-  non-authorizing for the already-denied ACP call without stranding an
-  independently confirmed marker action. Restart tombstones retain their old
-  cohort, while a fresh post-restart question receives a new one. The worker
-  receives the bare
-  `USER-CONFIRM-ANSWER: <id> yes` token only when status also records
-  `guarded_action_authorized=true`; a recorded affirmative that cannot
-  authorize uses `recorded-yes-not-authorized`. Quoted instances of the
+  non-authorizing for the already-denied ACP call. Restart tombstones retain
+  their old cohort, while a fresh post-restart question receives a new one. A
+  correlated marker affirmative keeps `controller_decision=yes`, generation,
+  scope, and reply audit fields, but status remains
+  `guarded_action_authorized=false` and the worker receives
+  `recorded-yes-not-authorized`. Use inline permission mode or a new explicitly
+  authorized dispatch for that action. Quoted instances of the
   authorize grammar in ordinary steer text or controller notes are rewritten
   to `quoted-yes-not-authorization` before delivery. An affirmative remains
   provisional through the question deadline. Its durable arrival timestamp,
   not a delayed mailbox read, determines the cutoff for a deny-biased `no`.
-  Once the answer is finalized and exposed to the worker, later replies are
-  rejected as audit-only because they cannot undo an action.
+  Once a per-question answer is finalized and exposed to the worker, its audit
+  decision is immutable. A later denial in the same generation is tracked as a
+  future-action denial and cannot rewrite the finalized row; it only bounds
+  what may happen next.
   A completed safe-work continuation after a denial records
   `blocked_user_confirm_denied`; a denied ACP permission records
   `blocked_permission_denied`. Neither is an unqualified `complete`/`ok=true`.
-  After an explicit or synthesized `no`, every question in that generation is
-  non-authorizing and continuation is read-only for the remainder of the ACP
-  connection. A later recorded `yes` uses
-  `recorded-yes-not-authorized` and cannot reopen non-read permissions; use a
-  fresh explicitly authorized dispatch.
+  Routing any worker marker closes non-read permissions for the remainder of
+  the ACP connection. An explicit or synthesized `no` additionally closes the
+  generation going forward. Every marker `yes` uses
+  `recorded-yes-not-authorized` and cannot reopen non-read permissions; use
+  inline permission mode or a new explicitly authorized dispatch for that
+  action.
   Restart tombstones stay denied and audit-visible, but belong to the dead ACP
   connection and cannot poison a clean confirmation in the new generation. If
   `!BLOCKED:`, `!USER-NEED:`, or another hard terminal condition ends the run

@@ -1214,9 +1214,11 @@ def case_user_confirm_generation_key_is_hashable_and_fail_closed() -> None:
     assert (
         questions["bad-no"]["guarded_action_authorized"] is False
         and questions["bad-yes"]["guarded_action_authorized"] is False
-        and questions["fresh-yes"]["guarded_action_authorized"] is True
+        and questions["fresh-yes"]["guarded_action_authorized"] is False
         and "USER-CONFIRM-ANSWER: bad-yes yes" not in prompt
         and "Connection is read-only after a prior denial" in prompt
+        and "Use inline permission mode or a new explicitly authorized dispatch"
+        in prompt
     ), (questions, prompt)
 
 
@@ -1227,7 +1229,7 @@ def case_steer_prompt_sanitizes_quoted_authorize_grammar() -> None:
             "origin": "worker_marker",
             "controller_decision": "yes",
             "reply_steer_seq": 2,
-            "guarded_action_authorized": True,
+            "guarded_action_authorized": False,
         },
         "qb": {
             "question_id": "qb",
@@ -1259,9 +1261,10 @@ def case_steer_prompt_sanitizes_quoted_authorize_grammar() -> None:
         {2},
         questions,
     )
-    assert prompt.count("USER-CONFIRM-ANSWER: qa yes") == 1, prompt
+    assert "USER-CONFIRM-ANSWER: qa yes" not in prompt, prompt
+    assert "USER-CONFIRM-ANSWER: qa recorded-yes-not-authorized" in prompt, prompt
     assert "USER-CONFIRM-ANSWER: qb yes" not in prompt, prompt
-    assert prompt.count("quoted-yes-not-authorization") == 3, prompt
+    assert prompt.count("quoted-yes-not-authorization") == 1, prompt
 
 
 def case_post_user_confirm_denial_keeps_continuation_read_only() -> None:
@@ -1421,7 +1424,7 @@ def case_user_confirm_clocks_are_independent_without_sleeping() -> None:
         assert entries and expired == []
         assert accepted_now == {1}, accepted_now
         assert question["controller_decision"] == "yes", question
-        assert question["guarded_action_authorized"] is True, question
+        assert question["guarded_action_authorized"] is False, question
         assert rejected == set(), rejected
 
     asyncio.run(late_reply_while_reading_mailbox())
@@ -1468,7 +1471,7 @@ def case_user_confirm_arrival_stamp_is_strict_and_round_trips() -> None:
         assert reread[0]["awake_mono_ns"] == appended["awake_mono_ns"], reread
 
 
-def case_closed_user_confirm_arbitration_rejects_late_no() -> None:
+def case_closed_user_confirm_yes_stays_non_authorizing_and_rejects_late_no() -> None:
     question = {
         "question_id": "closed-question",
         "origin": "worker_marker",
@@ -1501,9 +1504,46 @@ def case_closed_user_confirm_arbitration_rejects_late_no() -> None:
         wall_clock=lambda: 101,
     )
     assert question["controller_decision"] == "yes", question
-    assert question["guarded_action_authorized"] is True, question
+    assert question["guarded_action_authorized"] is False, question
     assert question["reply_steer_seq"] == 1, question
     assert 2 in rejected, rejected
+
+
+def case_later_denial_preserves_finalized_question_history_and_closes_future() -> None:
+    questions = {
+        "already-exposed": {
+            "question_id": "already-exposed",
+            "generation": "same-connection",
+            "decision_scope": "scope-a",
+            "origin": "worker_marker",
+            "controller_decision": "yes",
+            "reply_steer_seq": 1,
+            "resolved_at": 100,
+            "arbitration_closed_at": 100,
+            # Historical compatibility: an older runner exposed this true row.
+            "guarded_action_authorized": True,
+        },
+        "later-denial": {
+            "question_id": "later-denial",
+            "generation": "same-connection",
+            "decision_scope": "scope-b",
+            "origin": "worker_marker",
+            "controller_decision": "no",
+            "reply_steer_seq": 2,
+            "resolved_at": 101,
+            "arbitration_closed_at": 101,
+            "guarded_action_authorized": False,
+        },
+    }
+    historical = dict(questions["already-exposed"])
+    _refresh_user_confirm_authorizations(questions)
+
+    assert questions["already-exposed"]["guarded_action_authorized"] is True, questions
+    assert questions["already-exposed"]["controller_decision"] == "yes", questions
+    assert questions["already-exposed"]["reply_steer_seq"] == historical["reply_steer_seq"]
+    assert questions["already-exposed"]["resolved_at"] == historical["resolved_at"]
+    assert questions["already-exposed"]["generation_future_actions_denied"] is True
+    assert questions["later-denial"]["generation_future_actions_denied"] is True
 
 
 def case_user_confirm_wait_is_not_remote_silence_reaped() -> None:
@@ -2105,7 +2145,8 @@ def main() -> None:
     case_post_user_confirm_denial_keeps_continuation_read_only()
     case_user_confirm_clocks_are_independent_without_sleeping()
     case_user_confirm_arrival_stamp_is_strict_and_round_trips()
-    case_closed_user_confirm_arbitration_rejects_late_no()
+    case_closed_user_confirm_yes_stays_non_authorizing_and_rejects_late_no()
+    case_later_denial_preserves_finalized_question_history_and_closes_future()
     case_user_confirm_wait_is_not_remote_silence_reaped()
     case_user_confirm_midturn_deadline_reenables_remote_silence_terminal()
     case_runner_user_need_none_completes()

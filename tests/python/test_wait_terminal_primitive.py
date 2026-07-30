@@ -153,10 +153,26 @@ def test_live_but_ambiguous_worker_is_not_killed() -> None:
         compat.pid_alive = saved  # type: ignore[assignment]
 
 
-def test_identity_mismatch_with_growing_tail_vetoes_worker_dead() -> None:
+def test_identity_mismatch_with_marker_and_growing_tail_vetoes_terminal() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         tail = Path(tmp) / "worker.tail"
+        status_path = Path(tmp) / "worker.status.json"
         tail.write_text("started\n", encoding="utf-8")
+        status_path.write_text(
+            json.dumps(
+                {
+                    "dispatch_id": "identity-mismatch-growing",
+                    "state": "running",
+                    "worker_pid": 4242,
+                    "terminal_marker": {
+                        "kind": "COMPLETE",
+                        "text": "scraped too early",
+                        "line": 1,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
         rec = {
             "dispatch_id": "identity-mismatch-growing",
             "classification": "unknown",
@@ -167,6 +183,7 @@ def test_identity_mismatch_with_growing_tail_vetoes_worker_dead() -> None:
                 "comm": "sh",
             },
             "tail_path": str(tail),
+            "status_path": str(status_path),
         }
         payload = _payload(rec)
         saved_identity_matches = status.goalflight_ledger.identity_matches
@@ -194,6 +211,7 @@ def test_identity_mismatch_with_growing_tail_vetoes_worker_dead() -> None:
             )
             assert_eq("growing mismatch stays non-terminal", row["terminal"], False)
             assert_eq("growing mismatch reports running", row["state"], "running")
+            assert_eq("growing mismatch marker reports live done code", row["done_code"], 1)
             assert_eq("growing mismatch reports alive via output", row["progress"]["worker_alive"], True)
             assert_true("growing mismatch does not arm death", rec["dispatch_id"] not in dead_since)
         finally:
@@ -724,7 +742,7 @@ def main() -> None:
         test_crashed_worker_resolves_worker_dead_after_grace_not_before,
         test_stale_dead_with_dead_pid_resolves_worker_dead,
         test_live_but_ambiguous_worker_is_not_killed,
-        test_identity_mismatch_with_growing_tail_vetoes_worker_dead,
+        test_identity_mismatch_with_marker_and_growing_tail_vetoes_terminal,
         test_identity_mismatch_with_quiet_tail_still_resolves_worker_dead,
         test_dead_quiet_worker_with_success_marker_completes,
         test_wedged_alive_worker_resolves_worker_stalled_after_stale_grace,

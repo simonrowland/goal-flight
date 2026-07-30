@@ -330,6 +330,11 @@ def handle_prompt(req_id: int, params: dict) -> None:
 
         prompt = prompt_text(params)
         decision = "yes" if AUTHORIZE_TOKEN.search(prompt) else "no"
+        marker_redirect_seen = (
+            "Use inline permission mode or a new explicitly authorized dispatch "
+            "for that action."
+            in prompt
+        )
         if SCENARIO == "user_confirm_later_after_no" and turn == 2:
             text_update(session_id, "RESULT: independent_work=preserved_after_denial\n")
             text_update(
@@ -363,7 +368,10 @@ def handle_prompt(req_id: int, params: dict) -> None:
                     }
                 ],
             )
-            action_authorized = action_authorized and bool(selected)
+            # Model an unrelated action B arriving after marker question A. The
+            # permission plane, not the worker's prose-token discipline, must
+            # keep this tool call closed.
+            action_authorized = bool(selected)
             text_update(
                 session_id,
                 (
@@ -387,7 +395,10 @@ def handle_prompt(req_id: int, params: dict) -> None:
                     }
                 ],
             )
-            action_authorized = action_authorized and bool(selected)
+            # Model an unrelated action B arriving after marker question A. The
+            # permission plane, not the worker's prose-token discipline, must
+            # keep this tool call closed.
+            action_authorized = bool(selected)
             read_only_reason_seen = (
                 "Connection is read-only after a prior denial" in prompt
             )
@@ -400,11 +411,7 @@ def handle_prompt(req_id: int, params: dict) -> None:
                     f"permission_selected={str(bool(selected)).lower()}\n"
                 ),
             )
-        elif (
-            action_authorized
-            and os.environ.get("GOALFLIGHT_FAKE_ACP_REQUEST_GUARDED_PERMISSION")
-            == "1"
-        ):
+        elif os.environ.get("GOALFLIGHT_FAKE_ACP_REQUEST_GUARDED_PERMISSION") == "1":
             selected = request_permission(
                 session_id,
                 "guarded-after-confirm",
@@ -420,6 +427,9 @@ def handle_prompt(req_id: int, params: dict) -> None:
                     }
                 ],
             )
+            # Model an unrelated action B arriving after marker question A. The
+            # permission plane, not the worker's prose-token discipline, must
+            # keep this tool call closed.
             action_authorized = bool(selected)
         if action_authorized and guarded_file:
             with open(guarded_file, "w", encoding="utf-8") as f:
@@ -429,6 +439,10 @@ def handle_prompt(req_id: int, params: dict) -> None:
                 seq = line.split(":", 1)[0].strip()
                 text_update(session_id, f"STEER-ACK: {seq}\n")
                 break
+        text_update(
+            session_id,
+            f"RESULT: marker_redirect_seen={str(marker_redirect_seen).lower()}\n",
+        )
         text_update(
             session_id,
             f"RESULT: guarded_action_taken={str(action_authorized).lower()}\n",
