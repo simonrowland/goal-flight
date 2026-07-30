@@ -62,12 +62,36 @@ surface REAL blockers → routing table → grouped fixes → serial integrator`
   foreground controller can be reaped by `cleanup_ghosts` / release-stale once
   that controller exits — see the D007/D008 class. Detached dispatch and
   out-of-session launch avoid that failure mode.
-- **codex workers: context-mode is now OFF by default** (goal-flight passes
-  `-c mcp_servers.context-mode.enabled=false` to dispatched `codex exec`, and defaults codex-acp's
-  posture off too; opt back in with `GOALFLIGHT_CODEX_CONTEXT_MODE=enabled`). This removes the
-  exec-mode elicitation wedge at the source. The old "do NOT use context-mode / ctx_* tools"
-  brief line is now belt-and-suspenders (for opted-in or externally-launched codex workers); or
-  route to a non-wedging engine.
+- **codex AND cursor workers: context-mode is OFF by default.** Two engines, two
+  different failure modes, one posture.
+  - **codex** — goal-flight passes `-c mcp_servers.context-mode.enabled=false` to
+    dispatched `codex exec` and defaults codex-acp's posture off. `exec` cannot
+    answer context-mode's elicitation, so the worker wedges. Opt back in with
+    `GOALFLIGHT_CODEX_CONTEXT_MODE=enabled`.
+  - **cursor** — same posture, different mechanism. Cursor routes tool calls
+    through an automatic reviewer that refuses the ctx tools; the worker reports
+    "The MCP batch tool was refused", retries, and burns its entire event budget
+    (`runaway_event_cap`, nothing written). Opt back in with
+    `GOALFLIGHT_CURSOR_CONTEXT_MODE=enabled`.
+
+  Cursor was previously left ON here, which is why cursor workers wedged where
+  codex workers did not. Until this landed the only remedy was
+  `cursor-agent mcp disable context-mode` **per project** — cursor's own disable
+  is project-scoped, so it did not carry to the next checkout and each repo
+  silently re-acquired the fault.
+
+  **Cursor also honours `~/.cursor/hooks.json`.** A `preToolUse` hook matching
+  `Shell` intercepts every command a worker runs, and a context-mode hook there
+  refuses them regardless of the MCP posture above. Disabling the MCP server is
+  not sufficient on its own; the hook must be detached too. That file is
+  machine-local operator config — goal-flight does not and should not rewrite it.
+
+  `grok-acp` keeps context-mode enabled: no wedge has been observed there, and
+  disabling it for an engine that tolerates it removes capability for nothing.
+
+  The old "do NOT use context-mode / ctx_* tools" brief line is now
+  belt-and-suspenders (for opted-in or externally-launched workers); or route to
+  a non-wedging engine.
 - **codex workers: codedb is the SAFE search swap-in** (registered ON by default at install via
   `scripts/register-codedb-codex.py`; opt out with `GOALFLIGHT_CODEX_CODEDB=0`). codedb is
   read-only indexed code-intelligence (`symbol`/`find`/`search`/`callers`/`deps`/`context`) and,

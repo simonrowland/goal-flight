@@ -74,14 +74,43 @@ def test_acp_default_off_for_codex_only() -> None:
             "grok-acp default enabled",
             D._acp_context_mode_default(argparse.Namespace(agent="grok-acp")) == "enabled",
         )
+        # Cursor is OFF by default, for a different reason than codex. Codex
+        # wedges because `exec` cannot answer context-mode's elicitation; cursor
+        # routes tool calls through an automatic reviewer that REFUSES the ctx
+        # tools, and the worker loops on the refusal until it hits the event cap
+        # with nothing written. Observed live: "The MCP batch tool was refused",
+        # then runaway_event_cap.
+        #
+        # This assertion previously required "enabled", which is why cursor
+        # workers wedged where codex workers did not, and why the only remedy
+        # was `cursor-agent mcp disable` per project -- cursor's own disable is
+        # project-scoped and does not carry to the next checkout.
         assert_true(
-            "cursor default enabled",
-            D._acp_context_mode_default(argparse.Namespace(agent="cursor")) == "enabled",
+            "cursor default disabled",
+            D._acp_context_mode_default(argparse.Namespace(agent="cursor")) == "disabled",
+        )
+        assert_true(
+            "cursor-agent alias default disabled",
+            D._acp_context_mode_default(argparse.Namespace(agent="cursor-agent")) == "disabled",
         )
     with env("GOALFLIGHT_CODEX_CONTEXT_MODE", "enabled"):
         assert_true(
             "codex-acp opt-in enabled",
             D._acp_context_mode_default(argparse.Namespace(agent="codex-acp")) == "enabled",
+        )
+        # The codex opt-in must not reach across engines.
+        assert_true(
+            "codex opt-in does not enable cursor",
+            D._acp_context_mode_default(argparse.Namespace(agent="cursor")) == "disabled",
+        )
+    with env("GOALFLIGHT_CURSOR_CONTEXT_MODE", "enabled"):
+        assert_true(
+            "cursor opt-in enabled",
+            D._acp_context_mode_default(argparse.Namespace(agent="cursor")) == "enabled",
+        )
+        assert_true(
+            "cursor opt-in does not enable codex-acp",
+            D._acp_context_mode_default(argparse.Namespace(agent="codex-acp")) == "disabled",
         )
 
 

@@ -218,12 +218,10 @@
     "dispatch_presets": {
       "grok-code": {
         "transport": "cli",
-        "default_model": "grok-4.5",
-        "notes": "Default flagged to grok-4.5 (2026-07-08, user directive); grok-composer-2.5-fast is the coding-specialised model, reachable via explicit --model."
+        "notes": "No model id is pinned: the preset passes no --model so grok's CLI serves its own current flagship, and a new one is picked up without a code or manifest change. Do not reintroduce a pin here -- a pinned id goes stale the week the next model ships, and a controller reading this note as a default is how a retired id gets re-adopted. Specific models (grok-composer-2.5-fast for coding, and any current id) stay reachable via an explicit --model on the dispatch."
       },
       "grok-research": {
         "transport": "cli",
-        "default_model": "grok-4.5",
         "web_search": "enabled_by_default",
         "notes": "Research/search worker; CLI has --disable-web-search only (no enable flag)."
       }

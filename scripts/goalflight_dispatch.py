@@ -435,8 +435,12 @@ READ_ONLY_WRITE_PROMPT_PATTERNS = (
 # Web-research intent on a grok-code dispatch (B5c-style teaching guard).
 # grok-code runs the composer CODING model, which reliably fails web_fetch /
 # returns thin web results (observed live 2026-06-09: a research dispatch
-# tool_output_error'd repeatedly); grok-research runs grok-build, the web
-# model. Precision-first: signals are explicit web-research phrasings; bare
+# tool_output_error'd repeatedly); grok-research is the web-capable lane.
+# NB: neither preset pins a model id any more -- both run grok's own current
+# default so a new flagship is picked up without a code change. The retired
+# pins (grok-build for research, grok-composer-2.5-fast for coding) survive
+# only as history below; do not reintroduce one, and do not read this comment
+# as naming a default. Precision-first: signals are explicit web-research phrasings; bare
 # URLs and the word "research" alone must NOT trigger (code prompts cite repo
 # links; "research the codebase" is repo reading). Suppressors win.
 # Verb-led, live-action phrasings ONLY (review round 1 found 16+ coding false
@@ -7825,11 +7829,39 @@ def _codex_context_mode_enabled() -> bool:
     return raw in {"1", "true", "yes", "enabled", "on"}
 
 
+def _cursor_context_mode_enabled() -> bool:
+    """Whether a dispatched cursor worker should load the context-mode MCP server.
+
+    Default OFF, for the same reason as codex but a different mechanism. Cursor
+    routes tool calls through an automatic reviewer that refuses the ctx tools;
+    the worker reports "The MCP batch tool was refused", retries, and burns its
+    whole event budget -- observed as runaway_event_cap with nothing written.
+    Headless workers do not need it. Opt back in with
+    GOALFLIGHT_CURSOR_CONTEXT_MODE in {1,true,yes,enabled,on}.
+    """
+    raw = os.environ.get("GOALFLIGHT_CURSOR_CONTEXT_MODE", "").strip().lower()
+    return raw in {"1", "true", "yes", "enabled", "on"}
+
+
 def _acp_context_mode_default(args) -> str:
-    """codex-acp shares the exec-mode elicitation wedge risk, so default its
-    context-mode posture OFF (opt back in via GOALFLIGHT_CODEX_CONTEXT_MODE).
-    Other acp engines (grok-acp, cursor) keep context-mode enabled."""
-    agent = str(getattr(args, "agent", ""))
+    """Per-worker context-mode posture for acp engines.
+
+    codex-acp: OFF -- exec-mode cannot answer context-mode's elicitation, so the
+    worker wedges (opt in via GOALFLIGHT_CODEX_CONTEXT_MODE).
+
+    cursor: OFF -- its command reviewer refuses the ctx tools and the worker
+    loops on the refusal to the event cap (opt in via
+    GOALFLIGHT_CURSOR_CONTEXT_MODE). This was previously left ON, which is why
+    cursor workers wedged where codex workers did not, and why the only remedy
+    was disabling the server by hand -- per project, since cursor's own disable
+    is project-scoped and does not carry to the next checkout.
+
+    grok-acp keeps it enabled: no wedge has been observed there, and turning it
+    off for an engine that tolerates it would remove capability for no reason.
+    """
+    agent = str(getattr(args, "agent", "")).strip().lower()
+    if agent in CURSOR_AGENTS and not _cursor_context_mode_enabled():
+        return "disabled"
     if agent.startswith("codex") and not _codex_context_mode_enabled():
         return "disabled"
     return "enabled"
