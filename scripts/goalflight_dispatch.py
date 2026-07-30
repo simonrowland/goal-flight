@@ -475,6 +475,35 @@ PROMPT_FILE_PREAMBLE = (
     "iteration, and before final commit/exit; the disk file is authoritative over "
     "summarized memory."
 )
+# Cursor's CLI auto-reviews shell commands. Reading the prompt-file env var is
+# one of the commands it escalates, and an unattended dispatch has nobody to
+# approve it -- so the generic instruction above ("re-read $GOALFLIGHT_PROMPT_FILE")
+# is unfollowable there. Workers obeyed it, retried the refusal, and burned the
+# whole ACP event budget: observed twice, killed at the cap with nothing written.
+# Give that lane an instruction it can actually follow.
+CURSOR_PROMPT_FILE_PREAMBLE = (
+    "Your FULL original brief is delivered inline above; treat it as authoritative "
+    "and re-read it there after any internal compaction/summarization.\n"
+    "- Do NOT shell out for the brief. `$GOALFLIGHT_PROMPT_FILE` and other dispatch "
+    "environment variables are not readable from your shell on this transport: "
+    "`echo`, `printf`, `cat` and `ls` against them are escalated for approval, and "
+    "in an unattended run nobody is watching to approve it."
+)
+CURSOR_TOOLING_PREAMBLE = (
+    "Tooling on this transport:\n"
+    "- Shell commands pass through an automatic reviewer. Simple single commands "
+    "(`ls -1`, `python3 -c '...'`) generally run; pipelines and some common "
+    "utilities (`cat`, `echo`, anything with `|`) are frequently rejected, sometimes "
+    "with no reason given.\n"
+    "- Prefer your native file-read, search and list tools over shell equivalents. "
+    "Use `python3 -c '...'` when you genuinely need computation such as counting or "
+    "parsing; it is reliable and is the best escape hatch.\n"
+    "- NEVER retry a rejected command in a loop. Looping on a refusal is the most "
+    "common way a run on this transport dies: it exhausts the event budget and the "
+    "run is killed with nothing to show, even when the task was easy. Take the "
+    "refusal as final, use a different tool, or emit `!BLOCKED: <what was refused>` "
+    "and stop."
+)
 PROJECT_ORIENTATION_RELATIVE = Path("docs-private") / "rag" / "ORIENTATION.md"
 PROJECT_ORIENTATION_SCOPE_RULE = "Read it before starting; orientation only, never scope expansion."
 WORKER_EXECUTION_PREAMBLE = (
@@ -2501,10 +2530,23 @@ def _cmd_resume(argv: list[str]) -> int:
     return main(launch_argv)
 
 
+CURSOR_AGENTS = {"cursor", "cursor-agent"}
+
+
 def _worker_prompt_preamble(agent: str | None, *, orientation_path: Path | None = None) -> str:
-    preambles = [STEER_PROMPT_PREAMBLE, PROMPT_FILE_PREAMBLE]
+    is_cursor = agent in CURSOR_AGENTS
+    preambles = [
+        STEER_PROMPT_PREAMBLE,
+        CURSOR_PROMPT_FILE_PREAMBLE if is_cursor else PROMPT_FILE_PREAMBLE,
+    ]
     if orientation_path is not None:
         preambles.append(_project_orientation_preamble(orientation_path))
+    if is_cursor:
+        preambles.append(CURSOR_TOOLING_PREAMBLE)
+    # Execution contract goes to the bash-tail agents only. ACP transports
+    # (cursor, codex-acp, claude-acp) carry terminal state in the protocol, so
+    # they do not need to be taught a text marker shape -- see
+    # test_dispatch_steer.case_preamble_routing_matrix, which pins that split.
     if agent in {"grok-code", "grok-research", "kimi"}:
         preambles.append(WORKER_EXECUTION_PREAMBLE)
     return "\n\n".join(preambles)

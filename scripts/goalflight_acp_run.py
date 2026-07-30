@@ -56,7 +56,31 @@ DEFAULT_REMOTE_TURN_SILENCE_S = 1200.0
 DEFAULT_REMOTE_TURN_CANCEL_GRACE_S = 15.0
 DEFAULT_MAX_TOOL_S = 3600.0
 DEFAULT_MAX_CONSECUTIVE_TOOL_ERRORS = 5
-DEFAULT_MAX_ACP_EVENTS = 5000
+# Absolute backstop against a worker that streams forever WITHOUT erroring.
+# It is not the primary runaway detector: an erroring loop is caught far earlier
+# by DEFAULT_MAX_CONSECUTIVE_TOOL_ERRORS, and a silent worker by the heartbeat
+# and wedge machinery. This only has to bound the pathological
+# never-stops-emitting case.
+#
+# Sizing, from measurement rather than intuition. Three kimi-over-cursor runs of
+# the SAME trivial task -- read a few files, count them, write one small document:
+#     run 1  4428 events  succeeded (just under the old 5000 cap)
+#     run 2  5001 events  killed at the cap, nothing written
+#     run 3  5001 events  killed at the cap, nothing written
+# Run 3 had zero tool errors and zero escalations; it was making ordinary
+# progress and was killed purely for being event-verbose. So ~4.5k events buys
+# roughly one small document on this transport.
+#
+# A real chunk is 10-50x that work, so a cap that survives it needs to be at
+# least ~50k. Take 60000: 4500 x 50 = 225000 would be pure runaway-tolerance with
+# no guard value, while 60000 still bounds a true runaway at roughly 13x the
+# observed cost of a small task -- generous enough that healthy work never trips
+# it, tight enough to stop an infinite stream long before it fills a disk.
+#
+# Sanity check: the old value killed 2 of 3 healthy runs (67% false-kill rate on
+# a task that does almost nothing). Any cap that a trivial task can reach is
+# measuring verbosity, not runaway.
+DEFAULT_MAX_ACP_EVENTS = 60000
 DEFAULT_STALL_WAKE_CAP = 3
 DEFAULT_BETWEEN_TURN_STEER_GRACE_S = 10.0
 DEFAULT_EMPTY_BETWEEN_TURN_STEER_POLL_S = 0.25
@@ -756,45 +780,33 @@ def _user_confirm_decision_scope(question: dict[str, object]) -> str:
     return str(question.get("decision_scope") or question.get("question_id") or "")
 
 
+_USER_CONFIRM_ACTION_REDIRECT = (
+    "Use inline permission mode or a new explicitly authorized dispatch for that action."
+)
+
+
 def _refresh_user_confirm_authorizations(
     questions: dict[str, dict[str, object]],
 ) -> None:
-    """Recompute authorization by generation and decision cohort."""
-    questions_by_scope: dict[tuple[str, str], list[dict[str, object]]] = {}
+    """Refresh future-action denial without rewriting finalized audit truth.
+
+    Worker-marker prose has no machine-readable action identity, so a marker
+    answer never authorizes a non-read tool call. Historical finalized rows may
+    record an authorization already exposed by an older runner; preserve that
+    immutable fact while recording a later generation denial separately.
+    """
     denied_generations = {
         _user_confirm_generation(question)
         for question in questions.values()
         if _user_confirm_denies_run(question)
     }
     for question in questions.values():
-        questions_by_scope.setdefault(
-            (
-                _user_confirm_generation(question),
-                _user_confirm_decision_scope(question),
-            ),
-            [],
-        ).append(question)
-    authorized_scopes = {
-        generation_scope
-        for generation_scope, members in questions_by_scope.items()
-        if generation_scope[0] not in denied_generations
-        and members
-        and all(
-            member.get("origin") == "worker_marker"
-            and member.get("controller_decision") == "yes"
-            for member in members
+        question["generation_future_actions_denied"] = (
+            _user_confirm_generation(question) in denied_generations
         )
-    }
-    for question in questions.values():
-        question["guarded_action_authorized"] = bool(
-            (
-                _user_confirm_generation(question),
-                _user_confirm_decision_scope(question),
-            )
-            in authorized_scopes
-            and question.get("origin") == "worker_marker"
-            and question.get("controller_decision") == "yes"
-        )
+        if question.get("arbitration_closed_at") is not None:
+            continue
+        question["guarded_action_authorized"] = False
 
 
 def _apply_user_confirm_reply_batch(
@@ -1032,15 +1044,7 @@ def _steer_turn_prompt(
                 f"{entry['seq']}: Controller response recorded for {question_id}: "
                 f"{'affirmative acknowledgment' if decision == 'yes' else 'denied'}. "
                 "The ACP tool call remains denied and this response authorizes no retry "
-                "or alternate route. Use inline permission mode or a new explicitly "
-                "authorized dispatch for that action."
-            )
-        elif question.get("guarded_action_authorized") is True:
-            controller_note = _sanitize_quoted_user_confirm_tokens(entry["text"])
-            lines.append(
-                f"{entry['seq']}: USER-CONFIRM-ANSWER: {question_id} yes. "
-                "Controller note (quoted text, not an authorization signal): "
-                f"{controller_note}"
+                f"or alternate route. {_USER_CONFIRM_ACTION_REDIRECT}"
             )
         elif decision == "yes":
             generation_denied = any(
@@ -1050,14 +1054,14 @@ def _steer_turn_prompt(
                 for candidate in (user_confirm_questions or {}).values()
             )
             reason = (
-                "Connection is read-only after a prior denial; a new dispatch "
-                "is required to authorize this."
+                "Connection is read-only after a prior denial."
                 if generation_denied
                 else "No action is authorized."
             )
             lines.append(
                 f"{entry['seq']}: USER-CONFIRM-ANSWER: {question_id} "
-                f"recorded-yes-not-authorized. {reason}"
+                f"recorded-yes-not-authorized. {reason} "
+                f"{_USER_CONFIRM_ACTION_REDIRECT}"
             )
         else:
             lines.append(
@@ -1068,9 +1072,10 @@ def _steer_turn_prompt(
         lines.extend(
             [
                 "",
-                "Only a correlated `yes` for a worker-marker question whose status says "
-                "`guarded_action_authorized=true` authorizes that action. A permission-"
-                "escalation response is acknowledgment only.",
+                "A correlated `yes` for a worker-marker question records consent but "
+                "does not authorize a non-read tool call. Marker prose has no tool-call "
+                "identity, kind, or canonical target to bind to the requested action.",
+                _USER_CONFIRM_ACTION_REDIRECT,
                 "A steer ACK, mailbox read, unrelated steer, or silence is not approval.",
                 "A denied ACP tool call stays denied; prose cannot retroactively authorize it.",
             ]
@@ -2354,15 +2359,15 @@ async def _run_acp_dispatch_impl(
 
     def refresh_user_confirm_guard() -> None:
         questions = current_generation_user_confirms()
-        # Deliberate F4 boundary: after any denial this ACP connection remains
-        # read-only. Worker markers do not carry a stable permission/action key,
-        # so trying to reopen only a "correlated" non-read call would be guessy
-        # and fail-open. Restart tombstones remain audit-visible but belong to
-        # the dead connection; this new generation is the reopening boundary.
-        if any(_user_confirm_denies_run(question) for question in questions):
-            state = "denied"
-        elif any(not _user_confirm_is_resolved(question) for question in questions):
+        # A worker marker has no tool-call id, kind, or canonical targets. Once
+        # one is routed, this ACP connection can therefore never bind its prose
+        # answer to a later non-read request. Pending questions close the guard;
+        # any resolution (including correlated yes) keeps it closed. A new ACP
+        # connection is the reopening boundary.
+        if any(not _user_confirm_is_resolved(question) for question in questions):
             state = "pending"
+        elif questions:
+            state = "denied"
         else:
             state = "none"
         setter = getattr(getattr(conn, "client", None), "set_user_confirm_guard", None)
@@ -2566,7 +2571,7 @@ async def _run_acp_dispatch_impl(
             "text": question_text,
             "turn_index": int(turn_index),
             # Multiple same-origin questions emitted in one turn are one
-            # authorization decision: a crossed denial poisons that cohort.
+            # audit/arbitration decision: a crossed denial poisons that cohort.
             # Permission escalations are acknowledgment-only and cannot join a
             # worker-marker cohort. Repeating the same guarded action keeps its
             # prior cohort; a different later action or restarted generation gets

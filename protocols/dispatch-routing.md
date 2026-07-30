@@ -88,17 +88,22 @@ Right-size the shape — three loop failure modes to avoid:
   `USER-CONFIRM-ANSWER: <question_id> yes|no <optional note>` in
   `goalflight_dispatch.py steer`. The `<question_id>` must match an outstanding
   mailbox question exactly; unknown, stale, and duplicate replies are delivered
-  only as explicit non-authorization notices. The bare
-  `USER-CONFIRM-ANSWER: <question_id> yes` worker token is emitted only when
-  `guarded_action_authorized=true`; a recorded affirmative in a deny-biased
-  cohort uses `recorded-yes-not-authorized` instead. Quoted copies of the
+  only as explicit non-authorization notices. A marker affirmative records
+  `controller_decision=yes` and keeps its generation/scope audit fields, but
+  marker prose has no tool-call id, kind, or canonical target and therefore
+  cannot authorize a later non-read request. Status remains
+  `guarded_action_authorized=false`, and worker delivery uses
+  `recorded-yes-not-authorized` plus the inline-permission/new-dispatch
+  instruction. Quoted copies of the
   authorize grammar in ordinary steer text or controller notes are rewritten
   to `quoted-yes-not-authorization` before worker delivery. An affirmative remains
   provisional through the question's arbitration deadline. Mailbox rows carry
   durable awake-monotonic arrival timestamps: only a `yes` proven written by
   the deadline participates, while any `no` remains deny-biased.
-  After a finalized answer is exposed to the worker, later replies are rejected
-  as audit-only because they cannot undo an action. Unanswered questions have a
+  After a finalized per-question answer is exposed to the worker, its audit
+  decision is immutable and later replies to it are rejected as audit-only.
+  A distinct later denial is tracked as a generation-wide future-action bound;
+  it does not rewrite the earlier row. Unanswered questions have a
   600-awake-second deadline by default and fail closed to correlated `no`.
   If the worker keeps its current ACP turn open to wait, the harness exempts
   quiet only until that deadline. On expiry it first reconciles a correlated,
@@ -106,11 +111,12 @@ Right-size the shape — three loop failure modes to avoid:
   `user_confirm_overdue=true` and denies. Either settlement re-enables ordinary
   silence/wedge detection, so a turn that never releases the session lock
   terminates detectably.
-  Questions in one same-origin decision cohort fail closed together. An explicit
-  or synthesized `no` makes every question in that generation non-authorizing
-  and keeps the ACP connection read-only; a later recorded `yes` is delivered as
-  `recorded-yes-not-authorized` with a fresh-dispatch instruction and does not
-  reopen non-read permission routing. Historical restart tombstones stay
+  Questions in one same-origin decision cohort fail closed together. Routing
+  any marker closes non-read permissions for the remainder of that ACP
+  connection. An explicit or synthesized `no` also bounds every later action in
+  that generation; every recorded marker `yes` is delivered as
+  `recorded-yes-not-authorized` with the inline-permission/new-dispatch
+  instruction and does not reopen non-read permission routing. Historical restart tombstones stay
   audit-visible but do not poison the fresh connection or its terminal
   qualification. If another hard terminal condition ends the run first, every
   still-open question is recorded as denied while the
