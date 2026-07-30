@@ -89,6 +89,38 @@ BARE_TERMINAL_MARKER_RE = re.compile(
 )
 HARNESS_HOOK_TRAILER_LINES = frozenset({"hook: Stop", "hook: Stop Completed"})
 HARNESS_TOKEN_COUNT_RE = re.compile(r"^\d{1,3}(?:,\d{3})*$|^\d+$")
+# Session-resume footer some agent CLIs print AFTER the worker's own final line,
+# e.g. "To resume this session: kimi -r session_<id>". The worker emitted its
+# terminal marker correctly; the CLI then appended a line of its own, so the
+# marker was no longer last and the live watcher scored a finished worker as
+# dead. Observed repeatedly on kimi/cursor dispatches, each needing manual
+# salvage of work that was already complete and staged.
+HARNESS_RESUME_FOOTER_RE = re.compile(
+    r"^(?:to\s+)?(?:resume|continue)\s+(?:this\s+)?session\s*:",
+    re.IGNORECASE,
+)
+
+
+def _task_breadcrumb_error_is_missing_item(error: object) -> bool:
+    """True when the breadcrumb failed only because the task id is not in the store.
+
+    Distinguishes a bad dispatch input (a task id this repo does not have) from a
+    broken store (corrupt or unwritable). Only the former leaves the worker's
+    verdict intact; anything unrecognised is treated as the latter, so an
+    unfamiliar error still blocks.
+    """
+    if not isinstance(error, dict):
+        return False
+    message = str(error.get("message") or "").lower()
+    return "item not found" in message
+
+
+def _is_harness_trailer_line(stripped: str) -> bool:
+    """A line the AGENT CLI appended, not worker output."""
+    return (
+        stripped in HARNESS_HOOK_TRAILER_LINES
+        or bool(HARNESS_RESUME_FOOTER_RE.match(stripped))
+    )
 HUNK_HEADER_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@")
 PROMPT_ECHO_ANCHOR_SEARCH_LINES = 200
 PROMPT_ECHO_MAX_ANCHORS = 10
@@ -945,19 +977,26 @@ def _last_line_is_terminal_marker(
     if not candidates:
         return None
 
+    # Strip trailers the AGENT CLI appends after the worker's own final line.
+    # A loop rather than a fixed order: a run can end with a usage footer, hook
+    # lines, a resume hint, or several of them, and the previous ordered chain
+    # only tolerated the combinations it happened to list. Anything it does not
+    # recognise stops the loop, so unknown output still blocks the marker --
+    # failing closed, as before.
     candidate_idx = len(candidates) - 1
-    trailing = candidates[candidate_idx][1].strip()
-    if HARNESS_TOKEN_COUNT_RE.fullmatch(trailing):
-        if candidate_idx == 0 or candidates[candidate_idx - 1][1].strip() != "tokens used":
-            return None
-        candidate_idx -= 2
-    elif trailing == "tokens used":
-        candidate_idx -= 1
-    while (
-        candidate_idx >= 0
-        and candidates[candidate_idx][1].strip() in HARNESS_HOOK_TRAILER_LINES
-    ):
-        candidate_idx -= 1
+    while candidate_idx >= 0:
+        trailing = candidates[candidate_idx][1].strip()
+        if HARNESS_TOKEN_COUNT_RE.fullmatch(trailing):
+            # A bare number counts as a trailer only directly under "tokens
+            # used"; otherwise it is worker output and must not be skipped.
+            if candidate_idx == 0 or candidates[candidate_idx - 1][1].strip() != "tokens used":
+                return None
+            candidate_idx -= 2
+            continue
+        if trailing == "tokens used" or _is_harness_trailer_line(trailing):
+            candidate_idx -= 1
+            continue
+        break
     if candidate_idx < 0:
         return None
 
@@ -1335,14 +1374,33 @@ def main() -> int:
             if terminal_write:
                 terminal_error = append_task_breadcrumb(_task_state_for_terminal(payload.get("state")), payload)
                 if terminal_error:
-                    original_state = payload.get("state")
                     payload["task_breadcrumb_error"] = terminal_error
-                    payload["task_breadcrumb_failed_state"] = original_state
+                    payload["task_breadcrumb_failed"] = True
+                    payload["task_breadcrumb_failed_state"] = payload.get("state")
                     if payload.get("reason"):
                         payload["task_breadcrumb_failed_reason"] = payload.get("reason")
-                    payload["state"] = BLOCKED_TASK_BREADCRUMB_STATE
-                    payload["reason"] = "task_breadcrumb_error"
-                    payload["liveness_state"] = goalflight_terminal.terminal_liveness_state(payload.get("state"))
+                    # A store that cannot be trusted still blocks: if the file is
+                    # corrupt or unwritable, the task system is broken and the
+                    # run should stop for a human.
+                    #
+                    # A MISSING TASK ID is a different thing and must not. The
+                    # dispatch referenced an item this repo's store does not have
+                    # -- a bad input, not a broken store -- and the worker's own
+                    # result is unaffected. Blocking on it rewrote a finished run
+                    # as blocked: a worker emitted its terminal marker, staged its
+                    # work, and the state flipped from `complete` to
+                    # `blocked_task_breadcrumb` because a note about it could not
+                    # be filed against t-482. The run was then hand-salvaged for
+                    # work that was already done and already detected.
+                    #
+                    # If the message shape ever changes this falls back to
+                    # blocking, which is the safe direction.
+                    if not _task_breadcrumb_error_is_missing_item(terminal_error):
+                        payload["state"] = BLOCKED_TASK_BREADCRUMB_STATE
+                        payload["reason"] = "task_breadcrumb_error"
+                        payload["liveness_state"] = goalflight_terminal.terminal_liveness_state(
+                            payload.get("state")
+                        )
                 elif (
                     _task_state_for_terminal(payload.get("state")) == "worker-finished"
                     and not _terminal_marker_from_ignored_prompt(

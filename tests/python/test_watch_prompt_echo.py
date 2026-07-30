@@ -476,6 +476,52 @@ def case_ready_terminal_marker() -> None:
         assert "findings.md" in term.get("text", ""), term
 
 
+def case_task_breadcrumb_missing_item_keeps_worker_verdict() -> None:
+    """A task id absent from the store must not rewrite a finished run as blocked.
+
+    Live failure: a worker completed, emitted its terminal marker and staged a
+    298-line test file. The breadcrumb append then failed with
+    "item not found: t-482" -- the dispatch referenced a task this repo's store
+    did not have -- and the state flipped from `complete` to
+    `blocked_task_breadcrumb`. The run read as blocked and was hand-salvaged for
+    work that was already done and already detected.
+
+    The store here is intact; only the referenced id is absent. Contrast
+    case_task_terminal_breadcrumb_failure_blocks_completion, where the store
+    itself is corrupt and blocking is still correct.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        project = tmp / "project"
+        _write_task_store(project)  # valid store, contains t-001 only
+        tail = tmp / "tail.txt"
+        tail.write_text("work done\nCOMPLETE: pinned the claim\n", encoding="utf-8")
+        worker = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"], start_new_session=True)
+        try:
+            rc, _, term, payload = _run_watcher(
+                tail,
+                tmp / "s.json",
+                tmp / "p.md",
+                ignore=False,
+                worker_pid=worker.pid,
+                poll_secs="0.2",
+                max_idle_secs="2",
+                dispatch_id="watch-task-breadcrumb-missing",
+                project_root=project,
+                task_ids="t-482",  # not in the store
+                agent="codex",
+            )
+        finally:
+            worker.terminate()
+            worker.wait()
+        assert term.get("kind") == "COMPLETE", term
+        assert payload["state"] == "complete", payload
+        assert payload["reason"] != "task_breadcrumb_error", payload
+        # The bookkeeping failure is still surfaced, just not as the verdict.
+        assert payload["task_breadcrumb_failed"] is True, payload
+        assert "item not found" in payload["task_breadcrumb_error"]["message"], payload
+
+
 def case_task_terminal_breadcrumb_failure_blocks_completion() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
@@ -1236,6 +1282,7 @@ def main() -> None:
     case_mid_output_marker_ignored()
     case_live_failed_marker_blocks_not_rate_limited()
     case_ready_terminal_marker()
+    case_task_breadcrumb_missing_item_keeps_worker_verdict()
     case_task_terminal_breadcrumb_failure_blocks_completion()
     case_task_terminal_breadcrumb_happy_path_persists()
     case_dead_pid_fresh_output_vetoes_worker_dead()
