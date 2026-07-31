@@ -59,3 +59,14 @@ python3 ~/Repos/goal-flight/scripts/goalflight_dispatch.py \
 Status JSONs and steer mailboxes for all four dispatch_ids above were under
 `/tmp/goal-flight-501/dispatch/` at the time of writing (tmp-reaper caveat applies; ids and states
 are reproduced fully in this memo for when those files age out).
+
+
+## Addendum (same day): a fifth, unrelated dispatch-layer trap — bash shape this time
+
+`--read-only` (bash-shape grok-code) **cannot be enforced from a worktree under `/tmp`**:
+`os sandbox cannot enforce workspace boundaries when cwd is inside allowed temp root '/tmp'`.
+The error message is good (states cause + both remedies), but the combination is unfortunate in
+practice: goal-flight's own conventions put throwaway worktrees under `/private/tmp/…`, so the
+recommended read-only review posture silently conflicts with the recommended worktree location.
+Suggest either documenting a blessed non-tmp scratch root for review worktrees, or letting the
+sandbox treat an explicitly-passed `--cwd` under /tmp as the workspace boundary itself.
