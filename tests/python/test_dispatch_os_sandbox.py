@@ -134,6 +134,48 @@ def case_profile_survives_submit_drain() -> None:
     assert "--os-sandbox" not in r_def and "--read-only" not in r_def, r_def
 
 
+def case_boundary_rejected_early_names_the_real_cause() -> None:
+    """The sandbox refuses when cwd sits in a temp/agent-state root. Say so up front.
+
+    That refusal is correct -- inside those roots it cannot separate "the
+    workspace" from "everywhere the worker may already write". But it used to
+    surface only after a detached worker had launched and died as
+    `blocked_os_sandbox`, with the reason buried in a status file.
+
+    Two controllers independently misread that as "--os-sandbox / --read-only is
+    broken for ACP shapes" and proposed rejecting those flags for ACP outright,
+    which would break sandboxed ACP dispatches from ordinary worktrees. The
+    trigger is the cwd LOCATION -- not the shape, not the flag. Hence the
+    non-temp cases below: they are the ones a shape-based rejection would have
+    broken.
+    """
+    repo_cwd = str(Path(__file__).resolve().parents[2])
+    for shape in ("acp", "bash"):
+        for profile in ("read-only", "workspace-write"):
+            try:
+                d._validate_os_sandbox_boundary(
+                    _args(agent="cursor", shape=shape, os_sandbox=profile, cwd="/tmp/gf-probe")
+                )
+            except d.DispatchUsageError as exc:
+                message = str(exc)
+                assert "working directory" in message, message
+                # Must name the cause and a way out, not just fail.
+                assert "temp" in message or "root" in message, message
+                assert "--os-sandbox off" in message, message
+            else:
+                raise AssertionError(f"cwd inside a temp root must reject early ({shape}/{profile})")
+
+            # A real worktree is fine for BOTH shapes -- the case a shape-based
+            # rejection would have wrongly blocked.
+            d._validate_os_sandbox_boundary(
+                _args(agent="cursor", shape=shape, os_sandbox=profile, cwd=repo_cwd)
+            )
+    # `off` asks for no boundary, so it is never rejected, even from /tmp.
+    d._validate_os_sandbox_boundary(
+        _args(agent="cursor", shape="acp", os_sandbox="off", cwd="/tmp/gf-probe")
+    )
+
+
 def main() -> None:
     case_resolution_precedence()
     case_codex_sandbox_mapping()
@@ -143,6 +185,7 @@ def main() -> None:
     case_claude_acp_read_only_fallback_notice_is_pinned()
     case_acp_supported_and_unrequested_warning_paths_are_unchanged()
     case_profile_survives_submit_drain()
+    case_boundary_rejected_early_names_the_real_cause()
     print("test_dispatch_os_sandbox: all cases passed")
 
 

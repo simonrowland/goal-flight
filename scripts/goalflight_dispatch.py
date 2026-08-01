@@ -273,6 +273,59 @@ def _validate_os_sandbox_conflict(args) -> None:
         )
 
 
+def _validate_os_sandbox_boundary(args) -> None:
+    """Fail fast when the requested sandbox cannot draw a boundary around cwd.
+
+    The sandbox refuses when cwd sits inside a temp root or an agent state root,
+    because it cannot separate "the workspace" from "everywhere the worker is
+    already allowed to write". That refusal is correct and stays. What was wrong
+    is WHERE it surfaced: the dispatcher launched a detached worker, the worker
+    hit the check on startup, and the run died as `blocked_os_sandbox` with the
+    reason buried in its status file.
+
+    Two controllers then misread that as "--os-sandbox / --read-only is broken
+    for ACP shapes" and proposed rejecting those flags for ACP entirely -- which
+    would break sandboxed ACP dispatches from ordinary worktrees, where they work
+    fine. The trigger is the cwd LOCATION, nothing about the shape or the flag.
+
+    Running the same check here turns a wasted dispatch into an immediate,
+    accurate error naming the real cause and the two real remedies.
+    """
+    # Only an EXPLICIT request is checked here. `_effective_os_sandbox` falls
+    # back to workspace-write when nothing was passed, so gating on it would
+    # reject every dispatch from a temp cwd -- including the many that never
+    # asked for a sandbox and are perfectly happy without one. Refusing those up
+    # front would be a far worse regression than the late failure this fixes.
+    explicit = getattr(args, "os_sandbox", None) or (
+        "read-only" if getattr(args, "read_only", False) else None
+    )
+    if not explicit or explicit == "off":
+        return
+    profile = _effective_os_sandbox(args)
+    if not profile or profile == "off":
+        return
+    cwd = getattr(args, "cwd", None)
+    if not cwd:
+        return
+    # Function-local import, matching this module's convention for the readiness
+    # helpers: dispatch must not fail to load if the sandbox module is absent.
+    try:
+        from goalflight_os_sandbox import OsSandboxError, macos_write_roots
+    except ImportError:
+        return
+    try:
+        macos_write_roots(
+            str(cwd), profile, agent=getattr(args, "agent", None), command=""
+        )
+    except OsSandboxError as exc:
+        raise DispatchUsageError(
+            f"--os-sandbox {profile} cannot be enforced from this working directory: {exc} "
+            "(this is about WHERE the worktree lives, not the agent or the shape: "
+            "dispatch from a worktree outside the temp/agent-state roots, or pass "
+            "--os-sandbox off and rely on the review/permission layer instead)"
+        ) from exc
+
+
 def _validate_agent_os_sandbox(args) -> None:
     profile = _effective_os_sandbox(args)
     if str(getattr(args, "agent", "")) == "kimi" and profile != OS_SANDBOX_OFF:
@@ -1957,6 +2010,7 @@ def _validate_before_side_effects(args, raw_argv: list[str]) -> None:
     if args.prompt_file and not Path(args.prompt_file).expanduser().exists():
         raise DispatchUsageError(f"prompt file not found: {args.prompt_file}")
     _validate_os_sandbox_conflict(args)
+    _validate_os_sandbox_boundary(args)
     _validate_agent_os_sandbox(args)
     _guard_read_only_write_prompt(args)
     _guard_grok_code_research_prompt(args)
@@ -8179,6 +8233,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.prompt_file and not Path(args.prompt_file).expanduser().exists():
                 raise DispatchUsageError(f"prompt file not found: {args.prompt_file}")
             _validate_os_sandbox_conflict(args)
+            _validate_os_sandbox_boundary(args)
             _guard_read_only_write_prompt(args)
             dispatch_warnings = _dispatch_warnings(args, raw)
             args.dispatch_warnings = dispatch_warnings
