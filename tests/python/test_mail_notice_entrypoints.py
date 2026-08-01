@@ -29,6 +29,12 @@ NOTICE = (
 ENTRYPOINTS = ("status", "task-status", "task-next", "usage", "gate", "doctor")
 
 
+def assert_eq(name: str, got, want) -> None:
+    """Equality assertion the stderr/stdout contract test expects."""
+    if got != want:
+        raise AssertionError(f"{name}: got {got!r}, want {want!r}")
+
+
 def assert_true(name: str, condition: bool) -> None:
     if not condition:
         raise AssertionError(name)
@@ -347,27 +353,48 @@ def test_status_json_never_contains_or_prints_mail_signal() -> None:
         assert_true("notice is not mixed into JSON stdout", "new mail; read:" not in stdout.getvalue())
 
 
-def main() -> None:
-    tests = [
-        test_project_addressed_cross_project_mail_notifies_without_flood,
-        test_regolith_shorthand_and_full_name_both_notify,
-        test_existing_project_names_keep_working,
-        test_unrelated_longer_project_alias_does_not_notify,
-        test_short_derived_leading_segment_is_not_an_alias,
-        test_explicit_project_mail_alias_override,
-        test_common_entrypoints_emit_one_body_free_sanitized_notice,
-        test_common_entrypoints_stay_silent_without_mail,
-        test_corrupt_addressed_mailbox_is_fail_open_for_every_entrypoint,
-        test_unreadable_addressed_mailbox_is_fail_open_for_every_entrypoint,
-        test_status_json_never_contains_or_prints_mail_signal,
-    ]
-    for test in tests:
-        test()
-    print(f"PASS tests/python/test_mail_notice_entrypoints.py ({len(tests)} tests)")
 
+def test_milestone_notice_speaks_only_when_due() -> None:
+    """A sweep notice that printed every run would be a line nobody reads.
 
-if __name__ == "__main__":
-    main()
+    Mail gets acted on and milestone sweeps did not, and the cause was reach:
+    the mail notice rides doctor/gate/messages/status/usage, while the milestone
+    signal appeared in `status` alone. A controller running a gate or a usage
+    check -- most of a run -- was never told a sweep had come due.
+
+    So it now rides the same carriers, under two constraints: silent unless due,
+    and fail-open. Both are pinned here.
+    """
+    import goalflight_milestone as ms
+
+    real = ms.check_status
+    try:
+        # Not due -> nothing printed, nothing returned.
+        ms.check_status = lambda **kw: {"due": False, "active_cadence": True,
+                                        "commits_since": 1, "K": 5, "last_marker": {}}
+        err = io.StringIO()
+        assert_true("silent when not due",
+                    M.emit_controller_milestone_notice(stream=err) is None)
+        assert_true("nothing printed when not due", err.getvalue() == "")
+
+        # Due -> one line, carrying the cadence and where to look.
+        ms.check_status = lambda **kw: {"due": True, "active_cadence": True,
+                                        "commits_since": 7, "K": 5, "last_marker": {}}
+        err = io.StringIO()
+        notice = M.emit_controller_milestone_notice(stream=err)
+        assert_true("a notice was produced when due", bool(notice))
+        assert_true("notice reaches the stream", notice in err.getvalue())
+        assert_true("names the protocol to follow", "milestone-review" in notice)
+
+        # Fail-open: a broken detector must never break the calling tool.
+        def boom(**kw):
+            raise RuntimeError("detector exploded")
+        ms.check_status = boom
+        err = io.StringIO()
+        assert_true("fail-open on detector error",
+                    M.emit_controller_milestone_notice(stream=err) is None)
+    finally:
+        ms.check_status = real
 
 
 def test_notice_goes_to_stderr_so_stdout_stays_a_data_contract() -> None:
@@ -395,3 +422,28 @@ def test_notice_goes_to_stderr_so_stdout_stays_a_data_contract() -> None:
         assert_eq("stdout untouched", out.getvalue(), "")
         assert_true("stderr carries the notice", notice in err.getvalue())
         assert_true("body never leaks", "body that must not appear" not in err.getvalue())
+
+
+def main() -> None:
+    tests = [
+        test_project_addressed_cross_project_mail_notifies_without_flood,
+        test_regolith_shorthand_and_full_name_both_notify,
+        test_existing_project_names_keep_working,
+        test_unrelated_longer_project_alias_does_not_notify,
+        test_short_derived_leading_segment_is_not_an_alias,
+        test_explicit_project_mail_alias_override,
+        test_common_entrypoints_emit_one_body_free_sanitized_notice,
+        test_milestone_notice_speaks_only_when_due,
+        test_notice_goes_to_stderr_so_stdout_stays_a_data_contract,
+        test_common_entrypoints_stay_silent_without_mail,
+        test_corrupt_addressed_mailbox_is_fail_open_for_every_entrypoint,
+        test_unreadable_addressed_mailbox_is_fail_open_for_every_entrypoint,
+        test_status_json_never_contains_or_prints_mail_signal,
+    ]
+    for test in tests:
+        test()
+    print(f"PASS tests/python/test_mail_notice_entrypoints.py ({len(tests)} tests)")
+
+
+if __name__ == "__main__":
+    main()

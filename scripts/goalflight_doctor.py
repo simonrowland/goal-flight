@@ -3489,6 +3489,9 @@ def main(argv: list[str] | None = None) -> int:
             goalflight_messages.emit_controller_mail_notice(
                 project_root=Path(args.project_root).resolve(),
             )
+            goalflight_messages.emit_controller_milestone_notice(
+                project_root=Path(args.project_root).resolve(),
+            )
     plugin = payload["plugin"]
     if not plugin.get("skipped") and (
         plugin.get("manifest_exists") is False or plugin.get("validate_ok") is False

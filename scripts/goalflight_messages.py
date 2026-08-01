@@ -1213,6 +1213,39 @@ def emit_controller_mail_notice(
         return None
 
 
+def emit_controller_milestone_notice(
+    *,
+    project_root: Path | None = None,
+    stream=None,
+) -> str | None:
+    """Print a one-line milestone-sweep notice, but ONLY when a sweep is due.
+
+    Mail gets acted on and milestone sweeps do not, and the reason is reach, not
+    discipline: the mail notice is emitted from doctor/gate/messages/status/usage,
+    while the milestone signal appeared in `status` alone. A controller running a
+    gate or a usage check -- most of a run -- was never told a sweep had come due.
+
+    So it rides the same carriers as mail. It stays silent unless `due`, because a
+    line printed every time is a line nobody reads, and it goes to stderr for the
+    same reason the mail notice does: several callers' stdout is a data contract.
+    Fail-open throughout -- a monitoring nicety must never break a dispatch.
+    """
+    try:
+        import goalflight_milestone
+
+        status = goalflight_milestone.check_status(
+            project_root=project_root or _current_project_root() or Path.cwd()
+        )
+        if not status.get("due"):
+            return None
+        line = goalflight_milestone.format_line(status)
+        notice = f"{line}  # milestone sweep due: see protocols/milestone-review.md"
+        print(notice, file=sys.stderr if stream is None else stream)
+        return notice
+    except Exception:
+        return None
+
+
 def _mail_scope(*, all_projects: bool) -> tuple[Path | None, set[str] | None]:
     if all_projects:
         return None, None

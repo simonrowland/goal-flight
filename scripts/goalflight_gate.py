@@ -136,6 +136,9 @@ def main(argv: list[str] | None = None) -> int:
         goalflight_messages.emit_controller_mail_notice(
             project_root=Path.cwd(),
         )
+        goalflight_messages.emit_controller_milestone_notice(
+            project_root=Path.cwd(),
+        )
     return rc
 
 
