@@ -27,15 +27,22 @@ Read:
 
 ## Two things that decide whether a dispatch is worth its tokens
 
-**Require a plan before the build, for any chunk with design content.** The
-worker's first deliverable is the design — interfaces, invariants, acceptance
-checks, intended test names — written to the lane's research directory, followed
-by `!USER-NEED: design ready for approval at <path>`, and then it stops. You
-review, steer back approval or corrections, and it builds from there. A wrong
-design then costs one steer instead of a whole build plus a rewrite. The rendered
-worker prompt carries this rule, so it applies unless a brief overrides it; skip
-it only for chunks with no design content (a mechanical edit, a rename, a fix
-whose shape the brief already fixes). When unsure, checkpoint.
+**Ask for a plan before the build on CP/H-class chunks — by tagging the brief.**
+Tag it `[design-checkpoint]`. The worker's first deliverable is then the design —
+interfaces, invariants, acceptance checks, intended test names — written to the
+lane's research directory, followed by
+`!USER-NEED: design ready for approval at <path>; session <resume-id>; log <path>`,
+and it stops. **Resume that session with your corrections; do not re-dispatch** —
+re-dispatching re-pays the orientation the checkpoint exists to save. A wrong
+design then costs one steer instead of a whole build plus a rewrite.
+
+**This is opt-in per brief, and deliberately so.** It is NOT on by default and
+must not be: `!USER-NEED:` ends the run, so a worker that checkpoints on its own
+initiative during an unattended execute stalls the queue until a human appears —
+and because the background wait correctly wakes you on that terminal, the stall
+looks like normal progress. Only the codex goal-mode template carries the rule
+today; the dispatch-wrapper path does not, so **tag the brief rather than
+assuming the worker was told.**
 
 **Wait on the work, not on a clock.** Every dispatch prints a `wait:` line —
 `goalflight_status.py --wait <id>`. Run it **in the background**: its completion

@@ -29,6 +29,55 @@ concern-diverse flight with at least two concern-diverse reviewers/lenses as the
 floor: whole-delta walk, cross-lane-seam pass, and backwards look over every
 chunk landed since the last milestone.
 
+## Seams are the point of a milestone sweep — brief for them explicitly
+
+A milestone sweep exists to catch what per-chunk review is **structurally unable
+to see**. Per-chunk review is scoped to one chunk's diff, so it is blind by
+construction to defects living BETWEEN chunks. Field evidence from a multi-chunk
+milestone: per-chunk output graded well and nearly every escaped defect was
+cross-chunk. **More reviews of the same shape do not help — the scope is what
+misses, not the effort.** A sweep that runs another per-chunk-shaped pass has
+spent the tokens and not looked where the defects are.
+
+The full doctrine, including the integrated-tip gate, is in
+`protocols/chunk-review.md` §Seams. Both of its gates are **standing
+requirements at a milestone**, not optional extras:
+
+1. **Integrated-tip gate** — run the full gate against all chunks landed
+   together, never against each chunk in isolation. A suite that passed
+   per-chunk and fails integrated **is** the seam; that failure is the finding.
+2. **Cross-chunk pass** — one review whose unit is the milestone. Give it the
+   chunk list and the shared surfaces, not the concatenated diffs. The question
+   is consistency, not correctness-in-detail.
+
+### Name these in the sweep brief — do not hope a reviewer looks
+
+Reviewers find what they are pointed at. Every milestone brief should ask, in
+these words:
+
+- **Where do two chunks answer the same question differently?** A shared schema
+  each side implements slightly differently; two chunks that each decide a
+  default and disagree; a catalog entry nobody owns.
+- **Which invariant does every chunk half-maintain?** An invariant upheld at each
+  site individually and by nothing at the chokepoint is upheld nowhere.
+- **What changed shape underneath a consumer that was not re-read?** A field, a
+  state name, or an error payload whose meaning moved while its readers did not.
+- **Which claim is asserted by a state that never measured it?** A verdict
+  derived from a proxy — a marker standing in for liveness, a flag standing in
+  for an authorization, a count standing in for enforcement.
+- **Architecture landing ahead of vertical slices** — scaffolding accreting
+  before any end-to-end path exercises it, so nothing disproves the design.
+- **Tests proving the implementation rather than the invariant** — a test
+  restating what the code does passes forever and catches nothing. Ask what
+  observable property would break if the implementation were wrong, then break it
+  and watch.
+- **Docs lagging schema growth** — the schema moved, the document describing it
+  did not, and the drift stays invisible until someone trusts the doc.
+
+A milestone that ran two concern-diverse reviews per chunk and never asked a
+cross-chunk question has satisfied the floor and still not looked where the
+defects were.
+
 Run reviewers as file-backed jobs:
 
 ```bash

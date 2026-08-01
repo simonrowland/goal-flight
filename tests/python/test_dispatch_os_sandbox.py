@@ -175,6 +175,23 @@ def case_boundary_rejected_early_names_the_real_cause() -> None:
         _args(agent="cursor", shape="acp", os_sandbox="off", cwd="/tmp/gf-probe")
     )
 
+    # THE REGRESSION THIS GUARD ALREADY CAUSED ONCE. The first version gated on
+    # the EFFECTIVE profile, which falls back to workspace-write when no flag is
+    # passed -- so it rejected every dispatch from a temp cwd, including the many
+    # that never asked for a sandbox and run fine without one. Two existing test
+    # modules went red and it was reverted.
+    #
+    # Without these cases the test passes even with that regression reinstated
+    # (verified: the check was blind to it). An unflagged dispatch must be
+    # allowed from anywhere -- that is the common case, and refusing it is far
+    # worse than the late failure this guard exists to fix.
+    for shape in ("acp", "bash"):
+        for cwd in ("/tmp/gf-probe", repo_cwd):
+            d._validate_os_sandbox_boundary(
+                _args(agent="cursor", shape=shape, os_sandbox=None,
+                      read_only=False, cwd=cwd)
+            )
+
 
 def main() -> None:
     case_resolution_precedence()

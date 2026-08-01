@@ -69,9 +69,32 @@ def test_status_reminder_acp_shape() -> None:
     assert "watch-dispatch-tail.sh" not in text
 
 
+def test_wait_hint_teaches_the_backgrounded_form() -> None:
+    """The hint must show a wait a controller can actually run.
+
+    Printed as a bare foreground command it collided with the rule against long
+    foreground calls, leaving no legal move: the same hint forbids hand-rolled
+    watchers, so controllers hand-rolled pollers anyway. One was seen polling a
+    harness task file, which cannot observe `awaiting_user_confirm` at all -- a
+    worker paused for approval looked exactly like a worker still working.
+
+    Pinned because stripping this advice left every existing assertion green:
+    the hint's *commands* were tested, the guidance that makes them usable was
+    not.
+    """
+    for shape in ("bash", "acp"):
+        text, _status_json, _tail = _reminder_text(shape)
+        assert "--wait reminder-dispatch-42" in text, shape
+        assert "BACKGROUND" in text, f"{shape}: hint must say to background the wait"
+        assert "timer" in text, f"{shape}: hint must warn against substituting a timer"
+        # The reason has to travel with the instruction, or it reads as arbitrary.
+        assert "clock" in text, f"{shape}: hint must say why a timer is wrong"
+
+
 def main() -> None:
     test_status_reminder_bash_shape()
     test_status_reminder_acp_shape()
+    test_wait_hint_teaches_the_backgrounded_form()
     print("OK: dispatch status reminder tests pass")
 
 
