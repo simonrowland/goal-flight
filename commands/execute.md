@@ -25,6 +25,27 @@ Read:
 - `protocols/milestone-review.md`
 - `protocols/worktrees-parallel.md` only for `--parallel`
 
+## Two things that decide whether a dispatch is worth its tokens
+
+**Require a plan before the build, for any chunk with design content.** The
+worker's first deliverable is the design — interfaces, invariants, acceptance
+checks, intended test names — written to the lane's research directory, followed
+by `!USER-NEED: design ready for approval at <path>`, and then it stops. You
+review, steer back approval or corrections, and it builds from there. A wrong
+design then costs one steer instead of a whole build plus a rewrite. The rendered
+worker prompt carries this rule, so it applies unless a brief overrides it; skip
+it only for chunks with no design content (a mechanical edit, a rename, a fix
+whose shape the brief already fixes). When unsure, checkpoint.
+
+**Wait on the work, not on a clock.** Every dispatch prints a `wait:` line —
+`goalflight_status.py --wait <id>`. Run it **in the background**: its completion
+wakes you the moment the worker reaches a terminal state. Do not block the turn
+on it (long foreground calls are forbidden), and do not substitute a timed
+wake-up. A timer wakes on the clock, not on the work: it either sleeps past a
+finished worker or fires repeatedly at one that is still going, and it cannot
+tell you which. The same applies to a design checkpoint — the background wait is
+what bumps you when a plan lands and is ready for review.
+
 ## Steps
 
 1. Pre-flight:

@@ -1721,7 +1721,17 @@ def _status_reminder_lines(
         "tooling — do NOT hand-roll ps/tail -f/backgrounded watchers (they race the worker "
         "and exit early):",
         f"  status: python3 {status_py} --dispatch {dispatch_id}",
-        f"  wait:   python3 {status_py} --wait {dispatch_id}",
+        # The wait is shown in its BACKGROUNDED form on purpose. Printed as a
+        # plain foreground command it reads as "block here for however long the
+        # worker takes", which the >10s foreground rule forbids -- so controllers
+        # resolved the contradiction by abandoning the event wait entirely and
+        # polling on a timer instead. A timer cannot know when the work finished;
+        # it only knows when the clock did. Backgrounding the wait keeps the
+        # event as the wake signal AND keeps the turn free.
+        f"  wait:   python3 {status_py} --wait {dispatch_id}"
+        "   # run this in the BACKGROUND; its completion wakes you on the",
+        "          #   real event. Do not block the turn on it, and do not"
+        "  replace it with a timer -- a timer wakes on the clock, not the work.",
         f"  done?:  python3 {status_py} --done {dispatch_id}   "
         "# exit 0=terminal, 1=running, 2=ambiguous",
         f"  mail:   python3 {messages_py} relay   # current project, open + unread",
