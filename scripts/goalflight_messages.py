@@ -782,7 +782,11 @@ def format_bounded_relay(
     return "\n".join(selected)
 
 
-def _task_store_dispatch_id(project_root: Path) -> str | None:
+def _task_store_dispatch_id(
+    project_root: Path,
+    *,
+    canonical_project_root: Path | None = None,
+) -> str | None:
     try:
         if str(REPO_ROOT) not in sys.path:
             sys.path.insert(0, str(REPO_ROOT))
@@ -793,22 +797,11 @@ def _task_store_dispatch_id(project_root: Path) -> str | None:
         # different slug and the reader would silently watch the wrong inbox
         # (live consumption-gap regression caught 2026-07-02). Anchored git
         # discovery covers ANY linked worktree, not just managed ones.
-        root = Path(project_root)
-        try:
-            import subprocess
-
-            common_raw = subprocess.check_output(
-                ["git", "rev-parse", "--git-common-dir"],
-                cwd=str(root),
-                text=True,
-                stderr=subprocess.DEVNULL,
-            ).strip()
-            common = Path(common_raw)
-            if not common.is_absolute():
-                common = (root / common).resolve()
-            root = common.parent
-        except Exception:
-            root = Path(goalflight_task.resolve_project_root(str(project_root)))
+        root = (
+            Path(canonical_project_root)
+            if canonical_project_root is not None
+            else _canonical_project_root(project_root)
+        )
         return goalflight_task._next_nudge_dispatch_id(root)
     except Exception:
         return None
@@ -832,16 +825,27 @@ def _canonical_project_root(project_root: Path) -> Path:
             return common.parent
     except Exception:
         pass
-    return root
+    try:
+        if str(REPO_ROOT) not in sys.path:
+            sys.path.insert(0, str(REPO_ROOT))
+        import goalflight_task  # type: ignore
+
+        return Path(goalflight_task.resolve_project_root(str(project_root)))
+    except Exception:
+        return root
 
 
 def _normalize_project_mail_alias(value: object) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "-", str(value or "")).strip("-")
 
 
-def _project_mailbox_aliases(project_root: Path) -> set[str]:
+def _project_mailbox_aliases(
+    project_root: Path,
+    *,
+    canonical_project_root: Path | None = None,
+) -> set[str]:
     """Address aliases: basename, safe leading segment, and explicit overrides."""
-    root = _canonical_project_root(project_root)
+    root = canonical_project_root or _canonical_project_root(project_root)
     basename = _normalize_project_mail_alias(root.name) or "project"
     aliases = {basename}
     leading = basename.split("-", 1)[0]
@@ -882,8 +886,12 @@ def _project_addressed_dispatch_ids(
     *,
     messages_dir: Path,
     fleet_dir: Path | None,
+    canonical_project_root: Path | None = None,
 ) -> set[str]:
-    aliases = _project_mailbox_aliases(project_root)
+    aliases = _project_mailbox_aliases(
+        project_root,
+        canonical_project_root=canonical_project_root,
+    )
     return {
         path.stem
         for path in collect_inbox_paths(messages_dir, fleet_dir)
@@ -897,12 +905,16 @@ def _owned_with_project_mail(
     *,
     messages_dir: Path,
     fleet_dir: Path | None,
+    canonical_project_root: Path | None = None,
 ) -> set[str] | None:
     if owned_dispatch_ids is None:
         return owned_dispatch_ids
     scoped = set(owned_dispatch_ids)
     if task_store_project_root is not None:
-        dispatch_id = _task_store_dispatch_id(task_store_project_root)
+        dispatch_id = _task_store_dispatch_id(
+            task_store_project_root,
+            canonical_project_root=canonical_project_root,
+        )
         if dispatch_id:
             scoped.add(dispatch_id)
         scoped.update(
@@ -910,6 +922,7 @@ def _owned_with_project_mail(
                 task_store_project_root,
                 messages_dir=messages_dir,
                 fleet_dir=fleet_dir,
+                canonical_project_root=canonical_project_root,
             )
         )
     return scoped
@@ -1084,17 +1097,28 @@ def _task_store_nudge_is_current(item: dict, project_root: Path) -> bool:
     return bool(frontier_ids) and frontier_ids == payload_ids
 
 
-def _filter_task_store_nudges(items: list[dict], task_store_project_root: Path | None) -> list[dict]:
+def _filter_task_store_nudges(
+    items: list[dict],
+    task_store_project_root: Path | None,
+    *,
+    canonical_project_root: Path | None = None,
+) -> list[dict]:
     if task_store_project_root is None:
         return items
-    dispatch_id = _task_store_dispatch_id(task_store_project_root)
+    dispatch_id = _task_store_dispatch_id(
+        task_store_project_root,
+        canonical_project_root=canonical_project_root,
+    )
     if not dispatch_id:
         return items
     return [
         item
         for item in items
         if str(item.get("dispatch_id") or "") != dispatch_id
-        or _task_store_nudge_is_current(item, task_store_project_root)
+        or _task_store_nudge_is_current(
+            item,
+            canonical_project_root or task_store_project_root,
+        )
     ]
 
 
@@ -1132,11 +1156,17 @@ def controller_mail_summary(
     # scoped status call. build_aggregate is also per-inbox tolerant as a backstop.
     resolved_messages_dir = messages_dir or default_messages_dir()
     resolved_fleet_dir = fleet_dir if fleet_dir is not None else default_fleet_dir()
+    canonical_project_root = (
+        _canonical_project_root(task_store_project_root)
+        if task_store_project_root is not None
+        else None
+    )
     scoped_dispatch_ids = _owned_with_project_mail(
         owned_dispatch_ids,
         task_store_project_root,
         messages_dir=resolved_messages_dir,
         fleet_dir=resolved_fleet_dir,
+        canonical_project_root=canonical_project_root,
     )
     aggregate = build_aggregate(
         messages_dir=resolved_messages_dir,
@@ -1151,7 +1181,11 @@ def controller_mail_summary(
             if str(n.get("dispatch_id") or "") in scoped_dispatch_ids
             or str(n.get("dispatch_id") or "") == "controller-quota-advisory"
         ]
-    needs = _filter_task_store_nudges(needs, task_store_project_root)
+    needs = _filter_task_store_nudges(
+        needs,
+        task_store_project_root,
+        canonical_project_root=canonical_project_root,
+    )
     if unread_only:
         read_cursor = load_read_cursor(read_cursor_path(resolved_messages_dir))
         needs = [
@@ -1494,13 +1528,20 @@ def cmd_relay(args: argparse.Namespace) -> int:
             if headlines:
                 print(headlines)
                 print("bodies: re-run with --bodies, or read one inbox with `read`")
-        print(format_unseen_counts(counts))
         if args.ack:
             try:
                 advance_read_cursor(cursor_path, ack_advances)
+                cursor = load_read_cursor(cursor_path)
+                _, counts, _ = unseen_envelopes_for_paths(
+                    paths,
+                    cursor=cursor,
+                    tolerate_errors=True,
+                )
             except (OSError, ValueError, TypeError) as exc:
                 warn_cursor_not_advanced(exc)
+                print(format_unseen_counts(counts))
                 return 1
+        print(format_unseen_counts(counts))
         return 0
     summary = controller_mail_summary(
         owned_dispatch_ids=owned_dispatch_ids,

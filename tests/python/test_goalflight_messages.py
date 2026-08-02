@@ -372,6 +372,86 @@ def test_controller_summary_includes_quota_advisory() -> None:
         assert_true("advisory hint has relay command", "goalflight_messages.py relay --new" in summary["hint"])
 
 
+def test_controller_summary_resolves_canonical_root_once() -> None:
+    import tempfile
+    import goalflight_messages as messages
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project = base / "project"
+        init_git_project(project)
+        git_common_dir_calls: list[list[str]] = []
+        original_run = messages.subprocess.run
+        original_check_output = messages.subprocess.check_output
+
+        def track_run(command, *args, **kwargs):
+            if list(command) == ["git", "rev-parse", "--git-common-dir"]:
+                git_common_dir_calls.append(list(command))
+            return original_run(command, *args, **kwargs)
+
+        def track_check_output(command, *args, **kwargs):
+            if list(command) == ["git", "rev-parse", "--git-common-dir"]:
+                git_common_dir_calls.append(list(command))
+            return original_check_output(command, *args, **kwargs)
+
+        messages.subprocess.run = track_run  # type: ignore[assignment]
+        messages.subprocess.check_output = track_check_output  # type: ignore[assignment]
+        try:
+            messages.controller_mail_summary(
+                owned_dispatch_ids=set(),
+                task_store_project_root=project,
+                messages_dir=base / "messages",
+                fleet_dir=base / "fleet",
+            )
+        finally:
+            messages.subprocess.run = original_run  # type: ignore[assignment]
+            messages.subprocess.check_output = original_check_output  # type: ignore[assignment]
+
+        assert_true("one canonical root resolution", len(git_common_dir_calls) == 1)
+
+
+def test_controller_summary_git_failure_uses_task_store_root_fallback() -> None:
+    import tempfile
+    import goalflight_messages as messages
+    import goalflight_task as tasks
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project = base / "project"
+        managed_worktree = project / ".claude" / "worktrees" / "worker"
+        messages_dir = base / "messages"
+        dispatch_id = tasks._next_nudge_dispatch_id(project)
+        messages.post_message(
+            dispatch_id=dispatch_id,
+            msg_type="user_need",
+            payload={"text": "controller decision"},
+            messages_dir=messages_dir,
+        )
+        git_common_dir_calls = 0
+        original_run = messages.subprocess.run
+
+        def fail_git_common_dir(command, *args, **kwargs):
+            nonlocal git_common_dir_calls
+            if list(command) == ["git", "rev-parse", "--git-common-dir"]:
+                git_common_dir_calls += 1
+                return messages.subprocess.CompletedProcess(command, 1, "", "not a git repository")
+            return original_run(command, *args, **kwargs)
+
+        messages.subprocess.run = fail_git_common_dir  # type: ignore[assignment]
+        try:
+            summary = messages.controller_mail_summary(
+                owned_dispatch_ids=set(),
+                task_store_project_root=managed_worktree,
+                messages_dir=messages_dir,
+                fleet_dir=base / "fleet",
+            )
+        finally:
+            messages.subprocess.run = original_run  # type: ignore[assignment]
+
+        assert_true("one failed canonical root resolution", git_common_dir_calls == 1)
+        assert_true("task store fallback inbox surfaced", summary["needs"][0]["dispatch_id"] == dispatch_id)
+
+
 def test_mcp_stdio_tools_call() -> None:
     import json
     import subprocess
@@ -774,6 +854,34 @@ def test_default_read_and_relay_respect_independent_read_cursor() -> None:
         assert_true("status stable fields unchanged", stable_status(status_after.stdout) == stable_before)
 
 
+def test_relay_new_ack_reports_post_ack_unseen_counts() -> None:
+    import tempfile
+    from goalflight_messages import append_envelope, inbox_path, markers_to_envelopes
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        messages_dir = base / "messages"
+        fleet_dir = base / "fleet"
+        fleet_dir.mkdir()
+        dispatch_id = "d-relay-ack"
+        append_envelope(
+            inbox_path(messages_dir, dispatch_id),
+            markers_to_envelopes({"STATUS": ["ready"]}, dispatch_id=dispatch_id)[0],
+        )
+
+        relayed = run_messages_cli(
+            messages_dir,
+            fleet_dir,
+            ["relay", "--new", "--all-projects", "--ack"],
+        )
+
+        assert_true("relay ack exit 0", relayed.returncode == 0)
+        assert_true(
+            "relay ack count reflects advanced cursor",
+            relayed.stdout.splitlines()[-1] == f"unseen counts: {dispatch_id}=0",
+        )
+
+
 def test_default_relay_is_bounded_newest_first_with_elision() -> None:
     import tempfile
     from goalflight_messages import append_envelope, inbox_path, markers_to_envelopes
@@ -1007,6 +1115,8 @@ def main() -> None:
         test_post_message_rejects_invalid_seq_and_accepts_one,
         test_post_message_allocates_seq_under_mail_lock,
         test_controller_summary_includes_quota_advisory,
+        test_controller_summary_resolves_canonical_root_once,
+        test_controller_summary_git_failure_uses_task_store_root_fallback,
         test_mcp_stdio_tools_call,
         test_mark_read_creates_cursor_and_unseen_filters,
         test_mark_read_all_advances_every_inbox_to_current_max,
@@ -1020,6 +1130,7 @@ def main() -> None:
         test_controller_relay_sanitizes_worker_text,
         test_bounded_relay_sanitizes_c1_csi,
         test_default_read_and_relay_respect_independent_read_cursor,
+        test_relay_new_ack_reports_post_ack_unseen_counts,
         test_default_relay_is_bounded_newest_first_with_elision,
         test_default_relay_excludes_cross_project_mail,
         test_ack_stale_expires_exact_stale_set_and_preserves_read_cursor,
