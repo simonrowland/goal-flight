@@ -839,9 +839,27 @@ def build_fleet_plane(
     return payload
 
 
-def _attention_kind(value: object) -> str:
+def _attention_kind(value: object) -> str | None:
+    """The attention kind, or None when this is not operator attention.
+
+    This used to coerce every unrecognised type to "user_need". The mail
+    summary hands over types that are ALREADY correctly self-describing --
+    done-suggest, resume-ready, parallel-ready are task-store automation, a
+    controller prompting itself ("worker says done: b-663 -> review?", "276
+    tasks ready -> continue?"). The fallback relabelled all of them as a
+    pending human decision: 137 of 202 rows on this machine. The producer
+    said "automation" and the console overrode it, which is this project's
+    signature defect -- a field asserting a state it never measured --
+    sitting in a fallback branch, with the right answer already in hand.
+
+    Closed by construction rather than by a deny-list of known automation
+    kinds: a deny-list has to be updated every time a producer adds a kind,
+    and the failure mode of forgetting is silent laundering all over again.
+    _ATTENTION_KINDS is the positive authority, matching how this module
+    treats every other boundary.
+    """
     kind = str(value or "").strip().lower().replace("-", "_")
-    return kind if kind in _ATTENTION_KINDS else "user_need"
+    return kind if kind in _ATTENTION_KINDS else None
 
 
 def _attention_rows(summary: object) -> list[dict[str, Any]]:
@@ -851,7 +869,14 @@ def _attention_rows(summary: object) -> list[dict[str, Any]]:
         if not isinstance(item, dict):
             continue
         observed_at = _iso_timestamp(item.get("ts"))
+        # Anything not recognised as operator attention is dropped, not
+        # promoted. Doubly so here: the fleet view is unscoped
+        # (task_store_project_root=None), so _filter_task_store_nudges()
+        # no-ops and a laundered nudge could never even be retired once its
+        # tasks were done.
         kind = _attention_kind(item.get("type"))
+        if kind is None:
+            continue
         rows.append(
             {
                 "dispatch_id": _display(item.get("dispatch_id"), limit=128),

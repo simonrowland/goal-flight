@@ -414,6 +414,44 @@ def test_degraded_sample_exits_nonzero_instead_of_looking_healthy() -> None:
         F.goalflight_status.status_payload = real
 
 
+def test_unrecognised_attention_type_is_dropped_not_promoted() -> None:
+    """Automation must not be laundered into a pending human decision.
+
+    controller_mail_summary hands over types that already describe themselves.
+    done-suggest / resume-ready / parallel-ready are a controller prompting
+    ITSELF ("worker says done: b-663 -> review?"). The old fallback coerced every
+    unrecognised type to user_need, so 137 of 202 rows on a real machine told the
+    operator a human decision was pending that no human had ever been asked for.
+    Rendered on a phone that was 57 screens of demand.
+
+    Pinned as a DROP rather than a deny-list of known automation kinds: a
+    deny-list rots the moment a producer adds a kind, and the failure mode of
+    forgetting is silent laundering again. Also pinned is that the four real
+    kinds still survive -- over-correcting into dropping everything would be
+    just as wrong and far quieter.
+    """
+    summary = {"needs": [
+        {"type": "done-suggest", "ts": "2026-08-02T10:00:00+00:00", "dispatch_id": "a", "text": "worker says done"},
+        {"type": "resume-ready", "ts": "2026-08-02T10:00:00+00:00", "dispatch_id": "b", "text": "276 ready"},
+        {"type": "parallel-ready", "ts": "2026-08-02T10:00:00+00:00", "dispatch_id": "c", "text": "fan out"},
+        {"type": "totally-new-automation-kind", "ts": "2026-08-02T10:00:00+00:00", "dispatch_id": "d", "text": "future"},
+        {"type": "user_need", "ts": "2026-08-02T10:00:00+00:00", "dispatch_id": "e", "text": "decide"},
+        {"type": "user_confirm", "ts": "2026-08-02T10:00:00+00:00", "dispatch_id": "f", "text": "approve"},
+        {"type": "blocked", "ts": "2026-08-02T10:00:00+00:00", "dispatch_id": "g", "text": "stuck"},
+        {"type": "advisory", "ts": "2026-08-02T10:00:00+00:00", "dispatch_id": "h", "text": "fyi"},
+    ]}
+    rows = F._attention_rows(summary)
+    kinds = sorted(row["kind"] for row in rows)
+    assert_true(
+        "only real operator attention survives",
+        kinds == ["advisory", "blocked", "user_confirm", "user_need"],
+    )
+    assert_true(
+        "an unknown FUTURE kind is dropped, not promoted",
+        all(row["dispatch_id"] != "d" for row in rows),
+    )
+
+
 def main() -> None:
     fleet_payload = test_fleet_consumes_status_once_before_project_grouping()
     attention_payload = test_attention_uses_envelope_timestamps_and_tolerates_missing_fleet_join()
@@ -421,6 +459,7 @@ def main() -> None:
     test_source_error_is_bounded_and_not_a_false_success()
     test_registry_pass_is_bounded_and_reports_what_it_skipped()
     test_degraded_sample_exits_nonzero_instead_of_looking_healthy()
+    test_unrecognised_attention_type_is_dropped_not_promoted()
     test_allowlist_rejects_unknown_and_unsafe_fields(attention_payload)
     print("OK: fleet-console projection tests pass")
 
