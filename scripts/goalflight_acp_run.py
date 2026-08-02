@@ -3929,11 +3929,26 @@ async def _run_acp_dispatch_impl(
                 if permission_denied
                 else "blocked_user_confirm_denied"
             )
+            # Carry the QUESTION TEXT, not just its id. The text has always been
+            # recorded under user_confirm_resolved[].text, but the error payload
+            # named only ids -- so a controller seeing a denied run could not tell
+            # a deny-by-default bug from a genuinely dangerous request, and could
+            # not pre-authorize the action next time. A field report hit exactly
+            # that: an auto-denied read-only review, diagnosable only by digging
+            # a level deeper into status than the error invited.
             error = {
                 "code": 0,
                 "message": "requested_action_denied_safe_work_preserved",
                 "question_ids": [
                     str(question.get("question_id")) for question in denied_questions
+                ],
+                "denied_questions": [
+                    {
+                        "question_id": str(question.get("question_id")),
+                        "origin": question.get("origin"),
+                        "text": _compact_permission_str(question.get("text"), 300),
+                    }
+                    for question in denied_questions
                 ],
             }
         # Sweep B P1 (2026-05-27): denied permissions can look like success.
