@@ -34,7 +34,8 @@
 #                   (terminal-marker subset; emphasis-tolerant for grok's **MARKER:**)
 #   --poll-secs     15
 #   --max-idle-secs 180   (matches protocol idle/no-progress guidance)
-#   --cpu-epsilon   0.1   (process-group %CPU above this is running_quiet)
+#   --cpu-epsilon   0.1   (process-group CPU % of one core above this is running_quiet;
+#                          measured as a cputime delta, not ps's decaying %cpu average)
 #
 # Intended to be backgrounded by commands/execute.md (the bash-tail dispatch branch):
 #   bash <skill-root>/scripts/watch-dispatch-tail.sh \
@@ -48,6 +49,217 @@
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Process-group CPU as percent of ONE core, mirrored from
+# scripts/goalflight_liveness.py (pgroup_cpu_pct / cpu_pct_from_cputime_delta).
+#
+# Why not ps %cpu: on Darwin %cpu is a DECAYING AVERAGE, measured up to 4x wrong
+# in both directions at transitions (ps 95.4% for a process truly at 25% just
+# after it stopped burning; ps 0.7% for one truly at 9.2% doing short bursts).
+# Those transitions are exactly when this watcher decides working vs wedged.
+# Differencing cumulative cpu-time (`ps -o time=`) across two samples measures
+# the rate over the window that actually elapsed.
+#
+# Warm path: the main poll loop keeps the previous sample between iterations so
+# each tick costs one ps sweep (no sleep). Cold path (first call / aged-out
+# cache): take a second sample after a short deliberate pause — a rate cannot
+# be read from a single cumulative counter.
+#
+# Sample format: newline-separated "pid cputime_seconds" for pids in the group.
+# Cache is process-local to this watcher (one pgid at a time).
+_CPU_SAMPLE_WARM_MIN_S=0.2
+_CPU_SAMPLE_COLD_WINDOW_S=0.6
+_CPU_SAMPLE_MAX_AGE_S=60
+_CPU_CACHE_PGID=""
+_CPU_CACHE_TS=""
+_CPU_CACHE_SAMPLE=""
+
+# Monotonic seconds as a float. date +%s is whole-second and wall-clock (jumps
+# on sleep/NTP); python time.monotonic matches the python twin and resolves the
+# cold-window sub-second pause. python3 is a hard dep of this script.
+_cpu_monotonic_now() {
+  python3 -c 'import time; print("%.6f" % time.monotonic())' 2>/dev/null
+}
+
+# Parse a ps TIME field -- [[DD-]HH:]MM:SS[.ss] -- into seconds.
+# Derivation: ps omits leading zero groups, so the rightmost colon field is
+# always seconds, then minutes, then hours (powers of 60 right-to-left). A
+# leading "N-" is whole days. Left-to-right accumulation (secs = secs*60 + part)
+# is algebraically identical to the right-to-left sum and is what awk does here.
+# Unit check: "1:02:03" -> 3723; "0:00.06" -> 0.06; "2-03:04:05" -> 183845.
+parse_ps_cputime() {
+  # $1 = field; prints seconds on stdout. Empty / unparsable -> exit 1.
+  local field="$1"
+  [ -n "$field" ] || return 1
+  printf '%s\n' "$field" | awk '
+    {
+      text = $0
+      days = 0
+      if (index(text, "-") > 0) {
+        split(text, dparts, "-")
+        days = dparts[1] + 0
+        text = dparts[2]
+      }
+      n = split(text, parts, ":")
+      if (n < 1) { exit 1 }
+      secs = 0
+      for (i = 1; i <= n; i++) {
+        secs = secs * 60 + (parts[i] + 0)
+      }
+      printf "%.6f\n", days * 86400 + secs
+      exit 0
+    }'
+}
+
+# One ps sweep for a process group -> "pid seconds" lines on stdout.
+# Returns 1 only when the ps sample itself is unavailable (caller -> "unknown").
+# An empty group (no matching pids) is a successful empty sample, not unknown.
+pgroup_cputime_snapshot() {
+  local pgid="$1"
+  local raw
+  if ! raw=$(ps -A -o pgid=,pid=,time= 2>/dev/null); then
+    return 1
+  fi
+  printf '%s\n' "$raw" | awk -v target="$pgid" '
+    function parse_time(field,    days, n, parts, i, secs, text) {
+      text = field
+      days = 0
+      if (index(text, "-") > 0) {
+        split(text, dparts, "-")
+        days = dparts[1] + 0
+        text = dparts[2]
+      }
+      n = split(text, parts, ":")
+      secs = 0
+      for (i = 1; i <= n; i++) {
+        secs = secs * 60 + (parts[i] + 0)
+      }
+      return days * 86400 + secs
+    }
+    NF >= 3 && ($1 + 0) == (target + 0) {
+      printf "%s %.6f\n", $2, parse_time($3)
+    }
+  '
+  return 0
+}
+
+# Percent of one core burned by a process group over window_s.
+# Paired PER PID rather than summing the group (see python twin docstring):
+#   - exited child: drop it (do not go negative)
+#   - born child: count its full cpu-time (all of it is in-window)
+#   - matched pid: after - before when positive
+cpu_pct_from_cputime_delta() {
+  local before="$1"
+  local after="$2"
+  local window="$3"
+  # awk gets the two samples via env-style -v; newlines stay intact in gawk/nawk
+  # when passed as -v values on modern macOS awk. Fall back through printf pipe
+  # if a platform ever strips them: keep the separator form below.
+  {
+    printf '%s\n' "$before"
+    printf '%s\n' "--"
+    printf '%s\n' "$after"
+  } | awk -v window="$window" '
+    BEGIN {
+      side = 0
+      # Nonpositive window: a rate is undefined. Print once in END (awk still
+      # runs END after exit-from-BEGIN, so printing here would double the line).
+    }
+    $0 == "--" { side = 1; next }
+    NF >= 2 {
+      pid = $1
+      secs = $2 + 0
+      if (side == 0) {
+        before[pid] = secs
+      } else {
+        after_pids[pid] = secs
+      }
+    }
+    END {
+      if ((window + 0) <= 0) {
+        printf "0.0\n"
+        exit 0
+      }
+      busy = 0
+      for (pid in after_pids) {
+        a = after_pids[pid]
+        if (!(pid in before)) {
+          busy += a
+        } else if (a > before[pid]) {
+          busy += a - before[pid]
+        }
+      }
+      if (busy < 0) busy = 0
+      printf "%.1f\n", busy / window * 100.0
+    }
+  '
+}
+
+pgroup_cpu_pct() {
+  local pgid="$1"
+  local now sample window later later_sample pct
+
+  if [ -z "$pgid" ]; then
+    echo "unknown"
+    return 0
+  fi
+
+  now=$(_cpu_monotonic_now) || true
+  if [ -z "$now" ]; then
+    echo "unknown"
+    return 0
+  fi
+
+  if ! sample=$(pgroup_cputime_snapshot "$pgid"); then
+    echo "unknown"
+    return 0
+  fi
+
+  # Warm path: difference against the previous loop iteration's sample.
+  if [ -n "$_CPU_CACHE_TS" ] \
+     && [ "$_CPU_CACHE_PGID" = "$pgid" ]; then
+    window=$(awk -v now="$now" -v prev="$_CPU_CACHE_TS" \
+      'BEGIN { printf "%.6f", now - prev }')
+    if awk -v w="$window" \
+           -v mn="$_CPU_SAMPLE_WARM_MIN_S" \
+           -v mx="$_CPU_SAMPLE_MAX_AGE_S" \
+           'BEGIN { exit !((w + 0) >= (mn + 0) && (w + 0) <= (mx + 0)) }'; then
+      pct=$(cpu_pct_from_cputime_delta "$_CPU_CACHE_SAMPLE" "$sample" "$window")
+      _CPU_CACHE_PGID="$pgid"
+      _CPU_CACHE_TS="$now"
+      _CPU_CACHE_SAMPLE="$sample"
+      printf '%s\n' "$pct"
+      return 0
+    fi
+  fi
+
+  # Cold path: no usable cached sample. One deliberate short sleep to build a
+  # rate — same shape as goalflight_liveness.pgroup_cpu_pct.
+  sleep "$_CPU_SAMPLE_COLD_WINDOW_S"
+  later=$(_cpu_monotonic_now) || true
+  if [ -z "$later" ]; then
+    echo "unknown"
+    return 0
+  fi
+  if ! later_sample=$(pgroup_cputime_snapshot "$pgid"); then
+    echo "unknown"
+    return 0
+  fi
+  window=$(awk -v now="$later" -v prev="$now" \
+    'BEGIN { printf "%.6f", now - prev }')
+  pct=$(cpu_pct_from_cputime_delta "$sample" "$later_sample" "$window")
+  _CPU_CACHE_PGID="$pgid"
+  _CPU_CACHE_TS="$later"
+  _CPU_CACHE_SAMPLE="$later_sample"
+  printf '%s\n' "$pct"
+  return 0
+}
+# Pure CPU helpers above are sourceable for unit tests without running the watcher:
+#   GOALFLIGHT_WATCH_HELPERS_ONLY=1 source scripts/watch-dispatch-tail.sh
+if [ "${GOALFLIGHT_WATCH_HELPERS_ONLY:-}" = "1" ]; then
+  return 0 2>/dev/null || exit 0
+fi
+
 
 default_marker_re() {
   PYTHONPATH="$SCRIPT_DIR" python3 - <<'PY'
@@ -154,25 +366,6 @@ PIDFILE="$PIDFILE_DIR/${CONTROLLER_PID}.bashtail.${WORKER_PID}.jsonl"
 ps_meta() {
   local pid="$1"
   ps -o lstart=,comm= -p "$pid" 2>/dev/null | head -1
-}
-
-pgroup_cpu_pct() {
-  local pgid="$1"
-  local sample
-  if ! sample=$(ps -A -o pgid=,%cpu= 2>/dev/null); then
-    echo "unknown"
-    return 0
-  fi
-  printf '%s\n' "$sample" | awk -v target="$pgid" '
-    BEGIN { sum = 0; found = 0 }
-    $1 == target { sum += $2 + 0; found = 1 }
-    END {
-      if (found) {
-        printf "%.1f\n", sum
-      } else {
-        printf "0.0\n"
-      }
-    }'
 }
 
 worker_pgid_current() {

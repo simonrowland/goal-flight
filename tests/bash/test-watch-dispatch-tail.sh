@@ -787,6 +787,114 @@ err=/tmp/test-watch-arg-validation-$$.err
 expect_eq "case-5c exit code on non-integer --controller-pid" "64" "$?"
 rm -f "$err"
 
+# ---- Case 6: pure CPU helpers (cputime delta, not ps %cpu decaying average) ----
+# Mirrors tests/python/test_goalflight_liveness.py pure-function pins so a
+# revert to summing ps %cpu fails these without needing a full watcher run.
+GOALFLIGHT_WATCH_HELPERS_ONLY=1
+# shellcheck source=../../scripts/watch-dispatch-tail.sh
+. "$WATCHER"
+unset GOALFLIGHT_WATCH_HELPERS_ONLY
+
+# Structural pins: the production snapshot must read cumulative time=, and must
+# not request ps's decaying %cpu column on any non-comment line. A revert that
+# puts `%cpu=` back into the ps invocation fails both without needing a full
+# watcher run (the live spinner case below is the runtime complement).
+if grep -q 'pgid=,pid=,time=' "$WATCHER"; then
+  expect_eq "case-6 snapshot uses cumulative time= column" "yes" "yes"
+else
+  expect_eq "case-6 snapshot uses cumulative time= column" "yes" "no"
+fi
+code_uses_pct_cpu=no
+while IFS= read -r line || [ -n "$line" ]; do
+  code=${line%%#*}
+  case "$code" in
+    *%cpu*) code_uses_pct_cpu=yes; break ;;
+  esac
+done < "$WATCHER"
+expect_eq "case-6 no non-comment %cpu in watcher" "no" "$code_uses_pct_cpu"
+
+got=$(parse_ps_cputime "0:00.06")
+expect_eq "case-6 parse 0:00.06" "0.060000" "$got"
+got=$(parse_ps_cputime "1:02:03")
+expect_eq "case-6 parse 1:02:03" "3723.000000" "$got"
+got=$(parse_ps_cputime "2-03:04:05")
+expect_eq "case-6 parse 2-03:04:05" "183845.000000" "$got"
+got=$(parse_ps_cputime "315:47.25")
+expect_eq "case-6 parse 315:47.25" "18947.250000" "$got"
+
+got=$(cpu_pct_from_cputime_delta "7 4.0" "7 5.0" 1.0)
+expect_eq "case-6 one saturated core is 100%" "100.0" "$got"
+got=$(cpu_pct_from_cputime_delta "$(printf '7 4.0\n8 1.0')" "$(printf '7 5.0\n8 2.0')" 1.0)
+expect_eq "case-6 two saturated cores is 200%" "200.0" "$got"
+got=$(cpu_pct_from_cputime_delta "7 4.0" "7 4.0" 1.0)
+expect_eq "case-6 idle process is 0%" "0.0" "$got"
+# Exited child must not drive the group negative (pairing pin, not just sign).
+got=$(cpu_pct_from_cputime_delta "$(printf '100 10.0\n101 30.0')" "100 10.5" 1.0)
+expect_eq "case-6 exited child ignored (not negative)" "50.0" "$got"
+# Born child: all of its cpu-time is in-window.
+got=$(cpu_pct_from_cputime_delta "100 10.0" "$(printf '100 10.0\n102 2.0')" 2.0)
+expect_eq "case-6 born child counts in full" "100.0" "$got"
+got=$(cpu_pct_from_cputime_delta "1 0.0" "1 5.0" 0.0)
+expect_eq "case-6 nonpositive window is 0%" "0.0" "$got"
+
+# Live sampler: measures NOW, not a decaying average. Spinner in its own
+# session (mirrors start_new_session workers), then sleeps — delta must drop
+# to ~0 immediately while a decaying %cpu average would still carry the spin.
+SPIN_FLAG="/tmp/test-watch-cpu-spin-$$.flag"
+rm -f "$SPIN_FLAG"
+python3 - "$SPIN_FLAG" <<'PY' &
+import os, pathlib, sys, time
+os.setsid()
+flag = pathlib.Path(sys.argv[1])
+end = time.time() + 3.0
+x = 0
+while time.time() < end:
+    x += 1
+flag.write_text("done")
+time.sleep(60)
+PY
+SPIN_PID=$!
+# Reset any cache left over from earlier helper probes in this shell.
+_CPU_CACHE_PGID=""
+_CPU_CACHE_TS=""
+_CPU_CACHE_SAMPLE=""
+# Wait briefly for the child to enter its spin.
+sleep 0.3
+SPIN_PGID=$(ps -o pgid= -p "$SPIN_PID" 2>/dev/null | tr -d ' ')
+if [ -z "$SPIN_PGID" ]; then
+  expect_eq "case-6 live spinner started" "yes" "no"
+else
+  busy=$(pgroup_cpu_pct "$SPIN_PGID")
+  # Flat-out spinner on one core must read clearly busy (same floor as python twin).
+  if awk -v b="$busy" 'BEGIN { exit !(b + 0 > 25.0) }'; then
+    expect_eq "case-6 live spinner reads busy (not decaying-average blind)" "busy" "busy"
+  else
+    expect_eq "case-6 live spinner reads busy (not decaying-average blind)" "busy>25" "got-$busy"
+  fi
+  # Wait for the spin→sleep transition the child signals.
+  for _i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
+    [ -f "$SPIN_FLAG" ] && break
+    sleep 0.1
+  done
+  if [ -f "$SPIN_FLAG" ]; then
+    # Discard the mid-spin baseline, then sample a window that lies entirely
+    # after the CPU went quiet.
+    pgroup_cpu_pct "$SPIN_PGID" >/dev/null
+    sleep 0.7
+    settled=$(pgroup_cpu_pct "$SPIN_PGID")
+    if awk -v s="$settled" 'BEGIN { exit !(s + 0 < 2.0) }'; then
+      expect_eq "case-6 stopped spinner reads idle (cputime delta, not decay)" "idle" "idle"
+    else
+      expect_eq "case-6 stopped spinner reads idle (cputime delta, not decay)" "idle<2" "got-$settled"
+    fi
+  else
+    expect_eq "case-6 spinner signalled finished" "yes" "no"
+  fi
+fi
+kill "$SPIN_PID" 2>/dev/null
+wait "$SPIN_PID" 2>/dev/null
+rm -f "$SPIN_FLAG"
+
 # ---- Summary ----
 echo "===== watch-dispatch-tail: $pass passed, $fail failed ====="
 exit $fail
