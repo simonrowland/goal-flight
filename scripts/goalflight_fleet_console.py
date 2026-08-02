@@ -26,6 +26,7 @@ ROOT = SCRIPT_DIR.parent
 sys.path.insert(0, str(SCRIPT_DIR))
 sys.path.insert(0, str(ROOT))
 
+import goalflight_dispatch_states
 import goalflight_fleet_status_cli
 import goalflight_messages
 import goalflight_session_status
@@ -38,6 +39,12 @@ FLEET_SCHEMA = "goalflight.fleet-console.fleet.v1"
 ATTENTION_SCHEMA = "goalflight.fleet-console.attention.v1"
 PRODUCER_NAME = "goalflight_fleet_console.py"
 SCRIPT_GLOBALS = {"fleet": "GF_FLEET", "attention": "GF_ATTENTION"}
+
+# Head of the recency-ordered project registry to sample per tick. See
+# _registered_projects for the measurement that sets this: the per-project
+# cost is ~1.0s, and the drain tick this rides is ~60s, so the whole
+# per-project pass has to fit in a fraction of that alongside everything else.
+DEFAULT_MAX_PROJECTS = 12
 
 # Fields rejected at the shareable-mirror boundary even when an upstream
 # payload supplies them.  The allowlists below are the positive authority;
@@ -80,7 +87,10 @@ FLEET_FIELD_ALLOWLIST: dict[str, Any] = {
     "last_success_at": None,
     "producer": {"name": None, "plane": None},
     "last_error": None,
+    "registry_total": None,
+    "registry_deep_sampled": None,
     "machine": {
+        "queue_depth": None,
         "operating_cap": None,
         "active_leases": None,
         "local_workers": None,
@@ -119,6 +129,11 @@ FLEET_FIELD_ALLOWLIST: dict[str, Any] = {
             "registered": None,
             "last_seen": None,
             "skill_version": None,
+            "queue": {
+                "depth": None,
+                "lanes": [{"agent": None, "count": None}],
+                "oldest_created_at": None,
+            },
             "session": {
                 "available": None,
                 "active": None,
@@ -504,7 +519,134 @@ def _milestone_row(payload: object) -> dict[str, Any]:
     }
 
 
-def _registered_projects(payload: object) -> list[dict[str, Any]]:
+def _roots_with_records(machine_status: object) -> set[str]:
+    """Canonical roots with a LIVE worker right now.
+
+    Deliberately not "has a dispatch record": the ledger keeps terminal
+    records forever, so that set was 282 roots on this machine while only 17
+    had anything actually running. Prioritising 282 candidates for 12 slots
+    is not prioritising. Liveness is what the operator is watching, and it
+    is what makes the deep sample cheap when work is concentrated -- fifty
+    queued workers in one project is one project to sample, not twelve.
+    """
+    status = machine_status if isinstance(machine_status, dict) else {}
+    dispatch = status.get("dispatch")
+    records = (dispatch or {}).get("records") if isinstance(dispatch, dict) else []
+    roots = set()
+    for item in records or []:
+        if isinstance(item, dict):
+            state = item.get("state")
+            terminal = item.get("terminal_state")
+            if goalflight_dispatch_states.is_terminal_state(state) or (
+                terminal and goalflight_dispatch_states.is_terminal_state(terminal)
+            ):
+                continue
+            root = _canonical_root(item.get("project_root"))
+            if root is not None:
+                roots.add(root)
+    return roots
+
+
+def _queue_summary(machine_status: object) -> tuple[dict[str, dict[str, Any]], int]:
+    """Per-project queue depth from the dispatch queue, plus a machine total.
+
+    Queued work is INVISIBLE in dispatch records -- an entry becomes a record
+    only once it launches. Without this, fifty queued research workers show as
+    an empty fleet, and a queue draining (or stalled) cannot be watched at all,
+    which is the single thing an operator most wants to see during a large fan-
+    out.
+
+    Read straight from the queue directory rather than through a peer module:
+    no existing component projects queue depth, so there is nothing to consume.
+    Cost is one readdir plus a small JSON parse per entry.
+    """
+    status = machine_status if isinstance(machine_status, dict) else {}
+    dispatch = status.get("dispatch")
+    state_dir = (dispatch or {}).get("state_dir") if isinstance(dispatch, dict) else None
+    if not isinstance(state_dir, str) or not state_dir:
+        return {}, 0
+    queue_dir = Path(state_dir) / "dispatch-queue"
+    by_root: dict[str, dict[str, Any]] = {}
+    total = 0
+    try:
+        entries = sorted(queue_dir.iterdir())
+    except OSError:
+        return {}, 0
+    for entry in entries:
+        if not entry.is_file():
+            continue
+        try:
+            row = json.loads(entry.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(row, dict):
+            continue
+        root = _canonical_root(row.get("project_root"))
+        if root is None:
+            continue
+        total += 1
+        bucket = by_root.setdefault(root, {"depth": 0, "lanes": {}, "oldest_created_at": None})
+        bucket["depth"] += 1
+        agent = _display(row.get("agent"), limit=32) or "unknown"
+        bucket["lanes"][agent] = bucket["lanes"].get(agent, 0) + 1
+        created = _iso_timestamp(row.get("created_at"))
+        if created and (bucket["oldest_created_at"] is None or created < bucket["oldest_created_at"]):
+            bucket["oldest_created_at"] = created
+    for bucket in by_root.values():
+        bucket["lanes"] = [
+            {"agent": agent, "count": count}
+            for agent, count in sorted(bucket["lanes"].items(), key=lambda kv: (-kv[1], kv[0]))
+        ]
+    return by_root, total
+
+
+def _empty_queue_row() -> dict[str, Any]:
+    return {"depth": 0, "lanes": [], "oldest_created_at": None}
+
+
+def _attach_queue_rows(
+    projects: list[dict[str, Any]],
+    queue_by_root: dict[str, dict[str, Any]],
+) -> None:
+    """Merge queue depth onto project rows, keyed by the SAME id the rows use.
+
+    Project rows carry ``project_id`` (a hash) rather than the raw root, which
+    is on the deny list, so the join has to go through _project_id as well.
+    Every row gets a queue key: an absent queue must read as depth 0, never as
+    a missing field a renderer has to interpret.
+    """
+    by_id = {_project_id(root): row for root, row in queue_by_root.items()}
+    for project in projects:
+        found = by_id.get(project.get("project_id"))
+        project["queue"] = dict(found) if found else _empty_queue_row()
+
+
+def _registered_projects(
+    payload: object,
+    *,
+    active_roots: set[str] | None = None,
+    limit: int = DEFAULT_MAX_PROJECTS,
+) -> tuple[list[dict[str, Any]], int]:
+    """Return (sampled projects, total registered).
+
+    Sampling every registered project is not viable. The registry accumulates a
+    root for every project any dispatch ever ran in, including throwaway
+    per-ticket worktrees. Measured on this machine: 1433 registered roots at
+    ~1.0s each (one session_status plus one milestone call), so a full serial
+    pass costs ~1433s against a ~60s drain tick. That 24x overrun is why this
+    projection hung and emitted nothing at all.
+
+    Bounded by RECENCY, because the operator cares about projects with current
+    activity and the registry already records ``last_seen``. ISO-8601 sorts
+    lexicographically, so newest-first is a plain reverse string sort; entries
+    with no timestamp sort last rather than being dropped, since a missing
+    timestamp is unknown recency, not proven staleness.
+
+    The total is returned alongside so the payload can say how many were NOT
+    sampled. A silent cap would read as "these are all your projects" -- the
+    field-asserting-an-unmeasured-state failure this projection exists to
+    avoid.
+    """
     rows = payload if isinstance(payload, list) else []
     result = []
     seen: set[str] = set()
@@ -522,7 +664,21 @@ def _registered_projects(payload: object) -> list[dict[str, Any]]:
                 "skill_version": _display(row.get("skill_version"), limit=32),
             }
         )
-    return result
+    total = len(result)
+    # A project with work in flight outranks a merely-recent one: that is what
+    # the operator is actually watching. Recency breaks ties.
+    active = active_roots or set()
+    result.sort(
+        key=lambda item: (
+            item["root"] in active,
+            item["last_seen"] is not None,
+            item["last_seen"] or "",
+        ),
+        reverse=True,
+    )
+    if limit is not None and limit >= 0:
+        result = result[:limit]
+    return result, total
 
 
 def _project_rows(
@@ -639,11 +795,20 @@ def build_fleet_plane(
         [],
     )
 
+    queue_by_root, queue_total = _queue_summary(machine_status)
+    sampled_projects, registry_total = _registered_projects(
+        registered,
+        active_roots=_roots_with_records(machine_status),
+    )
     projects, unassigned = _project_rows(
         machine_status if isinstance(machine_status, dict) else {},
-        _registered_projects(registered),
+        sampled_projects,
         errors,
     )
+    # Attach queue depth by the project's own root. Every row gets the key --
+    # the allowlist requires it, and an absent queue must read as depth 0, not
+    # as a missing field a renderer has to guess about.
+    _attach_queue_rows(projects, queue_by_root)
     finished_at = _utc_now()
     payload = {
         "schema": FLEET_SCHEMA,
@@ -654,7 +819,17 @@ def build_fleet_plane(
             finished_at=finished_at,
             errors=errors,
         ),
-        "machine": _machine_row(machine_status if isinstance(machine_status, dict) else {}),
+        # These count the REGISTRY pass, not len(projects): a project with a
+        # live dispatch record gets a row even when it is outside the deep
+        # sample, so projects[] is legitimately larger. Naming them
+        # projects_* invited reading 24 as "you have 24 projects" while 283
+        # were listed.
+        "registry_total": registry_total,
+        "registry_deep_sampled": len(sampled_projects),
+        "machine": {
+            **_machine_row(machine_status if isinstance(machine_status, dict) else {}),
+            "queue_depth": queue_total,
+        },
         "vendors": _vendor_rows(usage_rows),
         "remote": _remote_row(remote_status),
         "projects": projects,
@@ -779,9 +954,30 @@ def main(argv: list[str] | None = None) -> int:
             fleet_dir=args.fleet_dir,
         )
     if args.output is not None:
+        # A missing parent directory is a first-run footgun, not a reason to
+        # crash without a payload: create it rather than leaving the operator
+        # with a traceback and no mirror.
+        Path(args.output).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
         publish_plane(args.output, payload, args.plane)
     else:
         print(json.dumps(payload, indent=2, sort_keys=True))
+
+    # A DEGRADED sample must not exit 0. Source failures are captured as data
+    # so a partial payload still publishes -- that is deliberate, and it is
+    # also exactly how a scheduler learns nothing went wrong when it did. A
+    # sample whose sources all failed produces zeros and empty lists, which a
+    # page renders as a calm, healthy fleet.
+    #
+    # last_success_at is None precisely when at least one source failed, so it
+    # is the honest signal. Exit 1 there, and say why on stderr, so a cron or
+    # drain tick and a human both see the same verdict.
+    if payload.get("last_success_at") is None:
+        print(
+            f"fleet-console {args.plane} sample DEGRADED: "
+            f"{payload.get('last_error') or 'one or more sources failed'}",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 

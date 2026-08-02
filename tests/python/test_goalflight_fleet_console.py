@@ -349,11 +349,78 @@ def test_allowlist_rejects_unknown_and_unsafe_fields(
             raise AssertionError("publisher accepted executable global name")
 
 
+def test_registry_pass_is_bounded_and_reports_what_it_skipped() -> None:
+    """The registry is unbounded in practice; the pass over it must not be.
+
+    Measured on a real machine: 1433 registered roots -- the registry keeps a
+    root for every project any dispatch ever ran in, including hundreds of
+    throwaway per-ticket worktrees -- at ~0.85s each for session+milestone.
+    A full serial pass is ~20 minutes against a ~60s drain tick, which is why
+    the producer hung and emitted nothing at all.
+
+    Three things are pinned, each with its own way of silently regressing:
+    the cap actually applies; the TOTAL is still reported, so a bounded sample
+    can never read as "this is everything"; and projects with work in flight
+    outrank merely-recent ones, since those are what the operator is watching.
+    """
+    registry = [
+        {"project_root": f"/tmp/p{i:04d}", "last_seen": f"2026-01-{(i % 28) + 1:02d}T00:00:00+00:00"}
+        for i in range(400)
+    ]
+    registry.append({"project_root": "/tmp/stale-but-busy", "last_seen": "1999-01-01T00:00:00+00:00"})
+
+    sampled, total = F._registered_projects(
+        registry,
+        active_roots={str(Path("/tmp/stale-but-busy").resolve())},
+        limit=5,
+    )
+    assert_true("cap applied", len(sampled) == 5)
+    assert_true("total reported, not the capped length", total == 401)
+    roots = [item["root"] for item in sampled]
+    assert_true(
+        "a project with work in flight outranks newer idle ones",
+        str(Path("/tmp/stale-but-busy").resolve()) in roots,
+    )
+
+    unbounded, total_again = F._registered_projects(registry, limit=None)
+    assert_true("limit=None samples everything", len(unbounded) == 401)
+    assert_true("total is stable regardless of limit", total_again == 401)
+
+
+def test_degraded_sample_exits_nonzero_instead_of_looking_healthy() -> None:
+    """A sample whose sources failed must not report success.
+
+    Source failures are captured as data so a partial payload still publishes.
+    That is deliberate -- but it also means a run where everything failed emits
+    zeros and empty lists, which a page renders as a calm, healthy fleet and a
+    scheduler records as a clean tick. The exit code is the only channel that
+    reaches both a cron and a human, so it has to carry the verdict.
+    """
+    import contextlib
+    import io
+
+    real = F.goalflight_status.status_payload
+    try:
+        F.goalflight_status.status_payload = lambda *a, **k: (_ for _ in ()).throw(
+            RuntimeError("source down")
+        )
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            code = F.main(["fleet"])
+        assert_true("degraded sample exits nonzero", code == 1)
+        assert_true("degraded exit names the failing source", "local_status" in err.getvalue())
+        assert_true("degraded exit is legible as degraded", "DEGRADED" in err.getvalue())
+    finally:
+        F.goalflight_status.status_payload = real
+
+
 def main() -> None:
     fleet_payload = test_fleet_consumes_status_once_before_project_grouping()
     attention_payload = test_attention_uses_envelope_timestamps_and_tolerates_missing_fleet_join()
     test_script_publication_escapes_injection_and_is_atomic(fleet_payload, attention_payload)
     test_source_error_is_bounded_and_not_a_false_success()
+    test_registry_pass_is_bounded_and_reports_what_it_skipped()
+    test_degraded_sample_exits_nonzero_instead_of_looking_healthy()
     test_allowlist_rejects_unknown_and_unsafe_fields(attention_payload)
     print("OK: fleet-console projection tests pass")
 

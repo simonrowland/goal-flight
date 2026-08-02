@@ -880,7 +880,15 @@ def test_pgroup_cpu_pct_measures_now_not_a_decaying_average() -> None:
             if busy is None:
                 print("SKIP: process-group CPU sampler unavailable")
                 return
-            assert busy > 25.0, f"a flat-out spinner must read busy, got {busy}"
+            # Scale-free on purpose. An absolute floor assumes the spinner WINS a
+            # core; under a loaded box (this suite runs at load 20+) it may get a
+            # fraction, and the test fails for a reason unrelated to what it
+            # checks. What is being tested is a REVERSAL: the delta method reads
+            # high-then-zero, while ps %cpu reads low-then-high (no decay has
+            # accumulated at process start, and it lingers after the spin). Both
+            # readings scale down together under contention, so their ORDER is
+            # the load-independent signal.
+            assert busy > 0.0, f"a flat-out spinner must burn measurable CPU, got {busy}"
 
             # Wait on the observable transition, never on a fixed sleep: the
             # child tells us when it stopped burning.
@@ -904,9 +912,15 @@ def test_pgroup_cpu_pct_measures_now_not_a_decaying_average() -> None:
             # no cpu-time at all, so the delta is 0.0 by construction. That is
             # the sharp edge against a decaying average, which still carries
             # the spin it just finished.
+            # Absolute here IS load-independent: a sleeping process accrues no
+            # cpu-time no matter how busy the machine is.
             assert settled < 2.0, (
                 f"a process that stopped burning must read idle, got {settled}. "
                 "A decaying ps %cpu average would still carry the finished spin."
+            )
+            assert busy > settled, (
+                f"busy ({busy}) must exceed settled ({settled}); ps %cpu inverts "
+                "this, reading low at spin-up and high after the spin ends."
             )
         finally:
             worker.terminate()
