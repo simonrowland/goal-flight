@@ -199,7 +199,25 @@ block on raw logs.
 
 For multi-dispatch joins, use
 `python3 <skill-root>/scripts/goalflight_status.py --wait id1,id2 --wait-timeout <s>`.
-Exit 0 means every requested dispatch is terminal; exit 1 means pending/timeout.
+Exit 0 means every requested dispatch is terminal; exit 1 means pending/timeout;
+**exit 3 means mail arrived while you were waiting** and the wait returned early
+so you can read it. Workers may still be running -- that is why it is not 0 --
+and the re-arm command, pre-filled with the ids still pending, is printed on
+stderr.
+
+Branch on all three. A controller that treats any non-zero as failure will read
+an early mail wake as a broken wait, abandon its workers, and go back to
+polling by hand. That is the exact behaviour this replaced: before the wake
+existed, worker escalations sat unread for hours while a human relayed messages
+between sessions.
+
+To be told about mail without waiting on any dispatch at all, background a
+listener. It prints NOTHING until something arrives, so one call can stay open
+across a long stretch of work:
+
+```bash
+python3 <skill-root>/scripts/goalflight_messages.py listen
+```
 
 7. Completion:
 

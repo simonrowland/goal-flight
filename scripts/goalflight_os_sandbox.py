@@ -147,6 +147,22 @@ def _scheme_string(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+def goalflight_worker_channel_roots() -> list[str]:
+    """Paths a sandboxed worker needs in order to SEND mail.
+
+    A worker under workspace-write could not write the messages directory at
+    all, so its only way to reach a controller was a marker in its console log
+    that the watcher happened to scrape. That is why controllers ended up
+    inventing side-channel files: the real channel was write-locked against the
+    agents that most needed it.
+
+    Scope is deliberately the messages tree only. The fleet directory holds the
+    registry and the derived aggregate -- state a worker consumes but must never
+    author -- and stays denied.
+    """
+    return [str(Path.home() / ".goal-flight" / "messages")]
+
+
 def _agent_state_roots(agent: str | None, command: str) -> list[str]:
     label = (agent or "").lower()
     binary = Path(command).name.lower()
@@ -228,7 +244,9 @@ def macos_write_roots(cwd: str, profile: str, *, agent: str | None = None, comma
                 f"inside allowed temp root {root!r}; move the worktree or use off"
             )
     roots.extend(temp_roots)
-    agent_roots = _unique_real_paths(_agent_state_roots(agent, command))
+    agent_roots = _unique_real_paths(
+        _agent_state_roots(agent, command) + goalflight_worker_channel_roots()
+    )
     for root in agent_roots:
         if _path_contains(root, cwd):
             raise OsSandboxError(

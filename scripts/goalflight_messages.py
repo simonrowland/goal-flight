@@ -14,6 +14,7 @@ import subprocess
 import uuid
 from pathlib import Path
 import sys
+import time
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
@@ -1690,6 +1691,80 @@ def merge_remote_register(
     return {"merged_into": str(dest), "appended": appended, "open_user_needs": len(aggregate.get("open_user_needs") or [])}
 
 
+def cmd_listen(args) -> int:
+    """Block silently until new mail arrives for this project, then report.
+
+    The point is the SILENCE. A controller told to background a long-poll is
+    asleep by design; a listener that chatters costs it context for nothing, and
+    one that returns immediately trains it to ignore the signal. This emits
+    nothing at all until something arrives, so a controller can leave one call
+    open across a long stretch of work without paying for the wait.
+
+    Only mail that arrives AFTER the listener starts counts. Waking on the
+    existing backlog would return instantly for any controller with unread mail
+    -- and on this machine that backlog is 100+ envelopes, some 32 days old. Use
+    `relay --new` to read what is already there; use this to be told about what
+    is not there yet.
+
+    Exits 0 when mail arrives, 1 on timeout. Fail-open: if the mailbox cannot be
+    read at all, say so on stderr and exit 2 rather than blocking forever on a
+    channel that will never deliver.
+    """
+    project_root = Path(args.project_root).resolve() if args.project_root else Path.cwd()
+    messages_dir = args.messages_dir or default_messages_dir()
+    fleet_dir = args.fleet_dir if args.fleet_dir is not None else default_fleet_dir()
+    poll = max(0.5, float(args.poll_secs or 5.0))
+    deadline = None
+    if args.timeout_s and float(args.timeout_s) > 0:
+        deadline = time.monotonic() + float(args.timeout_s)
+
+    def watermark():
+        """(inbox, seq) pairs, not a count: acking lowers a count, so a count
+        would read an ack as 'nothing new' and then miss the next arrival that
+        merely restored the old number. Pairs only ever add."""
+        try:
+            summary = controller_mail_summary(
+                owned_dispatch_ids=None,
+                task_store_project_root=project_root,
+                messages_dir=messages_dir,
+                fleet_dir=fleet_dir,
+            )
+        except Exception as exc:  # noqa: BLE001 - reported, not swallowed
+            raise RuntimeError(str(exc)) from exc
+        return {
+            (str(item.get("dispatch_id")), item.get("seq")): item
+            for item in (summary.get("needs") or [])
+        }
+
+    try:
+        baseline = watermark()
+    except RuntimeError as exc:
+        print(f"listen: cannot read mailbox: {exc}", file=sys.stderr)
+        return 2
+
+    while True:
+        if deadline is not None and time.monotonic() >= deadline:
+            print("listen: timed out with no new mail", file=sys.stderr)
+            return 1
+        time.sleep(poll)
+        try:
+            current = watermark()
+        except RuntimeError as exc:
+            print(f"listen: cannot read mailbox: {exc}", file=sys.stderr)
+            return 2
+        fresh = [current[key] for key in current if key not in baseline]
+        if not fresh:
+            continue
+        if args.json:
+            print(json.dumps({"new_mail": len(fresh), "items": fresh}, sort_keys=True, default=str))
+        else:
+            print(format_mail_notice(len(fresh)))
+            for item in fresh:
+                print(f"  {item.get('dispatch_id')} [{item.get('type')}] "
+                      f"{sanitize_display(item.get('text') or '', limit=140)}")
+        return 0
+
+
 def cmd_mirror(args: argparse.Namespace) -> int:
     result = merge_remote_register(args.fleet_dir, args.remote, messages_dir=args.messages_dir)
     print(json.dumps(result, indent=2))
@@ -1796,8 +1871,19 @@ def main(argv: list[str] | None = None) -> int:
     )
     relay.set_defaults(func=cmd_relay)
 
+    listen = sub.add_parser(
+        "listen",
+        help="block SILENTLY until new mail arrives, then print it and exit",
+    )
+    listen.add_argument("--project-root", default=None)
+    listen.add_argument("--poll-secs", type=float, default=5.0)
+    listen.add_argument("--timeout-s", type=float, default=0.0,
+                        help="0 = wait indefinitely")
+    listen.add_argument("--json", action="store_true")
+
     mirror = sub.add_parser("mirror")
     mirror.add_argument("--remote", type=Path, required=True, help="Remote *.jsonl inbox to merge")
+    listen.set_defaults(func=cmd_listen)
     mirror.set_defaults(func=cmd_mirror)
 
     args = parser.parse_args(argv)

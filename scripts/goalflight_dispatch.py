@@ -8513,6 +8513,14 @@ def main(argv: list[str] | None = None) -> int:
             env["CODEX_HOME"] = codex_dispatch_home
             summary_head["codex_home"] = codex_dispatch_home
         env["GOALFLIGHT_STEER_FILE"] = str(steer_file)
+        # A worker's only channel used to be markers scraped out of its console
+        # log, which the watcher bridges into mail. That makes every message a
+        # side effect of stdout: it cannot be addressed, cannot be typed, and
+        # arrives only if the scrape recognises it. Telling the worker its own
+        # dispatch id gives it a first-class SIDEBAND -- it can post a real
+        # envelope with goalflight_messages.py while still writing prose to its
+        # log for the human reading the tail.
+        env["GOALFLIGHT_DISPATCH_ID"] = str(args.dispatch_id)
         if original_prompt_path:
             env["GOALFLIGHT_PROMPT_FILE"] = str(original_prompt_path)
         else:
