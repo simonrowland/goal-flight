@@ -65,14 +65,32 @@ codex's own read-only sandbox + non-interactive approval policy, NOT as a
 nested ACP tool-call inside the worker's shim.** Read-only sandbox enforces
 the safety property the ACP permission gate was protecting;
 `-c approval_policy=never` removes the asking flow that's redundant when the
-inner sandbox is already constraining the subprocess. The two together let
-the goal-mode worker run its own review without triggering ACP permission
-elicitation. Do NOT use `--dangerously-bypass-approvals-and-sandbox` — it is
+inner sandbox is already constraining the subprocess.
+
+**Run it CONTROLLER-SIDE. A dispatched worker cannot review its own work.**
+This paragraph used to claim the two flags let a goal-mode worker run its own
+review; they do not, and no flag can. Measured 2026-08-02: the worker's
+command-execution sandbox denies DNS to **every child process** -- python
+`socket.gaierror`, `curl: (6) Could not resolve host`, and `codex exec` failing
+identically under `workspace-write` and `read-only` alike. The review needs the
+network to reach a model, so it dies before it starts. Changing the INNER
+sandbox profile cannot grant connectivity the PARENT denied.
+
+The failure surfaces as a bare `Operation not permitted` or a DNS lookup error,
+neither of which names the cause -- so briefing a worker to "run your mandatory
+independent review" produces a worker that correctly refuses to commit and
+escalates `BLOCKED:` against an instruction that was never satisfiable. Three
+workers did exactly that in one day, and their finished work sat staged for
+hours. Review is the controller's job on receipt (see the null-hypothesis gate
+above); a worker's own pass is the executor SELF-review, which is reasoning over
+its diff, not a nested model call.
+
+Do NOT use `--dangerously-bypass-approvals-and-sandbox` — it is
 rejected by classifiers and forbidden in adapter manifests
 (`adapters/*.json` `forbidden_args`); `-c approval_policy=never` paired with
 `--sandbox read-only` is the canonical non-interactive form.
 
-Canonical invocation (worker-internal or controller-side, same shape):
+Canonical invocation (controller-side; see above for why not worker-internal):
 
 ```bash
 mkdir -p docs-private/reviews/<date>-<slug>   # the redirects below do NOT create it
