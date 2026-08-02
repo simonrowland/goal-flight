@@ -1802,6 +1802,13 @@ def wait_for_dispatches(
         except Exception:
             pass
 
+    # Baseline AFTER the arming notice: only mail that arrives while the
+    # controller is asleep should wake it. Waking on mail that was already
+    # open would return instantly on every wait for a controller with a
+    # non-empty inbox, which trains people to ignore the signal -- the same
+    # way an always-red gate stops meaning anything.
+    mail_baseline = _mail_watermark(project_root, wait_ids)
+
     start = time.monotonic()
     poll_s = max(0.05, poll_s)
     if timeout_s in (None, 0, 0.0):
@@ -1875,10 +1882,66 @@ def wait_for_dispatches(
                         print(_wait_verdict_line(row))
                 return 1
 
+            # New mail is a reason to wake. It is by definition something a
+            # human or a peer controller decided this controller needed, which
+            # outranks saving one re-arm -- and the re-arm is printed below,
+            # pre-filled, so it costs a single call.
+            if mail_baseline is not None:
+                current = _mail_watermark(project_root, wait_ids)
+                fresh = (current - mail_baseline) if current is not None else set()
+                if fresh:
+                    pending = [r["dispatch_id"] for r in rows if not r["terminal"]]
+                    if json_output:
+                        print(json.dumps(
+                            {"ok": False, "woken_by": "mail", "new_mail": len(fresh),
+                             "pending": pending, "dispatches": rows},
+                            sort_keys=True,
+                        ))
+                    else:
+                        print(f"wait woken by mail: {len(fresh)} new; "
+                              f"{sum(1 for r in rows if r['terminal'])}/{len(rows)} terminal")
+                    print(
+                        f"new mail: python3 {Path(__file__).resolve()} --wait "
+                        f"{','.join(pending)}  # re-arm after reading",
+                        file=sys.stderr,
+                    )
+                    return _WAIT_EXIT_MAIL
+
             time.sleep(poll_s)
     except KeyboardInterrupt:
         print(_wait_interrupt_hint(wait_ids), file=sys.stderr)
         return 130
+
+
+# --wait exit codes: 0 all terminal, 1 timeout, 2 usage, 3 woken by new mail,
+# 130 interrupt. A mail wake MUST NOT reuse 0 -- callers key off the code, and
+# reporting "all terminal" for a wait that ended with workers still running is
+# the same false-verdict class this module keeps having to fix.
+_WAIT_EXIT_MAIL = 3
+
+
+def _mail_watermark(project_root: str | None, wait_ids: list[str]) -> set[tuple[str, object]] | None:
+    """Identity of the controller's currently-open mail, or None if unavailable.
+
+    A set of (inbox, seq) pairs rather than a count. Acking lowers the count, so
+    a count-based check would read an ack as "no new mail" and then miss a later
+    arrival that merely restored the old number. Pairs only ever ADD.
+
+    Fail-open: any error returns None, which disables the mail wake for this
+    wait rather than breaking it. A messaging glitch must never cost a
+    controller its watcher.
+    """
+    try:
+        import goalflight_messages as _gm
+
+        summary = _gm.controller_mail_summary(
+            owned_dispatch_ids=set(wait_ids),
+            task_store_project_root=Path(project_root) if project_root else None,
+        )
+        items = summary.get("needs") or []
+        return {(str(item.get("dispatch_id")), item.get("seq")) for item in items}
+    except Exception:
+        return None
 
 
 def _mail_summary(owned_dispatch_ids: set[str] | None = None, *, project_root: Path | None = None) -> dict:
