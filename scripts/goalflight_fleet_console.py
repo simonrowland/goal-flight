@@ -1,0 +1,789 @@
+#!/usr/bin/env python3
+"""Backend-only, shareable projections for the Goal Flight fleet console.
+
+This module is a consumer of the existing status authorities.  It does not
+read dispatch ledgers, status sidecars, tails, marker files, or process tables,
+and it deliberately does not classify workers.  Fleet and attention samples
+are independent so a fast mailbox refresh never pretends to refresh worker
+liveness.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import math
+import re
+import sys
+import uuid
+from pathlib import Path
+from typing import Any, Callable
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+ROOT = SCRIPT_DIR.parent
+sys.path.insert(0, str(SCRIPT_DIR))
+sys.path.insert(0, str(ROOT))
+
+import goalflight_fleet_status_cli
+import goalflight_messages
+import goalflight_session_status
+import goalflight_status
+import goalflight_task
+import goalflight_usage
+
+
+FLEET_SCHEMA = "goalflight.fleet-console.fleet.v1"
+ATTENTION_SCHEMA = "goalflight.fleet-console.attention.v1"
+PRODUCER_NAME = "goalflight_fleet_console.py"
+SCRIPT_GLOBALS = {"fleet": "GF_FLEET", "attention": "GF_ATTENTION"}
+
+# Fields rejected at the shareable-mirror boundary even when an upstream
+# payload supplies them.  The allowlists below are the positive authority;
+# this deny set documents the highest-risk omissions for audits and tests.
+DENIED_FIELDS = frozenset(
+    {
+        "account",
+        "account_identity",
+        "argv",
+        "codex_home",
+        "effective_account",
+        "error",
+        "last_marker",
+        "marker",
+        "marker_body",
+        "payload",
+        "project_root",
+        "prompt",
+        "prompt_path",
+        "raw_marker",
+        "reason",
+        "status_path",
+        "stderr_path",
+        "stdout_path",
+        "tail",
+        "tail_path",
+        "text",
+        "worker_identity",
+    }
+)
+
+# ``None`` means a scalar leaf; ``[schema]`` means a homogeneous list.  These
+# schemas double as executable allowlists: every completed projection is
+# validated before it can be returned or published.
+FLEET_FIELD_ALLOWLIST: dict[str, Any] = {
+    "schema": None,
+    "generation_id": None,
+    "sample_started_at": None,
+    "sample_finished_at": None,
+    "last_success_at": None,
+    "producer": {"name": None, "plane": None},
+    "last_error": None,
+    "machine": {
+        "operating_cap": None,
+        "active_leases": None,
+        "local_workers": None,
+        "rate_pressure": [
+            {"provider": None, "scope": None, "count": None}
+        ],
+        "warnings": [{"code": None, "severity": None, "count": None}],
+    },
+    "vendors": [
+        {
+            "provider": None,
+            "seat_index": None,
+            "remaining": None,
+            "reset_at": None,
+            "flags": [None],
+        }
+    ],
+    "remote": {
+        "available": None,
+        "nodes": [{"node_id": None, "dispatches": None, "auth_states": [None]}],
+        "workers": [
+            {
+                "dispatch_id": None,
+                "node_id": None,
+                "state": None,
+                "quarantine_reason": None,
+                "ssh_reachable": None,
+                "may_release": None,
+            }
+        ],
+    },
+    "projects": [
+        {
+            "project_id": None,
+            "name": None,
+            "registered": None,
+            "last_seen": None,
+            "skill_version": None,
+            "session": {
+                "available": None,
+                "active": None,
+                "queue_state": None,
+                "queue_last_touched": None,
+                "active_leases": None,
+            },
+            "milestone": {
+                "available": None,
+                "active_cadence": None,
+                "commits_since": None,
+                "cadence": None,
+                "due": None,
+            },
+            "workers": [
+                {
+                    "dispatch_id": None,
+                    "agent": None,
+                    "engine": None,
+                    "shape": None,
+                    "transport": None,
+                    "os_sandbox": None,
+                    "state": None,
+                    "classification": None,
+                    "terminal_state": None,
+                    "liveness_state": None,
+                    "worker_alive": None,
+                    "started_at": None,
+                    "ended_at": None,
+                }
+            ],
+        }
+    ],
+    "unassigned_workers": [
+        {
+            "dispatch_id": None,
+            "agent": None,
+            "engine": None,
+            "shape": None,
+            "transport": None,
+            "os_sandbox": None,
+            "state": None,
+            "classification": None,
+            "terminal_state": None,
+            "liveness_state": None,
+            "worker_alive": None,
+            "started_at": None,
+            "ended_at": None,
+        }
+    ],
+}
+
+ATTENTION_FIELD_ALLOWLIST: dict[str, Any] = {
+    "schema": None,
+    "generation_id": None,
+    "sample_started_at": None,
+    "sample_finished_at": None,
+    "last_success_at": None,
+    "producer": {"name": None, "plane": None},
+    "last_error": None,
+    "age_granularity": None,
+    "items": [
+        {
+            "dispatch_id": None,
+            "seq": None,
+            "kind": None,
+            "action": None,
+            "observed_at": None,
+            "headline": None,
+        }
+    ],
+}
+
+FIELD_ALLOWLISTS = {
+    "fleet": FLEET_FIELD_ALLOWLIST,
+    "attention": ATTENTION_FIELD_ALLOWLIST,
+}
+
+_ABSOLUTE_PATH = re.compile(
+    r"(^|[\s(\[{'\"])/(?!/)[^\s<>\"']+|(^|[\s(\[{'\"])[A-Za-z]:\\[^\s<>\"']+"
+)
+_ATTENTION_KINDS = frozenset({"user_need", "user_confirm", "blocked", "advisory"})
+
+
+class ProjectionSecurityError(ValueError):
+    """A projection tried to cross the mirror boundary with an unsafe shape."""
+
+
+def _validate_allowlist(value: Any, schema: Any, *, path: str) -> None:
+    if schema is None:
+        if isinstance(value, (dict, list, tuple)):
+            raise ProjectionSecurityError(f"{path}: expected scalar")
+        return
+    if isinstance(schema, dict):
+        if not isinstance(value, dict):
+            raise ProjectionSecurityError(f"{path}: expected object")
+        unexpected = set(value) - set(schema)
+        if unexpected:
+            names = ", ".join(sorted(str(item) for item in unexpected))
+            raise ProjectionSecurityError(f"{path}: fields not allowlisted: {names}")
+        missing = set(schema) - set(value)
+        if missing:
+            names = ", ".join(sorted(str(item) for item in missing))
+            raise ProjectionSecurityError(f"{path}: required fields absent: {names}")
+        for key, child_schema in schema.items():
+            _validate_allowlist(value[key], child_schema, path=f"{path}.{key}")
+        return
+    if isinstance(schema, list) and len(schema) == 1:
+        if not isinstance(value, list):
+            raise ProjectionSecurityError(f"{path}: expected list")
+        for index, item in enumerate(value):
+            _validate_allowlist(item, schema[0], path=f"{path}[{index}]")
+        return
+    raise ProjectionSecurityError(f"{path}: invalid allowlist schema")
+
+
+def _validate_no_absolute_paths(value: Any, *, path: str = "$") -> None:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            _validate_no_absolute_paths(item, path=f"{path}.{key}")
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            _validate_no_absolute_paths(item, path=f"{path}[{index}]")
+    elif isinstance(value, str) and _ABSOLUTE_PATH.search(value):
+        raise ProjectionSecurityError(f"{path}: absolute path denied")
+
+
+def validate_projection(payload: dict[str, Any], plane: str) -> None:
+    """Validate the explicit field allowlist and path-denial policy."""
+    schema = FIELD_ALLOWLISTS.get(plane)
+    if schema is None:
+        raise ProjectionSecurityError(f"unknown plane: {plane}")
+    _validate_allowlist(payload, schema, path="$" )
+    _validate_no_absolute_paths(payload)
+
+
+def _utc_now() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+
+
+def _iso_timestamp(value: object) -> str | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc).isoformat(timespec="seconds")
+
+
+def _number(value: object) -> int | float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    if not math.isfinite(number):
+        return None
+    return int(number) if number.is_integer() else number
+
+
+def _display(value: object, *, limit: int = 96) -> str | None:
+    if value is None:
+        return None
+    text = goalflight_messages.sanitize_display(value, limit=limit)
+    text = _ABSOLUTE_PATH.sub(lambda match: f"{match.group(1) or match.group(2) or ''}[path]", text)
+    return text or None
+
+
+def _safe_error(source: str, exc: BaseException) -> str:
+    return f"{source}:{type(exc).__name__}"
+
+
+def _generation_id(plane: str, supplied: str | None) -> str:
+    value = supplied or f"{plane}-{uuid.uuid4()}"
+    return _display(value, limit=128) or f"{plane}-unknown"
+
+
+def _metadata(
+    plane: str,
+    *,
+    generation_id: str,
+    started_at: str,
+    finished_at: str,
+    errors: list[str],
+) -> dict[str, Any]:
+    return {
+        "generation_id": generation_id,
+        "sample_started_at": started_at,
+        "sample_finished_at": finished_at,
+        "last_success_at": finished_at if not errors else None,
+        "producer": {"name": PRODUCER_NAME, "plane": plane},
+        "last_error": errors[-1] if errors else None,
+    }
+
+
+def _capture(
+    source: str,
+    errors: list[str],
+    producer: Callable[[], Any],
+    fallback: Any,
+) -> Any:
+    try:
+        return producer()
+    except Exception as exc:  # source failures are data, not a false healthy sample
+        errors.append(_safe_error(source, exc))
+        return fallback
+
+
+def _project_id(project_root: str) -> str:
+    name = Path(project_root).name or "project"
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-") or "project"
+    digest = hashlib.sha256(project_root.encode("utf-8")).hexdigest()[:10]
+    return f"{safe_name}-{digest}"
+
+
+def _canonical_root(value: object) -> str | None:
+    if not isinstance(value, str) or not value:
+        return None
+    return str(Path(value).expanduser().resolve(strict=False))
+
+
+def _worker_row(record: dict[str, Any]) -> dict[str, Any]:
+    # No state derivation here: all state/liveness values are copied from the
+    # one reconciled goalflight_status sample.
+    alive = record.get("worker_still_alive")
+    return {
+        "dispatch_id": _display(record.get("dispatch_id"), limit=128),
+        "agent": _display(record.get("agent"), limit=64),
+        "engine": _display(record.get("engine"), limit=64),
+        "shape": _display(record.get("shape"), limit=64),
+        "transport": _display(record.get("transport"), limit=64),
+        "os_sandbox": _display(record.get("os_sandbox"), limit=32),
+        "state": _display(record.get("state"), limit=64),
+        "classification": _display(record.get("classification"), limit=64),
+        "terminal_state": _display(record.get("terminal_state"), limit=64),
+        "liveness_state": _display(record.get("liveness_state"), limit=64),
+        "worker_alive": alive if isinstance(alive, bool) else None,
+        "started_at": _iso_timestamp(record.get("started_at")),
+        "ended_at": _iso_timestamp(record.get("ended_at")),
+    }
+
+
+def _rate_pressure_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    pressure = payload.get("rate_pressure")
+    pressure = pressure if isinstance(pressure, dict) else {}
+    rows = []
+    for item in pressure.get("providers_under_pressure") or []:
+        if not isinstance(item, dict):
+            continue
+        rows.append(
+            {
+                "provider": _display(item.get("provider"), limit=64),
+                "scope": _display(item.get("scope"), limit=32),
+                "count": _number(item.get("count")),
+            }
+        )
+    return rows
+
+
+def _warning_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = []
+    for item in payload.get("warnings") or []:
+        if not isinstance(item, dict):
+            continue
+        rows.append(
+            {
+                "code": _display(item.get("code"), limit=64),
+                "severity": _display(item.get("severity"), limit=16),
+                "count": _number(item.get("queue_depth")),
+            }
+        )
+    return rows
+
+
+def _machine_row(payload: dict[str, Any]) -> dict[str, Any]:
+    capacity = payload.get("capacity")
+    capacity = capacity if isinstance(capacity, dict) else {}
+    capacity_state = payload.get("capacity_state")
+    capacity_state = capacity_state if isinstance(capacity_state, dict) else {}
+    leases = capacity_state.get("leases")
+    leases = leases if isinstance(leases, dict) else {}
+    active_leases = sum(
+        1 for item in leases.values() if isinstance(item, dict) and item.get("state") == "active"
+    )
+    dispatch = payload.get("dispatch")
+    dispatch = dispatch if isinstance(dispatch, dict) else {}
+    records = [item for item in dispatch.get("records") or [] if isinstance(item, dict)]
+    return {
+        "operating_cap": _number(capacity.get("operating_cap")),
+        "active_leases": active_leases,
+        "local_workers": len(records),
+        "rate_pressure": _rate_pressure_rows(payload),
+        "warnings": _warning_rows(payload),
+    }
+
+
+def _vendor_rows(rows: object) -> list[dict[str, Any]]:
+    if not isinstance(rows, list):
+        return []
+    seat_indexes: dict[str, int] = {}
+    projected = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        provider = _display(row.get("provider"), limit=64) or "unknown"
+        seat_indexes[provider] = seat_indexes.get(provider, 0) + 1
+        flags = row.get("flags") if isinstance(row.get("flags"), list) else []
+        projected.append(
+            {
+                "provider": provider,
+                "seat_index": seat_indexes[provider],
+                "remaining": _display(row.get("remaining"), limit=128),
+                "reset_at": _number(row.get("reset_at")),
+                "flags": [item for item in (_display(flag, limit=32) for flag in flags) if item],
+            }
+        )
+    return projected
+
+
+def _remote_row(payload: object) -> dict[str, Any]:
+    data = payload if isinstance(payload, dict) else {}
+    workers = []
+    for row in data.get("dispatches") or []:
+        if not isinstance(row, dict):
+            continue
+        reachable = row.get("ssh_reachable")
+        workers.append(
+            {
+                "dispatch_id": _display(row.get("dispatch_id"), limit=128),
+                "node_id": _display(row.get("node"), limit=96),
+                "state": _display(row.get("state"), limit=64),
+                "quarantine_reason": _display(row.get("quarantine_reason"), limit=64),
+                "ssh_reachable": reachable if isinstance(reachable, bool) else None,
+                "may_release": row.get("may_release") if isinstance(row.get("may_release"), bool) else None,
+            }
+        )
+    nodes = []
+    for node in data.get("nodes") or []:
+        if not isinstance(node, dict):
+            continue
+        auth_states = []
+        for account in node.get("accounts") or []:
+            if not isinstance(account, dict):
+                continue
+            state = _display(account.get("auth_probe"), limit=32)
+            if state and state not in auth_states:
+                auth_states.append(state)
+        dispatches = node.get("dispatches")
+        nodes.append(
+            {
+                "node_id": _display(node.get("node_id"), limit=96),
+                "dispatches": len(dispatches) if isinstance(dispatches, list) else 0,
+                "auth_states": auth_states,
+            }
+        )
+    return {
+        "available": data.get("available") if isinstance(data.get("available"), bool) else False,
+        "nodes": nodes,
+        "workers": workers,
+    }
+
+
+def _session_row(payload: object) -> dict[str, Any]:
+    data = payload if isinstance(payload, dict) else {}
+    return {
+        "available": bool(data),
+        "active": data.get("active") if isinstance(data.get("active"), bool) else None,
+        "queue_state": _display(data.get("queue_state"), limit=32),
+        "queue_last_touched": _iso_timestamp(data.get("queue_last_touched")),
+        "active_leases": _number(data.get("active_leases_in_project")),
+    }
+
+
+def _milestone_row(payload: object) -> dict[str, Any]:
+    data = payload if isinstance(payload, dict) else {}
+    return {
+        "available": bool(data) and not bool(data.get("error")),
+        "active_cadence": data.get("active_cadence") if isinstance(data.get("active_cadence"), bool) else None,
+        "commits_since": _number(data.get("commits_since")),
+        "cadence": _number(data.get("K")),
+        "due": data.get("due") if isinstance(data.get("due"), bool) else None,
+    }
+
+
+def _registered_projects(payload: object) -> list[dict[str, Any]]:
+    rows = payload if isinstance(payload, list) else []
+    result = []
+    seen: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        root = _canonical_root(row.get("project_root"))
+        if root is None or root in seen:
+            continue
+        seen.add(root)
+        result.append(
+            {
+                "root": root,
+                "last_seen": _iso_timestamp(row.get("last_seen")),
+                "skill_version": _display(row.get("skill_version"), limit=32),
+            }
+        )
+    return result
+
+
+def _project_rows(
+    machine_status: dict[str, Any],
+    registered_projects: list[dict[str, Any]],
+    errors: list[str],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    dispatch = machine_status.get("dispatch")
+    dispatch = dispatch if isinstance(dispatch, dict) else {}
+    records = [item for item in dispatch.get("records") or [] if isinstance(item, dict)]
+    by_root = {item["root"]: item for item in registered_projects}
+    for record in records:
+        root = _canonical_root(record.get("project_root"))
+        if root is not None:
+            by_root.setdefault(root, {"root": root, "last_seen": None, "skill_version": None})
+
+    projects = []
+    assigned_dispatches: set[int] = set()
+    registered_roots = {item["root"] for item in registered_projects}
+    for root in sorted(by_root):
+        metadata = by_root[root]
+        scoped = goalflight_status.scope_payload(machine_status, root)
+        scoped_dispatch = scoped.get("dispatch") if isinstance(scoped, dict) else {}
+        scoped_records = (
+            [item for item in scoped_dispatch.get("records") or [] if isinstance(item, dict)]
+            if isinstance(scoped_dispatch, dict)
+            else []
+        )
+        for record in scoped_records:
+            assigned_dispatches.add(id(record))
+
+        if root in registered_roots:
+            session = _capture(
+                "session",
+                errors,
+                lambda root=root: goalflight_session_status.aggregate_status(Path(root)),
+                {},
+            )
+            milestone = _capture(
+                "milestone",
+                errors,
+                lambda root=root: goalflight_status.milestone_status_payload(root),
+                {},
+            )
+        else:
+            session = {}
+            milestone = {}
+
+        projects.append(
+            {
+                "project_id": _project_id(root),
+                "name": _display(Path(root).name or "project", limit=64),
+                "registered": root in registered_roots,
+                "last_seen": metadata.get("last_seen"),
+                "skill_version": metadata.get("skill_version"),
+                "session": _session_row(session),
+                "milestone": _milestone_row(milestone),
+                "workers": [_worker_row(record) for record in scoped_records],
+            }
+        )
+
+    # Records with no usable project root remain visible without inventing a
+    # controller/project association.  Object identity is stable across the
+    # shallow scope_payload filtering used above.
+    unassigned = [_worker_row(record) for record in records if id(record) not in assigned_dispatches]
+    return projects, unassigned
+
+
+def build_fleet_plane(
+    *,
+    fleet_dir: Path | None = None,
+    readers_dir: Path | None = None,
+    usage_timeout_s: float = goalflight_usage.DEFAULT_TIMEOUT_S,
+    generation_id: str | None = None,
+) -> dict[str, Any]:
+    """Build one machine-wide fleet sample, then group it by registered project."""
+    started_at = _utc_now()
+    errors: list[str] = []
+
+    # Machine-wide facts first.  The unscoped local authority is invoked once,
+    # and its reconciled records are only filtered afterward via scope_payload.
+    machine_status = _capture(
+        "local_status",
+        errors,
+        goalflight_status.status_payload,
+        {
+            "capacity": {},
+            "capacity_state": {"leases": {}},
+            "rate_pressure": {},
+            "dispatch": {"records": []},
+            "warnings": [],
+        },
+    )
+    resolved_fleet_dir = fleet_dir or goalflight_messages.default_fleet_dir()
+    remote_status = _capture(
+        "remote",
+        errors,
+        lambda: goalflight_fleet_status_cli.build_fleet_status(resolved_fleet_dir),
+        {},
+    )
+    usage_kwargs: dict[str, Any] = {"timeout_s": usage_timeout_s}
+    if readers_dir is not None:
+        usage_kwargs["readers_dir"] = readers_dir
+    usage_rows = _capture(
+        "usage",
+        errors,
+        lambda: goalflight_usage.collect_usage(**usage_kwargs),
+        [],
+    )
+    registered = _capture(
+        "projects",
+        errors,
+        goalflight_task.read_project_registry,
+        [],
+    )
+
+    projects, unassigned = _project_rows(
+        machine_status if isinstance(machine_status, dict) else {},
+        _registered_projects(registered),
+        errors,
+    )
+    finished_at = _utc_now()
+    payload = {
+        "schema": FLEET_SCHEMA,
+        **_metadata(
+            "fleet",
+            generation_id=_generation_id("fleet", generation_id),
+            started_at=started_at,
+            finished_at=finished_at,
+            errors=errors,
+        ),
+        "machine": _machine_row(machine_status if isinstance(machine_status, dict) else {}),
+        "vendors": _vendor_rows(usage_rows),
+        "remote": _remote_row(remote_status),
+        "projects": projects,
+        "unassigned_workers": unassigned,
+    }
+    validate_projection(payload, "fleet")
+    return payload
+
+
+def _attention_kind(value: object) -> str:
+    kind = str(value or "").strip().lower().replace("-", "_")
+    return kind if kind in _ATTENTION_KINDS else "user_need"
+
+
+def _attention_rows(summary: object) -> list[dict[str, Any]]:
+    data = summary if isinstance(summary, dict) else {}
+    rows = []
+    for item in data.get("needs") or []:
+        if not isinstance(item, dict):
+            continue
+        observed_at = _iso_timestamp(item.get("ts"))
+        kind = _attention_kind(item.get("type"))
+        rows.append(
+            {
+                "dispatch_id": _display(item.get("dispatch_id"), limit=128),
+                "seq": int(item["seq"]) if isinstance(item.get("seq"), int) else None,
+                "kind": kind,
+                "action": "review",
+                "observed_at": observed_at,
+                # Bounded, path-redacted mail display text; the raw body and raw
+                # marker payload never cross the allowlist.
+                "headline": _display(item.get("text"), limit=96),
+            }
+        )
+    rows.sort(key=lambda row: (row["observed_at"] is None, row["observed_at"] or "", row["dispatch_id"] or ""))
+    return rows
+
+
+def build_attention_plane(
+    *,
+    messages_dir: Path | None = None,
+    fleet_dir: Path | None = None,
+    generation_id: str | None = None,
+) -> dict[str, Any]:
+    """Build the fast attention sample from timestamped mail envelopes only."""
+    started_at = _utc_now()
+    errors: list[str] = []
+    kwargs: dict[str, Any] = {
+        "owned_dispatch_ids": None,
+        "task_store_project_root": None,
+        "unread_only": True,
+    }
+    if messages_dir is not None:
+        kwargs["messages_dir"] = messages_dir
+    if fleet_dir is not None:
+        kwargs["fleet_dir"] = fleet_dir
+    summary = _capture(
+        "mail",
+        errors,
+        lambda: goalflight_messages.controller_mail_summary(**kwargs),
+        {},
+    )
+    finished_at = _utc_now()
+    payload = {
+        "schema": ATTENTION_SCHEMA,
+        **_metadata(
+            "attention",
+            generation_id=_generation_id("attention", generation_id),
+            started_at=started_at,
+            finished_at=finished_at,
+            errors=errors,
+        ),
+        # Renderers derive minute buckets from observed_at at display time.  No
+        # marker timestamp and no sample-time age is substituted.
+        "age_granularity": "minute",
+        "items": _attention_rows(summary),
+    }
+    validate_projection(payload, "attention")
+    return payload
+
+
+def publish_plane(path: str | Path, payload: dict[str, Any], plane: str) -> Path:
+    """Validate and atomically publish one independently generated plane."""
+    validate_projection(payload, plane)
+    target = Path(path).expanduser().resolve()
+    goalflight_status.write_script_data_js(
+        target,
+        payload,
+        global_name=SCRIPT_GLOBALS[plane],
+    )
+    return target
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Goal Flight fleet-console projection producer")
+    subparsers = parser.add_subparsers(dest="plane", required=True)
+
+    fleet = subparsers.add_parser("fleet", help="sample local/remote fleet, usage, and projects")
+    fleet.add_argument("--fleet-dir", type=Path)
+    fleet.add_argument("--readers-dir", type=Path)
+    fleet.add_argument("--usage-timeout-s", type=float, default=goalflight_usage.DEFAULT_TIMEOUT_S)
+    fleet.add_argument("--output", type=Path, help="atomic GF_FLEET script output; JSON stdout when omitted")
+
+    attention = subparsers.add_parser("attention", help="sample timestamped operator attention mail")
+    attention.add_argument("--messages-dir", type=Path)
+    attention.add_argument("--fleet-dir", type=Path)
+    attention.add_argument("--output", type=Path, help="atomic GF_ATTENTION script output; JSON stdout when omitted")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    if args.plane == "fleet":
+        payload = build_fleet_plane(
+            fleet_dir=args.fleet_dir,
+            readers_dir=args.readers_dir,
+            usage_timeout_s=args.usage_timeout_s,
+        )
+    else:
+        payload = build_attention_plane(
+            messages_dir=args.messages_dir,
+            fleet_dir=args.fleet_dir,
+        )
+    if args.output is not None:
+        publish_plane(args.output, payload, args.plane)
+    else:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
