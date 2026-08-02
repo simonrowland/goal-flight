@@ -483,6 +483,60 @@ def test_controller_authored_mail_reaches_the_attention_plane() -> None:
     assert_true("automation is STILL dropped", "auto" not in by_id)
 
 
+def test_registry_membership_is_not_a_statement_about_sampling() -> None:
+    """A project outside the deep-sample cap is still registered.
+
+    registered_roots used to be built from the CAPPED sample, so the 13th
+    registered project -- one with a live dispatch record, therefore visible --
+    was emitted as registered=false purely because that tick did not sample it.
+    Two different questions had one answer.
+    """
+    machine = {
+        "schema": "goalflight.status.aggregate.v1",
+        "capacity": {},
+        "capacity_state": {"leases": {}},
+        "rate_pressure": {},
+        "warnings": [],
+        "dispatch": {"records": [
+            {"dispatch_id": "w1", "project_root": "/tmp/outside-the-cap", "state": "running"},
+        ]},
+    }
+    sampled = [{"root": F._canonical_root("/tmp/inside"), "last_seen": None, "skill_version": None}]
+    projects, _ = F._project_rows(
+        machine, sampled, [],
+        # Canonical form: _canonical_root resolves /tmp -> /private/tmp on
+        # macOS, and the join is on the resolved value.
+        all_registered_roots={
+            F._canonical_root("/tmp/inside"),
+            F._canonical_root("/tmp/outside-the-cap"),
+        },
+    )
+    by_name = {p["name"]: p for p in projects}
+    assert_true("the unsampled project still reports registered",
+                by_name["outside-the-cap"]["registered"] is True)
+    assert_true("and it did NOT get a deep sample",
+                by_name["outside-the-cap"]["session"]["available"] is False)
+
+
+def test_live_worker_count_ignores_permanent_terminal_history() -> None:
+    """"How many are running" must not answer "how much history is there".
+
+    The ledger keeps terminal records forever -- 1541 on a real machine against
+    37 actually running. A record can also read state="running" while its own
+    classification says worker_dead, so the check has to consider every field
+    the record uses to describe itself, not just the most convenient one.
+    """
+    records = [
+        {"dispatch_id": "live", "state": "running", "classification": "expected_live"},
+        {"dispatch_id": "done", "state": "complete"},
+        {"dispatch_id": "lying", "state": "running", "classification": "worker_dead"},
+        {"dispatch_id": "failed", "state": "running", "terminal_state": "failed"},
+    ]
+    row = F._machine_row({"dispatch": {"records": records}, "capacity": {}, "capacity_state": {}})
+    assert_true(f"only the genuinely live worker counts (got {row['local_workers']})",
+                row["local_workers"] == 1)
+
+
 def main() -> None:
     fleet_payload = test_fleet_consumes_status_once_before_project_grouping()
     attention_payload = test_attention_uses_envelope_timestamps_and_tolerates_missing_fleet_join()
@@ -492,6 +546,8 @@ def main() -> None:
     test_degraded_sample_exits_nonzero_instead_of_looking_healthy()
     test_unrecognised_attention_type_is_dropped_not_promoted()
     test_controller_authored_mail_reaches_the_attention_plane()
+    test_registry_membership_is_not_a_statement_about_sampling()
+    test_live_worker_count_ignores_permanent_terminal_history()
     test_allowlist_rejects_unknown_and_unsafe_fields(attention_payload)
     print("OK: fleet-console projection tests pass")
 

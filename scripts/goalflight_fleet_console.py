@@ -425,7 +425,11 @@ def _machine_row(payload: dict[str, Any]) -> dict[str, Any]:
     return {
         "operating_cap": _number(capacity.get("operating_cap")),
         "active_leases": active_leases,
-        "local_workers": len(records),
+        # Live workers, not len(records). The ledger keeps terminal records
+        # permanently -- 1541 on this machine against 37 actually running -- so
+        # counting rows answered "how much history is there", printed under a
+        # label that reads "how much is running".
+        "local_workers": sum(1 for item in records if not _record_is_terminal(item)),
         "rate_pressure": _rate_pressure_rows(payload),
         "warnings": _warning_rows(payload),
     }
@@ -535,11 +539,7 @@ def _roots_with_records(machine_status: object) -> set[str]:
     roots = set()
     for item in records or []:
         if isinstance(item, dict):
-            state = item.get("state")
-            terminal = item.get("terminal_state")
-            if goalflight_dispatch_states.is_terminal_state(state) or (
-                terminal and goalflight_dispatch_states.is_terminal_state(terminal)
-            ):
+            if _record_is_terminal(item):
                 continue
             root = _canonical_root(item.get("project_root"))
             if root is not None:
@@ -621,6 +621,38 @@ def _attach_queue_rows(
         project["queue"] = dict(found) if found else _empty_queue_row()
 
 
+def _record_is_terminal(record: object) -> bool:
+    """True when a dispatch record is finished by ANY of its own accounts.
+
+    Checks classification and terminal_state as well as state. A record can read
+    state="running" while its classification says worker_dead; trusting the
+    state string alone let a dead root win scarce deep-sample priority over a
+    live one.
+    """
+    if not isinstance(record, dict):
+        return True
+    for key in ("state", "terminal_state", "classification"):
+        if goalflight_dispatch_states.is_terminal_state(record.get(key)):
+            return True
+    return False
+
+
+def _all_registered_roots(payload: object) -> set[str]:
+    """Every root in the registry, independent of the deep-sample cap.
+
+    Kept separate from _registered_projects, which returns the CAPPED head:
+    conflating them made "registered" a statement about this tick's sampling
+    rather than about the project.
+    """
+    roots: set[str] = set()
+    for row in payload if isinstance(payload, list) else []:
+        if isinstance(row, dict):
+            root = _canonical_root(row.get("project_root"))
+            if root is not None:
+                roots.add(root)
+    return roots
+
+
 def _registered_projects(
     payload: object,
     *,
@@ -685,7 +717,16 @@ def _project_rows(
     machine_status: dict[str, Any],
     registered_projects: list[dict[str, Any]],
     errors: list[str],
+    all_registered_roots: set[str] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Rows for every project with a record, deep-sampling only the head.
+
+    ``registered_projects`` is the CAPPED sample; ``all_registered_roots`` is the
+    whole registry. They are different questions and were previously the same
+    set: "registered" answered from the sample, so the 13th registered project
+    was emitted as registered=false purely because this tick did not sample it.
+    Whether a project is registered has nothing to do with which head we chose.
+    """
     dispatch = machine_status.get("dispatch")
     dispatch = dispatch if isinstance(dispatch, dict) else {}
     records = [item for item in dispatch.get("records") or [] if isinstance(item, dict)]
@@ -697,7 +738,10 @@ def _project_rows(
 
     projects = []
     assigned_dispatches: set[int] = set()
-    registered_roots = {item["root"] for item in registered_projects}
+    # Deep-sample membership: who gets session/milestone calls this tick.
+    sampled_roots = {item["root"] for item in registered_projects}
+    # Registry membership: a fact about the project, independent of sampling.
+    registered_roots = set(all_registered_roots) if all_registered_roots is not None else sampled_roots
     for root in sorted(by_root):
         metadata = by_root[root]
         scoped = goalflight_status.scope_payload(machine_status, root)
@@ -710,7 +754,7 @@ def _project_rows(
         for record in scoped_records:
             assigned_dispatches.add(id(record))
 
-        if root in registered_roots:
+        if root in sampled_roots:
             session = _capture(
                 "session",
                 errors,
@@ -804,6 +848,7 @@ def build_fleet_plane(
         machine_status if isinstance(machine_status, dict) else {},
         sampled_projects,
         errors,
+        all_registered_roots=_all_registered_roots(registered),
     )
     # Attach queue depth by the project's own root. Every row gets the key --
     # the allowlist requires it, and an absent queue must read as depth 0, not
