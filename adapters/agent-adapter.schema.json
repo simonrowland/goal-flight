@@ -241,7 +241,8 @@
       "properties": {
         "skill_triggers": {"$ref": "#/$defs/stringArray"},
         "commands": {"$ref": "#/$defs/stringArray"},
-        "exec": {"$ref": "#/$defs/execSpec"}
+        "exec": {"$ref": "#/$defs/execSpec"},
+        "model_notes": {"type": "string", "minLength": 1}
       }
     },
     "execSpec": {

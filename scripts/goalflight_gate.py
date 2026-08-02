@@ -9,7 +9,7 @@ few summary lines, the failures, and the log path, and reads deeper only when
 something failed.
 
 Usage:
-    goalflight_gate.py                        # default: python3 -m pytest tests/python -q
+    goalflight_gate.py                        # default: ./tests/run.sh (all hermetic tiers)
     goalflight_gate.py -- <cmd> [args...]     # any gate command
     goalflight_gate.py --log PATH --tail N -- <cmd> [args...]
 
@@ -29,7 +29,7 @@ import sys
 import tempfile
 import time
 
-DEFAULT_CMD = [sys.executable, "-m", "pytest", "tests/python", "-q"]
+DEFAULT_CMD = [str(Path(__file__).resolve().parents[1] / "tests" / "run.sh")]
 DEFAULT_TAIL = 5
 MAX_FAILURE_LINES = 40
 

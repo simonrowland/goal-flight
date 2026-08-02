@@ -310,15 +310,9 @@ def main() -> None:
     case_claude_model_applies_after_session_new()
     case_build_worker_injects_model()
     case_retired_bare_grok_agent_label()
-    case_dispatch_acp_cfg_passes_resolved_prompt_file()
-    case_direct_acp_prompt_exports_resolved_prompt_file()
-    case_promptless_acp_spawn_env_clears_prompt_file()
-    case_acp_prompt_file_preamble_is_shared()
+    test_acp_prompt_file_env_and_preamble()
+    test_cursor_defaults_to_kimi_and_grok_is_one_flag_away()
     print("OK: model passthrough tests pass")
-
-
-if __name__ == "__main__":
-    main()
 
 
 def test_cursor_defaults_to_kimi_and_grok_is_one_flag_away():
@@ -343,3 +337,7 @@ def test_cursor_defaults_to_kimi_and_grok_is_one_flag_away():
     assert "claude" not in acp._DEFAULT_STRONG_MODEL
     assert "codex" not in acp._DEFAULT_STRONG_MODEL
     assert "grok" not in acp._DEFAULT_STRONG_MODEL
+
+
+if __name__ == "__main__":
+    main()

@@ -803,9 +803,14 @@ def test_golden_master_validation_rules() -> None:
 def test_runner_invokes_skill_structure() -> None:
     run_sh = read_repo_text("tests/run.sh")
     assert_true("tests/run.sh lists test_skill_structure", "tests/python/test_skill_structure.py" in run_sh)
-    assert_true("tests/run.sh uses python test glob", "for test in tests/python/test_*.py" in run_sh)
-    assert_true("tests/run.sh has structural-test execution sentinel", "skill_structure_seen" in run_sh)
-    assert_true("tests/run.sh fails if structural test not executed", "required Golden Master guard was not executed" in run_sh)
+    assert_true("tests/run.sh uses recursive python discovery", "find tests/python -type f -name 'test_*.py'" in run_sh)
+    assert_true("tests/run.sh delegates python execution to pytest", "python3 -m pytest tests/python -q" in run_sh)
+    assert_true("tests/run.sh has observed collection sentinel", "skill_structure_collected" in run_sh)
+    assert_true("tests/run.sh does not hardcode collection success", "skill_structure_collected=1" not in run_sh)
+    assert_true(
+        "tests/run.sh fails if structural test not collected",
+        "required Golden Master guard was not collected by the pytest driver" in run_sh,
+    )
     for acp_python in (None, "/tmp/goal-flight-missing-acp-python"):
         env = None
         label = "default env"
@@ -835,7 +840,19 @@ def test_runner_invokes_skill_structure() -> None:
         (fake_root / "tests/bash").mkdir(parents=True)
         (fake_root / "tests/python").mkdir(parents=True)
         shutil.copy2(ROOT / "tests/run.sh", fake_root / "tests/run.sh")
-        (fake_root / "tests/python/test_placeholder.py").write_text("print('placeholder')\n", encoding="utf-8")
+        shutil.copy2(ROOT / "tests/python/conftest.py", fake_root / "tests/python/conftest.py")
+        shutil.copy2(
+            ROOT / "tests/python/test_script_style_modules.py",
+            fake_root / "tests/python/test_script_style_modules.py",
+        )
+        (fake_root / "tests/python/test_dispatch_ergonomics.py").write_text(
+            "def test_dispatch_ergonomics():\n    pass\n",
+            encoding="utf-8",
+        )
+        (fake_root / "tests/python/test_placeholder.py").write_text(
+            "def test_placeholder():\n    pass\n",
+            encoding="utf-8",
+        )
         missing_guard_proc = subprocess.run(
             ["bash", "tests/run.sh"],
             cwd=fake_root,
@@ -847,7 +864,7 @@ def test_runner_invokes_skill_structure() -> None:
         assert_true("tests/run.sh fails when structural test absent", missing_guard_proc.returncode != 0)
         assert_true(
             "tests/run.sh absent structural test failure message",
-            "required Golden Master guard was not executed" in missing_guard_proc.stdout,
+            "required Golden Master guard was not collected by the pytest driver" in missing_guard_proc.stdout,
         )
     with tempfile.TemporaryDirectory() as tmpdir:
         fake_root = Path(tmpdir)
@@ -855,10 +872,36 @@ def test_runner_invokes_skill_structure() -> None:
         (fake_root / "tests/bash").mkdir(parents=True)
         (fake_root / "tests/python").mkdir(parents=True)
         shutil.copy2(ROOT / "tests/run.sh", fake_root / "tests/run.sh")
+        shutil.copy2(ROOT / "tests/python/conftest.py", fake_root / "tests/python/conftest.py")
+        shutil.copy2(
+            ROOT / "tests/python/test_script_style_modules.py",
+            fake_root / "tests/python/test_script_style_modules.py",
+        )
+        (fake_root / "tests/python/test_dispatch_ergonomics.py").write_text(
+            "def test_dispatch_ergonomics():\n    pass\n",
+            encoding="utf-8",
+        )
         (fake_root / "tests/python/test_skill_structure.py").write_text(
             "from pathlib import Path\n"
-            f"Path({str(marker)!r}).write_text('ran', encoding='utf-8')\n",
+            "def test_marks_execution():\n"
+            f"    Path({str(marker)!r}).write_text('ran', encoding='utf-8')\n",
             encoding="utf-8",
+        )
+        collection_env = os.environ.copy()
+        collection_env.pop("GOALFLIGHT_ISOLATED_TEST_FILE", None)
+        present_collection_proc = subprocess.run(
+            [sys.executable, "-m", "pytest", "tests/python", "--collect-only", "-q"],
+            cwd=fake_root,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=collection_env,
+            check=False,
+        )
+        assert_true(
+            f"fake pytest driver collects structural test: {present_collection_proc.stdout}{present_collection_proc.stderr}",
+            present_collection_proc.returncode == 0
+            and "test_isolated_test_module[test_skill_structure.py]" in present_collection_proc.stdout,
         )
         present_guard_proc = subprocess.run(
             ["bash", "tests/run.sh"],
@@ -868,7 +911,11 @@ def test_runner_invokes_skill_structure() -> None:
             stderr=subprocess.PIPE,
             check=False,
         )
-        assert_true(f"tests/run.sh fake structural test exits 0: {present_guard_proc.stdout}", present_guard_proc.returncode == 0)
+        assert_true(
+            "tests/run.sh fake structural test exits 0: "
+            f"{present_guard_proc.stdout}\ncollection:\n{present_collection_proc.stdout}",
+            present_guard_proc.returncode == 0,
+        )
         assert_true("tests/run.sh executes present structural test", marker.read_text(encoding="utf-8") == "ran")
     assert_true("tests/run.sh has no skip_skill_regression token", "skip_skill_regression" not in run_sh)
 

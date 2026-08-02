@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Discover and run test suites:
 #   - tests/bash/test-*.sh — bash tests (installers, codex overrides, fork-detect)
-#   - tests/python/test_*.py — Python tests (ACP client + pool + runner + failure modes)
+#   - tests/python/**/test_*.py — isolated Python modules routed by pytest
 #   - tests/js/test_*.js — Node-only hermetic browserless checks
-# One pass/fail per file. Exit code = number of failed tests.
+# One pass/fail per bash/JS file plus one pass/fail for the isolated Python suite.
+# Exit code = number of failed gate entries.
 #
 # Skips tests/python/dispatch_acp_chunk.py (live e2e against real codex-acp, non-hermetic).
 
@@ -23,9 +24,9 @@ fi
 
 pass=0
 fail=0
+skip=0
 failed_tests=()
-skill_structure_seen=0
-ACP_PY="${GOALFLIGHT_ACP_PYTHON:-$HOME/.goal-flight/venvs/acp-0.10/bin/python}"
+skill_structure_collected=0
 list_only=0
 if [ "${1:-}" = "--list" ]; then
   list_only=1
@@ -38,6 +39,7 @@ run_isolated_test_env() {
   # the suite isolates GOALFLIGHT_STATE_DIR). An explicit outer value passes
   # through for tests that deliberately exercise a real conf.
   env -u GOALFLIGHT_STEER_FILE -u GOALFLIGHT_ALLOW_EXTERNAL_STEER_FILE \
+    -u GOALFLIGHT_ISOLATED_TEST_FILE \
     GOALFLIGHT_CAPACITY_CONF="${GOALFLIGHT_CAPACITY_CONF:-/dev/null}" \
     GOALFLIGHT_TASK_STORE_DIR="${GOALFLIGHT_TASK_STORE_DIR:-$_GF_TASK_STORE_BASE}" "$@"
 }
@@ -59,6 +61,7 @@ for test in test-*.sh; do
     test-opencode-*.sh)
       if [ "${GOALFLIGHT_LIVE_OPENCODE:-0}" != "1" ]; then
         echo "SKIP  tests/bash/$test (live opencode ACP probe; set GOALFLIGHT_LIVE_OPENCODE=1 to run)"
+        skip=$((skip + 1))
         continue
       fi
       ;;
@@ -81,46 +84,40 @@ for test in test-*.sh; do
   rm -f /tmp/goal-flight-test-$$.out
 done
 
-# Python tests (tests/python/test_*.py; skips dispatch_acp_chunk.py — requires live codex-acp)
-# Golden Master guard: tests/python/test_skill_structure.py is intentionally covered by this glob.
+# Python tests. The directory-level pytest driver routes every module in a fresh
+# process: guarded case_* modules run as scripts, native pytest modules run under
+# pytest, and nested modules such as tests/python/ext/ stay visible. Directly
+# executing every file is not equivalent: files without a main guard exit 0
+# without running their test_* functions.
 if command -v python3 >/dev/null 2>&1 && [ -d "$REPO_ROOT/tests/python" ]; then
   cd "$REPO_ROOT"
-  for test in tests/python/test_*.py; do
-    [ -f "$test" ] || continue
-    py="python3"
-    case "$test" in
-      tests/python/test_acp_*.py|tests/python/test_os_sandbox.py)
-        py="$ACP_PY"
-        ;;
-    esac
-    if [ "$list_only" -ne 1 ] && [ "$py" = "$ACP_PY" ] && [ ! -x "$py" ]; then
-      echo "FAIL  $test"
-      echo "      SDK missing -- run install: $ACP_PY"
-      fail=$((fail + 1))
-      failed_tests+=("$test")
-      continue
+  if [ "$list_only" -eq 1 ]; then
+    find tests/python -type f -name 'test_*.py' -print | LC_ALL=C sort
+  else
+    # Measure collection through the same pytest/conftest contract that owns
+    # execution. Name the state precisely: collection is observed here; the
+    # driver and its regression test separately guarantee execution.
+    if run_isolated_test_env python3 -m pytest tests/python --collect-only -q \
+        > /tmp/goal-flight-collect-$$.out 2>&1; then
+      skill_structure_collected="$(
+        grep -Ec '::test_isolated_test_module\[test_skill_structure\.py\]$' \
+          /tmp/goal-flight-collect-$$.out || true
+      )"
     fi
-    if [ "$list_only" -eq 1 ]; then
-      echo "$test"
-      continue
-    fi
-    if run_isolated_test_env "$py" "$test" > /tmp/goal-flight-test-$$.out 2>&1; then
-      if [ "$test" = "tests/python/test_skill_structure.py" ]; then
-        skill_structure_seen=1
-      fi
-      echo "PASS  $test"
+    rm -f /tmp/goal-flight-collect-$$.out
+
+    if run_isolated_test_env python3 -m pytest tests/python -q > /tmp/goal-flight-test-$$.out 2>&1; then
+      echo "PASS  tests/python (isolated pytest directory suite)"
+      sed -n '$p' /tmp/goal-flight-test-$$.out | sed 's/^/      /'
       pass=$((pass + 1))
     else
-      if [ "$test" = "tests/python/test_skill_structure.py" ]; then
-        skill_structure_seen=1
-      fi
-      echo "FAIL  $test"
+      echo "FAIL  tests/python (isolated pytest directory suite)"
       cat /tmp/goal-flight-test-$$.out | sed 's/^/      /'
       fail=$((fail + 1))
-      failed_tests+=("$test")
+      failed_tests+=("tests/python")
     fi
     rm -f /tmp/goal-flight-test-$$.out
-  done
+  fi
 fi
 
 # JS tests (tests/js/test_*.js; skipped when node is unavailable)
@@ -134,6 +131,7 @@ if [ -d "$REPO_ROOT/tests/js" ]; then
     fi
     if ! command -v node >/dev/null 2>&1; then
       echo "SKIP  $test (node not found on PATH)"
+      skip=$((skip + 1))
       continue
     fi
     if run_isolated_test_env node "$test" > /tmp/goal-flight-test-$$.out 2>&1; then
@@ -149,9 +147,9 @@ if [ -d "$REPO_ROOT/tests/js" ]; then
   done
 fi
 
-if [ "$list_only" -ne 1 ] && [ "$skill_structure_seen" -ne 1 ]; then
+if [ "$list_only" -ne 1 ] && [ "$skill_structure_collected" -ne 1 ]; then
   echo "FAIL  tests/python/test_skill_structure.py"
-  echo "      required Golden Master guard was not executed"
+  echo "      required Golden Master guard was not collected by the pytest driver"
   fail=$((fail + 1))
   failed_tests+=("tests/python/test_skill_structure.py")
 fi
@@ -161,7 +159,7 @@ if [ "$list_only" -eq 1 ]; then
 fi
 
 echo
-echo "===== $pass passed, $fail failed ====="
+echo "===== $pass passed, $skip skipped, $fail failed ====="
 if [ "$fail" -gt 0 ]; then
   printf 'failed:\n'
   printf '  %s\n' "${failed_tests[@]}"
