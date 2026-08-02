@@ -30,6 +30,7 @@ import goalflight_compat
 import goalflight_dispatch_states as dispatch_states
 import goalflight_ledger
 import goalflight_quota_stuck
+import goalflight_terminal
 from goalflight_liveness import cpu_confirmed_idle
 import goalflight_milestone
 from goalflight_watch import (
@@ -213,6 +214,54 @@ def _record_terminal_marker_kind(record: dict | None) -> str | None:
 
 def _record_has_terminal_marker(record: dict | None) -> bool:
     return _record_terminal_marker_kind(record) in _OUTPUT_TAIL_TERMINAL_MARKERS
+
+
+def _position_validated_marker(payload: dict | None) -> dict | None:
+    """Only the marker the watcher promoted after its final-line check.
+
+    ``last_marker`` and the ``markers`` list hold EVERY marker-looking line
+    scraped from output, including ones followed by more prose.
+    ``terminal_marker`` is set only once the line is the final non-empty line
+    and has stayed that way -- the watcher is explicit that this is the only
+    trustworthy position.
+    """
+    if not isinstance(payload, dict):
+        return None
+    candidate = payload.get("terminal_marker")
+    if isinstance(candidate, dict) and candidate.get("kind") in _OUTPUT_TAIL_TERMINAL_MARKERS:
+        return candidate
+    if isinstance(candidate, str) and candidate in _OUTPUT_TAIL_TERMINAL_MARKERS:
+        return {"kind": candidate}
+    return None
+
+
+def _record_has_attention_marker(record: dict | None) -> bool:
+    """True when the worker's FINAL marker is a call for the controller.
+
+    Deliberately stricter than _record_has_terminal_marker. An attention marker
+    bypasses the liveness check, so accepting any scraped line would let a
+    worker that merely PRINTS ``BLOCKED: example diagnostic`` mid-explanation
+    end its controller's wait and tear down the monitor while it keeps working.
+    Position is the evidence that the worker actually stopped.
+
+    ACP workers do not rely on this path at all: they park in an attention
+    STATE, which is written from a protocol event and checked first in
+    done_code(). This covers bash-tail, where a marker is all there is.
+    """
+    marker = _position_validated_marker(record)
+    if marker is None:
+        status_path = (record or {}).get("status_path")
+        if isinstance(status_path, str) and status_path:
+            try:
+                with open(status_path, encoding="utf-8") as handle:
+                    data = json.load(handle)
+            except (OSError, ValueError):
+                return False
+            if isinstance(data, dict) and data.get("dispatch_id") == (record or {}).get(
+                "dispatch_id"
+            ):
+                marker = _position_validated_marker(data)
+    return goalflight_terminal.attention_marker_present(marker)
 
 
 def _output_tail_reconcile_gate(record: dict, *, tail_mtime: float | None) -> tuple[bool, str]:
@@ -933,6 +982,13 @@ def terminal_marker_done_code(
     """Return the shared marker/liveness verdict, or None without a marker."""
     if not _record_has_terminal_marker(record):
         return None
+    # An attention marker resolves terminal WHETHER OR NOT the worker is alive.
+    # A worker parked on USER-CONFIRM:/USER-NEED:/BLOCKED: is alive *because* it
+    # is waiting for the controller, so treating liveness as a contradiction --
+    # correct for COMPLETE: -- left --wait blocking on exactly the signals it
+    # exists to deliver. See goalflight_terminal.attention_marker_present.
+    if _record_has_attention_marker(record):
+        return 0
     if worker_alive is None:
         liveness = _wait_worker_liveness(record)
         worker_alive = liveness == _WAIT_LIVENESS_CONFIRMED_ALIVE
@@ -942,6 +998,15 @@ def terminal_marker_done_code(
 def done_code(record: dict, *, worker_alive: bool | None = None) -> int:
     """0 = terminal/done, 1 = live, 2 = ambiguous/unknown."""
     cls = record.get("classification") or record.get("state") or "unknown"
+    # A parked-for-a-human STATE outranks everything below, and is checked
+    # first because it is the only wake signal that is MEASURED rather than
+    # scraped: the ACP runner writes it from a protocol event, so no amount of
+    # worker prose can forge it and no liveness check can contradict it (the
+    # worker is alive precisely because it stopped to ask).
+    if dispatch_states.is_attention_state(record.get("state")) or dispatch_states.is_attention_state(
+        record.get("classification")
+    ):
+        return 0
     marker_code = terminal_marker_done_code(record, worker_alive=worker_alive)
     if marker_code is not None:
         # A terminal marker is scraped from worker OUTPUT, so ordinary text can
@@ -1157,27 +1222,39 @@ def _wait_record_pid(record: dict | None) -> int | None:
 
 
 def _wait_process_cpu_pct(record: dict | None) -> float | None:
-    pid = _wait_record_pid(record)
-    if pid is None:
+    """CPU for the waited-on worker, READ from the watcher's own sample.
+
+    This deliberately does not sample. The watcher already measures the
+    worker's process group every tick via
+    ``goalflight_liveness.pgroup_cpu_pct`` and writes the result to the status
+    file, so consuming that value keeps one measurement with one owner.
+
+    It previously ran ``ps -o %cpu= -p <pid>``, which was wrong twice over.
+    ``%cpu`` is a decaying average on Darwin -- measured up to ~4x off in both
+    directions at exactly the transitions this path cares about, reading a
+    just-stopped worker as ~95% busy and a bursty one as idle. And a single pid
+    cannot see the children a worker spawned, so a worker blocked on its own
+    test run read as doing nothing.
+
+    Sampling here instead would mean a second ps sweep per dispatch per poll, a
+    second implementation of a measurement the watcher owns, and -- because a
+    rate needs two observations -- a blocking pause on the first poll of every
+    dispatch, on the wait's own hot path.
+    """
+    if not isinstance(record, dict):
+        return None
+    status_path = record.get("status_path")
+    if not isinstance(status_path, str) or not status_path:
         return None
     try:
-        proc = subprocess.run(
-            ["ps", "-o", "%cpu=", "-p", str(pid)],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=1.0,
-        )
-    except (OSError, subprocess.SubprocessError):
+        with open(status_path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
         return None
-    if proc.returncode != 0:
+    if not isinstance(data, dict) or data.get("dispatch_id") != record.get("dispatch_id"):
         return None
-    for part in proc.stdout.split():
-        try:
-            return float(part)
-        except ValueError:
-            continue
-    return None
+    value = data.get("pgroup_cpu_pct")
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
 
 
 def _wait_tail_stat(record: dict | None) -> dict:
@@ -1667,6 +1744,38 @@ def wait_for_dispatches(
     if not wait_ids:
         print("wait requires at least one dispatch id", file=sys.stderr)
         return 2
+
+    # Announce mail HERE, at the moment the wait is armed. The controller is
+    # awake right now -- it has just dispatched -- and is about to go quiet for
+    # as long as its slowest worker takes. This is the one point where the
+    # notice costs nothing: no wake mechanism, no waiter teardown, no re-arm of
+    # the other N-1 ids. Without it the controller commonly discovers mail only
+    # after a scheduled wake-up several tool calls later.
+    #
+    # stderr, because stdout is the --json data contract. Fail-open, because a
+    # messaging glitch must never delay or break a wait. Scoping is delegated:
+    # passing project_root lets emit_controller_mail_notice derive this
+    # controller's own inboxes exactly as the aggregate status path does, so
+    # the two cannot drift.
+    try:
+        import goalflight_messages as _gm
+    except Exception:
+        pass
+    else:
+        try:
+            # owned_dispatch_ids is passed explicitly, NOT left to be derived:
+            # the derivation runs `git rev-parse --git-common-dir` to resolve
+            # linked worktrees, and the wait path must not shell out (a
+            # regression test pins that, and it is right to -- Ctrl-C during a
+            # wait must never reach a worker). The ids being waited on are the
+            # correct scope here anyway.
+            _gm.emit_controller_mail_notice(
+                owned_dispatch_ids=set(wait_ids),
+                project_root=Path(project_root) if project_root else None,
+                stream=sys.stderr,
+            )
+        except Exception:
+            pass
 
     start = time.monotonic()
     poll_s = max(0.05, poll_s)

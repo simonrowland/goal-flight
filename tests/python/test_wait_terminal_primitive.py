@@ -737,8 +737,71 @@ def test_wait_heartbeat_emits_progress_line_at_cadence() -> None:
     assert_true("heartbeat counts json/tool", "tool-use 1/json 1" in out)
 
 
+def test_arming_a_wait_announces_mail_before_it_blocks() -> None:
+    """The controller is awake when it arms a wait -- tell it about mail THEN.
+
+    A backgrounded `--wait` is where a controller goes quiet for as long as its
+    slowest worker takes. Announcing at arming costs nothing: no wake
+    mechanism, no waiter teardown, no re-arm. Announcing anywhere else means
+    the controller finds out at a scheduled wake-up several tool calls later.
+
+    Three things are pinned, because each has its own way of silently breaking:
+
+    1. The notice is emitted BEFORE the first poll. Ordering is checked against
+       a shared call log, so moving the call after the loop -- or into the
+       all-terminal branch, where a still-running wait never reaches it -- is
+       caught. An "it was called at some point" assertion would not be.
+    2. It goes to stderr. stdout is the ``--json`` data contract; a mail line
+       there corrupts every machine consumer of a wait.
+    3. Pre-existing mail does NOT shortcut the wait. The wait still runs to its
+       own verdict (here: timeout, exit 1). A mail notice is information, not a
+       terminal state -- reporting otherwise would be one more field asserting
+       something it never measured.
+    """
+    calls: list[tuple[str, object]] = []
+
+    import goalflight_messages as gm
+
+    real_emit = gm.emit_controller_mail_notice
+    real_payload = status.status_payload
+
+    def fake_emit(**kwargs):
+        calls.append(("mail-notice", kwargs.get("stream")))
+        return "1 new mail"
+
+    def fake_payload(*args, **kwargs):
+        calls.append(("poll", None))
+        return real_payload(*args, **kwargs)
+
+    gm.emit_controller_mail_notice = fake_emit
+    status.status_payload = fake_payload
+    try:
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = status.wait_for_dispatches(
+                ["no-such-dispatch-for-mail-arming-test"],
+                project_root=str(ROOT),
+                timeout_s=0.2,
+                poll_s=0.05,
+            )
+    finally:
+        gm.emit_controller_mail_notice = real_emit
+        status.status_payload = real_payload
+
+    assert_true("mail notice was emitted at all", any(c[0] == "mail-notice" for c in calls))
+    assert_eq("mail notice is the FIRST thing the wait does", calls[0][0], "mail-notice")
+    assert_eq("mail notice goes to stderr, never stdout", calls[0][1], sys.stderr)
+    assert_true("the wait still polled after announcing", any(c[0] == "poll" for c in calls))
+    assert_eq("pre-existing mail does not shortcut the wait", code, 1)
+    assert_true(
+        "no mail text leaked onto stdout (the --json contract)",
+        "new mail" not in buf.getvalue(),
+    )
+
+
 def main() -> None:
     tests = [
+        test_arming_a_wait_announces_mail_before_it_blocks,
         test_crashed_worker_resolves_worker_dead_after_grace_not_before,
         test_stale_dead_with_dead_pid_resolves_worker_dead,
         test_live_but_ambiguous_worker_is_not_killed,
@@ -750,15 +813,17 @@ def main() -> None:
         test_busy_cpu_worker_never_resolves_worker_stalled,
         test_unknown_cpu_worker_never_resolves_worker_stalled,
         test_completed_pid_dead_stays_complete_trust_clause,
+        test_terminal_row_carries_marker_kind_and_verdict_distinguishes_checkpoint,
+        test_verdict_line_stays_bare_for_complete_and_timeout,
+        test_marker_kind_is_read_from_the_status_FILE_not_just_the_record,
+        test_marker_helpers_share_production_status_file_fallback,
+        test_status_marker_fallback_rejects_nonterminal_and_wrong_dispatch,
         test_wait_returns_bounded_on_crash_not_at_timeout,
         test_wait_heartbeat_emits_progress_line_at_cadence,
     ]
     for test in tests:
         test()
     print(f"PASS tests/python/test_wait_terminal_primitive.py ({len(tests)} tests)")
-    test_terminal_row_carries_marker_kind_and_verdict_distinguishes_checkpoint()
-    test_verdict_line_stays_bare_for_complete_and_timeout()
-    test_marker_kind_is_read_from_the_status_FILE_not_just_the_record()
 
 
 if __name__ == "__main__":

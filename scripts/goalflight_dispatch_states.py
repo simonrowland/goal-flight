@@ -45,6 +45,32 @@ SALVAGE_NEEDED_STATES = frozenset(
     }
 )
 
+# States a worker enters when it has STOPPED to wait for a person. These are
+# written by the ACP runner from real protocol events -- a permission request,
+# a routed confirmation -- so unlike a marker scraped out of worker output they
+# cannot be forged by ordinary prose. They are terminal for waiting purposes:
+# the worker will make no further progress until someone answers.
+#
+# They were previously in NO set at all -- not terminal, not running, not
+# salvage -- so done_code() fell through to "ambiguous" and `--wait` polled
+# until its timeout. Every ACP worker that asked for approval was invisible to
+# the primitive whose whole job is to deliver that request.
+ATTENTION_STATES = frozenset(
+    {
+        "running_user_confirm",
+        "awaiting_user_confirm",
+        "awaiting_permission",
+    }
+)
+
+
+def is_attention_state(state: object) -> bool:
+    """True when the worker is parked waiting for a human decision."""
+    if isinstance(state, str) and state in ATTENTION_STATES:
+        return True
+    normalized = DISPATCH_STATE_ALIASES.get(state) if isinstance(state, str) else None
+    return bool(normalized and normalized in ATTENTION_STATES)
+
 RUNNING_STATES = frozenset(
     {
         "queued",

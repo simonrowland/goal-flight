@@ -259,26 +259,156 @@ def process_group_id(pid: int | str | None) -> int | None:
         return None
 
 
-def parse_ps_pgroup_cpu(ps_output: str, target_pgid: int | str) -> float:
-    """Sum %CPU from `ps -A -o pgid=,%cpu=` output for one process group."""
+# ── process-group CPU sampling ───────────────────────────────────────────────
+#
+# Why this measures a DELTA of cumulative cpu-time instead of reading ps's
+# ``%cpu`` column, which is what it used to do:
+#
+#   BSD/Darwin ``%cpu`` is a DECAYING AVERAGE over roughly the last minute, not
+#   the rate right now. Measured on this fleet (1155 processes, two ps sweeps
+#   4s apart, differencing cumulative cpu-time to get ground truth):
+#
+#       ps 100.7%  vs true 101.7%   steady load          -> agrees
+#       ps  95.4%  vs true  25.0%   just stopped burning -> ps lags HIGH
+#       ps   0.7%  vs true   9.2%   short bursts         -> ps reads LOW
+#
+#   So it is wrong in BOTH directions by up to ~4x precisely at transitions --
+#   which is exactly when a watcher is deciding "is this worker still working,
+#   or is it wedged". A worker that finishes thinking and starts a test run
+#   keeps reading hot for tens of seconds.
+#
+# The measurement:
+#       pct = (cpu_seconds(t1) - cpu_seconds(t0)) / (t1 - t0) * 100
+#   Units: cpu-seconds / wall-seconds is dimensionless; x100 gives percent of
+#   ONE core, so a group saturating two cores reads 200% -- the same convention
+#   ``%cpu`` used, so callers and status consumers need no change.
+#
+# Resolution: ps reports cpu-time in centiseconds, so the smallest non-zero
+#   delta is 0.01 cpu-s and the quantum over a window W is (1/W) percent --
+#   ~1.7% at the 0.6s cold-start window, ~0.2% at a 5s warm window. This does
+#   NOT weaken the idle test (``--cpu-epsilon`` defaults to 0.1): a group
+#   burning no CPU accrues no ticks at all, so its delta is exactly 0.0 for any
+#   W. The quantum only blurs small-but-nonzero rates, and it blurs them upward
+#   -- toward "busy" -- which is the safe direction for a liveness check.
+#
+# Sanity check: one process spinning flat out for the whole window burns W
+#   cpu-seconds, so W/W*100 = 100%. Two such processes give 200%. A group that
+#   burns nothing gives 0%. All three match what the callers already expect.
+
+# Two different bounds, deliberately not one constant.
+#
+# WARM_MIN is the shortest cached gap worth differencing. It must sit BELOW the
+# shortest interval any caller polls at, or the warm path never triggers: with a
+# single 0.6 constant, `cpu_liveness_keep_waiting`'s 0.5s resample fell under
+# the threshold on every attempt, so each one re-entered the cold path, slept
+# another 0.6s, and threw away the continuous series the cache exists to build.
+# 0.2s is below every current caller's cadence.
+#
+# COLD_WINDOW is how long to sleep when there is no usable cached sample and a
+# rate must be produced from a standing start. Longer than WARM_MIN because a
+# deliberate pause should buy real resolution: at centisecond ps granularity the
+# quantum is (1/W) percent, so 0.6s gives ~1.7%.
+#
+# MAX_AGE bounds the other end: a cached sample older than this would average
+# over so long a window that it reintroduces the very lag this replaced.
+_CPU_SAMPLE_WARM_MIN_S = 0.2
+_CPU_SAMPLE_COLD_WINDOW_S = 0.6
+_CPU_SAMPLE_MAX_AGE_S = 60.0
+
+# pgid -> (monotonic timestamp, {pid: cumulative cpu-seconds})
+_cpu_samples: dict[int, tuple[float, dict[int, float]]] = {}
+
+
+def parse_ps_cputime(field: str) -> float:
+    """Parse a ps TIME field -- ``[[DD-]HH:]MM:SS[.ss]`` -- into seconds."""
+    text = field.strip()
+    if not text:
+        raise ValueError("empty cpu-time field")
+    days = 0.0
+    if "-" in text:
+        day_part, _, text = text.partition("-")
+        days = float(day_part)
+    # Right-to-left, each colon-separated group is the next power of 60:
+    # seconds, minutes, hours. ps omits leading groups that are zero.
+    seconds = 0.0
+    for power, value in enumerate(reversed([float(p) for p in text.split(":")])):
+        seconds += value * (60.0**power)
+    return days * 86400.0 + seconds
+
+
+def parse_ps_pgroup_cputime(ps_output: str, target_pgid: int | str) -> dict[int, float]:
+    """Map pid -> cumulative cpu-seconds for one process group.
+
+    Input is ``ps -A -o pgid=,pid=,time=`` output.
+    """
     try:
         target = int(str(target_pgid).strip())
     except (TypeError, ValueError):
-        return 0.0
+        return {}
 
-    total = 0.0
+    sample: dict[int, float] = {}
     for raw_line in ps_output.splitlines():
         parts = raw_line.split()
-        if len(parts) < 2:
+        if len(parts) < 3:
             continue
         try:
-            pgid = int(parts[0])
-            cpu = float(parts[1])
+            if int(parts[0]) != target:
+                continue
+            sample[int(parts[1])] = parse_ps_cputime(parts[2])
         except ValueError:
             continue
-        if pgid == target:
-            total += cpu
-    return total
+    return sample
+
+
+def cpu_pct_from_cputime_delta(
+    before: dict[int, float],
+    after: dict[int, float],
+    window_s: float,
+) -> float:
+    """Percent of one core burned by a process group over ``window_s``.
+
+    Paired PER PID rather than summing the group, because a group sum is wrong
+    in two ways that happen on every tick of a real worker:
+
+    - a child that EXITS during the window drops out of ``after``, so a naive
+      ``sum(after) - sum(before)`` goes NEGATIVE -- every finished bash tool
+      call does this;
+    - a child BORN during the window carries its whole lifetime cpu-time into
+      ``after`` with nothing to subtract, inflating the delta.
+
+    Pairing by pid fixes both: matched pids contribute their own delta, pids
+    only in ``after`` contribute their full cpu-time (they were born inside the
+    window, so all of it IS in-window), and pids that vanished contribute 0.
+    That last case undercounts, bounded by one poll interval of one child, and
+    biased toward "idle" -- which callers already cross-check against output
+    and marker activity before declaring a worker dead.
+    """
+    if window_s <= 0:
+        return 0.0
+    busy = 0.0
+    for pid, after_s in after.items():
+        before_s = before.get(pid)
+        if before_s is None:
+            busy += after_s
+        elif after_s > before_s:
+            busy += after_s - before_s
+    return max(0.0, busy / window_s * 100.0)
+
+
+def _pgroup_cputime_snapshot(pgid: int) -> dict[int, float] | None:
+    """One ps sweep, or None when the sample itself is unavailable."""
+    try:
+        output = subprocess.check_output(
+            ["ps", "-A", "-o", "pgid=,pid=,time="],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=2.0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return parse_ps_pgroup_cputime(output, pgid)
 
 
 def pgroup_cpu_pct(pgid_or_pid: int | str | None) -> float | None:
@@ -311,18 +441,32 @@ def pgroup_cpu_pct(pgid_or_pid: int | str | None) -> float | None:
     # worker that is NOT its own group leader, this would under-count CPU (it
     # would sum only that pid's group rather than the worker's actual group).
     pgid = process_group_id(target) or target
-    try:
-        output = subprocess.check_output(
-            ["ps", "-A", "-o", "pgid=,%cpu="],
-            stderr=subprocess.DEVNULL,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=2.0,
-        )
-    except (OSError, subprocess.SubprocessError):
+
+    now = time.monotonic()
+    sample = _pgroup_cputime_snapshot(pgid)
+    if sample is None:
         return None
-    return parse_ps_pgroup_cpu(output, pgid)
+
+    # Warm path: difference against the caller's previous call, so a polling
+    # watcher pays one ps sweep per tick and the window is its own interval.
+    cached = _cpu_samples.get(pgid)
+    if cached is not None:
+        prev_at, prev_sample = cached
+        window = now - prev_at
+        if _CPU_SAMPLE_WARM_MIN_S <= window <= _CPU_SAMPLE_MAX_AGE_S:
+            _cpu_samples[pgid] = (now, sample)
+            return cpu_pct_from_cputime_delta(prev_sample, sample, window)
+
+    # Cold path (first call for this group, or the cached sample aged out):
+    # take the second half of the pair now. One deliberate short sleep, not a
+    # guess -- a rate cannot be read from a single cumulative counter.
+    time.sleep(_CPU_SAMPLE_COLD_WINDOW_S)
+    later = time.monotonic()
+    later_sample = _pgroup_cputime_snapshot(pgid)
+    if later_sample is None:
+        return None
+    _cpu_samples[pgid] = (later, later_sample)
+    return cpu_pct_from_cputime_delta(sample, later_sample, later - now)
 
 
 def cpu_confirmed_idle(cpu_pct: float | None, epsilon_pct: float) -> bool:

@@ -817,9 +817,25 @@ def test_wait_keyboard_interrupt_returns_130_without_signal() -> None:
     orig_run = S.subprocess.run
     subprocess_calls: list[tuple] = []
 
+    # What this guard actually protects: Ctrl-C during a wait must never reach
+    # a worker. It is scoped to AFTER the interrupt, not to the whole call,
+    # because arming the wait legitimately shells out -- the mail notice
+    # resolves project-addressed mailbox aliases via `git rev-parse`, which is
+    # how a peer controller's message reaches this project at all. Banning
+    # every subprocess for the whole call would forbid that unrelated read
+    # while protecting nothing extra: the danger is signalling, and signalling
+    # can only happen once we are unwinding.
+    interrupted = {"yes": False}
+
     def fail_subprocess(*args, **kwargs):
+        if not interrupted["yes"]:
+            return orig_run(*args, **kwargs)
         subprocess_calls.append(args)
         raise AssertionError("wait interrupt path must not shell out or signal workers")
+
+    def interrupt_now(_seconds):
+        interrupted["yes"] = True
+        raise KeyboardInterrupt()
 
     def payload_without_pid() -> dict:
         payload = _wait_payload("live1", "unknown_no_pid")
@@ -828,7 +844,7 @@ def test_wait_keyboard_interrupt_returns_130_without_signal() -> None:
 
     try:
         S.status_payload = payload_without_pid
-        S.time.sleep = lambda _seconds: (_ for _ in ()).throw(KeyboardInterrupt())
+        S.time.sleep = interrupt_now
         S.subprocess.run = fail_subprocess
         err = io.StringIO()
         with redirect_stderr(err):

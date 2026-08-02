@@ -30,7 +30,10 @@ from goalflight_liveness import (  # noqa: E402
     classify_liveness,
     cpu_confirmed_idle,
     cpu_liveness_keep_waiting,
-    parse_ps_pgroup_cpu,
+    _CPU_SAMPLE_WARM_MIN_S,
+    cpu_pct_from_cputime_delta,
+    parse_ps_cputime,
+    parse_ps_pgroup_cputime,
     pgroup_cpu_pct,
     progress_stall_decision,
     system_starved,
@@ -785,14 +788,132 @@ def test_cpu_keep_waiting_real_busy_subprocess_keeps_waiting() -> None:
             worker.kill()
 
 
-def test_ps_output_parser_sums_matching_process_group() -> None:
+def test_ps_cputime_field_parses_every_shape_ps_emits() -> None:
+    # ps omits leading zero groups, so all four of these occur on one machine.
+    assert parse_ps_cputime("0:00.06") == 0.06
+    assert parse_ps_cputime("315:47.25") == 315 * 60 + 47.25
+    assert parse_ps_cputime("1:02:03") == 3600 + 120 + 3
+    assert parse_ps_cputime("2-03:04:05") == 2 * 86400 + 3 * 3600 + 4 * 60 + 5
+
+
+def test_ps_output_parser_maps_pids_of_the_matching_group_only() -> None:
     ps_output = """\
-    501   0.0
-   1200  13.5
-   1200   2.5
-   1300   7.0
+    501   501   0:00.00
+   1200  1200   0:10.00
+   1200  1201   0:02.50
+   1300  1300   0:07.00
 """
-    assert parse_ps_pgroup_cpu(ps_output, 1200) == 16.0
+    assert parse_ps_pgroup_cputime(ps_output, 1200) == {1200: 10.0, 1201: 2.5}
+
+
+def test_cpu_delta_reads_one_saturated_core_as_100_percent() -> None:
+    # 1 cpu-second burned across a 1 second window = 100% of one core; two such
+    # processes = 200%, matching the convention callers already expect.
+    assert cpu_pct_from_cputime_delta({7: 4.0}, {7: 5.0}, 1.0) == 100.0
+    assert cpu_pct_from_cputime_delta({7: 4.0, 8: 1.0}, {7: 5.0, 8: 2.0}, 1.0) == 200.0
+    assert cpu_pct_from_cputime_delta({7: 4.0}, {7: 4.0}, 1.0) == 0.0
+
+
+def test_cpu_delta_ignores_a_child_that_exited_instead_of_going_negative() -> None:
+    """A finished bash tool call must not read as negative CPU.
+
+    Summing the group and differencing the sums -- the obvious implementation --
+    loses the exited child's cpu-time from the second sample and produces a
+    negative rate, which then reads as 'idle' to cpu_confirmed_idle. Pairing per
+    pid is what prevents it, so this pins the pairing, not just the sign.
+    """
+    before = {100: 10.0, 101: 30.0}   # 101 is a child mid-run
+    after = {100: 10.5}               # ...which exited during the window
+    assert cpu_pct_from_cputime_delta(before, after, 1.0) == 50.0
+
+
+def test_cpu_delta_counts_a_child_born_inside_the_window() -> None:
+    # A pid absent from the first sample was born during the window, so ALL of
+    # its cpu-time was burned inside the window and counts in full.
+    assert cpu_pct_from_cputime_delta({100: 10.0}, {100: 10.0, 102: 2.0}, 2.0) == 100.0
+
+
+def test_cpu_delta_is_zero_for_a_nonpositive_window() -> None:
+    assert cpu_pct_from_cputime_delta({1: 0.0}, {1: 5.0}, 0.0) == 0.0
+
+
+@skipif(os.name == "nt", reason="POSIX process-group CPU sampler")
+def test_pgroup_cpu_pct_measures_now_not_a_decaying_average() -> None:
+    """Pins the PRODUCTION sampler, not just its helpers.
+
+    The pure delta/parser tests above all pass against a `pgroup_cpu_pct` that
+    has been reverted to reading ps's ``%cpu`` column -- two independent
+    reviewers flagged that, and they were right: nothing wired the fix to the
+    function.
+
+    The discriminating measurement is a process that STOPS. Darwin's ``%cpu``
+    is a decaying average over roughly a minute, so it still reads near its
+    peak seconds after the CPU goes quiet (measured on this fleet: ps 95.4% vs
+    a true 25.0%). A cpu-time delta reads ~0 immediately, because a process
+    burning nothing accrues no ticks.
+
+    Both directions are asserted, so a sampler that simply always returned 0.0
+    would fail the busy half rather than passing this vacuously.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        flag = Path(td) / "spin-finished"
+        worker = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                # Spin long enough for a decaying %cpu average to actually
+                # build up. A short burst decays away before we can measure it,
+                # which makes the whole comparison vacuous.
+                "import pathlib, sys, time\n"
+                "end = time.time() + 3.0\n"
+                "x = 0\n"
+                "while time.time() < end:\n"
+                "    x += 1\n"
+                "pathlib.Path(sys.argv[1]).write_text('done')\n"
+                "time.sleep(60)\n",
+                str(flag),
+            ],
+            start_new_session=True,  # own pgroup leader, mirrors the runner
+        )
+        try:
+            busy = pgroup_cpu_pct(worker.pid)
+            if busy is None:
+                print("SKIP: process-group CPU sampler unavailable")
+                return
+            assert busy > 25.0, f"a flat-out spinner must read busy, got {busy}"
+
+            # Wait on the observable transition, never on a fixed sleep: the
+            # child tells us when it stopped burning.
+            deadline = time.time() + 30
+            while not flag.exists() and time.time() < deadline:
+                time.sleep(0.05)
+            assert flag.exists(), "spinner never signalled that it finished"
+
+            # Rebaseline: the cached sample was taken DURING the spin, so a
+            # reading now would correctly average the spin into its window.
+            # Discard one call to move the baseline to the present, then let a
+            # window elapse that lies entirely after the CPU went quiet.
+            pgroup_cpu_pct(worker.pid)
+            # Not a timeout being waited out -- this establishes the
+            # measurement window. It is load-independent: a sleeping process
+            # accrues no cpu-time no matter how busy the machine is.
+            time.sleep(_CPU_SAMPLE_WARM_MIN_S * 3)
+            settled = pgroup_cpu_pct(worker.pid)
+            assert settled is not None
+            # Near-exactly zero, not merely "low": a sleeping process accrues
+            # no cpu-time at all, so the delta is 0.0 by construction. That is
+            # the sharp edge against a decaying average, which still carries
+            # the spin it just finished.
+            assert settled < 2.0, (
+                f"a process that stopped burning must read idle, got {settled}. "
+                "A decaying ps %cpu average would still carry the finished spin."
+            )
+        finally:
+            worker.terminate()
+            try:
+                worker.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                worker.kill()
 
 
 def test_pgroup_cpu_pct_returns_float_or_none() -> None:
@@ -911,7 +1032,13 @@ def main() -> None:
     test_idle_gate_hard_wall_fires_after_sustained_quiet()
     test_idle_gate_event_resets_hard_wall()
     test_cpu_keep_waiting_real_busy_subprocess_keeps_waiting()
-    test_ps_output_parser_sums_matching_process_group()
+    test_ps_cputime_field_parses_every_shape_ps_emits()
+    test_ps_output_parser_maps_pids_of_the_matching_group_only()
+    test_cpu_delta_reads_one_saturated_core_as_100_percent()
+    test_cpu_delta_ignores_a_child_that_exited_instead_of_going_negative()
+    test_cpu_delta_counts_a_child_born_inside_the_window()
+    test_cpu_delta_is_zero_for_a_nonpositive_window()
+    test_pgroup_cpu_pct_measures_now_not_a_decaying_average()
     test_pgroup_cpu_pct_returns_float_or_none()
     test_python_watcher_busy_silence_records_running_quiet()
     print("OK: liveness helper tests pass")

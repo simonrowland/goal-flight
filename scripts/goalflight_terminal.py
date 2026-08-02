@@ -12,7 +12,17 @@ RATE_LIMIT_TAIL_BYTES = 2048
 FINAL_RECONCILIATION_TAIL_BYTES = 10 * 1024 * 1024
 RATE_LIMITED_STATE = "rate_limited"
 SUCCESS_TERMINAL_MARKERS = {"COMPLETE", "READY", "RESULT"}
-TERMINAL_MARKERS = SUCCESS_TERMINAL_MARKERS | {"FAILED", "BLOCKED", "USER-NEED", "USER-CONFIRM"}
+# Markers that mean "I need the controller", as opposed to "I am finished".
+# The distinction decides whose word wins when a marker and a live worker
+# disagree -- see attention_marker_present() below.
+#
+# FAILED belongs here, not with the completion markers: the marker contract
+# (protocols/worker-markers.md) says FAILED stops the dispatch loop and
+# surfaces to the controller. A worker that reports a real failure and then
+# hangs in teardown is still a worker whose work has failed -- the live
+# process does not invalidate the report, so liveness must not suppress it.
+ATTENTION_MARKERS = {"BLOCKED", "USER-NEED", "USER-CONFIRM", "FAILED"}
+TERMINAL_MARKERS = SUCCESS_TERMINAL_MARKERS | ATTENTION_MARKERS
 TOKEN_COUNT_RE = re.compile(r"^\d[\d,]*$")
 # One optional worker-marker sigil grammar shared by every parser. Keep this as
 # a regex fragment so each consumer can preserve its existing markdown/fence/
@@ -37,11 +47,15 @@ def read_tail_excerpt(path: Path, max_bytes: int = RATE_LIMIT_TAIL_BYTES) -> str
 def rate_limit_signature_in_text(text: str) -> str | None:
     lowered = text.lower()
     for pattern in goalflight_rate_pressure.RATE_LIMIT_PATTERNS:
-        if pattern in {"429", "529"}:
-            if re.search(rf"(?<!\d){re.escape(pattern)}(?!\d)", lowered):
-                return pattern
-            continue
         if pattern in lowered:
+            return pattern
+    # Numeric HTTP statuses are context-sensitive in the provider-pressure
+    # scanner, so they deliberately are not substring entries in
+    # RATE_LIMIT_PATTERNS. The terminal-tail scanner still needs to recognize
+    # their standalone token form. Keeping this outside the pattern loop is
+    # load-bearing: the old in-loop special case was unreachable.
+    for pattern in ("429", "529"):
+        if re.search(rf"(?<!\d){re.escape(pattern)}(?!\d)", lowered):
             return pattern
     for pattern in goalflight_rate_pressure.MODEL_CAPACITY_PATTERNS:
         if pattern in lowered:
@@ -82,6 +96,26 @@ def terminal_success_marker_present(marker: object) -> bool:
 
 def terminal_marker_present(marker: object) -> bool:
     return isinstance(marker, dict) and marker.get("kind") in TERMINAL_MARKERS
+
+
+def attention_marker_present(marker: object) -> bool:
+    """True for a marker whose whole point is that the worker is still there.
+
+    A live worker CONTRADICTS a completion marker -- ``COMPLETE:`` from a
+    process that is still running is exactly the false-done case, so liveness
+    has to outrank the marker there. A live worker CONFIRMS an attention
+    marker: ``USER-CONFIRM:``/``USER-NEED:``/``BLOCKED:`` are emitted by a
+    worker that is alive precisely because it stopped to wait for someone.
+    Applying the completion rule to these suppressed the verdict and left
+    ``--wait`` blocking on a worker that was asking for help.
+
+    Markers are scraped from worker output, so ordinary text can forge one.
+    That is tolerable here because the costs are asymmetric: waking a
+    controller that did not need waking costs one status read, while failing
+    to wake one that did costs the whole wait timeout with the worker parked.
+    Bias toward waking.
+    """
+    return isinstance(marker, dict) and marker.get("kind") in ATTENTION_MARKERS
 
 
 def terminal_rate_limit_outcome(
