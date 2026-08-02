@@ -159,6 +159,23 @@ def _agent_state_roots(agent: str | None, command: str) -> list[str]:
             home / ".local" / "share" / "codex",
             home / ".cache" / "codex",
         ])
+        # TEMPORARY (see the task-store item on deriving sandbox roots from the
+        # worker's authorized toolchain rather than its own agent label).
+        #
+        # Dispatch does not use ~/.codex: it points CODEX_HOME at a per-dispatch
+        # directory under the goal-flight state root. Granting only ~/.codex
+        # means every nested codex fails to initialize with "Operation not
+        # permitted" -- including a worker running its own MANDATORY independent
+        # review, which then correctly refuses to commit and escalates BLOCKED.
+        # Two workers did exactly that today and the work sat staged for hours.
+        #
+        # Grant the home actually in use, plus the shared parent so a nested
+        # dispatch that mints its own home can start. Both stay well outside the
+        # workspace boundary the profile exists to enforce.
+        configured_home = os.environ.get("CODEX_HOME")
+        if configured_home:
+            roots.append(Path(configured_home))
+        roots.append(home / ".goal-flight" / "dispatch-homes")
     if "grok" in label or "grok" in binary:
         roots.extend([
             home / ".grok",
