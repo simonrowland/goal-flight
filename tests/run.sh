@@ -50,14 +50,21 @@ for test in test-*.sh; do
     echo "tests/bash/$test"
     continue
   fi
-  # Live opencode ACP probes are slow (~300s each) and environment-flaky; they can
-  # wedge the whole suite on a stalled child. Skip EXECUTION by default; opt in
-  # explicitly. Listing above is intentionally unaffected so --list collection
-  # stays stable regardless of GOALFLIGHT_LIVE_OPENCODE.
+  # Live external-agent probes are slow and environment-flaky; they can wedge the
+  # whole suite on a stalled child or an LLM that exits "success" without doing
+  # the asked work. Skip EXECUTION by default; opt in explicitly. Listing above
+  # is intentionally unaffected so --list collection stays stable regardless of
+  # GOALFLIGHT_LIVE_OPENCODE / GOALFLIGHT_LIVE_GROK.
   case "$test" in
     test-opencode-*.sh)
       if [ "${GOALFLIGHT_LIVE_OPENCODE:-0}" != "1" ]; then
         echo "SKIP  tests/bash/$test (live opencode ACP probe; set GOALFLIGHT_LIVE_OPENCODE=1 to run)"
+        continue
+      fi
+      ;;
+    test-grok-*.sh)
+      if [ "${GOALFLIGHT_LIVE_GROK:-0}" != "1" ]; then
+        echo "SKIP  tests/bash/$test (live grok probe; set GOALFLIGHT_LIVE_GROK=1 to run)"
         continue
       fi
       ;;
