@@ -44,6 +44,24 @@ looks like normal progress. Only the codex goal-mode template carries the rule
 today; the dispatch-wrapper path does not, so **tag the brief rather than
 assuming the worker was told.**
 
+**Collect approvals in a batch, not one at a time.** `--wait` takes several ids
+and blocks until **all** are terminal, and a design checkpoint is terminal:
+
+```bash
+python3 <skill-root>/scripts/goalflight_status.py --wait chunk-a,chunk-b,chunk-c
+```
+
+Backgrounded, that is a single wake-up carrying every checkpoint that landed.
+Review the designs together — they usually share surfaces, and reading three at
+once is where you notice two of them deciding the same thing differently — then
+resume each session with its corrections. Waking three times to approve three
+designs costs three context reloads and gives you no cross-chunk view.
+
+**Batch peers, not a sprinter with a marathon runner.** All-terminal means the
+batch is as slow as its slowest member, so grouping a two-minute chunk with a
+forty-minute one idles the fast result for 38 minutes. Group by expected
+duration; wait separately on anything you need back early.
+
 **Wait on the work, not on a clock.** Every dispatch prints a `wait:` line —
 `goalflight_status.py --wait <id>`. Run it **in the background**: its completion
 wakes you the moment the worker reaches a terminal state. Do not block the turn
