@@ -67,6 +67,116 @@ def _session_file(project_root: Path) -> Path:
     return project_root / SESSION_FILE_REL
 
 
+def _read_session_map(path: Path) -> dict[str, dict]:
+    """Session file as a pid->record map, tolerating the pre-map shape."""
+    try:
+        raw = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError, FileNotFoundError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    if "id" in raw and "pid" in raw and not all(isinstance(v, dict) for v in raw.values()):
+        return {str(raw.get("pid")): raw}
+    return {str(k): v for k, v in raw.items() if isinstance(v, dict)}
+
+
+def _write_session_map(path: Path, data: dict[str, dict]) -> None:
+    """Atomic replace via a unique sibling temp, matching ensure_session."""
+    tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}")
+    tmp.write_text(json.dumps(data, indent=2) + "\n")
+    tmp.replace(path)
+
+
+# ── controller session identity: the beacon ─────────────────────────────────
+#
+# ensure_session() keys a record by the CALLER's pid, which is right for a
+# long-lived terminal but useless for a controller that reaches the CLI through
+# one-shot tool calls: every call is a fresh python3 process, so every call
+# minted a new id. Measured: three consecutive --ensure-session invocations
+# returned three different ids.
+#
+# So identity is anchored to a BEACON instead -- a long-running process that
+# holds the session open and says, in effect, "I am here and this is my name".
+# The beacon's pid is stable for as long as the controller is working, and it is
+# observable from outside, which makes ownership answerable ("is this worker
+# mine?") and presence answerable ("is that controller still alive?") without
+# either being inferred from something that never measured it.
+#
+# A beacon record is just a session slot with beacon=True. Non-beacon slots keep
+# their existing per-terminal meaning and are untouched.
+
+
+def claim_session(
+    project_root: Path,
+    *,
+    pid: int,
+    session_id: str | None = None,
+    label: str | None = None,
+) -> dict:
+    """Bind a session id to a beacon process. Idempotent for the same pid."""
+    path = _session_file(project_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _file_lock(path):
+        data = _read_session_map(path)
+        key = str(pid)
+        existing = data.get(key)
+        if isinstance(existing, dict) and existing.get("beacon"):
+            return existing
+        record = {
+            "id": session_id or str(uuid.uuid4()),
+            "pid": pid,
+            "started_at": _now_iso(),
+            "hostname": socket.gethostname(),
+            "beacon": True,
+        }
+        if label:
+            record["label"] = str(label)[:64]
+        data[key] = record
+        _write_session_map(path, data)
+    return record
+
+
+def live_session(project_root: Path) -> dict | None:
+    """The session for this project: the live beacon, or None.
+
+    None is an honest answer and callers must treat it as one -- it means no
+    controller has claimed this project, NOT that the project is idle. Anything
+    that would rather guess an owner should instead say it does not know.
+    """
+    path = _session_file(project_root)
+    if not path.exists():
+        return None
+    candidates = [
+        record
+        for record in _read_session_map(path).values()
+        if isinstance(record, dict) and record.get("beacon") and _pid_alive(record.get("pid"))
+    ]
+    if not candidates:
+        return None
+    # A second live beacon means a takeover or a stray controller. Prefer the
+    # newest and report the collision rather than silently picking one.
+    candidates.sort(key=lambda r: str(r.get("started_at") or ""), reverse=True)
+    winner = dict(candidates[0])
+    if len(candidates) > 1:
+        winner["conflicting_beacons"] = len(candidates)
+    return winner
+
+
+def release_session(project_root: Path, *, pid: int) -> bool:
+    """Drop a beacon slot. Returns True when one was removed."""
+    path = _session_file(project_root)
+    if not path.exists():
+        return False
+    with _file_lock(path):
+        data = _read_session_map(path)
+        record = data.get(str(pid))
+        if not (isinstance(record, dict) and record.get("beacon")):
+            return False
+        del data[str(pid)]
+        _write_session_map(path, data)
+    return True
+
+
 def ensure_session(project_root: Path, *, pid: int | None = None) -> dict:
     """Read or generate the per-terminal session id record.
 
@@ -841,6 +951,23 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--claim", action="store_true")
     mode.add_argument("--release", action="store_true")
     mode.add_argument("--force-release-stale", action="store_true")
+    mode.add_argument(
+        "--claim-session",
+        action="store_true",
+        help="bind a session id to a beacon pid (--session-pid, default: this process)",
+    )
+    mode.add_argument(
+        "--live-session",
+        action="store_true",
+        help="print the live beacon session for this project, or exit 1 if none",
+    )
+    mode.add_argument(
+        "--release-session",
+        action="store_true",
+        help="drop a beacon slot (--session-pid, default: this process)",
+    )
+    parser.add_argument("--session-pid", type=int)
+    parser.add_argument("--session-label")
     parser.add_argument("--queue")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--reason", default="user-exit")
@@ -851,6 +978,30 @@ def main(argv: list[str] | None = None) -> int:
         record = ensure_session(project_root)
         print(json.dumps(record))
         return 0
+
+    if args.claim_session:
+        record = claim_session(
+            project_root,
+            pid=args.session_pid or os.getpid(),
+            label=args.session_label,
+        )
+        print(json.dumps(record))
+        return 0
+
+    if args.live_session:
+        record = live_session(project_root)
+        if record is None:
+            # Exit 1, not an empty object: 'no controller has claimed this
+            # project' must not be mistaken for a session with blank fields.
+            print("no live controller session for this project", file=sys.stderr)
+            return 1
+        print(json.dumps(record))
+        return 0
+
+    if args.release_session:
+        removed = release_session(project_root, pid=args.session_pid or os.getpid())
+        print(json.dumps({"released": removed}))
+        return 0 if removed else 1
 
     if args.claim:
         if not args.queue:
