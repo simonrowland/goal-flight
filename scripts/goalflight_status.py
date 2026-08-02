@@ -2303,12 +2303,22 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.wait:
-        # NOTE: --wait (the long-poll over N workers) is deliberately mail-FREE.
-        # Coupling mail to the wait would mean either waking/returning early on a
-        # message (collapsing the multi-worker wait and forcing the controller to
-        # re-arm the other N-1 waiters) or withholding mail until every worker is
-        # terminal. Mail belongs on the aggregate `status` poll instead — one call
-        # that already covers all workers AND mail, with no waiter teardown.
+        # --wait announces mail at arming and WAKES on mail that arrives after.
+        #
+        # This note previously said the wait was "deliberately mail-FREE",
+        # reasoning that coupling mail to it meant either collapsing the
+        # multi-worker wait or withholding mail until every worker finished.
+        # That was a false dichotomy: the wait can return early with its OWN
+        # exit code (3) and print the re-arm command pre-filled, which costs one
+        # tool call. The cost of the alternative was measured in practice --
+        # worker escalations sat unread for hours while a human relayed messages
+        # between controller sessions by hand.
+        #
+        # Exit 3 is a BEHAVIOUR CHANGE for existing callers. It is deliberately
+        # not 0: a wait that returned with workers still running has not
+        # finished, and saying otherwise is the false-terminal class this module
+        # keeps having to fix. Callers testing `-eq 0` stay correct; callers
+        # treating any non-zero as failure will see an early wake as one.
         return wait_for_dispatches(
             _parse_wait_ids(args.wait),
             project_root=project_root,
