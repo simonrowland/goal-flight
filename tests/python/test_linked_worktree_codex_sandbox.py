@@ -89,12 +89,21 @@ def case_linked_worktree_argv_is_narrow() -> None:
         dirs = sandbox.linked_worktree_git_dirs(linked)
         assert dirs is not None
         git_dir, common_dir = dirs
+        # Worktree roots, then the worker's channel roots. The channel roots are
+        # unconditional: without them a worker cannot post mail or start its own
+        # mandatory review, both of which failed as bare "Operation not
+        # permitted" with no hint that the grant was simply never passed.
+        #
+        # Kept as EXACT equality on purpose. This case exists to catch
+        # over-granting, and the cheap way to make a sandbox bug go away is to
+        # widen the grant until it does -- so the list must be enumerated, not
+        # merely contain what it needs.
         expected = [
             str(git_dir),
             str(common_dir / "objects"),
             str(common_dir / "refs" / "heads"),
             str(common_dir / "logs" / "refs" / "heads"),
-        ]
+        ] + sandbox.worker_channel_roots()
 
         bash_argv, _ = dispatch.build_worker(_codex_args(linked), "/tmp/p.md", [])
         assert _configured_roots(bash_argv) == expected
@@ -113,14 +122,35 @@ def case_linked_worktree_argv_is_narrow() -> None:
         misleading_roots = os_sandbox.macos_write_roots(
             str(linked), "workspace-write", agent="notcodex", command="custom-codex-proxy"
         )
-        assert not any(root in misleading_roots for root in expected), misleading_roots
+        # The protection here is that a LOOK-ALIKE agent does not inherit codex's
+        # worktree grants: "custom-codex-proxy" contains the substring "codex",
+        # and the worktree roots are gated on an exact label match precisely so
+        # that spoofing the name earns nothing.
+        #
+        # Channel roots are deliberately excluded from this check: every worker
+        # needs to post mail regardless of engine, so they are universal by
+        # design and their presence for another agent is correct, not a leak.
+        worktree_only = [root for root in expected if root not in sandbox.worker_channel_roots()]
+        assert worktree_only, "the spoofing check must still have something to protect"
+        assert not any(root in misleading_roots for root in worktree_only), misleading_roots
 
         parent_root = parent.resolve()
         assert str(parent_root) not in expected
         assert str(parent_root) not in _configured_roots(bash_argv)
-        for raw in expected:
+        # Worktree grants must stay inside the worktree's own git dirs -- the
+        # whole point of the linked-worktree narrowing. Channel roots sit outside
+        # by definition (they are the shared mailbox and codex's dispatch homes),
+        # so they are checked separately below rather than exempted silently.
+        for raw in worktree_only:
             path = Path(raw).resolve()
             assert _is_within(path, git_dir) or _is_within(path, common_dir), raw
+        # And the channel roots must not smuggle in anything beyond the two
+        # directories they exist for: this is the check that would catch someone
+        # "fixing" a sandbox denial by widening the channel grant to $HOME.
+        for raw in sandbox.worker_channel_roots():
+            path = Path(raw).resolve()
+            assert path.name in {"messages", "dispatch-homes"} or path.parent.name == "dispatch-homes", raw
+            assert _is_within(path, Path.home() / ".goal-flight"), raw
 
         # Filesystem-permission proof of the same boundary. Pack the current
         # branch first, then make the whole common gitdir read-only except the
@@ -154,7 +184,14 @@ def case_linked_worktree_argv_is_narrow() -> None:
         (common_dir / "objects").symlink_to(external_objects, target_is_directory=True)
         assert sandbox.linked_worktree_writable_roots(linked) == []
         escaped_argv, _ = dispatch.build_worker(_codex_args(linked), "/tmp/p.md", [])
-        assert not any("writable_roots=" in part for part in escaped_argv), escaped_argv
+        # When the worktree narrowing cannot be computed safely (objects moved
+        # outside via symlink), NO worktree root may be emitted -- a partial
+        # narrow grant is worse than none. The channel roots still are: they do
+        # not depend on the worktree, and a worker that cannot reach its mailbox
+        # cannot report the very breakage that got it here.
+        escaped_roots = _configured_roots(escaped_argv)
+        assert escaped_roots == sandbox.worker_channel_roots(), escaped_argv
+        assert not any(str(common_dir) in root for root in escaped_roots), escaped_argv
         escaped_outer = os_sandbox.macos_write_roots(
             str(linked), "workspace-write", agent="codex", command="codex"
         )
@@ -169,7 +206,14 @@ def case_non_linked_and_non_write_profiles_are_unchanged() -> None:
 
         assert sandbox.linked_worktree_writable_roots(repo) == []
         normal_argv, _ = dispatch.build_worker(_codex_args(repo), "/tmp/p.md", [])
-        assert not any("writable_roots=" in part for part in normal_argv), normal_argv
+        # A NORMAL (non-linked) repo needs no worktree narrowing -- codex's own
+        # workspace-write already covers the checkout. It still gets the channel
+        # roots, and only those. This is the case that was silently broken: the
+        # grant was gated behind a cwd argument nobody passes, so an ordinary
+        # worker in an ordinary repo could neither post mail nor start its
+        # review, and the failure surfaced only as "Operation not permitted".
+        normal_roots = _configured_roots(normal_argv)
+        assert normal_roots == sandbox.worker_channel_roots(), normal_argv
 
         read_only_argv, _ = dispatch.build_worker(
             _codex_args(repo, "read-only"), "/tmp/p.md", []
