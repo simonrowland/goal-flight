@@ -859,7 +859,18 @@ def _attention_kind(value: object) -> str | None:
     treats every other boundary.
     """
     kind = str(value or "").strip().lower().replace("-", "_")
-    return kind if kind in _ATTENTION_KINDS else None
+    if kind in _ATTENTION_KINDS:
+        return kind
+    # Controller-addressed mail is operator attention too, and it is the
+    # channel a human actually writes on. A question needs an answer, so it
+    # is a need; the rest are informational. Mapped onto the existing kinds
+    # rather than inventing new ones, so the renderer and the allowlist stay
+    # closed.
+    if kind == "controller_question":
+        return "user_need"
+    if kind in {"controller_answer", "controller_notice", "coordination", "notice"}:
+        return "advisory"
+    return None
 
 
 def _attention_rows(summary: object) -> list[dict[str, Any]]:

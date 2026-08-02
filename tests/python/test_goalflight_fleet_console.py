@@ -452,6 +452,37 @@ def test_unrecognised_attention_type_is_dropped_not_promoted() -> None:
     )
 
 
+def test_controller_authored_mail_reaches_the_attention_plane() -> None:
+    """The channel a human actually writes on must be read.
+
+    The plane was sourced only from the worker-MARKER stream (user_need /
+    user_confirm / blocked). Controller-addressed types -- controller-question,
+    controller-notice, coordination -- existed in the store in the hundreds and
+    were surfaced to nobody, so a peer controller's question reached no one and
+    the operator relayed messages by hand between sessions.
+
+    Mapped onto the existing kinds rather than new ones so the renderer and the
+    allowlist stay closed: a question needs an answer (user_need), the rest are
+    informational (advisory). Genuine automation must still be dropped, so that
+    is asserted here too -- widening the map until everything gets through would
+    re-create the laundering this same function was just fixed for.
+    """
+    summary = {"needs": [
+        {"type": "controller-question", "ts": "2026-08-02T10:00:00+00:00", "dispatch_id": "peer", "text": "can I merge?"},
+        {"type": "controller-notice", "ts": "2026-08-02T10:00:00+00:00", "dispatch_id": "peer", "text": "fyi"},
+        {"type": "coordination", "ts": "2026-08-02T10:00:00+00:00", "dispatch_id": "peer", "text": "merge train"},
+        {"type": "blocked", "ts": "2026-08-02T10:00:00+00:00", "dispatch_id": "w1", "text": "worker stuck"},
+        {"type": "done-suggest", "ts": "2026-08-02T10:00:00+00:00", "dispatch_id": "auto", "text": "review + accept?"},
+    ]}
+    rows = F._attention_rows(summary)
+    by_id = {row["dispatch_id"]: row["kind"] for row in rows}
+    assert_true("a peer controller's question needs an answer", by_id.get("peer") is not None)
+    kinds = sorted(row["kind"] for row in rows)
+    assert_true("question -> need, notices -> advisory, marker survives",
+                kinds == ["advisory", "advisory", "blocked", "user_need"])
+    assert_true("automation is STILL dropped", "auto" not in by_id)
+
+
 def main() -> None:
     fleet_payload = test_fleet_consumes_status_once_before_project_grouping()
     attention_payload = test_attention_uses_envelope_timestamps_and_tolerates_missing_fleet_join()
@@ -460,6 +491,7 @@ def main() -> None:
     test_registry_pass_is_bounded_and_reports_what_it_skipped()
     test_degraded_sample_exits_nonzero_instead_of_looking_healthy()
     test_unrecognised_attention_type_is_dropped_not_promoted()
+    test_controller_authored_mail_reaches_the_attention_plane()
     test_allowlist_rejects_unknown_and_unsafe_fields(attention_payload)
     print("OK: fleet-console projection tests pass")
 

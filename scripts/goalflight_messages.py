@@ -417,6 +417,49 @@ def _open_user_needs(envelopes: list[dict], *, acked_through: int = 0) -> list[d
     return open_items
 
 
+# Types a CONTROLLER or a human deliberately addressed to another controller,
+# as opposed to the worker-marker stream (_open_user_needs). Both are real
+# attention; only the marker stream was ever read, so a peer controller's
+# question or notice reached nobody and the human ended up relaying it by hand.
+CONTROLLER_CHANNEL_TYPES = frozenset(
+    {
+        "controller-question",
+        "controller-answer",
+        "controller-notice",
+        "coordination",
+        "notice",
+    }
+)
+
+
+def _open_controller_channel(envelopes: list[dict], *, acked_through: int = 0) -> list[dict]:
+    """Unacked controller-addressed messages.
+
+    Deliberately NOT gated on _dispatch_complete the way _open_user_needs is: a
+    worker's need dies with its dispatch, but a message a peer controller wrote
+    is still worth reading after the dispatch that carried it has finished.
+    """
+    open_items: list[dict] = []
+    for env in envelopes:
+        if (
+            env.get("type") in CONTROLLER_CHANNEL_TYPES
+            and int(env.get("seq", 0)) > acked_through
+        ):
+            payload = env.get("payload", {}) or {}
+            open_items.append(
+                {
+                    "dispatch_id": env["dispatch_id"],
+                    "seq": env["seq"],
+                    "type": env["type"],
+                    "nudge_kind": payload.get("nudge_kind"),
+                    "ts": env["ts"],
+                    "text": payload.get("text", ""),
+                    "payload": payload,
+                }
+            )
+    return open_items
+
+
 def _open_controller_advisories(envelopes: list[dict], *, acked_through: int = 0) -> list[dict]:
     if _dispatch_complete(envelopes):
         return []
@@ -566,6 +609,7 @@ def build_aggregate(
 
     open_user_needs: list[dict] = []
     open_advisories: list[dict] = []
+    open_controller_channel: list[dict] = []
     active_dispatches: list[str] = []
     for dispatch_id, envelopes in sorted(envelopes_by_dispatch.items()):
         if not envelopes:
@@ -577,6 +621,9 @@ def build_aggregate(
         open_advisories.extend(
             _open_controller_advisories(envelopes, acked_through=acked_through)
         )
+        open_controller_channel.extend(
+            _open_controller_channel(envelopes, acked_through=acked_through)
+        )
 
     return {
         "schema": AGGREGATE_SCHEMA,
@@ -585,6 +632,7 @@ def build_aggregate(
         "updated_at": utc_now(),
         "open_user_needs": open_user_needs,
         "open_advisories": open_advisories,
+        "open_controller_channel": open_controller_channel,
         "active_dispatches": active_dispatches,
         "last_steering": _last_steering(envelopes_by_dispatch),
     }
@@ -1175,6 +1223,10 @@ def controller_mail_summary(
     )
     needs = list(aggregate.get("open_user_needs") or [])
     needs.extend(aggregate.get("open_advisories") or [])
+    # The controller-addressed channel. Without this the summary is only the
+    # worker-marker stream, so a peer controller's question or notice was
+    # never surfaced to anyone and a human had to carry it between sessions.
+    needs.extend(aggregate.get("open_controller_channel") or [])
     if scoped_dispatch_ids is not None:
         needs = [
             n for n in needs
