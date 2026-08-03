@@ -281,16 +281,19 @@ echo "$out" | grep -qi "npx" \
   || { echo "test14 FAIL: config.toml was written despite missing npx"; cat "$HOME/.codex/config.toml"; exit 1; }
 echo "test14 pass: missing npx is a clean error (no broken registration)"
 
-# --- test 15: lock file is cleaned up after successful register ---
-# Round-2 P1: prior lock file persisted as a stale artifact.
-mk_sandbox lock-cleanup
+# --- test 15: shared resource lock persists after successful register ---
+# A stable inode is load-bearing: unlink-after-release lets later processes lock
+# different inodes at the same pathname and defeats mutual exclusion.
+mk_sandbox lock-persistence
 cat > "$HOME/.claude.json" <<'EOF'
 { "mcpServers": { "context-mode": { "command": "node", "args": [] } } }
 EOF
 "$SCRIPT" >/dev/null
-[ ! -f "$HOME/.codex/.register-context-mode.lock" ] \
-  || { echo "test15 FAIL: lock file persisted after successful register"; ls -la "$HOME/.codex/"; exit 1; }
-echo "test15 pass: lock file cleaned up after register"
+[ -f "$HOME/.codex/.config.toml.lock" ] \
+  || { echo "test15 FAIL: shared resource lock missing after successful register"; ls -la "$HOME/.codex/"; exit 1; }
+[ ! -e "$HOME/.codex/.register-context-mode.lock" ] \
+  || { echo "test15 FAIL: writer-named lock should not be created"; ls -la "$HOME/.codex/"; exit 1; }
+echo "test15 pass: shared resource lock persists after register"
 
 # --- test 16: --check with codex needs register AND npx missing → exit 4 ---
 # Round-4 P1: prior --check returned 1 even when npx was absent, leading to

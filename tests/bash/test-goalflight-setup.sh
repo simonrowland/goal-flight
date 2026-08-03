@@ -365,6 +365,39 @@ grep -q 'refusing mutation without --yes' /tmp/goal-flight-setup-denied.out || f
 
 mkdir -p "$HOME/.codex"
 printf 'existing = true\n' > "$HOME/.codex/config.toml"
+# A live codedb probe may trigger its updater/bootstrap during MCP startup. Make
+# that integration-registration side effect deterministic: the registrar must
+# probe under an isolated HOME so this bare server block never lands in the
+# target config. An empty advertised tool list also must fall back to the known
+# read-only approvals instead of reporting success with a bare server table.
+mkdir -p "$HOME/bin"
+cat > "$HOME/bin/codedb" <<'PY'
+#!/usr/bin/env python3
+import json
+import os
+import sys
+from pathlib import Path
+
+config = Path(os.environ["HOME"]) / ".codex" / "config.toml"
+config.parent.mkdir(parents=True, exist_ok=True)
+existing = config.read_text() if config.exists() else ""
+config.write_text(
+    existing
+    + '\n[mcp_servers.codedb]\ncommand = "/fake/codedb"\nargs = ["mcp"]\n'
+    + '\n[mcp_servers.deepwiki]\nurl = "https://mcp.deepwiki.com/mcp"\n'
+)
+for line in sys.stdin:
+    message = json.loads(line)
+    if message.get("id") == 2:
+        print(json.dumps({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {"tools": []},
+        }), flush=True)
+        break
+PY
+chmod +x "$HOME/bin/codedb"
+export PATH="$HOME/bin:$PATH"
 mkdir -p "$HOME/.codex/skills/goal-flight"
 printf 'legacy skill\n' > "$HOME/.codex/skills/goal-flight/SKILL.md"
 cp "$HOME/.codex/config.toml" "$TMP_ROOT/original-config.toml"
@@ -414,6 +447,10 @@ grep -q 'register-context-mode-codex.py' "$GOALFLIGHT_SETUP_FAKE_CONTEXT_MODE_LO
 [ ! -e "$HOME/.codex/skills/goal-flight" ] || fail "codex legacy personal skill not cleaned up"
 grep -q 'existing = true' "$HOME/.codex/config.toml" || fail "existing codex config lost"
 [ "$(grep -c '# >>> goal-flight codex' "$HOME/.codex/config.toml")" -eq 1 ] || fail "goal-flight block missing after apply"
+grep -qF '[mcp_servers.codedb.tools.codedb_context]' "$HOME/.codex/config.toml" || fail "codedb empty live-probe registration omitted the wedge-critical approval"
+if grep -qF '[mcp_servers.deepwiki]' "$HOME/.codex/config.toml"; then fail "codedb live probe mutated the target HOME"; fi
+[ -f "$HOME/.codex/.config.toml.lock" ] || fail "codedb shared resource lock missing"
+[ ! -e "$HOME/.codex/.register-codedb.lock" ] || fail "codedb registrar created its obsolete writer-named lock"
 
 run_setup --apply --yes --agent codex >/tmp/goal-flight-setup-apply2.out
 [ "$(grep -c '# >>> goal-flight codex' "$HOME/.codex/config.toml")" -eq 1 ] || fail "codex setup not idempotent"

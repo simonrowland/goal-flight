@@ -23,9 +23,9 @@ entries, not just the server block:
   present, CONTEXT-OK).
 
 So registering codedb safely for headless codex means writing
-`[mcp_servers.codedb.tools.<tool>] approval_mode = "approve"` for EVERY codedb
-tool. That is what this script does. All codedb tools are read-only
-code-intelligence, so blanket auto-approve is correct.
+`[mcp_servers.codedb.tools.<tool>] approval_mode = "approve"` for every known
+read-only tool the live server advertises. Unknown and mutating tools stay
+unapproved; the wedge-critical `codedb_context` approval is always included.
 
 What this script does
 ---------------------
@@ -38,11 +38,10 @@ What this script does
      bare-server wedge state; the registrar REPAIRS it by appending the missing
      per-tool approvals (a server-only re-run otherwise leaves the wedge forever).
    - "absent"     = no server block -> writes the full registration.
-3. The approved tool set is the codedb `mcp` server's LIVE advertised surface
-   (queried via a tools/list handshake; falls back to a hardcoded read-only set
-   if the query fails), minus the write tool `codedb_edit`. So a newer codedb
-   that adds read tools is covered without a code change, and the approved set is
-   never broader than what the server actually exposes.
+3. The approved tool set intersects the codedb `mcp` server's LIVE advertised
+   surface with a hardcoded read-only allowlist. If the query fails or advertises
+   no tools, it falls back to that allowlist. Unknown tools remain unapproved,
+   while the wedge-critical `codedb_context` approval is always included.
 
 Idempotency + safety:
 - Backs up existing ~/.codex/config.toml with a collision-resistant suffix.
@@ -131,79 +130,102 @@ READONLY_CODEDB_TOOLS = frozenset({
 # registration that lacks THIS approval is "incomplete" and must be repaired.
 WEDGE_CRITICAL_TOOL = "codedb_context"
 
+# Both standalone registrars mutate the same resource. Keep this duplicated
+# constant in each dependency-free bootstrap script: the lock is named for the
+# config file, shared by every registrar, and intentionally never unlinked.
+CODEX_CONFIG_LOCK_NAME = ".config.toml.lock"
+
 
 def advertised_codedb_tools(codedb_path: str, *, timeout_s: float = 15.0) -> Optional[list[str]]:
     """Return the tool names the installed `codedb mcp` advertises, or None on any failure.
 
     Spawns `codedb mcp`, performs the minimal JSON-RPC handshake (initialize ->
     initialized notification -> tools/list), and returns the advertised names.
-    The caller (target_tools) intersects this with the read-only allowlist, so a
-    newer codedb that adds READ tools is covered without a code bump while a new
-    WRITE tool is never auto-approved. Best-effort — any error (spawn failure,
-    protocol drift, timeout) returns None and the caller falls back to the
-    READONLY_CODEDB_TOOLS allowlist.
+    The caller (target_tools) intersects this with the read-only allowlist, so
+    unknown or mutating tools are never auto-approved. Best-effort — any error
+    (spawn failure, protocol drift, timeout) returns None and the caller falls
+    back to the READONLY_CODEDB_TOOLS allowlist.
     """
     import subprocess
     import select
     import time as _time
 
-    proc: Optional[subprocess.Popen] = None
     try:
-        proc = subprocess.Popen(
-            [codedb_path, "mcp"],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-        )
-
-        def _send(obj: dict) -> None:
-            assert proc.stdin is not None
-            proc.stdin.write(json.dumps(obj) + "\n")
-            proc.stdin.flush()
-
-        _send({
-            "jsonrpc": "2.0", "id": 1, "method": "initialize",
-            "params": {"protocolVersion": "2024-11-05", "capabilities": {},
-                       "clientInfo": {"name": "goalflight-register", "version": "1"}},
-        })
-        _send({"jsonrpc": "2.0", "method": "notifications/initialized"})
-        _send({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
-        # A stdio MCP server does NOT exit after tools/list — it keeps serving — so we
-        # must read line-by-line until the id:2 response (or a deadline), with stdin
-        # kept OPEN (closing it makes some builds return nothing), and then kill it.
-        # communicate() would block to EOF/exit and always time out -> dead discovery.
-        deadline = _time.monotonic() + timeout_s
-        assert proc.stdout is not None
-        while _time.monotonic() < deadline:
-            ready, _, _ = select.select([proc.stdout], [], [], deadline - _time.monotonic())
-            if not ready:
-                break
-            line = proc.stdout.readline()
-            if not line:
-                break
-            line = line.strip()
-            if not line:
-                continue
+        # Capability discovery must not inherit any home/config root for the
+        # config we are registering. MCP startup can trigger codedb's updater /
+        # bootstrap, whose integration setup writes MCP entries. Against the
+        # target config that side effect can create a bare server table between
+        # classification and the append below.
+        with tempfile.TemporaryDirectory(prefix="goalflight-codedb-probe-") as probe_home:
+            probe_env = os.environ.copy()
+            probe_env["HOME"] = probe_home
+            probe_env["USERPROFILE"] = probe_home
+            probe_env["XDG_CONFIG_HOME"] = str(Path(probe_home) / ".config")
+            probe_env["CODEX_HOME"] = str(Path(probe_home) / ".codex")
+            # Disable optional updater and integration setup where supported.
+            # The rebased config roots independently contain integration writes
+            # from older builds that ignore the policy switch.
+            probe_env["CODEDB_NO_AUTO_UPDATE"] = "1"
+            probe_env["CODEDB_NO_CODEX_POLICY"] = "1"
+            proc: Optional[subprocess.Popen] = None
             try:
-                msg = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if msg.get("id") == 2 and isinstance(msg.get("result"), dict):
-                tools = msg["result"].get("tools")
-                if isinstance(tools, list):
-                    names = [t.get("name") for t in tools if isinstance(t, dict) and t.get("name")]
-                    return names or None
+                proc = subprocess.Popen(
+                    [codedb_path, "mcp"],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    env=probe_env,
+                )
+
+                def _send(obj: dict) -> None:
+                    assert proc.stdin is not None
+                    proc.stdin.write(json.dumps(obj) + "\n")
+                    proc.stdin.flush()
+
+                _send({
+                    "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                    "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                               "clientInfo": {"name": "goalflight-register", "version": "1"}},
+                })
+                _send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+                _send({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+                # A stdio MCP server does NOT exit after tools/list — it keeps serving — so we
+                # must read line-by-line until the id:2 response (or a deadline), with stdin
+                # kept OPEN (closing it makes some builds return nothing), and then kill it.
+                # communicate() would block to EOF/exit and always time out -> dead discovery.
+                deadline = _time.monotonic() + timeout_s
+                assert proc.stdout is not None
+                while _time.monotonic() < deadline:
+                    ready, _, _ = select.select([proc.stdout], [], [], deadline - _time.monotonic())
+                    if not ready:
+                        break
+                    line = proc.stdout.readline()
+                    if not line:
+                        break
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        msg = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if msg.get("id") == 2 and isinstance(msg.get("result"), dict):
+                        tools = msg["result"].get("tools")
+                        if isinstance(tools, list):
+                            names = [t.get("name") for t in tools if isinstance(t, dict) and t.get("name")]
+                            return names or None
+                        return None
                 return None
-        return None
+            finally:
+                if proc is not None and proc.poll() is None:
+                    try:
+                        proc.kill()
+                        proc.wait(timeout=1)
+                    except Exception:
+                        pass
     except Exception:
         return None
-    finally:
-        if proc is not None and proc.poll() is None:
-            try:
-                proc.kill()
-            except Exception:
-                pass
 
 
 def target_tools(codedb_path: str) -> list[str]:
@@ -395,7 +417,7 @@ def register_atomically(
     # inode while a third creates a fresh file at the same path — two writers, two
     # different locks, mutex defeated (pre-landing review P2). A stable empty
     # lock file in ~/.codex is harmless.
-    lock_path = codex_config.parent / ".register-codedb.lock"
+    lock_path = codex_config.parent / CODEX_CONFIG_LOCK_NAME
     try:
         lock_file = open(lock_path, "w")
     except OSError as e:

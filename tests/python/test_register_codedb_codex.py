@@ -13,14 +13,17 @@ Pins (incl. the three pre-landing-review findings):
 - classify_registration distinguishes absent / incomplete / complete.
 - register_atomically REPAIRS an incomplete (server-only) config — the P1 where a plain
   re-run used to no-op forever on the exact wedge state.
-- the flock lock file is NOT unlinked (P2 mutex-split fix).
+- an MCP-startup bootstrap cannot register into the target HOME mid-transaction.
+- both Codex registrars share one persistent config-resource lock (P2 mutex fix).
 """
 
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 import tempfile
+import threading
 import tomllib
 from pathlib import Path
 
@@ -32,6 +35,12 @@ _spec = importlib.util.spec_from_file_location(
 )
 R = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(R)
+
+_context_spec = importlib.util.spec_from_file_location(
+    "register_context_mode_codex", ROOT / "scripts" / "register-context-mode-codex.py"
+)
+C = importlib.util.module_from_spec(_context_spec)
+_context_spec.loader.exec_module(C)
 
 
 def assert_true(name: str, cond: bool) -> None:
@@ -81,6 +90,71 @@ def test_advertised_writer_is_not_approved() -> None:
         assert_true("read tools kept", {"codedb_symbol", "codedb_search", "codedb_context"} <= set(tools))
     finally:
         R.advertised_codedb_tools = saved  # type: ignore[assignment]
+
+
+def test_live_probe_cannot_mutate_target_config() -> None:
+    """A probed codedb process must not race registration in the target config.
+
+    The observed failure came from codedb's updater/bootstrap running during MCP
+    startup.  This fake makes that side effect deterministic before returning
+    tools/list, reproducing the double declaration when the probe inherits a
+    config root.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        home = Path(d) / "home"
+        cfg = home / ".codex" / "config.toml"
+        fake_codedb = home / "bin" / "codedb"
+        cfg.parent.mkdir(parents=True)
+        fake_codedb.parent.mkdir(parents=True)
+        cfg.write_text("existing = true\n", encoding="utf-8")
+        fake_codedb.write_text(
+            f"#!{sys.executable}\n"
+            "import json, os\n"
+            "from pathlib import Path\n"
+            "codex_home = Path(os.environ.get('CODEX_HOME', "
+            "Path(os.environ['HOME']) / '.codex'))\n"
+            "cfg = codex_home / 'config.toml'\n"
+            "cfg.parent.mkdir(parents=True, exist_ok=True)\n"
+            "existing = cfg.read_text() if cfg.exists() else ''\n"
+            "cfg.write_text(existing + '\\n[mcp_servers.codedb]\\n'\n"
+            "               'command = \\\"/fake/codedb\\\"\\nargs = [\\\"mcp\\\"]\\n'\n"
+            "               '\\n[mcp_servers.deepwiki]\\n'\n"
+            "               'url = \\\"https://mcp.deepwiki.com/mcp\\\"\\n')\n"
+            "for line in __import__('sys').stdin:\n"
+            "    message = json.loads(line)\n"
+            "    if message.get('id') == 2:\n"
+            "        print(json.dumps({'jsonrpc': '2.0', 'id': 2, 'result': {\n"
+            "            'tools': [{'name': 'codedb_context'}, {'name': 'codedb_symbol'}]\n"
+            "        }}), flush=True)\n"
+            "        break\n",
+            encoding="utf-8",
+        )
+        fake_codedb.chmod(0o755)
+
+        saved_home = os.environ.get("HOME")
+        saved_codex_home = os.environ.get("CODEX_HOME")
+        os.environ["HOME"] = str(home)
+        os.environ["CODEX_HOME"] = str(home / ".codex")
+        try:
+            result = R.register_atomically(cfg, str(fake_codedb))
+        finally:
+            if saved_home is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = saved_home
+            if saved_codex_home is None:
+                os.environ.pop("CODEX_HOME", None)
+            else:
+                os.environ["CODEX_HOME"] = saved_codex_home
+
+        assert_true("registration succeeded", result is not R.RACED)
+        action, _backup = result
+        assert_eq("registered after isolated probe", action, "registered")
+        text = cfg.read_text()
+        data = tomllib.loads(text)
+        assert_eq("one codedb server table", text.count("[mcp_servers.codedb]"), 1)
+        assert_true("probe side effect stayed isolated", "deepwiki" not in data["mcp_servers"])
+        assert_eq("registration complete", R.classify_registration(cfg)[0], "complete")
 
 
 def test_render_block_is_valid_toml_and_approves_context() -> None:
@@ -284,7 +358,93 @@ def test_lock_file_is_not_unlinked() -> None:
         cfg = Path(d) / "config.toml"
         cfg.write_text("[features]\nx = 1\n", encoding="utf-8")
         R.register_atomically(cfg, _NO_CODEDB)
-        assert_true("lock file persists", (Path(d) / ".register-codedb.lock").exists())
+        assert_true("lock file persists", (Path(d) / R.CODEX_CONFIG_LOCK_NAME).exists())
+
+
+def test_codex_registrars_mutually_exclude_each_other() -> None:
+    """The two writers must serialize on the config resource, not tool names."""
+    with tempfile.TemporaryDirectory() as d:
+        cfg = Path(d) / "config.toml"
+        cfg.write_text("existing = true\n", encoding="utf-8")
+        codedb_has_lock = threading.Event()
+        release_codedb = threading.Event()
+        context_lock_checked = threading.Event()
+        context_was_blocked = threading.Event()
+        errors: list[BaseException] = []
+
+        saved_target_tools = R.target_tools
+        saved_context_fcntl = C.fcntl
+
+        class ObservedFcntl:
+            """Turn the context writer's lock attempt into an observed try-lock."""
+
+            def __getattr__(self, name: str) -> object:
+                return getattr(saved_context_fcntl, name)
+
+            def flock(self, handle: object, operation: int) -> None:
+                if threading.current_thread().name != "context-registrar":
+                    saved_context_fcntl.flock(handle, operation)
+                    return
+                try:
+                    saved_context_fcntl.flock(handle, operation | saved_context_fcntl.LOCK_NB)
+                except BlockingIOError:
+                    context_was_blocked.set()
+                    context_lock_checked.set()
+                    assert_true("codedb test released", release_codedb.wait(5))
+                    saved_context_fcntl.flock(handle, operation)
+                else:
+                    context_lock_checked.set()
+
+        def blocking_target_tools(_path: str) -> list[str]:
+            codedb_has_lock.set()
+            assert_true("codedb test released", release_codedb.wait(5))
+            return ["codedb_context"]
+
+        def run_codedb() -> None:
+            try:
+                R.register_atomically(cfg, _NO_CODEDB)
+            except BaseException as exc:
+                errors.append(exc)
+
+        def run_context() -> None:
+            try:
+                C.append_atomically(cfg, C.render_block("/usr/bin/npx"))
+            except BaseException as exc:
+                errors.append(exc)
+
+        R.target_tools = blocking_target_tools  # type: ignore[assignment]
+        C.fcntl = ObservedFcntl()  # type: ignore[assignment]
+        codedb_thread = threading.Thread(target=run_codedb, name="codedb-registrar")
+        context_thread = threading.Thread(target=run_context, name="context-registrar")
+        try:
+            codedb_thread.start()
+            assert_true("codedb acquired its lock", codedb_has_lock.wait(5))
+            context_thread.start()
+            assert_true("context lock attempt observed", context_lock_checked.wait(5))
+        finally:
+            release_codedb.set()
+            codedb_thread.join(5)
+            context_thread.join(5)
+            R.target_tools = saved_target_tools  # type: ignore[assignment]
+            C.fcntl = saved_context_fcntl  # type: ignore[assignment]
+
+        assert_true("context registrar blocked on shared resource lock", context_was_blocked.is_set())
+        assert_true("codedb thread stopped", not codedb_thread.is_alive())
+        assert_true("context thread stopped", not context_thread.is_alive())
+        assert_eq("registrars completed without errors", errors, [])
+        data = tomllib.loads(cfg.read_text())
+        assert_true("codedb preserved", "codedb" in data["mcp_servers"])
+        assert_true("context-mode preserved", "context-mode" in data["mcp_servers"])
+
+
+def test_context_registrar_keeps_resource_lock_file() -> None:
+    with tempfile.TemporaryDirectory() as d:
+        cfg = Path(d) / "config.toml"
+        cfg.write_text("existing = true\n", encoding="utf-8")
+        C.append_atomically(cfg, C.render_block("/usr/bin/npx"))
+        lock_path = Path(d) / C.CODEX_CONFIG_LOCK_NAME
+        assert_true("context registrar uses shared lock name", lock_path.exists())
+        assert_eq("registrars share lock name", C.CODEX_CONFIG_LOCK_NAME, R.CODEX_CONFIG_LOCK_NAME)
 
 
 def test_main_check_exit_when_no_codedb() -> None:
@@ -309,6 +469,7 @@ def main() -> None:
     tests = [
         test_target_tools_fallback_excludes_edit_includes_context,
         test_advertised_writer_is_not_approved,
+        test_live_probe_cannot_mutate_target_config,
         test_invalid_whole_file_toml_is_not_clobbered,
         test_empty_file_is_absent_not_malformed,
         test_render_block_is_valid_toml_and_approves_context,
@@ -322,6 +483,8 @@ def main() -> None:
         test_malformed_tools_value_errors,
         test_register_preserves_curated_complete_config,
         test_lock_file_is_not_unlinked,
+        test_codex_registrars_mutually_exclude_each_other,
+        test_context_registrar_keeps_resource_lock_file,
         test_main_check_exit_when_no_codedb,
     ]
     for t in tests:

@@ -84,6 +84,11 @@ class _RaceSentinel:
 
 RACED = _RaceSentinel()
 
+# Both standalone registrars mutate the same resource. Keep this duplicated
+# constant in each dependency-free bootstrap script: the lock is named for the
+# config file, shared by every registrar, and intentionally never unlinked.
+CODEX_CONFIG_LOCK_NAME = ".config.toml.lock"
+
 
 def claude_has_context_mode() -> str | None:
     """Return a one-line provenance string if context-mode is detected Claude-side, else None.
@@ -185,7 +190,9 @@ def append_atomically(
             file=sys.stderr,
         )
         sys.exit(3)
-    lock_path = codex_config.parent / ".register-context-mode.lock"
+    # The stable lock path is shared with register-codedb-codex.py. Unlinking a
+    # lock after release can split the mutex across old and newly-created inodes.
+    lock_path = codex_config.parent / CODEX_CONFIG_LOCK_NAME
     try:
         lock_file = open(lock_path, "w")
     except OSError as e:
@@ -195,51 +202,42 @@ def append_atomically(
             file=sys.stderr,
         )
         sys.exit(3)
-    try:
-        with lock_file:
-            fcntl.flock(lock_file, fcntl.LOCK_EX)
-            # Re-check under lock — another runner may have written it.
-            if codex_already_registered(codex_config):
-                return RACED
-            backup: Optional[Path] = None
-            if codex_config.exists():
-                ts = time.strftime("%Y%m%d-%H%M%S")
-                backup_fd, backup_name = tempfile.mkstemp(
-                    prefix=f"config.toml.bak.{ts}.",
-                    dir=str(codex_config.parent),
-                )
-                os.close(backup_fd)
-                shutil.copy2(codex_config, backup_name)
-                backup = Path(backup_name)
-            existing = codex_config.read_text() if codex_config.exists() else ""
-            if existing and not existing.endswith("\n"):
-                existing += "\n"
-            new_content = existing + block
-            tmp_fd, tmp_name = tempfile.mkstemp(
-                prefix="config.toml.new.",
+    with lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        # Re-check under lock — another runner may have written it.
+        if codex_already_registered(codex_config):
+            return RACED
+        backup: Optional[Path] = None
+        if codex_config.exists():
+            ts = time.strftime("%Y%m%d-%H%M%S")
+            backup_fd, backup_name = tempfile.mkstemp(
+                prefix=f"config.toml.bak.{ts}.",
                 dir=str(codex_config.parent),
             )
-            with os.fdopen(tmp_fd, "w") as f:
-                f.write(new_content)
-            try:
-                os.replace(tmp_name, codex_config)
-            except OSError as e:
-                if e.errno == errno.EXDEV:
-                    # Cross-FS rename (e.g. tmpdir on different mount). Fall back
-                    # to shutil.move which copies + unlinks. Loses atomicity but
-                    # we still hold the lock, so concurrent readers won't tear.
-                    shutil.move(tmp_name, codex_config)
-                else:
-                    raise
-            return backup
-    finally:
-        # Best-effort lock-file cleanup. The flock is released on file close
-        # above; unlinking the lock file itself prevents ~/.codex/ from
-        # accumulating stale lock artifacts across many init invocations.
+            os.close(backup_fd)
+            shutil.copy2(codex_config, backup_name)
+            backup = Path(backup_name)
+        existing = codex_config.read_text() if codex_config.exists() else ""
+        if existing and not existing.endswith("\n"):
+            existing += "\n"
+        new_content = existing + block
+        tmp_fd, tmp_name = tempfile.mkstemp(
+            prefix="config.toml.new.",
+            dir=str(codex_config.parent),
+        )
+        with os.fdopen(tmp_fd, "w") as f:
+            f.write(new_content)
         try:
-            lock_path.unlink()
-        except FileNotFoundError:
-            pass
+            os.replace(tmp_name, codex_config)
+        except OSError as e:
+            if e.errno == errno.EXDEV:
+                # Cross-FS rename (e.g. tmpdir on different mount). Fall back
+                # to shutil.move which copies + unlinks. Loses atomicity but
+                # we still hold the lock, so concurrent readers won't tear.
+                shutil.move(tmp_name, codex_config)
+            else:
+                raise
+        return backup
 
 
 def main(argv: list[str]) -> int:
