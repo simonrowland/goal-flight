@@ -46,10 +46,11 @@ before they bite mid-execute.
      untagged or grouped.
    - `[milestone]` tags should appear roughly every 5 chunks for projects
      ≥ 15 chunks; warn if absent.
-   - `[controller-direct]` tags (when present): chunk SCOPE should imply
-     trivial single-file work, < ~30 LoC delta, no cross-module coupling.
-     Heuristic check: SCOPE word count < 60 AND CHECKLIST item count ≤ 3.
-     Warn if violated (probably mis-tagged).
+   - `[controller-direct]` is a candidate tag, not permission. SCOPE must show
+     held session context and a fully stateable edit with no exploration or
+     special review-independence need. Warn on unread call sites, cross-module
+     discovery, or a non-mechanical trust surface — not delta size or file
+     count. Recheck free-slot serialization under Axis 2 at execution.
    - `[acp]` and `[bash-tail]` are mutually exclusive — co-occurrence on the
      same chunk → P1 conflict warn (orchestrator would otherwise have to pick
      arbitrarily). `[acp]` should only appear when `docs-private/env-caveats.md`

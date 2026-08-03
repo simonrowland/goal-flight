@@ -128,21 +128,19 @@ This is the front-end complement to inline-office-hours' per-chunk premise-check
 > - <explicit anti-scope: paths or patterns not to touch>
 > ```"
 
-When drafter completes, **analyst** (explorer worker via the host `delegate` operation; current Claude wrapper: Explore subagent; other hosts: adapter delegate equivalent): identify parallel-safe chunks AND trivial chunks the orchestrator can handle inline.
+When drafter completes, **analyst** (explorer worker via the host `delegate` operation; current Claude wrapper: Explore subagent; other hosts: adapter delegate equivalent): identify parallel-safe chunks AND context-held controller-direct candidates.
 
 > "Given these N drafted chunks, two tagging passes:
 >
 > (1) **`[parallel-safe:<group-id>]`** — chunks that touch disjoint files/modules and could safely run in parallel worktrees. Chunks in the same group can run together; different groups must be sequential relative to each other if they share dependencies. Conservative bias: when unsure, do not tag.
 >
-> (2) **`[controller-direct]`** — chunks where dispatching a worker would cost more than just doing the work inline. Two distinct triggers:
+> (2) **`[controller-direct]`** — candidates where the orchestrator already holds the needed state and can state the whole edit before typing. Dispatch-wrapper cost may then exceed the edit: common shapes are a just-root-caused bug, a fully read rename/comment fix, or a review finding the orchestrator has consumed. Delta size and file count do not decide the tag.
 >
->     **A. Trivially small work.** Single-file change, < ~30 LoC delta, no cross-module coupling, no new public surface, no test-harness changes. Dispatch overhead exceeds the work. Examples: typo fixes, version bumps, single-constant renames, single-line bug fixes confirmed against an existing failing test.
->
->     **B. Too much context to explain.** The orchestrator has already loaded substantial relevant state (read files, traced data flow, accumulated reasoning across prior chunks in this session) that a fresh worker would have to re-discover via dispatch wrapper. When the cost of EXPLAINING the context (wrapper rendering + executor re-load) exceeds the cost of just doing the work, controller-direct wins on the same overhead-arbitrage logic as case A, but for a different reason. Heuristic: if a clean dispatch wrapper for this chunk would exceed ~5 KB (the verification-first target size per `prompts/dispatch-wrapper.md`) primarily because the chunk depends on session-loaded orchestrator state, prefer inline. Common shapes: mid-debug chunks where the orchestrator has just diagnosed the bug; chunks that resolve a P0 from a milestone review the orchestrator just consumed; chunks that depend on rolling decisions made in the last 10 turns that haven't been promoted to `docs-private/rag/decisions.md` yet.
+>     **The disqualifier is serialization — not effort.** Do not tag when the orchestrator would have to EXPLORE, when trust needs implementation independence beyond routine chunk review, or when a ready unit could run in a free slot without unexported session state. Inline work is one thing at a time; the fleet is many.
 >
 > Conservative bias: when unsure, do NOT tag — let `execute.md` dispatch a worker. The default worker-dispatch path is safer for ambiguous cases (clean context, transcript record, parallel-safe candidates).
 >
-> Report which file paths each chunk touches (audit trail for parallel safety + controller-direct triviality). Drafter output: <paste>."
+> Report which file paths each chunk touches (audit trail for parallel safety + the controller-direct call). Drafter output: <paste>."
 
 ### 3. Write to goal-queue
 
@@ -168,7 +166,7 @@ Status: ✅ DONE — `<hash>` · 🟡 IN-FLIGHT — `<executor-id>` · TODO · B
 Tags (see SKILL.md for full definitions):
 - [parallel-safe:<group>] — chunks in the same group can run via `--parallel N`
 - [milestone] — trigger gstack review sweep after this chunk lands
-- [controller-direct] — orchestrator handles inline (trivial OR too much session-loaded context to explain)
+- [controller-direct] — inline candidate only when context is held and Axis 2 serialization disqualifiers are clean; trivial size alone does not qualify
 - [goal-mode] — chunk warrants the iteration loop primitive. Composes with `[acp]` for any worker that has an ACP adapter (codex/grok/cursor-agent/claude-code-cli-acp), OR with `[bash-tail]` ONLY for codex `/goal` (codex emits a Final-response marker giving the watcher a turn-boundary signal; other workers don't qualify today — see `protocols/dispatch-routing.md`)
 - [max-iterations:<N>] — cap for [goal-mode] external loops
 - [mixed-executor] — iterations cross executor types for model-diversity stuck-loop recovery

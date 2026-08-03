@@ -52,6 +52,63 @@ sweep question before treating it as one-off cleanup.
    rubric or the relevant protocol), so the next instance is caught at
    review time, not in production.
 
+
+## Standing class: a field asserting a state it never measured
+
+This one earned a permanent lens rather than another entry in the archive.
+**Eight confirmed instances catalogued in a single sweep**, across code,
+comments and a protocol — different subsystems, one shape.
+
+**Predicate.** A value is presented as an observation but is derived from
+something adjacent that was convenient to reach: an intent instead of an
+outcome, a label instead of a measurement, a request instead of a grant, a
+population instead of the subset asked about. The value is usually *correct
+about something* — just not about what its name claims.
+
+**The hunter's question.** For every field on a status line, a dashboard cell,
+a guard, or a sentence in a doc: *what measurement backs this, and when was it
+taken?* If the answer is "it follows from X", ask whether X can be true while
+the claim is false. That gap is the bug.
+
+**Confirmed instances, as recognition training.** Every row below was checked
+back to the code it describes; a ninth candidate was dropped because the
+hardcode it alleged had never actually landed. Verify before you cite — a
+lens against unmeasured claims cannot afford unmeasured evidence.
+
+| asserted | actually measured |
+|---|---|
+| `--wait` says COMPLETE | a marker appeared in output; the process was still running |
+| `guarded_action_authorized` | a weaker signal — an affirmative, not-denied reply — never a grant |
+| `local_workers` (1541) | every record the ledger ever kept; 37 were running |
+| `registered: false` | this tick did not sample it; it *is* registered |
+| attention `user_need` | producer-labelled automation, relabelled by an unrecognised-type fallback |
+| `os_sandbox` shows no profile | goal-flight's seatbelt never applied on that path; codex was enforcing its own |
+| a `--wait` comment saying "deliberately mail-free" | mail waking had landed; the comment outlived its behaviour |
+| "the worker can run its own review" | the sandbox denies DNS to every child; it never could |
+
+**Two lessons the instances agree on.**
+
+*Prose counts.* Two of the eight were English, and one of those cost the most.
+A protocol sentence promised a capability the sandbox made impossible, so
+three workers escalated `BLOCKED:` against an instruction nobody could
+satisfy — and their correct behaviour read as sloppiness until someone
+checked. The other was a comment that outlived the behaviour it described.
+Review docs for this predicate exactly as you review fields.
+
+*Component checks do not catch it.* Most of the code rows had tests that
+stayed green over the wrong measurement — the test asserted the field's value,
+which was never in doubt, rather than the thing the field claimed to observe.
+The prose rows had no test at all. What caught them was exercising the SYSTEM:
+a real worker, a live payload, a mutation. When the fix is for this class,
+verify end to end or do not claim it.
+
+**The tell in the wild:** an error or a status that does not name its own
+cause. `Operation not permitted` does not say who denied it; an `os_sandbox`
+field with no profile reads as "no sandbox" while one is enforcing. When a
+diagnostic cannot distinguish two very different worlds, the field is already
+lying by omission and the next debugger will fix the wrong layer — twice, in
+this case.
+
 ## Cadence
 
 - On every new bug class: run the loop immediately while the anchor

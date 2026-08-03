@@ -65,4 +65,5 @@ available.
 
 Read-only review/analysis remains different from execution: Explore/Agent can
 summarize code or logs, but code-writing chunks need ledger/status/marker
-coverage unless the controller-direct path is truly tiny.
+coverage unless controller-direct already holds the context and Axis 2
+disqualifiers are clean.

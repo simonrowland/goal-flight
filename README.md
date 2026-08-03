@@ -135,7 +135,8 @@ reroutes work away from a limited provider.
 - **A range of agents, local or remote.** Workers include codex, grok, cursor, and
   claude-cli over ACP or bash-tail; the fleet layer runs the same dispatch on remote SSH
   nodes. The orchestrator picks executor and iteration pattern per chunk (one-shot,
-  goal-mode loop to convergence, or controller-direct for trivial edits) and divides usage
+  goal-mode loop to convergence, or controller-direct for context-held edits that do not
+  stall the fleet) and divides usage
   and rate limits across vendors, routing around a pressured provider instead of stalling
   the run.
 - **Independent review before commit.** Every `/goal` chunk runs a 7-category adversarial
@@ -215,7 +216,7 @@ You normally don't need this section unless you're tuning worker selection.
 
 | Pattern | When | Cost |
 |---|---|---|
-| **`controller-direct`** | Trivially small (single-file, < ~30 LoC), OR orchestrator already has the session-loaded context a fresh subagent would have to re-discover | Inline; no subagent |
+| **`controller-direct`** | Orchestrator holds the context, can state the whole edit before typing, and passes Axis 2 serialization disqualifiers | Inline; no subagent |
 | **one-shot subagent** | Default for most chunks. Frontier model picks the executor target based on chunk shape | One subagent dispatch per chunk |
 | **goal-mode loop** | Multi-step refactor, code migration, prototype implementation, converge code to ground-truth — anything that benefits from plan/act/test/review-to-convergence | Multi-hour autonomous session (codex `/goal` natively, or orchestrator-driven iteration loop) |
 

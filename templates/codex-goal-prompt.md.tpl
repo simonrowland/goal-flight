@@ -43,9 +43,15 @@ Rules:
 - {{RULE_EDIT_SCOPE — e.g., do not edit code unless needed for diagnostic tables/plots}}
 - {{RULE_VALIDATION — e.g., validate facts before downstream claims}}
 - Only run safe read/diagnostic commands unless explicitly authorized to edit.
+- **Sandbox denials are controller deferrals, not worker failures.** Run every
+  permitted step. For each denied step, report the command, required capability,
+  and exact denial; never edit a test or weaken the sandbox to get past it.
+  Denied validation does not block completion. Emit `!BLOCKED:` only when a
+  denial prevents the work itself; otherwise finish and let the controller
+  complete denied review/full-gate steps before commit.
 - **Emit marker lines** when you hit ambiguous points, need user input, or finish. One marker per line in your output. New emissions use the `!` prefix; parsers still accept every unprefixed form from deployed or older workers. Vocabulary (see goal-flight SKILL.md §Worker message passing): `!STATUS: <update>` (informational), `!RESULT: <key>=<value>` (structured output), `!USER-NEED: <question>` (you can't decide without user input — stop and emit this; the controller will relay), `!USER-CONFIRM: <action> [Y/N]` (irreversible op needs authorization), `!BLOCKED: <reason>` (unrecoverable), `!COMPLETE: <summary>` (task done). Emit a `!STATUS:` line at least every ~8 minutes and before any long step; work incrementally so the controller sees live progress. The controller relays `!USER-NEED:` / `!USER-CONFIRM:` to its conversational surface. Reserve them for the narrow cases below: `!USER-NEED:` and `!BLOCKED:` end the turn; unattended `!USER-CONFIRM:` is routed without discarding the partial turn, but its free prose has no tool-call id, kind, or canonical targets. A correlated `yes` records consent and keeps its audit fields, but it does not unlock any non-read permission on this ACP connection; status remains `guarded_action_authorized=false` and the worker receives `recorded-yes-not-authorized`. Use inline permission mode or a new explicitly authorized dispatch for that action. Ordinary ambiguity is still resolved by deciding and recording the assumption, not by asking.
 - **Design checkpoint — ONLY when this brief asks for one.** This applies **only** if the brief above is tagged `[design-checkpoint]` (or sets `plan_first: true`) — normally a CP/H-class chunk. **If the brief carries no such tag, skip this bullet entirely and build.** When it does apply, your FIRST deliverable is the design, not the code: write interfaces, invariants, acceptance checks and the test names you intend to the lane's research directory, then emit `!USER-NEED: design ready for approval at <path>; session <resume-id>; log <path>` and STOP. Include the resume handle — `!USER-NEED:` ends the run, so without it the controller must re-dispatch from scratch and re-pay the orientation this checkpoint exists to save. This is the ONE case where `!USER-NEED:` is correct for a design question, and it is an ordered exception to the unattended-dispatch contract below, which otherwise forbids asking about design preferences: it applies because the brief asked for it, not because you are unsure. **If you are unsure whether some choice is right and the brief is not tagged, decide, record the assumption, and keep going** — do not checkpoint on your own initiative, because nobody may be watching to approve it.
-- **End-of-convergence-attempt self-review.** When you think the goal is met (FOCUSED test gates green — the full gate is controller-side — AND acceptance criteria satisfied), DO NOT yet emit `Goal complete: true`. First run the 7-category adversarial self-review from `prompts/executor-self-review.md` (INVARIANT GAP / SCOPE LEAK / MUTATION PURITY / BEHAVIOR DRIFT / DEAD CODE / CONTRACT LEAK / INTEGRITY), specialized to this chunk's project nouns and grep patterns, plus the universal null-hypothesis floor: state the null hypothesis (this change did NOT achieve its purpose / is a no-op / introduced a regression), actively try to CONFIRM it, and hand off only when observed before/after evidence REJECTS it. Severity-rank findings P0/P1/P2/P3. **Any P0 or P1 is a continue-iterating signal** — fix it in-loop (which becomes another plan/act/test cycle) and re-run the self-review pass. Emit `Goal complete: true` only when the self-review pass yields no P0/P1 and the null hypothesis is rejected by evidence, OR when every flagged P0/P1 was resolved in-loop with test gates still green and the null hypothesis is rejected by evidence. **Cadence**: ONE self-review pass per "I think I'm done" attempt — NOT after every micro-step. Typical: 1-3 passes total per chunk.
+- **End-of-convergence-attempt self-review.** When you think the goal is met (runnable FOCUSED test gates green and acceptance criteria satisfied), DO NOT yet emit `Goal complete: true`. First run the 7-category adversarial self-review from `prompts/executor-self-review.md` (INVARIANT GAP / SCOPE LEAK / MUTATION PURITY / BEHAVIOR DRIFT / DEAD CODE / CONTRACT LEAK / INTEGRITY), specialized to this chunk's project nouns and grep patterns, plus the universal null-hypothesis floor: state the null hypothesis (this change did NOT achieve its purpose / is a no-op / introduced a regression), actively try to CONFIRM it, and hand off only when observed before/after evidence REJECTS it. Severity-rank findings P0/P1/P2/P3. **Any P0 or P1 is a continue-iterating signal** — fix it in-loop (which becomes another plan/act/test cycle) and re-run the self-review pass. Emit `Goal complete: true` only when every required work step ran, the self-review pass yields no P0/P1 and the null hypothesis is rejected by evidence, OR when every flagged P0/P1 was resolved in-loop with runnable gates green and the null hypothesis rejected. Report sandbox-denied validation separately; it does not prevent completion. **Cadence**: ONE self-review pass per "I think I'm done" attempt — NOT after every micro-step. Typical: 1-3 passes total per chunk.
 
 Acceptance criteria:
 - {{ACCEPT_INSPECT — what to inspect/read first, by file path}}
@@ -53,10 +59,10 @@ Acceptance criteria:
 - {{ACCEPT_SEPARATE — distinguish observed facts, deconvolution, priors, plotting choices, downstream implications}}
 - {{ACCEPT_RECOMMEND — concrete recommendation + sensitivity/stress alternatives}}
 - {{ACCEPT_WRITE — write memo/output to <docs-private/...md>}}
-- {{ACCEPT_TEST_GATE — any test that must stay green / any artifact that must be produced}}
-- {{ACCEPT_SELF_REVIEW_CLEAN — final 7-category adversarial self-review (per prompts/executor-self-review.md, specialized to this chunk's nouns/files) plus the universal null-hypothesis floor shows no P0/P1 findings and rejects the null with observed evidence, OR every flagged P0/P1 was resolved in-loop with test gates still green and the null remains rejected. The controller never sees a non-converged result.}}
+- {{ACCEPT_TEST_GATE — any runnable test that must stay green, denied check that must be reported, or artifact that must be produced}}
+- {{ACCEPT_SELF_REVIEW_CLEAN — final 7-category adversarial self-review (per prompts/executor-self-review.md, specialized to this chunk's nouns/files) plus the universal null-hypothesis floor shows no P0/P1 findings and rejects the null with observed evidence, OR every flagged P0/P1 was resolved in-loop with runnable gates green, denied checks recorded, and the null still rejected. The controller never sees a non-converged result.}}
 
-Test gates (must remain true throughout):
+Test gates (run what the sandbox permits; runnable checks stay green; report denied checks):
 - {{TEST_GATE_1 — e.g., pytest tests/test_invariants.py stays green}}
 - {{TEST_GATE_2 — e.g., grep -c "forbidden_pattern" returns 0 in <paths>}}
 
@@ -84,9 +90,9 @@ Unattended-dispatch contract (read this before your first tool call):
   durable arrival stamp met the cutoff; without one it answers `no`. Waiting
   alone does not kill the turn, but normal silence/wedge limits resume after
   settlement. Respect a denial and finish whatever safe deliverable remains.
-- If you are blocked by the ENVIRONMENT rather than by a decision (a refused
-  sandbox operation, a missing tool), that is `!BLOCKED:` with the exact refusal
-  — not a question.
+- If the ENVIRONMENT prevents the work itself (a refused sandbox operation, a
+  missing tool), emit `!BLOCKED:` with the exact refusal — not a question.
+  Denied validation is reported and deferred, not escalated as `!BLOCKED:`.
 
 Gate discipline (token economy — these are standing rules, not suggestions):
 - **Run FOCUSED suites only** — the test files named in your gates above, plus
@@ -108,10 +114,9 @@ Gate discipline (token economy — these are standing rules, not suggestions):
   (MCP, already indexed) over `grep`/`find` sweeps and whole-file reads for
   locating code. Read narrowly, only what you are about to edit.
 - **No internal independent review fleets.** Your end-of-attempt self-review
-  (below) stays, uncapped. Do NOT additionally spawn or simulate independent
-  refutation/review passes unless this brief explicitly orders them (reserved
-  for security/credential-class chunks): landing reviews are the controller's
-  chain, and duplicating them in-loop is pure token burn.
+  (below) stays, uncapped. Do NOT spawn or simulate independent review passes.
+  For security/credential-class chunks, add in-context security lenses; the
+  controller dispatches extra independent review after handoff.
 
 If a review tool or required artifact is blocked or unavailable:
 - {{BLOCKER_PROTOCOL — e.g., write a NEEDS-RESOLUTION note to docs-private/<topic>-blockers.md, surface in Final response, do NOT attempt to bypass the gate}}

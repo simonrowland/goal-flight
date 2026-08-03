@@ -137,7 +137,7 @@ The hermetic test in `tests/python/test_skill_structure.py` (chunk-5) asserts
 When adding a new behaviour or feature to goal-flight:
 
 1. Add the entry HERE first (with all required fields).
-2. Re-distill `SKILL.md` to fit (a worker dispatch with this file as full context, or controller-direct for small changes).
+2. Re-distill `SKILL.md` to fit (a worker dispatch with this file as full context, or controller-direct when current context is held and Axis 2 disqualifiers are clean).
 3. The hermetic invariants test confirms `SKILL.md` still satisfies the spec.
 4. Add a behaviour scenario under `tests/fixtures/controller_scenarios/` if the entry has a testable failure mode.
 5. Only then implement the feature's runtime code.
@@ -1058,11 +1058,11 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **id:** `controller-direct-plan-marked`
 - **name:** Restrict controller-direct chunks
 - **category:** `dispatch-discipline`
-- **controller_does:** The orchestrator uses controller-direct only for tiny doc/test edits or chunks that the active plan explicitly marks as controller-direct.
-- **failure_mode:** The orchestrator performs implementation directly because dispatch is inconvenient, even though the plan called for worker execution or reviewable chunk isolation.
+- **controller_does:** The orchestrator uses controller-direct only when it holds the needed context, can state the whole change before typing, no Axis 2 serialization disqualifier applies, and any plan mark passes the same test.
+- **failure_mode:** The orchestrator treats size or a plan tag as permission to work inline, rediscovering state or serializing ready work while slots sit idle.
 - **skill_md_compressed_form:**
     - **kind:** literal
-    - **pattern:** "Controller-direct only for tiny or plan-marked chunks"
+    - **pattern:** "Controller-direct: held context, fully stateable edit, clean Axis 2; plan marks do not waive it."
     - **max_section_lines:** 25
 - **verifier:**
     - **kind:** textual-invariant
@@ -1259,7 +1259,7 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **failure_mode:** The orchestrator gives a reviewer executor context it does not need, or gives a planner a code-writing wrapper that invites implementation drift.
 - **skill_md_compressed_form:**
     - **kind:** literal
-    - **pattern:** "Type dispatches as executor, reviewer, or planner"
+    - **pattern:** "typed dispatch roles"
     - **max_section_lines:** 30
 - **verifier:**
     - **kind:** textual-invariant
@@ -1281,7 +1281,7 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **failure_mode:** The orchestrator sends a short generic task prompt and loses the situational frame, template pointer, file anchors, environment caveats, and specialized self-review.
 - **skill_md_compressed_form:**
     - **kind:** literal
-    - **pattern:** "Dispatch prompts need the five-layer wrapper"
+    - **pattern:** "five-layer prompts"
     - **max_section_lines:** 30
 - **verifier:**
     - **kind:** textual-invariant
@@ -1325,7 +1325,7 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **failure_mode:** Two workers edit the same module family because their prompts described the bug class but not the files they must avoid.
 - **skill_md_compressed_form:**
     - **kind:** literal
-    - **pattern:** "Parallel fix clusters need explicit forbid lists"
+    - **pattern:** "parallel forbid lists"
     - **max_section_lines:** 25
 - **verifier:**
     - **kind:** textual-invariant
@@ -1347,7 +1347,7 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **failure_mode:** The orchestrator asks one worker for adapter, tests, and docs in a single broad pass, then needs a corrective follow-up to finish the missed surfaces.
 - **skill_md_compressed_form:**
     - **kind:** literal
-    - **pattern:** "Split chunks likely to touch many files"
+    - **pattern:** "split broad chunks"
     - **max_section_lines:** 23
 - **verifier:**
     - **kind:** textual-invariant
@@ -1926,7 +1926,7 @@ chunk-3a rationale:
 - **failure_mode:** The orchestrator tells a worker to call a generic tool name that does not exist on that host.
 - **skill_md_compressed_form:**
     - **kind:** literal
-    - **pattern:** "Abstract tool roles resolve through host tool-name maps"
+    - **pattern:** "host tool maps"
     - **max_section_lines:** 25
 - **verifier:**
     - **kind:** textual-invariant
@@ -1952,7 +1952,7 @@ chunk-3a rationale:
 - **failure_mode:** The orchestrator accepts same-provider self-review despite a manifest policy that forbids it or requires cross-provider review.
 - **skill_md_compressed_form:**
     - **kind:** literal
-    - **pattern:** "Same-provider policy controls review routing trust"
+    - **pattern:** "same-provider review policy"
     - **max_section_lines:** 25
 - **verifier:**
     - **kind:** textual-invariant
@@ -2289,11 +2289,11 @@ chunk-3a rationale:
 - **id:** `goal-loop-is-the-default-for-convergence-heavy-implementation`
 - **name:** Goal-loop is default for convergence-heavy implementation
 - **category:** `worker-routing-defaults`
-- **controller_does:** The orchestrator routes substantive multi-step implementation by work shape: controller-direct only for tiny or judgment-heavy edits, one-shot dispatch for a single bounded task, and a goal-loop for work that must iterate until tests pass and self-review is clean.
-- **failure_mode:** The orchestrator keeps iterative implementation in its own context because it already has some local state, then spends repeated edit/test turns on work that should have been delegated as a converging loop.
+- **controller_does:** The orchestrator routes substantive multi-step implementation by work shape: controller-direct when it holds the change context without stalling the fleet, one-shot dispatch for bounded work, and a goal-loop for work that must iterate until tests and self-review are green.
+- **failure_mode:** The orchestrator keeps iterative implementation in its own context because it already has some local state, then spends repeated edit/test turns on work that should have been delegated as a converging loop -- serializing itself while worker slots sit idle. The mirror failure is dispatching a fix it could already state, paying a worker round-trip to re-derive what it knows.
 - **skill_md_compressed_form:**
     - **kind:** literal
-    - **pattern:** "Goal-loop is default for convergence-heavy implementation; one-shot is single bounded work; controller-direct only tiny/judgment."
+    - **pattern:** "Goal-loop for convergence; one-shot for bounded work; controller-direct needs held context and no fleet stall."
     - **max_section_lines:** 30
 - **verifier:**
     - **kind:** behaviour-scenario
@@ -2467,7 +2467,7 @@ chunk-3a rationale:
 - **id:** `agent-recon-only-not-executor`
 - **name:** Host Agent is recon/review only, never code executor
 - **category:** `dispatch-discipline`
-- **controller_does:** The orchestrator uses the host Agent / Task / Explore tool only for recon, analysis, and review. All code-writing execution chunks go through `scripts/goalflight_dispatch.py` (or controller-direct when the chunk is tiny).
+- **controller_does:** The orchestrator uses the host Agent / Task / Explore tool only for recon, analysis, and review. Code-writing chunks use `scripts/goalflight_dispatch.py`, or controller-direct when the controller holds the context and passes Axis 2.
 - **failure_mode:** The orchestrator runs a code-writing chunk as a host Agent, bypassing capacity lease, ledger/status trace, marker/steer protocol, and burning the controller provider — the documented bypass regression observed in handoff history.
 - **skill_md_compressed_form:**
     - **kind:** literal

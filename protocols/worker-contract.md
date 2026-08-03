@@ -111,22 +111,32 @@ trivial tier includes the seven-category self-review plus the universal
 null-hypothesis floor above; it does not add the controller chunk-review layer's
 separate >=2 concern-diverse floor.
 
+A sandboxed worker cannot perform every brief step. It self-reviews in its own
+context and cannot spawn a nested reviewer because child-process network access
+is denied; tests may also require denied capabilities such as process inspection
+or external writable roots. Run every permitted step, report the exact command,
+capability, and denial for the rest, and never weaken a test or sandbox to pass.
+The controller dispatches independent review and completes denied/full-gate
+steps in an environment with the required capabilities before commit. A denied
+validation is not `BLOCKED:`: finish the work and report its exact evidence.
+Escalate `BLOCKED:` only when a denial prevents the work itself. In a worker
+brief, "gate fully green" means runnable checks pass and denied checks plus
+counts are reported, not zero failures from an impossible step.
+
 - **Trivial/mechanical**: run the existing seven-category self-review plus
   universal null-hypothesis floor to green.
 - **Non-trivial**: run self-review to convergence with at least two
   concern-diverse lenses. This is the floor, not the target; add perspectives
-  as complexity warrants. When a second engine is abundant, run at least one pass
-  on a different engine than the author. Convergence means a clean round with
-  zero P0/P1/P2 findings, not a round count.
+  as complexity warrants. Convergence means a clean round with zero P0/P1/P2
+  findings, not a round count.
 - **Complicated** (optimizer, search, numeric, objective-bearing paths): run
-  more than two concern-diverse perspectives, add deeper domain/adversarial
-  checks, and use a different engine when abundant.
+  more than two in-context concern-diverse perspectives and add deeper
+  domain/adversarial checks.
 
-Axis rule for non-trivial worker self-review: perspectives are the floor and
-primary axis; engine diversity is a second axis that escalates by stakes. If
-only one engine is abundant, run the multi-angle lenses on it, note that engine
-diversity was unavailable, and do not strand budget or skip review chasing a
-second engine. Separately, controller chunk review keeps a universal >=2
+Axis rule for non-trivial worker self-review: in-context perspectives are the
+floor and primary axis; scale their number and depth with stakes. Engine
+diversity belongs to controller chunk and milestone review, never a nested
+worker subprocess. Controller chunk review keeps a universal >=2
 concern-diverse floor for every commit-worthy chunk, and milestone sweeps keep
 at least two concern-diverse reviewers/lenses as their floor.
 

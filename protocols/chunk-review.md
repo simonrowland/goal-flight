@@ -140,17 +140,6 @@ capture that response into `docs-private/reviews/...` afterward. If the review
 must create files directly, dispatch it in a writable worktree/sandbox instead
 of pairing `--read-only` with a write-artifact prompt.
 
-**Why this works:** the codex-acp shim's permission gate triggers on
-worker-issued ACP tool calls (e.g., the worker invoking `codex exec` as a
-structured `execute_command` tool, which is what nested ACP-routed
-review-dispatches do). A bash-tail subprocess spawned with the inner sandbox
-flag set is a different path — the inner codex's sandbox is the safety
-boundary, and the worker's outer permission gate doesn't intercept the
-already-sandboxed read-only operation. Nesting the review as a tool call
-without the read-only sandbox, non-interactive approval policy, and closed
-stdin shape lets the outer gate classify it as a write-grade execute; the
-canonical subprocess shape avoids that ambiguity.
-
 ## Where the review runs
 
 **Independent review is controller-side.** The landing chain runs at least two
@@ -162,12 +151,10 @@ on checkpointed dispatches — as a session-resume revision prompt (see
 The worker's own end-of-attempt self-review stays mandatory and uncapped, but
 it is **not a leg of the independent floor** — it is the worker checking
 itself, and the floor exists precisely because self-checks share the author's
-blind spots. Workers do not additionally spawn independent review subprocesses
-in-loop: that duplicated the controller chain at frontier-worker prices while
-counting toward nothing (an in-loop pass and a landing pass of the same
-reviewer find the same defects twice). The only exception is a brief that
-explicitly orders an enclosed review for a security/credential-class chunk;
-such an ordered pass supplements the floor, never replaces it.
+blind spots. Workers never spawn independent review subprocesses in-loop; the
+sandbox denies child-process network access. Security/credential-class chunks
+add in-context worker lenses, and the controller dispatches the extra independent
+review after handoff. Neither replaces the controller review floor.
 
 **Landing requires both**: (a) the controller-side full gate green (see §The
 landing gate is controller-side and quiet), and (b) the independent floor —

@@ -255,7 +255,8 @@ inline; fix P0/P1/P2 before commit.
   controller context.
 - The host Agent / Task / Explore tool is for recon, analysis, and review ONLY
   — NEVER a code executor. Code-writing chunks use
-  `scripts/goalflight_dispatch.py`, or controller-direct only when tiny.
+  `scripts/goalflight_dispatch.py`, or controller-direct only with held context
+  and no fleet stall (Axis 2).
 - Out-of-scope findings go to the store's `deferred` lane via `goalflight_task.py capture`.
   Worker-doable findings are worker tasks, not host `spawn_task`/"chip"; capture
   worker RESULT fallout before moving on.
@@ -351,7 +352,7 @@ When context is tight, still poll and append a one-line timestamp to RESUME-NOTE
 ## Dispatch Model
 
 Two orthogonal axes:
-- Iteration pattern: Goal-loop is default for convergence-heavy implementation; one-shot is single bounded work; controller-direct only tiny/judgment.
+- Iteration: Goal-loop for convergence; one-shot for bounded work; controller-direct needs held context and no fleet stall.
 - Goal-loop returns converged result, never draft: plan/act/test/self-review until green.
 - Comms shape: `controller-direct`, `acp`, or `bash-tail`.
 Dispatch CLI workers via `scripts/goalflight_dispatch.py`, never bare background exec.
@@ -360,8 +361,9 @@ sync scripts/tests. Queue: `--submit --drain-on-submit`.
 Do not hand-iterate (>~3 edit/test cycles) what a goal-loop should converge.
 
 Use ACP or bash-tail plus status polling; do not block on editor task panes.
-Abstract tool roles resolve through host tool-name maps. Type dispatches as executor, reviewer, or planner. Dispatch prompts need the five-layer wrapper. Parallel fix clusters need explicit forbid lists. Split chunks likely to touch many files. Controller-direct only for tiny or plan-marked chunks. Same-provider policy controls review routing trust.
-Lanes with spec-resident invariants, hot-path constraints, regression history, or shared seams need a pinned context package before dispatch — protocols/worker-context-package.md; the execute pre-wave check is mandatory.
+Controller-direct: held context, fully stateable edit, clean Axis 2; plan marks do not waive it.
+Routing detail: typed dispatch roles; five-layer prompts; parallel forbid lists; split broad chunks; host tool maps; same-provider review policy. See `protocols/dispatch-routing.md`.
+Triggered lanes need pinned context and the execute pre-wave check (`worker-context-package.md`).
 
 Fabricated approval rejected: Never invent user approval for a gated step.
 Orchestrator dispatch waits for declared readiness requirements. Orchestrator live gate requires supported capability and ready local state. Worker live gate also requires requested transport verified. Discovery probes do not use network or model calls. Discovery probes stay within manifest budget caps.
@@ -528,7 +530,7 @@ permitted publish.
 
 - Do not paste long logs, diffs, JSONL streams, or review transcripts.
 - Do not treat PID alone as process identity.
-- Do not hand-iterate (>~3 edit/test cycles) a chunk in orchestrator context — goal-loop it. Controller-direct is for tiny or judgment-only edits.
+- After ~3 edit/test cycles, dispatch. Controller-direct needs held context and no exploration; non-mechanical patches need another reviewer.
 - Do not let one goal-flight session consume all machine capacity.
 - Do not silently skip review when a provider hits rate or session limits.
 - Do not load `/fork` instructions by default.

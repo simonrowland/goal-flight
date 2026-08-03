@@ -37,11 +37,21 @@ The other layers follow the same principle: point at what to investigate; let th
 | 5 — Self-review categories | The 7 abstract categories from `prompts/executor-self-review.md` (INVARIANT GAP / SCOPE LEAK / MUTATION PURITY / BEHAVIOR DRIFT / DEAD CODE / CONTRACT LEAK / INTEGRITY) plus the universal null-hypothesis floor: state the null hypothesis (this change did NOT achieve its purpose / is a no-op / introduced a regression), actively try to CONFIRM it, and hand off only when observed before/after evidence REJECTS it. | Abstract scaffold in the PROMPT; executor SPECIALIZES in the REPORT, not pre-pasted. |
 | 6 — Marker vocabulary | The worker message-passing contract: emit `STATUS:`, `RESULT:`, `USER-NEED:`, `USER-CONFIRM:`, `BLOCKED:`, `COMPLETE:` lines as needed. See `protocols/worker-markers.md`. | One-line instruction in the prompt: "Emit marker lines per protocols/worker-markers.md when you hit ambiguous points, need user input, or finish. Emit `STATUS:` at least every ~8 minutes and before any long step; work incrementally." Workers without this instruction guess and proceed silently. |
 
+Layer 5 means in-context self-review. Never tell a sandboxed worker to run an
+independent review of its own diff: it cannot spawn a networked reviewer. The
+controller dispatches independent review after handoff.
+
+Every layer must treat sandbox denials as controller deferrals. The worker runs
+permitted steps, reports each denied command/capability/error, and never weakens
+tests or the sandbox. A denied validation does not block handoff; use `BLOCKED:`
+only when the denial prevents the work itself. The controller completes denied
+review and gate steps.
+
 **Frontier models compose excellent dispatch prompts from these principles alone.** No worked examples here — they calcify around one project's idioms and over-prescribe for others. The principle generalizes; the examples don't.
 
-## Triviality bypass
+## Trivial worker-wrapper bypass
 
-Trivial single-file chunks (< ~30 LoC delta, no new public surface, no cross-module coupling): Layers 0 + 1 + abstract Layer 5 + the one-line Layer 6 marker instruction suffice. Skip 2/3/4. Same threshold for `[controller-direct]` (see `SKILL.md`): if the chunk genuinely qualifies, the orchestrator can do the work inline with no subagent at all (and the marker convention is moot — controller-direct has no marker channel because the orchestrator IS the worker).
+Trivial single-file worker chunks (< ~30 LoC delta, no new public surface, no cross-module coupling): Layers 0 + 1 + abstract Layer 5 + the one-line Layer 6 marker instruction suffice. Skip 2/3/4. This prompt shortcut does not qualify controller-direct; Axis 2 decides inline work from held context and serialization, not LoC.
 
 ## Corpus integration
 

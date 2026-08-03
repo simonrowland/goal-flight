@@ -4,6 +4,12 @@ Choose the smallest execution shape that can finish safely. Routing has two
 orthogonal axes: **iteration pattern** (how many turns) and **comms shape**
 (how the orchestrator observes the worker). Pick one value from each.
 
+Operational routing still applies: resolve abstract roles through host maps;
+type dispatches as executor, reviewer, or planner; use the five-layer wrapper;
+give parallel fixes forbid lists; split broad chunks; and apply same-provider
+review policy. Triggered lanes require the pinned package and execute pre-wave
+check in `protocols/worker-context-package.md`.
+
 ## Axis 1 — Iteration pattern
 
 - `one-shot`: send a single prompt, worker completes the chunk in one turn.
@@ -17,11 +23,13 @@ orthogonal axes: **iteration pattern** (how many turns) and **comms shape**
 
 Right-size the shape — three loop failure modes to avoid:
 
-- **Don't dispatch what one look fixes.** A serialized worker round-trip
-  (spawn, orient, loop, review, report) costs minutes; when the controller can
-  see the fix directly, controller-direct is correct even mid-run. The inverse
-  rule (don't hand-iterate >~3 edit/test cycles) still holds — right-sizing
-  cuts both ways.
+- **Don't dispatch what you already know how to fix.** A serialized worker
+  round-trip (spawn, orient, loop, review, report) costs minutes, and the
+  wrapper cannot carry everything you currently hold; when the controller can
+  already state the fix, controller-direct is correct even mid-run. The inverse
+  rule (don't hand-iterate past ~3 edit/test cycles, and never explore
+  in-session when a worker could) still holds — right-sizing cuts both ways.
+  See Axis 2 for the full test.
 - **Every loop exits through defensive failure-condition verification.** Before
   handoff, the worker states the concrete failure conditions for the patch,
   runs checks capable of exposing them, and hands off only when evidence shows
@@ -30,8 +38,8 @@ Right-size the shape — three loop failure modes to avoid:
   findings block loop exit. Trivial/mechanical chunks self-review the seven
   categories to green; non-trivial chunks add at least two concern-diverse lenses
   as the floor, not the target; complicated optimizer/search/numeric or
-  objective-bearing chunks use more than two perspectives, deeper checks, and a
-  different-engine pass when abundant. Safe/easy in-scope P3s may be applied
+  objective-bearing chunks use more than two in-context perspectives and deeper
+  checks. Safe/easy in-scope P3s may be applied
   inline when mechanical (per `protocols/chunk-review.md`) — but they never drive
   another iteration; uncertain, non-mechanical, or out-of-scope P3s go into the
   worker's report for store capture. Never keep looping solely for P3 polish.
@@ -42,8 +50,33 @@ Right-size the shape — three loop failure modes to avoid:
 ## Axis 2 — Comms shape
 
 - `controller-direct`: no worker spawned. The orchestrator does the edit itself.
-  Use only for tiny local work expected to finish in seconds. If the task
-  grows, stop and dispatch.
+
+  **The test is context, not size.** Write it yourself when you already hold
+  what the change needs — you just diagnosed the bug, you just read the
+  function, the fix follows from a review finding you have already consumed —
+  and you can state the whole change before you start typing. That covers far
+  more than one-liners: a bug you have just root-caused; a rename or comment fix
+  confined to files whose current text and all intended call sites you already
+  read this session (a search to be sure means explore — dispatch); or a review
+  finding you already consumed. Spawning a worker to re-derive what you know is
+  waste, and the hand-off itself loses fidelity.
+
+  **The disqualifier is serialization, not effort.** Doing it yourself is one
+  thing at a time; the fleet is many. Hand it off the moment any of these is
+  true, however small the change looks:
+  - you are about to explore — read files you have not read, search for the
+    call sites, work out how it currently behaves;
+  - you have run ~3 edit/test cycles without converging;
+  - another ready unit does not depend on your held context and a slot is free —
+    inline only the dependent unit; dispatch the rest;
+  - trust requires implementation independence beyond the routine independent
+    chunk review — dispatch implementation; never solely review your own
+    non-mechanical patch.
+
+  Before every inline edit, record in the controller trace either
+  `in-flight: <dispatch ids>` or `fleet idle: <N free slots>`. With a free slot,
+  dispatch every ready unit except the one uniquely dependent on unexported
+  session state.
 - `acp`: structured JSON-RPC stream over stdio. Default whenever an adapter
   exists. The orchestrator sees turn boundaries, tool calls, plan entries, and
   stop reasons as discrete events, not text.
@@ -462,7 +495,7 @@ context-mode tools.
 
 | Iteration | Comms | Supported | Notes |
 |---|---|---|---|
-| one-shot | controller-direct | yes | tiny edits, no spawn |
+| one-shot | controller-direct | yes | context-held edits, no spawn |
 | one-shot | acp | yes | default for any spawned worker |
 | one-shot | bash-tail | yes | only when no ACP adapter |
 | goal-mode | acp | yes | preferred for main-tree-write loops and non-codex loops; for read-only or worktree-isolated **codex** loops, bash-tail is equivalent + leaner — see below |

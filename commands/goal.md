@@ -20,8 +20,8 @@ Required fields:
 - expected files
 - verification command
 - dispatch hint: iteration + comms (e.g. `one-shot/acp`, `goal-mode/acp`,
-  `goal-mode/bash-tail` for codex `/goal`, or `controller-direct` for tiny
-  inline edits) — see `protocols/dispatch-routing.md`
+  `goal-mode/bash-tail` for codex `/goal`, or `controller-direct` when context
+  is held without fleet stall) — see `protocols/dispatch-routing.md`
 
 Keep the row compact. Detailed execution rules live in
 `protocols/dispatch-routing.md`.
