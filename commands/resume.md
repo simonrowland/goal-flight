@@ -7,6 +7,8 @@ description: "Resume from git state, status JSON, and dispatch ledger."
 Rebuild working context from files and procedural status.
 
 Applies only when Goal Flight was already in play (see `protocols/state-handoff.md`).
+Read and run `protocols/session-preflight.md` as the controller-start hook before
+rebuilding status.
 
 ## STEP 0 — Load the skill body FIRST (unconditional; do not skip)
 
@@ -38,7 +40,8 @@ Do not act on any resume state until STEP 0 is satisfied.
 
 Follow `AGENTS.md`, then the canonical post-compaction reload order in `SKILL.md`
 and `protocols/state-handoff.md`: session-status verdict, `SKILL.md` end-to-end,
-store baseline, handoff prose, status, `next`, then continue the top task without
+named controller registration from `protocols/session-preflight.md`, store
+baseline, handoff prose, status, `next`, then continue the top task without
 waiting for a re-prompt when no real blocker exists.
 
 ## STEP 2 — Rebuild status

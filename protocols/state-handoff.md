@@ -44,6 +44,25 @@ exceptions — leave in place, do not retroactively rename.
 
 ## Session identity
 
+At controller startup, run the best-effort named beacon step in
+`protocols/session-preflight.md`. `GOALFLIGHT_CONTROLLER_PID` must identify the
+actual long-lived controller process; `GOALFLIGHT_CONTROLLER_LABEL` declares the
+stable controller name inherited by its later dispatches. The startup helper
+never invents either value and never blocks work when registration fails.
+Dispatch inherits both declarations and stamps ownership only when PID, label,
+and stored process-start generation still match the live beacon.
+
+Beacon records are label-scoped for dispatch ownership. A controller exit
+without release leaves a record on disk, but `live_session()` ignores it once
+its PID is dead or reused by a later process generation. A stale record
+therefore cannot displace a live same-label controller. Two different live
+labels coexist; duplicate live labels surface `conflicting_beacons` and are
+ambiguous rather than silently assigned, and a live controller cannot silently
+relabel itself. Claim or liveness failures leave later dispatches honestly
+unowned, even when another controller uses the same label.
+Normal shutdown may remove the record with `--release-session --session-pid
+<pid>`.
+
 While a run is active, the orchestrator's `current_session` is stamped
 into the active goal-queue's frontmatter:
 
@@ -60,7 +79,9 @@ session_history:
 `session_history` is append-only. Two layers of identity: the RUN
 (slug + started date) survives across many sessions; the SESSION
 (uuid + pid) is per-terminal and turns over on takeover/crash/exit.
-See `scripts/goalflight_session_status.py --claim` / `--release`.
+This queue ownership is separate from the named beacon. See
+`scripts/goalflight_session_status.py --claim` / `--release` for queue takeover,
+and `--controller-startup` / `--release-session` for controller presence.
 
 ## Before compact or sleep
 

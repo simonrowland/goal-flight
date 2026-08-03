@@ -711,6 +711,8 @@ def case_runner_preserves_live_controller_beacon_pair() -> None:
             os_sandbox=None,
             controller_pid=os.getpid(),
             controller_session_id=None,
+            controller_label="battery-main",
+            controller_beacon_pid=beacon.pid,
             _controller_beacon_pid=None,
             task_ids=[],
             launch_detached=False,
@@ -745,6 +747,7 @@ def case_runner_preserves_live_controller_beacon_pair() -> None:
                 project_root,
                 pid=beacon.pid,
                 session_id="acp-controller-session",
+                label="battery-main",
             )
             dispatch._stamp_controller_session(args, project_root)
             expected = (claimed["id"], beacon.pid)
@@ -772,6 +775,8 @@ def case_runner_preserves_live_controller_beacon_pair() -> None:
                 record.get("controller_session_id"),
                 record.get("controller_pid"),
             ) == expected
+            assert payload.get("controller_label") == "battery-main", payload
+            assert record.get("controller_label") == "battery-main", record
         finally:
             _force_kill(worker_pid)
             if beacon.poll() is None:

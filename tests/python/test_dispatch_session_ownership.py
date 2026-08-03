@@ -41,7 +41,13 @@ def _dead_pid() -> int:
     return process.pid
 
 
-def _args(dispatch_id: str, *, shape: str = "bash") -> argparse.Namespace:
+def _args(
+    dispatch_id: str,
+    *,
+    shape: str = "bash",
+    controller_label: str | None = None,
+    controller_beacon_pid: int | None = None,
+) -> argparse.Namespace:
     return argparse.Namespace(
         dispatch_id=dispatch_id,
         agent="codex",
@@ -51,6 +57,8 @@ def _args(dispatch_id: str, *, shape: str = "bash") -> argparse.Namespace:
         os_sandbox=None,
         controller_pid=os.getpid(),  # legacy flag must not become ownership
         controller_session_id=None,
+        controller_label=controller_label,
+        controller_beacon_pid=controller_beacon_pid,
         _controller_beacon_pid=None,
         task_ids=[],
         launch_detached=False,
@@ -65,6 +73,7 @@ def _args(dispatch_id: str, *, shape: str = "bash") -> argparse.Namespace:
         no_orientation=True,
         model=None,
         priority="normal",
+        billing="subscription",
         capacity_wait_s=0,
         max_idle_secs=5.0,
         poll_secs=0.1,
@@ -73,6 +82,10 @@ def _args(dispatch_id: str, *, shape: str = "bash") -> argparse.Namespace:
         permission_inline_timeout_s=None,
         permission_user_timeout_s=None,
         interactive=False,
+        fast=False,
+        web_research_ok=False,
+        web_qa=False,
+        ignore_git_warn=False,
         context_mode=None,
     )
 
@@ -83,6 +96,7 @@ def _ledger_args(
     controller_session_id: str | None,
     controller_pid: int | None,
     state: str,
+    controller_label: str | None = None,
 ) -> argparse.Namespace:
     return argparse.Namespace(
         dispatch_id=dispatch_id,
@@ -98,6 +112,7 @@ def _ledger_args(
         project_root=str(ROOT),
         controller_pid=controller_pid,
         controller_session_id=controller_session_id,
+        controller_label=controller_label,
         claimant_pid=None,
         worker_pid=None,
         acp_session_id=None,
@@ -130,6 +145,8 @@ def _dispatch_env(base: Path) -> dict[str, str]:
     env = os.environ.copy()
     env.pop("GOALFLIGHT_STEER_FILE", None)
     env.pop("GOALFLIGHT_PROMPT_FILE", None)
+    env.pop("GOALFLIGHT_CONTROLLER_LABEL", None)
+    env.pop("GOALFLIGHT_CONTROLLER_PID", None)
     env["GOALFLIGHT_STATE_DIR"] = str(base / "state")
     env["GOAL_FLIGHT_PIDFILE_DIR"] = str(base / "pids")
     env["GOALFLIGHT_CAPACITY_CONF"] = os.devnull
@@ -158,9 +175,15 @@ def _launch(
     worker_code: str,
     *,
     max_idle_secs: float = 5.0,
+    controller_label: str | None = None,
+    controller_beacon_pid: int | None = None,
 ) -> tuple[subprocess.Popen[str], Path, dict[str, str]]:
     status_path = base / f"{dispatch_id}.status.json"
     env = _dispatch_env(base)
+    if controller_label is not None:
+        env["GOALFLIGHT_CONTROLLER_LABEL"] = controller_label
+    if controller_beacon_pid is not None:
+        env["GOALFLIGHT_CONTROLLER_PID"] = str(controller_beacon_pid)
     process = subprocess.Popen(
         [
             sys.executable,
@@ -223,16 +246,26 @@ def test_live_beacon_pair_reaches_queue_bash_acp_and_status_records() -> None:
         launched: subprocess.Popen[str] | None = None
         launched_status: Path | None = None
         try:
-            claimed = sessions.claim_session(
-                root, pid=beacon.pid, session_id="controller-session-one"
+            controller_label = "battery-main"
+            startup = sessions.claim_controller_startup(
+                root,
+                pid=beacon.pid,
+                environ={"GOALFLIGHT_CONTROLLER_LABEL": controller_label},
             )
-            args = _args("owned")
+            assert startup.get("claimed") is True, startup
+            claimed = startup["session"]
+            args = _args(
+                "owned",
+                controller_label=controller_label,
+                controller_beacon_pid=beacon.pid,
+            )
             dispatch._stamp_controller_session(args, root)
             expected = (claimed["id"], beacon.pid)
             assert (
                 dispatch._controller_session_id(args),
                 dispatch._controller_pid(args),
             ) == expected
+            assert dispatch._controller_label(args) == controller_label
 
             with patch.dict(os.environ, {"GOALFLIGHT_STATE_DIR": str(base / "state")}):
                 with _quiet_record_side_effects():
@@ -245,6 +278,7 @@ def test_live_beacon_pair_reaches_queue_bash_acp_and_status_records() -> None:
                     )
                     queued = _read_record("owned")
                     assert (queued.get("controller_session_id"), queued.get("controller_pid")) == expected
+                    assert queued.get("controller_label") == controller_label
 
                     dispatch._record_ledger(
                         args,
@@ -258,8 +292,14 @@ def test_live_beacon_pair_reaches_queue_bash_acp_and_status_records() -> None:
                     )
                     bash = _read_record("owned")
                     assert (bash.get("controller_session_id"), bash.get("controller_pid")) == expected
+                    assert bash.get("controller_label") == controller_label
 
-                    acp_args = _args("owned-acp", shape="acp")
+                    acp_args = _args(
+                        "owned-acp",
+                        shape="acp",
+                        controller_label=controller_label,
+                        controller_beacon_pid=beacon.pid,
+                    )
                     dispatch._stamp_controller_session(acp_args, root)
                     dispatch._record_test_acp_running_fast(
                         acp_args,
@@ -271,6 +311,7 @@ def test_live_beacon_pair_reaches_queue_bash_acp_and_status_records() -> None:
                     )
                     acp = _read_record("owned-acp")
                     assert (acp.get("controller_session_id"), acp.get("controller_pid")) == expected
+                    assert acp.get("controller_label") == controller_label
 
                     cfg = dispatch._build_acp_cfg(
                         acp_args,
@@ -278,12 +319,14 @@ def test_live_beacon_pair_reaches_queue_bash_acp_and_status_records() -> None:
                         base=base / "dispatch",
                     )
                     assert (cfg.controller_session_id, cfg.controller_pid) == expected
+                    assert cfg.controller_label == controller_label
 
             status_meta = dispatch._prelaunch_status_metadata(args)
             assert (
                 status_meta.get("controller_session_id"),
                 status_meta.get("controller_pid"),
             ) == expected
+            assert status_meta.get("controller_label") == controller_label
 
             identity = ledger.process_identity(os.getpid())
             assert identity, "test process identity unavailable"
@@ -304,6 +347,7 @@ def test_live_beacon_pair_reaches_queue_bash_acp_and_status_records() -> None:
                 pid_record.get("controller_session_id"),
                 pid_record.get("controller_pid"),
             ) == expected
+            assert pid_record.get("controller_label") == controller_label
 
             launched, launched_status, env = _launch(
                 base,
@@ -311,6 +355,8 @@ def test_live_beacon_pair_reaches_queue_bash_acp_and_status_records() -> None:
                 "owned-live-launch",
                 "import time; print('worker-start', flush=True); time.sleep(60)",
                 max_idle_secs=2.0,
+                controller_label=controller_label,
+                controller_beacon_pid=beacon.pid,
             )
             running = _wait_for_status(
                 launched_status,
@@ -320,11 +366,13 @@ def test_live_beacon_pair_reaches_queue_bash_acp_and_status_records() -> None:
                 running.get("controller_session_id"),
                 running.get("controller_pid"),
             ) == expected
+            assert running.get("controller_label") == controller_label
             launched_record = _record_from_env(env, "owned-live-launch")
             assert (
                 launched_record.get("controller_session_id"),
                 launched_record.get("controller_pid"),
             ) == expected
+            assert launched_record.get("controller_label") == controller_label
             launch_pidfiles = list((base / "pids").glob("*.jsonl"))
             assert len(launch_pidfiles) == 1, launch_pidfiles
             launch_pid_record = json.loads(
@@ -334,6 +382,7 @@ def test_live_beacon_pair_reaches_queue_bash_acp_and_status_records() -> None:
                 launch_pid_record.get("controller_session_id"),
                 launch_pid_record.get("controller_pid"),
             ) == expected
+            assert launch_pid_record.get("controller_label") == controller_label
 
             beacon.terminate()
             beacon.wait(timeout=10)
@@ -345,6 +394,7 @@ def test_live_beacon_pair_reaches_queue_bash_acp_and_status_records() -> None:
                 orphaned.get("controller_session_id"),
                 orphaned.get("controller_pid"),
             ) == expected
+            assert orphaned.get("controller_label") == controller_label
         finally:
             if launched_status is not None:
                 _kill_worker(launched_status)
@@ -365,6 +415,7 @@ def test_unclaimed_dispatch_stays_unowned_instead_of_using_launcher_pid() -> Non
         dispatch._stamp_controller_session(args, root)
         assert dispatch._controller_session_id(args) is None
         assert dispatch._controller_pid(args) is None
+        assert dispatch._controller_label(args) is None
 
         with patch.dict(os.environ, {"GOALFLIGHT_STATE_DIR": str(base / "state")}):
             with _quiet_record_side_effects():
@@ -378,6 +429,7 @@ def test_unclaimed_dispatch_stays_unowned_instead_of_using_launcher_pid() -> Non
             record = _read_record("unowned")
         assert record.get("controller_session_id") is None
         assert record.get("controller_pid") is None
+        assert record.get("controller_label") is None
         assert record.get("controller_pid") != os.getpid()
 
         launched, status_path, env = _launch(
@@ -393,6 +445,7 @@ def test_unclaimed_dispatch_stays_unowned_instead_of_using_launcher_pid() -> Non
         for payload in (status, launched_record):
             assert payload.get("controller_session_id") is None, payload
             assert payload.get("controller_pid") is None, payload
+            assert payload.get("controller_label") is None, payload
             assert payload.get("controller_pid") != launched.pid, payload
 
 
@@ -401,23 +454,36 @@ def test_dead_beacon_dispatch_is_unowned() -> None:
         base = Path(td)
         root = base / "project"
         root.mkdir()
-        dead_pid = _dead_pid()
-        sessions.claim_session(
-            root,
-            pid=dead_pid,
-            session_id="dead-controller-session",
-        )
+        dead_beacon = _beacon()
+        try:
+            sessions.claim_session(
+                root,
+                pid=dead_beacon.pid,
+                session_id="dead-controller-session",
+                label="battery-dead",
+            )
+            dead_pid = dead_beacon.pid
+        finally:
+            dead_beacon.terminate()
+            dead_beacon.wait(timeout=10)
 
-        args = _args("dead-beacon")
+        args = _args(
+            "dead-beacon",
+            controller_label="battery-dead",
+            controller_beacon_pid=dead_pid,
+        )
         dispatch._stamp_controller_session(args, root)
         assert dispatch._controller_session_id(args) is None
         assert dispatch._controller_pid(args) is None
+        assert dispatch._controller_label(args) is None
 
         launched, status_path, env = _launch(
             base,
             root,
             "dead-beacon-launch",
             "print('COMPLETE: dead beacon launch', flush=True)",
+            controller_label="battery-dead",
+            controller_beacon_pid=dead_pid,
         )
         stdout, stderr = launched.communicate(timeout=10)
         assert launched.returncode == 0, (launched.returncode, stdout, stderr)
@@ -426,6 +492,7 @@ def test_dead_beacon_dispatch_is_unowned() -> None:
         for payload in (status, record):
             assert payload.get("controller_session_id") is None, payload
             assert payload.get("controller_pid") is None, payload
+            assert payload.get("controller_label") is None, payload
             assert payload.get("controller_pid") != dead_pid, payload
             assert payload.get("controller_pid") != launched.pid, payload
 
@@ -436,14 +503,28 @@ def test_one_snapshot_cannot_mix_session_id_with_a_later_beacon() -> None:
         first = _beacon()
         second = None
         try:
-            sessions.claim_session(root, pid=first.pid, session_id="first-session")
-            args = _args("stable-pair")
+            sessions.claim_session(
+                root,
+                pid=first.pid,
+                session_id="first-session",
+                label="battery-main",
+            )
+            args = _args(
+                "stable-pair",
+                controller_label="battery-main",
+                controller_beacon_pid=first.pid,
+            )
             dispatch._stamp_controller_session(args, root)
             first.terminate()
             first.wait(timeout=10)
 
             second = _beacon()
-            sessions.claim_session(root, pid=second.pid, session_id="second-session")
+            sessions.claim_session(
+                root,
+                pid=second.pid,
+                session_id="second-session",
+                label="battery-bugs",
+            )
             assert (
                 dispatch._controller_session_id(args),
                 dispatch._controller_pid(args),
@@ -455,6 +536,222 @@ def test_one_snapshot_cannot_mix_session_id_with_a_later_beacon() -> None:
             if second is not None:
                 second.terminate()
                 second.wait(timeout=10)
+
+
+def test_different_named_controllers_keep_their_own_dispatches() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        root = base / "project"
+        root.mkdir()
+        first, second = _beacon(), _beacon()
+        try:
+            first_claim = sessions.claim_session(
+                root,
+                pid=first.pid,
+                session_id="battery-main-session",
+                label="battery-main",
+            )
+            second_claim = sessions.claim_session(
+                root,
+                pid=second.pid,
+                session_id="battery-bugs-session",
+                label="battery-bugs",
+            )
+            first_args = _args(
+                "battery-main-work",
+                controller_label="battery-main",
+                controller_beacon_pid=first.pid,
+            )
+            second_args = _args(
+                "battery-bugs-work",
+                controller_label="battery-bugs",
+                controller_beacon_pid=second.pid,
+            )
+            dispatch._stamp_controller_session(first_args, root)
+            dispatch._stamp_controller_session(second_args, root)
+
+            assert (
+                dispatch._controller_session_id(first_args),
+                dispatch._controller_pid(first_args),
+                dispatch._controller_label(first_args),
+            ) == (first_claim["id"], first.pid, "battery-main")
+            assert (
+                dispatch._controller_session_id(second_args),
+                dispatch._controller_pid(second_args),
+                dispatch._controller_label(second_args),
+            ) == (second_claim["id"], second.pid, "battery-bugs")
+
+            with patch.dict(os.environ, {"GOALFLIGHT_STATE_DIR": str(base / "state")}):
+                with _quiet_record_side_effects():
+                    for args in (first_args, second_args):
+                        dispatch._record_queued_ledger_fast(
+                            args,
+                            project_root=root,
+                            prompt_path=None,
+                            status_json=base / f"{args.dispatch_id}.status.json",
+                            tail=base / f"{args.dispatch_id}.tail",
+                        )
+                first_record = _read_record("battery-main-work")
+                second_record = _read_record("battery-bugs-work")
+            assert first_record.get("controller_label") == "battery-main"
+            assert first_record.get("controller_session_id") == first_claim["id"]
+            assert second_record.get("controller_label") == "battery-bugs"
+            assert second_record.get("controller_session_id") == second_claim["id"]
+        finally:
+            for proc in (first, second):
+                proc.terminate()
+                proc.wait(timeout=10)
+
+
+def test_failed_startup_claim_keeps_dispatch_unowned() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        root = base / "project"
+        root.mkdir()
+        unrelated = _beacon()
+        try:
+            sessions.claim_session(
+                root,
+                pid=unrelated.pid,
+                session_id="other-session",
+                label="battery-main",
+            )
+            with patch.object(sessions, "claim_session", side_effect=OSError("read only")):
+                startup = sessions.claim_controller_startup(
+                    root,
+                    pid=os.getpid(),
+                    label="battery-main",
+                )
+            assert startup.get("claimed") is False, startup
+            assert startup.get("reason") == "claim_failed", startup
+
+            args = _args(
+                "claim-failed",
+                controller_label="battery-main",
+                controller_beacon_pid=os.getpid(),
+            )
+            dispatch._stamp_controller_session(args, root)
+            assert dispatch._controller_session_id(args) is None
+            assert dispatch._controller_pid(args) is None
+            assert dispatch._controller_label(args) is None
+
+            with patch.dict(os.environ, {"GOALFLIGHT_STATE_DIR": str(base / "state")}):
+                with _quiet_record_side_effects():
+                    dispatch._record_queued_ledger_fast(
+                        args,
+                        project_root=root,
+                        prompt_path=None,
+                        status_json=base / "claim-failed.status.json",
+                        tail=base / "claim-failed.tail",
+                    )
+                record = _read_record("claim-failed")
+            assert record.get("controller_session_id") is None, record
+            assert record.get("controller_pid") is None, record
+            assert record.get("controller_label") is None, record
+
+            launched, status_path, env = _launch(
+                base,
+                root,
+                "claim-failed-launch",
+                "print('COMPLETE: claim failure stayed nonfatal', flush=True)",
+                controller_label="battery-main",
+                controller_beacon_pid=os.getpid(),
+            )
+            stdout, stderr = launched.communicate(timeout=10)
+            assert launched.returncode == 0, (launched.returncode, stdout, stderr)
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+            launched_record = _record_from_env(env, "claim-failed-launch")
+            for payload in (status, launched_record):
+                assert payload.get("controller_session_id") is None, payload
+                assert payload.get("controller_pid") is None, payload
+                assert payload.get("controller_label") is None, payload
+        finally:
+            unrelated.terminate()
+            unrelated.wait(timeout=10)
+
+
+def test_duplicate_live_same_label_dispatch_is_honestly_unowned() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        first, second = _beacon(), _beacon()
+        try:
+            sessions.claim_session(root, pid=first.pid, label="battery-main")
+            sessions.claim_session(root, pid=second.pid, label="battery-main")
+            winner = sessions.live_session(root, label="battery-main")
+            assert winner is not None and winner.get("conflicting_beacons") == 2
+            args = _args(
+                "ambiguous-owner",
+                controller_label="battery-main",
+                controller_beacon_pid=int(winner["pid"]),
+            )
+            dispatch._stamp_controller_session(args, root)
+            assert dispatch._controller_session_id(args) is None
+            assert dispatch._controller_pid(args) is None
+            assert dispatch._controller_label(args) is None
+        finally:
+            for proc in (first, second):
+                proc.terminate()
+                proc.wait(timeout=10)
+
+
+def test_queue_replay_carries_declaration_and_remeasures_live_beacon() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        root = base / "project"
+        root.mkdir()
+        beacon = _beacon()
+        try:
+            claimed = sessions.claim_session(
+                root,
+                pid=beacon.pid,
+                session_id="queued-controller",
+                label="battery-main",
+            )
+            args = _args(
+                "queued-owner",
+                controller_label="battery-main",
+                controller_beacon_pid=beacon.pid,
+            )
+            dispatch._stamp_controller_session(args, root)
+            replay_argv = dispatch._canonical_replay_argv(
+                args,
+                [sys.executable, "-c", "print('COMPLETE: replay')"],
+                tail=base / "queued-owner.tail",
+                status_json=base / "queued-owner.status.json",
+            )
+            label_index = replay_argv.index("--controller-label")
+            pid_index = replay_argv.index("--controller-beacon-pid")
+            assert replay_argv[label_index + 1] == "battery-main"
+            assert int(replay_argv[pid_index + 1]) == beacon.pid
+
+            replay_args = _args(
+                "queued-owner",
+                controller_label=replay_argv[label_index + 1],
+                controller_beacon_pid=int(replay_argv[pid_index + 1]),
+            )
+            with patch.dict(os.environ, {}, clear=True):
+                dispatch._stamp_controller_session(replay_args, root)
+            assert (
+                dispatch._controller_session_id(replay_args),
+                dispatch._controller_pid(replay_args),
+                dispatch._controller_label(replay_args),
+            ) == (claimed["id"], beacon.pid, "battery-main")
+
+            beacon.terminate()
+            beacon.wait(timeout=10)
+            dead_replay_args = _args(
+                "queued-owner-dead",
+                controller_label="battery-main",
+                controller_beacon_pid=beacon.pid,
+            )
+            dispatch._stamp_controller_session(dead_replay_args, root)
+            assert dispatch._controller_session_id(dead_replay_args) is None
+            assert dispatch._controller_pid(dead_replay_args) is None
+            assert dispatch._controller_label(dead_replay_args) is None
+        finally:
+            if beacon.poll() is None:
+                beacon.terminate()
+                beacon.wait(timeout=10)
 
 
 def test_cmd_record_merge_preserves_owned_pair_in_only_the_null_direction() -> None:
@@ -518,6 +815,10 @@ def main() -> None:
         test_unclaimed_dispatch_stays_unowned_instead_of_using_launcher_pid,
         test_dead_beacon_dispatch_is_unowned,
         test_one_snapshot_cannot_mix_session_id_with_a_later_beacon,
+        test_different_named_controllers_keep_their_own_dispatches,
+        test_failed_startup_claim_keeps_dispatch_unowned,
+        test_duplicate_live_same_label_dispatch_is_honestly_unowned,
+        test_queue_replay_carries_declaration_and_remeasures_live_beacon,
         test_cmd_record_merge_preserves_owned_pair_in_only_the_null_direction,
     ]
     for test in tests:

@@ -1897,11 +1897,14 @@ async def _run_acp_dispatch_impl(
     project_root = Path(cfg.cwd).resolve()
     controller_session_id = getattr(cfg, "controller_session_id", None)
     controller_pid = getattr(cfg, "controller_pid", None)
+    controller_label = getattr(cfg, "controller_label", None)
     if not controller_session_id or controller_pid is None:
         controller_session_id = None
         controller_pid = None
+        controller_label = None
     else:
         controller_session_id = str(controller_session_id)
+        controller_label = str(controller_label)[:64] if controller_label else None
     permission_mode = str(getattr(cfg, "permission_mode", "auto") or "auto")
     try:
         user_confirm_timeout_s = float(
@@ -1980,6 +1983,7 @@ async def _run_acp_dispatch_impl(
         "session_id": cfg.session_id,
         "controller_session_id": controller_session_id,
         "controller_pid": controller_pid,
+        "controller_label": controller_label,
         "project_root": str(project_root),
         "worker_cwd": worker_cwd,
         "worktree_mode": worktree_mode,
@@ -2328,6 +2332,7 @@ async def _run_acp_dispatch_impl(
                     project_root=str(project_root),
                     controller_pid=controller_pid,
                     controller_session_id=controller_session_id,
+                    controller_label=controller_label,
                     worker_pid=worker_pid,
                     acp_session_id=cfg.session_id,
                     logical_session_id=cfg.session_id,

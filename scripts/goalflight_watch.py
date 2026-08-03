@@ -1183,6 +1183,7 @@ def main() -> int:
     parser.add_argument("--pgid", type=int)
     parser.add_argument("--controller-pid", type=int)
     parser.add_argument("--controller-session-id")
+    parser.add_argument("--controller-label")
     parser.add_argument("--detached", action="store_true",
                         help="Ignore controller-beacon liveness; worker pid identity is authoritative.")
     parser.add_argument(
@@ -1205,9 +1206,11 @@ def main() -> int:
 
     controller_session_id = args.controller_session_id
     controller_pid = args.controller_pid
+    controller_label = args.controller_label
     if not controller_session_id or controller_pid is None:
         controller_session_id = None
         controller_pid = None
+        controller_label = None
 
     ignore_prefix_lines: list[str] = []
     if args.ignore_prompt_file:
@@ -1242,6 +1245,7 @@ def main() -> int:
             "detached": bool(args.detached),
             "controller_session_id": controller_session_id,
             "controller_pid": controller_pid,
+            "controller_label": controller_label,
             "state": "blocked_windows_dispatch",
             "reason": goalflight_compat.windows_watcher_skip(),
             "tail_path": str(tail),
@@ -1318,6 +1322,7 @@ def main() -> int:
             payload["effective_account"] = effective_account
         payload["controller_session_id"] = controller_session_id
         payload["controller_pid"] = controller_pid
+        payload["controller_label"] = controller_label
         if codex_home is not None:
             payload["codex_home"] = str(codex_home)
             if codex_session_id is None:

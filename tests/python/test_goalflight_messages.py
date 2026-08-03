@@ -60,6 +60,61 @@ def run_messages_cli(
     )
 
 
+def start_messages_listener(
+    messages_dir: Path,
+    fleet_dir: Path,
+    project_root: Path,
+    *,
+    session_id: str | None = None,
+) -> subprocess.Popen[str]:
+    env = dict(os.environ)
+    env.update(
+        {
+            "GOALFLIGHT_MESSAGES_DIR": str(messages_dir),
+            "GOALFLIGHT_FLEET_DIR": str(fleet_dir),
+            "GOALFLIGHT_STATE_DIR": str(messages_dir.parent / "state"),
+            "GOAL_FLIGHT_PIDFILE_DIR": str(messages_dir.parent / "pids"),
+            "GOALFLIGHT_TASK_STORE_DIR": str(messages_dir.parent / "task-store"),
+        }
+    )
+    command = [
+        sys.executable,
+        str(ROOT / "scripts" / "goalflight_messages.py"),
+        "--messages-dir",
+        str(messages_dir),
+        "--fleet-dir",
+        str(fleet_dir),
+        "listen",
+        "--project-root",
+        str(project_root),
+        "--poll-secs",
+        "0.05",
+        "--timeout-s",
+        "5",
+        "--json",
+    ]
+    if session_id is not None:
+        command.extend(["--session-id", session_id])
+    return subprocess.Popen(
+        command,
+        cwd=str(project_root),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+
+def listener_result(process: subprocess.Popen[str]) -> tuple[int, str, str]:
+    try:
+        stdout, stderr = process.communicate(timeout=7)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=2)
+    return int(process.returncode or 0), stdout, stderr
+
+
 def write_ledger_record(
     base: Path,
     dispatch_id: str,
@@ -71,6 +126,8 @@ def write_ledger_record(
     detached: bool = False,
     reason: str | None = None,
     started_at: str = "2026-07-23T00:00:00+00:00",
+    controller_session_id: str | None = None,
+    controller_pid: int | None = None,
 ) -> None:
     runs_dir = base / "state" / "runs.d"
     runs_dir.mkdir(parents=True, exist_ok=True)
@@ -92,6 +149,9 @@ def write_ledger_record(
         record["detached"] = True
     if reason is not None:
         record["reason"] = reason
+    if controller_session_id is not None:
+        record["controller_session_id"] = controller_session_id
+        record["controller_pid"] = controller_pid if controller_pid is not None else os.getpid()
     (runs_dir / f"{dispatch_id}.json").write_text(json.dumps(record) + "\n", encoding="utf-8")
 
 
@@ -805,6 +865,178 @@ def test_controller_summary_git_failure_uses_task_store_root_fallback() -> None:
 
         assert_true("one failed canonical root resolution", git_common_dir_calls == 1)
         assert_true("task store fallback inbox surfaced", summary["needs"][0]["dispatch_id"] == dispatch_id)
+
+
+def test_listener_live_session_covers_dispatch_launched_after_start() -> None:
+    import tempfile
+    import goalflight_session_status as sessions
+    from goalflight_messages import post_message
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project = base / "late-listener-project"
+        messages_dir = base / "messages"
+        fleet_dir = base / "fleet"
+        init_git_project(project)
+        session_id = "listener-owner"
+        sessions.claim_session(project, pid=os.getpid(), session_id=session_id)
+        listener = start_messages_listener(messages_dir, fleet_dir, project)
+        time.sleep(0.2)
+        write_ledger_record(
+            base,
+            "late-owned",
+            project,
+            controller_session_id=session_id,
+        )
+        post_message(
+            dispatch_id="late-owned",
+            msg_type="result",
+            payload={"complete": True, "text": "finished"},
+            messages_dir=messages_dir,
+        )
+        code, stdout, stderr = listener_result(listener)
+        assert_true("late-owned dispatch wakes", code == 0)
+        payload = json.loads(stdout)
+        assert_true("implicit live session owns wake", payload["items"][0]["dispatch_id"] == "late-owned")
+        assert_true("terminal envelope wakes", payload["items"][0]["type"] == "result")
+        assert_true("listener stays silent on stderr", stderr == "")
+
+
+def test_listener_ignores_dispatch_owned_by_different_session() -> None:
+    import tempfile
+    from goalflight_messages import post_message
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project = base / "other-owner-project"
+        messages_dir = base / "messages"
+        fleet_dir = base / "fleet"
+        init_git_project(project)
+        listener = start_messages_listener(messages_dir, fleet_dir, project, session_id="mine")
+        time.sleep(0.2)
+        other_dispatch_id = f"{project.name}-theirs"
+        write_ledger_record(base, other_dispatch_id, project, controller_session_id="theirs")
+        post_message(
+            dispatch_id=other_dispatch_id,
+            msg_type="blocked",
+            payload={"text": "other controller must decide"},
+            messages_dir=messages_dir,
+        )
+        time.sleep(0.7)
+        assert_true("different owner does not wake", listener.poll() is None)
+        write_ledger_record(base, "mine", project, controller_session_id="mine")
+        post_message(
+            dispatch_id="mine",
+            msg_type="blocked",
+            payload={"text": "this controller must decide"},
+            messages_dir=messages_dir,
+        )
+        code, stdout, _stderr = listener_result(listener)
+        assert_true("owned escalation wakes", code == 0)
+        assert_true("only owned dispatch reported", json.loads(stdout)["items"][0]["dispatch_id"] == "mine")
+
+
+def test_listener_ignores_unowned_dispatch() -> None:
+    import tempfile
+    from goalflight_messages import post_message
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project = base / "unowned-project"
+        messages_dir = base / "messages"
+        fleet_dir = base / "fleet"
+        init_git_project(project)
+        listener = start_messages_listener(messages_dir, fleet_dir, project, session_id="mine")
+        time.sleep(0.2)
+        unowned_dispatch_id = f"{project.name}-unowned"
+        write_ledger_record(base, unowned_dispatch_id, project)
+        post_message(
+            dispatch_id=unowned_dispatch_id,
+            msg_type="result",
+            payload={"complete": True, "text": "owner unknown"},
+            messages_dir=messages_dir,
+        )
+        time.sleep(0.7)
+        assert_true("honestly unowned dispatch does not wake", listener.poll() is None)
+        write_ledger_record(base, "mine", project, controller_session_id="mine")
+        post_message(
+            dispatch_id="mine",
+            msg_type="result",
+            payload={"complete": True, "text": "owned terminal"},
+            messages_dir=messages_dir,
+        )
+        code, stdout, _stderr = listener_result(listener)
+        assert_true("owned terminal wakes after unowned mail", code == 0)
+        assert_true("unowned event stays absent", unowned_dispatch_id not in stdout)
+
+
+def test_listener_task_store_nag_counts_without_waking_then_escalation_wakes() -> None:
+    import tempfile
+    import goalflight_task as tasks
+    from goalflight_messages import controller_mail_summary, post_message
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project = base / "nag-project"
+        messages_dir = base / "messages"
+        fleet_dir = base / "fleet"
+        init_git_project(project)
+        listener = start_messages_listener(messages_dir, fleet_dir, project, session_id="mine")
+        time.sleep(0.2)
+        task_store_dispatch_id = tasks._next_nudge_dispatch_id(project)
+        post_message(
+            dispatch_id=task_store_dispatch_id,
+            msg_type="user_need",
+            payload={
+                "nudge_kind": "resume-ready",
+                "text": "19 tasks ready (top: t-022) -> continue?",
+            },
+            messages_dir=messages_dir,
+        )
+        time.sleep(0.7)
+        assert_true("periodic task-store nag does not wake", listener.poll() is None)
+        summary = controller_mail_summary(
+            owned_dispatch_ids=set(),
+            task_store_project_root=project,
+            messages_dir=messages_dir,
+            fleet_dir=fleet_dir,
+        )
+        assert_true("task-store nag remains in unread display count", summary["count"] == 1)
+        write_ledger_record(base, "real-escalation", project, controller_session_id="mine")
+        post_message(
+            dispatch_id="real-escalation",
+            msg_type="user_need",
+            payload={"text": "worker needs a real decision"},
+            messages_dir=messages_dir,
+        )
+        code, stdout, _stderr = listener_result(listener)
+        assert_true("real worker escalation wakes", code == 0)
+        assert_true("wake output excludes nag", task_store_dispatch_id not in stdout)
+        assert_true("wake output includes escalation", "real-escalation" in stdout)
+
+
+def test_listener_wakes_for_controller_addressed_mail() -> None:
+    import tempfile
+    from goalflight_messages import post_message
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project = base / "addressed-project"
+        messages_dir = base / "messages"
+        fleet_dir = base / "fleet"
+        init_git_project(project)
+        listener = start_messages_listener(messages_dir, fleet_dir, project, session_id="mine")
+        time.sleep(0.2)
+        addressed_inbox = f"{project.name}-controller-note"
+        post_message(
+            dispatch_id=addressed_inbox,
+            msg_type="controller-notice",
+            payload={"text": "peer controller message"},
+            messages_dir=messages_dir,
+        )
+        code, stdout, _stderr = listener_result(listener)
+        assert_true("controller-addressed mail wakes", code == 0)
+        assert_true("addressed inbox reported", addressed_inbox in stdout)
 
 
 def test_mcp_stdio_tools_call() -> None:
@@ -1563,6 +1795,11 @@ def main() -> None:
         test_controller_summary_includes_quota_advisory,
         test_controller_summary_resolves_canonical_root_once,
         test_controller_summary_git_failure_uses_task_store_root_fallback,
+        test_listener_live_session_covers_dispatch_launched_after_start,
+        test_listener_ignores_dispatch_owned_by_different_session,
+        test_listener_ignores_unowned_dispatch,
+        test_listener_task_store_nag_counts_without_waking_then_escalation_wakes,
+        test_listener_wakes_for_controller_addressed_mail,
         test_mcp_stdio_tools_call,
         test_mcp_delivery_failure_sets_tool_error_and_call_exit,
         test_mark_read_creates_cursor_and_unseen_filters,

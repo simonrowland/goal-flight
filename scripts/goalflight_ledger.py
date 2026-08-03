@@ -471,11 +471,14 @@ def cmd_record(args: argparse.Namespace) -> int:
     # are implementation details rather than evidence of a controller.
     controller_pid = getattr(args, "controller_pid", None)
     controller_session_id = getattr(args, "controller_session_id", None)
+    controller_label = getattr(args, "controller_label", None)
     if not controller_session_id or controller_pid is None:
         controller_pid = None
         controller_session_id = None
+        controller_label = None
     else:
         controller_session_id = str(controller_session_id)
+        controller_label = str(controller_label)[:64] if controller_label else None
     claimant_pid = getattr(args, "claimant_pid", None)
     os_sandbox = None
     if getattr(args, "os_sandbox_json", None):
@@ -502,6 +505,7 @@ def cmd_record(args: argparse.Namespace) -> int:
         "project_root": args.project_root,
         "controller_pid": controller_pid,
         "controller_session_id": controller_session_id,
+        "controller_label": controller_label,
         "controller_identity": process_identity(controller_pid),
         "claimant_pid": claimant_pid,
         "claimant_identity": process_identity(claimant_pid),
@@ -571,7 +575,14 @@ def cmd_record(args: argparse.Namespace) -> int:
             ):
                 record["controller_session_id"] = existing_controller_session_id
                 record["controller_pid"] = existing_controller_pid
+                record["controller_label"] = existing.get("controller_label")
                 record["controller_identity"] = existing.get("controller_identity")
+            elif (
+                record.get("controller_label") is None
+                and record.get("controller_session_id") == existing_controller_session_id
+                and record.get("controller_pid") == existing_controller_pid
+            ):
+                record["controller_label"] = existing.get("controller_label")
             if record.get("claimant_pid") is None and existing.get("claimant_pid"):
                 record["claimant_pid"] = existing["claimant_pid"]
                 record["claimant_identity"] = existing.get("claimant_identity")
@@ -929,6 +940,7 @@ def build_parser() -> argparse.ArgumentParser:
     rec.add_argument("--project-root")
     rec.add_argument("--controller-pid", type=int)
     rec.add_argument("--controller-session-id")
+    rec.add_argument("--controller-label")
     rec.add_argument("--claimant-pid", type=int)
     rec.add_argument("--worker-pid", type=int)
     rec.add_argument("--acp-session-id")

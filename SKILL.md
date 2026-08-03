@@ -144,9 +144,9 @@ skill loaded. Load those protocols on demand.
 For non-trivial commands, use `protocols/session-preflight.md`.
 
 ```bash
+python3 <skill-root>/scripts/goalflight_session_status.py --controller-startup
 python3 <skill-root>/scripts/goalflight_status.py
 ```
-
 Use doctor when readiness is unknown or changed:
 
 ```bash
@@ -169,7 +169,7 @@ Check mail with `relay --new` (one FROM/subject headline per unseen message) plu
 | `/goal-flight doctor` | `commands/doctor.md` | `tool-readiness` |
 | `/goal-flight migrate [<flags>]` | `commands/migrate.md` | `project-state-layout`, `task-lifecycle` |
 | `/goal-flight build-corpus [<flags>]` | `commands/build-corpus.md` | corpus docs referenced there |
-| `/goal-flight resume` | `commands/resume.md` | `state-handoff` |
+| `/goal-flight resume` | `commands/resume.md` | `session-preflight`, `state-handoff` |
 | `/goal-flight goal <SLUG>` | `commands/goal.md` | none |
 | `/goal-flight usage` | `commands/usage.md` | none |
 | `/goal-flight register-codex [<path>]` | `commands/register-codex.md` | `tool-readiness` |

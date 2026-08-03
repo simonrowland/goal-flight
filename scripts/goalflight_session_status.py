@@ -58,6 +58,8 @@ ROOT = Path(__file__).resolve().parent.parent
 SESSION_FILE_REL = Path("docs-private/.goal-flight-current-session.json")
 QUEUE_GLOB = "docs-private/goal-queue-*.md"
 RESUME_NOTES_GLOB = "docs-private/RESUME-NOTES-*.md"
+CONTROLLER_LABEL_ENV = "GOALFLIGHT_CONTROLLER_LABEL"
+CONTROLLER_PID_ENV = "GOALFLIGHT_CONTROLLER_PID"
 
 
 # --- session id (per-terminal) ----------------------------------------------
@@ -65,6 +67,33 @@ RESUME_NOTES_GLOB = "docs-private/RESUME-NOTES-*.md"
 
 def _session_file(project_root: Path) -> Path:
     return project_root / SESSION_FILE_REL
+
+
+def resolve_controller_label(
+    explicit_label: str | None = None,
+    *,
+    environ: dict[str, str] | None = None,
+) -> str | None:
+    """Return the controller-declared label, never a generated identity guess."""
+    env = os.environ if environ is None else environ
+    value = explicit_label if explicit_label is not None else env.get(CONTROLLER_LABEL_ENV)
+    label = str(value or "").strip()
+    return label[:64] or None
+
+
+def resolve_controller_pid(
+    explicit_pid: object = None,
+    *,
+    environ: dict[str, str] | None = None,
+) -> int | None:
+    """Return the controller-declared long-lived PID, never the helper PID."""
+    env = os.environ if environ is None else environ
+    raw_pid = explicit_pid if explicit_pid is not None else env.get(CONTROLLER_PID_ENV)
+    try:
+        pid = int(raw_pid)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return pid if pid > 0 else None
 
 
 def _read_session_map(path: Path) -> dict[str, dict]:
@@ -106,6 +135,100 @@ def _write_session_map(path: Path, data: dict[str, dict]) -> None:
 # their existing per-terminal meaning and are untouched.
 
 
+def _controller_process_identity(pid: int) -> dict | None:
+    """Return a PID-reuse-safe process-start token using only stdlib APIs."""
+    if not _pid_alive(pid):
+        return None
+
+    if goalflight_compat.is_windows():
+        identity = goalflight_compat.windows_process_identity(pid)
+        created = identity.get("creation_time") if isinstance(identity, dict) else None
+        if created:
+            return {"pid": pid, "start_token": f"windows:{created}"}
+        return None
+
+    if sys.platform == "darwin":
+        try:
+            import ctypes
+
+            class ProcBsdInfo(ctypes.Structure):
+                _fields_ = [
+                    ("pbi_flags", ctypes.c_uint32),
+                    ("pbi_status", ctypes.c_uint32),
+                    ("pbi_xstatus", ctypes.c_uint32),
+                    ("pbi_pid", ctypes.c_uint32),
+                    ("pbi_ppid", ctypes.c_uint32),
+                    ("pbi_uid", ctypes.c_uint32),
+                    ("pbi_gid", ctypes.c_uint32),
+                    ("pbi_ruid", ctypes.c_uint32),
+                    ("pbi_rgid", ctypes.c_uint32),
+                    ("pbi_svuid", ctypes.c_uint32),
+                    ("pbi_svgid", ctypes.c_uint32),
+                    ("rfu_1", ctypes.c_uint32),
+                    ("pbi_comm", ctypes.c_char * 16),
+                    ("pbi_name", ctypes.c_char * 32),
+                    ("pbi_nfiles", ctypes.c_uint32),
+                    ("pbi_pgid", ctypes.c_uint32),
+                    ("pbi_pjobc", ctypes.c_uint32),
+                    ("e_tdev", ctypes.c_uint32),
+                    ("e_tpgid", ctypes.c_uint32),
+                    ("pbi_nice", ctypes.c_int32),
+                    ("pbi_start_tvsec", ctypes.c_uint64),
+                    ("pbi_start_tvusec", ctypes.c_uint64),
+                ]
+
+            libproc = ctypes.CDLL("/usr/lib/libproc.dylib")
+            libproc.proc_pidinfo.argtypes = (
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_uint64,
+                ctypes.c_void_p,
+                ctypes.c_int,
+            )
+            libproc.proc_pidinfo.restype = ctypes.c_int
+            info = ProcBsdInfo()
+            size = ctypes.sizeof(info)
+            read = libproc.proc_pidinfo(pid, 3, 0, ctypes.byref(info), size)
+            if read == size and int(info.pbi_pid) == pid and info.pbi_start_tvsec:
+                token = f"darwin:{info.pbi_start_tvsec}:{info.pbi_start_tvusec}"
+                return {"pid": pid, "start_token": token}
+        except (AttributeError, OSError, TypeError, ValueError):
+            return None
+        return None
+
+    if sys.platform.startswith("linux"):
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+            # The comm field may contain spaces and parentheses. Everything
+            # after its final ')' starts at field 3; starttime is field 22.
+            fields = stat[stat.rfind(")") + 2 :].split()
+            start_ticks = fields[19]
+            try:
+                boot_id = Path("/proc/sys/kernel/random/boot_id").read_text(
+                    encoding="utf-8"
+                ).strip()
+            except OSError:
+                return None
+            if not boot_id:
+                return None
+            return {"pid": pid, "start_token": f"linux:{boot_id}:{start_ticks}"}
+        except (IndexError, OSError, ValueError):
+            return None
+
+    return None
+
+
+def _same_controller_process(record: dict, current: dict | None) -> bool:
+    expected = record.get("process_identity")
+    if not isinstance(expected, dict) or not isinstance(current, dict):
+        return False
+    return bool(
+        expected.get("pid") == current.get("pid")
+        and expected.get("start_token")
+        and expected.get("start_token") == current.get("start_token")
+    )
+
+
 def claim_session(
     project_root: Path,
     *,
@@ -113,14 +236,30 @@ def claim_session(
     session_id: str | None = None,
     label: str | None = None,
 ) -> dict:
-    """Bind a session id to a beacon process. Idempotent for the same pid."""
+    """Bind a session id to one process generation, idempotently."""
     path = _session_file(project_root)
     path.parent.mkdir(parents=True, exist_ok=True)
+    process_identity = _controller_process_identity(pid)
+    if process_identity is None:
+        raise RuntimeError("controller process generation is unavailable")
+    resolved_label = resolve_controller_label(label, environ={})
     with _file_lock(path):
         data = _read_session_map(path)
         key = str(pid)
         existing = data.get(key)
-        if isinstance(existing, dict) and existing.get("beacon"):
+        if (
+            isinstance(existing, dict)
+            and existing.get("beacon")
+            and _same_controller_process(existing, process_identity)
+        ):
+            # An older, unlabeled beacon for this exact process generation can
+            # safely adopt the controller's first explicit declaration. Once
+            # named, however, a live controller cannot silently relabel itself.
+            if resolved_label and not existing.get("label"):
+                existing = dict(existing)
+                existing["label"] = resolved_label
+                data[key] = existing
+                _write_session_map(path, data)
             return existing
         record = {
             "id": session_id or str(uuid.uuid4()),
@@ -129,37 +268,129 @@ def claim_session(
             "hostname": socket.gethostname(),
             "beacon": True,
         }
-        if label:
-            record["label"] = str(label)[:64]
+        if process_identity is not None:
+            record["process_identity"] = process_identity
+        if resolved_label:
+            record["label"] = resolved_label
         data[key] = record
         _write_session_map(path, data)
     return record
 
 
-def live_session(project_root: Path) -> dict | None:
+def live_session(
+    project_root: Path,
+    *,
+    label: str | None = None,
+    pid: int | None = None,
+) -> dict | None:
     """The session for this project: the live beacon, or None.
 
     None is an honest answer and callers must treat it as one -- it means no
     controller has claimed this project, NOT that the project is idle. Anything
     that would rather guess an owner should instead say it does not know.
     """
+    if label is None and pid is None:
+        declared_label = resolve_controller_label()
+        declared_pid = resolve_controller_pid()
+        if declared_label is not None or declared_pid is not None:
+            if declared_label is None or declared_pid is None:
+                return None
+            label, pid = declared_label, declared_pid
+
     path = _session_file(project_root)
     if not path.exists():
         return None
-    candidates = [
-        record
-        for record in _read_session_map(path).values()
-        if isinstance(record, dict) and record.get("beacon") and _pid_alive(record.get("pid"))
-    ]
+    candidates = []
+    for record in _read_session_map(path).values():
+        if not (isinstance(record, dict) and record.get("beacon")):
+            continue
+        record_pid = record.get("pid")
+        if not isinstance(record_pid, int):
+            continue
+        try:
+            current_identity = _controller_process_identity(record_pid)
+        except Exception:
+            current_identity = None
+        if _same_controller_process(record, current_identity):
+            candidates.append(record)
+    label_candidate_count: int | None = None
+    if label is not None:
+        requested_label = resolve_controller_label(label, environ={})
+        if requested_label is None:
+            return None
+        candidates = [
+            record for record in candidates if record.get("label") == requested_label
+        ]
+        # Preserve same-label ambiguity even when pid narrows the returned
+        # record to this controller. The label is the ownership namespace.
+        label_candidate_count = len(candidates)
+    if pid is not None:
+        candidates = [record for record in candidates if record.get("pid") == pid]
     if not candidates:
         return None
     # A second live beacon means a takeover or a stray controller. Prefer the
     # newest and report the collision rather than silently picking one.
     candidates.sort(key=lambda r: str(r.get("started_at") or ""), reverse=True)
     winner = dict(candidates[0])
-    if len(candidates) > 1:
-        winner["conflicting_beacons"] = len(candidates)
+    conflict_count = (
+        label_candidate_count
+        if label_candidate_count is not None
+        else len(candidates)
+    )
+    if conflict_count > 1:
+        winner["conflicting_beacons"] = conflict_count
     return winner
+
+
+def claim_controller_startup(
+    project_root: Path,
+    *,
+    pid: int | None = None,
+    label: str | None = None,
+    environ: dict[str, str] | None = None,
+) -> dict:
+    """Best-effort startup registration; observability must never block work."""
+    try:
+        env = os.environ if environ is None else environ
+        resolved_label = resolve_controller_label(label, environ=env)
+        if not resolved_label:
+            return {"claimed": False, "reason": "missing_controller_label"}
+        resolved_pid = resolve_controller_pid(pid, environ=env)
+        if resolved_pid is None:
+            return {"claimed": False, "reason": "missing_controller_pid"}
+        if not _pid_alive(resolved_pid):
+            return {"claimed": False, "reason": "controller_pid_not_live"}
+        record = claim_session(
+            project_root,
+            pid=resolved_pid,
+            label=resolved_label,
+        )
+        if record.get("label") != resolved_label:
+            return {
+                "claimed": False,
+                "reason": "controller_label_mismatch",
+                "existing_label": record.get("label"),
+            }
+        live = live_session(
+            project_root,
+            label=resolved_label,
+            pid=resolved_pid,
+        )
+        if not isinstance(live, dict) or live.get("id") != record.get("id"):
+            return {"claimed": False, "reason": "claim_not_live"}
+        if live.get("conflicting_beacons"):
+            return {
+                "claimed": False,
+                "reason": "controller_label_conflict",
+                "conflicting_beacons": live["conflicting_beacons"],
+            }
+    except Exception as exc:
+        return {
+            "claimed": False,
+            "reason": "claim_failed",
+            "error_type": type(exc).__name__,
+        }
+    return {"claimed": True, "session": record}
 
 
 def release_session(project_root: Path, *, pid: int) -> bool:
@@ -957,6 +1188,15 @@ def main(argv: list[str] | None = None) -> int:
         help="bind a session id to a beacon pid (--session-pid, default: this process)",
     )
     mode.add_argument(
+        "--controller-startup",
+        action="store_true",
+        help=(
+            "best-effort named controller registration from --session-pid/"
+            "GOALFLIGHT_CONTROLLER_PID and --session-label/"
+            "GOALFLIGHT_CONTROLLER_LABEL; always exits successfully"
+        ),
+    )
+    mode.add_argument(
         "--live-session",
         action="store_true",
         help="print the live beacon session for this project, or exit 1 if none",
@@ -986,6 +1226,15 @@ def main(argv: list[str] | None = None) -> int:
             label=args.session_label,
         )
         print(json.dumps(record))
+        return 0
+
+    if args.controller_startup:
+        result = claim_controller_startup(
+            project_root,
+            pid=args.session_pid,
+            label=args.session_label,
+        )
+        print(json.dumps(result))
         return 0
 
     if args.live_session:

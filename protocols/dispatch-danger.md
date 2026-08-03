@@ -39,8 +39,24 @@ Safe to run anytime, as often as you like.
 
 A launchd agent at `~/Library/LaunchAgents/com.goalflight.drain.plist` (installed by
 `scripts/install-drainer.sh`, template `scripts/templates/com.goalflight.drain.plist.tmpl`)
-runs `goalflight_dispatch.py drain --json` every **60s**, `RunAtLoad`. It **launches
-anything sitting in the dispatch queue**, with no further prompt.
+runs `goalflight_dispatch.py drain --json` every **60s**, `RunAtLoad`. Each local
+tick first releases stale capacity leases, conservatively reconciles abandoned
+local ledger records, then **launches anything sitting in the dispatch queue**,
+with no further prompt. `goalflight_dispatch.py reconcile-abandoned --json` is a
+read-only diagnostic of the same reconciliation predicate; only the drainer tick
+applies it automatically.
+
+Reconciliation is fail-closed. A record must be a stale local running dispatch
+with no queue carrier; recorded status/output pointers whose referenced files
+are absent or readable (and whose status, when present, matches); no live,
+malformed, conflicting, or indeterminate worker, claimant, producer-group, or
+persisted-descendant identity; an absent or terminal lease; and no live or
+ambiguous owning-controller beacon. A terminal output marker is reconciled by
+the existing marker machinery. Without one, the record becomes
+`inconclusive_no_final` with an `inferred_abandonment` audit basis. Resuming such
+a record creates the normal fresh tracked child and marks the old attempt
+`superseded`, preserving both the abandonment evidence and observed resume
+lineage.
 
 Consequences:
 

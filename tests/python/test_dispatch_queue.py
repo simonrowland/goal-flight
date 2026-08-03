@@ -1395,30 +1395,327 @@ def test_stale_claim_launch_token_requires_matching_worker_record() -> None:
         finally:
             os.environ.clear()
             os.environ.update(old_env)
-        # The carrier is redundant but UNLINKED (no task_ids on either side), so
-        # fail-closed parks it in quarantine: never deleted, never restored, live
-        # record untouched — the same contract pinned for live unlinked carriers
-        # by test_b065_unlinked_early_terminal_and_live_carriers_quarantine. The
-        # earlier "preserve as pending" expectation assumed INDETERMINATE
-        # admission, but the token-matched live record is merged by
-        # _entry_with_record_identity, upgrading admission to LIVE, where the
-        # designed unlinked outcome is quarantine, not deferral.
+        # The token-matched identity-live ledger row proves launch accounting.
+        # Missing task linkage is not orphan evidence, so the redundant carrier
+        # is cleared without quarantining or touching the live worker record.
         assert cleared["restored"] == 0, cleared  # never re-launch a live dispatch
-        assert cleared["cleared"] == 0, cleared
-        assert cleared["quarantined"] == 1, cleared
+        assert cleared["cleared"] == 1, cleared
+        assert cleared["quarantined"] == 0, cleared
         # pending_launch == 2: the matched ledger row (LIVE → deferred by the
-        # carrier-less ledger scan after its carrier was parked) plus the
+        # carrier-less ledger scan after its redundant carrier was cleared) plus the
         # carrier-less "queued" token-only row left over from the phase-1 restore.
         assert cleared["pending_launch"] == 2, cleared
         assert cleared["ledger_terminalized"] == 0, cleared
-        assert not matched_claim.exists(), "carrier is parked, not left in the launch glob"
+        assert not matched_claim.exists(), "identity-live launch carrier is redundant"
         parked = queue / "quarantine" / "matched.json.claimed-123.quarantined"
-        assert parked.exists(), "quarantine retains the envelope (never deletes)"
-        parked_entry = json.loads(parked.read_text(encoding="utf-8"))
-        assert parked_entry.get("quarantine_reason") == "live_worker_unlinked_claim_carrier", parked_entry
+        assert not parked.exists(), "live worker must never be labeled an orphan"
         assert not (tmp / "state" / "dispatch-queue" / "matched.json").exists()
         record = json.loads((tmp / "state" / "runs.d" / "matched.json").read_text(encoding="utf-8"))
         assert record["state"] == "running", record  # live worker record untouched
+
+
+def test_fresh_live_unlinked_claim_is_not_quarantined() -> None:
+    """Missing task linkage is ambiguous while the token-matched worker is live."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        env = _b065_env(tmp)
+        old_env = os.environ.copy()
+        try:
+            os.environ.clear()
+            os.environ.update(env)
+            queue = tmp / "state" / "dispatch-queue"
+            queue.mkdir(parents=True)
+            dispatch_id = "fresh-live-unlinked"
+            token = "fresh-live-token"
+            claim = queue / f"{dispatch_id}.json.claimed-1"
+            with _sleeping_worker() as worker:
+                identity = D.goalflight_ledger.process_identity(worker.pid)
+                claim.write_text(
+                    json.dumps(
+                        {
+                            "schema": D.DISPATCH_QUEUE_SCHEMA,
+                            "state": "claimed",
+                            "dispatch_id": dispatch_id,
+                            "dispatch_argv": ["--agent", "test-dispatch"],
+                            "created_at": D.goalflight_ledger.utc_now(),
+                            "queue_launch_token": token,
+                            "queue_launch_started": True,
+                            "queue_worker_pid": worker.pid,
+                            "queue_worker_identity": identity,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                D.goalflight_ledger.write_record(
+                    {
+                        "schema": D.goalflight_ledger.SCHEMA,
+                        "dispatch_id": dispatch_id,
+                        "state": "running",
+                        "terminal_state": "unknown",
+                        "worker_pid": worker.pid,
+                        "worker_identity": identity,
+                        "queue_launch_token": token,
+                        "started_at": D.goalflight_ledger.utc_now(),
+                    }
+                )
+
+                result = D._recover_claimed_queue_entries(queue, stale_s=300)
+                record = D._find_dispatch_record(dispatch_id)
+
+            assert result["quarantined"] == 0, result
+            assert result["cleared"] == 1, result
+            assert not claim.exists(), "identity-live launch carrier is redundant"
+            assert not list((queue / "quarantine").glob("*"))
+            assert record is not None and record["state"] == "running", record
+        finally:
+            os.environ.clear()
+            os.environ.update(old_env)
+
+
+def test_observed_unlinked_terminal_orphan_is_quarantined() -> None:
+    """A token-matched terminal orphan remains recoverable after observation."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        env = _b065_env(tmp)
+        old_env = os.environ.copy()
+        try:
+            os.environ.clear()
+            os.environ.update(env)
+            queue = tmp / "state" / "dispatch-queue"
+            queue.mkdir(parents=True)
+            dispatch_id = "observed-terminal-orphan"
+            token = "observed-terminal-token"
+            tail = tmp / f"{dispatch_id}.tail"
+            tail.write_text("worker stopped without task linkage\n", encoding="utf-8")
+            claim = queue / f"{dispatch_id}.json.claimed-1"
+            claim.write_text(
+                json.dumps(
+                    {
+                        "schema": D.DISPATCH_QUEUE_SCHEMA,
+                        "state": "claimed",
+                        "dispatch_id": dispatch_id,
+                        "dispatch_argv": ["--agent", "test-dispatch"],
+                        "project_root": str(tmp),
+                        "created_at": "2000-01-01T00:00:00+00:00",
+                        "queue_launch_token": token,
+                        "queue_launch_started": True,
+                        "queue_worker_spawn_intent": True,
+                        "request": {"cwd": str(tmp), "tail": str(tail)},
+                        **_dead_producer_fields(at="2000-01-01T00:00:00+00:00"),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            D.goalflight_ledger.write_record(
+                {
+                    "schema": D.goalflight_ledger.SCHEMA,
+                    "dispatch_id": dispatch_id,
+                    "state": "worker_dead",
+                    "terminal_state": "failed",
+                    "worker_pid": 99_999_991,
+                    "worker_identity": {"pid": 99_999_991},
+                    "queue_launch_token": token,
+                    "started_at": "2000-01-01T00:00:00+00:00",
+                    "ended_at": "2000-01-01T00:01:00+00:00",
+                }
+            )
+
+            with _process_snapshot([]):
+                first = D._recover_claimed_queue_entries(queue, stale_s=0)
+            staged = json.loads(claim.read_text(encoding="utf-8"))
+            assert first["quarantined"] == 0, first
+            assert staged.get("orphan_first_seen_at"), staged
+
+            with _process_snapshot([]):
+                second = D._recover_claimed_queue_entries(queue, stale_s=0)
+            parked_paths = list((queue / "quarantine").glob("*.quarantined*"))
+            assert len(parked_paths) == 1, (second, staged, claim.exists())
+            parked = json.loads(parked_paths[0].read_text(encoding="utf-8"))
+
+            assert second["quarantined"] == 1, second
+            assert not claim.exists()
+            assert len(parked_paths) == 1, parked_paths
+            evidence = parked.get("quarantine_evidence") or {}
+            assert evidence.get("basis") == "observed_unlinked_terminal_record", evidence
+            assert evidence.get("record_token_matches_claim") is True, evidence
+            assert evidence.get("worker_identity_status") == "dead", evidence
+        finally:
+            os.environ.clear()
+            os.environ.update(old_env)
+
+
+def test_terminal_record_with_live_worker_identity_is_preserved() -> None:
+    """Terminal metadata cannot outweigh a positively live worker identity."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        env = _b065_env(tmp)
+        old_env = os.environ.copy()
+        try:
+            os.environ.clear()
+            os.environ.update(env)
+            queue = tmp / "state" / "dispatch-queue"
+            queue.mkdir(parents=True)
+            claim = queue / "terminal-live-worker.json.claimed-1"
+            token = "terminal-live-worker-token"
+            entry = {
+                "schema": D.DISPATCH_QUEUE_SCHEMA,
+                "state": "claimed",
+                "dispatch_id": "terminal-live-worker",
+                "dispatch_argv": ["--agent", "test-dispatch"],
+                "created_at": "2000-01-01T00:00:00+00:00",
+                "orphan_first_seen_at": "2000-01-01T00:00:00+00:00",
+                "queue_launch_token": token,
+                "queue_launch_started": True,
+            }
+            claim.write_text(json.dumps(entry), encoding="utf-8")
+
+            with _sleeping_worker() as worker:
+                record = {
+                    "schema": D.goalflight_ledger.SCHEMA,
+                    "dispatch_id": "terminal-live-worker",
+                    "state": "worker_dead",
+                    "terminal_state": "failed",
+                    "worker_pid": worker.pid,
+                    "worker_identity": D.goalflight_ledger.process_identity(worker.pid),
+                    "queue_launch_token": token,
+                }
+                parked = D._quarantine_unlinked_claim_if_observed_orphan(
+                    claim,
+                    entry,
+                    record,
+                    reason="terminal_live_worker_test",
+                    stale_s=0,
+                )
+
+            assert parked is None
+            assert claim.exists()
+            assert not list((queue / "quarantine").glob("*"))
+        finally:
+            os.environ.clear()
+            os.environ.update(old_env)
+
+
+def test_live_unlinked_cleanup_sites_agree_never_to_quarantine() -> None:
+    """Positive cleanup and the lower orphan site reject the same live evidence."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        env = _b065_env(tmp)
+        old_env = os.environ.copy()
+        try:
+            os.environ.clear()
+            os.environ.update(env)
+            queue = tmp / "state" / "dispatch-queue"
+            queue.mkdir(parents=True)
+            actions: list[str] = []
+            claims: list[Path] = []
+            original_classify = D.classify_reconciliation_admission
+            with _sleeping_worker() as worker:
+                identity = D.goalflight_ledger.process_identity(worker.pid)
+                for site in ("positive", "transaction"):
+                    dispatch_id = f"shared-live-policy-{site}"
+                    token = f"shared-live-policy-{site}-token"
+                    claim = queue / f"{dispatch_id}.json.claimed-1"
+                    claims.append(claim)
+                    entry = {
+                        "schema": D.DISPATCH_QUEUE_SCHEMA,
+                        "state": "claimed",
+                        "dispatch_id": dispatch_id,
+                        "dispatch_argv": ["--agent", "test-dispatch"],
+                        "created_at": D.goalflight_ledger.utc_now(),
+                        "queue_launch_token": token,
+                        "queue_launch_started": True,
+                        "queue_worker_pid": worker.pid,
+                        "queue_worker_identity": identity,
+                    }
+                    claim.write_text(json.dumps(entry), encoding="utf-8")
+                    D.goalflight_ledger.write_record(
+                        {
+                            "schema": D.goalflight_ledger.SCHEMA,
+                            "dispatch_id": dispatch_id,
+                            "state": "running",
+                            "terminal_state": "unknown",
+                            "worker_pid": worker.pid,
+                            "worker_identity": identity,
+                            "queue_launch_token": token,
+                            "started_at": D.goalflight_ledger.utc_now(),
+                        }
+                    )
+
+                    if site == "positive":
+                        action = D._positive_live_carrier_cleanup(claim, entry, queue, stale_s=300)
+                    else:
+                        # Force this focused policy test past the LIVE fast path
+                        # so it reaches the lower unlinked quarantine call site
+                        # with otherwise identical token-matched live evidence.
+                        D.classify_reconciliation_admission = (
+                            lambda *_args, **_kwargs: D.PreAdmitClass.STALE_NO_SPAWN
+                        )
+                        try:
+                            action = D._reconcile_claim_transaction(
+                                claim,
+                                entry,
+                                queue_dir=queue,
+                                reason="shared_live_policy_transaction",
+                                stale_s=0,
+                            )
+                        finally:
+                            D.classify_reconciliation_admission = original_classify
+                    actions.append(action)
+
+            assert actions == ["cleared", "pending"], actions
+            assert not claims[0].exists(), claims
+            assert claims[1].exists(), claims
+            assert not list((queue / "quarantine").glob("*"))
+        finally:
+            D.classify_reconciliation_admission = original_classify
+            os.environ.clear()
+            os.environ.update(old_env)
+
+
+def test_unlinked_no_record_quarantine_freezes_ledger_absence() -> None:
+    """A destructive no-row inference acquires L even when the first read is empty."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        env = _b065_env(tmp)
+        old_env = os.environ.copy()
+        original_begin = D._begin_reconcile_transaction
+        observed_need_ledger: list[bool] = []
+        try:
+            os.environ.clear()
+            os.environ.update(env)
+            queue = tmp / "state" / "dispatch-queue"
+            queue.mkdir(parents=True)
+            claim = queue / "unlinked-no-record.json.claimed-1"
+            entry = {
+                "schema": D.DISPATCH_QUEUE_SCHEMA,
+                "state": "claimed",
+                "dispatch_id": "unlinked-no-record",
+                "dispatch_argv": ["--agent", "test-dispatch"],
+                "created_at": "2000-01-01T00:00:00+00:00",
+                "queue_launch_token": "unlinked-no-record-token",
+            }
+            claim.write_text(json.dumps(entry), encoding="utf-8")
+
+            def capture_begin(*_args, **kwargs):
+                observed_need_ledger.append(bool(kwargs.get("need_ledger")))
+                return None
+
+            D._begin_reconcile_transaction = capture_begin
+            action = D._reconcile_claim_transaction(
+                claim,
+                entry,
+                queue_dir=queue,
+                reason="unlinked_no_record_lock_test",
+                stale_s=0,
+            )
+
+            assert action == "pending", action
+            assert observed_need_ledger == [True], observed_need_ledger
+            assert claim.exists()
+        finally:
+            D._begin_reconcile_transaction = original_begin
+            os.environ.clear()
+            os.environ.update(old_env)
 
 
 def test_stale_claim_result_marker_with_rate_limit_text_completes() -> None:
@@ -2027,7 +2324,7 @@ def test_b065_state_flips_to_terminal_so_wait_resolves() -> None:
 
 
 def test_b065_linked_vs_unlinked_action_matrix() -> None:
-    """2. Linked terminalizes; unlinked is quarantined, not deleted/terminalized."""
+    """2. Linked terminalizes; unlinked nonterminal evidence stays pending."""
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         env = _b065_env(tmp)
@@ -2127,9 +2424,9 @@ def test_b065_linked_vs_unlinked_action_matrix() -> None:
         assert linked_record["state"] == "worker_dead", linked_record
         assert unlinked_record["state"] == "starting", unlinked_record
         assert unlinked_record.get("terminal_state") in {None, "unknown"}, unlinked_record
-        assert not unlinked_claim.exists()
-        assert quarantine_files, "unlinked claim must be quarantined, not deleted"
-        assert result.get("quarantined", 0) >= 1, result
+        assert unlinked_claim.exists(), "nonterminal linkage gap is not an orphan"
+        assert not quarantine_files
+        assert result.get("quarantined", 0) == 0, result
 
 
 def test_b065_superseded_does_not_demote_task_success() -> None:
@@ -2575,8 +2872,8 @@ def test_b065_live_stdout_lock_skips_reconciliation_promptly() -> None:
         assert "COMPLETE: inherited lock" in tail.read_text(encoding="utf-8")
 
 
-def test_b065_unlinked_quarantine_not_deleted_or_terminalized() -> None:
-    """7. Unlinked post-spawn orphan at quarantine → not deleted, not auto-terminalized."""
+def test_b065_unlinked_nonterminal_claim_is_preserved() -> None:
+    """7. Dead worker evidence cannot quarantine an unlinked nonterminal record."""
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         env = _b065_env(tmp)
@@ -2636,11 +2933,10 @@ def test_b065_unlinked_quarantine_not_deleted_or_terminalized() -> None:
             os.environ.clear()
             os.environ.update(old_env)
         assert record["state"] == "starting", record
-        assert not claim.exists()
-        assert qfiles, "quarantine artifact must retain the envelope"
-        parked = json.loads(qfiles[0].read_text(encoding="utf-8"))
-        assert parked.get("dispatch_argv"), parked
-        assert result.get("quarantined", 0) >= 1, result
+        assert claim.exists()
+        assert not qfiles
+        assert result.get("quarantined", 0) == 0, result
+        assert result.get("pending_launch", 0) >= 1, result
 
 
 def test_b065_concurrent_double_restore_second_exhausts() -> None:
@@ -3006,8 +3302,8 @@ def test_b065_carrier_mtime_poison_still_orphans() -> None:
         assert result.get("cleared", 0) >= 1 or result.get("ledger_terminalized", 0) >= 1, result
 
 
-def test_b065_unlinked_early_terminal_and_live_carriers_quarantine() -> None:
-    """Early terminal/live-token branches never delete unlinked carriers."""
+def test_b065_unlinked_terminal_waits_while_live_carrier_clears() -> None:
+    """A live carrier clears; a terminal carrier needs observed-orphan evidence."""
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         env = _b065_env(tmp)
@@ -3023,11 +3319,13 @@ def test_b065_unlinked_early_terminal_and_live_carriers_quarantine() -> None:
                     ("terminal", "complete", None, None),
                     ("live", "running", worker.pid, worker_identity),
                 )
+                claims: dict[str, Path] = {}
                 for label, state, worker_pid, identity in cases:
                     dispatch_id = f"b065-unlinked-early-{label}"
                     tail = tmp / f"{dispatch_id}.tail"
                     tail.write_text("working...\n", encoding="utf-8")
                     claim = queue / f"{dispatch_id}.json.claimed-1"
+                    claims[label] = claim
                     claim.write_text(
                         json.dumps(
                             {
@@ -3084,10 +3382,14 @@ def test_b065_unlinked_early_terminal_and_live_carriers_quarantine() -> None:
             os.environ.clear()
             os.environ.update(old_env)
         quarantined = list((queue / "quarantine").glob("*.quarantined*"))
-        assert result["quarantined"] == 2, result
-        assert len(quarantined) == 2, quarantined
+        terminal_entry = json.loads(claims["terminal"].read_text(encoding="utf-8"))
+        assert result["quarantined"] == 0, result
+        assert result["cleared"] == 1, result
+        assert not quarantined
+        assert terminal_entry.get("orphan_first_seen_at"), terminal_entry
+        assert not claims["live"].exists(), "identity-live carrier is redundant"
         assert live_record["state"] == "running", live_record
-        assert captured.getvalue().count('"action": "quarantine"') == 2, captured.getvalue()
+        assert '"action": "quarantine"' not in captured.getvalue(), captured.getvalue()
 
 
 def test_b065_unlinked_complete_carrier_quarantines_before_authority() -> None:
@@ -3145,7 +3447,11 @@ def test_b065_unlinked_complete_carrier_quarantines_before_authority() -> None:
             )
             captured = io.StringIO()
             with contextlib.redirect_stderr(captured), _process_snapshot([]):
-                result = D._recover_claimed_queue_entries(queue, stale_s=300)
+                first = D._recover_claimed_queue_entries(queue, stale_s=300)
+                assert first["quarantined"] == 0, first
+                staged = json.loads(claim.read_text(encoding="utf-8"))
+                assert staged.get("orphan_first_seen_at"), staged
+                result = D._recover_claimed_queue_entries(queue, stale_s=0)
             record = json.loads(
                 (tmp / "state" / "runs.d" / f"{dispatch_id}.json").read_text(encoding="utf-8")
             )
@@ -3192,6 +3498,10 @@ def test_b065_unlinked_pre_spawn_carrier_quarantines_instead_of_restore() -> Non
             )
             captured = io.StringIO()
             with contextlib.redirect_stderr(captured):
+                first = D._recover_claimed_queue_entries(queue, stale_s=0)
+                assert first["quarantined"] == 0, first
+                staged = json.loads(claim.read_text(encoding="utf-8"))
+                assert staged.get("orphan_first_seen_at"), staged
                 result = D._recover_claimed_queue_entries(queue, stale_s=0)
             quarantined = list((queue / "quarantine").glob("*.quarantined*"))
         finally:
@@ -4006,6 +4316,11 @@ def main() -> None:
     test_failed_claim_tombstone_is_not_recovered()
     test_fresh_token_only_claim_waits_for_stale_window()
     test_stale_claim_launch_token_requires_matching_worker_record()
+    test_fresh_live_unlinked_claim_is_not_quarantined()
+    test_observed_unlinked_terminal_orphan_is_quarantined()
+    test_terminal_record_with_live_worker_identity_is_preserved()
+    test_live_unlinked_cleanup_sites_agree_never_to_quarantine()
+    test_unlinked_no_record_quarantine_freezes_ledger_absence()
     test_stale_claim_result_marker_with_rate_limit_text_completes()
     test_claim_recovery_terminal_marker_normalization_is_kimi_only()
     test_drain_replay_argv_injects_queue_control_flags()
@@ -4024,12 +4339,12 @@ def main() -> None:
     test_b065_weak_worker_pid_claim_unlink_then_ledger_terminalizes()
     test_b065_late_complete_wins_over_worker_dead()
     test_b065_live_stdout_lock_skips_reconciliation_promptly()
-    test_b065_unlinked_quarantine_not_deleted_or_terminalized()
+    test_b065_unlinked_nonterminal_claim_is_preserved()
     test_b065_concurrent_double_restore_second_exhausts()
     test_b065_late_complete_racing_restore_wins()
     test_b065_normal_drain_restore_honors_completed_linked_task()
     test_b065_carrier_mtime_poison_still_orphans()
-    test_b065_unlinked_early_terminal_and_live_carriers_quarantine()
+    test_b065_unlinked_terminal_waits_while_live_carrier_clears()
     test_b065_unlinked_complete_carrier_quarantines_before_authority()
     test_b065_unlinked_pre_spawn_carrier_quarantines_instead_of_restore()
     test_b065_identity_exception_is_indeterminate()

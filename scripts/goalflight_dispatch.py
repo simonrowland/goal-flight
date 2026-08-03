@@ -91,6 +91,8 @@ DAEMON_SPAWN_ARG = "__goalflight_spawn_daemon"
 DISPATCH_QUEUE_SCHEMA = "goalflight.dispatch-queue.v1"
 QUEUE_CLAIM_STALE_S = 300.0
 LAUNCH_TIMEOUT_S = QUEUE_CLAIM_STALE_S
+ABANDONED_RECONCILE_STALE_S = QUEUE_CLAIM_STALE_S
+ABANDONED_RECONCILIATION_SCHEMA = "goalflight.abandoned-reconciliation.v1"
 MAX_CLAIM_RECOVERY_REQUEUES = 1
 RECONCILE_DOWNSTREAM_LOCK_BUDGET_S = 0.100
 RECONCILE_LOCK_POLL_S = 0.010
@@ -2630,6 +2632,58 @@ def _cmd_resume(argv: list[str]) -> int:
     return main(launch_argv)
 
 
+def _mark_reconciled_parent_resumed(
+    parent_dispatch_id: str,
+    child_dispatch_id: str,
+) -> bool:
+    """Replace an inferred-abandonment label with observed resume lineage.
+
+    The old attempt remains terminal; the new child owns the live process.
+    ``superseded`` states only the observed fact that a fresh tracked child has
+    replaced that attempt, while the nested reconciliation record preserves
+    why the old attempt was originally closed.
+    """
+
+    with goalflight_ledger.StateLock():
+        parent = _find_dispatch_record(parent_dispatch_id)
+        child = _find_dispatch_record(child_dispatch_id)
+        if not isinstance(parent, dict) or not isinstance(child, dict):
+            return False
+        outcome = parent.get("outcome")
+        reconciliation = outcome.get("reconciliation") if isinstance(outcome, dict) else None
+        if not isinstance(reconciliation, dict) or reconciliation.get("basis") != "inferred_abandonment":
+            return False
+        if child.get("parent_dispatch_id") != parent_dispatch_id:
+            return False
+        if not goalflight_dispatch_states.is_running_state(child.get("state")):
+            return False
+
+        resumed_at = child.get("started_at") or goalflight_ledger.utc_now()
+        resume_observation = {
+            "dispatch_id": child_dispatch_id,
+            "state": child.get("state"),
+            "started_at": resumed_at,
+        }
+        updated_outcome = dict(outcome)
+        updated_outcome["terminal_state"] = "superseded"
+        updated_outcome["reason"] = "resumed_by_dispatch"
+        updated_outcome["resume"] = resume_observation
+        parent.update(
+            {
+                "state": "superseded",
+                "terminal_state": "superseded",
+                "liveness_state": goalflight_terminal.terminal_liveness_state("superseded"),
+                "reason": "resumed_by_dispatch",
+                "updated_at": resumed_at,
+                "resumed_at": resumed_at,
+                "resumed_by_dispatch_id": child_dispatch_id,
+                "outcome": updated_outcome,
+            }
+        )
+        goalflight_ledger.write_record(parent)
+    return True
+
+
 CURSOR_AGENTS = {"cursor", "cursor-agent"}
 
 
@@ -2711,23 +2765,46 @@ def _stamp_controller_session(args, project_root: Path) -> None:
     dispatch is unowned; it must never make the launch fail or cause this
     process to be substituted as the owner.
     """
+    requested_label = goalflight_session_status.resolve_controller_label(
+        getattr(args, "controller_label", None)
+    )
+    requested_pid = goalflight_session_status.resolve_controller_pid(
+        getattr(args, "controller_beacon_pid", None)
+    )
     try:
-        session = goalflight_session_status.live_session(project_root)
+        session = (
+            goalflight_session_status.live_session(
+                project_root,
+                label=requested_label,
+            )
+            if requested_label and requested_pid is not None
+            else None
+        )
     except Exception:
+        session = None
+    if isinstance(session, dict) and session.get("conflicting_beacons"):
         session = None
 
     session_id = session.get("id") if isinstance(session, dict) else None
     session_pid = session.get("pid") if isinstance(session, dict) else None
+    session_label = session.get("label") if isinstance(session, dict) else None
     try:
         session_pid = int(session_pid) if session_pid is not None else None
     except (TypeError, ValueError):
         session_pid = None
-    if not session_id or session_pid is None:
+    if (
+        not session_id
+        or session_pid is None
+        or session_pid != requested_pid
+        or not session_label
+    ):
         session_id = None
         session_pid = None
+        session_label = None
 
     args.controller_session_id = str(session_id) if session_id is not None else None
     args._controller_beacon_pid = session_pid
+    args.controller_label = str(session_label) if session_label is not None else None
 
 
 def _controller_pid(args) -> int | None:
@@ -2740,6 +2817,11 @@ def _controller_session_id(args) -> str | None:
     value = getattr(args, "controller_session_id", None)
     pid = getattr(args, "_controller_beacon_pid", None)
     return str(value) if value and pid is not None else None
+
+
+def _controller_label(args) -> str | None:
+    value = getattr(args, "controller_label", None)
+    return str(value) if value and _controller_session_id(args) is not None else None
 
 
 def _account_engine(agent: str) -> str | None:
@@ -2968,6 +3050,7 @@ def _prelaunch_status_metadata(
         "shape": args.shape,
         "controller_session_id": _controller_session_id(args),
         "controller_pid": _controller_pid(args),
+        "controller_label": _controller_label(args),
     }
     task_ids = list(getattr(args, "task_ids", []) or [])
     if task_ids:
@@ -3166,6 +3249,7 @@ def _record_ledger(args, *, project_root: Path, prompt_path: str | None, status_
                 project_root=str(project_root),
                 controller_pid=_controller_pid(args),
                 controller_session_id=_controller_session_id(args),
+                controller_label=_controller_label(args),
                 claimant_pid=os.getpid() if state == "waiting_capacity" else None,
                 worker_pid=worker_pid,
                 acp_session_id=None,
@@ -3208,6 +3292,7 @@ def _record_queued_ledger_fast(args, *, project_root: Path, prompt_path: str | N
         "project_root": str(project_root),
         "controller_pid": _controller_pid(args),
         "controller_session_id": _controller_session_id(args),
+        "controller_label": _controller_label(args),
         "controller_identity": None,
         "worker_pid": None,
         "worker_identity": None,
@@ -3358,9 +3443,13 @@ def _canonical_replay_argv(args, raw_argv: list[str], *, tail: Path, status_json
         argv += ["--permission-inline-timeout-s", str(args.permission_inline_timeout_s)]
     if args.permission_user_timeout_s is not None:
         argv += ["--permission-user-timeout-s", str(args.permission_user_timeout_s)]
-    # A replay is a new dispatch invocation and snapshots the then-live beacon.
-    # Carrying either the legacy CLI pid or this invocation's snapshot would
-    # turn a durable queue request into stale ownership evidence.
+    # Persist only the controller's declared lookup key. Replay re-measures the
+    # live beacon and therefore cannot turn this snapshot into stale ownership.
+    controller_label = _controller_label(args)
+    controller_beacon_pid = _controller_pid(args)
+    if controller_label is not None and controller_beacon_pid is not None:
+        argv += ["--controller-label", controller_label]
+        argv += ["--controller-beacon-pid", str(controller_beacon_pid)]
     if raw_argv:
         argv += ["--", *raw_argv]
     return argv
@@ -3906,13 +3995,21 @@ def _queue_quarantine_dir(queue_dir: Path) -> Path:
     return path
 
 
-def _quarantine_claim(claim: Path, entry: dict, *, reason: str) -> Path | None:
+def _quarantine_claim(
+    claim: Path,
+    entry: dict,
+    *,
+    reason: str,
+    evidence: dict | None = None,
+) -> Path | None:
     """Park an unlinked orphan claim out of the active launch glob. Never deletes."""
     queue_dir = claim.parent
     quarantine = _queue_quarantine_dir(queue_dir)
     entry = dict(entry)
     entry["state"] = "quarantined"
     entry["quarantine_reason"] = reason
+    if evidence is not None:
+        entry["quarantine_evidence"] = dict(evidence)
     entry["quarantined_at"] = goalflight_ledger.utc_now()
     entry["updated_at"] = entry["quarantined_at"]
     dest = quarantine / f"{claim.name}.quarantined"
@@ -3948,6 +4045,7 @@ def _quarantine_claim(claim: Path, entry: dict, *, reason: str) -> Path | None:
                 "dispatch_id": entry.get("dispatch_id"),
                 "action": "quarantine",
                 "reason": reason,
+                "evidence": entry.get("quarantine_evidence"),
                 "path": str(dest),
             },
             sort_keys=True,
@@ -3956,6 +4054,93 @@ def _quarantine_claim(claim: Path, entry: dict, *, reason: str) -> Path | None:
         flush=True,
     )
     return dest
+
+
+def _quarantine_unlinked_claim_if_observed_orphan(
+    claim: Path,
+    entry: dict,
+    record: dict | None,
+    *,
+    reason: str,
+    stale_s: float,
+) -> Path | None:
+    """Quarantine only after durable, repeated orphan evidence.
+
+    Missing task linkage alone is never orphan evidence: task linkage may land
+    after the launch record. A live or non-terminal record therefore always
+    defers. The only eligible cases are a token-matched terminal record whose
+    worker identity is not live/indeterminate, or an unrecorded pre-spawn claim.
+    Both must survive a first-observed orphan interval before quarantine.
+    """
+    if _is_task_linked(entry, record):
+        return None
+
+    now_s = time.time()
+    claim_token = _queue_launch_token_from_entry(entry)
+    record_token = (
+        str(record.get("queue_launch_token") or "")
+        if isinstance(record, dict)
+        else None
+    )
+    worker_status = "no_record"
+    worker_reason = "no_record"
+    if isinstance(record, dict):
+        if not claim_token or record_token != claim_token:
+            return None
+        if not _dispatch_record_is_terminal(record):
+            return None
+        worker_status, worker_reason = _queue_claim_identity_status(
+            record.get("worker_pid"),
+            record.get("worker_identity"),
+        )
+        if worker_status in {"live", "indeterminate"}:
+            return None
+        basis = "observed_unlinked_terminal_record"
+    else:
+        if not _entry_pre_spawn(entry):
+            return None
+        if (
+            classify_reconciliation_admission(entry, now_s, stale_s=stale_s)
+            is not PreAdmitClass.STALE_NO_SPAWN
+        ):
+            return None
+        basis = "observed_unlinked_stale_pre_spawn"
+
+    orphan_stamp = _parse_timestamp_s(entry.get("orphan_first_seen_at"))
+    if orphan_stamp is None:
+        staged = dict(entry)
+        staged["orphan_first_seen_at"] = _persist_orphan_first_seen(staged)
+        staged["updated_at"] = goalflight_ledger.utc_now()
+        try:
+            _write_json_atomic(claim, staged)
+        except OSError:
+            return None
+        return None
+
+    orphan_age_s = max(0.0, now_s - orphan_stamp)
+    if orphan_age_s < max(0.0, stale_s):
+        return None
+
+    evidence = {
+        "basis": basis,
+        "claim_orphan_first_seen_at": entry.get("orphan_first_seen_at"),
+        "orphan_age_s": orphan_age_s,
+        "required_stale_s": max(0.0, stale_s),
+        "record_present": isinstance(record, dict),
+        "record_state": record.get("state") if isinstance(record, dict) else None,
+        "record_terminal_state": record.get("terminal_state") if isinstance(record, dict) else None,
+        "record_token_matches_claim": bool(
+            record is not None and claim_token and record_token == claim_token
+        ),
+        "worker_identity_status": worker_status,
+        "worker_identity_reason": worker_reason,
+    }
+    return _quarantine_claim(
+        claim,
+        entry,
+        reason=f"{reason}_observed_orphan",
+        evidence=evidence,
+    )
 
 
 def _persist_orphan_first_seen(entry: dict, *, now_iso: str | None = None) -> str:
@@ -4045,6 +4230,8 @@ def _submit_dispatch(args, raw_argv: list[str], *, base: Path) -> int:
             "max_idle_secs": args.max_idle_secs,
             "permission_mode": args.permission_mode,
             "no_orientation": bool(getattr(args, "no_orientation", False)),
+            "controller_label": _controller_label(args),
+            "controller_beacon_pid": _controller_pid(args),
             "raw_worker": raw_argv,
         },
     }
@@ -4175,6 +4362,7 @@ def _write_pidfile(
     entry = {
         "controller_pid": controller_pid,
         "controller_session_id": controller_session_id,
+        "controller_label": _controller_label(args),
         "pid": worker_pid,
         "pgid": int(pgid or worker_pid),
         "started_at": ident.get("lstart"),
@@ -4305,6 +4493,634 @@ def _release_stale_capacity_for_drain() -> None:
         goalflight_capacity.cmd_release_stale(
             argparse.Namespace(state="expired", reason="drain_stale_worker", keep=True)
         )
+
+
+def _read_capacity_state_for_reconciliation() -> dict:
+    """Read capacity state without converting corruption into an empty lease set."""
+
+    path = goalflight_capacity.state_path()
+    if not path.exists():
+        return {"schema": goalflight_capacity.SCHEMA, "leases": {}}
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict) or not isinstance(payload.get("leases"), dict):
+        raise ValueError("capacity state has no readable lease map")
+    return payload
+
+
+def _abandoned_status_payload(record: dict) -> tuple[dict | None, str]:
+    """Read status evidence without confusing absence with corruption.
+
+    A status file that was never created is absent evidence.  A file that
+    exists but cannot be read, parsed, or tied to this dispatch is ambiguous
+    evidence and must veto reconciliation.
+    """
+
+    status_path = record.get("status_path")
+    if status_path is None or status_path == "":
+        return None, "status_path_absent"
+    if not isinstance(status_path, str):
+        return None, "status_path_invalid"
+    try:
+        payload = json.loads(Path(status_path).expanduser().read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}, "status_file_absent"
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return None, f"status_unreadable:{type(exc).__name__}"
+    if not isinstance(payload, dict):
+        return None, "status_payload_invalid"
+    if payload.get("dispatch_id") != record.get("dispatch_id"):
+        return None, "status_dispatch_mismatch"
+    return payload, "status_read"
+
+
+def _abandoned_progress_snapshot(record: dict, status: dict) -> tuple[float | None, tuple]:
+    """Return latest measured progress time plus a change-detection fingerprint."""
+
+    timestamps = [
+        _parse_timestamp_s(record.get("started_at")),
+        _parse_timestamp_s(record.get("updated_at")),
+        _parse_timestamp_s(status.get("updated_at")),
+    ]
+    fingerprints: list[tuple] = []
+    for key in ("stdout_path", "stderr_path", "status_path"):
+        raw = record.get(key)
+        if not isinstance(raw, str) or not raw:
+            fingerprints.append((key, None))
+            continue
+        path = Path(raw).expanduser()
+        try:
+            stat = path.stat()
+        except OSError:
+            fingerprints.append((key, str(path), None))
+            continue
+        timestamps.append(stat.st_mtime)
+        fingerprints.append((key, str(path), stat.st_mtime_ns, stat.st_size))
+    measured = [value for value in timestamps if value is not None]
+    return (max(measured) if measured else None), tuple(fingerprints)
+
+
+def _abandoned_output_evidence(record: dict) -> tuple[bool, str]:
+    raw = record.get("stdout_path")
+    if raw is None or raw == "":
+        return False, "output_path_absent"
+    if not isinstance(raw, str):
+        return False, "output_path_invalid"
+    path = Path(raw).expanduser()
+    try:
+        if not path.exists():
+            return True, "output_file_absent"
+        if not path.is_file():
+            return False, "output_not_regular_file"
+        with path.open("rb") as stream:
+            stream.read(1)
+    except FileNotFoundError:
+        return True, "output_file_absent"
+    except OSError as exc:
+        return False, f"output_unreadable:{type(exc).__name__}"
+    return True, "output_readable"
+
+
+def _abandoned_changed_progress_keys(before: tuple, after: tuple) -> set[str]:
+    before_by_key = {str(item[0]): item[1:] for item in before if item}
+    after_by_key = {str(item[0]): item[1:] for item in after if item}
+    return {
+        key
+        for key in before_by_key.keys() | after_by_key.keys()
+        if before_by_key.get(key) != after_by_key.get(key)
+    }
+
+
+def _abandoned_process_evidence(record: dict, status: dict) -> tuple[bool, str]:
+    """Prove every locally recorded worker/claimant identity inactive.
+
+    ``True`` means no recorded process can still own the dispatch. Identity
+    provider errors and weak/unknown identities fail closed.
+    """
+
+    if status.get("worker_alive") is True:
+        return False, "status_worker_alive:true"
+    if "worker_alive" in status and status.get("worker_alive") not in {True, False, None}:
+        return False, "status_worker_alive:indeterminate"
+
+    probes: list[tuple[str, object, object]] = [
+        (
+            "worker",
+            record.get("worker_pid"),
+            record.get("worker_identity"),
+        ),
+        (
+            "status_worker",
+            status.get("worker_pid"),
+            status.get("expected_worker_identity") or status.get("worker_identity"),
+        ),
+        (
+            "claimant",
+            record.get("claimant_pid"),
+            record.get("claimant_identity"),
+        ),
+    ]
+    descendants = record.get("producer_descendants")
+    if descendants is not None:
+        if not isinstance(descendants, list):
+            return False, "producer_descendants:invalid"
+        for index, descendant in enumerate(descendants):
+            if not isinstance(descendant, dict):
+                return False, f"producer_descendant_{index}:invalid"
+            probes.append(
+                (
+                    f"producer_descendant_{index}",
+                    descendant.get("pid"),
+                    descendant.get("identity"),
+                )
+            )
+
+    evidence: list[str] = []
+    for label, pid_value, identity in probes:
+        if pid_value is None or pid_value == "":
+            continue
+        if isinstance(pid_value, bool):
+            return False, f"{label}:invalid_pid"
+        try:
+            pid = int(pid_value)
+        except (TypeError, ValueError):
+            return False, f"{label}:invalid_pid"
+        if pid <= 0:
+            return False, f"{label}:invalid_pid"
+        state, reason = _queue_claim_identity_status(pid, identity)
+        evidence.append(f"{label}:{state}:{reason}")
+        if state in {"live", "indeterminate"}:
+            return False, ",".join(evidence)
+
+    producer_contract_fields = (
+        "worker_pgid",
+        "worker_group_leader_identity",
+        "producer_group_contract",
+        "producer_group_contract_enforced",
+    )
+    if any(record.get(key) for key in producer_contract_fields):
+        producer_entry = _entry_with_record_identity({}, record, prefer_record=True)
+        producer_set = enumerate_token_producers(producer_entry)
+        evidence.append(f"producer_set:{producer_set.state.value}:{producer_set.reason}")
+        if producer_set.state not in {ProducerSetState.DEAD, ProducerSetState.PID_REUSED}:
+            return False, ",".join(evidence)
+    if not evidence:
+        return True, "no_recorded_pid"
+    return True, ",".join(evidence)
+
+
+def _abandoned_lease_evidence(record: dict, capacity_state: dict) -> tuple[bool, str]:
+    leases = capacity_state.get("leases")
+    if not isinstance(leases, dict):
+        return False, "lease_map_indeterminate"
+    dispatch_id = str(record.get("dispatch_id") or "")
+    recorded_ids = {
+        str(value)
+        for value in (record.get("lease_id"), record.get("remote_lease_id"))
+        if value
+    }
+    matching: list[dict] = []
+    for lease_id, lease in leases.items():
+        key_matches = str(lease_id) in recorded_ids
+        if not isinstance(lease, dict):
+            if key_matches:
+                return False, "matching_lease_malformed"
+            continue
+        if (
+            key_matches
+            or str(lease.get("lease_id") or "") in recorded_ids
+            or str(lease.get("dispatch_id") or "") == dispatch_id
+        ):
+            matching.append(lease)
+    if not matching:
+        return True, "lease_absent"
+    states = [str(lease.get("state") or "") for lease in matching]
+    if all(state in goalflight_capacity.TERMINAL_LEASE_STATES for state in states):
+        return True, "lease_terminal:" + ",".join(sorted(states))
+    return False, "lease_nonterminal:" + ",".join(sorted(states))
+
+
+def _abandoned_controller_evidence(record: dict) -> tuple[bool, str]:
+    session_id = record.get("controller_session_id")
+    controller_pid = record.get("controller_pid")
+    controller_label = record.get("controller_label")
+    if not controller_label and (not session_id or controller_pid is None):
+        return True, "controller_unowned"
+    project_root = record.get("project_root")
+    if not isinstance(project_root, str) or not project_root:
+        return False, "controller_owner_project_indeterminate"
+    try:
+        live = goalflight_session_status.live_session(
+            Path(project_root).expanduser(),
+            label=str(controller_label) if controller_label else None,
+        )
+    except Exception as exc:
+        return False, f"controller_beacon_error:{type(exc).__name__}"
+    if not isinstance(live, dict):
+        return True, "controller_beacon_absent"
+    if live.get("conflicting_beacons"):
+        return False, "controller_beacon_conflict"
+    if controller_label:
+        if str(live.get("label") or "") == str(controller_label):
+            return False, "live_controller_label_owner"
+        return False, "controller_label_identity_indeterminate"
+    try:
+        live_pid = int(live.get("pid"))
+        recorded_pid = int(controller_pid)
+    except (TypeError, ValueError):
+        return False, "controller_beacon_identity_indeterminate"
+    if str(live.get("id") or "") == str(session_id) and live_pid == recorded_pid:
+        return False, "live_controller_owner"
+    return True, "recorded_controller_beacon_absent"
+
+
+def _evaluate_abandoned_dispatch(
+    record: dict,
+    *,
+    queue_dir: Path,
+    capacity_state: dict,
+    now_s: float,
+    stale_s: float,
+) -> dict:
+    dispatch_id = str(record.get("dispatch_id") or "")
+    result = {"dispatch_id": dispatch_id, "state": record.get("state")}
+    if not dispatch_id:
+        return {**result, "eligible": False, "reason": "missing_dispatch_id"}
+    if _dispatch_record_is_terminal(record):
+        return {**result, "eligible": False, "reason": "already_terminal"}
+    if not goalflight_dispatch_states.is_running_state(record.get("state")):
+        return {**result, "eligible": False, "reason": "not_running_state"}
+    if record.get("transport") != "dispatch":
+        return {**result, "eligible": False, "reason": "nonlocal_transport"}
+    hostname = record.get("hostname")
+    if not isinstance(hostname, str) or hostname != socket.gethostname():
+        return {**result, "eligible": False, "reason": "nonlocal_or_unknown_host"}
+    if _claim_has_active_carrier(queue_dir, dispatch_id):
+        return {**result, "eligible": False, "reason": "active_queue_carrier"}
+
+    status, status_evidence = _abandoned_status_payload(record)
+    if status is None:
+        return {
+            **result,
+            "eligible": False,
+            "reason": "status_indeterminate",
+            "status_evidence": status_evidence,
+        }
+    output_readable, output_evidence = _abandoned_output_evidence(record)
+    if not output_readable:
+        return {
+            **result,
+            "eligible": False,
+            "reason": "output_indeterminate",
+            "output_evidence": output_evidence,
+        }
+    process_inactive, process_evidence = _abandoned_process_evidence(record, status)
+    if not process_inactive:
+        return {
+            **result,
+            "eligible": False,
+            "reason": "worker_live_or_indeterminate",
+            "process_evidence": process_evidence,
+        }
+    lease_inactive, lease_evidence = _abandoned_lease_evidence(record, capacity_state)
+    if not lease_inactive:
+        return {
+            **result,
+            "eligible": False,
+            "reason": "lease_live_or_indeterminate",
+            "lease_evidence": lease_evidence,
+        }
+    controller_inactive, controller_evidence = _abandoned_controller_evidence(record)
+    if not controller_inactive:
+        return {
+            **result,
+            "eligible": False,
+            "reason": "controller_live_or_indeterminate",
+            "controller_evidence": controller_evidence,
+        }
+    latest_progress_s, progress_fingerprint = _abandoned_progress_snapshot(record, status)
+    if latest_progress_s is None:
+        return {**result, "eligible": False, "reason": "progress_time_indeterminate"}
+    progress_age_s = now_s - latest_progress_s
+    if progress_age_s < stale_s:
+        return {
+            **result,
+            "eligible": False,
+            "reason": "recent_progress",
+            "progress_age_s": round(progress_age_s, 3),
+        }
+    return {
+        **result,
+        "eligible": True,
+        "reason": "worker_provably_gone",
+        "process_evidence": process_evidence,
+        "status_evidence": status_evidence,
+        "output_evidence": output_evidence,
+        "lease_evidence": lease_evidence,
+        "controller_evidence": controller_evidence,
+        "progress_age_s": round(progress_age_s, 3),
+        "progress_fingerprint": progress_fingerprint,
+    }
+
+
+def _abandoned_terminal_outcome(record: dict) -> tuple[str, object, dict | None]:
+    dispatch_id = str(record.get("dispatch_id") or "")
+    tail = Path(str(record.get("stdout_path") or _dispatch_base_dir() / f"{dispatch_id}.tail"))
+    prompt = record.get("prompt_path")
+    state, reason, marker = _resolve_claim_terminal_outcome(
+        record,
+        reason="abandoned_without_verdict",
+        tail=tail,
+        ignore_prefix_lines=_ignore_prefix_lines(str(Path(prompt).expanduser()) if prompt else None),
+        agent=str(record.get("agent") or "unknown"),
+    )
+    if marker is None:
+        return "inconclusive_no_final", "abandoned_without_verdict", None
+    return state, reason, marker
+
+
+def _commit_abandoned_dispatch(
+    record: dict,
+    *,
+    evaluation: dict,
+    state: str,
+    reason: object,
+    marker: dict | None,
+) -> None:
+    terminal_state = goalflight_ledger.terminal_state_for(state, reason)
+    if terminal_state in {"", "unknown", "watcher_stopped"}:
+        raise ValueError(f"abandoned reconciliation produced non-terminal state: {state}")
+    ended_at = goalflight_ledger.utc_now()
+    basis = "observed_terminal_marker" if marker is not None else "inferred_abandonment"
+    reconciliation = {
+        "source": "goalflight_dispatch.drain",
+        "basis": basis,
+        "reason": evaluation.get("reason"),
+        "process_evidence": evaluation.get("process_evidence"),
+        "status_evidence": evaluation.get("status_evidence"),
+        "output_evidence": evaluation.get("output_evidence"),
+        "lease_evidence": evaluation.get("lease_evidence"),
+        "controller_evidence": evaluation.get("controller_evidence"),
+        "progress_age_s": evaluation.get("progress_age_s"),
+        "checked_output": True,
+        "observed_outcome": marker is not None,
+    }
+    if marker is not None:
+        reconciliation["terminal_marker_kind"] = marker.get("kind")
+        record["terminal_marker"] = marker
+    record.update(
+        {
+            "state": state,
+            "ended_at": ended_at,
+            "terminal_state": terminal_state,
+            "liveness_state": goalflight_terminal.terminal_liveness_state(state),
+            "worker_still_alive": False,
+            "reason": reason,
+            "outcome": {
+                "terminal_state": terminal_state,
+                "reason": reason,
+                "reconciliation": reconciliation,
+            },
+        }
+    )
+    record.pop("error", None)
+    elapsed_s = goalflight_ledger.elapsed_seconds(record, ended_at)
+    if elapsed_s is not None:
+        record["elapsed_s"] = elapsed_s
+    goalflight_ledger.write_record(record)
+
+
+def _abandoned_status_entry(record: dict) -> dict:
+    return {
+        **record,
+        "request": {
+            "cwd": record.get("project_root"),
+            "prompt_file": record.get("prompt_path"),
+            "tail": record.get("stdout_path"),
+            "status_json": record.get("status_path"),
+        },
+    }
+
+
+def reconcile_abandoned_dispatches(
+    *,
+    queue_dir: Path | None = None,
+    dry_run: bool = False,
+    stale_s: float = ABANDONED_RECONCILE_STALE_S,
+    now: dt.datetime | None = None,
+) -> dict:
+    """Close only local running records whose worker is provably gone."""
+
+    resolved_queue_dir = (queue_dir or _dispatch_queue_dir()).expanduser()
+    current = now or dt.datetime.now(dt.timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=dt.timezone.utc)
+    now_s = current.timestamp()
+    initial_records = goalflight_ledger.read_records()
+    with goalflight_capacity.StateLock():
+        initial_capacity = _read_capacity_state_for_reconciliation()
+
+    entries: list[dict] = []
+    changed_projects: set[Path] = set()
+    for initial in initial_records:
+        initial_evaluation = _evaluate_abandoned_dispatch(
+            initial,
+            queue_dir=resolved_queue_dir,
+            capacity_state=initial_capacity,
+            now_s=now_s,
+            stale_s=stale_s,
+        )
+        if not initial_evaluation.get("eligible"):
+            if initial_evaluation.get("reason") != "already_terminal":
+                entries.append(initial_evaluation)
+            continue
+
+        queue_lock = try_acquire_queue_lock(
+            resolved_queue_dir,
+            deadline_s=time.monotonic() + RECONCILE_DOWNSTREAM_LOCK_BUDGET_S,
+        )
+        if queue_lock is None:
+            entries.append({**initial_evaluation, "eligible": False, "reason": "queue_lock_busy"})
+            continue
+        committed_record: dict | None = None
+        final_evaluation: dict | None = None
+        state: str | None = None
+        reason: object = None
+        marker: dict | None = None
+        try:
+            with goalflight_capacity.StateLock():
+                fresh_capacity = _read_capacity_state_for_reconciliation()
+                ledger_lock = try_acquire_ledger_lock(
+                    deadline_s=time.monotonic() + RECONCILE_DOWNSTREAM_LOCK_BUDGET_S
+                )
+                if ledger_lock is None:
+                    entries.append({**initial_evaluation, "eligible": False, "reason": "ledger_lock_busy"})
+                    continue
+                try:
+                    fresh = _find_dispatch_record(str(initial.get("dispatch_id") or ""))
+                    if not isinstance(fresh, dict):
+                        entries.append({**initial_evaluation, "eligible": False, "reason": "record_disappeared"})
+                        continue
+                    final_evaluation = _evaluate_abandoned_dispatch(
+                        fresh,
+                        queue_dir=resolved_queue_dir,
+                        capacity_state=fresh_capacity,
+                        now_s=now_s,
+                        stale_s=stale_s,
+                    )
+                    if not final_evaluation.get("eligible"):
+                        entries.append(final_evaluation)
+                        continue
+                    if final_evaluation.get("progress_fingerprint") != initial_evaluation.get("progress_fingerprint"):
+                        entries.append({**final_evaluation, "eligible": False, "reason": "progress_changed_before_close"})
+                        continue
+                    state, reason, marker = _abandoned_terminal_outcome(fresh)
+                    post_status, post_status_evidence = _abandoned_status_payload(fresh)
+                    if post_status is None:
+                        entries.append(
+                            {
+                                **final_evaluation,
+                                "eligible": False,
+                                "reason": "status_changed_before_close",
+                                "status_evidence": post_status_evidence,
+                            }
+                        )
+                        continue
+                    _post_progress_s, post_fingerprint = _abandoned_progress_snapshot(
+                        fresh, post_status
+                    )
+                    changed_keys = _abandoned_changed_progress_keys(
+                        final_evaluation.get("progress_fingerprint", ()),
+                        post_fingerprint,
+                    )
+                    if changed_keys:
+                        # A terminal marker can land in the tail between the
+                        # final liveness evaluation and the outcome scan.  It
+                        # is observed evidence, so accept it only after a
+                        # second scan proves that the tail then stayed stable.
+                        if changed_keys != {"stdout_path"} or marker is None:
+                            entries.append(
+                                {
+                                    **final_evaluation,
+                                    "eligible": False,
+                                    "reason": "progress_changed_before_close",
+                                    "changed_progress_keys": sorted(changed_keys),
+                                }
+                            )
+                            continue
+                        state, reason, marker = _abandoned_terminal_outcome(fresh)
+                        _stable_progress_s, stable_fingerprint = (
+                            _abandoned_progress_snapshot(fresh, post_status)
+                        )
+                        if stable_fingerprint != post_fingerprint or marker is None:
+                            entries.append(
+                                {
+                                    **final_evaluation,
+                                    "eligible": False,
+                                    "reason": "progress_changed_before_close",
+                                    "changed_progress_keys": ["stdout_path"],
+                                }
+                            )
+                            continue
+                    if not dry_run:
+                        if state is None:
+                            raise ValueError("abandoned reconciliation outcome missing")
+                        _commit_abandoned_dispatch(
+                            fresh,
+                            evaluation=final_evaluation,
+                            state=state,
+                            reason=reason,
+                            marker=marker,
+                        )
+                        committed_record = fresh
+                finally:
+                    ledger_lock.release()
+        finally:
+            queue_lock.release()
+
+        if final_evaluation is None:
+            continue
+        if state is None:
+            continue
+        action = "would_close" if dry_run else "closed"
+        entries.append(
+            {
+                **final_evaluation,
+                "action": action,
+                "closed_state": state,
+                "closure_basis": (
+                    "observed_terminal_marker" if marker is not None else "inferred_abandonment"
+                ),
+            }
+        )
+        if committed_record is not None:
+            _write_reconciled_terminal_status(_abandoned_status_entry(committed_record), marker)
+            project_root = committed_record.get("project_root")
+            if isinstance(project_root, str) and project_root:
+                changed_projects.add(Path(project_root).expanduser())
+
+    for project_root in changed_projects:
+        _export_dashboard_status_for_project(project_root)
+    closed = [entry for entry in entries if entry.get("action") == "closed"]
+    would_close = [entry for entry in entries if entry.get("action") == "would_close"]
+    kept_reasons: dict[str, int] = {}
+    for entry in entries:
+        if entry.get("action"):
+            continue
+        key = str(entry.get("reason") or "unknown")
+        kept_reasons[key] = kept_reasons.get(key, 0) + 1
+    return {
+        "schema": ABANDONED_RECONCILIATION_SCHEMA,
+        "mode": "dry-run" if dry_run else "automatic",
+        "stale_seconds": stale_s,
+        "scanned": len(initial_records),
+        "closed": len(closed),
+        "would_close": len(would_close),
+        "kept": len(entries) - len(closed) - len(would_close),
+        "kept_reasons": kept_reasons,
+        "entries": entries,
+    }
+
+
+def _reconcile_abandoned_for_drain(queue_dir: Path) -> dict:
+    try:
+        return reconcile_abandoned_dispatches(queue_dir=queue_dir)
+    except Exception as exc:
+        return {
+            "schema": ABANDONED_RECONCILIATION_SCHEMA,
+            "mode": "automatic",
+            "closed": 0,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+
+def _cmd_reconcile_abandoned(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        description="Dry-run abandoned dispatch reconciliation; never changes ledger records."
+    )
+    parser.add_argument("--queue-dir")
+    parser.add_argument("--stale-s", type=float, default=ABANDONED_RECONCILE_STALE_S)
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+    payload = reconcile_abandoned_dispatches(
+        queue_dir=Path(args.queue_dir).expanduser() if args.queue_dir else None,
+        dry_run=True,
+        stale_s=args.stale_s,
+    )
+    if args.json:
+        print(json.dumps(payload, sort_keys=True))
+    else:
+        print(
+            "RECONCILE-ABANDONED "
+            + json.dumps(
+                {
+                    "would_close": payload["would_close"],
+                    "kept": payload["kept"],
+                    "scanned": payload["scanned"],
+                },
+                sort_keys=True,
+            )
+        )
+    return 0
 
 
 def _reap_quota_stuck_before_bash_launch() -> None:
@@ -5204,6 +6020,8 @@ def _restore_claim_if_incomplete(
     claim: Path,
     entry: dict,
     queue_dir: Path,
+    *,
+    stale_s: float = QUEUE_CLAIM_STALE_S,
 ) -> tuple[Path | None, dict | None]:
     """Normal-drain restore through the same held T→Q→S→L transaction."""
     try:
@@ -5217,10 +6035,10 @@ def _restore_claim_if_incomplete(
         queue_dir=queue_dir,
         stale_s=0.0,
         need_queue=True,
-        need_task_store=_is_task_linked(
-            observed,
-            _find_dispatch_record(str(observed.get("dispatch_id") or "")),
-        ),
+        # Freeze a task link that may be landing even when the first read is
+        # unlinked. Quarantine decisions later in this transaction depend on
+        # absence of linkage, so absence needs the same S lock as presence.
+        need_task_store=True,
         need_ledger=True,
     )
     if txn is None:
@@ -5246,8 +6064,15 @@ def _restore_claim_if_incomplete(
         if decision is not None:
             if _completion_decision_is_deferred(decision):
                 return None, None
-            if not _is_task_linked(fresh, _find_dispatch_record(str(fresh.get("dispatch_id") or ""))):
-                if _quarantine_claim(claim, fresh, reason="normal_restore_completion_unlinked"):
+            record = _find_dispatch_record(str(fresh.get("dispatch_id") or ""))
+            if not _is_task_linked(fresh, record):
+                if _quarantine_unlinked_claim_if_observed_orphan(
+                    claim,
+                    fresh,
+                    record,
+                    reason="normal_restore_completion_unlinked",
+                    stale_s=stale_s,
+                ):
                     return None, {**decision, "_committed": True, "state": "quarantined"}
                 return None, None
             result, _marker = _commit_claim_terminal_in_txn(
@@ -5369,6 +6194,7 @@ def _positive_live_carrier_cleanup(
     queue_dir: Path,
     *,
     worker_record_sufficient: bool = False,
+    stale_s: float = QUEUE_CLAIM_STALE_S,
 ) -> str:
     """Narrow positive-accounting exception: Q-only redundant-carrier cleanup
     after revalidation. A carrier is clearable only when its dispatch is
@@ -5439,12 +6265,21 @@ def _positive_live_carrier_cleanup(
             or _fleet_terminal_accounted_record(_find_dispatch_record(dispatch_id), token)
         ):
             return "pending"
-        if not _is_task_linked(fresh, _find_dispatch_record(dispatch_id)):
-            return "quarantined" if _quarantine_claim(
-                claim,
-                fresh,
-                reason="live_worker_unlinked_claim_carrier",
-            ) else "pending"
+        record = _find_dispatch_record(dispatch_id)
+        if not _is_task_linked(fresh, record):
+            # Missing task linkage is not orphan evidence. When the exact
+            # token-matched ledger worker is identity-live and non-terminal,
+            # the claim is only a redundant launch carrier; clearing it cannot
+            # replay or stop the worker. Any weaker accounting stays pending.
+            if not (
+                _dispatch_record_has_live_nonterminal_worker(record)
+                or (
+                    worker_record_sufficient
+                    and record is not None
+                    and not _dispatch_record_is_terminal(record)
+                )
+            ):
+                return "pending"
         claim.unlink()
         return "cleared"
     except OSError:
@@ -5463,7 +6298,7 @@ def _reconcile_claim_transaction(
 ) -> str:
     admission = classify_reconciliation_admission(entry, time.time(), stale_s=stale_s)
     if admission is PreAdmitClass.LIVE:
-        return _positive_live_carrier_cleanup(claim, entry, queue_dir)
+        return _positive_live_carrier_cleanup(claim, entry, queue_dir, stale_s=stale_s)
     if admission is PreAdmitClass.INDETERMINATE:
         _alert_identity_indeterminate(
             str(entry.get("dispatch_id") or claim.name),
@@ -5479,7 +6314,7 @@ def _reconcile_claim_transaction(
             # tombstone — clear it under the same revalidation as the LIVE
             # case. Unaccounted carriers return "pending" here, which is
             # exactly DEFER_UNCHANGED.
-            return _positive_live_carrier_cleanup(claim, entry, queue_dir)
+            return _positive_live_carrier_cleanup(claim, entry, queue_dir, stale_s=stale_s)
         return "pending"
 
     record = _find_dispatch_record(str(entry.get("dispatch_id") or ""))
@@ -5489,8 +6324,13 @@ def _reconcile_claim_transaction(
         queue_dir=queue_dir,
         stale_s=stale_s,
         need_queue=True,
-        need_task_store=linked,
-        need_ledger=linked or record is not None,
+        # A task link can land after claim creation. Hold S even while the
+        # record is currently unlinked so a destructive orphan decision cannot
+        # race the task-link transaction.
+        need_task_store=True,
+        # Absence of a ledger row is also evidence. Freeze both presence and
+        # absence before any unlinked quarantine decision.
+        need_ledger=True,
         admission=admission,
     )
     if txn is None:
@@ -5509,7 +6349,12 @@ def _reconcile_claim_transaction(
         record = _find_dispatch_record(str(fresh.get("dispatch_id") or ""))
         linked = _is_task_linked(fresh, record)
         carrier_stamp = str(fresh.get("orphan_first_seen_at") or "") or None
-        if carrier_stamp and record is not None and not record.get("orphan_first_seen_at"):
+        if (
+            carrier_stamp
+            and record is not None
+            and not _dispatch_record_is_terminal(record)
+            and not record.get("orphan_first_seen_at")
+        ):
             if _stamp_ledger_orphan_first_seen(record, txn=txn, stamp=carrier_stamp) is None:
                 return "pending"
             record = _find_dispatch_record(str(fresh.get("dispatch_id") or ""))
@@ -5533,10 +6378,12 @@ def _reconcile_claim_transaction(
             return "pending"
         if record is not None and _dispatch_record_is_terminal(record):
             if not linked:
-                return "quarantined" if _quarantine_claim(
+                return "quarantined" if _quarantine_unlinked_claim_if_observed_orphan(
                     claim,
                     fresh,
+                    record,
                     reason=f"{reason}_unlinked_terminal",
+                    stale_s=stale_s,
                 ) else "pending"
             try:
                 claim.unlink()
@@ -5564,10 +6411,13 @@ def _reconcile_claim_transaction(
                 return "pending"
             terminal_mirror = (fresh, _marker)
             if not linked:
-                return "quarantined" if _quarantine_claim(
+                record = _find_dispatch_record(str(fresh.get("dispatch_id") or ""))
+                return "quarantined" if _quarantine_unlinked_claim_if_observed_orphan(
                     claim,
                     fresh,
+                    record,
                     reason=f"{reason}_unlinked_completion",
+                    stale_s=stale_s,
                 ) else "pending"
             try:
                 claim.unlink()
@@ -5576,7 +6426,13 @@ def _reconcile_claim_transaction(
             return "cleared"
 
         if not linked:
-            return "quarantined" if _quarantine_claim(claim, fresh, reason=f"{reason}_unlinked") else "pending"
+            return "quarantined" if _quarantine_unlinked_claim_if_observed_orphan(
+                claim,
+                fresh,
+                record,
+                reason=f"{reason}_unlinked",
+                stale_s=stale_s,
+            ) else "pending"
 
         target = queue_dir / claim.name.split(".claimed-", 1)[0]
         pre_spawn = _entry_pre_spawn(fresh)
@@ -7100,6 +7956,12 @@ def _drain_queue_once(args) -> dict:
     queue_dir = Path(args.queue_dir).expanduser() if args.queue_dir else _dispatch_queue_dir()
     queue_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     remote_node = _remote_drain_node(args)
+    abandoned_reconciliation = {
+        "schema": ABANDONED_RECONCILIATION_SCHEMA,
+        "mode": "skipped",
+        "closed": 0,
+        "reason": "remote_drain",
+    }
     if remote_node:
         _validate_remote_drain_node(args)
         if getattr(args, "remote_runner", None) is None:
@@ -7111,6 +7973,7 @@ def _drain_queue_once(args) -> dict:
                 raise _RemoteDrainBlocked(str(exc), code="live_ssh_required") from exc
     else:
         _release_stale_capacity_for_drain()
+        abandoned_reconciliation = _reconcile_abandoned_for_drain(queue_dir)
     recovery = _recover_claimed_queue_entries(queue_dir, stale_s=args.claim_stale_s)
     launched = 0
     left_queued = 0
@@ -7231,7 +8094,12 @@ def _drain_queue_once(args) -> dict:
                     timeout=timeout_s,
                 )
         except _RemoteDrainBlocked as exc:
-            restored, decision = _restore_claim_if_incomplete(claim, entry, queue_dir)
+            restored, decision = _restore_claim_if_incomplete(
+                claim,
+                entry,
+                queue_dir,
+                stale_s=args.claim_stale_s,
+            )
             if decision is not None:
                 details.append(
                     {
@@ -7294,6 +8162,7 @@ def _drain_queue_once(args) -> dict:
                 # record), so the carrier is redundant even if a fast worker
                 # already exited; reconcile terminalizes from the ledger.
                 worker_record_sufficient=True,
+                stale_s=args.claim_stale_s,
             )
             if carrier_cleanup == "pending":
                 # Launch is durably ledger-confirmed, but the carrier could
@@ -7315,7 +8184,12 @@ def _drain_queue_once(args) -> dict:
                 details.append({"dispatch_id": dispatch_id, "state": "launched"})
             continue
         if no_capacity:
-            restored, decision = _restore_claim_if_incomplete(claim, entry, queue_dir)
+            restored, decision = _restore_claim_if_incomplete(
+                claim,
+                entry,
+                queue_dir,
+                stale_s=args.claim_stale_s,
+            )
             if decision is not None:
                 details.append(
                     {
@@ -7349,6 +8223,7 @@ def _drain_queue_once(args) -> dict:
                 # record), so the carrier is redundant even if a fast worker
                 # already exited; reconcile terminalizes from the ledger.
                 worker_record_sufficient=True,
+                stale_s=args.claim_stale_s,
             )
             if carrier_cleanup == "pending":
                 # Same accounting contract as the stdout_launched branch: a
@@ -7385,6 +8260,7 @@ def _drain_queue_once(args) -> dict:
         "remaining": remaining,
         "pending_claims": pending_claims,
         "recovered_claims": recovery,
+        "abandoned_reconciliation": abandoned_reconciliation,
         "details": details,
     }
 
@@ -7568,6 +8444,7 @@ def _build_acp_cfg(args, *, status_json: Path, base: Path | None = None):
         request_envelope=_queue_request_envelope(args),
         controller_session_id=_controller_session_id(args),
         controller_pid=_controller_pid(args),
+        controller_label=_controller_label(args),
         cpu_epsilon=0.1,
         json=False,
     )
@@ -7609,6 +8486,7 @@ def _record_test_acp_running_fast(
         "project_root": str(project_root),
         "controller_pid": _controller_pid(args),
         "controller_session_id": _controller_session_id(args),
+        "controller_label": _controller_label(args),
         "controller_identity": None,
         "worker_pid": worker_pid,
         "worker_identity": None,
@@ -8117,6 +8995,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_steer(argv[1:])
     if argv and argv[0] == "resume":
         return _cmd_resume(argv[1:])
+    if argv and argv[0] == "reconcile-abandoned":
+        return _cmd_reconcile_abandoned(argv[1:])
     if argv and argv[0] == "drain":
         return _cmd_drain(argv[1:])
     if argv and argv[0] == "dashboard-refresh":
@@ -8252,6 +9132,16 @@ def main(argv: list[str] | None = None) -> int:
             "orphan guard are derived from the live project beacon."
         ),
     )
+    parser.add_argument(
+        "--controller-label",
+        "--session-label",
+        dest="controller_label",
+        help=(
+            "Controller-declared name used to select its live beacon. "
+            "Default: GOALFLIGHT_CONTROLLER_LABEL."
+        ),
+    )
+    parser.add_argument("--controller-beacon-pid", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--from-queue", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--queue-launch-token", help=argparse.SUPPRESS)
     parser.add_argument("--queue-claim-path", help=argparse.SUPPRESS)
@@ -8682,6 +9572,11 @@ def main(argv: list[str] | None = None) -> int:
                 codex_home=codex_dispatch_home,
                 request_envelope=request_envelope,
             )
+            if getattr(args, "parent_dispatch_id", None):
+                _mark_reconciled_parent_resumed(
+                    args.parent_dispatch_id,
+                    args.dispatch_id,
+                )
         except Exception as e:
             registration_errors.append(_registration_error("record_ledger_running", e))
 
@@ -8754,6 +9649,9 @@ def main(argv: list[str] | None = None) -> int:
                 "--controller-session-id",
                 controller_session_id,
             ]
+            controller_label = _controller_label(args)
+            if controller_label is not None:
+                watch_cmd += ["--controller-label", controller_label]
         if prompt_path:
             watch_cmd += ["--ignore-prompt-file", str(prompt_path)]
 

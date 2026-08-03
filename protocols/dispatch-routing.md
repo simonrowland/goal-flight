@@ -192,8 +192,25 @@ python3 <skill-root>/scripts/goalflight_dispatch.py --agent codex --prompt-file 
 ```
 
 The dispatcher prints `DISPATCH-LAUNCHED` with the dispatch id, status JSON,
-tail path, and worker PID, then returns immediately. Follow progress with
-`goalflight_status.py --dispatch <id>` or `goalflight_status.py --wait <id>`.
+tail path, and worker PID, then returns immediately. Keep one ownership-scoped
+mail listener open for the controller session:
+
+```bash
+python3 <skill-root>/scripts/goalflight_messages.py listen --project-root "$PWD"
+```
+
+The listener resolves the live session beacon by default (`--session-id <id>`
+pins an explicit session), stays silent until wakeable mail arrives, and
+re-discovers that session's dispatches on every poll. This covers workers
+launched after the listener starts without re-arming. It wakes for owned worker
+terminal/result or escalation envelopes and controller-addressed mail. Foreign
+or unowned workers, status/monitor traffic, quota advisories, and recurring
+task-store status nudges do not wake it; task-store nudges remain in the unread
+count shown by normal status/mail reads.
+
+Use `goalflight_status.py --dispatch <id>` for a snapshot, or
+`goalflight_status.py --wait <id>` only when a fixed-set terminal join and its
+timeout verdict are specifically needed.
 
 Prefer `--prompt-file` over inline `--prompt` for anything beyond a short
 one-shot, and always when prompt text exceeds ~2KB: workers compact too — an

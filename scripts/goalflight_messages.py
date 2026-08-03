@@ -60,6 +60,8 @@ CONTROLLER_CHANNEL_TYPES = frozenset(
         "notice",
     }
 )
+CONTROLLER_LISTENER_ESCALATION_TYPES = frozenset({"user_need", "user_confirm", "blocked"})
+TASK_STORE_STATUS_NUDGE_KINDS = frozenset({"parallel-ready", "resume-ready", "done-suggest"})
 NON_ERROR_UNDELIVERED_STATUSES = frozenset({"terminal_recorded_only", "worker_view_queued"})
 
 REQUIRED_ENVELOPE_FIELDS = (
@@ -1208,6 +1210,123 @@ def _project_ledger_records(project_root: Path) -> list[dict]:
         return []
 
 
+def _resolve_listener_session_id(project_root: Path, explicit_session_id: str | None) -> str:
+    if explicit_session_id is not None:
+        session_id = str(explicit_session_id).strip()
+        if not session_id:
+            raise MessageError("--session-id must not be empty")
+        return session_id
+    try:
+        import goalflight_session_status  # type: ignore
+
+        session = goalflight_session_status.live_session(project_root)
+    except Exception as exc:
+        raise MessageError(f"cannot resolve live controller session: {exc}") from exc
+    if not session or not session.get("id"):
+        raise MessageError("no live controller session; claim one or pass --session-id")
+    if session.get("conflicting_beacons"):
+        raise MessageError("multiple live controller sessions; pass --session-id")
+    return str(session["id"])
+
+
+def _listener_event(
+    envelope: dict,
+    *,
+    owned_dispatch_ids: set[str],
+    addressed_dispatch_ids: set[str],
+    task_store_dispatch_id: str | None,
+) -> dict | None:
+    dispatch_id = str(envelope.get("dispatch_id") or "")
+    msg_type = str(envelope.get("type") or "")
+    payload = envelope.get("payload") or {}
+    if (
+        dispatch_id == task_store_dispatch_id
+        and msg_type == "user_need"
+        and str(payload.get("nudge_kind") or "") in TASK_STORE_STATUS_NUDGE_KINDS
+    ):
+        return None
+    if dispatch_id in owned_dispatch_ids:
+        wakes = msg_type == "result" or msg_type in CONTROLLER_LISTENER_ESCALATION_TYPES
+        wakes = wakes or msg_type in CONTROLLER_CHANNEL_TYPES
+    else:
+        wakes = (
+            dispatch_id in addressed_dispatch_ids or dispatch_id == task_store_dispatch_id
+        ) and (
+            msg_type in CONTROLLER_LISTENER_ESCALATION_TYPES
+            or msg_type in CONTROLLER_CHANNEL_TYPES
+        )
+    if not wakes:
+        return None
+    return {
+        "dispatch_id": dispatch_id,
+        "type": msg_type,
+        "seq": envelope.get("seq"),
+        "ts": envelope.get("ts"),
+        "text": sanitize_display(payload.get("text") or "", limit=120),
+    }
+
+
+def controller_listener_watermark(
+    *,
+    controller_session_id: str,
+    project_root: Path,
+    messages_dir: Path | None = None,
+    fleet_dir: Path | None = None,
+) -> dict[tuple[str, object], dict]:
+    """Wakeable mail for one controller session, discovered from live ownership.
+
+    Ledger ownership is recomputed on every call. A dispatch created after the
+    listener's baseline therefore enters the next snapshot as soon as its record
+    carries this session id; its first wakeable envelope cannot be hidden by the
+    startup watermark.
+    """
+    resolved_messages_dir = messages_dir or default_messages_dir()
+    resolved_fleet_dir = fleet_dir if fleet_dir is not None else default_fleet_dir()
+    records = _project_ledger_records(project_root)
+    known_dispatch_ids = {
+        str(record["dispatch_id"])
+        for record in records
+        if record.get("dispatch_id")
+    }
+    owned_dispatch_ids = {
+        str(record["dispatch_id"])
+        for record in records
+        if record.get("dispatch_id")
+        and str(record.get("controller_session_id") or "") == controller_session_id
+    }
+    canonical_project_root = _canonical_project_root(project_root)
+    addressed_dispatch_ids = _project_addressed_dispatch_ids(
+        project_root,
+        messages_dir=resolved_messages_dir,
+        fleet_dir=resolved_fleet_dir,
+        canonical_project_root=canonical_project_root,
+    ) - known_dispatch_ids
+    task_store_dispatch_id = _task_store_dispatch_id(
+        project_root,
+        canonical_project_root=canonical_project_root,
+    )
+    candidate_dispatch_ids = owned_dispatch_ids | addressed_dispatch_ids
+    if task_store_dispatch_id:
+        candidate_dispatch_ids.add(task_store_dispatch_id)
+
+    events: dict[tuple[str, object], dict] = {}
+    for path in collect_inbox_paths(
+        resolved_messages_dir,
+        resolved_fleet_dir,
+        dispatch_ids=candidate_dispatch_ids,
+    ):
+        for envelope in read_envelopes(path):
+            event = _listener_event(
+                envelope,
+                owned_dispatch_ids=owned_dispatch_ids,
+                addressed_dispatch_ids=addressed_dispatch_ids,
+                task_store_dispatch_id=task_store_dispatch_id,
+            )
+            if event is not None:
+                events[(event["dispatch_id"], event["seq"])] = event
+    return events
+
+
 def _project_dispatch_ids(project_root: Path) -> set[str]:
     return {
         str(record["dispatch_id"])
@@ -1894,7 +2013,7 @@ def merge_remote_register(
 
 
 def cmd_listen(args) -> int:
-    """Block silently until new mail arrives for this project, then report.
+    """Block silently until new wakeable mail arrives for this controller.
 
     The point is the SILENCE. A controller told to background a long-poll is
     asleep by design; a listener that chatters costs it context for nothing, and
@@ -1908,6 +2027,12 @@ def cmd_listen(args) -> int:
     `relay --new` to read what is already there; use this to be told about what
     is not there yet.
 
+    Ownership is an exact controller-session match and is re-read every poll, so
+    late dispatches join without re-arming. Owned terminal/result and escalation
+    envelopes wake, as does project-addressed controller mail. Unowned or
+    other-session workers, status/monitor traffic, quota advisories, and recurring
+    task-store status nudges do not. The nudges remain in the normal unread count.
+
     Exits 0 when mail arrives, 1 on timeout. Fail-open: if the mailbox cannot be
     read at all, say so on stderr and exit 2 rather than blocking forever on a
     channel that will never deliver.
@@ -1920,23 +2045,25 @@ def cmd_listen(args) -> int:
     if args.timeout_s and float(args.timeout_s) > 0:
         deadline = time.monotonic() + float(args.timeout_s)
 
+    try:
+        controller_session_id = _resolve_listener_session_id(project_root, args.session_id)
+    except MessageError as exc:
+        print(f"listen: {exc}", file=sys.stderr)
+        return 2
+
     def watermark():
         """(inbox, seq) pairs, not a count: acking lowers a count, so a count
         would read an ack as 'nothing new' and then miss the next arrival that
         merely restored the old number. Pairs only ever add."""
         try:
-            summary = controller_mail_summary(
-                owned_dispatch_ids=None,
-                task_store_project_root=project_root,
+            return controller_listener_watermark(
+                controller_session_id=controller_session_id,
+                project_root=project_root,
                 messages_dir=messages_dir,
                 fleet_dir=fleet_dir,
             )
         except Exception as exc:  # noqa: BLE001 - reported, not swallowed
             raise RuntimeError(str(exc)) from exc
-        return {
-            (str(item.get("dispatch_id")), item.get("seq")): item
-            for item in (summary.get("needs") or [])
-        }
 
     try:
         baseline = watermark()
@@ -2078,6 +2205,11 @@ def main(argv: list[str] | None = None) -> int:
         help="block SILENTLY until new mail arrives, then print it and exit",
     )
     listen.add_argument("--project-root", default=None)
+    listen.add_argument(
+        "--session-id",
+        default=None,
+        help="controller session id; default: the project's live session beacon",
+    )
     listen.add_argument("--poll-secs", type=float, default=5.0)
     listen.add_argument("--timeout-s", type=float, default=0.0,
                         help="0 = wait indefinitely")
