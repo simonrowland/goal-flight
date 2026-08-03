@@ -57,3 +57,10 @@ docs-private/
 scripts/ext
 tests/python/ext
 .gstack/
+
+# Fleet-console data, written by the drainer next to the template it feeds.
+# It is a snapshot of a live fleet: absolute project paths, dispatch prompts
+# and per-worker state. The renderer is the artifact; the sample is not, and
+# committing one both leaks the operator's tree and makes every tick a diff.
+templates/fleet-console/fleet-data.js
+templates/fleet-console/attention-data.js

@@ -35,7 +35,7 @@ import goalflight_task
 import goalflight_usage
 
 
-FLEET_SCHEMA = "goalflight.fleet-console.fleet.v1"
+FLEET_SCHEMA = "goalflight.fleet-console.fleet.v2"
 ATTENTION_SCHEMA = "goalflight.fleet-console.attention.v1"
 PRODUCER_NAME = "goalflight_fleet_console.py"
 SCRIPT_GLOBALS = {"fleet": "GF_FLEET", "attention": "GF_ATTENTION"}
@@ -115,7 +115,21 @@ FLEET_FIELD_ALLOWLIST: dict[str, Any] = {
             {
                 "dispatch_id": None,
                 "node_id": None,
+                "agent": None,
+                "engine": None,
+                "shape": None,
+                "transport": None,
+                "os_sandbox": None,
                 "state": None,
+                "classification": None,
+                "terminal_state": None,
+                "liveness_state": None,
+                "worker_alive": None,
+                "started_at": None,
+                "ended_at": None,
+                "display_state": None,
+                "is_terminal": None,
+                "classification_conflict": None,
                 "quarantine_reason": None,
                 "ssh_reachable": None,
                 "may_release": None,
@@ -151,6 +165,7 @@ FLEET_FIELD_ALLOWLIST: dict[str, Any] = {
             "workers": [
                 {
                     "dispatch_id": None,
+                    "node_id": None,
                     "agent": None,
                     "engine": None,
                     "shape": None,
@@ -163,6 +178,9 @@ FLEET_FIELD_ALLOWLIST: dict[str, Any] = {
                     "worker_alive": None,
                     "started_at": None,
                     "ended_at": None,
+                    "display_state": None,
+                    "is_terminal": None,
+                    "classification_conflict": None,
                 }
             ],
         }
@@ -170,6 +188,7 @@ FLEET_FIELD_ALLOWLIST: dict[str, Any] = {
     "unassigned_workers": [
         {
             "dispatch_id": None,
+            "node_id": None,
             "agent": None,
             "engine": None,
             "shape": None,
@@ -182,6 +201,9 @@ FLEET_FIELD_ALLOWLIST: dict[str, Any] = {
             "worker_alive": None,
             "started_at": None,
             "ended_at": None,
+            "display_state": None,
+            "is_terminal": None,
+            "classification_conflict": None,
         }
     ],
 }
@@ -216,6 +238,19 @@ _ABSOLUTE_PATH = re.compile(
     r"(^|[\s(\[{'\"])/(?!/)[^\s<>\"']+|(^|[\s(\[{'\"])[A-Za-z]:\\[^\s<>\"']+"
 )
 _ATTENTION_KINDS = frozenset({"user_need", "user_confirm", "blocked", "advisory"})
+_TIMESTAMP_FIELDS = frozenset(
+    {
+        "sample_started_at",
+        "sample_finished_at",
+        "last_success_at",
+        "last_seen",
+        "oldest_created_at",
+        "queue_last_touched",
+        "started_at",
+        "ended_at",
+        "observed_at",
+    }
+)
 
 
 class ProjectionSecurityError(ValueError):
@@ -261,12 +296,30 @@ def _validate_no_absolute_paths(value: Any, *, path: str = "$") -> None:
         raise ProjectionSecurityError(f"{path}: absolute path denied")
 
 
+def _validate_scalar_types(value: Any, *, path: str = "$") -> None:
+    """Reject scalar coercions that could turn malformed metadata into facts."""
+    if isinstance(value, dict):
+        for key, item in value.items():
+            item_path = f"{path}.{key}"
+            if key in _TIMESTAMP_FIELDS and item is not None:
+                if not isinstance(item, str) or not item.strip():
+                    raise ProjectionSecurityError(f"{item_path}: expected timestamp string or null")
+            if key == "generation_id":
+                if not isinstance(item, str) or not item:
+                    raise ProjectionSecurityError(f"{item_path}: expected non-empty string")
+            _validate_scalar_types(item, path=item_path)
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            _validate_scalar_types(item, path=f"{path}[{index}]")
+
+
 def validate_projection(payload: dict[str, Any], plane: str) -> None:
     """Validate the explicit field allowlist and path-denial policy."""
     schema = FIELD_ALLOWLISTS.get(plane)
     if schema is None:
         raise ProjectionSecurityError(f"unknown plane: {plane}")
     _validate_allowlist(payload, schema, path="$" )
+    _validate_scalar_types(payload)
     _validate_no_absolute_paths(payload)
 
 
@@ -356,12 +409,80 @@ def _canonical_root(value: object) -> str | None:
     return str(Path(value).expanduser().resolve(strict=False))
 
 
-def _worker_row(record: dict[str, Any]) -> dict[str, Any]:
-    # No state derivation here: all state/liveness values are copied from the
-    # one reconciled goalflight_status sample.
+def _worker_display_verdict(record: dict[str, Any]) -> dict[str, Any]:
+    """Resolve one presentation verdict from the reconciled authority fields."""
+    state_values = [record.get(key) for key in ("state", "terminal_state", "classification")]
+    terminal_values = [
+        value for value in state_values if goalflight_dispatch_states.is_terminal_state(value)
+    ]
+    terminal_states = {
+        goalflight_dispatch_states.normalize_dispatch_state(value) for value in terminal_values
+    }
+    attention = any(goalflight_dispatch_states.is_attention_state(value) for value in state_values)
+    running_values = [
+        value for value in state_values if goalflight_dispatch_states.is_running_state(value)
+    ]
+    classification = record.get("classification")
+    liveness_state = record.get("liveness_state")
+    alive = record.get("worker_still_alive")
+    live_evidence = bool(
+        attention
+        or running_values
+        or classification == "expected_live"
+        or goalflight_dispatch_states.is_running_state(liveness_state)
+        or alive is True
+    )
+    conflict = bool(
+        ((terminal_values or alive is False) and live_evidence)
+        or len(terminal_states) > 1
+    )
+
+    if conflict:
+        return {
+            "display_state": "unknown",
+            "is_terminal": None,
+            "classification_conflict": True,
+        }
+    if terminal_values:
+        normalized = goalflight_dispatch_states.normalize_dispatch_state(terminal_values[0])
+        return {
+            "display_state": normalized or "terminal",
+            "is_terminal": True,
+            "classification_conflict": False,
+        }
+    if attention:
+        return {
+            "display_state": "attention",
+            "is_terminal": False,
+            "classification_conflict": False,
+        }
+    if live_evidence:
+        normalized_liveness = goalflight_dispatch_states.normalize_dispatch_state(liveness_state)
+        if normalized_liveness == "running_quiet":
+            display_state = "running_quiet"
+        elif running_values:
+            display_state = goalflight_dispatch_states.normalize_dispatch_state(running_values[0]) or "running"
+        else:
+            display_state = "running"
+        return {
+            "display_state": display_state,
+            "is_terminal": False,
+            "classification_conflict": False,
+        }
+    return {
+        "display_state": "unknown",
+        "is_terminal": None,
+        "classification_conflict": False,
+    }
+
+
+def _worker_row(record: dict[str, Any], *, node_id: str | None = "local") -> dict[str, Any]:
+    # Raw authority fields remain available for diagnosis, while renderers use
+    # only the canonical verdict below for filtering and presentation.
     alive = record.get("worker_still_alive")
     return {
         "dispatch_id": _display(record.get("dispatch_id"), limit=128),
+        "node_id": _display(node_id, limit=96),
         "agent": _display(record.get("agent"), limit=64),
         "engine": _display(record.get("engine"), limit=64),
         "shape": _display(record.get("shape"), limit=64),
@@ -374,6 +495,7 @@ def _worker_row(record: dict[str, Any]) -> dict[str, Any]:
         "worker_alive": alive if isinstance(alive, bool) else None,
         "started_at": _iso_timestamp(record.get("started_at")),
         "ended_at": _iso_timestamp(record.get("ended_at")),
+        **_worker_display_verdict(record),
     }
 
 
@@ -429,7 +551,7 @@ def _machine_row(payload: dict[str, Any]) -> dict[str, Any]:
         # permanently -- 1541 on this machine against 37 actually running -- so
         # counting rows answered "how much history is there", printed under a
         # label that reads "how much is running".
-        "local_workers": sum(1 for item in records if not _record_is_terminal(item)),
+        "local_workers": sum(1 for item in records if _record_is_running(item)),
         "rate_pressure": _rate_pressure_rows(payload),
         "warnings": _warning_rows(payload),
     }
@@ -465,16 +587,15 @@ def _remote_row(payload: object) -> dict[str, Any]:
         if not isinstance(row, dict):
             continue
         reachable = row.get("ssh_reachable")
-        workers.append(
+        worker = _worker_row(row, node_id=_display(row.get("node"), limit=96))
+        worker.update(
             {
-                "dispatch_id": _display(row.get("dispatch_id"), limit=128),
-                "node_id": _display(row.get("node"), limit=96),
-                "state": _display(row.get("state"), limit=64),
                 "quarantine_reason": _display(row.get("quarantine_reason"), limit=64),
                 "ssh_reachable": reachable if isinstance(reachable, bool) else None,
                 "may_release": row.get("may_release") if isinstance(row.get("may_release"), bool) else None,
             }
         )
+        workers.append(worker)
     nodes = []
     for node in data.get("nodes") or []:
         if not isinstance(node, dict):
@@ -635,6 +756,13 @@ def _record_is_terminal(record: object) -> bool:
         if goalflight_dispatch_states.is_terminal_state(record.get(key)):
             return True
     return False
+
+
+def _record_is_running(record: object) -> bool:
+    if not isinstance(record, dict):
+        return False
+    verdict = _worker_display_verdict(record)
+    return verdict["is_terminal"] is False
 
 
 def _all_registered_roots(payload: object) -> set[str]:

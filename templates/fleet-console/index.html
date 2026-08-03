@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Goal Flight · fleet console</title>
+<link rel="stylesheet" href="fleet-console.css">
+</head>
+<body>
+<div class="shell">
+
+  <header class="topbar">
+    <div class="wordmark">goal<span>·</span>flight <span>/</span> fleet console</div>
+    <!-- Freshness only. Cadence and generation ids are mechanism, not signal;
+         they live in the title attribute, and this says one honest word when
+         the data has stopped moving. -->
+    <div class="planes" id="plane-status"></div>
+    <button class="ghost-btn" id="theme-toggle" type="button">Theme</button>
+    <span class="count" id="live-status" aria-live="polite"></span>
+  </header>
+
+  <aside class="rail">
+    <section class="panel">
+      <div class="panel-hd">Machine</div>
+      <div class="load-body" id="machine"></div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-hd">Vendors <span class="count">remaining</span></div>
+      <div id="vendors"></div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-hd">Legend</div>
+      <div class="legend">
+        <span><i class="glyph moving"></i> moving</span>
+        <span><i class="glyph attn"></i> needs you</span>
+        <span><i class="glyph quiet"></i> quiet</span>
+        <span><i class="glyph advisory"></i> advisory</span>
+        <span><i class="glyph unknown"></i> contradictory / unknown</span>
+      </div>
+    </section>
+  </aside>
+
+  <main class="main">
+    <section class="panel attn attention-section" id="attention-section">
+      <div id="attention"></div>
+    </section>
+
+    <div class="fleet-section" id="fleet-section">
+      <div id="fleet" style="display:flex;flex-direction:column;gap:14px;"></div>
+    </div>
+  </main>
+</div>
+<script src="./fleet-data.js"></script>
+<script src="./attention-data.js"></script>
+<script src="./fleet-console.js"></script>
+</body>
+</html>
