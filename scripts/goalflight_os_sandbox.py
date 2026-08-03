@@ -10,7 +10,7 @@ import platform
 import shutil
 import tempfile
 
-from goalflight_codex_sandbox import linked_worktree_writable_roots
+from goalflight_codex_sandbox import linked_worktree_writable_roots, worker_task_store_root
 from typing import Any
 
 import goalflight_compat
@@ -156,11 +156,20 @@ def goalflight_worker_channel_roots() -> list[str]:
     inventing side-channel files: the real channel was write-locked against the
     agents that most needed it.
 
-    Scope is deliberately the messages tree only. The fleet directory holds the
-    registry and the derived aggregate -- state a worker consumes but must never
-    author -- and stays denied.
+    The task-store parent is here for the same reason: workers are instructed
+    to send out-of-scope findings to the store's deferred lane, and the store
+    moved out of the repo to the durable state home without the grant
+    following it. Only ``task-stores/`` is granted -- the state base above it
+    holds the cross-project index and setup backups, which stay denied.
+
+    Scope is deliberately those two. The fleet directory holds the registry and
+    the derived aggregate -- state a worker consumes but must never author --
+    and stays denied.
     """
-    return [str(Path.home() / ".goal-flight" / "messages")]
+    return [
+        str(Path.home() / ".goal-flight" / "messages"),
+        str(worker_task_store_root()),
+    ]
 
 
 def _agent_state_roots(agent: str | None, command: str) -> list[str]:

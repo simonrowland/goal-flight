@@ -14,6 +14,7 @@ import tempfile
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
+sys.path.insert(0, str(REPO_ROOT))
 
 import goalflight_acp_run as acp  # noqa: E402
 import goalflight_codex_sandbox as sandbox  # noqa: E402
@@ -144,13 +145,46 @@ def case_linked_worktree_argv_is_narrow() -> None:
         for raw in worktree_only:
             path = Path(raw).resolve()
             assert _is_within(path, git_dir) or _is_within(path, common_dir), raw
-        # And the channel roots must not smuggle in anything beyond the two
-        # directories they exist for: this is the check that would catch someone
-        # "fixing" a sandbox denial by widening the channel grant to $HOME.
+        # And the channel roots must not smuggle in anything beyond the
+        # directories they exist for. This is the check that would catch someone
+        # "fixing" a sandbox denial by widening the grant.
+        #
+        # An allowlist of EXACT paths, not a containment test. Containment was
+        # tried and lost its teeth immediately: "anything under ~/.goal-flight"
+        # silently permits the fleet directory, and "anything under the state
+        # base" silently permits the cross-project index and setup backups.
+        # Each entry below is one capability the worker contract REQUIRES --
+        # post mail, start a nested review in its own codex home, capture a task
+        # -- so adding a line here should take an argument about which required
+        # capability it serves.
+        import goalflight_task as goalflight_task_module
+
+        allowed = {
+            (Path.home() / ".goal-flight" / "messages").resolve(),
+            (Path.home() / ".goal-flight" / "dispatch-homes").resolve(),
+            (goalflight_task_module.resolve_state_base_dir() / "task-stores").resolve(),
+        }
+        configured_codex_home = os.environ.get("CODEX_HOME")
+        if configured_codex_home:
+            allowed.add(Path(configured_codex_home).expanduser().resolve())
         for raw in sandbox.worker_channel_roots():
-            path = Path(raw).resolve()
-            assert path.name in {"messages", "dispatch-homes"} or path.parent.name == "dispatch-homes", raw
-            assert _is_within(path, Path.home() / ".goal-flight"), raw
+            assert Path(raw).resolve() in allowed, (raw, sorted(map(str, allowed)))
+
+        # And the granted task-store root must be where the store actually
+        # writes, not merely near it: resolve_task_store_dir() is the authority.
+        granted = {Path(raw).resolve() for raw in sandbox.worker_channel_roots()}
+        store = goalflight_task_module.resolve_task_store_dir(Path.cwd()).resolve()
+        assert any(root in store.parents for root in granted), (granted, store)
+        # Neither the state base nor anything above it: those hold projects.json
+        # and setup-backups, which a worker must never author.
+        for forbidden in (
+            Path.home(),
+            (Path.home() / ".local" / "state").resolve(),
+            goalflight_task_module.resolve_state_base_dir().resolve(),
+            (Path.home() / ".goal-flight").resolve(),
+            (Path.home() / ".goal-flight" / "fleet").resolve(),
+        ):
+            assert forbidden not in granted, (forbidden, granted)
 
         # Filesystem-permission proof of the same boundary. Pack the current
         # branch first, then make the whole common gitdir read-only except the
@@ -161,7 +195,15 @@ def case_linked_worktree_argv_is_narrow() -> None:
         packed_before = packed_refs.read_bytes()
         try:
             _chmod_tree(common_dir, writable=False)
-            for raw in expected:
+            # Only the WORKTREE roots. This proof is about the git dirs: it
+            # locks the common gitdir and reopens exactly the four granted git
+            # paths. The channel roots are the operator's live mailbox, codex
+            # dispatch homes and durable task store -- they are outside
+            # common_dir, so chmodding them proves nothing here, while a
+            # concurrent dispatch creating or reaping a home underneath one made
+            # this fail with a bare FileNotFoundError on somebody else's
+            # directory. A test must not need write access to live fleet state.
+            for raw in worktree_only:
                 _chmod_tree(Path(raw), writable=True)
             (linked / "probe.txt").write_text("probe\n", encoding="utf-8")
             _run("git", "add", "--", "probe.txt", cwd=linked)
