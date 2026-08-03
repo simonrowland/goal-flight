@@ -444,19 +444,17 @@ def extract_markers(text: str) -> dict[str, list[str]]:
         return {}
     lines = text.splitlines()
     out: dict[str, list[str]] = {}
-    in_fence = False
+    fence = goalflight_terminal.MarkdownFenceTracker()
     for line in lines:
         stripped = line.strip()
-        lstrip = line.lstrip()
-        if lstrip.startswith("```") or lstrip.startswith("~~~"):
-            in_fence = not in_fence
+        if fence.consume_boundary(line):
             continue
-        if in_fence:
+        if fence.in_fence:
             continue
         match = _MARKERS_RE.match(stripped)
         if match:
             value = match.group(2).rstrip("* \t")
-            if value:  # skip empty captures
+            if value and not goalflight_terminal.marker_is_template_example(match.group(1), value):
                 out.setdefault(match.group(1), []).append(value)
     return out
 

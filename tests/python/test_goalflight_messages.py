@@ -38,6 +38,8 @@ def run_messages_cli(
             "GOALFLIGHT_MESSAGES_DIR": str(messages_dir),
             "GOALFLIGHT_FLEET_DIR": str(fleet_dir),
             "GOALFLIGHT_STATE_DIR": str(messages_dir.parent / "state"),
+            "GOAL_FLIGHT_PIDFILE_DIR": str(messages_dir.parent / "pids"),
+            "GOALFLIGHT_TASK_STORE_DIR": str(messages_dir.parent / "task-store"),
         }
     )
     return subprocess.run(
@@ -65,6 +67,9 @@ def write_ledger_record(
     *,
     state: str = "running",
     task_ids: list[str] | None = None,
+    worker_pid: int | None = None,
+    detached: bool = False,
+    reason: str | None = None,
     started_at: str = "2026-07-23T00:00:00+00:00",
 ) -> None:
     runs_dir = base / "state" / "runs.d"
@@ -78,6 +83,15 @@ def write_ledger_record(
     }
     if task_ids:
         record["task_ids"] = task_ids
+    if worker_pid is not None:
+        import goalflight_ledger
+
+        record["worker_pid"] = worker_pid
+        record["worker_identity"] = goalflight_ledger.process_identity(worker_pid)
+    if detached:
+        record["detached"] = True
+    if reason is not None:
+        record["reason"] = reason
     (runs_dir / f"{dispatch_id}.json").write_text(json.dumps(record) + "\n", encoding="utf-8")
 
 
@@ -352,6 +366,347 @@ def test_post_message_allocates_seq_under_mail_lock() -> None:
         assert_true("unique monotonic seqs", [env["seq"] for env in loaded] == [1, 2])
 
 
+def test_controller_post_reaches_worker_steer_read_path() -> None:
+    import tempfile
+    import goalflight_steer_mailbox as steer
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        messages_dir = base / "messages"
+        fleet_dir = base / "fleet"
+        dispatch_id = "d-controller-live"
+        write_ledger_record(base, dispatch_id, base / "project", state="running", worker_pid=os.getpid())
+        steer_path = steer.steer_file(dispatch_id, state_dir=base / "state")
+        steer.append_steer_entry(steer_path, "earlier steer", dispatch_id=dispatch_id)
+
+        posted = run_messages_cli(
+            messages_dir,
+            fleet_dir,
+            [
+                "post",
+                "--dispatch-id",
+                dispatch_id,
+                "--type",
+                "controller-notice",
+                "--text",
+                "worker-visible notice",
+            ],
+        )
+
+        assert_true(f"controller post succeeds: {posted.stderr}", posted.returncode == 0)
+        result = json.loads(posted.stdout)
+        assert_true("record is reported", result["recorded"] is True)
+        assert_true("worker delivery is reported", result["delivery"]["delivered"] is True)
+        entries = steer.worker_entries(steer.read_steer_entries(steer_path))
+        delivered = entries[-1]
+        assert_true("worker read path sees posted text", delivered["text"] == "worker-visible notice")
+        assert_true("steer sequence remains independent", delivered["seq"] == 2)
+        envelope = delivered["context"]["message_envelope"]
+        assert_true("typed envelope survives projection", envelope["type"] == "controller-notice")
+        assert_true("message sequence remains canonical", envelope["seq"] == 1)
+
+
+def test_worker_sideband_type_does_not_echo_to_worker_from_controller_context() -> None:
+    import tempfile
+    from goalflight_messages import read_envelopes
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        messages_dir = base / "messages"
+        fleet_dir = base / "fleet"
+        dispatch_id = "d-controller-sideband"
+        write_ledger_record(base, dispatch_id, base / "project", state="running", worker_pid=os.getpid())
+
+        posted = run_messages_cli(
+            messages_dir,
+            fleet_dir,
+            ["post", "--dispatch-id", dispatch_id, "--type", "status", "--text", "worker progress"],
+        )
+
+        assert_true(f"sideband record succeeds: {posted.stderr}", posted.returncode == 0)
+        result = json.loads(posted.stdout)
+        assert_true("worker delivery is not requested for sideband type", result["delivery"]["requested"] is False)
+        assert_true("sideband is still recorded", read_envelopes(messages_dir / f"{dispatch_id}.jsonl")[0]["type"] == "status")
+        steer_path = base / "state" / "dispatch" / f"{dispatch_id}.steer.jsonl"
+        assert_true("sideband does not echo into worker steer", not steer_path.exists())
+
+
+def test_controller_channel_types_project_and_remain_in_aggregate() -> None:
+    import tempfile
+    import goalflight_steer_mailbox as steer
+    from goalflight_messages import CONTROLLER_CHANNEL_TYPES, build_aggregate
+
+    expected_types = {
+        "controller-question",
+        "controller-answer",
+        "controller-notice",
+        "controller-coordination",
+        "coordination",
+        "notice",
+    }
+    assert_true("controller channel type contract is complete", CONTROLLER_CHANNEL_TYPES == expected_types)
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        messages_dir = base / "messages"
+        fleet_dir = base / "fleet"
+        dispatch_id = "d-controller-types"
+        fleet_dir.mkdir()
+        write_ledger_record(base, dispatch_id, base / "project", state="running", worker_pid=os.getpid())
+
+        for msg_type in sorted(expected_types):
+            posted = run_messages_cli(
+                messages_dir,
+                fleet_dir,
+                ["post", "--dispatch-id", dispatch_id, "--type", msg_type, "--text", msg_type],
+            )
+            assert_true(f"{msg_type} reaches worker: {posted.stderr}", posted.returncode == 0)
+
+        entries = steer.worker_entries(
+            steer.read_steer_entries(steer.steer_file(dispatch_id, state_dir=base / "state"))
+        )
+        projected_types = {
+            entry["context"]["message_envelope"]["type"]
+            for entry in entries
+        }
+        assert_true("every controller channel type projects", projected_types == expected_types)
+        aggregate = build_aggregate(messages_dir=messages_dir, fleet_dir=fleet_dir)
+        aggregate_types = {item["type"] for item in aggregate["open_controller_channel"]}
+        assert_true("every projected type remains relay-visible", aggregate_types == expected_types)
+
+
+def test_concurrent_controller_posts_preserve_worker_view_order() -> None:
+    import tempfile
+    import goalflight_messages as messages
+    import goalflight_steer_mailbox as steer
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        messages_dir = base / "messages"
+        dispatch_id = "d-controller-concurrent"
+        first_delivery_started = threading.Event()
+        release_first_delivery = threading.Event()
+        second_delivery_started = threading.Event()
+        errors: list[BaseException] = []
+        original_record = messages._dispatch_record
+        original_append = messages.goalflight_steer_mailbox.append_message_view
+
+        def running_record(_dispatch_id: str) -> tuple[dict, None]:
+            import goalflight_ledger
+
+            return (
+                {
+                    "dispatch_id": dispatch_id,
+                    "state": "running",
+                    "worker_pid": os.getpid(),
+                    "worker_identity": goalflight_ledger.process_identity(os.getpid()),
+                },
+                None,
+            )
+
+        def delayed_append(target_dispatch_id: str, envelope: dict):
+            if envelope["seq"] == 1:
+                first_delivery_started.set()
+                if not release_first_delivery.wait(timeout=2):
+                    raise AssertionError("timed out waiting to release first delivery")
+            else:
+                second_delivery_started.set()
+            return original_append(target_dispatch_id, envelope, state_dir=base / "state")
+
+        def post(text: str) -> None:
+            try:
+                messages.post_message(
+                    dispatch_id=dispatch_id,
+                    msg_type="controller-notice",
+                    payload={"text": text},
+                    messages_dir=messages_dir,
+                    deliver_to_worker=True,
+                )
+            except BaseException as exc:  # noqa: BLE001 - relayed to the test thread
+                errors.append(exc)
+
+        messages._dispatch_record = running_record  # type: ignore[assignment]
+        messages.goalflight_steer_mailbox.append_message_view = delayed_append  # type: ignore[assignment]
+        first = threading.Thread(target=post, args=("first",))
+        second = threading.Thread(target=post, args=("second",))
+        try:
+            first.start()
+            assert_true("first delivery reaches projection", first_delivery_started.wait(timeout=1))
+            second.start()
+            # Broken code reaches the second projection while seq 1 is paused.
+            # Correct code holds the message lock until seq 1's projection lands.
+            second_delivery_started.wait(timeout=0.5)
+            release_first_delivery.set()
+            first.join(timeout=2)
+            second.join(timeout=2)
+        finally:
+            release_first_delivery.set()
+            first.join(timeout=2)
+            second.join(timeout=2)
+            messages._dispatch_record = original_record  # type: ignore[assignment]
+            messages.goalflight_steer_mailbox.append_message_view = original_append  # type: ignore[assignment]
+
+        assert_true("concurrent posts do not raise", not errors)
+        assert_true("concurrent post threads finish", not first.is_alive() and not second.is_alive())
+        entries = steer.worker_entries(
+            steer.read_steer_entries(steer.steer_file(dispatch_id, state_dir=base / "state"))
+        )
+        envelope_seqs = [entry["context"]["message_envelope"]["seq"] for entry in entries]
+        assert_true("worker view follows canonical message order", envelope_seqs == [1, 2])
+
+
+def test_live_controller_post_delivery_failure_is_nonzero_and_recorded() -> None:
+    import tempfile
+    from goalflight_messages import read_envelopes
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        messages_dir = base / "messages"
+        fleet_dir = base / "fleet"
+        dispatch_id = "d-controller-undeliverable"
+        write_ledger_record(base, dispatch_id, base / "project", state="running", worker_pid=os.getpid())
+        blocked_steer_path = base / "state" / "dispatch" / f"{dispatch_id}.steer.jsonl"
+        blocked_steer_path.mkdir(parents=True)
+
+        posted = run_messages_cli(
+            messages_dir,
+            fleet_dir,
+            [
+                "post",
+                "--dispatch-id",
+                dispatch_id,
+                "--type",
+                "controller-notice",
+                "--text",
+                "record even when delivery fails",
+            ],
+        )
+
+        assert_true("undeliverable live post is nonzero", posted.returncode != 0)
+        result = json.loads(posted.stdout)
+        assert_true("failed delivery still reports record", result["recorded"] is True)
+        assert_true("failed delivery is explicit", result["delivery"]["status"] == "worker_delivery_failed")
+        assert_true("failed delivery is not claimed", result["delivery"]["delivered"] is False)
+        assert_true("call site says record versus delivery", "recorded but worker delivery failed" in posted.stderr)
+        envelopes = read_envelopes(messages_dir / f"{dispatch_id}.jsonl")
+        assert_true(
+            "record survives delivery failure",
+            envelopes[0]["payload"]["text"] == "record even when delivery fails",
+        )
+
+
+def test_running_label_without_live_identity_is_not_delivery() -> None:
+    import tempfile
+    from goalflight_messages import read_envelopes
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        messages_dir = base / "messages"
+        fleet_dir = base / "fleet"
+        dispatch_id = "d-controller-no-worker"
+        write_ledger_record(base, dispatch_id, base / "project", state="running")
+
+        posted = run_messages_cli(
+            messages_dir,
+            fleet_dir,
+            [
+                "post",
+                "--dispatch-id",
+                dispatch_id,
+                "--type",
+                "controller-notice",
+                "--text",
+                "do not call a state label delivery",
+            ],
+        )
+
+        assert_true("running label without worker is nonzero", posted.returncode != 0)
+        result = json.loads(posted.stdout)
+        assert_true("message remains recorded", result["recorded"] is True)
+        assert_true("no worker delivery is claimed", result["delivery"]["delivered"] is False)
+        assert_true("missing worker identity is explicit", result["delivery"]["dispatch_classification"] == "unknown_no_pid")
+        assert_true("worker view is not written", result["delivery"]["worker_view_written"] is False)
+        assert_true("record survives unavailable worker", len(read_envelopes(messages_dir / f"{dispatch_id}.jsonl")) == 1)
+
+
+def test_detached_controller_dead_record_with_live_worker_still_delivers() -> None:
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        messages_dir = base / "messages"
+        fleet_dir = base / "fleet"
+        dispatch_id = "d-detached-live-worker"
+        write_ledger_record(
+            base,
+            dispatch_id,
+            base / "project",
+            state="controller_dead",
+            worker_pid=os.getpid(),
+            detached=True,
+            reason="controller_dead",
+        )
+
+        posted = run_messages_cli(
+            messages_dir,
+            fleet_dir,
+            [
+                "post",
+                "--dispatch-id",
+                dispatch_id,
+                "--type",
+                "controller-notice",
+                "--text",
+                "detached worker still owns this mailbox",
+            ],
+        )
+
+        assert_true(f"detached live worker post succeeds: {posted.stderr}", posted.returncode == 0)
+        result = json.loads(posted.stdout)
+        assert_true("detached worker is classified live", result["delivery"]["dispatch_classification"] == "expected_live")
+        assert_true("detached live worker receives view", result["delivery"]["delivered"] is True)
+
+
+def test_terminal_controller_post_is_recorded_and_labelled_record_only() -> None:
+    import tempfile
+    from goalflight_messages import read_envelopes
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        messages_dir = base / "messages"
+        fleet_dir = base / "fleet"
+        dispatch_id = "d-controller-terminal"
+        write_ledger_record(base, dispatch_id, base / "project", state="complete")
+
+        posted = run_messages_cli(
+            messages_dir,
+            fleet_dir,
+            [
+                "post",
+                "--dispatch-id",
+                dispatch_id,
+                "--type",
+                "controller-notice",
+                "--text",
+                "terminal history",
+            ],
+        )
+
+        assert_true(f"terminal post is a normal case: {posted.stderr}", posted.returncode == 0)
+        result = json.loads(posted.stdout)
+        assert_true("terminal post is recorded", result["recorded"] is True)
+        assert_true("terminal delivery is false", result["delivery"]["delivered"] is False)
+        assert_true(
+            "terminal result is labelled record-only",
+            result["delivery"]["status"] == "terminal_recorded_only",
+        )
+        assert_true("terminal result says no reader", "no worker will read it" in result["delivery"]["detail"])
+        envelopes = read_envelopes(messages_dir / f"{dispatch_id}.jsonl")
+        assert_true("terminal message stays in record", envelopes[0]["payload"]["text"] == "terminal history")
+        steer_path = base / "state" / "dispatch" / f"{dispatch_id}.steer.jsonl"
+        assert_true("terminal post does not create worker view", not steer_path.exists())
+
+
 def test_controller_summary_includes_quota_advisory() -> None:
     import tempfile
     from goalflight_messages import controller_mail_summary, post_message
@@ -459,7 +814,13 @@ def test_mcp_stdio_tools_call() -> None:
 
     with tempfile.TemporaryDirectory() as td:
         messages_dir = Path(td) / "messages"
-        env = {**dict(os.environ), "GOALFLIGHT_MESSAGES_DIR": str(messages_dir)}
+        env = {
+            **dict(os.environ),
+            "GOALFLIGHT_MESSAGES_DIR": str(messages_dir),
+            "GOALFLIGHT_STATE_DIR": str(Path(td) / "state"),
+            "GOAL_FLIGHT_PIDFILE_DIR": str(Path(td) / "pids"),
+            "GOALFLIGHT_TASK_STORE_DIR": str(Path(td) / "task-store"),
+        }
         req = {
             "jsonrpc": "2.0",
             "id": 1,
@@ -490,6 +851,70 @@ def test_mcp_stdio_tools_call() -> None:
         path = messages_dir / "d-stdio.jsonl"
         assert_true("file exists", path.exists())
         assert_true("stdio line match", path.read_text() == posted["line"])
+
+
+def test_mcp_delivery_failure_sets_tool_error_and_call_exit() -> None:
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        messages_dir = base / "messages"
+        fleet_dir = base / "fleet"
+        dispatch_id = "d-mcp-undeliverable"
+        write_ledger_record(base, dispatch_id, base / "project", state="running", worker_pid=os.getpid())
+        blocked_steer_path = base / "state" / "dispatch" / f"{dispatch_id}.steer.jsonl"
+        blocked_steer_path.mkdir(parents=True)
+        arguments = {
+            "dispatch_id": dispatch_id,
+            "type": "controller-notice",
+            "payload": {"text": "recorded MCP failure"},
+        }
+        env = {
+            **dict(os.environ),
+            "GOALFLIGHT_MESSAGES_DIR": str(messages_dir),
+            "GOALFLIGHT_FLEET_DIR": str(fleet_dir),
+            "GOALFLIGHT_STATE_DIR": str(base / "state"),
+            "GOAL_FLIGHT_PIDFILE_DIR": str(base / "pids"),
+            "GOALFLIGHT_TASK_STORE_DIR": str(base / "task-store"),
+        }
+        request = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "goalflight_post_message", "arguments": arguments},
+        }
+
+        stdio = subprocess.run(
+            [sys.executable, str(ROOT / "scripts" / "goalflight_mcp_messages.py"), "stdio"],
+            input=json.dumps(request) + "\n",
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert_true(f"MCP stdio server stays healthy: {stdio.stderr}", stdio.returncode == 0)
+        response = json.loads(stdio.stdout.strip().splitlines()[-1])
+        assert_true("MCP tool result is an error", response["result"]["isError"] is True)
+        posted = json.loads(response["result"]["content"][0]["text"])
+        assert_true("MCP error still reports record", posted["recorded"] is True)
+        assert_true("MCP error does not claim delivery", posted["delivery"]["delivered"] is False)
+
+        call = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts" / "goalflight_mcp_messages.py"),
+                "call",
+                "--arguments",
+                json.dumps(arguments),
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert_true("one-shot MCP call exits nonzero on delivery failure", call.returncode != 0)
+        call_result = json.loads(call.stdout)
+        assert_true("one-shot failure still reports record", call_result["recorded"] is True)
 
 
 def test_mark_read_creates_cursor_and_unseen_filters() -> None:
@@ -987,14 +1412,27 @@ def test_ack_stale_expires_exact_stale_set_and_preserves_read_cursor() -> None:
                 "created_by": "test",
             }
 
-        T.TaskStore(project).save_items_atomic(
-            [
-                task("t-closed", done=True),
-                task("t-superseded"),
-                task("t-live", done=True),
-                task("t-current"),
-            ]
-        )
+        prior_task_store_dir = os.environ.get("GOALFLIGHT_TASK_STORE_DIR")
+        os.environ["GOALFLIGHT_TASK_STORE_DIR"] = str(base / "task-store")
+        try:
+            task_store = T.TaskStore(project)
+            assert_true(
+                "task store is isolated from operator state",
+                task_store.store_dir.is_relative_to((base / "task-store").resolve()),
+            )
+            task_store.save_items_atomic(
+                [
+                    task("t-closed", done=True),
+                    task("t-superseded"),
+                    task("t-live", done=True),
+                    task("t-current"),
+                ]
+            )
+        finally:
+            if prior_task_store_dir is None:
+                os.environ.pop("GOALFLIGHT_TASK_STORE_DIR", None)
+            else:
+                os.environ["GOALFLIGHT_TASK_STORE_DIR"] = prior_task_store_dir
         now = dt.datetime.now(dt.timezone.utc)
         taskless_old_at = (now - dt.timedelta(hours=25)).isoformat()
         taskless_recent_at = (now - dt.timedelta(hours=1)).isoformat()
@@ -1114,10 +1552,19 @@ def main() -> None:
         test_mcp_post_matches_file_append,
         test_post_message_rejects_invalid_seq_and_accepts_one,
         test_post_message_allocates_seq_under_mail_lock,
+        test_controller_post_reaches_worker_steer_read_path,
+        test_worker_sideband_type_does_not_echo_to_worker_from_controller_context,
+        test_controller_channel_types_project_and_remain_in_aggregate,
+        test_concurrent_controller_posts_preserve_worker_view_order,
+        test_live_controller_post_delivery_failure_is_nonzero_and_recorded,
+        test_running_label_without_live_identity_is_not_delivery,
+        test_detached_controller_dead_record_with_live_worker_still_delivers,
+        test_terminal_controller_post_is_recorded_and_labelled_record_only,
         test_controller_summary_includes_quota_advisory,
         test_controller_summary_resolves_canonical_root_once,
         test_controller_summary_git_failure_uses_task_store_root_fallback,
         test_mcp_stdio_tools_call,
+        test_mcp_delivery_failure_sets_tool_error_and_call_exit,
         test_mark_read_creates_cursor_and_unseen_filters,
         test_mark_read_all_advances_every_inbox_to_current_max,
         test_mark_read_through_never_rewinds,

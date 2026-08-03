@@ -17,6 +17,7 @@ from goalflight_messages import (  # noqa: E402
     default_fleet_dir,
     default_messages_dir,
     goalflight_post_message_tool,
+    post_result_is_error,
 )
 
 TOOL_DESCRIPTOR = {
@@ -90,7 +91,7 @@ def handle_request(
                         "text": json.dumps(posted, indent=2),
                     }
                 ],
-                "isError": False,
+                "isError": post_result_is_error(posted),
             }
         )
     if method == "ping":
@@ -107,7 +108,7 @@ def cmd_call(args: argparse.Namespace) -> int:
         refresh_aggregate=args.refresh_aggregate,
     )
     print(json.dumps(result, indent=2))
-    return 0
+    return 1 if post_result_is_error(result) else 0
 
 
 def cmd_stdio(args: argparse.Namespace) -> int:

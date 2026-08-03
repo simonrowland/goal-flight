@@ -573,11 +573,6 @@ def _is_diff_context_line(raw_line: str) -> bool:
     return raw_line.startswith("-") and not raw_line.startswith("- ")
 
 
-def _is_fence_line(raw_line: str) -> bool:
-    lstrip = raw_line.lstrip()
-    return lstrip.startswith("```") or lstrip.startswith("~~~")
-
-
 def _strip_terminal_marker_prefix(stripped: str) -> str:
     if stripped.startswith("> "):
         return stripped[2:].lstrip()
@@ -597,13 +592,12 @@ def _strip_kimi_terminal_marker_prefix(stripped: str) -> str:
 
 
 def _fence_state_unbalanced(lines: list[str], ignored_lines: set[int]) -> bool:
-    fence_count = 0
+    fence = goalflight_terminal.MarkdownFenceTracker()
     for idx, line in enumerate(lines):
         if idx in ignored_lines:
             continue
-        if _is_fence_line(line):
-            fence_count += 1
-    return fence_count % 2 == 1
+        fence.consume_boundary(line)
+    return fence.in_fence
 
 
 def _final_terminal_marker_from_line(
@@ -641,6 +635,8 @@ def _final_terminal_marker_from_line(
         return signoff
     match = FINAL_TERMINAL_MARKER_RE.match(stripped)
     if not match:
+        return None
+    if goalflight_terminal.marker_is_template_example(match.group(1), match.group(2)):
         return None
     return {
         "line": line_no,
@@ -817,7 +813,7 @@ def extract_markers(path: Path, max_bytes: int = 10 * 1024 * 1024,
     start = max(0, size - max_bytes)
     prompt_prefix = ignore_prefix_lines or []
     markers: list[dict] = []
-    in_fence = False
+    fence = goalflight_terminal.MarkdownFenceTracker()
     with path.open("rb") as f:
         f.seek(start)
         text = f.read().decode(errors="replace")
@@ -832,13 +828,14 @@ def extract_markers(path: Path, max_bytes: int = 10 * 1024 * 1024,
             continue
         # Fence skip (hardening): do not match markers inside ``` or ~~~ blocks.
         # Worker output containing example marker vocab in code fences must not inject terminals.
-        if _is_fence_line(line):
-            in_fence = not in_fence
+        if fence.consume_boundary(line):
             continue
-        if in_fence and not ignore_fences:
+        if fence.in_fence and not ignore_fences:
             continue
         match = MARKER_RE.match(stripped)
         if match:
+            if goalflight_terminal.marker_is_template_example(match.group(1), match.group(2)):
+                continue
             markers.append({"line": idx, "kind": match.group(1), "text": match.group(2)[:1000]})
             continue
         # Bare sign-off ("Done.", "complete", "FINISHED!") carries no payload and
@@ -947,7 +944,7 @@ def _last_line_is_terminal_marker(
     size = path.stat().st_size
     start = max(0, size - 10 * 1024 * 1024)
     prompt_prefix = ignore_prefix_lines or []
-    in_fence = False
+    fence = goalflight_terminal.MarkdownFenceTracker()
     candidates: list[tuple[int, str, bool]] = []
     with path.open("rb") as f:
         f.seek(start)
@@ -960,13 +957,13 @@ def _last_line_is_terminal_marker(
         if idx - 1 in prompt_echo_lines:
             # prompt echo line (even if looks like marker): do not use for last_nonempty terminal decision
             continue
-        fence_line = _is_fence_line(line)
+        fence_was_open = fence.in_fence
+        fence_line = fence.consume_boundary(line)
         if fence_line:
-            in_fence = not in_fence
             if stripped:
-                candidates.append((idx, line, in_fence and not ignore_fences))
+                candidates.append((idx, line, (fence_was_open or fence.in_fence) and not ignore_fences))
             continue
-        if in_fence and not ignore_fences:
+        if fence.in_fence and not ignore_fences:
             if stripped:
                 candidates.append((idx, line, True))
             continue
@@ -1040,17 +1037,16 @@ def _scan_final_terminal_marker(
     ignore_fences: bool,
     kimi_output: bool = False,
 ) -> dict | None:
-    in_fence = False
+    fence = goalflight_terminal.MarkdownFenceTracker()
     in_hunk = False
     terminal: dict | None = None
     for idx, line in enumerate(lines, start=1):
         stripped = line.strip()
         if idx - 1 in prompt_echo_lines:
             continue
-        if _is_fence_line(line):
-            in_fence = not in_fence
+        if fence.consume_boundary(line):
             continue
-        if in_fence and not ignore_fences:
+        if fence.in_fence and not ignore_fences:
             continue
         if in_hunk:
             if line.startswith((" ", "+", "-", "\\")):
@@ -1186,8 +1182,9 @@ def main() -> int:
     )
     parser.add_argument("--pgid", type=int)
     parser.add_argument("--controller-pid", type=int)
+    parser.add_argument("--controller-session-id")
     parser.add_argument("--detached", action="store_true",
-                        help="Ignore launcher/controller pid liveness; worker pid identity is authoritative.")
+                        help="Ignore controller-beacon liveness; worker pid identity is authoritative.")
     parser.add_argument(
         "--codex-dispatch-home-resolved",
         action="store_true",
@@ -1205,6 +1202,12 @@ def main() -> int:
     parser.add_argument("--stay-after-terminal", action="store_true",
                         help="After a terminal marker, keep watching until the worker exits or this watcher is stopped.")
     args = parser.parse_args()
+
+    controller_session_id = args.controller_session_id
+    controller_pid = args.controller_pid
+    if not controller_session_id or controller_pid is None:
+        controller_session_id = None
+        controller_pid = None
 
     ignore_prefix_lines: list[str] = []
     if args.ignore_prompt_file:
@@ -1237,6 +1240,8 @@ def main() -> int:
             "agent": args.agent,
             "worker_pid": args.pid,
             "detached": bool(args.detached),
+            "controller_session_id": controller_session_id,
+            "controller_pid": controller_pid,
             "state": "blocked_windows_dispatch",
             "reason": goalflight_compat.windows_watcher_skip(),
             "tail_path": str(tail),
@@ -1311,6 +1316,8 @@ def main() -> int:
         nonlocal last_payload, final_status_written, working_breadcrumb_written
         if effective_account:
             payload["effective_account"] = effective_account
+        payload["controller_session_id"] = controller_session_id
+        payload["controller_pid"] = controller_pid
         if codex_home is not None:
             payload["codex_home"] = str(codex_home)
             if codex_session_id is None:
@@ -1629,8 +1636,8 @@ def main() -> int:
             exit_reason = payload.get("reason", exit_reason)
             break
         if (
-            args.controller_pid
-            and not alive(args.controller_pid)
+            controller_pid
+            and not alive(controller_pid)
             and _controller_dead_is_terminal(detached=bool(args.detached))
         ):
             if bool(trace_sample.get("trace_active")):

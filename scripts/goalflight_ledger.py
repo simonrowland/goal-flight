@@ -214,13 +214,22 @@ def process_identity(pid: int | None) -> dict | None:
 
 
 def identity_matches(record: dict) -> tuple[bool, str]:
-    pid = record.get("worker_pid") or record.get("controller_pid")
+    pid = (
+        record.get("worker_pid")
+        or record.get("claimant_pid")
+        or record.get("controller_pid")
+    )
     if not pid:
         return False, "no_pid"
     current = process_identity(int(pid))
     if current is None:
         return False, "dead"
-    prior = record.get("worker_identity") or record.get("controller_identity") or {}
+    prior = (
+        record.get("worker_identity")
+        or record.get("claimant_identity")
+        or record.get("controller_identity")
+        or {}
+    )
     if goalflight_compat.is_windows() and not current.get("identity_available", True):
         return False, "identity_indeterminate"
     if not current.get("identity_available", True) or not prior.get("identity_available", True):
@@ -457,7 +466,17 @@ def scan_surplus(records: list[dict], limit: int = 20) -> list[dict]:
 def cmd_record(args: argparse.Namespace) -> int:
     dispatch_id = args.dispatch_id or str(uuid.uuid4())
     worker_identity = process_identity(args.worker_pid)
-    controller_pid = args.controller_pid or os.getpid()
+    # Ownership comes from the long-lived controller beacon. This command is
+    # commonly called by short-lived dispatcher/runner processes, whose pids
+    # are implementation details rather than evidence of a controller.
+    controller_pid = getattr(args, "controller_pid", None)
+    controller_session_id = getattr(args, "controller_session_id", None)
+    if not controller_session_id or controller_pid is None:
+        controller_pid = None
+        controller_session_id = None
+    else:
+        controller_session_id = str(controller_session_id)
+    claimant_pid = getattr(args, "claimant_pid", None)
     os_sandbox = None
     if getattr(args, "os_sandbox_json", None):
         try:
@@ -482,7 +501,10 @@ def cmd_record(args: argparse.Namespace) -> int:
         "transport": args.transport,
         "project_root": args.project_root,
         "controller_pid": controller_pid,
+        "controller_session_id": controller_session_id,
         "controller_identity": process_identity(controller_pid),
+        "claimant_pid": claimant_pid,
+        "claimant_identity": process_identity(claimant_pid),
         "worker_pid": args.worker_pid,
         "worker_identity": worker_identity,
         "worker_pgid": worker_identity.get("pgid") if worker_identity else None,
@@ -540,6 +562,19 @@ def cmd_record(args: argparse.Namespace) -> int:
                 and isinstance(existing.get("request_envelope"), dict)
             ):
                 record["request_envelope"] = existing["request_envelope"]
+            existing_controller_session_id = existing.get("controller_session_id")
+            existing_controller_pid = existing.get("controller_pid")
+            if (
+                record.get("controller_session_id") is None
+                and existing_controller_session_id
+                and existing_controller_pid is not None
+            ):
+                record["controller_session_id"] = existing_controller_session_id
+                record["controller_pid"] = existing_controller_pid
+                record["controller_identity"] = existing.get("controller_identity")
+            if record.get("claimant_pid") is None and existing.get("claimant_pid"):
+                record["claimant_pid"] = existing["claimant_pid"]
+                record["claimant_identity"] = existing.get("claimant_identity")
             for key in (
                 "codex_session_id",
                 "codex_home",
@@ -638,6 +673,8 @@ def status_payload() -> dict:
             "worker_pid": r.get("worker_pid"),
             "worker_identity": r.get("worker_identity"),
             "project_root": r.get("project_root"),
+            "controller_pid": r.get("controller_pid"),
+            "controller_session_id": r.get("controller_session_id"),
             "prompt_path": r.get("prompt_path"),
             "stdout_path": r.get("stdout_path"),
             "stderr_path": r.get("stderr_path"),
@@ -891,6 +928,8 @@ def build_parser() -> argparse.ArgumentParser:
     rec.add_argument("--transport", default="unknown")
     rec.add_argument("--project-root")
     rec.add_argument("--controller-pid", type=int)
+    rec.add_argument("--controller-session-id")
+    rec.add_argument("--claimant-pid", type=int)
     rec.add_argument("--worker-pid", type=int)
     rec.add_argument("--acp-session-id")
     rec.add_argument("--logical-session-id")

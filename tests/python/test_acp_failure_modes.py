@@ -20,6 +20,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -685,6 +686,100 @@ def case_runner_raw_vendor_flood_hits_progress_stall_and_reaps() -> None:
 
 
 @skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")
+def case_runner_preserves_live_controller_beacon_pair() -> None:
+    import goalflight_adapter_readiness as adapter_readiness
+    import goalflight_dispatch as dispatch
+    import goalflight_ledger as ledger
+    import goalflight_session_status as sessions
+    from goalflight_acp_run import run_acp_dispatch
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        project_root = tmp / "project"
+        project_root.mkdir()
+        state_dir = tmp / "state"
+        status_path = tmp / "owned-acp-runtime.status.json"
+        wrapper = _make_fake_agent_wrapper(tmp, scenario="echo")
+        adapters = tmp / "adapters"
+        _write_supported_adapter_manifest(adapters, wrapper.name)
+        beacon = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+        args = argparse.Namespace(
+            dispatch_id="owned-acp-runtime",
+            agent="codex",
+            account=None,
+            read_only=False,
+            os_sandbox=None,
+            controller_pid=os.getpid(),
+            controller_session_id=None,
+            _controller_beacon_pid=None,
+            task_ids=[],
+            launch_detached=False,
+            queue_launch_token=None,
+            cwd=None,
+            prompt="ownership test",
+            prompt_file=None,
+            no_orientation=True,
+            model=None,
+            priority="normal",
+            capacity_wait_s=0,
+            max_idle_secs=5.0,
+            poll_secs=0.1,
+            permission_mode="auto",
+            permission_dir=None,
+            permission_inline_timeout_s=None,
+            permission_user_timeout_s=None,
+            interactive=False,
+            context_mode=None,
+        )
+        worker_pid: object = None
+        env = {
+            "GOALFLIGHT_STATE_DIR": str(state_dir),
+            "GOALFLIGHT_MESSAGES_DIR": str(tmp / "messages"),
+            "GOALFLIGHT_FAKE_ACP_SCENARIO": "echo",
+            "GOALFLIGHT_ACP_PYTHON": sys.executable,
+            "GOALFLIGHT_CAPACITY_CONF": os.devnull,
+            "GOAL_FLIGHT_PIDFILE_DIR": str(tmp / "pids"),
+        }
+        try:
+            claimed = sessions.claim_session(
+                project_root,
+                pid=beacon.pid,
+                session_id="acp-controller-session",
+            )
+            dispatch._stamp_controller_session(args, project_root)
+            expected = (claimed["id"], beacon.pid)
+            with patch.object(
+                adapter_readiness, "ADAPTERS_DIR", adapters
+            ), patch.dict(os.environ, env, clear=False):
+                cfg = dispatch._build_acp_cfg(
+                    args,
+                    status_json=status_path,
+                    base=tmp / "dispatch",
+                )
+                cfg.agent = str(wrapper)
+                payload = asyncio.run(run_acp_dispatch(cfg))
+                worker_pid = payload.get("worker_pid")
+                record = json.loads(
+                    ledger.record_path(args.dispatch_id).read_text(encoding="utf-8")
+                )
+
+            assert payload.get("state") == "complete", payload
+            assert (
+                payload.get("controller_session_id"),
+                payload.get("controller_pid"),
+            ) == expected
+            assert (
+                record.get("controller_session_id"),
+                record.get("controller_pid"),
+            ) == expected
+        finally:
+            _force_kill(worker_pid)
+            if beacon.poll() is None:
+                beacon.terminate()
+                beacon.wait(timeout=10)
+
+
+@skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")
 def case_runner_progress_stall_detaches_by_default() -> None:
     state_snapshot: dict = {}
     returncode, status, stdout, stderr = _run_fake_runner(
@@ -708,6 +803,8 @@ def case_runner_progress_stall_detaches_by_default() -> None:
         assert status["killed_by_heartbeat"] is False, status
         assert status["wedged_by_heartbeat"] is False, status
         assert status["markers"]["STALLED"], status
+        assert status.get("controller_session_id") is None, status
+        assert status.get("controller_pid") is None, status
         assert _pid_alive(worker_pid), (status, stderr)
 
         dispatch_id = status["dispatch_id"]
@@ -715,6 +812,8 @@ def case_runner_progress_stall_detaches_by_default() -> None:
         assert records and records[-1].get("state") == "stalled", records
         assert records[-1].get("terminal_state") == "stalled", records[-1]
         assert records[-1].get("worker_still_alive") is True, records[-1]
+        assert records[-1].get("controller_session_id") is None, records[-1]
+        assert records[-1].get("controller_pid") is None, records[-1]
         leases = [
             lease
             for lease in (state_snapshot.get("capacity", {}).get("leases") or {}).values()
@@ -724,6 +823,7 @@ def case_runner_progress_stall_detaches_by_default() -> None:
         assert not leases[-1].get("released_at"), leases[-1]
         assert leases[-1].get("worker_pid") == worker_pid, leases[-1]
         assert leases[-1].get("controller_pid") == worker_pid, leases[-1]
+        assert leases[-1].get("detached_controller_pid") is None, leases[-1]
     finally:
         _force_kill(worker_pid)
 
@@ -2125,6 +2225,7 @@ def main() -> None:
     case_matrix_env_surfaces_bounded_audit()
     case_matrix_claude_defer_skips_remaining_cases()
     case_runner_raw_vendor_flood_hits_progress_stall_and_reaps()
+    case_runner_preserves_live_controller_beacon_pair()
     case_runner_progress_stall_detaches_by_default()
     case_detached_pidfile_entry_survives_ghost_cleanup()
     case_runner_progress_then_silent_wedges_and_reaps()

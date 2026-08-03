@@ -1895,6 +1895,13 @@ async def _run_acp_dispatch_impl(
     original_prompt_file = _resolve_original_prompt_file(cfg)
     run_started = time.time()
     project_root = Path(cfg.cwd).resolve()
+    controller_session_id = getattr(cfg, "controller_session_id", None)
+    controller_pid = getattr(cfg, "controller_pid", None)
+    if not controller_session_id or controller_pid is None:
+        controller_session_id = None
+        controller_pid = None
+    else:
+        controller_session_id = str(controller_session_id)
     permission_mode = str(getattr(cfg, "permission_mode", "auto") or "auto")
     try:
         user_confirm_timeout_s = float(
@@ -1971,6 +1978,8 @@ async def _run_acp_dispatch_impl(
         "agent": cfg.agent,
         "priority": getattr(cfg, "priority", "normal"),
         "session_id": cfg.session_id,
+        "controller_session_id": controller_session_id,
+        "controller_pid": controller_pid,
         "project_root": str(project_root),
         "worker_cwd": worker_cwd,
         "worktree_mode": worktree_mode,
@@ -2132,7 +2141,7 @@ async def _run_acp_dispatch_impl(
         project_root=str(project_root),
         worktree_path=str(worktree_path) if worktree_path is not None else None,
         worker_cwd=str(worktree_path) if worktree_path is not None else worker_cwd,
-        controller_pid=os.getpid(),
+        controller_pid=controller_pid,
         worker_pid=None,
         lease_id=None,
         mem_mb=None,
@@ -2317,7 +2326,8 @@ async def _run_acp_dispatch_impl(
                     # This mirrors the capacity lease, which already records the
                     # unmodified project_root.
                     project_root=str(project_root),
-                    controller_pid=os.getpid(),
+                    controller_pid=controller_pid,
+                    controller_session_id=controller_session_id,
                     worker_pid=worker_pid,
                     acp_session_id=cfg.session_id,
                     logical_session_id=cfg.session_id,

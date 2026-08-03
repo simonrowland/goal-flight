@@ -22,8 +22,11 @@ SUCCESS_TERMINAL_MARKERS = {"COMPLETE", "READY", "RESULT"}
 # hangs in teardown is still a worker whose work has failed -- the live
 # process does not invalidate the report, so liveness must not suppress it.
 ATTENTION_MARKERS = {"BLOCKED", "USER-NEED", "USER-CONFIRM", "FAILED"}
+TEMPLATE_GUARDED_MARKERS = {"BLOCKED", "USER-NEED", "USER-CONFIRM"}
 TERMINAL_MARKERS = SUCCESS_TERMINAL_MARKERS | ATTENTION_MARKERS
 TOKEN_COUNT_RE = re.compile(r"^\d[\d,]*$")
+TEMPLATE_PLACEHOLDER_RE = re.compile(r"<[^<>\r\n]+>")
+FENCE_RUN_RE = re.compile(r"^[ \t]*(?P<run>`{3,}|~{3,})(?P<rest>.*)$")
 # One optional worker-marker sigil grammar shared by every parser. Keep this as
 # a regex fragment so each consumer can preserve its existing markdown/fence/
 # position rules around the marker token.
@@ -32,6 +35,52 @@ MARKER_SIGIL_OPT_RE = rf"{re.escape(MARKER_SIGIL)}?"
 STEER_ACK_RE = re.compile(
     rf"^\**{MARKER_SIGIL_OPT_RE}\**STEER-ACK:\**\s*(\d+)\b"
 )
+
+
+class MarkdownFenceTracker:
+    """Track fenced regions without letting a different delimiter close them."""
+
+    def __init__(self) -> None:
+        self._delimiter = ""
+        self._minimum_length = 0
+
+    @property
+    def in_fence(self) -> bool:
+        return bool(self._delimiter)
+
+    def consume_boundary(self, raw_line: str) -> bool:
+        """Consume a matching fence boundary and report whether the line was one."""
+
+        match = FENCE_RUN_RE.match(raw_line)
+        if not match:
+            return False
+        run = match.group("run")
+        rest = match.group("rest")
+        if not self.in_fence:
+            self._delimiter = run[0]
+            self._minimum_length = len(run)
+            return True
+        if (
+            run[0] == self._delimiter
+            and len(run) >= self._minimum_length
+            and not rest.strip()
+        ):
+            self._delimiter = ""
+            self._minimum_length = 0
+            return True
+        return False
+
+
+def marker_payload_has_template_placeholder(payload: object) -> bool:
+    """Return whether a payload still contains a documented ``<...>`` token."""
+
+    return bool(TEMPLATE_PLACEHOLDER_RE.search(str(payload or "")))
+
+
+def marker_is_template_example(kind: object, payload: object) -> bool:
+    """Reject unsubstituted escalation templates, never completion/failure markers."""
+
+    return kind in TEMPLATE_GUARDED_MARKERS and marker_payload_has_template_placeholder(payload)
 
 
 def read_tail_excerpt(path: Path, max_bytes: int = RATE_LIMIT_TAIL_BYTES) -> str:

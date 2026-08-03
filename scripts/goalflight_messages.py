@@ -31,6 +31,7 @@ MIN_DERIVED_PROJECT_ALIAS_LEN = 4
 sys.path.insert(0, str(SCRIPT_DIR))
 
 import goalflight_compat  # noqa: E402
+import goalflight_steer_mailbox  # noqa: E402
 from goalflight_watch import BLOCKING_TERMINAL_MARKERS, SUCCESS_TERMINAL_MARKERS  # noqa: E402
 
 MARKER_TO_TYPE: dict[str, str] = {
@@ -47,6 +48,19 @@ PRIORITY_BY_TYPE: dict[str, str] = {
     "user_confirm": "urgent",
     "blocked": "urgent",
 }
+# Typed controller channel. The unprefixed values are legacy envelopes that the
+# aggregate already accepts; keeping one set prevents delivery and relay drift.
+CONTROLLER_CHANNEL_TYPES = frozenset(
+    {
+        "controller-question",
+        "controller-answer",
+        "controller-notice",
+        "controller-coordination",
+        "coordination",
+        "notice",
+    }
+)
+NON_ERROR_UNDELIVERED_STATUSES = frozenset({"terminal_recorded_only", "worker_view_queued"})
 
 REQUIRED_ENVELOPE_FIELDS = (
     "schema",
@@ -249,6 +263,8 @@ def post_message(
     priority: str | None = None,
     fleet_dir: Path | None = None,
     update_aggregate: bool = False,
+    deliver_to_worker: bool = False,
+    retain_terminal_worker_view: bool = False,
 ) -> dict:
     """Append one goalflight.message.v1 envelope; shared by CLI, MCP, and tests."""
     if not isinstance(payload, dict):
@@ -288,9 +304,203 @@ def post_message(
         line = serialize_envelope_line(envelope)
         with path.open("a", encoding="utf-8") as fh:
             fh.write(line)
+        # The messages lock orders both the canonical record and its materialized
+        # worker view. Releasing it between the two writes lets concurrent posts
+        # assign message seq 1/2 but append steer entries in the order 2/1.
+        delivery = (
+            _deliver_message_to_worker(
+                dispatch_id,
+                envelope,
+                retain_terminal_worker_view=retain_terminal_worker_view,
+            )
+            if deliver_to_worker
+            else {
+                "requested": False,
+                "delivered": False,
+                "worker_view_written": False,
+                "status": "record_only",
+                "detail": "message recorded; worker delivery was not requested",
+            }
+        )
     if update_aggregate and fleet_dir is not None:
         refresh_aggregate(fleet_dir, messages_dir=messages_dir)
-    return {"envelope": envelope, "line": line, "path": str(path)}
+    return {
+        "envelope": envelope,
+        "line": line,
+        "path": str(path),
+        "recorded": True,
+        "delivery": delivery,
+    }
+
+
+def _dispatch_record(dispatch_id: str) -> tuple[dict | None, str | None]:
+    try:
+        import goalflight_ledger  # type: ignore
+
+        return (
+            next(
+                (record for record in goalflight_ledger.read_records() if record.get("dispatch_id") == dispatch_id),
+                None,
+            ),
+            None,
+        )
+    except Exception as exc:  # noqa: BLE001 - surfaced as a delivery failure
+        return None, f"{type(exc).__name__}: {exc}"
+
+
+def _deliver_message_to_worker(
+    dispatch_id: str,
+    envelope: dict,
+    *,
+    retain_terminal_worker_view: bool = False,
+) -> dict:
+    record, lookup_error = _dispatch_record(dispatch_id)
+    if lookup_error is not None:
+        return {
+            "requested": True,
+            "delivered": False,
+            "worker_view_written": False,
+            "status": "worker_delivery_failed",
+            "detail": f"message recorded but dispatch lookup failed: {lookup_error}",
+        }
+    if record is None:
+        return {
+            "requested": True,
+            "delivered": False,
+            "worker_view_written": False,
+            "status": "recorded_only_no_dispatch",
+            "detail": "message recorded; no matching dispatch record, so no worker delivery was attempted",
+        }
+    try:
+        import goalflight_ledger  # type: ignore
+
+        classification = goalflight_ledger.classify(record)
+    except Exception as exc:  # noqa: BLE001 - surfaced as a delivery failure
+        return {
+            "requested": True,
+            "delivered": False,
+            "worker_view_written": False,
+            "status": "worker_delivery_failed",
+            "detail": f"message recorded but worker liveness classification failed: {type(exc).__name__}: {exc}",
+        }
+    # A detached worker intentionally survives controller death. Ledger
+    # classification verifies its PID+identity and is authoritative over that
+    # otherwise-terminal state label; all other terminal records remain record-only.
+    detached_live = classification == "expected_live" and bool(record.get("detached")) and (
+        record.get("state") == "controller_dead"
+        or (
+            record.get("state") == "orphaned"
+            and (record.get("reason") or record.get("error")) == "controller_dead"
+        )
+    )
+    if _record_is_terminal(record) and not detached_live:
+        state = record.get("terminal_state") or record.get("state") or "terminal"
+        if not retain_terminal_worker_view:
+            return {
+                "requested": True,
+                "delivered": False,
+                "worker_view_written": False,
+                "status": "terminal_recorded_only",
+                "dispatch_state": str(state),
+                "detail": "message recorded for terminal dispatch; no worker will read it",
+            }
+        # Legacy `dispatch steer` keeps terminal rows in the view because a
+        # restarted ACP session can reuse the dispatch id and must reject stale
+        # confirmation replies by sequence/generation rather than lose them.
+        try:
+            steer_path, steer_entry = goalflight_steer_mailbox.append_message_view(dispatch_id, envelope)
+        except (OSError, ValueError) as exc:
+            return {
+                "requested": True,
+                "delivered": False,
+                "worker_view_written": False,
+                "status": "terminal_recorded_only",
+                "dispatch_state": str(state),
+                "detail": (
+                    "message recorded for terminal dispatch; no worker will read it, and its retained "
+                    f"worker view could not be written: {type(exc).__name__}: {exc}"
+                ),
+            }
+        return {
+            "requested": True,
+            "delivered": False,
+            "worker_view_written": True,
+            "status": "terminal_recorded_only",
+            "dispatch_state": str(state),
+            "steer_path": str(steer_path),
+            "steer_seq": steer_entry["seq"],
+            "steer_entry": steer_entry,
+            "detail": "message recorded for terminal dispatch and retained in its worker view; no current worker will read it",
+        }
+    if classification not in {"expected_live", "queued_capacity"}:
+        return {
+            "requested": True,
+            "delivered": False,
+            "worker_view_written": False,
+            "status": "worker_unavailable",
+            "dispatch_classification": classification,
+            "detail": f"message recorded; dispatch is {classification}, so no worker delivery was attempted",
+        }
+    try:
+        steer_path, steer_entry = goalflight_steer_mailbox.append_message_view(dispatch_id, envelope)
+    except (OSError, ValueError) as exc:
+        return {
+            "requested": True,
+            "delivered": False,
+            "worker_view_written": False,
+            "status": "worker_delivery_failed",
+            "detail": f"message recorded but worker delivery failed: {type(exc).__name__}: {exc}",
+        }
+    if classification == "queued_capacity":
+        return {
+            "requested": True,
+            "delivered": False,
+            "worker_view_written": True,
+            "status": "worker_view_queued",
+            "dispatch_classification": classification,
+            "steer_path": str(steer_path),
+            "steer_seq": steer_entry["seq"],
+            "steer_entry": steer_entry,
+            "detail": "message recorded and queued in the worker-visible steer mailbox; no worker is running yet",
+        }
+    return {
+        "requested": True,
+        "delivered": True,
+        "worker_view_written": True,
+        "status": "worker_view_written",
+        "dispatch_classification": classification,
+        "steer_path": str(steer_path),
+        "steer_seq": steer_entry["seq"],
+        "steer_entry": steer_entry,
+        "detail": "message recorded and written to the worker-visible steer mailbox",
+    }
+
+
+def _controller_delivery_requested(dispatch_id: str, msg_type: str) -> bool:
+    """A worker posting to its own inbox is worker→controller sideband."""
+    return os.environ.get("GOALFLIGHT_DISPATCH_ID") != dispatch_id and msg_type in CONTROLLER_CHANNEL_TYPES
+
+
+def post_result_is_error(result: dict) -> bool:
+    delivery = result["delivery"]
+    return bool(
+        delivery["requested"]
+        and not delivery["delivered"]
+        and delivery["status"] not in NON_ERROR_UNDELIVERED_STATUSES
+    )
+
+
+def post_controller_steer(dispatch_id: str, text: str) -> dict:
+    """Record a legacy steer command, then materialize its worker-visible view."""
+    return post_message(
+        dispatch_id=dispatch_id,
+        msg_type="controller-notice",
+        payload={"text": text},
+        messages_dir=default_messages_dir(),
+        source={"node": "local", "adapter": "goalflight-dispatch", "transport": "steer"},
+        deliver_to_worker=True,
+        retain_terminal_worker_view=True,
+    )
 
 
 MCP_TOOL_POST_MESSAGE = "goalflight_post_message"
@@ -326,6 +536,7 @@ def goalflight_post_message_tool(
         priority=arguments.get("priority"),
         fleet_dir=fleet_dir,
         update_aggregate=refresh_aggregate,
+        deliver_to_worker=_controller_delivery_requested(str(dispatch_id), str(msg_type)),
     )
 
 
@@ -416,21 +627,6 @@ def _open_user_needs(envelopes: list[dict], *, acked_through: int = 0) -> list[d
                 }
             )
     return open_items
-
-
-# Types a CONTROLLER or a human deliberately addressed to another controller,
-# as opposed to the worker-marker stream (_open_user_needs). Both are real
-# attention; only the marker stream was ever read, so a peer controller's
-# question or notice reached nobody and the human ended up relaying it by hand.
-CONTROLLER_CHANNEL_TYPES = frozenset(
-    {
-        "controller-question",
-        "controller-answer",
-        "controller-notice",
-        "coordination",
-        "notice",
-    }
-)
 
 
 def _open_controller_channel(envelopes: list[dict], *, acked_through: int = 0) -> list[dict]:
@@ -702,8 +898,13 @@ def cmd_post(args: argparse.Namespace) -> int:
         source=source,
         fleet_dir=args.fleet_dir,
         update_aggregate=args.refresh_aggregate,
+        deliver_to_worker=_controller_delivery_requested(args.dispatch_id, args.type),
     )
     print(json.dumps(result, indent=2 if args.json else None))
+    delivery = result["delivery"]
+    if post_result_is_error(result):
+        print(delivery["detail"], file=sys.stderr)
+        return 1
     return 0
 
 
@@ -1076,8 +1277,9 @@ def _record_is_terminal(record: dict) -> bool:
     try:
         import goalflight_dispatch_states as dispatch_states  # type: ignore
 
-        return dispatch_states.is_terminal_state(record.get("state")) or dispatch_states.is_terminal_state(
-            record.get("terminal_state")
+        return any(
+            dispatch_states.is_terminal_state(record.get(key))
+            for key in ("state", "terminal_state")
         )
     except Exception:
         return False

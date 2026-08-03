@@ -28,20 +28,30 @@ import goalflight_terminal  # noqa: E402
 
 @contextlib.contextmanager
 def _state_dir(tmp: Path):
-    old = os.environ.get("GOALFLIGHT_STATE_DIR")
-    os.environ["GOALFLIGHT_STATE_DIR"] = str(tmp)
+    isolated = {
+        "GOALFLIGHT_STATE_DIR": str(tmp),
+        "GOALFLIGHT_MESSAGES_DIR": str(tmp / "messages"),
+        "GOAL_FLIGHT_PIDFILE_DIR": str(tmp / "pids"),
+        "GOALFLIGHT_TASK_STORE_DIR": str(tmp / "task-store"),
+    }
+    old = {key: os.environ.get(key) for key in isolated}
+    os.environ.update(isolated)
     try:
         yield
     finally:
-        if old is None:
-            os.environ.pop("GOALFLIGHT_STATE_DIR", None)
-        else:
-            os.environ["GOALFLIGHT_STATE_DIR"] = old
+        for key, value in old.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 def _env(tmp: Path) -> dict[str, str]:
     env = os.environ.copy()
     env["GOALFLIGHT_STATE_DIR"] = str(tmp)
+    env["GOALFLIGHT_MESSAGES_DIR"] = str(tmp / "messages")
+    env["GOAL_FLIGHT_PIDFILE_DIR"] = str(tmp / "pids")
+    env["GOALFLIGHT_TASK_STORE_DIR"] = str(tmp / "task-store")
     env["PYTHONPATH"] = str(SCRIPTS) + os.pathsep + env.get("PYTHONPATH", "")
     return env
 
@@ -120,6 +130,11 @@ def case_bash_append_and_list_with_ack() -> None:
         entries = _read_mailbox(tmp, dispatch_id)
         assert [entry["seq"] for entry in entries] == [1, 2], entries
         assert [entry["text"] for entry in entries] == ["hello one", "hello two"], entries
+        envelopes = [
+            json.loads(line)
+            for line in (tmp / "messages" / f"{dispatch_id}.jsonl").read_text(encoding="utf-8").splitlines()
+        ]
+        assert [envelope["payload"]["text"] for envelope in envelopes] == ["hello one", "hello two"], envelopes
 
         listed = _run_steer(tmp, dispatch_id, "--list")
         assert listed.returncode == 0, listed.stderr
@@ -186,15 +201,21 @@ def case_prefixed_ack_is_parsed_by_both_call_sites() -> None:
         ), (mailbox_acks, dispatch_acks, regexes_share_definition, regex_values)
 
 
-def case_dead_worker_warns_but_appends() -> None:
+def case_dead_worker_records_but_does_not_claim_delivery() -> None:
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
         _record(tmp, "dead-worker")
         proc = _run_steer(tmp, "dead-worker", "halt")
-        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert proc.returncode != 0, proc.stdout + proc.stderr
         assert "WARN:" in proc.stderr, proc.stderr
+        assert "unknown_no_pid" in proc.stderr, proc.stderr
         entries = _read_mailbox(tmp, "dead-worker")
-        assert len(entries) == 1 and entries[0]["text"] == "halt", entries
+        assert entries == [], entries
+        envelopes = [
+            json.loads(line)
+            for line in (tmp / "messages" / "dead-worker.jsonl").read_text(encoding="utf-8").splitlines()
+        ]
+        assert envelopes[0]["payload"]["text"] == "halt", envelopes
 
 
 def case_steer_is_no_worker_early_exit() -> None:
@@ -223,10 +244,16 @@ def case_steer_is_no_worker_early_exit() -> None:
             goalflight_dispatch._materialize_steer_prompt = old_materialize
             goalflight_dispatch.subprocess.Popen = old_popen
 
-        assert rc == 0, proc_err.getvalue()
-        assert "steer appended:" in proc_out.getvalue(), proc_out.getvalue()
+        assert rc != 0, proc_err.getvalue()
+        assert "unknown_no_pid" in proc_err.getvalue(), proc_err.getvalue()
+        assert "steer appended:" not in proc_out.getvalue(), proc_out.getvalue()
         entries = _read_mailbox(tmp, dispatch_id)
-        assert len(entries) == 1 and entries[0]["text"] == "redirect", entries
+        assert entries == [], entries
+        envelopes = [
+            json.loads(line)
+            for line in (tmp / "messages" / f"{dispatch_id}.jsonl").read_text(encoding="utf-8").splitlines()
+        ]
+        assert envelopes[0]["payload"]["text"] == "redirect", envelopes
 
 
 def case_concurrent_appends_have_monotonic_unique_seq() -> None:
@@ -612,7 +639,7 @@ def main() -> None:
     case_shape_routing_and_missing_record()
     case_acp_list_reads_status_ack_dict()
     case_prefixed_ack_is_parsed_by_both_call_sites()
-    case_dead_worker_warns_but_appends()
+    case_dead_worker_records_but_does_not_claim_delivery()
     case_steer_is_no_worker_early_exit()
     case_concurrent_appends_have_monotonic_unique_seq()
     case_spawn_exports_steer_env()

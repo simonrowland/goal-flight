@@ -73,6 +73,7 @@ import goalflight_dispatch_states
 import goalflight_steer_mailbox
 import goalflight_ledger
 import goalflight_quota_stuck
+import goalflight_session_status
 import goalflight_terminal
 from goalflight_codex_sandbox import codex_workspace_write_args
 from goalflight_liveness import active_monotonic, process_group_id, write_status
@@ -2162,8 +2163,24 @@ def _read_steer_entries(path: Path) -> list[dict]:
     return goalflight_steer_mailbox.read_steer_entries(path)
 
 
-def _append_steer_message(dispatch_id: str, text: str) -> tuple[Path, dict]:
-    return goalflight_steer_mailbox.append_steer_message(dispatch_id, text)
+def _append_steer_message(dispatch_id: str, text: str) -> dict:
+    import goalflight_messages
+
+    return goalflight_messages.post_controller_steer(dispatch_id, text)
+
+
+def _report_steer_result(dispatch_id: str, result: dict) -> int:
+    delivery = result["delivery"]
+    if delivery["delivered"]:
+        print(
+            f"steer appended: dispatch_id={dispatch_id} seq={delivery['steer_seq']} "
+            f"mailbox={delivery['steer_path']}"
+        )
+        return 0
+    non_error = delivery["status"] in {"terminal_recorded_only", "worker_view_queued"}
+    stream = sys.stdout if non_error else sys.stderr
+    print(f"steer recorded: dispatch_id={dispatch_id}; {delivery['detail']}", file=stream)
+    return 0 if non_error else 1
 
 
 def _acked_steer_seqs(record: dict) -> set[int]:
@@ -2200,9 +2217,10 @@ def _cmd_steer(argv: list[str]) -> int:
         warning = _worker_liveness_warning(record)
         if warning:
             print(warning, file=sys.stderr)
-        path, entry = _append_steer_message(args.dispatch_id, args.message)
-        print(f"steer appended: dispatch_id={args.dispatch_id} seq={entry['seq']} mailbox={path}")
-        return 0
+        return _report_steer_result(
+            args.dispatch_id,
+            _append_steer_message(args.dispatch_id, args.message),
+        )
     if shape != "bash":
         print(f"goalflight_dispatch: dispatch {args.dispatch_id} has unsupported shape {shape!r}", file=sys.stderr)
         return 64
@@ -2210,9 +2228,10 @@ def _cmd_steer(argv: list[str]) -> int:
     warning = _worker_liveness_warning(record)
     if warning:
         print(warning, file=sys.stderr)
-    path, entry = _append_steer_message(args.dispatch_id, args.message)
-    print(f"steer appended: dispatch_id={args.dispatch_id} seq={entry['seq']} mailbox={path}")
-    return 0
+    return _report_steer_result(
+        args.dispatch_id,
+        _append_steer_message(args.dispatch_id, args.message),
+    )
 
 
 def _codex_dispatch_homes_dir() -> Path:
@@ -2683,8 +2702,44 @@ def _reserve_auto_dispatch_id(agent: str, base: Path) -> str:
     raise DispatchUsageError(f"could not reserve a dispatch id for stem {stem!r}")
 
 
-def _controller_pid(args) -> int:
-    return int(args.controller_pid or os.getpid())
+def _stamp_controller_session(args, project_root: Path) -> None:
+    """Snapshot the live controller beacon onto one dispatch invocation.
+
+    The dispatch CLI is a short-lived process, so its pid is not controller
+    identity. Resolve the beacon once and keep its id/pid paired for every
+    record this invocation writes. A missing or unreadable beacon means the
+    dispatch is unowned; it must never make the launch fail or cause this
+    process to be substituted as the owner.
+    """
+    try:
+        session = goalflight_session_status.live_session(project_root)
+    except Exception:
+        session = None
+
+    session_id = session.get("id") if isinstance(session, dict) else None
+    session_pid = session.get("pid") if isinstance(session, dict) else None
+    try:
+        session_pid = int(session_pid) if session_pid is not None else None
+    except (TypeError, ValueError):
+        session_pid = None
+    if not session_id or session_pid is None:
+        session_id = None
+        session_pid = None
+
+    args.controller_session_id = str(session_id) if session_id is not None else None
+    args._controller_beacon_pid = session_pid
+
+
+def _controller_pid(args) -> int | None:
+    session_id = getattr(args, "controller_session_id", None)
+    pid = getattr(args, "_controller_beacon_pid", None)
+    return pid if session_id and pid is not None else None
+
+
+def _controller_session_id(args) -> str | None:
+    value = getattr(args, "controller_session_id", None)
+    pid = getattr(args, "_controller_beacon_pid", None)
+    return str(value) if value and pid is not None else None
 
 
 def _account_engine(agent: str) -> str | None:
@@ -2911,6 +2966,8 @@ def _prelaunch_status_metadata(
         "dispatch_id": args.dispatch_id,
         "agent": args.agent,
         "shape": args.shape,
+        "controller_session_id": _controller_session_id(args),
+        "controller_pid": _controller_pid(args),
     }
     task_ids = list(getattr(args, "task_ids", []) or [])
     if task_ids:
@@ -3108,6 +3165,8 @@ def _record_ledger(args, *, project_root: Path, prompt_path: str | None, status_
                 transport="dispatch",
                 project_root=str(project_root),
                 controller_pid=_controller_pid(args),
+                controller_session_id=_controller_session_id(args),
+                claimant_pid=os.getpid() if state == "waiting_capacity" else None,
                 worker_pid=worker_pid,
                 acp_session_id=None,
                 logical_session_id=args.dispatch_id,
@@ -3148,6 +3207,7 @@ def _record_queued_ledger_fast(args, *, project_root: Path, prompt_path: str | N
         "transport": "dispatch",
         "project_root": str(project_root),
         "controller_pid": _controller_pid(args),
+        "controller_session_id": _controller_session_id(args),
         "controller_identity": None,
         "worker_pid": None,
         "worker_identity": None,
@@ -3298,8 +3358,9 @@ def _canonical_replay_argv(args, raw_argv: list[str], *, tail: Path, status_json
         argv += ["--permission-inline-timeout-s", str(args.permission_inline_timeout_s)]
     if args.permission_user_timeout_s is not None:
         argv += ["--permission-user-timeout-s", str(args.permission_user_timeout_s)]
-    if args.controller_pid:
-        argv += ["--controller-pid", str(args.controller_pid)]
+    # A replay is a new dispatch invocation and snapshots the then-live beacon.
+    # Carrying either the legacy CLI pid or this invocation's snapshot would
+    # turn a durable queue request into stale ownership evidence.
     if raw_argv:
         argv += ["--", *raw_argv]
     return argv
@@ -4108,9 +4169,12 @@ def _write_pidfile(
     if not ident:
         return None
     controller_pid = _controller_pid(args)
-    pidfile = pidfile_dir / f"{controller_pid}.bashtail.{worker_pid}.jsonl"
+    controller_session_id = _controller_session_id(args)
+    owner_key = str(controller_pid) if controller_pid is not None else "unowned"
+    pidfile = pidfile_dir / f"{owner_key}.bashtail.{worker_pid}.jsonl"
     entry = {
         "controller_pid": controller_pid,
+        "controller_session_id": controller_session_id,
         "pid": worker_pid,
         "pgid": int(pgid or worker_pid),
         "started_at": ident.get("lstart"),
@@ -4177,15 +4241,10 @@ def _reap_dead_worker_pgroup(pidfile: Path, worker_pid: int) -> None:
 def _mark_pidfile_detached(pidfile: Path) -> None:
     """Stamp ``detached: true`` on a bash-tail pidfile whose worker is still alive.
 
-    Mirror of the ACP ``mark_connection_detached`` path. This dispatch process is
-    EPHEMERAL: once a NON-terminal watcher exit returns (idle-timeout rc=2, or any
-    exit with the worker still running for re-attach), the pidfile's recorded
-    ``controller_pid`` is this soon-to-exit pid. Without a ``detached`` flag the
-    next ``cleanup_ghosts`` sweep -- including a sibling project sharing the pidfile
-    dir -- would see dead-controller + live-worker and SIGKILL the live worker's
-    group, losing its uncommitted work. ``detached: true`` makes cleanup_ghosts
-    SKIP it (exactly as it skips an intentionally-detached ACP worker), without
-    weakening genuine-ghost reaping (dead controller + dead worker, not detached).
+    Mirror of the ACP ``mark_connection_detached`` path. A non-terminal watcher
+    exit can leave the worker running for re-attach. The marker makes that intent
+    explicit for owned workers after their controller exits; unowned workers are
+    independently preserved because missing ownership is not proof of abandonment.
     """
     try:
         lines = pidfile.read_text(encoding="utf-8").splitlines()
@@ -4204,10 +4263,8 @@ def _cleanup_pidfile_if_worker_dead(pidfile: Path | None, worker_pid: int | None
         return
     if goalflight_compat.pid_alive(worker_pid):
         # Still alive: non-destructive -- leave the pidfile for re-attach, but flag
-        # it detached so cleanup_ghosts protects this live worker after we exit
-        # (symmetry with the ACP mark_connection_detached path). Without this, the
-        # un-flagged pidfile + this ephemeral process's now-dead pid = a live worker
-        # that the next ghost sweep would SIGKILL.
+        # it detached so cleanup_ghosts preserves the explicit re-attach intent for
+        # owned workers after their controller exits (symmetry with ACP cleanup).
         _mark_pidfile_detached(pidfile)
         return
     _reap_dead_worker_pgroup(pidfile, worker_pid)
@@ -7509,6 +7566,8 @@ def _build_acp_cfg(args, *, status_json: Path, base: Path | None = None):
         steer_file=str(_steer_file(args.dispatch_id)),
         queue_launch_token=getattr(args, "queue_launch_token", None),
         request_envelope=_queue_request_envelope(args),
+        controller_session_id=_controller_session_id(args),
+        controller_pid=_controller_pid(args),
         cpu_epsilon=0.1,
         json=False,
     )
@@ -7549,6 +7608,7 @@ def _record_test_acp_running_fast(
         "transport": "dispatch",
         "project_root": str(project_root),
         "controller_pid": _controller_pid(args),
+        "controller_session_id": _controller_session_id(args),
         "controller_identity": None,
         "worker_pid": worker_pid,
         "worker_identity": None,
@@ -8184,8 +8244,14 @@ def main(argv: list[str] | None = None) -> int:
             "180s for read-only/research/custom workers."
         ),
     )
-    parser.add_argument("--controller-pid", type=int,
-                        help="If set, watcher exits when this pid dies (orphan guard)")
+    parser.add_argument(
+        "--controller-pid",
+        type=int,
+        help=(
+            "Legacy compatibility input. Controller ownership and the watcher "
+            "orphan guard are derived from the live project beacon."
+        ),
+    )
     parser.add_argument("--from-queue", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--queue-launch-token", help=argparse.SUPPRESS)
     parser.add_argument("--queue-claim-path", help=argparse.SUPPRESS)
@@ -8221,6 +8287,7 @@ def main(argv: list[str] | None = None) -> int:
             print(goalflight_ledger.format_stats_table(payload))
         return 0
     raw = _raw_worker_args(args)
+    _stamp_controller_session(args, _project_root(args))
 
     if args.interactive:
         if args.shape not in {"auto", "acp"}:
@@ -8576,7 +8643,7 @@ def main(argv: list[str] | None = None) -> int:
         # Record worker_pid on the lease FIRST and unconditionally: stale-release
         # treats a live worker_pid as authoritative, so this must persist even if
         # the detached reparent below fails (otherwise release-stale could free a
-        # live detached worker's slot when controller_pid is the dead launcher).
+        # live detached worker's slot when its controller is dead or unknown).
         try:
             _attach_worker_to_lease(lease_id, worker_pid)
         except Exception as e:
@@ -8635,7 +8702,7 @@ def main(argv: list[str] | None = None) -> int:
             worker_pid=worker_pid,
             shape="bash",
             agent=args.agent,
-            controller_pid=args.controller_pid,
+            controller_pid=_controller_pid(args),
             poll_secs=args.poll_secs,
             max_idle_secs=args.max_idle_secs,
         )
@@ -8678,8 +8745,15 @@ def main(argv: list[str] | None = None) -> int:
                 "--codex-home-owner-dispatch-id",
                 codex_home_owner_dispatch_id,
             ]
-        if args.controller_pid:
-            watch_cmd += ["--controller-pid", str(args.controller_pid)]
+        controller_pid = _controller_pid(args)
+        controller_session_id = _controller_session_id(args)
+        if controller_pid is not None and controller_session_id is not None:
+            watch_cmd += [
+                "--controller-pid",
+                str(controller_pid),
+                "--controller-session-id",
+                controller_session_id,
+            ]
         if prompt_path:
             watch_cmd += ["--ignore-prompt-file", str(prompt_path)]
 

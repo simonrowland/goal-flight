@@ -1,15 +1,19 @@
 """Focused tests for capacity TTL-prune liveness gate + non-mutating status.
 
-Covers two fixes (B-P0, B-P1) in scripts/goalflight_capacity.py:
+Covers three fixes (B-P0, B-P1, B-P2) in scripts/goalflight_capacity.py:
 
-  B-P0  prune_state must NOT TTL-expire a lease whose worker or orchestrator pid
-        is still LIVE. capacity.json is shared across sibling projects under one
+  B-P0  prune_state must NOT TTL-expire a lease with any live holder pid.
+        capacity.json is shared across sibling projects under one
         /tmp/goal-flight-<uid>/ dir; a clock-only TTL eviction here would
         over-subscribe the machine while a sibling project's worker is still
-        consuming RAM. Only a lease with BOTH pids dead is reclaimable by TTL.
+        consuming RAM. Only a lease with no live worker, controller, or
+        pre-attach claimant is reclaimable by TTL.
 
   B-P1  cmd_status is a READ. It must compute a pruned VIEW without persisting,
         so a frequent status poll can't race-evict another project's live lease.
+
+  B-P2  an unowned acquire keeps controller ownership null while a separate
+        claimant pid protects the lease until the worker pid is attached.
 
 State is isolated via $GOALFLIGHT_STATE_DIR (read at call time by state_dir()),
 so these tests never read or mutate the real shared capacity.json.
@@ -588,6 +592,54 @@ def case_acquire_atomic_gate_still_blocks_over_cap(state_dir: Path) -> None:
         worker.wait()
 
 
+def case_unowned_acquire_tracks_pre_attach_claimant(state_dir: Path) -> None:
+    """A live launcher protects an unowned lease without becoming its owner."""
+    cap.save_state(
+        {
+            "schema": cap.SCHEMA,
+            "machine_id": cap.machine_id(),
+            "leases": {},
+            "cooldowns": {},
+        }
+    )
+    output = io.StringIO()
+    with redirect_stdout(output):
+        rc = cap.main(
+            [
+                "acquire",
+                "--agent",
+                "codex",
+                "--lease-id",
+                "unowned-pre-attach",
+                "--project-root",
+                str(REPO_ROOT),
+                "--ttl-s",
+                "3600",
+                "--ram-mb",
+                "65536",
+                "--max-total",
+                "20",
+            ]
+        )
+    assert rc == 0, (rc, output.getvalue())
+
+    data = cap.load_state()
+    lease = data["leases"]["unowned-pre-attach"]
+    assert lease.get("controller_pid") is None, lease
+    assert lease.get("worker_pid") is None, lease
+    assert lease.get("claimant_pid") == os.getpid(), lease
+    assert lease not in cap.stale_active_leases(data), lease
+
+    lease["expires_at"] = cap.iso(cap.utc_now() - dt.timedelta(seconds=1))
+    cap.prune_state(data)
+    assert lease.get("state") == "active", lease
+
+    lease["claimant_pid"] = _dead_pid()
+    assert lease in cap.stale_active_leases(data), lease
+    cap.prune_state(data)
+    assert lease.get("state") == "expired", lease
+
+
 def case_adaptive_rate_pressure_reduces_codex_effective_cap(state_dir: Path) -> None:
     """Clustered codex model-capacity failures halve only codex effective cap.
 
@@ -770,6 +822,7 @@ def main() -> None:
             case_release_stale_poison_pair_live_worker_survives_dead_controller(state_dir)
             case_aggregate_status_payload_does_not_persist_prune(state_dir)
             case_acquire_atomic_gate_still_blocks_over_cap(state_dir)
+            case_unowned_acquire_tracks_pre_attach_claimant(state_dir)
             case_adaptive_rate_pressure_reduces_codex_effective_cap(state_dir)
             case_adaptive_rate_pressure_status_surfaces_warning(state_dir)
             case_rate_pressure_refuses_per_session_policy_override(state_dir)

@@ -183,12 +183,21 @@ def _ps_meta(pid: int) -> tuple[str, str] | None:
         return None
 
 
+def _normalize_lstart(value: str) -> str:
+    """Canonicalize ps lstart whitespace across producer and consumer formats."""
+    return " ".join(value.split())
+
+
 def _same_process(
     started_meta: tuple[str, str] | None,
     live_meta: tuple[str, str] | None,
 ) -> bool:
     """Return false only when a live process has a different start time."""
-    return started_meta is None or live_meta is None or started_meta[0] == live_meta[0]
+    return (
+        started_meta is None
+        or live_meta is None
+        or _normalize_lstart(started_meta[0]) == _normalize_lstart(live_meta[0])
+    )
 
 
 class AcpError(Exception):
@@ -316,7 +325,7 @@ def _shim_owner_marker() -> str:
 
 
 def cleanup_ghosts(active_worker_pids: set[int] | None = None) -> int:
-    """Reap workers recorded by dead orchestrator pidfiles."""
+    """Reap owned ACP ghosts while preserving live bash-tail workers."""
     own_pid = os.getpid()
     own_worker_pids = active_worker_pids or set()
     killed = 0
@@ -328,15 +337,26 @@ def cleanup_ghosts(active_worker_pids: set[int] | None = None) -> int:
         )
     skipped_stale = 0
     skipped_live_controller = 0
+    skipped_live_bashtail = 0
     skipped_detached = 0
+    skipped_unowned = 0
     for pf in _PIDFILE_DIR.glob("*.jsonl"):
+        owner_key = pf.stem.split(".", 1)[0]
         try:
-            controller_pid = int(pf.stem.split(".", 1)[0])
+            controller_pid = None if owner_key == "unowned" else int(owner_key)
         except ValueError:
             continue
-        if controller_pid == own_pid:
+        is_bash_tail_pidfile = ".bashtail." in pf.name
+        if (
+            not is_bash_tail_pidfile
+            and controller_pid is not None
+            and controller_pid == own_pid
+        ):
             continue
-        if _ps_meta(controller_pid) is not None or goalflight_compat.pid_alive(controller_pid):
+        if not is_bash_tail_pidfile and controller_pid is not None and (
+            _ps_meta(controller_pid) is not None
+            or goalflight_compat.pid_alive(controller_pid)
+        ):
             skipped_live_controller += 1
             continue
         try:
@@ -355,20 +375,19 @@ def cleanup_ghosts(active_worker_pids: set[int] | None = None) -> int:
             pid = entry.get("pid")
             if not isinstance(pid, int) or pid in own_worker_pids:
                 continue
-            if entry.get("detached"):
-                # A worker the runner intentionally DETACHED on a non-destructive
-                # stall (D2): the orchestrator exited but deliberately left the
-                # worker running for re-attach, so it is NOT a ghost. Reaping it
-                # here would SIGKILL a live, intentional worker (and across
-                # concurrent projects sharing this pidfile dir). Leave the pidfile
-                # while the worker is live; once the pid is gone, fall through to
-                # unlink the stale pidfile below. The capacity lease's detached_*
-                # markers drive slot reclamation when the worker actually dies
-                # (see goalflight_capacity stale-release).
-                skipped_detached += 1
-                detached_live = False
+            is_bash_tail = is_bash_tail_pidfile and str(
+                entry.get("agent", "")
+            ).endswith("-bash-tail")
+            if is_bash_tail or entry.get("detached") or controller_pid is None:
+                # Detached workers were deliberately left for re-attach. Unowned
+                # workers have no controller beacon proving they are abandoned.
+                # A bash-tail worker can outlive its controller before the launcher's
+                # finally block detach-stamps it. None is a ghost merely because no
+                # live owner is known. Keep an identity-matching live worker and its
+                # pidfile; once the worker dies, unlink the stale pidfile below.
+                protected_live = False
                 if goalflight_compat.is_windows():
-                    detached_live = goalflight_compat.pid_alive(pid)
+                    protected_live = goalflight_compat.pid_alive(pid)
                 else:
                     meta = _ps_meta(pid)
                     recorded_lstart = entry.get("started_at")
@@ -378,8 +397,22 @@ def cleanup_ghosts(active_worker_pids: set[int] | None = None) -> int:
                         if isinstance(recorded_lstart, str) and isinstance(recorded_comm, str)
                         else None
                     )
-                    detached_live = meta is not None and _same_process(recorded_meta, meta)
-                if detached_live:
+                    protected_live = meta is not None and _same_process(
+                        recorded_meta, meta
+                    )
+                    if (is_bash_tail or controller_pid is None) and meta is None:
+                        # Bash-tail and unowned entries lack an explicit reapable
+                        # transition. When ps identity is unavailable, kill(0)
+                        # liveness is enough to preserve metadata; the safe failure
+                        # is a stale pidfile, never killing or forgetting a worker.
+                        protected_live = goalflight_compat.pid_alive(pid)
+                if protected_live:
+                    if is_bash_tail:
+                        skipped_live_bashtail += 1
+                    elif entry.get("detached"):
+                        skipped_detached += 1
+                    else:
+                        skipped_unowned += 1
                     preserve_pidfile = True
                     continue
                 continue
@@ -440,14 +473,23 @@ def cleanup_ghosts(active_worker_pids: set[int] | None = None) -> int:
                 killed += 1
         if not preserve_pidfile:
             pf.unlink(missing_ok=True)
-    if killed or skipped_stale or skipped_live_controller or skipped_detached:
+    if (
+        killed
+        or skipped_stale
+        or skipped_live_controller
+        or skipped_live_bashtail
+        or skipped_detached
+        or skipped_unowned
+    ):
         log.info(
             "ghost_cleanup: killed=%d skipped_stale=%d skipped_live_controllers=%d "
-            "skipped_detached=%d",
+            "skipped_live_bashtail=%d skipped_detached=%d skipped_unowned=%d",
             killed,
             skipped_stale,
             skipped_live_controller,
+            skipped_live_bashtail,
             skipped_detached,
+            skipped_unowned,
         )
     return (
         killed
@@ -1762,17 +1804,17 @@ _USER_CONFIRM_MARKER_RE = re.compile(
 
 def _has_actionable_user_confirm_marker(text: str) -> bool:
     """Match USER-CONFIRM with the same fence/payload rules as acp_runner."""
-    in_fence = False
+    fence = goalflight_terminal.MarkdownFenceTracker()
     for line in str(text or "").splitlines():
-        lstrip = line.lstrip()
-        if lstrip.startswith("```") or lstrip.startswith("~~~"):
-            in_fence = not in_fence
+        if fence.consume_boundary(line):
             continue
-        if in_fence:
+        if fence.in_fence:
             continue
         match = _USER_CONFIRM_MARKER_RE.match(line.strip())
-        if match and match.group(1).rstrip("* \t"):
-            return True
+        if match:
+            payload = match.group(1).rstrip("* \t")
+            if payload and not goalflight_terminal.marker_is_template_example("USER-CONFIRM", payload):
+                return True
     return False
 
 

@@ -287,18 +287,32 @@ def test_diff_prefixed_terminal_markers() -> None:
         diff_complete_tail.write_text("+COMPLETE: diff report written\n", encoding="utf-8")
         diff_ready_tail = base / "diff-ready.txt"
         diff_ready_tail.write_text("+ READY: docs-private/research/findings.md\n", encoding="utf-8")
+        preceded_tail = base / "preceded.txt"
+        preceded_tail.write_text(
+            "@@ -1 +1 @@\n"
+            "+ quoted diff output\n"
+            "> quoted markdown output\n"
+            "  indented worker summary\n"
+            "COMPLETE: genuine final marker\n",
+            encoding="utf-8",
+        )
 
         diff_complete = goalflight_watch._last_line_is_terminal_marker(diff_complete_tail)
         diff_ready = goalflight_watch._last_line_is_terminal_marker(diff_ready_tail)
+        preceded = goalflight_watch._last_line_is_terminal_marker(preceded_tail)
 
     assert_eq("diff-prefixed COMPLETE terminal", diff_complete["kind"], "COMPLETE")
     assert_eq("diff-prefixed READY terminal", diff_ready["kind"], "READY")
+    assert_eq("preceding diff/markdown text does not hide real marker", preceded["text"], "genuine final marker")
 
 
 def test_marker_before_known_harness_trailer() -> None:
     with tempfile.TemporaryDirectory() as td:
         tail = Path(td) / "harness-trailer.txt"
         tail.write_text(
+            "```text\n"
+            "BLOCKED: <intended-path> not writable due to <reason>\n"
+            "```\n"
             "COMPLETE: worker finished\n"
             "hook: Stop\n"
             "hook: Stop Completed\n"
@@ -309,6 +323,7 @@ def test_marker_before_known_harness_trailer() -> None:
         marker = goalflight_watch._last_line_is_terminal_marker(tail)
 
     assert_eq("marker before harness trailer terminal", marker["kind"], "COMPLETE")
+    assert_eq("marker before harness trailer payload", marker["text"], "worker finished")
 
 
 def test_recorded_terminal_success_marker() -> None:

@@ -17,6 +17,8 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import goalflight_watch as W  # noqa: E402
 import goalflight_messages as M  # noqa: E402
+import goalflight_acp_client as ACP_CLIENT  # noqa: E402
+from acp_runner import extract_markers as extract_acp_markers  # noqa: E402
 
 
 def assert_eq(name: str, got: object, exp: object) -> None:
@@ -115,6 +117,84 @@ def test_only_urgent_trio_bridged() -> None:
     assert_eq("user_confirm + blocked only (STATUS excluded)", types, ["blocked", "user_confirm"])
 
 
+def test_fenced_marker_example_does_not_hide_or_post_real_marker() -> None:
+    def body(d):
+        transcript = (
+            "worker is explaining the contract\n"
+            "```text\n"
+            "~~~\n"
+            "BLOCKED: quoted example only\n"
+            "USER-CONFIRM: quoted confirmation only\n"
+            "```\n"
+            "work then reached a real blocker\n"
+            "BLOCKED: actual filesystem denial\n"
+        )
+        markers = _markers_from(transcript, d)
+        W.post_worker_mail("w-fenced", markers, set())
+        watcher_blocked = [m["text"] for m in markers if m.get("kind") == "BLOCKED"]
+        acp_blocked = extract_acp_markers(transcript).get("BLOCKED") or []
+        permission_quote_only = transcript.rsplit("work then reached", 1)[0]
+        return (
+            watcher_blocked,
+            acp_blocked,
+            ACP_CLIENT._has_actionable_user_confirm_marker(permission_quote_only),
+            ACP_CLIENT._has_actionable_user_confirm_marker(
+                permission_quote_only + "USER-CONFIRM: approve actual schema change\n"
+            ),
+            _inbox("w-fenced"),
+        )
+
+    watcher_blocked, acp_blocked, quoted_confirmation, real_confirmation, inbox = _with_env(body)
+    expected = ["actual filesystem denial"]
+    assert_eq("watcher detects only real marker outside matched fence", watcher_blocked, expected)
+    assert_eq("ACP detects only real marker outside matched fence", acp_blocked, expected)
+    assert_eq("permission router ignores quoted USER-CONFIRM", quoted_confirmation, False)
+    assert_eq("permission router detects real USER-CONFIRM", real_confirmation, True)
+    assert_eq("mail bridge posts only real marker", inbox, [("blocked", expected[0])])
+
+
+def test_unsubstituted_placeholder_marker_is_secondary_filtered() -> None:
+    def body(d):
+        transcript = (
+            "BLOCKED: <intended-path> not writable due to <reason>\n"
+            "BLOCKED: actual filesystem denial\n"
+            "FAILED: parser stopped at <EOF>\n"
+        )
+        markers = _markers_from(transcript, d)
+        W.post_worker_mail("w-placeholder", markers, set())
+        watcher_blocked = [m["text"] for m in markers if m.get("kind") == "BLOCKED"]
+        acp_blocked = extract_acp_markers(transcript).get("BLOCKED") or []
+        watcher_failed = [m["text"] for m in markers if m.get("kind") == "FAILED"]
+        acp_failed = extract_acp_markers(transcript).get("FAILED") or []
+        return (
+            watcher_blocked,
+            acp_blocked,
+            watcher_failed,
+            acp_failed,
+            ACP_CLIENT._has_actionable_user_confirm_marker("USER-CONFIRM: <question>\n"),
+            ACP_CLIENT._has_actionable_user_confirm_marker("USER-CONFIRM: approve actual schema change\n"),
+            _inbox("w-placeholder"),
+        )
+
+    (
+        watcher_blocked,
+        acp_blocked,
+        watcher_failed,
+        acp_failed,
+        placeholder_confirmation,
+        real_confirmation,
+        inbox,
+    ) = _with_env(body)
+    expected = ["actual filesystem denial"]
+    assert_eq("watcher filters unsubstituted template payload", watcher_blocked, expected)
+    assert_eq("ACP filters unsubstituted template payload", acp_blocked, expected)
+    assert_eq("watcher keeps real FAILED diagnostic with angle brackets", watcher_failed, ["parser stopped at <EOF>"])
+    assert_eq("ACP keeps real FAILED diagnostic with angle brackets", acp_failed, ["parser stopped at <EOF>"])
+    assert_eq("permission router filters placeholder confirmation", placeholder_confirmation, False)
+    assert_eq("permission router keeps real confirmation", real_confirmation, True)
+    assert_eq("placeholder marker never reaches mail", inbox, [("blocked", expected[0])])
+
+
 def test_bridge_is_best_effort_never_raises() -> None:
     # If the mail layer blows up, the bridge must swallow it (liveness comes first).
     saved = M.post_message
@@ -171,6 +251,8 @@ def main() -> None:
         test_dedup_in_memory_and_across_restart,
         test_disabled_after_mail_failure_no_retry_storm,
         test_only_urgent_trio_bridged,
+        test_fenced_marker_example_does_not_hide_or_post_real_marker,
+        test_unsubstituted_placeholder_marker_is_secondary_filtered,
         test_bridge_is_best_effort_never_raises,
         test_non_regular_inbox_disables_bridge_without_hang,
     ]

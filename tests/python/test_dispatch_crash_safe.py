@@ -446,7 +446,10 @@ def case_foreground_keyboard_interrupt_leaves_worker_and_watcher_running() -> No
             pidfile = pidfiles[0]
             rec = json.loads(pidfile.read_text(encoding="utf-8").splitlines()[0])
             assert rec.get("pid") == worker_pid, rec
-            assert rec.get("controller_pid") == proc.pid, rec
+            assert pidfile.name.startswith("unowned."), pidfile
+            assert rec.get("controller_session_id") is None, rec
+            assert rec.get("controller_pid") is None, rec
+            assert rec.get("controller_pid") != proc.pid, rec
             assert rec.get("agent", "").endswith("-bash-tail"), rec
             assert rec.get("detached") is True, "foreground interrupt must detach-stamp live worker pidfile"
 
@@ -461,10 +464,7 @@ def case_foreground_keyboard_interrupt_leaves_worker_and_watcher_running() -> No
                 killed = goalflight_acp_client.cleanup_ghosts()
             assert killed == 0, "detached foreground-interrupt worker must not be reaped"
             assert _process_exists(worker_pid), "worker died during cleanup_ghosts sweep"
-            if meta is not None:
-                assert pidfile.exists(), "live detached pidfile stays available for re-attach"
-            else:
-                assert not pidfile.exists(), "unverifiable detached pidfile is safely unlinked"
+            assert pidfile.exists(), "live unowned pidfile stays available for re-attach"
 
             assert _wait_for(done.exists, timeout=8), "worker did not finish after launcher interrupt"
             assert _wait_for(
@@ -535,6 +535,7 @@ def case_detached_watcher_ignores_dead_controller_pid() -> None:
                 "--status-json", str(status),
                 "--poll-secs", "0.2",
                 "--max-idle-secs", "30",
+                "--controller-session-id", "dead-controller-session",
                 "--controller-pid", str(dead_controller),
                 "--detached",
             ],
@@ -553,6 +554,10 @@ def case_detached_watcher_ignores_dead_controller_pid() -> None:
             ), status.read_text(encoding="utf-8") if status.exists() else "missing detached watcher status"
             payload = json.loads(status.read_text(encoding="utf-8"))
             assert payload.get("detached") is True, payload
+            assert (
+                payload.get("controller_session_id"),
+                payload.get("controller_pid"),
+            ) == ("dead-controller-session", dead_controller), payload
             assert payload.get("state") not in {"orphaned", "controller_dead"}, payload
             assert watcher.poll() is None, "detached watcher exited on dead controller pid"
         finally:
@@ -580,6 +585,7 @@ def case_non_detached_watcher_dead_controller_remains_orphaned() -> None:
                 "--status-json", str(status),
                 "--poll-secs", "0.2",
                 "--max-idle-secs", "30",
+                "--controller-session-id", "dead-controller-session",
                 "--controller-pid", str(dead_controller),
             ],
             stdout=subprocess.PIPE,
@@ -595,6 +601,10 @@ def case_non_detached_watcher_dead_controller_remains_orphaned() -> None:
             payload = json.loads(status.read_text(encoding="utf-8"))
             assert payload.get("state") == "orphaned", payload
             assert payload.get("reason") == "controller_dead", payload
+            assert (
+                payload.get("controller_session_id"),
+                payload.get("controller_pid"),
+            ) == ("dead-controller-session", dead_controller), payload
         finally:
             if watcher.poll() is None:
                 watcher.terminate()

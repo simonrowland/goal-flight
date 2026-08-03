@@ -123,6 +123,29 @@ def append_steer_entry(
             goalflight_compat.flock(f, goalflight_compat.LOCK_UN)
 
 
+def append_message_view(
+    dispatch_id: str,
+    envelope: dict,
+    *,
+    state_dir: Path | str | None = None,
+) -> tuple[Path, dict]:
+    """Project a typed message envelope into the worker's steer mailbox."""
+    payload = envelope.get("payload")
+    if not isinstance(payload, dict):
+        raise ValueError("message envelope payload must be an object")
+    text = payload.get("text")
+    if text is None:
+        text = json.dumps(payload, sort_keys=True) if payload else str(envelope.get("type") or "message")
+    path = steer_file(dispatch_id, state_dir=state_dir)
+    return path, append_steer_entry(
+        path,
+        str(text),
+        dispatch_id=dispatch_id,
+        kind="message",
+        context={"message_envelope": envelope},
+    )
+
+
 def append_steer_message(
     dispatch_id: str,
     text: str,

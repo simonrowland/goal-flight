@@ -534,15 +534,19 @@ def profile(args: argparse.Namespace | None = None) -> dict:
 
 
 def _lease_pids_dead(lease: dict) -> bool:
-    """True only when BOTH the worker and orchestrator pids are gone.
+    """True only when every process that can hold the lease is gone.
 
     A lease whose tracked processes are all dead is genuinely reclaimable;
     one with a live pid is still consuming RAM and must not be evicted by a
     clock-only TTL check (capacity.json is shared across sibling projects, so a
     TTL eviction here would over-subscribe the machine while the lease is LIVE).
     """
-    return not pid_alive(lease.get("worker_pid")) and not pid_alive(
-        lease.get("controller_pid")
+    worker_pid = lease.get("worker_pid")
+    claimant_pid = lease.get("claimant_pid") if worker_pid is None else None
+    return (
+        not pid_alive(worker_pid)
+        and not pid_alive(lease.get("controller_pid"))
+        and not pid_alive(claimant_pid)
     )
 
 
@@ -553,10 +557,10 @@ def prune_state(data: dict) -> None:
         lease = leases[lease_id]
         expires_at = parse_iso(lease.get("expires_at"))
         # TTL expiry is gated on liveness: only flip a past-TTL lease to
-        # "expired" when its worker AND orchestrator pids are both dead. A LIVE
-        # lease past its TTL is kept and left to liveness-based reclaim
-        # (cmd_release-stale / stale_active_leases), so a long-running worker in
-        # a sibling project is never evicted out from under itself.
+        # "expired" when its worker, controller, and pre-attach claimant are all
+        # dead. A LIVE lease past its TTL is kept and left to liveness-based
+        # reclaim (cmd_release-stale / stale_active_leases), so a long-running
+        # worker in a sibling project is never evicted out from under itself.
         if expires_at and expires_at < now and _lease_pids_dead(lease):
             lease["state"] = "expired"
             lease["ended_at"] = lease.get("ended_at") or iso()
@@ -596,7 +600,7 @@ def extend_active_lease_expiry(lease_id: str | None, seconds: float) -> bool:
 
 
 def detach_lease_to_worker(lease_id: str | None, worker_pid: int, reason: object) -> bool:
-    """Re-parent a detached-worker lease from launcher pid to worker pid."""
+    """Make a detached worker's own pid authoritative for lease liveness."""
     if not lease_id or not worker_pid:
         return False
     with StateLock():
@@ -915,7 +919,12 @@ def cmd_acquire(args: argparse.Namespace) -> int:
             "project_root": args.project_root,
             "worker_cwd": getattr(args, "worker_cwd", None),
             "worktree_path": getattr(args, "worktree_path", None),
-            "controller_pid": args.controller_pid or os.getpid(),
+            # None is meaningful: no live controller beacon owned this launch.
+            # The acquire helper's own pid is not controller identity.
+            "controller_pid": args.controller_pid,
+            # Claimant liveness closes the acquire-to-worker-attach race without
+            # conflating this short-lived launcher with controller ownership.
+            "claimant_pid": os.getpid(),
             "worker_pid": args.worker_pid,
             "mem_mb": rss_mb,
             "priority": priority,
@@ -978,7 +987,7 @@ def pid_alive(pid: int | None) -> bool:
 
 
 def stale_active_leases(data: dict) -> list[dict]:
-    """Active leases whose orchestrator or worker PID is no longer running."""
+    """Active leases with no live worker, controller, or pre-attach claimant."""
     stale: list[dict] = []
     for lease in active_leases(data):
         controller_pid = lease.get("controller_pid")
@@ -988,7 +997,7 @@ def stale_active_leases(data: dict) -> list[dict]:
                 continue
             stale.append(lease)
             continue
-        if not pid_alive(controller_pid):
+        if not pid_alive(controller_pid) and not pid_alive(lease.get("claimant_pid")):
             stale.append(lease)
     return stale
 

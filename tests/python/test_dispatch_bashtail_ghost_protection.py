@@ -1,25 +1,12 @@
 #!/usr/bin/env python3
-"""Regression: a bash-tail worker left ALIVE after a non-terminal dispatch exit
-must NOT be SIGKILLed by cleanup_ghosts (the live-worker SIGKILL landmine).
+"""Regression coverage for bash-tail pidfile cleanup.
 
-Bug shape (the asymmetry this fixes): goalflight_dispatch's bash-tail pidfile is
-stamped with ``controller_pid = os.getpid()`` -- the EPHEMERAL dispatch process,
-which then exits. On a NON-terminal watcher exit (idle-timeout rc=2, or any exit
-with the worker still running for re-attach) the pidfile was left on disk with NO
-``detached`` flag and an ``agent`` tag of ``<agent>-dispatch``. The next
-cleanup_ghosts() sweep -- fired by ANY ACP dispatch, including a sibling project
-sharing /tmp/goal-flight-acp-pids.d -- then saw dead-controller + live-worker +
-no-detached-flag and SIGKILLed the live worker's process group, losing its
-uncommitted work.
-
-The fix mirrors the ACP ``mark_connection_detached`` protection: the dispatch
-finally-block stamps ``detached: true`` on the pidfile whenever the worker is
-still alive at cleanup time, and tags the agent ``<agent>-bash-tail`` so the
-intended cleanup_ghosts branch is reachable. This test drives the real
-``_cleanup_pidfile_if_worker_dead`` (the finally-block call) against a genuinely
-alive worker, then runs the real ``cleanup_ghosts`` with a DEAD controller and
-asserts the live worker survives -- while a genuine ghost (dead controller + dead
-worker, not detached) is still reaped.
+Live identity-matching bash-tail workers survive cleanup even when their beacon
+dies before the launcher detach-stamps the pidfile. Unowned pidfiles use an
+explicit ``unowned`` filename marker: cleanup must parse that marker, preserve a
+live worker because missing ownership is not proof of abandonment, and unlink
+the pidfile after the worker dies. These tests use real processes so a parse skip
+cannot masquerade as protection.
 
 POSIX-only (real process groups + ps identity); skips native Windows.
 """
@@ -64,10 +51,21 @@ def _wait_dead(pid: int, timeout: float = 5.0) -> bool:
     return not _alive(pid)
 
 
-def _dispatch_args(*, controller_pid: int, dispatch_id: str, agent: str = "codex"):
+def _dispatch_args(
+    *,
+    controller_pid: int | None,
+    dispatch_id: str,
+    controller_session_id: str | None = None,
+    agent: str = "codex",
+):
     """Minimal args namespace covering exactly what _write_pidfile reads."""
-    return argparse.Namespace(controller_pid=controller_pid, agent=agent,
-                              dispatch_id=dispatch_id)
+    return argparse.Namespace(
+        controller_pid=None,
+        controller_session_id=controller_session_id,
+        _controller_beacon_pid=controller_pid,
+        agent=agent,
+        dispatch_id=dispatch_id,
+    )
 
 
 def _spawn_live_worker() -> subprocess.Popen:
@@ -84,15 +82,46 @@ def _free_dead_pid() -> int:
     return p.pid
 
 
-def _recorded_identity(pid: int) -> tuple[str, str]:
-    """Return (started_at, cmd) EXACTLY as cleanup_ghosts will read them back via
-    its own ``_ps_meta`` (which collapses ps's lstart padding). Recording in this
-    normalized form makes the lstart/comm re-check a guaranteed MATCH, so the test
-    exercises the intended branch (detached-skip vs genuine-kill) deterministically
-    -- not an incidental stale-mismatch skip that varies by day-of-month padding."""
-    meta = goalflight_acp_client._ps_meta(pid)
-    assert meta is not None, f"ps identity unavailable for pid {pid}"
-    return meta
+def case_lstart_padding_is_normalized() -> None:
+    """Ledger and cleanup ps timestamp formatting must compare identically."""
+    recorded = ("Sun Aug  2 12:34:56 2026", "python")
+    observed = ("Sun Aug 2 12:34:56 2026", "python")
+    assert goalflight_acp_client._same_process(recorded, observed)
+
+
+def case_real_pidfile_identity_round_trip() -> None:
+    """A real writer identity must survive cleanup's independently read format."""
+    worker = _spawn_live_worker()
+    worker_pid = worker.pid
+    try:
+        identity = goalflight_ledger.process_identity(worker_pid)
+        assert identity, "ps identity became unavailable after the suite-level probe"
+        with tempfile.TemporaryDirectory() as td:
+            pid_dir = Path(td)
+            with patch.dict(os.environ, {"GOAL_FLIGHT_PIDFILE_DIR": str(pid_dir)}):
+                pidfile = dispatch._write_pidfile(
+                    _dispatch_args(
+                        controller_pid=os.getpid(),
+                        controller_session_id="live-controller-session",
+                        dispatch_id="bashtail-real-identity",
+                    ),
+                    worker_pid=worker_pid,
+                    pgid=os.getpgid(worker_pid),
+                    identity=identity,
+                )
+            assert pidfile is not None and pidfile.exists()
+            with patch("goalflight_acp_client._PIDFILE_DIR", pid_dir), patch(
+                "goalflight_compat.kill_pid",
+                side_effect=AssertionError("real identity round-trip killed live worker"),
+            ):
+                assert goalflight_acp_client.cleanup_ghosts() == 0
+            assert pidfile.exists(), "live worker pidfile lost after real identity round-trip"
+            assert _alive(worker_pid), "real identity round-trip must preserve worker"
+    finally:
+        with contextlib.suppress(OSError):
+            os.killpg(os.getpgid(worker_pid), signal.SIGKILL)
+        with contextlib.suppress(Exception):
+            worker.wait(timeout=5)
 
 
 def case_live_bashtail_worker_not_killed_by_ghost_sweep() -> None:
@@ -104,31 +133,32 @@ def case_live_bashtail_worker_not_killed_by_ghost_sweep() -> None:
     worker_pid = worker.pid
     try:
         assert _alive(worker_pid)
-        # The dispatch process's OWN pid acts as the (about-to-be-dead) controller
-        # pid recorded in the pidfile -- exactly the ephemeral-pid landmine. We do
-        # NOT pass --controller-pid, so _controller_pid(args) falls back to it.
+        # Model an owned worker whose controller dies before the cleanup sweep.
         ephemeral_controller = os.getpid()
-        identity = goalflight_ledger.process_identity(worker_pid)
-        assert identity and identity.get("lstart") and identity.get("comm"), identity
+        identity = {"lstart": "test-start", "comm": "python"}
         pgid = os.getpgid(worker_pid)
         assert pgid == worker_pid, (pgid, worker_pid)  # own-session leader
 
         with tempfile.TemporaryDirectory() as td:
             pid_dir = Path(td)
             with patch.dict(os.environ, {"GOAL_FLIGHT_PIDFILE_DIR": str(pid_dir)}):
-                args = _dispatch_args(controller_pid=None, dispatch_id="bashtail-live")
-                # Force the recorded controller_pid to a value we will then make
-                # "dead" for the sweep, mirroring the ephemeral dispatch proc.
-                with patch.object(dispatch, "_controller_pid",
-                                  return_value=ephemeral_controller):
-                    pidfile = dispatch._write_pidfile(
-                        args, worker_pid=worker_pid, pgid=pgid, identity=identity)
+                args = _dispatch_args(
+                    controller_pid=ephemeral_controller,
+                    controller_session_id="ephemeral-session",
+                    dispatch_id="bashtail-live",
+                )
+                pidfile = dispatch._write_pidfile(
+                    args, worker_pid=worker_pid, pgid=pgid, identity=identity)
                 assert pidfile is not None and pidfile.exists()
 
                 # The agent tag MUST be -bash-tail so cleanup_ghosts's bash-tail
                 # branch is reachable (was -dispatch, which never matched).
                 rec = json.loads(pidfile.read_text().splitlines()[0])
                 assert rec["agent"].endswith("-bash-tail"), rec["agent"]
+                assert (
+                    rec.get("controller_session_id"),
+                    rec.get("controller_pid"),
+                ) == ("ephemeral-session", ephemeral_controller), rec
                 assert rec.get("detached") in (None, False), "fresh pidfile not detached yet"
 
                 # Simulate the NON-terminal dispatch exit: the finally-block call
@@ -137,18 +167,6 @@ def case_live_bashtail_worker_not_killed_by_ghost_sweep() -> None:
                 assert pidfile.exists(), "live worker's pidfile must be preserved for re-attach"
                 rec2 = json.loads(pidfile.read_text().splitlines()[0])
                 assert rec2.get("detached") is True, "live worker must be flagged detached"
-
-                # Normalize started_at/cmd to the exact form cleanup_ghosts reads
-                # back (its _ps_meta collapses lstart padding; _write_pidfile records
-                # via the ledger's _ps_field which does not). This makes the sweep's
-                # lstart/comm re-check a guaranteed MATCH, so the ONLY thing that can
-                # spare the worker is the detached-skip we are testing -- not an
-                # incidental stale-mismatch. (The padding delta is a separate
-                # pre-existing quirk, noted in RESULT, not in scope here.)
-                norm_lstart, norm_cmd = _recorded_identity(worker_pid)
-                rec2["started_at"] = norm_lstart
-                rec2["cmd"] = norm_cmd
-                pidfile.write_text(json.dumps(rec2, sort_keys=True) + "\n", encoding="utf-8")
 
                 # Now the REAL ghost sweep, with the recorded controller treated as
                 # DEAD (the dispatch proc has exited). Real cleanup_ghosts logic.
@@ -163,6 +181,8 @@ def case_live_bashtail_worker_not_killed_by_ghost_sweep() -> None:
                 def fake_ps_meta(pid: int):
                     if pid == ephemeral_controller:
                         return None  # dead controller -> not a live-controller skip
+                    if pid == worker_pid:
+                        return identity["lstart"], identity["comm"]
                     return orig_ps_meta(pid)
 
                 with patch("goalflight_acp_client._PIDFILE_DIR", pid_dir), \
@@ -201,6 +221,7 @@ def case_from_queue_detached_pidfile_spares_live_worker() -> None:
             with patch.dict(os.environ, {"GOAL_FLIGHT_PIDFILE_DIR": str(pid_dir)}):
                 args = _dispatch_args(
                     controller_pid=dead_controller,
+                    controller_session_id="dead-controller-session",
                     dispatch_id="bashtail-detached-live",
                 )
                 pidfile = dispatch._write_pidfile(
@@ -212,6 +233,10 @@ def case_from_queue_detached_pidfile_spares_live_worker() -> None:
                 )
             assert pidfile is not None and pidfile.exists()
             rec = json.loads(pidfile.read_text().splitlines()[0])
+            assert (
+                rec.get("controller_session_id"),
+                rec.get("controller_pid"),
+            ) == ("dead-controller-session", dead_controller), rec
             assert rec.get("detached") is True, rec
 
             orig_pid_alive = goalflight_compat.pid_alive
@@ -245,6 +270,96 @@ def case_from_queue_detached_pidfile_spares_live_worker() -> None:
             worker.wait(timeout=5)
 
 
+def case_unowned_live_worker_is_not_a_ghost() -> None:
+    """Unknown ownership alone cannot authorize killing a live worker."""
+    worker = _spawn_live_worker()
+    worker_pid = worker.pid
+    try:
+        identity = {"lstart": "test-start", "comm": "python"}
+        with tempfile.TemporaryDirectory() as td:
+            pid_dir = Path(td)
+            with patch.dict(os.environ, {"GOAL_FLIGHT_PIDFILE_DIR": str(pid_dir)}):
+                pidfile = dispatch._write_pidfile(
+                    _dispatch_args(
+                        controller_pid=None,
+                        dispatch_id="bashtail-unowned-live",
+                    ),
+                    worker_pid=worker_pid,
+                    pgid=os.getpgid(worker_pid),
+                    identity=identity,
+                )
+            assert pidfile is not None and pidfile.name.startswith("unowned.")
+            record = json.loads(pidfile.read_text(encoding="utf-8"))
+            assert record.get("controller_session_id") is None, record
+            assert record.get("controller_pid") is None, record
+            assert record.get("detached") in (None, False), record
+
+            original_ps_meta = goalflight_acp_client._ps_meta
+
+            def fake_ps_meta(pid: int):
+                if pid == worker_pid:
+                    return identity["lstart"], identity["comm"]
+                return original_ps_meta(pid)
+
+            with patch("goalflight_acp_client._PIDFILE_DIR", pid_dir), patch(
+                "goalflight_acp_client._ps_meta", side_effect=fake_ps_meta
+            ), patch(
+                "goalflight_compat.kill_pid",
+                side_effect=AssertionError("unowned live worker killed"),
+            ):
+                assert goalflight_acp_client.cleanup_ghosts() == 0
+            assert _alive(worker_pid), "unowned live worker must survive cleanup"
+            assert pidfile.exists(), "live unowned pidfile remains for later cleanup"
+    finally:
+        with contextlib.suppress(OSError):
+            os.killpg(os.getpgid(worker_pid), signal.SIGKILL)
+        with contextlib.suppress(Exception):
+            worker.wait(timeout=5)
+
+
+def case_dead_unowned_pidfile_is_unlinked() -> None:
+    """The unowned marker is parsed; dead entries do not leak forever."""
+    dead_worker = _free_dead_pid()
+    with tempfile.TemporaryDirectory() as td:
+        pid_dir = Path(td)
+        with patch.dict(os.environ, {"GOAL_FLIGHT_PIDFILE_DIR": str(pid_dir)}):
+            pidfile = dispatch._write_pidfile(
+                _dispatch_args(
+                    controller_pid=None,
+                    dispatch_id="bashtail-unowned-dead",
+                ),
+                worker_pid=dead_worker,
+                pgid=dead_worker,
+                identity={"lstart": "dead", "comm": "dead"},
+            )
+        assert pidfile is not None and pidfile.exists()
+        with patch("goalflight_acp_client._PIDFILE_DIR", pid_dir):
+            assert goalflight_acp_client.cleanup_ghosts() == 0
+        assert not pidfile.exists(), "dead unowned pidfile must be unlinked"
+
+
+def case_reused_controller_pid_does_not_pin_dead_bashtail_pidfile() -> None:
+    """A live/reused owner PID cannot bypass bash-tail worker reconciliation."""
+    dead_worker = _free_dead_pid()
+    with tempfile.TemporaryDirectory() as td:
+        pid_dir = Path(td)
+        with patch.dict(os.environ, {"GOAL_FLIGHT_PIDFILE_DIR": str(pid_dir)}):
+            pidfile = dispatch._write_pidfile(
+                _dispatch_args(
+                    controller_pid=os.getpid(),
+                    controller_session_id="stale-controller-session",
+                    dispatch_id="bashtail-reused-controller-pid",
+                ),
+                worker_pid=dead_worker,
+                pgid=dead_worker,
+                identity={"lstart": "dead", "comm": "dead"},
+            )
+        assert pidfile is not None and pidfile.exists()
+        with patch("goalflight_acp_client._PIDFILE_DIR", pid_dir):
+            assert goalflight_acp_client.cleanup_ghosts() == 0
+        assert not pidfile.exists(), "live/reused owner PID must not pin dead worker metadata"
+
+
 def case_dead_detached_pidfile_still_unlinked() -> None:
     """Detached is not a leak: once the worker pid is dead, cleanup unlinks."""
     dead_controller = _free_dead_pid()
@@ -269,52 +384,53 @@ def case_dead_detached_pidfile_still_unlinked() -> None:
         assert not pidfile.exists(), "dead detached pidfile must be unlinked"
 
 
-def case_genuine_ghost_still_reaped() -> None:
-    """Safety not neutered: dead controller + LIVE worker + NOT detached + correct
-    -bash-tail tag + pgid==pid is a genuine ghost (the orchestrator crashed without
-    leaving a detached marker) and MUST still be reaped. We spawn a real worker,
-    record a matching pidfile WITHOUT the detached flag, and assert cleanup_ghosts
-    kills it. (This is the post-crash case the reaper exists for.)"""
+def case_owned_live_worker_survives_beacon_death_before_detach_stamp() -> None:
+    """Beacon death cannot make a live, not-yet-detached worker reapable."""
     worker = _spawn_live_worker()
     worker_pid = worker.pid
-    reaped = False
     try:
         assert _alive(worker_pid)
         dead_controller = _free_dead_pid()
-        norm_lstart, norm_cmd = _recorded_identity(worker_pid)
+        identity = ("test-start", "python")
         pgid = os.getpgid(worker_pid)
         assert pgid == worker_pid
 
         with tempfile.TemporaryDirectory() as td:
             pid_dir = Path(td)
             pidfile = pid_dir / f"{dead_controller}.bashtail.{worker_pid}.jsonl"
-            # A crashed-orchestrator ghost: correct tag, NO detached flag.
             pidfile.write_text(json.dumps({
                 "controller_pid": dead_controller,
+                "controller_session_id": "dead-controller-session",
                 "pid": worker_pid,
                 "pgid": pgid,
-                "started_at": norm_lstart,
-                "cmd": norm_cmd,
+                "started_at": identity[0],
+                "cmd": identity[1],
                 "agent": "codex-bash-tail",
-                "session_id": "bashtail-ghost",
+                "session_id": "bashtail-beacon-race",
             }, sort_keys=True) + "\n", encoding="utf-8")
 
-            with patch("goalflight_acp_client._PIDFILE_DIR", pid_dir):
+            original_ps_meta = goalflight_acp_client._ps_meta
+
+            def fake_ps_meta(pid: int):
+                if pid == dead_controller:
+                    return None
+                if pid == worker_pid:
+                    return identity
+                return original_ps_meta(pid)
+
+            with patch("goalflight_acp_client._PIDFILE_DIR", pid_dir), patch(
+                "goalflight_acp_client._ps_meta", side_effect=fake_ps_meta
+            ), patch(
+                "goalflight_compat.kill_pid",
+                side_effect=AssertionError("live bash-tail worker killed after beacon death"),
+            ):
                 killed = goalflight_acp_client.cleanup_ghosts()
-            assert killed == 1, "genuine ghost (dead controller + dead worker class) must be reaped"
-            # The worker is a direct child here, so after killpg it is a ZOMBIE
-            # until reaped (pid_alive(zombie) is True -- the very trap the dispatch
-            # reaper thread exists to avoid). Reap via wait() and assert the group
-            # actually took SIGKILL, which proves the reap fired.
-            worker.wait(timeout=5)
-            reaped = True
-            assert worker.returncode == -signal.SIGKILL, (
-                f"ghost worker's group must be SIGKILLed (rc={worker.returncode})")
-            assert not pidfile.exists(), "ghost pidfile unlinked after reap"
+            assert killed == 0
+            assert _alive(worker_pid), "live worker must survive beacon-death cleanup"
+            assert pidfile.exists(), "live worker pidfile remains for detach stamping"
     finally:
-        if not reaped:
-            with contextlib.suppress(OSError):
-                os.killpg(os.getpgid(worker_pid), signal.SIGKILL)
+        with contextlib.suppress(OSError):
+            os.killpg(os.getpgid(worker_pid), signal.SIGKILL)
         with contextlib.suppress(Exception):
             worker.wait(timeout=5)
 
@@ -339,13 +455,18 @@ def case_dead_worker_pidfile_unlinked_not_marked() -> None:
 
 
 def main() -> None:
+    case_lstart_padding_is_normalized()
     case_from_queue_detached_pidfile_spares_live_worker()
+    case_dead_unowned_pidfile_is_unlinked()
+    case_reused_controller_pid_does_not_pin_dead_bashtail_pidfile()
     case_dead_detached_pidfile_still_unlinked()
+    case_live_bashtail_worker_not_killed_by_ghost_sweep()
+    case_unowned_live_worker_is_not_a_ghost()
+    case_owned_live_worker_survives_beacon_death_before_detach_stamp()
     if goalflight_acp_client._ps_meta(os.getpid()) is None:
         print("OK: dispatch bash-tail ghost-protection detached tests pass (ps-dependent cases skipped)")
         return
-    case_live_bashtail_worker_not_killed_by_ghost_sweep()
-    case_genuine_ghost_still_reaped()
+    case_real_pidfile_identity_round_trip()
     case_dead_worker_pidfile_unlinked_not_marked()
     print("OK: dispatch bash-tail ghost-protection tests pass")
 

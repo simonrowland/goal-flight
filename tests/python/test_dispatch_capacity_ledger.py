@@ -326,7 +326,7 @@ def case_status_sees_dispatch_and_lease_releases() -> None:
         assert row and row.get("state") == "complete", row
 
 
-def case_live_controller_pidfile_preserves_blocked_worker_for_reattach() -> None:
+def case_unowned_pidfile_preserves_blocked_worker_for_reattach() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         env = _env(tmp)
@@ -345,7 +345,10 @@ def case_live_controller_pidfile_preserves_blocked_worker_for_reattach() -> None
             assert worker_pid and _process_exists(worker_pid), f"worker not left for cleanup: {worker_pid}"
             pidfiles = list((tmp / "pids").glob("*.jsonl"))
             assert pidfiles, "dispatch pidfile missing"
-            assert pidfiles[0].name.startswith(f"{os.getpid()}."), pidfiles[0]
+            pid_record = json.loads(pidfiles[0].read_text(encoding="utf-8").splitlines()[0])
+            assert pidfiles[0].name.startswith("unowned."), pidfiles[0]
+            assert pid_record.get("controller_pid") is None, pid_record
+            assert pid_record.get("controller_session_id") is None, pid_record
 
             cleanup = subprocess.run(
                 [
@@ -362,7 +365,7 @@ def case_live_controller_pidfile_preserves_blocked_worker_for_reattach() -> None
                 check=True,
             )
             assert int(cleanup.stdout.strip()) == 0, cleanup
-            assert _process_exists(worker_pid), "cleanup killed live worker owned by live controller"
+            assert _process_exists(worker_pid), "cleanup killed live unowned worker"
             assert list((tmp / "pids").glob("*.jsonl")), "pidfile removed before reattach"
             _assert_terminal_record_and_lease(env, dispatch_id, "blocked")
         finally:
@@ -437,7 +440,7 @@ def case_from_queue_detached_launch_reparents_lease_and_survives_release_stale()
             assert lease.get("state") == "active", lease
             assert lease.get("worker_pid") == worker_pid, lease
             assert lease.get("controller_pid") == worker_pid, lease
-            assert lease.get("detached_controller_pid") not in (None, worker_pid), lease
+            assert lease.get("detached_controller_pid") is None, lease
             assert lease.get("detached_at"), lease
             assert lease.get("detached_reason") == "bash_launch_detached", lease
 
@@ -460,7 +463,7 @@ def case_from_queue_detached_launch_reparents_lease_and_survives_release_stale()
             _kill_if_alive(watcher_pid)
 
 
-def case_direct_default_background_returns_and_preserves_live_controller() -> None:
+def case_direct_default_background_records_unowned_controller() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         env = _env(tmp)
@@ -510,11 +513,16 @@ def case_direct_default_background_returns_and_preserves_live_controller() -> No
             status_payload = _wait_for(_running_status, timeout_s=5.0)
             assert status_payload.get("state") != "controller_dead", status_payload
             assert status_payload.get("worker_pid") == worker_pid, status_payload
+            assert status_payload.get("controller_session_id") is None, status_payload
+            assert status_payload.get("controller_pid") is None, status_payload
 
             pidfiles = list((tmp / "pids").glob("*.jsonl"))
             assert len(pidfiles) == 1, pidfiles
             pid_entry = json.loads(pidfiles[0].read_text().splitlines()[0])
-            assert pid_entry.get("controller_pid") == controller_pid, pid_entry
+            assert pidfiles[0].name.startswith("unowned."), pidfiles[0]
+            assert pid_entry.get("controller_session_id") is None, pid_entry
+            assert pid_entry.get("controller_pid") is None, pid_entry
+            assert pid_entry.get("controller_pid") != controller_pid, pid_entry
             assert pid_entry.get("detached") is True, pid_entry
 
             payload = _status(env)
@@ -524,7 +532,7 @@ def case_direct_default_background_returns_and_preserves_live_controller() -> No
             assert lease.get("state") == "active", lease
             assert lease.get("worker_pid") == worker_pid, lease
             assert lease.get("controller_pid") == worker_pid, lease
-            assert lease.get("detached_controller_pid") == controller_pid, lease
+            assert lease.get("detached_controller_pid") is None, lease
             assert lease.get("detached_reason") == "bash_background_default", lease
 
             live_release = _capacity_release_stale(env)
@@ -1548,10 +1556,10 @@ def case_ledger_finish_cli_accepts_rate_limited() -> None:
 def main() -> None:
     case_ledger_finish_cli_accepts_rate_limited()
     case_status_sees_dispatch_and_lease_releases()
-    case_live_controller_pidfile_preserves_blocked_worker_for_reattach()
+    case_unowned_pidfile_preserves_blocked_worker_for_reattach()
     case_from_queue_detached_launch_stamps_pidfile()
     case_from_queue_detached_launch_reparents_lease_and_survives_release_stale()
-    case_direct_default_background_returns_and_preserves_live_controller()
+    case_direct_default_background_records_unowned_controller()
     case_default_background_finalizes_ledger_and_rate_pressure_once()
     case_ledger_finalize_retries_after_transient_failure()
     case_foreground_blocks_until_terminal_state()
