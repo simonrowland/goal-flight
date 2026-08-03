@@ -64,8 +64,9 @@ function makeDom(fleet, attention) {
   [
     "plane-status", "machine", "vendors", "attention", "fleet",
     "attention-section", "fleet-section", "theme-toggle", "live-status",
+    "age-filter-toggle", "age-filter-note",
   ].forEach((id) => {
-    byId[id] = element(id === "theme-toggle" ? "button" : "div");
+    byId[id] = element(id === "theme-toggle" || id === "age-filter-toggle" ? "button" : "div");
   });
   byId["attention-section"].className = "panel attn attention-section";
   byId["fleet-section"].className = "fleet-section";
@@ -145,6 +146,15 @@ function workerRow(overrides) {
     display_state: "running",
     is_terminal: false,
     classification_conflict: false,
+    controller_session_id: null,
+    controller_pid: null,
+    controller_label: null,
+    controller_display: "unowned",
+    controller_state: "unowned",
+    age_filter_match: false,
+    age_filter_reason: "within_threshold",
+    observed_live: true,
+    observed_live_source: "identity_recheck",
   }, overrides || {});
 }
 
@@ -159,6 +169,11 @@ function fleetPayload(overrides) {
     last_error: null,
     registry_total: 1433,
     registry_deep_sampled: 12,
+    worker_age_filter: {
+      threshold_seconds: 43200,
+      default_enabled: true,
+      unknown_started_at: "show",
+    },
     machine: {
       queue_depth: 9,
       operating_cap: 12,
@@ -200,6 +215,16 @@ function fleetPayload(overrides) {
   }, overrides || {});
 }
 
+function projectRow(workers, overrides) {
+  return Object.assign({
+    project_id: "p", name: "p", registered: true, last_seen: null, skill_version: null,
+    queue: { depth: 0, lanes: [], oldest_created_at: null },
+    session: { available: false, active: null, queue_state: null, queue_last_touched: null, active_leases: null },
+    milestone: { available: false, active_cadence: null, commits_since: null, cadence: null, due: null },
+    workers,
+  }, overrides || {});
+}
+
 function attentionPayload(overrides) {
   return Object.assign({
     schema: "goalflight.fleet-console.attention.v1",
@@ -225,9 +250,53 @@ let producerProbeCache = null;
 function producerProbe() {
   if (producerProbeCache) return producerProbeCache;
   const code = String.raw`
-import json, pathlib, sys
+import json, os, pathlib, sys, tempfile
 sys.path.insert(0, str(pathlib.Path.cwd() / "scripts"))
 import goalflight_fleet_console as F
+sampled_at = F._parse_timestamp("2030-01-01T00:03:00Z")
+def worker(dispatch_id, started_at, **overrides):
+    record = {
+        "dispatch_id": dispatch_id, "state": "running",
+        "classification": "expected_live", "worker_still_alive": None,
+        "started_at": started_at,
+    }
+    record.update(overrides)
+    return F._worker_row(
+        record, sampled_at=sampled_at, controller_labels=controller_labels,
+    )
+with tempfile.TemporaryDirectory() as tmp:
+    project_root = pathlib.Path(tmp)
+    F.goalflight_session_status.claim_session(
+        project_root, pid=os.getpid(), session_id="controller-session", label="battery-main",
+    )
+    controller_labels = F._controller_labels_by_session(
+        project_root, [{"controller_session_id": "controller-session"}],
+    )
+    status_path = project_root / "status.json"
+    status_path.write_text(json.dumps({
+        "dispatch_id": "resumed-status-worker", "worker_alive": True,
+        "heartbeat_at": "2030-01-01T00:03:30Z",
+    }))
+    old_status_live = worker(
+        "resumed-status-worker", "2029-12-31T12:02:59Z", status_path=str(status_path),
+    )
+    missing_id_status_path = project_root / "status-missing-id.json"
+    missing_id_status_path.write_text(json.dumps({
+        "worker_alive": True, "heartbeat_at": "2030-01-01T00:03:30Z",
+    }))
+    old_status_missing_id = worker(
+        "status-missing-id", "2029-12-31T12:02:59Z",
+        status_path=str(missing_id_status_path),
+    )
+    mismatched_id_status_path = project_root / "status-mismatched-id.json"
+    mismatched_id_status_path.write_text(json.dumps({
+        "dispatch_id": "different-worker", "worker_alive": True,
+        "heartbeat_at": "2030-01-01T00:03:30Z",
+    }))
+    old_status_mismatched_id = worker(
+        "status-mismatched-id", "2029-12-31T12:02:59Z",
+        status_path=str(mismatched_id_status_path),
+    )
 conflict = F._worker_row({
     "dispatch_id": "conflict", "state": "running",
     "classification": "worker_dead", "worker_still_alive": None,
@@ -244,6 +313,23 @@ remote = F._remote_row({
 terminal_conflict = F._worker_row({
     "dispatch_id": "terminal-conflict", "state": "complete", "classification": "worker_dead",
 })
+old = worker("old-worker", "2029-12-31T12:02:59Z")
+old_live = worker("resumed-old-worker", "2029-12-31T12:02:59Z", worker_still_alive=True)
+recent = worker("recent-worker", "2030-01-01T00:02:00Z")
+malformed = worker("unknown-age-worker", "not-a-timestamp")
+future = worker("future-worker", "2030-01-01T00:04:00Z")
+ordered = F._sort_worker_rows([
+    worker("tie-b", "2030-01-01T00:01:00Z"),
+    malformed,
+    worker("newest", "2030-01-01T00:02:00Z"),
+    worker("tie-a", "2030-01-01T00:01:00Z"),
+])
+controller_rows = [
+    worker("owned-label", "2030-01-01T00:02:00Z", controller_session_id="controller-session", controller_pid=101),
+    worker("owned-session", "2030-01-01T00:02:00Z", controller_session_id="session-only", controller_pid=102),
+    worker("owned-unknown", "2030-01-01T00:02:00Z", controller_pid=103),
+    worker("unowned", "2030-01-01T00:02:00Z"),
+]
 try:
     F._validate_scalar_types({"sample_started_at": 2030})
 except F.ProjectionSecurityError:
@@ -253,6 +339,11 @@ else:
 print(json.dumps({
     "conflict": conflict, "sparse": sparse, "remote": remote,
     "terminal_conflict": terminal_conflict, "numeric_rejected": numeric_rejected,
+    "old": old, "old_live": old_live, "old_status_live": old_status_live,
+    "old_status_missing_id": old_status_missing_id,
+    "old_status_mismatched_id": old_status_mismatched_id,
+    "recent": recent, "malformed": malformed, "future": future,
+    "ordered": ordered, "controller_rows": controller_rows,
     "fleet_schema": F.FLEET_SCHEMA,
 }))
 `;
@@ -464,6 +555,110 @@ print(json.dumps({
   ].every(Boolean));
 }
 
+// The producer-owned age verdict drives a persisted browser-only presentation toggle.
+{
+  const probe = producerProbe();
+  const fleet = fleetPayload({
+    projects: [projectRow([probe.old_live, probe.old_status_live, probe.old, probe.recent])],
+  });
+  const { byId, storage } = loadConsole(fleet, attentionPayload({ items: [] }));
+  const defaultDispatches = descendants(byId.fleet)
+    .filter((node) => node.className === "did").map((node) => node.textContent);
+  const hiddenByDefault = !defaultDispatches.includes("old-worker") &&
+    defaultDispatches.includes("recent-worker") &&
+    defaultDispatches.includes("resumed-old-worker") &&
+    defaultDispatches.includes("resumed-status-worker");
+  byId["age-filter-toggle"].click();
+  const shownDispatches = descendants(byId.fleet)
+    .filter((node) => node.className === "did").map((node) => node.textContent);
+  assert("old non-terminal toggle hides by default and reveals without regeneration", [
+    hiddenByDefault,
+    defaultDispatches[0] === "resumed-old-worker",
+    probe.old_live.observed_live === true,
+    probe.old_live.age_filter_reason === "observed_live",
+    probe.old_status_live.observed_live_source === "fresh_status",
+    probe.old_status_live.age_filter_match === false,
+    probe.old_status_missing_id.observed_live_source === "unobserved",
+    probe.old_status_missing_id.age_filter_match === true,
+    probe.old_status_mismatched_id.observed_live_source === "unobserved",
+    probe.old_status_mismatched_id.age_filter_match === true,
+    shownDispatches.includes("old-worker"),
+    shownDispatches.includes("recent-worker"),
+    byId["age-filter-toggle"].textContent.includes("shown"),
+    storage["goalflight-fleet-age-filter"] === "show",
+  ].every(Boolean));
+}
+
+// An empty-looking view must say when rows were removed by the active age filter.
+{
+  const probe = producerProbe();
+  const secondOld = Object.assign({}, probe.old, { dispatch_id: "old-worker-2" });
+  const { byId } = loadConsole(
+    fleetPayload({ projects: [projectRow([probe.old, secondOld])] }),
+    attentionPayload({ items: [] })
+  );
+  assert("hidden age-filter count remains visible", [
+    byId["age-filter-toggle"].textContent.includes("Non-terminal / unresolved >12h"),
+    byId["age-filter-toggle"].textContent.includes("2 hidden"),
+    byId.fleet.textContent.includes("2 older rows hidden by age filter"),
+    !byId.fleet.textContent.includes("No project has active workers or queued work"),
+  ].every(Boolean));
+}
+
+// Producer order is newest-started first, then dispatch identity; unknown ages
+// stay visible and sort after measured start times.
+{
+  const probe = producerProbe();
+  const { byId } = loadConsole(
+    fleetPayload({ projects: [projectRow(probe.ordered)] }),
+    attentionPayload({ items: [] })
+  );
+  const dispatches = descendants(byId.fleet)
+    .filter((node) => node.className === "did").map((node) => node.textContent);
+  const bandDom = loadConsole(fleetPayload({ projects: [
+    projectRow([probe.malformed], { project_id: "z", name: "unknown-start" }),
+    projectRow([probe.ordered[1]], { project_id: "b", name: "older-start" }),
+    projectRow([probe.old_live], { project_id: "live", name: "observed-live-old" }),
+    projectRow([probe.recent], { project_id: "a", name: "recent-start" }),
+  ] }), attentionPayload({ items: [] })).byId;
+  const bandNames = descendants(bandDom.fleet)
+    .filter((node) => node.className === "proj").map((node) => node.textContent);
+  const futureDom = loadConsole(
+    fleetPayload({ projects: [projectRow([probe.future])] }),
+    attentionPayload({ items: [] })
+  ).byId;
+  assert("newest-started order is deterministic and unknown age policy is explicit", [
+    JSON.stringify(dispatches) === JSON.stringify(["newest", "tie-a", "tie-b", "unknown-age-worker"]),
+    JSON.stringify(bandNames) === JSON.stringify(["observed-live-old", "recent-start", "older-start", "unknown-start"]),
+    probe.malformed.started_at === null,
+    probe.malformed.age_filter_match === false,
+    probe.malformed.age_filter_reason === "started_at_unknown",
+    probe.future.age_filter_match === false,
+    probe.future.age_filter_reason === "started_at_future",
+    futureDom.fleet.textContent.includes("future-worker"),
+    byId["age-filter-note"].textContent.includes("unknown start time stays visible"),
+    byId["age-filter-note"].textContent.includes("Observed live first"),
+  ].every(Boolean));
+}
+
+// Controller display uses only stamped ownership plus the matching beacon label.
+{
+  const probe = producerProbe();
+  const { byId } = loadConsole(
+    fleetPayload({ projects: [projectRow(probe.controller_rows)] }),
+    attentionPayload({ items: [] })
+  );
+  const controllers = descendants(byId.fleet)
+    .filter((node) => /^controller-id /.test(node.className));
+  assert("controller label/session/unknown-owner/unowned states remain distinct", [
+    controllers.some((node) => node.textContent === "battery-main" && node.className === "controller-id label"),
+    controllers.some((node) => node.textContent === "session-only" && node.className === "controller-id session"),
+    controllers.some((node) => node.textContent === "owned · identity unknown" && node.className === "controller-id owned_unknown"),
+    controllers.some((node) => node.textContent === "unowned" && node.className === "controller-id unowned"),
+    !controllers.some((node) => node.textContent === "p" || node.textContent === "103"),
+  ].every(Boolean));
+}
+
 // Machine count is authoritative; unassigned and remote rows are separate populations.
 {
   const probe = producerProbe();
@@ -540,7 +735,7 @@ print(json.dumps({
     byId.fleet.textContent.includes("Showing 200 of 1500 active or unresolved worker rows"),
     byId.fleet.textContent.includes("across 50 of 300 groups"),
     renderedBands === 50,
-    descendants(byId.fleet).length < 2600,
+    descendants(byId.fleet).length < 2800,
     clock.parses < 500,
   ].every(Boolean));
 }
@@ -641,12 +836,13 @@ print(json.dumps({
     !/(?:src|href)=["'](?:https?:)?\/\//.test(HTML),
     HTML.includes('<script src="./fleet-data.js"></script>'),
     HTML.includes('<script src="./attention-data.js"></script>'),
+    /id="age-filter-toggle"[^>]*aria-pressed="true"/.test(HTML),
     /id="live-status"[^>]*aria-live="polite"/.test(HTML),
     !/id="(?:plane-status|attention|fleet)"[^>]*aria-live/.test(HTML),
   ].every(Boolean));
 }
 
-// CSS matches the six emitted columns and no longer carries the reviewed dead mockup selectors.
+// CSS matches the seven emitted columns and no longer carries the reviewed dead mockup selectors.
 {
   const cssWithoutComments = CSS.replace(/\/\*[\s\S]*?\*\//g, "");
   const dead = [
@@ -656,11 +852,13 @@ print(json.dumps({
     "eye", "watched", "parked", "dead", "hung", "bad", "calm",
   ];
   const deadAbsent = dead.every((name) => !(new RegExp("\\." + name + "\\b")).test(cssWithoutComments));
-  assert("six-column CSS and wrapper styles", [
-    /grid-template-columns:9px minmax\(168px,1\.3fr\) minmax\(112px,\.8fr\) minmax\(116px,1fr\) minmax\(80px,auto\) minmax\(96px,\.65fr\)/.test(CSS),
+  assert("seven-column CSS and wrapper styles", [
+    /grid-template-columns:9px minmax\(168px,1\.3fr\) minmax\(112px,\.8fr\) minmax\(128px,\.9fr\) minmax\(116px,1fr\) minmax\(80px,auto\) minmax\(96px,\.65fr\)/.test(CSS),
     /\.attention-section, \.fleet-section\s*\{[^}]*min-width:0/.test(CSS),
     /\.rows\s*\{[^}]*overflow-x:auto/.test(CSS),
     /\.glyph\.advisory\s*\{/.test(CSS),
+    /\.controller-id\.unowned\s*\{/.test(CSS),
+    /\.controller-id\.owned_unknown\s*\{/.test(CSS),
     /\.panel-hd\s*\+\s*\.attn-row\s*\{[^}]*border-top:0/.test(CSS),
     !/\[hidden\]\s*\{/.test(cssWithoutComments),
     deadAbsent,

@@ -30,6 +30,7 @@
   var reloadPending = { fleet: false, attention: false };
   var lastAgeSignature = null;
   var themeMode = "auto";
+  var ageFilterEnabled = true;
 
   function el(tag, cls, txt) {
     var node = document.createElement(tag);
@@ -140,6 +141,50 @@
     return worker && typeof worker === "object" && worker.is_terminal !== true;
   }
 
+  function displayedWorker(worker) {
+    return visibleWorker(worker) && (!ageFilterEnabled || worker.age_filter_match !== true);
+  }
+
+  function workerAgeSummary() {
+    var rows = [];
+    (FLEET.projects || []).forEach(function (project) {
+      rows = rows.concat(project.workers || []);
+    });
+    rows = rows.concat(FLEET.unassigned_workers || [], ((FLEET.remote || {}).workers) || []);
+    var summary = { matches: 0, hidden: 0, unknown: 0 };
+    rows.filter(visibleWorker).forEach(function (worker) {
+      if (worker.age_filter_match === true) summary.matches += 1;
+      if (worker.age_filter_reason === "started_at_unknown") summary.unknown += 1;
+    });
+    summary.hidden = ageFilterEnabled ? summary.matches : 0;
+    return summary;
+  }
+
+  function ageThresholdLabel() {
+    var seconds = Number(((FLEET.worker_age_filter || {}).threshold_seconds));
+    if (!Number.isFinite(seconds) || seconds <= 0) return "configured age";
+    if (seconds % 3600 === 0) return (seconds / 3600) + "h";
+    if (seconds % 60 === 0) return (seconds / 60) + "m";
+    return seconds + "s";
+  }
+
+  function renderAgeFilterControl(fleetState) {
+    var button = document.getElementById("age-filter-toggle");
+    var note = document.getElementById("age-filter-note");
+    if (!button || !note) return;
+    if (fleetState.stale) {
+      button.textContent = "Older rows: unavailable";
+      button.setAttribute("aria-pressed", ageFilterEnabled ? "true" : "false");
+      note.textContent = "Fleet data stale; age filter not applied.";
+      return;
+    }
+    var summary = workerAgeSummary();
+    button.textContent = "Non-terminal / unresolved >" + ageThresholdLabel() + ": " +
+      (ageFilterEnabled ? "hidden · " + summary.hidden + " hidden" : "shown");
+    button.setAttribute("aria-pressed", ageFilterEnabled ? "true" : "false");
+    note.textContent = "Observed live first · otherwise newest started · unknown start time stays visible.";
+  }
+
   function glyphFor(worker) {
     if (worker.classification_conflict) return "unknown";
     return DISPLAY_GLYPHS[worker.display_state] || "unknown";
@@ -154,7 +199,7 @@
     }
 
     var header = el("div", "row-hd");
-    ["", "dispatch", "agent · via", "state", "started", "host"].forEach(function (label) {
+    ["", "dispatch", "agent · via", "controller", "state", "started", "host"].forEach(function (label) {
       header.appendChild(el("div", null, label));
     });
     rows.appendChild(header);
@@ -172,6 +217,8 @@
       if (worker.os_sandbox === "read-only") wire.appendChild(el("b", null, " ro"));
       identity.appendChild(wire);
       row.appendChild(identity);
+      row.appendChild(el("div", "controller-id " + textValue(worker.controller_state),
+        textValue(worker.controller_display)));
       var displayState = textValue(worker.display_state);
       if (worker.classification_conflict) displayState += " · conflicting authority fields";
       row.appendChild(el("div", "state-txt", displayState));
@@ -326,19 +373,27 @@
   function projectBands() {
     var result = [];
     (FLEET.projects || []).forEach(function (project) {
-      var workers = (project.workers || []).filter(visibleWorker);
+      var workers = (project.workers || []).filter(displayedWorker);
       if (workers.length || ((project.queue || {}).depth || 0) > 0) {
         result.push({ kind: "project", project: project, workers: workers });
       }
     });
-    var unassigned = (FLEET.unassigned_workers || []).filter(visibleWorker);
+    var unassigned = (FLEET.unassigned_workers || []).filter(displayedWorker);
     if (unassigned.length) result.push({ kind: "unassigned", workers: unassigned });
-    var remote = (((FLEET.remote || {}).workers) || []).filter(visibleWorker);
+    var remote = (((FLEET.remote || {}).workers) || []).filter(displayedWorker);
     if (remote.length) result.push({ kind: "remote", workers: remote });
     result.sort(function (left, right) {
-      var leftDepth = left.workers.length + (((left.project || {}).queue || {}).depth || 0);
-      var rightDepth = right.workers.length + (((right.project || {}).queue || {}).depth || 0);
-      return rightDepth - leftDepth;
+      var leftLive = (((left.workers || [])[0] || {}).observed_live) === true;
+      var rightLive = (((right.workers || [])[0] || {}).observed_live) === true;
+      if (leftLive !== rightLive) return leftLive ? -1 : 1;
+      var leftValue = ((left.workers || [])[0] || {}).started_at;
+      var rightValue = ((right.workers || [])[0] || {}).started_at;
+      var leftStarted = typeof leftValue === "string" ? leftValue : "";
+      var rightStarted = typeof rightValue === "string" ? rightValue : "";
+      if (leftStarted !== rightStarted) return leftStarted > rightStarted ? -1 : 1;
+      var leftId = textValue(((left.project || {}).project_id) || left.kind);
+      var rightId = textValue(((right.project || {}).project_id) || right.kind);
+      return leftId < rightId ? -1 : (leftId > rightId ? 1 : 0);
     });
     return result;
   }
@@ -402,8 +457,11 @@
       return;
     }
     var entries = projectBands();
+    var ageSummary = workerAgeSummary();
     if (!entries.length) {
-      host.appendChild(el("div", "quiet-state", "No project has active workers or queued work."));
+      host.appendChild(el("div", "quiet-state", ageSummary.hidden ?
+        "No recent active or unresolved worker rows. " + ageSummary.hidden + " older rows hidden by age filter." :
+        "No project has active workers or queued work."));
       return;
     }
     var budget = { shown: 0, total: 0 };
@@ -452,6 +510,7 @@
     var fleetState = planeState(FLEET, SCHEMAS.fleet, CADENCES.fleet, now);
     var attentionState = planeState(ATTENTION, SCHEMAS.attention, CADENCES.attention, now);
     renderPlaneStatus(fleetState, attentionState);
+    renderAgeFilterControl(fleetState);
     renderMachine(fleetState);
     renderVendors(fleetState, now);
     renderAttention(attentionState, now);
@@ -524,10 +583,37 @@
     }
   }
 
+  function applyAgeFilter(enabled, persist) {
+    ageFilterEnabled = enabled === true;
+    if (persist !== false) {
+      try { window.localStorage.setItem("goalflight-fleet-age-filter", ageFilterEnabled ? "hide" : "show"); } catch (_error) { /* optional */ }
+    }
+    return ageFilterEnabled;
+  }
+
+  function initializeAgeFilter() {
+    var policy = FLEET && FLEET.worker_age_filter;
+    var initial = !policy || policy.default_enabled !== false;
+    try {
+      var saved = window.localStorage.getItem("goalflight-fleet-age-filter");
+      if (saved === "hide") initial = true;
+      else if (saved === "show") initial = false;
+    } catch (_error) { /* optional */ }
+    applyAgeFilter(initial, false);
+    var button = document.getElementById("age-filter-toggle");
+    if (button) {
+      button.addEventListener("click", function () {
+        applyAgeFilter(!ageFilterEnabled);
+        render();
+      });
+    }
+  }
+
   window.GFFleetConsole = {
     ageBucket: ageFrom,
     planeState: planeState,
     applyTheme: applyTheme,
+    applyAgeFilter: applyAgeFilter,
     render: render,
     reloadPlane: reloadPlane,
     schemas: SCHEMAS,
@@ -535,6 +621,7 @@
   };
 
   initializeTheme();
+  initializeAgeFilter();
   render();
   window.setInterval(function () { reloadPlane("attention"); }, CADENCES.attention);
   window.setInterval(function () { reloadPlane("fleet"); }, CADENCES.fleet);

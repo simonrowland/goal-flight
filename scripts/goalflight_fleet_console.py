@@ -11,6 +11,7 @@ liveness.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
 import hashlib
 import json
@@ -45,6 +46,20 @@ SCRIPT_GLOBALS = {"fleet": "GF_FLEET", "attention": "GF_ATTENTION"}
 # cost is ~1.0s, and the drain tick this rides is ~60s, so the whole
 # per-project pass has to fit in a fraction of that alongside everything else.
 DEFAULT_MAX_PROJECTS = 12
+
+# A half-day is 12 hours × 60 minutes/hour × 60 seconds/minute = 43,200
+# seconds. This deliberately removes the reported 15-100 hour non-terminal
+# records while leaving shorter long-running work in the default view.
+WORKER_AGE_FILTER_SECONDS = 12 * 60 * 60
+# Two 60-second fleet refresh intervals = 120 seconds. A status-sidecar
+# liveness sample older than that cannot make an old ledger row reappear.
+WORKER_LIVE_SAMPLE_FRESH_SECONDS = 2 * 60
+WORKER_AGE_FILTER_POLICY = {
+    "threshold_seconds": WORKER_AGE_FILTER_SECONDS,
+    "default_enabled": True,
+    "unknown_started_at": "show",
+    "order": "observed_live_then_newest_started",
+}
 
 # Fields rejected at the shareable-mirror boundary even when an upstream
 # payload supplies them.  The allowlists below are the positive authority;
@@ -89,6 +104,12 @@ FLEET_FIELD_ALLOWLIST: dict[str, Any] = {
     "last_error": None,
     "registry_total": None,
     "registry_deep_sampled": None,
+    "worker_age_filter": {
+        "threshold_seconds": None,
+        "default_enabled": None,
+        "unknown_started_at": None,
+        "order": None,
+    },
     "machine": {
         "queue_depth": None,
         "operating_cap": None,
@@ -130,6 +151,15 @@ FLEET_FIELD_ALLOWLIST: dict[str, Any] = {
                 "display_state": None,
                 "is_terminal": None,
                 "classification_conflict": None,
+                "controller_session_id": None,
+                "controller_pid": None,
+                "controller_label": None,
+                "controller_display": None,
+                "controller_state": None,
+                "age_filter_match": None,
+                "age_filter_reason": None,
+                "observed_live": None,
+                "observed_live_source": None,
                 "quarantine_reason": None,
                 "ssh_reachable": None,
                 "may_release": None,
@@ -181,6 +211,15 @@ FLEET_FIELD_ALLOWLIST: dict[str, Any] = {
                     "display_state": None,
                     "is_terminal": None,
                     "classification_conflict": None,
+                    "controller_session_id": None,
+                    "controller_pid": None,
+                    "controller_label": None,
+                    "controller_display": None,
+                    "controller_state": None,
+                    "age_filter_match": None,
+                    "age_filter_reason": None,
+                    "observed_live": None,
+                    "observed_live_source": None,
                 }
             ],
         }
@@ -204,6 +243,15 @@ FLEET_FIELD_ALLOWLIST: dict[str, Any] = {
             "display_state": None,
             "is_terminal": None,
             "classification_conflict": None,
+            "controller_session_id": None,
+            "controller_pid": None,
+            "controller_label": None,
+            "controller_display": None,
+            "controller_state": None,
+            "age_filter_match": None,
+            "age_filter_reason": None,
+            "observed_live": None,
+            "observed_live_source": None,
         }
     ],
 }
@@ -327,7 +375,7 @@ def _utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
 
 
-def _iso_timestamp(value: object) -> str | None:
+def _parse_timestamp(value: object) -> dt.datetime | None:
     if not isinstance(value, str) or not value:
         return None
     try:
@@ -336,7 +384,12 @@ def _iso_timestamp(value: object) -> str | None:
         return None
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=dt.timezone.utc)
-    return parsed.astimezone(dt.timezone.utc).isoformat(timespec="seconds")
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def _iso_timestamp(value: object) -> str | None:
+    parsed = _parse_timestamp(value)
+    return parsed.isoformat(timespec="seconds") if parsed is not None else None
 
 
 def _number(value: object) -> int | float | None:
@@ -476,10 +529,123 @@ def _worker_display_verdict(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _worker_row(record: dict[str, Any], *, node_id: str | None = "local") -> dict[str, Any]:
+def _controller_labels_by_session(
+    project_root: Path,
+    records: list[dict[str, Any]],
+) -> dict[str, str]:
+    """Return only unambiguous beacon labels for stamped controller sessions."""
+    wanted = {
+        str(record.get("controller_session_id"))
+        for record in records
+        if record.get("controller_session_id")
+    }
+    if not wanted:
+        return {}
+    session_map = goalflight_session_status._read_session_map(  # noqa: SLF001
+        goalflight_session_status._session_file(project_root)  # noqa: SLF001
+    )
+    labels: dict[str, set[str]] = {}
+    for session in session_map.values():
+        session_id = _display(session.get("id"), limit=128)
+        label = _display(session.get("label"), limit=64)
+        if session_id in wanted and label:
+            labels.setdefault(session_id, set()).add(label)
+    return {
+        session_id: next(iter(values))
+        for session_id, values in labels.items()
+        if len(values) == 1
+    }
+
+
+def _controller_fields(
+    record: dict[str, Any],
+    controller_labels: dict[str, str],
+) -> dict[str, Any]:
+    session_id = _display(record.get("controller_session_id"), limit=128)
+    raw_pid = record.get("controller_pid")
+    controller_pid = raw_pid if isinstance(raw_pid, int) and not isinstance(raw_pid, bool) and raw_pid > 0 else None
+    label = controller_labels.get(session_id) if session_id else None
+    if label:
+        display, state = label, "label"
+    elif session_id:
+        display, state = session_id, "session"
+    elif controller_pid is not None:
+        display, state = "owned · identity unknown", "owned_unknown"
+    else:
+        display, state = "unowned", "unowned"
+    return {
+        "controller_session_id": session_id,
+        "controller_pid": controller_pid,
+        "controller_label": label,
+        "controller_display": display,
+        "controller_state": state,
+    }
+
+
+def _worker_age_filter_fields(
+    *,
+    started_at: str | None,
+    is_terminal: bool | None,
+    sampled_at: dt.datetime | None,
+    observed_live: bool | None,
+) -> dict[str, Any]:
+    if is_terminal is True:
+        return {"age_filter_match": False, "age_filter_reason": "terminal"}
+    if observed_live is True:
+        return {"age_filter_match": False, "age_filter_reason": "observed_live"}
+    parsed = _parse_timestamp(started_at)
+    if parsed is None:
+        return {"age_filter_match": False, "age_filter_reason": "started_at_unknown"}
+    if sampled_at is None:
+        return {"age_filter_match": False, "age_filter_reason": "sample_time_unknown"}
+    age_seconds = (sampled_at - parsed).total_seconds()
+    if age_seconds < 0:
+        return {"age_filter_match": False, "age_filter_reason": "started_at_future"}
+    if age_seconds > WORKER_AGE_FILTER_SECONDS:
+        return {"age_filter_match": True, "age_filter_reason": "older_than_threshold"}
+    return {"age_filter_match": False, "age_filter_reason": "within_threshold"}
+
+
+def _worker_observed_live_fields(
+    record: dict[str, Any],
+    *,
+    sampled_at: dt.datetime | None,
+) -> dict[str, Any]:
+    alive = record.get("worker_still_alive")
+    if isinstance(alive, bool):
+        return {"observed_live": alive, "observed_live_source": "identity_recheck"}
+    status = goalflight_status._status_json_payload(record)  # noqa: SLF001
+    dispatch_id = record.get("dispatch_id")
+    if not status or not dispatch_id or status.get("dispatch_id") != dispatch_id:
+        return {"observed_live": None, "observed_live_source": "unobserved"}
+    observed_at = _parse_timestamp(status.get("heartbeat_at"))
+    if observed_at is None:
+        updated_at = _number(status.get("updated_at"))
+        if updated_at is not None:
+            with contextlib.suppress(OverflowError, OSError, ValueError):
+                observed_at = dt.datetime.fromtimestamp(updated_at, tz=dt.timezone.utc)
+    status_alive = status.get("worker_alive")
+    if sampled_at is None or observed_at is None or not isinstance(status_alive, bool):
+        return {"observed_live": None, "observed_live_source": "unobserved"}
+    sample_age_s = (sampled_at - observed_at).total_seconds()
+    if abs(sample_age_s) <= WORKER_LIVE_SAMPLE_FRESH_SECONDS:
+        return {"observed_live": status_alive, "observed_live_source": "fresh_status"}
+    return {"observed_live": None, "observed_live_source": "unobserved"}
+
+
+def _worker_row(
+    record: dict[str, Any],
+    *,
+    node_id: str | None = "local",
+    sampled_at: dt.datetime | None = None,
+    controller_labels: dict[str, str] | None = None,
+) -> dict[str, Any]:
     # Raw authority fields remain available for diagnosis, while renderers use
     # only the canonical verdict below for filtering and presentation.
     alive = record.get("worker_still_alive")
+    started_at = _iso_timestamp(record.get("started_at"))
+    verdict = _worker_display_verdict(record)
+    observed_live = _worker_observed_live_fields(record, sampled_at=sampled_at)
     return {
         "dispatch_id": _display(record.get("dispatch_id"), limit=128),
         "node_id": _display(node_id, limit=96),
@@ -493,10 +659,36 @@ def _worker_row(record: dict[str, Any], *, node_id: str | None = "local") -> dic
         "terminal_state": _display(record.get("terminal_state"), limit=64),
         "liveness_state": _display(record.get("liveness_state"), limit=64),
         "worker_alive": alive if isinstance(alive, bool) else None,
-        "started_at": _iso_timestamp(record.get("started_at")),
+        "started_at": started_at,
         "ended_at": _iso_timestamp(record.get("ended_at")),
-        **_worker_display_verdict(record),
+        **verdict,
+        **_controller_fields(record, controller_labels or {}),
+        **observed_live,
+        **_worker_age_filter_fields(
+            started_at=started_at,
+            is_terminal=verdict["is_terminal"],
+            sampled_at=sampled_at,
+            observed_live=observed_live["observed_live"],
+        ),
     }
+
+
+def _worker_sort_key(row: dict[str, Any]) -> tuple[Any, ...]:
+    """Newest started first; missing starts last; identities break equal-time ties."""
+    started_at = _parse_timestamp(row.get("started_at"))
+    return (
+        row.get("observed_live") is not True,
+        started_at is None,
+        -started_at.timestamp() if started_at is not None else 0.0,
+        str(row.get("dispatch_id") or ""),
+        str(row.get("node_id") or ""),
+        str(row.get("agent") or ""),
+        str(row.get("transport") or ""),
+    )
+
+
+def _sort_worker_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(rows, key=_worker_sort_key)
 
 
 def _rate_pressure_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -580,14 +772,22 @@ def _vendor_rows(rows: object) -> list[dict[str, Any]]:
     return projected
 
 
-def _remote_row(payload: object) -> dict[str, Any]:
+def _remote_row(
+    payload: object,
+    *,
+    sampled_at: dt.datetime | None = None,
+) -> dict[str, Any]:
     data = payload if isinstance(payload, dict) else {}
     workers = []
     for row in data.get("dispatches") or []:
         if not isinstance(row, dict):
             continue
         reachable = row.get("ssh_reachable")
-        worker = _worker_row(row, node_id=_display(row.get("node"), limit=96))
+        worker = _worker_row(
+            row,
+            node_id=_display(row.get("node"), limit=96),
+            sampled_at=sampled_at,
+        )
         worker.update(
             {
                 "quarantine_reason": _display(row.get("quarantine_reason"), limit=64),
@@ -618,7 +818,7 @@ def _remote_row(payload: object) -> dict[str, Any]:
     return {
         "available": data.get("available") if isinstance(data.get("available"), bool) else False,
         "nodes": nodes,
-        "workers": workers,
+        "workers": _sort_worker_rows(workers),
     }
 
 
@@ -846,6 +1046,7 @@ def _project_rows(
     registered_projects: list[dict[str, Any]],
     errors: list[str],
     all_registered_roots: set[str] | None = None,
+    sampled_at: dt.datetime | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Rows for every project with a record, deep-sampling only the head.
 
@@ -899,6 +1100,17 @@ def _project_rows(
             session = {}
             milestone = {}
 
+        controller_labels = _controller_labels_by_session(Path(root), scoped_records)
+        worker_rows = _sort_worker_rows(
+            [
+                _worker_row(
+                    record,
+                    sampled_at=sampled_at,
+                    controller_labels=controller_labels,
+                )
+                for record in scoped_records
+            ]
+        )
         projects.append(
             {
                 "project_id": _project_id(root),
@@ -908,14 +1120,28 @@ def _project_rows(
                 "skill_version": metadata.get("skill_version"),
                 "session": _session_row(session),
                 "milestone": _milestone_row(milestone),
-                "workers": [_worker_row(record) for record in scoped_records],
+                "workers": worker_rows,
             }
         )
 
     # Records with no usable project root remain visible without inventing a
     # controller/project association.  Object identity is stable across the
     # shallow scope_payload filtering used above.
-    unassigned = [_worker_row(record) for record in records if id(record) not in assigned_dispatches]
+    unassigned = _sort_worker_rows(
+        [
+            _worker_row(record, sampled_at=sampled_at)
+            for record in records
+            if id(record) not in assigned_dispatches
+        ]
+    )
+    projects.sort(
+        key=lambda project: (
+            _worker_sort_key(project["workers"][0])
+            if project["workers"]
+            else (True, True, 0.0, "", "", "", ""),
+            str(project.get("project_id") or ""),
+        )
+    )
     return projects, unassigned
 
 
@@ -928,6 +1154,7 @@ def build_fleet_plane(
 ) -> dict[str, Any]:
     """Build one machine-wide fleet sample, then group it by registered project."""
     started_at = _utc_now()
+    sampled_at = _parse_timestamp(started_at)
     errors: list[str] = []
 
     # Machine-wide facts first.  The unscoped local authority is invoked once,
@@ -977,6 +1204,7 @@ def build_fleet_plane(
         sampled_projects,
         errors,
         all_registered_roots=_all_registered_roots(registered),
+        sampled_at=sampled_at,
     )
     # Attach queue depth by the project's own root. Every row gets the key --
     # the allowlist requires it, and an absent queue must read as depth 0, not
@@ -999,12 +1227,13 @@ def build_fleet_plane(
         # were listed.
         "registry_total": registry_total,
         "registry_deep_sampled": len(sampled_projects),
+        "worker_age_filter": dict(WORKER_AGE_FILTER_POLICY),
         "machine": {
             **_machine_row(machine_status if isinstance(machine_status, dict) else {}),
             "queue_depth": queue_total,
         },
         "vendors": _vendor_rows(usage_rows),
-        "remote": _remote_row(remote_status),
+        "remote": _remote_row(remote_status, sampled_at=sampled_at),
         "projects": projects,
         "unassigned_workers": unassigned,
     }
@@ -1120,6 +1349,68 @@ def build_attention_plane(
     return payload
 
 
+def build_degraded_plane(
+    plane: str,
+    *,
+    error: str,
+    started_at: str | None = None,
+    generation_id: str | None = None,
+) -> dict[str, Any]:
+    """Build an empty, schema-valid sample for a whole-tick producer failure.
+
+    Source-level failures normally flow through ``_capture``.  A wall-clock
+    budget is different: the timed-out sampler is stopped out-of-process, so it
+    cannot finish its own payload.  This keeps that stop on the same DEGRADED
+    contract instead of leaving an old mirror behind or inventing another
+    renderer state.
+
+    A timed-out fleet sample reports zero deep samples and an unknown registry
+    total.  That is deliberately not ``0 / 0``: the producer did not finish the
+    registry pass, so claiming an empty fleet would turn "I did not look" into
+    "nothing exists".
+    """
+    if plane not in SCRIPT_GLOBALS:
+        raise ValueError(f"unknown plane: {plane}")
+    began = started_at or _utc_now()
+    finished_at = _utc_now()
+    bounded_error = _display(error, limit=96) or "producer:RuntimeError"
+    metadata = _metadata(
+        plane,
+        generation_id=_generation_id(plane, generation_id),
+        started_at=began,
+        finished_at=finished_at,
+        errors=[bounded_error],
+    )
+    if plane == "attention":
+        payload = {
+            "schema": ATTENTION_SCHEMA,
+            **metadata,
+            "age_granularity": "minute",
+            "items": [],
+        }
+    else:
+        payload = {
+            "schema": FLEET_SCHEMA,
+            **metadata,
+            "registry_total": None,
+            "registry_deep_sampled": 0,
+            # The age-filter policy is a property of this build, not of the
+            # tick, so a degraded sample still declares it. Omitting it made a
+            # budget timeout fail its own schema validation and raise instead of
+            # publishing the DEGRADED payload the budget exists to produce --
+            # the timeout path would have crashed the producer rather than
+            # reporting that it ran out of time.
+            "worker_age_filter": dict(WORKER_AGE_FILTER_POLICY),
+            "machine": {**_machine_row({}), "queue_depth": None},
+            "vendors": [],
+            "remote": _remote_row({}),
+            "projects": [],
+            "unassigned_workers": [],
+        }
+    validate_projection(payload, plane)
+    return payload
+
+
 def publish_plane(path: str | Path, payload: dict[str, Any], plane: str) -> Path:
     """Validate and atomically publish one independently generated plane."""
     validate_projection(payload, plane)
@@ -1130,6 +1421,18 @@ def publish_plane(path: str | Path, payload: dict[str, Any], plane: str) -> Path
         global_name=SCRIPT_GLOBALS[plane],
     )
     return target
+
+
+def sample_exit_code(payload: dict[str, Any], plane: str) -> int:
+    """Report and return the shared healthy/degraded producer exit contract."""
+    if payload.get("last_success_at") is not None:
+        return 0
+    print(
+        f"fleet-console {plane} sample DEGRADED: "
+        f"{payload.get('last_error') or 'one or more sources failed'}",
+        file=sys.stderr,
+    )
+    return 1
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1180,14 +1483,7 @@ def main(argv: list[str] | None = None) -> int:
     # last_success_at is None precisely when at least one source failed, so it
     # is the honest signal. Exit 1 there, and say why on stderr, so a cron or
     # drain tick and a human both see the same verdict.
-    if payload.get("last_success_at") is None:
-        print(
-            f"fleet-console {args.plane} sample DEGRADED: "
-            f"{payload.get('last_error') or 'one or more sources failed'}",
-            file=sys.stderr,
-        )
-        return 1
-    return 0
+    return sample_exit_code(payload, args.plane)
 
 
 if __name__ == "__main__":

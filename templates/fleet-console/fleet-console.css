@@ -67,6 +67,7 @@
   .wordmark span { color:var(--amber); }
   .planes { margin-left:auto; display:flex; gap:14px; font-size:10px; color:var(--ink-3); }
   .planes b { font-weight:400; color:var(--ink-2); }
+  .filter-note { max-width:220px; font-size:9px; color:var(--ink-3); line-height:1.25; }
 
   .ghost-btn {
     font:inherit; font-size:10px; letter-spacing:.06em; text-transform:uppercase;
@@ -158,7 +159,7 @@
   .rows { overflow-x:auto; }
   .row, .row-hd {
     display:grid;
-    grid-template-columns:9px minmax(168px,1.3fr) minmax(112px,.8fr) minmax(116px,1fr) minmax(80px,auto) minmax(96px,.65fr);
+    grid-template-columns:9px minmax(168px,1.3fr) minmax(112px,.8fr) minmax(128px,.9fr) minmax(116px,1fr) minmax(80px,auto) minmax(96px,.65fr);
     gap:12px; align-items:center; padding:7px 12px; min-width:700px;
   }
   .row-hd { font-size:9px; letter-spacing:.14em; text-transform:uppercase; color:var(--ink-3); padding:8px 12px 6px; }
@@ -177,6 +178,9 @@
   .agent { font-size:11px; color:var(--ink-2); }
   .wire { font-size:9.5px; color:var(--ink-3); letter-spacing:.02em; }
   .wire b { color:var(--cyan); font-weight:600; }
+  .controller-id { font-size:10px; color:var(--ink-2); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .controller-id.unowned { color:var(--ink-3); font-style:italic; }
+  .controller-id.owned_unknown { color:var(--amber); }
   .state-txt { font-size:11px; }
   .host { font-size:11px; color:var(--ink-3); }
 
