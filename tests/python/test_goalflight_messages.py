@@ -128,6 +128,7 @@ def write_ledger_record(
     started_at: str = "2026-07-23T00:00:00+00:00",
     controller_session_id: str | None = None,
     controller_pid: int | None = None,
+    controller_label: str | None = None,
 ) -> None:
     runs_dir = base / "state" / "runs.d"
     runs_dir.mkdir(parents=True, exist_ok=True)
@@ -152,6 +153,8 @@ def write_ledger_record(
     if controller_session_id is not None:
         record["controller_session_id"] = controller_session_id
         record["controller_pid"] = controller_pid if controller_pid is not None else os.getpid()
+        if controller_label is not None:
+            record["controller_label"] = controller_label
     (runs_dir / f"{dispatch_id}.json").write_text(json.dumps(record) + "\n", encoding="utf-8")
 
 
@@ -1154,6 +1157,290 @@ def test_wake_filter_uses_sender_direction_and_preserves_unread_mail() -> None:
                     os.environ[key] = value
 
 
+def _claim_test_controller(
+    base: Path,
+    project: Path,
+    *,
+    label: str = "mine-controller",
+    session_id: str = "mine-session",
+) -> dict[str, str | None]:
+    import goalflight_session_status as sessions
+
+    sessions.claim_session(
+        project,
+        pid=os.getpid(),
+        session_id=session_id,
+        label=label,
+    )
+    updates = {
+        "GOALFLIGHT_STATE_DIR": str(base / "state"),
+        "GOALFLIGHT_MESSAGES_DIR": str(base / "messages"),
+        "GOALFLIGHT_FLEET_DIR": str(base / "fleet"),
+        "GOALFLIGHT_CONTROLLER_PID": str(os.getpid()),
+        "GOALFLIGHT_CONTROLLER_LABEL": label,
+    }
+    previous = {key: os.environ.get(key) for key in updates}
+    os.environ.update(updates)
+    return previous
+
+
+def _restore_test_controller(previous: dict[str, str | None]) -> None:
+    for key, value in previous.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+
+
+def test_named_peer_mail_crosses_projects_by_default() -> None:
+    import tempfile
+    import goalflight_messages as messages
+    import goalflight_status as status
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        mine = base / "mine"
+        peer = base / "peer"
+        messages_dir = base / "messages"
+        fleet_dir = base / "fleet"
+        init_git_project(mine)
+        init_git_project(peer)
+        fleet_dir.mkdir()
+        previous = _claim_test_controller(base, mine)
+        try:
+            write_ledger_record(
+                base,
+                "mine-worker",
+                mine,
+                controller_session_id="mine-session",
+                controller_label="mine-controller",
+            )
+            write_ledger_record(base, "peer-correspondence", peer)
+            posted = run_messages_cli(
+                messages_dir,
+                fleet_dir,
+                [
+                    "post",
+                    "--dispatch-id",
+                    "peer-correspondence",
+                    "--type",
+                    "controller-notice",
+                    "--text",
+                    "cross-project finding",
+                    "--to-controller",
+                    "mine-controller",
+                ],
+                cwd=peer,
+            )
+            assert_true("named controller post records without worker delivery", posted.returncode == 0)
+            stored = messages.read_envelopes(messages.inbox_path(messages_dir, "peer-correspondence"))
+            assert_true(
+                "envelope carries stable controller label",
+                stored[0].get("addressee") == {"kind": "controller", "label": "mine-controller"},
+            )
+            relayed = run_messages_cli(messages_dir, fleet_dir, ["relay", "--new"], cwd=mine)
+            assert_true("default relay surfaces named peer mail", "cross-project finding" in relayed.stdout)
+            summary = status._mail_summary({"mine-worker"}, project_root=mine)
+            assert_true("default status scope counts named peer mail", summary.get("count") == 1)
+            wakes = messages.controller_wake_watermark(
+                project_root=mine,
+                owned_dispatch_ids={"mine-worker"},
+                messages_dir=messages_dir,
+                fleet_dir=fleet_dir,
+            )
+            assert_true("shared wake filter includes named peer mail", ("peer-correspondence", 1) in wakes)
+            wait_wakes = status._mail_watermark(str(mine), ["mine-worker"])
+            assert_true(
+                "status wait delegates named peer mail to shared filter",
+                wait_wakes is not None and ("peer-correspondence", 1) in wait_wakes,
+            )
+        finally:
+            _restore_test_controller(previous)
+
+
+def test_named_mail_for_different_controller_is_quiet_and_readable() -> None:
+    import tempfile
+    import goalflight_messages as messages
+
+    assert_true(
+        "recipient cursor keys cannot collide on colon-bearing labels",
+        messages.controller_cursor_key("a:b", "c")
+        != messages.controller_cursor_key("a", "b:c"),
+    )
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        mine = base / "mine"
+        peer = base / "peer"
+        messages_dir = base / "messages"
+        fleet_dir = base / "fleet"
+        init_git_project(mine)
+        init_git_project(peer)
+        fleet_dir.mkdir()
+        previous = _claim_test_controller(base, mine)
+        try:
+            write_ledger_record(
+                base,
+                "mine-worker",
+                mine,
+                controller_session_id="mine-session",
+                controller_label="mine-controller",
+            )
+            messages.post_message(
+                dispatch_id="peer-private",
+                msg_type="controller-question",
+                payload={"text": "for somebody else"},
+                messages_dir=messages_dir,
+                addressee=messages.controller_addressee("other-controller"),
+            )
+            wakes = messages.controller_wake_watermark(
+                project_root=mine,
+                owned_dispatch_ids={"mine-worker"},
+                messages_dir=messages_dir,
+                fleet_dir=fleet_dir,
+            )
+            assert_true("different addressee does not wake", ("peer-private", 1) not in wakes)
+            relayed = run_messages_cli(messages_dir, fleet_dir, ["relay", "--new"], cwd=mine)
+            assert_true("different addressee absent from default relay", "for somebody else" not in relayed.stdout)
+            readable = run_messages_cli(
+                messages_dir,
+                fleet_dir,
+                ["read", "--dispatch-id", "peer-private", "--json"],
+                cwd=mine,
+            )
+            assert_true("different addressee correspondence remains readable", "for somebody else" in readable.stdout)
+        finally:
+            _restore_test_controller(previous)
+
+
+def test_cross_project_worker_traffic_remains_project_scoped() -> None:
+    import tempfile
+    import goalflight_messages as messages
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        mine = base / "mine"
+        peer = base / "peer"
+        messages_dir = base / "messages"
+        fleet_dir = base / "fleet"
+        init_git_project(mine)
+        init_git_project(peer)
+        fleet_dir.mkdir()
+        previous = _claim_test_controller(base, mine)
+        try:
+            write_ledger_record(
+                base,
+                "mine-worker",
+                mine,
+                controller_session_id="mine-session",
+                controller_label="mine-controller",
+            )
+            write_ledger_record(base, "peer-worker", peer)
+            messages.post_message(
+                dispatch_id="peer-worker",
+                msg_type="blocked",
+                payload={"text": "peer worker escalation"},
+                messages_dir=messages_dir,
+            )
+            wakes = messages.controller_wake_watermark(
+                project_root=mine,
+                owned_dispatch_ids={"mine-worker"},
+                messages_dir=messages_dir,
+                fleet_dir=fleet_dir,
+            )
+            assert_true("foreign worker escalation does not wake", ("peer-worker", 1) not in wakes)
+            relayed = run_messages_cli(messages_dir, fleet_dir, ["relay", "--new"], cwd=mine)
+            assert_true("foreign worker traffic absent from default relay", "peer worker escalation" not in relayed.stdout)
+        finally:
+            _restore_test_controller(previous)
+
+
+def test_unknown_controller_name_is_preserved_and_reported() -> None:
+    import tempfile
+    import goalflight_messages as messages
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        mine = base / "mine"
+        messages_dir = base / "messages"
+        fleet_dir = base / "fleet"
+        init_git_project(mine)
+        fleet_dir.mkdir()
+        previous = _claim_test_controller(base, mine)
+        try:
+            write_ledger_record(
+                base,
+                "mine-worker",
+                mine,
+                controller_session_id="mine-session",
+                controller_label="mine-controller",
+            )
+            messages.post_message(
+                dispatch_id="ghost-mail",
+                msg_type="controller-notice",
+                payload={"text": "retain this warning"},
+                messages_dir=messages_dir,
+                addressee=messages.controller_addressee("unclaimed-controller"),
+            )
+            wakes = messages.controller_wake_watermark(
+                project_root=mine,
+                owned_dispatch_ids={"mine-worker"},
+                messages_dir=messages_dir,
+                fleet_dir=fleet_dir,
+            )
+            assert_true("unclaimed name does not wake arbitrary controller", ("ghost-mail", 1) not in wakes)
+            report = run_messages_cli(messages_dir, fleet_dir, ["undeliverable"], cwd=mine)
+            assert_true("unclaimed name is reported", "1 unresolved controller envelope" in report.stdout)
+            assert_true("unclaimed label is named", "to unclaimed-controller" in report.stdout)
+            assert_true("unclaimed subject remains reportable", "retain this warning" in report.stdout)
+            stored = messages.read_envelopes(messages.inbox_path(messages_dir, "ghost-mail"))
+            assert_true("unclaimed envelope remains stored", len(stored) == 1)
+            assert_true("unclaimed envelope remains unread", not messages.read_cursor_path(messages_dir).exists())
+        finally:
+            _restore_test_controller(previous)
+
+
+def test_backlog_triage_digests_without_deleting_and_new_mail_stays_new() -> None:
+    import tempfile
+    import goalflight_messages as messages
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        messages_dir = base / "messages"
+        fleet_dir = base / "fleet"
+        fleet_dir.mkdir()
+        for index in range(3):
+            messages.post_message(
+                dispatch_id=f"legacy-{index}",
+                msg_type="status",
+                payload={"text": f"legacy body {index}"},
+                messages_dir=messages_dir,
+            )
+        original = {
+            path.name: path.read_bytes()
+            for path in messages_dir.glob("*.jsonl")
+        }
+        triaged = run_messages_cli(messages_dir, fleet_dir, ["triage-backlog", "--apply"])
+        result = json.loads(triaged.stdout)
+        assert_true("exact unread snapshot triaged", result["envelope_count"] == 3)
+        digest = json.loads(Path(result["digest"]).read_text(encoding="utf-8"))
+        assert_true("digest lists every envelope", len(digest["items"]) == 3)
+        assert_true("digest records retention", digest["correspondence_retained"] is True)
+        assert_true(
+            "original correspondence bytes unchanged",
+            all((messages_dir / name).read_bytes() == content for name, content in original.items()),
+        )
+        messages.post_message(
+            dispatch_id="legacy-0",
+            msg_type="status",
+            payload={"text": "arrived after triage"},
+            messages_dir=messages_dir,
+        )
+        relayed = run_messages_cli(messages_dir, fleet_dir, ["relay", "--new", "--all-projects"])
+        assert_true("post-snapshot mail remains new", "arrived after triage" in relayed.stdout)
+        assert_true("triaged bodies no longer flood new view", "legacy body" not in relayed.stdout)
+
+
 def test_mcp_stdio_tools_call() -> None:
     import json
     import subprocess
@@ -1916,6 +2203,11 @@ def main() -> None:
         test_listener_task_store_nag_counts_without_waking_then_escalation_wakes,
         test_listener_wakes_for_controller_addressed_mail,
         test_wake_filter_uses_sender_direction_and_preserves_unread_mail,
+        test_named_peer_mail_crosses_projects_by_default,
+        test_named_mail_for_different_controller_is_quiet_and_readable,
+        test_cross_project_worker_traffic_remains_project_scoped,
+        test_unknown_controller_name_is_preserved_and_reported,
+        test_backlog_triage_digests_without_deleting_and_new_mail_stays_new,
         test_mcp_stdio_tools_call,
         test_mcp_delivery_failure_sets_tool_error_and_call_exit,
         test_mark_read_creates_cursor_and_unseen_filters,

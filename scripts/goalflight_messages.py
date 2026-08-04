@@ -22,6 +22,7 @@ DEFAULT_CONTRACT = REPO_ROOT / "docs-private" / "architecture" / "contracts" / "
 AGGREGATE_SCHEMA = "goalflight.fleet.register.aggregate.v1"
 READ_CURSOR_FILE = ".read-cursor.json"
 ACK_CURSOR_FILE = ".ack-cursor.json"
+BACKLOG_DIGEST_DIR = "backlog-digests"
 DEFAULT_RELAY_ITEM_LIMIT = 20
 DEFAULT_RELAY_BYTE_LIMIT = 4096
 TASKLESS_TERMINAL_STALE_AFTER = dt.timedelta(hours=24)
@@ -63,6 +64,7 @@ CONTROLLER_CHANNEL_TYPES = frozenset(
 CONTROLLER_LISTENER_ESCALATION_TYPES = frozenset({"user_need", "user_confirm", "blocked"})
 TASK_STORE_STATUS_NUDGE_KINDS = frozenset({"parallel-ready", "resume-ready", "done-suggest"})
 NON_ERROR_UNDELIVERED_STATUSES = frozenset({"terminal_recorded_only", "worker_view_queued"})
+CONTROLLER_ADDRESSEE_KIND = "controller"
 
 REQUIRED_ENVELOPE_FIELDS = (
     "schema",
@@ -206,6 +208,50 @@ def validate_envelope(envelope: dict, *, path: str = "envelope") -> None:
     for key in ("node", "adapter", "transport"):
         if key not in source:
             raise MessageError(f"{path}.source: missing {key}")
+    addressee = envelope.get("addressee")
+    if addressee is not None:
+        if not isinstance(addressee, dict):
+            raise MessageError(f"{path}.addressee: expected object")
+        if addressee.get("kind") != CONTROLLER_ADDRESSEE_KIND:
+            raise MessageError(f"{path}.addressee.kind: unsupported addressee kind")
+        label = addressee.get("label")
+        if not isinstance(label, str) or not label.strip() or len(label.strip()) > 64:
+            raise MessageError(f"{path}.addressee.label: expected 1..64 non-blank characters")
+        if envelope.get("type") not in CONTROLLER_CHANNEL_TYPES:
+            raise MessageError(
+                f"{path}.addressee: controller addressing is only valid for controller-channel types"
+            )
+
+
+def controller_addressee(label: str) -> dict[str, str]:
+    """Build the stable-name address carried by controller correspondence."""
+    resolved = str(label or "").strip()
+    if not resolved or len(resolved) > 64:
+        raise MessageError("controller addressee label must contain 1..64 non-blank characters")
+    return {"kind": CONTROLLER_ADDRESSEE_KIND, "label": resolved}
+
+
+def controller_addressee_label(envelope: dict) -> str | None:
+    addressee = envelope.get("addressee") if isinstance(envelope, dict) else None
+    if not isinstance(addressee, dict) or addressee.get("kind") != CONTROLLER_ADDRESSEE_KIND:
+        return None
+    label = addressee.get("label")
+    return label.strip() if isinstance(label, str) and label.strip() else None
+
+
+def controller_cursor_key(label: str, dispatch_id: str) -> str:
+    """Recipient-private cursor key; one controller cannot mark another's mail read."""
+    return "controller:" + json.dumps(
+        [str(label), str(dispatch_id)],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def envelope_cursor_key(envelope: dict) -> str:
+    dispatch_id = str(envelope.get("dispatch_id") or "")
+    label = controller_addressee_label(envelope)
+    return controller_cursor_key(label, dispatch_id) if label else dispatch_id
 
 
 def read_envelopes(path: Path, *, last_n: int | None = None) -> list[dict]:
@@ -267,6 +313,7 @@ def post_message(
     update_aggregate: bool = False,
     deliver_to_worker: bool = False,
     retain_terminal_worker_view: bool = False,
+    addressee: dict | None = None,
 ) -> dict:
     """Append one goalflight.message.v1 envelope; shared by CLI, MCP, and tests."""
     if not isinstance(payload, dict):
@@ -303,6 +350,8 @@ def post_message(
             "priority": priority or PRIORITY_BY_TYPE.get(msg_type, "normal"),
             "payload": payload,
         }
+        if addressee is not None:
+            envelope["addressee"] = dict(addressee)
         line = serialize_envelope_line(envelope)
         with path.open("a", encoding="utf-8") as fh:
             fh.write(line)
@@ -570,9 +619,13 @@ def goalflight_post_message_tool(
         source=source,
         seq=arguments.get("seq"),
         priority=arguments.get("priority"),
+        addressee=arguments.get("addressee"),
         fleet_dir=fleet_dir,
         update_aggregate=refresh_aggregate,
-        deliver_to_worker=_controller_delivery_requested(str(dispatch_id), str(msg_type)),
+        deliver_to_worker=(
+            arguments.get("addressee") is None
+            and _controller_delivery_requested(str(dispatch_id), str(msg_type))
+        ),
     )
 
 
@@ -665,7 +718,13 @@ def _open_user_needs(envelopes: list[dict], *, acked_through: int = 0) -> list[d
     return open_items
 
 
-def _open_controller_channel(envelopes: list[dict], *, acked_through: int = 0) -> list[dict]:
+def _open_controller_channel(
+    envelopes: list[dict],
+    *,
+    acked_through: int = 0,
+    ack_cursor: dict[str, int] | None = None,
+    controller_label: str | None = None,
+) -> list[dict]:
     """Unacked controller-addressed messages.
 
     Deliberately NOT gated on _dispatch_complete the way _open_user_needs is: a
@@ -674,9 +733,15 @@ def _open_controller_channel(envelopes: list[dict], *, acked_through: int = 0) -
     """
     open_items: list[dict] = []
     for env in envelopes:
+        envelope_acked_through = acked_through
+        addressee_label = controller_addressee_label(env)
+        if ack_cursor is not None and addressee_label and controller_label == addressee_label:
+            envelope_acked_through = int(
+                ack_cursor.get(controller_cursor_key(addressee_label, str(env.get("dispatch_id") or "")), 0)
+            )
         if (
             env.get("type") in CONTROLLER_CHANNEL_TYPES
-            and int(env.get("seq", 0)) > acked_through
+            and int(env.get("seq", 0)) > envelope_acked_through
         ):
             payload = env.get("payload", {}) or {}
             open_items.append(
@@ -688,6 +753,7 @@ def _open_controller_channel(envelopes: list[dict], *, acked_through: int = 0) -
                     "ts": env["ts"],
                     "text": payload.get("text", ""),
                     "payload": payload,
+                    "addressee": env.get("addressee"),
                 }
             )
     return open_items
@@ -781,6 +847,8 @@ def unseen_envelopes_for_paths(
     cursor: dict[str, int],
     last_n: int | None = None,
     tolerate_errors: bool = False,
+    envelope_filter: Callable[[dict], bool] | None = None,
+    cursor_key: Callable[[dict], str] | None = None,
 ) -> tuple[list[dict], dict[str, int], dict[str, int]]:
     shown: list[dict] = []
     counts: dict[str, int] = {}
@@ -793,13 +861,24 @@ def unseen_envelopes_for_paths(
             if tolerate_errors:
                 continue
             raise
-        unseen = [env for env in envelopes if int(env.get("seq", 0)) > int(cursor.get(key, 0))]
+        if envelope_filter is not None:
+            envelopes = [env for env in envelopes if envelope_filter(env)]
+        key_for = cursor_key or (lambda _env: key)
+        unseen = [
+            env
+            for env in envelopes
+            if int(env.get("seq", 0)) > int(cursor.get(key_for(env), 0))
+        ]
         counts[key] = len(unseen)
         if last_n is not None and last_n >= 0:
             unseen = unseen[-last_n:] if last_n else []
         shown.extend(unseen)
-        if unseen:
-            ack_advances[key] = max(int(env.get("seq", 0)) for env in unseen)
+        for env in unseen:
+            cursor_name = key_for(env)
+            ack_advances[cursor_name] = max(
+                int(ack_advances.get(cursor_name, 0)),
+                int(env.get("seq", 0)),
+            )
     return shown, counts, ack_advances
 
 
@@ -829,12 +908,17 @@ def build_aggregate(
     messages_dir: Path,
     fleet_dir: Path | None = None,
     dispatch_ids: set[str] | None = None,
+    envelope_filter: Callable[[dict], bool] | None = None,
+    controller_label: str | None = None,
 ) -> dict:
     envelopes_by_dispatch: dict[str, list[dict]] = {}
     ack_cursor = load_read_cursor(ack_cursor_path(messages_dir))
     for path in collect_inbox_paths(messages_dir, fleet_dir, dispatch_ids=dispatch_ids):
         try:
-            envelopes_by_dispatch[path.stem] = read_envelopes(path)
+            envelopes = read_envelopes(path)
+            if envelope_filter is not None:
+                envelopes = [envelope for envelope in envelopes if envelope_filter(envelope)]
+            envelopes_by_dispatch[path.stem] = envelopes
         except MessageError:
             # One malformed/unreadable inbox must NOT suppress everyone else's mail
             # (a scoped status reads only its own inbox, but be tolerant regardless).
@@ -855,7 +939,12 @@ def build_aggregate(
             _open_controller_advisories(envelopes, acked_through=acked_through)
         )
         open_controller_channel.extend(
-            _open_controller_channel(envelopes, acked_through=acked_through)
+            _open_controller_channel(
+                envelopes,
+                acked_through=acked_through,
+                ack_cursor=ack_cursor,
+                controller_label=controller_label,
+            )
         )
 
     return {
@@ -926,15 +1015,23 @@ def cmd_post(args: argparse.Namespace) -> int:
         "adapter": args.adapter,
         "transport": args.transport,
     }
+    addressee = (
+        controller_addressee(args.to_controller)
+        if getattr(args, "to_controller", None)
+        else None
+    )
     result = post_message(
         dispatch_id=args.dispatch_id,
         msg_type=args.type,
         payload=payload,
         messages_dir=args.messages_dir,
         source=source,
+        addressee=addressee,
         fleet_dir=args.fleet_dir,
         update_aggregate=args.refresh_aggregate,
-        deliver_to_worker=_controller_delivery_requested(args.dispatch_id, args.type),
+        deliver_to_worker=(
+            addressee is None and _controller_delivery_requested(args.dispatch_id, args.type)
+        ),
     )
     print(json.dumps(result, indent=2 if args.json else None))
     delivery = result["delivery"]
@@ -1244,6 +1341,156 @@ def _project_ledger_records(project_root: Path) -> list[dict]:
         return []
 
 
+def _verified_controller_identity(
+    project_root: Path,
+    records: list[dict],
+    *,
+    owned_dispatch_ids: set[str],
+    controller_session_id: str | None = None,
+) -> dict[str, object] | None:
+    """Resolve this controller's durable name through its live beacon.
+
+    Environment declarations are authoritative when present. Otherwise an
+    ownership-scoped wait/listener may recover the same label/session/PID tuple
+    from dispatch records. Every path revalidates the tuple against the beacon;
+    project name, inbox name, and a bare session id are never treated as an
+    address.
+    """
+    try:
+        import goalflight_session_status as sessions  # type: ignore
+
+        declared_label = sessions.resolve_controller_label()
+        declared_pid = sessions.resolve_controller_pid()
+        if declared_label is not None or declared_pid is not None:
+            if declared_label is None or declared_pid is None:
+                return None
+            live = sessions.live_session(
+                project_root,
+                label=declared_label,
+                pid=declared_pid,
+            )
+            if (
+                not isinstance(live, dict)
+                or live.get("conflicting_beacons")
+                or not live.get("id")
+                or (controller_session_id and str(live.get("id")) != controller_session_id)
+            ):
+                return None
+            return {
+                "label": declared_label,
+                "session_id": str(live["id"]),
+                "pid": declared_pid,
+            }
+
+        resolved_session_id = controller_session_id or _controller_session_for_owned_dispatches(
+            records,
+            owned_dispatch_ids,
+        )
+        if not resolved_session_id:
+            return None
+        beacon_candidates = [
+            record
+            for record in sessions._read_session_map(sessions._session_file(project_root)).values()
+            if str(record.get("id") or "") == resolved_session_id
+            and record.get("label")
+            and isinstance(record.get("pid"), int)
+        ]
+        if len(beacon_candidates) == 1:
+            beacon = beacon_candidates[0]
+            label = str(beacon["label"])
+            pid = int(beacon["pid"])
+            live = sessions.live_session(project_root, label=label, pid=pid)
+            if (
+                isinstance(live, dict)
+                and not live.get("conflicting_beacons")
+                and str(live.get("id") or "") == resolved_session_id
+            ):
+                return {"label": label, "session_id": resolved_session_id, "pid": pid}
+        candidates = {
+            (str(record.get("controller_label") or ""), record.get("controller_pid"))
+            for record in records
+            if str(record.get("controller_session_id") or "") == resolved_session_id
+            and record.get("controller_label")
+            and isinstance(record.get("controller_pid"), int)
+        }
+        if len(candidates) != 1:
+            return None
+        label, pid = next(iter(candidates))
+        live = sessions.live_session(project_root, label=label, pid=pid)
+        if (
+            not isinstance(live, dict)
+            or live.get("conflicting_beacons")
+            or str(live.get("id") or "") != resolved_session_id
+        ):
+            return None
+        return {"label": label, "session_id": resolved_session_id, "pid": pid}
+    except Exception:
+        return None
+
+
+def _controller_scope_kind(
+    envelope: dict,
+    *,
+    owned_dispatch_ids: set[str],
+    legacy_addressed_dispatch_ids: set[str],
+    task_store_dispatch_id: str | None,
+    controller_label: str | None,
+) -> str | None:
+    """Single authority for whether one envelope belongs to this controller."""
+    dispatch_id = str(envelope.get("dispatch_id") or "")
+    addressee_label = controller_addressee_label(envelope)
+    if addressee_label is not None:
+        if controller_label is not None and addressee_label == controller_label:
+            return "controller"
+        return None
+    if dispatch_id in owned_dispatch_ids:
+        return "worker"
+    if dispatch_id == task_store_dispatch_id:
+        return "task-store"
+    if dispatch_id in legacy_addressed_dispatch_ids:
+        return "legacy-controller"
+    return None
+
+
+def _controller_scope_inputs(
+    project_root: Path,
+    *,
+    records: list[dict],
+    owned_dispatch_ids: set[str],
+    controller_session_id: str | None,
+    messages_dir: Path,
+    fleet_dir: Path | None,
+    canonical_project_root: Path | None = None,
+) -> dict[str, object]:
+    canonical_project_root = canonical_project_root or _canonical_project_root(project_root)
+    known_dispatch_ids = {
+        str(record["dispatch_id"])
+        for record in records
+        if record.get("dispatch_id")
+    }
+    legacy_addressed_dispatch_ids = _project_addressed_dispatch_ids(
+        project_root,
+        messages_dir=messages_dir,
+        fleet_dir=fleet_dir,
+        canonical_project_root=canonical_project_root,
+    ) - known_dispatch_ids
+    identity = _verified_controller_identity(
+        project_root,
+        records,
+        owned_dispatch_ids=owned_dispatch_ids,
+        controller_session_id=controller_session_id,
+    )
+    return {
+        "legacy_addressed_dispatch_ids": legacy_addressed_dispatch_ids,
+        "task_store_dispatch_id": _task_store_dispatch_id(
+            project_root,
+            canonical_project_root=canonical_project_root,
+        ),
+        "controller_label": str(identity.get("label")) if identity else None,
+        "controller_session_id": str(identity.get("session_id")) if identity else controller_session_id,
+    }
+
+
 def _resolve_listener_session_id(project_root: Path, explicit_session_id: str | None) -> str:
     if explicit_session_id is not None:
         session_id = str(explicit_session_id).strip()
@@ -1266,9 +1513,7 @@ def _resolve_listener_session_id(project_root: Path, explicit_session_id: str | 
 def _controller_wake_event(
     envelope: dict,
     *,
-    owned_dispatch_ids: set[str],
-    addressed_dispatch_ids: set[str],
-    task_store_dispatch_id: str | None,
+    scope_kind: str,
     controller_session_id: str | None,
 ) -> dict | None:
     """A new typed result/escalation or controller-channel envelope in this
@@ -1278,18 +1523,16 @@ def _controller_wake_event(
     msg_type = str(envelope.get("type") or "")
     payload = envelope.get("payload") or {}
     if (
-        dispatch_id == task_store_dispatch_id
+        scope_kind == "task-store"
         and msg_type == "user_need"
         and str(payload.get("nudge_kind") or "") in TASK_STORE_STATUS_NUDGE_KINDS
     ):
         return None
-    if dispatch_id in owned_dispatch_ids:
+    if scope_kind == "worker":
         wakes = msg_type == "result" or msg_type in CONTROLLER_LISTENER_ESCALATION_TYPES
         wakes = wakes or msg_type in CONTROLLER_CHANNEL_TYPES
     else:
         wakes = (
-            dispatch_id in addressed_dispatch_ids or dispatch_id == task_store_dispatch_id
-        ) and (
             msg_type in CONTROLLER_LISTENER_ESCALATION_TYPES
             or msg_type in CONTROLLER_CHANNEL_TYPES
         )
@@ -1357,11 +1600,6 @@ def controller_wake_watermark(
     resolved_messages_dir = messages_dir or default_messages_dir()
     resolved_fleet_dir = fleet_dir if fleet_dir is not None else default_fleet_dir()
     records = _project_ledger_records(project_root)
-    known_dispatch_ids = {
-        str(record["dispatch_id"])
-        for record in records
-        if record.get("dispatch_id")
-    }
     if owned_dispatch_ids is None:
         owned_dispatch_ids = {
             str(record["dispatch_id"])
@@ -1372,38 +1610,45 @@ def controller_wake_watermark(
         }
     else:
         owned_dispatch_ids = {str(dispatch_id) for dispatch_id in owned_dispatch_ids}
-    if controller_session_id is None:
-        controller_session_id = _controller_session_for_owned_dispatches(
-            records,
-            owned_dispatch_ids,
-        )
-    canonical_project_root = _canonical_project_root(project_root)
-    addressed_dispatch_ids = _project_addressed_dispatch_ids(
+    scope_inputs = _controller_scope_inputs(
         project_root,
+        records=records,
+        owned_dispatch_ids=owned_dispatch_ids,
+        controller_session_id=controller_session_id,
         messages_dir=resolved_messages_dir,
         fleet_dir=resolved_fleet_dir,
-        canonical_project_root=canonical_project_root,
-    ) - known_dispatch_ids
-    task_store_dispatch_id = _task_store_dispatch_id(
-        project_root,
-        canonical_project_root=canonical_project_root,
     )
-    candidate_dispatch_ids = owned_dispatch_ids | addressed_dispatch_ids
+    legacy_addressed_dispatch_ids = set(scope_inputs["legacy_addressed_dispatch_ids"])
+    task_store_dispatch_id = scope_inputs["task_store_dispatch_id"]
+    controller_label = scope_inputs["controller_label"]
+    controller_session_id = str(scope_inputs["controller_session_id"] or "") or None
+    candidate_dispatch_ids = owned_dispatch_ids | legacy_addressed_dispatch_ids
     if task_store_dispatch_id:
-        candidate_dispatch_ids.add(task_store_dispatch_id)
+        candidate_dispatch_ids.add(str(task_store_dispatch_id))
 
     events: dict[tuple[str, object], dict] = {}
     for path in collect_inbox_paths(
         resolved_messages_dir,
         resolved_fleet_dir,
-        dispatch_ids=candidate_dispatch_ids,
+        dispatch_ids=None if controller_label else candidate_dispatch_ids,
     ):
-        for envelope in read_envelopes(path):
-            event = _controller_wake_event(
+        try:
+            envelopes = read_envelopes(path)
+        except MessageError:
+            continue
+        for envelope in envelopes:
+            scope_kind = _controller_scope_kind(
                 envelope,
                 owned_dispatch_ids=owned_dispatch_ids,
-                addressed_dispatch_ids=addressed_dispatch_ids,
-                task_store_dispatch_id=task_store_dispatch_id,
+                legacy_addressed_dispatch_ids=legacy_addressed_dispatch_ids,
+                task_store_dispatch_id=(str(task_store_dispatch_id) if task_store_dispatch_id else None),
+                controller_label=(str(controller_label) if controller_label else None),
+            )
+            if scope_kind is None:
+                continue
+            event = _controller_wake_event(
+                envelope,
+                scope_kind=scope_kind,
                 controller_session_id=controller_session_id,
             )
             if event is not None:
@@ -1631,6 +1876,8 @@ def controller_mail_summary(
         if task_store_project_root is not None
         else None
     )
+    controller_label: str | None = None
+    envelope_filter: Callable[[dict], bool] | None = None
     scoped_dispatch_ids = _owned_with_project_mail(
         owned_dispatch_ids,
         task_store_project_root,
@@ -1638,10 +1885,40 @@ def controller_mail_summary(
         fleet_dir=resolved_fleet_dir,
         canonical_project_root=canonical_project_root,
     )
+    if owned_dispatch_ids is not None and task_store_project_root is not None:
+        records = _project_ledger_records(task_store_project_root)
+        scope_inputs = _controller_scope_inputs(
+            task_store_project_root,
+            records=records,
+            owned_dispatch_ids={str(value) for value in owned_dispatch_ids},
+            controller_session_id=None,
+            messages_dir=resolved_messages_dir,
+            fleet_dir=resolved_fleet_dir,
+            canonical_project_root=canonical_project_root,
+        )
+        legacy_addressed_dispatch_ids = set(scope_inputs["legacy_addressed_dispatch_ids"])
+        task_store_dispatch_id = scope_inputs["task_store_dispatch_id"]
+        controller_label = (
+            str(scope_inputs["controller_label"])
+            if scope_inputs.get("controller_label")
+            else None
+        )
+
+        def envelope_filter(envelope: dict) -> bool:
+            return _controller_scope_kind(
+                envelope,
+                owned_dispatch_ids={str(value) for value in owned_dispatch_ids},
+                legacy_addressed_dispatch_ids=legacy_addressed_dispatch_ids,
+                task_store_dispatch_id=(str(task_store_dispatch_id) if task_store_dispatch_id else None),
+                controller_label=controller_label,
+            ) is not None
+
     aggregate = build_aggregate(
         messages_dir=resolved_messages_dir,
         fleet_dir=resolved_fleet_dir,
-        dispatch_ids=scoped_dispatch_ids,
+        dispatch_ids=None if controller_label else scoped_dispatch_ids,
+        envelope_filter=envelope_filter,
+        controller_label=controller_label,
     )
     needs = list(aggregate.get("open_user_needs") or [])
     needs.extend(aggregate.get("open_advisories") or [])
@@ -1649,7 +1926,7 @@ def controller_mail_summary(
     # worker-marker stream, so a peer controller's question or notice was
     # never surfaced to anyone and a human had to carry it between sessions.
     needs.extend(aggregate.get("open_controller_channel") or [])
-    if scoped_dispatch_ids is not None:
+    if scoped_dispatch_ids is not None and envelope_filter is None:
         needs = [
             n for n in needs
             if str(n.get("dispatch_id") or "") in scoped_dispatch_ids
@@ -1666,7 +1943,19 @@ def controller_mail_summary(
             item
             for item in needs
             if not isinstance(item.get("seq"), int)
-            or int(item["seq"]) > int(read_cursor.get(str(item.get("dispatch_id") or ""), 0))
+            or int(item["seq"])
+            > int(
+                read_cursor.get(
+                    controller_cursor_key(
+                        str((item.get("addressee") or {}).get("label")),
+                        str(item.get("dispatch_id") or ""),
+                    )
+                    if isinstance(item.get("addressee"), dict)
+                    and (item.get("addressee") or {}).get("label")
+                    else str(item.get("dispatch_id") or ""),
+                    0,
+                )
+            )
         ]
     if not needs:
         return {}
@@ -1677,6 +1966,7 @@ def controller_mail_summary(
             "seq": n.get("seq"),
             "ts": n.get("ts"),
             "text": sanitize_display(n.get("text") or "", limit=120),
+            "addressee": n.get("addressee"),
         }
         for n in needs
     ]
@@ -1956,6 +2246,181 @@ def format_envelope_headlines(envelopes: list) -> str:
     return "\n".join(lines)
 
 
+def _verified_live_controller_labels() -> set[str]:
+    """Names proven by a live beacon plus its paired dispatch identity."""
+    try:
+        import goalflight_ledger  # type: ignore
+        import goalflight_session_status as sessions  # type: ignore
+
+        records = goalflight_ledger.read_records()
+    except Exception:
+        return set()
+    labels: set[str] = set()
+    for record in records:
+        label = str(record.get("controller_label") or "")
+        session_id = str(record.get("controller_session_id") or "")
+        pid = record.get("controller_pid")
+        project_root = record.get("project_root")
+        if not label or not session_id or not isinstance(pid, int) or not project_root:
+            continue
+        try:
+            live = sessions.live_session(Path(str(project_root)), label=label, pid=pid)
+        except Exception:
+            continue
+        if (
+            isinstance(live, dict)
+            and not live.get("conflicting_beacons")
+            and str(live.get("id") or "") == session_id
+        ):
+            labels.add(label)
+    return labels
+
+
+def unresolved_controller_envelopes(
+    *,
+    messages_dir: Path,
+    fleet_dir: Path | None,
+) -> list[dict]:
+    """Unread named mail whose recipient has no provable live claim."""
+    live_labels = _verified_live_controller_labels()
+    cursor = load_read_cursor(read_cursor_path(messages_dir))
+    unresolved: list[dict] = []
+    for path in collect_inbox_paths(messages_dir, fleet_dir):
+        try:
+            envelopes = read_envelopes(path)
+        except MessageError:
+            continue
+        for envelope in envelopes:
+            label = controller_addressee_label(envelope)
+            if not label or label in live_labels:
+                continue
+            key = controller_cursor_key(label, str(envelope.get("dispatch_id") or path.stem))
+            if int(envelope.get("seq", 0)) > int(cursor.get(key, 0)):
+                unresolved.append(envelope)
+    unresolved.sort(key=lambda envelope: str(envelope.get("ts") or ""), reverse=True)
+    return unresolved
+
+
+def cmd_undeliverable(args: argparse.Namespace) -> int:
+    envelopes = unresolved_controller_envelopes(
+        messages_dir=args.messages_dir,
+        fleet_dir=args.fleet_dir,
+    )
+    if not envelopes:
+        print("no unresolved controller mail")
+        return 0
+    print(f"{len(envelopes)} unresolved controller envelope(s); correspondence remains unread")
+    for envelope in envelopes[:DEFAULT_RELAY_ITEM_LIMIT]:
+        label = controller_addressee_label(envelope) or "?"
+        print(
+            f"to {sanitize_display(label)}: "
+            f"{sanitize_display(envelope.get('dispatch_id') or '?')} "
+            f"#{sanitize_display(envelope.get('seq') or '?')}: "
+            f"{envelope_headline(envelope)}"
+        )
+    if len(envelopes) > DEFAULT_RELAY_ITEM_LIMIT:
+        print(f"(+{len(envelopes) - DEFAULT_RELAY_ITEM_LIMIT} elided)")
+    return 2
+
+
+def backlog_digest(
+    *,
+    messages_dir: Path,
+    fleet_dir: Path | None,
+) -> tuple[dict, dict[str, int]]:
+    """Summarize the current unread snapshot without copying or deleting bodies."""
+    cursor = load_read_cursor(read_cursor_path(messages_dir))
+    items: list[dict] = []
+    advances: dict[str, int] = {}
+    counts_by_type: dict[str, int] = {}
+    counts_by_addressee: dict[str, int] = {}
+    for path in collect_inbox_paths(messages_dir, fleet_dir):
+        try:
+            envelopes = read_envelopes(path)
+        except MessageError:
+            continue
+        for envelope in envelopes:
+            key = envelope_cursor_key(envelope)
+            seq = int(envelope.get("seq", 0))
+            if seq <= int(cursor.get(key, 0)):
+                continue
+            msg_type = str(envelope.get("type") or "unknown")
+            label = controller_addressee_label(envelope) or "legacy-unaddressed"
+            counts_by_type[msg_type] = counts_by_type.get(msg_type, 0) + 1
+            counts_by_addressee[label] = counts_by_addressee.get(label, 0) + 1
+            advances[key] = max(int(advances.get(key, 0)), seq)
+            items.append(
+                {
+                    "dispatch_id": str(envelope.get("dispatch_id") or path.stem),
+                    "seq": seq,
+                    "id": envelope.get("id"),
+                    "ts": envelope.get("ts"),
+                    "type": msg_type,
+                    "addressee": envelope.get("addressee"),
+                    "from": envelope_from(envelope),
+                    "headline": envelope_headline(envelope),
+                    "body_chars": len(str((envelope.get("payload") or {}).get("text") or "")),
+                    "source_inbox": str(path),
+                }
+            )
+    items.sort(key=lambda item: (str(item.get("ts") or ""), str(item.get("dispatch_id"))), reverse=True)
+    return (
+        {
+            "schema": "goalflight.mail.backlog-digest.v1",
+            "created_at": utc_now(),
+            "envelope_count": len(items),
+            "counts_by_type": dict(sorted(counts_by_type.items())),
+            "counts_by_addressee": dict(sorted(counts_by_addressee.items())),
+            "correspondence_retained": True,
+            "retention_note": "Original JSONL inboxes are unchanged; use source_inbox + seq to read bodies.",
+            "items": items,
+        },
+        advances,
+    )
+
+
+def cmd_triage_backlog(args: argparse.Namespace) -> int:
+    digest, advances = backlog_digest(
+        messages_dir=args.messages_dir,
+        fleet_dir=args.fleet_dir,
+    )
+    if not args.apply:
+        print(
+            json.dumps(
+                {
+                    "apply": False,
+                    "envelope_count": digest["envelope_count"],
+                    "counts_by_type": digest["counts_by_type"],
+                    "counts_by_addressee": digest["counts_by_addressee"],
+                    "note": "dry run; pass --apply to write a digest and advance only this snapshot",
+                },
+                sort_keys=True,
+            )
+        )
+        return 0
+    digest_dir = args.messages_dir / BACKLOG_DIGEST_DIR
+    digest_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    stamp = str(digest["created_at"]).replace(":", "").replace("+", "-")
+    path = digest_dir / f"backlog-{stamp}-{uuid.uuid4().hex[:8]}.json"
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_text(json.dumps(digest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+    advance_read_cursor(read_cursor_path(args.messages_dir), advances)
+    print(
+        json.dumps(
+            {
+                "apply": True,
+                "digest": str(path),
+                "envelope_count": digest["envelope_count"],
+                "correspondence_retained": True,
+                "cursor_entries_advanced": len(advances),
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
 def cmd_relay(args: argparse.Namespace) -> int:
     if args.ack and not args.new:
         print("relay --ack requires --new", file=sys.stderr)
@@ -1975,10 +2440,48 @@ def cmd_relay(args: argparse.Namespace) -> int:
             messages_dir=args.messages_dir,
             fleet_dir=args.fleet_dir,
         )
+        envelope_filter = None
+        cursor_key = None
+        controller_label = None
+        if project_root is not None and owned_dispatch_ids is not None:
+            records = _project_ledger_records(project_root)
+            scope_inputs = _controller_scope_inputs(
+                project_root,
+                records=records,
+                owned_dispatch_ids={str(value) for value in owned_dispatch_ids},
+                controller_session_id=None,
+                messages_dir=args.messages_dir,
+                fleet_dir=args.fleet_dir,
+            )
+            legacy_addressed_dispatch_ids = set(scope_inputs["legacy_addressed_dispatch_ids"])
+            task_store_dispatch_id = scope_inputs["task_store_dispatch_id"]
+            controller_label = (
+                str(scope_inputs["controller_label"])
+                if scope_inputs.get("controller_label")
+                else None
+            )
+
+            def envelope_filter(envelope: dict) -> bool:
+                return _controller_scope_kind(
+                    envelope,
+                    owned_dispatch_ids={str(value) for value in owned_dispatch_ids},
+                    legacy_addressed_dispatch_ids=legacy_addressed_dispatch_ids,
+                    task_store_dispatch_id=(
+                        str(task_store_dispatch_id) if task_store_dispatch_id else None
+                    ),
+                    controller_label=controller_label,
+                ) is not None
+
+            def cursor_key(envelope: dict) -> str:
+                label = controller_addressee_label(envelope)
+                if label and label == controller_label:
+                    return controller_cursor_key(label, str(envelope.get("dispatch_id") or ""))
+                return str(envelope.get("dispatch_id") or "")
+
         paths = collect_inbox_paths(
             args.messages_dir,
             args.fleet_dir,
-            dispatch_ids=scoped_dispatch_ids,
+            dispatch_ids=None if controller_label else scoped_dispatch_ids,
         )
         cursor_path = read_cursor_path(args.messages_dir)
         cursor = load_read_cursor(cursor_path)
@@ -1986,6 +2489,8 @@ def cmd_relay(args: argparse.Namespace) -> int:
             paths,
             cursor=cursor,
             tolerate_errors=True,
+            envelope_filter=envelope_filter,
+            cursor_key=cursor_key,
         )
         if getattr(args, "bodies", False):
             fresh, stale = split_fresh_and_stale(envelopes)
@@ -2010,6 +2515,8 @@ def cmd_relay(args: argparse.Namespace) -> int:
                     paths,
                     cursor=cursor,
                     tolerate_errors=True,
+                    envelope_filter=envelope_filter,
+                    cursor_key=cursor_key,
                 )
             except (OSError, ValueError, TypeError) as exc:
                 warn_cursor_not_advanced(exc)
@@ -2244,6 +2751,11 @@ def main(argv: list[str] | None = None) -> int:
         "--subject",
         help="Short scannable subject; shown in relay listings instead of the first body line",
     )
+    post.add_argument(
+        "--to-controller",
+        metavar="LABEL",
+        help="address controller-channel mail to one declared controller beacon label",
+    )
     post.add_argument("--node", default="local")
     post.add_argument("--adapter", default="unknown")
     post.add_argument(
@@ -2301,6 +2813,23 @@ def main(argv: list[str] | None = None) -> int:
         help="Include read open items and use the legacy unbounded summary",
     )
     relay.set_defaults(func=cmd_relay)
+
+    undeliverable = sub.add_parser(
+        "undeliverable",
+        help="report unread named controller mail with no provable live recipient",
+    )
+    undeliverable.set_defaults(func=cmd_undeliverable)
+
+    triage_backlog = sub.add_parser(
+        "triage-backlog",
+        help="digest the machine-wide unread snapshot without deleting correspondence",
+    )
+    triage_backlog.add_argument(
+        "--apply",
+        action="store_true",
+        help="write the digest, then advance read cursors through exactly that snapshot",
+    )
+    triage_backlog.set_defaults(func=cmd_triage_backlog)
 
     listen = sub.add_parser(
         "listen",

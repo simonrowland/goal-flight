@@ -208,6 +208,47 @@ or unowned workers, status/monitor traffic, quota advisories, and recurring
 task-store status nudges do not wake it; task-store nudges remain in the unread
 count shown by normal status/mail reads.
 
+### Controller correspondence addressing
+
+Controller-to-controller envelopes carry a machine-readable stable-name
+address, independent of their inbox and project:
+
+```json
+{"addressee": {"kind": "controller", "label": "goal-flight"}}
+```
+
+The label is the same declared name claimed by
+`goalflight_session_status.py --controller-startup`; it is not a project alias
+or a second identity namespace. Send controller-channel mail with
+`goalflight_messages.py post ... --to-controller goal-flight`. The receiver
+matches the label only after resolving its session id/PID/label tuple to a live,
+non-conflicting beacon. A sender therefore needs the durable human-known name,
+not the recipient's transient session id.
+
+Named controller mail is global across projects. Worker result/escalation mail
+remains dispatch-owned and project-scoped. The shared
+`controller_wake_watermark()` applies both rules for the listener and
+`goalflight_status.py --wait`; do not add a second addressee filter in a caller.
+Legacy unaddressed project-alias inboxes remain readable for compatibility, but
+new correspondence must use `addressee`.
+
+Mail for an unclaimed or unknown label remains in its original JSONL inbox,
+does not wake an arbitrary controller, and is listed by
+`goalflight_messages.py undeliverable`. Recipient cursor keys include the
+controller label, so one controller cannot mark another controller's addressed
+mail read. Broadcast is intentionally unsupported: until broadcast has bounded
+severity, topic, expiry, and acknowledgement semantics, fleet alerts must be
+explicitly fanned out as one addressed envelope per controller instead of creating
+an easy-to-mute global channel.
+
+Backlog triage is lossless. `goalflight_messages.py triage-backlog` is a dry
+run; `--apply` writes a machine-local digest under
+`$GOALFLIGHT_MESSAGES_DIR/backlog-digests/` containing every unread envelope's
+source inbox, sequence, type, addressee, headline, and body size, then advances
+read cursors through exactly that snapshot. Original JSONL correspondence and
+bodies are unchanged. Envelopes arriving after the snapshot retain higher
+sequences and remain unread.
+
 Use `goalflight_status.py --dispatch <id>` for a snapshot, or
 `goalflight_status.py --wait <id>` only when a fixed-set terminal join and its
 timeout verdict are specifically needed.
