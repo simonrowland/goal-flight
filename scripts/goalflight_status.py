@@ -1921,11 +1921,14 @@ _WAIT_EXIT_MAIL = 3
 
 
 def _mail_watermark(project_root: str | None, wait_ids: list[str]) -> set[tuple[str, object]] | None:
-    """Identity of the controller's currently-open mail, or None if unavailable.
+    """Identity of wake-worthy arrivals, or None if mail is unavailable.
 
     A set of (inbox, seq) pairs rather than a count. Acking lowers the count, so
     a count-based check would read an ack as "no new mail" and then miss a later
     arrival that merely restored the old number. Pairs only ever ADD.
+
+    Wake classification lives in goalflight_messages beside the ownership-keyed
+    listener. The normal mail summary remains the display/unread authority.
 
     Fail-open: any error returns None, which disables the mail wake for this
     wait rather than breaking it. A messaging glitch must never cost a
@@ -1934,12 +1937,11 @@ def _mail_watermark(project_root: str | None, wait_ids: list[str]) -> set[tuple[
     try:
         import goalflight_messages as _gm
 
-        summary = _gm.controller_mail_summary(
+        events = _gm.controller_wake_watermark(
+            project_root=Path(project_root) if project_root else Path.cwd(),
             owned_dispatch_ids=set(wait_ids),
-            task_store_project_root=Path(project_root) if project_root else None,
         )
-        items = summary.get("needs") or []
-        return {(str(item.get("dispatch_id")), item.get("seq")) for item in items}
+        return set(events)
     except Exception:
         return None
 

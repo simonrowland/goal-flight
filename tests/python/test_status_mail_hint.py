@@ -358,6 +358,26 @@ def test_post_message_fails_closed_on_non_regular_inbox() -> None:
     assert_eq("writer fails closed (MessageError), no hang", _with_mail_dirs(body), "MessageError")
 
 
+def test_wait_watermark_delegates_to_shared_wake_filter() -> None:
+    calls: list[dict] = []
+    original = M.controller_wake_watermark
+
+    def fake_wake_watermark(**kwargs):
+        calls.append(kwargs)
+        return {("owned-dispatch", 7): {"dispatch_id": "owned-dispatch", "seq": 7}}
+
+    M.controller_wake_watermark = fake_wake_watermark  # type: ignore[assignment]
+    try:
+        watermark = S._mail_watermark(str(ROOT), ["owned-dispatch"])
+    finally:
+        M.controller_wake_watermark = original  # type: ignore[assignment]
+
+    assert_eq("wait sees shared wake identities", watermark, {("owned-dispatch", 7)})
+    assert_eq("wait calls shared filter once", len(calls), 1)
+    assert_eq("wait passes exact owned dispatches", calls[0]["owned_dispatch_ids"], {"owned-dispatch"})
+    assert_eq("wait passes project root", calls[0]["project_root"], ROOT)
+
+
 def main() -> None:
     tests = [
         test_no_mail_empty_summary,
@@ -376,6 +396,7 @@ def main() -> None:
         test_non_regular_inbox_file_does_not_hang,
         test_corrupt_unrelated_inbox_does_not_suppress_owned_need,
         test_post_message_fails_closed_on_non_regular_inbox,
+        test_wait_watermark_delegates_to_shared_wake_filter,
     ]
     for t in tests:
         t()

@@ -23,6 +23,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from unittest.mock import patch
@@ -217,7 +218,7 @@ def case_dispatch_worker_dead_ledger_liveness() -> None:
     assert record.get("liveness_state") == "worker_dead", record
 
 
-def case_post_terminal_idle_worker_finishes() -> None:
+def case_post_terminal_idle_worker_times_out_inconclusively() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
         tail = tmp_path / "tail.txt"
@@ -230,7 +231,8 @@ def case_post_terminal_idle_worker_finishes() -> None:
         worker_code = (
             "import time\n"
             "print('COMPLETE: done', flush=True)\n"
-            "time.sleep(20)\n"
+            "while True:\n"
+            "    time.sleep(1)\n"
         )
         with tail.open("w", encoding="utf-8") as tail_out:
             worker = subprocess.Popen(
@@ -264,13 +266,14 @@ def case_post_terminal_idle_worker_finishes() -> None:
         try:
             out, err = watcher.communicate(timeout=25)
             elapsed = time.time() - t0
-            assert watcher.returncode == 0, (watcher.returncode, out, err)
+            assert watcher.returncode == 1, (watcher.returncode, out, err)
             assert elapsed < 18, f"post-terminal idle wait took {elapsed:.1f}s"
             payload = json.loads(status.read_text(encoding="utf-8"))
-            assert payload.get("state") == "complete", payload
-            assert payload.get("liveness_state") == "completed", payload
+            assert payload.get("state") == "inconclusive_timeout", payload
+            assert payload.get("liveness_state") == "inconclusive_timeout", payload
             assert payload.get("worker_alive") is True, payload
             assert payload.get("reason") == "marker:COMPLETE:post_terminal_idle_timeout", payload
+            assert payload.get("terminal_pending_state") == "complete", payload
             assert worker.poll() is None, "worker should still be alive until test cleanup"
         finally:
             if watcher.poll() is None:
@@ -281,7 +284,146 @@ def case_post_terminal_idle_worker_finishes() -> None:
                 worker.wait(timeout=5)
 
 
-def case_dispatch_post_terminal_idle_returns_success() -> None:
+def case_post_terminal_busy_worker_wait_is_bounded() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        tail = tmp_path / "tail.txt"
+        status = tmp_path / "status.json"
+        env = os.environ.copy()
+        env["GOALFLIGHT_STATE_DIR"] = str(tmp_path / "state")
+        env["GOAL_FLIGHT_PIDFILE_DIR"] = str(tmp_path / "pids")
+        env["GOALFLIGHT_TEST_MODE"] = "1"
+        env["GOALFLIGHT_TEST_PGROUP_CPU_PCT"] = "50.0"
+        worker_code = (
+            "import time\n"
+            "print('COMPLETE: done', flush=True)\n"
+            "while True:\n"
+            "    time.sleep(1)\n"
+        )
+        with tail.open("w", encoding="utf-8") as tail_out:
+            worker = subprocess.Popen(
+                [sys.executable, "-c", worker_code],
+                stdout=tail_out,
+                stderr=subprocess.STDOUT,
+                text=True,
+                start_new_session=True,
+                env=env,
+            )
+        watcher = subprocess.Popen(
+            [
+                sys.executable, str(WATCH),
+                "--pid", str(worker.pid),
+                "--tail", str(tail),
+                "--status-json", str(status),
+                "--agent", "test",
+                "--poll-secs", "0.2",
+                "--max-idle-secs", "1",
+                "--pgid", str(worker.pid),
+                "--stay-after-terminal",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+        )
+        t0 = time.monotonic()
+        try:
+            try:
+                out, err = watcher.communicate(timeout=8)
+            except subprocess.TimeoutExpired as exc:
+                raise AssertionError("post-terminal busy worker left watcher running past 8s") from exc
+            elapsed = time.monotonic() - t0
+            assert watcher.returncode == 1, (watcher.returncode, out, err)
+            assert elapsed < 8, f"post-terminal wait took {elapsed:.1f}s"
+            payload = json.loads(status.read_text(encoding="utf-8"))
+            assert payload.get("state") == "inconclusive_timeout", payload
+            assert payload.get("liveness_state") == "inconclusive_timeout", payload
+            assert payload.get("worker_alive") is True, payload
+            assert payload.get("terminal_pending_state") == "complete", payload
+            assert payload.get("terminal_marker", {}).get("kind") == "COMPLETE", payload
+            assert payload.get("reason") == "marker:COMPLETE:post_terminal_exit_timeout", payload
+            assert payload.get("post_terminal_wait_elapsed_secs", 0) >= 6, payload
+            assert payload.get("post_terminal_wait_limit_secs") == 6.0, payload
+        finally:
+            if watcher.poll() is None:
+                watcher.terminate()
+                watcher.wait(timeout=5)
+            if worker.poll() is None:
+                os.killpg(worker.pid, signal.SIGTERM)
+                worker.wait(timeout=5)
+
+
+def case_post_terminal_delayed_worker_exit_is_observed() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        tail = tmp_path / "tail.txt"
+        status = tmp_path / "status.json"
+        env = os.environ.copy()
+        env["GOALFLIGHT_STATE_DIR"] = str(tmp_path / "state")
+        env["GOAL_FLIGHT_PIDFILE_DIR"] = str(tmp_path / "pids")
+        env["GOALFLIGHT_TEST_MODE"] = "1"
+        env["GOALFLIGHT_TEST_PGROUP_CPU_PCT"] = "50.0"
+        worker_code = (
+            "import time\n"
+            "print('COMPLETE: delayed exit', flush=True)\n"
+            "time.sleep(2)\n"
+        )
+        with tail.open("w", encoding="utf-8") as tail_out:
+            worker = subprocess.Popen(
+                [sys.executable, "-c", worker_code],
+                stdout=tail_out,
+                stderr=subprocess.STDOUT,
+                text=True,
+                start_new_session=True,
+                env=env,
+            )
+        watcher = subprocess.Popen(
+            [
+                sys.executable, str(WATCH),
+                "--pid", str(worker.pid),
+                "--tail", str(tail),
+                "--status-json", str(status),
+                "--agent", "test",
+                "--poll-secs", "0.2",
+                "--max-idle-secs", "20",
+                "--pgid", str(worker.pid),
+                "--stay-after-terminal",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+        )
+        worker_reaper = threading.Thread(target=worker.wait)
+        worker_reaper.start()
+        t0 = time.monotonic()
+        try:
+            out, err = watcher.communicate(timeout=8)
+            elapsed = time.monotonic() - t0
+            assert watcher.returncode == 0, (watcher.returncode, out, err)
+            assert elapsed >= 1.5, f"watcher truncated the delayed exit after {elapsed:.1f}s"
+            assert elapsed < 6, f"watcher missed the delayed worker exit after {elapsed:.1f}s"
+            payload = json.loads(status.read_text(encoding="utf-8"))
+            assert payload.get("state") == "complete", payload
+            assert payload.get("liveness_state") == "completed", payload
+            assert payload.get("worker_alive") is False, payload
+            assert payload.get("terminal_marker", {}).get("kind") == "COMPLETE", payload
+            assert payload.get("reason") == "marker:COMPLETE", payload
+        finally:
+            worker_reaper.join(timeout=5)
+            if watcher.poll() is None:
+                watcher.terminate()
+                watcher.wait(timeout=5)
+            if worker.poll() is None:
+                os.killpg(worker.pid, signal.SIGTERM)
+                worker.wait(timeout=5)
+
+
+def case_dispatch_post_terminal_idle_returns_inconclusive() -> None:
     rc, elapsed, end = _run(
         [
             sys.executable,
@@ -293,10 +435,10 @@ def case_dispatch_post_terminal_idle_returns_success() -> None:
         confirmed_idle_cpu=True,
     )
     try:
-        assert rc == 0, f"expected exit 0 (complete), got {rc} ({end})"
+        assert rc == 1, f"expected exit 1 (inconclusive), got {rc} ({end})"
         assert elapsed < 18, f"dispatch post-terminal idle wait took {elapsed:.1f}s"
-        assert end.get("terminal_state") == "complete", end
-        assert end.get("watcher_exit") == 0, end
+        assert end.get("terminal_state") == "inconclusive_timeout", end
+        assert end.get("watcher_exit") == 1, end
         assert end.get("reason") == "marker:COMPLETE:post_terminal_idle_timeout", end
         assert end.get("worker_still_alive") is True, end
     finally:
@@ -621,8 +763,10 @@ def main() -> None:
     case_dispatch_success_marker_with_limit_terms_stays_complete()
     case_dispatch_clean_complete_preserves_reason_without_rate_signal()
     case_dispatch_worker_dead_ledger_liveness()
-    case_post_terminal_idle_worker_finishes()
-    case_dispatch_post_terminal_idle_returns_success()
+    case_post_terminal_idle_worker_times_out_inconclusively()
+    case_post_terminal_busy_worker_wait_is_bounded()
+    case_post_terminal_delayed_worker_exit_is_observed()
+    case_dispatch_post_terminal_idle_returns_inconclusive()
     case_worker_and_watcher_survive_launcher_pgroup_sigterm()
     case_foreground_keyboard_interrupt_leaves_worker_and_watcher_running()
     case_watcher_sigterm_flushes_non_running_status()

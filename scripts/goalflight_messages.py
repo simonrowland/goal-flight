@@ -483,6 +483,36 @@ def _controller_delivery_requested(dispatch_id: str, msg_type: str) -> bool:
     return os.environ.get("GOALFLIGHT_DISPATCH_ID") != dispatch_id and msg_type in CONTROLLER_CHANNEL_TYPES
 
 
+def _controller_sender_session_id(dispatch_id: str) -> str | None:
+    """Return the declared live controller that authored an outbound steer.
+
+    Missing or ambiguous identity stays ``None``. Wake filtering treats that as
+    unknown correspondence and wakes; it must never guess an author and silence
+    mail that may have come from another controller.
+    """
+    record, _classification = _dispatch_record(dispatch_id)
+    project_root = (record or {}).get("project_root")
+    if not project_root:
+        return None
+    try:
+        import goalflight_session_status  # type: ignore
+
+        label = goalflight_session_status.resolve_controller_label()
+        pid = goalflight_session_status.resolve_controller_pid()
+        if label is None or pid is None:
+            return None
+        session = goalflight_session_status.live_session(
+            Path(str(project_root)),
+            label=label,
+            pid=pid,
+        )
+    except Exception:
+        return None
+    if not session or session.get("conflicting_beacons") or not session.get("id"):
+        return None
+    return str(session["id"])
+
+
 def post_result_is_error(result: dict) -> bool:
     delivery = result["delivery"]
     return bool(
@@ -494,12 +524,16 @@ def post_result_is_error(result: dict) -> bool:
 
 def post_controller_steer(dispatch_id: str, text: str) -> dict:
     """Record a legacy steer command, then materialize its worker-visible view."""
+    source = {"node": "local", "adapter": "goalflight-dispatch", "transport": "steer"}
+    sender_session_id = _controller_sender_session_id(dispatch_id)
+    if sender_session_id is not None:
+        source["controller_session_id"] = sender_session_id
     return post_message(
         dispatch_id=dispatch_id,
         msg_type="controller-notice",
         payload={"text": text},
         messages_dir=default_messages_dir(),
-        source={"node": "local", "adapter": "goalflight-dispatch", "transport": "steer"},
+        source=source,
         deliver_to_worker=True,
         retain_terminal_worker_view=True,
     )
@@ -1229,13 +1263,17 @@ def _resolve_listener_session_id(project_root: Path, explicit_session_id: str | 
     return str(session["id"])
 
 
-def _listener_event(
+def _controller_wake_event(
     envelope: dict,
     *,
     owned_dispatch_ids: set[str],
     addressed_dispatch_ids: set[str],
     task_store_dispatch_id: str | None,
+    controller_session_id: str | None,
 ) -> dict | None:
+    """A new typed result/escalation or controller-channel envelope in this
+    controller's scope earns an interrupt unless it is periodic status or provably
+    self-authored controller mail; unknown authorship wakes."""
     dispatch_id = str(envelope.get("dispatch_id") or "")
     msg_type = str(envelope.get("type") or "")
     payload = envelope.get("payload") or {}
@@ -1257,6 +1295,18 @@ def _listener_event(
         )
     if not wakes:
         return None
+    # Direction is authoritative only when the producer proved its session.
+    # Unknown/missing authorship wakes. Escalations and worker results also wake
+    # regardless of source metadata, so a spoofed/incorrect source can never
+    # swallow BLOCKED, USER-NEED, USER-CONFIRM, or terminal worker mail.
+    source = envelope.get("source") or {}
+    source_session_id = str(source.get("controller_session_id") or "")
+    if (
+        msg_type in CONTROLLER_CHANNEL_TYPES
+        and controller_session_id
+        and source_session_id == controller_session_id
+    ):
+        return None
     return {
         "dispatch_id": dispatch_id,
         "type": msg_type,
@@ -1266,19 +1316,43 @@ def _listener_event(
     }
 
 
-def controller_listener_watermark(
+def _controller_session_for_owned_dispatches(
+    records: list[dict],
+    owned_dispatch_ids: set[str],
+) -> str | None:
+    """Resolve one proven owner only when every requested dispatch agrees."""
+    if not owned_dispatch_ids:
+        return None
+    recorded_ids: set[str] = set()
+    session_ids: set[str] = set()
+    for record in records:
+        dispatch_id = str(record.get("dispatch_id") or "")
+        if dispatch_id not in owned_dispatch_ids:
+            continue
+        recorded_ids.add(dispatch_id)
+        session_id = str(record.get("controller_session_id") or "")
+        if not session_id:
+            return None
+        session_ids.add(session_id)
+    if recorded_ids != owned_dispatch_ids or len(session_ids) != 1:
+        return None
+    return next(iter(session_ids))
+
+
+def controller_wake_watermark(
     *,
-    controller_session_id: str,
     project_root: Path,
+    owned_dispatch_ids: set[str] | None = None,
+    controller_session_id: str | None = None,
     messages_dir: Path | None = None,
     fleet_dir: Path | None = None,
 ) -> dict[tuple[str, object], dict]:
-    """Wakeable mail for one controller session, discovered from live ownership.
+    """Wakeable mail for one controller, separate from unread/display state.
 
-    Ledger ownership is recomputed on every call. A dispatch created after the
-    listener's baseline therefore enters the next snapshot as soon as its record
-    carries this session id; its first wakeable envelope cannot be hidden by the
-    startup watermark.
+    When only ``controller_session_id`` is supplied, ledger ownership is
+    recomputed on every call so listener dispatches created after its baseline
+    join automatically. ``--wait`` supplies its exact dispatch ids and the same
+    function derives their common owner when the ledger proves one.
     """
     resolved_messages_dir = messages_dir or default_messages_dir()
     resolved_fleet_dir = fleet_dir if fleet_dir is not None else default_fleet_dir()
@@ -1288,12 +1362,21 @@ def controller_listener_watermark(
         for record in records
         if record.get("dispatch_id")
     }
-    owned_dispatch_ids = {
-        str(record["dispatch_id"])
-        for record in records
-        if record.get("dispatch_id")
-        and str(record.get("controller_session_id") or "") == controller_session_id
-    }
+    if owned_dispatch_ids is None:
+        owned_dispatch_ids = {
+            str(record["dispatch_id"])
+            for record in records
+            if record.get("dispatch_id")
+            and controller_session_id
+            and str(record.get("controller_session_id") or "") == controller_session_id
+        }
+    else:
+        owned_dispatch_ids = {str(dispatch_id) for dispatch_id in owned_dispatch_ids}
+    if controller_session_id is None:
+        controller_session_id = _controller_session_for_owned_dispatches(
+            records,
+            owned_dispatch_ids,
+        )
     canonical_project_root = _canonical_project_root(project_root)
     addressed_dispatch_ids = _project_addressed_dispatch_ids(
         project_root,
@@ -1316,15 +1399,32 @@ def controller_listener_watermark(
         dispatch_ids=candidate_dispatch_ids,
     ):
         for envelope in read_envelopes(path):
-            event = _listener_event(
+            event = _controller_wake_event(
                 envelope,
                 owned_dispatch_ids=owned_dispatch_ids,
                 addressed_dispatch_ids=addressed_dispatch_ids,
                 task_store_dispatch_id=task_store_dispatch_id,
+                controller_session_id=controller_session_id,
             )
             if event is not None:
                 events[(event["dispatch_id"], event["seq"])] = event
     return events
+
+
+def controller_listener_watermark(
+    *,
+    controller_session_id: str,
+    project_root: Path,
+    messages_dir: Path | None = None,
+    fleet_dir: Path | None = None,
+) -> dict[tuple[str, object], dict]:
+    """Compatibility name for the ownership-keyed listener's shared filter."""
+    return controller_wake_watermark(
+        controller_session_id=controller_session_id,
+        project_root=project_root,
+        messages_dir=messages_dir,
+        fleet_dir=fleet_dir,
+    )
 
 
 def _project_dispatch_ids(project_root: Path) -> set[str]:
@@ -2029,9 +2129,11 @@ def cmd_listen(args) -> int:
 
     Ownership is an exact controller-session match and is re-read every poll, so
     late dispatches join without re-arming. Owned terminal/result and escalation
-    envelopes wake, as does project-addressed controller mail. Unowned or
-    other-session workers, status/monitor traffic, quota advisories, and recurring
-    task-store status nudges do not. The nudges remain in the normal unread count.
+    envelopes always wake. Controller-channel mail wakes unless its source proves
+    this same controller session authored it; missing or ambiguous authorship wakes.
+    Unowned or other-session workers, status/monitor traffic, quota advisories, and
+    recurring task-store status nudges do not. Quiet mail remains in the normal
+    unread count.
 
     Exits 0 when mail arrives, 1 on timeout. Fail-open: if the mailbox cannot be
     read at all, say so on stderr and exit 2 rather than blocking forever on a
@@ -2056,7 +2158,7 @@ def cmd_listen(args) -> int:
         would read an ack as 'nothing new' and then miss the next arrival that
         merely restored the old number. Pairs only ever add."""
         try:
-            return controller_listener_watermark(
+            return controller_wake_watermark(
                 controller_session_id=controller_session_id,
                 project_root=project_root,
                 messages_dir=messages_dir,

@@ -129,6 +129,10 @@ PROMPT_ECHO_MAX_ANCHORS = 10
 # of false-killing a healthy quiet worker. The streak still protects against
 # one-off noisy idle samples.
 WEDGE_CONFIRM_SAMPLES = 2
+# A terminal marker is the worker's final act. Three default two-second poll
+# intervals give wrappers time to flush and exit while keeping this handoff
+# grace independent from the much longer general worker-idle timeout.
+POST_TERMINAL_EXIT_GRACE_SECS = 6.0
 BLOCKED_TASK_BREADCRUMB_STATE = "blocked_task_breadcrumb"
 TRACE_RESOLUTION_RETRY_SECS = 300.0
 TRACE_LSOF_TIMEOUT_SECS = 1.0
@@ -1291,6 +1295,7 @@ def main() -> int:
     thresholds = LivenessThresholds(idle_timeout_s=args.max_idle_secs, cpu_epsilon_pct=args.cpu_epsilon)
     last_payload: dict | None = None
     terminal_seen: dict | None = None
+    terminal_seen_at: float | None = None
     final_status_written = False
     working_breadcrumb_written = False
 
@@ -1621,6 +1626,8 @@ def main() -> int:
         if low_power_relax:
             payload["low_power_relax"] = True
         if terminal:
+            if terminal_seen is None:
+                terminal_seen_at = active_monotonic()
             terminal_seen = terminal
         terminal_state = _marker_state(terminal_seen) if terminal_seen else None
         terminal_reason = f"marker:{terminal_seen['kind']}" if terminal_seen else None
@@ -1632,6 +1639,25 @@ def main() -> int:
         )
         if terminal_seen:
             payload["terminal_marker"] = terminal_seen
+        post_terminal_wait_elapsed = (
+            max(0.0, active_monotonic() - terminal_seen_at)
+            if post_terminal_wait and terminal_seen_at is not None
+            else None
+        )
+        if (
+            post_terminal_wait
+            and post_terminal_wait_elapsed is not None
+            and post_terminal_wait_elapsed >= POST_TERMINAL_EXIT_GRACE_SECS
+        ):
+            payload["state"] = "inconclusive_timeout"
+            payload["terminal_pending_state"] = terminal_state
+            payload["post_terminal_wait_elapsed_secs"] = round(post_terminal_wait_elapsed, 3)
+            payload["post_terminal_wait_limit_secs"] = POST_TERMINAL_EXIT_GRACE_SECS
+            exit_reason = f"{terminal_reason}:post_terminal_exit_timeout"
+            write_payload(payload, reason=exit_reason, terminal_write=True)
+            exit_code = _exit_code_for_state(payload["state"])
+            exit_reason = payload.get("reason", exit_reason)
+            break
         if terminal_seen and not post_terminal_wait:
             payload["state"] = terminal_state
             exit_code = _exit_code_for_state(payload["state"])
@@ -1763,7 +1789,13 @@ def main() -> int:
             wedge_streak += 1
             if wedge_streak >= WEDGE_CONFIRM_SAMPLES:
                 if post_terminal_wait:
-                    payload["state"] = terminal_state
+                    payload["state"] = "inconclusive_timeout"
+                    payload["terminal_pending_state"] = terminal_state
+                    if post_terminal_wait_elapsed is not None:
+                        payload["post_terminal_wait_elapsed_secs"] = round(
+                            post_terminal_wait_elapsed, 3
+                        )
+                    payload["post_terminal_wait_limit_secs"] = POST_TERMINAL_EXIT_GRACE_SECS
                     exit_reason = f"{terminal_reason}:post_terminal_idle_timeout"
                     exit_code = _exit_code_for_state(payload["state"])
                 else:

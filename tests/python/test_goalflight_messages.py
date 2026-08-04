@@ -1039,6 +1039,121 @@ def test_listener_wakes_for_controller_addressed_mail() -> None:
         assert_true("addressed inbox reported", addressed_inbox in stdout)
 
 
+def test_wake_filter_uses_sender_direction_and_preserves_unread_mail() -> None:
+    import tempfile
+    import goalflight_messages as messages
+    import goalflight_session_status as sessions
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project = base / "direction-project"
+        messages_dir = base / "messages"
+        fleet_dir = base / "fleet"
+        dispatch_id = "mine"
+        init_git_project(project)
+        sessions.claim_session(
+            project,
+            pid=os.getpid(),
+            session_id="mine-session",
+            label="mine-controller",
+        )
+        write_ledger_record(
+            base,
+            dispatch_id,
+            project,
+            controller_session_id="mine-session",
+            worker_pid=os.getpid(),
+        )
+
+        updates = {
+            "GOALFLIGHT_MESSAGES_DIR": str(messages_dir),
+            "GOALFLIGHT_FLEET_DIR": str(fleet_dir),
+            "GOALFLIGHT_STATE_DIR": str(base / "state"),
+            "GOAL_FLIGHT_PIDFILE_DIR": str(base / "pids"),
+            "GOALFLIGHT_CONTROLLER_PID": str(os.getpid()),
+            "GOALFLIGHT_CONTROLLER_LABEL": "mine-controller",
+        }
+        previous = {key: os.environ.get(key) for key in updates}
+        os.environ.update(updates)
+        try:
+            messages.post_controller_steer(dispatch_id, "my outbound steer")
+            recorded = messages.read_envelopes(messages.inbox_path(messages_dir, dispatch_id))
+            assert_true(
+                "outbound steer records its proven author session",
+                recorded[0]["source"].get("controller_session_id") == "mine-session",
+            )
+            own_only = messages.controller_wake_watermark(
+                project_root=project,
+                owned_dispatch_ids={dispatch_id},
+                messages_dir=messages_dir,
+                fleet_dir=fleet_dir,
+            )
+            assert_true("controller's own outbound steer does not wake", not own_only)
+
+            messages.post_message(
+                dispatch_id=dispatch_id,
+                msg_type="controller-notice",
+                payload={"text": "peer controller steer"},
+                messages_dir=messages_dir,
+                source={
+                    "node": "local",
+                    "adapter": "goalflight-dispatch",
+                    "transport": "steer",
+                    "controller_session_id": "peer-session",
+                },
+            )
+            messages.post_message(
+                dispatch_id=dispatch_id,
+                msg_type="controller-notice",
+                payload={"text": "ambiguous controller steer"},
+                messages_dir=messages_dir,
+                source={
+                    "node": "local",
+                    "adapter": "goalflight-dispatch",
+                    "transport": "steer",
+                },
+            )
+            messages.post_message(
+                dispatch_id=dispatch_id,
+                msg_type="blocked",
+                payload={"text": "worker escalation with misleading source"},
+                messages_dir=messages_dir,
+                source={
+                    "node": "local",
+                    "adapter": "goalflight-dispatch",
+                    "transport": "steer",
+                    "controller_session_id": "mine-session",
+                },
+            )
+            wakes = messages.controller_wake_watermark(
+                project_root=project,
+                owned_dispatch_ids={dispatch_id},
+                messages_dir=messages_dir,
+                fleet_dir=fleet_dir,
+            )
+            assert_true(
+                "another controller wakes despite sharing goalflight-dispatch adapter",
+                (dispatch_id, 2) in wakes,
+            )
+            assert_true("ambiguous controller authorship wakes", (dispatch_id, 3) in wakes)
+            assert_true("typed worker escalation cannot be self-suppressed", (dispatch_id, 4) in wakes)
+            assert_true("self-authored envelope stays out of wake set", (dispatch_id, 1) not in wakes)
+
+            summary = messages.controller_mail_summary(
+                owned_dispatch_ids={dispatch_id},
+                task_store_project_root=project,
+                messages_dir=messages_dir,
+                fleet_dir=fleet_dir,
+            )
+            assert_true("all wake-worthy and quiet mail remains unread", summary["count"] == 4)
+        finally:
+            for key, value in previous.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+
 def test_mcp_stdio_tools_call() -> None:
     import json
     import subprocess
@@ -1800,6 +1915,7 @@ def main() -> None:
         test_listener_ignores_unowned_dispatch,
         test_listener_task_store_nag_counts_without_waking_then_escalation_wakes,
         test_listener_wakes_for_controller_addressed_mail,
+        test_wake_filter_uses_sender_direction_and_preserves_unread_mail,
         test_mcp_stdio_tools_call,
         test_mcp_delivery_failure_sets_tool_error_and_call_exit,
         test_mark_read_creates_cursor_and_unseen_filters,
