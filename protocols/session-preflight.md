@@ -2,35 +2,45 @@
 
 Run before non-trivial goal-flight commands. Keep output compact.
 
-0. Register this controller's declared identity before status, listening, or
-dispatch. The host/controller launcher must export the PID of the actual
-long-lived controller process and one stable, meaningful label:
+0. Register this controller's identity before status, listening, or dispatch.
+The host/controller launcher must export the PID of the actual long-lived
+controller process. The label defaults to the repository name:
 
 ```bash
 export GOALFLIGHT_CONTROLLER_PID=<long-lived-controller-pid>
-export GOALFLIGHT_CONTROLLER_LABEL=battery-main
 python3 <skill-root>/scripts/goalflight_session_status.py --controller-startup
 ```
 
-`--session-pid` and `--session-label` explicitly override the two environment
-values. Never substitute the one-shot helper PID, dispatcher PID, project root,
-or a worker parent. Missing inputs, relabel attempts, same-label conflicts, and
-claim errors return `claimed: false` but exit zero: identity improves
-observability and must not block work. Re-running this step for the same live
-PID and label is idempotent; an existing unlabeled beacon for that exact process
-generation may adopt its first explicit label.
+The default is measured from the project root after applying the task store's
+managed-worktree stripping, so a main checkout and its managed linked worktrees
+use one name. Set `GOALFLIGHT_CONTROLLER_LABEL=battery-main` (or pass
+`--session-label battery-main`) only when multiple controllers share one repo;
+an explicit label wins. If startup reports `controller_label_conflict`, release
+that controller's conflicted beacon by running `--release-session` with
+`--session-pid <long-lived-controller-pid>`, set an explicit distinct label,
+and run startup again. It never mints a variant.
 
-Later dispatch commands inherit both variables (or use `--controller-label
-<name>` while inheriting the PID) to select this exact beacon. The label and
-PID must both match; a failed or skipped claim therefore cannot capture another
-controller with the same label. Durable queue replay carries this declared pair
-but re-measures the beacon at launch. No measured match means honestly unowned.
+`--session-pid` explicitly overrides `GOALFLIGHT_CONTROLLER_PID`. Never
+substitute the one-shot helper PID, dispatcher PID, project root, or a worker
+parent. A missing PID, an unresolvable project root, relabel attempts,
+same-label conflicts, and claim errors return `claimed: false` but exit zero:
+identity improves observability and must not block work. Re-running this step
+for the same live PID and label is idempotent; an existing unlabeled beacon for
+that exact process generation may adopt its first resolved label.
+
+Later dispatch commands inherit the PID and any explicit label (or use
+`--controller-label <name>`). Without an explicit label they remeasure the repo
+default. The resolved label and PID must both match; a failed or skipped claim
+therefore cannot capture another controller with the same label. Durable queue
+replay carries this resolved pair but re-measures the beacon at launch. No
+measured match means honestly unowned.
 Different labels coexist. Multiple live beacons with one label remain visible
 through `conflicting_beacons` and dispatches under that ambiguous label stay
 unowned until the conflict is resolved. Beacon records also store the OS
 process-start generation, so a recycled numeric PID does not revive stale
-ownership. There is deliberately no project-derived label default: one project
-may have `battery-main` and `battery-bugs` controllers at the same time.
+ownership. The repo-name default covers the common single-controller case;
+same-repo controllers such as `battery-main` and `battery-bugs` declare distinct
+labels.
 
 1. Run procedural status:
 

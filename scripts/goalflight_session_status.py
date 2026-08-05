@@ -46,15 +46,20 @@ import argparse
 import json
 import os
 import socket
+import subprocess
 import sys
 import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-import goalflight_compat
-
 ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+import goalflight_compat
+from goalflight_task import _strip_managed_worktree
+
 SESSION_FILE_REL = Path("docs-private/.goal-flight-current-session.json")
 QUEUE_GLOB = "docs-private/goal-queue-*.md"
 RESUME_NOTES_GLOB = "docs-private/RESUME-NOTES-*.md"
@@ -69,16 +74,48 @@ def _session_file(project_root: Path) -> Path:
     return project_root / SESSION_FILE_REL
 
 
+def _git_project_root() -> Path | None:
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=2,
+        )
+    except Exception:
+        # Project discovery is best-effort identity evidence, never a launch gate.
+        return None
+    return Path(out.stdout.strip()) if out.returncode == 0 and out.stdout.strip() else None
+
+
+def _normalize_controller_label(value: object) -> str | None:
+    label = str(value or "").strip()
+    return label[:64] or None
+
+
 def resolve_controller_label(
     explicit_label: str | None = None,
     *,
+    project_root: Path | None = None,
     environ: dict[str, str] | None = None,
 ) -> str | None:
-    """Return the controller-declared label, never a generated identity guess."""
+    """Return the explicit label or the measured, worktree-invariant repo name."""
     env = os.environ if environ is None else environ
     value = explicit_label if explicit_label is not None else env.get(CONTROLLER_LABEL_ENV)
-    label = str(value or "").strip()
-    return label[:64] or None
+    label = _normalize_controller_label(value)
+    if label:
+        return label
+    root = project_root
+    if root is None and resolve_controller_pid(environ=env) is not None:
+        root = _git_project_root()
+    if root is None:
+        return None
+    try:
+        return _strip_managed_worktree(root).name[:64] or None
+    except (OSError, RuntimeError):
+        return None
 
 
 def resolve_controller_pid(
@@ -242,7 +279,7 @@ def claim_session(
     process_identity = _controller_process_identity(pid)
     if process_identity is None:
         raise RuntimeError("controller process generation is unavailable")
-    resolved_label = resolve_controller_label(label, environ={})
+    resolved_label = _normalize_controller_label(label)
     with _file_lock(path):
         data = _read_session_map(path)
         key = str(pid)
@@ -290,9 +327,10 @@ def live_session(
     that would rather guess an owner should instead say it does not know.
     """
     if label is None and pid is None:
-        declared_label = resolve_controller_label()
         declared_pid = resolve_controller_pid()
-        if declared_label is not None or declared_pid is not None:
+        label_was_declared = bool(str(os.environ.get(CONTROLLER_LABEL_ENV) or "").strip())
+        if label_was_declared or declared_pid is not None:
+            declared_label = resolve_controller_label(project_root=project_root)
             if declared_label is None or declared_pid is None:
                 return None
             label, pid = declared_label, declared_pid
@@ -315,7 +353,7 @@ def live_session(
             candidates.append(record)
     label_candidate_count: int | None = None
     if label is not None:
-        requested_label = resolve_controller_label(label, environ={})
+        requested_label = _normalize_controller_label(label)
         if requested_label is None:
             return None
         candidates = [
@@ -352,7 +390,11 @@ def claim_controller_startup(
     """Best-effort startup registration; observability must never block work."""
     try:
         env = os.environ if environ is None else environ
-        resolved_label = resolve_controller_label(label, environ=env)
+        resolved_label = resolve_controller_label(
+            label,
+            project_root=project_root,
+            environ=env,
+        )
         if not resolved_label:
             return {"claimed": False, "reason": "missing_controller_label"}
         resolved_pid = resolve_controller_pid(pid, environ=env)
@@ -1154,21 +1196,8 @@ def _default_project_root() -> str:
     Sweep C P1 fix — invocations from subdirs now resolve to the repo
     root automatically.
     """
-    try:
-        import subprocess
-        out = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=2,
-        )
-        if out.returncode == 0 and out.stdout.strip():
-            return out.stdout.strip()
-    except (subprocess.SubprocessError, OSError, FileNotFoundError):
-        pass
-    return str(Path.cwd())
+    project_root = _git_project_root()
+    return str(project_root if project_root is not None else Path.cwd())
 
 
 def main(argv: list[str] | None = None) -> int:

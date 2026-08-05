@@ -173,24 +173,19 @@ def test_startup_names_legacy_beacon_once_and_rejects_relabel() -> None:
             proc.wait(timeout=10)
 
 
-def test_duplicate_startup_label_surfaces_conflict() -> None:
+def test_repo_default_duplicate_surfaces_conflict() -> None:
     with tempfile.TemporaryDirectory() as td:
-        root = Path(td)
+        root = Path(td) / "shared-repo"
+        root.mkdir()
         first, second = _beacon(), _beacon()
         try:
-            initial = S.claim_controller_startup(root, pid=first.pid, label="battery-main")
-            duplicate = S.claim_controller_startup(root, pid=second.pid, label="battery-main")
-            assert_true("first named controller claims cleanly", initial.get("claimed") is True)
-            assert_true("duplicate label is not reported as owned", duplicate.get("claimed") is False)
+            initial = S.claim_controller_startup(root, pid=first.pid, environ={})
+            duplicate = S.claim_controller_startup(root, pid=second.pid, environ={})
+            assert_true("repo default names the first controller", initial["session"]["label"] == root.name)
+            assert_true("first default-named controller claims cleanly", initial.get("claimed") is True)
+            assert_true("duplicate repo name is not reported as owned", duplicate.get("claimed") is False)
             assert_true("duplicate cause is explicit", duplicate.get("reason") == "controller_label_conflict")
-            with patch.dict(
-                S.os.environ,
-                {
-                    "GOALFLIGHT_CONTROLLER_LABEL": "battery-main",
-                    "GOALFLIGHT_CONTROLLER_PID": str(first.pid),
-                },
-            ):
-                resolved = S.live_session(root)
+            resolved = S.live_session(root, label=root.name, pid=first.pid)
             assert_true("pid-scoped lookup still exposes label conflict", resolved is not None)
             assert_true("both same-label beacons are counted", resolved.get("conflicting_beacons") == 2)
         finally:
@@ -199,9 +194,55 @@ def test_duplicate_startup_label_surfaces_conflict() -> None:
                 proc.wait(timeout=10)
 
 
-def test_controller_startup_cli_claims_the_declared_name() -> None:
+def test_controller_startup_cli_defaults_to_repo_name() -> None:
     with tempfile.TemporaryDirectory() as td:
-        root = Path(td)
+        root = Path(td) / "repo-default"
+        root.mkdir()
+        proc = _beacon()
+        try:
+            env = os.environ.copy()
+            env.pop("GOALFLIGHT_CONTROLLER_LABEL", None)
+            env["GOALFLIGHT_CONTROLLER_PID"] = str(proc.pid)
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "scripts" / "goalflight_session_status.py"),
+                    "--project-root",
+                    str(root),
+                    "--controller-startup",
+                ],
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+            payload = json.loads(completed.stdout)
+            assert_true("startup hook is non-blocking", completed.returncode == 0)
+            assert_true("startup hook claims without a label declaration", payload.get("claimed") is True)
+            assert_true("startup hook defaults to the repo name", payload["session"]["label"] == root.name)
+        finally:
+            proc.terminate()
+            proc.wait(timeout=10)
+
+
+def test_worktree_default_matches_main_repo_name() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "shared-repo"
+        worktree = root / ".claude" / "worktrees" / "feature"
+        worktree.mkdir(parents=True)
+        with patch.object(S, "_git_project_root", return_value=root):
+            main_label = S.resolve_controller_label(environ={S.CONTROLLER_PID_ENV: "123"})
+        with patch.object(S, "_git_project_root", return_value=worktree):
+            worktree_label = S.resolve_controller_label(environ={S.CONTROLLER_PID_ENV: "123"})
+        assert_true("main checkout uses the repo name", main_label == root.name)
+        assert_true("managed worktree keeps the same name", worktree_label == root.name)
+
+
+def test_controller_startup_cli_explicit_name_overrides_repo_default() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "repo-default"
+        root.mkdir()
         proc = _beacon()
         try:
             env = os.environ.copy()
@@ -228,11 +269,50 @@ def test_controller_startup_cli_claims_the_declared_name() -> None:
             payload = json.loads(completed.stdout)
             assert_true("startup hook is non-blocking", completed.returncode == 0)
             assert_true("startup hook claims the controller", payload.get("claimed") is True)
-            assert_true("startup hook stores the declared name", payload["session"]["label"] == "battery-main")
+            assert_true("declared name overrides the repo default", payload["session"]["label"] == "battery-main")
             assert_true("startup hook stores the declared pid", payload["session"]["pid"] == proc.pid)
         finally:
             proc.terminate()
             proc.wait(timeout=10)
+
+
+def test_dead_repo_default_does_not_block_reclaim() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "shared-repo"
+        root.mkdir()
+        stale = _beacon()
+        replacement = None
+        try:
+            first = S.claim_controller_startup(root, pid=stale.pid, environ={})
+            assert_true("initial repo-default claim succeeds", first.get("claimed") is True)
+            stale.terminate()
+            stale.wait(timeout=10)
+            replacement = _beacon()
+            second = S.claim_controller_startup(root, pid=replacement.pid, environ={})
+            assert_true("dead default holder does not block a replacement", second.get("claimed") is True)
+            resolved = S.live_session(root, label=root.name, pid=replacement.pid)
+            assert_true("replacement owns the repo name", resolved is not None)
+            assert_true("dead holder is not a conflict", "conflicting_beacons" not in resolved)
+        finally:
+            if stale.poll() is None:
+                stale.terminate()
+                stale.wait(timeout=10)
+            if replacement is not None and replacement.poll() is None:
+                replacement.terminate()
+                replacement.wait(timeout=10)
+
+
+def test_unresolvable_project_root_stays_unnamed() -> None:
+    with patch.object(S.subprocess, "run", side_effect=AssertionError("root probe failed")):
+        label = S.resolve_controller_label(environ={S.CONTROLLER_PID_ENV: "123"})
+    assert_true("no project root does not become a cwd basename", label is None)
+
+
+def test_implicit_default_requires_controller_pid() -> None:
+    with patch.object(S, "_git_project_root", return_value=Path("/measured/repo")) as probe:
+        label = S.resolve_controller_label(environ={})
+    assert_true("an undeclared listener does not acquire a repo label", label is None)
+    assert_true("undeclared lookup does not probe the repo", not probe.called)
 
 
 def test_dead_beacon_resolves_to_none_not_a_stale_id() -> None:
@@ -388,8 +468,13 @@ def main() -> None:
     test_unavailable_process_generation_preserves_existing_beacon()
     test_linux_identity_requires_measured_boot_generation()
     test_startup_names_legacy_beacon_once_and_rejects_relabel()
-    test_duplicate_startup_label_surfaces_conflict()
-    test_controller_startup_cli_claims_the_declared_name()
+    test_repo_default_duplicate_surfaces_conflict()
+    test_controller_startup_cli_defaults_to_repo_name()
+    test_worktree_default_matches_main_repo_name()
+    test_controller_startup_cli_explicit_name_overrides_repo_default()
+    test_dead_repo_default_does_not_block_reclaim()
+    test_unresolvable_project_root_stays_unnamed()
+    test_implicit_default_requires_controller_pid()
     test_dead_beacon_resolves_to_none_not_a_stale_id()
     test_no_beacon_is_none_rather_than_an_invented_owner()
     test_second_live_beacon_is_reported_not_silently_arbitrated()
