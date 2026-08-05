@@ -192,8 +192,8 @@ python3 <skill-root>/scripts/goalflight_dispatch.py --agent codex --prompt-file 
 ```
 
 The dispatcher prints `DISPATCH-LAUNCHED` with the dispatch id, status JSON,
-tail path, and worker PID, then returns immediately. Keep one ownership-scoped
-mail listener open for the controller session:
+tail path, and worker PID, then returns immediately. Arm one ownership-scoped
+mail listener in the background for the controller session:
 
 ```bash
 python3 <skill-root>/scripts/goalflight_messages.py listen --project-root "$PWD"
@@ -201,12 +201,13 @@ python3 <skill-root>/scripts/goalflight_messages.py listen --project-root "$PWD"
 
 The listener resolves the live session beacon by default (`--session-id <id>`
 pins an explicit session), stays silent until wakeable mail arrives, and
-re-discovers that session's dispatches on every poll. This covers workers
-launched after the listener starts without re-arming. It wakes for owned worker
-terminal/result or escalation envelopes and controller-addressed mail. Foreign
-or unowned workers, status/monitor traffic, quota advisories, and recurring
-task-store status nudges do not wake it; task-store nudges remain in the unread
-count shown by normal status/mail reads.
+re-discovers that session's dispatches internally. This covers workers launched
+after the listener starts without re-arming. A controller with a claimed name
+does not enumerate dispatch ids or schedule status timers: arm the listener and
+let it wake. It wakes for owned worker terminal/result or escalation envelopes
+and controller-addressed mail. Foreign or unowned workers, status/monitor
+traffic, quota advisories, and recurring task-store status nudges do not wake it;
+task-store nudges remain in the unread count shown by normal status/mail reads.
 
 ### Controller correspondence addressing
 
@@ -249,9 +250,10 @@ read cursors through exactly that snapshot. Original JSONL correspondence and
 bodies are unchanged. Envelopes arriving after the snapshot retain higher
 sequences and remain unread.
 
-Use `goalflight_status.py --dispatch <id>` for a snapshot, or
-`goalflight_status.py --wait <id>` only when a fixed-set terminal join and its
-timeout verdict are specifically needed.
+Use `goalflight_status.py --dispatch <id>` for a snapshot, or background
+`goalflight_status.py --wait <ids>` only when an unclaimed fixed-set terminal
+join and its timeout verdict are specifically needed. Exit 3 means mail, not
+completion; read it, then run the printed pending-id re-arm.
 
 Prefer `--prompt-file` over inline `--prompt` for anything beyond a short
 one-shot, and always when prompt text exceeds ~2KB: workers compact too — an
@@ -270,18 +272,21 @@ dispatch-gate concern, not a scouting concern.
 
 ### Background by default; don't block the controller
 
-The controller dispatches workers in the background and self-paces with status
-checks, scheduled wakeups, and queue drains. Background any controller tool call
-expected to run longer than about 10 seconds so typed steers remain visible and
-ESC/Ctrl-C interrupts only the observer surface, not the detached worker.
+The controller dispatches workers in the background and self-paces from the
+ownership event listener and queue drains. Arm the wait; let it wake you. A timer
+is a fallback for state no channel can report, such as external CI, a remote
+queue, or a deploy. A timer that asks whether a worker finished is polling an
+available channel. Background every controller tool call expected to run longer
+than about 10 seconds so typed steers remain visible and ESC/Ctrl-C interrupts
+only the observer surface, not the detached worker.
 
 Blocking waits are for short scripted synchronous needs. Prefer default detached
-dispatch plus `goalflight_status.py --dispatch <id>` or bounded
-`goalflight_status.py --wait <id>`; the `--wait` default is 1800 seconds and
-reports still-pending ids with a nonzero exit. `--wait-timeout 0` is explicit
-unbounded waiting. `goalflight_dispatch.py --foreground` blocks until terminal
-state and should stay rare because it locks the controller terminal and queues
-typed steers behind the wait.
+dispatch plus the background listener; use `goalflight_status.py --dispatch <id>`
+for a snapshot or background bounded `--wait <ids>` for an unclaimed fixed join.
+The `--wait` default is 1800 seconds and reports still-pending ids with a nonzero
+exit; `--wait-timeout 0` is explicit unbounded waiting. `goalflight_dispatch.py
+--foreground` blocks until terminal state and should stay rare because it locks
+the controller terminal and queues typed steers behind the wait.
 
 Durable queue dispatch:
 

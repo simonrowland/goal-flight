@@ -158,19 +158,19 @@ frontmatter above. New categories require a frontmatter schema bump (raise
 ## Background Dispatch + Self-Pacing (don't block the controller)
 
 The controller keeps the interactive session responsive by dispatching workers in
-the background and self-pacing from status, scheduled wakeups, and queue drains.
-Any tool call expected to run longer than about 10 seconds is backgrounded so
-typed steers remain visible and ESC/Ctrl-C cancels only the observer, not the
-detached worker.
+the background and arming `goalflight_messages.py listen --project-root "$PWD"`
+in the background. A controller with a claimed stable name does not enumerate
+dispatch ids: the ownership listener discovers current and future owned work. Arm
+the wait and let work wake it. Any tool call expected to run longer than about 10
+seconds is backgrounded so typed steers remain visible and ESC/Ctrl-C cancels only
+the observer, not the detached worker.
 
-Blocking waits are reserved for short scripted needs. A foreground launcher locks
-the controller's terminal, queues typed steers behind the blocked call, and makes
-ESC/Ctrl-C interrupt the controller wait surface. Prefer default detached
-dispatch plus `goalflight_status.py --dispatch <id>` or bounded
-`goalflight_status.py --wait <id>`. The `--wait` default is bounded at 1800
-seconds and reports still-pending ids; `--wait-timeout 0` is the explicit
-unbounded footgun. `goalflight_dispatch.py --foreground` is the synchronous
-escape hatch for scripts/tests that truly need the worker exit code.
+Use background `goalflight_status.py --wait <ids>` only for a deliberate fixed-set
+join without claimed ownership. Exit 3 means mail, not completion, and prints the
+pending-id re-arm. Blocking foreground waits are reserved for short scripted needs.
+A timer is for non-notifiable external state such as CI, a remote queue, or a
+deploy. Scheduling one to ask whether a worker finished is polling a channel that
+would have told the controller.
 
 ---
 
@@ -279,13 +279,13 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 ### Entry: no-blocking-cursor-task-worker
 
 - **id:** `no-blocking-cursor-task-worker`
-- **name:** Avoid blocking editor task workers
+- **name:** Arm the event wake without blocking
 - **category:** `worker-routing-defaults`
-- **controller_does:** The orchestrator routes worker execution through ACP or bash-tail plus status polling, rather than blocking the interactive session on editor task panes.
-- **failure_mode:** The orchestrator opens a long editor task and waits synchronously in chat, preventing status polling, capacity checks, or review dispatch from continuing.
+- **controller_does:** The orchestrator backgrounds one ownership listener for a claimed controller, lets worker events wake it without enumerating dispatch ids, and backgrounds a fixed-id wait only for a deliberate unclaimed join.
+- **failure_mode:** The orchestrator blocks the interactive session or schedules a timer to ask whether a worker finished instead of arming the available event channel.
 - **skill_md_compressed_form:**
     - **kind:** literal
-    - **pattern:** "Use ACP or bash-tail plus status polling; do not block on editor task panes"
+    - **pattern:** "Arm one background `goalflight_messages.py listen --project-root \"$PWD\"` per claimed controller"
     - **max_section_lines:** 55
 - **verifier:**
     - **kind:** behaviour-scenario
@@ -346,10 +346,10 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 ### Entry: user-status-cadence-15min
 
 - **id:** `user-status-cadence-15min`
-- **name:** Poll and report every 15 minutes
+- **name:** Report at least every 15 minutes
 - **category:** `autonomous-throughput-and-status`
-- **controller_does:** While workers, review jobs, or background verification are in flight, the orchestrator polls compact state and gives the user a short update at least every 15 minutes unless context is tight.
-- **failure_mode:** The orchestrator lets workers run for an hour with no poll or status digest, then asks the user what to do next because it lost track of state.
+- **controller_does:** While workers, review jobs, or background verification are in flight, the orchestrator reports event wakes and, if none arrive, samples compact state for a short user update at least every 15 minutes unless context is tight.
+- **failure_mode:** The orchestrator lets workers run for an hour with no event-driven or cadence status digest, then asks the user what to do next because it lost track of state.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "at least every 15 minutes"

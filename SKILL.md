@@ -345,9 +345,9 @@ Steer a live worker via `scripts/goalflight_dispatch.py steer <id> '<msg>'`; `--
 Distinct from engagement polling and from worker `STATUS:` markers.
 
 While `execute` has in-flight workers, review jobs, or background verification
-(>10s), poll compact state and report progress to the user at least every 15
-minutes unless context is tight. Full rules: `protocols/user-status-cadence.md`.
-When context is tight, still poll and append a one-line timestamp to RESUME-NOTES.
+(>10s), report event wakes and, if none, sample compact state for a user update
+within each 15-minute window unless context is tight. Full rules:
+`protocols/user-status-cadence.md`; when tight, append one RESUME-NOTES line.
 
 ## Dispatch Model
 
@@ -356,11 +356,10 @@ Two orthogonal axes:
 - Goal-loop returns converged result, never draft: plan/act/test/self-review until green.
 - Comms shape: `controller-direct`, `acp`, or `bash-tail`.
 Dispatch CLI workers via `scripts/goalflight_dispatch.py`, never bare background exec.
-Default direct dispatch returns `DISPATCH-LAUNCHED`; use `--foreground` only for
-sync scripts/tests. Queue: `--submit --drain-on-submit`.
+Dispatch defaults detached; `--foreground` only for sync scripts/tests. Queue: `--submit --drain-on-submit`.
 Do not hand-iterate (>~3 edit/test cycles) what a goal-loop should converge.
 
-Use ACP or bash-tail plus status polling; do not block on editor task panes.
+Arm one background `goalflight_messages.py listen --project-root "$PWD"` per claimed controller; it owns future work without ids. Background fixed-id `goalflight_status.py --wait <ids>`; exit 3 is mail, not completion; run its printed re-arm. Timers cover non-notifiable external state, never worker completion.
 Controller-direct: held context, fully stateable edit, clean Axis 2; plan marks do not waive it.
 Routing detail: typed dispatch roles; five-layer prompts; parallel forbid lists; split broad chunks; host tool maps; same-provider review policy. See `protocols/dispatch-routing.md`.
 Triggered lanes need pinned context and the execute pre-wave check (`worker-context-package.md`).

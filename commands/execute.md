@@ -44,32 +44,34 @@ looks like normal progress. Only the codex goal-mode template carries the rule
 today; the dispatch-wrapper path does not, so **tag the brief rather than
 assuming the worker was told.**
 
-**Collect approvals in a batch, not one at a time.** `--wait` takes several ids
-and blocks until **all** are terminal, and a design checkpoint is terminal:
+**Collect approvals in a batch, not one at a time.** A claimed controller keeps
+its ownership listener armed and does not enumerate dispatch ids; after each wake,
+use owned status to collect compatible terminal checkpoints. For an unclaimed
+scripted fixed-set join only, `--wait` takes several ids and returns when **all**
+are terminal, and a design checkpoint is terminal:
 
 ```bash
 python3 <skill-root>/scripts/goalflight_status.py --wait chunk-a,chunk-b,chunk-c
 ```
 
-Backgrounded, that is a single wake-up carrying every checkpoint that landed.
-Review the designs together — they usually share surfaces, and reading three at
-once is where you notice two of them deciding the same thing differently — then
-resume each session with its corrections. Waking three times to approve three
-designs costs three context reloads and gives you no cross-chunk view.
+Backgrounded, that is a single fixed-set wake carrying every checkpoint that
+landed. Review the designs together — they usually share surfaces, and reading
+three at once is where you notice two of them deciding the same thing differently
+— then resume each session with its corrections. Waking three times to approve
+three designs costs three context reloads and gives you no cross-chunk view.
 
 **Batch peers, not a sprinter with a marathon runner.** All-terminal means the
 batch is as slow as its slowest member, so grouping a two-minute chunk with a
 forty-minute one idles the fast result for 38 minutes. Group by expected
 duration; wait separately on anything you need back early.
 
-**Wait on the work, not on a clock.** Every dispatch prints a `wait:` line —
-`goalflight_status.py --wait <id>`. Run it **in the background**: its completion
-wakes you the moment the worker reaches a terminal state. Do not block the turn
-on it (long foreground calls are forbidden), and do not substitute a timed
-wake-up. A timer wakes on the clock, not on the work: it either sleeps past a
-finished worker or fires repeatedly at one that is still going, and it cannot
-tell you which. The same applies to a design checkpoint — the background wait is
-what bumps you when a plan lands and is ready for review.
+**Arm the wait; let it wake you.** A controller that claimed a name backgrounds
+one `goalflight_messages.py listen --project-root "$PWD"`; it discovers current
+and future owned dispatches, so do not maintain an id list. An unclaimed
+fixed-set join backgrounds the printed `goalflight_status.py --wait <ids>`
+command. Do not block the turn on either. A timer is only for non-notifiable
+external state such as CI, a remote queue, or a deploy. Scheduling one to ask
+whether a worker finished is polling a channel that would have told you.
 
 ## Steps
 
@@ -192,12 +194,12 @@ Use `scripts/goalflight_ledger.py record` directly only when a runner did not
 already record the worker.
 
 **In-flight monitoring:** while workers or review jobs run, follow
-`protocols/user-status-cadence.md` — poll `goalflight_status.py` and
-surface a compact user status update at least every 15 minutes unless context
-is tight (file-only row in RESUME-NOTES then). Background the poll; do not
-block on raw logs.
+`protocols/user-status-cadence.md` — report event wakes and, if none arrive,
+sample `goalflight_status.py` for a compact user update at least every 15 minutes
+unless context is tight (file-only row in RESUME-NOTES then). This cadence is
+for user reporting, not completion discovery; background it and do not read logs.
 
-For multi-dispatch joins, use
+For an unclaimed deliberate fixed-set join, use in the background:
 `python3 <skill-root>/scripts/goalflight_status.py --wait id1,id2 --wait-timeout <s>`.
 Exit 0 means every requested dispatch is terminal; exit 1 means pending/timeout;
 **exit 3 means mail arrived while you were waiting** and the wait returned early
@@ -211,9 +213,9 @@ polling by hand. That is the exact behaviour this replaced: before the wake
 existed, worker escalations sat unread for hours while a human relayed messages
 between sessions.
 
-To be told about mail without waiting on any dispatch at all, background a
-listener. It prints NOTHING until something arrives, so one call can stay open
-across a long stretch of work:
+For the normal claimed-controller path, background the ownership listener. It
+prints NOTHING until something arrives and discovers later owned dispatches, so
+do not enumerate ids:
 
 ```bash
 python3 <skill-root>/scripts/goalflight_messages.py listen
