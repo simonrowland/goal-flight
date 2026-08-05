@@ -23,6 +23,7 @@ if str(ROOT) not in sys.path:
 
 import goalflight_compat
 import goalflight_codex_sessions
+import goalflight_dispatch_states
 import goalflight_ledger
 import goalflight_quota_stuck
 import goalflight_task
@@ -411,7 +412,7 @@ def _exit_code_for_state(state: str) -> int:
         return 0
     if state == "worker_dead":
         return 1
-    if state == "rate_limited":
+    if goalflight_dispatch_states.is_limit_state(state):
         return 1
     if state == "idle_timeout":
         return 2
@@ -1357,7 +1358,7 @@ def main() -> int:
             payload["reason"] = reason
         if terminal_write:
             terminal_marker = payload.get("terminal_marker") or terminal_seen
-            final_state, final_reason, _rate_limited = goalflight_terminal.terminal_rate_limit_outcome(
+            final_state, final_reason, _limit_reached = goalflight_terminal.terminal_rate_limit_outcome(
                 payload.get("state"),
                 payload.get("reason"),
                 tail,
@@ -1466,6 +1467,7 @@ def main() -> int:
             tail=tail,
             previous_state=previous_state,
             previous_reason=previous_reason,
+            effective_account=effective_account,
         )
 
     def flush_terminal_status(reason: str) -> None:
@@ -1508,7 +1510,11 @@ def main() -> int:
         })
         if state in {"worker_dead", "watcher_stopped"} and not terminal_seen:
             apply_tail_quota_status(payload, previous_state=state, previous_reason=reason)
-        write_reason = payload.get("reason") if payload.get("state") == "rate_limited" else reason
+        write_reason = (
+            payload.get("reason")
+            if goalflight_dispatch_states.is_limit_state(payload.get("state"))
+            else reason
+        )
         with contextlib.suppress(Exception):
             write_payload(payload, reason=write_reason, terminal_write=True)
 

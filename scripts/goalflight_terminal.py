@@ -6,11 +6,13 @@ from __future__ import annotations
 from pathlib import Path
 import re
 
+import goalflight_dispatch_states
 import goalflight_rate_pressure
 
 RATE_LIMIT_TAIL_BYTES = 2048
 FINAL_RECONCILIATION_TAIL_BYTES = 10 * 1024 * 1024
-RATE_LIMITED_STATE = "rate_limited"
+# Compatibility import for callers that still name the historical umbrella.
+RATE_LIMITED_STATE = goalflight_dispatch_states.LEGACY_RATE_LIMITED_STATE
 SUCCESS_TERMINAL_MARKERS = {"COMPLETE", "READY", "RESULT"}
 # Markers that mean "I need the controller", as opposed to "I am finished".
 # The distinction decides whose word wins when a marker and a live worker
@@ -93,23 +95,8 @@ def read_tail_excerpt(path: Path, max_bytes: int = RATE_LIMIT_TAIL_BYTES) -> str
         return ""
 
 
-def rate_limit_signature_in_text(text: str) -> str | None:
-    lowered = text.lower()
-    for pattern in goalflight_rate_pressure.RATE_LIMIT_PATTERNS:
-        if pattern in lowered:
-            return pattern
-    # Numeric HTTP statuses are context-sensitive in the provider-pressure
-    # scanner, so they deliberately are not substring entries in
-    # RATE_LIMIT_PATTERNS. The terminal-tail scanner still needs to recognize
-    # their standalone token form. Keeping this outside the pattern loop is
-    # load-bearing: the old in-loop special case was unreachable.
-    for pattern in ("429", "529"):
-        if re.search(rf"(?<!\d){re.escape(pattern)}(?!\d)", lowered):
-            return pattern
-    for pattern in goalflight_rate_pressure.MODEL_CAPACITY_PATTERNS:
-        if pattern in lowered:
-            return pattern
-    return None
+# Compatibility export, not a second analyzer.
+rate_limit_signature_in_text = goalflight_rate_pressure.rate_limit_signature_in_text
 
 
 def _rate_limit_outcome_from_text(
@@ -122,21 +109,27 @@ def _rate_limit_outcome_from_text(
     excerpt = text.strip()
     if not excerpt:
         return state, reason, False
-    signature = rate_limit_signature_in_text(excerpt)
-    if not signature:
+    evidence = goalflight_rate_pressure.rate_limit_signature_in_text(excerpt)
+    if not evidence:
         return state, reason, False
     probe = {"state": "worker_dead", "error": excerpt}
     if not goalflight_rate_pressure.detect_rate_limit_signature(probe, None):
         return state, reason, False
+    limit_state = str(evidence.get("state") or goalflight_dispatch_states.LIMIT_UNKNOWN_STATE)
     payload = {
-        "message": "dispatch_worker_rate_limited",
-        "rate_limit_signature": signature,
+        "message": "dispatch_worker_limit_reached",
+        "rate_limit_signature": evidence.get("limit_signature"),
+        "limit_signature": evidence.get("limit_signature"),
+        "limit_kind": evidence.get("limit_kind"),
+        "limit_state": limit_state,
+        "reset_at": evidence.get("reset_at"),
+        "retry_after": evidence.get("retry_after"),
         "tail_excerpt": excerpt[-RATE_LIMIT_TAIL_BYTES:],
         "reason": reason,
     }
     if reason_extra:
         payload.update(reason_extra)
-    return RATE_LIMITED_STATE, payload, state != RATE_LIMITED_STATE
+    return limit_state, payload, state != limit_state
 
 
 def terminal_success_marker_present(marker: object) -> bool:
@@ -175,6 +168,9 @@ def terminal_rate_limit_outcome(
     success_marker_present: bool = False,
     terminal_marker_present: bool = False,
 ) -> tuple[str | None, object, bool]:
+    if isinstance(reason, dict) and reason.get("message") == "dispatch_worker_limit_reached":
+        limit_state = str(reason.get("limit_state") or goalflight_dispatch_states.LIMIT_UNKNOWN_STATE)
+        return limit_state, reason, state != limit_state
     if isinstance(reason, dict) and reason.get("message") == "dispatch_worker_rate_limited":
         return RATE_LIMITED_STATE, reason, state != RATE_LIMITED_STATE
     if terminal_marker_present or success_marker_present:
@@ -226,8 +222,8 @@ def final_reconciliation_error_veto_outcome(
 def terminal_liveness_state(state: object) -> str:
     if state == "complete":
         return "completed"
-    if state == RATE_LIMITED_STATE:
-        return RATE_LIMITED_STATE
+    if goalflight_dispatch_states.is_limit_state(state):
+        return goalflight_dispatch_states.normalize_dispatch_state(state) or str(state)
     if state == "worker_dead":
         return "worker_dead"
     if isinstance(state, str) and state.startswith("blocked"):

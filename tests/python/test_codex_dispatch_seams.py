@@ -737,10 +737,21 @@ def _install_stub_seat_api(
 
 
 @pytest.mark.parametrize(
-    ("failure_kind", "worker_text"),
+    ("failure_kind", "worker_text", "expect_state"),
     [
-        ("auth", "HTTP 401 Unauthorized"),
-        ("quota", "quota exceeded"),
+        ("auth", "HTTP 401 Unauthorized", None),
+        # Real usage-limit phrasing from a 2026-08-05 seat exhaustion; must
+        # classify as the measured exhausted kind, not the legacy literal.
+        (
+            "quota",
+            "ERROR: You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage "
+            "to purchase more credits or try again at Aug 8th, 2026 1:41 PM.",
+            "quota_exhausted",
+        ),
+        # Exhaustion phrasing with NO parseable reset: still the exhausted
+        # kind (the words mean consumption); the missing reset is a separate
+        # fact carried as hold_reset_unknown in the retry policy.
+        ("quota", "quota exceeded", "quota_exhausted"),
     ],
 )
 def test_queued_terminal_reconcile_requeues_exactly_once_end_to_end(
@@ -748,6 +759,7 @@ def test_queued_terminal_reconcile_requeues_exactly_once_end_to_end(
     tmp_path: Path,
     failure_kind: str,
     worker_text: str,
+    expect_state: str | None,
 ) -> None:
     dispatch_id = f"queued-{failure_kind}-parent"
     home = tmp_path / "resolved-home"
@@ -809,7 +821,8 @@ def test_queued_terminal_reconcile_requeues_exactly_once_end_to_end(
     assert terminal["effective_account"] == "seat-e2e"
     assert terminal["request_envelope"]["dispatch_argv"]
     if failure_kind == "quota":
-        assert terminal["state"] == "rate_limited"
+        assert terminal["state"] == expect_state
+        assert D._requeue_failure_kind(terminal, tail) == "quota"
     else:
         assert D._requeue_failure_kind(terminal, tail) == "auth"
 
@@ -824,6 +837,18 @@ def test_queued_terminal_reconcile_requeues_exactly_once_end_to_end(
     assert child["dispatch_id"] == child_id
     assert child["requeued_from"] == dispatch_id
     assert child["request"]["requeued_from"] == dispatch_id
+    if failure_kind == "quota" and terminal.get("state") == "quota_exhausted":
+        reset_at = (terminal.get("limit_evidence") or {}).get("reset_at") or terminal.get("reset_at")
+        if reset_at:
+            # Exhausted WITH a measured reset: the child relaunches AT the
+            # reset, not never and not immediately. This is the requeue half
+            # of the state split; without it the split only renames the death.
+            assert child.get("not_before") == reset_at, child
+        else:
+            # Exhausted with reset unknown: falls back to the account cooldown
+            # (may be None when no cooldown is recorded) -- but must NOT be an
+            # invented eligibility timestamp.
+            assert "not_before" in child or child.get("not_before") is None
 
     D._recover_claimed_queue_entries(queue_dir, stale_s=0.0)
     assert [path.name for path in queue_dir.glob("*.json")] == [
@@ -1128,3 +1153,28 @@ def test_requeued_child_is_never_auto_requeued(tmp_path: Path) -> None:
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+def test_quota_reconcile_writes_the_measured_limit_state(tmp_path: Path) -> None:
+    """_quota_limited_state_reason must return the kind it measured.
+
+    The reconcile path re-examines idle_timeout/worker_dead/legacy deaths whose
+    tails carry a limit signature. Hardcoding the legacy literal here kept
+    minting new kind-unknown records from the one code path that had just
+    classified the kind -- the field-asserting-unmeasured-state class.
+    """
+    tail = tmp_path / "reconcile.tail"
+    tail.write_text(
+        "ERROR: You've hit your usage limit. Visit https://chatgpt.com/codex/"
+        "settings/usage to purchase more credits or try again at Aug 8th, 2026 1:41 PM.\n",
+        encoding="utf-8",
+    )
+    state, reason = D._quota_limited_state_reason(
+        "worker_dead", None, tail, agent="codex"
+    )
+    assert state == "quota_exhausted", (state, reason)
+    assert isinstance(reason, dict) and reason.get("limit_state") == "quota_exhausted"
+
+    # A state outside the reconcile-input set passes through untouched.
+    state2, _ = D._quota_limited_state_reason("complete", None, tail, agent="codex")
+    assert state2 == "complete"

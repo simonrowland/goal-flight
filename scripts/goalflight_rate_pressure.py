@@ -64,6 +64,7 @@ import json
 import re
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -121,134 +122,200 @@ PROVIDER_FALLBACK: dict[str, list[str]] = {
     "cursor":            ["codex", "grok"],
 }
 
-# Substring patterns indicating an account/provider rate-limit failure.
-# Case-insensitive.
-RATE_LIMIT_PATTERNS: tuple[str, ...] = (
-    "rate_limit",
-    "rate-limit",
-    "rate limit",
-    "you've hit your limit",
-    "usage limit",
-    "try again at",
-    "anthropic.ratelimiterror",
-    "openai.ratelimiterror",
-    "session_limit",
-    "blocked_session_limit",
-    # Coverage-audit additions (2026-06-10) — provider phrases the original
-    # list missed. Matching stays failure-state-gated (detect_pressure_scope),
-    # so prompt-echo inside successful runs cannot false-positive.
-    "too many requests",        # OpenAI/HTTP prose form of 429
-    "insufficient_quota",       # OpenAI hard quota
-    "rate_limit_error",         # Anthropic API error type
-    "overloaded_error",         # Anthropic 529 error type
-    "session limit",            # Claude CLI prose (space form; underscore form above)
-    "resource_exhausted",       # gRPC/generic quota signal
-    "quota exceeded",           # generic billing/quota hard limit
-    "check your settings to continue",  # Cursor plan/usage block (full phrase for precision)
-    # codex CLI + xAI/grok additions. NOTE: most
-    # codex/xAI 429 PROSE ("you've exceeded the rate limit", "rate limit reached for
-    # organization", xAI "...reached the rate limit") is ALREADY caught by the
-    # substrings above ("rate limit"/"too many requests"), so only the
-    # genuinely-uncaught literals are added. Matching stays failure-state-gated.
-    "exceeded retry limit",          # codex CLI retry-wrapper exhaustion (catches retry-exhaust even when the line is not a bare 429)
-    "prepaid credits are depleted",  # xAI hard CREDIT exhaustion — a distinct failure mode (no 429, no "rate limit" text)
-    "payment_required",              # xAI 402 credits-out (code form; safer than a bare "402")
-    # xAI Grok Build usage-balance exhaustion — OBSERVED LIVE 2026-07-01. The real
-    # grok CLI-proxy text is: 'API error (status 402 Payment Required): Grok Build
-    # usage balance exhausted' (Request URL cli-chat-proxy.grok.com). Neither
-    # "payment_required" (underscore) NOR any 402 anchor (there was none) matched it,
-    # so rate_limit_signature_in_text() returned None: adaptive walk-back never fired,
-    # a whole grok batch failed on 402 and the workers hung (orphan leak), all while
-    # the monitor read pressure=none. Add the actual prose + HTTP reason-phrase form.
-    "usage balance exhausted",       # xAI Grok Build balance gone (prose; unambiguous)
-    "payment required",              # HTTP 402 reason-phrase (space form) as emitted by the grok CLI proxy
-    # Moonshot/Kimi additions (2026-07-20 kimi-worker dogfood). `kimi` maps to
-    # provider "moonshot" in AGENT_TO_PROVIDER but had ZERO signatures, so a
-    # rate-limited kimi worker went undetected. Sources: the installed
-    # kimi-code v0.27.0 binary (~/.kimi-code/bin/kimi) and the official error
-    # reference (https://www.kimi.com/code/docs/en/kimi-code/error-reference.html).
-    # NOTE what is deliberately NOT added: "provider.rate_limit" (kimi-code's
-    # error code) and "rate_limit_exceeded" already match via the "rate_limit"
-    # substring above; the documented 429 prose "We're receiving too many
-    # requests" and every "You've reached ... usage limit ..." variant already
-    # match via "too many requests" / "usage limit".
-    "apiproviderratelimiterror",     # kimi-code CLI error class (VERIFIED in v0.27.0 binary: APIProviderRateLimitError extends APIStatusError, this.name = "APIProviderRateLimitError"); appears in error dumps like the anthropic/openai dotted forms above
-    "the engine is currently overloaded",  # moonshot 429 inference-overload prose (VERIFIED official error reference: 'error, status code: 429, message: The engine is currently overloaded, please try again later')
-)
-
-# Moonshot RPM-cap prose. kimi-code v0.27.0's binary matcher uses
-# /reached .*max rpm/ (VERIFIED in PROVIDER_RATE_LIMIT_MESSAGE_PATTERNS); exact
-# server text remains unverified. Keep both anchors on one bounded line so
-# incidental mechanical/code prose containing only "max rpm" cannot match.
-MOONSHOT_MAX_RPM_RE = re.compile(r"\breached\b[^\r\n]{0,200}\bmax rpm\b", re.IGNORECASE)
-
-# HTTP status codes require provider-error context — bare "429"/"529" in line
-# numbers, ids, or unrelated prose must not false-positive.
-RATE_LIMIT_HTTP_STATUS_ANCHORS: dict[str, tuple[str, ...]] = {
-    "429": (
-        "http 429",
-        "status 429",
-        "status: 429",
-        "429 too many",
-        "got 429",
-        "error 429",
-        '"code": 429',
-        '"code":429',
-        # Moonshot/Kimi error envelope from the official error reference:
-        # 'error, status code: 429, message: <prose>'. The binary does not
-        # embed this template. "status code: 429" is not caught by
-        # "status: 429" above ("code" sits between).
-        "status code: 429",
-    ),
-    "529": (
-        "http 529",
-        "status 529",
-        "status: 529",
-        "529 overloaded",
-        "got 529",
-        "error 529",
-        "(529)",
-        '"code": 529',
-        '"code":529',
-    ),
-    # 402 Payment Required — xAI hard usage/credit exhaustion (added 2026-07-01,
-    # see RATE_LIMIT_PATTERNS note). 402 is unambiguously a billing/quota wall, so
-    # anchoring on the status is safe.
-    "402": (
-        "http 402",
-        "status 402",
-        "status: 402",
-        "402 payment required",
-        "got 402",
-        "error 402",
-        "(status 402",
-        '"http_status": 402',
-        '"http_status":402',
-        '"code": 402',
-        '"code":402',
-    ),
-}
-
-
-def rate_limit_signature_in_text(text: str) -> str | None:
-    lowered = text.lower()
-    for pattern in RATE_LIMIT_PATTERNS:
-        if pattern in lowered:
-            return pattern
-    if MOONSHOT_MAX_RPM_RE.search(text):
-        return "reached ... max rpm"
-    return None
-
-# Substring patterns indicating model-specific capacity, not account-wide quota.
-# These reduce only the label that produced the signal. Bare "at capacity" is
-# excluded — unrelated prose can mention capacity without a model-scoped signal.
-MODEL_CAPACITY_PATTERNS: tuple[str, ...] = (
-    "selected model is at capacity",
-    "model is at capacity",
-)
-
 ACCOUNT_RATE_LIMIT_SCOPE = "account_rate_limit"
 MODEL_CAPACITY_SCOPE = "model_capacity"
+
+
+class LimitPattern(str):
+    """String-compatible entry in the one authoritative signature table."""
+
+    def __new__(
+        cls,
+        marker: str,
+        kind: str,
+        *,
+        signature: str | None = None,
+        scope: str = ACCOUNT_RATE_LIMIT_SCOPE,
+        regex: re.Pattern[str] | None = None,
+    ) -> "LimitPattern":
+        value = str.__new__(cls, marker)
+        value.kind = kind
+        value.signature = signature or marker
+        value.scope = scope
+        value.regex = regex
+        return value
+
+
+class LimitEvidence(str):
+    """Backward string-compatible signature carrying measured kind/evidence."""
+
+    def __new__(
+        cls,
+        signature: str,
+        *,
+        kind: str,
+        scope: str,
+        reset_at: str | None,
+        retry_after: float | None,
+    ) -> "LimitEvidence":
+        value = str.__new__(cls, signature)
+        value.signature = signature
+        value.kind = kind
+        value.scope = scope
+        value.state = goalflight_dispatch_states.limit_state_for_kind(kind)
+        value.reset_at = reset_at
+        value.retry_after = retry_after
+        return value
+
+    def get(self, key: str, default: object = None) -> object:
+        aliases = {
+            "signature": self.signature,
+            "limit_signature": self.signature,
+            "kind": self.kind,
+            "limit_kind": self.kind,
+            "scope": self.scope,
+            "state": self.state,
+            "reset_at": self.reset_at,
+            "retry_after": self.retry_after,
+        }
+        return aliases.get(key, default)
+
+
+E = goalflight_dispatch_states.LIMIT_KIND_EXHAUSTED
+T = goalflight_dispatch_states.LIMIT_KIND_TRANSIENT
+U = goalflight_dispatch_states.LIMIT_KIND_UNKNOWN
+
+# One table decides signature, kind, and pressure scope. Entries are strings so
+# existing low-level scanners can still use casefold()/substring operations.
+# Specific evidence precedes generic umbrella phrases.
+RATE_LIMIT_PATTERNS: tuple[LimitPattern, ...] = (
+    LimitPattern("usage balance exhausted", E),
+    LimitPattern("prepaid credits are depleted", E),
+    LimitPattern("insufficient_quota", E),
+    LimitPattern("quota exceeded", E),
+    LimitPattern("weekly limit", E),
+    LimitPattern("usage limit", E),
+    LimitPattern("blocked_session_limit", E),
+    LimitPattern("session_limit", E),
+    LimitPattern("session limit", E),
+    LimitPattern("payment_required", E),
+    LimitPattern("payment required", E),
+    *(
+        LimitPattern(anchor, E, signature="402")
+        for anchor in (
+            "http 402", "status 402", "status: 402", "402 payment required",
+            "got 402", "error 402", "(status 402", '"http_status": 402',
+            '"http_status":402', '"code": 402', '"code":402',
+        )
+    ),
+    LimitPattern("too many requests", T),
+    LimitPattern("overloaded_error", T),
+    LimitPattern("the engine is currently overloaded", T),
+    LimitPattern("exceeded retry limit", T),
+    *(
+        LimitPattern(anchor, T, signature="429")
+        for anchor in (
+            "http 429", "status 429", "status: 429", "429 too many",
+            "got 429", "error 429", '"code": 429', '"code":429',
+            "status code: 429",
+        )
+    ),
+    *(
+        LimitPattern(anchor, T, signature="529")
+        for anchor in (
+            "http 529", "status 529", "status: 529", "529 overloaded",
+            "got 529", "error 529", "(529)", '"code": 529', '"code":529',
+        )
+    ),
+    LimitPattern(
+        "reached ... max rpm",
+        T,
+        regex=re.compile(r"\breached\b[^\r\n]{0,200}\bmax rpm\b", re.IGNORECASE),
+    ),
+    LimitPattern("selected model is at capacity", T, scope=MODEL_CAPACITY_SCOPE),
+    LimitPattern("model is at capacity", T, scope=MODEL_CAPACITY_SCOPE),
+    LimitPattern("rate_limit", U),
+    LimitPattern("rate-limit", U),
+    LimitPattern("rate limit", U),
+    LimitPattern("you've hit your limit", U),
+    LimitPattern("try again at", U),
+    LimitPattern("anthropic.ratelimiterror", U),
+    LimitPattern("openai.ratelimiterror", U),
+    LimitPattern("rate_limit_error", U),
+    LimitPattern("resource_exhausted", U),
+    LimitPattern("check your settings to continue", U),
+    LimitPattern("apiproviderratelimiterror", U),
+)
+_CODEX_RESET_RE = re.compile(
+    r"\b(?:try\s+again|reset(?:s)?)\s+(?:at|on)\s+"
+    r"(?P<month>[A-Z][a-z]{2,8})\s+"
+    r"(?P<day>\d{1,2})(?:st|nd|rd|th)?\s*,?\s+"
+    r"(?P<year>\d{4})\s+"
+    r"(?P<clock>\d{1,2}:\d{2}\s*[AP]M)\b",
+    re.IGNORECASE,
+)
+_ISO_RESET_RE = re.compile(
+    r"\b(?:try\s+again|reset(?:s)?(?:_at)?)\s*(?:at|on|[:=])\s*"
+    r"(?P<iso>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2}))",
+    re.IGNORECASE,
+)
+_RETRY_AFTER_RE = re.compile(
+    r"\bretry(?:-|\s*)after\s*[:=]?\s*(?P<seconds>\d+(?:\.\d+)?)\s*(?:s|sec(?:ond)?s?)?\b",
+    re.IGNORECASE,
+)
+_RETRY_IN_RE = re.compile(
+    r"\bretry\s+in\s+(?P<seconds>\d+(?:\.\d+)?)\s*(?:s|sec(?:ond)?s?)\b",
+    re.IGNORECASE,
+)
+
+
+def _reset_at_in_text(text: str) -> str | None:
+    iso_match = _ISO_RESET_RE.search(text)
+    if iso_match:
+        value = iso_match.group("iso")
+        if value.endswith(("Z", "z")):
+            value = f"{value[:-1]}+00:00"
+        try:
+            return datetime.fromisoformat(value).isoformat()
+        except ValueError:
+            return None
+    match = _CODEX_RESET_RE.search(text)
+    if not match:
+        return None
+    value = (
+        f"{match.group('month')} {match.group('day')}, "
+        f"{match.group('year')} {match.group('clock')}"
+    )
+    try:
+        # Codex renders this timestamp in the invoking machine's local zone.
+        return datetime.strptime(value, "%b %d, %Y %I:%M %p").astimezone().isoformat()
+    except ValueError:
+        return None
+
+
+def _retry_after_in_text(text: str) -> float | None:
+    match = _RETRY_AFTER_RE.search(text) or _RETRY_IN_RE.search(text)
+    return float(match.group("seconds")) if match else None
+
+
+def rate_limit_signature_in_text(text: str) -> LimitEvidence | None:
+    lowered = str(text or "").lower()
+    retry_after = _retry_after_in_text(text)
+    for pattern in RATE_LIMIT_PATTERNS:
+        matched = pattern.regex.search(text) if pattern.regex else pattern in lowered
+        if not matched:
+            continue
+        kind = pattern.kind
+        if retry_after is not None and kind == U:
+            kind = T
+        return LimitEvidence(
+            pattern.signature,
+            kind=kind,
+            scope=pattern.scope,
+            reset_at=_reset_at_in_text(text),
+            retry_after=retry_after,
+        )
+    return None
 
 
 def provider_for(agent_label: str) -> str | None:
@@ -377,19 +444,6 @@ def _status_haystack(status: dict | None) -> str:
     return " ".join(haystack_parts).lower()
 
 
-def _haystack_matches_rate_limit(haystack: str) -> bool:
-    """True when haystack carries account/provider rate-limit evidence."""
-    if rate_limit_signature_in_text(haystack) is not None:
-        return True
-    for status_code, anchors in RATE_LIMIT_HTTP_STATUS_ANCHORS.items():
-        if any(anchor in haystack for anchor in anchors):
-            return True
-        # overloaded_error already lives in RATE_LIMIT_PATTERNS; keep 529 tied to it.
-        if status_code == "529" and "overloaded_error" in haystack:
-            return True
-    return False
-
-
 def detect_pressure_scope(record: dict, status: dict | None) -> str | None:
     """Return the pressure scope for this dispatch, or None.
 
@@ -413,7 +467,13 @@ def detect_pressure_scope(record: dict, status: dict | None) -> str | None:
     # gate — counting it would feed our queueing back into the walk-back and
     # falsely halve provider caps (self-referential pressure). "blocked_auth"
     # stays excluded per the note above.
-    if state not in {"failed", "inconclusive_timeout", "blocked", "inconclusive_no_final", "worker_dead", "rate_limited"}:
+    if not goalflight_dispatch_states.is_limit_state(state) and state not in {
+        "failed",
+        "inconclusive_timeout",
+        "blocked",
+        "inconclusive_no_final",
+        "worker_dead",
+    }:
         # Successful, pending, capacity-, or auth-blocked dispatches don't count.
         return None
 
@@ -425,13 +485,8 @@ def detect_pressure_scope(record: dict, status: dict | None) -> str | None:
         haystack = f"{haystack} {str(record_error).lower()}".strip()
     if not haystack:
         return None
-    # Account-wide rate limits take precedence when both signals appear — mixed
-    # HTTP 429 + model-capacity prose is still provider quota pressure.
-    if _haystack_matches_rate_limit(haystack):
-        return ACCOUNT_RATE_LIMIT_SCOPE
-    if any(pat in haystack for pat in MODEL_CAPACITY_PATTERNS):
-        return MODEL_CAPACITY_SCOPE
-    return None
+    evidence = rate_limit_signature_in_text(haystack)
+    return evidence.scope if evidence is not None else None
 
 
 def detect_rate_limit_signature(record: dict, status: dict | None) -> bool:

@@ -20,6 +20,8 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -36,6 +38,252 @@ def assert_true(name: str, condition: bool) -> None:
 
 def _beacon() -> subprocess.Popen:
     return subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+
+
+def test_same_session_calling_shell_is_warned_not_refused() -> None:
+    """POSIX session membership is suspicious, not proof of doomed lifetime."""
+    if os.name == "nt":
+        return
+    with tempfile.TemporaryDirectory() as td:
+        env = os.environ.copy()
+        env.pop(S.CONTROLLER_PID_ENV, None)
+        completed = subprocess.run(
+            [
+                "/bin/sh",
+                "-c",
+                (
+                    "GOALFLIGHT_CONTROLLER_PID=$$ GOALFLIGHT_CONTROLLER_LABEL=doomed "
+                    '"$1" "$2" --project-root "$3" --controller-startup; '
+                    "status=$?; :; exit $status"
+                ),
+                "sh",
+                sys.executable,
+                str(ROOT / "scripts" / "goalflight_session_status.py"),
+                td,
+            ],
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+        payload = json.loads(completed.stdout)
+        assert_true("startup remains fail-open", completed.returncode == 0)
+        assert_true("the live parent claim is accepted", payload.get("claimed") is True)
+        assert_true(
+            "the lifetime uncertainty is explicit",
+            payload.get("warnings", [{}])[0].get("reason")
+            == "controller_pid_lifetime_suspicious",
+        )
+
+
+def test_ancestry_resolution_uses_surviving_host() -> None:
+    """Resolve through a transient shell to a real, still-running host process."""
+    if os.name == "nt":
+        return
+    launcher_source = r'''
+import json
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+script, root, result_path = sys.argv[1:]
+shell = subprocess.Popen(
+    [
+        "/bin/sh",
+        "-c",
+        '"$1" "$2" --project-root "$3" --controller-startup '
+        '--controller-pid-from-ancestry --session-label ancestry-host; '
+        'status=$?; :; exit $status',
+        "sh",
+        sys.executable,
+        script,
+        root,
+    ],
+    start_new_session=True,
+    text=True,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+)
+stdout, stderr = shell.communicate(timeout=10)
+Path(result_path).write_text(
+    json.dumps(
+        {
+            "claim": json.loads(stdout),
+            "shell_pid": shell.pid,
+            "shell_returncode": shell.returncode,
+            "stderr": stderr,
+        }
+    ),
+    encoding="utf-8",
+)
+time.sleep(120)
+'''
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        result_path = root / "ancestry-result.json"
+        launcher = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                launcher_source,
+                str(ROOT / "scripts" / "goalflight_session_status.py"),
+                str(root),
+                str(result_path),
+            ],
+            start_new_session=True,
+        )
+        try:
+            deadline = time.monotonic() + 10
+            while not result_path.exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert_true("claiming helper returned", result_path.exists())
+            payload = json.loads(result_path.read_text(encoding="utf-8"))
+            claim = payload["claim"]
+            assert_true("ancestry claim succeeded", claim.get("claimed") is True)
+            assert_true("transient shell exited", payload["shell_returncode"] == 0)
+            assert_true("transient shell is gone", not S._pid_alive(payload["shell_pid"]))
+            assert_true("durable launcher still runs", launcher.poll() is None)
+            assert_true(
+                "the exact durable host was selected",
+                claim["session"]["pid"] == launcher.pid,
+            )
+            live = S.live_session(root, label="ancestry-host", pid=launcher.pid)
+            assert_true("beacon remains live after claim helper exits", live is not None)
+        finally:
+            launcher.terminate()
+            launcher.wait(timeout=10)
+
+
+def test_ancestry_stopping_rule_excludes_shell_and_init() -> None:
+    ancestry = (
+        {"pid": 44, "ppid": 33, "session_id": 33, "start_token": "helper"},
+        {"pid": 33, "ppid": 22, "session_id": 33, "start_token": "shell"},
+        {"pid": 22, "ppid": 1, "session_id": 22, "start_token": "host"},
+        {"pid": 1, "ppid": 0, "session_id": 1, "start_token": "init"},
+    )
+    selected = S._select_durable_controller_ancestor(ancestry)
+    assert_true("a durable ancestor is selected", selected is not None)
+    assert_true("stop at the host session leader", selected["pid"] == 22)
+
+
+def test_unrelated_live_launcher_pid_still_claims() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        launcher = _beacon()
+        try:
+            result = S.claim_controller_startup(
+                root,
+                pid=launcher.pid,
+                label="unrelated-launcher",
+            )
+            assert_true("unrelated live launcher remains valid", result.get("claimed") is True)
+            assert_true("launcher pid is preserved", result["session"]["pid"] == launcher.pid)
+        finally:
+            launcher.terminate()
+            launcher.wait(timeout=10)
+
+
+def test_dead_declared_pid_is_still_refused() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        dead = _beacon()
+        dead.terminate()
+        dead.wait(timeout=10)
+        result = S.claim_controller_startup(
+            Path(td),
+            pid=dead.pid,
+            label="dead-launcher",
+        )
+        assert_true("dead pid cannot claim", result.get("claimed") is False)
+        assert_true("dead-pid reason is preserved", result.get("reason") == "controller_pid_not_live")
+
+
+def test_claim_session_cli_uses_the_lifetime_gate() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        env = os.environ.copy()
+        env.pop(S.CONTROLLER_PID_ENV, None)
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts" / "goalflight_session_status.py"),
+                "--project-root",
+                td,
+                "--claim-session",
+                "--session-label",
+                "one-shot",
+            ],
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+        payload = json.loads(completed.stdout)
+        assert_true("claim-session remains fail-open", completed.returncode == 0)
+        assert_true("one-shot helper is not claimed", payload.get("claimed") is False)
+        assert_true(
+            "claim-session reports measured lifetime failure",
+            payload.get("reason") == "controller_pid_cannot_outlive_claim",
+        )
+
+
+def test_selected_ancestry_start_token_cannot_be_replaced_before_claim() -> None:
+    ancestry = (
+        {"pid": 44, "ppid": 33, "session_id": 33, "start_token": "helper"},
+        {"pid": 33, "ppid": 22, "session_id": 33, "start_token": "shell"},
+        {"pid": 22, "ppid": 1, "session_id": 22, "start_token": "old"},
+    )
+    replacement = {"pid": 22, "start_token": "new"}
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        with (
+            patch.object(S, "_controller_process_ancestry", return_value=ancestry),
+            patch.object(S, "_controller_process_identity", return_value=replacement),
+        ):
+            startup = S.claim_controller_startup(
+                root,
+                label="ancestry",
+                pid_from_ancestry=True,
+                environ={},
+            )
+        assert_true("reused selected pid is not claimed", startup.get("claimed") is False)
+        assert_true("generation race is explicit", startup.get("reason") == "claim_failed")
+
+        selected_identity = {"pid": 22, "start_token": "old"}
+        with patch.object(S, "_controller_process_identity", return_value=replacement):
+            registered = S.register_controller(
+                root,
+                "register-race",
+                pid=22,
+                process_identity=selected_identity,
+            )
+        assert_true(
+            "register preserves selected generation",
+            registered.get("reason") == "controller_process_generation_changed",
+        )
+
+        S.register_controller(root, "join-race")
+        with patch.object(S, "_controller_process_identity", return_value=replacement):
+            joined = S.join_controller(
+                root,
+                "join-race",
+                pid=22,
+                process_identity=selected_identity,
+                acknowledge_conflict=True,
+            )
+        assert_true(
+            "join preserves selected generation",
+            joined.get("reason") == "controller_process_generation_changed",
+        )
+
+
+def test_identity_capture_does_not_require_ancestry_metadata() -> None:
+    if os.name == "nt":
+        return
+    with patch.object(S.os, "getsid", side_effect=AssertionError("ancestry probe")):
+        identity = S._controller_process_identity(os.getpid())
+    assert_true("ordinary identity capture remains independent", identity is not None)
 
 
 def test_identity_is_stable_across_separate_resolutions() -> None:
@@ -131,7 +379,10 @@ def test_unavailable_process_generation_preserves_existing_beacon() -> None:
                     label="battery-main",
                 )
             assert_true("missing generation fails honestly", failed.get("claimed") is False)
-            assert_true("missing generation is a claim failure", failed.get("reason") == "claim_failed")
+            assert_true(
+                "missing generation is reported precisely",
+                failed.get("reason") == "controller_process_generation_unavailable",
+            )
             resolved = S.live_session(root, label="battery-main", pid=proc.pid)
             assert_true("prior measured beacon survives", resolved is not None)
             assert_true("prior session id is preserved", resolved["id"] == first_id)
@@ -398,10 +649,14 @@ def test_live_same_label_beacon_wins_over_newer_stale_record() -> None:
         live_proc = _beacon()
         stale_proc = _beacon()
         try:
+            measured_now = datetime.now(timezone.utc)
             with patch.object(
                 S,
                 "_now_iso",
-                side_effect=["2026-08-03T10:00:00Z", "2026-08-03T11:00:00Z"],
+                side_effect=[
+                    (measured_now - timedelta(seconds=2)).isoformat(),
+                    (measured_now - timedelta(seconds=1)).isoformat(),
+                ],
             ):
                 live = S.claim_session(
                     root,
@@ -461,6 +716,14 @@ def test_release_drops_the_beacon() -> None:
 
 
 def main() -> None:
+    test_same_session_calling_shell_is_warned_not_refused()
+    test_ancestry_resolution_uses_surviving_host()
+    test_ancestry_stopping_rule_excludes_shell_and_init()
+    test_unrelated_live_launcher_pid_still_claims()
+    test_dead_declared_pid_is_still_refused()
+    test_claim_session_cli_uses_the_lifetime_gate()
+    test_selected_ancestry_start_token_cannot_be_replaced_before_claim()
+    test_identity_capture_does_not_require_ancestry_metadata()
     test_identity_is_stable_across_separate_resolutions()
     test_claim_is_idempotent_for_the_same_beacon()
     test_reused_pid_replaces_the_stale_process_generation()

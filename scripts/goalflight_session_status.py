@@ -65,6 +65,10 @@ QUEUE_GLOB = "docs-private/goal-queue-*.md"
 RESUME_NOTES_GLOB = "docs-private/RESUME-NOTES-*.md"
 CONTROLLER_LABEL_ENV = "GOALFLIGHT_CONTROLLER_LABEL"
 CONTROLLER_PID_ENV = "GOALFLIGHT_CONTROLLER_PID"
+CONTROLLER_SESSION_ID_ENV = "GOALFLIGHT_CONTROLLER_SESSION_ID"
+CONTROLLER_REGISTRY_KEY_PREFIX = "controller:"
+CONTROLLER_HEARTBEAT_RECENCY_S = 15 * 60
+CONTROLLER_HEARTBEAT_MAX_FUTURE_S = 60
 
 
 # --- session id (per-terminal) ----------------------------------------------
@@ -133,6 +137,22 @@ def resolve_controller_pid(
     return pid if pid > 0 else None
 
 
+def resolve_controller_session_id(
+    explicit_session_id: object = None,
+    *,
+    environ: dict[str, str] | None = None,
+) -> str | None:
+    """Return an explicitly carried incarnation id, never an inferred one."""
+    env = os.environ if environ is None else environ
+    raw = (
+        explicit_session_id
+        if explicit_session_id is not None
+        else env.get(CONTROLLER_SESSION_ID_ENV)
+    )
+    value = str(raw or "").strip()
+    return value or None
+
+
 def _read_session_map(path: Path) -> dict[str, dict]:
     """Session file as a pid->record map, tolerating the pre-map shape."""
     try:
@@ -151,6 +171,187 @@ def _write_session_map(path: Path, data: dict[str, dict]) -> None:
     tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}")
     tmp.write_text(json.dumps(data, indent=2) + "\n")
     tmp.replace(path)
+
+
+def _controller_registry_key(label: str) -> str:
+    return f"{CONTROLLER_REGISTRY_KEY_PREFIX}{label}"
+
+
+def _parse_utc(value: object) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _heartbeat_age_s(record: dict, *, now: datetime | None = None) -> float | None:
+    heartbeat = _parse_utc(record.get("heartbeat_at"))
+    if heartbeat is None:
+        return None
+    measured_now = now or datetime.now(timezone.utc)
+    if measured_now.tzinfo is None:
+        measured_now = measured_now.replace(tzinfo=timezone.utc)
+    return (measured_now.astimezone(timezone.utc) - heartbeat).total_seconds()
+
+
+def _heartbeat_recent(record: dict, *, now: datetime | None = None) -> bool:
+    age_s = _heartbeat_age_s(record, now=now)
+    return bool(
+        age_s is not None
+        and -CONTROLLER_HEARTBEAT_MAX_FUTURE_S <= age_s <= CONTROLLER_HEARTBEAT_RECENCY_S
+    )
+
+
+def _registry_record(data: dict[str, dict], label: str) -> dict | None:
+    record = data.get(_controller_registry_key(label))
+    if not isinstance(record, dict) or not record.get("controller_registry"):
+        return None
+    return record
+
+
+def _controller_session_record(record: dict) -> dict:
+    """Return the current incarnation in the historic session-record shape."""
+    session = {
+        "id": record.get("id"),
+        "started_at": record.get("started_at"),
+        "hostname": record.get("hostname"),
+        "label": record.get("label"),
+        "heartbeat_at": record.get("heartbeat_at"),
+        "controller_registry": True,
+    }
+    for key in ("pid", "process_identity"):
+        if record.get(key) is not None:
+            session[key] = record[key]
+    if record.get("retired_at"):
+        session["retired_at"] = record["retired_at"]
+    return session
+
+
+def _new_registry_record(
+    label: str,
+    *,
+    session_id: str | None = None,
+    pid: int | None = None,
+    process_identity: dict | None = None,
+    now_iso: str | None = None,
+) -> dict:
+    stamp = now_iso or _now_iso()
+    record = {
+        "controller_registry": True,
+        "label": label,
+        "id": session_id or str(uuid.uuid4()),
+        "created_at": stamp,
+        "started_at": stamp,
+        "heartbeat_at": stamp,
+        "hostname": socket.gethostname(),
+    }
+    if pid is not None:
+        record["pid"] = pid
+    if process_identity is not None:
+        record["process_identity"] = process_identity
+    return record
+
+
+def _legacy_label_records(data: dict[str, dict], label: str) -> list[dict]:
+    return [
+        record
+        for record in data.values()
+        if isinstance(record, dict)
+        and record.get("beacon")
+        and record.get("label") == label
+    ]
+
+
+def _sync_registry_claim_locked(
+    data: dict[str, dict],
+    session: dict,
+    *,
+    now_iso: str,
+) -> None:
+    label = _normalize_controller_label(session.get("label"))
+    if label is None:
+        return
+    key = _controller_registry_key(label)
+    registry = _registry_record(data, label)
+    if registry is not None and registry.get("retired_at"):
+        return
+    process_identity = session.get("process_identity")
+    same_incarnation = bool(
+        registry
+        and (
+            str(registry.get("id") or "") == str(session.get("id") or "")
+            or _same_controller_process(registry, process_identity)
+        )
+    )
+    if registry is None or same_incarnation or not _heartbeat_recent(registry):
+        if registry is None:
+            registry = _new_registry_record(
+                label,
+                session_id=str(session.get("id") or "") or None,
+                pid=session.get("pid") if isinstance(session.get("pid"), int) else None,
+                process_identity=process_identity if isinstance(process_identity, dict) else None,
+                now_iso=now_iso,
+            )
+        else:
+            created_at = registry.get("created_at") or now_iso
+            registry = _new_registry_record(
+                label,
+                session_id=str(session.get("id") or "") or None,
+                pid=session.get("pid") if isinstance(session.get("pid"), int) else None,
+                process_identity=process_identity if isinstance(process_identity, dict) else None,
+                now_iso=now_iso,
+            )
+            registry["created_at"] = created_at
+        data[key] = registry
+
+
+def _registered_controller_records(
+    project_root: Path,
+    *,
+    include_retired: bool = False,
+) -> list[dict]:
+    data = _read_session_map(_session_file(project_root))
+    records = [
+        dict(record)
+        for record in data.values()
+        if isinstance(record, dict) and record.get("controller_registry")
+    ]
+    known = {str(record.get("label") or "") for record in records}
+    for record in data.values():
+        label = _normalize_controller_label(record.get("label") if isinstance(record, dict) else None)
+        if not label or label in known or not record.get("beacon"):
+            continue
+        legacy = dict(record)
+        legacy["controller_registry"] = False
+        records.append(legacy)
+        known.add(label)
+    records = [record for record in records if include_retired or not record.get("retired_at")]
+    records.sort(key=lambda record: str(record.get("label") or ""))
+    return records
+
+
+def registered_controller_labels(project_root: Path) -> set[str]:
+    return {
+        str(record["label"])
+        for record in _registered_controller_records(project_root)
+        if record.get("label") and not record.get("retired_at")
+    }
+
+
+def _index_controller_project(project_root: Path) -> None:
+    """Best-effort discovery index; controller truth remains in the session map."""
+    try:
+        import goalflight_task  # type: ignore
+
+        goalflight_task.upsert_project_registry(project_root)
+    except Exception:
+        pass
 
 
 # ── controller session identity: the beacon ─────────────────────────────────
@@ -172,8 +373,8 @@ def _write_session_map(path: Path, data: dict[str, dict]) -> None:
 # their existing per-terminal meaning and are untouched.
 
 
-def _controller_process_identity(pid: int) -> dict | None:
-    """Return a PID-reuse-safe process-start token using only stdlib APIs."""
+def _controller_process_snapshot(pid: int, *, include_ancestry: bool = False) -> dict | None:
+    """Return process identity, optionally with measured ancestry fields."""
     if not _pid_alive(pid):
         return None
 
@@ -228,7 +429,15 @@ def _controller_process_identity(pid: int) -> dict | None:
             read = libproc.proc_pidinfo(pid, 3, 0, ctypes.byref(info), size)
             if read == size and int(info.pbi_pid) == pid and info.pbi_start_tvsec:
                 token = f"darwin:{info.pbi_start_tvsec}:{info.pbi_start_tvusec}"
-                return {"pid": pid, "start_token": token}
+                snapshot = {"pid": pid, "start_token": token}
+                if include_ancestry:
+                    snapshot.update(
+                        {
+                            "ppid": int(info.pbi_ppid),
+                            "session_id": os.getsid(pid),
+                        }
+                    )
+                return snapshot
         except (AttributeError, OSError, TypeError, ValueError):
             return None
         return None
@@ -248,11 +457,174 @@ def _controller_process_identity(pid: int) -> dict | None:
                 return None
             if not boot_id:
                 return None
-            return {"pid": pid, "start_token": f"linux:{boot_id}:{start_ticks}"}
+            snapshot = {"pid": pid, "start_token": f"linux:{boot_id}:{start_ticks}"}
+            if include_ancestry:
+                snapshot.update(
+                    {
+                        "ppid": int(fields[1]),
+                        "session_id": int(fields[3]),
+                    }
+                )
+            return snapshot
         except (IndexError, OSError, ValueError):
             return None
 
     return None
+
+
+def _controller_process_identity(pid: int) -> dict | None:
+    """Return the existing PID-reuse-safe identity shape for beacon records."""
+    snapshot = _controller_process_snapshot(pid)
+    if snapshot is None:
+        return None
+    return {"pid": snapshot["pid"], "start_token": snapshot["start_token"]}
+
+
+def _controller_process_ancestry(pid: int | None = None) -> tuple[dict, ...]:
+    """Measure the helper-to-root process chain without invoking ``ps``."""
+    current = os.getpid() if pid is None else pid
+    ancestry: list[dict] = []
+    seen: set[int] = set()
+    while current > 0 and current not in seen and len(ancestry) < 64:
+        seen.add(current)
+        snapshot = _controller_process_snapshot(current, include_ancestry=True)
+        if snapshot is None:
+            break
+        ancestry.append(snapshot)
+        parent = snapshot.get("ppid")
+        if not isinstance(parent, int):
+            break
+        current = parent
+    return tuple(ancestry)
+
+
+def _select_durable_controller_ancestor(ancestry: tuple[dict, ...]) -> dict | None:
+    """Select the leader of the first process session outside the tool call.
+
+    Agent harnesses launch each tool call in a transient POSIX session. The
+    helper and its calling shell share that session. The first outer session is
+    the durable host's session; selecting its measured leader skips transient
+    shells/interpreters while refusing to drift upward to PID 1 (launchd/init).
+    If that leader is not present in the measured parent chain, fail rather than
+    invent an identity.
+    """
+    if not ancestry:
+        return None
+    helper_session = ancestry[0].get("session_id")
+    if not isinstance(helper_session, int):
+        return None
+    outer_index = next(
+        (
+            index
+            for index, process in enumerate(ancestry[1:], start=1)
+            if process.get("session_id") != helper_session
+        ),
+        None,
+    )
+    if outer_index is None:
+        return None
+    outer_session = ancestry[outer_index].get("session_id")
+    if not isinstance(outer_session, int) or outer_session <= 1:
+        return None
+    for process in ancestry[outer_index:]:
+        if process.get("pid") == outer_session and process.get("session_id") == outer_session:
+            return process
+    return None
+
+
+def _doomed_invocation_pid(pid: int, ancestry: tuple[dict, ...]) -> bool:
+    """True only when measurement proves the claimed process is this helper.
+
+    A parent in the helper's POSIX session is suspicious, but it can remain
+    alive after the helper exits. Session membership alone is therefore not a
+    lifetime proof.
+    """
+    return pid == os.getpid()
+
+
+def _suspicious_invocation_pid(pid: int, ancestry: tuple[dict, ...]) -> bool:
+    if not ancestry:
+        return False
+    helper_session = ancestry[0].get("session_id")
+    if not isinstance(helper_session, int):
+        return False
+    return any(
+        process.get("pid") == pid
+        and process.get("pid") != os.getpid()
+        and process.get("session_id") == helper_session
+        for process in ancestry
+    )
+
+
+def _resolve_optional_incarnation(
+    pid: int | None,
+    *,
+    environ: dict[str, str] | None = None,
+    pid_from_ancestry: bool = False,
+    default_to_current: bool = False,
+) -> tuple[dict | None, dict | None]:
+    """Resolve one PID generation once and carry its start token forward."""
+    env = os.environ if environ is None else environ
+    declared_pid = resolve_controller_pid(pid, environ=env)
+    if pid_from_ancestry:
+        if declared_pid is not None:
+            return None, {
+                "reason": "conflicting_controller_pid_sources",
+                "message": (
+                    "--controller-pid-from-ancestry cannot be combined with "
+                    "--session-pid or GOALFLIGHT_CONTROLLER_PID"
+                ),
+            }
+        ancestor = _select_durable_controller_ancestor(_controller_process_ancestry())
+        if ancestor is None:
+            return None, {
+                "reason": "controller_ancestry_unavailable",
+                "message": "no durable host session leader was measurable",
+            }
+        identity = {
+            "pid": int(ancestor["pid"]),
+            "start_token": str(ancestor.get("start_token") or ""),
+        }
+        if not identity["start_token"]:
+            return None, {
+                "reason": "controller_process_generation_unavailable",
+                "controller_pid": identity["pid"],
+            }
+        return {"pid": identity["pid"], "process_identity": identity}, None
+
+    if declared_pid is None and default_to_current:
+        declared_pid = os.getpid()
+    if declared_pid is None:
+        return None, None
+    ancestry = _controller_process_ancestry()
+    if _doomed_invocation_pid(declared_pid, ancestry):
+        return None, {
+            "reason": "controller_pid_cannot_outlive_claim",
+            "controller_pid": declared_pid,
+            "message": (
+                "the declared controller PID is the claim helper itself and cannot "
+                "outlive this invocation; use --controller-pid-from-ancestry or "
+                "supply a live launcher PID"
+            ),
+        }
+    identity = _controller_process_identity(declared_pid)
+    if identity is None:
+        reason = (
+            "controller_process_generation_unavailable"
+            if _pid_alive(declared_pid)
+            else "controller_pid_not_live"
+        )
+        return None, {"reason": reason, "controller_pid": declared_pid}
+    resolution = {"pid": declared_pid, "process_identity": identity}
+    if _suspicious_invocation_pid(declared_pid, ancestry):
+        resolution["warning"] = {
+            "reason": "controller_pid_lifetime_suspicious",
+            "message": (
+                "the declared PID shares the helper's POSIX session; measurement "
+                "cannot prove whether it will outlive this invocation"
+            ),
+        }
+    return resolution, None
 
 
 def _same_controller_process(record: dict, current: dict | None) -> bool:
@@ -272,14 +644,23 @@ def claim_session(
     pid: int,
     session_id: str | None = None,
     label: str | None = None,
+    process_identity: dict | None = None,
 ) -> dict:
     """Bind a session id to one process generation, idempotently."""
     path = _session_file(project_root)
     path.parent.mkdir(parents=True, exist_ok=True)
-    process_identity = _controller_process_identity(pid)
-    if process_identity is None:
+    measured_identity = _controller_process_identity(pid)
+    if measured_identity is None:
         raise RuntimeError("controller process generation is unavailable")
+    if process_identity is not None:
+        expected = {"pid": process_identity.get("pid"), "start_token": process_identity.get("start_token")}
+        if expected != measured_identity:
+            raise RuntimeError("controller process generation changed before claim")
+        process_identity = expected
+    else:
+        process_identity = measured_identity
     resolved_label = _normalize_controller_label(label)
+    now_iso = _now_iso()
     with _file_lock(path):
         data = _read_session_map(path)
         key = str(pid)
@@ -292,16 +673,20 @@ def claim_session(
             # An older, unlabeled beacon for this exact process generation can
             # safely adopt the controller's first explicit declaration. Once
             # named, however, a live controller cannot silently relabel itself.
+            existing = dict(existing)
             if resolved_label and not existing.get("label"):
-                existing = dict(existing)
                 existing["label"] = resolved_label
-                data[key] = existing
-                _write_session_map(path, data)
+            existing.pop("superseded_at", None)
+            existing["heartbeat_at"] = now_iso
+            data[key] = existing
+            _sync_registry_claim_locked(data, existing, now_iso=now_iso)
+            _write_session_map(path, data)
             return existing
         record = {
             "id": session_id or str(uuid.uuid4()),
             "pid": pid,
-            "started_at": _now_iso(),
+            "started_at": now_iso,
+            "heartbeat_at": now_iso,
             "hostname": socket.gethostname(),
             "beacon": True,
         }
@@ -310,6 +695,7 @@ def claim_session(
         if resolved_label:
             record["label"] = resolved_label
         data[key] = record
+        _sync_registry_claim_locked(data, record, now_iso=now_iso)
         _write_session_map(path, data)
     return record
 
@@ -331,16 +717,34 @@ def live_session(
         label_was_declared = bool(str(os.environ.get(CONTROLLER_LABEL_ENV) or "").strip())
         if label_was_declared or declared_pid is not None:
             declared_label = resolve_controller_label(project_root=project_root)
-            if declared_label is None or declared_pid is None:
+            if declared_label is None:
                 return None
             label, pid = declared_label, declared_pid
 
     path = _session_file(project_root)
     if not path.exists():
         return None
+    data = _read_session_map(path)
+    all_registries = {
+        str(record.get("label")): record
+        for record in data.values()
+        if isinstance(record, dict)
+        and record.get("controller_registry")
+        and record.get("label")
+    }
+    registries = {
+        label: record
+        for label, record in all_registries.items()
+        if not record.get("retired_at")
+    }
     candidates = []
-    for record in _read_session_map(path).values():
+    for record in data.values():
         if not (isinstance(record, dict) and record.get("beacon")):
+            continue
+        if record.get("superseded_at"):
+            continue
+        record_label = str(record.get("label") or "")
+        if record_label in all_registries and record_label not in registries:
             continue
         record_pid = record.get("pid")
         if not isinstance(record_pid, int):
@@ -351,6 +755,9 @@ def live_session(
             current_identity = None
         if _same_controller_process(record, current_identity):
             candidates.append(record)
+    for registry in registries.values():
+        if registry.get("pid") is None and _heartbeat_recent(registry):
+            candidates.append(_controller_session_record(registry))
     label_candidate_count: int | None = None
     if label is not None:
         requested_label = _normalize_controller_label(label)
@@ -386,6 +793,7 @@ def claim_controller_startup(
     pid: int | None = None,
     label: str | None = None,
     environ: dict[str, str] | None = None,
+    pid_from_ancestry: bool = False,
 ) -> dict:
     """Best-effort startup registration; observability must never block work."""
     try:
@@ -397,15 +805,23 @@ def claim_controller_startup(
         )
         if not resolved_label:
             return {"claimed": False, "reason": "missing_controller_label"}
-        resolved_pid = resolve_controller_pid(pid, environ=env)
-        if resolved_pid is None:
+        resolution, pid_error = _resolve_optional_incarnation(
+            pid,
+            environ=env,
+            pid_from_ancestry=pid_from_ancestry,
+        )
+        if pid_error is not None:
+            return {"claimed": False, **pid_error}
+        if resolution is None:
             return {"claimed": False, "reason": "missing_controller_pid"}
-        if not _pid_alive(resolved_pid):
-            return {"claimed": False, "reason": "controller_pid_not_live"}
+        resolved_pid = int(resolution["pid"])
+        # This gate validates a PID-backed incarnation only. A future named
+        # registry may establish liveness from heartbeat activity instead.
         record = claim_session(
             project_root,
             pid=resolved_pid,
             label=resolved_label,
+            process_identity=resolution.get("process_identity"),
         )
         if record.get("label") != resolved_label:
             return {
@@ -432,7 +848,681 @@ def claim_controller_startup(
             "reason": "claim_failed",
             "error_type": type(exc).__name__,
         }
-    return {"claimed": True, "session": record}
+    result = {"claimed": True, "session": record}
+    if resolution.get("warning"):
+        result["warnings"] = [resolution["warning"]]
+    return result
+
+
+def register_controller(
+    project_root: Path,
+    name: str,
+    *,
+    pid: int | None = None,
+    session_id: str | None = None,
+    process_identity: dict | None = None,
+) -> dict:
+    """Create one durable controller name and its first incarnation."""
+    label = _normalize_controller_label(name)
+    if label is None:
+        return {"registered": False, "reason": "missing_controller_label"}
+    if pid is not None and _doomed_invocation_pid(pid, _controller_process_ancestry()):
+        return {
+            "registered": False,
+            "reason": "controller_pid_cannot_outlive_claim",
+            "controller_pid": pid,
+        }
+    if pid is not None:
+        measured_identity = _controller_process_identity(pid)
+        if measured_identity is None:
+            return {"registered": False, "reason": "controller_pid_not_live"}
+        if process_identity is not None and measured_identity != process_identity:
+            return {"registered": False, "reason": "controller_process_generation_changed"}
+        process_identity = process_identity or measured_identity
+    path = _session_file(project_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _file_lock(path):
+        data = _read_session_map(path)
+        if pid is not None:
+            existing_pid = data.get(str(pid))
+            if (
+                isinstance(existing_pid, dict)
+                and _same_controller_process(existing_pid, process_identity)
+                and existing_pid.get("label") not in (None, label)
+            ):
+                return {
+                    "registered": False,
+                    "reason": "controller_label_mismatch",
+                    "existing_label": existing_pid.get("label"),
+                }
+        existing = _registry_record(data, label)
+        if existing is None:
+            legacy = sorted(
+                _legacy_label_records(data, label),
+                key=lambda record: str(record.get("heartbeat_at") or record.get("started_at") or ""),
+                reverse=True,
+            )
+            if legacy:
+                stamp = str(legacy[0].get("heartbeat_at") or _now_iso())
+                _sync_registry_claim_locked(data, legacy[0], now_iso=stamp)
+                existing = _registry_record(data, label)
+                _write_session_map(path, data)
+        if existing is not None:
+            return {
+                "registered": False,
+                "reason": "controller_already_registered",
+                "retired": bool(existing.get("retired_at")),
+                "session": _controller_session_record(existing),
+            }
+        now_iso = _now_iso()
+        record = _new_registry_record(
+            label,
+            session_id=session_id,
+            pid=pid,
+            process_identity=process_identity,
+            now_iso=now_iso,
+        )
+        data[_controller_registry_key(label)] = record
+        if pid is not None:
+            data[str(pid)] = {
+                **_controller_session_record(record),
+                "beacon": True,
+            }
+            data[str(pid)].pop("controller_registry", None)
+        _write_session_map(path, data)
+    return {"registered": True, "session": _controller_session_record(record)}
+
+
+def join_controller(
+    project_root: Path,
+    name: str,
+    *,
+    pid: int | None = None,
+    session_id: str | None = None,
+    acknowledge_conflict: bool = False,
+    process_identity: dict | None = None,
+) -> dict:
+    """Join a durable name, succeeding an idle incarnation without friction."""
+    label = _normalize_controller_label(name)
+    if label is None:
+        return {"joined": False, "reason": "missing_controller_label"}
+    if pid is not None and _doomed_invocation_pid(pid, _controller_process_ancestry()):
+        return {
+            "joined": False,
+            "reason": "controller_pid_cannot_outlive_claim",
+            "controller_pid": pid,
+        }
+    if pid is not None:
+        measured_identity = _controller_process_identity(pid)
+        if measured_identity is None:
+            return {"joined": False, "reason": "controller_pid_not_live"}
+        if process_identity is not None and measured_identity != process_identity:
+            return {"joined": False, "reason": "controller_process_generation_changed"}
+        process_identity = process_identity or measured_identity
+    path = _session_file(project_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _file_lock(path):
+        data = _read_session_map(path)
+        registry = _registry_record(data, label)
+        if registry is None:
+            legacy = sorted(
+                _legacy_label_records(data, label),
+                key=lambda record: str(record.get("heartbeat_at") or record.get("started_at") or ""),
+                reverse=True,
+            )
+            if legacy:
+                stamp = str(legacy[0].get("heartbeat_at") or _now_iso())
+                _sync_registry_claim_locked(data, legacy[0], now_iso=stamp)
+                registry = _registry_record(data, label)
+        if registry is None:
+            return {"joined": False, "reason": "controller_not_registered"}
+        if registry.get("retired_at"):
+            return {
+                "joined": False,
+                "reason": "controller_retired",
+                "retired_at": registry.get("retired_at"),
+            }
+        same_incarnation = bool(
+            (session_id and str(registry.get("id") or "") == str(session_id))
+            or (pid is not None and _same_controller_process(registry, process_identity))
+        )
+        incarnation_state, pid_live = _incarnation_state(registry)
+        incumbent_live = pid_live is True or (
+            pid_live is None and _heartbeat_recent(registry)
+        )
+        if incumbent_live and not same_incarnation and not acknowledge_conflict:
+            measured_conflicts = 1
+            current_live = live_session(project_root, label=label)
+            if isinstance(current_live, dict):
+                measured_conflicts = int(current_live.get("conflicting_beacons") or 1)
+            return {
+                "joined": False,
+                "reason": "controller_label_conflict",
+                "conflicting_beacons": measured_conflicts,
+                "acknowledgement_available": True,
+                "heartbeat_age_seconds": _heartbeat_age_s(registry),
+                "heartbeat_recency_seconds": CONTROLLER_HEARTBEAT_RECENCY_S,
+                "incarnation_state": incarnation_state,
+                "current": _controller_session_record(registry),
+            }
+        now_iso = _now_iso()
+        succession = not same_incarnation
+        if succession:
+            created_at = registry.get("created_at") or now_iso
+            for key, beacon in list(data.items()):
+                if not (
+                    isinstance(beacon, dict)
+                    and beacon.get("beacon")
+                    and beacon.get("label") == label
+                ):
+                    continue
+                if pid is not None and beacon.get("pid") == pid:
+                    continue
+                beacon = dict(beacon)
+                beacon["superseded_at"] = now_iso
+                data[key] = beacon
+            registry = _new_registry_record(
+                label,
+                session_id=session_id,
+                pid=pid,
+                process_identity=process_identity,
+                now_iso=now_iso,
+            )
+            registry["created_at"] = created_at
+        else:
+            registry = dict(registry)
+            registry["heartbeat_at"] = now_iso
+        data[_controller_registry_key(label)] = registry
+        if pid is not None:
+            existing_pid = data.get(str(pid))
+            if (
+                isinstance(existing_pid, dict)
+                and _same_controller_process(existing_pid, process_identity)
+                and existing_pid.get("label") not in (None, label)
+            ):
+                return {
+                    "joined": False,
+                    "reason": "controller_label_mismatch",
+                    "existing_label": existing_pid.get("label"),
+                }
+            data[str(pid)] = {
+                **_controller_session_record(registry),
+                "beacon": True,
+            }
+            data[str(pid)].pop("controller_registry", None)
+        _write_session_map(path, data)
+    return {
+        "joined": True,
+        "succession": succession,
+        "conflict_acknowledged": bool(acknowledge_conflict and succession),
+        "session": _controller_session_record(registry),
+    }
+
+
+def touch_controller_heartbeat(
+    project_root: Path,
+    name: str,
+    *,
+    session_id: str | None = None,
+    pid: int | None = None,
+    dispatching_pid: int | None = None,
+) -> dict | None:
+    """Stamp measured controller activity when the incarnation still matches."""
+    label = _normalize_controller_label(name)
+    if label is None:
+        return None
+    path = _session_file(project_root)
+    if not path.exists():
+        return None
+    with _file_lock(path):
+        data = _read_session_map(path)
+        registry = _registry_record(data, label)
+        if registry is None or registry.get("retired_at"):
+            return None
+        if session_id is not None and str(registry.get("id") or "") != str(session_id):
+            return None
+        if pid is not None and registry.get("pid") != pid:
+            return None
+        stamp = _now_iso()
+        registry = dict(registry)
+        registry["heartbeat_at"] = stamp
+        if dispatching_pid is not None:
+            dispatch_identity = _controller_process_identity(dispatching_pid)
+            if dispatch_identity is None:
+                return None
+            registry["active_dispatch_resolution"] = {
+                "dispatcher_pid": dispatching_pid,
+                "process_identity": dispatch_identity,
+                "resolved_at": stamp,
+            }
+        data[_controller_registry_key(label)] = registry
+        current_pid = registry.get("pid")
+        if isinstance(current_pid, int):
+            beacon = data.get(str(current_pid))
+            if isinstance(beacon, dict) and str(beacon.get("id") or "") == str(registry.get("id") or ""):
+                beacon = dict(beacon)
+                beacon["heartbeat_at"] = stamp
+                data[str(current_pid)] = beacon
+        _write_session_map(path, data)
+    return _controller_session_record(registry)
+
+
+def touch_controller_heartbeat_by_session_id(
+    project_root: Path,
+    session_id: str,
+) -> dict | None:
+    for record in _registered_controller_records(project_root):
+        if str(record.get("id") or "") == str(session_id):
+            return touch_controller_heartbeat(
+                project_root,
+                str(record.get("label") or ""),
+                session_id=str(session_id),
+            )
+    return None
+
+
+def _format_idle_duration(age_s: float | None) -> str:
+    if age_s is None:
+        return "idle unknown"
+    if age_s < -CONTROLLER_HEARTBEAT_MAX_FUTURE_S:
+        return "clock skew: future heartbeat"
+    age_s = max(0.0, age_s)
+    if age_s < 60:
+        return "idle <1 minute"
+    if age_s < 3600:
+        minutes = int(age_s // 60)
+        return f"idle {minutes} minute{'s' if minutes != 1 else ''}"
+    if age_s < 86400:
+        hours = int(age_s // 3600)
+        return f"idle {hours} hour{'s' if hours != 1 else ''}"
+    days = int(age_s // 86400)
+    return f"idle {days} day{'s' if days != 1 else ''}"
+
+
+def _incarnation_state(record: dict) -> tuple[str, bool | None]:
+    pid = record.get("pid")
+    if not isinstance(pid, int):
+        return "heartbeat-only", None
+    try:
+        alive = _pid_alive(pid)
+        identity = _controller_process_identity(pid) if alive else None
+    except Exception:
+        return "pid-unmeasurable", None
+    if not alive:
+        return "dead-pid", False
+    if identity is None:
+        return "pid-unmeasurable", None
+    if _same_controller_process(record, identity):
+        return "live-pid", True
+    return "dead-pid", False
+
+
+def _addressed_unread_counts(
+    project_root: Path,
+    *,
+    messages_dir: Path | None = None,
+    fleet_dir: Path | None = None,
+) -> tuple[dict[str, int] | None, str | None]:
+    try:
+        import goalflight_messages as messages  # type: ignore
+
+        resolved_messages_dir = messages_dir or messages.default_messages_dir()
+        resolved_fleet_dir = fleet_dir if fleet_dir is not None else messages.default_fleet_dir()
+        cursor = messages.load_read_cursor(messages.read_cursor_path(resolved_messages_dir))
+        counts: dict[str, int] = {}
+        for inbox in messages.collect_inbox_paths(resolved_messages_dir, resolved_fleet_dir):
+            for envelope in messages.read_envelopes(inbox):
+                label = messages.controller_addressee_label(envelope)
+                addressee_root = messages.controller_addressee_project_root(envelope)
+                if (
+                    label is None
+                    or addressee_root != messages.controller_address_project_root(project_root)
+                ):
+                    continue
+                dispatch_id = str(envelope.get("dispatch_id") or inbox.stem)
+                key = messages.controller_cursor_key(label, dispatch_id, addressee_root)
+                if int(envelope.get("seq", 0)) > int(cursor.get(key, 0)):
+                    counts[label] = counts.get(label, 0) + 1
+        return counts, None
+    except Exception as exc:
+        return None, type(exc).__name__
+
+
+def _nonterminal_owned_dispatches(
+    project_root: Path,
+    *,
+    records: list[dict] | None = None,
+) -> tuple[dict[str, list[dict]] | None, str | None]:
+    try:
+        import goalflight_dispatch_states as dispatch_states  # type: ignore
+        import goalflight_ledger  # type: ignore
+
+        ledger_records = goalflight_ledger.read_records() if records is None else records
+        root = str(project_root.resolve())
+        by_label: dict[str, list[dict]] = {}
+        for record in ledger_records:
+            label = _normalize_controller_label(record.get("controller_label"))
+            if label is None or str(record.get("project_root") or "") != root:
+                continue
+            if any(
+                dispatch_states.is_terminal_state(record.get(key))
+                for key in ("state", "terminal_state", "classification")
+            ):
+                continue
+            by_label.setdefault(label, []).append(
+                {
+                    "dispatch_id": record.get("dispatch_id"),
+                    "state": record.get("state"),
+                }
+            )
+        return by_label, None
+    except Exception as exc:
+        return None, type(exc).__name__
+
+
+def controller_roster(
+    project_root: Path,
+    *,
+    include_retired: bool = False,
+    now: datetime | None = None,
+    messages_dir: Path | None = None,
+    fleet_dir: Path | None = None,
+    ledger_records: list[dict] | None = None,
+) -> dict:
+    """Return measured durable controller state for human and console consumers."""
+    measured_now = now or datetime.now(timezone.utc)
+    unread, unread_error = _addressed_unread_counts(
+        project_root,
+        messages_dir=messages_dir,
+        fleet_dir=fleet_dir,
+    )
+    owned, owned_error = _nonterminal_owned_dispatches(
+        project_root,
+        records=ledger_records,
+    )
+    controllers = []
+    for record in _registered_controller_records(project_root, include_retired=include_retired):
+        label = str(record.get("label") or "")
+        idle_s = _heartbeat_age_s(record, now=measured_now)
+        incarnation_state, pid_live = _incarnation_state(record)
+        live = live_session(project_root, label=label)
+        conflicting_beacons = (
+            int(live.get("conflicting_beacons") or 0)
+            if isinstance(live, dict)
+            else 0
+        )
+        heartbeat_clock_state = (
+            "future-skew"
+            if idle_s is not None and idle_s < -CONTROLLER_HEARTBEAT_MAX_FUTURE_S
+            else "trusted"
+        )
+        controllers.append(
+            {
+                "label": label,
+                "last_heartbeat_at": record.get("heartbeat_at"),
+                "idle_seconds": round(idle_s, 3) if idle_s is not None else None,
+                "idle": _format_idle_duration(idle_s),
+                "heartbeat_clock_state": heartbeat_clock_state,
+                "incarnation_state": incarnation_state,
+                "conflicting_beacons": conflicting_beacons,
+                "pid": record.get("pid") if isinstance(record.get("pid"), int) else None,
+                "pid_live": pid_live,
+                "session_id": record.get("id"),
+                "unread_addressed_mail": unread.get(label, 0) if unread is not None else None,
+                "nonterminal_owned_dispatches": len(owned.get(label, [])) if owned is not None else None,
+                "retired": bool(record.get("retired_at")),
+                "retired_at": record.get("retired_at"),
+            }
+        )
+    return {
+        "schema": "goalflight.controller-roster.v1",
+        "generated_at": measured_now.astimezone(timezone.utc).isoformat(),
+        "heartbeat_recency_seconds": CONTROLLER_HEARTBEAT_RECENCY_S,
+        "measurements": {
+            "unread_addressed_mail": {"measured": unread is not None, "error": unread_error},
+            "nonterminal_owned_dispatches": {"measured": owned is not None, "error": owned_error},
+        },
+        "controllers": controllers,
+    }
+
+
+def controller_roster_lines(roster: dict) -> list[str]:
+    lines = []
+    for record in roster.get("controllers") or []:
+        unread = record.get("unread_addressed_mail")
+        owned = record.get("nonterminal_owned_dispatches")
+        label = "".join(
+            char if char.isprintable() and char not in "\r\n" else "?"
+            for char in str(record.get("label") or "")
+        )
+        conflict = int(record.get("conflicting_beacons") or 0)
+        state = str(record.get("incarnation_state") or "unknown")
+        if conflict > 1:
+            state = f"{state}, conflict {conflict}"
+        lines.append(
+            f"{label} | {record.get('idle')} | "
+            f"{state} | "
+            f"unread {unread if unread is not None else 'unknown'} | "
+            f"owned {owned if owned is not None else 'unknown'}"
+        )
+    return lines
+
+
+def retire_controller(
+    project_root: Path,
+    name: str,
+    *,
+    pid: int | None = None,
+    session_id: str | None = None,
+    process_identity: dict | None = None,
+    acknowledge: bool = False,
+    messages_dir: Path | None = None,
+    fleet_dir: Path | None = None,
+    ledger_records: list[dict] | None = None,
+) -> dict:
+    """Crash-order digest -> registry -> cursor for an authenticated incumbent."""
+    label = _normalize_controller_label(name)
+    if label is None:
+        return {"retired": False, "reason": "missing_controller_label"}
+    path = _session_file(project_root)
+    if not path.exists():
+        return {"retired": False, "reason": "controller_not_registered"}
+    with _file_lock(path):
+        data = _read_session_map(path)
+        registry = _registry_record(data, label)
+        if registry is None:
+            return {"retired": False, "reason": "controller_not_registered"}
+
+        registry_session_id = str(registry.get("id") or "")
+        registry_pid = registry.get("pid") if isinstance(registry.get("pid"), int) else None
+        resolved_session_id = str(session_id or "").strip() or None
+        actual_identity: dict | None = None
+        if registry_pid is not None:
+            measured_identity = _controller_process_identity(registry_pid)
+            if (
+                pid != registry_pid
+                or measured_identity is None
+                or not _same_controller_process(registry, measured_identity)
+                or (process_identity is not None and process_identity != measured_identity)
+                or (resolved_session_id is not None and resolved_session_id != registry_session_id)
+            ):
+                return {
+                    "retired": False,
+                    "reason": "retirer_not_incumbent",
+                    "message": "join the controller name before retiring it",
+                }
+            actual_identity = measured_identity
+            resolved_session_id = registry_session_id
+        elif resolved_session_id != registry_session_id:
+            return {
+                "retired": False,
+                "reason": "retirer_not_incumbent",
+                "message": (
+                    "heartbeat-only retirement requires the session id returned by join"
+                ),
+            }
+        else:
+            # Heartbeat-only retirement authenticates by session id alone. A
+            # declared PID is not identity evidence in this branch: it must
+            # neither exempt a same-label beacon from the acknowledgement gate
+            # nor enter the audit as an unmeasured claim.
+            pid = None
+
+        try:
+            import goalflight_messages as messages  # type: ignore
+
+            resolved_messages_dir = messages_dir or messages.default_messages_dir()
+            resolved_fleet_dir = fleet_dir if fleet_dir is not None else messages.default_fleet_dir()
+            controller_project_root = messages.controller_address_project_root(project_root)
+        except Exception as exc:
+            return {
+                "retired": False,
+                "reason": "retirement_digest_failed",
+                "error_type": type(exc).__name__,
+            }
+
+        if registry.get("retired_at"):
+            cursor_finalized = False
+            cursor_error = None
+            digest_path = registry.get("retirement_digest")
+            if digest_path:
+                try:
+                    messages.finalize_controller_retirement_mailbox(
+                        messages_dir=resolved_messages_dir,
+                        digest_path=str(digest_path),
+                    )
+                    cursor_finalized = True
+                except Exception as exc:
+                    cursor_error = type(exc).__name__
+            return {
+                "retired": True,
+                "already_retired": True,
+                "retired_at": registry.get("retired_at"),
+                "digest": digest_path,
+                "cursor_finalized": cursor_finalized,
+                "cursor_error": cursor_error,
+            }
+        live_incarnations = []
+        for beacon in _legacy_label_records(data, label):
+            beacon_pid = beacon.get("pid")
+            if not isinstance(beacon_pid, int):
+                continue
+            state, pid_live = _incarnation_state(beacon)
+            if pid_live is False:
+                continue
+            if pid is not None and beacon_pid == pid and _same_controller_process(
+                beacon,
+                _controller_process_identity(pid),
+            ):
+                continue
+            live_incarnations.append(
+                {
+                    "session_id": beacon.get("id"),
+                    "pid": beacon_pid,
+                    "state": state,
+                }
+            )
+        owned, owned_error = _nonterminal_owned_dispatches(
+            project_root,
+            records=ledger_records,
+        )
+        owned_dispatches = owned.get(label, []) if owned is not None else []
+        active_dispatch_resolution = registry.get("active_dispatch_resolution")
+        if isinstance(active_dispatch_resolution, dict):
+            dispatch_pid = active_dispatch_resolution.get("dispatcher_pid")
+            expected = active_dispatch_resolution.get("process_identity")
+            measured = (
+                _controller_process_identity(dispatch_pid)
+                if isinstance(dispatch_pid, int)
+                else None
+            )
+            if not (
+                isinstance(expected, dict)
+                and measured is not None
+                and expected == measured
+            ):
+                active_dispatch_resolution = None
+        else:
+            active_dispatch_resolution = None
+        requires_ack = bool(
+            live_incarnations
+            or owned_dispatches
+            or owned_error
+            or active_dispatch_resolution
+        )
+        if requires_ack and not acknowledge:
+            return {
+                "retired": False,
+                "reason": "retirement_requires_acknowledgement",
+                "acknowledgement_flag": "--acknowledge-retirement",
+                "live_incarnations": live_incarnations,
+                "nonterminal_owned_dispatches": owned_dispatches,
+                "owned_dispatch_measurement_error": owned_error,
+                "active_dispatch_resolution": active_dispatch_resolution,
+            }
+        retired_at = _now_iso()
+        retired_by = {
+            "controller_label": label,
+            "session_id": resolved_session_id,
+            "pid": pid,
+            "process_identity": actual_identity,
+            "hostname": socket.gethostname(),
+        }
+        try:
+            digest_result = messages.retire_controller_mailbox(
+                messages_dir=resolved_messages_dir,
+                fleet_dir=resolved_fleet_dir,
+                controller_label=label,
+                controller_project_root=controller_project_root,
+                controller_session_id=registry_session_id,
+                retired_at=retired_at,
+                retired_by=retired_by,
+            )
+        except Exception as exc:
+            return {
+                "retired": False,
+                "reason": "retirement_digest_failed",
+                "error_type": type(exc).__name__,
+            }
+        retired_at = str(digest_result.get("retired_at") or retired_at)
+        registry = dict(registry)
+        registry["retired_at"] = retired_at
+        registry["retired_by"] = retired_by
+        registry["retirement_digest"] = digest_result.get("digest")
+        data[_controller_registry_key(label)] = registry
+        try:
+            _write_session_map(path, data)
+        except Exception as exc:
+            return {
+                "retired": False,
+                "reason": "retirement_registry_write_failed",
+                "error_type": type(exc).__name__,
+                "digest": digest_result.get("digest"),
+                "correspondence_retained": True,
+                "recovery": "registry remains active; retry retirement",
+            }
+        cursor_finalized = False
+        cursor_error = None
+        try:
+            messages.finalize_controller_retirement_mailbox(
+                messages_dir=resolved_messages_dir,
+                digest_path=str(digest_result.get("digest") or ""),
+            )
+            cursor_finalized = True
+        except Exception as exc:
+            cursor_error = type(exc).__name__
+    return {
+        "retired": True,
+        "label": label,
+        "retired_at": retired_at,
+        "retired_by": retired_by,
+        "digest": digest_result.get("digest"),
+        "digested_envelopes": digest_result.get("envelope_count"),
+        "correspondence_retained": True,
+        "acknowledged": requires_ack,
+        "cursor_finalized": cursor_finalized,
+        "cursor_error": cursor_error,
+    }
 
 
 def release_session(project_root: Path, *, pid: int) -> bool:
@@ -1204,9 +2294,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="goal-flight session status helper")
     parser.add_argument("--project-root", default=_default_project_root())
     parser.add_argument("--ttl-days", type=int, default=7)
+    output = parser.add_mutually_exclusive_group()
+    output.add_argument("--json", action="store_true")
+    output.add_argument("--text", action="store_true")
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--json", action="store_true")
-    mode.add_argument("--text", action="store_true")
     mode.add_argument("--ensure-session", action="store_true")
     mode.add_argument("--claim", action="store_true")
     mode.add_argument("--release", action="store_true")
@@ -1235,13 +2326,102 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="drop a beacon slot (--session-pid, default: this process)",
     )
+    mode.add_argument(
+        "--list-controllers",
+        action="store_true",
+        help="print the durable controller roster; combine with --json for machine output",
+    )
+    mode.add_argument("--join", metavar="NAME", help="join an existing durable controller name")
+    mode.add_argument("--register", metavar="NAME", help="register a new durable controller name")
+    mode.add_argument("--retire", metavar="NAME", help="digest mail and retire a controller name")
     parser.add_argument("--session-pid", type=int)
     parser.add_argument("--session-label")
+    parser.add_argument(
+        "--controller-session-id",
+        help=(
+            "incarnation id returned by register/join; default: "
+            "GOALFLIGHT_CONTROLLER_SESSION_ID"
+        ),
+    )
+    parser.add_argument(
+        "--controller-pid-from-ancestry",
+        action="store_true",
+        help=(
+            "with --controller-startup or --claim-session, claim the measured durable host session "
+            "leader instead of requiring a declared PID"
+        ),
+    )
     parser.add_argument("--queue")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--reason", default="user-exit")
+    parser.add_argument("--include-retired", action="store_true")
+    parser.add_argument("--acknowledge-controller-conflict", action="store_true")
+    parser.add_argument("--acknowledge-retirement", action="store_true")
     args = parser.parse_args(argv)
     project_root = Path(args.project_root).resolve()
+
+    if args.list_controllers:
+        roster = controller_roster(project_root, include_retired=args.include_retired)
+        if args.json:
+            print(json.dumps(roster, indent=2, sort_keys=True))
+        else:
+            lines = controller_roster_lines(roster)
+            print("\n".join(lines) if lines else "no known controllers")
+        return 0
+
+    if args.register or args.join or args.retire:
+        resolution, pid_error = _resolve_optional_incarnation(
+            args.session_pid,
+            pid_from_ancestry=args.controller_pid_from_ancestry,
+        )
+        if pid_error is not None:
+            action = "registered" if args.register else "joined" if args.join else "retired"
+            print(json.dumps({action: False, **pid_error}, sort_keys=True))
+            return 2
+        resolved_pid = int(resolution["pid"]) if resolution else None
+        process_identity = resolution.get("process_identity") if resolution else None
+        resolved_session_id = resolve_controller_session_id(args.controller_session_id)
+        if args.register:
+            result = register_controller(
+                project_root,
+                args.register,
+                pid=resolved_pid,
+                session_id=resolved_session_id,
+                process_identity=process_identity,
+            )
+            if resolution and resolution.get("warning"):
+                result.setdefault("warnings", []).append(resolution["warning"])
+            if result.get("registered"):
+                _index_controller_project(project_root)
+            print(json.dumps(result, sort_keys=True))
+            return 0 if result.get("registered") else 2
+        if args.join:
+            result = join_controller(
+                project_root,
+                args.join,
+                pid=resolved_pid,
+                session_id=resolved_session_id,
+                acknowledge_conflict=args.acknowledge_controller_conflict,
+                process_identity=process_identity,
+            )
+            if resolution and resolution.get("warning"):
+                result.setdefault("warnings", []).append(resolution["warning"])
+            if result.get("joined"):
+                _index_controller_project(project_root)
+            print(json.dumps(result, sort_keys=True))
+            return 0 if result.get("joined") else 2
+        result = retire_controller(
+            project_root,
+            args.retire,
+            pid=resolved_pid,
+            session_id=resolved_session_id,
+            process_identity=process_identity,
+            acknowledge=args.acknowledge_retirement,
+        )
+        if resolution and resolution.get("warning"):
+            result.setdefault("warnings", []).append(resolution["warning"])
+        print(json.dumps(result, sort_keys=True))
+        return 0 if result.get("retired") else 2
 
     if args.ensure_session:
         record = ensure_session(project_root)
@@ -1249,12 +2429,40 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.claim_session:
-        record = claim_session(
-            project_root,
-            pid=args.session_pid or os.getpid(),
-            label=args.session_label,
+        resolution, pid_error = _resolve_optional_incarnation(
+            args.session_pid,
+            pid_from_ancestry=args.controller_pid_from_ancestry,
+            default_to_current=True,
         )
-        print(json.dumps(record))
+        if pid_error is not None or resolution is None:
+            print(json.dumps({"claimed": False, **(pid_error or {"reason": "missing_controller_pid"})}))
+            return 0
+        try:
+            record = claim_session(
+                project_root,
+                pid=int(resolution["pid"]),
+                label=(
+                    args.session_label
+                    or resolve_controller_label(project_root=project_root, environ=os.environ)
+                ),
+                process_identity=resolution.get("process_identity"),
+            )
+        except Exception as exc:
+            print(
+                json.dumps(
+                    {
+                        "claimed": False,
+                        "reason": "claim_failed",
+                        "error_type": type(exc).__name__,
+                    }
+                )
+            )
+            return 0
+        _index_controller_project(project_root)
+        payload = dict(record)
+        if resolution.get("warning"):
+            payload["warnings"] = [resolution["warning"]]
+        print(json.dumps(payload))
         return 0
 
     if args.controller_startup:
@@ -1262,7 +2470,10 @@ def main(argv: list[str] | None = None) -> int:
             project_root,
             pid=args.session_pid,
             label=args.session_label,
+            pid_from_ancestry=args.controller_pid_from_ancestry,
         )
+        if result.get("claimed"):
+            _index_controller_project(project_root)
         print(json.dumps(result))
         return 0
 

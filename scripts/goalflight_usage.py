@@ -14,6 +14,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+import goalflight_dispatch_states
+import goalflight_ledger
+import goalflight_rate_pressure
+
 
 DEFAULT_TIMEOUT_S = 20.0
 # --deep opens a real TUI per Claude account. A measured three-account sweep runs
@@ -61,6 +65,7 @@ READERS = (
 )
 
 ROW_KEYS = ("provider", "account", "remaining", "reset_at", "flags")
+REPORT_ROW_KEYS = ROW_KEYS + ("evidence",)
 AUTH_MARKERS = (
     "auth",
     "credential",
@@ -562,11 +567,17 @@ def normalize_payload(
         return [unavailable_row(spec.provider)]
 
     normalizer = NORMALIZERS[spec.key]
-    rows = [
-        normalizer(record, current_time)
-        for record in records
-        if isinstance(record, Mapping)
-    ]
+    rows = []
+    for record in records:
+        if not isinstance(record, Mapping):
+            continue
+        row = normalizer(record, current_time)
+        for key in ("probed_at", "measured_at", "checked_at", "updated_at"):
+            observed_at = parse_reset(record.get(key))
+            if observed_at is not None:
+                row["_probed_at"] = observed_at
+                break
+        rows.append(row)
     return rows or [unavailable_row(spec.provider)]
 
 
@@ -614,20 +625,194 @@ def collect_usage(
     reader_specs: Sequence[ReaderSpec] = READERS,
     now: float | None = None,
     deep: bool = False,
+    ledger_records: Sequence[Mapping[str, object]] | None = None,
 ) -> list[dict[str, object]]:
     current_time = time.time() if now is None else now
     rows = []
     for spec in reader_specs:
-        rows.extend(
-            run_reader(
+        spec_rows = run_reader(
                 spec,
                 readers_dir=readers_dir,
                 timeout_s=timeout_s,
                 now=current_time,
                 deep=deep,
             )
+        for row in spec_rows:
+            probed_at = parse_reset(row.pop("_probed_at", None))
+            if probed_at is None:
+                probed_at = current_time
+            row["evidence"] = {
+                "probe": {
+                    "source": "quota_probe",
+                    "state": _probe_state(row),
+                    "observed_at": probed_at,
+                },
+                "dispatch": None,
+                "conflict": False,
+            }
+            rows.append(row)
+    if ledger_records is None:
+        try:
+            ledger_records = goalflight_ledger.read_records()
+        except (OSError, ValueError):
+            ledger_records = []
+    return overlay_dispatch_evidence(rows, ledger_records)
+
+
+def _probe_state(row: Mapping[str, object]) -> str:
+    flags = set(row.get("flags") or []) if isinstance(row.get("flags"), list) else set()
+    if "walled" in flags:
+        return "walled"
+    if "auth-broken" in flags:
+        return "auth_broken"
+    if "timeout" in flags:
+        return "timed_out"
+    if "unavailable" in flags:
+        return "unavailable"
+    return "reported"
+
+
+def _record_account(record: Mapping[str, object]) -> str | None:
+    for key in ("effective_account", "account"):
+        value = _label(record.get(key))
+        if value and value != "default":
+            return value
+    return None
+
+
+def _record_provider(record: Mapping[str, object]) -> str | None:
+    provider = goalflight_rate_pressure.provider_for(str(record.get("agent") or ""))
+    return {
+        "openai": "codex",
+        "xai": "grok",
+        "moonshot": "kimi-code",
+        "cursor": "cursor",
+        "anthropic-session": "claude",
+        "anthropic-cli-acp": "claude",
+        "anthropic-api": "claude",
+    }.get(str(provider or ""))
+
+
+def _record_observed_at(record: Mapping[str, object]) -> float | None:
+    for key in ("ended_at", "updated_at", "started_at"):
+        parsed = parse_reset(record.get(key))
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _record_evidence_value(record: Mapping[str, object], key: str) -> object:
+    for source in (
+        record,
+        record.get("reason"),
+        record.get("error"),
+        record.get("outcome"),
+    ):
+        if isinstance(source, Mapping) and source.get(key) not in (None, ""):
+            return source.get(key)
+    return None
+
+
+def _dispatch_outcome(record: Mapping[str, object]) -> dict[str, object] | None:
+    state = str(record.get("state") or record.get("terminal_state") or "")
+    observed_at = _record_observed_at(record)
+    if state in goalflight_dispatch_states.SUCCESS_TERMINAL_RECORD_STATES:
+        return {
+            "source": "dispatch",
+            "state": "served",
+            "observed_at": observed_at,
+            "reset_at": None,
+            "retry_after": None,
+            "dispatch_id": record.get("dispatch_id"),
+        }
+    kind = goalflight_dispatch_states.limit_kind_for_record(record)
+    if kind is None:
+        return None
+    return {
+        "source": "dispatch",
+        "state": goalflight_dispatch_states.limit_state_for_kind(kind),
+        "limit_kind": kind,
+        "observed_at": observed_at,
+        "reset_at": _record_evidence_value(record, "reset_at"),
+        "retry_after": _record_evidence_value(record, "retry_after"),
+        "dispatch_id": record.get("dispatch_id"),
+    }
+
+
+def _evidence_conflicts(
+    probe: Mapping[str, object],
+    dispatch: Mapping[str, object],
+) -> bool:
+    """True only when the two sources disagree about the PRESENT.
+
+    A conflict requires (a) incompatible claims and (b) the dispatch evidence
+    being newer than the probe observation. A seat that served at 14:29 and
+    was probed walled at 16:36 is not a conflict — time alone explains it
+    (it walled in between), and shouting there teaches the operator to ignore
+    the banner. When either timestamp is unmeasured the ordering cannot be
+    proven coherent, so the disagreement stays loud.
+    """
+    probe_state = probe.get("state")
+    dispatch_state = dispatch.get("state")
+    disagree = False
+    if probe_state == "walled":
+        disagree = dispatch_state in {
+            "served",
+            goalflight_dispatch_states.TRANSIENT_THROTTLE_STATE,
+        }
+    elif probe_state == "reported":
+        disagree = dispatch_state == goalflight_dispatch_states.QUOTA_EXHAUSTED_STATE
+    if not disagree:
+        return False
+    probed_at = parse_reset(probe.get("observed_at"))
+    dispatched_at = parse_reset(dispatch.get("observed_at"))
+    if probed_at is not None and dispatched_at is not None:
+        return dispatched_at > probed_at
+    return True
+
+
+def overlay_dispatch_evidence(
+    rows: Sequence[dict[str, object]],
+    records: Sequence[Mapping[str, object]],
+) -> list[dict[str, object]]:
+    latest: dict[tuple[str, str], dict[str, object]] = {}
+    for record in records:
+        provider = _record_provider(record)
+        account = _record_account(record)
+        outcome = _dispatch_outcome(record)
+        if not provider or not account or not outcome:
+            continue
+        key = (provider, account)
+        existing = latest.get(key)
+        observed = parse_reset(outcome.get("observed_at")) or float("-inf")
+        existing_observed = (
+            parse_reset(existing.get("observed_at")) if existing else None
         )
-    return rows
+        if existing is None or observed >= (existing_observed or float("-inf")):
+            latest[key] = outcome
+
+    out: list[dict[str, object]] = []
+    for original in rows:
+        row = dict(original)
+        evidence = row.get("evidence")
+        if not isinstance(evidence, dict):
+            evidence = {
+                "probe": {
+                    "source": "quota_probe",
+                    "state": _probe_state(row),
+                    "observed_at": None,
+                },
+                "dispatch": None,
+                "conflict": False,
+            }
+        account = _label(row.get("account"))
+        dispatch = latest.get((str(row.get("provider") or ""), account or ""))
+        evidence["dispatch"] = dispatch
+        probe = evidence.get("probe") if isinstance(evidence.get("probe"), Mapping) else {}
+        evidence["conflict"] = bool(dispatch and _evidence_conflicts(probe, dispatch))
+        row["evidence"] = evidence
+        out.append(row)
+    return out
 
 
 def humanize_delta(seconds: float) -> str:
@@ -654,6 +839,40 @@ def _provider_account(row: Mapping[str, object]) -> str:
     return f"{provider} {account}" if account else provider
 
 
+def _observed_text(value: object, *, now: float) -> str:
+    observed_at = parse_reset(value)
+    if observed_at is None:
+        return "unknown time"
+    local = datetime.fromtimestamp(observed_at).astimezone().strftime("%b %d %H:%M")
+    return f"{local}, age {humanize_delta(now - observed_at)}"
+
+
+def _evidence_text(row: Mapping[str, object], *, now: float) -> str:
+    evidence = row.get("evidence") if isinstance(row.get("evidence"), Mapping) else {}
+    probe = evidence.get("probe") if isinstance(evidence.get("probe"), Mapping) else {}
+    probe_state = probe.get("state") or _probe_state(row)
+    parts = [
+        f"probe: {probe_state} (as of {_observed_text(probe.get('observed_at'), now=now)})"
+    ]
+    dispatch = evidence.get("dispatch") if isinstance(evidence.get("dispatch"), Mapping) else None
+    if dispatch:
+        dispatch_text = (
+            f"dispatch: {dispatch.get('state') or 'unknown'} "
+            f"(as of {_observed_text(dispatch.get('observed_at'), now=now)})"
+        )
+        reset_at = parse_reset(dispatch.get("reset_at"))
+        if reset_at is not None:
+            dispatch_text += f", reset {_local_reset(reset_at)}"
+        retry_after = _number(dispatch.get("retry_after"))
+        if retry_after is not None:
+            dispatch_text += f", retry-after {humanize_delta(retry_after)}"
+        parts.append(dispatch_text)
+    else:
+        parts.append("dispatch: none")
+    prefix = "⚠CONFLICT — " if evidence.get("conflict") is True else ""
+    return prefix + "; ".join(parts)
+
+
 def soonest_reset(
     rows: Sequence[Mapping[str, object]],
     *,
@@ -674,7 +893,12 @@ def render_table(
     now: float | None = None,
 ) -> str:
     current_time = time.time() if now is None else now
-    headers = ("PROVIDER/ACCOUNT", "REMAINING", "RESETS (local HH:MM)")
+    headers = (
+        "PROVIDER/ACCOUNT",
+        "PROBE READING",
+        "RESETS (local HH:MM)",
+        "EVIDENCE",
+    )
     display_rows = []
     for row in rows:
         flags = row.get("flags")
@@ -689,7 +913,14 @@ def render_table(
         if reset_at is not None:
             local = _local_reset(reset_at)
             reset_text = f"{local}  ({humanize_delta(reset_at - current_time)})"
-        display_rows.append((_provider_account(row), remaining, reset_text))
+        display_rows.append(
+            (
+                _provider_account(row),
+                remaining,
+                reset_text,
+                _evidence_text(row, now=current_time),
+            )
+        )
 
     widths = [
         max([len(headers[index]), *(len(row[index]) for row in display_rows)])

@@ -22,7 +22,6 @@ DEFAULT_STATE_DIR = goalflight_compat.resolve_state_dir()
 TERMINAL_DONE = dispatch_states.SUCCESS_TERMINAL_RECORD_STATES
 TERMINAL_FAILED = dispatch_states.FAILURE_TERMINAL_RECORD_STATES
 WEDGED_STATES = dispatch_states.WEDGED_TERMINAL_RECORD_STATES
-RETRYABLE_FAILED = frozenset({"rate_limited"})
 
 
 def parse_time(value: Any) -> dt.datetime | None:
@@ -160,10 +159,23 @@ def state_in(value: str | None, states: set[str] | frozenset[str]) -> bool:
     return bool(value and (value in states or canonical_state(value) in states))
 
 
+def limit_retry_policy(
+    record: dict[str, Any] | None,
+    status: dict[str, Any] | None,
+    *,
+    now: float | None = None,
+) -> dict[str, object] | None:
+    combined: dict[str, object] = {}
+    for source in (record, status):
+        if isinstance(source, dict):
+            combined.update({key: value for key, value in source.items() if value is not None})
+    current = dt.datetime.now(dt.timezone.utc).timestamp() if now is None else now
+    return dispatch_states.retry_policy_for_record(combined, now=current)
+
+
 def retryable_failure_present(record: dict[str, Any] | None, status: dict[str, Any] | None) -> bool:
-    status_state = str(status.get("state")) if status and status.get("state") else None
-    record_state = str(record.get("state")) if record and record.get("state") else None
-    return state_in(status_state, RETRYABLE_FAILED) or state_in(record_state, RETRYABLE_FAILED)
+    policy = limit_retry_policy(record, status)
+    return bool(policy and policy.get("eligible") is not False)
 
 
 def runtime_record(
@@ -263,7 +275,14 @@ def choose_record(slug: str, records: list[dict[str, Any]], leases: list[dict[st
     return record, lease
 
 
-def decision_hint(state: str, worker_live: bool, mins: int | None, *, retryable: bool = False) -> str:
+def decision_hint(
+    state: str,
+    worker_live: bool,
+    mins: int | None,
+    *,
+    retryable: bool = False,
+    retry_policy: dict[str, object] | None = None,
+) -> str:
     if state == "complete":
         return "done"
     if state == "missing":
@@ -271,6 +290,16 @@ def decision_hint(state: str, worker_live: bool, mins: int | None, *, retryable:
     if state == "wedged":
         return "takeover"
     if state == "failed":
+        if retry_policy:
+            mode = retry_policy.get("mode")
+            if mode == "retry_after_reset":
+                return "retry_now" if retry_policy.get("eligible") else "hold_until_reset"
+            if mode == "hold_reset_unknown":
+                return "hold_reset_unknown"
+            if mode == "retry_soon":
+                return "retry_soon" if retry_policy.get("eligible") else "hold_until_retry_after"
+            if mode == "legacy_cooldown":
+                return "cooldown_retry"
         if retryable:
             return "cooldown_retry"
         return "investigate"
@@ -292,7 +321,8 @@ def summarize(slug: str, state_dir: Path) -> dict[str, Any]:
     worker_pid = (reconciled or {}).get("worker_pid") or (status or {}).get("worker_pid") or (record or {}).get("worker_pid") or (lease or {}).get("worker_pid")
     worker_live = worker_alive_at_read_time(reconciled or merged)
     state = normalize_state(reconciled or record, status, lease, worker_live=worker_live)
-    retryable = retryable_failure_present(reconciled or record, status)
+    retry_policy = limit_retry_policy(reconciled or record, status)
+    retryable = bool(retry_policy and retry_policy.get("eligible") is not False)
     mins = age_mins(latest_timestamp(record, status, lease))
     log_path = (reconciled or {}).get("tail_path") or (status or {}).get("tail_path") or (record or {}).get("stdout_path") or (record or {}).get("stderr_path")
     dispatch_id = (reconciled or {}).get("dispatch_id") or (record or {}).get("dispatch_id") or (lease or {}).get("dispatch_id")
@@ -306,7 +336,15 @@ def summarize(slug: str, state_dir: Path) -> dict[str, Any]:
         "log_path": str(log_path) if log_path else None,
         "last_marker": marker,
         "mins_since_last_event": mins,
-        "decision_hint": decision_hint(state, worker_live, mins, retryable=retryable),
+        "limit_kind": retry_policy.get("kind") if retry_policy else None,
+        "not_retryable_before": retry_policy.get("not_before") if retry_policy else None,
+        "decision_hint": decision_hint(
+            state,
+            worker_live,
+            mins,
+            retryable=retryable,
+            retry_policy=retry_policy,
+        ),
     }
 
 
@@ -316,6 +354,8 @@ def text_summary(payload: dict[str, Any]) -> str:
         f"dispatch={payload['dispatch_id'] or 'null'} "
         f"marker={payload['last_marker'] or 'null'} "
         f"age={payload['mins_since_last_event'] if payload['mins_since_last_event'] is not None else 'null'}m "
+        f"limit={payload.get('limit_kind') or 'null'} "
+        f"not-before={payload.get('not_retryable_before') or 'null'} "
         f"hint={payload['decision_hint']}"
     )
 

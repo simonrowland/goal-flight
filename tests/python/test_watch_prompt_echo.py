@@ -746,12 +746,13 @@ def case_dead_pid_usage_limit_without_success_marker_reclassifies() -> None:
     rc, _elapsed, term, payload = _run_dead_worker_tail(
         "You've hit your usage limit. Please try again at 6:13 AM.\n"
     )
-    assert rc == 1, f"rate limit must be retryable, got rc={rc} ({payload})"
-    assert payload.get("state") == "rate_limited", payload
-    assert payload.get("liveness_state") == "rate_limited", payload
+    assert rc == 1, f"quota exhaustion must stop, got rc={rc} ({payload})"
+    assert payload.get("state") == "quota_exhausted", payload
+    assert payload.get("liveness_state") == "quota_exhausted", payload
     reason = payload.get("reason")
     assert isinstance(reason, dict), payload
-    assert reason.get("message") == "dispatch_worker_rate_limited", reason
+    assert reason.get("message") == "dispatch_worker_limit_reached", reason
+    assert reason.get("limit_kind") == "exhausted", reason
     assert reason.get("rate_limit_signature") == "usage limit", reason
     assert reason.get("reason") == "worker_dead_no_terminal_marker", reason
     assert "try again at 6:13 AM" in reason.get("tail_excerpt", ""), reason
@@ -768,11 +769,12 @@ def case_b054_real_evidence_marker_vocab_bullet_reclassifies_rate_limited() -> N
 
     rc, _elapsed, term, payload = _run_dead_worker_tail(B054_FALSE_COMPLETE_SANITIZED_TAIL)
     assert rc == 1, f"b-054 specimen must not complete, got rc={rc} ({payload})"
-    assert payload.get("state") == "rate_limited", payload
-    assert payload.get("liveness_state") == "rate_limited", payload
+    assert payload.get("state") == "transient_throttle", payload
+    assert payload.get("liveness_state") == "transient_throttle", payload
     reason = payload.get("reason")
     assert isinstance(reason, dict), payload
-    assert reason.get("message") == "dispatch_worker_rate_limited", reason
+    assert reason.get("message") == "dispatch_worker_limit_reached", reason
+    assert reason.get("limit_kind") == "transient", reason
     assert reason.get("rate_limit_signature") == "selected model is at capacity", reason
     assert reason.get("reason") == "worker_dead_no_terminal_marker", reason
     assert not term, term
@@ -788,13 +790,14 @@ def case_b054_error_after_reconciled_marker_vetoes_complete() -> None:
         "179,057\n"
     )
     assert rc == 1, f"provider error after candidate marker must veto complete, got rc={rc} ({payload})"
-    assert payload.get("state") == "rate_limited", payload
-    assert payload.get("liveness_state") == "rate_limited", payload
+    assert payload.get("state") == "transient_throttle", payload
+    assert payload.get("liveness_state") == "transient_throttle", payload
     assert term.get("kind") == "COMPLETE", term
     assert term.get("text") == "dashboard fold, tests green", term
     reason = payload.get("reason")
     assert isinstance(reason, dict), payload
-    assert reason.get("message") == "dispatch_worker_rate_limited", reason
+    assert reason.get("message") == "dispatch_worker_limit_reached", reason
+    assert reason.get("limit_kind") == "transient", reason
     assert reason.get("rate_limit_signature") == "selected model is at capacity", reason
     assert reason.get("reason") == "marker:COMPLETE:final_reconciliation", reason
     assert reason.get("vetoed_terminal_marker") == term, reason

@@ -284,6 +284,46 @@ def test_detect_try_again_at_pattern():
     assert_true("try again at pattern", rp.detect_rate_limit_signature(record, status))
 
 
+def test_limit_signature_carries_measured_kind_and_timing_evidence():
+    """Exhausted specimen is verbatim from the 2026-08-05
+    seat-probe-d78343/ctrl-registry tails under /tmp/goal-flight-501/dispatch.
+    The transient specimen uses the standard HTTP 429 + Retry-After carrier;
+    the generic rate-limit line deliberately supplies no distinguishing fact.
+    """
+    exhausted = rp.rate_limit_signature_in_text(
+        "ERROR: You've hit your usage limit. Visit "
+        "https://chatgpt.com/codex/settings/usage to purchase more credits or "
+        "try again at Aug 8th, 2026 1:17 PM."
+    )
+    transient = rp.rate_limit_signature_in_text(
+        "ERROR HTTP 429 Too Many Requests; Retry-After: 45"
+    )
+    unknown = rp.rate_limit_signature_in_text("ERROR provider rate limit reached")
+
+    assert_eq("weekly wall kind", exhausted.get("limit_kind"), "exhausted")
+    assert_eq("weekly wall state", exhausted.get("state"), "quota_exhausted")
+    assert_true("weekly wall reset carried", str(exhausted.get("reset_at")).startswith("2026-08-08T13:17:00"))
+    assert_eq("weekly wall retry absent", exhausted.get("retry_after"), None)
+    assert_eq("429 kind", transient.get("limit_kind"), "transient")
+    assert_eq("429 state", transient.get("state"), "transient_throttle")
+    assert_eq("429 retry-after", transient.get("retry_after"), 45.0)
+    assert_eq("429 reset absent", transient.get("reset_at"), None)
+    assert_eq("ambiguous kind", unknown.get("limit_kind"), "unknown")
+    assert_eq("ambiguous state", unknown.get("state"), "limit_unknown")
+    assert_eq("ambiguous reset absent", unknown.get("reset_at"), None)
+    assert_eq("ambiguous retry absent", unknown.get("retry_after"), None)
+
+
+def test_unknown_signature_with_retry_after_upgrades_to_transient():
+    """A generic rate-limit line cannot distinguish kind on its own; a measured
+    Retry-After is the distinguishing fact, so the pair reads as transient."""
+    evidence = rp.rate_limit_signature_in_text("ERROR provider rate limit; Retry-After: 30")
+
+    assert_eq("unknown+retry-after kind", evidence.get("limit_kind"), "transient")
+    assert_eq("unknown+retry-after state", evidence.get("state"), "transient_throttle")
+    assert_eq("unknown+retry-after seconds", evidence.get("retry_after"), 30.0)
+
+
 # ----- moonshot/kimi signatures (2026-07-20 kimi-worker dogfood) -----
 
 def test_detect_moonshot_kimi_signatures():

@@ -565,15 +565,16 @@ def case_default_background_finalizes_ledger_and_rate_pressure_once() -> None:
 
         rate_path = tmp / "state" / "runs.d" / f"{rate_id}.json"
 
-        def _rate_limited_record() -> dict | None:
+        def _quota_exhausted_record() -> dict | None:
             if not rate_path.exists():
                 return None
             record = json.loads(rate_path.read_text(encoding="utf-8"))
-            return record if record.get("state") == "rate_limited" else None
+            return record if record.get("state") == "quota_exhausted" else None
 
-        rate_record = _wait_for(_rate_limited_record, timeout_s=10.0)
-        assert rate_record["terminal_state"] == "rate_limited", rate_record
-        assert rate_record.get("error", {}).get("message") == "dispatch_worker_rate_limited", rate_record
+        rate_record = _wait_for(_quota_exhausted_record, timeout_s=10.0)
+        assert rate_record["terminal_state"] == "quota_exhausted", rate_record
+        assert rate_record.get("limit_kind") == "exhausted", rate_record
+        assert rate_record.get("error", {}).get("message") == "dispatch_worker_limit_reached", rate_record
         assert "usage limit" in json.dumps(rate_record.get("error"), sort_keys=True).lower(), rate_record
         release = _capacity_release_stale(env)
         assert release["count"] == 1, release

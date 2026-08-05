@@ -16,6 +16,7 @@ from typing import Any
 
 import goalflight_ledger
 import goalflight_rate_pressure
+import goalflight_dispatch_states
 
 
 QUOTA_STUCK_TAIL_BYTES = 8192
@@ -38,18 +39,9 @@ BASH_TAIL_WORKER_COMM_ALLOWLIST = frozenset(
     }
 )
 
-RATE_LIMITED_STATES = frozenset(
-    {
-        "idle_timeout",
-        "inconclusive_timeout",
-        "rate_limited",
-        "running_quiet",
-        "stalled",
-        "watcher_stopped",
-        "wedged",
-        "worker_dead",
-    }
-)
+# Compatibility name used by the reaper. The values themselves live in the
+# dispatch-state authority so a fourth drifted state list cannot emerge here.
+RATE_LIMITED_STATES = goalflight_dispatch_states.LIMIT_RECONCILE_INPUT_STATES
 
 _DRAFT_ARTIFACT_FIELDS = (
     "artifact_path",
@@ -138,22 +130,18 @@ def _quota_error_context(text: str) -> str:
     return "\n".join(lines)
 
 
-def _quota_signature_in_error_context(text: str) -> str | None:
-    status = {"error": text}
-    record = {"state": "worker_dead"}
-    if goalflight_rate_pressure.detect_pressure_scope(record, status) != goalflight_rate_pressure.ACCOUNT_RATE_LIMIT_SCOPE:
+def _quota_signature_in_error_context(
+    text: str,
+) -> goalflight_rate_pressure.LimitEvidence | None:
+    evidence = goalflight_rate_pressure.rate_limit_signature_in_text(text)
+    if evidence is None or evidence.scope != goalflight_rate_pressure.ACCOUNT_RATE_LIMIT_SCOPE:
         return None
-    direct = goalflight_rate_pressure.rate_limit_signature_in_text(text)
-    if direct:
-        return direct
-    lowered = text.lower()
-    for status_code, anchors in goalflight_rate_pressure.RATE_LIMIT_HTTP_STATUS_ANCHORS.items():
-        if any(anchor in lowered for anchor in anchors):
-            return f"http_{status_code}"
-    return None
+    return evidence
 
 
-def quota_signature_in_text(text: str) -> str | None:
+def quota_signature_in_text(
+    text: str,
+) -> goalflight_rate_pressure.LimitEvidence | None:
     context = _quota_error_context(text)
     if not context:
         return None
@@ -165,8 +153,8 @@ def tail_quota_signature(path: Path | str | None) -> dict[str, Any] | None:
         return None
     p = Path(path).expanduser()
     excerpt = tail_excerpt(p)
-    signature = quota_signature_in_text(excerpt)
-    if not signature:
+    evidence = quota_signature_in_text(excerpt)
+    if not evidence:
         return None
     try:
         stat = p.stat()
@@ -174,7 +162,11 @@ def tail_quota_signature(path: Path | str | None) -> dict[str, Any] | None:
     except OSError:
         mtime = None
     return {
-        "signature": signature,
+        "signature": evidence.get("limit_signature"),
+        "limit_kind": evidence.get("limit_kind"),
+        "limit_state": evidence.get("state"),
+        "reset_at": evidence.get("reset_at"),
+        "retry_after": evidence.get("retry_after"),
         "tail_path": str(p),
         "tail_excerpt": excerpt.strip(),
         "tail_mtime": mtime,
@@ -187,6 +179,25 @@ def provider_for_agent(agent: object) -> str | None:
 
 def budget_key_for_agent(agent: object, *, pool_map: dict[str, str] | None = None) -> str | None:
     return goalflight_rate_pressure.budget_key_for_agent(str(agent or "").strip(), pool_map=pool_map)
+
+
+def seat_reset_at(account: object) -> str | None:
+    """Read the probe daemon's output without changing or re-probing it."""
+    if not isinstance(account, str) or not account:
+        return None
+    state_root = Path(
+        os.environ.get("GOALFLIGHT_CODEX_STATE_DIR") or Path.home() / ".goal-flight"
+    ).expanduser()
+    payload = _read_json(state_root / "codex-seat-states.json")
+    seats = payload.get("seats") if isinstance(payload, dict) else None
+    seat = seats.get(account) if isinstance(seats, dict) else None
+    if not isinstance(seat, dict):
+        return None
+    for key in ("reset_at", "cooldown_until"):
+        value = seat.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
 
 
 def _read_json(path: Path | str | None) -> dict | None:
@@ -228,15 +239,43 @@ def _record_haystack(record: dict) -> str:
 
 
 def record_quota_signature(record: dict, *, require_tail: bool = False) -> dict[str, Any] | None:
+    legacy = any(
+        record.get(key) == goalflight_dispatch_states.LEGACY_RATE_LIMITED_STATE
+        for key in ("state", "terminal_state", "classification")
+    )
     tail_info = tail_quota_signature(tail_path_from_record(record))
     if tail_info:
+        if legacy:
+            tail_info.update(
+                {
+                    "limit_kind": goalflight_dispatch_states.LIMIT_KIND_UNKNOWN,
+                    "limit_state": goalflight_dispatch_states.LIMIT_UNKNOWN_STATE,
+                    "reset_at": None,
+                    "retry_after": None,
+                }
+            )
         return {**tail_info, "source": "tail"}
     if require_tail:
         return None
-    signature = quota_signature_in_text(_record_haystack(record))
-    if not signature:
+    evidence = quota_signature_in_text(_record_haystack(record))
+    if not evidence:
         return None
-    return {"signature": signature, "source": "record"}
+    return {
+        "signature": evidence.get("limit_signature"),
+        "limit_kind": (
+            goalflight_dispatch_states.LIMIT_KIND_UNKNOWN
+            if legacy
+            else evidence.get("limit_kind")
+        ),
+        "limit_state": (
+            goalflight_dispatch_states.LIMIT_UNKNOWN_STATE
+            if legacy
+            else evidence.get("state")
+        ),
+        "reset_at": None if legacy else evidence.get("reset_at"),
+        "retry_after": None if legacy else evidence.get("retry_after"),
+        "source": "record",
+    }
 
 
 def quota_limited_reason(
@@ -245,21 +284,49 @@ def quota_limited_reason(
     tail: Path | str | None,
     previous_state: object,
     previous_reason: object,
+    effective_account: object = None,
 ) -> dict[str, Any] | None:
+    # Idempotence guard: a record whose reason already carries a limit
+    # classification must pass through unchanged. The reconcile input set
+    # deliberately includes the refined limit states so a limit_unknown can be
+    # upgraded when the tail says more -- but re-entering with an
+    # ALREADY-refined reason must not wrap it again, which buried the original
+    # previous_reason one level deeper on every pass (observed as
+    # error.previous_reason becoming a nested wrapper instead of the
+    # pre-quota classification string).
     if (
-        previous_state == "rate_limited"
+        goalflight_dispatch_states.is_limit_state(previous_state)
         and isinstance(previous_reason, dict)
-        and previous_reason.get("rate_limit_signature")
+        and (
+            previous_reason.get("rate_limit_signature")
+            or previous_reason.get("limit_signature")
+            or previous_reason.get("limit_state")
+        )
     ):
         return previous_reason
     info = tail_quota_signature(tail)
     if not info:
         return None
     provider = provider_for_agent(agent)
+    reset_at = info.get("reset_at")
+    if (
+        not reset_at
+        and info.get("limit_kind")
+        in {
+            goalflight_dispatch_states.LIMIT_KIND_EXHAUSTED,
+            goalflight_dispatch_states.LIMIT_KIND_UNKNOWN,
+        }
+    ):
+        reset_at = seat_reset_at(effective_account)
     reason: dict[str, Any] = {
-        "message": "dispatch_worker_rate_limited",
+        "message": "dispatch_worker_limit_reached",
         "provider": provider,
         "rate_limit_signature": info["signature"],
+        "limit_signature": info["signature"],
+        "limit_kind": info.get("limit_kind"),
+        "limit_state": info.get("limit_state"),
+        "reset_at": reset_at,
+        "retry_after": info.get("retry_after"),
         "tail_path": info.get("tail_path"),
         "previous_state": previous_state,
         "previous_reason": previous_reason,
@@ -275,20 +342,27 @@ def apply_rate_limited_status(
     tail: Path | str | None,
     previous_state: object,
     previous_reason: object,
+    effective_account: object = None,
 ) -> bool:
     reason = quota_limited_reason(
         agent=agent,
         tail=tail,
         previous_state=previous_state,
         previous_reason=previous_reason,
+        effective_account=effective_account,
     )
     if not reason:
         return False
-    payload["state"] = "rate_limited"
-    payload["terminal_state"] = "rate_limited"
+    limit_state = str(reason.get("limit_state") or goalflight_dispatch_states.LIMIT_UNKNOWN_STATE)
+    payload["state"] = limit_state
+    payload["terminal_state"] = limit_state
     payload["reason"] = reason
     payload["rate_limit_provider"] = reason.get("provider")
     payload["rate_limit_signature"] = reason.get("rate_limit_signature")
+    payload["limit_kind"] = reason.get("limit_kind")
+    payload["limit_signature"] = reason.get("limit_signature")
+    payload["reset_at"] = reason.get("reset_at")
+    payload["retry_after"] = reason.get("retry_after")
     return True
 
 
@@ -363,6 +437,9 @@ def stuck_workers_for_entry(
                 "state": record.get("state"),
                 "classification": record.get("classification"),
                 "signature": info.get("signature"),
+                "limit_kind": info.get("limit_kind"),
+                "reset_at": info.get("reset_at"),
+                "retry_after": info.get("retry_after"),
                 "tail_path": info.get("tail_path"),
                 "tail_mtime": info.get("tail_mtime"),
             }
@@ -407,7 +484,15 @@ def decorate_pressure_payload(
         stuck = stuck_workers_for_entry(entry, records, window_seconds=window_seconds, pool_map=pool_map)
         entry["stuck_worker_count"] = len(stuck)
         entry["stuck_workers"] = stuck
-        if entry.get("scope") != "agent" and stuck:
+        hard_stop = any(
+            item.get("limit_kind")
+            in {
+                goalflight_dispatch_states.LIMIT_KIND_EXHAUSTED,
+                goalflight_dispatch_states.LIMIT_KIND_UNKNOWN,
+            }
+            for item in stuck
+        )
+        if entry.get("scope") != "agent" and hard_stop:
             labels = [str(label) for label in entry.get("labels") or []]
             entry["quota_hard_stop"] = True
             entry["effective_caps"] = {label: 0 for label in labels}
@@ -429,9 +514,19 @@ def advisory_key(entry: dict) -> str:
 def advisory_payload(entry: dict) -> dict[str, Any]:
     provider = entry.get("provider") or entry.get("budget_key") or "unknown"
     count = int(entry.get("stuck_worker_count") or 0)
+    kinds = {
+        item.get("limit_kind")
+        for item in entry.get("stuck_workers") or []
+        if item.get("limit_kind")
+    }
+    condition = (
+        "quota exhausted"
+        if kinds == {goalflight_dispatch_states.LIMIT_KIND_EXHAUSTED}
+        else "provider limit unresolved"
+    )
     text = (
-        f"{provider} quota exhausted: {count} agent(s) stuck "
-        "(will not self-recover) - re-dispatch their tasks; holding new provider dispatch"
+        f"{provider} {condition}: {count} agent(s) stuck "
+        "- re-dispatch their tasks; holding new provider dispatch"
     )
     return {
         "text": text,

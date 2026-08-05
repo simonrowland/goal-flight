@@ -64,6 +64,9 @@ def test_terminal_state_poison_pairs() -> None:
         "blocked_capacity": "failed",
         "inconclusive_no_final": "failed",
         "rate_limited": "failed",
+        "quota_exhausted": "failed",
+        "transient_throttle": "failed",
+        "limit_unknown": "failed",
         "superseded": "failed",
         "orphaned": "failed",
     }
@@ -105,6 +108,9 @@ def test_terminal_state_shared_sets_cover_lease_pruning() -> None:
         "blocked_session_limit",
         "inconclusive_no_final",
         "rate_limited",
+        "quota_exhausted",
+        "transient_throttle",
+        "limit_unknown",
         "orphaned",
         "superseded",
     )
@@ -130,7 +136,15 @@ def test_terminal_state_shared_sets_cover_lease_pruning() -> None:
 
 
 def test_terminal_state_for_preserves_specific_failures() -> None:
-    for state in ("orphaned", "rate_limited", "superseded", "inconclusive_no_final"):
+    for state in (
+        "orphaned",
+        "rate_limited",
+        "quota_exhausted",
+        "transient_throttle",
+        "limit_unknown",
+        "superseded",
+        "inconclusive_no_final",
+    ):
         assert_eq(
             f"{state} terminal_state_for specificity",
             dispatch_states.terminal_state_for(state),
@@ -149,6 +163,9 @@ def test_fleet_reconcile_pre_status_uses_shared_failure_states() -> None:
         "blocked_session_limit",
         "inconclusive_no_final",
         "rate_limited",
+        "quota_exhausted",
+        "transient_throttle",
+        "limit_unknown",
         "orphaned",
         "superseded",
     ):

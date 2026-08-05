@@ -71,6 +71,8 @@ assert "goalflight-watchdog-prompt.md" in ctx
 assert "ARM THE EVENT WAKE FIRST" in ctx
 assert "goalflight_messages.py listen" in ctx
 assert "goalflight_status.py --wait" in ctx
+assert "--controller-pid-from-ancestry" in ctx
+assert "returned `session.pid`" in ctx
 assert "crash-recovery fallback only" in ctx
 assert "`7 * * * *`" in ctx
 assert ctx.index("ARM THE EVENT WAKE FIRST") < ctx.index("CronList")
@@ -347,7 +349,10 @@ def main() -> None:
     context = (
         "An active goal-flight run was detected on this session start. ARM THE EVENT WAKE FIRST "
         "as a background task per `protocols/dispatch-routing.md` and `commands/execute.md`: "
-        "a claimed controller runs `goalflight_messages.py listen --project-root \"$PWD\"`; an "
+        "inside a one-shot agent harness, claim with `goalflight_session_status.py "
+        "--controller-startup --controller-pid-from-ancestry` and carry the returned "
+        "`session.pid` on later ownership commands. "
+        "A claimed controller runs `goalflight_messages.py listen --project-root \"$PWD\"`; an "
         "unclaimed fixed-set controller runs the printed `goalflight_status.py --wait <ids>` "
         "command. Do not block the controller turn on either wait. CONTINUE IN-SKILL: re-invoke "
         "`/goal-flight resume` (this reloads SKILL.md fresh "

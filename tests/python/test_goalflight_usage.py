@@ -14,6 +14,27 @@ sys.path.insert(0, str(REPO_ROOT / "scripts"))
 import goalflight_usage as usage  # noqa: E402
 
 
+@pytest.fixture
+def new_york_tz():
+    """Pin the render-local clock so timestamp assertions are host-independent."""
+    import os
+    import time
+
+    if not hasattr(time, "tzset"):
+        pytest.skip("tzset unavailable on this platform")
+    previous = os.environ.get("TZ")
+    os.environ["TZ"] = "America/New_York"
+    time.tzset()
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = previous
+        time.tzset()
+
+
 def _write_reader(directory: Path, filename: str, body: str) -> None:
     (directory / filename).write_text(body, encoding="utf-8")
 
@@ -334,6 +355,28 @@ def test_missing_reader_degrades_to_one_unavailable_row(tmp_path: Path):
     ]
 
 
+def test_every_report_row_carries_probe_source_and_observation_time(
+    tmp_path: Path,
+):
+    rows = usage.collect_usage(
+        readers_dir=tmp_path,
+        reader_specs=(usage.ReaderSpec("codex", "codex", "missing.py"),),
+        now=1_786_000_000.0,
+        ledger_records=[],
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["evidence"] == {
+        "probe": {
+            "source": "quota_probe",
+            "state": "unavailable",
+            "observed_at": 1_786_000_000.0,
+        },
+        "dispatch": None,
+        "conflict": False,
+    }
+
+
 @pytest.mark.parametrize(
     ("seconds", "expected"),
     [
@@ -402,7 +445,7 @@ def test_json_cli_shape_and_unavailable_exit_zero(tmp_path: Path, capsys):
     # fail this test for the wrong reason.
     assert len(rows) == len(usage.READERS)
     assert rows[0]["remaining"] == "99%"
-    assert all(tuple(row) == usage.ROW_KEYS for row in rows)
+    assert all(tuple(row) == usage.REPORT_ROW_KEYS for row in rows)
     assert [row["provider"] for row in rows[1:]] == [
         spec.provider for spec in usage.READERS if spec.key != "codex"
     ]
@@ -436,6 +479,156 @@ def test_table_renders_health_flags():
     assert "unavailable  ⚠unavailable" in rendered
     assert "needs-login  ⚠auth" in rendered
     assert rendered.endswith("soonest reset: none")
+
+
+def test_probe_wall_and_newer_served_dispatch_render_as_timestamped_conflict(
+    tmp_path: Path,
+    new_york_tz,
+):
+    """Reproduces the 2026-08-05 incident: the seat probe reports every Codex
+    seat walled, while ledger evidence proves cf9f50 served after probed_at.
+    """
+    probed_at = "2026-08-05T18:28:00+00:00"
+    served_at = "2026-08-05T18:29:00+00:00"
+    records = [
+        {
+            "seat": seat,
+            "used_percent": 100.0,
+            "reset_at": None,
+            "probed_at": probed_at,
+            "ok": True,
+        }
+        for seat in ("4c9435", "d78343", "cf9f50", "25ca6b")
+    ]
+    _write_reader(
+        tmp_path,
+        "codex_usage.py",
+        "import json\nprint(json.dumps(" + repr(records) + "))\n",
+    )
+    rows = usage.collect_usage(
+        readers_dir=tmp_path,
+        reader_specs=(usage.ReaderSpec("codex", "codex", "codex_usage.py"),),
+        now=datetime.fromisoformat("2026-08-05T19:00:00+00:00").timestamp(),
+        ledger_records=[
+            {
+                "dispatch_id": "served-after-probe",
+                "agent": "codex",
+                "effective_account": "cf9f50",
+                "state": "complete",
+                "ended_at": served_at,
+            },
+            {
+                "dispatch_id": "wall-at-dispatch",
+                "agent": "codex",
+                "effective_account": "d78343",
+                "state": "quota_exhausted",
+                "limit_kind": "exhausted",
+                "reset_at": "2026-08-08T17:17:00+00:00",
+                "ended_at": "2026-08-05T18:33:00+00:00",
+            },
+            {
+                "dispatch_id": "legacy-wall",
+                "agent": "codex",
+                "effective_account": "4c9435",
+                "state": "rate_limited",
+                "ended_at": "2026-08-05T18:20:00+00:00",
+            },
+        ],
+    )
+    rendered = usage.render_table(
+        rows,
+        now=datetime.fromisoformat("2026-08-05T19:00:00+00:00").timestamp(),
+    )
+    served = next(row for row in rows if row["account"] == "cf9f50")
+    exhausted = next(row for row in rows if row["account"] == "d78343")
+    legacy = next(row for row in rows if row["account"] == "4c9435")
+
+    assert all(tuple(row) == usage.REPORT_ROW_KEYS for row in rows)
+    assert served["remaining"] == "0%"
+    assert served["evidence"]["probe"]["state"] == "walled"
+    assert served["evidence"]["dispatch"]["state"] == "served"
+    assert served["evidence"]["conflict"] is True
+    assert exhausted["evidence"]["dispatch"]["state"] == "quota_exhausted"
+    assert exhausted["evidence"]["dispatch"]["reset_at"] == "2026-08-08T17:17:00+00:00"
+    assert legacy["evidence"]["dispatch"]["state"] == "limit_unknown"
+    assert "⚠CONFLICT" in rendered
+    assert "probe: walled" in rendered
+    assert "dispatch: served" in rendered
+    assert "Aug 05 14:28" in rendered
+    assert "Aug 05 14:29" in rendered
+
+
+def test_stale_served_dispatch_shows_without_false_conflict(
+    tmp_path: Path,
+    new_york_tz,
+):
+    """Live 2026-08-05 shape: seat 25ca6b served at 19:41Z, genuinely walled
+    afterwards, and the 20:35Z probe then measured walled. The probe is the
+    freshest reading, so both are shown with NO conflict banner - time alone
+    explains the difference, and a banner here teaches operators to ignore it.
+    """
+    probed_at = "2026-08-05T20:35:11+00:00"
+    records = [
+        {
+            "seat": "25ca6b",
+            "used_percent": 100.0,
+            "reset_at": None,
+            "probed_at": probed_at,
+            "ok": True,
+        }
+    ]
+    _write_reader(
+        tmp_path,
+        "codex_usage.py",
+        "import json\nprint(json.dumps(" + repr(records) + "))\n",
+    )
+    rows = usage.collect_usage(
+        readers_dir=tmp_path,
+        reader_specs=(usage.ReaderSpec("codex", "codex", "codex_usage.py"),),
+        now=datetime.fromisoformat("2026-08-05T20:36:00+00:00").timestamp(),
+        ledger_records=[
+            {
+                "dispatch_id": "served-before-probe",
+                "agent": "codex",
+                "effective_account": "25ca6b",
+                "state": "complete",
+                "ended_at": "2026-08-05T19:41:31+00:00",
+            },
+        ],
+    )
+    rendered = usage.render_table(
+        rows,
+        now=datetime.fromisoformat("2026-08-05T20:36:00+00:00").timestamp(),
+    )
+
+    seat = rows[0]
+    assert seat["evidence"]["probe"]["state"] == "walled"
+    assert seat["evidence"]["dispatch"]["state"] == "served"
+    assert seat["evidence"]["conflict"] is False
+    assert "⚠CONFLICT" not in rendered
+    # Both readings stay visible with their own timestamps either way.
+    assert "probe: walled" in rendered
+    assert "dispatch: served" in rendered
+
+
+def test_conflict_requires_dispatch_evidence_newer_than_probe():
+    walled = {"state": "walled", "observed_at": 1_787_000_000.0}
+    older_served = {"state": "served", "observed_at": 1_786_999_000.0}
+    newer_served = {"state": "served", "observed_at": 1_787_000_001.0}
+    assert usage._evidence_conflicts(walled, older_served) is False
+    assert usage._evidence_conflicts(walled, newer_served) is True
+    # Unmeasured ordering cannot be proven coherent: stays loud.
+    assert usage._evidence_conflicts({"state": "walled"}, {"state": "served"}) is True
+
+    reported = {"state": "reported", "observed_at": 1_787_000_000.0}
+    newer_exhausted = {"state": "quota_exhausted", "observed_at": 1_787_000_001.0}
+    older_exhausted = {"state": "quota_exhausted", "observed_at": 1_786_999_000.0}
+    assert usage._evidence_conflicts(reported, newer_exhausted) is True
+    assert usage._evidence_conflicts(reported, older_exhausted) is False
+    # Agreement kinds never conflict, in either direction of staleness.
+    assert usage._evidence_conflicts(walled, newer_exhausted) is False
+    unknown = {"state": "limit_unknown", "observed_at": 1_787_000_001.0}
+    assert usage._evidence_conflicts(walled, unknown) is False
 
 
 def test_claude_reader_invoked_with_skip_tui(tmp_path):

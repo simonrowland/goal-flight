@@ -722,7 +722,7 @@ def _quota_limited_state_reason(
     *,
     agent: object,
 ) -> tuple[str | None, object]:
-    if state not in {"idle_timeout", "rate_limited", "worker_dead"}:
+    if state not in goalflight_dispatch_states.LIMIT_RECONCILE_INPUT_STATES:
         return state, reason
     quota_reason = goalflight_quota_stuck.quota_limited_reason(
         agent=agent,
@@ -732,7 +732,13 @@ def _quota_limited_state_reason(
     )
     if not quota_reason:
         return state, reason
-    return "rate_limited", quota_reason
+    # Write the MEASURED kind the reason already carries. Hardcoding the legacy
+    # literal here kept minting new kind-unknown records from a path that had
+    # just classified the kind.
+    return (
+        str(quota_reason.get("limit_state") or goalflight_dispatch_states.LIMIT_UNKNOWN_STATE),
+        quota_reason,
+    )
 
 
 def _is_status_terminal(state: object) -> bool:
@@ -2776,8 +2782,9 @@ def _stamp_controller_session(args, project_root: Path) -> None:
             goalflight_session_status.live_session(
                 project_root,
                 label=requested_label,
+                pid=requested_pid,
             )
-            if requested_label and requested_pid is not None
+            if requested_label
             else None
         )
     except Exception:
@@ -2794,13 +2801,30 @@ def _stamp_controller_session(args, project_root: Path) -> None:
         session_pid = None
     if (
         not session_id
-        or session_pid is None
-        or session_pid != requested_pid
         or not session_label
+        or (requested_pid is not None and session_pid != requested_pid)
+        or (requested_pid is None and session_pid is not None)
     ):
         session_id = None
         session_pid = None
         session_label = None
+    else:
+        try:
+            touched = goalflight_session_status.touch_controller_heartbeat(
+                project_root,
+                str(session_label),
+                session_id=str(session_id),
+                pid=session_pid,
+                dispatching_pid=os.getpid(),
+            )
+            if touched is None:
+                session_id = None
+                session_pid = None
+                session_label = None
+        except Exception:
+            session_id = None
+            session_pid = None
+            session_label = None
 
     args.controller_session_id = str(session_id) if session_id is not None else None
     args._controller_beacon_pid = session_pid
@@ -2815,8 +2839,7 @@ def _controller_pid(args) -> int | None:
 
 def _controller_session_id(args) -> str | None:
     value = getattr(args, "controller_session_id", None)
-    pid = getattr(args, "_controller_beacon_pid", None)
-    return str(value) if value and pid is not None else None
+    return str(value) if value else None
 
 
 def _controller_label(args) -> str | None:
@@ -3447,8 +3470,9 @@ def _canonical_replay_argv(args, raw_argv: list[str], *, tail: Path, status_json
     # live beacon and therefore cannot turn this snapshot into stale ownership.
     controller_label = _controller_label(args)
     controller_beacon_pid = _controller_pid(args)
-    if controller_label is not None and controller_beacon_pid is not None:
+    if controller_label is not None:
         argv += ["--controller-label", controller_label]
+    if controller_beacon_pid is not None:
         argv += ["--controller-beacon-pid", str(controller_beacon_pid)]
     if raw_argv:
         argv += ["--", *raw_argv]
@@ -7538,7 +7562,11 @@ _CODEX_AUTH_FAILURE_RE = re.compile(
 
 def _requeue_failure_kind(record: dict, tail: Path) -> str | None:
     state = str(record.get("state") or record.get("terminal_state") or "")
-    if state == "rate_limited":
+    # Any limit-family state is a quota-style requeue candidate. Matching only
+    # the legacy literal made the measured kinds (quota_exhausted,
+    # transient_throttle, limit_unknown) fall through to the auth-regex scan
+    # and return None, so a limit death was never requeued at all.
+    if goalflight_dispatch_states.is_limit_state(state):
         return "quota"
     if state == "blocked_auth":
         return "auth"
@@ -7743,11 +7771,22 @@ def _maybe_requeue_terminal_claim(
 
     failure_kind = _requeue_failure_kind(record, tail)
     effective_account = record.get("effective_account")
-    not_before = (
-        _effective_account_cooldown(effective_account)
-        if failure_kind == "quota" and isinstance(effective_account, str)
-        else None
-    )
+    not_before = None
+    if failure_kind == "quota":
+        # Prefer the MEASURED retry policy over the blanket account cooldown:
+        # an exhausted record carries its own reset (relaunch AT the reset,
+        # not never and not constantly), a transient one is eligible soon.
+        # A policy of None, or the hold_reset_unknown / legacy modes, mean the
+        # measurement could not decide -- fall back to today's cooldown rather
+        # than inventing eligibility.
+        policy = goalflight_dispatch_states.retry_policy_for_record(record, now=time.time())
+        mode = policy.get("mode") if isinstance(policy, dict) else None
+        if mode == "retry_after_reset":
+            not_before = policy.get("not_before")
+        elif mode == "retry_soon":
+            not_before = policy.get("not_before") or None
+        elif isinstance(effective_account, str):
+            not_before = _effective_account_cooldown(effective_account)
     child = _requeue_child_entry(
         entry,
         child_id=child_id,

@@ -217,18 +217,34 @@ def validate_envelope(envelope: dict, *, path: str = "envelope") -> None:
         label = addressee.get("label")
         if not isinstance(label, str) or not label.strip() or len(label.strip()) > 64:
             raise MessageError(f"{path}.addressee.label: expected 1..64 non-blank characters")
+        project_root = addressee.get("project_root")
+        if (
+            not isinstance(project_root, str)
+            or not project_root.strip()
+            or not Path(project_root).is_absolute()
+        ):
+            raise MessageError(f"{path}.addressee.project_root: expected an absolute path")
         if envelope.get("type") not in CONTROLLER_CHANNEL_TYPES:
             raise MessageError(
                 f"{path}.addressee: controller addressing is only valid for controller-channel types"
             )
 
 
-def controller_addressee(label: str) -> dict[str, str]:
-    """Build the stable-name address carried by controller correspondence."""
+def controller_addressee(label: str, *, project_root: Path | str) -> dict[str, str]:
+    """Build the project-root + stable-name controller address."""
     resolved = str(label or "").strip()
     if not resolved or len(resolved) > 64:
         raise MessageError("controller addressee label must contain 1..64 non-blank characters")
-    return {"kind": CONTROLLER_ADDRESSEE_KIND, "label": resolved}
+    root = controller_address_project_root(project_root)
+    return {
+        "kind": CONTROLLER_ADDRESSEE_KIND,
+        "label": resolved,
+        "project_root": root,
+    }
+
+
+def controller_address_project_root(project_root: Path | str) -> str:
+    return str(_canonical_project_root(Path(project_root)))
 
 
 def controller_addressee_label(envelope: dict) -> str | None:
@@ -239,10 +255,27 @@ def controller_addressee_label(envelope: dict) -> str | None:
     return label.strip() if isinstance(label, str) and label.strip() else None
 
 
-def controller_cursor_key(label: str, dispatch_id: str) -> str:
+def controller_addressee_project_root(envelope: dict) -> str | None:
+    addressee = envelope.get("addressee") if isinstance(envelope, dict) else None
+    if not isinstance(addressee, dict) or addressee.get("kind") != CONTROLLER_ADDRESSEE_KIND:
+        return None
+    root = addressee.get("project_root")
+    return str(root).strip() if isinstance(root, str) and str(root).strip() else None
+
+
+def controller_cursor_key(
+    label: str,
+    dispatch_id: str,
+    project_root: str | Path | None = None,
+) -> str:
     """Recipient-private cursor key; one controller cannot mark another's mail read."""
+    identity = (
+        [str(project_root), str(label), str(dispatch_id)]
+        if project_root is not None
+        else [str(label), str(dispatch_id)]
+    )
     return "controller:" + json.dumps(
-        [str(label), str(dispatch_id)],
+        identity,
         ensure_ascii=False,
         separators=(",", ":"),
     )
@@ -251,7 +284,12 @@ def controller_cursor_key(label: str, dispatch_id: str) -> str:
 def envelope_cursor_key(envelope: dict) -> str:
     dispatch_id = str(envelope.get("dispatch_id") or "")
     label = controller_addressee_label(envelope)
-    return controller_cursor_key(label, dispatch_id) if label else dispatch_id
+    project_root = controller_addressee_project_root(envelope)
+    return (
+        controller_cursor_key(label, dispatch_id, project_root)
+        if label and project_root
+        else dispatch_id
+    )
 
 
 def read_envelopes(path: Path, *, last_n: int | None = None) -> list[dict]:
@@ -735,9 +773,17 @@ def _open_controller_channel(
     for env in envelopes:
         envelope_acked_through = acked_through
         addressee_label = controller_addressee_label(env)
+        addressee_root = controller_addressee_project_root(env)
         if ack_cursor is not None and addressee_label and controller_label == addressee_label:
             envelope_acked_through = int(
-                ack_cursor.get(controller_cursor_key(addressee_label, str(env.get("dispatch_id") or "")), 0)
+                ack_cursor.get(
+                    controller_cursor_key(
+                        addressee_label,
+                        str(env.get("dispatch_id") or ""),
+                        addressee_root,
+                    ),
+                    0,
+                )
             )
         if (
             env.get("type") in CONTROLLER_CHANNEL_TYPES
@@ -1015,11 +1061,19 @@ def cmd_post(args: argparse.Namespace) -> int:
         "adapter": args.adapter,
         "transport": args.transport,
     }
-    addressee = (
-        controller_addressee(args.to_controller)
-        if getattr(args, "to_controller", None)
-        else None
-    )
+    addressee = None
+    if getattr(args, "to_controller", None):
+        addressed_root = getattr(args, "controller_project_root", None) or _current_project_root()
+        if addressed_root is None:
+            print(
+                "post: --to-controller requires --controller-project-root outside a git project",
+                file=sys.stderr,
+            )
+            return 2
+        addressee = controller_addressee(
+            args.to_controller,
+            project_root=Path(addressed_root),
+        )
     result = post_message(
         dispatch_id=args.dispatch_id,
         msg_type=args.type,
@@ -1348,21 +1402,14 @@ def _verified_controller_identity(
     owned_dispatch_ids: set[str],
     controller_session_id: str | None = None,
 ) -> dict[str, object] | None:
-    """Resolve this controller's durable name through its live beacon.
-
-    Environment declarations are authoritative when present. Otherwise an
-    ownership-scoped wait/listener may recover the same label/session/PID tuple
-    from dispatch records. Every path revalidates the tuple against the beacon;
-    project name, inbox name, and a bare session id are never treated as an
-    address.
-    """
+    """Resolve the current incarnation, with the durable name as ownership."""
     try:
         import goalflight_session_status as sessions  # type: ignore
 
         declared_label = sessions.resolve_controller_label()
         declared_pid = sessions.resolve_controller_pid()
         if declared_label is not None or declared_pid is not None:
-            if declared_label is None or declared_pid is None:
+            if declared_label is None:
                 return None
             live = sessions.live_session(
                 project_root,
@@ -1379,53 +1426,65 @@ def _verified_controller_identity(
             return {
                 "label": declared_label,
                 "session_id": str(live["id"]),
-                "pid": declared_pid,
+                "pid": live.get("pid"),
             }
-
-        resolved_session_id = controller_session_id or _controller_session_for_owned_dispatches(
-            records,
-            owned_dispatch_ids,
-        )
-        if not resolved_session_id:
+        label: str | None = None
+        if controller_session_id:
+            registry = next(
+                (
+                    record
+                    for record in sessions._registered_controller_records(project_root)
+                    if str(record.get("id") or "") == str(controller_session_id)
+                ),
+                None,
+            )
+            if registry is not None:
+                label = str(registry.get("label") or "") or None
+        if label is None:
+            label = _controller_label_for_owned_dispatches(records, owned_dispatch_ids)
+        if label is None:
             return None
-        beacon_candidates = [
-            record
-            for record in sessions._read_session_map(sessions._session_file(project_root)).values()
-            if str(record.get("id") or "") == resolved_session_id
-            and record.get("label")
-            and isinstance(record.get("pid"), int)
-        ]
-        if len(beacon_candidates) == 1:
-            beacon = beacon_candidates[0]
-            label = str(beacon["label"])
-            pid = int(beacon["pid"])
-            live = sessions.live_session(project_root, label=label, pid=pid)
-            if (
-                isinstance(live, dict)
-                and not live.get("conflicting_beacons")
-                and str(live.get("id") or "") == resolved_session_id
-            ):
-                return {"label": label, "session_id": resolved_session_id, "pid": pid}
-        candidates = {
-            (str(record.get("controller_label") or ""), record.get("controller_pid"))
-            for record in records
-            if str(record.get("controller_session_id") or "") == resolved_session_id
-            and record.get("controller_label")
-            and isinstance(record.get("controller_pid"), int)
-        }
-        if len(candidates) != 1:
-            return None
-        label, pid = next(iter(candidates))
-        live = sessions.live_session(project_root, label=label, pid=pid)
+        live = sessions.live_session(project_root, label=label)
         if (
             not isinstance(live, dict)
             or live.get("conflicting_beacons")
-            or str(live.get("id") or "") != resolved_session_id
+            or not live.get("id")
+            or (
+                controller_session_id
+                and str(live.get("id") or "") != str(controller_session_id)
+            )
         ):
             return None
-        return {"label": label, "session_id": resolved_session_id, "pid": pid}
+        return {
+            "label": label,
+            "session_id": str(live["id"]),
+            "pid": live.get("pid"),
+        }
     except Exception:
         return None
+
+
+def _controller_label_for_owned_dispatches(
+    records: list[dict],
+    owned_dispatch_ids: set[str],
+) -> str | None:
+    """Resolve one durable owner name even across incarnation succession."""
+    if not owned_dispatch_ids:
+        return None
+    recorded_ids: set[str] = set()
+    labels: set[str] = set()
+    for record in records:
+        dispatch_id = str(record.get("dispatch_id") or "")
+        if dispatch_id not in owned_dispatch_ids:
+            continue
+        recorded_ids.add(dispatch_id)
+        label = str(record.get("controller_label") or "").strip()
+        if not label:
+            return None
+        labels.add(label)
+    if recorded_ids != owned_dispatch_ids or len(labels) != 1:
+        return None
+    return next(iter(labels))
 
 
 def _controller_scope_kind(
@@ -1435,12 +1494,18 @@ def _controller_scope_kind(
     legacy_addressed_dispatch_ids: set[str],
     task_store_dispatch_id: str | None,
     controller_label: str | None,
+    controller_project_root: str,
 ) -> str | None:
     """Single authority for whether one envelope belongs to this controller."""
     dispatch_id = str(envelope.get("dispatch_id") or "")
     addressee_label = controller_addressee_label(envelope)
     if addressee_label is not None:
-        if controller_label is not None and addressee_label == controller_label:
+        addressee_root = controller_addressee_project_root(envelope)
+        if (
+            controller_label is not None
+            and addressee_label == controller_label
+            and addressee_root == controller_project_root
+        ):
             return "controller"
         return None
     if dispatch_id in owned_dispatch_ids:
@@ -1480,6 +1545,9 @@ def _controller_scope_inputs(
         owned_dispatch_ids=owned_dispatch_ids,
         controller_session_id=controller_session_id,
     )
+    owned_label = _controller_label_for_owned_dispatches(records, owned_dispatch_ids)
+    if identity is not None and owned_label is not None and identity.get("label") != owned_label:
+        identity = None
     return {
         "legacy_addressed_dispatch_ids": legacy_addressed_dispatch_ids,
         "task_store_dispatch_id": _task_store_dispatch_id(
@@ -1488,6 +1556,7 @@ def _controller_scope_inputs(
         ),
         "controller_label": str(identity.get("label")) if identity else None,
         "controller_session_id": str(identity.get("session_id")) if identity else controller_session_id,
+        "controller_project_root": str(canonical_project_root),
     }
 
 
@@ -1496,6 +1565,15 @@ def _resolve_listener_session_id(project_root: Path, explicit_session_id: str | 
         session_id = str(explicit_session_id).strip()
         if not session_id:
             raise MessageError("--session-id must not be empty")
+        try:
+            import goalflight_session_status  # type: ignore
+
+            goalflight_session_status.touch_controller_heartbeat_by_session_id(
+                project_root,
+                session_id,
+            )
+        except Exception:
+            pass
         return session_id
     try:
         import goalflight_session_status  # type: ignore
@@ -1507,6 +1585,15 @@ def _resolve_listener_session_id(project_root: Path, explicit_session_id: str | 
         raise MessageError("no live controller session; claim one or pass --session-id")
     if session.get("conflicting_beacons"):
         raise MessageError("multiple live controller sessions; pass --session-id")
+    try:
+        goalflight_session_status.touch_controller_heartbeat(
+            project_root,
+            str(session.get("label") or ""),
+            session_id=str(session["id"]),
+            pid=session.get("pid") if isinstance(session.get("pid"), int) else None,
+        )
+    except Exception:
+        pass
     return str(session["id"])
 
 
@@ -1601,12 +1688,30 @@ def controller_wake_watermark(
     resolved_fleet_dir = fleet_dir if fleet_dir is not None else default_fleet_dir()
     records = _project_ledger_records(project_root)
     if owned_dispatch_ids is None:
+        identity = _verified_controller_identity(
+            project_root,
+            records,
+            owned_dispatch_ids=set(),
+            controller_session_id=controller_session_id,
+        )
+        owner_label = str(identity.get("label") or "") if identity else ""
         owned_dispatch_ids = {
             str(record["dispatch_id"])
             for record in records
             if record.get("dispatch_id")
-            and controller_session_id
-            and str(record.get("controller_session_id") or "") == controller_session_id
+            and (
+                (
+                    owner_label
+                    and str(record.get("controller_label") or "") == owner_label
+                )
+                or (
+                    not owner_label
+                    and controller_session_id
+                    and not record.get("controller_label")
+                    and str(record.get("controller_session_id") or "")
+                    == str(controller_session_id)
+                )
+            )
         }
     else:
         owned_dispatch_ids = {str(dispatch_id) for dispatch_id in owned_dispatch_ids}
@@ -1621,6 +1726,7 @@ def controller_wake_watermark(
     legacy_addressed_dispatch_ids = set(scope_inputs["legacy_addressed_dispatch_ids"])
     task_store_dispatch_id = scope_inputs["task_store_dispatch_id"]
     controller_label = scope_inputs["controller_label"]
+    controller_project_root = str(scope_inputs["controller_project_root"])
     controller_session_id = str(scope_inputs["controller_session_id"] or "") or None
     candidate_dispatch_ids = owned_dispatch_ids | legacy_addressed_dispatch_ids
     if task_store_dispatch_id:
@@ -1643,6 +1749,7 @@ def controller_wake_watermark(
                 legacy_addressed_dispatch_ids=legacy_addressed_dispatch_ids,
                 task_store_dispatch_id=(str(task_store_dispatch_id) if task_store_dispatch_id else None),
                 controller_label=(str(controller_label) if controller_label else None),
+                controller_project_root=controller_project_root,
             )
             if scope_kind is None:
                 continue
@@ -1903,6 +2010,7 @@ def controller_mail_summary(
             if scope_inputs.get("controller_label")
             else None
         )
+        controller_project_root = str(scope_inputs["controller_project_root"])
 
         def envelope_filter(envelope: dict) -> bool:
             return _controller_scope_kind(
@@ -1911,6 +2019,7 @@ def controller_mail_summary(
                 legacy_addressed_dispatch_ids=legacy_addressed_dispatch_ids,
                 task_store_dispatch_id=(str(task_store_dispatch_id) if task_store_dispatch_id else None),
                 controller_label=controller_label,
+                controller_project_root=controller_project_root,
             ) is not None
 
     aggregate = build_aggregate(
@@ -1949,9 +2058,11 @@ def controller_mail_summary(
                     controller_cursor_key(
                         str((item.get("addressee") or {}).get("label")),
                         str(item.get("dispatch_id") or ""),
+                        str((item.get("addressee") or {}).get("project_root")),
                     )
                     if isinstance(item.get("addressee"), dict)
                     and (item.get("addressee") or {}).get("label")
+                    and (item.get("addressee") or {}).get("project_root")
                     else str(item.get("dispatch_id") or ""),
                     0,
                 )
@@ -2246,34 +2357,44 @@ def format_envelope_headlines(envelopes: list) -> str:
     return "\n".join(lines)
 
 
-def _verified_live_controller_labels() -> set[str]:
-    """Names proven by a live beacon plus its paired dispatch identity."""
+def _registered_controller_addresses() -> set[tuple[str, str]]:
+    """Durable, non-retired (project root, name) addresses."""
     try:
-        import goalflight_ledger  # type: ignore
+        import goalflight_task  # type: ignore
         import goalflight_session_status as sessions  # type: ignore
-
-        records = goalflight_ledger.read_records()
     except Exception:
         return set()
-    labels: set[str] = set()
-    for record in records:
-        label = str(record.get("controller_label") or "")
-        session_id = str(record.get("controller_session_id") or "")
-        pid = record.get("controller_pid")
-        project_root = record.get("project_root")
-        if not label or not session_id or not isinstance(pid, int) or not project_root:
-            continue
+    roots: set[Path] = set()
+    current_root = _current_project_root()
+    if current_root is not None:
+        roots.add(current_root)
+    try:
+        for project in goalflight_task.read_project_registry():
+            root = project.get("project_root")
+            if root:
+                roots.add(Path(str(root)))
+    except Exception:
+        pass
+    try:
+        import goalflight_ledger  # type: ignore
+
+        for record in goalflight_ledger.read_records():
+            root = record.get("project_root")
+            if root:
+                roots.add(Path(str(root)))
+    except Exception:
+        pass
+    addresses: set[tuple[str, str]] = set()
+    for root in roots:
         try:
-            live = sessions.live_session(Path(str(project_root)), label=label, pid=pid)
+            canonical_root = controller_address_project_root(root)
+            addresses.update(
+                (canonical_root, label)
+                for label in sessions.registered_controller_labels(root.resolve())
+            )
         except Exception:
             continue
-        if (
-            isinstance(live, dict)
-            and not live.get("conflicting_beacons")
-            and str(live.get("id") or "") == session_id
-        ):
-            labels.add(label)
-    return labels
+    return addresses
 
 
 def unresolved_controller_envelopes(
@@ -2281,8 +2402,8 @@ def unresolved_controller_envelopes(
     messages_dir: Path,
     fleet_dir: Path | None,
 ) -> list[dict]:
-    """Unread named mail whose recipient has no provable live claim."""
-    live_labels = _verified_live_controller_labels()
+    """Unread named mail whose recipient has no active durable registration."""
+    registered_addresses = _registered_controller_addresses()
     cursor = load_read_cursor(read_cursor_path(messages_dir))
     unresolved: list[dict] = []
     for path in collect_inbox_paths(messages_dir, fleet_dir):
@@ -2292,9 +2413,14 @@ def unresolved_controller_envelopes(
             continue
         for envelope in envelopes:
             label = controller_addressee_label(envelope)
-            if not label or label in live_labels:
+            project_root = controller_addressee_project_root(envelope)
+            if not label or not project_root or (project_root, label) in registered_addresses:
                 continue
-            key = controller_cursor_key(label, str(envelope.get("dispatch_id") or path.stem))
+            key = controller_cursor_key(
+                label,
+                str(envelope.get("dispatch_id") or path.stem),
+                project_root,
+            )
             if int(envelope.get("seq", 0)) > int(cursor.get(key, 0)):
                 unresolved.append(envelope)
     unresolved.sort(key=lambda envelope: str(envelope.get("ts") or ""), reverse=True)
@@ -2327,6 +2453,8 @@ def backlog_digest(
     *,
     messages_dir: Path,
     fleet_dir: Path | None,
+    controller_label: str | None = None,
+    controller_project_root: str | None = None,
 ) -> tuple[dict, dict[str, int]]:
     """Summarize the current unread snapshot without copying or deleting bodies."""
     cursor = load_read_cursor(read_cursor_path(messages_dir))
@@ -2340,6 +2468,15 @@ def backlog_digest(
         except MessageError:
             continue
         for envelope in envelopes:
+            if (
+                controller_label is not None
+                and (
+                    controller_addressee_label(envelope) != controller_label
+                    or controller_addressee_project_root(envelope)
+                    != controller_project_root
+                )
+            ):
+                continue
             key = envelope_cursor_key(envelope)
             seq = int(envelope.get("seq", 0))
             if seq <= int(cursor.get(key, 0)):
@@ -2377,6 +2514,97 @@ def backlog_digest(
         },
         advances,
     )
+
+
+def retire_controller_mailbox(
+    *,
+    messages_dir: Path,
+    fleet_dir: Path | None,
+    controller_label: str,
+    controller_project_root: str,
+    controller_session_id: str,
+    retired_at: str,
+    retired_by: dict,
+) -> dict:
+    """Prepare one idempotent retirement digest without advancing cursors."""
+    digest_dir = messages_dir / BACKLOG_DIGEST_DIR
+    digest_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    safe_label = re.sub(r"[^A-Za-z0-9._-]+", "-", controller_label).strip("-") or "controller"
+    transaction_id = uuid.uuid5(
+        uuid.NAMESPACE_URL,
+        f"{controller_project_root}\0{controller_label}\0{controller_session_id}",
+    ).hex[:16]
+    path = digest_dir / f"retirement-{safe_label}-{transaction_id}.json"
+    if path.exists():
+        existing = json.loads(path.read_text(encoding="utf-8"))
+        retirement = existing.get("retirement") if isinstance(existing, dict) else None
+        if not isinstance(retirement, dict) or (
+            retirement.get("controller_label") != controller_label
+            or retirement.get("controller_project_root") != controller_project_root
+            or retirement.get("controller_session_id") != controller_session_id
+        ):
+            raise MessageError(f"{path}: retirement digest identity mismatch")
+        retirement = dict(retirement)
+        retirement["retired_at"] = retired_at
+        retirement["retired_by"] = retired_by
+        existing["retirement"] = retirement
+        tmp = path.with_name(f".{path.name}.tmp")
+        tmp.write_text(json.dumps(existing, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+        return {
+            "digest": str(path),
+            "envelope_count": int(existing.get("envelope_count") or 0),
+            "retired_at": retired_at,
+            "correspondence_retained": True,
+            "reused": True,
+        }
+
+    digest, advances = backlog_digest(
+        messages_dir=messages_dir,
+        fleet_dir=fleet_dir,
+        controller_label=controller_label,
+        controller_project_root=controller_project_root,
+    )
+    digest["retirement"] = {
+        "controller_label": controller_label,
+        "controller_project_root": controller_project_root,
+        "controller_session_id": controller_session_id,
+        "retired_at": retired_at,
+        "retired_by": retired_by,
+    }
+    digest["cursor_advances"] = advances
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_text(json.dumps(digest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+    return {
+        "digest": str(path),
+        "envelope_count": digest["envelope_count"],
+        "retired_at": retired_at,
+        "correspondence_retained": True,
+        "reused": False,
+    }
+
+
+def finalize_controller_retirement_mailbox(
+    *,
+    messages_dir: Path,
+    digest_path: str | Path,
+) -> dict:
+    """Idempotently advance exactly the cursor snapshot named by a digest."""
+    digest_dir = (messages_dir / BACKLOG_DIGEST_DIR).resolve()
+    path = Path(digest_path).resolve()
+    if not path.is_relative_to(digest_dir):
+        raise MessageError("retirement digest is outside the mailbox digest directory")
+    digest = json.loads(path.read_text(encoding="utf-8"))
+    raw_advances = digest.get("cursor_advances") if isinstance(digest, dict) else None
+    if not isinstance(raw_advances, dict):
+        raise MessageError(f"{path}: missing retirement cursor snapshot")
+    advances = {
+        str(key): require_positive_int_seq(value, path=f"{path}.cursor_advances.{key}")
+        for key, value in raw_advances.items()
+    }
+    advance_read_cursor(read_cursor_path(messages_dir), advances)
+    return {"cursor_entries_advanced": len(advances), "finalized": True}
 
 
 def cmd_triage_backlog(args: argparse.Namespace) -> int:
@@ -2460,6 +2688,7 @@ def cmd_relay(args: argparse.Namespace) -> int:
                 if scope_inputs.get("controller_label")
                 else None
             )
+            controller_project_root = str(scope_inputs["controller_project_root"])
 
             def envelope_filter(envelope: dict) -> bool:
                 return _controller_scope_kind(
@@ -2470,12 +2699,17 @@ def cmd_relay(args: argparse.Namespace) -> int:
                         str(task_store_dispatch_id) if task_store_dispatch_id else None
                     ),
                     controller_label=controller_label,
+                    controller_project_root=controller_project_root,
                 ) is not None
 
             def cursor_key(envelope: dict) -> str:
                 label = controller_addressee_label(envelope)
                 if label and label == controller_label:
-                    return controller_cursor_key(label, str(envelope.get("dispatch_id") or ""))
+                    return controller_cursor_key(
+                        label,
+                        str(envelope.get("dispatch_id") or ""),
+                        controller_addressee_project_root(envelope),
+                    )
                 return str(envelope.get("dispatch_id") or "")
 
         paths = collect_inbox_paths(
@@ -2754,7 +2988,15 @@ def main(argv: list[str] | None = None) -> int:
     post.add_argument(
         "--to-controller",
         metavar="LABEL",
-        help="address controller-channel mail to one declared controller beacon label",
+        help="address controller-channel mail to one durable controller registry name",
+    )
+    post.add_argument(
+        "--controller-project-root",
+        type=Path,
+        help=(
+            "project root that scopes --to-controller; defaults to the current git "
+            "project, and is required for explicit cross-project addressing"
+        ),
     )
     post.add_argument("--node", default="local")
     post.add_argument("--adapter", default="unknown")
@@ -2816,7 +3058,7 @@ def main(argv: list[str] | None = None) -> int:
 
     undeliverable = sub.add_parser(
         "undeliverable",
-        help="report unread named controller mail with no provable live recipient",
+        help="report unread named controller mail with no active registered recipient",
     )
     undeliverable.set_defaults(func=cmd_undeliverable)
 

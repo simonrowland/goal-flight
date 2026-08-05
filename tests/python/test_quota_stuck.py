@@ -101,9 +101,19 @@ def quota_record(tmp: Path, *, dispatch_id: str = "q1", pid: int = 101, state: s
     }
 
 
-def test_tail_signature_classifies_rate_limited_provider() -> None:
-    with tempfile.TemporaryDirectory() as td:
+def test_tail_signature_classifies_exhausted_provider() -> None:
+    with tempfile.TemporaryDirectory() as td, temp_env(GOALFLIGHT_CODEX_STATE_DIR=td):
         tmp = Path(td)
+        reset_at = "2033-05-18T03:33:20Z"
+        (tmp / "codex-seat-states.json").write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "seats": {"seat-a": {"cooldown_until": reset_at}},
+                }
+            ),
+            encoding="utf-8",
+        )
         tail = tmp / "quota.tail"
         write_tail(tail, "ERROR: insufficient_quota; got 429\n")
         payload = {"state": "worker_dead"}
@@ -113,9 +123,13 @@ def test_tail_signature_classifies_rate_limited_provider() -> None:
             tail=tail,
             previous_state="worker_dead",
             previous_reason="worker_dead_no_terminal_marker",
+            effective_account="seat-a",
         )
         assert_true("quota status changed", changed)
-        assert_eq("state", payload["state"], "rate_limited")
+        assert_eq("state", payload["state"], "quota_exhausted")
+        assert_eq("kind", payload["limit_kind"], "exhausted")
+        assert_eq("seat-state reset", payload["reset_at"], reset_at)
+        assert_eq("unmeasured retry-after", payload["retry_after"], None)
         assert_eq("provider", payload["rate_limit_provider"], "openai")
 
 
@@ -159,6 +173,49 @@ def test_capacity_hard_stops_provider_launches() -> None:
         assert_eq("stuck count", payload["adaptive_rate_pressure"]["stuck_worker_count"], 3)
 
 
+def test_transient_throttles_do_not_hard_stop_provider() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        records = []
+        for idx in range(3):
+            record = quota_record(
+                tmp,
+                dispatch_id=f"throttle-{idx}",
+                pid=150 + idx,
+                state="running_quiet",
+            )
+            Path(record["stdout_path"]).write_text(
+                "ERROR HTTP 429 Too Many Requests; Retry-After: 30\n",
+                encoding="utf-8",
+            )
+            records.append(record)
+        pressure = {
+            "providers_under_pressure": [
+                {
+                    "scope": "provider",
+                    "provider": "xai",
+                    "budget_key": "provider:xai",
+                    "labels": ["grok-code"],
+                    "count": 3,
+                }
+            ]
+        }
+
+        entry = quota.decorate_pressure_payload(
+            pressure,
+            records,
+            window_seconds=600,
+        )["providers_under_pressure"][0]
+
+        assert_eq("transient workers measured", entry["stuck_worker_count"], 3)
+        assert_true(
+            "all transient kinds",
+            all(item["limit_kind"] == "transient" for item in entry["stuck_workers"]),
+        )
+        assert_eq("transient does not hard stop", entry["quota_hard_stop"], False)
+        assert_true("transient does not zero caps", "effective_caps" not in entry)
+
+
 def test_status_banner_and_advisory_mail() -> None:
     with tempfile.TemporaryDirectory() as td, temp_env(GOALFLIGHT_MESSAGES_DIR=str(Path(td) / "messages")):
         record = quota_record(Path(td), dispatch_id="quota-mail", pid=201, state="rate_limited")
@@ -175,7 +232,12 @@ def test_status_banner_and_advisory_mail() -> None:
                     "effective_caps": {"grok-code": 0, "grok-research": 0},
                     "stuck_worker_count": 1,
                     "stuck_workers": [
-                        {"dispatch_id": "quota-mail", "agent": "grok-code", "signature": "usage balance exhausted"}
+                        {
+                            "dispatch_id": "quota-mail",
+                            "agent": "grok-code",
+                            "signature": "usage balance exhausted",
+                            "limit_kind": "exhausted",
+                        }
                     ],
                 }
             ],
@@ -250,7 +312,10 @@ def test_quota_reaper_default_deny_guards_and_release() -> None:
         state = cap.load_state()
         assert_eq("lease released rate_limited", state["leases"]["lease-qkill"]["state"], "rate_limited")
         persisted = json.loads(ledger.record_path("qkill").read_text(encoding="utf-8"))
-        assert_eq("ledger state rate_limited", persisted["state"], "rate_limited")
+        assert_eq("ledger state measured", persisted["state"], "quota_exhausted")
+        assert_eq("ledger terminal measured", persisted["terminal_state"], "quota_exhausted")
+        assert_eq("ledger kind measured", persisted["limit_kind"], "exhausted")
+        assert_eq("outcome terminal measured", persisted["outcome"]["terminal_state"], "quota_exhausted")
 
 
 def test_kimi_quota_reaper_and_surplus_discovery() -> None:
@@ -294,6 +359,9 @@ def test_kimi_quota_reaper_and_surplus_discovery() -> None:
         )
         assert_eq("kimi quota worker reaped", killed, [42])
         assert_eq("kimi quota candidate recorded", result["reaped"][0]["dispatch_id"], "kimi-quota")
+        persisted = json.loads(ledger.record_path("kimi-quota").read_text(encoding="utf-8"))
+        assert_eq("kimi ledger state measured transient", persisted["state"], "transient_throttle")
+        assert_eq("kimi ledger kind measured", persisted["limit_kind"], "transient")
 
         ps = (
             "42 /Users/x/.kimi-code/bin/kimi /Users/x/.kimi-code/bin/kimi -p work\n"
@@ -673,8 +741,9 @@ def test_tail_quota_signature_preserves_float_mtime() -> None:
 
 def main() -> None:
     tests = [
-        test_tail_signature_classifies_rate_limited_provider,
+        test_tail_signature_classifies_exhausted_provider,
         test_capacity_hard_stops_provider_launches,
+        test_transient_throttles_do_not_hard_stop_provider,
         test_status_banner_and_advisory_mail,
         test_quota_reaper_default_deny_guards_and_release,
         test_kimi_quota_reaper_and_surplus_discovery,

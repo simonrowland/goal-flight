@@ -27,6 +27,7 @@ from typing import Any, Callable, Protocol
 
 import goalflight_compat
 import goalflight_acp_permits as permits
+import goalflight_dispatch_states
 import goalflight_ledger
 import goalflight_quota_stuck
 import goalflight_terminal
@@ -1029,12 +1030,19 @@ def _finish_quota_stuck_ledger(record: dict[str, Any], *, reason: dict[str, Any]
             return False
         with goalflight_ledger.StateLock():
             payload = json.loads(path.read_text(encoding="utf-8"))
-            payload["state"] = "rate_limited"
-            payload["terminal_state"] = "rate_limited"
+            # The reaper required a live tail quota signature, so the measured
+            # limit state exists: write it, never the unmeasured umbrella.
+            limit_state = str(
+                reason.get("limit_state") or goalflight_dispatch_states.LIMIT_UNKNOWN_STATE
+            )
+            payload["state"] = limit_state
+            payload["terminal_state"] = limit_state
             payload["ended_at"] = payload.get("ended_at") or goalflight_ledger.utc_now()
             payload["worker_still_alive"] = False
             payload["reason"] = reason
-            payload["outcome"] = {"terminal_state": "rate_limited", "reason": reason}
+            for key in ("limit_kind", "limit_signature", "reset_at", "retry_after"):
+                payload[key] = reason.get(key)
+            payload["outcome"] = {"terminal_state": limit_state, "reason": reason}
             goalflight_ledger.write_record(payload)
         return True
     except Exception as exc:
@@ -1116,6 +1124,11 @@ def reap_quota_stuck_workers(
             "message": "quota_stuck_worker_reaped",
             "provider": goalflight_quota_stuck.provider_for_agent(record.get("agent")),
             "rate_limit_signature": info.get("signature"),
+            "limit_signature": info.get("signature"),
+            "limit_kind": info.get("limit_kind"),
+            "limit_state": info.get("limit_state"),
+            "reset_at": info.get("reset_at"),
+            "retry_after": info.get("retry_after"),
             "tail_path": info.get("tail_path"),
         }
         candidate = {

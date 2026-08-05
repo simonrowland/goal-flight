@@ -2179,14 +2179,15 @@ def test_worker_dead_tail_rate_limit_reaches_pressure_sensor() -> None:
         )
         assert proc.returncode == 1, (proc.stdout, proc.stderr)
         record = json.loads((tmp / "state" / "runs.d" / "tail-rate-limit.json").read_text(encoding="utf-8"))
-        assert record["state"] == "rate_limited", record
-        assert record["terminal_state"] == "rate_limited", record
+        assert record["state"] == "quota_exhausted", record
+        assert record["terminal_state"] == "quota_exhausted", record
+        assert record["limit_kind"] == "exhausted", record
         error_text = json.dumps(record.get("error"), sort_keys=True)
         assert "usage limit" in error_text.lower(), record
         # Merged contract: the quota refinement wraps the pre-quota reason —
         # the original classification is preserved as previous_reason.
         error_obj = record.get("error", {})
-        assert error_obj.get("message") == "dispatch_worker_rate_limited", record
+        assert error_obj.get("message") == "dispatch_worker_limit_reached", record
         assert error_obj.get("previous_reason") == "worker_dead_no_terminal_marker", record
         assert error_obj.get("previous_state") == "worker_dead", record
         # Rate-pressure policy is shared-pool scoped and now refuses per-session

@@ -319,6 +319,22 @@ def test_source_error_is_bounded_and_not_a_false_success() -> None:
     assert_true("exception path denied", "/Users/alice/fleet" not in json.dumps(payload))
 
 
+def test_limit_display_uses_measured_kind_and_marks_legacy_unknown() -> None:
+    exhausted = F._worker_display_verdict(
+        {"state": "quota_exhausted", "limit_kind": "exhausted"}
+    )
+    legacy = F._worker_display_verdict({"state": "rate_limited"})
+    mixed = F._worker_display_verdict(
+        {"state": "worker_dead", "limit_kind": "exhausted"}
+    )
+
+    assert_true("exhausted state displayed", exhausted["display_state"] == "quota_exhausted")
+    assert_true("exhausted terminal", exhausted["is_terminal"] is True)
+    assert_true("legacy state does not imply transient", legacy["display_state"] == "limit_unknown")
+    assert_true("legacy remains terminal", legacy["is_terminal"] is True)
+    assert_true("measured kind beats bare death", mixed["display_state"] == "quota_exhausted")
+
+
 def test_allowlist_rejects_unknown_and_unsafe_fields(
     attention_payload: dict | None = None,
 ) -> None:

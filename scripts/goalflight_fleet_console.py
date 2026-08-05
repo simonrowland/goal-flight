@@ -464,6 +464,7 @@ def _canonical_root(value: object) -> str | None:
 
 def _worker_display_verdict(record: dict[str, Any]) -> dict[str, Any]:
     """Resolve one presentation verdict from the reconciled authority fields."""
+    limit_kind = goalflight_dispatch_states.limit_kind_for_record(record)
     state_values = [record.get(key) for key in ("state", "terminal_state", "classification")]
     terminal_values = [
         value for value in state_values if goalflight_dispatch_states.is_terminal_state(value)
@@ -497,7 +498,11 @@ def _worker_display_verdict(record: dict[str, Any]) -> dict[str, Any]:
             "classification_conflict": True,
         }
     if terminal_values:
-        normalized = goalflight_dispatch_states.normalize_dispatch_state(terminal_values[0])
+        normalized = (
+            goalflight_dispatch_states.limit_state_for_kind(limit_kind)
+            if limit_kind
+            else goalflight_dispatch_states.normalize_dispatch_state(terminal_values[0])
+        )
         return {
             "display_state": normalized or "terminal",
             "is_terminal": True,

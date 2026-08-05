@@ -1192,7 +1192,7 @@ def _restore_test_controller(previous: dict[str, str | None]) -> None:
             os.environ[key] = value
 
 
-def test_named_peer_mail_crosses_projects_by_default() -> None:
+def test_named_peer_mail_crosses_projects_when_explicitly_addressed() -> None:
     import tempfile
     import goalflight_messages as messages
     import goalflight_status as status
@@ -1229,6 +1229,8 @@ def test_named_peer_mail_crosses_projects_by_default() -> None:
                     "cross-project finding",
                     "--to-controller",
                     "mine-controller",
+                    "--controller-project-root",
+                    str(mine),
                 ],
                 cwd=peer,
             )
@@ -1236,7 +1238,12 @@ def test_named_peer_mail_crosses_projects_by_default() -> None:
             stored = messages.read_envelopes(messages.inbox_path(messages_dir, "peer-correspondence"))
             assert_true(
                 "envelope carries stable controller label",
-                stored[0].get("addressee") == {"kind": "controller", "label": "mine-controller"},
+                stored[0].get("addressee")
+                == {
+                    "kind": "controller",
+                    "label": "mine-controller",
+                    "project_root": str(mine.resolve()),
+                },
             )
             relayed = run_messages_cli(messages_dir, fleet_dir, ["relay", "--new"], cwd=mine)
             assert_true("default relay surfaces named peer mail", "cross-project finding" in relayed.stdout)
@@ -1291,7 +1298,9 @@ def test_named_mail_for_different_controller_is_quiet_and_readable() -> None:
                 msg_type="controller-question",
                 payload={"text": "for somebody else"},
                 messages_dir=messages_dir,
-                addressee=messages.controller_addressee("other-controller"),
+                addressee=messages.controller_addressee(
+                    "other-controller", project_root=peer
+                ),
             )
             wakes = messages.controller_wake_watermark(
                 project_root=mine,
@@ -1380,7 +1389,9 @@ def test_unknown_controller_name_is_preserved_and_reported() -> None:
                 msg_type="controller-notice",
                 payload={"text": "retain this warning"},
                 messages_dir=messages_dir,
-                addressee=messages.controller_addressee("unclaimed-controller"),
+                addressee=messages.controller_addressee(
+                    "unclaimed-controller", project_root=mine
+                ),
             )
             wakes = messages.controller_wake_watermark(
                 project_root=mine,
@@ -2203,7 +2214,7 @@ def main() -> None:
         test_listener_task_store_nag_counts_without_waking_then_escalation_wakes,
         test_listener_wakes_for_controller_addressed_mail,
         test_wake_filter_uses_sender_direction_and_preserves_unread_mail,
-        test_named_peer_mail_crosses_projects_by_default,
+        test_named_peer_mail_crosses_projects_when_explicitly_addressed,
         test_named_mail_for_different_controller_is_quiet_and_readable,
         test_cross_project_worker_traffic_remains_project_scoped,
         test_unknown_controller_name_is_preserved_and_reported,

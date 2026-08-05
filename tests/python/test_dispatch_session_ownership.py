@@ -609,6 +609,7 @@ def test_failed_startup_claim_keeps_dispatch_unowned() -> None:
         root = base / "project"
         root.mkdir()
         unrelated = _beacon()
+        failed_controller = _beacon()
         try:
             sessions.claim_session(
                 root,
@@ -619,7 +620,7 @@ def test_failed_startup_claim_keeps_dispatch_unowned() -> None:
             with patch.object(sessions, "claim_session", side_effect=OSError("read only")):
                 startup = sessions.claim_controller_startup(
                     root,
-                    pid=os.getpid(),
+                    pid=failed_controller.pid,
                     label="battery-main",
                 )
             assert startup.get("claimed") is False, startup
@@ -628,7 +629,7 @@ def test_failed_startup_claim_keeps_dispatch_unowned() -> None:
             args = _args(
                 "claim-failed",
                 controller_label="battery-main",
-                controller_beacon_pid=os.getpid(),
+                controller_beacon_pid=failed_controller.pid,
             )
             dispatch._stamp_controller_session(args, root)
             assert dispatch._controller_session_id(args) is None
@@ -668,6 +669,8 @@ def test_failed_startup_claim_keeps_dispatch_unowned() -> None:
         finally:
             unrelated.terminate()
             unrelated.wait(timeout=10)
+            failed_controller.terminate()
+            failed_controller.wait(timeout=10)
 
 
 def test_duplicate_live_same_label_dispatch_is_honestly_unowned() -> None:

@@ -152,23 +152,25 @@ def _run_dispatch_with_state(dispatch_id: str, worker_code: str, *, max_idle: st
         return proc.returncode, end, payload, record
 
 
-def case_dispatch_usage_limit_exit_zero_is_retryable() -> None:
+def case_dispatch_usage_limit_exit_zero_is_exhausted() -> None:
     worker_code = (
         "print(\"You've hit your usage limit. Please try again at 6:13 AM.\", flush=True)\n"
     )
     rc, end, payload, record = _run_dispatch_with_state("usage-limit-exit-zero", worker_code)
     assert rc == 1, (rc, end, payload, record)
-    assert end.get("terminal_state") == "rate_limited", end
-    assert payload.get("state") == "rate_limited", payload
-    assert payload.get("liveness_state") == "rate_limited", payload
+    assert end.get("terminal_state") == "quota_exhausted", end
+    assert payload.get("state") == "quota_exhausted", payload
+    assert payload.get("liveness_state") == "quota_exhausted", payload
     reason = payload.get("reason")
     assert isinstance(reason, dict), payload
-    assert reason.get("message") == "dispatch_worker_rate_limited", reason
+    assert reason.get("message") == "dispatch_worker_limit_reached", reason
+    assert reason.get("limit_kind") == "exhausted", reason
     assert reason.get("reason") == "worker_dead_no_terminal_marker", reason
-    assert record.get("state") == "rate_limited", record
-    assert record.get("terminal_state") == "rate_limited", record
-    assert record.get("liveness_state") == "rate_limited", record
-    assert record.get("error", {}).get("message") == "dispatch_worker_rate_limited", record
+    assert record.get("state") == "quota_exhausted", record
+    assert record.get("terminal_state") == "quota_exhausted", record
+    assert record.get("liveness_state") == "quota_exhausted", record
+    assert record.get("error", {}).get("message") == "dispatch_worker_limit_reached", record
+    assert record.get("limit_kind") == "exhausted", record
     assert goalflight_rate_pressure.detect_rate_limit_signature(record, None), record
 
 
@@ -759,7 +761,7 @@ def case_non_detached_watcher_dead_controller_remains_orphaned() -> None:
 def main() -> None:
     case_crash_detected_promptly()
     case_finished_via_marker()
-    case_dispatch_usage_limit_exit_zero_is_retryable()
+    case_dispatch_usage_limit_exit_zero_is_exhausted()
     case_dispatch_success_marker_with_limit_terms_stays_complete()
     case_dispatch_clean_complete_preserves_reason_without_rate_signal()
     case_dispatch_worker_dead_ledger_liveness()

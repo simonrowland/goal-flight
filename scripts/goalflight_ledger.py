@@ -639,6 +639,16 @@ def cmd_finish(args: argparse.Namespace) -> int:
         if envelope:
             record.update(envelope)
             record["outcome"].update(envelope)
+        if isinstance(args.reason, dict) and args.reason.get("limit_kind"):
+            for key in (
+                "limit_kind",
+                "limit_signature",
+                "reset_at",
+                "retry_after",
+            ):
+                value = args.reason.get(key)
+                record[key] = value
+                record["outcome"][key] = value
         write_record(record)
     print(json.dumps({"ok": True, "dispatch_id": args.dispatch_id, "state": args.state}, sort_keys=True))
     return 0
