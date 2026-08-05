@@ -1,6 +1,10 @@
-# Install the SessionStart watchdog re-arm hook
+# Install the SessionStart event-wake recovery hook
 
-Goal Flight uses a Claude Code in-session cron as the orchestrator watchdog. That cron is not durable: app restart, software update, or reboot clears it. The SessionStart hook is durable configuration. On a fresh Claude Code session in the goal-flight repo, it conservatively detects active or recent Goal Flight work and injects a re-arm instruction.
+Goal Flight uses event wakes for normal controller work. A claimed controller backgrounds the ownership listener; an unclaimed fixed-set controller backgrounds `goalflight_status.py --wait <ids>`. These wake promptly for owned worker terminal/escalation events and addressed mail; the canonical operating rule lives in `protocols/dispatch-routing.md` and `commands/execute.md`.
+
+Claude Code also has an hourly, self-suspending in-session cron as crash recovery. Its only job is to recover when the controller or background event wait was lost. If a live event wait already covers the session's in-flight dispatches, the cron reports that fact and does nothing else. The hourly interval bounds recovery of a lost event path to 60 minutes while avoiding a polling work loop.
+
+The cron is not durable: app restart, software update, or reboot clears it. The SessionStart hook is durable configuration. On a fresh Claude Code session in the goal-flight repo, it conservatively detects active or recent Goal Flight work and injects event-wake-first recovery context: arm the background event wait, resume in-skill, then ensure the hourly fallback cron exists. New dispatches arm or retain the wait; they do not re-arm the cron.
 
 ## Files
 
@@ -18,11 +22,11 @@ Otherwise it prints nothing.
 
 ## Claude Code specificity
 
-This hook does not call `CronCreate`. Hooks are shell commands; `CronCreate`, `CronList`, and `CronDelete` are Claude Code tools. The hook only injects `additionalContext` telling the orchestrator to run `CronList` and re-create the cron if absent.
+This hook does not launch the event wait or call `CronCreate`. Hooks are shell commands; background tasks, `CronCreate`, `CronList`, and `CronDelete` belong to the Claude Code controller session. The hook injects `additionalContext` that leads with the background wait and demotes `CronList`/`CronCreate` to ensuring the hourly crash-recovery fallback exists.
 
 Installing the Claude Code Goal Flight plugin loads `hooks/hooks.json`; no user-global `~/.claude/settings.json` edit is required for this hook. For local development without the plugin, copy the same `SessionStart` entry into `.claude/settings.json` and replace `${CLAUDE_PLUGIN_ROOT}` with `${CLAUDE_PROJECT_DIR}`.
 
-Codex, grok, Cursor, and OpenCode orchestrators need their own re-arm mechanism. Track that as a per-host adapter `wake` or `watchdog` capability, as sketched in `docs-private/research/2026-05-31-watchdog-injection-plan.md`; do not assume Claude Code cron tools exist outside Claude Code.
+Codex, grok, Cursor, and OpenCode orchestrators need equivalent background event-wake and crash-recovery capabilities. Track those as per-host adapter `wake` or `watchdog` capabilities, as sketched in `docs-private/research/2026-05-31-watchdog-injection-plan.md`; do not assume Claude Code cron tools exist outside Claude Code.
 
 ## Check
 
@@ -38,4 +42,4 @@ Expected:
 PASS: goalflight-session-start-watchdog self-test
 ```
 
-The self-test proves active dispatch injection, recent resume-note injection, no-active-run silence, and out-of-scope silence.
+The self-test proves event-wake-first injection, hourly fallback recovery context, canonical prompt doctrine, active dispatch injection, recent resume-note injection, no-active-run silence, and out-of-scope silence.

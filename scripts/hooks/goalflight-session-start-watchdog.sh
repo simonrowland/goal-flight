@@ -1,7 +1,8 @@
 #!/bin/sh
 
-# Claude Code SessionStart hook. Conservatively injects a reminder to re-arm the
-# in-session Goal Flight watchdog when this repo has active or recent work.
+# Claude Code SessionStart hook. Conservatively injects the event-wake-first
+# controller contract and its in-session crash-recovery fallback when this repo
+# has active or recent work.
 
 resolve_repo_root() {
   hook_src=${1:-$0}
@@ -67,7 +68,32 @@ ctx=d["hookSpecificOutput"]["additionalContext"]
 assert d["hookSpecificOutput"]["hookEventName"] == "SessionStart"
 assert "CronList" in ctx and "CronCreate" in ctx
 assert "goalflight-watchdog-prompt.md" in ctx
+assert "ARM THE EVENT WAKE FIRST" in ctx
+assert "goalflight_messages.py listen" in ctx
+assert "goalflight_status.py --wait" in ctx
+assert "crash-recovery fallback only" in ctx
+assert "`7 * * * *`" in ctx
+assert ctx.index("ARM THE EVENT WAKE FIRST") < ctx.index("CronList")
+assert "15-min" not in ctx
+assert "Then poll" not in ctx
 ' || fail "running dispatch should inject"
+
+  python3 - "$repo_root/templates/goalflight-watchdog-prompt.md" <<'PY' || fail "canonical prompt contract"
+import pathlib
+import sys
+
+text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+assert "event-wait-live" in text
+assert "do nothing else" in text
+assert "goalflight_messages.py listen" in text
+assert "goalflight_status.py --wait <ids>" in text
+assert "crash-recovery fallback only" in text
+assert "Schedule: `7 * * * *` (hourly)" in text
+assert "After every new dispatch, arm or retain the event wait" in text
+assert "Poll files; do not trust background notifications." not in text
+assert "Re-arm this watchdog after any new dispatch." not in text
+assert "7,22,37,52 * * * *" not in text
+PY
 
   out=$(env \
     GOALFLIGHT_WATCHDOG_STATUS_GLOB="$status_dir/*.status.json" \
@@ -319,16 +345,19 @@ def main() -> None:
         plugin_prompt = os.path.join(plugin_root, "templates", "goalflight-watchdog-prompt.md")
         prompt_file = repo_prompt if os.path.isfile(repo_prompt) else plugin_prompt
     context = (
-        "An active goal-flight run was detected on this session start. "
-        "CONTINUE IN-SKILL: re-invoke `/goal-flight resume` (this reloads SKILL.md fresh "
+        "An active goal-flight run was detected on this session start. ARM THE EVENT WAKE FIRST "
+        "as a background task per `protocols/dispatch-routing.md` and `commands/execute.md`: "
+        "a claimed controller runs `goalflight_messages.py listen --project-root \"$PWD\"`; an "
+        "unclaimed fixed-set controller runs the printed `goalflight_status.py --wait <ids>` "
+        "command. Do not block the controller turn on either wait. CONTINUE IN-SKILL: re-invoke "
+        "`/goal-flight resume` (this reloads SKILL.md fresh "
         "from disk) and keep dispatching workers with review-before-commit; do NOT fall "
-        "back to default inline editing or abandon the in-flight task. "
-        "Re-arm the watchdog: run `CronList`; if the 15-min self-suspending watchdog cron "
-        "is absent, re-create it via `CronCreate` with schedule `7,22,37,52 * * * *` and "
-        f"the canonical watchdog prompt at `{prompt_file}`. Then poll newest bounded "
-        "in-flight dispatch status JSON files under "
-        "`/tmp/goal-flight-*/dispatch/*.status.json` and resume per the newest "
-        "`docs-private/RESUME-NOTES-*.md`. Context-mode MCP is fine for your own context discipline; for worker dispatches see `protocols/dispatch-routing.md`."
+        "back to default inline editing or abandon the in-flight task. The cron is a "
+        "crash-recovery fallback only: run `CronList`; if the hourly self-suspending fallback "
+        "is absent, create it once via `CronCreate` with schedule `7 * * * *` and the canonical "
+        f"watchdog prompt at `{prompt_file}`. After every new dispatch, arm or retain the event "
+        "wait; never create or re-arm a per-dispatch cron. Resume durable state per the newest "
+        "`docs-private/RESUME-NOTES-*.md`. Context-mode MCP is fine for your own context discipline."
     )
     print(json.dumps({
         "hookSpecificOutput": {
