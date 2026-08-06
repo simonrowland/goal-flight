@@ -132,6 +132,23 @@ def case_non_positive_and_nonint_cap_values_ignored() -> None:
         os.unlink(path)
 
 
+def case_retired_handle_conf_key_tunes_successor_lane() -> None:
+    """A pre-rename machine profile keyed by the retired handle keeps tuning
+    the same lane: "kimi" overrides land on the moonshot pool, not a dead key."""
+    path = _write_conf(
+        json.dumps({"agent_caps": {"kimi": 12}, "agent_rss_mb": {"kimi": 512}})
+    )
+    try:
+        mod = _reload_limits(path)
+        assert mod.DEFAULT_AGENT_CAPS["moonshot"] == 12
+        assert "kimi" not in mod.DEFAULT_AGENT_CAPS
+        assert mod.AGENT_RSS_MB["moonshot"] == 512
+        assert "kimi" not in mod.AGENT_RSS_MB
+    finally:
+        os.unlink(path)
+        _reload_limits(None)
+
+
 def main() -> None:
     try:
         case_absent_conf_keeps_committed_baseline()
@@ -139,6 +156,7 @@ def main() -> None:
         case_conf_operating_cap_flows_through_capacity()
         case_malformed_conf_degrades_to_baseline()
         case_non_positive_and_nonint_cap_values_ignored()
+        case_retired_handle_conf_key_tunes_successor_lane()
     finally:
         # Restore baseline module state for any later import in the same process.
         _reload_limits(None)

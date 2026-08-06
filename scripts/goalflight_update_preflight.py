@@ -25,6 +25,9 @@ _CLI_AGENT_LABELS: dict[str, set[str]] = {
     "grok-code": {"grok", "grok-code", "grok-research", "grok-acp"},
     "grok-research": {"grok", "grok-code", "grok-research", "grok-acp"},
     "grok-acp": {"grok", "grok-code", "grok-research", "grok-acp"},
+    # moonshot is the current handle for the kimi CLI lane; legacy records carry
+    # agent/engine "kimi", so a moonshot scope must match both label sets.
+    "moonshot": {"moonshot", "kimi"},
     "kimi": {"kimi"},
     "cursor": {"cursor", "cursor-agent"},
     "cursor-agent": {"cursor", "cursor-agent"},

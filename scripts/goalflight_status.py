@@ -31,6 +31,7 @@ import goalflight_dispatch_states as dispatch_states
 import goalflight_ledger
 import goalflight_quota_stuck
 import goalflight_terminal
+from goalflight_agent_limits import moonshot_family
 from goalflight_liveness import cpu_confirmed_idle
 import goalflight_milestone
 from goalflight_watch import (
@@ -495,7 +496,7 @@ def _reconcile_output_tail_record(record: dict) -> dict:
     marker = _final_terminal_marker(
         tail,
         ignore_prefix_lines=_ignore_prefix_lines(record.get("prompt_path")),
-        kimi_output=record.get("agent") == "kimi",
+        kimi_output=moonshot_family(record.get("agent")),
     )
     marker_kind = marker.get("kind") if isinstance(marker, dict) else None
     if marker_kind not in _OUTPUT_TAIL_TERMINAL_MARKERS:
@@ -1468,7 +1469,7 @@ def _wait_terminal_success_marker(record: dict | None) -> dict | None:
     marker = _last_line_is_terminal_marker(
         tail,
         ignore_prefix_lines=_ignore_prefix_lines((record or {}).get("prompt_path")),
-        kimi_output=(record or {}).get("agent") == "kimi",
+        kimi_output=moonshot_family((record or {}).get("agent")),
     )
     if marker and marker.get("kind") in SUCCESS_TERMINAL_MARKERS:
         return marker
@@ -2150,7 +2151,7 @@ def verify_artifacts(dispatch_id: str, *, project_root: str | None) -> dict:
         marker = _final_terminal_marker(
             tail,
             ignore_prefix_lines=_ignore_prefix_lines(record.get("prompt_path")),
-            kimi_output=record.get("agent") == "kimi",
+            kimi_output=moonshot_family(record.get("agent")),
         )
     # Only a SUCCESS marker (READY/COMPLETE/RESULT) declares deliverables — a FAILED:/
     # BLOCKED: marker that happens to name a path must NOT report it as a present artifact.

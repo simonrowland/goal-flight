@@ -51,7 +51,10 @@ class ReaderSpec:
 READERS = (
     ReaderSpec("codex", "codex", "codex_usage.py"),
     ReaderSpec("grok", "grok", "grok_usage.py"),
-    ReaderSpec("kimi", "kimi-code", "kimi_usage.py"),
+    # The ext-zone reader (scripts/ext/kimi_usage.py) and its payload contract
+    # (source "kimi_code_usages", label "kimi-code") are not ours to rename; the
+    # dispatch handle is "moonshot", so the DISPLAY label maps at this boundary.
+    ReaderSpec("kimi", "moonshot", "kimi_usage.py"),
     ReaderSpec("cursor", "cursor", "cursor_usage.py"),
     # QUARANTINED: no deep variant. Letting the claude reader run its full TUI
     # capture is not merely slow, it is unsafe - the capture does not reliably
@@ -352,7 +355,7 @@ def _normalize_kimi(record: Mapping[str, Any], now: float) -> dict[str, object]:
     if failure is not None:
         remaining, flag = failure
         return _row(
-            "kimi-code",
+            "moonshot",
             account=account,
             remaining=remaining,
             reset_at=reset_at,
@@ -366,7 +369,7 @@ def _normalize_kimi(record: Mapping[str, Any], now: float) -> dict[str, object]:
     ):
         flags = ("walled",)
     return _row(
-        "kimi-code",
+        "moonshot",
         account=account,
         remaining=remaining or "unknown",
         reset_at=reset_at,
@@ -685,7 +688,7 @@ def _record_provider(record: Mapping[str, object]) -> str | None:
     return {
         "openai": "codex",
         "xai": "grok",
-        "moonshot": "kimi-code",
+        "moonshot": "moonshot",
         "cursor": "cursor",
         "anthropic-session": "claude",
         "anthropic-cli-acp": "claude",

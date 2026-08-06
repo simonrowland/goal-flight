@@ -71,7 +71,9 @@ def test_normalizes_codex_epoch_and_walled_state():
 
 
 def test_normalizes_kimi_nested_usage_and_iso_reset():
-    spec = usage.ReaderSpec("kimi", "kimi-code", "kimi_usage.py")
+    # The ext reader's payload contract (key/label/source) keeps the kimi
+    # product names; the DISPLAY provider maps to the moonshot handle.
+    spec = usage.ReaderSpec("kimi", "moonshot", "kimi_usage.py")
     reset_iso = "2033-05-18T03:33:20Z"
     row = usage.normalize_payload(
         spec,
@@ -90,7 +92,7 @@ def test_normalizes_kimi_nested_usage_and_iso_reset():
         ],
     )[0]
 
-    assert row["provider"] == "kimi-code"
+    assert row["provider"] == "moonshot"
     assert row["account"] is None
     assert row["remaining"] == "66/100"
     assert row["reset_at"] == datetime.fromisoformat(
@@ -348,10 +350,10 @@ def test_erroring_and_garbage_readers_degrade(
 
 
 def test_missing_reader_degrades_to_one_unavailable_row(tmp_path: Path):
-    spec = usage.ReaderSpec("kimi", "kimi-code", "missing.py")
+    spec = usage.ReaderSpec("kimi", "moonshot", "missing.py")
 
     assert usage.run_reader(spec, readers_dir=tmp_path) == [
-        usage.unavailable_row("kimi-code")
+        usage.unavailable_row("moonshot")
     ]
 
 
@@ -406,7 +408,7 @@ def test_soonest_reset_selects_across_epoch_and_iso_sources():
     )
     kimi_reset = datetime.fromtimestamp(now + 3_000, tz=timezone.utc).isoformat()
     kimi = usage.normalize_payload(
-        usage.ReaderSpec("kimi", "kimi-code", "kimi_usage.py"),
+        usage.ReaderSpec("kimi", "moonshot", "kimi_usage.py"),
         [
             {
                 "label": "kimi-code",
@@ -425,7 +427,7 @@ def test_soonest_reset_selects_across_epoch_and_iso_sources():
 
     assert usage.soonest_reset(codex + kimi, now=now) is kimi[0]
     rendered = usage.render_table(codex + kimi, now=now)
-    assert "soonest reset: kimi-code in 50m" in rendered
+    assert "soonest reset: moonshot in 50m" in rendered
 
 
 def test_json_cli_shape_and_unavailable_exit_zero(tmp_path: Path, capsys):
@@ -715,7 +717,7 @@ def test_token_lapsed_renders_auto_heal_not_needs_login(tmp_path):
     from goalflight_usage import ReaderSpec, run_reader
     import json as _json
 
-    spec = ReaderSpec("kimi", "kimi-code", "r.py")
+    spec = ReaderSpec("kimi", "moonshot", "r.py")
     reader = tmp_path / "r.py"
     reader.write_text(
         "import json\n"

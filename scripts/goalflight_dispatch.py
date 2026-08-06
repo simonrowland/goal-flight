@@ -75,6 +75,7 @@ import goalflight_ledger
 import goalflight_quota_stuck
 import goalflight_session_status
 import goalflight_terminal
+from goalflight_agent_limits import moonshot_family
 from goalflight_codex_sandbox import codex_workspace_write_args
 from goalflight_liveness import active_monotonic, process_group_id, write_status
 from goalflight_watch import (
@@ -101,8 +102,8 @@ PRELAUNCH_CANDIDATE_STATES = frozenset(
 )
 QUEUE_PRIORITY_RANK = {lane: rank for rank, lane in enumerate(goalflight_capacity.PRIORITY_LANES)}
 QUEUE_DEFAULT_PRIORITY = "normal"
-PRESET_AGENTS = {"codex", "grok-code", "grok-research", "kimi"}
-STDIN_PROMPT_AGENTS = {"codex", "grok-code", "grok-research", "kimi"}
+PRESET_AGENTS = {"codex", "grok-code", "grok-research", "moonshot"}
+STDIN_PROMPT_AGENTS = {"codex", "grok-code", "grok-research", "moonshot"}
 DEFAULT_MAX_IDLE_SECS = 180.0
 _DASHBOARD_REFRESH_SUBCOMMAND = "dashboard-refresh"
 _DASHBOARD_REFRESH_MARKER = "goalflight-dashboard-refresh-v1"
@@ -110,7 +111,7 @@ _DASHBOARD_REFRESH_QUEUED_GRACE_S = 60 * 60
 _DASHBOARD_REFRESH_MAX_LIFETIME_S = 4 * 60 * 60
 _DASHBOARD_REFRESH_CLAIM_STALE_S = 30.0
 CODE_WRITER_MAX_IDLE_SECS = 600.0
-CODE_WRITER_AGENTS = {"codex", "codex-acp", "grok-code", "grok-acp", "kimi", "cursor", "cursor-agent"}
+CODE_WRITER_AGENTS = {"codex", "codex-acp", "grok-code", "grok-acp", "moonshot", "cursor", "cursor-agent"}
 
 
 class PreAdmitClass(Enum):
@@ -250,7 +251,7 @@ def _effective_os_sandbox(args) -> str:
     """Resolve the effective OS sandbox profile (non-raising, safe anywhere).
 
     Precedence: explicit --os-sandbox > legacy --read-only alias > agent default
-    (Kimi "off", otherwise "workspace-write"). Conflicts are surfaced separately by
+    (Moonshot "off", otherwise "workspace-write"). Conflicts are surfaced separately by
     _validate_os_sandbox_conflict.
     """
     explicit = getattr(args, "os_sandbox", None)
@@ -258,7 +259,7 @@ def _effective_os_sandbox(args) -> str:
         return explicit
     if getattr(args, "read_only", False):
         return "read-only"
-    if str(getattr(args, "agent", "")) == "kimi":
+    if str(getattr(args, "agent", "")) == "moonshot":
         return OS_SANDBOX_OFF
     return "workspace-write"
 
@@ -331,9 +332,9 @@ def _validate_os_sandbox_boundary(args) -> None:
 
 def _validate_agent_os_sandbox(args) -> None:
     profile = _effective_os_sandbox(args)
-    if str(getattr(args, "agent", "")) == "kimi" and profile != OS_SANDBOX_OFF:
+    if str(getattr(args, "agent", "")) == "moonshot" and profile != OS_SANDBOX_OFF:
         raise DispatchUsageError(
-            f"--agent kimi supports only --os-sandbox {OS_SANDBOX_OFF}; "
+            f"--agent moonshot supports only --os-sandbox {OS_SANDBOX_OFF}; "
             f"requested profile {profile!r} is not enforced (b-079)"
         )
 
@@ -834,14 +835,14 @@ def _repair_watcher_terminal_status(
     terminal_marker = _last_line_is_terminal_marker(
         tail,
         ignore_prefix_lines=ignore_prefix_lines,
-        kimi_output=getattr(args, "agent", None) == "kimi",
+        kimi_output=moonshot_family(getattr(args, "agent", None)),
     )
     if not terminal_marker and not worker_is_alive:
         terminal_marker = _final_terminal_marker(
             tail,
             ignore_prefix_lines=ignore_prefix_lines,
             suppress_unfenced_prompt_markers=True,
-            kimi_output=getattr(args, "agent", None) == "kimi",
+            kimi_output=moonshot_family(getattr(args, "agent", None)),
         )
     if not terminal_marker:
         terminal_marker = payload.get("terminal_marker")
@@ -1751,11 +1752,11 @@ def _status_reminder_lines(
             f"--status-json {status_path}"
         )
     else:
-        # Kimi renderer normalization keys off the production preset label;
-        # synthetic -bash-tail aliases are not first-class dispatch agents.
+        # Moonshot (kimi CLI) renderer normalization keys off the production
+        # preset label; synthetic -bash-tail aliases are not first-class dispatch agents.
         agent_label = (
-            "kimi"
-            if agent == "kimi"
+            "moonshot"
+            if agent == "moonshot"
             else (f"{agent}-bash-tail" if agent else "worker-bash-tail")
         )
         watch_parts = [
@@ -2019,7 +2020,7 @@ def _validate_before_side_effects(args, raw_argv: list[str]) -> None:
     if args.agent not in PRESET_AGENTS:
         raise DispatchUsageError(
             "no worker preset for --agent "
-            f"{args.agent!r} — use --agent codex|grok-code|grok-research|kimi with "
+            f"{args.agent!r} — use --agent codex|grok-code|grok-research|moonshot with "
             "--prompt/--prompt-file, or pass a raw worker after `-- <cmd...>`"
         )
     if args.agent in STDIN_PROMPT_AGENTS and not _prompt_requested(args):
@@ -2707,7 +2708,7 @@ def _worker_prompt_preamble(agent: str | None, *, orientation_path: Path | None 
     # (cursor, codex-acp, claude-acp) carry terminal state in the protocol, so
     # they do not need to be taught a text marker shape -- see
     # test_dispatch_steer.case_preamble_routing_matrix, which pins that split.
-    if agent in {"grok-code", "grok-research", "kimi"}:
+    if agent in {"grok-code", "grok-research", "moonshot"}:
         preambles.append(WORKER_EXECUTION_PREAMBLE)
     return "\n\n".join(preambles)
 
@@ -7394,7 +7395,7 @@ def _resolve_claim_terminal_outcome(
                 tail,
                 ignore_prefix_lines=ignore_prefix_lines,
                 suppress_unfenced_prompt_markers=True,
-                kimi_output=agent == "kimi",
+                kimi_output=moonshot_family(agent),
             )
         except Exception:
             return None
@@ -9010,7 +9011,7 @@ def build_worker(args, prompt_path, raw_argv: list[str]):
         if args.cwd:
             argv += ["--cwd", args.cwd]
         return argv, None
-    if args.agent == "kimi":
+    if args.agent == "moonshot":
         # kimi has no --cwd, is off-PATH, takes the prompt as an argv value, and -p auto-runs
         # tools (no --auto/-y — those are rejected with -p). Resolve the binary and cd in a
         # login shell, exec kimi so the pid IS kimi (bash-tail pgid handling unaffected).
@@ -9045,7 +9046,7 @@ def main(argv: list[str] | None = None) -> int:
         description="Crash-safe worker dispatch: detached worker + decoupled watcher."
     )
     parser.add_argument("--agent", default="worker",
-                        help="Preset (codex|grok-code|grok-research|kimi) OR a label when you pass `-- <cmd>`")
+                        help="Preset (codex|grok-code|grok-research|moonshot) OR a label when you pass `-- <cmd>`")
     parser.add_argument("--prompt-file", help="Prompt file (preset path)")
     parser.add_argument("--prompt", help="Inline prompt text (preset path; alternative to --prompt-file)")
     parser.add_argument(
@@ -9057,7 +9058,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--cwd", help="Worker working directory")
     parser.add_argument("--model", default=None,
-                        help="Worker model id (grok-code/grok-research/kimi/codex --model passthrough). "
+                        help="Worker model id (grok-code/grok-research/moonshot/codex --model passthrough). "
                              "Default = agent label's own default.")
     parser.add_argument("--read-only", action="store_true",
                         help="Read-only sandbox (review/analysis dispatches). Equivalent to "

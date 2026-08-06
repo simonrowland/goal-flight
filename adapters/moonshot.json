@@ -1,8 +1,8 @@
 {
   "schema": "goalflight.agent-adapter.v1",
-  "agent_id": "kimi",
+  "agent_id": "moonshot",
   "display_name": "Kimi Code CLI",
-  "agent_family": "kimi",
+  "agent_family": "moonshot",
   "providers": {
     "controller_provider": "none",
     "model_provider": "moonshot",
@@ -169,7 +169,7 @@
   },
   "host_projection": {
     "dispatch_presets": {
-      "kimi": {
+      "moonshot": {
         "transport": "bash_tail",
         "default_model": "kimi-code/k3",
         "notes": "Print-mode coding worker; bare -p auto-runs tools and rejects --auto/--yolo."

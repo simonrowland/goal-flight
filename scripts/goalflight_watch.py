@@ -28,6 +28,7 @@ import goalflight_ledger
 import goalflight_quota_stuck
 import goalflight_task
 import goalflight_terminal
+from goalflight_agent_limits import moonshot_family
 from goalflight_liveness import (
     LivenessThresholds,
     active_monotonic,
@@ -1551,7 +1552,7 @@ def main() -> int:
         terminal = _last_line_is_terminal_marker(
             tail,
             ignore_prefix_lines=ignore_prefix_lines,
-            kimi_output=args.agent == "kimi",
+            kimi_output=moonshot_family(args.agent),
         )
         if terminal:
             # Stability recheck (minimal gap protection): if bytes arrive within a short
@@ -1561,7 +1562,7 @@ def main() -> int:
             terminal = _last_line_is_terminal_marker(
                 tail,
                 ignore_prefix_lines=ignore_prefix_lines,
-                kimi_output=args.agent == "kimi",
+                kimi_output=moonshot_family(args.agent),
             )
         worker_is_alive, identity_reason, current_identity = worker_alive(args.pid, expected_identity)
         if worker_is_alive:
@@ -1689,7 +1690,7 @@ def main() -> int:
                 reconciled = _final_terminal_marker(
                     tail,
                     ignore_prefix_lines=ignore_prefix_lines,
-                    kimi_output=args.agent == "kimi",
+                    kimi_output=moonshot_family(args.agent),
                 )
                 if reconciled:
                     terminal_seen = reconciled
@@ -1716,7 +1717,7 @@ def main() -> int:
             reconciled = _final_terminal_marker(
                 tail,
                 ignore_prefix_lines=ignore_prefix_lines,
-                kimi_output=args.agent == "kimi",
+                kimi_output=moonshot_family(args.agent),
             )
             if not reconciled:
                 recorded = _recorded_terminal_success_marker(payload)
@@ -1746,7 +1747,7 @@ def main() -> int:
                     reconciled = _final_terminal_marker(
                         tail,
                         ignore_prefix_lines=ignore_prefix_lines,
-                        kimi_output=args.agent == "kimi",
+                        kimi_output=moonshot_family(args.agent),
                     )
                     if reconciled:
                         terminal_seen = reconciled

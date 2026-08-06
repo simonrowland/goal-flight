@@ -511,6 +511,7 @@ PY
 import pathlib
 import sys
 
+from goalflight_agent_limits import moonshot_family
 from goalflight_watch import _last_line_is_terminal_marker
 
 tail = pathlib.Path(sys.argv[1])
@@ -524,7 +525,7 @@ if prompt_arg:
 marker = _last_line_is_terminal_marker(
     tail,
     ignore_prefix_lines=prompt_lines,
-    kimi_output=agent == "kimi",
+    kimi_output=moonshot_family(agent),
 )
 if marker:
     print(f"{marker['line']}:{marker['kind']}:{marker['text']}")
@@ -539,6 +540,7 @@ final_terminal_marker() {
 import pathlib
 import sys
 
+from goalflight_agent_limits import moonshot_family
 from goalflight_watch import _final_terminal_marker
 
 tail = pathlib.Path(sys.argv[1])
@@ -552,7 +554,7 @@ if prompt_arg:
 marker = _final_terminal_marker(
     tail,
     ignore_prefix_lines=prompt_lines,
-    kimi_output=agent == "kimi",
+    kimi_output=moonshot_family(agent),
 )
 if marker:
     print(f"{marker['line']}:{marker['kind']}:{marker['text']}")

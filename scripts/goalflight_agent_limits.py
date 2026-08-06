@@ -3,6 +3,11 @@
 
 Pure leaf module: imports neither goalflight_capacity nor goalflight_rate_pressure.
 
+Also hosts the agent-handle plumbing: ``normalize_agent``, the retired-handle
+legacy mapping (``LEGACY_AGENT_HANDLES`` / ``canonical_agent_label`` /
+``moonshot_family``) consulted by RECORD-READING paths, and ``cap_pool``.
+Input validation (dispatch presets, capacity acquire) must not canonicalize.
+
 The values below are the *committed generic baseline*. They are deliberately
 conservative-by-scaling: the machine-global operating cap in goalflight_capacity
 is RAM-tiered, so on a small box these high per-agent caps are never reached.
@@ -30,7 +35,7 @@ AGENT_RSS_MB = {
     "grok-research": 200,
     "codex": 386,
     "codex-acp": 386,
-    "kimi": 386,
+    "moonshot": 386,
     "claude": 614,
     "claude-code-cli-acp": 614,
     "cursor": 1203,
@@ -73,7 +78,7 @@ DEFAULT_AGENT_CAPS = {
     # reasoning as the 2026-06-16 global 20->32 bump.
     "codex": 18,
     "codex-acp": 18,
-    "kimi": 6,
+    "moonshot": 6,
     "grok": 30,
     "grok-acp": 30,
     "grok-code": 30,
@@ -97,9 +102,32 @@ def normalize_agent(agent: str) -> str:
     return agent.strip().lower()
 
 
+# Retired dispatch handles -> successor handle. Ledgers, leases, and status
+# files written before a rename carry the old label forever, so RECORD-READING
+# paths (rendering, reconciliation, marker quirks, capacity accounting, usage
+# evidence) map the old label onto its successor here -- old records mean the
+# successor family. INPUT paths (dispatch preset validation, capacity acquire)
+# must NOT consult this map: new input under the retired handle fails with the
+# normal unknown-agent error, which is the migration mechanism.
+LEGACY_AGENT_HANDLES = {"kimi": "moonshot"}
+
+
+def canonical_agent_label(agent: object) -> str:
+    """Record-reading boundary: normalize and map retired handles to successors."""
+    label = normalize_agent(str(agent or ""))
+    return LEGACY_AGENT_HANDLES.get(label, label)
+
+
+def moonshot_family(agent: object) -> bool:
+    """True when a label -- new input or legacy record value -- names the
+    Moonshot (kimi CLI) worker family. Drives the kimi-output marker dialect
+    for both new ``moonshot`` dispatches and legacy ``kimi`` records."""
+    return canonical_agent_label(agent) == "moonshot"
+
+
 def cap_pool(agent: str) -> str:
     """Map agent label to the shared capacity pool key."""
-    agent = normalize_agent(agent)
+    agent = canonical_agent_label(agent)
     return AGENT_CAP_POOL.get(agent, agent)
 
 
@@ -163,7 +191,9 @@ def _merge_int_map(target: dict, override: object) -> None:
         except (TypeError, ValueError):
             continue
         if parsed > 0:
-            target[normalize_agent(str(key))] = parsed
+            # Canonicalize so a pre-rename machine profile keyed by a retired
+            # handle (e.g. "kimi") keeps tuning the same lane ("moonshot").
+            target[canonical_agent_label(str(key))] = parsed
 
 
 LOCAL_OVERRIDES = load_local_overrides()

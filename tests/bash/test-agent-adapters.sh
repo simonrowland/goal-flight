@@ -36,11 +36,11 @@ def load(name):
 
 
 codex = load("codex")
-kimi = load("kimi")
+moonshot = load("moonshot")
 
-kimi_sandbox = kimi["permission_surface"]["os_sandbox"]
-if kimi_sandbox["supported_profiles"] != ["off"] or kimi_sandbox["implementation"] != "unsupported":
-    raise SystemExit(f"kimi must not advertise an unenforced OS sandbox: {kimi_sandbox}")
+moonshot_sandbox = moonshot["permission_surface"]["os_sandbox"]
+if moonshot_sandbox["supported_profiles"] != ["off"] or moonshot_sandbox["implementation"] != "unsupported":
+    raise SystemExit(f"moonshot must not advertise an unenforced OS sandbox: {moonshot_sandbox}")
 
 
 def expect_error(label, manifest, needle):
@@ -232,28 +232,28 @@ expect_denied(
 )
 
 expect_denied(
-    "kimi-worker-only-controller",
-    kimi,
+    "moonshot-worker-only-controller",
+    moonshot,
     "unsupported",
     role="controller",
     local_state={"controller": "ready", "worker": "ready"},
 )
 expect_denied(
-    "kimi-cli-json-not-implemented",
-    kimi,
+    "moonshot-cli-json-not-implemented",
+    moonshot,
     "probe_required",
     role="worker",
     requested_transport="cli_json",
     local_state={"controller": "ready", "worker": "ready"},
 )
-kimi_tail = validate_adapter_gate(
-    kimi,
+moonshot_tail = validate_adapter_gate(
+    moonshot,
     role="worker",
     requested_transport="tail_file",
     local_state={"controller": "ready", "worker": "ready"},
 )
-if not kimi_tail["allowed"]:
-    raise SystemExit(f"kimi tail-file worker should remain allowed when ready: {kimi_tail}")
+if not moonshot_tail["allowed"]:
+    raise SystemExit(f"moonshot tail-file worker should remain allowed when ready: {moonshot_tail}")
 
 config_only = copy.deepcopy(codex)
 config_only["support"]["controller"]["capability"] = "unsupported"

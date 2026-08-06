@@ -53,6 +53,10 @@ def test_provider_for_known_aliases():
     assert_eq("claude → anthropic-session", rp.provider_for("claude"), "anthropic-session")
     assert_eq("claude-code-cli-acp → anthropic-cli-acp",
               rp.provider_for("claude-code-cli-acp"), "anthropic-cli-acp")
+    # The moonshot handle and legacy records carrying the retired "kimi" label
+    # draw from the same Moonshot budget.
+    assert_eq("moonshot → moonshot", rp.provider_for("moonshot"), "moonshot")
+    assert_eq("kimi (legacy) → moonshot", rp.provider_for("kimi"), "moonshot")
 
 
 def test_provider_for_unknown():
@@ -671,10 +675,12 @@ def test_recommend_fallback_providers_populated():
 
 
 def test_recommend_moonshot_fallback_providers_populated():
-    """One Kimi account means Moonshot pressure requires cross-provider rerouting."""
-    out = rp.recommend({"provider:moonshot": 3}, {"kimi": 6}, threshold=3)
+    """One Kimi account means Moonshot pressure requires cross-provider rerouting.
+    The walkback covers the current handle and the legacy record label alike —
+    both draw from the same Moonshot budget."""
+    out = rp.recommend({"provider:moonshot": 3}, {"moonshot": 6, "kimi": 6}, threshold=3)
     pup = out["providers_under_pressure"][0]
-    assert_eq("moonshot kimi cap halved", pup["recommended_caps"], {"kimi": 3})
+    assert_eq("moonshot cap halved", pup["recommended_caps"], {"moonshot": 3, "kimi": 3})
     assert_eq("moonshot cross-provider fallback", pup["fallback_providers"], ["codex", "grok"])
 
 

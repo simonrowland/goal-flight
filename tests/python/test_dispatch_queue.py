@@ -1791,7 +1791,7 @@ def test_stale_claim_result_marker_with_rate_limit_text_completes() -> None:
         assert status_payload.get("terminal_marker", {}).get("kind") == "RESULT", status_payload
 
 
-def test_claim_recovery_terminal_marker_normalization_is_kimi_only() -> None:
+def test_claim_recovery_terminal_marker_normalization_is_moonshot_family() -> None:
     with tempfile.TemporaryDirectory() as td:
         tail = Path(td) / "normalized-marker.tail"
         tail.write_text("  COMPLETE: normalized terminal marker\n", encoding="utf-8")
@@ -1807,6 +1807,18 @@ def test_claim_recovery_terminal_marker_normalization_is_kimi_only() -> None:
             assert state == "worker_dead", (agent, state, reason, marker)
             assert marker is None, (agent, marker)
 
+        # The current handle normalizes kimi-dialect continuation markers...
+        state, reason, marker = D._resolve_claim_terminal_outcome(
+            {},
+            reason="stale_claim_launch_token_lost",
+            tail=tail,
+            ignore_prefix_lines=[],
+            agent="moonshot",
+        )
+        assert state == "complete", (state, reason, marker)
+        assert marker and marker["kind"] == "COMPLETE", marker
+
+        # ...and so does a LEGACY record carrying the retired agent value.
         state, reason, marker = D._resolve_claim_terminal_outcome(
             {},
             reason="stale_claim_launch_token_lost",
@@ -4323,7 +4335,7 @@ def main() -> None:
     test_live_unlinked_cleanup_sites_agree_never_to_quarantine()
     test_unlinked_no_record_quarantine_freezes_ledger_absence()
     test_stale_claim_result_marker_with_rate_limit_text_completes()
-    test_claim_recovery_terminal_marker_normalization_is_kimi_only()
+    test_claim_recovery_terminal_marker_normalization_is_moonshot_family()
     test_drain_replay_argv_injects_queue_control_flags()
     test_drain_requires_token_matched_ledger_before_clearing_claim()
     test_legacy_claim_dead_worker_without_token_defers_fail_closed()

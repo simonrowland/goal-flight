@@ -27,6 +27,7 @@ from goalflight_agent_limits import (
     AGENT_CAP_POOL,
     AGENT_RSS_MB,
     DEFAULT_AGENT_CAPS,
+    LEGACY_AGENT_HANDLES,
     cap_pool,
     local_hard_cap,
     local_operating_total,
@@ -829,6 +830,16 @@ def cmd_profile(args: argparse.Namespace) -> int:
 
 def cmd_acquire(args: argparse.Namespace) -> int:
     agent = normalize_agent(args.agent)
+    successor = LEGACY_AGENT_HANDLES.get(agent)
+    if successor:
+        # INPUT boundary: the retired handle must not acquire capacity. Legacy
+        # leases still ACCOUNT against the successor pool via cap_pool(), but no
+        # new lease may be taken under the old label.
+        print(json.dumps({
+            "decision": "error",
+            "reason": f"agent {agent!r} is retired; acquire as {successor!r}",
+        }, sort_keys=True))
+        return 2
     prof = profile(args)
     rss_mb = args.mem_mb or AGENT_RSS_MB.get(agent, DEFAULT_WORST_WORKER_MB)
     with StateLock():

@@ -17,6 +17,7 @@ This script groups workers by the provider whose budget they consume:
   anthropic-api        claude (claude -p headless — API billing)
   openai               codex, codex-acp (same OpenAI subscription / API)
   xai                  grok
+  moonshot             moonshot (direct kimi CLI lane; legacy records: agent "kimi")
   cursor               cursor, cursor-agent (same Cursor subscription)
 
 Two codex labels share OpenAI budget; two cursor labels share Cursor budget.
@@ -95,6 +96,10 @@ AGENT_TO_PROVIDER: dict[str, str] = {
     "grok-code": "xai",
     "grok-research": "xai",
     "grok-bash-tail": "xai",
+    "moonshot": "moonshot",
+    # Legacy records carry agent "kimi" (retired handle); they mean the same
+    # Moonshot budget. Input validation never sees this entry — only record
+    # readers do.
     "kimi": "moonshot",
     "cursor": "cursor",
     "cursor-agent": "cursor",

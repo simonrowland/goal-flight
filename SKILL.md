@@ -388,7 +388,7 @@ Default routing by task:
 
 | Task | Default | Fallback 1 | Fallback 2 |
 |---|---|---|---|
-| Code-writing chunks | `goalflight_dispatch.py` codex worker | Alternate marker-reliable CLI worker (`grok-code` or `kimi`) with passing write-file probe | Host Agent — LAST RESORT only ‡ |
+| Code-writing chunks | `goalflight_dispatch.py` codex worker | Alternate marker-reliable CLI worker (`grok-code` or `moonshot`) with passing write-file probe | Host Agent — LAST RESORT only ‡ |
 | Research / web search | `goalflight_dispatch.py` `--agent grok-research` (read-only) | controller-direct | - |
 | Reviewer dispatches | gstack `/review` via review worker + concern-diverse sweep | any one alone | Claude Agent only when others unreachable |
 | Planning / decompose | code/planning worker | controller-direct | Claude Agent |
@@ -399,7 +399,7 @@ Default routing by task:
 Give a stronger-reasoning host-subagent tier a modest, deliberate judgment-heavy and read-heavy slice: nonzero in sustained runs, but never drain the limited pool; use it to relieve controller context, not to substitute for abundant CLI-worker capacity. Every judgment-bearing host-subagent prompt MUST begin with `protocols/subagent-preamble.md`. Scouts run before critical-path prompts with unverified premises fire; follow `protocols/scout.md`.
 
 ‡ **Host Agent as code executor = LAST RESORT, never a co-equal fallback.** Use
-only when EVERY CLI worker (codex, grok-code, kimi) is genuinely unreachable, not slow.
+only when EVERY CLI worker (codex, grok-code, moonshot) is genuinely unreachable, not slow.
 1. Confirm CLI workers are down with doctor/probe.
 2. `log()` + record degraded host-Agent fallback and why in RESUME-NOTES.
 3. Return to `goalflight_dispatch.py` when a CLI worker recovers.

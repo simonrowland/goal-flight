@@ -623,9 +623,10 @@ def case_codex_prompt_does_not_add_grok_contract() -> None:
 def case_preamble_routing_matrix() -> None:
     # Lock the shared execution-preamble routing across every agent label.
     worker_marker = goalflight_dispatch.WORKER_EXECUTION_PREAMBLE
-    for agent in ("grok-code", "grok-research", "kimi"):
+    for agent in ("grok-code", "grok-research", "moonshot"):
         assert worker_marker in goalflight_dispatch._worker_prompt_preamble(agent), agent
-    for agent in ("codex", "cursor", "claude", "claude-acp", "codex-acp", "opencode", None):
+    # "kimi" is the retired moonshot handle: not a preset, no worker preamble.
+    for agent in ("codex", "cursor", "claude", "claude-acp", "codex-acp", "opencode", "kimi", None):
         assert worker_marker not in goalflight_dispatch._worker_prompt_preamble(agent), agent
     # The steer preamble is always present regardless of agent.
     for agent in ("grok-code", "grok-research", "codex", None):
