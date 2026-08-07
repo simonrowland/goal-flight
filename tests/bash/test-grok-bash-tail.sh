@@ -94,8 +94,17 @@ if ! grep -q '^COMPLETE: true$' "$TAIL"; then
   exit 1
 fi
 
-if [ ! -f "$TARGET" ] || [ "$(tr -d '\n' < "$TARGET")" != "done" ]; then
-  echo "FAIL  tests/bash/test-grok-bash-tail.sh (expected file with content 'done')"
+# This test exists to prove the bash-tail + watcher plumbing works end to end, not
+# to police the model's punctuation. grok 1.0.0 embellishes literal-content
+# instructions: asked for "exactly the text done" it writes "done." (measured
+# 2026-08-07; 0.2.x wrote "done"). Normalise case, whitespace and trailing
+# punctuation before comparing. This still fails on an absent file, an empty file,
+# or content that is not the requested word — only the trimming is tolerant.
+ACTUAL="$(tr -d '\n' < "$TARGET" 2>/dev/null \
+  | tr '[:upper:]' '[:lower:]' \
+  | sed 's/[[:space:]]//g; s/[.!,;:]*$//')"
+if [ ! -f "$TARGET" ] || [ "$ACTUAL" != "done" ]; then
+  echo "FAIL  tests/bash/test-grok-bash-tail.sh (expected file with content 'done', got '${ACTUAL}')"
   ls -la "$WORKDIR" | sed 's/^/      /' || true
   sed 's/^/      /' "$TAIL" || true
   exit 1

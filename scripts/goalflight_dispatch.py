@@ -8982,12 +8982,13 @@ def build_worker(args, prompt_path, raw_argv: list[str]):
         # (it's grok's default), in exchange for auto-tracking + no stale pin.
         default_model = None
         # PERMISSION MODE — pass NO `--permission-mode` flag (do not "fix" by
-        # swapping the value). grok 0.2.39 regression (verified 2026-06-10): in
-        # single-turn `--prompt-file` mode, EVERY `--permission-mode` value stops
-        # the file-write tool from writing — none produce the file; only OMITTING
-        # the flag does. The tail varies by value (probe: grok-composer-2.5-fast,
-        # write-a-file prompt):
-        #   omit-flag    -> file written + DONE marker, rc=0   (the only one that works)
+        # swapping the value). Omitting is the only setting verified to work on
+        # BOTH grok versions measured so far, which is why it stays.
+        #
+        # grok 0.2.39 (verified 2026-06-10): in single-turn `--prompt-file` mode
+        # EVERY value stopped the file-write tool — none produced the file; only
+        # OMITTING did (probe: grok-composer-2.5-fast, write-a-file prompt):
+        #   omit-flag    -> file written + DONE marker, rc=0   (the only one that worked)
         #   default      -> 1-byte no-op, no file
         #   acceptEdits  -> 1-byte no-op, no file   (this is the value we shipped)
         #   auto         -> 0-byte no-op, no file
@@ -8995,11 +8996,25 @@ def build_worker(args, prompt_path, raw_argv: list[str]):
         # The empty no-ops (default/acceptEdits/auto) make the watcher record
         # worker_dead_no_terminal_marker — how the shipped acceptEdits killed 4
         # grok-research dispatches (~18-25s, empty tails) on 2026-06-10; dontAsk is
-        # worse, faking a clean finish with no artifact. All values are still listed
-        # in `grok --help`, so this is a CLI regression, not a parse error. No safe
-        # middle-ground value exists, bypassPermissions is too broad, and a
-        # per-dispatch healthcheck would tax every dispatch's critical path — so the
-        # fix is the deterministic omit, locked by a regression test
+        # worse, faking a clean finish with no artifact.
+        #
+        # grok 1.0.0 (re-measured 2026-08-07, same probe shape): the flag is still
+        # not safe, but the failure set MOVED — proof that pinning a value would
+        # have silently rotted:
+        #   omit-flag    -> file written + DONE marker, rc=0   (still correct)
+        #   auto         -> NOW WRITES (it did not on 0.2.39)
+        #   acceptEdits  -> no file, and the tail narrates "Creating `artifact.txt`
+        #                   with the requested contents." — prose describing a write
+        #                   it never performs, the worst failure mode of the set
+        #   default      -> no file, empty tail
+        #   dontAsk      -> no file, empty tail
+        # So `auto` became viable while `acceptEdits` stayed broken and grew a
+        # misleading narration. Omitting is unchanged across both versions.
+        #
+        # All values are listed in `grok --help` in both releases, so this is a CLI
+        # behaviour regression, not a parse error. bypassPermissions is too broad,
+        # and a per-dispatch healthcheck would tax every dispatch's critical path —
+        # so the fix is the deterministic omit, locked by a regression test
         # (tests/python/test_acp_model_passthrough.py). Same lesson as the stale
         # model note above: grok flags drift; re-validate before trusting one.
         argv = ["grok", "--prompt-file", str(prompt_path)]
