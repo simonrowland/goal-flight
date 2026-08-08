@@ -11,6 +11,7 @@ import os
 import subprocess
 import sys
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -736,6 +737,34 @@ def _install_stub_seat_api(
     monkeypatch.setenv("GOALFLIGHT_TEST_CODEX_HOME", str(home))
 
 
+def _usage_limit_text(days_ahead: int = 30) -> str:
+    """Real usage-limit phrasing with a reset that is ALWAYS in the future.
+
+    The vendor prints an absolute local timestamp ("try again at Aug 8th, 2026
+    1:41 PM"). Pinning a literal date here made the fixture a time bomb: it was
+    two days ahead when written and silently became a PAST reset, at which point
+    the requeue correctly declines to schedule a relaunch at an elapsed instant
+    and `not_before` is None -- so the test failed for a reason that had nothing
+    to do with the behaviour under test. Derive the date instead, so "exhausted
+    WITH a measured future reset" stays the thing being asserted.
+    """
+    when = datetime.now().astimezone() + timedelta(days=days_ahead)
+    suffix = (
+        "th"
+        if 11 <= when.day <= 13
+        else {1: "st", 2: "nd", 3: "rd"}.get(when.day % 10, "th")
+    )
+    stamp = (
+        f"{when.strftime('%b')} {when.day}{suffix}, {when.year} "
+        f"{when.strftime('%I').lstrip('0') or '12'}:{when.strftime('%M %p')}"
+    )
+    return (
+        "ERROR: You've hit your usage limit. Visit "
+        "https://chatgpt.com/codex/settings/usage to purchase more credits "
+        f"or try again at {stamp}."
+    )
+
+
 @pytest.mark.parametrize(
     ("failure_kind", "worker_text", "expect_state"),
     [
@@ -744,8 +773,7 @@ def _install_stub_seat_api(
         # classify as the measured exhausted kind, not the legacy literal.
         (
             "quota",
-            "ERROR: You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage "
-            "to purchase more credits or try again at Aug 8th, 2026 1:41 PM.",
+            _usage_limit_text(),
             "quota_exhausted",
         ),
         # Exhaustion phrasing with NO parseable reset: still the exhausted
@@ -1164,11 +1192,7 @@ def test_quota_reconcile_writes_the_measured_limit_state(tmp_path: Path) -> None
     classified the kind -- the field-asserting-unmeasured-state class.
     """
     tail = tmp_path / "reconcile.tail"
-    tail.write_text(
-        "ERROR: You've hit your usage limit. Visit https://chatgpt.com/codex/"
-        "settings/usage to purchase more credits or try again at Aug 8th, 2026 1:41 PM.\n",
-        encoding="utf-8",
-    )
+    tail.write_text(_usage_limit_text() + "\n", encoding="utf-8")
     state, reason = D._quota_limited_state_reason(
         "worker_dead", None, tail, agent="codex"
     )
