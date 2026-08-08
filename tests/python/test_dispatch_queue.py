@@ -2229,10 +2229,28 @@ def test_worker_dead_tail_rate_limit_reaches_pressure_sensor() -> None:
         assert any(
             "threshold override" in item for item in rate_pressure.get("policy_warnings") or []
         ), rate_pressure
-        assert any(
-            row.get("provider") == "openai" or row.get("budget_key") == "provider:openai"
+        # Dispatcher writes account=default when no seat was selected. With
+        # multi-seat billing (pool_map['codex']=None) that resolves to
+        # provider-ambiguous:openai — not the full provider:openai roster key.
+        # Without billing facts it would be provider:openai. Either way the
+        # entry must be openai-scoped and must not pull in undeclared labels.
+        openai_rows = [
+            row
             for row in rate_pressure["providers_under_pressure"]
-        ), rate_pressure
+            if row.get("provider") == "openai"
+            or str(row.get("budget_key") or "").endswith(":openai")
+        ]
+        assert openai_rows, rate_pressure
+        for row in openai_rows:
+            key = str(row.get("budget_key") or "")
+            assert key in {
+                "provider:openai",
+                "provider-ambiguous:openai",
+            } or key.startswith("account:openai:"), (key, row)
+            if key == "provider-ambiguous:openai":
+                labels = set(row.get("labels") or [])
+                assert "opencode" not in labels, row
+                assert "codex" in labels, row
 
 
 # ---------------------------------------------------------------------------

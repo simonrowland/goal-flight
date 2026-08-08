@@ -753,6 +753,13 @@ def adaptive_agent_cap(agent: str, base_agent_cap: int, pressure: dict | None = 
     agent = normalize_agent(agent)
     pool = cap_pool(agent)
     for entry in pressure.get("providers_under_pressure") or []:
+        if entry.get("scope") == "account":
+            # Capacity leases are keyed by agent pool/label and carry no account,
+            # so applying account-scoped pressure here would zero machine-global
+            # labels shared by every seat of the provider (stopping healthy
+            # siblings). account_quota_advisory is currently advisory only —
+            # no automated consumer holds or reroutes on it yet.
+            continue
         labels = [normalize_agent(str(label)) for label in entry.get("labels") or []]
         if agent not in labels and pool not in labels:
             continue
@@ -797,19 +804,32 @@ def rate_pressure_warnings(pressure: dict | None, limit: int = 5) -> list[str]:
     window = pressure.get("window_seconds")
     for entry in (pressure.get("providers_under_pressure") or [])[:limit]:
         caps = []
-        display_caps = entry.get("effective_caps") or entry.get("recommended_caps") or {}
+        account_scoped = entry.get("scope") == "account"
+        display_caps = (
+            {}
+            if account_scoped
+            else entry.get("effective_caps") or entry.get("recommended_caps") or {}
+        )
         for label, cap in sorted(display_caps.items()):
             current = (entry.get("current_caps") or {}).get(label)
             caps.append(f"{label} {current}->{cap}" if current is not None else f"{label}->{cap}")
-        if entry.get("scope") == "agent":
+        if entry.get("scope") in {"agent", "account"}:
             subject = entry.get("budget_key") or "unknown"
         else:
             subject = entry.get("provider") or entry.get("budget_key") or "unknown"
+        if account_scoped:
+            # Capacity never holds account scope; wording must stay advisory-only.
+            action = (
+                "account-lane advisory only, no automated consumer; "
+                "label caps unchanged"
+            )
+        else:
+            action = "new dispatches wait"
         warnings.append(
             "adaptive rate pressure "
             f"{subject}: count={entry.get('count')}/{threshold} window={window}s; "
             f"stuck={entry.get('stuck_worker_count', 0)}; "
-            f"effective caps {', '.join(caps) or 'n/a'}; new dispatches wait"
+            f"effective caps {', '.join(caps) or 'n/a'}; {action}"
         )
     if pressure.get("error"):
         warnings.append(f"adaptive rate pressure unavailable: {pressure.get('error')}")

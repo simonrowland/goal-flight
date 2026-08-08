@@ -130,6 +130,25 @@ PROVIDER_FALLBACK: dict[str, list[str]] = {
 ACCOUNT_RATE_LIMIT_SCOPE = "account_rate_limit"
 MODEL_CAPACITY_SCOPE = "model_capacity"
 
+# Both goalflight_dispatch._record_queued_ledger_fast and
+# goalflight_ledger.cmd_record write this value when no --account was selected.
+# It is an absence marker, unlike qualified billing keys such as
+# "openai/default", which identify real configured accounts.
+ACCOUNT_PLACEHOLDERS = frozenset({"default"})
+
+# Billing account keys use vendor namespaces while pressure providers sometimes
+# distinguish transports (for example Anthropic session vs CLI).  A namespace
+# may therefore describe more than one pressure provider, but every record's
+# agent label still selects exactly one provider-qualified account lane.
+ACCOUNT_NAMESPACE_PROVIDERS: dict[str, frozenset[str]] = {
+    "anthropic": frozenset({"anthropic-session", "anthropic-cli-acp", "anthropic-api"}),
+    "cursor": frozenset({"cursor"}),
+    "grok": frozenset({"xai"}),
+    "moonshot": frozenset({"moonshot"}),
+    "openai": frozenset({"openai"}),
+    "xai": frozenset({"xai"}),
+}
+
 
 class LimitPattern(str):
     """String-compatible entry in the one authoritative signature table."""
@@ -345,30 +364,192 @@ def load_billing_accounts(fleet_dir: Path | None = None) -> dict | None:
         return None
 
 
-def agent_limit_pool_map(billing_doc: dict | None) -> dict[str, str]:
-    """Map agent label → limit_pool_id from fleet billing facts."""
-    out: dict[str, str] = {}
+class AgentLimitPoolMap(dict):
+    """Label pools plus account pools used to resolve dispatch records."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.account_pools: dict[str, str | None] = {}
+        self.account_declared_keys: dict[str, str] = {}
+        self.provider_accounts: dict[str, list[str]] = {}
+        self.billing_accounts_present = False
+
+
+def _account_budget_key(provider: str, account: str) -> str:
+    """Return a collision-safe account key, normalizing a matching namespace."""
+    local_account = account.strip()
+    namespace, separator, suffix = local_account.partition("/")
+    if separator and provider in ACCOUNT_NAMESPACE_PROVIDERS.get(namespace, frozenset()):
+        local_account = suffix
+    return f"account:{provider}:{local_account}"
+
+
+def account_budget_key_for_agent(agent_label: str, account: str) -> str | None:
+    """Qualify a local account alias by the provider selected by its agent."""
+    provider = provider_for(agent_label)
+    account = str(account or "").strip()
+    if not provider or not account:
+        return None
+    return _account_budget_key(provider, account)
+
+
+def agent_limit_pool_map(billing_doc: dict | None) -> AgentLimitPoolMap:
+    """Map label pools and provider-qualified billing accounts."""
+    out = AgentLimitPoolMap()
     if not billing_doc:
         return out
-    for account in billing_doc.get("accounts") or []:
+    accounts = billing_doc.get("accounts") or []
+    out.billing_accounts_present = bool(accounts)
+    for account in accounts:
         pool_id = account.get("limit_pool_id")
+        account_key = account.get("account_key")
+        labels = [str(label) for label in account.get("agent_labels") or []]
+        if account_key:
+            account_key = str(account_key)
+            account_pool = str(pool_id) if pool_id else None
+            providers = {provider_for(label) for label in labels}
+            providers.discard(None)
+            if not providers:
+                namespace = account_key.partition("/")[0]
+                providers.update(ACCOUNT_NAMESPACE_PROVIDERS.get(namespace, frozenset()))
+            for provider in sorted(providers):
+                qualified_key = _account_budget_key(provider, account_key)
+                if qualified_key not in out.account_pools:
+                    out.account_pools[qualified_key] = account_pool
+                elif out.account_pools[qualified_key] != account_pool:
+                    out.account_pools[qualified_key] = None
+                out.account_declared_keys[qualified_key] = account_key
+                declared = out.provider_accounts.setdefault(provider, [])
+                if account_key not in declared:
+                    declared.append(account_key)
         if not pool_id:
             continue
-        for label in account.get("agent_labels") or []:
-            out[str(label)] = str(pool_id)
+        pool_id = str(pool_id)
+        for label in labels:
+            if label not in out:
+                out[label] = pool_id
+            elif out[label] != pool_id:
+                out[label] = None
     return out
 
 
-def budget_key_for_agent(agent_label: str, *, pool_map: dict[str, str] | None = None) -> str | None:
-    """Prefer limit_pool_id; fall back to legacy provider key."""
-    if pool_map:
-        pool = pool_map.get(agent_label)
+def budget_key_for_agent(
+    agent_label: str,
+    *,
+    pool_map: dict[str, str | None] | None = None,
+) -> str | None:
+    """Prefer limit_pool_id; keep multi-pool ambiguity off the full provider roster.
+
+    When several billing accounts claim the same label, ``pool_map[label]`` is
+    ``None``. Falling through to ``provider:<name>`` would group that pressure
+    with *every* ``AGENT_TO_PROVIDER`` label for the provider — including labels
+    no billing account listed (measured: ``codex`` + ``account=default`` pulled
+    ``opencode*`` into the same cap set). Ambiguous declared labels use a
+    distinct key that expands only to labels that actually declared the agent.
+    """
+    if pool_map is not None and agent_label in pool_map:
+        pool = pool_map[agent_label]
         if pool:
             return f"pool:{pool}"
+        # Declared in billing by multiple pools (value is None). Distinct key so
+        # recommend() only attaches other multi-pool-declared labels for this
+        # provider — never labels absent from billing entirely.
+        provider = provider_for(agent_label)
+        if provider:
+            return f"provider-ambiguous:{provider}"
+        return None
     provider = provider_for(agent_label)
     if provider:
         return f"provider:{provider}"
     return None
+
+
+def _budget_key_for_record(
+    record: dict,
+    agent_label: str,
+    *,
+    pool_map: dict[str, str | None] | None,
+) -> str | None:
+    effective_account = str(record.get("effective_account") or "").strip()
+    if effective_account in ACCOUNT_PLACEHOLDERS:
+        effective_account = ""
+    account = str(record.get("account") or "").strip()
+    if account in ACCOUNT_PLACEHOLDERS:
+        account = ""
+    account = effective_account or account
+    billing_accounts_present = getattr(pool_map, "billing_accounts_present", None)
+    account_scoping_available = (
+        bool(pool_map)
+        if billing_accounts_present is None
+        else bool(billing_accounts_present)
+    )
+    if account and account_scoping_available:
+        return account_budget_key_for_agent(agent_label, account)
+    return budget_key_for_agent(agent_label, pool_map=pool_map)
+
+
+def budget_key_for_record(
+    record: dict,
+    agent_label: str,
+    *,
+    pool_map: dict[str, str | None] | None,
+) -> str | None:
+    """Public record-aware budget key used by both pressure channels."""
+    return _budget_key_for_record(record, agent_label, pool_map=pool_map)
+
+
+def _labels_for_account_key(
+    budget_key: str,
+    pool_map: dict[str, str | None] | None,
+) -> tuple[list[str], str | None, str | None, str | None, dict[str, Any]]:
+    """Resolve dispatch labels from the provider-qualified account lane."""
+    parts = budget_key.split(":", 2)
+    if len(parts) != 3 or parts[0] != "account" or not parts[1] or not parts[2]:
+        return [], None, None, None, {
+            "status": "unresolved",
+            "reason": "account_budget_key_not_provider_qualified",
+        }
+    provider, account_key = parts[1], parts[2]
+    labels = [label for label in AGENT_TO_PROVIDER if provider_for(label) == provider]
+    if not labels:
+        return [], None, provider, account_key, {
+            "status": "unresolved",
+            "reason": "no_dispatch_labels_for_account_provider",
+            "provider": provider,
+        }
+    account_pools = getattr(pool_map, "account_pools", None)
+    if account_pools is None:
+        return labels, None, provider, account_key, {
+            "status": "resolved_with_warning",
+            "source": "budget_key_provider",
+            "reason": "billing_account_map_unavailable",
+            "provider": provider,
+        }
+    if budget_key not in account_pools:
+        return labels, None, provider, account_key, {
+            "status": "resolved_with_warning",
+            "source": "budget_key_provider",
+            "reason": "ledger_account_not_declared_in_billing",
+            "provider": provider,
+            "ledger_account_key": account_key,
+            "declared_account_keys": list(
+                getattr(pool_map, "provider_accounts", {}).get(provider, [])
+            ),
+        }
+    pool_id = account_pools[budget_key]
+    if not pool_id:
+        return labels, None, provider, account_key, {
+            "status": "resolved_with_warning",
+            "source": "billing_account_provider",
+            "reason": "account_limit_pool_unresolved",
+            "provider": provider,
+        }
+    return labels, pool_id, provider, account_key, {
+        "status": "resolved",
+        "source": "billing_account_provider",
+        "provider": provider,
+        "declared_account_key": getattr(pool_map, "account_declared_keys", {}).get(budget_key),
+    }
 
 
 def _default_state_dir() -> Path:
@@ -504,13 +685,16 @@ def pressure_per_provider(
     window_seconds: int = 600,
     now_ts: float | None = None,
     *,
-    pool_map: dict[str, str] | None = None,
+    pool_map: dict[str, str | None] | None = None,
 ) -> dict[str, int]:
     """Count pressure signatures per budget key within window.
 
-    Keys are `pool:<limit_pool_id>` when fleet billing map is available,
-    otherwise `provider:<provider_key>`. Model-capacity signals use
-    `agent:<label>` because they are not account-wide quota signals.
+    Real account-bearing records use `account:<provider>:<local_account>`.
+    Placeholder or absent account values use the legacy label-derived
+    pool/provider key. When billing facts are unavailable, all records retain
+    that legacy behavior.
+    Model-capacity signals use `agent:<label>` because they are not account-wide
+    quota signals.
     """
     if now_ts is None:
         now_ts = time.time()
@@ -530,7 +714,7 @@ def pressure_per_provider(
         if scope == MODEL_CAPACITY_SCOPE:
             key = f"agent:{str(agent).strip().lower()}"
         else:
-            key = budget_key_for_agent(agent, pool_map=pool_map)
+            key = _budget_key_for_record(record, str(agent), pool_map=pool_map)
         if not key:
             continue
         counts[key] = counts.get(key, 0) + 1
@@ -542,7 +726,7 @@ def recommend(
     current_caps: dict[str, int],
     threshold: int = 3,
     *,
-    pool_map: dict[str, str] | None = None,
+    pool_map: dict[str, str | None] | None = None,
 ) -> dict[str, Any]:
     """Build a recommendation payload.
 
@@ -565,27 +749,44 @@ def recommend(
     for budget_key, count in sorted(pressure.items(), key=lambda kv: -kv[1]):
         if count < threshold:
             continue
-        labels = label_groups.get(budget_key, [])
+        labels = list(label_groups.get(budget_key, []))
         scope = "provider"
+        provider = None
+        account_key = None
+        label_resolution = None
+        limit_pool_id = budget_key.split(":", 1)[1] if budget_key.startswith("pool:") else None
+        if budget_key.startswith("account:"):
+            scope = "account"
+            labels, limit_pool_id, provider, account_key, label_resolution = _labels_for_account_key(
+                budget_key,
+                pool_map,
+            )
         if budget_key.startswith("agent:"):
             scope = "agent"
             agent_label = budget_key.split(":", 1)[1]
             labels = labels or [agent_label]
-        recommended_caps = {
-            label: max(1, current_caps.get(label, 5) // 2)
-            for label in labels
-        }
-        provider = budget_key.split(":", 1)[1] if budget_key.startswith("provider:") else None
-        limit_pool_id = budget_key.split(":", 1)[1] if budget_key.startswith("pool:") else None
-        if limit_pool_id and pool_map:
+        if budget_key.startswith("provider-ambiguous:"):
+            # Multi-pool-declared labels only (built via budget_key_for_agent).
+            # Capacity may still act on these label caps; labels never listed in
+            # billing do not share this key.
+            provider = budget_key.split(":", 1)[1]
+        elif budget_key.startswith("provider:"):
+            provider = budget_key.split(":", 1)[1]
+        if limit_pool_id and pool_map and not account_key:
             for label, pool in pool_map.items():
                 if pool == limit_pool_id and label not in labels:
                     labels.append(label)
+            provider = provider or provider_for(labels[0]) if labels else None
+        # Account-scoped pressure has no capacity actuator (leases are label/pool
+        # keyed). Emitting cap-shaped recommended_caps would look actuatable to
+        # doctor/status while adaptive_agent_cap deliberately ignores the entry.
+        if scope == "account":
+            recommended_caps: dict[str, int] = {}
+        else:
             recommended_caps = {
                 label: max(1, current_caps.get(label, 5) // 2)
                 for label in labels
             }
-            provider = provider or provider_for(labels[0]) if labels else None
         if scope == "agent":
             provider = provider_for(labels[0]) if labels else provider
         fallback = PROVIDER_FALLBACK.get(provider or "", [])
@@ -600,6 +801,10 @@ def recommend(
             "recommended_caps": recommended_caps,
             "fallback_providers": fallback,
         }
+        if account_key is not None:
+            entry["account_key"] = account_key
+        if label_resolution is not None:
+            entry["label_resolution"] = label_resolution
         out["providers_under_pressure"].append(entry)
     return out
 

@@ -177,7 +177,11 @@ def provider_for_agent(agent: object) -> str | None:
     return goalflight_rate_pressure.provider_for(str(agent or "").strip())
 
 
-def budget_key_for_agent(agent: object, *, pool_map: dict[str, str] | None = None) -> str | None:
+def budget_key_for_agent(
+    agent: object,
+    *,
+    pool_map: dict[str, str | None] | None = None,
+) -> str | None:
     return goalflight_rate_pressure.budget_key_for_agent(str(agent or "").strip(), pool_map=pool_map)
 
 
@@ -400,16 +404,45 @@ def _record_non_complete(record: dict) -> bool:
     )
 
 
-def _entry_matches_record(entry: dict, record: dict, *, pool_map: dict[str, str] | None = None) -> bool:
+def _entry_matches_record(
+    entry: dict,
+    record: dict,
+    *,
+    pool_map: dict[str, str | None] | None = None,
+) -> bool:
+    """Return True only when this stuck record belongs to this pressure entry.
+
+    Match contract (exact, no bare-provider widening):
+      - ``account:`` keys → record's budget_key_for_record equals the entry key
+      - ``agent:`` keys → record agent equals the entry agent
+      - all other keys (``provider:``, ``provider-ambiguous:``, ``pool:``, …) →
+        the record's agent is in the entry's label set, OR the record agent's
+        own budget_key_for_agent equals the entry budget_key.
+
+    A bare provider-name match is intentionally absent: it attached any same-
+    provider worker (e.g. opencode) to an entry whose labels deliberately
+    excluded it (e.g. provider-ambiguous:openai with codex*), hard-stopping the
+    healthy labels while leaving the sick lane uncapped.
+    """
     agent = str(record.get("agent") or "").strip()
+    budget_key = entry.get("budget_key")
+    if isinstance(budget_key, str) and budget_key.startswith("account:"):
+        return (
+            goalflight_rate_pressure.budget_key_for_record(
+                record,
+                agent,
+                pool_map=pool_map,
+            )
+            == budget_key
+        )
+    if isinstance(budget_key, str) and budget_key.startswith("agent:"):
+        return budget_key == f"agent:{agent.lower()}"
     labels = {str(label).strip() for label in entry.get("labels") or [] if str(label).strip()}
     if labels and agent in labels:
         return True
-    budget_key = entry.get("budget_key")
     if budget_key and budget_key_for_agent(agent, pool_map=pool_map) == budget_key:
         return True
-    provider = entry.get("provider")
-    return bool(provider and provider_for_agent(agent) == provider)
+    return False
 
 
 def stuck_workers_for_entry(
@@ -418,7 +451,7 @@ def stuck_workers_for_entry(
     *,
     window_seconds: int,
     now_ts: float | None = None,
-    pool_map: dict[str, str] | None = None,
+    pool_map: dict[str, str | None] | None = None,
 ) -> list[dict[str, Any]]:
     now = time.time() if now_ts is None else now_ts
     stuck: list[dict[str, Any]] = []
@@ -433,6 +466,8 @@ def stuck_workers_for_entry(
                 "dispatch_id": record.get("dispatch_id"),
                 "agent": record.get("agent"),
                 "provider": provider_for_agent(record.get("agent")),
+                "account": record.get("account"),
+                "effective_account": record.get("effective_account"),
                 "worker_pid": record.get("worker_pid"),
                 "state": record.get("state"),
                 "classification": record.get("classification"),
@@ -452,7 +487,7 @@ def quota_pressure_per_provider(
     *,
     window_seconds: int,
     now_ts: float | None = None,
-    pool_map: dict[str, str] | None = None,
+    pool_map: dict[str, str | None] | None = None,
 ) -> dict[str, int]:
     now = time.time() if now_ts is None else now_ts
     counts: dict[str, int] = {}
@@ -463,11 +498,71 @@ def quota_pressure_per_provider(
         info = record_quota_signature(record, require_tail=True)
         if not info or not _record_recent_or_live(record, info, now_ts=now, window_seconds=window_seconds):
             continue
-        key = budget_key_for_agent(agent, pool_map=pool_map)
+        key = goalflight_rate_pressure.budget_key_for_record(
+            record,
+            str(agent),
+            pool_map=pool_map,
+        )
         if not key:
             continue
         counts[key] = counts.get(key, 0) + 1
     return counts
+
+
+def _account_quota_advisory(entry: dict, stuck: list[dict[str, Any]]) -> dict[str, Any]:
+    """Honest account-scoped signal — advisory only, no automated consumer.
+
+    Capacity leases are keyed by agent pool/label and carry no account, so
+    adaptive_agent_cap deliberately skips account scope. No other automated
+    consumer of ``account_quota_advisory`` exists yet; this is surface for
+    humans/status only, not a hold.
+    """
+    account_key = entry.get("account_key")
+    if not account_key:
+        budget_key = str(entry.get("budget_key") or "")
+        if budget_key.startswith("account:"):
+            parts = budget_key.split(":", 2)
+            if len(parts) == 3:
+                account_key = parts[2]
+    if not account_key:
+        accounts = {
+            str(item.get("effective_account") or item.get("account") or "").strip()
+            for item in stuck
+        }
+        accounts.discard("")
+        if len(accounts) == 1:
+            account_key = next(iter(accounts))
+    limit_kinds = sorted(
+        {
+            str(item.get("limit_kind"))
+            for item in stuck
+            if item.get("limit_kind")
+        }
+    )
+    reset_candidates = sorted(
+        {
+            str(item.get("reset_at"))
+            for item in stuck
+            if item.get("reset_at")
+        }
+    )
+    return {
+        "enforced_by_capacity": False,
+        "account_key": account_key,
+        "provider": entry.get("provider"),
+        "budget_key": entry.get("budget_key"),
+        "limit_kinds": limit_kinds,
+        "reset_at": reset_candidates[0] if len(reset_candidates) == 1 else None,
+        "reset_at_candidates": reset_candidates,
+        "stuck_worker_count": len(stuck),
+        "message": (
+            "Account-scoped quota signal is advisory only with no automated "
+            "consumer. Capacity leases are keyed by agent pool/label with no "
+            "account dimension, so this fact is not enforced by the capacity "
+            "gate and nothing currently holds or reroutes on "
+            "account_quota_advisory."
+        ),
+    }
 
 
 def decorate_pressure_payload(
@@ -475,7 +570,7 @@ def decorate_pressure_payload(
     records: list[dict],
     *,
     window_seconds: int,
-    pool_map: dict[str, str] | None = None,
+    pool_map: dict[str, str | None] | None = None,
 ) -> dict:
     out = dict(payload)
     decorated: list[dict] = []
@@ -492,13 +587,26 @@ def decorate_pressure_payload(
             }
             for item in stuck
         )
-        if entry.get("scope") != "agent" and hard_stop:
-            labels = [str(label) for label in entry.get("labels") or []]
+        if entry.get("scope") == "account" and hard_stop:
+            # Capacity has no account dimension on leases and deliberately skips
+            # account scope in adaptive_agent_cap. Do not set quota_hard_stop —
+            # status/advisory_lines treat that flag as an active hold, and no
+            # automated consumer holds this lane today. Publish advisory only.
+            entry["quota_hard_stop"] = False
+            entry["account_quota_advisory"] = _account_quota_advisory(entry, stuck)
+            entry.pop("effective_caps", None)
+            entry.pop("effective_account_cap", None)
+        elif entry.get("scope") != "agent" and hard_stop:
             entry["quota_hard_stop"] = True
+            labels = [str(label) for label in entry.get("labels") or []]
             entry["effective_caps"] = {label: 0 for label in labels}
+            entry.pop("effective_account_cap", None)
+            entry.pop("account_quota_advisory", None)
         else:
             entry["quota_hard_stop"] = False
             entry.pop("effective_caps", None)
+            entry.pop("effective_account_cap", None)
+            entry.pop("account_quota_advisory", None)
         decorated.append(entry)
     out["providers_under_pressure"] = decorated
     return out
@@ -524,10 +632,18 @@ def advisory_payload(entry: dict) -> dict[str, Any]:
         if kinds == {goalflight_dispatch_states.LIMIT_KIND_EXHAUSTED}
         else "provider limit unresolved"
     )
-    text = (
-        f"{provider} {condition}: {count} agent(s) stuck "
-        "- re-dispatch their tasks; holding new provider dispatch"
-    )
+    # Account scope is never held by capacity; do not claim a hold there.
+    if entry.get("scope") == "account":
+        text = (
+            f"{provider} {condition}: {count} agent(s) stuck "
+            "- re-dispatch their tasks; advisory only, no automated consumer "
+            "(capacity does not hold this lane)"
+        )
+    else:
+        text = (
+            f"{provider} {condition}: {count} agent(s) stuck "
+            "- re-dispatch their tasks; holding new provider dispatch"
+        )
     return {
         "text": text,
         "provider": entry.get("provider"),
@@ -545,6 +661,12 @@ def advisory_lines(pressure: dict | None, *, limit: int = 5) -> list[str]:
         return []
     lines: list[str] = []
     for entry in (pressure.get("providers_under_pressure") or [])[:limit]:
+        # Account advisories are not capacity holds (quota_hard_stop stays false);
+        # still surface the honest advisory-only line when present.
+        if entry.get("scope") == "account" and entry.get("account_quota_advisory"):
+            payload = advisory_payload(entry)
+            lines.append(f"quota: {payload['text']}")
+            continue
         if not entry.get("quota_hard_stop"):
             continue
         payload = advisory_payload(entry)

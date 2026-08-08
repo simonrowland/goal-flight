@@ -481,6 +481,376 @@ def _build_record(agent, state, updated_at, dispatch_id="d"):
     }
 
 
+def _three_openai_seat_billing():
+    shared_labels = ["codex", "codex-acp", "codex-bash-tail"]
+    return {
+        "schema": "goalflight.fleet.billing-accounts.v1",
+        "schema_version": 1,
+        "min_reader_version": 1,
+        "accounts": [
+            {
+                "account_key": "25ca6b",
+                "limit_pool_id": "openai-simon",
+                "agent_labels": shared_labels,
+            },
+            {
+                "account_key": "cf9f50",
+                "limit_pool_id": "openai-tim",
+                "agent_labels": shared_labels,
+            },
+            {
+                "account_key": "d78343",
+                "limit_pool_id": "openai-default",
+                "agent_labels": shared_labels,
+            },
+        ],
+    }
+
+
+def _real_billing_account_fixture():
+    """Non-secret routing fields from the measured billing-accounts.json."""
+    return {
+        "accounts": [
+            {
+                "account_key": "openai/simon",
+                "limit_pool_id": "openai-simon",
+                "agent_labels": ["codex", "codex-acp", "codex-bash-tail"],
+            },
+            {
+                "account_key": "openai/tim",
+                "limit_pool_id": "openai-tim",
+                "agent_labels": ["codex", "codex-acp", "codex-bash-tail"],
+            },
+            {
+                "account_key": "anthropic/simon",
+                "limit_pool_id": "anthropic-simon",
+                "agent_labels": ["claude", "claude-code-cli-acp"],
+            },
+            {
+                "account_key": "anthropic/tim",
+                "limit_pool_id": "anthropic-tim",
+                "agent_labels": ["claude", "claude-code-cli-acp"],
+            },
+            {
+                "account_key": "cursor/shared",
+                "limit_pool_id": "cursor-house",
+                "agent_labels": ["cursor-agent", "cursor-acp"],
+            },
+            {
+                "account_key": "grok/shared",
+                "limit_pool_id": "grok-house",
+                "agent_labels": ["grok", "grok-agent-stdio"],
+            },
+            {
+                "account_key": "openai/default",
+                "limit_pool_id": "openai-default",
+                "agent_labels": ["codex", "codex-acp", "codex-bash-tail"],
+            },
+        ],
+    }
+
+
+def test_real_ledger_distribution_treats_default_as_placeholder():
+    """The measured default records fall back by label, never one cross-provider seat."""
+    distribution = {
+        "claude": {"default": 2},
+        "codex": {"25ca6b": 85, "default": 11, "cf9f50": 19, "d78343": 10, "4c9435": 5},
+        "codex-acp": {None: 8},
+        "cursor": {"default": 3},
+        "grok-code": {"default": 61},
+        "grok-research": {"default": 6},
+        "kimi": {"default": 9},
+    }
+    pool_map = rp.agent_limit_pool_map(_real_billing_account_fixture())
+    now = time.time()
+    recent_iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now - 60))
+    records = []
+    for agent, accounts in distribution.items():
+        for account, count in accounts.items():
+            for idx in range(count):
+                record = _build_record(agent, "blocked_session_limit", recent_iso, f"{agent}-{account}-{idx}")
+                if account is not None:
+                    record["account"] = account
+                records.append(record)
+
+    counts = rp.pressure_per_provider(records, window_seconds=600, now_ts=now, pool_map=pool_map)
+    assert_eq("default never becomes a seat", counts.get("account:openai:default"), None)
+    assert_eq("xAI placeholders stay in xAI", counts.get("provider:xai"), 67)
+    assert_eq("Cursor placeholders stay in Cursor", counts.get("provider:cursor"), 3)
+    assert_eq("Moonshot placeholders stay in Moonshot", counts.get("provider:moonshot"), 9)
+    # Multi-pool-declared labels (pool_map[label]=None) with placeholder accounts
+    # use provider-ambiguous:<provider>, not provider:<provider>. Input path:
+    # codex account=default → ACCOUNT_PLACEHOLDERS cleared → budget_key_for_agent
+    # → provider-ambiguous:openai (19 = 11 codex default + 8 codex-acp None).
+    assert_eq(
+        "ambiguous OpenAI placeholders use ambiguous-provider key",
+        counts.get("provider-ambiguous:openai"),
+        19,
+    )
+    assert_eq(
+        "ambiguous OpenAI placeholders do not use full provider roster key",
+        counts.get("provider:openai"),
+        None,
+    )
+    assert_eq(
+        "ambiguous Anthropic placeholders use ambiguous-provider key",
+        counts.get("provider-ambiguous:anthropic-session"),
+        2,
+    )
+    assert_eq("real OpenAI seat one", counts.get("account:openai:25ca6b"), 85)
+    assert_eq("real OpenAI seat two", counts.get("account:openai:cf9f50"), 19)
+    assert_eq(
+        "configured ambiguous labels retain provider-separated ambiguous keys",
+        {agent: rp._budget_key_for_record({"account": "default"}, agent, pool_map=pool_map)
+         for agent in ("claude", "codex")},
+        {
+            "claude": "provider-ambiguous:anthropic-session",
+            "codex": "provider-ambiguous:openai",
+        },
+    )
+
+    # The real ledger alias is not a declared billing key, but the qualified
+    # provider still gives an honest label set. Account scope emits no
+    # recommended_caps (no actuator).
+    out = rp.recommend(counts, {label: 10 for label in rp.AGENT_TO_PROVIDER}, pool_map=pool_map)
+    entries = {entry["budget_key"]: entry for entry in out["providers_under_pressure"]}
+    ledger_entry = entries["account:openai:cf9f50"]
+    assert_eq(
+        "real ledger alias resolves every OpenAI dispatch label",
+        ledger_entry["labels"],
+        [
+            "codex",
+            "codex-acp",
+            "codex-bash-tail",
+            "opencode",
+            "opencode-acp",
+            "opencode-bash-tail",
+        ],
+    )
+    assert_eq("account scope emits empty recommended_caps", ledger_entry["recommended_caps"], {})
+    assert_eq("real ledger alias provider", ledger_entry["provider"], "openai")
+    assert_eq("real ledger alias resolution status", ledger_entry["label_resolution"]["status"], "resolved_with_warning")
+    assert_eq(
+        "real ledger mismatch is legible",
+        ledger_entry["label_resolution"]["reason"],
+        "ledger_account_not_declared_in_billing",
+    )
+    assert_true(
+        "real billing vocabulary is named",
+        "openai/tim" in ledger_entry["label_resolution"]["declared_account_keys"],
+    )
+
+    # Ambiguous provider pressure must only attach billing-declared labels.
+    ambiguous_entry = entries["provider-ambiguous:openai"]
+    assert_eq(
+        "ambiguous codex pressure labels stay in billing-declared set",
+        ambiguous_entry["labels"],
+        ["codex", "codex-acp", "codex-bash-tail"],
+    )
+    assert_true(
+        "opencode absent from ambiguous caps",
+        "opencode" not in ambiguous_entry["recommended_caps"],
+    )
+
+    canonical = rp.recommend(
+        {"account:openai:tim": 3},
+        {label: 10 for label in rp.AGENT_TO_PROVIDER},
+        pool_map=pool_map,
+    )["providers_under_pressure"][0]
+    assert_eq("canonical account resolves same labels", canonical["labels"], ledger_entry["labels"])
+    assert_eq("canonical account resolves pool", canonical["limit_pool_id"], "openai-tim")
+    assert_eq("canonical billing match", canonical["label_resolution"]["status"], "resolved")
+    assert_eq("canonical account emits empty recommended_caps", canonical["recommended_caps"], {})
+
+
+def test_pressure_isolated_by_dispatch_seat_with_shared_labels():
+    """A dead seat must not add pressure to a live seat sharing its labels."""
+    now = time.time()
+    recent_iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now - 60))
+    pool_map = rp.agent_limit_pool_map(_three_openai_seat_billing())
+    records = []
+    for idx in range(3):
+        record = _build_record("codex", "blocked_session_limit", recent_iso, f"dead-{idx}")
+        record.update({"effective_account": "cf9f50", "account": "cf9f50"})
+        records.append(record)
+    for idx in range(41):
+        record = _build_record("codex", "complete", recent_iso, f"live-{idx}")
+        record.update({"effective_account": "25ca6b", "account": "25ca6b"})
+        records.append(record)
+
+    counts = rp.pressure_per_provider(records, window_seconds=600, now_ts=now, pool_map=pool_map)
+    assert_eq("only the exhausted seat is pressured", counts, {"account:openai:cf9f50": 3})
+
+
+def test_pressure_account_preference_fallback_and_model_scope():
+    """effective_account wins, account is next, then label; model scope stays label-only."""
+    billing = _three_openai_seat_billing()
+    billing["accounts"].append({
+        "account_key": "grok/shared",
+        "limit_pool_id": "grok-house",
+        "agent_labels": ["grok"],
+    })
+    pool_map = rp.agent_limit_pool_map(billing)
+    now = time.time()
+    recent_iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now - 60))
+
+    effective = _build_record("codex", "blocked_session_limit", recent_iso, "effective")
+    effective.update({"effective_account": "25ca6b", "account": "cf9f50"})
+    account = _build_record("codex", "blocked_session_limit", recent_iso, "account")
+    account["account"] = "cf9f50"
+    label = _build_record("grok", "blocked_session_limit", recent_iso, "label")
+    model = _build_record("codex", "failed", recent_iso, "model")
+    model.update({
+        "effective_account": "cf9f50",
+        "error": "ERROR: Selected model is at capacity. Please try a different model.",
+    })
+
+    counts = rp.pressure_per_provider(
+        [effective, account, label, model],
+        window_seconds=600,
+        now_ts=now,
+        pool_map=pool_map,
+    )
+    assert_eq(
+        "seat fallback order plus label/model exceptions",
+        counts,
+        {
+            "account:openai:25ca6b": 1,
+            "account:openai:cf9f50": 1,
+            "pool:grok-house": 1,
+            "agent:codex": 1,
+        },
+    )
+
+
+def test_unknown_account_is_own_key_but_missing_billing_keeps_legacy_key():
+    """Unknown seats stay isolated; unavailable billing facts preserve legacy behavior."""
+    now = time.time()
+    recent_iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now - 60))
+    record = _build_record("codex", "blocked_session_limit", recent_iso, "unknown")
+    record["account"] = "4c9435"
+
+    configured = rp.pressure_per_provider(
+        [record],
+        window_seconds=600,
+        now_ts=now,
+        pool_map=rp.agent_limit_pool_map(_three_openai_seat_billing()),
+    )
+    missing = rp.pressure_per_provider(
+        [record],
+        window_seconds=600,
+        now_ts=now,
+        pool_map=rp.agent_limit_pool_map(None),
+    )
+    empty = rp.pressure_per_provider(
+        [record],
+        window_seconds=600,
+        now_ts=now,
+        pool_map=rp.agent_limit_pool_map({"accounts": []}),
+    )
+    plain_configured_map = rp.pressure_per_provider(
+        [record],
+        window_seconds=600,
+        now_ts=now,
+        pool_map={"codex": "openai-default"},
+    )
+    assert_eq("unknown configured seat gets its own key", configured, {"account:openai:4c9435": 1})
+    assert_eq("missing billing keeps provider key", missing, {"provider:openai": 1})
+    assert_eq("empty billing keeps provider key", empty, {"provider:openai": 1})
+    assert_eq("plain configured map still isolates unknown seat", plain_configured_map, {"account:openai:4c9435": 1})
+
+
+def test_pressure_recommend_round_trip_caps_pool_and_declared_seat():
+    """Threshold pressure resolves real shared-label billing accounts."""
+    billing = _real_billing_account_fixture()
+    pool_map = rp.agent_limit_pool_map(billing)
+    now = time.time()
+    recent_iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now - 60))
+
+    seat_records = []
+    pool_records = []
+    unknown_records = []
+    for idx in range(3):
+        seat = _build_record("codex", "blocked_session_limit", recent_iso, f"seat-{idx}")
+        seat["account"] = "openai/tim"
+        seat_records.append(seat)
+        pool = _build_record("grok", "blocked_session_limit", recent_iso, f"pool-{idx}")
+        pool["account"] = "default"
+        pool_records.append(pool)
+        unknown = _build_record("codex", "blocked_session_limit", recent_iso, f"unknown-{idx}")
+        unknown["account"] = "ledger-only-seat"
+        unknown_records.append(unknown)
+
+    pressure = rp.pressure_per_provider(
+        seat_records + pool_records + unknown_records,
+        window_seconds=600,
+        now_ts=now,
+        pool_map=pool_map,
+    )
+    assert_eq(
+        "round-trip pressure keys",
+        pressure,
+        {"account:openai:tim": 3, "pool:grok-house": 3, "account:openai:ledger-only-seat": 3},
+    )
+    caps = {"codex": 10, "grok": 8, "cursor": 6}
+    out = rp.recommend(pressure, caps, threshold=3, pool_map=pool_map)
+    entries = {entry["budget_key"]: entry for entry in out["providers_under_pressure"]}
+    seat_entry = entries["account:openai:tim"]
+    pool_entry = entries["pool:grok-house"]
+    unknown_entry = entries["account:openai:ledger-only-seat"]
+    assert_eq(
+        "declared seat labels resolve despite shared billing labels",
+        seat_entry["labels"],
+        ["codex", "codex-acp", "codex-bash-tail", "opencode", "opencode-acp", "opencode-bash-tail"],
+    )
+    # Account scope has no capacity actuator — recommended_caps must be empty.
+    assert_eq(
+        "declared seat emits empty recommended_caps (no actuator)",
+        seat_entry["recommended_caps"],
+        {},
+    )
+    assert_eq("pool labels resolve", pool_entry["labels"], ["grok", "grok-agent-stdio"])
+    assert_eq("pool cap changes", pool_entry["recommended_caps"], {"grok": 4, "grok-agent-stdio": 2})
+    assert_eq("unrelated lane absent from recommendations", any("cursor" in e["recommended_caps"] for e in entries.values()), False)
+    assert_eq("ledger-only seat derives provider labels", unknown_entry["labels"], seat_entry["labels"])
+    assert_eq(
+        "ledger-only seat empty recommended_caps",
+        unknown_entry["recommended_caps"],
+        {},
+    )
+    assert_eq(
+        "ledger-only seat explains vocabulary mismatch",
+        unknown_entry["label_resolution"]["reason"],
+        "ledger_account_not_declared_in_billing",
+    )
+
+
+def test_provider_qualified_account_aliases_do_not_merge():
+    """The same local alias on OpenAI and xAI remains two budget lanes."""
+    now = time.time()
+    recent_iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now - 60))
+    records = []
+    for idx in range(2):
+        record = _build_record("codex", "blocked_session_limit", recent_iso, f"openai-{idx}")
+        record["account"] = "shared"
+        records.append(record)
+    grok = _build_record("grok", "blocked_session_limit", recent_iso, "xai-0")
+    grok["account"] = "shared"
+    records.append(grok)
+
+    counts = rp.pressure_per_provider(
+        records,
+        window_seconds=600,
+        now_ts=now,
+        pool_map=rp.agent_limit_pool_map(_real_billing_account_fixture()),
+    )
+    assert_eq(
+        "provider-qualified aliases",
+        counts,
+        {"account:openai:shared": 2, "account:xai:shared": 1},
+    )
+
+
 def test_pressure_groups_aliased_labels():
     """3 records: codex (1), codex-acp (2) → openai provider gets count 3."""
     now = time.time()

@@ -36,8 +36,10 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 from contextlib import redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
@@ -751,6 +753,697 @@ def case_rate_pressure_refuses_per_session_policy_override(state_dir: Path) -> N
     assert any("threshold override" in item for item in warnings), warnings
 
 
+def case_ambiguous_pool_label_does_not_reduce_unrelated_seat_lane() -> None:
+    """Measured path: multi-seat codex + account=default must not cap opencode*.
+
+    Input path that reaches the asserted state (must match the live system):
+      1. Multi-seat billing: three OpenAI accounts each declare codex* labels
+         → agent_limit_pool_map sets pool_map['codex']=None (ambiguous).
+      2. opencode* appears in no billing account → not in pool_map.
+      3. pressure_per_provider on records agent=codex, account="default"
+         (ACCOUNT_PLACEHOLDERS) → budget_key_for_record →
+         budget_key_for_agent → provider-ambiguous:openai (NOT provider:openai).
+      4. recommend() expands that key only to labels with pool_map[label]=None
+         for openai (codex*), never opencode*.
+      5. adaptive_agent_cap reads recommended_caps for those labels only.
+
+    The prior green test hand-fed pool:openai-default, a key multi-seat
+    billing never produces for codex/default.
+    """
+    shared_labels = ["codex", "codex-acp", "codex-bash-tail"]
+    billing = {
+        "accounts": [
+            {
+                "account_key": "25ca6b",
+                "limit_pool_id": "openai-simon",
+                "agent_labels": shared_labels,
+            },
+            {
+                "account_key": "cf9f50",
+                "limit_pool_id": "openai-tim",
+                "agent_labels": shared_labels,
+            },
+            {
+                "account_key": "d78343",
+                "limit_pool_id": "openai-default",
+                "agent_labels": shared_labels,
+            },
+        ],
+    }
+    pool_map = cap.goalflight_rate_pressure.agent_limit_pool_map(billing)
+    for label in shared_labels:
+        assert label in pool_map and pool_map[label] is None, pool_map
+    for label in ("opencode", "opencode-acp", "opencode-bash-tail"):
+        assert label not in pool_map, pool_map
+
+    # Step 3: the key the system actually produces for codex + default.
+    assert (
+        cap.goalflight_rate_pressure.budget_key_for_record(
+            {"account": "default"}, "codex", pool_map=pool_map
+        )
+        == "provider-ambiguous:openai"
+    ), "codex/default must not fall through to the full provider roster key"
+
+    now = time.time()
+    recent_iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now - 60))
+    records = []
+    for idx in range(3):
+        records.append(
+            {
+                "dispatch_id": f"default-codex-{idx}",
+                "agent": "codex",
+                "state": "blocked_session_limit",
+                "account": "default",
+                "updated_at": recent_iso,
+                "started_at": recent_iso,
+                "status_path": None,
+            }
+        )
+    counts = cap.goalflight_rate_pressure.pressure_per_provider(
+        records, window_seconds=600, now_ts=now, pool_map=pool_map
+    )
+    assert counts == {"provider-ambiguous:openai": 3}, counts
+
+    caps = {
+        "codex": 20,
+        "codex-acp": 15,
+        "codex-bash-tail": 10,
+        "opencode": 10,
+        "opencode-acp": 10,
+        "opencode-bash-tail": 10,
+    }
+    pressure = cap.goalflight_rate_pressure.recommend(
+        counts, caps, threshold=3, pool_map=pool_map
+    )
+    entries = {entry["budget_key"]: entry for entry in pressure["providers_under_pressure"]}
+    assert set(entries) == {"provider-ambiguous:openai"}, entries
+    entry = entries["provider-ambiguous:openai"]
+    assert entry["labels"] == shared_labels, entry
+    assert entry["recommended_caps"] == {
+        "codex": 10,
+        "codex-acp": 7,
+        "codex-bash-tail": 5,
+    }, entry
+    for open_label in ("opencode", "opencode-acp", "opencode-bash-tail"):
+        assert open_label not in entry["labels"], entry
+        assert open_label not in entry["recommended_caps"], entry
+
+    # Capacity applies codex* reductions; opencode* stays at base.
+    codex_cap, codex_detail = cap.adaptive_agent_cap("codex", 20, pressure)
+    assert codex_cap == 10 and codex_detail is not None, (codex_cap, codex_detail)
+    assert codex_detail["budget_key"] == "provider-ambiguous:openai", codex_detail
+    for open_label in ("opencode", "opencode-acp", "opencode-bash-tail"):
+        open_cap, open_detail = cap.adaptive_agent_cap(open_label, 10, pressure)
+        assert open_cap == 10 and open_detail is None, (open_label, open_cap, open_detail)
+
+    # Account-scoped pressure still emits no actuatable caps and does not
+    # change label capacity (sibling-seat isolation).
+    account_pressure = cap.goalflight_rate_pressure.recommend(
+        {"account:openai:cf9f50": 3},
+        caps,
+        threshold=3,
+        pool_map=pool_map,
+    )
+    account_entry = account_pressure["providers_under_pressure"][0]
+    assert account_entry["scope"] == "account", account_entry
+    assert account_entry["recommended_caps"] == {}, account_entry
+    for label in shared_labels + ["opencode"]:
+        base = caps.get(label, 10)
+        label_cap, label_detail = cap.adaptive_agent_cap(label, base, account_pressure)
+        assert label_cap == base and label_detail is None, (label, label_cap, label_detail)
+
+
+def case_real_quota_tail_hard_stops_only_ledger_account(state_dir: Path) -> None:
+    """Real billing/ledger vocabulary must never widen one seat into label caps.
+
+    Input path:
+      blocked_session_limit records with effective_account=cf9f50 + exhausted
+      tail prose → pressure_per_provider → account:openai:cf9f50 → recommend
+      (scope=account) → decorate_pressure_payload (stuck tails, hard_stop kinds).
+    """
+    isolated_state = state_dir / "real-quota-vocabulary"
+    runs = isolated_state / "runs.d"
+    tails = isolated_state / "tails"
+    runs.mkdir(parents=True, exist_ok=True)
+    tails.mkdir(parents=True, exist_ok=True)
+    recent_iso = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+
+    def write_record(idx: int, effective_account: str, account: str) -> None:
+        dispatch_id = f"quota-{effective_account}-{idx}"
+        tail = tails / f"{dispatch_id}.tail"
+        tail.write_text("ERROR: insufficient_quota; got 429\n", encoding="utf-8")
+        (runs / f"{dispatch_id}.json").write_text(
+            json.dumps(
+                {
+                    "schema": "goalflight.dispatch.v1",
+                    "dispatch_id": dispatch_id,
+                    "agent": "codex",
+                    "state": "blocked_session_limit",
+                    "account": account,
+                    "effective_account": effective_account,
+                    "started_at": recent_iso,
+                    "updated_at": recent_iso,
+                    "stdout_path": str(tail),
+                    "status_path": None,
+                },
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+
+    for idx in range(3):
+        write_record(idx, "cf9f50", "tim")
+    # A recognized tail on another OpenAI seat must not be attached to the
+    # thresholded cf9f50 entry merely because both records use label "codex".
+    write_record(0, "25ca6b", "simon")
+
+    billing = {
+        "accounts": [
+            {
+                "account_key": "openai/simon",
+                "limit_pool_id": "openai-simon",
+                "agent_labels": ["codex", "codex-acp", "codex-bash-tail"],
+            },
+            {
+                "account_key": "openai/tim",
+                "limit_pool_id": "openai-tim",
+                "agent_labels": ["codex", "codex-acp", "codex-bash-tail"],
+            },
+            {
+                "account_key": "openai/default",
+                "limit_pool_id": "openai-default",
+                "agent_labels": ["codex", "codex-acp", "codex-bash-tail"],
+            },
+        ],
+    }
+    old_state = os.environ.get("GOALFLIGHT_STATE_DIR")
+    os.environ["GOALFLIGHT_STATE_DIR"] = str(isolated_state)
+    try:
+        with mock.patch.object(cap.goalflight_rate_pressure, "load_billing_accounts", return_value=billing):
+            pressure = cap.current_rate_pressure()
+    finally:
+        if old_state is None:
+            os.environ.pop("GOALFLIGHT_STATE_DIR", None)
+        else:
+            os.environ["GOALFLIGHT_STATE_DIR"] = old_state
+
+    entries = {entry["budget_key"]: entry for entry in pressure["providers_under_pressure"]}
+    assert set(entries) == {"account:openai:cf9f50"}, entries
+    entry = entries["account:openai:cf9f50"]
+    assert entry["scope"] == "account", entry
+    assert entry["provider"] == "openai", entry
+    assert entry["label_resolution"]["status"] == "resolved_with_warning", entry
+    assert entry["label_resolution"]["reason"] == "ledger_account_not_declared_in_billing", entry
+    assert "openai/tim" in entry["label_resolution"]["declared_account_keys"], entry
+    # Account scope must NOT look like an active capacity hold.
+    assert entry["quota_hard_stop"] is False, entry
+    # No cap-shaped field without an actuator (capacity skips account scope).
+    assert "effective_account_cap" not in entry, entry
+    assert "effective_caps" not in entry, entry
+    assert entry.get("recommended_caps") == {}, entry
+    advisory = entry.get("account_quota_advisory")
+    assert isinstance(advisory, dict), entry
+    assert advisory.get("enforced_by_capacity") is False, advisory
+    assert advisory.get("account_key") == "cf9f50", advisory
+    assert advisory.get("provider") == "openai", advisory
+    assert "no automated consumer" in str(advisory.get("message") or ""), advisory
+    assert "not enforced by the capacity gate" in str(advisory.get("message") or ""), advisory
+    assert entry["stuck_worker_count"] == 3, entry
+    assert {item["effective_account"] for item in entry["stuck_workers"]} == {"cf9f50"}, entry
+
+    # Advisory text must not claim a hold capacity does not perform.
+    advisory_text = cap.goalflight_quota_stuck.advisory_payload(entry)["text"]
+    assert "holding new provider dispatch" not in advisory_text, advisory_text
+    assert "advisory only" in advisory_text, advisory_text
+    assert "capacity does not hold this lane" in advisory_text, advisory_text
+    lines = cap.goalflight_quota_stuck.advisory_lines(pressure)
+    assert lines, lines
+    assert all("holding new provider dispatch" not in line for line in lines), lines
+    assert any("advisory only" in line for line in lines), lines
+
+    warnings = cap.rate_pressure_warnings(pressure)
+    assert any("no automated consumer" in w for w in warnings), warnings
+    assert not any("holding new provider dispatch" in w for w in warnings), warnings
+
+    # One seat exhausted must leave every label cap untouched (healthy siblings
+    # sharing those labels keep full capacity).
+    for label in (
+        "codex",
+        "codex-acp",
+        "codex-bash-tail",
+        "opencode",
+        "opencode-acp",
+        "opencode-bash-tail",
+    ):
+        base = cap.DEFAULT_AGENT_CAPS.get(label, 5)
+        label_cap, label_detail = cap.adaptive_agent_cap(label, base, pressure)
+        assert label_cap == base, (label, label_cap, label_detail)
+        assert label_detail is None, (label, label_detail)
+
+
+def case_cross_label_exhausted_tail_does_not_hard_stop_ambiguous_lane(
+    state_dir: Path,
+) -> None:
+    """P0: opencode exhausted must not hard-stop codex on provider-ambiguous.
+
+    Input path (the measured inverted-cap failure):
+      1. Multi-seat billing declares only codex* → pool_map[codex]=None
+         → codex + account=default → provider-ambiguous:openai.
+      2. Three codex blocked_session_limit records (no exhausted tails) hit
+         threshold → recommend soft-reduces codex* only.
+      3. One opencode record with an exhausted quota tail (NOT in the
+         ambiguous entry's labels) is examined by decorate_pressure_payload.
+      4. _entry_matches_record must NOT attach opencode via bare provider
+         equality. Without that attachment there is no hard stop.
+      5. adaptive_agent_cap("codex") stays at the soft half of base, not 0.
+    """
+    isolated = state_dir / "cross-label-ambiguous"
+    runs = isolated / "runs.d"
+    tails = isolated / "tails"
+    runs.mkdir(parents=True, exist_ok=True)
+    tails.mkdir(parents=True, exist_ok=True)
+    recent_iso = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    shared_labels = ["codex", "codex-acp", "codex-bash-tail"]
+    billing = {
+        "accounts": [
+            {
+                "account_key": "25ca6b",
+                "limit_pool_id": "openai-simon",
+                "agent_labels": shared_labels,
+            },
+            {
+                "account_key": "cf9f50",
+                "limit_pool_id": "openai-tim",
+                "agent_labels": shared_labels,
+            },
+            {
+                "account_key": "d78343",
+                "limit_pool_id": "openai-default",
+                "agent_labels": shared_labels,
+            },
+        ],
+    }
+
+    for idx in range(3):
+        dispatch_id = f"ambig-codex-{idx}"
+        (runs / f"{dispatch_id}.json").write_text(
+            json.dumps(
+                {
+                    "schema": "goalflight.dispatch.v1",
+                    "dispatch_id": dispatch_id,
+                    "agent": "codex",
+                    "state": "blocked_session_limit",
+                    "account": "default",
+                    "started_at": recent_iso,
+                    "updated_at": recent_iso,
+                    "status_path": None,
+                },
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+
+    # The sick lane: opencode exhausted, outside the ambiguous label set.
+    open_id = "ambig-opencode-exhausted"
+    open_tail = tails / f"{open_id}.tail"
+    open_tail.write_text("ERROR: insufficient_quota; got 429\n", encoding="utf-8")
+    (runs / f"{open_id}.json").write_text(
+        json.dumps(
+            {
+                "schema": "goalflight.dispatch.v1",
+                "dispatch_id": open_id,
+                "agent": "opencode",
+                "state": "rate_limited",
+                "account": "default",
+                "started_at": recent_iso,
+                "updated_at": recent_iso,
+                "stdout_path": str(open_tail),
+                "status_path": None,
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+
+    old_state = os.environ.get("GOALFLIGHT_STATE_DIR")
+    os.environ["GOALFLIGHT_STATE_DIR"] = str(isolated)
+    try:
+        with mock.patch.object(
+            cap.goalflight_rate_pressure, "load_billing_accounts", return_value=billing
+        ):
+            pressure = cap.current_rate_pressure()
+    finally:
+        if old_state is None:
+            os.environ.pop("GOALFLIGHT_STATE_DIR", None)
+        else:
+            os.environ["GOALFLIGHT_STATE_DIR"] = old_state
+
+    entries = {e["budget_key"]: e for e in pressure["providers_under_pressure"]}
+    assert "provider-ambiguous:openai" in entries, entries
+    entry = entries["provider-ambiguous:openai"]
+    assert entry["labels"] == shared_labels, entry
+    # opencode must not attach; no exhausted match → no hard stop.
+    stuck_agents = {item.get("agent") for item in entry.get("stuck_workers") or []}
+    assert "opencode" not in stuck_agents, entry
+    assert entry.get("quota_hard_stop") is False, entry
+    assert "effective_caps" not in entry, entry
+
+    base_codex = cap.DEFAULT_AGENT_CAPS["codex"]
+    expected_soft = max(1, base_codex // 2)
+    codex_cap, codex_detail = cap.adaptive_agent_cap("codex", base_codex, pressure)
+    assert codex_cap == expected_soft, (codex_cap, codex_detail, entry)
+    assert codex_detail is not None, codex_detail
+    assert codex_detail["budget_key"] == "provider-ambiguous:openai", codex_detail
+    assert codex_detail.get("quota_hard_stop") is False, codex_detail
+
+    # opencode itself: count 1 under provider:openai is below threshold, so
+    # no pressure entry and full base cap (the inverted bug left this uncapped
+    # while zeroing codex — assert the healthy inverse).
+    open_cap, open_detail = cap.adaptive_agent_cap(
+        "opencode", cap.DEFAULT_AGENT_CAPS["opencode"], pressure
+    )
+    assert open_cap == cap.DEFAULT_AGENT_CAPS["opencode"], (open_cap, open_detail)
+    assert open_detail is None, open_detail
+
+
+def case_cross_pool_exhausted_does_not_hard_stop_other_pool(
+    state_dir: Path,
+) -> None:
+    """A pool:openai-tim stuck worker must not hard-stop pool:openai-simon.
+
+    Input path:
+      1. Distinct single-pool label maps (no ambiguity): codex → openai-simon,
+         codex-acp → openai-tim.
+      2. Three codex blocked_session_limit records → pool:openai-simon at
+         threshold (soft reduce only; no exhausted tails on simon).
+      3. One codex-acp exhausted tail on pool openai-tim.
+      4. decorate_pressure_payload must not attach the tim worker to the simon
+         entry via bare provider equality.
+      5. adaptive_agent_cap("codex") soft-halves; does not go to 0.
+    """
+    isolated = state_dir / "cross-pool-hard-stop"
+    runs = isolated / "runs.d"
+    tails = isolated / "tails"
+    runs.mkdir(parents=True, exist_ok=True)
+    tails.mkdir(parents=True, exist_ok=True)
+    recent_iso = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    billing = {
+        "accounts": [
+            {
+                "account_key": "openai/simon",
+                "limit_pool_id": "openai-simon",
+                "agent_labels": ["codex"],
+            },
+            {
+                "account_key": "openai/tim",
+                "limit_pool_id": "openai-tim",
+                "agent_labels": ["codex-acp"],
+            },
+        ],
+    }
+    pool_map = cap.goalflight_rate_pressure.agent_limit_pool_map(billing)
+    assert pool_map.get("codex") == "openai-simon", pool_map
+    assert pool_map.get("codex-acp") == "openai-tim", pool_map
+    assert (
+        cap.goalflight_rate_pressure.budget_key_for_agent("codex", pool_map=pool_map)
+        == "pool:openai-simon"
+    )
+    assert (
+        cap.goalflight_rate_pressure.budget_key_for_agent("codex-acp", pool_map=pool_map)
+        == "pool:openai-tim"
+    )
+
+    for idx in range(3):
+        dispatch_id = f"pool-simon-codex-{idx}"
+        (runs / f"{dispatch_id}.json").write_text(
+            json.dumps(
+                {
+                    "schema": "goalflight.dispatch.v1",
+                    "dispatch_id": dispatch_id,
+                    "agent": "codex",
+                    "state": "blocked_session_limit",
+                    "account": "default",
+                    "started_at": recent_iso,
+                    "updated_at": recent_iso,
+                    "status_path": None,
+                },
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+
+    tim_id = "pool-tim-acp-exhausted"
+    tim_tail = tails / f"{tim_id}.tail"
+    tim_tail.write_text("ERROR: insufficient_quota; got 429\n", encoding="utf-8")
+    (runs / f"{tim_id}.json").write_text(
+        json.dumps(
+            {
+                "schema": "goalflight.dispatch.v1",
+                "dispatch_id": tim_id,
+                "agent": "codex-acp",
+                "state": "rate_limited",
+                "account": "default",
+                "started_at": recent_iso,
+                "updated_at": recent_iso,
+                "stdout_path": str(tim_tail),
+                "status_path": None,
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+
+    old_state = os.environ.get("GOALFLIGHT_STATE_DIR")
+    os.environ["GOALFLIGHT_STATE_DIR"] = str(isolated)
+    try:
+        with mock.patch.object(
+            cap.goalflight_rate_pressure, "load_billing_accounts", return_value=billing
+        ):
+            pressure = cap.current_rate_pressure()
+    finally:
+        if old_state is None:
+            os.environ.pop("GOALFLIGHT_STATE_DIR", None)
+        else:
+            os.environ["GOALFLIGHT_STATE_DIR"] = old_state
+
+    entries = {e["budget_key"]: e for e in pressure["providers_under_pressure"]}
+    assert "pool:openai-simon" in entries, entries
+    simon = entries["pool:openai-simon"]
+    assert simon["labels"] == ["codex"], simon
+    stuck_agents = {item.get("agent") for item in simon.get("stuck_workers") or []}
+    assert "codex-acp" not in stuck_agents, simon
+    assert simon.get("quota_hard_stop") is False, simon
+
+    base_codex = cap.DEFAULT_AGENT_CAPS["codex"]
+    expected_soft = max(1, base_codex // 2)
+    codex_cap, codex_detail = cap.adaptive_agent_cap("codex", base_codex, pressure)
+    assert codex_cap == expected_soft, (codex_cap, codex_detail, simon)
+    assert codex_detail is not None and codex_detail.get("quota_hard_stop") is False, codex_detail
+
+
+def case_matching_exhausted_tail_still_hard_stops_own_labels(
+    state_dir: Path,
+) -> None:
+    """Genuinely matching stuck workers still hard-stop their own labels.
+
+    Input path:
+      1. Multi-seat billing → codex* → provider-ambiguous:openai.
+      2. Three codex records with exhausted tails (state blocked_session_limit).
+      3. decorate_pressure_payload attaches those codex workers (agent in
+         labels / budget key equals entry) → quota_hard_stop + effective_caps 0.
+      4. adaptive_agent_cap("codex") → 0. opencode stays at base (not in labels).
+    """
+    isolated = state_dir / "matching-hard-stop"
+    runs = isolated / "runs.d"
+    tails = isolated / "tails"
+    runs.mkdir(parents=True, exist_ok=True)
+    tails.mkdir(parents=True, exist_ok=True)
+    recent_iso = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    shared_labels = ["codex", "codex-acp", "codex-bash-tail"]
+    billing = {
+        "accounts": [
+            {
+                "account_key": "25ca6b",
+                "limit_pool_id": "openai-simon",
+                "agent_labels": shared_labels,
+            },
+            {
+                "account_key": "cf9f50",
+                "limit_pool_id": "openai-tim",
+                "agent_labels": shared_labels,
+            },
+            {
+                "account_key": "d78343",
+                "limit_pool_id": "openai-default",
+                "agent_labels": shared_labels,
+            },
+        ],
+    }
+
+    for idx in range(3):
+        dispatch_id = f"match-codex-{idx}"
+        tail = tails / f"{dispatch_id}.tail"
+        tail.write_text("ERROR: insufficient_quota; got 429\n", encoding="utf-8")
+        (runs / f"{dispatch_id}.json").write_text(
+            json.dumps(
+                {
+                    "schema": "goalflight.dispatch.v1",
+                    "dispatch_id": dispatch_id,
+                    "agent": "codex",
+                    "state": "blocked_session_limit",
+                    "account": "default",
+                    "started_at": recent_iso,
+                    "updated_at": recent_iso,
+                    "stdout_path": str(tail),
+                    "status_path": None,
+                },
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+
+    old_state = os.environ.get("GOALFLIGHT_STATE_DIR")
+    os.environ["GOALFLIGHT_STATE_DIR"] = str(isolated)
+    try:
+        with mock.patch.object(
+            cap.goalflight_rate_pressure, "load_billing_accounts", return_value=billing
+        ):
+            pressure = cap.current_rate_pressure()
+    finally:
+        if old_state is None:
+            os.environ.pop("GOALFLIGHT_STATE_DIR", None)
+        else:
+            os.environ["GOALFLIGHT_STATE_DIR"] = old_state
+
+    entries = {e["budget_key"]: e for e in pressure["providers_under_pressure"]}
+    assert set(entries) == {"provider-ambiguous:openai"}, entries
+    entry = entries["provider-ambiguous:openai"]
+    assert entry["labels"] == shared_labels, entry
+    assert entry.get("quota_hard_stop") is True, entry
+    assert entry.get("stuck_worker_count") == 3, entry
+    assert entry.get("effective_caps") == {label: 0 for label in shared_labels}, entry
+    stuck_agents = {item.get("agent") for item in entry.get("stuck_workers") or []}
+    assert stuck_agents == {"codex"}, stuck_agents
+
+    base_codex = cap.DEFAULT_AGENT_CAPS["codex"]
+    codex_cap, codex_detail = cap.adaptive_agent_cap("codex", base_codex, pressure)
+    assert codex_cap == 0, (codex_cap, codex_detail)
+    assert codex_detail is not None and codex_detail.get("quota_hard_stop") is True, codex_detail
+
+    for open_label in ("opencode", "opencode-acp", "opencode-bash-tail"):
+        base = cap.DEFAULT_AGENT_CAPS.get(open_label, 10)
+        open_cap, open_detail = cap.adaptive_agent_cap(open_label, base, pressure)
+        assert open_cap == base, (open_label, open_cap, open_detail)
+        assert open_detail is None, (open_label, open_detail)
+
+
+def case_label_set_match_hard_stops_when_budget_key_path_unavailable() -> None:
+    """Label-set matching is load-bearing when pool_map is absent at decorate.
+
+    Input path:
+      1. recommend() with multi-seat pool_map builds provider-ambiguous:openai
+         with labels=[codex*] and soft caps.
+      2. decorate_pressure_payload is called with pool_map=None (budget_key path
+         for codex becomes provider:openai, not provider-ambiguous:openai).
+      3. Attachment therefore depends on agent-in-labels.
+      4. adaptive_agent_cap("codex") → 0 hard stop; opencode stays at base.
+    """
+    shared_labels = ["codex", "codex-acp", "codex-bash-tail"]
+    billing = {
+        "accounts": [
+            {
+                "account_key": "25ca6b",
+                "limit_pool_id": "openai-simon",
+                "agent_labels": shared_labels,
+            },
+            {
+                "account_key": "cf9f50",
+                "limit_pool_id": "openai-tim",
+                "agent_labels": shared_labels,
+            },
+        ],
+    }
+    pool_map = cap.goalflight_rate_pressure.agent_limit_pool_map(billing)
+    assert pool_map.get("codex") is None, pool_map
+
+    now = time.time()
+    recent_iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now - 30))
+    records: list[dict] = []
+    with tempfile.TemporaryDirectory() as td:
+        tails = Path(td) / "tails"
+        tails.mkdir()
+        for idx in range(3):
+            dispatch_id = f"label-only-{idx}"
+            tail = tails / f"{dispatch_id}.tail"
+            tail.write_text("ERROR: insufficient_quota; got 429\n", encoding="utf-8")
+            records.append(
+                {
+                    "schema": "goalflight.dispatch.v1",
+                    "dispatch_id": dispatch_id,
+                    "agent": "codex",
+                    "state": "blocked_session_limit",
+                    "account": "default",
+                    "started_at": recent_iso,
+                    "updated_at": recent_iso,
+                    "stdout_path": str(tail),
+                    "status_path": None,
+                }
+            )
+        # Cross-label noise: must still not attach without label membership.
+        open_tail = tails / "label-only-open.tail"
+        open_tail.write_text("ERROR: insufficient_quota; got 429\n", encoding="utf-8")
+        records.append(
+            {
+                "schema": "goalflight.dispatch.v1",
+                "dispatch_id": "label-only-open",
+                "agent": "opencode",
+                "state": "rate_limited",
+                "account": "default",
+                "started_at": recent_iso,
+                "updated_at": recent_iso,
+                "stdout_path": str(open_tail),
+                "status_path": None,
+            }
+        )
+
+        counts = cap.goalflight_rate_pressure.pressure_per_provider(
+            records, window_seconds=600, now_ts=now, pool_map=pool_map
+        )
+        assert counts.get("provider-ambiguous:openai") == 3, counts
+        payload = cap.goalflight_rate_pressure.recommend(
+            counts,
+            dict(cap.DEFAULT_AGENT_CAPS),
+            threshold=3,
+            pool_map=pool_map,
+        )
+        # Decorate without pool_map so budget_key equality cannot rescue codex.
+        pressure = cap.goalflight_quota_stuck.decorate_pressure_payload(
+            payload,
+            records,
+            window_seconds=600,
+            pool_map=None,
+        )
+
+    entries = {e["budget_key"]: e for e in pressure["providers_under_pressure"]}
+    entry = entries["provider-ambiguous:openai"]
+    stuck_agents = {item.get("agent") for item in entry.get("stuck_workers") or []}
+    assert stuck_agents == {"codex"}, (stuck_agents, entry)
+    assert "opencode" not in stuck_agents, entry
+    assert entry.get("quota_hard_stop") is True, entry
+    assert entry.get("effective_caps") == {label: 0 for label in shared_labels}, entry
+
+    base_codex = cap.DEFAULT_AGENT_CAPS["codex"]
+    codex_cap, codex_detail = cap.adaptive_agent_cap("codex", base_codex, pressure)
+    assert codex_cap == 0, (codex_cap, codex_detail)
+    assert codex_detail is not None and codex_detail.get("quota_hard_stop") is True, codex_detail
+
+    open_cap, open_detail = cap.adaptive_agent_cap(
+        "opencode", cap.DEFAULT_AGENT_CAPS["opencode"], pressure
+    )
+    assert open_cap == cap.DEFAULT_AGENT_CAPS["opencode"], (open_cap, open_detail)
+    assert open_detail is None, open_detail
+
+
 def case_empty_state_dir_falls_back_not_cwd() -> None:
     """A present-but-empty (or whitespace-only) GOALFLIGHT_STATE_DIR must resolve
     to DEFAULT_STATE_DIR, NOT cwd. Regression: os.environ.get(key, default)
@@ -805,6 +1498,8 @@ def main() -> None:
     case_acquire_with_wait_zero_preserves_single_shot_payload()
     case_acquire_with_wait_jitter_bounds_and_deadline_math()
     case_acquire_with_wait_signal_interrupts_sleep_promptly()
+    case_ambiguous_pool_label_does_not_reduce_unrelated_seat_lane()
+    case_label_set_match_hard_stops_when_budget_key_path_unavailable()
 
     # IO cases: isolate capacity.json under a temp $GOALFLIGHT_STATE_DIR so the
     # real shared /tmp/goal-flight-<uid>/capacity.json is never touched.
@@ -817,6 +1512,10 @@ def main() -> None:
         os.environ["GOALFLIGHT_RATE_PRESSURE_THRESHOLD"] = "3"
         os.environ["GOALFLIGHT_RATE_PRESSURE_WINDOW_SECONDS"] = "600"
         try:
+            case_real_quota_tail_hard_stops_only_ledger_account(state_dir)
+            case_cross_label_exhausted_tail_does_not_hard_stop_ambiguous_lane(state_dir)
+            case_cross_pool_exhausted_does_not_hard_stop_other_pool(state_dir)
+            case_matching_exhausted_tail_still_hard_stops_own_labels(state_dir)
             case_status_is_non_mutating_for_live_lease(state_dir)
             case_status_still_reclaims_dead_lease_in_view(state_dir)
             case_release_stale_poison_pair_live_worker_survives_dead_controller(state_dir)
