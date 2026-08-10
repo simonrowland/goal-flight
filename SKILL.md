@@ -33,6 +33,7 @@ triggers:
   - resume the goal-flight run
   - continue the goal queue
   - recover a dispatched worker
+  - check mail
 ---
 
 > ⚠️ **Read this skill end-to-end, including Worker Routing, State, and Context Discipline** before acting; also read Do Not. The back half carries routing, state, marker, rate-limit, permission, and safety contracts.
@@ -156,7 +157,7 @@ python3 <skill-root>/scripts/goalflight_doctor.py --project-root "$PWD" --json
 Surface only actionable warnings: install ambiguity, missing required tool,
 capacity cooldown, stale dispatch, surplus worker-like process, or fingerprint
 drift against an in-flight queue.
-Check mail with `relay --new` (one FROM/subject headline per unseen message) plus `--ack` to advance the read cursor. Fetch bodies deliberately (`--bodies`, or `read --dispatch-id <id>`); post with `--subject`.
+Mail is one inbox, not a private markdown file: `relay --new` reads, `--list-controllers` lists peers, `post --to-controller` sends, `listen` wakes. See `protocols/controller-mail.md`.
 
 ## Commands
 
