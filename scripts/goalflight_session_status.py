@@ -1168,21 +1168,41 @@ def _addressed_unread_counts(
 
         resolved_messages_dir = messages_dir or messages.default_messages_dir()
         resolved_fleet_dir = fleet_dir if fleet_dir is not None else messages.default_fleet_dir()
-        cursor = messages.load_read_cursor(messages.read_cursor_path(resolved_messages_dir))
+        cursor = messages.load_read_cursor(
+            messages.read_cursor_path(resolved_messages_dir),
+            messages_dir=resolved_messages_dir,
+            fleet_dir=resolved_fleet_dir,
+        )
         counts: dict[str, int] = {}
-        for inbox in messages.collect_inbox_paths(resolved_messages_dir, resolved_fleet_dir):
-            for envelope in messages.read_envelopes(inbox):
-                label = messages.controller_addressee_label(envelope)
-                addressee_root = messages.controller_addressee_project_root(envelope)
-                if (
-                    label is None
-                    or addressee_root != messages.controller_address_project_root(project_root)
-                ):
-                    continue
-                dispatch_id = str(envelope.get("dispatch_id") or inbox.stem)
-                key = messages.controller_cursor_key(label, dispatch_id, addressee_root)
-                if int(envelope.get("seq", 0)) > int(cursor.get(key, 0)):
-                    counts[label] = counts.get(label, 0) + 1
+        paths = messages.collect_inbox_paths(resolved_messages_dir, resolved_fleet_dir)
+        for envelope in messages.logical_envelopes_for_paths(
+            paths,
+            messages_dir=resolved_messages_dir,
+            tolerate_errors=True,
+        ):
+            label = messages.controller_addressee_label(envelope)
+            addressee_root = messages.controller_addressee_project_root(envelope)
+            if (
+                label is None
+                or addressee_root != messages.controller_address_project_root(project_root)
+            ):
+                continue
+            dispatch_id = str(envelope.get("dispatch_id") or "")
+            keys = [
+                messages.controller_cursor_key(
+                    label,
+                    dispatch_id,
+                    addressee_root,
+                    inbox_key=inbox_key,
+                )
+                for inbox_key in messages.inbox_cursor_keys(envelope)
+            ]
+            if messages.cursor_has_unread_event(
+                cursor,
+                keys,
+                int(envelope.get("seq", 0)),
+            ):
+                counts[label] = counts.get(label, 0) + 1
         return counts, None
     except Exception as exc:
         return None, type(exc).__name__

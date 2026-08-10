@@ -134,6 +134,77 @@ def test_roster_measures_idle_incarnations_mail_and_owned_dispatches() -> None:
                 dead.wait(timeout=10)
 
 
+def test_addressed_unread_counts_match_backlog_across_stream_cursors() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        root = base / "project"
+        messages_dir = base / "messages"
+        remote_messages_dir = base / "remote-messages"
+        fleet_dir = base / "fleet"
+        root.mkdir()
+        fleet_dir.mkdir()
+        label = "battery-dual-stream"
+        dispatch_id = "addressed-dual-stream"
+        addressee = messages.controller_addressee(label, project_root=root)
+
+        local_path = Path(messages.post_message(
+            dispatch_id=dispatch_id,
+            msg_type="controller-notice",
+            payload={"text": "acknowledged local nine"},
+            messages_dir=messages_dir,
+            seq=9,
+            addressee=addressee,
+        )["path"])
+        local_key = messages.controller_cursor_key(
+            label,
+            dispatch_id,
+            messages.controller_address_project_root(root),
+            inbox_key=messages.inbox_stream_key(local_path, messages_dir=messages_dir),
+        )
+        messages.advance_read_cursor(messages.read_cursor_path(messages_dir), {local_key: 9})
+
+        remote_path = Path(messages.post_message(
+            dispatch_id=dispatch_id,
+            msg_type="controller-notice",
+            payload={"text": "unread fleet one"},
+            messages_dir=remote_messages_dir,
+            seq=1,
+            addressee=addressee,
+        )["path"])
+        merged = messages.merge_remote_register(
+            fleet_dir,
+            remote_path,
+            messages_dir=messages_dir,
+        )
+        fleet_path = Path(merged["merged_into"])
+        assert local_path == messages.inbox_path(messages_dir, dispatch_id)
+        assert remote_path == messages.inbox_path(remote_messages_dir, dispatch_id)
+        assert fleet_path.exists()
+
+        digest, advances = messages.backlog_digest(
+            messages_dir=messages_dir,
+            fleet_dir=fleet_dir,
+            controller_label=label,
+            controller_project_root=messages.controller_address_project_root(root),
+        )
+        counts, error = sessions._addressed_unread_counts(
+            root,
+            messages_dir=messages_dir,
+            fleet_dir=fleet_dir,
+        )
+        fleet_key = messages.controller_cursor_key(
+            label,
+            dispatch_id,
+            messages.controller_address_project_root(root),
+            inbox_key=messages.inbox_stream_key(fleet_path, messages_dir=messages_dir),
+        )
+        assert error is None
+        assert digest["envelope_count"] == 1
+        assert digest["items"][0]["headline"] == "unread fleet one"
+        assert advances == {fleet_key: 1}
+        assert counts == {label: 1}
+
+
 def test_idle_succession_without_pid_receives_registered_addressed_mail() -> None:
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)
@@ -167,7 +238,11 @@ def test_idle_succession_without_pid_receives_registered_addressed_mail() -> Non
                 messages_dir=messages_dir,
                 fleet_dir=fleet_dir,
             )
-        assert ("engine-mail", 1) in wake
+        engine_key = messages.inbox_stream_key(
+            messages.inbox_path(messages_dir, "engine-mail"),
+            messages_dir=messages_dir,
+        )
+        assert (engine_key, 1) in wake
         with patch.object(messages, "_current_project_root", return_value=root):
             assert messages.unresolved_controller_envelopes(
                 messages_dir=messages_dir,
@@ -336,7 +411,11 @@ def test_succession_inherits_previous_incarnation_worker_wakes_by_name() -> None
                 messages_dir=messages_dir,
                 fleet_dir=fleet_dir,
             )
-        assert ("old-worker", 1) in wakes
+        worker_key = messages.inbox_stream_key(
+            messages.inbox_path(messages_dir, "old-worker"),
+            messages_dir=messages_dir,
+        )
+        assert (worker_key, 1) in wakes
 
 
 def test_retire_requires_current_joined_incarnation_and_audits_actual_retirer() -> None:
@@ -444,7 +523,11 @@ def test_same_label_in_other_project_never_receives_addressed_mail() -> None:
                 messages_dir=messages_dir,
                 fleet_dir=fleet_dir,
             )
-        assert ("late-a", 1) not in wakes
+        late_key = messages.inbox_stream_key(
+            messages.inbox_path(messages_dir, "late-a"),
+            messages_dir=messages_dir,
+        )
+        assert (late_key, 1) not in wakes
         with patch.object(messages, "_current_project_root", return_value=root_b):
             unresolved = messages.unresolved_controller_envelopes(
                 messages_dir=messages_dir,

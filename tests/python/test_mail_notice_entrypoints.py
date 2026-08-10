@@ -307,7 +307,7 @@ def test_common_entrypoints_stay_silent_without_mail() -> None:
             assert_true(f"{name} stays silent", "new mail; read:" not in stdout + stderr)
 
 
-def test_corrupt_addressed_mailbox_is_fail_open_for_every_entrypoint() -> None:
+def test_corrupt_addressed_mailbox_preserves_prefix_for_every_entrypoint() -> None:
     with _mail_fixture() as (project, messages, _fleet):
         inbox = _post_addressed(messages, project)
         with inbox.open("a", encoding="utf-8") as fh:
@@ -315,7 +315,8 @@ def test_corrupt_addressed_mailbox_is_fail_open_for_every_entrypoint() -> None:
         for name in ENTRYPOINTS:
             rc, stdout, stderr = _run_entrypoint(name, project)
             assert_true(f"{name} survives corrupt mail", rc == 0)
-            assert_true(f"{name} suppresses corrupt notice", "new mail; read:" not in stdout + stderr)
+            assert_true(f"{name} preserves validated-prefix notice", "new mail; read:" in stderr)
+            assert_true(f"{name} reports corrupt carrier", "WARNING: carrier corruption:" in stderr)
             assert_true(f"{name} has no traceback", "Traceback" not in stdout + stderr)
 
 
@@ -436,7 +437,7 @@ def main() -> None:
         test_milestone_notice_speaks_only_when_due,
         test_notice_goes_to_stderr_so_stdout_stays_a_data_contract,
         test_common_entrypoints_stay_silent_without_mail,
-        test_corrupt_addressed_mailbox_is_fail_open_for_every_entrypoint,
+        test_corrupt_addressed_mailbox_preserves_prefix_for_every_entrypoint,
         test_unreadable_addressed_mailbox_is_fail_open_for_every_entrypoint,
         test_status_json_never_contains_or_prints_mail_signal,
     ]

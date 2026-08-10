@@ -120,29 +120,31 @@ def test_open_user_need_surfaces_body_free_notice() -> None:
 
 def test_headline_count_matches_default_relay_and_ack_lifecycle() -> None:
     def body(msgs, fleet):
+        keys: dict[str, str] = {}
         for dispatch_id in ("worker-read", "worker-open"):
-            M.post_message(
+            path = Path(M.post_message(
                 dispatch_id=dispatch_id,
                 msg_type="user_need",
                 payload={"text": f"{dispatch_id} decision"},
                 messages_dir=msgs,
-            )
-        M.advance_read_cursor(M.read_cursor_path(msgs), {"worker-read": 1})
+            )["path"])
+            keys[dispatch_id] = M.inbox_stream_key(path, messages_dir=msgs)
+        M.advance_read_cursor(M.read_cursor_path(msgs), {keys["worker-read"]: 1})
         summary = S._mail_summary({"worker-read", "worker-open"})
         relay = M.format_bounded_relay(list(summary.get("needs") or [])) or ""
-        M.advance_read_cursor(M.ack_cursor_path(msgs), {"worker-open": 1})
+        M.advance_read_cursor(M.ack_cursor_path(msgs), {keys["worker-open"]: 1})
         after_ack = S._mail_summary({"worker-read", "worker-open"})
         read_cursor = M.load_read_cursor(M.read_cursor_path(msgs))
-        return summary, relay, after_ack, read_cursor
+        return summary, relay, after_ack, read_cursor, keys["worker-read"]
 
-    summary, relay, after_ack, read_cursor = _with_mail_dirs(body)
+    summary, relay, after_ack, read_cursor, read_key = _with_mail_dirs(body)
     relay_items = [line for line in relay.splitlines() if not line.startswith("(+")]
     assert_eq("headline count equals relay item count", summary.get("count"), len(relay_items))
     assert_eq("only unread open item counted", summary.get("count"), 1)
     assert_true("default relay contains unread item", "worker-open" in relay)
     assert_true("default relay excludes read item", "worker-read" not in relay)
     assert_eq("ack moves status open count", after_ack, {})
-    assert_eq("ack does not alter read cursor", read_cursor, {"worker-read": 1})
+    assert_eq("ack does not alter read cursor", read_cursor, {read_key: 1})
 
 
 def test_mail_hint_sanitizes_newline_and_csi() -> None:

@@ -22,6 +22,14 @@ DEFAULT_CONTRACT = REPO_ROOT / "docs-private" / "architecture" / "contracts" / "
 AGGREGATE_SCHEMA = "goalflight.fleet.register.aggregate.v1"
 READ_CURSOR_FILE = ".read-cursor.json"
 ACK_CURSOR_FILE = ".ack-cursor.json"
+INGESTION_ORDER_FILE = ".ingestion-order"
+INGESTION_IDENTITY_FILE = ".ingestion-identities.json"
+MESSAGE_CURSOR_SCHEMA = "goalflight.message-cursor.v1"
+INGESTION_IDENTITY_SCHEMA = "goalflight.ingestion-identities.v1"
+_INBOX_CURSOR_KEY_FIELD = "_goalflight_inbox_cursor_key"
+_INBOX_CURSOR_KEYS_FIELD = "_goalflight_inbox_cursor_keys"
+_INBOX_SOURCE_PATHS_FIELD = "_goalflight_inbox_source_paths"
+_INGESTION_ORDER_FIELD = "_goalflight_ingestion_order"
 BACKLOG_DIGEST_DIR = "backlog-digests"
 DEFAULT_RELAY_ITEM_LIMIT = 20
 DEFAULT_RELAY_BYTE_LIMIT = 4096
@@ -135,12 +143,7 @@ def ack_cursor_path(messages_dir: Path) -> Path:
     return messages_dir / ACK_CURSOR_FILE
 
 
-def load_read_cursor(path: Path) -> dict[str, int]:
-    """Best-effort cursor load; absent/corrupt state means everything is unseen."""
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-        return {}
+def _clean_cursor_entries(raw: object) -> dict[str, int]:
     if not isinstance(raw, dict):
         return {}
     cursor: dict[str, int] = {}
@@ -155,16 +158,305 @@ def load_read_cursor(path: Path) -> dict[str, int]:
     return cursor
 
 
-def write_read_cursor(path: Path, cursor: dict[str, int]) -> None:
+def _load_read_cursor_unlocked(
+    path: Path,
+) -> tuple[dict[str, int], dict[str, object], bool, bool]:
+    """Load cursor state plus format facts; absent/corrupt state is unseen."""
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return {}, {}, False, False
+    if not isinstance(raw, dict):
+        return {}, {}, False, False
+    if (
+        raw.get("schema") == MESSAGE_CURSOR_SCHEMA
+        and raw.get("schema_version") == 1
+        and isinstance(raw.get("cursor"), dict)
+    ):
+        cursor = _clean_cursor_entries(raw["cursor"])
+        stored_migration = raw.get("migration")
+        migration = dict(stored_migration) if isinstance(stored_migration, dict) else {}
+        stored_unresolved = migration.get("unresolved")
+        unresolved = dict(stored_unresolved) if isinstance(stored_unresolved, dict) else {}
+        for key in list(cursor):
+            if _is_structural_cursor_key(key):
+                continue
+            unresolved.setdefault(
+                key,
+                {"value": cursor.pop(key), "reason": "invalid-versioned-cursor-key"},
+            )
+        migration["unresolved"] = unresolved
+        return (
+            cursor,
+            migration,
+            True,
+            True,
+        )
+    # No version marker means every key is legacy raw text. In particular, a
+    # dispatch id that happens to look like `["local","x"]` is not structural.
+    return _clean_cursor_entries(raw), {}, False, True
+
+
+def _structural_stream_key(source: str, stem: str) -> str:
+    return json.dumps([source, stem], ensure_ascii=False, separators=(",", ":"))
+
+
+def _structural_stream_key_parts(key: str) -> tuple[str, str] | None:
+    try:
+        value = json.loads(key)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if (
+        not isinstance(value, list)
+        or len(value) != 2
+        or value[0] not in {"local", "fleet"}
+        or not isinstance(value[1], str)
+    ):
+        return None
+    return str(value[0]), value[1]
+
+
+def _is_structural_cursor_key(key: str) -> bool:
+    if _structural_stream_key_parts(key) is not None:
+        return True
+    if not key.startswith("controller:"):
+        return False
+    try:
+        identity = json.loads(key.removeprefix("controller:"))
+    except (json.JSONDecodeError, TypeError):
+        return False
+    return (
+        isinstance(identity, list)
+        and len(identity) in {2, 3}
+        and isinstance(identity[-1], str)
+        and _structural_stream_key_parts(identity[-1]) is not None
+    )
+
+
+def _legacy_stream_cursor_target(
+    key: str,
+    *,
+    local_stems: set[str],
+    fleet_stems: set[str],
+) -> tuple[str | None, str | None]:
+    """Resolve an old textual cursor only when carrier paths make it unambiguous."""
+    candidates: set[str] = set()
+    if key in local_stems:
+        candidates.add(_structural_stream_key("local", key))
+    if key in fleet_stems:
+        candidates.add(_structural_stream_key("fleet", key))
+    if key.startswith("fleet:") and key[6:] in fleet_stems:
+        candidates.add(_structural_stream_key("fleet", key[6:]))
+    if len(candidates) == 1:
+        return next(iter(candidates)), None
+    if candidates:
+        return None, "ambiguous-carrier-provenance"
+    return None, "carrier-absent"
+
+
+def _legacy_cursor_target(
+    key: str,
+    *,
+    local_stems: set[str],
+    fleet_stems: set[str],
+) -> tuple[str | None, str | None]:
+    if not key.startswith("controller:"):
+        return _legacy_stream_cursor_target(
+            key,
+            local_stems=local_stems,
+            fleet_stems=fleet_stems,
+        )
+    try:
+        identity = json.loads(key.removeprefix("controller:"))
+    except (json.JSONDecodeError, TypeError):
+        return None, "unrecognized-legacy-key"
+    if not isinstance(identity, list) or len(identity) not in {2, 3}:
+        return None, "unrecognized-legacy-key"
+    legacy_inbox_key = identity[-1]
+    if not isinstance(legacy_inbox_key, str):
+        return None, "unrecognized-legacy-key"
+    migrated_inbox_key, unresolved_reason = _legacy_stream_cursor_target(
+        legacy_inbox_key,
+        local_stems=local_stems,
+        fleet_stems=fleet_stems,
+    )
+    if migrated_inbox_key is None:
+        return None, unresolved_reason
+    migrated_identity = [*identity[:-1], migrated_inbox_key]
+    return (
+        "controller:" + json.dumps(
+            migrated_identity,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+        None,
+    )
+
+
+def _migrate_legacy_cursor_entries(
+    cursor: dict[str, int],
+    *,
+    messages_dir: Path,
+    fleet_dir: Path | None,
+) -> tuple[dict[str, int], dict[str, object]]:
+    """Migrate only measured provenance; retain every unresolved raw entry."""
+    local_stems = {
+        path.stem
+        for path in messages_dir.glob("*.jsonl")
+        if path.is_file()
+    } if messages_dir.is_dir() else set()
+    register_dir = fleet_dir / "register" / "dispatches" if fleet_dir is not None else None
+    fleet_stems = {
+        path.stem
+        for path in register_dir.glob("*.jsonl")
+        if path.is_file()
+    } if register_dir is not None and register_dir.is_dir() else set()
+    migrated: dict[str, int] = {}
+    unresolved: dict[str, dict[str, object]] = {}
+    for key, seq in cursor.items():
+        target, unresolved_reason = _legacy_cursor_target(
+            key,
+            local_stems=local_stems,
+            fleet_stems=fleet_stems,
+        )
+        if target is None:
+            unresolved[key] = {
+                "value": int(seq),
+                "reason": unresolved_reason or "unrecognized-legacy-key",
+            }
+            continue
+        migrated[target] = max(int(migrated.get(target, 0)), int(seq))
+    return migrated, {
+        "source_format": "unversioned-flat-map",
+        "migrated": len(cursor) - len(unresolved),
+        "unresolved": unresolved,
+    }
+
+
+def load_read_cursor(
+    path: Path,
+    *,
+    messages_dir: Path | None = None,
+    fleet_dir: Path | None = None,
+    migration_report: dict[str, object] | None = None,
+) -> dict[str, int]:
+    """Load and atomically migrate legacy keys before returning cursor state."""
+    resolved_messages_dir = messages_dir or path.parent
+    resolved_fleet_dir = fleet_dir if fleet_dir is not None else default_fleet_dir()
+    with mail_lock(path):
+        cursor, stored_report, versioned, loaded = _load_read_cursor_unlocked(path)
+        if versioned or not loaded:
+            resolved_report = stored_report
+        else:
+            cursor, resolved_report = _migrate_legacy_cursor_entries(
+                cursor,
+                messages_dir=resolved_messages_dir,
+                fleet_dir=resolved_fleet_dir,
+            )
+            write_read_cursor(path, cursor, migration_report=resolved_report)
+        if migration_report is not None:
+            migration_report.clear()
+            migration_report.update(resolved_report)
+        return cursor
+
+
+def write_read_cursor(
+    path: Path,
+    cursor: dict[str, int],
+    *,
+    migration_report: dict[str, object] | None = None,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     clean = {str(key): max(0, int(value)) for key, value in sorted(cursor.items())}
+    report = dict(migration_report or {})
+    if not isinstance(report.get("unresolved"), dict):
+        report["unresolved"] = {}
+    document = {
+        "schema": MESSAGE_CURSOR_SCHEMA,
+        "schema_version": 1,
+        "cursor": clean,
+        "migration": report,
+    }
     tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     try:
-        tmp.write_text(json.dumps(clean, sort_keys=True) + "\n", encoding="utf-8")
+        tmp.write_text(json.dumps(document, sort_keys=True) + "\n", encoding="utf-8")
         os.replace(tmp, path)
     finally:
         with contextlib.suppress(OSError):
             tmp.unlink()
+
+
+def _next_ingestion_order(messages_dir: Path) -> int:
+    """Allocate a controller-local causal order that survives restarts and clock rollback."""
+    path = messages_dir / INGESTION_ORDER_FILE
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with mail_lock(path):
+        try:
+            previous = max(0, int(path.read_text(encoding="utf-8").strip()))
+        except (OSError, TypeError, ValueError, UnicodeDecodeError):
+            previous = 0
+        order = max(previous + 1, time.time_ns())
+        tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            tmp.write_text(f"{order}\n", encoding="utf-8")
+            os.replace(tmp, path)
+        finally:
+            with contextlib.suppress(OSError):
+                tmp.unlink()
+    return order
+
+
+def _load_ingestion_identity_orders(path: Path) -> dict[str, int]:
+    if not path.exists():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise MessageError(f"{path}: invalid ingestion identity store: {exc}") from exc
+    if (
+        not isinstance(raw, dict)
+        or raw.get("schema") != INGESTION_IDENTITY_SCHEMA
+        or raw.get("schema_version") != 1
+        or not isinstance(raw.get("orders"), dict)
+    ):
+        raise MessageError(f"{path}: unsupported ingestion identity store")
+    orders: dict[str, int] = {}
+    for identity, value in raw["orders"].items():
+        if not isinstance(identity, str) or isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise MessageError(f"{path}: invalid ingestion identity entry")
+        orders[identity] = value
+    return orders
+
+
+def _write_ingestion_identity_orders(path: Path, orders: dict[str, int]) -> None:
+    document = {
+        "schema": INGESTION_IDENTITY_SCHEMA,
+        "schema_version": 1,
+        "orders": dict(sorted(orders.items())),
+    }
+    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_text(json.dumps(document, sort_keys=True) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+
+
+def _ingestion_order_for_envelope(messages_dir: Path, envelope: dict) -> int:
+    """Assign one durable controller-local order per canonical event identity."""
+    identity = _canonical_envelope_identity(envelope)
+    path = messages_dir / INGESTION_IDENTITY_FILE
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with mail_lock(path):
+        orders = _load_ingestion_identity_orders(path)
+        existing = orders.get(identity)
+        if existing is not None:
+            return existing
+        order = _next_ingestion_order(messages_dir)
+        orders[identity] = order
+        _write_ingestion_identity_orders(path, orders)
+        return order
 
 
 def advance_read_cursor(
@@ -172,6 +464,8 @@ def advance_read_cursor(
     advances: dict[str, int] | None = None,
     *,
     max_scan: Callable[[], dict[str, int]] | None = None,
+    messages_dir: Path | None = None,
+    fleet_dir: Path | None = None,
 ) -> list[dict[str, object]]:
     """Advance cursor entries under lock; never rewind existing last-seen seq."""
     results: list[dict[str, object]] = []
@@ -181,13 +475,19 @@ def advance_read_cursor(
             for key, through in max_scan().items():
                 old_target = int(resolved_advances.get(key, 0))
                 resolved_advances[key] = max(old_target, int(through))
-        cursor = load_read_cursor(path)
+        cursor, migration_report, versioned, loaded = _load_read_cursor_unlocked(path)
+        if loaded and not versioned:
+            cursor, migration_report = _migrate_legacy_cursor_entries(
+                cursor,
+                messages_dir=messages_dir or path.parent,
+                fleet_dir=fleet_dir if fleet_dir is not None else default_fleet_dir(),
+            )
         for key, through in sorted(resolved_advances.items()):
             old = int(cursor.get(key, 0))
             new = max(old, int(through))
             cursor[key] = new
             results.append({"inbox": key, "old": old, "new": new, "advanced": new > old})
-        write_read_cursor(path, cursor)
+        write_read_cursor(path, cursor, migration_report=migration_report)
     return results
 
 
@@ -267,12 +567,15 @@ def controller_cursor_key(
     label: str,
     dispatch_id: str,
     project_root: str | Path | None = None,
+    *,
+    inbox_key: str | None = None,
 ) -> str:
     """Recipient-private cursor key; one controller cannot mark another's mail read."""
+    cursor_dispatch_id = inbox_key or str(dispatch_id)
     identity = (
-        [str(project_root), str(label), str(dispatch_id)]
+        [str(project_root), str(label), cursor_dispatch_id]
         if project_root is not None
-        else [str(label), str(dispatch_id)]
+        else [str(label), cursor_dispatch_id]
     )
     return "controller:" + json.dumps(
         identity,
@@ -281,36 +584,169 @@ def controller_cursor_key(
     )
 
 
-def envelope_cursor_key(envelope: dict) -> str:
+def envelope_cursor_key(envelope: dict, *, inbox_key: str | None = None) -> str:
     dispatch_id = str(envelope.get("dispatch_id") or "")
+    resolved_inbox_key = inbox_key or str(
+        envelope.get(_INBOX_CURSOR_KEY_FIELD) or dispatch_id
+    )
     label = controller_addressee_label(envelope)
     project_root = controller_addressee_project_root(envelope)
     return (
-        controller_cursor_key(label, dispatch_id, project_root)
+        controller_cursor_key(
+            label,
+            dispatch_id,
+            project_root,
+            inbox_key=resolved_inbox_key,
+        )
         if label and project_root
-        else dispatch_id
+        else resolved_inbox_key
     )
 
 
-def read_envelopes(path: Path, *, last_n: int | None = None) -> list[dict]:
+def inbox_cursor_keys(envelope: dict) -> list[str]:
+    """Cursor domains attached to one logical envelope or projected item."""
+    values = envelope.get(_INBOX_CURSOR_KEYS_FIELD)
+    if isinstance(values, list):
+        keys = [str(value) for value in values if str(value)]
+        if keys:
+            return list(dict.fromkeys(keys))
+    key = str(
+        envelope.get(_INBOX_CURSOR_KEY_FIELD)
+        or envelope.get("dispatch_id")
+        or ""
+    )
+    return [key] if key else []
+
+
+def resolved_envelope_cursor_keys(envelope: dict) -> list[str]:
+    """Recipient-aware cursor keys for every stream carrying an envelope."""
+    return [
+        envelope_cursor_key(envelope, inbox_key=inbox_key)
+        for inbox_key in inbox_cursor_keys(envelope)
+    ]
+
+
+def cursor_has_unread_event(cursor: dict[str, int], keys: list[str], seq: int) -> bool:
+    """A copied logical event is unread only until any carrier is acknowledged."""
+    return bool(keys) and all(seq > int(cursor.get(key, 0)) for key in keys)
+
+
+def _cursor_metadata(keys: list[str]) -> dict[str, object]:
+    unique = list(dict.fromkeys(str(key) for key in keys if str(key)))
+    return {
+        _INBOX_CURSOR_KEY_FIELD: unique[0] if unique else None,
+        _INBOX_CURSOR_KEYS_FIELD: unique,
+    }
+
+
+def _without_inbox_metadata(envelope: dict) -> dict:
+    clean = dict(envelope)
+    clean.pop(_INBOX_CURSOR_KEY_FIELD, None)
+    clean.pop(_INBOX_CURSOR_KEYS_FIELD, None)
+    clean.pop(_INBOX_SOURCE_PATHS_FIELD, None)
+    return clean
+
+
+def _canonical_envelope_identity(envelope: dict) -> str:
+    """Full source content identity; controller ingestion metadata is transport-local."""
+    clean = _without_inbox_metadata(envelope)
+    clean.pop(_INGESTION_ORDER_FIELD, None)
+    return json.dumps(
+        clean,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _event_causal_sort_key(envelope: dict) -> tuple[object, ...]:
+    """Order cross-carrier events only by controller order; legacy falls back deterministically."""
+    ingestion_order = envelope.get(_INGESTION_ORDER_FIELD)
+    identity = _canonical_envelope_identity(envelope)
+    if isinstance(ingestion_order, int):
+        return (1, ingestion_order, identity)
+    stream_keys = tuple(sorted(inbox_cursor_keys(envelope)))
+    return (0, stream_keys, int(envelope.get("seq", 0)), identity)
+
+
+def _read_envelope_prefix(path: Path) -> tuple[list[dict], dict[str, object] | None]:
+    """Return the validated prefix and the first carrier corruption, if any."""
     if not path.exists():
-        return []
+        return [], None
     if not path.is_file():
         # Non-regular inbox (FIFO/device): read_text()'s open() would block forever.
         # is_file() is a non-blocking stat; treat a non-regular inbox as empty so no
         # reader (build_aggregate, next_seq, the watcher bridge) can hang on it.
-        return []
+        return [], None
     envelopes: list[dict] = []
-    for line_no, line in enumerate(path.read_text().splitlines(), start=1):
+    try:
+        lines = path.read_bytes().splitlines()
+    except OSError as exc:
+        detail = f"{path}: unreadable carrier: {type(exc).__name__}: {exc}"
+        return [], {
+            "path": str(path),
+            "line": None,
+            "error": detail,
+            "validated_envelopes": 0,
+            "validated_through_seq": 0,
+        }
+    for line_no, raw_line in enumerate(lines, start=1):
+        try:
+            line = raw_line.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            detail = f"{path}:{line_no}: invalid UTF-8: {exc}"
+            return envelopes, {
+                "path": str(path),
+                "line": line_no,
+                "error": detail,
+                "validated_envelopes": len(envelopes),
+                "validated_through_seq": max(
+                    (int(env.get("seq", 0)) for env in envelopes),
+                    default=0,
+                ),
+            }
         stripped = line.strip()
         if not stripped:
             continue
         try:
             envelope = json.loads(stripped)
         except json.JSONDecodeError as exc:
-            raise MessageError(f"{path}:{line_no}: invalid JSON: {exc}") from exc
-        validate_envelope(envelope, path=f"{path}:{line_no}")
+            detail = f"{path}:{line_no}: invalid JSON: {exc}"
+            return envelopes, {
+                "path": str(path),
+                "line": line_no,
+                "error": detail,
+                "validated_envelopes": len(envelopes),
+                "validated_through_seq": max(
+                    (int(env.get("seq", 0)) for env in envelopes),
+                    default=0,
+                ),
+            }
+        try:
+            validate_envelope(envelope, path=f"{path}:{line_no}")
+        except MessageError as exc:
+            return envelopes, {
+                "path": str(path),
+                "line": line_no,
+                "error": str(exc),
+                "validated_envelopes": len(envelopes),
+                "validated_through_seq": max(
+                    (int(env.get("seq", 0)) for env in envelopes),
+                    default=0,
+                ),
+            }
         envelopes.append(envelope)
+    return envelopes, None
+
+
+def _emit_carrier_error(error: dict[str, object]) -> None:
+    print(f"WARNING: carrier corruption: {error.get('error')}", file=sys.stderr)
+
+
+def read_envelopes(path: Path, *, last_n: int | None = None) -> list[dict]:
+    envelopes, error = _read_envelope_prefix(path)
+    if error is not None:
+        raise MessageError(str(error["error"]))
     if last_n is not None and last_n >= 0:
         return envelopes[-last_n:] if last_n else []
     return envelopes
@@ -390,6 +826,10 @@ def post_message(
         }
         if addressee is not None:
             envelope["addressee"] = dict(addressee)
+        envelope[_INGESTION_ORDER_FIELD] = _ingestion_order_for_envelope(
+            messages_dir,
+            envelope,
+        )
         line = serialize_envelope_line(envelope)
         with path.open("a", encoding="utf-8") as fh:
             fh.write(line)
@@ -732,14 +1172,45 @@ def _dispatch_complete(envelopes: list[dict]) -> bool:
     return False
 
 
-def _open_user_needs(envelopes: list[dict], *, acked_through: int = 0) -> list[dict]:
-    if _dispatch_complete(envelopes):
-        return []
+def _event_causally_at_or_after(candidate: dict, event: dict) -> bool:
+    """Compare only same-stream sequence or controller-stamped ingestion order."""
+    shared_streams = set(inbox_cursor_keys(candidate)) & set(inbox_cursor_keys(event))
+    if shared_streams:
+        return int(candidate.get("seq", 0)) >= int(event.get("seq", 0))
+    candidate_order = candidate.get(_INGESTION_ORDER_FIELD)
+    event_order = event.get(_INGESTION_ORDER_FIELD)
+    if isinstance(candidate_order, int) and isinstance(event_order, int):
+        return candidate_order >= event_order
+    return False
+
+
+def _closed_by_completion(envelope: dict, envelopes: list[dict]) -> bool:
+    return any(
+        candidate.get("type") == "result"
+        and candidate.get("payload", {}).get("complete")
+        and _event_causally_at_or_after(candidate, envelope)
+        for candidate in envelopes
+    )
+
+
+def _open_user_needs(
+    envelopes: list[dict],
+    *,
+    acked_through: int = 0,
+    ack_cursor: dict[str, int] | None = None,
+) -> list[dict]:
     open_items: list[dict] = []
     for env in envelopes:
+        cursor_keys = resolved_envelope_cursor_keys(env)
+        is_unacked = (
+            cursor_has_unread_event(ack_cursor, cursor_keys, int(env.get("seq", 0)))
+            if ack_cursor is not None
+            else int(env.get("seq", 0)) > acked_through
+        )
         if (
             env.get("type") in {"user_need", "user_confirm", "blocked"}
-            and int(env.get("seq", 0)) > acked_through
+            and is_unacked
+            and not _closed_by_completion(env, envelopes)
         ):
             payload = env.get("payload", {}) or {}
             open_items.append(
@@ -751,6 +1222,8 @@ def _open_user_needs(envelopes: list[dict], *, acked_through: int = 0) -> list[d
                     "ts": env["ts"],
                     "text": payload.get("text", ""),
                     "payload": payload,
+                    _INGESTION_ORDER_FIELD: env.get(_INGESTION_ORDER_FIELD),
+                    **_cursor_metadata(cursor_keys),
                 }
             )
     return open_items
@@ -771,23 +1244,18 @@ def _open_controller_channel(
     """
     open_items: list[dict] = []
     for env in envelopes:
-        envelope_acked_through = acked_through
+        cursor_keys = inbox_cursor_keys(env)
         addressee_label = controller_addressee_label(env)
-        addressee_root = controller_addressee_project_root(env)
-        if ack_cursor is not None and addressee_label and controller_label == addressee_label:
-            envelope_acked_through = int(
-                ack_cursor.get(
-                    controller_cursor_key(
-                        addressee_label,
-                        str(env.get("dispatch_id") or ""),
-                        addressee_root,
-                    ),
-                    0,
-                )
-            )
+        if addressee_label and controller_label == addressee_label:
+            cursor_keys = resolved_envelope_cursor_keys(env)
+        is_unacked = (
+            cursor_has_unread_event(ack_cursor, cursor_keys, int(env.get("seq", 0)))
+            if ack_cursor is not None
+            else int(env.get("seq", 0)) > acked_through
+        )
         if (
             env.get("type") in CONTROLLER_CHANNEL_TYPES
-            and int(env.get("seq", 0)) > envelope_acked_through
+            and is_unacked
         ):
             payload = env.get("payload", {}) or {}
             open_items.append(
@@ -800,20 +1268,32 @@ def _open_controller_channel(
                     "text": payload.get("text", ""),
                     "payload": payload,
                     "addressee": env.get("addressee"),
+                    _INGESTION_ORDER_FIELD: env.get(_INGESTION_ORDER_FIELD),
+                    **_cursor_metadata(cursor_keys),
                 }
             )
     return open_items
 
 
-def _open_controller_advisories(envelopes: list[dict], *, acked_through: int = 0) -> list[dict]:
-    if _dispatch_complete(envelopes):
-        return []
+def _open_controller_advisories(
+    envelopes: list[dict],
+    *,
+    acked_through: int = 0,
+    ack_cursor: dict[str, int] | None = None,
+) -> list[dict]:
     open_items: list[dict] = []
     for env in envelopes:
+        cursor_keys = resolved_envelope_cursor_keys(env)
+        is_unacked = (
+            cursor_has_unread_event(ack_cursor, cursor_keys, int(env.get("seq", 0)))
+            if ack_cursor is not None
+            else int(env.get("seq", 0)) > acked_through
+        )
         if (
             env.get("dispatch_id") == "controller-quota-advisory"
             and env.get("type") == "advisory"
-            and int(env.get("seq", 0)) > acked_through
+            and is_unacked
+            and not _closed_by_completion(env, envelopes)
         ):
             open_items.append(
                 {
@@ -822,25 +1302,30 @@ def _open_controller_advisories(envelopes: list[dict], *, acked_through: int = 0
                     "type": env["type"],
                     "ts": env["ts"],
                     "text": env.get("payload", {}).get("text", ""),
+                    _INGESTION_ORDER_FIELD: env.get(_INGESTION_ORDER_FIELD),
+                    **_cursor_metadata(cursor_keys),
                 }
             )
     return open_items
 
 
 def _last_steering(envelopes_by_dispatch: dict[str, list[dict]]) -> dict | None:
-    latest: dict | None = None
-    for envelopes in envelopes_by_dispatch.values():
-        for env in envelopes:
-            if env.get("type") != "steering":
-                continue
-            if latest is None or env["seq"] >= latest.get("seq", 0):
-                latest = {
-                    "dispatch_id": env["dispatch_id"],
-                    "seq": env["seq"],
-                    "ts": env["ts"],
-                    "payload": env.get("payload", {}),
-                }
-    return latest
+    steering = [
+        env
+        for envelopes in envelopes_by_dispatch.values()
+        for env in envelopes
+        if env.get("type") == "steering"
+    ]
+    if not steering:
+        return None
+
+    latest = max(steering, key=_event_causal_sort_key)
+    return {
+        "dispatch_id": latest["dispatch_id"],
+        "seq": latest["seq"],
+        "ts": latest["ts"],
+        "payload": latest.get("payload", {}),
+    }
 
 
 def collect_inbox_paths(
@@ -857,18 +1342,75 @@ def collect_inbox_paths(
     def _want(stem: str) -> bool:
         return dispatch_ids is None or stem in dispatch_ids or stem == "controller-quota-advisory"
 
-    paths: dict[str, Path] = {}
+    paths: dict[str, list[Path]] = {}
     if messages_dir.is_dir():
         for path in sorted(messages_dir.glob("*.jsonl")):
             if path.is_file() and _want(path.stem):
-                paths[path.stem] = path
+                paths.setdefault(path.stem, []).append(path)
     if fleet_dir is not None:
         register_dir = fleet_dir / "register" / "dispatches"
         if register_dir.is_dir():
             for path in sorted(register_dir.glob("*.jsonl")):
                 if path.is_file() and _want(path.stem):
-                    paths[path.stem] = path
-    return list(paths.values())
+                    paths.setdefault(path.stem, []).append(path)
+    return [path for dispatch_id in sorted(paths) for path in paths[dispatch_id]]
+
+
+def inbox_stream_key(path: Path, *, messages_dir: Path) -> str:
+    """Stable cursor identity for one independently sequenced inbox stream."""
+    source = "local" if path.parent == messages_dir else "fleet"
+    return json.dumps([source, path.stem], ensure_ascii=False, separators=(",", ":"))
+
+
+def logical_envelopes_for_paths(
+    paths: list[Path],
+    *,
+    messages_dir: Path | None = None,
+    tolerate_errors: bool = False,
+    envelope_filter: Callable[[dict], bool] | None = None,
+    carrier_errors: list[dict[str, object]] | None = None,
+) -> list[dict]:
+    """Read logical events once while retaining every physical cursor domain."""
+    logical: list[dict] = []
+    by_identity: dict[str, dict] = {}
+    for path in paths:
+        inbox_key = (
+            inbox_stream_key(path, messages_dir=messages_dir)
+            if messages_dir is not None
+            else path.stem
+        )
+        if tolerate_errors:
+            envelopes, error = _read_envelope_prefix(path)
+            if error is not None:
+                if carrier_errors is not None:
+                    carrier_errors.append(error)
+                else:
+                    _emit_carrier_error(error)
+        else:
+            envelopes = read_envelopes(path)
+        for envelope in envelopes:
+            if envelope_filter is not None and not envelope_filter(envelope):
+                continue
+            identity = _canonical_envelope_identity(envelope)
+            existing = by_identity.get(identity)
+            if existing is not None:
+                keys = inbox_cursor_keys(existing)
+                if inbox_key not in keys:
+                    keys.append(inbox_key)
+                    existing.update(_cursor_metadata(keys))
+                source_paths = existing.setdefault(_INBOX_SOURCE_PATHS_FIELD, [])
+                if str(path) not in source_paths:
+                    source_paths.append(str(path))
+                continue
+            annotated = {
+                **envelope,
+                **_cursor_metadata([inbox_key]),
+                _INBOX_SOURCE_PATHS_FIELD: [str(path)],
+            }
+            by_identity[identity] = annotated
+            logical.append(annotated)
+    logical.sort(key=_event_causal_sort_key)
+    return logical
 
 
 def max_seq_by_inbox(
@@ -876,55 +1418,64 @@ def max_seq_by_inbox(
     messages_dir: Path,
     fleet_dir: Path | None = None,
     dispatch_ids: set[str] | None = None,
+    carrier_errors: list[dict[str, object]] | None = None,
 ) -> dict[str, int]:
     maxes: dict[str, int] = {}
     for path in collect_inbox_paths(messages_dir, fleet_dir, dispatch_ids=dispatch_ids):
-        try:
-            envelopes = read_envelopes(path)
-        except MessageError:
-            continue
-        maxes[path.stem] = max((int(env.get("seq", 0)) for env in envelopes), default=0)
+        envelopes, error = _read_envelope_prefix(path)
+        if error is not None:
+            if carrier_errors is not None:
+                carrier_errors.append(error)
+            else:
+                _emit_carrier_error(error)
+        maxes[inbox_stream_key(path, messages_dir=messages_dir)] = max(
+            (int(env.get("seq", 0)) for env in envelopes),
+            default=0,
+        )
     return maxes
 
 
 def unseen_envelopes_for_paths(
     paths: list[Path],
     *,
+    messages_dir: Path | None = None,
     cursor: dict[str, int],
     last_n: int | None = None,
     tolerate_errors: bool = False,
     envelope_filter: Callable[[dict], bool] | None = None,
-    cursor_key: Callable[[dict], str] | None = None,
+    cursor_key: Callable[[dict, str], str] | None = None,
+    carrier_errors: list[dict[str, object]] | None = None,
 ) -> tuple[list[dict], dict[str, int], dict[str, int]]:
     shown: list[dict] = []
-    counts: dict[str, int] = {}
+    counts: dict[str, int] = {path.stem: 0 for path in paths}
     ack_advances: dict[str, int] = {}
-    for path in paths:
-        key = path.stem
-        try:
-            envelopes = read_envelopes(path)
-        except MessageError:
-            if tolerate_errors:
-                continue
-            raise
-        if envelope_filter is not None:
-            envelopes = [env for env in envelopes if envelope_filter(env)]
-        key_for = cursor_key or (lambda _env: key)
-        unseen = [
-            env
-            for env in envelopes
-            if int(env.get("seq", 0)) > int(cursor.get(key_for(env), 0))
-        ]
-        counts[key] = len(unseen)
-        if last_n is not None and last_n >= 0:
-            unseen = unseen[-last_n:] if last_n else []
-        shown.extend(unseen)
-        for env in unseen:
-            cursor_name = key_for(env)
+    key_for = cursor_key or (lambda _env, inbox_key: inbox_key)
+    unseen: list[dict] = []
+    for env in logical_envelopes_for_paths(
+        paths,
+        messages_dir=messages_dir,
+        tolerate_errors=tolerate_errors,
+        envelope_filter=envelope_filter,
+        carrier_errors=carrier_errors,
+    ):
+        cursor_names = [key_for(env, key) for key in inbox_cursor_keys(env)]
+        seq = int(env.get("seq", 0))
+        dispatch_id = str(env.get("dispatch_id") or "")
+        counts.setdefault(dispatch_id, 0)
+        if not cursor_has_unread_event(cursor, cursor_names, seq):
+            continue
+        counts[dispatch_id] = counts.get(dispatch_id, 0) + 1
+        unseen.append(env)
+    if last_n is not None and last_n >= 0:
+        unseen = unseen[-last_n:] if last_n else []
+    for env in unseen:
+        seq = int(env.get("seq", 0))
+        for cursor_name in (key_for(env, key) for key in inbox_cursor_keys(env)):
             ack_advances[cursor_name] = max(
                 int(ack_advances.get(cursor_name, 0)),
-                int(env.get("seq", 0)),
+                seq,
             )
+    shown.extend(_without_inbox_metadata(env) for env in unseen)
     return shown, counts, ack_advances
 
 
@@ -956,19 +1507,25 @@ def build_aggregate(
     dispatch_ids: set[str] | None = None,
     envelope_filter: Callable[[dict], bool] | None = None,
     controller_label: str | None = None,
+    include_cursor_keys: bool = False,
 ) -> dict:
     envelopes_by_dispatch: dict[str, list[dict]] = {}
-    ack_cursor = load_read_cursor(ack_cursor_path(messages_dir))
-    for path in collect_inbox_paths(messages_dir, fleet_dir, dispatch_ids=dispatch_ids):
-        try:
-            envelopes = read_envelopes(path)
-            if envelope_filter is not None:
-                envelopes = [envelope for envelope in envelopes if envelope_filter(envelope)]
-            envelopes_by_dispatch[path.stem] = envelopes
-        except MessageError:
-            # One malformed/unreadable inbox must NOT suppress everyone else's mail
-            # (a scoped status reads only its own inbox, but be tolerant regardless).
-            continue
+    ack_cursor = load_read_cursor(
+        ack_cursor_path(messages_dir),
+        messages_dir=messages_dir,
+        fleet_dir=fleet_dir,
+    )
+    paths = collect_inbox_paths(messages_dir, fleet_dir, dispatch_ids=dispatch_ids)
+    carrier_errors: list[dict[str, object]] = []
+    for envelope in logical_envelopes_for_paths(
+        paths,
+        messages_dir=messages_dir,
+        tolerate_errors=True,
+        envelope_filter=envelope_filter,
+        carrier_errors=carrier_errors,
+    ):
+        dispatch_id = str(envelope.get("dispatch_id") or "")
+        envelopes_by_dispatch.setdefault(dispatch_id, []).append(envelope)
 
     open_user_needs: list[dict] = []
     open_advisories: list[dict] = []
@@ -979,21 +1536,26 @@ def build_aggregate(
             continue
         if not _dispatch_complete(envelopes):
             active_dispatches.append(dispatch_id)
-        acked_through = int(ack_cursor.get(dispatch_id, 0))
-        open_user_needs.extend(_open_user_needs(envelopes, acked_through=acked_through))
+        open_user_needs.extend(_open_user_needs(envelopes, ack_cursor=ack_cursor))
         open_advisories.extend(
-            _open_controller_advisories(envelopes, acked_through=acked_through)
+            _open_controller_advisories(envelopes, ack_cursor=ack_cursor)
         )
         open_controller_channel.extend(
             _open_controller_channel(
                 envelopes,
-                acked_through=acked_through,
                 ack_cursor=ack_cursor,
                 controller_label=controller_label,
             )
         )
 
-    return {
+    if not include_cursor_keys:
+        for items in (open_user_needs, open_advisories, open_controller_channel):
+            for item in items:
+                item.pop(_INBOX_CURSOR_KEY_FIELD, None)
+                item.pop(_INBOX_CURSOR_KEYS_FIELD, None)
+                item.pop(_INGESTION_ORDER_FIELD, None)
+
+    aggregate = {
         "schema": AGGREGATE_SCHEMA,
         "schema_version": 1,
         "min_reader_version": 1,
@@ -1004,6 +1566,9 @@ def build_aggregate(
         "active_dispatches": active_dispatches,
         "last_steering": _last_steering(envelopes_by_dispatch),
     }
+    if carrier_errors:
+        aggregate["carrier_errors"] = carrier_errors
+    return aggregate
 
 
 def refresh_aggregate(
@@ -1045,6 +1610,12 @@ def cmd_append(args: argparse.Namespace) -> int:
         envelope = json.loads(Path(args.envelope_file).read_text())
     else:
         envelope = json.loads(sys.stdin.read())
+    if isinstance(envelope, dict):
+        envelope = dict(envelope)
+        envelope[_INGESTION_ORDER_FIELD] = _ingestion_order_for_envelope(
+            args.messages_dir,
+            envelope,
+        )
     path = inbox_path(args.messages_dir, args.dispatch_id)
     append_envelope(path, envelope)
     if args.refresh_aggregate:
@@ -1099,27 +1670,57 @@ def cmd_read(args: argparse.Namespace) -> int:
     if args.ack and not args.unseen:
         print("read --ack requires --unseen", file=sys.stderr)
         return 2
-    path = inbox_path(args.messages_dir, args.dispatch_id)
+    paths = collect_inbox_paths(
+        args.messages_dir,
+        args.fleet_dir,
+        dispatch_ids={str(args.dispatch_id)},
+    )
+    carrier_errors: list[dict[str, object]] = []
     if args.unseen:
         cursor_path = read_cursor_path(args.messages_dir)
-        cursor = load_read_cursor(cursor_path)
+        cursor = load_read_cursor(
+            cursor_path,
+            messages_dir=args.messages_dir,
+            fleet_dir=args.fleet_dir,
+        )
         envelopes, counts, ack_advances = unseen_envelopes_for_paths(
-            [path],
+            paths,
+            messages_dir=args.messages_dir,
             cursor=cursor,
             last_n=args.last,
+            tolerate_errors=True,
+            carrier_errors=carrier_errors,
         )
+        counts.setdefault(str(args.dispatch_id), 0)
         print(json.dumps(envelopes, indent=2 if args.json else None))
         print(format_unseen_counts(counts))
         if args.ack:
             try:
-                advance_read_cursor(cursor_path, ack_advances)
+                advance_read_cursor(
+                    cursor_path,
+                    ack_advances,
+                    messages_dir=args.messages_dir,
+                    fleet_dir=args.fleet_dir,
+                )
             except (OSError, ValueError, TypeError) as exc:
                 warn_cursor_not_advanced(exc)
                 return 1
-        return 0
-    envelopes = read_envelopes(path, last_n=args.last)
+        for error in carrier_errors:
+            _emit_carrier_error(error)
+        return 1 if carrier_errors else 0
+    envelopes = logical_envelopes_for_paths(
+        paths,
+        messages_dir=args.messages_dir,
+        tolerate_errors=True,
+        carrier_errors=carrier_errors,
+    )
+    if args.last is not None and args.last >= 0:
+        envelopes = envelopes[-args.last:] if args.last else []
+    envelopes = [_without_inbox_metadata(envelope) for envelope in envelopes]
     print(json.dumps(envelopes, indent=2 if args.json else None))
-    return 0
+    for error in carrier_errors:
+        _emit_carrier_error(error)
+    return 1 if carrier_errors else 0
 
 
 def cmd_mark_read(args: argparse.Namespace) -> int:
@@ -1142,20 +1743,33 @@ def cmd_mark_read(args: argparse.Namespace) -> int:
             return max_seq_by_inbox(messages_dir=args.messages_dir, fleet_dir=args.fleet_dir)
 
     elif args.through is not None:
-        advances = {str(dispatch_id): args.through}
+        inboxes = max_seq_by_inbox(
+            messages_dir=args.messages_dir,
+            fleet_dir=args.fleet_dir,
+            dispatch_ids={str(dispatch_id)},
+        )
+        advances = {
+            key: min(args.through, stream_max)
+            for key, stream_max in inboxes.items()
+        }
     else:
         advances = {}
 
         def scan() -> dict[str, int]:
-            current = max_seq_by_inbox(
+            return max_seq_by_inbox(
                 messages_dir=args.messages_dir,
                 fleet_dir=args.fleet_dir,
                 dispatch_ids={str(dispatch_id)},
             )
-            return {str(dispatch_id): current.get(str(dispatch_id), 0)}
 
     try:
-        results = advance_read_cursor(read_cursor_path(args.messages_dir), advances, max_scan=scan)
+        results = advance_read_cursor(
+            read_cursor_path(args.messages_dir),
+            advances,
+            max_scan=scan,
+            messages_dir=args.messages_dir,
+            fleet_dir=args.fleet_dir,
+        )
     except (OSError, ValueError, TypeError) as exc:
         warn_cursor_not_advanced(exc)
         return 1
@@ -1183,18 +1797,10 @@ def format_bounded_relay(
     item_limit: int = DEFAULT_RELAY_ITEM_LIMIT,
     byte_limit: int = DEFAULT_RELAY_BYTE_LIMIT,
 ) -> str | None:
-    """Newest-first one-line relay with a hard UTF-8 output budget."""
+    """Newest-first causal relay with a hard UTF-8 output budget."""
     if not items:
         return None
-    ordered = sorted(
-        items,
-        key=lambda item: (
-            str(item.get("ts") or ""),
-            int(item.get("seq") or 0),
-            str(item.get("dispatch_id") or ""),
-        ),
-        reverse=True,
-    )
+    ordered = list(reversed(items))
     selected: list[str] = []
     total = len(ordered)
     for item in ordered:
@@ -1733,33 +2339,34 @@ def controller_wake_watermark(
         candidate_dispatch_ids.add(str(task_store_dispatch_id))
 
     events: dict[tuple[str, object], dict] = {}
-    for path in collect_inbox_paths(
+    paths = collect_inbox_paths(
         resolved_messages_dir,
         resolved_fleet_dir,
         dispatch_ids=None if controller_label else candidate_dispatch_ids,
+    )
+    for envelope in logical_envelopes_for_paths(
+        paths,
+        messages_dir=resolved_messages_dir,
+        tolerate_errors=True,
     ):
-        try:
-            envelopes = read_envelopes(path)
-        except MessageError:
+        scope_kind = _controller_scope_kind(
+            envelope,
+            owned_dispatch_ids=owned_dispatch_ids,
+            legacy_addressed_dispatch_ids=legacy_addressed_dispatch_ids,
+            task_store_dispatch_id=(str(task_store_dispatch_id) if task_store_dispatch_id else None),
+            controller_label=(str(controller_label) if controller_label else None),
+            controller_project_root=controller_project_root,
+        )
+        if scope_kind is None:
             continue
-        for envelope in envelopes:
-            scope_kind = _controller_scope_kind(
-                envelope,
-                owned_dispatch_ids=owned_dispatch_ids,
-                legacy_addressed_dispatch_ids=legacy_addressed_dispatch_ids,
-                task_store_dispatch_id=(str(task_store_dispatch_id) if task_store_dispatch_id else None),
-                controller_label=(str(controller_label) if controller_label else None),
-                controller_project_root=controller_project_root,
-            )
-            if scope_kind is None:
-                continue
-            event = _controller_wake_event(
-                envelope,
-                scope_kind=scope_kind,
-                controller_session_id=controller_session_id,
-            )
-            if event is not None:
-                events[(event["dispatch_id"], event["seq"])] = event
+        event = _controller_wake_event(
+            envelope,
+            scope_kind=scope_kind,
+            controller_session_id=controller_session_id,
+        )
+        if event is not None:
+            inbox_key = inbox_cursor_keys(envelope)[0]
+            events[(inbox_key, event["seq"])] = event
     return events
 
 
@@ -1959,6 +2566,7 @@ def controller_mail_summary(
     messages_dir: Path | None = None,
     fleet_dir: Path | None = None,
     unread_only: bool = True,
+    include_cursor_keys: bool = False,
 ) -> dict:
     """Structured "you have mail" summary for a controller's status output.
 
@@ -2028,6 +2636,7 @@ def controller_mail_summary(
         dispatch_ids=None if controller_label else scoped_dispatch_ids,
         envelope_filter=envelope_filter,
         controller_label=controller_label,
+        include_cursor_keys=True,
     )
     needs = list(aggregate.get("open_user_needs") or [])
     needs.extend(aggregate.get("open_advisories") or [])
@@ -2046,29 +2655,30 @@ def controller_mail_summary(
         task_store_project_root,
         canonical_project_root=canonical_project_root,
     )
+    needs.sort(key=_event_causal_sort_key)
+    cursor_migration: dict[str, object] = {}
     if unread_only:
-        read_cursor = load_read_cursor(read_cursor_path(resolved_messages_dir))
+        read_cursor = load_read_cursor(
+            read_cursor_path(resolved_messages_dir),
+            messages_dir=resolved_messages_dir,
+            fleet_dir=resolved_fleet_dir,
+            migration_report=cursor_migration,
+        )
         needs = [
             item
             for item in needs
             if not isinstance(item.get("seq"), int)
-            or int(item["seq"])
-            > int(
-                read_cursor.get(
-                    controller_cursor_key(
-                        str((item.get("addressee") or {}).get("label")),
-                        str(item.get("dispatch_id") or ""),
-                        str((item.get("addressee") or {}).get("project_root")),
-                    )
-                    if isinstance(item.get("addressee"), dict)
-                    and (item.get("addressee") or {}).get("label")
-                    and (item.get("addressee") or {}).get("project_root")
-                    else str(item.get("dispatch_id") or ""),
-                    0,
-                )
+            or cursor_has_unread_event(
+                read_cursor,
+                inbox_cursor_keys(item),
+                int(item["seq"]),
             )
         ]
-    if not needs:
+    carrier_errors = list(aggregate.get("carrier_errors") or [])
+    unresolved_cursor_entries = cursor_migration.get("unresolved")
+    if not isinstance(unresolved_cursor_entries, dict):
+        unresolved_cursor_entries = {}
+    if not needs and not carrier_errors and not unresolved_cursor_entries:
         return {}
     items = [
         {
@@ -2078,10 +2688,39 @@ def controller_mail_summary(
             "ts": n.get("ts"),
             "text": sanitize_display(n.get("text") or "", limit=120),
             "addressee": n.get("addressee"),
+            _INBOX_CURSOR_KEY_FIELD: n.get(_INBOX_CURSOR_KEY_FIELD),
+            _INBOX_CURSOR_KEYS_FIELD: n.get(_INBOX_CURSOR_KEYS_FIELD),
         }
         for n in needs
     ]
-    return {"count": len(items), "needs": items, "hint": format_mail_notice(len(items))}
+    if not include_cursor_keys:
+        for item in items:
+            item.pop(_INBOX_CURSOR_KEY_FIELD, None)
+            item.pop(_INBOX_CURSOR_KEYS_FIELD, None)
+    if items:
+        hint = format_mail_notice(len(items))
+    elif carrier_errors:
+        hint = f"WARNING: {len(carrier_errors)} corrupt mail carrier(s)"
+    else:
+        hint = (
+            f"WARNING: {len(unresolved_cursor_entries)} unresolved legacy cursor "
+            "entry/entries; affected mail remains unread"
+        )
+    result = {
+        "count": len(items),
+        "needs": items,
+        "hint": hint,
+    }
+    if carrier_errors:
+        result["carrier_errors"] = carrier_errors
+    if unresolved_cursor_entries:
+        result["cursor_migration"] = {
+            "source_format": cursor_migration.get("source_format"),
+            "migrated": cursor_migration.get("migrated"),
+            "unresolved_count": len(unresolved_cursor_entries),
+            "report_path": str(read_cursor_path(resolved_messages_dir)),
+        }
+    return result
 
 
 def emit_controller_mail_notice(
@@ -2107,6 +2746,11 @@ def emit_controller_mail_notice(
             messages_dir=messages_dir,
             fleet_dir=fleet_dir,
         )
+        for error in summary.get("carrier_errors") or []:
+            print(
+                f"WARNING: carrier corruption: {error.get('error')}",
+                file=sys.stderr if stream is None else stream,
+            )
         count = int(summary.get("count") or 0)
         if count < 1:
             return None
@@ -2169,18 +2813,27 @@ def _ack_dispatches(
     messages_dir: Path,
     items: list[dict],
     dispatch_ids: set[str],
+    fleet_dir: Path | None = None,
 ) -> tuple[int, int]:
     advances: dict[str, int] = {}
+    advanced_dispatches: set[str] = set()
     item_count = 0
     for item in items:
         dispatch_id = str(item.get("dispatch_id") or "")
         if dispatch_id not in dispatch_ids or not isinstance(item.get("seq"), int):
             continue
-        advances[dispatch_id] = max(advances.get(dispatch_id, 0), int(item["seq"]))
+        for cursor_key in inbox_cursor_keys(item):
+            advances[cursor_key] = max(advances.get(cursor_key, 0), int(item["seq"]))
+        advanced_dispatches.add(dispatch_id)
         item_count += 1
     if advances:
-        advance_read_cursor(ack_cursor_path(messages_dir), advances)
-    return len(advances), item_count
+        advance_read_cursor(
+            ack_cursor_path(messages_dir),
+            advances,
+            messages_dir=messages_dir,
+            fleet_dir=fleet_dir,
+        )
+    return len(advanced_dispatches), item_count
 
 
 def cmd_ack(args: argparse.Namespace) -> int:
@@ -2208,6 +2861,7 @@ def cmd_ack(args: argparse.Namespace) -> int:
         messages_dir=args.messages_dir,
         fleet_dir=args.fleet_dir,
         unread_only=False,
+        include_cursor_keys=True,
     )
     items = list(summary.get("needs") or [])
     targets = (
@@ -2223,6 +2877,7 @@ def cmd_ack(args: argparse.Namespace) -> int:
             messages_dir=args.messages_dir,
             items=items,
             dispatch_ids=targets,
+            fleet_dir=args.fleet_dir,
         )
     except (OSError, ValueError, TypeError) as exc:
         print(f"WARNING: ack cursor not advanced: {type(exc).__name__}: {exc}", file=sys.stderr)
@@ -2404,26 +3059,26 @@ def unresolved_controller_envelopes(
 ) -> list[dict]:
     """Unread named mail whose recipient has no active durable registration."""
     registered_addresses = _registered_controller_addresses()
-    cursor = load_read_cursor(read_cursor_path(messages_dir))
+    cursor = load_read_cursor(
+        read_cursor_path(messages_dir),
+        messages_dir=messages_dir,
+        fleet_dir=fleet_dir,
+    )
     unresolved: list[dict] = []
-    for path in collect_inbox_paths(messages_dir, fleet_dir):
-        try:
-            envelopes = read_envelopes(path)
-        except MessageError:
+    paths = collect_inbox_paths(messages_dir, fleet_dir)
+    for envelope in logical_envelopes_for_paths(
+        paths,
+        messages_dir=messages_dir,
+        tolerate_errors=True,
+    ):
+        label = controller_addressee_label(envelope)
+        project_root = controller_addressee_project_root(envelope)
+        if not label or not project_root or (project_root, label) in registered_addresses:
             continue
-        for envelope in envelopes:
-            label = controller_addressee_label(envelope)
-            project_root = controller_addressee_project_root(envelope)
-            if not label or not project_root or (project_root, label) in registered_addresses:
-                continue
-            key = controller_cursor_key(
-                label,
-                str(envelope.get("dispatch_id") or path.stem),
-                project_root,
-            )
-            if int(envelope.get("seq", 0)) > int(cursor.get(key, 0)):
-                unresolved.append(envelope)
-    unresolved.sort(key=lambda envelope: str(envelope.get("ts") or ""), reverse=True)
+        keys = resolved_envelope_cursor_keys(envelope)
+        if cursor_has_unread_event(cursor, keys, int(envelope.get("seq", 0))):
+            unresolved.append(_without_inbox_metadata(envelope))
+    unresolved.reverse()
     return unresolved
 
 
@@ -2457,50 +3112,56 @@ def backlog_digest(
     controller_project_root: str | None = None,
 ) -> tuple[dict, dict[str, int]]:
     """Summarize the current unread snapshot without copying or deleting bodies."""
-    cursor = load_read_cursor(read_cursor_path(messages_dir))
+    cursor = load_read_cursor(
+        read_cursor_path(messages_dir),
+        messages_dir=messages_dir,
+        fleet_dir=fleet_dir,
+    )
     items: list[dict] = []
     advances: dict[str, int] = {}
     counts_by_type: dict[str, int] = {}
     counts_by_addressee: dict[str, int] = {}
-    for path in collect_inbox_paths(messages_dir, fleet_dir):
-        try:
-            envelopes = read_envelopes(path)
-        except MessageError:
-            continue
-        for envelope in envelopes:
-            if (
-                controller_label is not None
-                and (
-                    controller_addressee_label(envelope) != controller_label
-                    or controller_addressee_project_root(envelope)
-                    != controller_project_root
-                )
-            ):
-                continue
-            key = envelope_cursor_key(envelope)
-            seq = int(envelope.get("seq", 0))
-            if seq <= int(cursor.get(key, 0)):
-                continue
-            msg_type = str(envelope.get("type") or "unknown")
-            label = controller_addressee_label(envelope) or "legacy-unaddressed"
-            counts_by_type[msg_type] = counts_by_type.get(msg_type, 0) + 1
-            counts_by_addressee[label] = counts_by_addressee.get(label, 0) + 1
-            advances[key] = max(int(advances.get(key, 0)), seq)
-            items.append(
-                {
-                    "dispatch_id": str(envelope.get("dispatch_id") or path.stem),
-                    "seq": seq,
-                    "id": envelope.get("id"),
-                    "ts": envelope.get("ts"),
-                    "type": msg_type,
-                    "addressee": envelope.get("addressee"),
-                    "from": envelope_from(envelope),
-                    "headline": envelope_headline(envelope),
-                    "body_chars": len(str((envelope.get("payload") or {}).get("text") or "")),
-                    "source_inbox": str(path),
-                }
+    paths = collect_inbox_paths(messages_dir, fleet_dir)
+    for envelope in logical_envelopes_for_paths(
+        paths,
+        messages_dir=messages_dir,
+        tolerate_errors=True,
+    ):
+        if (
+            controller_label is not None
+            and (
+                controller_addressee_label(envelope) != controller_label
+                or controller_addressee_project_root(envelope)
+                != controller_project_root
             )
-    items.sort(key=lambda item: (str(item.get("ts") or ""), str(item.get("dispatch_id"))), reverse=True)
+        ):
+            continue
+        keys = resolved_envelope_cursor_keys(envelope)
+        seq = int(envelope.get("seq", 0))
+        if not cursor_has_unread_event(cursor, keys, seq):
+            continue
+        msg_type = str(envelope.get("type") or "unknown")
+        label = controller_addressee_label(envelope) or "legacy-unaddressed"
+        counts_by_type[msg_type] = counts_by_type.get(msg_type, 0) + 1
+        counts_by_addressee[label] = counts_by_addressee.get(label, 0) + 1
+        for key in keys:
+            advances[key] = max(int(advances.get(key, 0)), seq)
+        source_paths = envelope.get(_INBOX_SOURCE_PATHS_FIELD) or []
+        items.append(
+            {
+                "dispatch_id": str(envelope.get("dispatch_id") or ""),
+                "seq": seq,
+                "id": envelope.get("id"),
+                "ts": envelope.get("ts"),
+                "type": msg_type,
+                "addressee": envelope.get("addressee"),
+                "from": envelope_from(envelope),
+                "headline": envelope_headline(envelope),
+                "body_chars": len(str((envelope.get("payload") or {}).get("text") or "")),
+                "source_inbox": str(source_paths[0]) if source_paths else "",
+            }
+        )
+    items.reverse()
     return (
         {
             "schema": "goalflight.mail.backlog-digest.v1",
@@ -2633,7 +3294,12 @@ def cmd_triage_backlog(args: argparse.Namespace) -> int:
     tmp = path.with_name(f".{path.name}.tmp")
     tmp.write_text(json.dumps(digest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     os.replace(tmp, path)
-    advance_read_cursor(read_cursor_path(args.messages_dir), advances)
+    advance_read_cursor(
+        read_cursor_path(args.messages_dir),
+        advances,
+        messages_dir=args.messages_dir,
+        fleet_dir=args.fleet_dir,
+    )
     print(
         json.dumps(
             {
@@ -2702,15 +3368,16 @@ def cmd_relay(args: argparse.Namespace) -> int:
                     controller_project_root=controller_project_root,
                 ) is not None
 
-            def cursor_key(envelope: dict) -> str:
+            def cursor_key(envelope: dict, inbox_key: str) -> str:
                 label = controller_addressee_label(envelope)
                 if label and label == controller_label:
                     return controller_cursor_key(
                         label,
                         str(envelope.get("dispatch_id") or ""),
                         controller_addressee_project_root(envelope),
+                        inbox_key=inbox_key,
                     )
-                return str(envelope.get("dispatch_id") or "")
+                return inbox_key
 
         paths = collect_inbox_paths(
             args.messages_dir,
@@ -2718,9 +3385,14 @@ def cmd_relay(args: argparse.Namespace) -> int:
             dispatch_ids=None if controller_label else scoped_dispatch_ids,
         )
         cursor_path = read_cursor_path(args.messages_dir)
-        cursor = load_read_cursor(cursor_path)
+        cursor = load_read_cursor(
+            cursor_path,
+            messages_dir=args.messages_dir,
+            fleet_dir=args.fleet_dir,
+        )
         envelopes, counts, ack_advances = unseen_envelopes_for_paths(
             paths,
+            messages_dir=args.messages_dir,
             cursor=cursor,
             tolerate_errors=True,
             envelope_filter=envelope_filter,
@@ -2743,10 +3415,20 @@ def cmd_relay(args: argparse.Namespace) -> int:
                 print("bodies: re-run with --bodies, or read one inbox with `read`")
         if args.ack:
             try:
-                advance_read_cursor(cursor_path, ack_advances)
-                cursor = load_read_cursor(cursor_path)
+                advance_read_cursor(
+                    cursor_path,
+                    ack_advances,
+                    messages_dir=args.messages_dir,
+                    fleet_dir=args.fleet_dir,
+                )
+                cursor = load_read_cursor(
+                    cursor_path,
+                    messages_dir=args.messages_dir,
+                    fleet_dir=args.fleet_dir,
+                )
                 _, counts, _ = unseen_envelopes_for_paths(
                     paths,
+                    messages_dir=args.messages_dir,
                     cursor=cursor,
                     tolerate_errors=True,
                     envelope_filter=envelope_filter,
@@ -2802,6 +3484,7 @@ def write_steering_envelope(
     messages_dir: Path | None = None,
 ) -> dict:
     path = steering_register_path(fleet_dir)
+    resolved_messages_dir = messages_dir or default_messages_dir()
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     with mail_lock(path):
         envelope = {
@@ -2821,8 +3504,12 @@ def write_steering_envelope(
                 "after_hash": after_hash,
             },
         }
+        envelope[_INGESTION_ORDER_FIELD] = _ingestion_order_for_envelope(
+            resolved_messages_dir,
+            envelope,
+        )
         append_envelope(path, envelope)
-    refresh_aggregate(fleet_dir, messages_dir=messages_dir or default_messages_dir())
+    refresh_aggregate(fleet_dir, messages_dir=resolved_messages_dir)
     return envelope
 
 
@@ -2838,6 +3525,7 @@ def merge_remote_register(
     remote = read_envelopes(remote_jsonl)
     dest = fleet_dir / "register" / "dispatches" / remote_jsonl.name
     dest.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    resolved_messages_dir = messages_dir or default_messages_dir()
     appended = 0
     with mail_lock(dest):
         existing = read_envelopes(dest) if dest.exists() else []
@@ -2846,10 +3534,15 @@ def merge_remote_register(
             seq = int(env.get("seq", 0))
             if seq in seen_seq:
                 continue
-            append_envelope(dest, env)
+            ingested = dict(env)
+            ingested[_INGESTION_ORDER_FIELD] = _ingestion_order_for_envelope(
+                resolved_messages_dir,
+                ingested,
+            )
+            append_envelope(dest, ingested)
             seen_seq.add(seq)
             appended += 1
-    aggregate = refresh_aggregate(fleet_dir, messages_dir=messages_dir or default_messages_dir())
+    aggregate = refresh_aggregate(fleet_dir, messages_dir=resolved_messages_dir)
     return {"merged_into": str(dest), "appended": appended, "open_user_needs": len(aggregate.get("open_user_needs") or [])}
 
 

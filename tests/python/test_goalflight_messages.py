@@ -163,6 +163,34 @@ def init_git_project(path: Path) -> None:
     subprocess.run(["git", "init", "-q"], cwd=path, check=True)
 
 
+def mirror_remote_message(
+    *,
+    remote_messages_dir: Path,
+    fleet_dir: Path,
+    messages_dir: Path,
+    dispatch_id: str,
+    msg_type: str,
+    payload: dict,
+    seq: int | None = None,
+) -> Path:
+    import goalflight_messages as messages
+
+    posted = messages.post_message(
+        dispatch_id=dispatch_id,
+        msg_type=msg_type,
+        payload=payload,
+        messages_dir=remote_messages_dir,
+        source={"node": "remote", "adapter": "codex", "transport": "acp"},
+        seq=seq,
+    )
+    messages.merge_remote_register(
+        fleet_dir,
+        Path(posted["path"]),
+        messages_dir=messages_dir,
+    )
+    return fleet_dir / "register" / "dispatches" / f"{dispatch_id}.jsonl"
+
+
 def test_marker_mapping() -> None:
     sample = "**STATUS:** working\nUSER-NEED: need maintainer\nCOMPLETE: goal done\n"
     markers = extract_markers(sample)
@@ -249,6 +277,1040 @@ def test_aggregate_open_user_need() -> None:
         written = refresh_aggregate(fleet_dir, messages_dir=messages_dir)
         assert_true("written aggregate", (fleet_dir / "register" / "aggregate.json").exists())
         assert_true("same open need", len(written["open_user_needs"]) == 1)
+
+
+def test_dual_source_inboxes_aggregate_without_fleet_overwrite() -> None:
+    import tempfile
+    import goalflight_messages as messages
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        messages_dir = base / "messages"
+        remote_messages_dir = base / "remote-messages"
+        fleet_dir = base / "fleet"
+        dispatch_id = "d-dual-local-need"
+        local_path = Path(
+            messages.post_message(
+                dispatch_id=dispatch_id,
+                msg_type="user_need",
+                payload={"text": "choose the account"},
+                messages_dir=messages_dir,
+            )["path"]
+        )
+        fleet_path = mirror_remote_message(
+            remote_messages_dir=remote_messages_dir,
+            fleet_dir=fleet_dir,
+            messages_dir=messages_dir,
+            dispatch_id=dispatch_id,
+            msg_type="status",
+            payload={"text": "remote worker is waiting"},
+        )
+
+        paths = messages.collect_inbox_paths(messages_dir, fleet_dir)
+        assert_true("local then fleet streams retained", paths == [local_path, fleet_path])
+        assert_true(
+            "both independent sequence maxima retained",
+            messages.max_seq_by_inbox(messages_dir=messages_dir, fleet_dir=fleet_dir)
+            == {
+                messages.inbox_stream_key(local_path, messages_dir=messages_dir): 1,
+                messages.inbox_stream_key(fleet_path, messages_dir=messages_dir): 1,
+            },
+        )
+        aggregate = messages.build_aggregate(messages_dir=messages_dir, fleet_dir=fleet_dir)
+        assert_true("local user need survives fleet merge", len(aggregate["open_user_needs"]) == 1)
+        assert_true(
+            "private cursor identity stays out of aggregate contract",
+            "_goalflight_inbox_cursor_key" not in aggregate["open_user_needs"][0],
+        )
+        assert_true(
+            "local user need text survives fleet merge",
+            aggregate["open_user_needs"][0]["text"] == "choose the account",
+        )
+
+
+def test_single_source_inboxes_and_deterministic_order_reject_local_overwrite() -> None:
+    import tempfile
+    import goalflight_messages as messages
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        messages_dir = base / "messages"
+        remote_messages_dir = base / "remote-messages"
+        fleet_dir = base / "fleet"
+        fleet_only_id = "a-fleet-only"
+        dual_id = "m-dual-fleet-need"
+        local_only_id = "z-local-only"
+
+        local_only_path = Path(
+            messages.post_message(
+                dispatch_id=local_only_id,
+                msg_type="user_need",
+                payload={"text": "local only"},
+                messages_dir=messages_dir,
+            )["path"]
+        )
+        fleet_only_path = mirror_remote_message(
+            remote_messages_dir=remote_messages_dir,
+            fleet_dir=fleet_dir,
+            messages_dir=messages_dir,
+            dispatch_id=fleet_only_id,
+            msg_type="user_need",
+            payload={"text": "fleet only"},
+        )
+        dual_local_path = Path(
+            messages.post_message(
+                dispatch_id=dual_id,
+                msg_type="status",
+                payload={"text": "local controller status"},
+                messages_dir=messages_dir,
+            )["path"]
+        )
+        dual_fleet_path = mirror_remote_message(
+            remote_messages_dir=remote_messages_dir,
+            fleet_dir=fleet_dir,
+            messages_dir=messages_dir,
+            dispatch_id=dual_id,
+            msg_type="user_need",
+            payload={"text": "fleet escalation"},
+        )
+
+        expected = [fleet_only_path, dual_local_path, dual_fleet_path, local_only_path]
+        first = messages.collect_inbox_paths(messages_dir, fleet_dir)
+        second = messages.collect_inbox_paths(messages_dir, fleet_dir)
+        assert_true("local-only and fleet-only streams retained", first == expected)
+        assert_true("collection order stable across runs", second == first)
+        aggregate = messages.build_aggregate(messages_dir=messages_dir, fleet_dir=fleet_dir)
+        needs = {
+            (item["dispatch_id"], item["text"])
+            for item in aggregate["open_user_needs"]
+        }
+        assert_true(
+            "single-source directions and dual fleet need all surface",
+            needs
+            == {
+                (local_only_id, "local only"),
+                (fleet_only_id, "fleet only"),
+                (dual_id, "fleet escalation"),
+            },
+        )
+
+
+def test_dual_source_sequences_keep_independent_cursor_and_wake_identity() -> None:
+    import tempfile
+    import goalflight_messages as messages
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project = base / "project"
+        messages_dir = base / "messages"
+        remote_messages_dir = base / "remote-messages"
+        fleet_dir = base / "fleet"
+        dispatch_id = "d-independent-seq"
+        init_git_project(project)
+
+        fleet_path = mirror_remote_message(
+            remote_messages_dir=remote_messages_dir,
+            fleet_dir=fleet_dir,
+            messages_dir=messages_dir,
+            dispatch_id=dispatch_id,
+            msg_type="status",
+            payload={"text": "remote seven"},
+            seq=7,
+        )
+        fleet_key = messages.inbox_stream_key(fleet_path, messages_dir=messages_dir)
+        first_max = messages.max_seq_by_inbox(
+            messages_dir=messages_dir,
+            fleet_dir=fleet_dir,
+            dispatch_ids={dispatch_id},
+        )
+        assert_true("fleet-only maximum has its own cursor", first_max == {fleet_key: 7})
+        cursor_path = messages.read_cursor_path(messages_dir)
+        messages.advance_read_cursor(cursor_path, first_max)
+
+        local_path = Path(messages.post_message(
+            dispatch_id=dispatch_id,
+            msg_type="status",
+            payload={"text": "local three"},
+            messages_dir=messages_dir,
+            seq=3,
+        )["path"])
+        local_key = messages.inbox_stream_key(local_path, messages_dir=messages_dir)
+        both_max = messages.max_seq_by_inbox(
+            messages_dir=messages_dir,
+            fleet_dir=fleet_dir,
+            dispatch_ids={dispatch_id},
+        )
+        assert_true(
+            "second stream adds rather than replaces a maximum",
+            both_max == {local_key: 3, fleet_key: 7},
+        )
+        messages.advance_read_cursor(cursor_path, both_max)
+        assert_true(
+            "second stream does not rewind existing cursor",
+            messages.load_read_cursor(cursor_path) == both_max,
+        )
+
+        messages.post_message(
+            dispatch_id=dispatch_id,
+            msg_type="blocked",
+            payload={"text": "local four"},
+            messages_dir=messages_dir,
+        )
+        mirror_remote_message(
+            remote_messages_dir=remote_messages_dir,
+            fleet_dir=fleet_dir,
+            messages_dir=messages_dir,
+            dispatch_id=dispatch_id,
+            msg_type="blocked",
+            payload={"text": "remote eight"},
+        )
+        shown, counts, advances = messages.unseen_envelopes_for_paths(
+            messages.collect_inbox_paths(messages_dir, fleet_dir, dispatch_ids={dispatch_id}),
+            messages_dir=messages_dir,
+            cursor=messages.load_read_cursor(cursor_path),
+        )
+        assert_true("one unread message from each stream", [item["seq"] for item in shown] == [4, 8])
+        assert_true("unread count aggregates both streams", counts == {dispatch_id: 2})
+        assert_true(
+            "unread advances remain stream-specific",
+            advances == {local_key: 4, fleet_key: 8},
+        )
+        summary = messages.controller_mail_summary(
+            owned_dispatch_ids={dispatch_id},
+            task_store_project_root=project,
+            messages_dir=messages_dir,
+            fleet_dir=fleet_dir,
+        )
+        assert_true("controller unread summary sees both streams", summary["count"] == 2)
+        messages.advance_read_cursor(cursor_path, advances)
+        assert_true(
+            "stream-specific cursor clears both unread messages",
+            messages.controller_mail_summary(
+                owned_dispatch_ids={dispatch_id},
+                task_store_project_root=project,
+                messages_dir=messages_dir,
+                fleet_dir=fleet_dir,
+            )
+            == {},
+        )
+
+        wake_id = "d-wake-collision"
+        wake_local_path = Path(messages.post_message(
+            dispatch_id=wake_id,
+            msg_type="blocked",
+            payload={"text": "local blocked"},
+            messages_dir=messages_dir,
+        )["path"])
+        wake_fleet_path = mirror_remote_message(
+            remote_messages_dir=remote_messages_dir,
+            fleet_dir=fleet_dir,
+            messages_dir=messages_dir,
+            dispatch_id=wake_id,
+            msg_type="blocked",
+            payload={"text": "remote blocked"},
+        )
+        wakes = messages.controller_wake_watermark(
+            project_root=project,
+            owned_dispatch_ids={wake_id},
+            messages_dir=messages_dir,
+            fleet_dir=fleet_dir,
+        )
+        assert_true(
+            "equal seq values in different streams have distinct wake identities",
+            set(wakes)
+            == {
+                (messages.inbox_stream_key(wake_local_path, messages_dir=messages_dir), 1),
+                (messages.inbox_stream_key(wake_fleet_path, messages_dir=messages_dir), 1),
+            },
+        )
+
+
+def test_unseen_last_n_ack_only_advances_shown_event_and_keeps_empty_zero() -> None:
+    import tempfile
+    import goalflight_messages as messages
+
+    with tempfile.TemporaryDirectory() as td:
+        messages_dir = Path(td) / "messages"
+        paths = [
+            Path(messages.post_message(
+                dispatch_id=dispatch_id,
+                msg_type="status",
+                payload={"text": dispatch_id},
+                messages_dir=messages_dir,
+            )["path"])
+            for dispatch_id in ("a-first", "b-shown")
+        ]
+        empty_path = messages.inbox_path(messages_dir, "c-empty")
+        empty_path.touch()
+        shown, counts, advances = messages.unseen_envelopes_for_paths(
+            [*paths, empty_path],
+            messages_dir=messages_dir,
+            cursor={},
+            last_n=1,
+        )
+        shown_key = messages.inbox_stream_key(paths[1], messages_dir=messages_dir)
+        assert_true("last-n returns only the displayed event", [item["dispatch_id"] for item in shown] == ["b-shown"])
+        assert_true("ack advances only the displayed event", advances == {shown_key: 1})
+        assert_true("counts describe all unread and retain empty zero", counts == {"a-first": 1, "b-shown": 1, "c-empty": 0})
+
+
+def test_mark_read_through_clamps_each_stream_and_preserves_later_fleet_mail() -> None:
+    import tempfile
+    import goalflight_messages as messages
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project = base / "project"
+        messages_dir = base / "messages"
+        remote_messages_dir = base / "remote-messages"
+        fleet_dir = base / "fleet"
+        dispatch_id = "d-cursor-skip"
+        init_git_project(project)
+
+        local_path = Path(messages.post_message(
+            dispatch_id=dispatch_id,
+            msg_type="status",
+            payload={"text": "local nine"},
+            messages_dir=messages_dir,
+            seq=9,
+        )["path"])
+        remote_path = Path(messages.post_message(
+            dispatch_id=dispatch_id,
+            msg_type="status",
+            payload={"text": "fleet one"},
+            messages_dir=remote_messages_dir,
+            seq=1,
+        )["path"])
+        merged = messages.merge_remote_register(
+            fleet_dir,
+            remote_path,
+            messages_dir=messages_dir,
+        )
+        fleet_path = Path(merged["merged_into"])
+        assert_true("measured local input path", local_path == messages.inbox_path(messages_dir, dispatch_id))
+        assert_true("measured remote input path", remote_path == messages.inbox_path(remote_messages_dir, dispatch_id))
+        assert_true("measured fleet input path", fleet_path.exists())
+
+        local_key = messages.inbox_stream_key(local_path, messages_dir=messages_dir)
+        fleet_key = messages.inbox_stream_key(fleet_path, messages_dir=messages_dir)
+        marked = run_messages_cli(
+            messages_dir,
+            fleet_dir,
+            ["mark-read", "--dispatch-id", dispatch_id, "--through", "9"],
+        )
+        assert_true("mark-read succeeds", marked.returncode == 0)
+        cursor = messages.load_read_cursor(messages.read_cursor_path(messages_dir))
+        assert_true("each stream clamps to its measured maximum", cursor == {local_key: 9, fleet_key: 1})
+
+        messages.post_message(
+            dispatch_id=dispatch_id,
+            msg_type="blocked",
+            payload={"text": "fleet two must surface"},
+            messages_dir=remote_messages_dir,
+        )
+        messages.merge_remote_register(fleet_dir, remote_path, messages_dir=messages_dir)
+        shown, counts, advances = messages.unseen_envelopes_for_paths(
+            messages.collect_inbox_paths(messages_dir, fleet_dir, dispatch_ids={dispatch_id}),
+            messages_dir=messages_dir,
+            cursor=messages.load_read_cursor(messages.read_cursor_path(messages_dir)),
+        )
+        assert_true("later lagging-stream blocker remains unread", [(item["seq"], item["payload"]["text"]) for item in shown] == [(2, "fleet two must surface")])
+        assert_true("later blocker unread count", counts == {dispatch_id: 1})
+        assert_true("later blocker advances only fleet stream", advances == {fleet_key: 2})
+        summary = messages.controller_mail_summary(
+            owned_dispatch_ids={dispatch_id},
+            task_store_project_root=project,
+            messages_dir=messages_dir,
+            fleet_dir=fleet_dir,
+        )
+        assert_true("later blocker reaches controller summary", summary["count"] == 1)
+
+
+def test_structural_stream_keys_prevent_dispatch_prefix_collision() -> None:
+    import tempfile
+    import goalflight_messages as messages
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project = base / "project"
+        messages_dir = base / "messages"
+        remote_messages_dir = base / "remote-messages"
+        fleet_dir = base / "fleet"
+        init_git_project(project)
+
+        local_dispatch_id = "fleet:x"
+        fleet_dispatch_id = "x"
+        local_path = Path(messages.post_message(
+            dispatch_id=local_dispatch_id,
+            msg_type="blocked",
+            payload={"text": "local prefix-shaped id"},
+            messages_dir=messages_dir,
+        )["path"])
+        fleet_path = mirror_remote_message(
+            remote_messages_dir=remote_messages_dir,
+            fleet_dir=fleet_dir,
+            messages_dir=messages_dir,
+            dispatch_id=fleet_dispatch_id,
+            msg_type="blocked",
+            payload={"text": "real fleet stream"},
+        )
+        assert_true("prefix collision local input path", local_path.name == "fleet:x.jsonl")
+        assert_true("prefix collision fleet input path", fleet_path.name == "x.jsonl")
+        local_key = messages.inbox_stream_key(local_path, messages_dir=messages_dir)
+        fleet_key = messages.inbox_stream_key(fleet_path, messages_dir=messages_dir)
+        assert_true("source and stem form distinct structural identities", local_key != fleet_key)
+
+        wakes = messages.controller_wake_watermark(
+            project_root=project,
+            owned_dispatch_ids={local_dispatch_id, fleet_dispatch_id},
+            messages_dir=messages_dir,
+            fleet_dir=fleet_dir,
+        )
+        assert_true("both collision-shaped events wake", set(wakes) == {(local_key, 1), (fleet_key, 1)})
+
+
+def test_merged_envelope_dedupes_event_but_acknowledges_both_streams() -> None:
+    import tempfile
+    import goalflight_messages as messages
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project = base / "project"
+        messages_dir = base / "messages"
+        fleet_dir = base / "fleet"
+        dispatch_id = "d-merged-envelope"
+        init_git_project(project)
+
+        local_path = Path(messages.post_message(
+            dispatch_id=dispatch_id,
+            msg_type="blocked",
+            payload={"text": "one logical blocker"},
+            messages_dir=messages_dir,
+        )["path"])
+        merged = messages.merge_remote_register(
+            fleet_dir,
+            local_path,
+            messages_dir=messages_dir,
+        )
+        fleet_path = Path(merged["merged_into"])
+        assert_true("dedupe local input path", local_path == messages.inbox_path(messages_dir, dispatch_id))
+        assert_true("dedupe fleet input path", fleet_path.exists())
+        local_key = messages.inbox_stream_key(local_path, messages_dir=messages_dir)
+        fleet_key = messages.inbox_stream_key(fleet_path, messages_dir=messages_dir)
+
+        aggregate = messages.build_aggregate(
+            messages_dir=messages_dir,
+            fleet_dir=fleet_dir,
+            include_cursor_keys=True,
+        )
+        assert_true("aggregate counts copied envelope once", len(aggregate["open_user_needs"]) == 1)
+        shown, counts, advances = messages.unseen_envelopes_for_paths(
+            messages.collect_inbox_paths(messages_dir, fleet_dir, dispatch_ids={dispatch_id}),
+            messages_dir=messages_dir,
+            cursor={},
+        )
+        assert_true("unread view counts copied envelope once", len(shown) == 1 and counts == {dispatch_id: 1})
+        assert_true("one logical read advances both physical cursors", advances == {local_key: 1, fleet_key: 1})
+        wakes = messages.controller_wake_watermark(
+            project_root=project,
+            owned_dispatch_ids={dispatch_id},
+            messages_dir=messages_dir,
+            fleet_dir=fleet_dir,
+        )
+        assert_true("wake watermark counts copied envelope once", len(wakes) == 1)
+
+        messages.advance_read_cursor(messages.read_cursor_path(messages_dir), advances)
+        cursor = messages.load_read_cursor(messages.read_cursor_path(messages_dir))
+        assert_true("read acknowledgement persists both cursor domains", cursor == advances)
+        assert_true(
+            "acknowledged logical event leaves no unread summary",
+            messages.controller_mail_summary(
+                owned_dispatch_ids={dispatch_id},
+                task_store_project_root=project,
+                messages_dir=messages_dir,
+                fleet_dir=fleet_dir,
+            ) == {},
+        )
+        dispatch_count, item_count = messages._ack_dispatches(
+            messages_dir=messages_dir,
+            items=aggregate["open_user_needs"],
+            dispatch_ids={dispatch_id},
+        )
+        assert_true("logical acknowledgement reports one event", (dispatch_count, item_count) == (1, 1))
+        assert_true(
+            "logical acknowledgement persists both source cursors",
+            messages.load_read_cursor(messages.ack_cursor_path(messages_dir)) == advances,
+        )
+
+
+def test_legacy_cursor_keys_migrate_atomically_and_idempotently() -> None:
+    import tempfile
+    from unittest.mock import patch
+    import goalflight_messages as messages
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project = base / "project"
+        messages_dir = base / "messages"
+        remote_messages_dir = base / "remote-messages"
+        fleet_dir = base / "fleet"
+        init_git_project(project)
+
+        local_id = "d-legacy-local"
+        fleet_id = "d-legacy-fleet"
+        addressed_id = "d-legacy-addressed"
+        local_path = Path(messages.post_message(
+            dispatch_id=local_id,
+            msg_type="user_need",
+            payload={"text": "already read locally"},
+            messages_dir=messages_dir,
+        )["path"])
+        fleet_path = mirror_remote_message(
+            remote_messages_dir=remote_messages_dir,
+            fleet_dir=fleet_dir,
+            messages_dir=messages_dir,
+            dispatch_id=fleet_id,
+            msg_type="user_need",
+            payload={"text": "already read remotely"},
+        )
+        addressed_path = Path(messages.post_message(
+            dispatch_id=addressed_id,
+            msg_type="status",
+            payload={"text": "controller carrier exists"},
+            messages_dir=messages_dir,
+        )["path"])
+        project_root = messages.controller_address_project_root(project)
+        old_controller_key = messages.controller_cursor_key(
+            "controller-a",
+            addressed_id,
+            project_root,
+        )
+        cursor_path = messages.read_cursor_path(messages_dir)
+        cursor_path.write_text(json.dumps({
+            local_id: 1,
+            f"fleet:{fleet_id}": 1,
+            old_controller_key: 3,
+        }) + "\n", encoding="utf-8")
+
+        with patch.object(messages.os, "replace", wraps=messages.os.replace) as replace:
+            summary = messages.controller_mail_summary(
+                owned_dispatch_ids={local_id, fleet_id, addressed_id},
+                task_store_project_root=project,
+                messages_dir=messages_dir,
+                fleet_dir=fleet_dir,
+            )
+        assert_true("legacy acknowledgements do not reopen", summary == {})
+        assert_true(
+            "migration replaces cursor file atomically",
+            any(Path(call.args[1]) == cursor_path for call in replace.call_args_list),
+        )
+        local_key = messages.inbox_stream_key(local_path, messages_dir=messages_dir)
+        fleet_key = messages.inbox_stream_key(fleet_path, messages_dir=messages_dir)
+        addressed_key = messages.controller_cursor_key(
+            "controller-a",
+            addressed_id,
+            project_root,
+            inbox_key=messages.inbox_stream_key(addressed_path, messages_dir=messages_dir),
+        )
+        document = json.loads(cursor_path.read_text(encoding="utf-8"))
+        migrated = document["cursor"]
+        assert_true(
+            "exactly three legacy key forms migrate",
+            migrated == {
+                local_key: 1,
+                fleet_key: 1,
+                addressed_key: 3,
+            },
+        )
+        assert_true("cursor migration writes explicit schema", document["schema"] == messages.MESSAGE_CURSOR_SCHEMA and document["schema_version"] == 1)
+        assert_true("fully resolved migration reports no unresolved entries", document["migration"]["unresolved"] == {})
+        first_bytes = cursor_path.read_bytes()
+        with patch.object(messages, "write_read_cursor", wraps=messages.write_read_cursor) as write:
+            second = messages.load_read_cursor(
+                cursor_path,
+                messages_dir=messages_dir,
+                fleet_dir=fleet_dir,
+            )
+        assert_true("second migration returns identical state", second == migrated)
+        assert_true("second migration leaves bytes unchanged", cursor_path.read_bytes() == first_bytes)
+        assert_true("second migration performs no rewrite", write.call_count == 0)
+
+
+def test_legacy_cursor_ambiguous_and_absent_entries_stay_unresolved() -> None:
+    import tempfile
+    import goalflight_messages as messages
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project = base / "project"
+        messages_dir = base / "messages"
+        remote_messages_dir = base / "remote-messages"
+        fleet_dir = base / "fleet"
+        ambiguous_id = "d-legacy-ambiguous"
+        absent_id = "d-legacy-reaped"
+        init_git_project(project)
+
+        local_path = Path(messages.post_message(
+            dispatch_id=ambiguous_id,
+            msg_type="blocked",
+            payload={"text": "unread local blocker"},
+            messages_dir=messages_dir,
+            seq=1,
+        )["path"])
+        remote_path = Path(messages.post_message(
+            dispatch_id=ambiguous_id,
+            msg_type="user_need",
+            payload={"text": "previously read fleet need"},
+            messages_dir=remote_messages_dir,
+            source={"node": "remote", "adapter": "codex", "transport": "acp"},
+            seq=1,
+        )["path"])
+        merged = messages.merge_remote_register(
+            fleet_dir,
+            remote_path,
+            messages_dir=messages_dir,
+        )
+        fleet_path = Path(merged["merged_into"])
+        assert_true("ambiguous local input path measured", local_path == messages.inbox_path(messages_dir, ambiguous_id))
+        assert_true("ambiguous remote input path measured", remote_path == messages.inbox_path(remote_messages_dir, ambiguous_id))
+        assert_true("ambiguous fleet input path measured", fleet_path.exists())
+
+        cursor_path = messages.read_cursor_path(messages_dir)
+        cursor_path.write_text(
+            json.dumps({ambiguous_id: 1, absent_id: 7}) + "\n",
+            encoding="utf-8",
+        )
+        summary = messages.controller_mail_summary(
+            owned_dispatch_ids={ambiguous_id},
+            task_store_project_root=project,
+            messages_dir=messages_dir,
+            fleet_dir=fleet_dir,
+        )
+        assert_true(
+            "ambiguous legacy cursor acknowledges neither stream",
+            messages.load_read_cursor(
+                cursor_path,
+                messages_dir=messages_dir,
+                fleet_dir=fleet_dir,
+            ) == {},
+        )
+        assert_true(
+            "both ambiguous carrier events remain visible",
+            {item["text"] for item in summary["needs"]}
+            == {"unread local blocker", "previously read fleet need"},
+        )
+        document = json.loads(cursor_path.read_text(encoding="utf-8"))
+        unresolved = document["migration"]["unresolved"]
+        assert_true(
+            "operator summary points to compact unresolved migration report",
+            summary["cursor_migration"]
+            == {
+                "source_format": "unversioned-flat-map",
+                "migrated": 0,
+                "unresolved_count": 2,
+                "report_path": str(cursor_path),
+            },
+        )
+        assert_true("ambiguous original value preserved", unresolved[ambiguous_id]["value"] == 1)
+        assert_true("ambiguous provenance reported", unresolved[ambiguous_id]["reason"] == "ambiguous-carrier-provenance")
+        assert_true("absent original value preserved", unresolved[absent_id]["value"] == 7)
+        assert_true("absent carrier reported", unresolved[absent_id]["reason"] == "carrier-absent")
+        migrated_bytes = cursor_path.read_bytes()
+
+        reaped_remote_path = Path(messages.post_message(
+            dispatch_id=absent_id,
+            msg_type="user_need",
+            payload={"text": "returned fleet carrier"},
+            messages_dir=remote_messages_dir,
+            source={"node": "remote", "adapter": "codex", "transport": "acp"},
+            seq=1,
+        )["path"])
+        reaped_merge = messages.merge_remote_register(
+            fleet_dir,
+            reaped_remote_path,
+            messages_dir=messages_dir,
+        )
+        reaped_fleet_path = Path(reaped_merge["merged_into"])
+        assert_true("reappeared remote input path measured", reaped_remote_path == messages.inbox_path(remote_messages_dir, absent_id))
+        assert_true("reappeared fleet input path measured", reaped_fleet_path == messages.steering_register_path(fleet_dir).with_name(f"{absent_id}.jsonl"))
+        assert_true(
+            "reappeared carrier does not reclassify retained key",
+            messages.load_read_cursor(
+                cursor_path,
+                messages_dir=messages_dir,
+                fleet_dir=fleet_dir,
+            ) == {},
+        )
+        assert_true("reappeared carrier leaves migration report unchanged", cursor_path.read_bytes() == migrated_bytes)
+        reaped_summary = messages.controller_mail_summary(
+            owned_dispatch_ids={absent_id},
+            task_store_project_root=project,
+            messages_dir=messages_dir,
+            fleet_dir=fleet_dir,
+        )
+        assert_true("reappeared fleet need remains visible", [item["text"] for item in reaped_summary["needs"]] == ["returned fleet carrier"])
+
+
+def test_cursor_version_controls_structural_key_parsing_and_is_idempotent() -> None:
+    import tempfile
+    import goalflight_messages as messages
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project = base / "project"
+        messages_dir = base / "messages"
+        fleet_dir = base / "fleet"
+        unusual_id = '["local","victim"]'
+        victim_id = "victim"
+        init_git_project(project)
+
+        unusual_path = Path(messages.post_message(
+            dispatch_id=unusual_id,
+            msg_type="blocked",
+            payload={"text": "acknowledged unusual dispatch"},
+            messages_dir=messages_dir,
+            seq=1,
+        )["path"])
+        victim_path = Path(messages.post_message(
+            dispatch_id=victim_id,
+            msg_type="blocked",
+            payload={"text": "unread victim"},
+            messages_dir=messages_dir,
+            seq=1,
+        )["path"])
+        unusual_key = messages.inbox_stream_key(unusual_path, messages_dir=messages_dir)
+        victim_key = messages.inbox_stream_key(victim_path, messages_dir=messages_dir)
+        assert_true("structural-looking raw input path measured", unusual_path == messages.inbox_path(messages_dir, unusual_id))
+        assert_true("victim input path measured", victim_path == messages.inbox_path(messages_dir, victim_id))
+
+        legacy_path = messages.read_cursor_path(messages_dir)
+        legacy_path.write_text(json.dumps({unusual_id: 1}) + "\n", encoding="utf-8")
+        first_legacy = messages.load_read_cursor(
+            legacy_path,
+            messages_dir=messages_dir,
+            fleet_dir=fleet_dir,
+        )
+        assert_true("unversioned structural-looking key remains raw text", first_legacy == {unusual_key: 1})
+        summary = messages.controller_mail_summary(
+            owned_dispatch_ids={unusual_id, victim_id},
+            task_store_project_root=project,
+            messages_dir=messages_dir,
+            fleet_dir=fleet_dir,
+        )
+        assert_true("raw key acknowledges unusual dispatch only", [item["text"] for item in summary["needs"]] == ["unread victim"])
+        legacy_bytes = legacy_path.read_bytes()
+        second_legacy = messages.load_read_cursor(
+            legacy_path,
+            messages_dir=messages_dir,
+            fleet_dir=fleet_dir,
+        )
+        assert_true("migrated legacy cursor is idempotent", second_legacy == first_legacy and legacy_path.read_bytes() == legacy_bytes)
+
+        versioned_path = messages_dir / ".versioned-cursor.json"
+        versioned_path.write_text(
+            json.dumps({
+                "schema": "goalflight.message-cursor.v1",
+                "schema_version": 1,
+                "cursor": {victim_key: 1},
+                "migration": {"unresolved": {}},
+            }, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        versioned_bytes = versioned_path.read_bytes()
+        first_versioned = messages.load_read_cursor(
+            versioned_path,
+            messages_dir=messages_dir,
+            fleet_dir=fleet_dir,
+        )
+        second_versioned = messages.load_read_cursor(
+            versioned_path,
+            messages_dir=messages_dir,
+            fleet_dir=fleet_dir,
+        )
+        assert_true("versioned cursor parses structural key", first_versioned == {victim_key: 1})
+        assert_true("versioned cursor is idempotent across two loads", second_versioned == first_versioned and versioned_path.read_bytes() == versioned_bytes)
+
+
+def test_same_id_different_envelopes_both_survive_and_later_need_reopens() -> None:
+    import tempfile
+    from unittest.mock import patch
+    import goalflight_messages as messages
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        messages_dir = base / "messages"
+        remote_messages_dir = base / "remote-messages"
+        fleet_dir = base / "fleet"
+        dispatch_id = "d-shared-envelope-id"
+
+        shared_id = messages.uuid.UUID("00000000-0000-0000-0000-000000000122")
+        with patch.object(messages.uuid, "uuid4", return_value=shared_id):
+            messages.post_message(
+                dispatch_id=dispatch_id,
+                msg_type="result",
+                payload={"complete": True, "text": "local terminal result"},
+                messages_dir=messages_dir,
+            )
+            remote = messages.post_message(
+                dispatch_id=dispatch_id,
+                msg_type="user_need",
+                payload={"text": "later remote blocker"},
+                messages_dir=remote_messages_dir,
+                source={"node": "remote", "adapter": "codex", "transport": "acp"},
+            )
+        messages.merge_remote_register(
+            fleet_dir,
+            Path(remote["path"]),
+            messages_dir=messages_dir,
+        )
+
+        logical = messages.logical_envelopes_for_paths(
+            messages.collect_inbox_paths(messages_dir, fleet_dir, dispatch_ids={dispatch_id}),
+            messages_dir=messages_dir,
+        )
+        assert_true("same UUID with different content remains two events", len(logical) == 2)
+        assert_true("both logical types survive", [env["type"] for env in logical] == ["result", "user_need"])
+        aggregate = messages.build_aggregate(messages_dir=messages_dir, fleet_dir=fleet_dir)
+        assert_true(
+            "later cross-carrier need survives earlier terminal result",
+            [item["text"] for item in aggregate["open_user_needs"]] == ["later remote blocker"],
+        )
+
+
+def test_corrupt_carrier_preserves_prefix_reports_error_and_clamps_cursor() -> None:
+    import tempfile
+    import goalflight_messages as messages
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project = base / "project"
+        messages_dir = base / "messages"
+        remote_messages_dir = base / "remote-messages"
+        fleet_dir = base / "fleet"
+        dispatch_id = "d-corrupt-fleet-prefix"
+        init_git_project(project)
+
+        local_path = Path(messages.post_message(
+            dispatch_id=dispatch_id,
+            msg_type="status",
+            payload={"text": "healthy local status"},
+            messages_dir=messages_dir,
+        )["path"])
+        remote_need = messages.post_message(
+            dispatch_id=dispatch_id,
+            msg_type="user_need",
+            payload={"text": "fleet escalation before corruption"},
+            messages_dir=remote_messages_dir,
+            source={"node": "remote", "adapter": "codex", "transport": "acp"},
+        )
+        merged = messages.merge_remote_register(
+            fleet_dir,
+            Path(remote_need["path"]),
+            messages_dir=messages_dir,
+        )
+        fleet_path = Path(merged["merged_into"])
+        remote_after = messages.post_message(
+            dispatch_id=dispatch_id,
+            msg_type="status",
+            payload={"text": "must remain beyond corrupt boundary"},
+            messages_dir=remote_messages_dir,
+            source={"node": "remote", "adapter": "codex", "transport": "acp"},
+        )["envelope"]
+        with fleet_path.open("a", encoding="utf-8") as carrier:
+            carrier.write("{corrupt json\n")
+            carrier.write(messages.serialize_envelope_line(remote_after))
+
+        summary = messages.controller_mail_summary(
+            owned_dispatch_ids={dispatch_id},
+            task_store_project_root=project,
+            messages_dir=messages_dir,
+            fleet_dir=fleet_dir,
+        )
+        assert_true("validated fleet escalation still surfaces", summary["count"] == 1)
+        assert_true("healthy stream is not muted", summary["needs"][0]["text"] == "fleet escalation before corruption")
+        assert_true("controller summary reports corrupt carrier", len(summary["carrier_errors"]) == 1)
+        assert_true("reported corrupt input path is exact", summary["carrier_errors"][0]["path"] == str(fleet_path))
+        assert_true("validated prefix boundary is reported", summary["carrier_errors"][0]["validated_through_seq"] == 1)
+
+        max_errors: list[dict[str, object]] = []
+        maxes = messages.max_seq_by_inbox(
+            messages_dir=messages_dir,
+            fleet_dir=fleet_dir,
+            dispatch_ids={dispatch_id},
+            carrier_errors=max_errors,
+        )
+        local_key = messages.inbox_stream_key(local_path, messages_dir=messages_dir)
+        fleet_key = messages.inbox_stream_key(fleet_path, messages_dir=messages_dir)
+        assert_true("both stream maxima survive corruption", maxes == {local_key: 1, fleet_key: 1})
+        assert_true("max scan reports corruption", len(max_errors) == 1)
+
+        read = run_messages_cli(
+            messages_dir,
+            fleet_dir,
+            ["read", "--dispatch-id", dispatch_id, "--unseen", "--ack"],
+        )
+        assert_true("corrupt read fails loud", read.returncode == 1)
+        assert_true("corrupt read prints warning", "WARNING: carrier corruption:" in read.stderr)
+        shown = json.loads(read.stdout.splitlines()[0])
+        assert_true("read preserves both validated prefix events", [env["type"] for env in shown] == ["status", "user_need"])
+        cursor = messages.load_read_cursor(
+            messages.read_cursor_path(messages_dir),
+            messages_dir=messages_dir,
+            fleet_dir=fleet_dir,
+        )
+        assert_true("ack cannot cross corruption boundary", cursor == {local_key: 1, fleet_key: 1})
+
+        utf_dispatch_id = "d-corrupt-fleet-utf8"
+        utf_remote = messages.post_message(
+            dispatch_id=utf_dispatch_id,
+            msg_type="user_need",
+            payload={"text": "fleet escalation before invalid UTF-8"},
+            messages_dir=remote_messages_dir,
+            source={"node": "remote", "adapter": "codex", "transport": "acp"},
+        )
+        utf_merged = messages.merge_remote_register(
+            fleet_dir,
+            Path(utf_remote["path"]),
+            messages_dir=messages_dir,
+        )
+        utf_fleet_path = Path(utf_merged["merged_into"])
+        with utf_fleet_path.open("ab") as carrier:
+            carrier.write(b"\xff invalid UTF-8\n")
+        utf_summary = messages.controller_mail_summary(
+            owned_dispatch_ids={utf_dispatch_id},
+            task_store_project_root=project,
+            messages_dir=messages_dir,
+            fleet_dir=fleet_dir,
+        )
+        assert_true("invalid UTF-8 preserves validated prefix", utf_summary["count"] == 1)
+        assert_true("invalid UTF-8 reports exact line", utf_summary["carrier_errors"][0]["line"] == 2)
+
+
+def test_read_returns_fleet_only_message_body() -> None:
+    import tempfile
+    import goalflight_messages as messages
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        messages_dir = base / "messages"
+        remote_messages_dir = base / "remote-messages"
+        fleet_dir = base / "fleet"
+        dispatch_id = "d-read-fleet-only"
+        mirror_remote_message(
+            remote_messages_dir=remote_messages_dir,
+            fleet_dir=fleet_dir,
+            messages_dir=messages_dir,
+            dispatch_id=dispatch_id,
+            msg_type="user_need",
+            payload={"text": "fleet-only body"},
+        )
+
+        read = run_messages_cli(messages_dir, fleet_dir, ["read", "--dispatch-id", dispatch_id])
+        assert_true("fleet-only read succeeds", read.returncode == 0)
+        envelopes = json.loads(read.stdout)
+        assert_true("fleet-only read returns one envelope", len(envelopes) == 1)
+        assert_true("fleet-only read returns body", envelopes[0]["payload"]["text"] == "fleet-only body")
+
+
+def test_last_steering_uses_controller_ingestion_order_across_clock_skew() -> None:
+    import tempfile
+    from unittest.mock import patch
+    import goalflight_messages as messages
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        messages_dir = base / "messages"
+        remote_messages_dir = base / "remote-messages"
+        fleet_dir = base / "fleet"
+        dispatch_id = messages.STEERING_DISPATCH_ID
+
+        with patch.object(messages, "utc_now", return_value="2026-08-08T10:00:10+00:00"):
+            local_path = Path(messages.post_message(
+                dispatch_id=dispatch_id,
+                msg_type="steering",
+                payload={"text": "first local steer"},
+                messages_dir=messages_dir,
+                seq=1,
+            )["path"])
+        with patch.object(messages, "utc_now", return_value="2026-08-08T10:00:00+00:00"):
+            remote_path = Path(messages.post_message(
+                dispatch_id=dispatch_id,
+                msg_type="steering",
+                payload={"text": "second remote steer"},
+                messages_dir=remote_messages_dir,
+                source={"node": "remote", "adapter": "codex", "transport": "acp"},
+                seq=1,
+            )["path"])
+        merged = messages.merge_remote_register(
+            fleet_dir,
+            remote_path,
+            messages_dir=messages_dir,
+        )
+        fleet_path = Path(merged["merged_into"])
+        assert_true("steering local input path", local_path == messages.inbox_path(messages_dir, dispatch_id))
+        assert_true("steering fleet input path", fleet_path.exists())
+
+        aggregate = messages.build_aggregate(messages_dir=messages_dir, fleet_dir=fleet_dir)
+        assert_true("second ingestion wins despite backwards source clock", aggregate["last_steering"]["payload"]["text"] == "second remote steer")
+        assert_true("source timestamp remains display value", aggregate["last_steering"]["ts"] == "2026-08-08T10:00:00+00:00")
+
+
+def test_remerged_identical_steering_reuses_persisted_ingestion_order() -> None:
+    import tempfile
+    import goalflight_messages as messages
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        messages_dir = base / "messages"
+        remote_messages_dir = base / "remote-messages"
+        fleet_dir = base / "fleet"
+        dispatch_id = messages.STEERING_DISPATCH_ID
+
+        remote_path = Path(messages.post_message(
+            dispatch_id=dispatch_id,
+            msg_type="steering",
+            payload={"text": "old remote steer"},
+            messages_dir=remote_messages_dir,
+            source={"node": "remote", "adapter": "codex", "transport": "acp"},
+            seq=1,
+        )["path"])
+        first_merge = messages.merge_remote_register(
+            fleet_dir,
+            remote_path,
+            messages_dir=messages_dir,
+        )
+        fleet_path = Path(first_merge["merged_into"])
+        first_order = messages.read_envelopes(fleet_path)[0][messages._INGESTION_ORDER_FIELD]
+        local_path = Path(messages.post_message(
+            dispatch_id=dispatch_id,
+            msg_type="steering",
+            payload={"text": "newer local steer"},
+            messages_dir=messages_dir,
+            seq=1,
+        )["path"])
+        assert_true("remerge remote input path measured", remote_path == messages.inbox_path(remote_messages_dir, dispatch_id))
+        assert_true("remerge local input path measured", local_path == messages.inbox_path(messages_dir, dispatch_id))
+        before_rotation = messages.build_aggregate(messages_dir=messages_dir, fleet_dir=fleet_dir)
+        assert_true("genuinely newer local steer wins before rotation", before_rotation["last_steering"]["payload"]["text"] == "newer local steer")
+
+        rotated_path = fleet_path.with_name(f"{fleet_path.stem}.rotated.jsonl")
+        fleet_path.rename(rotated_path)
+        second_merge = messages.merge_remote_register(
+            fleet_dir,
+            remote_path,
+            messages_dir=messages_dir,
+        )
+        remerged_path = Path(second_merge["merged_into"])
+        second_order = messages.read_envelopes(remerged_path)[0][messages._INGESTION_ORDER_FIELD]
+        after_remerge = messages.build_aggregate(messages_dir=messages_dir, fleet_dir=fleet_dir)
+        assert_true("remerged carrier input path measured", remerged_path == fleet_path)
+        assert_true("identical envelope reuses first ingestion order", second_order == first_order)
+        assert_true("remerge cannot displace newer local steer", after_remerge["last_steering"]["payload"]["text"] == "newer local steer")
+        identity_store = messages_dir / ".ingestion-identities.json"
+        assert_true("canonical ingestion identity store is outside carrier", identity_store.is_file() and identity_store.parent == messages_dir)
+        identity_document = json.loads(identity_store.read_text(encoding="utf-8"))
+        remote_identity = messages._canonical_envelope_identity(messages.read_envelopes(remote_path)[0])
+        assert_true("identity store keys the remote event to its first order", identity_document["orders"][remote_identity] == first_order)
 
 
 def test_relay_user_need_e2e() -> None:
@@ -1134,13 +2196,17 @@ def test_wake_filter_uses_sender_direction_and_preserves_unread_mail() -> None:
                 messages_dir=messages_dir,
                 fleet_dir=fleet_dir,
             )
+            wake_key = messages.inbox_stream_key(
+                messages.inbox_path(messages_dir, dispatch_id),
+                messages_dir=messages_dir,
+            )
             assert_true(
                 "another controller wakes despite sharing goalflight-dispatch adapter",
-                (dispatch_id, 2) in wakes,
+                (wake_key, 2) in wakes,
             )
-            assert_true("ambiguous controller authorship wakes", (dispatch_id, 3) in wakes)
-            assert_true("typed worker escalation cannot be self-suppressed", (dispatch_id, 4) in wakes)
-            assert_true("self-authored envelope stays out of wake set", (dispatch_id, 1) not in wakes)
+            assert_true("ambiguous controller authorship wakes", (wake_key, 3) in wakes)
+            assert_true("typed worker escalation cannot be self-suppressed", (wake_key, 4) in wakes)
+            assert_true("self-authored envelope stays out of wake set", (wake_key, 1) not in wakes)
 
             summary = messages.controller_mail_summary(
                 owned_dispatch_ids={dispatch_id},
@@ -1255,11 +2321,15 @@ def test_named_peer_mail_crosses_projects_when_explicitly_addressed() -> None:
                 messages_dir=messages_dir,
                 fleet_dir=fleet_dir,
             )
-            assert_true("shared wake filter includes named peer mail", ("peer-correspondence", 1) in wakes)
+            peer_key = messages.inbox_stream_key(
+                messages.inbox_path(messages_dir, "peer-correspondence"),
+                messages_dir=messages_dir,
+            )
+            assert_true("shared wake filter includes named peer mail", (peer_key, 1) in wakes)
             wait_wakes = status._mail_watermark(str(mine), ["mine-worker"])
             assert_true(
                 "status wait delegates named peer mail to shared filter",
-                wait_wakes is not None and ("peer-correspondence", 1) in wait_wakes,
+                wait_wakes is not None and (peer_key, 1) in wait_wakes,
             )
         finally:
             _restore_test_controller(previous)
@@ -1308,7 +2378,11 @@ def test_named_mail_for_different_controller_is_quiet_and_readable() -> None:
                 messages_dir=messages_dir,
                 fleet_dir=fleet_dir,
             )
-            assert_true("different addressee does not wake", ("peer-private", 1) not in wakes)
+            peer_key = messages.inbox_stream_key(
+                messages.inbox_path(messages_dir, "peer-private"),
+                messages_dir=messages_dir,
+            )
+            assert_true("different addressee does not wake", (peer_key, 1) not in wakes)
             relayed = run_messages_cli(messages_dir, fleet_dir, ["relay", "--new"], cwd=mine)
             assert_true("different addressee absent from default relay", "for somebody else" not in relayed.stdout)
             readable = run_messages_cli(
@@ -1357,7 +2431,11 @@ def test_cross_project_worker_traffic_remains_project_scoped() -> None:
                 messages_dir=messages_dir,
                 fleet_dir=fleet_dir,
             )
-            assert_true("foreign worker escalation does not wake", ("peer-worker", 1) not in wakes)
+            peer_key = messages.inbox_stream_key(
+                messages.inbox_path(messages_dir, "peer-worker"),
+                messages_dir=messages_dir,
+            )
+            assert_true("foreign worker escalation does not wake", (peer_key, 1) not in wakes)
             relayed = run_messages_cli(messages_dir, fleet_dir, ["relay", "--new"], cwd=mine)
             assert_true("foreign worker traffic absent from default relay", "peer worker escalation" not in relayed.stdout)
         finally:
@@ -1399,7 +2477,11 @@ def test_unknown_controller_name_is_preserved_and_reported() -> None:
                 messages_dir=messages_dir,
                 fleet_dir=fleet_dir,
             )
-            assert_true("unclaimed name does not wake arbitrary controller", ("ghost-mail", 1) not in wakes)
+            ghost_key = messages.inbox_stream_key(
+                messages.inbox_path(messages_dir, "ghost-mail"),
+                messages_dir=messages_dir,
+            )
+            assert_true("unclaimed name does not wake arbitrary controller", (ghost_key, 1) not in wakes)
             report = run_messages_cli(messages_dir, fleet_dir, ["undeliverable"], cwd=mine)
             assert_true("unclaimed name is reported", "1 unresolved controller envelope" in report.stdout)
             assert_true("unclaimed label is named", "to unclaimed-controller" in report.stdout)
@@ -1564,6 +2646,7 @@ def test_mcp_delivery_failure_sets_tool_error_and_call_exit() -> None:
 
 def test_mark_read_creates_cursor_and_unseen_filters() -> None:
     import tempfile
+    import goalflight_messages as messages
     from goalflight_messages import READ_CURSOR_FILE, append_envelope, inbox_path, markers_to_envelopes
 
     with tempfile.TemporaryDirectory() as td:
@@ -1587,7 +2670,8 @@ def test_mark_read_creates_cursor_and_unseen_filters() -> None:
         assert_true("mark-read exit 0", marked.returncode == 0)
         cursor_path = messages_dir / READ_CURSOR_FILE
         assert_true("cursor created", cursor_path.exists())
-        assert_true("cursor value", json.loads(cursor_path.read_text())[dispatch_id] == 1)
+        key = messages.inbox_stream_key(path, messages_dir=messages_dir)
+        assert_true("cursor value", messages.load_read_cursor(cursor_path)[key] == 1)
 
         unseen = run_messages_cli(messages_dir, fleet_dir, ["read", "--dispatch-id", dispatch_id, "--unseen"])
         assert_true("unseen exit 0", unseen.returncode == 0)
@@ -1600,6 +2684,7 @@ def test_mark_read_creates_cursor_and_unseen_filters() -> None:
 
 def test_mark_read_all_advances_every_inbox_to_current_max() -> None:
     import tempfile
+    import goalflight_messages as messages
     from goalflight_messages import READ_CURSOR_FILE, append_envelope, inbox_path, markers_to_envelopes
 
     with tempfile.TemporaryDirectory() as td:
@@ -1607,21 +2692,30 @@ def test_mark_read_all_advances_every_inbox_to_current_max() -> None:
         messages_dir = base / "messages"
         fleet_dir = base / "fleet"
         fleet_dir.mkdir()
+        paths: dict[str, Path] = {}
         for dispatch_id, count in {"d-one": 1, "d-two": 2}.items():
             path = inbox_path(messages_dir, dispatch_id)
+            paths[dispatch_id] = path
             markers = {"STATUS": [f"{dispatch_id}-{idx}" for idx in range(count)]}
             for env in markers_to_envelopes(markers, dispatch_id=dispatch_id):
                 append_envelope(path, env)
 
         marked = run_messages_cli(messages_dir, fleet_dir, ["mark-read", "--all"])
         assert_true("mark-read all exit 0", marked.returncode == 0)
-        cursor = json.loads((messages_dir / READ_CURSOR_FILE).read_text())
-        assert_true("first inbox max", cursor["d-one"] == 1)
-        assert_true("second inbox max", cursor["d-two"] == 2)
+        cursor = messages.load_read_cursor(messages_dir / READ_CURSOR_FILE)
+        assert_true(
+            "first inbox max",
+            cursor[messages.inbox_stream_key(paths["d-one"], messages_dir=messages_dir)] == 1,
+        )
+        assert_true(
+            "second inbox max",
+            cursor[messages.inbox_stream_key(paths["d-two"], messages_dir=messages_dir)] == 2,
+        )
 
 
 def test_mark_read_through_never_rewinds() -> None:
     import tempfile
+    import goalflight_messages as messages
     from goalflight_messages import READ_CURSOR_FILE
 
     with tempfile.TemporaryDirectory() as td:
@@ -1629,17 +2723,26 @@ def test_mark_read_through_never_rewinds() -> None:
         messages_dir = base / "messages"
         fleet_dir = base / "fleet"
         fleet_dir.mkdir()
+        path = Path(messages.post_message(
+            dispatch_id="d-sticky",
+            msg_type="status",
+            payload={"text": "five"},
+            messages_dir=messages_dir,
+            seq=5,
+        )["path"])
+        key = messages.inbox_stream_key(path, messages_dir=messages_dir)
         first = run_messages_cli(messages_dir, fleet_dir, ["mark-read", "--dispatch-id", "d-sticky", "--through", "5"])
         second = run_messages_cli(messages_dir, fleet_dir, ["mark-read", "--dispatch-id", "d-sticky", "--through", "3"])
         assert_true("first mark-read ok", first.returncode == 0)
         assert_true("second mark-read ok", second.returncode == 0)
-        cursor = json.loads((messages_dir / READ_CURSOR_FILE).read_text())
-        assert_true("cursor stayed at high-water mark", cursor["d-sticky"] == 5)
-        assert_true("unchanged reported", "d-sticky 5->5 (unchanged)" in second.stdout)
+        cursor = messages.load_read_cursor(messages_dir / READ_CURSOR_FILE)
+        assert_true("cursor stayed at high-water mark", cursor[key] == 5)
+        assert_true("unchanged reported", f"{key} 5->5 (unchanged)" in second.stdout)
 
 
 def test_concurrent_mark_read_through_merges_per_inbox_max() -> None:
     import tempfile
+    import goalflight_messages as messages
     from goalflight_messages import READ_CURSOR_FILE
 
     with tempfile.TemporaryDirectory() as td:
@@ -1648,6 +2751,16 @@ def test_concurrent_mark_read_through_merges_per_inbox_max() -> None:
         fleet_dir = base / "fleet"
         messages_dir.mkdir()
         fleet_dir.mkdir()
+        paths = {
+            dispatch_id: Path(messages.post_message(
+                dispatch_id=dispatch_id,
+                msg_type="status",
+                payload={"text": f"max {maximum}"},
+                messages_dir=messages_dir,
+                seq=maximum,
+            )["path"])
+            for dispatch_id, maximum in {"d-a": 9, "d-b": 7}.items()
+        }
         targets = [
             ("d-a", 1),
             ("d-a", 5),
@@ -1679,13 +2792,20 @@ def test_concurrent_mark_read_through_merges_per_inbox_max() -> None:
         assert_true("all workers returned", len(results) == len(targets))
         for dispatch_id, through, result in results:
             assert_true(f"{dispatch_id} through {through} exit 0: {result.stderr}", result.returncode == 0)
-        cursor = json.loads((messages_dir / READ_CURSOR_FILE).read_text())
-        assert_true("d-a max retained", cursor["d-a"] == 9)
-        assert_true("d-b max retained", cursor["d-b"] == 7)
+        cursor = messages.load_read_cursor(messages_dir / READ_CURSOR_FILE)
+        assert_true(
+            "d-a max retained",
+            cursor[messages.inbox_stream_key(paths["d-a"], messages_dir=messages_dir)] == 9,
+        )
+        assert_true(
+            "d-b max retained",
+            cursor[messages.inbox_stream_key(paths["d-b"], messages_dir=messages_dir)] == 7,
+        )
 
 
 def test_read_unseen_ack_advances_to_shown() -> None:
     import tempfile
+    import goalflight_messages as messages
     from goalflight_messages import READ_CURSOR_FILE, append_envelope, inbox_path, markers_to_envelopes
 
     with tempfile.TemporaryDirectory() as td:
@@ -1703,8 +2823,9 @@ def test_read_unseen_ack_advances_to_shown() -> None:
         first_lines = first.stdout.splitlines()
         assert_true("both shown", [env["seq"] for env in json.loads(first_lines[0])] == [1, 2])
         assert_true("pre-ack count", first_lines[1] == "unseen counts: d-ack=2")
-        cursor = json.loads((messages_dir / READ_CURSOR_FILE).read_text())
-        assert_true("ack cursor", cursor[dispatch_id] == 2)
+        cursor = messages.load_read_cursor(messages_dir / READ_CURSOR_FILE)
+        key = messages.inbox_stream_key(path, messages_dir=messages_dir)
+        assert_true("ack cursor", cursor[key] == 2)
 
         second = run_messages_cli(messages_dir, fleet_dir, ["read", "--dispatch-id", dispatch_id, "--unseen"])
         second_lines = second.stdout.splitlines()
@@ -2028,6 +3149,7 @@ def test_default_relay_excludes_cross_project_mail() -> None:
 def test_ack_stale_expires_exact_stale_set_and_preserves_read_cursor() -> None:
     import tempfile
     import goalflight_task as T
+    import goalflight_messages as messages
     from goalflight_messages import (
         ACK_CURSOR_FILE,
         READ_CURSOR_FILE,
@@ -2170,10 +3292,17 @@ def test_ack_stale_expires_exact_stale_set_and_preserves_read_cursor() -> None:
         assert_true("closed task escalation expired", "d-closed" not in relay.stdout)
         assert_true("superseded escalation expired", "d-old" not in relay.stdout)
         assert_true("old task-less terminal escalation expired", "d-taskless-old" not in relay.stdout)
-        ack_cursor = json.loads((messages_dir / ACK_CURSOR_FILE).read_text())
+        ack_cursor = messages.load_read_cursor(messages_dir / ACK_CURSOR_FILE)
         assert_true(
             "ack cursor exact stale keys",
-            set(ack_cursor) == {"d-closed", "d-old", "d-taskless-old"},
+            set(ack_cursor)
+            == {
+                messages.inbox_stream_key(
+                    inbox_path(messages_dir, dispatch_id),
+                    messages_dir=messages_dir,
+                )
+                for dispatch_id in ("d-closed", "d-old", "d-taskless-old")
+            },
         )
         assert_true("read cursor remains untouched", not (messages_dir / READ_CURSOR_FILE).exists())
 
@@ -2193,6 +3322,21 @@ def main() -> None:
         test_inbox_append_read_order,
         test_inbox_corrupt_line_fails_closed,
         test_aggregate_open_user_need,
+        test_dual_source_inboxes_aggregate_without_fleet_overwrite,
+        test_single_source_inboxes_and_deterministic_order_reject_local_overwrite,
+        test_dual_source_sequences_keep_independent_cursor_and_wake_identity,
+        test_unseen_last_n_ack_only_advances_shown_event_and_keeps_empty_zero,
+        test_mark_read_through_clamps_each_stream_and_preserves_later_fleet_mail,
+        test_structural_stream_keys_prevent_dispatch_prefix_collision,
+        test_merged_envelope_dedupes_event_but_acknowledges_both_streams,
+        test_legacy_cursor_keys_migrate_atomically_and_idempotently,
+        test_legacy_cursor_ambiguous_and_absent_entries_stay_unresolved,
+        test_cursor_version_controls_structural_key_parsing_and_is_idempotent,
+        test_same_id_different_envelopes_both_survive_and_later_need_reopens,
+        test_corrupt_carrier_preserves_prefix_reports_error_and_clamps_cursor,
+        test_read_returns_fleet_only_message_body,
+        test_last_steering_uses_controller_ingestion_order_across_clock_skew,
+        test_remerged_identical_steering_reuses_persisted_ingestion_order,
         test_relay_user_need_e2e,
         test_mcp_post_matches_file_append,
         test_post_message_rejects_invalid_seq_and_accepts_one,
