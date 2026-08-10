@@ -631,7 +631,13 @@ def test_inferred_abandonment_is_resumable_and_fresh_child_stays_live(
     assert reopened_parent["state"] == "superseded"
     assert reopened_parent["resumed_by_dispatch_id"] == fresh_child_id
     assert reopened_parent["resumed_at"] == resumed["started_at"]
-    assert reopened_parent["updated_at"] == resumed["started_at"]
+    # `resumed_at` is COPIED from the child's started_at, so equality above is a
+    # real contract. `updated_at` is stamped by write_record at write time, so it
+    # equals started_at only when the write happens to land in the same second --
+    # asserting equality here made the suite fail whenever the resume straddled a
+    # tick (observed 2026-08-10: 18:02:36 vs 18:02:37). The actual guarantee is
+    # ordering: the parent is updated at or after the child starts.
+    assert L.parse_utc(reopened_parent["updated_at"]) >= L.parse_utc(resumed["started_at"])
     assert reopened_parent["outcome"]["reconciliation"]["basis"] == "inferred_abandonment"
     assert reopened_parent["outcome"]["resume"]["dispatch_id"] == fresh_child_id
 
