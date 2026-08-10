@@ -12,15 +12,13 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# Isolate the durable canonical task-store base so no test writes to the real
-# ~/.local/state/goal-flight (mirrors the per-test GOALFLIGHT_STATE_DIR isolation).
-# Only mint + clean a temp base when the outer env did not provide one.
-if [ -z "${GOALFLIGHT_TASK_STORE_DIR:-}" ]; then
-  _GF_TASK_STORE_BASE="$(mktemp -d "${TMPDIR:-/tmp}/gf-test-taskstore-XXXXXX")"
-  trap 'rm -rf "$_GF_TASK_STORE_BASE" 2>/dev/null || true' EXIT
-else
-  _GF_TASK_STORE_BASE="$GOALFLIGHT_TASK_STORE_DIR"
-fi
+# Isolate every machine-global writable default. A test that omits an explicit
+# messages_dir/fleet_dir must never migrate or append to the operator's live
+# ~/.goal-flight state merely because the production helper supplies defaults.
+_GF_TEST_ENV_BASE="$(mktemp -d "${TMPDIR:-/tmp}/gf-test-env-XXXXXX")"
+trap 'rm -rf "$_GF_TEST_ENV_BASE" 2>/dev/null || true' EXIT
+_GF_TASK_STORE_BASE="${GOALFLIGHT_TASK_STORE_DIR:-$_GF_TEST_ENV_BASE/task-store}"
+_GF_MESSAGES_BASE="${GOALFLIGHT_MESSAGES_DIR:-$_GF_TEST_ENV_BASE/messages}"
 
 pass=0
 fail=0
@@ -41,6 +39,7 @@ run_isolated_test_env() {
   env -u GOALFLIGHT_STEER_FILE -u GOALFLIGHT_ALLOW_EXTERNAL_STEER_FILE \
     -u GOALFLIGHT_ISOLATED_TEST_FILE \
     GOALFLIGHT_CAPACITY_CONF="${GOALFLIGHT_CAPACITY_CONF:-/dev/null}" \
+    GOALFLIGHT_MESSAGES_DIR="$_GF_MESSAGES_BASE" \
     GOALFLIGHT_TASK_STORE_DIR="${GOALFLIGHT_TASK_STORE_DIR:-$_GF_TASK_STORE_BASE}" "$@"
 }
 

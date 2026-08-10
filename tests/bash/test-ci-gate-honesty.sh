@@ -29,6 +29,7 @@ required_fragments = (
     "$skip skipped",
     "skill_structure_collected",
     "-u GOALFLIGHT_ISOLATED_TEST_FILE",
+    'GOALFLIGHT_MESSAGES_DIR="$_GF_MESSAGES_BASE"',
 )
 for fragment in required_fragments:
     if fragment not in runner_text:
