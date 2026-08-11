@@ -663,10 +663,17 @@ def test_instruction_split_contract() -> None:
         # for the deliberate "Command danger classification" taxonomy (concise; the
         # full detail + drainer daemon + incident writeup live in
         # protocols/dispatch-danger.md, off the SKILL budget). Raised 32.5KB -> 33.5KB
-        # on 2026-07-08 for load-bearing review-cadence hardening; wc-line <=545
+        # on 2026-07-08 for load-bearing review-cadence hardening; wc-line
         # remains the primary budget. Catches future bloat.
-        f"SKILL under 33.5KB (got {len(skill.encode())}B)",
-        len(skill.encode()) <= 33_500,
+        #
+        # Raised 33.5KB -> 37KB on 2026-08-10 alongside the line budget (545 -> 600),
+        # which stays primary. Paired deliberately: SKILL.md runs ~61 bytes/line, so
+        # 600 lines is ~36.6KB and both caps bind at about the same point. Setting
+        # only one leaves the other vestigial -- on 2026-08-10 a single change
+        # tripped both within 24 bytes and 0 lines of their limits, which is what
+        # happens when each raise re-pins the ceiling to the current size.
+        f"SKILL under 37KB (got {len(skill.encode())}B)",
+        len(skill.encode()) <= 37_000,
     )
     for protocol in [
         "session-preflight.md",

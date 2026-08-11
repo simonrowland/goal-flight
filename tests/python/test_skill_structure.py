@@ -726,7 +726,22 @@ def test_skill_md_structural_invariants() -> None:
     # 525 lines exactly. Raised to 545 on 2026-07-06 for the fan-out safety-gate
     # "Command danger classification" section; still compact and within the byte
     # budget.
-    assert_true(f"SKILL.md wc -l <= 545 (got {wc_line_count})", wc_line_count <= 545)
+    #
+    # Raised to 600 on 2026-08-10 with DELIBERATE HEADROOM. Every previous raise
+    # set the ceiling just above the then-current size, so the file sat on the
+    # limit permanently: the 2026-08-10 controller-mail change hit this cap and
+    # the byte cap simultaneously, failing the gate twice for two reasons, with
+    # 24 bytes and 0 lines of slack. A budget with no slack does not shape
+    # authoring, it just taxes the next edit. 600 leaves ~10% room at the current
+    # 545 lines.
+    #
+    # This is still a REAL cap, not a formality. SKILL.md loads into every
+    # controller's context, so its size is a per-session token cost on every run.
+    # The cap exists to push detail into protocols/, which stay off the budget
+    # and load only when referenced. Reaching 600 means moving a section out, not
+    # raising it again -- and any future raise should keep visible headroom
+    # rather than re-pinning the ceiling to whatever the file happens to weigh.
+    assert_true(f"SKILL.md wc -l <= 600 (got {wc_line_count})", wc_line_count <= 600)
 
     frontmatter_markers = [idx for idx, line in enumerate(skill_lines) if line.strip() == "---"]
     assert_true("SKILL.md has YAML frontmatter close", len(frontmatter_markers) >= 2)
