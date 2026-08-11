@@ -47,7 +47,7 @@ STATE_FILE="$BROWSE_STATE_FILE"
 
 resolve_browse_bin() {
   if [ -n "${GSTACK_BROWSE_BIN:-}" ] && [ -x "$GSTACK_BROWSE_BIN" ]; then
-    printf '%s\n' "$GSTACK_BROWSE_BIN"
+    B="$GSTACK_BROWSE_BIN"
     return 0
   fi
   # Cover both Claude-host and canonical ~/.gstack installs (ADAPTER-4).
@@ -57,25 +57,61 @@ resolve_browse_bin() {
     "${HOME}/.gstack/repos/gstack/browse/dist/browse"
   do
     if [ -x "$candidate" ]; then
-      printf '%s\n' "$candidate"
+      B="$candidate"
       return 0
     fi
   done
   return 1
 }
 
-if ! B="$(resolve_browse_bin)"; then
+if ! resolve_browse_bin; then
   echo "BLOCKED: gstack browse binary not found/executable (set GSTACK_BROWSE_BIN or install under ~/.claude/skills/gstack or ~/.gstack/repos/gstack)"
   exit 127
 fi
 
+single_line_value() {
+  local mode="$1" value="$2"
+  python3 - "$mode" "$value" <<'PY'
+import sys
+import unicodedata
+
+# Enumerated from Python's actual behaviour over every Unicode code point with
+# len(("A" + chr(cp) + "B").splitlines()) > 1:
+# U+000A, U+000B, U+000C, U+000D, U+001C, U+001D, U+001E, U+0085,
+# U+2028, and U+2029. goalflight_watch.py uses str.splitlines(), so this exact
+# set is the parser boundary and therefore the validation/encoding authority.
+# A per-dispatch unguessable marker token or structured terminal event remains
+# the follow-up that removes this textual-marker class entirely.
+LINE_BOUNDARIES = frozenset(
+    {0x000A, 0x000B, 0x000C, 0x000D, 0x001C, 0x001D, 0x001E, 0x0085, 0x2028, 0x2029}
+)
+
+mode, value = sys.argv[1], sys.argv[2]
+if mode == "contains-boundary":
+    raise SystemExit(0 if any(ord(char) in LINE_BOUNDARIES for char in value) else 1)
+if mode != "encode":
+    raise SystemExit(2)
+
+def encode_char(char: str) -> str:
+    codepoint = ord(char)
+    if codepoint in LINE_BOUNDARIES:
+        return f"\\u{codepoint:04X}"
+    if unicodedata.category(char) == "Cc":
+        return f"\\x{codepoint:02X}" if codepoint <= 0xFF else f"\\u{codepoint:04X}"
+    return char
+
+sys.stdout.write("".join(encode_char(char) for char in value))
+PY
+}
+
 reject_control_chars() {
   local label="$1" value="$2"
   if [[ "$value" == *$'\n'* || "$value" == *$'\r'* ]] \
-    || LC_ALL=C printf '%s' "$value" | LC_ALL=C grep -q '[[:cntrl:]]'
+    || LC_ALL=C printf '%s' "$value" | LC_ALL=C grep -q '[[:cntrl:]]' \
+    || single_line_value contains-boundary "$value"
   then
     # Do not echo the hostile value: it may itself contain a forged marker.
-    echo "BLOCKED: $label contains control characters"
+    echo "BLOCKED: $label contains parser line boundaries or control characters"
     return 1
   fi
 }
@@ -84,11 +120,15 @@ reject_control_chars URL "$URL" || exit 2
 reject_control_chars OUT "$OUT" || exit 2
 reject_control_chars BROWSE_STATE_FILE "$STATE_FILE" || exit 2
 reject_control_chars GSTACK_BROWSE_BIN "$B" || exit 2
+URL_PRINT="$(single_line_value encode "$URL")" || { echo "BLOCKED: could not encode URL for worker output"; exit 2; }
+OUT_PRINT="$(single_line_value encode "$OUT")" || { echo "BLOCKED: could not encode OUT for worker output"; exit 2; }
+STATE_FILE_PRINT="$(single_line_value encode "$STATE_FILE")" || { echo "BLOCKED: could not encode BROWSE_STATE_FILE for worker output"; exit 2; }
+B_PRINT="$(single_line_value encode "$B")" || { echo "BLOCKED: could not encode GSTACK_BROWSE_BIN for worker output"; exit 2; }
 case "$OUT" in
   -*) echo "BLOCKED: OUT must not begin with '-': use ./ or an absolute path"; exit 2 ;;
 esac
 
-[ -x "$B" ] || { echo "BLOCKED: gstack browse binary not found/executable at $B"; exit 127; }
+[ -x "$B" ] || { printf 'BLOCKED: gstack browse binary not found/executable at %s\n' "$B_PRINT"; exit 127; }
 
 # The daemon runs outside the worker sandbox. A bare file:// allowance would let
 # it act as a filesystem-reading proxy, so local files are confined to the
@@ -148,30 +188,32 @@ case "$URL" in
     ;;
   file://*)
     original_url="$URL"
+    original_url_print="$URL_PRINT"
     if ! URL="$(canonical_workspace_file_url "$URL" 2>/dev/null)"; then
-      echo "BLOCKED: file URL escapes web-QA cwd: $original_url"
+      printf 'BLOCKED: file URL escapes web-QA cwd: %s\n' "$original_url_print"
       exit 2
     fi
+    URL_PRINT="$(single_line_value encode "$URL")" || { echo "BLOCKED: could not encode canonical URL for worker output"; exit 2; }
     ;;
-  *) echo "BLOCKED: url scheme must be http/https or a cwd-confined file: $URL"; exit 2 ;;
+  *) printf 'BLOCKED: url scheme must be http/https or a cwd-confined file: %s\n' "$URL_PRINT"; exit 2 ;;
 esac
 
-mkdir -p -- "$OUT" || { echo "BLOCKED: could not create web-QA artifact directory $OUT"; exit 4; }
+mkdir -p -- "$OUT" 2>/dev/null || { printf 'BLOCKED: could not create web-QA artifact directory %s\n' "$OUT_PRINT"; exit 4; }
 gb()  { env BROWSE_NO_AUTOSTART=1 BROWSE_STATE_FILE="$STATE_FILE" "$B" "$@"; }
 gbt() { env BROWSE_NO_AUTOSTART=1 BROWSE_STATE_FILE="$STATE_FILE" BROWSE_TAB="$TAB" "$B" "$@"; }
 
 # Fail loudly + early if the daemon is not up: a worker cannot start one itself.
 if ! gb status 2>&1 | grep -q '^Status: healthy'; then
-  echo "BLOCKED: no reachable browse daemon via state file $STATE_FILE"
+  printf 'BLOCKED: no reachable browse daemon via state file %s\n' "$STATE_FILE_PRINT"
   echo "  (a sandboxed worker cannot start one -- it cannot bind a port)"
   echo "  Operator, from the project dir, detached (macOS has no setsid):"
-  echo "    nohup $B goto <url> >/tmp/browse.log 2>&1 &"
+  printf '    nohup %s goto <url> >/tmp/browse.log 2>&1 &\n' "$B_PRINT"
   exit 3
 fi
 
 # Own tab => isolation from every other concurrent worker.
 TAB="$(gb newtab "$URL" 2>&1 | grep -oE 'Opened tab [0-9]+' | grep -oE '[0-9]+' | head -1)"
-[ -n "$TAB" ] || { echo "BLOCKED: could not open a tab for $URL"; exit 4; }
+[ -n "$TAB" ] || { printf 'BLOCKED: could not open a tab for %s\n' "$URL_PRINT"; exit 4; }
 trap 'gb closetab "$TAB" >/dev/null 2>&1 || true' EXIT
 
 gbt wait --networkidle >/dev/null 2>&1 || true
@@ -181,14 +223,14 @@ gbt wait --networkidle >/dev/null 2>&1 || true
 capture_stdout() {
   local label="$1" artifact="$2" temporary="${2}.tmp.$$"
   shift 2
-  rm -f -- "$artifact" "$temporary"
+  rm -f -- "$artifact" "$temporary" 2>/dev/null
   if ! gbt "$@" > "$temporary" 2>&1; then
-    rm -f -- "$temporary"
+    rm -f -- "$temporary" 2>/dev/null
     echo "BLOCKED: web-QA $label capture failed"
     return 1
   fi
-  if ! mv -f -- "$temporary" "$artifact"; then
-    rm -f -- "$temporary"
+  if ! mv -f -- "$temporary" "$artifact" 2>/dev/null; then
+    rm -f -- "$temporary" 2>/dev/null
     echo "BLOCKED: web-QA $label artifact publish failed"
     return 1
   fi
@@ -203,14 +245,14 @@ capture_stdout snapshot "$OUT/snapshot.txt" snapshot -i || exit 5
 # The browser infers image format from the EXTENSION, so the temp file must keep
 # a .png suffix: a bare ".tmp.$$" yields `unsupported mime type "null"`.
 screenshot_tmp="$OUT/screen.tmp.$$.png"
-rm -f -- "$OUT/screen.png" "$screenshot_tmp"
+rm -f -- "$OUT/screen.png" "$screenshot_tmp" 2>/dev/null
 if ! gbt screenshot "$screenshot_tmp" >/dev/null 2>&1; then
-  rm -f -- "$screenshot_tmp"
+  rm -f -- "$screenshot_tmp" 2>/dev/null
   echo "BLOCKED: web-QA screenshot capture failed"
   exit 5
 fi
-if ! mv -f -- "$screenshot_tmp" "$OUT/screen.png"; then
-  rm -f -- "$screenshot_tmp"
+if ! mv -f -- "$screenshot_tmp" "$OUT/screen.png" 2>/dev/null; then
+  rm -f -- "$screenshot_tmp" 2>/dev/null
   echo "BLOCKED: web-QA screenshot artifact publish failed"
   exit 5
 fi
@@ -220,7 +262,8 @@ for artifact in \
   "$OUT/a11y.txt" "$OUT/snapshot.txt" "$OUT/screen.png"
 do
   if [ ! -e "$artifact" ]; then
-    echo "BLOCKED: web-QA capture did not create artifact $artifact"
+    artifact_print="$(single_line_value encode "$artifact")" || { echo "BLOCKED: could not encode artifact path for worker output"; exit 5; }
+    printf 'BLOCKED: web-QA capture did not create artifact %s\n' "$artifact_print"
     exit 5
   fi
 done
@@ -274,15 +317,18 @@ print(sum(1 for line in lines if re.search(pattern, line, re.IGNORECASE)))
 PY
 }
 
-if ! ERRS="$(count_matches 'error|exception|uncaught' "$OUT/console.txt")"; then
+if ! ERRS="$(count_matches 'error|exception|uncaught' "$OUT/console.txt" 2>/dev/null)"; then
   echo "BLOCKED: could not read web-QA console artifact"
   exit 6
 fi
-if ! FAILED="$(count_matches ' (4[0-9]{2}|5[0-9]{2}) |failed|blocked' "$OUT/network.txt")"; then
+if ! FAILED="$(count_matches ' (4[0-9]{2}|5[0-9]{2}) |failed|blocked' "$OUT/network.txt" 2>/dev/null)"; then
   echo "BLOCKED: could not read web-QA network artifact"
   exit 6
 fi
 
-echo "WEBQA url=$URL tab=$TAB console_errors=$ERRS network_suspect=$FAILED artifacts=$OUT"
-echo "  text=$OUT/text.txt dom=$OUT/dom.html console=$OUT/console.txt network=$OUT/network.txt"
-echo "  a11y=$OUT/a11y.txt snapshot=$OUT/snapshot.txt screenshot=$OUT/screen.png"
+printf 'WEBQA url=%s tab=%s console_errors=%s network_suspect=%s artifacts=%s\n' \
+  "$URL_PRINT" "$TAB" "$ERRS" "$FAILED" "$OUT_PRINT"
+printf '  text=%s/text.txt dom=%s/dom.html console=%s/console.txt network=%s/network.txt\n' \
+  "$OUT_PRINT" "$OUT_PRINT" "$OUT_PRINT" "$OUT_PRINT"
+printf '  a11y=%s/a11y.txt snapshot=%s/snapshot.txt screenshot=%s/screen.png\n' \
+  "$OUT_PRINT" "$OUT_PRINT" "$OUT_PRINT"
