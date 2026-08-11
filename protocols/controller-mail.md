@@ -17,14 +17,24 @@ python3 <skill-root>/scripts/goalflight_messages.py relay --new
 python3 <skill-root>/scripts/goalflight_messages.py relay --new --ack
 # full envelopes instead of headlines
 python3 <skill-root>/scripts/goalflight_messages.py relay --new --bodies
-# one dispatch's thread
-python3 <skill-root>/scripts/goalflight_messages.py read --dispatch-id <id>
+# one dispatch's thread -- the last N envelopes, only what is unseen, as JSON
+python3 <skill-root>/scripts/goalflight_messages.py read --dispatch-id <id> --last 4
+python3 <skill-root>/scripts/goalflight_messages.py read --dispatch-id <id> --unseen --ack
+python3 <skill-root>/scripts/goalflight_messages.py read --dispatch-id <id> --last 1 --json
 ```
 
 Mail addressed to another project is hidden by default; add `--all-projects`.
 
 Fetch bodies deliberately. `--new` headlines are the scan; pulling every body on
 every check is how a controller burns its context on correspondence.
+
+**Do not hand-parse the JSONL.** A controller was seen running
+`python3 -c "import json; lines=[json.loads(l) for l in open(...)]"` to find the
+last seq and recent senders on one thread. `read --dispatch-id <id> --last 4`
+returns exactly that. If you are reaching for a file path under
+`~/.goal-flight/messages/`, the command you want already exists -- check
+`read --help` and `relay --help` first. Hand-parsing skips the cursor, the
+schema validation, and the corruption reporting.
 
 ## Who can I write to
 
