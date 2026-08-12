@@ -343,12 +343,14 @@ def _normalize_grok(record: Mapping[str, Any], now: float) -> dict[str, object]:
     """
     del now
     reset_at = parse_reset(record.get("reset_at"))
+    # None = the host ~/.grok login, which renders as a bare "grok" row.
+    account = record.get("account") or None
     failure = _failed_record(record)
     if failure is not None:
         remaining, flag = failure
         return _row(
             "grok",
-            account=None,
+            account=account,
             remaining=remaining,
             reset_at=reset_at,
             flags=(flag,) if flag else (),
@@ -356,12 +358,12 @@ def _normalize_grok(record: Mapping[str, Any], now: float) -> dict[str, object]:
 
     used = _number(record.get("used_percent"))
     if used is None:
-        return _row("grok", account=None, remaining="unknown", reset_at=reset_at)
+        return _row("grok", account=account, remaining="unknown", reset_at=reset_at)
     remaining_value = _percent_remaining(used)
     flags = ("walled",) if used >= 100 or remaining_value <= 0 else ()
     return _row(
         "grok",
-        account=None,
+        account=account,
         remaining=f"{_format_number(remaining_value)}%",
         reset_at=reset_at,
         flags=flags,

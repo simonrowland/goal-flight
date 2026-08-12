@@ -977,6 +977,79 @@ def test_probe_reading_shows_the_deciding_balance_and_omits_spend_attribution() 
     assert "PROVIDER/ACCOUNT  PROBE READING" in rendered
 
 
+def test_grok_rows_are_per_account_and_host_stays_unlabelled():
+    """Input path: the reader returns one record per configured grok login.
+
+    Several logins must render as several rows, each naming its own account, or
+    a second grok seat's headroom is invisible and the operator cannot tell
+    which pool a number belongs to. The host login carries account None and must
+    keep rendering as a bare "grok" row so its existing identity is unchanged.
+    """
+    spec = next(spec for spec in usage.READERS if spec.key == "grok")
+    rows = usage.normalize_payload(
+        spec,
+        [
+            {
+                "label": "grok",
+                "account": None,
+                "ok": True,
+                "used_percent": 100.0,
+                "prepaid_balance": 0.0,
+                "reset_at": 1786000000,
+            },
+            {
+                "label": "grok",
+                "account": "6f3c47",
+                "ok": True,
+                "used_percent": 12.0,
+                "prepaid_balance": 0.0,
+                "reset_at": 1786600000,
+            },
+        ],
+        now=1785900000,
+    )
+    assert len(rows) == 2
+    assert [row["account"] for row in rows] == [None, "6f3c47"]
+    assert all(row["provider"] == "grok" for row in rows)
+    # the two rows must not collapse onto one another
+    assert rows[0]["remaining"] != rows[1]["remaining"]
+
+
+def test_grok_account_label_survives_a_reader_failure():
+    """A failed row must still say which login failed, or it is unactionable."""
+    spec = next(spec for spec in usage.READERS if spec.key == "grok")
+    rows = usage.normalize_payload(
+        spec,
+        [{"label": "grok", "account": "6f3c47", "ok": False, "error": "no grok login found"}],
+        now=1785900000,
+    )
+    assert rows[0]["account"] == "6f3c47"
+
+
+def test_grok_absent_percent_renders_unknown_not_a_number():
+    """used_percent None (endpoint omitted the key) must read as unknown."""
+    spec = next(spec for spec in usage.READERS if spec.key == "grok")
+    rows = usage.normalize_payload(
+        spec,
+        [
+            {
+                "label": "grok",
+                "account": "6f3c47",
+                "ok": True,
+                "used_percent": None,
+                "prepaid_balance": 0.0,
+                "reset_at": 1786600000,
+            }
+        ],
+        now=1785900000,
+    )
+    # the prepaid balance still renders alongside it (that is the deciding
+    # field); what must never appear is a percentage invented from the absence.
+    assert "unknown" in str(rows[0]["remaining"])
+    assert "%" not in str(rows[0]["remaining"])
+    assert "walled" not in rows[0].get("flags", ())
+
+
 def test_grok_is_registered_in_readers_and_normalizers():
     assert "grok" in usage.NORMALIZERS
     assert any(spec.key == "grok" for spec in usage.READERS)

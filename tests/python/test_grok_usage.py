@@ -70,7 +70,6 @@ def test_healthy_payload_yields_percent_period_end_and_decision_details(
     [
         ({}, "config"),
         ({"config": []}, "config"),
-        ({"config": {}}, "creditUsagePercent"),
         ({"config": {"creditUsagePercent": None}}, "creditUsagePercent"),
         ({"config": {"creditUsagePercent": "41"}}, "creditUsagePercent"),
         ({"config": {"creditUsagePercent": True}}, "creditUsagePercent"),
@@ -79,14 +78,102 @@ def test_healthy_payload_yields_percent_period_end_and_decision_details(
 def test_contract_drift_is_not_measured_headroom(
     tmp_path: Path, payload: object, marker: str
 ) -> None:
-    """The endpoint is undocumented. A missing or re-typed field must report
-    'could not measure' - never full headroom, never 0%."""
+    """The endpoint is undocumented. A RE-TYPED field must report 'could not
+    measure' - never full headroom, never 0%. (An absent field is a different
+    event; see the absent-key test below.)"""
     record = grok.read_usage(
         auth_path=_auth(tmp_path), fetcher=lambda url, timeout: payload
     )
     assert record["ok"] is False
     assert marker in record["error"]
     assert "used_percent" not in record
+
+
+def test_absent_percent_is_unknown_but_still_reports_what_it_measured(
+    tmp_path: Path,
+) -> None:
+    """Input path: a freshly created account whose billing period just opened.
+
+    Observed live 2026-08-12 -- the endpoint omits creditUsagePercent entirely
+    rather than sending 0, while every other field parses. Failing the whole
+    record would throw away a balance and reset date we DID measure and would
+    hide a completely fresh seat behind an error.
+    """
+    payload = {
+        "config": {
+            "billingPeriodEnd": "2026-08-19T20:22:02.229859+00:00",
+            "prepaidBalance": {"val": 12.5},
+            "currentPeriod": {"type": "USAGE_PERIOD_TYPE_WEEKLY"},
+        }
+    }
+    record = grok.read_usage(
+        auth_path=_auth(tmp_path), fetcher=lambda url, timeout: payload
+    )
+    assert record["ok"] is True
+    assert record["used_percent"] is None, "absent must not become a number"
+    assert record["used_percent_absent"] is True
+    assert record["prepaid_balance"] == 12.5
+    assert record["reset_at"] is not None
+    assert record["period_type"] == "USAGE_PERIOD_TYPE_WEEKLY"
+
+
+def test_account_label_rides_on_every_record_including_failures(
+    tmp_path: Path,
+) -> None:
+    """With several logins configured, a record that cannot say WHICH login it
+    describes is not actionable."""
+    ok = grok.read_usage(
+        auth_path=_auth(tmp_path),
+        fetcher=lambda url, timeout: {"config": {"creditUsagePercent": 10.0}},
+        account="6f3c47",
+    )
+    assert ok["account"] == "6f3c47"
+
+    def boom(url, timeout):
+        raise grok.GrokUsageError("billing endpoint unreachable")
+
+    failed = grok.read_usage(
+        auth_path=_auth(tmp_path), fetcher=boom, account="6f3c47"
+    )
+    assert failed["ok"] is False
+    assert failed["account"] == "6f3c47"
+
+    host = grok.read_usage(
+        auth_path=_auth(tmp_path),
+        fetcher=lambda url, timeout: {"config": {"creditUsagePercent": 10.0}},
+    )
+    assert host["account"] is None, "the host login stays unlabelled"
+
+
+def test_accounts_lists_host_then_each_seat(tmp_path: Path, monkeypatch) -> None:
+    """Input path: seat dirs created by `HOME=<dir> grok` logins."""
+    home = tmp_path / "home"
+    (home / ".grok").mkdir(parents=True)
+    (home / ".grok" / "auth.json").write_text("{}")
+    accounts_dir = tmp_path / "accounts"
+    for seat in ("6f3c47", "aaa111"):
+        (accounts_dir / seat / "grok" / ".grok").mkdir(parents=True)
+        (accounts_dir / seat / "grok" / ".grok" / "auth.json").write_text("{}")
+    # a dir with no grok login must not be reported as a grok account
+    (accounts_dir / "codex-only" / "codex").mkdir(parents=True)
+
+    monkeypatch.delenv("GROK_HOME", raising=False)
+    monkeypatch.setattr(grok.Path, "home", staticmethod(lambda: home))
+    monkeypatch.setattr(grok, "ACCOUNTS_DIR", accounts_dir)
+
+    labels = [label for label, _ in grok.accounts()]
+    assert labels == [None, "6f3c47", "aaa111"]
+
+
+def test_grok_home_override_reports_that_one_account(
+    tmp_path: Path, monkeypatch
+) -> None:
+    accounts_dir = tmp_path / "accounts"
+    (accounts_dir / "6f3c47" / "grok" / ".grok").mkdir(parents=True)
+    (accounts_dir / "6f3c47" / "grok" / ".grok" / "auth.json").write_text("{}")
+    monkeypatch.setenv("GROK_HOME", str(tmp_path / "explicit"))
+    monkeypatch.setattr(grok, "ACCOUNTS_DIR", accounts_dir)
+    assert [label for label, _ in grok.accounts()] == [None]
 
 
 def test_missing_login_is_reported_not_raised(tmp_path: Path) -> None:

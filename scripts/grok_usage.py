@@ -11,10 +11,22 @@ The numbers behind that view come from an authenticated JSON endpoint, which is
 what this reader calls directly.
 
 This endpoint is undocumented and internal to the CLI, so it can change or
-disappear without notice. Every failure mode here - missing auth, HTTP error,
-unparseable body, missing or non-numeric fields - reports ``ok: false`` with a
-reason. None of them may render as a healthy row or as 0% remaining: a shape
-change means "could not measure", never "measured, and it is bad".
+disappear without notice. Failure modes - missing auth, HTTP error, unparseable
+body, a re-typed field - report ``ok: false`` with a reason. None of them may
+render as a healthy row or as 0% remaining: a shape change means "could not
+measure", never "measured, and it is bad".
+
+One case is deliberately NOT a failure. When ``creditUsagePercent`` is simply
+ABSENT the account is still measurable: observed 2026-08-12 on a newly created
+account whose billing period had just opened, where the endpoint omits the key
+rather than sending 0, and every other field parses. That record stays ``ok``
+with ``used_percent`` None, so headroom reads "unknown" while the prepaid
+balance and reset date it DID report still reach the operator. A key that is
+present but re-typed remains a failure - absent and re-typed are different
+events and are reported differently.
+
+Several logins are reported, not one: the host ``~/.grok`` plus every
+``~/.goal-flight/accounts/<seat>/.grok``. See ``accounts()``.
 """
 
 from __future__ import annotations
@@ -29,8 +41,47 @@ import urllib.request
 
 BILLING_URL = "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
 AUTH_PATH = Path(os.environ.get("GROK_HOME", Path.home() / ".grok")) / "auth.json"
+ACCOUNTS_DIR = Path.home() / ".goal-flight" / "accounts"
 DEFAULT_TIMEOUT_S = 15.0
 LABEL = "grok"
+
+
+def accounts() -> list[tuple[str | None, Path]]:
+    """Every grok login to report, as (account label, auth path).
+
+    The host login at ``~/.grok`` is labelled None so its row keeps rendering as
+    plain ``grok``; named seats render as ``grok <label>``.
+
+    Discovery globs the seat directories on purpose. Codex seats are governed by
+    a registry and MUST NOT be globbed, but grok has no registry: the dispatcher
+    resolves ``--account <name>`` straight to a per-account HOME and consults
+    nothing else, so that directory IS the authority for grok. Reporting from the
+    same substrate the dispatcher bills to keeps the row and the launch in
+    agreement.
+
+    The path has TWO levels and both matter. ``_account_home`` in the dispatcher
+    builds ``accounts/<name>/<engine>`` and hands that to the worker as ``HOME``;
+    grok then keeps its credentials in ``$HOME/.grok``. So a seat's auth lives at
+    ``accounts/<name>/grok/.grok/auth.json`` -- the ``grok`` level is the HOME and
+    the ``.grok`` level is grok's own directory inside it. Logging in with
+    ``HOME`` set to the account directory instead puts auth one level too high,
+    where the dispatcher refuses it as "not configured".
+
+    An explicit ``GROK_HOME`` is an operator override: honour it alone, so this
+    still reports exactly one account when someone points it at one.
+    """
+    if os.environ.get("GROK_HOME"):
+        return [(None, AUTH_PATH)]
+    found: list[tuple[str | None, Path]] = [(None, Path.home() / ".grok" / "auth.json")]
+    try:
+        seat_dirs = sorted(p for p in ACCOUNTS_DIR.iterdir() if p.is_dir())
+    except OSError:
+        seat_dirs = []
+    for seat in seat_dirs:
+        auth = seat / "grok" / ".grok" / "auth.json"
+        if auth.is_file():
+            found.append((seat.name, auth))
+    return found
 
 
 class GrokUsageError(RuntimeError):
@@ -140,8 +191,14 @@ def read_usage(
     url: str = BILLING_URL,
     timeout_s: float = DEFAULT_TIMEOUT_S,
     fetcher=None,
+    account: str | None = None,
 ) -> dict:
-    """Return one normalized record. Never raises for an expected failure."""
+    """Return one normalized record. Never raises for an expected failure.
+
+    ``account`` is the seat label this record describes (None = the host login).
+    It rides on every return path, including the failures: a row that cannot say
+    WHICH login it failed for is not actionable when several are configured.
+    """
     auth_path = AUTH_PATH if auth_path is None else auth_path
     try:
         payload = (
@@ -150,24 +207,44 @@ def read_usage(
             else _fetch(_session_token(auth_path), url=url, timeout_s=timeout_s)
         )
     except GrokUsageError as exc:
-        return {"label": LABEL, "ok": False, "error": str(exc)}
+        return {"label": LABEL, "account": account, "ok": False, "error": str(exc)}
 
     config = payload.get("config")
     if not isinstance(config, dict):
         return {
             "label": LABEL,
+            "account": account,
             "ok": False,
             "error": "billing response lacks config",
         }
 
-    used = config.get("creditUsagePercent")
-    if isinstance(used, bool) or not isinstance(used, (int, float)):
-        # A missing or re-typed field is a contract change, not 100% headroom.
+    # ABSENT and RE-TYPED are different events and must not be conflated.
+    #
+    # Absent: observed 2026-08-12 on a freshly-created account whose billing
+    # period had just opened -- the endpoint omits creditUsagePercent (and
+    # productUsage) entirely rather than sending 0. Every other field parsed.
+    # That is a measurable account with one field we cannot read, so the record
+    # stays ok with used_percent None ("unknown"), and prepaid balance, reset,
+    # and period still ride along. Returning early here instead would discard
+    # fields we DID measure and hide a completely fresh seat behind a failure.
+    #
+    # Re-typed: the key is present but is not a number (or is a bool). That is
+    # the endpoint contract changing under us, and it must read as a failure.
+    #
+    # Neither path may produce a healthy percentage: absent yields "unknown",
+    # never 0% used and never 100% headroom.
+    used_raw = config.get("creditUsagePercent")
+    used_absent = "creditUsagePercent" not in config
+    if not used_absent and (
+        isinstance(used_raw, bool) or not isinstance(used_raw, (int, float))
+    ):
         return {
             "label": LABEL,
+            "account": account,
             "ok": False,
-            "error": "billing response lacks a numeric creditUsagePercent",
+            "error": "billing response re-typed creditUsagePercent",
         }
+    used = None if used_absent else float(used_raw)
 
     # `creditUsagePercent` alone does NOT mean the seat is unusable. Subscription
     # credits and prepaid balance are separate purses: at 100% credit usage a
@@ -179,8 +256,11 @@ def read_usage(
     # so a contract change can never read as "no money left".
     return {
         "label": LABEL,
+        "account": account,
         "ok": True,
-        "used_percent": float(used),
+        # None = the endpoint did not report it for this account (see above).
+        "used_percent": used,
+        "used_percent_absent": used_absent,
         "reset_at": _epoch(config.get("billingPeriodEnd")),
         "source": "grok_billing_credits",
         "prepaid_balance": _balance(config.get("prepaidBalance")),
@@ -201,16 +281,38 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--json", action="store_true", help="emit a JSON list")
     parser.add_argument("--timeout-s", type=float, default=DEFAULT_TIMEOUT_S)
+    parser.add_argument(
+        "--account",
+        help="report only this seat label (default: every configured grok login)",
+    )
     args = parser.parse_args(argv)
 
-    record = read_usage(timeout_s=args.timeout_s)
+    targets = accounts()
+    if args.account:
+        targets = [(label, path) for label, path in targets if label == args.account]
+        if not targets:
+            targets = [(args.account, ACCOUNTS_DIR / args.account / ".grok" / "auth.json")]
+
+    records = [
+        read_usage(auth_path=path, timeout_s=args.timeout_s, account=label)
+        for label, path in targets
+    ]
     if args.json:
-        print(json.dumps([record]))
-    elif record.get("ok"):
-        print(f"  {LABEL:14s} used={record['used_percent']:.0f}%")
+        print(json.dumps(records))
     else:
-        print(f"  {LABEL:14s} {record.get('error')}")
-    return 0 if record.get("ok") else 1
+        for record in records:
+            name = f"{LABEL} {record['account']}" if record.get("account") else LABEL
+            used = record.get("used_percent")
+            if not record.get("ok"):
+                print(f"  {name:14s} {record.get('error')}")
+            elif used is None:
+                # ok, but the endpoint did not report the percentage for this
+                # account -- printing it as a number would invent one.
+                print(f"  {name:14s} used=unknown")
+            else:
+                print(f"  {name:14s} used={float(used):.0f}%")
+    # Exit 0 when ANY login reported; one dead seat must not blank the others.
+    return 0 if any(r.get("ok") for r in records) else 1
 
 
 if __name__ == "__main__":
