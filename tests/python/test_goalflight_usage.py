@@ -430,7 +430,10 @@ def test_soonest_reset_selects_across_epoch_and_iso_sources():
     assert "soonest reset: moonshot in 50m" in rendered
 
 
-def test_json_cli_shape_and_unavailable_exit_zero(tmp_path: Path, capsys):
+def test_json_cli_shape_and_unavailable_exit_zero(
+    tmp_path: Path, capsys, monkeypatch
+):
+    monkeypatch.setattr(usage, "PACKAGE_READERS_DIR", tmp_path / "empty-package")
     _write_reader(
         tmp_path,
         "codex_usage.py",
@@ -752,12 +755,20 @@ def test_grok_row_renders_as_a_resetting_window():
     spec = usage.ReaderSpec("grok", "grok", "grok_usage.py")
     row = usage.normalize_payload(
         spec,
-        [{"label": "grok", "ok": True, "used_percent": 41.0, "reset_at": 2_000_000_000}],
+        [
+            {
+                "label": "grok",
+                "ok": True,
+                "used_percent": 41.0,
+                "reset_at": 2_000_000_000,
+                "prepaid_balance": 0.0,
+            }
+        ],
     )[0]
     assert row == {
         "provider": "grok",
         "account": None,
-        "remaining": "59%",
+        "remaining": "59% · prepaid=0",
         "reset_at": 2_000_000_000.0,
         "flags": [],
     }
@@ -775,10 +786,195 @@ def test_grok_reader_failure_never_renders_as_headroom():
     assert not str(row["remaining"]).endswith("%")
 
     exhausted = usage.normalize_payload(
-        spec, [{"label": "grok", "ok": True, "used_percent": 100.0}]
+        spec,
+        [
+            {
+                "label": "grok",
+                "ok": True,
+                "used_percent": 100.0,
+                "prepaid_balance": 0.0,
+            }
+        ],
     )[0]
-    assert exhausted["remaining"] == "0%"
+    assert exhausted["remaining"] == "0% · prepaid=0"
     assert exhausted["flags"] == ["walled"]
+
+
+def test_grok_bundled_reader_is_fallback_when_operator_zone_is_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """run_reader: missing operator candidate -> bundled file -> normalized row."""
+    spec = next(spec for spec in usage.READERS if spec.key == "grok")
+    invoked_paths = []
+
+    def fake_run(argv, **kwargs):
+        del kwargs
+        invoked_paths.append(Path(argv[1]))
+        return usage.subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout=json.dumps(
+                [
+                    {
+                        "label": "grok",
+                        "ok": True,
+                        "used_percent": 10.0,
+                        "prepaid_balance": 0.0,
+                    }
+                ]
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(usage.subprocess, "run", fake_run)
+    rows = usage.run_reader(spec, readers_dir=tmp_path / "absent-operator-zone")
+
+    assert invoked_paths == [REPO_ROOT / "scripts" / "grok_usage.py"]
+    assert rows[0]["remaining"] == "90% · prepaid=0"
+
+
+def test_operator_grok_reader_shadows_bundled_reader(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """run_reader: present operator candidate wins before bundled fallback."""
+    spec = next(spec for spec in usage.READERS if spec.key == "grok")
+    shadow = tmp_path / spec.filename
+    shadow.write_text("# operator shadow\n", encoding="utf-8")
+    invoked_paths = []
+
+    def fake_run(argv, **kwargs):
+        del kwargs
+        invoked_paths.append(Path(argv[1]))
+        return usage.subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout=json.dumps(
+                [
+                    {
+                        "label": "grok",
+                        "ok": True,
+                        "used_percent": 20.0,
+                        "prepaid_balance": 0.0,
+                    }
+                ]
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(usage.subprocess, "run", fake_run)
+    rows = usage.run_reader(spec, readers_dir=tmp_path)
+
+    assert invoked_paths == [shadow]
+    assert rows[0]["remaining"] == "80% · prepaid=0"
+
+
+@pytest.mark.parametrize("reader_key", ["codex", "kimi", "cursor", "claude"])
+def test_ext_only_readers_stay_unavailable_without_operator_zone(
+    tmp_path: Path, reader_key: str
+) -> None:
+    """run_reader: both candidates absent -> the provider's unavailable row."""
+    spec = next(spec for spec in usage.READERS if spec.key == reader_key)
+
+    assert usage.run_reader(spec, readers_dir=tmp_path / "absent-operator-zone") == [
+        usage.unavailable_row(spec.provider)
+    ]
+
+
+@pytest.mark.parametrize(
+    ("used_percent", "prepaid_balance", "expected_walled"),
+    [
+        (100.0, 25.0, False),
+        (100.0, 0.0, True),
+        (100.0, None, True),
+        (99.0, None, False),
+    ],
+)
+def test_grok_prepaid_balance_controls_wall_without_collapsing_unknown(
+    used_percent: float,
+    prepaid_balance: float | None,
+    expected_walled: bool,
+) -> None:
+    """normalize_payload: reader values -> grok's tri-state wall predicate."""
+    spec = next(spec for spec in usage.READERS if spec.key == "grok")
+    row = usage.normalize_payload(
+        spec,
+        [
+            {
+                "label": "grok",
+                "ok": True,
+                "used_percent": used_percent,
+                "prepaid_balance": prepaid_balance,
+            }
+        ],
+    )[0]
+
+    assert ("walled" in row["flags"]) is expected_walled
+    expected_balance = (
+        "unknown" if prepaid_balance is None else str(int(prepaid_balance))
+    )
+    assert f"prepaid={expected_balance}" in row["remaining"]
+
+
+def test_non_grok_prepaid_balance_uses_generic_wall_and_display_path() -> None:
+    """codex reader record -> generic post-normalization balance handling."""
+    spec = next(spec for spec in usage.READERS if spec.key == "codex")
+    row = usage.normalize_payload(
+        spec,
+        [
+            {
+                "seat": "future-hybrid-seat",
+                "ok": True,
+                "used_percent": 100.0,
+                "prepaid_balance": 25.0,
+            }
+        ],
+    )[0]
+
+    assert row["flags"] == []
+    assert row["remaining"] == "0% · prepaid=25"
+    assert "0% · prepaid=25" in usage.render_table([row], now=2_000_000_000)
+
+
+def test_probe_reading_shows_the_deciding_balance_and_omits_spend_attribution() -> None:
+    """reader record -> normalized remaining -> existing PROBE READING column.
+
+    Only the balance earns a place in the row. `product_usage` percentages are
+    shares of one already-spent budget and sum to 100 (measured: GrokBuild 95,
+    GrokVoice 3, GrokChat 2) -- a receipt for where consumed credit went, not
+    per-product headroom. Rendering it next to a remaining-percent column reads
+    as "one lane is nearly spent, the others are free" when there is one budget
+    and it is gone. `on_demand_*` drives no verdict either.
+
+    Asserted as substrings, not as one exact line: the column pads to the widest
+    row, so an exact-string assertion passes with the full fleet and fails on a
+    single row, which is how the earlier version of this test broke.
+    """
+    spec = next(spec for spec in usage.READERS if spec.key == "grok")
+    row = usage.normalize_payload(
+        spec,
+        [
+            {
+                "label": "grok",
+                "ok": True,
+                "used_percent": 100.0,
+                "prepaid_balance": 0.0,
+                "on_demand_cap": 0.0,
+                "on_demand_used": 0.0,
+                "product_usage": {
+                    "GrokBuild": 95.0,
+                    "GrokVoice": 3.0,
+                    "GrokChat": 2.0,
+                },
+            }
+        ],
+    )[0]
+
+    rendered = usage.render_table([row], now=2_000_000_000)
+    assert "0% · prepaid=0" in rendered
+    assert "⛔wall" in rendered, "a zero balance must not clear the wall"
+    for omitted in ("components", "GrokBuild", "GrokVoice", "GrokChat", "on_demand"):
+        assert omitted not in rendered, f"{omitted} must not reach the row"
+    assert "PROVIDER/ACCOUNT  PROBE READING" in rendered
 
 
 def test_grok_is_registered_in_readers_and_normalizers():

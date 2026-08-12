@@ -26,7 +26,8 @@ DEFAULT_TIMEOUT_S = 20.0
 # fake failure. This bound exists only to stop a genuine hang, not to pace the
 # work - size it far above the observed worst case.
 DEEP_TIMEOUT_S = 900.0
-DEFAULT_READERS_DIR = Path(__file__).resolve().parent / "ext"
+PACKAGE_READERS_DIR = Path(__file__).resolve().parent
+DEFAULT_READERS_DIR = PACKAGE_READERS_DIR / "ext"
 
 
 @dataclass(frozen=True)
@@ -263,6 +264,40 @@ def _usage_remaining(
     if remaining is not None:
         return _format_number(remaining), remaining, used_percent
     return None, None, used_percent
+
+
+def _apply_reported_headroom(
+    row: dict[str, object], record: Mapping[str, Any]
+) -> None:
+    """Apply optional cross-provider headroom fields to a normalized row."""
+    details = []
+    if "prepaid_balance" in record:
+        prepaid_balance = _number(record.get("prepaid_balance"))
+        if prepaid_balance is not None and prepaid_balance > 0:
+            flags = row.get("flags")
+            if isinstance(flags, list):
+                row["flags"] = [flag for flag in flags if flag != "walled"]
+        details.append(
+            "prepaid="
+            + (
+                "unknown"
+                if prepaid_balance is None
+                else _format_number(prepaid_balance)
+            )
+        )
+
+    # `product_usage` is deliberately NOT rendered. Its percentages are shares of
+    # one already-spent budget and sum to 100 (measured 2026-08-11: GrokBuild 95,
+    # GrokVoice 3, GrokChat 2) -- a receipt for where consumed credit went, not
+    # per-product headroom. Printing it beside a remaining-percent column invites
+    # exactly the wrong reading: "GrokBuild 95%" next to "0%" looks like one lane
+    # is nearly spent while others are free, when in truth there is one budget and
+    # it is gone. It answers no dispatch question, so it stays out of the row; the
+    # reader still carries it for anyone querying --json deliberately.
+
+    if details:
+        remaining = str(row.get("remaining") or "unknown")
+        row["remaining"] = " · ".join((remaining, *details))
 
 
 def _normalize_codex(record: Mapping[str, Any], now: float) -> dict[str, object]:
@@ -575,6 +610,7 @@ def normalize_payload(
         if not isinstance(record, Mapping):
             continue
         row = normalizer(record, current_time)
+        _apply_reported_headroom(row, record)
         for key in ("probed_at", "measured_at", "checked_at", "updated_at"):
             observed_at = parse_reset(record.get(key))
             if observed_at is not None:
@@ -593,10 +629,13 @@ def run_reader(
     deep: bool = False,
 ) -> list[dict[str, object]]:
     """Run one optional reader; every failure becomes one unavailable row."""
+    # Operator-local variants intentionally shadow readers bundled with the package.
     reader_path = readers_dir / spec.filename
     try:
         if not reader_path.is_file():
-            return [unavailable_row(spec.provider)]
+            reader_path = PACKAGE_READERS_DIR / spec.filename
+            if not reader_path.is_file():
+                return [unavailable_row(spec.provider)]
         completed = subprocess.run(
             [sys.executable, str(reader_path), "--json", *spec.args_for(deep)],
             capture_output=True,
