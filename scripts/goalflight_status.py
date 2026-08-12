@@ -736,6 +736,7 @@ def _dashboard_status_row(record: dict) -> dict:
         "stdout_path": record.get("stdout_path"),
         "stderr_path": record.get("stderr_path"),
         "status_path": record.get("status_path"),
+        "os_sandbox": record.get("os_sandbox"),
         "started_at": record.get("started_at"),
         "ended_at": record.get("ended_at"),
         "updated_at": record.get("updated_at"),
@@ -909,6 +910,7 @@ def dashboard_status_payload(project_root: str | Path | None) -> dict:
                 "tail_last_line": _last_nonempty_tail_line(tail_path),
                 "marker": marker,
                 "status_path": record.get("status_path"),
+                "os_sandbox": record.get("os_sandbox"),
             }
         )
     return {
@@ -1099,9 +1101,20 @@ def _dispatch_cells(record: dict) -> str:
     cls = record.get("classification") or record.get("state") or "?"
     agent = record.get("agent") or "?"
     sig = _signal(record)
-    if sig and sig != cls:
-        return f"{cls} {agent} {sig}"
-    return f"{cls} {agent}"
+    cells = f"{cls} {agent} {sig}" if sig and sig != cls else f"{cls} {agent}"
+    posture = record.get("os_sandbox")
+    if isinstance(posture, dict) and any(
+        key in posture
+        for key in ("requested_profile", "supported_profile", "enforced_profile")
+    ):
+        requested = posture.get("requested_profile") or "none"
+        supported = posture.get("supported_profile") or "none"
+        enforced = posture.get("enforced_profile") or "none"
+        cells += (
+            f" sandbox requested={requested} supported={supported} "
+            f"enforced={enforced}"
+        )
+    return cells
 
 
 def _milestone_payload(project_root: str | None) -> dict:

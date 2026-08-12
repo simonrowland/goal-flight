@@ -268,6 +268,54 @@ def _effective_read_only(args) -> bool:
     return _effective_os_sandbox(args) == "read-only"
 
 
+def _requested_os_sandbox(args) -> str | None:
+    """Return only the posture the caller asked for, not a dispatcher default."""
+    explicit = getattr(args, "os_sandbox", None)
+    if explicit in OS_SANDBOX_PROFILES:
+        return explicit
+    if getattr(args, "read_only", False):
+        return "read-only"
+    return None
+
+
+def _supported_os_sandbox_profile(args) -> str | None:
+    """Return the posture this concrete bash launch path knows how to support."""
+    if getattr(args, "worker", None):
+        return None
+    agent = str(getattr(args, "agent", ""))
+    shape = getattr(args, "shape", "bash")
+    if agent == "codex" and shape != "acp":
+        return _effective_os_sandbox(args)
+    if agent == "moonshot" and shape != "acp":
+        return OS_SANDBOX_OFF
+    return None
+
+
+def _enforced_os_sandbox_profile(args, *, worker_pid: int | None) -> str | None:
+    """Return measured launch posture; pre-launch records must remain unset."""
+    if worker_pid is None or getattr(args, "worker", None):
+        return None
+    agent = str(getattr(args, "agent", ""))
+    shape = getattr(args, "shape", "bash")
+    if agent == "codex" and shape != "acp":
+        return _effective_os_sandbox(args)
+    if agent == "moonshot" and shape != "acp":
+        return OS_SANDBOX_OFF
+    return None
+
+
+def _os_sandbox_posture(args, *, worker_pid: int | None) -> dict:
+    """Keep request, support, and observed enforcement as separate facts."""
+    return {
+        "shape": getattr(args, "shape", "bash"),
+        "requested_profile": _requested_os_sandbox(args),
+        "supported_profile": _supported_os_sandbox_profile(args),
+        "enforced_profile": _enforced_os_sandbox_profile(
+            args, worker_pid=worker_pid
+        ),
+    }
+
+
 def _validate_os_sandbox_conflict(args) -> None:
     explicit = getattr(args, "os_sandbox", None)
     if explicit and getattr(args, "read_only", False) and explicit != "read-only":
@@ -333,9 +381,10 @@ def _validate_os_sandbox_boundary(args) -> None:
 def _validate_agent_os_sandbox(args) -> None:
     profile = _effective_os_sandbox(args)
     if str(getattr(args, "agent", "")) == "moonshot" and profile != OS_SANDBOX_OFF:
-        raise DispatchUsageError(
+        raise UnsupportedAgentSandboxRequest(
             f"--agent moonshot supports only --os-sandbox {OS_SANDBOX_OFF}; "
-            f"requested profile {profile!r} is not enforced (b-079)"
+            f"requested profile {profile!r} is not enforced and cannot be enforced; "
+            "refusing before launch (b-079)"
         )
 
 
@@ -596,6 +645,10 @@ STEER_ACK_RE = goalflight_terminal.STEER_ACK_RE
 
 class DispatchUsageError(Exception):
     pass
+
+
+class UnsupportedAgentSandboxRequest(DispatchUsageError):
+    """A requested sandbox posture is outside the selected launch path."""
 
 
 def _detached_popen_kwargs() -> dict:
@@ -2030,8 +2083,8 @@ def _validate_before_side_effects(args, raw_argv: list[str]) -> None:
     if args.prompt_file and not Path(args.prompt_file).expanduser().exists():
         raise DispatchUsageError(f"prompt file not found: {args.prompt_file}")
     _validate_os_sandbox_conflict(args)
-    _validate_os_sandbox_boundary(args)
     _validate_agent_os_sandbox(args)
+    _validate_os_sandbox_boundary(args)
     _guard_read_only_write_prompt(args)
     _guard_grok_code_research_prompt(args)
 
@@ -3286,7 +3339,10 @@ def _record_ledger(args, *, project_root: Path, prompt_path: str | None, status_
                 stdout_path=str(tail),
                 stderr_path=None,
                 status_path=str(status_json),
-                os_sandbox_json=json.dumps({"shape": "bash", "read_only": bool(args.read_only), "os_sandbox_profile": _effective_os_sandbox(args)}, sort_keys=True),
+                os_sandbox_json=json.dumps(
+                    _os_sandbox_posture(args, worker_pid=worker_pid),
+                    sort_keys=True,
+                ),
                 queue_launch_token=getattr(args, "queue_launch_token", None),
                 detached=bool(getattr(args, "launch_detached", False)),
                 state=state,
@@ -3328,7 +3384,7 @@ def _record_queued_ledger_fast(args, *, project_root: Path, prompt_path: str | N
         "stdout_path": str(tail),
         "stderr_path": None,
         "status_path": str(status_json),
-        "os_sandbox": {"shape": args.shape, "read_only": bool(args.read_only), "os_sandbox_profile": _effective_os_sandbox(args)},
+        "os_sandbox": _os_sandbox_posture(args, worker_pid=None),
         "state": "queued",
         "terminal_state": goalflight_ledger.terminal_state_for("queued"),
         "started_at": now,
@@ -3369,6 +3425,7 @@ def _record_queued_status(args, *, project_root: Path, status_json: Path, tail: 
             "worker_pid": None,
             "worker_alive": False,
             "tail_path": str(tail),
+            "os_sandbox": _os_sandbox_posture(args, worker_pid=None),
             "updated_at": int(time.time()),
         },
     )
@@ -3381,6 +3438,56 @@ def _record_queued_status(args, *, project_root: Path, status_json: Path, tail: 
     )
     _export_dashboard_status_for_project(project_root)
     _start_dashboard_refresh_for_project(project_root)
+
+
+def _record_unsupported_sandbox_rejection(
+    args, error: UnsupportedAgentSandboxRequest
+) -> int:
+    """Persist an honest terminal audit row without launching or taking capacity."""
+    base = _dispatch_base_dir()
+    if not args.dispatch_id:
+        args.dispatch_id = _reserve_auto_dispatch_id(args.agent, base)
+    _refuse_reused_dispatch_id_for_launch(args.dispatch_id)
+    tail = Path(args.tail) if args.tail else base / f"{args.dispatch_id}.tail"
+    status_json = (
+        Path(args.status_json)
+        if args.status_json
+        else base / f"{args.dispatch_id}.status.json"
+    )
+    project_root = _project_root(args)
+    reason = str(error)
+    posture = _os_sandbox_posture(args, worker_pid=None)
+    write_status(
+        status_json,
+        {
+            "dispatch_id": args.dispatch_id,
+            "agent": args.agent,
+            "state": "blocked_os_sandbox",
+            "reason": reason,
+            "project_root": str(project_root),
+            "worker_pid": None,
+            "worker_alive": False,
+            "tail_path": str(tail),
+            "os_sandbox": posture,
+            "updated_at": int(time.time()),
+        },
+    )
+    _record_ledger(
+        args,
+        project_root=project_root,
+        prompt_path=(
+            str(Path(args.prompt_file).expanduser()) if args.prompt_file else None
+        ),
+        status_json=status_json,
+        tail=tail,
+        lease_id=None,
+        worker_pid=None,
+        state="blocked_os_sandbox",
+    )
+    _finish_ledger(args.dispatch_id, "blocked_os_sandbox", reason, elapsed_s=0.0)
+    _export_dashboard_status_for_project(project_root)
+    print(f"goalflight_dispatch: {reason}", file=sys.stderr)
+    return 64
 
 
 def _insert_before_worker_remainder(argv: list[str], additions: list[str]) -> list[str]:
@@ -9297,6 +9404,12 @@ def main(argv: list[str] | None = None) -> int:
         _validate_before_side_effects(args, raw)
         dispatch_warnings = _dispatch_warnings(args, raw)
         account_env = _resolve_account_env(args)
+    except UnsupportedAgentSandboxRequest as e:
+        try:
+            return _record_unsupported_sandbox_rejection(args, e)
+        except DispatchUsageError as record_error:
+            print(f"goalflight_dispatch: {record_error}", file=sys.stderr)
+            return 64
     except DispatchUsageError as e:
         print(f"goalflight_dispatch: {e}", file=sys.stderr)
         return 64

@@ -136,6 +136,9 @@ function workerRow(overrides) {
     shape: "acp",
     transport: "acp",
     os_sandbox: "workspace-write",
+    os_sandbox_requested: null,
+    os_sandbox_supported: null,
+    os_sandbox_enforced: null,
     state: "running",
     classification: "expected_live",
     terminal_state: null,
@@ -519,6 +522,26 @@ print(json.dumps({
     !agents.includes("must-not-be-agent"),
     wires.includes("unknown"),
     !wires.includes("must-not-be-transport"),
+  ].every(Boolean));
+}
+
+// Sandbox request, support, and observed enforcement stay visibly independent.
+{
+  const row = workerRow({
+    dispatch_id: "sandbox-refused",
+    os_sandbox_requested: "read-only",
+    os_sandbox_supported: "off",
+    os_sandbox_enforced: null,
+  });
+  const fleet = fleetPayload({
+    vendors: [],
+    projects: [projectRow([row])],
+  });
+  const { byId } = loadConsole(fleet, attentionPayload({ items: [] }));
+  const wires = descendants(byId.fleet).filter((node) => node.className === "wire").map((node) => node.textContent);
+  assert("sandbox posture renders requested supported enforced separately", [
+    wires.includes("acp sandbox req=read-only sup=off enf=unknown"),
+    !wires.includes("acp ro"),
   ].every(Boolean));
 }
 

@@ -141,6 +141,9 @@ FLEET_FIELD_ALLOWLIST: dict[str, Any] = {
                 "shape": None,
                 "transport": None,
                 "os_sandbox": None,
+                "os_sandbox_requested": None,
+                "os_sandbox_supported": None,
+                "os_sandbox_enforced": None,
                 "state": None,
                 "classification": None,
                 "terminal_state": None,
@@ -201,6 +204,9 @@ FLEET_FIELD_ALLOWLIST: dict[str, Any] = {
                     "shape": None,
                     "transport": None,
                     "os_sandbox": None,
+                    "os_sandbox_requested": None,
+                    "os_sandbox_supported": None,
+                    "os_sandbox_enforced": None,
                     "state": None,
                     "classification": None,
                     "terminal_state": None,
@@ -233,6 +239,9 @@ FLEET_FIELD_ALLOWLIST: dict[str, Any] = {
             "shape": None,
             "transport": None,
             "os_sandbox": None,
+            "os_sandbox_requested": None,
+            "os_sandbox_supported": None,
+            "os_sandbox_enforced": None,
             "state": None,
             "classification": None,
             "terminal_state": None,
@@ -651,6 +660,8 @@ def _worker_row(
     started_at = _iso_timestamp(record.get("started_at"))
     verdict = _worker_display_verdict(record)
     observed_live = _worker_observed_live_fields(record, sampled_at=sampled_at)
+    os_sandbox = record.get("os_sandbox")
+    sandbox_posture = os_sandbox if isinstance(os_sandbox, dict) else {}
     return {
         "dispatch_id": _display(record.get("dispatch_id"), limit=128),
         "node_id": _display(node_id, limit=96),
@@ -659,6 +670,15 @@ def _worker_row(
         "shape": _display(record.get("shape"), limit=64),
         "transport": _display(record.get("transport"), limit=64),
         "os_sandbox": _display(record.get("os_sandbox"), limit=32),
+        "os_sandbox_requested": _display(
+            sandbox_posture.get("requested_profile"), limit=32
+        ),
+        "os_sandbox_supported": _display(
+            sandbox_posture.get("supported_profile"), limit=32
+        ),
+        "os_sandbox_enforced": _display(
+            sandbox_posture.get("enforced_profile"), limit=32
+        ),
         "state": _display(record.get("state"), limit=64),
         "classification": _display(record.get("classification"), limit=64),
         "terminal_state": _display(record.get("terminal_state"), limit=64),

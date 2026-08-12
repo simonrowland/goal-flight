@@ -919,9 +919,22 @@ def cmd_status(args: argparse.Namespace) -> int:
         return 0
     print(f"dispatch ledger: {payload['state_dir']}")
     for row in payload["records"][: args.limit]:
+        posture = row.get("os_sandbox")
+        sandbox = ""
+        if isinstance(posture, dict) and any(
+            key in posture
+            for key in ("requested_profile", "supported_profile", "enforced_profile")
+        ):
+            sandbox = (
+                " sandbox"
+                f" requested={posture.get('requested_profile') or 'none'}"
+                f" supported={posture.get('supported_profile') or 'none'}"
+                f" enforced={posture.get('enforced_profile') or 'none'}"
+            )
         print(
             f"- {row['classification']}: {row.get('dispatch_id')} "
-            f"agent={row.get('agent')} pid={row.get('worker_pid')} state={row.get('state')}"
+            f"agent={row.get('agent')} pid={row.get('worker_pid')} "
+            f"state={row.get('state')}{sandbox}"
         )
     if payload["surplus_processes"]:
         print("surplus worker-like processes:")

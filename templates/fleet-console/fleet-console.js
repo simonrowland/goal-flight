@@ -214,7 +214,14 @@
       var identity = el("div");
       identity.appendChild(el("div", "agent", textValue(worker.agent)));
       var wire = el("div", "wire", textValue(worker.transport));
-      if (worker.os_sandbox === "read-only") wire.appendChild(el("b", null, " ro"));
+      if (worker.os_sandbox_requested || worker.os_sandbox_supported || worker.os_sandbox_enforced) {
+        wire.appendChild(el("b", null,
+          " sandbox req=" + textValue(worker.os_sandbox_requested) +
+          " sup=" + textValue(worker.os_sandbox_supported) +
+          " enf=" + textValue(worker.os_sandbox_enforced)));
+      } else if (worker.os_sandbox === "read-only") {
+        wire.appendChild(el("b", null, " ro"));
+      }
       identity.appendChild(wire);
       row.appendChild(identity);
       row.appendChild(el("div", "controller-id " + textValue(worker.controller_state),
