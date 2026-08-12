@@ -9696,6 +9696,40 @@ def main(argv: list[str] | None = None) -> int:
         ) == "grok":
             env.pop("GROK_API_KEY", None)
             env.pop("XAI_API_KEY", None)
+        if _account_engine(args.agent) == "grok":
+            # Grok refuses an untrusted cwd by exiting in seconds with nothing on
+            # stdout, which through the dispatcher is indistinguishable from a
+            # worker that launched and died. A per-account home starts with an
+            # EMPTY trust list and every worktree is its own directory, so a
+            # controller dispatching into a fresh worktree hits this every time.
+            # Register the cwd we are about to hand the worker -- the operator
+            # already chose it; the alternative is a silent death.
+            # One handler, and it must not reference a name bound inside the
+            # try: if the import fails, evaluating `except grok_seats.X` raises
+            # NameError THROUGH the remaining handlers and kills the dispatch,
+            # which is the one thing this block may never do.
+            try:
+                import grok_seats
+
+                added = grok_seats.ensure_project_trusted(
+                    Path(env.get("HOME") or Path.home()), _project_root(args)
+                )
+                if added:
+                    print(
+                        "goalflight_dispatch: registered "
+                        f"{_project_root(args)} as grok-trusted for this worker home",
+                        file=sys.stderr,
+                    )
+            except BaseException as exc:
+                detail = (
+                    str(exc)
+                    if type(exc).__name__ == "TrustRefused"
+                    else f"{type(exc).__name__}; worker may exit immediately"
+                )
+                print(
+                    f"goalflight_dispatch: WARN: grok folder trust not registered: {detail}",
+                    file=sys.stderr,
+                )
         if args.account and _account_engine(args.agent) == "cursor":
             env.pop("CURSOR_API_KEY", None)
         if args.billing == "sub" and _account_engine(args.agent) == "codex":

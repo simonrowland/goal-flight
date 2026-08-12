@@ -162,3 +162,69 @@ def test_refresh_records_every_account_including_unreachable_ones(
     # a reader that raised must be recorded as unusable, not dropped silently
     assert document["seats"]["seat"]["ok"] is False
     assert json.loads(path.read_text())["seats"]["seat"]["ok"] is False
+
+
+# --- folder trust -------------------------------------------------------
+
+def test_trust_guard_refuses_paths_that_are_too_broad(tmp_path: Path) -> None:
+    """Root, home, and top-level system dirs are never a project.
+
+    /tmp is checked in its LITERAL form on purpose: resolving first would turn
+    it into /private/tmp on macOS, which has enough segments to look like a real
+    project while being the same system directory.
+    """
+    for bad in ("/", str(Path.home()), "/tmp", "/usr", "/etc"):
+        with pytest.raises(seats.TrustRefused):
+            seats._trust_guard(Path(bad))
+
+
+def test_ensure_project_trusted_appends_once_and_is_idempotent(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    (home / ".grok").mkdir(parents=True)
+    project = tmp_path / "repos" / "widget"
+    project.mkdir(parents=True)
+
+    assert seats.ensure_project_trusted(home, project) is True
+    assert seats.ensure_project_trusted(home, project) is False, "must not double-append"
+
+    text = (home / ".grok" / "trusted_folders.toml").read_text()
+    assert text.count(f'[folders."{project.resolve()}"]') == 1
+    assert "trusted = true" in text
+    assert seats.is_project_trusted(home, project) is True
+
+
+def test_trust_entry_is_not_glued_onto_a_file_without_a_trailing_newline(
+    tmp_path: Path,
+) -> None:
+    """The entry's LEADING newline is what prevents this.
+
+    Without it, a file not ending in a newline gets the new table header glued
+    onto its last line, where it parses as something else entirely."""
+    home = tmp_path / "home"
+    (home / ".grok").mkdir(parents=True)
+    trust = home / ".grok" / "trusted_folders.toml"
+    trust.write_text('[folders."/Users/x/a"]\ntrusted = true')  # no trailing newline
+    project = tmp_path / "b"
+    project.mkdir()
+
+    seats.ensure_project_trusted(home, project)
+    text = trust.read_text()
+    assert 'trusted = true[folders.' not in text
+    for line in text.splitlines():
+        assert not (line.startswith("[folders.") and not line.endswith("]"))
+
+
+def test_a_second_project_does_not_disturb_the_first(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    (home / ".grok").mkdir(parents=True)
+    first, second = tmp_path / "one", tmp_path / "two"
+    first.mkdir(); second.mkdir()
+    seats.ensure_project_trusted(home, first)
+    seats.ensure_project_trusted(home, second)
+    assert seats.is_project_trusted(home, first)
+    assert seats.is_project_trusted(home, second)
+
+
+def test_untrusted_home_reports_false_without_raising(tmp_path: Path) -> None:
+    """A home with no grok config at all must answer False, not explode."""
+    assert seats.is_project_trusted(tmp_path / "nothing", tmp_path) is False

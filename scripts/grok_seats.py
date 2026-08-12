@@ -54,6 +54,84 @@ def _now() -> float:
     return time.time()
 
 
+class TrustRefused(ValueError):
+    """A trust target that must never be registered."""
+
+
+def _trust_guard(project_root: Path) -> Path:
+    """Return the resolved project path, or raise if it is too broad to trust.
+
+    Mirrors the guards in install-codex-overrides.sh. These hold even though a
+    grok trust key looks like an exact folder: registering root or a home
+    directory is never the intent, and if grok ever matches by prefix such an
+    entry would be a standing grant over everything beneath it.
+    """
+    literal = Path(project_root).expanduser()
+    resolved = literal.resolve()
+    for candidate in (literal, resolved):
+        if candidate == Path(candidate.anchor):
+            raise TrustRefused(f"refusing to trust the filesystem root: {candidate}")
+        if candidate == Path.home() or candidate == Path.home().resolve():
+            raise TrustRefused(f"refusing to trust the home directory: {candidate}")
+        # Single-segment paths under root (/tmp, /usr, /etc) are system
+        # directories. Both forms are checked because resolving first would
+        # smuggle them past: on macOS /tmp resolves to /private/tmp, which has
+        # enough segments to look like a real project while being the same
+        # system directory. The literal form is what the operator typed and is
+        # the honest thing to judge.
+        if len(candidate.parts) < 3:
+            raise TrustRefused(f"refusing to trust a top-level system path: {candidate}")
+    return resolved
+
+
+def is_project_trusted(home_dir: Path, project_root: Path) -> bool:
+    trust_file = Path(home_dir) / ".grok" / "trusted_folders.toml"
+    try:
+        text = trust_file.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return False
+    return f'[folders."{_trust_guard(project_root)}"]' in text
+
+
+def ensure_project_trusted(home_dir: Path, project_root: Path) -> bool:
+    """Register project_root as trusted in home_dir's grok config, idempotently.
+
+    Returns True if an entry was added, False if it was already present.
+
+    Grok refuses to operate in a directory it has not been told to trust, and it
+    exits within seconds writing nothing at all -- through the dispatcher that
+    looks exactly like a worker that launched and died, with an empty tail and
+    no error to read. A freshly created per-account home starts with an EMPTY
+    trust list, so every seat hits this in every repo until registered, and any
+    worktree counts as its own directory.
+
+    Registering the directory the operator is explicitly dispatching INTO is not
+    a widening of what the worker may touch: it is the cwd they chose, and the
+    only alternative is a worker that dies without saying why. The guards above
+    still refuse anything broader than a specific project.
+    """
+    resolved = _trust_guard(project_root)
+    trust_file = Path(home_dir) / ".grok" / "trusted_folders.toml"
+    if is_project_trusted(home_dir, resolved):
+        return False
+    trust_file.parent.mkdir(parents=True, exist_ok=True)
+    # The LEADING newline is load-bearing: without it a file that does not end
+    # in a newline would have the new table header glued onto its last line,
+    # where it parses as something else entirely. It is unconditional because a
+    # spare blank line between entries is harmless while a missing one is not.
+    entry = (
+        f'\n[folders."{resolved}"]\n'
+        f"trusted = true\ndecided_at = {int(_now())}\n"
+    )
+    with trust_file.open("a", encoding="utf-8") as handle:
+        handle.write(entry)
+    try:
+        os.chmod(trust_file, 0o600)
+    except OSError:
+        pass
+    return True
+
+
 def load_states(path: Path = STATE_PATH) -> dict | None:
     """Return the cached probe document, or None if absent/unusable."""
     try:
