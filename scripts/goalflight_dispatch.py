@@ -2939,26 +2939,59 @@ def _cursor_account_probe(env: dict[str, str]) -> tuple[bool, str | None]:
     return False, combined[-400:] or f"cursor-agent status exited {proc.returncode}"
 
 
+_GROK_SELECTION_UNSET = object()
+
+
+def grok_selected_account(args) -> str | None:
+    """The grok seat auto-selected for an UNPINNED dispatch, or None for host.
+
+    Mirrors what codex already does through the active-seat pointer: an unpinned
+    dispatch still lands on a seat with headroom, while ``args.account`` stays
+    None so the ledger records `account: "default"` (nothing was pinned) beside
+    `effective_account: <seat>` (what actually got billed). Overwriting
+    args.account instead would erase the difference between an operator pinning
+    a seat and this picking one.
+
+    Memoized on args: selection may refresh a cached probe, and two calls that
+    straddled a refresh could disagree about which seat the dispatch used.
+    """
+    cached = getattr(args, "_grok_selected_account", _GROK_SELECTION_UNSET)
+    if cached is not _GROK_SELECTION_UNSET:
+        return cached
+    selected = None
+    if not getattr(args, "account", None) and _account_engine(args.agent) == "grok":
+        try:
+            import grok_seats
+
+            selected = grok_seats.select_seat()
+        except BaseException:
+            # Selection is an optimisation; never let it fail a dispatch.
+            selected = None
+    args._grok_selected_account = selected
+    return selected
+
+
 def _resolve_account_env(args) -> dict[str, str]:
-    if not args.account:
+    account = args.account or grok_selected_account(args)
+    if not account:
         return {}
     engine = _account_engine(args.agent)
     if not engine:
         raise DispatchUsageError(
             f"--account is not configured for --agent {args.agent!r}; refusing to bill the wrong account"
         )
-    home = _account_home(args.account, engine)
+    home = _account_home(account, engine)
     if engine == "codex":
         if not home.exists():
             raise DispatchUsageError(
-                f"--account {args.account} not configured (expected {home}). "
+                f"--account {account} not configured (expected {home}). "
                 "Set that account's creds there, or omit --account for the host default. "
                 "Refusing to bill the wrong account."
             )
         return {"CODEX_HOME": str(home)}
     if not home.exists():
         raise DispatchUsageError(
-            f"--account {args.account} not configured for {engine} (expected HOME {home}). "
+            f"--account {account} not configured for {engine} (expected HOME {home}). "
             "Refusing to bill the wrong account."
         )
     env = dict(os.environ)
@@ -2969,7 +3002,7 @@ def _resolve_account_env(args) -> dict[str, str]:
         auth = home / ".grok" / "auth.json"
         if not auth.is_file() or auth.stat().st_size == 0:
             raise DispatchUsageError(
-                f"--account {args.account} lacks grok creds (expected non-empty {auth}). "
+                f"--account {account} lacks grok creds (expected non-empty {auth}). "
                 "Refusing to bill the wrong account."
             )
         return {key: env[key] for key in ("HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME")}
@@ -2978,7 +3011,7 @@ def _resolve_account_env(args) -> dict[str, str]:
         ok, reason = _cursor_account_probe(env)
         if not ok:
             raise DispatchUsageError(
-                f"--account {args.account} lacks cursor creds ({reason}). "
+                f"--account {account} lacks cursor creds ({reason}). "
                 "Refusing to bill the wrong account."
             )
         return {key: env[key] for key in ("HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME")}
@@ -9580,6 +9613,11 @@ def main(argv: list[str] | None = None) -> int:
                 if specific:
                     final_reason = f"capacity_wait:{specific}"
             raise
+        if _account_engine(args.agent) == "grok" and not args.account:
+            # Same contract as the codex pointer: args.account stays None so the
+            # ledger records "default" (nothing pinned), while effective_account
+            # names the seat this dispatch actually billed.
+            effective_account = grok_selected_account(args)
         if (
             _account_engine(args.agent) == "codex"
             and not goalflight_compat.is_windows()
@@ -9650,7 +9688,12 @@ def main(argv: list[str] | None = None) -> int:
             env["GOALFLIGHT_PROMPT_FILE"] = str(original_prompt_path)
         else:
             env.pop("GOALFLIGHT_PROMPT_FILE", None)
-        if args.account and _account_engine(args.agent) == "grok":
+        # An auto-selected seat is still a seat: the API-key scrub must key on
+        # the account actually resolved, or a GROK_API_KEY in the environment
+        # would quietly bill the API instead of the subscription seat we chose.
+        if (args.account or grok_selected_account(args)) and _account_engine(
+            args.agent
+        ) == "grok":
             env.pop("GROK_API_KEY", None)
             env.pop("XAI_API_KEY", None)
         if args.account and _account_engine(args.agent) == "cursor":
