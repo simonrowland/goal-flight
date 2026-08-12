@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+from collections import deque
 import contextlib
 import io
 import json
@@ -126,6 +127,8 @@ def _is_harness_trailer_line(stripped: str) -> bool:
 HUNK_HEADER_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@")
 PROMPT_ECHO_ANCHOR_SEARCH_LINES = 200
 PROMPT_ECHO_MAX_ANCHORS = 10
+TAIL_SCAN_CHUNK_BYTES = 64 * 1024
+TAIL_SCAN_BOUNDARY_BYTES = 64
 # CPU-sampling-failure grace (codex 2026-05-20 P2): idle_timeout exits only on
 # confirmed-idle CPU. Unavailable CPU (ps failure -> None) keeps waiting instead
 # of false-killing a healthy quiet worker. The streak still protects against
@@ -811,6 +814,405 @@ def worker_alive(pid: int | None, expected_identity: dict | None) -> tuple[bool,
     return True, "identity_inconclusive", current
 
 
+class TailScanResult:
+    __slots__ = (
+        "markers",
+        "mail_markers",
+        "terminal",
+        "size",
+        "content_bytes",
+        "validation_bytes",
+        "lines_materialized",
+        "resynced",
+        "resync_reason",
+        "fence_unbalanced",
+    )
+
+    def __init__(
+        self,
+        *,
+        markers: list[dict],
+        mail_markers: list[dict],
+        terminal: dict | None,
+        size: int,
+        content_bytes: int,
+        validation_bytes: int,
+        lines_materialized: int,
+        resynced: bool,
+        resync_reason: str | None,
+        fence_unbalanced: bool,
+    ) -> None:
+        self.markers = markers
+        self.mail_markers = mail_markers
+        self.terminal = terminal
+        self.size = size
+        self.content_bytes = content_bytes
+        self.validation_bytes = validation_bytes
+        self.lines_materialized = lines_materialized
+        self.resynced = resynced
+        self.resync_reason = resync_reason
+        self.fence_unbalanced = fence_unbalanced
+
+    def metrics(self) -> dict:
+        result = {
+            "bytes_read": self.content_bytes + self.validation_bytes,
+            "content_bytes": self.content_bytes,
+            "validation_bytes": self.validation_bytes,
+            "lines_materialized": self.lines_materialized,
+            "offset": self.size,
+            "resynced": self.resynced,
+            "fence_unbalanced": self.fence_unbalanced,
+        }
+        if self.resync_reason:
+            result["resync_reason"] = self.resync_reason
+        return result
+
+
+def _combine_tail_scan_results(first: TailScanResult, second: TailScanResult) -> TailScanResult:
+    """Combine a normal poll scan with its terminal-stability recheck."""
+
+    mail_markers: list[dict] = []
+    seen: set[tuple[object, object, object]] = set()
+    for marker in [*first.mail_markers, *second.mail_markers]:
+        key = (marker.get("line"), marker.get("kind"), marker.get("text"))
+        if key in seen:
+            continue
+        seen.add(key)
+        mail_markers.append(marker)
+    return TailScanResult(
+        markers=second.markers,
+        mail_markers=mail_markers,
+        terminal=second.terminal,
+        size=second.size,
+        content_bytes=first.content_bytes + second.content_bytes,
+        validation_bytes=first.validation_bytes + second.validation_bytes,
+        lines_materialized=first.lines_materialized + second.lines_materialized,
+        resynced=first.resynced or second.resynced,
+        resync_reason=second.resync_reason or first.resync_reason,
+        fence_unbalanced=second.fence_unbalanced,
+    )
+
+
+class _IncrementalMarkerState:
+    """Marker/fence/last-line state derived from completed tail lines."""
+
+    def __init__(self) -> None:
+        self.fence = goalflight_terminal.MarkdownFenceTracker()
+        self.all_markers: deque[dict] = deque(maxlen=20)
+        self.outside_markers: deque[dict] = deque(maxlen=20)
+        self.last_candidate: tuple[int, str, bool] | None = None
+        self.previous_candidate = ""
+
+    def clone(self) -> _IncrementalMarkerState:
+        clone = _IncrementalMarkerState()
+        clone.fence._delimiter = self.fence._delimiter
+        clone.fence._minimum_length = self.fence._minimum_length
+        clone.all_markers = deque((dict(marker) for marker in self.all_markers), maxlen=20)
+        clone.outside_markers = deque(
+            (dict(marker) for marker in self.outside_markers), maxlen=20
+        )
+        clone.last_candidate = self.last_candidate
+        clone.previous_candidate = self.previous_candidate
+        return clone
+
+    def _consume_candidate(self, line_no: int, line: str, in_fence: bool) -> None:
+        stripped = line.strip()
+        if not stripped:
+            return
+        if HARNESS_TOKEN_COUNT_RE.fullmatch(stripped):
+            if self.previous_candidate != "tokens used":
+                self.last_candidate = (line_no, line, in_fence)
+        elif stripped != "tokens used" and not _is_harness_trailer_line(stripped):
+            self.last_candidate = (line_no, line, in_fence)
+        self.previous_candidate = stripped
+
+    def consume(self, line_no: int, line: str, *, ignored: bool = False) -> tuple[dict, bool] | None:
+        if ignored:
+            return None
+
+        stripped = line.strip()
+        fence_was_open = self.fence.in_fence
+        fence_line = self.fence.consume_boundary(line)
+        line_in_fence = fence_was_open or self.fence.in_fence
+        self._consume_candidate(line_no, line, line_in_fence)
+        if fence_line:
+            return None
+
+        marker: dict | None = None
+        match = MARKER_RE.match(stripped)
+        if match and not goalflight_terminal.marker_is_template_example(
+            match.group(1), match.group(2)
+        ):
+            marker = {
+                "line": line_no,
+                "kind": match.group(1),
+                "text": match.group(2)[:1000],
+            }
+        if marker is None:
+            marker = _completion_signoff_marker(stripped, line_no)
+        if marker is None:
+            return None
+
+        self.all_markers.append(marker)
+        if not line_in_fence:
+            self.outside_markers.append(marker)
+        return marker, line_in_fence
+
+    def visible_markers(self) -> list[dict]:
+        source = self.all_markers if self.fence.in_fence else self.outside_markers
+        return [dict(marker) for marker in source]
+
+    def terminal(self, *, kimi_output: bool) -> dict | None:
+        if self.last_candidate is None:
+            return None
+        line_no, line, candidate_in_fence = self.last_candidate
+        if candidate_in_fence and not self.fence.in_fence:
+            return None
+        return _final_terminal_marker_from_line(
+            line,
+            line_no,
+            allow_prefixed_marker=True,
+            kimi_output=kimi_output,
+        )
+
+
+class IncrementalTailScanner:
+    """Scan only appended tail bytes while retaining marker context.
+
+    The bounded prompt prefix is retained until echo classification can no
+    longer change. Fence and last-nonempty-line state then advance one complete
+    line at a time. An unfinished physical line stays as bytes and is previewed
+    without committing it, so a marker split across polls is neither lost nor
+    duplicated when its newline eventually arrives.
+    """
+
+    def __init__(self, path: Path, ignore_prefix_lines: list[str] | None = None) -> None:
+        self.path = path
+        self.prompt_prefix = ignore_prefix_lines or []
+        self._prompt_has_anchors = bool(_prompt_echo_anchor_indices(self.prompt_prefix))
+        self._prompt_record_limit = PROMPT_ECHO_ANCHOR_SEARCH_LINES + len(self.prompt_prefix)
+        self._identity: tuple[int, int] | None = None
+        self._mtime_ns: int | None = None
+        self._offset = 0
+        self._boundary = b""
+        self._partial = bytearray()
+        self._next_line_no = 1
+        self._prompt_stable = not self._prompt_has_anchors
+        self._prompt_records: list[tuple[int, str]] = []
+        self._state = _IncrementalMarkerState()
+
+    def _reset_content_state(self) -> None:
+        self._offset = 0
+        self._boundary = b""
+        self._partial = bytearray()
+        self._next_line_no = 1
+        self._prompt_stable = not self._prompt_has_anchors
+        self._prompt_records = []
+        self._state = _IncrementalMarkerState()
+
+    def _parse_prompt_records(
+        self, records: list[tuple[int, str]]
+    ) -> tuple[_IncrementalMarkerState, list[tuple[dict, bool]]]:
+        lines = [line for _line_no, line in records]
+        prompt_echo_lines, _anchor_found, _prompt_line_set = _prompt_echo_scan(
+            lines, self.prompt_prefix
+        )
+        state = _IncrementalMarkerState()
+        found: list[tuple[dict, bool]] = []
+        for index, (line_no, line) in enumerate(records):
+            marker = state.consume(line_no, line, ignored=index in prompt_echo_lines)
+            if marker:
+                found.append(marker)
+        return state, found
+
+    def _accept_completed_line(
+        self, line: str, scan_markers: list[tuple[dict, bool]]
+    ) -> None:
+        record = (self._next_line_no, line)
+        self._next_line_no += 1
+        if not self._prompt_stable:
+            self._prompt_records.append(record)
+            if len(self._prompt_records) >= self._prompt_record_limit:
+                self._state, rebuilt = self._parse_prompt_records(self._prompt_records)
+                scan_markers[:] = rebuilt
+                self._prompt_records = []
+                self._prompt_stable = True
+            return
+        marker = self._state.consume(*record)
+        if marker:
+            scan_markers.append(marker)
+
+    def _feed_bytes(
+        self, chunk: bytes, scan_markers: list[tuple[dict, bool]]
+    ) -> int:
+        self._partial.extend(chunk)
+        line_start = 0
+        line_count = 0
+        while True:
+            newline = self._partial.find(b"\n", line_start)
+            if newline < 0:
+                break
+            raw_line = bytes(self._partial[line_start:newline])
+            if raw_line.endswith(b"\r"):
+                raw_line = raw_line[:-1]
+            self._accept_completed_line(
+                raw_line.decode("utf-8", errors="replace"), scan_markers
+            )
+            line_start = newline + 1
+            line_count += 1
+        if line_start:
+            del self._partial[:line_start]
+        return line_count
+
+    def _preview(
+        self, scan_markers: list[tuple[dict, bool]]
+    ) -> tuple[_IncrementalMarkerState, list[tuple[dict, bool]], int]:
+        if not self._prompt_stable:
+            records = list(self._prompt_records)
+            materialized = 0
+            if self._partial:
+                records.append(
+                    (
+                        self._next_line_no,
+                        self._partial.decode("utf-8", errors="replace"),
+                    )
+                )
+                materialized = 1
+            state, found = self._parse_prompt_records(records)
+            return state, found, materialized
+
+        state = self._state.clone()
+        found = list(scan_markers)
+        materialized = 0
+        if self._partial:
+            marker = state.consume(
+                self._next_line_no,
+                self._partial.decode("utf-8", errors="replace"),
+            )
+            if marker:
+                found.append(marker)
+            materialized = 1
+        return state, found, materialized
+
+    def scan(self, *, kimi_output: bool = False) -> TailScanResult:
+        content_bytes = 0
+        validation_bytes = 0
+        lines_materialized = 0
+        resync_reason: str | None = None
+        scan_markers: list[tuple[dict, bool]] = []
+
+        try:
+            handle = self.path.open("rb")
+        except OSError:
+            if self._identity is not None:
+                self._identity = None
+                self._mtime_ns = None
+                self._reset_content_state()
+                resync_reason = "missing"
+            state, found, preview_lines = self._preview(scan_markers)
+            lines_materialized += preview_lines
+            return self._result(
+                state,
+                found,
+                size=0,
+                content_bytes=content_bytes,
+                validation_bytes=validation_bytes,
+                lines_materialized=lines_materialized,
+                resync_reason=resync_reason,
+                kimi_output=kimi_output,
+            )
+
+        with handle:
+            opened = os.fstat(handle.fileno())
+            identity = (opened.st_dev, opened.st_ino)
+            if self._identity is None:
+                resync_reason = "initial"
+            elif identity != self._identity:
+                resync_reason = "replacement"
+            elif opened.st_size < self._offset:
+                resync_reason = "truncated"
+            elif (
+                self._offset
+                and self._boundary
+                and opened.st_mtime_ns != self._mtime_ns
+            ):
+                handle.seek(self._offset - len(self._boundary))
+                observed = handle.read(len(self._boundary))
+                validation_bytes += len(observed)
+                if observed != self._boundary:
+                    resync_reason = "boundary_rewritten"
+
+            if resync_reason is not None:
+                self._reset_content_state()
+            self._identity = identity
+            handle.seek(self._offset)
+            while True:
+                chunk = handle.read(TAIL_SCAN_CHUNK_BYTES)
+                if not chunk:
+                    break
+                content_bytes += len(chunk)
+                lines_materialized += self._feed_bytes(chunk, scan_markers)
+                self._boundary = (self._boundary + chunk)[-TAIL_SCAN_BOUNDARY_BYTES:]
+            self._offset = handle.tell()
+            final_stat = os.fstat(handle.fileno())
+            self._mtime_ns = final_stat.st_mtime_ns
+
+        if not self._prompt_stable:
+            self._state, rebuilt = self._parse_prompt_records(self._prompt_records)
+            scan_markers = rebuilt
+        state, found, preview_lines = self._preview(scan_markers)
+        lines_materialized += preview_lines
+        return self._result(
+            state,
+            found,
+            size=self._offset,
+            content_bytes=content_bytes,
+            validation_bytes=validation_bytes,
+            lines_materialized=lines_materialized,
+            resync_reason=resync_reason,
+            kimi_output=kimi_output,
+        )
+
+    def _result(
+        self,
+        state: _IncrementalMarkerState,
+        found: list[tuple[dict, bool]],
+        *,
+        size: int,
+        content_bytes: int,
+        validation_bytes: int,
+        lines_materialized: int,
+        resync_reason: str | None,
+        kimi_output: bool,
+    ) -> TailScanResult:
+        visible = state.visible_markers()
+        mail_candidates = [
+            marker
+            for marker, marker_in_fence in found
+            if state.fence.in_fence or not marker_in_fence
+        ]
+        mail_markers: list[dict] = []
+        seen: set[tuple[object, object, object]] = set()
+        for marker in [*visible, *mail_candidates]:
+            key = (marker.get("line"), marker.get("kind"), marker.get("text"))
+            if key in seen:
+                continue
+            seen.add(key)
+            mail_markers.append(dict(marker))
+        return TailScanResult(
+            markers=visible,
+            mail_markers=mail_markers,
+            terminal=state.terminal(kimi_output=kimi_output),
+            size=size,
+            content_bytes=content_bytes,
+            validation_bytes=validation_bytes,
+            lines_materialized=lines_materialized,
+            resynced=resync_reason is not None,
+            resync_reason=resync_reason,
+            fence_unbalanced=state.fence.in_fence,
+        )
+
+
 def extract_markers(path: Path, max_bytes: int = 10 * 1024 * 1024,
                     ignore_prefix_lines: list[str] | None = None) -> tuple[list[dict], int]:
     if not path.exists():
@@ -1272,6 +1674,7 @@ def main() -> int:
         write_status(status_path, payload)
         print(json.dumps({"state": payload["state"], "reason": payload["reason"], "status_path": str(status_path)}, sort_keys=True))
         return 4
+    tail_scanner = IncrementalTailScanner(tail, ignore_prefix_lines)
     last_size = -1
     trace_liveness = TraceLiveness(
         dispatch_id=args.dispatch_id,
@@ -1533,12 +1936,14 @@ def main() -> int:
     posted_mail_keys: set = set()  # per-run dedup for the worker->controller mail bridge
     posted_trace_attention: set[str] = set()
     while True:
-        markers, size = extract_markers(tail, ignore_prefix_lines=ignore_prefix_lines)
+        scan = tail_scanner.scan(kimi_output=moonshot_family(args.agent))
+        markers = scan.markers
+        size = scan.size
         # Bridge worker USER-NEED/USER-CONFIRM/BLOCKED markers into the dispatch
         # inbox so the controller's status mail hint surfaces them. Runs BEFORE the
         # terminal-exit checks below so a need is posted even on the iteration the
         # watcher resolves (these markers are themselves terminal). Best-effort.
-        post_worker_mail(args.dispatch_id, markers, posted_mail_keys)
+        post_worker_mail(args.dispatch_id, scan.mail_markers, posted_mail_keys)
         if size != last_size:
             last_size = size
             last_change = active_monotonic()
@@ -1549,21 +1954,22 @@ def main() -> int:
             now_mono=active_monotonic(),
             idle_threshold=args.max_idle_secs,
         )
-        terminal = _last_line_is_terminal_marker(
-            tail,
-            ignore_prefix_lines=ignore_prefix_lines,
-            kimi_output=moonshot_family(args.agent),
-        )
+        terminal = scan.terminal
         if terminal:
             # Stability recheck (minimal gap protection): if bytes arrive within a short
             # window after a terminal marker became the last line, it was a mid-output
             # emission; discard and keep watching. Genuine sign-off is worker's final act.
             time.sleep(0.05)
-            terminal = _last_line_is_terminal_marker(
-                tail,
-                ignore_prefix_lines=ignore_prefix_lines,
+            recheck = tail_scanner.scan(
                 kimi_output=moonshot_family(args.agent),
             )
+            scan = _combine_tail_scan_results(scan, recheck)
+            markers = scan.markers
+            terminal = scan.terminal
+            post_worker_mail(args.dispatch_id, recheck.mail_markers, posted_mail_keys)
+            if scan.size != last_size:
+                last_size = scan.size
+                last_change = active_monotonic()
         worker_is_alive, identity_reason, current_identity = worker_alive(args.pid, expected_identity)
         if worker_is_alive:
             pgid = args.pgid or process_group_id(args.pid) or pgid
@@ -1607,6 +2013,7 @@ def main() -> int:
             "seconds_since_event": seconds_since_event,
             "liveness_state": liveness_state,
             "tail_path": str(tail),
+            "tail_scan": scan.metrics(),
             "markers": markers[-20:],
             "last_marker": markers[-1] if markers else None,
             "terminal_marker": terminal,
