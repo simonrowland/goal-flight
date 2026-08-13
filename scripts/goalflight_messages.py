@@ -2710,6 +2710,11 @@ def controller_mail_summary(
         "count": len(items),
         "needs": items,
         "hint": hint,
+        # The caller's own identity, already resolved above. Exposed so the
+        # listener reminder can ask "does THIS controller have a listener"
+        # rather than "does anything on this project", which would tell one
+        # controller it is covered by a sibling's listener.
+        "controller_label": controller_label,
     }
     if carrier_errors:
         result["carrier_errors"] = carrier_errors
@@ -2721,6 +2726,135 @@ def controller_mail_summary(
             "report_path": str(read_cursor_path(resolved_messages_dir)),
         }
     return result
+
+
+LISTENER_ARGV_MARKER = "goalflight_messages.py"
+LISTENER_CONTROLLER_FLAG = "--controller"
+
+
+def live_listener_pids(
+    project_root: Path | str,
+    controller_label: str,
+    *,
+    ps_output: str | None = None,
+) -> list[int] | None:
+    """PIDs of live `listen` processes belonging to THIS controller.
+
+    Returns None when the process table could not be read at all -- "cannot
+    tell", which is not the same as "none found". An empty list means measured
+    and absent. Collapsing the two would make an unreadable process table look
+    exactly like a missing listener and nag a controller that has one.
+
+    The process table is the authority on purpose, not a registry entry. The
+    question is "is a listener alive for me right now", and a stored PID would
+    have to be checked against the process table anyway -- so a registry adds a
+    second copy that can disagree with the first, and a dead listener would need
+    someone to notice and retract its record. A process either appears here or
+    it does not, and it cannot go stale.
+
+    Matching is exact on BOTH the controller handle and the project root. One
+    repo can host several controllers -- battery-tool-v2 currently runs three --
+    so "some listener exists for this project" would tell a controller it is
+    covered when the listener belongs to a sibling.
+    """
+    root = str(_canonical_project_root(Path(project_root)))
+    label = str(controller_label or "").strip()
+    if not label:
+        return []
+    if ps_output is None:
+        try:
+            ps_output = subprocess.run(
+                ["ps", "-eo", "pid=,command="],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            ).stdout
+        except (OSError, subprocess.SubprocessError):
+            return None
+    pids: list[int] = []
+    for line in (ps_output or "").splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) != 2:
+            continue
+        raw_pid, command = parts
+        if LISTENER_ARGV_MARKER not in command or " listen" not in command:
+            continue
+        if f"{LISTENER_CONTROLLER_FLAG} {label}" not in command:
+            continue
+        if root not in command:
+            continue
+        try:
+            pids.append(int(raw_pid))
+        except ValueError:
+            continue
+    return pids
+
+
+def listener_reminder_line(project_root: Path | str, controller_label: str) -> str:
+    root = _canonical_project_root(Path(project_root))
+    return (
+        f"no live mail listener for controller {controller_label!r}; "
+        "you will not be woken on new mail. start one in the BACKGROUND: "
+        f"python3 {Path(__file__).resolve()} listen "
+        f"--controller {controller_label} --project-root {root}"
+    )
+
+
+def emit_listener_reminder(
+    *,
+    project_root: Path | str | None,
+    controller_label: str | None,
+    exposure: int,
+    stream=None,
+    ps_output: str | None = None,
+) -> str | None:
+    """Warn a controller that nothing will wake it, when that actually costs it.
+
+    ``exposure`` is what it stands to miss -- open dispatches plus unread mail.
+    Gating on it is what keeps this from becoming a nag: a controller with
+    nothing in flight loses nothing by having no listener, so it is not told to
+    start one. That also removes any need for a throttle timestamp, which would
+    be state to keep and to get wrong.
+
+    TWO faults are reported, not one, because an unresolvable identity is itself
+    the more serious state and is common in practice. Measured on this project
+    while building this: all 26 owned dispatches carried no controller label and
+    neither registered label had a live session, so the caller could not be named
+    at all. Reporting only "you have no listener" would have stayed silent for
+    precisely the controller that had none -- an unregistered controller is also
+    the one nothing can be attributed to, it is invisible to peer discovery, and
+    no listener can be matched to it. So:
+
+      * identity known, no live listener -> start a listener
+      * identity unknown                 -> register first; the listener cannot
+                                            be attributed until you have a name
+    """
+    try:
+        if project_root is None or exposure < 1:
+            return None
+        root = _canonical_project_root(Path(project_root))
+        label = str(controller_label or "").strip()
+        if not label:
+            line = (
+                "this controller is not registered for "
+                f"{root}: peers cannot discover it, its dispatches are recorded "
+                "with no owner, and no mail listener can be attributed to it. "
+                "register with: python3 "
+                f"{Path(__file__).resolve().parent / 'goalflight_session_status.py'} "
+                "--controller-startup --controller-pid-from-ancestry"
+            )
+        else:
+            found = live_listener_pids(root, label, ps_output=ps_output)
+            # None = the process table was unreadable. Stay silent rather than
+            # assert an absence that was never measured.
+            if found is None or found:
+                return None
+            line = listener_reminder_line(root, label)
+        print(line, file=sys.stderr if stream is None else stream)
+        return line
+    except Exception:
+        return None
 
 
 def emit_controller_mail_notice(
@@ -2752,6 +2886,15 @@ def emit_controller_mail_notice(
                 file=sys.stderr if stream is None else stream,
             )
         count = int(summary.get("count") or 0)
+        # Emit the listener reminder BEFORE the mail-count early return: a
+        # controller with dispatches in flight and no unread mail is precisely
+        # the one that will need waking later and would otherwise never be told.
+        emit_listener_reminder(
+            project_root=project_root,
+            controller_label=summary.get("controller_label"),
+            exposure=count + len(resolved_owned_dispatch_ids or set()),
+            stream=stream,
+        )
         if count < 1:
             return None
         notice = format_mail_notice(count)
@@ -3771,6 +3914,17 @@ def main(argv: list[str] | None = None) -> int:
         help="block SILENTLY until new mail arrives, then print it and exit",
     )
     listen.add_argument("--project-root", default=None)
+    listen.add_argument(
+        "--controller",
+        default=None,
+        help=(
+            "this controller's handle (e.g. battery-bugs). Recorded in the "
+            "process arguments so `ps` shows whose listener this is without a "
+            "registry lookup, and matched exactly when deciding whether a "
+            "controller still has a live listener. One repo can host several "
+            "controllers, so an unlabelled listener cannot be attributed."
+        ),
+    )
     listen.add_argument(
         "--session-id",
         default=None,
