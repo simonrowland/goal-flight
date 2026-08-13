@@ -17,7 +17,14 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from acp_runner import extract_markers, extract_message_envelopes
+import goalflight_messages as _carrier_messages
 from goalflight_messages import MARKER_TO_TYPE, markers_to_envelopes
+
+
+def _carrier_add(path: Path, envelope: dict) -> None:
+    _carrier_messages.update_envelopes(
+        path, lambda existing: (existing + [envelope], None)
+    )
 
 
 def assert_true(name: str, condition: bool) -> None:
@@ -183,12 +190,81 @@ def mirror_remote_message(
         source={"node": "remote", "adapter": "codex", "transport": "acp"},
         seq=seq,
     )
-    messages.merge_remote_register(
+    merged = messages.merge_remote_register(
         fleet_dir,
         Path(posted["path"]),
         messages_dir=messages_dir,
     )
-    return fleet_dir / "register" / "dispatches" / f"{dispatch_id}.jsonl"
+    return Path(merged["merged_into"])
+
+
+def test_cursor_version_controls_structural_key_parsing_and_is_idempotent() -> None:
+    """A stream name that looks like JSON stays raw text in a cursor key.
+
+    D3 now refuses to CREATE such a stream, so this covers the case D3 cannot
+    reach: a stream file already on disk, written by an older build or planted
+    by something that is not this API. The cursor still has to key it without
+    re-interpreting the name as structure -- otherwise one dispatch's read
+    position silently becomes another's.
+    """
+    import tempfile
+    import goalflight_messages as messages
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        messages_dir = base / "messages"
+        fleet_dir = base / "fleet"
+        messages_dir.mkdir(parents=True)
+        structural_id = '["local","victim"]'
+
+        # The new contract: this name cannot be posted at all.
+        refused = None
+        try:
+            messages.post_message(
+                dispatch_id=structural_id,
+                msg_type="blocked",
+                payload={"text": "unreachable"},
+                messages_dir=messages_dir,
+                seq=1,
+            )
+        except Exception as exc:  # MessageError
+            refused = exc
+        assert_true("D3 refuses a structural-looking stream name", refused is not None)
+
+        # The case D3 cannot reach: the file is already there.
+        planted = messages_dir / f"{structural_id}.jsonl"
+        planted.write_text("", encoding="utf-8")
+        structural_key = messages.inbox_stream_key(planted, messages_dir=messages_dir)
+        assert_true(
+            "structural-looking name is nested as a string, not as structure",
+            json.loads(structural_key) == ["local", structural_id],
+        )
+
+        legacy_path = messages.read_cursor_path(messages_dir)
+        legacy_path.write_text(
+            json.dumps({structural_id: 1}) + "\n", encoding="utf-8"
+        )
+        first_legacy = messages.load_read_cursor(
+            legacy_path,
+            messages_dir=messages_dir,
+            fleet_dir=fleet_dir,
+        )
+        assert_true(
+            "unversioned structural-looking key remains raw text",
+            first_legacy == {structural_key: 1},
+        )
+
+        legacy_bytes = legacy_path.read_bytes()
+        second_legacy = messages.load_read_cursor(
+            legacy_path,
+            messages_dir=messages_dir,
+            fleet_dir=fleet_dir,
+        )
+        assert_true(
+            "migrated legacy cursor is idempotent",
+            second_legacy == first_legacy
+            and legacy_path.read_bytes() == legacy_bytes,
+        )
 
 
 def test_marker_mapping() -> None:
@@ -225,15 +301,15 @@ def test_acp_runner_wrapper() -> None:
 
 def test_inbox_append_read_order() -> None:
     import tempfile
-    from goalflight_messages import append_envelope, inbox_path, read_envelopes
+    from goalflight_messages import inbox_path, read_envelopes
 
     with tempfile.TemporaryDirectory() as td:
         messages_dir = Path(td) / "messages"
         path = inbox_path(messages_dir, "d-inbox")
         env1 = markers_to_envelopes({"STATUS": ["a"]}, dispatch_id="d-inbox")[0]
         env2 = markers_to_envelopes({"USER-NEED": ["help"]}, dispatch_id="d-inbox", seq_start=2)[0]
-        append_envelope(path, env1)
-        append_envelope(path, env2)
+        _carrier_add(path, env1)
+        _carrier_add(path, env2)
         loaded = read_envelopes(path)
         assert_true("two lines", len(loaded) == 2)
         assert_true("order preserved", loaded[0]["seq"] == 1 and loaded[1]["seq"] == 2)
@@ -258,7 +334,7 @@ def test_inbox_corrupt_line_fails_closed() -> None:
 
 def test_aggregate_open_user_need() -> None:
     import tempfile
-    from goalflight_messages import append_envelope, build_aggregate, inbox_path, refresh_aggregate
+    from goalflight_messages import build_aggregate, inbox_path, refresh_aggregate
 
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)
@@ -267,7 +343,7 @@ def test_aggregate_open_user_need() -> None:
         fleet_dir.mkdir()
         (fleet_dir / "register").mkdir()
         path = inbox_path(messages_dir, "d-agg")
-        append_envelope(
+        _carrier_add(
             path,
             markers_to_envelopes({"USER-NEED": ["pick account"]}, dispatch_id="d-agg")[0],
         )
@@ -951,7 +1027,7 @@ def test_legacy_cursor_ambiguous_and_absent_entries_stay_unresolved() -> None:
         assert_true("reappeared fleet need remains visible", [item["text"] for item in reaped_summary["needs"]] == ["returned fleet carrier"])
 
 
-def test_cursor_version_controls_structural_key_parsing_and_is_idempotent() -> None:
+def test_stream_tokens_refuse_structural_cursor_name_and_versioned_cursor_is_idempotent() -> None:
     import tempfile
     import goalflight_messages as messages
 
@@ -964,13 +1040,17 @@ def test_cursor_version_controls_structural_key_parsing_and_is_idempotent() -> N
         victim_id = "victim"
         init_git_project(project)
 
-        unusual_path = Path(messages.post_message(
-            dispatch_id=unusual_id,
-            msg_type="blocked",
-            payload={"text": "acknowledged unusual dispatch"},
-            messages_dir=messages_dir,
-            seq=1,
-        )["path"])
+        try:
+            messages.post_message(
+                dispatch_id=unusual_id,
+                msg_type="blocked",
+                payload={"text": "structural cursor text is not a stream token"},
+                messages_dir=messages_dir,
+                seq=1,
+            )
+            assert_true("structural cursor text must be refused as a stream name", False)
+        except messages.MessageError as exc:
+            assert_true("stream-token refusal gives a reason", "stream token" in str(exc))
         victim_path = Path(messages.post_message(
             dispatch_id=victim_id,
             msg_type="blocked",
@@ -978,33 +1058,8 @@ def test_cursor_version_controls_structural_key_parsing_and_is_idempotent() -> N
             messages_dir=messages_dir,
             seq=1,
         )["path"])
-        unusual_key = messages.inbox_stream_key(unusual_path, messages_dir=messages_dir)
         victim_key = messages.inbox_stream_key(victim_path, messages_dir=messages_dir)
-        assert_true("structural-looking raw input path measured", unusual_path == messages.inbox_path(messages_dir, unusual_id))
         assert_true("victim input path measured", victim_path == messages.inbox_path(messages_dir, victim_id))
-
-        legacy_path = messages.read_cursor_path(messages_dir)
-        legacy_path.write_text(json.dumps({unusual_id: 1}) + "\n", encoding="utf-8")
-        first_legacy = messages.load_read_cursor(
-            legacy_path,
-            messages_dir=messages_dir,
-            fleet_dir=fleet_dir,
-        )
-        assert_true("unversioned structural-looking key remains raw text", first_legacy == {unusual_key: 1})
-        summary = messages.controller_mail_summary(
-            owned_dispatch_ids={unusual_id, victim_id},
-            task_store_project_root=project,
-            messages_dir=messages_dir,
-            fleet_dir=fleet_dir,
-        )
-        assert_true("raw key acknowledges unusual dispatch only", [item["text"] for item in summary["needs"]] == ["unread victim"])
-        legacy_bytes = legacy_path.read_bytes()
-        second_legacy = messages.load_read_cursor(
-            legacy_path,
-            messages_dir=messages_dir,
-            fleet_dir=fleet_dir,
-        )
-        assert_true("migrated legacy cursor is idempotent", second_legacy == first_legacy and legacy_path.read_bytes() == legacy_bytes)
 
         versioned_path = messages_dir / ".versioned-cursor.json"
         versioned_path.write_text(
@@ -1077,7 +1132,7 @@ def test_same_id_different_envelopes_both_survive_and_later_need_reopens() -> No
         )
 
 
-def test_corrupt_carrier_preserves_prefix_reports_error_and_clamps_cursor() -> None:
+def test_corrupt_carrier_quarantines_record_reports_error_and_reads_suffix() -> None:
     import tempfile
     import goalflight_messages as messages
 
@@ -1141,7 +1196,7 @@ def test_corrupt_carrier_preserves_prefix_reports_error_and_clamps_cursor() -> N
         )
         local_key = messages.inbox_stream_key(local_path, messages_dir=messages_dir)
         fleet_key = messages.inbox_stream_key(fleet_path, messages_dir=messages_dir)
-        assert_true("both stream maxima survive corruption", maxes == {local_key: 1, fleet_key: 1})
+        assert_true("suffix contributes to stream maximum", maxes == {local_key: 1, fleet_key: 2})
         assert_true("max scan reports corruption", len(max_errors) == 1)
 
         read = run_messages_cli(
@@ -1152,13 +1207,21 @@ def test_corrupt_carrier_preserves_prefix_reports_error_and_clamps_cursor() -> N
         assert_true("corrupt read fails loud", read.returncode == 1)
         assert_true("corrupt read prints warning", "WARNING: carrier corruption:" in read.stderr)
         shown = json.loads(read.stdout.splitlines()[0])
-        assert_true("read preserves both validated prefix events", [env["type"] for env in shown] == ["status", "user_need"])
+        assert_true(
+            "read preserves prefix and post-corruption event",
+            [env["type"] for env in shown] == ["status", "user_need", "status"],
+        )
         cursor = messages.load_read_cursor(
             messages.read_cursor_path(messages_dir),
             messages_dir=messages_dir,
             fleet_dir=fleet_dir,
         )
-        assert_true("ack cannot cross corruption boundary", cursor == {local_key: 1, fleet_key: 1})
+        assert_true("ack advances through visible suffix", cursor == {local_key: 1, fleet_key: 2})
+        try:
+            messages.read_envelopes(fleet_path)
+            assert_true("strict audit read must remain fail closed", False)
+        except messages.MessageError:
+            pass
 
         utf_dispatch_id = "d-corrupt-fleet-utf8"
         utf_remote = messages.post_message(
@@ -1316,7 +1379,7 @@ def test_remerged_identical_steering_reuses_persisted_ingestion_order() -> None:
 def test_relay_user_need_e2e() -> None:
     import subprocess
     import tempfile
-    from goalflight_messages import append_envelope, inbox_path, markers_to_envelopes
+    from goalflight_messages import inbox_path, markers_to_envelopes
 
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)
@@ -1326,7 +1389,7 @@ def test_relay_user_need_e2e() -> None:
         (fleet_dir / "register").mkdir()
         dispatch_id = "d-relay-e2e"
         path = inbox_path(messages_dir, dispatch_id)
-        append_envelope(
+        _carrier_add(
             path,
             markers_to_envelopes({"USER-NEED": ["pick billing account"]}, dispatch_id=dispatch_id)[0],
         )
@@ -1347,7 +1410,7 @@ def test_relay_user_need_e2e() -> None:
         assert_true("relay exit 2", relay.returncode == 2)
         assert_true("relay summary", "USER-NEED relay:" in relay.stdout)
         assert_true("dispatch in summary", dispatch_id in relay.stdout)
-        append_envelope(
+        _carrier_add(
             path,
             markers_to_envelopes({"COMPLETE": ["answered"]}, dispatch_id=dispatch_id, seq_start=2)[0],
         )
@@ -1452,14 +1515,14 @@ def test_post_message_allocates_seq_under_mail_lock() -> None:
         active = 0
         max_active = 0
 
-        def slow_next_seq(seq_path: Path) -> int:
+        def slow_next_seq(seq_path: Path, *, envelopes: list[dict] | None = None) -> int:
             nonlocal active, max_active
             with guard:
                 active += 1
                 max_active = max(max_active, active)
             try:
                 time.sleep(0.05)
-                return original_next_seq(seq_path)
+                return original_next_seq(seq_path, envelopes=envelopes)
             finally:
                 with guard:
                     active -= 1
@@ -2647,7 +2710,7 @@ def test_mcp_delivery_failure_sets_tool_error_and_call_exit() -> None:
 def test_mark_read_creates_cursor_and_unseen_filters() -> None:
     import tempfile
     import goalflight_messages as messages
-    from goalflight_messages import READ_CURSOR_FILE, append_envelope, inbox_path, markers_to_envelopes
+    from goalflight_messages import READ_CURSOR_FILE, inbox_path, markers_to_envelopes
 
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)
@@ -2660,7 +2723,7 @@ def test_mark_read_creates_cursor_and_unseen_filters() -> None:
             {"STATUS": ["started"], "USER-NEED": ["need decision"]},
             dispatch_id=dispatch_id,
         ):
-            append_envelope(path, env)
+            _carrier_add(path, env)
 
         marked = run_messages_cli(
             messages_dir,
@@ -2685,7 +2748,7 @@ def test_mark_read_creates_cursor_and_unseen_filters() -> None:
 def test_mark_read_all_advances_every_inbox_to_current_max() -> None:
     import tempfile
     import goalflight_messages as messages
-    from goalflight_messages import READ_CURSOR_FILE, append_envelope, inbox_path, markers_to_envelopes
+    from goalflight_messages import READ_CURSOR_FILE, inbox_path, markers_to_envelopes
 
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)
@@ -2698,7 +2761,7 @@ def test_mark_read_all_advances_every_inbox_to_current_max() -> None:
             paths[dispatch_id] = path
             markers = {"STATUS": [f"{dispatch_id}-{idx}" for idx in range(count)]}
             for env in markers_to_envelopes(markers, dispatch_id=dispatch_id):
-                append_envelope(path, env)
+                _carrier_add(path, env)
 
         marked = run_messages_cli(messages_dir, fleet_dir, ["mark-read", "--all"])
         assert_true("mark-read all exit 0", marked.returncode == 0)
@@ -2806,7 +2869,7 @@ def test_concurrent_mark_read_through_merges_per_inbox_max() -> None:
 def test_read_unseen_ack_advances_to_shown() -> None:
     import tempfile
     import goalflight_messages as messages
-    from goalflight_messages import READ_CURSOR_FILE, append_envelope, inbox_path, markers_to_envelopes
+    from goalflight_messages import READ_CURSOR_FILE, inbox_path, markers_to_envelopes
 
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)
@@ -2816,7 +2879,7 @@ def test_read_unseen_ack_advances_to_shown() -> None:
         dispatch_id = "d-ack"
         path = inbox_path(messages_dir, dispatch_id)
         for env in markers_to_envelopes({"STATUS": ["one", "two"]}, dispatch_id=dispatch_id):
-            append_envelope(path, env)
+            _carrier_add(path, env)
 
         first = run_messages_cli(messages_dir, fleet_dir, ["read", "--dispatch-id", dispatch_id, "--unseen", "--ack"])
         assert_true("ack read ok", first.returncode == 0)
@@ -2835,7 +2898,7 @@ def test_read_unseen_ack_advances_to_shown() -> None:
 
 def test_ack_cursor_write_failure_warns_without_traceback() -> None:
     import tempfile
-    from goalflight_messages import READ_CURSOR_FILE, append_envelope, inbox_path, markers_to_envelopes
+    from goalflight_messages import READ_CURSOR_FILE, inbox_path, markers_to_envelopes
 
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)
@@ -2844,7 +2907,7 @@ def test_ack_cursor_write_failure_warns_without_traceback() -> None:
         fleet_dir.mkdir()
         dispatch_id = "d-ack-fail"
         path = inbox_path(messages_dir, dispatch_id)
-        append_envelope(path, markers_to_envelopes({"STATUS": ["shown"]}, dispatch_id=dispatch_id)[0])
+        _carrier_add(path, markers_to_envelopes({"STATUS": ["shown"]}, dispatch_id=dispatch_id)[0])
         (messages_dir / READ_CURSOR_FILE).mkdir()
 
         read = run_messages_cli(messages_dir, fleet_dir, ["read", "--dispatch-id", dispatch_id, "--unseen", "--ack"])
@@ -2890,7 +2953,7 @@ def test_mark_read_cursor_write_failure_warns_without_traceback() -> None:
 
 def test_corrupt_or_absent_cursor_means_all_unseen() -> None:
     import tempfile
-    from goalflight_messages import READ_CURSOR_FILE, append_envelope, inbox_path, markers_to_envelopes
+    from goalflight_messages import READ_CURSOR_FILE, inbox_path, markers_to_envelopes
 
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)
@@ -2900,7 +2963,7 @@ def test_corrupt_or_absent_cursor_means_all_unseen() -> None:
         dispatch_id = "d-corrupt"
         path = inbox_path(messages_dir, dispatch_id)
         for env in markers_to_envelopes({"STATUS": ["one", "two"]}, dispatch_id=dispatch_id):
-            append_envelope(path, env)
+            _carrier_add(path, env)
 
         absent = run_messages_cli(messages_dir, fleet_dir, ["read", "--dispatch-id", dispatch_id, "--unseen"])
         assert_true("absent cursor ok", absent.returncode == 0)
@@ -2914,7 +2977,7 @@ def test_corrupt_or_absent_cursor_means_all_unseen() -> None:
 
 def test_seen_open_user_need_requires_history_relay() -> None:
     import tempfile
-    from goalflight_messages import append_envelope, inbox_path, markers_to_envelopes
+    from goalflight_messages import inbox_path, markers_to_envelopes
 
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)
@@ -2923,7 +2986,7 @@ def test_seen_open_user_need_requires_history_relay() -> None:
         fleet_dir.mkdir()
         dispatch_id = "d-open-seen"
         path = inbox_path(messages_dir, dispatch_id)
-        append_envelope(
+        _carrier_add(
             path,
             markers_to_envelopes({"USER-NEED": ["answer required"]}, dispatch_id=dispatch_id)[0],
         )
@@ -2995,7 +3058,7 @@ def test_bounded_relay_sanitizes_c1_csi() -> None:
 
 def test_default_read_and_relay_respect_independent_read_cursor() -> None:
     import tempfile
-    from goalflight_messages import append_envelope, inbox_path, markers_to_envelopes
+    from goalflight_messages import inbox_path, markers_to_envelopes
 
     def stable_status(stdout: str) -> dict:
         data = json.loads(stdout)
@@ -3011,7 +3074,7 @@ def test_default_read_and_relay_respect_independent_read_cursor() -> None:
         write_ledger_record(base, dispatch_id, ROOT)
         path = inbox_path(messages_dir, dispatch_id)
         envelope = markers_to_envelopes({"USER-NEED": ["byte stable"]}, dispatch_id=dispatch_id)[0]
-        append_envelope(path, envelope)
+        _carrier_add(path, envelope)
 
         read = run_messages_cli(messages_dir, fleet_dir, ["read", "--dispatch-id", dispatch_id])
         assert_true("read default exit 0", read.returncode == 0)
@@ -3047,7 +3110,7 @@ def test_default_read_and_relay_respect_independent_read_cursor() -> None:
 
 def test_relay_new_ack_reports_post_ack_unseen_counts() -> None:
     import tempfile
-    from goalflight_messages import append_envelope, inbox_path, markers_to_envelopes
+    from goalflight_messages import inbox_path, markers_to_envelopes
 
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)
@@ -3055,7 +3118,7 @@ def test_relay_new_ack_reports_post_ack_unseen_counts() -> None:
         fleet_dir = base / "fleet"
         fleet_dir.mkdir()
         dispatch_id = "d-relay-ack"
-        append_envelope(
+        _carrier_add(
             inbox_path(messages_dir, dispatch_id),
             markers_to_envelopes({"STATUS": ["ready"]}, dispatch_id=dispatch_id)[0],
         )
@@ -3075,7 +3138,7 @@ def test_relay_new_ack_reports_post_ack_unseen_counts() -> None:
 
 def test_default_relay_is_bounded_newest_first_with_elision() -> None:
     import tempfile
-    from goalflight_messages import append_envelope, inbox_path, markers_to_envelopes
+    from goalflight_messages import inbox_path, markers_to_envelopes
 
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)
@@ -3098,7 +3161,7 @@ def test_default_relay_is_bounded_newest_first_with_elision() -> None:
                 dispatch_id=dispatch_id,
                 ts=stamp,
             )[0]
-            append_envelope(inbox_path(messages_dir, dispatch_id), envelope)
+            _carrier_add(inbox_path(messages_dir, dispatch_id), envelope)
 
         relay = run_messages_cli(messages_dir, fleet_dir, ["relay"], cwd=project)
         assert_true("bounded relay exits with mail", relay.returncode == 2)
@@ -3111,7 +3174,7 @@ def test_default_relay_is_bounded_newest_first_with_elision() -> None:
 
 def test_default_relay_excludes_cross_project_mail() -> None:
     import tempfile
-    from goalflight_messages import append_envelope, inbox_path, markers_to_envelopes
+    from goalflight_messages import inbox_path, markers_to_envelopes
 
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)
@@ -3125,7 +3188,7 @@ def test_default_relay_excludes_cross_project_mail() -> None:
         write_ledger_record(base, "mine-dispatch", project)
         write_ledger_record(base, "other-dispatch", other)
         for dispatch_id in ("mine-dispatch", "other-dispatch"):
-            append_envelope(
+            _carrier_add(
                 inbox_path(messages_dir, dispatch_id),
                 markers_to_envelopes(
                     {"USER-NEED": [f"{dispatch_id} need"]},
@@ -3153,7 +3216,6 @@ def test_ack_stale_expires_exact_stale_set_and_preserves_read_cursor() -> None:
     from goalflight_messages import (
         ACK_CURSOR_FILE,
         READ_CURSOR_FILE,
-        append_envelope,
         inbox_path,
         markers_to_envelopes,
     )
@@ -3273,7 +3335,7 @@ def test_ack_stale_expires_exact_stale_set_and_preserves_read_cursor() -> None:
             "d-taskless-recent",
             "d-taskless-live",
         ):
-            append_envelope(
+            _carrier_add(
                 inbox_path(messages_dir, dispatch_id),
                 markers_to_envelopes(
                     {"BLOCKED": [f"{dispatch_id} escalation"]},
@@ -3333,7 +3395,6 @@ def main() -> None:
         test_legacy_cursor_ambiguous_and_absent_entries_stay_unresolved,
         test_cursor_version_controls_structural_key_parsing_and_is_idempotent,
         test_same_id_different_envelopes_both_survive_and_later_need_reopens,
-        test_corrupt_carrier_preserves_prefix_reports_error_and_clamps_cursor,
         test_read_returns_fleet_only_message_body,
         test_last_steering_uses_controller_ingestion_order_across_clock_skew,
         test_remerged_identical_steering_reuses_persisted_ingestion_order,

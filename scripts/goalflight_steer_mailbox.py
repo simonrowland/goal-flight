@@ -1,13 +1,15 @@
-"""Steer mailbox JSONL helpers."""
+"""Steer mailbox JSONL helpers.
+
+Deploy this lock convention only after REV 5's zero-live-dispatch cutover gate.
+"""
 
 from __future__ import annotations
 
 import json
-import os
+import sys
 import time
 from pathlib import Path
 
-import goalflight_compat
 import goalflight_dispatch_paths
 import goalflight_terminal
 from goalflight_liveness import active_monotonic
@@ -23,53 +25,90 @@ def steer_file(dispatch_id: str, state_dir: Path | str | None = None) -> Path:
     return goalflight_dispatch_paths.steer_file(dispatch_id, state_dir=state_dir)
 
 
+def _normalize_steer_item(item: object) -> dict:
+    if not isinstance(item, dict):
+        raise ValueError("steer row must be an object")
+    try:
+        seq = int(item.get("seq"))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("steer row seq must be an integer") from exc
+    if seq < 1:
+        raise ValueError("steer row seq must be >= 1")
+    direction = str(item.get("direction") or TO_WORKER)
+    if direction not in STEER_DIRECTIONS:
+        raise ValueError(f"unsupported steer direction: {direction!r}")
+    entry = {
+        "seq": seq,
+        "ts": str(item.get("ts") or ""),
+        "text": str(item.get("text") or ""),
+    }
+    awake_mono_ns = item.get("awake_mono_ns")
+    if (
+        isinstance(awake_mono_ns, int)
+        and not isinstance(awake_mono_ns, bool)
+        and awake_mono_ns > 0
+    ):
+        entry["awake_mono_ns"] = awake_mono_ns
+    if "direction" in item:
+        entry["direction"] = direction
+    for key in ("dispatch_id", "kind", "question_id", "reply_to", "decision", "context"):
+        value = item.get(key)
+        if value is not None:
+            entry[key] = value
+    return entry
+
+
 def parse_steer_lines(lines: list[str]) -> list[dict]:
     entries: list[dict] = []
     for line in lines:
         if not line.strip():
             continue
         try:
-            item = json.loads(line)
-        except json.JSONDecodeError:
+            entries.append(_normalize_steer_item(json.loads(line)))
+        except (ValueError, RecursionError):
+            continue
+    return entries
+
+
+def _carrier_module():
+    # Lazy to avoid the intentional messages -> steer delivery import cycle.
+    active_main = sys.modules.get("__main__")
+    if active_main is not None and all(
+        hasattr(active_main, name)
+        for name in ("carrier_transaction", "record_carrier_quarantine")
+    ):
+        return active_main
+    import goalflight_messages
+
+    return goalflight_messages
+
+
+def _parse_steer_carrier(path: Path, data: bytes) -> list[dict]:
+    messages = _carrier_module()
+    entries: list[dict] = []
+    offset = 0
+    for line_no, chunk in enumerate(data.splitlines(keepends=True), start=1):
+        raw_line = chunk.rstrip(b"\r\n")
+        line_offset = offset
+        offset += len(chunk)
+        if not raw_line.strip():
             continue
         try:
-            seq = int(item.get("seq"))
-        except (TypeError, ValueError):
-            continue
-        direction = str(item.get("direction") or TO_WORKER)
-        if direction not in STEER_DIRECTIONS:
-            continue
-        entry = {
-            "seq": seq,
-            "ts": str(item.get("ts") or ""),
-            "text": str(item.get("text") or ""),
-        }
-        awake_mono_ns = item.get("awake_mono_ns")
-        if (
-            isinstance(awake_mono_ns, int)
-            and not isinstance(awake_mono_ns, bool)
-            and awake_mono_ns > 0
-        ):
-            entry["awake_mono_ns"] = awake_mono_ns
-        if "direction" in item:
-            entry["direction"] = direction
-        for key in ("dispatch_id", "kind", "question_id", "reply_to", "decision", "context"):
-            value = item.get(key)
-            if value is not None:
-                entry[key] = value
-        entries.append(entry)
+            entries.append(_normalize_steer_item(json.loads(raw_line.decode("utf-8"))))
+        except (UnicodeDecodeError, ValueError, RecursionError) as exc:
+            reason = f"invalid steer JSON: {type(exc).__name__}: {exc}"
+            row = messages.record_carrier_quarantine(path, line_offset, reason, raw_line)
+            print(
+                f"WARNING: carrier corruption: {row['path']}:{line_no}: {reason}",
+                file=sys.stderr,
+            )
     return entries
 
 
 def read_steer_entries(path: Path) -> list[dict]:
-    if not path.exists():
-        return []
-    with path.open("r", encoding="utf-8", errors="replace") as f:
-        goalflight_compat.flock(f, goalflight_compat.LOCK_SH)
-        try:
-            return parse_steer_lines(f.read().splitlines())
-        finally:
-            goalflight_compat.flock(f, goalflight_compat.LOCK_UN)
+    messages = _carrier_module()
+    with messages.carrier_transaction(path) as carrier:
+        return _parse_steer_carrier(carrier.path, carrier.read_bytes())
 
 
 def append_steer_entry(
@@ -87,40 +126,39 @@ def append_steer_entry(
 ) -> dict:
     if direction not in STEER_DIRECTIONS:
         raise ValueError(f"unsupported steer direction: {direction!r}")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a+", encoding="utf-8") as f:
-        goalflight_compat.flock(f, goalflight_compat.LOCK_EX)
+    messages = _carrier_module()
+    with messages.carrier_transaction(path) as carrier:
+        existing = _parse_steer_carrier(carrier.path, carrier.read_bytes())
+        next_seq = max((entry["seq"] for entry in existing), default=0) + 1 if seq is None else seq
+        entry = {
+            "seq": next_seq,
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "awake_mono_ns": int(active_monotonic() * 1_000_000_000),
+            "text": message,
+        }
+        if direction != TO_WORKER:
+            entry["direction"] = direction
+        if kind != "steer":
+            entry["kind"] = kind
+        if dispatch_id:
+            entry["dispatch_id"] = dispatch_id
+        if question_id:
+            entry["question_id"] = question_id
+        if reply_to:
+            entry["reply_to"] = reply_to
+        if decision:
+            entry["decision"] = decision
+        if context:
+            entry["context"] = context
         try:
-            f.seek(0)
-            existing = parse_steer_lines(f.read().splitlines())
-            next_seq = max((entry["seq"] for entry in existing), default=0) + 1 if seq is None else seq
-            entry = {
-                "seq": next_seq,
-                "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                "awake_mono_ns": int(active_monotonic() * 1_000_000_000),
-                "text": message,
-            }
-            if direction != TO_WORKER:
-                entry["direction"] = direction
-            if kind != "steer":
-                entry["kind"] = kind
-            if dispatch_id:
-                entry["dispatch_id"] = dispatch_id
-            if question_id:
-                entry["question_id"] = question_id
-            if reply_to:
-                entry["reply_to"] = reply_to
-            if decision:
-                entry["decision"] = decision
-            if context:
-                entry["context"] = context
-            f.seek(0, os.SEEK_END)
-            f.write(json.dumps(entry, sort_keys=True) + "\n")
-            f.flush()
-            os.fsync(f.fileno())
-            return entry
-        finally:
-            goalflight_compat.flock(f, goalflight_compat.LOCK_UN)
+            encoded = (
+                json.dumps(entry, allow_nan=False, sort_keys=True, separators=(",", ":"))
+                + "\n"
+            ).encode("utf-8")
+        except (TypeError, ValueError, OverflowError, RecursionError) as exc:
+            raise ValueError(f"steer entry is not JSON-serializable: {exc}") from exc
+        carrier.append_bytes(encoded)
+        return entry
 
 
 def append_message_view(

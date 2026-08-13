@@ -58,6 +58,43 @@ def _post_env(
     return json.loads(posted.stdout)["envelope"]
 
 
+def _post_env_raw(
+    tmp_path: Path,
+    text: str,
+    *,
+    dispatch_id: str,
+    msg_type: str = "status",
+) -> subprocess.CompletedProcess[str]:
+    """Post without asserting success -- for inputs the API must refuse."""
+    return subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--messages-dir",
+            str(tmp_path / "messages"),
+            "--fleet-dir",
+            str(tmp_path / "fleet"),
+            "post",
+            "--dispatch-id",
+            dispatch_id,
+            "--type",
+            msg_type,
+            "--text",
+            text,
+            "--node",
+            "local",
+            "--adapter",
+            "codex",
+            "--transport",
+            "controller",
+            "--json",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
 def _run_relay(tmp_path: Path, *, bodies: bool = False) -> subprocess.CompletedProcess[str]:
     fleet_dir = tmp_path / "fleet"
     fleet_dir.mkdir(exist_ok=True)
@@ -187,11 +224,15 @@ def test_default_cli_sanitizes_source_and_body_controls(tmp_path: Path) -> None:
 
 
 def test_relay_new_sanitizes_full_stdout_structure(tmp_path: Path) -> None:
+    # D3 closed the stream-name forgery vector at ingress: a dispatch_id
+    # carrying a newline can no longer be posted at all, so it can no longer
+    # reach stdout. The body stays free text, so the sanitizer is still the
+    # only thing standing between hostile content and the rendered structure.
     body = "first line\nFORGED-BODY\x1b[2J\x9b31m"
     _post_env(
         tmp_path,
         body,
-        dispatch_id="safe\nFORGED-COUNT",
+        dispatch_id="safe",
     )
 
     result = _run_relay(tmp_path)
@@ -199,24 +240,43 @@ def test_relay_new_sanitizes_full_stdout_structure(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     assert result.stdout.splitlines() == [
         (
-            r"safe FORGED-COUNT #1 [status] from codex: "
+            r"safe #1 [status] from codex: "
             rf"first line / FORGED-BODY\x1b[2J\x9b31m  ({len(body)}c)"
         ),
         "bodies: re-run with --bodies, or read one inbox with `read`",
-        "unseen counts: safe FORGED-COUNT=1",
+        "unseen counts: safe=1",
     ]
     assert "\x1b" not in result.stdout
     assert "\x9b" not in result.stdout
 
 
-def test_one_sanitizer_covers_dispatch_type_and_subject(tmp_path: Path) -> None:
-    envelope = _post_env(
-        tmp_path,
-        "body",
-        subject="Gate\n\x9b2Jgreen",
-        dispatch_id="safe\nFORGED",
-        msg_type="status\rINJECTED",
+def test_forged_stream_name_is_refused_at_ingress(tmp_path: Path) -> None:
+    # The vector the test above used to exercise, asserted at its new home:
+    # refused when posted, rather than sanitized after being accepted.
+    proc = _post_env_raw(tmp_path, "body", dispatch_id="safe\nFORGED-COUNT")
+
+    assert proc.returncode != 0, proc.stdout
+    assert "dispatch_id" in (proc.stderr + proc.stdout)
+    assert not (tmp_path / "messages").exists() or not list(
+        (tmp_path / "messages").rglob("*FORGED*")
     )
+
+
+def test_one_sanitizer_covers_dispatch_type_and_subject(tmp_path: Path) -> None:
+    # dispatch_id and type are now refused at ingress (D3/D4), so the only way
+    # hostile values in those fields can reach the formatter is a stream that
+    # was written by something other than this API -- a stale file from an
+    # older build, or a hand-planted one. The formatter is therefore still
+    # responsible for them, and this asserts it on an envelope carrying all
+    # three vectors at once: the one sanitizer covers dispatch, type, and
+    # subject. The posted envelope supplies the real shape; the hostile values
+    # are substituted into it rather than smuggled through a post the API
+    # would (correctly) reject.
+    envelope = dict(
+        _post_env(tmp_path, "body", subject="Gate\n\x9b2Jgreen", dispatch_id="safe")
+    )
+    envelope["dispatch_id"] = "safe\nFORGED"
+    envelope["type"] = "status\rINJECTED"
 
     out = msg.format_envelope_headlines([envelope])
 
@@ -225,6 +285,15 @@ def test_one_sanitizer_covers_dispatch_type_and_subject(tmp_path: Path) -> None:
     assert "safe FORGED" in out
     assert "[status INJECTED]" in out
     assert r"Gate \x9b2Jgreen" in out
+
+
+def test_forged_type_is_refused_at_ingress(tmp_path: Path) -> None:
+    proc = _post_env_raw(
+        tmp_path, "body", dispatch_id="safe", msg_type="status\rINJECTED"
+    )
+
+    assert proc.returncode != 0, proc.stdout
+    assert "type" in (proc.stderr + proc.stdout)
 
 
 def main() -> None:
@@ -239,7 +308,9 @@ def main() -> None:
         test_default_and_bodies_cli_paths_round_trip_subject,
         test_default_cli_sanitizes_source_and_body_controls,
         test_relay_new_sanitizes_full_stdout_structure,
+        test_forged_stream_name_is_refused_at_ingress,
         test_one_sanitizer_covers_dispatch_type_and_subject,
+        test_forged_type_is_refused_at_ingress,
     )
     for test in tests:
         with tempfile.TemporaryDirectory() as td:

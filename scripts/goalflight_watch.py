@@ -1301,7 +1301,7 @@ def post_worker_mail(dispatch_id: str, markers: list[dict], posted_keys: set) ->
         messages_dir = gm.default_messages_dir()
         inbox = gm.inbox_path(messages_dir, dispatch_id)
         if inbox.exists() and not inbox.is_file():
-            # Non-regular inbox (FIFO/device): read_envelopes()'s read or
+            # Non-regular inbox (FIFO/device): a carrier read or
             # post_message()'s open("a") could block the watcher's liveness loop
             # FOREVER — the broad except below can't catch a hang. Same hang class
             # as the read-side collect_inbox_paths guard. Refuse and disable the
@@ -1319,7 +1319,7 @@ def post_worker_mail(dispatch_id: str, markers: list[dict], posted_keys: set) ->
             if inbox_seen is None:
                 inbox_seen = {
                     (str(e.get("type")), str((e.get("payload") or {}).get("text") or "").strip())
-                    for e in gm.read_envelopes(inbox)
+                    for e in gm.read_envelopes_tolerant(inbox)
                 }
             posted_keys.add(key)  # mark BEFORE I/O: a failed post must not retry every poll
             if key in inbox_seen:

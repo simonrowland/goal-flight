@@ -88,12 +88,13 @@ def test_steering_apply_writes_envelope():
 
 def test_mirror_remote_user_need():
     fleet_dir = _fleet_tmp()
-    remote = Path("/tmp") / f"goal-flight-remote-{fleet.controller_id().replace(':', '-')}.jsonl"
     dispatch_id = "remote-dispatch-1"
+    remote = fleet_dir / "remote" / f"{dispatch_id}.jsonl"
+    remote.parent.mkdir(parents=True, exist_ok=True)
     envelope = {
         "schema": "goalflight.message.v1",
         "schema_version": 1,
-        "id": "env-1",
+        "id": str(uuid.uuid4()),
         "dispatch_id": dispatch_id,
         "seq": 1,
         "ts": "2026-05-24T12:00:00+00:00",

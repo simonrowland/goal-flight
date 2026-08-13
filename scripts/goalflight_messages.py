@@ -6,15 +6,23 @@ from __future__ import annotations
 import argparse
 from collections.abc import Callable
 import contextlib
+from dataclasses import dataclass
 import datetime as dt
+from enum import Enum
+import functools
+import hashlib
 import json
+import math
 import os
 import re
+import stat
 import subprocess
+import tempfile
 import uuid
 from pathlib import Path
 import sys
 import time
+from typing import TypeVar
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
@@ -73,6 +81,21 @@ CONTROLLER_LISTENER_ESCALATION_TYPES = frozenset({"user_need", "user_confirm", "
 TASK_STORE_STATUS_NUDGE_KINDS = frozenset({"parallel-ready", "resume-ready", "done-suggest"})
 NON_ERROR_UNDELIVERED_STATUSES = frozenset({"terminal_recorded_only", "worker_view_queued"})
 CONTROLLER_ADDRESSEE_KIND = "controller"
+STREAM_TOKEN_MAX = 255
+STREAM_TOKEN_RE = re.compile(
+    rf"[A-Za-z0-9](?:[A-Za-z0-9._:@+\-]{{0,{STREAM_TOKEN_MAX - 2}}}[A-Za-z0-9])?\Z"
+)
+MESSAGE_TYPE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
+RFC3339_RE = re.compile(
+    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})\Z"
+)
+MESSAGE_PRIORITIES = frozenset({"normal", "urgent"})
+MAX_SOURCE_VALUE_LENGTH = 128
+MAX_PROJECT_ROOT_LENGTH = 4096
+QUARANTINE_BYTES_LIMIT = 256
+MAX_JSON_DEPTH = 32
+MAX_ENVELOPE_JSON_BYTES = 1_048_576
+MAX_PAYLOAD_JSON_BYTES = 786_432
 
 REQUIRED_ENVELOPE_FIELDS = (
     "schema",
@@ -89,6 +112,19 @@ REQUIRED_ENVELOPE_FIELDS = (
 
 class MessageError(Exception):
     pass
+
+
+class CarrierReadStatus(str, Enum):
+    OK = "ok"
+    CORRUPT_RECORDS_QUARANTINED = "corrupt-records-quarantined"
+    CARRIER_UNREADABLE = "CARRIER-UNREADABLE"
+
+
+@dataclass(frozen=True)
+class CarrierReadResult:
+    status: CarrierReadStatus
+    envelopes: tuple[dict, ...]
+    errors: tuple[dict[str, object], ...]
 
 
 def require_positive_int_seq(value: object, *, path: str) -> int:
@@ -115,19 +151,83 @@ def default_fleet_dir() -> Path:
     )
 
 
+def validate_stream_id(dispatch_id: object, *, path: str = "dispatch_id") -> str:
+    if not isinstance(dispatch_id, str) or not STREAM_TOKEN_RE.fullmatch(dispatch_id):
+        raise MessageError(
+            f"{path}: expected a 1..{STREAM_TOKEN_MAX} character stream token "
+            "using letters, digits, '.', '_', ':', '@', '+', or '-'"
+        )
+    return dispatch_id
+
+
+def _lexical_absolute(path: Path) -> Path:
+    return Path(os.path.abspath(os.fspath(path)))
+
+
+def _canonical_jsonl_path(path: Path, *, allow_quarantine: bool = False) -> Path:
+    lexical = _lexical_absolute(Path(path))
+    if lexical.suffix != ".jsonl":
+        raise MessageError(f"{path}: carrier must be a .jsonl file")
+    if lexical.name.endswith(".quarantine.jsonl") and not allow_quarantine:
+        raise MessageError(f"{path}: quarantine sidecar is not an event carrier")
+    if lexical.is_symlink():
+        raise MessageError(f"{path}: symlinked inbox refused")
+    resolved_parent = lexical.parent.resolve(strict=False)
+    if lexical.exists():
+        try:
+            mode = os.lstat(lexical).st_mode
+        except OSError as exc:
+            raise MessageError(f"{path}: cannot stat carrier: {exc}") from exc
+        if not stat.S_ISREG(mode):
+            raise MessageError(f"{path}: inbox is not a regular file; refusing access")
+    resolved = lexical.resolve(strict=False)
+    if resolved.parent != resolved_parent:
+        raise MessageError(f"{path}: resolved carrier escapes its stream directory")
+    if lexical.exists() and resolved.exists():
+        try:
+            if os.lstat(lexical).st_ino != os.stat(resolved).st_ino:
+                # The name changed identity between the regular-file check and
+                # resolution (review round 3 finding 5's swap window). Refuse
+                # rather than operate on whichever file won the race; the
+                # O_NOFOLLOW + fstat checks at every open remain the final
+                # authority on what actually gets read or written.
+                raise MessageError(
+                    f"{path}: carrier identity changed during resolution; refusing"
+                )
+        except OSError as exc:
+            raise MessageError(f"{path}: cannot verify carrier identity: {exc}") from exc
+    return resolved
+
+
 def inbox_path(messages_dir: Path, dispatch_id: str) -> Path:
-    return messages_dir / f"{dispatch_id}.jsonl"
+    token = validate_stream_id(dispatch_id)
+    lexical_base = _lexical_absolute(Path(messages_dir))
+    resolved_base = lexical_base.resolve(strict=False)
+    candidate = _canonical_jsonl_path(lexical_base / f"{token}.jsonl")
+    if candidate.parent != resolved_base:
+        raise MessageError(f"dispatch_id: resolved inbox escapes messages directory: {dispatch_id!r}")
+    return candidate
 
 
 def mail_lock_path(path: Path) -> Path:
-    return path.with_name(f".{path.name}.lock")
+    resolved = Path(path).resolve(strict=False)
+    return resolved.with_name(f".{resolved.name}.lock")
 
 
 @contextlib.contextmanager
 def mail_lock(path: Path):
     lock = mail_lock_path(path)
     lock.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    with lock.open("w", encoding="utf-8") as fh:
+    if lock.is_symlink():
+        raise MessageError(f"{lock}: symlinked lock refused")
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(lock, flags, 0o600)
+    except OSError as exc:
+        raise MessageError(f"{lock}: cannot open carrier lock: {exc}") from exc
+    with os.fdopen(fd, "r+", encoding="utf-8") as fh:
         goalflight_compat.flock(fh, goalflight_compat.LOCK_EX)
         try:
             yield
@@ -491,7 +591,102 @@ def advance_read_cursor(
     return results
 
 
-def validate_envelope(envelope: dict, *, path: str = "envelope") -> None:
+def _bounded_nonblank_string(value: object, *, path: str, limit: int) -> str:
+    if not isinstance(value, str) or not value.strip() or len(value) > limit:
+        raise MessageError(f"{path}: expected 1..{limit} non-blank characters")
+    return value
+
+
+def _validate_rfc3339(value: object, *, path: str) -> str:
+    if not isinstance(value, str) or len(value) > 64 or not RFC3339_RE.fullmatch(value):
+        raise MessageError(f"{path}: expected an RFC3339 timestamp with timezone")
+    try:
+        parsed = dt.datetime.fromisoformat(value[:-1] + "+00:00" if value.endswith("Z") else value)
+    except ValueError as exc:
+        raise MessageError(f"{path}: invalid RFC3339 timestamp: {exc}") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise MessageError(f"{path}: RFC3339 timestamp must include a timezone")
+    return value
+
+
+def _validate_json_tree(
+    value: object,
+    *,
+    path: str,
+    depth: int = 0,
+    ancestors: frozenset[int] = frozenset(),
+) -> None:
+    if depth > MAX_JSON_DEPTH:
+        raise MessageError(f"{path}: JSON nesting exceeds maximum depth {MAX_JSON_DEPTH}")
+    if value is None or isinstance(value, (str, bool, int)):
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise MessageError(f"{path}: non-finite JSON number refused")
+        return
+    if isinstance(value, (dict, list)):
+        identity = id(value)
+        if identity in ancestors:
+            raise MessageError(f"{path}: cyclic JSON value refused")
+        nested_ancestors = ancestors | {identity}
+        if isinstance(value, dict):
+            for key, nested in value.items():
+                if not isinstance(key, str):
+                    raise MessageError(f"{path}: JSON object keys must be strings")
+                _validate_json_tree(
+                    nested,
+                    path=f"{path}.{key}",
+                    depth=depth + 1,
+                    ancestors=nested_ancestors,
+                )
+        else:
+            for index, nested in enumerate(value):
+                _validate_json_tree(
+                    nested,
+                    path=f"{path}[{index}]",
+                    depth=depth + 1,
+                    ancestors=nested_ancestors,
+                )
+        return
+    raise MessageError(f"{path}: value of type {type(value).__name__} is not JSON-serializable")
+
+
+def _canonical_json_text(value: object, *, path: str, byte_limit: int) -> str:
+    _validate_json_tree(value, path=path)
+    try:
+        serialized = json.dumps(
+            value,
+            allow_nan=False,
+            ensure_ascii=False,
+            sort_keys=False,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError, OverflowError, RecursionError) as exc:
+        raise MessageError(f"{path}: JSON serialization refused: {type(exc).__name__}: {exc}") from exc
+    size = len(serialized.encode("utf-8"))
+    if size > byte_limit:
+        raise MessageError(f"{path}: canonical JSON is {size} bytes; limit is {byte_limit}")
+    return serialized
+
+
+def validate_payload(payload: object, *, path: str = "payload") -> dict:
+    if not isinstance(payload, dict):
+        raise MessageError("payload must be an object")
+    _canonical_json_text(payload, path=path, byte_limit=MAX_PAYLOAD_JSON_BYTES)
+    return payload
+
+
+@functools.lru_cache(maxsize=512)
+def _canonical_project_root_text(project_root: str) -> str:
+    return str(_canonical_project_root(Path(project_root)))
+
+
+def validate_envelope(
+    envelope: dict,
+    *,
+    path: str = "envelope",
+    expected_dispatch_id: str | None = None,
+) -> str:
     if not isinstance(envelope, dict):
         raise MessageError(f"{path}: expected object")
     for field in REQUIRED_ENVELOPE_FIELDS:
@@ -501,13 +696,38 @@ def validate_envelope(envelope: dict, *, path: str = "envelope") -> None:
         raise MessageError(f"{path}: schema must be goalflight.message.v1")
     if envelope.get("schema_version") != 1:
         raise MessageError(f"{path}: unsupported schema_version")
+    event_id = _bounded_nonblank_string(envelope.get("id"), path=f"{path}.id", limit=36)
+    try:
+        parsed_event_id = uuid.UUID(event_id)
+    except ValueError as exc:
+        raise MessageError(f"{path}.id: expected a UUID") from exc
+    if str(parsed_event_id) != event_id:
+        raise MessageError(f"{path}.id: expected a canonical lowercase UUID")
+    dispatch_id = validate_stream_id(envelope.get("dispatch_id"), path=f"{path}.dispatch_id")
+    if expected_dispatch_id is not None and dispatch_id != expected_dispatch_id:
+        raise MessageError(
+            f"{path}.dispatch_id: {dispatch_id!r} does not match stream {expected_dispatch_id!r}"
+        )
     require_positive_int_seq(envelope.get("seq"), path=f"{path}.seq")
+    _validate_rfc3339(envelope.get("ts"), path=f"{path}.ts")
     source = envelope.get("source")
     if not isinstance(source, dict):
         raise MessageError(f"{path}.source: expected object")
     for key in ("node", "adapter", "transport"):
         if key not in source:
             raise MessageError(f"{path}.source: missing {key}")
+        _bounded_nonblank_string(
+            source.get(key), path=f"{path}.source.{key}", limit=MAX_SOURCE_VALUE_LENGTH
+        )
+    msg_type = envelope.get("type")
+    if not isinstance(msg_type, str) or not MESSAGE_TYPE_RE.fullmatch(msg_type):
+        raise MessageError(f"{path}.type: expected a bounded message-type token")
+    if "priority" in envelope and envelope.get("priority") not in MESSAGE_PRIORITIES:
+        raise MessageError(
+            f"{path}.priority: expected one of {', '.join(sorted(MESSAGE_PRIORITIES))}"
+        )
+    if not isinstance(envelope.get("payload"), dict):
+        raise MessageError(f"{path}.payload: expected object")
     addressee = envelope.get("addressee")
     if addressee is not None:
         if not isinstance(addressee, dict):
@@ -517,17 +737,23 @@ def validate_envelope(envelope: dict, *, path: str = "envelope") -> None:
         label = addressee.get("label")
         if not isinstance(label, str) or not label.strip() or len(label.strip()) > 64:
             raise MessageError(f"{path}.addressee.label: expected 1..64 non-blank characters")
-        project_root = addressee.get("project_root")
-        if (
-            not isinstance(project_root, str)
-            or not project_root.strip()
-            or not Path(project_root).is_absolute()
-        ):
+        project_root = _bounded_nonblank_string(
+            addressee.get("project_root"),
+            path=f"{path}.addressee.project_root",
+            limit=MAX_PROJECT_ROOT_LENGTH,
+        )
+        if not Path(project_root).is_absolute():
             raise MessageError(f"{path}.addressee.project_root: expected an absolute path")
+        canonical_root = _canonical_project_root_text(project_root)
+        if project_root != canonical_root:
+            raise MessageError(
+                f"{path}.addressee.project_root: expected canonical root {canonical_root!r}"
+            )
         if envelope.get("type") not in CONTROLLER_CHANNEL_TYPES:
             raise MessageError(
                 f"{path}.addressee: controller addressing is only valid for controller-channel types"
             )
+    return _canonical_json_text(envelope, path=path, byte_limit=MAX_ENVELOPE_JSON_BYTES)
 
 
 def controller_addressee(label: str, *, project_root: Path | str) -> dict[str, str]:
@@ -544,7 +770,7 @@ def controller_addressee(label: str, *, project_root: Path | str) -> dict[str, s
 
 
 def controller_address_project_root(project_root: Path | str) -> str:
-    return str(_canonical_project_root(Path(project_root)))
+    return _canonical_project_root_text(str(project_root))
 
 
 def controller_addressee_label(envelope: dict) -> str | None:
@@ -651,11 +877,10 @@ def _canonical_envelope_identity(envelope: dict) -> str:
     """Full source content identity; controller ingestion metadata is transport-local."""
     clean = _without_inbox_metadata(envelope)
     clean.pop(_INGESTION_ORDER_FIELD, None)
-    return json.dumps(
+    return _canonical_json_text(
         clean,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
+        path="envelope identity",
+        byte_limit=MAX_ENVELOPE_JSON_BYTES,
     )
 
 
@@ -669,78 +894,300 @@ def _event_causal_sort_key(envelope: dict) -> tuple[object, ...]:
     return (0, stream_keys, int(envelope.get("seq", 0)), identity)
 
 
-def _read_envelope_prefix(path: Path) -> tuple[list[dict], dict[str, object] | None]:
-    """Return the validated prefix and the first carrier corruption, if any."""
-    if not path.exists():
-        return [], None
-    if not path.is_file():
-        # Non-regular inbox (FIFO/device): read_text()'s open() would block forever.
-        # is_file() is a non-blocking stat; treat a non-regular inbox as empty so no
-        # reader (build_aggregate, next_seq, the watcher bridge) can hang on it.
-        return [], None
-    envelopes: list[dict] = []
+def quarantine_path(path: Path) -> Path:
+    canonical = _canonical_jsonl_path(Path(path))
+    return canonical.with_name(f"{canonical.name}.quarantine.jsonl")
+
+
+def _require_carrier_path(path: Path) -> str:
+    canonical = _canonical_jsonl_path(Path(path))
+    return validate_stream_id(canonical.stem, path=f"{canonical}.stream")
+
+
+def _read_nofollow_bytes(path: Path) -> bytes:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
     try:
-        lines = path.read_bytes().splitlines()
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        return b""
     except OSError as exc:
-        detail = f"{path}: unreadable carrier: {type(exc).__name__}: {exc}"
-        return [], {
-            "path": str(path),
-            "line": None,
-            "error": detail,
-            "validated_envelopes": 0,
-            "validated_through_seq": 0,
-        }
-    for line_no, raw_line in enumerate(lines, start=1):
-        try:
-            line = raw_line.decode("utf-8")
-        except UnicodeDecodeError as exc:
-            detail = f"{path}:{line_no}: invalid UTF-8: {exc}"
-            return envelopes, {
-                "path": str(path),
-                "line": line_no,
-                "error": detail,
-                "validated_envelopes": len(envelopes),
-                "validated_through_seq": max(
-                    (int(env.get("seq", 0)) for env in envelopes),
-                    default=0,
-                ),
-            }
-        stripped = line.strip()
-        if not stripped:
+        raise MessageError(f"{path}: unreadable carrier: {type(exc).__name__}: {exc}") from exc
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise MessageError(f"{path}: inbox is not a regular file; refusing access")
+        with os.fdopen(fd, "rb") as handle:
+            fd = -1
+            return handle.read()
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _append_fsync(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if path.is_symlink():
+        raise MessageError(f"{path}: symlinked file refused")
+    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags, 0o600)
+    except OSError as exc:
+        raise MessageError(f"{path}: cannot append carrier: {exc}") from exc
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise MessageError(f"{path}: append target is not a regular file")
+        with os.fdopen(fd, "ab", buffering=0) as handle:
+            fd = -1
+            handle.write(data)
+            os.fsync(handle.fileno())
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _replace_fsync(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if path.is_symlink():
+        raise MessageError(f"{path}: symlinked inbox refused")
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.tmp-", dir=path.parent)
+    tmp = Path(tmp_name)
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            fd = -1
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+        _fsync_directory(path.parent)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        tmp.unlink(missing_ok=True)
+
+
+@dataclass
+class CarrierTransaction:
+    """The only raw JSONL write surface; callers already hold its canonical lock."""
+
+    path: Path
+    _read_succeeded: bool = False
+
+    def read_bytes(self) -> bytes:
+        self._read_succeeded = False
+        data = _read_nofollow_bytes(self.path)
+        self._read_succeeded = True
+        return data
+
+    def _require_read_before_write(self) -> None:
+        if not self._read_succeeded:
+            raise MessageError(
+                f"CARRIER-UNREADABLE: retryable write refused until {self.path} "
+                "has been read successfully under this transaction lock"
+            )
+
+    def append_bytes(self, data: bytes) -> None:
+        if not isinstance(data, bytes):
+            raise TypeError("carrier append requires bytes")
+        self._require_read_before_write()
+        _append_fsync(self.path, data)
+
+    def replace_bytes(self, data: bytes) -> None:
+        if not isinstance(data, bytes):
+            raise TypeError("carrier replacement requires bytes")
+        self._require_read_before_write()
+        _replace_fsync(self.path, data)
+
+
+@contextlib.contextmanager
+def carrier_transaction(path: Path, *, quarantine_sidecar: bool = False):
+    """Validate one lexical path, then lock its canonical JSONL carrier."""
+    canonical = _canonical_jsonl_path(Path(path), allow_quarantine=quarantine_sidecar)
+    canonical.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with mail_lock(canonical):
+        yield CarrierTransaction(canonical)
+
+
+def _quarantine_row(path: Path, offset: int, reason: str, raw_line: bytes) -> dict:
+    canonical = _canonical_jsonl_path(Path(path))
+    return {
+        "path": str(canonical),
+        "offset": offset,
+        "reason": reason,
+        "hash": hashlib.sha256(raw_line).hexdigest(),
+        "bytes": list(raw_line[:QUARANTINE_BYTES_LIMIT]),
+    }
+
+
+def _record_quarantine(row: dict) -> None:
+    carrier = _canonical_jsonl_path(Path(str(row["path"])))
+    canonical_row = {**row, "path": str(carrier)}
+    sidecar = quarantine_path(carrier)
+    identity = (canonical_row["path"], canonical_row["offset"], canonical_row["hash"])
+    with carrier_transaction(sidecar, quarantine_sidecar=True) as transaction:
+        existing = transaction.read_bytes()
+        for raw in existing.splitlines():
+            try:
+                item = json.loads(raw)
+            except (UnicodeDecodeError, ValueError, RecursionError):
+                continue
+            if not isinstance(item, dict):
+                continue
+            if (item.get("path"), item.get("offset"), item.get("hash")) == identity:
+                return
+        transaction.append_bytes(
+            (json.dumps(canonical_row, ensure_ascii=False, separators=(",", ":")) + "\n").encode(
+                "utf-8"
+            ),
+        )
+
+
+def record_carrier_quarantine(path: Path, offset: int, reason: str, raw_line: bytes) -> dict:
+    """Record one malformed JSONL row using canonical path identity."""
+    row = _quarantine_row(path, offset, reason, raw_line)
+    _record_quarantine(row)
+    return row
+
+
+def _carrier_error(
+    path: Path,
+    *,
+    line_no: int | None,
+    offset: int | None,
+    reason: str,
+    raw_line: bytes | None,
+    envelopes: list[dict],
+) -> dict[str, object]:
+    error: dict[str, object] = {
+        "path": str(path),
+        "line": line_no,
+        "offset": offset,
+        "error": f"{path}{f':{line_no}' if line_no is not None else ''}: {reason}",
+        "reason": reason,
+        "validated_envelopes": len(envelopes),
+        "validated_through_seq": max(
+            (int(env.get("seq", 0)) for env in envelopes), default=0
+        ),
+    }
+    if raw_line is not None and offset is not None:
+        row = _quarantine_row(path, offset, reason, raw_line)
+        error.update({"hash": row["hash"], "bytes": row["bytes"]})
+    return error
+
+
+def _read_envelope_records(
+    path: Path, *, tolerate_errors: bool, locked_data: bytes | None = None
+) -> CarrierReadResult:
+    path = _canonical_jsonl_path(Path(path))
+    expected_dispatch_id = _require_carrier_path(path)
+    try:
+        data = _read_nofollow_bytes(path) if locked_data is None else locked_data
+    except MessageError as exc:
+        error = _carrier_error(
+            path,
+            line_no=None,
+            offset=None,
+            reason=str(exc),
+            raw_line=None,
+            envelopes=[],
+        )
+        error["carrier_status"] = CarrierReadStatus.CARRIER_UNREADABLE.value
+        return CarrierReadResult(
+            CarrierReadStatus.CARRIER_UNREADABLE,
+            (),
+            (error,),
+        )
+    envelopes: list[dict] = []
+    errors: list[dict[str, object]] = []
+    offset = 0
+    for line_no, chunk in enumerate(data.splitlines(keepends=True), start=1):
+        raw_line = chunk.rstrip(b"\r\n")
+        line_offset = offset
+        offset += len(chunk)
+        if not raw_line.strip():
             continue
+        reason: str | None = None
+        envelope: object = None
         try:
-            envelope = json.loads(stripped)
-        except json.JSONDecodeError as exc:
-            detail = f"{path}:{line_no}: invalid JSON: {exc}"
-            return envelopes, {
-                "path": str(path),
-                "line": line_no,
-                "error": detail,
-                "validated_envelopes": len(envelopes),
-                "validated_through_seq": max(
-                    (int(env.get("seq", 0)) for env in envelopes),
-                    default=0,
-                ),
-            }
-        try:
-            validate_envelope(envelope, path=f"{path}:{line_no}")
-        except MessageError as exc:
-            return envelopes, {
-                "path": str(path),
-                "line": line_no,
-                "error": str(exc),
-                "validated_envelopes": len(envelopes),
-                "validated_through_seq": max(
-                    (int(env.get("seq", 0)) for env in envelopes),
-                    default=0,
-                ),
-            }
-        envelopes.append(envelope)
-    return envelopes, None
+            decoded = raw_line.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            reason = f"invalid UTF-8: {exc}"
+        if reason is None:
+            try:
+                envelope = json.loads(decoded)
+            except (ValueError, RecursionError) as exc:
+                reason = f"invalid JSON: {exc}"
+        if reason is None:
+            try:
+                validate_envelope(
+                    envelope,
+                    path=f"{path}:{line_no}",
+                    expected_dispatch_id=expected_dispatch_id,
+                )
+            except (MessageError, ValueError, RecursionError) as exc:
+                reason = str(exc)
+        if reason is not None:
+            error = _carrier_error(
+                path,
+                line_no=line_no,
+                offset=line_offset,
+                reason=reason,
+                raw_line=raw_line,
+                envelopes=envelopes,
+            )
+            errors.append(error)
+            _record_quarantine(
+                _quarantine_row(path, line_offset, reason, raw_line)
+            )
+            if not tolerate_errors:
+                break
+            continue
+        envelopes.append(envelope)  # type: ignore[arg-type]
+    status = (
+        CarrierReadStatus.CORRUPT_RECORDS_QUARANTINED
+        if errors
+        else CarrierReadStatus.OK
+    )
+    return CarrierReadResult(status, tuple(envelopes), tuple(errors))
 
 
-def _emit_carrier_error(error: dict[str, object]) -> None:
-    print(f"WARNING: carrier corruption: {error.get('error')}", file=sys.stderr)
+def read_envelopes_result(
+    path: Path, *, tolerate_errors: bool = True
+) -> CarrierReadResult:
+    """Return the explicit ok/quarantined/unreadable carrier read state."""
+    return _read_envelope_records(path, tolerate_errors=tolerate_errors)
+
+
+def _read_envelope_prefix(path: Path) -> tuple[list[dict], dict[str, object] | None]:
+    """Return the validated prefix and first error for strict audit callers."""
+    result = read_envelopes_result(path, tolerate_errors=False)
+    return list(result.envelopes), result.errors[0] if result.errors else None
+
+
+def _emit_carrier_error(error: dict[str, object], *, stream=None) -> None:
+    # TODO(P2-outbox): commit a waking corruption event beside this stderr warning.
+    print(
+        f"WARNING: carrier corruption: {error.get('error')}",
+        file=sys.stderr if stream is None else stream,
+    )
 
 
 def read_envelopes(path: Path, *, last_n: int | None = None) -> list[dict]:
@@ -752,26 +1199,88 @@ def read_envelopes(path: Path, *, last_n: int | None = None) -> list[dict]:
     return envelopes
 
 
+def read_envelopes_tolerant(
+    path: Path,
+    *,
+    last_n: int | None = None,
+    carrier_errors: list[dict[str, object]] | None = None,
+) -> list[dict]:
+    result = read_envelopes_result(path, tolerate_errors=True)
+    envelopes = list(result.envelopes)
+    errors = list(result.errors)
+    if result.status is CarrierReadStatus.CARRIER_UNREADABLE:
+        detail = str(errors[0]["error"]) if errors else str(path)
+        raise MessageError(f"CARRIER-UNREADABLE: retryable carrier read: {detail}")
+    if carrier_errors is not None:
+        carrier_errors.extend(errors)
+    elif errors:
+        for error in errors:
+            _emit_carrier_error(error)
+    if last_n is not None and last_n >= 0:
+        return envelopes[-last_n:] if last_n else []
+    return envelopes
+
+
+def _read_envelopes_for_write(transaction: CarrierTransaction) -> list[dict]:
+    try:
+        locked_data = transaction.read_bytes()
+    except MessageError as exc:
+        raise MessageError(
+            f"CARRIER-UNREADABLE: retryable carrier read refused write: {exc}"
+        ) from exc
+    result = _read_envelope_records(
+        transaction.path,
+        tolerate_errors=True,
+        locked_data=locked_data,
+    )
+    for error in result.errors:
+        _emit_carrier_error(error)
+    return list(result.envelopes)
+
+
 def serialize_envelope_line(envelope: dict) -> str:
     """Canonical single-line JSON bytes for register append (file or MCP)."""
-    validate_envelope(envelope)
-    return json.dumps(envelope, separators=(",", ":")) + "\n"
+    return validate_envelope(envelope) + "\n"
 
 
-def append_envelope(path: Path, envelope: dict) -> None:
-    line = serialize_envelope_line(envelope)
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    with path.open("a", encoding="utf-8") as fh:
-        fh.write(line)
+def _serialize_envelope_for_stream(path: Path, envelope: dict) -> bytes:
+    dispatch_id = _require_carrier_path(path)
+    serialized = validate_envelope(envelope, expected_dispatch_id=dispatch_id)
+    return (serialized + "\n").encode("utf-8")
 
 
-def rewrite_envelopes(path: Path, envelopes: list[dict]) -> None:
-    lines = [serialize_envelope_line(envelope) for envelope in envelopes]
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    tmp = path.with_name(f".{path.name}.tmp")
-    with tmp.open("w", encoding="utf-8") as fh:
-        fh.writelines(lines)
-    tmp.replace(path)
+def _carrier_append_locked(transaction: CarrierTransaction, envelope: dict) -> None:
+    transaction.append_bytes(_serialize_envelope_for_stream(transaction.path, envelope))
+
+
+def _carrier_rewrite_locked(transaction: CarrierTransaction, envelopes: list[dict]) -> None:
+    _require_carrier_path(transaction.path)
+    data = b"".join(
+        _serialize_envelope_for_stream(transaction.path, envelope) for envelope in envelopes
+    )
+    transaction.replace_bytes(data)
+
+
+CarrierResult = TypeVar("CarrierResult")
+
+
+def update_envelopes(
+    path: Path,
+    update: Callable[[list[dict]], tuple[list[dict] | None, CarrierResult]],
+) -> CarrierResult:
+    """Own one locked read-modify-write carrier transaction.
+
+    Returning ``None`` as the replacement performs no write.  Replacements use
+    a unique fsync'd temporary file and an fsync'd directory replace.
+    """
+    path = _canonical_jsonl_path(Path(path))
+    _require_carrier_path(path)
+    with carrier_transaction(path) as transaction:
+        existing = _read_envelopes_for_write(transaction)
+        replacement, result = update(list(existing))
+        if replacement is not None:
+            _carrier_rewrite_locked(transaction, replacement)
+        return result
 
 
 def post_message(
@@ -788,51 +1297,81 @@ def post_message(
     deliver_to_worker: bool = False,
     retain_terminal_worker_view: bool = False,
     addressee: dict | None = None,
+    skip_if: Callable[[dict], bool] | None = None,
+    replace_if: Callable[[dict], bool] | None = None,
 ) -> dict:
     """Append one goalflight.message.v1 envelope; shared by CLI, MCP, and tests."""
-    if not isinstance(payload, dict):
-        raise MessageError("payload must be an object")
+    validate_payload(payload)
     path = inbox_path(messages_dir, dispatch_id)
-    if path.exists() and not path.is_file():
-        # Fail CLOSED on a non-regular inbox (FIFO/device) before any open():
-        # open("a") below would block the caller forever. Centralised here so
-        # CLI / MCP / direct writers are all protected, not just the watcher bridge.
-        raise MessageError(f"{path}: inbox is not a regular file; refusing to write")
+    _require_carrier_path(path)
     provided_seq = require_positive_int_seq(seq, path="seq") if seq is not None else None
     base_source = {
         "node": "local",
         "adapter": "unknown",
         "transport": "controller",
     }
+    if source is not None and not isinstance(source, dict):
+        raise MessageError("source must be an object")
     if source:
         base_source.update(source)
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    with mail_lock(path):
+    envelope = {
+        "schema": "goalflight.message.v1",
+        "schema_version": 1,
+        "id": str(uuid.uuid4()),
+        "dispatch_id": dispatch_id,
+        "seq": provided_seq or 1,
+        "ts": utc_now(),
+        "source": base_source,
+        "type": msg_type,
+        "priority": priority or PRIORITY_BY_TYPE.get(msg_type, "normal"),
+        "payload": payload,
+    }
+    if addressee is not None:
+        if not isinstance(addressee, dict):
+            raise MessageError("addressee must be an object")
+        envelope["addressee"] = dict(addressee)
+    # Boundary validation, including canonical serialization, happens before any
+    # carrier/ingestion state is touched. The final seq-bearing form is validated
+    # and serialized again under the transaction lock.
+    validate_envelope(envelope, expected_dispatch_id=dispatch_id)
+    with carrier_transaction(path) as transaction:
+        existing = _read_envelopes_for_write(transaction)
         resolved_seq = require_positive_int_seq(
-            provided_seq if provided_seq is not None else next_seq(path),
+            provided_seq
+            if provided_seq is not None
+            else next_seq(transaction.path, envelopes=existing),
             path="seq",
         )
-        envelope = {
-            "schema": "goalflight.message.v1",
-            "schema_version": 1,
-            "id": str(uuid.uuid4()),
-            "dispatch_id": dispatch_id,
-            "seq": resolved_seq,
-            "ts": utc_now(),
-            "source": base_source,
-            "type": msg_type,
-            "priority": priority or PRIORITY_BY_TYPE.get(msg_type, "normal"),
-            "payload": payload,
-        }
-        if addressee is not None:
-            envelope["addressee"] = dict(addressee)
+        envelope["seq"] = resolved_seq
+        validate_envelope(envelope, expected_dispatch_id=dispatch_id)
+        if skip_if is not None:
+            duplicate = next((item for item in existing if skip_if(item)), None)
+            if duplicate is not None:
+                return {
+                    "envelope": duplicate,
+                    "line": serialize_envelope_line(duplicate),
+                    "path": str(path),
+                    "recorded": False,
+                    "delivery": {
+                        "requested": False,
+                        "delivered": False,
+                        "worker_view_written": False,
+                        "status": "duplicate",
+                        "detail": "matching carrier record already exists",
+                    },
+                }
         envelope[_INGESTION_ORDER_FIELD] = _ingestion_order_for_envelope(
             messages_dir,
             envelope,
         )
         line = serialize_envelope_line(envelope)
-        with path.open("a", encoding="utf-8") as fh:
-            fh.write(line)
+        if replace_if is not None:
+            _carrier_rewrite_locked(
+                transaction,
+                [item for item in existing if not replace_if(item)] + [envelope],
+            )
+        else:
+            _carrier_append_locked(transaction, envelope)
         # The messages lock orders both the canonical record and its materialized
         # worker view. Releasing it between the two writes lets concurrent posts
         # assign message seq 1/2 but append steer entries in the order 2/1.
@@ -938,7 +1477,7 @@ def _deliver_message_to_worker(
         # confirmation replies by sequence/generation rather than lose them.
         try:
             steer_path, steer_entry = goalflight_steer_mailbox.append_message_view(dispatch_id, envelope)
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, MessageError) as exc:
             return {
                 "requested": True,
                 "delivered": False,
@@ -972,7 +1511,7 @@ def _deliver_message_to_worker(
         }
     try:
         steer_path, steer_entry = goalflight_steer_mailbox.append_message_view(dispatch_id, envelope)
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, MessageError) as exc:
         return {
             "requested": True,
             "delivered": False,
@@ -1345,28 +1884,41 @@ def collect_inbox_paths(
     paths: dict[str, list[Path]] = {}
     if messages_dir.is_dir():
         for path in sorted(messages_dir.glob("*.jsonl")):
-            if path.is_file() and _want(path.stem):
-                paths.setdefault(path.stem, []).append(path)
+            if (
+                path.is_file()
+                and not path.is_symlink()
+                and not path.name.endswith(".quarantine.jsonl")
+                and STREAM_TOKEN_RE.fullmatch(path.stem)
+                and _want(path.stem)
+            ):
+                paths.setdefault(path.stem, []).append(path.resolve(strict=False))
     if fleet_dir is not None:
         register_dir = fleet_dir / "register" / "dispatches"
         if register_dir.is_dir():
             for path in sorted(register_dir.glob("*.jsonl")):
-                if path.is_file() and _want(path.stem):
-                    paths.setdefault(path.stem, []).append(path)
+                if (
+                    path.is_file()
+                    and not path.is_symlink()
+                    and not path.name.endswith(".quarantine.jsonl")
+                    and STREAM_TOKEN_RE.fullmatch(path.stem)
+                    and _want(path.stem)
+                ):
+                    paths.setdefault(path.stem, []).append(path.resolve(strict=False))
     return [path for dispatch_id in sorted(paths) for path in paths[dispatch_id]]
 
 
 def inbox_stream_key(path: Path, *, messages_dir: Path) -> str:
     """Stable cursor identity for one independently sequenced inbox stream."""
-    source = "local" if path.parent == messages_dir else "fleet"
-    return json.dumps([source, path.stem], ensure_ascii=False, separators=(",", ":"))
+    canonical = Path(path).resolve(strict=False)
+    source = "local" if canonical.parent == Path(messages_dir).resolve(strict=False) else "fleet"
+    return json.dumps([source, canonical.stem], ensure_ascii=False, separators=(",", ":"))
 
 
 def logical_envelopes_for_paths(
     paths: list[Path],
     *,
     messages_dir: Path | None = None,
-    tolerate_errors: bool = False,
+    tolerate_errors: bool = True,
     envelope_filter: Callable[[dict], bool] | None = None,
     carrier_errors: list[dict[str, object]] | None = None,
 ) -> list[dict]:
@@ -1380,12 +1932,10 @@ def logical_envelopes_for_paths(
             else path.stem
         )
         if tolerate_errors:
-            envelopes, error = _read_envelope_prefix(path)
-            if error is not None:
-                if carrier_errors is not None:
-                    carrier_errors.append(error)
-                else:
-                    _emit_carrier_error(error)
+            envelopes = read_envelopes_tolerant(
+                path,
+                carrier_errors=carrier_errors,
+            )
         else:
             envelopes = read_envelopes(path)
         for envelope in envelopes:
@@ -1422,12 +1972,10 @@ def max_seq_by_inbox(
 ) -> dict[str, int]:
     maxes: dict[str, int] = {}
     for path in collect_inbox_paths(messages_dir, fleet_dir, dispatch_ids=dispatch_ids):
-        envelopes, error = _read_envelope_prefix(path)
-        if error is not None:
-            if carrier_errors is not None:
-                carrier_errors.append(error)
-            else:
-                _emit_carrier_error(error)
+        envelopes = read_envelopes_tolerant(
+            path,
+            carrier_errors=carrier_errors,
+        )
         maxes[inbox_stream_key(path, messages_dir=messages_dir)] = max(
             (int(env.get("seq", 0)) for env in envelopes),
             default=0,
@@ -1605,26 +2153,11 @@ def cmd_from_text(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_append(args: argparse.Namespace) -> int:
-    if args.envelope_file:
-        envelope = json.loads(Path(args.envelope_file).read_text())
-    else:
-        envelope = json.loads(sys.stdin.read())
-    if isinstance(envelope, dict):
-        envelope = dict(envelope)
-        envelope[_INGESTION_ORDER_FIELD] = _ingestion_order_for_envelope(
-            args.messages_dir,
-            envelope,
-        )
-    path = inbox_path(args.messages_dir, args.dispatch_id)
-    append_envelope(path, envelope)
-    if args.refresh_aggregate:
-        refresh_aggregate(args.fleet_dir, messages_dir=args.messages_dir)
-    return 0
-
-
 def cmd_post(args: argparse.Namespace) -> int:
-    payload = json.loads(args.payload) if args.payload else {"text": args.text or ""}
+    try:
+        payload = json.loads(args.payload) if args.payload else {"text": args.text or ""}
+    except (ValueError, RecursionError) as exc:
+        raise MessageError(f"payload is invalid JSON: {exc}") from exc
     if getattr(args, "subject", None) and isinstance(payload, dict):
         payload.setdefault("subject", args.subject)
     source = {
@@ -2881,10 +3414,7 @@ def emit_controller_mail_notice(
             fleet_dir=fleet_dir,
         )
         for error in summary.get("carrier_errors") or []:
-            print(
-                f"WARNING: carrier corruption: {error.get('error')}",
-                file=sys.stderr if stream is None else stream,
-            )
+            _emit_carrier_error(error, stream=stream)
         count = int(summary.get("count") or 0)
         # Emit the listener reminder BEFORE the mail-count early return: a
         # controller with dispatches in flight and no unread mail is precisely
@@ -3607,11 +4137,14 @@ STEERING_DISPATCH_ID = "fleet-steering"
 
 
 def steering_register_path(fleet_dir: Path) -> Path:
-    return fleet_dir / "register" / "dispatches" / f"{STEERING_DISPATCH_ID}.jsonl"
+    return _canonical_jsonl_path(
+        fleet_dir / "register" / "dispatches" / f"{STEERING_DISPATCH_ID}.jsonl"
+    )
 
 
-def next_seq(path: Path) -> int:
-    envelopes = read_envelopes(path) if path.exists() else []
+def next_seq(path: Path, *, envelopes: list[dict] | None = None) -> int:
+    if envelopes is None:
+        envelopes = read_envelopes_tolerant(path)
     if not envelopes:
         return 1
     return max(int(env.get("seq", 0)) for env in envelopes) + 1
@@ -3628,14 +4161,14 @@ def write_steering_envelope(
 ) -> dict:
     path = steering_register_path(fleet_dir)
     resolved_messages_dir = messages_dir or default_messages_dir()
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    with mail_lock(path):
+
+    def update(existing: list[dict]) -> tuple[list[dict], dict]:
         envelope = {
             "schema": "goalflight.message.v1",
             "schema_version": 1,
             "id": str(uuid.uuid4()),
             "dispatch_id": STEERING_DISPATCH_ID,
-            "seq": next_seq(path),
+            "seq": max((int(item.get("seq", 0)) for item in existing), default=0) + 1,
             "ts": utc_now(),
             "source": {"node": "local", "adapter": "fleet", "transport": "controller"},
             "type": "steering",
@@ -3651,7 +4184,9 @@ def write_steering_envelope(
             resolved_messages_dir,
             envelope,
         )
-        append_envelope(path, envelope)
+        return existing + [envelope], envelope
+
+    envelope = update_envelopes(path, update)
     refresh_aggregate(fleet_dir, messages_dir=resolved_messages_dir)
     return envelope
 
@@ -3665,13 +4200,15 @@ def merge_remote_register(
     """Merge remote dispatch jsonl into fleet register using monotonic seq rules."""
     if not remote_jsonl.exists():
         raise MessageError(f"remote file missing: {remote_jsonl}")
-    remote = read_envelopes(remote_jsonl)
-    dest = fleet_dir / "register" / "dispatches" / remote_jsonl.name
-    dest.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    remote_errors: list[dict[str, object]] = []
+    remote = read_envelopes_tolerant(remote_jsonl, carrier_errors=remote_errors)
+    dest = _canonical_jsonl_path(
+        fleet_dir / "register" / "dispatches" / remote_jsonl.name
+    )
     resolved_messages_dir = messages_dir or default_messages_dir()
-    appended = 0
-    with mail_lock(dest):
-        existing = read_envelopes(dest) if dest.exists() else []
+
+    def update(existing: list[dict]) -> tuple[list[dict] | None, int]:
+        appended_envelopes: list[dict] = []
         seen_seq = {int(env.get("seq", 0)) for env in existing}
         for env in remote:
             seq = int(env.get("seq", 0))
@@ -3682,11 +4219,21 @@ def merge_remote_register(
                 resolved_messages_dir,
                 ingested,
             )
-            append_envelope(dest, ingested)
+            appended_envelopes.append(ingested)
             seen_seq.add(seq)
-            appended += 1
+        return (
+            existing + appended_envelopes if appended_envelopes else None,
+            len(appended_envelopes),
+        )
+
+    appended = update_envelopes(dest, update)
     aggregate = refresh_aggregate(fleet_dir, messages_dir=resolved_messages_dir)
-    return {"merged_into": str(dest), "appended": appended, "open_user_needs": len(aggregate.get("open_user_needs") or [])}
+    return {
+        "merged_into": str(dest),
+        "appended": appended,
+        "quarantined": len(remote_errors),
+        "open_user_needs": len(aggregate.get("open_user_needs") or []),
+    }
 
 
 def cmd_listen(args) -> int:
@@ -3805,12 +4352,6 @@ def main(argv: list[str] | None = None) -> int:
     )
     from_text.add_argument("--json", action="store_true")
     from_text.set_defaults(func=cmd_from_text)
-
-    append = sub.add_parser("append")
-    append.add_argument("--dispatch-id", required=True)
-    append.add_argument("--envelope-file", type=Path)
-    append.add_argument("--refresh-aggregate", action="store_true")
-    append.set_defaults(func=cmd_append)
 
     post = sub.add_parser("post", help="Append one envelope (canonical file path)")
     post.add_argument("--dispatch-id", required=True)
@@ -3941,7 +4482,11 @@ def main(argv: list[str] | None = None) -> int:
     mirror.set_defaults(func=cmd_mirror)
 
     args = parser.parse_args(argv)
-    return args.func(args)
+    try:
+        return args.func(args)
+    except MessageError as exc:
+        print(f"{args.cmd}: refused: {exc}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

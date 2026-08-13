@@ -3786,35 +3786,36 @@ def _post_task_store_nudge(
         project_root_text = str(project_root.resolve())
         key = f"{nudge_kind}:{project_slug}:{dedup_suffix}"
         failure_key = key
-        lock_path = messages_dir / f".{dispatch_id}.lock"
-        messages_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        with FileLock(lock_path):
-            envelopes = gm.read_envelopes(inbox)
-            current_nudges = [
-                e
-                for e in envelopes
-                if e.get("type") == "user_need" and (e.get("payload") or {}).get("nudge_kind") == nudge_kind
-            ]
-            current_keys = [str((e.get("payload") or {}).get("dedup_key") or "") for e in current_nudges]
-            if key in current_keys:
-                return
-            if current_nudges:
-                stale_ids = {str(e.get("id") or "") for e in current_nudges}
-                gm.rewrite_envelopes(inbox, [e for e in envelopes if str(e.get("id") or "") not in stale_ids])
-            gm.post_message(
-                dispatch_id=dispatch_id,
-                msg_type="user_need",
-                payload={
-                    "text": text,
-                    "dedup_key": key,
-                    "nudge_kind": nudge_kind,
-                    "project_root": project_root_text,
-                    "project_slug": project_slug,
-                    **payload,
-                },
-                messages_dir=messages_dir,
-                source={"node": "local", "adapter": "task-store", "transport": transport},
+        def is_current_kind(envelope: dict) -> bool:
+            envelope_payload = envelope.get("payload")
+            return (
+                envelope.get("type") == "user_need"
+                and isinstance(envelope_payload, dict)
+                and envelope_payload.get("nudge_kind") == nudge_kind
             )
+
+        def is_duplicate(envelope: dict) -> bool:
+            envelope_payload = envelope.get("payload")
+            return is_current_kind(envelope) and isinstance(envelope_payload, dict) and str(
+                envelope_payload.get("dedup_key") or ""
+            ) == key
+
+        gm.post_message(
+            dispatch_id=dispatch_id,
+            msg_type="user_need",
+            payload={
+                "text": text,
+                "dedup_key": key,
+                "nudge_kind": nudge_kind,
+                "project_root": project_root_text,
+                "project_slug": project_slug,
+                **payload,
+            },
+            messages_dir=messages_dir,
+            source={"node": "local", "adapter": "task-store", "transport": transport},
+            skip_if=is_duplicate,
+            replace_if=is_current_kind,
+        )
     except Exception as exc:
         if failure_key not in _NEXT_NUDGE_LOGGED_FAILURES:
             _NEXT_NUDGE_LOGGED_FAILURES.add(failure_key)

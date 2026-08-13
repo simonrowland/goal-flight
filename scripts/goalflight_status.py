@@ -1988,7 +1988,7 @@ def _posted_advisory_keys(messages_dir: Path) -> set[str]:
     try:
         import goalflight_messages as _gm
 
-        envelopes = _gm.read_envelopes(
+        envelopes = _gm.read_envelopes_tolerant(
             _gm.inbox_path(messages_dir, goalflight_quota_stuck.QUOTA_STUCK_CONTROLLER_DISPATCH_ID)
         )
     except Exception:
