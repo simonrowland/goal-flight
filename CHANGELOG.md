@@ -6,7 +6,57 @@ incremented when meaningful skill behaviour changes.
 
 ## [Unreleased]
 
+## [1.4.0] — 2026-08-13
+
 ### Added
+
+- `scripts/goalflight_journal.py`: a per-project transactional state journal
+  (SQLite/WAL) that becomes the single substrate for coordination state, with
+  the message streams demoted to an idempotent projection of it. Carries a
+  schema/protocol epoch table enforced on every read, so a stale copy deployed
+  elsewhere is refused rather than silently misreading; a startup integrity
+  check that fails closed with an operator-readable message; and bounded
+  immediate-mode write transactions with jittered, budgeted retries. A timeout
+  reports `retryable` and never `lost` — a busy substrate and a lost compare-
+  and-swap are different facts, and collapsing them invents a conflict that did
+  not happen.
+- One carrier transaction API owning every message-stream append and rewrite:
+  a single lock convention, unique temporary files, and an fsync'd replace.
+  Every writer moved onto it and no public unlocked writer remains, which
+  removes the second-lock window where a nudge rewrite could drop a concurrent
+  append.
+
+### Changed
+
+- Stream names are validated at the API instead of in callers: a strict token
+  grammar, containment verified after resolution, symlinked inboxes refused,
+  and an envelope's dispatch id required to match the file it lives in. Values
+  are validated too — payloads must be objects, addressee roots canonical,
+  strings bounded, timestamps RFC3339. Forged stream names and message types
+  are now refused at ingress rather than sanitized after acceptance; message
+  subjects and bodies remain free text and are still sanitized on render.
+- A malformed line in a stream no longer truncates the read at it. The tolerant
+  read path records the offset, reason, hash and leading bytes to a quarantine
+  sidecar and continues to the end, so mail written after a corrupt line is
+  delivered instead of being silently invisible; the strict read path keeps its
+  fail-closed semantics for audit callers.
+- Restoring a journal snapshot installs it with a single atomic replace, so no
+  crash instant can leave the canonical path absent — previously two renames
+  left a window where the journal existed under neither name.
+
+### Fixed
+
+- Dispatch tests no longer depend on whether a controller happens to be
+  registered for the repo they run in. The controller registry is a per-project
+  file, so cases asserting the unowned shape were measuring the host rather
+  than the dispatch: they passed on an unregistered machine and failed on a
+  registered one. Registration is the recommended default, so this was a latent
+  red for every operator who followed the advice.
+- Two test functions had been removed while their names were left in the
+  module's runner list, which aborted the whole module before any case ran. One
+  is restored against the current contract; the other covered behaviour that
+  quarantine-and-continue deliberately replaced and its coverage now lives with
+  the quarantine tests.
 
 - `scripts/goalflight_gate.py`: quiet gate wrapper — full test output to a log
   file, summary/failures/log-path to the caller, exit code passed through. The

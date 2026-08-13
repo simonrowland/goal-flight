@@ -540,6 +540,11 @@ def case_foreground_keyboard_interrupt_leaves_worker_and_watcher_running() -> No
         proc = subprocess.Popen(
             [
                 sys.executable, str(DISPATCH),
+                # Pin the project root to the sandbox: the controller registry
+                # is per-project, so inheriting this repo as cwd would let a
+                # registered local controller be inferred as this dispatch's
+                # owner and break the unowned assertions below.
+                "--cwd", str(tmp_path),
                 "--agent", "test",
                 "--dispatch-id", "foreground-interrupt",
                 "--tail", str(tail),

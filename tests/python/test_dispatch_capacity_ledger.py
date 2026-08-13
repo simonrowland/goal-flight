@@ -38,10 +38,13 @@ def _env(tmp: Path) -> dict[str, str]:
     return env
 
 
-def _status(env: dict[str, str]) -> dict:
+def _status(env: dict[str, str], *, cwd: Path = ROOT) -> dict:
+    # cwd selects the project whose records are read. A case that pins its
+    # dispatch to a sandbox root must read that same root back, or it asks
+    # this repo whether it has a record it was never given.
     proc = subprocess.run(
         [sys.executable, str(STATUS), "--json"],
-        cwd=ROOT,
+        cwd=cwd,
         env=env,
         text=True,
         stdout=subprocess.PIPE,
@@ -109,6 +112,7 @@ def _dispatch_command(
     from_queue: bool = False,
     launch_detached: bool = False,
     foreground: bool = True,
+    isolate_project: bool = False,
 ) -> list[str]:
     cmd = [
         sys.executable,
@@ -126,6 +130,15 @@ def _dispatch_command(
         "--max-idle-secs",
         max_idle_secs,
     ]
+    if isolate_project:
+        # Pin the project root to the sandbox. The controller registry is a
+        # per-project file (<root>/docs-private/.goal-flight-current-session
+        # .json), so a dispatch inheriting this repo as its cwd discovers
+        # whatever controller is registered here and attributes ownership to
+        # it -- which made ownership assertions pass on an unregistered host
+        # and fail on a registered one. Opt-in, because the other cases here
+        # deliberately read this repo's ledger and lease state.
+        cmd += ["--cwd", str(tmp)]
     if controller_pid is not None:
         cmd += ["--controller-pid", str(controller_pid)]
     if from_queue:
@@ -152,6 +165,7 @@ def _run_dispatch(
     from_queue: bool = False,
     launch_detached: bool = False,
     foreground: bool = True,
+    isolate_project: bool = False,
     timeout_s: float = 90.0,
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
@@ -167,6 +181,7 @@ def _run_dispatch(
             from_queue=from_queue,
             launch_detached=launch_detached,
             foreground=foreground,
+            isolate_project=isolate_project,
         ),
         cwd=ROOT,
         env=env,
@@ -198,7 +213,7 @@ def _dispatch_launched(stdout: str) -> dict:
     raise AssertionError(f"missing DISPATCH-LAUNCHED in stdout:\n{stdout}")
 
 
-def _capacity_release_stale(env: dict[str, str]) -> dict:
+def _capacity_release_stale(env: dict[str, str], *, cwd: Path = ROOT) -> dict:
     proc = subprocess.run(
         [
             sys.executable,
@@ -210,7 +225,7 @@ def _capacity_release_stale(env: dict[str, str]) -> dict:
             "test_release_stale",
             "--keep",
         ],
-        cwd=ROOT,
+        cwd=cwd,
         env=env,
         text=True,
         stdout=subprocess.PIPE,
@@ -220,8 +235,10 @@ def _capacity_release_stale(env: dict[str, str]) -> dict:
     return json.loads(proc.stdout)
 
 
-def _assert_terminal_record_and_lease(env: dict[str, str], dispatch_id: str, state: str) -> None:
-    payload = _status(env)
+def _assert_terminal_record_and_lease(
+    env: dict[str, str], dispatch_id: str, state: str, *, cwd: Path = ROOT
+) -> None:
+    payload = _status(env, cwd=cwd)
     row = _record(payload, dispatch_id)
     assert row and row.get("state") == state, row
     assert row.get("classification") == state, row
@@ -339,6 +356,7 @@ def case_unowned_pidfile_preserves_blocked_worker_for_reattach() -> None:
                 dispatch_id,
                 "import time; print('BLOCKED: needs controller', flush=True); time.sleep(60)",
                 controller_pid=os.getpid(),
+                isolate_project=True,
             )
             worker_pid = _worker_pid_from_stdout(proc.stdout)
             assert proc.returncode == 4, f"dispatch rc={proc.returncode}\nstdout={proc.stdout}\nstderr={proc.stderr}"
@@ -367,7 +385,7 @@ def case_unowned_pidfile_preserves_blocked_worker_for_reattach() -> None:
             assert int(cleanup.stdout.strip()) == 0, cleanup
             assert _process_exists(worker_pid), "cleanup killed live unowned worker"
             assert list((tmp / "pids").glob("*.jsonl")), "pidfile removed before reattach"
-            _assert_terminal_record_and_lease(env, dispatch_id, "blocked")
+            _assert_terminal_record_and_lease(env, dispatch_id, "blocked", cwd=tmp)
         finally:
             _kill_if_alive(worker_pid)
 
@@ -424,6 +442,7 @@ def case_from_queue_detached_launch_reparents_lease_and_survives_release_stale()
                 max_idle_secs="20",
                 from_queue=True,
                 launch_detached=True,
+                isolate_project=True,
             )
             assert proc.returncode == 0, (
                 f"dispatch rc={proc.returncode}\nstdout={proc.stdout}\nstderr={proc.stderr}"
@@ -433,7 +452,7 @@ def case_from_queue_detached_launch_reparents_lease_and_survives_release_stale()
             watcher_pid = int(launched["watcher_pid"])
             assert worker_pid and _process_exists(worker_pid), launched
 
-            payload = _status(env)
+            payload = _status(env, cwd=tmp)
             leases = _leases(payload, dispatch_id)
             assert len(leases) == 1, leases
             lease = leases[0]
@@ -444,17 +463,17 @@ def case_from_queue_detached_launch_reparents_lease_and_survives_release_stale()
             assert lease.get("detached_at"), lease
             assert lease.get("detached_reason") == "bash_launch_detached", lease
 
-            live_release = _capacity_release_stale(env)
+            live_release = _capacity_release_stale(env, cwd=tmp)
             assert live_release["count"] == 0, live_release
-            payload = _status(env)
+            payload = _status(env, cwd=tmp)
             live_lease = _leases(payload, dispatch_id)[0]
             assert live_lease.get("state") == "active", live_lease
 
             _kill_if_alive(worker_pid)
             _wait_for(lambda: not _process_exists(worker_pid), timeout_s=10.0)
-            dead_release = _capacity_release_stale(env)
+            dead_release = _capacity_release_stale(env, cwd=tmp)
             assert dead_release["count"] == 1, dead_release
-            payload = _status(env)
+            payload = _status(env, cwd=tmp)
             dead_lease = _leases(payload, dispatch_id)[0]
             assert dead_lease.get("state") == "expired", dead_lease
             assert dead_lease.get("reason") == "test_release_stale", dead_lease
@@ -484,6 +503,7 @@ def case_direct_default_background_records_unowned_controller() -> None:
                 max_idle_secs="20",
                 controller_pid=controller_pid,
                 foreground=False,
+                isolate_project=True,
                 timeout_s=8.0,
             )
             elapsed = time.monotonic() - started
@@ -525,7 +545,7 @@ def case_direct_default_background_records_unowned_controller() -> None:
             assert pid_entry.get("controller_pid") != controller_pid, pid_entry
             assert pid_entry.get("detached") is True, pid_entry
 
-            payload = _status(env)
+            payload = _status(env, cwd=tmp)
             leases = _leases(payload, dispatch_id)
             assert len(leases) == 1, leases
             lease = leases[0]
@@ -535,7 +555,7 @@ def case_direct_default_background_records_unowned_controller() -> None:
             assert lease.get("detached_controller_pid") is None, lease
             assert lease.get("detached_reason") == "bash_background_default", lease
 
-            live_release = _capacity_release_stale(env)
+            live_release = _capacity_release_stale(env, cwd=tmp)
             assert live_release["count"] == 0, live_release
         finally:
             _kill_if_alive(worker_pid)
