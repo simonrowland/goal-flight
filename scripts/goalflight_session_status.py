@@ -524,12 +524,36 @@ def _select_durable_controller_ancestor(ancestry: tuple[dict, ...]) -> dict | No
     if outer_index is None:
         return None
     outer_session = ancestry[outer_index].get("session_id")
-    if not isinstance(outer_session, int) or outer_session <= 1:
+    if not isinstance(outer_session, int) or outer_session < 1:
         return None
+    # Prefer the outer session's own leader. In a terminal harness that is the
+    # shell or terminal that owns the whole run, which is the longest-lived
+    # thing that is still specific to this controller.
     for process in ancestry[outer_index:]:
-        if process.get("pid") == outer_session and process.get("session_id") == outer_session:
+        if (
+            process.get("pid") == outer_session
+            and process.get("session_id") == outer_session
+            and process.get("pid") != 1
+        ):
             return process
-    return None
+    # No leader to select: fall back to the process that SPAWNED our session.
+    #
+    # A GUI-launched host has no session of its own -- macOS puts it in session
+    # 1, whose leader is launchd. Refusing session 1 outright (as this did) made
+    # registration impossible for every desktop-launched controller, which is
+    # not a drift-to-init problem but a measurement gap: the spawner here is the
+    # host process itself, alive exactly as long as the controller it runs, and
+    # neither init nor a transient shell.
+    #
+    # The first ancestor outside our session is that spawner by construction --
+    # it created the session we are in, so it cannot be shorter-lived than this
+    # call. Anything above it (the enclosing application) is shared across
+    # sessions and would outlive this controller, which is the failure that
+    # matters: a beacon that never dies makes a dead controller look alive.
+    spawner = ancestry[outer_index]
+    if spawner.get("pid") == 1 or not isinstance(spawner.get("pid"), int):
+        return None
+    return spawner
 
 
 def _doomed_invocation_pid(pid: int, ancestry: tuple[dict, ...]) -> bool:

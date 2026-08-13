@@ -2831,6 +2831,25 @@ def _stamp_controller_session(args, project_root: Path) -> None:
     requested_pid = goalflight_session_status.resolve_controller_pid(
         getattr(args, "controller_beacon_pid", None)
     )
+    if not requested_label and requested_pid is None:
+        # Nothing was declared, so ask the registry who is running here.
+        #
+        # Declaring an owner requires either a flag on every dispatch or an
+        # environment variable, and neither survives a controller that drives
+        # this tool through separate short-lived shells -- which is the normal
+        # case. The result was that ownership went unrecorded even for a
+        # properly registered controller: measured on this project, 26 of 26
+        # dispatches carried no owner while two labels sat in the registry.
+        # Unowned dispatches cannot be routed, so mail addressed by ownership
+        # has nowhere to go and a listener cannot be attributed to anyone.
+        #
+        # The registry persists on disk, so it can answer later invocations
+        # that the environment cannot. Inference supplies BOTH label and pid so
+        # every check below still applies unchanged -- this widens where the
+        # inputs come from, not what is accepted.
+        inferred = _sole_live_controller(project_root)
+        if inferred is not None:
+            requested_label, requested_pid = inferred
     try:
         session = (
             goalflight_session_status.live_session(
@@ -2883,6 +2902,38 @@ def _stamp_controller_session(args, project_root: Path) -> None:
     args.controller_session_id = str(session_id) if session_id is not None else None
     args._controller_beacon_pid = session_pid
     args.controller_label = str(session_label) if session_label is not None else None
+
+
+def _sole_live_controller(project_root) -> tuple[str, int] | None:
+    """The one live controller registered here, or None when that is not one.
+
+    Deliberately refuses to guess when several controllers share a project --
+    battery-tool-v2 runs three. Picking one of them would attribute a dispatch
+    to a controller that did not launch it, which is worse than leaving it
+    unowned: unowned is visibly unknown, whereas a wrong owner reads as fact and
+    would route another controller's mail. Those controllers declare their label
+    explicitly, which still takes precedence over anything inferred here.
+
+    Returns None on any failure. Ownership is metadata; it must never be able to
+    fail a launch.
+    """
+    try:
+        labels = goalflight_session_status.registered_controller_labels(project_root)
+    except Exception:
+        return None
+    live: list[tuple[str, int]] = []
+    for label in sorted(labels):
+        try:
+            session = goalflight_session_status.live_session(project_root, label=label)
+        except Exception:
+            continue
+        if not isinstance(session, dict) or session.get("conflicting_beacons"):
+            continue
+        pid = session.get("pid")
+        if not isinstance(pid, int) or pid <= 0:
+            continue
+        live.append((str(session.get("label") or label), pid))
+    return live[0] if len(live) == 1 else None
 
 
 def _controller_pid(args) -> int | None:
