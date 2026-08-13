@@ -353,36 +353,60 @@ def _strip_managed_worktree(path: Path) -> Path:
     return resolved
 
 
-def resolve_project_root(value: str | None = None) -> Path:
-    explicit = value or os.environ.get("GOALFLIGHT_PROJECT_ROOT")
-    if explicit:
-        return _strip_managed_worktree(Path(explicit))
+def _git_canonical_root(start: Path) -> Path | None:
+    """Repo root as seen from ``start``, with worktrees collapsed to the main
+    checkout. None when ``start`` is not inside a git checkout.
 
-    cwd = Path.cwd()
+    ``--git-common-dir`` is the worktree-invariant part: every worktree of one
+    repo reports the SAME common dir, while ``--show-toplevel`` differs per
+    worktree. Collapsing on the common dir is what makes all worktrees of a
+    project share one task store.
+    """
     try:
         top = Path(
             subprocess.check_output(
                 ["git", "rev-parse", "--show-toplevel"],
-                cwd=str(cwd),
+                cwd=str(start),
                 text=True,
                 stderr=subprocess.DEVNULL,
             ).strip()
         )
         common_raw = subprocess.check_output(
             ["git", "rev-parse", "--git-common-dir"],
-            cwd=str(cwd),
+            cwd=str(start),
             text=True,
             stderr=subprocess.DEVNULL,
         ).strip()
     except (OSError, subprocess.CalledProcessError):
-        return _strip_managed_worktree(cwd)
+        return None
 
     common = Path(common_raw)
     if not common.is_absolute():
         common = top / common
-    if common.name == ".git":
-        return _strip_managed_worktree(common.parent)
-    return _strip_managed_worktree(top)
+    return common.parent if common.name == ".git" else top
+
+
+def resolve_project_root(value: str | None = None) -> Path:
+    """Canonical project root, identical from any worktree of the same repo.
+
+    Both entry points resolve the same way ON PURPOSE. They used to differ: an
+    EXPLICIT root (``--project-root <path>`` or ``GOALFLIGHT_PROJECT_ROOT``) got
+    only ``_strip_managed_worktree``, which strips this tool's own
+    ``.claude/worktrees/...`` layout and nothing else, so an operator's worktree
+    (``~/worktrees/bt-verify``, ``~/Repos/kiln-dofgran``) resolved to itself and
+    was handed its own task store. Each fork then minted its own id sequence, so
+    the same ``b-1141`` named different rows in different worktrees and ids cited
+    between controllers pointed at the wrong work.
+
+    The git resolution is the collapsing step, so it has to run for an explicit
+    path too -- rooted AT that path, not at the process cwd.
+    """
+    explicit = value or os.environ.get("GOALFLIGHT_PROJECT_ROOT")
+    start = Path(explicit) if explicit else Path.cwd()
+    # A path that is not a directory (or not a checkout) cannot be interrogated;
+    # fall back to the previous behaviour rather than failing the caller.
+    canonical = _git_canonical_root(start) if start.is_dir() else None
+    return _strip_managed_worktree(canonical or start)
 
 
 def _durable_state_base() -> Path:

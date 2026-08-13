@@ -994,3 +994,70 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+def _git(cwd: Path, *args: str) -> None:
+    subprocess.run(
+        ["git", *args],
+        cwd=str(cwd),
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+             "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"},
+    )
+
+
+def test_every_worktree_of_a_repo_resolves_to_one_task_store() -> None:
+    """A real git worktree, reached four ways, must give ONE store.
+
+    The explicit forms used to skip the git resolution and hand each worktree its
+    own store, so each fork minted its own id sequence and the same ``b-1141``
+    named different rows in different worktrees.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td).resolve()
+        main = base / "proj"
+        main.mkdir()
+        _git(main, "init", "-q")
+        main.joinpath("f.txt").write_text("x")
+        _git(main, "add", "f.txt")
+        _git(main, "commit", "-qm", "init")
+        tree = base / "proj-feature"
+        _git(main, "worktree", "add", "-q", "-b", "feat", str(tree))
+
+        previous_cwd = Path.cwd()
+        previous_env = os.environ.get("GOALFLIGHT_PROJECT_ROOT")
+        try:
+            os.chdir(tree)
+            implicit = goalflight_task.resolve_project_root()
+            explicit_dot = goalflight_task.resolve_project_root(".")
+            explicit_abs = goalflight_task.resolve_project_root(str(tree))
+            os.environ["GOALFLIGHT_PROJECT_ROOT"] = str(tree)
+            from_env = goalflight_task.resolve_project_root()
+        finally:
+            os.chdir(previous_cwd)
+            if previous_env is None:
+                os.environ.pop("GOALFLIGHT_PROJECT_ROOT", None)
+            else:
+                os.environ["GOALFLIGHT_PROJECT_ROOT"] = previous_env
+
+        assert_true("implicit collapses to main", implicit == main)
+        assert_true("--project-root . collapses to main", explicit_dot == main)
+        assert_true("--project-root ABS collapses to main", explicit_abs == main)
+        assert_true("env var collapses to main", from_env == main)
+
+        stores = {
+            goalflight_task.resolve_task_store_dir(root)
+            for root in (implicit, explicit_dot, explicit_abs, from_env)
+        }
+        assert_true("one store for every entry point", len(stores) == 1)
+
+
+def test_a_path_outside_any_checkout_is_returned_unchanged() -> None:
+    """Resolution must not require git: a non-repo path stays itself."""
+    with tempfile.TemporaryDirectory() as td:
+        plain = Path(td).resolve()
+        assert_true("non-git path unchanged", goalflight_task.resolve_project_root(str(plain)) == plain)
+    missing = Path("/no/such/project/root")
+    assert_true("missing path unchanged", goalflight_task.resolve_project_root(str(missing)) == missing)
