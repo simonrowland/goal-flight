@@ -7,6 +7,7 @@ from support import skip_posix_on_native_windows
 
 skip_posix_on_native_windows("dispatch capacity tests launch POSIX bash workers")
 
+import contextlib
 import datetime as dt
 import json
 import os
@@ -96,12 +97,52 @@ def _process_exists(pid: int | None) -> bool:
 
 
 def _kill_if_alive(pid: int | None) -> None:
-    if not _process_exists(pid):
+    if not pid:
+        return
+    expected_identity = goalflight_ledger.process_identity(pid)
+    if expected_identity is None and not _process_exists(pid):
         return
     try:
         os.kill(pid, signal.SIGKILL)
     except ProcessLookupError:
         return
+    if expected_identity is None:
+        _wait_for(lambda: not _process_exists(pid), timeout_s=10.0)
+    else:
+        _wait_for(
+            lambda: goalflight_ledger.process_identity(pid) != expected_identity,
+            timeout_s=10.0,
+        )
+
+
+def case_kill_waits_for_exact_process_generation_exit() -> None:
+    pid = 424242
+    identity = {"pid": pid, "start_token": "test-generation"}
+    identity_reads = 0
+    kill_signals: list[int] = []
+    original_identity = goalflight_ledger.process_identity
+    original_kill = os.kill
+
+    def fake_identity(candidate: int) -> dict | None:
+        nonlocal identity_reads
+        assert candidate == pid
+        identity_reads += 1
+        return identity if identity_reads < 3 else None
+
+    def fake_kill(candidate: int, sig: int) -> None:
+        assert candidate == pid
+        kill_signals.append(sig)
+
+    try:
+        goalflight_ledger.process_identity = fake_identity
+        os.kill = fake_kill
+        _kill_if_alive(pid)
+    finally:
+        goalflight_ledger.process_identity = original_identity
+        os.kill = original_kill
+
+    assert kill_signals == [signal.SIGKILL], kill_signals
+    assert identity_reads == 3, identity_reads
 
 
 def _dispatch_command(
@@ -578,67 +619,73 @@ def case_default_background_finalizes_ledger_and_rate_pressure_once() -> None:
         env = _env(tmp)
         rate_id = "background-rate-limited"
         clean_id = "background-clean-complete"
+        with contextlib.ExitStack() as processes:
+            rate_proc = _run_dispatch(
+                tmp,
+                env,
+                rate_id,
+                "import sys; print(\"You've hit your usage limit. Please try again later\", flush=True); sys.exit(1)",
+                agent="codex",
+                poll_secs="0.1",
+                max_idle_secs="5",
+                foreground=False,
+                timeout_s=8.0,
+            )
+            assert rate_proc.returncode == 0, (rate_proc.stdout, rate_proc.stderr)
+            assert "DISPATCH-LAUNCHED " in rate_proc.stdout, rate_proc.stdout
+            rate_launch = _dispatch_launched(rate_proc.stdout)
+            processes.callback(_kill_if_alive, int(rate_launch["worker_pid"]))
+            processes.callback(_kill_if_alive, int(rate_launch["watcher_pid"]))
 
-        rate_proc = _run_dispatch(
-            tmp,
-            env,
-            rate_id,
-            "import sys; print(\"You've hit your usage limit. Please try again later\", flush=True); sys.exit(1)",
-            agent="codex",
-            poll_secs="0.1",
-            max_idle_secs="5",
-            foreground=False,
-            timeout_s=8.0,
-        )
-        assert rate_proc.returncode == 0, (rate_proc.stdout, rate_proc.stderr)
-        assert "DISPATCH-LAUNCHED " in rate_proc.stdout, rate_proc.stdout
+            rate_path = tmp / "state" / "runs.d" / f"{rate_id}.json"
 
-        rate_path = tmp / "state" / "runs.d" / f"{rate_id}.json"
+            def _quota_exhausted_record() -> dict | None:
+                if not rate_path.exists():
+                    return None
+                record = json.loads(rate_path.read_text(encoding="utf-8"))
+                return record if record.get("state") == "quota_exhausted" else None
 
-        def _quota_exhausted_record() -> dict | None:
-            if not rate_path.exists():
-                return None
-            record = json.loads(rate_path.read_text(encoding="utf-8"))
-            return record if record.get("state") == "quota_exhausted" else None
+            rate_record = _wait_for(_quota_exhausted_record, timeout_s=10.0)
+            assert rate_record["terminal_state"] == "quota_exhausted", rate_record
+            assert rate_record.get("limit_kind") == "exhausted", rate_record
+            assert rate_record.get("error", {}).get("message") == "dispatch_worker_limit_reached", rate_record
+            assert "usage limit" in json.dumps(rate_record.get("error"), sort_keys=True).lower(), rate_record
+            release = _capacity_release_stale(env)
+            assert release["count"] == 1, release
 
-        rate_record = _wait_for(_quota_exhausted_record, timeout_s=10.0)
-        assert rate_record["terminal_state"] == "quota_exhausted", rate_record
-        assert rate_record.get("limit_kind") == "exhausted", rate_record
-        assert rate_record.get("error", {}).get("message") == "dispatch_worker_limit_reached", rate_record
-        assert "usage limit" in json.dumps(rate_record.get("error"), sort_keys=True).lower(), rate_record
-        release = _capacity_release_stale(env)
-        assert release["count"] == 1, release
+            clean_proc = _run_dispatch(
+                tmp,
+                env,
+                clean_id,
+                "print('COMPLETE: background done', flush=True)",
+                agent="codex",
+                poll_secs="0.1",
+                max_idle_secs="5",
+                foreground=False,
+                timeout_s=8.0,
+            )
+            assert clean_proc.returncode == 0, (clean_proc.stdout, clean_proc.stderr)
+            clean_launch = _dispatch_launched(clean_proc.stdout)
+            processes.callback(_kill_if_alive, int(clean_launch["worker_pid"]))
+            processes.callback(_kill_if_alive, int(clean_launch["watcher_pid"]))
+            clean_path = tmp / "state" / "runs.d" / f"{clean_id}.json"
 
-        clean_proc = _run_dispatch(
-            tmp,
-            env,
-            clean_id,
-            "print('COMPLETE: background done', flush=True)",
-            agent="codex",
-            poll_secs="0.1",
-            max_idle_secs="5",
-            foreground=False,
-            timeout_s=8.0,
-        )
-        assert clean_proc.returncode == 0, (clean_proc.stdout, clean_proc.stderr)
-        clean_path = tmp / "state" / "runs.d" / f"{clean_id}.json"
+            def _complete_record() -> dict | None:
+                if not clean_path.exists():
+                    return None
+                record = json.loads(clean_path.read_text(encoding="utf-8"))
+                return record if record.get("state") == "complete" else None
 
-        def _complete_record() -> dict | None:
-            if not clean_path.exists():
-                return None
-            record = json.loads(clean_path.read_text(encoding="utf-8"))
-            return record if record.get("state") == "complete" else None
+            clean_record = _wait_for(_complete_record, timeout_s=10.0)
+            assert clean_record["terminal_state"] == "complete", clean_record
 
-        clean_record = _wait_for(_complete_record, timeout_s=10.0)
-        assert clean_record["terminal_state"] == "complete", clean_record
-
-        records = rp.collect_records(tmp / "state")
-        rate_record = next(record for record in records if record.get("dispatch_id") == rate_id)
-        clean_record = next(record for record in records if record.get("dispatch_id") == clean_id)
-        assert rp.detect_pressure_scope(rate_record, None) == rp.ACCOUNT_RATE_LIMIT_SCOPE, rate_record
-        assert rp.detect_pressure_scope(clean_record, None) is None, clean_record
-        pressure = rp.pressure_per_provider(records, window_seconds=600, now_ts=time.time())
-        assert pressure.get("provider:openai") == 1, pressure
+            records = rp.collect_records(tmp / "state")
+            rate_record = next(record for record in records if record.get("dispatch_id") == rate_id)
+            clean_record = next(record for record in records if record.get("dispatch_id") == clean_id)
+            assert rp.detect_pressure_scope(rate_record, None) == rp.ACCOUNT_RATE_LIMIT_SCOPE, rate_record
+            assert rp.detect_pressure_scope(clean_record, None) is None, clean_record
+            pressure = rp.pressure_per_provider(records, window_seconds=600, now_ts=time.time())
+            assert pressure.get("provider:openai") == 1, pressure
 
 
 def case_ledger_finalize_retries_after_transient_failure() -> None:
@@ -1602,6 +1649,7 @@ def case_ledger_finish_cli_accepts_rate_limited() -> None:
 
 
 def main() -> None:
+    case_kill_waits_for_exact_process_generation_exit()
     case_ledger_finish_cli_accepts_rate_limited()
     case_status_sees_dispatch_and_lease_releases()
     case_unowned_pidfile_preserves_blocked_worker_for_reattach()

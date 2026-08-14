@@ -17,6 +17,7 @@ sys.path.insert(0, str(SCRIPTS))
 import goalflight_dispatch as dispatch  # noqa: E402
 import goalflight_journal as journal  # noqa: E402
 import goalflight_session_status as sessions  # noqa: E402
+import goalflight_wake as wake  # noqa: E402
 
 
 def _state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> tuple[Path, journal.Journal]:
@@ -43,9 +44,28 @@ def _args(**overrides):
         "from_queue": False,
         "launch_detached": False,
         "acp_detached_child": False,
+        "takeover": False,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
+
+
+def _capture_started_locks(monkeypatch: pytest.MonkeyPatch) -> list:
+    holders = []
+
+    def start(project_root, *, label, nonce, pid, start_token):
+        del pid, start_token
+        holders.append(
+            wake.register_lease_holder(
+                project_root,
+                controller_label=label,
+                lease_nonce=nonce,
+            )
+        )
+        return None
+
+    monkeypatch.setattr(sessions, "_start_lock_holder", start)
+    return holders
 
 
 def test_same_principal_claims_twice_without_nonce_and_renews(
@@ -66,6 +86,69 @@ def test_same_principal_claims_twice_without_nonce_and_renews(
     assert second.value.renew_deadline_at > first.value.renew_deadline_at
 
 
+def test_dead_holder_with_unexpired_deadline_is_replaced_automatically(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root, authority = _state(monkeypatch, tmp_path)
+    incumbent = authority.claim_or_renew_lease(
+        "owner",
+        principal={"pid": 62001, "start_token": "incumbent"},
+        horizon_s=300,
+    )
+    assert incumbent.committed and incumbent.value is not None
+    identities = {
+        62001: None,
+        62002: {"pid": 62002, "start_token": "successor"},
+    }
+    monkeypatch.setattr(sessions, "_controller_process_identity", identities.get)
+    monkeypatch.setattr(sessions.goalflight_compat, "pid_alive", lambda pid: pid == 62002)
+
+    claimed = sessions.claim_controller_startup(
+        root,
+        pid=62002,
+        label="owner",
+        role="controller",
+    )
+
+    assert claimed["claimed"] is True
+    assert claimed["session"]["generation"] == incumbent.value.generation + 1
+    rows = authority.lease_records(include_ended=True)
+    superseded = next(row for row in rows if row["generation"] == incumbent.value.generation)
+    assert superseded["state"] == "EXPIRED"
+    assert superseded["ended_reason"] == "holder-dead"
+    assert superseded["ended_at"] is not None
+
+
+def test_stale_dead_evidence_cannot_replace_a_new_live_generation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _root, authority = _state(monkeypatch, tmp_path)
+    first = authority.claim_or_renew_lease(
+        "owner", principal={"pid": 62001, "start_token": "first"}
+    )
+    assert first.committed and first.value is not None
+    stale_evidence = journal.LeaseLivenessEvidence(
+        generation=first.value.generation,
+        nonce=first.value.nonce,
+        alive=False,
+    )
+    second = authority.claim_or_renew_lease(
+        "owner",
+        principal={"pid": 62002, "start_token": "second"},
+        takeover=True,
+    )
+    assert second.committed and second.value is not None
+
+    refused = authority.claim_or_renew_lease(
+        "owner",
+        principal={"pid": 62003, "start_token": "third"},
+        incumbent_liveness=stale_evidence,
+    )
+
+    assert refused.cas_lost
+    assert authority.active_lease("owner") == second.value
+
+
 def test_owning_controller_child_renews_with_nonce_and_measured_beacon(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -80,6 +163,7 @@ def test_owning_controller_child_renews_with_nonce_and_measured_beacon(
         lambda pid: {"pid": pid, "start_token": "incumbent"},
     )
     monkeypatch.setenv("GOALFLIGHT_CONTROLLER_SESSION_ID", incumbent.value.nonce)
+    _capture_started_locks(monkeypatch)
     args = _args(controller_session_id=None)
     claimed = dispatch._stamp_controller_session(args, root)
     assert claimed["claimed"] is True
@@ -147,7 +231,7 @@ def test_different_live_controller_is_refused_even_with_incumbent_nonce(
     assert authority.active_lease("owner") == incumbent.value
 
 
-def test_expired_controller_lease_is_takeable_by_a_new_incarnation(
+def test_elapsed_legacy_deadline_does_not_make_a_live_holder_takeable(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     root, authority = _state(monkeypatch, tmp_path)
@@ -172,15 +256,24 @@ def test_expired_controller_lease_is_takeable_by_a_new_incarnation(
         )
     )
     assert expired.committed
-    claimed = authority.claim_or_renew_lease(
-        "owner", principal={"pid": 62002, "start_token": "successor"}
+    holder = wake.register_lease_holder(
+        root,
+        controller_label="owner",
+        lease_nonce=incumbent.value.nonce,
     )
-    assert claimed.committed and claimed.value is not None
-    successor = authority.active_lease("owner")
-    assert successor is not None
-    assert successor.generation == incumbent.value.generation + 1
-    assert successor.nonce != incumbent.value.nonce
-    assert successor.principal["pid"] == 62002
+    claimed = authority.claim_or_renew_lease(
+        "owner",
+        principal={"pid": 62002, "start_token": "successor"},
+        incumbent_liveness=sessions._lease_holder_liveness(incumbent.value),
+    )
+    holder.close()
+    assert claimed.cas_lost
+    active = authority.active_lease("owner")
+    assert active is not None
+    assert active.generation == incumbent.value.generation
+    assert active.nonce == incumbent.value.nonce
+    assert active.principal == incumbent.value.principal
+    assert active.renew_deadline_at == expired_at
 
 
 def test_dispatch_auto_claim_conflict_is_visible_and_never_steals(
@@ -191,17 +284,64 @@ def test_dispatch_auto_claim_conflict_is_visible_and_never_steals(
         "owner", principal={"pid": 62001, "start_token": "incumbent"}
     )
     assert incumbent.committed and incumbent.value is not None
-    monkeypatch.setattr(
-        sessions,
-        "_controller_process_identity",
-        lambda pid: {"pid": pid, "start_token": "different"},
+    identities = {
+        62001: {"pid": 62001, "start_token": "incumbent"},
+        62002: {"pid": 62002, "start_token": "different"},
+    }
+    monkeypatch.setattr(sessions, "_controller_process_identity", identities.get)
+    holder = wake.register_lease_holder(
+        root,
+        controller_label="owner",
+        lease_nonce=incumbent.value.nonce,
     )
     args = _args(controller_beacon_pid=62002)
     result = dispatch._stamp_controller_session(args, root)
+    holder.close()
     assert result["reason"] == "label_in_use"
     assert "label in use" in str(result["message"])
+    assert "goalflight_dispatch.py" in str(result["message"])
+    assert "--takeover" in str(result["message"])
     assert args.controller_label is None and args.controller_session_id is None
     assert authority.active_lease("owner") == incumbent.value
+
+
+def test_dispatch_explicit_takeover_supersedes_live_holder(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root, authority = _state(monkeypatch, tmp_path)
+    incumbent = authority.claim_or_renew_lease(
+        "owner", principal={"pid": 62001, "start_token": "incumbent"}
+    )
+    assert incumbent.committed and incumbent.value is not None
+    identities = {
+        62001: {"pid": 62001, "start_token": "incumbent"},
+        62002: {"pid": 62002, "start_token": "different"},
+    }
+    monkeypatch.setattr(sessions, "_controller_process_identity", identities.get)
+    incumbent_holder = wake.register_lease_holder(
+        root,
+        controller_label="owner",
+        lease_nonce=incumbent.value.nonce,
+    )
+    _capture_started_locks(monkeypatch)
+
+    args = _args(controller_beacon_pid=62002, takeover=True)
+    result = dispatch._stamp_controller_session(args, root)
+    incumbent_holder.close()
+
+    assert result["claimed"] is True
+    active = authority.active_lease("owner")
+    assert active is not None
+    assert active.generation == incumbent.value.generation + 1
+    assert active.principal["pid"] == 62002
+    ended = next(
+        row
+        for row in authority.lease_records(include_ended=True)
+        if row["generation"] == incumbent.value.generation
+    )
+    assert ended["state"] == "SUPERSEDED"
+    assert ended["ended_reason"] == "explicit-takeover"
+    assert ended["ended_at"] is not None
 
 
 def test_dispatch_main_returns_visible_label_in_use_before_launch(
@@ -211,10 +351,17 @@ def test_dispatch_main_returns_visible_label_in_use_before_launch(
     assert authority.claim_or_renew_lease(
         "owner", principal={"pid": 62001, "start_token": "incumbent"}
     ).committed
-    monkeypatch.setattr(
-        sessions,
-        "_controller_process_identity",
-        lambda pid: {"pid": pid, "start_token": "different"},
+    identities = {
+        62001: {"pid": 62001, "start_token": "incumbent"},
+        62002: {"pid": 62002, "start_token": "different"},
+    }
+    monkeypatch.setattr(sessions, "_controller_process_identity", identities.get)
+    incumbent = authority.active_lease("owner")
+    assert incumbent is not None
+    holder = wake.register_lease_holder(
+        root,
+        controller_label="owner",
+        lease_nonce=incumbent.nonce,
     )
     code = dispatch.main(
         [
@@ -225,8 +372,21 @@ def test_dispatch_main_returns_visible_label_in_use_before_launch(
             "--controller-beacon-pid", "62002",
         ]
     )
+    holder.close()
     assert code == 73
-    assert "label in use" in capsys.readouterr().err
+    error = capsys.readouterr().err
+    assert "label in use" in error
+    assert "goalflight_dispatch.py" in error
+    assert "--takeover" in error
+
+
+def test_dispatch_help_exposes_takeover_command(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as exit_info:
+        dispatch.main(["--help"])
+    assert exit_info.value.code == 0
+    assert "--takeover" in capsys.readouterr().out
 
 
 def test_queue_and_detached_children_verify_without_claim_or_renew(
@@ -238,6 +398,11 @@ def test_queue_and_detached_children_verify_without_claim_or_renew(
     )
     assert result.committed and result.value is not None
     before = result.value
+    holder = wake.register_lease_holder(
+        root,
+        controller_label="owner",
+        lease_nonce=before.nonce,
+    )
     monkeypatch.setattr(
         sessions,
         "_controller_process_identity",
@@ -257,12 +422,13 @@ def test_queue_and_detached_children_verify_without_claim_or_renew(
     assert missing_nonce.controller_session_id is None
     assert missing_nonce.controller_label is None
 
-    stale_identity = _args(from_queue=True, controller_session_id=before.nonce)
+    audit_identity_changed = _args(from_queue=True, controller_session_id=before.nonce)
     monkeypatch.setattr(
         sessions,
         "_controller_process_identity",
         lambda pid: {"pid": pid, "start_token": "reused"},
     )
-    dispatch._stamp_controller_session(stale_identity, root)
-    assert stale_identity.controller_session_id is None
-    assert stale_identity.controller_label is None
+    dispatch._stamp_controller_session(audit_identity_changed, root)
+    assert audit_identity_changed.controller_session_id == before.nonce
+    assert audit_identity_changed.controller_label == "owner"
+    holder.close()

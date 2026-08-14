@@ -14,11 +14,13 @@ sys.path.insert(0, str(SCRIPTS))
 
 import goalflight_journal as journal  # noqa: E402
 import goalflight_messages as msgs  # noqa: E402
+import goalflight_wake as wake  # noqa: E402
 
 
 def _authority(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> tuple[Path, journal.Journal, journal.LeaseIdentity]:
     monkeypatch.setenv("GOALFLIGHT_TASK_STORE_DIR", str(tmp_path / "task-store"))
     monkeypatch.setenv("GOALFLIGHT_JOURNAL_DIR", str(tmp_path / "journal"))
+    monkeypatch.setenv("GOAL_FLIGHT_PIDFILE_DIR", str(tmp_path / "pids"))
     monkeypatch.setenv("GOALFLIGHT_CONTROLLER_LABEL", "bugs")
     root = tmp_path / "project"
     root.mkdir()
@@ -31,7 +33,7 @@ def _authority(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> tuple[Path, j
     return root, authority, result.value
 
 
-def test_reminder_uses_coverage_rows_not_process_inventory(
+def test_reminder_uses_held_waiter_lock_not_journal_row(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     root, authority, lease = _authority(monkeypatch, tmp_path)
@@ -41,7 +43,7 @@ def test_reminder_uses_coverage_rows_not_process_inventory(
         project_root=root, controller_label="bugs", exposure=1, stream=stream
     )
     assert line is not None
-    assert "no verified journal coverage" in line
+    assert line.startswith("listener offline; start: ")
     assert "--controller-label bugs" in line
 
     armed = authority.arm_listener(
@@ -52,18 +54,18 @@ def test_reminder_uses_coverage_rows_not_process_inventory(
         parent_pid=51001,
     )
     assert armed.committed
-    stream = io.StringIO()
-    assert msgs.emit_listener_reminder(
-        project_root=root,
-        controller_label="bugs",
-        exposure=1,
-        stream=stream,
-        identity_probe=lambda pid: {"pid": pid, "start_token": "listener-token"},
-    ) is None
-    assert stream.getvalue() == ""
+    with wake.register_waiter(root, controller_label="bugs", kind="listener"):
+        stream = io.StringIO()
+        assert msgs.emit_listener_reminder(
+            project_root=root,
+            controller_label="bugs",
+            exposure=1,
+            stream=stream,
+        ) is None
+        assert stream.getvalue() == ""
 
 
-def test_mismatched_coverage_identity_is_not_authoritative(
+def test_armed_journal_row_without_held_lock_is_not_authoritative(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     root, authority, lease = _authority(monkeypatch, tmp_path)
@@ -76,7 +78,7 @@ def test_mismatched_coverage_identity_is_not_authoritative(
         identity_probe=lambda pid: {"pid": pid, "start_token": "reused-pid"},
     )
     assert status["covered"] is False
-    assert status["reason"] == "listener-identity-mismatch"
+    assert status["reason"] == "no-live-waiter-lock"
 
 
 def test_reminder_gates_on_exposure_and_reports_missing_identity(

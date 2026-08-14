@@ -127,7 +127,9 @@ ATTEMPT_LIVE_STATES = (ATTEMPT_PREPARED, ATTEMPT_STARTING, ATTEMPT_RUNNING)
 ATTEMPT_FINAL_STATES = (ATTEMPT_TERMINAL, ATTEMPT_ABANDONED)
 TERMINAL_EVENT_TYPES = frozenset({"result", "blocked", "user_need", "user_confirm"})
 START_CLAIM_DEADLINE_S = 300.0
-DEFAULT_LEASE_HORIZON_S = 15 * 60.0
+# Compatibility horizon for the legacy schema/API.  The derived deadline is
+# telemetry only; held kernel locks are the sole lease-liveness authority.
+DEFAULT_LEASE_HORIZON_S = 2 * 60 * 60.0
 LEASE_ACTIVE = "ACTIVE"
 LEASE_SUPERSEDED = "SUPERSEDED"
 LEASE_EXPIRED = "EXPIRED"
@@ -265,6 +267,13 @@ class LeaseIdentity:
     renewed_at: str
     renew_deadline_at: str
     principal: dict[str, object]
+
+
+@dataclass(frozen=True)
+class LeaseLivenessEvidence:
+    generation: int
+    nonce: str
+    alive: bool | None
 
 
 @dataclass(frozen=True)
@@ -554,12 +563,7 @@ def listener_exit_reason(
         or lease.get("nonce") != coverage.get("lease_nonce")
     ):
         return "superseded"
-    deadline = _parse_utc(lease.get("renew_deadline_at"))
-    measured_now = now or dt.datetime.now(dt.timezone.utc)
-    if deadline is None:
-        return "corrupt"
-    if deadline <= measured_now.astimezone(dt.timezone.utc):
-        return "stale-lease"
+    del now  # Kept for call compatibility; deadlines no longer decide liveness.
     return None
 
 
@@ -1686,6 +1690,7 @@ class Journal:
             WHERE e.project_root = ?
               AND e.recipient_label IN (?, '*')
               AND e.wake_class = 'waking'
+              AND e.event_type != 'controller_attention'
               AND e.projected_at IS NOT NULL
               AND e.withdrawn_at IS NULL
               AND e.stream_seq > COALESCE(c.position, 0)
@@ -1694,6 +1699,52 @@ class Journal:
             (label, project_root, label),
         ).fetchone()
         return waking is not None
+
+    @classmethod
+    def _collapse_open_attention(
+        cls,
+        connection: sqlite3.Connection,
+        *,
+        project_root: str,
+        label: str,
+    ) -> dict[str, object] | None:
+        """Keep one current orphan-work item; resolve historical generation noise."""
+        rows = connection.execute(
+            """
+            SELECT * FROM attention_items
+            WHERE project_root = ? AND source_label = ?
+              AND item_type = 'orphaned_controller_work' AND state = 'OPEN'
+            ORDER BY source_generation DESC, created_at DESC, item_id DESC
+            """,
+            (project_root, label),
+        ).fetchall()
+        if not rows:
+            return None
+        survivor = rows[0]
+        now = utc_now()
+        for stale in rows[1:]:
+            connection.execute(
+                """
+                UPDATE attention_items
+                SET state = 'RESOLVED', resolved_at = ?
+                WHERE item_id = ? AND state = 'OPEN'
+                """,
+                (now, str(stale["item_id"])),
+            )
+            connection.execute(
+                """
+                UPDATE delivery_events
+                SET withdrawn_at = ?
+                WHERE project_root = ? AND origin_node = 'journal'
+                  AND event_uuid = ? AND event_type = 'controller_attention'
+                  AND withdrawn_at IS NULL
+                """,
+                (now, project_root, str(stale["item_id"])),
+            )
+        try:
+            return json.loads(str(survivor["payload_json"]))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {"item_id": str(survivor["item_id"])}
 
     @classmethod
     def _materialize_attention(
@@ -1714,6 +1765,13 @@ class Journal:
             label=label,
         ):
             return None
+        inherited = cls._collapse_open_attention(
+            connection,
+            project_root=project_root,
+            label=label,
+        )
+        if inherited is not None:
+            return inherited
         existing = connection.execute(
             """
             SELECT * FROM attention_items
@@ -1811,6 +1869,7 @@ class Journal:
         nonce: str | None = None,
         horizon_s: float = DEFAULT_LEASE_HORIZON_S,
         takeover: bool = False,
+        incumbent_liveness: LeaseLivenessEvidence | None = None,
     ) -> WriteResult[LeaseIdentity]:
         resolved_label = self._identity_token(label, label="controller label")
         if not isinstance(principal, Mapping):
@@ -1832,6 +1891,13 @@ class Journal:
         def action(connection: sqlite3.Connection) -> LeaseIdentity:
             now = utc_now()
             deadline = _utc_after(horizon_s)
+            self._collapse_open_attention(
+                connection,
+                project_root=project_root,
+                label=resolved_label,
+            )
+            replacing_generation = False
+            replaced_nonce: str | None = None
             active = connection.execute(
                 """
                 SELECT * FROM controller_leases
@@ -1839,24 +1905,6 @@ class Journal:
                 """,
                 (project_root, resolved_label),
             ).fetchone()
-            if active is not None and str(active["renew_deadline_at"]) <= now:
-                connection.execute(
-                    """
-                    UPDATE controller_leases
-                    SET state = 'EXPIRED', ended_at = ?, ended_reason = 'renewal-horizon'
-                    WHERE project_root = ? AND label = ? AND generation = ? AND state = 'ACTIVE'
-                    """,
-                    (now, project_root, resolved_label, int(active["generation"])),
-                )
-                self._materialize_attention(
-                    connection,
-                    project_root=project_root,
-                    label=resolved_label,
-                    generation=int(active["generation"]),
-                    trigger_side="horizon",
-                    reason="stale-lease",
-                )
-                active = None
             if active is not None:
                 same_principal = self._principal_matches(active, principal)
                 # Process identity (pid + start token), or the stable principal_id
@@ -1892,27 +1940,70 @@ class Journal:
                     ).fetchone()
                     assert renewed is not None
                     return self._lease_identity(renewed)
-                if not takeover:
-                    raise CASMismatch(
-                        f"label in use: {resolved_label}; choose another label or take over explicitly"
+                incumbent_proven_dead = bool(
+                    incumbent_liveness is not None
+                    and incumbent_liveness.alive is False
+                    and incumbent_liveness.generation == int(active["generation"])
+                    and incumbent_liveness.nonce == str(active["nonce"])
+                )
+                if incumbent_proven_dead:
+                    connection.execute(
+                        """
+                        UPDATE controller_leases
+                        SET state = 'EXPIRED', ended_at = ?, ended_reason = 'holder-dead'
+                        WHERE project_root = ? AND label = ? AND generation = ?
+                          AND state = 'ACTIVE'
+                        """,
+                        (now, project_root, resolved_label, int(active["generation"])),
                     )
-                connection.execute(
-                    """
-                    UPDATE controller_leases
-                    SET state = 'SUPERSEDED', ended_at = ?, ended_reason = 'explicit-takeover'
-                    WHERE project_root = ? AND label = ? AND generation = ? AND state = 'ACTIVE'
-                    """,
-                    (now, project_root, resolved_label, int(active["generation"])),
-                )
-                connection.execute(
-                    """
-                    UPDATE listener_coverage
-                    SET state = 'EXITED', exited_at = ?, exit_reason = 'superseded'
-                    WHERE project_root = ? AND label = ? AND lease_generation = ?
-                      AND state = 'ARMED'
-                    """,
-                    (now, project_root, resolved_label, int(active["generation"])),
-                )
+                    connection.execute(
+                        """
+                        UPDATE listener_coverage
+                        SET state = 'EXITED', exited_at = ?, exit_reason = 'orphaned'
+                        WHERE project_root = ? AND label = ? AND lease_generation = ?
+                          AND state = 'ARMED'
+                        """,
+                        (now, project_root, resolved_label, int(active["generation"])),
+                    )
+                    # ``horizon`` is the shipped schema's journal-side bucket;
+                    # the precise kernel cause is carried in ``reason``.
+                    self._materialize_attention(
+                        connection,
+                        project_root=project_root,
+                        label=resolved_label,
+                        generation=int(active["generation"]),
+                        trigger_side="horizon",
+                        reason="holder-dead",
+                    )
+                    replaced_nonce = str(active["nonce"])
+                    active = None
+                    replacing_generation = True
+                if not takeover:
+                    if active is not None:
+                        raise CASMismatch(
+                            f"label in use: {resolved_label}; rerun goalflight_dispatch.py "
+                            "with --takeover"
+                        )
+                if active is not None:
+                    replacing_generation = True
+                    replaced_nonce = str(active["nonce"])
+                    connection.execute(
+                        """
+                        UPDATE controller_leases
+                        SET state = 'SUPERSEDED', ended_at = ?, ended_reason = 'explicit-takeover'
+                        WHERE project_root = ? AND label = ? AND generation = ? AND state = 'ACTIVE'
+                        """,
+                        (now, project_root, resolved_label, int(active["generation"])),
+                    )
+                    connection.execute(
+                        """
+                        UPDATE listener_coverage
+                        SET state = 'EXITED', exited_at = ?, exit_reason = 'superseded'
+                        WHERE project_root = ? AND label = ? AND lease_generation = ?
+                          AND state = 'ARMED'
+                        """,
+                        (now, project_root, resolved_label, int(active["generation"])),
+                    )
             generation = int(
                 connection.execute(
                     """
@@ -1922,7 +2013,14 @@ class Journal:
                     (project_root, resolved_label),
                 ).fetchone()[0]
             )
-            allocated_nonce = supplied_nonce or uuid.uuid4().hex
+            reuse_ended_capability = bool(
+                replacing_generation
+                and supplied_nonce is not None
+                and supplied_nonce == replaced_nonce
+            )
+            allocated_nonce = (
+                uuid.uuid4().hex if reuse_ended_capability else supplied_nonce or uuid.uuid4().hex
+            )
             connection.execute(
                 """
                 INSERT INTO controller_leases (
@@ -1972,58 +2070,13 @@ class Journal:
         return self._domain_write(action)
 
     def expire_stale_leases(self, *, observed_at: str | None = None) -> WriteResult[list[dict[str, object]]]:
-        parsed_cutoff = _parse_utc(observed_at or utc_now())
-        if parsed_cutoff is None:
-            raise ValueError("observed_at must be an RFC3339 timestamp")
-        cutoff = parsed_cutoff.isoformat(timespec="seconds")
-        project_root = str(self.project_root)
-
-        def action(connection: sqlite3.Connection) -> list[dict[str, object]]:
-            rows = connection.execute(
-                """
-                SELECT * FROM controller_leases
-                WHERE project_root = ? AND state = 'ACTIVE' AND renew_deadline_at <= ?
-                ORDER BY label, generation
-                """,
-                (project_root, cutoff),
-            ).fetchall()
-            expired: list[dict[str, object]] = []
-            for row in rows:
-                connection.execute(
-                    """
-                    UPDATE controller_leases
-                    SET state = 'EXPIRED', ended_at = ?, ended_reason = 'renewal-horizon'
-                    WHERE project_root = ? AND label = ? AND generation = ? AND state = 'ACTIVE'
-                    """,
-                    (cutoff, project_root, str(row["label"]), int(row["generation"])),
-                )
-                connection.execute(
-                    """
-                    UPDATE listener_coverage
-                    SET state = 'EXITED', exited_at = ?, exit_reason = 'stale-lease'
-                    WHERE project_root = ? AND label = ? AND lease_generation = ?
-                      AND state = 'ARMED'
-                    """,
-                    (cutoff, project_root, str(row["label"]), int(row["generation"])),
-                )
-                attention = self._materialize_attention(
-                    connection,
-                    project_root=project_root,
-                    label=str(row["label"]),
-                    generation=int(row["generation"]),
-                    trigger_side="horizon",
-                    reason="stale-lease",
-                )
-                expired.append(
-                    {
-                        "label": str(row["label"]),
-                        "generation": int(row["generation"]),
-                        "attention_item": attention,
-                    }
-                )
-            return expired
-
-        return self._domain_write(action)
+        del observed_at
+        return WriteResult(
+            WriteDisposition.COMMITTED,
+            [],
+            attempts=0,
+            reason="lease deadlines are telemetry-only; kernel locks decide liveness",
+        )
 
     def release_lease(
         self,
@@ -2342,8 +2395,6 @@ class Journal:
             ).fetchone()
             if lease is None or str(lease["nonce"]) != resolved_nonce:
                 raise CASMismatch("listener lease generation or nonce is no longer active")
-            if str(lease["renew_deadline_at"]) <= utc_now():
-                raise CASMismatch("listener lease is stale")
             cursor = connection.execute(
                 """SELECT registry_generation, cursor_version, backlog_pending
                    FROM controller_cursors
@@ -2536,7 +2587,7 @@ class Journal:
 
         def action(connection: sqlite3.Connection) -> dict[str, object]:
             lease = connection.execute(
-                """SELECT generation, nonce, state, renew_deadline_at FROM controller_leases
+                """SELECT generation, nonce, state FROM controller_leases
                    WHERE project_root = ? AND label = ? AND state = 'ACTIVE'""",
                 (project_root, label),
             ).fetchone()
@@ -2544,7 +2595,6 @@ class Journal:
                 lease is None
                 or int(lease["generation"]) != generation
                 or str(lease["nonce"]) != nonce
-                or str(lease["renew_deadline_at"]) <= utc_now()
             ):
                 raise CASMismatch("cursor CAS lost: lease generation changed")
             now = utc_now()
@@ -2618,8 +2668,6 @@ class Journal:
             ).fetchone()
             if lease is None or str(lease["nonce"]) != resolved_nonce:
                 raise CASMismatch("listener arm lost: lease generation or nonce changed")
-            if str(lease["renew_deadline_at"]) <= utc_now():
-                raise CASMismatch("listener arm lost: lease is stale")
             now = utc_now()
             connection.execute(
                 """
@@ -2724,22 +2772,6 @@ class Journal:
                     generation=int(row["lease_generation"]),
                     trigger_side="listener",
                     reason=reason,
-                )
-            if reason == "stale-lease":
-                connection.execute(
-                    """
-                    UPDATE controller_leases
-                    SET state = 'EXPIRED', ended_at = ?, ended_reason = 'renewal-horizon'
-                    WHERE project_root = ? AND label = ? AND generation = ?
-                      AND state = 'ACTIVE' AND renew_deadline_at <= ?
-                    """,
-                    (
-                        now,
-                        str(row["project_root"]),
-                        str(row["label"]),
-                        int(row["lease_generation"]),
-                        now,
-                    ),
                 )
             result = dict(row)
             result.update(state=COVERAGE_EXITED, exited_at=now, exit_reason=reason)
@@ -3578,6 +3610,15 @@ def main(argv: list[str] | None = None) -> int:
     restore_parser.add_argument("--snapshot", type=Path, required=True)
     restore_parser.add_argument("--i-understand", action="store_true")
     args = parser.parse_args(argv)
+    try:
+        import goalflight_messages
+
+        goalflight_messages.emit_wake_entry_notice(
+            project_root=goalflight_task.resolve_project_root(str(args.project_root)),
+            stream=sys.stderr,
+        )
+    except Exception:
+        pass
     try:
         if args.command == "init":
             print(Journal.create(args.project_root).path)

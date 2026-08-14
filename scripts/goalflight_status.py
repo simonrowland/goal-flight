@@ -35,6 +35,7 @@ import goalflight_quota_stuck
 import goalflight_session_status
 import goalflight_task
 import goalflight_terminal
+import goalflight_wake
 from goalflight_agent_limits import moonshot_family
 from goalflight_liveness import cpu_confirmed_idle
 import goalflight_milestone
@@ -1713,6 +1714,52 @@ def wait_for_dispatches(
     heartbeat_s: float | None = None,
     json_output: bool = False,
 ) -> int:
+    root = goalflight_task.resolve_project_root(project_root or str(Path.cwd()))
+    label = goalflight_session_status.resolve_controller_label(project_root=root)
+    if not label:
+        label = root.name
+    try:
+        waiter = goalflight_wake.register_waiter(
+            root,
+            controller_label=label,
+            kind="wait",
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f"goalflight_status: wake ledger registration failed: {exc}", file=sys.stderr)
+        waiter_context = contextlib.nullcontext()
+    else:
+        waiter_context = waiter
+    with waiter_context:
+        try:
+            import goalflight_messages as _gm
+
+            _gm.emit_wake_entry_notice(
+                project_root=root,
+                controller_label=label,
+                owned_dispatch_ids=set(wait_ids),
+                stream=sys.stderr,
+            )
+        except Exception:
+            pass
+        return _wait_for_dispatches_registered(
+            wait_ids,
+            project_root=str(root),
+            timeout_s=timeout_s,
+            poll_s=poll_s,
+            heartbeat_s=heartbeat_s,
+            json_output=json_output,
+        )
+
+
+def _wait_for_dispatches_registered(
+    wait_ids: list[str],
+    *,
+    project_root: str | None,
+    timeout_s: float | None,
+    poll_s: float,
+    heartbeat_s: float | None = None,
+    json_output: bool = False,
+) -> int:
     if not wait_ids:
         print("wait requires at least one dispatch id", file=sys.stderr)
         return 2
@@ -2183,25 +2230,16 @@ def main(argv: list[str] | None = None) -> int:
     else:
         project_root = this_project_root()
 
-    if project_root is not None:
-        role = (
-            "dashboard"
-            if args.export_dashboard is not None
-            else "listener"
-            if args.wait
-            else "controller"
-        )
-        claim_result = goalflight_session_status.claim_controller_startup(
-            Path(project_root),
-            pid_from_ancestry=True,
-            role=role,
-        )
-        if claim_result.get("reason") == "label_in_use":
-            print(
-                "goalflight_status: "
-                + str(claim_result.get("message") or "label in use"),
-                file=sys.stderr,
+    if not args.wait:
+        try:
+            import goalflight_messages as _gm
+
+            _gm.emit_wake_entry_notice(
+                project_root=Path(project_root) if project_root else Path.cwd(),
+                stream=sys.stderr,
             )
+        except Exception:
+            pass
 
     if args.record_milestone_sweep:
         repo = Path(project_root).resolve() if project_root else (

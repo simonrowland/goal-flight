@@ -45,6 +45,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import select
 import socket
 import subprocess
 import sys
@@ -60,6 +61,7 @@ if str(ROOT) not in sys.path:
 import goalflight_compat
 import goalflight_journal
 import goalflight_task
+import goalflight_wake
 
 SESSION_FILE_REL = Path("docs-private/.goal-flight-current-session.json")
 QUEUE_GLOB = "docs-private/goal-queue-*.md"
@@ -70,6 +72,9 @@ CONTROLLER_SESSION_ID_ENV = "GOALFLIGHT_CONTROLLER_SESSION_ID"
 CONTROLLER_HEARTBEAT_RECENCY_S = 15 * 60
 CONTROLLER_HEARTBEAT_MAX_FUTURE_S = 60
 NON_CONTROLLER_ROLES = frozenset({"listener", "drainer", "mirror", "dashboard"})
+CONTROLLER_LOCK_READY_TIMEOUT_S = 3.0
+CONTROLLER_LOCK_STARTUP_GRACE_S = 5.0
+CONTROLLER_LOCK_POLL_S = 0.5
 
 
 # --- session id (per-terminal) ----------------------------------------------
@@ -177,9 +182,6 @@ def _registered_controller_records(
     try:
         root = goalflight_task.resolve_project_root(str(project_root))
         authority = goalflight_journal.Journal(root)
-        swept = authority.expire_stale_leases()
-        if not swept.committed:
-            return []
     except goalflight_journal.JournalUnavailable:
         return []
     records = []
@@ -429,6 +431,205 @@ def _same_controller_process(record: dict, current: dict | None) -> bool:
     )
 
 
+def _lease_holder_liveness(
+    lease: goalflight_journal.LeaseIdentity | None,
+) -> goalflight_journal.LeaseLivenessEvidence | None:
+    """Measure one incumbent from its held kernel lock, never from PID state."""
+    if lease is None:
+        return None
+    return goalflight_journal.LeaseLivenessEvidence(
+        generation=lease.generation,
+        nonce=lease.nonce,
+        alive=goalflight_wake.lease_holder_alive(
+            lease.project_root,
+            controller_label=lease.label,
+            lease_nonce=lease.nonce,
+        ),
+    )
+
+
+def _auto_claim_refusal_reason(
+    *,
+    role: str,
+    has_session_beacon: bool,
+    worker_dispatch: bool,
+    session_entry: bool,
+) -> str | None:
+    """Pure policy: only a controller session beacon may auto-claim."""
+    if role != "controller":
+        return "role_does_not_auto_claim"
+    if worker_dispatch:
+        return "worker_dispatch_does_not_claim"
+    if not session_entry:
+        return "one_shot_cli_does_not_claim"
+    if not has_session_beacon:
+        return "missing_session_beacon"
+    return None
+
+
+def auto_claim_controller_entry(
+    project_root: Path,
+    *,
+    role: str | None = None,
+    label: str | None = None,
+    environ: dict[str, str] | None = None,
+    takeover: bool = False,
+    session_entry: bool = False,
+) -> dict:
+    """Auto-claim only for an explicit, beacon-backed session entry."""
+    env = os.environ if environ is None else environ
+    resolved_role = str(role or env.get("GOALFLIGHT_PROCESS_ROLE") or "controller").strip()
+    resolved_pid = resolve_controller_pid(environ=env)
+    refusal = _auto_claim_refusal_reason(
+        role=resolved_role,
+        has_session_beacon=resolved_pid is not None,
+        worker_dispatch=bool(str(env.get("GOALFLIGHT_DISPATCH_ID") or "").strip()),
+        session_entry=session_entry,
+    )
+    if refusal is not None:
+        return {"claimed": False, "reason": refusal, "role": resolved_role}
+    return claim_controller_startup(
+        project_root,
+        pid=resolved_pid,
+        label=label,
+        environ=env,
+        role=resolved_role,
+        session_id=resolve_controller_session_id(environ=env),
+        takeover=takeover,
+        hold_lock=True,
+    )
+
+
+def _same_lease_principal(
+    lease: goalflight_journal.LeaseIdentity | None,
+    principal: dict[str, object],
+) -> bool:
+    if lease is None:
+        return False
+    stored = lease.principal
+    if stored.get("pid") is not None or stored.get("start_token") is not None:
+        return bool(
+            stored.get("pid") == principal.get("pid")
+            and stored.get("start_token")
+            and stored.get("start_token") == principal.get("start_token")
+        )
+    return bool(
+        stored.get("principal_id")
+        and stored.get("principal_id") == principal.get("principal_id")
+    )
+
+
+def _stop_lock_holder(process: subprocess.Popen[str] | None) -> None:
+    if process is None or process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=2)
+
+
+def _start_lock_holder(
+    project_root: Path,
+    *,
+    label: str,
+    nonce: str,
+    pid: int,
+    start_token: str,
+) -> subprocess.Popen[str]:
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--project-root",
+        str(project_root),
+        "--hold-controller-lock",
+        "--session-label",
+        label,
+        "--controller-session-id",
+        nonce,
+        "--session-pid",
+        str(pid),
+        "--controller-start-token",
+        start_token,
+    ]
+    env = dict(os.environ)
+    env["GOALFLIGHT_PROCESS_ROLE"] = "beacon"
+    process = subprocess.Popen(
+        command,
+        cwd=project_root,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        start_new_session=True,
+    )
+    if process.stdout is None:
+        _stop_lock_holder(process)
+        raise RuntimeError("controller lease lock holder has no readiness pipe")
+    ready, _, _ = select.select(
+        [process.stdout],
+        [],
+        [],
+        CONTROLLER_LOCK_READY_TIMEOUT_S,
+    )
+    line = process.stdout.readline() if ready else ""
+    process.stdout.close()
+    try:
+        payload = json.loads(line)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        payload = {}
+    if not isinstance(payload, dict) or payload.get("ready") is not True:
+        _stop_lock_holder(process)
+        raise RuntimeError("controller lease lock holder failed to become ready")
+    return process
+
+
+def hold_controller_lock(
+    project_root: Path,
+    *,
+    label: str,
+    nonce: str,
+    pid: int,
+    start_token: str,
+) -> int:
+    """Hold one session lock until its host dies or its generation ends."""
+    expected_identity = {"pid": pid, "start_token": start_token}
+    if _controller_process_identity(pid) != expected_identity:
+        return 2
+    try:
+        registration = goalflight_wake.register_lease_holder(
+            project_root,
+            controller_label=label,
+            lease_nonce=nonce,
+        )
+    except (OSError, RuntimeError, ValueError):
+        return 2
+    print(json.dumps({"ready": True, "pid": os.getpid()}), flush=True)
+    startup_deadline = time.monotonic() + CONTROLLER_LOCK_STARTUP_GRACE_S
+    matched_generation = False
+    try:
+        while _controller_process_identity(pid) == expected_identity:
+            try:
+                lease = goalflight_journal.Journal(project_root).active_lease(label)
+            except goalflight_journal.JournalError:
+                lease = None
+                journal_unavailable = True
+            else:
+                journal_unavailable = False
+            if lease is not None and lease.nonce == nonce:
+                matched_generation = True
+            elif matched_generation and not journal_unavailable:
+                return 0
+            elif not matched_generation and time.monotonic() >= startup_deadline:
+                return 2
+            time.sleep(CONTROLLER_LOCK_POLL_S)
+        return 0
+    finally:
+        registration.close()
+
+
 def claim_session(
     project_root: Path,
     *,
@@ -436,6 +637,8 @@ def claim_session(
     session_id: str | None = None,
     label: str | None = None,
     process_identity: dict | None = None,
+    takeover: bool = False,
+    hold_lock: bool = False,
 ) -> dict:
     """Claim or renew one journal lease without stealing a live generation."""
     root = goalflight_task.resolve_project_root(str(project_root))
@@ -453,18 +656,58 @@ def claim_session(
     if resolved_label is None:
         raise RuntimeError("controller label is unavailable")
     authority = goalflight_journal.open_or_create_journal(root)
+    principal = {
+        "pid": pid,
+        "start_token": process_identity["start_token"],
+        "hostname": socket.gethostname(),
+    }
+    incumbent = authority.active_lease(resolved_label)
+    incumbent_liveness = _lease_holder_liveness(incumbent)
+    same_principal = _same_lease_principal(incumbent, principal)
+    if same_principal and incumbent is not None:
+        candidate_nonce = incumbent.nonce
+    elif session_id and (incumbent is None or session_id != incumbent.nonce):
+        candidate_nonce = session_id
+    else:
+        candidate_nonce = uuid.uuid4().hex
+    holder: subprocess.Popen[str] | None = None
+    needs_holder = bool(
+        hold_lock
+        and not (
+            same_principal
+            and incumbent_liveness is not None
+            and incumbent_liveness.alive is True
+        )
+        and not (
+            incumbent is not None
+            and not same_principal
+            and incumbent_liveness is not None
+            and incumbent_liveness.alive is True
+            and not takeover
+        )
+    )
+    if needs_holder:
+        holder = _start_lock_holder(
+            root,
+            label=resolved_label,
+            nonce=candidate_nonce,
+            pid=pid,
+            start_token=str(process_identity["start_token"]),
+        )
     result = authority.claim_or_renew_lease(
         resolved_label,
-        principal={
-            "pid": pid,
-            "start_token": process_identity["start_token"],
-            "hostname": socket.gethostname(),
-        },
-        nonce=session_id,
+        principal=principal,
+        nonce=candidate_nonce if hold_lock else session_id,
+        takeover=takeover,
+        incumbent_liveness=incumbent_liveness,
     )
     if not result.committed or result.value is None:
+        _stop_lock_holder(holder)
         raise RuntimeError(result.reason or "controller lease claim failed")
     lease = result.value
+    if holder is not None and lease.nonce != candidate_nonce:
+        _stop_lock_holder(holder)
+        raise RuntimeError("controller lease nonce changed after lock registration")
     return {
         "id": lease.nonce,
         "lease_nonce": lease.nonce,
@@ -478,6 +721,10 @@ def claim_session(
         "controller_registry": True,
         "label": lease.label,
         "process_identity": process_identity,
+        "kernel_lock_held": bool(
+            _lease_holder_liveness(lease) is not None
+            and _lease_holder_liveness(lease).alive is True
+        ),
     }
 
 
@@ -487,7 +734,7 @@ def live_session(
     label: str | None = None,
     pid: int | None = None,
 ) -> dict | None:
-    """Return the horizon-valid active journal lease, or ``None``."""
+    """Return the kernel-lock-live active journal lease, or ``None``."""
     root = goalflight_task.resolve_project_root(str(project_root))
     if label is None and pid is None:
         declared_pid = resolve_controller_pid()
@@ -501,9 +748,6 @@ def live_session(
         authority = goalflight_journal.Journal(root)
     except goalflight_journal.JournalUnavailable:
         return None
-    expired = authority.expire_stale_leases()
-    if not expired.committed:
-        return None
     lease = authority.active_lease(label) if label is not None else None
     if lease is None and label is None:
         rows = authority.lease_records()
@@ -511,6 +755,9 @@ def live_session(
             return None
         lease = authority.active_lease(str(rows[0]["label"]))
     if lease is None:
+        return None
+    liveness = _lease_holder_liveness(lease)
+    if liveness is None or liveness.alive is not True:
         return None
     principal = lease.principal
     if pid is not None and principal.get("pid") != pid:
@@ -546,6 +793,8 @@ def claim_controller_startup(
     pid_from_ancestry: bool = False,
     role: str | None = None,
     session_id: str | None = None,
+    takeover: bool = False,
+    hold_lock: bool = False,
 ) -> dict:
     """Best-effort startup registration; observability must never block work."""
     try:
@@ -576,6 +825,8 @@ def claim_controller_startup(
             label=resolved_label,
             session_id=resolve_controller_session_id(session_id, environ=env),
             process_identity=resolution.get("process_identity"),
+            takeover=takeover,
+            hold_lock=hold_lock,
         )
         if record.get("label") != resolved_label:
             return {
@@ -583,11 +834,19 @@ def claim_controller_startup(
                 "reason": "controller_label_mismatch",
                 "existing_label": record.get("label"),
             }
-        live = live_session(
-            project_root,
-            label=resolved_label,
-            pid=resolved_pid,
-        )
+        if hold_lock:
+            live = live_session(
+                project_root,
+                label=resolved_label,
+                pid=resolved_pid,
+            )
+        else:
+            lease = goalflight_journal.Journal(project_root).active_lease(resolved_label)
+            live = (
+                {"id": lease.nonce}
+                if lease is not None and lease.principal.get("pid") == resolved_pid
+                else None
+            )
         if not isinstance(live, dict) or live.get("id") != record.get("id"):
             return {"claimed": False, "reason": "claim_not_live"}
         if live.get("conflicting_beacons"):
@@ -623,6 +882,7 @@ def register_controller(
     pid: int | None = None,
     session_id: str | None = None,
     process_identity: dict | None = None,
+    hold_lock: bool = False,
 ) -> dict:
     """Create one active lease; a live incumbent returns ``label in use``."""
     label = _normalize_controller_label(name)
@@ -641,6 +901,26 @@ def register_controller(
         if process_identity is not None and measured_identity != process_identity:
             return {"registered": False, "reason": "controller_process_generation_changed"}
         process_identity = process_identity or measured_identity
+    if hold_lock:
+        if pid is None:
+            return {"registered": False, "reason": "missing_session_beacon"}
+        try:
+            record = claim_session(
+                project_root,
+                pid=pid,
+                session_id=session_id,
+                label=label,
+                process_identity=process_identity,
+                hold_lock=True,
+            )
+        except Exception as exc:
+            detail = str(exc)
+            return {
+                "registered": False,
+                "reason": "label_in_use" if "label in use" in detail else "claim_failed",
+                "message": detail,
+            }
+        return {"registered": True, "session": record}
     principal = (
         {
             "pid": pid,
@@ -655,10 +935,12 @@ def register_controller(
     )
     try:
         authority = goalflight_journal.open_or_create_journal(project_root)
+        incumbent_liveness = _lease_holder_liveness(authority.active_lease(label))
         result = authority.claim_or_renew_lease(
             label,
             principal=principal,
             nonce=session_id,
+            incumbent_liveness=incumbent_liveness,
         )
     except Exception as exc:
         return {"registered": False, "reason": "claim_failed", "message": str(exc)}
@@ -695,6 +977,7 @@ def join_controller(
     session_id: str | None = None,
     acknowledge_conflict: bool = False,
     process_identity: dict | None = None,
+    hold_lock: bool = False,
 ) -> dict:
     """Renew the incumbent or perform an explicit generation takeover."""
     label = _normalize_controller_label(name)
@@ -713,6 +996,36 @@ def join_controller(
         if process_identity is not None and measured_identity != process_identity:
             return {"joined": False, "reason": "controller_process_generation_changed"}
         process_identity = process_identity or measured_identity
+    if hold_lock:
+        if pid is None:
+            return {"joined": False, "reason": "missing_session_beacon"}
+        authority = goalflight_journal.open_or_create_journal(project_root)
+        before = authority.active_lease(label)
+        try:
+            record = claim_session(
+                project_root,
+                pid=pid,
+                session_id=session_id,
+                label=label,
+                process_identity=process_identity,
+                takeover=acknowledge_conflict,
+                hold_lock=True,
+            )
+        except Exception as exc:
+            detail = str(exc)
+            return {
+                "joined": False,
+                "reason": "label_in_use" if "label in use" in detail else "claim_failed",
+                "message": detail,
+                "acknowledgement_available": True,
+            }
+        succession = before is not None and before.generation != record["generation"]
+        return {
+            "joined": True,
+            "succession": succession,
+            "conflict_acknowledged": bool(acknowledge_conflict and succession),
+            "session": record,
+        }
     principal = (
         {
             "pid": pid,
@@ -732,6 +1045,7 @@ def join_controller(
         principal=principal,
         nonce=session_id,
         takeover=acknowledge_conflict,
+        incumbent_liveness=_lease_holder_liveness(before),
     )
     if not result.committed or result.value is None:
         return {
@@ -780,22 +1094,10 @@ def _format_idle_duration(age_s: float | None) -> str:
     return f"idle {days} day{'s' if days != 1 else ''}"
 
 
-def _incarnation_state(record: dict) -> tuple[str, bool | None]:
-    pid = record.get("pid")
-    if not isinstance(pid, int):
-        return "heartbeat-only", None
-    try:
-        alive = _pid_alive(pid)
-        identity = _controller_process_identity(pid) if alive else None
-    except Exception:
-        return "pid-unmeasurable", None
-    if not alive:
-        return "dead-pid", False
-    if identity is None:
-        return "pid-unmeasurable", None
-    if _same_controller_process(record, identity):
-        return "live-pid", True
-    return "dead-pid", False
+def _incarnation_state(record: dict, *, lease_lock_live: bool) -> tuple[str, bool]:
+    if record.get("retired_at"):
+        return "ended", False
+    return ("live-lock", True) if lease_lock_live else ("dead-lock", False)
 
 
 def _addressed_unread_counts(
@@ -877,8 +1179,11 @@ def controller_roster(
     for record in _registered_controller_records(project_root, include_retired=include_retired):
         label = str(record.get("label") or "")
         idle_s = _heartbeat_age_s(record, now=measured_now)
-        incarnation_state, pid_live = _incarnation_state(record)
         live = live_session(project_root, label=label)
+        incarnation_state, lease_lock_live = _incarnation_state(
+            record,
+            lease_lock_live=live is not None,
+        )
         conflicting_beacons = (
             int(live.get("conflicting_beacons") or 0)
             if isinstance(live, dict)
@@ -899,7 +1204,8 @@ def controller_roster(
                 "incarnation_state": incarnation_state,
                 "conflicting_beacons": conflicting_beacons,
                 "pid": record.get("pid") if isinstance(record.get("pid"), int) else None,
-                "pid_live": pid_live,
+                "pid_live": None,
+                "lease_lock_live": lease_lock_live,
                 "session_id": record.get("id"),
                 "unread_addressed_mail": unread.get(label, 0) if unread is not None else None,
                 "nonterminal_owned_dispatches": len(owned.get(label, [])) if owned is not None else None,
@@ -1819,6 +2125,7 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="drop a beacon slot (--session-pid, default: this process)",
     )
+    mode.add_argument("--hold-controller-lock", action="store_true", help=argparse.SUPPRESS)
     mode.add_argument(
         "--list-controllers",
         action="store_true",
@@ -1829,6 +2136,7 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--retire", metavar="NAME", help="digest mail and retire a controller name")
     parser.add_argument("--session-pid", type=int)
     parser.add_argument("--session-label")
+    parser.add_argument("--controller-start-token", help=argparse.SUPPRESS)
     parser.add_argument(
         "--controller-session-id",
         help=(
@@ -1850,29 +2158,45 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--include-retired", action="store_true")
     parser.add_argument("--acknowledge-controller-conflict", action="store_true")
     parser.add_argument("--acknowledge-retirement", action="store_true")
+    parser.add_argument(
+        "--takeover",
+        action="store_true",
+        help=(
+            "with --controller-startup or --claim-session, deliberately supersede "
+            "a live different holder of the requested label"
+        ),
+    )
     args = parser.parse_args(argv)
+    if args.takeover and not (args.controller_startup or args.claim_session):
+        parser.error("--takeover requires --controller-startup or --claim-session")
     project_root = goalflight_task.resolve_project_root(args.project_root)
 
-    explicit_identity_action = bool(
-        args.register
-        or args.join
-        or args.retire
-        or args.controller_startup
-        or args.claim_session
-        or args.release_session
-    )
-    if not explicit_identity_action:
-        auto_claim = claim_controller_startup(
+    if args.hold_controller_lock:
+        if (
+            args.session_pid is None
+            or not args.session_label
+            or not args.controller_session_id
+            or not args.controller_start_token
+        ):
+            return 2
+        return hold_controller_lock(
             project_root,
-            pid_from_ancestry=True,
-            role=None,
+            label=args.session_label,
+            nonce=args.controller_session_id,
+            pid=args.session_pid,
+            start_token=args.controller_start_token,
         )
-        if auto_claim.get("reason") == "label_in_use":
-            print(
-                "goalflight_session_status: "
-                + str(auto_claim.get("message") or "label in use"),
-                file=sys.stderr,
-            )
+
+    try:
+        import goalflight_messages
+
+        goalflight_messages.emit_wake_entry_notice(
+            project_root=project_root,
+            controller_label=args.session_label,
+            stream=sys.stderr,
+        )
+    except Exception:
+        pass
 
     if args.list_controllers:
         roster = controller_roster(project_root, include_retired=args.include_retired)
@@ -1902,6 +2226,7 @@ def main(argv: list[str] | None = None) -> int:
                 pid=resolved_pid,
                 session_id=resolved_session_id,
                 process_identity=process_identity,
+                hold_lock=True,
             )
             if resolution and resolution.get("warning"):
                 result.setdefault("warnings", []).append(resolution["warning"])
@@ -1917,6 +2242,7 @@ def main(argv: list[str] | None = None) -> int:
                 session_id=resolved_session_id,
                 acknowledge_conflict=args.acknowledge_controller_conflict,
                 process_identity=process_identity,
+                hold_lock=True,
             )
             if resolution and resolution.get("warning"):
                 result.setdefault("warnings", []).append(resolution["warning"])
@@ -1961,6 +2287,8 @@ def main(argv: list[str] | None = None) -> int:
                     or resolve_controller_label(project_root=project_root, environ=os.environ)
                 ),
                 process_identity=resolution.get("process_identity"),
+                takeover=args.takeover,
+                hold_lock=True,
             )
         except Exception as exc:
             print(
@@ -1987,6 +2315,8 @@ def main(argv: list[str] | None = None) -> int:
             label=args.session_label,
             pid_from_ancestry=args.controller_pid_from_ancestry,
             session_id=args.controller_session_id,
+            takeover=args.takeover,
+            hold_lock=True,
         )
         if result.get("claimed"):
             _index_controller_project(project_root)

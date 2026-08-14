@@ -8,6 +8,42 @@ incremented when meaningful skill behaviour changes.
 
 ### Added
 
+- The wake layer. Backgrounded waiters — the mail listener and dispatch waits —
+  hold a kernel lock for their lifetime, and every tool entry can read the live
+  waiter pool from lock state alone: a dead waiter's lock is released by the
+  kernel, so the ledger structurally cannot claim a dead waiter is alive. When a
+  claimed controller has no live wake coverage, every mail-bearing tool entry
+  prints one line naming the exact command that starts a listener, and a bounded
+  poll floor keeps mail surfacing in the meantime, so a missing listener
+  degrades to slower wakes instead of silence. Batch delivery returns the exact
+  re-arm command with its cursor, so staying subscribed is mechanical rather
+  than remembered.
+- An explicit lease takeover: a dead holder is replaced automatically the moment
+  a claimant asks, and a live holder can be superseded only with a deliberate
+  flag. The refusal message names the exact command that works.
+
+### Changed
+
+- Lease liveness is a held kernel lock, not a clock. The claiming session holds
+  its lock through a detached beacon helper bound to the controller's host
+  process; if the helper dies, the claim is honestly dead and immediately
+  takeable. Renewal deadlines and heartbeat staleness are no longer liveness
+  oracles, which removes the class of incidents where a restarted controller was
+  locked out of its own label, a dead holder blocked claimants until a future
+  deadline, and stale generations accumulated attention noise.
+- One-shot CLI invocations never auto-claim a controller label. Claiming is for
+  sessions; a status query that exits in milliseconds cannot leave a phantom
+  holder behind.
+- The offline-listener notice and the poll floor run only where they can help:
+  a claimed controller on a mail-bearing call with no live coverage. Bare tool
+  use, workers, and unclaimed sandboxes stay silent, and CLI latency returned to
+  ~0.1s/call after the notice briefly taxed every invocation.
+- Superseding a lease resolves the previous generations' attention items and
+  withdraws their deliveries, so historical generations stop accumulating as
+  noise.
+
+### Fixed
+
 - Controller leases. A controller claims a label for a project and holds one
   active generation of that claim, with a renewal horizon and an explicit
   takeover path. A listener can no longer renew the lease it is covered by —

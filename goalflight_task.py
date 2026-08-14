@@ -4472,6 +4472,15 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     store = TaskStore(resolve_project_root(args.project_root))
     try:
+        import goalflight_messages
+
+        goalflight_messages.emit_wake_entry_notice(
+            project_root=store.project_root,
+            stream=sys.stderr,
+        )
+    except Exception:
+        pass
+    try:
         return args.func(store, args)
     except TaskError as exc:
         print(f"goalflight_task.py: {exc}", file=sys.stderr)

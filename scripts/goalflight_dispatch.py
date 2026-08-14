@@ -2840,14 +2840,15 @@ def _stamp_controller_session(args, project_root: Path) -> dict[str, object]:
     )
     session: dict | None = None
     claim_result: dict[str, object]
-    if requested_label and not child_role:
+    if requested_label and not child_role and requested_pid is not None:
         claim_result = goalflight_session_status.claim_controller_startup(
             root,
             pid=requested_pid,
             label=requested_label,
-            pid_from_ancestry=requested_pid is None,
             role="controller",
             session_id=requested_session_id,
+            takeover=bool(getattr(args, "takeover", False)),
+            hold_lock=True,
         )
         if claim_result.get("claimed"):
             candidate = claim_result.get("session")
@@ -2862,29 +2863,28 @@ def _stamp_controller_session(args, project_root: Path) -> dict[str, object]:
     else:
         claim_result = {
             "claimed": False,
-            "reason": "role_does_not_claim" if child_role else "missing_controller_label",
+            "reason": (
+                "role_does_not_claim"
+                if child_role
+                else "missing_session_beacon"
+                if requested_label
+                else "missing_controller_label"
+            ),
             "role": "drainer" if child_role else "controller",
         }
-        if requested_label:
+        if requested_label and requested_session_id is not None:
             candidate = (
                 goalflight_session_status.live_session(
                     root,
                     label=requested_label,
                     pid=requested_pid,
                 )
-                if requested_pid is not None and requested_session_id is not None
-                else None
-            )
-            measured = (
-                goalflight_session_status._controller_process_identity(requested_pid)
                 if requested_pid is not None
-                else None
+                else goalflight_session_status.live_session(root, label=requested_label)
             )
             if (
                 isinstance(candidate, dict)
                 and candidate.get("id") == requested_session_id
-                and isinstance(measured, dict)
-                and candidate.get("process_identity") == measured
             ):
                 session = candidate
     session_id = session.get("id") if isinstance(session, dict) else None
@@ -9369,6 +9369,15 @@ def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv and argv[0] == DAEMON_SPAWN_ARG:
         return _cmd_spawn_daemon()
+    try:
+        import goalflight_messages
+
+        goalflight_messages.emit_wake_entry_notice(
+            project_root=goalflight_task.resolve_project_root(str(Path.cwd())),
+            stream=sys.stderr,
+        )
+    except Exception:
+        pass
     if argv and argv[0] == "steer":
         return _cmd_steer(argv[1:])
     if argv and argv[0] == "resume":
@@ -9519,6 +9528,14 @@ def main(argv: list[str] | None = None) -> int:
             "Default: GOALFLIGHT_CONTROLLER_LABEL."
         ),
     )
+    parser.add_argument(
+        "--takeover",
+        action="store_true",
+        help=(
+            "deliberately supersede a live different holder of --controller-label; "
+            "dead holders are replaced automatically"
+        ),
+    )
     parser.add_argument("--controller-beacon-pid", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--controller-session-id", help=argparse.SUPPRESS)
     parser.add_argument("--from-queue", action="store_true", help=argparse.SUPPRESS)
@@ -9568,12 +9585,26 @@ def main(argv: list[str] | None = None) -> int:
     if shape == "auto":
         shape = "acp" if args.agent in ("cursor", "claude-acp", "claude") else "bash"
     args.shape = shape
+    if (
+        shape == "bash"
+        and args.agent == "codex"
+        and getattr(args, "parent_dispatch_id", None)
+        and goalflight_codex_sessions.valid_session_id(
+            getattr(args, "codex_session_id", None)
+        )
+        is None
+    ):
+        print(
+            "goalflight_dispatch: codex resume launch requires a recorded session handle",
+            file=sys.stderr,
+        )
+        return 64
     if not goalflight_compat.is_windows():
         controller_claim = _stamp_controller_session(args, _project_root(args))
         if controller_claim.get("reason") == "label_in_use":
             print(
                 "goalflight_dispatch: "
-                + str(controller_claim.get("message") or "label in use; choose another label or take over explicitly"),
+                + str(controller_claim.get("message") or "label in use; rerun with --takeover"),
                 file=sys.stderr,
             )
             return 73

@@ -15,6 +15,7 @@ import json
 import math
 import os
 import re
+import shlex
 import stat
 import subprocess
 import tempfile
@@ -45,6 +46,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 import goalflight_compat  # noqa: E402
 import goalflight_steer_mailbox  # noqa: E402
+import goalflight_wake  # noqa: E402
 from goalflight_watch import BLOCKING_TERMINAL_MARKERS, SUCCESS_TERMINAL_MARKERS  # noqa: E402
 
 
@@ -2820,6 +2822,7 @@ def controller_mail_summary(
     task_store_project_root: Path | None = None,
     messages_dir: Path | None = None,
     fleet_dir: Path | None = None,
+    controller_label: str | None = None,
 ) -> dict:
     """Summarize journal-pending assignments without advancing the cursor."""
     del owned_dispatch_ids, messages_dir, fleet_dir
@@ -2832,7 +2835,10 @@ def controller_mail_summary(
 
         root = goalflight_task.resolve_project_root(str(task_store_project_root))
         authority = goalflight_journal.Journal(root)
-        label = sessions.resolve_controller_label(project_root=root)
+        label = sessions.resolve_controller_label(
+            controller_label,
+            project_root=root,
+        )
         if label is None:
             active = authority.lease_records()
             label = str(active[0]["label"]) if len(active) == 1 else None
@@ -2885,58 +2891,129 @@ def listener_coverage_status(
     *,
     identity_probe: Callable[[int], dict | None] | None = None,
 ) -> dict[str, object]:
-    """Journal coverage is authority; process identity only verifies its row."""
-    import goalflight_journal  # type: ignore
+    """Return live wake coverage from the kernel-held waiter ledger."""
     import goalflight_task  # type: ignore
 
     root = goalflight_task.resolve_project_root(str(project_root))
     label = str(controller_label or "").strip()
-    if not label:
-        return {"covered": False, "reason": "missing-label"}
-    try:
-        authority = goalflight_journal.Journal(root)
-        expired = authority.expire_stale_leases()
-        if not expired.committed:
-            return {"covered": False, "reason": "journal-unavailable"}
-        lease = authority.active_lease(label)
-        if lease is None:
-            return {"covered": False, "reason": "no-active-lease"}
-        coverage = authority.active_coverage(label)
-        if coverage is None:
-            return {
-                "covered": False,
-                "reason": "no-armed-coverage",
-                "lease_generation": lease.generation,
-            }
-        probe = identity_probe or (
-            lambda pid: goalflight_compat.process_start_identity(pid)
-        )
-        measured = probe(int(coverage["pid"]))
-        if not isinstance(measured, dict) or measured.get("start_token") != coverage.get("start_token"):
-            return {
-                "covered": False,
-                "reason": "listener-identity-mismatch",
-                "coverage": coverage,
-                "lease_generation": lease.generation,
-            }
-        return {
-            "covered": True,
-            "reason": "armed",
-            "coverage": coverage,
-            "lease_generation": lease.generation,
-        }
-    except goalflight_journal.JournalUnavailable:
-        return {"covered": False, "reason": "journal-unavailable"}
+    del identity_probe  # compatibility-only; lock state replaces process probing.
+    return goalflight_wake.coverage_status(root, controller_label=label or None)
 
 
 def listener_reminder_line(project_root: Path | str, controller_label: str) -> str:
-    root = _canonical_project_root(Path(project_root))
-    return (
-        f"no verified journal coverage for controller {controller_label!r}; "
-        "you will not be woken on new mail. start one in the BACKGROUND: "
-        f"python3 {Path(__file__).resolve()} listen "
-        f"--controller-label {controller_label} --project-root {root} "
-        "--lease-nonce \"$GOALFLIGHT_CONTROLLER_LEASE_NONCE\""
+    command = goalflight_wake.listener_start_command(
+        _canonical_project_root(Path(project_root)),
+        controller_label=controller_label,
+    )
+    return f"listener offline; start: {command}"
+
+
+def _ambient_claimed_controller(
+    project_root: Path,
+    *,
+    controller_label: str | None,
+    mail_bearing: bool,
+) -> dict[str, object]:
+    """Resolve a capability-matched ambient controller without mutating state."""
+    if not mail_bearing:
+        return {"claimed": False, "reason": "not-mail-bearing"}
+    role = str(os.environ.get("GOALFLIGHT_PROCESS_ROLE") or "controller").strip()
+    if role != "controller":
+        return {"claimed": False, "reason": "non-controller-role", "role": role}
+    if str(os.environ.get("GOALFLIGHT_DISPATCH_ID") or "").strip():
+        return {"claimed": False, "reason": "worker-dispatch"}
+
+    carried_capabilities = {
+        value
+        for value in (
+            str(os.environ.get("GOALFLIGHT_CONTROLLER_LEASE_NONCE") or "").strip(),
+            str(os.environ.get("GOALFLIGHT_CONTROLLER_SESSION_ID") or "").strip(),
+        )
+        if value
+    }
+    if len(carried_capabilities) != 1:
+        reason = (
+            "missing-controller-capability"
+            if not carried_capabilities
+            else "conflicting-controller-capabilities"
+        )
+        return {"claimed": False, "reason": reason}
+    capability = next(iter(carried_capabilities))
+
+    # Keep the overwhelmingly common one-shot CLI path import-free.  A process
+    # without a carried capability cannot be an ambient claimed controller and
+    # must not pay journal/session startup cost merely to reach that conclusion.
+    import goalflight_journal  # type: ignore
+    import goalflight_session_status as sessions  # type: ignore
+
+    label = sessions.resolve_controller_label(
+        controller_label,
+        project_root=project_root,
+    )
+    if not label:
+        return {"claimed": False, "reason": "missing-controller-label"}
+    try:
+        authority = goalflight_journal.Journal(project_root)
+        lease = authority.active_lease(label)
+    except goalflight_journal.JournalError:
+        return {"claimed": False, "reason": "journal-unavailable", "label": label}
+    if lease is None:
+        return {"claimed": False, "reason": "no-active-controller-lease", "label": label}
+    if lease.nonce != capability:
+        return {"claimed": False, "reason": "controller-capability-mismatch", "label": label}
+    if not goalflight_wake.lease_holder_alive(
+        project_root,
+        controller_label=label,
+        lease_nonce=lease.nonce,
+    ):
+        return {"claimed": False, "reason": "controller-lease-holder-dead", "label": label}
+    return {
+        "claimed": True,
+        "reason": "ambient-controller-lease",
+        "label": label,
+        "lease_generation": lease.generation,
+    }
+
+
+def emit_wake_entry_notice(
+    *,
+    project_root: Path | str,
+    controller_label: str | None = None,
+    owned_dispatch_ids: set[str] | None = None,
+    messages_dir: Path | None = None,
+    fleet_dir: Path | None = None,
+    mail_bearing: bool = True,
+    stream=None,
+) -> dict[str, object]:
+    """Bounded no-listener mail poll for one ambient claimed controller."""
+    import goalflight_task  # type: ignore
+
+    root = goalflight_task.resolve_project_root(str(project_root))
+    ambient = _ambient_claimed_controller(
+        root,
+        controller_label=controller_label,
+        mail_bearing=mail_bearing,
+    )
+    label = str(ambient.get("label") or "").strip() or None
+
+    def pending_probe() -> str | None:
+        summary = controller_mail_summary(
+            owned_dispatch_ids=owned_dispatch_ids,
+            task_store_project_root=root,
+            messages_dir=messages_dir,
+            fleet_dir=fleet_dir,
+            controller_label=label,
+        )
+        count = int(summary.get("count") or 0)
+        return format_mail_notice(count) if count else None
+
+    return goalflight_wake.check_tool_entry(
+        root,
+        controller_label=label,
+        controller_claimed=ambient.get("claimed") is True,
+        mail_bearing=mail_bearing,
+        pending_probe=pending_probe,
+        stream=stream,
     )
 
 
@@ -3024,15 +3101,6 @@ def emit_controller_mail_notice(
         for error in summary.get("carrier_errors") or []:
             _emit_carrier_error(error, stream=stream)
         count = int(summary.get("count") or 0)
-        # Emit the listener reminder BEFORE the mail-count early return: a
-        # controller with dispatches in flight and no pending mail is precisely
-        # the one that will need waking later and would otherwise never be told.
-        emit_listener_reminder(
-            project_root=project_root,
-            controller_label=summary.get("controller_label"),
-            exposure=count + len(resolved_owned_dispatch_ids or set()),
-            stream=stream,
-        )
         if count < 1:
             return None
         notice = format_mail_notice(count)
@@ -3396,6 +3464,42 @@ def cmd_listen(args) -> int:
         if not isinstance(identity, dict) or not identity.get("start_token"):
             raise MessageError("listener process identity is unavailable")
         parent_pid = os.getppid()
+    except (MessageError, goalflight_journal.JournalError, ValueError) as exc:
+        print(f"listen: {exc}", file=sys.stderr)
+        return 2
+
+    # Validate and advance the processed batch before arming.  A stale or
+    # corrupt token must not supersede an already healthy listener.
+    if args.cursor_token:
+        try:
+            identity_stamp = hashlib.sha256(
+                str(identity["start_token"]).encode("utf-8")
+            ).hexdigest()[:16]
+            advanced = authority.advance_cursor(
+                args.cursor_token,
+                actor=f"listener:{os.getpid()}:{identity_stamp}",
+            )
+        except (ValueError, goalflight_journal.JournalError) as exc:
+            print(f"listen: {exc}", file=sys.stderr)
+            return 2
+        if not advanced.committed:
+            print(f"listen: {advanced.reason or 'cursor advance lost'}", file=sys.stderr)
+            return 3
+
+    # Acquire the kernel witness before superseding journal coverage.  If the
+    # ledger is unavailable, the incumbent listener remains both ARMED and
+    # locked instead of being displaced by a replacement that cannot stay live.
+    try:
+        waiter = goalflight_wake.register_waiter(
+            project_root,
+            controller_label=label,
+            kind="listener",
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f"listen: wake ledger registration failed: {exc}", file=sys.stderr)
+        return 2
+
+    try:
         armed = authority.arm_listener(
             label,
             nonce=nonce,
@@ -3407,58 +3511,38 @@ def cmd_listen(args) -> int:
             raise MessageError(armed.reason or "listener coverage arm lost")
         coverage = dict(armed.value)
     except (MessageError, goalflight_journal.JournalError, ValueError) as exc:
+        waiter.close()
         print(f"listen: {exc}", file=sys.stderr)
         return 2
 
     coverage_id = str(coverage["coverage_id"])
 
     def finish(reason: str, *, code: int, detail: str | None = None) -> int:
-        exited = authority.exit_listener(coverage_id, reason=reason)
-        if not exited.committed:
-            detail = detail or exited.reason or "coverage exit CAS lost"
-        elif exited.value and exited.value.get("exit_reason"):
-            reason = str(exited.value["exit_reason"])
-        payload = {
-            "reason": reason,
-            "coverage_id": coverage_id,
-            "detail": detail,
-        }
-        if args.json:
-            print(json.dumps(payload, sort_keys=True))
-        elif detail:
-            print(f"listen: {reason}: {detail}", file=sys.stderr)
-        return code
-
-    if args.cursor_token:
         try:
-            lease = authority.active_lease(label)
-            measured = (
-                {"pid": os.getpid(), "start_token": test_start_token}
-                if test_start_token
-                else goalflight_compat.process_start_identity(os.getpid())
-            )
-            reason = goalflight_journal.listener_exit_reason(
-                coverage,
-                lease.__dict__ if lease is not None else None,
-                current_parent_pid=os.getppid(),
-                identity_matches=bool(
-                    isinstance(measured, dict)
-                    and measured.get("start_token") == coverage.get("start_token")
-                ),
-            )
-            if reason:
-                return finish(reason, code=3, detail="listener cursor-advance check failed")
-            identity_stamp = hashlib.sha256(
-                str(coverage["start_token"]).encode("utf-8")
-            ).hexdigest()[:16]
-            advanced = authority.advance_cursor(
-                args.cursor_token,
-                actor=f"listener:{os.getpid()}:{identity_stamp}",
-            )
-        except (ValueError, goalflight_journal.JournalError) as exc:
-            return finish("corrupt", code=2, detail=str(exc))
-        if not advanced.committed:
-            return finish("superseded", code=3, detail=advanced.reason)
+            exited = authority.exit_listener(coverage_id, reason=reason)
+            if not exited.committed:
+                detail = detail or exited.reason or "coverage exit CAS lost"
+            elif exited.value and exited.value.get("exit_reason"):
+                reason = str(exited.value["exit_reason"])
+            payload = {
+                "reason": reason,
+                "coverage_id": coverage_id,
+                "detail": detail,
+            }
+            if args.json:
+                print(json.dumps(payload, sort_keys=True))
+            elif detail:
+                print(f"listen: {reason}: {detail}", file=sys.stderr)
+            return code
+        finally:
+            if waiter is not None:
+                waiter.close()
+
+    emit_wake_entry_notice(
+        project_root=project_root,
+        controller_label=label,
+        stream=sys.stderr,
+    )
 
     while True:
         if os.getppid() != parent_pid:
@@ -3519,6 +3603,15 @@ def cmd_listen(args) -> int:
                 "count": len(items),
                 "more_pending": batch.more_pending,
             }
+            rearm_command = (
+                goalflight_wake.listener_start_command(
+                    project_root,
+                    controller_label=label,
+                )
+                + " --cursor-token "
+                + shlex.quote(batch.token)
+            )
+            payload["rearm_command"] = rearm_command
             if args.json:
                 print(json.dumps(payload, sort_keys=True))
             else:
@@ -3530,6 +3623,8 @@ def cmd_listen(args) -> int:
                         f"{sanitize_display(body.get('text') or '', limit=140)}"
                     )
                 print(f"cursor_token={batch.token} more_pending={str(batch.more_pending).lower()}")
+                print(f"re-arm after processing: {rearm_command}")
+            waiter.close()
             return 0
         sleep_until = time.monotonic() + poll
         while time.monotonic() < sleep_until:
@@ -3538,6 +3633,42 @@ def cmd_listen(args) -> int:
             if deadline is not None and time.monotonic() >= deadline:
                 return finish("timeout", code=1, detail="no waking event before timeout")
             time.sleep(min(0.25, max(0.0, sleep_until - time.monotonic())))
+
+
+def cmd_listen_auto(args) -> int:
+    """Resolve an existing ambient lease, then run the foreground listener."""
+    import goalflight_journal  # type: ignore
+    import goalflight_session_status as sessions  # type: ignore
+    import goalflight_task  # type: ignore
+
+    project_root = goalflight_task.resolve_project_root(args.project_root or str(Path.cwd()))
+    label = sessions.resolve_controller_label(
+        args.controller_label,
+        project_root=project_root,
+    )
+    if not label:
+        print("listen-auto: controller label is unavailable", file=sys.stderr)
+        return 2
+    ambient = _ambient_claimed_controller(
+        project_root,
+        controller_label=label,
+        mail_bearing=True,
+    )
+    if not ambient.get("claimed"):
+        print(
+            "listen-auto: " + str(ambient.get("reason") or "ambient lease unavailable"),
+            file=sys.stderr,
+        )
+        return 2
+    authority = goalflight_journal.Journal(project_root)
+    lease = authority.active_lease(label)
+    if lease is None:
+        print("listen-auto: active controller lease is unavailable", file=sys.stderr)
+        return 2
+    args.project_root = str(project_root)
+    args.controller_label = label
+    args.lease_nonce = lease.nonce
+    return cmd_listen(args)
 
 
 def cmd_mirror(args: argparse.Namespace) -> int:
@@ -3625,40 +3756,51 @@ def main(argv: list[str] | None = None) -> int:
     )
     relay.set_defaults(func=cmd_relay)
 
+    def add_listen_arguments(command_parser: argparse.ArgumentParser) -> None:
+        command_parser.add_argument("--project-root", default=None)
+        command_parser.add_argument(
+            "--controller-label",
+            default=None,
+            help="durable controller lease label",
+        )
+        command_parser.add_argument(
+            "--lease-nonce",
+            default=None,
+            help="active lease capability; defaults to GOALFLIGHT_CONTROLLER_LEASE_NONCE",
+        )
+        command_parser.add_argument(
+            "--cursor-token",
+            default=None,
+            help="previous one-shot batch token to CAS-advance before re-arming",
+        )
+        command_parser.add_argument("--batch-limit", type=int, default=50)
+        command_parser.add_argument("--poll-secs", type=float, default=5.0)
+        command_parser.add_argument(
+            "--timeout-s", type=float, default=0.0, help="0 = wait indefinitely"
+        )
+        command_parser.add_argument("--json", action="store_true")
+
     listen = sub.add_parser(
         "listen",
         help="one-shot journal cursor listener; its exit is the wake",
     )
-    listen.add_argument("--project-root", default=None)
-    listen.add_argument(
-        "--controller-label",
-        default=None,
-        help="durable controller lease label",
+    add_listen_arguments(listen)
+    listen_auto = sub.add_parser(
+        "listen-auto",
+        help="resolve the ambient lease and start the one-shot listener",
     )
-    listen.add_argument(
-        "--lease-nonce",
-        default=None,
-        help="active lease capability; defaults to GOALFLIGHT_CONTROLLER_LEASE_NONCE",
-    )
-    listen.add_argument(
-        "--cursor-token",
-        default=None,
-        help="previous one-shot batch token to CAS-advance before re-arming",
-    )
-    listen.add_argument("--batch-limit", type=int, default=50)
-    listen.add_argument("--poll-secs", type=float, default=5.0)
-    listen.add_argument("--timeout-s", type=float, default=0.0,
-                        help="0 = wait indefinitely")
-    listen.add_argument("--json", action="store_true")
+    add_listen_arguments(listen_auto)
 
     mirror = sub.add_parser("mirror")
     mirror.add_argument("--remote", type=Path, required=True, help="Remote *.jsonl inbox to merge")
     listen.set_defaults(func=cmd_listen)
+    listen_auto.set_defaults(func=cmd_listen_auto)
     mirror.set_defaults(func=cmd_mirror)
 
     args = parser.parse_args(argv)
     role_by_command = {
         "listen": "listener",
+        "listen-auto": "listener",
         "mirror": "mirror",
         "status": "dashboard",
         "relay": "dashboard",
@@ -3666,25 +3808,15 @@ def main(argv: list[str] | None = None) -> int:
         "post": "producer",
     }
     role = role_by_command.get(args.cmd, "controller")
-    if role == "controller":
-        try:
-            import goalflight_session_status as sessions  # type: ignore
-            import goalflight_task  # type: ignore
-
-            entry_root = goalflight_task.resolve_project_root(str(Path.cwd()))
-            claim_result = sessions.claim_controller_startup(
-                entry_root,
-                pid_from_ancestry=True,
-                role=role,
-            )
-            if claim_result.get("reason") == "label_in_use":
-                print(
-                    "goalflight_messages: "
-                    + str(claim_result.get("message") or "label in use"),
-                    file=sys.stderr,
-                )
-        except Exception:
-            pass
+    if args.cmd not in {"listen", "listen-auto"}:
+        entry_root = getattr(args, "controller_project_root", None) or Path.cwd()
+        emit_wake_entry_notice(
+            project_root=entry_root,
+            messages_dir=args.messages_dir,
+            fleet_dir=args.fleet_dir,
+            mail_bearing=role == "controller",
+            stream=sys.stderr,
+        )
     try:
         return args.func(args)
     except MessageError as exc:

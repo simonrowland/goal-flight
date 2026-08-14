@@ -17,6 +17,7 @@ sys.path.insert(0, str(SCRIPTS))
 import goalflight_journal as journal  # noqa: E402
 import goalflight_messages as messages  # noqa: E402
 import goalflight_session_status as sessions  # noqa: E402
+import goalflight_wake as wake  # noqa: E402
 
 
 def _isolate(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
@@ -40,19 +41,41 @@ def test_register_conflict_and_explicit_join_create_one_active_generation(
     root = _isolate(monkeypatch, tmp_path)
     first = sessions.register_controller(root, "engine", session_id="first-nonce")
     assert first["registered"] is True
-    conflict = sessions.register_controller(root, "engine", session_id="second-nonce")
-    assert conflict["registered"] is False
-    assert conflict["reason"] == "label_in_use"
-    joined = sessions.join_controller(
+    holder = wake.register_lease_holder(
         root,
-        "engine",
-        session_id="second-nonce",
-        acknowledge_conflict=True,
+        controller_label="engine",
+        lease_nonce=first["session"]["lease_nonce"],
     )
+    try:
+        conflict = sessions.register_controller(root, "engine", session_id="second-nonce")
+        assert conflict["registered"] is False
+        assert conflict["reason"] == "label_in_use"
+        joined = sessions.join_controller(
+            root,
+            "engine",
+            session_id="second-nonce",
+            acknowledge_conflict=True,
+        )
+    finally:
+        holder.close()
     assert joined["joined"] is True and joined["succession"] is True
     authority = journal.Journal(root)
     assert authority.active_lease("engine").nonce == "second-nonce"
     assert sum(row["state"] == "ACTIVE" for row in authority.lease_records(include_ended=True)) == 1
+
+
+def test_production_register_requires_a_session_beacon(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = _isolate(monkeypatch, tmp_path)
+    result = sessions.register_controller(
+        root,
+        "engine",
+        session_id="engine-nonce",
+        hold_lock=True,
+    )
+    assert result == {"registered": False, "reason": "missing_session_beacon"}
+    assert not journal.resolve_journal_path(root).exists()
 
 
 def test_roster_unread_is_journal_cursor_derived(

@@ -26,6 +26,7 @@ import goalflight_journal as journal  # noqa: E402
 import goalflight_messages as messages  # noqa: E402
 import goalflight_session_status as sessions  # noqa: E402
 import goalflight_status as status  # noqa: E402
+import goalflight_wake as wake  # noqa: E402
 
 
 def _set_state_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, str]:
@@ -181,6 +182,14 @@ def test_one_active_lease_generation_and_live_different_claim_never_steals(
         row for row in authority.lease_records(include_ended=True) if row["state"] == "ACTIVE"
     ]
     assert len(active_rows) == 1
+    ended = next(
+        row
+        for row in authority.lease_records(include_ended=True)
+        if row["generation"] == first.generation
+    )
+    assert ended["state"] == "SUPERSEDED"
+    assert ended["ended_reason"] == "explicit-takeover"
+    assert ended["ended_at"] is not None
 
 
 def test_cursor_cas_bounded_batch_and_rearm_delivers_remainder(
@@ -444,7 +453,7 @@ def test_two_real_one_shot_listeners_supersede_and_record_both_exits(
     assert after.renew_deadline_at == before.renew_deadline_at
 
 
-def test_lease_death_attention_materializes_on_listener_and_horizon_sides(
+def test_lease_death_attention_materializes_on_listener_and_holder_lock_sides(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -475,16 +484,22 @@ def test_lease_death_attention_materializes_on_listener_and_horizon_sides(
         horizon_s=60,
     )
     assert second_result.committed and second_result.value is not None
-    future = (
-        dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=2)
-    ).isoformat(timespec="seconds")
-    expired = authority.expire_stale_leases(observed_at=future)
-    assert expired.committed
-    horizon_items = [
+    replacement = authority.claim_or_renew_lease(
+        "horizon-side",
+        principal=_principal(41003, "start-c"),
+        incumbent_liveness=journal.LeaseLivenessEvidence(
+            generation=second_result.value.generation,
+            nonce=second_result.value.nonce,
+            alive=False,
+        ),
+    )
+    assert replacement.committed
+    holder_lock_items = [
         row for row in authority.attention_items() if row["source_label"] == "horizon-side"
     ]
-    assert len(horizon_items) == 1
-    assert horizon_items[0]["trigger_side"] == "horizon"
+    assert len(holder_lock_items) == 1
+    assert holder_lock_items[0]["trigger_side"] == "horizon"
+    assert holder_lock_items[0]["reason"] == "holder-dead"
 
 
 def test_orphaned_and_corrupt_self_checks_write_exit_rows_from_constructed_identity(
@@ -588,6 +603,11 @@ def test_auto_claim_is_controller_only_and_never_steals_live_label(
     authority = journal.Journal(project)
     incumbent = authority.active_lease("entry")
     assert incumbent is not None
+    holder = wake.register_lease_holder(
+        project,
+        controller_label="entry",
+        lease_nonce=incumbent.nonce,
+    )
     monkeypatch.setenv("GOALFLIGHT_CONTROLLER_SESSION_ID", incumbent.nonce)
 
     watchdog = sessions.claim_controller_startup(
@@ -621,6 +641,7 @@ def test_auto_claim_is_controller_only_and_never_steals_live_label(
     assert after_refusal.generation == incumbent.generation
     assert after_refusal.nonce == incumbent.nonce
     assert after_refusal.principal == incumbent.principal
+    holder.close()
 
 
 def test_hidden_consumers_use_journal_and_relay_is_peek_only(

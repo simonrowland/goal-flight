@@ -185,3 +185,44 @@ def test_controller_snapshot_uses_shared_fine_start_probe(monkeypatch) -> None:
         PID, include_ancestry=True
     ) == {"pid": PID, "start_token": START_TOKEN, "ppid": 12}
     assert calls == [(PID, True)]
+
+
+def test_controller_lease_liveness_is_the_lock_probe_never_pid(monkeypatch) -> None:
+    # The old contract measured a lease holder by pid + fine start token. That
+    # oracle was deliberately DELETED by the kernel-held-lease round: liveness
+    # is the held flock, and pid/start-token is audit identity only (kill -9
+    # coverage lives in test_wake_layer). This test pins the replacement
+    # contract two ways: the deleted oracle must not resurrect, and the
+    # evidence wrapper must delegate to the lock probe verbatim.
+    assert not hasattr(goalflight_session_status, "_controller_holder_liveness")
+
+    import goalflight_journal
+    import goalflight_wake
+
+    probes = []
+
+    def fake_lock_probe(project_root, *, controller_label, lease_nonce, **kwargs):
+        probes.append((str(project_root), controller_label, lease_nonce))
+        return True
+
+    monkeypatch.setattr(
+        goalflight_session_status.goalflight_wake,
+        "lease_holder_alive",
+        fake_lock_probe,
+    )
+    lease = goalflight_journal.LeaseIdentity(
+        label="probe-label",
+        project_root="/tmp/lease-probe-project",
+        generation=7,
+        nonce="probe-nonce",
+        state="ACTIVE",
+        claimed_at="2026-08-14T00:00:00+00:00",
+        renewed_at="2026-08-14T00:00:00+00:00",
+        renew_deadline_at="2026-08-14T01:00:00+00:00",
+        principal={"principal_id": "probe"},
+    )
+    evidence = goalflight_session_status._lease_holder_liveness(lease)
+    assert evidence is not None
+    assert (evidence.generation, evidence.nonce, evidence.alive) == (7, "probe-nonce", True)
+    assert probes == [("/tmp/lease-probe-project", "probe-label", "probe-nonce")]
+    assert goalflight_session_status._lease_holder_liveness(None) is None
