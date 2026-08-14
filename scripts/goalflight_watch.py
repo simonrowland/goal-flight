@@ -478,32 +478,71 @@ def _finish_existing_ledger(
     detached: bool = False,
     codex_dispatch_home_resolved: bool = False,
     codex_session_id: str | None = None,
+    terminal_marker: dict | None = None,
 ) -> dict | None:
     if not dispatch_id or not state:
         return None
     if state == "watcher_stopped" and worker_still_alive is True:
         return None
+    emitter_reason: object = reason
+    if (
+        isinstance(terminal_marker, dict)
+        and terminal_marker.get("kind") in WORKER_MAIL_MARKER_KINDS
+    ):
+        emitter_reason = {
+            "reason": reason,
+            "marker_kind": terminal_marker.get("kind"),
+            "text": _strip_marker_decoration(
+                str(terminal_marker.get("text") or "")
+            ).strip(),
+        }
     try:
         path = goalflight_ledger.record_path(dispatch_id, create=False)
         if not path.exists():
-            return None
+            committed = goalflight_ledger.commit_terminal_authority(
+                {
+                    "dispatch_id": dispatch_id,
+                    "project_root": str(Path.cwd()),
+                },
+                state=str(state),
+                reason=emitter_reason,
+                worker_still_alive=(
+                    worker_still_alive if isinstance(worker_still_alive, bool) else None
+                ),
+            )
+            if committed.committed:
+                return None
+            return {
+                "type": "TerminalCommitRefused",
+                "message": (
+                    f"journal terminal emitter returned {committed.disposition.value}: "
+                    f"{committed.reason}"
+                ),
+            }
         max_attempts = 3
         backoff_s = 0.05
         last_error: dict | None = None
         for attempt in range(max_attempts):
             try:
                 with contextlib.redirect_stdout(io.StringIO()):
-                    goalflight_ledger.cmd_finish(
+                    code = goalflight_ledger.cmd_finish(
                         argparse.Namespace(
                             dispatch_id=dispatch_id,
                             state=str(state),
-                            reason=reason,
+                            reason=emitter_reason,
                             terminal_state=None,
                             elapsed_s=None,
                             worker_still_alive=worker_still_alive,
                         )
                     )
-                return None
+                if code == 0:
+                    return None
+                last_error = {
+                    "type": "TerminalCommitRefused",
+                    "message": f"journal terminal emitter exited {code}",
+                }
+                if attempt + 1 < max_attempts:
+                    time.sleep(backoff_s * (attempt + 1))
             except Exception as exc:
                 last_error = {"type": type(exc).__name__, "message": str(exc)}
                 if attempt + 1 < max_attempts:
@@ -583,8 +622,6 @@ def _is_diff_context_line(raw_line: str) -> bool:
 
 
 def _strip_terminal_marker_prefix(stripped: str) -> str:
-    if stripped.startswith("> "):
-        return stripped[2:].lstrip()
     if stripped.startswith(("+", "-")):
         # Strip exactly one diff marker and at most its one separator space.
         # Keeping any further indentation makes the anchored marker regex fail.
@@ -614,6 +651,7 @@ def _final_terminal_marker_from_line(
     line_no: int,
     *,
     allow_prefixed_marker: bool = False,
+    allow_quote_prefix: bool = False,
     allow_status_prefix: bool = False,
     kimi_output: bool = False,
 ) -> dict | None:
@@ -631,7 +669,10 @@ def _final_terminal_marker_from_line(
     if allow_prefixed_marker and MARKER_VOCAB_BULLET_RE.match(stripped):
         return None
     if allow_prefixed_marker:
-        stripped = _strip_terminal_marker_prefix(stripped)
+        if allow_quote_prefix and stripped.startswith("> "):
+            stripped = stripped[2:].lstrip()
+        else:
+            stripped = _strip_terminal_marker_prefix(stripped)
         if kimi_output:
             stripped = _strip_kimi_terminal_marker_prefix(stripped)
         if not stripped:
@@ -1272,68 +1313,6 @@ WORKER_MAIL_MARKER_KINDS = frozenset({"USER-NEED", "USER-CONFIRM", "BLOCKED"})
 # Sentinel parked in the dedup set after any mail-layer failure: the bridge then
 # no-ops for the rest of the watcher run. A real (type, text) key can never equal
 # it (no message type is the empty marker below), so it cannot collide.
-_BRIDGE_DISABLED = ("\x00bridge-disabled", "")
-
-
-def post_worker_mail(dispatch_id: str, markers: list[dict], posted_keys: set) -> None:
-    """Best-effort: post a worker's USER-NEED / USER-CONFIRM / BLOCKED markers as
-    envelopes into the dispatch's mail inbox, so the controller's read-side status
-    mail hint surfaces them with the question/blocker text.
-
-    Liveness comes first and the bridge must never stall or storm the poll loop:
-    - the common poll (no urgent marker) returns immediately and imports nothing —
-      so the watcher's startup/steady path never touches the mail layer;
-    - the inbox is read at most ONCE, lazily, when the first fresh urgent marker
-      appears (rare; these markers are terminal), then the in-memory ``posted_keys``
-      set short-circuits every later poll — no per-poll inbox scan;
-    - each key is marked BEFORE the disk write, so a failed post can never re-attempt
-      the same I/O every poll;
-    - the FIRST mail-layer failure disables the bridge for the rest of the run.
-    """
-    if _BRIDGE_DISABLED in posted_keys:
-        return
-    try:
-        urgent = [m for m in markers if m.get("kind") in WORKER_MAIL_MARKER_KINDS]
-        if not urgent:
-            return
-        import goalflight_messages as gm  # lazy: the watcher must not hard-depend on mail
-
-        messages_dir = gm.default_messages_dir()
-        inbox = gm.inbox_path(messages_dir, dispatch_id)
-        if inbox.exists() and not inbox.is_file():
-            # Non-regular inbox (FIFO/device): a carrier read or
-            # post_message()'s open("a") could block the watcher's liveness loop
-            # FOREVER — the broad except below can't catch a hang. Same hang class
-            # as the read-side collect_inbox_paths guard. Refuse and disable the
-            # bridge for the run; liveness must never wait on the mail layer.
-            # is_file()/exists() are non-blocking stat()s (open() is what blocks).
-            posted_keys.add(_BRIDGE_DISABLED)
-            return
-        inbox_seen: set | None = None  # loaded once, only on a fresh urgent marker (restart-safe dedup)
-        for m in urgent:
-            mtype = gm.MARKER_TO_TYPE.get(m["kind"], "blocked")
-            text = _strip_marker_decoration(str(m.get("text") or "")).strip()
-            key = (mtype, text)
-            if key in posted_keys:
-                continue
-            if inbox_seen is None:
-                inbox_seen = {
-                    (str(e.get("type")), str((e.get("payload") or {}).get("text") or "").strip())
-                    for e in gm.read_envelopes_tolerant(inbox)
-                }
-            posted_keys.add(key)  # mark BEFORE I/O: a failed post must not retry every poll
-            if key in inbox_seen:
-                continue  # already delivered in a prior run; marked above, skip the re-post
-            gm.post_message(
-                dispatch_id=dispatch_id,
-                msg_type=mtype,
-                payload={"text": text},
-                messages_dir=messages_dir,
-                source={"node": "local", "adapter": "watcher", "transport": "marker-bridge"},
-            )
-    except Exception:
-        posted_keys.add(_BRIDGE_DISABLED)  # one failure -> bridge off for this run; liveness first
-        return
 
 
 def _last_line_is_terminal_marker(
@@ -1467,6 +1446,7 @@ def _scan_final_terminal_marker(
             line,
             idx,
             allow_prefixed_marker=True,
+            allow_quote_prefix=True,
             allow_status_prefix=True,
             kimi_output=kimi_output,
         )
@@ -1835,7 +1815,7 @@ def main() -> int:
                         goalflight_task.post_done_suggest_nudge(task_ids, task_project_root, args.dispatch_id)
         if terminal_write:
             payload["liveness_state"] = goalflight_terminal.terminal_liveness_state(payload.get("state"))
-        write_status(status_path, payload)
+        ledger_error = None
         if terminal_write:
             ledger_error = _finish_existing_ledger(
                 args.dispatch_id,
@@ -1848,14 +1828,20 @@ def main() -> int:
                     args.codex_dispatch_home_resolved
                 ),
                 codex_session_id=codex_session_id,
+                terminal_marker=(
+                    terminal_marker if isinstance(terminal_marker, dict) else None
+                ),
             )
             if ledger_error:
+                payload["terminal_pending_state"] = payload.get("state")
+                payload["state"] = "terminal_pending"
+                payload["liveness_state"] = "terminal_pending"
                 payload["ledger_finalize_error"] = ledger_error
-                write_status(status_path, payload)
+        write_status(status_path, payload)
         last_payload = dict(payload)
-        if terminal_write:
+        if terminal_write and not ledger_error:
             final_status_written = True
-        return terminal_error
+        return terminal_error or ledger_error
 
     def apply_tail_quota_status(
         payload: dict,
@@ -1933,17 +1919,11 @@ def main() -> int:
             signal.signal(sig, handle_signal)
     atexit.register(lambda: flush_terminal_status("watcher_exit"))
 
-    posted_mail_keys: set = set()  # per-run dedup for the worker->controller mail bridge
     posted_trace_attention: set[str] = set()
     while True:
         scan = tail_scanner.scan(kimi_output=moonshot_family(args.agent))
         markers = scan.markers
         size = scan.size
-        # Bridge worker USER-NEED/USER-CONFIRM/BLOCKED markers into the dispatch
-        # inbox so the controller's status mail hint surfaces them. Runs BEFORE the
-        # terminal-exit checks below so a need is posted even on the iteration the
-        # watcher resolves (these markers are themselves terminal). Best-effort.
-        post_worker_mail(args.dispatch_id, scan.mail_markers, posted_mail_keys)
         if size != last_size:
             last_size = size
             last_change = active_monotonic()
@@ -1966,7 +1946,6 @@ def main() -> int:
             scan = _combine_tail_scan_results(scan, recheck)
             markers = scan.markers
             terminal = scan.terminal
-            post_worker_mail(args.dispatch_id, recheck.mail_markers, posted_mail_keys)
             if scan.size != last_size:
                 last_size = scan.size
                 last_change = active_monotonic()

@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime as dt
+import io
 import json
 import os
 import re
@@ -38,7 +39,6 @@ from goalflight_watch import (
     BLOCKING_TERMINAL_MARKERS,
     SUCCESS_TERMINAL_MARKERS,
     _final_terminal_marker,
-    _last_line_is_terminal_marker,
 )
 
 # Each aggregated record carries a precomputed ``classification`` from
@@ -62,8 +62,6 @@ _QUEUE_PENDING_NO_DRAINER = "queue_pending_no_drainer"
 # --wait anti-hang grace: how long a dispatch may stay ambiguous/stale WITH a
 # confirmed-dead worker before --wait resolves it to a terminal worker_dead
 # verdict (instead of polling to the wait-timeout). >= 2 default poll intervals.
-_WAIT_CRASH_GRACE_S = 90.0
-_WAIT_STALE_GRACE_S = 600.0
 _WAIT_HEARTBEAT_S = 1200.0
 _WAIT_CPU_EPSILON = 0.1
 _WAIT_TAIL_COUNT_BYTES = 128 * 1024
@@ -356,15 +354,28 @@ def _persist_draft_artifact_reconciliation(record: dict, reconciled: dict) -> No
     if not path.exists():
         return
     with contextlib.suppress(Exception):
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if raw.get("terminal_state") == "complete" or raw.get("state") == "complete":
+            return
+        reason = {
+            "draft_artifact_reconciliation": reconciliation,
+            "terminal_marker": reconciled.get("terminal_marker"),
+        }
+        with contextlib.redirect_stdout(io.StringIO()):
+            if goalflight_ledger.cmd_finish(
+                argparse.Namespace(
+                    dispatch_id=str(dispatch_id),
+                    state="complete",
+                    reason=reason,
+                    terminal_state="complete",
+                    worker_still_alive=False,
+                )
+            ) != 0:
+                return
         with goalflight_ledger.StateLock():
             raw = json.loads(path.read_text(encoding="utf-8"))
-            if raw.get("terminal_state") == "complete" or raw.get("state") == "complete":
-                return
             raw.setdefault("raw_state", raw.get("state"))
             raw.setdefault("raw_terminal_state", raw.get("terminal_state"))
-            raw["state"] = "complete"
-            raw["terminal_state"] = "complete"
-            raw["ended_at"] = raw.get("ended_at") or goalflight_ledger.utc_now()
             raw["reason"] = reconciled.get("reason")
             raw["terminal_marker"] = reconciled.get("terminal_marker")
             raw["terminal_marker_source"] = "draft_artifact"
@@ -1474,21 +1485,6 @@ def _record_marker_info(record: dict | None) -> dict | None:
     return _validated_terminal_marker(data)
 
 
-def _wait_terminal_success_marker(record: dict | None) -> dict | None:
-    """Rescan a dead, quiet worker tail before resolving it as worker_dead."""
-    tail = _tail_path_from_record(record or {})
-    if tail is None:
-        return None
-    marker = _last_line_is_terminal_marker(
-        tail,
-        ignore_prefix_lines=_ignore_prefix_lines((record or {}).get("prompt_path")),
-        kimi_output=moonshot_family((record or {}).get("agent")),
-    )
-    if marker and marker.get("kind") in SUCCESS_TERMINAL_MARKERS:
-        return marker
-    return None
-
-
 def _fmt_wait_bytes(value: int | None) -> str:
     if value is None:
         return "+?B"
@@ -1536,19 +1532,11 @@ def _wait_snapshot(
     payload: dict,
     wait_ids: list[str],
     *,
-    dead_since: dict[str, float] | None = None,
-    stalled_since: dict[str, float] | None = None,
     progress_state: dict[str, dict] | None = None,
     now: float | None = None,
-    grace: float = _WAIT_CRASH_GRACE_S,
-    stale_grace: float = _WAIT_STALE_GRACE_S,
     cpu_epsilon: float = _WAIT_CPU_EPSILON,
     poll_s: float = 2.0,
 ) -> list[dict]:
-    if dead_since is None:
-        dead_since = {}
-    if stalled_since is None:
-        stalled_since = {}
     if progress_state is None:
         progress_state = {}
     if now is None:
@@ -1612,61 +1600,6 @@ def _wait_snapshot(
                     worker_alive=worker_alive,
                 )
             )
-        terminal_marker = None
-        output_active = bool(
-            code == 2
-            and confirmed_dead
-            and _wait_output_is_active(progress, poll_s=poll_s)
-        )
-        if output_active:
-            # A launcher exec can preserve pid/lstart while changing comm, so
-            # identity alone can call a live worker dead. Match the watcher's
-            # class-level veto: actively growing/fresh output is stronger live
-            # evidence for this poll, while a quiet tail still resolves dead.
-            confirmed_dead = False
-            worker_alive = True
-            progress["worker_alive"] = True
-            progress["worker_alive_via_output"] = True
-            state = "running"
-        elif code == 2 and confirmed_dead:
-            terminal_marker = _wait_terminal_success_marker(record)
-            if terminal_marker:
-                code = 0
-                terminal = True
-                state = "complete"
-        if terminal or code == 1:
-            dead_since.pop(dispatch_id, None)
-        elif code == 2 and confirmed_dead:
-            first = dead_since.setdefault(dispatch_id, now)
-            if now - first >= grace:
-                terminal = True
-                state = "worker_dead"
-            else:
-                state = "worker_dead_pending"
-        else:
-            dead_since.pop(dispatch_id, None)
-        if terminal or state.startswith("worker_dead"):
-            stalled_since.pop(dispatch_id, None)
-        else:
-            tail_known = isinstance(progress.get("tail_size"), int)
-            tail_grew = bool(
-                isinstance(progress.get("tail_growth_bytes"), int)
-                and progress.get("tail_growth_bytes") > 0
-            )
-            tail_changed = bool(progress.get("tail_changed"))
-            cpu_busy = bool(progress.get("cpu_busy"))
-            cpu_idle = bool(progress.get("cpu_idle"))
-            worker_alive = bool(progress.get("worker_alive"))
-            if tail_grew or tail_changed or cpu_busy or not cpu_idle or not worker_alive or not tail_known:
-                stalled_since.pop(dispatch_id, None)
-            else:
-                first = stalled_since.setdefault(
-                    dispatch_id,
-                    max(0.0, now - float(progress.get("last_growth_age_s") or 0.0)),
-                )
-                if now - first >= stale_grace:
-                    terminal = True
-                    state = "worker_stalled"
         row = {
             "dispatch_id": dispatch_id,
             "done_code": code,
@@ -1675,13 +1608,11 @@ def _wait_snapshot(
             "status_path": None if record is None else record.get("status_path"),
             "progress": progress,
         }
-        if terminal_marker:
-            row["terminal_marker"] = terminal_marker
         # Carry the marker kind on every terminal row. The state taxonomy
         # collapses all non-success terminals to "blocked", which makes an
         # expected checkpoint (USER-NEED) print identically to a wedged worker
         # (BLOCKED) - the reader learns which only by opening the tail.
-        marker_info = _record_marker_info(record) or terminal_marker
+        marker_info = _record_marker_info(record)
         if marker_info:
             row["marker_kind"] = marker_info.get("kind")
             row["marker_headline"] = str(marker_info.get("text") or "")[:120]
@@ -1775,8 +1706,6 @@ def wait_for_dispatches(
     project_root: str | None,
     timeout_s: float | None,
     poll_s: float,
-    crash_grace_s: float | None = None,
-    stale_grace_s: float | None = None,
     heartbeat_s: float | None = None,
     json_output: bool = False,
 ) -> int:
@@ -1827,16 +1756,7 @@ def wait_for_dispatches(
     poll_s = max(0.05, poll_s)
     if timeout_s in (None, 0, 0.0):
         timeout_s = None
-    grace = _WAIT_CRASH_GRACE_S if crash_grace_s is None else max(0.0, crash_grace_s)
-    stale_grace = _WAIT_STALE_GRACE_S if stale_grace_s is None else max(0.0, stale_grace_s)
     heartbeat = _WAIT_HEARTBEAT_S if heartbeat_s is None else max(0.0, heartbeat_s)
-    # Per-id monotonic timestamp of when a row first became ambiguous-and-dead.
-    # The grace window means a transient post-submit blip does not flip to
-    # worker_dead, but a genuine crash/premature-exit resolves in bounded time.
-    dead_since: dict[str, float] = {}
-    # Per-id monotonic timestamp of when an alive row last had no progress
-    # evidence. Cleared by tail growth/change, CPU activity, terminal, or death.
-    stalled_since: dict[str, float] = {}
     progress_state: dict[str, dict] = {}
     heartbeat_since: dict[str, float] = {dispatch_id: start for dispatch_id in wait_ids}
     try:
@@ -1851,12 +1771,8 @@ def wait_for_dispatches(
             rows = _wait_snapshot(
                 payload,
                 wait_ids,
-                dead_since=dead_since,
-                stalled_since=stalled_since,
                 progress_state=progress_state,
                 now=now,
-                grace=grace,
-                stale_grace=stale_grace,
                 poll_s=poll_s,
             )
             if not json_output:
@@ -2235,27 +2151,6 @@ def main(argv: list[str] | None = None) -> int:
         help="seconds between --wait polls",
     )
     parser.add_argument(
-        "--crash-grace-s",
-        dest="crash_grace_s",
-        type=float,
-        default=None,
-        help=(
-            "seconds an ambiguous/stale dispatch with a confirmed-dead worker may "
-            "persist before --wait resolves it to worker_dead instead of polling to "
-            f"--wait-timeout (default {int(_WAIT_CRASH_GRACE_S)})"
-        ),
-    )
-    parser.add_argument(
-        "--stale-grace-s",
-        dest="stale_grace_s",
-        type=float,
-        default=None,
-        help=(
-            "seconds an alive dispatch with no tail growth and no CPU activity may "
-            f"persist before --wait resolves it to worker_stalled (default {int(_WAIT_STALE_GRACE_S)})"
-        ),
-    )
-    parser.add_argument(
         "--heartbeat-s",
         dest="heartbeat_s",
         type=float,
@@ -2340,8 +2235,6 @@ def main(argv: list[str] | None = None) -> int:
             project_root=project_root,
             timeout_s=args.wait_timeout,
             poll_s=args.poll_s,
-            crash_grace_s=args.crash_grace_s,
-            stale_grace_s=args.stale_grace_s,
             heartbeat_s=args.heartbeat_s,
             json_output=args.json,
         )

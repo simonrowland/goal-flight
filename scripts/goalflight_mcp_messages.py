@@ -12,6 +12,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from goalflight_messages import (  # noqa: E402
+    EVENT_TYPE_REGISTRY,
     MCP_TOOL_POST_MESSAGE,
     MessageError,
     default_fleet_dir,
@@ -28,7 +29,7 @@ TOOL_DESCRIPTOR = {
         "required": ["dispatch_id", "type"],
         "properties": {
             "dispatch_id": {"type": "string"},
-            "type": {"type": "string"},
+            "type": {"type": "string", "enum": sorted(EVENT_TYPE_REGISTRY)},
             "payload": {"type": "object"},
             "source": {"type": "object"},
             "seq": {"type": "integer"},

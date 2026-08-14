@@ -133,6 +133,19 @@ def _read_record(dispatch_id: str) -> dict:
     return json.loads(ledger.record_path(dispatch_id).read_text(encoding="utf-8"))
 
 
+def _claim_attempt_running(dispatch_id: str, *, worker_pid: int) -> None:
+    authority = dispatch.goalflight_journal.Journal(ROOT)
+    attempt = authority.attempt_for_dispatch(dispatch_id)
+    assert attempt is not None
+    claimed = authority.mark_attempt_running(
+        attempt.attempt_id,
+        attempt.launch_token,
+        launch_epoch=attempt.launch_epoch,
+        worker_instance={"pid": worker_pid, "source": "ownership-test-worker"},
+    )
+    assert claimed.committed, claimed
+
+
 @contextlib.contextmanager
 def _quiet_record_side_effects():
     with patch.object(dispatch, "_export_dashboard_status_for_project"), patch.object(
@@ -301,13 +314,41 @@ def test_live_beacon_pair_reaches_queue_bash_acp_and_status_records() -> None:
                         controller_beacon_pid=beacon.pid,
                     )
                     dispatch._stamp_controller_session(acp_args, root)
-                    dispatch._record_test_acp_running_fast(
+                    dispatch._record_ledger(
                         acp_args,
                         project_root=root,
                         prompt_path=None,
                         status_json=base / "owned-acp.status.json",
                         tail=base / "owned-acp.tail",
+                        lease_id=None,
+                        worker_pid=None,
+                        state="starting",
+                    )
+                    attempt = dispatch.goalflight_journal.Journal(root).attempt_for_dispatch(
+                        "owned-acp"
+                    )
+                    assert attempt is not None
+                    claimed_running = dispatch.goalflight_journal.Journal(
+                        root
+                    ).mark_attempt_running(
+                        attempt.attempt_id,
+                        attempt.launch_token,
+                        launch_epoch=attempt.launch_epoch,
+                        worker_instance={
+                            "pid": os.getpid(),
+                            "source": "ownership-test-worker",
+                        },
+                    )
+                    assert claimed_running.committed, claimed_running
+                    dispatch._record_ledger(
+                        acp_args,
+                        project_root=root,
+                        prompt_path=None,
+                        status_json=base / "owned-acp.status.json",
+                        tail=base / "owned-acp.tail",
+                        lease_id=None,
                         worker_pid=os.getpid(),
+                        state="running",
                     )
                     acp = _read_record("owned-acp")
                     assert (acp.get("controller_session_id"), acp.get("controller_pid")) == expected
@@ -773,6 +814,7 @@ def test_cmd_record_merge_preserves_owned_pair_in_only_the_null_direction() -> N
                     state="starting",
                 )
             )
+            _claim_attempt_running("owned-then-null", worker_pid=owner_pid)
             ledger.cmd_record(
                 _ledger_args(
                     "owned-then-null",
@@ -796,6 +838,7 @@ def test_cmd_record_merge_preserves_owned_pair_in_only_the_null_direction() -> N
                     state="starting",
                 )
             )
+            _claim_attempt_running("null-then-owned", worker_pid=owner_pid)
             ledger.cmd_record(
                 _ledger_args(
                     "null-then-owned",

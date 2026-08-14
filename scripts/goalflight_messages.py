@@ -51,6 +51,164 @@ import goalflight_compat  # noqa: E402
 import goalflight_steer_mailbox  # noqa: E402
 from goalflight_watch import BLOCKING_TERMINAL_MARKERS, SUCCESS_TERMINAL_MARKERS  # noqa: E402
 
+
+@dataclass(frozen=True)
+class EventTypeRegistration:
+    schema: str
+    wake_class: str
+    authoritative_state_source: str
+    dedupe_semantics: str
+    claim_required: bool
+    orphan_disposition: str
+    retention_class: str
+
+
+# D13 is deliberately data, not scattered conditionals. Canonical types and the
+# finite measured compatibility vocabulary are registered before ingress
+# validation, while every unmeasured type remains a hard error.
+EVENT_TYPE_REGISTRY: dict[str, EventTypeRegistration] = {
+    "status": EventTypeRegistration(
+        "goalflight.message.v1/payload.object", "quiet", "worker-status",
+        "origin_node+event_uuid", False, "quiet-expire", "quiet-7d",
+    ),
+    "monitor": EventTypeRegistration(
+        "goalflight.message.v1/payload.object", "quiet", "worker-status",
+        "origin_node+event_uuid", False, "quiet-expire", "quiet-7d",
+    ),
+    "user_need": EventTypeRegistration(
+        "goalflight.message.v1/payload.object", "waking", "journal.terminal-outbox+task-store",
+        "attempt_id+transition_id|origin_node+event_uuid", True, "attention-item", "critical",
+    ),
+    "user_confirm": EventTypeRegistration(
+        "goalflight.message.v1/payload.object", "waking", "journal.terminal-outbox",
+        "attempt_id+transition_id", True, "attention-item", "critical",
+    ),
+    "result": EventTypeRegistration(
+        "goalflight.message.v1/payload.object", "waking", "journal.terminal-outbox",
+        "attempt_id+transition_id", True, "attention-item", "critical",
+    ),
+    "blocked": EventTypeRegistration(
+        "goalflight.message.v1/payload.object", "waking", "journal.terminal-outbox",
+        "attempt_id+transition_id", True, "attention-item", "critical",
+    ),
+    "advisory": EventTypeRegistration(
+        "goalflight.message.v1/payload.object", "waking", "service-observation",
+        "origin_node+event_uuid", False, "held-for-recipient", "controller-mail",
+    ),
+    "steering": EventTypeRegistration(
+        "goalflight.message.v1/payload.object", "waking", "fleet-steering-register",
+        "origin_node+event_uuid", True, "attention-item", "critical",
+    ),
+    "controller-question": EventTypeRegistration(
+        "goalflight.message.v1/payload.object", "waking", "journal.attention-items",
+        "origin_node+event_uuid", True, "attention-item", "critical",
+    ),
+    "controller-answer": EventTypeRegistration(
+        "goalflight.message.v1/payload.object", "waking", "controller-channel",
+        "origin_node+event_uuid", False, "held-for-recipient", "controller-mail",
+    ),
+    "controller-notice": EventTypeRegistration(
+        "goalflight.message.v1/payload.object", "waking", "controller-channel",
+        "origin_node+event_uuid", False, "held-for-recipient", "controller-mail",
+    ),
+    "controller-coordination": EventTypeRegistration(
+        "goalflight.message.v1/payload.object", "waking", "journal.attention-items",
+        "origin_node+event_uuid", True, "attention-item", "critical",
+    ),
+    "coordination": EventTypeRegistration(
+        "goalflight.message.v1/payload.object", "waking", "journal.attention-items",
+        "origin_node+event_uuid", True, "attention-item", "critical",
+    ),
+    "notice": EventTypeRegistration(
+        "goalflight.message.v1/payload.object", "waking", "controller-channel",
+        "origin_node+event_uuid", False, "held-for-recipient", "controller-mail",
+    ),
+}
+
+CANONICAL_EVENT_TYPES = frozenset(EVENT_TYPE_REGISTRY)
+
+# Finite compatibility vocabulary measured from the cross-repository carrier
+# fleet at the D13 cutover.  Each legacy spelling inherits one canonical
+# lifecycle contract; anything outside this map still fails closed at ingress.
+EVENT_TYPE_COMPATIBILITY_ALIASES: dict[str, str] = {
+    "ack": "advisory",
+    "bug-fix-handoff": "advisory",
+    "bug-haul": "advisory",
+    "canonization-update": "advisory",
+    "catalog-asks-response": "advisory",
+    "catalog-handoff": "advisory",
+    "catalog-handoff-ack": "advisory",
+    "catalog-integration-ack": "advisory",
+    "catalog-state-consolidation": "advisory",
+    "catalog-update": "advisory",
+    "consolidation-request": "advisory",
+    "controller-handoff": "advisory",
+    "controller-note": "advisory",
+    "controller_coordination": "advisory",
+    "controller_report": "advisory",
+    "controller_request": "advisory",
+    "coord": "advisory",
+    "coordination-answer": "advisory",
+    "coordination-update": "advisory",
+    "corpus-merge-notice": "advisory",
+    "defect-notice": "advisory",
+    "fea-complete-ontario-handoff": "advisory",
+    "fea-contract-ready": "advisory",
+    "finding": "advisory",
+    "fki-ref-fixed": "advisory",
+    "forensics": "advisory",
+    "idea-relay": "advisory",
+    "merge-ack": "advisory",
+    "merge-package-handoff": "advisory",
+    "merge-request": "advisory",
+    "note": "advisory",
+    "ontario-division-ack": "advisory",
+    "patch": "advisory",
+    "qa-bug": "advisory",
+    "qa-complete": "advisory",
+    "qa-round": "advisory",
+    "question": "advisory",
+    "raise-coordination": "advisory",
+    "reply": "advisory",
+    "request": "advisory",
+    "ruling": "advisory",
+    "sequencing-decision": "advisory",
+    "sequencing-reconcile": "advisory",
+    "steer": "steering",
+    "user_confirm_reply": "user_confirm",
+    "web-fix-block-handoff": "advisory",
+}
+EVENT_TYPE_REGISTRY.update(
+    {
+        alias: EVENT_TYPE_REGISTRY[canonical]
+        for alias, canonical in EVENT_TYPE_COMPATIBILITY_ALIASES.items()
+    }
+)
+
+
+def canonical_event_type(msg_type: str) -> str:
+    return EVENT_TYPE_COMPATIBILITY_ALIASES.get(msg_type, msg_type)
+
+
+def event_type_registration(msg_type: object) -> EventTypeRegistration:
+    if not isinstance(msg_type, str) or msg_type not in EVENT_TYPE_REGISTRY:
+        raise MessageError(
+            "unregistered message type; expected one of "
+            + ", ".join(sorted(EVENT_TYPE_REGISTRY))
+        )
+    return EVENT_TYPE_REGISTRY[msg_type]
+
+
+def event_wake_class(msg_type: str, payload: object = None) -> str:
+    registration = event_type_registration(msg_type)
+    if (
+        msg_type == "user_need"
+        and isinstance(payload, dict)
+        and payload.get("nudge_kind") in TASK_STORE_STATUS_NUDGE_KINDS
+    ):
+        return "quiet"
+    return registration.wake_class
+
 MARKER_TO_TYPE: dict[str, str] = {
     "STATUS": "status",
     "STEER-ACK": "monitor",
@@ -164,7 +322,12 @@ def _lexical_absolute(path: Path) -> Path:
     return Path(os.path.abspath(os.fspath(path)))
 
 
-def _canonical_jsonl_path(path: Path, *, allow_quarantine: bool = False) -> Path:
+def _canonical_jsonl_path(
+    path: Path,
+    *,
+    allow_quarantine: bool = False,
+    verify_identity: bool = False,
+) -> Path:
     lexical = _lexical_absolute(Path(path))
     if lexical.suffix != ".jsonl":
         raise MessageError(f"{path}: carrier must be a .jsonl file")
@@ -180,10 +343,12 @@ def _canonical_jsonl_path(path: Path, *, allow_quarantine: bool = False) -> Path
             raise MessageError(f"{path}: cannot stat carrier: {exc}") from exc
         if not stat.S_ISREG(mode):
             raise MessageError(f"{path}: inbox is not a regular file; refusing access")
-    resolved = lexical.resolve(strict=False)
+    # Resolve the parent but retain the lexical final component. Final-component
+    # symlink authority belongs to O_NOFOLLOW + fstat at the actual open.
+    resolved = resolved_parent / lexical.name
     if resolved.parent != resolved_parent:
         raise MessageError(f"{path}: resolved carrier escapes its stream directory")
-    if lexical.exists() and resolved.exists():
+    if verify_identity and lexical.exists() and resolved.exists():
         try:
             if os.lstat(lexical).st_ino != os.stat(resolved).st_ino:
                 # The name changed identity between the regular-file check and
@@ -210,7 +375,8 @@ def inbox_path(messages_dir: Path, dispatch_id: str) -> Path:
 
 
 def mail_lock_path(path: Path) -> Path:
-    resolved = Path(path).resolve(strict=False)
+    lexical = _lexical_absolute(Path(path))
+    resolved = lexical.parent.resolve(strict=False) / lexical.name
     return resolved.with_name(f".{resolved.name}.lock")
 
 
@@ -694,7 +860,9 @@ def validate_envelope(
             raise MessageError(f"{path}: missing field: {field}")
     if envelope.get("schema") != "goalflight.message.v1":
         raise MessageError(f"{path}: schema must be goalflight.message.v1")
-    if envelope.get("schema_version") != 1:
+    if isinstance(envelope.get("schema_version"), bool) or not isinstance(
+        envelope.get("schema_version"), int
+    ) or envelope.get("schema_version") != 1:
         raise MessageError(f"{path}: unsupported schema_version")
     event_id = _bounded_nonblank_string(envelope.get("id"), path=f"{path}.id", limit=36)
     try:
@@ -722,6 +890,7 @@ def validate_envelope(
     msg_type = envelope.get("type")
     if not isinstance(msg_type, str) or not MESSAGE_TYPE_RE.fullmatch(msg_type):
         raise MessageError(f"{path}.type: expected a bounded message-type token")
+    event_type_registration(msg_type)
     if "priority" in envelope and envelope.get("priority") not in MESSAGE_PRIORITIES:
         raise MessageError(
             f"{path}.priority: expected one of {', '.join(sorted(MESSAGE_PRIORITIES))}"
@@ -734,9 +903,9 @@ def validate_envelope(
             raise MessageError(f"{path}.addressee: expected object")
         if addressee.get("kind") != CONTROLLER_ADDRESSEE_KIND:
             raise MessageError(f"{path}.addressee.kind: unsupported addressee kind")
-        label = addressee.get("label")
-        if not isinstance(label, str) or not label.strip() or len(label.strip()) > 64:
-            raise MessageError(f"{path}.addressee.label: expected 1..64 non-blank characters")
+        _bounded_nonblank_string(
+            addressee.get("label"), path=f"{path}.addressee.label", limit=64
+        )
         project_root = _bounded_nonblank_string(
             addressee.get("project_root"),
             path=f"{path}.addressee.project_root",
@@ -749,7 +918,7 @@ def validate_envelope(
             raise MessageError(
                 f"{path}.addressee.project_root: expected canonical root {canonical_root!r}"
             )
-        if envelope.get("type") not in CONTROLLER_CHANNEL_TYPES:
+        if canonical_event_type(str(envelope.get("type") or "")) not in CONTROLLER_CHANNEL_TYPES:
             raise MessageError(
                 f"{path}.addressee: controller addressing is only valid for controller-channel types"
             )
@@ -931,10 +1100,13 @@ def _fsync_directory(path: Path) -> None:
         flags |= os.O_DIRECTORY
     try:
         fd = os.open(path, flags)
-    except OSError:
-        return
+    except OSError as exc:
+        raise MessageError(f"cannot fsync carrier directory {path}: {exc}") from exc
     try:
-        os.fsync(fd)
+        try:
+            os.fsync(fd)
+        except OSError as exc:
+            raise MessageError(f"cannot fsync carrier directory {path}: {exc}") from exc
     finally:
         os.close(fd)
 
@@ -943,11 +1115,18 @@ def _append_fsync(path: Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     if path.is_symlink():
         raise MessageError(f"{path}: symlinked file refused")
-    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
+    flags = os.O_WRONLY | os.O_APPEND
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
+    created = False
     try:
-        fd = os.open(path, flags, 0o600)
+        fd = os.open(path, flags | os.O_CREAT | os.O_EXCL, 0o600)
+        created = True
+    except FileExistsError:
+        try:
+            fd = os.open(path, flags, 0o600)
+        except OSError as exc:
+            raise MessageError(f"{path}: cannot append carrier: {exc}") from exc
     except OSError as exc:
         raise MessageError(f"{path}: cannot append carrier: {exc}") from exc
     try:
@@ -960,6 +1139,8 @@ def _append_fsync(path: Path, data: bytes) -> None:
     finally:
         if fd >= 0:
             os.close(fd)
+    if created:
+        _fsync_directory(path.parent)
 
 
 def _replace_fsync(path: Path, data: bytes) -> None:
@@ -1019,11 +1200,16 @@ class CarrierTransaction:
 
 @contextlib.contextmanager
 def carrier_transaction(path: Path, *, quarantine_sidecar: bool = False):
-    """Validate one lexical path, then lock its canonical JSONL carrier."""
+    """Lock one canonical carrier, then re-resolve and validate its identity."""
     canonical = _canonical_jsonl_path(Path(path), allow_quarantine=quarantine_sidecar)
     canonical.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     with mail_lock(canonical):
-        yield CarrierTransaction(canonical)
+        locked_canonical = _canonical_jsonl_path(
+            canonical,
+            allow_quarantine=quarantine_sidecar,
+            verify_identity=True,
+        )
+        yield CarrierTransaction(locked_canonical)
 
 
 def _quarantine_row(path: Path, offset: int, reason: str, raw_line: bytes) -> dict:
@@ -1183,7 +1369,7 @@ def _read_envelope_prefix(path: Path) -> tuple[list[dict], dict[str, object] | N
 
 
 def _emit_carrier_error(error: dict[str, object], *, stream=None) -> None:
-    # TODO(P2-outbox): commit a waking corruption event beside this stderr warning.
+    # Controller watermarks materialize the same error as a stable waking event.
     print(
         f"WARNING: carrier corruption: {error.get('error')}",
         file=sys.stderr if stream is None else stream,
@@ -1299,6 +1485,8 @@ def post_message(
     addressee: dict | None = None,
     skip_if: Callable[[dict], bool] | None = None,
     replace_if: Callable[[dict], bool] | None = None,
+    event_id: str | None = None,
+    event_ts: str | None = None,
 ) -> dict:
     """Append one goalflight.message.v1 envelope; shared by CLI, MCP, and tests."""
     validate_payload(payload)
@@ -1317,13 +1505,13 @@ def post_message(
     envelope = {
         "schema": "goalflight.message.v1",
         "schema_version": 1,
-        "id": str(uuid.uuid4()),
+        "id": event_id or str(uuid.uuid4()),
         "dispatch_id": dispatch_id,
         "seq": provided_seq or 1,
-        "ts": utc_now(),
+        "ts": event_ts or utc_now(),
         "source": base_source,
         "type": msg_type,
-        "priority": priority or PRIORITY_BY_TYPE.get(msg_type, "normal"),
+        "priority": priority or PRIORITY_BY_TYPE.get(canonical_event_type(msg_type), "normal"),
         "payload": payload,
     }
     if addressee is not None:
@@ -1344,6 +1532,46 @@ def post_message(
         )
         envelope["seq"] = resolved_seq
         validate_envelope(envelope, expected_dispatch_id=dispatch_id)
+        same_identity = next(
+            (
+                item
+                for item in existing
+                if item.get("id") == envelope["id"]
+                and isinstance(item.get("source"), dict)
+                and item["source"].get("node") == envelope["source"].get("node")
+            ),
+            None,
+        )
+        if same_identity is not None:
+            comparable_fields = (
+                "schema",
+                "schema_version",
+                "id",
+                "dispatch_id",
+                "ts",
+                "source",
+                "type",
+                "priority",
+                "payload",
+                "addressee",
+            )
+            if any(same_identity.get(key) != envelope.get(key) for key in comparable_fields):
+                raise MessageError(
+                    "event identity integrity conflict: same origin_node + event_uuid has different content"
+                )
+            return {
+                "envelope": same_identity,
+                "line": serialize_envelope_line(same_identity),
+                "path": str(path),
+                "recorded": False,
+                "delivery": {
+                    "requested": False,
+                    "delivered": False,
+                    "worker_view_written": False,
+                    "status": "duplicate",
+                    "detail": "matching event identity already exists",
+                },
+            }
         if skip_if is not None:
             duplicate = next((item for item in existing if skip_if(item)), None)
             if duplicate is not None:
@@ -1546,7 +1774,10 @@ def _deliver_message_to_worker(
 
 def _controller_delivery_requested(dispatch_id: str, msg_type: str) -> bool:
     """A worker posting to its own inbox is worker→controller sideband."""
-    return os.environ.get("GOALFLIGHT_DISPATCH_ID") != dispatch_id and msg_type in CONTROLLER_CHANNEL_TYPES
+    return (
+        os.environ.get("GOALFLIGHT_DISPATCH_ID") != dispatch_id
+        and canonical_event_type(msg_type) in CONTROLLER_CHANNEL_TYPES
+    )
 
 
 def _controller_sender_session_id(dispatch_id: str) -> str | None:
@@ -1793,7 +2024,7 @@ def _open_controller_channel(
             else int(env.get("seq", 0)) > acked_through
         )
         if (
-            env.get("type") in CONTROLLER_CHANNEL_TYPES
+            canonical_event_type(str(env.get("type") or "")) in CONTROLLER_CHANNEL_TYPES
             and is_unacked
         ):
             payload = env.get("payload", {}) or {}
@@ -1853,7 +2084,7 @@ def _last_steering(envelopes_by_dispatch: dict[str, list[dict]]) -> dict | None:
         env
         for envelopes in envelopes_by_dispatch.values()
         for env in envelopes
-        if env.get("type") == "steering"
+        if canonical_event_type(str(env.get("type") or "")) == "steering"
     ]
     if not steering:
         return None
@@ -2748,21 +2979,7 @@ def _controller_wake_event(
     dispatch_id = str(envelope.get("dispatch_id") or "")
     msg_type = str(envelope.get("type") or "")
     payload = envelope.get("payload") or {}
-    if (
-        scope_kind == "task-store"
-        and msg_type == "user_need"
-        and str(payload.get("nudge_kind") or "") in TASK_STORE_STATUS_NUDGE_KINDS
-    ):
-        return None
-    if scope_kind == "worker":
-        wakes = msg_type == "result" or msg_type in CONTROLLER_LISTENER_ESCALATION_TYPES
-        wakes = wakes or msg_type in CONTROLLER_CHANNEL_TYPES
-    else:
-        wakes = (
-            msg_type in CONTROLLER_LISTENER_ESCALATION_TYPES
-            or msg_type in CONTROLLER_CHANNEL_TYPES
-        )
-    if not wakes:
+    if event_wake_class(msg_type, payload) != "waking":
         return None
     # Direction is authoritative only when the producer proved its session.
     # Unknown/missing authorship wakes. Escalations and worker results also wake
@@ -2771,7 +2988,7 @@ def _controller_wake_event(
     source = envelope.get("source") or {}
     source_session_id = str(source.get("controller_session_id") or "")
     if (
-        msg_type in CONTROLLER_CHANNEL_TYPES
+        canonical_event_type(msg_type) in CONTROLLER_CHANNEL_TYPES
         and controller_session_id
         and source_session_id == controller_session_id
     ):
@@ -2877,10 +3094,12 @@ def controller_wake_watermark(
         resolved_fleet_dir,
         dispatch_ids=None if controller_label else candidate_dispatch_ids,
     )
+    carrier_errors: list[dict[str, object]] = []
     for envelope in logical_envelopes_for_paths(
         paths,
         messages_dir=resolved_messages_dir,
         tolerate_errors=True,
+        carrier_errors=carrier_errors,
     ):
         scope_kind = _controller_scope_kind(
             envelope,
@@ -2900,6 +3119,23 @@ def controller_wake_watermark(
         if event is not None:
             inbox_key = inbox_cursor_keys(envelope)[0]
             events[(inbox_key, event["seq"])] = event
+    for error in carrier_errors:
+        _emit_carrier_error(error)
+        error_path = Path(str(error.get("path") or ""))
+        inbox_key = inbox_stream_key(error_path, messages_dir=resolved_messages_dir)
+        identity = (
+            "carrier-corruption",
+            error.get("offset"),
+            error.get("hash"),
+            error.get("reason"),
+        )
+        events[(inbox_key, identity)] = {
+            "dispatch_id": error_path.stem,
+            "type": "carrier-corruption",
+            "seq": error.get("validated_through_seq"),
+            "ts": None,
+            "text": sanitize_display(error.get("reason") or "carrier corruption", limit=120),
+        }
     return events
 
 
@@ -4355,7 +4591,7 @@ def main(argv: list[str] | None = None) -> int:
 
     post = sub.add_parser("post", help="Append one envelope (canonical file path)")
     post.add_argument("--dispatch-id", required=True)
-    post.add_argument("--type", required=True)
+    post.add_argument("--type", required=True, choices=sorted(EVENT_TYPE_REGISTRY))
     post.add_argument("--payload", help="JSON object payload")
     post.add_argument("--text", help="Shorthand payload.text when --payload omitted")
     post.add_argument(

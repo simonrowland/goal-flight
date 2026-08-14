@@ -3,11 +3,13 @@
 
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import os
 from pathlib import Path
 import sqlite3
+import stat
 import subprocess
 import sys
 import threading
@@ -32,6 +34,8 @@ def _set_state_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("GOALFLIGHT_JOURNAL_DIR", str(tmp_path / "journal-state"))
     monkeypatch.setenv("GOALFLIGHT_MESSAGES_DIR", str(tmp_path / "messages"))
     monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(tmp_path / "dispatch-state"))
+    monkeypatch.setenv("GOAL_FLIGHT_PIDFILE_DIR", str(tmp_path / "pidfiles"))
+    monkeypatch.setenv("GOALFLIGHT_CAPACITY_CONF", "/dev/null")
     monkeypatch.delenv("GOALFLIGHT_DISABLE_NUDGES", raising=False)
 
 
@@ -43,6 +47,8 @@ def _subprocess_env(tmp_path: Path) -> dict[str, str]:
             "GOALFLIGHT_JOURNAL_DIR": str(tmp_path / "journal-state"),
             "GOALFLIGHT_MESSAGES_DIR": str(tmp_path / "messages"),
             "GOALFLIGHT_STATE_DIR": str(tmp_path / "dispatch-state"),
+            "GOAL_FLIGHT_PIDFILE_DIR": str(tmp_path / "pidfiles"),
+            "GOALFLIGHT_CAPACITY_CONF": "/dev/null",
             "PYTHONPATH": os.pathsep.join(
                 [str(SCRIPTS), str(ROOT), env.get("PYTHONPATH", "")]
             ),
@@ -127,7 +133,13 @@ print(json.dumps({"path": str(opened.path), "mode": opened.read_all("PRAGMA jour
     assert {row["disposition"] for row in rows} == {"committed"}
     assert sorted(row["created"] for row in rows) == [False, True]
     opened = journal.Journal(project)
-    assert opened.epochs() == journal.JournalEpochs(1, 1, 1, 1, 1)
+    assert opened.epochs() == journal.JournalEpochs(
+        journal.CURRENT_SCHEMA_EPOCH,
+        journal.CURRENT_PROTOCOL_EPOCH,
+        journal.CURRENT_REGISTRY_EPOCH,
+        journal.CURRENT_READER_EPOCH,
+        journal.CURRENT_WRITER_EPOCH,
+    )
     assert opened.read_all(
         "SELECT value FROM journal_meta WHERE key = 'journal_identity'"
     )[0][0] == journal.JOURNAL_IDENTITY_VALUE
@@ -370,10 +382,11 @@ def test_journal_epoch_fence_rechecks_declarative_writes(
     project = tmp_path / "project"
     project.mkdir()
     opened = journal.Journal.create(project)
+    advanced_protocol = journal.CURRENT_PROTOCOL_EPOCH + 1
     advanced = opened.write(
         journal.RowOperation.update(
             "journal_epochs",
-            {"protocol_epoch": 2, "updated_at": journal.utc_now()},
+            {"protocol_epoch": advanced_protocol, "updated_at": journal.utc_now()},
             where={"singleton": 1},
             row_cap=1,
             expected_rows=1,
@@ -382,9 +395,15 @@ def test_journal_epoch_fence_rechecks_declarative_writes(
     assert advanced.committed
     with pytest.raises(journal.JournalUpgradeRequired, match="UPGRADE_REQUIRED"):
         opened.epochs()
-    with pytest.raises(journal.JournalUpgradeRequired, match="protocol client=1 journal=2"):
+    with pytest.raises(
+        journal.JournalUpgradeRequired,
+        match=rf"protocol client={journal.CURRENT_PROTOCOL_EPOCH} journal={advanced_protocol}",
+    ):
         journal.Journal(project)
-    with pytest.raises(journal.JournalUpgradeRequired, match="protocol client=1 journal=2"):
+    with pytest.raises(
+        journal.JournalUpgradeRequired,
+        match=rf"protocol client={journal.CURRENT_PROTOCOL_EPOCH} journal={advanced_protocol}",
+    ):
         opened.write(
             journal.RowOperation.update(
                 "journal_epochs", {"updated_at": journal.utc_now()}, where={"singleton": 1},
@@ -442,7 +461,14 @@ def test_journal_operator_cli_inspect_dump_snapshot_and_guarded_restore(
         check=False,
     )
     assert snapped.returncode == 0, snapped.stderr
-    assert journal._validate_snapshot_file(snapshot) == journal.JournalEpochs(1, 1, 1, 1, 1)
+    expected_epochs = journal.JournalEpochs(
+        journal.CURRENT_SCHEMA_EPOCH,
+        journal.CURRENT_PROTOCOL_EPOCH,
+        journal.CURRENT_REGISTRY_EPOCH,
+        journal.CURRENT_READER_EPOCH,
+        journal.CURRENT_WRITER_EPOCH,
+    )
+    assert journal._validate_snapshot_file(snapshot) == expected_epochs
 
     refused = subprocess.run(
         [*base, "restore", "--snapshot", str(snapshot)],
@@ -485,7 +511,10 @@ def test_journal_operator_cli_inspect_dump_snapshot_and_guarded_restore(
     incompatible = tmp_path / "incompatible.sqlite3"
     with sqlite3.connect(snapshot) as source, sqlite3.connect(incompatible) as target:
         source.backup(target)
-        target.execute("UPDATE journal_epochs SET protocol_epoch = 2 WHERE singleton = 1")
+        target.execute(
+            "UPDATE journal_epochs SET protocol_epoch = ? WHERE singleton = 1",
+            (journal.CURRENT_PROTOCOL_EPOCH + 1,),
+        )
     incompatible_restore = subprocess.run(
         [*base, "restore", "--snapshot", str(incompatible), "--i-understand"],
         cwd=ROOT,
@@ -496,7 +525,7 @@ def test_journal_operator_cli_inspect_dump_snapshot_and_guarded_restore(
     )
     assert incompatible_restore.returncode == 2
     assert "refused restore before replacement" in incompatible_restore.stderr
-    assert journal.Journal(project).epochs() == journal.JournalEpochs(1, 1, 1, 1, 1)
+    assert journal.Journal(project).epochs() == expected_epochs
 
 
 def test_restore_holds_write_domain_validates_copy_and_rolls_back_post_install_failure(
@@ -581,8 +610,9 @@ def test_restore_holds_write_domain_validates_copy_and_rolls_back_post_install_f
     for suffix in ("-wal", "-shm"):
         Path(f"{opened.path}{suffix}").unlink(missing_ok=True)
     opened.path.write_bytes(b"unreadable live preimage")
-    journal.restore_snapshot(project, snapshot, i_understand=True)
-    assert journal.Journal(project).inspect()["integrity"] == "ok"
+    with pytest.raises(journal.JournalIntegrityError, match="validation failed"):
+        journal.restore_snapshot(project, snapshot, i_understand=True)
+    assert opened.path.read_bytes() == b"unreadable live preimage"
 
 
 def test_carrier_rewrite_and_append_are_serialized_across_real_processes(tmp_path: Path) -> None:
@@ -944,3 +974,316 @@ def test_deleted_legacy_message_surfaces_and_steer_use_carrier_transaction(
     assert [entry["text"] for entry in steer.read_steer_entries(path)] == ["before", "after"]
     assert messages.quarantine_path(path).is_file()
     assert messages.mail_lock_path(path).is_file()
+
+
+def test_restore_refuses_incompatible_live_epoch_before_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _set_state_env(monkeypatch, tmp_path)
+    project = tmp_path / "project"
+    project.mkdir()
+    opened = journal.Journal.create(project)
+    snapshot = opened.snapshot(tmp_path / "snapshot.sqlite3")
+    newer_protocol = journal.CURRENT_PROTOCOL_EPOCH + 1
+    with sqlite3.connect(opened.path) as connection:
+        connection.execute(
+            "UPDATE journal_epochs SET protocol_epoch = ? WHERE singleton = 1",
+            (newer_protocol,),
+        )
+
+    replacement_attempted = False
+    real_replace = journal.os.replace
+
+    def reject_replacement_instant(source: Path | str, destination: Path | str) -> None:
+        nonlocal replacement_attempted
+        if Path(destination) == opened.path:
+            replacement_attempted = True
+            raise AssertionError("stale client reached the destructive replacement instant")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(journal.os, "replace", reject_replacement_instant)
+    with pytest.raises(journal.JournalUpgradeRequired, match="live journal epoch fence"):
+        journal.restore_snapshot(project, snapshot, i_understand=True)
+    assert not replacement_attempted
+    with sqlite3.connect(opened.path) as connection:
+        assert connection.execute(
+            "SELECT protocol_epoch FROM journal_epochs WHERE singleton = 1"
+        ).fetchone() == (newer_protocol,)
+
+
+def test_carrier_corruption_changes_the_controller_wake_watermark(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _set_state_env(monkeypatch, tmp_path)
+    project = tmp_path / "project"
+    project.mkdir()
+    messages_dir = tmp_path / "messages"
+    fleet_dir = tmp_path / "fleet"
+    fleet_dir.mkdir()
+    dispatch_id = "corruption-wake"
+    result = messages.post_message(
+        dispatch_id=dispatch_id,
+        msg_type="status",
+        payload={"text": "quiet prefix"},
+        messages_dir=messages_dir,
+    )
+    baseline = messages.controller_wake_watermark(
+        project_root=project,
+        owned_dispatch_ids={dispatch_id},
+        messages_dir=messages_dir,
+        fleet_dir=fleet_dir,
+    )
+    assert baseline == {}
+
+    with Path(result["path"]).open("ab") as handle:
+        handle.write(b"{broken while listener sleeps\n")
+    current = messages.controller_wake_watermark(
+        project_root=project,
+        owned_dispatch_ids={dispatch_id},
+        messages_dir=messages_dir,
+        fleet_dir=fleet_dir,
+    )
+    fresh = [current[key] for key in current if key not in baseline]
+    assert len(fresh) == 1
+    assert fresh[0]["dispatch_id"] == dispatch_id
+    assert fresh[0]["type"] == "carrier-corruption"
+    assert "invalid JSON" in fresh[0]["text"]
+
+
+def test_envelope_rejects_non_integer_schema_versions_and_raw_overlong_label(
+    tmp_path: Path,
+) -> None:
+    result = messages.post_message(
+        dispatch_id="strict-envelope",
+        msg_type="status",
+        payload={"text": "valid"},
+        messages_dir=tmp_path / "messages",
+    )
+    for invalid_version in (True, 1.0):
+        invalid = {**result["envelope"], "schema_version": invalid_version}
+        with pytest.raises(messages.MessageError, match="schema_version"):
+            messages.validate_envelope(invalid)
+
+    project = tmp_path / "project"
+    project.mkdir()
+    invalid_label = {
+        **result["envelope"],
+        "type": "controller-notice",
+        "addressee": {
+            "kind": "controller",
+            "label": " " * 1000 + "main",
+            "project_root": str(project),
+        },
+    }
+    with pytest.raises(messages.MessageError, match="addressee.label"):
+        messages.validate_envelope(invalid_label)
+
+
+def test_first_carrier_append_fsyncs_file_and_parent_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = tmp_path / "messages"
+    parent.mkdir()
+    path = messages.inbox_path(parent, "first-append")
+    real_fsync = messages.os.fsync
+    fsync_targets: list[str] = []
+
+    def observe_fsync(fd: int) -> None:
+        mode = os.fstat(fd).st_mode
+        fsync_targets.append("directory" if stat.S_ISDIR(mode) else "file")
+        real_fsync(fd)
+
+    monkeypatch.setattr(messages.os, "fsync", observe_fsync)
+    with messages.carrier_transaction(path) as transaction:
+        assert transaction.read_bytes() == b""
+        transaction.append_bytes(b"first\n")
+    first_append_targets = list(fsync_targets)
+    fsync_targets.clear()
+    with messages.carrier_transaction(path) as transaction:
+        assert transaction.read_bytes() == b"first\n"
+        transaction.append_bytes(b"second\n")
+
+    assert first_append_targets == ["file", "directory"]
+    assert fsync_targets == ["file"]
+
+    real_open = messages.os.open
+
+    def refuse_directory_open(candidate: Path | str, flags: int, *args: object) -> int:
+        if Path(candidate) == parent and flags & getattr(os, "O_DIRECTORY", 0):
+            raise PermissionError("forced carrier directory open failure")
+        return real_open(candidate, flags, *args)
+
+    monkeypatch.setattr(messages.os, "open", refuse_directory_open)
+    failure_path = messages.inbox_path(parent, "failed-first-append")
+    with messages.carrier_transaction(failure_path) as transaction:
+        assert transaction.read_bytes() == b""
+        with pytest.raises(messages.MessageError, match="fsync carrier directory"):
+            transaction.append_bytes(b"not reported durable\n")
+
+
+def test_restore_cleanup_has_a_durable_crash_boundary_and_fsync_failure_is_visible(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _set_state_env(monkeypatch, tmp_path)
+    project = tmp_path / "project"
+    project.mkdir()
+    opened = journal.Journal.create(project)
+    snapshot = opened.snapshot(tmp_path / "snapshot.sqlite3")
+    opened.write(
+        journal.RowOperation.update(
+            "journal_epochs",
+            {"updated_at": "live-before-cleanup"},
+            where={"singleton": 1},
+            row_cap=1,
+            expected_rows=1,
+        )
+    )
+
+    class SimulatedCrash(BaseException):
+        pass
+
+    real_fsync_directory = journal._fsync_directory
+    durability_instants: list[list[Path]] = []
+
+    def crash_before_cleanup_fsync(path: Path) -> None:
+        preimages = list(path.glob(f".{opened.path.name}.restore-preimage-*"))
+        durability_instants.append(preimages)
+        if len(durability_instants) == 2:
+            raise SimulatedCrash("crash after pre-image unlink, before directory fsync")
+        real_fsync_directory(path)
+
+    monkeypatch.setattr(journal, "_fsync_directory", crash_before_cleanup_fsync)
+    with pytest.raises(SimulatedCrash, match="pre-image unlink"):
+        journal.restore_snapshot(project, snapshot, i_understand=True)
+    assert len(durability_instants) == 2
+    assert durability_instants[0]
+    assert durability_instants[1] == []
+    assert not list(opened.path.parent.glob(f".{opened.path.name}.restore-preimage-*"))
+    assert journal._validate_snapshot_file(opened.path) == journal._validate_snapshot_file(snapshot)
+
+    monkeypatch.setattr(journal, "_fsync_directory", real_fsync_directory)
+    real_open = journal.os.open
+
+    def refuse_directory_open(path: Path | str, flags: int, *args: object) -> int:
+        if Path(path) == opened.path.parent and flags & getattr(os, "O_DIRECTORY", 0):
+            raise PermissionError("forced directory fsync open failure")
+        return real_open(path, flags, *args)
+
+    monkeypatch.setattr(journal.os, "open", refuse_directory_open)
+    with pytest.raises(journal.JournalError, match="fsync journal directory"):
+        journal.restore_snapshot(project, snapshot, i_understand=True)
+
+
+def test_concurrent_rotation_and_append_both_succeed_under_the_carrier_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    messages_dir = tmp_path / "messages"
+    result = messages.post_message(
+        dispatch_id="rotation-race",
+        msg_type="status",
+        payload={"text": "old inode"},
+        messages_dir=messages_dir,
+    )
+    path = Path(result["path"])
+    old_stat = os.lstat(path)
+    writer_a_observed_old_inode = threading.Event()
+    writer_b_rotated = threading.Event()
+    lock_state = threading.local()
+    real_lstat = messages.os.lstat
+    real_mail_lock = messages.mail_lock
+
+    def interleaved_lstat(candidate: Path | str, *args: object, **kwargs: object):
+        if (
+            threading.current_thread().name == "writer-a"
+            and not getattr(lock_state, "held", False)
+            and Path(candidate) == path
+        ):
+            writer_a_observed_old_inode.set()
+            assert writer_b_rotated.wait(5)
+            return old_stat
+        return real_lstat(candidate, *args, **kwargs)
+
+    @contextlib.contextmanager
+    def observed_mail_lock(candidate: Path):
+        with real_mail_lock(candidate):
+            lock_state.held = True
+            try:
+                yield
+            finally:
+                lock_state.held = False
+
+    monkeypatch.setattr(messages.os, "lstat", interleaved_lstat)
+    monkeypatch.setattr(messages, "mail_lock", observed_mail_lock)
+    failures: list[BaseException] = []
+
+    def writer_a() -> None:
+        try:
+            messages.post_message(
+                dispatch_id="rotation-race",
+                msg_type="user_need",
+                payload={"text": "append after rotation"},
+                messages_dir=messages_dir,
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            failures.append(exc)
+
+    def writer_b() -> None:
+        try:
+            assert writer_a_observed_old_inode.wait(5)
+            replacement = messages.markers_to_envelopes(
+                {"STATUS": ["rotated inode"]}, dispatch_id="rotation-race", seq_start=2
+            )[0]
+            messages.update_envelopes(path, lambda _existing: ([replacement], None))
+        except BaseException as exc:  # pragma: no cover - asserted below
+            failures.append(exc)
+        finally:
+            writer_b_rotated.set()
+
+    threads = [
+        threading.Thread(target=writer_a, name="writer-a"),
+        threading.Thread(target=writer_b, name="writer-b"),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+    assert all(not thread.is_alive() for thread in threads)
+    assert failures == []
+    assert [item["payload"]["text"] for item in messages.read_envelopes(path)] == [
+        "rotated inode",
+        "append after rotation",
+    ]
+
+
+def test_steer_writers_and_bounded_legacy_types_resolve_to_registered_semantics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _set_state_env(monkeypatch, tmp_path)
+    _path, steering = steer.append_steer_message("canonical-steer", "continue")
+    _path, confirmation = steer.append_steer_message(
+        "canonical-steer",
+        "yes",
+        reply_to="question-1",
+        decision="yes",
+    )
+    assert steering["kind"] == "steering"
+    assert confirmation["kind"] == "user_confirm"
+    assert steering["kind"] in messages.EVENT_TYPE_REGISTRY
+    assert confirmation["kind"] in messages.EVENT_TYPE_REGISTRY
+
+    legacy = messages.post_message(
+        dispatch_id="legacy-cross-repo",
+        msg_type="qa-round",
+        payload={"text": "known legacy producer"},
+        messages_dir=tmp_path / "messages",
+    )
+    assert legacy["envelope"]["type"] == "qa-round"
+    assert messages.canonical_event_type("qa-round") == "advisory"
+    assert set(messages.EVENT_TYPE_COMPATIBILITY_ALIASES).issubset(messages.EVENT_TYPE_REGISTRY)
+    with pytest.raises(messages.MessageError, match="unregistered message type"):
+        messages.post_message(
+            dispatch_id="unknown-cross-repo",
+            msg_type="unseen-future-type",
+            payload={},
+            messages_dir=tmp_path / "messages",
+        )

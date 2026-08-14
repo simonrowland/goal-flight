@@ -32,6 +32,7 @@ import goalflight_agent_limits as limits  # noqa: E402
 import goalflight_capacity as cap  # noqa: E402
 import goalflight_dispatch as D  # noqa: E402
 import goalflight_status as status  # noqa: E402
+import goalflight_watch as watch  # noqa: E402
 
 
 def _fresh_limits(monkeypatch) -> object:
@@ -212,17 +213,21 @@ def test_legacy_kimi_lease_occupies_the_moonshot_pool(tmp_path, monkeypatch) -> 
 
 
 def test_legacy_record_drives_kimi_marker_dialect(tmp_path) -> None:
-    """A ledger record carrying the retired agent value still gets the kimi
-    output-dialect marker handling in status reconciliation — identical to a
-    new moonshot record, and distinct from other agents."""
+    """The watcher classifies legacy and current Moonshot output identically."""
     tail = tmp_path / "worker.tail"
     tail.write_text("• COMPLETE: legacy record marker\n", encoding="utf-8")
 
-    legacy = status._wait_terminal_success_marker({"agent": "kimi", "stdout_path": str(tail)})
+    legacy = watch._last_line_is_terminal_marker(
+        tail, ignore_prefix_lines=0, kimi_output=limits.moonshot_family("kimi")
+    )
     assert legacy is not None and legacy["kind"] == "COMPLETE"
 
-    current = status._wait_terminal_success_marker({"agent": "moonshot", "stdout_path": str(tail)})
+    current = watch._last_line_is_terminal_marker(
+        tail, ignore_prefix_lines=0, kimi_output=limits.moonshot_family("moonshot")
+    )
     assert current is not None and current["kind"] == "COMPLETE"
 
-    other = status._wait_terminal_success_marker({"agent": "codex", "stdout_path": str(tail)})
+    other = watch._last_line_is_terminal_marker(
+        tail, ignore_prefix_lines=0, kimi_output=limits.moonshot_family("codex")
+    )
     assert other is None

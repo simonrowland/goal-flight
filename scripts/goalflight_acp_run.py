@@ -88,6 +88,19 @@ DEFAULT_USER_CONFIRM_TIMEOUT_S = 600.0
 AGENT_STDERR_CAPTURE_BYTES = 64 * 1024
 AGENT_STDERR_ERROR_TAIL_CHARS = 1000
 LIVENESS_PROFILES = {"remote_api", "local_compute", "hybrid"}
+
+
+def _default_dispatch_id(agent: object) -> str:
+    """Build a journal-safe id even when the ACP agent is an executable path."""
+    label = Path(str(agent or "")).name
+    label = "".join(
+        character
+        if character.isascii()
+        and (character.isalnum() or character in "._:@+-")
+        else "-"
+        for character in label
+    ).strip("-")
+    return f"acp-{(label or 'worker')[:220]}-{uuid.uuid4().hex[:8]}"
 STEER_FILE_ALLOW_ENV = "GOALFLIGHT_ALLOW_EXTERNAL_STEER_FILE"
 PROMPT_FILE_ENV = "GOALFLIGHT_PROMPT_FILE"
 USER_CONFIRM_MARKER = "USER-CONFIRM"
@@ -1791,7 +1804,7 @@ async def run_acp_dispatch(
         return result
     except asyncio.CancelledError:
         if bridge.received:
-            dispatch_id = cfg.dispatch_id or f"acp-{cfg.agent}-{uuid.uuid4().hex[:8]}"
+            dispatch_id = cfg.dispatch_id or _default_dispatch_id(cfg.agent)
             result = {
                 "schema": "goalflight.acp-run.v1",
                 "dispatch_id": dispatch_id,
@@ -1890,7 +1903,7 @@ async def _run_acp_dispatch_impl(
         remote_turn_cancel_grace_s = DEFAULT_REMOTE_TURN_CANCEL_GRACE_S
     if remote_turn_cancel_grace_s < 0:
         remote_turn_cancel_grace_s = DEFAULT_REMOTE_TURN_CANCEL_GRACE_S
-    dispatch_id = cfg.dispatch_id or f"acp-{cfg.agent}-{uuid.uuid4().hex[:8]}"
+    dispatch_id = cfg.dispatch_id or _default_dispatch_id(cfg.agent)
     steer_file, steer_file_source = _resolve_steer_file(cfg, dispatch_id)
     original_prompt_file = _resolve_original_prompt_file(cfg)
     run_started = time.time()
@@ -2299,7 +2312,7 @@ async def _run_acp_dispatch_impl(
 
     def record_ledger_state(*, worker_pid: int | None, state: str) -> None:
         with contextlib.redirect_stdout(io.StringIO()):
-            goalflight_ledger.cmd_record(
+            record_code = goalflight_ledger.cmd_record(
                 argparse.Namespace(
                     dispatch_id=dispatch_id,
                     prompt_id=cfg.prompt_id,
@@ -2345,6 +2358,10 @@ async def _run_acp_dispatch_impl(
                     state=state,
                     json=True,
                 )
+            )
+        if record_code != 0:
+            raise RuntimeError(
+                f"journal attempt transition refused for {dispatch_id}: exit {record_code}"
             )
 
     def attach_worker_to_lease(worker_pid: int) -> None:
@@ -2429,7 +2446,7 @@ async def _run_acp_dispatch_impl(
                         "safe work; do not take the requested action."
                     ),
                     dispatch_id=dispatch_id,
-                    kind="user_confirm_reply",
+                    kind=goalflight_steer_mailbox.USER_CONFIRM_KIND,
                     reply_to=str(question["question_id"]),
                     decision="no",
                 )
@@ -3385,6 +3402,9 @@ async def _run_acp_dispatch_impl(
             if not context_mode_defined:
                 cfg.context_mode = "enabled"
 
+    cleanup_ghosts()
+    record_ledger_state(worker_pid=None, state="starting")
+    ledger_recorded = True
     try:
         if worktree_path is not None:
             try:
@@ -3421,9 +3441,29 @@ async def _run_acp_dispatch_impl(
         except OsSandboxError as e:
             await update_status(state="blocked_os_sandbox", error=str(e))
             return payload
-        cleanup_ghosts()
-        record_ledger_state(worker_pid=None, state="starting")
-        ledger_recorded = True
+        attempt_record = json.loads(
+            goalflight_ledger.record_path(dispatch_id).read_text(encoding="utf-8")
+        )
+        for required_key in ("attempt_id", "launch_token", "launch_epoch"):
+            if attempt_record.get(required_key) in (None, ""):
+                raise RuntimeError(
+                    f"prepared attempt identity missing for {dispatch_id}: {required_key}"
+                )
+        acp_args = [
+            str(SCRIPT_DIR / "goalflight_launch_worker.py"),
+            "--project-root",
+            str(project_root),
+            "--attempt-id",
+            str(attempt_record["attempt_id"]),
+            "--launch-token",
+            str(attempt_record["launch_token"]),
+            "--launch-epoch",
+            str(attempt_record["launch_epoch"]),
+            "--",
+            command,
+            *acp_args,
+        ]
+        command = sys.executable
         # Spawn + handshake, retrying once on AcpError (the intermittent
         # codex-acp wedge). The helper kills a wedged worker before respawning,
         # so no identity-matched PID is ever left alive. Status progresses
@@ -3508,6 +3548,7 @@ async def _run_acp_dispatch_impl(
                 acp_args,
                 agent=cfg.agent,
                 session_id=cfg.session_id,
+                attempts=1,
                 cwd=worker_cwd,
                 activity=activity,
                 on_attempt=mark_attempt,
@@ -3543,6 +3584,11 @@ async def _run_acp_dispatch_impl(
             test_delay_s = 0.0
         if test_delay_s > 0:
             await asyncio.sleep(test_delay_s)
+        await asyncio.to_thread(
+            goalflight_ledger.wait_attempt_running,
+            project_root,
+            dispatch_id,
+        )
         record_ledger_state(worker_pid=proc.pid, state="running")
         activity.reset_progress_clock(active_monotonic())
         heartbeat_task = asyncio.create_task(heartbeat_loop())
@@ -4137,7 +4183,7 @@ async def _run_acp_dispatch_impl(
             payload["pgroup_cpu_pct"] = pgroup_cpu_pct(payload.get("pgid"))
         if ledger_recorded:
             with contextlib.redirect_stdout(io.StringIO()):
-                goalflight_ledger.cmd_finish(
+                terminal_code = goalflight_ledger.cmd_finish(
                     argparse.Namespace(
                         dispatch_id=dispatch_id,
                         state=payload.get("state", state),
@@ -4146,6 +4192,13 @@ async def _run_acp_dispatch_impl(
                         elapsed_s=round(time.time() - run_started, 3),
                         worker_still_alive=payload.get("worker_still_alive"),
                     )
+                )
+            if terminal_code != 0:
+                pending_state = str(payload.get("state", state))
+                payload["terminal_pending_state"] = pending_state
+                payload["state"] = "terminal_pending"
+                payload["terminal_commit_error"] = (
+                    f"journal terminal emitter exited {terminal_code}"
                 )
         leave_lease_active = bool(detach_worker and proc is not None and proc.returncode is None)
         if leave_lease_active and proc is not None:
@@ -4208,7 +4261,7 @@ def acp_dispatch_exit_code(payload: dict) -> int:
 
 
 def write_windows_refusal_status(args: argparse.Namespace) -> tuple[dict, Path]:
-    dispatch_id = args.dispatch_id or f"acp-{args.agent}-{uuid.uuid4().hex[:8]}"
+    dispatch_id = args.dispatch_id or _default_dispatch_id(args.agent)
     project_root = Path(args.cwd).resolve()
     status_path = _resolve_status_json_path(getattr(args, "status_json", None), dispatch_id)
     args.status_json = str(status_path)

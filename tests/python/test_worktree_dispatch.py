@@ -32,6 +32,7 @@ os.environ.pop("GOALFLIGHT_ALLOW_EXTERNAL_STEER_FILE", None)
 import goalflight_acp_run
 import goalflight_capacity
 import goalflight_doctor
+import goalflight_journal
 
 OS_SANDBOX_OFF = goalflight_acp_run.OS_SANDBOX_OFF
 
@@ -380,6 +381,23 @@ def test_runner_worktree_status_and_capacity_contract() -> None:
 
             async def capture_spawn(*_args, **kwargs):
                 spawn_calls.append(kwargs)
+                launcher_args = list(_args[1])
+                project_root = launcher_args[launcher_args.index("--project-root") + 1]
+                attempt_id = launcher_args[launcher_args.index("--attempt-id") + 1]
+                launch_token = launcher_args[launcher_args.index("--launch-token") + 1]
+                launch_epoch = int(
+                    launcher_args[launcher_args.index("--launch-epoch") + 1]
+                )
+                claimed = goalflight_journal.Journal(project_root).mark_attempt_running(
+                    attempt_id,
+                    launch_token,
+                    launch_epoch=launch_epoch,
+                    worker_instance={
+                        "pid": FakeProc.pid,
+                        "source": "worktree-test-spawn",
+                    },
+                )
+                assert claimed.committed, claimed
                 return FakeProc(), FakeConn()
 
             goalflight_acp_run.agent_command = lambda _agent, model=None, fast=False: ("fake-agent", [])

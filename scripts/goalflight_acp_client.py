@@ -8,8 +8,10 @@ pidfile cleanup. Runner policy stays in ``goalflight_acp_run.py``.
 from __future__ import annotations
 
 import asyncio
+import argparse
 import contextlib
 from dataclasses import dataclass, field
+import io
 import inspect
 import json
 import logging
@@ -1025,26 +1027,24 @@ def _finish_quota_stuck_ledger(record: dict[str, Any], *, reason: dict[str, Any]
     if not dispatch_id:
         return False
     try:
-        path = goalflight_ledger.record_path(str(dispatch_id))
-        if not path.exists():
+        if not goalflight_ledger.record_path(str(dispatch_id)).exists():
             return False
-        with goalflight_ledger.StateLock():
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            # The reaper required a live tail quota signature, so the measured
-            # limit state exists: write it, never the unmeasured umbrella.
-            limit_state = str(
-                reason.get("limit_state") or goalflight_dispatch_states.LIMIT_UNKNOWN_STATE
+        # The reaper required a live tail quota signature, so the measured
+        # limit state exists: commit it through the sole terminal emitter.
+        limit_state = str(
+            reason.get("limit_state") or goalflight_dispatch_states.LIMIT_UNKNOWN_STATE
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            code = goalflight_ledger.cmd_finish(
+                argparse.Namespace(
+                    dispatch_id=str(dispatch_id),
+                    state=limit_state,
+                    terminal_state=limit_state,
+                    reason=reason,
+                    worker_still_alive=False,
+                )
             )
-            payload["state"] = limit_state
-            payload["terminal_state"] = limit_state
-            payload["ended_at"] = payload.get("ended_at") or goalflight_ledger.utc_now()
-            payload["worker_still_alive"] = False
-            payload["reason"] = reason
-            for key in ("limit_kind", "limit_signature", "reset_at", "retry_after"):
-                payload[key] = reason.get(key)
-            payload["outcome"] = {"terminal_state": limit_state, "reason": reason}
-            goalflight_ledger.write_record(payload)
-        return True
+        return code == 0
     except Exception as exc:
         log.error("quota_stuck_reap: ledger update failed dispatch_id=%s: %s", dispatch_id, exc)
     return False

@@ -25,6 +25,16 @@ import goalflight_review_job
 import goalflight_rate_pressure
 
 
+def isolate_state_env(env: dict[str, str], state_dir: Path) -> dict[str, str]:
+    env["GOALFLIGHT_STATE_DIR"] = str(state_dir)
+    env["GOALFLIGHT_TASK_STORE_DIR"] = str(state_dir.parent / "task-store")
+    env["GOALFLIGHT_JOURNAL_DIR"] = str(state_dir.parent / "journal")
+    env["GOALFLIGHT_MESSAGES_DIR"] = str(state_dir.parent / "messages")
+    env["GOAL_FLIGHT_PIDFILE_DIR"] = str(state_dir.parent / "pidfiles")
+    env["GOALFLIGHT_CAPACITY_CONF"] = "/dev/null"
+    return env
+
+
 def run(
     args: list[str],
     *,
@@ -34,7 +44,7 @@ def run(
     timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
     merged_env = os.environ.copy()
-    merged_env["GOALFLIGHT_STATE_DIR"] = str(state_dir)
+    isolate_state_env(merged_env, state_dir)
     if env:
         merged_env.update(env)
     proc = subprocess.run(
@@ -265,7 +275,7 @@ def review_command(tmp: Path, fake_codex: Path, name: str, *, timeout_s: float =
 
 def capacity_test_env(state_dir: Path, **extra: str) -> dict[str, str]:
     env = os.environ.copy()
-    env["GOALFLIGHT_STATE_DIR"] = str(state_dir)
+    isolate_state_env(env, state_dir)
     env["GOALFLIGHT_CAPACITY_MAX_TOTAL"] = "1"
     env.update(extra)
     return env
@@ -481,7 +491,7 @@ def test_final_file_detected_before_process_exit() -> None:
         fake = tmp / "fake-codex"
         write_fake_codex(fake)
         env = os.environ.copy()
-        env["GOALFLIGHT_STATE_DIR"] = str(state_dir)
+        isolate_state_env(env, state_dir)
         env["FAKE_REVIEW_MODE"] = "final_early"
         proc = subprocess.Popen(
             review_command(tmp, fake, "final-early", timeout_s=3, max_quiet_s=5),

@@ -34,11 +34,13 @@ import os
 from pathlib import Path
 import random
 import re
+import socket
 import sqlite3
 import sys
 import tempfile
 import time
-from collections.abc import Iterable, Mapping
+import uuid
+from collections.abc import Callable, Iterable, Mapping
 from typing import Generic, TypeVar
 
 
@@ -47,14 +49,15 @@ REPO_ROOT = SCRIPT_DIR.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+import goalflight_compat  # noqa: E402
 import goalflight_task  # noqa: E402
 
 
-CURRENT_SCHEMA_EPOCH = 1
-CURRENT_PROTOCOL_EPOCH = 1
-CURRENT_REGISTRY_EPOCH = 1
-CURRENT_READER_EPOCH = 1
-CURRENT_WRITER_EPOCH = 1
+CURRENT_SCHEMA_EPOCH = 2
+CURRENT_PROTOCOL_EPOCH = 2
+CURRENT_REGISTRY_EPOCH = 2
+CURRENT_READER_EPOCH = 2
+CURRENT_WRITER_EPOCH = 2
 JOURNAL_FILE_NAME = "state-journal.sqlite3"
 JOURNAL_IDENTITY_KEY = "journal_identity"
 JOURNAL_IDENTITY_VALUE = "goalflight.state-journal.v1"
@@ -63,6 +66,17 @@ MAX_OPERATION_ROWS = 10_000
 MAX_PARAMETER_VALUE_BYTES = 65_536
 MAX_TRANSACTION_PARAMETER_BYTES = 1_048_576
 _SQL_IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+_STATE_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,63}\Z")
+_IDENTITY_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@+-]{0,254}\Z")
+ATTEMPT_PREPARED = "PREPARED"
+ATTEMPT_STARTING = "STARTING"
+ATTEMPT_RUNNING = "RUNNING"
+ATTEMPT_TERMINAL = "TERMINAL"
+ATTEMPT_ABANDONED = "ABANDONED"
+ATTEMPT_LIVE_STATES = (ATTEMPT_PREPARED, ATTEMPT_STARTING, ATTEMPT_RUNNING)
+ATTEMPT_FINAL_STATES = (ATTEMPT_TERMINAL, ATTEMPT_ABANDONED)
+TERMINAL_EVENT_TYPES = frozenset({"result", "blocked", "user_need", "user_confirm"})
+START_CLAIM_DEADLINE_S = 300.0
 
 
 class JournalError(RuntimeError):
@@ -138,6 +152,36 @@ class RowWrite:
 
     affected_rows: int
     last_row_id: int | None = None
+
+
+@dataclass(frozen=True)
+class AttemptIdentity:
+    attempt_id: str
+    dispatch_id: str
+    launch_token: str
+    launch_epoch: int
+    lifecycle_state: str
+
+
+@dataclass(frozen=True)
+class TerminalCommit:
+    attempt_id: str
+    transition_id: str
+    dispatch_id: str
+    terminal_state: str
+    event_uuid: str
+    event_type: str
+    observation: dict[str, object]
+    idempotent: bool = False
+
+
+@dataclass(frozen=True)
+class OutboxProjection:
+    attempt_id: str
+    transition_id: str
+    event_uuid: str
+    recorded: bool
+    path: str
 
 
 @dataclass(frozen=True, init=False)
@@ -618,8 +662,12 @@ class Journal:
                 required = {"journal_meta", "journal_epochs"}
                 if required <= tables:
                     self._assert_identity(connection)
-                    self._assert_epoch_fence(connection, for_write=False)
-                    connection.rollback()
+                    migrated = self._migrate_v1_to_v2(connection)
+                    if migrated:
+                        connection.commit()
+                    else:
+                        self._assert_epoch_fence(connection, for_write=False)
+                        connection.rollback()
                     mode = str(connection.execute("PRAGMA journal_mode").fetchone()[0]).lower()
                     if mode != "wal":
                         self._assert_epoch_fence(connection, for_write=True)
@@ -687,6 +735,7 @@ class Journal:
                         utc_now(),
                     ),
                 )
+                self._install_p2_schema(connection)
                 connection.commit()
                 connection.execute("PRAGMA journal_mode = WAL")
                 return
@@ -702,6 +751,157 @@ class Journal:
                     raise
             finally:
                 connection.close()
+
+    def _migrate_v1_to_v2(self, connection: sqlite3.Connection) -> bool:
+        """Upgrade the shipped P1 journal while holding the exclusive write lock."""
+        row = connection.execute(
+            """
+            SELECT schema_epoch, protocol_epoch, registry_epoch,
+                   minimum_reader_epoch, minimum_writer_epoch
+            FROM journal_epochs WHERE singleton = 1
+            """
+        ).fetchone()
+        if row is None:
+            self._raise_integrity_failure("journal epoch row is missing during migration")
+        stored = tuple(int(row[index]) for index in range(5))
+        if stored == (
+            CURRENT_SCHEMA_EPOCH,
+            CURRENT_PROTOCOL_EPOCH,
+            CURRENT_REGISTRY_EPOCH,
+            CURRENT_READER_EPOCH,
+            CURRENT_WRITER_EPOCH,
+        ):
+            tables = {
+                str(schema_row[0])
+                for schema_row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            required = {
+                "journal_migrations",
+                "dispatch_attempts",
+                "dispatch_transitions",
+                "terminal_outbox",
+            }
+            if not required <= tables:
+                self._raise_integrity_failure(
+                    "epoch-2 journal is missing tables: "
+                    + ", ".join(sorted(required - tables))
+                )
+            return False
+        if stored != (1, 1, 1, 1, 1):
+            return False
+        client = self.client_epochs
+        if (client.schema, client.protocol, client.registry, client.reader, client.writer) != (
+            CURRENT_SCHEMA_EPOCH,
+            CURRENT_PROTOCOL_EPOCH,
+            CURRENT_REGISTRY_EPOCH,
+            CURRENT_READER_EPOCH,
+            CURRENT_WRITER_EPOCH,
+        ):
+            return False
+        self._install_p2_schema(connection)
+        now = utc_now()
+        connection.execute(
+            """
+            UPDATE journal_epochs
+            SET schema_epoch = ?, protocol_epoch = ?, registry_epoch = ?,
+                minimum_reader_epoch = ?, minimum_writer_epoch = ?, updated_at = ?
+            WHERE singleton = 1
+            """,
+            (
+                CURRENT_SCHEMA_EPOCH,
+                CURRENT_PROTOCOL_EPOCH,
+                CURRENT_REGISTRY_EPOCH,
+                CURRENT_READER_EPOCH,
+                CURRENT_WRITER_EPOCH,
+                now,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO journal_migrations (migration_id, applied_at)
+            VALUES ('p2-terminal-outbox-v2', ?)
+            """,
+            (now,),
+        )
+        return True
+
+    def _install_p2_schema(self, connection: sqlite3.Connection) -> None:
+        statements = (
+            """CREATE TABLE IF NOT EXISTS journal_migrations (
+                migration_id TEXT PRIMARY KEY,
+                applied_at TEXT NOT NULL
+            )""",
+            """CREATE TABLE IF NOT EXISTS dispatch_attempts (
+                attempt_id TEXT PRIMARY KEY,
+                dispatch_id TEXT NOT NULL UNIQUE,
+                project_root TEXT NOT NULL,
+                lifecycle_state TEXT NOT NULL
+                    CHECK (lifecycle_state IN ('PREPARED', 'STARTING', 'RUNNING', 'TERMINAL', 'ABANDONED')),
+                launch_epoch INTEGER NOT NULL DEFAULT 0
+                    CHECK (typeof(launch_epoch) = 'integer' AND launch_epoch >= 0),
+                launch_token TEXT NOT NULL,
+                worker_instance_json TEXT,
+                prepared_at TEXT NOT NULL,
+                state_updated_at TEXT NOT NULL,
+                start_deadline_at TEXT,
+                terminal_transition_id TEXT UNIQUE,
+                terminal_state TEXT,
+                terminal_outcome_json TEXT,
+                terminal_at TEXT,
+                CHECK (
+                    (lifecycle_state IN ('TERMINAL', 'ABANDONED')
+                     AND terminal_transition_id IS NOT NULL
+                     AND terminal_state IS NOT NULL
+                     AND terminal_outcome_json IS NOT NULL
+                     AND terminal_at IS NOT NULL)
+                    OR
+                    (lifecycle_state NOT IN ('TERMINAL', 'ABANDONED')
+                     AND terminal_transition_id IS NULL
+                     AND terminal_state IS NULL
+                     AND terminal_outcome_json IS NULL
+                     AND terminal_at IS NULL)
+                )
+            )""",
+            """CREATE TABLE IF NOT EXISTS dispatch_transitions (
+                attempt_id TEXT NOT NULL,
+                transition_id TEXT NOT NULL,
+                from_state TEXT NOT NULL,
+                to_state TEXT NOT NULL,
+                terminal_state TEXT,
+                observation_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (attempt_id, transition_id),
+                UNIQUE (transition_id),
+                FOREIGN KEY (attempt_id) REFERENCES dispatch_attempts(attempt_id)
+            )""",
+            """CREATE TABLE IF NOT EXISTS terminal_outbox (
+                attempt_id TEXT NOT NULL,
+                transition_id TEXT NOT NULL,
+                origin_node TEXT NOT NULL,
+                event_uuid TEXT NOT NULL,
+                recipient TEXT NOT NULL,
+                event_type TEXT NOT NULL
+                    CHECK (event_type IN ('result', 'blocked', 'user_need', 'user_confirm')),
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                projected_at TEXT,
+                projection_attempts INTEGER NOT NULL DEFAULT 0
+                    CHECK (typeof(projection_attempts) = 'integer' AND projection_attempts >= 0),
+                projection_error TEXT,
+                PRIMARY KEY (attempt_id, transition_id),
+                UNIQUE (origin_node, event_uuid, recipient),
+                FOREIGN KEY (attempt_id, transition_id)
+                    REFERENCES dispatch_transitions(attempt_id, transition_id)
+            )""",
+            """CREATE INDEX IF NOT EXISTS dispatch_attempts_pending_idx
+                ON dispatch_attempts (lifecycle_state, state_updated_at, attempt_id)""",
+            """CREATE INDEX IF NOT EXISTS terminal_outbox_pending_idx
+                ON terminal_outbox (projected_at, created_at, attempt_id, transition_id)""",
+        )
+        for statement in statements:
+            connection.execute(statement)
 
     def _retry_delay(self, started: float) -> bool:
         remaining = self.retry_budget_s - (time.monotonic() - started)
@@ -962,6 +1162,634 @@ class Journal:
                 connection.close()
                 write_lock.release()
 
+    def _domain_write(self, action: Callable[[sqlite3.Connection], T]) -> WriteResult[T]:
+        """Run one module-owned bounded transaction for P2 state machines."""
+        started = time.monotonic()
+        attempts = 0
+        while True:
+            attempts += 1
+            write_lock = goalflight_task.FileLock.try_acquire(
+                journal_write_lock_path(self.path),
+                deadline_s=started + self.retry_budget_s,
+            )
+            if write_lock is None:
+                return WriteResult(
+                    WriteDisposition.RETRYABLE,
+                    attempts=attempts,
+                    reason=f"journal write lock timeout within {self.retry_budget_s:.3f}s",
+                )
+            try:
+                connection = self._connect()
+            except JournalUnavailable as exc:
+                write_lock.release()
+                return WriteResult(
+                    WriteDisposition.RETRYABLE,
+                    attempts=attempts,
+                    reason=str(exc),
+                )
+            except BaseException:
+                write_lock.release()
+                raise
+            try:
+                deadline = time.monotonic() + self.transaction_budget_s
+                connection.set_progress_handler(
+                    lambda: 1 if time.monotonic() >= deadline else 0,
+                    1000,
+                )
+                connection.execute("BEGIN IMMEDIATE")
+                self._assert_epoch_fence(connection, for_write=True)
+                value = action(connection)
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("journal transaction deadline reached")
+                connection.commit()
+                return WriteResult(
+                    WriteDisposition.COMMITTED,
+                    value=value,
+                    attempts=attempts,
+                )
+            except CASMismatch as exc:
+                if connection.in_transaction:
+                    connection.rollback()
+                return WriteResult(
+                    WriteDisposition.CAS_LOST,
+                    attempts=attempts,
+                    reason=str(exc) or "compare-and-swap predicate lost",
+                )
+            except TimeoutError as exc:
+                if connection.in_transaction:
+                    connection.rollback()
+                return WriteResult(
+                    WriteDisposition.RETRYABLE,
+                    attempts=attempts,
+                    reason=f"transaction exceeded {self.transaction_budget_s:.3f}s budget: {exc}",
+                )
+            except sqlite3.OperationalError as exc:
+                if connection.in_transaction:
+                    connection.rollback()
+                if "interrupted" in str(exc).lower():
+                    return WriteResult(
+                        WriteDisposition.RETRYABLE,
+                        attempts=attempts,
+                        reason=f"transaction exceeded {self.transaction_budget_s:.3f}s budget",
+                    )
+                if not _is_busy(exc):
+                    raise
+                if not self._retry_delay(started):
+                    return WriteResult(
+                        WriteDisposition.RETRYABLE,
+                        attempts=attempts,
+                        reason=f"journal busy timeout within {self.retry_budget_s:.3f}s",
+                    )
+            finally:
+                connection.set_progress_handler(None, 0)
+                connection.close()
+                write_lock.release()
+
+    @staticmethod
+    def _identity_token(value: object, *, label: str) -> str:
+        text = str(value or "")
+        if not _IDENTITY_TOKEN_RE.fullmatch(text):
+            raise ValueError(f"{label} must be a bounded identity token")
+        return text
+
+    @staticmethod
+    def _state_token(value: object, *, label: str) -> str:
+        text = str(value or "")
+        if not _STATE_TOKEN_RE.fullmatch(text):
+            raise ValueError(f"{label} must be a bounded state token")
+        return text
+
+    @staticmethod
+    def _canonical_uuid(value: object, *, label: str) -> str:
+        try:
+            parsed = uuid.UUID(str(value))
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise ValueError(f"{label} must be a canonical UUID") from exc
+        text = str(parsed)
+        if text != str(value):
+            raise ValueError(f"{label} must be a canonical UUID")
+        return text
+
+    @staticmethod
+    def _json_object(value: Mapping[str, object] | None, *, label: str) -> str:
+        if value is None:
+            value = {}
+        if not isinstance(value, Mapping):
+            raise ValueError(f"{label} must be an object")
+        try:
+            return json.dumps(
+                dict(value),
+                allow_nan=False,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        except (TypeError, ValueError, OverflowError, RecursionError) as exc:
+            raise ValueError(f"{label} must be canonical JSON: {exc}") from exc
+
+    def attempt_for_dispatch(self, dispatch_id: str) -> AttemptIdentity | None:
+        dispatch = self._identity_token(dispatch_id, label="dispatch_id")
+        rows = self.read_all(
+            """
+            SELECT attempt_id, dispatch_id, launch_token, launch_epoch, lifecycle_state
+            FROM dispatch_attempts WHERE dispatch_id = ?
+            """,
+            (dispatch,),
+        )
+        if not rows:
+            return None
+        row = rows[0]
+        return AttemptIdentity(
+            str(row["attempt_id"]),
+            str(row["dispatch_id"]),
+            str(row["launch_token"]),
+            int(row["launch_epoch"]),
+            str(row["lifecycle_state"]),
+        )
+
+    def prepare_attempt(
+        self,
+        dispatch_id: str,
+        *,
+        attempt_id: str | None = None,
+        launch_token: str | None = None,
+        start_deadline_at: str | None = None,
+        defer_start_deadline: bool = False,
+    ) -> WriteResult[AttemptIdentity]:
+        dispatch = self._identity_token(dispatch_id, label="dispatch_id")
+        if defer_start_deadline and start_deadline_at is not None:
+            raise ValueError(
+                "defer_start_deadline cannot be combined with start_deadline_at"
+            )
+        supplied_attempt = (
+            self._canonical_uuid(attempt_id, label="attempt_id") if attempt_id else None
+        )
+        supplied_token = (
+            self._identity_token(launch_token, label="launch_token") if launch_token else None
+        )
+
+        def action(connection: sqlite3.Connection) -> AttemptIdentity:
+            existing = connection.execute(
+                """
+                SELECT attempt_id, dispatch_id, launch_token, launch_epoch, lifecycle_state
+                FROM dispatch_attempts WHERE dispatch_id = ?
+                """,
+                (dispatch,),
+            ).fetchone()
+            if existing is not None:
+                identity = AttemptIdentity(
+                    str(existing["attempt_id"]),
+                    str(existing["dispatch_id"]),
+                    str(existing["launch_token"]),
+                    int(existing["launch_epoch"]),
+                    str(existing["lifecycle_state"]),
+                )
+                if supplied_attempt and supplied_attempt != identity.attempt_id:
+                    raise CASMismatch("dispatch already belongs to a different attempt_id")
+                if supplied_token and supplied_token != identity.launch_token:
+                    raise CASMismatch("dispatch already belongs to a different launch_token")
+                return identity
+            allocated_attempt = supplied_attempt or str(uuid.uuid4())
+            allocated_token = supplied_token or uuid.uuid4().hex
+            now = utc_now()
+            resolved_start_deadline = (
+                None
+                if defer_start_deadline
+                else start_deadline_at
+                or (
+                    dt.datetime.now(dt.timezone.utc)
+                    + dt.timedelta(seconds=START_CLAIM_DEADLINE_S)
+                ).isoformat(timespec="seconds")
+            )
+            connection.execute(
+                """
+                INSERT INTO dispatch_attempts (
+                    attempt_id, dispatch_id, project_root, lifecycle_state,
+                    launch_epoch, launch_token, prepared_at, state_updated_at,
+                    start_deadline_at
+                ) VALUES (?, ?, ?, 'PREPARED', 0, ?, ?, ?, ?)
+                """,
+                (
+                    allocated_attempt,
+                    dispatch,
+                    str(self.project_root),
+                    allocated_token,
+                    now,
+                    now,
+                    resolved_start_deadline,
+                ),
+            )
+            return AttemptIdentity(
+                allocated_attempt,
+                dispatch,
+                allocated_token,
+                0,
+                ATTEMPT_PREPARED,
+            )
+
+        return self._domain_write(action)
+
+    def start_attempt(
+        self,
+        attempt_id: str,
+        launch_token: str,
+        *,
+        expected_launch_epoch: int = 0,
+    ) -> WriteResult[AttemptIdentity]:
+        attempt = self._canonical_uuid(attempt_id, label="attempt_id")
+        token = self._identity_token(launch_token, label="launch_token")
+        if expected_launch_epoch < 0:
+            raise ValueError("expected_launch_epoch must be >= 0")
+
+        def action(connection: sqlite3.Connection) -> AttemptIdentity:
+            now = utc_now()
+            deadline_override = goalflight_compat.allowed_env_override(
+                "GOALFLIGHT_TEST_START_CLAIM_DEADLINE_S", "", test_mode=True
+            )
+            deadline_seconds = (
+                float(deadline_override)
+                if deadline_override
+                else START_CLAIM_DEADLINE_S
+            )
+            start_deadline = (
+                dt.datetime.now(dt.timezone.utc)
+                + dt.timedelta(seconds=deadline_seconds)
+            ).isoformat(timespec="seconds")
+            cursor = connection.execute(
+                """
+                UPDATE dispatch_attempts
+                SET lifecycle_state = 'STARTING', launch_epoch = launch_epoch + 1,
+                    state_updated_at = ?, start_deadline_at = ?
+                WHERE attempt_id = ? AND launch_token = ?
+                  AND lifecycle_state = 'PREPARED' AND launch_epoch = ?
+                """,
+                (now, start_deadline, attempt, token, expected_launch_epoch),
+            )
+            if cursor.rowcount != 1:
+                raise CASMismatch(
+                    "PREPARED -> STARTING lost: attempt, token, state, or launch_epoch changed"
+                )
+            row = connection.execute(
+                """
+                SELECT attempt_id, dispatch_id, launch_token, launch_epoch, lifecycle_state
+                FROM dispatch_attempts WHERE attempt_id = ?
+                """,
+                (attempt,),
+            ).fetchone()
+            assert row is not None
+            return AttemptIdentity(
+                str(row["attempt_id"]),
+                str(row["dispatch_id"]),
+                str(row["launch_token"]),
+                int(row["launch_epoch"]),
+                str(row["lifecycle_state"]),
+            )
+
+        return self._domain_write(action)
+
+    def mark_attempt_running(
+        self,
+        attempt_id: str,
+        launch_token: str,
+        *,
+        launch_epoch: int,
+        worker_instance: Mapping[str, object],
+    ) -> WriteResult[AttemptIdentity]:
+        attempt = self._canonical_uuid(attempt_id, label="attempt_id")
+        token = self._identity_token(launch_token, label="launch_token")
+        if launch_epoch < 1:
+            raise ValueError("launch_epoch must be >= 1")
+        worker_json = self._json_object(worker_instance, label="worker_instance")
+
+        def action(connection: sqlite3.Connection) -> AttemptIdentity:
+            cursor = connection.execute(
+                """
+                UPDATE dispatch_attempts
+                SET lifecycle_state = 'RUNNING', worker_instance_json = ?, state_updated_at = ?
+                WHERE attempt_id = ? AND launch_token = ?
+                  AND lifecycle_state = 'STARTING' AND launch_epoch = ?
+                """,
+                (worker_json, utc_now(), attempt, token, launch_epoch),
+            )
+            if cursor.rowcount != 1:
+                raise CASMismatch(
+                    "STARTING -> RUNNING lost: attempt, token, state, or launch_epoch changed"
+                )
+            row = connection.execute(
+                """
+                SELECT attempt_id, dispatch_id, launch_token, launch_epoch, lifecycle_state
+                FROM dispatch_attempts WHERE attempt_id = ?
+                """,
+                (attempt,),
+            ).fetchone()
+            assert row is not None
+            return AttemptIdentity(
+                str(row["attempt_id"]),
+                str(row["dispatch_id"]),
+                str(row["launch_token"]),
+                int(row["launch_epoch"]),
+                str(row["lifecycle_state"]),
+            )
+
+        return self._domain_write(action)
+
+    def commit_terminal(
+        self,
+        attempt_id: str,
+        *,
+        terminal_state: str,
+        observation: Mapping[str, object] | None = None,
+        event_type: str | None = None,
+        _deadline_at_or_before: str | None = None,
+    ) -> WriteResult[TerminalCommit]:
+        """CAS one terminal winner and its outbox event in the same transaction."""
+        attempt = self._canonical_uuid(attempt_id, label="attempt_id")
+        terminal = self._state_token(terminal_state, label="terminal_state")
+        resolved_event_type = event_type or ("result" if terminal == "complete" else "blocked")
+        if resolved_event_type not in TERMINAL_EVENT_TYPES:
+            raise ValueError(
+                "terminal event_type must be result, blocked, user_need, or user_confirm"
+            )
+        observation_json = self._json_object(observation, label="observation")
+
+        def action(connection: sqlite3.Connection) -> TerminalCommit:
+            existing = connection.execute(
+                """
+                SELECT a.dispatch_id, a.lifecycle_state, a.terminal_state,
+                       a.terminal_transition_id, a.terminal_outcome_json,
+                       a.start_deadline_at,
+                       o.event_uuid, o.event_type
+                FROM dispatch_attempts AS a
+                LEFT JOIN terminal_outbox AS o
+                  ON o.attempt_id = a.attempt_id
+                 AND o.transition_id = a.terminal_transition_id
+                WHERE a.attempt_id = ?
+                """,
+                (attempt,),
+            ).fetchone()
+            if existing is None:
+                raise CASMismatch("terminal commit lost: attempt does not exist")
+            if str(existing["lifecycle_state"]) in ATTEMPT_FINAL_STATES:
+                if not existing["terminal_transition_id"] or not existing["event_uuid"]:
+                    raise JournalIntegrityError(
+                        "terminal attempt exists without its transition/outbox row"
+                    )
+                return TerminalCommit(
+                    attempt,
+                    str(existing["terminal_transition_id"]),
+                    str(existing["dispatch_id"]),
+                    str(existing["terminal_state"]),
+                    str(existing["event_uuid"]),
+                    str(existing["event_type"]),
+                    json.loads(str(existing["terminal_outcome_json"])),
+                    True,
+                )
+            if str(existing["lifecycle_state"]) not in ATTEMPT_LIVE_STATES:
+                raise CASMismatch(
+                    f"terminal commit lost: attempt state is {existing['lifecycle_state']}"
+                )
+            if _deadline_at_or_before is not None:
+                if str(existing["lifecycle_state"]) not in {
+                    ATTEMPT_PREPARED,
+                    ATTEMPT_STARTING,
+                }:
+                    raise CASMismatch(
+                        "expired launch abandonment lost: worker already claimed or attempt changed"
+                    )
+                deadline = existing["start_deadline_at"]
+                if deadline is None or str(deadline) > _deadline_at_or_before:
+                    raise CASMismatch(
+                        "expired launch abandonment lost: start deadline is no longer expired"
+                    )
+            transition_id = str(uuid.uuid4())
+            event_uuid = str(uuid.uuid4())
+            now = utc_now()
+            final_lifecycle = (
+                ATTEMPT_ABANDONED if terminal == "abandoned" else ATTEMPT_TERMINAL
+            )
+            observation_value = json.loads(observation_json)
+            outcome = (
+                observation_value.get("outcome")
+                if isinstance(observation_value, dict)
+                else None
+            )
+            error = outcome.get("error") if isinstance(outcome, dict) else None
+            marker_text = error.get("text") if isinstance(error, dict) else None
+            payload = {
+                "attempt_id": attempt,
+                "transition_id": transition_id,
+                "dispatch_id": str(existing["dispatch_id"]),
+                "terminal_state": terminal,
+                "complete": resolved_event_type == "result",
+                "text": str(marker_text or f"dispatch terminal: {terminal}"),
+                "observation": observation_value,
+            }
+            payload_json = self._json_object(payload, label="outbox_payload")
+            if _deadline_at_or_before is None:
+                cursor = connection.execute(
+                    """
+                    UPDATE dispatch_attempts
+                    SET lifecycle_state = ?, terminal_transition_id = ?,
+                        terminal_state = ?, terminal_outcome_json = ?, terminal_at = ?,
+                        state_updated_at = ?
+                    WHERE attempt_id = ?
+                      AND lifecycle_state IN ('PREPARED', 'STARTING', 'RUNNING')
+                    """,
+                    (
+                        final_lifecycle,
+                        transition_id,
+                        terminal,
+                        observation_json,
+                        now,
+                        now,
+                        attempt,
+                    ),
+                )
+            else:
+                cursor = connection.execute(
+                    """
+                    UPDATE dispatch_attempts
+                    SET lifecycle_state = ?, terminal_transition_id = ?,
+                        terminal_state = ?, terminal_outcome_json = ?, terminal_at = ?,
+                        state_updated_at = ?
+                    WHERE attempt_id = ?
+                      AND lifecycle_state IN ('PREPARED', 'STARTING')
+                      AND start_deadline_at IS NOT NULL
+                      AND start_deadline_at <= ?
+                    """,
+                    (
+                        final_lifecycle,
+                        transition_id,
+                        terminal,
+                        observation_json,
+                        now,
+                        now,
+                        attempt,
+                        _deadline_at_or_before,
+                    ),
+                )
+            if cursor.rowcount != 1:
+                raise CASMismatch("terminal commit lost to another classifier")
+            pause_file = goalflight_compat.allowed_env_override(
+                "GOALFLIGHT_TEST_TERMINAL_PAUSE_FILE", "", test_mode=True
+            )
+            if pause_file:
+                marker = Path(pause_file)
+                marker.write_text("state-updated\n", encoding="utf-8")
+                while marker.exists():
+                    time.sleep(0.005)
+            connection.execute(
+                """
+                INSERT INTO dispatch_transitions (
+                    attempt_id, transition_id, from_state, to_state,
+                    terminal_state, observation_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    attempt,
+                    transition_id,
+                    str(existing["lifecycle_state"]),
+                    final_lifecycle,
+                    terminal,
+                    observation_json,
+                    now,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO terminal_outbox (
+                    attempt_id, transition_id, origin_node, event_uuid,
+                    recipient, event_type, payload_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    attempt,
+                    transition_id,
+                    socket.gethostname(),
+                    event_uuid,
+                    str(existing["dispatch_id"]),
+                    resolved_event_type,
+                    payload_json,
+                    now,
+                ),
+            )
+            return TerminalCommit(
+                attempt,
+                transition_id,
+                str(existing["dispatch_id"]),
+                terminal,
+                event_uuid,
+                resolved_event_type,
+                json.loads(observation_json),
+                False,
+            )
+
+        return self._domain_write(action)
+
+    def commit_expired_attempt(
+        self,
+        attempt_id: str,
+        *,
+        observed_at: str,
+        terminal_state: str = "abandoned",
+        observation: Mapping[str, object] | None = None,
+    ) -> WriteResult[TerminalCommit]:
+        """Commit a reconciled terminal only while its launch remains expired."""
+        return self.commit_terminal(
+            attempt_id,
+            terminal_state=terminal_state,
+            observation=observation,
+            event_type="result" if terminal_state == "complete" else "blocked",
+            _deadline_at_or_before=observed_at,
+        )
+
+    def pending_outbox(self, *, limit: int = 100) -> list[dict[str, object]]:
+        if not 1 <= limit <= 1000:
+            raise ValueError("outbox limit must be between 1 and 1000")
+        rows = self.read_all(
+            """
+            SELECT attempt_id, transition_id, origin_node, event_uuid,
+                   recipient, event_type, payload_json, created_at,
+                   projection_attempts
+            FROM terminal_outbox
+            WHERE projected_at IS NULL
+            ORDER BY created_at, attempt_id, transition_id
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        return [dict(row) for row in rows]
+
+    def project_terminal_outbox(
+        self,
+        *,
+        messages_dir: Path,
+        limit: int = 100,
+    ) -> list[OutboxProjection]:
+        """Project terminal events to the carrier; event UUID makes retries idempotent."""
+        import goalflight_messages
+
+        projected: list[OutboxProjection] = []
+        for row in self.pending_outbox(limit=limit):
+            payload = json.loads(str(row["payload_json"]))
+            try:
+                result = goalflight_messages.post_message(
+                    dispatch_id=str(row["recipient"]),
+                    msg_type=str(row["event_type"]),
+                    payload=payload,
+                    messages_dir=messages_dir,
+                    source={
+                        "node": str(row["origin_node"]),
+                        "adapter": "journal-outbox",
+                        "transport": "journal",
+                    },
+                    event_id=str(row["event_uuid"]),
+                    event_ts=str(row["created_at"]),
+                )
+            except Exception as exc:
+                self.write(
+                    RowOperation.update(
+                        "terminal_outbox",
+                        {
+                            "projection_attempts": int(row["projection_attempts"]) + 1,
+                            "projection_error": f"{type(exc).__name__}: {exc}"[:2000],
+                        },
+                        where={
+                            "attempt_id": str(row["attempt_id"]),
+                            "transition_id": str(row["transition_id"]),
+                        },
+                        row_cap=1,
+                    )
+                )
+                continue
+            marked = self.write(
+                RowOperation.update(
+                    "terminal_outbox",
+                    {
+                        "projected_at": utc_now(),
+                        "projection_attempts": int(row["projection_attempts"]) + 1,
+                        "projection_error": None,
+                    },
+                    where={
+                        "attempt_id": str(row["attempt_id"]),
+                        "transition_id": str(row["transition_id"]),
+                    },
+                    row_cap=1,
+                    expected_rows=1,
+                )
+            )
+            if marked.committed:
+                projected.append(
+                    OutboxProjection(
+                        str(row["attempt_id"]),
+                        str(row["transition_id"]),
+                        str(row["event_uuid"]),
+                        bool(result.get("recorded")),
+                        str(result["path"]),
+                    )
+                )
+        return projected
+
     def inspect(self) -> dict[str, object]:
         with contextlib.closing(self._connect()) as connection:
             epochs = self._assert_epoch_fence(connection, for_write=False)
@@ -1016,6 +1844,19 @@ class Journal:
             tmp.unlink(missing_ok=True)
 
 
+def open_or_create_journal(project_root: Path | str) -> Journal:
+    """Open authority, explicitly bootstrapping only a truly absent path."""
+    path = resolve_journal_path(project_root)
+    if os.path.lexists(path):
+        return Journal(project_root)
+    try:
+        return Journal.create(project_root)
+    except JournalError:
+        if not os.path.lexists(path):
+            raise
+        return Journal(project_root)
+
+
 def _validate_snapshot_file(path: Path) -> JournalEpochs:
     if path.is_symlink() or not path.is_file():
         raise JournalIntegrityError(f"snapshot is not a regular non-symlink file: {path}")
@@ -1053,6 +1894,7 @@ def _assert_snapshot_epoch_compatibility(
     epochs: JournalEpochs,
     *,
     client: ClientEpochs | None = None,
+    subject: str = "snapshot",
 ) -> None:
     capabilities = client or ClientEpochs()
     mismatches = []
@@ -1073,7 +1915,7 @@ def _assert_snapshot_epoch_compatibility(
         )
     if mismatches:
         raise JournalUpgradeRequired(
-            "UPGRADE_REQUIRED: snapshot epoch fence refused restore before replacement: "
+            f"UPGRADE_REQUIRED: {subject} epoch fence refused restore before replacement: "
             + "; ".join(mismatches)
         )
 
@@ -1107,6 +1949,8 @@ def restore_snapshot(
             )
         if destination.is_symlink() or not destination.is_file():
             raise JournalIntegrityError(f"restore target is not a regular non-symlink file: {destination}")
+        live_epochs = _validate_snapshot_file(destination)
+        _assert_snapshot_epoch_compatibility(live_epochs, subject="live journal")
         live_sidecars = [Path(f"{destination}{suffix}") for suffix in ("-wal", "-shm")]
         if any(sidecar.exists() for sidecar in live_sidecars):
             try:
@@ -1200,22 +2044,28 @@ def restore_snapshot(
                 _fsync_directory(destination.parent)
                 installed_epochs = _validate_snapshot_file(destination)
                 _assert_snapshot_epoch_compatibility(installed_epochs)
-                displaced.unlink()
-                preserve_displaced = False
             except BaseException as install_exc:
                 try:
                     for sidecar in live_sidecars:
                         sidecar.unlink(missing_ok=True)
                     os.replace(displaced, destination)
-                    preserve_displaced = False
                     _fsync_directory(destination.parent)
+                    preserve_displaced = False
                 except BaseException as rollback_exc:
-                    preserve_displaced = True
+                    preserve_displaced = displaced.exists()
+                    rollback_state = (
+                        f"pre-image kept at {displaced}"
+                        if preserve_displaced
+                        else "pre-image restored but directory durability is unconfirmed"
+                    )
                     raise JournalIntegrityError(
-                        f"restore failed after displacement and rollback failed; pre-image kept at "
-                        f"{displaced}: install={install_exc}; rollback={rollback_exc}"
+                        f"restore failed after displacement and rollback failed; {rollback_state}: "
+                        f"install={install_exc}; rollback={rollback_exc}"
                     ) from install_exc
                 raise
+            displaced.unlink()
+            preserve_displaced = False
+            _fsync_directory(destination.parent)
             return destination
         finally:
             if copy_fd >= 0:
@@ -1233,10 +2083,13 @@ def _fsync_directory(path: Path) -> None:
         flags |= os.O_DIRECTORY
     try:
         fd = os.open(path, flags)
-    except OSError:
-        return
+    except OSError as exc:
+        raise JournalUnavailable(f"cannot fsync journal directory {path}: {exc}") from exc
     try:
-        os.fsync(fd)
+        try:
+            os.fsync(fd)
+        except OSError as exc:
+            raise JournalUnavailable(f"cannot fsync journal directory {path}: {exc}") from exc
     finally:
         os.close(fd)
 

@@ -187,6 +187,32 @@ def test_ledger_record_finish_status() -> None:
         state_dir = Path(td)
         prompt = state_dir / "prompt.md"
         prompt.write_text("hello\n")
+        invalid = run(
+            [
+                "python3",
+                "scripts/goalflight_ledger.py",
+                "record",
+                "--dispatch-id",
+                "weird/id",
+                "--prompt-path",
+                str(prompt),
+                "--agent",
+                "codex",
+                "--transport",
+                "file-backed-review",
+                "--worker-pid",
+                str(os.getpid()),
+                "--json",
+            ],
+            state_dir=state_dir,
+            check=False,
+        )
+        assert_true("path-like dispatch id rejected", invalid.returncode != 0)
+        assert_true(
+            "path-like dispatch id reports journal identity contract",
+            "dispatch_id must be a bounded identity token" in invalid.stderr,
+        )
+        dispatch_id = "weird-id"
         rec = json.loads(
             run(
                 [
@@ -194,7 +220,7 @@ def test_ledger_record_finish_status() -> None:
                     "scripts/goalflight_ledger.py",
                     "record",
                     "--dispatch-id",
-                    "weird/id",
+                    dispatch_id,
                     "--prompt-path",
                     str(prompt),
                     "--agent",
@@ -209,12 +235,12 @@ def test_ledger_record_finish_status() -> None:
             ).stdout
         )
         assert_true("record wrote", rec["ok"])
-        run(["python3", "scripts/goalflight_ledger.py", "finish", "--dispatch-id", "weird/id", "--state", "complete"], state_dir=state_dir)
-        run(["python3", "scripts/goalflight_ledger.py", "finish", "--dispatch-id", "weird/id", "--state", "failed", "--reason", "late-watcher-error"], state_dir=state_dir)
+        run(["python3", "scripts/goalflight_ledger.py", "finish", "--dispatch-id", dispatch_id, "--state", "complete"], state_dir=state_dir)
+        run(["python3", "scripts/goalflight_ledger.py", "finish", "--dispatch-id", dispatch_id, "--state", "failed", "--reason", "late-watcher-error"], state_dir=state_dir)
         status = json.loads(run(["python3", "scripts/goalflight_ledger.py", "status", "--json"], state_dir=state_dir).stdout)
         assert_true("ledger schema", status["schema"] == "goalflight.dispatch.v1")
         assert_true("finished visible", any(row["state"] == "complete" for row in status["records"]))
-        weird_row = next(row for row in status["records"] if row["dispatch_id"] == "weird/id")
+        weird_row = next(row for row in status["records"] if row["dispatch_id"] == dispatch_id)
         assert_true("conflicting terminal finish is idempotent no-op", weird_row["state"] == "complete")
 
         run(

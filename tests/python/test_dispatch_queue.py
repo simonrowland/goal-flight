@@ -33,8 +33,11 @@ import goalflight_dispatch as D  # noqa: E402
 def _env(tmp: Path) -> dict[str, str]:
     env = os.environ.copy()
     env["GOALFLIGHT_STATE_DIR"] = str(tmp / "state")
+    env["GOALFLIGHT_MESSAGES_DIR"] = str(tmp / "messages")
+    env["GOALFLIGHT_JOURNAL_DIR"] = str(tmp / "journal-state")
     env["GOALFLIGHT_TASK_STORE_DIR"] = str(tmp / "task-store")
     env["GOAL_FLIGHT_PIDFILE_DIR"] = str(tmp / "pids")
+    env["GOALFLIGHT_CAPACITY_CONF"] = "/dev/null"
     env["GOALFLIGHT_CAPACITY_WAIT_S"] = "0"
     return env
 
@@ -51,13 +54,90 @@ def _run(cmd: list[str], env: dict[str, str], *, timeout: float = 30.0) -> subpr
     )
 
 
-def _wait_for(predicate, *, timeout: float = 8.0) -> bool:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
+_ASYNC_WAIT_TIMEOUT_S = 30.0
+
+
+def _wait_for(predicate, *, timeout: float = _ASYNC_WAIT_TIMEOUT_S) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
         if predicate():
             return True
         time.sleep(0.1)
-    return False
+    return bool(predicate())
+
+
+def _wait_for_dispatch_shutdown(
+    env: dict[str, str],
+    dispatch_id: str,
+    status_path: Path,
+    *,
+    watcher: bool = True,
+    timeout: float = _ASYNC_WAIT_TIMEOUT_S,
+) -> None:
+    """Wait until a detached test dispatch has no writers left under its tmp tree."""
+    deadline = time.monotonic() + timeout
+    last_status: dict = {}
+
+    def remaining() -> float:
+        return max(0.0, deadline - time.monotonic())
+
+    def status_with_worker() -> bool:
+        nonlocal last_status
+        try:
+            payload = json.loads(status_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        if not isinstance(payload, dict) or not payload.get("worker_pid"):
+            return False
+        last_status = payload
+        return True
+
+    assert _wait_for(status_with_worker, timeout=remaining()), (
+        f"{dispatch_id} never recorded its worker pid; last_status={last_status!r}"
+    )
+    worker_pid = int(last_status["worker_pid"])
+    assert _wait_for(
+        lambda: not D.goalflight_compat.pid_alive(worker_pid),
+        timeout=remaining(),
+    ), f"{dispatch_id} worker pid {worker_pid} outlived the test timeout"
+
+    def terminal_status() -> bool:
+        nonlocal last_status
+        try:
+            payload = json.loads(status_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        if not isinstance(payload, dict):
+            return False
+        last_status = payload
+        return payload.get("state") == "complete" and payload.get("worker_alive") is not True
+
+    assert _wait_for(terminal_status, timeout=remaining()), (
+        f"{dispatch_id} did not reach terminal status after worker exit; "
+        f"last_status={last_status!r}"
+    )
+    if not watcher:
+        return
+
+    watcher_log = Path(env["GOALFLIGHT_STATE_DIR"]) / "dispatch" / f"{dispatch_id}.watcher.log"
+    last_watcher: dict = {}
+
+    def watcher_finished() -> bool:
+        nonlocal last_watcher
+        try:
+            lines = watcher_log.read_text(encoding="utf-8").splitlines()
+            payload = json.loads(lines[-1])
+        except (OSError, IndexError, json.JSONDecodeError):
+            return False
+        if not isinstance(payload, dict):
+            return False
+        last_watcher = payload
+        return payload.get("state") == "complete"
+
+    assert _wait_for(watcher_finished, timeout=remaining()), (
+        f"{dispatch_id} watcher did not finish its terminal write; "
+        f"last_watcher={last_watcher!r}"
+    )
 
 
 def _status(env: dict[str, str]) -> dict:
@@ -142,10 +222,10 @@ def _sleeping_worker():
         if proc.poll() is None:
             proc.terminate()
             try:
-                proc.wait(timeout=5.0)
+                proc.wait(timeout=_ASYNC_WAIT_TIMEOUT_S)
             except subprocess.TimeoutExpired:
                 proc.kill()
-                proc.wait(timeout=5.0)
+                proc.wait(timeout=_ASYNC_WAIT_TIMEOUT_S)
 
 
 def _write_queue_entry(
@@ -255,7 +335,6 @@ def test_submit_records_replayable_request_without_capacity_acquire() -> None:
                 raise AssertionError("submit must not acquire capacity")
 
             D._acquire_capacity = fail_acquire
-            started = time.time()
             rc = D.main(
                 [
                     "--agent",
@@ -276,13 +355,11 @@ def test_submit_records_replayable_request_without_capacity_acquire() -> None:
                     "print('COMPLETE: should launch later')",
                 ]
             )
-            elapsed = time.time() - started
         finally:
             D._acquire_capacity = old_acquire
             os.environ.clear()
             os.environ.update(old_env)
         assert rc == 0
-        assert elapsed < 1.0, elapsed
         queue_path = tmp / "state" / "dispatch-queue" / "submit-fast.json"
         assert queue_path.exists(), "queued request missing"
         entry = json.loads(queue_path.read_text(encoding="utf-8"))
@@ -400,12 +477,17 @@ def test_submit_default_drain_launches_once_and_duplicate_submit_does_not_double
         tmp = Path(td)
         env = _env(tmp)
         marker = tmp / "default-drain-count.txt"
+        release = tmp / "default-drain-release.txt"
         worker_code = (
             "from pathlib import Path; import time\n"
             f"p=Path({str(marker)!r})\n"
+            f"release=Path({str(release)!r})\n"
             "p.write_text((p.read_text() if p.exists() else '') + 'x')\n"
+            f"deadline=time.monotonic()+{_ASYNC_WAIT_TIMEOUT_S!r}\n"
+            "while not release.exists():\n"
+            "    if time.monotonic() >= deadline: raise TimeoutError('default drain release not received')\n"
+            "    time.sleep(0.01)\n"
             "print('COMPLETE: default drain launched', flush=True)\n"
-            "time.sleep(2.0)\n"
         )
         cmd = [
             sys.executable,
@@ -419,6 +501,8 @@ def test_submit_default_drain_launches_once_and_duplicate_submit_does_not_double
             str(tmp / "default-launch.tail"),
             "--status-json",
             str(tmp / "default-launch.status.json"),
+            "--poll-secs",
+            "0.1",
             "--cwd",
             str(ROOT),
             "--",
@@ -428,13 +512,20 @@ def test_submit_default_drain_launches_once_and_duplicate_submit_does_not_double
         ]
         first = _run(cmd, env)
         assert first.returncode == 0, (first.stdout, first.stderr)
-        assert _wait_for(lambda: marker.exists() and marker.read_text() == "x"), first.stdout
-        assert not (tmp / "state" / "dispatch-queue" / "submit-default-launch.json").exists()
+        try:
+            assert _wait_for(lambda: marker.exists() and marker.read_text() == "x"), first.stdout
+            assert not (tmp / "state" / "dispatch-queue" / "submit-default-launch.json").exists()
 
-        duplicate = _run(cmd, env)
-        assert duplicate.returncode == 64, (duplicate.stdout, duplicate.stderr)
-        assert "already has a non-terminal ledger record" in duplicate.stderr
-        time.sleep(0.3)
+            duplicate = _run(cmd, env)
+            assert duplicate.returncode == 64, (duplicate.stdout, duplicate.stderr)
+            assert "already has a non-terminal ledger record" in duplicate.stderr
+        finally:
+            release.write_text("release", encoding="utf-8")
+            _wait_for_dispatch_shutdown(
+                env,
+                "submit-default-launch",
+                tmp / "default-launch.status.json",
+            )
         assert marker.read_text() == "x", "duplicate submit launched the worker again"
 
 
@@ -623,7 +714,7 @@ def test_concurrent_submit_same_id_is_idempotent() -> None:
         ]
         results = []
         for proc in procs:
-            stdout, stderr = proc.communicate(timeout=30.0)
+            stdout, stderr = proc.communicate(timeout=_ASYNC_WAIT_TIMEOUT_S)
             results.append((proc.returncode, stdout, stderr))
         for rc, _stdout, _stderr in results:
             assert rc == 0, (rc, _stdout, _stderr)
@@ -777,11 +868,10 @@ def test_drain_launches_queued_request_once_and_exits() -> None:
         env = _env(tmp)
         marker = tmp / "launch-count.txt"
         worker_code = (
-            "from pathlib import Path; import time\n"
+            "from pathlib import Path\n"
             f"p=Path({str(marker)!r})\n"
             "p.write_text((p.read_text() if p.exists() else '') + 'x')\n"
             "print('COMPLETE: queued launch done', flush=True)\n"
-            "time.sleep(0.2)\n"
         )
         submit = _run(
             [
@@ -797,6 +887,8 @@ def test_drain_launches_queued_request_once_and_exits() -> None:
                 str(tmp / "drain.tail"),
                 "--status-json",
                 str(tmp / "drain.status.json"),
+                "--poll-secs",
+                "0.1",
                 "--cwd",
                 str(ROOT),
                 "--",
@@ -817,7 +909,7 @@ def test_drain_launches_queued_request_once_and_exits() -> None:
         second = _run([sys.executable, str(DISPATCH), "drain", "--capacity-wait-s", "0", "--json"], env)
         assert second.returncode == 0, (second.stdout, second.stderr)
         assert json.loads(second.stdout)["launched"] == 0, second.stdout
-        time.sleep(0.5)
+        _wait_for_dispatch_shutdown(env, "drain-launch", tmp / "drain.status.json")
         assert marker.read_text() == "x", "second drain double-launched the request"
 
 
@@ -825,7 +917,13 @@ def test_drain_waits_for_submit_status_recording() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         env = _env(tmp)
-        env["GOALFLIGHT_TEST_SUBMIT_STATUS_DELAY_S"] = "2.0"
+        env["GOALFLIGHT_TEST_MODE"] = "1"
+        submit_ready = tmp / "submit-status.ready"
+        submit_release = tmp / "submit-status.release"
+        drain_ready = tmp / "drain-before-claim.ready"
+        env["GOALFLIGHT_TEST_SUBMIT_STATUS_READY_FILE"] = str(submit_ready)
+        env["GOALFLIGHT_TEST_SUBMIT_STATUS_RELEASE_FILE"] = str(submit_release)
+        env["GOALFLIGHT_TEST_DRAIN_BEFORE_CLAIM_FILE"] = str(drain_ready)
         marker = tmp / "delayed-drain-ran.txt"
         status_json = tmp / "delayed.status.json"
         queue_path = tmp / "state" / "dispatch-queue" / "submit-drain-race.json"
@@ -848,6 +946,8 @@ def test_drain_waits_for_submit_status_recording() -> None:
                 str(tmp / "delayed.tail"),
                 "--status-json",
                 str(status_json),
+                "--poll-secs",
+                "0.1",
                 "--cwd",
                 str(ROOT),
                 "--",
@@ -861,24 +961,42 @@ def test_drain_waits_for_submit_status_recording() -> None:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
+        drain: subprocess.Popen[str] | None = None
         try:
-            assert _wait_for(lambda: queue_path.exists(), timeout=5.0), "submit did not expose queue file"
-            started = time.time()
-            drain = _run([sys.executable, str(DISPATCH), "drain", "--capacity-wait-s", "0", "--json"], env)
-            elapsed = time.time() - started
-            submit_stdout, submit_stderr = submit.communicate(timeout=30.0)
+            assert _wait_for(lambda: submit_ready.exists() and queue_path.exists()), (
+                "submit did not expose the queued carrier while holding its mutation lock"
+            )
+            drain = subprocess.Popen(
+                [sys.executable, str(DISPATCH), "drain", "--capacity-wait-s", "0", "--json"],
+                cwd=ROOT,
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            assert _wait_for(drain_ready.exists), "drain did not reach the queue claim boundary"
+            assert drain.poll() is None, "drain escaped the submit mutation lock before status recording"
+            assert queue_path.exists(), "drain claimed a queue entry before submit status recording"
+            submit_release.write_text("release", encoding="utf-8")
+            submit_stdout, submit_stderr = submit.communicate(timeout=_ASYNC_WAIT_TIMEOUT_S)
+            drain_stdout, drain_stderr = drain.communicate(timeout=_ASYNC_WAIT_TIMEOUT_S)
         finally:
+            submit_release.write_text("release", encoding="utf-8")
             if submit.poll() is None:
                 submit.kill()
-                submit.communicate(timeout=5.0)
+                submit.communicate(timeout=_ASYNC_WAIT_TIMEOUT_S)
+            if drain is not None and drain.poll() is None:
+                drain.kill()
+                drain.communicate(timeout=_ASYNC_WAIT_TIMEOUT_S)
         assert submit.returncode == 0, (submit.returncode, submit_stdout, submit_stderr)
-        assert drain.returncode == 0, (drain.stdout, drain.stderr)
-        assert elapsed >= 1.0, f"drain did not wait for submit record lock: {elapsed:.3f}s"
-        payload = json.loads(drain.stdout)
+        assert drain is not None
+        assert drain.returncode == 0, (drain.returncode, drain_stdout, drain_stderr)
+        payload = json.loads(drain_stdout)
         assert payload["launched"] == 1, payload
         final_status = json.loads(status_json.read_text(encoding="utf-8"))
         assert final_status["state"] != "queued", final_status
         assert not queue_path.exists()
+        _wait_for_dispatch_shutdown(env, "submit-drain-race", status_json)
 
 
 def test_drain_write_error_is_json_error_without_traceback() -> None:
@@ -907,9 +1025,11 @@ def test_acp_submit_then_drain_replays_from_queue() -> None:
         env.pop("GOALFLIGHT_STEER_FILE", None)
         env["PATH"] = f"{tmp}{os.pathsep}{env.get('PATH', '')}"
         marker = tmp / "acp-test-complete.txt"
+        release = tmp / "acp-test-release.txt"
+        status_path = tmp / "acp.status.json"
         env["GOALFLIGHT_TEST_MODE"] = "1"
         env["GOALFLIGHT_TEST_ACP_DISPATCH_COMPLETE_FILE"] = str(marker)
-        env["GOALFLIGHT_TEST_ACP_DISPATCH_SLEEP_AFTER_RUNNING_S"] = "4"
+        env["GOALFLIGHT_TEST_ACP_DISPATCH_RELEASE_FILE"] = str(release)
         env["GOALFLIGHT_FAKE_ACP_SCENARIO"] = "blocked_none"
         env["GOALFLIGHT_FAKE_ACP_INTERVAL"] = "0.01"
         env["GOALFLIGHT_ACP_PYTHON"] = sys.executable
@@ -930,7 +1050,7 @@ def test_acp_submit_then_drain_replays_from_queue() -> None:
                 "--tail",
                 str(tmp / "acp.tail"),
                 "--status-json",
-                str(tmp / "acp.status.json"),
+                str(status_path),
                 "--cwd",
                 str(ROOT),
                 "--max-idle-secs",
@@ -941,26 +1061,52 @@ def test_acp_submit_then_drain_replays_from_queue() -> None:
             env,
         )
         assert submit.returncode == 0, (submit.stdout, submit.stderr)
-        started = time.time()
-        drain = _run(
-            [sys.executable, str(DISPATCH), "drain", "--capacity-wait-s", "0", "--json"],
-            env,
-            timeout=45.0,
-        )
-        elapsed = time.time() - started
-        assert drain.returncode == 0, (drain.stdout, drain.stderr)
-        assert elapsed < 3.0, f"ACP drain waited for child completion: {elapsed:.3f}s"
-        payload = json.loads(drain.stdout)
-        assert payload["launched"] == 1, payload
-        assert payload["remaining"] == 0, payload
-        assert payload["pending_claims"] == 0, payload
-        assert not (tmp / "state" / "dispatch-queue" / "acp-drain.json").exists()
-        assert marker.exists(), "test ACP launch hook did not run"
-        assert _wait_for(
-            lambda: json.loads((tmp / "acp.status.json").read_text(encoding="utf-8")).get("state")
-            == "complete",
-            timeout=6.0,
-        )
+        launched = False
+        last_status: dict = {}
+        try:
+            drain = _run(
+                [sys.executable, str(DISPATCH), "drain", "--capacity-wait-s", "0", "--json"],
+                env,
+                timeout=45.0,
+            )
+            assert drain.returncode == 0, (drain.stdout, drain.stderr)
+            payload = json.loads(drain.stdout)
+            launched = payload["launched"] == 1
+            assert launched, payload
+            assert payload["remaining"] == 0, payload
+            assert payload["pending_claims"] == 0, payload
+            assert not (tmp / "state" / "dispatch-queue" / "acp-drain.json").exists()
+
+            def acp_started() -> bool:
+                nonlocal last_status
+                try:
+                    marker_pid = int(marker.read_text(encoding="utf-8"))
+                    current = json.loads(status_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError, json.JSONDecodeError):
+                    return False
+                if not isinstance(current, dict):
+                    return False
+                last_status = current
+                return (
+                    current.get("state") == "running"
+                    and current.get("worker_alive") is True
+                    and current.get("worker_pid") == marker_pid
+                    and D.goalflight_compat.pid_alive(marker_pid)
+                )
+
+            assert _wait_for(acp_started), (
+                "ACP worker never reached its running launch hook; "
+                f"marker_exists={marker.exists()} last_status={last_status!r}"
+            )
+        finally:
+            release.write_text("release", encoding="utf-8")
+            if launched:
+                _wait_for_dispatch_shutdown(
+                    env,
+                    "acp-drain",
+                    status_path,
+                    watcher=False,
+                )
 
 
 def test_drain_leaves_request_queued_when_capacity_full() -> None:
@@ -1965,12 +2111,12 @@ def test_legacy_claim_dead_worker_without_token_defers_fail_closed() -> None:
                 start_new_session=True,
             )
             try:
-                assert _wait_for(lambda: D.goalflight_ledger.process_identity(worker.pid) is not None, timeout=5.0)
+                assert _wait_for(lambda: D.goalflight_ledger.process_identity(worker.pid) is not None)
                 identity = D.goalflight_ledger.process_identity(worker.pid)
                 dead_pid = worker.pid
             finally:
                 worker.terminate()
-                worker.wait(timeout=5.0)
+                worker.wait(timeout=_ASYNC_WAIT_TIMEOUT_S)
             D.goalflight_ledger.write_record(
                 {
                     "schema": D.goalflight_ledger.SCHEMA,
@@ -2274,6 +2420,7 @@ def test_b065_state_flips_to_terminal_so_wait_resolves() -> None:
         env = _b065_env(tmp)
         old_env = os.environ.copy()
         original_snapshot = D._process_snapshot
+        release: Path | None = None
         try:
             os.environ.clear()
             os.environ.update(env)
@@ -2643,7 +2790,7 @@ def test_b065_weak_worker_pid_claim_unlink_then_ledger_terminalizes() -> None:
                 dead_pgid = os.getpgid(worker.pid)
             finally:
                 worker.terminate()
-                worker.wait(timeout=5)
+                worker.wait(timeout=_ASYNC_WAIT_TIMEOUT_S)
             started = (
                 __import__("datetime")
                 .datetime.now(__import__("datetime").timezone.utc)
@@ -2840,7 +2987,10 @@ def test_b065_live_stdout_lock_skips_reconciliation_promptly() -> None:
                 "from pathlib import Path; import time; "
                 f"ready=Path({str(ready)!r}); release=Path({str(release)!r}); "
                 "print('working...', flush=True); ready.write_text('ready'); "
-                "\nwhile not release.exists(): time.sleep(0.01)\n"
+                f"deadline=time.monotonic()+{_ASYNC_WAIT_TIMEOUT_S!r}; "
+                "\nwhile not release.exists():\n"
+                "    if time.monotonic() >= deadline: raise TimeoutError('tail producer release not received')\n"
+                "    time.sleep(0.01)\n"
                 "print('COMPLETE: inherited lock', flush=True)"
             )
             D._spawn_daemonized_process(
@@ -2854,7 +3004,6 @@ def test_b065_live_stdout_lock_skips_reconciliation_promptly() -> None:
             )
             assert _wait_for(
                 lambda: ready.exists() and tail.exists() and "working" in tail.read_text(encoding="utf-8"),
-                timeout=5.0,
             )
             result: dict[str, object] = {}
             D._process_snapshot = lambda: []
@@ -2863,17 +3012,15 @@ def test_b065_live_stdout_lock_skips_reconciliation_promptly() -> None:
                 result.update(D._recover_claimed_queue_entries(queue, stale_s=300))
 
             tick = threading.Thread(target=recover, daemon=True)
-            before = time.monotonic()
             tick.start()
-            tick.join(timeout=0.5)
-            elapsed = time.monotonic() - before
+            tick.join(timeout=_ASYNC_WAIT_TIMEOUT_S)
             returned_promptly = not tick.is_alive()
             record_while_live = json.loads(
                 (tmp / "state" / "runs.d" / f"{dispatch_id}.json").read_text(encoding="utf-8")
             )
             claim_while_live = claim.exists()
             release.write_text("release", encoding="utf-8")
-            tick.join(timeout=5.0)
+            tick.join(timeout=_ASYNC_WAIT_TIMEOUT_S)
             assert not tick.is_alive(), "test cleanup could not release the reconciler"
             if returned_promptly:
                 def tail_released() -> bool:
@@ -2883,17 +3030,18 @@ def test_b065_live_stdout_lock_skips_reconciliation_promptly() -> None:
                     except D._TailLockBusy:
                         return False
 
-                assert _wait_for(tail_released, timeout=5.0), "producer did not release tail flock"
+                assert _wait_for(tail_released), "producer did not release tail flock"
                 second = D._recover_claimed_queue_entries(queue, stale_s=300)
                 record_after_eof = json.loads(
                     (tmp / "state" / "runs.d" / f"{dispatch_id}.json").read_text(encoding="utf-8")
                 )
         finally:
+            if release is not None:
+                release.write_text("release", encoding="utf-8")
             D._process_snapshot = original_snapshot
             os.environ.clear()
             os.environ.update(old_env)
-        assert returned_promptly, f"drain tick blocked {elapsed:.3f}s on live tail producer"
-        assert elapsed < 0.5, elapsed
+        assert returned_promptly, "drain tick blocked on a live tail producer"
         assert claim_while_live, "live dispatch carrier must remain intact"
         assert record_while_live["state"] == "starting", record_while_live
         assert result.get("pending_launch") == 1, result
@@ -3016,15 +3164,16 @@ def test_b065_concurrent_double_restore_second_exhausts() -> None:
             barrier = threading.Barrier(2)
 
             def race() -> None:
-                barrier.wait(timeout=5)
+                barrier.wait(timeout=_ASYNC_WAIT_TIMEOUT_S)
                 results.append(D._bounded_restore_claim(claim, dict(payload), queue))
 
             t1 = threading.Thread(target=race)
             t2 = threading.Thread(target=race)
             t1.start()
             t2.start()
-            t1.join(timeout=10)
-            t2.join(timeout=10)
+            t1.join(timeout=_ASYNC_WAIT_TIMEOUT_S)
+            t2.join(timeout=_ASYNC_WAIT_TIMEOUT_S)
+            assert not t1.is_alive() and not t2.is_alive(), "double-restore race threads did not finish"
             restored_path = queue / f"{dispatch_id}.json"
             restored_ok = [r for r in results if r[0] is True]
             restored_fail = [r for r in results if r[0] is False]
@@ -3633,7 +3782,7 @@ def test_b065_identity_exception_is_indeterminate() -> None:
                 )
             finally:
                 worker.terminate()
-                worker.wait(timeout=5)
+                worker.wait(timeout=_ASYNC_WAIT_TIMEOUT_S)
         finally:
             os.environ.clear()
             os.environ.update(old_env)

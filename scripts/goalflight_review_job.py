@@ -41,6 +41,27 @@ def _now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+def _commit_early_terminal(payload: dict, *, project_root: str) -> None:
+    """Journal-first terminalization for review failures before launch setup."""
+    state = str(payload.get("state") or "failed")
+    result = goalflight_ledger.commit_terminal_authority(
+        {
+            "dispatch_id": str(payload["dispatch_id"]),
+            "project_root": project_root,
+        },
+        state=state,
+        reason=payload.get("reason") or payload.get("error"),
+        worker_still_alive=False,
+    )
+    if result.committed:
+        return
+    payload["terminal_pending_state"] = state
+    payload["state"] = "terminal_pending"
+    payload["terminal_commit_error"] = (
+        f"journal terminal emitter returned {result.disposition.value}: {result.reason}"
+    )
+
+
 def _file_size(path: Path | None) -> int:
     if path is None or not path.exists():
         return 0
@@ -581,6 +602,7 @@ def main(argv: list[str] | None = None) -> int:
             "stderr_path": str(stderr_path),
             "final_path": str(final_path) if final_path else None,
         }
+        _commit_early_terminal(payload, project_root=args.repo)
         write_status(status_path, payload)
         print(json.dumps(payload, sort_keys=True) if args.json else f"{args.name}: blocked_windows_dispatch status={status_path}")
         return 2
@@ -671,6 +693,7 @@ def main(argv: list[str] | None = None) -> int:
             "stderr_path": str(stderr_path),
             "final_path": str(final_path) if final_path else None,
         }
+        _commit_early_terminal(payload, project_root=args.repo)
         write_status(status_path, payload)
         if args.json:
             print(json.dumps(payload, sort_keys=True))
@@ -697,6 +720,7 @@ def main(argv: list[str] | None = None) -> int:
             "stderr_path": str(stderr_path),
             "final_path": str(final_path) if final_path else None,
         }
+        _commit_early_terminal(payload, project_root=args.repo)
         write_status(status_path, payload)
         if args.json:
             print(json.dumps(payload, sort_keys=True))
@@ -730,11 +754,76 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(payload, sort_keys=True) if args.json else f"{args.name}: failed status={status_path}")
         return 1
 
+    def record_review_state(state: str, worker_pid: int | None = None) -> None:
+        with contextlib.redirect_stdout(io.StringIO()):
+            code = goalflight_ledger.cmd_record(
+                argparse.Namespace(
+                    dispatch_id=dispatch_id,
+                    prompt_id=args.name,
+                    prompt_path=args.prompt,
+                    agent=args.agent,
+                    transport="file-backed-review",
+                    project_root=args.repo,
+                    controller_pid=os.getpid(),
+                    controller_session_id=None,
+                    controller_label=None,
+                    worker_pid=worker_pid,
+                    acp_session_id=None,
+                    logical_session_id=None,
+                    lease_id=lease_id,
+                    stdout_path=str(stdout_path),
+                    stderr_path=str(stderr_path),
+                    status_path=str(status_path),
+                    state=state,
+                    json=True,
+                )
+            )
+        if code != 0:
+            raise RuntimeError(
+                f"journal attempt transition refused for {dispatch_id}: exit {code}"
+            )
+
+    def finish_review_state(state: str, reason: object) -> int:
+        code = 2
+        for attempt in range(3):
+            with contextlib.redirect_stdout(io.StringIO()):
+                code = goalflight_ledger.cmd_finish(
+                    argparse.Namespace(
+                        dispatch_id=dispatch_id,
+                        state=state,
+                        reason=reason,
+                    )
+                )
+            if code == 0:
+                break
+            if attempt < 2:
+                time.sleep(0.05 * (attempt + 1))
+        return code
+
     started = time.time()
     returncode: int | None = None
-    ledger_recorded = False
+    record_review_state("waiting_capacity")
+    ledger_recorded = True
     with stdout_path.open("w", encoding="utf-8", errors="replace") as stdout_f, stderr_path.open("w", encoding="utf-8", errors="replace") as stderr_f:
         try:
+            record_review_state("starting")
+            attempt_record = json.loads(
+                goalflight_ledger.record_path(dispatch_id).read_text(encoding="utf-8")
+            )
+            cmd = [
+                sys.executable,
+                str(Path(__file__).resolve().parent / "goalflight_launch_worker.py"),
+                "--project-root",
+                str(args.repo),
+                "--attempt-id",
+                str(attempt_record["attempt_id"]),
+                "--launch-token",
+                str(attempt_record["launch_token"]),
+                "--launch-epoch",
+                str(attempt_record["launch_epoch"]),
+                "--",
+                *cmd,
+            ]
             proc = subprocess.Popen(
                 cmd,
                 cwd=args.repo,
@@ -761,34 +850,21 @@ def main(argv: list[str] | None = None) -> int:
                 "stderr_path": str(stderr_path),
                 "final_path": str(final_path) if final_path else None,
             }
+            terminal_code = finish_review_state("failed", payload["error"])
+            if terminal_code != 0:
+                payload["terminal_pending_state"] = "failed"
+                payload["state"] = "terminal_pending"
+                payload["terminal_commit_error"] = (
+                    f"journal terminal emitter exited {terminal_code}"
+                )
             write_status(status_path, payload)
             if lease_id:
                 with contextlib.redirect_stdout(io.StringIO()):
                     goalflight_capacity.cmd_release(argparse.Namespace(lease_id=lease_id, state="failed", reason=payload["error"], keep=True))
             print(json.dumps(payload, sort_keys=True) if args.json else f"{args.name}: failed status={status_path}")
             return 1
-        with contextlib.redirect_stdout(io.StringIO()):
-            goalflight_ledger.cmd_record(
-                argparse.Namespace(
-                    dispatch_id=dispatch_id,
-                    prompt_id=args.name,
-                    prompt_path=args.prompt,
-                    agent=args.agent,
-                    transport="file-backed-review",
-                    project_root=args.repo,
-                    controller_pid=os.getpid(),
-                    worker_pid=proc.pid,
-                    acp_session_id=None,
-                    logical_session_id=None,
-                    lease_id=lease_id,
-                    stdout_path=str(stdout_path),
-                    stderr_path=str(stderr_path),
-                    status_path=str(status_path),
-                    state="running",
-                    json=True,
-                )
-            )
-        ledger_recorded = True
+        goalflight_ledger.wait_attempt_running(args.repo, dispatch_id)
+        record_review_state("running", proc.pid)
         payload = {
             "schema": "goalflight.review-job.v1",
             "dispatch_id": dispatch_id,
@@ -881,21 +957,26 @@ def main(argv: list[str] | None = None) -> int:
         payload["error"] = failure_error
     else:
         payload.pop("error", None)
-    write_status(status_path, payload)
     if ledger_recorded:
-        with contextlib.redirect_stdout(io.StringIO()):
-            goalflight_ledger.cmd_finish(argparse.Namespace(dispatch_id=dispatch_id, state=state, reason=payload.get("error")))
+        terminal_code = finish_review_state(state, payload.get("error"))
+        if terminal_code != 0:
+            payload["terminal_pending_state"] = state
+            payload["state"] = "terminal_pending"
+            payload["terminal_commit_error"] = (
+                f"journal terminal emitter exited {terminal_code}"
+            )
+    write_status(status_path, payload)
     if lease_id:
         with contextlib.redirect_stdout(io.StringIO()):
-            goalflight_capacity.cmd_release(argparse.Namespace(lease_id=lease_id, state=state, reason=payload.get("error"), keep=True))
+            goalflight_capacity.cmd_release(argparse.Namespace(lease_id=lease_id, state=payload["state"], reason=payload.get("error"), keep=True))
     if state == "blocked_session_limit":
         with contextlib.redirect_stdout(io.StringIO()):
             goalflight_capacity.cmd_cooldown(argparse.Namespace(action="set", agent=args.agent, seconds=3600, reason="session_limit"))
     if args.json:
         print(json.dumps(payload, sort_keys=True))
     else:
-        print(f"{args.name}: {state} rc={returncode} status={status_path}")
-    return 0 if state == "complete" else 1
+        print(f"{args.name}: {payload['state']} rc={returncode} status={status_path}")
+    return 0 if payload["state"] == "complete" else 1
 
 
 if __name__ == "__main__":

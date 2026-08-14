@@ -6,6 +6,53 @@ incremented when meaningful skill behaviour changes.
 
 ## [Unreleased]
 
+### Added
+
+- The terminal outbox: a dispatch's terminal state, its state transition and the
+  outbox row that announces it are now written in one transaction, so a terminal
+  state can no longer exist without the event that tells anyone about it. Launches
+  carry an attempt identity through `PREPARED -> STARTING -> RUNNING` with a
+  compare-and-swap, and attempt rows are inserted before launch, so a crash
+  between insert and exec is recoverable instead of invisible.
+- The journal's terminal-commit API is now the single emitter. All five places
+  that used to classify a worker as finished — the watcher, the ACP runner, the
+  ACP client's stuck-worker reaper, review jobs, and the quota/drain/status
+  reconcilers — call it instead of writing terminal state themselves. Two
+  components classifying the same worker is how a false death got a second vote.
+- An exhaustive message-type table: every type carries its wake class, whether it
+  requires a claim, its orphan disposition and its retention.
+
+### Changed
+
+- Escalation now applies the terminal path's quote, fence and position guards, so
+  a marker quoted inside a worker's own output is no longer ingested as a real
+  escalation.
+- Waiters no longer classify dead or stalled workers; the watcher is the sole
+  classifier.
+- Message types outside the registry are refused at every ingress, with explicit
+  compatibility for the vocabulary already in use so existing senders keep
+  working. A new, unregistered type fails visibly and requires a registry entry —
+  the intended failure mode.
+
+### Fixed
+
+- Restoring a journal snapshot fences against the live journal's epoch, so an
+  older build can no longer destructively downgrade a newer database.
+- Carrier corruption is now itself a waking event rather than only a warning on
+  stderr, so a controller blocked on a listener is no longer left asleep by it.
+- Value validation rejects a boolean or float where an integer schema version is
+  required (in Python `True == 1` and `1.0 == 1`, so all three previously passed)
+  and bounds an addressee label by its raw length rather than its stripped one.
+- A stream's first append fsyncs its parent directory, so an acknowledged record
+  cannot vanish with the directory entry after power loss; a directory fsync that
+  fails is now visible instead of silently reporting success.
+- Dispatch launch reads its attempt identity from the journal rather than the
+  derived `runs.d` projection, so a launch no longer dies with a missing-file
+  error when the projection has not been written yet.
+- Queue tests synchronise on real conditions — worker exit, published status,
+  the watcher's final record — instead of fixed sleeps. They were passing on an
+  idle machine and failing under load at a measured 43.75%.
+
 ## [1.4.0] — 2026-08-13
 
 ### Added

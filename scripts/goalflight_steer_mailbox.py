@@ -19,6 +19,12 @@ STEER_ACK_RE = goalflight_terminal.STEER_ACK_RE
 TO_WORKER = "controller_to_worker"
 TO_CONTROLLER = "worker_to_controller"
 STEER_DIRECTIONS = frozenset({TO_WORKER, TO_CONTROLLER})
+STEERING_KIND = "steering"
+USER_CONFIRM_KIND = "user_confirm"
+LEGACY_STEER_KIND_ALIASES = {
+    "steer": STEERING_KIND,
+    "user_confirm_reply": USER_CONFIRM_KIND,
+}
 
 
 def steer_file(dispatch_id: str, state_dir: Path | str | None = None) -> Path:
@@ -54,6 +60,8 @@ def _normalize_steer_item(item: object) -> dict:
     for key in ("dispatch_id", "kind", "question_id", "reply_to", "decision", "context"):
         value = item.get(key)
         if value is not None:
+            if key == "kind" and isinstance(value, str):
+                value = LEGACY_STEER_KIND_ALIASES.get(value, value)
             entry[key] = value
     return entry
 
@@ -118,7 +126,7 @@ def append_steer_entry(
     seq: int | None = None,
     direction: str = TO_WORKER,
     dispatch_id: str | None = None,
-    kind: str = "steer",
+    kind: str = STEERING_KIND,
     question_id: str | None = None,
     reply_to: str | None = None,
     decision: str | None = None,
@@ -126,6 +134,7 @@ def append_steer_entry(
 ) -> dict:
     if direction not in STEER_DIRECTIONS:
         raise ValueError(f"unsupported steer direction: {direction!r}")
+    kind = LEGACY_STEER_KIND_ALIASES.get(kind, kind)
     messages = _carrier_module()
     with messages.carrier_transaction(path) as carrier:
         existing = _parse_steer_carrier(carrier.path, carrier.read_bytes())
@@ -135,11 +144,10 @@ def append_steer_entry(
             "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "awake_mono_ns": int(active_monotonic() * 1_000_000_000),
             "text": message,
+            "kind": kind,
         }
         if direction != TO_WORKER:
             entry["direction"] = direction
-        if kind != "steer":
-            entry["kind"] = kind
         if dispatch_id:
             entry["dispatch_id"] = dispatch_id
         if question_id:
@@ -192,7 +200,7 @@ def append_steer_message(
     decision: str | None = None,
 ) -> tuple[Path, dict]:
     path = steer_file(dispatch_id)
-    kind = "user_confirm_reply" if reply_to else "steer"
+    kind = USER_CONFIRM_KIND if reply_to else STEERING_KIND
     return path, append_steer_entry(
         path,
         text,
@@ -217,7 +225,7 @@ def append_user_confirm(
         text,
         direction=TO_CONTROLLER,
         dispatch_id=dispatch_id,
-        kind="user_confirm",
+        kind=USER_CONFIRM_KIND,
         question_id=question_id,
         context=context,
     )
@@ -287,6 +295,6 @@ def list_steer_messages(dispatch_id: str, record: dict) -> int:
         print(
             f"{entry['seq']}\t{entry['ts']}\t"
             f"{str(deliverable and entry['seq'] in acked).lower()}\t{entry['text']}\t"
-            f"{entry.get('direction', TO_WORKER)}\t{entry.get('kind', 'steer')}"
+            f"{entry.get('direction', TO_WORKER)}\t{entry.get('kind', STEERING_KIND)}"
         )
     return 0

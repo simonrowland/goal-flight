@@ -72,6 +72,7 @@ import goalflight_dispatch_paths
 import goalflight_dispatch_states
 import goalflight_steer_mailbox
 import goalflight_ledger
+import goalflight_journal
 import goalflight_quota_stuck
 import goalflight_session_status
 import goalflight_terminal
@@ -3390,7 +3391,7 @@ def _record_ledger(args, *, project_root: Path, prompt_path: str | None, status_
                    codex_home: str | None = None,
                    request_envelope: dict | None = None) -> None:
     with contextlib.redirect_stdout(io.StringIO()):
-        goalflight_ledger.cmd_record(
+        record_code = goalflight_ledger.cmd_record(
             argparse.Namespace(
                 dispatch_id=args.dispatch_id,
                 prompt_id=None,
@@ -3433,10 +3434,50 @@ def _record_ledger(args, *, project_root: Path, prompt_path: str | None, status_
                 json=True,
             )
         )
+    if record_code != 0:
+        raise RuntimeError(
+            f"journal attempt transition refused for {args.dispatch_id}: exit {record_code}"
+        )
     _export_dashboard_status_for_project(project_root)
     _upsert_project_registry_for_dispatch(project_root)
     if state in {"waiting_capacity", "starting", "running"}:
         _start_dashboard_refresh_for_project(project_root)
+
+
+def _attempt_claiming_worker_argv(
+    project_root: Path,
+    dispatch_id: str,
+    worker_argv: list[str],
+) -> tuple[list[str], bool]:
+    if not os.path.lexists(goalflight_journal.resolve_journal_path(project_root)):
+        # Embedders can replace the ledger-recording seam when they own launch
+        # tracking. Preserve that pre-P2 seam without bootstrapping authority
+        # behind the embedding's back.
+        return worker_argv, False
+    attempt = goalflight_journal.Journal(project_root).attempt_for_dispatch(dispatch_id)
+    if attempt is None:
+        raise RuntimeError(f"prepared attempt missing for {dispatch_id}")
+    if attempt.lifecycle_state != goalflight_journal.ATTEMPT_STARTING:
+        raise RuntimeError(
+            f"prepared attempt {attempt.attempt_id} is {attempt.lifecycle_state}, expected STARTING"
+        )
+    return (
+        [
+            sys.executable,
+            str(SCRIPT_DIR / "goalflight_launch_worker.py"),
+            "--project-root",
+            str(project_root),
+            "--attempt-id",
+            attempt.attempt_id,
+            "--launch-token",
+            attempt.launch_token,
+            "--launch-epoch",
+            str(attempt.launch_epoch),
+            "--",
+            *worker_argv,
+        ],
+        True,
+    )
 
 
 def _record_queued_ledger_fast(args, *, project_root: Path, prompt_path: str | None, status_json: Path, tail: Path) -> None:
@@ -3700,7 +3741,54 @@ def _cleanup_partial_submit(queue_path: Path, status_json: Path) -> None:
             tmp.unlink()
 
 
+_TEST_RELEASE_TIMEOUT_S = 30.0
+
+
+def _test_signal_file(env_name: str, value: str) -> Path | None:
+    if os.environ.get("GOALFLIGHT_TEST_MODE") != "1":
+        return None
+    raw = os.environ.get(env_name)
+    if not raw:
+        return None
+    path = Path(raw)
+    path.write_text(value, encoding="utf-8")
+    return path
+
+
+def _test_wait_for_release(
+    *,
+    ready_env: str,
+    release_env: str,
+    label: str,
+    ready_value: str | None = None,
+) -> bool:
+    if os.environ.get("GOALFLIGHT_TEST_MODE") != "1":
+        return False
+    release_raw = os.environ.get(release_env)
+    if not release_raw:
+        return False
+    ready_path = _test_signal_file(ready_env, ready_value if ready_value is not None else label)
+    if ready_path is None:
+        raise RuntimeError(f"{label} test release barrier missing ready path")
+    release_path = Path(release_raw)
+    deadline = time.monotonic() + _TEST_RELEASE_TIMEOUT_S
+    while not release_path.exists():
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"{label} test release barrier timed out after {_TEST_RELEASE_TIMEOUT_S:.0f}s; "
+                f"ready={ready_path} release={release_path}"
+            )
+        time.sleep(0.01)
+    return True
+
+
 def _test_submit_status_delay() -> None:
+    if _test_wait_for_release(
+        ready_env="GOALFLIGHT_TEST_SUBMIT_STATUS_READY_FILE",
+        release_env="GOALFLIGHT_TEST_SUBMIT_STATUS_RELEASE_FILE",
+        label="submit status",
+    ):
+        return
     raw = os.environ.get("GOALFLIGHT_TEST_SUBMIT_STATUS_DELAY_S")
     if not raw:
         return
@@ -4685,7 +4773,7 @@ def _finish_ledger(
     worker_still_alive: bool | None = None,
 ) -> None:
     with contextlib.redirect_stdout(io.StringIO()):
-        goalflight_ledger.cmd_finish(
+        code = goalflight_ledger.cmd_finish(
             argparse.Namespace(
                 dispatch_id=dispatch_id,
                 state=state,
@@ -4695,6 +4783,8 @@ def _finish_ledger(
                 worker_still_alive=worker_still_alive,
             )
         )
+    if code != 0:
+        raise RuntimeError(f"journal terminal emitter exited {code} for {dispatch_id}")
 
 
 def _release_capacity(lease_id: str | None, state: str, reason: str | None) -> None:
@@ -5065,6 +5155,19 @@ def _commit_abandoned_dispatch(
     terminal_state = goalflight_ledger.terminal_state_for(state, reason)
     if terminal_state in {"", "unknown", "watcher_stopped"}:
         raise ValueError(f"abandoned reconciliation produced non-terminal state: {state}")
+    committed = goalflight_ledger.commit_terminal_authority(
+        record,
+        state=state,
+        reason=reason,
+        terminal_state=terminal_state,
+        worker_still_alive=False,
+    )
+    if not committed.committed or committed.value is None:
+        raise RuntimeError(
+            f"terminal journal commit {committed.disposition.value}: {committed.reason}"
+        )
+    winner = committed.value
+    terminal_state = winner.terminal_state
     ended_at = goalflight_ledger.utc_now()
     basis = "observed_terminal_marker" if marker is not None else "inferred_abandonment"
     reconciliation = {
@@ -5098,6 +5201,9 @@ def _commit_abandoned_dispatch(
             },
         }
     )
+    record["attempt_id"] = winner.attempt_id
+    record["transition_id"] = winner.transition_id
+    record["terminal_event_uuid"] = winner.event_uuid
     record.pop("error", None)
     elapsed_s = goalflight_ledger.elapsed_seconds(record, ended_at)
     if elapsed_s is not None:
@@ -7670,6 +7776,22 @@ def commit_reconciled_terminal(
 
     existing_terminal = goalflight_ledger._terminal_key(record)
     if existing_terminal not in {"", "unknown", "watcher_stopped"}:
+        committed = goalflight_ledger.commit_terminal_authority(
+            record,
+            state=str(record.get("state") or existing_terminal),
+            reason=record.get("reason") or record.get("error"),
+            terminal_state=existing_terminal,
+            worker_still_alive=record.get("worker_still_alive"),
+        )
+        if not committed.committed or committed.value is None:
+            return TerminalCommitResult(TerminalCommitKind.DEFERRED, None, False)
+        record["attempt_id"] = committed.value.attempt_id
+        record["transition_id"] = committed.value.transition_id
+        record["terminal_event_uuid"] = committed.value.event_uuid
+        try:
+            goalflight_ledger.write_record(record)
+        except Exception:
+            return TerminalCommitResult(TerminalCommitKind.DEFERRED, None, False)
         return TerminalCommitResult(
             TerminalCommitKind.EXISTING_TERMINAL,
             str(record.get("state") or existing_terminal),
@@ -7688,6 +7810,18 @@ def commit_reconciled_terminal(
     terminal_state = goalflight_ledger.terminal_state_for(state, reason)
     if terminal_state in {"", "unknown", "watcher_stopped"}:
         return TerminalCommitResult(TerminalCommitKind.DEFERRED, None, False)
+
+    committed = goalflight_ledger.commit_terminal_authority(
+        record,
+        state=state,
+        reason=reason,
+        terminal_state=terminal_state,
+        worker_still_alive=False,
+    )
+    if not committed.committed or committed.value is None:
+        return TerminalCommitResult(TerminalCommitKind.DEFERRED, None, False)
+    winner = committed.value
+    terminal_state = winner.terminal_state
 
     ended_at = goalflight_ledger.utc_now()
     record.update(
@@ -7717,6 +7851,9 @@ def commit_reconciled_terminal(
     if envelope:
         record.update(envelope)
         record["outcome"].update(envelope)
+    record["attempt_id"] = winner.attempt_id
+    record["transition_id"] = winner.transition_id
+    record["terminal_event_uuid"] = winner.event_uuid
     try:
         goalflight_ledger.write_record(record)
     except Exception:
@@ -8256,6 +8393,10 @@ def _drain_queue_once(args) -> dict:
         claim_error: Exception | None = None
         entry: dict | None = None
         launch_token = _queue_launch_token()
+        _test_signal_file(
+            "GOALFLIGHT_TEST_DRAIN_BEFORE_CLAIM_FILE",
+            str(path),
+        )
         with _queue_mutation_lock(queue_dir):
             claim = _claim_queue_entry(path)
             if claim is not None:
@@ -8693,62 +8834,6 @@ def _apply_max_idle_default(args) -> None:
         args.max_idle_secs = _default_max_idle_secs(args)
 
 
-def _record_test_acp_running_fast(
-    args,
-    *,
-    project_root: Path,
-    prompt_path: str | None,
-    status_json: Path,
-    tail: Path,
-    worker_pid: int,
-) -> None:
-    now = goalflight_ledger.utc_now()
-    record = {
-        "schema": goalflight_ledger.SCHEMA,
-        "dispatch_id": args.dispatch_id,
-        "prompt_id": None,
-        "prompt_path": prompt_path,
-        "prompt_sha256": goalflight_ledger.sha256_file(prompt_path),
-        "agent": args.agent,
-        "engine": _account_engine(args.agent) or args.agent,
-        "shape": "acp",
-        "account": args.account or "default",
-        "transport": "dispatch",
-        "project_root": str(project_root),
-        "controller_pid": _controller_pid(args),
-        "controller_session_id": _controller_session_id(args),
-        "controller_label": _controller_label(args),
-        "controller_identity": None,
-        "worker_pid": worker_pid,
-        "worker_identity": None,
-        "worker_pgid": None,
-        "acp_session_id": None,
-        "logical_session_id": args.dispatch_id,
-        "lease_id": None,
-        "remote_lease_id": None,
-        "stdout_path": str(tail),
-        "stderr_path": None,
-        "status_path": str(status_json),
-        "os_sandbox": {"shape": "acp", "read_only": bool(args.read_only)},
-        "state": "running",
-        "terminal_state": goalflight_ledger.terminal_state_for("running"),
-        "started_at": now,
-        "hostname": socket.gethostname(),
-    }
-    if getattr(args, "queue_launch_token", None):
-        record["queue_launch_token"] = args.queue_launch_token
-    with goalflight_ledger.StateLock():
-        path = goalflight_ledger.record_path(args.dispatch_id)
-        if path.exists():
-            try:
-                existing = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                existing = {}
-            if existing.get("started_at"):
-                record["started_at"] = existing["started_at"]
-        goalflight_ledger.write_record(record)
-
-
 def _run_test_acp_shape_if_requested(args, *, base: Path, status_json: Path, tail_path: Path) -> int | None:
     marker_path = goalflight_compat.allowed_env_override(
         "GOALFLIGHT_TEST_ACP_DISPATCH_COMPLETE_FILE",
@@ -8762,13 +8847,39 @@ def _run_test_acp_shape_if_requested(args, *, base: Path, status_json: Path, tai
     tail_path.parent.mkdir(parents=True, exist_ok=True)
     with tail_path.open("ab") as tail_f:
         tail_f.write(b"COMPLETE: test acp dispatch\n")
-    _record_test_acp_running_fast(
+    prompt_path = str(Path(args.prompt_file).expanduser()) if args.prompt_file else None
+    for lifecycle_state in ("waiting_capacity", "starting"):
+        _record_ledger(
+            args,
+            project_root=project_root,
+            prompt_path=prompt_path,
+            status_json=status_json,
+            tail=tail_path,
+            lease_id=None,
+            worker_pid=None,
+            state=lifecycle_state,
+        )
+    authority = goalflight_journal.Journal(project_root)
+    attempt = authority.attempt_for_dispatch(str(args.dispatch_id))
+    if attempt is None:
+        raise RuntimeError(f"prepared test attempt missing for {args.dispatch_id}")
+    running = authority.mark_attempt_running(
+        attempt.attempt_id,
+        attempt.launch_token,
+        launch_epoch=attempt.launch_epoch,
+        worker_instance=goalflight_ledger.process_identity(worker_pid) or {"pid": worker_pid},
+    )
+    if not running.committed:
+        raise RuntimeError(f"test attempt RUNNING CAS lost: {running.reason}")
+    _record_ledger(
         args,
         project_root=project_root,
-        prompt_path=str(Path(args.prompt_file).expanduser()) if args.prompt_file else None,
+        prompt_path=prompt_path,
         status_json=status_json,
         tail=tail_path,
+        lease_id=None,
         worker_pid=worker_pid,
+        state="running",
     )
     sleep_after_running_s = 0.0
     with contextlib.suppress(ValueError):
@@ -8780,7 +8891,12 @@ def _run_test_acp_shape_if_requested(args, *, base: Path, status_json: Path, tai
             )
             or 0.0
         )
-    if sleep_after_running_s > 0:
+    release_path = goalflight_compat.allowed_env_override(
+        "GOALFLIGHT_TEST_ACP_DISPATCH_RELEASE_FILE",
+        "",
+        test_mode=True,
+    )
+    if sleep_after_running_s > 0 or release_path:
         write_status(
             status_json,
             {
@@ -8799,9 +8915,25 @@ def _run_test_acp_shape_if_requested(args, *, base: Path, status_json: Path, tai
         )
         _export_dashboard_status_for_project(project_root)
         _start_dashboard_refresh_for_project(project_root)
-        with contextlib.suppress(Exception):
-            Path(marker_path).write_text(str(worker_pid), encoding="utf-8")
-        time.sleep(sleep_after_running_s)
+        if release_path:
+            os.environ["GOALFLIGHT_TEST_ACP_DISPATCH_READY_FILE"] = marker_path
+            _test_wait_for_release(
+                ready_env="GOALFLIGHT_TEST_ACP_DISPATCH_READY_FILE",
+                release_env="GOALFLIGHT_TEST_ACP_DISPATCH_RELEASE_FILE",
+                label="ACP dispatch",
+                ready_value=str(worker_pid),
+            )
+        else:
+            with contextlib.suppress(Exception):
+                Path(marker_path).write_text(str(worker_pid), encoding="utf-8")
+            time.sleep(sleep_after_running_s)
+    _finish_ledger(
+        str(args.dispatch_id),
+        "complete",
+        None,
+        elapsed_s=0.0,
+        worker_still_alive=False,
+    )
     write_status(
         status_json,
         {
@@ -9790,6 +9922,11 @@ def main(argv: list[str] | None = None) -> int:
             worker_argv = _guard_codex_context_mode_disable(worker_argv, env)
 
         _mark_queue_claim_worker_spawn_intent(args)
+        worker_argv, wait_for_worker_claim = _attempt_claiming_worker_argv(
+            project_root,
+            str(args.dispatch_id),
+            worker_argv,
+        )
         worker_pid = _spawn_daemonized_process(
             worker_argv,
             env=env,
@@ -9855,6 +9992,11 @@ def main(argv: list[str] | None = None) -> int:
             registration_errors.append(_registration_error("write_pidfile", e))
             pidfile = None
         try:
+            if wait_for_worker_claim:
+                goalflight_ledger.wait_attempt_running(
+                    project_root,
+                    str(args.dispatch_id),
+                )
             _record_ledger(
                 args,
                 project_root=project_root,

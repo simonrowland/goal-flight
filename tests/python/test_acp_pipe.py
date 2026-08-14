@@ -18,6 +18,7 @@ import stat
 import sys
 import tempfile
 import time
+import uuid
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -446,7 +447,10 @@ async def _run_fake_runner_scenario(
             os.environ["GOAL_FLIGHT_PIDFILE_DIR"] = str(tmp_path / "pids")
             _write_supported_adapter_manifest(tmp_path, "fake-runner")
             status_path = tmp_path / "status.json"
-            dispatch_id = f"test-{scenario}-{os.getpid()}"
+            # Journal authority makes a dispatch id a single-attempt identity.
+            # This helper runs the same scenario more than once in one module,
+            # so every invocation must model a new dispatch.
+            dispatch_id = f"test-{scenario}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
             payload = await goalflight_acp_run.run(
                 argparse.Namespace(
                     agent="fake-runner",

@@ -961,7 +961,6 @@ def test_wait_explicit_id_uses_drain_status_identity_across_scope() -> None:
                     project_root="/repo/controller-worktree",
                     timeout_s=0.1,
                     poll_s=0.01,
-                    crash_grace_s=0.0,
                 )
             text = out.getvalue()
             check("drain live wait times out instead of worker_dead", rc == 1)
@@ -978,7 +977,7 @@ def test_wait_explicit_id_uses_drain_status_identity_across_scope() -> None:
             S.time.monotonic = orig_monotonic
 
 
-def test_wait_dead_drain_status_identity_still_verdicts_worker_dead() -> None:
+def test_wait_dead_drain_status_identity_does_not_cast_second_verdict() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         status_path = Path(tmp) / "drain-dead.status.json"
         status_path.write_text(
@@ -1018,39 +1017,17 @@ def test_wait_dead_drain_status_identity_still_verdicts_worker_dead() -> None:
                 "surplus_processes": [],
             },
         }
-        orig_payload = S.status_payload
-        orig_read_records = S.goalflight_ledger.read_records
         orig_identity_matches = S.goalflight_ledger.identity_matches
         orig_pid_alive = S.goalflight_compat.pid_alive
-        orig_sleep = S.time.sleep
-        orig_monotonic = S.time.monotonic
-        times = iter([0.0, 0.0])
         try:
-            S.status_payload = lambda: machine_payload
-            S.goalflight_ledger.read_records = lambda: []
             S.goalflight_compat.pid_alive = lambda _pid: False
             S.goalflight_ledger.identity_matches = lambda _record: (False, "dead")
-            S.time.sleep = lambda _seconds: None
-            S.time.monotonic = lambda: next(times)
-            out = io.StringIO()
-            with redirect_stdout(out):
-                rc = S.wait_for_dispatches(
-                    ["drain-dead"],
-                    project_root="/repo/controller-worktree",
-                    timeout_s=0.1,
-                    poll_s=0.01,
-                    crash_grace_s=0.0,
-                )
-            text = out.getvalue()
-            check("dead drain wait exits terminal", rc == 0)
-            check("dead drain wait reports worker_dead", "drain-dead -> worker_dead" in text)
+            rows = S._wait_snapshot(machine_payload, ["drain-dead"], now=0.0)
+            check("wait leaves dead observation nonterminal", rows[0]["terminal"] is False)
+            check("wait does not cast worker_dead verdict", rows[0]["state"] != "worker_dead")
         finally:
-            S.status_payload = orig_payload
-            S.goalflight_ledger.read_records = orig_read_records
             S.goalflight_ledger.identity_matches = orig_identity_matches
             S.goalflight_compat.pid_alive = orig_pid_alive
-            S.time.sleep = orig_sleep
-            S.time.monotonic = orig_monotonic
 
 
 def main() -> int:
@@ -1072,7 +1049,7 @@ def main() -> int:
     test_wait_keyboard_interrupt_returns_130_without_signal()
     test_wait_snapshot_uses_single_liveness_result()
     test_wait_explicit_id_uses_drain_status_identity_across_scope()
-    test_wait_dead_drain_status_identity_still_verdicts_worker_dead()
+    test_wait_dead_drain_status_identity_does_not_cast_second_verdict()
     if _FAILS:
         print(f"\n{len(_FAILS)} FAILED: {_FAILS}")
         return 1

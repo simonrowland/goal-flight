@@ -73,11 +73,14 @@ def _stub_bash_launch(
     failure_phase: str | None = None,
     cleanups: list[str] | None = None,
     foreground: bool = False,
+    persist_ledger: bool = True,
+    drop_starting_projection: bool = False,
 ) -> tuple[dict, list[dict]]:
     spawn_calls: list[dict] = []
     ledger_calls: list[dict] = []
     ordering: list[str] = []
     resolve_accounts: list[str | None] = []
+    real_record_ledger = D._record_ledger
 
     def resolve_seat(_project_root, explicit_account, _dispatch_id):
         ordering.append("resolve")
@@ -110,6 +113,15 @@ def _stub_bash_launch(
         ledger_calls.append(dict(kwargs))
         if failure_phase == "pre_spawn" and kwargs["state"] == "starting":
             raise RuntimeError("pre-spawn failure")
+        if persist_ledger:
+            # P2 prepares the journal attempt in this call; the worker-launch
+            # wrapper needs that durable identity before it can claim RUNNING.
+            real_record_ledger(*_args, **kwargs)
+            if drop_starting_projection and kwargs["state"] == "starting":
+                D.goalflight_ledger.record_path(
+                    _args[0].dispatch_id,
+                    create=False,
+                ).unlink()
 
     monkeypatch.setattr(D, "_record_ledger", record_ledger)
     monkeypatch.setattr(D, "_reap_quota_stuck_before_bash_launch", lambda: None)
@@ -148,7 +160,20 @@ def _stub_bash_launch(
                 "label": kwargs.get("label"),
             }
         )
-        return 41000 + len(spawn_calls)
+        pid = 41000 + len(spawn_calls)
+        if kwargs.get("label") == "worker" and "--attempt-id" in argv:
+            project_root = argv[argv.index("--project-root") + 1]
+            attempt_id = argv[argv.index("--attempt-id") + 1]
+            launch_token = argv[argv.index("--launch-token") + 1]
+            launch_epoch = int(argv[argv.index("--launch-epoch") + 1])
+            claimed = D.goalflight_journal.Journal(project_root).mark_attempt_running(
+                attempt_id,
+                launch_token,
+                launch_epoch=launch_epoch,
+                worker_instance={"pid": pid, "source": "dispatch-seam-test-spawn"},
+            )
+            assert claimed.committed, claimed
+        return pid
 
     monkeypatch.setattr(D, "_spawn_daemonized_process", fake_spawn)
     argv = [
@@ -206,6 +231,46 @@ def test_bash_pin_is_applied_after_capacity_and_reaches_spawn(
     ] == ["seat-a", "seat-a"]
 
 
+def test_bash_launch_survives_missing_starting_ledger_projection(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    worker_spawn, ledger_calls = _stub_bash_launch(
+        monkeypatch,
+        tmp_path,
+        resolved=(None, None),
+        drop_starting_projection=True,
+        foreground=True,
+    )
+
+    assert worker_spawn["label"] == "worker"
+    assert [call["state"] for call in ledger_calls] == [
+        "waiting_capacity",
+        "starting",
+        "running",
+    ]
+
+
+def test_bash_launch_preserves_nonpersisting_ledger_injection_seam(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    worker_spawn, ledger_calls = _stub_bash_launch(
+        monkeypatch,
+        tmp_path,
+        resolved=(None, None),
+        persist_ledger=False,
+        foreground=True,
+    )
+
+    assert worker_spawn["argv"] == [sys.executable, "-c", "pass"]
+    assert [call["state"] for call in ledger_calls] == [
+        "waiting_capacity",
+        "starting",
+        "running",
+    ]
+
+
 def test_bash_resolve_none_preserves_inherited_environment(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -229,7 +294,9 @@ def test_bash_ext_absent_preserves_spawn_and_stays_quiet(
         resolved=(None, None),
         api_missing=True,
     )
-    assert worker_spawn["argv"] == [sys.executable, "-c", "pass"]
+    worker_argv = worker_spawn["argv"]
+    assert Path(worker_argv[1]).name == "goalflight_launch_worker.py"
+    assert worker_argv[-3:] == [sys.executable, "-c", "pass"]
     assert "CODEX_HOME" not in worker_spawn["env"]
     assert all(call.get("effective_account") is None for call in ledger_calls)
     assert "per-dispatch home" not in capsys.readouterr().err

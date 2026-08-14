@@ -699,7 +699,11 @@ def test_scaffold_project_state_backfills_derivable_inflight_ledger_task_ids() -
                             "status_path": None,
                             "os_sandbox_json": None,
                             "queue_launch_token": None,
-                            "state": "running",
+                            # P2 requires the worker process to claim RUNNING in
+                            # the journal. This migration test needs only an
+                            # in-flight compatibility record, so STARTING is the
+                            # truthful pre-claim state.
+                            "state": "starting",
                             "json": True,
                         },
                     )()

@@ -21,6 +21,7 @@ DISPATCH = SCRIPTS / "goalflight_dispatch.py"
 sys.path.insert(0, str(SCRIPTS))
 
 import goalflight_dispatch  # noqa: E402
+import goalflight_journal  # noqa: E402
 import goalflight_ledger  # noqa: E402
 import goalflight_steer_mailbox  # noqa: E402
 import goalflight_terminal  # noqa: E402
@@ -78,8 +79,9 @@ def _record(
 ) -> None:
     status_path = status_path or (tmp / f"{dispatch_id}.status.json")
     with _state_dir(tmp), contextlib.redirect_stdout(io.StringIO()):
-        goalflight_ledger.cmd_record(
-            argparse.Namespace(
+        def record_state(state: str) -> int:
+            return goalflight_ledger.cmd_record(
+                argparse.Namespace(
                 dispatch_id=dispatch_id,
                 prompt_id=None,
                 prompt_path=None,
@@ -98,10 +100,22 @@ def _record(
                 stderr_path=None,
                 status_path=str(status_path),
                 os_sandbox_json=json.dumps({"shape": shape}, sort_keys=True),
-                state="running",
+                state=state,
                 json=True,
             )
         )
+        assert record_state("waiting_capacity") == 0
+        assert record_state("starting") == 0
+        authority = goalflight_journal.Journal(ROOT)
+        attempt = authority.attempt_for_dispatch(dispatch_id)
+        assert attempt is not None
+        assert authority.mark_attempt_running(
+            attempt.attempt_id,
+            attempt.launch_token,
+            launch_epoch=attempt.launch_epoch,
+            worker_instance={"pid": worker_pid or os.getpid(), "source": "steer-test"},
+        ).committed
+        assert record_state("running") == 0
 
 
 def _run_steer(tmp: Path, *args: str) -> subprocess.CompletedProcess[str]:

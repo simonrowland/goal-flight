@@ -37,6 +37,15 @@ import goalflight_acp_client  # noqa: E402
 import goalflight_rate_pressure  # noqa: E402
 
 
+def _isolate_state_env(env: dict[str, str], base: Path) -> None:
+    env["GOALFLIGHT_STATE_DIR"] = str(base / "state")
+    env["GOALFLIGHT_TASK_STORE_DIR"] = str(base / "task-store")
+    env["GOALFLIGHT_JOURNAL_DIR"] = str(base / "journal")
+    env["GOALFLIGHT_MESSAGES_DIR"] = str(base / "messages")
+    env["GOAL_FLIGHT_PIDFILE_DIR"] = str(base / "pids")
+    env["GOALFLIGHT_CAPACITY_CONF"] = "/dev/null"
+
+
 def _wait_for(predicate, timeout: float = 8.0, interval: float = 0.1) -> bool:
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -76,8 +85,7 @@ def _run(
         tail = Path(tmp) / "tail.txt"
         status = Path(tmp) / "status.json"
         env = os.environ.copy()
-        env["GOALFLIGHT_STATE_DIR"] = str(Path(tmp) / "state")
-        env["GOAL_FLIGHT_PIDFILE_DIR"] = str(Path(tmp) / "pids")
+        _isolate_state_env(env, Path(tmp))
         if confirmed_idle_cpu:
             env["GOALFLIGHT_TEST_MODE"] = "1"
             env["GOALFLIGHT_TEST_PGROUP_CPU_PCT"] = "0.0"
@@ -122,7 +130,7 @@ def _run_dispatch_with_state(dispatch_id: str, worker_code: str, *, max_idle: st
         status = tmp_path / "status.json"
         state_dir = tmp_path / "state"
         env = os.environ.copy()
-        env["GOALFLIGHT_STATE_DIR"] = str(state_dir)
+        _isolate_state_env(env, tmp_path)
         env["GOAL_FLIGHT_PIDFILE_DIR"] = str(tmp_path / "pids")
         proc = subprocess.run(
             [
@@ -226,7 +234,7 @@ def case_post_terminal_idle_worker_times_out_inconclusively() -> None:
         tail = tmp_path / "tail.txt"
         status = tmp_path / "status.json"
         env = os.environ.copy()
-        env["GOALFLIGHT_STATE_DIR"] = str(tmp_path / "state")
+        _isolate_state_env(env, tmp_path)
         env["GOAL_FLIGHT_PIDFILE_DIR"] = str(tmp_path / "pids")
         env["GOALFLIGHT_TEST_MODE"] = "1"
         env["GOALFLIGHT_TEST_PGROUP_CPU_PCT"] = "0.0"
@@ -292,7 +300,7 @@ def case_post_terminal_busy_worker_wait_is_bounded() -> None:
         tail = tmp_path / "tail.txt"
         status = tmp_path / "status.json"
         env = os.environ.copy()
-        env["GOALFLIGHT_STATE_DIR"] = str(tmp_path / "state")
+        _isolate_state_env(env, tmp_path)
         env["GOAL_FLIGHT_PIDFILE_DIR"] = str(tmp_path / "pids")
         env["GOALFLIGHT_TEST_MODE"] = "1"
         env["GOALFLIGHT_TEST_PGROUP_CPU_PCT"] = "50.0"
@@ -363,7 +371,7 @@ def case_post_terminal_delayed_worker_exit_is_observed() -> None:
         tail = tmp_path / "tail.txt"
         status = tmp_path / "status.json"
         env = os.environ.copy()
-        env["GOALFLIGHT_STATE_DIR"] = str(tmp_path / "state")
+        _isolate_state_env(env, tmp_path)
         env["GOAL_FLIGHT_PIDFILE_DIR"] = str(tmp_path / "pids")
         env["GOALFLIGHT_TEST_MODE"] = "1"
         env["GOALFLIGHT_TEST_PGROUP_CPU_PCT"] = "50.0"
@@ -460,7 +468,7 @@ def case_worker_and_watcher_survive_launcher_pgroup_sigterm() -> None:
         started = tmp_path / "started"
         done = tmp_path / "done"
         env = os.environ.copy()
-        env["GOALFLIGHT_STATE_DIR"] = str(tmp_path / "state")
+        _isolate_state_env(env, tmp_path)
         env["GOAL_FLIGHT_PIDFILE_DIR"] = str(tmp_path / "pids")
         env["GOALFLIGHT_TEST_MODE"] = "1"
         env["GOALFLIGHT_TEST_PGROUP_CPU_PCT"] = "0.0"
@@ -526,7 +534,7 @@ def case_foreground_keyboard_interrupt_leaves_worker_and_watcher_running() -> No
         started = tmp_path / "started"
         done = tmp_path / "done"
         env = os.environ.copy()
-        env["GOALFLIGHT_STATE_DIR"] = str(tmp_path / "state")
+        _isolate_state_env(env, tmp_path)
         env["GOAL_FLIGHT_PIDFILE_DIR"] = str(tmp_path / "pids")
         pid_dir = Path(env["GOAL_FLIGHT_PIDFILE_DIR"])
         worker_code = (

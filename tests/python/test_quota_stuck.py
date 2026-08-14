@@ -134,7 +134,12 @@ def test_tail_signature_classifies_exhausted_provider() -> None:
 
 
 def test_capacity_hard_stops_provider_launches() -> None:
-    with tempfile.TemporaryDirectory() as td, temp_env(GOALFLIGHT_STATE_DIR=str(Path(td) / "state")):
+    with tempfile.TemporaryDirectory() as td, temp_env(
+        GOALFLIGHT_STATE_DIR=str(Path(td) / "state"),
+        GOALFLIGHT_TASK_STORE_DIR=str(Path(td) / "task-store"),
+        GOALFLIGHT_JOURNAL_DIR=str(Path(td) / "journal"),
+        GOALFLIGHT_MESSAGES_DIR=str(Path(td) / "messages"),
+    ):
         state_dir = Path(td) / "state"
         runs = state_dir / "runs.d"
         runs.mkdir(parents=True)
@@ -262,7 +267,12 @@ def test_status_banner_and_advisory_mail() -> None:
 
 
 def test_quota_reaper_default_deny_guards_and_release() -> None:
-    with tempfile.TemporaryDirectory() as td, temp_env(GOALFLIGHT_STATE_DIR=str(Path(td) / "state")):
+    with tempfile.TemporaryDirectory() as td, temp_env(
+        GOALFLIGHT_STATE_DIR=str(Path(td) / "state"),
+        GOALFLIGHT_TASK_STORE_DIR=str(Path(td) / "task-store"),
+        GOALFLIGHT_JOURNAL_DIR=str(Path(td) / "journal"),
+        GOALFLIGHT_MESSAGES_DIR=str(Path(td) / "messages"),
+    ):
         tmp = Path(td)
         record = quota_record(tmp, dispatch_id="qkill", pid=301, state="running_quiet")
         ledger.write_record(record)
@@ -319,7 +329,12 @@ def test_quota_reaper_default_deny_guards_and_release() -> None:
 
 
 def test_kimi_quota_reaper_and_surplus_discovery() -> None:
-    with tempfile.TemporaryDirectory() as td, temp_env(GOALFLIGHT_STATE_DIR=str(Path(td) / "state")):
+    with tempfile.TemporaryDirectory() as td, temp_env(
+        GOALFLIGHT_STATE_DIR=str(Path(td) / "state"),
+        GOALFLIGHT_TASK_STORE_DIR=str(Path(td) / "task-store"),
+        GOALFLIGHT_JOURNAL_DIR=str(Path(td) / "journal"),
+        GOALFLIGHT_MESSAGES_DIR=str(Path(td) / "messages"),
+    ):
         tmp = Path(td)
         record = quota_record(tmp, dispatch_id="kimi-quota", pid=42, state="running_quiet")
         kimi_comm = "/Users/x/.kimi-code/bin/kimi"
@@ -392,7 +407,12 @@ def test_quota_reaper_escalates_sigkill_when_sigterm_does_not_exit() -> None:
 
 
 def test_quota_reaper_partial_failure_not_counted_as_reaped() -> None:
-    with tempfile.TemporaryDirectory() as td, temp_env(GOALFLIGHT_STATE_DIR=str(Path(td) / "state")):
+    with tempfile.TemporaryDirectory() as td, temp_env(
+        GOALFLIGHT_STATE_DIR=str(Path(td) / "state"),
+        GOALFLIGHT_TASK_STORE_DIR=str(Path(td) / "task-store"),
+        GOALFLIGHT_JOURNAL_DIR=str(Path(td) / "journal"),
+        GOALFLIGHT_MESSAGES_DIR=str(Path(td) / "messages"),
+    ):
         tmp = Path(td)
         record = quota_record(tmp, dispatch_id="qpartial", pid=321, state="running_quiet")
         cap.save_state(
@@ -430,7 +450,12 @@ def test_quota_reaper_partial_failure_not_counted_as_reaped() -> None:
 
 
 def test_quota_reaper_refuses_dispatch_lease_when_worker_pid_mismatches() -> None:
-    with tempfile.TemporaryDirectory() as td, temp_env(GOALFLIGHT_STATE_DIR=str(Path(td) / "state")):
+    with tempfile.TemporaryDirectory() as td, temp_env(
+        GOALFLIGHT_STATE_DIR=str(Path(td) / "state"),
+        GOALFLIGHT_TASK_STORE_DIR=str(Path(td) / "task-store"),
+        GOALFLIGHT_JOURNAL_DIR=str(Path(td) / "journal"),
+        GOALFLIGHT_MESSAGES_DIR=str(Path(td) / "messages"),
+    ):
         tmp = Path(td)
         record = quota_record(tmp, dispatch_id="qpidlease", pid=331, state="running_quiet")
         ledger.write_record(record)
@@ -546,7 +571,12 @@ def test_quota_reaper_default_off_requires_explicit_enable() -> None:
 
 
 def test_prompt_echo_quota_text_is_not_counted_or_hard_stopped() -> None:
-    with tempfile.TemporaryDirectory() as td, temp_env(GOALFLIGHT_STATE_DIR=str(Path(td) / "state")):
+    with tempfile.TemporaryDirectory() as td, temp_env(
+        GOALFLIGHT_STATE_DIR=str(Path(td) / "state"),
+        GOALFLIGHT_TASK_STORE_DIR=str(Path(td) / "task-store"),
+        GOALFLIGHT_JOURNAL_DIR=str(Path(td) / "journal"),
+        GOALFLIGHT_MESSAGES_DIR=str(Path(td) / "messages"),
+    ):
         state_dir = Path(td) / "state"
         runs = state_dir / "runs.d"
         runs.mkdir(parents=True)
@@ -666,7 +696,12 @@ def test_quota_reaper_rejects_pid_reuse_identity_mismatch() -> None:
 
 
 def test_draft_artifact_reconcile_requires_finality_before_complete() -> None:
-    with tempfile.TemporaryDirectory() as td, temp_env(GOALFLIGHT_STATE_DIR=str(Path(td) / "state")):
+    with tempfile.TemporaryDirectory() as td, temp_env(
+        GOALFLIGHT_STATE_DIR=str(Path(td) / "state"),
+        GOALFLIGHT_TASK_STORE_DIR=str(Path(td) / "task-store"),
+        GOALFLIGHT_JOURNAL_DIR=str(Path(td) / "journal"),
+        GOALFLIGHT_MESSAGES_DIR=str(Path(td) / "messages"),
+    ):
         tmp = Path(td)
         artifact = tmp / "docs-private" / "research" / "draft.md"
         artifact.parent.mkdir(parents=True)

@@ -7,6 +7,7 @@ from support import skip_posix_on_native_windows
 
 skip_posix_on_native_windows("uses POSIX subprocess liveness for ACP fake worker")
 
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -232,6 +233,7 @@ def _run_answered_confirmation(
     exclude_question_ids: set[str] | None = None,
     extra_env: dict[str, str] | None = None,
     steer_messages: list[str] | None = None,
+    pre_question_messages: list[str] | None = None,
     delay_before_messages_s: float = 0.0,
     poll_s: float = 0.05,
 ) -> tuple[subprocess.Popen[str], str, str, dict, Path, dict]:
@@ -274,6 +276,44 @@ def _run_answered_confirmation(
         stderr=subprocess.PIPE,
     )
     try:
+        for message in pre_question_messages or []:
+            ledger_path = (
+                Path(env["GOALFLIGHT_STATE_DIR"])
+                / "runs.d"
+                / f"{dispatch_id}.json"
+            )
+            deadline = time.monotonic() + 10.0
+            while True:
+                ledger_record = None
+                if ledger_path.exists():
+                    with contextlib.suppress(OSError, json.JSONDecodeError):
+                        ledger_record = json.loads(ledger_path.read_text())
+                if (
+                    isinstance(ledger_record, dict)
+                    and ledger_record.get("state") == "running"
+                    and ledger_record.get("worker_pid")
+                ):
+                    break
+                if proc.poll() is not None:
+                    stdout, stderr = proc.communicate(timeout=1)
+                    raise AssertionError(
+                        f"runner exited before ledger registration: {stdout}\n{stderr}"
+                    )
+                if time.monotonic() >= deadline:
+                    raise AssertionError(
+                        f"runner did not publish its worker before timeout: {dispatch_id}"
+                    )
+                time.sleep(0.01)
+            reply = subprocess.run(
+                [sys.executable, str(DISPATCH), "steer", dispatch_id, message],
+                cwd=ROOT,
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=10,
+            )
+            assert reply.returncode == 0, reply.stdout + reply.stderr
         question = _wait_for_worker_question(
             mailbox,
             exclude_question_ids=exclude_question_ids,
@@ -1218,6 +1258,7 @@ def case_restart_does_not_reuse_question_id_or_accept_stale_yes() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         dispatch_id = "acp-user-confirm-restart"
+        successor_dispatch_id = "acp-user-confirm-restart-successor"
         first_run, first_status, _first_guarded, _mailbox = _run_confirmation_scenario(
             tmp,
             scenario="user_confirm_then_blocked",
@@ -1242,36 +1283,23 @@ def case_restart_does_not_reuse_question_id_or_accept_stale_yes() -> None:
             pending_snapshot.pop(field, None)
         pending_snapshot["guarded_action_authorized"] = False
         restart_status = dict(first_status)
+        restart_status["dispatch_id"] = successor_dispatch_id
         restart_status["user_confirm_pending"] = [pending_snapshot]
         restart_status["user_confirm_resolved"] = []
-        (tmp / f"{dispatch_id}.status.json").write_text(
+        (tmp / f"{successor_dispatch_id}.status.json").write_text(
             json.dumps(restart_status),
             encoding="utf-8",
         )
-
-        stale_reply = subprocess.run(
-            [
-                sys.executable,
-                str(DISPATCH),
-                "steer",
-                dispatch_id,
-                f"USER-CONFIRM-ANSWER: {old_question_id} yes",
-            ],
-            cwd=ROOT,
-            env=_env(tmp),
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=10,
-        )
-        assert stale_reply.returncode == 0, stale_reply.stdout + stale_reply.stderr
 
         second_proc, second_stdout, second_stderr, second_status, guarded, new_question = (
             _run_answered_confirmation(
                 tmp,
                 scenario="user_confirm_continue",
-                dispatch_id=dispatch_id,
+                dispatch_id=successor_dispatch_id,
                 decisions=["yes"],
+                pre_question_messages=[
+                    f"USER-CONFIRM-ANSWER: {old_question_id} yes"
+                ],
                 exclude_question_ids={old_question_id},
                 extra_env={
                     "GOALFLIGHT_FAKE_ACP_REQUEST_GUARDED_PERMISSION": "1",

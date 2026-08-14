@@ -25,6 +25,8 @@ import uuid
 import goalflight_compat
 import goalflight_compat as fcntl
 import goalflight_dispatch_states
+import goalflight_journal
+import goalflight_task
 import goalflight_terminal
 
 SCHEMA = "goalflight.dispatch.v1"
@@ -425,6 +427,77 @@ def elapsed_seconds(record: dict, ended_at: str | None = None) -> float | None:
     return round(elapsed, 3)
 
 
+def commit_terminal_authority(
+    record: dict,
+    *,
+    state: str,
+    reason: object,
+    terminal_state: str | None = None,
+    worker_still_alive: bool | None = None,
+) -> goalflight_journal.WriteResult[goalflight_journal.TerminalCommit]:
+    """Sole journal emitter used by every terminal classifier."""
+    dispatch_id = str(record.get("dispatch_id") or "")
+    project_root = record.get("project_root") or Path.cwd()
+    authority = goalflight_journal.open_or_create_journal(project_root)
+    attempt = authority.attempt_for_dispatch(dispatch_id)
+    if attempt is None:
+        prepared = authority.prepare_attempt(dispatch_id)
+        if not prepared.committed or prepared.value is None:
+            return goalflight_journal.WriteResult(
+                prepared.disposition,
+                attempts=prepared.attempts,
+                reason=prepared.reason,
+            )
+        attempt = prepared.value
+    resolved_terminal = terminal_state or terminal_state_for(state, reason)
+    marker_kind = reason.get("marker_kind") if isinstance(reason, dict) else None
+    event_type = (
+        "user_need"
+        if marker_kind == "USER-NEED"
+        else "user_confirm"
+        if marker_kind == "USER-CONFIRM"
+        else "result"
+        if resolved_terminal == "complete"
+        else "blocked"
+    )
+    return authority.commit_terminal(
+        attempt.attempt_id,
+        terminal_state=resolved_terminal,
+        observation={
+            "state": state,
+            "terminal_state": resolved_terminal,
+            "outcome": failure_envelope(reason) or {},
+            "worker_still_alive": worker_still_alive,
+        },
+        event_type=event_type,
+    )
+
+
+def wait_attempt_running(
+    project_root: Path | str,
+    dispatch_id: str,
+    *,
+    timeout_s: float = 10.0,
+) -> goalflight_journal.AttemptIdentity:
+    authority = goalflight_journal.Journal(project_root)
+    deadline = time.monotonic() + timeout_s
+    while True:
+        attempt = authority.attempt_for_dispatch(dispatch_id)
+        if attempt is None:
+            raise RuntimeError(f"prepared attempt missing for {dispatch_id}")
+        if attempt.lifecycle_state == goalflight_journal.ATTEMPT_RUNNING:
+            return attempt
+        if attempt.lifecycle_state != goalflight_journal.ATTEMPT_STARTING:
+            raise RuntimeError(
+                f"attempt {attempt.attempt_id} entered {attempt.lifecycle_state} before RUNNING"
+            )
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"worker did not claim attempt {attempt.attempt_id} RUNNING within {timeout_s:.1f}s"
+            )
+        time.sleep(0.01)
+
+
 def scan_surplus(records: list[dict], limit: int = 20) -> list[dict]:
     known = {int(r["worker_pid"]) for r in records if r.get("worker_pid")}
     known.update(int(r["controller_pid"]) for r in records if r.get("controller_pid"))
@@ -552,6 +625,64 @@ def cmd_record(args: argparse.Namespace) -> int:
         record["detached"] = True
     if getattr(args, "queue_launch_token", None):
         record["queue_launch_token"] = args.queue_launch_token
+    if args.state in {"waiting_capacity", "starting", "running"}:
+        authority = goalflight_journal.open_or_create_journal(args.project_root)
+        prepared = authority.prepare_attempt(
+            dispatch_id,
+            launch_token=getattr(args, "queue_launch_token", None),
+            defer_start_deadline=args.state == "waiting_capacity",
+        )
+        if not prepared.committed or prepared.value is None:
+            print(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "dispatch_id": dispatch_id,
+                        "disposition": prepared.disposition.value,
+                        "error": prepared.reason,
+                    },
+                    sort_keys=True,
+                )
+            )
+            return 3 if prepared.cas_lost else 2
+        identity = prepared.value
+        if args.state == "starting":
+            started = authority.start_attempt(
+                identity.attempt_id,
+                identity.launch_token,
+                expected_launch_epoch=identity.launch_epoch,
+            )
+            if not started.committed or started.value is None:
+                print(
+                    json.dumps(
+                        {
+                            "ok": False,
+                            "dispatch_id": dispatch_id,
+                            "disposition": started.disposition.value,
+                            "error": started.reason,
+                        },
+                        sort_keys=True,
+                    )
+                )
+                return 3 if started.cas_lost else 2
+            identity = started.value
+        elif args.state == "running":
+            if identity.lifecycle_state != goalflight_journal.ATTEMPT_RUNNING:
+                print(
+                    json.dumps(
+                        {
+                            "ok": False,
+                            "dispatch_id": dispatch_id,
+                            "disposition": "cas_lost",
+                            "error": f"attempt state is {identity.lifecycle_state}, worker has not claimed RUNNING",
+                        },
+                        sort_keys=True,
+                    )
+                )
+                return 3
+        record["attempt_id"] = identity.attempt_id
+        record["launch_token"] = identity.launch_token
+        record["launch_epoch"] = identity.launch_epoch
     with StateLock():
         path = record_path(dispatch_id)
         if path.exists():
@@ -605,28 +736,39 @@ def cmd_finish(args: argparse.Namespace) -> int:
     if not path.exists():
         print(json.dumps({"ok": False, "error": "missing_dispatch", "dispatch_id": args.dispatch_id}))
         return 1
+    record = json.loads(path.read_text())
+    terminal_state = getattr(args, "terminal_state", None) or terminal_state_for(args.state, args.reason)
+    committed = commit_terminal_authority(
+        record,
+        state=args.state,
+        reason=args.reason,
+        terminal_state=terminal_state,
+        worker_still_alive=getattr(args, "worker_still_alive", None),
+    )
+    if not committed.committed or committed.value is None:
+        print(json.dumps({
+            "ok": False,
+            "dispatch_id": args.dispatch_id,
+            "disposition": committed.disposition.value,
+            "error": committed.reason,
+        }, sort_keys=True))
+        return 3 if committed.cas_lost else 2
+    winner = committed.value
     with StateLock():
         record = json.loads(path.read_text())
-        terminal_state = getattr(args, "terminal_state", None) or terminal_state_for(args.state, args.reason)
+        terminal_state = winner.terminal_state
         existing_terminal = _terminal_key(record)
-        if (
-            existing_terminal not in {"", "unknown", "watcher_stopped"}
-            and terminal_state not in {"", "unknown"}
-            and existing_terminal != terminal_state
-        ):
-            print(json.dumps({
-                "ok": True,
-                "dispatch_id": args.dispatch_id,
-                "state": record.get("state"),
-                "idempotent": True,
-                "terminal_state": existing_terminal,
-            }, sort_keys=True))
-            return 0
-        record["state"] = args.state
+        winner_state = str(winner.observation.get("state") or terminal_state)
+        effective_state = (
+            record.get("state")
+            if winner.idempotent and existing_terminal == terminal_state
+            else winner_state
+        )
+        record["state"] = effective_state
         ended_at = utc_now()
         record["ended_at"] = ended_at
         record["terminal_state"] = terminal_state
-        record["liveness_state"] = goalflight_terminal.terminal_liveness_state(args.state)
+        record["liveness_state"] = goalflight_terminal.terminal_liveness_state(effective_state)
         elapsed_s = getattr(args, "elapsed_s", None)
         if elapsed_s is None:
             elapsed_s = elapsed_seconds(record, ended_at)
@@ -634,24 +776,229 @@ def cmd_finish(args: argparse.Namespace) -> int:
             record["elapsed_s"] = round(float(elapsed_s), 3)
         if hasattr(args, "worker_still_alive"):
             record["worker_still_alive"] = args.worker_still_alive
-        envelope = failure_envelope(args.reason)
+        winner_outcome = winner.observation.get("outcome")
+        envelope = dict(winner_outcome) if isinstance(winner_outcome, dict) else None
         record["outcome"] = {"terminal_state": terminal_state}
         if envelope:
             record.update(envelope)
             record["outcome"].update(envelope)
-        if isinstance(args.reason, dict) and args.reason.get("limit_kind"):
+        winner_reason = None
+        if isinstance(envelope, dict):
+            winner_reason = envelope.get("error") or envelope.get("reason")
+        if isinstance(winner_reason, dict) and winner_reason.get("limit_kind"):
             for key in (
                 "limit_kind",
                 "limit_signature",
                 "reset_at",
                 "retry_after",
             ):
-                value = args.reason.get(key)
+                value = winner_reason.get(key)
                 record[key] = value
                 record["outcome"][key] = value
+        record["attempt_id"] = winner.attempt_id
+        record["transition_id"] = winner.transition_id
+        record["terminal_event_uuid"] = winner.event_uuid
         write_record(record)
-    print(json.dumps({"ok": True, "dispatch_id": args.dispatch_id, "state": args.state}, sort_keys=True))
+    try:
+        import goalflight_messages
+
+        authority = goalflight_journal.open_or_create_journal(
+            record.get("project_root") or Path.cwd()
+        )
+        authority.project_terminal_outbox(messages_dir=goalflight_messages.default_messages_dir())
+    except Exception:
+        # Projection is derived and retried by reconciliation. The committed
+        # journal state/outbox pair remains the terminal authority.
+        pass
+    print(json.dumps({
+        "ok": True,
+        "dispatch_id": args.dispatch_id,
+        "state": args.state,
+        "attempt_id": winner.attempt_id,
+        "transition_id": winner.transition_id,
+        "event_uuid": winner.event_uuid,
+        "idempotent": winner.idempotent,
+    }, sort_keys=True))
     return 0
+
+
+def reconcile_terminal_outbox(
+    project_root: Path | str,
+    *,
+    messages_dir: Path | None = None,
+) -> dict[str, object]:
+    """Repair terminal authority and classify provably dead workers once."""
+    canonical_root = goalflight_task.resolve_project_root(str(project_root))
+    authority = goalflight_journal.open_or_create_journal(canonical_root)
+    reconcile_at = utc_now()
+    expired_launches = {
+        str(row["dispatch_id"]): row
+        for row in authority.read_all(
+            """SELECT attempt_id, dispatch_id, launch_token, launch_epoch,
+                      lifecycle_state, start_deadline_at
+               FROM dispatch_attempts
+               WHERE lifecycle_state IN ('PREPARED', 'STARTING')
+                 AND start_deadline_at IS NOT NULL
+                 AND start_deadline_at <= ?""",
+            (reconcile_at,),
+        )
+    }
+    committed = 0
+    already_terminal = 0
+    retryable = 0
+    cas_lost = 0
+    records = read_records()
+    known_dispatch_ids = {
+        str(record.get("dispatch_id"))
+        for record in records
+        if isinstance(record, dict) and record.get("dispatch_id")
+    }
+    for dispatch_id, row in expired_launches.items():
+        if dispatch_id not in known_dispatch_ids:
+            records.append(
+                {
+                    "dispatch_id": dispatch_id,
+                    "project_root": str(canonical_root),
+                    "state": str(row["lifecycle_state"]).lower(),
+                    "attempt_id": str(row["attempt_id"]),
+                    "launch_token": str(row["launch_token"]),
+                    "launch_epoch": int(row["launch_epoch"]),
+                }
+            )
+    for record in records:
+        if not isinstance(record, dict) or not record.get("dispatch_id"):
+            continue
+        if not record.get("project_root"):
+            continue
+        try:
+            record_root = goalflight_task.resolve_project_root(
+                str(record["project_root"])
+            )
+        except Exception:
+            continue
+        if record_root != canonical_root:
+            continue
+        terminal_state = _terminal_key(record)
+        state = str(record.get("state") or "")
+        reason: object = record.get("reason") or record.get("error")
+        status_observation: dict | None = None
+        status_path_value = record.get("status_path")
+        if isinstance(status_path_value, str) and status_path_value:
+            try:
+                candidate = json.loads(Path(status_path_value).read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                candidate = None
+            if (
+                isinstance(candidate, dict)
+                and candidate.get("dispatch_id") == record.get("dispatch_id")
+            ):
+                candidate_state = candidate.get("terminal_pending_state") or candidate.get("state")
+                candidate_terminal = terminal_state_for(candidate_state, candidate.get("reason") or candidate.get("error"))
+                if candidate_terminal not in {"", "unknown", "watcher_stopped"}:
+                    status_observation = candidate
+        expired_launch = str(record["dispatch_id"]) in expired_launches
+        needs_ledger_projection = status_observation is not None or expired_launch or terminal_state in {
+            "",
+            "unknown",
+            "watcher_stopped",
+        }
+        if status_observation is not None:
+            state = str(
+                status_observation.get("terminal_pending_state")
+                or status_observation.get("state")
+            )
+            reason = status_observation.get("reason") or status_observation.get("error")
+            terminal_state = terminal_state_for(state, reason)
+        elif expired_launch:
+            state = "abandoned"
+            terminal_state = "abandoned"
+            reason = {
+                "reason": "start_claim_deadline_expired",
+                "prior_state": record.get("state"),
+            }
+        elif terminal_state in {"", "unknown", "watcher_stopped"}:
+            classification = classify(record)
+            if classification not in {"worker_dead", "stale_dead"}:
+                continue
+            state = "worker_dead"
+            terminal_state = "worker_dead"
+            reason = {
+                "reason": "reconciler_observed_identity_dead",
+                "prior_state": record.get("state"),
+            }
+        if expired_launch:
+            result = authority.commit_expired_attempt(
+                str(expired_launches[str(record["dispatch_id"])]["attempt_id"]),
+                observed_at=reconcile_at,
+                terminal_state=terminal_state,
+                observation={
+                    "state": state,
+                    "terminal_state": terminal_state,
+                    "outcome": failure_envelope(reason) or {},
+                    "worker_still_alive": False,
+                },
+            )
+        else:
+            result = commit_terminal_authority(
+                record,
+                state=state or terminal_state,
+                reason=reason,
+                terminal_state=terminal_state,
+                worker_still_alive=False,
+            )
+        if result.committed and result.value is not None:
+            if result.value.idempotent:
+                already_terminal += 1
+            else:
+                committed += 1
+            if needs_ledger_projection:
+                with StateLock():
+                    current_path = record_path(str(record["dispatch_id"]))
+                    current = (
+                        json.loads(current_path.read_text())
+                        if current_path.exists()
+                        else dict(record)
+                    )
+                    current.update(
+                        {
+                            "state": str(
+                                result.value.observation.get("state")
+                                or result.value.terminal_state
+                            ),
+                            "terminal_state": result.value.terminal_state,
+                            "ended_at": utc_now(),
+                            "worker_still_alive": False,
+                            "attempt_id": result.value.attempt_id,
+                            "transition_id": result.value.transition_id,
+                            "terminal_event_uuid": result.value.event_uuid,
+                            "reason": reason,
+                        }
+                    )
+                    write_record(current)
+        elif result.cas_lost:
+            cas_lost += 1
+        else:
+            retryable += 1
+    if messages_dir is None:
+        import goalflight_messages
+
+        messages_dir = goalflight_messages.default_messages_dir()
+    projected = authority.project_terminal_outbox(messages_dir=messages_dir)
+    return {
+        "ok": retryable == 0,
+        "project_root": str(canonical_root),
+        "committed": committed,
+        "already_terminal": already_terminal,
+        "cas_lost": cas_lost,
+        "retryable": retryable,
+        "projected": len(projected),
+    }
+
+
+def cmd_reconcile_outbox(args: argparse.Namespace) -> int:
+    payload = reconcile_terminal_outbox(args.project_root)
+    print(json.dumps(payload, indent=None if args.json else 2, sort_keys=True))
+    return 0 if payload["ok"] else 2
 
 
 def status_payload() -> dict:
@@ -973,7 +1320,10 @@ def build_parser() -> argparse.ArgumentParser:
     rec.add_argument("--stderr-path")
     rec.add_argument("--status-path")
     rec.add_argument("--os-sandbox-json")
-    rec.add_argument("--state", default="running")
+    # RUNNING belongs to the worker's pre-exec journal claim. A bare record
+    # command can truthfully prepare STARTING, but it cannot impersonate that
+    # worker-owned transition.
+    rec.add_argument("--state", default="starting")
     rec.add_argument("--detached", action="store_true")
     rec.add_argument("--json", action="store_true")
     rec.set_defaults(func=cmd_record)
@@ -988,6 +1338,14 @@ def build_parser() -> argparse.ArgumentParser:
     ))
     fin.add_argument("--elapsed-s", type=float)
     fin.set_defaults(func=cmd_finish)
+
+    reconcile = sub.add_parser(
+        "reconcile-outbox",
+        help="repair terminal journal authority and project pending outbox rows",
+    )
+    reconcile.add_argument("--project-root", type=Path, default=Path.cwd())
+    reconcile.add_argument("--json", action="store_true")
+    reconcile.set_defaults(func=cmd_reconcile_outbox)
 
     stat = sub.add_parser("status")
     stat.add_argument("--json", action="store_true")
