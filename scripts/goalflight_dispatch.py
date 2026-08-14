@@ -4639,7 +4639,20 @@ def _pidfile_dir() -> Path:
 def _identity_token(identity: dict | None) -> dict | None:
     if not identity:
         return None
-    return {key: identity.get(key) for key in ("pid", "lstart", "comm") if identity.get(key)}
+    return {
+        key: identity.get(key)
+        for key in ("pid", "start_token", "lstart", "comm")
+        if identity.get(key)
+    }
+
+
+def _watch_identity_token(identity: dict | None) -> dict | None:
+    token = _identity_token(identity)
+    if token and (
+        token.get("start_token") or (token.get("lstart") and token.get("comm"))
+    ):
+        return token
+    return None
 
 
 def _process_identity_after_spawn(worker_pid: int) -> dict | None:
@@ -10061,11 +10074,7 @@ def main(argv: list[str] | None = None) -> int:
         ]
         if getattr(args, "task_ids", None):
             watch_cmd += ["--project-root", str(project_root), "--task-ids", ",".join(args.task_ids)]
-        watch_identity_token = (
-            worker_identity_token
-            if worker_identity_token and worker_identity_token.get("lstart") and worker_identity_token.get("comm")
-            else None
-        )
+        watch_identity_token = _watch_identity_token(worker_identity_token)
         if watch_identity_token:
             watch_cmd += ["--worker-identity-json", json.dumps(watch_identity_token, sort_keys=True)]
         if args.launch_detached:

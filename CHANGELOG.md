@@ -6,6 +6,26 @@ incremented when meaningful skill behaviour changes.
 
 ## [Unreleased]
 
+### Fixed
+
+- A worker that replaces itself with `exec` is no longer mistaken for a recycled
+  PID and declared dead. The launcher execs into the agent process, which keeps
+  the PID and the start second but changes the process name; the anti-reuse check
+  read that as a different process occupying a reused PID. Measured before the
+  fix on one machine: 7 of 7 completed dispatches were recorded `worker_dead`,
+  and since terminal events are now committed and mailed, that false verdict was
+  being written into the record other tooling trusts.
+  Identity now carries a fine-grained start token — microseconds on macOS, the
+  start tick and boot id on Linux, the creation time on Windows — so start time
+  alone distinguishes a genuine reuse, including one that happens inside the same
+  clock second. Where no token is available the previous name-based tiebreaker
+  still applies, so a same-second reuse by an unrelated process is still caught.
+  The reaper used the same comparison and is fixed with it.
+- The process-identity probe degrades instead of raising when a platform-specific
+  call is unavailable. An identity probe that throws reaches a dispatch as a
+  crash rather than as "identity unknown", which is the failure class this change
+  set out to remove.
+
 ### Added
 
 - The terminal outbox: a dispatch's terminal state, its state transition and the

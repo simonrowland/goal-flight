@@ -984,6 +984,116 @@ def windows_process_identity(pid) -> dict | None:
         kernel32.CloseHandle(handle)
 
 
+def process_start_identity(pid: int, *, include_ancestry: bool = False) -> dict | None:
+    """Return a PID-reuse-safe, fine-grained process start identity when available."""
+    if not isinstance(pid, int) or pid <= 0 or not pid_alive(pid):
+        return None
+
+    if is_windows():
+        # An identity probe must never raise. Its callers decide whether a worker
+        # is alive, and an exception escaping here reaches a dispatch as a crash
+        # rather than as "identity unavailable" -- the failure mode this whole
+        # start-token change exists to remove. `windows_process_identity` reaches
+        # for ctypes.WinDLL, which does not exist off Windows, so a host that
+        # merely REPORTS Windows (a patched probe, a mis-detection, a stubbed
+        # platform) would otherwise die here instead of degrading to the
+        # coarser lstart+comm path.
+        try:
+            identity = windows_process_identity(pid)
+        except Exception:
+            return None
+        created = identity.get("creation_time") if isinstance(identity, dict) else None
+        if created:
+            return {"pid": pid, "start_token": f"windows:{created}"}
+        return None
+
+    if sys.platform == "darwin":
+        try:
+            import ctypes
+
+            class ProcBsdInfo(ctypes.Structure):
+                _fields_ = [
+                    ("pbi_flags", ctypes.c_uint32),
+                    ("pbi_status", ctypes.c_uint32),
+                    ("pbi_xstatus", ctypes.c_uint32),
+                    ("pbi_pid", ctypes.c_uint32),
+                    ("pbi_ppid", ctypes.c_uint32),
+                    ("pbi_uid", ctypes.c_uint32),
+                    ("pbi_gid", ctypes.c_uint32),
+                    ("pbi_ruid", ctypes.c_uint32),
+                    ("pbi_rgid", ctypes.c_uint32),
+                    ("pbi_svuid", ctypes.c_uint32),
+                    ("pbi_svgid", ctypes.c_uint32),
+                    ("rfu_1", ctypes.c_uint32),
+                    ("pbi_comm", ctypes.c_char * 16),
+                    ("pbi_name", ctypes.c_char * 32),
+                    ("pbi_nfiles", ctypes.c_uint32),
+                    ("pbi_pgid", ctypes.c_uint32),
+                    ("pbi_pjobc", ctypes.c_uint32),
+                    ("e_tdev", ctypes.c_uint32),
+                    ("e_tpgid", ctypes.c_uint32),
+                    ("pbi_nice", ctypes.c_int32),
+                    ("pbi_start_tvsec", ctypes.c_uint64),
+                    ("pbi_start_tvusec", ctypes.c_uint64),
+                ]
+
+            libproc = ctypes.CDLL("/usr/lib/libproc.dylib")
+            libproc.proc_pidinfo.argtypes = (
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_uint64,
+                ctypes.c_void_p,
+                ctypes.c_int,
+            )
+            libproc.proc_pidinfo.restype = ctypes.c_int
+            info = ProcBsdInfo()
+            size = ctypes.sizeof(info)
+            read = libproc.proc_pidinfo(pid, 3, 0, ctypes.byref(info), size)
+            if read == size and int(info.pbi_pid) == pid and info.pbi_start_tvsec:
+                token = f"darwin:{info.pbi_start_tvsec}:{info.pbi_start_tvusec}"
+                snapshot = {"pid": pid, "start_token": token}
+                if include_ancestry:
+                    snapshot.update(
+                        {
+                            "ppid": int(info.pbi_ppid),
+                            "session_id": os.getsid(pid),
+                        }
+                    )
+                return snapshot
+        except (AttributeError, OSError, TypeError, ValueError):
+            return None
+        return None
+
+    if sys.platform.startswith("linux"):
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+            # The comm field may contain spaces and parentheses. Everything
+            # after its final ')' starts at field 3; starttime is field 22.
+            fields = stat[stat.rfind(")") + 2 :].split()
+            start_ticks = fields[19]
+            try:
+                boot_id = Path("/proc/sys/kernel/random/boot_id").read_text(
+                    encoding="utf-8"
+                ).strip()
+            except OSError:
+                return None
+            if not boot_id:
+                return None
+            snapshot = {"pid": pid, "start_token": f"linux:{boot_id}:{start_ticks}"}
+            if include_ancestry:
+                snapshot.update(
+                    {
+                        "ppid": int(fields[1]),
+                        "session_id": int(fields[3]),
+                    }
+                )
+            return snapshot
+        except (IndexError, OSError, ValueError):
+            return None
+
+    return None
+
+
 def _windows_identity_matches(expected_identity: dict | None, current_identity: dict | None) -> tuple[bool, str]:
     if not isinstance(expected_identity, dict):
         return False, "missing_expected_identity"

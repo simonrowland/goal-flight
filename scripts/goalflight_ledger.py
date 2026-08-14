@@ -16,6 +16,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import socket
 import subprocess
 import sys
@@ -177,25 +178,35 @@ def _posix_ps_available() -> bool:
 def process_identity(pid: int | None) -> dict | None:
     if not pid:
         return None
+    start_identity = goalflight_compat.process_start_identity(pid)
+    start_token = (
+        start_identity.get("start_token") if isinstance(start_identity, dict) else None
+    )
     if goalflight_compat.is_windows():
         # Reject dead PIDs on Windows too, else a dead worker reads as
         # 'identity_indeterminate' instead of 'dead'. Windows lacks the ps
         # probe, so return the probe-only token only for a live PID.
         if not goalflight_compat.pid_alive(pid):
             return None
-        return {
+        ident = {
             "pid": pid,
             "identity_available": False,
             "identity_source": "windows_pid_probe_only",
         }
+        if start_token:
+            ident["start_token"] = start_token
+        return ident
     if not _posix_ps_available():
         if not goalflight_compat.pid_alive(pid):
             return None
-        return {
+        ident = {
             "pid": pid,
             "identity_available": False,
             "identity_source": "posix_pid_probe_only",
         }
+        if start_token:
+            ident["start_token"] = start_token
+        return ident
     ident = None
     for attempt in range(20):
         if not goalflight_compat.pid_alive(pid):
@@ -208,11 +219,83 @@ def process_identity(pid: int | None) -> dict | None:
             "comm": _ps_field(pid, "comm"),
             "args": _ps_field(pid, "args"),
         }
+        if start_token:
+            ident["start_token"] = start_token
         if ident.get("lstart") and ident.get("comm"):
             return ident
         if attempt < 19:
             time.sleep(0.1)
     return ident
+
+
+def _comm_base(value: object) -> str:
+    text = str(value or "").strip().lower()
+    if text.startswith("(") and ")" in text:
+        text = text[1:text.find(")")]
+    text = text.rsplit("/", 1)[-1]
+    match = re.match(r"[a-z0-9_]+", text)
+    return match.group(0) if match else ""
+
+
+def comm_matches(expected: object, actual: object) -> bool:
+    expected_base = _comm_base(expected)
+    actual_base = _comm_base(actual)
+    return bool(
+        expected_base
+        and actual_base
+        and (expected_base.startswith(actual_base) or actual_base.startswith(expected_base))
+    )
+
+
+def compare_process_identities(
+    pid: int,
+    expected_identity: dict | None,
+    current_identity: dict | None,
+) -> tuple[bool, str]:
+    """Pure worker identity comparison shared by verdict and reap paths."""
+    if current_identity is None:
+        return False, "dead"
+    if expected_identity:
+        if expected_identity.get("pid") and int(expected_identity["pid"]) != int(pid):
+            return False, "identity_pid_mismatch"
+
+        expected_lstart = expected_identity.get("lstart")
+        actual_lstart = current_identity.get("lstart")
+        expected_start_token = expected_identity.get("start_token")
+        actual_start_token = current_identity.get("start_token")
+        if expected_start_token and actual_start_token:
+            if actual_start_token != expected_start_token:
+                return False, "pid_reused_start_token"
+            if expected_lstart and actual_lstart and actual_lstart != expected_lstart:
+                return False, "pid_reused_lstart"
+            # exec(2) preserves the process generation while replacing comm.
+            # A matching fine-grained start token is decisive, unlike lstart's
+            # second-granularity wall-clock representation.
+            return True, "live"
+
+        expected_comm = expected_identity.get("comm")
+        actual_comm = current_identity.get("comm")
+        if expected_lstart and actual_lstart:
+            if actual_lstart != expected_lstart:
+                return False, "pid_reused_lstart"
+            # When the fine-grained token is unavailable, comm remains the
+            # tiebreaker that catches a genuinely different process reusing the
+            # PID within lstart's formatted second. Form-only comm variation is
+            # tolerated by comm_matches.
+            if expected_comm and actual_comm and not comm_matches(expected_comm, actual_comm):
+                return False, "pid_reused_lstart_comm"
+            return True, "live"
+
+        if not expected_comm:
+            missing = ["lstart", "comm"] if not expected_lstart else ["comm"]
+            return True, "identity_inconclusive_missing_expected_" + "_".join(missing)
+        if not actual_comm:
+            missing = ["lstart", "comm"] if not actual_lstart else ["comm"]
+            return True, "identity_inconclusive_missing_current_" + "_".join(missing)
+        if not comm_matches(expected_comm, actual_comm):
+            return False, "pid_reused_comm"
+        return True, "live"
+    return True, "identity_inconclusive"
 
 
 def identity_matches(record: dict) -> tuple[bool, str]:
@@ -232,14 +315,28 @@ def identity_matches(record: dict) -> tuple[bool, str]:
         or record.get("controller_identity")
         or {}
     )
-    if goalflight_compat.is_windows() and not current.get("identity_available", True):
+    prior_has_start = bool(prior.get("start_token"))
+    current_has_start = bool(current.get("start_token"))
+    fine_start_available = prior_has_start and current_has_start
+    if (
+        goalflight_compat.is_windows()
+        and not fine_start_available
+        and not current.get("identity_available", True)
+    ):
         return False, "identity_indeterminate"
-    if not current.get("identity_available", True) or not prior.get("identity_available", True):
+    if not fine_start_available and (
+        not current.get("identity_available", True)
+        or not prior.get("identity_available", True)
+    ):
         return True, "identity_indeterminate"
-    for key in ("lstart", "comm"):
-        if prior.get(key) and current.get(key) and prior[key] != current[key]:
-            return False, f"pid_reused_{key}"
-    return True, "live"
+    matched, reason = compare_process_identities(int(pid), prior, current)
+    if matched:
+        return True, "live"
+    if reason == "pid_reused_lstart_comm":
+        # Preserve the ledger/reaper reason taxonomy; the watcher keeps the
+        # more specific same-second reason from the shared comparator.
+        return False, "pid_reused_comm"
+    return False, reason
 
 
 def _is_detached_controller_dead_record(record: dict) -> bool:

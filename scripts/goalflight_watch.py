@@ -783,7 +783,11 @@ def alive(pid: int | None) -> bool:
 def _identity_token(identity: dict | None) -> dict | None:
     if not identity:
         return None
-    return {key: identity.get(key) for key in ("pid", "lstart", "comm") if identity.get(key)}
+    return {
+        key: identity.get(key)
+        for key in ("pid", "start_token", "lstart", "comm")
+        if identity.get(key)
+    }
 
 
 def _load_identity(raw: str | None) -> dict | None:
@@ -796,68 +800,14 @@ def _load_identity(raw: str | None) -> dict | None:
     return parsed if isinstance(parsed, dict) else None
 
 
-def _comm_base(value: object) -> str:
-    text = str(value or "").strip().lower()
-    if text.startswith("(") and ")" in text:
-        text = text[1:text.find(")")]
-    # A comm may be a bare name ("grok", "(grok-0.2.11-maco)") or a full
-    # executable path ("/opt/homebrew/.../python"); take the basename so a path
-    # tokenizes to its program name rather than an empty leading token.
-    text = text.rsplit("/", 1)[-1]
-    match = re.match(r"[a-z0-9_]+", text)
-    return match.group(0) if match else ""
-
-
-def _comm_matches(expected: object, actual: object) -> bool:
-    expected_base = _comm_base(expected)
-    actual_base = _comm_base(actual)
-    return bool(
-        expected_base
-        and actual_base
-        and (expected_base.startswith(actual_base) or actual_base.startswith(expected_base))
-    )
-
-
 def worker_alive(pid: int | None, expected_identity: dict | None) -> tuple[bool, str, dict | None]:
     if not pid:
         return False, "no_pid", None
     current = goalflight_ledger.process_identity(pid)
-    if current is None:
-        return False, "dead", None
-    if expected_identity:
-        if expected_identity.get("pid") and int(expected_identity["pid"]) != int(pid):
-            return False, "identity_pid_mismatch", current
-
-        expected_comm = expected_identity.get("comm")
-        actual_comm = current.get("comm")
-
-        expected_lstart = expected_identity.get("lstart")
-        actual_lstart = current.get("lstart")
-        if expected_lstart and actual_lstart:
-            if actual_lstart != expected_lstart:
-                return False, "pid_reused_lstart", current
-            # lstart is a SECOND-granularity wall-clock string, so a pid reused
-            # within the same formatted second yields an identical lstart. Trust
-            # lstart as the primary anti-reuse key, but when comm is available on
-            # both sides require comm-base compatibility too, so a same-second
-            # reuse by a genuinely DIFFERENT process (different base comm) is
-            # caught. _comm_matches is form-tolerant (base-token prefix), so a
-            # cosmetic comm change ("grok" vs "(grok-0.2.11-maco)") at the same
-            # lstart still reads live -- preserving the Mode B fix.
-            if expected_comm and actual_comm and not _comm_matches(expected_comm, actual_comm):
-                return False, "pid_reused_lstart_comm", current
-            return True, "live", current
-
-        if not expected_comm:
-            missing = ["lstart", "comm"] if not expected_lstart else ["comm"]
-            return True, "identity_inconclusive_missing_expected_" + "_".join(missing), current
-        if not actual_comm:
-            missing = ["lstart", "comm"] if not actual_lstart else ["comm"]
-            return True, "identity_inconclusive_missing_current_" + "_".join(missing), current
-        if not _comm_matches(expected_comm, actual_comm):
-            return False, "pid_reused_comm", current
-        return True, "live", current
-    return True, "identity_inconclusive", current
+    is_alive, reason = goalflight_ledger.compare_process_identities(
+        int(pid), expected_identity, current
+    )
+    return is_alive, reason, current
 
 
 class TailScanResult:
