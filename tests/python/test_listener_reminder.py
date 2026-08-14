@@ -1,150 +1,97 @@
-"""Tests for the listener/registration reminder.
-
-The process table is injected as text, so nothing here depends on what happens
-to be running on the machine.
-"""
+"""Journal coverage reminder contracts; no host process inspection."""
 
 from __future__ import annotations
 
-import importlib.util
 import io
 from pathlib import Path
 import sys
 
 import pytest
 
-
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
-MODULE_PATH = SCRIPTS / "goalflight_messages.py"
-SPEC = importlib.util.spec_from_file_location("test_target_gf_messages", MODULE_PATH)
-assert SPEC is not None and SPEC.loader is not None
-msgs = importlib.util.module_from_spec(SPEC)
-sys.modules[SPEC.name] = msgs
-SPEC.loader.exec_module(msgs)
-
-PROJECT = str(ROOT)
+import goalflight_journal as journal  # noqa: E402
+import goalflight_messages as msgs  # noqa: E402
 
 
-def _ps(label: str, root: str = PROJECT, pid: int = 4242) -> str:
-    return (
-        f"{pid} /usr/bin/python3 /somewhere/goalflight_messages.py listen "
-        f"--controller {label} --project-root {root}"
+def _authority(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> tuple[Path, journal.Journal, journal.LeaseIdentity]:
+    monkeypatch.setenv("GOALFLIGHT_TASK_STORE_DIR", str(tmp_path / "task-store"))
+    monkeypatch.setenv("GOALFLIGHT_JOURNAL_DIR", str(tmp_path / "journal"))
+    monkeypatch.setenv("GOALFLIGHT_CONTROLLER_LABEL", "bugs")
+    root = tmp_path / "project"
+    root.mkdir()
+    authority = journal.open_or_create_journal(root)
+    result = authority.claim_or_renew_lease(
+        "bugs",
+        principal={"pid": 51001, "start_token": "controller-token"},
     )
+    assert result.committed and result.value is not None
+    return root, authority, result.value
 
 
-def test_matches_only_this_controllers_listener() -> None:
-    """One repo can host several controllers, so a sibling's listener must not
-    count as mine -- battery-tool-v2 runs three."""
-    mine = msgs.live_listener_pids(PROJECT, "battery-bugs", ps_output=_ps("battery-bugs"))
-    assert mine == [4242]
-
-    sibling = msgs.live_listener_pids(
-        PROJECT, "battery-bugs", ps_output=_ps("battery-webui")
-    )
-    assert sibling == [], "a sibling controller's listener is not mine"
-
-
-def test_a_listener_for_another_project_does_not_count() -> None:
-    other = msgs.live_listener_pids(
-        PROJECT, "bugs", ps_output=_ps("bugs", root="/somewhere/else")
-    )
-    assert other == []
-
-
-@pytest.mark.parametrize(
-    "line",
-    [
-        "1 /usr/bin/python3 /x/goalflight_messages.py relay --new",  # not listen
-        "2 /usr/bin/python3 /x/other_tool.py listen --controller bugs",  # not ours
-        "3 grep listen --controller bugs",  # someone grepping for it
-    ],
-)
-def test_non_listener_processes_are_not_counted(line: str) -> None:
-    assert msgs.live_listener_pids(PROJECT, "bugs", ps_output=line) == []
-
-
-def test_unreadable_process_table_is_cannot_tell_not_absent(monkeypatch) -> None:
-    """None and [] must stay distinct.
-
-    If an unreadable table collapsed to "none found", a controller that is in
-    fact listening would be nagged whenever ps failed.
-    """
-    def boom(*args, **kwargs):
-        raise OSError("no ps here")
-
-    monkeypatch.setattr(msgs.subprocess, "run", boom)
-    assert msgs.live_listener_pids(PROJECT, "bugs") is None
-
-    stream = io.StringIO()
-    assert (
-        msgs.emit_listener_reminder(
-            project_root=PROJECT, controller_label="bugs", exposure=5, stream=stream
-        )
-        is None
-    )
-    assert stream.getvalue() == "", "must not assert an absence it never measured"
-
-
-def test_reminds_when_measured_absent_and_something_is_at_stake() -> None:
+def test_reminder_uses_coverage_rows_not_process_inventory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root, authority, lease = _authority(monkeypatch, tmp_path)
+    assert msgs.controller_mail_summary(task_store_project_root=root)["controller_label"] == "bugs"
     stream = io.StringIO()
     line = msgs.emit_listener_reminder(
-        project_root=PROJECT, controller_label="bugs", exposure=1,
-        stream=stream, ps_output="",
+        project_root=root, controller_label="bugs", exposure=1, stream=stream
     )
     assert line is not None
-    assert "no live mail listener" in line
-    # the reminder must carry the command, not merely report the absence
-    assert "listen --controller bugs" in line
-    assert stream.getvalue().strip() == line
+    assert "no verified journal coverage" in line
+    assert "--controller-label bugs" in line
 
-
-def test_silent_when_a_listener_is_running() -> None:
-    stream = io.StringIO()
-    assert (
-        msgs.emit_listener_reminder(
-            project_root=PROJECT, controller_label="bugs", exposure=9,
-            stream=stream, ps_output=_ps("bugs"),
-        )
-        is None
+    armed = authority.arm_listener(
+        "bugs",
+        nonce=lease.nonce,
+        pid=52001,
+        start_token="listener-token",
+        parent_pid=51001,
     )
+    assert armed.committed
+    stream = io.StringIO()
+    assert msgs.emit_listener_reminder(
+        project_root=root,
+        controller_label="bugs",
+        exposure=1,
+        stream=stream,
+        identity_probe=lambda pid: {"pid": pid, "start_token": "listener-token"},
+    ) is None
     assert stream.getvalue() == ""
 
 
-def test_silent_when_nothing_is_at_stake() -> None:
-    """No open dispatches and no unread mail: a listener buys nothing, so this
-    stays quiet instead of nagging. That gating is also why no throttle
-    timestamp is needed."""
-    stream = io.StringIO()
-    assert (
-        msgs.emit_listener_reminder(
-            project_root=PROJECT, controller_label="bugs", exposure=0,
-            stream=stream, ps_output="",
-        )
-        is None
+def test_mismatched_coverage_identity_is_not_authoritative(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root, authority, lease = _authority(monkeypatch, tmp_path)
+    assert authority.arm_listener(
+        "bugs", nonce=lease.nonce, pid=52001, start_token="stored", parent_pid=51001
+    ).committed
+    status = msgs.listener_coverage_status(
+        root,
+        "bugs",
+        identity_probe=lambda pid: {"pid": pid, "start_token": "reused-pid"},
     )
+    assert status["covered"] is False
+    assert status["reason"] == "listener-identity-mismatch"
+
+
+def test_reminder_gates_on_exposure_and_reports_missing_identity(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root, _authority_value, _lease = _authority(monkeypatch, tmp_path)
+    stream = io.StringIO()
+    assert msgs.emit_listener_reminder(
+        project_root=root, controller_label="bugs", exposure=0, stream=stream
+    ) is None
     assert stream.getvalue() == ""
 
-
-def test_an_unidentifiable_caller_is_told_to_register() -> None:
-    """Measured while building this: every owned dispatch on a live project
-    carried no controller label and no registered label had a live session, so
-    the caller could not be named. Reporting only the missing listener would
-    stay silent for exactly the controller that has none."""
-    stream = io.StringIO()
     line = msgs.emit_listener_reminder(
-        project_root=PROJECT, controller_label=None, exposure=4,
-        stream=stream, ps_output="",
+        project_root=root, controller_label=None, exposure=1, stream=stream
     )
     assert line is not None
     assert "not registered" in line
-    assert "--controller-startup" in line, "must carry the registration command"
-
-
-def test_summary_exposes_the_controller_label_the_reminder_needs() -> None:
-    """The reminder asks about THIS controller, so the summary has to say who
-    that is; without the key the reminder silently never fires."""
-    summary = msgs.controller_mail_summary(task_store_project_root=Path(PROJECT))
-    assert "controller_label" in summary
+    assert "--controller-startup" in line

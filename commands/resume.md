@@ -44,6 +44,11 @@ named controller registration from `protocols/session-preflight.md`, store
 baseline, handoff prose, status, `next`, then continue the top task without
 waiting for a re-prompt when no real blocker exists.
 
+The resume entry auto-claims/renews only the controller role's journal lease. Carry
+its label and `lease_nonce`; if it reports `label in use`, surface the incumbent and
+do not steal it. Listener, drainer, mirror, and dashboard children never claim during
+resume; a verified watchdog tick may renew the controller lease.
+
 ## STEP 2 — Rebuild status
 
 ```bash

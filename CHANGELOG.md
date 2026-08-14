@@ -6,6 +6,35 @@ incremented when meaningful skill behaviour changes.
 
 ## [Unreleased]
 
+### Added
+
+- Controller leases. A controller claims a label for a project and holds one
+  active generation of that claim, with a renewal horizon and an explicit
+  takeover path. A listener can no longer renew the lease it is covered by —
+  previously a dead controller looked alive for as long as its listener
+  survived, which is the opposite of what a liveness signal is for.
+- A one-shot cursor listener: bounded batches with an explicit "more pending"
+  signal, a generation-stamped token, and cursor advancement guarded by a
+  compare-and-swap on `(registry_generation, cursor_version)`. It exits by
+  itself when superseded, orphaned or corrupt, and records why it exited.
+- Listener coverage rows. Whether a controller is covered is now answered from
+  recorded coverage rather than by grepping the process table; a process scan is
+  a diagnostic, never the authority.
+- Auto-claim at natural entry points, aware of what the caller is: a listener,
+  drainer, mirror or dashboard child never claims a controller label.
+
+### Changed
+
+- Lease expiry raises an attention item from both detection sides, so expired
+  work is surfaced rather than silently orphaned.
+- Project roots resolve through one canonicalizer, so a worktree and its parent
+  share a lease instead of forking two.
+- `relay` is peek-only; reading mail no longer has the side effect of
+  acknowledging it. Everything that depended on the old acknowledgement
+  inventory now reads the journal instead.
+- A dispatch that finds its label already claimed says so and exits, instead of
+  quietly proceeding with no owner.
+
 ### Fixed
 
 - A worker that replaces itself with `exec` is no longer mistaken for a recycled

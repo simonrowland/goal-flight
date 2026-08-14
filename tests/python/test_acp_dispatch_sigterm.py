@@ -78,6 +78,9 @@ def _write_fake_codex_acp_manifest(directory: Path) -> None:
 def _env(tmp: Path, scenario: str) -> dict[str, str]:
     env = os.environ.copy()
     env["GOALFLIGHT_STATE_DIR"] = str(tmp / "state")
+    env["GOALFLIGHT_TASK_STORE_DIR"] = str(tmp / "task-store")
+    env["GOALFLIGHT_JOURNAL_DIR"] = str(tmp / "journal")
+    env["GOALFLIGHT_MESSAGES_DIR"] = str(tmp / "messages")
     env["GOAL_FLIGHT_PIDFILE_DIR"] = str(tmp / "pids")
     env["GOALFLIGHT_ADAPTERS_DIR"] = str(tmp / "adapters")
     env["GOALFLIGHT_ALLOW_ADAPTERS_DIR_OVERRIDE"] = "1"
@@ -88,7 +91,7 @@ def _env(tmp: Path, scenario: str) -> dict[str, str]:
 def _status(env: dict[str, str]) -> dict:
     proc = subprocess.run(
         [sys.executable, str(STATUS), "--json"],
-        cwd=ROOT,
+        cwd=Path(env["GOALFLIGHT_STATE_DIR"]).parent,
         env=env,
         text=True,
         stdout=subprocess.PIPE,
@@ -176,7 +179,7 @@ def case_dispatch_acp_single_finalize() -> None:
                     "--dispatch-id",
                     "acp-single-finalize",
                     "--cwd",
-                    str(ROOT),
+                    str(tmp),
                     "--prompt",
                     "hello",
                     "--status-json",
@@ -230,7 +233,7 @@ def case_dispatch_interactive_sugar_routes_codex_acp_inline() -> None:
                     "--dispatch-id",
                     "acp-interactive-sugar",
                     "--cwd",
-                    str(ROOT),
+                    str(tmp),
                     "--prompt",
                     "hello",
                     "--status-json",
@@ -306,7 +309,7 @@ def case_dispatch_inline_permission_relay_writes_decision_and_worker_proceeds() 
                         "--dispatch-id",
                         "acp-inline-relay",
                         "--cwd",
-                        str(ROOT),
+                        str(tmp),
                         "--prompt",
                         "go",
                         "--status-json",
@@ -364,7 +367,7 @@ def case_dispatch_acp_sigterm_finalizes_and_reaps() -> None:
                 "--dispatch-id",
                 dispatch_id,
                 "--cwd",
-                str(ROOT),
+                str(tmp),
                 "--prompt",
                 "stay running",
                 "--status-json",
@@ -456,7 +459,7 @@ def case_dispatch_acp_sigterm_before_pid_update_keeps_ledger_row() -> None:
                 "--dispatch-id",
                 dispatch_id,
                 "--cwd",
-                str(ROOT),
+                str(tmp),
                 "--prompt",
                 "stay running",
                 "--status-json",

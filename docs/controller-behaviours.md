@@ -158,10 +158,10 @@ frontmatter above. New categories require a frontmatter schema bump (raise
 ## Background Dispatch + Self-Pacing (don't block the controller)
 
 The controller keeps the interactive session responsive by dispatching workers in
-the background and arming `goalflight_messages.py listen --project-root "$PWD"`
-in the background. A controller with a claimed stable name does not enumerate
-dispatch ids: the ownership listener discovers current and future owned work. Arm
-the wait and let work wake it. Any tool call expected to run longer than about 10
+the background and arming a generation-bound `goalflight_messages.py listen
+--project-root "$PWD" --controller-label <label> --lease-nonce <nonce>` in the
+background. It processes the bounded batch, then re-arms with the returned cursor
+token. Arm the wait and let work wake it. Any tool call expected to run longer than about 10
 seconds is backgrounded so typed steers remain visible and ESC/Ctrl-C cancels only
 the observer, not the detached worker.
 
@@ -281,11 +281,11 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **id:** `no-blocking-cursor-task-worker`
 - **name:** Arm the event wake without blocking
 - **category:** `worker-routing-defaults`
-- **controller_does:** The orchestrator backgrounds one ownership listener for a claimed controller, lets worker events wake it without enumerating dispatch ids, and backgrounds a fixed-id wait only for a deliberate unclaimed join.
+- **controller_does:** The orchestrator auto-claims without stealing a live different lease, backgrounds one generation-bound listener, processes its bounded batch, re-arms with its cursor token, and uses a fixed-id wait only for a deliberate unclaimed join.
 - **failure_mode:** The orchestrator blocks the interactive session or schedules a timer to ask whether a worker finished instead of arming the available event channel.
 - **skill_md_compressed_form:**
     - **kind:** literal
-    - **pattern:** "Arm one background `goalflight_messages.py listen --project-root \"$PWD\"` per claimed controller"
+    - **pattern:** "Arm one background generation-bound `goalflight_messages.py listen --project-root \"$PWD\" --controller-label <label> --lease-nonce <nonce>`; process its bounded batch, then re-arm with its cursor token"
     - **max_section_lines:** 55
 - **verifier:**
     - **kind:** behaviour-scenario

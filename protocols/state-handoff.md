@@ -44,24 +44,17 @@ exceptions — leave in place, do not retroactively rename.
 
 ## Session identity
 
-At controller startup, run the best-effort named beacon step in
-`protocols/session-preflight.md`. `GOALFLIGHT_CONTROLLER_PID` must identify the
-actual long-lived controller process; `GOALFLIGHT_CONTROLLER_LABEL` declares the
-stable controller name inherited by its later dispatches. The startup helper
-never invents either value and never blocks work when registration fails.
-Dispatch inherits both declarations and stamps ownership only when PID, label,
-and stored process-start generation still match the live beacon.
+Controller startup and compaction resume auto-claim the canonical-project journal
+lease described in `protocols/session-preflight.md`. The lease carries the stable
+label, one active generation, nonce capability, exact PID/start-token principal when
+available, and renewal horizon. A live different generation is never displaced by an
+automatic claim. Listener, drainer, mirror, and dashboard roles do not claim or renew;
+a verified watchdog tick may renew.
 
-Beacon records are label-scoped for dispatch ownership. A controller exit
-without release leaves a record on disk, but `live_session()` ignores it once
-its PID is dead or reused by a later process generation. A stale record
-therefore cannot displace a live same-label controller. Two different live
-labels coexist; duplicate live labels surface `conflicting_beacons` and are
-ambiguous rather than silently assigned, and a live controller cannot silently
-relabel itself. Claim or liveness failures leave later dispatches honestly
-unowned, even when another controller uses the same label.
-Normal shutdown may remove the record with `--release-session --session-pid
-<pid>`.
+Dispatch ownership is stamped only when the declared label and measured incarnation
+match the active lease. A mismatch is visible and remains honestly unowned. Normal
+shutdown may release the matching lease with `--release-session`; expiry with work
+needing care materializes a journal attention item.
 
 While a run is active, the orchestrator's `current_session` is stamped
 into the active goal-queue's frontmatter:

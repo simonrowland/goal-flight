@@ -75,6 +75,7 @@ import goalflight_ledger
 import goalflight_journal
 import goalflight_quota_stuck
 import goalflight_session_status
+import goalflight_task
 import goalflight_terminal
 from goalflight_agent_limits import moonshot_family
 from goalflight_codex_sandbox import codex_workspace_write_args
@@ -1102,7 +1103,7 @@ def _project_orientation_preamble(orientation_path: Path) -> str:
 
 
 def _project_root(args) -> Path:
-    return Path(args.cwd).resolve() if args.cwd else Path.cwd().resolve()
+    return goalflight_task.resolve_project_root(args.cwd or str(Path.cwd()))
 
 
 def _parse_task_ids(values: list[str] | None) -> list[str]:
@@ -2817,55 +2818,75 @@ def _reserve_auto_dispatch_id(agent: str, base: Path) -> str:
     raise DispatchUsageError(f"could not reserve a dispatch id for stem {stem!r}")
 
 
-def _stamp_controller_session(args, project_root: Path) -> None:
-    """Snapshot the live controller beacon onto one dispatch invocation.
-
-    The dispatch CLI is a short-lived process, so its pid is not controller
-    identity. Resolve the beacon once and keep its id/pid paired for every
-    record this invocation writes. A missing or unreadable beacon means the
-    dispatch is unowned; it must never make the launch fail or cause this
-    process to be substituted as the owner.
-    """
+def _stamp_controller_session(args, project_root: Path) -> dict[str, object]:
+    """Auto-claim a controller entry, or verify child ownership without renewal."""
+    root = goalflight_task.resolve_project_root(str(project_root))
+    declared_label = getattr(args, "controller_label", None)
     requested_label = goalflight_session_status.resolve_controller_label(
-        getattr(args, "controller_label", None)
+        declared_label,
+        project_root=root,
     )
+    declared_owner_pid = getattr(args, "controller_beacon_pid", None)
     requested_pid = goalflight_session_status.resolve_controller_pid(
-        getattr(args, "controller_beacon_pid", None)
+        declared_owner_pid
     )
-    if not requested_label and requested_pid is None:
-        # Nothing was declared, so ask the registry who is running here.
-        #
-        # Declaring an owner requires either a flag on every dispatch or an
-        # environment variable, and neither survives a controller that drives
-        # this tool through separate short-lived shells -- which is the normal
-        # case. The result was that ownership went unrecorded even for a
-        # properly registered controller: measured on this project, 26 of 26
-        # dispatches carried no owner while two labels sat in the registry.
-        # Unowned dispatches cannot be routed, so mail addressed by ownership
-        # has nowhere to go and a listener cannot be attributed to anyone.
-        #
-        # The registry persists on disk, so it can answer later invocations
-        # that the environment cannot. Inference supplies BOTH label and pid so
-        # every check below still applies unchanged -- this widens where the
-        # inputs come from, not what is accepted.
-        inferred = _sole_live_controller(project_root)
-        if inferred is not None:
-            requested_label, requested_pid = inferred
-    try:
-        session = (
-            goalflight_session_status.live_session(
-                project_root,
-                label=requested_label,
-                pid=requested_pid,
-            )
-            if requested_label
-            else None
+    requested_session_id = goalflight_session_status.resolve_controller_session_id(
+        getattr(args, "controller_session_id", None)
+    )
+    child_role = bool(
+        getattr(args, "from_queue", False)
+        or getattr(args, "launch_detached", False)
+        or getattr(args, "acp_detached_child", False)
+    )
+    session: dict | None = None
+    claim_result: dict[str, object]
+    if requested_label and not child_role:
+        claim_result = goalflight_session_status.claim_controller_startup(
+            root,
+            pid=requested_pid,
+            label=requested_label,
+            pid_from_ancestry=requested_pid is None,
+            role="controller",
+            session_id=requested_session_id,
         )
-    except Exception:
-        session = None
-    if isinstance(session, dict) and session.get("conflicting_beacons"):
-        session = None
-
+        if claim_result.get("claimed"):
+            candidate = claim_result.get("session")
+            session = dict(candidate) if isinstance(candidate, dict) else None
+        elif claim_result.get("reason") == "label_in_use":
+            args.controller_session_id = None
+            args._controller_beacon_pid = None
+            args.controller_label = None
+            return claim_result
+        else:
+            claim_result.setdefault("visible_warning", True)
+    else:
+        claim_result = {
+            "claimed": False,
+            "reason": "role_does_not_claim" if child_role else "missing_controller_label",
+            "role": "drainer" if child_role else "controller",
+        }
+        if requested_label:
+            candidate = (
+                goalflight_session_status.live_session(
+                    root,
+                    label=requested_label,
+                    pid=requested_pid,
+                )
+                if requested_pid is not None and requested_session_id is not None
+                else None
+            )
+            measured = (
+                goalflight_session_status._controller_process_identity(requested_pid)
+                if requested_pid is not None
+                else None
+            )
+            if (
+                isinstance(candidate, dict)
+                and candidate.get("id") == requested_session_id
+                and isinstance(measured, dict)
+                and candidate.get("process_identity") == measured
+            ):
+                session = candidate
     session_id = session.get("id") if isinstance(session, dict) else None
     session_pid = session.get("pid") if isinstance(session, dict) else None
     session_label = session.get("label") if isinstance(session, dict) else None
@@ -2873,69 +2894,14 @@ def _stamp_controller_session(args, project_root: Path) -> None:
         session_pid = int(session_pid) if session_pid is not None else None
     except (TypeError, ValueError):
         session_pid = None
-    if (
-        not session_id
-        or not session_label
-        or (requested_pid is not None and session_pid != requested_pid)
-        or (requested_pid is None and session_pid is not None)
-    ):
+    if not session_id or not session_label:
         session_id = None
         session_pid = None
         session_label = None
-    else:
-        try:
-            touched = goalflight_session_status.touch_controller_heartbeat(
-                project_root,
-                str(session_label),
-                session_id=str(session_id),
-                pid=session_pid,
-                dispatching_pid=os.getpid(),
-            )
-            if touched is None:
-                session_id = None
-                session_pid = None
-                session_label = None
-        except Exception:
-            session_id = None
-            session_pid = None
-            session_label = None
-
     args.controller_session_id = str(session_id) if session_id is not None else None
     args._controller_beacon_pid = session_pid
     args.controller_label = str(session_label) if session_label is not None else None
-
-
-def _sole_live_controller(project_root) -> tuple[str, int] | None:
-    """The one live controller registered here, or None when that is not one.
-
-    Deliberately refuses to guess when several controllers share a project --
-    battery-tool-v2 runs three. Picking one of them would attribute a dispatch
-    to a controller that did not launch it, which is worse than leaving it
-    unowned: unowned is visibly unknown, whereas a wrong owner reads as fact and
-    would route another controller's mail. Those controllers declare their label
-    explicitly, which still takes precedence over anything inferred here.
-
-    Returns None on any failure. Ownership is metadata; it must never be able to
-    fail a launch.
-    """
-    try:
-        labels = goalflight_session_status.registered_controller_labels(project_root)
-    except Exception:
-        return None
-    live: list[tuple[str, int]] = []
-    for label in sorted(labels):
-        try:
-            session = goalflight_session_status.live_session(project_root, label=label)
-        except Exception:
-            continue
-        if not isinstance(session, dict) or session.get("conflicting_beacons"):
-            continue
-        pid = session.get("pid")
-        if not isinstance(pid, int) or pid <= 0:
-            continue
-        live.append((str(session.get("label") or label), pid))
-    return live[0] if len(live) == 1 else None
-
+    return claim_result
 
 def _controller_pid(args) -> int | None:
     session_id = getattr(args, "controller_session_id", None)
@@ -3444,6 +3410,9 @@ def _record_ledger(args, *, project_root: Path, prompt_path: str | None, status_
         _start_dashboard_refresh_for_project(project_root)
 
 
+_NATIVE_RECORD_LEDGER = _record_ledger
+
+
 def _attempt_claiming_worker_argv(
     project_root: Path,
     dispatch_id: str,
@@ -3456,6 +3425,11 @@ def _attempt_claiming_worker_argv(
         return worker_argv, False
     attempt = goalflight_journal.Journal(project_root).attempt_for_dispatch(dispatch_id)
     if attempt is None:
+        if _record_ledger is not _NATIVE_RECORD_LEDGER:
+            # Controller registration can create the journal independently of
+            # an embedder's injected, non-persisting ledger seam.  Its mere
+            # presence does not prove that seam prepared a launch attempt.
+            return worker_argv, False
         raise RuntimeError(f"prepared attempt missing for {dispatch_id}")
     if attempt.lifecycle_state != goalflight_journal.ATTEMPT_STARTING:
         raise RuntimeError(
@@ -3699,14 +3673,17 @@ def _canonical_replay_argv(args, raw_argv: list[str], *, tail: Path, status_json
         argv += ["--permission-inline-timeout-s", str(args.permission_inline_timeout_s)]
     if args.permission_user_timeout_s is not None:
         argv += ["--permission-user-timeout-s", str(args.permission_user_timeout_s)]
-    # Persist only the controller's declared lookup key. Replay re-measures the
-    # live beacon and therefore cannot turn this snapshot into stale ownership.
+    # Replay presents the controller capability plus its measured beacon
+    # identity.  The child process's own PID never becomes the lease principal.
     controller_label = _controller_label(args)
     controller_beacon_pid = _controller_pid(args)
+    controller_session_id = _controller_session_id(args)
     if controller_label is not None:
         argv += ["--controller-label", controller_label]
     if controller_beacon_pid is not None:
         argv += ["--controller-beacon-pid", str(controller_beacon_pid)]
+    if controller_session_id is not None:
+        argv += ["--controller-session-id", controller_session_id]
     if raw_argv:
         argv += ["--", *raw_argv]
     return argv
@@ -6475,7 +6452,9 @@ def _write_reconciled_terminal_status(entry: dict, marker: dict | None) -> None:
         return
     request = entry.get("request") if isinstance(entry.get("request"), dict) else {}
     args = _queued_args_for_status(entry)
-    project_root = Path(str(entry.get("project_root") or request.get("cwd") or Path.cwd())).resolve()
+    project_root = goalflight_task.resolve_project_root(
+        str(entry.get("project_root") or request.get("cwd") or Path.cwd())
+    )
     status_json = Path(str(request.get("status_json") or record.get("status_path") or _dispatch_base_dir() / f"{dispatch_id}.status.json"))
     tail = Path(str(request.get("tail") or record.get("stdout_path") or _dispatch_base_dir() / f"{dispatch_id}.tail"))
     state = str(record.get("state") or record.get("terminal_state") or "worker_dead")
@@ -7655,7 +7634,9 @@ def _restore_queued_record_from_entry(entry: dict, queue_path: Path) -> None:
     """Post-commit queued status/dashboard mirror; ledger truth is already durable."""
     request = entry.get("request") if isinstance(entry.get("request"), dict) else {}
     args = _queued_args_for_status(entry)
-    project_root = Path(str(entry.get("project_root") or request.get("cwd") or Path.cwd())).resolve()
+    project_root = goalflight_task.resolve_project_root(
+        str(entry.get("project_root") or request.get("cwd") or Path.cwd())
+    )
     status_json = Path(str(request.get("status_json") or _dispatch_base_dir() / f"{args.dispatch_id}.status.json"))
     tail = Path(str(request.get("tail") or _dispatch_base_dir() / f"{args.dispatch_id}.tail"))
     lock = goalflight_ledger.StateLock.try_acquire(
@@ -8181,7 +8162,9 @@ def _mark_claim_worker_dead(
         return False
     request = entry.get("request") if isinstance(entry.get("request"), dict) else {}
     args = _queued_args_for_status(entry)
-    project_root = Path(str(entry.get("project_root") or request.get("cwd") or Path.cwd())).resolve()
+    project_root = goalflight_task.resolve_project_root(
+        str(entry.get("project_root") or request.get("cwd") or Path.cwd())
+    )
     status_json = Path(str(request.get("status_json") or _dispatch_base_dir() / f"{dispatch_id}.status.json"))
     tail = Path(str(request.get("tail") or _dispatch_base_dir() / f"{dispatch_id}.tail"))
     ignore_prefix_lines = _ignore_prefix_lines(
@@ -9537,6 +9520,7 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument("--controller-beacon-pid", type=int, help=argparse.SUPPRESS)
+    parser.add_argument("--controller-session-id", help=argparse.SUPPRESS)
     parser.add_argument("--from-queue", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--queue-launch-token", help=argparse.SUPPRESS)
     parser.add_argument("--queue-claim-path", help=argparse.SUPPRESS)
@@ -9572,8 +9556,6 @@ def main(argv: list[str] | None = None) -> int:
             print(goalflight_ledger.format_stats_table(payload))
         return 0
     raw = _raw_worker_args(args)
-    _stamp_controller_session(args, _project_root(args))
-
     if args.interactive:
         if args.shape not in {"auto", "acp"}:
             print("goalflight_dispatch: --interactive conflicts with --shape bash", file=sys.stderr)
@@ -9586,6 +9568,21 @@ def main(argv: list[str] | None = None) -> int:
     if shape == "auto":
         shape = "acp" if args.agent in ("cursor", "claude-acp", "claude") else "bash"
     args.shape = shape
+    if not goalflight_compat.is_windows():
+        controller_claim = _stamp_controller_session(args, _project_root(args))
+        if controller_claim.get("reason") == "label_in_use":
+            print(
+                "goalflight_dispatch: "
+                + str(controller_claim.get("message") or "label in use; choose another label or take over explicitly"),
+                file=sys.stderr,
+            )
+            return 73
+        if controller_claim.get("visible_warning"):
+            print(
+                "goalflight_dispatch: controller auto-claim unavailable: "
+                + str(controller_claim.get("reason") or "unknown"),
+                file=sys.stderr,
+            )
     if shape == "acp":
         try:
             _normalize_acp_agent(args)

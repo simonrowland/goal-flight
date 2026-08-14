@@ -3,16 +3,56 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = REPO_ROOT / "scripts" / "goalflight_messages.py"
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 import goalflight_messages as msg  # noqa: E402
+import goalflight_journal as journal  # noqa: E402
+
+
+CONTROLLER_LABEL = "headlines"
+
+
+def _project(tmp_path: Path) -> Path:
+    project = tmp_path / "project"
+    project.mkdir(exist_ok=True)
+    return project
+
+
+def _test_env(tmp_path: Path) -> dict[str, str]:
+    env = os.environ.copy()
+    env.update(
+        {
+            "GOALFLIGHT_MESSAGES_DIR": str(tmp_path / "messages"),
+            "GOALFLIGHT_JOURNAL_DIR": str(tmp_path / "journals"),
+            "GOALFLIGHT_TASK_STORE_DIR": str(tmp_path / "tasks"),
+            "GOAL_FLIGHT_PIDFILE_DIR": str(tmp_path / "pids"),
+            "GOALFLIGHT_CAPACITY_CONF": "/dev/null",
+            "GOALFLIGHT_CONTROLLER_LABEL": CONTROLLER_LABEL,
+            "GOALFLIGHT_TEST_MODE": "1",
+        }
+    )
+    return env
+
+
+def _ensure_controller(tmp_path: Path) -> None:
+    with mock.patch.dict(os.environ, _test_env(tmp_path), clear=False):
+        authority = journal.open_or_create_journal(_project(tmp_path))
+        active = authority.active_lease(CONTROLLER_LABEL)
+        result = authority.claim_or_renew_lease(
+            CONTROLLER_LABEL,
+            principal={"principal_id": "headline-test-controller"},
+            nonce=active.nonce if active is not None else None,
+        )
+    assert result.committed, result.reason
 
 
 def _post_env(
@@ -21,9 +61,11 @@ def _post_env(
     *,
     subject: str | None = None,
     dispatch_id: str = "d1",
-    msg_type: str = "status",
+    msg_type: str = "controller-notice",
     adapter: str = "codex",
 ) -> dict:
+    _ensure_controller(tmp_path)
+    project = _project(tmp_path)
     argv = [
         sys.executable,
         str(SCRIPT),
@@ -44,12 +86,18 @@ def _post_env(
         adapter,
         "--transport",
         "controller",
+        "--to-controller",
+        CONTROLLER_LABEL,
+        "--controller-project-root",
+        str(project),
         "--json",
     ]
     if subject is not None:
         argv.extend(["--subject", subject])
     posted = subprocess.run(
         argv,
+        cwd=project,
+        env=_test_env(tmp_path),
         text=True,
         capture_output=True,
         check=False,
@@ -63,9 +111,11 @@ def _post_env_raw(
     text: str,
     *,
     dispatch_id: str,
-    msg_type: str = "status",
+    msg_type: str = "controller-notice",
 ) -> subprocess.CompletedProcess[str]:
     """Post without asserting success -- for inputs the API must refuse."""
+    _ensure_controller(tmp_path)
+    project = _project(tmp_path)
     return subprocess.run(
         [
             sys.executable,
@@ -87,8 +137,14 @@ def _post_env_raw(
             "codex",
             "--transport",
             "controller",
+            "--to-controller",
+            CONTROLLER_LABEL,
+            "--controller-project-root",
+            str(project),
             "--json",
         ],
+        cwd=project,
+        env=_test_env(tmp_path),
         text=True,
         capture_output=True,
         check=False,
@@ -107,11 +163,17 @@ def _run_relay(tmp_path: Path, *, bodies: bool = False) -> subprocess.CompletedP
         str(fleet_dir),
         "relay",
         "--new",
-        "--all-projects",
     ]
     if bodies:
         argv.append("--bodies")
-    return subprocess.run(argv, text=True, capture_output=True, check=False)
+    return subprocess.run(
+        argv,
+        cwd=_project(tmp_path),
+        env=_test_env(tmp_path),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
 
 
 def test_explicit_subject_wins_over_body(tmp_path: Path) -> None:
@@ -160,7 +222,7 @@ def test_listing_carries_size_without_dumping_body(tmp_path: Path) -> None:
         dispatch_id="proj",
     )
     out = msg.format_envelope_headlines([envelope])
-    assert out == "proj #1 [status] from codex: Big one  (2048c)"
+    assert out == "proj #1 [controller-notice] from codex: Big one  (2048c)"
     assert fragment not in out
 
 
@@ -193,9 +255,9 @@ def test_default_and_bodies_cli_paths_round_trip_subject(tmp_path: Path) -> None
     headlines = _run_relay(tmp_path)
     assert headlines.returncode == 0, headlines.stderr
     assert headlines.stdout.splitlines() == [
-        "kiln #1 [status] from codex: Gate green  (2048c)",
-        "bodies: re-run with --bodies, or read one inbox with `read`",
-        "unseen counts: kiln=1",
+        "kiln #1 [controller-notice] from codex: Gate green  (2048c)",
+        "bodies: re-run with --bodies",
+        "pending counts: kiln=1",
     ]
     assert fragment not in headlines.stdout
 
@@ -240,11 +302,11 @@ def test_relay_new_sanitizes_full_stdout_structure(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     assert result.stdout.splitlines() == [
         (
-            r"safe #1 [status] from codex: "
+            r"safe #1 [controller-notice] from codex: "
             rf"first line / FORGED-BODY\x1b[2J\x9b31m  ({len(body)}c)"
         ),
-        "bodies: re-run with --bodies, or read one inbox with `read`",
-        "unseen counts: safe=1",
+        "bodies: re-run with --bodies",
+        "pending counts: safe=1",
     ]
     assert "\x1b" not in result.stdout
     assert "\x9b" not in result.stdout

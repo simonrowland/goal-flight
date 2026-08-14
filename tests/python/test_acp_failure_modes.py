@@ -750,6 +750,7 @@ def case_runner_preserves_live_controller_beacon_pair() -> None:
                 session_id="acp-controller-session",
                 label="battery-main",
             )
+            args.controller_session_id = claimed["id"]
             dispatch._stamp_controller_session(args, project_root)
             expected = (claimed["id"], beacon.pid)
             with patch.object(

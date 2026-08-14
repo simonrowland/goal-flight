@@ -31,20 +31,25 @@ import goalflight_watch  # noqa: E402
 def _env(tmp: Path) -> dict[str, str]:
     env = os.environ.copy()
     env["GOALFLIGHT_STATE_DIR"] = str(tmp / "state")
+    env["GOALFLIGHT_TASK_STORE_DIR"] = str(tmp / "task-store")
+    env["GOALFLIGHT_JOURNAL_DIR"] = str(tmp / "journal")
+    env["GOALFLIGHT_MESSAGES_DIR"] = str(tmp / "messages")
     env["GOAL_FLIGHT_PIDFILE_DIR"] = str(tmp / "pids")
+    env["GOALFLIGHT_CONTROLLER_SESSION_ID"] = f"test-{tmp.name}"
     # Tests assert the instant DISPATCH-BLOCKED path; disable the capacity
     # queue (lane defaults wait minutes, which would hang subprocess asserts).
     env["GOALFLIGHT_CAPACITY_WAIT_S"] = "0"
+    env["GOALFLIGHT_TEST_PROJECT_ROOT"] = str(tmp)
     return env
 
 
-def _status(env: dict[str, str], *, cwd: Path = ROOT) -> dict:
+def _status(env: dict[str, str], *, cwd: Path | None = None) -> dict:
     # cwd selects the project whose records are read. A case that pins its
     # dispatch to a sandbox root must read that same root back, or it asks
     # this repo whether it has a record it was never given.
     proc = subprocess.run(
         [sys.executable, str(STATUS), "--json"],
-        cwd=cwd,
+        cwd=cwd or Path(env["GOALFLIGHT_TEST_PROJECT_ROOT"]),
         env=env,
         text=True,
         stdout=subprocess.PIPE,
@@ -112,7 +117,7 @@ def _dispatch_command(
     from_queue: bool = False,
     launch_detached: bool = False,
     foreground: bool = True,
-    isolate_project: bool = False,
+    isolate_project: bool = True,
 ) -> list[str]:
     cmd = [
         sys.executable,
@@ -131,13 +136,10 @@ def _dispatch_command(
         max_idle_secs,
     ]
     if isolate_project:
-        # Pin the project root to the sandbox. The controller registry is a
-        # per-project file (<root>/docs-private/.goal-flight-current-session
-        # .json), so a dispatch inheriting this repo as its cwd discovers
-        # whatever controller is registered here and attributes ownership to
-        # it -- which made ownership assertions pass on an unregistered host
-        # and fail on a registered one. Opt-in, because the other cases here
-        # deliberately read this repo's ledger and lease state.
+        # Every real dispatch in this module owns a sandbox project. Controller
+        # leases are keyed by (label, project_root), so using the repository
+        # root would inherit a live controller's lease and make the result
+        # depend on ambient host state.
         cmd += ["--cwd", str(tmp)]
     if controller_pid is not None:
         cmd += ["--controller-pid", str(controller_pid)]
@@ -165,7 +167,7 @@ def _run_dispatch(
     from_queue: bool = False,
     launch_detached: bool = False,
     foreground: bool = True,
-    isolate_project: bool = False,
+    isolate_project: bool = True,
     timeout_s: float = 90.0,
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
@@ -213,7 +215,7 @@ def _dispatch_launched(stdout: str) -> dict:
     raise AssertionError(f"missing DISPATCH-LAUNCHED in stdout:\n{stdout}")
 
 
-def _capacity_release_stale(env: dict[str, str], *, cwd: Path = ROOT) -> dict:
+def _capacity_release_stale(env: dict[str, str], *, cwd: Path | None = None) -> dict:
     proc = subprocess.run(
         [
             sys.executable,
@@ -225,7 +227,7 @@ def _capacity_release_stale(env: dict[str, str], *, cwd: Path = ROOT) -> dict:
             "test_release_stale",
             "--keep",
         ],
-        cwd=cwd,
+        cwd=cwd or Path(env["GOALFLIGHT_TEST_PROJECT_ROOT"]),
         env=env,
         text=True,
         stdout=subprocess.PIPE,
@@ -236,7 +238,7 @@ def _capacity_release_stale(env: dict[str, str], *, cwd: Path = ROOT) -> dict:
 
 
 def _assert_terminal_record_and_lease(
-    env: dict[str, str], dispatch_id: str, state: str, *, cwd: Path = ROOT
+    env: dict[str, str], dispatch_id: str, state: str, *, cwd: Path | None = None
 ) -> None:
     payload = _status(env, cwd=cwd)
     row = _record(payload, dispatch_id)
@@ -282,6 +284,8 @@ def case_status_sees_dispatch_and_lease_releases() -> None:
                 str(tmp / "tail.txt"),
                 "--status-json",
                 str(tmp / "status.json"),
+                "--cwd",
+                str(tmp),
                 "--poll-secs",
                 "0.2",
                 "--max-idle-secs",
@@ -347,6 +351,9 @@ def case_unowned_pidfile_preserves_blocked_worker_for_reattach() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         env = _env(tmp)
+        env.pop("GOALFLIGHT_CONTROLLER_LABEL", None)
+        env.pop("GOALFLIGHT_CONTROLLER_SESSION_ID", None)
+        env["GOALFLIGHT_CONTROLLER_PID"] = "99999991"
         dispatch_id = "dispatch-blocked-reattach"
         worker_pid = None
         try:
@@ -486,6 +493,9 @@ def case_direct_default_background_records_unowned_controller() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         env = _env(tmp)
+        env.pop("GOALFLIGHT_CONTROLLER_LABEL", None)
+        env.pop("GOALFLIGHT_CONTROLLER_SESSION_ID", None)
+        env["GOALFLIGHT_CONTROLLER_PID"] = "99999991"
         dispatch_id = "dispatch-default-background"
         status_path = tmp / f"{dispatch_id}.status.json"
         worker_pid = None
@@ -728,6 +738,8 @@ def case_submit_foreground_rejected() -> None:
                 "test-dispatch",
                 "--prompt",
                 "COMPLETE: noop",
+                "--cwd",
+                str(tmp),
             ],
             cwd=ROOT,
             env=env,
@@ -754,7 +766,7 @@ def case_capacity_block_does_not_spawn() -> None:
                 "--dispatch-id",
                 "held-capacity",
                 "--project-root",
-                str(ROOT),
+                str(tmp),
                 "--ttl-s",
                 "60",
             ],
@@ -781,6 +793,8 @@ def case_capacity_block_does_not_spawn() -> None:
                 str(tmp / "blocked.tail"),
                 "--status-json",
                 str(status_path),
+                "--cwd",
+                str(tmp),
                 "--",
                 sys.executable,
                 "-c",
@@ -814,7 +828,7 @@ def case_capacity_wait_queues_until_slot_frees() -> None:
             [
                 sys.executable, "scripts/goalflight_capacity.py", "acquire",
                 "--agent", "test-dispatch", "--dispatch-id", "held-for-queue",
-                "--project-root", str(ROOT), "--ttl-s", "60",
+                "--project-root", str(tmp), "--ttl-s", "60",
             ],
             cwd=ROOT, env=env, text=True,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True,
@@ -836,6 +850,7 @@ def case_capacity_wait_queues_until_slot_frees() -> None:
                 "--poll-secs", "0.2", "--max-idle-secs", "20",
                 "--tail", str(tmp / "queued.tail"),
                 "--status-json", str(status_path),
+                "--cwd", str(tmp),
                 "--foreground",
                 "--", sys.executable, "-c", worker_code,
             ],
@@ -859,7 +874,7 @@ def case_capacity_wait_queues_until_slot_frees() -> None:
         # While queued: --done must report LIVE (exit 1), not done/ambiguous —
         # the pre-recorded ledger entry classifies as queued_capacity.
         done = subprocess.run(
-            [sys.executable, str(STATUS), "--done", "queued-dispatch"],
+            [sys.executable, str(STATUS), "--project", str(tmp), "--done", "queued-dispatch"],
             cwd=ROOT, env=env, text=True,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
@@ -874,6 +889,7 @@ def case_capacity_wait_queues_until_slot_frees() -> None:
                 "--capacity-wait-s", "0",
                 "--tail", str(tmp / "reuse.tail"),
                 "--status-json", str(tmp / "reuse.status.json"),
+                "--cwd", str(tmp),
                 "--foreground",
                 "--", sys.executable, "-c", "print('nope')",
             ],
@@ -910,7 +926,7 @@ def case_capacity_wait_interrupt_writes_terminal_status() -> None:
             [
                 sys.executable, "scripts/goalflight_capacity.py", "acquire",
                 "--agent", "test-dispatch", "--dispatch-id", "held-for-interrupt",
-                "--project-root", str(ROOT), "--ttl-s", "60",
+                "--project-root", str(tmp), "--ttl-s", "60",
             ],
             cwd=ROOT, env=env, text=True,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True,
@@ -923,6 +939,7 @@ def case_capacity_wait_interrupt_writes_terminal_status() -> None:
                 "--capacity-wait-s", "120",
                 "--tail", str(tmp / "interrupted.tail"),
                 "--status-json", str(status_path),
+                "--cwd", str(tmp),
                 "--foreground",
                 "--", sys.executable, "-c", "print('never runs')",
             ],
@@ -954,6 +971,8 @@ def case_require_prompt_before_side_effects() -> None:
                 str(DISPATCH),
                 "--agent",
                 "codex",
+                "--cwd",
+                str(tmp),
             ],
             cwd=ROOT,
             env=env,
@@ -981,6 +1000,8 @@ def case_account_guard_before_prompt_materialization() -> None:
                 missing,
                 "--prompt",
                 "COMPLETE: should not materialize",
+                "--cwd",
+                str(tmp),
             ],
             cwd=ROOT,
             env=env,
@@ -1013,6 +1034,8 @@ def case_codex_routed_subscription_strips_openai_api_key() -> None:
                     str(tmp / f"{dispatch_id}.tail"),
                     "--status-json",
                     str(tmp / f"{dispatch_id}.status.json"),
+                    "--cwd",
+                    str(tmp),
                     "--poll-secs",
                     "0.1",
                     "--max-idle-secs",
@@ -1054,6 +1077,8 @@ def case_state_dir_auto_paths() -> None:
                 "0.1",
                 "--max-idle-secs",
                 "5",
+                "--cwd",
+                str(tmp),
                 "--foreground",
                 "--",
                 sys.executable,
@@ -1128,6 +1153,8 @@ def case_dispatch_id_collision_suffix() -> None:
                     "0.1",
                     "--max-idle-secs",
                     "5",
+                    "--cwd",
+                    str(tmp),
                     "--foreground",
                     "--",
                     sys.executable,

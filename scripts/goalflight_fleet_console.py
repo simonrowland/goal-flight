@@ -29,6 +29,7 @@ sys.path.insert(0, str(ROOT))
 
 import goalflight_dispatch_states
 import goalflight_fleet_status_cli
+import goalflight_journal
 import goalflight_messages
 import goalflight_session_status
 import goalflight_status
@@ -555,12 +556,15 @@ def _controller_labels_by_session(
     }
     if not wanted:
         return {}
-    session_map = goalflight_session_status._read_session_map(  # noqa: SLF001
-        goalflight_session_status._session_file(project_root)  # noqa: SLF001
-    )
+    try:
+        session_rows = goalflight_journal.Journal(project_root).lease_records(
+            include_ended=True
+        )
+    except goalflight_journal.JournalUnavailable:
+        return {}
     labels: dict[str, set[str]] = {}
-    for session in session_map.values():
-        session_id = _display(session.get("id"), limit=128)
+    for session in session_rows:
+        session_id = _display(session.get("nonce"), limit=128)
         label = _display(session.get("label"), limit=64)
         if session_id in wanted and label:
             labels.setdefault(session_id, set()).add(label)

@@ -93,6 +93,7 @@ def _run(
         proc = subprocess.run(
             [
                 sys.executable, str(DISPATCH),
+                "--cwd", tmp,
                 "--agent", "test", "--tail", str(tail), "--status-json", str(status),
                 "--poll-secs", poll, "--max-idle-secs", max_idle, "--foreground", "--", *worker_cmd,
             ],
@@ -135,6 +136,7 @@ def _run_dispatch_with_state(dispatch_id: str, worker_code: str, *, max_idle: st
         proc = subprocess.run(
             [
                 sys.executable, str(DISPATCH),
+                "--cwd", str(tmp_path),
                 "--agent", "codex",
                 "--dispatch-id", dispatch_id,
                 "--tail", str(tail),
@@ -484,6 +486,7 @@ def case_worker_and_watcher_survive_launcher_pgroup_sigterm() -> None:
         proc = subprocess.Popen(
             [
                 sys.executable, str(DISPATCH),
+                "--cwd", str(tmp_path),
                 "--agent", "test", "--tail", str(tail), "--status-json", str(status),
                 "--poll-secs", "0.2", "--max-idle-secs", "10", "--foreground", "--",
                 sys.executable, "-c", worker_code,
@@ -535,6 +538,9 @@ def case_foreground_keyboard_interrupt_leaves_worker_and_watcher_running() -> No
         done = tmp_path / "done"
         env = os.environ.copy()
         _isolate_state_env(env, tmp_path)
+        env.pop("GOALFLIGHT_CONTROLLER_LABEL", None)
+        env.pop("GOALFLIGHT_CONTROLLER_SESSION_ID", None)
+        env["GOALFLIGHT_CONTROLLER_PID"] = "99999991"
         env["GOAL_FLIGHT_PIDFILE_DIR"] = str(tmp_path / "pids")
         pid_dir = Path(env["GOAL_FLIGHT_PIDFILE_DIR"])
         worker_code = (

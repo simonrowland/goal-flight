@@ -28,17 +28,13 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 DEFAULT_CONTRACT = REPO_ROOT / "docs-private" / "architecture" / "contracts" / "goalflight.message.v1.json"
 AGGREGATE_SCHEMA = "goalflight.fleet.register.aggregate.v1"
-READ_CURSOR_FILE = ".read-cursor.json"
-ACK_CURSOR_FILE = ".ack-cursor.json"
 INGESTION_ORDER_FILE = ".ingestion-order"
 INGESTION_IDENTITY_FILE = ".ingestion-identities.json"
-MESSAGE_CURSOR_SCHEMA = "goalflight.message-cursor.v1"
 INGESTION_IDENTITY_SCHEMA = "goalflight.ingestion-identities.v1"
 _INBOX_CURSOR_KEY_FIELD = "_goalflight_inbox_cursor_key"
 _INBOX_CURSOR_KEYS_FIELD = "_goalflight_inbox_cursor_keys"
 _INBOX_SOURCE_PATHS_FIELD = "_goalflight_inbox_source_paths"
 _INGESTION_ORDER_FIELD = "_goalflight_ingestion_order"
-BACKLOG_DIGEST_DIR = "backlog-digests"
 DEFAULT_RELAY_ITEM_LIMIT = 20
 DEFAULT_RELAY_BYTE_LIMIT = 4096
 TASKLESS_TERMINAL_STALE_AFTER = dt.timedelta(hours=24)
@@ -401,257 +397,6 @@ def mail_lock(path: Path):
             goalflight_compat.flock(fh, goalflight_compat.LOCK_UN)
 
 
-def read_cursor_path(messages_dir: Path) -> Path:
-    return messages_dir / READ_CURSOR_FILE
-
-
-def ack_cursor_path(messages_dir: Path) -> Path:
-    return messages_dir / ACK_CURSOR_FILE
-
-
-def _clean_cursor_entries(raw: object) -> dict[str, int]:
-    if not isinstance(raw, dict):
-        return {}
-    cursor: dict[str, int] = {}
-    for key, value in raw.items():
-        if not isinstance(key, str):
-            continue
-        try:
-            seq = int(value)
-        except (TypeError, ValueError):
-            continue
-        cursor[key] = max(0, seq)
-    return cursor
-
-
-def _load_read_cursor_unlocked(
-    path: Path,
-) -> tuple[dict[str, int], dict[str, object], bool, bool]:
-    """Load cursor state plus format facts; absent/corrupt state is unseen."""
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-        return {}, {}, False, False
-    if not isinstance(raw, dict):
-        return {}, {}, False, False
-    if (
-        raw.get("schema") == MESSAGE_CURSOR_SCHEMA
-        and raw.get("schema_version") == 1
-        and isinstance(raw.get("cursor"), dict)
-    ):
-        cursor = _clean_cursor_entries(raw["cursor"])
-        stored_migration = raw.get("migration")
-        migration = dict(stored_migration) if isinstance(stored_migration, dict) else {}
-        stored_unresolved = migration.get("unresolved")
-        unresolved = dict(stored_unresolved) if isinstance(stored_unresolved, dict) else {}
-        for key in list(cursor):
-            if _is_structural_cursor_key(key):
-                continue
-            unresolved.setdefault(
-                key,
-                {"value": cursor.pop(key), "reason": "invalid-versioned-cursor-key"},
-            )
-        migration["unresolved"] = unresolved
-        return (
-            cursor,
-            migration,
-            True,
-            True,
-        )
-    # No version marker means every key is legacy raw text. In particular, a
-    # dispatch id that happens to look like `["local","x"]` is not structural.
-    return _clean_cursor_entries(raw), {}, False, True
-
-
-def _structural_stream_key(source: str, stem: str) -> str:
-    return json.dumps([source, stem], ensure_ascii=False, separators=(",", ":"))
-
-
-def _structural_stream_key_parts(key: str) -> tuple[str, str] | None:
-    try:
-        value = json.loads(key)
-    except (json.JSONDecodeError, TypeError):
-        return None
-    if (
-        not isinstance(value, list)
-        or len(value) != 2
-        or value[0] not in {"local", "fleet"}
-        or not isinstance(value[1], str)
-    ):
-        return None
-    return str(value[0]), value[1]
-
-
-def _is_structural_cursor_key(key: str) -> bool:
-    if _structural_stream_key_parts(key) is not None:
-        return True
-    if not key.startswith("controller:"):
-        return False
-    try:
-        identity = json.loads(key.removeprefix("controller:"))
-    except (json.JSONDecodeError, TypeError):
-        return False
-    return (
-        isinstance(identity, list)
-        and len(identity) in {2, 3}
-        and isinstance(identity[-1], str)
-        and _structural_stream_key_parts(identity[-1]) is not None
-    )
-
-
-def _legacy_stream_cursor_target(
-    key: str,
-    *,
-    local_stems: set[str],
-    fleet_stems: set[str],
-) -> tuple[str | None, str | None]:
-    """Resolve an old textual cursor only when carrier paths make it unambiguous."""
-    candidates: set[str] = set()
-    if key in local_stems:
-        candidates.add(_structural_stream_key("local", key))
-    if key in fleet_stems:
-        candidates.add(_structural_stream_key("fleet", key))
-    if key.startswith("fleet:") and key[6:] in fleet_stems:
-        candidates.add(_structural_stream_key("fleet", key[6:]))
-    if len(candidates) == 1:
-        return next(iter(candidates)), None
-    if candidates:
-        return None, "ambiguous-carrier-provenance"
-    return None, "carrier-absent"
-
-
-def _legacy_cursor_target(
-    key: str,
-    *,
-    local_stems: set[str],
-    fleet_stems: set[str],
-) -> tuple[str | None, str | None]:
-    if not key.startswith("controller:"):
-        return _legacy_stream_cursor_target(
-            key,
-            local_stems=local_stems,
-            fleet_stems=fleet_stems,
-        )
-    try:
-        identity = json.loads(key.removeprefix("controller:"))
-    except (json.JSONDecodeError, TypeError):
-        return None, "unrecognized-legacy-key"
-    if not isinstance(identity, list) or len(identity) not in {2, 3}:
-        return None, "unrecognized-legacy-key"
-    legacy_inbox_key = identity[-1]
-    if not isinstance(legacy_inbox_key, str):
-        return None, "unrecognized-legacy-key"
-    migrated_inbox_key, unresolved_reason = _legacy_stream_cursor_target(
-        legacy_inbox_key,
-        local_stems=local_stems,
-        fleet_stems=fleet_stems,
-    )
-    if migrated_inbox_key is None:
-        return None, unresolved_reason
-    migrated_identity = [*identity[:-1], migrated_inbox_key]
-    return (
-        "controller:" + json.dumps(
-            migrated_identity,
-            ensure_ascii=False,
-            separators=(",", ":"),
-        ),
-        None,
-    )
-
-
-def _migrate_legacy_cursor_entries(
-    cursor: dict[str, int],
-    *,
-    messages_dir: Path,
-    fleet_dir: Path | None,
-) -> tuple[dict[str, int], dict[str, object]]:
-    """Migrate only measured provenance; retain every unresolved raw entry."""
-    local_stems = {
-        path.stem
-        for path in messages_dir.glob("*.jsonl")
-        if path.is_file()
-    } if messages_dir.is_dir() else set()
-    register_dir = fleet_dir / "register" / "dispatches" if fleet_dir is not None else None
-    fleet_stems = {
-        path.stem
-        for path in register_dir.glob("*.jsonl")
-        if path.is_file()
-    } if register_dir is not None and register_dir.is_dir() else set()
-    migrated: dict[str, int] = {}
-    unresolved: dict[str, dict[str, object]] = {}
-    for key, seq in cursor.items():
-        target, unresolved_reason = _legacy_cursor_target(
-            key,
-            local_stems=local_stems,
-            fleet_stems=fleet_stems,
-        )
-        if target is None:
-            unresolved[key] = {
-                "value": int(seq),
-                "reason": unresolved_reason or "unrecognized-legacy-key",
-            }
-            continue
-        migrated[target] = max(int(migrated.get(target, 0)), int(seq))
-    return migrated, {
-        "source_format": "unversioned-flat-map",
-        "migrated": len(cursor) - len(unresolved),
-        "unresolved": unresolved,
-    }
-
-
-def load_read_cursor(
-    path: Path,
-    *,
-    messages_dir: Path | None = None,
-    fleet_dir: Path | None = None,
-    migration_report: dict[str, object] | None = None,
-) -> dict[str, int]:
-    """Load and atomically migrate legacy keys before returning cursor state."""
-    resolved_messages_dir = messages_dir or path.parent
-    resolved_fleet_dir = fleet_dir if fleet_dir is not None else default_fleet_dir()
-    with mail_lock(path):
-        cursor, stored_report, versioned, loaded = _load_read_cursor_unlocked(path)
-        if versioned or not loaded:
-            resolved_report = stored_report
-        else:
-            cursor, resolved_report = _migrate_legacy_cursor_entries(
-                cursor,
-                messages_dir=resolved_messages_dir,
-                fleet_dir=resolved_fleet_dir,
-            )
-            write_read_cursor(path, cursor, migration_report=resolved_report)
-        if migration_report is not None:
-            migration_report.clear()
-            migration_report.update(resolved_report)
-        return cursor
-
-
-def write_read_cursor(
-    path: Path,
-    cursor: dict[str, int],
-    *,
-    migration_report: dict[str, object] | None = None,
-) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    clean = {str(key): max(0, int(value)) for key, value in sorted(cursor.items())}
-    report = dict(migration_report or {})
-    if not isinstance(report.get("unresolved"), dict):
-        report["unresolved"] = {}
-    document = {
-        "schema": MESSAGE_CURSOR_SCHEMA,
-        "schema_version": 1,
-        "cursor": clean,
-        "migration": report,
-    }
-    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    try:
-        tmp.write_text(json.dumps(document, sort_keys=True) + "\n", encoding="utf-8")
-        os.replace(tmp, path)
-    finally:
-        with contextlib.suppress(OSError):
-            tmp.unlink()
-
-
 def _next_ingestion_order(messages_dir: Path) -> int:
     """Allocate a controller-local causal order that survives restarts and clock rollback."""
     path = messages_dir / INGESTION_ORDER_FILE
@@ -723,38 +468,6 @@ def _ingestion_order_for_envelope(messages_dir: Path, envelope: dict) -> int:
         orders[identity] = order
         _write_ingestion_identity_orders(path, orders)
         return order
-
-
-def advance_read_cursor(
-    path: Path,
-    advances: dict[str, int] | None = None,
-    *,
-    max_scan: Callable[[], dict[str, int]] | None = None,
-    messages_dir: Path | None = None,
-    fleet_dir: Path | None = None,
-) -> list[dict[str, object]]:
-    """Advance cursor entries under lock; never rewind existing last-seen seq."""
-    results: list[dict[str, object]] = []
-    with mail_lock(path):
-        resolved_advances = dict(advances or {})
-        if max_scan is not None:
-            for key, through in max_scan().items():
-                old_target = int(resolved_advances.get(key, 0))
-                resolved_advances[key] = max(old_target, int(through))
-        cursor, migration_report, versioned, loaded = _load_read_cursor_unlocked(path)
-        if loaded and not versioned:
-            cursor, migration_report = _migrate_legacy_cursor_entries(
-                cursor,
-                messages_dir=messages_dir or path.parent,
-                fleet_dir=fleet_dir if fleet_dir is not None else default_fleet_dir(),
-            )
-        for key, through in sorted(resolved_advances.items()):
-            old = int(cursor.get(key, 0))
-            new = max(old, int(through))
-            cursor[key] = new
-            results.append({"inbox": key, "old": old, "new": new, "advanced": new > old})
-        write_read_cursor(path, cursor, migration_report=migration_report)
-    return results
 
 
 def _bounded_nonblank_string(value: object, *, path: str, limit: int) -> str:
@@ -1019,11 +732,6 @@ def resolved_envelope_cursor_keys(envelope: dict) -> list[str]:
         envelope_cursor_key(envelope, inbox_key=inbox_key)
         for inbox_key in inbox_cursor_keys(envelope)
     ]
-
-
-def cursor_has_unread_event(cursor: dict[str, int], keys: list[str], seq: int) -> bool:
-    """A copied logical event is unread only until any carrier is acknowledged."""
-    return bool(keys) and all(seq > int(cursor.get(key, 0)) for key in keys)
 
 
 def _cursor_metadata(keys: list[str]) -> dict[str, object]:
@@ -1559,6 +1267,8 @@ def post_message(
                 raise MessageError(
                     "event identity integrity conflict: same origin_node + event_uuid has different content"
                 )
+            assignment = _prepare_journal_delivery(same_identity, path)
+            _mark_journal_delivery(assignment)
             return {
                 "envelope": same_identity,
                 "line": serialize_envelope_line(same_identity),
@@ -1575,6 +1285,8 @@ def post_message(
         if skip_if is not None:
             duplicate = next((item for item in existing if skip_if(item)), None)
             if duplicate is not None:
+                assignment = _prepare_journal_delivery(duplicate, path)
+                _mark_journal_delivery(assignment)
                 return {
                     "envelope": duplicate,
                     "line": serialize_envelope_line(duplicate),
@@ -1593,13 +1305,20 @@ def post_message(
             envelope,
         )
         line = serialize_envelope_line(envelope)
+        replaced = [item for item in existing if replace_if is not None and replace_if(item)]
+        assignment = _prepare_journal_delivery(
+            envelope,
+            path,
+            replaced_envelopes=replaced,
+        )
         if replace_if is not None:
             _carrier_rewrite_locked(
                 transaction,
-                [item for item in existing if not replace_if(item)] + [envelope],
+                [item for item in existing if item not in replaced] + [envelope],
             )
         else:
             _carrier_append_locked(transaction, envelope)
+        _mark_journal_delivery(assignment)
         # The messages lock orders both the canonical record and its materialized
         # worker view. Releasing it between the two writes lets concurrent posts
         # assign message seq 1/2 but append steer entries in the order 2/1.
@@ -1642,6 +1361,137 @@ def _dispatch_record(dispatch_id: str) -> tuple[dict | None, str | None]:
         )
     except Exception as exc:  # noqa: BLE001 - surfaced as a delivery failure
         return None, f"{type(exc).__name__}: {exc}"
+
+
+def _journal_delivery_target(envelope: dict) -> tuple[Path, str] | None:
+    addressee_label = controller_addressee_label(envelope)
+    addressee_root = controller_addressee_project_root(envelope)
+    if addressee_label and addressee_root:
+        try:
+            import goalflight_task  # type: ignore
+
+            return goalflight_task.resolve_project_root(addressee_root), addressee_label
+        except Exception as exc:
+            raise MessageError(f"cannot resolve controller delivery project: {exc}") from exc
+    record, lookup_error = _dispatch_record(str(envelope.get("dispatch_id") or ""))
+    if lookup_error is not None:
+        raise MessageError(f"cannot resolve dispatch delivery assignment: {lookup_error}")
+    if isinstance(record, dict) and record.get("project_root"):
+        label = str(record.get("controller_label") or "").strip()
+        if not label:
+            return None
+        try:
+            import goalflight_task  # type: ignore
+
+            return goalflight_task.resolve_project_root(str(record["project_root"])), label
+        except Exception as exc:
+            raise MessageError(f"cannot resolve dispatch project: {exc}") from exc
+    payload = envelope.get("payload")
+    if isinstance(payload, dict) and payload.get("project_root"):
+        try:
+            import goalflight_task  # type: ignore
+
+            return goalflight_task.resolve_project_root(str(payload["project_root"])), "*"
+        except Exception as exc:
+            raise MessageError(f"cannot resolve project-scoped delivery: {exc}") from exc
+    return None
+
+
+def _prepare_journal_delivery(
+    envelope: dict,
+    path: Path,
+    *,
+    replaced_envelopes: Iterable[dict] = (),
+) -> dict[str, object] | None:
+    target = _journal_delivery_target(envelope)
+    if target is None:
+        for replaced in replaced_envelopes:
+            _withdraw_journal_delivery(replaced, path)
+        return None
+    project_root, recipient_label = target
+    try:
+        import goalflight_journal  # type: ignore
+
+        authority = goalflight_journal.open_or_create_journal(project_root)
+        source = envelope.get("source")
+        origin_node = str(source.get("node") if isinstance(source, dict) else "local")
+        replacement_keys: list[tuple[str, str, str]] = []
+        for replaced in replaced_envelopes:
+            old_target = _journal_delivery_target(replaced)
+            if old_target is None:
+                continue
+            old_root, old_recipient = old_target
+            if old_root != project_root:
+                raise MessageError(
+                    "journal replacement cannot move an assigned event between projects"
+                )
+            old_source = replaced.get("source")
+            old_origin = str(
+                old_source.get("node") if isinstance(old_source, dict) else "local"
+            )
+            replacement_keys.append(
+                (old_recipient, old_origin, str(replaced.get("id") or ""))
+            )
+        recorded = authority.record_delivery_event(
+            recipient_label=recipient_label,
+            origin_node=origin_node,
+            event_uuid=str(envelope.get("id") or ""),
+            stream_id=str(envelope.get("dispatch_id") or ""),
+            stream_seq=int(envelope.get("seq") or 0),
+            carrier_path=path,
+            event_type=str(envelope.get("type") or ""),
+            wake_class=event_wake_class(
+                str(envelope.get("type") or ""),
+                envelope.get("payload"),
+            ),
+            created_at=str(envelope.get("ts") or ""),
+            replaces=replacement_keys,
+        )
+        if not recorded.committed:
+            raise MessageError(
+                f"journal delivery assignment was not committed: {recorded.reason or recorded.disposition.value}"
+            )
+        return {
+            "authority": authority,
+            "recipient_label": recipient_label,
+            "origin_node": origin_node,
+            "event_uuid": str(envelope["id"]),
+        }
+    except MessageError:
+        raise
+    except Exception as exc:
+        raise MessageError(f"journal delivery assignment failed: {type(exc).__name__}: {exc}") from exc
+
+
+def _mark_journal_delivery(assignment: dict[str, object] | None) -> None:
+    if assignment is None:
+        return
+    authority = assignment["authority"]
+    result = authority.mark_delivery_projected(
+        recipient_label=str(assignment["recipient_label"]),
+        origin_node=str(assignment["origin_node"]),
+        event_uuid=str(assignment["event_uuid"]),
+    )
+    if not result.committed:
+        raise MessageError(
+            f"journal delivery projection was not committed: {result.reason or result.disposition.value}"
+        )
+
+
+def _withdraw_journal_delivery(envelope: dict, path: Path) -> None:
+    assignment = _prepare_journal_delivery(envelope, path)
+    if assignment is None:
+        return
+    authority = assignment["authority"]
+    result = authority.withdraw_delivery_event(
+        recipient_label=str(assignment["recipient_label"]),
+        origin_node=str(assignment["origin_node"]),
+        event_uuid=str(assignment["event_uuid"]),
+    )
+    if not result.committed:
+        raise MessageError(
+            f"journal delivery withdrawal was not committed: {result.reason or result.disposition.value}"
+        )
 
 
 def _deliver_message_to_worker(
@@ -1965,21 +1815,12 @@ def _closed_by_completion(envelope: dict, envelopes: list[dict]) -> bool:
 
 def _open_user_needs(
     envelopes: list[dict],
-    *,
-    acked_through: int = 0,
-    ack_cursor: dict[str, int] | None = None,
 ) -> list[dict]:
     open_items: list[dict] = []
     for env in envelopes:
         cursor_keys = resolved_envelope_cursor_keys(env)
-        is_unacked = (
-            cursor_has_unread_event(ack_cursor, cursor_keys, int(env.get("seq", 0)))
-            if ack_cursor is not None
-            else int(env.get("seq", 0)) > acked_through
-        )
         if (
             env.get("type") in {"user_need", "user_confirm", "blocked"}
-            and is_unacked
             and not _closed_by_completion(env, envelopes)
         ):
             payload = env.get("payload", {}) or {}
@@ -2002,11 +1843,9 @@ def _open_user_needs(
 def _open_controller_channel(
     envelopes: list[dict],
     *,
-    acked_through: int = 0,
-    ack_cursor: dict[str, int] | None = None,
     controller_label: str | None = None,
 ) -> list[dict]:
-    """Unacked controller-addressed messages.
+    """Controller-addressed messages present in the carrier projection.
 
     Deliberately NOT gated on _dispatch_complete the way _open_user_needs is: a
     worker's need dies with its dispatch, but a message a peer controller wrote
@@ -2018,15 +1857,7 @@ def _open_controller_channel(
         addressee_label = controller_addressee_label(env)
         if addressee_label and controller_label == addressee_label:
             cursor_keys = resolved_envelope_cursor_keys(env)
-        is_unacked = (
-            cursor_has_unread_event(ack_cursor, cursor_keys, int(env.get("seq", 0)))
-            if ack_cursor is not None
-            else int(env.get("seq", 0)) > acked_through
-        )
-        if (
-            canonical_event_type(str(env.get("type") or "")) in CONTROLLER_CHANNEL_TYPES
-            and is_unacked
-        ):
+        if canonical_event_type(str(env.get("type") or "")) in CONTROLLER_CHANNEL_TYPES:
             payload = env.get("payload", {}) or {}
             open_items.append(
                 {
@@ -2047,22 +1878,13 @@ def _open_controller_channel(
 
 def _open_controller_advisories(
     envelopes: list[dict],
-    *,
-    acked_through: int = 0,
-    ack_cursor: dict[str, int] | None = None,
 ) -> list[dict]:
     open_items: list[dict] = []
     for env in envelopes:
         cursor_keys = resolved_envelope_cursor_keys(env)
-        is_unacked = (
-            cursor_has_unread_event(ack_cursor, cursor_keys, int(env.get("seq", 0)))
-            if ack_cursor is not None
-            else int(env.get("seq", 0)) > acked_through
-        )
         if (
             env.get("dispatch_id") == "controller-quota-advisory"
             and env.get("type") == "advisory"
-            and is_unacked
             and not _closed_by_completion(env, envelopes)
         ):
             open_items.append(
@@ -2194,89 +2016,12 @@ def logical_envelopes_for_paths(
     return logical
 
 
-def max_seq_by_inbox(
-    *,
-    messages_dir: Path,
-    fleet_dir: Path | None = None,
-    dispatch_ids: set[str] | None = None,
-    carrier_errors: list[dict[str, object]] | None = None,
-) -> dict[str, int]:
-    maxes: dict[str, int] = {}
-    for path in collect_inbox_paths(messages_dir, fleet_dir, dispatch_ids=dispatch_ids):
-        envelopes = read_envelopes_tolerant(
-            path,
-            carrier_errors=carrier_errors,
-        )
-        maxes[inbox_stream_key(path, messages_dir=messages_dir)] = max(
-            (int(env.get("seq", 0)) for env in envelopes),
-            default=0,
-        )
-    return maxes
-
-
-def unseen_envelopes_for_paths(
-    paths: list[Path],
-    *,
-    messages_dir: Path | None = None,
-    cursor: dict[str, int],
-    last_n: int | None = None,
-    tolerate_errors: bool = False,
-    envelope_filter: Callable[[dict], bool] | None = None,
-    cursor_key: Callable[[dict, str], str] | None = None,
-    carrier_errors: list[dict[str, object]] | None = None,
-) -> tuple[list[dict], dict[str, int], dict[str, int]]:
-    shown: list[dict] = []
-    counts: dict[str, int] = {path.stem: 0 for path in paths}
-    ack_advances: dict[str, int] = {}
-    key_for = cursor_key or (lambda _env, inbox_key: inbox_key)
-    unseen: list[dict] = []
-    for env in logical_envelopes_for_paths(
-        paths,
-        messages_dir=messages_dir,
-        tolerate_errors=tolerate_errors,
-        envelope_filter=envelope_filter,
-        carrier_errors=carrier_errors,
-    ):
-        cursor_names = [key_for(env, key) for key in inbox_cursor_keys(env)]
-        seq = int(env.get("seq", 0))
-        dispatch_id = str(env.get("dispatch_id") or "")
-        counts.setdefault(dispatch_id, 0)
-        if not cursor_has_unread_event(cursor, cursor_names, seq):
-            continue
-        counts[dispatch_id] = counts.get(dispatch_id, 0) + 1
-        unseen.append(env)
-    if last_n is not None and last_n >= 0:
-        unseen = unseen[-last_n:] if last_n else []
-    for env in unseen:
-        seq = int(env.get("seq", 0))
-        for cursor_name in (key_for(env, key) for key in inbox_cursor_keys(env)):
-            ack_advances[cursor_name] = max(
-                int(ack_advances.get(cursor_name, 0)),
-                seq,
-            )
-    shown.extend(_without_inbox_metadata(env) for env in unseen)
-    return shown, counts, ack_advances
-
-
-def format_unseen_counts(counts: dict[str, int]) -> str:
+def format_pending_counts(counts: dict[str, int]) -> str:
     if not counts:
-        return "unseen counts: none"
-    return "unseen counts: " + " ".join(
+        return "pending counts: none"
+    return "pending counts: " + " ".join(
         f"{sanitize_display(key)}={value}" for key, value in sorted(counts.items())
     )
-
-
-def print_cursor_advances(results: list[dict[str, object]]) -> None:
-    if not results:
-        print("mark-read: no inboxes")
-        return
-    for result in results:
-        status = "advanced" if result["advanced"] else "unchanged"
-        print(f"mark-read: {result['inbox']} {result['old']}->{result['new']} ({status})")
-
-
-def warn_cursor_not_advanced(exc: BaseException) -> None:
-    print(f"WARNING: cursor not advanced: {type(exc).__name__}: {exc}", file=sys.stderr)
 
 
 def build_aggregate(
@@ -2289,11 +2034,6 @@ def build_aggregate(
     include_cursor_keys: bool = False,
 ) -> dict:
     envelopes_by_dispatch: dict[str, list[dict]] = {}
-    ack_cursor = load_read_cursor(
-        ack_cursor_path(messages_dir),
-        messages_dir=messages_dir,
-        fleet_dir=fleet_dir,
-    )
     paths = collect_inbox_paths(messages_dir, fleet_dir, dispatch_ids=dispatch_ids)
     carrier_errors: list[dict[str, object]] = []
     for envelope in logical_envelopes_for_paths(
@@ -2315,14 +2055,11 @@ def build_aggregate(
             continue
         if not _dispatch_complete(envelopes):
             active_dispatches.append(dispatch_id)
-        open_user_needs.extend(_open_user_needs(envelopes, ack_cursor=ack_cursor))
-        open_advisories.extend(
-            _open_controller_advisories(envelopes, ack_cursor=ack_cursor)
-        )
+        open_user_needs.extend(_open_user_needs(envelopes))
+        open_advisories.extend(_open_controller_advisories(envelopes))
         open_controller_channel.extend(
             _open_controller_channel(
                 envelopes,
-                ack_cursor=ack_cursor,
                 controller_label=controller_label,
             )
         )
@@ -2431,47 +2168,13 @@ def cmd_post(args: argparse.Namespace) -> int:
 
 
 def cmd_read(args: argparse.Namespace) -> int:
-    if args.ack and not args.unseen:
-        print("read --ack requires --unseen", file=sys.stderr)
-        return 2
+    """Read a carrier for diagnostics; journal delivery state is not mutated."""
     paths = collect_inbox_paths(
         args.messages_dir,
         args.fleet_dir,
         dispatch_ids={str(args.dispatch_id)},
     )
     carrier_errors: list[dict[str, object]] = []
-    if args.unseen:
-        cursor_path = read_cursor_path(args.messages_dir)
-        cursor = load_read_cursor(
-            cursor_path,
-            messages_dir=args.messages_dir,
-            fleet_dir=args.fleet_dir,
-        )
-        envelopes, counts, ack_advances = unseen_envelopes_for_paths(
-            paths,
-            messages_dir=args.messages_dir,
-            cursor=cursor,
-            last_n=args.last,
-            tolerate_errors=True,
-            carrier_errors=carrier_errors,
-        )
-        counts.setdefault(str(args.dispatch_id), 0)
-        print(json.dumps(envelopes, indent=2 if args.json else None))
-        print(format_unseen_counts(counts))
-        if args.ack:
-            try:
-                advance_read_cursor(
-                    cursor_path,
-                    ack_advances,
-                    messages_dir=args.messages_dir,
-                    fleet_dir=args.fleet_dir,
-                )
-            except (OSError, ValueError, TypeError) as exc:
-                warn_cursor_not_advanced(exc)
-                return 1
-        for error in carrier_errors:
-            _emit_carrier_error(error)
-        return 1 if carrier_errors else 0
     envelopes = logical_envelopes_for_paths(
         paths,
         messages_dir=args.messages_dir,
@@ -2485,60 +2188,6 @@ def cmd_read(args: argparse.Namespace) -> int:
     for error in carrier_errors:
         _emit_carrier_error(error)
     return 1 if carrier_errors else 0
-
-
-def cmd_mark_read(args: argparse.Namespace) -> int:
-    if args.all and args.dispatch_id:
-        print("mark-read: --all cannot be combined with --dispatch-id", file=sys.stderr)
-        return 2
-    if args.all and args.through is not None:
-        print("mark-read: --through requires --dispatch-id", file=sys.stderr)
-        return 2
-    if not args.all and not args.dispatch_id:
-        print("mark-read: provide --dispatch-id or --all", file=sys.stderr)
-        return 2
-
-    dispatch_id = str(args.dispatch_id) if args.dispatch_id else None
-    scan: Callable[[], dict[str, int]] | None = None
-    if args.all:
-        advances = {}
-
-        def scan() -> dict[str, int]:
-            return max_seq_by_inbox(messages_dir=args.messages_dir, fleet_dir=args.fleet_dir)
-
-    elif args.through is not None:
-        inboxes = max_seq_by_inbox(
-            messages_dir=args.messages_dir,
-            fleet_dir=args.fleet_dir,
-            dispatch_ids={str(dispatch_id)},
-        )
-        advances = {
-            key: min(args.through, stream_max)
-            for key, stream_max in inboxes.items()
-        }
-    else:
-        advances = {}
-
-        def scan() -> dict[str, int]:
-            return max_seq_by_inbox(
-                messages_dir=args.messages_dir,
-                fleet_dir=args.fleet_dir,
-                dispatch_ids={str(dispatch_id)},
-            )
-
-    try:
-        results = advance_read_cursor(
-            read_cursor_path(args.messages_dir),
-            advances,
-            max_scan=scan,
-            messages_dir=args.messages_dir,
-            fleet_dir=args.fleet_dir,
-        )
-    except (OSError, ValueError, TypeError) as exc:
-        warn_cursor_not_advanced(exc)
-        return 1
-    print_cursor_advances(results)
-    return 0
 
 
 def format_controller_relay(aggregate: dict) -> str | None:
@@ -2578,14 +2227,14 @@ def format_bounded_relay(
         candidate = [*selected, line]
         omitted = total - len(candidate)
         if omitted:
-            candidate.append(f"(+{omitted} more open unread item(s) elided)")
+            candidate.append(f"(+{omitted} more open item(s) elided)")
         rendered = "\n".join(candidate) + "\n"
         if len(rendered.encode("utf-8")) > byte_limit:
             break
         selected.append(line)
     omitted = total - len(selected)
     if omitted:
-        selected.append(f"(+{omitted} more open unread item(s) elided)")
+        selected.append(f"(+{omitted} more open item(s) elided)")
     return "\n".join(selected)
 
 
@@ -2615,31 +2264,10 @@ def _task_store_dispatch_id(
 
 
 def _canonical_project_root(project_root: Path) -> Path:
-    """Resolve linked worktrees to the main repository root when possible."""
-    root = Path(project_root).resolve()
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--git-common-dir"],
-            cwd=str(root),
-            capture_output=True,
-            text=True,
-            timeout=2,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            common = Path(result.stdout.strip())
-            if not common.is_absolute():
-                common = (root / common).resolve()
-            return common.parent
-    except Exception:
-        pass
-    try:
-        if str(REPO_ROOT) not in sys.path:
-            sys.path.insert(0, str(REPO_ROOT))
-        import goalflight_task  # type: ignore
+    """Use the one worktree-collapsing project canonicalizer."""
+    import goalflight_task  # type: ignore
 
-        return Path(goalflight_task.resolve_project_root(str(project_root)))
-    except Exception:
-        return root
+    return goalflight_task.resolve_project_root(str(project_root))
 
 
 def _normalize_project_mail_alias(value: object) -> str:
@@ -2736,16 +2364,11 @@ def _owned_with_project_mail(
 
 
 def _current_project_root() -> Path | None:
-    """Resolve the current git root exactly like goalflight_status."""
+    """Resolve the current project through the shared canonicalizer."""
     try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            return Path(result.stdout.strip()).resolve()
+        import goalflight_task  # type: ignore
+
+        return goalflight_task.resolve_project_root(str(Path.cwd()))
     except Exception:
         pass
     return None
@@ -2930,229 +2553,95 @@ def _controller_scope_inputs(
     }
 
 
-def _resolve_listener_session_id(project_root: Path, explicit_session_id: str | None) -> str:
-    if explicit_session_id is not None:
-        session_id = str(explicit_session_id).strip()
-        if not session_id:
-            raise MessageError("--session-id must not be empty")
-        try:
-            import goalflight_session_status  # type: ignore
-
-            goalflight_session_status.touch_controller_heartbeat_by_session_id(
-                project_root,
-                session_id,
-            )
-        except Exception:
-            pass
-        return session_id
+def controller_pending_events(
+    *,
+    project_root: Path | str,
+    controller_label: str,
+    dispatch_ids: set[str] | None = None,
+    waking_only: bool = True,
+    limit: int = 1000,
+) -> list[dict[str, object]]:
+    """Read journal-authoritative pending assignments without advancing a cursor."""
     try:
-        import goalflight_session_status  # type: ignore
+        import goalflight_journal  # type: ignore
+        import goalflight_task  # type: ignore
 
-        session = goalflight_session_status.live_session(project_root)
-    except Exception as exc:
-        raise MessageError(f"cannot resolve live controller session: {exc}") from exc
-    if not session or not session.get("id"):
-        raise MessageError("no live controller session; claim one or pass --session-id")
-    if session.get("conflicting_beacons"):
-        raise MessageError("multiple live controller sessions; pass --session-id")
-    try:
-        goalflight_session_status.touch_controller_heartbeat(
-            project_root,
-            str(session.get("label") or ""),
-            session_id=str(session["id"]),
-            pid=session.get("pid") if isinstance(session.get("pid"), int) else None,
+        root = goalflight_task.resolve_project_root(str(project_root))
+        authority = goalflight_journal.Journal(root)
+        return authority.pending_delivery_events(
+            controller_label,
+            waking_only=waking_only,
+            stream_ids=dispatch_ids,
+            limit=limit,
         )
-    except Exception:
-        pass
-    return str(session["id"])
+    except goalflight_journal.JournalUnavailable:
+        return []
 
 
-def _controller_wake_event(
-    envelope: dict,
+def controller_cursor_batch(
     *,
-    scope_kind: str,
-    controller_session_id: str | None,
-) -> dict | None:
-    """A new typed result/escalation or controller-channel envelope in this
-    controller's scope earns an interrupt unless it is periodic status or provably
-    self-authored controller mail; unknown authorship wakes."""
-    dispatch_id = str(envelope.get("dispatch_id") or "")
-    msg_type = str(envelope.get("type") or "")
-    payload = envelope.get("payload") or {}
-    if event_wake_class(msg_type, payload) != "waking":
-        return None
-    # Direction is authoritative only when the producer proved its session.
-    # Unknown/missing authorship wakes. Escalations and worker results also wake
-    # regardless of source metadata, so a spoofed/incorrect source can never
-    # swallow BLOCKED, USER-NEED, USER-CONFIRM, or terminal worker mail.
-    source = envelope.get("source") or {}
-    source_session_id = str(source.get("controller_session_id") or "")
-    if (
-        canonical_event_type(msg_type) in CONTROLLER_CHANNEL_TYPES
-        and controller_session_id
-        and source_session_id == controller_session_id
-    ):
-        return None
-    return {
-        "dispatch_id": dispatch_id,
-        "type": msg_type,
-        "seq": envelope.get("seq"),
-        "ts": envelope.get("ts"),
-        "text": sanitize_display(payload.get("text") or "", limit=120),
-    }
+    project_root: Path | str,
+    controller_label: str,
+    lease_nonce: str,
+    limit: int,
+):
+    import goalflight_journal  # type: ignore
+    import goalflight_task  # type: ignore
+
+    root = goalflight_task.resolve_project_root(str(project_root))
+    return goalflight_journal.Journal(root).cursor_batch(
+        controller_label,
+        nonce=lease_nonce,
+        limit=limit,
+    )
 
 
-def _controller_session_for_owned_dispatches(
-    records: list[dict],
-    owned_dispatch_ids: set[str],
-) -> str | None:
-    """Resolve one proven owner only when every requested dispatch agrees."""
-    if not owned_dispatch_ids:
-        return None
-    recorded_ids: set[str] = set()
-    session_ids: set[str] = set()
-    for record in records:
-        dispatch_id = str(record.get("dispatch_id") or "")
-        if dispatch_id not in owned_dispatch_ids:
-            continue
-        recorded_ids.add(dispatch_id)
-        session_id = str(record.get("controller_session_id") or "")
-        if not session_id:
-            return None
-        session_ids.add(session_id)
-    if recorded_ids != owned_dispatch_ids or len(session_ids) != 1:
-        return None
-    return next(iter(session_ids))
-
-
-def controller_wake_watermark(
-    *,
-    project_root: Path,
-    owned_dispatch_ids: set[str] | None = None,
-    controller_session_id: str | None = None,
-    messages_dir: Path | None = None,
-    fleet_dir: Path | None = None,
-) -> dict[tuple[str, object], dict]:
-    """Wakeable mail for one controller, separate from unread/display state.
-
-    When only ``controller_session_id`` is supplied, ledger ownership is
-    recomputed on every call so listener dispatches created after its baseline
-    join automatically. ``--wait`` supplies its exact dispatch ids and the same
-    function derives their common owner when the ledger proves one.
-    """
-    resolved_messages_dir = messages_dir or default_messages_dir()
-    resolved_fleet_dir = fleet_dir if fleet_dir is not None else default_fleet_dir()
-    records = _project_ledger_records(project_root)
-    if owned_dispatch_ids is None:
-        identity = _verified_controller_identity(
-            project_root,
-            records,
-            owned_dispatch_ids=set(),
-            controller_session_id=controller_session_id,
+def _listener_envelope(authority, row: dict[str, object]) -> dict:
+    carrier_path = str(row.get("carrier_path") or "")
+    if carrier_path.startswith("journal:attention:"):
+        item_id = str(row.get("event_uuid") or "")
+        item = next(
+            (value for value in authority.attention_items() if value.get("item_id") == item_id),
+            None,
         )
-        owner_label = str(identity.get("label") or "") if identity else ""
-        owned_dispatch_ids = {
-            str(record["dispatch_id"])
-            for record in records
-            if record.get("dispatch_id")
-            and (
-                (
-                    owner_label
-                    and str(record.get("controller_label") or "") == owner_label
-                )
-                or (
-                    not owner_label
-                    and controller_session_id
-                    and not record.get("controller_label")
-                    and str(record.get("controller_session_id") or "")
-                    == str(controller_session_id)
-                )
-            )
+        if item is None:
+            raise MessageError("journal attention delivery points to a missing item")
+        payload = json.loads(str(item["payload_json"]))
+        return {
+            "schema": "goalflight.message.v1",
+            "schema_version": 1,
+            "id": item_id,
+            "dispatch_id": "attention",
+            "seq": int(row["stream_seq"]),
+            "ts": str(item["created_at"]),
+            "source": {"node": "journal", "adapter": "lease-attention", "transport": "journal"},
+            "type": "controller_attention",
+            "priority": "critical",
+            "payload": payload,
         }
-    else:
-        owned_dispatch_ids = {str(dispatch_id) for dispatch_id in owned_dispatch_ids}
-    scope_inputs = _controller_scope_inputs(
-        project_root,
-        records=records,
-        owned_dispatch_ids=owned_dispatch_ids,
-        controller_session_id=controller_session_id,
-        messages_dir=resolved_messages_dir,
-        fleet_dir=resolved_fleet_dir,
+    path = Path(carrier_path)
+    result = read_envelopes_result(path)
+    if result.status is not CarrierReadStatus.OK:
+        raise MessageError(f"carrier is corrupt or unreadable: {path}")
+    origin_node = str(row.get("origin_node") or "")
+    event_uuid = str(row.get("event_uuid") or "")
+    stream_seq = int(row.get("stream_seq") or 0)
+    envelope = next(
+        (
+            item
+            for item in result.envelopes
+            if item.get("id") == event_uuid
+            and int(item.get("seq") or 0) == stream_seq
+            and isinstance(item.get("source"), dict)
+            and str(item["source"].get("node") or "") == origin_node
+        ),
+        None,
     )
-    legacy_addressed_dispatch_ids = set(scope_inputs["legacy_addressed_dispatch_ids"])
-    task_store_dispatch_id = scope_inputs["task_store_dispatch_id"]
-    controller_label = scope_inputs["controller_label"]
-    controller_project_root = str(scope_inputs["controller_project_root"])
-    controller_session_id = str(scope_inputs["controller_session_id"] or "") or None
-    candidate_dispatch_ids = owned_dispatch_ids | legacy_addressed_dispatch_ids
-    if task_store_dispatch_id:
-        candidate_dispatch_ids.add(str(task_store_dispatch_id))
-
-    events: dict[tuple[str, object], dict] = {}
-    paths = collect_inbox_paths(
-        resolved_messages_dir,
-        resolved_fleet_dir,
-        dispatch_ids=None if controller_label else candidate_dispatch_ids,
-    )
-    carrier_errors: list[dict[str, object]] = []
-    for envelope in logical_envelopes_for_paths(
-        paths,
-        messages_dir=resolved_messages_dir,
-        tolerate_errors=True,
-        carrier_errors=carrier_errors,
-    ):
-        scope_kind = _controller_scope_kind(
-            envelope,
-            owned_dispatch_ids=owned_dispatch_ids,
-            legacy_addressed_dispatch_ids=legacy_addressed_dispatch_ids,
-            task_store_dispatch_id=(str(task_store_dispatch_id) if task_store_dispatch_id else None),
-            controller_label=(str(controller_label) if controller_label else None),
-            controller_project_root=controller_project_root,
+    if envelope is None:
+        raise MessageError(
+            f"journal delivery assignment has no projected carrier row: {path}:{stream_seq}"
         )
-        if scope_kind is None:
-            continue
-        event = _controller_wake_event(
-            envelope,
-            scope_kind=scope_kind,
-            controller_session_id=controller_session_id,
-        )
-        if event is not None:
-            inbox_key = inbox_cursor_keys(envelope)[0]
-            events[(inbox_key, event["seq"])] = event
-    for error in carrier_errors:
-        _emit_carrier_error(error)
-        error_path = Path(str(error.get("path") or ""))
-        inbox_key = inbox_stream_key(error_path, messages_dir=resolved_messages_dir)
-        identity = (
-            "carrier-corruption",
-            error.get("offset"),
-            error.get("hash"),
-            error.get("reason"),
-        )
-        events[(inbox_key, identity)] = {
-            "dispatch_id": error_path.stem,
-            "type": "carrier-corruption",
-            "seq": error.get("validated_through_seq"),
-            "ts": None,
-            "text": sanitize_display(error.get("reason") or "carrier corruption", limit=120),
-        }
-    return events
-
-
-def controller_listener_watermark(
-    *,
-    controller_session_id: str,
-    project_root: Path,
-    messages_dir: Path | None = None,
-    fleet_dir: Path | None = None,
-) -> dict[tuple[str, object], dict]:
-    """Compatibility name for the ownership-keyed listener's shared filter."""
-    return controller_wake_watermark(
-        controller_session_id=controller_session_id,
-        project_root=project_root,
-        messages_dir=messages_dir,
-        fleet_dir=fleet_dir,
-    )
+    return envelope
 
 
 def _project_dispatch_ids(project_root: Path) -> set[str]:
@@ -3322,10 +2811,7 @@ def _filter_task_store_nudges(
 
 def format_mail_notice(count: int) -> str:
     """One body-free notice shared by every controller entry point."""
-    return (
-        f"{count} new mail; read: "
-        "goalflight_messages.py relay --new (--ack to mark read)"
-    )
+    return f"{count} new mail; peek: goalflight_messages.py relay --new"
 
 
 def controller_mail_summary(
@@ -3334,239 +2820,123 @@ def controller_mail_summary(
     task_store_project_root: Path | None = None,
     messages_dir: Path | None = None,
     fleet_dir: Path | None = None,
-    unread_only: bool = True,
-    include_cursor_keys: bool = False,
 ) -> dict:
-    """Structured "you have mail" summary for a controller's status output.
-
-    Builds the inbox aggregate and returns OPEN user-needs (user_need /
-    user_confirm / blocked) plus controller quota advisories.
-
-    The mailbox is machine-global (shared across controllers), so when
-    ``owned_dispatch_ids`` is provided only needs from THOSE dispatches — the
-    controller's own workers — plus ``task_store_project_root``'s pseudo-inbox
-    and explicitly project-addressed inbox ids are surfaced; a controller must
-    never see another controller's workers' needs. ``None`` means no ownership
-    filter (e.g. an all-projects view). Returns ``{}`` when there is nothing to
-    show.
-    """
-    # Read ONLY this controller's own inboxes: an unrelated controller's corrupt or
-    # large inbox can then neither suppress (a parse error elsewhere) nor slow this
-    # scoped status call. build_aggregate is also per-inbox tolerant as a backstop.
-    resolved_messages_dir = messages_dir or default_messages_dir()
-    resolved_fleet_dir = fleet_dir if fleet_dir is not None else default_fleet_dir()
-    canonical_project_root = (
-        _canonical_project_root(task_store_project_root)
-        if task_store_project_root is not None
-        else None
-    )
-    controller_label: str | None = None
-    envelope_filter: Callable[[dict], bool] | None = None
-    scoped_dispatch_ids = _owned_with_project_mail(
-        owned_dispatch_ids,
-        task_store_project_root,
-        messages_dir=resolved_messages_dir,
-        fleet_dir=resolved_fleet_dir,
-        canonical_project_root=canonical_project_root,
-    )
-    if owned_dispatch_ids is not None and task_store_project_root is not None:
-        records = _project_ledger_records(task_store_project_root)
-        scope_inputs = _controller_scope_inputs(
-            task_store_project_root,
-            records=records,
-            owned_dispatch_ids={str(value) for value in owned_dispatch_ids},
-            controller_session_id=None,
-            messages_dir=resolved_messages_dir,
-            fleet_dir=resolved_fleet_dir,
-            canonical_project_root=canonical_project_root,
-        )
-        legacy_addressed_dispatch_ids = set(scope_inputs["legacy_addressed_dispatch_ids"])
-        task_store_dispatch_id = scope_inputs["task_store_dispatch_id"]
-        controller_label = (
-            str(scope_inputs["controller_label"])
-            if scope_inputs.get("controller_label")
-            else None
-        )
-        controller_project_root = str(scope_inputs["controller_project_root"])
-
-        def envelope_filter(envelope: dict) -> bool:
-            return _controller_scope_kind(
-                envelope,
-                owned_dispatch_ids={str(value) for value in owned_dispatch_ids},
-                legacy_addressed_dispatch_ids=legacy_addressed_dispatch_ids,
-                task_store_dispatch_id=(str(task_store_dispatch_id) if task_store_dispatch_id else None),
-                controller_label=controller_label,
-                controller_project_root=controller_project_root,
-            ) is not None
-
-    aggregate = build_aggregate(
-        messages_dir=resolved_messages_dir,
-        fleet_dir=resolved_fleet_dir,
-        dispatch_ids=None if controller_label else scoped_dispatch_ids,
-        envelope_filter=envelope_filter,
-        controller_label=controller_label,
-        include_cursor_keys=True,
-    )
-    needs = list(aggregate.get("open_user_needs") or [])
-    needs.extend(aggregate.get("open_advisories") or [])
-    # The controller-addressed channel. Without this the summary is only the
-    # worker-marker stream, so a peer controller's question or notice was
-    # never surfaced to anyone and a human had to carry it between sessions.
-    needs.extend(aggregate.get("open_controller_channel") or [])
-    if scoped_dispatch_ids is not None and envelope_filter is None:
-        needs = [
-            n for n in needs
-            if str(n.get("dispatch_id") or "") in scoped_dispatch_ids
-            or str(n.get("dispatch_id") or "") == "controller-quota-advisory"
-        ]
-    needs = _filter_task_store_nudges(
-        needs,
-        task_store_project_root,
-        canonical_project_root=canonical_project_root,
-    )
-    needs.sort(key=_event_causal_sort_key)
-    cursor_migration: dict[str, object] = {}
-    if unread_only:
-        read_cursor = load_read_cursor(
-            read_cursor_path(resolved_messages_dir),
-            messages_dir=resolved_messages_dir,
-            fleet_dir=resolved_fleet_dir,
-            migration_report=cursor_migration,
-        )
-        needs = [
-            item
-            for item in needs
-            if not isinstance(item.get("seq"), int)
-            or cursor_has_unread_event(
-                read_cursor,
-                inbox_cursor_keys(item),
-                int(item["seq"]),
-            )
-        ]
-    carrier_errors = list(aggregate.get("carrier_errors") or [])
-    unresolved_cursor_entries = cursor_migration.get("unresolved")
-    if not isinstance(unresolved_cursor_entries, dict):
-        unresolved_cursor_entries = {}
-    if not needs and not carrier_errors and not unresolved_cursor_entries:
+    """Summarize journal-pending assignments without advancing the cursor."""
+    del owned_dispatch_ids, messages_dir, fleet_dir
+    if task_store_project_root is None:
         return {}
-    items = [
-        {
-            "dispatch_id": str(n.get("dispatch_id") or "?"),
-            "type": str(n.get("nudge_kind") or n.get("type") or "user_need"),
-            "seq": n.get("seq"),
-            "ts": n.get("ts"),
-            "text": sanitize_display(n.get("text") or "", limit=120),
-            "addressee": n.get("addressee"),
-            _INBOX_CURSOR_KEY_FIELD: n.get(_INBOX_CURSOR_KEY_FIELD),
-            _INBOX_CURSOR_KEYS_FIELD: n.get(_INBOX_CURSOR_KEYS_FIELD),
-        }
-        for n in needs
-    ]
-    if not include_cursor_keys:
-        for item in items:
-            item.pop(_INBOX_CURSOR_KEY_FIELD, None)
-            item.pop(_INBOX_CURSOR_KEYS_FIELD, None)
-    if items:
-        hint = format_mail_notice(len(items))
-    elif carrier_errors:
-        hint = f"WARNING: {len(carrier_errors)} corrupt mail carrier(s)"
-    else:
-        hint = (
-            f"WARNING: {len(unresolved_cursor_entries)} unresolved legacy cursor "
-            "entry/entries; affected mail remains unread"
+    try:
+        import goalflight_journal  # type: ignore
+        import goalflight_session_status as sessions  # type: ignore
+        import goalflight_task  # type: ignore
+
+        root = goalflight_task.resolve_project_root(str(task_store_project_root))
+        authority = goalflight_journal.Journal(root)
+        label = sessions.resolve_controller_label(project_root=root)
+        if label is None:
+            active = authority.lease_records()
+            label = str(active[0]["label"]) if len(active) == 1 else None
+        if label is None:
+            return {}
+        rows = authority.pending_delivery_events(label, waking_only=True, limit=1000)
+    except (goalflight_journal.JournalUnavailable, ValueError):
+        return {}
+
+    items: list[dict[str, object]] = []
+    carrier_errors: list[dict[str, object]] = []
+    for row in rows:
+        try:
+            envelope = _listener_envelope(authority, row)
+        except MessageError as exc:
+            carrier_errors.append({"error": str(exc), "carrier_path": row.get("carrier_path")})
+            continue
+        payload = envelope.get("payload")
+        payload = payload if isinstance(payload, dict) else {}
+        items.append(
+            {
+                "dispatch_id": str(envelope.get("dispatch_id") or row.get("stream_id") or "?"),
+                "type": str(payload.get("nudge_kind") or envelope.get("type") or "event"),
+                "seq": envelope.get("seq"),
+                "ts": envelope.get("ts"),
+                "text": sanitize_display(payload.get("text") or payload.get("reason") or "", limit=120),
+                "addressee": envelope.get("addressee"),
+            }
         )
-    result = {
+    if not items and not carrier_errors:
+        return {"count": 0, "needs": [], "controller_label": label}
+    result: dict[str, object] = {
         "count": len(items),
         "needs": items,
-        "hint": hint,
-        # The caller's own identity, already resolved above. Exposed so the
-        # listener reminder can ask "does THIS controller have a listener"
-        # rather than "does anything on this project", which would tell one
-        # controller it is covered by a sibling's listener.
-        "controller_label": controller_label,
+        "hint": (
+            format_mail_notice(len(items))
+            if items
+            else f"WARNING: {len(carrier_errors)} corrupt mail carrier(s)"
+        ),
+        "controller_label": label,
     }
     if carrier_errors:
         result["carrier_errors"] = carrier_errors
-    if unresolved_cursor_entries:
-        result["cursor_migration"] = {
-            "source_format": cursor_migration.get("source_format"),
-            "migrated": cursor_migration.get("migrated"),
-            "unresolved_count": len(unresolved_cursor_entries),
-            "report_path": str(read_cursor_path(resolved_messages_dir)),
-        }
     return result
 
 
-LISTENER_ARGV_MARKER = "goalflight_messages.py"
-LISTENER_CONTROLLER_FLAG = "--controller"
-
-
-def live_listener_pids(
+def listener_coverage_status(
     project_root: Path | str,
     controller_label: str,
     *,
-    ps_output: str | None = None,
-) -> list[int] | None:
-    """PIDs of live `listen` processes belonging to THIS controller.
+    identity_probe: Callable[[int], dict | None] | None = None,
+) -> dict[str, object]:
+    """Journal coverage is authority; process identity only verifies its row."""
+    import goalflight_journal  # type: ignore
+    import goalflight_task  # type: ignore
 
-    Returns None when the process table could not be read at all -- "cannot
-    tell", which is not the same as "none found". An empty list means measured
-    and absent. Collapsing the two would make an unreadable process table look
-    exactly like a missing listener and nag a controller that has one.
-
-    The process table is the authority on purpose, not a registry entry. The
-    question is "is a listener alive for me right now", and a stored PID would
-    have to be checked against the process table anyway -- so a registry adds a
-    second copy that can disagree with the first, and a dead listener would need
-    someone to notice and retract its record. A process either appears here or
-    it does not, and it cannot go stale.
-
-    Matching is exact on BOTH the controller handle and the project root. One
-    repo can host several controllers -- battery-tool-v2 currently runs three --
-    so "some listener exists for this project" would tell a controller it is
-    covered when the listener belongs to a sibling.
-    """
-    root = str(_canonical_project_root(Path(project_root)))
+    root = goalflight_task.resolve_project_root(str(project_root))
     label = str(controller_label or "").strip()
     if not label:
-        return []
-    if ps_output is None:
-        try:
-            ps_output = subprocess.run(
-                ["ps", "-eo", "pid=,command="],
-                capture_output=True,
-                text=True,
-                timeout=10,
-                check=False,
-            ).stdout
-        except (OSError, subprocess.SubprocessError):
-            return None
-    pids: list[int] = []
-    for line in (ps_output or "").splitlines():
-        parts = line.strip().split(None, 1)
-        if len(parts) != 2:
-            continue
-        raw_pid, command = parts
-        if LISTENER_ARGV_MARKER not in command or " listen" not in command:
-            continue
-        if f"{LISTENER_CONTROLLER_FLAG} {label}" not in command:
-            continue
-        if root not in command:
-            continue
-        try:
-            pids.append(int(raw_pid))
-        except ValueError:
-            continue
-    return pids
+        return {"covered": False, "reason": "missing-label"}
+    try:
+        authority = goalflight_journal.Journal(root)
+        expired = authority.expire_stale_leases()
+        if not expired.committed:
+            return {"covered": False, "reason": "journal-unavailable"}
+        lease = authority.active_lease(label)
+        if lease is None:
+            return {"covered": False, "reason": "no-active-lease"}
+        coverage = authority.active_coverage(label)
+        if coverage is None:
+            return {
+                "covered": False,
+                "reason": "no-armed-coverage",
+                "lease_generation": lease.generation,
+            }
+        probe = identity_probe or (
+            lambda pid: goalflight_compat.process_start_identity(pid)
+        )
+        measured = probe(int(coverage["pid"]))
+        if not isinstance(measured, dict) or measured.get("start_token") != coverage.get("start_token"):
+            return {
+                "covered": False,
+                "reason": "listener-identity-mismatch",
+                "coverage": coverage,
+                "lease_generation": lease.generation,
+            }
+        return {
+            "covered": True,
+            "reason": "armed",
+            "coverage": coverage,
+            "lease_generation": lease.generation,
+        }
+    except goalflight_journal.JournalUnavailable:
+        return {"covered": False, "reason": "journal-unavailable"}
 
 
 def listener_reminder_line(project_root: Path | str, controller_label: str) -> str:
     root = _canonical_project_root(Path(project_root))
     return (
-        f"no live mail listener for controller {controller_label!r}; "
+        f"no verified journal coverage for controller {controller_label!r}; "
         "you will not be woken on new mail. start one in the BACKGROUND: "
         f"python3 {Path(__file__).resolve()} listen "
-        f"--controller {controller_label} --project-root {root}"
+        f"--controller-label {controller_label} --project-root {root} "
+        "--lease-nonce \"$GOALFLIGHT_CONTROLLER_LEASE_NONCE\""
     )
 
 
@@ -3576,11 +2946,11 @@ def emit_listener_reminder(
     controller_label: str | None,
     exposure: int,
     stream=None,
-    ps_output: str | None = None,
+    identity_probe: Callable[[int], dict | None] | None = None,
 ) -> str | None:
     """Warn a controller that nothing will wake it, when that actually costs it.
 
-    ``exposure`` is what it stands to miss -- open dispatches plus unread mail.
+    ``exposure`` is what it stands to miss -- open dispatches plus pending mail.
     Gating on it is what keeps this from becoming a nag: a controller with
     nothing in flight loses nothing by having no listener, so it is not told to
     start one. That also removes any need for a throttle timestamp, which would
@@ -3614,10 +2984,12 @@ def emit_listener_reminder(
                 "--controller-startup --controller-pid-from-ancestry"
             )
         else:
-            found = live_listener_pids(root, label, ps_output=ps_output)
-            # None = the process table was unreadable. Stay silent rather than
-            # assert an absence that was never measured.
-            if found is None or found:
+            coverage = listener_coverage_status(
+                root,
+                label,
+                identity_probe=identity_probe,
+            )
+            if coverage.get("covered"):
                 return None
             line = listener_reminder_line(root, label)
         print(line, file=sys.stderr if stream is None else stream)
@@ -3653,7 +3025,7 @@ def emit_controller_mail_notice(
             _emit_carrier_error(error, stream=stream)
         count = int(summary.get("count") or 0)
         # Emit the listener reminder BEFORE the mail-count early return: a
-        # controller with dispatches in flight and no unread mail is precisely
+        # controller with dispatches in flight and no pending mail is precisely
         # the one that will need waking later and would otherwise never be told.
         emit_listener_reminder(
             project_root=project_root,
@@ -3708,98 +3080,8 @@ def emit_controller_milestone_notice(
         return None
 
 
-def _mail_scope(*, all_projects: bool) -> tuple[Path | None, set[str] | None]:
-    if all_projects:
-        return None, None
-    project_root = _current_project_root()
-    if project_root is None:
-        raise MessageError("no current git project; pass --all-projects explicitly")
-    return project_root, _project_dispatch_ids(project_root)
-
-
-def _ack_dispatches(
-    *,
-    messages_dir: Path,
-    items: list[dict],
-    dispatch_ids: set[str],
-    fleet_dir: Path | None = None,
-) -> tuple[int, int]:
-    advances: dict[str, int] = {}
-    advanced_dispatches: set[str] = set()
-    item_count = 0
-    for item in items:
-        dispatch_id = str(item.get("dispatch_id") or "")
-        if dispatch_id not in dispatch_ids or not isinstance(item.get("seq"), int):
-            continue
-        for cursor_key in inbox_cursor_keys(item):
-            advances[cursor_key] = max(advances.get(cursor_key, 0), int(item["seq"]))
-        advanced_dispatches.add(dispatch_id)
-        item_count += 1
-    if advances:
-        advance_read_cursor(
-            ack_cursor_path(messages_dir),
-            advances,
-            messages_dir=messages_dir,
-            fleet_dir=fleet_dir,
-        )
-    return len(advanced_dispatches), item_count
-
-
-def cmd_ack(args: argparse.Namespace) -> int:
-    if bool(args.dispatch_id) == bool(args.stale):
-        print("ack: provide one dispatch id or --stale", file=sys.stderr)
-        return 2
-    try:
-        project_root, owned_dispatch_ids = _mail_scope(all_projects=False)
-    except MessageError as exc:
-        print(f"ack: {exc}", file=sys.stderr)
-        return 2
-    assert project_root is not None and owned_dispatch_ids is not None
-    scoped_dispatch_ids = _owned_with_project_mail(
-        owned_dispatch_ids,
-        project_root,
-        messages_dir=args.messages_dir,
-        fleet_dir=args.fleet_dir,
-    ) or set()
-    if args.dispatch_id and args.dispatch_id not in scoped_dispatch_ids:
-        print(f"ack: {args.dispatch_id} is not owned by the current project", file=sys.stderr)
-        return 2
-    summary = controller_mail_summary(
-        owned_dispatch_ids=owned_dispatch_ids,
-        task_store_project_root=project_root,
-        messages_dir=args.messages_dir,
-        fleet_dir=args.fleet_dir,
-        unread_only=False,
-        include_cursor_keys=True,
-    )
-    items = list(summary.get("needs") or [])
-    targets = (
-        _stale_dispatch_ids(
-            project_root,
-            {str(item.get("dispatch_id") or "") for item in items},
-        )
-        if args.stale
-        else {str(args.dispatch_id)}
-    )
-    try:
-        dispatch_count, item_count = _ack_dispatches(
-            messages_dir=args.messages_dir,
-            items=items,
-            dispatch_ids=targets,
-            fleet_dir=args.fleet_dir,
-        )
-    except (OSError, ValueError, TypeError) as exc:
-        print(f"WARNING: ack cursor not advanced: {type(exc).__name__}: {exc}", file=sys.stderr)
-        return 1
-    label = "ack --stale" if args.stale else f"ack {args.dispatch_id}"
-    print(f"{label}: {dispatch_count} dispatch(es), {item_count} open item(s) acknowledged")
-    return 0
-
-
-# Bodies are for mail you have not seen yet. An unacked envelope reappears on
-# every check, so a backlog that nobody acks re-floods the reader indefinitely -
-# the headline listing fixed the per-message cost but not the per-check one.
-# Anything older than this degrades to a headline even under --bodies.
+# Old pending bodies can dominate a repeated diagnostic peek. Anything older
+# than this degrades to a headline even under --bodies.
 STALE_BODY_AGE_S = 2 * 24 * 3600
 
 
@@ -3921,451 +3203,47 @@ def format_envelope_headlines(envelopes: list) -> str:
     return "\n".join(lines)
 
 
-def _registered_controller_addresses() -> set[tuple[str, str]]:
-    """Durable, non-retired (project root, name) addresses."""
-    try:
-        import goalflight_task  # type: ignore
-        import goalflight_session_status as sessions  # type: ignore
-    except Exception:
-        return set()
-    roots: set[Path] = set()
-    current_root = _current_project_root()
-    if current_root is not None:
-        roots.add(current_root)
-    try:
-        for project in goalflight_task.read_project_registry():
-            root = project.get("project_root")
-            if root:
-                roots.add(Path(str(root)))
-    except Exception:
-        pass
-    try:
-        import goalflight_ledger  # type: ignore
-
-        for record in goalflight_ledger.read_records():
-            root = record.get("project_root")
-            if root:
-                roots.add(Path(str(root)))
-    except Exception:
-        pass
-    addresses: set[tuple[str, str]] = set()
-    for root in roots:
-        try:
-            canonical_root = controller_address_project_root(root)
-            addresses.update(
-                (canonical_root, label)
-                for label in sessions.registered_controller_labels(root.resolve())
-            )
-        except Exception:
-            continue
-    return addresses
-
-
-def unresolved_controller_envelopes(
-    *,
-    messages_dir: Path,
-    fleet_dir: Path | None,
-) -> list[dict]:
-    """Unread named mail whose recipient has no active durable registration."""
-    registered_addresses = _registered_controller_addresses()
-    cursor = load_read_cursor(
-        read_cursor_path(messages_dir),
-        messages_dir=messages_dir,
-        fleet_dir=fleet_dir,
-    )
-    unresolved: list[dict] = []
-    paths = collect_inbox_paths(messages_dir, fleet_dir)
-    for envelope in logical_envelopes_for_paths(
-        paths,
-        messages_dir=messages_dir,
-        tolerate_errors=True,
-    ):
-        label = controller_addressee_label(envelope)
-        project_root = controller_addressee_project_root(envelope)
-        if not label or not project_root or (project_root, label) in registered_addresses:
-            continue
-        keys = resolved_envelope_cursor_keys(envelope)
-        if cursor_has_unread_event(cursor, keys, int(envelope.get("seq", 0))):
-            unresolved.append(_without_inbox_metadata(envelope))
-    unresolved.reverse()
-    return unresolved
-
-
-def cmd_undeliverable(args: argparse.Namespace) -> int:
-    envelopes = unresolved_controller_envelopes(
-        messages_dir=args.messages_dir,
-        fleet_dir=args.fleet_dir,
-    )
-    if not envelopes:
-        print("no unresolved controller mail")
-        return 0
-    print(f"{len(envelopes)} unresolved controller envelope(s); correspondence remains unread")
-    for envelope in envelopes[:DEFAULT_RELAY_ITEM_LIMIT]:
-        label = controller_addressee_label(envelope) or "?"
-        print(
-            f"to {sanitize_display(label)}: "
-            f"{sanitize_display(envelope.get('dispatch_id') or '?')} "
-            f"#{sanitize_display(envelope.get('seq') or '?')}: "
-            f"{envelope_headline(envelope)}"
-        )
-    if len(envelopes) > DEFAULT_RELAY_ITEM_LIMIT:
-        print(f"(+{len(envelopes) - DEFAULT_RELAY_ITEM_LIMIT} elided)")
-    return 2
-
-
-def backlog_digest(
-    *,
-    messages_dir: Path,
-    fleet_dir: Path | None,
-    controller_label: str | None = None,
-    controller_project_root: str | None = None,
-) -> tuple[dict, dict[str, int]]:
-    """Summarize the current unread snapshot without copying or deleting bodies."""
-    cursor = load_read_cursor(
-        read_cursor_path(messages_dir),
-        messages_dir=messages_dir,
-        fleet_dir=fleet_dir,
-    )
-    items: list[dict] = []
-    advances: dict[str, int] = {}
-    counts_by_type: dict[str, int] = {}
-    counts_by_addressee: dict[str, int] = {}
-    paths = collect_inbox_paths(messages_dir, fleet_dir)
-    for envelope in logical_envelopes_for_paths(
-        paths,
-        messages_dir=messages_dir,
-        tolerate_errors=True,
-    ):
-        if (
-            controller_label is not None
-            and (
-                controller_addressee_label(envelope) != controller_label
-                or controller_addressee_project_root(envelope)
-                != controller_project_root
-            )
-        ):
-            continue
-        keys = resolved_envelope_cursor_keys(envelope)
-        seq = int(envelope.get("seq", 0))
-        if not cursor_has_unread_event(cursor, keys, seq):
-            continue
-        msg_type = str(envelope.get("type") or "unknown")
-        label = controller_addressee_label(envelope) or "legacy-unaddressed"
-        counts_by_type[msg_type] = counts_by_type.get(msg_type, 0) + 1
-        counts_by_addressee[label] = counts_by_addressee.get(label, 0) + 1
-        for key in keys:
-            advances[key] = max(int(advances.get(key, 0)), seq)
-        source_paths = envelope.get(_INBOX_SOURCE_PATHS_FIELD) or []
-        items.append(
-            {
-                "dispatch_id": str(envelope.get("dispatch_id") or ""),
-                "seq": seq,
-                "id": envelope.get("id"),
-                "ts": envelope.get("ts"),
-                "type": msg_type,
-                "addressee": envelope.get("addressee"),
-                "from": envelope_from(envelope),
-                "headline": envelope_headline(envelope),
-                "body_chars": len(str((envelope.get("payload") or {}).get("text") or "")),
-                "source_inbox": str(source_paths[0]) if source_paths else "",
-            }
-        )
-    items.reverse()
-    return (
-        {
-            "schema": "goalflight.mail.backlog-digest.v1",
-            "created_at": utc_now(),
-            "envelope_count": len(items),
-            "counts_by_type": dict(sorted(counts_by_type.items())),
-            "counts_by_addressee": dict(sorted(counts_by_addressee.items())),
-            "correspondence_retained": True,
-            "retention_note": "Original JSONL inboxes are unchanged; use source_inbox + seq to read bodies.",
-            "items": items,
-        },
-        advances,
-    )
-
-
-def retire_controller_mailbox(
-    *,
-    messages_dir: Path,
-    fleet_dir: Path | None,
-    controller_label: str,
-    controller_project_root: str,
-    controller_session_id: str,
-    retired_at: str,
-    retired_by: dict,
-) -> dict:
-    """Prepare one idempotent retirement digest without advancing cursors."""
-    digest_dir = messages_dir / BACKLOG_DIGEST_DIR
-    digest_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    safe_label = re.sub(r"[^A-Za-z0-9._-]+", "-", controller_label).strip("-") or "controller"
-    transaction_id = uuid.uuid5(
-        uuid.NAMESPACE_URL,
-        f"{controller_project_root}\0{controller_label}\0{controller_session_id}",
-    ).hex[:16]
-    path = digest_dir / f"retirement-{safe_label}-{transaction_id}.json"
-    if path.exists():
-        existing = json.loads(path.read_text(encoding="utf-8"))
-        retirement = existing.get("retirement") if isinstance(existing, dict) else None
-        if not isinstance(retirement, dict) or (
-            retirement.get("controller_label") != controller_label
-            or retirement.get("controller_project_root") != controller_project_root
-            or retirement.get("controller_session_id") != controller_session_id
-        ):
-            raise MessageError(f"{path}: retirement digest identity mismatch")
-        retirement = dict(retirement)
-        retirement["retired_at"] = retired_at
-        retirement["retired_by"] = retired_by
-        existing["retirement"] = retirement
-        tmp = path.with_name(f".{path.name}.tmp")
-        tmp.write_text(json.dumps(existing, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        os.replace(tmp, path)
-        return {
-            "digest": str(path),
-            "envelope_count": int(existing.get("envelope_count") or 0),
-            "retired_at": retired_at,
-            "correspondence_retained": True,
-            "reused": True,
-        }
-
-    digest, advances = backlog_digest(
-        messages_dir=messages_dir,
-        fleet_dir=fleet_dir,
-        controller_label=controller_label,
-        controller_project_root=controller_project_root,
-    )
-    digest["retirement"] = {
-        "controller_label": controller_label,
-        "controller_project_root": controller_project_root,
-        "controller_session_id": controller_session_id,
-        "retired_at": retired_at,
-        "retired_by": retired_by,
-    }
-    digest["cursor_advances"] = advances
-    tmp = path.with_name(f".{path.name}.tmp")
-    tmp.write_text(json.dumps(digest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    os.replace(tmp, path)
-    return {
-        "digest": str(path),
-        "envelope_count": digest["envelope_count"],
-        "retired_at": retired_at,
-        "correspondence_retained": True,
-        "reused": False,
-    }
-
-
-def finalize_controller_retirement_mailbox(
-    *,
-    messages_dir: Path,
-    digest_path: str | Path,
-) -> dict:
-    """Idempotently advance exactly the cursor snapshot named by a digest."""
-    digest_dir = (messages_dir / BACKLOG_DIGEST_DIR).resolve()
-    path = Path(digest_path).resolve()
-    if not path.is_relative_to(digest_dir):
-        raise MessageError("retirement digest is outside the mailbox digest directory")
-    digest = json.loads(path.read_text(encoding="utf-8"))
-    raw_advances = digest.get("cursor_advances") if isinstance(digest, dict) else None
-    if not isinstance(raw_advances, dict):
-        raise MessageError(f"{path}: missing retirement cursor snapshot")
-    advances = {
-        str(key): require_positive_int_seq(value, path=f"{path}.cursor_advances.{key}")
-        for key, value in raw_advances.items()
-    }
-    advance_read_cursor(read_cursor_path(messages_dir), advances)
-    return {"cursor_entries_advanced": len(advances), "finalized": True}
-
-
-def cmd_triage_backlog(args: argparse.Namespace) -> int:
-    digest, advances = backlog_digest(
-        messages_dir=args.messages_dir,
-        fleet_dir=args.fleet_dir,
-    )
-    if not args.apply:
-        print(
-            json.dumps(
-                {
-                    "apply": False,
-                    "envelope_count": digest["envelope_count"],
-                    "counts_by_type": digest["counts_by_type"],
-                    "counts_by_addressee": digest["counts_by_addressee"],
-                    "note": "dry run; pass --apply to write a digest and advance only this snapshot",
-                },
-                sort_keys=True,
-            )
-        )
-        return 0
-    digest_dir = args.messages_dir / BACKLOG_DIGEST_DIR
-    digest_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    stamp = str(digest["created_at"]).replace(":", "").replace("+", "-")
-    path = digest_dir / f"backlog-{stamp}-{uuid.uuid4().hex[:8]}.json"
-    tmp = path.with_name(f".{path.name}.tmp")
-    tmp.write_text(json.dumps(digest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    os.replace(tmp, path)
-    advance_read_cursor(
-        read_cursor_path(args.messages_dir),
-        advances,
-        messages_dir=args.messages_dir,
-        fleet_dir=args.fleet_dir,
-    )
-    print(
-        json.dumps(
-            {
-                "apply": True,
-                "digest": str(path),
-                "envelope_count": digest["envelope_count"],
-                "correspondence_retained": True,
-                "cursor_entries_advanced": len(advances),
-            },
-            sort_keys=True,
-        )
-    )
-    return 0
-
-
 def cmd_relay(args: argparse.Namespace) -> int:
-    if args.ack and not args.new:
-        print("relay --ack requires --new", file=sys.stderr)
-        return 2
-    if args.new and args.history:
-        print("relay: --new cannot be combined with --history", file=sys.stderr)
+    """Peek at journal-pending assignments; never advance or acknowledge state."""
+    project_root = _current_project_root()
+    if project_root is None:
+        print("relay: no current git project", file=sys.stderr)
         return 2
     try:
-        project_root, owned_dispatch_ids = _mail_scope(all_projects=args.all_projects)
-    except MessageError as exc:
+        import goalflight_journal  # type: ignore
+        import goalflight_session_status as sessions  # type: ignore
+        import goalflight_task  # type: ignore
+
+        root = goalflight_task.resolve_project_root(str(project_root))
+        authority = goalflight_journal.Journal(root)
+        controller_label = sessions.resolve_controller_label(project_root=root)
+        if controller_label is None:
+            active = authority.lease_records()
+            controller_label = str(active[0]["label"]) if len(active) == 1 else None
+        if controller_label is None:
+            print("no pending journal events")
+            return 0
+        rows = authority.pending_delivery_events(
+            controller_label,
+            waking_only=False,
+            limit=1000,
+        )
+        envelopes = [_listener_envelope(authority, row) for row in rows]
+    except (goalflight_journal.JournalUnavailable, MessageError, ValueError) as exc:
         print(f"relay: {exc}", file=sys.stderr)
         return 2
-    if args.new:
-        scoped_dispatch_ids = _owned_with_project_mail(
-            owned_dispatch_ids,
-            project_root,
-            messages_dir=args.messages_dir,
-            fleet_dir=args.fleet_dir,
-        )
-        envelope_filter = None
-        cursor_key = None
-        controller_label = None
-        if project_root is not None and owned_dispatch_ids is not None:
-            records = _project_ledger_records(project_root)
-            scope_inputs = _controller_scope_inputs(
-                project_root,
-                records=records,
-                owned_dispatch_ids={str(value) for value in owned_dispatch_ids},
-                controller_session_id=None,
-                messages_dir=args.messages_dir,
-                fleet_dir=args.fleet_dir,
-            )
-            legacy_addressed_dispatch_ids = set(scope_inputs["legacy_addressed_dispatch_ids"])
-            task_store_dispatch_id = scope_inputs["task_store_dispatch_id"]
-            controller_label = (
-                str(scope_inputs["controller_label"])
-                if scope_inputs.get("controller_label")
-                else None
-            )
-            controller_project_root = str(scope_inputs["controller_project_root"])
-
-            def envelope_filter(envelope: dict) -> bool:
-                return _controller_scope_kind(
-                    envelope,
-                    owned_dispatch_ids={str(value) for value in owned_dispatch_ids},
-                    legacy_addressed_dispatch_ids=legacy_addressed_dispatch_ids,
-                    task_store_dispatch_id=(
-                        str(task_store_dispatch_id) if task_store_dispatch_id else None
-                    ),
-                    controller_label=controller_label,
-                    controller_project_root=controller_project_root,
-                ) is not None
-
-            def cursor_key(envelope: dict, inbox_key: str) -> str:
-                label = controller_addressee_label(envelope)
-                if label and label == controller_label:
-                    return controller_cursor_key(
-                        label,
-                        str(envelope.get("dispatch_id") or ""),
-                        controller_addressee_project_root(envelope),
-                        inbox_key=inbox_key,
-                    )
-                return inbox_key
-
-        paths = collect_inbox_paths(
-            args.messages_dir,
-            args.fleet_dir,
-            dispatch_ids=None if controller_label else scoped_dispatch_ids,
-        )
-        cursor_path = read_cursor_path(args.messages_dir)
-        cursor = load_read_cursor(
-            cursor_path,
-            messages_dir=args.messages_dir,
-            fleet_dir=args.fleet_dir,
-        )
-        envelopes, counts, ack_advances = unseen_envelopes_for_paths(
-            paths,
-            messages_dir=args.messages_dir,
-            cursor=cursor,
-            tolerate_errors=True,
-            envelope_filter=envelope_filter,
-            cursor_key=cursor_key,
-        )
-        if getattr(args, "bodies", False):
-            fresh, stale = split_fresh_and_stale(envelopes)
-            print(json.dumps(fresh))
-            if stale:
-                print(
-                    f"{len(stale)} envelope(s) older than "
-                    f"{int(STALE_BODY_AGE_S // 3600)}h shown as headlines only:"
-                )
-                print(format_envelope_headlines(stale))
-                print("read one in full with: `read --dispatch-id <id>`")
-        else:
-            headlines = format_envelope_headlines(envelopes)
-            if headlines:
-                print(headlines)
-                print("bodies: re-run with --bodies, or read one inbox with `read`")
-        if args.ack:
-            try:
-                advance_read_cursor(
-                    cursor_path,
-                    ack_advances,
-                    messages_dir=args.messages_dir,
-                    fleet_dir=args.fleet_dir,
-                )
-                cursor = load_read_cursor(
-                    cursor_path,
-                    messages_dir=args.messages_dir,
-                    fleet_dir=args.fleet_dir,
-                )
-                _, counts, _ = unseen_envelopes_for_paths(
-                    paths,
-                    messages_dir=args.messages_dir,
-                    cursor=cursor,
-                    tolerate_errors=True,
-                    envelope_filter=envelope_filter,
-                    cursor_key=cursor_key,
-                )
-            except (OSError, ValueError, TypeError) as exc:
-                warn_cursor_not_advanced(exc)
-                print(format_unseen_counts(counts))
-                return 1
-        print(format_unseen_counts(counts))
-        return 0
-    summary = controller_mail_summary(
-        owned_dispatch_ids=owned_dispatch_ids,
-        task_store_project_root=project_root,
-        messages_dir=args.messages_dir,
-        fleet_dir=args.fleet_dir,
-        unread_only=not args.history,
-    )
-    items = list(summary.get("needs") or [])
-    line = (
-        format_controller_relay({"open_user_needs": items})
-        if args.history
-        else format_bounded_relay(items)
-    )
-    if line:
-        print(line)
-        return 2
-    print("no open unread items" if not args.history else "no open user_needs")
+    if getattr(args, "bodies", False):
+        print(json.dumps(envelopes))
+    else:
+        headlines = format_envelope_headlines(envelopes)
+        if headlines:
+            print(headlines)
+            print("bodies: re-run with --bodies")
+    counts: dict[str, int] = {}
+    for envelope in envelopes:
+        dispatch_id = str(envelope.get("dispatch_id") or "unknown")
+        counts[dispatch_id] = counts.get(dispatch_id, 0) + 1
+    print(format_pending_counts(counts))
     return 0
 
 
@@ -4473,87 +3351,193 @@ def merge_remote_register(
 
 
 def cmd_listen(args) -> int:
-    """Block silently until new wakeable mail arrives for this controller.
+    """One-shot journal cursor listener; its exit is the wake."""
+    import goalflight_journal  # type: ignore
+    import goalflight_session_status as sessions  # type: ignore
+    import goalflight_task  # type: ignore
 
-    The point is the SILENCE. A controller told to background a long-poll is
-    asleep by design; a listener that chatters costs it context for nothing, and
-    one that returns immediately trains it to ignore the signal. This emits
-    nothing at all until something arrives, so a controller can leave one call
-    open across a long stretch of work without paying for the wait.
-
-    Only mail that arrives AFTER the listener starts counts. Waking on the
-    existing backlog would return instantly for any controller with unread mail
-    -- and on this machine that backlog is 100+ envelopes, some 32 days old. Use
-    `relay --new` to read what is already there; use this to be told about what
-    is not there yet.
-
-    Ownership is an exact controller-session match and is re-read every poll, so
-    late dispatches join without re-arming. Owned terminal/result and escalation
-    envelopes always wake. Controller-channel mail wakes unless its source proves
-    this same controller session authored it; missing or ambiguous authorship wakes.
-    Unowned or other-session workers, status/monitor traffic, quota advisories, and
-    recurring task-store status nudges do not. Quiet mail remains in the normal
-    unread count.
-
-    Exits 0 when mail arrives, 1 on timeout. Fail-open: if the mailbox cannot be
-    read at all, say so on stderr and exit 2 rather than blocking forever on a
-    channel that will never deliver.
-    """
-    project_root = Path(args.project_root).resolve() if args.project_root else Path.cwd()
-    messages_dir = args.messages_dir or default_messages_dir()
-    fleet_dir = args.fleet_dir if args.fleet_dir is not None else default_fleet_dir()
-    poll = max(0.5, float(args.poll_secs or 5.0))
-    deadline = None
-    if args.timeout_s and float(args.timeout_s) > 0:
-        deadline = time.monotonic() + float(args.timeout_s)
-
+    project_root = goalflight_task.resolve_project_root(args.project_root or str(Path.cwd()))
+    label = str(
+        args.controller_label
+        or sessions.resolve_controller_label(project_root=project_root)
+        or ""
+    ).strip()
+    nonce = str(
+        args.lease_nonce
+        or os.environ.get("GOALFLIGHT_CONTROLLER_LEASE_NONCE")
+        or os.environ.get("GOALFLIGHT_CONTROLLER_SESSION_ID")
+        or ""
+    ).strip()
+    if not label or not nonce:
+        print(
+            "listen: active controller label and lease nonce are required; claim the lease first",
+            file=sys.stderr,
+        )
+        return 2
+    test_mode = os.environ.get("GOALFLIGHT_TEST_MODE") == "1"
+    poll = max(0.01 if test_mode else 0.5, float(args.poll_secs or 5.0))
+    deadline = (
+        time.monotonic() + float(args.timeout_s)
+        if args.timeout_s and float(args.timeout_s) > 0
+        else None
+    )
     try:
-        controller_session_id = _resolve_listener_session_id(project_root, args.session_id)
-    except MessageError as exc:
+        authority = goalflight_journal.Journal(project_root)
+        test_start_token = (
+            os.environ.get("GOALFLIGHT_TEST_LISTENER_START_TOKEN")
+            if test_mode
+            else None
+        )
+        identity = (
+            {"pid": os.getpid(), "start_token": test_start_token}
+            if test_start_token
+            else goalflight_compat.process_start_identity(os.getpid())
+        )
+        if not isinstance(identity, dict) or not identity.get("start_token"):
+            raise MessageError("listener process identity is unavailable")
+        parent_pid = os.getppid()
+        armed = authority.arm_listener(
+            label,
+            nonce=nonce,
+            pid=os.getpid(),
+            start_token=str(identity["start_token"]),
+            parent_pid=parent_pid,
+        )
+        if not armed.committed or not armed.value:
+            raise MessageError(armed.reason or "listener coverage arm lost")
+        coverage = dict(armed.value)
+    except (MessageError, goalflight_journal.JournalError, ValueError) as exc:
         print(f"listen: {exc}", file=sys.stderr)
         return 2
 
-    def watermark():
-        """(inbox, seq) pairs, not a count: acking lowers a count, so a count
-        would read an ack as 'nothing new' and then miss the next arrival that
-        merely restored the old number. Pairs only ever add."""
-        try:
-            return controller_wake_watermark(
-                controller_session_id=controller_session_id,
-                project_root=project_root,
-                messages_dir=messages_dir,
-                fleet_dir=fleet_dir,
-            )
-        except Exception as exc:  # noqa: BLE001 - reported, not swallowed
-            raise RuntimeError(str(exc)) from exc
+    coverage_id = str(coverage["coverage_id"])
 
-    try:
-        baseline = watermark()
-    except RuntimeError as exc:
-        print(f"listen: cannot read mailbox: {exc}", file=sys.stderr)
-        return 2
+    def finish(reason: str, *, code: int, detail: str | None = None) -> int:
+        exited = authority.exit_listener(coverage_id, reason=reason)
+        if not exited.committed:
+            detail = detail or exited.reason or "coverage exit CAS lost"
+        elif exited.value and exited.value.get("exit_reason"):
+            reason = str(exited.value["exit_reason"])
+        payload = {
+            "reason": reason,
+            "coverage_id": coverage_id,
+            "detail": detail,
+        }
+        if args.json:
+            print(json.dumps(payload, sort_keys=True))
+        elif detail:
+            print(f"listen: {reason}: {detail}", file=sys.stderr)
+        return code
+
+    if args.cursor_token:
+        try:
+            lease = authority.active_lease(label)
+            measured = (
+                {"pid": os.getpid(), "start_token": test_start_token}
+                if test_start_token
+                else goalflight_compat.process_start_identity(os.getpid())
+            )
+            reason = goalflight_journal.listener_exit_reason(
+                coverage,
+                lease.__dict__ if lease is not None else None,
+                current_parent_pid=os.getppid(),
+                identity_matches=bool(
+                    isinstance(measured, dict)
+                    and measured.get("start_token") == coverage.get("start_token")
+                ),
+            )
+            if reason:
+                return finish(reason, code=3, detail="listener cursor-advance check failed")
+            identity_stamp = hashlib.sha256(
+                str(coverage["start_token"]).encode("utf-8")
+            ).hexdigest()[:16]
+            advanced = authority.advance_cursor(
+                args.cursor_token,
+                actor=f"listener:{os.getpid()}:{identity_stamp}",
+            )
+        except (ValueError, goalflight_journal.JournalError) as exc:
+            return finish("corrupt", code=2, detail=str(exc))
+        if not advanced.committed:
+            return finish("superseded", code=3, detail=advanced.reason)
 
     while True:
+        if os.getppid() != parent_pid:
+            return finish("orphaned", code=3, detail="listener parent changed")
         if deadline is not None and time.monotonic() >= deadline:
-            print("listen: timed out with no new mail", file=sys.stderr)
-            return 1
-        time.sleep(poll)
+            return finish("timeout", code=1, detail="no waking event before timeout")
         try:
-            current = watermark()
-        except RuntimeError as exc:
-            print(f"listen: cannot read mailbox: {exc}", file=sys.stderr)
-            return 2
-        fresh = [current[key] for key in current if key not in baseline]
-        if not fresh:
-            continue
-        if args.json:
-            print(json.dumps({"new_mail": len(fresh), "items": fresh}, sort_keys=True, default=str))
-        else:
-            print(format_mail_notice(len(fresh)))
-            for item in fresh:
-                print(f"  {item.get('dispatch_id')} [{item.get('type')}] "
-                      f"{sanitize_display(item.get('text') or '', limit=140)}")
-        return 0
+            stored_coverage = authority.coverage(coverage_id)
+            lease = authority.active_lease(label)
+            measured = (
+                {"pid": os.getpid(), "start_token": test_start_token}
+                if test_start_token
+                else goalflight_compat.process_start_identity(os.getpid())
+            )
+            reason = goalflight_journal.listener_exit_reason(
+                stored_coverage,
+                lease.__dict__ if lease is not None else None,
+                current_parent_pid=os.getppid(),
+                identity_matches=bool(
+                    isinstance(measured, dict)
+                    and measured.get("start_token") == coverage.get("start_token")
+                ),
+            )
+            if reason:
+                return finish(reason, code=3, detail="listener self-check failed")
+            batch = authority.cursor_batch(label, nonce=nonce, limit=args.batch_limit)
+        except goalflight_journal.CASMismatch as exc:
+            lease = authority.active_lease(label)
+            reason = "stale-lease" if lease is not None else "superseded"
+            return finish(reason, code=3, detail=str(exc))
+        except goalflight_journal.JournalUpgradeRequired as exc:
+            return finish("upgrade-required", code=2, detail=str(exc))
+        except goalflight_journal.JournalUnavailable as exc:
+            return finish("journal-unavailable", code=2, detail=str(exc))
+        except (goalflight_journal.JournalError, ValueError) as exc:
+            return finish("corrupt", code=2, detail=str(exc))
+        if batch.wake_pending:
+            try:
+                items = [_listener_envelope(authority, dict(row)) for row in batch.items]
+            except (MessageError, OSError, ValueError, json.JSONDecodeError) as exc:
+                return finish("corrupt", code=2, detail=str(exc))
+            exited = authority.exit_listener(coverage_id, reason="batch")
+            if not exited.committed or not exited.value:
+                return finish("superseded", code=3, detail=exited.reason)
+            if exited.value.get("exit_reason") != "batch":
+                return finish(
+                    "superseded",
+                    code=3,
+                    detail="listener coverage changed before batch exit",
+                )
+            payload = {
+                "reason": "batch",
+                "coverage_id": coverage_id,
+                "registry_generation": batch.registry_generation,
+                "cursor_version": batch.cursor_version,
+                "cursor_token": batch.token,
+                "items": items,
+                "count": len(items),
+                "more_pending": batch.more_pending,
+            }
+            if args.json:
+                print(json.dumps(payload, sort_keys=True))
+            else:
+                print(format_mail_notice(len(items)))
+                for item in items:
+                    body = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+                    print(
+                        f"  {item.get('dispatch_id')} [{item.get('type')}] "
+                        f"{sanitize_display(body.get('text') or '', limit=140)}"
+                    )
+                print(f"cursor_token={batch.token} more_pending={str(batch.more_pending).lower()}")
+            return 0
+        sleep_until = time.monotonic() + poll
+        while time.monotonic() < sleep_until:
+            if os.getppid() != parent_pid:
+                return finish("orphaned", code=3, detail="listener parent changed")
+            if deadline is not None and time.monotonic() >= deadline:
+                return finish("timeout", code=1, detail="no waking event before timeout")
+            time.sleep(min(0.25, max(0.0, sleep_until - time.monotonic())))
 
 
 def cmd_mirror(args: argparse.Namespace) -> int:
@@ -4626,87 +3610,42 @@ def main(argv: list[str] | None = None) -> int:
     read.add_argument("--dispatch-id", required=True)
     read.add_argument("--last", type=int, default=None)
     read.add_argument("--json", action="store_true")
-    read.add_argument("--unseen", action="store_true", help="Show only envelopes after this inbox's read cursor")
-    read.add_argument("--ack", action="store_true", help="With --unseen, advance the cursor through shown envelopes")
     read.set_defaults(func=cmd_read)
-
-    mark_read = sub.add_parser("mark-read", help="Advance read cursor state")
-    mark_read.add_argument("--dispatch-id")
-    mark_read.add_argument("--through", type=int)
-    mark_read.add_argument("--all", action="store_true")
-    mark_read.set_defaults(func=cmd_mark_read)
-
-    ack = sub.add_parser("ack", help="Acknowledge open escalation lifecycle items")
-    ack.add_argument("dispatch_id", nargs="?")
-    ack.add_argument(
-        "--stale",
-        action="store_true",
-        help="Acknowledge terminal task-linked escalations closed or superseded",
-    )
-    ack.set_defaults(func=cmd_ack)
 
     status = sub.add_parser("status")
     status.add_argument("--write-aggregate", action="store_true")
     status.set_defaults(func=cmd_status)
 
     relay = sub.add_parser("relay")
-    relay.add_argument("--new", action="store_true", help="Show only envelopes after each inbox read cursor")
-    relay.add_argument("--ack", action="store_true", help="With --new, advance cursors through shown envelopes")
-    relay.add_argument(
-        "--all-projects",
-        action="store_true",
-        help="Include inboxes outside the current project",
-    )
+    relay.add_argument("--new", action="store_true", help="Peek at events pending after the journal cursor")
     relay.add_argument(
         "--bodies",
         action="store_true",
         help="With --new, print full envelope JSON instead of one headline per message",
     )
-    relay.add_argument(
-        "--history",
-        action="store_true",
-        help="Include read open items and use the legacy unbounded summary",
-    )
     relay.set_defaults(func=cmd_relay)
-
-    undeliverable = sub.add_parser(
-        "undeliverable",
-        help="report unread named controller mail with no active registered recipient",
-    )
-    undeliverable.set_defaults(func=cmd_undeliverable)
-
-    triage_backlog = sub.add_parser(
-        "triage-backlog",
-        help="digest the machine-wide unread snapshot without deleting correspondence",
-    )
-    triage_backlog.add_argument(
-        "--apply",
-        action="store_true",
-        help="write the digest, then advance read cursors through exactly that snapshot",
-    )
-    triage_backlog.set_defaults(func=cmd_triage_backlog)
 
     listen = sub.add_parser(
         "listen",
-        help="block SILENTLY until new mail arrives, then print it and exit",
+        help="one-shot journal cursor listener; its exit is the wake",
     )
     listen.add_argument("--project-root", default=None)
     listen.add_argument(
-        "--controller",
+        "--controller-label",
         default=None,
-        help=(
-            "this controller's handle (e.g. battery-bugs). Recorded in the "
-            "process arguments so `ps` shows whose listener this is without a "
-            "registry lookup, and matched exactly when deciding whether a "
-            "controller still has a live listener. One repo can host several "
-            "controllers, so an unlabelled listener cannot be attributed."
-        ),
+        help="durable controller lease label",
     )
     listen.add_argument(
-        "--session-id",
+        "--lease-nonce",
         default=None,
-        help="controller session id; default: the project's live session beacon",
+        help="active lease capability; defaults to GOALFLIGHT_CONTROLLER_LEASE_NONCE",
     )
+    listen.add_argument(
+        "--cursor-token",
+        default=None,
+        help="previous one-shot batch token to CAS-advance before re-arming",
+    )
+    listen.add_argument("--batch-limit", type=int, default=50)
     listen.add_argument("--poll-secs", type=float, default=5.0)
     listen.add_argument("--timeout-s", type=float, default=0.0,
                         help="0 = wait indefinitely")
@@ -4718,6 +3657,34 @@ def main(argv: list[str] | None = None) -> int:
     mirror.set_defaults(func=cmd_mirror)
 
     args = parser.parse_args(argv)
+    role_by_command = {
+        "listen": "listener",
+        "mirror": "mirror",
+        "status": "dashboard",
+        "relay": "dashboard",
+        "from-text": "producer",
+        "post": "producer",
+    }
+    role = role_by_command.get(args.cmd, "controller")
+    if role == "controller":
+        try:
+            import goalflight_session_status as sessions  # type: ignore
+            import goalflight_task  # type: ignore
+
+            entry_root = goalflight_task.resolve_project_root(str(Path.cwd()))
+            claim_result = sessions.claim_controller_startup(
+                entry_root,
+                pid_from_ancestry=True,
+                role=role,
+            )
+            if claim_result.get("reason") == "label_in_use":
+                print(
+                    "goalflight_messages: "
+                    + str(claim_result.get("message") or "label in use"),
+                    file=sys.stderr,
+                )
+        except Exception:
+            pass
     try:
         return args.func(args)
     except MessageError as exc:

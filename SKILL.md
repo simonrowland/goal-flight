@@ -157,7 +157,7 @@ python3 <skill-root>/scripts/goalflight_doctor.py --project-root "$PWD" --json
 Surface only actionable warnings: install ambiguity, missing required tool,
 capacity cooldown, stale dispatch, surplus worker-like process, or fingerprint
 drift against an in-flight queue.
-Mail is one inbox, not a private markdown file: `relay --new` reads, `--list-controllers` lists peers, `post --to-controller` sends, `listen` wakes. See `protocols/controller-mail.md`.
+Mail is journal-assigned, not a private markdown file: `relay --new` peeks without acknowledging, `--list-controllers` lists leases, `post --to-controller` sends, and a generation-bound one-shot `listen` wakes. See `protocols/controller-mail.md`.
 
 ## Commands
 
@@ -360,7 +360,7 @@ Dispatch CLI workers via `scripts/goalflight_dispatch.py`, never bare background
 Dispatch defaults detached; `--foreground` only for sync scripts/tests. Queue: `--submit --drain-on-submit`.
 Do not hand-iterate (>~3 edit/test cycles) what a goal-loop should converge.
 
-Arm one background `goalflight_messages.py listen --project-root "$PWD"` per claimed controller; it owns future work without ids. Background fixed-id `goalflight_status.py --wait <ids>`; exit 3 is mail, not completion; run its printed re-arm. Timers cover non-notifiable external state, never worker completion.
+Controller entry auto-claims without stealing a live different lease. Arm one background generation-bound `goalflight_messages.py listen --project-root "$PWD" --controller-label <label> --lease-nonce <nonce>`; process its bounded batch, then re-arm with its cursor token. Background fixed-id `goalflight_status.py --wait <ids>` only for an unclaimed join; exit 3 is mail, not completion. Timers cover non-notifiable external state, never worker completion.
 Controller-direct: held context, fully stateable edit, clean Axis 2; plan marks do not waive it.
 Routing detail: typed dispatch roles; five-layer prompts; parallel forbid lists; split broad chunks; host tool maps; same-provider review policy. See `protocols/dispatch-routing.md`.
 Triggered lanes need pinned context and the execute pre-wave check (`worker-context-package.md`).

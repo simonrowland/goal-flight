@@ -192,63 +192,33 @@ python3 <skill-root>/scripts/goalflight_dispatch.py --agent codex --prompt-file 
 ```
 
 The dispatcher prints `DISPATCH-LAUNCHED` with the dispatch id, status JSON,
-tail path, and worker PID, then returns immediately. Arm one ownership-scoped
-mail listener in the background for the controller session:
+tail path, and worker PID, then returns immediately. Controller entry auto-claims
+the canonical-project lease without stealing a live different generation. Arm one
+generation-bound listener in the background using the returned label and nonce:
 
 ```bash
-python3 <skill-root>/scripts/goalflight_messages.py listen --project-root "$PWD"
+python3 <skill-root>/scripts/goalflight_messages.py listen \
+  --project-root "$PWD" --controller-label <label> --lease-nonce <nonce>
 ```
 
-The listener resolves the live session beacon by default (`--session-id <id>`
-pins an explicit session), stays silent until wakeable mail arrives, and
-re-discovers that session's dispatches internally. This covers workers launched
-after the listener starts without re-arming. A controller with a claimed name
-does not enumerate dispatch ids or schedule status timers: arm the listener and
-let it wake. It wakes for owned worker terminal/result or escalation envelopes
-and controller-addressed mail. Foreign or unowned workers, status/monitor
-traffic, quota advisories, and recurring task-store status nudges do not wake it;
-task-store nudges remain in the unread count shown by normal status/mail reads.
+The listener writes a coverage row, returns a bounded batch and cursor token, writes
+an exit row, and terminates. After processing the batch, re-arm with
+`--cursor-token <previous-token>`; that token advances only by CAS on the lease
+generation and cursor version. `more_pending=true` means the re-arm wakes from
+backlog immediately. Listener, drainer, mirror, and dashboard roles never claim or
+renew the controller lease; a verified watchdog tick may renew it.
 
 ### Controller correspondence addressing
 
-Controller-to-controller envelopes carry a machine-readable stable-name
-address, independent of their inbox and project:
+Controller-to-controller envelopes carry a durable label plus canonical project
+root. Producers journal the delivery assignment before projecting its JSONL carrier.
+The one-shot listener and `goalflight_status.py --wait` read that same journal
+authority; callers do not rebuild ownership or add a second addressee filter.
 
-```json
-{"addressee": {"kind": "controller", "label": "goal-flight"}}
-```
-
-The label is the same declared name claimed by
-`goalflight_session_status.py --controller-startup`; it is not a project alias
-or a second identity namespace. Send controller-channel mail with
-`goalflight_messages.py post ... --to-controller goal-flight`. The receiver
-matches the label only after resolving its session id/PID/label tuple to a live,
-non-conflicting beacon. A sender therefore needs the durable human-known name,
-not the recipient's transient session id.
-
-Named controller mail is global across projects. Worker result/escalation mail
-remains dispatch-owned and project-scoped. The shared
-`controller_wake_watermark()` applies both rules for the listener and
-`goalflight_status.py --wait`; do not add a second addressee filter in a caller.
-Legacy unaddressed project-alias inboxes remain readable for compatibility, but
-new correspondence must use `addressee`.
-
-Mail for an unclaimed or unknown label remains in its original JSONL inbox,
-does not wake an arbitrary controller, and is listed by
-`goalflight_messages.py undeliverable`. Recipient cursor keys include the
-controller label, so one controller cannot mark another controller's addressed
-mail read. Broadcast is intentionally unsupported: until broadcast has bounded
-severity, topic, expiry, and acknowledgement semantics, fleet alerts must be
-explicitly fanned out as one addressed envelope per controller instead of creating
-an easy-to-mute global channel.
-
-Backlog triage is lossless. `goalflight_messages.py triage-backlog` is a dry
-run; `--apply` writes a machine-local digest under
-`$GOALFLIGHT_MESSAGES_DIR/backlog-digests/` containing every unread envelope's
-source inbox, sequence, type, addressee, headline, and body size, then advances
-read cursors through exactly that snapshot. Original JSONL correspondence and
-bodies are unchanged. Envelopes arriving after the snapshot retain higher
-sequences and remain unread.
+`relay --new` is a read-only peek at journal-pending events. Advancing delivery
+requires the generation-stamped listener token; legacy read/ack cursor files,
+`mark-read`, `triage-backlog`, and relay acknowledgment do not exist. Coverage rows
+replace process-table discovery.
 
 Use `goalflight_status.py --dispatch <id>` for a snapshot, or background
 `goalflight_status.py --wait <ids>` only when an unclaimed fixed-set terminal

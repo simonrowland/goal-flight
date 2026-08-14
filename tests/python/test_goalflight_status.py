@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import itertools
 import json
 import os
 import sys
@@ -790,7 +791,7 @@ def test_wait_unbounded_sentinels_and_positive_timeout() -> None:
         check("internal None reports eventual terminal state", "flip -> complete" in out)
 
         S.status_payload = lambda: _wait_payload("pending1", "expected_live")
-        times = iter([0.0, 0.2])
+        times = itertools.count(0.0, 0.2)
         S.time.monotonic = lambda: next(times)
         S.time.sleep = lambda _seconds: None
         buf = io.StringIO()

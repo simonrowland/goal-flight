@@ -30,7 +30,10 @@ import goalflight_capacity
 import goalflight_compat
 import goalflight_dispatch_states as dispatch_states
 import goalflight_ledger
+import goalflight_journal
 import goalflight_quota_stuck
+import goalflight_session_status
+import goalflight_task
 import goalflight_terminal
 from goalflight_agent_limits import moonshot_family
 from goalflight_liveness import cpu_confirmed_idle
@@ -633,16 +636,9 @@ def _queue_drainer_warnings() -> list[dict]:
 
 
 def this_project_root() -> str | None:
-    """Resolved git toplevel of CWD, or None when not inside a git repo."""
+    """Worktree-collapsed canonical project root, or None outside a project."""
     try:
-        out = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if out.returncode == 0 and out.stdout.strip():
-            return str(Path(out.stdout.strip()).resolve())
+        return str(goalflight_task.resolve_project_root(str(Path.cwd())))
     except Exception:
         pass
     return None
@@ -881,7 +877,11 @@ def _dashboard_count_bucket(record: dict) -> str:
 
 
 def dashboard_status_payload(project_root: str | Path | None) -> dict:
-    root = str(Path(project_root).resolve()) if project_root is not None else None
+    root = (
+        str(goalflight_task.resolve_project_root(str(project_root)))
+        if project_root is not None
+        else None
+    )
     generated_at = _utc_now()
     now = dt.datetime.now(dt.timezone.utc)
     records = _dashboard_status_records(root)
@@ -994,7 +994,7 @@ def _write_status_data_js(path: Path, payload: dict) -> None:
 def export_dashboard_status(project_root: str | Path | None, path: str | Path | None = None) -> Path | None:
     if project_root is None:
         return None
-    root = Path(project_root).resolve()
+    root = goalflight_task.resolve_project_root(str(project_root))
     target = Path(path).expanduser().resolve() if path is not None else root / "dashboard" / "status-data.js"
     if not target.parent.is_dir():
         return None
@@ -1163,7 +1163,11 @@ def _milestone_payload(project_root: str | None) -> dict:
 
 def milestone_status_payload(project_root: str | Path | None) -> dict:
     """Public, fail-closed milestone projection for peer status consumers."""
-    root = str(Path(project_root).resolve()) if project_root is not None else None
+    root = (
+        str(goalflight_task.resolve_project_root(str(project_root)))
+        if project_root is not None
+        else None
+    )
     return _milestone_payload(root)
 
 
@@ -1851,27 +1855,14 @@ _WAIT_EXIT_MAIL = 3
 
 
 def _mail_watermark(project_root: str | None, wait_ids: list[str]) -> set[tuple[str, object]] | None:
-    """Identity of wake-worthy arrivals, or None if mail is unavailable.
-
-    A set of (inbox, seq) pairs rather than a count. Acking lowers the count, so
-    a count-based check would read an ack as "no new mail" and then miss a later
-    arrival that merely restored the old number. Pairs only ever ADD.
-
-    Wake classification lives in goalflight_messages beside the ownership-keyed
-    listener. The normal mail summary remains the display/unread authority.
-
-    Fail-open: any error returns None, which disables the mail wake for this
-    wait rather than breaking it. A messaging glitch must never cost a
-    controller its watcher.
-    """
+    """Monotonic journal event identity for ``--wait``; cursor advances cannot erase it."""
     try:
-        import goalflight_messages as _gm
-
-        events = _gm.controller_wake_watermark(
-            project_root=Path(project_root) if project_root else Path.cwd(),
-            owned_dispatch_ids=set(wait_ids),
+        root = goalflight_task.resolve_project_root(project_root or str(Path.cwd()))
+        events = goalflight_journal.Journal(root).delivery_event_watermark(
+            stream_ids=wait_ids,
+            waking_only=True,
         )
-        return set(events)
+        return {(recipient, f"{origin}:{event_uuid}") for recipient, origin, event_uuid in events}
     except Exception:
         return None
 
@@ -2188,9 +2179,29 @@ def main(argv: list[str] | None = None) -> int:
     if args.all_projects:
         project_root = None
     elif args.project:
-        project_root = str(Path(args.project).resolve())
+        project_root = str(goalflight_task.resolve_project_root(args.project))
     else:
         project_root = this_project_root()
+
+    if project_root is not None:
+        role = (
+            "dashboard"
+            if args.export_dashboard is not None
+            else "listener"
+            if args.wait
+            else "controller"
+        )
+        claim_result = goalflight_session_status.claim_controller_startup(
+            Path(project_root),
+            pid_from_ancestry=True,
+            role=role,
+        )
+        if claim_result.get("reason") == "label_in_use":
+            print(
+                "goalflight_status: "
+                + str(claim_result.get("message") or "label in use"),
+                file=sys.stderr,
+            )
 
     if args.record_milestone_sweep:
         repo = Path(project_root).resolve() if project_root else (

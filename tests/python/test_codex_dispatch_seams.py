@@ -76,6 +76,9 @@ def _stub_bash_launch(
     persist_ledger: bool = True,
     drop_starting_projection: bool = False,
 ) -> tuple[dict, list[dict]]:
+    monkeypatch.delenv("GOALFLIGHT_CONTROLLER_LABEL", raising=False)
+    monkeypatch.delenv("GOALFLIGHT_CONTROLLER_SESSION_ID", raising=False)
+    monkeypatch.setenv("GOALFLIGHT_CONTROLLER_PID", "99999991")
     spawn_calls: list[dict] = []
     ledger_calls: list[dict] = []
     ordering: list[str] = []
@@ -255,6 +258,7 @@ def test_bash_launch_preserves_nonpersisting_ledger_injection_seam(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    D.goalflight_journal.open_or_create_journal(tmp_path)
     worker_spawn, ledger_calls = _stub_bash_launch(
         monkeypatch,
         tmp_path,
@@ -269,6 +273,22 @@ def test_bash_launch_preserves_nonpersisting_ledger_injection_seam(
         "starting",
         "running",
     ]
+
+
+def test_native_ledger_missing_attempt_still_refuses_worker_launch(
+    tmp_path: Path,
+) -> None:
+    D.goalflight_journal.open_or_create_journal(tmp_path)
+
+    with pytest.raises(
+        RuntimeError,
+        match="prepared attempt missing for missing-attempt",
+    ):
+        D._attempt_claiming_worker_argv(
+            tmp_path,
+            "missing-attempt",
+            [sys.executable, "-c", "pass"],
+        )
 
 
 def test_bash_resolve_none_preserves_inherited_environment(

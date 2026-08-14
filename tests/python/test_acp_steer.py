@@ -106,6 +106,12 @@ def _env(tmp: Path) -> dict[str, str]:
     return env
 
 
+def _project(tmp: Path) -> Path:
+    project = tmp / "project"
+    project.mkdir(exist_ok=True)
+    return project
+
+
 def _wait_for(
     path: Path,
     timeout_s: float = 10.0,
@@ -189,7 +195,7 @@ def _run_confirmation_scenario(
     guarded = tmp / f"{dispatch_id}-guarded"
     env["GOALFLIGHT_FAKE_ACP_GUARDED_FILE"] = str(guarded)
     env["GOALFLIGHT_FAKE_ACP_PERMISSION_LOCATION"] = str(
-        ROOT / ".goalflight-fake-guard-target"
+        _project(tmp) / ".goalflight-fake-guard-target"
     )
     status_path = tmp / f"{dispatch_id}.status.json"
     run = subprocess.run(
@@ -203,7 +209,7 @@ def _run_confirmation_scenario(
             "--dispatch-id",
             dispatch_id,
             "--cwd",
-            str(ROOT),
+            str(_project(tmp)),
             "--prompt",
             "initial task",
             "--status-json",
@@ -261,7 +267,7 @@ def _run_answered_confirmation(
             "--dispatch-id",
             dispatch_id,
             "--cwd",
-            str(ROOT),
+            str(_project(tmp)),
             "--prompt",
             "initial task",
             "--status-json",
@@ -419,7 +425,7 @@ def _start_confirmation_runner(
             "--dispatch-id",
             dispatch_id,
             "--cwd",
-            str(ROOT),
+            str(_project(tmp)),
             "--prompt",
             "initial task",
             "--status-json",
@@ -457,7 +463,7 @@ def case_acp_mailbox_steer_delivered_at_next_turn_and_acked() -> None:
                 "--dispatch-id",
                 dispatch_id,
                 "--cwd",
-                str(ROOT),
+                str(_project(tmp)),
                 "--prompt",
                 "initial task",
                 "--status-json",
@@ -538,7 +544,7 @@ def case_mid_turn_steer_does_not_extend_wedge_deadline() -> None:
                 "--dispatch-id",
                 dispatch_id,
                 "--cwd",
-                str(ROOT),
+                str(_project(tmp)),
                 "--prompt",
                 "initial task",
                 "--status-json",
@@ -600,7 +606,7 @@ def case_nonterminal_steer_turn_continues_to_real_terminal() -> None:
                 "--dispatch-id",
                 dispatch_id,
                 "--cwd",
-                str(ROOT),
+                str(_project(tmp)),
                 "--prompt",
                 "initial task",
                 "--status-json",
@@ -660,7 +666,7 @@ def case_user_confirm_midrun_yes_records_consent_without_authorizing_action() ->
         env["GOALFLIGHT_FAKE_ACP_REQUEST_GUARDED_PERMISSION"] = "1"
         env["GOALFLIGHT_ACP_LIVE_MATRIX"] = "1"
         env["GOALFLIGHT_FAKE_ACP_PERMISSION_LOCATION"] = str(
-            ROOT / ".goalflight-fake-guard-target"
+            _project(tmp) / ".goalflight-fake-guard-target"
         )
         dispatch_id = "acp-user-confirm-route"
         status_path = tmp / "status.json"
@@ -676,7 +682,7 @@ def case_user_confirm_midrun_yes_records_consent_without_authorizing_action() ->
                 "--dispatch-id",
                 dispatch_id,
                 "--cwd",
-                str(ROOT),
+                str(_project(tmp)),
                 "--prompt",
                 "initial task",
                 "--status-json",
@@ -807,7 +813,7 @@ def case_midturn_mailbox_yes_is_reconciled_before_timeout_denial() -> None:
                 "--dispatch-id",
                 dispatch_id,
                 "--cwd",
-                str(ROOT),
+                str(_project(tmp)),
                 "--prompt-text",
                 "initial task",
                 "--status-json",
@@ -949,7 +955,7 @@ def case_uncorrelated_user_confirm_yes_is_not_authorization() -> None:
                 "--dispatch-id",
                 dispatch_id,
                 "--cwd",
-                str(ROOT),
+                str(_project(tmp)),
                 "--prompt",
                 "initial task",
                 "--status-json",
@@ -1022,7 +1028,7 @@ def case_same_turn_guarded_action_is_denied_without_answer() -> None:
         guarded = tmp / "same-turn-guarded-action"
         env["GOALFLIGHT_FAKE_ACP_GUARDED_FILE"] = str(guarded)
         env["GOALFLIGHT_FAKE_ACP_PERMISSION_LOCATION"] = str(
-            ROOT / ".goalflight-fake-guard-target"
+            _project(tmp) / ".goalflight-fake-guard-target"
         )
         status_path = tmp / "status.json"
         run = subprocess.run(
@@ -1036,7 +1042,7 @@ def case_same_turn_guarded_action_is_denied_without_answer() -> None:
                 "--dispatch-id",
                 "acp-user-confirm-same-turn-guard",
                 "--cwd",
-                str(ROOT),
+                str(_project(tmp)),
                 "--prompt",
                 "initial task",
                 "--status-json",
@@ -1121,7 +1127,7 @@ def case_user_confirm_timeout_is_fail_closed_then_continues() -> None:
                 "--dispatch-id",
                 dispatch_id,
                 "--cwd",
-                str(ROOT),
+                str(_project(tmp)),
                 "--prompt",
                 "initial task",
                 "--status-json",
@@ -1325,7 +1331,7 @@ def case_restart_does_not_reuse_question_id_or_accept_stale_yes() -> None:
                     "GOALFLIGHT_FAKE_ACP_REQUEST_GUARDED_PERMISSION": "1",
                     "GOALFLIGHT_ACP_LIVE_MATRIX": "1",
                     "GOALFLIGHT_FAKE_ACP_PERMISSION_LOCATION": str(
-                        ROOT / ".goalflight-fake-guard-target"
+                        _project(tmp) / ".goalflight-fake-guard-target"
                     ),
                 },
             )
@@ -1416,7 +1422,7 @@ def case_crossed_dual_user_confirm_answers_never_emit_authorization() -> None:
                 "--dispatch-id",
                 dispatch_id,
                 "--cwd",
-                str(ROOT),
+                str(_project(tmp)),
                 "--prompt",
                 "initial task",
                 "--status-json",
@@ -1492,7 +1498,7 @@ def case_prior_denial_blocks_later_scope_in_same_generation() -> None:
                 "GOALFLIGHT_FAKE_ACP_FIRST_TURN_SLEEP": "0.5",
                 "GOALFLIGHT_ACP_LIVE_MATRIX": "1",
                 "GOALFLIGHT_FAKE_ACP_PERMISSION_LOCATION": str(
-                    ROOT / ".goalflight-fake-guard-target"
+                    _project(tmp) / ".goalflight-fake-guard-target"
                 ),
             },
         )
@@ -1562,7 +1568,7 @@ def case_same_turn_permission_escalation_and_marker_yes_both_stay_closed() -> No
                 "GOALFLIGHT_ACP_LIVE_MATRIX": "1",
                 "GOALFLIGHT_FAKE_ACP_ESCALATION_FILE": str(escalation_target),
                 "GOALFLIGHT_FAKE_ACP_PERMISSION_LOCATION": str(
-                    ROOT / ".goalflight-fake-guard-target"
+                    _project(tmp) / ".goalflight-fake-guard-target"
                 ),
             },
         )
@@ -1636,8 +1642,9 @@ def case_conflicting_user_confirm_answers_are_deny_biased() -> None:
 
 def case_correlated_worker_marker_yes_never_opens_non_read_permissions() -> None:
     with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
         proc, stdout, stderr, status, guarded, _question = _run_answered_confirmation(
-            Path(td),
+            tmp,
             scenario="user_confirm_continue",
             dispatch_id="acp-user-confirm-yes",
             decisions=["yes"],
@@ -1645,7 +1652,7 @@ def case_correlated_worker_marker_yes_never_opens_non_read_permissions() -> None
                 "GOALFLIGHT_FAKE_ACP_REQUEST_GUARDED_PERMISSION": "1",
                 "GOALFLIGHT_ACP_LIVE_MATRIX": "1",
                 "GOALFLIGHT_FAKE_ACP_PERMISSION_LOCATION": str(
-                    ROOT / ".goalflight-fake-guard-target"
+                    _project(tmp) / ".goalflight-fake-guard-target"
                 ),
             },
         )

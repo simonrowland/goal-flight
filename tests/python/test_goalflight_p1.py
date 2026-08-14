@@ -917,38 +917,6 @@ def test_quarantine_dedup_uses_resolved_identity_for_relative_and_absolute_alias
     assert rows[0]["path"] == str(path.resolve())
 
 
-def test_corruption_quarantine_and_warning_surface_through_controller_notice(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _set_state_env(monkeypatch, tmp_path)
-    project = tmp_path / "project"
-    project.mkdir()
-    fleet = tmp_path / "fleet"
-    fleet.mkdir()
-    result = messages.post_message(
-        dispatch_id="controller-corruption",
-        msg_type="controller-notice",
-        payload={"text": "valid prefix"},
-        messages_dir=tmp_path / "messages",
-        addressee=messages.controller_addressee("main", project_root=project),
-    )
-    path = Path(result["path"])
-    with path.open("ab") as handle:
-        handle.write(b"{broken notice\n")
-    stream = io.StringIO()
-    notice = messages.emit_controller_mail_notice(
-        owned_dispatch_ids={"controller-corruption"},
-        project_root=project,
-        messages_dir=tmp_path / "messages",
-        fleet_dir=fleet,
-        stream=stream,
-    )
-    output = stream.getvalue()
-    assert notice is None or "new mail; read:" in output
-    assert "WARNING: carrier corruption:" in output
-    assert messages.quarantine_path(path).is_file()
-
-
 def test_deleted_legacy_message_surfaces_and_steer_use_carrier_transaction(
     tmp_path: Path,
 ) -> None:
@@ -1009,45 +977,6 @@ def test_restore_refuses_incompatible_live_epoch_before_replacement(
         assert connection.execute(
             "SELECT protocol_epoch FROM journal_epochs WHERE singleton = 1"
         ).fetchone() == (newer_protocol,)
-
-
-def test_carrier_corruption_changes_the_controller_wake_watermark(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _set_state_env(monkeypatch, tmp_path)
-    project = tmp_path / "project"
-    project.mkdir()
-    messages_dir = tmp_path / "messages"
-    fleet_dir = tmp_path / "fleet"
-    fleet_dir.mkdir()
-    dispatch_id = "corruption-wake"
-    result = messages.post_message(
-        dispatch_id=dispatch_id,
-        msg_type="status",
-        payload={"text": "quiet prefix"},
-        messages_dir=messages_dir,
-    )
-    baseline = messages.controller_wake_watermark(
-        project_root=project,
-        owned_dispatch_ids={dispatch_id},
-        messages_dir=messages_dir,
-        fleet_dir=fleet_dir,
-    )
-    assert baseline == {}
-
-    with Path(result["path"]).open("ab") as handle:
-        handle.write(b"{broken while listener sleeps\n")
-    current = messages.controller_wake_watermark(
-        project_root=project,
-        owned_dispatch_ids={dispatch_id},
-        messages_dir=messages_dir,
-        fleet_dir=fleet_dir,
-    )
-    fresh = [current[key] for key in current if key not in baseline]
-    assert len(fresh) == 1
-    assert fresh[0]["dispatch_id"] == dispatch_id
-    assert fresh[0]["type"] == "carrier-corruption"
-    assert "invalid JSON" in fresh[0]["text"]
 
 
 def test_envelope_rejects_non_integer_schema_versions_and_raw_overlong_label(

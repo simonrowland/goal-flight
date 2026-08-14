@@ -30,6 +30,13 @@ run_self_test() {
   trap 'rm -rf "$tmp_dir"' EXIT INT TERM
   status_dir="$tmp_dir/dispatch"
   mkdir -p "$status_dir"
+  export GOALFLIGHT_TASK_STORE_DIR="$tmp_dir/task-store"
+  export GOALFLIGHT_JOURNAL_DIR="$tmp_dir/journal"
+  export GOALFLIGHT_MESSAGES_DIR="$tmp_dir/messages"
+  export GOAL_FLIGHT_PIDFILE_DIR="$tmp_dir/pidfiles"
+  export GOALFLIGHT_CAPACITY_CONF=/dev/null
+  export GOALFLIGHT_PROCESS_ROLE=dashboard
+  export GOALFLIGHT_TEST_MODE=1
   payload='{"hook_event_name":"SessionStart","source":"startup","cwd":"'"$repo_root"'"}'
   hook_shell=${GOALFLIGHT_WATCHDOG_SELFTEST_SHELL:-/bin/sh}
 
@@ -42,6 +49,16 @@ $payload
 EOF
   )
   [ -z "$out" ] || fail "empty state should be silent"
+
+  PYTHONPATH="$repo_root/scripts:$repo_root${PYTHONPATH:+:$PYTHONPATH}" \
+    python3 - "$repo_root" <<'PY' || fail "seed journal activity"
+import sys
+import goalflight_journal
+
+authority = goalflight_journal.open_or_create_journal(sys.argv[1])
+result = authority.prepare_attempt("self-test")
+assert result.committed
+PY
 
   i=0
   while [ "$i" -lt 12 ]; do
@@ -71,8 +88,7 @@ assert "goalflight-watchdog-prompt.md" in ctx
 assert "ARM THE EVENT WAKE FIRST" in ctx
 assert "goalflight_messages.py listen" in ctx
 assert "goalflight_status.py --wait" in ctx
-assert "--controller-pid-from-ancestry" in ctx
-assert "returned `session.pid`" in ctx
+assert "returned `session.lease_nonce`" in ctx
 assert "crash-recovery fallback only" in ctx
 assert "`7 * * * *`" in ctx
 assert ctx.index("ARM THE EVENT WAKE FIRST") < ctx.index("CronList")
@@ -87,7 +103,7 @@ import sys
 text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
 assert "event-wait-live" in text
 assert "do nothing else" in text
-assert "goalflight_messages.py listen" in text
+assert "listener coverage row" in text
 assert "goalflight_status.py --wait <ids>" in text
 assert "crash-recovery fallback only" in text
 assert "Schedule: `7 * * * *` (hourly)" in text
@@ -176,7 +192,6 @@ main() {
 
   python3 - <<'PY' 2>/dev/null || true
 import glob
-import heapq
 import json
 import os
 import subprocess
@@ -221,67 +236,6 @@ def find_goalflight_root(cwd, plugin_root):
     if under(cwd, plugin_root):
         return os.path.realpath(plugin_root)
     return None
-
-
-def status_belongs_to_repo(data: dict, repo_root: str) -> bool:
-    for key in ("project_root", "worker_cwd"):
-        value = data.get(key)
-        if isinstance(value, str) and under(value, repo_root):
-            return True
-    return False
-
-
-def bounded_int_env(name: str, default: int, minimum: int, maximum: int) -> int:
-    try:
-        value = int(os.environ.get(name, str(default)))
-    except (TypeError, ValueError):
-        return default
-    return max(minimum, min(maximum, value))
-
-
-def bounded_float_env(name: str, default: float, minimum: float, maximum: float) -> float:
-    try:
-        value = float(os.environ.get(name, str(default)))
-    except (TypeError, ValueError):
-        return default
-    return max(minimum, min(maximum, value))
-
-
-def newest_status_paths(status_glob: str, cap: int, deadline: float):
-    newest = []
-    for path in glob.iglob(status_glob):
-        if time.monotonic() >= deadline:
-            break
-        try:
-            item = (os.path.getmtime(path), path)
-        except OSError:
-            continue
-        if len(newest) < cap:
-            heapq.heappush(newest, item)
-        elif item > newest[0]:
-            heapq.heapreplace(newest, item)
-    return [path for _, path in sorted(newest, reverse=True)]
-
-
-def has_running_dispatch(repo_root: str) -> bool:
-    status_glob = os.environ.get("GOALFLIGHT_WATCHDOG_STATUS_GLOB") or "/tmp/goal-flight-*/dispatch/*.status.json"
-    file_cap = bounded_int_env("GOALFLIGHT_WATCHDOG_STATUS_FILE_CAP", 64, 1, 4096)
-    probe_seconds = bounded_float_env("GOALFLIGHT_WATCHDOG_PROBE_SECONDS", 0.75, 0.05, 4.0)
-    deadline = time.monotonic() + probe_seconds
-    for path in newest_status_paths(status_glob, file_cap, deadline):
-        if time.monotonic() >= deadline:
-            break
-        try:
-            with open(path, "r", encoding="utf-8", errors="replace") as handle:
-                data = json.load(handle)
-        except Exception:
-            continue
-        if not isinstance(data, dict):
-            continue
-        state = str(data.get("state") or "").casefold()
-        if state == "running" and status_belongs_to_repo(data, repo_root):
-            return True
-    return False
 
 
 def has_recent_resume_note() -> bool:
@@ -329,16 +283,69 @@ def session_status_active(repo_root: str) -> bool:
     return result.returncode == 0 and result.stdout.lower().startswith("active goal-flight session")
 
 
+def claim_controller_entry(repo_root: str, cwd: str) -> dict:
+    script = os.path.join(repo_root, "scripts", "goalflight_session_status.py")
+    try:
+        result = subprocess.run(
+            [
+                sys.executable,
+                script,
+                "--project-root",
+                cwd,
+                "--controller-startup",
+                "--controller-pid-from-ancestry",
+            ],
+            cwd=cwd,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+            check=False,
+        )
+        payload = json.loads(result.stdout or "{}")
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
+def journal_activity(repo_root: str, cwd: str) -> bool:
+    try:
+        sys.path.insert(0, repo_root)
+        sys.path.insert(0, os.path.join(repo_root, "scripts"))
+        import goalflight_journal
+        import goalflight_task
+
+        root = goalflight_task.resolve_project_root(cwd)
+        authority = goalflight_journal.Journal(root)
+        if authority.attention_items():
+            return True
+        return bool(
+            authority.read_all(
+                """SELECT 1 FROM dispatch_attempts
+                   WHERE project_root = ? AND lifecycle_state IN ('PREPARED', 'STARTING', 'RUNNING')
+                   LIMIT 1""",
+                (str(root),),
+            )
+        )
+    except Exception:
+        return False
+
+
 def main() -> None:
     payload = load_payload()
+    if not payload:
+        return
     cwd = payload.get("cwd") or os.environ.get("CLAUDE_CODE_CWD") or os.environ.get("PWD") or ""
     plugin_root = os.environ["GOALFLIGHT_PLUGIN_ROOT"]
     repo_root = find_goalflight_root(str(cwd), plugin_root)
     if not repo_root:
         return
     os.environ["GOALFLIGHT_REPO_ROOT"] = repo_root
+    claim_result = claim_controller_entry(repo_root, str(cwd))
 
-    if not (has_running_dispatch(repo_root) or has_recent_resume_note() or session_status_active(repo_root)):
+    if not (journal_activity(repo_root, str(cwd)) or has_recent_resume_note() or session_status_active(repo_root)):
         return
 
     prompt_file = os.environ.get("GOALFLIGHT_WATCHDOG_PROMPT_FILE")
@@ -349,10 +356,10 @@ def main() -> None:
     context = (
         "An active goal-flight run was detected on this session start. ARM THE EVENT WAKE FIRST "
         "as a background task per `protocols/dispatch-routing.md` and `commands/execute.md`: "
-        "inside a one-shot agent harness, claim with `goalflight_session_status.py "
-        "--controller-startup --controller-pid-from-ancestry` and carry the returned "
-        "`session.pid` on later ownership commands. "
-        "A claimed controller runs `goalflight_messages.py listen --project-root \"$PWD\"`; an "
+        "the SessionStart hook already attempted a role-aware lease claim; inspect its result "
+        f"({json.dumps(claim_result, sort_keys=True)}). Carry the returned `session.lease_nonce`. "
+        "A claimed controller runs `goalflight_messages.py listen --project-root \"$PWD\" "
+        "--controller-label <label> --lease-nonce <nonce>`; an "
         "unclaimed fixed-set controller runs the printed `goalflight_status.py --wait <ids>` "
         "command. Do not block the controller turn on either wait. CONTINUE IN-SKILL: re-invoke "
         "`/goal-flight resume` (this reloads SKILL.md fresh "

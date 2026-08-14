@@ -11,12 +11,12 @@ Hard constraints:
 - Respect concurrent worker ownership and forbid edits outside the active chunk scope.
 
 First gate — event path owns the work:
-1. Determine whether this controller session already has a live background event wait covering its in-flight dispatches: the ownership-scoped `goalflight_messages.py listen` for a claimed controller, or the fixed-set `goalflight_status.py --wait <ids>` for an unclaimed controller.
+1. Query the project journal's active lease, cursor, and listener coverage row. Coverage is live only when its stored `(pid,start_token)` verifies and its lease generation is current and inside the renewal horizon. Process scans are diagnostics, never authority. An unclaimed fixed-set controller may instead use `goalflight_status.py --wait <ids>`, which reads the same journal event authority.
 2. If that event wait is live, report `event-wait-live` and do nothing else. Do not poll status files, process completions, dispatch work, or re-arm a cron from this pass.
 
 Crash-recovery pass — only when the event path is absent:
 1. Orient from the newest `docs-private/RESUME-NOTES-*.md`, the active `docs-private/goal-queue-*.md`, `git status --short --branch`, and `git log -1 --oneline`.
-2. Reconcile this repo's bounded dispatch status evidence and addressed mail. Classify each in-flight dispatch by status JSON, PID identity, terminal marker, and staleness.
+2. Reconcile journal attempts/outbox/attention rows first, then the ledger and bounded status projections. Classify each in-flight dispatch by journal state, status JSON, PID identity, terminal marker, and staleness.
 3. If dispatches remain in flight, restore the correct event wait as a background task before continuing. Never block the controller turn on the wait.
 4. For every unprocessed COMPLETE dispatch: verify the claimed files/tests, run independent chunk review when convergence-heavy, commit exactly that chunk if allowed by the active run rules, then mark the queue/resume notes.
 5. For wedged or stale dispatches: unstick conservatively from status evidence, recover or relaunch only when ownership and file scope are clear, otherwise report `BLOCKED:`.

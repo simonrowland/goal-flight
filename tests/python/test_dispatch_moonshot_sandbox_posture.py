@@ -78,10 +78,10 @@ def _record(dispatch_id: str) -> dict:
 
 
 def case_real_dispatch_records_honest_moonshot_sandbox_posture() -> None:
-    project = REPO_ROOT / f".moonshot-sandbox-probe-{os.getpid()}-{uuid.uuid4().hex}"
-    project.mkdir()
-    try:
-        with tempfile.TemporaryDirectory(prefix="gf-moonshot-posture-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="gf-moonshot-posture-") as tmp:
+        project = Path(tmp) / f"sandbox-project-{os.getpid()}-{uuid.uuid4().hex}"
+        project.mkdir()
+        try:
             temp_root = Path(tmp)
             fake_home = temp_root / "home"
             state_dir = temp_root / "state"
@@ -158,8 +158,8 @@ def case_real_dispatch_records_honest_moonshot_sandbox_posture() -> None:
                     "supported_profile": "off",
                     "enforced_profile": "off",
                 }, allowed_posture
-    finally:
-        shutil.rmtree(project, ignore_errors=True)
+        finally:
+            shutil.rmtree(project, ignore_errors=True)
 
 
 def main() -> None:
