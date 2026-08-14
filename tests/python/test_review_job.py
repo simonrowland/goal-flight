@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -754,6 +755,64 @@ def test_complete_review_does_not_copy_stderr_to_error_fields() -> None:
         assert_true("complete ledger has no stderr excerpt", "stderr_excerpt" not in json.dumps(record))
 
 
+@skipif(os.name == "nt", reason="native Windows review-job dispatch is refused in Phase 1")
+def test_missing_prompt_after_capacity_commits_terminal_outbox() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        state_dir = tmp / "state"
+        repo = tmp / "sandbox"
+        repo.mkdir()
+        out_dir = tmp / "out"
+        out_dir.mkdir()
+        missing_prompt = tmp / "missing.prompt.md"
+        proc = run(
+            [
+                sys.executable,
+                "scripts/goalflight_review_job.py",
+                "--agent",
+                "custom",
+                "--name",
+                "missing-prompt-outbox",
+                "--repo",
+                str(repo),
+                "--prompt",
+                str(missing_prompt),
+                "--output-dir",
+                str(out_dir),
+                "--json",
+                "--command",
+                sys.executable,
+                "-c",
+                "pass",
+            ],
+            state_dir=state_dir,
+            check=False,
+            timeout=20,
+        )
+        assert_true("missing prompt exits nonzero", proc.returncode != 0)
+        status = json.loads(
+            (out_dir / "missing-prompt-outbox.status.json").read_text(encoding="utf-8")
+        )
+        assert_true("missing prompt remains failed", status["state"] == "failed")
+        journals = list((tmp / "journal").rglob("state-journal.sqlite3"))
+        assert_true("one review journal", len(journals) == 1)
+        with sqlite3.connect(journals[0]) as connection:
+            rows = connection.execute(
+                """SELECT a.lifecycle_state, o.event_type, o.event_uuid
+                   FROM dispatch_attempts AS a
+                   JOIN terminal_outbox AS o USING (attempt_id)
+                   WHERE a.dispatch_id = ?""",
+                (status["dispatch_id"],),
+            ).fetchall()
+        assert_true(
+            "review prelaunch failure has one terminal outbox row",
+            len(rows) == 1
+            and rows[0][0] == "TERMINAL"
+            and rows[0][1] == "blocked"
+            and bool(rows[0][2]),
+        )
+
+
 def main() -> None:
     tests = [
         test_review_job_capacity_wait_queues_until_slot_frees,
@@ -771,6 +830,7 @@ def main() -> None:
         test_failed_stderr_excerpt_reaches_pressure_scanner,
         test_failed_stdout_rate_limit_is_classified_and_recorded,
         test_complete_review_does_not_copy_stderr_to_error_fields,
+        test_missing_prompt_after_capacity_commits_terminal_outbox,
     ]
     for test in tests:
         test()

@@ -3789,7 +3789,11 @@ def _test_submit_status_delay() -> None:
         label="submit status",
     ):
         return
-    raw = os.environ.get("GOALFLIGHT_TEST_SUBMIT_STATUS_DELAY_S")
+    raw = goalflight_compat.allowed_env_override(
+        "GOALFLIGHT_TEST_SUBMIT_STATUS_DELAY_S",
+        "",
+        test_mode=True,
+    )
     if not raw:
         return
     try:

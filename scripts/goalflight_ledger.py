@@ -843,6 +843,16 @@ def reconcile_terminal_outbox(
             (reconcile_at,),
         )
     }
+    running_attempts = {
+        str(row["dispatch_id"]): row
+        for row in authority.read_all(
+            """SELECT attempt_id, dispatch_id, launch_token, launch_epoch,
+                      lifecycle_state, worker_instance_json
+               FROM dispatch_attempts
+               WHERE lifecycle_state = 'RUNNING'
+                 AND worker_instance_json IS NOT NULL"""
+        )
+    }
     committed = 0
     already_terminal = 0
     retryable = 0
@@ -865,6 +875,46 @@ def reconcile_terminal_outbox(
                     "launch_epoch": int(row["launch_epoch"]),
                 }
             )
+    for dispatch_id, row in running_attempts.items():
+        try:
+            worker_instance = json.loads(str(row["worker_instance_json"]))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(worker_instance, dict) or not worker_instance.get("pid"):
+            continue
+        record = None
+        for candidate in records:
+            if (
+                not isinstance(candidate, dict)
+                or str(candidate.get("dispatch_id") or "") != dispatch_id
+                or not candidate.get("project_root")
+            ):
+                continue
+            try:
+                candidate_root = goalflight_task.resolve_project_root(
+                    str(candidate["project_root"])
+                )
+            except Exception:
+                continue
+            if candidate_root == canonical_root:
+                record = candidate
+                break
+        if record is None:
+            record = {
+                "dispatch_id": dispatch_id,
+                "project_root": str(canonical_root),
+                "state": "running",
+            }
+            records.append(record)
+        if not record.get("worker_pid"):
+            record["worker_pid"] = worker_instance["pid"]
+            record["worker_identity"] = worker_instance
+            record["worker_pgid"] = worker_instance.get("pgid")
+            record["attempt_id"] = str(row["attempt_id"])
+            record["launch_token"] = str(row["launch_token"])
+            record["launch_epoch"] = int(row["launch_epoch"])
+            if _terminal_key(record) in {"", "unknown", "watcher_stopped"}:
+                record["state"] = "running"
     for record in records:
         if not isinstance(record, dict) or not record.get("dispatch_id"):
             continue

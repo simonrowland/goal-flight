@@ -318,6 +318,59 @@ def test_reconciler_emits_dead_worker_once_without_classifier(
     assert ledger.record_path(prepared_only_id).is_file()
 
 
+def test_reconciler_reads_running_worker_instance_when_ledger_has_no_pid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = _set_state_env(monkeypatch, tmp_path)
+    project = _project(tmp_path)
+    dispatch_id = "running-before-ledger-pid"
+    _ledger_record(env, project, dispatch_id, "waiting_capacity")
+    _ledger_record(env, project, dispatch_id, "starting")
+    record = json.loads(ledger.record_path(dispatch_id).read_text(encoding="utf-8"))
+    assert record.get("worker_pid") is None
+
+    worker = subprocess.Popen(
+        [
+            sys.executable,
+            str(SCRIPTS / "goalflight_launch_worker.py"),
+            "--project-root",
+            str(project),
+            "--attempt-id",
+            str(record["attempt_id"]),
+            "--launch-token",
+            str(record["launch_token"]),
+            "--launch-epoch",
+            str(record["launch_epoch"]),
+            "--",
+            sys.executable,
+            "-c",
+            "pass",
+        ],
+        cwd=project,
+        env=env,
+    )
+    assert worker.wait(timeout=10) == 0
+    running = journal.Journal(project).read_all(
+        "SELECT lifecycle_state, worker_instance_json FROM dispatch_attempts "
+        "WHERE dispatch_id = ?",
+        (dispatch_id,),
+    )
+    assert len(running) == 1
+    assert running[0]["lifecycle_state"] == journal.ATTEMPT_RUNNING
+    assert json.loads(running[0]["worker_instance_json"])["pid"] == worker.pid
+
+    messages_dir = Path(env["GOALFLIGHT_MESSAGES_DIR"])
+    first = ledger.reconcile_terminal_outbox(project, messages_dir=messages_dir)
+    second = ledger.reconcile_terminal_outbox(project, messages_dir=messages_dir)
+    attempt = journal.Journal(project).attempt_for_dispatch(dispatch_id)
+    inbox = messages.read_envelopes(messages.inbox_path(messages_dir, dispatch_id))
+    assert first["committed"] == 1 and first["projected"] == 1
+    assert second["committed"] == 0 and second["projected"] == 0
+    assert attempt is not None and attempt.lifecycle_state == journal.ATTEMPT_TERMINAL
+    assert len(inbox) == 1
+    assert inbox[0]["payload"]["terminal_state"] == "worker_dead"
+
+
 def test_escalation_quote_fence_and_position_guards(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -365,6 +418,80 @@ def test_escalation_quote_fence_and_position_guards(
     assert len(outbox) == 1 and outbox[0]["event_type"] == "user_need"
     assert json.loads(outbox[0]["payload_json"])["text"] == "choose the release target"
     assert inbox_path.is_file()
+
+
+def test_unclosed_fence_rejects_quoted_escalation_but_keeps_real_terminals(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = _set_state_env(monkeypatch, tmp_path)
+    messages_dir = messages.default_messages_dir()
+    project = _project(tmp_path)
+    dispatch_id = "unclosed-fence-escalation"
+    _ledger_record(env, project, dispatch_id, "waiting_capacity")
+    _ledger_record(env, project, dispatch_id, "starting")
+    tail = tmp_path / "unclosed-fence.tail"
+    tail.write_text(
+        "worker quoted a historical example:\n"
+        "```text\n"
+        "BLOCKED: historical example\n",
+        encoding="utf-8",
+    )
+    scanner = watch.IncrementalTailScanner(tail)
+    quoted = scanner.scan()
+    quoted_markers, _ = watch.extract_markers(tail)
+    assert quoted.fence_unbalanced is True
+    assert quoted.terminal is None
+    assert all(marker.get("kind") != "BLOCKED" for marker in quoted.markers)
+    assert all(marker.get("kind") != "BLOCKED" for marker in quoted_markers)
+    assert watch._final_terminal_marker(tail) is None
+    assert journal.Journal(project).read_all(
+        "SELECT event_uuid FROM terminal_outbox WHERE recipient = ?",
+        (dispatch_id,),
+    ) == []
+
+    with tail.open("a", encoding="utf-8") as handle:
+        handle.write("```\nBLOCKED: genuine blocker outside fence\n")
+    genuine = scanner.scan()
+    assert genuine.fence_unbalanced is False
+    assert genuine.terminal == {
+        "line": 5,
+        "kind": "BLOCKED",
+        "text": "genuine blocker outside fence",
+    }
+    assert watch._final_terminal_marker(tail) == genuine.terminal
+    assert watch._finish_existing_ledger(
+        dispatch_id,
+        watch._marker_state(genuine.terminal),
+        "marker:BLOCKED",
+        worker_still_alive=False,
+        terminal_marker=genuine.terminal,
+    ) is None
+    outbox = journal.Journal(project).read_all(
+        "SELECT event_type, payload_json FROM terminal_outbox WHERE recipient = ?",
+        (dispatch_id,),
+    )
+    assert len(outbox) == 1 and outbox[0]["event_type"] == "blocked"
+    assert json.loads(outbox[0]["payload_json"])["text"] == (
+        "genuine blocker outside fence"
+    )
+    inbox = messages.read_envelopes(messages.inbox_path(messages_dir, dispatch_id))
+    assert len(inbox) == 1 and inbox[0]["payload"]["text"] == (
+        "genuine blocker outside fence"
+    )
+
+    success_tail = tmp_path / "unclosed-success.tail"
+    success_tail.write_text(
+        "work started\n~~~~^^\ntraceback underline\nCOMPLETE: genuine sign-off\n",
+        encoding="utf-8",
+    )
+    success = watch.IncrementalTailScanner(success_tail).scan()
+    assert success.fence_unbalanced is True
+    assert success.terminal == {
+        "line": 4,
+        "kind": "COMPLETE",
+        "text": "genuine sign-off",
+    }
+    assert watch._final_terminal_marker(success_tail) == success.terminal
 
 
 def test_d13_registry_is_exhaustive_and_cli_mcp_compatible(

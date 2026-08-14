@@ -646,6 +646,11 @@ def _fence_state_unbalanced(lines: list[str], ignored_lines: set[int]) -> bool:
     return fence.in_fence
 
 
+def _marker_survives_unbalanced_fence(marker: dict | None) -> bool:
+    """Recover genuine success sign-offs without promoting fenced escalations."""
+    return bool(marker and marker.get("kind") in SUCCESS_TERMINAL_MARKERS)
+
+
 def _final_terminal_marker_from_line(
     raw_line: str,
     line_no: int,
@@ -1000,8 +1005,21 @@ class _IncrementalMarkerState:
         return marker, line_in_fence
 
     def visible_markers(self) -> list[dict]:
-        source = self.all_markers if self.fence.in_fence else self.outside_markers
-        return [dict(marker) for marker in source]
+        if not self.fence.in_fence:
+            return [dict(marker) for marker in self.outside_markers]
+        outside = {
+            (marker.get("line"), marker.get("kind"), marker.get("text"))
+            for marker in self.outside_markers
+        }
+        return [
+            dict(marker)
+            for marker in self.all_markers
+            if (
+                (marker.get("line"), marker.get("kind"), marker.get("text"))
+                in outside
+                or _marker_survives_unbalanced_fence(marker)
+            )
+        ]
 
     def terminal(self, *, kimi_output: bool) -> dict | None:
         if self.last_candidate is None:
@@ -1009,12 +1027,15 @@ class _IncrementalMarkerState:
         line_no, line, candidate_in_fence = self.last_candidate
         if candidate_in_fence and not self.fence.in_fence:
             return None
-        return _final_terminal_marker_from_line(
+        marker = _final_terminal_marker_from_line(
             line,
             line_no,
             allow_prefixed_marker=True,
             kimi_output=kimi_output,
         )
+        if candidate_in_fence and not _marker_survives_unbalanced_fence(marker):
+            return None
+        return marker
 
 
 class IncrementalTailScanner:
@@ -1230,7 +1251,13 @@ class IncrementalTailScanner:
         mail_candidates = [
             marker
             for marker, marker_in_fence in found
-            if state.fence.in_fence or not marker_in_fence
+            if (
+                not marker_in_fence
+                or (
+                    state.fence.in_fence
+                    and _marker_survives_unbalanced_fence(marker)
+                )
+            )
         ]
         mail_markers: list[dict] = []
         seen: set[tuple[object, object, object]] = set()
@@ -1279,13 +1306,17 @@ def extract_markers(path: Path, max_bytes: int = 10 * 1024 * 1024,
         # Worker output containing example marker vocab in code fences must not inject terminals.
         if fence.consume_boundary(line):
             continue
-        if fence.in_fence and not ignore_fences:
+        marker_in_fence = fence.in_fence
+        if marker_in_fence and not ignore_fences:
             continue
         match = MARKER_RE.match(stripped)
         if match:
             if goalflight_terminal.marker_is_template_example(match.group(1), match.group(2)):
                 continue
-            markers.append({"line": idx, "kind": match.group(1), "text": match.group(2)[:1000]})
+            marker = {"line": idx, "kind": match.group(1), "text": match.group(2)[:1000]}
+            if marker_in_fence and not _marker_survives_unbalanced_fence(marker):
+                continue
+            markers.append(marker)
             continue
         # Bare sign-off ("Done.", "complete", "FINISHED!") carries no payload and
         # is indistinguishable from ordinary output -- notably the `done`
@@ -1299,7 +1330,9 @@ def extract_markers(path: Path, max_bytes: int = 10 * 1024 * 1024,
         # break that case. Consumers that turn markers into a terminal verdict
         # must cross-check liveness -- see goalflight_status wait verdicts.
         signoff = _completion_signoff_marker(stripped, idx)
-        if signoff:
+        if signoff and (
+            not marker_in_fence or _marker_survives_unbalanced_fence(signoff)
+        ):
             markers.append(signoff)
     return markers, size
 
@@ -1357,7 +1390,7 @@ def _last_line_is_terminal_marker(
         if stripped:
             # Preserve leading whitespace until the agent-specific check below.
             # Stripping here lets indented examples false-complete live workers.
-            candidates.append((idx, line, False))
+            candidates.append((idx, line, fence.in_fence))
     if not candidates:
         return None
 
@@ -1385,14 +1418,17 @@ def _last_line_is_terminal_marker(
         return None
 
     line_no, candidate_line, candidate_in_fence = candidates[candidate_idx]
-    if candidate_in_fence:
-        return None
-    return _final_terminal_marker_from_line(
+    marker = _final_terminal_marker_from_line(
         candidate_line,
         line_no,
         allow_prefixed_marker=True,
         kimi_output=kimi_output,
     )
+    if candidate_in_fence and not (
+        ignore_fences and _marker_survives_unbalanced_fence(marker)
+    ):
+        return None
+    return marker
 
 
 def _recorded_terminal_success_marker(payload: dict) -> dict | None:
@@ -1431,9 +1467,11 @@ def _scan_final_terminal_marker(
         stripped = line.strip()
         if idx - 1 in prompt_echo_lines:
             continue
+        fence_was_open = fence.in_fence
         if fence.consume_boundary(line):
             continue
-        if fence.in_fence and not ignore_fences:
+        marker_in_fence = fence_was_open or fence.in_fence
+        if marker_in_fence and not ignore_fences:
             continue
         if in_hunk:
             if line.startswith((" ", "+", "-", "\\")):
@@ -1451,6 +1489,8 @@ def _scan_final_terminal_marker(
             kimi_output=kimi_output,
         )
         if candidate:
+            if marker_in_fence and not _marker_survives_unbalanced_fence(candidate):
+                continue
             prompt_candidate = stripped
             if kimi_output:
                 # Compare Kimi's renderer-normalized marker to normalized prompt

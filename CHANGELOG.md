@@ -52,6 +52,27 @@ incremented when meaningful skill behaviour changes.
 - Queue tests synchronise on real conditions — worker exit, published status,
   the watcher's final record — instead of fixed sleeps. They were passing on an
   idle machine and failing under load at a measured 43.75%.
+- Every path that ends a dispatch now emits its terminal event, including the
+  ones that fail before a worker ever starts: a missing prompt file, an adapter
+  or sandbox refusal, a capacity refusal, an invalid custom review command.
+  Previously these wrote a terminal status and returned without an outbox row,
+  so the dispatch was over and nobody was told — the same silence the outbox
+  exists to remove, surviving in the failure paths.
+- A resolved user-confirm no longer posts its result alongside the journal
+  commit; the mail is the projection of the commit, so a crash between the two
+  can no longer leave terminal mail beside a still-running attempt, and no
+  second result is emitted under a different event id.
+- A worker whose launch wrapper died before its process existed is now
+  recoverable: reconciliation reads the recorded process identity and
+  terminalizes a proven-dead worker, instead of leaving the attempt RUNNING
+  forever behind a record with no pid.
+- An unclosed code fence no longer disables the quoted-marker guard. Recovery
+  from an unbalanced fence accepts success markers only; a quoted `BLOCKED`,
+  `USER-NEED` or `USER-CONFIRM` inside an open fence stays suppressed, so a
+  worker quoting an example cannot manufacture an escalation.
+- A test-only delay seam is gated behind the test-mode flag it belongs to.
+  Unset, it could previously make production sleep while holding the queue
+  mutation lock.
 
 ## [1.4.0] — 2026-08-13
 

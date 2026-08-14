@@ -321,6 +321,35 @@ def _record_drain_launch_order(order: list[str]):
         D.subprocess.run = old_run
 
 
+def test_submit_status_delay_requires_test_mode() -> None:
+    keys = (
+        "GOALFLIGHT_TEST_MODE",
+        "GOALFLIGHT_TEST_SUBMIT_STATUS_DELAY_S",
+        "GOALFLIGHT_TEST_SUBMIT_STATUS_RELEASE_FILE",
+    )
+    old_env = {key: os.environ.get(key) for key in keys}
+    old_sleep = D.time.sleep
+    sleeps: list[float] = []
+    try:
+        os.environ.pop("GOALFLIGHT_TEST_MODE", None)
+        os.environ.pop("GOALFLIGHT_TEST_SUBMIT_STATUS_RELEASE_FILE", None)
+        os.environ["GOALFLIGHT_TEST_SUBMIT_STATUS_DELAY_S"] = "5"
+        D.time.sleep = lambda seconds: sleeps.append(seconds)
+        D._test_submit_status_delay()
+        assert sleeps == [], sleeps
+
+        os.environ["GOALFLIGHT_TEST_MODE"] = "1"
+        D._test_submit_status_delay()
+        assert sleeps == [5.0], sleeps
+    finally:
+        D.time.sleep = old_sleep
+        for key, value in old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 def test_submit_records_replayable_request_without_capacity_acquire() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
@@ -4476,6 +4505,7 @@ def test_round5_tail_substitution_and_frozen_lock_order() -> None:
 
 
 def main() -> None:
+    test_submit_status_delay_requires_test_mode()
     test_submit_records_replayable_request_without_capacity_acquire()
     test_submit_is_idempotent_for_matching_args_and_rejects_collisions()
     test_submit_ignores_matching_failed_claim_tombstone_for_requeue()

@@ -15,6 +15,7 @@ import json
 import os
 import shlex
 import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -2213,6 +2214,74 @@ def case_test_mode_hooks_require_gate() -> None:
                 os.environ[key] = value
 
 
+def case_acp_missing_prompt_commits_terminal_outbox() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        sandbox = tmp / "sandbox"
+        sandbox.mkdir()
+        status = tmp / "missing-prompt.status.json"
+        missing_prompt = tmp / "missing.prompt.md"
+        wrapper = _make_fake_agent_wrapper(tmp)
+        env = os.environ.copy()
+        env.pop("GOALFLIGHT_STEER_FILE", None)
+        env.pop("GOAL_FLIGHT_PERMISSION_DIR", None)
+        env.update(
+            {
+                "GOALFLIGHT_STATE_DIR": str(tmp / "state"),
+                "GOALFLIGHT_TASK_STORE_DIR": str(tmp / "task-store"),
+                "GOALFLIGHT_JOURNAL_DIR": str(tmp / "journal"),
+                "GOALFLIGHT_MESSAGES_DIR": str(tmp / "messages"),
+                "GOAL_FLIGHT_PIDFILE_DIR": str(tmp / "pidfiles"),
+                "GOALFLIGHT_CAPACITY_CONF": "/dev/null",
+                "GOALFLIGHT_TEST_MODE": "1",
+                "GOALFLIGHT_ACP_PYTHON": sys.executable,
+            }
+        )
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts/goalflight_acp_run.py"),
+                "--agent",
+                str(wrapper),
+                "--dispatch-id",
+                "acp-missing-prompt",
+                "--cwd",
+                str(sandbox),
+                "--prompt",
+                str(missing_prompt),
+                "--status-json",
+                str(status),
+                "--json",
+            ],
+            cwd=sandbox,
+            env=env,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=20,
+        )
+        assert proc.returncode != 0, (proc.stdout, proc.stderr)
+        assert status.exists(), (proc.stdout, proc.stderr)
+        payload = json.loads(status.read_text(encoding="utf-8"))
+        assert payload["state"] == "failed", payload
+        assert payload.get("attempt_id") and payload.get("terminal_event_uuid"), payload
+        journals = list((tmp / "journal").rglob("state-journal.sqlite3"))
+        assert len(journals) == 1, journals
+        with sqlite3.connect(journals[0]) as connection:
+            rows = connection.execute(
+                """SELECT a.lifecycle_state, o.event_type, o.event_uuid
+                   FROM dispatch_attempts AS a
+                   JOIN terminal_outbox AS o USING (attempt_id)
+                   WHERE a.dispatch_id = ?""",
+                ("acp-missing-prompt",),
+            ).fetchall()
+        assert rows == [
+            ("TERMINAL", "blocked", payload["terminal_event_uuid"])
+        ], rows
+
+
 def main() -> None:
     case_vendor_flood_idle_waits_for_quiet_backstop()
     case_dropped_frame_records_are_bounded()
@@ -2269,6 +2338,7 @@ def main() -> None:
     case_env_ipc_paths_are_constrained()
     case_env_override_warning_shell_tokens_round_trip()
     case_test_mode_hooks_require_gate()
+    case_acp_missing_prompt_commits_terminal_outbox()
     print("OK: ACP SDK failure-mode tests pass")
 
 

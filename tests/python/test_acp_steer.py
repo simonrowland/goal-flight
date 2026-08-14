@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -93,6 +94,8 @@ def _write_fake_codex_acp_manifest(
 def _env(tmp: Path) -> dict[str, str]:
     env = os.environ.copy()
     env["GOALFLIGHT_STATE_DIR"] = str(tmp / "state")
+    env["GOALFLIGHT_TASK_STORE_DIR"] = str(tmp / "task-store")
+    env["GOALFLIGHT_JOURNAL_DIR"] = str(tmp / "journal")
     env["GOALFLIGHT_MESSAGES_DIR"] = str(tmp / "messages")
     env["GOAL_FLIGHT_PIDFILE_DIR"] = str(tmp / "pids")
     env["GOALFLIGHT_ADAPTERS_DIR"] = str(tmp / "adapters")
@@ -753,9 +756,26 @@ def case_user_confirm_midrun_yes_records_consent_without_authorizing_action() ->
             json.loads(line)
             for line in controller_inbox.read_text(encoding="utf-8").splitlines()
         ]
+        assert [envelope["type"] for envelope in envelopes] == [
+            "user_confirm",
+            "controller-notice",
+            "result",
+        ], envelopes
         assert envelopes[0]["dispatch_id"] == dispatch_id, envelopes
-        assert envelopes[0]["type"] == "user_confirm", envelopes
         assert envelopes[0]["payload"]["question_id"] == question["question_id"], envelopes
+        result_envelope = envelopes[2]
+        assert result_envelope["source"]["transport"] == "journal", envelopes
+        journals = list((tmp / "journal").rglob("state-journal.sqlite3"))
+        assert len(journals) == 1, journals
+        with sqlite3.connect(journals[0]) as connection:
+            outbox = connection.execute(
+                """SELECT event_uuid, event_type, projected_at
+                   FROM terminal_outbox WHERE recipient = ?""",
+                (dispatch_id,),
+            ).fetchall()
+        assert len(outbox) == 1, outbox
+        assert outbox[0][0] == result_envelope["id"], (outbox, envelopes)
+        assert outbox[0][1] == "result" and outbox[0][2] is not None, outbox
 
 
 def case_midturn_mailbox_yes_is_reconciled_before_timeout_denial() -> None:

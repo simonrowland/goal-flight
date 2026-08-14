@@ -451,6 +451,30 @@ from goalflight_startup_gate import StartupGate
 from acp_runner import PromptResult, extract_markers, has_actionable_marker_values, run_prompt
 
 
+def _commit_prelaunch_terminal(payload: dict, *, project_root: Path | str) -> None:
+    """Commit ACP refusals/failures that occur before the normal ledger setup."""
+    state = str(payload.get("state") or "failed")
+    result = goalflight_ledger.commit_terminal_authority(
+        {
+            "dispatch_id": str(payload["dispatch_id"]),
+            "project_root": str(project_root),
+        },
+        state=state,
+        reason=payload.get("reason") or payload.get("error"),
+        worker_still_alive=False,
+    )
+    if result.committed and result.value is not None:
+        payload["attempt_id"] = result.value.attempt_id
+        payload["transition_id"] = result.value.transition_id
+        payload["terminal_event_uuid"] = result.value.event_uuid
+        return
+    payload["terminal_pending_state"] = state
+    payload["state"] = "terminal_pending"
+    payload["terminal_commit_error"] = (
+        f"journal terminal emitter returned {result.disposition.value}: {result.reason}"
+    )
+
+
 class _SigtermCancelBridge:
     """Convert process termination signals into asyncio task cancellation.
 
@@ -2077,6 +2101,7 @@ async def _run_acp_dispatch_impl(
             error=worktree_error,
             updated_at=_now(),
         )
+        _commit_prelaunch_terminal(payload, project_root=project_root)
         write_status(status_path, payload)
         return payload
     try:
@@ -2093,6 +2118,7 @@ async def _run_acp_dispatch_impl(
         prompt = _prompt_with_original_prompt_file_preamble(prompt, original_prompt_file)
     except Exception as e:
         payload.update({"state": "failed", "error": f"{type(e).__name__}: {e}"})
+        _commit_prelaunch_terminal(payload, project_root=project_root)
         write_status(status_path, payload)
         return payload
 
@@ -2107,21 +2133,25 @@ async def _run_acp_dispatch_impl(
     gate = validate_acp_dispatch_readiness(cfg.agent, [command, *acp_args])
     if gate is not None:
         payload.update({"state": "blocked_adapter_gate", "error": gate})
+        _commit_prelaunch_terminal(payload, project_root=project_root)
         write_status(status_path, payload)
         return payload
     if os_sandbox_error is not None:
         payload.update({"state": "blocked_os_sandbox", "error": os_sandbox_error})
+        _commit_prelaunch_terminal(payload, project_root=project_root)
         write_status(status_path, payload)
         return payload
     os_sandbox_gate = validate_os_sandbox_request(cfg.agent, os_sandbox_profile)
     if os_sandbox_gate is not None:
         payload.update({"state": "blocked_os_sandbox", "error": os_sandbox_gate})
+        _commit_prelaunch_terminal(payload, project_root=project_root)
         write_status(status_path, payload)
         return payload
     try:
         preflight_os_sandbox(os_sandbox_profile)
     except OsSandboxError as e:
         payload.update({"state": "blocked_os_sandbox", "error": str(e)})
+        _commit_prelaunch_terminal(payload, project_root=project_root)
         write_status(status_path, payload)
         return payload
 
@@ -2143,6 +2173,7 @@ async def _run_acp_dispatch_impl(
             )
         except OsSandboxError as e:
             payload.update({"state": "blocked_os_sandbox", "error": str(e)})
+            _commit_prelaunch_terminal(payload, project_root=project_root)
             write_status(status_path, payload)
             return payload
         except Exception:
@@ -2228,6 +2259,7 @@ async def _run_acp_dispatch_impl(
                 "updated_at": _now(),
             }
         )
+        _commit_prelaunch_terminal(payload, project_root=project_root)
         write_status(status_path, payload)
         return payload
     if acquire_payload.get("decision") != "allow":
@@ -2239,6 +2271,7 @@ async def _run_acp_dispatch_impl(
             )
             acquire_payload.setdefault("attempts", int(last_capacity_wait["attempt"]) + 1)
         payload.update({"state": "blocked_capacity", "reason": acquire_payload})
+        _commit_prelaunch_terminal(payload, project_root=project_root)
         write_status(status_path, payload)
         return payload
 
@@ -4090,30 +4123,6 @@ async def _run_acp_dispatch_impl(
             payload.pop("permission_router_decisions", None)
             payload.pop("tool_calls", None)
         payload.update(final_updates)
-        if user_confirm_questions and state == "complete":
-            try:
-                import goalflight_messages
-
-                await asyncio.to_thread(
-                    goalflight_messages.post_message,
-                    dispatch_id=dispatch_id,
-                    msg_type="result",
-                    payload={
-                        "complete": True,
-                        "text": "USER-CONFIRM resolved; dispatch completed.",
-                        "question_ids": sorted(user_confirm_questions),
-                    },
-                    messages_dir=goalflight_messages.default_messages_dir(),
-                    source={
-                        "node": "local",
-                        "adapter": str(cfg.agent),
-                        "transport": "acp-user-confirm",
-                    },
-                )
-            except Exception as exc:
-                payload["user_confirm_resolution_relay_error"] = (
-                    f"{type(exc).__name__}: {exc}"
-                )
     except asyncio.CancelledError:
         if sigterm_received is not None and sigterm_received():
             payload.update(
@@ -4287,6 +4296,7 @@ def write_windows_refusal_status(args: argparse.Namespace) -> tuple[dict, Path]:
         "status_path": str(status_path),
         "updated_at": _now(),
     }
+    _commit_prelaunch_terminal(payload, project_root=project_root)
     write_status(status_path, payload)
     return payload, status_path
 

@@ -747,6 +747,7 @@ def main(argv: list[str] | None = None) -> int:
             "stderr_path": str(stderr_path),
             "final_path": str(final_path) if final_path else None,
         }
+        _commit_early_terminal(payload, project_root=args.repo)
         write_status(status_path, payload)
         if lease_id:
             with contextlib.redirect_stdout(io.StringIO()):
