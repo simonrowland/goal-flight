@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import goalflight_compat
+import goalflight_ledger
 from goalflight_acp_client import AcpProcessPool
 
 try:
@@ -54,6 +55,33 @@ DEFAULT_HARD_CAP = 20                     # AcpProcessPool's own default
 CONSERVATIVE_FALLBACK_CEILING = 4
 
 _RAM_LINE_RE = re.compile(r"^-\s+RAM:\s+([\d.]+)\s+GB\s+\((\d+)\s+MB\s+total\)", re.MULTILINE)
+
+
+def _kill_connection_sync(conn) -> bool:
+    """Best-effort atexit kill without an unchecked bare-PID fallback."""
+    if not conn.alive:
+        return False
+    recorded = getattr(conn, "_started_identity", None)
+    current = goalflight_ledger.process_identity(conn.proc.pid)
+    matched, reason = goalflight_ledger.compare_fine_process_identities(
+        conn.proc.pid, recorded, current
+    )
+    if not matched:
+        log.warning(
+            "atexit ACP kill skipped pid=%d identity=%s",
+            conn.proc.pid,
+            reason,
+        )
+        return False
+    hard_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
+    return goalflight_compat.kill_pid(
+        conn.proc.pid,
+        hard_signal,
+        pgid=conn.verified_pgid,
+        process_group=True,
+        expected_identity=recorded,
+        fallback_to_pid=False,
+    )
 
 
 def compute_pool_ceiling(
@@ -281,21 +309,7 @@ async def managed_pool(
             return
         for conn in list(pool._connections.values()):
             try:
-                if conn.alive:
-                    import signal as _sig
-                    hard_signal = getattr(_sig, "SIGKILL", _sig.SIGTERM)
-                    # POSIX uses the historical process-group kill. Native
-                    # Windows has no killpg/pgid; kill_pid degrades to the
-                    # tracked worker pid so atexit cleanup never raises
-                    # AttributeError. If stale children survive on Windows,
-                    # remember native dispatch is refused there; run dispatch
-                    # under WSL for full process-tree semantics.
-                    goalflight_compat.kill_pid(
-                        conn.proc.pid,
-                        hard_signal,
-                        pgid=conn.verified_pgid,
-                        process_group=True,
-                    )
+                _kill_connection_sync(conn)
             except (ProcessLookupError, PermissionError, Exception):
                 pass
         pool._connections.clear()

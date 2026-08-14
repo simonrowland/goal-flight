@@ -24,6 +24,7 @@ from typing import Any, Callable, Protocol
 import goalflight_fleet_mirror as mirror
 import goalflight_fleet_status as fleet_status
 import goalflight_dispatch_states as dispatch_states
+import goalflight_ledger
 from goalflight_liveness import write_status
 
 DEFAULT_UNTIL_TIMEOUT_S = 3600.0
@@ -791,6 +792,11 @@ class SshFleetWatchTransport:
             pid = int(receipt.get("remote_pid"))
         except (TypeError, ValueError):
             return RemoteIdentityResult(ok=False, error="launch receipt missing remote_pid")
+        expected_identity = receipt.get("remote_identity")
+        expected_lstart = str(receipt.get("remote_lstart") or "")
+        if not expected_lstart and isinstance(expected_identity, dict):
+            expected_lstart = str(expected_identity.get("lstart") or "")
+        used_legacy_fallback = False
         try:
             host = fleet_ssh.host_from_node_entry(node_id, node_entry)
             remote = fleet_ssh.build_remote_command(
@@ -798,13 +804,40 @@ class SshFleetWatchTransport:
                 repo_root=str(node_entry.get("repo_root") or ""),
                 python=str(node_entry.get("python") or "python3"),
                 pid=str(pid),
-                expected_lstart=str(receipt.get("remote_lstart") or ""),
+                expected_lstart=expected_lstart,
+                expected_identity=(
+                    expected_identity if isinstance(expected_identity, dict) else None
+                ),
             )
             ssh_argv = fleet_ssh.build_ssh_command(host, remote, command_class="pid_identity")
             with fleet_ssh.node_ssh_lock(node_id, fleet_dir=self._fleet_dir):
                 run = fleet_ssh.run_ssh(ssh_argv, runner=self._runner, dry_run=self._dry_run)
         except fleet_ssh.SshAllowlistError as exc:
             return RemoteIdentityResult(ok=False, error=str(exc))
+
+        if not run.get("ok") and isinstance(expected_identity, dict):
+            stderr = str(run.get("stderr") or "")
+            if "--expected-identity-b64" in stderr and (
+                "unrecognized arguments" in stderr or "unknown option" in stderr
+            ):
+                used_legacy_fallback = True
+                try:
+                    remote = fleet_ssh.build_remote_command(
+                        "pid_identity",
+                        repo_root=str(node_entry.get("repo_root") or ""),
+                        python=str(node_entry.get("python") or "python3"),
+                        pid=str(pid),
+                        expected_lstart=expected_lstart,
+                    )
+                    ssh_argv = fleet_ssh.build_ssh_command(
+                        host, remote, command_class="pid_identity"
+                    )
+                    with fleet_ssh.node_ssh_lock(node_id, fleet_dir=self._fleet_dir):
+                        run = fleet_ssh.run_ssh(
+                            ssh_argv, runner=self._runner, dry_run=self._dry_run
+                        )
+                except fleet_ssh.SshAllowlistError as exc:
+                    return RemoteIdentityResult(ok=False, error=str(exc))
 
         if not run.get("ok"):
             stderr = (run.get("stderr") or "").strip()
@@ -815,10 +848,37 @@ class SshFleetWatchTransport:
             return RemoteIdentityResult(ok=False, error=f"invalid identity JSON: {exc}")
         if not isinstance(payload, dict):
             return RemoteIdentityResult(ok=False, error="identity response must be a JSON object")
+        reported_identity = (
+            payload.get("identity")
+            if isinstance(payload.get("identity"), dict)
+            else None
+        )
+        if used_legacy_fallback and isinstance(expected_identity, dict):
+            if expected_identity.get("start_token"):
+                matched, reason = goalflight_ledger.compare_fine_process_identities(
+                    pid, expected_identity, reported_identity
+                )
+            else:
+                matched, reason = goalflight_ledger.compare_process_identities(
+                    pid, expected_identity, reported_identity
+                )
+            if not matched:
+                if reason == "identity_indeterminate":
+                    return RemoteIdentityResult(
+                        ok=False,
+                        identity=reported_identity,
+                        error="legacy identity response lacks a fine start token",
+                    )
+                return RemoteIdentityResult(
+                    ok=True,
+                    alive=False,
+                    identity=reported_identity,
+                    error=reason,
+                )
         return RemoteIdentityResult(
             ok=True,
             alive=bool(payload.get("alive")),
-            identity=payload.get("identity") if isinstance(payload.get("identity"), dict) else None,
+            identity=reported_identity,
         )
 
     def check_worktree_porcelain(

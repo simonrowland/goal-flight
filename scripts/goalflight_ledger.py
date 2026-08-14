@@ -221,30 +221,11 @@ def process_identity(pid: int | None) -> dict | None:
         }
         if start_token:
             ident["start_token"] = start_token
-        if ident.get("lstart") and ident.get("comm"):
+        if ident.get("lstart"):
             return ident
         if attempt < 19:
             time.sleep(0.1)
     return ident
-
-
-def _comm_base(value: object) -> str:
-    text = str(value or "").strip().lower()
-    if text.startswith("(") and ")" in text:
-        text = text[1:text.find(")")]
-    text = text.rsplit("/", 1)[-1]
-    match = re.match(r"[a-z0-9_]+", text)
-    return match.group(0) if match else ""
-
-
-def comm_matches(expected: object, actual: object) -> bool:
-    expected_base = _comm_base(expected)
-    actual_base = _comm_base(actual)
-    return bool(
-        expected_base
-        and actual_base
-        and (expected_base.startswith(actual_base) or actual_base.startswith(expected_base))
-    )
 
 
 def compare_process_identities(
@@ -273,29 +254,41 @@ def compare_process_identities(
             # second-granularity wall-clock representation.
             return True, "live"
 
-        expected_comm = expected_identity.get("comm")
-        actual_comm = current_identity.get("comm")
         if expected_lstart and actual_lstart:
             if actual_lstart != expected_lstart:
                 return False, "pid_reused_lstart"
-            # When the fine-grained token is unavailable, comm remains the
-            # tiebreaker that catches a genuinely different process reusing the
-            # PID within lstart's formatted second. Form-only comm variation is
-            # tolerated by comm_matches.
-            if expected_comm and actual_comm and not comm_matches(expected_comm, actual_comm):
-                return False, "pid_reused_lstart_comm"
+            # exec(2) preserves pid and lstart while replacing comm. The
+            # launcher records its Python identity immediately before execing
+            # the worker CLI, so comm is diagnostic only and cannot disprove
+            # this durable identity pair.
             return True, "live"
 
-        if not expected_comm:
-            missing = ["lstart", "comm"] if not expected_lstart else ["comm"]
-            return True, "identity_inconclusive_missing_expected_" + "_".join(missing)
-        if not actual_comm:
-            missing = ["lstart", "comm"] if not actual_lstart else ["comm"]
-            return True, "identity_inconclusive_missing_current_" + "_".join(missing)
-        if not comm_matches(expected_comm, actual_comm):
-            return False, "pid_reused_comm"
-        return True, "live"
+        missing_sides = []
+        if not expected_lstart:
+            missing_sides.append("expected")
+        if not actual_lstart:
+            missing_sides.append("current")
+        return True, (
+            "identity_inconclusive_missing_" + "_".join(missing_sides) + "_lstart"
+        )
     return True, "identity_inconclusive"
+
+
+def compare_fine_process_identities(
+    pid: int,
+    expected_identity: dict | None,
+    current_identity: dict | None,
+) -> tuple[bool, str]:
+    """Require the fine start token before authorizing a destructive action."""
+    if current_identity is None:
+        return False, "dead"
+    if not expected_identity:
+        return False, "identity_indeterminate"
+    if not expected_identity.get("start_token") or not current_identity.get(
+        "start_token"
+    ):
+        return False, "identity_indeterminate"
+    return compare_process_identities(pid, expected_identity, current_identity)
 
 
 def identity_matches(record: dict) -> tuple[bool, str]:
@@ -332,10 +325,6 @@ def identity_matches(record: dict) -> tuple[bool, str]:
     matched, reason = compare_process_identities(int(pid), prior, current)
     if matched:
         return True, "live"
-    if reason == "pid_reused_lstart_comm":
-        # Preserve the ledger/reaper reason taxonomy; the watcher keeps the
-        # more specific same-second reason from the shared comparator.
-        return False, "pid_reused_comm"
     return False, reason
 
 

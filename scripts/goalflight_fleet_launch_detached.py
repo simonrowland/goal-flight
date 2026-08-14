@@ -27,6 +27,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import goalflight_dispatch_states as dispatch_states
+import goalflight_ledger
 from goalflight_liveness import reset_status_lineage
 
 ENV_ALLOW_EXACT = frozenset(
@@ -284,10 +285,7 @@ def _recorded_worker_live(pid_raw: Any, identity: Any) -> tuple[bool | None, str
         return False, "dead"
     if not isinstance(identity, dict):
         return None, "identity_missing"
-    for key in ("lstart", "comm"):
-        if identity.get(key) and current.get(key) and identity[key] != current[key]:
-            return False, f"pid_reused_{key}"
-    return True, "live"
+    return goalflight_ledger.compare_process_identities(pid, identity, current)
 
 
 def _receipt_live_identity(receipt: dict[str, Any]) -> dict[str, Any] | None:
@@ -300,10 +298,19 @@ def _receipt_live_identity(receipt: dict[str, Any]) -> dict[str, Any] | None:
     if current is None:
         return None
     recorded = receipt.get("remote_identity") or receipt.get("worker_identity") or receipt.get("expected_worker_identity")
+    remote_lstart = receipt.get("remote_lstart")
+    if isinstance(recorded, dict) and remote_lstart and not recorded.get("lstart"):
+        recorded = {**recorded, "lstart": remote_lstart}
+    elif not isinstance(recorded, dict):
+        if not remote_lstart:
+            return None
+        recorded = {"pid": pid, "lstart": remote_lstart}
     if isinstance(recorded, dict):
-        for key in ("lstart", "comm"):
-            if recorded.get(key) and current.get(key) and recorded[key] != current[key]:
-                return None
+        matched, _reason = goalflight_ledger.compare_process_identities(
+            pid, recorded, current
+        )
+        if not matched:
+            return None
     return current
 
 
@@ -816,15 +823,35 @@ def _launch(args: argparse.Namespace) -> int:
 
 def _pid_identity(args: argparse.Namespace) -> int:
     expected_lstart = _decode_b64(args.expected_lstart_b64) if args.expected_lstart_b64 else ""
+    expected_identity = None
+    if args.expected_identity_b64:
+        try:
+            decoded = json.loads(_decode_b64(args.expected_identity_b64))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            decoded = None
+        if isinstance(decoded, dict):
+            expected_identity = decoded
+    if expected_identity is not None and expected_lstart and not expected_identity.get(
+        "lstart"
+    ):
+        expected_identity = {**expected_identity, "lstart": expected_lstart}
     identity = _process_identity(args.pid)
     alive = identity is not None
-    if expected_lstart:
+    reason = "live" if alive else "dead"
+    if expected_identity is not None:
+        alive, reason = goalflight_ledger.compare_process_identities(
+            args.pid, expected_identity, identity
+        )
+    elif expected_lstart:
         alive = bool(identity and identity.get("lstart") == expected_lstart)
+        reason = "live" if alive else "pid_reused_lstart"
     payload = {
         "schema": "goalflight.fleet.pid_identity.v1",
         "pid": args.pid,
         "alive": alive,
         "identity": identity,
+        "identity_reason": reason,
+        "expected_identity": expected_identity,
         "expected_lstart": expected_lstart or None,
         "checked_at": _utc_now(),
     }
@@ -853,6 +880,7 @@ def main(argv: list[str] | None = None) -> int:
 
     ident = sub.add_parser("pid-identity")
     ident.add_argument("--pid", type=int, required=True)
+    ident.add_argument("--expected-identity-b64")
     ident.add_argument("--expected-lstart-b64")
     ident.add_argument("--json", action="store_true")
     ident.set_defaults(func=_pid_identity)

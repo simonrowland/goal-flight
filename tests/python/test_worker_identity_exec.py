@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import argparse
+import base64
+import json
 import sys
 from pathlib import Path
 
@@ -9,9 +12,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 
+import goalflight_acp_client  # noqa: E402
 import goalflight_dispatch  # noqa: E402
+import goalflight_fleet_launch_detached  # noqa: E402
 import goalflight_ledger  # noqa: E402
 import goalflight_session_status  # noqa: E402
+import goalflight_status  # noqa: E402
 import goalflight_watch  # noqa: E402
 
 
@@ -32,8 +38,11 @@ def _identity(**overrides: object) -> dict:
 
 
 def test_legitimate_exec_comm_change_is_live() -> None:
-    expected = _identity(comm="/opt/homebrew/Frameworks/Python.framework/Versions/3.12/Python")
-    current = _identity(comm="node")
+    expected = _identity(
+        start_token=None,
+        comm="/opt/homebrew/Frameworks/Python.framework/Versions/3.12/Python",
+    )
+    current = _identity(start_token=None, comm="node")
 
     assert goalflight_ledger.compare_process_identities(PID, expected, current) == (
         True,
@@ -51,13 +60,13 @@ def test_different_lstart_is_still_pid_reuse() -> None:
     )
 
 
-def test_same_second_unrelated_comm_is_still_pid_reuse_without_fine_token() -> None:
+def test_same_lstart_comm_change_is_live_without_fine_token() -> None:
     expected = _identity(start_token=None, comm="grok")
     current = _identity(start_token=None, comm="node")
 
     assert goalflight_ledger.compare_process_identities(PID, expected, current) == (
-        False,
-        "pid_reused_lstart_comm",
+        True,
+        "live",
     )
 
 
@@ -86,12 +95,12 @@ def test_missing_identity_fields_preserve_inconclusive_and_fallback_paths() -> N
         (
             {"pid": PID, "lstart": None, "comm": None},
             _identity(start_token=None),
-            (True, "identity_inconclusive_missing_expected_lstart_comm"),
+            (True, "identity_inconclusive_missing_expected_lstart"),
         ),
         (
             _identity(start_token=None),
             {"pid": PID, "lstart": None, "comm": None},
-            (True, "identity_inconclusive_missing_current_lstart_comm"),
+            (True, "identity_inconclusive_missing_current_lstart"),
         ),
         (
             _identity(start_token=None, comm=None),
@@ -106,7 +115,7 @@ def test_missing_identity_fields_preserve_inconclusive_and_fallback_paths() -> N
         (
             {"pid": PID, "lstart": None, "comm": "grok"},
             {"pid": PID, "lstart": None, "comm": "(grok-0.2.11-maco)"},
-            (True, "live"),
+            (True, "identity_inconclusive_missing_expected_current_lstart"),
         ),
     ]
 
@@ -137,12 +146,169 @@ def test_reap_identity_check_uses_constructed_identity_comparison(monkeypatch) -
         {"worker_pid": PID, "worker_identity": expected}
     ) == (False, "pid_reused_start_token")
 
-    legacy_expected = _identity(start_token=None, comm="grok")
-    legacy_reused = _identity(start_token=None, comm="node")
-    monkeypatch.setattr(goalflight_ledger, "process_identity", lambda _pid: legacy_reused)
+    legacy_expected = _identity(start_token=None, comm="python")
+    execed_worker = _identity(start_token=None, comm="node")
+    monkeypatch.setattr(goalflight_ledger, "process_identity", lambda _pid: execed_worker)
     assert goalflight_ledger.identity_matches(
         {"worker_pid": PID, "worker_identity": legacy_expected}
-    ) == (False, "pid_reused_comm")
+    ) == (True, "live")
+
+
+def test_quota_reaper_identity_reader_ignores_exec_comm_change(monkeypatch) -> None:
+    expected = _identity(comm="python")
+    current = _identity(comm="node")
+    monkeypatch.setattr(goalflight_ledger, "process_identity", lambda _pid: current)
+
+    assert goalflight_acp_client._quota_worker_identity_matches(
+        {"worker_pid": PID, "worker_identity": expected}, current
+    ) == (True, "live")
+
+    reused = _identity(
+        lstart="actual process start",
+        comm="node",
+    )
+    monkeypatch.setattr(goalflight_ledger, "process_identity", lambda _pid: reused)
+    assert goalflight_acp_client._quota_worker_identity_matches(
+        {"worker_pid": PID, "worker_identity": expected}, reused
+    ) == (False, "pid_reused_lstart")
+
+    tokenless = _identity(start_token=None, comm="node")
+    monkeypatch.setattr(goalflight_ledger, "process_identity", lambda _pid: tokenless)
+    assert goalflight_acp_client._quota_worker_identity_matches(
+        {"worker_pid": PID, "worker_identity": expected}, tokenless
+    ) == (False, "identity_indeterminate")
+
+
+def test_fleet_identity_readers_ignore_exec_comm_change(monkeypatch) -> None:
+    expected = _identity(start_token=None, comm="python")
+    current = _identity(start_token=None, comm="node")
+    monkeypatch.setattr(
+        goalflight_fleet_launch_detached,
+        "_process_identity",
+        lambda _pid: current,
+    )
+
+    assert goalflight_fleet_launch_detached._recorded_worker_live(
+        PID, expected
+    ) == (True, "live")
+    assert goalflight_fleet_launch_detached._receipt_live_identity(
+        {"remote_pid": PID, "remote_identity": expected}
+    ) == current
+
+    reused = _identity(start_token=None, lstart="actual process start", comm="node")
+    monkeypatch.setattr(
+        goalflight_fleet_launch_detached,
+        "_process_identity",
+        lambda _pid: reused,
+    )
+    assert goalflight_fleet_launch_detached._recorded_worker_live(
+        PID, expected
+    ) == (False, "pid_reused_lstart")
+    assert goalflight_fleet_launch_detached._receipt_live_identity(
+        {"remote_pid": PID, "remote_identity": expected}
+    ) is None
+
+
+def test_legacy_fleet_receipt_still_checks_lstart(monkeypatch) -> None:
+    current = _identity(start_token=None, comm="node")
+    monkeypatch.setattr(
+        goalflight_fleet_launch_detached,
+        "_process_identity",
+        lambda _pid: current,
+    )
+
+    assert goalflight_fleet_launch_detached._receipt_live_identity(
+        {"remote_pid": PID, "remote_lstart": LSTART}
+    ) == current
+    assert goalflight_fleet_launch_detached._receipt_live_identity(
+        {"remote_pid": PID, "remote_lstart": "actual process start"}
+    ) is None
+
+
+def test_fleet_pid_identity_uses_fine_token(monkeypatch, capsys) -> None:
+    expected = _identity(comm="python")
+    encoded = base64.b64encode(json.dumps(expected).encode("utf-8")).decode("ascii")
+    args = argparse.Namespace(
+        pid=PID,
+        expected_identity_b64=encoded,
+        expected_lstart_b64=None,
+    )
+
+    current = _identity(comm="node")
+    monkeypatch.setattr(
+        goalflight_fleet_launch_detached,
+        "_process_identity",
+        lambda _pid: current,
+    )
+    assert goalflight_fleet_launch_detached._pid_identity(args) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["alive"] is True
+    assert payload["identity_reason"] == "live"
+
+    reused = _identity(start_token="darwin:1780262928:123999", comm="node")
+    monkeypatch.setattr(
+        goalflight_fleet_launch_detached,
+        "_process_identity",
+        lambda _pid: reused,
+    )
+    assert goalflight_fleet_launch_detached._pid_identity(args) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["alive"] is False
+    assert payload["identity_reason"] == "pid_reused_start_token"
+
+
+def test_fleet_partial_identity_retains_legacy_lstart(monkeypatch, capsys) -> None:
+    partial = base64.b64encode(json.dumps({"pid": PID}).encode("utf-8")).decode(
+        "ascii"
+    )
+    encoded_lstart = base64.b64encode(LSTART.encode("utf-8")).decode("ascii")
+    args = argparse.Namespace(
+        pid=PID,
+        expected_identity_b64=partial,
+        expected_lstart_b64=encoded_lstart,
+    )
+    current = _identity(
+        start_token=None,
+        lstart="actual process start",
+        comm="node",
+    )
+    monkeypatch.setattr(
+        goalflight_fleet_launch_detached,
+        "_process_identity",
+        lambda _pid: current,
+    )
+
+    assert goalflight_fleet_launch_detached._pid_identity(args) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["alive"] is False
+    assert payload["identity_reason"] == "pid_reused_lstart"
+
+
+def test_steer_liveness_warning_ignores_exec_comm_change(monkeypatch) -> None:
+    expected = _identity(start_token=None, comm="python")
+    current = _identity(start_token=None, comm="node")
+    record = {
+        "dispatch_id": "exec-worker",
+        "worker_pid": PID,
+        "worker_identity": expected,
+    }
+    monkeypatch.setattr(goalflight_ledger, "process_identity", lambda _pid: current)
+
+    assert goalflight_dispatch._worker_liveness_warning(record) is None
+
+    reused = _identity(start_token=None, lstart="actual process start", comm="node")
+    monkeypatch.setattr(goalflight_ledger, "process_identity", lambda _pid: reused)
+    warning = goalflight_dispatch._worker_liveness_warning(record)
+    assert warning and "pid_reused_lstart" in warning
+
+
+def test_lstart_without_comm_remains_a_recorded_identity() -> None:
+    identity = {"pid": PID, "lstart": LSTART}
+
+    assert goalflight_dispatch._watch_identity_token(identity) == identity
+    assert goalflight_status._has_recorded_worker_identity(
+        {"worker_identity": identity}
+    )
 
 
 def test_fine_start_token_survives_snapshot_and_watcher_projection(monkeypatch) -> None:

@@ -47,9 +47,9 @@ incremented when meaningful skill behaviour changes.
   Identity now carries a fine-grained start token — microseconds on macOS, the
   start tick and boot id on Linux, the creation time on Windows — so start time
   alone distinguishes a genuine reuse, including one that happens inside the same
-  clock second. Where no token is available the previous name-based tiebreaker
-  still applies, so a same-second reuse by an unrelated process is still caught.
-  The reaper used the same comparison and is fixed with it.
+  clock second. Where no token is available, matching PID plus `lstart` remains
+  live because `exec` may legitimately replace the process name. Destructive
+  reapers require the fine token and fail closed when it is unavailable.
 - The process-identity probe degrades instead of raising when a platform-specific
   call is unavailable. An identity probe that throws reaches a dispatch as a
   crash rather than as "identity unknown", which is the failure class this change

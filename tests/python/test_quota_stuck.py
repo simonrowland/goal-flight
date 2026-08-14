@@ -64,12 +64,19 @@ def write_tail(path: Path, text: str, *, old_s: float = 600.0) -> None:
 def worker_identity(pid: int, *, lstart: str = "Wed Jul  1 12:00:00 2026", comm: str = "grok") -> dict:
     return {
         "pid": pid,
+        "start_token": f"test:{pid}:generation-1",
         "ppid": "1",
         "pgid": str(pid),
         "lstart": lstart,
         "comm": comm,
         "args": comm,
     }
+
+
+def live_identity(pid: int) -> dict:
+    if pid == 501:
+        return worker_identity(pid, lstart="Wed Jul  1 12:30:00 2026")
+    return worker_identity(pid)
 
 
 def process_row(
@@ -300,7 +307,10 @@ def test_quota_reaper_default_deny_guards_and_release() -> None:
 
         def kill_group(pgid: int) -> str:
             killed.append(pgid)
-            return "SIGTERM"
+            # The worker may exit naturally between the outer identity gate and
+            # the termination helper's probe. With no live targets, bookkeeping
+            # must still converge instead of stranding the active lease.
+            return "skip_identity:dead"
 
         rows = [
             process_row(301),
@@ -308,6 +318,7 @@ def test_quota_reaper_default_deny_guards_and_release() -> None:
             process_row(303, age_s=10.0),  # young
             process_row(304, comm="claude-code-cli-acp"),
         ]
+        identities = iter([live_identity(301), None])
         result = acp.reap_quota_stuck_workers(
             process_rows=rows,
             records=ledger.read_records(),
@@ -316,9 +327,16 @@ def test_quota_reaper_default_deny_guards_and_release() -> None:
             terminate_group=kill_group,
             now_ts=time.time(),
             enabled=True,
+            identity_probe=lambda _pid: next(identities),
+            target_liveness_probe=lambda _pid, _pgid: False,
         )
-        assert_eq("only quota pid killed", killed, [301])
+        assert_eq("natural exit needs no signal", killed, [])
         assert_eq("reaped dispatch", result["reaped"][0]["dispatch_id"], "qkill")
+        assert_eq(
+            "natural exit action",
+            result["reaped"][0]["action"],
+            "skip_identity:dead",
+        )
         state = cap.load_state()
         assert_eq("lease released rate_limited", state["leases"]["lease-qkill"]["state"], "rate_limited")
         persisted = json.loads(ledger.record_path("qkill").read_text(encoding="utf-8"))
@@ -371,6 +389,8 @@ def test_kimi_quota_reaper_and_surplus_discovery() -> None:
             terminate_group=lambda pgid: killed.append(pgid) or "SIGTERM",
             now_ts=time.time(),
             enabled=True,
+            identity_probe=live_identity,
+            target_liveness_probe=lambda _pid, _pgid: False,
         )
         assert_eq("kimi quota worker reaped", killed, [42])
         assert_eq("kimi quota candidate recorded", result["reaped"][0]["dispatch_id"], "kimi-quota")
@@ -391,16 +411,24 @@ def test_quota_reaper_escalates_sigkill_when_sigterm_does_not_exit() -> None:
     calls: list[tuple[int, int]] = []
     original_killpg = acp.os.killpg
     original_alive = acp._pgid_alive
+    original_targets_live = acp._termination_targets_live
     original_monotonic = acp.time.monotonic
     try:
         acp.os.killpg = lambda pgid, sig: calls.append((pgid, sig))  # type: ignore[assignment]
         acp._pgid_alive = lambda pgid: True  # type: ignore[assignment]
+        acp._termination_targets_live = lambda **_kwargs: False  # type: ignore[assignment]
         ticks = iter([100.0, 106.0])
         acp.time.monotonic = lambda: next(ticks, 106.0)  # type: ignore[assignment]
-        action = acp._terminate_quota_process_group(777)
+        expected = worker_identity(777)
+        action = acp._terminate_quota_process_group(
+            777,
+            expected_identity=expected,
+            identity_probe=lambda _pid: expected,
+        )
     finally:
         acp.os.killpg = original_killpg  # type: ignore[assignment]
         acp._pgid_alive = original_alive  # type: ignore[assignment]
+        acp._termination_targets_live = original_targets_live  # type: ignore[assignment]
         acp.time.monotonic = original_monotonic  # type: ignore[assignment]
     assert_eq("quota reap escalation action", action, "SIGTERM+SIGKILL")
     assert_eq("quota reap escalation signals", calls, [(777, signal.SIGTERM), (777, signal.SIGKILL)])
@@ -443,6 +471,8 @@ def test_quota_reaper_partial_failure_not_counted_as_reaped() -> None:
             terminate_group=lambda pgid: "SIGTERM+SIGKILL",
             now_ts=time.time(),
             enabled=True,
+            identity_probe=live_identity,
+            target_liveness_probe=lambda _pid, _pgid: False,
         )
         assert_eq("partial failure not reaped", result["reaped"], [])
         assert_eq("partial failure count", len(result["partial_failures"]), 1)
@@ -487,6 +517,8 @@ def test_quota_reaper_refuses_dispatch_lease_when_worker_pid_mismatches() -> Non
             terminate_group=lambda pgid: "SIGTERM+SIGKILL",
             now_ts=time.time(),
             enabled=True,
+            identity_probe=live_identity,
+            target_liveness_probe=lambda _pid, _pgid: False,
         )
         assert_eq("pid mismatch not fully reaped", result["reaped"], [])
         assert_true("pid mismatch reports lease", "lease_not_released" in result["partial_failures"][0]["bookkeeping_errors"])
@@ -548,6 +580,8 @@ def test_quota_reaper_rejects_no_signature_young_pgid_mismatch_and_acp_shim() ->
             terminate_group=lambda pgid: killed.append(pgid) or "SIGTERM",
             now_ts=time.time(),
             enabled=True,
+            identity_probe=live_identity,
+            target_liveness_probe=lambda _pid, _pgid: False,
         )
         assert_eq("no negative guard kills", killed, [])
         assert_eq("no negative reaped", result["reaped"], [])
@@ -565,6 +599,8 @@ def test_quota_reaper_default_off_requires_explicit_enable() -> None:
             getpgid=lambda pid: pid,
             terminate_group=lambda pgid: killed.append(pgid) or "SIGTERM",
             now_ts=time.time(),
+            identity_probe=live_identity,
+            target_liveness_probe=lambda _pid, _pgid: False,
         )
         assert_eq("default off skip", result["skipped"], quota.QUOTA_STUCK_REAP_ENABLE_ENV)
         assert_eq("default off no kill", killed, [])
@@ -615,6 +651,8 @@ def test_prompt_echo_quota_text_is_not_counted_or_hard_stopped() -> None:
             terminate_group=lambda pgid: killed.append(pgid) or "SIGTERM",
             now_ts=time.time(),
             enabled=True,
+            identity_probe=live_identity,
+            target_liveness_probe=lambda _pid, _pgid: False,
         )
         assert_eq("prompt echo no reap", result["reaped"], [])
         assert_eq("prompt echo no kill", killed, [])
@@ -663,6 +701,8 @@ def test_quota_reaper_hard_denies_acp_shaped_record_with_allowed_comm() -> None:
             terminate_group=lambda pgid: killed.append(pgid) or "SIGTERM",
             now_ts=time.time(),
             enabled=True,
+            identity_probe=live_identity,
+            target_liveness_probe=lambda _pid, _pgid: False,
         )
         assert_eq("acp shaped no kill", killed, [])
         assert_eq("acp shaped no reaped", result["reaped"], [])
@@ -689,6 +729,8 @@ def test_quota_reaper_rejects_pid_reuse_identity_mismatch() -> None:
             terminate_group=lambda pgid: killed.append(pgid) or "SIGTERM",
             now_ts=time.time(),
             enabled=True,
+            identity_probe=live_identity,
+            target_liveness_probe=lambda _pid, _pgid: False,
         )
         assert_eq("pid reuse must not kill", killed, [])
         assert_eq("pid reuse no reaped", result["reaped"], [])
