@@ -785,6 +785,19 @@ def test_wait_default_timeout() -> None:
         S.wait_for_dispatches, S.this_project_root = orig_wait, orig_root
 
 
+def test_wait_help_distinguishes_unclaimed_join_from_claimed_doorbell() -> None:
+    buf = io.StringIO()
+    try:
+        with redirect_stdout(buf):
+            S.main(["--help"])
+    except SystemExit as exc:
+        check("--wait help exits successfully", exc.code == 0)
+    help_text = " ".join(buf.getvalue().split())
+    check("--wait help says it does not claim", "does not claim/renew" in help_text)
+    check("--wait help names exit 3 mail wake", "mail on any waited ID exits 3" in help_text)
+    check("--wait help directs claimed controllers to doorbell", "claimed controllers" in help_text)
+
+
 def test_wait_unbounded_sentinels_and_positive_timeout() -> None:
     orig_cycle = S._wait_cycle_payload
     orig_sleep = S.time.sleep
@@ -1090,6 +1103,7 @@ def main() -> int:
     test_cli()
     test_wait_cli()
     test_wait_default_timeout()
+    test_wait_help_distinguishes_unclaimed_join_from_claimed_doorbell()
     test_wait_unbounded_sentinels_and_positive_timeout()
     test_wait_keyboard_interrupt_returns_130_without_signal()
     test_wait_snapshot_uses_single_liveness_result()

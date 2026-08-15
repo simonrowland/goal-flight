@@ -2826,6 +2826,47 @@ def format_mail_notice(count: int) -> str:
     return f"{count} new mail; peek: goalflight_messages.py relay --new"
 
 
+def dispatch_mail_watermark(
+    dispatch_ids: set[str] | list[str] | tuple[str, ...],
+    *,
+    messages_dir: Path | None = None,
+) -> set[tuple[str, str]]:
+    """Read waking event identities from only the requested dispatch carriers.
+
+    Unclaimed fixed-set waits have no controller label, so their mail cannot be
+    assigned to a controller journal cursor.  Their exact dispatch carriers are
+    nevertheless authoritative for mail addressed to those waited ids.  This
+    fallback deliberately performs no directory enumeration, cursor mutation,
+    lock creation, or corruption-quarantine write.
+    """
+    root = messages_dir or default_messages_dir()
+    identities: set[tuple[str, str]] = set()
+    for dispatch_id in dict.fromkeys(str(value) for value in dispatch_ids):
+        path = inbox_path(root, dispatch_id)
+        data = _read_nofollow_bytes(path)
+        for line_no, raw_line in enumerate(data.splitlines(), start=1):
+            if not raw_line.strip():
+                continue
+            try:
+                envelope = json.loads(raw_line.decode("utf-8"))
+                validate_envelope(
+                    envelope,
+                    path=f"{path}:{line_no}",
+                    expected_dispatch_id=dispatch_id,
+                )
+            except (UnicodeDecodeError, ValueError, RecursionError, MessageError) as exc:
+                raise MessageError(f"{path}:{line_no}: invalid waited mail carrier: {exc}") from exc
+            if event_wake_class(
+                str(envelope.get("type") or ""),
+                envelope.get("payload"),
+            ) != "waking":
+                continue
+            source = envelope.get("source")
+            origin = str(source.get("node") if isinstance(source, dict) else "local")
+            identities.add((origin, str(envelope.get("id") or "")))
+    return identities
+
+
 def controller_mail_summary(
     *,
     owned_dispatch_ids: set[str] | None = None,
@@ -3290,6 +3331,47 @@ def format_envelope_headlines(envelopes: list) -> str:
     return "\n".join(lines)
 
 
+def _cursor_positions(rows: list[dict] | tuple[dict, ...]) -> dict[str, int]:
+    positions: dict[str, int] = {}
+    for row in rows:
+        stream_id = str(row.get("stream_id") or "")
+        if stream_id:
+            positions[stream_id] = max(
+                positions.get(stream_id, 0), int(row.get("stream_seq") or 0)
+            )
+    return positions
+
+
+def _cursor_advance_command(
+    *,
+    project_root: Path | str,
+    controller_label: str,
+    lease_nonce: str,
+    cursor_version: int,
+    positions: dict[str, int],
+) -> str | None:
+    """Return the exact snapshot-bound CAS command, safely shell quoted."""
+    if not positions:
+        return None
+    argv = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "advance",
+        "--project-root",
+        str(project_root),
+        "--controller-label",
+        str(controller_label),
+        "--lease-nonce",
+        str(lease_nonce),
+        "--cursor-version",
+        str(cursor_version),
+        "--json",
+        "--position",
+        *(f"{stream}={positions[stream]}" for stream in sorted(positions)),
+    ]
+    return shlex.join(argv)
+
+
 def cmd_relay(args: argparse.Namespace) -> int:
     """Peek at journal-pending assignments; never advance or acknowledge state."""
     project_root = _current_project_root()
@@ -3310,19 +3392,23 @@ def cmd_relay(args: argparse.Namespace) -> int:
         if controller_label is None:
             print("no pending journal events")
             return 0
-        peek = authority.cursor_peek(controller_label, limit=1000)
+        lease = authority.active_lease(controller_label)
+        if lease is None:
+            raise MessageError("active controller lease is unavailable")
+        peek = authority.cursor_peek(controller_label, nonce=lease.nonce, limit=1000)
         rows = list(peek.items)
         envelopes = [_listener_envelope(authority, row) for row in rows]
     except (goalflight_journal.JournalUnavailable, MessageError, ValueError) as exc:
         print(f"relay: {exc}", file=sys.stderr)
         return 2
-    positions: dict[str, int] = {}
-    for row in rows:
-        stream_id = str(row.get("stream_id") or "")
-        if stream_id:
-            positions[stream_id] = max(
-                positions.get(stream_id, 0), int(row.get("stream_seq") or 0)
-            )
+    positions = _cursor_positions(rows)
+    advance_command = _cursor_advance_command(
+        project_root=root,
+        controller_label=controller_label,
+        lease_nonce=lease.nonce,
+        cursor_version=peek.cursor_version,
+        positions=positions,
+    )
     if getattr(args, "json", False):
         print(
             json.dumps(
@@ -3331,6 +3417,7 @@ def cmd_relay(args: argparse.Namespace) -> int:
                     "registry_generation": peek.registry_generation,
                     "cursor_version": peek.cursor_version,
                     "positions": positions,
+                    "advance_command": advance_command,
                     "items": envelopes,
                 },
                 sort_keys=True,
@@ -3352,20 +3439,26 @@ def cmd_relay(args: argparse.Namespace) -> int:
     return 0
 
 
-def _parse_cursor_positions(values: list[str] | None) -> dict[str, int]:
+def _parse_cursor_positions(
+    values: list[str] | list[list[str]] | None,
+) -> dict[str, int]:
     advances: dict[str, int] = {}
-    for raw in values or []:
-        stream, separator, position_text = str(raw).partition("=")
-        stream = stream.strip()
-        if not separator or not stream:
-            raise ValueError("cursor position must use STREAM=SEQ")
-        try:
-            position = int(position_text)
-        except ValueError as exc:
-            raise ValueError("cursor position sequence must be an integer") from exc
-        if position <= 0:
-            raise ValueError("cursor position sequence must be positive")
-        advances[stream] = max(advances.get(stream, 0), position)
+    for group in values or []:
+        members = [group] if isinstance(group, str) else group
+        if not isinstance(members, (list, tuple)):
+            raise ValueError("cursor positions must be STREAM=SEQ values")
+        for raw in members:
+            stream, separator, position_text = str(raw).rpartition("=")
+            stream = stream.strip()
+            if not separator or not stream:
+                raise ValueError("cursor position must use STREAM=SEQ")
+            try:
+                position = int(position_text)
+            except ValueError as exc:
+                raise ValueError("cursor position sequence must be an integer") from exc
+            if position <= 0:
+                raise ValueError("cursor position sequence must be positive")
+            advances[stream] = max(advances.get(stream, 0), position)
     if not advances:
         raise ValueError("at least one --position STREAM=SEQ is required")
     return advances
@@ -3669,6 +3762,21 @@ def cmd_listen(args) -> int:
         except (goalflight_journal.JournalError, ValueError) as exc:
             return finish("corrupt", code=2, detail=str(exc))
         if peek.items:
+            snapshot = authority.cursor_peek(label, nonce=nonce, limit=1000)
+            positions = _cursor_positions(snapshot.items)
+            advance_command = _cursor_advance_command(
+                project_root=project_root,
+                controller_label=label,
+                lease_nonce=nonce,
+                cursor_version=snapshot.cursor_version,
+                positions=positions,
+            )
+            if advance_command is None:
+                return finish(
+                    "corrupt",
+                    code=2,
+                    detail="waking cursor snapshot has no advance positions",
+                )
             exited = authority.exit_listener(coverage_id, reason="event")
             if not exited.committed or not exited.value:
                 return finish("superseded", code=3, detail=exited.reason)
@@ -3681,13 +3789,17 @@ def cmd_listen(args) -> int:
             payload = {
                 "reason": "event",
                 "coverage_id": coverage_id,
-                "registry_generation": peek.registry_generation,
-                "cursor_version": peek.cursor_version,
+                "registry_generation": snapshot.registry_generation,
+                "cursor_version": snapshot.cursor_version,
+                "advance_command": advance_command,
             }
             if args.json:
                 print(json.dumps(payload, sort_keys=True))
             else:
-                print("mail available; peek: goalflight_messages.py relay --new")
+                print(
+                    "mail available; peek: goalflight_messages.py relay --new; "
+                    f"advance after processing: {advance_command}"
+                )
             waiter.close()
             return 0
         sleep_until = time.monotonic() + poll
@@ -3833,7 +3945,14 @@ def main(argv: list[str] | None = None) -> int:
     advance.add_argument("--controller-label", default=None)
     advance.add_argument("--lease-nonce", default=None)
     advance.add_argument("--cursor-version", type=int, required=True)
-    advance.add_argument("--position", action="append", default=[])
+    advance.add_argument(
+        "--position",
+        action="append",
+        nargs="+",
+        default=[],
+        metavar="STREAM=SEQ",
+        help="one or more positions; repeat the flag or group values after one flag",
+    )
     advance.add_argument("--json", action="store_true")
     advance.set_defaults(func=cmd_advance_cursor)
 

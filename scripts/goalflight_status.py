@@ -2251,16 +2251,42 @@ _WAIT_EXIT_MAIL = 3
 
 
 def _mail_watermark(project_root: str | None, wait_ids: list[str]) -> set[tuple[str, object]] | None:
-    """Monotonic journal event identity for ``--wait``; cursor advances cannot erase it."""
+    """Monotonic waking identities for exact-id waits, or ``None`` if unreadable.
+
+    Claimed mail is journal-assigned.  Unclaimed dispatch mail has no recipient
+    label to project into that journal, so merge the exact waited carriers as a
+    read-only fallback.  Both sources use origin+UUID identity, which dedupes one
+    envelope visible through both paths and survives controller cursor advances.
+    """
+    identities: set[tuple[str, object]] = set()
+    observed = False
     try:
         root = goalflight_task.resolve_project_root(project_root or str(Path.cwd()))
         events = _open_wait_journal_reader(str(root)).delivery_event_watermark(
             stream_ids=wait_ids,
             waking_only=True,
         )
-        return {(recipient, f"{origin}:{event_uuid}") for recipient, origin, event_uuid in events}
     except _EXPECTED_OPTIONAL_ERRORS:
-        return None
+        pass
+    else:
+        observed = True
+        identities.update(("event", f"{origin}:{event_uuid}") for _, origin, event_uuid in events)
+
+    try:
+        import goalflight_messages as _gm
+    except _EXPECTED_OPTIONAL_ERRORS:
+        pass
+    else:
+        try:
+            carrier_events = _gm.dispatch_mail_watermark(wait_ids)
+        except _gm.MessageError:
+            pass
+        except _EXPECTED_OPTIONAL_ERRORS:
+            pass
+        else:
+            observed = True
+            identities.update(("event", f"{origin}:{event_uuid}") for origin, event_uuid in carrier_events)
+    return identities if observed else None
 
 
 def _mail_summary(owned_dispatch_ids: set[str] | None = None, *, project_root: Path | None = None) -> dict:
@@ -2519,7 +2545,12 @@ def main(argv: list[str] | None = None) -> int:
         "--wait",
         metavar="IDS",
         action="append",
-        help="block until all comma-separated/repeated dispatch ids are terminal",
+        help=(
+            "unclaimed fixed-set join (does not claim/renew): block until all "
+            "comma-separated/repeated ids are terminal; new waking mail on any "
+            "waited ID exits 3. For claimed controllers use the messages "
+            "listen -> relay -> advance doorbell loop"
+        ),
     )
     parser.add_argument(
         "--wait-timeout",

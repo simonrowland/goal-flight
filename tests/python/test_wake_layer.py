@@ -510,6 +510,75 @@ def test_real_journal_mail_arrival_wakes_live_worker_wait_with_exit_three(
     assert live_attempt.lifecycle_state == journal.ATTEMPT_RUNNING
 
 
+def test_unclaimed_wait_wakes_on_mail_to_waited_dispatch_with_exit_three(
+    isolated: tuple[Path, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, _env = isolated
+    dispatch_id = "unclaimed-mail-wake"
+    authority = journal.open_or_create_journal(root)
+    assert authority.active_lease("wake-test") is None
+
+    prepared = authority.prepare_attempt(dispatch_id)
+    assert prepared.committed and prepared.value is not None
+    started = authority.start_attempt(
+        prepared.value.attempt_id,
+        prepared.value.launch_token,
+    )
+    assert started.committed and started.value is not None
+    running = authority.mark_attempt_running(
+        started.value.attempt_id,
+        started.value.launch_token,
+        launch_epoch=started.value.launch_epoch,
+        worker_instance={"pid": os.getpid(), "source": "unclaimed-mail-wake-probe"},
+    )
+    assert running.committed
+
+    baseline_read = threading.Event()
+    producer_errors: list[BaseException] = []
+    real_watermark = status._mail_watermark
+
+    def observed_watermark(*args, **kwargs):
+        watermark = real_watermark(*args, **kwargs)
+        baseline_read.set()
+        return watermark
+
+    monkeypatch.setattr(status, "_mail_watermark", observed_watermark)
+
+    def post_after_arm() -> None:
+        try:
+            assert baseline_read.wait(timeout=2)
+            result = messages.post_message(
+                dispatch_id=dispatch_id,
+                msg_type="controller-notice",
+                payload={"text": "wake the unclaimed fixed-set wait"},
+                messages_dir=messages.default_messages_dir(),
+                source={"node": "test", "adapter": "pytest", "transport": "controller"},
+                deliver_to_worker=True,
+            )
+            assert result["recorded"] is True
+        except BaseException as exc:  # thread transports its failure to the test.
+            producer_errors.append(exc)
+
+    producer = threading.Thread(target=post_after_arm)
+    producer.start()
+    code = status._wait_for_dispatches_registered(
+        [dispatch_id],
+        project_root=str(root),
+        timeout_s=3,
+        poll_s=0.02,
+        heartbeat_s=10,
+    )
+    producer.join(timeout=2)
+
+    assert not producer_errors
+    assert code == 3
+    assert authority.delivery_event_watermark(stream_ids=[dispatch_id]) == set()
+    live_attempt = journal.Journal.open_reader(root).attempt_for_dispatch(dispatch_id)
+    assert live_attempt is not None
+    assert live_attempt.lifecycle_state == journal.ATTEMPT_RUNNING
+
+
 def test_deleted_cursor_token_cli_surface_does_not_displace_healthy_listener(
     isolated: tuple[Path, dict[str, str]],
 ) -> None:
